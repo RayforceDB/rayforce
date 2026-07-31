@@ -82,6 +82,34 @@ static bool table_has_col_named(ray_t* tbl, const char* name, size_t len) {
     return false;
 }
 
+static bool splay_col_name_safe(const char* name, size_t name_len) {
+    return name_len > 0 && name[0] != '.' &&
+           !memchr(name, '/', name_len) &&
+           !memchr(name, '\\', name_len) &&
+           !memchr(name, '\0', name_len);
+}
+
+static ray_err_t splay_validate_persisted_names(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* a = ray_sym_str(ray_table_col_name(tbl, c));
+        if (!a || RAY_IS_ERR(a)) continue;
+        const char* an = ray_str_ptr(a);
+        size_t alen = ray_str_len(a);
+        if (!splay_col_name_safe(an, alen)) continue;
+        for (int64_t j = c + 1; j < nc; j++) {
+            ray_t* b = ray_sym_str(ray_table_col_name(tbl, j));
+            if (!b || RAY_IS_ERR(b)) continue;
+            const char* bn = ray_str_ptr(b);
+            size_t blen = ray_str_len(b);
+            if (!splay_col_name_safe(bn, blen)) continue;
+            if (alen == blen && memcmp(an, bn, alen) == 0)
+                return RAY_ERR_DOMAIN;
+        }
+    }
+    return RAY_OK;
+}
+
 /* Remove regular files in `dir` that are not part of the just-written
  * table: not a dotfile (".d", ".sym", ".sym.lk"), not a current column.
  * Runs after the .d commit so a stale wider-schema file can never shadow
@@ -118,6 +146,9 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
                                  bool durable) {
     if (!tbl || RAY_IS_ERR(tbl)) return RAY_ERR_TYPE;
     if (!dir) return RAY_ERR_IO;
+
+    ray_err_t name_err = splay_validate_persisted_names(tbl);
+    if (name_err != RAY_OK) return name_err;
 
     /* Symfile/column collision guard.  A column is written as `dir/<name>`;
      * the symfile (and its `<sym>.lk` lock) is written at `sym_path`.  A
@@ -237,9 +268,7 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
         if (!name_atom) continue;
         const char* name = ray_str_ptr(name_atom);
         size_t name_len  = ray_str_len(name_atom);
-        if (name_len == 0 || name[0] == '.' ||
-            memchr(name, '/', name_len) || memchr(name, '\\', name_len) ||
-            memchr(name, '\0', name_len))
+        if (!splay_col_name_safe(name, name_len))
             continue; /* unsafe name: no file, no .d entry */
 
         char path[1024];
@@ -359,9 +388,7 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
 
         /* Reject names with path separators, traversal, or starting with '.'
          * — these indicate a corrupt/hand-tampered .d. */
-        if (name_len == 0 || name[0] == '.' ||
-            memchr(name, '/', name_len) || memchr(name, '\\', name_len) ||
-            memchr(name, '\0', name_len)) {
+        if (!splay_col_name_safe(name, name_len)) {
             ray_release(schema);
             ray_release(tbl);
             return ray_error("corrupt",
