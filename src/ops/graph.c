@@ -421,6 +421,15 @@ static int8_t promote(int8_t a, int8_t b) {
     return RAY_BOOL;
 }
 
+static bool type_is_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+static int8_t promote_if_type(int8_t a, int8_t b) {
+    if (a == b && type_is_temporal(a)) return a;
+    return promote(a, b);
+}
+
 /* --------------------------------------------------------------------------
  * Unary element-wise ops
  * -------------------------------------------------------------------------- */
@@ -493,7 +502,7 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     uint32_t cond_id = cond->id;
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
-    int8_t out_type = promote(then_val->out_type, else_val->out_type);
+    int8_t out_type = promote_if_type(then_val->out_type, else_val->out_type);
     /* IF preserves string types: promote() handles RAY_STR (wins over SYM);
      * SYM override only applies when neither side is RAY_STR */
     if (out_type != RAY_STR &&
