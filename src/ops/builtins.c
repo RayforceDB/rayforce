@@ -1325,7 +1325,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     if (cast_match(tname, tlen, "I64") || cast_match(tname, tlen, "i64")) {
         ray_release(s);
         if (val->type == -RAY_I64) { ray_retain(val); return val; }
-        if (val->type == -RAY_F64) return make_i64((int64_t)val->f64);
+        if (val->type == -RAY_F64) return make_i64(ray_cast_f64_to_i64_null(val->f64));
         if (val->type == -RAY_BOOL) return make_i64(val->b8 ? 1 : 0);
         if (val->type == -RAY_I32 || val->type == -RAY_DATE || val->type == -RAY_TIME)
             return make_i64(val->i32);
@@ -1353,7 +1353,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_U8)  return ray_i32((int32_t)val->u8);
         if (val->type == -RAY_I16) return ray_i32(val->i16);
         if (val->type == -RAY_I64) return ray_i32((int32_t)val->i64);
-        if (val->type == -RAY_F64) return ray_i32((int32_t)val->f64);
+        if (val->type == -RAY_F64) return ray_i32(ray_cast_f64_to_i32_null(val->f64));
         if (val->type == -RAY_DATE || val->type == -RAY_TIME) return ray_i32(val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_i32((int32_t)val->i64);
         if (val->type == -RAY_STR) {
@@ -1375,7 +1375,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_U8)  return ray_i16((int16_t)val->u8);
         if (val->type == -RAY_I32) return ray_i16((int16_t)val->i32);
         if (val->type == -RAY_I64) return ray_i16((int16_t)val->i64);
-        if (val->type == -RAY_F64) return ray_i16((int16_t)val->f64);
+        if (val->type == -RAY_F64) return ray_i16(ray_cast_f64_to_i16_null(val->f64));
         if (val->type == -RAY_DATE || val->type == -RAY_TIME) return ray_i16((int16_t)val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_i16((int16_t)val->i64);
         if (val->type == -RAY_STR) {
@@ -1549,7 +1549,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_date((int64_t)val->i16);
         if (val->type == -RAY_I32) return ray_date((int64_t)val->i32);
         if (val->type == -RAY_I64) return ray_date(val->i64);
-        if (val->type == -RAY_F64) return ray_date((int64_t)val->f64);
+        if (val->type == -RAY_F64) return ray_date(ray_cast_f64_to_i32_null(val->f64));
         if (val->type == -RAY_TIME) return ray_date((int64_t)val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_date(ts_days_floor(val->i64));
         if (val->type == -RAY_STR) {
@@ -1583,7 +1583,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_time((int64_t)val->i16);
         if (val->type == -RAY_I32) return ray_time((int64_t)val->i32);
         if (val->type == -RAY_I64) return ray_time(val->i64);
-        if (val->type == -RAY_F64) return ray_time((int64_t)val->f64);
+        if (val->type == -RAY_F64) return ray_time(ray_cast_f64_to_i32_null(val->f64));
         if (val->type == -RAY_DATE) return ray_time((int64_t)val->i32);
         if (val->type == -RAY_TIMESTAMP)
             /* TIMESTAMP is ns since epoch; TIME stores ms-of-day.  Use
@@ -1622,7 +1622,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_timestamp((int64_t)val->i16);
         if (val->type == -RAY_I32) return ray_timestamp((int64_t)val->i32);
         if (val->type == -RAY_I64) return ray_timestamp(val->i64);
-        if (val->type == -RAY_F64) return ray_timestamp((int64_t)val->f64);
+        if (val->type == -RAY_F64) return ray_timestamp(ray_cast_f64_to_i64_null(val->f64));
         if (val->type == -RAY_TIME) return ray_timestamp((int64_t)val->i32);
         if (val->type == -RAY_DATE) {
             int64_t days = val->i32;
@@ -1755,7 +1755,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_u8((uint8_t)val->i16);
         if (val->type == -RAY_I32) return ray_u8((uint8_t)val->i32);
         if (val->type == -RAY_I64) return ray_u8((uint8_t)val->i64);
-        if (val->type == -RAY_F64) return ray_u8((uint8_t)val->f64);
+        if (val->type == -RAY_F64) return ray_u8(ray_cast_f64_to_u8_null(val->f64));
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             char* end; long v = strtol(sp, &end, 10);
