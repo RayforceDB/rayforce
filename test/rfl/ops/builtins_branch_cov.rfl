@@ -325,6 +325,37 @@
 (type (as 'TIMESTAMP "2024.01.15D12:30:45.000000000")) -- 'timestamp
 (as 'TIMESTAMP "2024.01.15D12:30:45.000000000") -- 2024.01.15D12:30:45.000000000
 
+;; TIMESTAMP STR malformed input must be REJECTED, not silently normalized.
+;; The parser walks a bounded cursor over
+;;   YYYY<sep>MM<sep>DD [ (T| |D) HH:MM[:SS][.frac] [Z|(+|-)HH[:]?MM] ]
+;; and must consume the whole string — a partial match or trailing garbage
+;; that used to be ignored silently corrupts the value.
+;; Bad date/time separator (dropped the time, returned midnight):
+(as 'TIMESTAMP "2024-01-02x01:02:03") !- domain
+(as 'TIMESTAMP "2024-01-02abc") !- domain
+;; Out-of-range time component (used to roll into the next day):
+(as 'TIMESTAMP "2024-01-02T25:02:03") !- domain
+(as 'TIMESTAMP "2024-01-02T12:99:03") !- domain
+;; Trailing garbage after HH:MM / HH:MM:SS / fraction / 'Z':
+(as 'TIMESTAMP "2024-01-02T12:34junk") !- domain
+(as 'TIMESTAMP "2024-01-02T12:34:03junk") !- domain
+(as 'TIMESTAMP "2024-01-02T12:34:03Zjunk") !- domain
+(as 'TIMESTAMP "2024-01-02T12:34:03.5junk") !- domain
+;; Partial / dangling component:
+(as 'TIMESTAMP "2024-01-02T12:34:") !- domain
+(as 'TIMESTAMP "2024-01-02T12:34:03.") !- domain
+;; Out-of-range timezone offset:
+(as 'TIMESTAMP "2024-01-02T12:34:03+99:99") !- domain
+;; Inconsistent / malformed date separator and short fields:
+(as 'TIMESTAMP "2024-01.02T00:00:00") !- domain
+(as 'TIMESTAMP "2024-1-2T00:00:00") !- domain
+;; Bare date (no time) is valid and yields midnight.
+(as 'TIMESTAMP "2024-01-02") -- 2024.01.02D00:00:00.000000000
+;; Space separator, HH:MM without seconds, and a tz offset are all accepted.
+(as 'TIMESTAMP "2024-01-02 01:02:03") -- 2024.01.02D01:02:03.000000000
+(as 'TIMESTAMP "2024-01-02T12:34") -- 2024.01.02D12:34:00.000000000
+(as 'TIMESTAMP "2004-10-21 12:00:00.010-23:00") -- 2004.10.22D11:00:00.010000000
+
 ;; --- Cast to GUID ---
 (type (as 'GUID "01234567-89ab-cdef-0123-456789abcdef")) -- 'guid
 (as 'STR (as 'GUID "01234567-89ab-cdef-0123-456789abcdef")) -- "01234567-89ab-cdef-0123-456789abcdef"

@@ -1628,34 +1628,92 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             int64_t days = val->i32;
             return ray_timestamp(days * 24LL * 60 * 60 * 1000000000LL);
         }
-        /* ISO string -> timestamp: "YYYY-MM-DD[T ]HH:MM:SS[.nnn...]" or "YYYY.MM.DDDHH:MM:SS.nnn..." */
+        /* ISO string -> timestamp.  Parse the whole value with a bounded
+         * cursor and require it to reach the end of the string.  A partial
+         * or trailing-garbage match must be REJECTED — otherwise malformed
+         * input is silently cast to a valid-but-wrong timestamp, the exact
+         * data-corruption class this parser guards against.  Grammar:
+         *   YYYY<sep>MM<sep>DD [ (T|' '|D) HH:MM[:SS][.frac] [Z|(+|-)HH[:]?MM] ]
+         * where <sep> is '-' or '.' and is consistent within the date. */
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 10) return ray_error("domain", "as: cannot parse str as timestamp, too short, got %lld chars", (long long)sl);
-            int y, m, d, hh = 0, mm = 0, ss = 0;
-            long long frac = 0;
-            /* Try both formats: YYYY-MM-DD and YYYY.MM.DD */
-            int parsed = sscanf(sp, "%d-%d-%d", &y, &m, &d);
-            /* parse date: try YYYY-MM-DD then YYYY.MM.DD */
-            if (parsed != 3) {
-                parsed = sscanf(sp, "%d.%d.%d", &y, &m, &d);
-                /* YYYY.MM.DD format */
-            }
-            if (parsed != 3) return ray_error("domain", "as: cannot parse str as timestamp, expected YYYY-MM-DD or YYYY.MM.DD");
-            /* Parse optional time part */
-            if (sl > 10 && (sp[10] == 'T' || sp[10] == ' ' || sp[10] == 'D')) {
-                sscanf(sp + 11, "%d:%d:%d", &hh, &mm, &ss);
-                /* Parse fractional seconds */
-                const char* dot = memchr(sp + 11, '.', sl - 11);
-                if (dot) {
-                    dot++;
+            size_t i = 0;
+            int y = 0, m = 0, d = 0, hh = 0, mm = 0, ss = 0;
+            long long frac = 0, tz_ns = 0;
+
+            /* Read exactly `w` digits (0-9) into `out`, or fail. */
+            #define TS_DIGITS(w, out) do {                                                     \
+                (out) = 0;                                                                     \
+                for (int _k = 0; _k < (w); _k++) {                                             \
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')                                 \
+                        return ray_error("domain", "as: cannot parse str as timestamp, expected %d-digit field at offset %lld", (w), (long long)i); \
+                    (out) = (out) * 10 + (sp[i] - '0'); i++;                                   \
+                }                                                                             \
+            } while (0)
+
+            TS_DIGITS(4, y);
+            if (i >= sl || (sp[i] != '-' && sp[i] != '.'))
+                return ray_error("domain", "as: cannot parse str as timestamp, expected '-' or '.' date separator");
+            char dsep = sp[i]; i++;
+            TS_DIGITS(2, m);
+            if (i >= sl || sp[i] != dsep)
+                return ray_error("domain", "as: cannot parse str as timestamp, inconsistent date separator");
+            i++;
+            TS_DIGITS(2, d);
+            if (m < 1 || m > 12 || d < 1 || d > 31)
+                return ray_error("domain", "as: cannot parse str as timestamp, date component out of range");
+
+            if (i < sl) {
+                /* date/time separator: T, space, or D (kdb literal form) */
+                if (sp[i] != 'T' && sp[i] != ' ' && sp[i] != 'D')
+                    return ray_error("domain", "as: cannot parse str as timestamp, expected 'T', ' ', or 'D' between date and time");
+                i++;
+                TS_DIGITS(2, hh);
+                if (i >= sl || sp[i] != ':')
+                    return ray_error("domain", "as: cannot parse str as timestamp, expected ':' after hour");
+                i++;
+                TS_DIGITS(2, mm);
+                if (i < sl && sp[i] == ':') { i++; TS_DIGITS(2, ss); }
+                if (hh > 23 || mm > 59 || ss > 59)
+                    return ray_error("domain", "as: cannot parse str as timestamp, time component out of range");
+                /* optional fractional seconds: at least one digit; up to 9
+                 * are kept (right-padded), any beyond are consumed. */
+                if (i < sl && sp[i] == '.') {
+                    i++;
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')
+                        return ray_error("domain", "as: cannot parse str as timestamp, expected fractional digits after '.'");
                     char fbuf[10] = "000000000";
                     int fi = 0;
-                    while (*dot >= '0' && *dot <= '9' && fi < 9) fbuf[fi++] = *dot++;
+                    while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                        if (fi < 9) fbuf[fi++] = sp[i];
+                        i++;
+                    }
                     frac = strtoll(fbuf, NULL, 10);
                 }
+                /* optional timezone: Z | (+|-)HH[:]?MM */
+                if (i < sl) {
+                    if (sp[i] == 'Z' || sp[i] == 'z') {
+                        i++;
+                    } else if (sp[i] == '+' || sp[i] == '-') {
+                        int tz_sign = (sp[i] == '+') ? 1 : -1; i++;
+                        int tz_hh = 0, tz_mm = 0;
+                        TS_DIGITS(2, tz_hh);
+                        if (i < sl && sp[i] == ':') i++;   /* optional ':' */
+                        if (i < sl) TS_DIGITS(2, tz_mm);
+                        if (tz_hh > 23 || tz_mm > 59)
+                            return ray_error("domain", "as: cannot parse str as timestamp, timezone offset out of range");
+                        tz_ns = (long long)tz_sign *
+                                ((long long)tz_hh * 3600 + (long long)tz_mm * 60) * 1000000000LL;
+                    } else {
+                        return ray_error("domain", "as: cannot parse str as timestamp, unexpected trailing characters");
+                    }
+                }
             }
+            if (i != sl)
+                return ray_error("domain", "as: cannot parse str as timestamp, unexpected trailing characters");
+            #undef TS_DIGITS
+
             /* Convert to days since 2000-01-01 */
             int64_t days = 0;
             { int ty;
@@ -1669,32 +1727,8 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             }
             int64_t ns = days * 86400000000000LL + (int64_t)hh * 3600000000000LL +
                          (int64_t)mm * 60000000000LL + (int64_t)ss * 1000000000LL + frac;
-            /* Handle timezone offset: Z, +HH:MM, -HH:MM, +HHMM, -HHMM */
-            if (sl > 19) {
-                const char* tz = sp + 19; /* after YYYY-MM-DDTHH:MM:SS */
-                /* Skip fractional seconds */
-                if (tz < sp + sl && *tz == '.') {
-                    tz++;
-                    while (tz < sp + sl && *tz >= '0' && *tz <= '9') tz++;
-                }
-                if (tz < sp + sl) {
-                    if (*tz == 'Z') {
-                        /* UTC, no adjustment */
-                    } else if (*tz == '+' || *tz == '-') {
-                        int tz_sign = (*tz == '+') ? 1 : -1;
-                        int tz_hh = 0, tz_mm = 0;
-                        tz++;
-                        /* Parse HH:MM or HHMM */
-                        if (tz + 4 < sp + sl && tz[2] == ':') {
-                            sscanf(tz, "%2d:%2d", &tz_hh, &tz_mm);
-                        } else {
-                            sscanf(tz, "%2d%2d", &tz_hh, &tz_mm);
-                        }
-                        int64_t tz_ns = ((int64_t)tz_hh * 3600 + (int64_t)tz_mm * 60) * 1000000000LL;
-                        ns -= tz_sign * tz_ns;
-                    }
-                }
-            }
+            /* Timezone offset converts local wall-clock to UTC. */
+            ns -= tz_ns;
             return ray_timestamp(ns);
         }
         /* Vector cast */
