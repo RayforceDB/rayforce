@@ -6377,6 +6377,82 @@ static test_result_t test_eval_restricted_fn(void) {
     PASS();
 }
 
+/* Evaluate one expression with the same VM-wide flag used by restricted IPC.
+ * Restore the caller's state before inspecting the result so a failed
+ * assertion cannot leak restricted mode into the next test. */
+static ray_t* eval_restricted_expr(const char* expr) {
+    bool previous = ray_eval_get_restricted();
+    ray_eval_set_restricted(true);
+    ray_t* result = ray_eval_str(expr);
+    ray_eval_set_restricted(previous);
+    return result;
+}
+
+static bool restricted_expr_returns_access(const char* expr) {
+    ray_t* result = eval_restricted_expr(expr);
+    bool access = result && RAY_IS_ERR(result) &&
+                  ray_err_code(result) &&
+                  strcmp(ray_err_code(result), "access") == 0;
+    if (result) {
+        if (RAY_IS_ERR(result)) ray_error_free(result);
+        else ray_release(result);
+    }
+    return access;
+}
+
+/* Restricted builtins must be rejected at the actual invocation boundary,
+ * including compiled lambda bytecode.  Invalid filesystem arguments are
+ * deliberate: before the fix they return os/type instead of access without
+ * performing a useful side effect. */
+static test_result_t test_eval_restricted_lambda_bypass(void) {
+    /* OP_CALL1: unary restricted builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (.sys.exec \"true\")) 0)"));
+
+    /* OP_CALL2: binary restricted builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (write \"/__rayforce_issue_363_missing__/file\" \"x\")) 0)"));
+
+    /* OP_CALLN: variadic restricted builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (.db.splayed.set 1 2)) 0)"));
+
+    /* OP_STOREGLOBAL: the compiler lowers `set` directly instead of calling
+     * the registered restricted special form. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (set '__rf_issue_363_injected 1)) 0)"));
+
+    /* The wide-constant opcode is a separate VM handler and must enforce the
+     * same rule.  Fill the constant pool before compiling `set` so its name
+     * index exceeds one byte and OP_STOREGLOBAL_W is emitted. */
+    char wide_set[4096];
+    size_t used = (size_t)snprintf(wide_set, sizeof(wide_set),
+                                   "((fn [x] (do ");
+    for (int i = 0; i < 260 && used < sizeof(wide_set); i++)
+        used += (size_t)snprintf(wide_set + used, sizeof(wide_set) - used,
+                                 "%d ", i);
+    if (used < sizeof(wide_set))
+        used += (size_t)snprintf(wide_set + used, sizeof(wide_set) - used,
+                                 "(set '__rf_issue_363_wide 1))) 0)");
+    TEST_ASSERT(used < sizeof(wide_set), "wide restricted set expression fits buffer");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(wide_set));
+
+    /* Nested bytecode and dynamic callable dispatch stay restricted too. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] ((fn [y] (read \"/__rayforce_issue_363_missing__/file\")) x)) 0)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [f] (f \"/__rayforce_issue_363_missing__/file\")) read)"));
+
+    /* Pure computation remains available in read-only mode. */
+    ray_t* allowed = eval_restricted_expr("((fn [x] (+ x 1)) 2)");
+    TEST_ASSERT_NOT_NULL(allowed);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(allowed));
+    TEST_ASSERT_EQ_I(allowed->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(allowed->i64, 3);
+    ray_release(allowed);
+    PASS();
+}
+
 /* --- self-recursive lambda via recursion (tests op_calls path) --- */
 static test_result_t test_eval_self_recursion_direct(void) {
     /* Direct recursion using named function — compiler may use op_calls */
@@ -8904,6 +8980,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
+    { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

@@ -2282,6 +2282,11 @@ op_storeglobal: {
     ray_t *name_obj = cpool[idx];
     /* `set` returns its value, so the result must stay on the stack;
      * PEEK rather than POP.  ray_env_set retains its own ref. */
+    if (RAY_UNLIKELY(__VM->restricted)) {
+        ray_release(POP());
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
     ray_t *val = PEEK();
     ray_err_t err = ray_env_set(name_obj->i64, val);
     if (err != RAY_OK) {
@@ -2296,6 +2301,11 @@ op_storeglobal_w: {
     uint16_t idx = (uint16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *name_obj = cpool[idx];
+    if (RAY_UNLIKELY(__VM->restricted)) {
+        ray_release(POP());
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
     ray_t *val = PEEK();
     ray_err_t err = ray_env_set(name_obj->i64, val);
     if (err != RAY_OK) {
@@ -2327,6 +2337,12 @@ op_jmpf: {
 op_call1: {
     ray_t *arg = POP();
     ray_t *fn_obj = POP();
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
+        ray_release(arg);
+        ray_release(fn_obj);
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
     ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
     ray_t *result;
     /* Materialise lazy args for non-lazy-aware fns.
@@ -2359,6 +2375,13 @@ op_call2: {
     ray_t *right = POP();
     ray_t *left = POP();
     ray_t *fn_obj = POP();
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
+        ray_release(left);
+        ray_release(right);
+        ray_release(fn_obj);
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
     ray_binary_fn fn = (ray_binary_fn)(uintptr_t)fn_obj->i64;
     ray_t *result;
     /* Materialise lazy args for non-lazy-aware fns.
@@ -2407,6 +2430,12 @@ op_calln: {
     for (int32_t i = n - 1; i >= 0; i--)
         fn_args[i] = POP();
     ray_t *fn_obj = POP();
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
+        for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
+        ray_release(fn_obj);
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
     ray_vary_fn fn = (ray_vary_fn)(uintptr_t)fn_obj->i64;
     if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
         ray_t* err = materialize_owned_args(fn_args, n);
