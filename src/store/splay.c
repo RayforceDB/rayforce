@@ -150,6 +150,17 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
     ray_err_t name_err = splay_validate_persisted_names(tbl);
     if (name_err != RAY_OK) return name_err;
 
+    /* Validate every column graph before mkdir, sym-domain growth, or the
+     * first per-column atomic rename.  Without this pass, an unsupported
+     * value in a later recursive LIST cell can return NYI after earlier
+     * columns have already replaced an existing committed generation. */
+    int64_t preflight_ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < preflight_ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_err_t err = ray_col_save_preflight(col);
+        if (err != RAY_OK) return err;
+    }
+
     /* Symfile/column collision guard.  A column is written as `dir/<name>`;
      * the symfile (and its `<sym>.lk` lock) is written at `sym_path`.  A
      * column whose file lands on the symfile path — or its lock path —
@@ -284,8 +295,9 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
             : (durable ? ray_col_save(col, path)
                        : ray_col_save_bulk(col, path));
         if (err != RAY_OK) {
-            /* No .d written yet: the dir stays in its previous committed
-             * state (old .d) or uncommitted state (no .d) — never torn. */
+            /* No new .d is written.  Preflight prevents deterministic format
+             * failures here; an I/O error or crash can still leave an
+             * existing directory with mixed-generation column files. */
             ray_release(schema);
             if (dom) ray_sym_domain_release(dom);
             return err;
