@@ -2965,6 +2965,37 @@ static test_result_t test_eval_insert_list_append(void) {
     PASS();
 }
 
+/* ---- Test: insert into a table with a boxed LIST column --------------- */
+static test_result_t test_eval_insert_list_column(void) {
+    const char* setup =
+        "(set nested_t (table ['k 'sched] (list ['a 'b] "
+        "  (list (list (as 'i64 (list 0)) (as 'f64 (list 5))) "
+        "        (list (as 'i64 (list 0 250000)) "
+        "              (as 'f64 (list 15 10)))))))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    /* A table payload is a batch: copy each boxed cell with a retain. */
+    ASSERT_EQ("(insert 'nested_t nested_t)", "'nested_t");
+    ASSERT_EQ("(count nested_t)", "4");
+    ASSERT_EQ("(at nested_t 'sched)",
+              "(list (list [0] [5.0]) "
+              "      (list [0 250000] [15.0 10.0]) "
+              "      (list [0] [5.0]) "
+              "      (list [0 250000] [15.0 10.0]))");
+
+    /* A positional row keeps its nested LIST as one cell, not a batch. */
+    ASSERT_EQ("(insert 'nested_t "
+              "        (list 'c (list [1 2] [3.0 4.0])))",
+              "'nested_t");
+    ASSERT_EQ("(count nested_t)", "5");
+    ASSERT_EQ("(get (at nested_t 'sched) 4)",
+              "(list [1 2] [3.0 4.0])");
+    PASS();
+}
+
 /* ---- Test: insert positional (arity 3, scalar idx) ---- */
 static test_result_t test_eval_insert_vec_positional(void) {
     /* Head, middle, tail (== append) */
@@ -4287,6 +4318,25 @@ static test_result_t test_eval_parted_list_column_impl(const char* root) {
 
     /* The parted view itself must stay usable after the reads. */
     ASSERT_EQ("(at pl 'acct)", "['a 'b 'a 'b]");
+
+    /* Append two boxed rows to the active partition.  The historical LIST
+     * segment stays mmap-backed while the active segment becomes a retained
+     * heap snapshot. */
+    ASSERT_EQ("(insert 'pl 2024.01.02 "
+              "        (table ['acct 'brk] "
+              "               (list ['c 'd] (list [1 2] [3 4 5]))))",
+              "'pl");
+    ASSERT_EQ("(count pl)", "6");
+    ASSERT_EQ("(at pl 'brk)",
+              "(list [0 250000] [0 250000 5000000] "
+              "      [0 250000] [0 250000 5000000] [1 2] [3 4 5])");
+
+    /* A greater key creates a new boxed heap segment. */
+    ASSERT_EQ("(insert 'pl 2024.01.03 "
+              "        (table ['acct 'brk] (list ['e] (list [7 8]))))",
+              "'pl");
+    ASSERT_EQ("(count pl)", "7");
+    ASSERT_EQ("(get (at pl 'brk) 6)", "[7 8]");
     PASS();
 }
 
@@ -8700,6 +8750,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert", test_eval_insert, lang_setup, lang_teardown },
     { "lang/eval/insert_vec_append", test_eval_insert_vec_append, lang_setup, lang_teardown },
     { "lang/eval/insert_list_append", test_eval_insert_list_append, lang_setup, lang_teardown },
+    { "lang/eval/insert_list_column", test_eval_insert_list_column, lang_setup, lang_teardown },
     { "lang/eval/insert_vec_positional", test_eval_insert_vec_positional, lang_setup, lang_teardown },
     { "lang/eval/insert_list_positional", test_eval_insert_list_positional, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_multi", test_eval_insert_positional_multi, lang_setup, lang_teardown },
