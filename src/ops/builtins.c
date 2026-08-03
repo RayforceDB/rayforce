@@ -1661,7 +1661,12 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 return ray_error("domain", "as: cannot parse str as timestamp, inconsistent date separator");
             i++;
             TS_DIGITS(2, d);
-            if (m < 1 || m > 12 || d < 1 || d > 31)
+            if (m < 1 || m > 12 || d < 1)
+                return ray_error("domain", "as: cannot parse str as timestamp, date component out of range");
+            static const int ts_md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            int mdays = ts_md[m] + (m == 2 && leap ? 1 : 0);
+            if (d > mdays)
                 return ray_error("domain", "as: cannot parse str as timestamp, date component out of range");
 
             if (i < sl) {
@@ -1700,7 +1705,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                         int tz_hh = 0, tz_mm = 0;
                         TS_DIGITS(2, tz_hh);
                         if (i < sl && sp[i] == ':') i++;   /* optional ':' */
-                        if (i < sl) TS_DIGITS(2, tz_mm);
+                        TS_DIGITS(2, tz_mm);
                         if (tz_hh > 23 || tz_mm > 59)
                             return ray_error("domain", "as: cannot parse str as timestamp, timezone offset out of range");
                         tz_ns = (long long)tz_sign *
@@ -1720,14 +1725,24 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
               for (ty = 2000; ty < y; ty++) days += (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
               for (ty = y; ty < 2000; ty++) days -= (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
             }
-            { static const int md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-              int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-              for (int mi = 1; mi < m; mi++) days += md[mi] + (mi == 2 && leap ? 1 : 0);
+            {
+              for (int mi = 1; mi < m; mi++) days += ts_md[mi] + (mi == 2 && leap ? 1 : 0);
               days += d - 1;
             }
-            int64_t ns = days * 86400000000000LL + (int64_t)hh * 3600000000000LL +
-                         (int64_t)mm * 60000000000LL + (int64_t)ss * 1000000000LL + frac;
+            const int64_t ns_per_day = 86400000000000LL;
+            if (days > INT64_MAX / ns_per_day || days < INT64_MIN / ns_per_day)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            int64_t day_ns = days * ns_per_day;
+            int64_t tod_ns = (int64_t)hh * 3600000000000LL +
+                             (int64_t)mm * 60000000000LL + (int64_t)ss * 1000000000LL + frac;
+            if (day_ns > INT64_MAX - tod_ns)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            int64_t ns = day_ns + tod_ns;
             /* Timezone offset converts local wall-clock to UTC. */
+            if (tz_ns > 0 && ns < INT64_MIN + tz_ns)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            if (tz_ns < 0 && ns > INT64_MAX + tz_ns)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
             ns -= tz_ns;
             return ray_timestamp(ns);
         }

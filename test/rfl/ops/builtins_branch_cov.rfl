@@ -346,11 +346,21 @@
 (as 'TIMESTAMP "2024-01-02T12:34:03.") !- domain
 ;; Out-of-range timezone offset:
 (as 'TIMESTAMP "2024-01-02T12:34:03+99:99") !- domain
+;; Timezone minutes are mandatory: grammar is HH[:]?MM, not bare HH.
+(as 'TIMESTAMP "2024-01-02T12:34:03+12") !- domain
+(as 'TIMESTAMP "2024-01-02T12:34:03+12:") !- domain
 ;; Inconsistent / malformed date separator and short fields:
 (as 'TIMESTAMP "2024-01.02T00:00:00") !- domain
 (as 'TIMESTAMP "2024-1-2T00:00:00") !- domain
+;; Calendar dates must be valid for the selected month/leap year.
+(as 'TIMESTAMP "2024-02-31") !- domain
+(as 'TIMESTAMP "2023-02-29") !- domain
+(as 'TIMESTAMP "2024-04-31") !- domain
+;; Reject values outside int64 nanosecond timestamp range before overflow.
+(as 'TIMESTAMP "9999-12-31") !- domain
 ;; Bare date (no time) is valid and yields midnight.
 (as 'TIMESTAMP "2024-01-02") -- 2024.01.02D00:00:00.000000000
+(as 'TIMESTAMP "2024-02-29") -- 2024.02.29D00:00:00.000000000
 ;; Space separator, HH:MM without seconds, and a tz offset are all accepted.
 (as 'TIMESTAMP "2024-01-02 01:02:03") -- 2024.01.02D01:02:03.000000000
 (as 'TIMESTAMP "2024-01-02T12:34") -- 2024.01.02D12:34:00.000000000
