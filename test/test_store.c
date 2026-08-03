@@ -3727,6 +3727,28 @@ static test_result_t test_ipc_restricted(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
     ray_release(r4);
 
+    /* Entering compiled lambda bytecode must preserve the connection's
+     * restricted context.  These are the request-level escapes from #363. */
+    const char* q_lambda =
+        "((fn [x] (.sys.exec \"true\")) 0)";
+    ray_t* msg5 = ray_str(q_lambda, strlen(q_lambda));
+    ray_t* r5 = ray_ipc_send(h, msg5);
+    ray_release(msg5);
+    TEST_ASSERT_NOT_NULL(r5);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r5));
+    TEST_ASSERT_STR_EQ(ray_err_code(r5), "access");
+    ray_release(r5);
+
+    const char* q_lambda_set =
+        "((fn [x] (set '__rf_issue_363_ipc_injected 1)) 0)";
+    ray_t* msg6 = ray_str(q_lambda_set, strlen(q_lambda_set));
+    ray_t* r6 = ray_ipc_send(h, msg6);
+    ray_release(msg6);
+    TEST_ASSERT_NOT_NULL(r6);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r6));
+    TEST_ASSERT_STR_EQ(ray_err_code(r6), "access");
+    ray_release(r6);
+
     ray_ipc_close(h);
     srv.running = false;
     ray_thread_join(tid);
