@@ -58,6 +58,25 @@ static test_result_t test_public_ipc_client_symbols(void) {
     PASS();
 }
 
+static test_result_t test_public_poll_symbols(void) {
+    ray_poll_t* (*create_fn)(void) = ray_poll_create;
+    void        (*destroy_fn)(ray_poll_t*) = ray_poll_destroy;
+    int64_t     (*run_fn)(ray_poll_t*) = ray_poll_run;
+    int64_t     (*run_for_fn)(ray_poll_t*, int) = ray_poll_run_for;
+    void        (*exit_fn)(ray_poll_t*, int64_t) = ray_poll_exit;
+    void        (*set_fn)(void*) = ray_runtime_set_poll;
+    void*       (*get_fn)(void) = ray_runtime_get_poll;
+
+    TEST_ASSERT_NOT_NULL((void*)create_fn);
+    TEST_ASSERT_NOT_NULL((void*)destroy_fn);
+    TEST_ASSERT_NOT_NULL((void*)run_fn);
+    TEST_ASSERT_NOT_NULL((void*)run_for_fn);
+    TEST_ASSERT_NOT_NULL((void*)exit_fn);
+    TEST_ASSERT_NOT_NULL((void*)set_fn);
+    TEST_ASSERT_NOT_NULL((void*)get_fn);
+    PASS();
+}
+
 static test_result_t test_public_query_and_format_symbols(void) {
     ray_t* (*select_fn)(ray_t**, int64_t) = ray_select;
     ray_t* (*update_fn)(ray_t**, int64_t) = ray_update;
@@ -661,6 +680,7 @@ static test_result_t test_public_nullability_matrix(void) {
 
 const test_entry_t public_api_entries[] = {
     { "public/ipc_client_symbols",        test_public_ipc_client_symbols,        NULL, NULL },
+    { "public/poll_symbols",              test_public_poll_symbols,              NULL, NULL },
     { "public/query_and_format_symbols",  test_public_query_and_format_symbols,  NULL, NULL },
 
     { "public/obj_type_atom_i64",   test_public_obj_type_atom_i64,   public_api_setup, public_api_teardown },
