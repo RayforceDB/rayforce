@@ -716,6 +716,34 @@ static test_result_t test_syscov_time_timer_fires(void) {
     PASS();
 }
 
+/* The production poll driver must also service Rayfall timers while an
+ * embedder lends it the thread for a bounded slice. */
+static test_result_t test_poll_run_for_fires_timer(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    ray_t* setup_counter = ray_eval_str("(set bounded_timer_fired 0)");
+    TEST_ASSERT_NOT_NULL(setup_counter);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup_counter));
+    ray_release(setup_counter);
+
+    ray_t* setup_timer = ray_eval_str(
+        "(.time.timer.set 5 1 (fn [t] (set bounded_timer_fired 1)))");
+    TEST_ASSERT_NOT_NULL(setup_timer);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup_timer));
+    ray_release(setup_timer);
+
+    TEST_ASSERT_EQ_I(ray_poll_run_for(poll, 30), 0);
+
+    ray_t* fired = ray_eval_str("bounded_timer_fired");
+    TEST_ASSERT_NOT_NULL(fired);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fired));
+    TEST_ASSERT_EQ_I(fired->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(fired->i64, 1);
+    ray_release(fired);
+    PASS();
+}
+
 /* ─── timer.c deep coverage (heap helpers + edge paths) ───────
  *
  * The static heap helpers (heap_less, heap_swap, heap_up sift body,
@@ -1173,6 +1201,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
     { "runtime/syscov_time_timer_set_del",   test_syscov_time_timer_set_del,   sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_time_timer_fires",     test_syscov_time_timer_fires,     sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/poll_run_for_fires_timer",    test_poll_run_for_fires_timer,    sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_heap_grow_past_initial_cap", test_timer_heap_grow_past_initial_cap, sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_next_deadline_ms",      test_timer_next_deadline_ms,      sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_heap_sift_paths",       test_timer_heap_sift_paths,       sys_setup_with_poll, sys_teardown_with_poll },
@@ -1193,5 +1222,4 @@ const test_entry_t runtime_entries[] = {
 
     { NULL, NULL, NULL, NULL },
 };
-
 
