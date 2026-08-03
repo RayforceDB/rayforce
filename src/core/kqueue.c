@@ -29,6 +29,7 @@
 #include <sys/event.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 #define RAY_POLL_MAX_EVENTS 64
@@ -159,15 +160,22 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     poll->sels[id] = NULL;
 }
 
-int64_t ray_poll_run(ray_poll_t* poll)
+int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
 {
     if (!poll) return -1;
 
     struct kevent events[RAY_POLL_MAX_EVENTS];
+    bool bounded = timeout_ms >= 0;
+    int64_t end_ms = bounded ? ray_time_now_ms() + timeout_ms : INT64_MAX;
 
     while (poll->code < 0) {
-        struct timespec  ts;
-        struct timespec* timeout = NULL;
+        int64_t wait_ms = -1;
+        if (bounded) {
+            int64_t remaining = end_ms - ray_time_now_ms();
+            if (remaining < 0) remaining = 0;
+            wait_ms = remaining;
+        }
+
         if (poll->timers) {
             int64_t deadline = ray_timers_next_deadline_ms(
                 (ray_timers_t*)poll->timers);
@@ -175,10 +183,17 @@ int64_t ray_poll_run(ray_poll_t* poll)
                 int64_t now = ray_time_now_ms();
                 int64_t delta = deadline - now;
                 if (delta < 0) delta = 0;
-                ts.tv_sec  = (time_t)(delta / 1000);
-                ts.tv_nsec = (long)((delta % 1000) * 1000000L);
-                timeout = &ts;
+                if (wait_ms < 0 || delta < wait_ms)
+                    wait_ms = delta;
             }
+        }
+
+        struct timespec  ts;
+        struct timespec* timeout = NULL;
+        if (wait_ms >= 0) {
+            ts.tv_sec  = (time_t)(wait_ms / 1000);
+            ts.tv_nsec = (long)((wait_ms % 1000) * 1000000L);
+            timeout = &ts;
         }
 
         int n = kevent((int)poll->fd, NULL, 0, events,
@@ -263,9 +278,15 @@ int64_t ray_poll_run(ray_poll_t* poll)
 
         if (poll->timers)
             ray_timers_fire_expired((ray_timers_t*)poll->timers);
+        if (bounded) break;
     }
 
-    return poll->code;
+    return poll->code >= 0 ? poll->code : 0;
+}
+
+int64_t ray_poll_run(ray_poll_t* poll)
+{
+    return ray_poll_run_for(poll, -1);
 }
 
 #endif /* __APPLE__ */

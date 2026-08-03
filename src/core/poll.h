@@ -107,6 +107,7 @@ void            ray_poll_destroy(ray_poll_t* poll);
 int64_t         ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg);
 void            ray_poll_deregister(ray_poll_t* poll, int64_t id);
 int64_t         ray_poll_run(ray_poll_t* poll);
+int64_t         ray_poll_run_for(ray_poll_t* poll, int timeout_ms);
 void            ray_poll_exit(ray_poll_t* poll, int64_t code);
 ray_selector_t* ray_poll_get(ray_poll_t* poll, int64_t id);
 
