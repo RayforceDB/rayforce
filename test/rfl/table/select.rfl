@@ -198,3 +198,53 @@
 (first (at aapl 'mx)) -- 151.0
 (first (at aapl 'mn)) -- 149.5
 (first (at aapl 'av)) -- 150.16666666666666
+
+;; ── grouped FIRST/LAST preserve boxed nested columns (issue #373)
+;; A LIST aggregate between scalar aggregates used to be omitted by the numeric
+;; emitter; positional renaming then shifted every later column left.
+(set nested-dicts (table [g nested c1 c2] (list [a a b] (list (dict (as 'i64 (list 0)) (as 'f64 (list 5))) (dict (as 'i64 (list 0 250000)) (as 'f64 (list 15 10))) (dict (as 'i64 (list 0)) (as 'f64 (list 7)))) (as 'i64 (list 1 2 3)) (as 'i64 (list 4 5 6)))))
+(set nested-dicts-last (select {n: (last nested) c1: (last c1) c2: (last c2) from: nested-dicts by: g}))
+(key nested-dicts-last) -- [g n c1 c2]
+(at nested-dicts-last 'c1) -- [2 3]
+(at nested-dicts-last 'c2) -- [5 6]
+(at (at (at nested-dicts-last 'n) 0) 0) -- 15.0
+(at (at (at nested-dicts-last 'n) 0) 250000) -- 10.0
+(at (at (at nested-dicts-last 'n) 1) 0) -- 7.0
+
+(set nested-dicts-first (select {n: (first nested) c1: (first c1) c2: (first c2) from: nested-dicts by: g}))
+(key nested-dicts-first) -- [g n c1 c2]
+(at nested-dicts-first 'c1) -- [1 3]
+(at nested-dicts-first 'c2) -- [4 6]
+(at (at (at nested-dicts-first 'n) 0) 0) -- 5.0
+(at (at (at nested-dicts-first 'n) 1) 0) -- 7.0
+
+;; The no-key aggregate emitter uses the same output-schema contract.
+(set nested-dicts-all (select {f: (first nested) l: (last nested) c: (last c1) from: nested-dicts}))
+(key nested-dicts-all) -- [f l c]
+(at (at (at nested-dicts-all 'f) 0) 0) -- 5.0
+(at (at (at nested-dicts-all 'l) 0) 0) -- 7.0
+(at nested-dicts-all 'c) -- [3]
+
+;; Vector-valued LIST cells use the same boxed row-gather path.  Multiple
+;; nested aggregates in one projection must retain independent child refs.
+(set nested-vecs (table [g nested tail] (list [a a b] (list [10 11] [20 21] [30 31]) (as 'i64 (list 1 2 3)))))
+(set nested-vecs-grouped (select {f: (first nested) l: (last nested) tail: (last tail) from: nested-vecs by: g}))
+(key nested-vecs-grouped) -- [g f l tail]
+(at (at nested-vecs-grouped 'f) 0) -- [10 11]
+(at (at nested-vecs-grouped 'l) 0) -- [20 21]
+(at (at nested-vecs-grouped 'f) 1) -- [30 31]
+(at (at nested-vecs-grouped 'l) 1) -- [30 31]
+(at nested-vecs-grouped 'tail) -- [2 3]
+
+;; Cross RAY_PARALLEL_THRESHOLD (65536 rows) with a sparse key range so the
+;; radix hash path also has to replace its temporary aggregate slot with the
+;; gathered LIST result.
+(set nested-radix (table [g nested tail] (list (* 100000 (% (til 70000) 2)) (take (list [10] [20] [30] [40]) 70000) (til 70000))))
+(set nested-radix-grouped (select {f: (first nested) l: (last nested) tail: (last tail) from: nested-radix by: g}))
+(key nested-radix-grouped) -- [g f l tail]
+(at nested-radix-grouped 'g) -- [0 100000]
+(at (at nested-radix-grouped 'f) 0) -- [10]
+(at (at nested-radix-grouped 'f) 1) -- [20]
+(at (at nested-radix-grouped 'l) 0) -- [30]
+(at (at nested-radix-grouped 'l) 1) -- [40]
+(at nested-radix-grouped 'tail) -- [69998 69999]
