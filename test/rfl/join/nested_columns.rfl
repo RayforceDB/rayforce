@@ -1,0 +1,58 @@
+;; Regression for #375: join gathers must preserve boxed LIST columns.
+;;
+;; LIST cells are owned ray_t* references, not fixed-width scalar cells.  Join
+;; output must retain each matched child and represent unmatched outer-join
+;; rows with a NULL list slot.  Copying raw pointers either drops the column or
+;; corrupts ownership; asof-join previously overwrote allocator metadata by
+;; treating the error returned by ray_vec_new(RAY_LIST, ...) as a vector.
+
+;; Equi-join fixture includes nested columns on both sides and one unmatched
+;; row per side so inner, left, full, and anti gather paths are all covered.
+(set EL (table ['k 'lv 'ls] (list [a c] [10 30] (list {x:1.0} {x:3.0}))))
+(set ER (table ['k 'rv 'rs] (list [a b] [50 60] (list {x:5.0} {x:6.0}))))
+
+(set IJ (inner-join ['k] EL ER))
+(cols IJ) -- [k lv ls rv rs]
+(count IJ) -- 1
+(at (at (at IJ 'ls) 0) 'x) -- 1.0
+(at (at (at IJ 'rs) 0) 'x) -- 5.0
+
+(set LJ (left-join ['k] EL ER))
+(cols LJ) -- [k lv ls rv rs]
+(count LJ) -- 2
+(at (at (at LJ 'ls) 1) 'x) -- 3.0
+(nil? (at (at LJ 'rs) 1)) -- true
+
+(set FJ (xasc (full-join ['k] EL ER) ['k]))
+(cols FJ) -- [k lv ls rv rs]
+(at FJ 'k) -- [a b c]
+(at (at (at FJ 'ls) 0) 'x) -- 1.0
+(nil? (at (at FJ 'ls) 1)) -- true
+(at (at (at FJ 'ls) 2) 'x) -- 3.0
+(at (at (at FJ 'rs) 0) 'x) -- 5.0
+(at (at (at FJ 'rs) 1) 'x) -- 6.0
+(nil? (at (at FJ 'rs) 2)) -- true
+
+(set AJ (anti-join ['k] EL ER))
+(cols AJ) -- [k lv ls]
+(at AJ 'k) -- [c]
+(at (at (at AJ 'ls) 0) 'x) -- 3.0
+
+;; Asof fixture exercises nested columns from both tables.  The final left row
+;; has no preceding right row for its equality group, covering the NULL slot.
+(set AL (table ['k 'd 'v 'ls] (list [a a c] [2024.01.02 2024.01.03 2024.01.03] [10 20 30] (list {x:1.0} {x:2.0} {x:3.0}))))
+(set AR (table ['k 'd 'rs] (list [a b] [2024.01.01 2024.01.01] (list {x:5.0} {x:6.0}))))
+(set AS (asof-join ['k 'd] AL AR))
+(cols AS) -- [k d v ls rs]
+(count AS) -- 3
+(at (at (at AS 'ls) 1) 'x) -- 2.0
+(at (at (at AS 'rs) 0) 'x) -- 5.0
+(at (at (at AS 'rs) 1) 'x) -- 5.0
+(nil? (at (at AS 'rs) 2)) -- true
+
+;; Repeated growing allocations reproduce the delayed free-list crash from the
+;; issue.  Successful row counts plus the sanitizer test build guard against
+;; allocator corruption after the joins are released.
+(set AB (as 'sym (list "a" "b")))
+(set MK (fn [n] (table ['k 'd] (list (take AB n) (+ 2025.01.01 (til n))))))
+(map (fn [n] (count (asof-join ['k 'd] (MK n) AR))) [1 2 4 8 16 32 64 128 256]) -- [1 2 4 8 16 32 64 128 256]
