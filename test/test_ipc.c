@@ -81,11 +81,8 @@ extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 #include <stdlib.h>
 #include <time.h>
 
-/* ---- Forward-declare runtime -------------------------------------------- */
+/* ---- Runtime test plumbing ---------------------------------------------- */
 
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
 /* ---- Setup / Teardown ---------------------------------------------------- */

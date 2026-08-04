@@ -56,11 +56,6 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-/* Forward-declare runtime lifecycle for total_ram test */
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
-
 #define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
 #define TMP_SPLAY_DIR "/tmp/rayforce_test_splay"
 

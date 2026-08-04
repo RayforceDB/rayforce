@@ -42,10 +42,6 @@
 #include <string.h>
 #include <stdio.h>
 
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
 /* Small epsilon for F64 comparisons. */

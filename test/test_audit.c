@@ -1293,6 +1293,64 @@ static test_result_t test_filter_reorder_correctness(void) {
     PASS();
 }
 
+static test_result_t test_public_runtime_api_not_redeclared(void) {
+    static const char* files[] = {
+        "fuzz/common.h",
+        "test/main.c",
+        "test/test_compile.c",
+        "test/test_datalog.c",
+        "test/test_embedding.c",
+        "test/test_format.c",
+        "test/test_fused_topk.c",
+        "test/test_ipc.c",
+        "test/test_journal.c",
+        "test/test_lang.c",
+        "test/test_link.c",
+        "test/test_public_api.c",
+        "test/test_repl.c",
+        "test/test_store.c",
+        "test/test_term.c",
+        "test/test_types.c",
+    };
+    static const char* forbidden[] = {
+        "struct ray_runtime_s" ";",
+        "typedef struct ray_runtime_s " "ray_runtime_t;",
+        "ray_runtime_create" "(int argc",
+        "ray_runtime_destroy" "(ray_runtime_t",
+    };
+
+    for (size_t fi = 0; fi < sizeof(files) / sizeof(files[0]); fi++) {
+        FILE* f = fopen(files[fi], "r");
+        if (!f) FAILF("cannot open %s", files[fi]);
+
+        int has_public_header = 0;
+        int bad_line = 0;
+        const char* bad_pattern = NULL;
+        char line[1024];
+        for (int line_no = 1; fgets(line, sizeof line, f); line_no++) {
+            if (strstr(line, "#include <rayforce.h>") ||
+                strstr(line, "#include \"rayforce.h\"")) {
+                has_public_header = 1;
+            }
+            for (size_t pi = 0; pi < sizeof(forbidden) / sizeof(forbidden[0]); pi++) {
+                if (strstr(line, forbidden[pi])) {
+                    bad_line = line_no;
+                    bad_pattern = forbidden[pi];
+                }
+            }
+        }
+        fclose(f);
+
+        TEST_ASSERT_FMT(has_public_header, "%s no longer includes rayforce.h", files[fi]);
+        if (bad_pattern) {
+            FAILF("%s:%d redeclares public runtime API pattern \"%s\"",
+                  files[fi], bad_line, bad_pattern);
+        }
+    }
+
+    PASS();
+}
+
 /* -----------------------------------------------------------------------
  * OP_WCO_JOIN selection audit findings
  * -----------------------------------------------------------------------
@@ -1498,10 +1556,9 @@ const test_entry_t audit_entries[] = {
     { "audit/join_empty_table", test_join_empty_table, NULL, NULL },
     { "audit/const_fold_div_zero", test_const_fold_div_zero, NULL, NULL },
     { "audit/const_fold_int_overflow", test_const_fold_int_overflow, NULL, NULL },
+    { "audit/public_runtime_api_not_redeclared", test_public_runtime_api_not_redeclared, NULL, NULL },
     { "audit/predicate_pushdown_group", test_predicate_pushdown_group, NULL, NULL },
     { "audit/dce_preserves_group_keys", test_dce_preserves_group_keys, NULL, NULL },
     { "audit/filter_reorder_correctness", test_filter_reorder_correctness, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
-

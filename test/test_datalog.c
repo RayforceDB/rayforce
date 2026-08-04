@@ -36,13 +36,7 @@
 #include <stdlib.h>        /* abort in datalog_rf_setup */
 #include <string.h>
 
-/* Forward-declare runtime API used by the full-runtime fixtures.
- * (Test target doesn't pull in core/runtime.h because it redefines
- * ray_vm_t, which clashes with lang/eval.h's definition — a pre-
- * existing duplication kept out of scope for this PR.) */
-typedef struct ray_runtime_s ray_runtime_t;
-ray_runtime_t* ray_runtime_create(int argc, char** argv);
-void           ray_runtime_destroy(ray_runtime_t* rt);
+/* Full-runtime fixtures use the public runtime API from <rayforce.h>. */
 
 static void datalog_setup(void) {
     ray_heap_init();
@@ -2542,5 +2536,4 @@ const test_entry_t datalog_entries[] = {
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
-
 
