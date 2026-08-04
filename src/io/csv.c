@@ -502,27 +502,52 @@ RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
     return civil_to_days(y, m, d);
 }
 
-/* TIME → int32_t milliseconds since midnight */
+/* TIME → int32_t milliseconds since midnight.
+ *
+ * RAY_TIME is a *signed* ms-of-day, and csv_write_time renders a negative
+ * or >=24h duration verbatim — a leading '-' plus an unbounded hour field
+ * (e.g. "-00:00:01", "25:00:00") rather than wrapping modulo a day.  Parse
+ * that same shape back so .csv.write -> .csv.read [TIME] round-trips: an
+ * optional sign, a variable-width hour field (NOT capped at 23), then MM:SS
+ * with an optional fractional part.  MM/SS stay at the fixed offsets after
+ * the hour field and the separator characters are not themselves validated,
+ * matching the historical lenient behaviour.  A magnitude that overflows
+ * int32 milliseconds is rejected as null. */
 RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
-    if (RAY_UNLIKELY(len < 8)) { *is_null = true; return 0; }
     *is_null = false;
-    int h  = (p[0]-'0')*10 + (p[1]-'0');
-    int mi = (p[3]-'0')*10 + (p[4]-'0');
-    int s  = (p[6]-'0')*10 + (p[7]-'0');
-    if (RAY_UNLIKELY(h > 23 || mi > 59 || s > 59)) { *is_null = true; return 0; }
-    int32_t ms = h * 3600000 + mi * 60000 + s * 1000;
+    size_t  o    = 0;
+    int64_t sign = 1;
+    if (len > 0 && p[0] == '-') { sign = -1; o = 1; }
+    /* Variable-width hour field: >=1 digit, capped so the int64 accumulator
+     * below cannot overflow before the range check. */
+    int64_t h  = 0;
+    size_t  hd = o;
+    while (hd < len && (unsigned)(p[hd] - '0') <= 9u) {
+        h = h * 10 + (p[hd] - '0');
+        if (RAY_UNLIKELY(++hd - o > 7)) { *is_null = true; return 0; }
+    }
+    size_t w = hd - o;                        /* hour digit count */
+    /* Need the hour field plus ":MM:SS" (6 more chars). */
+    if (RAY_UNLIKELY(w == 0 || o + w + 6 > len)) { *is_null = true; return 0; }
+    int mi = (p[o+w+1]-'0')*10 + (p[o+w+2]-'0');
+    int s  = (p[o+w+4]-'0')*10 + (p[o+w+5]-'0');
+    if (RAY_UNLIKELY(mi > 59 || s > 59)) { *is_null = true; return 0; }
+    int64_t ms = h * 3600000 + (int64_t)mi * 60000 + (int64_t)s * 1000;
     /* Fractional seconds → milliseconds */
-    if (len > 8 && p[8] == '.') {
+    size_t fi = o + w + 6;
+    if (fi < len && p[fi] == '.') {
         int frac = 0, digits = 0;
-        for (size_t i = 9; i < len && digits < 3; i++, digits++) {
+        for (size_t i = fi + 1; i < len && digits < 3; i++, digits++) {
             unsigned di = (unsigned char)p[i] - '0';
             if (di > 9) break;
             frac = frac * 10 + (int)di;
         }
         while (digits < 3) { frac *= 10; digits++; }
-        ms += (int32_t)frac;
+        ms += frac;
     }
-    return ms;
+    ms *= sign;
+    if (RAY_UNLIKELY(ms > INT32_MAX || ms < INT32_MIN)) { *is_null = true; return 0; }
+    return (int32_t)ms;
 }
 
 /* Timestamp time component → int64_t nanoseconds.
