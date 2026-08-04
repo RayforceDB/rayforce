@@ -47,10 +47,6 @@
 
 /* Tests run inside a runtime so the env is alive (link target lookup
  * needs that).  Use the same setup/teardown shape as test_lang.c. */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
 static void link_setup(void)    { ray_runtime_create(0, NULL); }

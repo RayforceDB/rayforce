@@ -34,10 +34,6 @@
 /* Most introspection helpers need a live heap/runtime so vectors and
  * atoms can be constructed via the public API. Match the test_link.c
  * pattern: bring up a runtime in setup, tear it down afterwards. */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
 static void public_api_setup(void)    { ray_runtime_create(0, NULL); }

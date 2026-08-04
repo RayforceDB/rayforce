@@ -50,16 +50,13 @@
 #include "ops/internal.h"
 #include "ops/idxop.h"
 
-/* Forward-declare runtime API — mirrors existing test_lang.c pattern. */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
+/* __RUNTIME is internal test plumbing; runtime API declarations come from
+ * <rayforce.h>. */
 extern ray_runtime_t* __RUNTIME;
 
 /* Runtime poll accessors (core/runtime.h) + poll lifecycle (core/poll.h),
- * forward-declared the same way to avoid the ray_vm_t clash between
- * core/runtime.h and lang/eval.h (included above). */
+ * forward-declared to avoid the ray_vm_t clash between core/runtime.h and
+ * lang/eval.h (included above). */
 struct ray_poll;
 typedef struct ray_poll ray_poll_t;
 extern ray_poll_t* ray_poll_create(void);
