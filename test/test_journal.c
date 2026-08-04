@@ -43,10 +43,6 @@
 
 /* ── Runtime fixture (same pattern as test_link.c) ─────────────────── */
 
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
 static void jrn_setup(void)    { ray_runtime_create(0, NULL); }

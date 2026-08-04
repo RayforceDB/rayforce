@@ -73,11 +73,8 @@
 #  include "core/poll.h"
 #endif
 
-/* Forward-declare runtime API — same pattern as test_lang.c. */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
+/* __RUNTIME is internal test plumbing; runtime API declarations come from
+ * <rayforce.h>. */
 extern ray_runtime_t* __RUNTIME;
 extern void           ray_runtime_set_poll(void* poll);
 extern void*          ray_runtime_get_poll(void);

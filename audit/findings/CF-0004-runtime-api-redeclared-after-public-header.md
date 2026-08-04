@@ -20,14 +20,14 @@ unit:
   - test/test_store.c
   - test/test_term.c
   - test/test_types.c
-status: reported
+status: fixed
 class: null
 members:
   - F-0006
 attempts: 0
 pass: P-01
 created-by: RP-0001
-updated: 2026-07-22
+updated: 2026-08-04
 ---
 
 ## Pattern
@@ -82,5 +82,22 @@ future runtime API redeclarations in files that include `rayforce.h`.
 
 ## Remediation
 
+Removed the redundant public runtime type and lifecycle declarations from all
+sixteen test/fuzz files in the census. The files now rely on `<rayforce.h>` for
+`ray_runtime_t`, `ray_runtime_create`, and `ray_runtime_destroy`, while keeping
+only the genuinely internal `__RUNTIME` extern where the test fixture needs it.
+
+Added `audit/public_runtime_api_not_redeclared` as a lightweight source guard
+over the same census so future edits fail the test suite if a file that includes
+`rayforce.h` reintroduces one of the public runtime API redeclarations.
+
 
 ## Verification
+
+Completed on 2026-08-04:
+
+- `git diff --check`
+- The recorded runtime redeclaration census returns no matches.
+- `./rayforce.test -f audit/public_runtime_api_not_redeclared` passed: 1 of 1
+  passed, 0 skipped, 0 failed.
+- `make test TEST_CORES=2` passed: 3657 of 3658 passed, 1 skipped, 0 failed.
