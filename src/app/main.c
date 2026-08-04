@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
             pw_len = sizeof(poll->auth_secret) - 1;
         memcpy(poll->auth_secret, auth_pw, pw_len);
         poll->auth_secret[pw_len] = '\0';
-        poll->restricted = auth_restricted;
+        ray_poll_set_restricted(poll, auth_restricted);
     }
 
     /* Open journal BEFORE the IPC listener accepts any connection.

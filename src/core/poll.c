@@ -31,6 +31,11 @@ void ray_poll_exit(ray_poll_t* poll, int64_t code)
     if (poll) poll->code = code;
 }
 
+void ray_poll_set_restricted(ray_poll_t* poll, bool restricted)
+{
+    if (poll) poll->restricted = restricted;
+}
+
 ray_selector_t* ray_poll_get(ray_poll_t* poll, int64_t id)
 {
     if (!poll || id < 0 || (uint32_t)id >= poll->n_sels)

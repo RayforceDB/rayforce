@@ -754,6 +754,65 @@ static test_result_t test_ipc_poll_based_listen(void) {
     PASS();
 }
 
+/* ---- test_ipc_poll_public_restricted ----------------------------------- */
+/*
+ * An embedder can make `.sys.listen` connections read-only without
+ * including the private poll definition.  Exercise the public setter and
+ * verify that the accepted connection evaluates in restricted mode,
+ * including inside compiled lambda bytecode.
+ */
+static test_result_t test_ipc_poll_public_restricted(void) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    ray_poll_set_restricted(NULL, true); /* documented no-op */
+    ray_poll_set_restricted(poll, true);
+
+    int64_t listener_id = ray_ipc_listen(poll, 0);
+    TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
+
+    ray_selector_t* listener_sel = ray_poll_get(poll, listener_id);
+    TEST_ASSERT_NOT_NULL(listener_sel);
+    uint16_t port = get_listen_port((ray_sock_t)listener_sel->fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    poll_thread_ctx_t pctx = { .poll = poll, .vm = srv_vm, .running = 1 };
+    ray_thread_t tid;
+    ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
+    sleep_ms(20);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "restricted poll client h >= 0");
+
+    ray_t* arithmetic = ray_str("(+ 3 4)", 7);
+    ray_t* allowed = ray_ipc_send(h, arithmetic);
+    ray_release(arithmetic);
+    TEST_ASSERT_NOT_NULL(allowed);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(allowed));
+    TEST_ASSERT_EQ_I(allowed->i64, 7);
+    ray_release(allowed);
+
+    const char* mutation =
+        "((fn [x] (set '__rf_issue_371_ipc_injected 1)) 0)";
+    ray_t* mutating = ray_str(mutation, strlen(mutation));
+    ray_t* denied = ray_ipc_send(h, mutating);
+    ray_release(mutating);
+    TEST_ASSERT_NOT_NULL(denied);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(denied));
+    TEST_ASSERT_STR_EQ(ray_err_code(denied), "access");
+    ray_release(denied);
+
+    ray_ipc_close(h);
+    poll_stop(poll, port);
+    ray_thread_join(tid);
+    ray_poll_destroy(poll);
+    ray_sys_free(srv_vm);
+    PASS();
+}
+
 /* ---- test_ipc_poll_auth_creds_path ------------------------------------- */
 /*
  * Poll-based auth happy path — exercises ipc_read_creds (lines 503-541) and
@@ -2072,6 +2131,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/send_invalid_handle",        test_ipc_send_invalid_handle,            ipc_setup, ipc_teardown },
     { "ipc/send_async_invalid_handle",  test_ipc_send_async_invalid_handle,      ipc_setup, ipc_teardown },
     { "ipc/poll_based_listen",          test_ipc_poll_based_listen,              ipc_setup, ipc_teardown },
+    { "ipc/poll_public_restricted",     test_ipc_poll_public_restricted,         ipc_setup, ipc_teardown },
     { "ipc/poll_auth_creds_path",        test_ipc_poll_auth_creds_path,           ipc_setup, ipc_teardown },
     { "ipc/poll_auth_reject",           test_ipc_poll_auth_reject,               ipc_setup, ipc_teardown },
     { "ipc/poll_handshake_version_mismatch", test_ipc_poll_handshake_version_mismatch, ipc_setup, ipc_teardown },
