@@ -57,6 +57,7 @@ static test_result_t test_public_ipc_client_symbols(void) {
 static test_result_t test_public_poll_symbols(void) {
     ray_poll_t* (*create_fn)(void) = ray_poll_create;
     void        (*destroy_fn)(ray_poll_t*) = ray_poll_destroy;
+    void        (*restricted_fn)(ray_poll_t*, bool) = ray_poll_set_restricted;
     int64_t     (*run_fn)(ray_poll_t*) = ray_poll_run;
     int64_t     (*run_for_fn)(ray_poll_t*, int) = ray_poll_run_for;
     void        (*exit_fn)(ray_poll_t*, int64_t) = ray_poll_exit;
@@ -65,6 +66,7 @@ static test_result_t test_public_poll_symbols(void) {
 
     TEST_ASSERT_NOT_NULL((void*)create_fn);
     TEST_ASSERT_NOT_NULL((void*)destroy_fn);
+    TEST_ASSERT_NOT_NULL((void*)restricted_fn);
     TEST_ASSERT_NOT_NULL((void*)run_fn);
     TEST_ASSERT_NOT_NULL((void*)run_for_fn);
     TEST_ASSERT_NOT_NULL((void*)exit_fn);
