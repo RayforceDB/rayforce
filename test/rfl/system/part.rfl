@@ -374,5 +374,24 @@
 (count (at Pac 'part)) -- 4
 (.sys.exec "rm -rf /tmp/rfl_part_atcol")
 
+;; ────────────── grouped FIRST/LAST on persisted nested columns (#373) ────────
+;; LIST columns loaded from a parted table contain boxed ray_t* cells.  Their
+;; aggregate result must be gathered as an owned child object; sending them
+;; through the fixed-width numeric emitter used to omit the column entirely
+;; and shift every following output name.
+(.sys.exec "rm -rf /tmp/rfl_part_nested")
+(set PN-A (table [g nested c1 c2] (list [a a b] (list (dict (as 'i64 (list 0)) (as 'f64 (list 5))) (dict (as 'i64 (list 0 250000)) (as 'f64 (list 15 10))) (dict (as 'i64 (list 0)) (as 'f64 (list 7)))) (as 'i64 (list 1 2 3)) (as 'i64 (list 4 5 6)))))
+(set PN-B (table [g nested c1 c2] (list [a b] (list (dict (as 'i64 (list 0)) (as 'f64 (list 20))) (dict (as 'i64 (list 0)) (as 'f64 (list 9)))) (as 'i64 (list 8 9)) (as 'i64 (list 10 11)))))
+(.db.splayed.set "/tmp/rfl_part_nested/2024.01.01/t/" PN-A)
+(.db.splayed.set "/tmp/rfl_part_nested/2024.01.02/t/" PN-B)
+(set Pnested (.db.parted.get "/tmp/rfl_part_nested/" 't))
+(set Rnested (select {n: (last nested) c1: (last c1) c2: (last c2) from: Pnested by: g}))
+(key Rnested) -- [g n c1 c2]
+(at Rnested 'c1) -- [8 9]
+(at Rnested 'c2) -- [10 11]
+(at (at (at Rnested 'n) 0) 0) -- 20.0
+(at (at (at Rnested 'n) 1) 0) -- 9.0
+(.sys.exec "rm -rf /tmp/rfl_part_nested")
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like /tmp/rfl_part_mc /tmp/rfl_part_mb")

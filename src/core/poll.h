@@ -104,6 +104,7 @@ struct ray_poll {
 
 ray_poll_t*     ray_poll_create(void);
 void            ray_poll_destroy(ray_poll_t* poll);
+void            ray_poll_set_restricted(ray_poll_t* poll, bool restricted);
 int64_t         ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg);
 void            ray_poll_deregister(ray_poll_t* poll, int64_t id);
 int64_t         ray_poll_run(ray_poll_t* poll);

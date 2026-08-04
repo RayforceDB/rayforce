@@ -687,6 +687,12 @@ typedef struct ray_poll ray_poll_t;
 ray_poll_t* ray_poll_create(void);
 void        ray_poll_destroy(ray_poll_t* poll);
 
+/* Mark IPC evaluations on connections subsequently created by poll as
+ * restricted (read-only). Existing connections keep their original mode.
+ * Call from the thread that owns poll before servicing the listener.
+ * A NULL poll is ignored. */
+void ray_poll_set_restricted(ray_poll_t* poll, bool restricted);
+
 /* Run until ray_poll_exit is called. */
 int64_t ray_poll_run(ray_poll_t* poll);
 

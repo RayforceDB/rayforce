@@ -145,7 +145,7 @@ static inline bool sym_lex_gt(struct ray_sym_domain_s* dom,
     return sym_lex_lt(dom, b, a);
 }
 
-/* ── Wide-element (STR/GUID) min/max/first/last ──────────────────────────
+/* ── Row-gathered min/max/first/last ─────────────────────────────────────
  * STR (a 16-byte ray_str_t: pool pointer + length) and GUID (16 raw bytes)
  * do not fit the 8-byte integer reduce accumulators, so the int64 fast paths
  * silently truncate them to a single byte.  These helpers instead track the
@@ -156,6 +156,20 @@ static inline bool sym_lex_gt(struct ray_sym_domain_s* dom,
  * scalar and DAG aggregation paths for wide element types. */
 static inline bool agg_is_wide_type(int8_t t) {
     return t == RAY_STR || t == RAY_GUID;
+}
+
+/* Aggregates whose result must be materialised by gathering the winning
+ * source row instead of packing the input into an 8-byte numeric accumulator.
+ *
+ * LIST columns are boxed ray_t* cells.  FIRST/LAST are well-defined for them,
+ * but the numeric emitters cannot construct a RAY_LIST with ray_vec_new (LIST
+ * is the special type tag 0) and must not reinterpret child pointers as i64.
+ * MIN/MAX remain limited to comparable STR/GUID elements. */
+static inline bool agg_needs_row_gather(int8_t t, uint16_t op) {
+    if (t == RAY_LIST)
+        return op == OP_FIRST || op == OP_LAST;
+    return agg_is_wide_type(t) &&
+           (op == OP_MIN || op == OP_MAX || op == OP_FIRST || op == OP_LAST);
 }
 
 /* Group key/agg output columns are filled by copying ray_str_t descriptors
@@ -185,14 +199,24 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     if (op == OP_FIRST) {
         for (int64_t i = 0; i < scan_n; i++) {
             int64_t row = sel ? sel[i] : i;
-            if (!has_nulls || !ray_vec_is_null(input, row)) return row;
+            if (input->type == RAY_LIST) {
+                ray_t* e = ((ray_t**)ray_data(input))[row];
+                if (e && !RAY_ATOM_IS_NULL(e)) return row;
+            } else if (!has_nulls || !ray_vec_is_null(input, row)) {
+                return row;
+            }
         }
         return -1;
     }
     if (op == OP_LAST) {
         for (int64_t i = scan_n - 1; i >= 0; i--) {
             int64_t row = sel ? sel[i] : i;
-            if (!has_nulls || !ray_vec_is_null(input, row)) return row;
+            if (input->type == RAY_LIST) {
+                ray_t* e = ((ray_t**)ray_data(input))[row];
+                if (e && !RAY_ATOM_IS_NULL(e)) return row;
+            } else if (!has_nulls || !ray_vec_is_null(input, row)) {
+                return row;
+            }
         }
         return -1;
     }
@@ -224,14 +248,21 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     }
     return best;
 }
-/* Whole-table (optionally selected) min/max/first/last over a wide column. */
+/* Whole-table (optionally selected) min/max/first/last over a row-gathered
+ * column, including boxed LIST cells. */
 static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
                               const int64_t* sel, int64_t scan_n,
                               bool has_nulls) {
     int64_t best = wide_winner_row(input, op, sel, scan_n, has_nulls);
-    if (best < 0) return ray_typed_null(-input->type);
+    if (best < 0)
+        return input->type == RAY_LIST
+            ? ray_typed_null(-RAY_I64)
+            : ray_typed_null(-input->type);
     int alloc;
-    return collection_elem(input, best, &alloc);
+    ray_t* result = collection_elem(input, best, &alloc);
+    /* collection_elem borrows boxed LIST cells; reductions return ownership. */
+    if (result && !alloc) ray_retain(result);
+    return result;
 }
 
 /* Integer reduction loop — reads native type T, accumulates as i64.
@@ -2521,12 +2552,13 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
 
 /* ─── ray_wide_minmax_per_group_buf ───────────────────────────────────────
  *
- * Per-group min/max/first/last for wide element types (STR/GUID) that don't
- * fit the 8-byte integer accumulators.  Same idx_buf/offsets/grp_cnt layout
- * as the median/topk kernels — produced by exec_group's group-contiguous row
- * gather — but instead of a numeric quickselect it finds the winning row per
- * group (lexicographic for STR, byte order for GUID; positional for
- * first/last) and materialises that element into a typed result column.
+ * Per-group min/max/first/last for elements that cannot flow through the
+ * 8-byte integer accumulators.  Same idx_buf/offsets/grp_cnt layout as the
+ * median/topk kernels — produced by exec_group's group-contiguous row gather
+ * — but instead of a numeric quickselect it finds the winning row per group
+ * (lexicographic for STR, byte order for GUID; positional for first/last) and
+ * materialises that element into a typed result column.  LIST elements retain
+ * the selected boxed child into a new owning list.
  *
  * Runs SERIAL: ray_str_vec_set COW-mutates the result vector and its shared
  * string pool, so concurrent group writers would corrupt the pool.  Wide
@@ -2537,17 +2569,28 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
                                      const int64_t* grp_cnt,
                                      int64_t n_groups) {
     if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
-    if (!agg_is_wide_type(src->type)) return NULL;  /* caller falls back */
+    if (!agg_needs_row_gather(src->type, op)) return NULL;  /* caller falls back */
     bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
 
-    ray_t* out = col_vec_new(src, n_groups);
+    ray_t* out = src->type == RAY_LIST
+        ? ray_list_new(n_groups)
+        : col_vec_new(src, n_groups);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-    out->len = n_groups;
+    /* LIST length advances with initialized child slots so every error path
+     * releases exactly the children whose ownership has been retained. */
+    out->len = src->type == RAY_LIST ? 0 : n_groups;
 
     for (int64_t g = 0; g < n_groups; g++) {
         int64_t cnt = grp_cnt[g];
         int64_t off = offsets[g];
         int64_t best = wide_winner_row(src, op, &idx_buf[off], cnt, has_nulls);
+        if (src->type == RAY_LIST) {
+            ray_t* e = best < 0 ? NULL : ((ray_t**)ray_data(src))[best];
+            if (e) ray_retain(e);
+            ((ray_t**)ray_data(out))[g] = e;
+            out->len = g + 1;
+            continue;
+        }
         if (best < 0) { ray_vec_set_null(out, g, true); continue; }
         int alloc;
         ray_t* e = collection_elem(src, best, &alloc);
@@ -2671,12 +2714,10 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         }
     }
 
-    /* Wide element types (STR/GUID) overflow the 8-byte reduce
-     * accumulators; resolve min/max/first/last by materialising the
+    /* Wide elements and boxed LIST cells cannot use the 8-byte reduce
+     * accumulators; resolve their supported operations by materialising the
      * winning row instead.  COUNT keeps the generic length-based path. */
-    if (agg_is_wide_type(in_type) &&
-        (op->opcode == OP_MIN || op->opcode == OP_MAX ||
-         op->opcode == OP_FIRST || op->opcode == OP_LAST)) {
+    if (agg_needs_row_gather(in_type, op->opcode)) {
         ray_t* r = agg_wide_reduce(input, op->opcode, sel_idx, scan_n, has_nulls);
         if (sel_idx_block) ray_release(sel_idx_block);
         return r;
@@ -2974,14 +3015,12 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
          * packed into entries or HT rows.  A post-radix pass over
          * row_gid+grp_cnt gathers per-group slices and runs the matching
          * per-group kernel. */
-        /* Wide-element (STR/GUID) min/max/first/last also reserve no
-         * row-layout slot: the 8-byte accumulators can't hold a 16-byte
-         * GUID or a pooled string, so they are resolved by the same
+        /* Wide-element STR/GUID aggregates and boxed LIST first/last also
+         * reserve no row-layout slot: the 8-byte accumulators cannot hold
+         * their cells, so they are resolved by the same
          * post-radix per-group pass via ray_wide_minmax_per_group_buf. */
         bool wide_mm = agg_ops && agg_vecs[a] &&
-                       agg_is_wide_type(agg_vecs[a]->type) &&
-                       (agg_ops[a] == OP_MIN  || agg_ops[a] == OP_MAX ||
-                        agg_ops[a] == OP_FIRST || agg_ops[a] == OP_LAST);
+                       agg_needs_row_gather(agg_vecs[a]->type, agg_ops[a]);
         bool holistic = agg_ops && (agg_ops[a] == OP_MEDIAN ||
                                     agg_ops[a] == OP_QUANTILE ||
                                     agg_ops[a] == OP_MODE ||
@@ -5200,7 +5239,12 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 out_type = is_f64 ? RAY_F64
                                    : (agg_col ? agg_col->type : RAY_I64); break;
         }
-        ray_t* new_col = ray_vec_new(out_type, (int64_t)grp_count);
+        /* LIST is the boxed collection tag (0), not a ray_vec_new element
+         * type.  The scalar no-key path fills this placeholder below via the
+         * row-gather override; keyed LIST aggregates never reach this emitter. */
+        ray_t* new_col = out_type == RAY_LIST
+            ? ray_list_new((int64_t)grp_count)
+            : ray_vec_new(out_type, (int64_t)grp_count);
         if (!new_col || RAY_IS_ERR(new_col)) continue;
         /* SYM MIN/MAX/FIRST/LAST: the emitted values are RAW cell ids
          * accumulated from ONE source column — the output resolves over
@@ -5208,7 +5252,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
         if (out_type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_col, sym_domain_rep(agg_col));
         new_col->len = (int64_t)grp_count;
-        for (uint32_t gi = 0; gi < grp_count; gi++) {
+        for (uint32_t gi = 0; out_type != RAY_LIST && gi < grp_count; gi++) {
             size_t idx = (size_t)gi * n_aggs + a;
             /* nn_counts[idx] == 0 means the group is all-null for this
              * agg column — null-aware operators (MIN/MAX/PROD/FIRST/LAST/
@@ -9534,15 +9578,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                          m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count,
                          NULL, NULL, NULL);
 
-        /* Wide-element (STR/GUID) min/max/first/last overflow emit_agg_columns'
-         * fixed-width slots (it truncated them to 1 byte above).  Recompute
-         * those 1-row columns by materialising the winning row — mirroring
+        /* Row-gathered min/max/first/last cannot be represented in
+         * emit_agg_columns' fixed-width accumulator slots.  Recompute those
+         * 1-row columns by materialising the winning row — mirroring
          * exec_reduction — and override them in the result table. */
         for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t aop = ext->agg_ops[a];
-            if (!(agg_vecs[a] && agg_is_wide_type(agg_vecs[a]->type) &&
-                  (aop == OP_MIN || aop == OP_MAX ||
-                   aop == OP_FIRST || aop == OP_LAST)))
+            if (!(agg_vecs[a] &&
+                  agg_needs_row_gather(agg_vecs[a]->type, aop)))
                 continue;
             ray_t* wsel_blk = NULL; const int64_t* wsel = NULL; int64_t wscan = nrows;
             if (g->selection) {
@@ -9556,11 +9599,18 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             bool hn = (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) != 0;
             ray_t* atom = agg_wide_reduce(agg_vecs[a], aop, wsel, wscan, hn);
             if (wsel_blk) ray_release(wsel_blk);
-            ray_t* col = col_vec_new(agg_vecs[a], 1);
+            ray_t* col = agg_vecs[a]->type == RAY_LIST
+                ? ray_list_new(1)
+                : col_vec_new(agg_vecs[a], 1);
             if (col && !RAY_IS_ERR(col)) {
                 col->len = 1;
                 if (RAY_ATOM_IS_NULL(atom)) {
                     ray_vec_set_null(col, 0, true);
+                } else if (agg_vecs[a]->type == RAY_LIST) {
+                    /* agg_wide_reduce returned an owned child reference;
+                     * transfer it directly into the owning output list. */
+                    ((ray_t**)ray_data(col))[0] = atom;
+                    atom = NULL;
                 } else if (agg_vecs[a]->type == RAY_STR) {
                     ray_t* nv = ray_str_vec_set(col, 0, ray_str_ptr(atom), ray_str_len(atom));
                     if (nv && !RAY_IS_ERR(nv)) col = nv;
@@ -9570,7 +9620,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 ray_table_set_col_idx(result, a, col);
                 ray_release(col);
             }
-            ray_release(atom);
+            if (atom) ray_release(atom);
         }
 
         /* Whole-table holistic aggregates have no n_keys==0 accumulator, so emit_agg_columns
@@ -9690,11 +9740,10 @@ da_path:;
             if (aop == OP_MODE)         da_eligible = false;
             if (aop == OP_TOP_N)        da_eligible = false;
             if (aop == OP_BOT_N)        da_eligible = false;
-            /* Wide-element (STR/GUID) min/max/first/last need the holistic
-             * post-fill; the DA emit (emit_agg_columns) would truncate them. */
-            if (agg_vecs[a] && agg_is_wide_type(agg_vecs[a]->type) &&
-                (aop == OP_MIN || aop == OP_MAX ||
-                 aop == OP_FIRST || aop == OP_LAST))
+            /* Row-gathered aggregates need the holistic post-fill; the DA
+             * emitter cannot represent their source cells. */
+            if (agg_vecs[a] &&
+                agg_needs_row_gather(agg_vecs[a]->type, aop))
                 da_eligible = false;
         }
         for (uint32_t k = 0; k < n_keys && da_eligible; k++) {
@@ -11645,7 +11694,9 @@ v2_emit:;
                     out_type = is_f64 ? RAY_F64
                                       : (agg_col ? agg_col->type : RAY_I64); break;
             }
-            ray_t* new_col = ray_vec_new(out_type, (int64_t)total_grps);
+            ray_t* new_col = out_type == RAY_LIST
+                ? ray_list_new((int64_t)total_grps)
+                : ray_vec_new(out_type, (int64_t)total_grps);
             if (!new_col || RAY_IS_ERR(new_col)) {
                 agg_cols[a] = NULL;
                 memset(&agg_outs[a], 0, sizeof(agg_outs[a]));
@@ -12276,9 +12327,9 @@ sequential_fallback:;
                                   : (agg_col ? agg_col->type : RAY_I64); break;
         }
         ray_t* new_col;
-        /* Drive off the layout bitmask, not the op literal: wide-element
-         * (STR/GUID) min/max/first/last are holistic too and their column
-         * lives in med_out[a], not the truncating row-layout read below. */
+        /* Drive off the layout bitmask, not the op literal: row-gathered
+         * STR/GUID/LIST aggregates are holistic too and their column lives
+         * in med_out[a], not the truncating row-layout read below. */
         bool is_holistic = (ly->agg_flags[a] & GHT_AF_HOLISTIC) != 0;
         if (is_holistic && med_out && med_out[a]
             && !RAY_IS_ERR(med_out[a])) {
