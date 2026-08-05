@@ -519,3 +519,27 @@
 (count (as 'U8 (til 100000))) -- 100000
 ;; f64 -> i64
 (sum (as 'I64 (as 'F64 (til 100000)))) -- 4999950000
+
+;; ========== OUT-OF-RANGE / NaN SCALAR FLOAT CASTS ==========
+;; A scalar float cast must clamp (and null a NaN) exactly like the vector
+;; cast path.  The scalar path previously did a raw (intN_t)val->f64, which
+;; is signed-overflow undefined behavior for an out-of-range magnitude
+;; (UBSan: "outside the range of representable values of type 'long long'").
+;; Clamp targets: INT64_MAX / INT64_MIN+1, etc. — matching the helpers used
+;; by the vector path.
+(as 'I64 9.3e18) -- 9223372036854775807
+(as 'I64 -9.9e18) -- -9223372036854775807
+(as 'I32 5e9) -- 2147483647
+(as 'I32 -5e9) -- -2147483647
+(as 'I16 70000.0) -- 32767h
+(as 'U8 300.0) -- 0xff
+(as 'U8 -5.0) -- 0x00
+;; Scalar result must equal the one-element vector result.
+(as 'I64 9.3e18) -- (at (as 'I64 [9.3e18]) 0)
+(as 'I32 5e9) -- (at (as 'I32 [5e9]) 0)
+(as 'I16 70000.0) -- (at (as 'I16 [70000.0]) 0)
+;; NaN float → typed null, like the vector path (was UB before).
+(set NaNf (sqrt -1.0))
+(nil? (as 'I64 NaNf)) -- true
+(nil? (as 'I32 NaNf)) -- true
+(nil? (as 'I16 NaNf)) -- true
