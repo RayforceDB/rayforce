@@ -34,10 +34,6 @@
 /* Most introspection helpers need a live heap/runtime so vectors and
  * atoms can be constructed via the public API. Match the test_link.c
  * pattern: bring up a runtime in setup, tear it down afterwards. */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
 static void public_api_setup(void)    { ray_runtime_create(0, NULL); }
@@ -55,6 +51,27 @@ static test_result_t test_public_ipc_client_symbols(void) {
     TEST_ASSERT_NOT_NULL((void*)send_fn);
     TEST_ASSERT_NOT_NULL((void*)async_fn);
     TEST_ASSERT_NOT_NULL((void*)verbose_fn);
+    PASS();
+}
+
+static test_result_t test_public_poll_symbols(void) {
+    ray_poll_t* (*create_fn)(void) = ray_poll_create;
+    void        (*destroy_fn)(ray_poll_t*) = ray_poll_destroy;
+    void        (*restricted_fn)(ray_poll_t*, bool) = ray_poll_set_restricted;
+    int64_t     (*run_fn)(ray_poll_t*) = ray_poll_run;
+    int64_t     (*run_for_fn)(ray_poll_t*, int) = ray_poll_run_for;
+    void        (*exit_fn)(ray_poll_t*, int64_t) = ray_poll_exit;
+    void        (*set_fn)(void*) = ray_runtime_set_poll;
+    void*       (*get_fn)(void) = ray_runtime_get_poll;
+
+    TEST_ASSERT_NOT_NULL((void*)create_fn);
+    TEST_ASSERT_NOT_NULL((void*)destroy_fn);
+    TEST_ASSERT_NOT_NULL((void*)restricted_fn);
+    TEST_ASSERT_NOT_NULL((void*)run_fn);
+    TEST_ASSERT_NOT_NULL((void*)run_for_fn);
+    TEST_ASSERT_NOT_NULL((void*)exit_fn);
+    TEST_ASSERT_NOT_NULL((void*)set_fn);
+    TEST_ASSERT_NOT_NULL((void*)get_fn);
     PASS();
 }
 
@@ -661,6 +678,7 @@ static test_result_t test_public_nullability_matrix(void) {
 
 const test_entry_t public_api_entries[] = {
     { "public/ipc_client_symbols",        test_public_ipc_client_symbols,        NULL, NULL },
+    { "public/poll_symbols",              test_public_poll_symbols,              NULL, NULL },
     { "public/query_and_format_symbols",  test_public_query_and_format_symbols,  NULL, NULL },
 
     { "public/obj_type_atom_i64",   test_public_obj_type_atom_i64,   public_api_setup, public_api_teardown },

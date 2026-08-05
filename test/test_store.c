@@ -56,11 +56,6 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-/* Forward-declare runtime lifecycle for total_ram test */
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
-
 #define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
 #define TMP_SPLAY_DIR "/tmp/rayforce_test_splay"
 
@@ -504,6 +499,114 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     ray_release(tbl);
     ray_release(tbl2);
 
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    PASS();
+}
+
+/* ---- test_splay_dict_column_roundtrip --------------------------------- */
+static test_result_t test_splay_dict_column_roundtrip(void) {
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+
+    int64_t ids_raw[] = {1, 2};
+    ray_t* ids = ray_vec_from_raw(RAY_I64, ids_raw, 2);
+    ray_t* sched = ray_list_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ids));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sched));
+
+    int64_t k0_raw[] = {0};
+    double v0_raw[] = {5.0};
+    int64_t k1_raw[] = {0, 250000};
+    double v1_raw[] = {15.0, 10.0};
+    ray_t* d0 = ray_dict_new(ray_vec_from_raw(RAY_I64, k0_raw, 1),
+                             ray_vec_from_raw(RAY_F64, v0_raw, 1));
+    ray_t* d1 = ray_dict_new(ray_vec_from_raw(RAY_I64, k1_raw, 2),
+                             ray_vec_from_raw(RAY_F64, v1_raw, 2));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d0));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d1));
+    sched = ray_list_append(sched, d0);
+    sched = ray_list_append(sched, d1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sched));
+    ray_release(d0);
+    ray_release(d1);
+
+    ray_t* tbl = ray_table_new(2);
+    int64_t id_id = ray_sym_intern("id", 2);
+    int64_t sched_id = ray_sym_intern("sched", 5);
+    tbl = ray_table_add_col(tbl, id_id, ids);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, sched_id, sched);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, TMP_SPLAY_DIR, NULL), RAY_OK);
+    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* loaded_sched = ray_table_get_col(loaded, sched_id);
+    TEST_ASSERT_NOT_NULL(loaded_sched);
+    TEST_ASSERT_EQ_I(loaded_sched->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded_sched->len, 2);
+
+    ray_t* ld0 = ray_list_get(loaded_sched, 0);
+    ray_t* ld1 = ray_list_get(loaded_sched, 1);
+    TEST_ASSERT_EQ_I(ld0->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(ld1->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(ray_dict_keys(ld0)->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_dict_vals(ld1)->type, RAY_F64);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_dict_keys(ld1)))[1], 250000);
+    TEST_ASSERT(((double*)ray_data(ray_dict_vals(ld1)))[1] == 10.0,
+                "dict value roundtrip");
+
+    ray_release(loaded);
+    ray_release(tbl);
+    ray_release(ids);
+    ray_release(sched);
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    PASS();
+}
+
+/* A deterministic unsupported column must be rejected before an earlier
+ * column can replace the committed generation. */
+static test_result_t test_splay_save_preflight_preserves_generation(void) {
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    int64_t k_id = ray_sym_intern("k", 1);
+    int64_t v_id = ray_sym_intern("v", 1);
+
+    int64_t old_k_raw[] = {1, 2};
+    int64_t old_v_raw[] = {3, 4};
+    ray_t* old_k = ray_vec_from_raw(RAY_I64, old_k_raw, 2);
+    ray_t* old_v = ray_vec_from_raw(RAY_I64, old_v_raw, 2);
+    ray_t* good = ray_table_new(2);
+    good = ray_table_add_col(good, k_id, old_k);
+    good = ray_table_add_col(good, v_id, old_v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(good));
+    TEST_ASSERT_EQ_I(ray_splay_save(good, TMP_SPLAY_DIR, NULL), RAY_OK);
+
+    int64_t new_k_raw[] = {9, 10};
+    int64_t dk_raw[] = {1, 2};
+    int64_t dv_raw[] = {11, 12};
+    ray_t* new_k = ray_vec_from_raw(RAY_I64, new_k_raw, 2);
+    ray_t* unsupported = ray_dict_new(ray_vec_from_raw(RAY_I64, dk_raw, 2),
+                                      ray_vec_from_raw(RAY_I64, dv_raw, 2));
+    ray_t* bad = ray_table_new(2);
+    bad = ray_table_add_col(bad, k_id, new_k);
+    bad = ray_table_add_col(bad, v_id, unsupported);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    TEST_ASSERT_EQ_I(ray_splay_save(bad, TMP_SPLAY_DIR, NULL), RAY_ERR_NYI);
+
+    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* loaded_k = ray_table_get_col(loaded, k_id);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_k))[0], 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_k))[1], 2);
+
+    ray_release(loaded);
+    ray_release(bad);
+    ray_release(unsupported);
+    ray_release(new_k);
+    ray_release(good);
+    ray_release(old_v);
+    ray_release(old_k);
     (void)!system("rm -rf " TMP_SPLAY_DIR);
     PASS();
 }
@@ -3619,6 +3722,28 @@ static test_result_t test_ipc_restricted(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
     ray_release(r4);
 
+    /* Entering compiled lambda bytecode must preserve the connection's
+     * restricted context.  These are the request-level escapes from #363. */
+    const char* q_lambda =
+        "((fn [x] (.sys.exec \"true\")) 0)";
+    ray_t* msg5 = ray_str(q_lambda, strlen(q_lambda));
+    ray_t* r5 = ray_ipc_send(h, msg5);
+    ray_release(msg5);
+    TEST_ASSERT_NOT_NULL(r5);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r5));
+    TEST_ASSERT_STR_EQ(ray_err_code(r5), "access");
+    ray_release(r5);
+
+    const char* q_lambda_set =
+        "((fn [x] (set '__rf_issue_363_ipc_injected 1)) 0)";
+    ray_t* msg6 = ray_str(q_lambda_set, strlen(q_lambda_set));
+    ray_t* r6 = ray_ipc_send(h, msg6);
+    ray_release(msg6);
+    TEST_ASSERT_NOT_NULL(r6);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r6));
+    TEST_ASSERT_STR_EQ(ray_err_code(r6), "access");
+    ray_release(r6);
+
     ray_ipc_close(h);
     srv.running = false;
     ray_thread_join(tid);
@@ -4954,6 +5079,8 @@ const test_entry_t store_entries[] = {
     { "store/splay_open_roundtrip", test_splay_open_roundtrip, store_setup, store_teardown },
     { "store/splay_str_column_roundtrip", test_splay_str_column_roundtrip, store_setup, store_teardown },
     { "store/splay_short_strv_roundtrip", test_splay_short_strv_roundtrip, store_setup, store_teardown },
+    { "store/splay_dict_column_roundtrip", test_splay_dict_column_roundtrip, store_setup, store_teardown },
+    { "store/splay_save_preflight", test_splay_save_preflight_preserves_generation, store_setup, store_teardown },
     { "store/parted_nrows", test_parted_nrows, store_setup, store_teardown },
     { "store/table_nrows_parted", test_table_nrows_parted, store_setup, store_teardown },
     { "store/parted_release", test_parted_release, store_setup, store_teardown },

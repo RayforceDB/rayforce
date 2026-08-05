@@ -31,17 +31,20 @@
 #include "core/pool.h"
 #include "core/poll.h"
 #include "core/platform.h"
+#include "core/timer.h"
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdatomic.h>
 #include <string.h>
 #include <math.h>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #include <sys/socket.h>
 #include <time.h>
+#endif
 
+#if defined(__linux__)
 static void epoll_sleep_ms(long ms) {
     struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
@@ -995,6 +998,82 @@ static test_result_t test_dispatch_n_exact_cap(void) {
 }
 
 /* ==========================================================================
+ * Bounded poll-step tests
+ * ========================================================================== */
+
+#if defined(__linux__) || defined(__APPLE__)
+
+typedef struct {
+    int calls;
+} poll_run_for_ctx_t;
+
+static int64_t poll_run_for_recv(int64_t fd, uint8_t* buf, int64_t len) {
+    return (int64_t)read((int)fd, buf, (size_t)len);
+}
+
+static ray_t* poll_run_for_read(ray_poll_t* poll, ray_selector_t* sel) {
+    poll_run_for_ctx_t* ctx = (poll_run_for_ctx_t*)sel->data;
+    ctx->calls++;
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+}
+
+static test_result_t test_poll_run_for_zero_drains_ready_event(void) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int pfd[2];
+    TEST_ASSERT_EQ_I(pipe(pfd), 0);
+
+    poll_run_for_ctx_t ctx = {0};
+    ray_poll_reg_t reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.fd      = pfd[0];
+    reg.type    = RAY_SEL_SOCKET;
+    reg.data    = &ctx;
+    reg.recv_fn = poll_run_for_recv;
+    reg.read_fn = poll_run_for_read;
+
+    int64_t id = ray_poll_register(poll, &reg);
+    TEST_ASSERT_TRUE(id >= 0);
+    ray_selector_t* sel = ray_poll_get(poll, id);
+    TEST_ASSERT_NOT_NULL(sel);
+    ray_poll_rx_request(poll, sel, 1);
+
+    TEST_ASSERT_EQ_I(write(pfd[1], "x", 1), 1);
+    TEST_ASSERT_EQ_I(ray_poll_run_for(poll, 0), 0);
+    TEST_ASSERT_EQ_I(ctx.calls, 1);
+
+    close(pfd[0]);
+    close(pfd[1]);
+    ray_poll_destroy(poll);
+    PASS();
+}
+
+static test_result_t test_poll_run_for_positive_timeout(void) {
+    TEST_ASSERT_EQ_I(ray_poll_run_for(NULL, 10), -1);
+
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int64_t before = ray_time_now_ms();
+    TEST_ASSERT_EQ_I(ray_poll_run_for(poll, 25), 0);
+    int64_t elapsed = ray_time_now_ms() - before;
+
+    TEST_ASSERT_FMT(elapsed >= 15,
+                    "bounded poll returned too early (%lld ms)",
+                    (long long)elapsed);
+    TEST_ASSERT_FMT(elapsed < 500,
+                    "bounded poll exceeded its budget (%lld ms)",
+                    (long long)elapsed);
+
+    ray_poll_destroy(poll);
+    PASS();
+}
+
+#endif
+
+/* ==========================================================================
  * epoll.c region-coverage tests
  *
  * These tests are Linux-only and exercise paths in src/core/epoll.c that
@@ -1258,6 +1337,10 @@ const test_entry_t pool_entries[] = {
     { "pool/destroy_when_uninit",   test_destroy_when_uninit,   NULL, NULL },
     { "pool/dispatch_n_multi_grow", test_dispatch_n_multi_grow, NULL, NULL },
     { "pool/dispatch_n_exact_cap",  test_dispatch_n_exact_cap,  NULL, NULL },
+#if defined(__linux__) || defined(__APPLE__)
+    { "pool/poll_run_for_zero_drains_ready_event", test_poll_run_for_zero_drains_ready_event, NULL, NULL },
+    { "pool/poll_run_for_positive_timeout", test_poll_run_for_positive_timeout, NULL, NULL },
+#endif
 #if defined(__linux__)
     { "pool/epoll_sel_cap_growth",  test_epoll_sel_cap_growth,  NULL, NULL },
     { "pool/epoll_hup_branch",      test_epoll_hup_branch,      NULL, NULL },
@@ -1265,4 +1348,3 @@ const test_entry_t pool_entries[] = {
 #endif
     { NULL, NULL, NULL, NULL },
 };
-

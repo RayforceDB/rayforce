@@ -28,11 +28,8 @@
 #include "lang/env.h"
 #include "ops/ops.h"
 
-/* Forward-declare runtime API (ray_fn_name test needs builtins registered). */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
+/* __RUNTIME is internal test plumbing; runtime API declarations come from
+ * <rayforce.h>. */
 extern ray_runtime_t* __RUNTIME;
 
 static void types_runtime_setup(void) {
@@ -184,5 +181,4 @@ const test_entry_t types_entries[] = {
     { "types/fn_name_builtin", test_fn_name_builtin, types_runtime_setup, types_runtime_teardown },
     { NULL, NULL, NULL, NULL },
 };
-
 

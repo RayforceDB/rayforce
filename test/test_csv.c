@@ -1114,13 +1114,14 @@ static test_result_t test_csv_roundtrip_date_time_ts(void) {
     int32_t* d2 = (int32_t*)ray_data(dc);
     for (int i = 0; i < 3; i++) TEST_ASSERT_EQ_I(d2[i], dates[i]);
 
-    /* Positive TIME values must round-trip exactly. Negative time is
-     * written as "-HH:MM:SS" by csv_write_time, but fast_time only
-     * accepts unsigned HH:MM:SS, so the negative cell parses as null.
-     * This is a known source limitation (no src/ changes allowed). */
+    /* All TIME values must round-trip exactly, including negative durations:
+     * csv_write_time renders a signed ms-of-day as "-HH:MM:SS" / "HH:MM:SS"
+     * with an unbounded hour field, and fast_time now parses that same shape
+     * back (previously the signed cell was a known limitation, read as null). */
     int32_t* t2 = (int32_t*)ray_data(tc);
     TEST_ASSERT_EQ_I(t2[0], times[0]);
-    TEST_ASSERT_TRUE(ray_vec_is_null(tc, 1));   /* negative time → null on read-back */
+    TEST_ASSERT_FALSE(ray_vec_is_null(tc, 1));  /* negative time now round-trips */
+    TEST_ASSERT_EQ_I(t2[1], times[1]);
     TEST_ASSERT_EQ_I(t2[2], times[2]);
 
     ray_release(loaded);

@@ -21,6 +21,16 @@
 (at R-Small 'a) -- (at T-Small 'a)
 (at R-Small 'b) -- (at T-Small 'b)
 
+;; ────────────── duplicate persisted names are rejected ──────────────
+;; Splayed stores one file per column name.  A table with duplicate column
+;; names used to write both columns to the same path, so the later column
+;; overwrote the earlier one and reload duplicated the later data.
+(.sys.exec "rm -rf /tmp/rfl_splayed_dup")
+(set J-L (table [sym qty px] (list ['A 'B] [10 20] [1.0 2.0])))
+(set J-R (table [sym qty venue] (list ['A 'C] [100 300] ['X 'Z])))
+(.db.splayed.set "/tmp/rfl_splayed_dup/join/" (full-join [sym] J-L J-R)) !- domain
+(.db.splayed.set "/tmp/rfl_splayed_dup/csv/" (table [a a] (list [1 2] [10 20]))) !- domain
+
 ;; ────────────── morsel-boundary table (1024 rows) ──────────────
 (set T-1024 (table [n] (list (til 1024))))
 (.db.splayed.set "/tmp/rfl_splayed_1024/" T-1024)

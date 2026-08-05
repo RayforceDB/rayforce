@@ -11238,6 +11238,43 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
     }
 }
 
+/* Build a fresh boxed LIST column.  A table payload supplies a LIST column
+ * whose slots are rows and is therefore spliced; positional LIST/DICT rows
+ * append their value as one boxed cell.  Every copied pointer gets its own
+ * retain so source tables and returned snapshots remain independently owned. */
+static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
+                                     bool splice_payload) {
+    if (!orig_col || RAY_IS_ERR(orig_col) || orig_col->type != RAY_LIST)
+        return ray_error("type", "insert: boxed column source must be LIST");
+    if (splice_payload &&
+        (!payload || RAY_IS_ERR(payload) || payload->type != RAY_LIST))
+        return ray_error("type", "insert: table payload for a LIST column must be LIST");
+
+    int64_t tail = splice_payload ? payload->len : 1;
+    if (tail < 0 || orig_col->len > INT64_MAX - tail)
+        return ray_error("oom", NULL);
+    ray_t* out = ray_list_new(orig_col->len + tail);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t** dst = (ray_t**)ray_data(out);
+    ray_t** src = (ray_t**)ray_data(orig_col);
+    for (int64_t r = 0; r < orig_col->len; r++) {
+        dst[r] = src[r];
+        if (dst[r]) ray_retain(dst[r]);
+    }
+    if (splice_payload) {
+        ray_t** cells = (ray_t**)ray_data(payload);
+        for (int64_t r = 0; r < tail; r++) {
+            dst[orig_col->len + r] = cells[r];
+            if (cells[r]) ray_retain(cells[r]);
+        }
+    } else {
+        dst[orig_col->len] = payload;
+        if (payload) ray_retain(payload);
+    }
+    out->len = orig_col->len + tail;
+    return out;
+}
+
 /* (update {col: expr ... from: t [where: pred]})
  * Special form — receives unevaluated dict arg.
  * For rows matching where (or all if no where), evaluate column expressions
@@ -12192,7 +12229,9 @@ static int parted_key_atom_cmp(ray_t* key, ray_t* keys, int64_t cell,
 }
 
 static bool parted_segment_attrs_valid(int8_t base, uint8_t attrs) {
-    uint8_t allowed = RAY_ATTR_HAS_INDEX | RAY_ATTR_SORTED;
+    uint8_t allowed = base == RAY_LIST
+                    ? 0
+                    : (RAY_ATTR_HAS_INDEX | RAY_ATTR_SORTED);
     if (base == RAY_SYM) allowed |= RAY_SYM_W_MASK;
     if (base == RAY_I32 || base == RAY_I64)
         allowed |= RAY_ATTR_HAS_LINK;
@@ -12291,7 +12330,7 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
             wrapper->len != nparts || wrapper->attrs != 0)
             return ray_error("corrupt", "insert: physical column %lld is not a canonical PARTED wrapper", (long long)(c - 1));
         int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
-        if (base < RAY_BOOL || base > RAY_STR)
+        if (base != RAY_LIST && (base < RAY_BOOL || base > RAY_STR))
             return ray_error("type", "insert: unsupported parted base type in physical column %lld", (long long)(c - 1));
 
         ray_t** segs = (ray_t**)ray_data(wrapper);
@@ -12408,7 +12447,22 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
         }
         ray_t** items = (ray_t**)ray_data(rows);
         for (int64_t c = 0; c < v->ndata; c++) {
-            vals = parted_values_append(vals, items[c], false);
+            ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
+            if (RAY_PARTED_BASETYPE(wrapper->type) == RAY_LIST) {
+                ray_t* one = ray_list_new(1);
+                if (!one || RAY_IS_ERR(one)) {
+                    ray_release(vals);
+                    return one ? one : ray_error("oom", NULL);
+                }
+                one = ray_list_append(one, items[c]);
+                if (!one || RAY_IS_ERR(one)) {
+                    ray_release(vals);
+                    return one ? one : ray_error("oom", NULL);
+                }
+                vals = parted_values_append(vals, one, true);
+            } else {
+                vals = parted_values_append(vals, items[c], false);
+            }
             if (!vals || RAY_IS_ERR(vals)) return vals;
         }
         return vals;
@@ -12472,7 +12526,23 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
         }
         if (dvals->type == RAY_LIST) {
             ray_t* item = ((ray_t**)ray_data(dvals))[found];
-            vals = parted_values_append(vals, item, false);
+            ray_t* wrapper = ray_table_get_col_idx(tbl, c);
+            if (RAY_PARTED_BASETYPE(wrapper->type) == RAY_LIST &&
+                item && item->type == RAY_LIST) {
+                ray_t* one = ray_list_new(1);
+                if (!one || RAY_IS_ERR(one)) {
+                    ray_release(vals);
+                    return one ? one : ray_error("oom", NULL);
+                }
+                one = ray_list_append(one, item);
+                if (!one || RAY_IS_ERR(one)) {
+                    ray_release(vals);
+                    return one ? one : ray_error("oom", NULL);
+                }
+                vals = parted_values_append(vals, one, true);
+            } else {
+                vals = parted_values_append(vals, item, false);
+            }
         } else {
             int owned = 0;
             ray_t* item = collection_elem(dvals, found, &owned);
@@ -12484,7 +12554,8 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
 }
 
 static bool parted_value_is_scalar(ray_t* v) {
-    return v && !RAY_IS_ERR(v) && (RAY_IS_NULL(v) || v->type < 0);
+    return v && !RAY_IS_ERR(v) &&
+           (RAY_IS_NULL(v) || (v->type != RAY_LIST && !ray_is_vec(v)));
 }
 
 static bool parted_source_vec_compatible(int8_t dst, int8_t src) {
@@ -12540,7 +12611,8 @@ static ray_t* validate_parted_payloads(ray_t* tbl,
     for (int64_t c = 0; c < v->ndata; c++) {
         ray_t* payload = pv[c];
         if (parted_value_is_scalar(payload)) continue;
-        if (!payload || RAY_IS_ERR(payload) || !ray_is_vec(payload))
+        if (!payload || RAY_IS_ERR(payload) ||
+            (payload->type != RAY_LIST && !ray_is_vec(payload)))
             return ray_error("type", "insert: physical column %lld payload must be an atom or an exactly typed vector",
                              (long long)c);
         if (payload->len < 0)
@@ -12555,6 +12627,12 @@ static ray_t* validate_parted_payloads(ray_t* tbl,
         ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
         int8_t dst = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
         ray_t* payload = pv[c];
+        if (dst == RAY_LIST) {
+            if (!parted_value_is_scalar(payload) && payload->type != RAY_LIST)
+                return ray_error("type", "insert: physical column %lld LIST payload must contain boxed rows",
+                                 (long long)c);
+            continue;
+        }
         if (!parted_value_is_scalar(payload) &&
             !parted_source_vec_compatible(dst, payload->type))
             return ray_error("type", "insert: physical column %lld vector type must exactly match %s",
@@ -12740,6 +12818,38 @@ static ray_t* build_parted_nonsym_segment(int8_t base,
         result->link_target = metadata_seg->link_target;
     }
     return result;
+}
+
+static ray_t* build_parted_list_segment(ray_t* old_seg, int64_t old_len,
+                                        ray_t* payload, int64_t batch) {
+    if (old_len > INT64_MAX - batch) return ray_error("oom", NULL);
+    ray_t* out = ray_list_new(old_len + batch);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t** dst = (ray_t**)ray_data(out);
+    if (old_seg) {
+        ray_t** src = (ray_t**)ray_data(old_seg);
+        for (int64_t r = 0; r < old_len; r++) {
+            dst[r] = src[r];
+            if (dst[r]) ray_retain(dst[r]);
+        }
+    } else {
+        memset(dst, 0, (size_t)old_len * sizeof(ray_t*));
+    }
+
+    if (payload->type == RAY_LIST) {
+        ray_t** cells = (ray_t**)ray_data(payload);
+        for (int64_t r = 0; r < batch; r++) {
+            dst[old_len + r] = cells[r];
+            if (cells[r]) ray_retain(cells[r]);
+        }
+    } else {
+        for (int64_t r = 0; r < batch; r++) {
+            dst[old_len + r] = payload;
+            ray_retain(payload);
+        }
+    }
+    out->len = old_len + batch;
+    return out;
 }
 
 /* Allocate and copy the old prefix of a W64 FILE-domain SYM segment. Appended
@@ -13008,7 +13118,9 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
         ray_t** segs = (ray_t**)ray_data(wrapper);
         int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
         ray_t* old_seg = new_partition ? NULL : segs[v.nparts - 1];
-        ray_t* new_seg = base == RAY_SYM
+        ray_t* new_seg = base == RAY_LIST
+            ? build_parted_list_segment(old_seg, old_len, pv[c], batch)
+            : base == RAY_SYM
             ? build_parted_sym_skeleton(&v, old_seg, old_len, batch)
             : build_parted_nonsym_segment(base, old_seg, old_len,
                                            parted_wrapper_metadata(wrapper, active),
@@ -13493,6 +13605,19 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
          * derived type drives the new column's storage. */
         if (ct == RAY_LIST && ray_len(orig_col) == 0)
             ct = typeless_col_type(row_elems[c]);
+
+        if (ct == RAY_LIST) {
+            ray_t* new_col = append_boxed_table_col(
+                orig_col, row_elems[c], tbl_row_list != NULL);
+            if (!new_col || RAY_IS_ERR(new_col)) {
+                ray_release(result);
+                return new_col ? new_col : ray_error("oom", NULL);
+            }
+            result = ray_table_add_col(result, col_name, new_col);
+            ray_release(new_col);
+            if (!result || RAY_IS_ERR(result)) return result;
+            continue;
+        }
 
         ray_t* new_col = ray_vec_new(ct, nrows + 1);
         if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }

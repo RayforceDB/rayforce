@@ -50,11 +50,8 @@
 #include "ops/ops.h"
 #include "ops/temporal.h"
 
-/* Forward-declare runtime API to avoid ray_vm_t redefinition from runtime.h */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
+/* __RUNTIME is internal test plumbing; runtime API declarations come from
+ * <rayforce.h>. */
 extern ray_runtime_t *__RUNTIME;
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2965,6 +2962,37 @@ static test_result_t test_eval_insert_list_append(void) {
     PASS();
 }
 
+/* ---- Test: insert into a table with a boxed LIST column --------------- */
+static test_result_t test_eval_insert_list_column(void) {
+    const char* setup =
+        "(set nested_t (table ['k 'sched] (list ['a 'b] "
+        "  (list (list (as 'i64 (list 0)) (as 'f64 (list 5))) "
+        "        (list (as 'i64 (list 0 250000)) "
+        "              (as 'f64 (list 15 10)))))))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    /* A table payload is a batch: copy each boxed cell with a retain. */
+    ASSERT_EQ("(insert 'nested_t nested_t)", "'nested_t");
+    ASSERT_EQ("(count nested_t)", "4");
+    ASSERT_EQ("(at nested_t 'sched)",
+              "(list (list [0] [5.0]) "
+              "      (list [0 250000] [15.0 10.0]) "
+              "      (list [0] [5.0]) "
+              "      (list [0 250000] [15.0 10.0]))");
+
+    /* A positional row keeps its nested LIST as one cell, not a batch. */
+    ASSERT_EQ("(insert 'nested_t "
+              "        (list 'c (list [1 2] [3.0 4.0])))",
+              "'nested_t");
+    ASSERT_EQ("(count nested_t)", "5");
+    ASSERT_EQ("(get (at nested_t 'sched) 4)",
+              "(list [1 2] [3.0 4.0])");
+    PASS();
+}
+
 /* ---- Test: insert positional (arity 3, scalar idx) ---- */
 static test_result_t test_eval_insert_vec_positional(void) {
     /* Head, middle, tail (== append) */
@@ -4287,6 +4315,25 @@ static test_result_t test_eval_parted_list_column_impl(const char* root) {
 
     /* The parted view itself must stay usable after the reads. */
     ASSERT_EQ("(at pl 'acct)", "['a 'b 'a 'b]");
+
+    /* Append two boxed rows to the active partition.  The historical LIST
+     * segment stays mmap-backed while the active segment becomes a retained
+     * heap snapshot. */
+    ASSERT_EQ("(insert 'pl 2024.01.02 "
+              "        (table ['acct 'brk] "
+              "               (list ['c 'd] (list [1 2] [3 4 5]))))",
+              "'pl");
+    ASSERT_EQ("(count pl)", "6");
+    ASSERT_EQ("(at pl 'brk)",
+              "(list [0 250000] [0 250000 5000000] "
+              "      [0 250000] [0 250000 5000000] [1 2] [3 4 5])");
+
+    /* A greater key creates a new boxed heap segment. */
+    ASSERT_EQ("(insert 'pl 2024.01.03 "
+              "        (table ['acct 'brk] (list ['e] (list [7 8]))))",
+              "'pl");
+    ASSERT_EQ("(count pl)", "7");
+    ASSERT_EQ("(get (at pl 'brk) 6)", "[7 8]");
     PASS();
 }
 
@@ -6324,6 +6371,82 @@ static test_result_t test_eval_restricted_fn(void) {
     ray_eval_set_restricted(false);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     ray_error_free(r);
+    PASS();
+}
+
+/* Evaluate one expression with the same VM-wide flag used by restricted IPC.
+ * Restore the caller's state before inspecting the result so a failed
+ * assertion cannot leak restricted mode into the next test. */
+static ray_t* eval_restricted_expr(const char* expr) {
+    bool previous = ray_eval_get_restricted();
+    ray_eval_set_restricted(true);
+    ray_t* result = ray_eval_str(expr);
+    ray_eval_set_restricted(previous);
+    return result;
+}
+
+static bool restricted_expr_returns_access(const char* expr) {
+    ray_t* result = eval_restricted_expr(expr);
+    bool access = result && RAY_IS_ERR(result) &&
+                  ray_err_code(result) &&
+                  strcmp(ray_err_code(result), "access") == 0;
+    if (result) {
+        if (RAY_IS_ERR(result)) ray_error_free(result);
+        else ray_release(result);
+    }
+    return access;
+}
+
+/* Restricted builtins must be rejected at the actual invocation boundary,
+ * including compiled lambda bytecode.  Invalid filesystem arguments are
+ * deliberate: before the fix they return os/type instead of access without
+ * performing a useful side effect. */
+static test_result_t test_eval_restricted_lambda_bypass(void) {
+    /* OP_CALL1: unary restricted builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (.sys.exec \"true\")) 0)"));
+
+    /* OP_CALL2: binary restricted builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (write \"/__rayforce_issue_363_missing__/file\" \"x\")) 0)"));
+
+    /* OP_CALLN: variadic restricted builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (.db.splayed.set 1 2)) 0)"));
+
+    /* OP_STOREGLOBAL: the compiler lowers `set` directly instead of calling
+     * the registered restricted special form. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] (set '__rf_issue_363_injected 1)) 0)"));
+
+    /* The wide-constant opcode is a separate VM handler and must enforce the
+     * same rule.  Fill the constant pool before compiling `set` so its name
+     * index exceeds one byte and OP_STOREGLOBAL_W is emitted. */
+    char wide_set[4096];
+    size_t used = (size_t)snprintf(wide_set, sizeof(wide_set),
+                                   "((fn [x] (do ");
+    for (int i = 0; i < 260 && used < sizeof(wide_set); i++)
+        used += (size_t)snprintf(wide_set + used, sizeof(wide_set) - used,
+                                 "%d ", i);
+    if (used < sizeof(wide_set))
+        used += (size_t)snprintf(wide_set + used, sizeof(wide_set) - used,
+                                 "(set '__rf_issue_363_wide 1))) 0)");
+    TEST_ASSERT(used < sizeof(wide_set), "wide restricted set expression fits buffer");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(wide_set));
+
+    /* Nested bytecode and dynamic callable dispatch stay restricted too. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [x] ((fn [y] (read \"/__rayforce_issue_363_missing__/file\")) x)) 0)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [f] (f \"/__rayforce_issue_363_missing__/file\")) read)"));
+
+    /* Pure computation remains available in read-only mode. */
+    ray_t* allowed = eval_restricted_expr("((fn [x] (+ x 1)) 2)");
+    TEST_ASSERT_NOT_NULL(allowed);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(allowed));
+    TEST_ASSERT_EQ_I(allowed->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(allowed->i64, 3);
+    ray_release(allowed);
     PASS();
 }
 
@@ -8700,6 +8823,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert", test_eval_insert, lang_setup, lang_teardown },
     { "lang/eval/insert_vec_append", test_eval_insert_vec_append, lang_setup, lang_teardown },
     { "lang/eval/insert_list_append", test_eval_insert_list_append, lang_setup, lang_teardown },
+    { "lang/eval/insert_list_column", test_eval_insert_list_column, lang_setup, lang_teardown },
     { "lang/eval/insert_vec_positional", test_eval_insert_vec_positional, lang_setup, lang_teardown },
     { "lang/eval/insert_list_positional", test_eval_insert_list_positional, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_multi", test_eval_insert_positional_multi, lang_setup, lang_teardown },
@@ -8853,6 +8977,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
+    { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

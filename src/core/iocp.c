@@ -51,10 +51,15 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     (void)poll; (void)id;
 }
 
+int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
+{
+    (void)poll; (void)timeout_ms;
+    return -1;
+}
+
 int64_t ray_poll_run(ray_poll_t* poll)
 {
-    (void)poll;
-    return -1;
+    return ray_poll_run_for(poll, -1);
 }
 
 #endif /* _WIN32 */

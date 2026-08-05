@@ -445,6 +445,57 @@ static join_radix_part_t* join_radix_partition(ray_pool_t* pool, int64_t nrows,
  *   Pass 3 (parallel):   Column gather — assemble result columns
  * ============================================================================ */
 
+/* Gather a boxed LIST column by row index.  LIST cells are owned ray_t*
+ * references, so the fixed-width gather kernels must never memcpy their raw
+ * pointers: doing so gives the result aliases without matching retains and
+ * later double-releases the children.  Negative indices represent unmatched
+ * outer-join rows and become the runtime's value-null singleton. */
+static ray_t* join_gather_list_col(const ray_t* src, const int64_t* idx,
+                                   int64_t n) {
+    ray_t* out = ray_list_new(n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t* const* s = (ray_t* const*)ray_data((ray_t*)src);
+    ray_t** d = (ray_t**)ray_data(out);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t row = idx[i];
+        ray_t* e = row >= 0 ? s[row] : RAY_NULL_OBJ;
+        /* Legacy/native callers can still construct lists with C NULL slots;
+         * normalize them at the language-facing join boundary. */
+        if (!e) e = RAY_NULL_OBJ;
+        ray_retain(e);
+        d[i] = e;
+        /* Advance only after the owned slot is initialized so an early
+         * release can never traverse uninitialized child pointers. */
+        out->len = i + 1;
+    }
+    return out;
+}
+
+/* Serial one-column gather used by the asof output builder.  Fixed-width
+ * columns preserve SYM width/domain, STR pools, and null sentinels; LIST
+ * columns take the ownership-aware path above. */
+static ray_t* join_gather_col_serial(ray_t* src, const int64_t* idx,
+                                     int64_t n) {
+    if (src->type == RAY_LIST)
+        return join_gather_list_col(src, idx, n);
+
+    ray_t* out = col_vec_new(src, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    uint8_t esz = col_esz(src);
+    const char* s = (const char*)ray_data(src);
+    char* d = (char*)ray_data(out);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t row = idx[i];
+        if (row >= 0) memcpy(d + i * esz, s + row * esz, esz);
+        else          memset(d + i * esz, 0, esz);
+    }
+    out->len = n;
+    col_propagate_str_pool(out, src);
+    col_propagate_nulls_gather(out, src, idx, n);
+    if (out->type == RAY_SYM) ray_sym_vec_adopt_domain(out, src);
+    return out;
+}
+
 /* Key equality helper — shared by count + fill phases */
 static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint32_t n_keys,
                                  int64_t l, int64_t r) {
@@ -1457,16 +1508,18 @@ join_gather:;
      * MGATHER_MAX_COLS and falls back to per-column gather otherwise, so
      * no column may be dropped here (a fixed [16] cap used to silently
      * truncate wide-table join results). */
+    size_t out_slots = (size_t)(left_ncols * 2 + right_ncols * 3);
     {
-        size_t slots = (size_t)(left_ncols * 2 + right_ncols * 3);
         void* out_mem = scratch_alloc(&out_cols_hdr,
-                                      (slots ? slots : 1) * sizeof(void*));
+                                      (out_slots ? out_slots : 1) * sizeof(void*));
         if (!out_mem) {
             ray_release(result);
             result = ray_error("oom", NULL);
             goto join_cleanup;
         }
     }
+    memset(ray_data(out_cols_hdr), 0,
+           (out_slots ? out_slots : 1) * sizeof(void*));
     ray_t** l_out_cols  = (ray_t**)ray_data(out_cols_hdr);
     int64_t* l_out_names = (int64_t*)(l_out_cols + left_ncols);
     ray_t** r_out_cols  = (ray_t**)(l_out_names + left_ncols);
@@ -1475,18 +1528,29 @@ join_gather:;
 
     /* Allocate all output columns upfront for batched gather */
     int64_t l_out_count = 0;
+    bool l_has_list = false;
     for (int64_t c = 0; c < left_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(left_table, c);
         if (!col) continue;
-        ray_t* new_col = col_vec_new(col, pair_count);
-        if (!new_col || RAY_IS_ERR(new_col)) continue;
-        new_col->len = pair_count;
+        ray_t* new_col = col->type == RAY_LIST
+            ? join_gather_list_col(col, l_idx, pair_count)
+            : col_vec_new(col, pair_count);
+        if (!new_col || RAY_IS_ERR(new_col)) {
+            ray_t* err = new_col ? new_col : ray_error("oom", NULL);
+            for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
+            ray_release(result);
+            result = err;
+            goto join_cleanup;
+        }
+        if (col->type == RAY_LIST) l_has_list = true;
+        else new_col->len = pair_count;
         l_out_cols[l_out_count] = new_col;
         l_out_names[l_out_count] = ray_table_col_name(left_table, c);
         l_out_count++;
     }
 
     int64_t r_out_count = 0;
+    bool r_has_list = false;
     for (int64_t c = 0; c < right_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(right_table, c);
         int64_t name_id = ray_table_col_name(right_table, c);
@@ -1499,9 +1563,19 @@ join_gather:;
             }
         }
         if (is_key) continue;
-        ray_t* new_col = col_vec_new(col, pair_count);
-        if (!new_col || RAY_IS_ERR(new_col)) continue;
-        new_col->len = pair_count;
+        ray_t* new_col = col->type == RAY_LIST
+            ? join_gather_list_col(col, r_idx, pair_count)
+            : col_vec_new(col, pair_count);
+        if (!new_col || RAY_IS_ERR(new_col)) {
+            ray_t* err = new_col ? new_col : ray_error("oom", NULL);
+            for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
+            for (int64_t i = 0; i < r_out_count; i++) ray_release(r_out_cols[i]);
+            ray_release(result);
+            result = err;
+            goto join_cleanup;
+        }
+        if (col->type == RAY_LIST) r_has_list = true;
+        else new_col->len = pair_count;
         r_out_cols[r_out_count] = new_col;
         r_src_cols[r_out_count] = col;
         r_out_names[r_out_count] = name_id;
@@ -1511,7 +1585,8 @@ join_gather:;
     if (pair_count > 0) {
         /* Left columns: multi_gather (non-nullable for INNER/LEFT) */
         bool l_nullable = (join_type == 2);  /* only FULL OUTER */
-        if (!l_nullable && l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
+        if (!l_nullable && !l_has_list &&
+            l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
             multi_gather_ctx_t mgctx = { .idx = l_idx, .ncols = l_out_count };
             int64_t si = 0;
             for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
@@ -1532,21 +1607,24 @@ join_gather:;
             for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
                 ray_t* col = ray_table_get_col_idx(left_table, c);
                 if (!col) continue;
-                gather_ctx_t gctx = {
-                    .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
-                    .esz = col_esz(col), .nullable = l_nullable,
-                };
-                if (pool && pair_count > RAY_PARALLEL_THRESHOLD)
-                    ray_pool_dispatch(pool, gather_fn, &gctx, pair_count);
-                else
-                    gather_fn(&gctx, 0, 0, pair_count);
+                if (col->type != RAY_LIST) {
+                    gather_ctx_t gctx = {
+                        .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
+                        .esz = col_esz(col), .nullable = l_nullable,
+                    };
+                    if (pool && pair_count > RAY_PARALLEL_THRESHOLD)
+                        ray_pool_dispatch(pool, gather_fn, &gctx, pair_count);
+                    else
+                        gather_fn(&gctx, 0, 0, pair_count);
+                }
                 si++;
             }
         }
 
         /* Right columns: per-column gather (nullable for LEFT/FULL OUTER) */
         bool r_nullable = (join_type >= 1);
-        if (!r_nullable && r_out_count > 1 && r_out_count <= MGATHER_MAX_COLS) {
+        if (!r_nullable && !r_has_list &&
+            r_out_count > 1 && r_out_count <= MGATHER_MAX_COLS) {
             multi_gather_ctx_t mgctx = { .idx = r_idx, .ncols = r_out_count };
             for (int64_t i = 0; i < r_out_count; i++) {
                 mgctx.srcs[i] = (char*)ray_data(r_src_cols[i]);
@@ -1559,14 +1637,16 @@ join_gather:;
                 multi_gather_fn(&mgctx, 0, 0, pair_count);
         } else {
             for (int64_t i = 0; i < r_out_count; i++) {
-                gather_ctx_t gctx = {
-                    .idx = r_idx, .src_col = r_src_cols[i], .dst_col = r_out_cols[i],
-                    .esz = col_esz(r_src_cols[i]), .nullable = r_nullable,
-                };
-                if (pool && pair_count > RAY_PARALLEL_THRESHOLD)
-                    ray_pool_dispatch(pool, gather_fn, &gctx, pair_count);
-                else
-                    gather_fn(&gctx, 0, 0, pair_count);
+                if (r_src_cols[i]->type != RAY_LIST) {
+                    gather_ctx_t gctx = {
+                        .idx = r_idx, .src_col = r_src_cols[i], .dst_col = r_out_cols[i],
+                        .esz = col_esz(r_src_cols[i]), .nullable = r_nullable,
+                    };
+                    if (pool && pair_count > RAY_PARALLEL_THRESHOLD)
+                        ray_pool_dispatch(pool, gather_fn, &gctx, pair_count);
+                    else
+                        gather_fn(&gctx, 0, 0, pair_count);
+                }
             }
         }
     }
@@ -1581,7 +1661,8 @@ join_gather:;
             ray_t* col = ray_table_get_col_idx(left_table, c);
             if (!col) continue;
             col_propagate_str_pool(l_out_cols[si], col);
-            col_propagate_nulls_gather(l_out_cols[si], col, l_idx, pair_count);
+            if (col->type != RAY_LIST)
+                col_propagate_nulls_gather(l_out_cols[si], col, l_idx, pair_count);
             if (l_out_cols[si]->type == RAY_SYM)
                 ray_sym_vec_adopt_domain(l_out_cols[si], col);
             si++;
@@ -1616,7 +1697,8 @@ join_gather:;
     }
     for (int64_t i = 0; i < r_out_count; i++) {
         col_propagate_str_pool(r_out_cols[i], r_src_cols[i]);
-        col_propagate_nulls_gather(r_out_cols[i], r_src_cols[i], r_idx, pair_count);
+        if (r_src_cols[i]->type != RAY_LIST)
+            col_propagate_nulls_gather(r_out_cols[i], r_src_cols[i], r_idx, pair_count);
         if (r_out_cols[i]->type == RAY_SYM)
             ray_sym_vec_adopt_domain(r_out_cols[i], r_src_cols[i]);
     }
@@ -1974,11 +2056,18 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
     for (int64_t c = 0; c < left_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(left_table, c);
         if (!col) continue;
-        ray_t* new_col = col_vec_new(col, out_count);
-        if (!new_col || RAY_IS_ERR(new_col)) continue;
-        new_col->len = out_count;
+        ray_t* new_col = col->type == RAY_LIST
+            ? join_gather_list_col(col, out_idx, out_count)
+            : col_vec_new(col, out_count);
+        if (!new_col || RAY_IS_ERR(new_col)) {
+            ray_t* err = new_col ? new_col : ray_error("oom", NULL);
+            ray_release(result);
+            scratch_free(out_idx_hdr);
+            return err;
+        }
+        if (col->type != RAY_LIST) new_col->len = out_count;
 
-        if (out_count > 0) {
+        if (out_count > 0 && col->type != RAY_LIST) {
             gather_ctx_t gctx = {
                 .idx = out_idx, .src_col = col, .dst_col = new_col,
                 .esz = col_esz(col), .nullable = false,
@@ -1993,7 +2082,8 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
         /* Gather copies sentinel cells verbatim, but the gather worker
          * does not flag HAS_NULLS. Preserve source null metadata to
          * mirror the inner/outer join gather path. */
-        col_propagate_nulls_gather(new_col, col, out_idx, out_count);
+        if (col->type != RAY_LIST)
+            col_propagate_nulls_gather(new_col, col, out_idx, out_count);
         /* SYM output gathers raw cell ids from `col`; resolve over
          * the same dictionary (sym-domain Phase 2). */
         if (new_col->type == RAY_SYM)
@@ -2002,6 +2092,10 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
         int64_t name_id = ray_table_col_name(left_table, c);
         result = ray_table_add_col(result, name_id, new_col);
         ray_release(new_col);
+        if (RAY_IS_ERR(result)) {
+            scratch_free(out_idx_hdr);
+            return result;
+        }
     }
 
     scratch_free(out_idx_hdr);
@@ -3591,6 +3685,20 @@ build_output:;
     }
 
     ray_t* out = ray_table_new(left_ncols + right_out_count);
+    if (!out || RAY_IS_ERR(out)) {
+        if (right_out_idx_hdr) scratch_free(right_out_idx_hdr);
+        scratch_free(mo_hdr);
+        scratch_free(match_hdr);
+        scratch_free(li_hdr);
+        scratch_free(ri_hdr);
+        if (lt_null_hdr) scratch_free(lt_null_hdr);
+        if (rt_null_hdr) scratch_free(rt_null_hdr);
+        if (lt_time_hdr) scratch_free(lt_time_hdr);
+        if (rt_time_hdr) scratch_free(rt_time_hdr);
+        if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
+        return out ? out : ray_error("oom", NULL);
+    }
 
     /* Build index arrays for gather so col_propagate_nulls_gather can
      * copy the null bitmap correctly (null bit in source → null bit in
@@ -3616,6 +3724,7 @@ build_output:;
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
         scratch_free(eqbuf_hdr);
+        ray_release(out);
         return ray_error("oom", NULL);
     }
     {
@@ -3632,28 +3741,15 @@ build_output:;
     for (int64_t c = 0; c < left_ncols; c++) {
         int64_t col_name = ray_table_col_name(left_table, c);
         ray_t* src_col = ray_table_get_col_idx(left_table, c);
-        int8_t ctype = src_col->type;
-        /* SYM is adaptive-width (W8/W16/W32/W64): a splayed/loaded source is
-         * typically W32 while ray_vec_new(RAY_SYM,…) yields a W64 dst.  Copy at
-         * the SOURCE element size into a dst of the SAME width — otherwise the
-         * ids are read at the wrong stride and decode to the empty symbol. */
-        uint8_t esz = (ctype == RAY_SYM) ? col_esz(src_col) : ray_type_sizes[ctype];
-        ray_t* dst_col = (ctype == RAY_SYM)
-            ? ray_sym_vec_new((uint8_t)(src_col->attrs & RAY_SYM_W_MASK), out_n)
-            : ray_vec_new(ctype, out_n);
-        char* src = (char*)ray_data(src_col);
-        char* dst = (char*)ray_data(dst_col);
-        for (int64_t wi = 0; wi < out_n; wi++)
-            memcpy(dst + wi * esz, src + lidx[wi] * esz, esz);
-        dst_col->len = out_n;
-        col_propagate_str_pool(dst_col, src_col);
-        col_propagate_nulls_gather(dst_col, src_col, lidx, out_n);
-        /* SYM output raw-copies cell ids from one source column —
-         * adopt its domain (sym-domain Phase 2). */
-        if (dst_col->type == RAY_SYM)
-            ray_sym_vec_adopt_domain(dst_col, src_col);
+        ray_t* dst_col = join_gather_col_serial(src_col, lidx, out_n);
+        if (!dst_col || RAY_IS_ERR(dst_col)) {
+            ray_release(out);
+            out = dst_col ? dst_col : ray_error("oom", NULL);
+            goto window_output_cleanup;
+        }
         out = ray_table_add_col(out, col_name, dst_col);
         ray_release(dst_col);
+        if (RAY_IS_ERR(out)) goto window_output_cleanup;
     }
 
     /* Gather right columns (excluding key duplicates) — original left-row order.
@@ -3665,28 +3761,18 @@ build_output:;
         int64_t cidx = right_out_idx[rc];
         int64_t col_name = ray_table_col_name(right_table, cidx);
         ray_t* src_col = ray_table_get_col_idx(right_table, cidx);
-        int8_t ctype = src_col->type;
-        /* SYM adaptive-width: match the source width (see left-gather note). */
-        uint8_t esz = (ctype == RAY_SYM) ? col_esz(src_col) : ray_type_sizes[ctype];
-        ray_t* dst_col = (ctype == RAY_SYM)
-            ? ray_sym_vec_new((uint8_t)(src_col->attrs & RAY_SYM_W_MASK), out_n)
-            : ray_vec_new(ctype, out_n);
-        char* src = (char*)ray_data(src_col);
-        char* dst = (char*)ray_data(dst_col);
-        for (int64_t wi = 0; wi < out_n; wi++) {
-            int64_t ri = ridx[wi];
-            if (ri >= 0) memcpy(dst + wi * esz, src + ri * esz, esz);
-            else         memset(dst + wi * esz, 0, esz);
+        ray_t* dst_col = join_gather_col_serial(src_col, ridx, out_n);
+        if (!dst_col || RAY_IS_ERR(dst_col)) {
+            ray_release(out);
+            out = dst_col ? dst_col : ray_error("oom", NULL);
+            goto window_output_cleanup;
         }
-        dst_col->len = out_n;
-        col_propagate_str_pool(dst_col, src_col);
-        col_propagate_nulls_gather(dst_col, src_col, ridx, out_n);
-        if (dst_col->type == RAY_SYM)
-            ray_sym_vec_adopt_domain(dst_col, src_col);
         out = ray_table_add_col(out, col_name, dst_col);
         ray_release(dst_col);
+        if (RAY_IS_ERR(out)) goto window_output_cleanup;
     }
 
+window_output_cleanup:
     if (lidx_hdr) scratch_free(lidx_hdr);
     if (ridx_hdr) scratch_free(ridx_hdr);
     if (right_out_idx_hdr) scratch_free(right_out_idx_hdr);
