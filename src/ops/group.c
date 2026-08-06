@@ -1176,6 +1176,300 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * Parallel distinct values — first-occurrence row ids.
+ *
+ * Same three-pass radix layout as exec_count_distinct above (histogram
+ * → scatter → per-partition dedup), except the scatter carries the row
+ * id alongside each value and the dedup marks first occurrences in a
+ * shared byte array instead of counting.  A given value lands in
+ * exactly one partition, so each row id is claimed by at most one
+ * task — the byte array needs no atomics.  Partition slices are in
+ * ascending row order (cursors are prefix-summed over tasks in task
+ * order, tasks scan rows in order), so "first hit in the slice" is the
+ * globally first occurrence, and the final sequential sweep of the
+ * byte array yields ids in first-appearance order — identical to the
+ * eager hashset path's contract.
+ * ════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const void* base;
+    int64_t*    out_buf;       /* partitioned values (output) */
+    int64_t*    rid_buf;       /* partitioned row ids (output) */
+    int64_t*    cursor;        /* per-task × P; advances per scatter */
+    uint64_t    p_mask;
+    int64_t     grain;
+    int64_t     total;
+    uint8_t     is_f64;
+    int8_t      type;
+} dv_scatter_ctx_t;
+
+static void dv_scatter_fn(void* ctx, uint32_t worker_id,
+                          int64_t start, int64_t end) {
+    (void)worker_id;
+    (void)end;
+    dv_scatter_ctx_t* x = (dv_scatter_ctx_t*)ctx;
+    int64_t task_idx = start;
+    int64_t row_start = task_idx * x->grain;
+    int64_t row_end = row_start + x->grain;
+    if (row_end > x->total) row_end = x->total;
+    int64_t* cur = x->cursor + (size_t)task_idx * (x->p_mask + 1);
+    int64_t* out = x->out_buf;
+    int64_t* rid = x->rid_buf;
+    const void* base = x->base;
+    uint64_t p_mask = x->p_mask;
+    #define DV_SCATTER_BODY(LOAD)                                             \
+        for (int64_t i = row_start; i < row_end; i++) {                       \
+            int64_t val = (LOAD);                                             \
+            uint64_t h = (uint64_t)val * CD_HASH_K1;                          \
+            h ^= h >> 33;                                                     \
+            uint64_t p = (h ^ (h >> 33)) & p_mask;                            \
+            int64_t c = cur[p]++;                                             \
+            out[c] = val;                                                     \
+            rid[c] = i;                                                       \
+        }
+    if (x->is_f64) {
+        const double* d = (const double*)base;
+        for (int64_t i = row_start; i < row_end; i++) {
+            double fv = d[i];
+            if (fv != fv) fv = (double)NAN;
+            else fv = clear_neg_zero(fv);
+            int64_t val;
+            memcpy(&val, &fv, sizeof(int64_t));
+            uint64_t h = (uint64_t)val * CD_HASH_K1;
+            h ^= h >> 33;
+            uint64_t p = (h ^ (h >> 33)) & p_mask;
+            int64_t c = cur[p]++;
+            out[c] = val;
+            rid[c] = i;
+        }
+    } else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP) {
+        const int64_t* d = (const int64_t*)base;
+        DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_I32 || x->type == RAY_DATE || x->type == RAY_TIME) {
+        const int32_t* d = (const int32_t*)base;
+        DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_I16) {
+        const int16_t* d = (const int16_t*)base;
+        DV_SCATTER_BODY(d[i])
+    }
+    #undef DV_SCATTER_BODY
+}
+
+typedef struct {
+    const int64_t* values;     /* partitioned values */
+    const int64_t* rids;       /* partitioned row ids */
+    const int64_t* part_off;   /* P+1 partition bounds */
+    int64_t*       part_count; /* OUT: per-partition distinct count (-1 = oom) */
+    uint8_t*       first;      /* OUT: len bytes; 1 = first occurrence */
+} dv_part_ctx_t;
+
+static void dv_part_dedup_fn(void* ctx, uint32_t worker_id,
+                             int64_t start, int64_t end) {
+    (void)worker_id;
+    dv_part_ctx_t* x = (dv_part_ctx_t*)ctx;
+    for (int64_t p = start; p < end; p++) {
+        int64_t off = x->part_off[p];
+        int64_t cnt = x->part_off[p + 1] - off;
+        if (cnt == 0) { x->part_count[p] = 0; continue; }
+
+        uint64_t cap = (uint64_t)cnt * 2;
+        if (cap < 32) cap = 32;
+        uint64_t c = 1;
+        while (c && c < cap) c <<= 1;
+        if (!c) { x->part_count[p] = -1; continue; }
+        cap = c;
+        uint64_t mask = cap - 1;
+        int cd_shift = 64 - __builtin_ctzll(cap);
+
+        ray_t* set_hdr  = NULL;
+        ray_t* used_hdr = NULL;
+        int64_t* set    = (int64_t*)scratch_alloc (&set_hdr,
+                                                   (size_t)cap * sizeof(int64_t));
+        uint8_t* used   = (uint8_t*)scratch_calloc(&used_hdr,
+                                                   (size_t)cap * sizeof(uint8_t));
+        if (!set || !used) {
+            if (set_hdr)  scratch_free(set_hdr);
+            if (used_hdr) scratch_free(used_hdr);
+            x->part_count[p] = -1;
+            continue;
+        }
+
+        const int64_t* vals = x->values + off;
+        const int64_t* rids = x->rids + off;
+        int64_t count = 0;
+        for (int64_t j = 0; j < cnt; j++) {
+            int64_t val = vals[j];
+            uint64_t h = (uint64_t)val * CD_HASH_K1;
+            uint64_t slot = h >> cd_shift;   /* Fibonacci hash: high bits */
+            while (used[slot]) {
+                if (set[slot] == val) goto dv_part_next;
+                slot = (slot + 1) & mask;
+            }
+            set[slot]  = val;
+            used[slot] = 1;
+            x->first[rids[j]] = 1;
+            count++;
+            dv_part_next:;
+        }
+        scratch_free(set_hdr);
+        scratch_free(used_hdr);
+        x->part_count[p] = count;
+    }
+}
+
+ray_t* distinct_radix_first_ids(ray_t* input) {
+    if (!input || RAY_IS_ERR(input)) return NULL;
+
+    int8_t in_type = input->type;
+    int64_t len = input->len;
+
+    switch (in_type) {
+    case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        break;
+    case RAY_F64:
+        /* The kernel canonicalizes every NaN to one value.  The eager
+         * hashset only does that under the HAS_NULLS gate (ungated NaNs
+         * are pairwise-distinct there) — bail so behavior is identical. */
+        if (!(input->attrs & RAY_ATTR_HAS_NULLS)) return NULL;
+        break;
+    default:
+        return NULL;
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || len < (1 << 16)) return NULL;
+
+    uint32_t nw = ray_pool_total_workers(pool);
+    uint32_t p_bits;
+    if (nw <= 8) p_bits = 4;
+    else if (nw <= 32) p_bits = 5;
+    else p_bits = 6;
+    uint64_t P = (uint64_t)1 << p_bits;
+    uint64_t p_mask = P - 1;
+
+    int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (grain <= 0) grain = 8192;
+    int64_t n_tasks_64 = (len + grain - 1) / grain;
+    if (n_tasks_64 <= 0 || n_tasks_64 > (1u << 16)) return NULL;
+    uint32_t n_tasks = (uint32_t)n_tasks_64;
+
+    void* base = ray_data(input);
+
+    /* Pass 1: per-task histogram (identical to exec_count_distinct's). */
+    ray_t* hist_hdr = NULL;
+    int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
+                                             (size_t)P * n_tasks * sizeof(int64_t));
+    if (!hist) return ray_error("oom", NULL);
+    cd_count_ctx_t hctx = {
+        .base = base, .counts = hist,
+        .p_bits = p_bits, .p_mask = p_mask,
+        .grain = grain, .total = len,
+        .stride_log2 = 0, .is_f64 = (in_type == RAY_F64),
+        .type = in_type, .attrs = input->attrs,
+    };
+    ray_pool_dispatch_n(pool, cd_hist_fn, &hctx, n_tasks);
+
+    ray_t* off_hdr = NULL;
+    int64_t* part_off = (int64_t*)scratch_alloc(&off_hdr,
+                                                (size_t)(P + 1) * sizeof(int64_t));
+    if (!part_off) { scratch_free(hist_hdr); return ray_error("oom", NULL); }
+    ray_t* cur_hdr = NULL;
+    int64_t* cursor = (int64_t*)scratch_alloc(&cur_hdr,
+                                              (size_t)P * n_tasks * sizeof(int64_t));
+    if (!cursor) {
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+
+    int64_t total = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        part_off[p] = total;
+        for (uint32_t t = 0; t < n_tasks; t++) {
+            cursor[(size_t)t * P + p] = total;
+            total += hist[(size_t)t * P + p];
+        }
+    }
+    part_off[P] = total;
+    if (total != len) {
+        scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("nyi", "distinct: histogram mismatch");
+    }
+
+    /* Pass 2: scatter (value, row id) pairs. */
+    ray_t* buf_hdr = NULL;
+    int64_t* out_buf = (int64_t*)scratch_alloc(&buf_hdr,
+                                               (size_t)len * sizeof(int64_t));
+    ray_t* rid_hdr = NULL;
+    int64_t* rid_buf = (int64_t*)scratch_alloc(&rid_hdr,
+                                               (size_t)len * sizeof(int64_t));
+    if (!out_buf || !rid_buf) {
+        if (buf_hdr) scratch_free(buf_hdr);
+        if (rid_hdr) scratch_free(rid_hdr);
+        scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+    dv_scatter_ctx_t sctx = {
+        .base = base, .out_buf = out_buf, .rid_buf = rid_buf, .cursor = cursor,
+        .p_mask = p_mask, .grain = grain, .total = len,
+        .is_f64 = (in_type == RAY_F64), .type = in_type,
+    };
+    ray_pool_dispatch_n(pool, dv_scatter_fn, &sctx, n_tasks);
+
+    /* Pass 3: per-partition dedup, marking first occurrences. */
+    ray_t* first_hdr = NULL;
+    uint8_t* first = (uint8_t*)scratch_calloc(&first_hdr, (size_t)len);
+    ray_t* pcnt_hdr = NULL;
+    int64_t* part_count = first ? (int64_t*)scratch_alloc(&pcnt_hdr,
+                                                  (size_t)P * sizeof(int64_t))
+                                : NULL;
+    if (!first || !part_count) {
+        if (first_hdr) scratch_free(first_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
+        scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+    dv_part_ctx_t dctx = {
+        .values = out_buf, .rids = rid_buf, .part_off = part_off,
+        .part_count = part_count, .first = first,
+    };
+    ray_pool_dispatch_n(pool, dv_part_dedup_fn, &dctx, (uint32_t)P);
+
+    int64_t total_distinct = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        if (part_count[p] < 0) {
+            scratch_free(pcnt_hdr); scratch_free(first_hdr);
+            scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+            scratch_free(off_hdr); scratch_free(hist_hdr);
+            return ray_error("oom", NULL);
+        }
+        total_distinct += part_count[p];
+    }
+
+    scratch_free(pcnt_hdr); scratch_free(rid_hdr); scratch_free(buf_hdr);
+    scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+
+    /* Sweep the byte array in row order — first-appearance order ids. */
+    ray_t* ids = ray_vec_new(RAY_I64, total_distinct);
+    if (!ids || RAY_IS_ERR(ids)) {
+        scratch_free(first_hdr);
+        return ids ? ids : ray_error("oom", NULL);
+    }
+    int64_t* out_ids = (int64_t*)ray_data(ids);
+    int64_t k = 0;
+    for (int64_t i = 0; i < len; i++)
+        if (first[i]) out_ids[k++] = i;
+    ids->len = k;
+    scratch_free(first_hdr);
+    if (k != total_distinct) {
+        ray_release(ids);
+        return ray_error("nyi", "distinct: first-occurrence sweep mismatch");
+    }
+    return ids;
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * Parallel partitioned grouped count(distinct).
  *
  * The serial kernel further down uses a single global hash keyed by
