@@ -1553,18 +1553,48 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIME) return ray_date((int64_t)val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_date(ts_days_floor(val->i64));
         if (val->type == -RAY_STR) {
-            /* Parse "YYYY.MM.DD" format */
+            /* Parse "YYYY.MM.DD" with a bounded cursor that must consume the
+             * whole string.  The old sscanf path accepted trailing garbage
+             * ("2024.01.02junk") and, worse, never range-checked the month:
+             * a month > 13 drove the days-in-month table index out of bounds
+             * — e.g. (as 'DATE "9999.99.99") read md[99] (ASan OOB). Validate
+             * the month BEFORE indexing the table, and the day against the
+             * actual days in that (possibly leap) month. Mirrors the strict
+             * TIMESTAMP string cast. */
             const char* sp = ray_str_ptr(val);
-            int y, m, d2;
-            if (sscanf(sp, "%d.%d.%d", &y, &m, &d2) != 3) return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            size_t sl = ray_str_len(val);
+            size_t i = 0;
+            int y = 0, m = 0, d2 = 0;
+            #define DT_DIGITS(w, out) do {                                                 \
+                (out) = 0;                                                                 \
+                for (int _k = 0; _k < (w); _k++) {                                         \
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')                             \
+                        return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD"); \
+                    (out) = (out) * 10 + (sp[i] - '0'); i++;                               \
+                }                                                                         \
+            } while (0)
+            DT_DIGITS(4, y);
+            if (i >= sl || sp[i] != '.') return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            i++;
+            DT_DIGITS(2, m);
+            if (i >= sl || sp[i] != '.') return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            i++;
+            DT_DIGITS(2, d2);
+            if (i != sl) return ray_error("domain", "as: cannot parse str as date, unexpected trailing characters");
+            #undef DT_DIGITS
+            static const int dt_md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            if (m < 1 || m > 12)
+                return ray_error("domain", "as: cannot parse str as date, month out of range");
+            int mdays = dt_md[m] + (m == 2 && leap ? 1 : 0);
+            if (d2 < 1 || d2 > mdays)
+                return ray_error("domain", "as: cannot parse str as date, day out of range for month");
             int64_t days = 0;
             { int ty;
               for (ty = 2000; ty < y; ty++) days += (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
               for (ty = y; ty < 2000; ty++) days -= (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
             }
-            { static const int md2[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-              int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-              for (int mi = 1; mi < m; mi++) days += md2[mi] + (mi == 2 && leap ? 1 : 0);
+            { for (int mi = 1; mi < m; mi++) days += dt_md[mi] + (mi == 2 && leap ? 1 : 0);
               days += d2 - 1;
             }
             return ray_date(days);

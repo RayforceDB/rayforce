@@ -262,6 +262,22 @@
 (as 'date 2000.01.02D00:00:00.000000000) -- 2000.01.02
 ;; date <- String
 (as 'date "2024.03.20") -- 2024.03.20
+;; Leap day is valid in a leap year, rejected otherwise.
+(as 'date "2024.02.29") -- 2024.02.29
+(as 'date "2023.02.29") !- domain
+;; date <- String: malformed input must be REJECTED, not silently parsed.
+;; A month past 12 used to index the days-in-month table out of bounds
+;; (ASan OOB read); trailing garbage and loose fields were also accepted.
+(as 'date "9999.99.99") !- domain
+(as 'date "2024.13.01") !- domain
+(as 'date "2024.00.10") !- domain
+(as 'date "2024.02.31") !- domain
+(as 'date "2024.04.31") !- domain
+(as 'date "2024.01.00") !- domain
+(as 'date "2024.01.02junk") !- domain
+(as 'date "2024.1.2") !- domain
+(as 'date "2024/01/02") !- domain
+(as 'date "2024-01-02") !- domain
 ;; ========== DATE VECTOR CASTS ==========
 (type (as 'DATE [0 1 2])) -- 'DATE
 (as 'I64 (as 'DATE [0 1 2])) -- [0 1 2]
