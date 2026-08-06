@@ -1,0 +1,84 @@
+;; extract_trunc_overflow.rfl — regression for signed-overflow UB in the
+;; DATE/TIMESTAMP → microseconds conversion shared by the four temporal
+;; decomposition kernels (standalone + DAG, extract + truncate).
+;;
+;; Bugs (all UBSan signed-overflow in src/ops/temporal.c):
+;;   * a DATE is int32 days, so an extreme value multiplied by µs-per-day
+;;     overflowed int64 — (dd (as 'DATE 2147483647)) tripped `raw * 86400000000`;
+;;   * the ns→µs floor for TIMESTAMP negated the input, so a value within
+;;     999 of INT64_MIN overflowed `(-raw) + 999`;
+;;   * the DAG date_trunc YEAR/MONTH arms re-multiply days_from_civil(...) — a
+;;     day count floored down to the period start — by µs-per-day, so a DATE
+;;     that cleared the µs bound still overflowed the ns range (d.year of
+;;     (as 'DATE -106751991)).
+;;
+;; Fix: reject the un-representable DATE (emit null, as for a null input) and
+;; do the TIMESTAMP floor with truncate-then-adjust so it never negates.  The
+;; truncate DATE bound is the int64-NANOSECOND representable day range so the
+;; re-multiply cannot overflow.  Covers both the standalone kernels
+;; (yyyy/dd/mm/hh and (date …)) and the DAG kernels (dotted col.field).
+
+;; ── standalone extract atom path ────────────────────────────────────
+;; Extreme DATE (large magnitude, both signs) → null instead of overflow.
+;; NB: -2147483648 == NULL_I32, i.e. a null DATE, so it would exit at the
+;; null-input early-out and never exercise the guard; use a non-null value.
+(nil? (yyyy (as 'DATE 2147483647)))  -- true
+(nil? (mm   (as 'DATE 2147483647)))  -- true
+(nil? (dd   (as 'DATE -200000000)))  -- true
+;; Minimum-edge TIMESTAMP no longer overflows the ns→µs floor.
+(mm (as 'TIMESTAMP -9223372036854775807)) -- 9
+(hh (as 'TIMESTAMP -9223372036854775807)) -- 0
+;; Ordinary values are unaffected.
+(yyyy 2024.03.15D14:27:31.123456789) -- 2024
+(mm   2024.03.15D14:27:31.123456789) -- 3
+(dd   2024.03.15D14:27:31.123456789) -- 15
+(hh   2024.03.15D14:27:31.123456789) -- 14
+(yyyy 2024.03.15) -- 2024
+(dd   2000.01.01) -- 1
+
+;; ── standalone extract vector path ──────────────────────────────────
+;; A mix of ordinary, null and extreme rows: only the extreme row nulls.
+(set Ex (yyyy (as 'DATE [0 366 2147483647])))
+(at Ex 0) -- 2000
+(at Ex 1) -- 2001
+(nil? (at Ex 2)) -- true
+
+;; ── DAG extract kernel (dotted-path in select) ──────────────────────
+(set T (table [d ts] (list (as 'DATE [0 366 2147483647]) (as 'TIMESTAMP [0 86400000000000 -9223372036854775807]))))
+(set Ey (at (select {v: d.yyyy from: T}) 'v))
+(at Ey 0) -- 2000
+(at Ey 1) -- 2001
+(nil? (at Ey 2)) -- true
+;; TIMESTAMP min edge decodes without overflow through the DAG kernel too.
+(set Em (at (select {v: ts.mm from: T}) 'v))
+(at Em 0) -- 1
+(at Em 2) -- 9
+
+;; ── DAG date_trunc kernel (dotted-path .date) ───────────────────────
+;; Extreme DATE truncates to null (not representable as a TIMESTAMP);
+;; ordinary rows are unchanged.
+(set Td (at (select {v: d.date from: T}) 'v))
+(at Td 0) -- 2000.01.01D00:00:00.000000000
+(at Td 1) -- 2001.01.01D00:00:00.000000000
+(nil? (at Td 2)) -- true
+
+;; ── DAG date_trunc YEAR / MONTH arms (the re-multiply path) ──────────
+;; d.year of a large-magnitude negative DATE used to overflow the second
+;; days_from_civil(...) * µs-per-day multiply; it must null, not UB.
+(set Tn (table [d] (list (as 'DATE [-106751991 8840 200000000]))))
+(set Ty (at (select {v: d.year from: Tn}) 'v))
+(nil? (at Ty 0)) -- true
+(at Ty 1) -- 2024.01.01D00:00:00.000000000
+(nil? (at Ty 2)) -- true
+(set Tmo (at (select {v: d.month from: Tn}) 'v))
+(nil? (at Tmo 0)) -- true
+(at Tmo 1) -- 2024.03.01D00:00:00.000000000
+(nil? (at Tmo 2)) -- true
+
+;; ── standalone truncate kernel via (date <temporal>) ────────────────
+;; Ordinary values truncate to the day; values outside the int64-ns range
+;; null instead of wrapping.
+(date (as 'TIMESTAMP 86400000000000)) -- 2000.01.02D00:00:00.000000000
+(nil? (date (as 'TIMESTAMP -9223372036854775807))) -- true
+(date (as 'DATE 8766)) -- 2024.01.01D00:00:00.000000000
+(nil? (date (as 'DATE 2000000000))) -- true

@@ -101,16 +101,56 @@ static int64_t rte_extract_one(int64_t us, int field) {
  * rest of the runtime).  The previous version of this helper treated
  * TIMESTAMP as µs, which made (yyyy ts) decode to absurd years (26204
  * on 2024-03-15) — a 1000× unit mismatch. */
-static inline int64_t rte_to_us(int8_t type, int64_t raw) {
-    if (type == RAY_DATE || type == -RAY_DATE) return raw * RTE_USEC_PER_DAY;
-    if (type == RAY_TIME || type == -RAY_TIME) return raw * 1000LL;
-    /* RAY_TIMESTAMP / -RAY_TIMESTAMP: ns → µs (floor toward -inf). */
-    return raw >= 0 ? raw / 1000LL
-                    : -(((-raw) + 999LL) / 1000LL);
+static inline bool rte_to_us_ck(int8_t type, int64_t raw, int64_t* out) {
+    if (type == RAY_DATE || type == -RAY_DATE) {
+        /* DATE is int32 days, so `raw` can be as large as INT32_MAX — a date
+         * hundreds of millennia out.  day * µs-per-day then overflows int64
+         * (UBSan).  Such a value is simply not representable in the µs domain
+         * the extract/truncate math uses; report it so the caller emits a
+         * null, consistent with how a null input is handled. */
+        if (raw > INT64_MAX / RTE_USEC_PER_DAY || raw < INT64_MIN / RTE_USEC_PER_DAY)
+            return false;
+        *out = raw * RTE_USEC_PER_DAY;
+        return true;
+    }
+    if (type == RAY_TIME || type == -RAY_TIME) { *out = raw * 1000LL; return true; }
+    /* RAY_TIMESTAMP / -RAY_TIMESTAMP: ns → µs, floor toward -inf.  Done with
+     * truncate-then-adjust rather than negating: the old `-((-raw)+999)/1000`
+     * overflowed for `raw` within 999 of INT64_MIN (the low edge of the
+     * representable range). */
+    int64_t q = raw / 1000LL;
+    if (raw % 1000LL != 0 && raw < 0) q--;
+    *out = q;
+    return true;
 }
 
-/* Inverse of rte_to_us for TIMESTAMP output paths (truncate). */
-static inline int64_t rte_us_to_ts_raw(int64_t us) { return us * 1000LL; }
+/* Extract one field from a raw temporal slot.  Returns false when the source
+ * value is not representable in the µs extract domain (caller emits null). */
+static inline bool rte_extract_elem(int8_t t, int64_t raw, int field, int64_t* out) {
+    int64_t us;
+    if (!rte_to_us_ck(t, raw, &us)) return false;
+    *out = rte_extract_one(us, field);
+    return true;
+}
+
+/* Truncate a raw temporal slot to a TIMESTAMP-ns bucket.  Returns false when
+ * the source or the bucketed result is outside the int64 nanosecond range
+ * (caller emits null): a value hundreds of millennia out cannot be a
+ * TIMESTAMP.  Keeps one bucket of headroom because the floor step can
+ * subtract up to `bucket` µs before the ×1000 ns conversion.  The headroom
+ * is applied unconditionally (not only when a floor actually happens), so up
+ * to one bucket of representable values at the very low edge round to null —
+ * an immaterial band ~292 millennia before 2000, not worth an extra branch
+ * in this hot kernel. */
+static inline bool rte_trunc_elem(int8_t t, int64_t raw, int64_t bucket, int64_t* out_ns) {
+    int64_t us;
+    if (!rte_to_us_ck(t, raw, &us)) return false;
+    if (us > INT64_MAX / 1000LL || us < INT64_MIN / 1000LL + bucket) return false;
+    int64_t r = us % bucket;
+    int64_t out_us = us - r - (r < 0 ? bucket : 0);
+    *out_ns = out_us * 1000LL;
+    return true;
+}
 
 ray_t* ray_temporal_extract(ray_t* input, int field) {
     if (!input || RAY_IS_ERR(input)) return input;
@@ -124,9 +164,9 @@ ray_t* ray_temporal_extract(ray_t* input, int field) {
         if (t != -RAY_DATE && t != -RAY_TIME && t != -RAY_TIMESTAMP)
             return ray_error("type", "extract: expected date/time/timestamp, got %s", ray_type_name(t));
         if (RAY_ATOM_IS_NULL(input)) return ray_typed_null(-RAY_I64);
-        int64_t raw = input->i64;
-        int64_t us = rte_to_us(t, raw);
-        return ray_i64(rte_extract_one(us, field));
+        int64_t ev;
+        if (!rte_extract_elem(t, input->i64, field, &ev)) return ray_typed_null(-RAY_I64);
+        return ray_i64(ev);
     }
 
     /* Vector input. */
@@ -158,31 +198,35 @@ ray_t* ray_temporal_extract(ray_t* input, int field) {
         const int32_t* d32 = (const int32_t*)base;
         if (src_has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i)) {
+                if (ray_vec_is_null(input, i) ||
+                    !rte_extract_elem(t, (int64_t)d32[i], field, &out[i])) {
                     out[i] = NULL_I64;
                     ray_vec_set_null(result, i, true);
-                    continue;
                 }
-                out[i] = rte_extract_one(rte_to_us(t, (int64_t)d32[i]), field);
             }
         } else {
             for (int64_t i = 0; i < len; i++)
-                out[i] = rte_extract_one(rte_to_us(t, (int64_t)d32[i]), field);
+                if (!rte_extract_elem(t, (int64_t)d32[i], field, &out[i])) {
+                    out[i] = NULL_I64;
+                    ray_vec_set_null(result, i, true);
+                }
         }
     } else {
         const int64_t* d64 = (const int64_t*)base;
         if (src_has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i)) {
+                if (ray_vec_is_null(input, i) ||
+                    !rte_extract_elem(t, d64[i], field, &out[i])) {
                     out[i] = NULL_I64;
                     ray_vec_set_null(result, i, true);
-                    continue;
                 }
-                out[i] = rte_extract_one(rte_to_us(t, d64[i]), field);
             }
         } else {
             for (int64_t i = 0; i < len; i++)
-                out[i] = rte_extract_one(rte_to_us(t, d64[i]), field);
+                if (!rte_extract_elem(t, d64[i], field, &out[i])) {
+                    out[i] = NULL_I64;
+                    ray_vec_set_null(result, i, true);
+                }
         }
     }
     return result;
@@ -252,13 +296,13 @@ ray_t* ray_temporal_truncate(ray_t* input, int kind) {
         if (t != -RAY_DATE && t != -RAY_TIME && t != -RAY_TIMESTAMP)
             return ray_error("type", "truncate: expected date/time/timestamp, got %s", ray_type_name(t));
         if (RAY_ATOM_IS_NULL(input)) return ray_typed_null(-RAY_TIMESTAMP);
-        int64_t us = rte_to_us(t, input->i64);
         int64_t bucket = (kind == RAY_EXTRACT_DAY)
             ? RTE_USEC_PER_DAY
             : RTE_USEC_PER_SEC;
-        int64_t r = us % bucket;
-        int64_t out_us = us - r - (r < 0 ? bucket : 0);
-        return ray_timestamp(rte_us_to_ts_raw(out_us));
+        int64_t out_ns;
+        if (!rte_trunc_elem(t, input->i64, bucket, &out_ns))
+            return ray_typed_null(-RAY_TIMESTAMP);
+        return ray_timestamp(out_ns);
     }
 
     /* Vector input. */
@@ -287,38 +331,30 @@ ray_t* ray_temporal_truncate(ray_t* input, int kind) {
     if (t == RAY_DATE || t == RAY_TIME) {
         const int32_t* d32 = (const int32_t*)base;
         if (src_has_nulls) {
-            for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i)) {
-                    out[i] = NULL_I64; ray_vec_set_null(result, i, true); continue;
+            for (int64_t i = 0; i < len; i++)
+                if (ray_vec_is_null(input, i) ||
+                    !rte_trunc_elem(t, (int64_t)d32[i], bucket, &out[i])) {
+                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
                 }
-                int64_t us = rte_to_us(t, (int64_t)d32[i]);
-                int64_t r = us % bucket;
-                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
-            }
         } else {
-            for (int64_t i = 0; i < len; i++) {
-                int64_t us = rte_to_us(t, (int64_t)d32[i]);
-                int64_t r = us % bucket;
-                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
-            }
+            for (int64_t i = 0; i < len; i++)
+                if (!rte_trunc_elem(t, (int64_t)d32[i], bucket, &out[i])) {
+                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
+                }
         }
     } else {
         const int64_t* d64 = (const int64_t*)base;
         if (src_has_nulls) {
-            for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i)) {
-                    out[i] = NULL_I64; ray_vec_set_null(result, i, true); continue;
+            for (int64_t i = 0; i < len; i++)
+                if (ray_vec_is_null(input, i) ||
+                    !rte_trunc_elem(t, d64[i], bucket, &out[i])) {
+                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
                 }
-                int64_t us = rte_to_us(t, d64[i]);
-                int64_t r = us % bucket;
-                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
-            }
         } else {
-            for (int64_t i = 0; i < len; i++) {
-                int64_t us = rte_to_us(t, d64[i]);
-                int64_t r = us % bucket;
-                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
-            }
+            for (int64_t i = 0; i < len; i++)
+                if (!rte_trunc_elem(t, d64[i], bucket, &out[i])) {
+                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
+                }
         }
     }
     return result;
@@ -383,14 +419,26 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
                 if (IN32) {                                                 \
                     /* RAY_DATE: int32 days → µs; RAY_TIME: int32 ms → µs */ \
                     int32_t raw32 = ((const int32_t*)m.morsel_ptr)[i];     \
+                    /* A DATE hundreds of millennia out (int32 days) would  \
+                     * overflow days×µs-per-day; it is not representable in  \
+                     * the µs domain, so emit a null like a null input. */   \
+                    if (in_type == RAY_DATE &&                              \
+                        ((int64_t)raw32 > INT64_MAX / USEC_PER_DAY ||       \
+                         (int64_t)raw32 < INT64_MIN / USEC_PER_DAY)) {      \
+                        out[off + i] = NULL_I64;                            \
+                        ray_vec_set_null(result, off + i, true);            \
+                        continue;                                           \
+                    }                                                       \
                     us = (in_type == RAY_DATE)                              \
                          ? (int64_t)raw32 * USEC_PER_DAY                   \
                          : (int64_t)raw32 * 1000LL;                        \
                 } else {                                                    \
-                    /* RAY_TIMESTAMP: int64 nanoseconds → µs */             \
+                    /* RAY_TIMESTAMP: int64 nanoseconds → µs, floor toward   \
+                     * -inf.  Truncate-then-adjust instead of negating: the  \
+                     * old -((-ns)+999)/1000 overflowed near INT64_MIN. */    \
                     int64_t ns = ((const int64_t*)m.morsel_ptr)[i];        \
-                    us = ns >= 0 ? ns / 1000LL                             \
-                                 : -(((-ns) + 999LL) / 1000LL);            \
+                    us = ns / 1000LL;                                       \
+                    if (ns % 1000LL != 0 && ns < 0) us--;                  \
                 }                                                           \
                 if (field == RAY_EXTRACT_EPOCH) {                          \
                     out[off + i] = us;                                      \
@@ -534,13 +582,29 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
                 int64_t us;                                                 \
                 if (IN32) {                                                 \
                     int32_t raw32 = ((const int32_t*)m.morsel_ptr)[i];     \
+                    /* Bound the DATE by the int64-NANOSECOND representable   \
+                     * day range, not just the µs one: the YEAR/MONTH arms    \
+                     * below re-multiply days_from_civil(...) — a day count   \
+                     * floored DOWN to the period start, up to a year beyond  \
+                     * `raw32` — by DT_USEC_PER_DAY, and the result is then    \
+                     * ×1000 to nanoseconds.  Matches rte_trunc_elem; a DATE   \
+                     * outside this range is not a TIMESTAMP, so null it. */   \
+                    if (in_type == RAY_DATE &&                              \
+                        ((int64_t)raw32 > INT64_MAX / 1000 / DT_USEC_PER_DAY || \
+                         (int64_t)raw32 < INT64_MIN / 1000 / DT_USEC_PER_DAY)) { \
+                        out[off + i] = NULL_I64;                            \
+                        ray_vec_set_null(result, off + i, true);            \
+                        continue;                                           \
+                    }                                                       \
                     us = (in_type == RAY_DATE)                              \
                          ? (int64_t)raw32 * DT_USEC_PER_DAY                \
                          : (int64_t)raw32 * 1000LL;                        \
                 } else {                                                    \
+                    /* ns → µs, floor toward -inf, overflow-free (the old    \
+                     * -((-ns)+999)/1000 overflowed near INT64_MIN). */      \
                     int64_t ns = ((const int64_t*)m.morsel_ptr)[i];        \
-                    us = ns >= 0 ? ns / 1000LL                             \
-                                 : -(((-ns) + 999LL) / 1000LL);            \
+                    us = ns / 1000LL;                                       \
+                    if (ns % 1000LL != 0 && ns < 0) us--;                  \
                 }                                                           \
                 int64_t out_us;                                             \
                 switch (field) {                                            \
@@ -597,6 +661,12 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
                     default:                                                \
                         out_us = us;                                        \
                         break;                                              \
+                }                                                           \
+                /* Result must fit int64 nanoseconds (out_us × 1000). */    \
+                if (out_us > INT64_MAX / 1000LL || out_us < INT64_MIN / 1000LL) { \
+                    out[off + i] = NULL_I64;                                \
+                    ray_vec_set_null(result, off + i, true);                \
+                    continue;                                               \
                 }                                                           \
                 out[off + i] = out_us * 1000LL; /* µs → ns for RAY_TIMESTAMP */ \
             }                                                               \
