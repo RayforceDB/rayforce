@@ -2,11 +2,10 @@
 ;; reduce_range type x null specialisations (src/ops/group.c).
 ;;
 ;; reduce_range is the inner reduction kernel for direct (raw-vec)
-;; sum/min/max/avg/first/last/var/stddev calls.  It dispatches per
-;; `input->type` (BOOL/U8, I16, I32, I64, F64, DATE, TIME, TIMESTAMP,
-;; SYM), then each integer/float arm goes through DISPATCH_I/F which
-;; macro-expands into four (HAS_NULLS x HAS_IDX) loop bodies so the
-;; compiler can DCE the inner per-row branches.
+;; sum/prod/all/any/min/max/avg/first/last/var/stddev calls.  It dispatches
+;; first by opcode, then type and (HAS_NULLS x HAS_IDX), so the compiler
+;; emits a loop containing only the accumulator fields needed by that
+;; opcode.  These assertions cover both serial loops and parallel merges.
 ;;
 ;; ARCHITECTURE NOTE on missed regions: the HAS_IDX=1 specialisations
 ;; in DISPATCH_I/F (and the corresponding `idx ? idx[i] : i` branch in
@@ -102,3 +101,20 @@
 ;; F64 + nulls + avg: F64 reduce_range HAS_NULLS=1 plus the OP_AVG
 ;; finaliser's null-aware divisor (uses non-null count).
 (avg (as 'F64 [10.0 0N 20.0 0N 30.0])) -- 20.0
+
+
+;; ─── Parallel opcode-specialised loops and merges ───────────────────
+;; RAY_PARALLEL_THRESHOLD is 65536.  Keep these vectors above it so each
+;; requested accumulator shape is also checked across worker-local merges.
+(set _Rspec (til 70000))
+(sum _Rspec) -- 2449965000
+(prod _Rspec) -- 0
+(prod (+ 1 (% _Rspec 1))) -- 1
+(min _Rspec) -- 0
+(max _Rspec) -- 69999
+(avg _Rspec) -- 34999.5
+(all (> (+ _Rspec 1) 0)) -- true
+(any (== _Rspec 69999)) -- true
+(any (< _Rspec 0)) -- false
+(< (abs (- (var_pop _Rspec) 408333333.25)) 0.001) -- true
+(del _Rspec) -- 0
