@@ -549,7 +549,7 @@ bool     ray_expr_disable; /* test knob: force the fallback path */
 static void expr_stats_dump(void) {
     static const char* names[EXPR_BAIL__N] = {
         "root-shape", "graph-size", "depth", "regs", "ins",
-        "mapcommon", "str", "nulls", "slice", "sym-domain",
+        "mapcommon", "str", "guid", "nulls", "slice", "sym-domain",
         "const", "null-shape", "other",
     };
     fprintf(stderr, "expr_compile ok=%llu\n",
@@ -687,6 +687,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 if (!col) EXPR_BAIL(EXPR_BAIL_OTHER);
                 if (col->type == RAY_MAPCOMMON) EXPR_BAIL(EXPR_BAIL_MAPCOMMON);
                 if (col->type == RAY_STR) EXPR_BAIL(EXPR_BAIL_STR); /* RAY_STR needs string comparison path */
+                /* GUID cells are 16-byte blobs the fused program has no
+                 * loads or compares for — without this bail the compiled
+                 * expression read garbage and predicates silently
+                 * matched nothing.  The unfused executor compares GUIDs
+                 * correctly. */
+                if (col->type == RAY_GUID) EXPR_BAIL(EXPR_BAIL_GUID);
                 if (col->attrs & RAY_ATTR_SLICE)     EXPR_BAIL(EXPR_BAIL_SLICE);
                 /* Length-1 columns used as scalar broadcasts are handled by the
                  * fallback's exec_elementwise_binary (which has vec/scalar routing).
@@ -3568,6 +3574,44 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             }
             binary_range_str(op, lhs, rhs, result, l_scalar, r_scalar, 0, len);
             fix_null_comparisons(lhs, rhs, result, l_scalar, r_scalar, len, op->opcode);
+            return result;
+        }
+    }
+
+    /* GUID comparison: 16-byte cells, memcmp equality.  Without this
+     * branch a guid predicate fell into the numeric loops, which read
+     * the cells at the wrong width and silently matched nothing.  Only
+     * == and != are defined for guid operands here (cmp.c orders guid
+     * ATOMS, but a ranged guid predicate over a column has no use). */
+    {
+        bool l_guid = (l_scalar ? (lhs->type == -RAY_GUID || lhs->type == RAY_GUID)
+                                : lhs->type == RAY_GUID);
+        bool r_guid = (r_scalar ? (rhs->type == -RAY_GUID || rhs->type == RAY_GUID)
+                                : rhs->type == RAY_GUID);
+        if (l_guid || r_guid) {
+            uint16_t opc = op->opcode;
+            if (!l_guid || !r_guid) {
+                ray_release(result);
+                return ray_error("type", "expr eval: cannot compare %s and %s",
+                                 ray_type_name(lhs->type), ray_type_name(rhs->type));
+            }
+            if (opc != OP_EQ && opc != OP_NE) {
+                ray_release(result);
+                return ray_error("type", "expr eval: guid operands support only == and !=");
+            }
+            uint8_t* out = (uint8_t*)ray_data(result);
+            const uint8_t* lb = (lhs->type == -RAY_GUID)
+                              ? (const uint8_t*)ray_data(lhs->obj)
+                              : (const uint8_t*)ray_data(lhs);
+            const uint8_t* rb = (rhs->type == -RAY_GUID)
+                              ? (const uint8_t*)ray_data(rhs->obj)
+                              : (const uint8_t*)ray_data(rhs);
+            for (int64_t i = 0; i < len; i++) {
+                const uint8_t* lp = lb + (l_scalar ? 0 : i * 16);
+                const uint8_t* rp = rb + (r_scalar ? 0 : i * 16);
+                uint8_t eq = (memcmp(lp, rp, 16) == 0) ? 1 : 0;
+                out[i] = (opc == OP_EQ) ? eq : (uint8_t)!eq;
+            }
             return result;
         }
     }

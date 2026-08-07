@@ -1,0 +1,32 @@
+;; select-where predicates that used to fail silently.
+;;
+;; GUID: the fused expression program has no 16-byte loads, and the
+;; elementwise fallback routed guid cells through the numeric loops —
+;; both silently matched nothing.  The compiler now bails GUID columns
+;; (EXPR_BAIL_GUID) and the fallback has a memcmp branch, so a guid
+;; equality predicate returns the matching rows.
+;;
+;; like: an unsupported input type in exec_like memset the result to
+;; all-false.  A list column (splayed string load shape) now delegates
+;; to the builtin's list branch; a non-string column raises.
+
+(set gs (guid 3))
+(set t (table [g v] (list gs [10 20 30])))
+(set g1 (at gs 1))
+
+;; guid equality predicate finds its row
+(get (select {from: t where: (== g g1)}) 'v) -- [20]
+(count (get (select {from: t where: (!= g g1)}) 'v)) -- 2
+
+;; guid predicate composes with aggregation
+(at (get (select {from: t where: (== g g1) s: (sum v)}) 's) 0) -- 20
+
+;; ordering on guid operands is undefined — loud, not silent
+(select {from: t where: (< g g1)}) !- type
+
+;; like over a list-of-strings column inside select-where
+(set ts (table [s v] (list (list "keep me" "drop" "also keep") [1 2 3])))
+(get (select {from: ts where: (like s "*keep*")}) 'v) -- [1 3]
+
+;; like over a non-string column raises instead of matching nothing
+(select {from: ts where: (like v "*1*")}) !- type
