@@ -1,0 +1,40 @@
+;; overflow_wrap.rfl — scalar integer +, -, * must wrap on overflow with
+;; DEFINED behavior, not signed-integer-overflow UB.
+;;
+;; ray_add_fn / ray_sub_fn / ray_mul_fn computed `as_i64(a) OP as_i64(b)`
+;; directly, so an i64 result that overflowed was undefined behavior — UBSan
+;; reported it at src/ops/arith.c:141 (+), :223 (-), :257 (*).  The wrapped
+;; value (INT64_MIN for MAX+1, which is the i64 null sentinel) was already
+;; what the code returned, so this only removes the UB; results are unchanged.
+;; Matches the vector arithmetic kernel (src/ops/expr.c OP_ADD/SUB/MUL), which
+;; already wraps via uint64.
+
+;; ── addition ────────────────────────────────────────────────────────
+;; MAX + 1 wraps to INT64_MIN, which prints as the i64 null.
+(nil? (+ 9223372036854775807 1)) -- true
+;; MAX + 2 wraps to INT64_MIN + 1 (a concrete, non-null value).
+(+ 9223372036854775807 2) -- -9223372036854775807
+;; Just-below-overflow is exact.
+(+ 9223372036854775806 1) -- 9223372036854775807
+
+;; ── subtraction ─────────────────────────────────────────────────────
+;; -MAX - 2 wraps around to +MAX.
+(- -9223372036854775807 2) -- 9223372036854775807
+;; 0 - INT64_MIN overflows (INT64_MIN has no positive counterpart) → wraps
+;; back to INT64_MIN = null.
+(nil? (- 0 -9223372036854775808)) -- true
+
+;; ── multiplication ──────────────────────────────────────────────────
+(* 9223372036854775807 2) -- -2
+(* 9223372036854775807 3) -- 9223372036854775805
+;; INT64_MIN * -1 overflows → wraps to INT64_MIN = null.
+(nil? (* -9223372036854775808 -1)) -- true
+
+;; ── ordinary arithmetic and narrow types are unaffected ─────────────
+(+ 2 3) -- 5
+(- 10 4) -- 6
+(* 6 7) -- 42
+(* 1000000 1000000) -- 1000000000000
+(+ 100h 200h) -- 300h
+(+ 5i 6i) -- 11i
+(+ 2.5 3.5) -- 6.0
