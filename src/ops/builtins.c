@@ -24,6 +24,7 @@
 /**   I/O builtins, type casting, and misc builtins extracted from eval.c.
  */
 
+#include <errno.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
@@ -1342,8 +1343,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as i64");
             char* end;
+            errno = 0;
             int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i64");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i64, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i64, value out of int64 range");
             return make_i64(v);
         }
         /* Vector/list cast */
@@ -1364,8 +1370,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIMESTAMP) return ray_i32((int32_t)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
+            errno = 0;
             long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i32");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i32, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i32, value out of int64 range");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
@@ -1386,8 +1397,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIMESTAMP) return ray_i16((int16_t)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
+            errno = 0;
             long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i16");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i16, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i16, value out of int64 range");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
@@ -1410,8 +1426,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as f64");
             char* end;
+            errno = 0;
             double v = strtod(sp, &end);
             if (end == sp) return ray_error("domain", "as: cannot parse str as f64");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as f64, unexpected trailing characters");
             /* STAGE 2 (ingest/cast STR→F64): canonicalize at the ingest entry
              * point.  strtod("inf")/strtod("1e400")/strtod("nan") would yield a
              * non-finite F64; make_f64 maps every non-finite to NULL_F64 (0Nf),
@@ -1900,8 +1919,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_F64) return ray_u8(ray_cast_f64_to_u8_null(val->f64));
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
-            char* end; long v = strtol(sp, &end, 10);
+            char* end; errno = 0;
+            long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as u8");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as u8, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as u8, value out of int64 range");
             return ray_u8((uint8_t)v);
         }
         /* Vector cast */
