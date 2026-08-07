@@ -134,20 +134,31 @@ static inline bool rte_extract_elem(int8_t t, int64_t raw, int field, int64_t* o
 }
 
 /* Truncate a raw temporal slot to a TIMESTAMP-ns bucket.  Returns false when
- * the source or the bucketed result is outside the int64 nanosecond range
+ * the source, or the bucketed result, is outside the int64 nanosecond range
  * (caller emits null): a value hundreds of millennia out cannot be a
- * TIMESTAMP.  Keeps one bucket of headroom because the floor step can
- * subtract up to `bucket` µs before the ×1000 ns conversion.  The headroom
- * is applied unconditionally (not only when a floor actually happens), so up
- * to one bucket of representable values at the very low edge round to null —
- * an immaterial band ~292 millennia before 2000, not worth an extra branch
- * in this hot kernel. */
+ * TIMESTAMP.  The floor uses overflow-safe arithmetic and the ACTUAL bucketed
+ * result is range-checked (mirroring exec_date_trunc), so a value whose
+ * floored bucket is still representable — e.g. the low day boundary
+ * 1707.09.23 — round-trips instead of being rejected by a pre-floor headroom
+ * that disagreed with the DAG path. */
 static inline bool rte_trunc_elem(int8_t t, int64_t raw, int64_t bucket, int64_t* out_ns) {
     int64_t us;
     if (!rte_to_us_ck(t, raw, &us)) return false;
-    if (us > INT64_MAX / 1000LL || us < INT64_MIN / 1000LL + bucket) return false;
+    /* Floor `us` to the bucket boundary (toward -inf).  `us - r` truncates
+     * toward zero (magnitude only shrinks, never overflows); a negative
+     * remainder needs one more bucket subtracted to floor toward -inf — the
+     * one step that can underflow (a DATE reaches `us` across the full µs
+     * range), so guard it. */
     int64_t r = us % bucket;
-    int64_t out_us = us - r - (r < 0 ? bucket : 0);
+    int64_t out_us = us - r;
+    if (r < 0) {
+        if (out_us < INT64_MIN + bucket) return false;
+        out_us -= bucket;
+    }
+    /* Range-check the ACTUAL floored result against the int64 nanosecond
+     * domain (out_us × 1000), matching exec_date_trunc — not a conservative
+     * pre-floor headroom, which rejected representable boundary values. */
+    if (out_us > INT64_MAX / 1000LL || out_us < INT64_MIN / 1000LL) return false;
     *out_ns = out_us * 1000LL;
     return true;
 }

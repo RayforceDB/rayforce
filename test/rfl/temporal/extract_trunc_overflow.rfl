@@ -82,3 +82,13 @@
 (nil? (date (as 'TIMESTAMP -9223372036854775807))) -- true
 (date (as 'DATE 8766)) -- 2024.01.01D00:00:00.000000000
 (nil? (date (as 'DATE 2000000000))) -- true
+
+;; ── low day boundary: floor result is representable (PR #386 review) ─
+;; A TIMESTAMP whose day-floored value is still inside the int64-ns range
+;; must round-trip, not null.  The old pre-floor headroom rejected it — so
+;; the standalone (date …) path disagreed with the DAG ts.date path.  The
+;; floor now uses overflow-safe arithmetic and range-checks the actual
+;; result, so both paths agree at the boundary.
+(date (as 'TIMESTAMP -9223286400000000000)) -- 1707.09.23D00:00:00.000000000
+(set Tbnd (table [ts] (list (as 'TIMESTAMP [-9223286400000000000]))))
+(at (at (select {v: ts.date from: Tbnd}) 'v) 0) -- 1707.09.23D00:00:00.000000000
