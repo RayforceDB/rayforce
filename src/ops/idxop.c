@@ -453,6 +453,7 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
     const uint8_t* base = (const uint8_t*)ray_data(v);
 
     for (uint32_t g = 0; g < n_chunks; g++) {
+        if (RAY_UNLIKELY(ray_interrupted())) return RAY_ERR_CANCEL;
         int64_t s = (int64_t)g * csz;
         int64_t e = s + csz; if (e > n) e = n;
         int64_t mn = INT64_MAX, mx = INT64_MIN;
@@ -491,6 +492,7 @@ static ray_err_t chunk_zone_scan_float(ray_t* v, ray_index_t* ix,
     const uint8_t* base = (const uint8_t*)ray_data(v);
 
     for (uint32_t g = 0; g < n_chunks; g++) {
+        if (RAY_UNLIKELY(ray_interrupted())) return RAY_ERR_CANCEL;
         int64_t s = (int64_t)g * csz;
         int64_t e = s + csz; if (e > n) e = n;
         double mn = INFINITY, mx = -INFINITY;
@@ -965,6 +967,12 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     int64_t n_keys = 0, n_groups = 0;
 
     for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY((i & 0xFFFF) == 0 && ray_interrupted())) {
+            scratch_free(btab_hdr);
+            scratch_free(rgid_hdr);
+            ray_release(gkeys);
+            return ray_error("cancel", "interrupted");
+        }
         if (ray_vec_is_null(v, i)) { rgid[i] = -1; continue; }  /* SYM is null-free → always false */
         int64_t kw = (v->type == RAY_SYM)
             ? ray_read_sym(base, i, RAY_SYM, v->attrs)  /* domain id, width-aware */
@@ -1003,14 +1011,26 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     int64_t* of = (int64_t*)ray_data(offs);
     int64_t* rw = (int64_t*)ray_data(rows);
     memset(of, 0, (size_t)(n_groups + 1) * sizeof(int64_t));
-    for (int64_t i = 0; i < n; i++)
+    for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY((i & 0xFFFF) == 0 && ray_interrupted()))
+            goto hash_cancel_csr;
         if (rgid[i] >= 0) of[rgid[i] + 1]++;
-    for (int64_t g = 0; g < n_groups; g++)
+    }
+    for (int64_t g = 0; g < n_groups; g++) {
+        if (RAY_UNLIKELY((g & 0xFFFF) == 0 && ray_interrupted()))
+            goto hash_cancel_csr;
         of[g + 1] += of[g];
-    for (int64_t i = 0; i < n; i++)
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY((i & 0xFFFF) == 0 && ray_interrupted()))
+            goto hash_cancel_csr;
         if (rgid[i] >= 0) rw[of[rgid[i]]++] = i;
-    for (int64_t g = n_groups; g > 0; g--)
+    }
+    for (int64_t g = n_groups; g > 0; g--) {
+        if (RAY_UNLIKELY((g & 0xFFFF) == 0 && ray_interrupted()))
+            goto hash_cancel_csr;
         of[g] = of[g - 1];
+    }
     of[0] = 0;
     scratch_free(rgid_hdr);
 
@@ -1027,6 +1047,11 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     int64_t* tbl = (int64_t*)ray_data(table);
     memset(tbl, 0, (size_t)cap * sizeof(int64_t));
     for (int64_t g = 0; g < n_groups; g++) {
+        if (RAY_UNLIKELY((g & 0xFFFF) == 0 && ray_interrupted())) {
+            ray_release(table); ray_release(gkeys);
+            ray_release(offs);  ray_release(rows);
+            return ray_error("cancel", "interrupted");
+        }
         uint64_t slot = mix64((uint64_t)gk[g]) & mask;
         while (tbl[slot] != 0) slot = (slot + 1) & mask;
         tbl[slot] = g + 1;
@@ -1049,6 +1074,13 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     ix->u.hash.order_sym = -1;
 
     return attach_finalize(v, idx);
+
+hash_cancel_csr:
+    scratch_free(rgid_hdr);
+    ray_release(gkeys);
+    ray_release(offs);
+    ray_release(rows);
+    return ray_error("cancel", "interrupted");
 }
 
 /* --------------------------------------------------------------------------
