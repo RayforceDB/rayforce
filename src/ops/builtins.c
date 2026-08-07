@@ -505,8 +505,13 @@ static int8_t resolve_type_name(int64_t sym_id) {
     else if (len == 3 && memcmp(name, "F64", 3) == 0) result = RAY_F64;
     else if (len == 2 && memcmp(name, "B8", 2) == 0) result = RAY_BOOL;
     else if (len == 2 && memcmp(name, "U8", 2) == 0) result = RAY_U8;
+    else if (len == 3 && memcmp(name, "SYM", 3) == 0) result = RAY_SYM;
     else if (len == 6 && memcmp(name, "SYMBOL", 6) == 0) result = RAY_SYM;
     else if (len == 3 && memcmp(name, "STR", 3) == 0) result = RAY_STR;
+    /* CSV cells are scalar text, so the historical LIST schema spelling is
+     * materialized as the native packed STR column rather than a boxed list.
+     * This keeps schemas copied from older table displays loadable. */
+    else if (len == 4 && memcmp(name, "LIST", 4) == 0) result = RAY_STR;
     else if (len == 3 && memcmp(name, "F32", 3) == 0) result = RAY_F32;
     else if (len == 4 && memcmp(name, "DATE", 4) == 0) result = RAY_DATE;
     else if (len == 4 && memcmp(name, "TIME", 4) == 0) result = RAY_TIME;

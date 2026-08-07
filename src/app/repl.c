@@ -147,6 +147,10 @@ static void render_progress_full(int64_t done, int64_t total,
     if (total > 0) {
         pct = (double)done / (double)total;
         if (pct > 1.0) pct = 1.0;
+        /* A dispatch can finish before its enclosing query's cleanup and
+         * finalization phases.  Reserve 100% for the final snapshot (which
+         * clears the line) so the live bar never claims completion early. */
+        if (pct >= 1.0) pct = 0.99;
         int sub = (int)(pct * sub_total);
         full = sub / 8;
         frac = sub % 8;
