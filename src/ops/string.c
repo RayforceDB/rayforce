@@ -27,6 +27,7 @@
 #include "ops/rowsel.h"
 #include "core/pool.h"
 #include "lang/format.h"   /* ray_type_name (error context) */
+#include "lang/internal.h" /* ray_like_fn (list-of-strings delegate) */
 
 /* ============================================================================
  * OP_LIKE: glob pattern matching on STR / SYM columns.  See ops/glob.[ch].
@@ -738,8 +739,21 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
                           : ray_glob_match(sp, sl, pat_str, pat_len)) ? 1 : 0;
             }
         }
+    } else if (in_type == RAY_LIST) {
+        /* List of string/symbol atoms — the shape splayed string columns
+         * load as (col_load_str_list).  Delegate to the builtin, which
+         * owns the list branch. */
+        ray_release(result);
+        ray_t* r = ray_like_fn(input, pat_v);
+        ray_release(input); ray_release(pat_v);
+        return r;
     } else {
-        memset(dst, 0, (size_t)len);
+        /* Previously memset-zero: a predicate over an unsupported column
+         * type silently matched nothing.  Surface the type error the
+         * direct builtin raises instead. */
+        ray_release(result); ray_release(input); ray_release(pat_v);
+        return ray_error("type", "like: expects a string or symbol column, got %s",
+                         ray_type_name(in_type));
     }
 
     ray_release(input); ray_release(pat_v);

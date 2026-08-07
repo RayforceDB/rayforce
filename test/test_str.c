@@ -849,12 +849,12 @@ static ray_t* make_str_sym_table(void) {
     return tbl;
 }
 
-/* exec_like: non-STR/non-SYM input → memset(dst,0) else-branch */
+/* exec_like: non-STR/non-SYM input → type error */
 static test_result_t test_str_like_non_string_type(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    /* Build an I64 column — exec_like's else branch fills with 0 */
+    /* Build an I64 column — exec_like's else branch raises a type error */
     ray_t* col = ray_vec_new(RAY_I64, 3);
     col->len = 3;
     int64_t* cd = (int64_t*)ray_data(col);
@@ -871,16 +871,10 @@ static test_result_t test_str_like_non_string_type(void) {
     ray_op_t* lk  = ray_like(g, val, pat);
     ray_t* result = ray_execute(g, lk);
 
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
-    TEST_ASSERT_EQ_I(result->len, 3);
-    uint8_t* rd = (uint8_t*)ray_data(result);
-    /* All false — I64 is not a string type */
-    TEST_ASSERT_EQ_I(rd[0], 0);
-    TEST_ASSERT_EQ_I(rd[1], 0);
-    TEST_ASSERT_EQ_I(rd[2], 0);
+    /* I64 is not a string type — loud, not a silently empty match */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
 
-    ray_release(result);
+    ray_error_free(result);  /* ray_release is a no-op on errors */
     ray_graph_free(g);
     ray_release(tbl);
     ray_sym_destroy();
