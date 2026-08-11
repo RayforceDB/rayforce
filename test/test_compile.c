@@ -34,6 +34,7 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "lang/parse.h"
+#include "ops/ops.h"
 #include <string.h>
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
@@ -87,19 +88,41 @@ static void compile_teardown(void) {
 } while (0)
 
 /* ════════════════════════════════════════════════════════════════════
- * 1. (set name val) inside a compiled lambda body (line 225-230)
- *    The compiler emits OP_CALLD for set because set modifies the
- *    global environment and the compiler defers to the interpreter.
+ * 1. (set name val) inside a compiled lambda body
+ *    The compiler evaluates the value in the current frame, forces lazy
+ *    results, and stores the concrete value in the global environment.
  * ════════════════════════════════════════════════════════════════════ */
 static test_result_t test_compile_set_inside_fn(void) {
-    /* Define a fn that calls (set ...) inside its body using a constant
-     * value (not a local variable) so the deferred AST can resolve.
-     * The compile path for (set name val) delegates to OP_CALLD. */
+    /* Define a fn that calls (set ...) inside its body. */
     EVAL_I64(
         "(do "
           "(set f (fn [] (set compile_set_g 42) compile_set_g)) "
           "(f))",
         42);
+    PASS();
+}
+
+/* A global written by compiled `set` must hold the concrete result, not the
+ * single-use lazy handle returned by first/distinct/etc. */
+static test_result_t test_compile_set_forces_lazy_value(void) {
+    EVAL_I64(
+        "(do "
+          "(set xs [5 1 4 2]) "
+          "(set f (fn [] (do (set lazy_set_g (first xs)) 0))) "
+          "(f) "
+          "(+ lazy_set_g lazy_set_g))",
+        10);
+    PASS();
+}
+
+static test_result_t test_compile_set_forces_lazy_chain(void) {
+    EVAL_I64(
+        "(do "
+          "(set xs [\"aaa\" \"bbb\" \"aaa\"]) "
+          "(set f (fn [] (do (set lazy_set_all (distinct xs)) 0))) "
+          "(f) "
+          "(+ (+ 0 (count lazy_set_all)) (count lazy_set_all)))",
+        4);
     PASS();
 }
 
@@ -120,6 +143,43 @@ static test_result_t test_compile_if_no_else_false(void) {
     EVAL_I64(
         "(do (set f (fn [x] (if (> x 0) 99))) (f -1))",
         0);
+    PASS();
+}
+
+/* A compiled condition must test the value produced by a lazy aggregate. */
+static test_result_t test_compile_if_forces_lazy_condition(void) {
+    EVAL_I64(
+        "(do (set xs [0 1 4 2]) (set f (fn [] (if (first xs) 1 0))) (f))",
+        0);
+    PASS();
+}
+
+/* A stale lazy alias is rejected before graph construction dereferences its
+ * cleared root.  This is a defensive backstop for callers outside bindings. */
+static test_result_t test_compile_spent_lazy_returns_error(void) {
+    ray_t* vec = ray_eval_str("[1 2 1]");
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_t* lazy = ray_distinct_fn(vec);
+    TEST_ASSERT_NOT_NULL(lazy);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy));
+    ray_retain(lazy); /* preserve one alias after materialization consumes one */
+    ray_t* concrete = ray_lazy_materialize(lazy);
+    TEST_ASSERT_NOT_NULL(concrete);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(concrete));
+
+    ray_t* err = ray_lazy_append(lazy, OP_COUNT);
+    TEST_ASSERT_NOT_NULL(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+
+    err = ray_lazy_materialize(lazy); /* consumes the final lazy alias */
+    TEST_ASSERT_NOT_NULL(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+
+    ray_release(concrete);
+    ray_release(vec);
     PASS();
 }
 
@@ -948,8 +1008,12 @@ static test_result_t test_compile_default_switch_case(void) {
  * ════════════════════════════════════════════════════════════════════ */
 const test_entry_t compile_entries[] = {
     { "compile/set_inside_fn",       test_compile_set_inside_fn,       compile_setup, compile_teardown },
+    { "compile/set_forces_lazy_value", test_compile_set_forces_lazy_value, compile_setup, compile_teardown },
+    { "compile/set_forces_lazy_chain", test_compile_set_forces_lazy_chain, compile_setup, compile_teardown },
     { "compile/if_no_else_true",     test_compile_if_no_else_true,     compile_setup, compile_teardown },
     { "compile/if_no_else_false",    test_compile_if_no_else_false,    compile_setup, compile_teardown },
+    { "compile/if_forces_lazy_condition", test_compile_if_forces_lazy_condition, compile_setup, compile_teardown },
+    { "compile/spent_lazy_returns_error", test_compile_spent_lazy_returns_error, compile_setup, compile_teardown },
     { "compile/do_inside_fn",        test_compile_do_inside_fn,        compile_setup, compile_teardown },
     { "compile/do_multi_exprs",      test_compile_do_multi_exprs,      compile_setup, compile_teardown },
     { "compile/nested_fn",           test_compile_nested_fn,           compile_setup, compile_teardown },
