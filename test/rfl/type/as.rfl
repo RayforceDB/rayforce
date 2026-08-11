@@ -262,6 +262,22 @@
 (as 'date 2000.01.02D00:00:00.000000000) -- 2000.01.02
 ;; date <- String
 (as 'date "2024.03.20") -- 2024.03.20
+;; Leap day is valid in a leap year, rejected otherwise.
+(as 'date "2024.02.29") -- 2024.02.29
+(as 'date "2023.02.29") !- domain
+;; date <- String: malformed input must be REJECTED, not silently parsed.
+;; A month past 12 used to index the days-in-month table out of bounds
+;; (ASan OOB read); trailing garbage and loose fields were also accepted.
+(as 'date "9999.99.99") !- domain
+(as 'date "2024.13.01") !- domain
+(as 'date "2024.00.10") !- domain
+(as 'date "2024.02.31") !- domain
+(as 'date "2024.04.31") !- domain
+(as 'date "2024.01.00") !- domain
+(as 'date "2024.01.02junk") !- domain
+(as 'date "2024.1.2") !- domain
+(as 'date "2024/01/02") !- domain
+(as 'date "2024-01-02") !- domain
 ;; ========== DATE VECTOR CASTS ==========
 (type (as 'DATE [0 1 2])) -- 'DATE
 (as 'I64 (as 'DATE [0 1 2])) -- [0 1 2]
@@ -309,6 +325,21 @@
 (as 'time "20:00:00") -- 20:00:00.000
 (as 'time "20:00:00.") -- 20:00:00.000
 (as 'time "20:00:00.0") -- 20:00:00.000
+;; TIME is a signed duration: hours may exceed a day and go negative,
+;; and HH:MM (no seconds) is accepted.
+(as 'time "25:00:00") -- 25:00:00.000
+(as 'time "-5:00:00") -- -05:00:00.000
+(as 'time "12:34") -- 12:34:00.000
+;; Malformed TIME strings must be REJECTED, not silently normalized.
+;; The old sscanf path accepted trailing garbage and out-of-range fields
+;; ("25:99:99" wrapped to 26:40:39).
+(as 'time "12:34:56junk") !- domain
+(as 'time "12:34:56.789junk") !- domain
+(as 'time "25:99:99") !- domain
+(as 'time "99:99:99") !- domain
+(as 'time "12x34x56") !- domain
+(as 'time "12:3") !- domain
+(as 'time "x") !- domain
 ;; time literals with 1-3 digit fractional seconds
 10:00:00.1 -- 10:00:00.001
 10:00:00.01 -- 10:00:00.001

@@ -505,8 +505,13 @@ static int8_t resolve_type_name(int64_t sym_id) {
     else if (len == 3 && memcmp(name, "F64", 3) == 0) result = RAY_F64;
     else if (len == 2 && memcmp(name, "B8", 2) == 0) result = RAY_BOOL;
     else if (len == 2 && memcmp(name, "U8", 2) == 0) result = RAY_U8;
+    else if (len == 3 && memcmp(name, "SYM", 3) == 0) result = RAY_SYM;
     else if (len == 6 && memcmp(name, "SYMBOL", 6) == 0) result = RAY_SYM;
     else if (len == 3 && memcmp(name, "STR", 3) == 0) result = RAY_STR;
+    /* CSV cells are scalar text, so the historical LIST schema spelling is
+     * materialized as the native packed STR column rather than a boxed list.
+     * This keeps schemas copied from older table displays loadable. */
+    else if (len == 4 && memcmp(name, "LIST", 4) == 0) result = RAY_STR;
     else if (len == 3 && memcmp(name, "F32", 3) == 0) result = RAY_F32;
     else if (len == 4 && memcmp(name, "DATE", 4) == 0) result = RAY_DATE;
     else if (len == 4 && memcmp(name, "TIME", 4) == 0) result = RAY_TIME;
@@ -1553,18 +1558,48 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIME) return ray_date((int64_t)val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_date(ts_days_floor(val->i64));
         if (val->type == -RAY_STR) {
-            /* Parse "YYYY.MM.DD" format */
+            /* Parse "YYYY.MM.DD" with a bounded cursor that must consume the
+             * whole string.  The old sscanf path accepted trailing garbage
+             * ("2024.01.02junk") and, worse, never range-checked the month:
+             * a month > 13 drove the days-in-month table index out of bounds
+             * — e.g. (as 'DATE "9999.99.99") read md[99] (ASan OOB). Validate
+             * the month BEFORE indexing the table, and the day against the
+             * actual days in that (possibly leap) month. Mirrors the strict
+             * TIMESTAMP string cast. */
             const char* sp = ray_str_ptr(val);
-            int y, m, d2;
-            if (sscanf(sp, "%d.%d.%d", &y, &m, &d2) != 3) return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            size_t sl = ray_str_len(val);
+            size_t i = 0;
+            int y = 0, m = 0, d2 = 0;
+            #define DT_DIGITS(w, out) do {                                                 \
+                (out) = 0;                                                                 \
+                for (int _k = 0; _k < (w); _k++) {                                         \
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')                             \
+                        return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD"); \
+                    (out) = (out) * 10 + (sp[i] - '0'); i++;                               \
+                }                                                                         \
+            } while (0)
+            DT_DIGITS(4, y);
+            if (i >= sl || sp[i] != '.') return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            i++;
+            DT_DIGITS(2, m);
+            if (i >= sl || sp[i] != '.') return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            i++;
+            DT_DIGITS(2, d2);
+            if (i != sl) return ray_error("domain", "as: cannot parse str as date, unexpected trailing characters");
+            #undef DT_DIGITS
+            static const int dt_md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            if (m < 1 || m > 12)
+                return ray_error("domain", "as: cannot parse str as date, month out of range");
+            int mdays = dt_md[m] + (m == 2 && leap ? 1 : 0);
+            if (d2 < 1 || d2 > mdays)
+                return ray_error("domain", "as: cannot parse str as date, day out of range for month");
             int64_t days = 0;
             { int ty;
               for (ty = 2000; ty < y; ty++) days += (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
               for (ty = y; ty < 2000; ty++) days -= (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
             }
-            { static const int md2[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-              int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-              for (int mi = 1; mi < m; mi++) days += md2[mi] + (mi == 2 && leap ? 1 : 0);
+            { for (int mi = 1; mi < m; mi++) days += dt_md[mi] + (mi == 2 && leap ? 1 : 0);
               days += d2 - 1;
             }
             return ray_date(days);
@@ -1592,21 +1627,60 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
              * matching wall-clock semantics. */
             return ray_time((int64_t)(ts_ns_in_day(val->i64) / 1000000LL));
         if (val->type == -RAY_STR) {
-            /* Parse "HH:MM:SS[.mmm]" */
+            /* Parse "[-]HH:MM[:SS][.fff]" with a bounded cursor that must
+             * consume the whole string.  TIME is a signed duration — ms-of-day
+             * can exceed a day and go negative (see .csv.read round-tripping) —
+             * so the hour field is variable width and unbounded, but minutes
+             * and seconds are 0-59.  The old sscanf path accepted trailing
+             * garbage ("12:34:56junk") and out-of-range fields ("25:99:99" →
+             * 26:40:39), silently corrupting the value; mirror the strict DATE
+             * / TIMESTAMP string casts. */
             const char* sp = ray_str_ptr(val);
-            int th = 0, tm = 0, ts = 0, tms = 0;
-            int nr = sscanf(sp, "%d:%d:%d", &th, &tm, &ts);
-            if (nr < 2) return ray_error("domain", "as: cannot parse str as time, expected HH:MM:SS[.mmm]");
-            const char* dot = strchr(sp, '.');
-            if (dot) {
-                dot++;
+            size_t sl = ray_str_len(val);
+            size_t i = 0;
+            int64_t sign = 1;
+            if (i < sl && sp[i] == '-') { sign = -1; i++; }
+            /* Variable-width hour, >= 1 digit, capped so ms cannot overflow. */
+            if (i >= sl || sp[i] < '0' || sp[i] > '9')
+                return ray_error("domain", "as: cannot parse str as time, expected [-]HH:MM[:SS][.fff]");
+            int64_t hh = 0;
+            int hd = 0;
+            while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                hh = hh * 10 + (sp[i] - '0'); i++;
+                if (++hd > 7) return ray_error("domain", "as: cannot parse str as time, hour field too long");
+            }
+            /* Read exactly 2 digits into `out`, validate 0..59. */
+            #define TM_2DIGIT(out) do {                                                       \
+                if (i + 1 >= sl || sp[i] < '0' || sp[i] > '9' || sp[i+1] < '0' || sp[i+1] > '9') \
+                    return ray_error("domain", "as: cannot parse str as time, expected 2-digit field"); \
+                (out) = (sp[i]-'0')*10 + (sp[i+1]-'0'); i += 2;                              \
+                if ((out) > 59) return ray_error("domain", "as: cannot parse str as time, minute/second out of range"); \
+            } while (0)
+            if (i >= sl || sp[i] != ':')
+                return ray_error("domain", "as: cannot parse str as time, expected ':' after hour");
+            i++;
+            int mm = 0, ss = 0, tms = 0;
+            TM_2DIGIT(mm);
+            if (i < sl && sp[i] == ':') { i++; TM_2DIGIT(ss); }
+            #undef TM_2DIGIT
+            /* Optional fractional seconds → milliseconds; a bare trailing '.'
+             * is accepted as .000. */
+            if (i < sl && sp[i] == '.') {
+                i++;
                 char mbuf[4] = "000";
                 int mi = 0;
-                while (*dot >= '0' && *dot <= '9' && mi < 3) mbuf[mi++] = *dot++;
+                while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                    if (mi < 3) mbuf[mi++] = sp[i];
+                    i++;
+                }
                 tms = (int)strtol(mbuf, NULL, 10);
             }
-            int32_t ms = (int32_t)th * 3600000 + (int32_t)tm * 60000 + (int32_t)ts * 1000 + tms;
-            return ray_time((int64_t)ms);
+            if (i != sl)
+                return ray_error("domain", "as: cannot parse str as time, unexpected trailing characters");
+            int64_t ms = sign * (hh * 3600000LL + (int64_t)mm * 60000LL + (int64_t)ss * 1000LL + tms);
+            if (ms > INT32_MAX || ms < INT32_MIN)
+                return ray_error("domain", "as: cannot parse str as time, out of int32 millisecond range");
+            return ray_time(ms);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)

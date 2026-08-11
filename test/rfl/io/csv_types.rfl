@@ -353,6 +353,21 @@
 (set Tcardlostr (.csv.read [STR] "rf_csv_card_lo.csv"))
 (type (at Tcardlostr 'k)) -- 'STR
 
+;; ════════════════════════════════════════════════════════════════════════════
+;; Explicit schema aliases and exact width validation.
+;; SYM is the canonical name printed by `type`; SYMBOL remains the long alias.
+;; Historical LIST text columns materialize as packed STR columns.  A schema
+;; must describe every CSV column exactly instead of failing later as OOM.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 's,text\nfoo,hello\nbar,world\n' > rf_test_csv_types_alias.csv") -- 0
+(set Talias (.csv.read [SYM LIST] "rf_test_csv_types_alias.csv"))
+(type (at Talias 's)) -- 'SYM
+(type (at Talias 'text)) -- 'STR
+(at (at Talias 'text) 0) -- "hello"
+(.csv.read [SYM] "rf_test_csv_types_alias.csv") !- length
+(.csv.read [SYM LIST I64] "rf_test_csv_types_alias.csv") !- length
+(.sys.exec "rm -f rf_test_csv_types_alias.csv") -- 0
+
 ;; ── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -f rf_csv_card_*.csv") -- 0
 (.sys.exec "rm -f rf_test_csv_types_*.csv") -- 0

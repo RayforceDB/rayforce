@@ -101,7 +101,6 @@ typedef struct {
      * instead of being whatever (uint64) wrap left in sum_i. */
     double sum_d;
     int64_t cnt;
-    int64_t null_count;
     int64_t zero_count;
     bool has_first;
 } reduce_acc_t;
@@ -112,7 +111,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
     acc->sum_d = 0;
-    acc->cnt = 0; acc->null_count = 0; acc->zero_count = 0; acc->has_first = false;
+    acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
 }
 
 /* Lexicographic SYM compare — resolves both sym_ids to strings and
@@ -265,6 +264,32 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
     return result;
 }
 
+/* Reduction field mask.  Every REDUCE_LOOP_* invocation receives a compile-time
+ * constant mask selected by opcode BEFORE entering the element loop.  The
+ * compiler therefore removes every accumulator update that the requested
+ * reduction does not need: OP_SUM emits a sum-only loop, OP_MIN a min-only
+ * loop, OP_VAR the sum/sum-square/count loop, and so on. */
+#define RED_NEED_SUM       (1u << 0)
+#define RED_NEED_SUM_SQ    (1u << 1)
+#define RED_NEED_PROD      (1u << 2)
+#define RED_NEED_SUM_D     (1u << 3)  /* integer stream accumulated as f64 */
+#define RED_NEED_COUNT     (1u << 4)
+#define RED_NEED_ZERO      (1u << 5)
+#define RED_NEED_MIN       (1u << 6)
+#define RED_NEED_MAX       (1u << 7)
+#define RED_NEED_FIRST     (1u << 8)
+#define RED_NEED_LAST      (1u << 9)
+
+#define RED_MASK_ANY       (RED_NEED_COUNT | RED_NEED_ZERO)
+#define RED_MASK_MIN       (RED_NEED_COUNT | RED_NEED_MIN)
+#define RED_MASK_MAX       (RED_NEED_COUNT | RED_NEED_MAX)
+#define RED_MASK_FIRST     (RED_NEED_COUNT | RED_NEED_FIRST)
+#define RED_MASK_LAST      (RED_NEED_COUNT | RED_NEED_LAST)
+#define RED_MASK_AVG_I     (RED_NEED_SUM_D | RED_NEED_COUNT)
+#define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
+#define RED_MASK_STATS_I   (RED_NEED_SUM_D | RED_NEED_SUM_SQ | RED_NEED_COUNT)
+#define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
+
 /* Integer reduction loop — reads native type T, accumulates as i64.
  * HAS_NULLS and HAS_IDX must be integer literal constants (0 or 1) so the
  * compiler dead-code-eliminates the corresponding branches in every
@@ -276,108 +301,231 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
  * NULL_I32, NULL_I64).  For BOOL/U8 the sentinel slot is unused
  * (those types are non-nullable; dispatcher pins HAS_NULLS=0) so any
  * value works; we pass 0 for compileability. */
-#define REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, HAS_NULLS, HAS_IDX, idx) \
+#define REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             T raw = d[row]; \
-            if ((HAS_NULLS) && raw == (T)(NULL_SENT)) { (acc)->null_count++; continue; } \
+            if ((HAS_NULLS) && raw == (T)(NULL_SENT)) continue; \
             int64_t v = (int64_t)raw; \
             /* sum/sum_sq may overflow on signed arithmetic — use defined \
              * unsigned wrap (same semantic, no UBSan whine). */ \
-            (acc)->sum_i    = (int64_t)((uint64_t)(acc)->sum_i    + (uint64_t)v); \
-            (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
-            (acc)->prod_i   = (int64_t)((uint64_t)(acc)->prod_i   * (uint64_t)v); \
-            (acc)->sum_d   += (double)v; \
-            if (v == 0) (acc)->zero_count++; \
-            if (v < (acc)->min_i) (acc)->min_i = v; \
-            if (v > (acc)->max_i) (acc)->max_i = v; \
-            if (!(acc)->has_first) { (acc)->first_i = v; (acc)->has_first = true; } \
-            (acc)->last_i = v; (acc)->cnt++; \
+            if ((NEEDS) & RED_NEED_SUM) \
+                (acc)->sum_i = (int64_t)((uint64_t)(acc)->sum_i + (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_SQ) \
+                (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_PROD) \
+                (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
+            if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
+            if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
+            if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
+                (acc)->first_i = v; (acc)->has_first = true; \
+            } \
+            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
+        } \
+    } while (0)
+
+/* BOOL/U8 nulls, when present, live in the vector bitmap rather than in-band
+ * as a sentinel.  Keep a sibling loop so opcode specialization remains true
+ * for these types as well. */
+#define REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
+    do { \
+        const T* d = (const T*)(base); \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = (HAS_IDX) ? (idx)[i] : i; \
+            if ((HAS_NULLS) && ray_vec_is_null((input), row)) continue; \
+            int64_t v = (int64_t)d[row]; \
+            if ((NEEDS) & RED_NEED_SUM) \
+                (acc)->sum_i = (int64_t)((uint64_t)(acc)->sum_i + (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_SQ) \
+                (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_PROD) \
+                (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
+            if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
+            if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
+            if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
+                (acc)->first_i = v; (acc)->has_first = true; \
+            } \
+            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
 
 /* Float reduction loop — see REDUCE_LOOP_I for HAS_NULLS/HAS_IDX semantics.
  * F32/F64 null = NaN; both accumulate in the shared F64 reduction lanes. */
-#define REDUCE_LOOP_F(T, base, start, end, acc, HAS_NULLS, HAS_IDX, idx) \
+#define REDUCE_LOOP_F(T, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             double v = (double)d[row]; \
-            if ((HAS_NULLS) && v != v) { (acc)->null_count++; continue; } \
-            (acc)->sum_f += v; (acc)->sum_sq_f += v * v; (acc)->prod_f *= v; \
-            if (v == 0.0) (acc)->zero_count++; \
-            if (v < (acc)->min_f) (acc)->min_f = v; \
-            if (v > (acc)->max_f) (acc)->max_f = v; \
-            if (!(acc)->has_first) { (acc)->first_f = v; (acc)->has_first = true; } \
-            (acc)->last_f = v; (acc)->cnt++; \
+            if ((HAS_NULLS) && v != v) continue; \
+            if ((NEEDS) & RED_NEED_SUM) (acc)->sum_f += v; \
+            if ((NEEDS) & RED_NEED_SUM_SQ) (acc)->sum_sq_f += v * v; \
+            if ((NEEDS) & RED_NEED_PROD) (acc)->prod_f *= v; \
+            if (((NEEDS) & RED_NEED_ZERO) && v == 0.0) (acc)->zero_count++; \
+            if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_f) (acc)->min_f = v; \
+            if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_f) (acc)->max_f = v; \
+            if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
+                (acc)->first_f = v; (acc)->has_first = true; \
+            } \
+            if ((NEEDS) & RED_NEED_LAST) (acc)->last_f = v; \
+            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
 
 /* Dispatch helper: expand REDUCE_LOOP_I/F with compile-time 0/1 constants for
  * HAS_NULLS and HAS_IDX based on the runtime pointers so the compiler can
  * dead-code-eliminate the branches inside each specialisation. */
-#define DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx) \
+#define DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, NEEDS) \
     do { \
         if (!(has_nulls) && !(idx)) \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 0, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 0, idx, NEEDS); \
         else if (!(has_nulls)) \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 1, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 1, idx, NEEDS); \
         else if (!(idx)) \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 0, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 0, idx, NEEDS); \
         else \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 1, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 1, idx, NEEDS); \
     } while (0)
 
-#define DISPATCH_F(T, base, start, end, acc, has_nulls, idx) \
+#define DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, NEEDS) \
     do { \
         if (!(has_nulls) && !(idx)) \
-            REDUCE_LOOP_F(T, base, start, end, acc, 0, 0, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 0, 0, idx, NEEDS); \
         else if (!(has_nulls)) \
-            REDUCE_LOOP_F(T, base, start, end, acc, 0, 1, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 0, 1, idx, NEEDS); \
         else if (!(idx)) \
-            REDUCE_LOOP_F(T, base, start, end, acc, 1, 0, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 1, 0, idx, NEEDS); \
         else \
-            REDUCE_LOOP_F(T, base, start, end, acc, 1, 1, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 1, 1, idx, NEEDS); \
+    } while (0)
+
+#define DISPATCH_F(T, base, start, end, acc, has_nulls, idx, NEEDS) \
+    do { \
+        if (!(has_nulls) && !(idx)) \
+            REDUCE_LOOP_F(T, base, start, end, acc, 0, 0, idx, NEEDS); \
+        else if (!(has_nulls)) \
+            REDUCE_LOOP_F(T, base, start, end, acc, 0, 1, idx, NEEDS); \
+        else if (!(idx)) \
+            REDUCE_LOOP_F(T, base, start, end, acc, 1, 0, idx, NEEDS); \
+        else \
+            REDUCE_LOOP_F(T, base, start, end, acc, 1, 1, idx, NEEDS); \
+    } while (0)
+
+/* Select the accumulator shape once per dispatched range.  NEEDS remains a
+ * literal at every loop expansion, which is the key property: no opcode test
+ * or unused accumulator dependency survives in the generated hot loop. */
+#define DISPATCH_I_OPCODE(T, NULL_SENT, base, start, end, acc, has_nulls, idx, opcode) \
+    do { \
+        switch (opcode) { \
+        case OP_SUM:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_NEED_SUM); break; \
+        case OP_PROD: DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_NEED_PROD); break; \
+        case OP_ALL:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_NEED_ZERO); break; \
+        case OP_ANY:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_ANY); break; \
+        case OP_MIN:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
+        case OP_MAX:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
+        case OP_AVG:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_I); break; \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+            DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_I); break; \
+        case OP_FIRST: DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
+        case OP_LAST:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
+        default: break; \
+        } \
+    } while (0)
+
+#define DISPATCH_BITMAP_I_OPCODE(T, input, base, start, end, acc, has_nulls, idx, opcode) \
+    do { \
+        switch (opcode) { \
+        case OP_SUM:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_NEED_SUM); break; \
+        case OP_PROD: DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_NEED_PROD); break; \
+        case OP_ALL:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_NEED_ZERO); break; \
+        case OP_ANY:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_ANY); break; \
+        case OP_MIN:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
+        case OP_MAX:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
+        case OP_AVG:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_I); break; \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+            DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_I); break; \
+        case OP_FIRST: DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
+        case OP_LAST:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
+        default: break; \
+        } \
+    } while (0)
+
+#define DISPATCH_F_OPCODE(T, base, start, end, acc, has_nulls, idx, opcode) \
+    do { \
+        switch (opcode) { \
+        case OP_SUM:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_NEED_SUM); break; \
+        case OP_PROD: DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_NEED_PROD); break; \
+        case OP_ALL:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_NEED_ZERO); break; \
+        case OP_ANY:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_ANY); break; \
+        case OP_MIN:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
+        case OP_MAX:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
+        case OP_AVG:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_F); break; \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+            DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_F); break; \
+        case OP_FIRST: DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
+        case OP_LAST:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
+        default: break; \
+        } \
+    } while (0)
+
+#define REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, HAS_NULLS, HAS_IDX, WANT_MIN) \
+    do { \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = (HAS_IDX) ? (idx)[i] : i; \
+            int64_t v = read_col_i64(base, row, (input)->type, (input)->attrs); \
+            if ((HAS_NULLS) && v == 0) continue; \
+            if ((acc)->cnt == 0) { \
+                if (WANT_MIN) (acc)->min_i = v; else (acc)->max_i = v; \
+            } else if (WANT_MIN) { \
+                if (sym_lex_lt(dom, v, (acc)->min_i)) (acc)->min_i = v; \
+            } else { \
+                if (sym_lex_gt(dom, v, (acc)->max_i)) (acc)->max_i = v; \
+            } \
+            (acc)->cnt++; \
+        } \
+    } while (0)
+
+#define DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls, idx, dom, WANT_MIN) \
+    do { \
+        if (!(has_nulls) && !(idx)) \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 0, 0, WANT_MIN); \
+        else if (!(has_nulls)) \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 0, 1, WANT_MIN); \
+        else if (!(idx)) \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 1, 0, WANT_MIN); \
+        else \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 1, 1, WANT_MIN); \
     } while (0)
 
 static void reduce_range(ray_t* input, int64_t start, int64_t end,
                          reduce_acc_t* acc, bool has_nulls,
-                         const int64_t* idx) {
+                         const int64_t* idx, uint16_t opcode) {
     void* base = ray_data(input);
     switch (input->type) {
-    case RAY_BOOL: case RAY_U8: {
-        /* BOOL/U8 are non-nullable; has_nulls is always false here,
-         * so the per-element null check is dead code in practice. */
-        const uint8_t* d = (const uint8_t*)base;
-        for (int64_t i = start; i < end; i++) {
-            int64_t row = idx ? idx[i] : i;
-            if (has_nulls && ray_vec_is_null(input, row)) { acc->null_count++; continue; }
-            int64_t v = (int64_t)d[row];
-            acc->sum_i    = (int64_t)((uint64_t)acc->sum_i    + (uint64_t)v);
-            acc->sum_sq_i = (int64_t)((uint64_t)acc->sum_sq_i + (uint64_t)v * (uint64_t)v);
-            acc->prod_i   = (int64_t)((uint64_t)acc->prod_i   * (uint64_t)v);
-            acc->sum_d   += (double)v;
-            if (v == 0) acc->zero_count++;
-            if (v < acc->min_i) acc->min_i = v;
-            if (v > acc->max_i) acc->max_i = v;
-            if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-            acc->last_i = v; acc->cnt++;
-        }
-        break;
-    }
+    case RAY_BOOL: case RAY_U8:
+        DISPATCH_BITMAP_I_OPCODE(uint8_t, input, base, start, end, acc,
+                                 has_nulls, idx, opcode); break;
     case RAY_I16:
-        DISPATCH_I(int16_t, NULL_I16, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_I_OPCODE(int16_t, NULL_I16, base, start, end, acc,
+                          has_nulls, idx, opcode); break;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
-        DISPATCH_I(int32_t, NULL_I32, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_I_OPCODE(int32_t, NULL_I32, base, start, end, acc,
+                          has_nulls, idx, opcode); break;
     case RAY_I64: case RAY_TIMESTAMP:
-        DISPATCH_I(int64_t, NULL_I64, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_I_OPCODE(int64_t, NULL_I64, base, start, end, acc,
+                          has_nulls, idx, opcode); break;
     case RAY_F32:
-        DISPATCH_F(float, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_F_OPCODE(float, base, start, end, acc, has_nulls, idx, opcode); break;
     case RAY_F64:
-        DISPATCH_F(double, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_F_OPCODE(double, base, start, end, acc, has_nulls, idx, opcode); break;
     case RAY_SYM: {
         /* Adaptive-width SYM columns — read_col_i64 produces the i64
          * sym id; id 0 is the canonical null sym (interned empty string
@@ -386,55 +534,12 @@ static void reduce_range(ray_t* input, int64_t start, int64_t end,
          * id.  Same 4-way dispatch to eliminate the per-element
          * null/idx branches. */
         struct ray_sym_domain_s* dom = ray_sym_vec_domain(input);
-        if (!has_nulls && !idx) {
-            for (int64_t i = start; i < end; i++) {
-                int64_t v = read_col_i64(base, i, input->type, input->attrs);
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        } else if (!has_nulls) {
-            for (int64_t i = start; i < end; i++) {
-                int64_t row = idx[i];
-                int64_t v = read_col_i64(base, row, input->type, input->attrs);
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        } else if (!idx) {
-            for (int64_t i = start; i < end; i++) {
-                int64_t v = read_col_i64(base, i, input->type, input->attrs);
-                if (v == 0) { acc->null_count++; continue; }
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        } else {
-            for (int64_t i = start; i < end; i++) {
-                int64_t row = idx[i];
-                int64_t v = read_col_i64(base, row, input->type, input->attrs);
-                if (v == 0) { acc->null_count++; continue; }
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        }
+        if (opcode == OP_MIN)
+            DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls,
+                                 idx, dom, 1);
+        else if (opcode == OP_MAX)
+            DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls,
+                                 idx, dom, 0);
         break;
     }
     default: break;
@@ -447,43 +552,86 @@ typedef struct {
     reduce_acc_t*  accs;   /* one per worker */
     bool           has_nulls;
     const int64_t* idx;    /* NULL = no selection; else int64[total_pass] */
+    uint16_t       opcode;
 } par_reduce_ctx_t;
 
 static void par_reduce_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     par_reduce_ctx_t* c = (par_reduce_ctx_t*)ctx;
     reduce_range(c->input, start, end, &c->accs[worker_id],
-                 c->has_nulls, c->idx);
+                 c->has_nulls, c->idx, c->opcode);
 }
 
 static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_type,
-                         struct ray_sym_domain_s* sym_dom) {
-    if (in_type == RAY_F64 || in_type == RAY_F32) {
-        dst->sum_f += src->sum_f;
-        dst->sum_sq_f += src->sum_sq_f;
-        dst->prod_f *= src->prod_f;
-        if (src->min_f < dst->min_f) dst->min_f = src->min_f;
-        if (src->max_f > dst->max_f) dst->max_f = src->max_f;
-    } else {
-        /* Defined unsigned wrap — matches REDUCE_LOOP_I's per-row path. */
-        dst->sum_i    = (int64_t)((uint64_t)dst->sum_i    + (uint64_t)src->sum_i);
-        dst->sum_sq_i = (int64_t)((uint64_t)dst->sum_sq_i + (uint64_t)src->sum_sq_i);
-        dst->prod_i   = (int64_t)((uint64_t)dst->prod_i   * (uint64_t)src->prod_i);
-        dst->sum_d   += src->sum_d;
-        if (in_type == RAY_SYM) {
-            /* Lex compare for SYM min/max (see sym_lex_lt). */
-            if (src->cnt > 0) {
-                if (dst->cnt == 0) { dst->min_i = src->min_i; dst->max_i = src->max_i; }
-                else { if (sym_lex_lt(sym_dom, src->min_i, dst->min_i)) dst->min_i = src->min_i;
-                       if (sym_lex_gt(sym_dom, src->max_i, dst->max_i)) dst->max_i = src->max_i; }
+                         struct ray_sym_domain_s* sym_dom, uint16_t opcode) {
+    bool fp = in_type == RAY_F64 || in_type == RAY_F32;
+    switch (opcode) {
+    case OP_SUM:
+        if (fp) dst->sum_f += src->sum_f;
+        else dst->sum_i = (int64_t)((uint64_t)dst->sum_i + (uint64_t)src->sum_i);
+        break;
+    case OP_PROD:
+        if (fp) dst->prod_f *= src->prod_f;
+        else dst->prod_i = (int64_t)((uint64_t)dst->prod_i * (uint64_t)src->prod_i);
+        break;
+    case OP_ALL:
+        dst->zero_count += src->zero_count;
+        break;
+    case OP_ANY:
+        dst->zero_count += src->zero_count;
+        dst->cnt += src->cnt;
+        break;
+    case OP_MIN:
+        if (src->cnt > 0) {
+            if (dst->cnt == 0) {
+                if (fp) dst->min_f = src->min_f;
+                else dst->min_i = src->min_i;
+            } else if (fp) {
+                if (src->min_f < dst->min_f) dst->min_f = src->min_f;
+            } else if (in_type == RAY_SYM) {
+                if (sym_lex_lt(sym_dom, src->min_i, dst->min_i)) dst->min_i = src->min_i;
+            } else if (src->min_i < dst->min_i) {
+                dst->min_i = src->min_i;
             }
-        } else {
-            if (src->min_i < dst->min_i) dst->min_i = src->min_i;
-            if (src->max_i > dst->max_i) dst->max_i = src->max_i;
+            dst->cnt += src->cnt;
         }
+        break;
+    case OP_MAX:
+        if (src->cnt > 0) {
+            if (dst->cnt == 0) {
+                if (fp) dst->max_f = src->max_f;
+                else dst->max_i = src->max_i;
+            } else if (fp) {
+                if (src->max_f > dst->max_f) dst->max_f = src->max_f;
+            } else if (in_type == RAY_SYM) {
+                if (sym_lex_gt(sym_dom, src->max_i, dst->max_i)) dst->max_i = src->max_i;
+            } else if (src->max_i > dst->max_i) {
+                dst->max_i = src->max_i;
+            }
+            dst->cnt += src->cnt;
+        }
+        break;
+    case OP_AVG:
+        if (fp) dst->sum_f += src->sum_f;
+        else dst->sum_d += src->sum_d;
+        dst->cnt += src->cnt;
+        break;
+    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
+        if (fp) {
+            dst->sum_f += src->sum_f;
+            dst->sum_sq_f += src->sum_sq_f;
+        } else {
+            dst->sum_d += src->sum_d;
+            dst->sum_sq_i = (int64_t)((uint64_t)dst->sum_sq_i +
+                                      (uint64_t)src->sum_sq_i);
+        }
+        dst->cnt += src->cnt;
+        break;
+    case OP_FIRST: case OP_LAST:
+        dst->cnt += src->cnt;
+        break;
+    default:
+        break;
     }
-    dst->cnt += src->cnt;
-    dst->null_count += src->null_count;
-    dst->zero_count += src->zero_count;
     /* reduce_merge does not merge first/last; caller handles these separately.
      * Since workers process sequential ranges, worker 0's first is the global first,
      * and the last worker's last is the global last. */
@@ -1025,6 +1173,300 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     scratch_free(pcnt_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
     scratch_free(off_hdr); scratch_free(hist_hdr);
     return ray_i64(total_distinct);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Parallel distinct values — first-occurrence row ids.
+ *
+ * Same three-pass radix layout as exec_count_distinct above (histogram
+ * → scatter → per-partition dedup), except the scatter carries the row
+ * id alongside each value and the dedup marks first occurrences in a
+ * shared byte array instead of counting.  A given value lands in
+ * exactly one partition, so each row id is claimed by at most one
+ * task — the byte array needs no atomics.  Partition slices are in
+ * ascending row order (cursors are prefix-summed over tasks in task
+ * order, tasks scan rows in order), so "first hit in the slice" is the
+ * globally first occurrence, and the final sequential sweep of the
+ * byte array yields ids in first-appearance order — identical to the
+ * eager hashset path's contract.
+ * ════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const void* base;
+    int64_t*    out_buf;       /* partitioned values (output) */
+    int64_t*    rid_buf;       /* partitioned row ids (output) */
+    int64_t*    cursor;        /* per-task × P; advances per scatter */
+    uint64_t    p_mask;
+    int64_t     grain;
+    int64_t     total;
+    uint8_t     is_f64;
+    int8_t      type;
+} dv_scatter_ctx_t;
+
+static void dv_scatter_fn(void* ctx, uint32_t worker_id,
+                          int64_t start, int64_t end) {
+    (void)worker_id;
+    (void)end;
+    dv_scatter_ctx_t* x = (dv_scatter_ctx_t*)ctx;
+    int64_t task_idx = start;
+    int64_t row_start = task_idx * x->grain;
+    int64_t row_end = row_start + x->grain;
+    if (row_end > x->total) row_end = x->total;
+    int64_t* cur = x->cursor + (size_t)task_idx * (x->p_mask + 1);
+    int64_t* out = x->out_buf;
+    int64_t* rid = x->rid_buf;
+    const void* base = x->base;
+    uint64_t p_mask = x->p_mask;
+    #define DV_SCATTER_BODY(LOAD)                                             \
+        for (int64_t i = row_start; i < row_end; i++) {                       \
+            int64_t val = (LOAD);                                             \
+            uint64_t h = (uint64_t)val * CD_HASH_K1;                          \
+            h ^= h >> 33;                                                     \
+            uint64_t p = (h ^ (h >> 33)) & p_mask;                            \
+            int64_t c = cur[p]++;                                             \
+            out[c] = val;                                                     \
+            rid[c] = i;                                                       \
+        }
+    if (x->is_f64) {
+        const double* d = (const double*)base;
+        for (int64_t i = row_start; i < row_end; i++) {
+            double fv = d[i];
+            if (fv != fv) fv = (double)NAN;
+            else fv = clear_neg_zero(fv);
+            int64_t val;
+            memcpy(&val, &fv, sizeof(int64_t));
+            uint64_t h = (uint64_t)val * CD_HASH_K1;
+            h ^= h >> 33;
+            uint64_t p = (h ^ (h >> 33)) & p_mask;
+            int64_t c = cur[p]++;
+            out[c] = val;
+            rid[c] = i;
+        }
+    } else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP) {
+        const int64_t* d = (const int64_t*)base;
+        DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_I32 || x->type == RAY_DATE || x->type == RAY_TIME) {
+        const int32_t* d = (const int32_t*)base;
+        DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_I16) {
+        const int16_t* d = (const int16_t*)base;
+        DV_SCATTER_BODY(d[i])
+    }
+    #undef DV_SCATTER_BODY
+}
+
+typedef struct {
+    const int64_t* values;     /* partitioned values */
+    const int64_t* rids;       /* partitioned row ids */
+    const int64_t* part_off;   /* P+1 partition bounds */
+    int64_t*       part_count; /* OUT: per-partition distinct count (-1 = oom) */
+    uint8_t*       first;      /* OUT: len bytes; 1 = first occurrence */
+} dv_part_ctx_t;
+
+static void dv_part_dedup_fn(void* ctx, uint32_t worker_id,
+                             int64_t start, int64_t end) {
+    (void)worker_id;
+    dv_part_ctx_t* x = (dv_part_ctx_t*)ctx;
+    for (int64_t p = start; p < end; p++) {
+        int64_t off = x->part_off[p];
+        int64_t cnt = x->part_off[p + 1] - off;
+        if (cnt == 0) { x->part_count[p] = 0; continue; }
+
+        uint64_t cap = (uint64_t)cnt * 2;
+        if (cap < 32) cap = 32;
+        uint64_t c = 1;
+        while (c && c < cap) c <<= 1;
+        if (!c) { x->part_count[p] = -1; continue; }
+        cap = c;
+        uint64_t mask = cap - 1;
+        int cd_shift = 64 - __builtin_ctzll(cap);
+
+        ray_t* set_hdr  = NULL;
+        ray_t* used_hdr = NULL;
+        int64_t* set    = (int64_t*)scratch_alloc (&set_hdr,
+                                                   (size_t)cap * sizeof(int64_t));
+        uint8_t* used   = (uint8_t*)scratch_calloc(&used_hdr,
+                                                   (size_t)cap * sizeof(uint8_t));
+        if (!set || !used) {
+            if (set_hdr)  scratch_free(set_hdr);
+            if (used_hdr) scratch_free(used_hdr);
+            x->part_count[p] = -1;
+            continue;
+        }
+
+        const int64_t* vals = x->values + off;
+        const int64_t* rids = x->rids + off;
+        int64_t count = 0;
+        for (int64_t j = 0; j < cnt; j++) {
+            int64_t val = vals[j];
+            uint64_t h = (uint64_t)val * CD_HASH_K1;
+            uint64_t slot = h >> cd_shift;   /* Fibonacci hash: high bits */
+            while (used[slot]) {
+                if (set[slot] == val) goto dv_part_next;
+                slot = (slot + 1) & mask;
+            }
+            set[slot]  = val;
+            used[slot] = 1;
+            x->first[rids[j]] = 1;
+            count++;
+            dv_part_next:;
+        }
+        scratch_free(set_hdr);
+        scratch_free(used_hdr);
+        x->part_count[p] = count;
+    }
+}
+
+ray_t* distinct_radix_first_ids(ray_t* input) {
+    if (!input || RAY_IS_ERR(input)) return NULL;
+
+    int8_t in_type = input->type;
+    int64_t len = input->len;
+
+    switch (in_type) {
+    case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        break;
+    case RAY_F64:
+        /* The kernel canonicalizes every NaN to one value.  The eager
+         * hashset only does that under the HAS_NULLS gate (ungated NaNs
+         * are pairwise-distinct there) — bail so behavior is identical. */
+        if (!(input->attrs & RAY_ATTR_HAS_NULLS)) return NULL;
+        break;
+    default:
+        return NULL;
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || len < (1 << 16)) return NULL;
+
+    uint32_t nw = ray_pool_total_workers(pool);
+    uint32_t p_bits;
+    if (nw <= 8) p_bits = 4;
+    else if (nw <= 32) p_bits = 5;
+    else p_bits = 6;
+    uint64_t P = (uint64_t)1 << p_bits;
+    uint64_t p_mask = P - 1;
+
+    int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (grain <= 0) grain = 8192;
+    int64_t n_tasks_64 = (len + grain - 1) / grain;
+    if (n_tasks_64 <= 0 || n_tasks_64 > (1u << 16)) return NULL;
+    uint32_t n_tasks = (uint32_t)n_tasks_64;
+
+    void* base = ray_data(input);
+
+    /* Pass 1: per-task histogram (identical to exec_count_distinct's). */
+    ray_t* hist_hdr = NULL;
+    int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
+                                             (size_t)P * n_tasks * sizeof(int64_t));
+    if (!hist) return ray_error("oom", NULL);
+    cd_count_ctx_t hctx = {
+        .base = base, .counts = hist,
+        .p_bits = p_bits, .p_mask = p_mask,
+        .grain = grain, .total = len,
+        .stride_log2 = 0, .is_f64 = (in_type == RAY_F64),
+        .type = in_type, .attrs = input->attrs,
+    };
+    ray_pool_dispatch_n(pool, cd_hist_fn, &hctx, n_tasks);
+
+    ray_t* off_hdr = NULL;
+    int64_t* part_off = (int64_t*)scratch_alloc(&off_hdr,
+                                                (size_t)(P + 1) * sizeof(int64_t));
+    if (!part_off) { scratch_free(hist_hdr); return ray_error("oom", NULL); }
+    ray_t* cur_hdr = NULL;
+    int64_t* cursor = (int64_t*)scratch_alloc(&cur_hdr,
+                                              (size_t)P * n_tasks * sizeof(int64_t));
+    if (!cursor) {
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+
+    int64_t total = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        part_off[p] = total;
+        for (uint32_t t = 0; t < n_tasks; t++) {
+            cursor[(size_t)t * P + p] = total;
+            total += hist[(size_t)t * P + p];
+        }
+    }
+    part_off[P] = total;
+    if (total != len) {
+        scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("nyi", "distinct: histogram mismatch");
+    }
+
+    /* Pass 2: scatter (value, row id) pairs. */
+    ray_t* buf_hdr = NULL;
+    int64_t* out_buf = (int64_t*)scratch_alloc(&buf_hdr,
+                                               (size_t)len * sizeof(int64_t));
+    ray_t* rid_hdr = NULL;
+    int64_t* rid_buf = (int64_t*)scratch_alloc(&rid_hdr,
+                                               (size_t)len * sizeof(int64_t));
+    if (!out_buf || !rid_buf) {
+        if (buf_hdr) scratch_free(buf_hdr);
+        if (rid_hdr) scratch_free(rid_hdr);
+        scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+    dv_scatter_ctx_t sctx = {
+        .base = base, .out_buf = out_buf, .rid_buf = rid_buf, .cursor = cursor,
+        .p_mask = p_mask, .grain = grain, .total = len,
+        .is_f64 = (in_type == RAY_F64), .type = in_type,
+    };
+    ray_pool_dispatch_n(pool, dv_scatter_fn, &sctx, n_tasks);
+
+    /* Pass 3: per-partition dedup, marking first occurrences. */
+    ray_t* first_hdr = NULL;
+    uint8_t* first = (uint8_t*)scratch_calloc(&first_hdr, (size_t)len);
+    ray_t* pcnt_hdr = NULL;
+    int64_t* part_count = first ? (int64_t*)scratch_alloc(&pcnt_hdr,
+                                                  (size_t)P * sizeof(int64_t))
+                                : NULL;
+    if (!first || !part_count) {
+        if (first_hdr) scratch_free(first_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
+        scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+    dv_part_ctx_t dctx = {
+        .values = out_buf, .rids = rid_buf, .part_off = part_off,
+        .part_count = part_count, .first = first,
+    };
+    ray_pool_dispatch_n(pool, dv_part_dedup_fn, &dctx, (uint32_t)P);
+
+    int64_t total_distinct = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        if (part_count[p] < 0) {
+            scratch_free(pcnt_hdr); scratch_free(first_hdr);
+            scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+            scratch_free(off_hdr); scratch_free(hist_hdr);
+            return ray_error("oom", NULL);
+        }
+        total_distinct += part_count[p];
+    }
+
+    scratch_free(pcnt_hdr); scratch_free(rid_hdr); scratch_free(buf_hdr);
+    scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+
+    /* Sweep the byte array in row order — first-appearance order ids. */
+    ray_t* ids = ray_vec_new(RAY_I64, total_distinct);
+    if (!ids || RAY_IS_ERR(ids)) {
+        scratch_free(first_hdr);
+        return ids ? ids : ray_error("oom", NULL);
+    }
+    int64_t* out_ids = (int64_t*)ray_data(ids);
+    int64_t k = 0;
+    for (int64_t i = 0; i < len; i++)
+        if (first[i]) out_ids[k++] = i;
+    ids->len = k;
+    scratch_free(first_hdr);
+    if (k != total_distinct) {
+        ray_release(ids);
+        return ray_error("nyi", "distinct: first-occurrence sweep mismatch");
+    }
+    return ids;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -2707,12 +3149,19 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (g && g->selection) {
         ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
         if (sm->nrows == len) {
-            sel_idx_block = ray_rowsel_to_indices(g->selection);
-            if (!sel_idx_block) return ray_error("oom", NULL);
-            sel_idx = (const int64_t*)ray_data(sel_idx_block);
             scan_n = sm->total_pass;
+            /* COUNT needs only the selected cardinality.  Do not materialise
+             * indices—and, below, do not scan the input column at all. */
+            if (op->opcode != OP_COUNT) {
+                sel_idx_block = ray_rowsel_to_indices(g->selection);
+                if (!sel_idx_block) return ray_error("oom", NULL);
+                sel_idx = (const int64_t*)ray_data(sel_idx_block);
+            }
         }
     }
+
+    if (op->opcode == OP_COUNT)
+        return ray_i64(scan_n);
 
     /* Wide elements and boxed LIST cells cannot use the 8-byte reduce
      * accumulators; resolve their supported operations by materialising the
@@ -2762,7 +3211,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
 
         par_reduce_ctx_t ctx = { .input = input, .accs = accs,
-                                 .has_nulls = has_nulls, .idx = sel_idx };
+                                 .has_nulls = has_nulls, .idx = sel_idx,
+                                 .opcode = op->opcode };
         ray_pool_dispatch(pool, par_reduce_fn, &ctx, scan_n);
 
         /* Merge: worker 0 is the base, merge the rest in order */
@@ -2770,8 +3220,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         reduce_acc_init(&merged);
         merged = accs[0];
         for (uint32_t i = 1; i < nw; i++) {
-            if (!accs[i].has_first) continue;
-            reduce_merge(&merged, &accs[i], in_type, ray_sym_vec_domain(input));
+            reduce_merge(&merged, &accs[i], in_type, ray_sym_vec_domain(input),
+                         op->opcode);
         }
         /* first = accs[first worker with data], last = accs[last worker with data] */
         for (uint32_t i = 0; i < nw; i++) {
@@ -2828,7 +3278,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 
     reduce_acc_t acc;
     reduce_acc_init(&acc);
-    reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx);
+    reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx, op->opcode);
     if (sel_idx_block) ray_release(sel_idx_block);
 
     switch (op->opcode) {
