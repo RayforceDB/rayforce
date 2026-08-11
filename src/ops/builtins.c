@@ -1627,21 +1627,60 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
              * matching wall-clock semantics. */
             return ray_time((int64_t)(ts_ns_in_day(val->i64) / 1000000LL));
         if (val->type == -RAY_STR) {
-            /* Parse "HH:MM:SS[.mmm]" */
+            /* Parse "[-]HH:MM[:SS][.fff]" with a bounded cursor that must
+             * consume the whole string.  TIME is a signed duration — ms-of-day
+             * can exceed a day and go negative (see .csv.read round-tripping) —
+             * so the hour field is variable width and unbounded, but minutes
+             * and seconds are 0-59.  The old sscanf path accepted trailing
+             * garbage ("12:34:56junk") and out-of-range fields ("25:99:99" →
+             * 26:40:39), silently corrupting the value; mirror the strict DATE
+             * / TIMESTAMP string casts. */
             const char* sp = ray_str_ptr(val);
-            int th = 0, tm = 0, ts = 0, tms = 0;
-            int nr = sscanf(sp, "%d:%d:%d", &th, &tm, &ts);
-            if (nr < 2) return ray_error("domain", "as: cannot parse str as time, expected HH:MM:SS[.mmm]");
-            const char* dot = strchr(sp, '.');
-            if (dot) {
-                dot++;
+            size_t sl = ray_str_len(val);
+            size_t i = 0;
+            int64_t sign = 1;
+            if (i < sl && sp[i] == '-') { sign = -1; i++; }
+            /* Variable-width hour, >= 1 digit, capped so ms cannot overflow. */
+            if (i >= sl || sp[i] < '0' || sp[i] > '9')
+                return ray_error("domain", "as: cannot parse str as time, expected [-]HH:MM[:SS][.fff]");
+            int64_t hh = 0;
+            int hd = 0;
+            while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                hh = hh * 10 + (sp[i] - '0'); i++;
+                if (++hd > 7) return ray_error("domain", "as: cannot parse str as time, hour field too long");
+            }
+            /* Read exactly 2 digits into `out`, validate 0..59. */
+            #define TM_2DIGIT(out) do {                                                       \
+                if (i + 1 >= sl || sp[i] < '0' || sp[i] > '9' || sp[i+1] < '0' || sp[i+1] > '9') \
+                    return ray_error("domain", "as: cannot parse str as time, expected 2-digit field"); \
+                (out) = (sp[i]-'0')*10 + (sp[i+1]-'0'); i += 2;                              \
+                if ((out) > 59) return ray_error("domain", "as: cannot parse str as time, minute/second out of range"); \
+            } while (0)
+            if (i >= sl || sp[i] != ':')
+                return ray_error("domain", "as: cannot parse str as time, expected ':' after hour");
+            i++;
+            int mm = 0, ss = 0, tms = 0;
+            TM_2DIGIT(mm);
+            if (i < sl && sp[i] == ':') { i++; TM_2DIGIT(ss); }
+            #undef TM_2DIGIT
+            /* Optional fractional seconds → milliseconds; a bare trailing '.'
+             * is accepted as .000. */
+            if (i < sl && sp[i] == '.') {
+                i++;
                 char mbuf[4] = "000";
                 int mi = 0;
-                while (*dot >= '0' && *dot <= '9' && mi < 3) mbuf[mi++] = *dot++;
+                while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                    if (mi < 3) mbuf[mi++] = sp[i];
+                    i++;
+                }
                 tms = (int)strtol(mbuf, NULL, 10);
             }
-            int32_t ms = (int32_t)th * 3600000 + (int32_t)tm * 60000 + (int32_t)ts * 1000 + tms;
-            return ray_time((int64_t)ms);
+            if (i != sl)
+                return ray_error("domain", "as: cannot parse str as time, unexpected trailing characters");
+            int64_t ms = sign * (hh * 3600000LL + (int64_t)mm * 60000LL + (int64_t)ss * 1000LL + tms);
+            if (ms > INT32_MAX || ms < INT32_MIN)
+                return ray_error("domain", "as: cannot parse str as time, out of int32 millisecond range");
+            return ray_time(ms);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
