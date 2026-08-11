@@ -1766,6 +1766,8 @@ ray_t* ray_lazy_wrap(ray_graph_t* g, ray_op_t* op) {
 ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
+    if (!g || !prev)
+        return ray_error("domain", "lazy handle already materialized");
 
     /* Determine output type based on opcode */
     int8_t out_type;
@@ -1833,6 +1835,8 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
 ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
+    if (!g || !prev)
+        return ray_error("domain", "lazy handle already materialized");
 
     int8_t out_type;
     switch (opcode) {
@@ -1865,6 +1869,12 @@ ray_t* ray_lazy_materialize(ray_t* val) {
 
     ray_graph_t* g  = RAY_LAZY_GRAPH(val);
     ray_op_t*    op = RAY_LAZY_OP(val);
+    if (!g || !op) {
+        RAY_LAZY_GRAPH(val) = NULL;
+        RAY_LAZY_OP(val) = NULL;
+        ray_release(val);
+        return ray_error("domain", "lazy handle already materialized");
+    }
 
     /* Run the full optimizer pipeline before execution. ray_optimize
        may return a different root (e.g. predicate pushdown). */
@@ -1876,6 +1886,7 @@ ray_t* ray_lazy_materialize(ray_t* val) {
     /* Clear graph pointer before releasing to prevent double-free in
      * ray_release_owned_refs */
     RAY_LAZY_GRAPH(val) = NULL;
+    RAY_LAZY_OP(val) = NULL;
     ray_release(val);
     return result;
 }
