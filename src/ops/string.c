@@ -1145,6 +1145,7 @@ static ray_t* substr_str_scalar_view(ray_t* input, int64_t start, int64_t length
             }
             memcpy(d->prefix, sp, 4);
             d->pool_off = s->pool_off + (uint32_t)st;
+            ray_str_t_cache_hash(d, pool);
         } else {
             ray_release(result);
             return NULL;
@@ -1238,6 +1239,7 @@ static ray_t* substr_str_scalar_start_len_view(ray_t* input,
             }
             memcpy(d->prefix, sp, 4);
             d->pool_off = s->pool_off + (uint32_t)st0;
+            ray_str_t_cache_hash(d, pool);
         } else {
             ray_release(result);
             return NULL;

@@ -352,26 +352,20 @@
 (count (inner-join [price] bigFL bigFR)) -- 70000
 
 ;; ──────────────────────────────────────────────────────────────────
-;; L33: hash_row_keys — NULL key vector (key column missing from table)
-;; When the join key doesn't exist in one table, the key_vec is NULL
-;; and hash_row_keys skips it via `if (!col) continue;`.
+;; Missing join keys are schema errors.  They must not silently look like an
+;; empty match set (or, for left/anti joins, a plausible all-unmatched result).
 ;; ──────────────────────────────────────────────────────────────────
 
-;; inner-join: key exists only in left table → no right key vec → 0 matches
 (set mL (table [a val] (list [1 2] [10 20])))
 (set mR (table [b val2] (list [1 2] [100 200])))
-(count (inner-join [a] mL mR)) -- 0
-
-;; left-join: key exists only in left → all left rows unmatched
-(count (left-join [a] mL mR)) -- 2
-
-;; anti-join: key missing from right → all left rows pass (no matches possible)
-(count (anti-join [a] mL mR)) -- 2
+(inner-join [a] mL mR) !- domain
+(left-join [a] mL mR) !- domain
+(anti-join [a] mL mR) !- domain
 
 ;; multi-key: one key exists in both, other only in left
 (set mkML (table [k1 k2 val] (list [1 2] [a b] [10 20])))
 (set mkMR (table [k1 val2] (list [1 2] [100 200])))
-(count (inner-join [k1 k2] mkML mkMR)) -- 0
+(inner-join [k1 k2] mkML mkMR) !- domain
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; Large table left-join with NULL keys — exercises L35 on radix path

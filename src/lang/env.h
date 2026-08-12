@@ -43,6 +43,7 @@ static inline const char* ray_fn_name(const ray_t* fn) {
 ray_err_t ray_env_init(void);
 void     ray_env_destroy(void);
 ray_t*    ray_env_get(int64_t sym_id);
+ray_t*    ray_env_get_local(int64_t sym_id);
 
 /* User-facing binder.  Refuses any name starting with `.` — that root is
  * reserved for system namespaces (.sys, .os, .io, .ipc, …) populated by
@@ -136,6 +137,10 @@ ray_err_t ray_env_push_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
+bool      ray_env_has_outer_local(int64_t sym_id);
+ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
+ray_t*    ray_env_capture_locals(void);
+ray_err_t ray_env_push_capture(ray_t* capture);
 
 /* Compiled-lambda local materialization (OP_SCOPE_BEGIN / OP_SCOPE_END).
  * bind: push a fresh frame and bind syms[i] -> slots[i] (NULL slots —

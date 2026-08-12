@@ -2446,7 +2446,7 @@ static inline uint64_t hash_i64(int64_t v) {
  * the existing path is degenerate for composite multi-key composites.
  * Uses the canonical wyhash helpers from ops/hash.h, same as the
  * pivot / datalog / join hashers. */
-static uint64_t atom_hash(ray_t* a) {
+uint64_t ray_atom_hash(ray_t* a) {
     /* List-element position: elements may be a bare C NULL (ray_list_set stores
      * NULL unretained; ray_list_get is out-of-range), mirroring atom_eq's
      * C-NULL-tolerant element handling — so keep the !a guard, not RAY_ASSERT_VALUE. */
@@ -2471,7 +2471,7 @@ static uint64_t atom_hash(ray_t* a) {
             /* Seed with len so [] and a list of zeros differ. */
             uint64_t h = ray_hash_i64(n);
             for (int64_t i = 0; i < n; i++)
-                h = ray_hash_combine(h, atom_hash(elems[i]));
+                h = ray_hash_combine(h, ray_atom_hash(elems[i]));
             return h;
         }
         default:
@@ -2481,6 +2481,12 @@ static uint64_t atom_hash(ray_t* a) {
              * for atom_eq-equal pairs. */
             return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
     }
+}
+
+/* Stable 64-bit structural hash.  The signed I64 result preserves every bit
+ * of wyhash's output; callers that display it may therefore see negatives. */
+ray_t* ray_hash_fn(ray_t* x) {
+    return make_i64((int64_t)ray_atom_hash(x));
 }
 
 /* Context for GUID rehash: the 16-byte source base and, indirectly,
@@ -2506,7 +2512,7 @@ static uint64_t ght_i64_hash_gi(uint32_t gi, void* ctx) {
 typedef struct { ray_t** gkeys; } ght_list_ctx_t;
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
-    return atom_hash(c->gkeys[gi]);
+    return ray_atom_hash(c->gkeys[gi]);
 }
 
 /* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
@@ -2614,7 +2620,7 @@ ray_t* ray_group_indices_fn(ray_t* x) {
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
-            uint64_t h = atom_hash(elem);
+            uint64_t h = ray_atom_hash(elem);
             uint32_t slot = (uint32_t)(h & ht.mask);
             uint32_t gi_found = GHT_EMPTY;
             while (ht.slots[slot] != GHT_EMPTY) {

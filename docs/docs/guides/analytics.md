@@ -231,24 +231,28 @@ The key list `[Sym Ts]` specifies equality columns followed by the time column (
         [12:00:00 12:00:01 12:00:02 12:00:03 12:00:04 12:00:05 12:00:06 12:00:07 12:00:08 12:00:09]
         [928 528 648 914 918 626 577 817 620 698])))
 
-; Simple window join: match on [Sym], join by Time
-(window-join trades quotes [Sym] 'Time)
+; TIME offsets are milliseconds: aggregate one second before through one after.
+(set intervals (map-left + [-1000 1000] (at trades 'Time)))
+(window-join [Sym Time] intervals trades quotes
+  {total_size: (sum Size)})
 ```
 
 ```text
-┌──────┬──────────────┬───────┬───────┐
-│ Sym  │     Time     │ Price │ Size  │
-│ SYM  │     TIME     │  F64  │  I64  │
-├──────┼──────────────┼───────┼───────┤
-│ AAPL │ 12:00:01.000 │ 89.17 │ 528   │
-│ AAPL │ 12:00:04.000 │ 70.5  │ 918   │
-│ AAPL │ 12:00:06.000 │ 80.54 │ 577   │
-├──────┴──────────────┴───────┴───────┤
-│ 3 rows (3 shown) 4 columns (4 shown)│
-└─────────────────────────────────────┘
+┌──────┬──────────────┬───────┬────────────┐
+│ Sym  │     Time     │ Price │ total_size │
+│ SYM  │     TIME     │  F64  │    I64     │
+├──────┼──────────────┼───────┼────────────┤
+│ AAPL │ 12:00:01.000 │ 89.17 │ 2104       │
+│ AAPL │ 12:00:04.000 │ 70.5  │ 2458       │
+│ AAPL │ 12:00:06.000 │ 80.54 │ 2020       │
+├──────┴──────────────┴───────┴────────────┤
+│ 3 rows (3 shown) 4 columns (4 shown)     │
+└──────────────────────────────────────────┘
 ```
 
-The `window-join` function matches rows from the right table within a time window around each left row. The equality keys (`[Sym]`) filter candidates, and the time column (`'Time`) determines the window range.
+The last key in `[Sym Time]` is temporal; preceding keys are equality
+partitions. `intervals` supplies a lower and upper offset for every left row,
+and the final dictionary names the aggregations applied to matching right rows.
 
 ## 7. Working with CSV { #csv-workflow }
 

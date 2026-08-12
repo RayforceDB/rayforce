@@ -33,8 +33,7 @@ Join two tables on shared key columns. Returns a table with all columns from bot
 Join on multiple keys:
 
 ```lisp
-; Key columns must be symbol (or numeric) — string key columns are not
-; supported for joins.
+; Key columns may be strings, symbols, or numeric values.
 (set x (table [a b c]
     (list (take [aa bb cc] 10)
           (take [I J K] 10)
@@ -48,6 +47,10 @@ Join on multiple keys:
 ; Join on both [a b]
 (inner-join [a b] x y)
 ```
+
+Every named key must exist in both input tables. A misspelled or missing key is
+a `domain` error instead of an empty result. A string key must be paired with a
+string key on the other side.
 
 ## Left Join
 

@@ -1,0 +1,63 @@
+;; Issue #394 — verified runtime gaps and deliberate Rayfall semantics.
+
+;; STR columns are valid equi-join keys.
+(set I394L (table [k lv] (list (list "alpha" "beta" "gamma") [1 2 3])))
+(set I394R (table [k rv] (list (list "gamma" "alpha" "delta") [30 10 40])))
+(count (inner-join [k] I394L I394R)) -- 2
+(sum (at (inner-join [k] I394L I394R) 'rv)) -- 40
+(count (anti-join [k] I394L I394R)) -- 1
+
+;; Pooled (>12-byte) and sliced STR descriptors use the same fast path while
+;; retaining content equality across independent string pools.
+(set I394LongLKeys (as 'STR ["customer-account-alpha" "customer-account-beta" "customer-account-gamma"]))
+(set I394LongRKeys (as 'STR ["customer-account-gamma" "customer-account-alpha" "customer-account-delta"]))
+(set I394LongL (table [k lv] (list I394LongLKeys [1 2 3])))
+(set I394LongR (table [k rv] (list I394LongRKeys [30 10 40])))
+(sum (at (inner-join [k] I394LongL I394LongR) 'rv)) -- 40
+(set I394SliceL (table [k lv] (list (drop (as 'STR ["unused-long-prefix" "customer-account-alpha" "customer-account-beta"]) 1) [1 2])))
+(set I394SliceR (table [k rv] (list (drop (as 'STR ["unused-long-prefix" "customer-account-beta" "customer-account-alpha"]) 1) [20 10])))
+(sum (at (inner-join [k] I394SliceL I394SliceR) 'rv)) -- 30
+
+;; A misspelled/missing join key is a schema error, not an empty result.
+(inner-join [missing] I394L I394R) !- domain
+(anti-join [missing] I394L I394R) !- domain
+
+;; Dyadic fill, min, and max are atomic and broadcast scalars.
+(fill 0 [1 0Nl 3]) -- [1 0 3]
+(min [3 9 1] [2 10 4]) -- [2 9 1]
+(max [3 9 1] 5) -- [5 9 5]
+
+;; String find uses the typed hash-set path and preserves first-index/miss rules.
+(find (list "alpha" "beta" "gamma") "beta") -- 1
+(find (list "alpha" "beta" "gamma") "absent") -- 0Nl
+
+;; Deterministic hashing is public under both descriptive and implementation names.
+(== (hash 42) (wyhash 42)) -- true
+(count (hash [1 2 3])) -- 3
+
+;; xkey construction is hash-based and keyed dictionaries accept vector probes.
+(set I394T (table [k v] (list (til 5000) (+ 10 (til 5000)))))
+(set I394D (xkey I394T 'k))
+(count I394D) -- 5000
+(at (at (at I394D [1 4999]) 0) 'v) -- 11
+(at (at (at I394D [1 4999]) 1) 'v) -- 5009
+
+;; Nested functions capture visible lexical values.
+(set I394MakeAdder (fn [x] (fn [y] (+ x y))))
+(set I394Add7 (I394MakeAdder 7))
+(I394Add7 5) -- 12
+(set I394Add7Roundtrip (de (ser I394Add7)))
+(I394Add7Roundtrip 6) -- 13
+
+;; Lambda parameters and let bindings take precedence over query columns.
+(set I394Q (table [x v] (list [1 2] [10 20])))
+(set I394SelectParam (fn [x] (select {y:x from:I394Q})))
+(at (I394SelectParam 99) 'y) -- [99 99]
+(set I394UpdateParam (fn [x] (update {v:x from:I394Q})))
+(at (I394UpdateParam 77) 'v) -- [77 77]
+
+;; These issue claims conflict with established Rayfall semantics: `%` is
+;; modulo, dict literals preserve query ASTs, and key(table) returns its schema.
+(% 7 3) -- 1
+(first (at {a:(list 1 2)} 'a)) -- 'list
+(key (select {s:(sum v) by:x from:I394Q})) -- [x s]

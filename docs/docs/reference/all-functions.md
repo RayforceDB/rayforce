@@ -51,12 +51,12 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
-`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`
+`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `hash`, `wyhash`
 
 ### Binary
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `quantile`, `percentile`, `set`, `let`,
-`try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
+`try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `fill`, `min`, `max`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
@@ -175,8 +175,8 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary | aggr | Minimum value | `(min [3 1 2])` → `1` |
-| `max` | unary | aggr | Maximum value | `(max [3 1 2])` → `3` |
+| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
+| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values | `(max [3 9 1] 5)` → `[5 9 5]` |
 | `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
 | `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
 | `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
@@ -258,8 +258,10 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | — | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | — | Index into vector (0-based) | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | — | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
+| `fill` | binary | atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
+| `hash` / `wyhash` | unary | atomic | Stable 64-bit structural hash (`wyhash` is an alias) | `(hash "abc")` |
 | `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | lazy/DAG | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
@@ -388,7 +390,7 @@ Create and manipulate tables, dictionaries, and their metadata.
 |---|---|---|---|---|
 | `list` | variadic | — | Create a list from vectors (column data for tables) | `(list [1 2] ['a 'b])` |
 | `table` | binary | — | Create table from column names and list of vectors | `(table [x y] (list [1 2] ['a 'b]))` |
-| `dict` | binary | — | Create dictionary from keys and values vectors | `(dict ['a 'b] [1 2])` |
+| `dict` | binary | — | Create dictionary from evaluated keys and values vectors | `(dict ['a 'b] [1 2])` |
 | `key` | unary | — | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | — | Get table column names | `(cols trades)` → `[sym price size time date]` |
 | `value` | unary | — | Get column data (table) or values (dict) | `(value d)` |
@@ -407,7 +409,11 @@ Create and manipulate tables, dictionaries, and their metadata.
 | `ungroup` | unary | — | Flatten a grouped table's nested list columns into one row per element | `(ungroup gt)` |
 | `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price sum)` |
 
-`xcol` requires exactly one new name for each existing column. `xcols`, `xkey`, and `xgroup` accept a symbol atom, a symbol vector, or a list of symbol atoms. `xkey` is a dictionary projection, not a native keyed-table type: key columns must be unique, and each value is a row dictionary containing the non-key columns. Use `xgroup` when keys may repeat; each dictionary value is a table slice for that group.
+`xcol` requires exactly one new name for each existing column. `xcols`, `xkey`, and `xgroup` accept a symbol atom, a symbol vector, or a list of symbol atoms. `xkey` is a dictionary projection, not a native keyed-table type: key columns must be unique, and each value is a row dictionary containing the non-key columns. Use `xgroup` when keys may repeat; each dictionary value is a table slice for that group. Passing a typed vector of keys to `at` performs a batch lookup and returns a list.
+
+Dictionary literals are literals: their entries are not evaluated, just as the
+elements of other literals are not evaluated. Use `(dict keys values)` to
+construct a dictionary from evaluated expressions.
 
 ```lisp
 ; Create a table
@@ -470,10 +476,10 @@ Rayforce supports seven join types, including time-series-aware as-of and window
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `left-join` | variadic | — | Left join — all left rows, unmatched filled with null. Keys are a symbol list. | `(left-join trades quotes [sym])` |
-| `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join orders products [product_id])` |
+| `left-join` | variadic | — | Left join — all left rows, unmatched filled with null. Keys are a symbol list. | `(left-join [sym] trades quotes)` |
+| `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join [product_id] orders products)` |
 | `full-join` | variadic | — | Full outer join — all rows from both sides, unmatched columns filled with null | `(full-join [sym] trades quotes)` |
-| `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join t1 t2 [key])` |
+| `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join [key] t1 t2)` |
 | `window-join` | variadic | special | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict | `(window-join [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `window-join1` | variadic | special | Window join variant (strict window, no prevailing quote) | `(window-join1 [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `asof-join` | variadic | — | As-of join — match most recent preceding value. Keys come first, last key is the time key. | `(asof-join [sym time] trades quotes)` |
@@ -491,7 +497,7 @@ Rayforce supports seven join types, including time-series-aware as-of and window
         [149.5 2799.5 150.5])))
 
 ; Left join on sym column (join keys are a symbol list)
-(left-join trades quotes [sym])
+(left-join [sym] trades quotes)
 
 ; Window join: keys are [equality-keys... time-key]; intervals is
 ; a two-vector list with one [lo hi] window bound per left row.
