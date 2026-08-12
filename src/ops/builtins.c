@@ -1973,27 +1973,49 @@ ray_t* ray_type_fn(ray_t* val) {
     return ray_sym(id);
 }
 
-/* (read path) — read a file's contents as a string */
-ray_t* ray_read_file_fn(ray_t* path_obj) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", "read: path must be str, got %s", ray_type_name(path_obj->type));
+static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
+    if (path_obj->type != -RAY_STR)
+        return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", "read: empty path");
+    if (!path || ray_str_len(path_obj) == 0)
+        return ray_error("domain", "%s: empty path", op);
+
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return ray_error("io", NULL); }
     long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
     if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
-    /* Use ray_alloc for the buffer */
-    ray_t* buf = ray_alloc((size_t)sz + 1);
-    if (!buf || RAY_IS_ERR(buf)) { fclose(fp); return ray_error("oom", NULL); }
-    char* data = (char*)ray_data(buf);
-    size_t rd = fread(data, 1, (size_t)sz, fp);
-    fclose(fp);
-    data[rd] = '\0';
-    ray_t* result = ray_str(data, rd);
-    ray_release(buf);
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return ray_error("io", NULL); }
+
+    ray_t* result = ray_vec_new(RAY_U8, (int64_t)sz);
+    if (!result || RAY_IS_ERR(result)) {
+        fclose(fp);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = (int64_t)sz;
+
+    size_t rd = sz > 0 ? fread(ray_data(result), 1, (size_t)sz, fp) : 0;
+    int close_rc = fclose(fp);
+    if (rd != (size_t)sz || close_rc != 0) {
+        ray_release(result);
+        return ray_error("io", NULL);
+    }
     return result;
+}
+
+/* (read path) — read a file's contents as a string */
+ray_t* ray_read_file_fn(ray_t* path_obj) {
+    ray_t* bytes = read_file_bytes(path_obj, "read");
+    if (RAY_IS_ERR(bytes)) return bytes;
+
+    ray_t* result = ray_str((const char*)ray_data(bytes), (size_t)bytes->len);
+    ray_release(bytes);
+    return result;
+}
+
+/* (read-bytes path) — read a file's contents as a U8 byte vector */
+ray_t* ray_read_bytes_fn(ray_t* path_obj) {
+    return read_file_bytes(path_obj, "read-bytes");
 }
 
 /* (load path) — read and evaluate a Rayfall script file via mmap */
@@ -2064,20 +2086,37 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 #endif
 }
 
-/* (write path content) — write string to a file */
-ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", "write: path must be str, got %s", ray_type_name(path_obj->type));
-    if (content->type != -RAY_STR) return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
+static ray_t* write_file_data(ray_t* path_obj, const void* data, size_t len,
+                              const char* op) {
+    if (path_obj->type != -RAY_STR)
+        return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    const char* data = ray_str_ptr(content);
-    size_t len = ray_str_len(content);
-    if (!path || !data) return ray_error("domain", "write: empty path or content");
+    if (!path || ray_str_len(path_obj) == 0)
+        return ray_error("domain", "%s: empty path", op);
+    if (len > 0 && !data) return ray_error("domain", "%s: invalid content", op);
+
     FILE* fp = fopen(path, "wb");
     if (!fp) return ray_error("io", NULL);
-    size_t written = fwrite(data, 1, len, fp);
-    fclose(fp);
-    if (written != len) return ray_error("io", NULL);
+    size_t written = len > 0 ? fwrite(data, 1, len, fp) : 0;
+    int close_rc = fclose(fp);
+    if (written != len || close_rc != 0) return ray_error("io", NULL);
     return make_i64(0);
+}
+
+/* (write path content) — write a string to a file */
+ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
+    if (content->type != -RAY_STR)
+        return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
+    return write_file_data(path_obj, ray_str_ptr(content), ray_str_len(content),
+                           "write");
+}
+
+/* (write-bytes path content) — write a U8 byte vector to a file */
+ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content) {
+    if (content->type != RAY_U8)
+        return ray_error("type", "write-bytes: content must be U8, got %s", ray_type_name(content->type));
+    return write_file_data(path_obj, ray_data(content), (size_t)content->len,
+                           "write-bytes");
 }
 
 /* ══════════════════════════════════════════

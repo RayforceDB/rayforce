@@ -3284,7 +3284,9 @@ static void ray_register_builtins(void) {
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
+    register_unary("read-bytes", RAY_FN_RESTRICTED, ray_read_bytes_fn);
     register_binary("write",    RAY_FN_RESTRICTED, ray_write_file_fn);
+    register_binary("write-bytes", RAY_FN_RESTRICTED, ray_write_bytes_fn);
     register_unary("load",      RAY_FN_RESTRICTED, ray_load_file_fn);
     register_unary("exit",      RAY_FN_RESTRICTED, ray_exit_fn);
     register_vary("resolve",    RAY_FN_SPECIAL_FORM, ray_resolve_fn);

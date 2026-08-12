@@ -7680,7 +7680,73 @@ static test_result_t test_builtin_load_file_fn(void) {
     PASS();
 }
 
-/* (write path content) — write a string to a file. */
+/* (read-bytes path) — read a file as a U8 byte vector. */
+static test_result_t test_builtin_read_bytes_fn(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/ray_test_read_bytes_%d.bin", (int)getpid());
+    static const uint8_t expected[] = { 0x00, 0x01, 0x7f, 0x80, 0xff };
+
+    FILE* fp = fopen(path, "wb");
+    TEST_ASSERT_NOT_NULL(fp);
+    TEST_ASSERT_EQ_U(fwrite(expected, 1, sizeof(expected), fp), sizeof(expected));
+    TEST_ASSERT_EQ_I(fclose(fp), 0);
+
+    ray_t* p = ray_str(path, strlen(path));
+    ray_t* bytes = ray_read_bytes_fn(p);
+    TEST_ASSERT_NOT_NULL(bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bytes));
+    TEST_ASSERT_EQ_I(bytes->type, RAY_U8);
+    TEST_ASSERT_EQ_I(bytes->len, (int64_t)sizeof(expected));
+    TEST_ASSERT_MEM_EQ(sizeof(expected), ray_data(bytes), expected);
+
+    /* The existing text reader keeps its string contract after sharing the
+     * exact-read path, including explicit length across embedded NULs. */
+    ray_t* text = ray_read_file_fn(p);
+    TEST_ASSERT_NOT_NULL(text);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(text));
+    TEST_ASSERT_EQ_I(text->type, -RAY_STR);
+    TEST_ASSERT_EQ_U(ray_str_len(text), sizeof(expected));
+    TEST_ASSERT_MEM_EQ(sizeof(expected), ray_str_ptr(text), expected);
+
+    /* Exercise public builtin registration, not only the C entry point. */
+    char expr[128];
+    snprintf(expr, sizeof(expr), "(read-bytes \"%s\")", path);
+    ray_t* eval_bytes = ray_eval_str(expr);
+    TEST_ASSERT_NOT_NULL(eval_bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(eval_bytes));
+    TEST_ASSERT_EQ_I(eval_bytes->type, RAY_U8);
+    TEST_ASSERT_EQ_I(eval_bytes->len, (int64_t)sizeof(expected));
+    TEST_ASSERT_MEM_EQ(sizeof(expected), ray_data(eval_bytes), expected);
+
+    /* Empty files produce an empty U8 vector. */
+    fp = fopen(path, "wb");
+    TEST_ASSERT_NOT_NULL(fp);
+    TEST_ASSERT_EQ_I(fclose(fp), 0);
+    ray_t* empty = ray_read_bytes_fn(p);
+    TEST_ASSERT_NOT_NULL(empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+    TEST_ASSERT_EQ_I(empty->type, RAY_U8);
+    TEST_ASSERT_EQ_I(empty->len, 0);
+
+    ray_t* bad_path = ray_i64(0);
+    ray_t* type_err = ray_read_bytes_fn(bad_path);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(type_err));
+    unlink(path);
+    ray_t* io_err = ray_read_bytes_fn(p);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(io_err));
+
+    ray_release(io_err);
+    ray_release(type_err);
+    ray_release(bad_path);
+    ray_release(empty);
+    ray_release(eval_bytes);
+    ray_release(text);
+    ray_release(bytes);
+    ray_release(p);
+    PASS();
+}
+
+/* Text and byte file writers have distinct public builtins. */
 static test_result_t test_builtin_write_file_fn(void) {
     char path[64];
     snprintf(path, sizeof(path), "/tmp/ray_test_write_%d.txt", (int)getpid());
@@ -7701,6 +7767,47 @@ static test_result_t test_builtin_write_file_fn(void) {
     TEST_ASSERT_EQ_U(rd, 11);
     TEST_ASSERT_TRUE(memcmp(buf, "hello world", 11) == 0);
 
+    /* write-bytes writes U8 content verbatim, including embedded NULs and
+     * bytes that are not valid text. */
+    static const uint8_t expected[] = { 0x00, 0x01, 0x7f, 0x80, 0xff };
+    ray_t* bytes = ray_vec_from_raw(RAY_U8, expected, (int64_t)sizeof(expected));
+    TEST_ASSERT_NOT_NULL(bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bytes));
+
+    ray_t* rbb = ray_write_bytes_fn(p, bytes);
+    TEST_ASSERT_NOT_NULL(rbb);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rbb));
+    char expr[192];
+    snprintf(expr, sizeof(expr),
+             "(write-bytes \"%s\" (as 'U8 [0 1 127 128 255]))", path);
+    ray_t* eval_write = ray_eval_str(expr);
+    TEST_ASSERT_NOT_NULL(eval_write);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(eval_write));
+    fp = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(fp);
+    uint8_t byte_buf[sizeof(expected)] = {0};
+    rd = fread(byte_buf, 1, sizeof(byte_buf), fp);
+    fclose(fp);
+    TEST_ASSERT_EQ_U(rd, sizeof(expected));
+    TEST_ASSERT_MEM_EQ(sizeof(expected), byte_buf, expected);
+
+    ray_t* string_err = ray_write_bytes_fn(p, c);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(string_err));
+    ray_t* bytes_err = ray_write_file_fn(p, bytes);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(bytes_err));
+
+    /* Empty byte vectors truncate/create an empty file. */
+    ray_t* empty = ray_vec_new(RAY_U8, 0);
+    TEST_ASSERT_NOT_NULL(empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+    ray_t* re = ray_write_bytes_fn(p, empty);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(re));
+    fp = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(fp);
+    TEST_ASSERT_EQ_I(fgetc(fp), EOF);
+    fclose(fp);
+
     /* Wrong-type paths. */
     ray_t* bad_path = ray_i64(0);
     ray_t* re1 = ray_write_file_fn(bad_path, c);
@@ -7710,6 +7817,13 @@ static test_result_t test_builtin_write_file_fn(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(re2));
 
     unlink(path);
+    ray_release(bytes_err);
+    ray_release(string_err);
+    ray_release(eval_write);
+    ray_release(rbb);
+    ray_release(re);
+    ray_release(empty);
+    ray_release(bytes);
     ray_release(re2);
     ray_release(bad_content);
     ray_release(re1);
@@ -9074,6 +9188,7 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/show",        test_builtin_show_fn,        lang_setup, lang_teardown },
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
+    { "lang/builtin/read_bytes",  test_builtin_read_bytes_fn,  lang_setup, lang_teardown },
     { "lang/builtin/write_file",  test_builtin_write_file_fn,  lang_setup, lang_teardown },
     { "lang/builtin/group_ht_grow_i64",   test_builtin_group_ht_grow_i64,   lang_setup, lang_teardown },
     { "lang/builtin/group_ht_grow_guid",  test_builtin_group_ht_grow_guid,  lang_setup, lang_teardown },

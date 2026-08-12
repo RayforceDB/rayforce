@@ -336,7 +336,9 @@ ray_t* ray_println_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_read_file_fn(ray_t* path_obj);
+ray_t* ray_read_bytes_fn(ray_t* path_obj);
 ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);
+ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
 
 /* Vector similarity / embeddings / HNSW.
  * cos-dist and l2-dist return distance (lower = closer); inner-prod is
