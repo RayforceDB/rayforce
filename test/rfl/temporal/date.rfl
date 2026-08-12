@@ -43,3 +43,25 @@
 (== 2024.06.15 2024.06.15) -- true
 (<= 2024.01.01 2024.01.01) -- true
 (>= 2024.12.31 2024.06.15) -- true
+
+;; ────────────── int32-range decode (regression) ──────────────
+;; days near INT32_MAX used to overflow int32 in date_to_ymd (cal.h:50)
+;; and print garbage / trip UBSan. Years above 9999 can't be written as
+;; literals, so pin decode+re-encode identity instead.
+(as 'DATE 0) -- 2000.01.01
+(as 'DATE -10957) -- 1970.01.01
+(as 'DATE 2921939) -- 9999.12.31
+(as 'i64 (as 'DATE 2146753528)) -- 2146753528
+(as 'i64 (as 'DATE 2146753529)) -- 2146753529
+(as 'i64 (as 'DATE 2147483646)) -- 2147483646
+(as 'i64 (as 'DATE 2147483647)) -- 2147483647
+(as 'i64 (+ (as 'DATE 2146753528) 1)) -- 2146753529
+(as 'i64 (as 'DATE -2147483647)) -- -2147483647
+(as 'DATE -2147483648) -- 0Nd
+;; round-trip through the int64 store stays exact
+(as 'i64 2000.01.01) -- 0
+(as 'i64 1970.01.01) -- -10957
+(as 'i64 2024.02.29) -- 8825
+(as 'i64 1900.02.28) -- -36466
+(as 'i64 9999.12.31) -- 2921939
+(as 'i64 2000.02.29) -- 59

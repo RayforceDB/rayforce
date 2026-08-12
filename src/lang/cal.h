@@ -41,20 +41,22 @@ static inline int date_leap_year(int year) {
     return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
 }
 
-static inline int32_t date_years_by_days(int yy) {
-    return (int32_t)((int64_t)yy * 365 + yy / 4 - yy / 100 + yy / 400);
+static inline int64_t date_years_by_days(int yy) {
+    return (int64_t)yy * 365 + yy / 4 - yy / 100 + yy / 400;
 }
 
 /* Decode: days-since-epoch → year/month/day */
 static inline void date_to_ymd(int32_t days, int* y, int* m, int* d) {
-    int32_t offset = days + date_years_by_days(RAY_DATE_EPOCH - 1);
+    /* int64 throughout: days near INT32_MAX overflow int32 after the epoch
+     * offset (e.g. (as 'DATE 2147483646)), producing garbage years. */
+    int64_t offset = (int64_t)days + date_years_by_days(RAY_DATE_EPOCH - 1);
     double approx = (double)offset / 365.2425;
     int32_t years = (int32_t)(approx >= 0.0 ? approx + 0.5 : approx - 0.5);
 
     if (date_years_by_days(years) > offset)
         years -= 1;
 
-    int32_t rem = offset - date_years_by_days(years);
+    int64_t rem = offset - date_years_by_days(years);
     int yy = years + 1;
     int leap = date_leap_year(yy);
     int mid = 0;
@@ -68,18 +70,18 @@ static inline void date_to_ymd(int32_t days, int* y, int* m, int* d) {
 
     *y = yy;
     *m = 1 + mid % 12;
-    *d = 1 + rem - (int32_t)MONTHDAYS[leap][mid];
+    *d = 1 + (int)(rem - (int32_t)MONTHDAYS[leap][mid]);
 }
 
 /* Encode: year/month/day → days-since-epoch */
 static inline int32_t ymd_to_date(int year, int month, int day) {
     int yy = (year > 0) ? year - 1 : 0;
-    int32_t ydays = date_years_by_days(yy);
+    int64_t ydays = date_years_by_days(yy);
     int leap = date_leap_year(year);
     int mm = (month > 0) ? month - 1 : 0;
     if (mm > 12) mm = 12;  /* defensive: never index past the 13-wide table */
-    int32_t mdays = (int32_t)MONTHDAYS[leap][mm];
-    return ydays - date_years_by_days(RAY_DATE_EPOCH - 1) + mdays + day - 1;
+    int64_t mdays = (int32_t)MONTHDAYS[leap][mm];
+    return (int32_t)(ydays - date_years_by_days(RAY_DATE_EPOCH - 1) + mdays + day - 1);
 }
 
 #endif /* RAY_CAL_H */
