@@ -1712,7 +1712,7 @@ static bool query_atom_truthy(ray_t* v, bool* out) {
 }
 
 static ray_t* eval_where_mask(ray_t* where_expr, ray_t* tbl, const char* label) {
-    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* _aqt = bind_all_columns(tbl);
     ray_t* mask = ray_eval(where_expr);
     if (mask && !RAY_IS_ERR(mask))
@@ -2766,7 +2766,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     for (int i = 0; i < n_cols; i++)
         cols[i] = ray_table_get_col(tbl, col_syms[i]);
 
-    if (ray_env_push_scope() != RAY_OK) { scratch_free(refs_hdr); return ray_error("oom", NULL); }
+    if (ray_env_push_query_scope() != RAY_OK) { scratch_free(refs_hdr); return ray_error("oom", NULL); }
 
     /* B3 Part 2: publish `tbl` as the active query table so a literal
      * column-name symbol inside `expr` resolves to its column during the
@@ -2960,7 +2960,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
     for (int i = 0; i < n_cols; i++)
         cols[i] = ray_table_get_col(tbl, col_syms[i]);
 
-    if (ray_env_push_scope() != RAY_OK) { scratch_free(refs_hdr); return ray_error("oom", NULL); }
+    if (ray_env_push_query_scope() != RAY_OK) { scratch_free(refs_hdr); return ray_error("oom", NULL); }
 
     /* B3 Part 2: publish `tbl` as the active query table so a literal
      * column-name symbol inside `expr` resolves to its column during the
@@ -3082,7 +3082,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
  * count — the caller enforces cross-column length agreement.  Mirrors
  * eval_expr_per_row's scope save/restore, including on every error exit. */
 static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
-    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* _aqt = bind_all_columns(tbl);
     ray_t* result = ray_eval(expr);
     /* distinct/asc/desc/reverse return a lazy DAG chain (RAY_LAZY) — force it
@@ -3127,7 +3127,7 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
     }
     if (!src) {
         /* Bind table cols and eval — same pattern as the existing path. */
-        if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+        if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* _aqt = bind_all_columns(tbl);
         src = ray_eval(col_expr);
         g_active_query_table = _aqt;
@@ -3245,7 +3245,7 @@ static ray_t* aggr_med_per_group_buf(ray_t* expr, ray_t* tbl,
         if (src) ray_retain(src);
     }
     if (!src) {
-        if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+        if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* _aqt = bind_all_columns(tbl);
         src = ray_eval(col_expr);
         g_active_query_table = _aqt;
@@ -3803,7 +3803,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         if (src) ray_retain(src);
     }
     if (!src) {
-        if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+        if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* _aqt = bind_all_columns(tbl);
         src = ray_eval(inner_expr);
         g_active_query_table = _aqt;
@@ -3978,7 +3978,7 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
         if (src) ray_retain(src);
     }
     if (!src) {
-        if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+        if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* _aqt = bind_all_columns(tbl);
         src = ray_eval(inner_expr);
         g_active_query_table = _aqt;
@@ -6180,7 +6180,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             where_expr = NULL;
         }
 
-        ray_env_push_scope();
+        ray_env_push_query_scope();
         int64_t in_ncols = ray_table_ncols(tbl);
         for (int64_t c = 0; c < in_ncols; c++) {
             int64_t cn = ray_table_col_name(tbl, c);
@@ -8118,7 +8118,7 @@ by_dict_done:
                     /* Non-aggregation expression: evaluate on full table,
                      * then gather per-group subsets into a LIST column
                      * (non-agg produces list-of-vectors). */
-                    if (ray_env_push_scope() != RAY_OK) {
+                    if (ray_env_push_query_scope() != RAY_OK) {
                         for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
                         scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                         ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
@@ -8937,7 +8937,7 @@ by_dict_done:
                         /* Evaluate by_expr against the (empty) filtered table
                          * to get a length-0 key vector typed like the
                          * non-empty path would produce it. */
-                        ray_env_push_scope();
+                        ray_env_push_query_scope();
                         for (int64_t c = 0; c < nc0; c++) {
                             ray_env_set_query_local(ray_table_col_name(filtered_tbl, c),
                                                     ray_table_get_col_idx(filtered_tbl, c));
@@ -8980,7 +8980,7 @@ by_dict_done:
                 /* Computed group key (e.g., xbar) — fall back to eval-level groupby */
                 ray_release(grouped);
                 int64_t tbl_ncols = ray_table_ncols(filtered_tbl);
-                ray_env_push_scope();
+                ray_env_push_query_scope();
                 for (int64_t c = 0; c < tbl_ncols; c++) {
                     int64_t cn = ray_table_col_name(filtered_tbl, c);
                     ray_t* cv = ray_table_get_col_idx(filtered_tbl, c);
@@ -9967,7 +9967,7 @@ by_dict_done:
             ray_t* cerr = NULL;
             bool layout_ok = hbase + n_hidden_aggs <= rnc;
             if (layout_ok) {
-                if (ray_env_push_scope() != RAY_OK) {
+                if (ray_env_push_query_scope() != RAY_OK) {
                     cerr = ray_error("oom", NULL);
                 } else {
                     for (int hi = 0; hi < n_hidden_aggs; hi++)
@@ -10769,7 +10769,7 @@ by_dict_done:
                         continue;
                     }
 
-                    if (ray_env_push_scope() != RAY_OK) {
+                    if (ray_env_push_query_scope() != RAY_OK) {
                         scatter_err = ray_error("oom", NULL); break;
                     }
                     ray_t* _aqt = bind_all_columns(tbl);
@@ -11507,7 +11507,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         if (!mask_vec || RAY_IS_ERR(mask_vec)) {
             /* Bind column names to column vectors in env, then eval */
             int64_t ncols2 = ray_table_ncols(tbl);
-            ray_env_push_scope();
+            ray_env_push_query_scope();
             for (int64_t c = 0; c < ncols2; c++) {
                 int64_t cn = ray_table_col_name(tbl, c);
                 ray_t* col = ray_table_get_col_idx(tbl, c);
@@ -11581,7 +11581,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) {
                     /* Fallback: eval with column bindings */
                     int64_t ncols_e = ray_table_ncols(tbl);
-                    ray_env_push_scope();
+                    ray_env_push_query_scope();
                     for (int64_t c2 = 0; c2 < ncols_e; c2++) {
                         int64_t cn = ray_table_col_name(tbl, c2);
                         ray_t* col2 = ray_table_get_col_idx(tbl, c2);
@@ -11886,7 +11886,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             if (!expr_vec || RAY_IS_ERR(expr_vec)) {
                 /* Fallback: eval with column bindings */
                 int64_t ncols_f = ray_table_ncols(tbl);
-                ray_env_push_scope();
+                ray_env_push_query_scope();
                 for (int64_t cf = 0; cf < ncols_f; cf++) {
                     int64_t cn = ray_table_col_name(tbl, cf);
                     ray_t* colf = ray_table_get_col_idx(tbl, cf);

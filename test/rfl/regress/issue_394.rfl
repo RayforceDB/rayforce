@@ -72,6 +72,15 @@
 (set I394UpdateParam (fn [x] (update {v:x from:I394Q})))
 (at (I394UpdateParam 77) 'v) -- [77 77]
 
+;; Query scopes do not count as lexical shadowing.  While the outer where:
+;; expression has its `x` column mounted, the called lambda's inner query must
+;; still mount its own same-named `x` column.  `eval` forces the tree-walk path
+;; that originally exposed the collision.
+(set I394NestedInner (table [x] (list [10 20])))
+(set I394NestedOuter (table [x] (list [1 2])))
+(set I394NestedQuery (fn [] (first (at (select {v:(eval (list + x 0)) from:I394NestedInner}) 'v))))
+(count (select {from:I394NestedOuter where:(== (I394NestedQuery) 10)})) -- 2
+
 ;; These issue claims conflict with established Rayfall semantics: `%` is
 ;; modulo, dict literals preserve query ASTs, and key(table) returns its schema.
 (% 7 3) -- 1

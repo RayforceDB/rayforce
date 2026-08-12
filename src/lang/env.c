@@ -115,12 +115,15 @@ int32_t ray_env_scope_depth(void) { return __VM ? __VM->scope_depth : 0; }
 int32_t ray_env_global_count(void) { return g_env.count; }
 
 /* Query scopes are synthetic and must not eclipse a caller's lexical
- * parameter/let binding.  The top frame is deliberately excluded because
- * repeated per-row/per-group binds should still replace their prior value. */
-bool ray_env_has_outer_local(int64_t sym_id) {
+ * parameter/let binding.  Other query frames are deliberately ignored so
+ * an inner query can bind a same-named column over an outer query column.
+ * The top frame is excluded because repeated per-row/per-group binds should
+ * replace their prior value. */
+static bool env_has_outer_lexical(int64_t sym_id) {
     if (!__VM) return false;
     for (int32_t d = __VM->scope_depth - 2; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
+        if (f->kind == RAY_SCOPE_QUERY) continue;
         for (int32_t i = 0; i < f->count; i++)
             if (f->keys[i] == sym_id) return true;
     }
@@ -128,8 +131,8 @@ bool ray_env_has_outer_local(int64_t sym_id) {
 }
 
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val) {
-    return ray_env_has_outer_local(sym_id) ? RAY_OK
-                                           : ray_env_set_local(sym_id, val);
+    return env_has_outer_lexical(sym_id) ? RAY_OK
+                                          : ray_env_set_local(sym_id, val);
 }
 
 ray_t* ray_env_capture_locals(void) {
@@ -702,15 +705,24 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
     return env_bind_global_user(sym_id, val);
 }
 
-ray_err_t ray_env_push_scope(void) {
+static ray_err_t env_push_scope(uint8_t kind) {
     if (__VM->scope_depth >= RAY_SCOPE_CAP) return RAY_ERR_OOM;
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth];
     f->keys = f->keys_inline;
     f->vals = f->vals_inline;
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
+    f->kind = kind;
     __VM->scope_depth++;
     return RAY_OK;
+}
+
+ray_err_t ray_env_push_scope(void) {
+    return env_push_scope(RAY_SCOPE_LEXICAL);
+}
+
+ray_err_t ray_env_push_query_scope(void) {
+    return env_push_scope(RAY_SCOPE_QUERY);
 }
 
 void ray_env_pop_scope(void) {
@@ -726,6 +738,7 @@ void ray_env_pop_scope(void) {
     f->vals = f->vals_inline;
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
+    f->kind = RAY_SCOPE_LEXICAL;
 }
 
 /* Materialize compiled-lambda locals into a fresh scope frame — the

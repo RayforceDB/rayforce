@@ -134,10 +134,10 @@ int32_t ray_env_global_count(void);
 
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
+ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
-bool      ray_env_has_outer_local(int64_t sym_id);
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_capture_locals(void);
 ray_err_t ray_env_push_capture(ray_t* capture);
