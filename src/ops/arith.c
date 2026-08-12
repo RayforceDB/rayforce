@@ -277,13 +277,25 @@ ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
                          ray_type_name(a->type), ray_type_name(b->type));
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
         return ray_typed_null(-RAY_I64);
-    double bv = as_f64(b);
-    if (bv == 0.0)
+    if (is_float_op(a, b)) {
+        double bv = as_f64(b);
+        if (bv == 0.0)
+            return ray_typed_null(-RAY_I64);
+        double q = floor(as_f64(a) / bv);
+        if (q >= 9223372036854775808.0 || q < (double)INT64_MIN)
+            return ray_typed_null(-RAY_I64);
+        return make_i64((int64_t)q);
+    }
+    /* Integer div: stay in int64 space. The double round-trip above silently
+     * loses precision for magnitudes > 2^53 and is UB for q == 2^63. */
+    int64_t bv = as_i64(b);
+    if (bv == 0)
         return ray_typed_null(-RAY_I64);
-    double q = floor(as_f64(a) / bv);
-    if (q < (double)INT64_MIN || q > (double)INT64_MAX)
-        return ray_typed_null(-RAY_I64);
-    return make_i64((int64_t)q);
+    int64_t la = as_i64(a);
+    int64_t q = la / bv;
+    if (la % bv != 0 && ((la < 0) != (bv < 0)))
+        q--; /* floor toward -inf */
+    return make_i64(q);
 }
 
 ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
