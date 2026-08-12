@@ -985,7 +985,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         ray_op_t* bound = cexpr_env_lookup(g, expr->i64);
         if (bound) return bound;
-        ray_t* local = ray_env_get_local(expr->i64);
+        ray_t* local = ray_env_get_lexical_local(expr->i64);
         if (local) {
             if (ray_is_atom(local)) return ray_const_atom(g, local);
             if (ray_is_vec(local))  return ray_const_vec(g, local);

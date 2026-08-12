@@ -138,6 +138,7 @@ ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
+ray_t*    ray_env_get_lexical_local(int64_t sym_id);
 bool      ray_env_has_lexical_local(int64_t sym_id);
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_capture_locals(void);

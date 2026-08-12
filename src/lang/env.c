@@ -119,15 +119,19 @@ int32_t ray_env_global_count(void) { return g_env.count; }
  * an inner query can bind a same-named column over an outer query column.
  * Query-local callers push a query frame before probing, so scanning every
  * frame still excludes the binding currently being installed. */
-bool ray_env_has_lexical_local(int64_t sym_id) {
-    if (!__VM) return false;
+ray_t* ray_env_get_lexical_local(int64_t sym_id) {
+    if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
         for (int32_t i = 0; i < f->count; i++)
-            if (f->keys[i] == sym_id) return true;
+            if (f->keys[i] == sym_id) return f->vals[i];
     }
-    return false;
+    return NULL;
+}
+
+bool ray_env_has_lexical_local(int64_t sym_id) {
+    return ray_env_get_lexical_local(sym_id) != NULL;
 }
 
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val) {
