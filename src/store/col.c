@@ -1212,7 +1212,8 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
     if (pool_size > mapped_size - offset - 32)
         return RAY_ERR_CORRUPT;
 
-    const ray_str_t* elems = (const ray_str_t*)((const char*)ptr + 32);
+    ray_str_t* elems = (ray_str_t*)((char*)ptr + 32);
+    const char* pool_base = (const char*)ptr + offset + 32;
     for (int64_t i = 0; i < hdr->len; i++) {
         uint32_t len = elems[i].len;
         if (len <= RAY_STR_INLINE_MAX) continue;
@@ -1220,10 +1221,25 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
             len > pool_size - elems[i].pool_off)
             return RAY_ERR_CORRUPT;
         if (len >= 4) {
-            const char* p = (const char*)ptr + offset + 32 + elems[i].pool_off;
+            const char* p = pool_base + elems[i].pool_off;
             if (memcmp(elems[i].prefix, p, 4) != 0)
                 return RAY_ERR_CORRUPT;
         }
+    }
+
+    /* Pre-hash-cache column files persisted the descriptor's final four
+     * bytes as uninitialized padding.  A nonzero legacy value must never be
+     * trusted as a content hash: equal strings could otherwise probe
+     * different join/group slots and silently produce wrong results.
+     *
+     * ray_vm_map_file is MAP_PRIVATE / copy-on-write, so refreshing the
+     * validated descriptors repairs both callers: ray_col_load copies these
+     * values into its buddy block, while ray_col_mmap retains the private
+     * repaired mapping without modifying the file. */
+    for (int64_t i = 0; i < hdr->len; i++) {
+        if (ray_str_is_inline(&elems[i])) continue;
+        uint32_t h = (uint32_t)ray_str_t_hash(&elems[i], pool_base);
+        elems[i].hash32 = h != 0 ? h : 1u;
     }
 
     out->has_str_pool = true;
