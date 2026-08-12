@@ -681,6 +681,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
 
     join_radix_part_t* rp = &c->r_parts[p];
     join_radix_part_t* lp = &c->l_parts[p];
+    bool str_specialized = c->l_str_desc && c->r_str_desc;
 
     /* Test knob: force the chained-path fallback.  Bail before allocating
      * anything (pp headers are still NULL → cleanup-safe). */
@@ -795,7 +796,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
             join_radix_entry_t future = lp->entries[i + 4];
             uint32_t future_slot = future.hash & ht_mask;
             __builtin_prefetch(&ht[future_slot * 2], 0, 1);
-            if (c->l_str_desc) {
+            if (str_specialized) {
                 const ray_str_t* ls = &c->l_str_desc[future.row_idx];
                 if (!ray_str_is_inline(ls) && c->l_str_pool)
                     __builtin_prefetch(c->l_str_pool + ls->pool_off, 0, 1);
@@ -815,7 +816,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
         while (ht[slot * 2 + 1] != RADIX_HT_EMPTY) {
             if (ht[slot * 2] == h) {
                 uint32_t rr = ht[slot * 2 + 1];
-                bool keys_equal = c->l_str_desc
+                bool keys_equal = str_specialized
                     ? join_str_eq_hashed(&c->l_str_desc[lr], c->l_str_pool,
                                          &c->r_str_desc[rr], c->r_str_pool)
                     : join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys,
