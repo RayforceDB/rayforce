@@ -81,6 +81,14 @@
 (set I394NestedQuery (fn [] (first (at (select {v:(eval (list + x 0)) from:I394NestedInner}) 'v))))
 (count (select {from:I394NestedOuter where:(== (I394NestedQuery) 10)})) -- 2
 
+;; The same distinction must drive grouped-expression shape classification.
+;; Otherwise the outer query's `x` makes the inner `(I394First x)` look
+;; constant and silently broadcasts 10 into both inner groups.
+(set I394NestedGroupedInner (table [g x] (list [1 2] [10 20])))
+(set I394First (fn [v] (first v)))
+(set I394NestedGrouped (fn [] (at (select {picked:(I394First x) from:I394NestedGroupedInner by:g}) 'picked)))
+(count (select {from:I394NestedOuter where:(== (last (I394NestedGrouped)) 20)})) -- 2
+
 ;; These issue claims conflict with established Rayfall semantics: `%` is
 ;; modulo, dict literals preserve query ASTs, and key(table) returns its schema.
 (% 7 3) -- 1

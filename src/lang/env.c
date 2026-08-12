@@ -117,11 +117,11 @@ int32_t ray_env_global_count(void) { return g_env.count; }
 /* Query scopes are synthetic and must not eclipse a caller's lexical
  * parameter/let binding.  Other query frames are deliberately ignored so
  * an inner query can bind a same-named column over an outer query column.
- * The top frame is excluded because repeated per-row/per-group binds should
- * replace their prior value. */
-static bool env_has_outer_lexical(int64_t sym_id) {
+ * Query-local callers push a query frame before probing, so scanning every
+ * frame still excludes the binding currently being installed. */
+bool ray_env_has_lexical_local(int64_t sym_id) {
     if (!__VM) return false;
-    for (int32_t d = __VM->scope_depth - 2; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
         for (int32_t i = 0; i < f->count; i++)
@@ -131,8 +131,8 @@ static bool env_has_outer_lexical(int64_t sym_id) {
 }
 
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val) {
-    return env_has_outer_lexical(sym_id) ? RAY_OK
-                                          : ray_env_set_local(sym_id, val);
+    return ray_env_has_lexical_local(sym_id) ? RAY_OK
+                                              : ray_env_set_local(sym_id, val);
 }
 
 ray_t* ray_env_capture_locals(void) {

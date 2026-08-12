@@ -1800,7 +1800,7 @@ static int is_agg_expr(ray_t* expr);  /* defined below */
 static int expr_refs_row_column(ray_t* expr, ray_t* tbl) {
     if (!expr) return 0;
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
-        if (ray_env_get_local(expr->i64)) return 0;
+        if (ray_env_has_lexical_local(expr->i64)) return 0;
         if (ray_table_get_col(tbl, expr->i64)) return 1;
         /* Dotted name whose head is a column is a row-aligned ref —
          * `Timestamp.ss` flows through row-by-row the same as plain
