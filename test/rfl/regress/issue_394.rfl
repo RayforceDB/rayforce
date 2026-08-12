@@ -47,9 +47,9 @@
 (find (list "alpha" "beta" "gamma") "beta") -- 1
 (find (list "alpha" "beta" "gamma") "absent") -- 0Nl
 
-;; Deterministic hashing is public under both descriptive and implementation names.
-(== (hash 42) (wyhash 42)) -- true
-(count (hash [1 2 3])) -- 3
+;; Hashing is an internal implementation detail, not a language builtin.
+(hash 42) !- name
+(wyhash 42) !- name
 
 ;; xkey construction is hash-based and keyed dictionaries accept vector probes.
 (set I394T (table [k v] (list (til 5000) (+ 10 (til 5000)))))

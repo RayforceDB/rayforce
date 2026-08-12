@@ -288,7 +288,6 @@ ray_t* ray_cross_fn(ray_t* a, ray_t* b);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
 ray_t* ray_fill_fn(ray_t* replacement, ray_t* value);
-ray_t* ray_hash_fn(ray_t* x);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
 ray_t* ray_lag_fn(ray_t* x);

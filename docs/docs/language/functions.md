@@ -160,7 +160,6 @@ Operations on vectors as collections.
 | `at` | binary | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
 | `fill` | binary, atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
-| `hash` / `wyhash` | unary, atomic | Stable 64-bit structural hash (`wyhash` is an alias) | `(hash "abc")` |
 | `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |

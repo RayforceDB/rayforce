@@ -2565,12 +2565,6 @@ uint64_t ray_atom_hash(ray_t* a) {
     }
 }
 
-/* Stable 64-bit structural hash.  The signed I64 result preserves every bit
- * of wyhash's output; callers that display it may therefore see negatives. */
-ray_t* ray_hash_fn(ray_t* x) {
-    return make_i64((int64_t)ray_atom_hash(x));
-}
-
 /* Context for GUID rehash: the 16-byte source base and, indirectly,
  * gvals — which stores the row_idx of the first occurrence per group. */
 typedef struct {
