@@ -1830,19 +1830,37 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         ray_release(s);
         if (val->type == -RAY_GUID) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
-            /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
+            /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+             * Require the canonical hyphenated form exactly: 32 hex
+             * nibbles with the four dashes at offsets 8/13/18/23.  The old
+             * parser skipped '-' anywhere and decoded any character as a
+             * nibble, so non-hex garbage (e.g. all-'z') silently produced a
+             * wrong-but-valid GUID. */
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
+            if (sl != 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
             uint8_t bytes[16];
-            const char* p = sp;
-            for (int bi = 0; bi < 16; bi++) {
-                if (*p == '-') p++;
-                char hi = *p++;
-                char lo = *p++;
-                int h = (hi >= 'a') ? hi - 'a' + 10 : (hi >= 'A') ? hi - 'A' + 10 : hi - '0';
-                int l = (lo >= 'a') ? lo - 'a' + 10 : (lo >= 'A') ? lo - 'A' + 10 : lo - '0';
-                bytes[bi] = (uint8_t)((h << 4) | l);
+            int nib = 0;
+            for (size_t j = 0; j < sl; j++) {
+                char c = sp[j];
+                /* Offsets 8/13/18/23 MUST be the dash; every other position
+                 * MUST be a hex digit.  This is position-driven (rather than
+                 * "reject a misplaced dash") so the 32 non-dash positions are
+                 * exactly 32 nibbles — nib never exceeds 31 and bytes[nib>>1]
+                 * cannot run past bytes[16]. */
+                if (j == 8 || j == 13 || j == 18 || j == 23) {
+                    if (c != '-')
+                        return ray_error("domain", "as: cannot parse str as guid, expected '-' at offset %lld", (long long)j);
+                    continue;
+                }
+                int v;
+                if (c >= '0' && c <= '9')        v = c - '0';
+                else if (c >= 'a' && c <= 'f')   v = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F')   v = c - 'A' + 10;
+                else return ray_error("domain", "as: cannot parse str as guid, non-hex character '%c'", c);
+                if ((nib & 1) == 0) bytes[nib >> 1] = (uint8_t)(v << 4);
+                else                bytes[nib >> 1] |= (uint8_t)v;
+                nib++;
             }
             return ray_guid(bytes);
         }
