@@ -45,8 +45,24 @@ static ray_t* jb_table1(const char* name, const int64_t* vals, int64_t n) {
     return tbl;
 }
 
+static ray_t* jb_str_table1(const char* name, const char* value) {
+    ray_t* col = ray_vec_new(RAY_STR, 1);
+    if (!col || RAY_IS_ERR(col)) return col;
+    ray_t* next = ray_str_vec_append(col, value, strlen(value));
+    if (!next || RAY_IS_ERR(next)) {
+        ray_release(col);
+        return next;
+    }
+    col = next;
+    ray_t* tbl = ray_table_new(1);
+    int64_t sym = ray_sym_intern(name, strlen(name));
+    tbl = ray_table_add_col(tbl, sym, col);
+    ray_release(col);
+    return tbl;
+}
+
 /* ── Join helper ───────────────────────────────────────────────────────────
- * jb_inner_join: build and execute a single-key I64 inner join.
+ * jb_inner_join: build and execute a single-key inner join.
  *
  * Graph shape (mirrors query.c join_impl):
  *   g = ray_graph_new(lt)          — g->table = lt (used for type inference
@@ -965,6 +981,41 @@ static test_result_t test_jb_not_sticky(void) {
     return (test_result_t){ TEST_PASS, NULL };
 }
 
+/* A direct graph can pair unlike key types even though the Rayfall query
+ * frontend rejects them.  The radix executor must use generic equality unless
+ * both key vectors are STR. */
+static test_result_t test_jb_mixed_type_radix(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    static const char str_key[] = "mixed-key-24497";
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(*rv));
+    TEST_ASSERT_NOT_NULL(rv);
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i;
+
+    ray_t* lt = jb_str_table1("lk", str_key);
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    free(rv);
+    TEST_ASSERT(lt && !RAY_IS_ERR(lt), "STR table allocation");
+    TEST_ASSERT(rt && !RAY_IS_ERR(rt), "I64 table allocation");
+
+    ray_join_no_build_swap = true;
+    ray_t* got = jb_inner_join(lt, "lk", rt, "rk");
+    ray_join_no_build_swap = false;
+
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "mixed-type direct join execution");
+    TEST_ASSERT_EQ_I(ray_table_nrows(got), 0);
+
+    ray_release(got);
+    ray_release(lt);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
@@ -985,5 +1036,6 @@ const test_entry_t join_buildside_entries[] = {
     { "join_buildside/no_trip_low_dup", test_jb_no_trip_low_dup, NULL, NULL },
     { "join_buildside/trip_boundary", test_jb_trip_boundary, NULL, NULL },
     { "join_buildside/not_sticky", test_jb_not_sticky, NULL, NULL },
+    { "join_buildside/mixed_type_radix", test_jb_mixed_type_radix, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

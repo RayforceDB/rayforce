@@ -1133,6 +1133,7 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
 
         memcpy(elem->prefix, s, 4);
         elem->pool_off = (uint32_t)pool_off;
+        ray_str_t_cache_hash(elem, pool_base);
         vec->str_pool->len = pool_off + (int64_t)len;
     }
 
@@ -1212,6 +1213,7 @@ ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
             d->len      = lens[i];
             d->pool_off = (uint32_t)pool_used;
             memcpy(d->prefix, ptrs[i], 4);
+            ray_str_t_cache_hash(d, pool_base);
             pool_used  += (int64_t)lens[i];
         }
     }
@@ -1323,6 +1325,7 @@ ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len) {
         elem->len = (uint32_t)len;
         memcpy(elem->prefix, s, 4);
         elem->pool_off = (uint32_t)pool_used;
+        ray_str_t_cache_hash(elem, pool_base);
         vec->str_pool->len = pool_used + (int64_t)len;
     }
 

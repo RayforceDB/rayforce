@@ -39,7 +39,7 @@
 typedef union {
     struct { uint32_t len; char     data[12]; };      /* inline: len <= 12 */
     struct { uint32_t len_; char    prefix[4];        /* pooled: len > 12  */
-             uint32_t pool_off; uint32_t _pad; };
+             uint32_t pool_off; uint32_t hash32; };
 } ray_str_t;
 
 #define RAY_STR_INLINE_MAX 12
@@ -66,6 +66,9 @@ static inline bool ray_str_t_eq(const ray_str_t* a, const char* pool_a,
     if (ray_str_is_inline(a)) {
         return memcmp(a->data, b->data, a->len) == 0;
     }
+    /* Slices, clones, and separately assembled tables can share one pool.
+     * Equal offsets in the same immutable pool identify the same bytes. */
+    if (pool_a && pool_a == pool_b && a->pool_off == b->pool_off) return true;
     /* Both pooled: check prefix first */
     if (memcmp(a->prefix, b->prefix, 4) != 0) return false;
     return memcmp(pool_a + a->pool_off, pool_b + b->pool_off, a->len) == 0;
@@ -113,6 +116,23 @@ static inline uint64_t ray_str_t_hash(const ray_str_t* s, const char* pool_base)
     }
     h ^= h >> 47; h *= m; h ^= h >> 47;
     return h;
+}
+
+/* Pooled descriptors have four bytes that are not needed for addressing.
+ * Cache a non-zero 32-bit content hash there so joins can hash long STR keys
+ * without rereading the pool on every execution.  A zero field denotes an
+ * older/on-disk descriptor without a cache; computing it remains fully
+ * backward compatible.  Inline strings use all 12 payload bytes and are
+ * cheap enough to hash directly. */
+static inline uint32_t ray_str_t_hash32(const ray_str_t* s,
+                                        const char* pool_base) {
+    if (!ray_str_is_inline(s) && s->hash32 != 0) return s->hash32;
+    uint32_t h = (uint32_t)ray_str_t_hash(s, pool_base);
+    return h != 0 ? h : 1u;
+}
+
+static inline void ray_str_t_cache_hash(ray_str_t* s, const char* pool_base) {
+    if (!ray_str_is_inline(s)) s->hash32 = ray_str_t_hash32(s, pool_base);
 }
 
 #endif /* RAY_STR_H */

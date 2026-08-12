@@ -35,11 +35,13 @@ typedef struct {
 
 #define RAY_SCOPE_CAP  64
 #define RAY_FRAME_CAP  64
+#define RAY_SCOPE_LEXICAL 0
+#define RAY_SCOPE_QUERY   1
 
-/* One lexical scope frame.  keys/vals start out pointing at the inline
- * arrays and move to heap blocks if the frame grows past RAY_FRAME_CAP
- * (see env.c).  Self-referential, so a frame must not be relocated
- * while live. */
+/* One lexical or synthetic query scope frame.  keys/vals start out pointing
+ * at the inline arrays and move to heap blocks if the frame grows past
+ * RAY_FRAME_CAP (see env.c).  Self-referential, so a frame must not be
+ * relocated while live. */
 typedef struct {
     int64_t  keys_inline[RAY_FRAME_CAP];
     ray_t*   vals_inline[RAY_FRAME_CAP];
@@ -47,6 +49,7 @@ typedef struct {
     ray_t**  vals;     /* -> vals_inline, or heap once grown */
     int32_t  cap;
     int32_t  count;
+    uint8_t  kind;
 } ray_scope_frame_t;
 
 /* ===== Per-thread VM =====

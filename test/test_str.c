@@ -635,6 +635,8 @@ static test_result_t test_str_t_eq_pooled(void) {
 
     ray_str_t* elems = (ray_str_t*)ray_data(v);
     const char* pool = (const char*)ray_data(v->str_pool);
+    /* Same immutable pool + same offset is an exact identity fast path. */
+    TEST_ASSERT_TRUE(ray_str_t_eq(&elems[0], pool, &elems[0], pool));
     TEST_ASSERT_TRUE(ray_str_t_eq(&elems[0], pool, &elems[1], pool));
     /* Same prefix "a]lo" but different content */
     TEST_ASSERT_FALSE(ray_str_t_eq(&elems[0], pool, &elems[2], pool));
@@ -1655,6 +1657,30 @@ static test_result_t test_str_t_hash_pooled(void) {
     PASS();
 }
 
+static test_result_t test_str_t_hash32_cache(void) {
+    ray_t* v = ray_vec_new(RAY_STR, 3);
+    v = ray_str_vec_append(v, "this is a cached pooled string", 30);
+    v = ray_str_vec_append(v, "this is a cached pooled string", 30);
+    v = ray_str_vec_append(v, "this is another pooled string", 29);
+
+    ray_str_t* elems = (ray_str_t*)ray_data(v);
+    const char* pool = (const char*)ray_data(v->str_pool);
+    TEST_ASSERT_TRUE(elems[0].hash32 != 0);
+    TEST_ASSERT_TRUE(elems[1].hash32 != 0);
+    TEST_ASSERT_TRUE(elems[2].hash32 != 0);
+
+    uint32_t cached = ray_str_t_hash32(&elems[0], pool);
+    TEST_ASSERT_EQ_U(cached, ray_str_t_hash32(&elems[1], pool));
+    TEST_ASSERT_TRUE(cached != ray_str_t_hash32(&elems[2], pool));
+
+    /* A zero cache models columns written by older Rayforce versions. */
+    elems[1].hash32 = 0;
+    TEST_ASSERT_EQ_U(cached, ray_str_t_hash32(&elems[1], pool));
+
+    ray_release(v);
+    PASS();
+}
+
 static test_result_t test_str_t_hash_empty(void) {
     ray_t* v = ray_vec_new(RAY_STR, 2);
     v = ray_str_vec_append(v, "", 0);
@@ -1928,6 +1954,7 @@ const test_entry_t str_entries[] = {
     { "str/vec_concat", test_str_vec_concat_vecs, str_setup, str_teardown },
     { "str/t_hash_inline", test_str_t_hash_inline, str_setup, str_teardown },
     { "str/t_hash_pooled", test_str_t_hash_pooled, str_setup, str_teardown },
+    { "str/t_hash32_cache", test_str_t_hash32_cache, str_setup, str_teardown },
     { "str/t_hash_empty", test_str_t_hash_empty, str_setup, str_teardown },
     { "str/vec_concat_pooled_rebase", test_str_vec_concat_pooled_rebase, str_setup, str_teardown },
     { "str/vec_concat_nulls", test_str_vec_concat_nulls, str_setup, str_teardown },

@@ -89,7 +89,8 @@
 /* Lambdas reuse the attr byte for function-internal flags: 0x40 is
  * RAY_FN_COMPILED, not "has nulls".  Only params/body cross the wire, so
  * compiled metadata must be stripped and rebuilt by the receiving runtime. */
-#define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK ((uint8_t)0)
+#define RAY_SERDE_LAMBDA_HAS_CLOSURE ((uint8_t)0x01)
+#define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK RAY_SERDE_LAMBDA_HAS_CLOSURE
 
 /* Helper: strlen with bounds */
 static size_t safe_strlen(const uint8_t* buf, int64_t max) {
@@ -231,7 +232,9 @@ int64_t ray_serde_size(ray_t* obj) {
     }
     case RAY_LAMBDA: {
         ray_t** slots = (ray_t**)ray_data(obj);
-        return 1 + 1 + ray_serde_size(slots[0]) + ray_serde_size(slots[1]);
+        int64_t size = 1 + 1 + ray_serde_size(slots[0]) + ray_serde_size(slots[1]);
+        if (LAMBDA_CLOSURE(obj)) size += ray_serde_size(LAMBDA_CLOSURE(obj));
+        return size;
     }
     case RAY_UNARY:
     case RAY_BINARY:
@@ -471,11 +474,13 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LAMBDA: {
-        buf[0] = obj->attrs & RAY_SERDE_LAMBDA_ATTR_WIRE_MASK;
+        buf[0] = LAMBDA_CLOSURE(obj) ? RAY_SERDE_LAMBDA_HAS_CLOSURE : 0;
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
         c += ray_ser_raw(buf + c, slots[1]); /* body */
+        if (LAMBDA_CLOSURE(obj))
+            c += ray_ser_raw(buf + c, LAMBDA_CLOSURE(obj));
         return 1 + 1 + c;
     }
 
@@ -872,19 +877,37 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return body;
         }
 
-        /* Build lambda: allocate with 7 slots (same as eval.c) */
-        ray_t* lambda = ray_alloc(7 * sizeof(ray_t*));
+        ray_t* closure = NULL;
+        if (lam_attrs & RAY_SERDE_LAMBDA_HAS_CLOSURE) {
+            closure = ray_de_raw(buf + (saved - *len), len);
+            if (!closure || RAY_IS_ERR(closure)) {
+                ray_release(params);
+                ray_release(body);
+                return closure;
+            }
+            if (closure->type != RAY_DICT) {
+                ray_release(params);
+                ray_release(body);
+                ray_release(closure);
+                return ray_error("type", "deserialize lambda: closure must be a dict");
+            }
+        }
+
+        /* Build lambda: allocate with 8 slots (same as eval.c). */
+        ray_t* lambda = ray_alloc(8 * sizeof(ray_t*));
         if (!lambda || RAY_IS_ERR(lambda)) {
             ray_release(params);
             ray_release(body);
+            ray_release(closure);
             return lambda;
         }
         lambda->type = RAY_LAMBDA;
-        lambda->attrs = lam_attrs & RAY_SERDE_LAMBDA_ATTR_WIRE_MASK;
+        lambda->attrs = 0;
         lambda->len = 0;
-        memset(ray_data(lambda), 0, 7 * sizeof(ray_t*));
+        memset(ray_data(lambda), 0, 8 * sizeof(ray_t*));
         ((ray_t**)ray_data(lambda))[0] = params;
         ((ray_t**)ray_data(lambda))[1] = body;
+        LAMBDA_CLOSURE(lambda) = closure;
         return lambda;
     }
 

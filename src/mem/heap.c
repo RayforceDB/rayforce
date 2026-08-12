@@ -817,7 +817,8 @@ static void ray_release_owned_refs(ray_t* v) {
 
     if (ray_is_atom(v)) {
         if (v->type == RAY_LAMBDA) {
-            /* Lambda stores [params, body, bytecode, constants, n_locals, nfo, dbg] in ray_data */
+            /* Lambda stores params/body/bytecode/constants plus optional
+             * nfo/debug/closure owned references in ray_data. */
             ray_t** slots = (ray_t**)ray_data(v);
             for (int i = 0; i < 4; i++) {
                 if (slots[i] && !RAY_IS_ERR(slots[i]))
@@ -826,6 +827,7 @@ static void ray_release_owned_refs(ray_t* v) {
             /* Release optional debug info slots */
             if (LAMBDA_NFO(v)) ray_release(LAMBDA_NFO(v));
             if (LAMBDA_DBG(v)) ray_release(LAMBDA_DBG(v));
+            if (LAMBDA_CLOSURE(v)) ray_release(LAMBDA_CLOSURE(v));
             return;
         }
         if (v->type == RAY_LAZY) {
@@ -946,6 +948,7 @@ bool ray_retain_owned_refs(ray_t* v) {
             }
             if (LAMBDA_NFO(v)) ray_retain(LAMBDA_NFO(v));
             if (LAMBDA_DBG(v)) ray_retain(LAMBDA_DBG(v));
+            if (LAMBDA_CLOSURE(v)) ray_retain(LAMBDA_CLOSURE(v));
             return true;
         }
         /* Lazy handles own their graph uniquely — no retain on copy */
@@ -1058,6 +1061,7 @@ static void ray_detach_owned_refs(ray_t* v) {
             for (int i = 0; i < 4; i++) slots[i] = NULL;
             LAMBDA_NFO(v) = NULL;
             LAMBDA_DBG(v) = NULL;
+            LAMBDA_CLOSURE(v) = NULL;
             return;
         }
         if (v->type == RAY_LAZY) {
