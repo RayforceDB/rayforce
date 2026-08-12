@@ -530,7 +530,6 @@ ray_t* ray_scan_left_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_right_fn(ray_t** args, int64_t n);
 ray_t* ray_enlist_fn(ray_t** args, int64_t n);
 uint64_t ray_atom_hash(ray_t* x);
-ray_t* ray_hash_fn(ray_t* x);
 
 /* String builtins (formerly static in eval.c, now in str_builtin.c) */
 ray_t* ray_split_fn(ray_t* str, ray_t* delim);

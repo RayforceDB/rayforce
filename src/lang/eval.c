@@ -3200,8 +3200,6 @@ static void ray_register_builtins(void) {
     register_binary("at",      RAY_FN_NONE, ray_at_fn);
     register_binary("find",    RAY_FN_NONE, ray_find_fn);
     register_binary("fill",    RAY_FN_ATOMIC, ray_fill_fn);
-    register_unary("hash",     RAY_FN_ATOMIC, ray_hash_fn);
-    register_unary("wyhash",   RAY_FN_ATOMIC, ray_hash_fn);
     register_unary("reverse",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_reverse_fn);
     register_unary("til",      RAY_FN_NONE, ray_til_fn);
     register_unary_op("lag",    RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lag_fn,    OP_LAG);
