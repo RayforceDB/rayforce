@@ -44,7 +44,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `signum`, `sum`, `prod`, `all`, `any`, `count`, `avg`, `min`, `max`,
 `first`, `last`, `med`, `mode`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
-`differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `load`, `exit`,
+`differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `read-bytes`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
 `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`,
@@ -57,7 +57,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `quantile`, `percentile`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `fill`, `min`, `max`, `msum`, `mavg`, `mmin`, `mmax`,
-`mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
+`mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `write-bytes`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
 `.col.link`
@@ -614,7 +614,9 @@ Printing, file I/O, CSV loading, and script execution.
 | `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | `read` | unary | restricted | Read file contents as string | `(read "file.txt")` |
-| `write` | binary | restricted | Write string to file | `(write "file.txt" "content")` |
+| `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
+| `write` | binary | restricted | Write a string to a file | `(write "file.txt" "content")` |
+| `write-bytes` | binary | restricted | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
 | `load` | unary | restricted | Load and evaluate a Rayfall script file | `(load "lib.rfl")` |
 | `exit` | unary | restricted | Exit the process with status code | `(exit 0)` |
 | `resolve` | variadic | special | Resolve a symbol in the current scope | `(resolve 'x)` |

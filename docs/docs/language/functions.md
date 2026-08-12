@@ -436,7 +436,9 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `.csv.read` | variadic | Load CSV file into table | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | `read` | unary | Read file contents as string | `(read "file.txt")` |
-| `write` | binary | Write string to file | `(write "file.txt" "content")` |
+| `read-bytes` | unary | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
+| `write` | binary | Write a string to a file | `(write "file.txt" "content")` |
+| `write-bytes` | binary | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
 | `load` | unary | Load and evaluate a Rayfall script | `(load "lib.rfl")` |
 
 ## Control Flow
