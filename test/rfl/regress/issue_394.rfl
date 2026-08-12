@@ -18,6 +18,22 @@
 (set I394SliceR (table [k rv] (list (drop (as 'STR ["unused-long-prefix" "customer-account-beta" "customer-account-alpha"]) 1) [20 10])))
 (sum (at (inner-join [k] I394SliceL I394SliceR) 'rv)) -- 30
 
+;; STR remains a first-class component of composite join keys.
+(set I394MultiL (table [tenant hk lv] (list [1 1 2 2] (as 'STR ["0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210" "0123456789abcdef0123456789abcdef" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) [10 20 30 40])))
+(set I394MultiR (table [tenant hk rv] (list [2 1 1 3] (as 'STR ["0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) [300 100 200 400])))
+(count (inner-join [tenant hk] I394MultiL I394MultiR)) -- 3
+(sum (at (inner-join [tenant hk] I394MultiL I394MultiR) 'rv)) -- 600
+(count (anti-join [tenant hk] I394MultiL I394MultiR)) -- 1
+
+;; STR grouping is hashed for both single and composite keys.  More than 1024
+;; unique pooled strings exercises dynamic group growth and cached hashes.
+(set I394GroupKeys (map (fn [i] (concat "0123456789abcdef0123456789abcdef" (as 'str i))) (til 1500)))
+(count (key (group I394GroupKeys))) -- 1500
+(sum (map count (value (group I394GroupKeys)))) -- 1500
+(set I394GroupT (table [tenant hk amount] (list [1 1 1 2 2] (as 'STR ["0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210" "0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef"]) [10 20 30 40 50])))
+(count (select {from:I394GroupT by:[tenant hk] total:(sum amount)})) -- 3
+(sum (at (select {from:I394GroupT by:[tenant hk] total:(sum amount)}) 'total)) -- 150
+
 ;; A misspelled/missing join key is a schema error, not an empty result.
 (inner-join [missing] I394L I394R) !- domain
 (anti-join [missing] I394L I394R) !- domain
