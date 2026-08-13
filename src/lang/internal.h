@@ -454,6 +454,8 @@ ray_t* ray_cov_fn(ray_t* x, ray_t* y);
 ray_t* ray_scov_fn(ray_t* x, ray_t* y);
 ray_t* ray_wsum_fn(ray_t* x, ray_t* y);
 ray_t* ray_wavg_fn(ray_t* x, ray_t* y);
+ray_t* ray_min2_fn(ray_t* a, ray_t* b);
+ray_t* ray_max2_fn(ray_t* a, ray_t* b);
 
 /* In-place median (quickselect).  Caller owns the buffer; we permute
  * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in
@@ -496,6 +498,7 @@ ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs);
 ray_t* ray_cross_fn(ray_t* a, ray_t* b);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
+ray_t* ray_fill_fn(ray_t* replacement, ray_t* value);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
 ray_t* ray_lag_fn(ray_t* x);
@@ -526,6 +529,7 @@ ray_t* ray_fold_right_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_left_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_right_fn(ray_t** args, int64_t n);
 ray_t* ray_enlist_fn(ray_t** args, int64_t n);
+uint64_t ray_atom_hash(ray_t* x);
 
 /* String builtins (formerly static in eval.c, now in str_builtin.c) */
 ray_t* ray_split_fn(ray_t* str, ray_t* delim);
@@ -678,8 +682,10 @@ ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);
 ray_t* ray_type_fn(ray_t* val);
 ray_t* ray_read_file_fn(ray_t* path_obj);
+ray_t* ray_read_bytes_fn(ray_t* path_obj);
 ray_t* ray_load_file_fn(ray_t* path_obj);
 ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);
+ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
 
 /* Misc builtins (formerly in eval.c, now in ops/builtins.c) */
 ray_t* ray_dict_fn(ray_t* keys, ray_t* vals);

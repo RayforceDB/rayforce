@@ -124,6 +124,12 @@ static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
 
+static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
+    if (fn == ray_min_fn) return ray_min2_fn;
+    if (fn == ray_max_fn) return ray_max2_fn;
+    return NULL;
+}
+
 static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         if (!args[i] || !ray_is_lazy(args[i])) continue;
@@ -1420,8 +1426,34 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
         return call_lambda(fn, args, 2);
     }
     if (fn->type == RAY_UNARY) {
-        /* Partial application not supported, just call with first arg */
         ray_unary_fn f = (ray_unary_fn)(uintptr_t)fn->i64;
+        ray_binary_fn f2 = unary_binary_overload(f);
+        if (f2) {
+            ray_t* la = a;
+            ray_t* lb = b;
+            bool owned_a = false, owned_b = false;
+            if (ray_is_lazy(la)) {
+                ray_retain(la);
+                la = ray_lazy_materialize(la);
+                if (!la || RAY_IS_ERR(la)) return la ? la : ray_error("type", NULL);
+                owned_a = true;
+            }
+            if (ray_is_lazy(lb)) {
+                ray_retain(lb);
+                lb = ray_lazy_materialize(lb);
+                if (!lb || RAY_IS_ERR(lb)) {
+                    if (owned_a) ray_release(la);
+                    return lb ? lb : ray_error("type", NULL);
+                }
+                owned_b = true;
+            }
+            ray_t* out = (is_collection(la) || is_collection(lb))
+                       ? atomic_map_binary(f2, la, lb) : f2(la, lb);
+            if (owned_a) ray_release(la);
+            if (owned_b) ray_release(lb);
+            return out;
+        }
+        /* Legacy helper behavior for unary functions without an overload. */
         return f(a);
     }
     return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
@@ -1939,14 +1971,18 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
         }
     }
 
-    /* Create lambda object with space for 7 slots:
+    ray_t* closure = ray_env_capture_locals();
+    if (closure && RAY_IS_ERR(closure)) return closure;
+
+    /* Create lambda object with space for 8 slots:
      * [0] params, [1] body, [2] bytecode, [3] constants, [4] n_locals,
-     * [5] nfo (source location), [6] dbg (debug metadata) */
-    ray_t* lambda = ray_alloc(7 * sizeof(ray_t*));
-    if (!lambda) return ray_error("oom", NULL);
+     * [5] nfo (source location), [6] dbg (debug metadata), [7] closure. */
+    ray_t* lambda = ray_alloc(8 * sizeof(ray_t*));
+    if (!lambda) { ray_release(closure); return ray_error("oom", NULL); }
     lambda->type = RAY_LAMBDA;
     lambda->attrs = 0;
     lambda->len = 0;
+    memset(ray_data(lambda), 0, 8 * sizeof(ray_t*));
 
     /* Store params list */
     ray_retain(params_list);
@@ -1956,8 +1992,8 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
     int64_t body_count = n - 1;
     ray_t* body = ray_alloc(body_count * sizeof(ray_t*));
     if (!body) {
-        ray_release(params_list);
         ray_release(lambda);
+        ray_release(closure);
         return ray_error("oom", NULL);
     }
     body->type = RAY_LIST;
@@ -1982,6 +2018,7 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
         LAMBDA_NFO(lambda) = NULL;
     }
     LAMBDA_DBG(lambda) = NULL;
+    LAMBDA_CLOSURE(lambda) = closure;
 
     return lambda;
 }
@@ -2049,7 +2086,7 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
 /* Call a lambda: compile on first call, then execute bytecode. */
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     /* Lazy compilation on first call */
-    if (!LAMBDA_IS_COMPILED(lambda)) {
+    if (!LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda)) {
         ray_compile(lambda);
     }
 
@@ -2067,7 +2104,13 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     if (argc != param_count)
         return ray_error("arity", "expected %" PRId64 " args, got %" PRId64, param_count, argc);
 
-    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
+    if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda)) != RAY_OK)
+        return ray_error("oom", NULL);
+    if (ray_env_push_scope() != RAY_OK) {
+        if (has_closure) ray_env_pop_scope();
+        return ray_error("oom", NULL);
+    }
 
     /* Bind 'self' to the current lambda for recursion */
     {
@@ -2089,11 +2132,13 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
         result = ray_eval(body_exprs[i]);
         if (RAY_IS_ERR(result)) {
             ray_env_pop_scope();
+            if (has_closure) ray_env_pop_scope();
             return result;
         }
     }
 
     ray_env_pop_scope();
+    if (has_closure) ray_env_pop_scope();
     return result;
 }
 
@@ -2518,6 +2563,28 @@ op_callf: {
         switch (fn_obj->type) {
         case RAY_UNARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
+            {
+            ray_unary_fn unary = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+            ray_binary_fn binary = unary_binary_overload(unary);
+            if (n == 2 && binary) {
+                for (int32_t i = 0; i < 2; i++) {
+                    if (fn_args[i] && ray_is_lazy(fn_args[i])) {
+                        fn_args[i] = ray_lazy_materialize(fn_args[i]);
+                        if (!fn_args[i] || RAY_IS_ERR(fn_args[i])) {
+                            result = fn_args[i] ? fn_args[i] : ray_error("type", NULL);
+                            fn_args[i] = NULL;
+                            ray_release(fn_args[1 - i]);
+                            goto unary_done;
+                        }
+                    }
+                }
+                result = (is_collection(fn_args[0]) || is_collection(fn_args[1]))
+                       ? atomic_map_binary(binary, fn_args[0], fn_args[1])
+                       : binary(fn_args[0], fn_args[1]);
+                ray_release(fn_args[0]);
+                ray_release(fn_args[1]);
+                goto unary_done;
+            }
             if (n != 1) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("arity", "expected 1 arg, got %d", n); break; }
             /* fn_args[0] is an owned ref (POPped from VM stack); materialise
              * consumes it — no extra ray_release after the call. */
@@ -2525,9 +2592,11 @@ op_callf: {
                 fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
                 if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; break; }
             }
-            result = ((ray_unary_fn)(uintptr_t)fn_obj->i64)(fn_args[0]);
+            result = unary(fn_args[0]);
             ray_release(fn_args[0]);
+unary_done:
             break;
+            }
         case RAY_BINARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
             if (n != 2) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("arity", "expected 2 args, got %d", n); break; }
@@ -3130,6 +3199,7 @@ static void ray_register_builtins(void) {
     register_binary("cross",   RAY_FN_NONE, ray_cross_fn);
     register_binary("at",      RAY_FN_NONE, ray_at_fn);
     register_binary("find",    RAY_FN_NONE, ray_find_fn);
+    register_binary("fill",    RAY_FN_ATOMIC, ray_fill_fn);
     register_unary("reverse",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_reverse_fn);
     register_unary("til",      RAY_FN_NONE, ray_til_fn);
     register_unary_op("lag",    RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lag_fn,    OP_LAG);
@@ -3212,7 +3282,9 @@ static void ray_register_builtins(void) {
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
+    register_unary("read-bytes", RAY_FN_RESTRICTED, ray_read_bytes_fn);
     register_binary("write",    RAY_FN_RESTRICTED, ray_write_file_fn);
+    register_binary("write-bytes", RAY_FN_RESTRICTED, ray_write_bytes_fn);
     register_unary("load",      RAY_FN_RESTRICTED, ray_load_file_fn);
     register_unary("exit",      RAY_FN_RESTRICTED, ray_exit_fn);
     register_vary("resolve",    RAY_FN_SPECIAL_FORM, ray_resolve_fn);
@@ -3718,9 +3790,30 @@ ray_t* ray_eval(ray_t* obj) {
 
     switch (head->type) {
         case RAY_UNARY: {
-            if (n != 2) { ray_release(head); ret = ray_error("arity", "expected 1 arg, got %d", (int)(n-1)); goto out; }
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_unary_fn fn = (ray_unary_fn)(uintptr_t)head->i64;
+            ray_binary_fn fn2 = unary_binary_overload(fn);
+            if (n == 3 && fn2) {
+                ray_t* left = ray_eval(elems[1]);
+                if (!left || RAY_IS_ERR(left)) { ray_release(head); ret = left ? left : ray_error("type", NULL); goto out; }
+                ray_t* right = ray_eval(elems[2]);
+                ray_release(head);
+                if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
+                if (ray_is_lazy(left)) {
+                    left = ray_lazy_materialize(left);
+                    if (!left || RAY_IS_ERR(left)) { ray_release(right); ret = left ? left : ray_error("type", NULL); goto out; }
+                }
+                if (ray_is_lazy(right)) {
+                    right = ray_lazy_materialize(right);
+                    if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
+                }
+                ret = (is_collection(left) || is_collection(right))
+                    ? atomic_map_binary(fn2, left, right) : fn2(left, right);
+                ray_release(left);
+                ray_release(right);
+                goto out;
+            }
+            if (n != 2) { ray_release(head); ret = ray_error("arity", "expected 1 arg, got %d", (int)(n-1)); goto out; }
             uint8_t fn_attrs = head->attrs;
             if (fn == (ray_unary_fn)ray_sum_fn) {
                 int handled = 0;

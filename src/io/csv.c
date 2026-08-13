@@ -1017,6 +1017,7 @@ static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
                 memcpy(dst[r].prefix, p, 4);
                 dst[r].pool_off = pool_off;
                 memcpy(pool_base + pool_off, p, l);
+                ray_str_t_cache_hash(&dst[r], pool_base);
                 pool_off += l;  /* cannot wrap: pool_bytes <= UINT32_MAX */
             }
         }

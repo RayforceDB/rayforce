@@ -102,14 +102,14 @@ The server evaluates any valid Rayfall expression sent as a string. This means y
 (.ipc.send h "(select {from: trades total: (sum qty)})")
 
 ;; Volume-weighted average price by symbol
-(.ipc.send h "(select {from: trades by: sym vwap: (% (sum (* price qty)) (sum qty))})")
+(.ipc.send h "(select {from: trades by: sym vwap: (/ (sum (* price qty)) (sum qty))})")
 ```
 
 ### Joins
 
 ```text
 ;; Join trades with quotes on sym
-(.ipc.send h "(select {from: (left-join trades quotes 'sym)})")
+(.ipc.send h "(select {from: (left-join [sym] trades quotes)})")
 ```
 
 !!! note "Tip"

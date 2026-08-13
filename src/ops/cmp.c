@@ -158,6 +158,26 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
     return make_bool(as_f64(a) <= as_f64(b) ? 1 : 0);
 }
 
+/* Elementwise dyadic overloads for the aggregate names `min` and `max`.
+ * Their vectorization is supplied by the evaluator, just like comparisons. */
+ray_t* ray_min2_fn(ray_t* a, ray_t* b) {
+    ray_t* cmp = ray_lte_fn(a, b);
+    if (!cmp || RAY_IS_ERR(cmp)) return cmp ? cmp : ray_error("oom", NULL);
+    ray_t* out = cmp->b8 ? a : b;
+    ray_retain(out);
+    ray_release(cmp);
+    return out;
+}
+
+ray_t* ray_max2_fn(ray_t* a, ray_t* b) {
+    ray_t* cmp = ray_gte_fn(a, b);
+    if (!cmp || RAY_IS_ERR(cmp)) return cmp ? cmp : ray_error("oom", NULL);
+    ray_t* out = cmp->b8 ? a : b;
+    ray_retain(out);
+    ray_release(cmp);
+    return out;
+}
+
 
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */

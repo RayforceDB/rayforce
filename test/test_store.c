@@ -41,8 +41,10 @@
 #include "core/platform.h"
 #include "core/runtime.h"
 #include "lang/eval.h"
+#include "lang/internal.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "vec/str.h"
 
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
@@ -4363,6 +4365,87 @@ static test_result_t test_col_str_pool_roundtrip(void) {
     PASS();
 }
 
+/* ---- test_col_str_legacy_hash_repair ----------------------------------- */
+/* Older column writers persisted the pooled descriptor's final four bytes
+ * as uninitialized padding.  Forge distinct nonzero values there for equal
+ * strings and verify both load modes recompute content hashes before the
+ * grouping fast path consumes them. */
+static test_result_t test_col_str_legacy_hash_repair(void) {
+    const char* same = "legacy-pooled-string-value";
+    const char* other = "different-pooled-string";
+    ray_t* vec = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, same, strlen(same));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, same, strlen(same));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, other, strlen(other));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+
+    /* [32-byte column header][16-byte descriptors]; hash32 is descriptor
+     * bytes 12..15.  These model arbitrary nonzero legacy padding. */
+    static const uint32_t garbage[] = {
+        0x11111111u, 0x22222222u, 0x33333333u
+    };
+    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_EQ_I(fseek(f, 32L + (long)i * 16L + 12L, SEEK_SET), 0);
+        TEST_ASSERT_EQ_U(fwrite(&garbage[i], 1, sizeof(garbage[i]), f),
+                         sizeof(garbage[i]));
+    }
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_str_t* ld = (ray_str_t*)ray_data(loaded);
+    const char* lpool = (const char*)ray_data(loaded->str_pool);
+    for (int i = 0; i < 3; i++) {
+        uint32_t h = (uint32_t)ray_str_t_hash(&ld[i], lpool);
+        TEST_ASSERT_EQ_U(ld[i].hash32, h != 0 ? h : 1u);
+    }
+    TEST_ASSERT_EQ_U(ld[0].hash32, ld[1].hash32);
+    ray_t* groups = ray_group_indices_fn(loaded);
+    TEST_ASSERT_NOT_NULL(groups);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(groups));
+    TEST_ASSERT_EQ_I(ray_dict_keys(groups)->len, 2);
+    ray_release(groups);
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    ray_str_t* md = (ray_str_t*)ray_data(mapped);
+    const char* mpool = (const char*)ray_data(mapped->str_pool);
+    for (int i = 0; i < 3; i++) {
+        uint32_t h = (uint32_t)ray_str_t_hash(&md[i], mpool);
+        TEST_ASSERT_EQ_U(md[i].hash32, h != 0 ? h : 1u);
+    }
+    TEST_ASSERT_EQ_U(md[0].hash32, md[1].hash32);
+    groups = ray_group_indices_fn(mapped);
+    TEST_ASSERT_NOT_NULL(groups);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(groups));
+    TEST_ASSERT_EQ_I(ray_dict_keys(groups)->len, 2);
+    ray_release(groups);
+    ray_release(mapped);
+
+    /* MAP_PRIVATE repair must not rewrite the persisted legacy bytes. */
+    f = fopen(TMP_COL_PATH, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, 32L + 12L, SEEK_SET), 0);
+    uint32_t persisted = 0;
+    TEST_ASSERT_EQ_U(fread(&persisted, 1, sizeof(persisted), f),
+                     sizeof(persisted));
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+    TEST_ASSERT_EQ_U(persisted, garbage[0]);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
 /* ---- test_col_format_version_roundtrip ---------------------------------- */
 /* A saved column carries the format generation in the 32-byte header's
  * `order` byte (offset 17), with aux (bytes 0-15) ZERO on disk (no magic —
@@ -5103,6 +5186,7 @@ const test_entry_t store_entries[] = {
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/col_str_pool_roundtrip", test_col_str_pool_roundtrip, store_setup, store_teardown },
+    { "store/col_str_legacy_hash_repair", test_col_str_legacy_hash_repair, store_setup, store_teardown },
     { "store/col_format_version_roundtrip", test_col_format_version_roundtrip, store_setup, store_teardown },
     { "store/col_format_bad_version", test_col_format_bad_version, store_setup, store_teardown },
     { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },

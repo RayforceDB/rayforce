@@ -371,6 +371,27 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
         /* (fn [params] body...) — nested lambda via dynamic eval */
         if (sym_id == sf_fn && n >= 3) {
+            if (ast_refs_locals(c, ast)) {
+                ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+                if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+                syms->type = RAY_I64;
+                syms->len = c->n_locals;
+                int64_t *ids = (int64_t*)ray_data(syms);
+                for (int32_t i = 0; i < c->n_locals; i++)
+                    ids[i] = c->locals[i].sym_id;
+                int32_t syms_idx = add_constant(c, syms);
+                ray_release(syms);
+                if (c->error) return;
+                emit_const(c, syms_idx);
+                emit(c, OP_SCOPE_BEGIN);
+                int32_t idx = add_constant(c, ast);
+                emit_const(c, idx);
+                emit(c, OP_CALLD);
+                emit(c, 0);
+                emit_const(c, syms_idx);
+                emit(c, OP_SCOPE_END);
+                return;
+            }
             int32_t idx = add_constant(c, ast);
             emit_const(c, idx);
             emit(c, OP_CALLD);

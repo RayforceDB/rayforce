@@ -451,6 +451,24 @@
 (type (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- 'guid
 ;; String → GUID → STR round-trip preserves the canonical 36-char form.
 (as 'STR (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"
+;; Malformed GUID strings must be REJECTED, not silently decoded into a
+;; wrong-but-valid GUID.  The old parser skipped '-' anywhere and decoded
+;; any character as a nibble, so "zzzz…" became a plausible GUID.
+(as 'guid "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz") !- domain
+(as 'guid "gggggggg-gggg-gggg-gggg-gggggggggggg") !- domain
+(as 'guid "d49f18a4:1969-49e8-9b8a-6bb9a4832eea") !- domain
+(as 'guid "d49f18a4_1969-49e8-9b8a-6bb9a4832eea") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a6bb9a4832eea") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea-") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832ee") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eeax") !- domain
+;; A 36-char all-hex string (a dash position holding a hex digit) must be
+;; rejected, not decoded — the byte index would otherwise run past
+;; bytes[16] (stack overflow).
+(as 'guid "0123456789abcdef0123456789abcdef0123") !- domain
+(as 'guid "d49f18a4a1969-49e8-9b8a-6bb9a4832eea") !- domain
+;; Uppercase hex is accepted and normalized on the round-trip.
+(as 'STR (as 'guid "ABCDEF01-2345-6789-ABCD-EF0123456789")) -- "abcdef01-2345-6789-abcd-ef0123456789"
 ;; ========== IDENTITY CASTS (same type) ==========
 (as 'b8 true) -- true
 (as 'u8 0xFF) -- 0xFF
@@ -508,6 +526,36 @@
 (as 'i64 (as 'i16 "32767")) -- 32767
 (as 'i64 (as 'i32 "-2147483648")) -- 0Nl
 (as 'i64 (as 'i32 "2147483647")) -- 2147483647
+
+;; ========== STRING → NUMERIC: FULL CONSUMPTION + OVERFLOW ==========
+;; The old strtoll/strtol/strtod path stopped at the first non-digit and
+;; never checked the end pointer or ERANGE, so trailing garbage and true
+;; overflow were silently accepted ("1e19" → 1, "9999...9" → INT64_MAX).
+;; All of these must now REJECT with a domain error, matching the strict
+;; DATE/TIME/TIMESTAMP string casts.  Narrow-int truncation itself still
+;; wraps (documented narrow-int rule); only unparseable/overflowing input
+;; errors.
+(as 'i64 "123abc") !- domain
+(as 'i64 "1e19") !- domain
+(as 'i64 "12.5") !- domain
+(as 'i64 "999999999999999999999999") !- domain
+(as 'i64 "-999999999999999999999999") !- domain
+(as 'i32 "123x") !- domain
+(as 'i32 "1e9") !- domain
+(as 'i16 "40000junk") !- domain
+(as 'u8 "12zz") !- domain
+(as 'u8 "300abc") !- domain
+(as 'f64 "1.5x") !- domain
+(as 'f64 "1.5e3junk") !- domain
+;; Clean values still parse.
+(as 'i64 " 123") -- 123
+(as 'i64 "-5") -- -5
+(as 'f64 "0x10") -- 16.0
+;; The string-VECTOR cast routes through the same per-element parser: a
+;; malformed element rejects the whole cast, clean elements parse.
+(as 'I64 (list "42" "-7" "100")) -- [42 -7 100]
+(as 'I64 (list "42" "123abc")) !- domain
+(as 'F64 (list "3.14" "1.5x")) !- domain
 
 ;; ========== NULL PRESERVATION ACROSS CASTS ==========
 ;; Casting any null returns null of target type, never sentinel/INT_MIN.

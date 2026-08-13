@@ -24,11 +24,13 @@
 /**   I/O builtins, type casting, and misc builtins extracted from eval.c.
  */
 
+#include <errno.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "vec/vec.h"
+#include "vec/str.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
 #include "core/pool.h"
@@ -1341,8 +1343,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as i64");
             char* end;
+            errno = 0;
             int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i64");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i64, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i64, value out of int64 range");
             return make_i64(v);
         }
         /* Vector/list cast */
@@ -1363,8 +1370,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIMESTAMP) return ray_i32((int32_t)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
+            errno = 0;
             long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i32");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i32, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i32, value out of int64 range");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
@@ -1385,8 +1397,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIMESTAMP) return ray_i16((int16_t)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
+            errno = 0;
             long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i16");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i16, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i16, value out of int64 range");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
@@ -1409,8 +1426,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as f64");
             char* end;
+            errno = 0;
             double v = strtod(sp, &end);
             if (end == sp) return ray_error("domain", "as: cannot parse str as f64");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as f64, unexpected trailing characters");
             /* STAGE 2 (ingest/cast STR→F64): canonicalize at the ingest entry
              * point.  strtod("inf")/strtod("1e400")/strtod("nan") would yield a
              * non-finite F64; make_f64 maps every non-finite to NULL_F64 (0Nf),
@@ -1830,19 +1850,37 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         ray_release(s);
         if (val->type == -RAY_GUID) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
-            /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
+            /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+             * Require the canonical hyphenated form exactly: 32 hex
+             * nibbles with the four dashes at offsets 8/13/18/23.  The old
+             * parser skipped '-' anywhere and decoded any character as a
+             * nibble, so non-hex garbage (e.g. all-'z') silently produced a
+             * wrong-but-valid GUID. */
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
+            if (sl != 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
             uint8_t bytes[16];
-            const char* p = sp;
-            for (int bi = 0; bi < 16; bi++) {
-                if (*p == '-') p++;
-                char hi = *p++;
-                char lo = *p++;
-                int h = (hi >= 'a') ? hi - 'a' + 10 : (hi >= 'A') ? hi - 'A' + 10 : hi - '0';
-                int l = (lo >= 'a') ? lo - 'a' + 10 : (lo >= 'A') ? lo - 'A' + 10 : lo - '0';
-                bytes[bi] = (uint8_t)((h << 4) | l);
+            int nib = 0;
+            for (size_t j = 0; j < sl; j++) {
+                char c = sp[j];
+                /* Offsets 8/13/18/23 MUST be the dash; every other position
+                 * MUST be a hex digit.  This is position-driven (rather than
+                 * "reject a misplaced dash") so the 32 non-dash positions are
+                 * exactly 32 nibbles — nib never exceeds 31 and bytes[nib>>1]
+                 * cannot run past bytes[16]. */
+                if (j == 8 || j == 13 || j == 18 || j == 23) {
+                    if (c != '-')
+                        return ray_error("domain", "as: cannot parse str as guid, expected '-' at offset %lld", (long long)j);
+                    continue;
+                }
+                int v;
+                if (c >= '0' && c <= '9')        v = c - '0';
+                else if (c >= 'a' && c <= 'f')   v = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F')   v = c - 'A' + 10;
+                else return ray_error("domain", "as: cannot parse str as guid, non-hex character '%c'", c);
+                if ((nib & 1) == 0) bytes[nib >> 1] = (uint8_t)(v << 4);
+                else                bytes[nib >> 1] |= (uint8_t)v;
+                nib++;
             }
             return ray_guid(bytes);
         }
@@ -1881,8 +1919,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_F64) return ray_u8(ray_cast_f64_to_u8_null(val->f64));
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
-            char* end; long v = strtol(sp, &end, 10);
+            char* end; errno = 0;
+            long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as u8");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as u8, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as u8, value out of int64 range");
             return ray_u8((uint8_t)v);
         }
         /* Vector cast */
@@ -1954,27 +1997,49 @@ ray_t* ray_type_fn(ray_t* val) {
     return ray_sym(id);
 }
 
-/* (read path) — read a file's contents as a string */
-ray_t* ray_read_file_fn(ray_t* path_obj) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", "read: path must be str, got %s", ray_type_name(path_obj->type));
+static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
+    if (path_obj->type != -RAY_STR)
+        return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", "read: empty path");
+    if (!path || ray_str_len(path_obj) == 0)
+        return ray_error("domain", "%s: empty path", op);
+
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return ray_error("io", NULL); }
     long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
     if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
-    /* Use ray_alloc for the buffer */
-    ray_t* buf = ray_alloc((size_t)sz + 1);
-    if (!buf || RAY_IS_ERR(buf)) { fclose(fp); return ray_error("oom", NULL); }
-    char* data = (char*)ray_data(buf);
-    size_t rd = fread(data, 1, (size_t)sz, fp);
-    fclose(fp);
-    data[rd] = '\0';
-    ray_t* result = ray_str(data, rd);
-    ray_release(buf);
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return ray_error("io", NULL); }
+
+    ray_t* result = ray_vec_new(RAY_U8, (int64_t)sz);
+    if (!result || RAY_IS_ERR(result)) {
+        fclose(fp);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = (int64_t)sz;
+
+    size_t rd = sz > 0 ? fread(ray_data(result), 1, (size_t)sz, fp) : 0;
+    int close_rc = fclose(fp);
+    if (rd != (size_t)sz || close_rc != 0) {
+        ray_release(result);
+        return ray_error("io", NULL);
+    }
     return result;
+}
+
+/* (read path) — read a file's contents as a string */
+ray_t* ray_read_file_fn(ray_t* path_obj) {
+    ray_t* bytes = read_file_bytes(path_obj, "read");
+    if (RAY_IS_ERR(bytes)) return bytes;
+
+    ray_t* result = ray_str((const char*)ray_data(bytes), (size_t)bytes->len);
+    ray_release(bytes);
+    return result;
+}
+
+/* (read-bytes path) — read a file's contents as a U8 byte vector */
+ray_t* ray_read_bytes_fn(ray_t* path_obj) {
+    return read_file_bytes(path_obj, "read-bytes");
 }
 
 /* (load path) — read and evaluate a Rayfall script file via mmap */
@@ -2045,20 +2110,37 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 #endif
 }
 
-/* (write path content) — write string to a file */
-ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", "write: path must be str, got %s", ray_type_name(path_obj->type));
-    if (content->type != -RAY_STR) return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
+static ray_t* write_file_data(ray_t* path_obj, const void* data, size_t len,
+                              const char* op) {
+    if (path_obj->type != -RAY_STR)
+        return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    const char* data = ray_str_ptr(content);
-    size_t len = ray_str_len(content);
-    if (!path || !data) return ray_error("domain", "write: empty path or content");
+    if (!path || ray_str_len(path_obj) == 0)
+        return ray_error("domain", "%s: empty path", op);
+    if (len > 0 && !data) return ray_error("domain", "%s: invalid content", op);
+
     FILE* fp = fopen(path, "wb");
     if (!fp) return ray_error("io", NULL);
-    size_t written = fwrite(data, 1, len, fp);
-    fclose(fp);
-    if (written != len) return ray_error("io", NULL);
+    size_t written = len > 0 ? fwrite(data, 1, len, fp) : 0;
+    int close_rc = fclose(fp);
+    if (written != len || close_rc != 0) return ray_error("io", NULL);
     return make_i64(0);
+}
+
+/* (write path content) — write a string to a file */
+ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
+    if (content->type != -RAY_STR)
+        return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
+    return write_file_data(path_obj, ray_str_ptr(content), ray_str_len(content),
+                           "write");
+}
+
+/* (write-bytes path content) — write a U8 byte vector to a file */
+ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content) {
+    if (content->type != RAY_U8)
+        return ray_error("type", "write-bytes: content must be U8, got %s", ray_type_name(content->type));
+    return write_file_data(path_obj, ray_data(content), (size_t)content->len,
+                           "write-bytes");
 }
 
 /* ══════════════════════════════════════════
@@ -2446,7 +2528,7 @@ static inline uint64_t hash_i64(int64_t v) {
  * the existing path is degenerate for composite multi-key composites.
  * Uses the canonical wyhash helpers from ops/hash.h, same as the
  * pivot / datalog / join hashers. */
-static uint64_t atom_hash(ray_t* a) {
+uint64_t ray_atom_hash(ray_t* a) {
     /* List-element position: elements may be a bare C NULL (ray_list_set stores
      * NULL unretained; ray_list_get is out-of-range), mirroring atom_eq's
      * C-NULL-tolerant element handling — so keep the !a guard, not RAY_ASSERT_VALUE. */
@@ -2471,7 +2553,7 @@ static uint64_t atom_hash(ray_t* a) {
             /* Seed with len so [] and a list of zeros differ. */
             uint64_t h = ray_hash_i64(n);
             for (int64_t i = 0; i < n; i++)
-                h = ray_hash_combine(h, atom_hash(elems[i]));
+                h = ray_hash_combine(h, ray_atom_hash(elems[i]));
             return h;
         }
         default:
@@ -2501,12 +2583,23 @@ static uint64_t ght_i64_hash_gi(uint32_t gi, void* ctx) {
     return hash_i64(c->gvals[gi]);
 }
 
+typedef struct {
+    const ray_str_t* desc;
+    const char* pool;
+    const int64_t* gvals;
+} ght_str_ctx_t;
+
+static uint64_t ght_str_hash_gi(uint32_t gi, void* ctx) {
+    ght_str_ctx_t* c = (ght_str_ctx_t*)ctx;
+    return ray_str_t_hash32(&c->desc[c->gvals[gi]], c->pool);
+}
+
 /* Context for the LIST-path rehash: gkeys holds atom pointers for each
  * unique group (one slot per gi), recomputed on grow via atom_hash. */
 typedef struct { ray_t** gkeys; } ght_list_ctx_t;
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
-    return atom_hash(c->gkeys[gi]);
+    return ray_atom_hash(c->gkeys[gi]);
 }
 
 /* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
@@ -2576,12 +2669,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         return ray_dict_new(keys, vals);
     }
 
-    /* Collect unique values; the scalar / RAY_GUID / RAY_LIST paths
-     * grow these arrays on demand (group_grow / group_grow_listkeys).
-     * The RAY_STR path below still caps at this initial size — its
-     * side buffer isn't yet wired into a grow helper, but the cap is
-     * unreachable in practice (RAY_STR is char-vector, ≤256 distinct
-     * 1-byte chars).  Starting at 1024 keeps the initial alloc cheap. */
+    /* Collect unique values.  Every path grows these arrays on demand;
+     * starting at 1024 keeps the initial allocation cheap. */
     int64_t max_groups = n < 1024 ? n : 1024;
     ray_t* val_block = ray_alloc((size_t)(max_groups * sizeof(int64_t)));
     if (RAY_IS_ERR(val_block)) return val_block;
@@ -2614,7 +2703,7 @@ ray_t* ray_group_indices_fn(ray_t* x) {
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
-            uint64_t h = atom_hash(elem);
+            uint64_t h = ray_atom_hash(elem);
             uint32_t slot = (uint32_t)(h & ht.mask);
             uint32_t gi_found = GHT_EMPTY;
             while (ht.slots[slot] != GHT_EMPTY) {
@@ -2759,66 +2848,97 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         return ray_dict_new(keys_vec, vals_lst);
     }
 
-    /* RAY_STR: string-based grouping using ray_str_vec_get */
+    /* RAY_STR: descriptor hashing plus collision-safe content equality.
+     * Pooled descriptors reuse their cached hash, so grouping digest keys
+     * does not reread 32/64-byte payloads merely to locate the hash slot. */
     if (x->type == RAY_STR) {
-        /* Store group keys as (ptr, len) pairs -- use a scratch block for strings */
-        ray_t* skblock = ray_alloc((size_t)(max_groups * sizeof(ray_t*)));
-        if (RAY_IS_ERR(skblock)) { ray_free(val_block); ray_free(ivblock); return skblock; }
-        ray_t** str_keys = (ray_t**)ray_data(skblock);
+        ray_t* owner = x;
+        int64_t off = 0;
+        if (x->attrs & RAY_ATTR_SLICE) {
+            owner = x->slice_parent;
+            off = x->slice_offset;
+        }
+        const ray_str_t* desc = (const ray_str_t*)ray_data(owner) + off;
+        const char* pool = (owner->str_pool && !RAY_IS_ERR(owner->str_pool))
+                         ? (const char*)ray_data(owner->str_pool) : NULL;
+
+        group_ht_t ht;
+        uint32_t seed_cap = (uint32_t)(n < 64 ? 64 : (n < 1048576 ? (n * 2) : 2097152));
+        if (!group_ht_init(&ht, seed_cap)) {
+            ray_free(val_block); ray_free(ivblock);
+            return ray_error("oom", NULL);
+        }
+        ght_str_ctx_t sctx = { .desc = desc, .pool = pool, .gvals = gvals };
 
         for (int64_t i = 0; i < n; i++) {
-            size_t slen = 0;
-            const char* sp = ray_str_vec_get(x, i, &slen);
-
-            int64_t gi = -1;
-            for (int64_t g = 0; g < ngroups; g++) {
-                size_t gsl = ray_str_len(str_keys[g]);
-                const char* gsp = ray_str_ptr(str_keys[g]);
-                if (gsl == slen && (slen == 0 || memcmp(gsp, sp, slen) == 0)) {
-                    gi = g; break;
+            const ray_str_t* cur = &desc[i];
+            uint64_t h = ray_str_t_hash32(cur, pool);
+            uint32_t slot = (uint32_t)(h & ht.mask);
+            uint32_t gi_found = GHT_EMPTY;
+            while (ht.slots[slot] != GHT_EMPTY) {
+                uint32_t gi = ht.slots[slot];
+                if (ray_str_t_eq(&desc[gvals[gi]], pool, cur, pool)) {
+                    gi_found = gi;
+                    break;
                 }
+                slot = (slot + 1) & ht.mask;
             }
-            if (gi < 0) {
+
+            int64_t gi;
+            if (gi_found != GHT_EMPTY) {
+                gi = gi_found;
+            } else {
                 if (ngroups >= max_groups) {
-                    for (int64_t g = 0; g < ngroups; g++) {
-                        ray_release(str_keys[g]);
-                        ray_release(idx_vecs[g]);
+                    if (!group_grow(&val_block, &ivblock, &gvals, &idx_vecs,
+                                    ngroups, &max_groups)) {
+                        for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+                        group_ht_free(&ht);
+                        ray_free(val_block); ray_free(ivblock);
+                        return ray_error("oom", NULL);
                     }
-                    ray_free(val_block); ray_free(ivblock); ray_free(skblock);
-                    return ray_error("limit", NULL);
+                    sctx.gvals = gvals;
                 }
                 gi = ngroups++;
-                str_keys[gi] = ray_str(sp ? sp : "", slen);
+                gvals[gi] = i;
                 idx_vecs[gi] = ray_vec_new(RAY_I64, 0);
+                ht.slots[slot] = (uint32_t)gi;
+                ht.count++;
+                if (ht.count * 2 > ht.cap) {
+                    if (!group_ht_grow(&ht, ght_str_hash_gi, &sctx)) {
+                        for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+                        group_ht_free(&ht);
+                        ray_free(val_block); ray_free(ivblock);
+                        return ray_error("oom", NULL);
+                    }
+                }
             }
             idx_vecs[gi] = ray_vec_append(idx_vecs[gi], &i);
         }
+        group_ht_free(&ht);
 
-        /* Build dict: keys as RAY_STR vec from str_keys, vals as LIST of idx vecs. */
+        /* Build keys from each group's first source row, preserving encounter order. */
         ray_t* keys_vec = ray_vec_new(RAY_STR, ngroups);
         if (RAY_IS_ERR(keys_vec)) {
-            for (int64_t g = 0; g < ngroups; g++) {
-                ray_release(str_keys[g]);
-                ray_release(idx_vecs[g]);
-            }
-            ray_free(val_block); ray_free(ivblock); ray_free(skblock);
+            for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+            ray_free(val_block); ray_free(ivblock);
             return ray_error("oom", NULL);
         }
         for (int64_t g = 0; g < ngroups; g++) {
-            keys_vec = ray_str_vec_append(keys_vec, ray_str_ptr(str_keys[g]), ray_str_len(str_keys[g]));
-            ray_release(str_keys[g]);
+            const ray_str_t* key = &desc[gvals[g]];
+            keys_vec = ray_str_vec_append(keys_vec,
+                                          ray_str_t_ptr(key, pool), key->len);
         }
         ray_t* vals_lst = ray_list_new(ngroups);
         if (RAY_IS_ERR(vals_lst)) {
-            ray_release(keys_vec); ray_free(skblock); goto gfail;
+            ray_release(keys_vec); goto gfail;
         }
         for (int64_t g = 0; g < ngroups; g++) {
             vals_lst = ray_list_append(vals_lst, idx_vecs[g]);
             ray_release(idx_vecs[g]);
             idx_vecs[g] = NULL;
-            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); ray_free(skblock); goto gfail; }
+            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
         }
-        ray_free(val_block); ray_free(ivblock); ray_free(skblock);
+        ray_free(val_block); ray_free(ivblock);
         return ray_dict_new(keys_vec, vals_lst);
     }
 

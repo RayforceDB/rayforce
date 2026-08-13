@@ -71,6 +71,37 @@ static int join_store_key_cell(ray_t* dst, int64_t dst_row,
 
 /* ── Hash helper (shared by radix and chained HT join paths) ──────────── */
 
+/* Resolve a STR cell directly from its 16-byte descriptor.  Join hashing and
+ * equality execute once per input/matched row; calling ray_str_vec_get there
+ * repeatedly re-runs type/range checks and hides the descriptor prefix fast
+ * path from the compiler.  The join has already validated both the type and
+ * row bounds, so retain only the slice adjustment and pool resolution here. */
+static inline const ray_str_t* join_str_cell(ray_t* col, int64_t row,
+                                              const char** pool_out) {
+    ray_t* owner = col;
+    if (col->attrs & RAY_ATTR_SLICE) {
+        owner = col->slice_parent;
+        row += col->slice_offset;
+    }
+    *pool_out = (owner->str_pool && !RAY_IS_ERR(owner->str_pool))
+              ? (const char*)ray_data(owner->str_pool) : NULL;
+    return &((const ray_str_t*)ray_data(owner))[row];
+}
+
+/* The radix STR specialization calls this only after the complete cached
+ * 32-bit hashes match.  Shared-pool offsets are exact identities; otherwise
+ * one content comparison preserves collision-safe equality. */
+static inline bool join_str_eq_hashed(const ray_str_t* a, const char* pool_a,
+                                      const ray_str_t* b, const char* pool_b) {
+    if (a->len != b->len) return false;
+    if (a->len == 0) return true;
+    if (!ray_str_is_inline(a) && pool_a && pool_a == pool_b &&
+        a->pool_off == b->pool_off) return true;
+    const char* pa = ray_str_t_ptr(a, pool_a);
+    const char* pb = ray_str_t_ptr(b, pool_b);
+    return memcmp(pa, pb, a->len) == 0;
+}
+
 static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
     uint64_t h = 0;
     for (uint32_t k = 0; k < n_keys; k++) {
@@ -80,7 +111,13 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
         if (ray_vec_is_null(col, row))
             return h ^ ((uint64_t)row * 0x9E3779B97F4A7C15ULL);
         uint64_t kh;
-        if (col->type == RAY_F64) {
+        if (col->type == RAY_STR) {
+            const char* pool = NULL;
+            const ray_str_t* str = join_str_cell(col, row, &pool);
+            kh = ray_str_is_inline(str)
+               ? ray_hash_bytes(str->data, str->len)
+               : ray_str_t_hash32(str, pool);
+        } else if (col->type == RAY_F64) {
             kh = ray_hash_f64(((double*)ray_data(col))[row]);
         } else {
             int64_t kv = read_col_i64(ray_data(col), row, col->type, col->attrs);
@@ -170,13 +207,47 @@ typedef struct {
     ray_t**    key_vecs;
     uint32_t  n_keys;
     uint32_t* hashes;    /* output: hash[row] */
+    const ray_str_t* str_desc; /* one-key STR specialization, else NULL */
+    const char*       str_pool;
 } join_radix_hash_ctx_t;
 
 static void join_radix_hash_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     join_radix_hash_ctx_t* c = (join_radix_hash_ctx_t*)raw;
+    if (c->str_desc) {
+        const ray_str_t* desc = c->str_desc;
+        const char* pool = c->str_pool;
+        for (int64_t r = start; r < end; r++) {
+            const ray_str_t* str = &desc[r];
+            c->hashes[r] = ray_str_is_inline(str)
+                           ? (uint32_t)ray_hash_bytes(str->data, str->len)
+                           : ray_str_t_hash32(str, pool);
+        }
+        return;
+    }
     for (int64_t r = start; r < end; r++)
         c->hashes[r] = (uint32_t)hash_row_keys(c->key_vecs, c->n_keys, r);
+}
+
+static join_radix_hash_ctx_t join_radix_hash_ctx(ray_t** keys, uint32_t n_keys,
+                                                  uint32_t* hashes) {
+    join_radix_hash_ctx_t c = {
+        .key_vecs = keys, .n_keys = n_keys, .hashes = hashes,
+        .str_desc = NULL, .str_pool = NULL,
+    };
+    if (n_keys == 1 && keys[0] && keys[0]->type == RAY_STR) {
+        ray_t* col = keys[0];
+        ray_t* owner = col;
+        int64_t off = 0;
+        if (col->attrs & RAY_ATTR_SLICE) {
+            owner = col->slice_parent;
+            off = col->slice_offset;
+        }
+        c.str_desc = (const ray_str_t*)ray_data(owner) + off;
+        c.str_pool = (owner->str_pool && !RAY_IS_ERR(owner->str_pool))
+                   ? (const char*)ray_data(owner->str_pool) : NULL;
+    }
+    return c;
 }
 
 /* Context for parallel partition histogram + scatter (pre-computed hashes).
@@ -505,7 +576,14 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         if (!lc || !rc) return false;
         /* NULL != NULL in join predicates */
         if (ray_vec_is_null(lc, l) || ray_vec_is_null(rc, r)) return false;
-        if (lc->type == RAY_F64) {
+        if (lc->type == RAY_STR || rc->type == RAY_STR) {
+            if (lc->type != RAY_STR || rc->type != RAY_STR) return false;
+            const char* lpool = NULL;
+            const char* rpool = NULL;
+            const ray_str_t* ls = join_str_cell(lc, l, &lpool);
+            const ray_str_t* rs = join_str_cell(rc, r, &rpool);
+            if (!ray_str_t_eq(ls, lpool, rs, rpool)) return false;
+        } else if (lc->type == RAY_F64) {
             if (((double*)ray_data(lc))[l] != ((double*)ray_data(rc))[r]) return false;
         } else {
             int64_t lv = read_col_i64(ray_data(lc), l, lc->type, lc->attrs);
@@ -546,6 +624,10 @@ typedef struct {
     ray_t**         l_key_vecs;
     ray_t**         r_key_vecs;
     uint32_t       n_keys;
+    const ray_str_t* l_str_desc; /* one-key STR specialization */
+    const ray_str_t* r_str_desc;
+    const char*      l_str_pool;
+    const char*      r_str_pool;
     uint8_t        join_type;
     /* Per-partition output: pp_l[p], pp_r[p] are local buffers */
     int32_t**      pp_l;         /* per-partition left indices (int32_t) */
@@ -599,6 +681,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
 
     join_radix_part_t* rp = &c->r_parts[p];
     join_radix_part_t* lp = &c->l_parts[p];
+    bool str_specialized = c->l_str_desc && c->r_str_desc;
 
     /* Test knob: force the chained-path fallback.  Bail before allocating
      * anything (pp headers are still NULL → cleanup-safe). */
@@ -709,14 +792,36 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
         uint32_t h = lp->entries[i].hash;
         uint32_t lr = lp->entries[i].row_idx;
         uint32_t slot = h & ht_mask;
-        if (i + 4 < lp->count)
-            __builtin_prefetch(&ht[(lp->entries[i + 4].hash & ht_mask) * 2], 0, 1);
+        if (i + 4 < lp->count) {
+            join_radix_entry_t future = lp->entries[i + 4];
+            uint32_t future_slot = future.hash & ht_mask;
+            __builtin_prefetch(&ht[future_slot * 2], 0, 1);
+            if (str_specialized) {
+                const ray_str_t* ls = &c->l_str_desc[future.row_idx];
+                if (!ray_str_is_inline(ls) && c->l_str_pool)
+                    __builtin_prefetch(c->l_str_pool + ls->pool_off, 0, 1);
+
+                /* At a 0.5 HT load factor the initial slot is usually the
+                 * matching digest.  Pull its pool payload forward too; a
+                 * collision merely makes this a harmless speculative read. */
+                uint32_t rr = ht[future_slot * 2 + 1];
+                if (rr != RADIX_HT_EMPTY && ht[future_slot * 2] == future.hash) {
+                    const ray_str_t* rs = &c->r_str_desc[rr];
+                    if (!ray_str_is_inline(rs) && c->r_str_pool)
+                        __builtin_prefetch(c->r_str_pool + rs->pool_off, 0, 1);
+                }
+            }
+        }
         bool matched = false;
         while (ht[slot * 2 + 1] != RADIX_HT_EMPTY) {
             if (ht[slot * 2] == h) {
                 uint32_t rr = ht[slot * 2 + 1];
-                if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys,
-                                 (int64_t)lr, (int64_t)rr)) {
+                bool keys_equal = str_specialized
+                    ? join_str_eq_hashed(&c->l_str_desc[lr], c->l_str_pool,
+                                         &c->r_str_desc[rr], c->r_str_pool)
+                    : join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys,
+                                   (int64_t)lr, (int64_t)rr);
+                if (keys_equal) {
                     if (!bp_grow_bufs(c, p, &pl, &pr, &cap, cnt))
                         goto done;
                     pl[cnt] = (int32_t)lr;
@@ -1007,15 +1112,6 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             r_key_vecs[k] = rk->literal;
     }
 
-    /* RAY_STR keys not yet supported (16-byte elements vs 8-byte hash/eq slots) */
-    for (uint32_t k = 0; k < n_keys; k++) {
-        if ((l_key_vecs[k] && l_key_vecs[k]->type == RAY_STR) ||
-            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR)) {
-            scratch_free(key_vecs_hdr);
-            return ray_error("nyi", NULL);
-        }
-    }
-
     /* Sequential LUT warm-up BEFORE any dispatch (see join_warm_sym_luts). */
     if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
         scratch_free(key_vecs_hdr);
@@ -1070,8 +1166,8 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             if (l_hash_hdr) scratch_free(l_hash_hdr);
             goto chained_ht_fallback;
         }
-        join_radix_hash_ctx_t rhctx = { .key_vecs = build_keys, .n_keys = n_keys, .hashes = r_hashes };
-        join_radix_hash_ctx_t lhctx = { .key_vecs = probe_keys, .n_keys = n_keys, .hashes = l_hashes };
+        join_radix_hash_ctx_t rhctx = join_radix_hash_ctx(build_keys, n_keys, r_hashes);
+        join_radix_hash_ctx_t lhctx = join_radix_hash_ctx(probe_keys, n_keys, l_hashes);
         if (pool) {
             ray_pool_dispatch(pool, join_radix_hash_fn, &rhctx, build_rows);
             ray_pool_dispatch(pool, join_radix_hash_fn, &lhctx, probe_rows);
@@ -1166,6 +1262,8 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             .l_parts = l_parts, .r_parts = r_parts,
             .l_key_vecs = probe_keys, .r_key_vecs = build_keys,
             .n_keys = n_keys, .join_type = join_type,
+            .l_str_desc = lhctx.str_desc, .r_str_desc = rhctx.str_desc,
+            .l_str_pool = lhctx.str_pool, .r_str_pool = rhctx.str_pool,
             .pp_l = pp_l, .pp_r = pp_r,
             .pp_l_hdr = pp_l_hdr, .pp_r_hdr = pp_r_hdr,
             .part_counts = part_counts, .pp_cap = pp_cap,
@@ -1762,10 +1860,6 @@ int64_t ray_join_perpart_runs(void) {
  *   - ANTI: eligible only if the parted side is LEFT, same reasoning.
  *   - FULL (join_type 2): INELIGIBLE always — unmatched rows from BOTH
  *     sides can span segments.
- * STR keys are `nyi` in the flat kernel regardless — declining here just
- * avoids the wasted per-segment calls (the flat kernel would return the
- * same nyi on the first segment either way).
- *
  * `op->opcode` distinguishes OP_JOIN (join_type 0/1/2 from ext->join) from
  * OP_ANTIJOIN (always anti semantics, no join_type field consulted).
  * Returns NULL if the shape is ineligible (caller falls through to the
@@ -1927,15 +2021,6 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             r_key_vecs[k] = ray_table_get_col(right_table, rk->sym);
         if (rk && rk->base.opcode == OP_CONST && rk->literal)
             r_key_vecs[k] = rk->literal;
-    }
-
-    /* RAY_STR keys not yet supported */
-    for (uint32_t k = 0; k < n_keys; k++) {
-        if ((l_key_vecs[k] && l_key_vecs[k]->type == RAY_STR) ||
-            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR)) {
-            scratch_free(key_vecs_hdr);
-            return ray_error("nyi", NULL);
-        }
     }
 
     /* Sequential LUT warm-up BEFORE the parallel build dispatch. */
