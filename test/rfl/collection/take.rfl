@@ -175,3 +175,12 @@
 (count (take [1 2 3 4 5] [2 0])) -- 0
 ;; range take with start = count → empty
 (count (take [1 2 3 4 5] [5 3])) -- 0
+;; INT64_MIN count: `-INT64_MIN` is signed-overflow UB (was tripped computing
+;; the magnitude in every scalar-count take branch — vector, string, char,
+;; scalar, list).  Its magnitude is unrepresentable as int64, so it is a range
+;; error, not UB followed by a bogus allocation.
+(take [1 2 3] -9223372036854775808) !- range
+(take "hello" -9223372036854775808) !- range
+(take "a" -9223372036854775808) !- range
+(take 42 -9223372036854775808) !- range
+(take (list 1 2 3) -9223372036854775808) !- range
