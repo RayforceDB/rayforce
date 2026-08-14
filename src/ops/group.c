@@ -4670,6 +4670,20 @@ typedef struct {
     uint32_t gid;
 } group_topn_item_t;
 
+/* (first_row, flat_id) pair for the sparse stable-order path below —
+ * sorting groups by earliest source row reproduces exactly the order the
+ * dense row-domain scan assigns. */
+typedef struct {
+    int64_t  first;
+    uint32_t flat;
+} group_order_pair_t;
+
+static int group_order_pair_cmp(const void* a, const void* b) {
+    int64_t fa = ((const group_order_pair_t*)a)->first;
+    int64_t fb = ((const group_order_pair_t*)b)->first;
+    return (fa > fb) - (fa < fb);
+}
+
 /* Selection-aware group iteration gate.  When a WHERE leaves fewer than
  * nrows >> SEL_MATCH_GATE_SHIFT survivors, the high-card group build iterates
  * the survivor row list (match_idx) instead of scanning all nrows with a
@@ -10198,6 +10212,26 @@ da_path:;
          * carries per-agg arrays rather than a fixed-width bitmask. */
         bool da_eligible = (n_scan > 0 && n_keys > 0 && n_keys <= 8 &&
                              n_aggs <= 64);
+        /* Selection-sparse gate (restored from the pre-#326 routing): with a
+         * bitmap rowsel and no flattened match_idx, both DA scans (min/max
+         * prescan and accumulate) visit every input row and test the bitmap
+         * per row — O(nrows) regardless of selectivity — while the HT/radix
+         * paths work off the surviving rows only.  A selective filter makes
+         * the DA path arbitrarily worse than the input it replaces (ClickBench
+         * q07/q38/q40: 4-12ms -> 42-54ms), so route sparse selections away. */
+        if (da_eligible && rowsel && !match_idx) {
+            ray_rowsel_t* sm = ray_rowsel_meta(rowsel);
+            if (sm && sm->total_pass * 4 < nrows)
+                da_eligible = false;
+        }
+        /* DA slot budget: dense per-worker state must stay well under the
+         * input size or the scatter loses to radix grouping on cache misses
+         * alone (ClickBench q28: a 2.7M-slot Referer array over 10M rows ran
+         * 10x slower than the HT path).  n_scan/8 keeps the state O(input/8)
+         * while still allowing the >262144-slot shapes #326 opened up; the
+         * old fixed cap remains as the floor so small inputs keep DA. */
+        uint64_t da_slot_budget = (uint64_t)(n_scan >> 3);
+        if (da_slot_budget < 262144) da_slot_budget = 262144;
         /* Binary aggregators (OP_PEARSON_CORR) are not wired into the
          * dense-array accumulator's per-worker da_accum_t struct — force
          * the HT path which has the row-layout offsets allocated.
@@ -10281,12 +10315,12 @@ da_path:;
                 if (key_scan_sym[k] < 0) continue;
                 int64_t card = ray_grp_card_lookup(key_scan_sym[k]);
                 if (card <= 1) continue;
-                if ((uint64_t)card > (uint64_t)n_scan / known_ub) {
+                if ((uint64_t)card > da_slot_budget / known_ub) {
                     da_eligible = false;
                     break;
                 }
                 known_ub *= (uint64_t)card;
-                if (known_ub > (uint64_t)n_scan) { da_eligible = false; break; }
+                if (known_ub > da_slot_budget) { da_eligible = false; break; }
             }
         }
 
@@ -10320,7 +10354,7 @@ da_path:;
                     .n_workers      = mm_n,
                     .match_idx      = match_idx,
                     .rowsel         = rowsel,
-                    .span_budget    = n_scan,
+                    .span_budget    = (int64_t)da_slot_budget,
                     .abort_flag     = &mm_abort,
                 };
                 if (mm_n > 1) {
@@ -10345,8 +10379,8 @@ da_path:;
                 da_key_range[k] = (int64_t)span;
                 if (da_key_range[k] <= 0) { da_fits = false; break; }
                 uint64_t range = (uint64_t)da_key_range[k];
-                uint64_t slot_limit = (uint64_t)n_scan < INT32_MAX
-                    ? (uint64_t)n_scan : INT32_MAX;
+                uint64_t slot_limit = da_slot_budget < INT32_MAX
+                    ? da_slot_budget : INT32_MAX;
                 if (total_slots > slot_limit / range) {
                     da_fits = false;
                     break;
@@ -11039,7 +11073,30 @@ da_path:;
 
             uint8_t key_esz = ray_sym_elem_size(key_types[0], key_attrs[0]);
 
-            if (use_emit_filter &&
+            /* Dense-cap vs survivor gate: the dyn-dense emit path callocs
+             * and slot-scans a key-range-sized array (1<<20 initial for
+             * 4-byte keys, up to 1<<24) — pure overhead when a WHERE
+             * leaves far fewer survivors than the array has slots
+             * (ClickBench q21: a 1M-slot scatter+scan for 44 rows).  The
+             * comparison is cap-vs-survivors, NOT raw selectivity: a
+             * narrow key's 64K cap stays profitable at any filter (q07).
+             * Sparse-vs-cap selections continue to the radix/HT paths,
+             * which size their state from the surviving rows. */
+            bool sp_dyn_sparse = false;
+            if (rowsel) {
+                ray_rowsel_t* sp_sm = ray_rowsel_meta(rowsel);
+                uint64_t sp_cap = key_esz == 1 ? 256u
+                                : key_esz == 2 ? (1u << 16)
+                                : (1u << 20);
+                /* Break-even multiplier: the dense side costs a sequential
+                 * cap-sized calloc+scan (cheap per slot); the radix side
+                 * costs per-survivor hashing plus fixed pipeline setup.
+                 * Measured on ClickBench: 39K survivors amortize a 1M cap
+                 * (q38, dense wins), 44 survivors do not (q21). */
+                if (sp_sm && (uint64_t)sp_sm->total_pass * 32 < sp_cap)
+                    sp_dyn_sparse = true;
+            }
+            if (use_emit_filter && !sp_dyn_sparse &&
                 (emit_filter.min_count_exclusive > 0 ||
                  emit_filter.top_count_take > 0) &&
                 n_scan <= UINT32_MAX) {
@@ -11555,7 +11612,19 @@ ht_path:;
     /* Parallel path: radix-partitioned group-by */
     ray_pool_t* pool = ray_pool_get();
     uint32_t n_total = pool ? ray_pool_total_workers(pool) : 1;
-    uint32_t radix_n_parts = group_radix_part_count(n_total, n_scan);
+    /* Size the radix fan-out by the rows that actually reach the partition
+     * HTs: with a pushed WHERE only the survivors are scattered, and a
+     * part count derived from the raw row count allocates and merges
+     * n_workers * n_parts hash tables of pure setup overhead (ClickBench
+     * q40: 8 x 4096 HTs for ~10K survivors — the merge dwarfed the query).
+     * Partition count only affects work distribution, never results. */
+    int64_t radix_rows = n_scan;
+    if (g->selection) {
+        ray_rowsel_t* sel_sm = ray_rowsel_meta(g->selection);
+        if (sel_sm && sel_sm->nrows == nrows && sel_sm->total_pass < radix_rows)
+            radix_rows = sel_sm->total_pass > 0 ? sel_sm->total_pass : 1;
+    }
+    uint32_t radix_n_parts = group_radix_part_count(n_total, radix_rows);
 
     group_ht_t single_ht;
     group_ht_t top_ht;
@@ -12068,6 +12137,59 @@ v2_emit:;
                 result = ray_error("limit", "group row index is too large");
                 goto cleanup;
             }
+            /* Sparse path: with few groups relative to rows, sort the
+             * (first_row, flat) pairs instead of building + scanning a
+             * dense uint32[nrows] map — the dense pass costs O(nrows) in
+             * allocation, memset and scan regardless of group count
+             * (ClickBench q40: a 40MB map and full 10M-row walk to order
+             * 110 groups).  Sorting by earliest source row assigns exactly
+             * the ids the row-domain scan would.  Duplicate first rows are
+             * rejected the same way the dense map's collision check did. */
+            if ((uint64_t)total_grps <= row_count / 16) {
+                ray_t* pair_hdr = NULL;
+                group_order_pair_t* pairs = (group_order_pair_t*)scratch_alloc(
+                    &pair_hdr, (size_t)total_grps * sizeof(group_order_pair_t));
+                if (!pairs) {
+                    result = ray_error("oom", NULL);
+                    goto cleanup;
+                }
+                bool order_ok = true;
+                uint32_t np = 0;
+                for (uint32_t p = 0; p < radix_n_parts && order_ok; p++) {
+                    group_ht_t* ph = &part_hts[p];
+                    for (uint32_t gi = 0; gi < ph->grp_count; gi++) {
+                        uint32_t flat = part_offsets[p] + gi;
+                        const char* group_row = ph->rows
+                            + (size_t)gi * ph->layout.row_stride;
+                        int64_t first;
+                        memcpy(&first,
+                               group_row + ph->layout.off_group_first, 8);
+                        if (first < 0 || first >= nrows) {
+                            order_ok = false;
+                            break;
+                        }
+                        pairs[np].first = first;
+                        pairs[np].flat  = flat;
+                        np++;
+                    }
+                }
+                if (order_ok) {
+                    qsort(pairs, np, sizeof(group_order_pair_t),
+                          group_order_pair_cmp);
+                    for (uint32_t i = 0; i < np; i++) {
+                        if (i > 0 && pairs[i].first == pairs[i - 1].first) {
+                            order_ok = false;
+                            break;
+                        }
+                        group_out[pairs[i].flat] = i;
+                    }
+                }
+                scratch_free(pair_hdr);
+                if (!order_ok || np != total_grps) {
+                    result = ray_error("group", "failed to order all groups");
+                    goto cleanup;
+                }
+            } else {
             ray_t* first_hdr = NULL;
             uint32_t* first_to_flat = (uint32_t*)scratch_alloc(
                 &first_hdr, (size_t)row_count * sizeof(uint32_t));
@@ -12105,6 +12227,7 @@ v2_emit:;
             if (!order_ok || out != total_grps) {
                 result = ray_error("group", "failed to order all groups");
                 goto cleanup;
+            }
             }
         }
 
