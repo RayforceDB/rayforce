@@ -15451,6 +15451,18 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: unknown equality key symbol"); }
         eq_ops[i] = ray_scan(g, ray_str_ptr(nm));
         if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: equality key column not found"); }
+        ray_t* lcol = ray_table_get_col(left_tbl, eq_elems[i]->i64);
+        ray_t* rcol = ray_table_get_col(right_tbl, eq_elems[i]->i64);
+        int8_t lct = lcol ? lcol->type : (int8_t)0;
+        int8_t rct = rcol ? rcol->type : (int8_t)0;
+        if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
+        if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
+        if (lct == RAY_STR || rct == RAY_STR) {
+            scratch_free(eqops_hdr);
+            ray_graph_free(g);
+            if (_bxeq) ray_release(_bxeq);
+            return ray_error("nyi", "window-join: string equality key columns are not supported");
+        }
     }
 
     if (_bxeq) ray_release(_bxeq);

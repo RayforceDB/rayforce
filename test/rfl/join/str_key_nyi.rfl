@@ -10,8 +10,8 @@
 ;; aggregates are WRONG.  The base equi-join (inner/left/anti) uses a separate
 ;; STR-aware kernel and stays correct, so the fix is scoped to asof + window:
 ;; reject a STR eq-key on either side with `nyi` instead of returning corrupt
-;; data.  window-join1 shares the window kernel; both asof call paths share
-;; ray_asof_join_core, so one guard each covers every entry point.
+;; data.  window-join1 shares the window kernel; the 4-argument compatibility
+;; window forms fall through to the asof executor, so they need the same guard.
 
 ;; ── asof-join: STR equality key → nyi (both operand orders) ──────────
 (set tr (table [Sym Time Price] (list ["A" "A"] [12:00:01 12:00:04] [100 101])))(set qs (table [Sym Time Bid] (list ["A" "A"] [12:00:00 12:00:05] [99 100])))(asof-join [Sym Time] tr qs) !- nyi
@@ -20,6 +20,8 @@
 ;; ── window-join / window-join1: STR equality key → nyi ───────────────
 (set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set wi (map-left + [-2000 2000] (at wt 'Time)))(window-join [Sym Time] wi wt wq {minBid: (min Bid)}) !- nyi
 (set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set wi (map-left + [-2000 2000] (at wt 'Time)))(window-join1 [Sym Time] wi wt wq {minBid: (min Bid)}) !- nyi
+(set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(at (window-join wt wq [Sym] 'Time) 'Bid) !- nyi
+(set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(at (window-join1 wt wq [Sym] 'Time) 'Bid) !- nyi
 
 ;; ── SYM equality keys keep working and stay order-independent ────────
 (set KS (as 'sym ["AAPL" "AAPL"]))(set trS (table [Sym Time Price] (list KS [12:00:01 12:00:04] [100 101])))(set qsS (table [Sym Time Bid] (list KS [12:00:00 12:00:05] [99 100])))(at (asof-join [Sym Time] trS qsS) 'Bid) -- [99 99]
