@@ -566,6 +566,55 @@ static test_result_t test_splay_dict_column_roundtrip(void) {
     PASS();
 }
 
+/* ---- test_splay_empty_list_column_roundtrip --------------------------- */
+static test_result_t test_splay_empty_list_column_roundtrip(void) {
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+
+    ray_t* ids = ray_vec_new(RAY_I64, 0);
+    ray_t* who = ray_vec_new(RAY_SYM, 0);
+    ray_t* sched = ray_list_new(0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ids));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(who));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sched));
+
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("id", 2), ids);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, ray_sym_intern("who", 3), who);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, ray_sym_intern("sched", 5), sched);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    const char* sym_path = TMP_SPLAY_DIR "/.sym";
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, TMP_SPLAY_DIR, sym_path), RAY_OK);
+    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, sym_path);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 3);
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 0);
+
+    ray_t* loaded_ids = ray_table_get_col(loaded, ray_sym_find("id", 2));
+    ray_t* loaded_who = ray_table_get_col(loaded, ray_sym_find("who", 3));
+    ray_t* loaded_sched = ray_table_get_col(loaded, ray_sym_find("sched", 5));
+    TEST_ASSERT_NOT_NULL(loaded_ids);
+    TEST_ASSERT_NOT_NULL(loaded_who);
+    TEST_ASSERT_NOT_NULL(loaded_sched);
+    TEST_ASSERT_EQ_I(loaded_ids->type, RAY_I64);
+    TEST_ASSERT_EQ_I(loaded_who->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(loaded_sched->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded_ids->len, 0);
+    TEST_ASSERT_EQ_I(loaded_who->len, 0);
+    TEST_ASSERT_EQ_I(loaded_sched->len, 0);
+
+    ray_release(loaded);
+    ray_release(tbl);
+    ray_release(ids);
+    ray_release(who);
+    ray_release(sched);
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    PASS();
+}
+
 /* A deterministic unsupported column must be rejected before an earlier
  * column can replace the committed generation. */
 static test_result_t test_splay_save_preflight_preserves_generation(void) {
@@ -5163,6 +5212,7 @@ const test_entry_t store_entries[] = {
     { "store/splay_str_column_roundtrip", test_splay_str_column_roundtrip, store_setup, store_teardown },
     { "store/splay_short_strv_roundtrip", test_splay_short_strv_roundtrip, store_setup, store_teardown },
     { "store/splay_dict_column_roundtrip", test_splay_dict_column_roundtrip, store_setup, store_teardown },
+    { "store/splay_empty_list_column_roundtrip", test_splay_empty_list_column_roundtrip, store_setup, store_teardown },
     { "store/splay_save_preflight", test_splay_save_preflight_preserves_generation, store_setup, store_teardown },
     { "store/parted_nrows", test_parted_nrows, store_setup, store_teardown },
     { "store/table_nrows_parted", test_table_nrows_parted, store_setup, store_teardown },
