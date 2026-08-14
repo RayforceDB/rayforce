@@ -6149,17 +6149,29 @@ static bool sparse_i64_touch(sparse_i64_ht_t* ht, int64_t key, uint8_t n_aggs,
     return true;
 }
 
+/* Sign discipline for DA key reads: the min/max prescan (minmax_scan_fn)
+ * reads narrow keys through their SIGNED column type, so key_mins[k] is a
+ * sign-extended value.  Every accumulate-side read must sign-extend the
+ * same way or a negative I16/I32/DATE/TIME key maps to a slot far outside
+ * [0, range) — an out-of-bounds write, not just a wrong group.  Only
+ * BOOL/U8 and SYM dictionary ids are unsigned. */
+static inline int da_key_is_unsigned(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || RAY_IS_SYM(t);
+}
+
 /* Composite GID from multi-key. Planning bounds total_slots to INT32_MAX. */
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     int32_t gid = 0;
     for (uint32_t k = 0; k < c->n_keys; k++) {
-        int64_t val = read_by_esz(c->key_ptrs[k], r, c->key_esz[k]);
+        int64_t val = read_signed_by_esz(c->key_ptrs[k], r, c->key_esz[k],
+                                         da_key_is_unsigned(c->key_types[k]));
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
     }
     return gid;
 }
 
-/* Typed composite GID: eliminates per-element switch when all keys share width */
+/* Typed composite GID: eliminates per-element switch when all keys share
+ * width AND signedness (see da_key_is_unsigned above). */
 #define DEFINE_DA_COMPOSITE_GID_TYPED(SUFFIX, KTYPE) \
 static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
     int32_t gid = 0; \
@@ -6172,6 +6184,8 @@ static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
 DEFINE_DA_COMPOSITE_GID_TYPED(u8,  uint8_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(u16, uint16_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(u32, uint32_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(i16, int16_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(i32, int32_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(i64, int64_t)
 #undef DEFINE_DA_COMPOSITE_GID_TYPED
 
@@ -6826,11 +6840,23 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     } while (0)
 
     if (n_keys == 1) {
-        switch (c->key_esz[0]) {
-        case 1: DA_SINGLE_KEY_LOOP(uint8_t, ); break;
-        case 2: DA_SINGLE_KEY_LOOP(uint16_t, ); break;
-        case 4: DA_SINGLE_KEY_LOOP(uint32_t, (int64_t)); break;
-        default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
+        /* Signed narrow keys (I16/I32/DATE/TIME) must sign-extend exactly
+         * as the min/max prescan did — an unsigned read maps a negative
+         * key to a slot outside [0, range) (see da_key_is_unsigned). */
+        if (da_key_is_unsigned(c->key_types[0])) {
+            switch (c->key_esz[0]) {
+            case 1: DA_SINGLE_KEY_LOOP(uint8_t, ); break;
+            case 2: DA_SINGLE_KEY_LOOP(uint16_t, ); break;
+            case 4: DA_SINGLE_KEY_LOOP(uint32_t, (int64_t)); break;
+            default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
+            }
+        } else {
+            switch (c->key_esz[0]) {
+            case 1: DA_SINGLE_KEY_LOOP(int8_t, ); break;
+            case 2: DA_SINGLE_KEY_LOOP(int16_t, ); break;
+            case 4: DA_SINGLE_KEY_LOOP(int32_t, (int64_t)); break;
+            default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
+            }
         }
         #undef DA_SINGLE_KEY_LOOP
         return;
@@ -6854,27 +6880,51 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         } \
     } while (0)
 
-    /* Check if all keys share the same element size */
+    /* Typed loops need all keys to share element size AND signedness; a
+     * mixed set (e.g. I16 + SYM16) falls to the sign-aware generic gid. */
     bool uniform_esz = true;
-    for (uint32_t k = 1; k < n_keys; k++)
+    bool uniform_sign = true;
+    for (uint32_t k = 1; k < n_keys; k++) {
         if (c->key_esz[k] != c->key_esz[0]) { uniform_esz = false; break; }
+        if (da_key_is_unsigned(c->key_types[k]) !=
+            da_key_is_unsigned(c->key_types[0])) { uniform_sign = false; break; }
+    }
 
-    if (uniform_esz) {
+    if (uniform_esz && uniform_sign) {
+        bool k_uns = da_key_is_unsigned(c->key_types[0]);
         switch (c->key_esz[0]) {
         case 1:
+            if (k_uns) {
 #define GID_FN(R) da_composite_gid_u8(c, (R))
-            DA_MULTI_KEY_LOOP(GID_FN);
+                DA_MULTI_KEY_LOOP(GID_FN);
 #undef GID_FN
+            } else {
+#define GID_FN(R) da_composite_gid(c, (R))
+                DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            }
             break;
         case 2:
+            if (k_uns) {
 #define GID_FN(R) da_composite_gid_u16(c, (R))
-            DA_MULTI_KEY_LOOP(GID_FN);
+                DA_MULTI_KEY_LOOP(GID_FN);
 #undef GID_FN
+            } else {
+#define GID_FN(R) da_composite_gid_i16(c, (R))
+                DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            }
             break;
         case 4:
+            if (k_uns) {
 #define GID_FN(R) da_composite_gid_u32(c, (R))
-            DA_MULTI_KEY_LOOP(GID_FN);
+                DA_MULTI_KEY_LOOP(GID_FN);
 #undef GID_FN
+            } else {
+#define GID_FN(R) da_composite_gid_i32(c, (R))
+                DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            }
             break;
         default:
 #define GID_FN(R) da_composite_gid_i64(c, (R))
