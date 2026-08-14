@@ -4454,7 +4454,14 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
                              fn_obj ? ray_type_name(fn_obj->type) : "null");
         }
 
-        ray_t* src = eval_expr_per_row(agg_elems[1], tbl, nrows);
+        /* A whole-column verb (distinct/asc/desc/reverse) at the head of the
+         * aggregate's argument consumes the entire column — per-row scatter
+         * would feed it one scalar cell at a time, making `count` report the
+         * row count instead of the distinct count (issue #405).  Mirror the
+         * projection fallback's routing and evaluate it once. */
+        ray_t* src = is_whole_column_projection(agg_elems[1])
+                   ? eval_expr_whole_column(agg_elems[1], tbl)
+                   : eval_expr_per_row(agg_elems[1], tbl, nrows);
         if (!src || RAY_IS_ERR(src)) {
             ray_release(result);
             return src ? src : ray_error("domain", "select: failed to evaluate aggregation source");
