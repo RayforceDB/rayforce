@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 #include "part.h"
+#include "core/runtime.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
 #include "store/splay.h"
@@ -560,7 +561,21 @@ static ray_t* empty_table_like(ray_t* tmpl) {
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_get_col_idx(tmpl, c);
         if (!col) { ray_release(out); return ray_error("type", "empty_table_like: null column"); }
-        ray_t* ecol = ray_vec_new(col->type, 0);
+        ray_t* ecol = NULL;
+        if (col->type == RAY_LIST) {
+            ecol = ray_list_new(0);
+        } else if (col->type == RAY_TABLE || col->type == RAY_DICT) {
+            int64_t name_id = ray_table_col_name(tmpl, c);
+            ray_t* name = ray_sym_str(name_id);
+            const char* name_ptr = name ? ray_str_ptr(name) : "?";
+            int name_len = name ? (int)ray_str_len(name) : 1;
+            const char* type_name = col->type == RAY_TABLE ? "TABLE" : "DICT";
+            ray_release(out);
+            return ray_error("nyi", "empty_table_like: column '%.*s' has unsupported nested type %s",
+                             name_len, name_ptr, type_name);
+        } else {
+            ecol = ray_vec_new(col->type, 0);
+        }
         if (!ecol || RAY_IS_ERR(ecol)) { ray_release(out); return ecol ? ecol : ray_error("oom", NULL); }
         ray_t* nout = ray_table_add_col(out, ray_table_col_name(tmpl, c), ecol);
         ray_release(ecol);
@@ -674,6 +689,7 @@ ray_t* ray_parted_fill(const char* db_root) {
     int64_t all_count = 0, all_cap = 0;
     uint8_t* fixed = (uint8_t*)ray_calloc_raw((size_t)((size_t)part_count) * (1));
     ray_err_t err = fixed ? RAY_OK : RAY_ERR_OOM;
+    char cause[256] = {0};
 
     for (int64_t p = 0; p < part_count && err == RAY_OK; p++) {
         char pdir[1024];
@@ -718,16 +734,23 @@ ray_t* ray_parted_fill(const char* db_root) {
                 if (tn < 0 || (size_t)tn >= sizeof(tdir)) { err = RAY_ERR_RANGE; break; }
                 ray_t* full = ray_read_splayed(tdir, sym_path);
                 if (!full || RAY_IS_ERR(full)) {
+                    err = full ? ray_err_from_obj(full) : RAY_ERR_OOM;
+                    const char* detail = ray_error_msg();
+                    snprintf(cause, sizeof(cause), "table %s (partition %s): %s",
+                             tname, part_dirs[templ],
+                             detail && *detail ? detail : "template read failed");
                     if (full) ray_error_free(full);
-                    err = RAY_ERR_IO;
                     break;
                 }
                 empty_tbl = empty_table_like(full);
                 ray_release(full);
                 if (!empty_tbl || RAY_IS_ERR(empty_tbl)) {
+                    err = empty_tbl ? ray_err_from_obj(empty_tbl) : RAY_ERR_OOM;
+                    const char* detail = ray_error_msg();
+                    snprintf(cause, sizeof(cause), "table %s: %s", tname,
+                             detail && *detail ? detail : "empty table construction failed");
                     if (empty_tbl) ray_error_free(empty_tbl);
                     empty_tbl = NULL;
-                    err = RAY_ERR_IO;
                     break;
                 }
             }
@@ -737,7 +760,12 @@ ray_t* ray_parted_fill(const char* db_root) {
                                db_root, part_dirs[p], tname);
             if (ptn < 0 || (size_t)ptn >= sizeof(ptdir)) { err = RAY_ERR_RANGE; break; }
             ray_err_t se = ray_splay_save(empty_tbl, ptdir, sym_path);
-            if (se != RAY_OK) { err = se; break; }
+            if (se != RAY_OK) {
+                err = se;
+                snprintf(cause, sizeof(cause), "table %s (partition %s): save failed",
+                         tname, part_dirs[p]);
+                break;
+            }
             fixed[p] = 1;
         }
         if (empty_tbl) ray_release(empty_tbl);
@@ -767,6 +795,9 @@ ray_t* ray_parted_fill(const char* db_root) {
 
     if (err != RAY_OK) {
         if (result && !RAY_IS_ERR(result)) ray_release(result);
+        if (cause[0])
+            return ray_error(ray_err_code_str(err), "parted %s: fill failed: %s",
+                             db_root, cause);
         return ray_error(ray_err_code_str(err), "parted %s: fill failed", db_root);
     }
     return result;

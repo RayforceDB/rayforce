@@ -89,6 +89,10 @@ jobs:
   # work-stealing ring real contention to race against.  Linux + clang only.
   tsan:
     runs-on: ubuntu-latest
+    env:
+      # Keep Clang off transient hosted-runner ISA features that become
+      # -Werror diagnostics before the TSan suites can run.
+      RAY_MARCH: x86-64
     steps:
       - uses: actions/checkout@v4
       - name: TSan concurrency suites

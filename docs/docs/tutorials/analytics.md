@@ -205,7 +205,9 @@ Each trade row now carries the `Bid` and `Ask` from the most recent quote for th
 
 ## 6. Window Joins
 
-A window join is similar to an ASOF join but allows you to match each left row against right rows within a time window partitioned by equality keys. Use `window-join` with the form `(window-join leftTable rightTable [eqKeys] 'timeCol)`:
+A window join aggregates right rows within a time interval for each left row,
+partitioned by optional equality keys. Its form is
+`(window-join [eqKeys... timeKey] intervals left right {aggregations})`:
 
 ```lisp
 (set trades (table [Time Symbol Price]
@@ -219,24 +221,14 @@ A window join is similar to an ASOF join but allows you to match each left row a
         [149.0 149.5 278.0 279.0 150.5 279.5 278.5 151.0]
         [150.0 150.5 279.0 280.0 151.5 280.5 279.5 152.0])))
 
-; Join each trade to the latest quote for the same symbol
-(window-join trades quotes ['Symbol] 'Time)
+; Average quotes from ten time units before each trade through the trade time.
+(set intervals (map-left + [-10 0] (at trades 'Time)))
+(window-join [Symbol Time] intervals trades quotes
+  {avg_bid: (avg Bid) avg_ask: (avg Ask)})
 ```
 
-```text
-┌──────┬────────┬───────┬───────┬───────┐
-│ Time │ Symbol │ Price │  Bid  │  Ask  │
-│ I64  │  SYM   │  F64  │  F64  │  F64  │
-├──────┼────────┼───────┼───────┼───────┤
-│ 10   │ AAPL   │ 150.0 │ 149.5 │ 150.5 │
-│ 20   │ AAPL   │ 151.0 │ 149.5 │ 150.5 │
-│ 30   │ GOOG   │ 280.0 │ 279.5 │ 280.5 │
-│ 40   │ GOOG   │ 279.0 │ 278.5 │ 279.5 │
-│ 50   │ AAPL   │ 152.0 │ 151.0 │ 152.0 │
-└──────┴────────┴───────┴───────┴───────┘
-```
-
-The `window-join` matches each trade to the closest preceding quote for the same `Symbol`, partitioned by the equality keys in the vector. The `'Time` argument specifies the temporal ordering column.
+The last key, `Time`, is the temporal key; `Symbol` is the equality key. The
+two vectors in `intervals` provide the lower and upper offsets for each trade.
 
 ## 7. Multi-Step Pipeline
 

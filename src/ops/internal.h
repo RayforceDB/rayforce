@@ -1045,6 +1045,14 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input);
 
+/* Parallel distinct for large fixed-width columns: radix-partitioned
+ * dedup (exec_count_distinct's layout) returning an I64 vec of
+ * first-occurrence row ids in first-appearance order.  Returns NULL
+ * when the kernel doesn't apply (unsupported type, small input, no
+ * pool) — caller falls back to the eager hashset.  Errors are
+ * RAY_IS_ERR ray_t*. */
+ray_t* distinct_radix_first_ids(ray_t* input);
+
 /* Single-pass per-group count(distinct).  Returns I64 vec of length
  * n_groups, or NULL if `src->type` isn't a supported scalar/SYM type
  * (caller falls back to per-group exec_count_distinct).  Errors are

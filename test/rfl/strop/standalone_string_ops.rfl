@@ -23,6 +23,19 @@
 (substr (as 'STR (list "abcdefghijklmnopqrstuvwxyz" "short")) 5 -1) -- ["efghijklmnopqrstuvwxyz" "t"]
 (substr ["abcdef" "xyz"] [1 2] [3 9]) -- ["abc" "yz"]
 
+;; Null start/length propagates to the empty (null) string — a STR/SYM has no
+;; null distinct from ""/'.  A null integer atom is INT64_MIN, so it must be
+;; handled before the 1-based->0-based `start - 1` (else signed-overflow UB;
+;; regression for src/ops/strop.c substr_atom + src/ops/string.c exec_substr).
+(substr "abcdef" 0N 3) -- ""
+(substr "abcdef" 2 0N) -- ""
+(substr "abcdef" 0N 0N) -- ""
+(substr 'abcdef 0N 3) -- '
+(substr 'abcdef 2 0N) -- '
+;; Columnar path: a scalar null start/length nulls every row.
+(substr ["abcdef" "xyz"] 0N 2) -- ["" ""]
+(substr ["abcdef" "xyz"] 1 0N) -- ["" ""]
+
 (replace "banana" "a" "A") -- "bAnAnA"
 (replace "banana" "na" "NA") -- "baNANA"
 (replace 'banana "a" "A") -- 'bAnAnA

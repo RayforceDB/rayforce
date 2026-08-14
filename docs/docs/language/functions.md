@@ -83,8 +83,8 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `any` | unary, aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary, aggr | Minimum value | `(min [3 1 2])` → `1` |
-| `max` | unary, aggr | Maximum value | `(max [3 1 2])` → `3` |
+| `min` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise minimum of two values | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
+| `max` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise maximum of two values | `(max [3 9 1] 5)` → `[5 9 5]` |
 | `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
 | `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
@@ -157,8 +157,9 @@ Operations on vectors as collections.
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | Index into vector | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
+| `fill` | binary, atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
@@ -214,7 +215,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `key` | unary | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | Get table column names | `(cols trades)` → `[sym price size]` |
 | `value` | unary | Get column data (table) or values (dict) | `(value trades)` |
-| `dict` | binary | Create dictionary from keys and values | `(dict [a b] [1 2])` |
+| `dict` | binary | Create a dictionary from evaluated keys and values | `(dict [a b] [1 2])` |
 | `get` | binary | Lookup key in dict/table | `(get d 'a)` → `1` |
 | `remove` | binary | Remove key from dict | `(remove d 'a)` |
 | `row` | binary | Extract single row from table as dict | `(row trades 0)` |
@@ -228,7 +229,11 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 
-`xkey` returns a dictionary keyed by unique key column value(s). Duplicate keys are a domain error; use `xgroup` to get a dictionary whose values are grouped table slices.
+`xkey` returns a dictionary keyed by unique key column value(s). Duplicate keys are a domain error; use `xgroup` to get a dictionary whose values are grouped table slices. Passing a typed vector of keys to `at` performs a batch lookup and returns a list of the corresponding values.
+
+Dictionary literals are literals: their entries are not evaluated, just as the
+elements of other literals are not evaluated. Use `(dict keys values)` to
+construct a dictionary from evaluated expressions.
 
 ## Query Operations
 
@@ -322,10 +327,10 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 (set products (table [product_id name] (list [10 20] [widget gadget])))
 
 ; Left join two tables on the sym column (join keys are a symbol list)
-(left-join trades_j quotes [sym])
+(left-join [sym] trades_j quotes)
 
 ; Inner join
-(inner-join orders products [product_id])
+(inner-join [product_id] orders products)
 
 ; Full outer join keeps rows from both sides
 (full-join [sym] trades_j quotes)
@@ -430,7 +435,9 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `.csv.read` | variadic | Load CSV file into table | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | `read` | unary | Read file contents as string | `(read "file.txt")` |
-| `write` | binary | Write string to file | `(write "file.txt" "content")` |
+| `read-bytes` | unary | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
+| `write` | binary | Write a string to a file | `(write "file.txt" "content")` |
+| `write-bytes` | binary | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
 | `load` | unary | Load and evaluate a Rayfall script | `(load "lib.rfl")` |
 
 ## Control Flow
@@ -509,7 +516,7 @@ Built-in support for triple stores. The EAV table has three columns: `e` (entity
 |---|---|---|---|
 | `union-all` | binary | Concatenate two tables (all rows) | `(union-all t1 t2)` |
 | `distinct` | unary | Remove duplicate rows from a table | `(distinct t)` |
-| `anti-join` | variadic | Anti-semi-join: rows in left not in right | `(anti-join t1 t2 [x])` |
+| `anti-join` | variadic | Anti-semi-join: rows in left not in right | `(anti-join [x] t1 t2)` |
 
 ```lisp
 ; Table concatenation and deduplication
@@ -517,7 +524,7 @@ Built-in support for triple stores. The EAV table has three columns: `e` (entity
 (set t2 (table [x] (list [2 3])))
 (union-all t1 t2)          ; 4 rows: 1 2 2 3
 (distinct (union-all t1 t2))  ; 3 rows: 1 2 3
-(anti-join t1 t2 [x])     ; 1 row: 1
+(anti-join [x] t1 t2)     ; 1 row: 1
 ```
 
 ## Datalog

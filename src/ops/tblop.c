@@ -905,26 +905,54 @@ ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys_arg) {
         return keys && RAY_IS_ERR(keys) ? keys : (vals && RAY_IS_ERR(vals) ? vals : ray_error("oom", NULL));
     }
 
+    /* Duplicate detection is an open-addressed set of indices into `keys`.
+     * The old all-prior-keys scan made construction quadratic. */
+    size_t ht_cap = 16;
+    if ((uint64_t)nrows > SIZE_MAX / 2) {
+        ray_release(keys); ray_release(vals);
+        ray_free_raw(key_cols); ray_free_raw(key_syms);
+        return ray_error("limit", "xkey: table is too large");
+    }
+    while (nrows > 0 && ht_cap < (size_t)nrows * 2) {
+        if (ht_cap > SIZE_MAX / 2) {
+            ray_release(keys); ray_release(vals);
+            ray_free_raw(key_cols); ray_free_raw(key_syms);
+            return ray_error("limit", "xkey: table is too large");
+        }
+        ht_cap *= 2;
+    }
+    int64_t* ht = (int64_t*)ray_alloc_raw(ht_cap * sizeof(int64_t));
+    if (!ht) {
+        ray_release(keys); ray_release(vals);
+        ray_free_raw(key_cols); ray_free_raw(key_syms);
+        return ray_error("oom", NULL);
+    }
+    for (size_t i = 0; i < ht_cap; i++) ht[i] = -1;
+
     for (int64_t r = 0; r < nrows; r++) {
         ray_t* k = table_row_key(key_cols, nkeys, r);
-        if (!k || RAY_IS_ERR(k)) { ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return k ? k : ray_error("oom", NULL); }
+        if (!k || RAY_IS_ERR(k)) { ray_free_raw(ht); ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return k ? k : ray_error("oom", NULL); }
         ray_t** key_items = (ray_t**)ray_data(keys);
-        for (int64_t i = 0; i < keys->len; i++) {
-            if (atom_eq(key_items[i], k)) {
+        size_t slot = (size_t)ray_atom_hash(k) & (ht_cap - 1);
+        while (ht[slot] >= 0) {
+            if (atom_eq(key_items[ht[slot]], k)) {
                 ray_release(k);
+                ray_free_raw(ht);
                 ray_release(keys);
                 ray_release(vals);
                 ray_free_raw(key_cols);
                 ray_free_raw(key_syms);
                 return ray_error("domain", "xkey: duplicate key at row %lld", (long long)r);
             }
+            slot = (slot + 1) & (ht_cap - 1);
         }
         ray_t* v = table_row_value_dict(tbl, key_syms, nkeys, r);
-        if (!v || RAY_IS_ERR(v)) { ray_release(k); ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return v ? v : ray_error("oom", NULL); }
+        if (!v || RAY_IS_ERR(v)) { ray_release(k); ray_free_raw(ht); ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return v ? v : ray_error("oom", NULL); }
         ray_t* nkeys_obj = ray_list_append(keys, k);
         if (!nkeys_obj || RAY_IS_ERR(nkeys_obj)) {
             ray_release(k);
             ray_release(v);
+            ray_free_raw(ht);
             ray_release(keys);
             ray_release(vals);
             ray_free_raw(key_cols);
@@ -932,11 +960,13 @@ ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys_arg) {
             return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
         }
         keys = nkeys_obj;
+        ht[slot] = keys->len - 1;
 
         ray_t* nvals_obj = ray_list_append(vals, v);
         if (!nvals_obj || RAY_IS_ERR(nvals_obj)) {
             ray_release(k);
             ray_release(v);
+            ray_free_raw(ht);
             ray_release(keys);
             ray_release(vals);
             ray_free_raw(key_cols);
@@ -948,6 +978,7 @@ ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys_arg) {
         ray_release(v);
     }
 
+    ray_free_raw(ht);
     ray_free_raw(key_cols);
     ray_free_raw(key_syms);
     return ray_dict_new(keys, vals);

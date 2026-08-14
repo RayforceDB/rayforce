@@ -85,6 +85,10 @@ static inline ray_err_t ray_col_check_format(const ray_t* header) {
  * loads attach that symfile's domain (sym-domain architecture spec). */
 ray_err_t ray_col_save(ray_t* vec, const char* path);
 ray_err_t ray_col_save_bulk(ray_t* vec, const char* path);
+/* Validate the complete object graph accepted by ray_col_save without
+ * opening or modifying a file.  Splayed saves use this before mutating a
+ * symfile or any already-committed column generation. */
+ray_err_t ray_col_save_preflight(ray_t* vec);
 ray_t*    ray_col_load(const char* path);
 ray_t*    ray_col_mmap(const char* path);
 

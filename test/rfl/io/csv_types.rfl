@@ -138,11 +138,31 @@
 ;; Note: NULL_I32 sentinel so sum excludes nulls
 
 ;; ════════════════════════════════════════════════════════════════════════════
-;; 12. fast_time: h>23, mi>59, s>59 → is_null=true (line 436)
+;; 12. fast_time: TIME is a signed ms-of-day duration. csv_write_time emits
+;;     negative and >=24h values verbatim, so .csv.read [TIME] round-trips
+;;     them; only mi>59 / s>59 (and int32-overflowing magnitudes) are null.
 ;; ════════════════════════════════════════════════════════════════════════════
 (.sys.exec "printf 'a\n24:00:00\n12:60:00\n12:00:60\n12:30:45\n' > rf_test_csv_types_badtime.csv") -- 0
 (set Tbt (.csv.read [TIME] "rf_test_csv_types_badtime.csv"))
 (count Tbt) -- 4
+;; 24:00:00 is a valid >=24h duration; only mi>59 / s>59 rows are null.
+(at (at Tbt 'a) 0) -- 24:00:00.000
+(nil? (at (at Tbt 'a) 1)) -- true
+(nil? (at (at Tbt 'a) 2)) -- true
+(at (at Tbt 'a) 3) -- 12:30:45.000
+;; Signed / >23h durations round-trip through .csv.write -> .csv.read [TIME].
+(set Trt (table [t] (list (as 'TIME [-1000 -1 86400000 90000000 1000]))))
+(.csv.write Trt "rf_test_csv_types_timert.csv") -- 0
+(set Trtb (.csv.read [TIME] "rf_test_csv_types_timert.csv"))
+(at (at Trtb 't) 0) -- -00:00:01.000
+(at (at Trtb 't) 1) -- -00:00:00.001
+(at (at Trtb 't) 2) -- 24:00:00.000
+(at (at Trtb 't) 3) -- 25:00:00.000
+(at (at Trtb 't) 4) -- 00:00:01.000
+;; int32-ms overflow (huge hour field) is rejected as null.
+(.sys.exec "printf 't\n9999999:00:00\n' > rf_test_csv_types_timeovf.csv") -- 0
+(nil? (at (at (.csv.read [TIME] "rf_test_csv_types_timeovf.csv") 't) 0)) -- true
+(.sys.exec "rm -f rf_test_csv_types_timert.csv rf_test_csv_types_timeovf.csv") -- 0
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 13. fast_timestamp: invalid time component → is_null (line 487)
@@ -332,6 +352,21 @@
 (type (at Tcardlo 'k)) -- 'SYM
 (set Tcardlostr (.csv.read [STR] "rf_csv_card_lo.csv"))
 (type (at Tcardlostr 'k)) -- 'STR
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; Explicit schema aliases and exact width validation.
+;; SYM is the canonical name printed by `type`; SYMBOL remains the long alias.
+;; Historical LIST text columns materialize as packed STR columns.  A schema
+;; must describe every CSV column exactly instead of failing later as OOM.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 's,text\nfoo,hello\nbar,world\n' > rf_test_csv_types_alias.csv") -- 0
+(set Talias (.csv.read [SYM LIST] "rf_test_csv_types_alias.csv"))
+(type (at Talias 's)) -- 'SYM
+(type (at Talias 'text)) -- 'STR
+(at (at Talias 'text) 0) -- "hello"
+(.csv.read [SYM] "rf_test_csv_types_alias.csv") !- length
+(.csv.read [SYM LIST I64] "rf_test_csv_types_alias.csv") !- length
+(.sys.exec "rm -f rf_test_csv_types_alias.csv") -- 0
 
 ;; ── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -f rf_csv_card_*.csv") -- 0

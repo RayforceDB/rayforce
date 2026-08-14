@@ -284,6 +284,22 @@ static ray_t* substr_atom(ray_t* str, ray_t* start_obj, ray_t* len_obj) {
     int64_t start = 0, amount = 0;
     if (!str_atom_bytes(str, &sp, &sl, &is_sym))
         return ray_error("type", "substr: expected string or symbol, got %s", ray_type_name(str->type));
+
+    /* A null start or length propagates to the empty (null) string.  In
+     * Rayforce a STR/SYM has no null distinct from ""/' (see
+     * ray_atom_is_null_fn), so the empty value IS the null result — matching
+     * the per-row null propagation in exec_substr.  Checked BEFORE the
+     * 1-based->0-based `start - 1` below: a null integer atom is INT64_MIN,
+     * so the subtraction would be signed-overflow undefined behaviour
+     * (reported by UBSan at this line). */
+    if (RAY_ATOM_IS_NULL(start_obj) || RAY_ATOM_IS_NULL(len_obj)) {
+        if (is_sym) {
+            int64_t sid = ray_sym_intern("", 0);
+            return sid >= 0 ? ray_sym(sid) : ray_error("oom", NULL);
+        }
+        return ray_str("", 0);
+    }
+
     if (!intish_atom_value(start_obj, &start))
         return ray_error("type", "substr: start must be an integer atom");
     if (!intish_atom_value(len_obj, &amount))

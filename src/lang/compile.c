@@ -278,6 +278,10 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             ray_t *name_obj = elems[1];
             if (name_obj->type != -RAY_SYM) { c->error = true; return; }
             compile_expr(c, elems[2]);
+            /* Match ray_set_fn: globals must never retain a single-use lazy
+             * DAG handle.  Materializing one alias consumes its graph and
+             * would leave every other global read pointing at a spent handle. */
+            emit(c, OP_FORCE);
             int32_t idx = add_constant(c, name_obj);
             if (idx < 256) {
                 emit(c, OP_STOREGLOBAL);
@@ -332,6 +336,9 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         /* (if cond then else?) */
         if (sym_id == sf_if && n >= 3) {
             compile_expr(c, elems[1]);
+            /* Match ray_cond_fn: truthiness belongs to the materialized value,
+             * not to the non-NULL lazy handle that happens to contain it. */
+            emit(c, OP_FORCE);
             int32_t jmpf_pos = emit_jump(c, OP_JMPF);
             compile_expr(c, elems[2]);
             if (n >= 4) {
@@ -364,6 +371,27 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
         /* (fn [params] body...) — nested lambda via dynamic eval */
         if (sym_id == sf_fn && n >= 3) {
+            if (ast_refs_locals(c, ast)) {
+                ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+                if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+                syms->type = RAY_I64;
+                syms->len = c->n_locals;
+                int64_t *ids = (int64_t*)ray_data(syms);
+                for (int32_t i = 0; i < c->n_locals; i++)
+                    ids[i] = c->locals[i].sym_id;
+                int32_t syms_idx = add_constant(c, syms);
+                ray_release(syms);
+                if (c->error) return;
+                emit_const(c, syms_idx);
+                emit(c, OP_SCOPE_BEGIN);
+                int32_t idx = add_constant(c, ast);
+                emit_const(c, idx);
+                emit(c, OP_CALLD);
+                emit(c, 0);
+                emit_const(c, syms_idx);
+                emit(c, OP_SCOPE_END);
+                return;
+            }
             int32_t idx = add_constant(c, ast);
             emit_const(c, idx);
             emit(c, OP_CALLD);

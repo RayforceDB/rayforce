@@ -73,11 +73,8 @@
 #  include "core/poll.h"
 #endif
 
-/* Forward-declare runtime API — same pattern as test_lang.c. */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
-extern void           ray_runtime_destroy(ray_runtime_t* rt);
+/* __RUNTIME is internal test plumbing; runtime API declarations come from
+ * <rayforce.h>. */
 extern ray_runtime_t* __RUNTIME;
 extern void           ray_runtime_set_poll(void* poll);
 extern void*          ray_runtime_get_poll(void);
@@ -2788,6 +2785,24 @@ static bool pty_read_until(int fd, const char* needle, int timeout_ms,
     return false;
 }
 
+static bool pty_write_all(int fd, const void* data, size_t len, int timeout_ms) {
+    const char* p = data;
+    size_t off = 0;
+    int waited = 0;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EINTR) return false;
+        if (waited >= timeout_ms) return false;
+        usleep(10 * 1000);
+        waited += 10;
+    }
+    return true;
+}
+
 /* A literal Ctrl-C keypress must interrupt lazy/DAG materialization, not sit
  * in raw input until after the result prints. */
 static int run_pty_ctrl_c_during_lazy_materialize(void) {
@@ -2822,7 +2837,12 @@ static int run_pty_ctrl_c_during_lazy_materialize(void) {
     const char* preload_fmt = "(do (set l (til %d)) 0)\n";
     char preload[96];
     snprintf(preload, sizeof(preload), preload_fmt, N);
-    (void)write(master_fd, preload, strlen(preload));
+    if (!pty_write_all(master_fd, preload, strlen(preload), 1000)) {
+        kill(pid, SIGKILL);
+        int s; waitpid(pid, &s, 0);
+        close(master_fd);
+        return -10;
+    }
     if (!pty_read_until(master_fd, "\r\n0\r\n", 30000, accum, sizeof(accum), &pos)) {
         kill(pid, SIGKILL);
         int s; waitpid(pid, &s, 0);
@@ -2834,7 +2854,12 @@ static int run_pty_ctrl_c_during_lazy_materialize(void) {
     char expr[256];
     snprintf(expr, sizeof(expr),
              "(do (println \"%s\") (deltas (+ l 1)))\n", marker);
-    (void)write(master_fd, expr, strlen(expr));
+    if (!pty_write_all(master_fd, expr, strlen(expr), 1000)) {
+        kill(pid, SIGKILL);
+        int s; waitpid(pid, &s, 0);
+        close(master_fd);
+        return -11;
+    }
     if (!pty_read_until(master_fd, marker_line, 10000, accum, sizeof(accum), &pos)) {
         kill(pid, SIGKILL);
         int s; waitpid(pid, &s, 0);
@@ -2844,15 +2869,24 @@ static int run_pty_ctrl_c_during_lazy_materialize(void) {
 
     /* The marker is emitted immediately before constructing the lazy result.
      * Send Ctrl-C as soon as it is observed: fixed sleeps race with faster
-     * materialization and can miss the interruptible window entirely. */
+     * materialization and can miss the interruptible window entirely.  A
+     * nonblocking PTY write can also fail transiently under load, so write all
+     * input robustly and resend the literal keypress until the REPL
+     * acknowledges it.  Seeing the result first still fails the test,
+     * preventing a retry after materialization from hiding a real regression. */
     const char ctrl_c = '\003';
-    (void)write(master_fd, &ctrl_c, 1);
+    if (!pty_write_all(master_fd, &ctrl_c, 1, 1000)) {
+        kill(pid, SIGKILL);
+        int s; waitpid(pid, &s, 0);
+        close(master_fd);
+        return -12;
+    }
 
     bool saw_ctrl_c = false;
     bool result_before_ctrl_c = false;
     size_t ctrl_len = strlen("^C");
     size_t res_len = strlen(expected_result);
-    for (int waited = 0; waited < 5000; waited += 10) {
+    for (int waited = 0; waited < 15000; waited += 10) {
         char buf[4096];
         ssize_t n = read(master_fd, buf, sizeof(buf));
         if (n > 0) {
@@ -2874,6 +2908,10 @@ static int run_pty_ctrl_c_during_lazy_materialize(void) {
                 break;
             }
         } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            break;
+        }
+        if (waited > 0 && waited % 250 == 0
+            && !pty_write_all(master_fd, &ctrl_c, 1, 1000)) {
             break;
         }
         usleep(10 * 1000);

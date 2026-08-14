@@ -111,6 +111,7 @@ enum {
  *   data[4] = int32_t n_locals    (number of local slots needed)
  *   data[5] = ray_t* nfo          (source location info, NULL if absent)
  *   data[6] = ray_t* dbg          (debug metadata, NULL if absent)
+ *   data[7] = ray_t* closure      (captured lexical locals, NULL if empty)
  */
 
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
@@ -122,6 +123,7 @@ enum {
 #define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[4]))
 #define LAMBDA_NFO(lam)       (((ray_t**)ray_data(lam))[5])
 #define LAMBDA_DBG(lam)       (((ray_t**)ray_data(lam))[6])
+#define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 
@@ -225,6 +227,8 @@ ray_t* ray_gt_fn(ray_t* a, ray_t* b);
 ray_t* ray_lt_fn(ray_t* a, ray_t* b);
 ray_t* ray_gte_fn(ray_t* a, ray_t* b);
 ray_t* ray_lte_fn(ray_t* a, ray_t* b);
+ray_t* ray_min2_fn(ray_t* a, ray_t* b);
+ray_t* ray_max2_fn(ray_t* a, ray_t* b);
 ray_t* ray_eq_fn(ray_t* a, ray_t* b);
 ray_t* ray_neq_fn(ray_t* a, ray_t* b);
 
@@ -283,6 +287,7 @@ ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs);
 ray_t* ray_cross_fn(ray_t* a, ray_t* b);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
+ray_t* ray_fill_fn(ray_t* replacement, ray_t* value);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
 ray_t* ray_lag_fn(ray_t* x);
@@ -330,7 +335,9 @@ ray_t* ray_println_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_read_file_fn(ray_t* path_obj);
+ray_t* ray_read_bytes_fn(ray_t* path_obj);
 ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);
+ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
 
 /* Vector similarity / embeddings / HNSW.
  * cos-dist and l2-dist return distance (lower = closer); inner-prod is

@@ -138,7 +138,12 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
     if (both_f32_atoms(a, b)) return ray_f32((float)(as_f64(a) + as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) + as_f64(b));
     int8_t rt = promote_int_type(a, b);
-    return make_typed_int(rt, as_i64(a) + as_i64(b));
+    /* Wrap on overflow (defined) rather than signed-overflow UB, matching the
+     * vector arithmetic kernel (src/ops/expr.c OP_ADD/SUB/MUL).  The wrapped
+     * i64 (INT64_MIN on MAX+1) is the null sentinel, so results are unchanged
+     * — only the undefined arithmetic is removed. */
+    int64_t la = as_i64(a), lb = as_i64(b);
+    return make_typed_int(rt, (int64_t)((uint64_t)la + (uint64_t)lb));
 }
 
 ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
@@ -220,7 +225,9 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
         return make_f64(r);
     }
     int8_t rt = promote_int_type_right(a, b);
-    return make_typed_int(rt, as_i64(a) - as_i64(b));
+    /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
+    int64_t la = as_i64(a), lb = as_i64(b);
+    return make_typed_int(rt, (int64_t)((uint64_t)la - (uint64_t)lb));
 }
 
 ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
@@ -254,7 +261,9 @@ ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
     if (both_f32_atoms(a, b)) return ray_f32((float)(as_f64(a) * as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) * as_f64(b));
     int8_t rt = promote_int_type(a, b);
-    return make_typed_int(rt, as_i64(a) * as_i64(b));
+    /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
+    int64_t la = as_i64(a), lb = as_i64(b);
+    return make_typed_int(rt, (int64_t)((uint64_t)la * (uint64_t)lb));
 }
 
 ray_t* ray_div_fn(ray_t* a, ray_t* b) {

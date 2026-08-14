@@ -25,6 +25,7 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "core/qstats.h"
 #include "io/csv.h"
 #include "table/sym.h"
 #include <stdio.h>
@@ -1114,13 +1115,14 @@ static test_result_t test_csv_roundtrip_date_time_ts(void) {
     int32_t* d2 = (int32_t*)ray_data(dc);
     for (int i = 0; i < 3; i++) TEST_ASSERT_EQ_I(d2[i], dates[i]);
 
-    /* Positive TIME values must round-trip exactly. Negative time is
-     * written as "-HH:MM:SS" by csv_write_time, but fast_time only
-     * accepts unsigned HH:MM:SS, so the negative cell parses as null.
-     * This is a known source limitation (no src/ changes allowed). */
+    /* All TIME values must round-trip exactly, including negative durations:
+     * csv_write_time renders a signed ms-of-day as "-HH:MM:SS" / "HH:MM:SS"
+     * with an unbounded hour field, and fast_time now parses that same shape
+     * back (previously the signed cell was a known limitation, read as null). */
     int32_t* t2 = (int32_t*)ray_data(tc);
     TEST_ASSERT_EQ_I(t2[0], times[0]);
-    TEST_ASSERT_TRUE(ray_vec_is_null(tc, 1));   /* negative time → null on read-back */
+    TEST_ASSERT_FALSE(ray_vec_is_null(tc, 1));  /* negative time now round-trips */
+    TEST_ASSERT_EQ_I(t2[1], times[1]);
     TEST_ASSERT_EQ_I(t2[2], times[2]);
 
     ray_release(loaded);
@@ -1544,6 +1546,103 @@ static test_result_t test_csv_resolve_int_width(void) {
     PASS();
 }
 
+typedef struct {
+    int calls;
+    bool cancel_on_first;
+    bool went_backwards;
+    uint64_t last_done;
+    uint64_t last_total;
+} csv_progress_probe_t;
+
+static void csv_progress_probe_cb(const ray_progress_t* p, void* user) {
+    csv_progress_probe_t* probe = (csv_progress_probe_t*)user;
+    if (p->final || p->rows_total == 0) return;
+    if (probe->last_total != 0 &&
+        p->rows_done * probe->last_total < probe->last_done * p->rows_total)
+        probe->went_backwards = true;
+    probe->last_done = p->rows_done;
+    probe->last_total = p->rows_total;
+    probe->calls++;
+    if (probe->cancel_on_first && probe->calls == 1)
+        ray_request_interrupt();
+}
+
+/* Cancellation must be observed while pool workers are inside the CSV row
+ * loop, and cleanup must only inspect initialized strrefs.  Sparse escaped
+ * fields exercise ownership cleanup without turning the fixture into an
+ * allocation benchmark. */
+static test_result_t test_csv_interrupt_mid_parse(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("id,payload\n", f);
+    for (int i = 0; i < 200000; i++) {
+        if ((i % 1000) == 0)
+            fprintf(f, "%d,\"escaped \"\"value\"\" %d\"\n", i, i);
+        else
+            fprintf(f, "%d,payload_%06d\n", i, i);
+    }
+    fclose(f);
+
+    csv_progress_probe_t probe = {.cancel_on_first = true};
+    ray_progress_set_callback(csv_progress_probe_cb, &probe, 1, 1);
+    ray_qstats_set_mode(RAY_QS_PROGRESS);
+    int8_t schema[] = {RAY_I32, RAY_STR};
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, ',', true, schema, 2);
+    bool got_cancel = loaded && RAY_IS_ERR(loaded) &&
+                      strcmp(ray_err_code(loaded), "cancel") == 0;
+
+    if (loaded) ray_release(loaded);
+    ray_progress_end();
+    ray_progress_set_callback(NULL, NULL, 0, 0);
+    ray_qstats_set_mode(0);
+    ray_clear_interrupt();
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+
+    TEST_ASSERT_TRUE(probe.calls > 0);
+    TEST_ASSERT_TRUE(got_cancel);
+    PASS();
+}
+
+/* The row parser is followed by a two-task text finalizer.  That internal
+ * dispatch must not replace n_rows progress with 0/2 and make the visible
+ * percentage jump from complete back to 50%. */
+static test_result_t test_csv_progress_never_goes_backwards(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("payload,symbol\n", f);
+    for (int i = 0; i < 100000; i++)
+        fprintf(f, "long_payload_%06d_for_progress,unique_symbol_%06d\n", i, i);
+    fclose(f);
+
+    csv_progress_probe_t probe = {0};
+    ray_progress_set_callback(csv_progress_probe_cb, &probe, 1, 1);
+    ray_qstats_set_mode(RAY_QS_PROGRESS);
+    int8_t schema[] = {RAY_STR, RAY_SYM};
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, ',', true, schema, 2);
+    bool read_ok = loaded && !RAY_IS_ERR(loaded);
+
+    if (loaded) ray_release(loaded);
+    ray_progress_end();
+    ray_progress_set_callback(NULL, NULL, 0, 0);
+    ray_qstats_set_mode(0);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+
+    TEST_ASSERT_TRUE(read_ok);
+    TEST_ASSERT_TRUE(probe.calls > 0);
+    TEST_ASSERT_FALSE(probe.went_backwards);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1596,5 +1695,7 @@ const test_entry_t csv_entries[] = {
     { "csv/explicit_u8_schema_serial",
                                   test_csv_explicit_u8_schema_serial,      NULL, NULL },
     { "csv/resolve_int_width",    test_csv_resolve_int_width,              NULL, NULL },
+    { "csv/interrupt_mid_parse",  test_csv_interrupt_mid_parse,             NULL, NULL },
+    { "csv/progress_monotonic",   test_csv_progress_never_goes_backwards,   NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

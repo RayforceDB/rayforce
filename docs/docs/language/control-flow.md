@@ -81,7 +81,7 @@ If no error is raised, `try` returns the result of the body expression normally.
 
 ### Fallback value
 
-If the second argument is **not** a function, it is returned as-is as the fallback value on error (evaluated only when the body fails). Because lambdas do not capture closures, this is the only way to surface an outer binding from the failure branch:
+If the second argument is **not** a function, it is returned as-is as the fallback value on error (evaluated only when the body fails):
 
 ```lisp
 ‣ (try (raise "boom") 0)
@@ -92,6 +92,15 @@ If the second argument is **not** a function, it is returned as-is as the fallba
 ```
 
 A handler must accept the single error argument, so only a lambda or a unary builtin is *called* with the error; any other value (including a multi-argument builtin) is treated as a fallback value.
+
+Nested lambdas capture visible lexical bindings when they are created:
+
+```lisp
+‣ (set make-adder (fn [x] (fn [y] (+ x y))))
+‣ (set add7 (make-adder 7))
+‣ (add7 5)
+12
+```
 
 ## Early Return: return
 

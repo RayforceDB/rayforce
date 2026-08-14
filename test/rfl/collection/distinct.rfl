@@ -256,3 +256,45 @@
 (distinct (* "bad" 5))   !- type
 (distinct (round "x"))   !- type
 (distinct (at (sqrt 'foo) 0)) !- type
+
+;; ---- Parallel radix path ----
+;; Vectors of >= 65536 rows route fixed-width types through the
+;; radix-partitioned kernel (distinct_radix_first_ids); everything below
+;; must agree with the small-vector hashset semantics above: value-sorted
+;; output, declared nulls collapsed to one (sentinel sorts first).
+
+;; i64: duplicates spread across the whole vector, null in the tail
+(set big (concat (concat [5 7 5] (take [9] 100000)) (concat [7 3 0Nl] (take [5] 100000))))
+(count big) -- 200006
+(distinct big) -- [0Nl 3 5 7 9]
+;; the fused count(distinct) kernel (OP_COUNT_DISTINCT) must agree with
+;; the materializing kernel — two independent implementations
+(count (distinct big)) -- 5
+;; idempotent on the radix path
+(distinct (distinct big)) -- [0Nl 3 5 7 9]
+;; dedup invariant at radix scale
+(count (distinct big)) -- (count (distinct (concat big big)))
+
+;; f64 with declared nulls: every NaN collapses to a single null
+;; (order of the null among sorted values is comparator-defined for
+;; NaN, so assert cardinality + null survival, not full ordering)
+(set bigf (concat (take [1.5] 80000) (concat [0Nf 2.5 1.5 0Nf] (take [2.5] 80000))))
+(count (distinct bigf)) -- 3
+(count (distinct (concat bigf bigf))) -- 3
+
+;; i32 (cast keeps the null): same values through the 4-byte lane
+(count (distinct (as 'I32 big))) -- 5
+
+;; i16 lane
+(set bigh (concat (take [1h] 70000) (concat [3h 2h] (take [2h] 70000))))
+(distinct bigh) -- [1 2 3]
+
+;; temporal lanes: time (i32) and timestamp (i64)
+(set bigt (concat (take [09:30:00.000] 70000) (concat [09:31:00.000 0Nt] (take [09:30:00.000] 70000))))
+(distinct bigt) -- [0Nt 09:30:00.000 09:31:00.000]
+(set bigp (concat (take [2024.01.01D10:00:00.000000000] 70000) (take [2024.01.02D10:00:00.000000000] 70000)))
+(distinct bigp) -- [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000]
+
+;; exactly at the engage threshold (1 << 16 rows)
+(set edge (concat (take [1] 65535) [2]))
+(distinct edge) -- [1 2]

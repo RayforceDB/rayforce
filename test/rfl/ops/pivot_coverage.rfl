@@ -36,31 +36,25 @@
 (set RTTS (at (select {t: (if x ts ts2) from: TTS}) 't))
 (count RTTS) -- 3
 ;; Value-check: x=[t,f,t] picks ts[0]=100, ts2[1]=20, ts[2]=300.
-(at RTTS 0) -- 100
-(at RTTS 1) -- 20
-(at RTTS 2) -- 300
+(type RTTS) -- 'TIMESTAMP
+(as 'I64 RTTS) -- [100 20 300]
 
 ;; ── 1d. DATE output branch (4-byte temporal) ───────────────────────
 (set TDate (table [x d] (list [1 2 3 4] [2024.01.01 2024.01.02 2024.01.03 2024.01.04])))
-;; if x>2 use d else 2024.01.01; dates as epoch-day I32
+;; if x>2 use d else 2024.01.01; result remains DATE.
 (set RTDate (at (select {r: (if (> x 2) d 2024.01.01) from: TDate}) 'r))
 (count RTDate) -- 4
-;; Value-check: cond=(x>2)=[f,f,t,t] → [01,01,03,04] as epoch-days
-;; (2024.01.01=8766, 2024.01.03=8768, 2024.01.04=8769).
-(at RTDate 0) -- 8766
-(at RTDate 1) -- 8766
-(at RTDate 2) -- 8768
-(at RTDate 3) -- 8769
+;; Value-check: cond=(x>2)=[f,f,t,t] → [01,01,03,04].
+(type RTDate) -- 'DATE
+RTDate -- [2024.01.01 2024.01.01 2024.01.03 2024.01.04]
 
 ;; ── 1e. TIME output branch (4-byte temporal) ───────────────────────
 (set TTime (table [x t] (list [1 2 3] [09:30:00.000 10:00:00.000 11:00:00.000])))
 (set RTTime (at (select {r: (if (> x 1) t 09:30:00.000) from: TTime}) 'r))
 (count RTTime) -- 3
-;; Value-check: cond=(x>1)=[f,t,t] → [09:30,10:00,11:00] as millis
-;; (34200000, 36000000, 39600000).
-(at RTTime 0) -- 34200000
-(at RTTime 1) -- 36000000
-(at RTTime 2) -- 39600000
+;; Value-check: cond=(x>1)=[f,t,t] → [09:30,10:00,11:00].
+(type RTTime) -- 'TIME
+RTTime -- [09:30:00.000 10:00:00.000 11:00:00.000]
 
 ;; ── 1e2. I16 output branch ─────────────────────────────────────────
 ;; A table with two I16 columns; the if projection produces I16 output.
@@ -646,37 +640,26 @@
 
 ;; ====================================================================
 ;; Section 29: exec_if — TIMESTAMP/DATE/TIME output branches
-;;             BUG: These branches (lines 189-209) are UNREACHABLE.
-;;             promote(RAY_TIMESTAMP, RAY_TIMESTAMP) returns RAY_I64
-;;             promote(RAY_DATE, RAY_DATE) returns RAY_I32
-;;             promote(RAY_TIME, RAY_TIME) returns RAY_I32
-;;             so exec_if never enters the TIMESTAMP/DATE/TIME arms.
-;;             These arms handle correct temporal semantics but are dead.
-;;
-;; Verify the current (demoted) behavior:
+;;             IF uses temporal-preserving promotion for matching branch types.
 ;; ====================================================================
 
-;; TIMESTAMP if → actually produces I64 (not TIMESTAMP)
+;; TIMESTAMP if preserves TIMESTAMP output.
 (set TTSdead (table [x ts1 ts2] (list [true false] (as 'TIMESTAMP [100 200]) (as 'TIMESTAMP [10 20]))))
 (set RTSdead (at (select {t: (if x ts1 ts2) from: TTSdead}) 't))
 (count RTSdead) -- 2
-;; Value-check: x=[t,f] picks ts1[0]=100, ts2[1]=20 (demoted to I64 nanos).
-(at RTSdead 0) -- 100
-(at RTSdead 1) -- 20
+(type RTSdead) -- 'TIMESTAMP
+(as 'I64 RTSdead) -- [100 20]
 
-;; DATE if → actually produces I32 (not DATE)
+;; DATE if preserves DATE output.
 (set TDatedead (table [x d1 d2] (list [true false] [2024.01.01 2024.01.02] [2023.01.01 2023.01.02])))
 (set RDatedead (at (select {d: (if x d1 d2) from: TDatedead}) 'd))
 (count RDatedead) -- 2
-;; Value-check: x=[t,f] picks d1[0]=2024.01.01, d2[1]=2023.01.02 (epoch-day I32).
-;; 2024.01.01 epoch-day = 8766; 2023.01.02 = 8766-365+1 = 8402.
-(at RDatedead 0) -- 8766
-(at RDatedead 1) -- 8402
+(type RDatedead) -- 'DATE
+RDatedead -- [2024.01.01 2023.01.02]
 
-;; TIME if → actually produces I32 (not TIME)
+;; TIME if preserves TIME output.
 (set TTimedead (table [x t1 t2] (list [true false] [09:30:00.000 10:00:00.000] [08:00:00.000 11:00:00.000])))
 (set RTimedead (at (select {t: (if x t1 t2) from: TTimedead}) 't))
 (count RTimedead) -- 2
-;; Value-check: x=[t,f] picks t1[0]=09:30 (34200000ms), t2[1]=11:00 (39600000ms).
-(at RTimedead 0) -- 34200000
-(at RTimedead 1) -- 39600000
+(type RTimedead) -- 'TIME
+RTimedead -- [09:30:00.000 11:00:00.000]

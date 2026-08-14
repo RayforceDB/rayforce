@@ -24,11 +24,13 @@
 /**   I/O builtins, type casting, and misc builtins extracted from eval.c.
  */
 
+#include <errno.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "vec/vec.h"
+#include "vec/str.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
 #include "core/pool.h"
@@ -505,8 +507,13 @@ static int8_t resolve_type_name(int64_t sym_id) {
     else if (len == 3 && memcmp(name, "F64", 3) == 0) result = RAY_F64;
     else if (len == 2 && memcmp(name, "B8", 2) == 0) result = RAY_BOOL;
     else if (len == 2 && memcmp(name, "U8", 2) == 0) result = RAY_U8;
+    else if (len == 3 && memcmp(name, "SYM", 3) == 0) result = RAY_SYM;
     else if (len == 6 && memcmp(name, "SYMBOL", 6) == 0) result = RAY_SYM;
     else if (len == 3 && memcmp(name, "STR", 3) == 0) result = RAY_STR;
+    /* CSV cells are scalar text, so the historical LIST schema spelling is
+     * materialized as the native packed STR column rather than a boxed list.
+     * This keeps schemas copied from older table displays loadable. */
+    else if (len == 4 && memcmp(name, "LIST", 4) == 0) result = RAY_STR;
     else if (len == 3 && memcmp(name, "F32", 3) == 0) result = RAY_F32;
     else if (len == 4 && memcmp(name, "DATE", 4) == 0) result = RAY_DATE;
     else if (len == 4 && memcmp(name, "TIME", 4) == 0) result = RAY_TIME;
@@ -1325,7 +1332,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     if (cast_match(tname, tlen, "I64") || cast_match(tname, tlen, "i64")) {
         ray_release(s);
         if (val->type == -RAY_I64) { ray_retain(val); return val; }
-        if (val->type == -RAY_F64) return make_i64((int64_t)val->f64);
+        if (val->type == -RAY_F64) return make_i64(ray_cast_f64_to_i64_null(val->f64));
         if (val->type == -RAY_BOOL) return make_i64(val->b8 ? 1 : 0);
         if (val->type == -RAY_I32 || val->type == -RAY_DATE || val->type == -RAY_TIME)
             return make_i64(val->i32);
@@ -1336,8 +1343,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as i64");
             char* end;
+            errno = 0;
             int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i64");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i64, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i64, value out of int64 range");
             return make_i64(v);
         }
         /* Vector/list cast */
@@ -1353,13 +1365,18 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_U8)  return ray_i32((int32_t)val->u8);
         if (val->type == -RAY_I16) return ray_i32(val->i16);
         if (val->type == -RAY_I64) return ray_i32((int32_t)val->i64);
-        if (val->type == -RAY_F64) return ray_i32((int32_t)val->f64);
+        if (val->type == -RAY_F64) return ray_i32(ray_cast_f64_to_i32_null(val->f64));
         if (val->type == -RAY_DATE || val->type == -RAY_TIME) return ray_i32(val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_i32((int32_t)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
+            errno = 0;
             long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i32");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i32, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i32, value out of int64 range");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
@@ -1375,13 +1392,18 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_U8)  return ray_i16((int16_t)val->u8);
         if (val->type == -RAY_I32) return ray_i16((int16_t)val->i32);
         if (val->type == -RAY_I64) return ray_i16((int16_t)val->i64);
-        if (val->type == -RAY_F64) return ray_i16((int16_t)val->f64);
+        if (val->type == -RAY_F64) return ray_i16(ray_cast_f64_to_i16_null(val->f64));
         if (val->type == -RAY_DATE || val->type == -RAY_TIME) return ray_i16((int16_t)val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_i16((int16_t)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
+            errno = 0;
             long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i16");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as i16, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as i16, value out of int64 range");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
@@ -1404,8 +1426,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as f64");
             char* end;
+            errno = 0;
             double v = strtod(sp, &end);
             if (end == sp) return ray_error("domain", "as: cannot parse str as f64");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as f64, unexpected trailing characters");
             /* STAGE 2 (ingest/cast STR→F64): canonicalize at the ingest entry
              * point.  strtod("inf")/strtod("1e400")/strtod("nan") would yield a
              * non-finite F64; make_f64 maps every non-finite to NULL_F64 (0Nf),
@@ -1549,22 +1574,52 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_date((int64_t)val->i16);
         if (val->type == -RAY_I32) return ray_date((int64_t)val->i32);
         if (val->type == -RAY_I64) return ray_date(val->i64);
-        if (val->type == -RAY_F64) return ray_date((int64_t)val->f64);
+        if (val->type == -RAY_F64) return ray_date(ray_cast_f64_to_i32_null(val->f64));
         if (val->type == -RAY_TIME) return ray_date((int64_t)val->i32);
         if (val->type == -RAY_TIMESTAMP) return ray_date(ts_days_floor(val->i64));
         if (val->type == -RAY_STR) {
-            /* Parse "YYYY.MM.DD" format */
+            /* Parse "YYYY.MM.DD" with a bounded cursor that must consume the
+             * whole string.  The old sscanf path accepted trailing garbage
+             * ("2024.01.02junk") and, worse, never range-checked the month:
+             * a month > 13 drove the days-in-month table index out of bounds
+             * — e.g. (as 'DATE "9999.99.99") read md[99] (ASan OOB). Validate
+             * the month BEFORE indexing the table, and the day against the
+             * actual days in that (possibly leap) month. Mirrors the strict
+             * TIMESTAMP string cast. */
             const char* sp = ray_str_ptr(val);
-            int y, m, d2;
-            if (sscanf(sp, "%d.%d.%d", &y, &m, &d2) != 3) return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            size_t sl = ray_str_len(val);
+            size_t i = 0;
+            int y = 0, m = 0, d2 = 0;
+            #define DT_DIGITS(w, out) do {                                                 \
+                (out) = 0;                                                                 \
+                for (int _k = 0; _k < (w); _k++) {                                         \
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')                             \
+                        return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD"); \
+                    (out) = (out) * 10 + (sp[i] - '0'); i++;                               \
+                }                                                                         \
+            } while (0)
+            DT_DIGITS(4, y);
+            if (i >= sl || sp[i] != '.') return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            i++;
+            DT_DIGITS(2, m);
+            if (i >= sl || sp[i] != '.') return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
+            i++;
+            DT_DIGITS(2, d2);
+            if (i != sl) return ray_error("domain", "as: cannot parse str as date, unexpected trailing characters");
+            #undef DT_DIGITS
+            static const int dt_md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            if (m < 1 || m > 12)
+                return ray_error("domain", "as: cannot parse str as date, month out of range");
+            int mdays = dt_md[m] + (m == 2 && leap ? 1 : 0);
+            if (d2 < 1 || d2 > mdays)
+                return ray_error("domain", "as: cannot parse str as date, day out of range for month");
             int64_t days = 0;
             { int ty;
               for (ty = 2000; ty < y; ty++) days += (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
               for (ty = y; ty < 2000; ty++) days -= (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
             }
-            { static const int md2[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-              int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-              for (int mi = 1; mi < m; mi++) days += md2[mi] + (mi == 2 && leap ? 1 : 0);
+            { for (int mi = 1; mi < m; mi++) days += dt_md[mi] + (mi == 2 && leap ? 1 : 0);
               days += d2 - 1;
             }
             return ray_date(days);
@@ -1583,7 +1638,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_time((int64_t)val->i16);
         if (val->type == -RAY_I32) return ray_time((int64_t)val->i32);
         if (val->type == -RAY_I64) return ray_time(val->i64);
-        if (val->type == -RAY_F64) return ray_time((int64_t)val->f64);
+        if (val->type == -RAY_F64) return ray_time(ray_cast_f64_to_i32_null(val->f64));
         if (val->type == -RAY_DATE) return ray_time((int64_t)val->i32);
         if (val->type == -RAY_TIMESTAMP)
             /* TIMESTAMP is ns since epoch; TIME stores ms-of-day.  Use
@@ -1592,21 +1647,60 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
              * matching wall-clock semantics. */
             return ray_time((int64_t)(ts_ns_in_day(val->i64) / 1000000LL));
         if (val->type == -RAY_STR) {
-            /* Parse "HH:MM:SS[.mmm]" */
+            /* Parse "[-]HH:MM[:SS][.fff]" with a bounded cursor that must
+             * consume the whole string.  TIME is a signed duration — ms-of-day
+             * can exceed a day and go negative (see .csv.read round-tripping) —
+             * so the hour field is variable width and unbounded, but minutes
+             * and seconds are 0-59.  The old sscanf path accepted trailing
+             * garbage ("12:34:56junk") and out-of-range fields ("25:99:99" →
+             * 26:40:39), silently corrupting the value; mirror the strict DATE
+             * / TIMESTAMP string casts. */
             const char* sp = ray_str_ptr(val);
-            int th = 0, tm = 0, ts = 0, tms = 0;
-            int nr = sscanf(sp, "%d:%d:%d", &th, &tm, &ts);
-            if (nr < 2) return ray_error("domain", "as: cannot parse str as time, expected HH:MM:SS[.mmm]");
-            const char* dot = strchr(sp, '.');
-            if (dot) {
-                dot++;
+            size_t sl = ray_str_len(val);
+            size_t i = 0;
+            int64_t sign = 1;
+            if (i < sl && sp[i] == '-') { sign = -1; i++; }
+            /* Variable-width hour, >= 1 digit, capped so ms cannot overflow. */
+            if (i >= sl || sp[i] < '0' || sp[i] > '9')
+                return ray_error("domain", "as: cannot parse str as time, expected [-]HH:MM[:SS][.fff]");
+            int64_t hh = 0;
+            int hd = 0;
+            while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                hh = hh * 10 + (sp[i] - '0'); i++;
+                if (++hd > 7) return ray_error("domain", "as: cannot parse str as time, hour field too long");
+            }
+            /* Read exactly 2 digits into `out`, validate 0..59. */
+            #define TM_2DIGIT(out) do {                                                       \
+                if (i + 1 >= sl || sp[i] < '0' || sp[i] > '9' || sp[i+1] < '0' || sp[i+1] > '9') \
+                    return ray_error("domain", "as: cannot parse str as time, expected 2-digit field"); \
+                (out) = (sp[i]-'0')*10 + (sp[i+1]-'0'); i += 2;                              \
+                if ((out) > 59) return ray_error("domain", "as: cannot parse str as time, minute/second out of range"); \
+            } while (0)
+            if (i >= sl || sp[i] != ':')
+                return ray_error("domain", "as: cannot parse str as time, expected ':' after hour");
+            i++;
+            int mm = 0, ss = 0, tms = 0;
+            TM_2DIGIT(mm);
+            if (i < sl && sp[i] == ':') { i++; TM_2DIGIT(ss); }
+            #undef TM_2DIGIT
+            /* Optional fractional seconds → milliseconds; a bare trailing '.'
+             * is accepted as .000. */
+            if (i < sl && sp[i] == '.') {
+                i++;
                 char mbuf[4] = "000";
                 int mi = 0;
-                while (*dot >= '0' && *dot <= '9' && mi < 3) mbuf[mi++] = *dot++;
+                while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                    if (mi < 3) mbuf[mi++] = sp[i];
+                    i++;
+                }
                 tms = (int)strtol(mbuf, NULL, 10);
             }
-            int32_t ms = (int32_t)th * 3600000 + (int32_t)tm * 60000 + (int32_t)ts * 1000 + tms;
-            return ray_time((int64_t)ms);
+            if (i != sl)
+                return ray_error("domain", "as: cannot parse str as time, unexpected trailing characters");
+            int64_t ms = sign * (hh * 3600000LL + (int64_t)mm * 60000LL + (int64_t)ss * 1000LL + tms);
+            if (ms > INT32_MAX || ms < INT32_MIN)
+                return ray_error("domain", "as: cannot parse str as time, out of int32 millisecond range");
+            return ray_time(ms);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
@@ -1622,79 +1716,128 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_timestamp((int64_t)val->i16);
         if (val->type == -RAY_I32) return ray_timestamp((int64_t)val->i32);
         if (val->type == -RAY_I64) return ray_timestamp(val->i64);
-        if (val->type == -RAY_F64) return ray_timestamp((int64_t)val->f64);
+        if (val->type == -RAY_F64) return ray_timestamp(ray_cast_f64_to_i64_null(val->f64));
         if (val->type == -RAY_TIME) return ray_timestamp((int64_t)val->i32);
         if (val->type == -RAY_DATE) {
             int64_t days = val->i32;
             return ray_timestamp(days * 24LL * 60 * 60 * 1000000000LL);
         }
-        /* ISO string -> timestamp: "YYYY-MM-DD[T ]HH:MM:SS[.nnn...]" or "YYYY.MM.DDDHH:MM:SS.nnn..." */
+        /* ISO string -> timestamp.  Parse the whole value with a bounded
+         * cursor and require it to reach the end of the string.  A partial
+         * or trailing-garbage match must be REJECTED — otherwise malformed
+         * input is silently cast to a valid-but-wrong timestamp, the exact
+         * data-corruption class this parser guards against.  Grammar:
+         *   YYYY<sep>MM<sep>DD [ (T|' '|D) HH:MM[:SS][.frac] [Z|(+|-)HH[:]?MM] ]
+         * where <sep> is '-' or '.' and is consistent within the date. */
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 10) return ray_error("domain", "as: cannot parse str as timestamp, too short, got %lld chars", (long long)sl);
-            int y, m, d, hh = 0, mm = 0, ss = 0;
-            long long frac = 0;
-            /* Try both formats: YYYY-MM-DD and YYYY.MM.DD */
-            int parsed = sscanf(sp, "%d-%d-%d", &y, &m, &d);
-            /* parse date: try YYYY-MM-DD then YYYY.MM.DD */
-            if (parsed != 3) {
-                parsed = sscanf(sp, "%d.%d.%d", &y, &m, &d);
-                /* YYYY.MM.DD format */
-            }
-            if (parsed != 3) return ray_error("domain", "as: cannot parse str as timestamp, expected YYYY-MM-DD or YYYY.MM.DD");
-            /* Parse optional time part */
-            if (sl > 10 && (sp[10] == 'T' || sp[10] == ' ' || sp[10] == 'D')) {
-                sscanf(sp + 11, "%d:%d:%d", &hh, &mm, &ss);
-                /* Parse fractional seconds */
-                const char* dot = memchr(sp + 11, '.', sl - 11);
-                if (dot) {
-                    dot++;
+            size_t i = 0;
+            int y = 0, m = 0, d = 0, hh = 0, mm = 0, ss = 0;
+            long long frac = 0, tz_ns = 0;
+
+            /* Read exactly `w` digits (0-9) into `out`, or fail. */
+            #define TS_DIGITS(w, out) do {                                                     \
+                (out) = 0;                                                                     \
+                for (int _k = 0; _k < (w); _k++) {                                             \
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')                                 \
+                        return ray_error("domain", "as: cannot parse str as timestamp, expected %d-digit field at offset %lld", (w), (long long)i); \
+                    (out) = (out) * 10 + (sp[i] - '0'); i++;                                   \
+                }                                                                             \
+            } while (0)
+
+            TS_DIGITS(4, y);
+            if (i >= sl || (sp[i] != '-' && sp[i] != '.'))
+                return ray_error("domain", "as: cannot parse str as timestamp, expected '-' or '.' date separator");
+            char dsep = sp[i]; i++;
+            TS_DIGITS(2, m);
+            if (i >= sl || sp[i] != dsep)
+                return ray_error("domain", "as: cannot parse str as timestamp, inconsistent date separator");
+            i++;
+            TS_DIGITS(2, d);
+            if (m < 1 || m > 12 || d < 1)
+                return ray_error("domain", "as: cannot parse str as timestamp, date component out of range");
+            static const int ts_md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            int mdays = ts_md[m] + (m == 2 && leap ? 1 : 0);
+            if (d > mdays)
+                return ray_error("domain", "as: cannot parse str as timestamp, date component out of range");
+
+            if (i < sl) {
+                /* date/time separator: T, space, or D (kdb literal form) */
+                if (sp[i] != 'T' && sp[i] != ' ' && sp[i] != 'D')
+                    return ray_error("domain", "as: cannot parse str as timestamp, expected 'T', ' ', or 'D' between date and time");
+                i++;
+                TS_DIGITS(2, hh);
+                if (i >= sl || sp[i] != ':')
+                    return ray_error("domain", "as: cannot parse str as timestamp, expected ':' after hour");
+                i++;
+                TS_DIGITS(2, mm);
+                if (i < sl && sp[i] == ':') { i++; TS_DIGITS(2, ss); }
+                if (hh > 23 || mm > 59 || ss > 59)
+                    return ray_error("domain", "as: cannot parse str as timestamp, time component out of range");
+                /* optional fractional seconds: at least one digit; up to 9
+                 * are kept (right-padded), any beyond are consumed. */
+                if (i < sl && sp[i] == '.') {
+                    i++;
+                    if (i >= sl || sp[i] < '0' || sp[i] > '9')
+                        return ray_error("domain", "as: cannot parse str as timestamp, expected fractional digits after '.'");
                     char fbuf[10] = "000000000";
                     int fi = 0;
-                    while (*dot >= '0' && *dot <= '9' && fi < 9) fbuf[fi++] = *dot++;
+                    while (i < sl && sp[i] >= '0' && sp[i] <= '9') {
+                        if (fi < 9) fbuf[fi++] = sp[i];
+                        i++;
+                    }
                     frac = strtoll(fbuf, NULL, 10);
                 }
+                /* optional timezone: Z | (+|-)HH[:]?MM */
+                if (i < sl) {
+                    if (sp[i] == 'Z' || sp[i] == 'z') {
+                        i++;
+                    } else if (sp[i] == '+' || sp[i] == '-') {
+                        int tz_sign = (sp[i] == '+') ? 1 : -1; i++;
+                        int tz_hh = 0, tz_mm = 0;
+                        TS_DIGITS(2, tz_hh);
+                        if (i < sl && sp[i] == ':') i++;   /* optional ':' */
+                        TS_DIGITS(2, tz_mm);
+                        if (tz_hh > 23 || tz_mm > 59)
+                            return ray_error("domain", "as: cannot parse str as timestamp, timezone offset out of range");
+                        tz_ns = (long long)tz_sign *
+                                ((long long)tz_hh * 3600 + (long long)tz_mm * 60) * 1000000000LL;
+                    } else {
+                        return ray_error("domain", "as: cannot parse str as timestamp, unexpected trailing characters");
+                    }
+                }
             }
+            if (i != sl)
+                return ray_error("domain", "as: cannot parse str as timestamp, unexpected trailing characters");
+            #undef TS_DIGITS
+
             /* Convert to days since 2000-01-01 */
             int64_t days = 0;
             { int ty;
               for (ty = 2000; ty < y; ty++) days += (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
               for (ty = y; ty < 2000; ty++) days -= (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
             }
-            { static const int md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-              int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-              for (int mi = 1; mi < m; mi++) days += md[mi] + (mi == 2 && leap ? 1 : 0);
+            {
+              for (int mi = 1; mi < m; mi++) days += ts_md[mi] + (mi == 2 && leap ? 1 : 0);
               days += d - 1;
             }
-            int64_t ns = days * 86400000000000LL + (int64_t)hh * 3600000000000LL +
-                         (int64_t)mm * 60000000000LL + (int64_t)ss * 1000000000LL + frac;
-            /* Handle timezone offset: Z, +HH:MM, -HH:MM, +HHMM, -HHMM */
-            if (sl > 19) {
-                const char* tz = sp + 19; /* after YYYY-MM-DDTHH:MM:SS */
-                /* Skip fractional seconds */
-                if (tz < sp + sl && *tz == '.') {
-                    tz++;
-                    while (tz < sp + sl && *tz >= '0' && *tz <= '9') tz++;
-                }
-                if (tz < sp + sl) {
-                    if (*tz == 'Z') {
-                        /* UTC, no adjustment */
-                    } else if (*tz == '+' || *tz == '-') {
-                        int tz_sign = (*tz == '+') ? 1 : -1;
-                        int tz_hh = 0, tz_mm = 0;
-                        tz++;
-                        /* Parse HH:MM or HHMM */
-                        if (tz + 4 < sp + sl && tz[2] == ':') {
-                            sscanf(tz, "%2d:%2d", &tz_hh, &tz_mm);
-                        } else {
-                            sscanf(tz, "%2d%2d", &tz_hh, &tz_mm);
-                        }
-                        int64_t tz_ns = ((int64_t)tz_hh * 3600 + (int64_t)tz_mm * 60) * 1000000000LL;
-                        ns -= tz_sign * tz_ns;
-                    }
-                }
-            }
+            const int64_t ns_per_day = 86400000000000LL;
+            if (days > INT64_MAX / ns_per_day || days < INT64_MIN / ns_per_day)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            int64_t day_ns = days * ns_per_day;
+            int64_t tod_ns = (int64_t)hh * 3600000000000LL +
+                             (int64_t)mm * 60000000000LL + (int64_t)ss * 1000000000LL + frac;
+            if (day_ns > INT64_MAX - tod_ns)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            int64_t ns = day_ns + tod_ns;
+            /* Timezone offset converts local wall-clock to UTC. */
+            if (tz_ns > 0 && ns < INT64_MIN + tz_ns)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            if (tz_ns < 0 && ns > INT64_MAX + tz_ns)
+                return ray_error("domain", "as: timestamp out of int64 nanosecond range");
+            ns -= tz_ns;
             return ray_timestamp(ns);
         }
         /* Vector cast */
@@ -1707,19 +1850,37 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         ray_release(s);
         if (val->type == -RAY_GUID) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
-            /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
+            /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+             * Require the canonical hyphenated form exactly: 32 hex
+             * nibbles with the four dashes at offsets 8/13/18/23.  The old
+             * parser skipped '-' anywhere and decoded any character as a
+             * nibble, so non-hex garbage (e.g. all-'z') silently produced a
+             * wrong-but-valid GUID. */
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
+            if (sl != 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
             uint8_t bytes[16];
-            const char* p = sp;
-            for (int bi = 0; bi < 16; bi++) {
-                if (*p == '-') p++;
-                char hi = *p++;
-                char lo = *p++;
-                int h = (hi >= 'a') ? hi - 'a' + 10 : (hi >= 'A') ? hi - 'A' + 10 : hi - '0';
-                int l = (lo >= 'a') ? lo - 'a' + 10 : (lo >= 'A') ? lo - 'A' + 10 : lo - '0';
-                bytes[bi] = (uint8_t)((h << 4) | l);
+            int nib = 0;
+            for (size_t j = 0; j < sl; j++) {
+                char c = sp[j];
+                /* Offsets 8/13/18/23 MUST be the dash; every other position
+                 * MUST be a hex digit.  This is position-driven (rather than
+                 * "reject a misplaced dash") so the 32 non-dash positions are
+                 * exactly 32 nibbles — nib never exceeds 31 and bytes[nib>>1]
+                 * cannot run past bytes[16]. */
+                if (j == 8 || j == 13 || j == 18 || j == 23) {
+                    if (c != '-')
+                        return ray_error("domain", "as: cannot parse str as guid, expected '-' at offset %lld", (long long)j);
+                    continue;
+                }
+                int v;
+                if (c >= '0' && c <= '9')        v = c - '0';
+                else if (c >= 'a' && c <= 'f')   v = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F')   v = c - 'A' + 10;
+                else return ray_error("domain", "as: cannot parse str as guid, non-hex character '%c'", c);
+                if ((nib & 1) == 0) bytes[nib >> 1] = (uint8_t)(v << 4);
+                else                bytes[nib >> 1] |= (uint8_t)v;
+                nib++;
             }
             return ray_guid(bytes);
         }
@@ -1755,11 +1916,16 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I16) return ray_u8((uint8_t)val->i16);
         if (val->type == -RAY_I32) return ray_u8((uint8_t)val->i32);
         if (val->type == -RAY_I64) return ray_u8((uint8_t)val->i64);
-        if (val->type == -RAY_F64) return ray_u8((uint8_t)val->f64);
+        if (val->type == -RAY_F64) return ray_u8(ray_cast_f64_to_u8_null(val->f64));
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
-            char* end; long v = strtol(sp, &end, 10);
+            char* end; errno = 0;
+            long v = strtol(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as u8");
+            if (*end != '\0')
+                return ray_error("domain", "as: cannot parse str as u8, unexpected trailing characters");
+            if (errno == ERANGE)
+                return ray_error("domain", "as: cannot parse str as u8, value out of int64 range");
             return ray_u8((uint8_t)v);
         }
         /* Vector cast */
@@ -1831,27 +1997,49 @@ ray_t* ray_type_fn(ray_t* val) {
     return ray_sym(id);
 }
 
-/* (read path) — read a file's contents as a string */
-ray_t* ray_read_file_fn(ray_t* path_obj) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", "read: path must be str, got %s", ray_type_name(path_obj->type));
+static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
+    if (path_obj->type != -RAY_STR)
+        return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", "read: empty path");
+    if (!path || ray_str_len(path_obj) == 0)
+        return ray_error("domain", "%s: empty path", op);
+
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return ray_error("io", NULL); }
     long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
     if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
-    /* Use ray_alloc for the buffer */
-    ray_t* buf = ray_alloc((size_t)sz + 1);
-    if (!buf || RAY_IS_ERR(buf)) { fclose(fp); return ray_error("oom", NULL); }
-    char* data = (char*)ray_data(buf);
-    size_t rd = fread(data, 1, (size_t)sz, fp);
-    fclose(fp);
-    data[rd] = '\0';
-    ray_t* result = ray_str(data, rd);
-    ray_release(buf);
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return ray_error("io", NULL); }
+
+    ray_t* result = ray_vec_new(RAY_U8, (int64_t)sz);
+    if (!result || RAY_IS_ERR(result)) {
+        fclose(fp);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = (int64_t)sz;
+
+    size_t rd = sz > 0 ? fread(ray_data(result), 1, (size_t)sz, fp) : 0;
+    int close_rc = fclose(fp);
+    if (rd != (size_t)sz || close_rc != 0) {
+        ray_release(result);
+        return ray_error("io", NULL);
+    }
     return result;
+}
+
+/* (read path) — read a file's contents as a string */
+ray_t* ray_read_file_fn(ray_t* path_obj) {
+    ray_t* bytes = read_file_bytes(path_obj, "read");
+    if (RAY_IS_ERR(bytes)) return bytes;
+
+    ray_t* result = ray_str((const char*)ray_data(bytes), (size_t)bytes->len);
+    ray_release(bytes);
+    return result;
+}
+
+/* (read-bytes path) — read a file's contents as a U8 byte vector */
+ray_t* ray_read_bytes_fn(ray_t* path_obj) {
+    return read_file_bytes(path_obj, "read-bytes");
 }
 
 /* (load path) — read and evaluate a Rayfall script file via mmap */
@@ -1922,20 +2110,37 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 #endif
 }
 
-/* (write path content) — write string to a file */
-ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", "write: path must be str, got %s", ray_type_name(path_obj->type));
-    if (content->type != -RAY_STR) return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
+static ray_t* write_file_data(ray_t* path_obj, const void* data, size_t len,
+                              const char* op) {
+    if (path_obj->type != -RAY_STR)
+        return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    const char* data = ray_str_ptr(content);
-    size_t len = ray_str_len(content);
-    if (!path || !data) return ray_error("domain", "write: empty path or content");
+    if (!path || ray_str_len(path_obj) == 0)
+        return ray_error("domain", "%s: empty path", op);
+    if (len > 0 && !data) return ray_error("domain", "%s: invalid content", op);
+
     FILE* fp = fopen(path, "wb");
     if (!fp) return ray_error("io", NULL);
-    size_t written = fwrite(data, 1, len, fp);
-    fclose(fp);
-    if (written != len) return ray_error("io", NULL);
+    size_t written = len > 0 ? fwrite(data, 1, len, fp) : 0;
+    int close_rc = fclose(fp);
+    if (written != len || close_rc != 0) return ray_error("io", NULL);
     return make_i64(0);
+}
+
+/* (write path content) — write a string to a file */
+ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
+    if (content->type != -RAY_STR)
+        return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
+    return write_file_data(path_obj, ray_str_ptr(content), ray_str_len(content),
+                           "write");
+}
+
+/* (write-bytes path content) — write a U8 byte vector to a file */
+ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content) {
+    if (content->type != RAY_U8)
+        return ray_error("type", "write-bytes: content must be U8, got %s", ray_type_name(content->type));
+    return write_file_data(path_obj, ray_data(content), (size_t)content->len,
+                           "write-bytes");
 }
 
 /* ══════════════════════════════════════════
@@ -2323,7 +2528,7 @@ static inline uint64_t hash_i64(int64_t v) {
  * the existing path is degenerate for composite multi-key composites.
  * Uses the canonical wyhash helpers from ops/hash.h, same as the
  * pivot / datalog / join hashers. */
-static uint64_t atom_hash(ray_t* a) {
+uint64_t ray_atom_hash(ray_t* a) {
     /* List-element position: elements may be a bare C NULL (ray_list_set stores
      * NULL unretained; ray_list_get is out-of-range), mirroring atom_eq's
      * C-NULL-tolerant element handling — so keep the !a guard, not RAY_ASSERT_VALUE. */
@@ -2348,7 +2553,7 @@ static uint64_t atom_hash(ray_t* a) {
             /* Seed with len so [] and a list of zeros differ. */
             uint64_t h = ray_hash_i64(n);
             for (int64_t i = 0; i < n; i++)
-                h = ray_hash_combine(h, atom_hash(elems[i]));
+                h = ray_hash_combine(h, ray_atom_hash(elems[i]));
             return h;
         }
         default:
@@ -2378,12 +2583,23 @@ static uint64_t ght_i64_hash_gi(uint32_t gi, void* ctx) {
     return hash_i64(c->gvals[gi]);
 }
 
+typedef struct {
+    const ray_str_t* desc;
+    const char* pool;
+    const int64_t* gvals;
+} ght_str_ctx_t;
+
+static uint64_t ght_str_hash_gi(uint32_t gi, void* ctx) {
+    ght_str_ctx_t* c = (ght_str_ctx_t*)ctx;
+    return ray_str_t_hash32(&c->desc[c->gvals[gi]], c->pool);
+}
+
 /* Context for the LIST-path rehash: gkeys holds atom pointers for each
  * unique group (one slot per gi), recomputed on grow via atom_hash. */
 typedef struct { ray_t** gkeys; } ght_list_ctx_t;
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
-    return atom_hash(c->gkeys[gi]);
+    return ray_atom_hash(c->gkeys[gi]);
 }
 
 /* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
@@ -2453,12 +2669,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         return ray_dict_new(keys, vals);
     }
 
-    /* Collect unique values; the scalar / RAY_GUID / RAY_LIST paths
-     * grow these arrays on demand (group_grow / group_grow_listkeys).
-     * The RAY_STR path below still caps at this initial size — its
-     * side buffer isn't yet wired into a grow helper, but the cap is
-     * unreachable in practice (RAY_STR is char-vector, ≤256 distinct
-     * 1-byte chars).  Starting at 1024 keeps the initial alloc cheap. */
+    /* Collect unique values.  Every path grows these arrays on demand;
+     * starting at 1024 keeps the initial allocation cheap. */
     int64_t max_groups = n < 1024 ? n : 1024;
     ray_t* val_block = ray_alloc((size_t)(max_groups * sizeof(int64_t)));
     if (RAY_IS_ERR(val_block)) return val_block;
@@ -2491,7 +2703,7 @@ ray_t* ray_group_indices_fn(ray_t* x) {
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
-            uint64_t h = atom_hash(elem);
+            uint64_t h = ray_atom_hash(elem);
             uint32_t slot = (uint32_t)(h & ht.mask);
             uint32_t gi_found = GHT_EMPTY;
             while (ht.slots[slot] != GHT_EMPTY) {
@@ -2636,66 +2848,97 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         return ray_dict_new(keys_vec, vals_lst);
     }
 
-    /* RAY_STR: string-based grouping using ray_str_vec_get */
+    /* RAY_STR: descriptor hashing plus collision-safe content equality.
+     * Pooled descriptors reuse their cached hash, so grouping digest keys
+     * does not reread 32/64-byte payloads merely to locate the hash slot. */
     if (x->type == RAY_STR) {
-        /* Store group keys as (ptr, len) pairs -- use a scratch block for strings */
-        ray_t* skblock = ray_alloc((size_t)(max_groups * sizeof(ray_t*)));
-        if (RAY_IS_ERR(skblock)) { ray_free(val_block); ray_free(ivblock); return skblock; }
-        ray_t** str_keys = (ray_t**)ray_data(skblock);
+        ray_t* owner = x;
+        int64_t off = 0;
+        if (x->attrs & RAY_ATTR_SLICE) {
+            owner = x->slice_parent;
+            off = x->slice_offset;
+        }
+        const ray_str_t* desc = (const ray_str_t*)ray_data(owner) + off;
+        const char* pool = (owner->str_pool && !RAY_IS_ERR(owner->str_pool))
+                         ? (const char*)ray_data(owner->str_pool) : NULL;
+
+        group_ht_t ht;
+        uint32_t seed_cap = (uint32_t)(n < 64 ? 64 : (n < 1048576 ? (n * 2) : 2097152));
+        if (!group_ht_init(&ht, seed_cap)) {
+            ray_free(val_block); ray_free(ivblock);
+            return ray_error("oom", NULL);
+        }
+        ght_str_ctx_t sctx = { .desc = desc, .pool = pool, .gvals = gvals };
 
         for (int64_t i = 0; i < n; i++) {
-            size_t slen = 0;
-            const char* sp = ray_str_vec_get(x, i, &slen);
-
-            int64_t gi = -1;
-            for (int64_t g = 0; g < ngroups; g++) {
-                size_t gsl = ray_str_len(str_keys[g]);
-                const char* gsp = ray_str_ptr(str_keys[g]);
-                if (gsl == slen && (slen == 0 || memcmp(gsp, sp, slen) == 0)) {
-                    gi = g; break;
+            const ray_str_t* cur = &desc[i];
+            uint64_t h = ray_str_t_hash32(cur, pool);
+            uint32_t slot = (uint32_t)(h & ht.mask);
+            uint32_t gi_found = GHT_EMPTY;
+            while (ht.slots[slot] != GHT_EMPTY) {
+                uint32_t gi = ht.slots[slot];
+                if (ray_str_t_eq(&desc[gvals[gi]], pool, cur, pool)) {
+                    gi_found = gi;
+                    break;
                 }
+                slot = (slot + 1) & ht.mask;
             }
-            if (gi < 0) {
+
+            int64_t gi;
+            if (gi_found != GHT_EMPTY) {
+                gi = gi_found;
+            } else {
                 if (ngroups >= max_groups) {
-                    for (int64_t g = 0; g < ngroups; g++) {
-                        ray_release(str_keys[g]);
-                        ray_release(idx_vecs[g]);
+                    if (!group_grow(&val_block, &ivblock, &gvals, &idx_vecs,
+                                    ngroups, &max_groups)) {
+                        for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+                        group_ht_free(&ht);
+                        ray_free(val_block); ray_free(ivblock);
+                        return ray_error("oom", NULL);
                     }
-                    ray_free(val_block); ray_free(ivblock); ray_free(skblock);
-                    return ray_error("limit", NULL);
+                    sctx.gvals = gvals;
                 }
                 gi = ngroups++;
-                str_keys[gi] = ray_str(sp ? sp : "", slen);
+                gvals[gi] = i;
                 idx_vecs[gi] = ray_vec_new(RAY_I64, 0);
+                ht.slots[slot] = (uint32_t)gi;
+                ht.count++;
+                if (ht.count * 2 > ht.cap) {
+                    if (!group_ht_grow(&ht, ght_str_hash_gi, &sctx)) {
+                        for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+                        group_ht_free(&ht);
+                        ray_free(val_block); ray_free(ivblock);
+                        return ray_error("oom", NULL);
+                    }
+                }
             }
             idx_vecs[gi] = ray_vec_append(idx_vecs[gi], &i);
         }
+        group_ht_free(&ht);
 
-        /* Build dict: keys as RAY_STR vec from str_keys, vals as LIST of idx vecs. */
+        /* Build keys from each group's first source row, preserving encounter order. */
         ray_t* keys_vec = ray_vec_new(RAY_STR, ngroups);
         if (RAY_IS_ERR(keys_vec)) {
-            for (int64_t g = 0; g < ngroups; g++) {
-                ray_release(str_keys[g]);
-                ray_release(idx_vecs[g]);
-            }
-            ray_free(val_block); ray_free(ivblock); ray_free(skblock);
+            for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+            ray_free(val_block); ray_free(ivblock);
             return ray_error("oom", NULL);
         }
         for (int64_t g = 0; g < ngroups; g++) {
-            keys_vec = ray_str_vec_append(keys_vec, ray_str_ptr(str_keys[g]), ray_str_len(str_keys[g]));
-            ray_release(str_keys[g]);
+            const ray_str_t* key = &desc[gvals[g]];
+            keys_vec = ray_str_vec_append(keys_vec,
+                                          ray_str_t_ptr(key, pool), key->len);
         }
         ray_t* vals_lst = ray_list_new(ngroups);
         if (RAY_IS_ERR(vals_lst)) {
-            ray_release(keys_vec); ray_free(skblock); goto gfail;
+            ray_release(keys_vec); goto gfail;
         }
         for (int64_t g = 0; g < ngroups; g++) {
             vals_lst = ray_list_append(vals_lst, idx_vecs[g]);
             ray_release(idx_vecs[g]);
             idx_vecs[g] = NULL;
-            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); ray_free(skblock); goto gfail; }
+            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
         }
-        ray_free(val_block); ray_free(ivblock); ray_free(skblock);
+        ray_free(val_block); ray_free(ivblock);
         return ray_dict_new(keys_vec, vals_lst);
     }
 
