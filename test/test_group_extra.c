@@ -2322,7 +2322,8 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
 
     ght_layout_t master;
     TEST_ASSERT_TRUE(ght_compute_layout(&master, NK, NA, agg_vecs, NULL,
-                                        GHT_NEED_SUM, agg_ops, key_types));
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
     /* > GHT_INLINE on both axes: this must be a real, owned spill block. */
     TEST_ASSERT_NOT_NULL(master.spill_hdr);
     TEST_ASSERT_FALSE(master.agg_val_slot == master.agg_val_slot_in);
@@ -2378,7 +2379,8 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
      * never left aliasing the source's — the mirror of the spill leg above. */
     ght_layout_t inl;
     TEST_ASSERT_TRUE(ght_compute_layout(&inl, 2, 2, agg_vecs, NULL,
-                                        GHT_NEED_SUM, agg_ops, key_types));
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
     TEST_ASSERT_NULL(inl.spill_hdr);
     TEST_ASSERT_TRUE(inl.agg_val_slot == inl.agg_val_slot_in);
     ght_layout_t ic;

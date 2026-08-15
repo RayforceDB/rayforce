@@ -1027,7 +1027,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * it exactly once so a spilled layout's heap block is never leaked. */
     ght_layout_t ly;
     if (!ght_compute_layout(&ly, n_keys, 1, agg_vecs, NULL,
-                            need_flags, agg_ops, key_types)) {
+                            need_flags, agg_ops, key_types, NULL)) {
         scratch_free(key_hdr);
         return ray_error("limit", "pivot: key stride budget exceeded");
     }

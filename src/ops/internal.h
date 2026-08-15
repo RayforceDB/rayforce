@@ -1285,6 +1285,13 @@ typedef struct {
     uint8_t  agg_flags_any;    /* OR of all agg_flags[a] — scalar shape guard */
     uint8_t  any_wide_key;     /* replaces wide_key_mask != 0 */
     uint8_t  any_inline_str;   /* replaces key_inline_str != 0 */
+    /* Set when the whole key tuple is plain fixed-width integer lanes: no
+     * wide/inline-STR key and no floating-point key.  Such a key region is
+     * exactly (n_keys + null_words) 8-byte lanes whose STORED BITS are the
+     * identity, so hash and compare may treat it as one packed value.  F64
+     * keys are excluded because their hash normalises -0.0 (ray_hash_f64) —
+     * a raw-lane hash would not, and the two must stay consistent. */
+    uint8_t  packed_key;
     uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
     /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */
     int8_t*  agg_val_slot;     /* [n_aggs] accum slot per agg, -1 = none */
@@ -1402,7 +1409,8 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                         ray_t** agg_vecs, ray_t** agg_vecs2,
                         uint8_t need_flags,
                         const uint16_t* agg_ops,
-                        const int8_t* key_types);
+                        const int8_t* key_types,
+                        ray_t* const* key_vecs);
 /* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not
  * ownership (src->spill_hdr == NULL is true both for genuine inline layouts
  * AND for borrowers, so it cannot be the test): when src->agg_val_slot ==

@@ -3417,11 +3417,14 @@ void ght_layout_copy(ght_layout_t* dst, const ght_layout_t* src) {
     }
 }
 
+static inline bool ray_key_may_be_null(const ray_t* kv);
+
 bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                         ray_t** agg_vecs, ray_t** agg_vecs2,
                         uint8_t need_flags,
                         const uint16_t* agg_ops,
-                        const int8_t* key_types) {
+                        const int8_t* key_types,
+                        ray_t* const* key_vecs) {
     memset(out, 0, sizeof(*out));
     out->n_keys = (uint16_t)n_keys;
     out->n_aggs = (uint16_t)n_aggs;
@@ -3455,6 +3458,15 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                 out->any_inline_str = 1;
             }
         }
+        /* Packed-tuple eligibility: every key is a plain fixed-width integer
+         * lane (no GUID/STR indirection, no F64 — see ght_layout_t.packed_key
+         * for why F64 is excluded).  n_keys == 0 is not a tuple. */
+        if (n_keys >= 1 && !out->any_wide_key) {
+            bool packed = true;
+            for (uint32_t k = 0; k < n_keys && packed; k++)
+                packed = key_types[k] != RAY_F64;
+            out->packed_key = packed ? 1 : 0;
+        }
     }
 
     uint16_t nv = 0;
@@ -3476,10 +3488,21 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                                     agg_ops[a] == OP_MODE ||
                                     agg_ops[a] == OP_TOP_N ||
                                     agg_ops[a] == OP_BOT_N || wide_mm);
+        /* OP_COUNT is GROUP SIZE: its emit reads the group row count (cnt),
+         * never a staged value or an off_nn slot (see the OP_COUNT arms of
+         * radix_phase3_fn / the sequential emit, and the DA path's "value is
+         * ignored for COUNT" skip).  Reserving a value slot for it therefore
+         * costs 8 bytes on every fat entry and every HT group row, one extra
+         * source-column read per row in phase 1, and one extra 8-byte store —
+         * all of it dead.  Give it no slot: ClickBench q16/q18 are count-only,
+         * so this takes their entry from 48 to 40 bytes across 10M rows. */
+        bool valueless = agg_ops && agg_ops[a] == OP_COUNT;
         uint8_t af = 0;
         if (holistic) {
             af |= GHT_AF_HOLISTIC;
             if (wide_mm) af |= GHT_AF_WIDE;
+            out->agg_val_slot[a] = -1;
+        } else if (valueless) {
             out->agg_val_slot[a] = -1;
         } else if (agg_vecs[a]) {
             out->agg_val_slot[a] = (int8_t)nv;
@@ -3557,8 +3580,29 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
     out->agg_flags_any = agg_any;
     /* Null tracking: ceil(n_keys/64) int64 words, floored at 1 so the rare
      * n_keys==0 HT fallback keeps a (trivially-zero) null slot — byte-identical
-     * to the legacy single-int64 layout for every ≤64-key shape. */
+     * to the legacy single-int64 layout for every ≤64-key shape.
+     *
+     * Null-mask ELISION: the words exist solely to keep a NULL key distinct
+     * from a 0 / "" key.  When no key column can yield a NULL there is nothing
+     * to distinguish and the words are pure overhead — 8 bytes on every fat
+     * entry AND every HT group row, copied by phase 1, re-read by phase 2, and
+     * folded into every key compare.  On ClickBench q18 (10M rows, 4.9M
+     * groups, 3 null-free keys) that is 8 of 56 entry bytes.  Elide when the
+     * caller hands us the key vectors and every one of them is provably
+     * null-free.  Capped at 64 keys so the surviving null-mask READERS can
+     * substitute a single shared zero word (see ght_null_words_at).
+     *
+     * INVARIANT: every writer of the mask (`nullw[k>>6] |= …` in the phase-1
+     * key builders) is guarded by the caller's own `nullable` summary, which
+     * is computed from the SAME key_vecs through the SAME ray_key_may_be_null
+     * predicate — so a layout with null_words == 0 is never written to. */
     uint32_t null_words = n_keys ? ((n_keys + 63u) >> 6) : 1u;
+    if (key_vecs && n_keys >= 1 && n_keys <= 64) {
+        bool any_nullable = false;
+        for (uint32_t k = 0; k < n_keys && !any_nullable; k++)
+            any_nullable = ray_key_may_be_null(key_vecs[k]);
+        if (!any_nullable) null_words = 0;
+    }
     out->null_words = (uint16_t)null_words;
     /* Key region = keys + null_words*8 null-mask words (stored after last key).
      * The null-mask words hold a bitmap of which keys were null in the source
@@ -3801,6 +3845,157 @@ static inline uint64_t ght_hash_null_words(uint64_t h, const int64_t* nullw,
     return h;
 }
 
+/* Avalanche a packed key tuple — `lanes` 8-byte words covering the whole key
+ * region (n_keys value lanes + null_words mask lanes) — into one 64-bit hash.
+ *
+ * Only for ly->packed_key layouts: every lane's stored BITS are the key's
+ * identity there, which is exactly the precondition for hashing the tuple as
+ * one value instead of hashing each key and combining.  Same mixer as
+ * ray_hash_i64 / ray_hash_combine (wyhash's wymum + wymix), but folded over
+ * the tuple in a single chain: ceil(lanes/2) + 1 mixer rounds instead of
+ * `lanes` hashes plus `lanes-1` combines.  ClickBench q18's 3-key tuple goes
+ * from 5 rounds (10 multiplies) to 3 (3 multiplies).
+ *
+ * Bit discipline: the final wymix is a full 128->64 avalanche, so the
+ * partition bits (hash >> 16, group_radix_part) and the table-slot bits
+ * (hash & mask) remain independent — the same guarantee ray_hash_i64 gave.
+ * The lane count is seeded in so tuples of different arity cannot collide by
+ * zero-padding. */
+static inline uint64_t ght_hash_lanes(const int64_t* lane, uint32_t lanes) {
+    uint64_t a = 0x2d358dccaa6c78a5ULL;
+    uint64_t b = 0x8bb84b93962eacc9ULL ^ (uint64_t)lanes;
+    uint32_t k = 0;
+    for (; k + 2 <= lanes; k += 2) {
+        a ^= (uint64_t)lane[k];
+        b ^= (uint64_t)lane[k + 1];
+        ray__wymum(&a, &b);
+    }
+    if (k < lanes) {
+        /* Odd tail lane feeds BOTH mixer halves, so wymum stays quadratic in
+         * the lane value.  Folding it into `a` alone leaves the other half a
+         * constant, which degrades to a multiply-by-constant — measurably
+         * worse probe chains on single-key group-bys (ClickBench q15). */
+        uint64_t v = (uint64_t)lane[k];
+        a ^= v;
+        b ^= v;
+        ray__wymum(&a, &b);
+    }
+    return ray__wymix(a ^ 0x2d358dccaa6c78a5ULL, b ^ 0x8bb84b93962eacc9ULL);
+}
+
+/* Gather one key column's lanes for a batch of rows.  Semantically
+ * `dst[j] = read_col_i64(data, rows[j], type, attrs)` for every j — the type
+ * (and, for SYM, the stored-id-width) dispatch is hoisted OUT of the row loop,
+ * which is the whole point: read_col_i64's switch lowers to a jump table, so
+ * the row-major builder pays one indirect jump per key per row and mispredicts
+ * whenever a tuple mixes widths (ClickBench q18 is I64, I64, SYM32).
+ *
+ * MUST stay bit-identical to read_col_i64 (ops/internal.h) — narrow signed
+ * types sign-extend, SYM ids zero-extend. */
+static inline void group_keys_gather(int64_t* dst, const void* data,
+                                     const int64_t* rows, uint32_t m,
+                                     int8_t type, uint8_t attrs) {
+    switch (type) {
+    case RAY_I64: case RAY_TIMESTAMP:
+        for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j]];
+        return;
+    case RAY_SYM:
+        switch (attrs & RAY_SYM_W_MASK) {
+        case RAY_SYM_W8:
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint8_t*)data)[rows[j]];
+            return;
+        case RAY_SYM_W16:
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint16_t*)data)[rows[j]];
+            return;
+        case RAY_SYM_W32:
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint32_t*)data)[rows[j]];
+            return;
+        default:
+            for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j]];
+            return;
+        }
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const int32_t*)data)[rows[j]];
+        return;
+    case RAY_I16:
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const int16_t*)data)[rows[j]];
+        return;
+    default: /* RAY_BOOL, RAY_U8 */
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint8_t*)data)[rows[j]];
+        return;
+    }
+}
+
+/* Contiguous-row variant of group_keys_gather: rows row0..row0+m.  The
+ * indexed form above hides the sequential access behind rows[j], which blocks
+ * vectorisation; with no WHERE and no match list (the common full-scan case)
+ * this reads each column as a straight run and the widening loads vectorise. */
+static inline void group_keys_gather_seq(int64_t* dst, const void* data,
+                                         int64_t row0, uint32_t m,
+                                         int8_t type, uint8_t attrs) {
+    switch (type) {
+    case RAY_I64: case RAY_TIMESTAMP: {
+        const int64_t* p = (const int64_t*)data + row0;
+        for (uint32_t j = 0; j < m; j++) dst[j] = p[j];
+        return;
+    }
+    case RAY_SYM:
+        switch (attrs & RAY_SYM_W_MASK) {
+        case RAY_SYM_W8: {
+            const uint8_t* p = (const uint8_t*)data + row0;
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)p[j];
+            return;
+        }
+        case RAY_SYM_W16: {
+            const uint16_t* p = (const uint16_t*)data + row0;
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)p[j];
+            return;
+        }
+        case RAY_SYM_W32: {
+            const uint32_t* p = (const uint32_t*)data + row0;
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)p[j];
+            return;
+        }
+        default: {
+            const int64_t* p = (const int64_t*)data + row0;
+            for (uint32_t j = 0; j < m; j++) dst[j] = p[j];
+            return;
+        }
+        }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: {
+        const int32_t* p = (const int32_t*)data + row0;
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)p[j];
+        return;
+    }
+    case RAY_I16: {
+        const int16_t* p = (const int16_t*)data + row0;
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)p[j];
+        return;
+    }
+    default: { /* RAY_BOOL, RAY_U8 */
+        const uint8_t* p = (const uint8_t*)data + row0;
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)p[j];
+        return;
+    }
+    }
+}
+
+/* Shared all-zero stand-in for an elided null-mask region (null_words == 0,
+ * i.e. no key column can produce a NULL).  Elision is capped at 64 keys, so a
+ * single word covers every (k >> 6) a reader can form. */
+static const int64_t ght_null_words_none[1] = { 0 };
+
+/* Base of a group row's / entry's null-mask words.  `keybase` is the start of
+ * the key region (row + 8 or entry + 8).  Returns the shared zero word when
+ * the layout elided the mask, so readers stay branch-free and never step past
+ * the key region into the accumulator block. */
+static inline const int64_t* ght_null_words_at(const ght_layout_t* ly,
+                                                const void* keybase) {
+    if (!ly->null_words) return ght_null_words_none;
+    return (const int64_t*)(const void*)((const char*)keybase +
+                                         ly->key_off[ly->n_keys]);
+}
+
 /* True when key column kv (or its slice parent) carries the HAS_NULLS attr and
  * so may yield a null at some row.  Replaces the old per-key `1u << k` nullable
  * bitmask (which silently dropped keys past index 7 / was UB past 31): callers
@@ -3912,6 +4107,11 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
         const int64_t* nullw = (const int64_t*)((const char*)keys + ly->key_off[n_keys]);
         return ght_hash_null_words(h, nullw, ly->null_words);
     }
+    /* Packed tuple: one avalanche over the whole key region.  MUST stay in
+     * lockstep with every phase-1 key builder below — a rehash that hashed a
+     * row differently from the entry that created it would lose the group. */
+    if (ly->packed_key)
+        return ght_hash_lanes(keys, (uint32_t)n_keys + ly->null_words);
     const uint8_t* const kflags = ly->key_flags;
     uint64_t h = 0;
     for (uint32_t k = 0; k < n_keys; k++) {
@@ -4354,19 +4554,71 @@ static void init_accum_from_entry_nullable(char* row, const char* entry,
     accum_from_entry_nullable(row, entry, ly);
 }
 
+/* ── Lane-wise key-region copy / compare ───────────────────────────────────
+ * Every group key region is a whole number of 8-byte lanes (8 B per scalar
+ * key, 16 B per inline-STR descriptor, plus null_words*8 trailing mask words),
+ * but its length is a runtime uint16 — so memcpy/memcmp over it lower to libc
+ * calls that re-dispatch on the size for every single row.  A dwarf
+ * call-graph profile of ClickBench q18 (3 narrow keys, 10M rows, 4.9M groups)
+ * charged 11.2% of the query to __memmove_avx under radix_buf_push, a further
+ * 2.5% to the same under radix_phase2_fn's group-row copy, and 2.2% to
+ * __memcmp_avx2_movbe under group_keys_equal — every one of them moving 24 or
+ * 32 bytes.  Narrow layouts (≤ GHT_LANES_INLINE lanes, i.e. every group-by up
+ * to 7 scalar keys) run a switch of straight u64 loads/stores instead: no
+ * call, no size dispatch, and the compare short-circuits on first mismatch.
+ * Wider layouts keep the libc call, so their generated code is unchanged.
+ *
+ * Alignment: key regions start at entry+8 / row+8 inside malloc'd blocks whose
+ * strides are all multiples of 8, so every lane is naturally aligned. */
+#define GHT_LANES_INLINE 8
+
+static inline void ght_lanes_copy(void* dst, const void* src, uint16_t bytes) {
+    uint64_t* d = (uint64_t*)dst;
+    const uint64_t* s = (const uint64_t*)src;
+    switch ((unsigned)bytes >> 3) {
+    default: memcpy(dst, src, bytes); return;
+    case 8: d[7] = s[7]; __attribute__((fallthrough));
+    case 7: d[6] = s[6]; __attribute__((fallthrough));
+    case 6: d[5] = s[5]; __attribute__((fallthrough));
+    case 5: d[4] = s[4]; __attribute__((fallthrough));
+    case 4: d[3] = s[3]; __attribute__((fallthrough));
+    case 3: d[2] = s[2]; __attribute__((fallthrough));
+    case 2: d[1] = s[1]; __attribute__((fallthrough));
+    case 1: d[0] = s[0]; __attribute__((fallthrough));
+    case 0: return;
+    }
+}
+
+static inline bool ght_lanes_equal(const void* a, const void* b, uint16_t bytes) {
+    const uint64_t* x = (const uint64_t*)a;
+    const uint64_t* y = (const uint64_t*)b;
+    switch ((unsigned)bytes >> 3) {
+    default: return memcmp(a, b, bytes) == 0;
+    case 8: if (x[7] != y[7]) return false; __attribute__((fallthrough));
+    case 7: if (x[6] != y[6]) return false; __attribute__((fallthrough));
+    case 6: if (x[5] != y[5]) return false; __attribute__((fallthrough));
+    case 5: if (x[4] != y[4]) return false; __attribute__((fallthrough));
+    case 4: if (x[3] != y[3]) return false; __attribute__((fallthrough));
+    case 3: if (x[2] != y[2]) return false; __attribute__((fallthrough));
+    case 2: if (x[1] != y[1]) return false; __attribute__((fallthrough));
+    case 1: if (x[0] != y[0]) return false; __attribute__((fallthrough));
+    case 0: return true;
+    }
+}
+
 /* Compare the n_keys key slots of two rows, handling wide keys via
  * key_data[] resolution.  Returns true if all keys are bytewise equal.
- * Hot path: when wide_mask == 0, reduces to a single memcmp over the
+ * Hot path: when wide_mask == 0, reduces to a lane-wise compare over the
  * packed 8-byte-per-key region. */
 static inline bool group_keys_equal(const int64_t* a_keys, const int64_t* b_keys,
                                       const ght_layout_t* ly, void* const* key_data,
                                       const void* const* key_pool) {
     uint16_t nk = ly->n_keys;
     if (!ly->any_wide_key) {
-        /* memcmp covers nk 8-byte values + the null_words trailing words:
+        /* Covers nk 8-byte values + the null_words trailing words:
          * key_region == (nk + null_words)*8 with no wide/inline-STR keys, so
          * the compare length widens with the null region — no shape change. */
-        return memcmp(a_keys, b_keys, (size_t)ly->key_region) == 0;
+        return ght_lanes_equal(a_keys, b_keys, ly->key_region);
     }
     const uint8_t* const kflags = ly->key_flags;
     const uint16_t* const koff = ly->key_off;
@@ -4437,7 +4689,7 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
             uint32_t gid = ht->grp_count++;
             char* row = ht->rows + (size_t)gid * ly->row_stride;
             *(int64_t*)row = 1;   /* count = 1 */
-            memcpy(row + 8, ekeys, key_bytes);
+            ght_lanes_copy(row + 8, ekeys, key_bytes);
             if (!accum_skip)
                 init_accum_from_entry(row, entry, ly);
             else if (ly->row_stride > 8 + key_bytes)
@@ -4563,6 +4815,23 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         int64_t* nullw = ek + nk;
         uint32_t null_words = ly->null_words;
         for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
+        if (ly->packed_key) {
+            /* Packed tuple (ly->packed_key): every key is a plain integer lane, so
+             * the wide/F64 arms of the generic loop below are dead and the whole
+             * key region — values plus null-mask words — avalanches in ONE
+             * ght_hash_lanes call instead of nk hashes plus nk-1 combines.  MUST
+             * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
+            for (uint32_t k = 0; k < nk; k++) {
+                if (__builtin_expect(any_nullable && ray_key_may_be_null(key_vecs[k])
+                             && ray_vec_is_null(key_vecs[k], row), 0)) {
+                    nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
+                    ek[k] = 0;
+                } else {
+                    ek[k] = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
+                }
+            }
+            h = ght_hash_lanes(ek, (uint32_t)nk + null_words);
+        } else {
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
@@ -4591,15 +4860,19 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         }
         h = ght_hash_null_words(h, nullw, null_words);
         }
+        }
         *(uint64_t*)ebuf = h;
 
         int64_t* ev = (int64_t*)(ebuf + 8 + (size_t)ly->key_region);
-        uint8_t vi = 0;
         for (uint32_t a = 0; a < na; a++) {
             uint8_t af = aflags[a];
-            /* Holistic agg (OP_MEDIAN): no slot reserved — skip packing.
-             * Source column read in the post-radix pass. */
-            if (af & GHT_AF_HOLISTIC) continue;
+            /* Destination slot comes from the layout, never a running counter:
+             * aggs that reserve no value slot (holistic OP_MEDIAN &c., and
+             * valueless OP_COUNT) carry agg_val_slot == -1, and a running
+             * counter would silently shift every later agg's slot. */
+            int8_t vs = ly->agg_val_slot[a];
+            if (vs < 0) continue;
+            uint8_t vi = (uint8_t)vs;
             ray_t* ac = agg_vecs[a];
             if (!ac) continue;
             if (agg_strlen && agg_strlen[a])
@@ -4692,6 +4965,12 @@ static int group_order_pair_cmp(const void* a, const void* b) {
  * "fewer than half the rows survive"; tuned in Task 2. */
 #define SEL_MATCH_GATE_SHIFT 1
 
+/* Morsel geometry for radix_phase1_fn's column-major key staging: 256 rows
+ * x <= 8 keys = 16 KiB of worker stack, small enough to stay L1-resident while
+ * still amortising the per-key type dispatch over a useful batch. */
+#define P1_MORSEL       256u
+#define P1_MORSEL_KEYS  8u
+
 /* Per-worker, per-partition buffer of fat entries */
 typedef struct {
     char*    data;           /* flat buffer: data[i * entry_stride] */
@@ -4722,9 +5001,9 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
     }
     char* dst = buf->data + (size_t)buf->count * entry_stride;
     *(uint64_t*)dst = hash;
-    memcpy(dst + 8, key_region_buf, key_region);
+    ght_lanes_copy(dst + 8, key_region_buf, key_region);
     if (n_agg_vals)
-        memcpy(dst + 8 + key_region, agg_vals, (size_t)n_agg_vals * 8);
+        ght_lanes_copy(dst + 8 + key_region, agg_vals, (uint16_t)(n_agg_vals * 8));
     memcpy(dst + entry_stride - 8, &row, 8);
     buf->count++;
 }
@@ -4757,15 +5036,63 @@ typedef struct {
     uint32_t       buf_prime;
 } radix_phase1_ctx_t;
 
+/* Pack one row's aggregate input values into the entry staging slots.
+ * Shared by radix_phase1_fn's morsel-staged and row-major builders so the
+ * two cannot drift; slot indices come from the layout (agg_val_slot), never
+ * a running counter. */
+static inline void radix_phase1_pack_aggs(const radix_phase1_ctx_t* c,
+                                          const ght_layout_t* ly,
+                                          int64_t* agg_vals, int64_t row) {
+    const uint8_t* const aflags = ly->agg_flags;
+    uint16_t na = ly->n_aggs;
+    for (uint32_t a = 0; a < na; a++) {
+        uint8_t af = aflags[a];
+        /* Destination slot from the layout (see group_rows_range): aggs
+         * with no value slot — holistic OP_MEDIAN &c. and valueless
+         * OP_COUNT — carry agg_val_slot == -1 and pack nothing. */
+        int8_t vs = ly->agg_val_slot[a];
+        if (vs < 0) continue;
+        uint8_t vi = (uint8_t)vs;
+        ray_t* ac = c->agg_vecs[a];
+        if (!ac) continue;
+        if (c->agg_strlen && c->agg_strlen[a])
+            agg_vals[vi] = group_strlen_at(ac, row);
+        else if (af & GHT_AF_F64) {
+            double v = group_fp_type(ac->type)
+                ? group_fp_at(ray_data(ac), ac->type, row)
+                : group_pack_i64_as_f64(ac, row);
+            memcpy(&agg_vals[vi], &v, sizeof(v));
+        }
+        else
+            agg_vals[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+        vi++;
+        /* Binary aggregator: read y-side value into the next slot.
+         * Cast non-F64 inputs through read_col_i64 — pearson_corr's
+         * finalize reads both slots as F64 doubles regardless of
+         * input type (i64 will be reinterpreted; for now we only
+         * support F64 inputs cleanly — i64 path is a perf followup). */
+        if ((af & GHT_AF_BINARY) && c->agg_vecs2 && c->agg_vecs2[a]) {
+            ray_t* ay = c->agg_vecs2[a];
+            if (af & GHT_AF_F64) {
+                double v = group_fp_type(ay->type)
+                    ? group_fp_at(ray_data(ay), ay->type, row)
+                    : group_pack_i64_as_f64(ay, row);
+                memcpy(&agg_vals[vi], &v, sizeof(v));
+            }
+            else
+                agg_vals[vi] = group_pack_y_i64(ay, row);
+            vi++;
+        }
+    }
+}
+
 static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     radix_phase1_ctx_t* c = (radix_phase1_ctx_t*)ctx;
     const ght_layout_t* ly = &c->layout;
     radix_buf_t* my_bufs = &c->bufs[(size_t)worker_id * c->n_parts];
     uint16_t nk = ly->n_keys;
-    uint16_t na = ly->n_aggs;
     uint16_t nv = ly->n_agg_vals;
     const uint8_t* const kflags = ly->key_flags;
-    const uint8_t* const aflags = ly->agg_flags;
     uint8_t wide_any = ly->any_wide_key;
     uint8_t inline_str = ly->any_inline_str;
     uint16_t estride = ly->entry_stride;
@@ -4793,6 +5120,66 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     }
 
     uint8_t nullable = c->nullable_mask;   /* 0/1: any key may be null (see build) */
+    uint8_t packed = ly->packed_key;
+
+    /* ── Morsel-staged packed key build ──────────────────────────────────────
+     * read_col_i64 dispatches on the column type — and, for SYM, on the stored
+     * id width — so it lowers to a jump table: ONE INDIRECT JUMP per key per
+     * row.  When a tuple mixes widths (ClickBench q18 is I64, I64, SYM32) the
+     * target alternates every key and the predictor cannot keep up; `notrack
+     * jmp` accounted for ~6% of the query inside this function.
+     *
+     * For packed, null-free layouts the keys are staged COLUMN-MAJOR over a
+     * morsel of rows first (group_keys_gather), so the dispatch happens once
+     * per key per MORSEL and each column is read strictly sequentially.  The
+     * per-row half then only transposes lanes, hashes and pushes.
+     *
+     * Rows are visited in exactly the same order, the entry bytes and the
+     * hash are the same values the row-major loop below would produce, and the
+     * partition assignment follows from the hash — staging order only. */
+    if (packed && !nullable && !inline_str && ly->null_words == 0 &&
+        nk >= 1 && nk <= P1_MORSEL_KEYS) {
+        int64_t rowbuf[P1_MORSEL];
+        static_assert(sizeof(int64_t) * P1_MORSEL * P1_MORSEL_KEYS <= 64u * 1024u,
+                      "phase1 morsel stage must stay a modest worker-stack block");
+        int64_t stage[P1_MORSEL_KEYS][P1_MORSEL];
+        /* No match list and no row selection => the morsel's rows are exactly
+         * rowbuf[0] .. rowbuf[0]+m-1, so the columns can be read as runs. */
+        bool contiguous = !match_idx && !c->rowsel;
+        for (int64_t i = start; i < end; ) {
+            /* Cancellation checkpoint once per morsel — strictly more
+             * responsive than the row-major loop's every-65536-rows poll. */
+            if (ray_interrupted()) break;
+            uint32_t m = 0;
+            for (; i < end && m < P1_MORSEL; i++) {
+                int64_t row = match_idx ? match_idx[i] : i;
+                if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row))
+                    continue;
+                rowbuf[m++] = row;
+            }
+            if (m == 0) continue;
+            for (uint32_t k = 0; k < nk; k++) {
+                if (contiguous)
+                    group_keys_gather_seq(stage[k], c->key_data[k], rowbuf[0], m,
+                                          c->key_types[k], c->key_attrs[k]);
+                else
+                    group_keys_gather(stage[k], c->key_data[k], rowbuf, m,
+                                      c->key_types[k], c->key_attrs[k]);
+            }
+            for (uint32_t j = 0; j < m; j++) {
+                int64_t row = rowbuf[j];
+                for (uint32_t k = 0; k < nk; k++) keys[k] = stage[k][j];
+                uint64_t h = ght_hash_lanes(keys, nk);
+                radix_phase1_pack_aggs(c, ly, agg_vals, row);
+                uint32_t part = group_radix_part(h, c->n_parts);
+                radix_buf_push(&my_bufs[part], estride, h, keys,
+                               agg_vals, nv, row, ly->key_region, c->buf_prime);
+            }
+        }
+        scratch_free(stage_hdr);   /* NULL (inline staging) → no-op */
+        return;
+    }
+
     for (int64_t i = start; i < end; i++) {
         /* Cancellation checkpoint every 65536 rows — ~150 polls on a
          * 10M-row ingest, imperceptible in the inner loop and still
@@ -4811,6 +5198,25 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         int64_t* nullw = keys + nk;
         uint32_t null_words = ly->null_words;
         for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
+        if (packed) {
+            /* Packed tuple (ly->packed_key): every key is a plain integer lane,
+             * so the wide/F64 arms of the generic loop below are dead and the
+             * whole key region — values plus null-mask words — avalanches in
+             * ONE ght_hash_lanes call instead of nk hashes plus nk-1 combines.
+             * The generic loop stays byte-for-byte what it was for every other
+             * key shape. */
+            for (uint32_t k = 0; k < nk; k++) {
+                if (__builtin_expect(nullable && ray_key_may_be_null(c->key_vecs[k])
+                                     && ray_vec_is_null(c->key_vecs[k], row), 0)) {
+                    nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
+                    keys[k] = 0;
+                } else {
+                    keys[k] = read_col_i64(c->key_data[k], row, c->key_types[k],
+                                           c->key_attrs[k]);
+                }
+            }
+            h = ght_hash_lanes(keys, (uint32_t)nk + null_words);
+        } else {
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
@@ -4837,44 +5243,9 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         }
         h = ght_hash_null_words(h, nullw, null_words);
         }
-
-        uint8_t vi = 0;
-        for (uint32_t a = 0; a < na; a++) {
-            uint8_t af = aflags[a];
-            /* Holistic agg (OP_MEDIAN): no slot reserved — skip
-             * packing.  Source column is read in the post-radix pass. */
-            if (af & GHT_AF_HOLISTIC) continue;
-            ray_t* ac = c->agg_vecs[a];
-            if (!ac) continue;
-            if (c->agg_strlen && c->agg_strlen[a])
-                agg_vals[vi] = group_strlen_at(ac, row);
-            else if (af & GHT_AF_F64) {
-                double v = group_fp_type(ac->type)
-                    ? group_fp_at(ray_data(ac), ac->type, row)
-                    : group_pack_i64_as_f64(ac, row);
-                memcpy(&agg_vals[vi], &v, sizeof(v));
-            }
-            else
-                agg_vals[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
-            vi++;
-            /* Binary aggregator: read y-side value into the next slot.
-             * Cast non-F64 inputs through read_col_i64 — pearson_corr's
-             * finalize reads both slots as F64 doubles regardless of
-             * input type (i64 will be reinterpreted; for now we only
-             * support F64 inputs cleanly — i64 path is a perf followup). */
-            if ((af & GHT_AF_BINARY) && c->agg_vecs2 && c->agg_vecs2[a]) {
-                ray_t* ay = c->agg_vecs2[a];
-                if (af & GHT_AF_F64) {
-                    double v = group_fp_type(ay->type)
-                        ? group_fp_at(ray_data(ay), ay->type, row)
-                        : group_pack_i64_as_f64(ay, row);
-                    memcpy(&agg_vals[vi], &v, sizeof(v));
-                }
-                else
-                    agg_vals[vi] = group_pack_y_i64(ay, row);
-                vi++;
-            }
         }
+
+        radix_phase1_pack_aggs(c, ly, agg_vals, row);
 
         uint32_t part = group_radix_part(h, c->n_parts);
         radix_buf_push(&my_bufs[part], estride, h,
@@ -4968,7 +5339,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             const char* row = ph->rows + (size_t)gi * rs;
             const char* rk = row + 8;     /* key region (key_off-addressed) */
             int64_t cnt = *(const int64_t*)(const void*)row;
-            const int64_t* nullw = (const int64_t*)(const void*)(rk + koff[nk]);
+            const int64_t* nullw = ght_null_words_at(ly, rk);
             /* Per-slot non-null count when nullable aggs are present; NULL
              * (→ use cnt) for null-free layouts (byte-identical to before). */
             const int64_t* nnbase = ly->off_nn
@@ -5035,7 +5406,9 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 /* nn = per-slot non-null count (nullable layout) or the group
                  * row count (null-free).  Drives the AVG/VAR/STDDEV divisor
                  * and the all-null → typed-null decision, matching the DA path. */
-                int64_t nn = nnbase ? nnbase[s] : cnt;
+                /* s < 0 for a valueless agg (OP_COUNT): it owns no off_nn
+                 * slot, and its emit uses cnt.  Never index nnbase with it. */
+                int64_t nn = (nnbase && s >= 0) ? nnbase[s] : cnt;
                 if (ao->out_type == RAY_F64) {
                     double v;
                     switch (op) {
@@ -5530,6 +5903,23 @@ v2_morsel_done:
         int64_t* nullw = ek + nk;   /* null-mask words at key_off[nk]==nk*8 */
         uint32_t null_words = ly->null_words;
         for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
+        if (ly->packed_key) {
+            /* Packed tuple (ly->packed_key): every key is a plain integer lane, so
+             * the wide/F64 arms of the generic loop below are dead and the whole
+             * key region — values plus null-mask words — avalanches in ONE
+             * ght_hash_lanes call instead of nk hashes plus nk-1 combines.  MUST
+             * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
+            for (uint32_t k = 0; k < nk; k++) {
+                if (__builtin_expect(nullable && ray_key_may_be_null(c->key_vecs[k])
+                             && ray_vec_is_null(c->key_vecs[k], row), 0)) {
+                    nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
+                    ek[k] = 0;
+                } else {
+                    ek[k] = read_col_i64(c->key_data[k], row, c->key_types[k], c->key_attrs[k]);
+                }
+            }
+            h = ght_hash_lanes(ek, (uint32_t)nk + null_words);
+        } else {
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
@@ -5556,6 +5946,7 @@ v2_morsel_done:
         }
         h = ght_hash_null_words(h, nullw, null_words);
         }
+        }
         *(uint64_t*)ebuf = h;
         /* Pack agg values into entry — only when the HT layout actually
          * reads them.  For count-only need_flags == 0 and accum_from_entry
@@ -5563,11 +5954,12 @@ v2_morsel_done:
          * read per row (a measurable regression on q15-class queries). */
         if (ly->need_flags) {
             int64_t* ev = (int64_t*)(ebuf + 8 + (size_t)ly->key_region);
-            uint8_t vi = 0;
             uint16_t na = ly->n_aggs;
             for (uint32_t a = 0; a < na; a++) {
                 uint8_t af = aflags[a];
-                if (af & GHT_AF_HOLISTIC) continue;
+                int8_t vs = ly->agg_val_slot[a];
+                if (vs < 0) continue;   /* holistic / valueless OP_COUNT */
+                uint8_t vi = (uint8_t)vs;
                 ray_t* ac = c->agg_vecs ? c->agg_vecs[a] : NULL;
                 if (!ac) continue;
                 if (c->agg_strlen && c->agg_strlen[a])
@@ -7326,6 +7718,23 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
         int64_t* nullw = ek_buf + nk;
         uint32_t null_words = c->layout->null_words;
         for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
+        if (c->layout->packed_key) {
+            /* Packed tuple (ly->packed_key): every key is a plain integer lane, so
+             * the wide/F64 arms of the generic loop below are dead and the whole
+             * key region — values plus null-mask words — avalanches in ONE
+             * ght_hash_lanes call instead of nk hashes plus nk-1 combines.  MUST
+             * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
+            for (uint32_t k = 0; k < nk; k++) {
+                if (__builtin_expect(nullable && ray_key_may_be_null(key_vecs[k])
+                             && ray_vec_is_null(key_vecs[k], row), 0)) {
+                    nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
+                    ek_buf[k] = 0;
+                } else {
+                    ek_buf[k] = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
+                }
+            }
+            h = ght_hash_lanes(ek_buf, (uint32_t)nk + null_words);
+        } else {
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
@@ -7351,6 +7760,7 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
         h = ght_hash_null_words(h, nullw, null_words);
+        }
         lookup_keys = ek_buf;
     }
 
@@ -12034,7 +12444,7 @@ ht_path:;
     ght_layout_t ght_layout;
     if (!ght_compute_layout(&ght_layout, n_keys, n_aggs, agg_vecs, agg_vecs2,
                             ght_need,
-                            ext->agg_ops, key_types)) {
+                            ext->agg_ops, key_types, key_vecs)) {
         for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
@@ -13143,13 +13553,16 @@ sequential_fallback:;
         const char* src_base = is_wide ? (const char*)key_data[k] : NULL;
 
         bool inline_str_k = (ly->key_flags[k] & GHT_KEYF_INLINE_STR) != 0;
-        /* Key k's null bit lives in null-mask word (k>>6), bit (k&63). */
-        size_t null_woff = (size_t)ly->key_off[n_keys] + (size_t)(k >> 6) * 8;
+        /* Key k's null bit lives in null-mask word (k>>6), bit (k&63).  An
+         * elided mask (null_words == 0) resolves to the shared zero word. */
+        size_t null_woff = ly->null_words
+            ? (size_t)ly->key_off[n_keys] + (size_t)(k >> 6) * 8 : 0;
         int64_t null_kbit = (int64_t)((uint64_t)1 << (k & 63));
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             const char* rk = row + 8;
-            int64_t null_word = *(const int64_t*)(rk + null_woff);
+            int64_t null_word = ly->null_words
+                ? *(const int64_t*)(rk + null_woff) : 0;
             if (null_word & null_kbit) {
                 ray_vec_set_null(new_col, (int64_t)gi, true);
                 /* Fill the correct-width sentinel. */
@@ -13266,6 +13679,23 @@ sequential_fallback:;
                     int64_t* nullw = ek_buf + n_keys;   /* null-mask words at key_off[nk] */
                     uint32_t null_words = ly->null_words;
                     for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
+                    if (ly->packed_key) {
+                        /* Packed tuple (ly->packed_key): every key is a plain integer lane, so
+                         * the wide/F64 arms of the generic loop below are dead and the whole
+                         * key region — values plus null-mask words — avalanches in ONE
+                         * ght_hash_lanes call instead of nk hashes plus nk-1 combines.  MUST
+                         * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
+                        for (uint32_t k = 0; k < n_keys; k++) {
+                            if (__builtin_expect(reprobe_nullable_s && ray_key_may_be_null(key_vecs[k])
+                                         && ray_vec_is_null(key_vecs[k], row), 0)) {
+                                nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
+                                ek_buf[k] = 0;
+                            } else {
+                                ek_buf[k] = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
+                            }
+                        }
+                        h = ght_hash_lanes(ek_buf, (uint32_t)n_keys + null_words);
+                    } else {
                     for (uint32_t k = 0; k < n_keys; k++) {
                         int8_t t = key_types[k];
                         uint64_t kh;
@@ -13291,6 +13721,7 @@ sequential_fallback:;
                         h = (k == 0) ? kh : ray_hash_combine(h, kh);
                     }
                     h = ght_hash_null_words(h, nullw, null_words);
+                    }
                     lookup_keys = ek_buf;
                     }
                     uint32_t gid = group_ht_lookup_gid(final_ht, h, lookup_keys, key_types);
@@ -13430,7 +13861,8 @@ sequential_fallback:;
             int64_t cnt = *(const int64_t*)(const void*)row;
             /* nn = per-slot non-null count (nullable layout) or the group row
              * count (null-free — byte-identical to before). */
-            int64_t nn = ly->off_nn
+            /* s < 0 for a valueless agg (OP_COUNT) — see radix_phase3_fn. */
+            int64_t nn = (ly->off_nn && s >= 0)
                 ? ((const int64_t*)(const void*)(row + ly->off_nn))[s] : cnt;
             if (out_type == RAY_F64) {
                 double v;

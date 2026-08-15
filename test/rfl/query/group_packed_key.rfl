@@ -1,0 +1,81 @@
+;; Packed-key group-by pipeline (src/ops/group.c ght_layout_t.packed_key).
+;;
+;; When every group key is a plain fixed-width integer lane (no GUID/STR
+;; indirection, no F64) the fat-entry radix pipeline hashes the WHOLE key
+;; region in one ght_hash_lanes avalanche instead of hashing each key and
+;; combining, elides the null-mask words when no key column can be null, and
+;; drops the dead value slot reserved for OP_COUNT.  Entry/row layout, group
+;; ids, first-seen ordering and emit-filter behaviour must be unchanged.
+;;
+;; `desc: c take: N` arms the group emit filter, which routes the query onto
+;; the fat-entry path specifically (ClickBench q16/q18 shape) — several cases
+;; below use it deliberately.  300K rows forces the parallel radix build even
+;; under RAYFORCE_CORES=2.
+
+;; ── 2-key narrow tuple, emit filter armed ────────────────────────────────
+(set PK2 (table [a b] (list (% (til 300000) 500) (% (til 300000) 300))))
+(count (select {c: (count a) by: {a: a b: b} from: PK2})) -- 1500
+(sum (at (select {c: (count a) by: {a: a b: b} from: PK2}) 'c)) -- 300000
+(count (select {c: (count a) by: {a: a b: b} from: PK2 desc: c take: 10})) -- 10
+(at (at (select {c: (count a) by: {a: a b: b} from: PK2 desc: c take: 10}) 'c) 0) -- 200
+
+;; ── 3-key narrow tuple (the q18 shape: two wide ids + a small derived key) ─
+(set PK3 (table [a b m] (list (% (til 300000) 700) (% (til 300000) 11) (% (til 300000) 60))))
+;; lcm(700,11,60) = 46200 > 300000/… — count distinct triples directly
+(count (select {c: (count a) by: {a: a b: b m: m} from: PK3})) -- 23100
+(sum (at (select {c: (count a) by: {a: a b: b m: m} from: PK3}) 'c)) -- 300000
+(count (select {c: (count a) by: {a: a b: b m: m} from: PK3 desc: c take: 7})) -- 7
+
+;; ── 4-key tuple: past the 2-lane / 16-byte packing width ─────────────────
+(set PK4 (table [a b c d] (list (% (til 300000) 13) (% (til 300000) 7) (% (til 300000) 5) (% (til 300000) 3))))
+(count (select {n: (count a) by: {a: a b: b c: c d: d} from: PK4})) -- 1365
+(sum (at (select {n: (count a) by: {a: a b: b c: c d: d} from: PK4}) 'n)) -- 300000
+
+;; ── mixed declared widths I16 / I32 / I64, with negatives ────────────────
+(set PKW (table [s i l v] (list (as 'I16 (- (% (til 300000) 400) 200)) (as 'I32 (- (% (til 300000) 9) 4)) (- (% (til 300000) 6) 3) (til 300000))))
+(count (select {n: (count v) by: {s: s i: i l: l} from: PKW})) -- 3600
+(sum (at (select {n: (count v) by: {s: s i: i l: l} from: PKW}) 'n)) -- 300000
+;; negative keys survive the packed hash and compare
+(at (at (select {n: (count v) by: {s: s} asc: s from: PKW}) 's) 0) -- -200
+(count (select {n: (count v) by: {s: s i: i} from: PKW where: (< s 0)})) -- 1800
+
+;; ── WHERE (rowsel) under the packed path ─────────────────────────────────
+(sum (at (select {n: (count v) by: {i: i l: l} from: PKW where: (< v 1000)}) 'n)) -- 1000
+(count (select {n: (count a) by: {a: a b: b} from: PK2 where: (< a 10)})) -- 30
+
+;; ── SYM keys are packed lanes too (cell ids), mixed with an integer key ───
+(set PKS (table [g k v] (list (as 'SYM (% (til 300000) 97)) (% (til 300000) 8) (til 300000))))
+(count (select {n: (count v) by: {g: g k: k} from: PKS})) -- 776
+(sum (at (select {n: (count v) by: {g: g k: k} from: PKS}) 'n)) -- 300000
+(count (select {n: (count v) by: {g: g k: k} from: PKS desc: n take: 5})) -- 5
+
+;; ── NOT packed: an F64 key keeps the per-key hash (−0.0 normalisation) ────
+(set PKF (table [f k v] (list (% (til 300000) 37.0) (% (til 300000) 4) (til 300000))))
+(count (select {n: (count v) by: {f: f k: k} from: PKF})) -- 148
+(sum (at (select {n: (count v) by: {f: f k: k} from: PKF}) 'n)) -- 300000
+;; F64 key mixed with an integer key, emit filter armed
+(count (select {n: (count v) by: {f: f k: k} from: PKF desc: n take: 6})) -- 6
+
+;; ── NOT packed: a STR key stays on the inline-STR / wide-key machinery ────
+(set PKT (table [s k v] (list (as 'STR (% (til 300000) 53)) (% (til 300000) 6) (til 300000))))
+(count (select {n: (count v) by: {s: s k: k} from: PKT})) -- 318
+(sum (at (select {n: (count v) by: {s: s k: k} from: PKT}) 'n)) -- 300000
+
+;; ── Nullable keys: the null-mask words are NOT elided, so a NULL key stays
+;;    a distinct group from a 0 / "" key. ───────────────────────────────────
+(set PKN (table [k v] (list (as 'I64 (list 1 0 0Ni 1 0Ni 0)) [10 20 30 40 50 60])))
+(count (select {n: (count v) by: {k: k} from: PKN})) -- 3
+(sum (at (select {n: (count v) by: {k: k} from: PKN}) 'n)) -- 6
+(count (select {n: (count v) by: {k: k} from: PKN desc: n take: 2})) -- 2
+;; two nullable keys, null in either position
+(count (select {n: (count v) by: {a: a b: b} from: (table [a b v] (list (as 'I64 (list 1 1 0Ni 0Ni 0)) (as 'I64 (list 2 0Ni 2 0Ni 0)) [1 2 3 4 5]))})) -- 5
+
+;; ── COUNT keeps its own semantics next to a value-bearing agg (the OP_COUNT
+;;    slot elision must not shift the other aggs' accumulator slots). ───────
+(set PKA (table [k v w] (list (% (til 300000) 100) (til 300000) (% (til 300000) 3))))
+(at (at (select {n: (count v) s: (sum w) mn: (min v) mx: (max v) by: {k: k} asc: k from: PKA}) 'n) 0) -- 3000
+(at (at (select {n: (count v) s: (sum w) mn: (min v) mx: (max v) by: {k: k} asc: k from: PKA}) 'mn) 0) -- 0
+(at (at (select {n: (count v) s: (sum w) mn: (min v) mx: (max v) by: {k: k} asc: k from: PKA}) 'mx) 0) -- 299900
+(sum (at (select {n: (count v) s: (sum w) by: {k: k} from: PKA}) 's)) -- 300000
+;; aggs BEFORE and AFTER the count in the projection order
+(at (at (select {s: (sum w) n: (count v) mx: (max v) by: {k: k} asc: k from: PKA}) 'mx) 99) -- 299999
