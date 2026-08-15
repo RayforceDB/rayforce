@@ -85,9 +85,10 @@
 (count (select {c: (count v) by: {k: k j: j} from: BIGN})) -- 1000
 (sum (at (select {c: (count v) by: {k: k j: j} from: BIGN}) 'c)) -- 2500000
 
-;; ── Tuple width: 8 keys vs 9 keys — both packed ──────────────────────────
-;; Pins that eligibility has no lane-count / 16-byte cap; 9 keys simply falls
-;; off the morsel stager's stack budget onto the row-major packed builder.
+;; ── Tuple width: 8 keys vs 9 keys ────────────────────────────────────────
+;; Result-level only: at 300K rows these stay below the radix-layout cutoff,
+;; so this pins values for wide key tuples but not which builder runs them
+;; (the P1_MORSEL_KEYS stack-budget boundary has no path-level test).
 (set K9 (table [a b c d e f g h i v] (list (% (til 300000) 2) (% (til 300000) 3) (% (til 300000) 5) (% (til 300000) 7) (% (til 300000) 11) (as 'I16 (% (til 300000) 13)) (as 'I32 (% (til 300000) 4)) (% (til 300000) 6) (as 'SYM (% (til 300000) 9)) (til 300000))))
 (count (select {n: (count v) by: {a: a b: b c: c d: d e: e f: f g: g h: h} from: K9})) -- 60060
 (count (select {n: (count v) by: {a: a b: b c: c d: d e: e f: f g: g h: h i: i} from: K9})) -- 180180

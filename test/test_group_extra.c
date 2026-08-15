@@ -2409,6 +2409,44 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Packed-key eligibility: F64 keys must never join the packed lane path.
+ * The lane compare is raw-bit while ray_hash_f64 normalises -0.0, so a
+ * packed F64 key would make hash and equality disagree.  The rfl-level
+ * ±0.0 test cannot pin this (a raw-bit hash+compare is self-consistent
+ * and passes it), so the predicate is asserted directly here.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_ght_packed_key_excludes_f64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    uint16_t agg_ops[1] = { OP_SUM };
+    ray_t* agg_vecs[1] = { ray_vec_new(RAY_F64, 1) };
+    TEST_ASSERT_NOT_NULL(agg_vecs[0]);
+    agg_vecs[0]->len = 1;
+    ((double*)ray_data(agg_vecs[0]))[0] = 0.0;
+
+    int8_t key_types[2] = { RAY_I64, RAY_I64 };
+    ght_layout_t ly;
+    TEST_ASSERT_TRUE(ght_compute_layout(&ly, 2, 1, agg_vecs, NULL,
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
+    TEST_ASSERT_TRUE(ly.packed_key);      /* integer keys: packed */
+    ght_layout_free(&ly);
+
+    key_types[1] = RAY_F64;
+    TEST_ASSERT_TRUE(ght_compute_layout(&ly, 2, 1, agg_vecs, NULL,
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
+    TEST_ASSERT_FALSE(ly.packed_key);     /* any F64 key: excluded */
+    ght_layout_free(&ly);
+
+    ray_release(agg_vecs[0]);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Fused grouped count-distinct kernel (src/ops/cdfuse.c)
  * -------------------------------------------------------------------------- */
 
@@ -2676,6 +2714,7 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/hll_count_distinct_approx_pg_stream_types", test_hll_count_distinct_approx_pg_stream_types, NULL, NULL },
     { "group_extra/hll_merge_edges",               test_hll_merge_edges,               NULL, NULL },
     { "group_extra/ght_layout_copy_depth_invariance", test_ght_layout_copy_depth_invariance, NULL, NULL },
+    { "group_extra/ght_packed_key_excludes_f64", test_ght_packed_key_excludes_f64, NULL, NULL },
     { "group_extra/cd_fused_basic",                test_cd_fused_basic,                NULL, NULL },
     { "group_extra/cd_fused_interleaved",          test_cd_fused_interleaved,          NULL, NULL },
     { "group_extra/cd_fused_narrow_types",         test_cd_fused_narrow_types,         NULL, NULL },
