@@ -50,6 +50,7 @@
 #include "ops/cdfuse.h"
 #include "table/sym.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define N 70000  /* > RAY_PARALLEL_THRESHOLD (65536) */
@@ -2409,6 +2410,63 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
  * Fused grouped count-distinct kernel (src/ops/cdfuse.c)
  * -------------------------------------------------------------------------- */
 
+/* Full O(n) reference check of a ray_cd_fused result against the row-major
+ * key/value arrays the caller generated.  Verifies, for EVERY group: the key
+ * (in first-seen order), the distinct count, and the _first row — plus that
+ * the emitted _first column is strictly increasing.  Key values must lie in
+ * [0,nk), value values in [0,nv). */
+static test_result_t cdf_verify(ray_t* r, const int64_t* kref, const int64_t* vref,
+                                int64_t n, int64_t nk, int64_t nv) {
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(r->type == RAY_TABLE, "fused cd returns a table");
+
+    int64_t* exp_cnt = (int64_t*)calloc((size_t)nk, sizeof(int64_t));
+    int64_t* exp_first = (int64_t*)malloc((size_t)nk * sizeof(int64_t));
+    int64_t* exp_key = (int64_t*)malloc((size_t)nk * sizeof(int64_t));
+    char* seen = (char*)calloc((size_t)nk * (size_t)nv, 1);
+    TEST_ASSERT_NOT_NULL(exp_cnt);
+    TEST_ASSERT_NOT_NULL(exp_first);
+    TEST_ASSERT_NOT_NULL(exp_key);
+    TEST_ASSERT_NOT_NULL(seen);
+    for (int64_t i = 0; i < nk; i++) exp_first[i] = -1;
+
+    int64_t exp_ng = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t kk = kref[i], vv = vref[i];
+        if (exp_first[kk] < 0) { exp_first[kk] = i; exp_key[exp_ng++] = kk; }
+        char* slot = &seen[kk * nv + vv];
+        if (!*slot) { *slot = 1; exp_cnt[kk]++; }
+    }
+
+    ray_t* keys = ray_table_get_col_idx(r, 0);
+    ray_t* cnts = ray_table_get_col_idx(r, 1);
+    ray_t* firsts = ray_table_get_col_idx(r, 2);
+    TEST_ASSERT_NOT_NULL(keys);
+    TEST_ASSERT_NOT_NULL(cnts);
+    TEST_ASSERT_NOT_NULL(firsts);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), exp_ng);
+    const int64_t* gk = (const int64_t*)ray_data(keys);
+    const int64_t* gc = (const int64_t*)ray_data(cnts);
+    const int64_t* gf = (const int64_t*)ray_data(firsts);
+    for (int64_t g = 0; g < exp_ng; g++) {
+        TEST_ASSERT_FMT(gk[g] == exp_key[g],
+                        "group %lld key: got %lld, expected %lld",
+                        (long long)g, (long long)gk[g], (long long)exp_key[g]);
+        TEST_ASSERT_FMT(gc[g] == exp_cnt[exp_key[g]],
+                        "group %lld (key %lld) count: got %lld, expected %lld",
+                        (long long)g, (long long)exp_key[g], (long long)gc[g],
+                        (long long)exp_cnt[exp_key[g]]);
+        TEST_ASSERT_FMT(gf[g] == exp_first[exp_key[g]],
+                        "group %lld (key %lld) _first: got %lld, expected %lld",
+                        (long long)g, (long long)exp_key[g], (long long)gf[g],
+                        (long long)exp_first[exp_key[g]]);
+        TEST_ASSERT_FMT(g == 0 || gf[g] > gf[g - 1],
+                        "_first not strictly increasing at group %lld", (long long)g);
+    }
+    free(exp_cnt); free(exp_first); free(exp_key); free(seen);
+    PASS();
+}
+
 static test_result_t test_cd_fused_basic(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -2416,31 +2474,104 @@ static test_result_t test_cd_fused_basic(void) {
     /* 300000 rows, 1000 keys, 3 distinct values per key (see the rfl pin).
      * Row count is >= CDF_MIN_ROWS so the kernel's admission gate passes;
      * the key/value shape mirrors the brief's 200-key sketch. */
-    int64_t n = 300000, nk = 1000;
+    int64_t n = 300000, nk = 1000, nv = 3000;
     ray_t* k = ray_vec_new(RAY_I64, n);
     ray_t* v = ray_vec_new(RAY_I64, n);
     TEST_ASSERT_NOT_NULL(k);
     TEST_ASSERT_NOT_NULL(v);
     int64_t* kd = (int64_t*)ray_data(k);
     int64_t* vd = (int64_t*)ray_data(v);
-    for (int64_t i = 0; i < n; i++) { kd[i] = i % nk; vd[i] = i % (nk * 3); }
+    for (int64_t i = 0; i < n; i++) { kd[i] = i % nk; vd[i] = i % nv; }
     k->len = n; v->len = n;
 
     ray_t* r = ray_cd_fused(k, v, n);
     TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT(r->type == RAY_TABLE, "fused cd returns a table");
     TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
-    ray_t* keys = ray_table_get_col_idx(r, 0);
-    ray_t* cnts = ray_table_get_col_idx(r, 1);
-    TEST_ASSERT_NOT_NULL(keys);
-    TEST_ASSERT_NOT_NULL(cnts);
     /* stable first-seen order: key i at row i for this data */
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(keys))[0], 0);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(keys))[nk - 1], nk - 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], 0);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[nk - 1], nk - 1);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
     int64_t total = 0;
-    for (int64_t g = 0; g < nk; g++) total += ((int64_t*)ray_data(cnts))[g];
+    for (int64_t g = 0; g < nk; g++)
+        total += ((int64_t*)ray_data(ray_table_get_col_idx(r, 1)))[g];
     TEST_ASSERT_EQ_I(total, nk * 3);   /* 3 distinct values per key */
     ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Interleaved keys: first occurrences are NOT monotonic in key value, so the
+ * emitted order genuinely exercises the cross-partition first_row sort and the
+ * per-record first_row MIN.  Distinct counts differ between groups. */
+static test_result_t test_cd_fused_interleaved(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 997, nv = 1013;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i * 391) % nk;   /* 391 coprime with 997 → scrambled order */
+        vd[i] = (i * 7) % nv;
+    }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    /* keys are emitted in first-seen (not sorted) order for this pattern */
+    const int64_t* gk = (const int64_t*)ray_data(ray_table_get_col_idx(r, 0));
+    int sorted = 1;
+    for (int64_t g = 1; g < ray_table_nrows(r); g++)
+        if (gk[g] < gk[g - 1]) { sorted = 0; break; }
+    TEST_ASSERT(!sorted, "emitted key order must be first-seen, not sorted");
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Narrow column types: I32 key, I16 value (read_col_i64 widening path). */
+static test_result_t test_cd_fused_narrow_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 1000, nv = 300;
+    ray_t* k = ray_vec_new(RAY_I32, n);
+    ray_t* v = ray_vec_new(RAY_I16, n);
+    ray_t* kr = ray_vec_new(RAY_I64, n);
+    ray_t* vr = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_NOT_NULL(kr);
+    TEST_ASSERT_NOT_NULL(vr);
+    int32_t* kd = (int32_t*)ray_data(k);
+    int16_t* vd = (int16_t*)ray_data(v);
+    int64_t* kd64 = (int64_t*)ray_data(kr);
+    int64_t* vd64 = (int64_t*)ray_data(vr);
+    for (int64_t i = 0; i < n; i++) {
+        kd64[i] = (i * 13) % nk;
+        vd64[i] = (i * 3) % nv;
+        kd[i] = (int32_t)kd64[i];
+        vd[i] = (int16_t)vd64[i];
+    }
+    k->len = n; v->len = n; kr->len = n; vr->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    test_result_t chk = cdf_verify(r, kd64, vd64, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    ray_release(r);
+    ray_release(k); ray_release(v); ray_release(kr); ray_release(vr);
 
     ray_sym_destroy();
     ray_heap_destroy();
@@ -2477,5 +2608,7 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/hll_merge_edges",               test_hll_merge_edges,               NULL, NULL },
     { "group_extra/ght_layout_copy_depth_invariance", test_ght_layout_copy_depth_invariance, NULL, NULL },
     { "group_extra/cd_fused_basic",                test_cd_fused_basic,                NULL, NULL },
+    { "group_extra/cd_fused_interleaved",          test_cd_fused_interleaved,          NULL, NULL },
+    { "group_extra/cd_fused_narrow_types",         test_cd_fused_narrow_types,         NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

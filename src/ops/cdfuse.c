@@ -94,6 +94,12 @@ typedef struct {
     cdf_buf_t* bufs; /* [nw * n_parts] */
     uint32_t prime;  /* first-allocation capacity per buf */
     _Atomic(int) oom;
+    /* Rows actually scattered.  ray_pool_dispatch clamps its task count to
+     * the ring capacity but RECOMPUTES the grain, so no row is dropped by
+     * clamping — however a cancelled pool (pool->cancelled) skips claimed
+     * tasks outright.  Comparing this against nrows turns any such silent
+     * row loss into a NULL decline instead of a short answer. */
+    _Atomic(int64_t) rows_done;
 } cdf_p1_ctx_t;
 
 static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -115,6 +121,7 @@ static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         ((int64_t*)rec)[2] = v;
         ((int64_t*)rec)[3] = r;
     }
+    atomic_fetch_add_explicit(&c->rows_done, end - start, memory_order_relaxed);
 }
 
 /* ══════════════════════════════════════════
@@ -139,6 +146,13 @@ typedef struct {
     cdf_part_t* parts;
     uint32_t nw, n_parts, part_bits;
     _Atomic(int) oom;
+    /* Partitions actually processed.  ray_pool_dispatch_n CLAMPS its task
+     * count to the ring capacity when the growth realloc fails (see
+     * RAY_POOL_INIT_TASKS in core/pool.h) and a cancelled pool skips claimed
+     * tasks — either way the tail partitions never run, keep ng == 0, and
+     * their groups would silently vanish from the result.  The wrapper
+     * compares this against n_parts and declines (NULL) on mismatch. */
+    _Atomic(int64_t) done;
 } cdf_p2_ctx_t;
 
 static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -150,7 +164,10 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         for (uint32_t w = 0; w < c->nw; w++)
             total += c->bufs[(size_t)w * c->n_parts + p].n;
         c->parts[p].ng = 0;
-        if (total == 0) continue;
+        if (total == 0) {
+            atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
+            continue;
+        }
 
         /* Both partition-local tables are sized to 2× the record count:
          * groups and distinct (k,v) pairs are each bounded by the record
@@ -211,8 +228,16 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
                 int64_t gi = 0;
                 for (;;) {
                     if (kidx[t] == -1) {
-                        if (ng == cap) {
-                            int64_t nc = cap * 2 > total ? total : cap * 2;
+                        if (ng >= cap) {
+                            /* Invariant: ng <= total — every group is opened
+                             * by a distinct record of this partition, so the
+                             * record count bounds the group count and `total`
+                             * is a legitimate clamp.  The growth must never
+                             * be a no-op while ng == cap (that would write one
+                             * past the end), so nc is always > cap: clamp to
+                             * total only while cap is still below it. */
+                            int64_t nc = cap * 2;
+                            if (nc > total && cap < total) nc = total;
                             cdf_grp_t* ngp = (cdf_grp_t*)ray_realloc_raw(
                                 grps, (size_t)nc * sizeof(cdf_grp_t));
                             if (!ngp) { failed = 1; break; }
@@ -265,6 +290,7 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         c->parts[p].g = grps;
         c->parts[p].cap = cap;
         c->parts[p].ng = ng;
+        atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
     }
 }
 
@@ -342,20 +368,22 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         /* Uniform-hash expectation with 25% slack; ≥8 so tiny buffers don't
          * immediately re-double. */
         .prime = (uint32_t)((uint64_t)nrows / ((uint64_t)nw * n_parts) * 5 / 4 + 8),
-        .oom = 0,
+        .oom = 0, .rows_done = 0,
     };
     ray_pool_dispatch(pool, cdf_p1_fn, &p1, nrows);
-    if (atomic_load_explicit(&p1.oom, memory_order_relaxed)) {
+    if (atomic_load_explicit(&p1.oom, memory_order_relaxed) ||
+        atomic_load_explicit(&p1.rows_done, memory_order_relaxed) != nrows) {
         cdf_free_all(bufs, nbuf, parts, n_parts);
         return NULL; /* fallback, not an error */
     }
 
     cdf_p2_ctx_t p2 = {
         .bufs = bufs, .parts = parts, .nw = nw, .n_parts = n_parts,
-        .part_bits = (uint32_t)__builtin_ctz(n_parts), .oom = 0,
+        .part_bits = (uint32_t)__builtin_ctz(n_parts), .oom = 0, .done = 0,
     };
     ray_pool_dispatch_n(pool, cdf_p2_fn, &p2, n_parts);
-    if (atomic_load_explicit(&p2.oom, memory_order_relaxed)) {
+    if (atomic_load_explicit(&p2.oom, memory_order_relaxed) ||
+        atomic_load_explicit(&p2.done, memory_order_relaxed) != (int64_t)n_parts) {
         cdf_free_all(bufs, nbuf, parts, n_parts);
         return NULL;
     }
