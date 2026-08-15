@@ -85,4 +85,10 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                           const char* dir, int64_t rows_per_chunk);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 
+/* Hash-vs-chunk-zone index policy for a column, from its chunk-zone entropy
+ * (payload-level; see csv.c).  Shared by the in-memory CSV load and the
+ * .csv.splayed store index builder so both make the same decision. */
+int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
+                               const void* index_payload);
+
 #endif /* RAY_CSV_H */

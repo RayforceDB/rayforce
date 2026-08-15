@@ -1466,14 +1466,17 @@ static int csv_hash_elem_size(int8_t t) {
  * BOOL/U8/I16 where the index would dwarf the column.
  *
  * Returns 1 to attach, 0 to skip. */
-static int csv_should_attach_hash(ray_t* v) {
-    if (!v || RAY_IS_ERR(v)) return 0;
-    int esz = csv_hash_elem_size(v->type);
+/* Payload-level core of the hash-upgrade decision, shared with the
+ * .csv.splayed index builder (ray_splay_build_indexes) so the on-disk
+ * store makes the SAME hash-vs-zone decision the in-memory load does --
+ * a reloaded store must not query slower than a fresh .csv.read. */
+int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
+                               const void* index_payload) {
+    const ray_index_t* ix = (const ray_index_t*)index_payload;
+    int esz = csv_hash_elem_size(type);
     if (esz == 0) return 0;
-    /* Need a chunk_zone we can read for entropy estimation. */
-    if (!(v->attrs & RAY_ATTR_HAS_INDEX) || !v->index) return 0;
-    ray_index_t* ix = ray_index_payload(v->index);
-    if (ix->kind != RAY_IDX_CHUNK_ZONE || ix->u.chunk_zone.is_f64) return 0;
+    if (!ix || ix->kind != RAY_IDX_CHUNK_ZONE || ix->u.chunk_zone.is_f64)
+        return 0;
     uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
     if (n_chunks < 4) return 0;
     const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
@@ -1535,7 +1538,7 @@ static int csv_should_attach_hash(ray_t* v) {
      * index dwarfs the data) out of the index set while admitting
      * I32 / I64 numeric IDs.  Done in int64 arithmetic (we cap n
      * to anything that would overflow at the row counts we accept). */
-    int64_t n = v->len;
+    int64_t n = len;
     if (n <= 0) return 0;
     uint64_t cap = 8;
     uint64_t want = (uint64_t)(2 * n);
@@ -1545,6 +1548,13 @@ static int csv_should_attach_hash(ray_t* v) {
     if (aux_bytes > 5u * data_bytes) return 0;
 
     return 1;
+}
+
+static int csv_should_attach_hash(ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return 0;
+    if (!(v->attrs & RAY_ATTR_HAS_INDEX) || !v->index) return 0;
+    return ray_csv_hash_upgrade_check(v->type, v->len,
+                                      ray_index_payload(v->index));
 }
 
 /* --------------------------------------------------------------------------
@@ -1953,9 +1963,19 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
      * After the chunk_zone attaches we re-walk the same columns and
      * upgrade the high-entropy ones to a hash index (the chunk_zone
      * stays as well — it's the entropy signal we just measured).  See
-     * csv_should_attach_hash for the selectivity + memory cap. */
+     * csv_should_attach_hash for the selectivity + memory cap.
+     *
+     * Progress: same treatment as the finalize dispatch above — the
+     * per-column index builds run their own pool dispatches whose row
+     * totals are not n_rows, so letting them drive the progress pump
+     * resets a completed parse to arbitrary fractions (visibly
+     * 100% -> 50% -> ...).  Suppress progress for the whole index
+     * phase; the parse's completed row count stays on screen. */
+    uint32_t idx_qmode = ray_qstats_mode();
+    ray_qstats_set_mode(idx_qmode & ~RAY_QS_PROGRESS);
     for (int c = 0; c < ncols; c++) {
         if (ray_interrupted()) {
+            ray_qstats_set_mode(idx_qmode);
             for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
             return ray_error("cancel", "interrupted");
         }
@@ -1964,6 +1984,7 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         if (v->len < (1 << 16)) continue;        /* < one chunk, skip */
         ray_t* r = ray_index_attach_chunk_zone(&v, 16);
         if (ray_interrupted()) {
+            ray_qstats_set_mode(idx_qmode);
             for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
             return ray_error("cancel", "interrupted");
         }
@@ -1972,6 +1993,7 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
     }
     for (int c = 0; c < ncols; c++) {
         if (ray_interrupted()) {
+            ray_qstats_set_mode(idx_qmode);
             for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
             return ray_error("cancel", "interrupted");
         }
@@ -1984,11 +2006,13 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
          * anyway, so the chunk_zone is dead weight. */
         ray_t* r = ray_index_attach_hash(&v);
         if (ray_interrupted()) {
+            ray_qstats_set_mode(idx_qmode);
             for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
             return ray_error("cancel", "interrupted");
         }
         if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
     }
+    ray_qstats_set_mode(idx_qmode);
 
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) {
@@ -2459,24 +2483,30 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
          * matching loop in build_table_from_cols) — unsupported types
          * fall through to the unindexed path inside the consumer.
          * Second pass upgrades high-entropy columns to a hash index;
-         * see csv_should_attach_hash. */
+         * see csv_should_attach_hash.
+         * Progress suppressed for the whole phase (same rationale as the
+         * finalize dispatch): the index builds' pool dispatches would
+         * reset the completed parse progress to arbitrary fractions. */
+        uint32_t idx_qmode = ray_qstats_mode();
+        ray_qstats_set_mode(idx_qmode & ~RAY_QS_PROGRESS);
         for (int c = 0; c < ncols; c++) {
-            if (ray_interrupted()) goto fail_cols_cancel;
+            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
             ray_t* v = col_vecs[c];
             if (!v || RAY_IS_ERR(v)) continue;
             if (v->len < (1 << 16)) continue;
             ray_t* r = ray_index_attach_chunk_zone(&v, 16);
-            if (ray_interrupted()) goto fail_cols_cancel;
+            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
             if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
         }
         for (int c = 0; c < ncols; c++) {
-            if (ray_interrupted()) goto fail_cols_cancel;
+            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
             ray_t* v = col_vecs[c];
             if (!csv_should_attach_hash(v)) continue;
             ray_t* r = ray_index_attach_hash(&v);
-            if (ray_interrupted()) goto fail_cols_cancel;
+            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
             if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
         }
+        ray_qstats_set_mode(idx_qmode);
 
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
