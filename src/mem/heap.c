@@ -1223,13 +1223,13 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
  * repeat-query case hits exactly; the bound keeps waste at <= 25%.
  * Concurrency: any thread may alloc or free a direct block, so a global
  * spinlock guards the table — direct ops are a handful per query, so
- * contention is nil.  RAY_DIRECT_CACHE_MB overrides the 512MB budget
- * (0 disables). */
+ * contention is nil.  Budget: 1/16 of the anon watermark (physical RAM
+ * by default, the -m budget when set), capped at 512MB — no knob; the
+ * cache is invisible to correctness and self-drains under pressure. */
 #define RAY_DIRECT_CACHE_SLOTS 16
 typedef struct { void* base; size_t map_size; } ray_direct_cache_slot_t;
 static ray_direct_cache_slot_t g_direct_cache[RAY_DIRECT_CACHE_SLOTS];
 static size_t          g_direct_cache_bytes = 0;
-static _Atomic(size_t) g_direct_cache_budget = (size_t)-1;  /* -1 = unresolved */
 static _Atomic(int)    g_direct_cache_spin = 0;
 
 static inline void direct_cache_lock(void) {
@@ -1241,24 +1241,15 @@ static inline void direct_cache_unlock(void) {
 }
 
 static size_t direct_cache_budget(void) {
-    size_t b = atomic_load_explicit(&g_direct_cache_budget,
-                                    memory_order_relaxed);
-    if (b != (size_t)-1) return b;
-    const char* env = getenv("RAY_DIRECT_CACHE_MB");
-    size_t mb = 512;
-    if (env && *env) {
-        long v = strtol(env, NULL, 10);
-        mb = (v >= 0) ? (size_t)v : 512;
-    }
-    b = mb << 20;
-    atomic_store_explicit(&g_direct_cache_budget, b, memory_order_relaxed);
+    int64_t wm = heap_anon_watermark();
+    size_t b = (wm > 0) ? (size_t)wm / 16 : 0;
+    if (b > (512u << 20)) b = (512u << 20);
     return b;
 }
 
 /* Take a cached block whose map_size fits [need, need + waste bound].
  * Returns the base pointer (its map_size in *out_size) or NULL. */
 static void* direct_cache_take(size_t need, size_t* out_size) {
-    if (direct_cache_budget() == 0) return NULL;
     void* base = NULL;
     direct_cache_lock();
     size_t slack = need / 4;
