@@ -1,0 +1,98 @@
+;; Issue #394 — verified runtime gaps and deliberate Rayfall semantics.
+
+;; STR columns are valid equi-join keys.
+(set I394L (table [k lv] (list (list "alpha" "beta" "gamma") [1 2 3])))
+(set I394R (table [k rv] (list (list "gamma" "alpha" "delta") [30 10 40])))
+(count (inner-join [k] I394L I394R)) -- 2
+(sum (at (inner-join [k] I394L I394R) 'rv)) -- 40
+(count (anti-join [k] I394L I394R)) -- 1
+
+;; Pooled (>12-byte) and sliced STR descriptors use the same fast path while
+;; retaining content equality across independent string pools.
+(set I394LongLKeys (as 'STR ["customer-account-alpha" "customer-account-beta" "customer-account-gamma"]))
+(set I394LongRKeys (as 'STR ["customer-account-gamma" "customer-account-alpha" "customer-account-delta"]))
+(set I394LongL (table [k lv] (list I394LongLKeys [1 2 3])))
+(set I394LongR (table [k rv] (list I394LongRKeys [30 10 40])))
+(sum (at (inner-join [k] I394LongL I394LongR) 'rv)) -- 40
+(set I394SliceL (table [k lv] (list (drop (as 'STR ["unused-long-prefix" "customer-account-alpha" "customer-account-beta"]) 1) [1 2])))
+(set I394SliceR (table [k rv] (list (drop (as 'STR ["unused-long-prefix" "customer-account-beta" "customer-account-alpha"]) 1) [20 10])))
+(sum (at (inner-join [k] I394SliceL I394SliceR) 'rv)) -- 30
+
+;; STR remains a first-class component of composite join keys.
+(set I394MultiL (table [tenant hk lv] (list [1 1 2 2] (as 'STR ["0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210" "0123456789abcdef0123456789abcdef" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) [10 20 30 40])))
+(set I394MultiR (table [tenant hk rv] (list [2 1 1 3] (as 'STR ["0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) [300 100 200 400])))
+(count (inner-join [tenant hk] I394MultiL I394MultiR)) -- 3
+(sum (at (inner-join [tenant hk] I394MultiL I394MultiR) 'rv)) -- 600
+(count (anti-join [tenant hk] I394MultiL I394MultiR)) -- 1
+
+;; STR grouping is hashed for both single and composite keys.  More than 1024
+;; unique pooled strings exercises dynamic group growth and cached hashes.
+(set I394GroupKeys (map (fn [i] (concat "0123456789abcdef0123456789abcdef" (as 'str i))) (til 1500)))
+(count (key (group I394GroupKeys))) -- 1500
+(sum (map count (value (group I394GroupKeys)))) -- 1500
+(set I394GroupT (table [tenant hk amount] (list [1 1 1 2 2] (as 'STR ["0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210" "0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef"]) [10 20 30 40 50])))
+(count (select {from:I394GroupT by:[tenant hk] total:(sum amount)})) -- 3
+(sum (at (select {from:I394GroupT by:[tenant hk] total:(sum amount)}) 'total)) -- 150
+
+;; A misspelled/missing join key is a schema error, not an empty result.
+(inner-join [missing] I394L I394R) !- domain
+(anti-join [missing] I394L I394R) !- domain
+
+;; Dyadic fill, min, and max are atomic and broadcast scalars.
+(fill 0 [1 0Nl 3]) -- [1 0 3]
+(min [3 9 1] [2 10 4]) -- [2 9 1]
+(max [3 9 1] 5) -- [5 9 5]
+
+;; String find uses the typed hash-set path and preserves first-index/miss rules.
+(find (list "alpha" "beta" "gamma") "beta") -- 1
+(find (list "alpha" "beta" "gamma") "absent") -- 0Nl
+
+;; Hashing is an internal implementation detail, not a language builtin.
+(hash 42) !- name
+(wyhash 42) !- name
+
+;; xkey construction is hash-based and keyed dictionaries accept vector probes.
+(set I394T (table [k v] (list (til 5000) (+ 10 (til 5000)))))
+(set I394D (xkey I394T 'k))
+(count I394D) -- 5000
+(at (at (at I394D [1 4999]) 0) 'v) -- 11
+(at (at (at I394D [1 4999]) 1) 'v) -- 5009
+
+;; Nested functions capture visible lexical values.
+(set I394MakeAdder (fn [x] (fn [y] (+ x y))))
+(set I394Add7 (I394MakeAdder 7))
+(I394Add7 5) -- 12
+(set I394Add7Roundtrip (de (ser I394Add7)))
+(I394Add7Roundtrip 6) -- 13
+
+;; Lambda parameters and let bindings take precedence over query columns.
+(set I394Q (table [x v] (list [1 2] [10 20])))
+(set I394SelectParam (fn [x] (select {y:x from:I394Q})))
+(at (I394SelectParam 99) 'y) -- [99 99]
+(set I394UpdateParam (fn [x] (update {v:x from:I394Q})))
+(at (I394UpdateParam 77) 'v) -- [77 77]
+
+;; Query scopes do not count as lexical shadowing.  While the outer where:
+;; expression has its `x` column mounted, the called lambda's inner query must
+;; still mount its own same-named `x` column.  `eval` forces the tree-walk path
+;; that originally exposed the collision.
+(set I394NestedInner (table [x] (list [10 20])))
+(set I394NestedOuter (table [x] (list [1 2])))
+(set I394NestedQuery (fn [] (first (at (select {v:(eval (list + x 0)) from:I394NestedInner}) 'v))))
+(count (select {from:I394NestedOuter where:(== (I394NestedQuery) 10)})) -- 2
+(set I394NestedDagQuery (fn [] (first (at (select {v:x from:I394NestedInner}) 'v))))
+(count (select {from:I394NestedOuter where:(== (I394NestedDagQuery) 10)})) -- 2
+
+;; The same distinction must drive grouped-expression shape classification.
+;; Otherwise the outer query's `x` makes the inner `(I394First x)` look
+;; constant and silently broadcasts 10 into both inner groups.
+(set I394NestedGroupedInner (table [g x] (list [1 2] [10 20])))
+(set I394First (fn [v] (first v)))
+(set I394NestedGrouped (fn [] (at (select {picked:(I394First x) from:I394NestedGroupedInner by:g}) 'picked)))
+(count (select {from:I394NestedOuter where:(== (last (I394NestedGrouped)) 20)})) -- 2
+
+;; These issue claims conflict with established Rayfall semantics: `%` is
+;; modulo, dict literals preserve query ASTs, and key(table) returns its schema.
+(% 7 3) -- 1
+(first (at {a:(list 1 2)} 'a)) -- 'list
+(key (select {s:(sum v) by:x from:I394Q})) -- [x s]

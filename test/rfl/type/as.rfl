@@ -262,6 +262,22 @@
 (as 'date 2000.01.02D00:00:00.000000000) -- 2000.01.02
 ;; date <- String
 (as 'date "2024.03.20") -- 2024.03.20
+;; Leap day is valid in a leap year, rejected otherwise.
+(as 'date "2024.02.29") -- 2024.02.29
+(as 'date "2023.02.29") !- domain
+;; date <- String: malformed input must be REJECTED, not silently parsed.
+;; A month past 12 used to index the days-in-month table out of bounds
+;; (ASan OOB read); trailing garbage and loose fields were also accepted.
+(as 'date "9999.99.99") !- domain
+(as 'date "2024.13.01") !- domain
+(as 'date "2024.00.10") !- domain
+(as 'date "2024.02.31") !- domain
+(as 'date "2024.04.31") !- domain
+(as 'date "2024.01.00") !- domain
+(as 'date "2024.01.02junk") !- domain
+(as 'date "2024.1.2") !- domain
+(as 'date "2024/01/02") !- domain
+(as 'date "2024-01-02") !- domain
 ;; ========== DATE VECTOR CASTS ==========
 (type (as 'DATE [0 1 2])) -- 'DATE
 (as 'I64 (as 'DATE [0 1 2])) -- [0 1 2]
@@ -309,6 +325,21 @@
 (as 'time "20:00:00") -- 20:00:00.000
 (as 'time "20:00:00.") -- 20:00:00.000
 (as 'time "20:00:00.0") -- 20:00:00.000
+;; TIME is a signed duration: hours may exceed a day and go negative,
+;; and HH:MM (no seconds) is accepted.
+(as 'time "25:00:00") -- 25:00:00.000
+(as 'time "-5:00:00") -- -05:00:00.000
+(as 'time "12:34") -- 12:34:00.000
+;; Malformed TIME strings must be REJECTED, not silently normalized.
+;; The old sscanf path accepted trailing garbage and out-of-range fields
+;; ("25:99:99" wrapped to 26:40:39).
+(as 'time "12:34:56junk") !- domain
+(as 'time "12:34:56.789junk") !- domain
+(as 'time "25:99:99") !- domain
+(as 'time "99:99:99") !- domain
+(as 'time "12x34x56") !- domain
+(as 'time "12:3") !- domain
+(as 'time "x") !- domain
 ;; time literals with 1-3 digit fractional seconds
 10:00:00.1 -- 10:00:00.001
 10:00:00.01 -- 10:00:00.001
@@ -420,6 +451,24 @@
 (type (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- 'guid
 ;; String → GUID → STR round-trip preserves the canonical 36-char form.
 (as 'STR (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"
+;; Malformed GUID strings must be REJECTED, not silently decoded into a
+;; wrong-but-valid GUID.  The old parser skipped '-' anywhere and decoded
+;; any character as a nibble, so "zzzz…" became a plausible GUID.
+(as 'guid "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz") !- domain
+(as 'guid "gggggggg-gggg-gggg-gggg-gggggggggggg") !- domain
+(as 'guid "d49f18a4:1969-49e8-9b8a-6bb9a4832eea") !- domain
+(as 'guid "d49f18a4_1969-49e8-9b8a-6bb9a4832eea") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a6bb9a4832eea") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea-") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832ee") !- domain
+(as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eeax") !- domain
+;; A 36-char all-hex string (a dash position holding a hex digit) must be
+;; rejected, not decoded — the byte index would otherwise run past
+;; bytes[16] (stack overflow).
+(as 'guid "0123456789abcdef0123456789abcdef0123") !- domain
+(as 'guid "d49f18a4a1969-49e8-9b8a-6bb9a4832eea") !- domain
+;; Uppercase hex is accepted and normalized on the round-trip.
+(as 'STR (as 'guid "ABCDEF01-2345-6789-ABCD-EF0123456789")) -- "abcdef01-2345-6789-abcd-ef0123456789"
 ;; ========== IDENTITY CASTS (same type) ==========
 (as 'b8 true) -- true
 (as 'u8 0xFF) -- 0xFF
@@ -478,6 +527,36 @@
 (as 'i64 (as 'i32 "-2147483648")) -- 0Nl
 (as 'i64 (as 'i32 "2147483647")) -- 2147483647
 
+;; ========== STRING → NUMERIC: FULL CONSUMPTION + OVERFLOW ==========
+;; The old strtoll/strtol/strtod path stopped at the first non-digit and
+;; never checked the end pointer or ERANGE, so trailing garbage and true
+;; overflow were silently accepted ("1e19" → 1, "9999...9" → INT64_MAX).
+;; All of these must now REJECT with a domain error, matching the strict
+;; DATE/TIME/TIMESTAMP string casts.  Narrow-int truncation itself still
+;; wraps (documented narrow-int rule); only unparseable/overflowing input
+;; errors.
+(as 'i64 "123abc") !- domain
+(as 'i64 "1e19") !- domain
+(as 'i64 "12.5") !- domain
+(as 'i64 "999999999999999999999999") !- domain
+(as 'i64 "-999999999999999999999999") !- domain
+(as 'i32 "123x") !- domain
+(as 'i32 "1e9") !- domain
+(as 'i16 "40000junk") !- domain
+(as 'u8 "12zz") !- domain
+(as 'u8 "300abc") !- domain
+(as 'f64 "1.5x") !- domain
+(as 'f64 "1.5e3junk") !- domain
+;; Clean values still parse.
+(as 'i64 " 123") -- 123
+(as 'i64 "-5") -- -5
+(as 'f64 "0x10") -- 16.0
+;; The string-VECTOR cast routes through the same per-element parser: a
+;; malformed element rejects the whole cast, clean elements parse.
+(as 'I64 (list "42" "-7" "100")) -- [42 -7 100]
+(as 'I64 (list "42" "123abc")) !- domain
+(as 'F64 (list "3.14" "1.5x")) !- domain
+
 ;; ========== NULL PRESERVATION ACROSS CASTS ==========
 ;; Casting any null returns null of target type, never sentinel/INT_MIN.
 (nil? (as 'i64 0Nh)) -- true
@@ -519,3 +598,27 @@
 (count (as 'U8 (til 100000))) -- 100000
 ;; f64 -> i64
 (sum (as 'I64 (as 'F64 (til 100000)))) -- 4999950000
+
+;; ========== OUT-OF-RANGE / NaN SCALAR FLOAT CASTS ==========
+;; A scalar float cast must clamp (and null a NaN) exactly like the vector
+;; cast path.  The scalar path previously did a raw (intN_t)val->f64, which
+;; is signed-overflow undefined behavior for an out-of-range magnitude
+;; (UBSan: "outside the range of representable values of type 'long long'").
+;; Clamp targets: INT64_MAX / INT64_MIN+1, etc. — matching the helpers used
+;; by the vector path.
+(as 'I64 9.3e18) -- 9223372036854775807
+(as 'I64 -9.9e18) -- -9223372036854775807
+(as 'I32 5e9) -- 2147483647
+(as 'I32 -5e9) -- -2147483647
+(as 'I16 70000.0) -- 32767h
+(as 'U8 300.0) -- 0xff
+(as 'U8 -5.0) -- 0x00
+;; Scalar result must equal the one-element vector result.
+(as 'I64 9.3e18) -- (at (as 'I64 [9.3e18]) 0)
+(as 'I32 5e9) -- (at (as 'I32 [5e9]) 0)
+(as 'I16 70000.0) -- (at (as 'I16 [70000.0]) 0)
+;; NaN float → typed null, like the vector path (was UB before).
+(set NaNf (sqrt -1.0))
+(nil? (as 'I64 NaNf)) -- true
+(nil? (as 'I32 NaNf)) -- true
+(nil? (as 'I16 NaNf)) -- true

@@ -40,7 +40,27 @@
 ;; Idempotent: a second fill finds nothing missing → empty result.
 (.db.parted.fill "/tmp/rfl_fill/") -- []
 
+;; Regression #401: an empty copy of a LIST column must use the LIST
+;; constructor, not the concrete-vector constructor (RAY_LIST == 0).
+(set SCHED (table [acct sched] (list ['a 'b] (list (dict [0] [5.0]) (dict [0 250000] [15.0 10.0])))))
+(.db.splayed.set "/tmp/rfl_fill/2024.01.03/SCHED/" SCHED)
+(.db.parted.fill "/tmp/rfl_fill/") -- ['2024.01.01 '2024.01.02]
+(set RS (.db.parted.get "/tmp/rfl_fill/" 'SCHED))
+(count RS) -- 2
+(type (at RS 'sched)) -- 'LIST
+(type (at (at RS 'sched) 0)) -- 'DICT
+(at (at (at RS 'sched) 1) 250000) -- 10.0
+(.db.parted.fill "/tmp/rfl_fill/") -- []
+
+;; Template errors retain their real code instead of being flattened to io.
+(.sys.exec "rm -rf /tmp/rfl_fill_bad") -- 0
+(set TN (table [v] (list [1])))
+(.db.splayed.set "/tmp/rfl_fill_bad/2024.01.01/A/" TN)
+(.db.splayed.set "/tmp/rfl_fill_bad/2024.01.02/BAD/" TN)
+(.sys.exec "printf 'bad' > /tmp/rfl_fill_bad/2024.01.02/BAD/.d") -- 0
+(.db.parted.fill "/tmp/rfl_fill_bad/") !- corrupt
+
 ;; Error paths: missing root and a non-parted (splayed) root.
 (.db.parted.fill "/tmp/rfl_fill_nope/") !- io
 
-(.sys.exec "rm -rf /tmp/rfl_fill")
+(.sys.exec "rm -rf /tmp/rfl_fill /tmp/rfl_fill_bad")

@@ -1048,16 +1048,33 @@ ray_t* distinct_vec_eager(ray_t* x) {
         }
     }
 
-    hashset_t hs;
-    if (!hashset_init(&hs, x, len)) {
-        if (idx != idx_stack) ray_sys_free(idx);
-        return ray_error("oom", NULL);
-    }
+    /* Parallel radix kernel for large fixed-width columns — same
+     * partition scheme as exec_count_distinct, producing the same row-id
+     * set the hashset pass below would (one first-occurrence id per
+     * value).  NULL means the kernel declined (type, size, or pool) and
+     * the hashset handles it.  Either way the ids flow into the shared
+     * sort + gather tail, so result semantics are identical. */
     int64_t count = 0;
-    for (int64_t i = 0; i < len; i++) {
-        if (hashset_insert(&hs, i)) idx[count++] = i;
+    ray_t* rids = distinct_radix_first_ids(x);
+    if (rids && RAY_IS_ERR(rids)) {
+        if (idx != idx_stack) ray_sys_free(idx);
+        return rids;
     }
-    hashset_destroy(&hs);
+    if (rids) {
+        count = ray_len(rids);
+        memcpy(idx, ray_data(rids), (size_t)count * sizeof(int64_t));
+        ray_release(rids);
+    } else {
+        hashset_t hs;
+        if (!hashset_init(&hs, x, len)) {
+            if (idx != idx_stack) ray_sys_free(idx);
+            return ray_error("oom", NULL);
+        }
+        for (int64_t i = 0; i < len; i++) {
+            if (hashset_insert(&hs, i)) idx[count++] = i;
+        }
+        hashset_destroy(&hs);
+    }
 
     /* Sort unique indices by value for numeric/temporal types — preserves
      * pre-existing distinct semantics.  qsort-based; was O(count^2). */
@@ -2243,6 +2260,33 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
 
     /* Dict key access: (at dict key) → value or 0Nl if missing */
     if (vec->type == RAY_DICT) {
+        /* Vectorized lookup keeps LIST available as a composite scalar key
+         * (xkey uses lists for multi-column keys), while every typed vector
+         * is interpreted as a batch of independent keys. */
+        if (is_collection(idx) && idx->type != RAY_LIST) {
+            int64_t n = ray_len(idx);
+            ray_t* out = ray_list_new(n);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+            for (int64_t i = 0; i < n; i++) {
+                int allocated = 0;
+                ray_t* key = collection_elem(idx, i, &allocated);
+                if (!key || RAY_IS_ERR(key)) {
+                    ray_release(out);
+                    return key ? key : ray_error("oom", NULL);
+                }
+                ray_t* value = ray_at_fn(vec, key);
+                if (allocated) ray_release(key);
+                if (!value || RAY_IS_ERR(value)) {
+                    ray_release(out);
+                    return value ? value : ray_error("oom", NULL);
+                }
+                out = ray_list_append(out, value);
+                ray_release(value);
+                if (!out || RAY_IS_ERR(out))
+                    return out ? out : ray_error("oom", NULL);
+            }
+            return out;
+        }
         ray_t* v = ray_dict_get(vec, idx);
         if (v) return v;
         return ray_typed_null(-RAY_I64); /* 0Nl for missing key */
@@ -2345,6 +2389,14 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     ray_t* elem = ((ray_t**)ray_data(vec))[i];
     ray_retain(elem);
     return elem;
+}
+
+/* (fill replacement values) — replace null cells in values.  Registered as
+ * atomic, so scalar replacement broadcasts and vector replacements zip. */
+ray_t* ray_fill_fn(ray_t* replacement, ray_t* value) {
+    ray_t* out = RAY_ATOM_IS_NULL(value) ? replacement : value;
+    ray_retain(out);
+    return out;
 }
 
 /* (find vec val) — index of first occurrence, or -1 */

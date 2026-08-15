@@ -1145,6 +1145,7 @@ static ray_t* substr_str_scalar_view(ray_t* input, int64_t start, int64_t length
             }
             memcpy(d->prefix, sp, 4);
             d->pool_off = s->pool_off + (uint32_t)st;
+            ray_str_t_cache_hash(d, pool);
         } else {
             ray_release(result);
             return NULL;
@@ -1238,6 +1239,7 @@ static ray_t* substr_str_scalar_start_len_view(ray_t* input,
             }
             memcpy(d->prefix, sp, 4);
             d->pool_off = s->pool_off + (uint32_t)st0;
+            ray_str_t_cache_hash(d, pool);
         } else {
             ray_release(result);
             return NULL;
@@ -1245,6 +1247,19 @@ static ray_t* substr_str_scalar_start_len_view(ray_t* input,
     }
 
     return result;
+}
+
+/* True when a whole-column (scalar) start/length argument is null.  Such an
+ * argument applies to every row, so the entire result is null — and a null
+ * integer scalar is INT64_MIN, which must never reach the `scalar - 1`
+ * subtraction in the row loop (signed-overflow UB).  Only scalars are tested
+ * here; the per-row vector case is handled inline via ray_vec_is_null. */
+static bool substr_scalar_is_null(ray_t* v) {
+    if (!v) return false;
+    if (ray_is_atom(v)) return RAY_ATOM_IS_NULL(v);
+    if (ray_is_vec(v) && v->len == 1 && (v->attrs & RAY_ATTR_HAS_NULLS))
+        return ray_vec_is_null(v, 0);
+    return false;
 }
 
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
@@ -1331,10 +1346,18 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
     else if (len_v->type == RAY_I32) l_data_i32 = (const int32_t*)ray_data(len_v);
     else l_data = (const int64_t*)ray_data(len_v);
 
+    /* A scalar (whole-column) null start or length makes every result row
+     * null.  The per-row check below only inspects the vector (s_data /
+     * l_data) case, so a scalar NULL_I64 start would otherwise reach the
+     * `s_scalar - 1` subtraction and overflow (signed-overflow UB). */
+    bool s_all_null = !s_data && !s_data_i32 && substr_scalar_is_null(start_v);
+    bool l_all_null = !l_data && !l_data_i32 && substr_scalar_is_null(len_v);
+
     for (int64_t i = 0; i < nrows; i++) {
         /* Propagate null — from input, start, or length */
         /* STR input has no null; start/len are I64 and can be null. */
-        if (((s_data || s_data_i32) && ray_vec_is_null((ray_t*)start_v, i)) ||
+        if (s_all_null || l_all_null ||
+            ((s_data || s_data_i32) && ray_vec_is_null((ray_t*)start_v, i)) ||
             ((l_data || l_data_i32) && ray_vec_is_null((ray_t*)len_v, i))) {
             if (is_str) {
                 result = ray_str_vec_append(result, "", 0);

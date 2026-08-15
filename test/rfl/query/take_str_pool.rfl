@@ -1,0 +1,35 @@
+;; Issue #404: `select` with `take:` returned EMPTY strings for pool-backed
+;; STR values (longer than the 12-byte inline limit).  The DAG OP_HEAD /
+;; OP_TAIL executors' flat-column copy adopted the SYM domain but never
+;; propagated the source's str_pool, so the sliced descriptors pointed into
+;; a pool the result didn't carry.  Inline (≤12 byte) strings were unaffected,
+;; which is why this could hide in tables of short strings.
+
+(set Tsp (table [s v] (list ["long-string-value-zero" "long-string-value-one" "long-string-value-two"] [0 1 2])))
+
+;; baseline: unlimited select keeps pooled strings (always worked)
+(at (at (select {from: Tsp s: s where: (> v 0)}) 's) 0) -- "long-string-value-one"
+
+;; identity select + take (OP_HEAD, no filter)
+(at (at (select {from: Tsp take: 1}) 's) 0) -- "long-string-value-zero"
+
+;; projection + take
+(at (at (select {from: Tsp s: s take: 1}) 's) 0) -- "long-string-value-zero"
+
+;; where + take (lazy selection compacted, then OP_HEAD)
+(at (at (select {from: Tsp s: s where: (> v 0) take: 1}) 's) 0) -- "long-string-value-one"
+
+;; negative take → OP_TAIL
+(at (at (select {from: Tsp take: -1}) 's) 0) -- "long-string-value-two"
+(at (at (select {from: Tsp s: s where: (< v 2) take: -1}) 's) 0) -- "long-string-value-one"
+
+;; take larger than nrows → clamp, strings intact
+(at (at (select {from: Tsp take: 100}) 's) 2) -- "long-string-value-two"
+
+;; sort + take still correct (was already working — pin it)
+(at (at (select {from: Tsp s: s where: (> v 0) asc: s take: 1}) 's) 0) -- "long-string-value-one"
+
+;; inline strings (≤12 bytes) through the same paths stay correct
+(set Tsi (table [s v] (list ["aa" "bb" "cc"] [0 1 2])))
+(at (at (select {from: Tsi take: 1}) 's) 0) -- "aa"
+(at (at (select {from: Tsi take: -1}) 's) 0) -- "cc"

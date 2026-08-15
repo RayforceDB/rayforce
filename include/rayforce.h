@@ -675,6 +675,39 @@ ray_runtime_t* ray_runtime_create_with_sym_err(const char* sym_path,
  * exactly one ray_runtime_create* call. */
 void ray_runtime_destroy(ray_runtime_t* rt);
 
+/* ===== Host-Driven Event Loop API =====
+ *
+ * Embedders that own the runtime thread can attach a poll to the runtime,
+ * create listeners from Rayfall (for example `(.sys.listen 7701)`), and
+ * service IPC and Rayfall timers in bounded slices.  The runtime borrows
+ * the poll: detach and destroy it before destroying the runtime. */
+
+typedef struct ray_poll ray_poll_t;
+
+ray_poll_t* ray_poll_create(void);
+void        ray_poll_destroy(ray_poll_t* poll);
+
+/* Mark IPC evaluations on connections subsequently created by poll as
+ * restricted (read-only). Existing connections keep their original mode.
+ * Call from the thread that owns poll before servicing the listener.
+ * A NULL poll is ignored. */
+void ray_poll_set_restricted(ray_poll_t* poll, bool restricted);
+
+/* Run until ray_poll_exit is called. */
+int64_t ray_poll_run(ray_poll_t* poll);
+
+/* Serve events and timers for at most timeout_ms milliseconds.
+ * A negative timeout preserves ray_poll_run's blocking behavior; zero
+ * performs one non-blocking drain.  Returns 0 (or an exit code) normally
+ * and -1 when poll is NULL or the platform event queue fails. */
+int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms);
+
+void ray_poll_exit(ray_poll_t* poll, int64_t code);
+
+/* The runtime borrows this pointer; pass NULL to detach it. */
+void  ray_runtime_set_poll(void* poll);
+void* ray_runtime_get_poll(void);
+
 /* Parse and evaluate a Rayfall source string against the global env.
  * Returns RAY_NULL_OBJ for successful void / null results, an error ray_t*
  * on failure (test with RAY_IS_ERR and inspect with ray_err_code), or the

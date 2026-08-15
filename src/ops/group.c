@@ -101,7 +101,6 @@ typedef struct {
      * instead of being whatever (uint64) wrap left in sum_i. */
     double sum_d;
     int64_t cnt;
-    int64_t null_count;
     int64_t zero_count;
     bool has_first;
 } reduce_acc_t;
@@ -112,7 +111,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
     acc->sum_d = 0;
-    acc->cnt = 0; acc->null_count = 0; acc->zero_count = 0; acc->has_first = false;
+    acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
 }
 
 /* Lexicographic SYM compare — resolves both sym_ids to strings and
@@ -145,7 +144,7 @@ static inline bool sym_lex_gt(struct ray_sym_domain_s* dom,
     return sym_lex_lt(dom, b, a);
 }
 
-/* ── Wide-element (STR/GUID) min/max/first/last ──────────────────────────
+/* ── Row-gathered min/max/first/last ─────────────────────────────────────
  * STR (a 16-byte ray_str_t: pool pointer + length) and GUID (16 raw bytes)
  * do not fit the 8-byte integer reduce accumulators, so the int64 fast paths
  * silently truncate them to a single byte.  These helpers instead track the
@@ -156,6 +155,20 @@ static inline bool sym_lex_gt(struct ray_sym_domain_s* dom,
  * scalar and DAG aggregation paths for wide element types. */
 static inline bool agg_is_wide_type(int8_t t) {
     return t == RAY_STR || t == RAY_GUID;
+}
+
+/* Aggregates whose result must be materialised by gathering the winning
+ * source row instead of packing the input into an 8-byte numeric accumulator.
+ *
+ * LIST columns are boxed ray_t* cells.  FIRST/LAST are well-defined for them,
+ * but the numeric emitters cannot construct a RAY_LIST with ray_vec_new (LIST
+ * is the special type tag 0) and must not reinterpret child pointers as i64.
+ * MIN/MAX remain limited to comparable STR/GUID elements. */
+static inline bool agg_needs_row_gather(int8_t t, uint16_t op) {
+    if (t == RAY_LIST)
+        return op == OP_FIRST || op == OP_LAST;
+    return agg_is_wide_type(t) &&
+           (op == OP_MIN || op == OP_MAX || op == OP_FIRST || op == OP_LAST);
 }
 
 /* Group key/agg output columns are filled by copying ray_str_t descriptors
@@ -185,14 +198,24 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     if (op == OP_FIRST) {
         for (int64_t i = 0; i < scan_n; i++) {
             int64_t row = sel ? sel[i] : i;
-            if (!has_nulls || !ray_vec_is_null(input, row)) return row;
+            if (input->type == RAY_LIST) {
+                ray_t* e = ((ray_t**)ray_data(input))[row];
+                if (e && !RAY_ATOM_IS_NULL(e)) return row;
+            } else if (!has_nulls || !ray_vec_is_null(input, row)) {
+                return row;
+            }
         }
         return -1;
     }
     if (op == OP_LAST) {
         for (int64_t i = scan_n - 1; i >= 0; i--) {
             int64_t row = sel ? sel[i] : i;
-            if (!has_nulls || !ray_vec_is_null(input, row)) return row;
+            if (input->type == RAY_LIST) {
+                ray_t* e = ((ray_t**)ray_data(input))[row];
+                if (e && !RAY_ATOM_IS_NULL(e)) return row;
+            } else if (!has_nulls || !ray_vec_is_null(input, row)) {
+                return row;
+            }
         }
         return -1;
     }
@@ -224,15 +247,48 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     }
     return best;
 }
-/* Whole-table (optionally selected) min/max/first/last over a wide column. */
+/* Whole-table (optionally selected) min/max/first/last over a row-gathered
+ * column, including boxed LIST cells. */
 static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
                               const int64_t* sel, int64_t scan_n,
                               bool has_nulls) {
     int64_t best = wide_winner_row(input, op, sel, scan_n, has_nulls);
-    if (best < 0) return ray_typed_null(-input->type);
+    if (best < 0)
+        return input->type == RAY_LIST
+            ? ray_typed_null(-RAY_I64)
+            : ray_typed_null(-input->type);
     int alloc;
-    return collection_elem(input, best, &alloc);
+    ray_t* result = collection_elem(input, best, &alloc);
+    /* collection_elem borrows boxed LIST cells; reductions return ownership. */
+    if (result && !alloc) ray_retain(result);
+    return result;
 }
+
+/* Reduction field mask.  Every REDUCE_LOOP_* invocation receives a compile-time
+ * constant mask selected by opcode BEFORE entering the element loop.  The
+ * compiler therefore removes every accumulator update that the requested
+ * reduction does not need: OP_SUM emits a sum-only loop, OP_MIN a min-only
+ * loop, OP_VAR the sum/sum-square/count loop, and so on. */
+#define RED_NEED_SUM       (1u << 0)
+#define RED_NEED_SUM_SQ    (1u << 1)
+#define RED_NEED_PROD      (1u << 2)
+#define RED_NEED_SUM_D     (1u << 3)  /* integer stream accumulated as f64 */
+#define RED_NEED_COUNT     (1u << 4)
+#define RED_NEED_ZERO      (1u << 5)
+#define RED_NEED_MIN       (1u << 6)
+#define RED_NEED_MAX       (1u << 7)
+#define RED_NEED_FIRST     (1u << 8)
+#define RED_NEED_LAST      (1u << 9)
+
+#define RED_MASK_ANY       (RED_NEED_COUNT | RED_NEED_ZERO)
+#define RED_MASK_MIN       (RED_NEED_COUNT | RED_NEED_MIN)
+#define RED_MASK_MAX       (RED_NEED_COUNT | RED_NEED_MAX)
+#define RED_MASK_FIRST     (RED_NEED_COUNT | RED_NEED_FIRST)
+#define RED_MASK_LAST      (RED_NEED_COUNT | RED_NEED_LAST)
+#define RED_MASK_AVG_I     (RED_NEED_SUM_D | RED_NEED_COUNT)
+#define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
+#define RED_MASK_STATS_I   (RED_NEED_SUM_D | RED_NEED_SUM_SQ | RED_NEED_COUNT)
+#define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
 
 /* Integer reduction loop — reads native type T, accumulates as i64.
  * HAS_NULLS and HAS_IDX must be integer literal constants (0 or 1) so the
@@ -245,108 +301,231 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
  * NULL_I32, NULL_I64).  For BOOL/U8 the sentinel slot is unused
  * (those types are non-nullable; dispatcher pins HAS_NULLS=0) so any
  * value works; we pass 0 for compileability. */
-#define REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, HAS_NULLS, HAS_IDX, idx) \
+#define REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             T raw = d[row]; \
-            if ((HAS_NULLS) && raw == (T)(NULL_SENT)) { (acc)->null_count++; continue; } \
+            if ((HAS_NULLS) && raw == (T)(NULL_SENT)) continue; \
             int64_t v = (int64_t)raw; \
             /* sum/sum_sq may overflow on signed arithmetic — use defined \
              * unsigned wrap (same semantic, no UBSan whine). */ \
-            (acc)->sum_i    = (int64_t)((uint64_t)(acc)->sum_i    + (uint64_t)v); \
-            (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
-            (acc)->prod_i   = (int64_t)((uint64_t)(acc)->prod_i   * (uint64_t)v); \
-            (acc)->sum_d   += (double)v; \
-            if (v == 0) (acc)->zero_count++; \
-            if (v < (acc)->min_i) (acc)->min_i = v; \
-            if (v > (acc)->max_i) (acc)->max_i = v; \
-            if (!(acc)->has_first) { (acc)->first_i = v; (acc)->has_first = true; } \
-            (acc)->last_i = v; (acc)->cnt++; \
+            if ((NEEDS) & RED_NEED_SUM) \
+                (acc)->sum_i = (int64_t)((uint64_t)(acc)->sum_i + (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_SQ) \
+                (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_PROD) \
+                (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
+            if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
+            if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
+            if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
+                (acc)->first_i = v; (acc)->has_first = true; \
+            } \
+            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
+        } \
+    } while (0)
+
+/* BOOL/U8 nulls, when present, live in the vector bitmap rather than in-band
+ * as a sentinel.  Keep a sibling loop so opcode specialization remains true
+ * for these types as well. */
+#define REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
+    do { \
+        const T* d = (const T*)(base); \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = (HAS_IDX) ? (idx)[i] : i; \
+            if ((HAS_NULLS) && ray_vec_is_null((input), row)) continue; \
+            int64_t v = (int64_t)d[row]; \
+            if ((NEEDS) & RED_NEED_SUM) \
+                (acc)->sum_i = (int64_t)((uint64_t)(acc)->sum_i + (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_SQ) \
+                (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_PROD) \
+                (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
+            if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
+            if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
+            if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
+            if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
+                (acc)->first_i = v; (acc)->has_first = true; \
+            } \
+            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
 
 /* Float reduction loop — see REDUCE_LOOP_I for HAS_NULLS/HAS_IDX semantics.
  * F32/F64 null = NaN; both accumulate in the shared F64 reduction lanes. */
-#define REDUCE_LOOP_F(T, base, start, end, acc, HAS_NULLS, HAS_IDX, idx) \
+#define REDUCE_LOOP_F(T, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             double v = (double)d[row]; \
-            if ((HAS_NULLS) && v != v) { (acc)->null_count++; continue; } \
-            (acc)->sum_f += v; (acc)->sum_sq_f += v * v; (acc)->prod_f *= v; \
-            if (v == 0.0) (acc)->zero_count++; \
-            if (v < (acc)->min_f) (acc)->min_f = v; \
-            if (v > (acc)->max_f) (acc)->max_f = v; \
-            if (!(acc)->has_first) { (acc)->first_f = v; (acc)->has_first = true; } \
-            (acc)->last_f = v; (acc)->cnt++; \
+            if ((HAS_NULLS) && v != v) continue; \
+            if ((NEEDS) & RED_NEED_SUM) (acc)->sum_f += v; \
+            if ((NEEDS) & RED_NEED_SUM_SQ) (acc)->sum_sq_f += v * v; \
+            if ((NEEDS) & RED_NEED_PROD) (acc)->prod_f *= v; \
+            if (((NEEDS) & RED_NEED_ZERO) && v == 0.0) (acc)->zero_count++; \
+            if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_f) (acc)->min_f = v; \
+            if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_f) (acc)->max_f = v; \
+            if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
+                (acc)->first_f = v; (acc)->has_first = true; \
+            } \
+            if ((NEEDS) & RED_NEED_LAST) (acc)->last_f = v; \
+            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
 
 /* Dispatch helper: expand REDUCE_LOOP_I/F with compile-time 0/1 constants for
  * HAS_NULLS and HAS_IDX based on the runtime pointers so the compiler can
  * dead-code-eliminate the branches inside each specialisation. */
-#define DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx) \
+#define DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, NEEDS) \
     do { \
         if (!(has_nulls) && !(idx)) \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 0, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 0, idx, NEEDS); \
         else if (!(has_nulls)) \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 1, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 0, 1, idx, NEEDS); \
         else if (!(idx)) \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 0, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 0, idx, NEEDS); \
         else \
-            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 1, idx); \
+            REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, 1, 1, idx, NEEDS); \
     } while (0)
 
-#define DISPATCH_F(T, base, start, end, acc, has_nulls, idx) \
+#define DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, NEEDS) \
     do { \
         if (!(has_nulls) && !(idx)) \
-            REDUCE_LOOP_F(T, base, start, end, acc, 0, 0, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 0, 0, idx, NEEDS); \
         else if (!(has_nulls)) \
-            REDUCE_LOOP_F(T, base, start, end, acc, 0, 1, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 0, 1, idx, NEEDS); \
         else if (!(idx)) \
-            REDUCE_LOOP_F(T, base, start, end, acc, 1, 0, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 1, 0, idx, NEEDS); \
         else \
-            REDUCE_LOOP_F(T, base, start, end, acc, 1, 1, idx); \
+            REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, 1, 1, idx, NEEDS); \
+    } while (0)
+
+#define DISPATCH_F(T, base, start, end, acc, has_nulls, idx, NEEDS) \
+    do { \
+        if (!(has_nulls) && !(idx)) \
+            REDUCE_LOOP_F(T, base, start, end, acc, 0, 0, idx, NEEDS); \
+        else if (!(has_nulls)) \
+            REDUCE_LOOP_F(T, base, start, end, acc, 0, 1, idx, NEEDS); \
+        else if (!(idx)) \
+            REDUCE_LOOP_F(T, base, start, end, acc, 1, 0, idx, NEEDS); \
+        else \
+            REDUCE_LOOP_F(T, base, start, end, acc, 1, 1, idx, NEEDS); \
+    } while (0)
+
+/* Select the accumulator shape once per dispatched range.  NEEDS remains a
+ * literal at every loop expansion, which is the key property: no opcode test
+ * or unused accumulator dependency survives in the generated hot loop. */
+#define DISPATCH_I_OPCODE(T, NULL_SENT, base, start, end, acc, has_nulls, idx, opcode) \
+    do { \
+        switch (opcode) { \
+        case OP_SUM:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_NEED_SUM); break; \
+        case OP_PROD: DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_NEED_PROD); break; \
+        case OP_ALL:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_NEED_ZERO); break; \
+        case OP_ANY:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_ANY); break; \
+        case OP_MIN:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
+        case OP_MAX:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
+        case OP_AVG:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_I); break; \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+            DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_I); break; \
+        case OP_FIRST: DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
+        case OP_LAST:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
+        default: break; \
+        } \
+    } while (0)
+
+#define DISPATCH_BITMAP_I_OPCODE(T, input, base, start, end, acc, has_nulls, idx, opcode) \
+    do { \
+        switch (opcode) { \
+        case OP_SUM:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_NEED_SUM); break; \
+        case OP_PROD: DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_NEED_PROD); break; \
+        case OP_ALL:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_NEED_ZERO); break; \
+        case OP_ANY:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_ANY); break; \
+        case OP_MIN:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
+        case OP_MAX:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
+        case OP_AVG:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_I); break; \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+            DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_I); break; \
+        case OP_FIRST: DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
+        case OP_LAST:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
+        default: break; \
+        } \
+    } while (0)
+
+#define DISPATCH_F_OPCODE(T, base, start, end, acc, has_nulls, idx, opcode) \
+    do { \
+        switch (opcode) { \
+        case OP_SUM:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_NEED_SUM); break; \
+        case OP_PROD: DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_NEED_PROD); break; \
+        case OP_ALL:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_NEED_ZERO); break; \
+        case OP_ANY:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_ANY); break; \
+        case OP_MIN:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
+        case OP_MAX:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
+        case OP_AVG:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_F); break; \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+            DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_F); break; \
+        case OP_FIRST: DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
+        case OP_LAST:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
+        default: break; \
+        } \
+    } while (0)
+
+#define REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, HAS_NULLS, HAS_IDX, WANT_MIN) \
+    do { \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = (HAS_IDX) ? (idx)[i] : i; \
+            int64_t v = read_col_i64(base, row, (input)->type, (input)->attrs); \
+            if ((HAS_NULLS) && v == 0) continue; \
+            if ((acc)->cnt == 0) { \
+                if (WANT_MIN) (acc)->min_i = v; else (acc)->max_i = v; \
+            } else if (WANT_MIN) { \
+                if (sym_lex_lt(dom, v, (acc)->min_i)) (acc)->min_i = v; \
+            } else { \
+                if (sym_lex_gt(dom, v, (acc)->max_i)) (acc)->max_i = v; \
+            } \
+            (acc)->cnt++; \
+        } \
+    } while (0)
+
+#define DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls, idx, dom, WANT_MIN) \
+    do { \
+        if (!(has_nulls) && !(idx)) \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 0, 0, WANT_MIN); \
+        else if (!(has_nulls)) \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 0, 1, WANT_MIN); \
+        else if (!(idx)) \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 1, 0, WANT_MIN); \
+        else \
+            REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 1, 1, WANT_MIN); \
     } while (0)
 
 static void reduce_range(ray_t* input, int64_t start, int64_t end,
                          reduce_acc_t* acc, bool has_nulls,
-                         const int64_t* idx) {
+                         const int64_t* idx, uint16_t opcode) {
     void* base = ray_data(input);
     switch (input->type) {
-    case RAY_BOOL: case RAY_U8: {
-        /* BOOL/U8 are non-nullable; has_nulls is always false here,
-         * so the per-element null check is dead code in practice. */
-        const uint8_t* d = (const uint8_t*)base;
-        for (int64_t i = start; i < end; i++) {
-            int64_t row = idx ? idx[i] : i;
-            if (has_nulls && ray_vec_is_null(input, row)) { acc->null_count++; continue; }
-            int64_t v = (int64_t)d[row];
-            acc->sum_i    = (int64_t)((uint64_t)acc->sum_i    + (uint64_t)v);
-            acc->sum_sq_i = (int64_t)((uint64_t)acc->sum_sq_i + (uint64_t)v * (uint64_t)v);
-            acc->prod_i   = (int64_t)((uint64_t)acc->prod_i   * (uint64_t)v);
-            acc->sum_d   += (double)v;
-            if (v == 0) acc->zero_count++;
-            if (v < acc->min_i) acc->min_i = v;
-            if (v > acc->max_i) acc->max_i = v;
-            if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-            acc->last_i = v; acc->cnt++;
-        }
-        break;
-    }
+    case RAY_BOOL: case RAY_U8:
+        DISPATCH_BITMAP_I_OPCODE(uint8_t, input, base, start, end, acc,
+                                 has_nulls, idx, opcode); break;
     case RAY_I16:
-        DISPATCH_I(int16_t, NULL_I16, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_I_OPCODE(int16_t, NULL_I16, base, start, end, acc,
+                          has_nulls, idx, opcode); break;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
-        DISPATCH_I(int32_t, NULL_I32, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_I_OPCODE(int32_t, NULL_I32, base, start, end, acc,
+                          has_nulls, idx, opcode); break;
     case RAY_I64: case RAY_TIMESTAMP:
-        DISPATCH_I(int64_t, NULL_I64, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_I_OPCODE(int64_t, NULL_I64, base, start, end, acc,
+                          has_nulls, idx, opcode); break;
     case RAY_F32:
-        DISPATCH_F(float, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_F_OPCODE(float, base, start, end, acc, has_nulls, idx, opcode); break;
     case RAY_F64:
-        DISPATCH_F(double, base, start, end, acc, has_nulls, idx); break;
+        DISPATCH_F_OPCODE(double, base, start, end, acc, has_nulls, idx, opcode); break;
     case RAY_SYM: {
         /* Adaptive-width SYM columns — read_col_i64 produces the i64
          * sym id; id 0 is the canonical null sym (interned empty string
@@ -355,55 +534,12 @@ static void reduce_range(ray_t* input, int64_t start, int64_t end,
          * id.  Same 4-way dispatch to eliminate the per-element
          * null/idx branches. */
         struct ray_sym_domain_s* dom = ray_sym_vec_domain(input);
-        if (!has_nulls && !idx) {
-            for (int64_t i = start; i < end; i++) {
-                int64_t v = read_col_i64(base, i, input->type, input->attrs);
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        } else if (!has_nulls) {
-            for (int64_t i = start; i < end; i++) {
-                int64_t row = idx[i];
-                int64_t v = read_col_i64(base, row, input->type, input->attrs);
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        } else if (!idx) {
-            for (int64_t i = start; i < end; i++) {
-                int64_t v = read_col_i64(base, i, input->type, input->attrs);
-                if (v == 0) { acc->null_count++; continue; }
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        } else {
-            for (int64_t i = start; i < end; i++) {
-                int64_t row = idx[i];
-                int64_t v = read_col_i64(base, row, input->type, input->attrs);
-                if (v == 0) { acc->null_count++; continue; }
-                acc->sum_i += v; acc->sum_sq_i += v * v;
-                acc->prod_i = (int64_t)((uint64_t)acc->prod_i * (uint64_t)v);
-                if (acc->cnt == 0) { acc->min_i = v; acc->max_i = v; }
-                else { if (sym_lex_lt(dom, v, acc->min_i)) acc->min_i = v;
-                       if (sym_lex_gt(dom, v, acc->max_i)) acc->max_i = v; }
-                if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
-                acc->last_i = v; acc->cnt++;
-            }
-        }
+        if (opcode == OP_MIN)
+            DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls,
+                                 idx, dom, 1);
+        else if (opcode == OP_MAX)
+            DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls,
+                                 idx, dom, 0);
         break;
     }
     default: break;
@@ -416,43 +552,86 @@ typedef struct {
     reduce_acc_t*  accs;   /* one per worker */
     bool           has_nulls;
     const int64_t* idx;    /* NULL = no selection; else int64[total_pass] */
+    uint16_t       opcode;
 } par_reduce_ctx_t;
 
 static void par_reduce_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     par_reduce_ctx_t* c = (par_reduce_ctx_t*)ctx;
     reduce_range(c->input, start, end, &c->accs[worker_id],
-                 c->has_nulls, c->idx);
+                 c->has_nulls, c->idx, c->opcode);
 }
 
 static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_type,
-                         struct ray_sym_domain_s* sym_dom) {
-    if (in_type == RAY_F64 || in_type == RAY_F32) {
-        dst->sum_f += src->sum_f;
-        dst->sum_sq_f += src->sum_sq_f;
-        dst->prod_f *= src->prod_f;
-        if (src->min_f < dst->min_f) dst->min_f = src->min_f;
-        if (src->max_f > dst->max_f) dst->max_f = src->max_f;
-    } else {
-        /* Defined unsigned wrap — matches REDUCE_LOOP_I's per-row path. */
-        dst->sum_i    = (int64_t)((uint64_t)dst->sum_i    + (uint64_t)src->sum_i);
-        dst->sum_sq_i = (int64_t)((uint64_t)dst->sum_sq_i + (uint64_t)src->sum_sq_i);
-        dst->prod_i   = (int64_t)((uint64_t)dst->prod_i   * (uint64_t)src->prod_i);
-        dst->sum_d   += src->sum_d;
-        if (in_type == RAY_SYM) {
-            /* Lex compare for SYM min/max (see sym_lex_lt). */
-            if (src->cnt > 0) {
-                if (dst->cnt == 0) { dst->min_i = src->min_i; dst->max_i = src->max_i; }
-                else { if (sym_lex_lt(sym_dom, src->min_i, dst->min_i)) dst->min_i = src->min_i;
-                       if (sym_lex_gt(sym_dom, src->max_i, dst->max_i)) dst->max_i = src->max_i; }
+                         struct ray_sym_domain_s* sym_dom, uint16_t opcode) {
+    bool fp = in_type == RAY_F64 || in_type == RAY_F32;
+    switch (opcode) {
+    case OP_SUM:
+        if (fp) dst->sum_f += src->sum_f;
+        else dst->sum_i = (int64_t)((uint64_t)dst->sum_i + (uint64_t)src->sum_i);
+        break;
+    case OP_PROD:
+        if (fp) dst->prod_f *= src->prod_f;
+        else dst->prod_i = (int64_t)((uint64_t)dst->prod_i * (uint64_t)src->prod_i);
+        break;
+    case OP_ALL:
+        dst->zero_count += src->zero_count;
+        break;
+    case OP_ANY:
+        dst->zero_count += src->zero_count;
+        dst->cnt += src->cnt;
+        break;
+    case OP_MIN:
+        if (src->cnt > 0) {
+            if (dst->cnt == 0) {
+                if (fp) dst->min_f = src->min_f;
+                else dst->min_i = src->min_i;
+            } else if (fp) {
+                if (src->min_f < dst->min_f) dst->min_f = src->min_f;
+            } else if (in_type == RAY_SYM) {
+                if (sym_lex_lt(sym_dom, src->min_i, dst->min_i)) dst->min_i = src->min_i;
+            } else if (src->min_i < dst->min_i) {
+                dst->min_i = src->min_i;
             }
-        } else {
-            if (src->min_i < dst->min_i) dst->min_i = src->min_i;
-            if (src->max_i > dst->max_i) dst->max_i = src->max_i;
+            dst->cnt += src->cnt;
         }
+        break;
+    case OP_MAX:
+        if (src->cnt > 0) {
+            if (dst->cnt == 0) {
+                if (fp) dst->max_f = src->max_f;
+                else dst->max_i = src->max_i;
+            } else if (fp) {
+                if (src->max_f > dst->max_f) dst->max_f = src->max_f;
+            } else if (in_type == RAY_SYM) {
+                if (sym_lex_gt(sym_dom, src->max_i, dst->max_i)) dst->max_i = src->max_i;
+            } else if (src->max_i > dst->max_i) {
+                dst->max_i = src->max_i;
+            }
+            dst->cnt += src->cnt;
+        }
+        break;
+    case OP_AVG:
+        if (fp) dst->sum_f += src->sum_f;
+        else dst->sum_d += src->sum_d;
+        dst->cnt += src->cnt;
+        break;
+    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
+        if (fp) {
+            dst->sum_f += src->sum_f;
+            dst->sum_sq_f += src->sum_sq_f;
+        } else {
+            dst->sum_d += src->sum_d;
+            dst->sum_sq_i = (int64_t)((uint64_t)dst->sum_sq_i +
+                                      (uint64_t)src->sum_sq_i);
+        }
+        dst->cnt += src->cnt;
+        break;
+    case OP_FIRST: case OP_LAST:
+        dst->cnt += src->cnt;
+        break;
+    default:
+        break;
     }
-    dst->cnt += src->cnt;
-    dst->null_count += src->null_count;
-    dst->zero_count += src->zero_count;
     /* reduce_merge does not merge first/last; caller handles these separately.
      * Since workers process sequential ranges, worker 0's first is the global first,
      * and the last worker's last is the global last. */
@@ -994,6 +1173,300 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     scratch_free(pcnt_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
     scratch_free(off_hdr); scratch_free(hist_hdr);
     return ray_i64(total_distinct);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Parallel distinct values — first-occurrence row ids.
+ *
+ * Same three-pass radix layout as exec_count_distinct above (histogram
+ * → scatter → per-partition dedup), except the scatter carries the row
+ * id alongside each value and the dedup marks first occurrences in a
+ * shared byte array instead of counting.  A given value lands in
+ * exactly one partition, so each row id is claimed by at most one
+ * task — the byte array needs no atomics.  Partition slices are in
+ * ascending row order (cursors are prefix-summed over tasks in task
+ * order, tasks scan rows in order), so "first hit in the slice" is the
+ * globally first occurrence, and the final sequential sweep of the
+ * byte array yields ids in first-appearance order — identical to the
+ * eager hashset path's contract.
+ * ════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const void* base;
+    int64_t*    out_buf;       /* partitioned values (output) */
+    int64_t*    rid_buf;       /* partitioned row ids (output) */
+    int64_t*    cursor;        /* per-task × P; advances per scatter */
+    uint64_t    p_mask;
+    int64_t     grain;
+    int64_t     total;
+    uint8_t     is_f64;
+    int8_t      type;
+} dv_scatter_ctx_t;
+
+static void dv_scatter_fn(void* ctx, uint32_t worker_id,
+                          int64_t start, int64_t end) {
+    (void)worker_id;
+    (void)end;
+    dv_scatter_ctx_t* x = (dv_scatter_ctx_t*)ctx;
+    int64_t task_idx = start;
+    int64_t row_start = task_idx * x->grain;
+    int64_t row_end = row_start + x->grain;
+    if (row_end > x->total) row_end = x->total;
+    int64_t* cur = x->cursor + (size_t)task_idx * (x->p_mask + 1);
+    int64_t* out = x->out_buf;
+    int64_t* rid = x->rid_buf;
+    const void* base = x->base;
+    uint64_t p_mask = x->p_mask;
+    #define DV_SCATTER_BODY(LOAD)                                             \
+        for (int64_t i = row_start; i < row_end; i++) {                       \
+            int64_t val = (LOAD);                                             \
+            uint64_t h = (uint64_t)val * CD_HASH_K1;                          \
+            h ^= h >> 33;                                                     \
+            uint64_t p = (h ^ (h >> 33)) & p_mask;                            \
+            int64_t c = cur[p]++;                                             \
+            out[c] = val;                                                     \
+            rid[c] = i;                                                       \
+        }
+    if (x->is_f64) {
+        const double* d = (const double*)base;
+        for (int64_t i = row_start; i < row_end; i++) {
+            double fv = d[i];
+            if (fv != fv) fv = (double)NAN;
+            else fv = clear_neg_zero(fv);
+            int64_t val;
+            memcpy(&val, &fv, sizeof(int64_t));
+            uint64_t h = (uint64_t)val * CD_HASH_K1;
+            h ^= h >> 33;
+            uint64_t p = (h ^ (h >> 33)) & p_mask;
+            int64_t c = cur[p]++;
+            out[c] = val;
+            rid[c] = i;
+        }
+    } else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP) {
+        const int64_t* d = (const int64_t*)base;
+        DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_I32 || x->type == RAY_DATE || x->type == RAY_TIME) {
+        const int32_t* d = (const int32_t*)base;
+        DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_I16) {
+        const int16_t* d = (const int16_t*)base;
+        DV_SCATTER_BODY(d[i])
+    }
+    #undef DV_SCATTER_BODY
+}
+
+typedef struct {
+    const int64_t* values;     /* partitioned values */
+    const int64_t* rids;       /* partitioned row ids */
+    const int64_t* part_off;   /* P+1 partition bounds */
+    int64_t*       part_count; /* OUT: per-partition distinct count (-1 = oom) */
+    uint8_t*       first;      /* OUT: len bytes; 1 = first occurrence */
+} dv_part_ctx_t;
+
+static void dv_part_dedup_fn(void* ctx, uint32_t worker_id,
+                             int64_t start, int64_t end) {
+    (void)worker_id;
+    dv_part_ctx_t* x = (dv_part_ctx_t*)ctx;
+    for (int64_t p = start; p < end; p++) {
+        int64_t off = x->part_off[p];
+        int64_t cnt = x->part_off[p + 1] - off;
+        if (cnt == 0) { x->part_count[p] = 0; continue; }
+
+        uint64_t cap = (uint64_t)cnt * 2;
+        if (cap < 32) cap = 32;
+        uint64_t c = 1;
+        while (c && c < cap) c <<= 1;
+        if (!c) { x->part_count[p] = -1; continue; }
+        cap = c;
+        uint64_t mask = cap - 1;
+        int cd_shift = 64 - __builtin_ctzll(cap);
+
+        ray_t* set_hdr  = NULL;
+        ray_t* used_hdr = NULL;
+        int64_t* set    = (int64_t*)scratch_alloc (&set_hdr,
+                                                   (size_t)cap * sizeof(int64_t));
+        uint8_t* used   = (uint8_t*)scratch_calloc(&used_hdr,
+                                                   (size_t)cap * sizeof(uint8_t));
+        if (!set || !used) {
+            if (set_hdr)  scratch_free(set_hdr);
+            if (used_hdr) scratch_free(used_hdr);
+            x->part_count[p] = -1;
+            continue;
+        }
+
+        const int64_t* vals = x->values + off;
+        const int64_t* rids = x->rids + off;
+        int64_t count = 0;
+        for (int64_t j = 0; j < cnt; j++) {
+            int64_t val = vals[j];
+            uint64_t h = (uint64_t)val * CD_HASH_K1;
+            uint64_t slot = h >> cd_shift;   /* Fibonacci hash: high bits */
+            while (used[slot]) {
+                if (set[slot] == val) goto dv_part_next;
+                slot = (slot + 1) & mask;
+            }
+            set[slot]  = val;
+            used[slot] = 1;
+            x->first[rids[j]] = 1;
+            count++;
+            dv_part_next:;
+        }
+        scratch_free(set_hdr);
+        scratch_free(used_hdr);
+        x->part_count[p] = count;
+    }
+}
+
+ray_t* distinct_radix_first_ids(ray_t* input) {
+    if (!input || RAY_IS_ERR(input)) return NULL;
+
+    int8_t in_type = input->type;
+    int64_t len = input->len;
+
+    switch (in_type) {
+    case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        break;
+    case RAY_F64:
+        /* The kernel canonicalizes every NaN to one value.  The eager
+         * hashset only does that under the HAS_NULLS gate (ungated NaNs
+         * are pairwise-distinct there) — bail so behavior is identical. */
+        if (!(input->attrs & RAY_ATTR_HAS_NULLS)) return NULL;
+        break;
+    default:
+        return NULL;
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || len < (1 << 16)) return NULL;
+
+    uint32_t nw = ray_pool_total_workers(pool);
+    uint32_t p_bits;
+    if (nw <= 8) p_bits = 4;
+    else if (nw <= 32) p_bits = 5;
+    else p_bits = 6;
+    uint64_t P = (uint64_t)1 << p_bits;
+    uint64_t p_mask = P - 1;
+
+    int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (grain <= 0) grain = 8192;
+    int64_t n_tasks_64 = (len + grain - 1) / grain;
+    if (n_tasks_64 <= 0 || n_tasks_64 > (1u << 16)) return NULL;
+    uint32_t n_tasks = (uint32_t)n_tasks_64;
+
+    void* base = ray_data(input);
+
+    /* Pass 1: per-task histogram (identical to exec_count_distinct's). */
+    ray_t* hist_hdr = NULL;
+    int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
+                                             (size_t)P * n_tasks * sizeof(int64_t));
+    if (!hist) return ray_error("oom", NULL);
+    cd_count_ctx_t hctx = {
+        .base = base, .counts = hist,
+        .p_bits = p_bits, .p_mask = p_mask,
+        .grain = grain, .total = len,
+        .stride_log2 = 0, .is_f64 = (in_type == RAY_F64),
+        .type = in_type, .attrs = input->attrs,
+    };
+    ray_pool_dispatch_n(pool, cd_hist_fn, &hctx, n_tasks);
+
+    ray_t* off_hdr = NULL;
+    int64_t* part_off = (int64_t*)scratch_alloc(&off_hdr,
+                                                (size_t)(P + 1) * sizeof(int64_t));
+    if (!part_off) { scratch_free(hist_hdr); return ray_error("oom", NULL); }
+    ray_t* cur_hdr = NULL;
+    int64_t* cursor = (int64_t*)scratch_alloc(&cur_hdr,
+                                              (size_t)P * n_tasks * sizeof(int64_t));
+    if (!cursor) {
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+
+    int64_t total = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        part_off[p] = total;
+        for (uint32_t t = 0; t < n_tasks; t++) {
+            cursor[(size_t)t * P + p] = total;
+            total += hist[(size_t)t * P + p];
+        }
+    }
+    part_off[P] = total;
+    if (total != len) {
+        scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("nyi", "distinct: histogram mismatch");
+    }
+
+    /* Pass 2: scatter (value, row id) pairs. */
+    ray_t* buf_hdr = NULL;
+    int64_t* out_buf = (int64_t*)scratch_alloc(&buf_hdr,
+                                               (size_t)len * sizeof(int64_t));
+    ray_t* rid_hdr = NULL;
+    int64_t* rid_buf = (int64_t*)scratch_alloc(&rid_hdr,
+                                               (size_t)len * sizeof(int64_t));
+    if (!out_buf || !rid_buf) {
+        if (buf_hdr) scratch_free(buf_hdr);
+        if (rid_hdr) scratch_free(rid_hdr);
+        scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+    dv_scatter_ctx_t sctx = {
+        .base = base, .out_buf = out_buf, .rid_buf = rid_buf, .cursor = cursor,
+        .p_mask = p_mask, .grain = grain, .total = len,
+        .is_f64 = (in_type == RAY_F64), .type = in_type,
+    };
+    ray_pool_dispatch_n(pool, dv_scatter_fn, &sctx, n_tasks);
+
+    /* Pass 3: per-partition dedup, marking first occurrences. */
+    ray_t* first_hdr = NULL;
+    uint8_t* first = (uint8_t*)scratch_calloc(&first_hdr, (size_t)len);
+    ray_t* pcnt_hdr = NULL;
+    int64_t* part_count = first ? (int64_t*)scratch_alloc(&pcnt_hdr,
+                                                  (size_t)P * sizeof(int64_t))
+                                : NULL;
+    if (!first || !part_count) {
+        if (first_hdr) scratch_free(first_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
+        scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("oom", NULL);
+    }
+    dv_part_ctx_t dctx = {
+        .values = out_buf, .rids = rid_buf, .part_off = part_off,
+        .part_count = part_count, .first = first,
+    };
+    ray_pool_dispatch_n(pool, dv_part_dedup_fn, &dctx, (uint32_t)P);
+
+    int64_t total_distinct = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        if (part_count[p] < 0) {
+            scratch_free(pcnt_hdr); scratch_free(first_hdr);
+            scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+            scratch_free(off_hdr); scratch_free(hist_hdr);
+            return ray_error("oom", NULL);
+        }
+        total_distinct += part_count[p];
+    }
+
+    scratch_free(pcnt_hdr); scratch_free(rid_hdr); scratch_free(buf_hdr);
+    scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+
+    /* Sweep the byte array in row order — first-appearance order ids. */
+    ray_t* ids = ray_vec_new(RAY_I64, total_distinct);
+    if (!ids || RAY_IS_ERR(ids)) {
+        scratch_free(first_hdr);
+        return ids ? ids : ray_error("oom", NULL);
+    }
+    int64_t* out_ids = (int64_t*)ray_data(ids);
+    int64_t k = 0;
+    for (int64_t i = 0; i < len; i++)
+        if (first[i]) out_ids[k++] = i;
+    ids->len = k;
+    scratch_free(first_hdr);
+    if (k != total_distinct) {
+        ray_release(ids);
+        return ray_error("nyi", "distinct: first-occurrence sweep mismatch");
+    }
+    return ids;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -2521,12 +2994,13 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
 
 /* ─── ray_wide_minmax_per_group_buf ───────────────────────────────────────
  *
- * Per-group min/max/first/last for wide element types (STR/GUID) that don't
- * fit the 8-byte integer accumulators.  Same idx_buf/offsets/grp_cnt layout
- * as the median/topk kernels — produced by exec_group's group-contiguous row
- * gather — but instead of a numeric quickselect it finds the winning row per
- * group (lexicographic for STR, byte order for GUID; positional for
- * first/last) and materialises that element into a typed result column.
+ * Per-group min/max/first/last for elements that cannot flow through the
+ * 8-byte integer accumulators.  Same idx_buf/offsets/grp_cnt layout as the
+ * median/topk kernels — produced by exec_group's group-contiguous row gather
+ * — but instead of a numeric quickselect it finds the winning row per group
+ * (lexicographic for STR, byte order for GUID; positional for first/last) and
+ * materialises that element into a typed result column.  LIST elements retain
+ * the selected boxed child into a new owning list.
  *
  * Runs SERIAL: ray_str_vec_set COW-mutates the result vector and its shared
  * string pool, so concurrent group writers would corrupt the pool.  Wide
@@ -2537,17 +3011,28 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
                                      const int64_t* grp_cnt,
                                      int64_t n_groups) {
     if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
-    if (!agg_is_wide_type(src->type)) return NULL;  /* caller falls back */
+    if (!agg_needs_row_gather(src->type, op)) return NULL;  /* caller falls back */
     bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
 
-    ray_t* out = col_vec_new(src, n_groups);
+    ray_t* out = src->type == RAY_LIST
+        ? ray_list_new(n_groups)
+        : col_vec_new(src, n_groups);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-    out->len = n_groups;
+    /* LIST length advances with initialized child slots so every error path
+     * releases exactly the children whose ownership has been retained. */
+    out->len = src->type == RAY_LIST ? 0 : n_groups;
 
     for (int64_t g = 0; g < n_groups; g++) {
         int64_t cnt = grp_cnt[g];
         int64_t off = offsets[g];
         int64_t best = wide_winner_row(src, op, &idx_buf[off], cnt, has_nulls);
+        if (src->type == RAY_LIST) {
+            ray_t* e = best < 0 ? NULL : ((ray_t**)ray_data(src))[best];
+            if (e) ray_retain(e);
+            ((ray_t**)ray_data(out))[g] = e;
+            out->len = g + 1;
+            continue;
+        }
         if (best < 0) { ray_vec_set_null(out, g, true); continue; }
         int alloc;
         ray_t* e = collection_elem(src, best, &alloc);
@@ -2664,19 +3149,24 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (g && g->selection) {
         ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
         if (sm->nrows == len) {
-            sel_idx_block = ray_rowsel_to_indices(g->selection);
-            if (!sel_idx_block) return ray_error("oom", NULL);
-            sel_idx = (const int64_t*)ray_data(sel_idx_block);
             scan_n = sm->total_pass;
+            /* COUNT needs only the selected cardinality.  Do not materialise
+             * indices—and, below, do not scan the input column at all. */
+            if (op->opcode != OP_COUNT) {
+                sel_idx_block = ray_rowsel_to_indices(g->selection);
+                if (!sel_idx_block) return ray_error("oom", NULL);
+                sel_idx = (const int64_t*)ray_data(sel_idx_block);
+            }
         }
     }
 
-    /* Wide element types (STR/GUID) overflow the 8-byte reduce
-     * accumulators; resolve min/max/first/last by materialising the
+    if (op->opcode == OP_COUNT)
+        return ray_i64(scan_n);
+
+    /* Wide elements and boxed LIST cells cannot use the 8-byte reduce
+     * accumulators; resolve their supported operations by materialising the
      * winning row instead.  COUNT keeps the generic length-based path. */
-    if (agg_is_wide_type(in_type) &&
-        (op->opcode == OP_MIN || op->opcode == OP_MAX ||
-         op->opcode == OP_FIRST || op->opcode == OP_LAST)) {
+    if (agg_needs_row_gather(in_type, op->opcode)) {
         ray_t* r = agg_wide_reduce(input, op->opcode, sel_idx, scan_n, has_nulls);
         if (sel_idx_block) ray_release(sel_idx_block);
         return r;
@@ -2721,7 +3211,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
 
         par_reduce_ctx_t ctx = { .input = input, .accs = accs,
-                                 .has_nulls = has_nulls, .idx = sel_idx };
+                                 .has_nulls = has_nulls, .idx = sel_idx,
+                                 .opcode = op->opcode };
         ray_pool_dispatch(pool, par_reduce_fn, &ctx, scan_n);
 
         /* Merge: worker 0 is the base, merge the rest in order */
@@ -2729,8 +3220,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         reduce_acc_init(&merged);
         merged = accs[0];
         for (uint32_t i = 1; i < nw; i++) {
-            if (!accs[i].has_first) continue;
-            reduce_merge(&merged, &accs[i], in_type, ray_sym_vec_domain(input));
+            reduce_merge(&merged, &accs[i], in_type, ray_sym_vec_domain(input),
+                         op->opcode);
         }
         /* first = accs[first worker with data], last = accs[last worker with data] */
         for (uint32_t i = 0; i < nw; i++) {
@@ -2787,7 +3278,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 
     reduce_acc_t acc;
     reduce_acc_init(&acc);
-    reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx);
+    reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx, op->opcode);
     if (sel_idx_block) ray_release(sel_idx_block);
 
     switch (op->opcode) {
@@ -2974,14 +3465,12 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
          * packed into entries or HT rows.  A post-radix pass over
          * row_gid+grp_cnt gathers per-group slices and runs the matching
          * per-group kernel. */
-        /* Wide-element (STR/GUID) min/max/first/last also reserve no
-         * row-layout slot: the 8-byte accumulators can't hold a 16-byte
-         * GUID or a pooled string, so they are resolved by the same
+        /* Wide-element STR/GUID aggregates and boxed LIST first/last also
+         * reserve no row-layout slot: the 8-byte accumulators cannot hold
+         * their cells, so they are resolved by the same
          * post-radix per-group pass via ray_wide_minmax_per_group_buf. */
         bool wide_mm = agg_ops && agg_vecs[a] &&
-                       agg_is_wide_type(agg_vecs[a]->type) &&
-                       (agg_ops[a] == OP_MIN  || agg_ops[a] == OP_MAX ||
-                        agg_ops[a] == OP_FIRST || agg_ops[a] == OP_LAST);
+                       agg_needs_row_gather(agg_vecs[a]->type, agg_ops[a]);
         bool holistic = agg_ops && (agg_ops[a] == OP_MEDIAN ||
                                     agg_ops[a] == OP_QUANTILE ||
                                     agg_ops[a] == OP_MODE ||
@@ -4181,6 +4670,20 @@ typedef struct {
     uint32_t gid;
 } group_topn_item_t;
 
+/* (first_row, flat_id) pair for the sparse stable-order path below —
+ * sorting groups by earliest source row reproduces exactly the order the
+ * dense row-domain scan assigns. */
+typedef struct {
+    int64_t  first;
+    uint32_t flat;
+} group_order_pair_t;
+
+static int group_order_pair_cmp(const void* a, const void* b) {
+    int64_t fa = ((const group_order_pair_t*)a)->first;
+    int64_t fb = ((const group_order_pair_t*)b)->first;
+    return (fa > fb) - (fa < fb);
+}
+
 /* Selection-aware group iteration gate.  When a WHERE leaves fewer than
  * nrows >> SEL_MATCH_GATE_SHIFT survivors, the high-card group build iterates
  * the survivor row list (match_idx) instead of scanning all nrows with a
@@ -5200,7 +5703,12 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 out_type = is_f64 ? RAY_F64
                                    : (agg_col ? agg_col->type : RAY_I64); break;
         }
-        ray_t* new_col = ray_vec_new(out_type, (int64_t)grp_count);
+        /* LIST is the boxed collection tag (0), not a ray_vec_new element
+         * type.  The scalar no-key path fills this placeholder below via the
+         * row-gather override; keyed LIST aggregates never reach this emitter. */
+        ray_t* new_col = out_type == RAY_LIST
+            ? ray_list_new((int64_t)grp_count)
+            : ray_vec_new(out_type, (int64_t)grp_count);
         if (!new_col || RAY_IS_ERR(new_col)) continue;
         /* SYM MIN/MAX/FIRST/LAST: the emitted values are RAW cell ids
          * accumulated from ONE source column — the output resolves over
@@ -5208,7 +5716,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
         if (out_type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_col, sym_domain_rep(agg_col));
         new_col->len = (int64_t)grp_count;
-        for (uint32_t gi = 0; gi < grp_count; gi++) {
+        for (uint32_t gi = 0; out_type != RAY_LIST && gi < grp_count; gi++) {
             size_t idx = (size_t)gi * n_aggs + a;
             /* nn_counts[idx] == 0 means the group is all-null for this
              * agg column — null-aware operators (MIN/MAX/PROD/FIRST/LAST/
@@ -5655,17 +6163,29 @@ static bool sparse_i64_touch(sparse_i64_ht_t* ht, int64_t key, uint8_t n_aggs,
     return true;
 }
 
+/* Sign discipline for DA key reads: the min/max prescan (minmax_scan_fn)
+ * reads narrow keys through their SIGNED column type, so key_mins[k] is a
+ * sign-extended value.  Every accumulate-side read must sign-extend the
+ * same way or a negative I16/I32/DATE/TIME key maps to a slot far outside
+ * [0, range) — an out-of-bounds write, not just a wrong group.  Only
+ * BOOL/U8 and SYM dictionary ids are unsigned. */
+static inline int da_key_is_unsigned(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || RAY_IS_SYM(t);
+}
+
 /* Composite GID from multi-key. Planning bounds total_slots to INT32_MAX. */
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     int32_t gid = 0;
     for (uint32_t k = 0; k < c->n_keys; k++) {
-        int64_t val = read_by_esz(c->key_ptrs[k], r, c->key_esz[k]);
+        int64_t val = read_signed_by_esz(c->key_ptrs[k], r, c->key_esz[k],
+                                         da_key_is_unsigned(c->key_types[k]));
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
     }
     return gid;
 }
 
-/* Typed composite GID: eliminates per-element switch when all keys share width */
+/* Typed composite GID: eliminates per-element switch when all keys share
+ * width AND signedness (see da_key_is_unsigned above). */
 #define DEFINE_DA_COMPOSITE_GID_TYPED(SUFFIX, KTYPE) \
 static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
     int32_t gid = 0; \
@@ -5678,6 +6198,8 @@ static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
 DEFINE_DA_COMPOSITE_GID_TYPED(u8,  uint8_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(u16, uint16_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(u32, uint32_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(i16, int16_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(i32, int32_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(i64, int64_t)
 #undef DEFINE_DA_COMPOSITE_GID_TYPED
 
@@ -6332,11 +6854,23 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     } while (0)
 
     if (n_keys == 1) {
-        switch (c->key_esz[0]) {
-        case 1: DA_SINGLE_KEY_LOOP(uint8_t, ); break;
-        case 2: DA_SINGLE_KEY_LOOP(uint16_t, ); break;
-        case 4: DA_SINGLE_KEY_LOOP(uint32_t, (int64_t)); break;
-        default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
+        /* Signed narrow keys (I16/I32/DATE/TIME) must sign-extend exactly
+         * as the min/max prescan did — an unsigned read maps a negative
+         * key to a slot outside [0, range) (see da_key_is_unsigned). */
+        if (da_key_is_unsigned(c->key_types[0])) {
+            switch (c->key_esz[0]) {
+            case 1: DA_SINGLE_KEY_LOOP(uint8_t, ); break;
+            case 2: DA_SINGLE_KEY_LOOP(uint16_t, ); break;
+            case 4: DA_SINGLE_KEY_LOOP(uint32_t, (int64_t)); break;
+            default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
+            }
+        } else {
+            switch (c->key_esz[0]) {
+            case 1: DA_SINGLE_KEY_LOOP(int8_t, ); break;
+            case 2: DA_SINGLE_KEY_LOOP(int16_t, ); break;
+            case 4: DA_SINGLE_KEY_LOOP(int32_t, (int64_t)); break;
+            default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
+            }
         }
         #undef DA_SINGLE_KEY_LOOP
         return;
@@ -6360,27 +6894,51 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         } \
     } while (0)
 
-    /* Check if all keys share the same element size */
+    /* Typed loops need all keys to share element size AND signedness; a
+     * mixed set (e.g. I16 + SYM16) falls to the sign-aware generic gid. */
     bool uniform_esz = true;
-    for (uint32_t k = 1; k < n_keys; k++)
+    bool uniform_sign = true;
+    for (uint32_t k = 1; k < n_keys; k++) {
         if (c->key_esz[k] != c->key_esz[0]) { uniform_esz = false; break; }
+        if (da_key_is_unsigned(c->key_types[k]) !=
+            da_key_is_unsigned(c->key_types[0])) { uniform_sign = false; break; }
+    }
 
-    if (uniform_esz) {
+    if (uniform_esz && uniform_sign) {
+        bool k_uns = da_key_is_unsigned(c->key_types[0]);
         switch (c->key_esz[0]) {
         case 1:
+            if (k_uns) {
 #define GID_FN(R) da_composite_gid_u8(c, (R))
-            DA_MULTI_KEY_LOOP(GID_FN);
+                DA_MULTI_KEY_LOOP(GID_FN);
 #undef GID_FN
+            } else {
+#define GID_FN(R) da_composite_gid(c, (R))
+                DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            }
             break;
         case 2:
+            if (k_uns) {
 #define GID_FN(R) da_composite_gid_u16(c, (R))
-            DA_MULTI_KEY_LOOP(GID_FN);
+                DA_MULTI_KEY_LOOP(GID_FN);
 #undef GID_FN
+            } else {
+#define GID_FN(R) da_composite_gid_i16(c, (R))
+                DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            }
             break;
         case 4:
+            if (k_uns) {
 #define GID_FN(R) da_composite_gid_u32(c, (R))
-            DA_MULTI_KEY_LOOP(GID_FN);
+                DA_MULTI_KEY_LOOP(GID_FN);
 #undef GID_FN
+            } else {
+#define GID_FN(R) da_composite_gid_i32(c, (R))
+                DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            }
             break;
         default:
 #define GID_FN(R) da_composite_gid_i64(c, (R))
@@ -9534,15 +10092,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                          m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count,
                          NULL, NULL, NULL);
 
-        /* Wide-element (STR/GUID) min/max/first/last overflow emit_agg_columns'
-         * fixed-width slots (it truncated them to 1 byte above).  Recompute
-         * those 1-row columns by materialising the winning row — mirroring
+        /* Row-gathered min/max/first/last cannot be represented in
+         * emit_agg_columns' fixed-width accumulator slots.  Recompute those
+         * 1-row columns by materialising the winning row — mirroring
          * exec_reduction — and override them in the result table. */
         for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t aop = ext->agg_ops[a];
-            if (!(agg_vecs[a] && agg_is_wide_type(agg_vecs[a]->type) &&
-                  (aop == OP_MIN || aop == OP_MAX ||
-                   aop == OP_FIRST || aop == OP_LAST)))
+            if (!(agg_vecs[a] &&
+                  agg_needs_row_gather(agg_vecs[a]->type, aop)))
                 continue;
             ray_t* wsel_blk = NULL; const int64_t* wsel = NULL; int64_t wscan = nrows;
             if (g->selection) {
@@ -9556,11 +10113,18 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             bool hn = (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) != 0;
             ray_t* atom = agg_wide_reduce(agg_vecs[a], aop, wsel, wscan, hn);
             if (wsel_blk) ray_release(wsel_blk);
-            ray_t* col = col_vec_new(agg_vecs[a], 1);
+            ray_t* col = agg_vecs[a]->type == RAY_LIST
+                ? ray_list_new(1)
+                : col_vec_new(agg_vecs[a], 1);
             if (col && !RAY_IS_ERR(col)) {
                 col->len = 1;
                 if (RAY_ATOM_IS_NULL(atom)) {
                     ray_vec_set_null(col, 0, true);
+                } else if (agg_vecs[a]->type == RAY_LIST) {
+                    /* agg_wide_reduce returned an owned child reference;
+                     * transfer it directly into the owning output list. */
+                    ((ray_t**)ray_data(col))[0] = atom;
+                    atom = NULL;
                 } else if (agg_vecs[a]->type == RAY_STR) {
                     ray_t* nv = ray_str_vec_set(col, 0, ray_str_ptr(atom), ray_str_len(atom));
                     if (nv && !RAY_IS_ERR(nv)) col = nv;
@@ -9570,7 +10134,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 ray_table_set_col_idx(result, a, col);
                 ray_release(col);
             }
-            ray_release(atom);
+            if (atom) ray_release(atom);
         }
 
         /* Whole-table holistic aggregates have no n_keys==0 accumulator, so emit_agg_columns
@@ -9648,6 +10212,26 @@ da_path:;
          * carries per-agg arrays rather than a fixed-width bitmask. */
         bool da_eligible = (n_scan > 0 && n_keys > 0 && n_keys <= 8 &&
                              n_aggs <= 64);
+        /* Selection-sparse gate (restored from the pre-#326 routing): with a
+         * bitmap rowsel and no flattened match_idx, both DA scans (min/max
+         * prescan and accumulate) visit every input row and test the bitmap
+         * per row — O(nrows) regardless of selectivity — while the HT/radix
+         * paths work off the surviving rows only.  A selective filter makes
+         * the DA path arbitrarily worse than the input it replaces (ClickBench
+         * q07/q38/q40: 4-12ms -> 42-54ms), so route sparse selections away. */
+        if (da_eligible && rowsel && !match_idx) {
+            ray_rowsel_t* sm = ray_rowsel_meta(rowsel);
+            if (sm && sm->total_pass * 4 < nrows)
+                da_eligible = false;
+        }
+        /* DA slot budget: dense per-worker state must stay well under the
+         * input size or the scatter loses to radix grouping on cache misses
+         * alone (ClickBench q28: a 2.7M-slot Referer array over 10M rows ran
+         * 10x slower than the HT path).  n_scan/8 keeps the state O(input/8)
+         * while still allowing the >262144-slot shapes #326 opened up; the
+         * old fixed cap remains as the floor so small inputs keep DA. */
+        uint64_t da_slot_budget = (uint64_t)(n_scan >> 3);
+        if (da_slot_budget < 262144) da_slot_budget = 262144;
         /* Binary aggregators (OP_PEARSON_CORR) are not wired into the
          * dense-array accumulator's per-worker da_accum_t struct — force
          * the HT path which has the row-layout offsets allocated.
@@ -9690,11 +10274,10 @@ da_path:;
             if (aop == OP_MODE)         da_eligible = false;
             if (aop == OP_TOP_N)        da_eligible = false;
             if (aop == OP_BOT_N)        da_eligible = false;
-            /* Wide-element (STR/GUID) min/max/first/last need the holistic
-             * post-fill; the DA emit (emit_agg_columns) would truncate them. */
-            if (agg_vecs[a] && agg_is_wide_type(agg_vecs[a]->type) &&
-                (aop == OP_MIN || aop == OP_MAX ||
-                 aop == OP_FIRST || aop == OP_LAST))
+            /* Row-gathered aggregates need the holistic post-fill; the DA
+             * emitter cannot represent their source cells. */
+            if (agg_vecs[a] &&
+                agg_needs_row_gather(agg_vecs[a]->type, aop))
                 da_eligible = false;
         }
         for (uint32_t k = 0; k < n_keys && da_eligible; k++) {
@@ -9732,12 +10315,12 @@ da_path:;
                 if (key_scan_sym[k] < 0) continue;
                 int64_t card = ray_grp_card_lookup(key_scan_sym[k]);
                 if (card <= 1) continue;
-                if ((uint64_t)card > (uint64_t)n_scan / known_ub) {
+                if ((uint64_t)card > da_slot_budget / known_ub) {
                     da_eligible = false;
                     break;
                 }
                 known_ub *= (uint64_t)card;
-                if (known_ub > (uint64_t)n_scan) { da_eligible = false; break; }
+                if (known_ub > da_slot_budget) { da_eligible = false; break; }
             }
         }
 
@@ -9771,7 +10354,7 @@ da_path:;
                     .n_workers      = mm_n,
                     .match_idx      = match_idx,
                     .rowsel         = rowsel,
-                    .span_budget    = n_scan,
+                    .span_budget    = (int64_t)da_slot_budget,
                     .abort_flag     = &mm_abort,
                 };
                 if (mm_n > 1) {
@@ -9796,8 +10379,8 @@ da_path:;
                 da_key_range[k] = (int64_t)span;
                 if (da_key_range[k] <= 0) { da_fits = false; break; }
                 uint64_t range = (uint64_t)da_key_range[k];
-                uint64_t slot_limit = (uint64_t)n_scan < INT32_MAX
-                    ? (uint64_t)n_scan : INT32_MAX;
+                uint64_t slot_limit = da_slot_budget < INT32_MAX
+                    ? da_slot_budget : INT32_MAX;
                 if (total_slots > slot_limit / range) {
                     da_fits = false;
                     break;
@@ -10490,7 +11073,30 @@ da_path:;
 
             uint8_t key_esz = ray_sym_elem_size(key_types[0], key_attrs[0]);
 
-            if (use_emit_filter &&
+            /* Dense-cap vs survivor gate: the dyn-dense emit path callocs
+             * and slot-scans a key-range-sized array (1<<20 initial for
+             * 4-byte keys, up to 1<<24) — pure overhead when a WHERE
+             * leaves far fewer survivors than the array has slots
+             * (ClickBench q21: a 1M-slot scatter+scan for 44 rows).  The
+             * comparison is cap-vs-survivors, NOT raw selectivity: a
+             * narrow key's 64K cap stays profitable at any filter (q07).
+             * Sparse-vs-cap selections continue to the radix/HT paths,
+             * which size their state from the surviving rows. */
+            bool sp_dyn_sparse = false;
+            if (rowsel) {
+                ray_rowsel_t* sp_sm = ray_rowsel_meta(rowsel);
+                uint64_t sp_cap = key_esz == 1 ? 256u
+                                : key_esz == 2 ? (1u << 16)
+                                : (1u << 20);
+                /* Break-even multiplier: the dense side costs a sequential
+                 * cap-sized calloc+scan (cheap per slot); the radix side
+                 * costs per-survivor hashing plus fixed pipeline setup.
+                 * Measured on ClickBench: 39K survivors amortize a 1M cap
+                 * (q38, dense wins), 44 survivors do not (q21). */
+                if (sp_sm && (uint64_t)sp_sm->total_pass * 32 < sp_cap)
+                    sp_dyn_sparse = true;
+            }
+            if (use_emit_filter && !sp_dyn_sparse &&
                 (emit_filter.min_count_exclusive > 0 ||
                  emit_filter.top_count_take > 0) &&
                 n_scan <= UINT32_MAX) {
@@ -11006,7 +11612,19 @@ ht_path:;
     /* Parallel path: radix-partitioned group-by */
     ray_pool_t* pool = ray_pool_get();
     uint32_t n_total = pool ? ray_pool_total_workers(pool) : 1;
-    uint32_t radix_n_parts = group_radix_part_count(n_total, n_scan);
+    /* Size the radix fan-out by the rows that actually reach the partition
+     * HTs: with a pushed WHERE only the survivors are scattered, and a
+     * part count derived from the raw row count allocates and merges
+     * n_workers * n_parts hash tables of pure setup overhead (ClickBench
+     * q40: 8 x 4096 HTs for ~10K survivors — the merge dwarfed the query).
+     * Partition count only affects work distribution, never results. */
+    int64_t radix_rows = n_scan;
+    if (g->selection) {
+        ray_rowsel_t* sel_sm = ray_rowsel_meta(g->selection);
+        if (sel_sm && sel_sm->nrows == nrows && sel_sm->total_pass < radix_rows)
+            radix_rows = sel_sm->total_pass > 0 ? sel_sm->total_pass : 1;
+    }
+    uint32_t radix_n_parts = group_radix_part_count(n_total, radix_rows);
 
     group_ht_t single_ht;
     group_ht_t top_ht;
@@ -11519,6 +12137,59 @@ v2_emit:;
                 result = ray_error("limit", "group row index is too large");
                 goto cleanup;
             }
+            /* Sparse path: with few groups relative to rows, sort the
+             * (first_row, flat) pairs instead of building + scanning a
+             * dense uint32[nrows] map — the dense pass costs O(nrows) in
+             * allocation, memset and scan regardless of group count
+             * (ClickBench q40: a 40MB map and full 10M-row walk to order
+             * 110 groups).  Sorting by earliest source row assigns exactly
+             * the ids the row-domain scan would.  Duplicate first rows are
+             * rejected the same way the dense map's collision check did. */
+            if ((uint64_t)total_grps <= row_count / 16) {
+                ray_t* pair_hdr = NULL;
+                group_order_pair_t* pairs = (group_order_pair_t*)scratch_alloc(
+                    &pair_hdr, (size_t)total_grps * sizeof(group_order_pair_t));
+                if (!pairs) {
+                    result = ray_error("oom", NULL);
+                    goto cleanup;
+                }
+                bool order_ok = true;
+                uint32_t np = 0;
+                for (uint32_t p = 0; p < radix_n_parts && order_ok; p++) {
+                    group_ht_t* ph = &part_hts[p];
+                    for (uint32_t gi = 0; gi < ph->grp_count; gi++) {
+                        uint32_t flat = part_offsets[p] + gi;
+                        const char* group_row = ph->rows
+                            + (size_t)gi * ph->layout.row_stride;
+                        int64_t first;
+                        memcpy(&first,
+                               group_row + ph->layout.off_group_first, 8);
+                        if (first < 0 || first >= nrows) {
+                            order_ok = false;
+                            break;
+                        }
+                        pairs[np].first = first;
+                        pairs[np].flat  = flat;
+                        np++;
+                    }
+                }
+                if (order_ok) {
+                    qsort(pairs, np, sizeof(group_order_pair_t),
+                          group_order_pair_cmp);
+                    for (uint32_t i = 0; i < np; i++) {
+                        if (i > 0 && pairs[i].first == pairs[i - 1].first) {
+                            order_ok = false;
+                            break;
+                        }
+                        group_out[pairs[i].flat] = i;
+                    }
+                }
+                scratch_free(pair_hdr);
+                if (!order_ok || np != total_grps) {
+                    result = ray_error("group", "failed to order all groups");
+                    goto cleanup;
+                }
+            } else {
             ray_t* first_hdr = NULL;
             uint32_t* first_to_flat = (uint32_t*)scratch_alloc(
                 &first_hdr, (size_t)row_count * sizeof(uint32_t));
@@ -11556,6 +12227,7 @@ v2_emit:;
             if (!order_ok || out != total_grps) {
                 result = ray_error("group", "failed to order all groups");
                 goto cleanup;
+            }
             }
         }
 
@@ -11645,7 +12317,9 @@ v2_emit:;
                     out_type = is_f64 ? RAY_F64
                                       : (agg_col ? agg_col->type : RAY_I64); break;
             }
-            ray_t* new_col = ray_vec_new(out_type, (int64_t)total_grps);
+            ray_t* new_col = out_type == RAY_LIST
+                ? ray_list_new((int64_t)total_grps)
+                : ray_vec_new(out_type, (int64_t)total_grps);
             if (!new_col || RAY_IS_ERR(new_col)) {
                 agg_cols[a] = NULL;
                 memset(&agg_outs[a], 0, sizeof(agg_outs[a]));
@@ -12276,9 +12950,9 @@ sequential_fallback:;
                                   : (agg_col ? agg_col->type : RAY_I64); break;
         }
         ray_t* new_col;
-        /* Drive off the layout bitmask, not the op literal: wide-element
-         * (STR/GUID) min/max/first/last are holistic too and their column
-         * lives in med_out[a], not the truncating row-layout read below. */
+        /* Drive off the layout bitmask, not the op literal: row-gathered
+         * STR/GUID/LIST aggregates are holistic too and their column lives
+         * in med_out[a], not the truncating row-layout read below. */
         bool is_holistic = (ly->agg_flags[a] & GHT_AF_HOLISTIC) != 0;
         if (is_holistic && med_out && med_out[a]
             && !RAY_IS_ERR(med_out[a])) {

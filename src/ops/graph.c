@@ -421,6 +421,15 @@ static int8_t promote(int8_t a, int8_t b) {
     return RAY_BOOL;
 }
 
+static bool type_is_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+static int8_t promote_if_type(int8_t a, int8_t b) {
+    if (a == b && type_is_temporal(a)) return a;
+    return promote(a, b);
+}
+
 /* --------------------------------------------------------------------------
  * Unary element-wise ops
  * -------------------------------------------------------------------------- */
@@ -493,7 +502,7 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     uint32_t cond_id = cond->id;
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
-    int8_t out_type = promote(then_val->out_type, else_val->out_type);
+    int8_t out_type = promote_if_type(then_val->out_type, else_val->out_type);
     /* IF preserves string types: promote() handles RAY_STR (wins over SYM);
      * SYM override only applies when neither side is RAY_STR */
     if (out_type != RAY_STR &&
@@ -1757,6 +1766,8 @@ ray_t* ray_lazy_wrap(ray_graph_t* g, ray_op_t* op) {
 ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
+    if (!g || !prev)
+        return ray_error("domain", "lazy handle already materialized");
 
     /* Determine output type based on opcode */
     int8_t out_type;
@@ -1824,6 +1835,8 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
 ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
+    if (!g || !prev)
+        return ray_error("domain", "lazy handle already materialized");
 
     int8_t out_type;
     switch (opcode) {
@@ -1856,6 +1869,12 @@ ray_t* ray_lazy_materialize(ray_t* val) {
 
     ray_graph_t* g  = RAY_LAZY_GRAPH(val);
     ray_op_t*    op = RAY_LAZY_OP(val);
+    if (!g || !op) {
+        RAY_LAZY_GRAPH(val) = NULL;
+        RAY_LAZY_OP(val) = NULL;
+        ray_release(val);
+        return ray_error("domain", "lazy handle already materialized");
+    }
 
     /* Run the full optimizer pipeline before execution. ray_optimize
        may return a different root (e.g. predicate pushdown). */
@@ -1867,6 +1886,7 @@ ray_t* ray_lazy_materialize(ray_t* val) {
     /* Clear graph pointer before releasing to prevent double-free in
      * ray_release_owned_refs */
     RAY_LAZY_GRAPH(val) = NULL;
+    RAY_LAZY_OP(val) = NULL;
     ray_release(val);
     return result;
 }

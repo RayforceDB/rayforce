@@ -28,6 +28,7 @@
 #include "store/fileio.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "table/dict.h"
 #include "ops/idxop.h"
 #include "vec/str.h"
 #include "lang/format.h"
@@ -153,6 +154,52 @@ static bool is_serializable_type(int8_t t) {
     default:
         return false;
     }
+}
+
+/* Mirror col_write_recursive without touching a FILE.  This is deliberately
+ * structural rather than size-estimating: the save path can still report I/O
+ * or OOM later, but deterministic unsupported/corrupt object graphs are
+ * rejected before a splayed overwrite replaces any live column. */
+static ray_err_t col_preflight_recursive(ray_t* obj) {
+    if (!obj || RAY_IS_ERR(obj)) return RAY_ERR_TYPE;
+    int8_t type = obj->type;
+    if (type < 0 || is_serializable_type(type)) return RAY_OK;
+
+    if (type == RAY_LIST) {
+        ray_t** slots = (ray_t**)ray_data(obj);
+        for (int64_t i = 0; i < obj->len; i++) {
+            ray_err_t err = col_preflight_recursive(slots[i]);
+            if (err != RAY_OK) return err;
+        }
+        return RAY_OK;
+    }
+
+    if (type == RAY_TABLE) {
+        int64_t ncols = ray_table_ncols(obj);
+        for (int64_t c = 0; c < ncols; c++) {
+            ray_err_t err = col_preflight_recursive(
+                ray_table_get_col_idx(obj, c));
+            if (err != RAY_OK) return err;
+        }
+        return RAY_OK;
+    }
+
+    if (type == RAY_DICT) {
+        ray_t* keys = ray_dict_keys(obj);
+        ray_t* vals = ray_dict_vals(obj);
+        ray_err_t err = col_preflight_recursive(keys);
+        return err == RAY_OK ? col_preflight_recursive(vals) : err;
+    }
+
+    return RAY_ERR_NYI;
+}
+
+ray_err_t ray_col_save_preflight(ray_t* vec) {
+    if (!vec || RAY_IS_ERR(vec)) return RAY_ERR_TYPE;
+    if (is_serializable_type(vec->type)) return RAY_OK;
+    if (vec->type == RAY_LIST || vec->type == RAY_TABLE)
+        return col_preflight_recursive(vec);
+    return RAY_ERR_NYI;
 }
 
 /* --------------------------------------------------------------------------
@@ -359,6 +406,13 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
         return RAY_OK;
     }
 
+    if (type == RAY_DICT) {
+        ray_t* keys = ray_dict_keys(obj);
+        ray_t* vals = ray_dict_vals(obj);
+        ray_err_t err = col_write_recursive(keys, f);
+        return err == RAY_OK ? col_write_recursive(vals, f) : err;
+    }
+
     return RAY_ERR_NYI;
 }
 
@@ -536,6 +590,17 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
             if (!tbl || RAY_IS_ERR(tbl)) return tbl;
         }
         return tbl;
+    }
+
+    if (type == RAY_DICT) {
+        ray_t* keys = col_read_recursive(pp, remaining);
+        if (!keys || RAY_IS_ERR(keys)) return keys;
+        ray_t* vals = col_read_recursive(pp, remaining);
+        if (!vals || RAY_IS_ERR(vals)) {
+            ray_release(keys);
+            return vals;
+        }
+        return ray_dict_new(keys, vals); /* consumes keys + vals */
     }
 
     return ray_error("nyi", NULL);
@@ -1147,7 +1212,8 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
     if (pool_size > mapped_size - offset - 32)
         return RAY_ERR_CORRUPT;
 
-    const ray_str_t* elems = (const ray_str_t*)((const char*)ptr + 32);
+    ray_str_t* elems = (ray_str_t*)((char*)ptr + 32);
+    const char* pool_base = (const char*)ptr + offset + 32;
     for (int64_t i = 0; i < hdr->len; i++) {
         uint32_t len = elems[i].len;
         if (len <= RAY_STR_INLINE_MAX) continue;
@@ -1155,10 +1221,25 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
             len > pool_size - elems[i].pool_off)
             return RAY_ERR_CORRUPT;
         if (len >= 4) {
-            const char* p = (const char*)ptr + offset + 32 + elems[i].pool_off;
+            const char* p = pool_base + elems[i].pool_off;
             if (memcmp(elems[i].prefix, p, 4) != 0)
                 return RAY_ERR_CORRUPT;
         }
+    }
+
+    /* Pre-hash-cache column files persisted the descriptor's final four
+     * bytes as uninitialized padding.  A nonzero legacy value must never be
+     * trusted as a content hash: equal strings could otherwise probe
+     * different join/group slots and silently produce wrong results.
+     *
+     * ray_vm_map_file is MAP_PRIVATE / copy-on-write, so refreshing the
+     * validated descriptors repairs both callers: ray_col_load copies these
+     * values into its buddy block, while ray_col_mmap retains the private
+     * repaired mapping without modifying the file. */
+    for (int64_t i = 0; i < hdr->len; i++) {
+        if (ray_str_is_inline(&elems[i])) continue;
+        uint32_t h = (uint32_t)ray_str_t_hash(&elems[i], pool_base);
+        elems[i].hash32 = h != 0 ? h : 1u;
     }
 
     out->has_str_pool = true;

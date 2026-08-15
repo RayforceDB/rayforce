@@ -65,8 +65,8 @@ In restricted mode, specific builtins that write files, mutate state, or control
 | Category | Blocked Builtins |
 |---|---|
 | Mutation | `set`, `del`, `update`, `insert`, `upsert`, `modify` |
-| File writes | `write`, `.csv.write`, `load`, `.db.splayed.set` |
-| File reads | `read`, `.csv.read` |
+| File writes | `write`, `write-bytes`, `.csv.write`, `load`, `.db.splayed.set` |
+| File reads | `read`, `read-bytes`, `.csv.read` |
 | System | `.sys.exec`, `.os.getenv`, `.os.setenv`, `exit` |
 | IPC chaining | `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post` |
 

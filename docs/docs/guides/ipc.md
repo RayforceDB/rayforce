@@ -102,14 +102,14 @@ The server evaluates any valid Rayfall expression sent as a string. This means y
 (.ipc.send h "(select {from: trades total: (sum qty)})")
 
 ;; Volume-weighted average price by symbol
-(.ipc.send h "(select {from: trades by: sym vwap: (% (sum (* price qty)) (sum qty))})")
+(.ipc.send h "(select {from: trades by: sym vwap: (/ (sum (* price qty)) (sum qty))})")
 ```
 
 ### Joins
 
 ```text
 ;; Join trades with quotes on sym
-(.ipc.send h "(select {from: (left-join trades quotes 'sym)})")
+(.ipc.send h "(select {from: (left-join [sym] trades quotes)})")
 ```
 
 !!! note "Tip"
@@ -326,7 +326,24 @@ The IPC layer is also accessible from C, enabling you to embed Rayforce clients 
 | `ray_ipc_send(handle, msg)` | Synchronous send: serialize `msg`, send, wait for response, return deserialized result. |
 | `ray_ipc_send_async(handle, msg)` | Fire-and-forget send: serialize and send `msg` without waiting for a response. |
 | `ray_ipc_close(handle)` | Close the connection and free the handle. |
+| `ray_poll_set_restricted(poll, restricted)` | Make connections created afterward evaluate in restricted (read-only) mode. Call before servicing an embedded listener. |
 | `ray_ipc_listen(poll, port)` | Register a server socket on the given poll loop. Used internally by `-p` mode. |
+
+An embedded read-only server can use only the public, pointer-based API:
+
+```c
+ray_poll_t* poll = ray_poll_create();
+ray_poll_set_restricted(poll, true);
+ray_runtime_set_poll(poll);
+
+ray_t* listener = ray_eval_str("(.sys.listen 7701)");
+/* Check listener for an error, then service IPC from the host loop. */
+ray_poll_run_for(poll, 200);
+ray_release(listener);
+```
+
+The restriction applies to connections created after the setter call;
+existing connections keep their original evaluation mode.
 
 ### Example: C Client
 

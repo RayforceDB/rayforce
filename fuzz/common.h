@@ -32,12 +32,8 @@
 
 #include <rayforce.h>
 
-/* Runtime lifecycle — forward-declared the same way test/main.c does, to
- * dodge the ray_vm_t type clash between core/runtime.h and the public
- * header.  We only ever need create(). */
-struct ray_runtime_s;
-typedef struct ray_runtime_s ray_runtime_t;
-extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
+/* Runtime lifecycle is part of the public header; fuzz drivers only need
+ * create(). */
 
 /* Lazy one-time runtime init.  libFuzzer offers LLVMFuzzerInitialize, but
  * a guarded lazy path keeps each driver self-contained and also works when
