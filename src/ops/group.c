@@ -5389,16 +5389,27 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
         enum { V2M = 1024, V2MPF = 8 };
         /* Morsel staging: hashes, key values, source rows, partition ids,
          * partition-order permutation, and the counting-sort histogram.
-         * n_parts is bounded by group_radix_part_count (sqrt of rows), so
-         * the histogram is a scratch carve, not a VLA on 16K parts. */
+         * mpart is uint32_t: group_radix_part_count is uncapped, so at
+         * extreme row counts (>4.29e9) n_parts can exceed 65536 and a
+         * uint16_t partition id would truncate and misroute the probe.
+         * morder stays uint16_t — it indexes morsel slots, always <=1024.
+         * hist is sized n_parts (not n_parts+1: sparse scheme below writes
+         * counts directly into hist[p], no running-offset slot needed) and
+         * is scratch_calloc'd ONCE per dispatch call so it starts zeroed;
+         * each morsel only touches (and only re-zeroes) the partitions it
+         * actually hit, tracked via plist, keeping the per-morsel counting
+         * sort O(morsel size) instead of O(n_parts) — at 100M rows
+         * n_parts can reach ~16384, and a full memset+prefix per 1024-row
+         * morsel would dominate the useful work. */
         uint64_t mh[V2M];
         int64_t  mk[V2M * 2];
         int64_t  mrow[V2M];
-        uint16_t mpart[V2M];
+        uint32_t mpart[V2M];
         uint16_t morder[V2M];
+        uint32_t plist[V2M];
         ray_t* hist_hdr = NULL;
-        uint32_t* hist = (uint32_t*)scratch_alloc(&hist_hdr,
-            ((size_t)c->n_parts + 1) * sizeof(uint32_t));
+        uint32_t* hist = (uint32_t*)scratch_calloc(&hist_hdr,
+            (size_t)c->n_parts * sizeof(uint32_t));
         if (!hist) {
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             scratch_free(v2_stage_hdr);
@@ -5434,17 +5445,31 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                 }
                 mh[mn]   = h;
                 mrow[mn] = row;
-                mpart[mn] = (uint16_t)group_radix_part(h, c->n_parts);
+                mpart[mn] = group_radix_part(h, c->n_parts);
                 mn++;
             }
             if (mn == 0) continue;
 
-            /* ---- counting-sort morsel indices by partition ---- */
-            memset(hist, 0, ((size_t)c->n_parts + 1) * sizeof(uint32_t));
-            for (uint32_t j = 0; j < mn; j++) hist[mpart[j] + 1]++;
-            for (uint32_t p = 0; p < c->n_parts; p++) hist[p + 1] += hist[p];
+            /* ---- counting-sort morsel indices by partition, touched-set
+             * only ---- */
+            uint32_t np = 0;
+            for (uint32_t j = 0; j < mn; j++) {
+                uint32_t p = mpart[j];
+                if (hist[p] == 0) plist[np++] = p;
+                hist[p]++;
+            }
+            uint32_t run = 0;
+            for (uint32_t t = 0; t < np; t++) {
+                uint32_t p = plist[t];
+                uint32_t cnt = hist[p];
+                hist[p] = run;
+                run += cnt;
+            }
             for (uint32_t j = 0; j < mn; j++)
                 morder[hist[mpart[j]]++] = (uint16_t)j;
+            /* Restore the all-zero invariant for the next morsel — only
+             * the touched entries need clearing. */
+            for (uint32_t t = 0; t < np; t++) hist[plist[t]] = 0;
 
             /* ---- probe, partition-major with intra-run prefetch ---- */
             for (uint32_t o = 0; o < mn; o++) {
