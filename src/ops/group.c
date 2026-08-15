@@ -3459,12 +3459,28 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             }
         }
         /* Packed-tuple eligibility: every key is a plain fixed-width integer
-         * lane (no GUID/STR indirection, no F64 — see ght_layout_t.packed_key
-         * for why F64 is excluded).  n_keys == 0 is not a tuple. */
+         * lane.  This is a WHITELIST of exactly the types read_col_i64
+         * decodes deliberately, not a `!= RAY_F64` blacklist: read_col_i64's
+         * `default` arm reads ONE BYTE, so an un-enumerated fixed-width type
+         * (RAY_F32 is the live example) would be silently mis-loaded, and a
+         * packed layout would then hash those wrong bits as the key identity.
+         * F64 is excluded for a different reason — ray_hash_f64 normalises
+         * -0.0 and a raw-lane hash would not (see ght_layout_t.packed_key).
+         * GUID/STR are excluded by any_wide_key.  n_keys == 0 is not a
+         * tuple. */
         if (n_keys >= 1 && !out->any_wide_key) {
             bool packed = true;
-            for (uint32_t k = 0; k < n_keys && packed; k++)
-                packed = key_types[k] != RAY_F64;
+            for (uint32_t k = 0; k < n_keys && packed; k++) {
+                switch (key_types[k]) {
+                case RAY_BOOL: case RAY_U8:  case RAY_I16: case RAY_I32:
+                case RAY_I64:  case RAY_DATE: case RAY_TIME:
+                case RAY_TIMESTAMP: case RAY_SYM:
+                    break;
+                default:
+                    packed = false;
+                    break;
+                }
+            }
             out->packed_key = packed ? 1 : 0;
         }
     }
@@ -4572,9 +4588,24 @@ static void init_accum_from_entry_nullable(char* row, const char* entry,
  * strides are all multiples of 8, so every lane is naturally aligned. */
 #define GHT_LANES_INLINE 8
 
+/* Whole-lane precondition.  Both helpers round the length DOWN to lanes, so a
+ * length that is not a multiple of 8 would silently drop the tail bytes from
+ * the copy / the compare.  Every caller passes ly->key_region or
+ * n_agg_vals*8, both built purely from 8- and 16-byte pieces, so this is an
+ * invariant, not input validation — checked under DEBUG/RAY_HARDENED (which
+ * is what `make test` builds) and free in release, matching RAY_ASSERT_VALUE's
+ * convention. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
+#define GHT_LANES_WHOLE(bytes) assert((((unsigned)(bytes)) & 7u) == 0 && \
+    "ght_lanes_* length must be a whole number of 8-byte lanes")
+#else
+#define GHT_LANES_WHOLE(bytes) ((void)0)
+#endif
+
 static inline void ght_lanes_copy(void* dst, const void* src, uint16_t bytes) {
     uint64_t* d = (uint64_t*)dst;
     const uint64_t* s = (const uint64_t*)src;
+    GHT_LANES_WHOLE(bytes);
     switch ((unsigned)bytes >> 3) {
     default: memcpy(dst, src, bytes); return;
     case 8: d[7] = s[7]; __attribute__((fallthrough));
@@ -4592,6 +4623,7 @@ static inline void ght_lanes_copy(void* dst, const void* src, uint16_t bytes) {
 static inline bool ght_lanes_equal(const void* a, const void* b, uint16_t bytes) {
     const uint64_t* x = (const uint64_t*)a;
     const uint64_t* y = (const uint64_t*)b;
+    GHT_LANES_WHOLE(bytes);
     switch ((unsigned)bytes >> 3) {
     default: return memcmp(a, b, bytes) == 0;
     case 8: if (x[7] != y[7]) return false; __attribute__((fallthrough));
@@ -5753,7 +5785,10 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
      * stay cache-hot, unlike the row-major order where consecutive
      * rows hit different partitions.  Hashing, entry layout, probe and
      * merge are IDENTICAL to the generic loop below — iteration order
-     * only; group ids and first_row (MIN) are order-independent. */
+     * only; group ids and first_row (MIN) are order-independent.
+     *
+     * NOTE: "hashing is identical" is load-bearing and is enforced by the
+     * v2_packed branch in the staging loop — see the comment there. */
     if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
         ly->need_flags == 0 &&
         !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
@@ -5774,6 +5809,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
          * sort O(morsel size) instead of O(n_parts) — at 100M rows
          * n_parts can reach ~16384, and a full memset+prefix per 1024-row
          * morsel would dominate the useful work. */
+        uint8_t v2_packed = ly->packed_key;
         uint64_t mh[V2M];
         int64_t  mk[V2M * 2];
         int64_t  mrow[V2M];
@@ -5801,21 +5837,35 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                     continue;
                 uint64_t h = 0;
                 for (uint32_t k = 0; k < nk; k++) {
-                    uint64_t kh;
+                    uint64_t kh = 0;
                     int8_t t = c->key_types[k];
                     if (t == RAY_F64) {
                         int64_t kv;
                         memcpy(&kv, &((double*)c->key_data[k])[row], 8);
                         mk[(size_t)mn * nk + k] = kv;
-                        kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+                        if (!v2_packed) kh = ray_hash_f64(((double*)c->key_data[k])[row]);
                     } else {
                         int64_t kv = read_col_i64(c->key_data[k], row, t,
                                                   c->key_attrs[k]);
                         mk[(size_t)mn * nk + k] = kv;
-                        kh = ray_hash_i64(kv);
+                        if (!v2_packed) kh = ray_hash_i64(kv);
                     }
-                    h = (k == 0) ? kh : ray_hash_combine(h, kh);
+                    if (!v2_packed) h = (k == 0) ? kh : ray_hash_combine(h, kh);
                 }
+                /* Packed layouts MUST hash through ght_hash_lanes here, not
+                 * per-key hash + combine.  hash_keys_inline — which
+                 * group_ht_rehash, group_ht_rebuild_slots and group_merge_row
+                 * all use to re-derive a row's hash — returns ght_hash_lanes
+                 * for this layout, so a per-key hash staged here would stop
+                 * matching the moment a worker HT rehashes: the probe would
+                 * land on the wrong slot chain and insert a DUPLICATE group
+                 * row for a key already present.  (Phase 2's merge folds the
+                 * duplicates so answers stayed right, which is exactly why it
+                 * would have gone unnoticed.)  This whole fast path was
+                 * unreachable before null-mask elision made null_words == 0
+                 * satisfiable, so the divergence arrived with it.
+                 * null_words == 0 is in the gate above, hence lanes == nk. */
+                if (v2_packed) h = ght_hash_lanes(&mk[(size_t)mn * nk], nk);
                 mh[mn]   = h;
                 mrow[mn] = row;
                 mpart[mn] = group_radix_part(h, c->n_parts);
