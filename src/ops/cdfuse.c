@@ -129,8 +129,16 @@ static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t r = start; r < end; r++) {
         int64_t k = read_col_i64(c->kdata, r, c->ktype, c->kattrs);
         int64_t v = read_col_i64(c->vdata, r, c->vtype, c->vattrs);
-        /* PAIR hash: uniform even when one key owns most of the table. */
-        uint64_t h = cdf_fmix64(ray_hash_i64(k) ^ ray_hash_i64(v));
+        /* PAIR hash: uniform even when one key owns most of the table.
+         * The odd-multiplier on the k side is LOAD-BEARING, not decoration: a
+         * bare `hash(k) ^ hash(v)` cancels to 0 for every row where k == v, so
+         * a `(count (distinct k)) by: k` — or any strongly correlated column
+         * pair — would pile every row into partition 0 at dedupe slot 0 and run
+         * one giant serial probe cluster (measured: 2m42s on 20M rows vs 0.09s
+         * uncorrelated).  Multiplying one side by the golden-ratio constant
+         * makes the combine asymmetric, so k == v hashes like any other pair. */
+        uint64_t h = cdf_fmix64(ray_hash_i64(k) * 0x9E3779B97F4A7C15ULL ^
+                                ray_hash_i64(v));
         uint32_t p = (uint32_t)(h & (c->n_parts - 1));
         char* rec = cdf_reserve(&my[p], c->prime);
         if (!rec) {
@@ -543,7 +551,14 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
 
     /* Phase 3: merge the per-partition partials into global per-key totals, one
      * task per key bucket.  Keys are disjoint across buckets, so the tasks
-     * never touch the same entry and need no coordination. */
+     * never touch the same entry and need no coordination.
+     *
+     * KNOWN MEMORY BOUND: peak footprint scales with ROWS, not with groups —
+     * phase 2's partial triples (24B per distinct (partition, key) pair, itself
+     * bounded by the row count) coexist with phase 1's 32B-per-row records
+     * until the cdf_free_all below, so a pathological all-distinct input peaks
+     * near 56B/row.  Cardinality-aware admission (declining when the estimated
+     * distinct-pair count would blow a budget) is future work. */
     cdf_merge_t mg[CDF_MERGE_PARTS];
     memset(mg, 0, sizeof(mg));
     cdf_p3_ctx_t p3 = {

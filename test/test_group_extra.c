@@ -2573,6 +2573,40 @@ static test_result_t test_cd_fused_skewed(void) {
     PASS();
 }
 
+/* Self-correlated columns: v == k on every row.  A symmetric pair-hash combine
+ * (hash(k) ^ hash(v)) cancels to zero here, sending every row to partition 0 at
+ * dedupe slot 0 — a single serial probe cluster that took minutes on 20M rows.
+ * At 300K rows the query completes either way, so this test guards the SHAPE's
+ * correctness while the asymmetric combine in cdf_p1_fn guards the cliff. */
+static test_result_t test_cd_fused_self(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 200;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) { kd[i] = i % nk; vd[i] = kd[i]; }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nk);
+    if (chk.status != TEST_PASS) return chk;
+    /* v == k → exactly one distinct value per key */
+    const int64_t* gc = (const int64_t*)ray_data(ray_table_get_col_idx(r, 1));
+    for (int64_t g = 0; g < nk; g++) TEST_ASSERT_EQ_I(gc[g], 1);
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Narrow column types: I32 key, I16 value (read_col_i64 widening path). */
 static test_result_t test_cd_fused_narrow_types(void) {
     ray_heap_init();
@@ -2644,5 +2678,6 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/cd_fused_interleaved",          test_cd_fused_interleaved,          NULL, NULL },
     { "group_extra/cd_fused_narrow_types",         test_cd_fused_narrow_types,         NULL, NULL },
     { "group_extra/cd_fused_skewed",               test_cd_fused_skewed,               NULL, NULL },
+    { "group_extra/cd_fused_self",                 test_cd_fused_self,                 NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
