@@ -5372,85 +5372,121 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
     }
     derive_key_pool(ly, c->key_vecs, kpool);
 
-    /* Pipelined fast path: narrow-key (<=2), null-free, count-only entries —
-     * the q13-q18 class of high-cardinality counts.  The generic loop's
-     * probe stalls on two dependent cache misses per row (HT slot line,
-     * then the group row); staging a small ring of pre-built entries and
-     * prefetching each entry's slot line V2PF rows ahead overlaps those
-     * misses across iterations.  Entry layout, hashing, probe and merge
-     * semantics are IDENTICAL to the generic loop below — this is purely
-     * a scheduling change. */
+    /* Partition-major fast path (spec Part A): stage a morsel of rows
+     * (hash + partition, no HT access), counting-sort the morsel's
+     * indices by partition, then probe each partition's rows
+     * back-to-back against ONE hash table with slot-line prefetch.
+     * Within a partition run the HT struct, metadata, and slot array
+     * stay cache-hot, unlike the row-major order where consecutive
+     * rows hit different partitions.  Hashing, entry layout, probe and
+     * merge are IDENTICAL to the generic loop below — iteration order
+     * only; group ids and first_row (MIN) are order-independent. */
     if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
         ly->need_flags == 0 &&
         !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
                                GHT_AF_HOLISTIC)) &&
         nk >= 1 && nk <= 2 && ly->entry_stride <= 64) {
-        enum { V2PF = 8 };
-        char     ering[V2PF][64];
-        uint32_t pring[V2PF];
-        uint32_t rhead = 0, rcount = 0;
-
-        #define V2_PIPE_PROBE_OLDEST()                                        \
-            do {                                                              \
-                uint32_t pp = pring[rhead];                                   \
-                if (!my_hts[pp].slots) {                                      \
-                    if (!group_ht_init_sized(&my_hts[pp], c->ht_init_cap, ly, \
-                                             c->ht_init_block)) {             \
-                        atomic_store_explicit(&c->oom, 1,                     \
-                                              memory_order_relaxed);          \
-                        goto v2_pipe_done;                                    \
-                    }                                                         \
-                    masks[pp] = my_hts[pp].ht_cap - 1;                        \
-                }                                                             \
-                masks[pp] = group_probe_entry(&my_hts[pp], ering[rhead],      \
-                                              c->key_types, masks[pp]);       \
-                if (my_hts[pp].oom) {                                         \
-                    atomic_store_explicit(&c->oom, 1, memory_order_relaxed);  \
-                    goto v2_pipe_done;                                        \
-                }                                                             \
-                rhead = (rhead + 1) % V2PF;                                   \
-                rcount--;                                                     \
-            } while (0)
-
-        for (int64_t i = start; i < end; i++) {
-            if (((i - start) & 65535) == 0 && ray_interrupted()) break;
-            int64_t row = match_idx ? match_idx[i] : i;
-            if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row))
-                continue;
-            char* e = ering[(rhead + rcount) % V2PF];
-            int64_t* rk = (int64_t*)(e + 8);
-            uint64_t h = 0;
-            for (uint32_t k = 0; k < nk; k++) {
-                uint64_t kh;
-                int8_t t = c->key_types[k];
-                if (t == RAY_F64) {
-                    int64_t kv;
-                    memcpy(&kv, &((double*)c->key_data[k])[row], 8);
-                    rk[k] = kv;
-                    kh = ray_hash_f64(((double*)c->key_data[k])[row]);
-                } else {
-                    int64_t kv = read_col_i64(c->key_data[k], row, t,
-                                              c->key_attrs[k]);
-                    rk[k] = kv;
-                    kh = ray_hash_i64(kv);
-                }
-                h = (k == 0) ? kh : ray_hash_combine(h, kh);
-            }
-            *(uint64_t*)e = h;
-            memcpy(e + ly->entry_stride - 8, &row, 8);
-            uint32_t p = group_radix_part(h, c->n_parts);
-            pring[(rhead + rcount) % V2PF] = p;
-            if (my_hts[p].slots)
-                __builtin_prefetch(
-                    &my_hts[p].slots[(uint32_t)(h & masks[p])], 1, 1);
-            rcount++;
-            if (rcount == V2PF)
-                V2_PIPE_PROBE_OLDEST();
+        enum { V2M = 1024, V2MPF = 8 };
+        /* Morsel staging: hashes, key values, source rows, partition ids,
+         * partition-order permutation, and the counting-sort histogram.
+         * n_parts is bounded by group_radix_part_count (sqrt of rows), so
+         * the histogram is a scratch carve, not a VLA on 16K parts. */
+        uint64_t mh[V2M];
+        int64_t  mk[V2M * 2];
+        int64_t  mrow[V2M];
+        uint16_t mpart[V2M];
+        uint16_t morder[V2M];
+        ray_t* hist_hdr = NULL;
+        uint32_t* hist = (uint32_t*)scratch_alloc(&hist_hdr,
+            ((size_t)c->n_parts + 1) * sizeof(uint32_t));
+        if (!hist) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            scratch_free(v2_stage_hdr);
+            return;
         }
-        while (rcount > 0)
-            V2_PIPE_PROBE_OLDEST();
-        #undef V2_PIPE_PROBE_OLDEST
-v2_pipe_done:
+
+        int64_t i = start;
+        while (i < end) {
+            if (ray_interrupted()) break;
+            /* ---- stage ---- */
+            uint32_t mn = 0;
+            for (; i < end && mn < V2M; i++) {
+                int64_t row = match_idx ? match_idx[i] : i;
+                if (!match_idx && c->rowsel &&
+                    !group_rowsel_pass(c->rowsel, row))
+                    continue;
+                uint64_t h = 0;
+                for (uint32_t k = 0; k < nk; k++) {
+                    uint64_t kh;
+                    int8_t t = c->key_types[k];
+                    if (t == RAY_F64) {
+                        int64_t kv;
+                        memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+                        mk[(size_t)mn * nk + k] = kv;
+                        kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+                    } else {
+                        int64_t kv = read_col_i64(c->key_data[k], row, t,
+                                                  c->key_attrs[k]);
+                        mk[(size_t)mn * nk + k] = kv;
+                        kh = ray_hash_i64(kv);
+                    }
+                    h = (k == 0) ? kh : ray_hash_combine(h, kh);
+                }
+                mh[mn]   = h;
+                mrow[mn] = row;
+                mpart[mn] = (uint16_t)group_radix_part(h, c->n_parts);
+                mn++;
+            }
+            if (mn == 0) continue;
+
+            /* ---- counting-sort morsel indices by partition ---- */
+            memset(hist, 0, ((size_t)c->n_parts + 1) * sizeof(uint32_t));
+            for (uint32_t j = 0; j < mn; j++) hist[mpart[j] + 1]++;
+            for (uint32_t p = 0; p < c->n_parts; p++) hist[p + 1] += hist[p];
+            for (uint32_t j = 0; j < mn; j++)
+                morder[hist[mpart[j]]++] = (uint16_t)j;
+
+            /* ---- probe, partition-major with intra-run prefetch ---- */
+            for (uint32_t o = 0; o < mn; o++) {
+                uint32_t j = morder[o];
+                uint32_t p = mpart[j];
+                if (!my_hts[p].slots) {
+                    if (!group_ht_init_sized(&my_hts[p], c->ht_init_cap, ly,
+                                             c->ht_init_block)) {
+                        atomic_store_explicit(&c->oom, 1,
+                                              memory_order_relaxed);
+                        goto v2_morsel_done;
+                    }
+                    masks[p] = my_hts[p].ht_cap - 1;
+                }
+                /* Prefetch the slot line V2MPF entries ahead WITHIN this
+                 * morsel — mostly the same partition, so the mask read is
+                 * usually exact and the prefetch always harmless. */
+                if (o + V2MPF < mn) {
+                    uint32_t jn = morder[o + V2MPF];
+                    uint32_t pn = mpart[jn];
+                    if (my_hts[pn].slots)
+                        __builtin_prefetch(
+                            &my_hts[pn].slots[(uint32_t)(mh[jn] & masks[pn])],
+                            1, 1);
+                }
+                /* Build the entry in ebuf exactly as the generic loop
+                 * does: [hash][keys][row]. */
+                *(uint64_t*)ebuf = mh[j];
+                int64_t* ek = (int64_t*)(ebuf + 8);
+                for (uint32_t k = 0; k < nk; k++)
+                    ek[k] = mk[(size_t)j * nk + k];
+                memcpy(ebuf + ly->entry_stride - 8, &mrow[j], 8);
+                masks[p] = group_probe_entry(&my_hts[p], ebuf,
+                                             c->key_types, masks[p]);
+                if (my_hts[p].oom) {
+                    atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+                    goto v2_morsel_done;
+                }
+            }
+        }
+v2_morsel_done:
+        scratch_free(hist_hdr);
         scratch_free(v2_stage_hdr);
         return;
     }
