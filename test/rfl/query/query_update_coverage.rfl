@@ -463,25 +463,31 @@
 ;; ────────────────────────────────────────────────────────────────────
 ;; I32 key: case RAY_I32 at lines 131-133
 (set Tupd_i32by (table [k v] (list (as 'I32 [1 2 1 2 3]) [10 20 30 40 50])))
-;; update by: scatters aggregate back to original 5 rows (count unchanged)
-;; Groups: k=1→sum=40, k=2→sum=60, k=3→sum=50.
-;; Scatter fills only first occurrence per group; others remain 0.
-;; Row values: [40, 60, 0, 0, 50] → sum = 150
+;; update by: broadcasts the aggregate back to every row of its group
+;; (kdb `by:` semantics — the group sum lands on ALL member rows, not just
+;; the first).  Groups: k=1→sum=40, k=2→sum=60, k=3→sum=50.
+;; Row values: [40, 60, 40, 60, 50] → sum = 250
+;;
+;; USER-FACING FIX (was bug): pre-fix, updating an EXISTING column `v` via
+;; `by:` silently did nothing — the aggregate was appended as a duplicate
+;; column (schema `[k v v]`), so `(at U 'v)` kept reading the stale
+;; original [10 20 30 40 50] → sum 150.  From a user's perspective the
+;; `by:`-update "succeeded" (no error) but the column never changed, and
+;; `(key U)` unexpectedly listed the column name twice.
 (count (update {v: (sum v) by: k from: Tupd_i32by})) -- 5
-(sum (at (update {v: (sum v) by: k from: Tupd_i32by}) 'v)) -- 150
+(sum (at (update {v: (sum v) by: k from: Tupd_i32by}) 'v)) -- 250
 
 ;; BOOL key: case RAY_BOOL (RAY_U8) at lines 135-136
 (set Tupd_boolby (table [k v] (list [true false true false] [10 20 30 40])))
-;; Groups: k=true→sum=40, k=false→sum=60.
-;; Scatter fills first occurrence; others remain 0: [40, 60, 0, 0] → sum = 100
+;; Groups: k=true→sum=40, k=false→sum=60 → broadcast [40, 60, 40, 60] → sum = 200
 (count (update {v: (sum v) by: k from: Tupd_boolby})) -- 4
-(sum (at (update {v: (sum v) by: k from: Tupd_boolby}) 'v)) -- 100
+(sum (at (update {v: (sum v) by: k from: Tupd_boolby}) 'v)) -- 200
 
 ;; F64 key: case RAY_F64 at line 137
 (set Tupd_f64by (table [k v] (list [1.0 2.0 1.0 2.0] [10 20 30 40])))
-;; Groups: k=1.0→sum=40, k=2.0→sum=60. [40, 60, 0, 0] → sum = 100
+;; Groups: k=1.0→sum=40, k=2.0→sum=60 → broadcast [40, 60, 40, 60] → sum = 200
 (count (update {v: (sum v) by: k from: Tupd_f64by})) -- 4
-(sum (at (update {v: (sum v) by: k from: Tupd_f64by}) 'v)) -- 100
+(sum (at (update {v: (sum v) by: k from: Tupd_f64by}) 'v)) -- 200
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; WHERE-update SYM column with null in expr_vec (line 8707)

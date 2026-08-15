@@ -1,0 +1,93 @@
+;; Regression for `update` over PARTED tables (src/ops/query.c).
+;;
+;; Two distinct bugs, both hitting a `.db.parted.get` table as the `from:`
+;; source:
+;;
+;; 1. PARTED columns carry the RAY_PARTED_BASE wrapper type (printed as "?")
+;;    and a RAY_MAPCOMMON partition key.  ray_update read the original
+;;    column through `ray_vec_new(ct, ...)` / `ray_data(col)` / the grouped
+;;    gather, none of which understood the segmented shape — so MODIFYING an
+;;    existing column of a parted table failed with
+;;    `expression type I64 does not match ? column` (and `by:` with
+;;    `group: argument must be a vector`).  Fix: flatten a parted input
+;;    table once, the way `select` does.
+;;
+;; 2. The `by:`-UPDATE branch duplicated an existing target column instead
+;;    of replacing it — `(update {w: (sum v) from: T by: k})` on a table that
+;;    already has `w` produced schema `[k v w w]` and `at` read the stale
+;;    original.  Affected flat tables too.  Fix: skip source columns that
+;;    the update dict replaces in the initial copy loop.
+;;
+;; Both are checked against flat-table oracles with identical data.
+
+;; ────────────── build a 2-partition parted table ──────────────
+(.sys.exec "rm -rf /tmp/rfl_update_parted")
+(set D1 (table [k v w] (list [1 2 3] [10 20 30] [100 200 300])))
+(set D2 (table [k v w] (list [1 1 2] [40 50 60] [400 500 600])))
+(.db.splayed.set "/tmp/rfl_update_parted/2024.01.01/t/" D1)
+(.db.splayed.set "/tmp/rfl_update_parted/2024.01.02/t/" D2)
+(set Pt (.db.parted.get "/tmp/rfl_update_parted/" 't))
+(set flat (table [k v w] (list [1 2 3 1 1 2] [10 20 30 40 50 60] [100 200 300 400 500 600])))
+
+;; ────────────── fix 1a: modify existing column, no where ──────────────
+;; USER-FACING: pre-fix, `(update {v: (+ v 100) from: Pt})` on a parted table
+;; aborted with an immediate type error —
+;;   `error: type: update: expression type I64 does not match ? column`
+;; so the user could not modify ANY existing column of a parted table at all.
+(at (update {v: (+ v 100) from: Pt}) 'v) -- [110 120 130 140 150 160]
+(count (update {v: (+ v 100) from: Pt})) -- 6
+
+;; ────────────── fix 1b: scalar broadcast into existing column ──────────────
+;; USER-FACING: pre-fix, `(update {v: 5 from: Pt})` failed with the same
+;; `expression type I64 does not match ? column` — even a plain constant
+;; cannot be written over an existing parted column.
+(at (update {v: 5 from: Pt}) 'v) -- [5 5 5 5 5 5]
+
+;; ────────────── fix 1c: where-masked update of existing column ──────────────
+;; USER-FACING: pre-fix, `where:`-masked writes failed with
+;;   `error: type: vec_new: type must be a positive concrete vector type, got ?`
+;; so conditional in-place updates over parted data were impossible.
+(at (update {v: 99 from: Pt where: (> k 1)}) 'v) -- [10 99 99 40 50 99]
+
+;; ────────────── fix 1d: update by: aggregate broadcast over parted ──────────────
+;; USER-FACING: pre-fix, `by:`-grouped updates on parted tables errored with
+;;   `error: type: group: argument must be a vector or list, got ?`
+;; while on FLAT tables (bug 2) the write silently appeared to do nothing:
+;; the aggregate was appended as a duplicate column, the query "succeeded",
+;; `(key U)` suddenly listed the column twice, and `(at U 'w)` kept returning
+;; the stale original values.
+;; k=1 row v={10,40,50} sum=100; k=2 {20,60} sum=80; k=3 {30} sum=30
+(at (update {w: (sum v) from: Pt by: k}) 'w) -- [100 80 30 100 100 80]
+;; fix 2: schema must NOT duplicate the replaced target column
+(key (update {w: (sum v) from: Pt by: k})) -- [date k v w]
+;; flat oracle — same rows, same answers
+(at (update {w: (sum v) from: flat by: k}) 'w) -- [100 80 30 100 100 80]
+(key (update {w: (sum v) from: flat by: k})) -- [k v w]
+
+;; ────────────── fix 1e: mixed update — modify existing + add new over parted ──────────────
+;; USER-FACING: any dict naming an EXISTING column tripped the fix-1a error
+;; even when it also added new columns (`z`), so mixed single-pass updates
+;; over parted tables were not possible.
+(set U5 (update {v: (+ v 1) z: (* k 10) from: Pt}))
+(at U5 'v) -- [11 21 31 41 51 61]
+(at U5 'z) -- [10 20 30 10 10 20]
+(key U5) -- [date k v w z]
+
+;; ────────────── in-place amend of a parted global (from: 'name) ──────────────
+;; NOTE: `(update {from: 'G …})` amends the env global G in place and returns a
+;; SYM (it does not return a new table) — for both flat and parted, so the
+;; caller ignores the return and inspects G afterwards.
+;; USER-FACING: pre-fix, even this over a parted global hit the same
+;; `does not match ? column` error.
+(set G (.db.parted.get "/tmp/rfl_update_parted/" 't))
+(update {from: 'G v: (* v 100)})          ;; amend G in place, ignore the sym return
+(at G 'v) -- [1000 2000 3000 4000 5000 6000]
+(key G) -- [date k v w]
+;; flat oracle — same rows, same answer (in-place amend via symbol)
+(set Gflat (table [k v w] (list [1 2 3 1 1 2] [10 20 30 40 50 60] [100 200 300 400 500 600])))
+(update {from: 'Gflat v: (* v 100)})
+(at Gflat 'v) -- [1000 2000 3000 4000 5000 6000]
+(key Gflat) -- [k v w]
+
+(.sys.exec "rm -rf /tmp/rfl_update_parted")
+(exit 0)

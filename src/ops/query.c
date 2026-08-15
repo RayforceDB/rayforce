@@ -1999,6 +1999,7 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
 }
 
 static ray_t* query_materialize_parted_col(ray_t* col);
+static bool table_has_parted_columns(ray_t* tbl);
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * length-changing / reordering builtin (distinct, asc, desc, reverse) that
@@ -11270,6 +11271,35 @@ ray_t* ray_update(ray_t** args, int64_t n) {
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "update: `from:` must be a table, got %s", ray_type_name(tbl_t)); }
 
+    /* A parted table's data columns carry the RAY_PARTED_BASE wrapper type
+     * (which `ray_type_name` prints as "?"), and its partition key is
+     * RAY_MAPCOMMON.  The update machinery below reads the original column
+     * through `ray_vec_new(ct, ...)` / `ray_data(col)` / the per-group gather
+     * and type-check against the wrapper type, none of which understand the
+     * parted/segmented shape — so `(update {col: … from: partedT})` failed
+     * with `expression type I64 does not match ? column` (or the `by:` path
+     * with `group: argument must be a vector`).  `select` solves this by
+     * materialising parted columns on demand; replicate it here by flattening
+     * the whole table once so every branch below sees wrapped-free vectors. */
+    if (table_has_parted_columns(tbl)) {
+        ray_t* flat_tbl = ray_table_new(ray_table_ncols(tbl));
+        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { ray_release(tbl); return flat_tbl ? flat_tbl : ray_error("oom", NULL); }
+        int64_t nc = ray_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* col = ray_table_get_col_idx(tbl, c);
+            ray_t* flat_col = query_materialize_parted_col(col);
+            if (!flat_col || RAY_IS_ERR(flat_col)) {
+                ray_release(flat_tbl); ray_release(tbl);
+                return flat_col ? flat_col : ray_error("oom", NULL);
+            }
+            flat_tbl = ray_table_add_col(flat_tbl, ray_table_col_name(tbl, c), flat_col);
+            ray_release(flat_col);
+            if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { ray_release(tbl); return flat_tbl ? flat_tbl : ray_error("oom", NULL); }
+        }
+        ray_release(tbl);
+        tbl = flat_tbl;
+    }
+
     ray_t* where_expr = dict_get(dict, "where");
     ray_t* by_expr = dict_get(dict, "by");
 
@@ -11330,6 +11360,19 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         if (RAY_IS_ERR(result)) { ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
         for (int64_t c = 0; c < ncols; c++) {
             int64_t cn = ray_table_col_name(tbl, c);
+            /* Skip columns that the update dict replaces — the aggregate
+             * loop below adds the computed column for a REPLACED target, and
+             * ray_table_add_col always appends, so keeping both would create
+             * a duplicate name ([k v w w]) and `at` would read the stale
+             * original.  Added columns (not in the source schema) fall out
+             * naturally. */
+            int64_t replaced = 0;
+            for (int64_t d = 0; d + 1 < dict_n; d += 2) {
+                int64_t kid = dict_elems[d]->i64;
+                if (kid == from_id || kid == where_id || kid == by_id) continue;
+                if (kid == cn) { replaced = 1; break; }
+            }
+            if (replaced) continue;
             ray_t* col = ray_table_get_col_idx(tbl, c);
             ray_retain(col);
             result = ray_table_add_col(result, cn, col);
