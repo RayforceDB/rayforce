@@ -8988,7 +8988,8 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 /* v2 bridge for expression agg inputs — see the call site in
  * exec_group_run.  Returns the v2 result (or an error), or NULL when the
  * shape is ineligible and the caller should continue on the legacy path. */
-static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
+static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                  int64_t group_limit) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
     /* Own gate: this v2-expression shadow path serves any key/agg count
@@ -9097,7 +9098,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
     ray_t* result = NULL;
     if (ok && agg_v2_can_handle(g, op2, sub))
-        result = exec_group_v2(g, op2, sub);
+        result = exec_group_v2(g, op2, sub, group_limit);
     for (uint32_t a = 0; a < na; a++)
         if (synth[a]) ray_release(synth[a]);
     if (sub) ray_release(sub);
@@ -9607,10 +9608,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     /* v2 doesn't implement the top-count emit filter (old-engine feature);
      * when one is active, stay on the legacy path that honors it. */
-    if (ray_agg_engine_v2 && group_limit == 0
+    /* group_limit is a HINT (HEAD(GROUP) fusion), not a semantic: v2 threads
+     * it down to the radix strategy's bounded emit and the caller trims the
+     * result either way, so a positive limit stays on v2 rather than falling
+     * back to the (slower, full-materialization) legacy ladder. */
+    if (ray_agg_engine_v2 && group_limit >= 0
         && !ray_group_emit_filter_get().enabled
         && agg_v2_can_handle(g, op, tbl))
-        return exec_group_v2(g, op, tbl);
+        return exec_group_v2(g, op, tbl, group_limit);
 
     /* Emit-filter shape on a wide-domain SYM key: the sp dense/sparse
      * ladder below is single-threaded and its dense array scales with the
@@ -9648,7 +9653,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 ray_group_emit_filter_t saved = ray_group_emit_filter_get();
                 ray_group_emit_filter_t off = {0};
                 ray_group_emit_filter_set(off);
-                ray_t* r = exec_group_v2(g, op, tbl);
+                ray_t* r = exec_group_v2(g, op, tbl, 0);
                 ray_group_emit_filter_set(saved);
                 if (r && !RAY_IS_ERR(r))
                     return group_emit_filter_trim(r, ext->n_keys,
@@ -9671,9 +9676,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * v2's scan-input naming (agg_result_col_name) emits the SAME
      * `_e{a}_{op}` output names the legacy expression emit produced.
      * Any ineligibility falls through to the legacy path unchanged. */
-    if (ray_agg_engine_v2 && group_limit == 0
+    if (ray_agg_engine_v2 && group_limit >= 0
         && !ray_group_emit_filter_get().enabled) {
-        ray_t* r = exec_group_v2_exprs(g, op, tbl);
+        ray_t* r = exec_group_v2_exprs(g, op, tbl, group_limit);
         if (r) return r;
     }
 

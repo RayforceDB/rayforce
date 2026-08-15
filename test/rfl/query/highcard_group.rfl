@@ -29,3 +29,18 @@
 (set HK3 (table [k v] (list (as 'I32 (% (til 262144) 65536)) (til 262144))))
 (count (select {c: (count v) by: k from: HK3})) -- 65536
 (sum (at (select {c: (count v) by: k from: HK3}) 'c)) -- 262144
+
+;; take-without-sort under a group-by: the take is pushed as HEAD(GROUP), so the
+;; v2 radix engine emits ONLY the first N groups (bounded emit) instead of
+;; materializing all 100K.  The result must still be the first-seen PREFIX:
+;; 100K distinct (k, j) pairs (j is a function of k), 3 rows each, so take: 5
+;; is exactly keys 0..4 with count 3.
+(set HKT (table [k j] (list (% (til 300000) 100000) (% (% (til 300000) 100000) 7))))
+(set RT (select {c: (count k) by: {k: k j: j} from: HKT take: 5}))
+(count RT) -- 5
+(at RT 'k) -- [0 1 2 3 4]
+(at RT 'j) -- [0 1 2 3 4]
+(at RT 'c) -- [3 3 3 3 3]
+;; negative (tail) and range takes are NOT pushed — full group set, then slice
+(at (select {c: (count k) by: {k: k j: j} from: HKT take: -3}) 'k) -- [99997 99998 99999]
+(at (select {c: (count k) by: {k: k j: j} from: HKT take: [2 3]}) 'k) -- [2 3 4]

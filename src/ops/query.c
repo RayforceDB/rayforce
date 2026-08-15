@@ -525,6 +525,27 @@ static bool quantile_literal_prob(ray_t* prob_expr, bool percentile,
     return true;
 }
 
+/* True when any GROUP BY key names a BOOL column of `tbl`.  A BOOL-keyed
+ * group is emitted in key order (false before true) and query.c reorders the
+ * finished result to first-occurrence AFTERWARDS, so a take must not be pushed
+ * into the DAG ahead of that fix-up. */
+static bool group_keys_have_bool(ray_t* by_expr, ray_t* tbl) {
+    if (!by_expr || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return true;
+    if (by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED)) {
+        ray_t* c = ray_table_get_col(tbl, by_expr->i64);
+        return !c || c->type == RAY_BOOL;
+    }
+    if (ray_is_vec(by_expr) && by_expr->type == RAY_SYM) {
+        const int64_t* ids = (const int64_t*)ray_data(by_expr);
+        for (int64_t i = 0; i < ray_len(by_expr); i++) {
+            ray_t* c = ray_table_get_col(tbl, ids[i]);
+            if (!c || c->type == RAY_BOOL) return true;
+        }
+        return false;
+    }
+    return true;   /* computed / unresolved key shapes: stay conservative */
+}
+
 /* Apply sort (asc/desc) and take clauses to a materialized result table.
  * Used by eval-level paths that bypass the DAG (e.g., LIST/STR group keys).
  * Builds a temporary DAG for sorting (supports per-column direction flags)
@@ -9796,21 +9817,46 @@ by_dict_done:
         scratch_free(sortk_hdr);
     }
 
-    /* Take: add to DAG only when no group-by and no nearest (rerank
-     * absorbs the take into its k parameter). */
+    /* Take: added to the DAG when there is no nearest (rerank absorbs the take
+     * into its k parameter).
+     *
+     * Without a group-by the take is the DAG's HEAD/TAIL outright.  WITH a
+     * group-by the result schema differs from the input, so the take is
+     * normally left to the post-execution apply_sort_take — EXCEPT for a
+     * positive integer atom take with no asc:/desc: clause: the group emits
+     * groups in stable first-seen order, so "first N rows of the group result"
+     * is exactly "first N groups".  Adding a HEAD above the GROUP node lets
+     * exec.c's HEAD(GROUP) fusion forward N to exec_group as the group_limit
+     * HINT, which the v2 radix engine uses to emit only N groups instead of
+     * materializing all of them.  The hint is advisory: HEAD still trims and
+     * apply_sort_take still runs at the end, so correctness never depends on
+     * it.  NOT pushed with a group-by: negative (tail) and range takes, which
+     * both need the full group set; and any asc:/desc: shape, which reorders
+     * the groups first (that shape also owns the desc+take emit-filter
+     * machinery — has_sort keeps the two disjoint).  Also NOT pushed when a
+     * deferred key WHERE runs AFTER the group (post_group_where_expr): that
+     * filter drops result rows, so taking the first N groups before it would
+     * under-fill the answer. */
     ray_t* take_range = NULL;
-    if (take_expr && !by_expr && !nearest_expr) {
+    bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
+                            && !post_group_where_expr
+                            && !group_keys_have_bool(by_expr, tbl));
+    if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t n_take = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
             ray_release(tv);
-            if (n_take >= 0)
+            if (group_take_push) {
+                if (n_take > 0) root = ray_head(g, root, n_take);
+                /* n_take <= 0 with a group-by: leave it to apply_sort_take. */
+            } else if (n_take >= 0)
                 root = ray_head(g, root, n_take);
             else
                 root = ray_tail(g, root, -n_take);
         } else if (ray_is_vec(tv) && (tv->type == RAY_I64 || tv->type == RAY_I32) && tv->len == 2) {
-            take_range = tv;  /* apply after DAG execution */
+            if (group_take_push) ray_release(tv);   /* range: apply_sort_take handles it */
+            else take_range = tv;  /* apply after DAG execution */
         } else {
             int8_t tv_t = tv->type;            /* capture BEFORE free */
             ray_release(tv);
