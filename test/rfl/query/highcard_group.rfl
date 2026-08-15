@@ -1,0 +1,31 @@
+;; High-cardinality group-by pinning tests for the partition-major build
+;; (docs/superpowers/specs/2026-08-15-high-card-group-scaling.md, Part A).
+;; 300K rows forces the parallel radix_v2 path even under RAYFORCE_CORES=2;
+;; keys are arithmetic so every expected value is closed-form.
+
+;; ~100K distinct I64 keys, 3 rows each: count per group is exactly 3.
+(set HK (table [k] (list (% (til 300000) 100000))))
+(count (select {c: (count k) by: k from: HK})) -- 100000
+(sum (at (select {c: (count k) by: k from: HK}) 'c)) -- 300000
+;; stable first-seen order: first group is key 0, last is key 99999
+(at (at (select {c: (count k) by: k from: HK}) 'k) 0) -- 0
+(at (at (select {c: (count k) by: k from: HK}) 'k) 99999) -- 99999
+
+;; top-N by count with ties: every count == 3, keep semantics unchanged
+(count (select {c: (count k) by: k from: HK desc: c take: 10})) -- 10
+
+;; 2-key composite, 1500 distinct pairs (lcm(500,300)=1500)
+(set HK2 (table [a b] (list (% (til 300000) 500) (% (til 300000) 300))))
+;; 1500 distinct pairs -> distinct pairs = 1500; count per pair = 200
+(count (select {c: (count a) by: {a: a b: b} from: HK2})) -- 1500
+(sum (at (select {c: (count a) by: {a: a b: b} from: HK2}) 'c)) -- 300000
+(at (at (select {c: (count a) by: {a: a b: b} from: HK2 desc: c take: 3}) 'c) 0) -- 200
+
+;; filtered (rowsel) variant stays correct
+(sum (at (select {c: (count k) by: k from: HK where: (< k 1000)}) 'c)) -- 3000
+(count (select {c: (count k) by: k from: HK where: (< k 1000)})) -- 1000
+
+;; I32-typed keys through the same path
+(set HK3 (table [k v] (list (% (til 262144) 65536) (til 262144))))
+(count (select {c: (count v) by: k from: HK3})) -- 65536
+(sum (at (select {c: (count v) by: k from: HK3}) 'c)) -- 262144
