@@ -2376,7 +2376,10 @@ static ray_t* exec_group_v2_parallel_radix(
         agg_desc_free(&d);
         return ray_error("oom", NULL);
     }
-    for (int64_t i = 0; i < input_count; i++) pairs[i].idx = -1;
+    /* -1 fill as bytes: 0xFF.. == -1 for int64, and memset vectorizes —
+     * this is an 80MB serial touch on a 10M-row input, worth the idiom. */
+    memset(pairs, 0xFF,
+           (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
     bool order_ok = true;
     for (uint32_t p = 0; p < n_parts && order_ok; p++) {
         for (int64_t gg = 0; gg < parts[p].ng; gg++) {
