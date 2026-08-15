@@ -2209,6 +2209,11 @@ static test_result_t test_order_overflow_guards(void) {
  * watermark so the crossing is deterministic regardless of machine RAM. */
 static test_result_t test_anon_watermark_spill(void) {
     size_t sz = 40 * 1024 * 1024 - 128;   /* order 26 → direct path */
+    /* Start from an empty reuse cache: leftover cached blocks from earlier
+     * tests would (a) inflate the baseline and (b) be drained by the
+     * second alloc's pressure path, freeing enough headroom for it to stay
+     * anonymous instead of spilling. */
+    ray_heap_direct_cache_drain();
     int64_t base = ray_heap_anon_committed();
     /* Headroom for exactly one ~40 MB block, not two. */
     ray_heap_set_anon_watermark(base + 48 * 1024 * 1024);
@@ -2235,6 +2240,10 @@ static test_result_t test_anon_watermark_spill(void) {
      * blocks or leave the low watermark set for later tests. */
     if (a) ray_free(a);
     if (b) ray_free(b);
+    /* Freeing a large anon direct block may STASH it in the reuse cache
+     * (pages stay resident and counted).  Drain so the baseline assertion
+     * below sees the fully-released state. */
+    ray_heap_direct_cache_drain();
     ray_heap_set_anon_watermark(0);
 
     TEST_ASSERT_NOT_NULL(a);

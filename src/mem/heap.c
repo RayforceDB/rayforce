@@ -1317,6 +1317,10 @@ static void direct_cache_drain(void) {
     direct_cache_unlock();
 }
 
+void ray_heap_direct_cache_drain(void) {
+    direct_cache_drain();
+}
+
 /* Direct large allocation: mmap the exact page-rounded size instead of a
  * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
 static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
