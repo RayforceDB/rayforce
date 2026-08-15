@@ -7907,6 +7907,97 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                              int64_t group_limit);
 
+/* Trim a full group result to the emit filter's keep set: rows whose
+ * filtered-agg value passes min_count_exclusive and, when top_count_take
+ * is set, lies within the top-N by that value (ties INCLUDED — the result
+ * is a superset of N rows; the DAG's sort+take downstream finalizes the
+ * exact order/limit, exactly as it would on an untrimmed result).
+ * Row order is preserved.  Consumes `result`, returns an owned table. */
+static ray_t* group_emit_filter_trim(ray_t* result, uint32_t n_keys,
+                                     uint32_t n_aggs,
+                                     ray_group_emit_filter_t ef) {
+    if (!result || RAY_IS_ERR(result) || result->type != RAY_TABLE)
+        return result;
+    if (ef.agg_index >= n_aggs) return result;
+    int64_t nrows = ray_table_nrows(result);
+    if (nrows <= 0) return result;
+    ray_t* vcol = ray_table_get_col_idx(result,
+                                        (int64_t)n_keys + ef.agg_index);
+    if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64))
+        return result;
+    bool is_f64 = (vcol->type == RAY_F64);
+    /* Direction convention (mirrors the v2_emit topn path): the historical
+     * COUNT filter never sets .desc — an unset flag on COUNT means
+     * largest-first. */
+    if ((ef.agg_op == 0 || ef.agg_op == OP_COUNT) && !ef.desc)
+        ef.desc = 1;
+    const int64_t* vi = (const int64_t*)ray_data(vcol);
+    const double*  vf = (const double*)ray_data(vcol);
+    #define EF_VAL_D(r) (is_f64 ? vf[(r)] : (double)vi[(r)])
+
+    double thr = 0.0;
+    bool have_thr = false;
+    if (ef.top_count_take > 0 && nrows > ef.top_count_take) {
+        /* Quickselect (on a copy) for the N-th value in the keep
+         * direction: desc keeps the N largest -> threshold is the
+         * (nrows-N)-th ascending element; asc keeps the N smallest. */
+        ray_t* sel_hdr = NULL;
+        double* sv = (double*)scratch_alloc(&sel_hdr,
+                                            (size_t)nrows * sizeof(double));
+        if (sv) {
+            for (int64_t r = 0; r < nrows; r++) sv[r] = EF_VAL_D(r);
+            int64_t k = ef.desc ? (nrows - ef.top_count_take)
+                                : (ef.top_count_take - 1);
+            int64_t lo = 0, hi = nrows - 1;
+            while (lo < hi) {
+                double pivot = sv[k];
+                int64_t i = lo, j = hi;
+                while (i <= j) {
+                    while (sv[i] < pivot) i++;
+                    while (sv[j] > pivot) j--;
+                    if (i <= j) {
+                        double t = sv[i]; sv[i] = sv[j]; sv[j] = t;
+                        i++; j--;
+                    }
+                }
+                if (k <= j) hi = j;
+                else if (k >= i) lo = i;
+                else break;
+            }
+            thr = sv[k];
+            have_thr = true;
+            scratch_free(sel_hdr);
+        }
+    }
+
+    ray_t* idx = ray_vec_new(RAY_I64, nrows);
+    if (!idx || RAY_IS_ERR(idx)) {
+        if (idx) ray_error_free(idx);
+        return result;   /* trim is an optimization — full result is valid */
+    }
+    int64_t* ix = (int64_t*)ray_data(idx);
+    int64_t kept = 0;
+    for (int64_t r = 0; r < nrows; r++) {
+        double v = EF_VAL_D(r);
+        if (ef.min_count_exclusive > 0 && !(v > (double)ef.min_count_exclusive))
+            continue;
+        if (have_thr && (ef.desc ? (v < thr) : (v > thr)))
+            continue;
+        ix[kept++] = r;
+    }
+    #undef EF_VAL_D
+    idx->len = kept;
+    if (kept == nrows) { ray_release(idx); return result; }
+    ray_t* out = ray_at_fn(result, idx);
+    ray_release(idx);
+    if (!out || RAY_IS_ERR(out)) {
+        if (out) ray_error_free(out);
+        return result;
+    }
+    ray_release(result);
+    return out;
+}
+
 /* Map an I32 dictionary-code result column back to strings via the source
  * column: code -> first_occ[code] -> the string at that row. */
 static ray_t* dict_codes_to_str(const ray_t* codes_col, ray_t* src_col,
@@ -8911,6 +9002,46 @@ typedef struct {
     ray_group_emit_filter_t emit_filter;
 } sp_dyn_ctx_t;
 
+/* Parallel dense-count fill for the sp_dyn pure-count case: each worker
+ * scatters its row slice into a private uint32[bound] array; the caller
+ * merges them into range_count.  The serial scatter was the Amdahl wall of
+ * every single-SYM-key "top-N by count" query (ClickBench q13: 88ms of a
+ * 110ms query in one thread's cache-miss loop; flat 8->16 core scaling).
+ * A key outside [0, bound) sets `fail` and the caller falls back to the
+ * serial path — correctness never depends on the bound being right. */
+typedef struct {
+    const void*    key_data;
+    uint8_t        key_esz;
+    uint32_t*      counts;      /* [n_workers * bound] */
+    uint64_t       bound;
+    uint32_t       n_workers;
+    const int64_t* match_idx;
+    ray_t*         rowsel;
+    _Atomic(int)   fail;
+} sp_dyn_pcount_ctx_t;
+
+static void sp_dyn_pcount_fn(void* vctx, uint32_t wid, int64_t start,
+                             int64_t end) {
+    sp_dyn_pcount_ctx_t* c = (sp_dyn_pcount_ctx_t*)vctx;
+    if (atomic_load_explicit(&c->fail, memory_order_relaxed)) return;
+    uint32_t* my = c->counts + (size_t)(wid % c->n_workers) * c->bound;
+    const int64_t* match_idx = c->match_idx;
+    const uint64_t bound = c->bound;
+    const uint8_t esz = c->key_esz;
+    const void* kd = c->key_data;
+    for (int64_t i = start; i < end; i++) {
+        int64_t r = match_idx ? match_idx[i] : i;
+        if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r))
+            continue;
+        int64_t key = read_by_esz(kd, r, esz);
+        if ((uint64_t)key >= bound) {   /* negative wraps huge — caught too */
+            atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+            return;
+        }
+        if (my[key] != UINT32_MAX) my[key]++;
+    }
+}
+
 static ray_t* __attribute__((noinline))
 exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
     ray_graph_t*   g          = c->g;
@@ -8959,6 +9090,79 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
 
 	                uint64_t max_seen = 0;
 	                bool have_dyn_key = false;
+
+                /* Parallel fill (pure-count only: range_sum == NULL).  The
+                 * bound must be known up front: SYM codes are bounded by
+                 * their domain count, narrow keys by their width.  Success
+                 * skips the serial scatter below; any bound violation or
+                 * allocation miss falls straight back to it. */
+                bool dyn_par_done = false;
+                if (dyn_ok && !range_sum && n_scan >= 262144) {
+                    uint64_t bound = 0;
+                    if (key_types[0] == RAY_SYM) {
+                        int64_t dc = ray_sym_domain_count(
+                            ray_sym_vec_domain(key_vecs[0]));
+                        if (dc > 0 && (uint64_t)dc <= max_dense_cap)
+                            bound = (uint64_t)dc;
+                    } else if (key_esz == 1) bound = 256u;
+                    else if (key_esz == 2)   bound = 1u << 16;
+                    ray_pool_t* dp = ray_pool_get();
+                    uint32_t dnw = dp ? ray_pool_total_workers(dp) : 1;
+                    if (bound > 0 && dp && dnw >= 2 &&
+                        (uint64_t)dnw * bound * sizeof(uint32_t) <= (512u << 20)) {
+                        ray_t* pc_hdr = NULL;
+                        uint32_t* pc = (uint32_t*)scratch_calloc(&pc_hdr,
+                            (size_t)dnw * bound * sizeof(uint32_t));
+                        if (pc) {
+                            sp_dyn_pcount_ctx_t pctx = {
+                                .key_data  = key_data[0],
+                                .key_esz   = key_esz,
+                                .counts    = pc,
+                                .bound     = bound,
+                                .n_workers = dnw,
+                                .match_idx = match_idx,
+                                .rowsel    = rowsel,
+                                .fail      = 0,
+                            };
+                            ray_pool_dispatch(dp, sp_dyn_pcount_fn, &pctx,
+                                              n_scan);
+                            if (!atomic_load_explicit(&pctx.fail,
+                                                      memory_order_relaxed)) {
+                                /* Grow range_count to the bound, then merge
+                                 * worker arrays with saturation. */
+                                if (bound > cap) {
+                                    uint32_t* nc = (uint32_t*)scratch_realloc(
+                                        &cnt_hdr, (size_t)cap * sizeof(uint32_t),
+                                        (size_t)bound * sizeof(uint32_t));
+                                    if (nc) {
+                                        range_count = nc;
+                                        memset(range_count + cap, 0,
+                                               (size_t)(bound - cap) * sizeof(uint32_t));
+                                        cap = bound;
+                                    }
+                                }
+                                if (bound <= cap) {
+                                    for (uint32_t w = 0; w < dnw; w++) {
+                                        const uint32_t* src = pc + (size_t)w * bound;
+                                        for (uint64_t o = 0; o < bound; o++) {
+                                            uint64_t s = (uint64_t)range_count[o] + src[o];
+                                            range_count[o] = s > UINT32_MAX
+                                                           ? UINT32_MAX : (uint32_t)s;
+                                        }
+                                    }
+                                    for (uint64_t o = 0; o < bound; o++)
+                                        if (range_count[o] > 0) {
+                                            have_dyn_key = true;
+                                            max_seen = o;
+                                        }
+                                    dyn_par_done = true;
+                                }
+                            }
+                            scratch_free(pc_hdr);
+                        }
+                    }
+                }
+
 #define DYN_DENSE_ACCUM_ROW(row_expr)                                            \
     do {                                                                         \
         int64_t dyn_row = (row_expr);                                            \
@@ -9013,7 +9217,9 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
         }                                                                        \
     } while (0)
 
-	                if (dyn_ok && match_idx) {
+	                if (dyn_par_done) {
+	                    /* counts merged by the parallel fill above */
+	                } else if (dyn_ok && match_idx) {
 	                    for (int64_t i = 0; i < n_scan; i++)
 	                        DYN_DENSE_ACCUM_ROW(match_idx[i]);
 	                } else if (dyn_ok && rowsel) {
@@ -9256,6 +9462,44 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         && !ray_group_emit_filter_get().enabled
         && agg_v2_can_handle(g, op, tbl))
         return exec_group_v2(g, op, tbl);
+
+    /* Emit-filter shape on a wide-domain SYM key: the sp dense/sparse
+     * ladder below is single-threaded and its dense array scales with the
+     * store's SHARED sym domain (splayed stores keep one domain across all
+     * SYM columns — often 10M+ ids), so the scatter becomes the query's
+     * serial wall (ClickBench q13: 88ms of a 110ms query, flat multi-core
+     * scaling).  Run the PARALLEL v2 engine instead and trim its full
+     * result to the filter's top-N superset — the emit filter is purely an
+     * optimization; the DAG's sort+take downstream produces the final
+     * order/limit either way. */
+    {
+        ray_group_emit_filter_t ef = ray_group_emit_filter_get();
+        if (ray_agg_engine_v2 && group_limit == 0 && ef.enabled
+            && ext->n_keys == 1
+            && (ef.agg_op == 0 || ef.agg_op == OP_COUNT || ef.agg_op == OP_SUM
+                || ef.agg_op == OP_MIN || ef.agg_op == OP_MAX)
+            && agg_v2_can_handle(g, op, tbl)) {
+            ray_op_t* k0 = op_node(g, ext->keys[0]);
+            ray_op_ext_t* k0e = k0 ? find_ext(g, k0->id) : NULL;
+            ray_t* k0c = (k0e && k0e->base.opcode == OP_SCAN)
+                       ? ray_table_get_col(tbl, k0e->sym) : NULL;
+            if (k0c && k0c->type == RAY_SYM &&
+                ray_sym_domain_count(ray_sym_vec_domain(k0c)) > (1 << 21)) {
+                /* Suppress the filter for the v2 run (v2 ignores it anyway;
+                 * clearing keeps recursion/asserts honest), restore after. */
+                ray_group_emit_filter_t saved = ray_group_emit_filter_get();
+                ray_group_emit_filter_t off = {0};
+                ray_group_emit_filter_set(off);
+                ray_t* r = exec_group_v2(g, op, tbl);
+                ray_group_emit_filter_set(saved);
+                if (r && !RAY_IS_ERR(r))
+                    return group_emit_filter_trim(r, ext->n_keys,
+                                                  ext->n_aggs, ef);
+                if (r) return r;
+                /* v2 declined at runtime — continue on the legacy ladder. */
+            }
+        }
+    }
 
     /* v2 with EXPRESSION agg inputs: v2 admission requires plain-column
      * scans, so a group like {sum(a*b), stddev(c), cor(x,y)} — where ONE
