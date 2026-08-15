@@ -4707,11 +4707,12 @@ typedef struct {
 static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
                                    uint64_t hash, const int64_t* key_region_buf,
                                    const int64_t* agg_vals, uint16_t n_agg_vals,
-                                   int64_t row, uint16_t key_region) {
+                                   int64_t row, uint16_t key_region,
+                                   uint32_t cap0) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
         uint32_t old_cap = buf->cap;
         if (old_cap > UINT32_MAX / 2) { buf->oom = true; return; }
-        uint32_t new_cap = old_cap ? old_cap * 2 : 1;
+        uint32_t new_cap = old_cap ? old_cap * 2 : (cap0 ? cap0 : 1);
         char* new_data = (char*)scratch_realloc(
             &buf->_hdr, (size_t)old_cap * entry_stride,
             (size_t)new_cap * entry_stride);
@@ -4750,6 +4751,10 @@ typedef struct {
     /* When non-NULL, workers iterate match_idx[start..end) and
      * read row=match_idx[i].  When NULL, row=i. */
     const int64_t* match_idx;
+    /* Expected rows per (worker,partition) — first-allocation capacity for
+     * the payload buffers.  Growing 1->2->4->... instead re-copies the whole
+     * scattered payload ~2x (28% of ClickBench q16 in memmove). */
+    uint32_t       buf_prime;
 } radix_phase1_ctx_t;
 
 static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -4874,7 +4879,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         uint32_t part = group_radix_part(h, c->n_parts);
         radix_buf_push(&my_bufs[part], estride, h,
                        inline_str ? (const int64_t*)keybuf : keys,
-                       agg_vals, nv, row, ly->key_region);
+                       agg_vals, nv, row, ly->key_region, c->buf_prime);
     }
     scratch_free(stage_hdr);   /* NULL (inline staging) → no-op */
 }
@@ -11879,6 +11884,8 @@ v2_done:;
             .bufs          = radix_bufs,
             .rowsel        = rowsel,
             .match_idx     = match_idx,
+            .buf_prime     = (uint32_t)((uint64_t)(n_scan > 0 ? n_scan : 1)
+                                / ((uint64_t)n_total * radix_n_parts) * 5 / 4 + 8),
         };
         ght_layout_copy(&p1ctx.layout, &ght_layout);
         /* Wide-key str-pool table (n_keys slots): carve once (never per row);
@@ -14235,6 +14242,8 @@ bool pivot_ingest_run(pivot_ingest_t* out,
         .n_parts       = n_parts,
         .bufs          = radix_bufs,
         .match_idx     = NULL,
+        .buf_prime     = (uint32_t)((uint64_t)(n_scan > 0 ? n_scan : 1)
+                            / ((uint64_t)n_total * n_parts) * 5 / 4 + 8),
     };
     ght_layout_copy(&p1ctx.layout, ly);
     /* Wide-key str-pool table (n_keys slots): carved once, freed post-dispatch. */
