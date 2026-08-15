@@ -572,13 +572,21 @@ static bool table_is_parted(ray_t* tbl) {
  * name), an atom take with K << nrows, and the result is a flat table
  * with no LIST columns, dispatch to ray_topk_table — bounded-heap
  * selection in O(n log K) instead of full sort + gather. */
-/* `take_pre` (borrowed, may be NULL) is the take: value the CALLER already
- * evaluated — passed by the grouped DAG path, which evaluates take: once to
- * decide the HEAD pushdown.  Re-evaluating here would run a side-effecting or
- * expensive take: expression twice; with it set, no second ray_eval happens. */
+/* Decoded take: value the CALLER already evaluated (grouped DAG path: it
+ * evaluates take: once to decide the HEAD pushdown).  Passing the DECODED form
+ * rather than the ray_t keeps it a stack value with no ownership to leak on the
+ * caller's error paths, and re-evaluating a side-effecting or expensive take:
+ * expression a second time is avoided either way. */
+typedef enum { TAKE_PRE_NONE = 0, TAKE_PRE_ATOM, TAKE_PRE_RANGE } take_pre_kind_t;
+typedef struct {
+    take_pre_kind_t kind;
+    int64_t a, b;   /* ATOM: a = count.  RANGE: [a start, b amount]. */
+} take_pre_t;
+
+/* `take_pre` (may be NULL / TAKE_PRE_NONE) — see take_pre_t. */
 static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                               int64_t asc_id, int64_t desc_id, int64_t take_id,
-                              ray_t* take_pre) {
+                              const take_pre_t* take_pre) {
     if (!result || RAY_IS_ERR(result)) return result;
 
     /* Check for sort/take clauses */
@@ -592,8 +600,22 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
     if (!has_sort && !take_val_expr) return result;
 
     if (!has_sort && take_val_expr) {
-        ray_t* tv = take_pre;
-        if (tv) ray_retain(tv); else tv = ray_eval(take_val_expr);
+        /* Re-materialize the caller's already-evaluated value instead of
+         * running take_val_expr again; the rest of this branch is unchanged
+         * and owns tv exactly as before. */
+        ray_t* tv;
+        if (take_pre && take_pre->kind == TAKE_PRE_ATOM) {
+            tv = ray_i64(take_pre->a);
+        } else if (take_pre && take_pre->kind == TAKE_PRE_RANGE) {
+            tv = ray_vec_new(RAY_I64, 2);
+            if (tv && !RAY_IS_ERR(tv)) {
+                ((int64_t*)ray_data(tv))[0] = take_pre->a;
+                ((int64_t*)ray_data(tv))[1] = take_pre->b;
+                tv->len = 2;
+            }
+        } else {
+            tv = ray_eval(take_val_expr);
+        }
         if (!tv || RAY_IS_ERR(tv)) {
             ray_release(result);
             return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`");
@@ -9868,7 +9890,7 @@ by_dict_done:
      * now retains LIST cells, but the group's LIST output has no reason to pay
      * a trim it can skip, and the take is a no-op there anyway. */
     ray_t* take_range = NULL;
-    ray_t* take_pre = NULL;   /* evaluated take: value, reused by apply_sort_take */
+    take_pre_t take_pre = {0};   /* decoded take: value, reused by apply_sort_take */
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
                             && !post_group_where_expr && !has_list_agg
                             && !group_keys_have_bool(by_expr, tbl)
@@ -9878,8 +9900,11 @@ by_dict_done:
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t n_take = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
-            if (group_take_push) take_pre = tv;   /* ownership moves to take_pre */
-            else ray_release(tv);
+            if (group_take_push) {
+                take_pre.kind = TAKE_PRE_ATOM;
+                take_pre.a = n_take;
+            }
+            ray_release(tv);
             if (group_take_push) {
                 if (n_take > 0) root = ray_head(g, root, n_take);
                 /* n_take <= 0 with a group-by: leave it to apply_sort_take. */
@@ -9888,8 +9913,15 @@ by_dict_done:
             else
                 root = ray_tail(g, root, -n_take);
         } else if (ray_is_vec(tv) && (tv->type == RAY_I64 || tv->type == RAY_I32) && tv->len == 2) {
-            if (group_take_push) take_pre = tv;    /* range: apply_sort_take slices it */
-            else take_range = tv;  /* apply after DAG execution */
+            if (group_take_push) {
+                /* range: apply_sort_take slices it after execution */
+                const int64_t* rv = (const int64_t*)ray_data(tv);
+                take_pre.kind = TAKE_PRE_RANGE;
+                if (tv->type == RAY_I64) { take_pre.a = rv[0]; take_pre.b = rv[1]; }
+                else { const int32_t* r32 = (const int32_t*)rv;
+                       take_pre.a = r32[0]; take_pre.b = r32[1]; }
+                ray_release(tv);
+            } else take_range = tv;  /* apply after DAG execution */
         } else {
             int8_t tv_t = tv->type;            /* capture BEFORE free */
             ray_release(tv);
@@ -11088,8 +11120,8 @@ by_dict_done:
      * allowing sort clauses to reference non-agg output columns. */
     if (by_expr && (has_sort || take_expr))
         result = apply_sort_take(result, dict_elems, dict_n, asc_id, desc_id,
-                                 take_id, take_pre);
-    if (take_pre) ray_release(take_pre);
+                                 take_id,
+                                 take_pre.kind ? &take_pre : NULL);
 
     if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
     if (saved_selection) ray_release(saved_selection);

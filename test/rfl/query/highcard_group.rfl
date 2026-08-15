@@ -79,10 +79,14 @@ TKCNT -- 1
 
 ;; PARTED input with an EMPTY partition: exec_group_parted reads a positive
 ;; group_limit as "stop after N partitions", which assumes 1 group per
-;; partition — an empty partition would under-fill.  Grouped takes over parted
-;; inputs are therefore never pushed; the answers below are the un-pushed ones.
+;; partition — partition 2 is empty, so partitions [1 2] hold only ONE group
+;; and a pushed take: 2 would answer [1] instead of [1 3].  Grouped takes over
+;; parted inputs are therefore never pushed.  The fixture uses 1000 rows per
+;; partition on purpose: exec_group_parted's cardinality gate keeps SMALL
+;; partitions on the concat fallback, which never consults group_limit, so a
+;; tiny fixture would pass even with the bug present.
 (.sys.exec "rm -rf /tmp/rfl_take_parted")
-(set TP1 (table [k v] (list (as 'I64 [1 1 2]) (as 'I64 [10 20 30]))))
+(set TP1 (table [k v] (list (% (til 1000) 10) (til 1000))))
 (set TP0 (table [k v] (list (as 'I64 []) (as 'I64 []))))
 (.db.splayed.set "/tmp/rfl_take_parted/1/t/" TP1)
 (.db.splayed.set "/tmp/rfl_take_parted/2/t/" TP0)
@@ -91,6 +95,8 @@ TKCNT -- 1
 (.db.splayed.set "/tmp/rfl_take_parted/5/t/" TP1)
 (set PTK (.db.parted.get "/tmp/rfl_take_parted/" 't))
 (at (select {c: (count v) by: part from: PTK}) 'part) -- [1 3 4 5]
-(at (select {c: (count v) by: part from: PTK take: 4}) 'part) -- [1 3 4 5]
-(at (select {c: (count v) by: part from: PTK take: 4}) 'c) -- [3 3 3 3]
+(at (select {c: (count v) by: part from: PTK}) 'c) -- [1000 1000 1000 1000]
 (at (select {c: (count v) by: part from: PTK take: 2}) 'part) -- [1 3]
+(at (select {c: (count v) by: part from: PTK take: 2}) 'c) -- [1000 1000]
+(at (select {c: (count v) by: part from: PTK take: 3}) 'part) -- [1 3 4]
+(at (select {c: (count v) by: part from: PTK take: 4}) 'part) -- [1 3 4 5]
