@@ -49,10 +49,18 @@
 #include <string.h>
 #include "rayforce.h"
 #include "core/pool.h"
-#include "ops/internal.h" /* scratch_*, read_col_i64 */
-#include "ops/hash.h"     /* ray_hash_i64 */
+#include "mem/heap.h"      /* ray_heap_anon_watermark */
+#include "ops/internal.h"  /* scratch_*, read_col_i64 */
+#include "ops/hash.h"      /* ray_hash_i64 */
 #include "ops/cdfuse.h"
-#include "table/sym.h"    /* RAY_IS_SYM */
+#include "table/sym.h"     /* RAY_IS_SYM */
+
+/* Peak-footprint estimate used by the admission gate below: 32B/row for
+ * phase 1's records plus up to 24B per (partition, key) pair in phase 2,
+ * itself bounded by the row count — see the KNOWN MEMORY BOUND comment at
+ * the phase-3 call site.  56B/row is that worst case (all-distinct input),
+ * both phases' buffers alive simultaneously until cdf_free_all runs. */
+#define CDF_BYTES_PER_ROW 56
 
 /* ══════════════════════════════════════════
  * Shared helpers
@@ -510,7 +518,31 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     if (nrows < CDF_MIN_ROWS) return NULL; /* small: existing path fine */
 
     ray_pool_t* pool = ray_pool_get();
-    if (!pool) return NULL;
+    /* Self-contained dispatch guard (folds ray_pool_par_dispatch_ok in, not
+     * just min-rows): live pool with background workers and not already
+     * inside an in-flight dispatch, so any future caller — not just the
+     * query.c rewrite, which currently duplicates this check — gets a safe
+     * kernel.  The query.c call-site guard is left in place unchanged; this
+     * makes it redundant there but load-bearing for other callers. */
+    if (!ray_pool_par_dispatch_ok(pool, nrows, CDF_MIN_ROWS)) return NULL;
+
+    /* Memory admission gate: peak footprint is ~CDF_BYTES_PER_ROW bytes/row
+     * (see the constant's derivation above and the phase-3 KNOWN MEMORY
+     * BOUND comment).  Decline rather than risk the OOM killer when that
+     * estimate would exceed a quarter of the heap's anon watermark (default:
+     * total physical RAM) — leaving headroom for the rest of the query
+     * (source columns, other operators, concurrent work) sharing the same
+     * budget.  No new env knob: this rides the existing watermark, which
+     * ray_heap_set_anon_watermark already lets tests/embedders override.
+     * Same "unknown RAM -> stay permissive" convention as heap.c's own
+     * heap_anon_would_exceed: a caller that never ran ray_runtime_new (unit
+     * tests calling ray_cd_fused directly, without the app's runtime/RAM
+     * probe) sees ray_sys_total_ram() == 0, which must not read as a
+     * zero-byte budget. */
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm > 0 && (double)nrows * CDF_BYTES_PER_ROW > (double)wm / 4.0)
+        return NULL;
+
     uint32_t nw = ray_pool_total_workers(pool);
 
     uint32_t n_parts = cdf_part_count(nw, nrows);

@@ -12,3 +12,30 @@
 (sum (at (select {u: (count (distinct v)) by: k from: CD1}) 'u)) -- 1000
 ;; top-N by distinct count still works through the emit path
 (count (select {u: (count (distinct v)) by: k from: CD desc: u take: 7})) -- 7
+
+;; SYM-key coverage (finding I2): ray_cd_fused's cdf_type_ok accepts SYM
+;; keys directly (src/ops/cdfuse.c), so exercise the fused kernel with a
+;; SYM group key at the same 300K-row / 1000-key scale as CD above, built
+;; via (as 'SYM (% (til N) K)) — the same construction test/rfl/group's
+;; group_radix_coverage.rfl and parted_group_expr_key.rfl use for large
+;; synthetic SYM columns.  v = (til N), so every row has a unique value:
+;; each of the 1000 keys owns exactly 300 rows, all distinct => u == 300
+;; per group, closed-form sum == N.
+(set CDS (table [k v] (list (as 'SYM (% (til 300000) 1000)) (til 300000))))
+(count (select {u: (count (distinct v)) by: k from: CDS})) -- 1000
+(sum (at (select {u: (count (distinct v)) by: k from: CDS}) 'u)) -- 300000
+(at (at (select {u: (count (distinct v)) by: k from: CDS}) 'u) 0) -- 300
+
+;; Boundary pin (finding I3): CDF_MIN_ROWS is 262144 (src/ops/cdfuse.h), so
+;; nrows==262143 takes the two-pass group+count-distinct rewrite while
+;; nrows==262144 takes ray_cd_fused.  k = i mod 1000, v = i mod 3: since
+;; gcd(1000,3)==1 and every key has >=262 occurrences (>=3), each group's v
+;; values cycle through all 3 residues, so u==3 for every one of the 1000
+;; keys regardless of which side of the boundary the row count falls on —
+;; both paths must agree on count==1000 and sum(u)==3000.
+(set CDB0 (table [k v] (list (% (til 262143) 1000) (% (til 262143) 3))))
+(count (select {u: (count (distinct v)) by: k from: CDB0})) -- 1000
+(sum (at (select {u: (count (distinct v)) by: k from: CDB0}) 'u)) -- 3000
+(set CDB1 (table [k v] (list (% (til 262144) 1000) (% (til 262144) 3))))
+(count (select {u: (count (distinct v)) by: k from: CDB1})) -- 1000
+(sum (at (select {u: (count (distinct v)) by: k from: CDB1}) 'u)) -- 3000
