@@ -47,6 +47,7 @@
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/hll.h"
+#include "ops/cdfuse.h"
 #include "table/sym.h"
 #include <math.h>
 #include <string.h>
@@ -2405,6 +2406,48 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Fused grouped count-distinct kernel (src/ops/cdfuse.c)
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_cd_fused_basic(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 300000 rows, 1000 keys, 3 distinct values per key (see the rfl pin).
+     * Row count is >= CDF_MIN_ROWS so the kernel's admission gate passes;
+     * the key/value shape mirrors the brief's 200-key sketch. */
+    int64_t n = 300000, nk = 1000;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) { kd[i] = i % nk; vd[i] = i % (nk * 3); }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(r->type == RAY_TABLE, "fused cd returns a table");
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
+    ray_t* keys = ray_table_get_col_idx(r, 0);
+    ray_t* cnts = ray_table_get_col_idx(r, 1);
+    TEST_ASSERT_NOT_NULL(keys);
+    TEST_ASSERT_NOT_NULL(cnts);
+    /* stable first-seen order: key i at row i for this data */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(keys))[0], 0);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(keys))[nk - 1], nk - 1);
+    int64_t total = 0;
+    for (int64_t g = 0; g < nk; g++) total += ((int64_t*)ray_data(cnts))[g];
+    TEST_ASSERT_EQ_I(total, nk * 3);   /* 3 distinct values per key */
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test registry
  * -------------------------------------------------------------------------- */
 
@@ -2433,5 +2476,6 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/hll_count_distinct_approx_pg_stream_types", test_hll_count_distinct_approx_pg_stream_types, NULL, NULL },
     { "group_extra/hll_merge_edges",               test_hll_merge_edges,               NULL, NULL },
     { "group_extra/ght_layout_copy_depth_invariance", test_ght_layout_copy_depth_invariance, NULL, NULL },
+    { "group_extra/cd_fused_basic",                test_cd_fused_basic,                NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

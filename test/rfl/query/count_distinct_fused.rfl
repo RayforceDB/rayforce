@@ -1,0 +1,14 @@
+;; Fused grouped count-distinct (spec Part B).  Closed-form data:
+;; 300K rows, k = i mod 1000 (1000 groups), v = i mod 3000.
+;; For each k the values are {k, k+1000, k+2000} mod 3000 pattern:
+;; v = i mod 3000 and k = i mod 1000 => v mod 1000 == k, and v takes
+;; exactly 3 distinct values per k.  So every group's distinct count is 3.
+(set CD (table [k v] (list (% (til 300000) 1000) (% (til 300000) 3000))))
+(count (select {u: (count (distinct v)) by: k from: CD})) -- 1000
+(sum (at (select {u: (count (distinct v)) by: k from: CD}) 'u)) -- 3000
+(at (at (select {u: (count (distinct v)) by: k from: CD}) 'k) 0) -- 0
+;; duplicate-heavy: v constant => distinct count 1 per group
+(set CD1 (table [k v] (list (% (til 300000) 1000) (* (til 300000) 0))))
+(sum (at (select {u: (count (distinct v)) by: k from: CD1}) 'u)) -- 1000
+;; top-N by distinct count still works through the emit path
+(count (select {u: (count (distinct v)) by: k from: CD desc: u take: 7})) -- 7
