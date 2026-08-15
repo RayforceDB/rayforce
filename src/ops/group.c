@@ -9097,7 +9097,11 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                  * skips the serial scatter below; any bound violation or
                  * allocation miss falls straight back to it. */
                 bool dyn_par_done = false;
-                if (dyn_ok && !range_sum && n_scan >= 262144) {
+                /* rowsel excluded: the serial loop below iterates the
+                 * selection segment-aware (whole SEL_NONE morsels skipped),
+                 * which beats a parallel per-row bitmap test on sparse
+                 * selections (ClickBench q07: 2ms serial vs 6ms parallel). */
+                if (dyn_ok && !range_sum && !rowsel && n_scan >= 262144) {
                     uint64_t bound = 0;
                     if (key_types[0] == RAY_SYM) {
                         int64_t dc = ray_sym_domain_count(
@@ -9483,7 +9487,16 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_op_ext_t* k0e = k0 ? find_ext(g, k0->id) : NULL;
             ray_t* k0c = (k0e && k0e->base.opcode == OP_SCAN)
                        ? ray_table_get_col(tbl, k0e->sym) : NULL;
+            /* Input-size gate: on RAW-table inputs (10M+ rows) consecutive
+             * rows repeat keys, so the serial dense scatter mostly hits
+             * cache and beats the radix pipeline (ClickBench q33/q34:
+             * 56ms serial vs 148ms via v2).  The pathological case is the
+             * count-distinct SECOND phase, whose distinct-pairs
+             * intermediate (~1M rows) has no locality — every increment
+             * misses (q13: 88ms serial).  Intermediates are bounded by
+             * their distinct count; raw fact tables are not. */
             if (k0c && k0c->type == RAY_SYM &&
+                ray_table_nrows(tbl) <= (int64_t)(4u << 20) &&
                 ray_sym_domain_count(ray_sym_vec_domain(k0c)) > (1 << 21)) {
                 /* Suppress the filter for the v2 run (v2 ignores it anyway;
                  * clearing keeps recursion/asserts honest), restore after. */
