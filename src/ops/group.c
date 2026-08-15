@@ -8700,7 +8700,11 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                               int64_t group_limit,
                               ray_t** agg_vecs, ray_t** agg_vecs2,
                               agg_prod_t* prod) {
-    if (group_limit != 0) return false;
+    /* group_limit is a HEAD(GROUP) HINT, not a semantic: this kernel computes
+     * every group and the caller's HEAD trims the result, so a positive limit
+     * is simply ignored here (staying eligible keeps where+by+take shapes on
+     * the slice kernel instead of dropping them to the generic ladder). */
+    if (group_limit < 0) return false;
     if (ray_group_emit_filter_get().enabled) return false;
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext || ext->n_keys != 1 || ext->n_aggs < 1 || ext->n_aggs > 16)

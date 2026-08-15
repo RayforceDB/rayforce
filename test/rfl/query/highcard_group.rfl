@@ -44,3 +44,53 @@
 ;; negative (tail) and range takes are NOT pushed — full group set, then slice
 (at (select {c: (count k) by: {k: k j: j} from: HKT take: -3}) 'k) -- [99997 99998 99999]
 (at (select {c: (count k) by: {k: k j: j} from: HKT take: [2 3]}) 'k) -- [2 3 4]
+
+;; ─── take-pushdown guards (grouped take: without asc:/desc:) ──────────
+;; The pushdown adds HEAD(GROUP) to the DAG so the group engine can emit only
+;; the first N groups.  These shapes must NOT be pushed (or must survive the
+;; trim), and all of them are pinned against the pre-pushdown answers.
+
+;; LIST-producing aggregate (top/bot): the group emits a LIST column.
+(set LT (table [k v] (list (% (til 40) 6) (til 40))))
+(set LR (select {t: (top v 3) c: (count v) by: k from: LT take: 4}))
+(count LR) -- 4
+(at LR 'k) -- [0 1 2 3]
+(at LR 'c) -- [7 7 7 7]
+(at (at LR 't) 0) -- [36 30 24]
+(at (at LR 't) 3) -- [39 33 27]
+;; take larger than the group count, and a negative (tail) take
+(count (select {t: (top v 3) c: (count v) by: k from: LT take: 100})) -- 6
+(at (select {t: (top v 3) c: (count v) by: k from: LT take: -2}) 'k) -- [4 5]
+
+;; HEAD/TAIL over a table with a LIST column (exec.c trim: LIST cells are
+;; copied WITH a retain — the raw byte copy used to leave the column NULL and
+;; fail with "table add_col: column must be a vector").
+(set LC (table [a b] (list (as 'I64 [1 2 3]) (list [10 11] [20 21] [30 31]))))
+(at (select {a: a b: b from: LC take: 2}) 'a) -- [1 2]
+(at (at (select {a: a b: b from: LC take: 2}) 'b) 1) -- [20 21]
+(at (select {a: a b: b from: LC take: -2}) 'a) -- [2 3]
+(at (at (select {a: a b: b from: LC take: -2}) 'b) 0) -- [20 21]
+
+;; take: is evaluated EXACTLY once (the pushdown decision must not re-run a
+;; side-effecting take: expression that apply_sort_take also reads).
+(set TKCNT 0)
+(count (select {c: (count v) by: k from: LT take: (do (set TKCNT (+ TKCNT 1)) 3)})) -- 3
+TKCNT -- 1
+
+;; PARTED input with an EMPTY partition: exec_group_parted reads a positive
+;; group_limit as "stop after N partitions", which assumes 1 group per
+;; partition — an empty partition would under-fill.  Grouped takes over parted
+;; inputs are therefore never pushed; the answers below are the un-pushed ones.
+(.sys.exec "rm -rf /tmp/rfl_take_parted")
+(set TP1 (table [k v] (list (as 'I64 [1 1 2]) (as 'I64 [10 20 30]))))
+(set TP0 (table [k v] (list (as 'I64 []) (as 'I64 []))))
+(.db.splayed.set "/tmp/rfl_take_parted/1/t/" TP1)
+(.db.splayed.set "/tmp/rfl_take_parted/2/t/" TP0)
+(.db.splayed.set "/tmp/rfl_take_parted/3/t/" TP1)
+(.db.splayed.set "/tmp/rfl_take_parted/4/t/" TP1)
+(.db.splayed.set "/tmp/rfl_take_parted/5/t/" TP1)
+(set PTK (.db.parted.get "/tmp/rfl_take_parted/" 't))
+(at (select {c: (count v) by: part from: PTK}) 'part) -- [1 3 4 5]
+(at (select {c: (count v) by: part from: PTK take: 4}) 'part) -- [1 3 4 5]
+(at (select {c: (count v) by: part from: PTK take: 4}) 'c) -- [3 3 3 3]
+(at (select {c: (count v) by: part from: PTK take: 2}) 'part) -- [1 3]

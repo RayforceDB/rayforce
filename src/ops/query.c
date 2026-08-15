@@ -546,6 +546,23 @@ static bool group_keys_have_bool(ray_t* by_expr, ray_t* tbl) {
     return true;   /* computed / unresolved key shapes: stay conservative */
 }
 
+/* True when `tbl` carries PARTED or MAPCOMMON columns (a parted store).  The
+ * parted GROUP dispatch (exec_group_parted) treats a positive group_limit as
+ * "stop after group_limit partitions", which assumes every partition yields a
+ * group — an EMPTY partition breaks that and under-fills the answer.  Rather
+ * than push a hint that path would mis-apply, grouped takes over parted inputs
+ * keep the post-execution take. */
+static bool table_is_parted(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return true;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
+}
+
 /* Apply sort (asc/desc) and take clauses to a materialized result table.
  * Used by eval-level paths that bypass the DAG (e.g., LIST/STR group keys).
  * Builds a temporary DAG for sorting (supports per-column direction flags)
@@ -555,8 +572,13 @@ static bool group_keys_have_bool(ray_t* by_expr, ray_t* tbl) {
  * name), an atom take with K << nrows, and the result is a flat table
  * with no LIST columns, dispatch to ray_topk_table — bounded-heap
  * selection in O(n log K) instead of full sort + gather. */
+/* `take_pre` (borrowed, may be NULL) is the take: value the CALLER already
+ * evaluated — passed by the grouped DAG path, which evaluates take: once to
+ * decide the HEAD pushdown.  Re-evaluating here would run a side-effecting or
+ * expensive take: expression twice; with it set, no second ray_eval happens. */
 static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
-                              int64_t asc_id, int64_t desc_id, int64_t take_id) {
+                              int64_t asc_id, int64_t desc_id, int64_t take_id,
+                              ray_t* take_pre) {
     if (!result || RAY_IS_ERR(result)) return result;
 
     /* Check for sort/take clauses */
@@ -570,7 +592,8 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
     if (!has_sort && !take_val_expr) return result;
 
     if (!has_sort && take_val_expr) {
-        ray_t* tv = ray_eval(take_val_expr);
+        ray_t* tv = take_pre;
+        if (tv) ray_retain(tv); else tv = ray_eval(take_val_expr);
         if (!tv || RAY_IS_ERR(tv)) {
             ray_release(result);
             return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`");
@@ -3732,7 +3755,7 @@ static ray_t* try_count_distinct_v2_rewrite(
                 if (!out) return ray_error("oom", NULL);
                 if (RAY_IS_ERR(out)) return out;
                 return apply_sort_take(out, dict_elems, dict_n,
-                                       asc_id, desc_id, take_id);
+                                       asc_id, desc_id, take_id, NULL);
             }
         }
     }
@@ -3855,7 +3878,7 @@ static ray_t* try_count_distinct_v2_rewrite(
      * `desc: c` ordering is silently dropped — the result set is right
      * but its row order isn't.  apply_sort_take is a no-op when the
      * clauses are absent. */
-    return apply_sort_take(result, dict_elems, dict_n, asc_id, desc_id, take_id);
+    return apply_sort_take(result, dict_elems, dict_n, asc_id, desc_id, take_id, NULL);
 }
 
 /* Per-group count(distinct) using the existing OP_COUNT_DISTINCT kernel.
@@ -6492,6 +6515,7 @@ by_dict_done:
     int     n_compound = 0;
     int     n_aggs_real = 0;           /* DAG agg slots before hidden ones */
     int synth_count_col = 0;  /* 1 if we synthesized OP_COUNT for group boundaries */
+    int has_list_agg = 0;     /* 1 if any aggregate emits a LIST column (top/bot) */
 
     if (where_expr && by_expr && !nearest_expr &&
         can_defer_single_key_where(by_expr, where_expr, tbl)) {
@@ -7801,7 +7825,7 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                 }
                 result = apply_sort_take(result, dict_elems, dict_n,
-                                         asc_id, desc_id, take_id);
+                                         asc_id, desc_id, take_id, NULL);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             }
 
@@ -7994,7 +8018,7 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return first_err;
                 }
                 res = apply_sort_take(res, dict_elems, dict_n,
-                                      asc_id, desc_id, take_id);
+                                      asc_id, desc_id, take_id, NULL);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res;
             }
 
@@ -8434,7 +8458,7 @@ by_dict_done:
             if (eval_tbl != tbl) ray_release(eval_tbl);
             ray_release(tbl);
             result = apply_sort_take(result, dict_elems, dict_n,
-                                     asc_id, desc_id, take_id);
+                                     asc_id, desc_id, take_id, NULL);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
 
@@ -8769,6 +8793,7 @@ by_dict_done:
                     }
                     has_binary_agg = 1;
                 } else if (op == OP_TOP_N || op == OP_BOT_N) {
+                    has_list_agg = 1;
                     if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: top/bot aggregation requires a K argument"); }
                     ray_t* k_expr = agg_elems[2];
                     int64_t k_val;
@@ -8836,6 +8861,7 @@ by_dict_done:
             agg_ins2[n_aggs] = NULL;
             agg_k[n_aggs] = 0;
             if (hop == OP_TOP_N || hop == OP_BOT_N) {
+                has_list_agg = 1;
                 if (ray_len(hidden_agg_exprs[hi]) < 3) {
                     for (int ci = 0; ci < n_compound; ci++)
                         ray_release(compound_rw[ci]);
@@ -9485,7 +9511,7 @@ by_dict_done:
             if (filtered_tbl != tbl) ray_release(filtered_tbl);
             ray_release(tbl);
             result = apply_sort_take(result, dict_elems, dict_n,
-                                     asc_id, desc_id, take_id);
+                                     asc_id, desc_id, take_id, NULL);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
     } else if (n_out > 0) {
@@ -9750,7 +9776,7 @@ by_dict_done:
                 if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 result = apply_sort_take(result, dict_elems, dict_n,
-                                         asc_id, desc_id, take_id);
+                                         asc_id, desc_id, take_id, NULL);
                 scratch_free(colops_hdr);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             } else {
@@ -9836,17 +9862,24 @@ by_dict_done:
      * machinery — has_sort keeps the two disjoint).  Also NOT pushed when a
      * deferred key WHERE runs AFTER the group (post_group_where_expr): that
      * filter drops result rows, so taking the first N groups before it would
-     * under-fill the answer. */
+     * under-fill the answer.  Nor over a PARTED input (exec_group_parted
+     * mis-applies the hint on empty partitions — see table_is_parted), nor
+     * with a LIST-producing aggregate (top/bot): exec.c's HEAD/TAIL table trim
+     * now retains LIST cells, but the group's LIST output has no reason to pay
+     * a trim it can skip, and the take is a no-op there anyway. */
     ray_t* take_range = NULL;
+    ray_t* take_pre = NULL;   /* evaluated take: value, reused by apply_sort_take */
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
-                            && !post_group_where_expr
-                            && !group_keys_have_bool(by_expr, tbl));
+                            && !post_group_where_expr && !has_list_agg
+                            && !group_keys_have_bool(by_expr, tbl)
+                            && !table_is_parted(tbl));
     if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t n_take = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
-            ray_release(tv);
+            if (group_take_push) take_pre = tv;   /* ownership moves to take_pre */
+            else ray_release(tv);
             if (group_take_push) {
                 if (n_take > 0) root = ray_head(g, root, n_take);
                 /* n_take <= 0 with a group-by: leave it to apply_sort_take. */
@@ -9855,7 +9888,7 @@ by_dict_done:
             else
                 root = ray_tail(g, root, -n_take);
         } else if (ray_is_vec(tv) && (tv->type == RAY_I64 || tv->type == RAY_I32) && tv->len == 2) {
-            if (group_take_push) ray_release(tv);   /* range: apply_sort_take handles it */
+            if (group_take_push) take_pre = tv;    /* range: apply_sort_take slices it */
             else take_range = tv;  /* apply after DAG execution */
         } else {
             int8_t tv_t = tv->type;            /* capture BEFORE free */
@@ -11054,7 +11087,9 @@ by_dict_done:
      * last so non-agg LIST columns are already in the result,
      * allowing sort clauses to reference non-agg output columns. */
     if (by_expr && (has_sort || take_expr))
-        result = apply_sort_take(result, dict_elems, dict_n, asc_id, desc_id, take_id);
+        result = apply_sort_take(result, dict_elems, dict_n, asc_id, desc_id,
+                                 take_id, take_pre);
+    if (take_pre) ray_release(take_pre);
 
     if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
     if (saved_selection) ray_release(saved_selection);
@@ -16199,7 +16234,7 @@ static ray_t* try_stream_parted_order_by_topk(
     /* Final merge: apply_sort_take reads asc/desc/take straight from dict_elems
      * and is the SAME stable kernel the flat path uses, so the k rows and their
      * order are byte-identical to flatten→sort→take.  It consumes `accum`. */
-    return apply_sort_take(accum, dict_elems, dict_n, asc_id, desc_id, take_id);
+    return apply_sort_take(accum, dict_elems, dict_n, asc_id, desc_id, take_id, NULL);
 }
 
 /* If `tbl` is DATE-partitioned, return its (borrowed) per-partition RAY_DATE
