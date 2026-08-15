@@ -2540,6 +2540,39 @@ static test_result_t test_cd_fused_interleaved(void) {
     PASS();
 }
 
+/* q08 shape: low-cardinality key (200), heavy skew (key 0 owns half the rows),
+ * high-cardinality values.  Key-hash partitioning serialized phase 2 on the
+ * fat key here; pair-hash partitioning must still produce the exact answer. */
+static test_result_t test_cd_fused_skewed(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 200, nv = 50021;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        /* every other row goes to key 0 → key 0 owns 50% of the table */
+        kd[i] = (i & 1) ? 1 + ((i / 2) % (nk - 1)) : 0;
+        vd[i] = (i * 2654435761u) % nv;   /* high-cardinality values */
+    }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Narrow column types: I32 key, I16 value (read_col_i64 widening path). */
 static test_result_t test_cd_fused_narrow_types(void) {
     ray_heap_init();
@@ -2610,5 +2643,6 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/cd_fused_basic",                test_cd_fused_basic,                NULL, NULL },
     { "group_extra/cd_fused_interleaved",          test_cd_fused_interleaved,          NULL, NULL },
     { "group_extra/cd_fused_narrow_types",         test_cd_fused_narrow_types,         NULL, NULL },
+    { "group_extra/cd_fused_skewed",               test_cd_fused_skewed,               NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

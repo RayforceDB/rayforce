@@ -22,14 +22,25 @@
  */
 
 /* Fused grouped count-distinct (spec Part B).  Single pass over rows:
- * phase 1 scatters compact [khash][k][v][row] records into per-(worker,
- * partition) buffers, partitioned by fmix64(hash(k)) LOW bits so every
- * row of one key lands in exactly one partition; phase 2 walks each
- * partition once with two partition-local open-addressing tables — a
- * (k,v) dedupe table and a k count table — and emits (k, distinct,
- * first_row) directly.  No intermediate pairs table, no second group
- * pipeline.  Slot indices for both local tables use hash bits ABOVE the
- * partition bits (the agg_engine hash-bit-overlap lesson). */
+ * phase 1 scatters compact [pairhash][k][v][row] records into per-(worker,
+ * partition) buffers; phase 2 walks each partition once with two
+ * partition-local open-addressing tables — a (k,v) dedupe table and a k
+ * table — producing PARTIAL per-key (distinct count, first_row); phase 3
+ * merges the partials into global totals and emits (k, distinct,
+ * first_row).  No intermediate pairs table, no second group pipeline.
+ *
+ * Partitioning is by the PAIR hash fmix64(hash(k) ^ hash(v)), NOT by the
+ * key hash.  Key-hash partitioning makes each key's ENTIRE row set land in
+ * one partition, so a single skewed key (e.g. a region owning half the
+ * table) serializes phase 2 behind one core — measured 35% SLOWER than the
+ * unfused path on a 100M-row / 9K-key / heavy-skew query.  The pair hash is
+ * uniform regardless of key skew, at the price of every partition seeing
+ * (nearly) every key — hence the additive merge in phase 3 and the 1024
+ * partition cap that bounds the merge input.
+ *
+ * The dedupe table's slot index uses pair-hash bits ABOVE the partition
+ * bits (the agg_engine hash-bit-overlap lesson); the k table indexes on an
+ * independent hash of k alone, which takes no part in partition selection. */
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -46,8 +57,8 @@
  * ══════════════════════════════════════════ */
 
 /* Avalanche finalizer — identical body to agg_radix_fmix64 (agg_engine.c,
- * static there).  Partition selection consumes the LOW log2(n_parts) bits
- * and both partition-local slot indices the bits ABOVE them, so the raw
+ * static there).  Partition selection consumes the LOW log2(n_parts) bits of
+ * the pair hash and the dedupe slot index the bits ABOVE them, so the raw
  * hash must be finalized for the shift-out split to hold. */
 static inline uint64_t cdf_fmix64(uint64_t h) {
     h ^= h >> 33;
@@ -64,7 +75,14 @@ typedef struct {
     uint32_t n, cap;
 } cdf_buf_t;
 
-#define CDF_REC 32 /* [khash 8][k 8][v 8][row 8] */
+#define CDF_REC 32 /* [pairhash 8][k 8][v 8][row 8] */
+
+/* Upper bound on partitions.  Phase 3's merge input is
+ * n_parts × distinct-keys-per-partition and pair-hash partitioning lets every
+ * partition see nearly every key, so the cap is what keeps the merge bounded;
+ * 1024 still gives ample parallelism (and equals RAY_POOL_INIT_TASKS, so
+ * ray_pool_dispatch_n never needs to grow its ring). */
+#define CDF_MAX_PARTS 1024u
 
 /* Reserve room for one more record; returns dest ptr or NULL on OOM. */
 static char* cdf_reserve(cdf_buf_t* b, uint32_t prime) {
@@ -109,7 +127,8 @@ static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t r = start; r < end; r++) {
         int64_t k = read_col_i64(c->kdata, r, c->ktype, c->kattrs);
         int64_t v = read_col_i64(c->vdata, r, c->vtype, c->vattrs);
-        uint64_t h = cdf_fmix64(ray_hash_i64(k));
+        /* PAIR hash: uniform even when one key owns most of the table. */
+        uint64_t h = cdf_fmix64(ray_hash_i64(k) ^ ray_hash_i64(v));
         uint32_t p = (uint32_t)(h & (c->n_parts - 1));
         char* rec = cdf_reserve(&my[p], c->prime);
         if (!rec) {
@@ -128,10 +147,12 @@ static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
  * Phase 2 — per-partition dedupe + count
  * ══════════════════════════════════════════ */
 
-/* One emitted group.  Kept as a struct-of-three (not three parallel slabs
- * pre-sized to the partition's record count) so the output memory tracks
- * the group count instead of the row count — a 100M-row / 1K-group run
- * then pays 24 bytes per GROUP, not 24 bytes per ROW. */
+/* One group's PARTIAL result inside one partition: this partition's share of
+ * the key's distinct-value count and the minimum row index it saw for the key.
+ * Phase 3 sums the counts and takes the MIN of the firsts.  Kept as a
+ * struct-of-three (not three parallel slabs pre-sized to the partition's
+ * record count) so the output memory tracks the group count instead of the row
+ * count — a 100M-row / 1K-group run pays 24 bytes per GROUP, not per ROW. */
 typedef struct {
     int64_t key, cnt, first;
 } cdf_grp_t;
@@ -216,15 +237,18 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
             cdf_buf_t* b = &c->bufs[(size_t)w * c->n_parts + p];
             const char* rec = b->buf;
             for (uint32_t i = 0; i < b->n; i++, rec += CDF_REC) {
-                uint64_t kh = ((const uint64_t*)rec)[0];
+                uint64_t ph = ((const uint64_t*)rec)[0];
                 int64_t k = ((const int64_t*)rec)[1];
                 int64_t v = ((const int64_t*)rec)[2];
                 int64_t row = ((const int64_t*)rec)[3];
 
-                /* k table probe for EVERY record: first_row must be the MIN
-                 * over all rows of the key, not only over rows that open a
-                 * fresh (k,v) pair. */
-                uint64_t t = (kh >> c->part_bits) & dmask;
+                /* k table probe for EVERY record: this partition's first_row
+                 * must be the MIN over all its rows of the key, not only over
+                 * rows that open a fresh (k,v) pair.  The slot index comes
+                 * from a hash of k ALONE — recomputed here rather than stored,
+                 * to keep the record at 32B — and that hash never selects a
+                 * partition, so it needs no bit shift-out. */
+                uint64_t t = cdf_fmix64(ray_hash_i64(k)) & dmask;
                 int64_t gi = 0;
                 for (;;) {
                     if (kidx[t] == -1) {
@@ -262,10 +286,9 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
                 }
                 if (failed) break;
 
-                /* Combined (k,v) hash for the dedupe table; slot bits above
-                 * the partition bits. */
-                uint64_t vh = cdf_fmix64(kh ^ ray_hash_i64(v));
-                uint64_t s = (vh >> c->part_bits) & dmask;
+                /* Dedupe on the pair hash already in the record; slot bits
+                 * above the partition bits. */
+                uint64_t s = (ph >> c->part_bits) & dmask;
                 for (;;) {
                     if (docc[s] == -1) {
                         dkv[s * 2] = k;
@@ -298,27 +321,22 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
  * Assembly
  * ══════════════════════════════════════════ */
 
-/* (first_row, partition, group index) triple used to restore stable
- * first-seen order across partitions.  first_row values are unique — each
- * key lives in exactly one partition and contributes one group — so the
- * sort is total and the comparator needs no tiebreak. */
-typedef struct {
-    int64_t first;
-    int32_t part, idx;
-} cdf_ord_t;
-
-static int cdf_ord_cmp(const void* a, const void* b) {
-    int64_t x = ((const cdf_ord_t*)a)->first, y = ((const cdf_ord_t*)b)->first;
+/* Merged group.  first_row values are unique across merged groups — one entry
+ * per distinct key, each carrying that key's global minimum row — so the
+ * ordering sort is total and the comparator needs no tiebreak. */
+static int cdf_grp_cmp(const void* a, const void* b) {
+    int64_t x = ((const cdf_grp_t*)a)->first, y = ((const cdf_grp_t*)b)->first;
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
 /* Same sqrt-style sizing as agg_radix_part_count: at least one partition per
- * worker, and enough partitions that each holds ~sqrt(nrows) records. */
+ * worker, and enough partitions that each holds ~sqrt(nrows) records — capped
+ * at CDF_MAX_PARTS to bound phase 3's merge input. */
 static uint32_t cdf_part_count(uint32_t nworkers, int64_t nrows) {
     uint32_t n = 1;
     uint64_t rows = nrows > 0 ? (uint64_t)nrows : 1;
     while ((n < nworkers || (uint64_t)n < rows / n + (rows % n != 0)) &&
-           n < (1u << 14))
+           n < CDF_MAX_PARTS)
         n <<= 1;
     return n;
 }
@@ -388,23 +406,85 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         return NULL;
     }
 
-    int64_t ng = 0;
-    for (uint32_t p = 0; p < n_parts; p++) ng += parts[p].ng;
-
-    cdf_ord_t* ord = (cdf_ord_t*)ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(cdf_ord_t));
-    if (!ord) {
+    /* Phase 3: merge the per-partition partials into global per-key totals.
+     * A (k,v) pair hashes to exactly ONE partition, so the partitions' distinct
+     * sets for a key are disjoint and their counts simply ADD; first_row is a
+     * MIN, which composes the same way.  The merge input is bounded by
+     * n_parts × distinct keys and the table grows from the actual key count, so
+     * this serial hash accumulate stays small even at 100M rows. */
+    cdf_grp_t* merged = NULL;
+    int32_t* mslot = NULL;
+    int64_t mcap = 1024, mn = 0;
+    uint64_t scap = 4096, smask = scap - 1;
+    merged = (cdf_grp_t*)ray_alloc_raw((size_t)mcap * sizeof(cdf_grp_t));
+    mslot = (int32_t*)ray_alloc_raw((size_t)scap * sizeof(int32_t));
+    if (!merged || !mslot) {
+        ray_free_raw(merged); ray_free_raw(mslot);
         cdf_free_all(bufs, nbuf, parts, n_parts);
         return NULL;
     }
-    int64_t o = 0;
-    for (uint32_t p = 0; p < n_parts; p++)
+    memset(mslot, 0xFF, (size_t)scap * sizeof(int32_t));
+
+    for (uint32_t p = 0; p < n_parts; p++) {
         for (int64_t i = 0; i < parts[p].ng; i++) {
-            ord[o].first = parts[p].g[i].first;
-            ord[o].part = (int32_t)p;
-            ord[o].idx = (int32_t)i;
-            o++;
+            const cdf_grp_t* src = &parts[p].g[i];
+            uint64_t h = cdf_fmix64(ray_hash_i64(src->key));
+            uint64_t s = h & smask;
+            while (mslot[s] != -1 && merged[mslot[s]].key != src->key)
+                s = (s + 1) & smask;
+            if (mslot[s] != -1) {
+                cdf_grp_t* dst = &merged[mslot[s]];
+                dst->cnt += src->cnt;
+                if (src->first < dst->first) dst->first = src->first;
+                continue;
+            }
+            if (mn == mcap || mn > INT32_MAX) {
+                if (mn > INT32_MAX) { /* int32 slot payload exhausted */
+                    ray_free_raw(merged); ray_free_raw(mslot);
+                    cdf_free_all(bufs, nbuf, parts, n_parts);
+                    return NULL;
+                }
+                cdf_grp_t* nm = (cdf_grp_t*)ray_realloc_raw(
+                    merged, (size_t)(mcap * 2) * sizeof(cdf_grp_t));
+                if (!nm) {
+                    ray_free_raw(merged); ray_free_raw(mslot);
+                    cdf_free_all(bufs, nbuf, parts, n_parts);
+                    return NULL;
+                }
+                merged = nm;
+                mcap *= 2;
+            }
+            merged[mn] = *src;
+            mslot[s] = (int32_t)mn;
+            mn++;
+            /* Keep the slot table under 50% load; rehash from merged[]. */
+            if ((uint64_t)mn * 2 >= scap) {
+                uint64_t ns = scap * 2;
+                int32_t* nsl = (int32_t*)ray_realloc_raw(mslot,
+                                                         (size_t)ns * sizeof(int32_t));
+                if (!nsl) {
+                    ray_free_raw(merged); ray_free_raw(mslot);
+                    cdf_free_all(bufs, nbuf, parts, n_parts);
+                    return NULL;
+                }
+                mslot = nsl;
+                scap = ns;
+                smask = scap - 1;
+                memset(mslot, 0xFF, (size_t)scap * sizeof(int32_t));
+                for (int64_t m = 0; m < mn; m++) {
+                    uint64_t hh = cdf_fmix64(ray_hash_i64(merged[m].key)) & smask;
+                    while (mslot[hh] != -1) hh = (hh + 1) & smask;
+                    mslot[hh] = (int32_t)m;
+                }
+            }
         }
-    qsort(ord, (size_t)ng, sizeof(cdf_ord_t), cdf_ord_cmp);
+    }
+    ray_free_raw(mslot);
+    cdf_free_all(bufs, nbuf, parts, n_parts);
+
+    int64_t ng = mn;
+    /* Global stable first-seen order. */
+    qsort(merged, (size_t)ng, sizeof(cdf_grp_t), cdf_grp_cmp);
 
     ray_t* keys = ray_vec_new(RAY_I64, ng);
     ray_t* cnts = ray_vec_new(RAY_I64, ng);
@@ -413,8 +493,7 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     if (!keys || RAY_IS_ERR(keys) || !cnts || RAY_IS_ERR(cnts) ||
         !firsts || RAY_IS_ERR(firsts) || !tbl || RAY_IS_ERR(tbl)) {
         ray_release(keys); ray_release(cnts); ray_release(firsts); ray_release(tbl);
-        ray_free_raw(ord);
-        cdf_free_all(bufs, nbuf, parts, n_parts);
+        ray_free_raw(merged);
         return NULL;
     }
     keys->len = cnts->len = firsts->len = ng;
@@ -422,13 +501,11 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     int64_t* cd = (int64_t*)ray_data(cnts);
     int64_t* fd = (int64_t*)ray_data(firsts);
     for (int64_t i = 0; i < ng; i++) {
-        const cdf_grp_t* g = &parts[ord[i].part].g[ord[i].idx];
-        kd[i] = g->key;
-        cd[i] = g->cnt;
-        fd[i] = g->first;
+        kd[i] = merged[i].key;
+        cd[i] = merged[i].cnt;
+        fd[i] = merged[i].first;
     }
-    ray_free_raw(ord);
-    cdf_free_all(bufs, nbuf, parts, n_parts);
+    ray_free_raw(merged);
 
     tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), keys);
     tbl = ray_table_add_col(tbl, ray_sym_intern("u", 1), cnts);
