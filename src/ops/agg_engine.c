@@ -1794,10 +1794,14 @@ static uint32_t agg_radix_part_count(uint32_t nworkers, int64_t nrows) {
 typedef struct { char* buf; uint32_t n, cap; } agg_pay_buf_t;  /* n = #records */
 
 /* Reserve room for one more record of `rec` bytes; returns dest ptr or NULL. */
-static char* agg_pay_reserve(agg_pay_buf_t* b, size_t rec) {
+static char* agg_pay_reserve(agg_pay_buf_t* b, size_t rec, uint32_t cap0) {
     if (b->n == b->cap) {
         if (b->cap > UINT32_MAX / 2) return NULL;
-        uint32_t nc = b->cap ? b->cap * 2 : 1;
+        /* First allocation jumps straight to the caller's expected row count
+         * (uniform-hash estimate).  Growing 1->2->4->... instead re-copies the
+         * whole payload ~2x across tens of thousands of per-(worker,partition)
+         * buffers — the memmove was 23% of ClickBench q17. */
+        uint32_t nc = b->cap ? b->cap * 2 : (cap0 ? cap0 : 1);
         char* nb = ray_realloc_raw(b->buf, (size_t)nc * rec);
         if (!nb) return NULL;
         b->buf = nb; b->cap = nc;
@@ -1885,6 +1889,11 @@ typedef struct {
     const void**        val2_data; const int8_t* val2_types; const bool* val2_hasnull; const uint8_t* val2_esz;
     uint32_t            nw;
     uint32_t            n_parts;
+    uint32_t            part_bits;  /* log2(n_parts): hash bits consumed by
+                                     * partition selection; phase 2 shifts
+                                     * them out before slot indexing */
+    uint32_t            pay_prime;  /* expected rows per (worker,partition)
+                                     * buffer — first-allocation capacity */
     agg_pay_buf_t*      bufs;       /* [nw * n_parts] payload records */
     agg_radix_part_t*   parts;      /* [n_parts] */
     int                 phase1_oom; /* set by any Phase-1 worker on push failure */
@@ -1913,6 +1922,19 @@ typedef struct {
     int64_t*            kv_scratch;
 } agg_radix_ctx_t;
 
+/* Avalanche finalizer shared by the radix scatter (partition selection) and
+ * phase 2 (partition-local slot index).  Both consume DISJOINT bit ranges of
+ * the same per-row hash — partition from the low log2(n_parts) bits, slot
+ * from the bits above them — so the raw FNV must be finalized (fmix64, same
+ * rationale as agg_tuple_hash) and the two sides must compute IDENTICAL
+ * values for the shift-out split to hold. */
+static inline uint64_t agg_radix_fmix64(uint64_t h) {
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
+
 /* Scatter one ORIGINAL row r's packed payload record into the worker's per-
  * partition buffer.  Returns 0 or -1 on push OOM (sets phase1_oom). */
 static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
@@ -1927,8 +1949,9 @@ static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
         kv[k] = v;
         h ^= (uint64_t)v; h *= 1099511628211ULL;
     }
+    h = agg_radix_fmix64(h);
     uint32_t p = (uint32_t)(h & (c->n_parts - 1));
-    char* rec = agg_pay_reserve(&my[p], c->rec);
+    char* rec = agg_pay_reserve(&my[p], c->rec, c->pay_prime);
     if (!rec) { c->phase1_oom = 1; return -1; }
     int64_t* kdst = (int64_t*)rec;
     for (uint32_t k = 0; k < n_keys; k++) kdst[k] = kv[k];
@@ -2079,10 +2102,18 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
                     if (gy[a]) { uint8_t ez2 = c->val2_esz[a];
                         memcpy(gy[a] + (size_t)ri * ez2, rec + c->val2_off[a], ez2); }
                 }
-                /* Hash the contiguous packed keys (same FNV-1a as the scatter). */
+                /* Hash the contiguous packed keys (same FNV-1a as the scatter).
+                 * The scatter consumed the LOW log2(n_parts) bits of this hash
+                 * to pick the partition, so within this partition those bits
+                 * are constant across every record — the slot index must come
+                 * from the bits above them or the open-addressing table
+                 * collapses to 2^(htbits - partbits) usable slots and probing
+                 * degrades to O(ng^2) linear chains (ClickBench q17: 65% of
+                 * the query inside this probe loop at 4096 partitions). */
                 uint64_t h = 1469598103934665603ULL;
                 for (uint32_t k = 0; k < n_keys; k++) { h ^= (uint64_t)keys[k]; h *= 1099511628211ULL; }
-                uint64_t slot = h & htmask;
+                h = agg_radix_fmix64(h);
+                uint64_t slot = (h >> c->part_bits) & htmask;
                 /* Salt = top 8 bits of the hash (independent of the low-bit slot
                  * index). Compared first on probe to skip ~255/256 full memcmps. */
                 uint8_t salt = (uint8_t)(h >> 56);
@@ -2292,6 +2323,11 @@ static ray_t* exec_group_v2_parallel_radix(
         .val_data = val_data, .val_types = val_types, .val_hasnull = val_hasnull, .val_esz = val_esz,
         .val2_data = val2_data, .val2_types = val2_types, .val2_hasnull = val2_hasnull, .val2_esz = val2_esz,
         .nw = nw, .n_parts = n_parts,
+        .part_bits = (uint32_t)__builtin_ctz(n_parts),
+        /* Uniform-hash expectation with 25% slack; ≥8 so tiny buffers don't
+         * immediately re-double. */
+        .pay_prime = (uint32_t)((uint64_t)(sel ? n_sel : nrows)
+                                / ((uint64_t)nw * n_parts) * 5 / 4 + 8),
         .bufs = bufs, .parts = parts, .phase1_oom = 0,
         .rec = rec, .row_off = row_off, .needs_row = needs_row,
         .sel = sel, .sel_prefix = sel_prefix,

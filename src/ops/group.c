@@ -5188,7 +5188,14 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             total += c->bufs[(size_t)w * c->n_parts + p].count;
         if (total == 0) continue;
 
-        if (!group_ht_init_sized(&c->part_hts[p], 2, &c->layout, 1))
+        /* `total` counts ROWS, an upper bound on groups — start from it
+         * (capped: heavy-duplicate partitions shouldn't over-allocate) so
+         * high-card partitions skip the 2->4->...->N rehash ladder. */
+        uint32_t fe_cap = 2;
+        uint32_t fe_target = total < 4096 ? total : 4096;
+        while (fe_cap < fe_target) fe_cap <<= 1;
+        uint32_t fe_blk = total < 256 ? total : 256;
+        if (!group_ht_init_sized(&c->part_hts[p], fe_cap, &c->layout, fe_blk))
             continue;
         /* Wide keys need source-column resolution during probe/rehash. */
         if (c->layout.any_wide_key && c->key_data) {
@@ -5311,6 +5318,13 @@ typedef struct {
     ght_layout_t   layout;
     ray_t*         rowsel;
     const int64_t* match_idx;
+    uint32_t       ht_init_cap;      /* first-touch HT capacity: expected rows
+                                      * per (worker,partition), clamped to
+                                      * [2, 256].  Starting at 2 regardless of
+                                      * load re-rehashes every table ~8 times
+                                      * (ClickBench q32); empty pairs still
+                                      * allocate nothing. */
+    uint32_t       ht_init_block;    /* row-block granularity for the same */
     _Atomic(int)   oom;
 } radix_v2_phase1_ctx_t;
 
@@ -5437,7 +5451,8 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
             /* Demand-driven initialization: the first observed row creates
              * the smallest valid table and normal growth follows actual
              * cardinality.  Empty worker/partition pairs allocate nothing. */
-            if (!group_ht_init_sized(&my_hts[p], 2, ly, 1)) {
+            if (!group_ht_init_sized(&my_hts[p], c->ht_init_cap, ly,
+                                     c->ht_init_block)) {
                 atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
                 break;
             }
@@ -5484,7 +5499,14 @@ static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
         for (uint32_t w = 0; w < c->n_workers; w++)
             total_grps += c->wpart_hts[(size_t)w * c->n_parts + p].grp_count;
         if (total_grps == 0) continue;
-        if (!group_ht_init_sized(&c->part_hts[p], 2, &c->layout, 1)) {
+        /* Size the merged table from the known upper bound instead of
+         * growing 2->4->...->N — with thousands of groups per partition the
+         * repeated rehash+re-insert dominated the merge (ClickBench q32). */
+        uint32_t merge_cap = 2;
+        while (merge_cap < total_grps && merge_cap < (1u << 30)) merge_cap <<= 1;
+        uint32_t merge_blk = total_grps < 256 ? total_grps : 256;
+        if (!group_ht_init_sized(&c->part_hts[p], merge_cap, &c->layout,
+                                 merge_blk)) {
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             return;
         }
@@ -11739,6 +11761,13 @@ ht_path:;
                     }
                 }
             }
+            /* Expected rows per (worker, partition) under a uniform hash —
+             * sized from the rows this dispatch will actually scatter. */
+            uint64_t v2_rows_disp = (uint64_t)(sel_match ? sel_n : n_scan);
+            uint64_t v2_exp = v2_rows_disp
+                            / ((uint64_t)n_total * radix_n_parts) + 1;
+            uint32_t v2_cap = 2;
+            while (v2_cap < v2_exp && v2_cap < 256) v2_cap <<= 1;
             radix_v2_phase1_ctx_t v2p1 = {
                 .key_data      = key_data,
                 .key_types     = key_types,
@@ -11753,6 +11782,8 @@ ht_path:;
                 .wpart_hts     = wpart_hts,
                 .rowsel        = rowsel,
                 .match_idx     = sel_match,
+                .ht_init_cap   = v2_cap,
+                .ht_init_block = v2_cap > 2 ? v2_cap / 2 : 1,
                 .oom           = 0,
             };
             /* By-value embed the layout, fixing its base pointers to v2p1's
