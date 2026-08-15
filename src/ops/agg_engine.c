@@ -2216,6 +2216,84 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
  *   - LIST out_type (top/bot) cells are NEW ray_t's whose finalize + ray_list_set
  *     COW/retain semantics are not confirmed race-free → LIST aggs are finalized
  *     SERIALLY by the caller (q10 and other scalar shapes get the full win). */
+/* ---- Parallel phase-3 stable ordering -----------------------------------
+ * The order map (pairs[input_count], -1-filled) is scattered into by
+ * partition and then stream-compacted.  Serially this is an 80MB touch +
+ * scatter + full scan per 10M-row query — a flat-scaling wall on high-card
+ * groups (q17/q18).  Parallel version:
+ *   scatter — dispatched over PARTITIONS: each group's first_row is globally
+ *   unique (a row belongs to exactly one group, groups are disjoint across
+ *   partitions), so writes are disjoint and race-free.  The serial code's
+ *   per-write duplicate check moves to the aggregate `ordered == ng` check:
+ *   a duplicate (corrupt state) overwrites one entry, the compact count
+ *   comes up short, and the same error path fires.
+ *   compact — two passes over fixed chunks: per-chunk non-empty counts, a
+ *   serial prefix over the (few hundred) chunk counts, then in-place writes
+ *   at each chunk's prefix offset.  In-place is forward-safe: chunk k's
+ *   write region [prefix[k], prefix[k]+cnt[k]) never overlaps a LATER
+ *   chunk's unread region (prefix[j+1] <= (j+1)*C <= k*C for j < k), and
+ *   within a chunk dst <= src with ascending iteration. */
+typedef struct {
+    agg_radix_part_t*  parts;
+    agg_radix_order_t* pairs;
+    int64_t            input_count;
+    _Atomic(int)       fail;
+} agg_ord_scatter_ctx_t;
+
+static void agg_ord_scatter_fn(void* vctx, uint32_t wid, int64_t start,
+                               int64_t end) {
+    (void)wid;
+    agg_ord_scatter_ctx_t* c = (agg_ord_scatter_ctx_t*)vctx;
+    if (atomic_load_explicit(&c->fail, memory_order_relaxed)) return;
+    for (int64_t p = start; p < end; p++) {
+        agg_radix_part_t* pr = &c->parts[p];
+        for (int64_t gg = 0; gg < pr->ng; gg++) {
+            int64_t first = pr->first_row[gg];
+            if (first < 0 || first >= c->input_count) {
+                atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+                return;
+            }
+            c->pairs[first].idx = ((int64_t)p << 32) | (uint32_t)gg;
+        }
+    }
+}
+
+typedef struct {
+    agg_radix_order_t* pairs;
+    int64_t            input_count;
+    int64_t            chunk;      /* elements per chunk */
+    int64_t*           counts;     /* [n_chunks]: pass A out / pass B prefix in */
+} agg_ord_compact_ctx_t;
+
+static void agg_ord_count_fn(void* vctx, uint32_t wid, int64_t start,
+                             int64_t end) {
+    (void)wid;
+    agg_ord_compact_ctx_t* c = (agg_ord_compact_ctx_t*)vctx;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk;
+        int64_t hi = lo + c->chunk;
+        if (hi > c->input_count) hi = c->input_count;
+        int64_t n = 0;
+        for (int64_t i = lo; i < hi; i++)
+            n += (c->pairs[i].idx != -1);
+        c->counts[ch] = n;
+    }
+}
+
+static void agg_ord_compact_fn(void* vctx, uint32_t wid, int64_t start,
+                               int64_t end) {
+    (void)wid;
+    agg_ord_compact_ctx_t* c = (agg_ord_compact_ctx_t*)vctx;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk;
+        int64_t hi = lo + c->chunk;
+        if (hi > c->input_count) hi = c->input_count;
+        int64_t w = c->counts[ch];   /* prefix offset for this chunk */
+        for (int64_t i = lo; i < hi; i++)
+            if (c->pairs[i].idx != -1) c->pairs[w++].idx = c->pairs[i].idx;
+    }
+}
+
 typedef struct {
     agg_radix_part_t*    parts;
     const agg_radix_order_t* pairs;   /* [ng], stable first-seen order */
@@ -2381,21 +2459,61 @@ static ray_t* exec_group_v2_parallel_radix(
     memset(pairs, 0xFF,
            (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
     bool order_ok = true;
-    for (uint32_t p = 0; p < n_parts && order_ok; p++) {
-        for (int64_t gg = 0; gg < parts[p].ng; gg++) {
-            int64_t first = parts[p].first_row[gg];
-            if (first < 0 || first >= input_count || pairs[first].idx != -1) {
+    int64_t ordered = 0;
+    bool ord_parallel_done = false;
+    if (pool && nw > 1 && input_count >= (1 << 20)) {
+        const int64_t ORD_CHUNK = 1 << 17;
+        int64_t n_chunks = (input_count + ORD_CHUNK - 1) / ORD_CHUNK;
+        ray_t* ordcnt_hdr = NULL;
+        int64_t* ord_counts = (int64_t*)scratch_alloc(&ordcnt_hdr,
+            (size_t)n_chunks * sizeof(int64_t));
+        if (ord_counts) {
+            agg_ord_scatter_ctx_t sctx = {
+                .parts = parts, .pairs = pairs,
+                .input_count = input_count, .fail = 0,
+            };
+            ray_pool_dispatch(pool, agg_ord_scatter_fn, &sctx,
+                              (int64_t)n_parts);
+            if (!atomic_load_explicit(&sctx.fail, memory_order_relaxed)) {
+                agg_ord_compact_ctx_t cctx = {
+                    .pairs = pairs, .input_count = input_count,
+                    .chunk = ORD_CHUNK, .counts = ord_counts,
+                };
+                ray_pool_dispatch(pool, agg_ord_count_fn, &cctx, n_chunks);
+                /* Exclusive prefix (serial over a few hundred chunks). */
+                int64_t run = 0;
+                for (int64_t ch = 0; ch < n_chunks; ch++) {
+                    int64_t n = ord_counts[ch];
+                    ord_counts[ch] = run;
+                    run += n;
+                }
+                ray_pool_dispatch(pool, agg_ord_compact_fn, &cctx, n_chunks);
+                ordered = run;
+                order_ok = ordered == ng;
+                ord_parallel_done = true;
+            } else {
                 order_ok = false;
-                break;
+                ord_parallel_done = true;   /* bounds violation → error path */
             }
-            pairs[first].idx = ((int64_t)p << 32) | (uint32_t)gg;
+            scratch_free(ordcnt_hdr);
         }
     }
-    int64_t ordered = 0;
-    if (order_ok) {
-        for (int64_t i = 0; i < input_count; i++)
-            if (pairs[i].idx != -1) pairs[ordered++].idx = pairs[i].idx;
-        order_ok = ordered == ng;
+    if (!ord_parallel_done) {
+        for (uint32_t p = 0; p < n_parts && order_ok; p++) {
+            for (int64_t gg = 0; gg < parts[p].ng; gg++) {
+                int64_t first = parts[p].first_row[gg];
+                if (first < 0 || first >= input_count || pairs[first].idx != -1) {
+                    order_ok = false;
+                    break;
+                }
+                pairs[first].idx = ((int64_t)p << 32) | (uint32_t)gg;
+            }
+        }
+        if (order_ok) {
+            for (int64_t i = 0; i < input_count; i++)
+                if (pairs[i].idx != -1) pairs[ordered++].idx = pairs[i].idx;
+            order_ok = ordered == ng;
+        }
     }
     if (!order_ok) {
         ray_free_raw(pairs);
