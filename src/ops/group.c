@@ -5371,6 +5371,90 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
         kpool = (const void**)(blk + ly->entry_stride);
     }
     derive_key_pool(ly, c->key_vecs, kpool);
+
+    /* Pipelined fast path: narrow-key (<=2), null-free, count-only entries —
+     * the q13-q18 class of high-cardinality counts.  The generic loop's
+     * probe stalls on two dependent cache misses per row (HT slot line,
+     * then the group row); staging a small ring of pre-built entries and
+     * prefetching each entry's slot line V2PF rows ahead overlaps those
+     * misses across iterations.  Entry layout, hashing, probe and merge
+     * semantics are IDENTICAL to the generic loop below — this is purely
+     * a scheduling change. */
+    if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
+        ly->need_flags == 0 &&
+        !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
+                               GHT_AF_HOLISTIC)) &&
+        nk >= 1 && nk <= 2 && ly->entry_stride <= 64) {
+        enum { V2PF = 8 };
+        char     ering[V2PF][64];
+        uint32_t pring[V2PF];
+        uint32_t rhead = 0, rcount = 0;
+
+        #define V2_PIPE_PROBE_OLDEST()                                        \
+            do {                                                              \
+                uint32_t pp = pring[rhead];                                   \
+                if (!my_hts[pp].slots) {                                      \
+                    if (!group_ht_init_sized(&my_hts[pp], c->ht_init_cap, ly, \
+                                             c->ht_init_block)) {             \
+                        atomic_store_explicit(&c->oom, 1,                     \
+                                              memory_order_relaxed);          \
+                        goto v2_pipe_done;                                    \
+                    }                                                         \
+                    masks[pp] = my_hts[pp].ht_cap - 1;                        \
+                }                                                             \
+                masks[pp] = group_probe_entry(&my_hts[pp], ering[rhead],      \
+                                              c->key_types, masks[pp]);       \
+                if (my_hts[pp].oom) {                                         \
+                    atomic_store_explicit(&c->oom, 1, memory_order_relaxed);  \
+                    goto v2_pipe_done;                                        \
+                }                                                             \
+                rhead = (rhead + 1) % V2PF;                                   \
+                rcount--;                                                     \
+            } while (0)
+
+        for (int64_t i = start; i < end; i++) {
+            if (((i - start) & 65535) == 0 && ray_interrupted()) break;
+            int64_t row = match_idx ? match_idx[i] : i;
+            if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row))
+                continue;
+            char* e = ering[(rhead + rcount) % V2PF];
+            int64_t* rk = (int64_t*)(e + 8);
+            uint64_t h = 0;
+            for (uint32_t k = 0; k < nk; k++) {
+                uint64_t kh;
+                int8_t t = c->key_types[k];
+                if (t == RAY_F64) {
+                    int64_t kv;
+                    memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+                    rk[k] = kv;
+                    kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+                } else {
+                    int64_t kv = read_col_i64(c->key_data[k], row, t,
+                                              c->key_attrs[k]);
+                    rk[k] = kv;
+                    kh = ray_hash_i64(kv);
+                }
+                h = (k == 0) ? kh : ray_hash_combine(h, kh);
+            }
+            *(uint64_t*)e = h;
+            memcpy(e + ly->entry_stride - 8, &row, 8);
+            uint32_t p = group_radix_part(h, c->n_parts);
+            pring[(rhead + rcount) % V2PF] = p;
+            if (my_hts[p].slots)
+                __builtin_prefetch(
+                    &my_hts[p].slots[(uint32_t)(h & masks[p])], 1, 1);
+            rcount++;
+            if (rcount == V2PF)
+                V2_PIPE_PROBE_OLDEST();
+        }
+        while (rcount > 0)
+            V2_PIPE_PROBE_OLDEST();
+        #undef V2_PIPE_PROBE_OLDEST
+v2_pipe_done:
+        scratch_free(v2_stage_hdr);
+        return;
+    }
+
     for (int64_t i = start; i < end; i++) {
         if (((i - start) & 65535) == 0 && ray_interrupted()) break;
         int64_t row = match_idx ? match_idx[i] : i;
