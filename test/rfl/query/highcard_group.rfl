@@ -26,6 +26,6 @@
 (count (select {c: (count k) by: k from: HK where: (< k 1000)})) -- 1000
 
 ;; I32-typed keys through the same path
-(set HK3 (table [k v] (list (% (til 262144) 65536) (til 262144))))
+(set HK3 (table [k v] (list (as 'I32 (% (til 262144) 65536)) (til 262144))))
 (count (select {c: (count v) by: k from: HK3})) -- 65536
 (sum (at (select {c: (count v) by: k from: HK3}) 'c)) -- 262144
