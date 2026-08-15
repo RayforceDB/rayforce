@@ -1243,11 +1243,14 @@ static inline void direct_cache_unlock(void) {
 static size_t direct_cache_budget(void) {
     int64_t wm = heap_anon_watermark();
     size_t b = (wm > 0) ? (size_t)wm / 16 : 0;
-    /* Cap at 4GB: at 100M-row scale a single query's order map is ~800MB —
-     * a 512MB cap silently excluded exactly the blocks whose kernel
-     * zeroing costs the most.  1/16 of RAM stays the binding limit on
-     * small machines (e.g. 1GB on a 16GB box). */
-    if (b > ((size_t)4 << 30)) b = ((size_t)4 << 30);
+    /* 1/16 of the watermark is the sole bound (1GB on a 16GB box, ~8GB
+     * on 128GB).  Earlier absolute caps (512MB, then 4GB) each turned
+     * out to exclude exactly the blocks whose kernel re-zeroing cost the
+     * most at the next data scale: a 100M-row group query cycles several
+     * GB-scale scratch blocks (order map ~800MB, per-partition gather
+     * arrays ~1.6GB, result columns ~500MB) per execution, and every
+     * cache miss is an mmap + munmap + full page-zeroing round trip
+     * (measured 14-17% of q17/q18 wall as kernel_init_pages). */
     return b;
 }
 
