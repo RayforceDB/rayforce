@@ -38,6 +38,7 @@
 #include "ops/fused_group.h"
 #include "ops/fused_topk.h"
 #include "ops/hll.h"
+#include "ops/cdfuse.h"       /* ray_cd_fused — fused grouped count-distinct */
 #include "ops/temporal.h"
 #include "core/profile.h"
 #include "table/sym.h"
@@ -3657,6 +3658,63 @@ static ray_t* try_count_distinct_v2_rewrite(
 
     if (where_expr && !ray_fused_group_supported(where_expr, tbl))
         return NULL;
+
+    /* === Fused single-pass kernel (spec Part B) ===
+     * Single narrow key, plain column cd-inner, no WHERE, flat columns:
+     * ray_cd_fused replaces the two group-by passes below with one
+     * partitioned scatter + per-partition dedup.  It declines (NULL) on
+     * any shape it does not handle — small inputs, unsupported types,
+     * nullable columns, allocation pressure — and NULL is never an
+     * error: the two-pass rewrite below then runs unchanged.
+     *
+     * The kernel calls ray_pool_dispatch unconditionally, and the pool is
+     * single-producer, so it must never run from inside an in-flight
+     * dispatch (i.e. from a worker thread).  ray_pool_par_dispatch_ok
+     * carries exactly that check (n_workers > 0 && !ray_parallel_flag)
+     * plus the row-count floor. */
+    if (n_K == 1 && !where_expr) {
+        int64_t nrows = ray_table_nrows(tbl);
+        if (ray_pool_par_dispatch_ok(ray_pool_get(), nrows, CDF_MIN_ROWS)) {
+            ray_t* fr = ray_cd_fused(K_cols[0], X_col, nrows);
+            if (fr) {
+                if (RAY_IS_ERR(fr)) return fr;
+                /* fr = (k, u, _first) I64 columns in first-seen key order.
+                 * Emit {K: keys, c: counts}: the key column is rebuilt at
+                 * the source column's own type/width (so a SYM key stays a
+                 * SYM over the source domain and renders as text), and
+                 * `_first` — an internal ordering artifact — is dropped by
+                 * building a fresh 2-column table. */
+                ray_t* fk = ray_table_get_col_idx(fr, 0);
+                ray_t* fu = ray_table_get_col_idx(fr, 1);
+                int64_t ng = fk ? fk->len : 0;
+                ray_t* kv = col_vec_new(K_cols[0], ng > 0 ? ng : 1);
+                if (!kv || RAY_IS_ERR(kv)) {
+                    ray_release(fr);
+                    return kv ? kv : ray_error("oom", NULL);
+                }
+                if (kv->type == RAY_SYM)
+                    ray_sym_vec_adopt_domain(kv, sym_domain_rep(K_cols[0]));
+                kv->len = ng;
+                {
+                    const int64_t* src = (const int64_t*)ray_data(fk);
+                    void* dst = ray_data(kv);
+                    for (int64_t i = 0; i < ng; i++)
+                        write_col_i64(dst, i, src[i], kv->type, kv->attrs);
+                }
+                ray_t* out = ray_table_new(2);
+                if (out && !RAY_IS_ERR(out))
+                    out = ray_table_add_col(out, K_syms[0], kv);
+                if (out && !RAY_IS_ERR(out))
+                    out = ray_table_add_col(out, cd_c_sym, fu);
+                ray_release(kv);
+                ray_release(fr);
+                if (!out) return ray_error("oom", NULL);
+                if (RAY_IS_ERR(out)) return out;
+                return apply_sort_take(out, dict_elems, dict_n,
+                                       asc_id, desc_id, take_id);
+            }
+        }
+    }
 
     /* === Inner pass: group by (K1, ..., Kn, X) on the source table === */
     ray_graph_t* g_in = ray_graph_new(tbl);
