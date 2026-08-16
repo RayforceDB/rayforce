@@ -5110,6 +5110,46 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
     }
 }
 
+/* FUSED per-partition scan: the same reduction topn_scan_fn performs, run at
+ * the END of the phase-2 task that BUILT the partition, while its rows are
+ * still in that core's L2/L3 instead of being re-read from DRAM afterwards.
+ *
+ * It is arithmetically the same scan — same shared topn_heap_push, the same
+ * per-partition cap (`cap` is k_take ITSELF, condition (1) of the proof above,
+ * here as a uniform stride because grp_count is unknown at allocation time),
+ * and the same sort back into gid order so the merge still sees candidates
+ * partitions-ascending / gid-ascending (condition (2)).  Fusion moves only
+ * WHERE the scan runs, never what it retains.
+ *
+ * `items == NULL` means fusion is off and the standalone topn_scan_fn pre-pass
+ * (or the serial scan) runs instead.  `item_cnt` is calloc'd by the driver and
+ * every phase-2 task clears its own partition's entry BEFORE any early
+ * `continue`, so a partition that is skipped — or whose task never runs at all
+ * because the dispatch was drained by a cancel — reads as 0 survivors. */
+typedef struct {
+    group_topn_item_t* items;     /* [n_parts * cap]; NULL = fusion off */
+    uint32_t*          item_cnt;  /* [n_parts] survivors per partition */
+    uint32_t           cap;       /* per-partition capacity = k_take */
+    uint16_t           order_off; /* in-row byte offset of the ordering agg */
+    uint8_t            desc_dir;
+} topn_fuse_t;
+
+static inline void topn_fuse_partition(const topn_fuse_t* f, group_ht_t* ph,
+                                       uint32_t p) {
+    uint32_t gc = ph->grp_count;
+    uint16_t rs = ph->layout.row_stride;
+    group_topn_item_t* h = f->items + (size_t)p * f->cap;
+    int64_t cap = (int64_t)f->cap;
+    int64_t hn = 0;
+    for (uint32_t gi = 0; gi < gc; gi++) {
+        int64_t v = *(const int64_t*)(const void*)
+                    (ph->rows + (size_t)gi * rs + f->order_off);
+        hn = topn_heap_push(h, hn, cap, f->desc_dir, v, p, gi);
+    }
+    if (hn > 1) qsort(h, (size_t)hn, sizeof(*h), topn_gid_cmp);
+    f->item_cnt[p] = (uint32_t)hn;
+}
+
 /* Slot rebuild after compaction: gids moved, so every surviving row must be
  * re-hashed into a cleared slot array.  Only partitions whose grp_count
  * actually changed need it; an untouched partition's slots still describe its
@@ -5738,6 +5778,7 @@ typedef struct {
      * Each partition HT stashes the ones matching wide_key_mask. */
     void**       key_data;
     const void** key_pool;     /* [n_keys] str-pool base per wide STR key */
+    topn_fuse_t  fuse;         /* .items NULL when top-k fusion is off */
 } radix_phase2_ctx_t;
 
 static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -5746,6 +5787,10 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     uint16_t estride = c->layout.entry_stride;
 
     for (int64_t p = start; p < end; p++) {
+        /* Before any `continue`: a partition that produces no HT produces no
+         * top-k candidates (and this run may be re-using a stash a bailed v2
+         * attempt already wrote into). */
+        if (c->fuse.items) c->fuse.item_cnt[p] = 0;
         uint32_t total = 0;
         for (uint32_t w = 0; w < c->n_workers; w++)
             total += c->bufs[(size_t)w * c->n_parts + p].count;
@@ -5772,6 +5817,11 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             group_rows_indirect(&c->part_hts[p], c->key_types,
                                 buf->data, buf->count, estride);
         }
+        /* Partition complete (every worker's entries folded in, so the
+         * ordering agg's row slot is final) and still cache-hot: run its
+         * top-k here instead of re-reading the rows from DRAM later. */
+        if (c->fuse.items)
+            topn_fuse_partition(&c->fuse, &c->part_hts[p], (uint32_t)p);
     }
 }
 
@@ -6254,6 +6304,7 @@ typedef struct {
     ght_layout_t  layout;
     void**        key_data;
     const void**  key_pool;    /* [n_keys] str-pool base per wide STR key */
+    topn_fuse_t   fuse;        /* .items NULL when top-k fusion is off */
     _Atomic(int)  oom;
 } radix_v2_phase2_ctx_t;
 
@@ -6264,6 +6315,8 @@ static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
     uint16_t row_stride = c->layout.row_stride;
     for (int64_t p = start; p < end; p++) {
+        /* Cleared before any `continue`/`return` below — see topn_fuse_t. */
+        if (c->fuse.items) c->fuse.item_cnt[p] = 0;
         /* Upper bound on the merged partition: sum of worker grp_counts
          * (some keys may be present in multiple workers — the merge will
          * fold those, so the final grp_count is ≤ this sum). */
@@ -6301,6 +6354,10 @@ static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
                 }
             }
         }
+        /* Merge for this partition is complete (count/sum slots final) and
+         * the rows are cache-hot — same fused top-k as the fat-entry path. */
+        if (c->fuse.items)
+            topn_fuse_partition(&c->fuse, &c->part_hts[p], (uint32_t)p);
     }
 }
 
@@ -12718,6 +12775,97 @@ ht_path:;
     uint32_t* part_offsets = NULL;
     ray_t* group_out_hdr = NULL;
     uint32_t* group_out = NULL;
+    ray_t* topn_fuse_hdr = NULL;
+    ray_t* topn_fuse_cnt_hdr = NULL;
+    topn_fuse_t topn_fuse = {0};
+
+    /* ---- top-N ordering-agg resolution, hoisted above the parallel section.
+     * Phase 2 now runs each partition's top-k itself, while the partition is
+     * cache-hot (topn_fuse_partition), so the in-row offset of the ordering
+     * agg and the direction have to be known at DISPATCH time rather than
+     * derived after phase 2.  The v2_emit compaction below consumes exactly
+     * these values, so the fused and standalone scans cannot drift apart.
+     *
+     * topn_order_ok == false means the shape is not servable by the int64
+     * row-slot comparison (F64-output agg, SYM MIN/MAX, no value slot) — the
+     * whole compaction is skipped, exactly as the in-place `goto
+     * topn_compact_skip` did before. */
+    uint16_t topn_order_off = 0;   /* default: COUNT at row + 0 */
+    uint8_t  topn_desc_dir  = 0;
+    bool     topn_order_ok  = false;
+    if (use_topn_filter) {
+        /* F64 agg outputs would have to compare by bitcast — for IEEE 754
+         * that only preserves order for finite positive values, so they are
+         * excluded (COUNT is always I64, and SUM/MIN/MAX over an integer
+         * column keep an I64 slot; GHT_AF_F64 marks the SUM-over-F64 case). */
+        uint16_t order_op = emit_filter.agg_op ? emit_filter.agg_op
+                                               : (uint16_t)OP_COUNT;
+        uint8_t  ai = emit_filter.agg_index;   /* < n_aggs, see use_topn_filter */
+        bool order_is_f64 = (ght_layout.agg_flags[ai] & GHT_AF_F64) != 0;
+        int8_t agg_slot = ght_layout.agg_val_slot[ai];
+        topn_order_ok = true;
+        if (order_op == OP_SUM) {
+            if (agg_slot < 0 || order_is_f64) topn_order_ok = false;
+            else topn_order_off = (uint16_t)(ght_layout.off_sum
+                                             + (uint16_t)agg_slot * 8u);
+        } else if (order_op == OP_MIN) {
+            if (agg_slot < 0 || order_is_f64
+                || (ght_layout.agg_flags[ai] & GHT_AF_SYM)) topn_order_ok = false;
+            else topn_order_off = (uint16_t)(ght_layout.off_min
+                                             + (uint16_t)agg_slot * 8u);
+        } else if (order_op == OP_MAX) {
+            if (agg_slot < 0 || order_is_f64
+                || (ght_layout.agg_flags[ai] & GHT_AF_SYM)) topn_order_ok = false;
+            else topn_order_off = (uint16_t)(ght_layout.off_max
+                                             + (uint16_t)agg_slot * 8u);
+        }
+        /* COUNT defaults to desc when the filter struct's desc bit isn't set
+         * (old single-bit filter shape); query.c sets it explicitly. */
+        topn_desc_dir = emit_filter.desc ? 1 : 0;
+        if (order_op == OP_COUNT && !emit_filter.desc) topn_desc_dir = 1;
+    }
+
+    /* Admit the fused per-partition top-k: stash n_parts x k_take candidates,
+     * filled by phase 2 and consumed by the v2_emit merge below.
+     *
+     * The standalone pre-pass sizes its staging from the ACTUAL group counts
+     * and admits it only as a real reduction (<= an eighth of the groups).
+     * Fusion has to commit before any group exists, so the same test is made
+     * against the row count that bounds them: groups <= scattered rows, so
+     * n_parts * k_take <= radix_rows / 8 keeps the stash under 2 bytes per
+     * scattered row — against the >= 16 bytes per row phase 1's fat entries
+     * (or the v2 worker HTs) already hold, peak memory cannot move.  Failing
+     * that test, or a single worker/partition, or allocation failure, leaves
+     * .items NULL and the unchanged post-phase-2 scan runs. */
+    if (use_topn_filter && topn_order_ok && pool && n_total > 1 &&
+        radix_n_parts > 1 && emit_filter.top_count_take > 0) {
+        uint64_t kt  = (uint64_t)emit_filter.top_count_take;
+        uint64_t tot = (uint64_t)radix_n_parts * kt;
+        if (kt <= UINT32_MAX && tot <= (uint64_t)radix_rows / 8 &&
+            tot <= UINT32_MAX && tot <= SIZE_MAX / sizeof(group_topn_item_t)) {
+            /* CALLOC, not alloc: item_cnt[] is written only by a phase-2 task,
+             * and ray_pool_dispatch_n drains its tickets WITHOUT running fn
+             * when the pool is cancelled — every entry must then read as a
+             * well-defined 0, not stack garbage that would send the merge off
+             * the end of items[]. */
+            uint32_t* fcnt = (uint32_t*)scratch_calloc(&topn_fuse_cnt_hdr,
+                (size_t)radix_n_parts * sizeof(uint32_t));
+            group_topn_item_t* fit = fcnt
+                ? (group_topn_item_t*)scratch_alloc(&topn_fuse_hdr,
+                    (size_t)tot * sizeof(group_topn_item_t))
+                : NULL;
+            if (fit) {
+                topn_fuse.items     = fit;
+                topn_fuse.item_cnt  = fcnt;
+                topn_fuse.cap       = (uint32_t)kt;
+                topn_fuse.order_off = topn_order_off;
+                topn_fuse.desc_dir  = topn_desc_dir;
+            } else if (fcnt) {
+                scratch_free(topn_fuse_cnt_hdr);
+                topn_fuse_cnt_hdr = NULL;
+            }
+        }
+    }
 
     /* Top-N-by-count (`select … by … desc:c take:N`) is served by the
      * parallel radix_v2 path below: phase1/phase2 build per-partition HTs
@@ -12878,6 +13026,7 @@ ht_path:;
                 .n_workers = n_total,
                 .n_parts   = radix_n_parts,
                 .key_data  = key_data,
+                .fuse      = topn_fuse,
                 .oom       = 0,
             };
             ght_layout_copy(&v2p2.layout, &ght_layout);
@@ -12998,6 +13147,7 @@ v2_done:;
             .bufs        = radix_bufs,
             .part_hts    = part_hts,
             .key_data    = key_data,
+            .fuse        = topn_fuse,
         };
         ght_layout_copy(&p2ctx.layout, &ght_layout);
         /* Wide-key str-pool table: phase2 copies each into its part_hts (whose
@@ -13050,48 +13200,14 @@ v2_emit:;
             uint64_t total_pre = 0;
             for (uint32_t p = 0; p < radix_n_parts; p++)
                 total_pre += part_hts[p].grp_count;
-            /* Resolve the in-row offset of the order-by agg's value.  For
-             * COUNT it's the leading int64 at offset 0; for SUM/MIN/MAX
-             * it's the per-slot int64 in off_sum/off_min/off_max.  F64
-             * agg outputs (sum over an F64 column) compare by bitcast —
-             * for IEEE 754 the bit pattern preserves ordering for finite
-             * positive values; mixed-sign and NaN cases drop the heap
-             * back to a wider comparator.  To stay correct we exclude
-             * F64-output aggs from this fast path (the COUNT count is
-             * always I64, and SUM/MIN/MAX over an integer column keep
-             * an I64 slot — agg_is_f64 marks the SUM-over-F64 case). */
-            uint16_t order_op = emit_filter.agg_op
-                ? emit_filter.agg_op
-                : (uint16_t)OP_COUNT;
-            uint8_t  agg_index_local = emit_filter.agg_index;
-            uint16_t order_off = 0;  /* default: COUNT at row+0 */
-            bool order_is_f64 = false;
-            if (agg_index_local < n_aggs &&
-                (ght_layout.agg_flags[agg_index_local] & GHT_AF_F64))
-                order_is_f64 = true;
-            int8_t agg_slot = ght_layout.agg_val_slot[agg_index_local];
-            if (order_op == OP_SUM) {
-                if (agg_slot < 0 || order_is_f64) goto topn_compact_skip;
-                order_off = (uint16_t)(ght_layout.off_sum
-                                       + (uint16_t)agg_slot * 8u);
-            } else if (order_op == OP_MIN) {
-                if (agg_slot < 0 || order_is_f64) goto topn_compact_skip;
-                if (ght_layout.agg_flags[agg_index_local] & GHT_AF_SYM)
-                    goto topn_compact_skip;
-                order_off = (uint16_t)(ght_layout.off_min
-                                       + (uint16_t)agg_slot * 8u);
-            } else if (order_op == OP_MAX) {
-                if (agg_slot < 0 || order_is_f64) goto topn_compact_skip;
-                if (ght_layout.agg_flags[agg_index_local] & GHT_AF_SYM)
-                    goto topn_compact_skip;
-                order_off = (uint16_t)(ght_layout.off_max
-                                       + (uint16_t)agg_slot * 8u);
-            }
-            uint8_t desc_dir = emit_filter.desc ? 1 : 0;
-            /* COUNT defaults to desc when the filter struct's desc bit
-             * isn't set (old single-bit filter shape).  Producer code in
-             * query.c sets it explicitly. */
-            if (order_op == OP_COUNT && !emit_filter.desc) desc_dir = 1;
+            /* The in-row offset of the order-by agg's value and the sort
+             * direction are resolved ONCE, above the parallel section (search
+             * topn_order_off), because phase 2 needs them at dispatch time to
+             * run the fused per-partition scan.  !topn_order_ok = a shape the
+             * int64 row-slot comparison cannot serve. */
+            if (!topn_order_ok) goto topn_compact_skip;
+            uint16_t order_off = topn_order_off;
+            uint8_t  desc_dir  = topn_desc_dir;
             if (total_pre > (uint64_t)k_take && k_take > 0 &&
                 (uint64_t)k_take <= SIZE_MAX / sizeof(group_topn_item_t)) {
                 /* The heap is sized by the requested result cardinality.
@@ -13104,21 +13220,44 @@ v2_emit:;
                 if (!heap) goto topn_compact_skip;
                 int64_t hn = 0;
 
-                /* Parallel pre-pass (topn_scan_fn): reduce each partition to
-                 * its own top-k, then merge the survivors here.  Admitted only
-                 * when the staging array is a real REDUCTION — at most an
-                 * eighth of the groups, i.e. under 2 bytes per group against
-                 * the >= 24-byte group rows already resident, so peak memory
-                 * cannot move.  Otherwise the pre-pass would do the serial
-                 * scan's work plus a copy, and the serial scan below is used
-                 * unchanged (it is also the fallback for allocation failure,
-                 * a single worker and a single partition). */
+                /* Each partition is reduced to its own <= k_take candidates
+                 * and only those are merged here.  Three sources, in
+                 * preference order:
+                 *
+                 *  1. FUSED — phase 2 already ran the scan at the end of the
+                 *     task that built each partition, while its rows were
+                 *     cache-hot.  Nothing to dispatch: the candidates are in
+                 *     topn_fuse, at a uniform k_take stride per partition.
+                 *  2. the standalone topn_scan_fn pre-pass, admitted when the
+                 *     staging array is a real REDUCTION — at most an eighth of
+                 *     the groups, i.e. under 2 bytes per group against the
+                 *     >= 24-byte group rows already resident, so peak memory
+                 *     cannot move.  (Fusion could not make this test: it must
+                 *     commit before any group exists, so it makes the
+                 *     equivalent one against the row count — see topn_fuse.)
+                 *  3. the serial scan below — one worker, one partition,
+                 *     allocation failure, or a staging array that would not
+                 *     reduce.
+                 *
+                 * All three feed the same heap in the same (partition asc,
+                 * gid asc) order, so they retain the same set. */
                 ray_t* stage_hdr = NULL;
                 ray_t* item_hdr = NULL;
-                uint32_t* item_off = NULL;
-                group_topn_item_t* items = NULL;
+                const uint32_t* item_off = NULL;  /* NULL => uniform stride */
+                const uint32_t* item_cnt = NULL;
+                const group_topn_item_t* items = NULL;
                 bool scanned = false;
-                if (pool && n_total > 1 && radix_n_parts > 1 &&
+                if (topn_fuse.items) {
+                    /* The cancel bail that guards this stash is the
+                     * CHECK_CANCEL_GOTO right after the phase-2 dispatch that
+                     * fills it; a drained dispatch never reaches here.  Even
+                     * so item_cnt is calloc'd and each task zeroes its own
+                     * entry before any early `continue`, so a partition with
+                     * no task contributes nothing rather than garbage. */
+                    items    = topn_fuse.items;
+                    item_cnt = topn_fuse.item_cnt;
+                    scanned  = true;
+                } else if (pool && n_total > 1 && radix_n_parts > 1 &&
                     (size_t)radix_n_parts + 1 <= SIZE_MAX / sizeof(uint32_t) / 2) {
                     /* Per-partition capacity: at most k_take (a partition can
                      * contribute no more than that to the global top-k), and
@@ -13139,26 +13278,29 @@ v2_emit:;
                          * tickets WITHOUT running fn — every entry must then
                          * read as a well-defined 0, not stack garbage that
                          * would send the merge off the end of items[]. */
-                        item_off = (uint32_t*)scratch_calloc(&stage_hdr,
+                        uint32_t* off_w = (uint32_t*)scratch_calloc(&stage_hdr,
                             ((size_t)radix_n_parts * 2 + 1) * sizeof(uint32_t));
-                        items = item_off
+                        group_topn_item_t* items_w = off_w
                             ? (group_topn_item_t*)scratch_alloc(&item_hdr,
                                 (size_t)tot * sizeof(group_topn_item_t))
                             : NULL;
-                        if (items) {
-                            uint32_t* item_cnt = item_off + radix_n_parts + 1;
+                        if (items_w) {
+                            uint32_t* cnt_w = off_w + radix_n_parts + 1;
                             uint32_t run = 0;
                             for (uint32_t p = 0; p < radix_n_parts; p++) {
                                 uint64_t gc = part_hts[p].grp_count;
-                                item_off[p] = run;
+                                off_w[p] = run;
                                 /* Same cap as the sizing pass above; the sum
                                  * is `tot`, already checked <= UINT32_MAX. */
                                 run += (uint32_t)(gc < kcap ? gc : kcap);
                             }
-                            item_off[radix_n_parts] = run;
+                            off_w[radix_n_parts] = run;
+                            items = items_w;
+                            item_off = off_w;
+                            item_cnt = cnt_w;
                             topn_scan_ctx_t sctx = {
-                                .part_hts = part_hts, .items = items,
-                                .item_off = item_off, .item_cnt = item_cnt,
+                                .part_hts = part_hts, .items = items_w,
+                                .item_off = off_w, .item_cnt = cnt_w,
                                 .order_off = order_off, .desc_dir = desc_dir,
                             };
                             ray_pool_dispatch_n(pool, topn_scan_fn, &sctx,
@@ -13177,18 +13319,28 @@ v2_emit:;
                                 result = ray_error("cancel", NULL);
                                 goto cleanup;
                             }
-                            for (uint32_t p = 0; p < radix_n_parts; p++) {
-                                const group_topn_item_t* h = items + item_off[p];
-                                uint32_t n = item_cnt[p];
-                                for (uint32_t i = 0; i < n; i++)
-                                    hn = topn_heap_push(heap, hn, k_take,
-                                                        desc_dir, h[i].value,
-                                                        h[i].part, h[i].gid);
-                            }
                             scanned = true;
                         }
                     }
                 }
+
+                /* Merge the per-partition survivors: partitions ascending,
+                 * gid ascending within one — the serial scan's push order,
+                 * which is what makes the retained set identical (condition
+                 * (2) of the topn_heap_push proof).  `item_off` is the
+                 * standalone pre-pass's packed layout; the fused stash uses a
+                 * uniform k_take stride instead. */
+                if (scanned)
+                    for (uint32_t p = 0; p < radix_n_parts; p++) {
+                        const group_topn_item_t* h = items
+                            + (item_off ? (size_t)item_off[p]
+                                        : (size_t)p * topn_fuse.cap);
+                        uint32_t n = item_cnt[p];
+                        for (uint32_t i = 0; i < n; i++)
+                            hn = topn_heap_push(heap, hn, k_take, desc_dir,
+                                                h[i].value, h[i].part,
+                                                h[i].gid);
+                    }
                 scratch_free(item_hdr);
                 scratch_free(stage_hdr);
 
@@ -14376,6 +14528,8 @@ cleanup:
     }
     scratch_free(part_offsets_hdr);
     scratch_free(group_out_hdr);
+    scratch_free(topn_fuse_hdr);
+    scratch_free(topn_fuse_cnt_hdr);
     /* Master layout owns any spill block; every by-value copy borrowed it.
      * cleanup: is reached only after ght_layout is initialised (all gotos to
      * it are below the ght_compute_layout call).  NULL-safe / no-op inline. */
