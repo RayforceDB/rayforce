@@ -62,11 +62,22 @@ static inline bool floor_idiv_i64_checked(int64_t a, int64_t b, int64_t* out) {
  * lies far outside it, so a null in the span also falls to the exact kernel
  * (which is where nulls are handled anyway). */
 #define DBL_EXACT_INT_LIM (0x1p53) /* 2^53 as a double bound */
+static inline bool i64_dbl_exact(int64_t v) {
+    return v <= (int64_t)DBL_EXACT_INT_LIM && v >= -(int64_t)DBL_EXACT_INT_LIM;
+}
+/* Gate scans are branchless accumulations rather than early-exit loops: the
+ * gate is paid on every morsel, so the passing (common) case — which reads the
+ * whole span regardless — must stay auto-vectorized. */
 static inline bool i64_span_dbl_exact(const int64_t* v, int64_t n) {
-    for (int64_t i = 0; i < n; i++)
-        if (v[i] > (int64_t)DBL_EXACT_INT_LIM || v[i] < -(int64_t)DBL_EXACT_INT_LIM)
-            return false;
-    return true;
+    int bad = 0;
+    for (int64_t i = 0; i < n; i++) bad |= !i64_dbl_exact(v[i]);
+    return !bad;
+}
+/* Both operands in one pass — one traversal, two streams. */
+static inline bool i64_span2_dbl_exact(const int64_t* a, const int64_t* b, int64_t n) {
+    int bad = 0;
+    for (int64_t i = 0; i < n; i++) bad |= !i64_dbl_exact(a[i]) | !i64_dbl_exact(b[i]);
+    return !bad;
 }
 
 static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* out_is_f64) {
@@ -1113,7 +1124,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                      * both null-free AND within ±2^53 → the vectorizable double
                      * kernel is exact (divisor==0 still yields NULL_I64).  Any
                      * null or large magnitude falls to the exact scalar kernel. */
-                    if (i64_span_dbl_exact(a, n) && i64_span_dbl_exact(b, n)) {
+                    if (i64_span2_dbl_exact(a, b, n)) {
                         for (int64_t j=0;j<n;j++)
                             d[j] = b[j] != 0 ? (int64_t)floor((double)a[j] / (double)b[j]) : NULL_I64;
                     } else {
@@ -1148,7 +1159,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                 case OP_IDIV:
                     /* Whole morsel within ±2^53 → the vectorizable double kernel
                      * (bit-exact there); otherwise the exact scalar int64 kernel. */
-                    if (i64_span_dbl_exact(a, n) && i64_span_dbl_exact(b, n)) {
+                    if (i64_span2_dbl_exact(a, b, n)) {
                         for (int64_t j = 0; j < n; j++)
                             d[j] = b[j] != 0 ? (int64_t)floor((double)a[j] / (double)b[j]) : 0;
                     } else {
@@ -3170,14 +3181,38 @@ static void binary_range(ray_op_t* op, int8_t out_type,
      * exact scalar int64 kernel is only paid for genuinely large magnitudes and
      * the common small-value case stays on the vectorizable double kernel. */
     bool idiv_i64_small = false;
+    /* Set when the I64 arm carries the gate inside its own divide loop and the
+     * pre-pass above was skipped entirely — see `case OP_IDIV` there. */
+    bool idiv_i64_inline_gate = false;
     if (src_is_i64_all && op->opcode == OP_IDIV) {
-        idiv_i64_small = true;
-        for (int64_t i = 0; i < n; i++) {
-            int64_t lv = LV_READ_I64(i), rv = RV_READ_I64(i);
-            if (lv > (int64_t)DBL_EXACT_INT_LIM || lv < -(int64_t)DBL_EXACT_INT_LIM ||
-                rv > (int64_t)DBL_EXACT_INT_LIM || rv < -(int64_t)DBL_EXACT_INT_LIM) {
-                idiv_i64_small = false; break;
-            }
+        /* Gate scan plumbing — per-element cost only where it is unavoidable:
+         *  - a broadcast scalar operand holds ONE value, so it is checked once
+         *    here instead of re-read n times through the LV/RV_READ_I64 chain;
+         *  - a narrow vector (I32/U32/I16/BOOL/U8) cannot leave ±2^53 by
+         *    construction — no scan at all;
+         *  - an I64 vector is scanned through its typed data pointer, and when
+         *    both sides are I64 vectors the two scans share one pass;
+         *  - for the hot I64-output shapes the scan is not a pre-pass at all:
+         *    the I64 arm folds it into the divide loop, so the column is read
+         *    once instead of twice (a second streaming pass over a 20 M-row
+         *    column is DRAM-bound and was the bulk of #403's `(div col k)`
+         *    regression).
+         * Every variant decides exactly the same predicate. */
+        const int64_t* lscan = lp_i64;
+        const int64_t* rscan = rp_i64;
+        bool l_vec = lscan || lp_i32 || lp_u32 || lp_i16 || lp_bool;
+        bool r_vec = rscan || rp_i32 || rp_u32 || rp_i16 || rp_bool;
+        idiv_i64_small = (l_vec || i64_dbl_exact(l_i64)) &&
+                         (r_vec || i64_dbl_exact(r_i64));
+        /* I64 column ÷ (I64 column | broadcast int scalar), I64 output: the
+         * scalar side (if any) is already decided by the check above, so the
+         * only per-element work left rides along in the divide loop. */
+        idiv_i64_inline_gate = idiv_i64_small && lscan && (rscan || !r_vec) &&
+                               (out_type == RAY_I64 || out_type == RAY_TIMESTAMP);
+        if (idiv_i64_small && !idiv_i64_inline_gate) {
+            if (lscan && rscan)   idiv_i64_small = i64_span2_dbl_exact(lscan, rscan, n);
+            else if (lscan)       idiv_i64_small = i64_span_dbl_exact(lscan, n);
+            else if (rscan)       idiv_i64_small = i64_span_dbl_exact(rscan, n);
         }
     }
 
@@ -3242,7 +3277,34 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li*(uint64_t)ri);}break;
             case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}break;
             case OP_IDIV:
-                if (src_is_i64_all && !idiv_i64_small) {
+                if (idiv_i64_inline_gate) {
+                    /* Gate rides inside the divide loop: each element is read
+                     * once, range-checked in-register, and divided by the
+                     * vectorizable double kernel.  If any element (or a null,
+                     * which is INT64_MIN and therefore out of range) failed the
+                     * check, the whole range is recomputed by the exact int64
+                     * kernel — the same all-or-nothing decision the pre-pass
+                     * gate makes, without the extra streaming pass. */
+                    int bad = 0;
+                    if (rp_i64) {
+                        const int64_t* lv = lp_i64; const int64_t* rv = rp_i64;
+                        for (int64_t i=0;i<n;i++) {
+                            int64_t li=lv[i], ri=rv[i];
+                            bad |= !i64_dbl_exact(li) | !i64_dbl_exact(ri);
+                            odst[i] = ri!=0 ? ray_cast_f64_to_i64_null(floor((double)li/(double)ri)) : 0;
+                        }
+                    } else {
+                        /* broadcast scalar divisor: range-checked once already */
+                        const int64_t* lv = lp_i64; double rd = (double)r_i64;
+                        for (int64_t i=0;i<n;i++) {
+                            int64_t li=lv[i];
+                            bad |= !i64_dbl_exact(li);
+                            odst[i] = r_i64!=0 ? ray_cast_f64_to_i64_null(floor((double)li/rd)) : 0;
+                        }
+                    }
+                    if (bad)
+                        for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}
+                } else if (src_is_i64_all && !idiv_i64_small) {
                     for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}
                 } else {
                     for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i64_null(floor(lv/rv)):0;}

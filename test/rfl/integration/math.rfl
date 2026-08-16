@@ -2530,3 +2530,20 @@
 (div (as 'I16 [100 55 -7]) (as 'I16 [7 8 2])) -- (as 'I16 [14 6 -4])
 (set TdivN (table [a b] (list (as 'I16 [100 55 6]) (as 'I16 [7 0 2]))))
 (at (select {q: (div a b) from: TdivN}) 'q) -- (as 'I16 [14 0 3])
+
+;; ── #403 follow-up: the ±2^53 gate rides inside the I64 divide loop for
+;;    `I64 column ÷ (I64 column | int scalar)`, so the column is read once
+;;    instead of twice.  Same all-or-nothing decision: one out-of-range value
+;;    (or a null, which is INT64_MIN) sends the whole range to the exact
+;;    kernel.  These pin fast lane, redo lane, and the scalar-divisor lane. ──
+(set TdivGate (table [a b] (list [10 -10 9007199254740993 0Nl] [3 3 7 3])))
+(at (select {q: (div a b) from: TdivGate}) 'q) -- [3 -4 1286742750677284 0Nl]
+(at (select {q: (div a 3) from: TdivGate}) 'q) -- [3 -4 3002399751580331 0Nl]
+(at (select {q: (div a 9007199254740993) from: TdivGate}) 'q) -- [0 -1 1 0Nl]
+;; all-small column keeps the fast lane (identical results either way)
+(set TdivGateS (table [a b] (list [10 -10 20 -21] [3 3 7 4])))
+(at (select {q: (div a b) from: TdivGateS}) 'q) -- [3 -4 2 -6]
+(at (select {q: (div a 3) from: TdivGateS}) 'q) -- [3 -4 6 -7]
+(at (select {q: (div a 0) from: TdivGateS}) 'q) -- [0Nl 0Nl 0Nl 0Nl]
+;; broadcast scalar past ±2^53 with an in-range column: exact kernel, no rescan
+(at (select {q: (div a -9007199254740993) from: TdivGateS}) 'q) -- [-1 0 -1 0]
