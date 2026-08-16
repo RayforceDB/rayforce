@@ -3734,6 +3734,7 @@ static bool group_ht_init_sized(group_ht_t* ht, uint32_t cap,
                                  const ght_layout_t* ly, uint32_t init_grp_cap) {
     ht->ht_cap = cap;
     ht->oom = 0;
+    ht->grow_cap = 0;   /* callers that know a bound set it right after init */
     /* By-value embed: re-point the layout's bases at this HT's own inline
      * arrays (inline src) or borrow the shared spill (wide src).  The source
      * layout (owned by the caller's exec_group/pivot master) outlives this HT. */
@@ -3812,6 +3813,10 @@ void group_ht_free(group_ht_t* ht) {
 static bool group_ht_grow(group_ht_t* ht) {
     uint32_t old_cap = ht->grp_cap;
     uint32_t new_cap = old_cap * 2;
+    /* Row array tracks the slot array at the 50% rehash load factor, so a
+     * slot-count target implies a row-count target of half that. */
+    uint32_t row_tgt = ht->grow_cap >> 1;
+    if (row_tgt > new_cap) new_cap = row_tgt;
     uint16_t rs = ht->layout.row_stride;
     char* new_rows = (char*)scratch_realloc(
         &ht->_h_rows, (size_t)old_cap * rs, (size_t)new_cap * rs);
@@ -4152,6 +4157,10 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
 
 static void group_ht_rehash(group_ht_t* ht, const int8_t* key_types) {
     uint32_t new_cap = ht->ht_cap * 2;
+    /* Jump straight to the caller's bound when it exceeds the next rung (see
+     * group_ht_t.grow_cap): each intermediate rung re-hashes and re-inserts
+     * every live group for nothing. */
+    if (ht->grow_cap > new_cap) new_cap = ht->grow_cap;
     ray_t* new_h = NULL;
     uint32_t* new_slots = (uint32_t*)scratch_alloc(&new_h, (size_t)new_cap * sizeof(uint32_t));
     if (!new_slots) return; /* OOM: keep old HT, it still works (just slower) */
@@ -5735,8 +5744,53 @@ typedef struct {
                                       * (ClickBench q32); empty pairs still
                                       * allocate nothing. */
     uint32_t       ht_init_block;    /* row-block granularity for the same */
+    uint32_t       ht_grow_cap;      /* slot-count target on first growth —
+                                      * see group_ht_t.grow_cap */
     _Atomic(int)   oom;
 } radix_v2_phase1_ctx_t;
+
+/* Pack one row's aggregate input values into the entry's agg-value slots.
+ * Shared by radix_v2_phase1_fn's morsel-staged and row-major builders so the
+ * two cannot drift; slot indices come from the layout (agg_val_slot), never a
+ * running counter.  Mirrors radix_phase1_pack_aggs, but tolerates a NULL
+ * agg_vecs table (pure-COUNT layouts carry none). */
+static inline void radix_v2_pack_aggs(const radix_v2_phase1_ctx_t* c,
+                                      const ght_layout_t* ly,
+                                      int64_t* ev, int64_t row) {
+    const uint8_t* const aflags = ly->agg_flags;
+    uint16_t na = ly->n_aggs;
+    for (uint32_t a = 0; a < na; a++) {
+        uint8_t af = aflags[a];
+        int8_t vs = ly->agg_val_slot[a];
+        if (vs < 0) continue;   /* holistic / valueless OP_COUNT */
+        uint8_t vi = (uint8_t)vs;
+        ray_t* ac = c->agg_vecs ? c->agg_vecs[a] : NULL;
+        if (!ac) continue;
+        if (c->agg_strlen && c->agg_strlen[a])
+            ev[vi] = group_strlen_at(ac, row);
+        else if (af & GHT_AF_F64) {
+            double v = group_fp_type(ac->type)
+                ? group_fp_at(ray_data(ac), ac->type, row)
+                : group_pack_i64_as_f64(ac, row);
+            memcpy(&ev[vi], &v, sizeof(v));
+        }
+        else
+            ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+        vi++;
+        if ((af & GHT_AF_BINARY) && c->agg_vecs2 && c->agg_vecs2[a]) {
+            ray_t* ay = c->agg_vecs2[a];
+            if (af & GHT_AF_F64) {
+                double v = group_fp_type(ay->type)
+                    ? group_fp_at(ray_data(ay), ay->type, row)
+                    : group_pack_i64_as_f64(ay, row);
+                memcpy(&ev[vi], &v, sizeof(v));
+            }
+            else
+                ev[vi] = group_pack_y_i64(ay, row);
+            vi++;
+        }
+    }
+}
 
 static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                                int64_t start, int64_t end) {
@@ -5745,7 +5799,6 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
     const ght_layout_t* ly = &c->layout;
     uint16_t nk = ly->n_keys;
     const uint8_t* const kflags = ly->key_flags;
-    const uint8_t* const aflags = ly->agg_flags;
     uint8_t wide_any = ly->any_wide_key;
     uint8_t inline_str = ly->any_inline_str;
     uint8_t nullable = c->nullable_mask;
@@ -5787,10 +5840,17 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
      * merge are IDENTICAL to the generic loop below — iteration order
      * only; group ids and first_row (MIN) are order-independent.
      *
+     * Order-independence extends to the accumulators (COUNT/SUM/AVG, the
+     * only shapes the caller's v2 gate admits) because the counting sort is
+     * STABLE and a group lives entirely inside one partition: rows of the
+     * same group are visited in their original relative order, so even an
+     * f64 SUM accumulates in exactly the sequence the row-major loop uses.
+     * Only the interleaving BETWEEN partitions changes.
+     *
      * NOTE: "hashing is identical" is load-bearing and is enforced by the
      * v2_packed branch in the staging loop — see the comment there. */
     if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
-        ly->need_flags == 0 &&
+        (ly->need_flags & ~(uint32_t)GHT_NEED_SUM) == 0 &&
         !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
                                GHT_AF_HOLISTIC)) &&
         nk >= 1 && nk <= 2 && ly->entry_stride <= 64) {
@@ -5905,6 +5965,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                                               memory_order_relaxed);
                         goto v2_morsel_done;
                     }
+                    my_hts[p].grow_cap = c->ht_grow_cap;
                     masks[p] = my_hts[p].ht_cap - 1;
                 }
                 /* Prefetch the slot line V2MPF entries ahead WITHIN this
@@ -5924,6 +5985,12 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                 int64_t* ek = (int64_t*)(ebuf + 8);
                 for (uint32_t k = 0; k < nk; k++)
                     ek[k] = mk[(size_t)j * nk + k];
+                /* Agg inputs are read here, not staged, so the morsel arrays
+                 * stay the same size; the source row is mrow[j] and the reads
+                 * are identical to the row-major builder's. */
+                if (ly->need_flags)
+                    radix_v2_pack_aggs(c, ly,
+                        (int64_t*)(ebuf + 8 + (size_t)ly->key_region), mrow[j]);
                 memcpy(ebuf + ly->entry_stride - 8, &mrow[j], 8);
                 masks[p] = group_probe_entry(&my_hts[p], ebuf,
                                              c->key_types, masks[p]);
@@ -6002,41 +6069,9 @@ v2_morsel_done:
          * reads them.  For count-only need_flags == 0 and accum_from_entry
          * skips every agg slot; packing here would be a wasted column
          * read per row (a measurable regression on q15-class queries). */
-        if (ly->need_flags) {
-            int64_t* ev = (int64_t*)(ebuf + 8 + (size_t)ly->key_region);
-            uint16_t na = ly->n_aggs;
-            for (uint32_t a = 0; a < na; a++) {
-                uint8_t af = aflags[a];
-                int8_t vs = ly->agg_val_slot[a];
-                if (vs < 0) continue;   /* holistic / valueless OP_COUNT */
-                uint8_t vi = (uint8_t)vs;
-                ray_t* ac = c->agg_vecs ? c->agg_vecs[a] : NULL;
-                if (!ac) continue;
-                if (c->agg_strlen && c->agg_strlen[a])
-                    ev[vi] = group_strlen_at(ac, row);
-                else if (af & GHT_AF_F64) {
-                    double v = group_fp_type(ac->type)
-                        ? group_fp_at(ray_data(ac), ac->type, row)
-                        : group_pack_i64_as_f64(ac, row);
-                    memcpy(&ev[vi], &v, sizeof(v));
-                }
-                else
-                    ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
-                vi++;
-                if ((af & GHT_AF_BINARY) && c->agg_vecs2 && c->agg_vecs2[a]) {
-                    ray_t* ay = c->agg_vecs2[a];
-                    if (af & GHT_AF_F64) {
-                        double v = group_fp_type(ay->type)
-                            ? group_fp_at(ray_data(ay), ay->type, row)
-                            : group_pack_i64_as_f64(ay, row);
-                        memcpy(&ev[vi], &v, sizeof(v));
-                    }
-                    else
-                        ev[vi] = group_pack_y_i64(ay, row);
-                    vi++;
-                }
-            }
-        }
+        if (ly->need_flags)
+            radix_v2_pack_aggs(c, ly,
+                               (int64_t*)(ebuf + 8 + (size_t)ly->key_region), row);
         memcpy(ebuf + ly->entry_stride - 8, &row, 8);
         uint32_t p = group_radix_part(h, c->n_parts);
         if (!my_hts[p].slots) {
@@ -6048,6 +6083,7 @@ v2_morsel_done:
                 atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
                 break;
             }
+            my_hts[p].grow_cap = c->ht_grow_cap;
             if (wide_any && c->key_data) {
                 group_ht_set_key_data(&my_hts[p], c->key_data);
                 group_ht_set_key_pool(&my_hts[p], c->key_vecs);
@@ -12644,6 +12680,16 @@ ht_path:;
                             / ((uint64_t)n_total * radix_n_parts) + 1;
             uint32_t v2_cap = 2;
             while (v2_cap < v2_exp && v2_cap < 256) v2_cap <<= 1;
+            /* Growth target for a worker HT that outgrows v2_cap: at the 50%
+             * rehash load factor a table expecting v2_exp rows needs 2*v2_exp
+             * slots, and v2_exp is already the per-(worker,partition) row
+             * budget computed above — no new tunable.  Sizing the FIRST
+             * allocation this way would over-allocate every mid-cardinality
+             * shape (most (worker,partition) tables never approach v2_exp
+             * distinct keys); applying it at the first growth spends it only
+             * on tables that have demonstrably gone near-unique. */
+            uint32_t v2_grow = 2;
+            while (v2_grow < 2 * v2_exp && v2_grow < (1u << 24)) v2_grow <<= 1;
             radix_v2_phase1_ctx_t v2p1 = {
                 .key_data      = key_data,
                 .key_types     = key_types,
@@ -12660,6 +12706,7 @@ ht_path:;
                 .match_idx     = sel_match,
                 .ht_init_cap   = v2_cap,
                 .ht_init_block = v2_cap > 2 ? v2_cap / 2 : 1,
+                .ht_grow_cap   = v2_grow,
                 .oom           = 0,
             };
             /* By-value embed the layout, fixing its base pointers to v2p1's

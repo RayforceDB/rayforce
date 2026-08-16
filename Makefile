@@ -50,8 +50,16 @@ RAY_MARCH ?= native
 DEBUG_CFLAGS   = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=$(RAY_MARCH) -DDEBUG \
   -fsanitize=address,undefined -fno-omit-frame-pointer
 RELEASE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) \
-  -funroll-loops -fomit-frame-pointer -fno-math-errno \
+  -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
   -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math
+# -falign-functions=64: start every function on a cache line.  The default
+#   16-byte alignment makes hot leaf functions' cost depend on where unrelated
+#   edits elsewhere in the same translation unit happen to push them —
+#   measured as a reproducible 14% swing on ClickBench q33/q34
+#   (exec_group_sp_dyn_emit, ~45% of those queries) from an edit that path
+#   never executes.  That noise floor is larger than most real optimisations,
+#   so it hides regressions and manufactures phantom ones.  Costs a few KB of
+#   padding.
 # -fassociative-math: license to reorder FP additions/multiplications.
 #   Required for autovectorization of F64 reductions (sum/avg/dot).
 #   Without it, scalar_sum_f64_fn at group.c:1666 is a serial latency

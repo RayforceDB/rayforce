@@ -1374,6 +1374,15 @@ typedef struct {
     ray_t*        _h_slots;
     ray_t*        _h_rows;
     uint8_t       oom;        /* set by group_probe_entry on grow failure */
+    /* Optional one-shot growth target in SLOTS (0 = plain doubling).  A table
+     * only ever grows once it already holds ht_cap/2 groups, i.e. it has
+     * proven near-unique for its share of the input; when the caller knows a
+     * bound on how many rows this table can still receive, jumping straight to
+     * that bound skips the 2x ladder, every rung of which re-hashes and
+     * re-inserts every live group.  Idempotent (the jump is a max()), so once
+     * ht_cap reaches grow_cap the field stops having any effect.  Placed here
+     * to land in the existing tail padding — group_ht_t's size is unchanged. */
+    uint32_t      grow_cap;
 } group_ht_t;
 
 /* Row-level accessors for group HT rows */

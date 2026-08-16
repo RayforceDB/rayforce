@@ -22,6 +22,7 @@
 ;;   radix_phase1_fn    morsel stager     nk=3 nv=2                (BIGM)
 ;;   radix_phase1_fn    row-major packed  nullable, null_words=1   (BIGN)
 ;;   radix_v2_phase1_fn morsel  packed=1  (BIGP)   packed=0  (PKF)
+;;   radix_v2_phase1_fn morsel  need_flags=SUM, near-unique (BIGU)
 ;; The 300K cases at the bottom cover the sequential / direct-array entries
 ;; into the same layout.
 ;;
@@ -62,6 +63,36 @@
 (count (select {c: (count a) by: {a: a b: b} from: BIGP desc: c take: 10})) -- 10
 (count (select {c: (count a) by: {a: a b: b} from: BIGP})) -- 15000
 (sum (at (select {c: (count a) by: {a: a b: b} from: BIGP}) 'c)) -- 2500000
+
+;; ── 2-key packed tuple, NEAR-UNIQUE, count + sum + avg ───────────────────
+;; radix_v2_phase1_fn's partition-major morsel path used to be gated on
+;; `need_flags == 0` (count-only).  It now also serves COUNT/SUM/AVG, which
+;; are the only aggs the v2 pipeline admits at all, by reading the agg inputs
+;; at probe time from the staged source row.  Verified reached: nk=2,
+;; need_flags=GHT_NEED_SUM, entry_stride=48.
+;;
+;; The reorder is partition-major, but the counting sort is STABLE and a group
+;; lives entirely in one partition, so rows of a group are still visited in
+;; source order — an f64 SUM accumulates in exactly the old sequence.
+;;
+;; Near-unique on purpose (2499990 groups from 2500000 rows): every probe
+;; misses and inserts, so the worker HTs outgrow their first allocation.  That
+;; is also the only shape that exercises group_ht_t.grow_cap — verified to
+;; jump ht_cap 256 -> 1024 in one step here instead of climbing 256->512->1024
+;; and re-hashing every live group on each rung.
+;;
+;; `a` collides only for the ten values 0..9 (rows T and T+2499990, which share
+;; b since 2499990 is even), so `desc: c take: 10` selects exactly those ten
+;; groups.  Their ORDER within the tie block is not defined by the engine, so
+;; every take-10 assertion below is an order-independent aggregate of the ten.
+(set BIGU (table [a b v] (list (% T 2499990) (% T 2) T)))
+(count (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU})) -- 2499990
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU}) 'c)) -- 2500000
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU}) 's)) -- 3124998750000
+(count (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10})) -- 10
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10}) 'c)) -- 20
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10}) 'a)) -- 45
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10}) 's)) -- 24999990
 
 ;; ── 3-key mixed-width tuple + aggs around the valueless OP_COUNT ─────────
 ;; I64 + SYM + I16(negative) keys.  COUNT reserves no value slot, so sum/max
