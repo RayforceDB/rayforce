@@ -2073,6 +2073,7 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
 }
 
 static ray_t* query_materialize_parted_col(ray_t* col);
+static bool table_has_parted_columns(ray_t* tbl);
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * length-changing / reordering builtin (distinct, asc, desc, reverse) that
@@ -11510,6 +11511,35 @@ ray_t* ray_update(ray_t** args, int64_t n) {
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "update: `from:` must be a table, got %s", ray_type_name(tbl_t)); }
 
+    /* A parted table's data columns carry the RAY_PARTED_BASE wrapper type
+     * (which `ray_type_name` prints as "?"), and its partition key is
+     * RAY_MAPCOMMON.  The update machinery below reads the original column
+     * through `ray_vec_new(ct, ...)` / `ray_data(col)` / the per-group gather
+     * and type-check against the wrapper type, none of which understand the
+     * parted/segmented shape — so `(update {col: … from: partedT})` failed
+     * with `expression type I64 does not match ? column` (or the `by:` path
+     * with `group: argument must be a vector`).  `select` solves this by
+     * materialising parted columns on demand; replicate it here by flattening
+     * the whole table once so every branch below sees wrapped-free vectors. */
+    if (table_has_parted_columns(tbl)) {
+        ray_t* flat_tbl = ray_table_new(ray_table_ncols(tbl));
+        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { ray_release(tbl); return flat_tbl ? flat_tbl : ray_error("oom", NULL); }
+        int64_t nc = ray_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* col = ray_table_get_col_idx(tbl, c);
+            ray_t* flat_col = query_materialize_parted_col(col);
+            if (!flat_col || RAY_IS_ERR(flat_col)) {
+                ray_release(flat_tbl); ray_release(tbl);
+                return flat_col ? flat_col : ray_error("oom", NULL);
+            }
+            flat_tbl = ray_table_add_col(flat_tbl, ray_table_col_name(tbl, c), flat_col);
+            ray_release(flat_col);
+            if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { ray_release(tbl); return flat_tbl ? flat_tbl : ray_error("oom", NULL); }
+        }
+        ray_release(tbl);
+        tbl = flat_tbl;
+    }
+
     ray_t* where_expr = dict_get(dict, "where");
     ray_t* by_expr = dict_get(dict, "by");
 
@@ -11564,37 +11594,55 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             if (RAY_IS_ERR(groups)) { ray_release(tbl); DICT_VIEW_CLOSE(updv); return groups; }
         }
 
-        /* Start with a copy of the original table */
         int64_t ncols = ray_table_ncols(tbl);
-        ray_t* result = ray_table_new((int32_t)ncols);
-        if (RAY_IS_ERR(result)) { ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
-        for (int64_t c = 0; c < ncols; c++) {
-            int64_t cn = ray_table_col_name(tbl, c);
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            ray_retain(col);
-            result = ray_table_add_col(result, cn, col);
-            ray_release(col);
-            if (RAY_IS_ERR(result)) { ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
+        int64_t ngroups = groups->len / 2;
+        ray_t** gdata = (ray_t**)ray_data(groups);
+        if (!gdata) { ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("oom", NULL); }
+
+        int64_t n_updates = 0;
+        for (int64_t d = 0; d + 1 < dict_n; d += 2) {
+            int64_t kid = dict_elems[d]->i64;
+            if (kid == from_id || kid == where_id || kid == by_id) continue;
+            n_updates++;
         }
+        size_t upd_slots = (size_t)(n_updates ? n_updates : 1);
+        ray_t* upd_hdr = NULL;
+        int64_t* upd_names = (int64_t*)scratch_calloc(&upd_hdr,
+            upd_slots * sizeof(int64_t) +
+            upd_slots * sizeof(ray_t*) +
+            upd_slots * sizeof(uint8_t));
+        if (!upd_names) { ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("oom", NULL); }
+        ray_t** upd_cols = (ray_t**)(upd_names + upd_slots);
+        uint8_t* upd_used = (uint8_t*)(upd_cols + upd_slots);
+
+        #define UPDATE_BY_CLEANUP_COLS() do {                                      \
+            for (int64_t _ui = 0; _ui < n_updates; _ui++)                          \
+                if (upd_cols[_ui]) ray_release(upd_cols[_ui]);                     \
+            scratch_free(upd_hdr);                                                 \
+        } while (0)
 
         /* For each aggregate expression, compute per group and broadcast */
+        int64_t upd_i = 0;
         for (int64_t d = 0; d + 1 < dict_n; d += 2) {
             int64_t kid = dict_elems[d]->i64;
             if (kid == from_id || kid == where_id || kid == by_id) continue;
             ray_t* agg_expr = dict_elems[d + 1];
 
-            /* Evaluate the aggregate for each group and broadcast */
-            ray_t* grp_items = (ray_t**)ray_data(groups) ? groups : NULL;
-            if (!grp_items) { ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("oom", NULL); }
-            int64_t ngroups = groups->len / 2;
-            ray_t** gdata = (ray_t**)ray_data(groups);
-
             /* We need to evaluate the aggregate per group.
              * Build the result column by evaluating the expression on each group's subset. */
-            ray_t* out_col = ray_vec_new(RAY_I64, nrows2); /* will be resized to correct type */
-            if (RAY_IS_ERR(out_col)) { ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
-
             int8_t out_type = RAY_I64;
+            ray_t* target_col = ray_table_get_col(tbl, kid);
+            if (ngroups == 0 && target_col) out_type = target_col->type;
+            ray_t* out_col = ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
+            if (RAY_IS_ERR(out_col)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
+            if (ngroups == 0) {
+                out_col->len = nrows2;
+                /* Match the per-group path's zero-fill so an unwritten buffer
+                 * never carries allocator garbage (unreachable with rows today
+                 * — a non-empty table always yields a group — but uniform). */
+                memset(ray_data(out_col), 0,
+                    (size_t)nrows2 * (size_t)ray_sym_elem_size(out_col->type, out_col->attrs));
+            }
             int first_group = 1;
 
             for (int64_t gi = 0; gi < ngroups; gi++) {
@@ -11603,7 +11651,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
 
                 /* Build a sub-table for this group */
                 ray_t* sub_tbl = ray_table_new((int32_t)ncols);
-                if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
+                if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
                 for (int64_t c = 0; c < ncols; c++) {
                     int64_t cn = ray_table_col_name(tbl, c);
                     ray_t* full_col = ray_table_get_col_idx(tbl, c);
@@ -11617,7 +11665,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     ray_t* sub_col = (ct == RAY_SYM)
                         ? ray_sym_vec_new(full_col->attrs & RAY_SYM_W_MASK, gsize)
                         : ray_vec_new(ct, gsize);
-                    if (RAY_IS_ERR(sub_col)) { ray_release(sub_tbl); ray_release(out_col); ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_col; }
+                    if (RAY_IS_ERR(sub_col)) { ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_col; }
                     /* per-group gather raw-copies cell ids from ONE
                      * source column — keep its dictionary */
                     if (ct == RAY_SYM)
@@ -11631,19 +11679,19 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                         memcpy(dst + r * esz, src + idxs[r] * esz, esz);
                     sub_tbl = ray_table_add_col(sub_tbl, cn, sub_col);
                     ray_release(sub_col);
-                    if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
+                    if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
                 }
 
                 /* Evaluate expression on sub-table via DAG */
                 ray_graph_t* ug = ray_graph_new(sub_tbl);
                 ray_op_t* expr_op = compile_expr_dag(ug, agg_expr);
-                if (!expr_op) { ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("domain", "update by: failed to compile aggregate expression"); }
+                if (!expr_op) { ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("domain", "update by: failed to compile aggregate expression"); }
                 expr_op = ray_optimize(ug, expr_op);
                 ray_t* agg_result = ray_execute(ug, expr_op);
                 ray_graph_free(ug);
                 ray_release(sub_tbl);
 
-                if (RAY_IS_ERR(agg_result)) { ray_release(out_col); ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
+                if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
 
                 /* Determine output type from first group */
                 if (first_group) {
@@ -11651,25 +11699,77 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     else if (ray_is_vec(agg_result)) out_type = agg_result->type;
                     ray_release(out_col);
                     out_col = ray_vec_new(out_type, nrows2);
-                    if (RAY_IS_ERR(out_col)) { ray_release(agg_result); ray_release(result); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
+                    if (RAY_IS_ERR(out_col)) { ray_release(agg_result); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
                     out_col->len = nrows2;
+                    memset(ray_data(out_col), 0,
+                        (size_t)nrows2 * (size_t)ray_sym_elem_size(out_col->type, out_col->attrs));
                     first_group = 0;
                 }
 
-                /* Broadcast aggregate value to all rows in this group */
+                /* Scatter the group's result back to its rows.  An atom
+                 * broadcasts to every row of the group; a per-row vector
+                 * (valid kdb, e.g. `update v: 2*v by k`) scatters elementwise
+                 * through idxs[r], symmetric with the atom branch.  Any other
+                 * shape — a vector whose length is neither 1 nor the group
+                 * size — has no row-aligned meaning, so decline loudly rather
+                 * than leave the memset zeros in place (silent data loss). */
                 int64_t* idxs = (int64_t*)ray_data(idx_vec);
                 if (ray_is_atom(agg_result)) {
                     for (int64_t r = 0; r < gsize; r++)
                         store_typed_elem(out_col, idxs[r], agg_result);
+                } else if (ray_is_vec(agg_result) && ray_len(agg_result) == gsize) {
+                    for (int64_t r = 0; r < gsize; r++) {
+                        int alloc = 0;
+                        ray_t* cell = collection_elem(agg_result, r, &alloc);
+                        store_typed_elem(out_col, idxs[r], cell);
+                        if (alloc) ray_release(cell);
+                    }
+                } else {
+                    int64_t got = ray_is_vec(agg_result) ? ray_len(agg_result) : -1;
+                    ray_release(agg_result); ray_release(out_col);
+                    UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                    return ray_error("length", "update by: expression result length %lld does not match group size %lld", (long long)got, (long long)gsize);
                 }
                 ray_release(agg_result);
             }
 
-            /* Add the new column to the result table */
-            result = ray_table_add_col(result, kid, out_col);
-            ray_release(out_col);
-            if (RAY_IS_ERR(result)) { ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
+            upd_names[upd_i] = kid;
+            upd_cols[upd_i] = out_col;
+            upd_i++;
         }
+
+        /* Build result in schema order: replace existing targets in place, then
+         * append genuinely new update columns in dict order. */
+        ray_t* result = ray_table_new((int32_t)(ncols + n_updates));
+        if (RAY_IS_ERR(result)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
+        for (int64_t c = 0; c < ncols; c++) {
+            int64_t cn = ray_table_col_name(tbl, c);
+            int64_t ui = -1;
+            for (int64_t u = 0; u < n_updates; u++) {
+                if (upd_names[u] == cn) { ui = u; break; }
+            }
+            if (ui >= 0) {
+                result = ray_table_add_col(result, cn, upd_cols[ui]);
+                ray_release(upd_cols[ui]);
+                upd_cols[ui] = NULL;
+                upd_used[ui] = 1;
+            } else {
+                ray_t* col = ray_table_get_col_idx(tbl, c);
+                ray_retain(col);
+                result = ray_table_add_col(result, cn, col);
+                ray_release(col);
+            }
+            if (RAY_IS_ERR(result)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
+        }
+        for (int64_t u = 0; u < n_updates; u++) {
+            if (upd_used[u]) continue;
+            result = ray_table_add_col(result, upd_names[u], upd_cols[u]);
+            ray_release(upd_cols[u]);
+            upd_cols[u] = NULL;
+            if (RAY_IS_ERR(result)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return result; }
+        }
+        UPDATE_BY_CLEANUP_COLS();
+        #undef UPDATE_BY_CLEANUP_COLS
 
         ray_release(groups);
         /* Store in-place and return the symbol if amending by name. */

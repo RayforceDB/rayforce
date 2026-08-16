@@ -386,23 +386,24 @@
 (at (window-join [Sym Time] wji_null wjt_null wjq_i64null {l: (last Price)}) 'l) -- [400]
 
 ;; ────────────────────────────────────────────────────────────────────
-;; update by: with vector-returning expression (line 8376):
-;; When agg_result from exec (sub-table expression) is a vector (not atom),
-;; ray_is_vec(agg_result) = true at line 8376.
-;; The sub-table expression (* v 2) on each group returns a vector,
-;; so line 8376 fires for the first group's result.
-;; NOTE: the by-group vector result path has no broadcast logic (only
-;; atoms are broadcast at 8387-8388), so new_v fills with zeros.
-;; This is observable behavior, not an error.
+;; update by: with a per-row VECTOR expression (valid kdb: `update v:2*v by k`).
+;; The sub-table expression (* v 2) returns a vector of the group's size, so
+;; each group's result is scattered elementwise back to its rows through
+;; idxs[r] — symmetric with the atom broadcast.  Regression: this path used to
+;; write nothing, leaving the memset'd column all-zero (silent data loss).
 ;; ────────────────────────────────────────────────────────────────────
 (set Tupd_by_vec (table [k v] (list (list "a" "b" "a" "b") [10 20 30 40])))
-;; update by: k where expression (* v 2) returns a vector per group
-;; line 8376 fires: ray_is_vec(agg_result) = true for first group
-;; (vector result has no broadcast → new_v column filled with 0)
+;; NEW column: group "a"=rows 0,2 -> [20 60]; group "b"=rows 1,3 -> [40 80]
 (count (update {new_v: (* v 2) by: k from: Tupd_by_vec})) -- 4
-;; Vector group result is NOT broadcast → new_v column stays all-zero.
-;; Assert the actual modified cells, not just the row count.
-(at (update {new_v: (* v 2) by: k from: Tupd_by_vec}) 'new_v) -- [40 80 0 0]
+(at (update {new_v: (* v 2) by: k from: Tupd_by_vec}) 'new_v) -- [20 40 60 80]
+;; REPLACING an existing column in place must scatter too, not zero it out
+(at (update {v: (* v 2) by: k from: Tupd_by_vec}) 'v) -- [20 40 60 80]
+;; the reviewer's exact repro: integer keys, an untouched trailing column
+(set Tupd_by_vec3 (table [k v w] (list [1 2 1 2] [10 20 30 40] [7 7 7 7])))
+(at (update {v: (* v 2) from: Tupd_by_vec3 by: k}) 'v) -- [20 40 60 80]
+(at (update {v: (* v 2) from: Tupd_by_vec3 by: k}) 'w) -- [7 7 7 7]
+;; a vector result whose length != the group size has no row mapping -> length error
+(update {new_v: [1 2 3] by: k from: Tupd_by_vec}) !- length
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; update WHERE with LIST-type expression → type error (lines 8682-8684):
@@ -463,25 +464,31 @@
 ;; ────────────────────────────────────────────────────────────────────
 ;; I32 key: case RAY_I32 at lines 131-133
 (set Tupd_i32by (table [k v] (list (as 'I32 [1 2 1 2 3]) [10 20 30 40 50])))
-;; update by: scatters aggregate back to original 5 rows (count unchanged)
-;; Groups: k=1→sum=40, k=2→sum=60, k=3→sum=50.
-;; Scatter fills only first occurrence per group; others remain 0.
-;; Row values: [40, 60, 0, 0, 50] → sum = 150
+;; update by: broadcasts the aggregate back to every row of its group
+;; (kdb `by:` semantics — the group sum lands on ALL member rows, not just
+;; the first).  Groups: k=1→sum=40, k=2→sum=60, k=3→sum=50.
+;; Row values: [40, 60, 40, 60, 50] → sum = 250
+;;
+;; USER-FACING FIX (was bug): pre-fix, updating an EXISTING column `v` via
+;; `by:` silently did nothing — the aggregate was appended as a duplicate
+;; column (schema `[k v v]`), so `(at U 'v)` kept reading the stale
+;; original [10 20 30 40 50] → sum 150.  From a user's perspective the
+;; `by:`-update "succeeded" (no error) but the column never changed, and
+;; `(key U)` unexpectedly listed the column name twice.
 (count (update {v: (sum v) by: k from: Tupd_i32by})) -- 5
-(sum (at (update {v: (sum v) by: k from: Tupd_i32by}) 'v)) -- 150
+(sum (at (update {v: (sum v) by: k from: Tupd_i32by}) 'v)) -- 250
 
 ;; BOOL key: case RAY_BOOL (RAY_U8) at lines 135-136
 (set Tupd_boolby (table [k v] (list [true false true false] [10 20 30 40])))
-;; Groups: k=true→sum=40, k=false→sum=60.
-;; Scatter fills first occurrence; others remain 0: [40, 60, 0, 0] → sum = 100
+;; Groups: k=true→sum=40, k=false→sum=60 → broadcast [40, 60, 40, 60] → sum = 200
 (count (update {v: (sum v) by: k from: Tupd_boolby})) -- 4
-(sum (at (update {v: (sum v) by: k from: Tupd_boolby}) 'v)) -- 100
+(sum (at (update {v: (sum v) by: k from: Tupd_boolby}) 'v)) -- 200
 
 ;; F64 key: case RAY_F64 at line 137
 (set Tupd_f64by (table [k v] (list [1.0 2.0 1.0 2.0] [10 20 30 40])))
-;; Groups: k=1.0→sum=40, k=2.0→sum=60. [40, 60, 0, 0] → sum = 100
+;; Groups: k=1.0→sum=40, k=2.0→sum=60 → broadcast [40, 60, 40, 60] → sum = 200
 (count (update {v: (sum v) by: k from: Tupd_f64by})) -- 4
-(sum (at (update {v: (sum v) by: k from: Tupd_f64by}) 'v)) -- 100
+(sum (at (update {v: (sum v) by: k from: Tupd_f64by}) 'v)) -- 200
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; WHERE-update SYM column with null in expr_vec (line 8707)
