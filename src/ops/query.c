@@ -2454,6 +2454,10 @@ static bool match_group_count_emit_filter(ray_t* from_expr, ray_t* where_expr,
             out->enabled = 1;
             out->agg_index = agg_index;
             out->min_count_exclusive = threshold;
+            /* Keeps the LARGEST counts (count > threshold): consumers read
+             * .desc as the direction, so state it rather than relying on a
+             * zero default. */
+            out->desc = 1;
             DICT_VIEW_CLOSE(iv);
             return true;
         }
@@ -3859,6 +3863,11 @@ static ray_t* try_count_distinct_v2_rewrite(
         emit_f.agg_index = 0;
         emit_f.top_count_take = take_n;
         emit_f.min_count_exclusive = 0;
+        /* This rewrite fires only for `desc: c take: N` (see the
+         * desc_col_sym test above) — consumers read .desc as the direction,
+         * so set it explicitly instead of leaning on a zero default that
+         * used to be coerced to desc inside group.c. */
+        emit_f.desc = 1;
         ray_group_emit_filter_set(emit_f);
         emit_set = 1;
     }

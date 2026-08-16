@@ -8768,11 +8768,10 @@ static ray_t* group_emit_filter_trim(ray_t* result, uint32_t n_keys,
     if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64))
         return result;
     bool is_f64 = (vcol->type == RAY_F64);
-    /* Direction convention (mirrors the v2_emit topn path): the historical
-     * COUNT filter never sets .desc — an unset flag on COUNT means
-     * largest-first. */
-    if ((ef.agg_op == 0 || ef.agg_op == OP_COUNT) && !ef.desc)
-        ef.desc = 1;
+    /* Direction comes straight from .desc (mirrors the v2_emit topn path):
+     * every arming site sets it, COUNT included.  Coercing COUNT to
+     * largest-first here made `asc: <count> take: N` keep the largest N
+     * (issue #408). */
     const int64_t* vi = (const int64_t*)ray_data(vcol);
     const double*  vf = (const double*)ray_data(vcol);
     #define EF_VAL_D(r) (is_f64 ? vf[(r)] : (double)vi[(r)])
@@ -10775,10 +10774,22 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * reads the agg's int64 row slot directly.  The non-COUNT paths
      * (sparse_i64 range-counting, the n_keys>1 macro fast path) still
      * gate on COUNT because they DON'T have the agg value available
-     * outside the row slot. */
+     * outside the row slot.
+     *
+     * DIRECTION.  The count-trimming machinery gated by use_emit_filter
+     * (da_count_emit_keep_min and the sparse/dense keep_min emits) is
+     * inherently LARGEST-first: it derives a minimum count to keep and drops
+     * every group below it.  An `asc: <count> take: N` shape wants the
+     * SMALLEST N, so those trims would discard exactly the rows the query
+     * asks for — they are disabled for it and the full group result flows to
+     * the downstream sort+take.  The bounded-heap top-N path
+     * (use_topn_filter) is direction-symmetric (TOPN_BETTER) and serves asc
+     * shapes itself.  A pure min_count_exclusive filter (no take) is
+     * direction-agnostic and stays enabled. */
     bool use_emit_filter = emit_filter.enabled &&
         emit_filter.agg_index < n_aggs &&
-        ext->agg_ops[emit_filter.agg_index] == OP_COUNT;
+        ext->agg_ops[emit_filter.agg_index] == OP_COUNT &&
+        (emit_filter.top_count_take <= 0 || emit_filter.desc);
     bool use_topn_filter = emit_filter.enabled &&
         emit_filter.top_count_take > 0 &&
         emit_filter.agg_index < n_aggs &&
@@ -12819,10 +12830,12 @@ ht_path:;
             else topn_order_off = (uint16_t)(ght_layout.off_max
                                              + (uint16_t)agg_slot * 8u);
         }
-        /* COUNT defaults to desc when the filter struct's desc bit isn't set
-         * (old single-bit filter shape); query.c sets it explicitly. */
+        /* `.desc` is authoritative for every agg kind, COUNT included: every
+         * arming site in query.c sets it (1 for desc:, 0 for asc:).  It used
+         * to be force-set to 1 for COUNT — that silently turned
+         * `asc: <count> take: N` into the desc answer on this path while
+         * `-c 1` returned the smallest N (issue #408). */
         topn_desc_dir = emit_filter.desc ? 1 : 0;
-        if (order_op == OP_COUNT && !emit_filter.desc) topn_desc_dir = 1;
     }
 
     /* Admit the fused per-partition top-k: stash n_parts x k_take candidates,

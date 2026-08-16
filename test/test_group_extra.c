@@ -1080,6 +1080,11 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
     filter.enabled = 1;
     filter.agg_index = 0;
     filter.top_count_take = 2;
+    /* Direction is explicit since issue #408: the keep-min count trims are
+     * largest-first machinery, so they run for desc = 1 only (an asc take
+     * keeps the SMALLEST N and is served by the bounded heap / the
+     * downstream sort+take instead). */
+    filter.desc = 1;
     ray_group_emit_filter_set(filter);
     ray_t* res = ray_execute(g, grp);
     ray_group_emit_filter_set(prev);
@@ -1100,6 +1105,29 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
         if (k == 2 && c == 4) got_2 = 1;
     }
     TEST_ASSERT_TRUE(got_1 && got_2);
+    ray_release(res);
+
+    /* Same filter with desc = 0 (`asc: c take: 2`): the emit filter must NOT
+     * keep the two LARGEST groups.  Trimming here is desc-only machinery, so
+     * the asc request falls through to the full group set and the caller's
+     * sort+take picks the smallest — what must never happen is the result
+     * losing the small groups (issue #408: asc returned the desc answer). */
+    filter.desc = 0;
+    ray_group_emit_filter_set(filter);
+    res = ray_execute(g, grp);
+    ray_group_emit_filter_set(prev);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    out_key = ray_table_get_col(res, key_sym);
+    out_cnt = ray_table_get_col_idx(res, 1);
+    TEST_ASSERT_NOT_NULL(out_key);
+    TEST_ASSERT_NOT_NULL(out_cnt);
+    int got_smallest = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int16_t k = ((int16_t*)ray_data(out_key))[i];
+        int64_t c = ((int64_t*)ray_data(out_cnt))[i];
+        if (k == 5 && c == 1) got_smallest = 1;
+    }
+    TEST_ASSERT_TRUE(got_smallest);
 
     ray_release(res);
     ray_graph_free(g);
@@ -1149,6 +1177,11 @@ static test_result_t test_sym_group_top_count_emit_filter(void) {
     filter.enabled = 1;
     filter.agg_index = 0;
     filter.top_count_take = 2;
+    /* Direction is explicit since issue #408: the keep-min count trims are
+     * largest-first machinery, so they run for desc = 1 only (an asc take
+     * keeps the SMALLEST N and is served by the bounded heap / the
+     * downstream sort+take instead). */
+    filter.desc = 1;
     ray_group_emit_filter_set(filter);
     ray_t* res = ray_execute(g, grp);
     ray_group_emit_filter_set(prev);
@@ -1225,6 +1258,11 @@ static test_result_t test_five_key_group_top_count_emit_filter(void) {
     filter.enabled = 1;
     filter.agg_index = 0;
     filter.top_count_take = 2;
+    /* Direction is explicit since issue #408: the keep-min count trims are
+     * largest-first machinery, so they run for desc = 1 only (an asc take
+     * keeps the SMALLEST N and is served by the bounded heap / the
+     * downstream sort+take instead). */
+    filter.desc = 1;
     ray_group_emit_filter_set(filter);
     ray_t* res = ray_execute(g, grp);
     ray_group_emit_filter_set(prev);
