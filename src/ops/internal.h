@@ -1374,14 +1374,23 @@ typedef struct {
     ray_t*        _h_slots;
     ray_t*        _h_rows;
     uint8_t       oom;        /* set by group_probe_entry on grow failure */
-    /* Optional one-shot growth target in SLOTS (0 = plain doubling).  A table
-     * only ever grows once it already holds ht_cap/2 groups, i.e. it has
-     * proven near-unique for its share of the input; when the caller knows a
-     * bound on how many rows this table can still receive, jumping straight to
-     * that bound skips the 2x ladder, every rung of which re-hashes and
-     * re-inserts every live group.  Idempotent (the jump is a max()), so once
-     * ht_cap reaches grow_cap the field stops having any effect.  Placed here
-     * to land in the existing tail padding — group_ht_t's size is unchanged. */
+    /* Optional growth target in SLOTS (0 = plain doubling).  Consumed ONLY by
+     * group_ht_rehash — never by group_ht_grow, which keeps the row array,
+     * where nearly all the bytes live, at O(groups).
+     *
+     * What the trigger actually proves: a rehash means the table just crossed
+     * ht_cap/2 groups.  That is a lower bound on its cardinality, NOT evidence
+     * that it will keep growing — so the caller's target (derived from how
+     * many rows the table can still receive) is applied at most ONE extra
+     * doubling per rehash rather than in full.  A table that stalls right
+     * after a jump therefore over-allocates its slot array by 2x and nothing
+     * else, while a genuinely near-unique table still reaches its final size
+     * in far fewer rungs — and every rung skipped is one whole re-hash and
+     * re-insert of every live group avoided.
+     *
+     * Idempotent (the jump is a max()), so once ht_cap reaches grow_cap the
+     * field stops having any effect.  Placed here to land in the existing tail
+     * padding — group_ht_t's size is unchanged. */
     uint32_t      grow_cap;
 } group_ht_t;
 

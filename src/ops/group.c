@@ -3813,10 +3813,11 @@ void group_ht_free(group_ht_t* ht) {
 static bool group_ht_grow(group_ht_t* ht) {
     uint32_t old_cap = ht->grp_cap;
     uint32_t new_cap = old_cap * 2;
-    /* Row array tracks the slot array at the 50% rehash load factor, so a
-     * slot-count target implies a row-count target of half that. */
-    uint32_t row_tgt = ht->grow_cap >> 1;
-    if (row_tgt > new_cap) new_cap = row_tgt;
+    /* Deliberately NOT accelerated by grow_cap (see group_ht_t.grow_cap): the
+     * row array is the memory-dominant one (row_stride is 24-48 B against a
+     * slot's 4 B), and growing it early buys nothing — a row-array growth is
+     * one realloc/memmove, whereas a SLOT growth re-hashes and re-inserts
+     * every live group.  Plain doubling keeps this array O(groups). */
     uint16_t rs = ht->layout.row_stride;
     char* new_rows = (char*)scratch_realloc(
         &ht->_h_rows, (size_t)old_cap * rs, (size_t)new_cap * rs);
@@ -4157,10 +4158,17 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
 
 static void group_ht_rehash(group_ht_t* ht, const int8_t* key_types) {
     uint32_t new_cap = ht->ht_cap * 2;
-    /* Jump straight to the caller's bound when it exceeds the next rung (see
-     * group_ht_t.grow_cap): each intermediate rung re-hashes and re-inserts
-     * every live group for nothing. */
-    if (ht->grow_cap > new_cap) new_cap = ht->grow_cap;
+    /* Skip ahead toward the caller's bound (see group_ht_t.grow_cap): each
+     * intermediate rung re-hashes and re-inserts every live group.  Capped at
+     * ONE extra doubling per rehash, because the only thing known here is that
+     * the table just crossed ht_cap/2 groups — not that it will keep growing.
+     * A table that stops right after the jump over-allocates its slot array by
+     * 2x and nothing else; without the cap it would take the full row-derived
+     * bound (up to 8x at 10M) on the strength of a single rung. */
+    uint32_t tgt = ht->grow_cap;
+    uint32_t lim = ht->ht_cap << 2;
+    if (tgt > lim) tgt = lim;
+    if (tgt > new_cap) new_cap = tgt;
     ray_t* new_h = NULL;
     uint32_t* new_slots = (uint32_t*)scratch_alloc(&new_h, (size_t)new_cap * sizeof(uint32_t));
     if (!new_slots) return; /* OOM: keep old HT, it still works (just slower) */
@@ -5744,7 +5752,7 @@ typedef struct {
                                       * (ClickBench q32); empty pairs still
                                       * allocate nothing. */
     uint32_t       ht_init_block;    /* row-block granularity for the same */
-    uint32_t       ht_grow_cap;      /* slot-count target on first growth —
+    uint32_t       ht_grow_cap;      /* slot-count ceiling for HT growth —
                                       * see group_ht_t.grow_cap */
     _Atomic(int)   oom;
 } radix_v2_phase1_ctx_t;
@@ -12680,14 +12688,17 @@ ht_path:;
                             / ((uint64_t)n_total * radix_n_parts) + 1;
             uint32_t v2_cap = 2;
             while (v2_cap < v2_exp && v2_cap < 256) v2_cap <<= 1;
-            /* Growth target for a worker HT that outgrows v2_cap: at the 50%
-             * rehash load factor a table expecting v2_exp rows needs 2*v2_exp
-             * slots, and v2_exp is already the per-(worker,partition) row
-             * budget computed above — no new tunable.  Sizing the FIRST
-             * allocation this way would over-allocate every mid-cardinality
-             * shape (most (worker,partition) tables never approach v2_exp
-             * distinct keys); applying it at the first growth spends it only
-             * on tables that have demonstrably gone near-unique. */
+            /* Slot-count ceiling for a worker HT that outgrows v2_cap: at the
+             * 50% rehash load factor a table receiving v2_exp rows needs at
+             * most 2*v2_exp slots, and v2_exp is already the
+             * per-(worker,partition) row budget computed above — no new
+             * tunable.  This is a CEILING, not a target: group_ht_rehash
+             * approaches it one extra doubling at a time (see
+             * group_ht_t.grow_cap), because crossing a rung proves a lower
+             * bound on cardinality, not that growth will continue.  Sizing the
+             * first allocation from it instead was measured and rejected: it
+             * cost q15 (density ~0.25) 5% and inflated worker-HT memory on
+             * every mid-cardinality shape. */
             uint32_t v2_grow = 2;
             while (v2_grow < 2 * v2_exp && v2_grow < (1u << 24)) v2_grow <<= 1;
             radix_v2_phase1_ctx_t v2p1 = {

@@ -119,7 +119,7 @@ TSAN_LDFLAGS = -fsanitize=thread
 HARDENED_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) -g \
   -fno-omit-frame-pointer -DRAY_HARDENED \
   -funroll-loops -fno-math-errno -fassociative-math -ffp-contract=fast \
-  -fno-signed-zeros -fno-trapping-math
+  -fno-signed-zeros -fno-trapping-math -falign-functions=64
 
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)
