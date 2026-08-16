@@ -11708,7 +11708,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
 
                 /* Scatter the group's result back to its rows.  An atom
                  * broadcasts to every row of the group; a per-row vector
-                 * (valid kdb, e.g. `update v: 2*v by k`) scatters elementwise
+                 * (e.g. `update {v: (* v 2) by: k}`) scatters elementwise
                  * through idxs[r], symmetric with the atom branch.  Any other
                  * shape — a vector whose length is neither 1 nor the group
                  * size — has no row-aligned meaning, so decline loudly rather
