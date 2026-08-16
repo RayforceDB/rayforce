@@ -3209,6 +3209,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
          * only per-element work left rides along in the divide loop. */
         idiv_i64_inline_gate = idiv_i64_small && lscan && (rscan || !r_vec) &&
                                (out_type == RAY_I64 || out_type == RAY_TIMESTAMP);
+        /* With the inline gate the span was never validated — make sure no
+         * later branch can read idiv_i64_small as "proven in-range". */
+        if (idiv_i64_inline_gate) idiv_i64_small = false;
         if (idiv_i64_small && !idiv_i64_inline_gate) {
             if (lscan && rscan)   idiv_i64_small = i64_span2_dbl_exact(lscan, rscan, n);
             else if (lscan)       idiv_i64_small = i64_span_dbl_exact(lscan, n);

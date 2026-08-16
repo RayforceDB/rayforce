@@ -2547,3 +2547,9 @@
 (at (select {q: (div a 0) from: TdivGateS}) 'q) -- [0Nl 0Nl 0Nl 0Nl]
 ;; broadcast scalar past ±2^53 with an in-range column: exact kernel, no rescan
 (at (select {q: (div a -9007199254740993) from: TdivGateS}) 'q) -- [-1 0 -1 0]
+;; gate BOUND pin: values strictly inside (2^53, 2^54], no null, nothing
+;; larger — the only fixture where widening the ±2^53 bound (0x1p53 ->
+;; 0x1p54) changes the answer instead of being masked by a co-resident
+;; out-of-range value.  Verified to fail on exactly that mutant.
+(set TdivBound (table [v] (list [9007199254740993 9007199254740995 9007199254740997])))
+(at (select {q: (div v 1) from: TdivBound}) 'q) -- [9007199254740993 9007199254740995 9007199254740997]
