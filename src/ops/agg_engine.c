@@ -1847,9 +1847,10 @@ static void agg_radix_parts_destroy(agg_radix_part_t* parts, uint32_t nparts,
     }
 }
 
-/* Build a result key column of src_col's type for the radix path by un-packing
- * the per-group packed key value (column key_idx of each group's representative
- * record) from the per-partition `keys` buffers in stable first-seen order.
+/* Allocate an EMPTY result key column of src_col's type/width for the radix
+ * path.  agg_key_emit_range below fills it from the per-partition packed `keys`
+ * buffers in stable first-seen order; the two halves are split so one dispatch
+ * can fill every key column at once.
  *
  * agg_read_key_i64 widened each key into int64 (sign-extend for signed types,
  * zero-extend for U8/BOOL/SYM intern ids); write_col_i64 is its exact inverse,
@@ -1857,27 +1858,59 @@ static void agg_radix_parts_destroy(agg_radix_part_t* parts, uint32_t nparts,
  * raw memcpy of the original column produced — for SYM it routes through
  * ray_write_sym at the matching width, and the domain is adopted from src_col
  * just like agg_gather_key_col.  Caller owns the returned column.
- * key_idx/n_keys stay uint8_t: both are admission-bounded <=16 (see
- * agg_v2_can_handle) and key_idx indexes the packed-key stride below. */
-static ray_t* agg_unpack_key_col(ray_t* src_col, uint32_t key_idx, uint32_t n_keys,
-                                 const agg_radix_part_t* parts, uint32_t nparts,
-                                 const agg_radix_order_t* pairs, int64_t n) {
+ * Keys are admitted only as fixed-width integer/temporal/SYM columns
+ * (agg_v2_can_handle) — there is no STR/variable-width emit path here — but the
+ * key COUNT is unbounded on the radix strategy (only dense direct-index routing
+ * caps it at 16), so nothing downstream may size an array by a 16 assumption. */
+static ray_t* agg_unpack_key_col_new(ray_t* src_col, int64_t n) {
     ray_t* out = col_vec_new(src_col, n);
     if (!out || RAY_IS_ERR(out)) return out;
     if (out->type == RAY_SYM)
         ray_sym_vec_adopt_domain(out, sym_domain_rep(src_col));
     out->len = n;
-    int8_t type = src_col->type; uint8_t attrs = src_col->attrs;
-    void* dst = ray_data(out);
-    (void)nparts;
-    for (int64_t i = 0; i < n; i++) {
-        uint32_t p = (uint32_t)(pairs[i].idx >> 32);
-        uint32_t gg = (uint32_t)pairs[i].idx;
-        write_col_i64(dst, i,
-            parts[p].keys[(size_t)gg * n_keys + key_idx], type, attrs);
-    }
     if (src_col->attrs & RAY_ATTR_HAS_NULLS) out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
+}
+
+/* Un-pack context for the key emit: all n_keys destination columns at once, so
+ * one dispatch covers the whole key side (mirrors agg_radix_fin_ctx_t, which
+ * carries every agg's output column through one finalize dispatch). */
+typedef struct {
+    ray_t* const*            key_cols;   /* [n_keys] source columns (type/attrs) */
+    ray_t* const*            outs;       /* [n_keys] pre-sized destinations */
+    const agg_radix_part_t*  parts;
+    const agg_radix_order_t* pairs;      /* [n], stable first-seen order */
+    uint32_t                 n_keys;
+} agg_key_emit_ctx_t;
+
+/* Fill output rows [start,end) of EVERY key column from the packed per-group
+ * keys.  Row i of every column is written by exactly one caller, so a parallel
+ * dispatch over disjoint [start,end) ranges is race-free: write_col_i64 is a
+ * pure payload store at index i (down to a 1-byte store for BOOL/U8/SYM_W8 —
+ * still disjoint, there is no bit-packed representation here) and nothing in
+ * this loop touches out->attrs or any other shared header field.  The nulls
+ * flag is not derived per row at all: it is copied wholesale from src_col by
+ * agg_unpack_key_col_new before the dispatch, so no attrs fold is needed. */
+RAY_INLINE void agg_key_emit_range(const agg_key_emit_ctx_t* c,
+                                   int64_t start, int64_t end) {
+    uint32_t n_keys = c->n_keys;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_t* out = c->outs[k];
+        void* dst = ray_data(out);
+        int8_t type = c->key_cols[k]->type;
+        uint8_t attrs = c->key_cols[k]->attrs;
+        for (int64_t i = start; i < end; i++) {
+            uint32_t p  = (uint32_t)(c->pairs[i].idx >> 32);
+            uint32_t gg = (uint32_t)c->pairs[i].idx;
+            write_col_i64(dst, i,
+                c->parts[p].keys[(size_t)gg * n_keys + k], type, attrs);
+        }
+    }
+}
+
+static void agg_key_emit_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_key_emit_range((const agg_key_emit_ctx_t*)vctx, start, end);
 }
 
 typedef struct {
@@ -2658,21 +2691,58 @@ static ray_t* exec_group_v2_parallel_radix(
     /* Emit key columns by sequential un-pack from the contiguous per-partition
      * packed-key buffers (cache-friendly), NOT a scattered gather of the
      * original columns at first_row[].  Byte-identical to agg_gather_key_col
-     * (see agg_unpack_key_col), incl. SYM payload + domain. */
-    for (uint32_t k = 0; k < n_keys; k++) {
-        ray_t* kc = agg_unpack_key_col(key_cols[k], k, n_keys, parts, n_parts,
-                                       pairs, n_emit);
-        if (!kc || RAY_IS_ERR(kc)) {
-            ray_free_raw(pairs);
-            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-            ray_free_raw(bufs); ray_free_raw(parts);
-            agg_desc_free(&d);
-            ray_release(result); return kc ? kc : ray_error("oom", NULL);
-        }
-        result = ray_table_add_col(result, key_syms[k], kc);
-        ray_release(kc);
+     * (see agg_unpack_key_col_new), incl. SYM payload + domain.
+     *
+     * All n_keys destinations are built BEFORE the fill so one dispatch covers
+     * the whole key side; they enter the table only once every row is written.
+     * n_keys is NOT bounded to 16 on this path (only dense direct-index routing
+     * caps it, in agg_dense_plan), so the handle array is a scratch carve, not
+     * a stack array — ASan caught the stack version overflowing on a 17-key
+     * group-by (test/rfl/group/radix_key_emit_parallel.rfl). */
+    ray_t*   kouts_hdr = NULL;
+    ray_t**  kouts   = (ray_t**)scratch_calloc(&kouts_hdr, (size_t)n_keys * sizeof(ray_t*));
+    ray_t*   kerr    = kouts ? NULL : ray_error("oom", NULL);
+    uint32_t k_built = 0;
+    for (; !kerr && k_built < n_keys; k_built++) {
+        ray_t* kc = agg_unpack_key_col_new(key_cols[k_built], n_emit);
+        if (!kc || RAY_IS_ERR(kc)) { kerr = kc ? kc : ray_error("oom", NULL); break; }
+        kouts[k_built] = kc;
     }
+    if (!kerr) {
+        agg_key_emit_ctx_t kctx = {
+            .key_cols = key_cols, .outs = kouts, .parts = parts,
+            .pairs = pairs, .n_keys = n_keys,
+        };
+        /* Parallelize the un-pack over the OUTPUT rows on the same terms as the
+         * phase-3 finalize below: worthwhile only when ngroups is large.  Every
+         * bounded-emit shape (the HEAD(GROUP) limit hint — q17 emits 10 rows)
+         * and every low-cardinality group-by stays on the identical serial
+         * range call, so there is no dispatch overhead where there is no win. */
+        if (ray_pool_par_dispatch_ok(pool, n_emit, RAY_PARALLEL_THRESHOLD)) {
+            ray_pool_dispatch(pool, agg_key_emit_fn, &kctx, n_emit);
+            /* A cancelled dispatch drains its tickets WITHOUT running fn, so the
+             * key columns can be left partly uninitialized (for SYM that would
+             * be an out-of-domain id).  Never hand that back — bail. */
+            if (pool_cancelled(pool)) kerr = ray_error("cancel", NULL);
+        } else {
+            agg_key_emit_range(&kctx, 0, n_emit);
+        }
+    }
+    if (kerr) {
+        for (uint32_t k = 0; k < k_built; k++) ray_release(kouts[k]);
+        scratch_free(kouts_hdr);
+        ray_free_raw(pairs);
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
+        ray_free_raw(bufs); ray_free_raw(parts);
+        agg_desc_free(&d);
+        ray_release(result); return kerr;
+    }
+    for (uint32_t k = 0; k < n_keys; k++) {
+        result = ray_table_add_col(result, key_syms[k], kouts[k]);
+        ray_release(kouts[k]);
+    }
+    scratch_free(kouts_hdr);
 
     /* Pre-allocate every agg's output column up front so the parallel finalize
      * pass can write disjoint slices into all scalar columns at once.  LIST

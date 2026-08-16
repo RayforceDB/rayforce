@@ -1,0 +1,96 @@
+;; ════════════════════════════════════════════════════════════════════
+;; radix_key_emit_parallel.rfl — parallel key-column emit of the v2 radix
+;; group-by (agg_key_emit_range / agg_key_emit_fn, src/ops/agg_engine.c).
+;;
+;; The emit un-packs each group's representative key tuple out of the
+;; per-partition packed `keys` buffers into the result key columns, in
+;; stable first-seen order.  It used to run single-threaded over every
+;; output row; it is now dispatched over disjoint output-row ranges when
+;; n_emit >= RAY_PARALLEL_THRESHOLD (65536).
+;;
+;; What each fixture pins:
+;;   1. WIDE-SYM  — 2.6M singleton groups on a W32 SYM key: the widest
+;;      emit shape (and the one the 100M q13 profile is about).  Every
+;;      group is a singleton in til() order, so the emitted key column
+;;      must equal the SOURCE column element-for-element — a per-row
+;;      oracle over all 2.6M rows, not a spot check.
+;;   2. WIDE-KEY  — 17 keys of MIXED width (I64/I32/I16/U8/BOOL/DATE/
+;;      TIME/TIMESTAMP/SYM + I64 constants) at 100k groups.  Two things
+;;      at once: the packed-key stride (a per-column index error shows up
+;;      as a shifted column) and write_col_i64's per-type store width.
+;;      >16 keys ALSO takes the radix path deliberately — the key count is
+;;      unbounded there (only dense direct-index routing caps it at 16),
+;;      which is why the emit's destination-handle array must not be a
+;;      fixed [16] stack array.
+;;   3. TAKE-BOUNDED — the HEAD(GROUP) limit hint (q17's shape): n_emit is
+;;      10, far below the dispatch threshold, so the emit stays on the
+;;      identical serial range call.  Both emit shapes must agree with the
+;;      same source-column oracle.
+;;
+;; Routing (all three): >=1 int/SYM key with no nulls, >= 65536 rows, only
+;; streaming aggs, and a key range too sparse for the parallel dense plan
+;; (total_slots > rows/workers) -> exec_group_v2_parallel_radix.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ---------- 1. wide-SYM key, 2.6M singleton groups ----------
+(set NS 2600000)
+(set KS (as 'SYM (til NS)))
+(set TS (table [k v] (list KS (til NS))))
+(set RS (select {c: (count v) s: (sum v) from: TS by: k}))
+(count RS) -- 2600000
+;; singleton groups in first-seen order => the key column IS the source column
+(all (== (at RS 'k) KS)) -- true
+(all (== (at RS 'c) (+ 1 (* 0 (til NS))))) -- true
+(all (== (at RS 's) (til NS))) -- true
+
+;; ---------- 2. seventeen keys, mixed widths, 100k groups ----------
+(set N 100000)
+(set K0 (til N))
+(set K1 (as 'I32 (% (til N) 1000)))
+(set K2 (as 'I16 (% (til N) 300)))
+(set K3 (as 'U8 (% (til N) 251)))
+(set K4 (as 'BOOL (% (til N) 2)))
+(set K5 (as 'DATE (% (til N) 4000)))
+(set K6 (as 'TIME (% (til N) 86400000)))
+(set K7 (as 'TIMESTAMP (* (til N) 1000000)))
+(set K8 (as 'SYM (% (til N) 5000)))
+(set K9 (+ 63 (* 0 (til N))))
+(set K10 (+ 70 (* 0 (til N))))
+(set K11 (+ 77 (* 0 (til N))))
+(set K12 (+ 84 (* 0 (til N))))
+(set K13 (+ 91 (* 0 (til N))))
+(set K14 (+ 98 (* 0 (til N))))
+(set K15 (+ 105 (* 0 (til N))))
+(set K16 (+ 112 (* 0 (til N))))
+(set VV (til N))
+(set KL (list K0 K1 K2 K3 K4 K5 K6 K7 K8 K9 K10 K11 K12 K13 K14 K15 K16 VV))
+(set T17 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12 k13 k14 k15 k16 v] KL))
+(set R17 (select {c: (count v) from: T17 by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8 k9: k9 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16}}))
+(count R17) -- 100000
+;; k0 is distinct per row => every group is a singleton, first-seen == input order
+(all (== (at R17 'k0) K0)) -- true
+(all (== (at R17 'k1) K1)) -- true
+(all (== (at R17 'k2) K2)) -- true
+(all (== (at R17 'k3) K3)) -- true
+(all (== (at R17 'k4) K4)) -- true
+(all (== (at R17 'k5) K5)) -- true
+(all (== (at R17 'k6) K6)) -- true
+(all (== (at R17 'k7) K7)) -- true
+(all (== (at R17 'k8) K8)) -- true
+(all (== (at R17 'k9) K9)) -- true
+(all (== (at R17 'k16) K16)) -- true
+(all (== (at R17 'c) (+ 1 (* 0 (til N))))) -- true
+
+;; ---------- 3. take-bounded emit (serial range call) ----------
+(set RT (select {c: (count v) from: T17 by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8 k9: k9 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16} take: 10}))
+(count RT) -- 10
+(all (== (at RT 'k0) (til 10))) -- true
+(all (== (at RT 'k1) (as 'I32 (til 10)))) -- true
+(all (== (at RT 'k3) (as 'U8 (til 10)))) -- true
+(all (== (at RT 'k8) (as 'SYM (til 10)))) -- true
+(all (== (at RT 'k16) (+ 112 (* 0 (til 10))))) -- true
+
+;; same for the wide-SYM shape: bounded emit agrees with the full emit
+(set RSB (select {c: (count v) from: TS by: k take: 10}))
+(count RSB) -- 10
+(all (== (at RSB 'k) (as 'SYM (til 10)))) -- true
