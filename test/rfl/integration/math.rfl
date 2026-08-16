@@ -2505,3 +2505,10 @@
 ;; floor semantics preserved for int operands
 (div [-7 7 -7] [2 -2 -2]) -- [-4 -4 3]
 (div [7 8 9] 2) -- [3 4 4]
+;; compiled select/update must not round integer columns through double
+(set TdivI64 (table [v] (list [9007199254740993 123456789012345678])))
+(at (select {q: (div v 1) from: TdivI64}) 'q) -- [9007199254740993 123456789012345678]
+(at (select {q: (div v 3) from: TdivI64}) 'q) -- [3002399751580331 41152263004115226]
+(set TdivUpd (table [v q] (list [9007199254740993 123456789012345678] [0 0])))
+(at (update {q: (div v 1) from: TdivUpd}) 'q) -- [9007199254740993 123456789012345678]
+(at (update {q: (div v 3) from: TdivUpd}) 'q) -- [3002399751580331 41152263004115226]

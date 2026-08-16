@@ -42,6 +42,15 @@ static inline uint8_t truthy_f64ish(double v) {
     return (v == v && v != 0.0) ? 1 : 0;
 }
 
+static inline bool floor_idiv_i64_checked(int64_t a, int64_t b, int64_t* out) {
+    if (b == 0 || (a == INT64_MIN && b == -1)) return false;
+    int64_t q = a / b;
+    int64_t rem = a % b;
+    if (rem != 0 && ((a < 0) != (b < 0))) q--;
+    *out = q;
+    return true;
+}
+
 static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* out_is_f64) {
     if (!atom || !ray_is_atom(atom)) return false;
     switch (atom->type) {
@@ -192,12 +201,10 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
         case OP_SUB: r = (int64_t)((uint64_t)li - (uint64_t)ri); break;
         case OP_MUL: r = (int64_t)((uint64_t)li * (uint64_t)ri); break;
         case OP_DIV:
-            if (ri==0) return false;
-            r = li/ri; if ((li^ri)<0 && r*ri!=li) r--;
+            if (!floor_idiv_i64_checked(li, ri, &r)) return false;
             break;
         case OP_IDIV:
-            if (ri==0) return false;
-            r = li/ri; if ((li^ri)<0 && r*ri!=li) r--;
+            if (!floor_idiv_i64_checked(li, ri, &r)) return false;
             break;
         case OP_MOD:
             if (ri==0) return false;
@@ -583,11 +590,11 @@ static bool expr_null_capable(uint8_t op, int8_t dt, int8_t t1) {
     /* Task 7: I64 arithmetic and unary ops.
      * OP_ADD=20..OP_MOD=24, OP_MIN2=33, OP_MAX2=34 in the binary block.
      * OP_NEG=10, OP_ABS=11 in the unary block.
-     * OP_IDIV=49 is NOT contiguous with OP_ADD..OP_MOD and has no I64 plain
-     * case in exec_elementwise_binary, so it is excluded. */
+     * OP_IDIV=49 is NOT contiguous with OP_ADD..OP_MOD, but has explicit I64
+     * cases in both fused and fallback kernels. */
     if (dt == RAY_I64 && t1 != RAY_F64 &&
         ((op >= OP_ADD && op <= OP_MOD) || op == OP_MIN2 || op == OP_MAX2 ||
-         op == OP_NEG || op == OP_ABS || op == OP_SIGNUM))
+         op == OP_IDIV || op == OP_NEG || op == OP_ABS || op == OP_SIGNUM))
         return true;
     if (dt == RAY_I64 && t1 == RAY_F64 && op == OP_SIGNUM)
         return true;
@@ -1053,6 +1060,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
             case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(a[j] - b[j]); break;
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(a[j] * b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(a[j] / b[j]) : NULL_F64; break;
+            case OP_IDIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(floor(a[j] / b[j])) : NULL_F64; break;
             case OP_MOD: for (int64_t j = 0; j < n; j++) {
                 if (b[j] == 0.0) { d[j] = NULL_F64; continue; }
                 double m = fmod(a[j], b[j]);
@@ -1081,12 +1089,11 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                  * b==0 (non-null) → NULL_I64 mirrors fallback's zero-divisor post-pass.
                  * b==-1 && a==INT64_MIN → overflow: direct NULL_I64 (vs fallback: loop writes 0
                  * then zero-divisor pass marks null — same observable result). */
-                case OP_DIV: for (int64_t j=0;j<n;j++) {
+                case OP_DIV:
+                case OP_IDIV: for (int64_t j=0;j<n;j++) {
                     if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
-                    if (b[j]==0||(b[j]==-1&&a[j]==INT64_MIN)) { d[j]=NULL_I64; continue; }
-                    int64_t q=a[j]/b[j];
-                    if ((a[j]^b[j])<0&&q*b[j]!=a[j]) q--;
-                    d[j]=q;
+                    int64_t q = 0;
+                    d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : NULL_I64;
                 } break;
                 case OP_MOD: for (int64_t j=0;j<n;j++) {
                     if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
@@ -1108,11 +1115,10 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                 case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] + (uint64_t)b[j]); break;
                 case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] - (uint64_t)b[j]); break;
                 case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] * (uint64_t)b[j]); break;
-                case OP_DIV: for (int64_t j = 0; j < n; j++) {
-                    if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=0; continue; }
-                    int64_t q = a[j]/b[j];
-                    if ((a[j]^b[j])<0 && q*b[j]!=a[j]) q--;
-                    d[j] = q;
+                case OP_DIV:
+                case OP_IDIV: for (int64_t j = 0; j < n; j++) {
+                    int64_t q = 0;
+                    d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : 0;
                 } break;
                 case OP_MOD: for (int64_t j = 0; j < n; j++) {
                     if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=0; continue; }
@@ -3111,6 +3117,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
      * Each of these yields a double for the given index. */
 #define LV_READ(i)  (lp_f64 ? lp_f64[i] : lp_f32 ? (double)lp_f32[i] : lp_i64 ? (double)lp_i64[i] : lp_i32 ? (double)lp_i32[i] : lp_u32 ? (double)lp_u32[i] : lp_i16 ? (double)lp_i16[i] : lp_bool ? (double)lp_bool[i] : (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64 || lhs->type == -RAY_F32 || lhs->type == RAY_F32)) ? l_f64 : (double)l_i64)
 #define RV_READ(i)  (rp_f64 ? rp_f64[i] : rp_f32 ? (double)rp_f32[i] : rp_i64 ? (double)rp_i64[i] : rp_i32 ? (double)rp_i32[i] : rp_u32 ? (double)rp_u32[i] : rp_i16 ? (double)rp_i16[i] : rp_bool ? (double)rp_bool[i] : (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64 || rhs->type == -RAY_F32 || rhs->type == RAY_F32)) ? r_f64 : (double)r_i64)
+#define LV_READ_I64(i) (lp_i64 ? lp_i64[i] : lp_i32 ? (int64_t)lp_i32[i] : lp_u32 ? (int64_t)lp_u32[i] : lp_i16 ? (int64_t)lp_i16[i] : lp_bool ? (int64_t)lp_bool[i] : l_i64)
+#define RV_READ_I64(i) (rp_i64 ? rp_i64[i] : rp_i32 ? (int64_t)rp_i32[i] : rp_u32 ? (int64_t)rp_u32[i] : rp_i16 ? (int64_t)rp_i16[i] : rp_bool ? (int64_t)rp_bool[i] : r_i64)
 
     /* Compute once: is lhs/rhs integer-family (not float)? Used by BOOL path. */
     int l_is_int = !(lp_f64 || lp_f32 || (l_scalar &&
@@ -3181,7 +3189,13 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_SUB: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li-(uint64_t)ri);}break;
             case OP_MUL: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li*(uint64_t)ri);}break;
             case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);int64_t r;if(ri==0||(ri==-1&&li==INT64_MIN)){r=0;}else{r=li/ri;if((li^ri)<0&&r*ri!=li)r--;}odst[i]=r;}break;
-            case OP_IDIV:for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i64_null(floor(lv/rv)):0;}break;
+            case OP_IDIV:
+                if (src_is_i64_all) {
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}
+                } else {
+                    for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i64_null(floor(lv/rv)):0;}
+                }
+                break;
             case OP_MOD: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);int64_t r;if(ri==0||(ri==-1&&li==INT64_MIN)){r=0;}else{r=li%ri;if(r&&(r^ri)<0)r+=ri;}odst[i]=r;}break;
             case OP_MIN2:for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
             case OP_MAX2:for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
@@ -3195,7 +3209,13 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=(int32_t)((uint32_t)li*(uint32_t)ri);}break;
             /* OP_DIV omitted — ray_binop hard-codes F64 for OP_DIV, so
              * narrow-output OP_DIV is unreachable through any caller. */
-            case OP_IDIV:for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i32_null(floor(lv/rv)):0;}break;
+            case OP_IDIV:
+                if (src_is_i64_all) {
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(int32_t)q:0;}
+                } else {
+                    for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i32_null(floor(lv/rv)):0;}
+                }
+                break;
             case OP_MOD: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);int32_t r;if(ri==0||(ri==-1&&li==INT32_MIN)){r=0;}else{r=li%ri;if(r&&(r^ri)<0)r+=ri;}odst[i]=r;}break;
             case OP_MIN2:for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
             case OP_MAX2:for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
@@ -3208,7 +3228,13 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_SUB: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=(int16_t)((uint16_t)li-(uint16_t)ri);}break;
             case OP_MUL: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=(int16_t)((uint16_t)li*(uint16_t)ri);}break;
             /* OP_DIV omitted — unreachable, see I32 arm. */
-            case OP_IDIV:for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i16_null(floor(lv/rv)):0;}break;
+            case OP_IDIV:
+                if (src_is_i64_all) {
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(int16_t)q:0;}
+                } else {
+                    for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i16_null(floor(lv/rv)):0;}
+                }
+                break;
             case OP_MOD: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=ri?li%ri:0;}break;
             case OP_MIN2:for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
             case OP_MAX2:for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
@@ -3221,7 +3247,13 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_SUB: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li-ri;}break;
             case OP_MUL: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li*ri;}break;
             /* OP_DIV omitted — unreachable, see I32 arm. */
-            case OP_IDIV:for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_u8_null(floor(lv/rv)):0;}break;
+            case OP_IDIV:
+                if (src_is_i64_all) {
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(uint8_t)q:0;}
+                } else {
+                    for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_u8_null(floor(lv/rv)):0;}
+                }
+                break;
             case OP_MOD: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=ri?li%ri:0;}break;
             case OP_MIN2:for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
             case OP_MAX2:for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
@@ -3262,6 +3294,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     }
 #undef LV_READ
 #undef RV_READ
+#undef LV_READ_I64
+#undef RV_READ_I64
 done:
     if (lsym_buf) ray_free_raw(lsym_buf);
     if (rsym_buf) ray_free_raw(rsym_buf);
