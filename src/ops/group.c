@@ -60,8 +60,10 @@ static inline bool group_fp_type(int8_t t) {
  * -0.0 defect was an asymmetry between hash and compare, and NaN has none.
  * Canonicalising would also fold 0Nf (NULL_F64) together with a
  * runtime-produced NaN; SQL nullness is carried by the key null mask, not by
- * the payload, and F64 group keys therefore group non-sentinel NaNs by bit
- * pattern.
+ * the payload.  Bit-pattern grouping of NaNs is only observable on a column
+ * WITHOUT the HAS_NULLS attr: with it set, sentinel detection is `x != x`,
+ * so EVERY NaN payload is a null and the mask folds them into the one null
+ * group before the payload is ever compared.
  */
 static inline int64_t group_key_f64_bits(const void* data, int64_t row) {
     int64_t bits;
@@ -2346,19 +2348,18 @@ static inline uint64_t mode_scalar_key(ray_t* src, int64_t row) {
     const void* base = ray_data(src);
     switch (src->type) {
         case RAY_F64: {
-            double v;
-            memcpy(&v, (const char*)base + (size_t)row * 8, 8);
-            if (v == 0.0) v = 0.0;
+            /* Bit-level -0.0 fold: `if (v == 0.0) v = 0.0` is a no-op
+             * under release's -fno-signed-zeros (the #407 trap), which
+             * made (mode f) build-dependent for +/-0.0. */
             uint64_t k;
-            memcpy(&k, &v, 8);
+            memcpy(&k, (const char*)base + (size_t)row * 8, 8);
+            if (k == 0x8000000000000000ULL) k = 0;
             return k;
         }
         case RAY_F32: {
-            float v;
-            memcpy(&v, (const char*)base + (size_t)row * 4, 4);
-            if (v == 0.0f) v = 0.0f;
             uint32_t k32;
-            memcpy(&k32, &v, 4);
+            memcpy(&k32, (const char*)base + (size_t)row * 4, 4);
+            if (k32 == 0x80000000U) k32 = 0;
             return (uint64_t)k32;
         }
         case RAY_SYM:
