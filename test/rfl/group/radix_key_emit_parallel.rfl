@@ -9,11 +9,12 @@
 ;; n_emit >= RAY_PARALLEL_THRESHOLD (65536).
 ;;
 ;; What each fixture pins:
-;;   1. WIDE-SYM  — 2.6M singleton groups on a W32 SYM key: the widest
-;;      emit shape (and the one the 100M q13 profile is about).  Every
-;;      group is a singleton in til() order, so the emitted key column
-;;      must equal the SOURCE column element-for-element — a per-row
-;;      oracle over all 2.6M rows, not a spot check.
+;;   1. WIDE-SYM  — 200k singleton groups on a W32 SYM key: the widest
+;;      emit shape (and the one the 100M q13 profile is about).  200k is
+;;      enough to clear the dispatch threshold AND still land W32 SYM;
+;;      every group is a singleton in til() order, so the emitted key
+;;      column must equal the SOURCE column element-for-element — a
+;;      per-row oracle, not a spot check.
 ;;   2. WIDE-KEY  — 17 keys of MIXED width (I64/I32/I16/U8/BOOL/DATE/
 ;;      TIME/TIMESTAMP/SYM + I64 constants) at 100k groups.  Two things
 ;;      at once: the packed-key stride (a per-column index error shows up
@@ -22,22 +23,25 @@
 ;;      unbounded there (only dense direct-index routing caps it at 16),
 ;;      which is why the emit's destination-handle array must not be a
 ;;      fixed [16] stack array.
-;;   3. TAKE-BOUNDED — the HEAD(GROUP) limit hint (q17's shape): n_emit is
-;;      10, far below the dispatch threshold, so the emit stays on the
-;;      identical serial range call.  Both emit shapes must agree with the
-;;      same source-column oracle.
+;;   3. TAKE-BOUNDED — two shapes.  RSB (single-key take: 10) is the
+;;      HEAD(GROUP) limit hint (q17's shape): n_emit is 10, far below the
+;;      dispatch threshold, so it pins the serial range call.  RT (17-key
+;;      take: 10) does NOT get the pushdown — the limit hint doesn't fire
+;;      on this multi-key shape, so it emits all 100k rows in parallel and
+;;      apply_sort_take trims after; it pins the parallel emit + trim
+;;      composition, not the serial path.
 ;;
 ;; Routing (all three): >=1 int/SYM key with no nulls, >= 65536 rows, only
 ;; streaming aggs, and a key range too sparse for the parallel dense plan
 ;; (total_slots > rows/workers) -> exec_group_v2_parallel_radix.
 ;; ════════════════════════════════════════════════════════════════════
 
-;; ---------- 1. wide-SYM key, 2.6M singleton groups ----------
-(set NS 2600000)
+;; ---------- 1. wide-SYM key, 200k singleton groups ----------
+(set NS 200000)
 (set KS (as 'SYM (til NS)))
 (set TS (table [k v] (list KS (til NS))))
 (set RS (select {c: (count v) s: (sum v) from: TS by: k}))
-(count RS) -- 2600000
+(count RS) -- 200000
 ;; singleton groups in first-seen order => the key column IS the source column
 (all (== (at RS 'k) KS)) -- true
 (all (== (at RS 'c) (+ 1 (* 0 (til NS))))) -- true
