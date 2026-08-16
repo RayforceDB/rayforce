@@ -4992,6 +4992,119 @@ typedef struct {
     uint32_t gid;
 } group_topn_item_t;
 
+/* ---- top-N group selection (`by … desc: <agg> take: N`) -------------------
+ * The emit filter keeps only the globally best N groups before the phase-3
+ * emit.  Selection is a bounded heap over EVERY group of EVERY partition, so
+ * its cost is O(total groups) — tens of millions of rows on a high-cardinality
+ * 100M-row group-by, and it ran on one thread.
+ *
+ * `TOPN_BETTER(desc, a, b)` is the single ordering predicate: for `desc` a
+ * larger value is better, otherwise a smaller one.  The heap keeps the WORST
+ * retained item at the root (min-heap when desc), so the invariant is
+ * "parent is not better than child" and a swap is needed exactly when the
+ * parent IS better. */
+#define TOPN_BETTER(desc_dir, a, b) ((desc_dir) ? ((a) > (b)) : ((a) < (b)))
+
+/* Push one candidate into a bounded "best k" heap; returns the new count.
+ * Replacement is on STRICT improvement, so among equal values the earliest
+ * pushed wins: the retained set is exactly the k best items under the total
+ * order (value, push position).  Every caller pushes in (partition, gid)
+ * order, which makes that set independent of how the scan is parallelised. */
+static inline int64_t topn_heap_push(group_topn_item_t* h, int64_t hn,
+                                     int64_t k, uint8_t desc_dir, int64_t v,
+                                     uint32_t part, uint32_t gid) {
+    if (hn < k) {
+        int64_t j = hn++;
+        h[j] = (group_topn_item_t){v, part, gid};
+        while (j > 0) {                             /* sift up */
+            int64_t pr = (j - 1) >> 1;
+            if (!TOPN_BETTER(desc_dir, h[pr].value, h[j].value)) break;
+            group_topn_item_t t = h[pr]; h[pr] = h[j]; h[j] = t;
+            j = pr;
+        }
+        return hn;
+    }
+    if (!TOPN_BETTER(desc_dir, v, h[0].value)) return hn;
+    h[0] = (group_topn_item_t){v, part, gid};
+    for (int64_t j = 0;;) {                         /* sift down */
+        int64_t l = j * 2 + 1, r = l + 1, m = j;
+        if (l < hn && TOPN_BETTER(desc_dir, h[m].value, h[l].value)) m = l;
+        if (r < hn && TOPN_BETTER(desc_dir, h[m].value, h[r].value)) m = r;
+        if (m == j) break;
+        group_topn_item_t t = h[m]; h[m] = h[j]; h[j] = t;
+        j = m;
+    }
+    return hn;
+}
+
+static int topn_gid_cmp(const void* a, const void* b) {
+    uint32_t ga = ((const group_topn_item_t*)a)->gid;
+    uint32_t gb = ((const group_topn_item_t*)b)->gid;
+    return ga < gb ? -1 : (ga > gb ? 1 : 0);
+}
+
+static int topn_part_gid_cmp(const void* a, const void* b) {
+    const group_topn_item_t* x = (const group_topn_item_t*)a;
+    const group_topn_item_t* y = (const group_topn_item_t*)b;
+    if (x->part != y->part) return x->part < y->part ? -1 : 1;
+    return x->gid < y->gid ? -1 : (x->gid > y->gid ? 1 : 0);
+}
+
+/* Parallel pre-pass: reduce each partition to its OWN top-k.  The global
+ * top-k is a subset of the union of those, so the serial merge that follows
+ * only walks the survivors.  Each worker sorts its survivors back into gid
+ * order and the merge walks partitions in ascending order, so the merge sees
+ * candidates in the same (partition, gid) sequence the single-threaded scan
+ * did — the retained set, and therefore the emitted rows, are identical. */
+typedef struct {
+    group_ht_t*        part_hts;
+    group_topn_item_t* items;      /* [item_off[n_parts]] staging */
+    const uint32_t*    item_off;   /* [n_parts + 1] per-partition capacity */
+    uint32_t*          item_cnt;   /* [n_parts] survivors produced */
+    uint16_t           order_off;  /* in-row byte offset of the ordering agg */
+    uint8_t            desc_dir;
+} topn_scan_ctx_t;
+
+static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
+                         int64_t end) {
+    (void)worker_id;
+    topn_scan_ctx_t* c = (topn_scan_ctx_t*)vctx;
+    for (int64_t pi = start; pi < end; pi++) {
+        uint32_t p = (uint32_t)pi;
+        group_ht_t* ph = &c->part_hts[p];
+        uint32_t gc = ph->grp_count;
+        uint16_t rs = ph->layout.row_stride;
+        group_topn_item_t* h = c->items + c->item_off[p];
+        int64_t cap = (int64_t)(c->item_off[p + 1] - c->item_off[p]);
+        int64_t hn = 0;
+        for (uint32_t gi = 0; gi < gc; gi++) {
+            int64_t v = *(const int64_t*)(const void*)
+                        (ph->rows + (size_t)gi * rs + c->order_off);
+            hn = topn_heap_push(h, hn, cap, c->desc_dir, v, p, gi);
+        }
+        if (hn > 1) qsort(h, (size_t)hn, sizeof(*h), topn_gid_cmp);
+        c->item_cnt[p] = (uint32_t)hn;
+    }
+}
+
+/* Slot rebuild after compaction: gids moved, so every surviving row must be
+ * re-hashed into a cleared slot array.  Only partitions whose grp_count
+ * actually changed need it; an untouched partition's slots still describe its
+ * rows exactly. */
+typedef struct {
+    group_ht_t*    part_hts;
+    const int8_t*  key_types;
+    const uint8_t* dirty;          /* [n_parts] */
+} topn_rebuild_ctx_t;
+
+static void topn_rebuild_fn(void* vctx, uint32_t worker_id, int64_t start,
+                            int64_t end) {
+    (void)worker_id;
+    topn_rebuild_ctx_t* c = (topn_rebuild_ctx_t*)vctx;
+    for (int64_t p = start; p < end; p++)
+        if (c->dirty[p]) group_ht_rebuild_slots(&c->part_hts[p], c->key_types);
+}
+
 /* (first_row, flat_id) pair for the sparse stable-order path below —
  * sorting groups by earliest source row reproduces exactly the order the
  * dense row-domain scan assigns. */
@@ -12967,112 +13080,152 @@ v2_emit:;
                     &heap_hdr, (size_t)k_take * sizeof(group_topn_item_t));
                 if (!heap) goto topn_compact_skip;
                 int64_t hn = 0;
-                /* For top-N largest (desc=1): min-heap.  Root is smallest;
-                 * incoming v replaces root iff v > root.  Heap invariant:
-                 * parent ≤ child (so swap when parent > child).
-                 *
-                 * For top-N smallest (desc=0): max-heap.  Root is largest;
-                 * incoming v replaces root iff v < root.  Heap invariant:
-                 * parent ≥ child (so swap when parent < child).
-                 *
-                 * TOPN_NEEDS_SWAP(parent, child) := does the parent
-                 * violate the invariant relative to child? */
-                #define TOPN_NEEDS_SWAP(parent, child) \
-                    (desc_dir ? ((parent) > (child)) : ((parent) < (child)))
-                #define TOPN_SHOULD_REPLACE(new_v, root_v) \
-                    (desc_dir ? ((new_v) > (root_v)) : ((new_v) < (root_v)))
-                for (uint32_t p = 0; p < radix_n_parts; p++) {
-                    group_ht_t* ph = &part_hts[p];
-                    uint16_t rs = ph->layout.row_stride;
-                    uint32_t gc = ph->grp_count;
-                    for (uint32_t gi = 0; gi < gc; gi++) {
-                        const char* row = ph->rows + (size_t)gi * rs;
-                        int64_t v = *(const int64_t*)(const void*)
-                                    (row + order_off);
-                        if (hn < k_take) {
-                            int64_t j = hn++;
-                            heap[j] = (group_topn_item_t){v, p, gi};
-                            /* Sift up: bubble new entry toward root while
-                             * parent violates invariant. */
-                            while (j > 0) {
-                                int64_t pr = (j - 1) >> 1;
-                                if (!TOPN_NEEDS_SWAP(heap[pr].value,
-                                                     heap[j].value)) break;
-                                group_topn_item_t tmp = heap[pr];
-                                heap[pr] = heap[j]; heap[j] = tmp;
-                                j = pr;
+
+                /* Parallel pre-pass (topn_scan_fn): reduce each partition to
+                 * its own top-k, then merge the survivors here.  Admitted only
+                 * when the staging array is a real REDUCTION — at most an
+                 * eighth of the groups, i.e. under 2 bytes per group against
+                 * the >= 24-byte group rows already resident, so peak memory
+                 * cannot move.  Otherwise the pre-pass would do the serial
+                 * scan's work plus a copy, and the serial scan below is used
+                 * unchanged (it is also the fallback for allocation failure,
+                 * a single worker and a single partition). */
+                ray_t* stage_hdr = NULL;
+                ray_t* item_hdr = NULL;
+                uint32_t* item_off = NULL;
+                group_topn_item_t* items = NULL;
+                bool scanned = false;
+                if (pool && n_total > 1 && radix_n_parts > 1 &&
+                    (size_t)radix_n_parts + 1 <= SIZE_MAX / sizeof(uint32_t) / 2) {
+                    /* Per-partition capacity: a partition can contribute at
+                     * most k_take groups to the global top-k, and never more
+                     * groups than it holds.  kcap stays 64-bit — k_take is the
+                     * user's LIMIT and may exceed UINT32_MAX, in which case the
+                     * per-partition cap is just the partition's own count. */
+                    const uint64_t kcap = (uint64_t)k_take;
+                    uint64_t tot = 0;
+                    for (uint32_t p = 0; p < radix_n_parts; p++) {
+                        uint64_t gc = part_hts[p].grp_count;
+                        tot += gc < kcap ? gc : kcap;
+                    }
+                    if (tot > 0 && tot <= total_pre / 8 && tot <= UINT32_MAX &&
+                        tot <= SIZE_MAX / sizeof(group_topn_item_t)) {
+                        item_off = (uint32_t*)scratch_alloc(&stage_hdr,
+                            ((size_t)radix_n_parts * 2 + 1) * sizeof(uint32_t));
+                        items = item_off
+                            ? (group_topn_item_t*)scratch_alloc(&item_hdr,
+                                (size_t)tot * sizeof(group_topn_item_t))
+                            : NULL;
+                        if (items) {
+                            uint32_t* item_cnt = item_off + radix_n_parts + 1;
+                            uint32_t run = 0;
+                            for (uint32_t p = 0; p < radix_n_parts; p++) {
+                                uint64_t gc = part_hts[p].grp_count;
+                                item_off[p] = run;
+                                /* Same cap as the sizing pass above; the sum
+                                 * is `tot`, already checked <= UINT32_MAX. */
+                                run += (uint32_t)(gc < kcap ? gc : kcap);
                             }
-                        } else if (TOPN_SHOULD_REPLACE(v, heap[0].value)) {
-                            heap[0] = (group_topn_item_t){v, p, gi};
-                            int64_t j = 0;
-                            /* Sift down: find the child that should be
-                             * promoted (the one most violating the
-                             * invariant) and swap. */
-                            for (;;) {
-                                int64_t l = j * 2 + 1, r = l + 1, m = j;
-                                if (l < hn && TOPN_NEEDS_SWAP(heap[m].value,
-                                                             heap[l].value)) m = l;
-                                if (r < hn && TOPN_NEEDS_SWAP(heap[m].value,
-                                                             heap[r].value)) m = r;
-                                if (m == j) break;
-                                group_topn_item_t tmp = heap[m];
-                                heap[m] = heap[j]; heap[j] = tmp;
-                                j = m;
+                            item_off[radix_n_parts] = run;
+                            topn_scan_ctx_t sctx = {
+                                .part_hts = part_hts, .items = items,
+                                .item_off = item_off, .item_cnt = item_cnt,
+                                .order_off = order_off, .desc_dir = desc_dir,
+                            };
+                            ray_pool_dispatch_n(pool, topn_scan_fn, &sctx,
+                                                radix_n_parts);
+                            for (uint32_t p = 0; p < radix_n_parts; p++) {
+                                const group_topn_item_t* h = items + item_off[p];
+                                uint32_t n = item_cnt[p];
+                                for (uint32_t i = 0; i < n; i++)
+                                    hn = topn_heap_push(heap, hn, k_take,
+                                                        desc_dir, h[i].value,
+                                                        h[i].part, h[i].gid);
                             }
+                            scanned = true;
                         }
                     }
                 }
-                #undef TOPN_NEEDS_SWAP
-                #undef TOPN_SHOULD_REPLACE
-                if (hn > 0) {
-                    uint64_t all_groups = 0;
-                    for (uint32_t p = 0; p < radix_n_parts; p++)
-                        all_groups += part_hts[p].grp_count;
-                    ray_t* keep_hdr = NULL;
-                    ray_t* off_hdr = NULL;
-                    uint8_t* keep = all_groups <= SIZE_MAX
-                        ? (uint8_t*)scratch_calloc(&keep_hdr,
-                            (size_t)all_groups)
-                        : NULL;
-                    uint32_t* keep_off =
-                        (size_t)radix_n_parts + 1 <= SIZE_MAX / sizeof(uint32_t)
-                        ? (uint32_t*)scratch_alloc(&off_hdr,
-                            ((size_t)radix_n_parts + 1) * sizeof(uint32_t))
-                        : NULL;
-                    if (keep && keep_off) {
-                        keep_off[0] = 0;
-                        for (uint32_t p = 0; p < radix_n_parts; p++)
-                            keep_off[p + 1] = keep_off[p]
-                                + part_hts[p].grp_count;
-                        for (int64_t i = 0; i < hn; i++)
-                            keep[keep_off[heap[i].part] + heap[i].gid] = 1;
+                scratch_free(item_hdr);
+                scratch_free(stage_hdr);
 
-                        /* In-place compact each partition in original gid
-                         * order, preserving deterministic tie behaviour. */
-                        bool rebuilt_slots = false;
+                if (!scanned)
+                    for (uint32_t p = 0; p < radix_n_parts; p++) {
+                        group_ht_t* ph = &part_hts[p];
+                        uint16_t rs = ph->layout.row_stride;
+                        uint32_t gc = ph->grp_count;
+                        for (uint32_t gi = 0; gi < gc; gi++) {
+                            int64_t v = *(const int64_t*)(const void*)
+                                        (ph->rows + (size_t)gi * rs + order_off);
+                            hn = topn_heap_push(heap, hn, k_take, desc_dir,
+                                                v, p, gi);
+                        }
+                    }
+
+                if (hn > 0) {
+                    /* Compact straight from the <= k_take survivors: ordering
+                     * them by (partition, gid) makes each partition's keepers
+                     * ascending, so the in-place move is the same one the old
+                     * keep-bitmap walk made — but O(k_take + n_parts) instead
+                     * of O(total groups), and with no bitmap to allocate. */
+                    qsort(heap, (size_t)hn, sizeof(*heap), topn_part_gid_cmp);
+                    ray_t* dirty_hdr = NULL;
+                    uint8_t* dirty = (uint8_t*)scratch_calloc(&dirty_hdr,
+                        (size_t)radix_n_parts);
+                    if (dirty) {
+                        bool any_dirty = false;
+                        int64_t i = 0;
                         for (uint32_t p = 0; p < radix_n_parts; p++) {
                             group_ht_t* ph = &part_hts[p];
                             uint16_t rs = ph->layout.row_stride;
-                            uint32_t old_n = ph->grp_count;
                             uint32_t kn = 0;
-                            for (uint32_t gi = 0; gi < old_n; gi++) {
-                                if (!keep[keep_off[p] + gi]) continue;
+                            for (; i < hn && heap[i].part == p; i++) {
+                                uint32_t gi = heap[i].gid;
                                 if (gi != kn)
                                     memmove(ph->rows + (size_t)kn * rs,
                                             ph->rows + (size_t)gi * rs, rs);
                                 kn++;
                             }
                             if (kn == ph->grp_count) continue;
-                            rebuilt_slots = true;
                             ph->grp_count = kn;
+                            /* Resize the slot array to the survivors before it
+                             * is rebuilt.  A partition that held millions of
+                             * groups keeps at most k_take of them, yet the
+                             * rebuild's clear is O(ht_cap) — across all
+                             * partitions of a 100M-row group-by that is a
+                             * gigabyte of memset for a handful of live rows.
+                             * The ALLOCATION is untouched (group_ht_free goes
+                             * through the block header) and only shrinks, so
+                             * every slot the table now uses is still inside it.
+                             * Safe because nothing inserts into these tables
+                             * again: phase 3 reads rows, and the holistic
+                             * re-probe only probes.  2*kn keeps the same 50%
+                             * load factor group_ht_rehash targets. */
+                            uint64_t need = (uint64_t)kn * 2;
+                            uint32_t want = 2;
+                            while ((uint64_t)want < need && want < ph->ht_cap)
+                                want <<= 1;
+                            if (want < ph->ht_cap) ph->ht_cap = want;
+                            dirty[p] = 1;
+                            any_dirty = true;
                         }
-                        if (rebuilt_slots) {
-                            for (uint32_t p = 0; p < radix_n_parts; p++)
-                                group_ht_rebuild_slots(&part_hts[p], key_types);
+                        if (any_dirty) {
+                            if (pool && n_total > 1 && radix_n_parts > 1) {
+                                topn_rebuild_ctx_t rctx = {
+                                    .part_hts = part_hts,
+                                    .key_types = key_types, .dirty = dirty,
+                                };
+                                ray_pool_dispatch_n(pool, topn_rebuild_fn,
+                                                    &rctx, radix_n_parts);
+                            } else {
+                                for (uint32_t p = 0; p < radix_n_parts; p++)
+                                    if (dirty[p])
+                                        group_ht_rebuild_slots(&part_hts[p],
+                                                               key_types);
+                            }
                         }
                     }
-                    scratch_free(off_hdr);
-                    scratch_free(keep_hdr);
+                    scratch_free(dirty_hdr);
                 }
                 scratch_free(heap_hdr);
             }
