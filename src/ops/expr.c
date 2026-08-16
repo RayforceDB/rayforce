@@ -76,7 +76,12 @@ static inline bool i64_span_dbl_exact(const int64_t* v, int64_t n) {
 /* Both operands in one pass — one traversal, two streams. */
 static inline bool i64_span2_dbl_exact(const int64_t* a, const int64_t* b, int64_t n) {
     int bad = 0;
-    for (int64_t i = 0; i < n; i++) bad |= !i64_dbl_exact(a[i]) | !i64_dbl_exact(b[i]);
+    /* Two statements, not `!x | !y`: clang's -Wbitwise-instead-of-logical
+     * rejects `|` on two boolean operands under -Werror.  Still branchless. */
+    for (int64_t i = 0; i < n; i++) {
+        bad |= !i64_dbl_exact(a[i]);
+        bad |= !i64_dbl_exact(b[i]);
+    }
     return !bad;
 }
 
@@ -3293,7 +3298,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                         const int64_t* lv = lp_i64; const int64_t* rv = rp_i64;
                         for (int64_t i=0;i<n;i++) {
                             int64_t li=lv[i], ri=rv[i];
-                            bad |= !i64_dbl_exact(li) | !i64_dbl_exact(ri);
+                            bad |= !i64_dbl_exact(li);
+                            bad |= !i64_dbl_exact(ri);
                             odst[i] = ri!=0 ? ray_cast_f64_to_i64_null(floor((double)li/(double)ri)) : 0;
                         }
                     } else {
