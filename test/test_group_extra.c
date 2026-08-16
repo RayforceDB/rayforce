@@ -1121,6 +1121,10 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
     out_cnt = ray_table_get_col_idx(res, 1);
     TEST_ASSERT_NOT_NULL(out_key);
     TEST_ASSERT_NOT_NULL(out_cnt);
+    /* The asc request falls through to the FULL group set (all 5 groups) —
+     * pin the row count too, so this can tell "full fall-through" apart
+     * from a hypothetical asc top-2, and cannot pass by accident. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
     int got_smallest = 0;
     for (int64_t i = 0; i < ray_table_nrows(res); i++) {
         int16_t k = ((int16_t*)ray_data(out_key))[i];

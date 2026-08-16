@@ -1463,7 +1463,12 @@ typedef struct {
      * For COUNT/SUM/MAX the natural ordering is largest-first; for
      * MIN it's smallest-first.  Both directions are supported per
      * agg kind so `desc: min_value take: N` (the N groups with the
-     * largest min) is also expressible. */
+     * largest min) is also expressible.
+     *
+     * CONTRACT (#408): every arming site MUST set this explicitly.
+     * A zero default is NOT coerced to largest-first for COUNT any
+     * more — consumers take .desc at face value, and the desc-only
+     * keep-min trims are gated off entirely when it is 0. */
     uint8_t  desc;
 } ray_group_emit_filter_t;
 ray_group_emit_filter_t ray_group_emit_filter_get(void);

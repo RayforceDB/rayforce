@@ -3,9 +3,10 @@
 ;;
 ;; `select … by … asc: <agg> take: N` arms the SAME emit filter as the
 ;; `desc:` form (query.c match_group_desc_count_take sets .desc = 0), and
-;; group.c serves it with the bounded top-N heap (use_topn_filter →
-;; topn_fuse_partition / topn_scan_fn → topn_heap_push, whose TOPN_BETTER
-;; predicate is direction-symmetric).  Two places used to force
+;; group.c serves it either with the bounded top-N heap (use_topn_filter
+;; → topn_fuse_partition / topn_scan_fn → topn_heap_push, whose
+;; TOPN_BETTER predicate is direction-symmetric) or, on single-key
+;; dense/sparse shapes, with the desc-only keep-min trims.  Two places used to force
 ;; `desc = 1` whenever the ordering agg was COUNT — the v2_emit direction
 ;; hoist and group_emit_filter_trim — so an asc COUNT take returned the
 ;; LARGEST N groups, byte-identical to the desc answer, while `-c 1` (no
@@ -14,10 +15,14 @@
 ;;
 ;; PATH REACH.  Every fixture below is 2.5M rows (> the 1<<21 radix
 ;; admission) with the emit filter armed by `asc:`/`desc: <agg> take: N`,
-;; N ≤ 1024.  Instrumenting use_topn_filter and the fused-top-k admission
-;; showed each select here entering the parallel radix path with the
-;; fused per-partition heap armed, desc_dir = 0 for `asc:` and 1 for
-;; `desc:`.
+;; N ≤ 1024.  Instrumentation showed the 2-KEY selects entering the
+;; parallel radix path with the fused per-partition heap armed
+;; (desc_dir = 0 for `asc:`, 1 for `desc:`).  The SINGLE-key selects
+;; take the dense/sparse keep-min ladder instead: desc arms
+;; da_count_emit_keep_min, asc must NOT (that machinery is largest-
+;; first only) and falls through to the full group set + sort/take —
+;; pre-fix, single-key asc was wrong at EVERY core count, not just
+;; under the pool.
 ;;
 ;; ORACLE.  S = round(sqrt(i)) over (til 2500000) puts 2j+1 rows in group
 ;; j (1, 3, 5, … — every group count DISTINCT, so the smallest-N set is
