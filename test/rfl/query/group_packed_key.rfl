@@ -148,17 +148,20 @@
 (count (select {n: (count v) by: {a: a b: b} from: (table [a b v] (list (as 'I64 (list 1 1 0Ni 0Ni 0)) (as 'I64 (list 2 0Ni 2 0Ni 0)) [1 2 3 4 5]))})) -- 5
 
 ;; ── NOT packed: F64 key keeps the per-key hash ───────────────────────────
-;; ±0.0 NOTE.  How many groups [0.0, -0.0, 1.0] forms is BUILD-DEPENDENT and
-;; PRE-EXISTING, so it is deliberately not pinned to a number here: the
-;; release build compiles with -fno-signed-zeros and folds -0.0 to +0.0
-;; (2 groups), while the debug/ASan build keeps them distinct (3 groups)
-;; because group_keys_equal compares the raw key bits while ray_hash_f64
-;; normalises -0.0 — those two already disagree in base, and that is filed
-;; separately.  F64 keys are excluded from packed_key precisely so this
-;; change cannot touch it.  What IS asserted holds in BOTH builds and is the
-;; property that actually matters: whatever a build decides about -0.0, hash
-;; and compare agree well enough that the group count does not depend on how
-;; often the rows repeat.
+;; ±0.0 CONTRACT (#407, previously build-dependent).  [0.0, -0.0, 1.0] is
+;; TWO groups in EVERY build.  Each F64 group-key builder canonicalises
+;; -0.0 → +0.0 at the key-READ boundary (group_key_f64_bits in src/ops/group.c)
+;; before both the key store and the hash, so group_keys_equal's raw-bit
+;; compare can no longer disagree with ray_hash_f64's normalisation.  Before
+;; the fix this line was 3 in the debug/ASan build and 2 in release — release
+;; only by accident, because -fno-signed-zeros folds the -0.0 LITERAL below to
+;; +0.0 before the kernel sees it.  The literal form is therefore the DEBUG
+;; half of the contract; the release half needs a runtime-produced -0.0 and
+;; lives in group_f64_signed_zero.rfl.  F64 keys stay off packed_key
+;; regardless (read_col_i64 does not decode F64), pinned by
+;; group_extra/ght_packed_key_excludes_f64.
+(count (select {n: (count v) by: {f: f} from: (table [f v] (list [0.0 -0.0 1.0] [1 2 3]))})) -- 2
+;; …and the count still does not depend on how often the rows repeat.
 (- (count (select {n: (count v) by: {f: f} from: (table [f v] (list [0.0 -0.0 1.0] [1 2 3]))})) (count (select {n: (count v) by: {f: f} from: (table [f v] (list [0.0 -0.0 1.0 0.0 -0.0 1.0] [1 2 3 4 5 6]))}))) -- 0
 (set PKF (table [f k v] (list (% (til 300000) 37.0) (% (til 300000) 4) (til 300000))))
 (count (select {n: (count v) by: {f: f k: k} from: PKF})) -- 148

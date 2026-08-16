@@ -1,0 +1,105 @@
+;; F64 group keys: -0.0 and +0.0 are ONE group (issue #407).
+;;
+;; ray_hash_f64 normalises -0.0 -> +0.0, but group_keys_equal / ght_lanes_equal
+;; compare the raw 8 key bytes.  A column carrying both bit patterns therefore
+;; hashed -0.0 into +0.0's slot chain but never compared equal to it, so -0.0
+;; split off into its own group.  Every F64 group-key builder now canonicalises
+;; the value at the key-READ boundary (group_key_f64_bits in src/ops/group.c) before
+;; both the key store and the hash, so hash and compare see identical bits on
+;; every path -- generic per-row, fat-entry radix phase 1, the v2 partition-
+;; major stager, the reprobe/regroup paths and the sequential fallback.
+;;
+;; EVERY -0.0 below is produced at RUNTIME via (* -1.0 0.0).  A -0.0 LITERAL is
+;; not enough: the release build compiles with -fno-signed-zeros and folds the
+;; literal to +0.0 before the group kernel ever sees it, which is exactly why
+;; the bug survived in release.  The multiply is data-dependent, so no build
+;; folds it away.  (The literal form is pinned in group_packed_key.rfl, which
+;; covers the debug side of the same contract.)
+;;
+;; NaN policy: NaN is deliberately NOT canonicalised.  Distinct NaN payloads
+;; hash distinctly AND compare distinctly -- self-consistent already, unlike
+;; the -0.0 asymmetry -- and SQL nullness rides on the key null mask, not on
+;; the payload, so 0Nf keeps its own group (asserted below).
+
+(set Z (* -1.0 0.0))
+
+;; ── single F64 key, runtime -0.0 ─────────────────────────────────────────
+(set SZ1 (table [f v] (list (as 'F64 (list 0.0 Z 1.0)) [1 2 3])))
+(count (select {n: (count v) by: {f: f} from: SZ1})) -- 2
+(at (select {n: (count v) by: {f: f} asc: f from: SZ1}) 'n) -- [2 1]
+
+;; -0.0 arriving FIRST must not change the answer (the group's stored key is
+;; canonical +0.0 for every contributing row, so the representative does not
+;; depend on which row opened the group or on which worker saw it first).
+(set SZ2 (table [f v] (list (as 'F64 (list Z 0.0 1.0)) [1 2 3])))
+(count (select {n: (count v) by: {f: f} from: SZ2})) -- 2
+(at (select {n: (count v) by: {f: f} asc: f from: SZ2}) 'n) -- [2 1]
+
+;; a column of nothing but runtime -0.0 collapses to a single group
+(count (select {n: (count v) by: {f: f} from: (table [f v] (list (as 'F64 (list Z Z Z)) [1 2 3]))})) -- 1
+
+;; group count must not depend on how often the rows repeat
+(- (count (select {n: (count v) by: {f: f} from: SZ1})) (count (select {n: (count v) by: {f: f} from: (table [f v] (list (as 'F64 (list 0.0 Z 1.0 0.0 Z 1.0)) [1 2 3 4 5 6]))}))) -- 0
+
+;; ── multi-key: F64 + F64, and F64 + I64 ──────────────────────────────────
+(set SZM (table [a b v] (list (as 'F64 (list 0.0 Z 1.0 Z 0.0)) (as 'F64 (list 1.0 1.0 2.0 2.0 1.0)) [1 2 3 4 5])))
+(count (select {n: (count v) by: {a: a b: b} from: SZM})) -- 3
+(at (select {n: (count v) by: {a: a b: b} from: SZM}) 'n) -- [3 1 1]
+
+(set SZI (table [a k v] (list (as 'F64 (list 0.0 Z 0.0 Z 1.0)) (as 'I64 (list 7 7 8 8 7)) [1 2 3 4 5])))
+(count (select {n: (count v) by: {a: a k: k} from: SZI})) -- 3
+(at (select {n: (count v) by: {a: a k: k} from: SZI}) 'n) -- [2 2 1]
+
+;; ── WHERE-filtered group-by (rowsel / match-list key gather) ─────────────
+;; Rows 0..3 survive: +0.0, -0.0, 1.0, -0.0 -> 2 groups, counts 3 and 1.
+(set SZW (table [f k v] (list (as 'F64 (list 0.0 Z 1.0 Z 0.0 Z)) (as 'I64 (list 0 1 2 3 9 9)) [1 2 3 4 5 6])))
+(count (select {n: (count v) by: {f: f} from: SZW where: (< k 4)})) -- 2
+(at (select {n: (count v) by: {f: f} asc: f from: SZW where: (< k 4)}) 'n) -- [3 1]
+(sum (at (select {s: (sum v) by: {f: f} from: SZW where: (< k 4)}) 's)) -- 10
+
+;; ── 0Nf null F64 keys keep their own group (NaN is not canonicalised) ────
+;; p = [+0.0, null, -0.0, null, 1.0, +0.0] -> 3 groups: 0.0 x3, null x2, 1.0 x1.
+;; Base behaviour for the NULL group is unchanged; only the +0.0 / -0.0 split
+;; is gone (base produced 4 groups here).
+(set SZN (table [i p] (list (til 6) (as 'F64 (list 0.0 0Nf Z 0Nf 1.0 0.0)))))
+(count (select {n: (count i) by: {p: p} from: SZN})) -- 3
+(at (select {n: (count i) by: {p: p} from: SZN}) 'n) -- [3 2 1]
+(nil? (at (at (select {n: (count i) by: {p: p} from: SZN}) 'p) 1)) -- true
+(nil? (at (at (select {n: (count i) by: {p: p} from: SZN}) 'p) 0)) -- false
+;; a null-only F64 key column is still one group, as before
+(count (select {n: (count i) by: {p: p} from: (table [i p] (list (til 3) (as 'F64 (list 0Nf 0Nf 0Nf))))})) -- 1
+
+;; ── large parallel: 3M rows > the radix pipeline's 1<<21 scan gate ───────
+;; Every expectation below is analytic and core-count independent, so a
+;; divergence between the sequential and the pool-parallel builders (phase-1
+;; stagers, phase-2 partition merge, reprobe) fails loudly.
+(set BN 3000000)
+
+;; low cardinality: f cycles [+0.0, -0.0, 1.0, -1.0] -> 3 groups, the merged
+;; zero group holding exactly half the rows.
+(set BF (as 'F64 (take (list 0.0 Z 1.0 -1.0) BN)))
+(set BT (table [f k v] (list BF (% (til BN) 997) (til BN))))
+(count (select {n: (count v) by: {f: f} from: BT})) -- 3
+(at (select {n: (count v) by: {f: f} asc: f from: BT}) 'n) -- [750000 1500000 750000]
+(sum (at (select {n: (count v) by: {f: f} from: BT}) 'n)) -- 3000000
+
+;; two keys (F64 + I64), 3 x 997 combinations -- all reachable because 4 and
+;; 997 are coprime and BN covers every residue mod 3988.
+(count (select {n: (count v) by: {f: f k: k} from: BT})) -- 2991
+(sum (at (select {n: (count v) by: {f: f k: k} from: BT}) 'n)) -- 3000000
+
+;; large + WHERE: k < 100 of 997 survives; both zero signs are in the survivors.
+(count (select {n: (count v) by: {f: f} from: BT where: (< k 100)})) -- 3
+(at (select {n: (count v) by: {f: f} asc: f from: BT where: (< k 100)}) 'n) -- [75232 150463 75232]
+(sum (at (select {n: (count v) by: {f: f} from: BT where: (< k 100)}) 'n)) -- 300927
+
+;; medium-high cardinality F64 key (~200K groups) so the near-unique
+;; partition-major probe runs: magnitude i%99991 with a parity-driven sign, so
+;; +m and -m both occur for every m -- and m == 0 yields both +0.0 and -0.0,
+;; which must fold into ONE group.  2*99990 + 1 = 199981.
+(set BU (* (- (* 2 (% (til BN) 2)) 1) (as 'F64 (% (til BN) 99991))))
+(count (select {n: (count v) by: {f: f} from: (table [f v] (list BU (til BN)))})) -- 199981
+;; distinct uses the hashset path, whose F64 compare is `==` (so it always
+;; folded the zeros) -- an independent oracle for the same count.
+(count (distinct BU)) -- 199981
+(sum (at (select {n: (count v) by: {f: f} from: (table [f v] (list BU (til BN)))}) 'n)) -- 3000000

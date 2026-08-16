@@ -2452,10 +2452,12 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
 
 /* --------------------------------------------------------------------------
  * Packed-key eligibility: F64 keys must never join the packed lane path.
- * The lane compare is raw-bit while ray_hash_f64 normalises -0.0, so a
- * packed F64 key would make hash and equality disagree.  The rfl-level
- * ±0.0 test cannot pin this (a raw-bit hash+compare is self-consistent
- * and passes it), so the predicate is asserted directly here.
+ * read_col_i64 — which the packed stagers use to load every lane — does not
+ * decode F64, so a packed F64 key would hash and compare the wrong bits; the
+ * exclusion also keeps the packed lanes clear of the -0.0 canonicalisation
+ * the F64 key builders apply (group_key_f64_bits, #407).  No rfl-level
+ * assertion can pin the predicate itself (every layout now agrees on the
+ * ±0.0 answer), so it is asserted directly here.
  * -------------------------------------------------------------------------- */
 static test_result_t test_ght_packed_key_excludes_f64(void) {
     ray_heap_init();

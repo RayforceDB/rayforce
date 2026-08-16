@@ -1289,8 +1289,10 @@ typedef struct {
      * wide/inline-STR key and no floating-point key.  Such a key region is
      * exactly (n_keys + null_words) 8-byte lanes whose STORED BITS are the
      * identity, so hash and compare may treat it as one packed value.  F64
-     * keys are excluded because their hash normalises -0.0 (ray_hash_f64) —
-     * a raw-lane hash would not, and the two must stay consistent. */
+     * keys are excluded: read_col_i64 (which the packed stagers use) does not
+     * decode F64 at all, and keeping them out also keeps the packed lanes free
+     * of the -0.0 canonicalisation the F64 builders apply (#407,
+     * group_key_f64_bits).  Pinned by group_extra/ght_packed_key_excludes_f64. */
     uint8_t  packed_key;
     uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
     /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */

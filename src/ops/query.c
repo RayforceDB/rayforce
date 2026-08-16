@@ -9302,10 +9302,9 @@ by_dict_done:
              * We also record a per-group null flag.  The DAG GROUP path
              * stores null keys with value=0 and differentiates via a
              * null mask — if we hashed raw bits only, a null group would
-             * collide with non-null value 0 (for I64 / I32 / SYM / DATE
-             * / TIME etc.) or with +0.0 for F64 (ray_hash_f64 normalises
-             * -0.0 to +0.0, and F64's null bit pattern on this platform
-             * is the -0.0 pattern).  The null flag keeps those groups
+             * collide with non-null value 0 (for I64 / I32 / SYM / DATE /
+             * TIME etc.), and for F64 with +0.0, since an all-zero key slot
+             * reads back as +0.0.  The null flag keeps those groups
              * distinct. */
             uint8_t gk_null_stack[256];
             ray_t*  gk_null_hdr = NULL;
@@ -9327,18 +9326,27 @@ by_dict_done:
                 bool gk_has_nulls = (grp_key_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
                 if (gk_has_nulls) {
                     for (int64_t gi = 0; gi < n_groups; gi++) {
-                        if (kt == RAY_F64)
-                            memcpy(&gk_vals[gi], &((double*)ray_data(grp_key_col))[gi], 8);
-                        else
+                        if (kt == RAY_F64) {
+                            /* -0.0 -> +0.0, matching group.c's key-read
+                             * normalisation (group_key_f64_bits, #407):
+                             * gk_vals is compared BIT-WISE against the source
+                             * column below while the probe hashes through
+                             * ray_hash_f64 (which normalises), so both sides
+                             * must carry canonical bits or a -0.0 row would
+                             * never match its own +0.0 group. */
+                            double dv = clear_neg_zero(((double*)ray_data(grp_key_col))[gi]);
+                            memcpy(&gk_vals[gi], &dv, 8);
+                        } else
                             gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
                         if (ray_vec_is_null(grp_key_col, gi))
                             gk_null[gi] = 1;
                     }
                 } else {
                     for (int64_t gi = 0; gi < n_groups; gi++) {
-                        if (kt == RAY_F64)
-                            memcpy(&gk_vals[gi], &((double*)ray_data(grp_key_col))[gi], 8);
-                        else
+                        if (kt == RAY_F64) {           /* canonical -0.0, see above */
+                            double dv = clear_neg_zero(((double*)ray_data(grp_key_col))[gi]);
+                            memcpy(&gk_vals[gi], &dv, 8);
+                        } else
                             gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
                     }
                 }
@@ -9382,9 +9390,8 @@ by_dict_done:
                  * For F64 keys, hash via the float path; memcpy bit pattern
                  * out of gk_vals to dodge strict-aliasing.  Null groups
                  * get a distinct hash so they don't collide with zero-valued
-                 * groups (F64 null has the -0.0 bit pattern, which
-                 * ray_hash_f64 normalises to +0.0; integer-flavoured
-                 * nulls are stored as value=0). */
+                 * groups (null keys are stored as an all-zero key slot,
+                 * which reads back as integer 0 / +0.0). */
                 for (int64_t gi = 0; gi < n_groups; gi++) {
                     uint64_t h;
                     if (gk_null[gi]) {
@@ -9411,8 +9418,10 @@ by_dict_done:
                 for (int64_t r = 0; r < nrows_orig && found < n_groups; r++) {
                     bool r_null = orig_nulls_flag && ray_vec_is_null(orig_key_col, r);
                     int64_t ov;
-                    if (kt == RAY_F64) memcpy(&ov, &((double*)ray_data(orig_key_col))[r], 8);
-                    else ov = read_col_i64(ray_data(orig_key_col), r, kt, orig_key_col->attrs);
+                    if (kt == RAY_F64) {           /* canonical -0.0, see above */
+                        double dv = clear_neg_zero(((double*)ray_data(orig_key_col))[r]);
+                        memcpy(&ov, &dv, 8);
+                    } else ov = read_col_i64(ray_data(orig_key_col), r, kt, orig_key_col->attrs);
                     uint64_t h;
                     if (r_null) {
                         h = ray_hash_i64((int64_t)0xDEADBEEFCAFEBABEULL);

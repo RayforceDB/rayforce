@@ -42,6 +42,38 @@ static inline bool group_fp_type(int8_t t) {
     return t == RAY_F32 || t == RAY_F64;
 }
 
+/*
+ * group_key_f64_bits -- read an F64 GROUP BY key's bits, canonicalised.
+ *
+ * Canonicalises -0.0 -> +0.0 at the key-READ boundary, before the value is
+ * both stored into the key slot and hashed.  ray_hash_f64 normalises -0.0,
+ * but group_keys_equal / ght_lanes_equal compare the raw 8 bytes: a column
+ * carrying both bit patterns hashed +0.0 and -0.0 into the same slot chain
+ * yet never compared equal, so -0.0 formed its own group (#407).  Normalising
+ * once here keeps hash and compare in lockstep on every path (the ab5053a9
+ * lesson) and makes +0.0 the emitted representative of the merged group
+ * regardless of which row arrived first — the stored bits are +0.0 for every
+ * contributing row, so the result is order- and thread-independent.
+ *
+ * NaN is deliberately NOT canonicalised.  Distinct NaN payloads hash
+ * distinctly AND compare distinctly, which is already self-consistent — the
+ * -0.0 defect was an asymmetry between hash and compare, and NaN has none.
+ * Canonicalising would also fold 0Nf (NULL_F64) together with a
+ * runtime-produced NaN; SQL nullness is carried by the key null mask, not by
+ * the payload, and F64 group keys therefore group non-sentinel NaNs by bit
+ * pattern.
+ */
+static inline int64_t group_key_f64_bits(const void* data, int64_t row) {
+    int64_t bits;
+    memcpy(&bits, (const double*)data + row, 8);
+    /* Bit-level, never `if (v == 0.0) v = 0.0`: release builds use
+     * -fno-signed-zeros, under which that form folds to a no-op (same trap
+     * clear_neg_zero documents).  Lowers to one compare + cmov on the value
+     * that was loaded anyway. */
+    if (bits == INT64_MIN) bits = 0;          /* -0.0 -> +0.0 */
+    return bits;
+}
+
 static inline double group_fp_at(const void* data, int8_t t, int64_t row) {
     return t == RAY_F64 ? ((const double*)data)[row]
                         : (double)((const float*)data)[row];
@@ -3464,8 +3496,10 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
          * `default` arm reads ONE BYTE, so an un-enumerated fixed-width type
          * (RAY_F32 is the live example) would be silently mis-loaded, and a
          * packed layout would then hash those wrong bits as the key identity.
-         * F64 is excluded for a different reason — ray_hash_f64 normalises
-         * -0.0 and a raw-lane hash would not (see ght_layout_t.packed_key).
+         * F64 is excluded by the same rule (read_col_i64 does not decode it),
+         * which additionally keeps the packed lanes clear of the -0.0
+         * canonicalisation the F64 key builders apply (group_key_f64_bits,
+         * #407) — see ght_layout_t.packed_key.
          * GUID/STR are excluded by any_wide_key.  n_keys == 0 is not a
          * tuple. */
         if (n_keys >= 1 && !out->any_wide_key) {
@@ -4100,8 +4134,11 @@ static inline uint64_t inline_build_keys(const ght_layout_t* ly, const int8_t* k
             *(int64_t*)slot = row;
             kh = wide_key_hash_at(ly, k, key_data, key_pool, row);
         } else if (key_types[k] == RAY_F64) {
-            *(int64_t*)slot = ((const int64_t*)key_data[k])[row];
-            kh = ray_hash_f64(((const double*)key_data[k])[row]);
+            /* -0.0 -> +0.0 before BOTH the store and the hash (group_key_f64_bits). */
+            int64_t kv = group_key_f64_bits(key_data[k], row);
+            double dv; memcpy(&dv, &kv, 8);
+            *(int64_t*)slot = kv;
+            kh = ray_hash_f64(dv);
         } else {
             int64_t kv = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
             *(int64_t*)slot = kv;
@@ -4896,10 +4933,11 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                 ek[k] = row;
                 kh = wide_key_hash_at(ly, k, key_data, ht->key_pool, row);
             } else if (t == RAY_F64) {
-                int64_t kv;
-                memcpy(&kv, &((double*)key_data[k])[row], 8);
+                /* -0.0 -> +0.0 before BOTH the store and the hash. */
+                int64_t kv = group_key_f64_bits(key_data[k], row);
+                double dv; memcpy(&dv, &kv, 8);
                 ek[k] = kv;
-                kh = ray_hash_f64(((double*)key_data[k])[row]);
+                kh = ray_hash_f64(dv);
             } else {
                 int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
                 ek[k] = kv;
@@ -5455,10 +5493,11 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 keys[k] = row;
                 kh = wide_key_hash_at(ly, k, c->key_data, c->key_pool, row);
             } else if (t == RAY_F64) {
-                int64_t kv;
-                memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+                /* -0.0 -> +0.0 before BOTH the store and the hash. */
+                int64_t kv = group_key_f64_bits(c->key_data[k], row);
+                double dv; memcpy(&dv, &kv, 8);
                 keys[k] = kv;
-                kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+                kh = ray_hash_f64(dv);
             } else {
                 int64_t kv = read_col_i64(c->key_data[k], row, t, c->key_attrs[k]);
                 keys[k] = kv;
@@ -6094,10 +6133,14 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                     uint64_t kh = 0;
                     int8_t t = c->key_types[k];
                     if (t == RAY_F64) {
-                        int64_t kv;
-                        memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+                        /* -0.0 -> +0.0 before BOTH the store and the hash.
+                         * (v2_packed never holds with an F64 key — F64 is off
+                         * the packed whitelist — but stage the same bits the
+                         * generic builder would either way.) */
+                        int64_t kv = group_key_f64_bits(c->key_data[k], row);
+                        double dv; memcpy(&dv, &kv, 8);
                         mk[(size_t)mn * nk + k] = kv;
-                        if (!v2_packed) kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+                        if (!v2_packed) kh = ray_hash_f64(dv);
                     } else {
                         int64_t kv = read_col_i64(c->key_data[k], row, t,
                                                   c->key_attrs[k]);
@@ -6244,10 +6287,11 @@ v2_morsel_done:
                 ek[k] = row;
                 kh = wide_key_hash_at(ly, k, c->key_data, kpool, row);
             } else if (t == RAY_F64) {
-                int64_t kv;
-                memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+                /* -0.0 -> +0.0 before BOTH the store and the hash. */
+                int64_t kv = group_key_f64_bits(c->key_data[k], row);
+                double dv; memcpy(&dv, &kv, 8);
                 ek[k] = kv;
-                kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+                kh = ray_hash_f64(dv);
             } else {
                 int64_t kv = read_col_i64(c->key_data[k], row, t, c->key_attrs[k]);
                 ek[k] = kv;
@@ -8035,10 +8079,12 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
                 ek_buf[k] = row;
                 kh = wide_key_hash_at(c->layout, k, key_data, c->key_pool, row);
             } else if (t == RAY_F64) {
-                int64_t kv;
-                memcpy(&kv, &((double*)key_data[k])[row], 8);
+                /* -0.0 -> +0.0 before BOTH the store and the hash — the
+                 * reprobe MUST derive the same bits phase 1 stored. */
+                int64_t kv = group_key_f64_bits(key_data[k], row);
+                double dv; memcpy(&dv, &kv, 8);
                 ek_buf[k] = kv;
-                kh = ray_hash_f64(((double*)key_data[k])[row]);
+                kh = ray_hash_f64(dv);
             } else {
                 int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
                 ek_buf[k] = kv;
@@ -14188,10 +14234,12 @@ sequential_fallback:;
                             ek_buf[k] = row;
                             kh = wide_key_hash_at(ly, k, key_data, reprobe_pool, row);
                         } else if (t == RAY_F64) {
-                            int64_t kv;
-                            memcpy(&kv, &((double*)key_data[k])[row], 8);
+                            /* -0.0 -> +0.0 before BOTH the store and the hash
+                             * — must match the builder that filled final_ht. */
+                            int64_t kv = group_key_f64_bits(key_data[k], row);
+                            double dv; memcpy(&dv, &kv, 8);
                             ek_buf[k] = kv;
-                            kh = ray_hash_f64(((double*)key_data[k])[row]);
+                            kh = ray_hash_f64(dv);
                         } else {
                             int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
                             ek_buf[k] = kv;
