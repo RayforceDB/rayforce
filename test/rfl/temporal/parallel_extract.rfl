@@ -10,69 +10,79 @@
 ;; Nulls here are payload sentinels, not a bitmap, so the per-row write is
 ;; already disjoint across workers.  The one piece of shared state is the
 ;; HAS_NULLS attr byte: workers never touch it, they raise one atomic flag
-;; and the caller folds it into the result after the dispatch joins.  If that
-;; fold were dropped, ray_vec_is_null's HAS_NULLS fast-path gate would report
-;; every row non-null and every `nil?` below would flip to false.
+;; and the caller folds it into the result after the dispatch joins.  Note
+;; that per-element `nil?` tests the sentinel bit pattern and NEVER reaches
+;; the vec-level HAS_NULLS gate — only whole-vector consumers (min/max/avg,
+;; group-by) do, which is why the min/max assertions below exist: they are
+;; the ones that fail if the fold is dropped (min then reads the sentinel
+;; as a value and returns 0Nl).
 ;;
-;; Null placement is deliberate: index 1310720 is both 64-element aligned and
-;; exactly 160 x the 8192-row dispatch grain, i.e. an interior task seam, and
-;; 1310723 is mid-word inside the following task.  A chunking bug lands on
+;; Null placement is deliberate: index 163840 is both 64-element aligned and
+;; exactly 20 x the 8192-row dispatch grain, i.e. an interior task seam, and
+;; 163843 is mid-word inside the following task.  A chunking bug lands on
 ;; one of the two.
 ;;
 ;; Row i of every column below is i seconds after 2000.01.01, so every
 ;; expected value is closed-form over (til N) and nothing is hand-computed.
 
 ;; ════════════════════════════════════════════════════════════════════
-;; Section 1: >2.5M rows, no nulls
+;; Section 1: >150K rows (parallel), no nulls
 ;; ════════════════════════════════════════════════════════════════════
 
-(set N 2600005)
+(set N 200005)
 (set NF (as 'TIMESTAMP (* (til N) 1000000000)))
-(count NF) -- 2600005
+(count NF) -- 200005
 
 (all (== (minute NF) (% (div (til N) 60) 60)))     -- true
 (all (== (ss NF) (% (til N) 60)))                   -- true
 (all (== (hh NF) (% (div (til N) 3600) 24)))       -- true
 
-;; 2 600 005 s is 30.1 days, so the whole column is January 2000.
+;; 200 005 s is 2.3 days, so the whole column is January 2000.
 (all (== (yyyy NF) 2000)) -- true
 (all (== (mm NF) 1))      -- true
 
-;; ray_temporal_truncate, DAY bucket, over the same 2.6M rows.
+;; ray_temporal_truncate, DAY bucket, over the same 200K rows.
 (all (== (date NF) (as 'TIMESTAMP (* (div (til N) 86400) 86400000000000)))) -- true
 
 ;; ════════════════════════════════════════════════════════════════════
-;; Section 2: >2.5M rows with nulls on a task seam and mid-word
+;; Section 2: parallel rows with nulls on a task seam and mid-word
 ;; ════════════════════════════════════════════════════════════════════
-;; Indices 1310720 and 1310723 are null; 1310721/1310722/1310724 are not.
+;; Indices 163840 and 163843 are null; 163841/163842/163844 are not.
 
-(set NB_HEAD (as 'TIMESTAMP (* (til 1310720) 1000000000)))
-(set NB_SEAM (as 'TIMESTAMP [0N 1310721000000000 1310722000000000 0N 1310724000000000]))
-(set NB_TAIL (as 'TIMESTAMP (* (+ (til 1289280) 1310725) 1000000000)))
+(set NB_HEAD (as 'TIMESTAMP (* (til 163840) 1000000000)))
+(set NB_SEAM (as 'TIMESTAMP [0N 163841000000000 163842000000000 0N 163844000000000]))
+(set NB_TAIL (as 'TIMESTAMP (* (+ (til 36160) 163845) 1000000000)))
 (set NB (concat (concat NB_HEAD NB_SEAM) NB_TAIL))
-(count NB) -- 2600005
+(count NB) -- 200005
 
-;; The two nulls survive as nulls — this is the HAS_NULLS fold.
-(nil? (at (minute NB) 1310720)) -- true
-(nil? (at (minute NB) 1310723)) -- true
-(nil? (at (ss NB) 1310720))     -- true
-(nil? (at (ss NB) 1310723))     -- true
+;; The two nulls survive as nulls.
+(nil? (at (minute NB) 163840)) -- true
+(nil? (at (minute NB) 163843)) -- true
+(nil? (at (ss NB) 163840))     -- true
+(nil? (at (ss NB) 163843))     -- true
+
+;; The HAS_NULLS fold itself: these consumers hit the vec-level gate.
+;; With the fold dropped, min reads the sentinel as a value (0Nl).
+(min (minute NB))        -- 0
+(max (minute NB))        -- 59
+(nil? (min (ss NB)))     -- false
+(min (ss NB))            -- 0
 
 ;; Their non-null neighbours, on both sides of the seam, are untouched.
-(at (ss NB) 1310719) -- 19
-(at (ss NB) 1310721) -- 21
-(at (ss NB) 1310722) -- 22
-(at (ss NB) 1310724) -- 24
-(nil? (at (ss NB) 1310719)) -- false
-(nil? (at (ss NB) 1310724)) -- false
+(at (ss NB) 163839) -- 39
+(at (ss NB) 163841) -- 41
+(at (ss NB) 163842) -- 42
+(at (ss NB) 163844) -- 44
+(nil? (at (ss NB) 163839)) -- false
+(nil? (at (ss NB) 163844)) -- false
 
 ;; Everything before and after the null run matches the closed form.
-(all (== (take (minute NB) 1310720) (% (div (til 1310720) 60) 60)))              -- true
-(all (== (drop (minute NB) 1310725) (% (div (+ (til 1289280) 1310725) 60) 60))) -- true
+(all (== (take (minute NB) 163840) (% (div (til 163840) 60) 60)))            -- true
+(all (== (drop (minute NB) 163845) (% (div (+ (til 36160) 163845) 60) 60))) -- true
 
 ;; Truncate over the same nullable column.
-(nil? (at (date NB) 1310723)) -- true
-(at (date NB) 1310721)        -- 2000.01.16D00:00:00.000000000
+(nil? (at (date NB) 163843)) -- true
+(at (date NB) 163841)        -- 2000.01.02D00:00:00.000000000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 3: the DAG ops (exec_extract / exec_date_trunc)
@@ -85,13 +95,16 @@
 (all (== (at (select {s: (second ts) from: TF}) 's) (% (til N) 60)))          -- true
 (all (== (at (select {h: (hour ts) from: TF}) 'h) (% (div (til N) 3600) 24))) -- true
 
-(nil? (at (at (select {s: (second ts) from: TN}) 's) 1310720)) -- true
-(nil? (at (at (select {s: (second ts) from: TN}) 's) 1310723)) -- true
-(at (at (select {s: (second ts) from: TN}) 's) 1310721)        -- 21
-(at (at (select {s: (second ts) from: TN}) 's) 1310724)        -- 24
+(nil? (at (at (select {s: (second ts) from: TN}) 's) 163840)) -- true
+(nil? (at (at (select {s: (second ts) from: TN}) 's) 163843)) -- true
+(at (at (select {s: (second ts) from: TN}) 's) 163841)        -- 41
+(at (at (select {s: (second ts) from: TN}) 's) 163844)        -- 44
 
-(nil? (at (at (select {s: ts.date from: TN}) 's) 1310720)) -- true
-(at (at (select {s: ts.time from: TN}) 's) 1310721)        -- 2000.01.16D04:05:21.000000000
+;; DAG-path HAS_NULLS fold, same argument as Section 2.
+(min (at (select {s: (second ts) from: TN}) 's)) -- 0
+
+(nil? (at (at (select {s: ts.date from: TN}) 's) 163840)) -- true
+(at (at (select {s: ts.time from: TN}) 's) 163841)        -- 2000.01.02D21:30:41.000000000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 4: sub-threshold columns stay serial and must agree
