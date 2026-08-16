@@ -1772,6 +1772,12 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
 
         return ray_error("type", "take: range take unsupported for %s", ray_type_name(vec->type));
     }
+    /* Every scalar-count branch below turns the count into a magnitude with
+     * `n < 0 ? -n : n`; `-INT64_MIN` is signed-overflow UB and |INT64_MIN| is
+     * unallocatable anyway, so reject an INT64_MIN count (also the i64 null
+     * sentinel) once here, up front, for all of them. */
+    if (ray_is_atom(n_obj) && is_numeric(n_obj) && as_i64(n_obj) == INT64_MIN)
+        return ray_error("range", "take: count magnitude out of range");
     /* Char take: (take 'a' n) → string of n copies of char */
     if (ray_is_atom(vec) && vec->type == -RAY_STR && ray_str_len(vec) == 1 && ray_is_atom(n_obj) && is_numeric(n_obj)) {
         int64_t n = as_i64(n_obj);
@@ -2015,7 +2021,10 @@ ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj) {
         start = n < len ? n : len;
         amount = len - start;
     } else {
-        int64_t cut = -n;
+        /* `-INT64_MIN` is signed-overflow UB; a drop-from-end of that
+         * magnitude removes the whole collection (|n| >= len), so treat it as
+         * cut == len (amount 0) rather than negating. */
+        int64_t cut = (n == INT64_MIN) ? len : -n;
         amount = cut < len ? len - cut : 0;
     }
     return collection_slice(vec, start, amount);
