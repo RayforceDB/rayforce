@@ -39,6 +39,10 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio.h>
+#if defined(RAY_OS_MACOS)
+#include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
+#endif
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -247,6 +251,49 @@ uint32_t ray_thread_count(void) {
     return (n > 0) ? (uint32_t)n : 1;
 }
 
+/* Physical cores (SMT siblings collapsed).  The worker pool's kernels are
+ * memory-bound; two hyperthreads sharing one core's load/store machinery
+ * only add contention (measured: the full ClickBench suite runs ~11%
+ * SLOWER with 32 SMT threads than with the 16 physical cores on a 5950X).
+ * Counts unique (package, core) pairs from sysfs; any read failure falls
+ * back to the logical count so exotic systems keep the old behavior. */
+uint32_t ray_physical_core_count(void) {
+#if defined(RAY_OS_MACOS)
+    int phys = 0;
+    size_t len = sizeof(phys);
+    if (sysctlbyname("hw.physicalcpu", &phys, &len, NULL, 0) == 0 && phys > 0)
+        return (uint32_t)phys;
+    return ray_thread_count();
+#else
+    uint32_t logical = ray_thread_count();
+    /* (package_id << 16) | core_id per cpu; count distinct values. */
+    enum { MAX_IDS = 4096 };
+    uint32_t seen[MAX_IDS];
+    uint32_t n_seen = 0;
+    for (uint32_t cpu = 0; cpu < logical && cpu < MAX_IDS; cpu++) {
+        char path[128];
+        long core = -1, pkg = 0;
+        FILE* f;
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%u/topology/core_id", cpu);
+        f = fopen(path, "r");
+        if (!f) return logical;              /* no topology → fall back */
+        if (fscanf(f, "%ld", &core) != 1) { fclose(f); return logical; }
+        fclose(f);
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%u/topology/physical_package_id",
+                 cpu);
+        f = fopen(path, "r");
+        if (f) { if (fscanf(f, "%ld", &pkg) != 1) pkg = 0; fclose(f); }
+        uint32_t id = ((uint32_t)pkg << 16) | ((uint32_t)core & 0xFFFF);
+        uint32_t j = 0;
+        while (j < n_seen && seen[j] != id) j++;
+        if (j == n_seen) seen[n_seen++] = id;
+    }
+    return n_seen > 0 ? n_seen : logical;
+#endif
+}
+
 /* --------------------------------------------------------------------------
  * Semaphore
  * -------------------------------------------------------------------------- */
@@ -431,6 +478,12 @@ uint32_t ray_thread_count(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     return (uint32_t)si.dwNumberOfProcessors;
+}
+
+/* Windows: no cheap topology read here — fall back to the logical count
+ * (the SMT-aware default sizing is a POSIX-side optimization). */
+uint32_t ray_physical_core_count(void) {
+    return ray_thread_count();
 }
 
 /* --------------------------------------------------------------------------
