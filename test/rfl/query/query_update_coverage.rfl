@@ -386,7 +386,7 @@
 (at (window-join [Sym Time] wji_null wjt_null wjq_i64null {l: (last Price)}) 'l) -- [400]
 
 ;; ────────────────────────────────────────────────────────────────────
-;; update by: with a per-row VECTOR expression (valid kdb: `update v:2*v by k`).
+;; update by: with a per-row VECTOR expression (`update {v: (* v 2) by: k}`).
 ;; The sub-table expression (* v 2) returns a vector of the group's size, so
 ;; each group's result is scattered elementwise back to its rows through
 ;; idxs[r] — symmetric with the atom broadcast.  Regression: this path used to
@@ -465,7 +465,7 @@
 ;; I32 key: case RAY_I32 at lines 131-133
 (set Tupd_i32by (table [k v] (list (as 'I32 [1 2 1 2 3]) [10 20 30 40 50])))
 ;; update by: broadcasts the aggregate back to every row of its group
-;; (kdb `by:` semantics — the group sum lands on ALL member rows, not just
+;; (grouped-update semantics — the group sum lands on ALL member rows, not just
 ;; the first).  Groups: k=1→sum=40, k=2→sum=60, k=3→sum=50.
 ;; Row values: [40, 60, 40, 60, 50] → sum = 250
 ;;
