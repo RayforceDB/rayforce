@@ -51,6 +51,24 @@ static inline bool floor_idiv_i64_checked(int64_t a, int64_t b, int64_t* out) {
     return true;
 }
 
+/* Integer floor-division can be delegated to the vectorizable double kernel
+ * only while both operands stay within ±2^53.  Such integers are exact
+ * doubles, and (proof) round(a/b) never crosses an integer boundary: a
+ * non-integer a/b is at least 1/|b| from any integer, while the rounded
+ * result's half-ULP is at most 1/|b| — with 2^e ≤ |a/b| we have
+ * |b|·2^e ≤ |a| ≤ 2^53, so 2^(e-53) ≤ 1/|b|.  Thus floor of the rounded
+ * quotient equals the true integer floor.  Outside the range the scalar
+ * exact kernel (floor_idiv_i64_checked) is required; NULL_I64 (INT64_MIN)
+ * lies far outside it, so a null in the span also falls to the exact kernel
+ * (which is where nulls are handled anyway). */
+#define DBL_EXACT_INT_LIM (0x1p53) /* 2^53 as a double bound */
+static inline bool i64_span_dbl_exact(const int64_t* v, int64_t n) {
+    for (int64_t i = 0; i < n; i++)
+        if (v[i] > (int64_t)DBL_EXACT_INT_LIM || v[i] < -(int64_t)DBL_EXACT_INT_LIM)
+            return false;
+    return true;
+}
+
 static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* out_is_f64) {
     if (!atom || !ray_is_atom(atom)) return false;
     switch (atom->type) {
@@ -1090,11 +1108,22 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                  * b==-1 && a==INT64_MIN → overflow: direct NULL_I64 (vs fallback: loop writes 0
                  * then zero-divisor pass marks null — same observable result). */
                 case OP_DIV:
-                case OP_IDIV: for (int64_t j=0;j<n;j++) {
-                    if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
-                    int64_t q = 0;
-                    d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : NULL_I64;
-                } break;
+                case OP_IDIV:
+                    /* i64_span_dbl_exact rejects INT64_MIN, so a passing span is
+                     * both null-free AND within ±2^53 → the vectorizable double
+                     * kernel is exact (divisor==0 still yields NULL_I64).  Any
+                     * null or large magnitude falls to the exact scalar kernel. */
+                    if (i64_span_dbl_exact(a, n) && i64_span_dbl_exact(b, n)) {
+                        for (int64_t j=0;j<n;j++)
+                            d[j] = b[j] != 0 ? (int64_t)floor((double)a[j] / (double)b[j]) : NULL_I64;
+                    } else {
+                        for (int64_t j=0;j<n;j++) {
+                            if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
+                            int64_t q = 0;
+                            d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : NULL_I64;
+                        }
+                    }
+                    break;
                 case OP_MOD: for (int64_t j=0;j<n;j++) {
                     if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
                     if (b[j]==0||(b[j]==-1&&a[j]==INT64_MIN)) { d[j]=NULL_I64; continue; }
@@ -1116,10 +1145,19 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                 case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] - (uint64_t)b[j]); break;
                 case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] * (uint64_t)b[j]); break;
                 case OP_DIV:
-                case OP_IDIV: for (int64_t j = 0; j < n; j++) {
-                    int64_t q = 0;
-                    d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : 0;
-                } break;
+                case OP_IDIV:
+                    /* Whole morsel within ±2^53 → the vectorizable double kernel
+                     * (bit-exact there); otherwise the exact scalar int64 kernel. */
+                    if (i64_span_dbl_exact(a, n) && i64_span_dbl_exact(b, n)) {
+                        for (int64_t j = 0; j < n; j++)
+                            d[j] = b[j] != 0 ? (int64_t)floor((double)a[j] / (double)b[j]) : 0;
+                    } else {
+                        for (int64_t j = 0; j < n; j++) {
+                            int64_t q = 0;
+                            d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : 0;
+                        }
+                    }
+                    break;
                 case OP_MOD: for (int64_t j = 0; j < n; j++) {
                     if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=0; continue; }
                     int64_t m = a[j]%b[j];
@@ -3128,6 +3166,20 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         (rhs->type == -RAY_F64 || rhs->type == RAY_F64 ||
          rhs->type == -RAY_F32 || rhs->type == RAY_F32)));
     int src_is_i64_all = l_is_int && r_is_int;
+    /* Integer floor-div: decide once whether the whole range fits ±2^53, so the
+     * exact scalar int64 kernel is only paid for genuinely large magnitudes and
+     * the common small-value case stays on the vectorizable double kernel. */
+    bool idiv_i64_small = false;
+    if (src_is_i64_all && op->opcode == OP_IDIV) {
+        idiv_i64_small = true;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t lv = LV_READ_I64(i), rv = RV_READ_I64(i);
+            if (lv > (int64_t)DBL_EXACT_INT_LIM || lv < -(int64_t)DBL_EXACT_INT_LIM ||
+                rv > (int64_t)DBL_EXACT_INT_LIM || rv < -(int64_t)DBL_EXACT_INT_LIM) {
+                idiv_i64_small = false; break;
+            }
+        }
+    }
 
     /* Hoist out_type outside the loop. Each branch is a tight per-element kernel. */
     if (out_type == RAY_F64) {
@@ -3188,9 +3240,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_ADD: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li+(uint64_t)ri);}break;
             case OP_SUB: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li-(uint64_t)ri);}break;
             case OP_MUL: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li*(uint64_t)ri);}break;
-            case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);int64_t r;if(ri==0||(ri==-1&&li==INT64_MIN)){r=0;}else{r=li/ri;if((li^ri)<0&&r*ri!=li)r--;}odst[i]=r;}break;
+            case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}break;
             case OP_IDIV:
-                if (src_is_i64_all) {
+                if (src_is_i64_all && !idiv_i64_small) {
                     for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}
                 } else {
                     for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i64_null(floor(lv/rv)):0;}
@@ -3210,8 +3262,10 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             /* OP_DIV omitted — ray_binop hard-codes F64 for OP_DIV, so
              * narrow-output OP_DIV is unreachable through any caller. */
             case OP_IDIV:
-                if (src_is_i64_all) {
-                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(int32_t)q:0;}
+                if (src_is_i64_all && !idiv_i64_small) {
+                    /* Clamp the exact quotient to match ray_cast_f64_to_i32_null's
+                     * saturating narrow (the double arm below), not a wrapping cast. */
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(q>=INT32_MAX?INT32_MAX:q<=INT32_MIN?INT32_MIN+1:(int32_t)q):0;}
                 } else {
                     for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i32_null(floor(lv/rv)):0;}
                 }
@@ -3229,8 +3283,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=(int16_t)((uint16_t)li*(uint16_t)ri);}break;
             /* OP_DIV omitted — unreachable, see I32 arm. */
             case OP_IDIV:
-                if (src_is_i64_all) {
-                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(int16_t)q:0;}
+                if (src_is_i64_all && !idiv_i64_small) {
+                    /* Saturating narrow to match ray_cast_f64_to_i16_null below. */
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(q>=INT16_MAX?INT16_MAX:q<=INT16_MIN?INT16_MIN+1:(int16_t)q):0;}
                 } else {
                     for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i16_null(floor(lv/rv)):0;}
                 }
@@ -3248,8 +3303,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li*ri;}break;
             /* OP_DIV omitted — unreachable, see I32 arm. */
             case OP_IDIV:
-                if (src_is_i64_all) {
-                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(uint8_t)q:0;}
+                if (src_is_i64_all && !idiv_i64_small) {
+                    /* Saturating narrow to match ray_cast_f64_to_u8_null below. */
+                    for(int64_t i=0;i<n;i++){int64_t li=LV_READ_I64(i),ri=RV_READ_I64(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?(q<=0?0:q>=UINT8_MAX?UINT8_MAX:(uint8_t)q):0;}
                 } else {
                     for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_u8_null(floor(lv/rv)):0;}
                 }

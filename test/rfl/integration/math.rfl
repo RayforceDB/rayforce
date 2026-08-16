@@ -2512,3 +2512,21 @@
 (set TdivUpd (table [v q] (list [9007199254740993 123456789012345678] [0 0])))
 (at (update {q: (div v 1) from: TdivUpd}) 'q) -- [9007199254740993 123456789012345678]
 (at (update {q: (div v 3) from: TdivUpd}) 'q) -- [3002399751580331 41152263004115226]
+
+;; ── dual-path: the fast (<=2^53 double) and exact (>2^53 int64) kernels
+;;    must agree.  2^53 itself takes the fast path; 2^53+1 the exact one. ──
+(div 9007199254740992 3) -- 3002399751580330
+(div [9007199254740992 9007199254740993] 1) -- [9007199254740992 9007199254740993]
+;; a mixed small+big morsel forces the exact kernel for the whole span
+(set TdivMix (table [a b] (list [10 9007199254740993] [3 7])))
+(at (select {q: (div a b) from: TdivMix}) 'q) -- [3 1286742750677284]
+;; div-by-zero through the integer path: scalar/vector null, narrow arm 0
+(div 5 0) -- 0Nl
+(div [5 6] [0 2]) -- [0Nl 3]
+(set TdivZ (table [a b] (list [5 6] [0 2])))
+(at (select {q: (div a b) from: TdivZ}) 'q) -- [0Nl 3]
+;; narrow-output floor div (I32 / I16 / U8 arms), incl. div-by-zero -> 0
+(div (as 'I32 [100 55 -7]) (as 'I32 [7 8 2])) -- (as 'I32 [14 6 -4])
+(div (as 'I16 [100 55 -7]) (as 'I16 [7 8 2])) -- (as 'I16 [14 6 -4])
+(set TdivN (table [a b] (list (as 'I16 [100 55 6]) (as 'I16 [7 0 2]))))
+(at (select {q: (div a b) from: TdivN}) 'q) -- (as 'I16 [14 0 3])
