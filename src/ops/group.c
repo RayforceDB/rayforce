@@ -5006,10 +5006,33 @@ typedef struct {
 #define TOPN_BETTER(desc_dir, a, b) ((desc_dir) ? ((a) > (b)) : ((a) < (b)))
 
 /* Push one candidate into a bounded "best k" heap; returns the new count.
- * Replacement is on STRICT improvement, so among equal values the earliest
- * pushed wins: the retained set is exactly the k best items under the total
- * order (value, push position).  Every caller pushes in (partition, gid)
- * order, which makes that set independent of how the scan is parallelised. */
+ * Replacement is on STRICT improvement: an item that merely TIES the root is
+ * rejected and the heap is left byte-for-byte unchanged.
+ *
+ * That is NOT the same as "the earliest of equal values wins" — with k=2,
+ * desc, pushing 5,5,7 evicts the FIRST 5, because sift-down may promote
+ * either equal child to the root.  What holds is only that the outcome is a
+ * deterministic function of the push sequence, which is all the callers need.
+ *
+ * WHY THE PARALLEL PRE-PASS RETAINS THE SAME SET AS ONE SERIAL SCAN.  Let H
+ * be the global heap of the serial scan and H_p a partition's local heap.
+ * When H_p is full it holds the k best of what that partition has shown so
+ * far; H at the same point holds the k best of a SUPERSET of those items, so
+ * H's root is never worse than H_p's.  An item H_p rejects is therefore not
+ * strictly better than H's root either — H would reject it too, leaving H
+ * unchanged.  So the pre-pass elides only pushes that are provably no-ops,
+ * and feeding H the survivors alone reproduces its exact trajectory.
+ *
+ * TWO CONDITIONS CARRY THAT ARGUMENT.  Do not "optimise" either away:
+ *   (1) the per-partition cap is k_take ITSELF, never k_take/n_parts or any
+ *       other share.  (It may be smaller only when the partition holds fewer
+ *       than k_take groups — then the heap drops nothing at all.)  With a
+ *       smaller cap H_p's root could be BETTER than H's, and H_p would drop
+ *       an item the serial scan keeps.
+ *   (2) the merge feeds candidates in the serial scan's order: partitions
+ *       ascending, and gid ascending within a partition.  Ties are
+ *       order-sensitive (see the 5,5,7 trace above), so topn_scan_fn sorts
+ *       its survivors back into gid order for exactly this reason. */
 static inline int64_t topn_heap_push(group_topn_item_t* h, int64_t hn,
                                      int64_t k, uint8_t desc_dir, int64_t v,
                                      uint32_t part, uint32_t gid) {
@@ -13097,11 +13120,12 @@ v2_emit:;
                 bool scanned = false;
                 if (pool && n_total > 1 && radix_n_parts > 1 &&
                     (size_t)radix_n_parts + 1 <= SIZE_MAX / sizeof(uint32_t) / 2) {
-                    /* Per-partition capacity: a partition can contribute at
-                     * most k_take groups to the global top-k, and never more
-                     * groups than it holds.  kcap stays 64-bit — k_take is the
-                     * user's LIMIT and may exceed UINT32_MAX, in which case the
-                     * per-partition cap is just the partition's own count. */
+                    /* Per-partition capacity: at most k_take (a partition can
+                     * contribute no more than that to the global top-k), and
+                     * never more groups than it holds.  64-bit because k_take
+                     * is an int64 LIMIT: match_group_desc_count_take caps it
+                     * at 1024 but the count-distinct rewrite (query.c) does
+                     * not, so the width is a guard, not a live shape. */
                     const uint64_t kcap = (uint64_t)k_take;
                     uint64_t tot = 0;
                     for (uint32_t p = 0; p < radix_n_parts; p++) {
@@ -13110,7 +13134,12 @@ v2_emit:;
                     }
                     if (tot > 0 && tot <= total_pre / 8 && tot <= UINT32_MAX &&
                         tot <= SIZE_MAX / sizeof(group_topn_item_t)) {
-                        item_off = (uint32_t*)scratch_alloc(&stage_hdr,
+                        /* CALLOC, not alloc: item_cnt[] is written only by
+                         * topn_scan_fn, and a CANCELLED dispatch drains its
+                         * tickets WITHOUT running fn — every entry must then
+                         * read as a well-defined 0, not stack garbage that
+                         * would send the merge off the end of items[]. */
+                        item_off = (uint32_t*)scratch_calloc(&stage_hdr,
                             ((size_t)radix_n_parts * 2 + 1) * sizeof(uint32_t));
                         items = item_off
                             ? (group_topn_item_t*)scratch_alloc(&item_hdr,
@@ -13134,6 +13163,20 @@ v2_emit:;
                             };
                             ray_pool_dispatch_n(pool, topn_scan_fn, &sctx,
                                                 radix_n_parts);
+                            /* Same bail as every other dispatch in this
+                             * driver (CHECK_CANCEL_GOTO), spelled out because
+                             * this block owns scratch the cleanup label does
+                             * not know about.  A cancelled dispatch runs no
+                             * tasks at all, so the survivors below would be
+                             * empty/partial — bail rather than emit a wrong
+                             * top-N. */
+                            if (pool_cancelled(pool)) {
+                                scratch_free(item_hdr);
+                                scratch_free(stage_hdr);
+                                scratch_free(heap_hdr);
+                                result = ray_error("cancel", NULL);
+                                goto cleanup;
+                            }
                             for (uint32_t p = 0; p < radix_n_parts; p++) {
                                 const group_topn_item_t* h = items + item_off[p];
                                 uint32_t n = item_cnt[p];
@@ -13217,6 +13260,16 @@ v2_emit:;
                                 };
                                 ray_pool_dispatch_n(pool, topn_rebuild_fn,
                                                     &rctx, radix_n_parts);
+                                /* A cancelled dispatch skips the rebuild and
+                                 * leaves slots pointing at pre-compaction
+                                 * gids; bail like every other dispatch here
+                                 * rather than carry stale tables forward. */
+                                if (pool_cancelled(pool)) {
+                                    scratch_free(dirty_hdr);
+                                    scratch_free(heap_hdr);
+                                    result = ray_error("cancel", NULL);
+                                    goto cleanup;
+                                }
                             } else {
                                 for (uint32_t p = 0; p < radix_n_parts; p++)
                                     if (dirty[p])
