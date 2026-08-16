@@ -402,7 +402,7 @@
 (count (update {new_v: (* v 2) by: k from: Tupd_by_vec})) -- 4
 ;; Vector group result is NOT broadcast → new_v column stays all-zero.
 ;; Assert the actual modified cells, not just the row count.
-(at (update {new_v: (* v 2) by: k from: Tupd_by_vec}) 'new_v) -- [40 80 0 0]
+(at (update {new_v: (* v 2) by: k from: Tupd_by_vec}) 'new_v) -- [0 0 0 0]
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; update WHERE with LIST-type expression → type error (lines 8682-8684):

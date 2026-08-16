@@ -15,8 +15,8 @@
 ;; 2. The `by:`-UPDATE branch duplicated an existing target column instead
 ;;    of replacing it — `(update {w: (sum v) from: T by: k})` on a table that
 ;;    already has `w` produced schema `[k v w w]` and `at` read the stale
-;;    original.  Affected flat tables too.  Fix: skip source columns that
-;;    the update dict replaces in the initial copy loop.
+;;    original.  Affected flat tables too.  Fix: substitute existing target
+;;    columns in their original slots and append only new columns.
 ;;
 ;; Both are checked against flat-table oracles with identical data.
 
@@ -63,6 +63,13 @@
 ;; flat oracle — same rows, same answers
 (at (update {w: (sum v) from: flat by: k}) 'w) -- [100 80 30 100 100 80]
 (key (update {w: (sum v) from: flat by: k})) -- [k v w]
+;; replaced columns keep their original schema position, even when not last
+(key (update {v: (sum v) from: flat by: k})) -- [k v w]
+(at (update {v: (sum v) from: flat by: k}) 'v) -- [100 80 30 100 100 80]
+;; empty grouped updates preserve an existing target column's type
+(set E (table [k v w] (list (as 'I64 []) (as 'F64 []) (as 'F64 []))))
+(key (update {w: (sum v) from: E by: k})) -- [k v w]
+(type (at (update {w: (sum v) from: E by: k}) 'w)) -- 'F64
 
 ;; ────────────── fix 1e: mixed update — modify existing + add new over parted ──────────────
 ;; USER-FACING: any dict naming an EXISTING column tripped the fix-1a error
@@ -90,4 +97,3 @@
 (key Gflat) -- [k v w]
 
 (.sys.exec "rm -rf /tmp/rfl_update_parted")
-(exit 0)
