@@ -129,6 +129,9 @@ ray_t* trades = ray_read_parted("db", "trades");
 !!! note "Rayfall builtin"
     Use `.db.parted.get` from Rayfall to load partitioned tables: `(.db.parted.get "db" 'trades)`. See the [Rayfall Storage Builtins](#rayfall-storage) section below.
 
+!!! warning "`update` over a partitioned table materializes in memory"
+    `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.
+
 ### Partition Pruning
 
 The query optimizer recognizes predicates on the `MAPCOMMON` column and eliminates entire partitions from the scan plan. This means a query filtering on a single date in a year of data only touches 1/365th of the files on disk — with zero per-row cost for the pruned partitions.

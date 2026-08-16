@@ -11617,7 +11617,14 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             if (ngroups == 0 && target_col) out_type = target_col->type;
             ray_t* out_col = ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
             if (RAY_IS_ERR(out_col)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
-            if (ngroups == 0) out_col->len = nrows2;
+            if (ngroups == 0) {
+                out_col->len = nrows2;
+                /* Match the per-group path's zero-fill so an unwritten buffer
+                 * never carries allocator garbage (unreachable with rows today
+                 * — a non-empty table always yields a group — but uniform). */
+                memset(ray_data(out_col), 0,
+                    (size_t)nrows2 * (size_t)ray_sym_elem_size(out_col->type, out_col->attrs));
+            }
             int first_group = 1;
 
             for (int64_t gi = 0; gi < ngroups; gi++) {
@@ -11681,11 +11688,29 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     first_group = 0;
                 }
 
-                /* Broadcast aggregate value to all rows in this group */
+                /* Scatter the group's result back to its rows.  An atom
+                 * broadcasts to every row of the group; a per-row vector
+                 * (valid kdb, e.g. `update v: 2*v by k`) scatters elementwise
+                 * through idxs[r], symmetric with the atom branch.  Any other
+                 * shape — a vector whose length is neither 1 nor the group
+                 * size — has no row-aligned meaning, so decline loudly rather
+                 * than leave the memset zeros in place (silent data loss). */
                 int64_t* idxs = (int64_t*)ray_data(idx_vec);
                 if (ray_is_atom(agg_result)) {
                     for (int64_t r = 0; r < gsize; r++)
                         store_typed_elem(out_col, idxs[r], agg_result);
+                } else if (ray_is_vec(agg_result) && ray_len(agg_result) == gsize) {
+                    for (int64_t r = 0; r < gsize; r++) {
+                        int alloc = 0;
+                        ray_t* cell = collection_elem(agg_result, r, &alloc);
+                        store_typed_elem(out_col, idxs[r], cell);
+                        if (alloc) ray_release(cell);
+                    }
+                } else {
+                    int64_t got = ray_is_vec(agg_result) ? ray_len(agg_result) : -1;
+                    ray_release(agg_result); ray_release(out_col);
+                    UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                    return ray_error("length", "update by: expression result length %lld does not match group size %lld", (long long)got, (long long)gsize);
                 }
                 ray_release(agg_result);
             }
