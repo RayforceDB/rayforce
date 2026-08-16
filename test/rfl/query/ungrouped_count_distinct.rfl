@@ -1,0 +1,41 @@
+;; Issue #405: ungrouped `(count (distinct col))` as a select projection did
+;; not compute a distinct count.  The scalar-aggregate eval fallback
+;; (eval_scalar_agg_outputs) evaluated the aggregate's argument per row, so
+;; `distinct` saw one scalar cell at a time: STR/SYM rows collapsed into a
+;; row-count answer (silently wrong), I64 rows errored ("argument must be a
+;; list").  A whole-column argument (distinct/asc/desc/reverse at its head)
+;; must be evaluated once against the full column, like the projection
+;; fallback already does.
+
+(set Tcd (table [i s g] (list [1 1 2 2 3] ["aa" "aa" "bb" "bb" "cc"] [9 9 9 9 9])))
+
+;; whole-vector reducer — always worked; pin as the reference
+(count (distinct (at Tcd 'i))) -- 3
+(count (distinct (at Tcd 's))) -- 3
+
+;; grouped form — always worked; pin it
+(at (at (select {from: Tcd by: g u: (count (distinct i))}) 'u) 0) -- 3
+(at (at (select {from: Tcd by: g u: (count (distinct s))}) 'u) 0) -- 3
+
+;; ungrouped select projection: was 5 (row count) for STR, error for I64
+(at (at (select {from: Tcd u: (count (distinct s))}) 'u) 0) -- 3
+(at (at (select {from: Tcd u: (count (distinct i))}) 'u) 0) -- 3
+
+;; single-group result stays one row
+(count (select {from: Tcd u: (count (distinct s))})) -- 1
+
+;; with a where: filter — distinct over the filtered rows only
+(at (at (select {from: Tcd u: (count (distinct i)) where: (< i 3)}) 'u) 0) -- 2
+
+;; multiple aggregate outputs side by side
+(set Rcd (select {from: Tcd u: (count (distinct s)) n: (count s)}))
+(at (at Rcd 'u) 0) -- 3
+(at (at Rcd 'n) 0) -- 5
+
+;; pool-backed (>12 byte) strings through the same path
+(set Tcw (table [s] (list ["long-string-value-zero" "long-string-value-zero" "long-string-value-one"])))
+(at (at (select {from: Tcw u: (count (distinct s))}) 'u) 0) -- 2
+
+;; other whole-column verbs as aggregate arguments
+(at (at (select {from: Tcd u: (count (reverse i))}) 'u) 0) -- 5
+(at (at (select {from: Tcd u: (sum (distinct i))}) 'u) 0) -- 6

@@ -1026,8 +1026,12 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * point; every exit below (early return AND pivot_cleanup) must call
      * it exactly once so a spilled layout's heap block is never leaked. */
     ght_layout_t ly;
+    /* key_vecs = NULL: pivot must NOT get the null-mask elision.  Its ingest
+     * reads the key region's null word RAW (`keys[n_keys + pvt_null_word]`
+     * below) to detect a null pivot key, so the layout needs null_words >= 1.
+     * Passing NULL is what keeps it. */
     if (!ght_compute_layout(&ly, n_keys, 1, agg_vecs, NULL,
-                            need_flags, agg_ops, key_types)) {
+                            need_flags, agg_ops, key_types, NULL)) {
         scratch_free(key_hdr);
         return ray_error("limit", "pivot: key stride budget exceeded");
     }
@@ -1400,7 +1404,13 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 int64_t cnt = *(const int64_t*)(const void*)row;
                 /* nn = per-slot non-null count (nullable value column) or the
                  * group row count (null-free — byte-identical to before). */
-                int64_t nn = ly.off_nn
+                /* s < 0 for an agg that reserves no value slot (holistic, or
+                 * the now-valueless OP_COUNT): it owns no off_nn slot either,
+                 * so never index with it — mirrors the guard in group.c's
+                 * radix_phase3_fn / sequential emit.  Safe today only because
+                 * off_nn is 0 for every such layout; the guard makes it not
+                 * depend on that coincidence. */
+                int64_t nn = (ly.off_nn && s >= 0)
                     ? ((const int64_t*)(const void*)(row + ly.off_nn))[s] : cnt;
 
             if (out_agg_type == RAY_F64) {

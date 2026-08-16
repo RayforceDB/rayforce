@@ -25,6 +25,7 @@
 #include "lang/internal.h"
 #include "ops/temporal.h"
 #include "lang/format.h"  /* ray_type_name (error context) */
+#include "core/pool.h"    /* ray_pool_dispatch — parallel extract/truncate */
 #include <time.h>
 
 /* ============================================================================
@@ -163,6 +164,113 @@ static inline bool rte_trunc_elem(int8_t t, int64_t raw, int64_t bucket, int64_t
     return true;
 }
 
+/* ----------------------------------------------------------------------------
+ * Parallel driver for the two whole-column kernels below.
+ *
+ * Both loops are pure elementwise maps: row i of the output depends only on
+ * row i of the input, so any partition of [0, len) is safe.  The ONE piece of
+ * cross-row state is the null marking.  Nulls in this engine are *sentinels in
+ * the payload* (see ray_vec_set_null_checked) — the per-row write is already
+ * disjoint — but ray_vec_set_null also does a read-modify-write of the shared
+ * `attrs` byte (RAY_ATTR_HAS_NULLS, and the SORTED clear inside
+ * vec_drop_index_inplace).  That byte is what races, not the bitmap the
+ * bitmap-based engines would have.
+ *
+ * So the workers never touch `attrs`: each writes the NULL_* sentinel into its
+ * own rows and reports "I produced at least one null" through one atomic flag,
+ * and the caller folds that into `result->attrs` once, single-threaded, after
+ * the dispatch has joined.  Result is byte-identical to the serial version:
+ * the destination is a fresh ray_vec_new (attrs == 0, no index, not a slice),
+ * so ray_vec_set_null on it reduces to exactly "sentinel + HAS_NULLS".
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    ray_t*             input;
+    const char*        base;
+    int64_t*           out;
+    int64_t            bucket;        /* truncate only */
+    int                field;
+    int8_t             t;
+    bool               src_has_nulls;
+    bool               in32;          /* RAY_DATE / RAY_TIME element is int32 */
+    _Atomic(uint32_t)  any_null;
+} rte_par_ctx_t;
+
+#define RTE_RANGE_BODY(CALL)                                                  \
+    do {                                                                      \
+        if (c->in32) {                                                        \
+            const int32_t* d32 = (const int32_t*)c->base;                     \
+            if (c->src_has_nulls) {                                           \
+                for (int64_t i = start; i < end; i++)                         \
+                    if (ray_vec_is_null(c->input, i) ||                       \
+                        !CALL((int64_t)d32[i])) {                             \
+                        c->out[i] = NULL_I64; nulled = true;                  \
+                    }                                                         \
+            } else {                                                          \
+                for (int64_t i = start; i < end; i++)                         \
+                    if (!CALL((int64_t)d32[i])) {                             \
+                        c->out[i] = NULL_I64; nulled = true;                  \
+                    }                                                         \
+            }                                                                 \
+        } else {                                                              \
+            const int64_t* d64 = (const int64_t*)c->base;                     \
+            if (c->src_has_nulls) {                                           \
+                for (int64_t i = start; i < end; i++)                         \
+                    if (ray_vec_is_null(c->input, i) || !CALL(d64[i])) {      \
+                        c->out[i] = NULL_I64; nulled = true;                  \
+                    }                                                         \
+            } else {                                                          \
+                for (int64_t i = start; i < end; i++)                         \
+                    if (!CALL(d64[i])) {                                      \
+                        c->out[i] = NULL_I64; nulled = true;                  \
+                    }                                                         \
+            }                                                                 \
+        }                                                                     \
+        if (nulled)                                                           \
+            atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);     \
+    } while (0)
+
+#define RTE_EXTRACT_CALL(RAW) rte_extract_elem(c->t, (RAW), c->field, &c->out[i])
+#define RTE_TRUNC_CALL(RAW)   rte_trunc_elem(c->t, (RAW), c->bucket, &c->out[i])
+
+static void rte_extract_range(rte_par_ctx_t* c, int64_t start, int64_t end) {
+    bool nulled = false;
+    RTE_RANGE_BODY(RTE_EXTRACT_CALL);
+}
+
+static void rte_trunc_range(rte_par_ctx_t* c, int64_t start, int64_t end) {
+    bool nulled = false;
+    RTE_RANGE_BODY(RTE_TRUNC_CALL);
+}
+
+#undef RTE_EXTRACT_CALL
+#undef RTE_TRUNC_CALL
+#undef RTE_RANGE_BODY
+
+static void rte_extract_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    rte_extract_range((rte_par_ctx_t*)ctx, start, end);
+}
+
+static void rte_trunc_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    rte_trunc_range((rte_par_ctx_t*)ctx, start, end);
+}
+
+/* Run `range_fn` over [0, len), in parallel when the column is big enough to
+ * amortize dispatch (the engine-wide RAY_PARALLEL_THRESHOLD, same gate
+ * expr_eval_full uses — no new knob), then fold the null flag into `result`. */
+static void rte_run(rte_par_ctx_t* c, ray_pool_fn task_fn,
+                    void (*range_fn)(rte_par_ctx_t*, int64_t, int64_t),
+                    ray_t* result, int64_t len) {
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, task_fn, c, len);
+    else
+        range_fn(c, 0, len);
+    if (atomic_load_explicit(&c->any_null, memory_order_relaxed))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
+}
+
 ray_t* ray_temporal_extract(ray_t* input, int field) {
     if (!input || RAY_IS_ERR(input)) return input;
 
@@ -202,44 +310,20 @@ ray_t* ray_temporal_extract(ray_t* input, int field) {
         (input->attrs & RAY_ATTR_HAS_NULLS) ||
         ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
          (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
-    const char* base = (const char*)ray_data(input);
-    /* Hoist src_has_nulls and type dispatch outside the loop so the
-     * inner body is a tight typed kernel with no per-element branches. */
-    if (t == RAY_DATE || t == RAY_TIME) {
-        const int32_t* d32 = (const int32_t*)base;
-        if (src_has_nulls) {
-            for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i) ||
-                    !rte_extract_elem(t, (int64_t)d32[i], field, &out[i])) {
-                    out[i] = NULL_I64;
-                    ray_vec_set_null(result, i, true);
-                }
-            }
-        } else {
-            for (int64_t i = 0; i < len; i++)
-                if (!rte_extract_elem(t, (int64_t)d32[i], field, &out[i])) {
-                    out[i] = NULL_I64;
-                    ray_vec_set_null(result, i, true);
-                }
-        }
-    } else {
-        const int64_t* d64 = (const int64_t*)base;
-        if (src_has_nulls) {
-            for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i) ||
-                    !rte_extract_elem(t, d64[i], field, &out[i])) {
-                    out[i] = NULL_I64;
-                    ray_vec_set_null(result, i, true);
-                }
-            }
-        } else {
-            for (int64_t i = 0; i < len; i++)
-                if (!rte_extract_elem(t, d64[i], field, &out[i])) {
-                    out[i] = NULL_I64;
-                    ray_vec_set_null(result, i, true);
-                }
-        }
-    }
+    /* src_has_nulls and the 32-/64-bit element dispatch are hoisted into the
+     * context so the inner body is a tight typed kernel with no per-element
+     * branches; the row range is chunked over the pool for large columns. */
+    rte_par_ctx_t c = {
+        .input = input,
+        .base = (const char*)ray_data(input),
+        .out = out,
+        .field = field,
+        .t = t,
+        .src_has_nulls = src_has_nulls,
+        .in32 = (t == RAY_DATE || t == RAY_TIME),
+        .any_null = 0,
+    };
+    rte_run(&c, rte_extract_fn, rte_extract_range, result, len);
     return result;
 }
 
@@ -338,36 +422,18 @@ ray_t* ray_temporal_truncate(ray_t* input, int kind) {
         ? RTE_USEC_PER_DAY
         : RTE_USEC_PER_SEC;
 
-    /* Hoist src_has_nulls and type dispatch outside the loop. */
-    if (t == RAY_DATE || t == RAY_TIME) {
-        const int32_t* d32 = (const int32_t*)base;
-        if (src_has_nulls) {
-            for (int64_t i = 0; i < len; i++)
-                if (ray_vec_is_null(input, i) ||
-                    !rte_trunc_elem(t, (int64_t)d32[i], bucket, &out[i])) {
-                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
-                }
-        } else {
-            for (int64_t i = 0; i < len; i++)
-                if (!rte_trunc_elem(t, (int64_t)d32[i], bucket, &out[i])) {
-                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
-                }
-        }
-    } else {
-        const int64_t* d64 = (const int64_t*)base;
-        if (src_has_nulls) {
-            for (int64_t i = 0; i < len; i++)
-                if (ray_vec_is_null(input, i) ||
-                    !rte_trunc_elem(t, d64[i], bucket, &out[i])) {
-                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
-                }
-        } else {
-            for (int64_t i = 0; i < len; i++)
-                if (!rte_trunc_elem(t, d64[i], bucket, &out[i])) {
-                    out[i] = NULL_I64; ray_vec_set_null(result, i, true);
-                }
-        }
-    }
+    /* Same hoist-and-chunk shape as ray_temporal_extract above. */
+    rte_par_ctx_t c = {
+        .input = input,
+        .base = base,
+        .out = out,
+        .bucket = bucket,
+        .t = t,
+        .src_has_nulls = src_has_nulls,
+        .in32 = (t == RAY_DATE || t == RAY_TIME),
+        .any_null = 0,
+    };
+    rte_run(&c, rte_trunc_fn, rte_trunc_range, result, len);
     return result;
 }
 
@@ -382,35 +448,32 @@ ray_t* ray_temporal_truncate(ray_t* input, int kind) {
  * Gregorian calendar decomposition.
  * ============================================================================ */
 
-ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
-    ray_t* input = exec_node(g, op_child(g, op, 0));
-    if (!input || RAY_IS_ERR(input)) return input;
+/* Per-worker state for the DAG-level extract.  Same contract as
+ * rte_par_ctx_t above: workers own disjoint row ranges, write NULL_I64
+ * sentinels themselves, and report the HAS_NULLS decision through one
+ * atomic flag the caller folds into `result` after the join. */
+typedef struct {
+    ray_t*             input;
+    int64_t*           out;
+    int64_t            field;
+    int8_t             in_type;
+    bool               src_has_nulls;
+    bool               in32;
+    _Atomic(uint32_t)  any_null;
+} xtr_par_ctx_t;
 
-    ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
+#undef  USEC_PER_SEC
+#define USEC_PER_SEC  1000000LL
+#define USEC_PER_MIN  (60LL  * USEC_PER_SEC)
+#define USEC_PER_HOUR (3600LL * USEC_PER_SEC)
+#define USEC_PER_DAY  (86400LL * USEC_PER_SEC)
 
-    int64_t field = ext->sym;
-    int64_t len = input->len;
-    int8_t in_type = input->type;
-
-    ray_t* result = ray_vec_new(RAY_I64, len);
-    if (!result || RAY_IS_ERR(result)) { ray_release(input); return result; }
-    result->len = len;
-
-    int64_t* out = (int64_t*)ray_data(result);
-
-    #undef  USEC_PER_SEC
-    #define USEC_PER_SEC  1000000LL
-    #define USEC_PER_MIN  (60LL  * USEC_PER_SEC)
-    #define USEC_PER_HOUR (3600LL * USEC_PER_SEC)
-    #define USEC_PER_DAY  (86400LL * USEC_PER_SEC)
-
-    /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
-     * themselves, so inspect the parent when input is a slice. */
-    bool src_has_nulls =
-        (input->attrs & RAY_ATTR_HAS_NULLS) ||
-        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
-         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+static void xtr_extract_range(xtr_par_ctx_t* c, int64_t start, int64_t end) {
+    ray_t* input   = c->input;
+    int64_t* out   = c->out;
+    int64_t field  = c->field;
+    int8_t in_type = c->in_type;
+    bool nulled    = false;
 
     /* Macro to emit a tight inner loop body with loop-invariant branches
      * hoisted at compile time.  HAS_NULLS and IN32 are 0/1 constants so
@@ -423,7 +486,7 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
             for (int64_t i = 0; i < n; i++) {                              \
                 if (HAS_NULLS && ray_vec_is_null(input, off + i)) {        \
                     out[off + i] = NULL_I64;                                \
-                    ray_vec_set_null(result, off + i, true);                \
+                    nulled = true;                                          \
                     continue;                                               \
                 }                                                           \
                 int64_t us;                                                 \
@@ -437,7 +500,7 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
                         ((int64_t)raw32 > INT64_MAX / USEC_PER_DAY ||       \
                          (int64_t)raw32 < INT64_MIN / USEC_PER_DAY)) {      \
                         out[off + i] = NULL_I64;                            \
-                        ray_vec_set_null(result, off + i, true);            \
+                        nulled = true;                                      \
                         continue;                                           \
                     }                                                       \
                     us = (in_type == RAY_DATE)                              \
@@ -506,12 +569,13 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
     } while (0)
 
     ray_morsel_t m;
-    ray_morsel_init(&m, input);
-    int64_t off = 0;
+    ray_morsel_init_range(&m, input, start, end);
+    int64_t off = start;
 
     /* Hoist src_has_nulls and in_type (32- vs 64-bit element) outside
      * all loops using the macro dispatch above. */
-    bool in32 = (in_type == RAY_DATE || in_type == RAY_TIME);
+    const bool src_has_nulls = c->src_has_nulls;
+    const bool in32 = c->in32;
     if (!src_has_nulls && !in32) EXTRACT_INNER(0, 0);
     else if (!src_has_nulls &&  in32) EXTRACT_INNER(0, 1);
     else if ( src_has_nulls && !in32) EXTRACT_INNER(1, 0);
@@ -519,10 +583,65 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
 
 #undef EXTRACT_INNER
 
-    #undef USEC_PER_SEC
-    #undef USEC_PER_MIN
-    #undef USEC_PER_HOUR
-    #undef USEC_PER_DAY
+    if (nulled) atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+}
+
+#undef USEC_PER_SEC
+#undef USEC_PER_MIN
+#undef USEC_PER_HOUR
+#undef USEC_PER_DAY
+
+static void xtr_extract_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    xtr_extract_range((xtr_par_ctx_t*)ctx, start, end);
+}
+
+ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
+    ray_t* input = exec_node(g, op_child(g, op, 0));
+    if (!input || RAY_IS_ERR(input)) return input;
+
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
+
+    int64_t field = ext->sym;
+    int64_t len = input->len;
+    int8_t in_type = input->type;
+
+    ray_t* result = ray_vec_new(RAY_I64, len);
+    if (!result || RAY_IS_ERR(result)) { ray_release(input); return result; }
+    result->len = len;
+
+    /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
+     * themselves, so inspect the parent when input is a slice. */
+    bool src_has_nulls =
+        (input->attrs & RAY_ATTR_HAS_NULLS) ||
+        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
+         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+
+    /* Preserve ray_morsel_init's one-time sequential-readahead hint for
+     * mmap'd columns.  The per-worker ray_morsel_init_range deliberately
+     * does not issue it — it would fire once per task instead of once per
+     * column — so it is issued here, on the main thread, before dispatch. */
+    ray_morsel_t warm;
+    ray_morsel_init(&warm, input);
+
+    xtr_par_ctx_t c = {
+        .input = input,
+        .out = (int64_t*)ray_data(result),
+        .field = field,
+        .in_type = in_type,
+        .src_has_nulls = src_has_nulls,
+        .in32 = (in_type == RAY_DATE || in_type == RAY_TIME),
+        .any_null = 0,
+    };
+
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, xtr_extract_fn, &c, len);
+    else
+        xtr_extract_range(&c, 0, len);
+    if (atomic_load_explicit(&c.any_null, memory_order_relaxed))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
 
     ray_release(input);
     return result;
@@ -548,34 +667,17 @@ static int64_t days_from_civil(int64_t y, int64_t m, int64_t d) {
     return era * 146097 + (int64_t)doe - 719468 - 10957;
 }
 
-ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
-    ray_t* input = exec_node(g, op_child(g, op, 0));
-    if (!input || RAY_IS_ERR(input)) return input;
+#define DT_USEC_PER_SEC  1000000LL
+#define DT_USEC_PER_MIN  (60LL  * DT_USEC_PER_SEC)
+#define DT_USEC_PER_HOUR (3600LL * DT_USEC_PER_SEC)
+#define DT_USEC_PER_DAY  (86400LL * DT_USEC_PER_SEC)
 
-    ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
-
-    int64_t field = ext->sym;
-    int64_t len = input->len;
-    int8_t in_type = input->type;
-
-    ray_t* result = ray_vec_new(RAY_TIMESTAMP, len);
-    if (!result || RAY_IS_ERR(result)) { ray_release(input); return result; }
-    result->len = len;
-
-    int64_t* out = (int64_t*)ray_data(result);
-
-    #define DT_USEC_PER_SEC  1000000LL
-    #define DT_USEC_PER_MIN  (60LL  * DT_USEC_PER_SEC)
-    #define DT_USEC_PER_HOUR (3600LL * DT_USEC_PER_SEC)
-    #define DT_USEC_PER_DAY  (86400LL * DT_USEC_PER_SEC)
-
-    /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
-     * themselves, so inspect the parent when input is a slice. */
-    bool src_has_nulls =
-        (input->attrs & RAY_ATTR_HAS_NULLS) ||
-        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
-         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+static void xtr_trunc_range(xtr_par_ctx_t* c, int64_t start, int64_t end) {
+    ray_t* input   = c->input;
+    int64_t* out   = c->out;
+    int64_t field  = c->field;
+    int8_t in_type = c->in_type;
+    bool nulled    = false;
 
     /* Macro to emit a tight inner loop body with HAS_NULLS and IN32 hoisted
      * as compile-time constants (DCE removes dead branches).
@@ -587,7 +689,7 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
             for (int64_t i = 0; i < n; i++) {                              \
                 if (HAS_NULLS && ray_vec_is_null(input, off + i)) {        \
                     out[off + i] = NULL_I64;                                \
-                    ray_vec_set_null(result, off + i, true);                \
+                    nulled = true;                        \
                     continue;                                               \
                 }                                                           \
                 int64_t us;                                                 \
@@ -604,7 +706,7 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
                         ((int64_t)raw32 > INT64_MAX / 1000 / DT_USEC_PER_DAY || \
                          (int64_t)raw32 < INT64_MIN / 1000 / DT_USEC_PER_DAY)) { \
                         out[off + i] = NULL_I64;                            \
-                        ray_vec_set_null(result, off + i, true);            \
+                        nulled = true;                    \
                         continue;                                           \
                     }                                                       \
                     us = (in_type == RAY_DATE)                              \
@@ -676,7 +778,7 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
                 /* Result must fit int64 nanoseconds (out_us × 1000). */    \
                 if (out_us > INT64_MAX / 1000LL || out_us < INT64_MIN / 1000LL) { \
                     out[off + i] = NULL_I64;                                \
-                    ray_vec_set_null(result, off + i, true);                \
+                    nulled = true;                        \
                     continue;                                               \
                 }                                                           \
                 out[off + i] = out_us * 1000LL; /* µs → ns for RAY_TIMESTAMP */ \
@@ -686,11 +788,12 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
     } while (0)
 
     ray_morsel_t m;
-    ray_morsel_init(&m, input);
-    int64_t off = 0;
+    ray_morsel_init_range(&m, input, start, end);
+    int64_t off = start;
 
     /* Hoist src_has_nulls and in_type dispatch outside all loops. */
-    bool dt_in32 = (in_type == RAY_DATE || in_type == RAY_TIME);
+    const bool src_has_nulls = c->src_has_nulls;
+    const bool dt_in32 = c->in32;
     if (!src_has_nulls && !dt_in32) DATE_TRUNC_INNER(0, 0);
     else if (!src_has_nulls &&  dt_in32) DATE_TRUNC_INNER(0, 1);
     else if ( src_has_nulls && !dt_in32) DATE_TRUNC_INNER(1, 0);
@@ -698,10 +801,65 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
 
 #undef DATE_TRUNC_INNER
 
-    #undef DT_USEC_PER_SEC
-    #undef DT_USEC_PER_MIN
-    #undef DT_USEC_PER_HOUR
-    #undef DT_USEC_PER_DAY
+    if (nulled) atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+}
+
+#undef DT_USEC_PER_SEC
+#undef DT_USEC_PER_MIN
+#undef DT_USEC_PER_HOUR
+#undef DT_USEC_PER_DAY
+
+static void xtr_trunc_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    xtr_trunc_range((xtr_par_ctx_t*)ctx, start, end);
+}
+
+ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
+    ray_t* input = exec_node(g, op_child(g, op, 0));
+    if (!input || RAY_IS_ERR(input)) return input;
+
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
+
+    int64_t field = ext->sym;
+    int64_t len = input->len;
+    int8_t in_type = input->type;
+
+    ray_t* result = ray_vec_new(RAY_TIMESTAMP, len);
+    if (!result || RAY_IS_ERR(result)) { ray_release(input); return result; }
+    result->len = len;
+
+    /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
+     * themselves, so inspect the parent when input is a slice. */
+    bool src_has_nulls =
+        (input->attrs & RAY_ATTR_HAS_NULLS) ||
+        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
+         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+
+    /* Preserve ray_morsel_init's one-time sequential-readahead hint for
+     * mmap'd columns.  The per-worker ray_morsel_init_range deliberately
+     * does not issue it — it would fire once per task instead of once per
+     * column — so it is issued here, on the main thread, before dispatch. */
+    ray_morsel_t warm;
+    ray_morsel_init(&warm, input);
+
+    xtr_par_ctx_t c = {
+        .input = input,
+        .out = (int64_t*)ray_data(result),
+        .field = field,
+        .in_type = in_type,
+        .src_has_nulls = src_has_nulls,
+        .in32 = (in_type == RAY_DATE || in_type == RAY_TIME),
+        .any_null = 0,
+    };
+
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, xtr_trunc_fn, &c, len);
+    else
+        xtr_trunc_range(&c, 0, len);
+    if (atomic_load_explicit(&c.any_null, memory_order_relaxed))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
 
     ray_release(input);
     return result;
