@@ -1285,6 +1285,15 @@ typedef struct {
     uint8_t  agg_flags_any;    /* OR of all agg_flags[a] — scalar shape guard */
     uint8_t  any_wide_key;     /* replaces wide_key_mask != 0 */
     uint8_t  any_inline_str;   /* replaces key_inline_str != 0 */
+    /* Set when the whole key tuple is plain fixed-width integer lanes: no
+     * wide/inline-STR key and no floating-point key.  Such a key region is
+     * exactly (n_keys + null_words) 8-byte lanes whose STORED BITS are the
+     * identity, so hash and compare may treat it as one packed value.  F64
+     * keys are excluded: read_col_i64 (which the packed stagers use) does not
+     * decode F64 at all, and keeping them out also keeps the packed lanes free
+     * of the -0.0 canonicalisation the F64 builders apply (#407,
+     * group_key_f64_bits).  Pinned by group_extra/ght_packed_key_excludes_f64. */
+    uint8_t  packed_key;
     uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
     /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */
     int8_t*  agg_val_slot;     /* [n_aggs] accum slot per agg, -1 = none */
@@ -1367,6 +1376,24 @@ typedef struct {
     ray_t*        _h_slots;
     ray_t*        _h_rows;
     uint8_t       oom;        /* set by group_probe_entry on grow failure */
+    /* Optional growth target in SLOTS (0 = plain doubling).  Consumed ONLY by
+     * group_ht_rehash — never by group_ht_grow, which keeps the row array,
+     * where nearly all the bytes live, at O(groups).
+     *
+     * What the trigger actually proves: a rehash means the table just crossed
+     * ht_cap/2 groups.  That is a lower bound on its cardinality, NOT evidence
+     * that it will keep growing — so the caller's target (derived from how
+     * many rows the table can still receive) is applied at most ONE extra
+     * doubling per rehash rather than in full.  A table that stalls right
+     * after a jump therefore over-allocates its slot array by 2x and nothing
+     * else, while a genuinely near-unique table still reaches its final size
+     * in far fewer rungs — and every rung skipped is one whole re-hash and
+     * re-insert of every live group avoided.
+     *
+     * Idempotent (the jump is a max()), so once ht_cap reaches grow_cap the
+     * field stops having any effect.  Placed here to land in the existing tail
+     * padding — group_ht_t's size is unchanged. */
+    uint32_t      grow_cap;
 } group_ht_t;
 
 /* Row-level accessors for group HT rows */
@@ -1402,7 +1429,8 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                         ray_t** agg_vecs, ray_t** agg_vecs2,
                         uint8_t need_flags,
                         const uint16_t* agg_ops,
-                        const int8_t* key_types);
+                        const int8_t* key_types,
+                        ray_t* const* key_vecs);
 /* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not
  * ownership (src->spill_hdr == NULL is true both for genuine inline layouts
  * AND for borrowers, so it cannot be the test): when src->agg_val_slot ==
@@ -1437,7 +1465,12 @@ typedef struct {
      * For COUNT/SUM/MAX the natural ordering is largest-first; for
      * MIN it's smallest-first.  Both directions are supported per
      * agg kind so `desc: min_value take: N` (the N groups with the
-     * largest min) is also expressible. */
+     * largest min) is also expressible.
+     *
+     * CONTRACT (#408): every arming site MUST set this explicitly.
+     * A zero default is NOT coerced to largest-first for COUNT any
+     * more — consumers take .desc at face value, and the desc-only
+     * keep-min trims are gated off entirely when it is 0. */
     uint8_t  desc;
 } ray_group_emit_filter_t;
 ray_group_emit_filter_t ray_group_emit_filter_get(void);

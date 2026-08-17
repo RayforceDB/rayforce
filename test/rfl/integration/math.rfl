@@ -2478,3 +2478,78 @@
 ;; Test division with type conversion
 (/ [100 200 300] 3.0) -- [33.33 66.67 100.0]
 (% [100 200 300] 3.0) -- [1.0 2.0 0.0]
+
+;; ========== I64 FLOOR DIV EXACTNESS / UB REGRESSIONS ==========
+;; Integer div must stay in int64 space: the old double round-trip lost
+;; precision above 2^53 and hit UB at q == 2^63 (div -9223372036854775807 -1).
+(div 9007199254740993 1) -- 9007199254740993
+(div 9007199254740993 3) -- 3002399751580331
+(div 18014398509481985 1) -- 18014398509481985
+(div 123456789012345678 1) -- 123456789012345678
+(div 9223372036854775807 1) -- 9223372036854775807
+(div 9223372036854775807 -1) -- -9223372036854775807
+(div -9223372036854775807 -1) -- 9223372036854775807
+(div -9223372036854775807 2) -- -4611686018427387904
+(div -9223372036854775807 -2) -- 4611686018427387903
+(div 9223372036854775807 2) -- 4611686018427387903
+;; vectors (1-element vectors route through the scalar path)
+(div [9007199254740993 9007199254740993] 3) -- [3002399751580331 3002399751580331]
+(div [123456789012345678 9007199254740993] 1) -- [123456789012345678 9007199254740993]
+(div [9223372036854775807] -1) -- [-9223372036854775807]
+(div [-9223372036854775807] -1) -- [9223372036854775807]
+;; out-of-int64-range (float input) still clamps to null
+(div 1e308 1) -- 0Nl
+(div -1e308 1) -- 0Nl
+(div [1e308 9.3e18] 1) -- [0Nl 0Nl]
+(div 9223372036854775808.0 1) -- 0Nl
+;; floor semantics preserved for int operands
+(div [-7 7 -7] [2 -2 -2]) -- [-4 -4 3]
+(div [7 8 9] 2) -- [3 4 4]
+;; compiled select/update must not round integer columns through double
+(set TdivI64 (table [v] (list [9007199254740993 123456789012345678])))
+(at (select {q: (div v 1) from: TdivI64}) 'q) -- [9007199254740993 123456789012345678]
+(at (select {q: (div v 3) from: TdivI64}) 'q) -- [3002399751580331 41152263004115226]
+(set TdivUpd (table [v q] (list [9007199254740993 123456789012345678] [0 0])))
+(at (update {q: (div v 1) from: TdivUpd}) 'q) -- [9007199254740993 123456789012345678]
+(at (update {q: (div v 3) from: TdivUpd}) 'q) -- [3002399751580331 41152263004115226]
+
+;; ── dual-path: the fast (<=2^53 double) and exact (>2^53 int64) kernels
+;;    must agree.  2^53 itself takes the fast path; 2^53+1 the exact one. ──
+(div 9007199254740992 3) -- 3002399751580330
+(div [9007199254740992 9007199254740993] 1) -- [9007199254740992 9007199254740993]
+;; a mixed small+big morsel forces the exact kernel for the whole span
+(set TdivMix (table [a b] (list [10 9007199254740993] [3 7])))
+(at (select {q: (div a b) from: TdivMix}) 'q) -- [3 1286742750677284]
+;; div-by-zero through the integer path: scalar/vector null, narrow arm 0
+(div 5 0) -- 0Nl
+(div [5 6] [0 2]) -- [0Nl 3]
+(set TdivZ (table [a b] (list [5 6] [0 2])))
+(at (select {q: (div a b) from: TdivZ}) 'q) -- [0Nl 3]
+;; narrow-output floor div (I32 / I16 / U8 arms), incl. div-by-zero -> 0
+(div (as 'I32 [100 55 -7]) (as 'I32 [7 8 2])) -- (as 'I32 [14 6 -4])
+(div (as 'I16 [100 55 -7]) (as 'I16 [7 8 2])) -- (as 'I16 [14 6 -4])
+(set TdivN (table [a b] (list (as 'I16 [100 55 6]) (as 'I16 [7 0 2]))))
+(at (select {q: (div a b) from: TdivN}) 'q) -- (as 'I16 [14 0 3])
+
+;; ── #403 follow-up: the ±2^53 gate rides inside the I64 divide loop for
+;;    `I64 column ÷ (I64 column | int scalar)`, so the column is read once
+;;    instead of twice.  Same all-or-nothing decision: one out-of-range value
+;;    (or a null, which is INT64_MIN) sends the whole range to the exact
+;;    kernel.  These pin fast lane, redo lane, and the scalar-divisor lane. ──
+(set TdivGate (table [a b] (list [10 -10 9007199254740993 0Nl] [3 3 7 3])))
+(at (select {q: (div a b) from: TdivGate}) 'q) -- [3 -4 1286742750677284 0Nl]
+(at (select {q: (div a 3) from: TdivGate}) 'q) -- [3 -4 3002399751580331 0Nl]
+(at (select {q: (div a 9007199254740993) from: TdivGate}) 'q) -- [0 -1 1 0Nl]
+;; all-small column keeps the fast lane (identical results either way)
+(set TdivGateS (table [a b] (list [10 -10 20 -21] [3 3 7 4])))
+(at (select {q: (div a b) from: TdivGateS}) 'q) -- [3 -4 2 -6]
+(at (select {q: (div a 3) from: TdivGateS}) 'q) -- [3 -4 6 -7]
+(at (select {q: (div a 0) from: TdivGateS}) 'q) -- [0Nl 0Nl 0Nl 0Nl]
+;; broadcast scalar past ±2^53 with an in-range column: exact kernel, no rescan
+(at (select {q: (div a -9007199254740993) from: TdivGateS}) 'q) -- [-1 0 -1 0]
+;; gate BOUND pin: values strictly inside (2^53, 2^54], no null, nothing
+;; larger — the only fixture where widening the ±2^53 bound (0x1p53 ->
+;; 0x1p54) changes the answer instead of being masked by a co-resident
+;; out-of-range value.  Verified to fail on exactly that mutant.
+(set TdivBound (table [v] (list [9007199254740993 9007199254740995 9007199254740997])))
+(at (select {q: (div v 1) from: TdivBound}) 'q) -- [9007199254740993 9007199254740995 9007199254740997]

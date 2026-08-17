@@ -1,0 +1,78 @@
+;; ════════════════════════════════════════════════════════════════════
+;; topn_asc_take.rfl — direction of the group emit filter (issue #408).
+;;
+;; `select … by … asc: <agg> take: N` arms the SAME emit filter as the
+;; `desc:` form (query.c match_group_desc_count_take sets .desc = 0), and
+;; group.c serves it either with the bounded top-N heap (use_topn_filter
+;; → topn_fuse_partition / topn_scan_fn → topn_heap_push, whose
+;; TOPN_BETTER predicate is direction-symmetric) or, on single-key
+;; dense/sparse shapes, with the desc-only keep-min trims.  Two places used to force
+;; `desc = 1` whenever the ordering agg was COUNT — the v2_emit direction
+;; hoist and group_emit_filter_trim — so an asc COUNT take returned the
+;; LARGEST N groups, byte-identical to the desc answer, while `-c 1` (no
+;; pool ⇒ no radix emit filter) returned the correct smallest N.  The
+;; answer therefore changed with core count.  Regression: #408.
+;;
+;; PATH REACH.  Every fixture below is 2.5M rows (> the 1<<21 radix
+;; admission) with the emit filter armed by `asc:`/`desc: <agg> take: N`,
+;; N ≤ 1024.  Instrumentation showed the 2-KEY selects entering the
+;; parallel radix path with the fused per-partition heap armed
+;; (desc_dir = 0 for `asc:`, 1 for `desc:`).  The SINGLE-key selects
+;; take the dense/sparse keep-min ladder instead: desc arms
+;; da_count_emit_keep_min, asc must NOT (that machinery is largest-
+;; first only) and falls through to the full group set + sort/take —
+;; pre-fix, single-key asc was wrong at EVERY core count, not just
+;; under the pool.
+;;
+;; ORACLE.  S = round(sqrt(i)) over (til 2500000) puts 2j+1 rows in group
+;; j (1, 3, 5, … — every group count DISTINCT, so the smallest-N set is
+;; unambiguous and tie-break order cannot mask a direction flip).  Group
+;; ids are the counts' rank, so the key column is checked too: an asc
+;; take:5 must return groups 0..4, a desc take:5 the last five.
+;; ════════════════════════════════════════════════════════════════════
+
+(set T408 (til 2500000))
+(set S408 (as 'I64 (sqrt (as 'F64 T408))))
+(set G408 (as 'SYM S408))
+;; w cycles over [-500, 512] with period 1013 (coprime with the group
+;; sizes) so SUM/MIN/MAX have a genuine spread across groups.
+(set W408 (- (% T408 1013) 500))
+(set B408 (table [g k v w] (list G408 S408 T408 W408)))
+
+;; ─── COUNT, two keys (SYM + I64) — the shape from the issue ──────────
+(set A408 (select {c: (count v) by: {g: g k: k} from: B408 asc: c take: 5}))
+(count A408) -- 5
+;; smallest five counts are 1, 3, 5, 7, 9 …
+(at (at A408 'c) 0) -- 1
+(at (at A408 'c) 4) -- 9
+(sum (at A408 'c)) -- 25
+;; … held by groups 0, 1, 2, 3, 4 (before the fix: the five LARGEST).
+(at (at A408 'k) 0) -- 0
+(sum (at A408 'k)) -- 10
+
+(set D408 (select {c: (count v) by: {g: g k: k} from: B408 desc: c take: 5}))
+(count D408) -- 5
+(at (at D408 'c) 0) -- 3161
+(sum (at D408 'c)) -- 15785
+
+;; ─── COUNT, single I64 key (same filter, dense/sparse entry) ─────────
+(set B408S (table [k v] (list S408 T408)))
+(set A408S (select {c: (count v) by: {k: k} from: B408S asc: c take: 5}))
+(sum (at A408S 'c)) -- 25
+(sum (at A408S 'k)) -- 10
+(sum (at (select {c: (count v) by: {k: k} from: B408S desc: c take: 5}) 'c)) -- 15785
+
+;; ─── SUM: asc keeps the most negative sums, desc the largest ─────────
+(at (at (select {s: (sum w) by: {g: g k: k} from: B408 asc: s take: 5}) 's) 0) -- -114612
+(at (at (select {s: (sum w) by: {g: g k: k} from: B408 desc: s take: 5}) 's) 0) -- 133674
+
+;; ─── MIN / MAX: the direction is the agg's, not the op's ────────────
+;; `asc: <max>` asks for the groups with the SMALLEST maximum — the tiny
+;; leading groups, whose w never climbs past -500 + (rows-1).  Under the
+;; old COUNT-only coercion these were unaffected, but they pin that the
+;; hoisted direction stays per-request for every supported agg.
+(at (at (select {m: (max w) by: {g: g k: k} from: B408 asc: m take: 5}) 'm) 0) -- -500
+(at (at (select {m: (max w) by: {g: g k: k} from: B408 asc: m take: 5}) 'm) 4) -- -476
+(at (at (select {m: (max w) by: {g: g k: k} from: B408 desc: m take: 5}) 'm) 0) -- 512
+;; `desc: <min>` — the groups whose minimum is largest.
+(at (at (select {m: (min w) by: {g: g k: k} from: B408 desc: m take: 5}) 'm) 0) -- 423

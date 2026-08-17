@@ -30,6 +30,7 @@
 #include "table/table.h"
 #include "table/domain.h"
 #include "ops/idxop.h"
+#include "io/csv.h"      /* ray_csv_hash_upgrade_check — shared index policy */
 #include "vec/str.h"
 #include "lang/format.h"
 #include <string.h>
@@ -560,11 +561,42 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
         if (col->len < (1 << 16)) continue;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal
-         * get the per-chunk min/max for block-skip. */
+         * get the per-chunk min/max for block-skip.
+         *
+         * High-entropy numeric columns are then upgraded to a persisted HASH
+         * index using the same chunk-zone entropy heuristic the in-memory
+         * .csv.read load applies (ray_csv_hash_upgrade_check): the index
+         * decision is made ONCE at conversion time, so a `.db.splayed.get`
+         * reload serves equality probes exactly as fast as a fresh CSV load
+         * (previously the reloaded store had only the zone map and e.g.
+         * ClickBench q10 ran 5x slower on-disk than in-memory). */
         ray_t* idx = (col->type == RAY_STR)
                      ? ray_index_dict_compute(col)
                      : ray_index_chunk_zone_compute(col, 16);
         if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); continue; }
+
+        if (col->type != RAY_STR &&
+            ray_csv_hash_upgrade_check(col->type, col->len,
+                                       ray_index_payload(idx))) {
+            ray_t* hi = ray_idx_hash_fn(col);
+            if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
+                ray_release(idx);          /* zone sacrificed for the hash */
+                idx = NULL;
+                ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+                if (nstr && !RAY_IS_ERR(nstr)) {
+                    char path[1100];
+                    int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                                     (int)ray_str_len(nstr), ray_str_ptr(nstr));
+                    if (n > 0 && n < (int)sizeof(path))
+                        (void)ray_col_append_index(path,
+                            ray_index_payload(hi->index), hi->len, hi->type);
+                }
+                ray_release(hi);
+                continue;
+            }
+            if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
+            /* Hash build failed — fall through and persist the zone. */
+        }
 
         ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
         if (nstr && !RAY_IS_ERR(nstr)) {

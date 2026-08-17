@@ -1202,6 +1202,123 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
     return mapped;
 }
 
+/* --------------------------------------------------------------------------
+ * Direct-block reuse cache
+ *
+ * Analytical queries allocate the same few large scratch/result blocks
+ * every run (radix payload maps, order maps, result columns) and freed
+ * them straight back to the kernel: ~330MB of anon mmap+munmap round-trip
+ * per 10M-row group query, with the kernel re-zeroing every page on the
+ * next fault (kernel_init_pages was ~8% of ClickBench q17).  Keep a small
+ * global stash of recently freed ANON direct blocks and serve size-matched
+ * requests from it.
+ *
+ * Accounting: a cached block's pages stay resident, so it remains counted
+ * in both the committed-RAM tracker and the g_anon_committed watermark;
+ * only the live-block stats (g_direct_bytes/count) drop on stash and rise
+ * again on reuse.  Under watermark pressure the cache is drained before
+ * new memory is committed.  File-backed spill blocks are never cached.
+ *
+ * Fit: first block with map_size in [need, need + max(need/4, 2MB)] — the
+ * repeat-query case hits exactly; the bound keeps waste at <= 25%.
+ * Concurrency: any thread may alloc or free a direct block, so a global
+ * spinlock guards the table — direct ops are a handful per query, so
+ * contention is nil.  Budget: 1/16 of the anon watermark (physical RAM
+ * by default, the -m budget when set), capped at 512MB — no knob; the
+ * cache is invisible to correctness and self-drains under pressure. */
+#define RAY_DIRECT_CACHE_SLOTS 16
+typedef struct { void* base; size_t map_size; } ray_direct_cache_slot_t;
+static ray_direct_cache_slot_t g_direct_cache[RAY_DIRECT_CACHE_SLOTS];
+static size_t          g_direct_cache_bytes = 0;
+static _Atomic(int)    g_direct_cache_spin = 0;
+
+static inline void direct_cache_lock(void) {
+    while (atomic_exchange_explicit(&g_direct_cache_spin, 1,
+                                    memory_order_acquire)) { /* spin */ }
+}
+static inline void direct_cache_unlock(void) {
+    atomic_store_explicit(&g_direct_cache_spin, 0, memory_order_release);
+}
+
+static size_t direct_cache_budget(void) {
+    int64_t wm = heap_anon_watermark();
+    size_t b = (wm > 0) ? (size_t)wm / 16 : 0;
+    /* 1/16 of the watermark is the sole bound (1GB on a 16GB box, ~8GB
+     * on 128GB).  Earlier absolute caps (512MB, then 4GB) each turned
+     * out to exclude exactly the blocks whose kernel re-zeroing cost the
+     * most at the next data scale: a 100M-row group query cycles several
+     * GB-scale scratch blocks (order map ~800MB, per-partition gather
+     * arrays ~1.6GB, result columns ~500MB) per execution, and every
+     * cache miss is an mmap + munmap + full page-zeroing round trip
+     * (measured 14-17% of q17/q18 wall as kernel_init_pages). */
+    return b;
+}
+
+/* Take a cached block whose map_size fits [need, need + waste bound].
+ * Returns the base pointer (its map_size in *out_size) or NULL. */
+static void* direct_cache_take(size_t need, size_t* out_size) {
+    void* base = NULL;
+    direct_cache_lock();
+    size_t slack = need / 4;
+    if (slack < (2u << 20)) slack = (2u << 20);
+    for (int i = 0; i < RAY_DIRECT_CACHE_SLOTS; i++) {
+        size_t ms = g_direct_cache[i].map_size;
+        if (g_direct_cache[i].base && ms >= need && ms - need <= slack) {
+            base = g_direct_cache[i].base;
+            *out_size = ms;
+            g_direct_cache[i].base = NULL;
+            g_direct_cache[i].map_size = 0;
+            g_direct_cache_bytes -= ms;
+            break;
+        }
+    }
+    direct_cache_unlock();
+    return base;
+}
+
+/* Stash a freed ANON block; returns true when cached (caller must then
+ * NOT munmap or un-commit it). */
+static bool direct_cache_put(void* base, size_t map_size) {
+    size_t budget = direct_cache_budget();
+    if (budget == 0) return false;
+    bool cached = false;
+    direct_cache_lock();
+    if (g_direct_cache_bytes + map_size <= budget) {
+        for (int i = 0; i < RAY_DIRECT_CACHE_SLOTS; i++) {
+            if (!g_direct_cache[i].base) {
+                g_direct_cache[i].base = base;
+                g_direct_cache[i].map_size = map_size;
+                g_direct_cache_bytes += map_size;
+                cached = true;
+                break;
+            }
+        }
+    }
+    direct_cache_unlock();
+    return cached;
+}
+
+/* Release every cached block back to the kernel (memory pressure). */
+static void direct_cache_drain(void) {
+    direct_cache_lock();
+    for (int i = 0; i < RAY_DIRECT_CACHE_SLOTS; i++) {
+        if (g_direct_cache[i].base) {
+            size_t ms = g_direct_cache[i].map_size;
+            atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)ms,
+                                      memory_order_relaxed);
+            ray_vm_free(g_direct_cache[i].base, ms);
+            g_direct_cache[i].base = NULL;
+            g_direct_cache[i].map_size = 0;
+            g_direct_cache_bytes -= ms;
+        }
+    }
+    direct_cache_unlock();
+}
+
+void ray_heap_direct_cache_drain(void) {
+    direct_cache_drain();
+}
+
 /* Direct large allocation: mmap the exact page-rounded size instead of a
  * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
 static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
@@ -1212,22 +1329,37 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     int   swap_fd   = -1;
     char* swap_path = NULL;
 
-    /* If keeping this in anonymous RAM would push our footprint past the
-     * watermark (default: physical RAM), back it with a disk file from the
-     * start so it spills instead of being OOM-killed as its pages fault in.
-     * (Under lenient overcommit an anon mmap the kernel can't actually back
-     * SUCCEEDS, then kills us at fault time — so a fallback-on-failure alone
-     * would not catch it.)  Otherwise use anonymous RAM, and fall back to a
-     * spill file only if the kernel refuses the mapping. */
-    bool force_file = heap_anon_would_exceed(map_size);
-    if (!force_file)
-        base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
-    if (!base) {
-        base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
-        if (!base) return NULL;
+    /* Reuse cache first: a hit hands back resident, already-committed
+     * pages — no mmap, no watermark commit (the block never left the
+     * committed totals while cached), no kernel page-zeroing on fault. */
+    size_t cached_size = 0;
+    base = direct_cache_take(map_size, &cached_size);
+    if (base) {
+        map_size = cached_size;
+    } else {
+        /* If keeping this in anonymous RAM would push our footprint past the
+         * watermark (default: physical RAM), back it with a disk file from the
+         * start so it spills instead of being OOM-killed as its pages fault in.
+         * (Under lenient overcommit an anon mmap the kernel can't actually back
+         * SUCCEEDS, then kills us at fault time — so a fallback-on-failure alone
+         * would not catch it.)  Otherwise use anonymous RAM, and fall back to a
+         * spill file only if the kernel refuses the mapping.
+         * Under pressure, drain the reuse cache before deciding — its resident
+         * pages are the first thing to give back. */
+        bool force_file = heap_anon_would_exceed(map_size);
+        if (force_file) {
+            direct_cache_drain();
+            force_file = heap_anon_would_exceed(map_size);
+        }
+        if (!force_file)
+            base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
+        if (!base) {
+            base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
+            if (!base) return NULL;
+        }
+        if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
+            heap_anon_commit((int64_t)map_size);
     }
-    if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
-        heap_anon_commit((int64_t)map_size);
 
     ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
     hdr->map_size  = map_size;
@@ -1442,6 +1574,11 @@ void ray_free(ray_t* v) {
             ray_sys_track_sub((int64_t)map_size);
             close(swap_fd);
             if (swap_path) { unlink(swap_path); ray_sys_free(swap_path); }
+        } else if (direct_cache_put(base, map_size)) {
+            /* Stashed for reuse: pages stay resident, so the block keeps
+             * its committed-RAM and watermark accounting; only the live
+             * stats above dropped.  Eviction (direct_cache_drain) performs
+             * the deferred un-commit + munmap. */
         } else {
             atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)map_size,
                                       memory_order_relaxed);

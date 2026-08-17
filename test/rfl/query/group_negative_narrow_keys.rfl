@@ -1,0 +1,23 @@
+;; Direct-array group-by: signed narrow keys (I16/I32/DATE/TIME) must be
+;; sign-extended identically in the min/max prescan and the accumulate loop.
+;; The accumulate dispatch used to pick readers by ELEMENT SIZE only, reading
+;; I16 as uint16 — a negative key then mapped to a slot far outside the dense
+;; range (out-of-bounds write) and its group vanished from the result
+;; (caught by csv_explicit_numeric_types.rfl's 3-group check).
+
+;; I16 key with a negative group, binary agg (wavg keeps DA eligible)
+(set Tnk (table [k a b c] (list [32000 -300 9 9] [1.25 -2.5 3.75 16777216.0] [100000 -7 42 100001] [0.25 1.5 -0.25 1.0])))
+(count (select {mx: (max a) wa: (wavg b c) by: {kk: k} from: Tnk})) -- 3
+(at (at (select {mx: (max a) wa: (wavg b c) by: {kk: k} asc: kk from: Tnk}) 'kk) 0) -- -300
+
+;; I32-typed negative keys via wide values
+(count (select {c: (count v) by: {k: k} from: (table [k v] (list [-100000 -100000 70000 3] [1 2 3 4]))})) -- 3
+
+;; sums attributed to the right (negative) group
+(at (at (select {s: (sum v) by: {k: k} where: (< k 0) from: (table [k v] (list [-5 -5 3 7] [10 20 30 40]))}) 's) 0) -- 30
+
+;; two narrow signed keys (composite gid path)
+(count (select {c: (count a) by: {k1: k1 k2: k2} from: (table [k1 k2 a] (list [-300 -300 9 9] [1 1 1 2] [10 20 30 40]))})) -- 3
+
+;; mixed signedness composite: signed I16 + unsigned-style small ints
+(count (select {c: (count a) by: {k1: k1 k2: k2} from: (table [k1 k2 a] (list [-2 -2 2 2] [0 1 0 1] [1 2 3 4]))})) -- 4

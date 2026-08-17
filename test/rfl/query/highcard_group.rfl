@@ -1,0 +1,102 @@
+;; High-cardinality group-by pinning tests for the partition-major build
+;; (docs/superpowers/specs/2026-08-15-high-card-group-scaling.md, Part A).
+;; 300K rows forces the parallel radix_v2 path even under RAYFORCE_CORES=2;
+;; keys are arithmetic so every expected value is closed-form.
+
+;; ~100K distinct I64 keys, 3 rows each: count per group is exactly 3.
+(set HK (table [k] (list (% (til 300000) 100000))))
+(count (select {c: (count k) by: k from: HK})) -- 100000
+(sum (at (select {c: (count k) by: k from: HK}) 'c)) -- 300000
+;; stable first-seen order: first group is key 0, last is key 99999
+(at (at (select {c: (count k) by: k from: HK}) 'k) 0) -- 0
+(at (at (select {c: (count k) by: k from: HK}) 'k) 99999) -- 99999
+
+;; top-N by count with ties: every count == 3, keep semantics unchanged
+(count (select {c: (count k) by: k from: HK desc: c take: 10})) -- 10
+
+;; 2-key composite, 1500 distinct pairs (lcm(500,300)=1500)
+(set HK2 (table [a b] (list (% (til 300000) 500) (% (til 300000) 300))))
+;; 1500 distinct pairs -> distinct pairs = 1500; count per pair = 200
+(count (select {c: (count a) by: {a: a b: b} from: HK2})) -- 1500
+(sum (at (select {c: (count a) by: {a: a b: b} from: HK2}) 'c)) -- 300000
+(at (at (select {c: (count a) by: {a: a b: b} from: HK2 desc: c take: 3}) 'c) 0) -- 200
+
+;; filtered (rowsel) variant stays correct
+(sum (at (select {c: (count k) by: k from: HK where: (< k 1000)}) 'c)) -- 3000
+(count (select {c: (count k) by: k from: HK where: (< k 1000)})) -- 1000
+
+;; I32-typed keys through the same path
+(set HK3 (table [k v] (list (as 'I32 (% (til 262144) 65536)) (til 262144))))
+(count (select {c: (count v) by: k from: HK3})) -- 65536
+(sum (at (select {c: (count v) by: k from: HK3}) 'c)) -- 262144
+
+;; take-without-sort under a group-by: the take is pushed as HEAD(GROUP), so the
+;; v2 radix engine emits ONLY the first N groups (bounded emit) instead of
+;; materializing all 100K.  The result must still be the first-seen PREFIX:
+;; 100K distinct (k, j) pairs (j is a function of k), 3 rows each, so take: 5
+;; is exactly keys 0..4 with count 3.
+(set HKT (table [k j] (list (% (til 300000) 100000) (% (% (til 300000) 100000) 7))))
+(set RT (select {c: (count k) by: {k: k j: j} from: HKT take: 5}))
+(count RT) -- 5
+(at RT 'k) -- [0 1 2 3 4]
+(at RT 'j) -- [0 1 2 3 4]
+(at RT 'c) -- [3 3 3 3 3]
+;; negative (tail) and range takes are NOT pushed — full group set, then slice
+(at (select {c: (count k) by: {k: k j: j} from: HKT take: -3}) 'k) -- [99997 99998 99999]
+(at (select {c: (count k) by: {k: k j: j} from: HKT take: [2 3]}) 'k) -- [2 3 4]
+
+;; ─── take-pushdown guards (grouped take: without asc:/desc:) ──────────
+;; The pushdown adds HEAD(GROUP) to the DAG so the group engine can emit only
+;; the first N groups.  These shapes must NOT be pushed (or must survive the
+;; trim), and all of them are pinned against the pre-pushdown answers.
+
+;; LIST-producing aggregate (top/bot): the group emits a LIST column.
+(set LT (table [k v] (list (% (til 40) 6) (til 40))))
+(set LR (select {t: (top v 3) c: (count v) by: k from: LT take: 4}))
+(count LR) -- 4
+(at LR 'k) -- [0 1 2 3]
+(at LR 'c) -- [7 7 7 7]
+(at (at LR 't) 0) -- [36 30 24]
+(at (at LR 't) 3) -- [39 33 27]
+;; take larger than the group count, and a negative (tail) take
+(count (select {t: (top v 3) c: (count v) by: k from: LT take: 100})) -- 6
+(at (select {t: (top v 3) c: (count v) by: k from: LT take: -2}) 'k) -- [4 5]
+
+;; HEAD/TAIL over a table with a LIST column (exec.c trim: LIST cells are
+;; copied WITH a retain — the raw byte copy used to leave the column NULL and
+;; fail with "table add_col: column must be a vector").
+(set LC (table [a b] (list (as 'I64 [1 2 3]) (list [10 11] [20 21] [30 31]))))
+(at (select {a: a b: b from: LC take: 2}) 'a) -- [1 2]
+(at (at (select {a: a b: b from: LC take: 2}) 'b) 1) -- [20 21]
+(at (select {a: a b: b from: LC take: -2}) 'a) -- [2 3]
+(at (at (select {a: a b: b from: LC take: -2}) 'b) 0) -- [20 21]
+
+;; take: is evaluated EXACTLY once (the pushdown decision must not re-run a
+;; side-effecting take: expression that apply_sort_take also reads).
+(set TKCNT 0)
+(count (select {c: (count v) by: k from: LT take: (do (set TKCNT (+ TKCNT 1)) 3)})) -- 3
+TKCNT -- 1
+
+;; PARTED input with an EMPTY partition: exec_group_parted reads a positive
+;; group_limit as "stop after N partitions", which assumes 1 group per
+;; partition — partition 2 is empty, so partitions [1 2] hold only ONE group
+;; and a pushed take: 2 would answer [1] instead of [1 3].  Grouped takes over
+;; parted inputs are therefore never pushed.  The fixture uses 1000 rows per
+;; partition on purpose: exec_group_parted's cardinality gate keeps SMALL
+;; partitions on the concat fallback, which never consults group_limit, so a
+;; tiny fixture would pass even with the bug present.
+(.sys.exec "rm -rf /tmp/rfl_take_parted")
+(set TP1 (table [k v] (list (% (til 1000) 10) (til 1000))))
+(set TP0 (table [k v] (list (as 'I64 []) (as 'I64 []))))
+(.db.splayed.set "/tmp/rfl_take_parted/1/t/" TP1)
+(.db.splayed.set "/tmp/rfl_take_parted/2/t/" TP0)
+(.db.splayed.set "/tmp/rfl_take_parted/3/t/" TP1)
+(.db.splayed.set "/tmp/rfl_take_parted/4/t/" TP1)
+(.db.splayed.set "/tmp/rfl_take_parted/5/t/" TP1)
+(set PTK (.db.parted.get "/tmp/rfl_take_parted/" 't))
+(at (select {c: (count v) by: part from: PTK}) 'part) -- [1 3 4 5]
+(at (select {c: (count v) by: part from: PTK}) 'c) -- [1000 1000 1000 1000]
+(at (select {c: (count v) by: part from: PTK take: 2}) 'part) -- [1 3]
+(at (select {c: (count v) by: part from: PTK take: 2}) 'c) -- [1000 1000]
+(at (select {c: (count v) by: part from: PTK take: 3}) 'part) -- [1 3 4]
+(at (select {c: (count v) by: part from: PTK take: 4}) 'part) -- [1 3 4 5]

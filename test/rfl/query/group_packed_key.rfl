@@ -1,0 +1,182 @@
+;; Packed-key group-by pipeline (src/ops/group.c ght_layout_t.packed_key).
+;;
+;; When every group key is a plain fixed-width integer lane (whitelisted type,
+;; no GUID/STR indirection, no F64) the group pipeline hashes the WHOLE key
+;; region in one ght_hash_lanes avalanche instead of hashing each key and
+;; combining, elides the null-mask words when no key column can be null, and
+;; drops the dead value slot reserved for OP_COUNT.  Group ids, first-seen
+;; ordering and emit-filter behaviour must be unchanged.
+;;
+;; There is NO 16-byte / 2-lane cap: eligibility is per-key TYPE, not tuple
+;; width, so a 9-key tuple is packed just as a 2-key one is.  The only
+;; width-sensitive thing is P1_MORSEL_KEYS (8), which selects the morsel
+;; stager vs the row-major builder — both packed.
+;;
+;; PATH REACH — the point of the 2.5M sizes below.  The fat-entry radix
+;; pipeline (radix_phase1_fn, which owns the morsel stager) needs
+;; n_scan > 1<<21 AND the emit filter armed (`desc: <agg> take: N`) AND a key
+;; shape the fused count-only radix declines (a SYM key does that); without a
+;; SYM key the same size lands on radix_v2_phase1_fn's partition-major morsel
+;; instead.  Instrumenting both showed the cases below execute, in order:
+;;   radix_phase1_fn    morsel stager     nk=2 nv=0                (BIGS)
+;;   radix_phase1_fn    morsel stager     nk=3 nv=2                (BIGM)
+;;   radix_phase1_fn    row-major packed  nullable, null_words=1   (BIGN)
+;;   radix_v2_phase1_fn morsel  packed=1  (BIGP)   packed=0  (PKF)
+;;   radix_v2_phase1_fn morsel  need_flags=SUM, near-unique (BIGU)
+;; The 300K cases at the bottom cover the sequential / direct-array entries
+;; into the same layout.
+;;
+;; Columns are derived from one shared (til 2500000) — rebuilding it per
+;; column roughly doubled this file's debug-build runtime.
+
+(set T (til 2500000))
+(set G (as 'SYM (% T 900)))
+(set K (% T 700))
+(set M (as 'I16 (- (% T 60) 30)))
+
+;; ── 2-key packed tuple, count-only: no value slots at all ────────────────
+;; SYM + I64 keys -> fat-entry radix + morsel stager (nk=2, nv=0).
+(set BIGS (table [g k v] (list G K T)))
+(count (select {c: (count v) by: {g: g k: k} from: BIGS})) -- 6300
+(sum (at (select {c: (count v) by: {g: g k: k} from: BIGS}) 'c)) -- 2500000
+(at (at (select {c: (count v) by: {g: g k: k} from: BIGS desc: c take: 10}) 'c) 0) -- 397
+;; same shape under a WHERE.  The predicate is deliberately WIDE (96% of rows
+;; survive) and the emit filter is kept armed: a dense selection stays on the
+;; sequential scan with a rowsel, which is what drives the morsel stager's
+;; INDEXED gather (group_keys_gather) instead of the contiguous one — verified
+;; as contig=0.  A narrow predicate, or dropping `desc/take`, routes the query
+;; off this path entirely.
+(count (select {c: (count v) by: {g: g k: k} from: BIGS where: (< v 2400000) desc: c take: 5})) -- 5
+(sum (at (select {c: (count v) by: {g: g k: k} from: BIGS where: (< v 2400000) desc: c take: 5}) 'c)) -- 1905
+
+;; ── 2-key packed tuple with NO SYM key ───────────────────────────────────
+;; The fused count-only radix accepts this shape, so it lands on
+;; radix_v2_phase1_fn's partition-major morsel path.  That path was
+;; UNREACHABLE until null-mask elision made its `null_words == 0` gate
+;; satisfiable, and it staged a per-key hash while hash_keys_inline — used by
+;; group_ht_rehash / rebuild_slots / merge_row — returns ght_hash_lanes for
+;; the same layout.  After a worker-HT rehash the probe then missed and
+;; inserted DUPLICATE group rows; phase 2's merge folded them, so the answers
+;; stayed right and a result diff could never have caught it.  Regression
+;; case for that.
+(set BIGP (table [a b] (list (% T 5000) (% T 3000))))
+(count (select {c: (count a) by: {a: a b: b} from: BIGP desc: c take: 10})) -- 10
+(count (select {c: (count a) by: {a: a b: b} from: BIGP})) -- 15000
+(sum (at (select {c: (count a) by: {a: a b: b} from: BIGP}) 'c)) -- 2500000
+
+;; ── 2-key packed tuple, NEAR-UNIQUE, count + sum + avg ───────────────────
+;; radix_v2_phase1_fn's partition-major morsel path used to be gated on
+;; `need_flags == 0` (count-only).  It now also serves COUNT/SUM/AVG, which
+;; are the only aggs the v2 pipeline admits at all, by reading the agg inputs
+;; at probe time from the staged source row.  Verified reached: nk=2,
+;; need_flags=GHT_NEED_SUM, entry_stride=48.
+;;
+;; The reorder is partition-major, but the counting sort is STABLE and a group
+;; lives entirely in one partition, so rows of a group are still visited in
+;; source order — an f64 SUM accumulates in exactly the old sequence.
+;;
+;; Near-unique on purpose (2499990 groups from 2500000 rows): every probe
+;; misses and inserts, so the worker HTs outgrow their first allocation.  That
+;; is also the only shape that exercises group_ht_t.grow_cap — verified to
+;; jump ht_cap 256 -> 1024 in one step here instead of climbing 256->512->1024
+;; and re-hashing every live group on each rung.
+;;
+;; `a` collides only for the ten values 0..9 (rows T and T+2499990, which share
+;; b since 2499990 is even), so `desc: c take: 10` selects exactly those ten
+;; groups.  Their ORDER within the tie block is not defined by the engine, so
+;; every take-10 assertion below is an order-independent aggregate of the ten.
+(set BIGU (table [a b v] (list (% T 2499990) (% T 2) T)))
+(count (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU})) -- 2499990
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU}) 'c)) -- 2500000
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU}) 's)) -- 3124998750000
+(count (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10})) -- 10
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10}) 'c)) -- 20
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10}) 'a)) -- 45
+(sum (at (select {c: (count v) s: (sum v) av: (avg v) by: {a: a b: b} from: BIGU desc: c take: 10}) 's)) -- 24999990
+
+;; ── 3-key mixed-width tuple + aggs around the valueless OP_COUNT ─────────
+;; I64 + SYM + I16(negative) keys.  COUNT reserves no value slot, so sum/max
+;; must still land on accumulator slots 0 and 1 — asserted with the count
+;; both before and after them in the projection.
+(set BIGM (table [a b m v] (list K G M T)))
+(count (select {c: (count v) s: (sum v) mx: (max v) by: {a: a b: b m: m} from: BIGM desc: c take: 7})) -- 7
+(count (select {c: (count v) s: (sum v) mx: (max v) by: {a: a b: b m: m} from: BIGM})) -- 6300
+(sum (at (select {s: (sum v) c: (count v) mn: (min v) by: {a: a b: b m: m} from: BIGM}) 's)) -- 3124998750000
+(max (at (select {s: (sum v) c: (count v) mx: (max v) by: {a: a b: b m: m} from: BIGM}) 'mx)) -- 2499999
+;; negative narrow key survives the packed hash and compare at scale
+(at (at (select {c: (count v) by: {m: m} asc: m from: BIGM}) 'm) 0) -- -30
+
+;; ── nullable keys keep the null-mask words (elision must NOT fire) ───────
+;; Lands on the packed ROW-MAJOR builder, not the morsel stager (which
+;; requires null_words == 0), so both packed builders are covered.  Indexing
+;; a small nullable seed is what makes the column really carry HAS_NULLS.
+(set NSEED (as 'I64 (list 1 0 0Ni 7 0Ni 3)))
+(set BIGN (table [k j v] (list (at NSEED (% T 6)) (as 'SYM (% T 400)) T)))
+(count (select {c: (count v) by: {k: k j: j} from: BIGN desc: c take: 5})) -- 5
+(count (select {c: (count v) by: {k: k j: j} from: BIGN})) -- 1000
+(sum (at (select {c: (count v) by: {k: k j: j} from: BIGN}) 'c)) -- 2500000
+
+;; ── Tuple width: 8 keys vs 9 keys ────────────────────────────────────────
+;; Result-level only: at 300K rows these stay below the radix-layout cutoff,
+;; so this pins values for wide key tuples but not which builder runs them
+;; (the P1_MORSEL_KEYS stack-budget boundary has no path-level test).
+(set K9 (table [a b c d e f g h i v] (list (% (til 300000) 2) (% (til 300000) 3) (% (til 300000) 5) (% (til 300000) 7) (% (til 300000) 11) (as 'I16 (% (til 300000) 13)) (as 'I32 (% (til 300000) 4)) (% (til 300000) 6) (as 'SYM (% (til 300000) 9)) (til 300000))))
+(count (select {n: (count v) by: {a: a b: b c: c d: d e: e f: f g: g h: h} from: K9})) -- 60060
+(count (select {n: (count v) by: {a: a b: b c: c d: d e: e f: f g: g h: h i: i} from: K9})) -- 180180
+(sum (at (select {n: (count v) by: {a: a b: b c: c d: d e: e f: f g: g h: h i: i} from: K9}) 'n)) -- 300000
+
+;; ── Smaller shapes: sequential / direct-array entries, same layout ───────
+(set PK2 (table [a b] (list (% (til 300000) 500) (% (til 300000) 300))))
+(count (select {c: (count a) by: {a: a b: b} from: PK2})) -- 1500
+(sum (at (select {c: (count a) by: {a: a b: b} from: PK2}) 'c)) -- 300000
+(count (select {c: (count a) by: {a: a b: b} from: PK2 desc: c take: 10})) -- 10
+(at (at (select {c: (count a) by: {a: a b: b} from: PK2 desc: c take: 10}) 'c) 0) -- 200
+(count (select {c: (count a) by: {a: a b: b} from: PK2 where: (< a 10)})) -- 30
+
+(set PKW (table [s i l v] (list (as 'I16 (- (% (til 300000) 400) 200)) (as 'I32 (- (% (til 300000) 9) 4)) (- (% (til 300000) 6) 3) (til 300000))))
+(count (select {n: (count v) by: {s: s i: i l: l} from: PKW})) -- 3600
+(sum (at (select {n: (count v) by: {s: s i: i l: l} from: PKW}) 'n)) -- 300000
+(at (at (select {n: (count v) by: {s: s} asc: s from: PKW}) 's) 0) -- -200
+(count (select {n: (count v) by: {s: s i: i} from: PKW where: (< s 0)})) -- 1800
+(sum (at (select {n: (count v) by: {i: i l: l} from: PKW where: (< v 1000)}) 'n)) -- 1000
+
+;; small nullable: a NULL key stays a distinct group from a 0 key
+(set PKN (table [k v] (list (as 'I64 (list 1 0 0Ni 1 0Ni 0)) [10 20 30 40 50 60])))
+(count (select {n: (count v) by: {k: k} from: PKN})) -- 3
+(sum (at (select {n: (count v) by: {k: k} from: PKN}) 'n)) -- 6
+(count (select {n: (count v) by: {k: k} from: PKN desc: n take: 2})) -- 2
+(count (select {n: (count v) by: {a: a b: b} from: (table [a b v] (list (as 'I64 (list 1 1 0Ni 0Ni 0)) (as 'I64 (list 2 0Ni 2 0Ni 0)) [1 2 3 4 5]))})) -- 5
+
+;; ── NOT packed: F64 key keeps the per-key hash ───────────────────────────
+;; ±0.0 CONTRACT (#407, previously build-dependent).  [0.0, -0.0, 1.0] is
+;; TWO groups in EVERY build.  Each F64 group-key builder canonicalises
+;; -0.0 → +0.0 at the key-READ boundary (group_key_f64_bits in src/ops/group.c)
+;; before both the key store and the hash, so group_keys_equal's raw-bit
+;; compare can no longer disagree with ray_hash_f64's normalisation.  Before
+;; the fix this line was 3 in the debug/ASan build and 2 in release — release
+;; only by accident, because -fno-signed-zeros folds the -0.0 LITERAL below to
+;; +0.0 before the kernel sees it.  The literal form is therefore the DEBUG
+;; half of the contract; the release half needs a runtime-produced -0.0 and
+;; lives in group_f64_signed_zero.rfl.  F64 keys stay off packed_key
+;; regardless (read_col_i64 does not decode F64), pinned by
+;; group_extra/ght_packed_key_excludes_f64.
+(count (select {n: (count v) by: {f: f} from: (table [f v] (list [0.0 -0.0 1.0] [1 2 3]))})) -- 2
+;; …and the count still does not depend on how often the rows repeat.
+(- (count (select {n: (count v) by: {f: f} from: (table [f v] (list [0.0 -0.0 1.0] [1 2 3]))})) (count (select {n: (count v) by: {f: f} from: (table [f v] (list [0.0 -0.0 1.0 0.0 -0.0 1.0] [1 2 3 4 5 6]))}))) -- 0
+(set PKF (table [f k v] (list (% (til 300000) 37.0) (% (til 300000) 4) (til 300000))))
+(count (select {n: (count v) by: {f: f k: k} from: PKF})) -- 148
+(sum (at (select {n: (count v) by: {f: f k: k} from: PKF}) 'n)) -- 300000
+(count (select {n: (count v) by: {f: f k: k} from: PKF desc: n take: 6})) -- 6
+
+;; ── NOT packed: STR key stays on the inline-STR / wide-key machinery ─────
+(set PKT (table [s k v] (list (as 'STR (% (til 300000) 53)) (% (til 300000) 6) (til 300000))))
+(count (select {n: (count v) by: {s: s k: k} from: PKT})) -- 318
+(sum (at (select {n: (count v) by: {s: s k: k} from: PKT}) 'n)) -- 300000
+
+;; ── COUNT next to value-bearing aggs at small scale too ─────────────────
+(set PKA (table [k v w] (list (% (til 300000) 100) (til 300000) (% (til 300000) 3))))
+(at (at (select {n: (count v) s: (sum w) mn: (min v) mx: (max v) by: {k: k} asc: k from: PKA}) 'n) 0) -- 3000
+(at (at (select {n: (count v) s: (sum w) mn: (min v) mx: (max v) by: {k: k} asc: k from: PKA}) 'mn) 0) -- 0
+(at (at (select {n: (count v) s: (sum w) mn: (min v) mx: (max v) by: {k: k} asc: k from: PKA}) 'mx) 0) -- 299900
+(sum (at (select {n: (count v) s: (sum w) by: {k: k} from: PKA}) 's)) -- 300000
+(at (at (select {s: (sum w) n: (count v) mx: (max v) by: {k: k} asc: k from: PKA}) 'mx) 99) -- 299999

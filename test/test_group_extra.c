@@ -47,8 +47,10 @@
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/hll.h"
+#include "ops/cdfuse.h"
 #include "table/sym.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define N 70000  /* > RAY_PARALLEL_THRESHOLD (65536) */
@@ -1078,6 +1080,11 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
     filter.enabled = 1;
     filter.agg_index = 0;
     filter.top_count_take = 2;
+    /* Direction is explicit since issue #408: the keep-min count trims are
+     * largest-first machinery, so they run for desc = 1 only (an asc take
+     * keeps the SMALLEST N and is served by the bounded heap / the
+     * downstream sort+take instead). */
+    filter.desc = 1;
     ray_group_emit_filter_set(filter);
     ray_t* res = ray_execute(g, grp);
     ray_group_emit_filter_set(prev);
@@ -1098,6 +1105,33 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
         if (k == 2 && c == 4) got_2 = 1;
     }
     TEST_ASSERT_TRUE(got_1 && got_2);
+    ray_release(res);
+
+    /* Same filter with desc = 0 (`asc: c take: 2`): the emit filter must NOT
+     * keep the two LARGEST groups.  Trimming here is desc-only machinery, so
+     * the asc request falls through to the full group set and the caller's
+     * sort+take picks the smallest — what must never happen is the result
+     * losing the small groups (issue #408: asc returned the desc answer). */
+    filter.desc = 0;
+    ray_group_emit_filter_set(filter);
+    res = ray_execute(g, grp);
+    ray_group_emit_filter_set(prev);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    out_key = ray_table_get_col(res, key_sym);
+    out_cnt = ray_table_get_col_idx(res, 1);
+    TEST_ASSERT_NOT_NULL(out_key);
+    TEST_ASSERT_NOT_NULL(out_cnt);
+    /* The asc request falls through to the FULL group set (all 5 groups) —
+     * pin the row count too, so this can tell "full fall-through" apart
+     * from a hypothetical asc top-2, and cannot pass by accident. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
+    int got_smallest = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int16_t k = ((int16_t*)ray_data(out_key))[i];
+        int64_t c = ((int64_t*)ray_data(out_cnt))[i];
+        if (k == 5 && c == 1) got_smallest = 1;
+    }
+    TEST_ASSERT_TRUE(got_smallest);
 
     ray_release(res);
     ray_graph_free(g);
@@ -1147,6 +1181,11 @@ static test_result_t test_sym_group_top_count_emit_filter(void) {
     filter.enabled = 1;
     filter.agg_index = 0;
     filter.top_count_take = 2;
+    /* Direction is explicit since issue #408: the keep-min count trims are
+     * largest-first machinery, so they run for desc = 1 only (an asc take
+     * keeps the SMALLEST N and is served by the bounded heap / the
+     * downstream sort+take instead). */
+    filter.desc = 1;
     ray_group_emit_filter_set(filter);
     ray_t* res = ray_execute(g, grp);
     ray_group_emit_filter_set(prev);
@@ -1223,6 +1262,11 @@ static test_result_t test_five_key_group_top_count_emit_filter(void) {
     filter.enabled = 1;
     filter.agg_index = 0;
     filter.top_count_take = 2;
+    /* Direction is explicit since issue #408: the keep-min count trims are
+     * largest-first machinery, so they run for desc = 1 only (an asc take
+     * keeps the SMALLEST N and is served by the bounded heap / the
+     * downstream sort+take instead). */
+    filter.desc = 1;
     ray_group_emit_filter_set(filter);
     ray_t* res = ray_execute(g, grp);
     ray_group_emit_filter_set(prev);
@@ -2320,7 +2364,8 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
 
     ght_layout_t master;
     TEST_ASSERT_TRUE(ght_compute_layout(&master, NK, NA, agg_vecs, NULL,
-                                        GHT_NEED_SUM, agg_ops, key_types));
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
     /* > GHT_INLINE on both axes: this must be a real, owned spill block. */
     TEST_ASSERT_NOT_NULL(master.spill_hdr);
     TEST_ASSERT_FALSE(master.agg_val_slot == master.agg_val_slot_in);
@@ -2376,7 +2421,8 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
      * never left aliasing the source's — the mirror of the spill leg above. */
     ght_layout_t inl;
     TEST_ASSERT_TRUE(ght_compute_layout(&inl, 2, 2, agg_vecs, NULL,
-                                        GHT_NEED_SUM, agg_ops, key_types));
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
     TEST_ASSERT_NULL(inl.spill_hdr);
     TEST_ASSERT_TRUE(inl.agg_val_slot == inl.agg_val_slot_in);
     ght_layout_t ic;
@@ -2398,6 +2444,285 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
     TEST_ASSERT_NULL(master.spill_hdr);
 
     for (int i = 0; i < NA; i++) ray_release(agg_vecs[i]);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Packed-key eligibility: F64 keys must never join the packed lane path.
+ * read_col_i64 — which the packed stagers use to load every lane — does not
+ * decode F64, so a packed F64 key would hash and compare the wrong bits; the
+ * exclusion also keeps the packed lanes clear of the -0.0 canonicalisation
+ * the F64 key builders apply (group_key_f64_bits, #407).  No rfl-level
+ * assertion can pin the predicate itself (every layout now agrees on the
+ * ±0.0 answer), so it is asserted directly here.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_ght_packed_key_excludes_f64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    uint16_t agg_ops[1] = { OP_SUM };
+    ray_t* agg_vecs[1] = { ray_vec_new(RAY_F64, 1) };
+    TEST_ASSERT_NOT_NULL(agg_vecs[0]);
+    agg_vecs[0]->len = 1;
+    ((double*)ray_data(agg_vecs[0]))[0] = 0.0;
+
+    int8_t key_types[2] = { RAY_I64, RAY_I64 };
+    ght_layout_t ly;
+    TEST_ASSERT_TRUE(ght_compute_layout(&ly, 2, 1, agg_vecs, NULL,
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
+    TEST_ASSERT_TRUE(ly.packed_key);      /* integer keys: packed */
+    ght_layout_free(&ly);
+
+    key_types[1] = RAY_F64;
+    TEST_ASSERT_TRUE(ght_compute_layout(&ly, 2, 1, agg_vecs, NULL,
+                                        GHT_NEED_SUM, agg_ops, key_types,
+                                        NULL));
+    TEST_ASSERT_FALSE(ly.packed_key);     /* any F64 key: excluded */
+    ght_layout_free(&ly);
+
+    ray_release(agg_vecs[0]);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Fused grouped count-distinct kernel (src/ops/cdfuse.c)
+ * -------------------------------------------------------------------------- */
+
+/* Full O(n) reference check of a ray_cd_fused result against the row-major
+ * key/value arrays the caller generated.  Verifies, for EVERY group: the key
+ * (in first-seen order), the distinct count, and the _first row — plus that
+ * the emitted _first column is strictly increasing.  Key values must lie in
+ * [0,nk), value values in [0,nv). */
+static test_result_t cdf_verify(ray_t* r, const int64_t* kref, const int64_t* vref,
+                                int64_t n, int64_t nk, int64_t nv) {
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(r->type == RAY_TABLE, "fused cd returns a table");
+
+    int64_t* exp_cnt = (int64_t*)calloc((size_t)nk, sizeof(int64_t));
+    int64_t* exp_first = (int64_t*)malloc((size_t)nk * sizeof(int64_t));
+    int64_t* exp_key = (int64_t*)malloc((size_t)nk * sizeof(int64_t));
+    char* seen = (char*)calloc((size_t)nk * (size_t)nv, 1);
+    TEST_ASSERT_NOT_NULL(exp_cnt);
+    TEST_ASSERT_NOT_NULL(exp_first);
+    TEST_ASSERT_NOT_NULL(exp_key);
+    TEST_ASSERT_NOT_NULL(seen);
+    for (int64_t i = 0; i < nk; i++) exp_first[i] = -1;
+
+    int64_t exp_ng = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t kk = kref[i], vv = vref[i];
+        if (exp_first[kk] < 0) { exp_first[kk] = i; exp_key[exp_ng++] = kk; }
+        char* slot = &seen[kk * nv + vv];
+        if (!*slot) { *slot = 1; exp_cnt[kk]++; }
+    }
+
+    ray_t* keys = ray_table_get_col_idx(r, 0);
+    ray_t* cnts = ray_table_get_col_idx(r, 1);
+    ray_t* firsts = ray_table_get_col_idx(r, 2);
+    TEST_ASSERT_NOT_NULL(keys);
+    TEST_ASSERT_NOT_NULL(cnts);
+    TEST_ASSERT_NOT_NULL(firsts);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), exp_ng);
+    const int64_t* gk = (const int64_t*)ray_data(keys);
+    const int64_t* gc = (const int64_t*)ray_data(cnts);
+    const int64_t* gf = (const int64_t*)ray_data(firsts);
+    for (int64_t g = 0; g < exp_ng; g++) {
+        TEST_ASSERT_FMT(gk[g] == exp_key[g],
+                        "group %lld key: got %lld, expected %lld",
+                        (long long)g, (long long)gk[g], (long long)exp_key[g]);
+        TEST_ASSERT_FMT(gc[g] == exp_cnt[exp_key[g]],
+                        "group %lld (key %lld) count: got %lld, expected %lld",
+                        (long long)g, (long long)exp_key[g], (long long)gc[g],
+                        (long long)exp_cnt[exp_key[g]]);
+        TEST_ASSERT_FMT(gf[g] == exp_first[exp_key[g]],
+                        "group %lld (key %lld) _first: got %lld, expected %lld",
+                        (long long)g, (long long)exp_key[g], (long long)gf[g],
+                        (long long)exp_first[exp_key[g]]);
+        TEST_ASSERT_FMT(g == 0 || gf[g] > gf[g - 1],
+                        "_first not strictly increasing at group %lld", (long long)g);
+    }
+    free(exp_cnt); free(exp_first); free(exp_key); free(seen);
+    PASS();
+}
+
+static test_result_t test_cd_fused_basic(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 300000 rows, 1000 keys, 3 distinct values per key (see the rfl pin).
+     * Row count is >= CDF_MIN_ROWS so the kernel's admission gate passes;
+     * the key/value shape mirrors the brief's 200-key sketch. */
+    int64_t n = 300000, nk = 1000, nv = 3000;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) { kd[i] = i % nk; vd[i] = i % nv; }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
+    /* stable first-seen order: key i at row i for this data */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], 0);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[nk - 1], nk - 1);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    int64_t total = 0;
+    for (int64_t g = 0; g < nk; g++)
+        total += ((int64_t*)ray_data(ray_table_get_col_idx(r, 1)))[g];
+    TEST_ASSERT_EQ_I(total, nk * 3);   /* 3 distinct values per key */
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Interleaved keys: first occurrences are NOT monotonic in key value, so the
+ * emitted order genuinely exercises the cross-partition first_row sort and the
+ * per-record first_row MIN.  Distinct counts differ between groups. */
+static test_result_t test_cd_fused_interleaved(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 997, nv = 1013;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i * 391) % nk;   /* 391 coprime with 997 → scrambled order */
+        vd[i] = (i * 7) % nv;
+    }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    /* keys are emitted in first-seen (not sorted) order for this pattern */
+    const int64_t* gk = (const int64_t*)ray_data(ray_table_get_col_idx(r, 0));
+    int sorted = 1;
+    for (int64_t g = 1; g < ray_table_nrows(r); g++)
+        if (gk[g] < gk[g - 1]) { sorted = 0; break; }
+    TEST_ASSERT(!sorted, "emitted key order must be first-seen, not sorted");
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* q08 shape: low-cardinality key (200), heavy skew (key 0 owns half the rows),
+ * high-cardinality values.  Key-hash partitioning serialized phase 2 on the
+ * fat key here; pair-hash partitioning must still produce the exact answer. */
+static test_result_t test_cd_fused_skewed(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 200, nv = 50021;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        /* every other row goes to key 0 → key 0 owns 50% of the table */
+        kd[i] = (i & 1) ? 1 + ((i / 2) % (nk - 1)) : 0;
+        vd[i] = (i * 2654435761u) % nv;   /* high-cardinality values */
+    }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Self-correlated columns: v == k on every row.  A symmetric pair-hash combine
+ * (hash(k) ^ hash(v)) cancels to zero here, sending every row to partition 0 at
+ * dedupe slot 0 — a single serial probe cluster that took minutes on 20M rows.
+ * At 300K rows the query completes either way, so this test guards the SHAPE's
+ * correctness while the asymmetric combine in cdf_p1_fn guards the cliff. */
+static test_result_t test_cd_fused_self(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 200;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* kd = (int64_t*)ray_data(k);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) { kd[i] = i % nk; vd[i] = kd[i]; }
+    k->len = n; v->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), nk);
+    test_result_t chk = cdf_verify(r, kd, vd, n, nk, nk);
+    if (chk.status != TEST_PASS) return chk;
+    /* v == k → exactly one distinct value per key */
+    const int64_t* gc = (const int64_t*)ray_data(ray_table_get_col_idx(r, 1));
+    for (int64_t g = 0; g < nk; g++) TEST_ASSERT_EQ_I(gc[g], 1);
+    ray_release(r); ray_release(k); ray_release(v);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Narrow column types: I32 key, I16 value (read_col_i64 widening path). */
+static test_result_t test_cd_fused_narrow_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 300000, nk = 1000, nv = 300;
+    ray_t* k = ray_vec_new(RAY_I32, n);
+    ray_t* v = ray_vec_new(RAY_I16, n);
+    ray_t* kr = ray_vec_new(RAY_I64, n);
+    ray_t* vr = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_NOT_NULL(kr);
+    TEST_ASSERT_NOT_NULL(vr);
+    int32_t* kd = (int32_t*)ray_data(k);
+    int16_t* vd = (int16_t*)ray_data(v);
+    int64_t* kd64 = (int64_t*)ray_data(kr);
+    int64_t* vd64 = (int64_t*)ray_data(vr);
+    for (int64_t i = 0; i < n; i++) {
+        kd64[i] = (i * 13) % nk;
+        vd64[i] = (i * 3) % nv;
+        kd[i] = (int32_t)kd64[i];
+        vd[i] = (int16_t)vd64[i];
+    }
+    k->len = n; v->len = n; kr->len = n; vr->len = n;
+
+    ray_t* r = ray_cd_fused(k, v, n);
+    TEST_ASSERT_NOT_NULL(r);
+    test_result_t chk = cdf_verify(r, kd64, vd64, n, nk, nv);
+    if (chk.status != TEST_PASS) return chk;
+    ray_release(r);
+    ray_release(k); ray_release(v); ray_release(kr); ray_release(vr);
 
     ray_sym_destroy();
     ray_heap_destroy();
@@ -2433,5 +2758,11 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/hll_count_distinct_approx_pg_stream_types", test_hll_count_distinct_approx_pg_stream_types, NULL, NULL },
     { "group_extra/hll_merge_edges",               test_hll_merge_edges,               NULL, NULL },
     { "group_extra/ght_layout_copy_depth_invariance", test_ght_layout_copy_depth_invariance, NULL, NULL },
+    { "group_extra/ght_packed_key_excludes_f64", test_ght_packed_key_excludes_f64, NULL, NULL },
+    { "group_extra/cd_fused_basic",                test_cd_fused_basic,                NULL, NULL },
+    { "group_extra/cd_fused_interleaved",          test_cd_fused_interleaved,          NULL, NULL },
+    { "group_extra/cd_fused_narrow_types",         test_cd_fused_narrow_types,         NULL, NULL },
+    { "group_extra/cd_fused_skewed",               test_cd_fused_skewed,               NULL, NULL },
+    { "group_extra/cd_fused_self",                 test_cd_fused_self,                 NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

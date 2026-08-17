@@ -508,6 +508,26 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
 
 /* Forward declarations — exec_node wraps exec_node_inner with profiling */
 /* exec_node declared extern in exec_internal.h */
+/* Contiguous LIST slice with per-cell retain — the raw byte copy the HEAD/TAIL
+ * trims use for flat columns would alias the source's ray_t* cells without a
+ * refcount and double-free on release (issue #355; same reason exec_filter_head
+ * gathers LIST columns separately).  col_vec_new/typed_vec_new also reject
+ * RAY_LIST, so without this the column comes back NULL and ray_table_add_col
+ * fails with "column must be a vector".  Caller owns the returned list. */
+static ray_t* list_slice_retain(ray_t* col, int64_t start, int64_t n) {
+    ray_t* out = ray_list_new(n > 0 ? n : 1);
+    if (!out || RAY_IS_ERR(out)) return out;
+    out->len = n;
+    ray_t** d = (ray_t**)ray_data(out);
+    ray_t** s = (ray_t**)ray_data(col);
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* e = s[start + i];
+        if (e) ray_retain(e);
+        d[i] = e;
+    }
+    return out;
+}
+
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op);
 
 
@@ -2931,6 +2951,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         result = ray_table_add_col(result, name_id, head_vec);
                         ray_release(head_vec);
+                    } else if (col->type == RAY_LIST) {
+                        ray_t* lcol = list_slice_retain(col, 0, n);
+                        result = ray_table_add_col(result, name_id, lcol);
+                        ray_release(lcol);
                     } else {
                         /* Flat column: direct copy */
                         uint8_t esz = col_esz(col);
@@ -2944,6 +2968,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                              * dictionary (sym-domain Phase 2) */
                             if (col->type == RAY_SYM)
                                 ray_sym_vec_adopt_domain(head_vec, col);
+                            /* copied ray_str_t descriptors still reference
+                             * the source's pool by offset (issue #404) */
+                            if (col->type == RAY_STR)
+                                col_propagate_str_pool(head_vec, col);
                         }
                         result = ray_table_add_col(result, name_id, head_vec);
                         ray_release(head_vec);
@@ -2954,6 +2982,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             }
             if (n > input->len) n = input->len;
             /* Materialized copy for vector head */
+            if (input->type == RAY_LIST) {
+                ray_t* lres = list_slice_retain(input, 0, n);
+                ray_release(input);
+                return lres;
+            }
             uint8_t esz = col_esz(input);
             ray_t* result = col_vec_new(input, n);
             if (result && !RAY_IS_ERR(result)) {
@@ -2962,6 +2995,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 col_propagate_nulls_range(result, 0, input, 0, n);
                 if (input->type == RAY_SYM)
                     ray_sym_vec_adopt_domain(result, input);
+                if (input->type == RAY_STR)
+                    col_propagate_str_pool(result, input);
             }
             ray_release(input);
             return result;
@@ -3064,6 +3099,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         result = ray_table_add_col(result, name_id, tail_vec);
                         ray_release(tail_vec);
+                    } else if (col->type == RAY_LIST) {
+                        ray_t* lcol = list_slice_retain(col, skip, n);
+                        result = ray_table_add_col(result, name_id, lcol);
+                        ray_release(lcol);
                     } else {
                         /* Flat column: direct copy */
                         uint8_t esz = col_esz(col);
@@ -3077,6 +3116,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             /* raw SYM cell-id copy — adopt source dict */
                             if (col->type == RAY_SYM)
                                 ray_sym_vec_adopt_domain(tail_vec, col);
+                            /* copied ray_str_t descriptors still reference
+                             * the source's pool by offset (issue #404) */
+                            if (col->type == RAY_STR)
+                                col_propagate_str_pool(tail_vec, col);
                         }
                         result = ray_table_add_col(result, name_id, tail_vec);
                         ray_release(tail_vec);
@@ -3087,6 +3130,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             }
             if (n > input->len) n = input->len;
             int64_t skip = input->len - n;
+            if (input->type == RAY_LIST) {
+                ray_t* lres = list_slice_retain(input, skip, n);
+                ray_release(input);
+                return lres;
+            }
             uint8_t esz = col_esz(input);
             ray_t* result = col_vec_new(input, n);
             if (result && !RAY_IS_ERR(result)) {
@@ -3097,6 +3145,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 col_propagate_nulls_range(result, 0, input, skip, n);
                 if (input->type == RAY_SYM)
                     ray_sym_vec_adopt_domain(result, input);
+                if (input->type == RAY_STR)
+                    col_propagate_str_pool(result, input);
             }
             ray_release(input);
             return result;

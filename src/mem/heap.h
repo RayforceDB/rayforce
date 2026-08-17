@@ -249,6 +249,11 @@ int64_t ray_heap_anon_peak(void);
  * to total physical RAM). */
 int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
+/* Release every block held by the direct-allocation reuse cache back to
+ * the kernel (their committed-RAM accounting drops with them).  The cache
+ * self-drains under watermark pressure; this is for tests and explicit
+ * memory trimming. */
+void    ray_heap_direct_cache_drain(void);
 
 /* --------------------------------------------------------------------------
  * Pool header: first min-block (64B) of each self-aligned pool.

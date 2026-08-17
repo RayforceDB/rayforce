@@ -5224,9 +5224,9 @@ static test_result_t test_dotted_del_cascade(void) {
 
 static test_result_t test_select_by_nullable_f64_key(void) {
     /* Nullable F64 key column: without null-awareness the new hash-based
-     * first-idx path collided the null group with the 0.0 group — F64
-     * null's bit pattern is -0.0, and ray_hash_f64 normalises -0.0 to
-     * +0.0, so hash(null) == hash(0.0) and the null group got a stale
+     * first-idx path collided the null group with the 0.0 group — a null
+     * key is stored as an all-zero key slot, which reads back as +0.0, so
+     * hash(null) == hash(0.0) and the null group got a stale
      * first_idx = -1.  The indices must point to the actual first row
      * with that Price value (or first null row). */
     ray_eval_str("(set __nv (table [OrderId Price] (list (til 5) [0.0 0Nf 0.0 0Nf 1.0])))");
@@ -5246,6 +5246,53 @@ static test_result_t test_select_by_nullable_f64_key(void) {
     ASSERT_EQ("(nil? (at (at __ng 'Price) 0))", "false");
     ASSERT_EQ("(nil? (at (at __ng 'Price) 1))", "true");
     ASSERT_EQ("(nil? (at (at __ng 'Price) 2))", "false");
+    PASS();
+}
+
+/* F64 group keys: -0.0 and +0.0 form ONE group, and the emitted key of that
+ * group is bitwise +0.0 (issue #407).
+ *
+ * ray_hash_f64 normalises -0.0, but group_keys_equal / ght_lanes_equal compare
+ * the raw 8 key bytes: -0.0 hashed into +0.0's slot chain yet never compared
+ * equal, so it split off into its own group.  Each F64 key builder now reads
+ * keys through group_key_f64_bits, which canonicalises BEFORE both
+ * the key store and the hash.
+ *
+ * The representative is checked at the BIT level here, not through the REPL:
+ * ray_format normalises -0.0 on output (format.c clear_neg_zero), so an emitted
+ * -0.0 would print as "0.0" and no .rfl assertion could see it.  Because every
+ * contributing row stores canonical bits, +0.0 wins no matter which row opened
+ * the group or which worker got there first.
+ *
+ * This test file is built with the debug flags (no -fno-signed-zeros), so the
+ * -0.0 literal survives to the group kernel and the group count alone fails on
+ * a pre-fix build; the -0.0-first case additionally uses a runtime multiply so
+ * the same property is exercised the way release sees it. */
+static test_result_t test_select_by_f64_signed_zero_key(void) {
+    static const uint64_t POS_ZERO_BITS = UINT64_C(0);
+    /* -0.0 second (literal), then -0.0 FIRST via a runtime multiply. */
+    const char* const setups[2] = {
+        "(set __sz (table [f v] (list [0.0 -0.0 1.0] [1 2 3])))",
+        "(set __sz (table [f v] (list (as 'F64 (list (* -1.0 0.0) 0.0 1.0)) [1 2 3])))",
+    };
+    for (int c = 0; c < 2; c++) {
+        ray_eval_str(setups[c]);
+        ASSERT_EQ("(count (select {n: (count v) by: {f: f} from: __sz}))", "2");
+        /* The zero group is first-seen in both cases (row 0 opens it). */
+        ASSERT_EQ("(at (at (select {n: (count v) by: {f: f} from: __sz}) 'n) 0)", "2");
+        ray_t* g = ray_eval_str("(at (select {n: (count v) by: {f: f} from: __sz}) 'f)");
+        TEST_ASSERT_NOT_NULL(g);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(g));
+        TEST_ASSERT_TRUE(g->type == RAY_F64);
+        TEST_ASSERT_TRUE(g->len == 2);
+        uint64_t bits;
+        memcpy(&bits, &((const double*)ray_data(g))[0], 8);
+        TEST_ASSERT_FMT(bits == POS_ZERO_BITS,
+                        "merged zero group must emit bitwise +0.0, got %016llx",
+                        (unsigned long long)bits);
+        ray_release(g);
+    }
+    ray_eval_str("(del __sz)");
     PASS();
 }
 
@@ -9011,6 +9058,7 @@ const test_entry_t lang_entries[] = {
     { "lang/select_by_f64_perf", test_select_by_f64_perf, lang_setup, lang_teardown },
     { "lang/select_by_narrow_int_key", test_select_by_narrow_int_key, lang_setup, lang_teardown },
     { "lang/select_by_nullable_f64_key", test_select_by_nullable_f64_key, lang_setup, lang_teardown },
+    { "lang/select_by_f64_signed_zero_key", test_select_by_f64_signed_zero_key, lang_setup, lang_teardown },
     { "lang/select_by_nullable_i64_key", test_select_by_nullable_i64_key, lang_setup, lang_teardown },
     { "lang/select_by_str_nullable_nonkey", test_select_by_str_nullable_nonkey, lang_setup, lang_teardown },
     { "lang/select_by_computed_key_nullable_nonkey", test_select_by_computed_key_nullable_nonkey, lang_setup, lang_teardown },

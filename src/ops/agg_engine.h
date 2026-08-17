@@ -14,8 +14,12 @@ extern bool ray_agg_engine_v2;
  * Conservative: any uncertainty → false → caller uses the existing engine. */
 bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
-/* Precondition: agg_v2_can_handle(g, op, tbl) returned true. */
-ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+/* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
+ * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when
+ * positive, an engine strategy may emit only the first `group_limit` groups in
+ * first-seen order.  Advisory only — the caller trims the result regardless. */
+ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                     int64_t group_limit);
 
 /* Dense group assignment over the group's key columns, first-occurrence
  * order (key count unbounded since cut 3; the dense planner self-limits). */
