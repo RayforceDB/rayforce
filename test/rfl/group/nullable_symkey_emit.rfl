@@ -1,0 +1,95 @@
+;; ════════════════════════════════════════════════════════════════════
+;; nullable_symkey_emit.rfl — the fused top-N radix group-by must emit a
+;; CANONICAL NULL for a null SYM key, not whatever bytes were in the
+;; freshly-allocated output column.
+;;
+;; The bug (silent wrong answers, counts right / keys wrong):
+;;   radix_phase3_fn (src/ops/group.c) scatters each surviving group's key
+;;   tuple out of the partition HT rows.  When key k's null-mask bit is set
+;;   it wrote the type-correct NULL_* sentinel — but only for
+;;   F64/I64/TIMESTAMP/I32/DATE/TIME/I16/STR.  SYM (and GUID) fell through
+;;   `default: break`, and grp_set_null (= par_set_null) documents itself as
+;;   a no-op for SYM/STR/GUID, so NOTHING was written to the destination
+;;   element.  ray_sym_vec_new does not zero its payload, so the emitted key
+;;   was an uninitialized word resolved through the source column's domain
+;;   into an arbitrary dictionary entry.  A null SYM key is domain position
+;;   0 (== ""), so the correct payload is all-zero bytes.
+;;
+;; Only a column that ADVERTISES nulls reaches that branch, which is why
+;; this stayed hidden until HAS_NULLS started round-tripping honestly on
+;; SYM columns (#416, 3ebf8f23).  Both fixtures below carry it: the
+;; in-memory table AND the converted splayed store (file-domain, positional
+;; SYM), so this pins the engine path, not the store.
+;;
+;; Fixture shape — the routing matters:
+;;   * 70 000 rows (> RAY_PARALLEL_THRESHOLD 65536) so the parallel radix
+;;     pipeline runs at all;
+;;   * `by:` with the nullable SYM as a NON-LEADING key (1-key shapes route
+;;     elsewhere and were always right);
+;;   * `desc: s take: 500` — the top-N fusion is what routes into
+;;     radix_phase3_fn's key scatter.  `take` also has to be large enough
+;;     that the output key column is a recycled (non-zeroed) block; at
+;;     take: 6 the emitted garbage happened to be zero and the bug hid.
+;;
+;; Oracle: `uid` is even exactly when its SearchPhrase-analogue `sp` is ""
+;; (by construction), so every emitted (key-tuple) can be checked against
+;; its own key — no reliance on which groups the top-N cut keeps.  Ground
+;; truth is taken with literal "" filters.  Pre-fix, every section under-
+;; counts the empty-sp rows (the exact wrong number depends on what was in
+;; the recycled block) and the odd-uid parity check fails outright.
+;; ════════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -rf rf_test_nullsym_store") -- 0
+
+(set NSK 70000)
+(set nsk_uid (% (til NSK) 1000))
+;; sp is "" (the canonical SYM null) on even uid, "p" on odd uid.
+(set nsk_sp (as 'SYM (at ["" "p"] (% nsk_uid 2))))
+(set nsk_g3 (% (til NSK) 7))
+(set Tnsk (table [uid sp g3 v] (list nsk_uid nsk_sp nsk_g3 (til NSK))))
+
+;; ---------- 1. in-memory twin ----------
+;; 1000 (uid, sp) groups, sum v strictly increasing in uid, so the top 500
+;; are uid 500..999 → exactly 250 empty and 250 non-empty phrases.
+(set RM2 (select {s: (sum v) from: Tnsk by: {uid: uid sp: sp} desc: s take: 500}))
+(count RM2) -- 500
+(count (select {from: RM2 where: (== sp "")})) -- 250
+(count (select {from: RM2 where: (!= sp "")})) -- 250
+(all (== (% (at (select {from: RM2 where: (== sp "")}) 'uid) 2) 0)) -- true
+(all (== (% (at (select {from: RM2 where: (!= sp "")}) 'uid) 2) 1)) -- true
+
+;; ---------- 2. converted splayed store, 2 keys ----------
+;; HAS_NULLS round-trips onto the on-disk SYM column (#416), and the loaded
+;; column is file-domain / positional — the shape the ClickBench q17/q18
+;; regression was found on.
+(count (.db.splayed.set "rf_test_nullsym_store" Tnsk)) -- 70000
+(set Snsk (.db.splayed.get "rf_test_nullsym_store" 'Tnsk))
+(count Snsk) -- 70000
+
+(set RS2 (select {s: (sum v) from: Snsk by: {uid: uid sp: sp} desc: s take: 500}))
+(count RS2) -- 500
+(count (select {from: RS2 where: (== sp "")})) -- 250
+(count (select {from: RS2 where: (!= sp "")})) -- 250
+(all (== (% (at (select {from: RS2 where: (== sp "")}) 'uid) 2) 0)) -- true
+(all (== (% (at (select {from: RS2 where: (!= sp "")}) 'uid) 2) 1)) -- true
+
+;; ---------- 3. converted splayed store, 3 keys ----------
+;; 7000 (uid, sp, g3) groups; the parity oracle holds per emitted row
+;; regardless of which 500 the cut keeps.  Both halves must be non-empty so
+;; neither parity check can pass vacuously.
+(set RS3 (select {s: (sum v) from: Snsk by: {uid: uid sp: sp g3: g3} desc: s take: 500}))
+(count RS3) -- 500
+(count (select {from: RS3 where: (== sp "")})) -- 250
+(count (select {from: RS3 where: (!= sp "")})) -- 250
+(all (== (% (at (select {from: RS3 where: (== sp "")}) 'uid) 2) 0)) -- true
+(all (== (% (at (select {from: RS3 where: (!= sp "")}) 'uid) 2) 1)) -- true
+
+;; ---------- 4. the unordered emit stays correct ----------
+;; Same grouping without the top-N fusion (a different emit path) — it was
+;; already right; pin that it stays right.
+(set RS0 (select {s: (sum v) from: Snsk by: {uid: uid sp: sp}}))
+(count RS0) -- 1000
+(count (select {from: RS0 where: (== sp "")})) -- 500
+(all (== (% (at (select {from: RS0 where: (== sp "")}) 'uid) 2) 0)) -- true
+
+(.sys.exec "rm -rf rf_test_nullsym_store") -- 0

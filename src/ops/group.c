@@ -5571,7 +5571,6 @@ typedef struct {
     int8_t*       key_types;
     uint8_t*      key_attrs;
     uint8_t*      key_esizes;
-    ray_t**       key_cols;       /* [n_keys] output key vecs (for null bit writes) */
     uint32_t      n_keys;         /* full width — a uint8 here wrapped 256 keys to 0 */
     agg_out_t*    agg_outs;
     uint32_t      n_aggs;
@@ -5619,12 +5618,26 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 int8_t kt = c->key_types[k];
                 size_t doff = (size_t)di * esz;
                 if (nullw[k >> 6] & ((int64_t)((uint64_t)1 << (k & 63)))) {
-                    if (c->key_cols && c->key_cols[k])
-                        grp_set_null(c->key_cols[k], di);
-                    /* Fill the correct-width sentinel. */
+                    /* Fill the correct-width canonical null.  EVERY key type
+                     * must land in an arm here: the destination element is
+                     * freshly allocated and NOT zeroed (ray_vec_new /
+                     * ray_sym_vec_new), so falling through would emit
+                     * uninitialized bytes as the group's key — for a SYM key
+                     * that stale word resolves through the source domain to an
+                     * arbitrary dictionary entry, i.e. a silent wrong answer
+                     * whose counts still look right.
+                     *
+                     * The payload is the whole job here.  HAS_NULLS is seeded
+                     * from the source column before the dispatch and
+                     * re-derived serially afterwards by grp_finalize_nulls, so
+                     * no worker stores into the shared attrs byte that every
+                     * other worker reads non-atomically through ray_data(). */
                     switch (kt) {
                         case RAY_F64: {
                             double v = NULL_F64; memcpy(dst + doff, &v, 8); break;
+                        }
+                        case RAY_F32: {
+                            float v = NULL_F32; memcpy(dst + doff, &v, 4); break;
                         }
                         case RAY_I64: case RAY_TIMESTAMP: {
                             int64_t v = NULL_I64; memcpy(dst + doff, &v, 8); break;
@@ -5635,8 +5648,18 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case RAY_I16: {
                             int16_t v = NULL_I16; memcpy(dst + doff, &v, 2); break;
                         }
-                        case RAY_STR: { memset(dst + doff, 0, sizeof(ray_str_t)); break; }
-                        default: break;
+                        default:
+                            /* SYM (domain position 0 == ""), STR (len 0) and
+                             * GUID (16 zero bytes) all encode their canonical
+                             * null as all-zero bytes at the column's element
+                             * width — the same payload
+                             * ray_vec_set_null_checked writes on the serial
+                             * emit path.  The HAS_NULLS bit these three need
+                             * (par_set_null does not write it for them) is
+                             * seeded from the source column BEFORE the
+                             * dispatch, so no worker touches attrs here. */
+                            memset(dst + doff, 0, esz);
+                            break;
                     }
                     continue;
                 }
@@ -13659,6 +13682,15 @@ v2_emit:;
                 new_col = ray_vec_new(src_col->type, (int64_t)total_grps);
             if (!new_col || RAY_IS_ERR(new_col)) continue;
             new_col->len = (int64_t)total_grps;
+            /* Seed HAS_NULLS from the source key column, exactly as the
+             * gather-based emit does (agg_gather_key_col).  radix_phase3_fn
+             * runs in parallel and par_set_null writes this bit for the
+             * sentinel types only, so setting it once here — serially,
+             * before the dispatch — keeps SYM/STR/GUID null keys flagged
+             * without a worker ever storing into a shared attrs byte that
+             * other workers read non-atomically via ray_data(). */
+            if (src_col->attrs & RAY_ATTR_HAS_NULLS)
+                new_col->attrs |= RAY_ATTR_HAS_NULLS;
             key_cols[k] = new_col;
             key_dsts[k] = (char*)ray_data(new_col);
             key_out_types[k] = src_col->type;
@@ -13738,7 +13770,6 @@ v2_emit:;
                 .key_types    = key_out_types,
                 .key_attrs    = key_attrs,
                 .key_esizes   = key_esizes,
-                .key_cols     = key_cols,
                 .n_keys       = n_keys,
                 .agg_outs     = agg_outs,
                 .n_aggs       = n_aggs,
