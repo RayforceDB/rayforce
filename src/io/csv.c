@@ -1550,13 +1550,6 @@ int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
     return 1;
 }
 
-static int csv_should_attach_hash(ray_t* v) {
-    if (!v || RAY_IS_ERR(v)) return 0;
-    if (!(v->attrs & RAY_ATTR_HAS_INDEX) || !v->index) return 0;
-    return ray_csv_hash_upgrade_check(v->type, v->len,
-                                      ray_index_payload(v->index));
-}
-
 /* --------------------------------------------------------------------------
  * `INT` schema columns — auto narrowest integer width.
  *
@@ -1954,65 +1947,12 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         col_data[c] = dst;
     }
 
-    /* Per-chunk min/max + null bit on every column big enough to be worth
-     * indexing — gives the reduce min/max and the filter chunk-skip paths
-     * an O(n_chunks) scan instead of O(n_rows).  Attach is best-effort:
-     * unsupported types (RAY_STR/RAY_SYM/RAY_GUID in v1) just stay
-     * unindexed and the consumer falls back to a row scan.
-     *
-     * After the chunk_zone attaches we re-walk the same columns and
-     * upgrade the high-entropy ones to a hash index (the chunk_zone
-     * stays as well — it's the entropy signal we just measured).  See
-     * csv_should_attach_hash for the selectivity + memory cap.
-     *
-     * Progress: same treatment as the finalize dispatch above — the
-     * per-column index builds run their own pool dispatches whose row
-     * totals are not n_rows, so letting them drive the progress pump
-     * resets a completed parse to arbitrary fractions (visibly
-     * 100% -> 50% -> ...).  Suppress progress for the whole index
-     * phase; the parse's completed row count stays on screen. */
-    uint32_t idx_qmode = ray_qstats_mode();
-    ray_qstats_set_mode(idx_qmode & ~RAY_QS_PROGRESS);
-    for (int c = 0; c < ncols; c++) {
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        ray_t* v = col_vecs[c];
-        if (!v || RAY_IS_ERR(v)) continue;
-        if (v->len < (1 << 16)) continue;        /* < one chunk, skip */
-        ray_t* r = ray_index_attach_chunk_zone(&v, 16);
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;  /* attach succeeded */
-        /* On failure the original column stays in col_vecs[c]; ignore. */
-    }
-    for (int c = 0; c < ncols; c++) {
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        ray_t* v = col_vecs[c];
-        if (!csv_should_attach_hash(v)) continue;
-        /* ray_index_attach_hash drops any existing index on the
-         * column first; the chunk_zone we just built is sacrificed
-         * for the hash.  That's the right trade — once the column
-         * is known to be high-entropy, chunk-skip never fires
-         * anyway, so the chunk_zone is dead weight. */
-        ray_t* r = ray_index_attach_hash(&v);
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
-    }
-    ray_qstats_set_mode(idx_qmode);
+    /* No index attach here.  This function feeds the streaming csv→splayed /
+     * →parted writers: every column it produces is immediately serialised to
+     * disk and thrown away, and store/splay.c decides and persists the real
+     * index (chunk-zone / dict, upgraded to hash by
+     * ray_csv_hash_upgrade_check) at conversion time.  Building an in-memory
+     * index per 1M-row chunk here was pure waste. */
 
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) {
@@ -2479,34 +2419,13 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
 
     /* ---- 11. Build table ---- */
     {
-        /* Best-effort per-chunk zone index attach (see comment on the
-         * matching loop in build_table_from_cols) — unsupported types
-         * fall through to the unindexed path inside the consumer.
-         * Second pass upgrades high-entropy columns to a hash index;
-         * see csv_should_attach_hash.
-         * Progress suppressed for the whole phase (same rationale as the
-         * finalize dispatch): the index builds' pool dispatches would
-         * reset the completed parse progress to arbitrary fractions. */
-        uint32_t idx_qmode = ray_qstats_mode();
-        ray_qstats_set_mode(idx_qmode & ~RAY_QS_PROGRESS);
-        for (int c = 0; c < ncols; c++) {
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            ray_t* v = col_vecs[c];
-            if (!v || RAY_IS_ERR(v)) continue;
-            if (v->len < (1 << 16)) continue;
-            ray_t* r = ray_index_attach_chunk_zone(&v, 16);
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
-        }
-        for (int c = 0; c < ncols; c++) {
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            ray_t* v = col_vecs[c];
-            if (!csv_should_attach_hash(v)) continue;
-            ray_t* r = ray_index_attach_hash(&v);
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
-        }
-        ray_qstats_set_mode(idx_qmode);
+        /* No index attach at load time.  Index policy lives at csv→splayed
+         * CONVERSION (store/splay.c: chunk-zone / dict, upgraded to a hash
+         * index by ray_csv_hash_upgrade_check) where the decision is made
+         * once and persisted.  A `.csv.read` into memory used to pay for a
+         * chunk-zone AND a hash index on all 105 columns of an 8 GB file —
+         * 3.6 s + 16.1 s of a 46 s load — for indexes most in-memory reads
+         * never probe.  Columns that need one can be indexed explicitly. */
 
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
