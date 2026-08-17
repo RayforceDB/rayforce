@@ -825,16 +825,33 @@ static void csv_scan_rows_fn(void* arg, uint32_t worker_id,
             }
         } else {
             /* Mirrors the serial slow path exactly: quote parity gates the
-             * terminators, '\r' alone ends a row, "\r\n" ends exactly one. */
+             * terminators, '\r' alone ends a row, "\r\n" ends exactly one.
+             *
+             * One shortcut, provably equivalent: INSIDE a quoted field the
+             * serial loop's only reachable action is "p++" until it meets the
+             * closing '"' (the newline arm is gated on !in_quote), so memchr
+             * can jump straight to that quote.  Worth doing because a quoted
+             * field is where the byte-at-a-time loop spends its time — long
+             * URL/title columns are exactly the quoted ones. */
             bool in_quote = ctx->start_quoted[i] != 0;
             size_t checked = 0;
             while (p < cend) {
+                if (in_quote) {
+                    if (RAY_UNLIKELY((++checked & 0xFFF) == 0 && ray_interrupted())) break;
+                    const char* q = (const char*)memchr(p, '"', (size_t)(cend - p));
+                    if (!q) { p = cend; break; }
+                    p = q + 1;
+                    in_quote = false;
+                    continue;
+                }
+                /* Outside a quoted field (in_quote is false for the rest of
+                 * this iteration by construction). */
                 if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
                 char c = *p;
                 if (c == '"') {
-                    in_quote = !in_quote;
+                    in_quote = true;
                     p++;
-                } else if (!in_quote && (c == '\n' || c == '\r')) {
+                } else if (c == '\n' || c == '\r') {
                     if (c == '\r' && p + 1 < end && *(p + 1) == '\n') p++;
                     p++;
                     if (p < end) out[n++] = (int64_t)(p - buf);
@@ -1220,61 +1237,272 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
 }
 
 /* --------------------------------------------------------------------------
- * Batch-intern string columns after parse.
- * Single-threaded — walks each string column, interns into global sym table,
- * writes sym IDs into the final uint32_t column.
+ * Per-column local dedupe — the parallel front half of the sym intern.
+ *
+ * The serial intern below walks every SYM column row by row and calls
+ * ray_sym_intern_no_split_unlocked once per row.  That is n_rows probes into
+ * the process-global dictionary per column and it cannot be threaded: the
+ * "unlocked" contract assumes no concurrent writers, and a symbol's id IS its
+ * first-encounter order, so racing threads would hand out different ids.
+ *
+ * It splits, though, because interning is idempotent: only the FIRST
+ * occurrence of a string allocates an id, every later one is a lookup.  So:
+ *
+ *   A) in parallel, one task per column, dedupe locally — build a dictionary
+ *      of the column's distinct strings IN FIRST-OCCURRENCE ORDER and write a
+ *      dense local code per row (code 0 reserved for empty/missing);
+ *   B) serially, columns in ascending index order, intern each dictionary's
+ *      entries in insertion order and record the global id each one got;
+ *   C) in parallel, one task per column, map local codes to global ids.
+ *
+ * ID-ORDER PRESERVATION (why ids come out bit-identical to the serial walk):
+ * the sequence of intern calls that ALLOCATE an id is what fixes the id
+ * assignment, and step B reproduces that sequence exactly.  The serial walk
+ * allocates in the order (column ascending, then row ascending, first
+ * occurrence only); step A records precisely the first occurrences of one
+ * column in row order, step B replays columns in ascending order, so the
+ * concatenation is the same sequence of first occurrences in the same order.
+ * Every other call in the serial walk is a repeat that returns an existing id
+ * and allocates nothing, so dropping them changes no assignment.  The
+ * empty-symbol intern stays the first call of step B, as it was the first call
+ * of the serial walk.  This is verified empirically, not just argued: see
+ * .superpowers/csv-load-report.md for the per-column raw-id comparison
+ * against the pre-change build.
+ *
+ * A column whose distinct set exceeds CSV_DEDUP_MAX_ENTS gives up its local
+ * dictionary (the dedupe stops paying for itself once the local table is as
+ * cache-hostile as the global one) and is interned the old row-by-row way in
+ * step B — at its own position in column order, so the id sequence is still
+ * the same one.
  * -------------------------------------------------------------------------- */
 
-static bool csv_intern_strings(csv_strref_t** str_refs, int n_cols,
-                                const csv_type_t* col_types,
-                                const int8_t* resolved_types,
-                                void** col_data, int64_t n_rows,
-                                int64_t* col_max_ids) {
+/* Distinct-strings ceiling per column.  Past this the local table no longer
+ * fits a private cache, so it buys nothing over probing the global
+ * dictionary, and the scratch (this many entries plus a 2x slot array) would
+ * be charged for every SYM column at once.
+ *
+ * A test build lowers it far enough that a few-thousand-distinct fixture
+ * crosses it, so the overflow fallback in csv_intern_dicts is exercised by
+ * the suite instead of only by 1M-distinct columns nobody puts in a test.
+ * Same gate and same reasoning as CSV_SCAN_CHUNKS above: compile-time, never
+ * a runtime knob. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
+#define CSV_DEDUP_MAX_ENTS   8192u
+#else
+#define CSV_DEDUP_MAX_ENTS   (1u << 20)
+#endif
+#define CSV_DEDUP_MIN_SLOTS  64u
+
+typedef struct {
+    uint32_t    hash;
+    uint32_t    len;
+    const char* ptr;
+    int64_t     gid;      /* global sym id, filled in step B */
+} csv_dedup_ent_t;
+
+typedef struct {
+    uint32_t*        slots;     /* [n_slots] 0 = empty, else entry index + 1 */
+    uint32_t         n_slots;   /* power of two */
+    csv_dedup_ent_t* ents;      /* [n_ents] distinct strings, insertion order */
+    uint32_t         n_ents;
+    uint32_t         ents_cap;
+    bool            done;      /* task ran to completion */
+    bool            overflow;  /* too many distinct — intern this column serially */
+} csv_dedup_t;
+
+static void csv_dedup_release(csv_dedup_t* d) {
+    if (d->slots) { ray_sys_free(d->slots); d->slots = NULL; }
+    if (d->ents)  { ray_sys_free(d->ents);  d->ents  = NULL; }
+    d->n_slots = 0; d->n_ents = 0; d->ents_cap = 0;
+}
+
+/* Grow slots to 2x and reinsert.  Entry order is untouched — rehashing moves
+ * slot positions, never the insertion-ordered ents array the ids come from. */
+static bool csv_dedup_grow(csv_dedup_t* d) {
+    uint32_t new_slots = d->n_slots ? d->n_slots * 2 : CSV_DEDUP_MIN_SLOTS;
+    uint32_t* s = (uint32_t*)ray_sys_alloc((size_t)new_slots * sizeof(uint32_t));
+    if (!s) return false;
+    memset(s, 0, (size_t)new_slots * sizeof(uint32_t));
+    uint32_t mask = new_slots - 1;
+    for (uint32_t i = 0; i < d->n_ents; i++) {
+        uint32_t j = d->ents[i].hash & mask;
+        while (s[j]) j = (j + 1) & mask;
+        s[j] = i + 1;
+    }
+    if (d->slots) ray_sys_free(d->slots);
+    d->slots = s;
+    d->n_slots = new_slots;
+    return true;
+}
+
+static bool csv_dedup_grow_ents(csv_dedup_t* d) {
+    uint32_t cap = d->ents_cap ? d->ents_cap * 2 : CSV_DEDUP_MIN_SLOTS;
+    csv_dedup_ent_t* e = (csv_dedup_ent_t*)ray_sys_realloc(
+        d->ents, (size_t)cap * sizeof(csv_dedup_ent_t));
+    if (!e) return false;
+    d->ents = e;
+    d->ents_cap = cap;
+    return true;
+}
+
+typedef struct {
+    csv_strref_t** str_refs;
+    void**         col_data;
+    const int*     cols;      /* [n] SYM column indices, ascending */
+    csv_dedup_t*   dicts;     /* [n] */
+    int64_t        n_rows;
+    int64_t        empty_gid; /* global id of "" — step B fills it in */
+} csv_dedup_ctx_t;
+
+static void csv_dedup_task(void* arg, uint32_t worker_id,
+                           int64_t start, int64_t end_i) {
+    (void)worker_id; (void)end_i;
+    csv_dedup_ctx_t* ctx = (csv_dedup_ctx_t*)arg;
+    csv_dedup_t* d = &ctx->dicts[start];
+    const csv_strref_t* refs = ctx->str_refs[ctx->cols[start]];
+    /* Local codes land in the destination id array and are replaced in place
+     * by step C, so the dedupe needs no per-row scratch of its own. */
+    uint32_t* codes = (uint32_t*)ctx->col_data[ctx->cols[start]];
+    int64_t n_rows = ctx->n_rows;
+
+    if (!csv_dedup_grow(d) || !csv_dedup_grow_ents(d)) {
+        d->overflow = true;
+        d->done = true;
+        csv_dedup_release(d);
+        return;
+    }
+
+    for (int64_t r = 0; r < n_rows; r++) {
+        if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
+        if (refs[r].ptr == NULL) { codes[r] = 0; continue; }
+        uint32_t h = (uint32_t)ray_hash_bytes(refs[r].ptr, refs[r].len);
+        uint32_t mask = d->n_slots - 1;
+        uint32_t j = h & mask;
+        uint32_t found = 0;
+        for (;;) {
+            uint32_t slot = d->slots[j];
+            if (!slot) break;
+            const csv_dedup_ent_t* e = &d->ents[slot - 1];
+            if (e->hash == h && e->len == refs[r].len &&
+                memcmp(e->ptr, refs[r].ptr, refs[r].len) == 0) {
+                found = slot;
+                break;
+            }
+            j = (j + 1) & mask;
+        }
+        if (found) { codes[r] = found; continue; }
+
+        if (d->n_ents >= CSV_DEDUP_MAX_ENTS) {
+            d->overflow = true;
+            d->done = true;
+            csv_dedup_release(d);
+            return;
+        }
+        if (d->n_ents == d->ents_cap && !csv_dedup_grow_ents(d)) {
+            d->overflow = true; d->done = true; csv_dedup_release(d); return;
+        }
+        csv_dedup_ent_t* e = &d->ents[d->n_ents];
+        e->hash = h;
+        e->len  = refs[r].len;
+        e->ptr  = refs[r].ptr;
+        e->gid  = 0;
+        d->n_ents++;
+        codes[r] = d->n_ents;                 /* code = entry index + 1 */
+        d->slots[j] = d->n_ents;
+        /* Keep the load factor under 3/4. */
+        if (d->n_ents * 4u >= d->n_slots * 3u && !csv_dedup_grow(d)) {
+            d->overflow = true; d->done = true; csv_dedup_release(d); return;
+        }
+    }
+    d->done = true;
+}
+
+/* Step C: local code -> global sym id, in place. */
+static void csv_dedup_map_task(void* arg, uint32_t worker_id,
+                               int64_t start, int64_t end_i) {
+    (void)worker_id; (void)end_i;
+    csv_dedup_ctx_t* ctx = (csv_dedup_ctx_t*)arg;
+    const csv_dedup_t* d = &ctx->dicts[start];
+    if (d->overflow) return;              /* step B already wrote real ids */
+    uint32_t* ids = (uint32_t*)ctx->col_data[ctx->cols[start]];
+    int64_t n_rows = ctx->n_rows;
+    uint32_t empty = (uint32_t)ctx->empty_gid;
+    for (int64_t r = 0; r < n_rows; r++) {
+        if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
+        uint32_t code = ids[r];
+        ids[r] = code ? (uint32_t)d->ents[code - 1].gid : empty;
+    }
+}
+
+/* Step B — the only serial part left: intern each column's distinct strings,
+ * columns in ascending order, entries in first-occurrence order.  See the
+ * ID-ORDER PRESERVATION note above for why this reproduces the serial walk's
+ * id assignment exactly.
+ *
+ * CSV/TSV import policy for SYM columns, unchanged: an empty field writes the
+ * canonical empty-symbol id (always 0, reserved by ray_sym_init).  SYM columns
+ * carry no null bitmap by design — sym 0 is "missing", "empty" and "absent"
+ * all at once.  The CSV format cannot distinguish a missing field from an
+ * empty string anyway, so collapsing them is the only deterministic answer the
+ * parser can give.  Empty fields are local code 0 out of the dedupe and are
+ * mapped to that id by step C. */
+static bool csv_intern_dicts(csv_dedup_ctx_t* dd, int n_sym,
+                             int64_t* col_max_ids,
+                             uint64_t prog_base, uint64_t prog_len) {
     bool ok = true;
 
-    /* CSV/TSV import policy for SYM columns: empty fields write the
-     * canonical empty-symbol ID (always 0, reserved by ray_sym_init).
-     * SYM columns carry no null bitmap by design — sym 0 is the
-     * representation of "missing", "empty", and "absent" all at once.
-     * The CSV format can't distinguish "missing field" from "empty
-     * string" anyway, so collapsing them is the only deterministic
-     * answer the parser can give.
-     *
-     * Sym 0 is guaranteed to exist by ray_sym_init; the intern call
-     * here is a fast-path lookup that returns it without growing the
-     * dictionary. */
+    /* Same first call, same reason, as the serial walk: sym 0 is reserved by
+     * ray_sym_init, so this is a lookup that allocates nothing — but it must
+     * stay FIRST for the id sequence to match on a table where it somehow
+     * would allocate. */
     int64_t empty_sym_id = ray_sym_intern_prehashed(
         (uint32_t)ray_hash_bytes("", 0), "", 0);
-    if (empty_sym_id < 0) empty_sym_id = 0;  /* shouldn't happen — sym 0 is reserved */
+    if (empty_sym_id < 0) empty_sym_id = 0;
+    dd->empty_gid = empty_sym_id;
 
-    for (int c = 0; c < n_cols; c++) {
-        if (col_types[c] != CSV_TYPE_STR) continue;
-        /* RAY_STR columns are materialized directly; skip sym interning. */
-        if (resolved_types[c] == RAY_STR) continue;
-        csv_strref_t* refs = str_refs[c];
-        if (!refs) continue;
-        uint32_t* ids = (uint32_t*)col_data[c];
+    for (int i = 0; i < n_sym; i++) {
+        int c = dd->cols[i];
+        csv_dedup_t* d = &dd->dicts[i];
         int64_t max_id = empty_sym_id;
 
-        /* Pre-grow: upper bound is n_rows unique strings */
+        /* Pre-grow: upper bound is n_rows unique strings (unchanged). */
         uint32_t current = ray_sym_count();
-        if (!ray_sym_ensure_cap(current + (uint32_t)(n_rows < UINT32_MAX ? n_rows : UINT32_MAX)))
-            return false;  /* OOM: cannot grow sym table */
+        if (!ray_sym_ensure_cap(current +
+                (uint32_t)(dd->n_rows < UINT32_MAX ? dd->n_rows : UINT32_MAX)))
+            return false;
 
-        for (int64_t r = 0; r < n_rows; r++) {
-            if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
-                return false;
-            if (refs[r].ptr == NULL) {
-                /* Empty/missing field → canonical sym-0 null. */
-                ids[r] = (uint32_t)empty_sym_id;
-                continue;
+        if (d->done && !d->overflow) {
+            for (uint32_t e = 0; e < d->n_ents; e++) {
+                if (RAY_UNLIKELY((e & 1023) == 0 && ray_interrupted())) return false;
+                int64_t id = ray_sym_intern_no_split_unlocked(d->ents[e].ptr,
+                                                              d->ents[e].len);
+                if (id < 0) { ok = false; id = 0; }
+                d->ents[e].gid = id;
+                if (id > max_id) max_id = id;
             }
-            int64_t id = ray_sym_intern_no_split_unlocked(refs[r].ptr, refs[r].len);
-            if (id < 0) { ok = false; id = 0; }
-            ids[r] = (uint32_t)id;
-            if (id > max_id) max_id = id;
+        } else {
+            /* No usable dictionary (distinct set over the ceiling, or the task
+             * never ran).  Intern row by row exactly where the serial walk
+             * would have, so the id sequence is still the same one. */
+            const csv_strref_t* refs = dd->str_refs[c];
+            uint32_t* ids = (uint32_t*)dd->col_data[c];
+            for (int64_t r = 0; r < dd->n_rows; r++) {
+                if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return false;
+                if (refs[r].ptr == NULL) {
+                    /* Empty/missing field → canonical sym-0 null. */
+                    ids[r] = (uint32_t)empty_sym_id;
+                    continue;
+                }
+                int64_t id = ray_sym_intern_no_split_unlocked(refs[r].ptr, refs[r].len);
+                if (id < 0) { ok = false; id = 0; }
+                ids[r] = (uint32_t)id;
+                if (id > max_id) max_id = id;
+            }
         }
         if (col_max_ids) col_max_ids[c] = max_id;
+        if (prog_len)
+            ray_progress_span_set(prog_base + (uint64_t)((double)prog_len *
+                (double)(i + 1) / (double)n_sym));
     }
     return ok;
 }
@@ -1360,19 +1588,25 @@ static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows) {
 /* --------------------------------------------------------------------------
  * Stage 9b: finalize the text columns.
  *
- * Two kinds of work, dispatched together so they overlap:
- *   - one task PER RAY_STR COLUMN (independent vector + string pool), and
- *   - one task for the whole sym intern, which walks every SYM column into
- *     the process-global symbol table and therefore must stay single
- *     threaded (ray_sym_intern_no_split_unlocked assumes no concurrent
- *     writers, and the id a string gets is its first-encounter order).
+ * Three steps, laid out so only the middle one is serial:
  *
- * It used to be exactly two tasks — "all the fills" and "the intern" — which
- * on a 105-column file left 8 cores running 2 threads for ~5 s.  The intern
- * is now the phase's critical path; the fills fan out behind it.  The intern
- * is dispatched LAST so the main thread, which is the only one that can pump
- * the progress bar, picks up short fill tasks first instead of parking
- * inside the long serial one.
+ *   dispatch 1  one task per RAY_STR column (materialize its vector + string
+ *               pool) AND one task per SYM column (local dedupe, above).
+ *               Everything here is column-private.
+ *   serial      intern each SYM column's distinct strings into the global
+ *               symbol table, columns in ascending order (csv_intern_dicts).
+ *               Bounded by DISTINCT strings, not rows.
+ *   dispatch 2  one task per SYM column, mapping local codes to global ids.
+ *
+ * This started as exactly two tasks -- "all the fills" and "the whole intern"
+ * -- which on a 105-column file left 8 cores running 2 threads for ~5 s, and
+ * then as per-column fills plus one monolithic intern, where the intern was
+ * the critical path at 3.9 s.  Only the distinct-string interning is
+ * genuinely serial, and that is all that is left of it.
+ *
+ * Fills are dispatched before dedupes because they are the longer tasks
+ * (whole-column copies vs. one hash probe per row), and longest-first is what
+ * balances a fixed task list.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -1387,52 +1621,100 @@ typedef struct {
     const int*        fill_cols;   /* [n_fill] RAY_STR column indices */
     int               n_fill;
     bool*             fill_ok;     /* [n_fill] per-task result */
+    csv_dedup_ctx_t   dd;          /* SYM columns: cols[], dicts[] */
+    int               n_sym;
     bool              intern_ok;
 } csv_finalize_ctx_t;
 
+/* dispatch 1: [0, n_fill) fill a RAY_STR column, [n_fill, n_fill+n_sym) dedupe
+ * a SYM column. */
 static void csv_finalize_task(void* arg, uint32_t worker_id,
                               int64_t start, int64_t end_idx) {
-    (void)worker_id; (void)end_idx;
     csv_finalize_ctx_t* ctx = (csv_finalize_ctx_t*)arg;
     if (start < (int64_t)ctx->n_fill) {
         int c = ctx->fill_cols[start];
         ctx->fill_ok[start] = csv_fill_str_col(ctx->str_refs[c],
                                                ctx->col_vecs[c], ctx->n_rows);
     } else {
-        ctx->intern_ok = csv_intern_strings(ctx->str_refs, ctx->n_cols,
-            ctx->parse_types, ctx->resolved_types, ctx->col_data,
-            ctx->n_rows, ctx->sym_max_ids);
+        csv_dedup_task(&ctx->dd, worker_id, start - (int64_t)ctx->n_fill, end_idx);
     }
 }
 
-/* Run the finalize tasks, in parallel when the pool allows.  Returns false if
- * any task failed.  fill_cols/fill_ok are caller-owned scratch of at least
- * n_cols entries. */
+/* Run the finalize steps, in parallel when the pool allows.  Returns false if
+ * any step failed or the load was cancelled.  fill_cols/fill_ok/sym_cols/dicts
+ * are caller-owned scratch of at least n_cols entries; dicts MUST be zeroed
+ * (a task the pool skips on cancellation must read as "not done"), and this
+ * function releases every dictionary before it returns, on every path.
+ *
+ * prog_base/prog_len describe this phase's slice of the load's byte axis; pass
+ * len 0 when no progress span is active (the streaming conversion path). */
 static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
-                             bool* fill_ok) {
-    int n_fill = 0;
-    for (int c = 0; c < ctx->n_cols; c++)
-        if (ctx->resolved_types[c] == RAY_STR && ctx->str_refs[c])
-            fill_cols[n_fill++] = c;
+                             bool* fill_ok, int* sym_cols, csv_dedup_t* dicts,
+                             uint64_t prog_base, uint64_t prog_len) {
+    int n_fill = 0, n_sym = 0;
+    for (int c = 0; c < ctx->n_cols; c++) {
+        if (ctx->parse_types[c] != CSV_TYPE_STR || !ctx->str_refs[c]) continue;
+        if (ctx->resolved_types[c] == RAY_STR) fill_cols[n_fill++] = c;
+        else                                   sym_cols[n_sym++] = c;
+    }
     for (int i = 0; i < n_fill; i++) fill_ok[i] = true;
+    memset(dicts, 0, (size_t)n_sym * sizeof(csv_dedup_t));
+
     ctx->fill_cols = fill_cols;
     ctx->n_fill    = n_fill;
     ctx->fill_ok   = fill_ok;
+    ctx->n_sym     = n_sym;
     ctx->intern_ok = true;
+    ctx->dd.str_refs  = ctx->str_refs;
+    ctx->dd.col_data  = ctx->col_data;
+    ctx->dd.cols      = sym_cols;
+    ctx->dd.dicts     = dicts;
+    ctx->dd.n_rows    = ctx->n_rows;
+    ctx->dd.empty_gid = 0;
 
-    int64_t n_tasks = (int64_t)n_fill + 1;   /* +1 = the sym intern */
+    /* Slice the phase: dedupe+fill is the bulk, the serial intern touches only
+     * distinct strings, the remap is one linear pass per SYM column.  Measured
+     * roughly 60 / 10 / 30 on the 8 GB file. */
+    uint64_t w1 = prog_len * 6 / 10;
+    uint64_t w2 = prog_len / 10;
+
+    int64_t n_tasks = (int64_t)n_fill + (int64_t)n_sym;
     ray_pool_t* pool = ray_pool_get();
-    if (pool && ray_pool_total_workers(pool) >= 2 &&
-        n_tasks <= (int64_t)RAY_POOL_INIT_TASKS) {
-        ray_pool_dispatch_n(pool, csv_finalize_task, ctx, (uint32_t)n_tasks);
-    } else {
-        for (int64_t i = 0; i < n_tasks; i++)
-            csv_finalize_task(ctx, 0, i, i + 1);
+    bool par = pool && ray_pool_total_workers(pool) >= 2 &&
+               n_tasks > 0 && n_tasks <= (int64_t)RAY_POOL_INIT_TASKS;
+
+    if (prog_len) ray_progress_span_phase("finalize", prog_base, w1);
+    if (par) ray_pool_dispatch_n(pool, csv_finalize_task, ctx, (uint32_t)n_tasks);
+    else for (int64_t i = 0; i < n_tasks; i++) csv_finalize_task(ctx, 0, i, i + 1);
+    /* Cancellation drains the ticket queue WITHOUT running fn, so a skipped
+     * dedupe leaves dicts[i].done == false and codes unwritten.  Bail here
+     * rather than letting step B fall back on 105 columns' worth of scratch we
+     * are about to throw away. */
+    if (ray_interrupted()) goto fail;
+
+    if (prog_len) ray_progress_span_phase("intern", prog_base + w1, w2);
+    ctx->intern_ok = csv_intern_dicts(&ctx->dd, n_sym, ctx->sym_max_ids,
+                                      prog_base + w1, w2);
+    if (!ctx->intern_ok || ray_interrupted()) goto fail;
+
+    if (n_sym > 0) {
+        if (prog_len)
+            ray_progress_span_phase("sym ids", prog_base + w1 + w2,
+                                    prog_len - w1 - w2);
+        if (par) ray_pool_dispatch_n(pool, csv_dedup_map_task, &ctx->dd,
+                                     (uint32_t)n_sym);
+        else for (int64_t i = 0; i < n_sym; i++)
+            csv_dedup_map_task(&ctx->dd, 0, i, i + 1);
+        if (ray_interrupted()) goto fail;
     }
 
-    if (!ctx->intern_ok) return false;
+    for (int i = 0; i < n_sym; i++) csv_dedup_release(&dicts[i]);
     for (int i = 0; i < n_fill; i++) if (!fill_ok[i]) return false;
     return true;
+
+fail:
+    for (int i = 0; i < n_sym; i++) csv_dedup_release(&dicts[i]);
+    return false;
 }
 
 /* --------------------------------------------------------------------------
@@ -2239,8 +2521,12 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             .sym_max_ids    = sym_max_ids,
         };
         int  fill_cols[CSV_MAX_COLS];
+        int  sym_cols[CSV_MAX_COLS];
         bool fill_ok[CSV_MAX_COLS];
-        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok);
+        csv_dedup_t dicts[CSV_MAX_COLS];
+        /* No progress span on the conversion path — pass a zero-length slice. */
+        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
+                                       sym_cols, dicts, 0, 0);
         if (!fin_ok || ray_interrupted()) {
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, row_done, col_had_escaped);
@@ -2249,15 +2535,6 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
             return ray_interrupted() ? ray_error("cancel", "interrupted") : NULL;
         }
-    }
-
-    for (int c = 0; c < ncols; c++) {
-        if (resolved_types[c] != RAY_SYM) continue;
-        uint32_t* ids = (uint32_t*)col_data[c];
-        int64_t max_id = 0;
-        for (int64_t r = 0; r < n_rows; r++)
-            if ((int64_t)ids[r] > max_id) max_id = ids[r];
-        sym_max_ids[c] = max_id;
     }
 
     csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
@@ -2703,16 +2980,18 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             .n_rows         = n_rows,
             .sym_max_ids    = sym_max_ids,
         };
-        /* Finalization dispatches coarse tasks, not rows.  It used to be
-         * hidden from the progress pump entirely (its 0/2 would have reset a
-         * completed n_rows parse to 50%), which left the terminal frozen for
-         * the rest of the load.  On the byte axis it is simply the last
-         * slice, so it reports like any other phase. */
-        ray_progress_span_phase("finalize", prog_parse_end,
-                                (uint64_t)file_size - prog_parse_end);
+        /* Finalization used to be hidden from the progress pump entirely (its
+         * 0/2 would have reset a completed n_rows parse to 50%), which left
+         * the terminal frozen for the rest of the load.  On the byte axis it
+         * is simply the last slice, and csv_finalize_run subdivides it across
+         * its three steps. */
         int  fill_cols[CSV_MAX_COLS];
+        int  sym_cols[CSV_MAX_COLS];
         bool fill_ok[CSV_MAX_COLS];
-        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok);
+        csv_dedup_t dicts[CSV_MAX_COLS];
+        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
+                                       sym_cols, dicts, prog_parse_end,
+                                       (uint64_t)file_size - prog_parse_end);
         if (!fin_ok || ray_interrupted()) {
             if (ray_interrupted()) goto fail_parsed_cancel;
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
@@ -2722,18 +3001,6 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
             goto fail_offsets;
         }
-    }
-
-    for (int c = 0; c < ncols; c++) {
-        if (resolved_types[c] != RAY_SYM) continue;
-        uint32_t* ids = (uint32_t*)col_data[c];
-        int64_t max_id = 0;
-        for (int64_t r = 0; r < n_rows; r++) {
-            if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
-                goto fail_parsed_cancel;
-            if ((int64_t)ids[r] > max_id) max_id = ids[r];
-        }
-        sym_max_ids[c] = max_id;
     }
 
     /* Free heap-allocated escaped string copies, then strref buffers */
@@ -2761,7 +3028,10 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     }
 
-    /* ---- 10. Narrow sym columns to optimal width ---- */
+    /* ---- 10. Narrow sym columns to optimal width ----
+     * sym_max_ids[] comes from csv_intern_dicts, which already saw every id it
+     * handed out; the full 10M-row rescan that used to recompute it here was
+     * pure duplication (0.26 s on the 8 GB file). */
     for (int c = 0; c < ncols; c++) {
         if (resolved_types[c] != RAY_SYM) continue;
         uint8_t new_w = ray_sym_dict_width(sym_max_ids[c]);

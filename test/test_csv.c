@@ -1734,6 +1734,82 @@ static test_result_t test_csv_scan_boundary_matrix(void) {
     PASS();
 }
 
+/* --------------------------------------------------------------------------
+ * SYM interning — id assignment order.
+ *
+ * The intern is parallelized as: per-column local dedupe (threads) -> serial
+ * intern of only the distinct strings -> per-column code->id remap (threads).
+ * That is only sound because it reproduces the id assignment of a plain
+ * row-by-row walk, and a symbol's id IS its first-encounter order, so the
+ * property to pin is: ids are allocated column by column (ascending), and
+ * within a column row by row, first occurrence only.
+ *
+ * The fixture makes that order fully predictable and then reads the ids back
+ * with ray_sym_find:
+ *   col a  "a<k>" for k = 0..NA-1, cycling  -> first occurrences in k order
+ *   col b  the same vocabulary REVERSED     -> must reuse col a's ids, not
+ *                                              allocate new ones in b's order
+ *   col c  "c<r>", one per row              -> allocated after all of a's
+ * NA is under the test build's CSV_DEDUP_MAX_ENTS (8192) so col a takes the
+ * local-dictionary path, and col c's distinct count is over it so col c takes
+ * the overflow fallback: one fixture, both paths, one expected id sequence.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_csv_sym_id_order(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int NA = 5000;      /* col a distinct — under the dedupe ceiling */
+    const int NROWS = 30000;  /* col c distinct — over it */
+
+    FILE* f = fopen(TMP_CSV, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b,c\n", f);
+    for (int r = 0; r < NROWS; r++)
+        fprintf(f, "a%d,a%d,c%d\n", r % NA, NA - 1 - (r % NA), r);
+    fclose(f);
+
+    int8_t schema[] = {RAY_SYM, RAY_SYM, RAY_SYM};
+    ray_t* t = ray_read_csv_opts(TMP_CSV, ',', true, schema, 3);
+    bool ok = t && !RAY_IS_ERR(t) && t->type == RAY_TABLE &&
+              ray_table_nrows(t) == NROWS;
+
+    char buf[32];
+    int64_t a0 = -1;
+    if (ok) {
+        int n = snprintf(buf, sizeof(buf), "a%d", 0);
+        a0 = ray_sym_find(buf, (size_t)n);
+        ok = a0 > 0;
+    }
+    /* col a: consecutive ids in first-occurrence (k ascending) order. */
+    for (int k = 0; ok && k < NA; k++) {
+        int n = snprintf(buf, sizeof(buf), "a%d", k);
+        if (ray_sym_find(buf, (size_t)n) != a0 + k) ok = false;
+    }
+    /* col b reused those strings; had b been interned in ITS own order the
+     * "a<NA-1>" end of the range would hold the lower ids. */
+    /* col c: allocated strictly after every a<k>, in row order. */
+    for (int r = 0; ok && r < NROWS; r++) {
+        int n = snprintf(buf, sizeof(buf), "c%d", r);
+        if (ray_sym_find(buf, (size_t)n) != a0 + NA + r) ok = false;
+    }
+    /* And the id actually STORED in a cell is that symbol's id — the remap
+     * step has to land the right value in the row, not just intern the right
+     * string.  Row 0 of col b is "a<NA-1>", the LAST id col a allocated. */
+    if (ok) {
+        ray_t* cb = ray_table_get_col_idx(t, 1);
+        int64_t pos = ray_read_sym(ray_data(cb), 0, RAY_SYM, cb->attrs);
+        int n = snprintf(buf, sizeof(buf), "a%d", NA - 1);
+        ok = (pos == a0 + NA - 1) && (ray_sym_find(buf, (size_t)n) == pos);
+    }
+
+    if (t) ray_release(t);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1789,5 +1865,6 @@ const test_entry_t csv_entries[] = {
     { "csv/interrupt_mid_parse",  test_csv_interrupt_mid_parse,             NULL, NULL },
     { "csv/progress_monotonic",   test_csv_progress_never_goes_backwards,   NULL, NULL },
     { "csv/scan_boundary_matrix", test_csv_scan_boundary_matrix,            NULL, NULL },
+    { "csv/sym_id_order",         test_csv_sym_id_order,                    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
