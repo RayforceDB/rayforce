@@ -133,7 +133,8 @@ static const char* fmt_bytes(int64_t bytes, char* buf, size_t bufsz) {
 static void render_progress_full(int64_t done, int64_t total,
                                    const char* op, const char* phase,
                                    double elapsed_sec,
-                                   int64_t mem_used, int64_t mem_total) {
+                                   int64_t mem_used, int64_t mem_total,
+                                   int64_t bytes_done, int64_t bytes_total) {
     int cols = progress_term_cols();
     /* Reserve a chunk for labels + percent + elapsed; give the rest
      * to the bar. Minimum bar is 10 cells, maximum 40. */
@@ -169,11 +170,22 @@ static void render_progress_full(int64_t done, int64_t total,
                        (op && *op) ? ": " : " \xc2\xb7 ", phase);
     if (elapsed_sec > 0.0)
         tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %.1fs", elapsed_sec);
+    /* Byte-metered ops (CSV load) show input consumed / input size.  It goes
+     * before the memory gauge because it is the thing the percentage is
+     * actually measuring. */
+    if (bytes_total > 0) {
+        char db[16], tbb[16];
+        fmt_bytes(bytes_done, db, sizeof(db));
+        fmt_bytes(bytes_total, tbb, sizeof(tbb));
+        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", db, tbb);
+    }
+    /* Live heap footprint against physical RAM — explicitly labelled "mem"
+     * so it can't be misread as a position in the input. */
     if (mem_used > 0 && mem_total > 0) {
         char ub[16], tb[16];
         fmt_bytes(mem_used, ub, sizeof(ub));
         fmt_bytes(mem_total, tb, sizeof(tb));
-        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", ub, tb);
+        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 mem %s/%s", ub, tb);
     }
 
     /* Clear the line first, then draw. Using \e[2K avoids leaving
@@ -215,7 +227,8 @@ static void repl_query_progress_cb(const ray_progress_t* p, void* user) {
     if (p->final) { clear_progress(); return; }
     render_progress_full((int64_t)p->rows_done, (int64_t)p->rows_total,
                          p->op_name, p->phase, p->elapsed_sec,
-                         p->mem_used, p->mem_total);
+                         p->mem_used, p->mem_total,
+                         (int64_t)p->bytes_done, (int64_t)p->bytes_total);
 }
 
 /* ===== Profiler span tree printer (reads from g_ray_profile) ===== */

@@ -367,6 +367,12 @@ typedef struct {
     int64_t     mem_total;    /* bytes: total physical RAM (the disk-spill threshold) */
     bool        final;        /* true on the last tick of a query — renderers
                                  use this to clear the line */
+    /* Byte-metered ops (currently .csv.read) publish their real progress on a
+     * byte axis as well as the row counters, so a renderer can show
+     * "3.2G/8.1G" instead of a row count nobody can size.  bytes_total == 0
+     * means the op is not byte-metered and these two must be ignored. */
+    uint64_t    bytes_done;
+    uint64_t    bytes_total;
 } ray_progress_t;
 
 typedef void (*ray_progress_cb)(const ray_progress_t* snapshot, void* user);
@@ -406,6 +412,25 @@ bool ray_progress_active(void);
  * reports progress with no per-kernel changes. Both are no-ops with no callback. */
 void ray_progress_dispatch_begin(uint64_t phase_rows_total);
 void ray_progress_pump(void);
+
+/* ===== Byte-metered span (main-thread only) =====
+ *
+ * An op made of several internal phases — each of which may run its own pool
+ * dispatch over a different element count — cannot report honest progress
+ * through the per-dispatch pump: every dispatch restarts at 0%, so the bar
+ * saws.  A SPAN gives such an op one monotone axis (bytes of input) that all
+ * of its phases share.
+ *
+ * ray_progress_span_begin declares the axis (bytes_total, e.g. the file size).
+ * ray_progress_span_phase declares that whatever runs next occupies
+ * [base, base+len) of that axis: the dispatch pump maps its own 0..100% into
+ * that window instead of publishing raw row counts, and a serial phase can
+ * drive the same window directly with ray_progress_span_set.  The published
+ * value never decreases.  All are no-ops with no callback registered. */
+void ray_progress_span_begin(const char* op_name, uint64_t bytes_total);
+void ray_progress_span_phase(const char* phase, uint64_t base, uint64_t len);
+void ray_progress_span_set(uint64_t bytes_done);
+void ray_progress_span_end(void);
 
 /* ===== COW / Ref Counting API ===== */
 
