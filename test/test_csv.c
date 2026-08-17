@@ -1643,6 +1643,102 @@ static test_result_t test_csv_progress_never_goes_backwards(void) {
     PASS();
 }
 
+/* --------------------------------------------------------------------------
+ * Parallel row-offset scan — chunk-boundary stitching.
+ *
+ * build_row_offsets_par splits the file into chunks and reconciles quote
+ * parity across them, so its entire risk surface is what a boundary lands in
+ * the middle of: a quoted field carrying a newline, a "" escape run, or the
+ * two bytes of a "\r\n".  A test build shrinks the chunking (see
+ * CSV_SCAN_CHUNKS in csv.c) to RAY_POOL_INIT_TASKS chunks, which over these
+ * ~20 KB fixtures puts a boundary every ~20 bytes — i.e. essentially every
+ * position in the file is tried as a split point across the matrix.
+ *
+ * The oracle is exact and catches all three failure modes at once: every row
+ * begins with its own index, so a dropped row, a duplicated row or a row
+ * split in the wrong place all show up as either a wrong row count or a gap
+ * in column 0.
+ * -------------------------------------------------------------------------- */
+
+static uint32_t bmx_rand(uint32_t* s) {   /* xorshift32, reproducible */
+    uint32_t x = *s;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return (*s = x);
+}
+
+/* One randomized fixture + full verification.  `quoted` picks the state
+ * machine under test: the quote-parity one, or the quote-free fast path
+ * (whose terminator grammar differs — only '\n' ends a row and a following
+ * '\r' is absorbed — so it gets its own terminator menu). */
+static bool bmx_one_case(uint32_t* seed, bool quoted, int n_rows) {
+    /* Hazards for the quoted machine.  Odd and even "" runs both appear, so
+     * a boundary can land on either parity inside a run. */
+    static const char* const q_fields[] = {
+        "\"a\nb\"", "\"a\r\nb\"", "\"a\rb\"", "\"x\"\"y\"",
+        "\"x\"\"\"\"y\"", "\"\"\"\"", "\"p,q\"", "\"\"",
+        "\"pad0123456789abcdef\"", "plain", "", "\"z\nz\r\nz\rz\"",
+    };
+    static const char* const p_fields[] = {
+        "plain", "", "abc", "pad0123456789", "0", "-12", "long_field_value",
+    };
+    static const char* const q_terms[] = { "\n", "\r\n", "\r" };
+    static const char* const p_terms[] = { "\n", "\n\r" };
+
+    FILE* f = fopen(TMP_CSV, "wb");
+    if (!f) return false;
+    fputs("i,a,b\n", f);
+    for (int r = 0; r < n_rows; r++) {
+        const char* a;
+        const char* b;
+        const char* t;
+        if (quoted) {
+            a = q_fields[bmx_rand(seed) % (sizeof(q_fields) / sizeof(*q_fields))];
+            b = q_fields[bmx_rand(seed) % (sizeof(q_fields) / sizeof(*q_fields))];
+            t = q_terms[bmx_rand(seed) % (sizeof(q_terms) / sizeof(*q_terms))];
+        } else {
+            a = p_fields[bmx_rand(seed) % (sizeof(p_fields) / sizeof(*p_fields))];
+            b = p_fields[bmx_rand(seed) % (sizeof(p_fields) / sizeof(*p_fields))];
+            t = p_terms[bmx_rand(seed) % (sizeof(p_terms) / sizeof(*p_terms))];
+        }
+        fprintf(f, "%d,%s,%s%s", r, a, b, t);
+    }
+    fclose(f);
+
+    int8_t schema[] = {RAY_I64, RAY_STR, RAY_STR};
+    ray_t* t = ray_read_csv_opts(TMP_CSV, ',', true, schema, 3);
+    bool ok = t && !RAY_IS_ERR(t) && t->type == RAY_TABLE &&
+              ray_table_nrows(t) == n_rows;
+    if (ok) {
+        /* Column 0 must be exactly 0..n_rows-1: any mis-stitch either shifts
+         * a row start into the middle of a field (index parses as null) or
+         * changes how many rows there are. */
+        const int64_t* idx = (const int64_t*)ray_data(ray_table_get_col_idx(t, 0));
+        for (int r = 0; r < n_rows; r++)
+            if (idx[r] != r) { ok = false; break; }
+    }
+    if (t) ray_release(t);
+    unlink(TMP_CSV);
+    return ok;
+}
+
+static test_result_t test_csv_scan_boundary_matrix(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    uint32_t seed = 0x9e3779b9u;
+    bool ok = true;
+    /* ~700 rows keeps each fixture around 20 KB — comfortably past the test
+     * build's parallel-scan threshold, small enough that 120 of them cost a
+     * fraction of a second even under ASan. */
+    for (int i = 0; i < 60 && ok; i++) ok = bmx_one_case(&seed, true, 700);
+    for (int i = 0; i < 60 && ok; i++) ok = bmx_one_case(&seed, false, 900);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1697,5 +1793,6 @@ const test_entry_t csv_entries[] = {
     { "csv/resolve_int_width",    test_csv_resolve_int_width,              NULL, NULL },
     { "csv/interrupt_mid_parse",  test_csv_interrupt_mid_parse,             NULL, NULL },
     { "csv/progress_monotonic",   test_csv_progress_never_goes_backwards,   NULL, NULL },
+    { "csv/scan_boundary_matrix", test_csv_scan_boundary_matrix,            NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

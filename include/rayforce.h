@@ -360,6 +360,10 @@ bool     ray_interrupted(void);
 typedef struct {
     const char* op_name;      /* coarse: scan, group, pivot, join, ... */
     const char* phase;        /* optional finer label, e.g. "pivot: dedupe" */
+    /* Units follow the op: normally rows, but while a byte-metered span is
+     * active (see ray_progress_span_begin) these two carry BYTES — the same
+     * values as bytes_done/bytes_total below — so that the percentage a
+     * callback derives from them is the span's, not some inner dispatch's. */
     uint64_t    rows_done;
     uint64_t    rows_total;   /* 0 = indeterminate */
     double      elapsed_sec;

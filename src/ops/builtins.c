@@ -684,8 +684,10 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
 
     /* The streaming writer emits raw columns; append chunk-zone indexes to the
      * just-written files, then reload so the returned table carries them
-     * (mmap'd in place).  Without this, an on-disk column would lack the
-     * block-skip an in-memory .csv.read column has. */
+     * (mmap'd in place).  Conversion is the ONLY place a CSV load decides an
+     * index: `.csv.read` returns an index-free in-memory table, and callers
+     * that want one on it ask explicitly (.idx.hash / the attrs verbs).
+     * Without this pass, a converted store would have no block-skip at all. */
     ray_t* tbl = ray_read_splayed(dir, sym);
     if (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
         ray_splay_build_indexes(dir, tbl);

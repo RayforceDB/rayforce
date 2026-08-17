@@ -735,11 +735,31 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
  * locks) and a final compaction closes the gaps.
  * -------------------------------------------------------------------------- */
 
+/* Chunking is normally sized for throughput: a few chunks per worker, each at
+ * least CSV_SCAN_CHUNK_MIN bytes, and the parallel path is skipped entirely
+ * below CSV_SCAN_PAR_MIN_BYTES.  That puts ~31 boundaries in a 6 MB file,
+ * which exercises almost none of the stitching this scan is built out of —
+ * the interesting states (a boundary inside a quoted field, between the two
+ * bytes of a "\r\n", in the middle of a "" run) only show up when boundaries
+ * are dense.  A test build therefore shrinks all three so that even a small
+ * fixture is cut into RAY_POOL_INIT_TASKS chunks a few dozen bytes wide, and
+ * every CSV the suite reads becomes a boundary-stitching test.
+ *
+ * The chunk count is a constant, not a function of the core count, so a
+ * failure reproduces the same way on any machine.  Gated exactly like
+ * group.c's GHT_LANES_WHOLE assertions — this is a test affordance, and
+ * deliberately NOT a runtime knob. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
+#define CSV_SCAN_PAR_MIN_BYTES  (8u << 10)
+#define CSV_SCAN_CHUNK_MIN      64u
+#define CSV_SCAN_CHUNKS(pool)   ((int64_t)RAY_POOL_INIT_TASKS)
+#else
 /* Minimum bytes before the parallel scan is worth its two passes. */
 #define CSV_SCAN_PAR_MIN_BYTES  (4u << 20)
 /* Minimum bytes per chunk — below this the per-task overhead dominates. */
 #define CSV_SCAN_CHUNK_MIN      (256u << 10)
-#define CSV_SCAN_MAX_CHUNKS     4096
+#define CSV_SCAN_CHUNKS(pool)   ((int64_t)ray_pool_total_workers(pool) * 4)
+#endif
 
 typedef struct {
     const char*  buf;
@@ -854,11 +874,11 @@ static int64_t build_row_offsets_par(const char* buf, size_t buf_size,
                                   (int64_t)CSV_SCAN_PAR_MIN_BYTES))
         return -2;
 
-    int64_t n_chunks = (int64_t)ray_pool_total_workers(pool) * 4;
-    if (n_chunks > CSV_SCAN_MAX_CHUNKS) n_chunks = CSV_SCAN_MAX_CHUNKS;
+    int64_t n_chunks = CSV_SCAN_CHUNKS(pool);
     /* Never exceed the task ring's initial capacity: growth failure inside
      * ray_pool_dispatch_n silently DROPS tasks, which here would silently
-     * drop rows. */
+     * drop rows.  The span floor below can only lower n_chunks (it triggers
+     * exactly when remaining < n_chunks * CHUNK_MIN), so the cap holds. */
     if (n_chunks > (int64_t)RAY_POOL_INIT_TASKS) n_chunks = RAY_POOL_INIT_TASKS;
     size_t span = remaining / (size_t)n_chunks;
     if (span < CSV_SCAN_CHUNK_MIN) {
@@ -1821,10 +1841,14 @@ static int csv_hash_elem_size(int8_t t) {
  * BOOL/U8/I16 where the index would dwarf the column.
  *
  * Returns 1 to attach, 0 to skip. */
-/* Payload-level core of the hash-upgrade decision, shared with the
- * .csv.splayed index builder (ray_splay_build_indexes) so the on-disk
- * store makes the SAME hash-vs-zone decision the in-memory load does --
- * a reloaded store must not query slower than a fresh .csv.read. */
+/* Payload-level core of the hash-upgrade decision.  Its only caller is the
+ * .csv.splayed index builder (ray_splay_build_indexes): indexing is a
+ * CONVERSION-time decision, made once and persisted with the column files.
+ * A `.csv.read` into memory attaches nothing (it used to run this same
+ * heuristic over every column and throw the result away — 19.7 s of a 46 s
+ * 8 GB load), so there is no in-memory decision left for the on-disk one to
+ * match.  It lives here because the heuristic is written against the
+ * chunk-zone payload the CSV type machinery defines. */
 int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
                                const void* index_payload) {
     const ray_index_t* ix = (const ray_index_t*)index_payload;
