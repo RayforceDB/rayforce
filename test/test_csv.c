@@ -1750,9 +1750,21 @@ static test_result_t test_csv_scan_boundary_matrix(void) {
  *   col b  the same vocabulary REVERSED     -> must reuse col a's ids, not
  *                                              allocate new ones in b's order
  *   col c  "c<r>", one per row              -> allocated after all of a's
- * NA is under the test build's CSV_DEDUP_MAX_ENTS (8192) so col a takes the
- * local-dictionary path, and col c's distinct count is over it so col c takes
- * the overflow fallback: one fixture, both paths, one expected id sequence.
+ *   col d  MIXED, cycling every 3 rows:
+ *            r%3==0  "a<(7r) mod ND>"  already interned by col a
+ *            r%3==1  "d<r/3>"          NEW, must be allocated in d's ROW
+ *                                      order, after every id col c allocated
+ *            r%3==2  ""                empty -> local code 0 -> empty sym id
+ * col d is the case the whole argument leans on hardest: one column that both
+ * reuses ids from an earlier column AND allocates its own, so a step that
+ * replayed dictionaries in the wrong order, or that mixed up which entries
+ * were new, would land visibly wrong ids.  Its empties also cover the code-0
+ * remap, which is the one value step C does not read out of the dictionary.
+ *
+ * Path coverage in the one fixture: cols a, b, d are under the test build's
+ * CSV_DEDUP_MAX_ENTS (8192) so they take the local-dictionary path; col c's
+ * distinct count is over it so it takes the overflow fallback.  One expected
+ * id sequence spans both.
  * -------------------------------------------------------------------------- */
 static test_result_t test_csv_sym_id_order(void) {
     ray_heap_init();
@@ -1760,16 +1772,28 @@ static test_result_t test_csv_sym_id_order(void) {
 
     const int NA = 5000;      /* col a distinct — under the dedupe ceiling */
     const int NROWS = 30000;  /* col c distinct — over it */
+    /* col d: ND reused strings + ND new ones = 8000 distinct, still under the
+     * ceiling.  ND divides into NA and 7 is coprime with it, so (7r) mod ND
+     * scrambles the reuse order without ever naming a string col a missed. */
+    const int ND = 4000;
+    const int NDNEW = 4000;   /* "d0".."d3999", first seen at rows 1,4,7,... */
 
     FILE* f = fopen(TMP_CSV, "wb");
     TEST_ASSERT_NOT_NULL(f);
-    fputs("a,b,c\n", f);
-    for (int r = 0; r < NROWS; r++)
-        fprintf(f, "a%d,a%d,c%d\n", r % NA, NA - 1 - (r % NA), r);
+    fputs("a,b,c,d\n", f);
+    for (int r = 0; r < NROWS; r++) {
+        char d[32];
+        switch (r % 3) {
+            case 0:  snprintf(d, sizeof(d), "a%d", (7 * r) % ND); break;
+            case 1:  snprintf(d, sizeof(d), "d%d", (r / 3) % NDNEW); break;
+            default: d[0] = '\0'; break;      /* empty field */
+        }
+        fprintf(f, "a%d,a%d,c%d,%s\n", r % NA, NA - 1 - (r % NA), r, d);
+    }
     fclose(f);
 
-    int8_t schema[] = {RAY_SYM, RAY_SYM, RAY_SYM};
-    ray_t* t = ray_read_csv_opts(TMP_CSV, ',', true, schema, 3);
+    int8_t schema[] = {RAY_SYM, RAY_SYM, RAY_SYM, RAY_SYM};
+    ray_t* t = ray_read_csv_opts(TMP_CSV, ',', true, schema, 4);
     bool ok = t && !RAY_IS_ERR(t) && t->type == RAY_TABLE &&
               ray_table_nrows(t) == NROWS;
 
@@ -1792,6 +1816,14 @@ static test_result_t test_csv_sym_id_order(void) {
         int n = snprintf(buf, sizeof(buf), "c%d", r);
         if (ray_sym_find(buf, (size_t)n) != a0 + NA + r) ok = false;
     }
+    /* col d's NEW strings: allocated after every id col c allocated, and in
+     * d's own row order — "d<k>" is first seen at row 3k+1, so k ascending.
+     * The reused "a<...>" values interleaved between them must have consumed
+     * no ids at all, or these would not be consecutive. */
+    for (int k = 0; ok && k < NDNEW; k++) {
+        int n = snprintf(buf, sizeof(buf), "d%d", k);
+        if (ray_sym_find(buf, (size_t)n) != a0 + NA + NROWS + k) ok = false;
+    }
     /* And the id actually STORED in a cell is that symbol's id — the remap
      * step has to land the right value in the row, not just intern the right
      * string.  Row 0 of col b is "a<NA-1>", the LAST id col a allocated. */
@@ -1800,6 +1832,23 @@ static test_result_t test_csv_sym_id_order(void) {
         int64_t pos = ray_read_sym(ray_data(cb), 0, RAY_SYM, cb->attrs);
         int n = snprintf(buf, sizeof(buf), "a%d", NA - 1);
         ok = (pos == a0 + NA - 1) && (ray_sym_find(buf, (size_t)n) == pos);
+    }
+    /* Col d's three row shapes, read out of the column: a reused id, a newly
+     * allocated one, and the empty-field code-0 remap (the only value step C
+     * does not take from the dictionary). */
+    if (ok) {
+        ray_t* cd = ray_table_get_col_idx(t, 3);
+        const void* dd = ray_data(cd);
+        int64_t empty_id = ray_sym_find("", 0);
+        int64_t p0 = ray_read_sym(dd, 0, RAY_SYM, cd->attrs);   /* "a0"  */
+        int64_t p1 = ray_read_sym(dd, 1, RAY_SYM, cd->attrs);   /* "d0"  */
+        int64_t p2 = ray_read_sym(dd, 2, RAY_SYM, cd->attrs);   /* ""    */
+        int64_t p3 = ray_read_sym(dd, 3, RAY_SYM, cd->attrs);   /* "a21" */
+        ok = empty_id >= 0 &&
+             p0 == a0 &&
+             p1 == a0 + NA + NROWS &&
+             p2 == empty_id &&
+             p3 == a0 + ((7 * 3) % ND);
     }
 
     if (t) ray_release(t);

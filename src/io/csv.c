@@ -745,6 +745,18 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
  * fixture is cut into RAY_POOL_INIT_TASKS chunks a few dozen bytes wide, and
  * every CSV the suite reads becomes a boundary-stitching test.
  *
+ * DENSER IS NOT STRICTLY BETTER, so do not "improve" the 64-byte floor
+ * downward.  Sensitivity to the two bug classes runs in OPPOSITE directions:
+ *   - boundary/stitching bugs (parity prefix, csv_scan_split_at) are most
+ *     visible with tiny spans, since every byte becomes a boundary;
+ *   - intra-chunk state-machine bugs are most visible with LARGER spans,
+ *     because a chunk has to walk real distance under its own in_quote state
+ *     to expose them.  At span 1 the parity prefix does essentially all the
+ *     work and the state machine is barely exercised — a review mutant that
+ *     corrupted in_quote handling was INVISIBLE at span 1 and caught only at
+ *     span >= 17.
+ * 64 bytes sits in the range that is sensitive to both.
+ *
  * The chunk count is a constant, not a function of the core count, so a
  * failure reproduces the same way on any machine.  Gated exactly like
  * group.c's GHT_LANES_WHOLE assertions — this is a test affordance, and
@@ -838,6 +850,12 @@ static void csv_scan_rows_fn(void* arg, uint32_t worker_id,
             while (p < cend) {
                 if (in_quote) {
                     if (RAY_UNLIKELY((++checked & 0xFFF) == 0 && ray_interrupted())) break;
+                    /* Bounding the search at cend is defensive, not required:
+                     * the `p < cend` guard above already stops the loop after
+                     * an overshoot, so searching to the file end would find
+                     * the same offsets (it would just do the next chunk's
+                     * work).  Bounded because a chunk has no business reading
+                     * past its own slice. */
                     const char* q = (const char*)memchr(p, '"', (size_t)(cend - p));
                     if (!q) { p = cend; break; }
                     p = q + 1;
@@ -1277,9 +1295,18 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
  * -------------------------------------------------------------------------- */
 
 /* Distinct-strings ceiling per column.  Past this the local table no longer
- * fits a private cache, so it buys nothing over probing the global
- * dictionary, and the scratch (this many entries plus a 2x slot array) would
- * be charged for every SYM column at once.
+ * fits a private cache, so it buys nothing over probing the global dictionary
+ * — the fallback in csv_intern_dicts costs speed, never correctness.
+ *
+ * It bounds the PER-COLUMN scratch only, and that is the honest limit: a
+ * dictionary at the ceiling is 1M entries (24 B each) plus a 2M-slot u32
+ * array, ~32 MB, and every SYM column's dictionary is live simultaneously
+ * from dispatch 1 until step C releases them.  So the aggregate bound is
+ * ~32 MB x live SYM columns — ~700 MB for the 22 SYM columns of the
+ * ClickBench hits file if each were at the ceiling (they are nowhere near
+ * it), and ~8 GB in the worst case allowed by CSV_MAX_COLS=256.  Transient,
+ * and it takes a file with hundreds of million-distinct SYM columns to get
+ * there, but it is not bounded by a constant.
  *
  * A test build lowers it far enough that a few-thousand-distinct fixture
  * crosses it, so the overflow fallback in csv_intern_dicts is exercised by
@@ -1642,9 +1669,10 @@ static void csv_finalize_task(void* arg, uint32_t worker_id,
 
 /* Run the finalize steps, in parallel when the pool allows.  Returns false if
  * any step failed or the load was cancelled.  fill_cols/fill_ok/sym_cols/dicts
- * are caller-owned scratch of at least n_cols entries; dicts MUST be zeroed
- * (a task the pool skips on cancellation must read as "not done"), and this
- * function releases every dictionary before it returns, on every path.
+ * are caller-owned scratch of at least n_cols entries, uninitialised — this
+ * function zeroes the dictionaries itself before dispatching (a task the pool
+ * skips on cancellation must read as "not done"), and releases every one of
+ * them before it returns, on every path.
  *
  * prog_base/prog_len describe this phase's slice of the load's byte axis; pass
  * len 0 when no progress span is active (the streaming conversion path). */
