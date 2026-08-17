@@ -7,13 +7,21 @@
 ;; HAS_NULLS started reaching such columns (#416).  The property under test is
 ;; that the fused and unfused kernels give the SAME answer.
 ;;
-;; Forcing the unfused path: the fused compiler rejects a predicate containing
-;; any comparison it cannot handle, and an F64 column is one of those.  So
-;;    where: (!= s "")                    -> fused
-;;    where: (and (!= s "") (== f 1.5))   -> unfused (F64 arm declines)
-;; over an F64 column that is constant 1.5, i.e. the same row set both ways.
-;; Every count is also asserted against its value by construction, so a pair
-;; that agreed on a wrong answer still fails.
+;; ── What THIS section does and does NOT cover ──────────────────────────────
+;; The pairs below are a plain-filter differential: `where:` with no
+;; sort+take, so NEITHER arm reaches the fused evaluator.  The fused predicate
+;; path is only entered from the fused filter+top-K shape in query.c
+;; (`where:` + `asc:/desc:` + `take:`, no `by:`/`nearest:`) — see
+;; `ray_fused_topk_supported`.  So the `(and … (== f 1.5))` twin here forces
+;; nothing: the F64 term does decline the fused compiler, but its partner runs
+;; unfused too, and both arms are the same FILTER kernel.
+;;
+;; What these pairs are still worth: they pin the null-aware FILTER kernel's
+;; answers for every literal shape, and every count is asserted against its
+;; value by construction, so a pair that agreed on a wrong answer still fails.
+;; The real fused-vs-unfused differential — the one that actually exercises
+;; fp_col_supported_op's relaxation — is the FUSED TOP-K section at the bottom
+;; of this file, and it is the section to extend when that gate moves.
 ;;
 ;; Fixture: a 6-row block doubled 12 times = 24576 rows (past any per-row
 ;; fused threshold), with column `s` empty in the block's FIRST, MIDDLE and
@@ -92,3 +100,127 @@
 ;; ════════════════════════════════════════════════════════════════════════════
 
 (.sys.exec "rm -f rf_test_nullcmp.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; FUSED TOP-K DIFFERENTIAL — the section that actually reaches
+;; fp_col_supported_op's relaxation.
+;;
+;; Routing: `(select {cols… from: T where: <pred> asc/desc: <col> take: K})`
+;; with no by:/nearest: and every output column a plain source-column name is
+;; the ONLY shape that enters ray_fused_topk_select -> fp_compile_pred ->
+;; fp_col_supported_op.  Each `…_F` binding below was confirmed to fuse under
+;; temporary instrumentation in ray_fused_topk_select; each `…_U` twin adds an
+;; `(or … (== n -1))` term, which `ray_fused_group_supported` rejects outright
+;; (no `or` in its grammar), so the twin never even reaches the executor and
+;; runs the FILTER -> SORT_TAKE pipeline instead.  `(== n -1)` matches nothing
+;; (n = til N), so the two arms describe the SAME row set.
+;;
+;; `n` is a distinct row id AND the sort key, so the emitted `n` column pins
+;; row selection and order together, and its golden is derivable by hand:
+;; e.g. `!= s ""` keeps n % 6 in {1,2,4}, so descending from N-1 (≡ 5, empty)
+;; the first five keepers are N-2, N-4, N-5, N-8, N-10.
+;;
+;; The key column itself is checked with literal "" filters rather than `==`
+;; on the SYM column, so no assertion depends on null-vs-null comparison
+;; semantics.
+;;
+;; Size: 3 145 728 rows (2^19 x the same 6-row pattern), built in-language so
+;; the ≥2.5M scale costs no CSV.  Well past every morsel/parallel threshold on
+;; the fused scan.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set FN 3145728)
+(set fs (as 'SYM (at ["" "b" "c" "" "b" ""] (% (til FN) 6))))
+(set fz (as 'SYM (at [""] (* 0 (til FN)))))
+(set fn_ (til FN))
+(set FT (table [s z n] (list fs fz fn_)))
+(count FT) -- 3145728
+
+;; ── != "" (the ClickBench q24/q25/q26 predicate) ───────────────────────────
+(set FA_F (select {s: s n: n from: FT where: (!= s "") desc: n take: 5}))
+(set FA_U (select {s: s n: n from: FT where: (or (!= s "") (== n -1)) desc: n take: 5}))
+(at FA_F 'n) -- [3145726 3145724 3145723 3145720 3145718]
+(at FA_U 'n) -- [3145726 3145724 3145723 3145720 3145718]
+(count (select {from: FA_F where: (== s "")})) -- 0
+(count (select {from: FA_U where: (== s "")})) -- 0
+
+;; ── == "" : the nulls are the match, and every emitted key must BE null ────
+(set FB_F (select {s: s n: n from: FT where: (== s "") desc: n take: 5}))
+(set FB_U (select {s: s n: n from: FT where: (or (== s "") (== n -1)) desc: n take: 5}))
+(at FB_F 'n) -- [3145727 3145725 3145722 3145721 3145719]
+(at FB_U 'n) -- [3145727 3145725 3145722 3145721 3145719]
+(count (select {from: FB_F where: (== s "")})) -- 5
+(count (select {from: FB_U where: (== s "")})) -- 5
+
+;; ── non-empty literal, == : nulls must NOT be swept in ─────────────────────
+(set FC_F (select {s: s n: n from: FT where: (== s "b") desc: n take: 5}))
+(set FC_U (select {s: s n: n from: FT where: (or (== s "b") (== n -1)) desc: n take: 5}))
+(at FC_F 'n) -- [3145726 3145723 3145720 3145717 3145714]
+(at FC_U 'n) -- [3145726 3145723 3145720 3145717 3145714]
+(count (select {from: FC_F where: (== s "")})) -- 0
+
+;; ── non-empty literal, != : nulls must be counted IN (asc, so from row 0) ──
+(set FD_F (select {s: s n: n from: FT where: (!= s "b") asc: n take: 5}))
+(set FD_U (select {s: s n: n from: FT where: (or (!= s "b") (== n -1)) asc: n take: 5}))
+(at FD_F 'n) -- [0 2 3 5 6]
+(at FD_U 'n) -- [0 2 3 5 6]
+;; of [0 2 3 5 6], only n=2 ("c") is non-empty — 0/3/5/6 are all empty
+(count (select {from: FD_F where: (== s "")})) -- 4
+
+;; ── all-empty column: every row null.  != "" selects nothing, == "" all. ───
+(count (select {z: z n: n from: FT where: (!= z "") desc: n take: 5})) -- 0
+(count (select {z: z n: n from: FT where: (or (!= z "") (== n -1)) desc: n take: 5})) -- 0
+(set FE_F (select {z: z n: n from: FT where: (== z "") desc: n take: 5}))
+(set FE_U (select {z: z n: n from: FT where: (or (== z "") (== n -1)) desc: n take: 5}))
+(at FE_F 'n) -- [3145727 3145726 3145725 3145724 3145723]
+(at FE_U 'n) -- [3145727 3145726 3145725 3145724 3145723]
+(count (select {from: FE_F where: (== z "")})) -- 5
+
+;; ── STR twin ───────────────────────────────────────────────────────────────
+;; A nullable STR column reaches the fused evaluator ONLY through its
+;; RAY_IDX_DICT (fp_check_simple_cmp / fp_compile_cmp both require it: the
+;; comparison is driven on the int32 dict-code vector, not the descriptors).
+;; There is no language verb that builds one — `.idx.dict` does not exist and
+;; dict conversion is a splayed-storage attribute (splay.c only computes it for
+;; STR columns of >= 65536 rows).  So the twin needs a converted store, and it
+;; is deliberately smaller than the SYM fixture: 131072 rows is the smallest
+;; power of two that clears splay.c's dict threshold.  Confirmed fused under
+;; the same instrumentation; the `.idx.info` assertion below is what keeps the
+;; shape honest — if a future change stops attaching the dict, the kind flips
+;; and this test says so instead of silently measuring the unfused path twice.
+(.sys.exec "rm -rf rf_test_nullcmp_store") -- 0
+(set SN 98304)
+(set SU (table [u n] (list (at ["" "b" "c" "" "b" ""] (% (til SN) 6)) (til SN))))
+(count (.db.splayed.set "rf_test_nullcmp_store" SU)) -- 98304
+(set ST (.db.splayed.get "rf_test_nullcmp_store" 'SU))
+(count ST) -- 98304
+(.idx.info (at ST 'u)) -- {kind:dict length:98304 parent_type:13 saved_attrs:64 n_distinct:3}
+
+(set SA_F (select {u: u n: n from: ST where: (!= u "") desc: n take: 5}))
+(set SA_U (select {u: u n: n from: ST where: (or (!= u "") (== n -1)) desc: n take: 5}))
+(at SA_F 'n) -- [98302 98300 98299 98296 98294]
+(at SA_U 'n) -- [98302 98300 98299 98296 98294]
+(count (select {from: SA_F where: (== u "")})) -- 0
+
+(set SB_F (select {u: u n: n from: ST where: (== u "") desc: n take: 5}))
+(set SB_U (select {u: u n: n from: ST where: (or (== u "") (== n -1)) desc: n take: 5}))
+(at SB_F 'n) -- [98303 98301 98298 98297 98295]
+(at SB_U 'n) -- [98303 98301 98298 98297 98295]
+(count (select {from: SB_F where: (== u "")})) -- 5
+
+(set SC_F (select {u: u n: n from: ST where: (== u "b") desc: n take: 5}))
+(set SC_U (select {u: u n: n from: ST where: (or (== u "b") (== n -1)) desc: n take: 5}))
+(at SC_F 'n) -- [98302 98299 98296 98293 98290]
+(at SC_U 'n) -- [98302 98299 98296 98293 98290]
+
+;; ── the boundary: ops the relaxation deliberately does NOT admit ───────────
+;; LIKE keeps the strict gate (fp_col_supported_op is called with eq_or_ne=0),
+;; and ordering ops on SYM are rejected before the gate is even consulted.
+;; Both must keep agreeing with their unfused twins — this is where a future
+;; loosening of the gate would first have to prove itself.
+(set FL_F (select {s: s n: n from: FT where: (like s "*b*") desc: n take: 5}))
+(set FL_U (select {s: s n: n from: FT where: (or (like s "*b*") (== n -1)) desc: n take: 5}))
+(at FL_F 'n) -- [3145726 3145723 3145720 3145717 3145714]
+(at FL_U 'n) -- [3145726 3145723 3145720 3145717 3145714]
+
+(.sys.exec "rm -rf rf_test_nullcmp_store") -- 0

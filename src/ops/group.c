@@ -13688,8 +13688,19 @@ v2_emit:;
              * sentinel types only, so setting it once here — serially,
              * before the dispatch — keeps SYM/STR/GUID null keys flagged
              * without a worker ever storing into a shared attrs byte that
-             * other workers read non-atomically via ray_data(). */
-            if (src_col->attrs & RAY_ATTR_HAS_NULLS)
+             * other workers read non-atomically via ray_data().
+             *
+             * Hop the slice parent, exactly as ray_key_may_be_null does: a
+             * SLICE carries no HAS_NULLS of its own, so reading src_col->attrs
+             * directly would set the null-mask bits (which that predicate
+             * gates) while leaving the emitted column unflagged.  Benign for
+             * SYM/STR (is_null reads the payload) and recoverable for the
+             * sentinel types (grp_finalize_nulls rescans), but GUID nullness
+             * rests SOLELY on this attr — its reader gates on HAS_NULLS before
+             * looking at the 16 zero bytes. */
+            const ray_t* null_src = (src_col->attrs & RAY_ATTR_SLICE)
+                                    ? src_col->slice_parent : src_col;
+            if (null_src && (null_src->attrs & RAY_ATTR_HAS_NULLS))
                 new_col->attrs |= RAY_ATTR_HAS_NULLS;
             key_cols[k] = new_col;
             key_dsts[k] = (char*)ray_data(new_col);
