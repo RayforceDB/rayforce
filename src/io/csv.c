@@ -2455,6 +2455,10 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
 
     bool col_had_null[CSV_MAX_COLS];
     if (ncols > 0) memset(col_had_null, 0, (size_t)ncols * sizeof(bool));
+    /* Set by the finalizer for any SYM/STR column that WROTE a canonical null
+     * (sym id 0 / zero-length descriptor) — see csv_note_empty. */
+    bool col_wrote_null[CSV_MAX_COLS];
+    if (ncols > 0) memset(col_wrote_null, 0, (size_t)ncols * sizeof(bool));
     bool col_had_escaped[CSV_MAX_COLS];
     memset(col_had_escaped, 0, sizeof(col_had_escaped));
 
@@ -2590,11 +2594,9 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         int  sym_cols[CSV_MAX_COLS];
         bool fill_ok[CSV_MAX_COLS];
         csv_dedup_t dicts[CSV_MAX_COLS];
-        /* No progress span on the conversion path — pass a zero-length slice.
-         * empties is unused here: this path keeps the pre-bfb5b380 rule that
-         * SYM/STR columns carry no HAS_NULLS (see the attrs loop below). */
+        /* No progress span on the conversion path — pass a zero-length slice. */
         bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
-                                       sym_cols, dicts, NULL, 0, 0);
+                                       sym_cols, dicts, col_wrote_null, 0, 0);
         if (!fin_ok || ray_interrupted()) {
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, row_done, col_had_escaped);
@@ -2614,12 +2616,16 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         return ray_error("cancel", "interrupted");
     }
 
+    /* HAS_NULLS, same rule as the in-memory read path (step 9c there).
+     * SYM/STR use sym 0 / a zero-length descriptor as their canonical null
+     * (bfb5b380), and this path had been left behind on the pre-bfb5b380 rule
+     * that cleared the bit for those two types — so a converted store and a
+     * fresh .csv.read of the same file disagreed about the same empty cells
+     * (issue #416).  The SYM/STR answer comes from col_wrote_null[], recorded
+     * by the finalizer at each write site, so it costs no extra pass. */
     for (int c = 0; c < ncols; c++) {
         ray_t* vec = col_vecs[c];
-        /* SYM and STR both represent a blank cell as the empty string ("" /
-         * sym 0) — there is no null distinct from empty, so neither type
-         * carries HAS_NULLS (a per-row null check on them is pure waste). */
-        if (col_had_null[c] && vec->type != RAY_SYM && vec->type != RAY_STR)
+        if (col_had_null[c] || col_wrote_null[c])
             vec->attrs |= RAY_ATTR_HAS_NULLS;
         else
             vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
@@ -3279,6 +3285,14 @@ static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
                                                     ray_str_len(s));
                 if (pos < 0) return RAY_ERR_OOM;
                 buf[i] = (uint32_t)pos;
+                /* Position 0 of any symfile is the empty string (domain.c
+                 * enforces that reservation on open), so a re-encoded cell is
+                 * the canonical SYM null exactly when its position is 0.
+                 * Testing the value WRITTEN keeps the on-disk HAS_NULLS honest
+                 * without trusting the chunk vec's attrs — and this arm is why
+                 * streamed SYM columns used to lose the bit entirely: only the
+                 * non-SYM arm below propagated it (issue #416). */
+                if (pos == 0) w->had_nulls = true;
             }
             if (fwrite(buf, sizeof(uint32_t), (size_t)cnt, w->fp) != (size_t)cnt)
                 return RAY_ERR_IO;

@@ -1080,7 +1080,15 @@ ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
         /* Same-domain saves preserve positions, hence order; re-encoding
          * from another domain reorders ids — drop SORTED then. */
         uint8_t keep_sorted = (src == target) ? (vec->attrs & RAY_ATTR_SORTED) : 0;
-        header.attrs = (uint8_t)(w | keep_sorted);
+        /* attrs is REBUILT here rather than inherited, because the width bits
+         * change with the target domain's size.  Every other persisted bit has
+         * to be carried across explicitly: HAS_NULLS is one, and forgetting it
+         * silently dropped canonical sym-0 nulls on every splayed SYM column
+         * (issue #416) — an all-empty SYM column round-tripped as attrs 0.
+         * Re-encoding cannot change WHETHER a null is present: position 0 of
+         * any domain is the empty symbol, so a sym-0 cell stays sym-0. */
+        header.attrs = (uint8_t)(w | keep_sorted |
+                                 (vec->attrs & RAY_ATTR_HAS_NULLS));
         memset(header.aux, 0, 16); /* domain ptr is runtime-only state;
                                     * aux reserved (postponed index), never
                                     * the version (lives in `order` above). */

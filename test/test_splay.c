@@ -2191,7 +2191,82 @@ static test_result_t test_resolution_explicit_wins(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+
+/* =========================================================================
+ * HAS_NULLS must round-trip losslessly through a splayed store, for EVERY
+ * persisted type.
+ *
+ * ray_col_save_sym_encoded REBUILDS the on-disk attrs byte (the SYM width
+ * bits depend on the target domain's size), and it used to rebuild it as
+ * (width | SORTED) only — silently dropping HAS_NULLS on every splayed SYM
+ * column, so an all-sym-0 column came back as attrs 0 (issue #416).  That
+ * also made the store a lying instrument for attrs comparisons.
+ *
+ * Each column below is built with a null in it, flagged HAS_NULLS, saved and
+ * reloaded; the reloaded attrs must still carry the bit.  SYM is the case that
+ * regressed, but the loop covers the rest so the next writer that rebuilds an
+ * attrs byte is caught too.  The SYM cell is sym 0 — the canonical SYM null,
+ * and position 0 of any symfile — so the value, not just the flag, survives
+ * re-encoding into the store's domain.
+ * ========================================================================= */
+static test_result_t test_splayed_has_nulls_roundtrip(void) {
+    static const int8_t types[] = {
+        RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64,
+        RAY_DATE, RAY_TIME, RAY_TIMESTAMP, RAY_GUID, RAY_SYM, RAY_STR,
+    };
+    const int n_types = (int)(sizeof(types) / sizeof(*types));
+
+    for (int i = 0; i < n_types; i++) {
+        int8_t t = types[i];
+        const char* dir = TMP_SPLAY_BASE "/hasnulls_rt";
+        rm_rf(dir);
+
+        ray_t* col = (t == RAY_SYM) ? ray_sym_vec_new(RAY_SYM_W8, 4)
+                                    : ray_vec_new(t, 4);
+        TEST_ASSERT_NOT_NULL(col);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+        col->len = 4;
+        memset(ray_data(col), 0, 4 * (size_t)ray_type_sizes[(uint8_t)t]);
+        if (t == RAY_SYM) {
+            /* All four cells are sym 0 = the canonical SYM null. */
+            memset(ray_data(col), 0, 4);
+        }
+        col->attrs |= RAY_ATTR_HAS_NULLS;
+        uint8_t want = (uint8_t)(col->attrs & RAY_ATTR_HAS_NULLS);
+        TEST_ASSERT_EQ_I(want, RAY_ATTR_HAS_NULLS);
+
+        int64_t cname = ray_sym_intern("c", 1);
+        ray_t* tbl = ray_table_new(2);
+        tbl = ray_table_add_col(tbl, cname, col);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+        char sym_path[512];
+        snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
+        ray_err_t err = ray_splay_save(tbl, dir, sym_path);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+
+        ray_t* loaded = ray_read_splayed(dir, sym_path);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        ray_t* rcol = ray_table_get_col_idx(loaded, 0);
+        TEST_ASSERT_NOT_NULL(rcol);
+        TEST_ASSERT_EQ_I(rcol->type, t);
+        /* The bit, and (for SYM) the null value it advertises. */
+        TEST_ASSERT_EQ_I(rcol->attrs & RAY_ATTR_HAS_NULLS, RAY_ATTR_HAS_NULLS);
+        if (t == RAY_SYM)
+            TEST_ASSERT_EQ_I(ray_read_sym(ray_data(rcol), 0, RAY_SYM,
+                                          rcol->attrs), 0);
+
+        ray_release(loaded);
+        ray_release(col);
+        ray_release(tbl);
+        rm_rf(dir);
+    }
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
+    { "splay/has_nulls_roundtrip",        test_splayed_has_nulls_roundtrip,      splay_setup, splay_teardown },
     { "splay/save_null_dir",              test_save_null_dir,                   splay_setup, splay_teardown },
     { "splay/save_null_tbl",              test_save_null_tbl,                   splay_setup, splay_teardown },
     { "splay/save_skips_dot_col_name",    test_save_skips_dot_col_name,         splay_setup, splay_teardown },
