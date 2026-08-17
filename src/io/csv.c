@@ -1379,7 +1379,25 @@ typedef struct {
     csv_dedup_t*   dicts;     /* [n] */
     int64_t        n_rows;
     int64_t        empty_gid; /* global id of "" — step B fills it in */
+    /* [n_cols] "this column wrote a canonical null", recorded where the value
+     * is written.  See csv_note_empty. */
+    bool*          empties;
 } csv_dedup_ctx_t;
+
+/* HAS_NULLS accounting for SYM/STR columns (step 9c).
+ *
+ * bfb5b380 made an empty SYM/STR cell a canonical null and, where the parse
+ * had not already flagged the column, fell back to a per-row ray_vec_is_null
+ * scan to find out.  Every writer of those cells already has the value in a
+ * register, so the same predicate is evaluated there instead — SYM null is
+ * id == 0, STR null is len == 0, exactly what ray_vec_is_null tests.  Same
+ * semantics, same flag, no extra pass: the fallback scan cost 0.207 s on the
+ * 8 GB file walking 5 columns to find nothing (it cannot find anything the
+ * parse missed, but this way that is a property of the code rather than of
+ * an argument about the parser). */
+static inline void csv_note_empty(bool* empties, int col, bool is_null) {
+    if (is_null && empties) empties[col] = true;
+}
 
 static void csv_dedup_task(void* arg, uint32_t worker_id,
                            int64_t start, int64_t end_i) {
@@ -1454,11 +1472,15 @@ static void csv_dedup_map_task(void* arg, uint32_t worker_id,
     uint32_t* ids = (uint32_t*)ctx->col_data[ctx->cols[start]];
     int64_t n_rows = ctx->n_rows;
     uint32_t empty = (uint32_t)ctx->empty_gid;
+    bool saw_null = false;
     for (int64_t r = 0; r < n_rows; r++) {
         if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
         uint32_t code = ids[r];
-        ids[r] = code ? (uint32_t)d->ents[code - 1].gid : empty;
+        uint32_t id = code ? (uint32_t)d->ents[code - 1].gid : empty;
+        ids[r] = id;
+        saw_null |= (id == 0);
     }
+    csv_note_empty(ctx->empties, ctx->cols[start], saw_null);
 }
 
 /* Step B — the only serial part left: intern each column's distinct strings,
@@ -1513,18 +1535,22 @@ static bool csv_intern_dicts(csv_dedup_ctx_t* dd, int n_sym,
              * would have, so the id sequence is still the same one. */
             const csv_strref_t* refs = dd->str_refs[c];
             uint32_t* ids = (uint32_t*)dd->col_data[c];
+            bool saw_null = false;
             for (int64_t r = 0; r < dd->n_rows; r++) {
                 if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return false;
                 if (refs[r].ptr == NULL) {
                     /* Empty/missing field → canonical sym-0 null. */
                     ids[r] = (uint32_t)empty_sym_id;
+                    saw_null |= (empty_sym_id == 0);
                     continue;
                 }
                 int64_t id = ray_sym_intern_no_split_unlocked(refs[r].ptr, refs[r].len);
                 if (id < 0) { ok = false; id = 0; }
                 ids[r] = (uint32_t)id;
+                saw_null |= (id == 0);
                 if (id > max_id) max_id = id;
             }
+            csv_note_empty(dd->empties, c, saw_null);
         }
         if (col_max_ids) col_max_ids[c] = max_id;
         if (prog_len)
@@ -1561,7 +1587,8 @@ static void csv_free_escaped_strrefs(csv_strref_t** str_refs, int n_cols,
  * realloc/COW path that ray_str_vec_set would take for a freshly-owned
  * vector.  Columns are independent (own vector, own pool), which is what
  * lets the finalizer run one task per column. */
-static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows) {
+static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows,
+                             bool* saw_null_out) {
     {
         ray_str_t* dst = (ray_str_t*)ray_data(vec);
 
@@ -1588,11 +1615,14 @@ static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows) {
 
         char* pool_base = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL;
         uint32_t pool_off = 0;
+        bool saw_null = false;
 
         for (int64_t r = 0; r < n_rows; r++) {
             if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
                 return false;
             memset(&dst[r], 0, sizeof(ray_str_t));
+            /* len 0 is what ray_vec_is_null tests for a STR cell. */
+            if (refs[r].ptr == NULL || refs[r].len == 0) { saw_null = true; }
             if (refs[r].ptr == NULL) continue;
             const char* p = refs[r].ptr;
             uint32_t l = refs[r].len;
@@ -1608,6 +1638,7 @@ static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows) {
             }
         }
         if (vec->str_pool) vec->str_pool->len = (int64_t)pool_off;
+        if (saw_null_out) *saw_null_out = saw_null;
     }
     return true;
 }
@@ -1650,6 +1681,7 @@ typedef struct {
     bool*             fill_ok;     /* [n_fill] per-task result */
     csv_dedup_ctx_t   dd;          /* SYM columns: cols[], dicts[] */
     int               n_sym;
+    bool*             empties;     /* [n_cols] SYM/STR column wrote a null */
     bool              intern_ok;
 } csv_finalize_ctx_t;
 
@@ -1660,8 +1692,11 @@ static void csv_finalize_task(void* arg, uint32_t worker_id,
     csv_finalize_ctx_t* ctx = (csv_finalize_ctx_t*)arg;
     if (start < (int64_t)ctx->n_fill) {
         int c = ctx->fill_cols[start];
+        bool saw_null = false;
         ctx->fill_ok[start] = csv_fill_str_col(ctx->str_refs[c],
-                                               ctx->col_vecs[c], ctx->n_rows);
+                                               ctx->col_vecs[c], ctx->n_rows,
+                                               &saw_null);
+        csv_note_empty(ctx->empties, c, saw_null);
     } else {
         csv_dedup_task(&ctx->dd, worker_id, start - (int64_t)ctx->n_fill, end_idx);
     }
@@ -1678,6 +1713,7 @@ static void csv_finalize_task(void* arg, uint32_t worker_id,
  * len 0 when no progress span is active (the streaming conversion path). */
 static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
                              bool* fill_ok, int* sym_cols, csv_dedup_t* dicts,
+                             bool* empties,
                              uint64_t prog_base, uint64_t prog_len) {
     int n_fill = 0, n_sym = 0;
     for (int c = 0; c < ctx->n_cols; c++) {
@@ -1692,6 +1728,7 @@ static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
     ctx->n_fill    = n_fill;
     ctx->fill_ok   = fill_ok;
     ctx->n_sym     = n_sym;
+    ctx->empties   = empties;
     ctx->intern_ok = true;
     ctx->dd.str_refs  = ctx->str_refs;
     ctx->dd.col_data  = ctx->col_data;
@@ -1699,6 +1736,7 @@ static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
     ctx->dd.dicts     = dicts;
     ctx->dd.n_rows    = ctx->n_rows;
     ctx->dd.empty_gid = 0;
+    ctx->dd.empties   = ctx->empties;
 
     /* Slice the phase: dedupe+fill is the bulk, the serial intern touches only
      * distinct strings, the remap is one linear pass per SYM column.  Measured
@@ -2552,9 +2590,11 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         int  sym_cols[CSV_MAX_COLS];
         bool fill_ok[CSV_MAX_COLS];
         csv_dedup_t dicts[CSV_MAX_COLS];
-        /* No progress span on the conversion path — pass a zero-length slice. */
+        /* No progress span on the conversion path — pass a zero-length slice.
+         * empties is unused here: this path keeps the pre-bfb5b380 rule that
+         * SYM/STR columns carry no HAS_NULLS (see the attrs loop below). */
         bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
-                                       sym_cols, dicts, 0, 0);
+                                       sym_cols, dicts, NULL, 0, 0);
         if (!fin_ok || ray_interrupted()) {
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, row_done, col_had_escaped);
@@ -2874,6 +2914,11 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     bool col_had_null[CSV_MAX_COLS];
     if (ncols > 0) memset(col_had_null, 0, (size_t)ncols * sizeof(bool));
 
+    /* Set by the finalizer for any SYM/STR column that WROTE a canonical null
+     * (sym id 0 / zero-length descriptor).  Feeds step 9c below. */
+    bool col_wrote_null[CSV_MAX_COLS];
+    if (ncols > 0) memset(col_wrote_null, 0, (size_t)ncols * sizeof(bool));
+
     bool col_had_escaped[CSV_MAX_COLS];
     memset(col_had_escaped, 0, sizeof(col_had_escaped));
 
@@ -3018,7 +3063,8 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
         bool fill_ok[CSV_MAX_COLS];
         csv_dedup_t dicts[CSV_MAX_COLS];
         bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
-                                       sym_cols, dicts, prog_parse_end,
+                                       sym_cols, dicts, col_wrote_null,
+                                       prog_parse_end,
                                        (uint64_t)file_size - prog_parse_end);
         if (!fin_ok || ray_interrupted()) {
             if (ray_interrupted()) goto fail_parsed_cancel;
@@ -3041,15 +3087,17 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
      *
      * Sentinels in the payload carry the null state; HAS_NULLS is the
      * vec-level fast-path bit.  SYM/STR use sym 0 / empty descriptors as
-     * canonical nulls, including explicitly quoted empty CSV fields. */
+     * canonical nulls, including explicitly quoted empty CSV fields.
+     *
+     * For SYM/STR the answer comes from col_wrote_null[], which the finalizer
+     * records at the point it writes each cell using ray_vec_is_null's own
+     * predicate (id == 0 / len == 0).  That replaced a per-row
+     * ray_vec_is_null fallback scan over any SYM/STR column the parse had not
+     * already flagged — same semantics, but free instead of 0.207 s of
+     * whole-column passes on the 8 GB file. */
     for (int c = 0; c < ncols; c++) {
         ray_t* vec = col_vecs[c];
-        bool has_null = col_had_null[c] != 0;
-        if (!has_null && (vec->type == RAY_SYM || vec->type == RAY_STR)) {
-            for (int64_t r = 0; r < n_rows; r++) {
-                if (ray_vec_is_null(vec, r)) { has_null = true; break; }
-            }
-        }
+        bool has_null = col_had_null[c] || col_wrote_null[c];
         if (has_null)
             vec->attrs |= RAY_ATTR_HAS_NULLS;
         else
