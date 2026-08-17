@@ -379,6 +379,7 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 /* Op flags */
 #define OP_FLAG_PUSHED       0x01  /* filter interposed below a GROUP by predicate pushdown */
 #define OP_FLAG_DEAD         0x02
+#define OP_FLAG_INVALID_SCAN 0x04  /* query compiler emitted an unknown column */
 
 /* Sentinel node id for "no input".  Node id 0 is a valid node (the first
  * one allocated), so zero cannot mean "none" — use the max value.  All
@@ -390,7 +391,7 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 typedef struct ray_op {
     uint16_t       opcode;     /* OP_ADD, OP_SCAN, OP_FILTER, etc. */
     uint8_t        arity;      /* 0, 1, or 2 */
-    uint8_t        flags;      /* PUSHED, DEAD */
+    uint8_t        flags;      /* PUSHED, DEAD, INVALID_SCAN */
     int8_t         out_type;   /* inferred output type */
     uint8_t        pad[3];
     uint32_t       id;         /* unique node ID (== index into g->nodes) */

@@ -79,8 +79,8 @@ static const char* null_literal_str(int8_t type) {
         case RAY_DATE:      return "0Nd";
         case RAY_TIME:      return "0Nt";
         case RAY_TIMESTAMP: return "0Np";
-        /* SYM has no null literal: empty symbol is a value, never reaches
-         * here — callers gate on RAY_ATOM_IS_NULL, always false for SYM. */
+        /* SYM/STR use their empty literal as the canonical null spelling;
+         * callers keep them on their ordinary formatting paths. */
         default:            return "null";
     }
 }
@@ -100,10 +100,9 @@ void ray_lang_print(FILE* fp, ray_t* val) {
         return;
     }
     if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
-    /* STR has no distinct null — empty and null strings are the same
-     * value and print as empty content (handled by the -RAY_STR case),
-     * not a null literal. */
-    if (val->type != -RAY_STR && RAY_ATOM_IS_NULL(val)) {
+    /* STR/SYM use their empty literals as canonical null spellings. */
+    if (val->type != -RAY_STR && val->type != -RAY_SYM &&
+        RAY_ATOM_IS_NULL(val)) {
         fprintf(fp, "%s", null_literal_str(val->type));
         return;
     }
@@ -198,7 +197,8 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
             int tlen = 0;
             if (!a || RAY_IS_ERR(a)) {
                 tlen = snprintf(tmp, sizeof(tmp), "error");
-            } else if (a->type != -RAY_STR && RAY_ATOM_IS_NULL(a)) {
+            } else if (a->type != -RAY_STR && a->type != -RAY_SYM &&
+                       RAY_ATOM_IS_NULL(a)) {
                 tlen = snprintf(tmp, sizeof(tmp), "%s", null_literal_str(a->type));
             } else if (a->type == -RAY_I64) {
                 tlen = snprintf(tmp, sizeof(tmp), "%ld", (long)a->i64);
@@ -1202,6 +1202,14 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
                 if (d[i] == NULL_I64) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
             return;
         }
+        case RAY_SYM:
+            for (int64_t i = 0; i < n; i++) {
+                if (ray_read_sym(out, i, RAY_SYM, vec->attrs) == 0) {
+                    vec->attrs |= RAY_ATTR_HAS_NULLS;
+                    return;
+                }
+            }
+            return;
         default: return;
     }
 }

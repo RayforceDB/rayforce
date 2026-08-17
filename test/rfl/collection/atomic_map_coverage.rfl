@@ -91,9 +91,9 @@
 (== syms null) -- false
 (!= syms null) -- true
 
-;; sym vec vs the empty-symbol atom ('): ' is a VALUE (sym id 0), not a null.
+;; sym vec vs the canonical empty/null atom ('), represented by sym id 0.
 ;; None of {a,b,c} equals the empty symbol → == all-false, != all-true.
-;; The per-width compare loop runs (no null short-circuit; SYM has no null).
+;; The per-width raw-id compare loop handles canonical null directly.
 (sum (== syms ')) -- 0
 (sum (!= syms ')) -- 5
 

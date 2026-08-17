@@ -203,7 +203,7 @@ linked_sd.name                  -- (list 'carol 'alice 'bob 'alice)
 (set linked_sdn (.col.link 'dim_sd rids_sdn))
 (set res_sdn linked_sdn.name)
 (.col.link? linked_sdn)         -- true
-(nil? (at res_sdn 1))           -- false
+(nil? (at res_sdn 1))           -- true
 (at res_sdn 0)                  -- 'carol
 (at res_sdn 2)                  -- 'bob
 

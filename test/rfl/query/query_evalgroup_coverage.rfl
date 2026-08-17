@@ -275,25 +275,25 @@
 ;;
 ;; ' has sym id=0 → sym_w = RAY_SYM_W8 (id ≤ 0xFF)
 ;;   → line 3081: memset(dst, 0, n) for W8
-;; RAY_ATOM_IS_NULL(') → case RAY_SYM → false (SYM has no null; ' is a value)
-;;   → no HAS_NULLS set; the broadcast cells are the empty symbol ', not null
+;; RAY_ATOM_IS_NULL(') → case RAY_SYM → true (canonical null, id 0)
+;;   → HAS_NULLS is set on the broadcast vector
 ;; ────────────────────────────────────────────────────────────────────
 (set Tbcast_null (table [k v] (list ['X 'Y 'Z] [10 20 30])))
-;; extra: ' (empty SYM ', id=0) → W8 memset, broadcast as a value (no null)
+;; extra: ' (empty/null SYM, id=0) → W8 memset plus HAS_NULLS
 ;; can_atom_broadcast(')=1 → atom_broadcast_vec(', 3)
-;; After broadcast: all 3 cells are the empty symbol ' (sym-id=0), not null
+;; After broadcast: all 3 cells are canonical empty/null SYM values
 (count (select {s: (sum v) extra: ' by: k from: Tbcast_null})) -- 3
-(nil? (at (at (select {s: (sum v) extra: ' by: k from: Tbcast_null}) 'extra) 0)) -- false
+(nil? (at (at (select {s: (sum v) extra: ' by: k from: Tbcast_null}) 'extra) 0)) -- true
 ;; Order-independent: mask to one SYM key. X→v=[10]→sum=10, extra is empty '.
 (set Gbn_X (select {s: (sum v) extra: ' by: k from: Tbcast_null where: (== k 'X)}))
 (count Gbn_X)            -- 1
 (at (at Gbn_X 'k) 0)     -- 'X
 (at (at Gbn_X 's) 0)     -- 10
-(nil? (at (at Gbn_X 'extra) 0)) -- false
+(nil? (at (at Gbn_X 'extra) 0)) -- true
 (set Gbn_Z (select {s: (sum v) extra: ' by: k from: Tbcast_null where: (== k 'Z)}))
 (at (at Gbn_Z 'k) 0)     -- 'Z
 (at (at Gbn_Z 's) 0)     -- 30
-(nil? (at (at Gbn_Z 'extra) 0)) -- false
+(nil? (at (at Gbn_Z 'extra) 0)) -- true
 ;; Order-independent multiset of all 3 group sums: {10,20,30}
 (asc (at (select {s: (sum v) extra: ' by: k from: Tbcast_null}) 's)) -- [10 20 30]
 
@@ -397,7 +397,7 @@
 (at (at (at Gsn_a 'n) 0) 0)        -- "x"
 (set Gsn_b (select {n: name by: k from: Tstr_null_grp where: (== k "b")}))
 (at (at Gsn_b 'k) 0)     -- "b"
-(nil? (at (at (at Gsn_b 'n) 0) 0)) -- false
+(nil? (at (at (at Gsn_b 'n) 0) 0)) -- true
 
 ;; NOTE: aggr_unary_per_group_buf (lines 2256-2337) is unreachable from RFL:
 ;; It requires n_aggs >= 16 for a streaming-aggr-unary to overflow into

@@ -480,10 +480,7 @@ static test_result_t test_csv_null_bool(void) {
 
 static test_result_t test_csv_null_sym(void) {
     /* CSV format conflates "empty field" and "missing field" — both
-     * appear as a zero-length cell.  The Rayforce loader interns empty
-     * SYM cells as the empty SYM (not the null sentinel) so SQL-style
-     * `(!= col "")` filters work the way users expect.  RAY_STR columns
-     * and non-string types preserve the null distinction. */
+     * appear as a zero-length cell.  Empty SYM is the canonical null. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -496,7 +493,7 @@ static test_result_t test_csv_null_sym(void) {
 
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(col, 1));  /* empty → empty SYM, not null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));   /* empty → canonical SYM null */
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
 
     /* Row 1's SYM ID resolves to a zero-length string — the empty SYM.
@@ -563,10 +560,9 @@ static test_result_t test_csv_null_mixed_columns(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(val_col, 1));
     TEST_ASSERT_TRUE(ray_vec_is_null(val_col, 2));
 
-    /* name column: alice, "", bob — empty SYM cell becomes the empty
-     * SYM (not null).  See test_csv_null_sym for the rationale. */
+    /* name column: alice, canonical empty/null SYM, bob. */
     TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(name_col, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 2));
 
     ray_release(loaded);
@@ -608,9 +604,8 @@ static test_result_t test_csv_explicit_str_schema(void) {
     s = ray_str_vec_get(note, 1, &l);
     TEST_ASSERT_EQ_I((int)l, 35);
     TEST_ASSERT_MEM_EQ(35, s, "this-is-a-long-string-over-12-bytes");
-    /* A blank CSV field for a STR column is the empty string "" (a value),
-     * not a null — consistent with SYM and the STR no-null model. */
-    TEST_ASSERT_FALSE(ray_vec_is_null(note, 2));
+    /* A blank CSV field is the canonical empty/null STR. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(note, 2));
     s = ray_str_vec_get(note, 2, &l);
     TEST_ASSERT_EQ_I((int)l, 0);
     s = ray_str_vec_get(note, 3, &l);

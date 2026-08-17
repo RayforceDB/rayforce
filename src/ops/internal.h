@@ -1596,9 +1596,9 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op);
  * with different idx, so each per-slot store is uncontended.  attrs OR
  * is atomic so the read-modify-write on the shared attrs byte is safe.
  *
- * BOOL/U8/SYM are non-nullable (rejected at the producer surface) and
- * are no-ops here.  STR/GUID don't appear in parallel aggregation/window
- * output columns and likewise no-op. */
+ * BOOL/U8 are non-nullable (rejected at the producer surface).  SYM/STR/GUID
+ * don't appear in parallel aggregation/window output columns and are no-ops
+ * here. */
 static inline void par_set_null(ray_t* vec, int64_t idx) {
     void* p = ray_data(vec);
     switch (vec->type) {

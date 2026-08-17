@@ -667,13 +667,13 @@ static test_result_t test_str_t_cmp_order(void) {
 static test_result_t test_str_vec_null(void) {
     ray_t* v = ray_vec_new(RAY_STR, 4);
     v = ray_str_vec_append(v, "hello", 5);
-    v = ray_str_vec_append(v, "", 0);  /* empty, not null */
+    v = ray_str_vec_append(v, "", 0);  /* canonical empty/null */
     v = ray_str_vec_append(v, "world", 5);
     TEST_ASSERT_EQ_I(ray_len(v), 3);
 
-    /* STR has no null: set_null writes "" — the cell is never null */
+    /* STR null is represented by the empty string. */
     ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
 
@@ -697,7 +697,7 @@ static test_result_t test_str_vec_null_pooled(void) {
 
     /* Set null on row 1 — must not corrupt str_pool */
     ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
 
@@ -1739,10 +1739,10 @@ static test_result_t test_str_vec_concat_nulls(void) {
 
     /* a's nulls preserved */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(c, 1));   /* a[1] was null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(c, 1));    /* a[1] was null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 2));
     /* b's nulls preserved at offset a->len */
-    TEST_ASSERT_FALSE(ray_vec_is_null(c, 3));    /* b[0] was null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(c, 3));     /* b[0] was null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 4));
 
     ray_release(c);
@@ -1768,7 +1768,7 @@ static test_result_t test_str_vec_slice_null(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
 
     /* Slice index 0 = parent index 1 = null */
-    TEST_ASSERT_FALSE(ray_vec_is_null(s, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(s, 0));
     /* Slice index 1 = parent index 2 = not null */
     TEST_ASSERT_FALSE(ray_vec_is_null(s, 1));
 
@@ -1853,7 +1853,7 @@ static test_result_t test_str_vec_from_parts(void) {
     p = ray_str_vec_get(v, 1, &l); TEST_ASSERT_EQ_U(l, 3); TEST_ASSERT_EQ_I(memcmp(p,"abc",3), 0);
     p = ray_str_vec_get(v, 2, &l); TEST_ASSERT_EQ_U(l, 27); TEST_ASSERT_EQ_I(memcmp(p,"this_is_long_enough_to_pool",27), 0);
     p = ray_str_vec_get(v, 3, &l); TEST_ASSERT_EQ_U(l, 1); TEST_ASSERT_EQ_I(p[0],'x');
-    /* Missing STR input collapses to the ordinary empty string. */
+    /* Missing STR input uses the canonical empty/null string. */
     p = ray_str_vec_get(v, 4, &l); TEST_ASSERT_EQ_U(l, 0); (void)p;
     ray_release(v);
     ray_heap_destroy();

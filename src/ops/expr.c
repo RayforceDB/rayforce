@@ -2441,6 +2441,22 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (!result || RAY_IS_ERR(result)) return result;
     result->len = len;
 
+    /* ISNULL is defined for every vector type, including the canonical
+     * empty/null STR and width-adaptive SYM representations.  Handle it
+     * before numeric opcode dispatch so unsupported input types cannot leave
+     * the BOOL result buffer unwritten. */
+    if (op->opcode == OP_ISNULL) {
+        uint8_t* dst = (uint8_t*)ray_data(result);
+        if (input->type != RAY_STR && input->type != RAY_SYM &&
+            !vec_may_have_nulls(input)) {
+            memset(dst, 0, (size_t)len);
+        } else {
+            for (int64_t i = 0; i < len; i++)
+                dst[i] = ray_vec_is_null(input, i) ? 1 : 0;
+        }
+        return result;
+    }
+
     /* Hoist in_type, out_type, and opcode dispatch entirely outside the
      * morsel loop so each inner loop is a tight, single-type kernel.
      * This allows autovectorisation and eliminates per-element branch predict slots. */

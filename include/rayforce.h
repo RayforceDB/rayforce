@@ -473,14 +473,14 @@ ray_t* ray_typed_null(int8_t type);
  *   F32/F64           NaN                       NaN
  *   GUID              16 all-zero bytes         16 all-zero bytes
  *   BOOL/U8           ray_typed_null aux bit    non-nullable
- *   SYM/STR           no distinct null          non-nullable
+ *   SYM/STR           canonical empty value     canonical empty value
  *
- * Empty SYM/STR values are ordinary values.  A requested typed or input null
- * for either type collapses to the ordinary empty value; its public null
- * predicate remains false and a vector does not acquire HAS_NULLS.  Callers
- * compare sentinel-backed payloads directly (for example `x == NULL_I64` or
- * `x != x` for NaN).  Temporal types reuse NULL_I32 or NULL_I64 according to
- * storage width. */
+ * Empty SYM/STR values are their canonical in-band nulls.  A requested typed
+ * or input null for either type collapses to that empty representation; the
+ * public null predicate recognizes it and vectors containing it acquire
+ * HAS_NULLS.  Callers compare sentinel-backed payloads directly (for example
+ * `x == NULL_I64` or `x != x` for NaN).  Temporal types reuse NULL_I32 or
+ * NULL_I64 according to storage width. */
 #define NULL_I16  ((int16_t)INT16_MIN)
 #define NULL_I32  ((int32_t)INT32_MIN)
 #define NULL_I64  ((int64_t)INT64_MIN)
@@ -489,8 +489,8 @@ ray_t* ray_typed_null(int8_t type);
 
 /* Atom null check.  RAY_NULL_OBJ is the untyped null singleton.
  * Sentinel-backed atoms use payload comparison.  BOOL/U8 typed-null atoms
- * use the aux[0]&1 bit written by ray_typed_null.  SYM/STR always return
- * false because their empty payloads are ordinary values. */
+ * use the aux[0]&1 bit written by ray_typed_null.  SYM/STR use their
+ * canonical in-band empty values (sym 0 / "") as null. */
 static inline bool ray_atom_is_null_fn(const union ray_t* x) {
     if (RAY_IS_NULL(x)) return true;
     if (x->type >= 0) return false;
@@ -508,14 +508,11 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
         case RAY_TIME:      return x->i32 == NULL_I32;
         case RAY_I16:       return x->i16 == NULL_I16;
         case RAY_SYM:
-            /* SYM has no null — sym 0 is the empty symbol ' (a value), mirroring
-             * STR's empty "" below.  A SYM atom is never null. */
-            return false;
+            return x->i64 == 0;
         case RAY_STR:
-            /* STR has no null distinct from "" (char lists have no null, only
-             * symbols do).  A STR atom is never null — the empty
-             * string is a value. */
-            return false;
+            /* Empty SSO is the only STR atom whose value union is all zero;
+             * non-empty SSO and long-string pointers are both non-NULL. */
+            return x->obj == NULL;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes in obj's U8 buffer.
              * obj is always populated by ray_guid / ray_typed_null —

@@ -508,7 +508,7 @@
 ;; WHERE k>0: k=[1,2,3] all>0, so all rows are masked.
 ;; Row 0: src_vec=expr_vec, expr_vec[0]=null SYM → line 8707 fires!
 (count (update {sym: sym from: Tsymwhn where: (> k 0)})) -- 3
-(nil? (at (at (update {sym: sym from: Tsymwhn where: (> k 0)}) 'sym) 0)) -- false
+(nil? (at (at (update {sym: sym from: Tsymwhn where: (> k 0)}) 'sym) 0)) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; WHERE-update STR column with null in expr_vec (line 8698)
@@ -524,7 +524,7 @@
 (set strnv (as 'STR (list "x" 0Ni "z")))
 ;; WHERE k>0 masks rows 1,2; strnv[1]=null → line 8698 fires for row 1
 (count (update {name: strnv from: Tupd_str3 where: (> k 0)})) -- 3
-(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- false
+(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; insert into table with null STR column (lines 9333-9335)
@@ -536,7 +536,7 @@
 ;; Insert new row (k=4, name="d"): copies existing rows including null
 ;; → line 9333 fires for row 1 (null STR element)
 (count (insert Tstr_null_ins (list 4 "d"))) -- 4
-(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- false
+(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; insert into table with null SYM column (line 9349)
@@ -549,7 +549,7 @@
 ;; Insert new row: copies existing rows; row 0 has null SYM
 ;; → line 9349 fires when copying row 0 (null SYM)
 (count (insert Tsym_n_ins (list 3 'c))) -- 3
-(nil? (at (at (insert Tsym_n_ins (list 3 'c)) 'sym) 0)) -- false
+(nil? (at (at (insert Tsym_n_ins (list 3 'c)) 'sym) 0)) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; BUG: WHERE-branch update with a null I32 atom (`0Ni`) corrupts the

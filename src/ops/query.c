@@ -1113,9 +1113,17 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
         }
-        /* Unknown name — let ray_scan produce a column-not-found
-         * error at exec time, matching prior behavior. */
-        return ray_scan(g, ray_str_ptr(s));
+        /* Unknown name — retain an explicit invalid-scan marker.  Optimizer
+         * shortcuts may make the scan dead (count/max/projection paths), but
+         * execution must still reject the original column reference. */
+        ray_op_t* missing = ray_scan(g, ray_str_ptr(s));
+        int64_t dist_sym = ray_sym_find("_dist", 5);
+        if (missing && expr->i64 != dist_sym) {
+            missing->flags |= OP_FLAG_INVALID_SCAN;
+            ray_op_ext_t* ext = find_ext(g, missing->id);
+            if (ext) ext->base.flags |= OP_FLAG_INVALID_SCAN;
+        }
+        return missing;
     }
 
     /* Symbol literal (ATTR_QUOTED set; name refs handled above).  Inside a
@@ -11675,8 +11683,16 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     char* src = (char*)ray_data(full_col);
                     char* dst = (char*)ray_data(sub_col);
                     int64_t* idxs = (int64_t*)ray_data(idx_vec);
-                    for (int64_t r = 0; r < gsize; r++)
+                    bool copied_null = false;
+                    for (int64_t r = 0; r < gsize; r++) {
                         memcpy(dst + r * esz, src + idxs[r] * esz, esz);
+                        copied_null |= ray_vec_is_null(full_col, idxs[r]);
+                    }
+                    /* Raw payload gathers do not carry vector metadata.  The
+                     * aggregate kernels use HAS_NULLS as their fast-path gate,
+                     * so preserve it when any gathered row is null. */
+                    if (copied_null)
+                        sub_col->attrs |= RAY_ATTR_HAS_NULLS;
                     sub_tbl = ray_table_add_col(sub_tbl, cn, sub_col);
                     ray_release(sub_col);
                     if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }

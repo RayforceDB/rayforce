@@ -166,14 +166,11 @@
 (at (at rk2s 's) 66) -- 2
 (at (at rk2s 'p) 99) -- 3.0
 (at (at rk2s 's) 99) -- 2
-;; The original test here ran a SYM null-rank-collapse regression
-;; using [' ' aa] over 99 rows.  SYM columns are now no-null by
-;; design (sym 0 = empty string is the canonical "missing" value),
-;; so the null-collapse case it covered no longer exists.  Other
-;; non-SYM null tests above and below still exercise the rank
-;; fallback paths; this block is intentionally removed rather than
-;; rewritten because the empty-sym variant would just be a
-;; same-value-many-rows sort, which the rk2 block already covers.
+;; The original test here ran a SYM rank-collapse regression using
+;; [' ' aa] over 99 rows. Canonical SYM null is now id 0 and remains a
+;; distinct/groupable key, so the old rank-collapse case no longer applies.
+;; Other null tests above and below exercise the fallback paths; this block
+;; remains omitted because the empty-sym variant duplicates rk2.
 ;; RAY_STR multi-key. 100 rows, three distinct strings, three
 ;; distinct prices.  Pre-fix, has_wide_key didn't exist and RAY_STR
 ;; wasn't in can_radix, so this would fall into merge sort; now it

@@ -745,9 +745,8 @@ static test_result_t test_fmt_null_date(void) {
 }
 
 static test_result_t test_fmt_null_str(void) {
-    /* A STR atom has no distinct null: ray_typed_null collapses to the
-     * ordinary empty string and renders as "" — never 0Nc (which the parser
-     * cannot even read back). */
+    /* STR's canonical null is the empty string and renders as "" — never
+     * 0Nc, which the parser cannot even read back. */
     ray_t* result = ray_fmt(ray_typed_null(-RAY_STR), 1);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
@@ -779,8 +778,8 @@ static test_result_t test_fmt_null_guid(void) {
 }
 
 static test_result_t test_fmt_null_sym(void) {
-    /* SYM has no null: ray_typed_null(-RAY_SYM) is sym 0 (the empty
-     * symbol), which renders as the bare quote literal '. */
+    /* SYM's canonical null is sym 0 (the empty symbol), which renders as
+     * the bare quote literal '. */
     ray_t* result = ray_fmt(ray_typed_null(-RAY_SYM), 1);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
@@ -943,8 +942,8 @@ static test_result_t test_fmt_vec_str(void) {
 }
 
 static test_result_t test_fmt_vec_str_null(void) {
-    /* A requested null in a STR vector collapses to the ordinary empty
-     * string, so it renders as "" and its null predicate remains false. */
+    /* A requested null in a STR vector uses the canonical empty string, so
+     * it renders as "" while its null predicate remains true. */
     ray_t* vec = ray_vec_new(RAY_STR, 2);
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));

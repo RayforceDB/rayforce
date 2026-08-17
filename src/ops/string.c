@@ -921,13 +921,24 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
     if (input->type == RAY_STR) {
         const ray_str_t* elems; const char* pool;
         str_resolve(input, &elems, &pool);
-        for (int64_t i = 0; i < len; i++)
-            dst[i] = (int64_t)elems[i].len;
+        for (int64_t i = 0; i < len; i++) {
+            if (ray_vec_is_null(input, i)) {
+                dst[i] = NULL_I64;
+                result->attrs |= RAY_ATTR_HAS_NULLS;
+            } else {
+                dst[i] = (int64_t)elems[i].len;
+            }
+        }
     } else {
         for (int64_t i = 0; i < len; i++) {
-            const char* sp; size_t sl;
-            sym_elem(input, i, &sp, &sl);
-            dst[i] = (int64_t)sl;
+            if (ray_vec_is_null(input, i)) {
+                dst[i] = NULL_I64;
+                result->attrs |= RAY_ATTR_HAS_NULLS;
+            } else {
+                const char* sp; size_t sl;
+                sym_elem(input, i, &sp, &sl);
+                dst[i] = (int64_t)sl;
+            }
         }
     }
     ray_release(input);

@@ -680,7 +680,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
      * Null rows emit 0 regardless of negate (isn masks after the OR).
      * Bit-identical to the generic loops below; additive, chosen once. */
     /* SYM verdict-LUT fast path: one byte load per row, no set scan.
-     * SYM has no null, so there is no per-element null branch either. */
+     * Canonical null is raw id 0 and is handled by the same LUT lookup. */
     if (!c->col_is_atom && c->symlut && ct == RAY_SYM) {
         const uint8_t* lut = c->symlut;
         uint8_t neg = (uint8_t)negate;
@@ -3723,6 +3723,30 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
 
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
 
+/* Validate compiler-marked missing scans before execution.  Optimizer rewrites
+ * may replace a root or eliminate such a scan from the live DAG (for example
+ * count/missing-column), but that must not turn an invalid reference into a
+ * result.  Do not revalidate every OP_SCAN against g->table here: graph APIs
+ * legitimately scan derived columns produced by upstream operators. */
+static ray_t* validate_scan_columns(ray_graph_t* g) {
+    if (!g) return ray_error("nyi", NULL);
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if (op->opcode != OP_SCAN ||
+            !(op->flags & OP_FLAG_INVALID_SCAN)) continue;
+
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext) return ray_error("schema", "scan metadata missing");
+        ray_t* name = ray_sym_str(ext->sym);
+        if (name)
+            return ray_error("schema", "column '%.*s' not found",
+                             (int)ray_str_len(name), ray_str_ptr(name));
+        return ray_error("schema", "column not found");
+    }
+    return NULL;
+}
+
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* The qstats capture mode is armed once per query at the eval boundary
      * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
@@ -3735,6 +3759,8 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* Progress ends at the eval boundary (the true query end), not here —
      * a query can drive several ray_execute calls, and ending after each
      * would reset the elapsed clock and fire premature "final" ticks. */
+    ray_t* scan_err = validate_scan_columns(g);
+    if (scan_err) return scan_err;
     return ray_execute_inner(g, root);
 }
 

@@ -254,9 +254,8 @@ static void fmt_sym_atom(fmt_buf_t* b, ray_t* s) {
     if (s && !RAY_IS_ERR(s) && ray_str_len(s) > 0) {
         fmt_putn(b, ray_str_ptr(s), (int32_t)ray_str_len(s));
     } else {
-        /* sym 0 (the empty symbol, resolves to "") and any unresolvable
-         * id render as the bare quote literal `'` — the canonical spelling
-         * of the empty symbol.  SYM has no null, so there is no `0Ns`. */
+        /* sym 0 (the canonical empty/null symbol) and any unresolvable id
+         * render as the bare quote literal `'`; there is no separate `0Ns`. */
         fmt_putc(b, '\'');
     }
 }
@@ -352,10 +351,8 @@ static const char* null_literal(int8_t type) {
     case RAY_DATE:      return "0Nd";
     case RAY_TIME:      return "0Nt";
     case RAY_TIMESTAMP: return "0Np";
-    /* SYM has no null literal: the empty symbol is a value (renders as ')
-     * and never reaches this table — callers gate on null, false for SYM.
-     * RAY_STR likewise has no null literal: empty and null strings both
-     * render as "" (handled directly by the STR paths, never via this table). */
+    /* SYM/STR have no separate null literal: their canonical empty/null values
+     * render as ' / "" on their ordinary formatting paths. */
     case RAY_GUID:      return "0Ng";
     default:            return "null";
     }
@@ -1031,11 +1028,9 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
 
     int8_t type = obj->type;
     if (type < 0) {
-        /* Typed null atom: null bit set → display as 0Nx.  STR is the
-         * exception — it has no distinct null (empty and null are the
-         * same value), so it always falls through to fmt_str_atom and
-         * renders as "", never 0Nc (which the parser cannot read back). */
-        if (-type != RAY_STR && RAY_ATOM_IS_NULL(obj)) {
+        /* STR/SYM use their empty literals as canonical null spellings, so
+         * retain those parseable representations instead of inventing 0Nc/0Ns. */
+        if (-type != RAY_STR && -type != RAY_SYM && RAY_ATOM_IS_NULL(obj)) {
             fmt_puts(b, null_literal(-type));
             return;
         }

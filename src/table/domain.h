@@ -47,8 +47,8 @@
  *              ray_sym_domain_str a lock-free array read.
  *
  * Position-0 reservation: position 0 of every non-empty FILE domain is
- * the ordinary empty symbol "" (mirrors global id 0).  SYM has no distinct
- * null; group kernels treat id 0 as an ordinary value.  ray_sym_domain_open
+ * the canonical empty/null symbol "" (mirrors global id 0).  Group kernels
+ * retain id 0 as a groupable null key.  ray_sym_domain_open
  * VALIDATES this and refuses (NULL) files that violate it; intern on an
  * empty domain seeds "" at position 0 before the first real symbol, so
  * newly created symfiles always carry it.  Empty vocabularies are fine.

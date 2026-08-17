@@ -5,8 +5,8 @@
 (nil? 0Nl) -- true
 (nil? 0) -- false
 (nil? 1) -- false
-;; STR has no distinct null; "" is the ordinary empty value.
-(nil? "") -- false
+;; Empty STR is the canonical in-band null.
+(nil? "") -- true
 ;; nil? distinguishes typed nulls from zero-valued atoms across types
 (nil? 0Ni)   -- true
 (nil? 0Nf)   -- true

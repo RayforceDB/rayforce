@@ -636,9 +636,9 @@ done:
 }
 
 /* (c) join cardinality: count of the language's inner-join live x hist on
- * ticker vs the shadow's sum over distinct live tickers of
- * live_count(k) * hist_count(k) — including the "" null key, which the
- * join matches like any other (probed).  Sides are projected to disjoint
+ * ticker vs the shadow's sum over distinct non-null live tickers of
+ * live_count(k) * hist_count(k).  Canonical empty/null keys do not join.
+ * Sides are projected to disjoint
  * non-key column names first (live/hist share price+qty names). */
 static bool verify_join_cardinality(stress_ctx_t* c, const char* live_dir) {
     if (c->nparts == 0) {
@@ -648,6 +648,7 @@ static bool verify_join_cardinality(stress_ctx_t* c, const char* live_dir) {
     int64_t expect = 0;
     for (int64_t i = 0; i < c->live.len; i++) {
         const char* k = c->live.rows[i].ticker;
+        if (k[0] == '\0') continue;
         bool seen = false;
         for (int64_t j = 0; j < i && !seen; j++)
             seen = strcmp(k, c->live.rows[j].ticker) == 0;

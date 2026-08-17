@@ -1265,8 +1265,7 @@ static bool csv_intern_strings(csv_strref_t** str_refs, int n_cols,
             if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
                 return false;
             if (refs[r].ptr == NULL) {
-                /* Empty/missing field → sym 0 (the canonical empty
-                 * symbol).  SYM columns are no-null by design. */
+                /* Empty/missing field → canonical sym-0 null. */
                 ids[r] = (uint32_t)empty_sym_id;
                 continue;
             }
@@ -2743,17 +2742,20 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
     scratch_free(row_done_hdr);
 
-    /* ---- 9c. Set HAS_NULLS for columns that saw a null ----
+    /* ---- 9c. Set HAS_NULLS for columns that saw a canonical null ----
      *
      * Sentinels in the payload carry the null state; HAS_NULLS is the
-     * vec-level fast-path bit.  SYM columns are no-null by design —
-     * empty fields were already remapped to sym 0 in step 9b. */
+     * vec-level fast-path bit.  SYM/STR use sym 0 / empty descriptors as
+     * canonical nulls, including explicitly quoted empty CSV fields. */
     for (int c = 0; c < ncols; c++) {
         ray_t* vec = col_vecs[c];
-        /* SYM and STR both represent a blank cell as the empty string ("" /
-         * sym 0) — there is no null distinct from empty, so neither type
-         * carries HAS_NULLS (a per-row null check on them is pure waste). */
-        if (col_had_null[c] && vec->type != RAY_SYM && vec->type != RAY_STR)
+        bool has_null = col_had_null[c] != 0;
+        if (!has_null && (vec->type == RAY_SYM || vec->type == RAY_STR)) {
+            for (int64_t r = 0; r < n_rows; r++) {
+                if (ray_vec_is_null(vec, r)) { has_null = true; break; }
+            }
+        }
+        if (has_null)
             vec->attrs |= RAY_ATTR_HAS_NULLS;
         else
             vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;

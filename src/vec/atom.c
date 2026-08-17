@@ -183,7 +183,7 @@ ray_t* ray_typed_null(int8_t type) {
      * can deref obj without a NULL check.  Other types use the payload
      * union — the sentinel write below is the source of truth.  The
      * aux[0] bit represents typed null only for BOOL/U8; F32 uses NaN.
-     * SYM/STR typed-null requests collapse to ordinary empty values. */
+     * SYM/STR typed-null requests use their canonical empty values. */
     if (type == -RAY_GUID) {
         static const uint8_t NULL_GUID_BYTES[16] = {0};
         ray_t* v = ray_guid(NULL_GUID_BYTES);
@@ -201,8 +201,7 @@ ray_t* ray_typed_null(int8_t type) {
         case -RAY_I32: case -RAY_DATE: case -RAY_TIME: v->i32 = NULL_I32; break;
         case -RAY_I16:                                 v->i16 = NULL_I16; break;
         case -RAY_SYM:
-            /* SYM has no null — a SYM "typed null" is just the empty symbol '
-             * (sym 0), a value, mirroring STR.  No aux[0] null bit. */
+            /* SYM's canonical null is the empty symbol ' (sym 0). */
             v->i64 = 0;
             return v;
         default:                                       v->i64 = 0; break;
