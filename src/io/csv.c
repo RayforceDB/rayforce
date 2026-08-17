@@ -43,10 +43,9 @@
 #include "core/numparse.h"
 #include "core/pool.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
-#include "core/qstats.h"     /* suppress progress for internal finalize tasks */
 #include "lang/format.h"
 #include "ops/hash.h"
-#include "ops/idxop.h"      /* attach per-chunk zone index after load */
+#include "ops/idxop.h"      /* ray_index_payload — shared hash-upgrade policy */
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"
@@ -76,6 +75,29 @@
 #define CSV_SAMPLE_ROWS   4096
 #define CSV_STR_DISTINCT_MIN 256
 #define CSV_PART_ROWS_DEFAULT 1000000
+
+/* --------------------------------------------------------------------------
+ * Whole-load progress axis.
+ *
+ * A CSV load is four phases that each traverse the file once, so no single
+ * counter (rows, morsels, dispatched elements) describes the load as a whole
+ * and every per-dispatch bar restarts at zero.  The honest shared metric is
+ * BYTES OF INPUT, and each phase owns a fixed slice of that axis, weighted by
+ * its measured cost.  Measured on an 8.1 GB / 10M-row / 105-column load with
+ * the parallel scan, per-column finalize and no load-time index attach:
+ * row-offset scan 4.34 s, parse 6.68 s, finalize (str fill + sym intern)
+ * 4.60 s, tail (sym max/narrow, table build) 0.58 s of 16.2 s.  Rounded to
+ * 27 / 41 / 32, the tail riding in the finalize slice.  The mix shifts with
+ * column types and core count, so these are pacing estimates — nothing
+ * depends on them for correctness.
+ * -------------------------------------------------------------------------- */
+#define CSV_PROG_PCT_SCAN   27
+#define CSV_PROG_PCT_PARSE  41
+
+/* Byte position of `pct` percent along a file-sized axis. */
+static inline uint64_t csv_prog_at(size_t file_size, unsigned pct) {
+    return (uint64_t)((double)file_size * (double)pct / 100.0);
+}
 
 /* --------------------------------------------------------------------------
  * mmap flags
@@ -688,9 +710,274 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
  * Allocates offsets via scratch_alloc. Caller frees with scratch_free.
  * -------------------------------------------------------------------------- */
 
-static int64_t build_row_offsets(const char* buf, size_t buf_size,
-                                  size_t data_offset,
-                                  int64_t** offsets_out, ray_t** hdr_out) {
+/* --------------------------------------------------------------------------
+ * Parallel row-offset scan.
+ *
+ * The serial scan below is a pure state machine over the byte stream, and its
+ * only cross-position state is the QUOTE PARITY (an odd number of '"' seen so
+ * far means "inside a quoted field", where newlines are data).  Parity is an
+ * XOR-scan, so it can be reconciled: count the quotes in every chunk first,
+ * prefix-XOR the counts, and each chunk then starts its scan with exactly the
+ * parity the serial scanner would have had there.  Escaped quotes need no
+ * special case — a doubled "" flips parity twice, which is what the serial
+ * loop does too.
+ *
+ * The one place a decision spans a chunk boundary is a "\r\n" pair split down
+ * the middle: the left chunk consumes both bytes and records the row start
+ * after them, so the right chunk must not treat the orphan '\n' as a fresh
+ * terminator.  Boundaries are nudged one byte right in that case
+ * (csv_scan_split_at) so the pair always lands whole in the left chunk.  The
+ * quote-free fast path has the mirror case ("\n\r"), handled the same way.
+ *
+ * Sizing: the counting pass also counts line-terminator bytes, which is an
+ * exact upper bound on the rows a chunk can emit.  Each chunk therefore writes
+ * straight into a reserved slice of one array (no per-worker allocation, no
+ * locks) and a final compaction closes the gaps.
+ * -------------------------------------------------------------------------- */
+
+/* Minimum bytes before the parallel scan is worth its two passes. */
+#define CSV_SCAN_PAR_MIN_BYTES  (4u << 20)
+/* Minimum bytes per chunk — below this the per-task overhead dominates. */
+#define CSV_SCAN_CHUNK_MIN      (256u << 10)
+#define CSV_SCAN_MAX_CHUNKS     4096
+
+typedef struct {
+    const char*  buf;
+    size_t       file_size;
+    const size_t* bound;         /* [n_chunks+1] chunk start byte offsets   */
+    uint64_t*    quote_cnt;      /* [n_chunks] '"' per chunk (pass 1 out)   */
+    uint64_t*    term_cnt;       /* [n_chunks] '\n'+'\r' per chunk (pass 1) */
+    const uint8_t* start_quoted; /* [n_chunks] parity at chunk start        */
+    const int64_t* slot;         /* [n_chunks] write base into offs         */
+    int64_t*     n_out;          /* [n_chunks] rows written (pass 2 out)    */
+    int64_t*     offs;           /* row-offset array being filled           */
+    bool         has_quotes;     /* pick the fast/slow state machine        */
+} csv_scan_ctx_t;
+
+static void csv_scan_count_fn(void* arg, uint32_t worker_id,
+                              int64_t start, int64_t end_i) {
+    (void)worker_id;
+    csv_scan_ctx_t* ctx = (csv_scan_ctx_t*)arg;
+    for (int64_t i = start; i < end_i; i++) {
+        const char* p = ctx->buf + ctx->bound[i];
+        const char* e = ctx->buf + ctx->bound[i + 1];
+        uint64_t q = 0, t = 0;
+        while (p < e) {
+            const char* stop = p + (1 << 20);
+            if (stop > e) stop = e;
+            for (; p < stop; p++) {
+                char c = *p;
+                q += (c == '"');
+                t += (c == '\n' || c == '\r');
+            }
+            if (RAY_UNLIKELY(ray_interrupted())) break;
+        }
+        ctx->quote_cnt[i] = q;
+        ctx->term_cnt[i]  = t;
+    }
+}
+
+static void csv_scan_rows_fn(void* arg, uint32_t worker_id,
+                             int64_t start, int64_t end_i) {
+    (void)worker_id;
+    csv_scan_ctx_t* ctx = (csv_scan_ctx_t*)arg;
+    const char* buf = ctx->buf;
+    const char* end = buf + ctx->file_size;
+
+    for (int64_t i = start; i < end_i; i++) {
+        const char* p    = buf + ctx->bound[i];
+        const char* cend = buf + ctx->bound[i + 1];
+        int64_t* out = ctx->offs + ctx->slot[i];
+        int64_t  n   = 0;
+
+        if (RAY_LIKELY(!ctx->has_quotes)) {
+            /* Mirrors the serial fast path exactly: only '\n' terminates a
+             * row, and an optional '\r' immediately after it is absorbed. */
+            size_t checked = 0;
+            while (p < cend) {
+                if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
+                const char* nl = (const char*)memchr(p, '\n', (size_t)(cend - p));
+                if (!nl) break;
+                p = nl + 1;
+                if (p < end && *p == '\r') p++;
+                if (p >= end) break;
+                out[n++] = (int64_t)(p - buf);
+            }
+        } else {
+            /* Mirrors the serial slow path exactly: quote parity gates the
+             * terminators, '\r' alone ends a row, "\r\n" ends exactly one. */
+            bool in_quote = ctx->start_quoted[i] != 0;
+            size_t checked = 0;
+            while (p < cend) {
+                if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
+                char c = *p;
+                if (c == '"') {
+                    in_quote = !in_quote;
+                    p++;
+                } else if (!in_quote && (c == '\n' || c == '\r')) {
+                    if (c == '\r' && p + 1 < end && *(p + 1) == '\n') p++;
+                    p++;
+                    if (p < end) out[n++] = (int64_t)(p - buf);
+                } else {
+                    p++;
+                }
+            }
+        }
+        ctx->n_out[i] = n;
+    }
+}
+
+/* Nudge a chunk boundary right so a two-byte line terminator is never split.
+ * Quoted or not, the left chunk's state machine consumes both bytes of the
+ * pair, so the byte after it must belong to the left chunk as well. */
+static size_t csv_scan_split_at(const char* buf, size_t file_size, size_t s,
+                                bool has_quotes) {
+    if (s == 0 || s >= file_size) return s;
+    char prev = buf[s - 1], cur = buf[s];
+    if (has_quotes) { if (prev == '\r' && cur == '\n') s++; }
+    else            { if (prev == '\n' && cur == '\r') s++; }
+    return s;
+}
+
+/* Returns the row count (>=0), -1 if interrupted, or -2 when the parallel
+ * path does not apply and the caller should run the serial scan. */
+static int64_t build_row_offsets_par(const char* buf, size_t buf_size,
+                                     size_t data_offset,
+                                     uint64_t prog_base, uint64_t prog_len,
+                                     int64_t** offsets_out, ray_t** hdr_out) {
+    *offsets_out = NULL;
+    *hdr_out = NULL;
+
+    size_t remaining = buf_size - data_offset;
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, (int64_t)remaining,
+                                  (int64_t)CSV_SCAN_PAR_MIN_BYTES))
+        return -2;
+
+    int64_t n_chunks = (int64_t)ray_pool_total_workers(pool) * 4;
+    if (n_chunks > CSV_SCAN_MAX_CHUNKS) n_chunks = CSV_SCAN_MAX_CHUNKS;
+    /* Never exceed the task ring's initial capacity: growth failure inside
+     * ray_pool_dispatch_n silently DROPS tasks, which here would silently
+     * drop rows. */
+    if (n_chunks > (int64_t)RAY_POOL_INIT_TASKS) n_chunks = RAY_POOL_INIT_TASKS;
+    size_t span = remaining / (size_t)n_chunks;
+    if (span < CSV_SCAN_CHUNK_MIN) {
+        span = CSV_SCAN_CHUNK_MIN;
+        n_chunks = (int64_t)((remaining + span - 1) / span);
+    }
+    if (n_chunks < 2) return -2;
+
+    /* One block for every per-chunk array: bounds, counts, parity, slots. */
+    size_t hdr_bytes = (size_t)(n_chunks + 1) * sizeof(size_t)
+                     + (size_t)n_chunks * (2 * sizeof(uint64_t)
+                                           + 2 * sizeof(int64_t)
+                                           + sizeof(uint8_t));
+    void* blk = ray_sys_alloc(hdr_bytes);
+    if (!blk) return -2;
+    size_t*   bound     = (size_t*)blk;
+    uint64_t* quote_cnt = (uint64_t*)(bound + n_chunks + 1);
+    uint64_t* term_cnt  = quote_cnt + n_chunks;
+    int64_t*  slot      = (int64_t*)(term_cnt + n_chunks);
+    int64_t*  n_out     = slot + n_chunks;
+    uint8_t*  start_q   = (uint8_t*)(n_out + n_chunks);
+
+    csv_scan_ctx_t ctx = {
+        .buf = buf, .file_size = buf_size, .bound = bound,
+        .quote_cnt = quote_cnt, .term_cnt = term_cnt,
+        .start_quoted = start_q, .slot = slot, .n_out = n_out,
+        .offs = NULL, .has_quotes = false,
+    };
+
+    /* Pass-1 boundaries are the raw even split: counting is boundary-shape
+     * agnostic, and the quote-aware nudge below needs has_quotes, which only
+     * pass 1 can establish. */
+    bound[0] = data_offset;
+    for (int64_t i = 1; i < n_chunks; i++) {
+        size_t s = data_offset + (size_t)i * span;
+        if (s > buf_size) s = buf_size;
+        if (s < bound[i - 1]) s = bound[i - 1];
+        bound[i] = s;
+    }
+    bound[n_chunks] = buf_size;
+
+    /* Pass 1 is the bandwidth-bound count; pass 2 is the byte-at-a-time state
+     * machine.  Measured 0.90 s / 3.42 s of the scan on the 8 GB file. */
+    ray_progress_span_phase("scan: quotes", prog_base, prog_len / 5);
+    ray_pool_dispatch_n(pool, csv_scan_count_fn, &ctx, (uint32_t)n_chunks);
+    if (ray_interrupted()) { ray_sys_free(blk); return -1; }
+
+    uint64_t total_q = 0, total_term = 0;
+    for (int64_t i = 0; i < n_chunks; i++) {
+        start_q[i] = (uint8_t)(total_q & 1u);
+        total_q    += quote_cnt[i];
+        total_term += term_cnt[i];
+    }
+    ctx.has_quotes = total_q != 0;
+
+    /* Now nudge the boundaries for the state machine pass 1 just chose.  The
+     * byte skipped is always '\n' or '\r', never '"', so the parities
+     * computed above stay exact. */
+    for (int64_t i = 1; i < n_chunks; i++) {
+        size_t s = csv_scan_split_at(buf, buf_size, bound[i], ctx.has_quotes);
+        if (s < bound[i - 1]) s = bound[i - 1];
+        bound[i] = s;
+    }
+
+    /* Slice sizing: a chunk emits at most one row start per line-terminator
+     * byte it walks over.  The nudge can hand a chunk one terminator from its
+     * right neighbour, and the last row of a chunk can be recorded from a
+     * terminator one byte past cend, so reserve term_cnt + 2.  Slot 0 is
+     * reserved for the first row — the data section always starts one. */
+    uint64_t slack = 2u * (uint64_t)n_chunks + 1u;
+    if (total_term > (uint64_t)INT64_MAX / (uint64_t)sizeof(int64_t) - slack) {
+        ray_sys_free(blk);
+        return -2;
+    }
+    int64_t cap = (int64_t)(total_term + slack);
+    {
+        int64_t base = 1;
+        for (int64_t i = 0; i < n_chunks; i++) {
+            slot[i] = base;
+            base += (int64_t)term_cnt[i] + 2;
+        }
+    }
+
+    ray_t* hdr = NULL;
+    int64_t* offs = (int64_t*)scratch_alloc(&hdr, (size_t)cap * sizeof(int64_t));
+    if (!offs) { ray_sys_free(blk); return -2; }
+    offs[0] = (int64_t)data_offset;
+    ctx.offs = offs;
+
+    ray_progress_span_phase("scan: rows", prog_base + prog_len / 5,
+                            prog_len - prog_len / 5);
+    ray_pool_dispatch_n(pool, csv_scan_rows_fn, &ctx, (uint32_t)n_chunks);
+    if (ray_interrupted()) {
+        scratch_free(hdr);
+        ray_sys_free(blk);
+        return -1;
+    }
+
+    /* Compact the per-chunk slices into one dense, ascending array. */
+    int64_t n = 1;
+    for (int64_t i = 0; i < n_chunks; i++) {
+        int64_t cnt = n_out[i];
+        if (cnt <= 0) continue;
+        if (n != slot[i])
+            memmove(offs + n, offs + slot[i], (size_t)cnt * sizeof(int64_t));
+        n += cnt;
+    }
+
+    ray_sys_free(blk);
+    *offsets_out = offs;
+    *hdr_out = hdr;
+    return n;
+}
+
+/* Serial scan — the reference semantics the parallel scan above mirrors. */
+static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
+                                        size_t data_offset,
+                                        uint64_t prog_base, uint64_t prog_len,
+                                        int64_t** offsets_out, ray_t** hdr_out) {
     const char* p = buf + data_offset;
     const char* end = buf + buf_size;
 
@@ -720,11 +1007,16 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
          * Only scans for \n; pure \r line endings (old Mac) treated as single row.
          * Empty lines are preserved as rows (for NULL handling). */
         for (;;) {
-            if (RAY_UNLIKELY((n & 0xFFFF) == 0 && ray_interrupted())) {
-                scratch_free(hdr);
-                *offsets_out = NULL;
-                *hdr_out = NULL;
-                return -1;
+            if (RAY_UNLIKELY((n & 0xFFFF) == 0)) {
+                if (ray_interrupted()) {
+                    scratch_free(hdr);
+                    *offsets_out = NULL;
+                    *hdr_out = NULL;
+                    return -1;
+                }
+                ray_progress_span_set(prog_base +
+                    (uint64_t)((double)prog_len * (double)(size_t)(p - buf - (ptrdiff_t)data_offset)
+                               / (double)remaining));
             }
             const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
             if (!nl) break;
@@ -756,6 +1048,9 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
                     *hdr_out = NULL;
                     return -1;
                 }
+                ray_progress_span_set(prog_base +
+                    (uint64_t)((double)prog_len * (double)(size_t)(p - buf - (ptrdiff_t)data_offset)
+                               / (double)remaining));
             }
             char c = *p;
             if (c == '"') {
@@ -783,6 +1078,26 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
     *offsets_out = offs;
     *hdr_out = hdr;
     return n;
+}
+
+static int64_t build_row_offsets(const char* buf, size_t buf_size,
+                                 size_t data_offset,
+                                 uint64_t prog_base, uint64_t prog_len,
+                                 int64_t** offsets_out, ray_t** hdr_out) {
+    if (data_offset >= buf_size) { *offsets_out = NULL; *hdr_out = NULL; return 0; }
+
+    /* Large files: chunked parallel scan with quote-parity reconciliation.
+     * -2 means "not applicable" (small file, no pool, allocation refused) and
+     * falls back to the serial scan, which defines the semantics. */
+    int64_t par = build_row_offsets_par(buf, buf_size, data_offset,
+                                        prog_base, prog_len,
+                                        offsets_out, hdr_out);
+    if (par != -2) return par;
+
+    ray_progress_span_phase("scan", prog_base, prog_len);
+    return build_row_offsets_serial(buf, buf_size, data_offset,
+                                    prog_base, prog_len,
+                                    offsets_out, hdr_out);
 }
 
 static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
@@ -967,16 +1282,13 @@ static void csv_free_escaped_strrefs(csv_strref_t** str_refs, int n_cols,
     }
 }
 
-/* Materialize RAY_STR columns from parsed strrefs. Two-pass so the per-column
- * string pool is sized exactly once — avoids the repeated realloc/COW path
- * that ray_str_vec_set would take for a freshly-owned vector. */
-static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
-                              const int8_t* resolved_types,
-                              ray_t** col_vecs, int64_t n_rows) {
-    for (int c = 0; c < n_cols; c++) {
-        if (resolved_types[c] != RAY_STR) continue;
-        csv_strref_t* refs = str_refs[c];
-        ray_t* vec = col_vecs[c];
+/* Materialize ONE RAY_STR column from its parsed strrefs.  Two-pass so the
+ * per-column string pool is sized exactly once — avoids the repeated
+ * realloc/COW path that ray_str_vec_set would take for a freshly-owned
+ * vector.  Columns are independent (own vector, own pool), which is what
+ * lets the finalizer run one task per column. */
+static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows) {
+    {
         ray_str_t* dst = (ray_str_t*)ray_data(vec);
 
         /* ray_str_t.pool_off is u32 — the per-column pool is capped at 4 GiB.
@@ -1027,11 +1339,21 @@ static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
 }
 
 /* --------------------------------------------------------------------------
- * Stage 9b helper: dispatch csv_fill_str_cols and csv_intern_strings on
- * separate threads when a pool is available.  They write to disjoint
- * column data, and intern_strings is the only one that touches the
- * global sym table (so it stays single-threaded; we just run it in
- * parallel with fill_str_cols).
+ * Stage 9b: finalize the text columns.
+ *
+ * Two kinds of work, dispatched together so they overlap:
+ *   - one task PER RAY_STR COLUMN (independent vector + string pool), and
+ *   - one task for the whole sym intern, which walks every SYM column into
+ *     the process-global symbol table and therefore must stay single
+ *     threaded (ray_sym_intern_no_split_unlocked assumes no concurrent
+ *     writers, and the id a string gets is its first-encounter order).
+ *
+ * It used to be exactly two tasks — "all the fills" and "the intern" — which
+ * on a 105-column file left 8 cores running 2 threads for ~5 s.  The intern
+ * is now the phase's critical path; the fills fan out behind it.  The intern
+ * is dispatched LAST so the main thread, which is the only one that can pump
+ * the progress bar, picks up short fill tasks first instead of parking
+ * inside the long serial one.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -1043,7 +1365,9 @@ typedef struct {
     ray_t**           col_vecs;
     int64_t           n_rows;
     int64_t*          sym_max_ids;
-    bool              fill_ok;
+    const int*        fill_cols;   /* [n_fill] RAY_STR column indices */
+    int               n_fill;
+    bool*             fill_ok;     /* [n_fill] per-task result */
     bool              intern_ok;
 } csv_finalize_ctx_t;
 
@@ -1051,14 +1375,45 @@ static void csv_finalize_task(void* arg, uint32_t worker_id,
                               int64_t start, int64_t end_idx) {
     (void)worker_id; (void)end_idx;
     csv_finalize_ctx_t* ctx = (csv_finalize_ctx_t*)arg;
-    if (start == 0) {
-        ctx->fill_ok = csv_fill_str_cols(ctx->str_refs, ctx->n_cols,
-            ctx->resolved_types, ctx->col_vecs, ctx->n_rows);
+    if (start < (int64_t)ctx->n_fill) {
+        int c = ctx->fill_cols[start];
+        ctx->fill_ok[start] = csv_fill_str_col(ctx->str_refs[c],
+                                               ctx->col_vecs[c], ctx->n_rows);
     } else {
         ctx->intern_ok = csv_intern_strings(ctx->str_refs, ctx->n_cols,
             ctx->parse_types, ctx->resolved_types, ctx->col_data,
             ctx->n_rows, ctx->sym_max_ids);
     }
+}
+
+/* Run the finalize tasks, in parallel when the pool allows.  Returns false if
+ * any task failed.  fill_cols/fill_ok are caller-owned scratch of at least
+ * n_cols entries. */
+static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
+                             bool* fill_ok) {
+    int n_fill = 0;
+    for (int c = 0; c < ctx->n_cols; c++)
+        if (ctx->resolved_types[c] == RAY_STR && ctx->str_refs[c])
+            fill_cols[n_fill++] = c;
+    for (int i = 0; i < n_fill; i++) fill_ok[i] = true;
+    ctx->fill_cols = fill_cols;
+    ctx->n_fill    = n_fill;
+    ctx->fill_ok   = fill_ok;
+    ctx->intern_ok = true;
+
+    int64_t n_tasks = (int64_t)n_fill + 1;   /* +1 = the sym intern */
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && ray_pool_total_workers(pool) >= 2 &&
+        n_tasks <= (int64_t)RAY_POOL_INIT_TASKS) {
+        ray_pool_dispatch_n(pool, csv_finalize_task, ctx, (uint32_t)n_tasks);
+    } else {
+        for (int64_t i = 0; i < n_tasks; i++)
+            csv_finalize_task(ctx, 0, i, i + 1);
+    }
+
+    if (!ctx->intern_ok) return false;
+    for (int i = 0; i < n_fill; i++) if (!fill_ok[i]) return false;
+    return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -1859,20 +2214,11 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             .col_vecs       = col_vecs,
             .n_rows         = n_rows,
             .sym_max_ids    = sym_max_ids,
-            .fill_ok        = true,
-            .intern_ok      = true,
         };
-        ray_pool_t* fpool = ray_pool_get();
-        if (fpool && ray_pool_total_workers(fpool) >= 2) {
-            uint32_t qmode = ray_qstats_mode();
-            ray_qstats_set_mode(qmode & ~RAY_QS_PROGRESS);
-            ray_pool_dispatch_n(fpool, csv_finalize_task, &fctx, 2);
-            ray_qstats_set_mode(qmode);
-        } else {
-            csv_finalize_task(&fctx, 0, 0, 1);
-            csv_finalize_task(&fctx, 0, 1, 2);
-        }
-        if (!fctx.fill_ok || !fctx.intern_ok || ray_interrupted()) {
+        int  fill_cols[CSV_MAX_COLS];
+        bool fill_ok[CSV_MAX_COLS];
+        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok);
+        if (!fin_ok || ray_interrupted()) {
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, row_done, col_had_escaped);
             for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
@@ -2000,9 +2346,12 @@ static const char* csv_skip_matching_header(const char* p, const char* buf_end,
  * ray_read_csv_opts — main CSV parser
  * -------------------------------------------------------------------------- */
 
-ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
-                               const int8_t* col_types_in, int32_t n_types,
-                               const int64_t* col_names_in, int32_t n_names) {
+/* Body of ray_read_csv_named_opts.  Split out so the byte-metered progress
+ * span is closed on exactly one path, whichever of the dozen returns below
+ * fires. */
+static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool header,
+                                        const int8_t* col_types_in, int32_t n_types,
+                                        const int64_t* col_names_in, int32_t n_names) {
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
 
     /* ---- 1. Open file and get size ---- */
@@ -2027,6 +2376,11 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
 
     const char* buf_end = buf + file_size;
     ray_t* result = NULL;
+
+    /* One monotone bar for the whole load, metered in bytes of input.  Every
+     * return path below runs through ray_progress_span_end (the executor's
+     * ray_progress_end also clears it, so an early error cannot strand it). */
+    ray_progress_span_begin(NULL, (uint64_t)file_size);
 
     /* ---- 3. Detect delimiter ---- */
     /* Delimiter auto-detected from header row only. Files where the header
@@ -2111,7 +2465,11 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
     /* ---- 6. Build row offsets (memchr-accelerated) ---- */
     ray_t* row_offsets_hdr = NULL;
     int64_t* row_offsets = NULL;
+    uint64_t prog_scan_end  = csv_prog_at(file_size, CSV_PROG_PCT_SCAN);
+    uint64_t prog_parse_end  = csv_prog_at(file_size,
+                                           CSV_PROG_PCT_SCAN + CSV_PROG_PCT_PARSE);
     int64_t n_rows = build_row_offsets(buf, file_size, data_offset,
+                                        0, prog_scan_end,
                                         &row_offsets, &row_offsets_hdr);
 
     if (n_rows < 0) {
@@ -2248,6 +2606,7 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
         }
     }
 
+    ray_progress_span_phase("parse", prog_scan_end, prog_parse_end - prog_scan_end);
     {
         ray_pool_t* pool = ray_pool_get();
         bool use_parallel = pool && n_rows > 8192;
@@ -2320,24 +2679,18 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
             .col_vecs       = col_vecs,
             .n_rows         = n_rows,
             .sym_max_ids    = sym_max_ids,
-            .fill_ok        = true,
-            .intern_ok      = true,
         };
-        ray_pool_t* fpool = ray_pool_get();
-        if (fpool && ray_pool_total_workers(fpool) >= 2) {
-            /* Finalization has two coarse internal tasks, not rows.  Letting
-             * the generic pool progress pump expose them resets a completed
-             * n_rows parse to 0/2 (visibly 100% -> 50%).  Keep profiling
-             * active, but preserve the row progress until query completion. */
-            uint32_t qmode = ray_qstats_mode();
-            ray_qstats_set_mode(qmode & ~RAY_QS_PROGRESS);
-            ray_pool_dispatch_n(fpool, csv_finalize_task, &fctx, 2);
-            ray_qstats_set_mode(qmode);
-        } else {
-            csv_finalize_task(&fctx, 0, 0, 1);
-            csv_finalize_task(&fctx, 0, 1, 2);
-        }
-        if (!fctx.fill_ok || !fctx.intern_ok || ray_interrupted()) {
+        /* Finalization dispatches coarse tasks, not rows.  It used to be
+         * hidden from the progress pump entirely (its 0/2 would have reset a
+         * completed n_rows parse to 50%), which left the terminal frozen for
+         * the rest of the load.  On the byte axis it is simply the last
+         * slice, so it reports like any other phase. */
+        ray_progress_span_phase("finalize", prog_parse_end,
+                                (uint64_t)file_size - prog_parse_end);
+        int  fill_cols[CSV_MAX_COLS];
+        bool fill_ok[CSV_MAX_COLS];
+        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok);
+        if (!fin_ok || ray_interrupted()) {
             if (ray_interrupted()) goto fail_parsed_cancel;
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, NULL, col_had_escaped);
@@ -2463,6 +2816,16 @@ fail_offsets:
 fail_unmap:
     ray_vm_unmap_file(buf, file_size);
     return ray_error("oom", NULL);
+}
+
+ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
+                               const int8_t* col_types_in, int32_t n_types,
+                               const int64_t* col_names_in, int32_t n_names) {
+    ray_t* r = csv_read_named_opts_inner(path, delimiter, header,
+                                         col_types_in, n_types,
+                                         col_names_in, n_names);
+    ray_progress_span_end();
+    return r;
 }
 
 ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,

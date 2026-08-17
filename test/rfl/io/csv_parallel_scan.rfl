@@ -1,0 +1,62 @@
+;; Parallel row-offset scan (csv.c build_row_offsets_par) — exactness.
+;;
+;; The scan splits the file into chunks and reconciles quote parity across
+;; them, so its whole risk surface is the chunk BOUNDARY: a quoted field that
+;; contains a newline, a "" escape that flips parity twice, and a two-byte
+;; line terminator split down the middle.  Both fixtures below are built past
+;; CSV_SCAN_PAR_MIN_BYTES (4 MiB) so the parallel path is actually taken —
+;; a smaller file silently falls back to the serial scanner and proves
+;; nothing.  Row counts are exact (fixed block repeated 2^n times), so a
+;; dropped, duplicated or mis-split row fails the count assertion.
+;;
+;; Fixtures use the rf_test_csvps_* prefix so the Makefile `rm -f
+;; rf_test_*.csv` rule keeps the tree clean.
+
+;; ── scrub stale state ───────────────────────────────────────────────────────
+(.sys.exec "rm -f rf_test_csvps_q.csv rf_test_csvps_p.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 1. Quoted / mixed-terminator file — the slow (quote-parity) state machine.
+;;
+;;    One block = 4 rows, each exercising a different boundary hazard:
+;;      "a\nb",1,plain\r\n   quoted embedded LF, then a CRLF terminator
+;;      "q""q",2,x\n         doubled-quote escape (parity flips twice)
+;;      3,4\r                lone-CR terminator AND a short row (2 of 3 cols)
+;;      "c,d",5,"e\r\nf"\n   quoted delimiter and a quoted CRLF
+;;    Doubled 17 times => 131072 blocks = 524288 rows, ~5.9 MB.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b,c\n' > rf_test_csvps_q.csv; printf '\"a\nb\",1,plain\r\n\"q\"\"q\",2,x\n3,4\r\"c,d\",5,\"e\r\nf\"\n' > rf_test_csvps_blk; i=0; while [ $i -lt 17 ]; do cat rf_test_csvps_blk rf_test_csvps_blk > rf_test_csvps_blk2; mv rf_test_csvps_blk2 rf_test_csvps_blk; i=$((i+1)); done; cat rf_test_csvps_blk >> rf_test_csvps_q.csv; rm -f rf_test_csvps_blk") -- 0
+
+(set Q (.csv.read [STR I64 STR] "rf_test_csvps_q.csv"))
+;; 4 rows per block x 2^17 blocks — off-by-one anywhere in the stitching
+;; changes this number.
+(count Q) -- 524288
+;; b column: 1 + 2 + 4 + 5 per block => 12 x 131072.  The short row's missing
+;; third field must NOT shift the next row's fields.
+(sum (at Q 'b)) -- 1572864
+;; Field-level spot checks at both ends of the file.
+(at (at Q 'b) 0) -- 1
+(at (at Q 'c) 1) -- "x"
+(at (at Q 'a) 2) -- "3"
+(at (at Q 'b) 524287) -- 5
+(at (at Q 'c) 524285) -- "x"
+(.sys.exec "rm -f rf_test_csvps_q.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 2. Quote-free file — the fast (memchr) state machine, whose terminator
+;;    grammar differs: only '\n' ends a row and an immediately following '\r'
+;;    is absorbed into it.  The block ends one row with "\n\r" so a boundary
+;;    landing between those two bytes is exercised.
+;;    One block = 3 rows, doubled 18 times => 262144 blocks = 786432 rows,
+;;    ~4.7 MB.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n' > rf_test_csvps_p.csv; printf '10,20\n30,40\n\r50,60\n' > rf_test_csvps_blk; i=0; while [ $i -lt 18 ]; do cat rf_test_csvps_blk rf_test_csvps_blk > rf_test_csvps_blk2; mv rf_test_csvps_blk2 rf_test_csvps_blk; i=$((i+1)); done; cat rf_test_csvps_blk >> rf_test_csvps_p.csv; rm -f rf_test_csvps_blk") -- 0
+
+(set P (.csv.read [I64 I64] "rf_test_csvps_p.csv"))
+(count P) -- 786432
+(sum (at P 'a)) -- 23592960
+(sum (at P 'b)) -- 31457280
+(at (at P 'a) 0) -- 10
+(at (at P 'a) 2) -- 50
+(at (at P 'b) 786431) -- 60
+(.sys.exec "rm -f rf_test_csvps_p.csv") -- 0
