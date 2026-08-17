@@ -1,0 +1,94 @@
+;; Equality comparison on NULLABLE SYM / STR columns — fused path vs unfused.
+;;
+;; A SYM null is sym id 0 and a STR null is a zero-length descriptor: both are
+;; IN-BAND ordinary values, unlike a numeric null which is an out-of-band
+;; sentinel.  That is what lets the fused per-row predicate evaluator compare
+;; them for equality on raw payloads (fused_pred.c fp_col_supported_op) once
+;; HAS_NULLS started reaching such columns (#416).  The property under test is
+;; that the fused and unfused kernels give the SAME answer.
+;;
+;; Forcing the unfused path: the fused compiler rejects a predicate containing
+;; any comparison it cannot handle, and an F64 column is one of those.  So
+;;    where: (!= s "")                    -> fused
+;;    where: (and (!= s "") (== f 1.5))   -> unfused (F64 arm declines)
+;; over an F64 column that is constant 1.5, i.e. the same row set both ways.
+;; Every count is also asserted against its value by construction, so a pair
+;; that agreed on a wrong answer still fails.
+;;
+;; Fixture: a 6-row block doubled 12 times = 24576 rows (past any per-row
+;; fused threshold), with column `s` empty in the block's FIRST, MIDDLE and
+;; LAST rows, `z` empty everywhere, `u` the STR twin of `s`.
+;;   block rows: (s,z,u,f,n) = ("",_,"",_,null) (b,_,b,_,5) ("",_,"",_,null)
+;;                              (c,_,c,_,7)    (b,_,b,_,5) ("",_,"",_,null)
+;;   per block: 3 empty s, 2 "b", 1 "c"   => x4096 = 12288 / 8192 / 4096
+;;   `n` is a NULLABLE I64 — the other side of the gate, kept for contrast.
+
+;; ── scrub stale state ───────────────────────────────────────────────────────
+(.sys.exec "rm -f rf_test_nullcmp.csv rf_test_nullcmp_blk") -- 0
+
+(.sys.exec "printf 's,z,u,f,n\n' > rf_test_nullcmp.csv; printf ',,,1.5,\nb,,b,1.5,5\n,,,1.5,\nc,,c,1.5,7\nb,,b,1.5,5\n,,,1.5,\n' > rf_test_nullcmp_blk; i=0; while [ $i -lt 12 ]; do cat rf_test_nullcmp_blk rf_test_nullcmp_blk > rf_test_nullcmp_blk2; mv rf_test_nullcmp_blk2 rf_test_nullcmp_blk; i=$((i+1)); done; cat rf_test_nullcmp_blk >> rf_test_nullcmp.csv; rm -f rf_test_nullcmp_blk") -- 0
+
+(set T (.csv.read [SYMBOL SYMBOL STR F64 I64] "rf_test_nullcmp.csv"))
+(count T) -- 24576
+
+;; ── SYM: != "" — the ClickBench q24/q25/q26 shape ───────────────────────────
+(count (select {from: T where: (!= s "")}))                    -- 12288
+(count (select {from: T where: (and (!= s "") (== f 1.5))}))   -- 12288
+
+;; ── SYM: == "" — nulls are matched, not skipped ─────────────────────────────
+(count (select {from: T where: (== s "")}))                    -- 12288
+(count (select {from: T where: (and (== s "") (== f 1.5))}))    -- 12288
+
+;; ── SYM: a non-empty literal.  != "b" must still count the nulls in, the
+;;    same way the unfused kernel does. ────────────────────────────────────────
+(count (select {from: T where: (== s "b")}))                   -- 8192
+(count (select {from: T where: (and (== s "b") (== f 1.5))}))   -- 8192
+(count (select {from: T where: (!= s "b")}))                   -- 16384
+(count (select {from: T where: (and (!= s "b") (== f 1.5))}))   -- 16384
+
+;; ── all-empty SYM column: every row is null ────────────────────────────────
+(count (select {from: T where: (== z "")}))                    -- 24576
+(count (select {from: T where: (and (== z "") (== f 1.5))}))    -- 24576
+(count (select {from: T where: (!= z "")}))                    -- 0
+(count (select {from: T where: (and (!= z "") (== f 1.5))}))    -- 0
+
+;; ── STR twin: same answers as the SYM column it mirrors ────────────────────
+(count (select {from: T where: (== u "")}))                    -- 12288
+(count (select {from: T where: (and (== u "") (== f 1.5))}))    -- 12288
+(count (select {from: T where: (!= u "")}))                    -- 12288
+(count (select {from: T where: (and (!= u "") (== f 1.5))}))    -- 12288
+
+;; ── NULLABLE I64: the OTHER side of the gate.  A numeric null is an
+;;    out-of-band sentinel, so fp_col_supported_op still rejects the column and
+;;    both forms run unfused.  Asserted so the boundary is covered: if someone
+;;    admits numeric columns, these must keep agreeing (they do for a constant
+;;    that is not itself the sentinel — which is exactly why the numeric arm
+;;    needs more than this test before it could ever be relaxed).
+(count (select {from: T where: (!= n 5)}))                     -- 16384
+(count (select {from: T where: (and (!= n 5) (== f 1.5))}))    -- 16384
+(count (select {from: T where: (== n 5)}))                     -- 8192
+(count (select {from: T where: (and (== n 5) (== f 1.5))}))     -- 8192
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ORDERING is deliberately NOT covered by the in-band argument, and is NOT
+;; asserted here — because it is not currently a spec.  Measured on this very
+;; fixture (and identical on the pre-relaxation build, so pre-existing):
+;;
+;;              24576 rows        6 rows
+;;   SYM asc:   nulls FIRST       nulls LAST
+;;   SYM desc:  nulls LAST
+;;   STR asc:   nulls LAST
+;;   STR desc:  nulls FIRST
+;;
+;; So SYM and STR place nulls at OPPOSITE ends for the same direction, and SYM
+;; flips with row count (the small-array path and the radix/parallel path
+;; disagree: sort_cmp defaults nulls_first to `desc`, sort_indices_ex to
+;; `!desc`).  Pinning any of that would freeze accidental behaviour.
+;;
+;; What matters for the relaxation in fused_pred.c is only that ordering was
+;; left alone: ray_key_cols_sorted still rejects HAS_NULLS keys for SYM/STR, so
+;; the parted ORDER BY shortcut never assumes sym 0 ranks as the empty string.
+;; Settle the placement question first; then this section can assert it.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -f rf_test_nullcmp.csv") -- 0

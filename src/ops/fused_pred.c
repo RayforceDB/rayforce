@@ -100,16 +100,47 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
 }
 
 /* Reject columns the fused per-row compare can't read safely.
- * Currently: any column carrying nulls (RAY_ATTR_HAS_NULLS).
- * The fused evaluator reads raw payload bytes — for nullable columns it
- * would compare the sentinel value rather than treating the slot as
- * null, producing a different result from the unfused null-aware
- * compare kernel.  Until fp_eval_cmp learns to skip nulls, gate fused
- * off here at compile so the planner falls back transparently. */
-static int fp_col_supported(const ray_t* col) {
+ *
+ * The fused evaluator reads raw payload bytes.  For a NUMERIC or TEMPORAL
+ * column the null is an OUT-OF-BAND SENTINEL (NULL_I64, NULL_I32, NaN, ...)
+ * that does not stand for any real value, so comparing it would answer a
+ * question about the sentinel rather than about the null — a different result
+ * from the unfused null-aware kernel.  Those stay rejected.
+ *
+ * SYM and STR are different in kind: their null is an IN-BAND ORDINARY VALUE.
+ * A SYM null is id 0, which is a genuine dictionary entry — the empty string,
+ * held at position 0 of every symfile by construction (domain.c enforces the
+ * reservation on open).  A STR null is a zero-length descriptor.  Comparing
+ * those raw payloads for EQUALITY therefore gives exactly the answer the
+ * unfused kernel gives: `== ""` is true precisely on the null cells, `!= ""`
+ * false precisely on them.  Nothing is being skipped or guessed.
+ *
+ * Deliberately limited to EQ/NE:
+ *   - ORDERING (LT/LE/GT/GE) is NOT safe by this argument.  The sort kernels
+ *     treat nulls as a separate order class placed by the `nulls_first` flag
+ *     (sort_cmp; the single-key path partitions them out and rotates), NOT by
+ *     their payload — so "" sorting as the smallest string is not the ordering
+ *     a null-aware comparison implies.  (SYM ordering ops are rejected outright
+ *     a few lines below in any case.)
+ *   - LIKE is not safe either: bfb5b380 made the string kernels
+ *     null-propagating (e.g. `strlen` of a null SYM/STR is NULL_I64), so a
+ *     pattern match against the empty payload need not equal the null-aware
+ *     answer.  LIKE keeps the strict gate.
+ *
+ * This mattered the moment converted stores started carrying HAS_NULLS on SYM
+ * columns (#416): ClickBench q24/q25/q26 are `where: (!= SearchPhrase "")`,
+ * and losing the fused path cost them ~70x for an identical result. */
+static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
     if (!col) return 0;
-    if (col->attrs & RAY_ATTR_HAS_NULLS) return 0;
+    if (col->attrs & RAY_ATTR_HAS_NULLS)
+        return eq_or_ne && (col->type == RAY_SYM || col->type == RAY_STR);
     return 1;
+}
+
+/* Strict form — no nullable column at all.  Used by the shapes whose
+ * evaluator arm is not an equality compare (LIKE, IN). */
+static int fp_col_supported(const ray_t* col) {
+    return fp_col_supported_op(col, 0);
 }
 
 static int fp_expr_const_str(ray_t* expr) {
@@ -178,7 +209,7 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
             && ct != RAY_I16 && ct != RAY_I32 && ct != RAY_I64
             && ct != RAY_DATE && ct != RAY_TIME && ct != RAY_TIMESTAMP)
             return -1;
-        if (!fp_col_supported(col)) return -1;
+        if (!fp_col_supported_op(col, code == 0 || code == 1)) return -1;
         if (!is_dict_str && !fp_atom_col_compatible(rhs->type, ct)) return -1;
     }
     return code;
@@ -791,7 +822,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
      * its code once; absent ⇒ EQ all-false / NE all-true via fold. */
     if (col->type == RAY_STR && (out->op == FP_EQ || out->op == FP_NE)
         && ray_index_kind(col) == RAY_IDX_DICT) {
-        if (!fp_col_supported(col)) return -1;
+        if (!fp_col_supported_op(col, 1)) return -1;
         ray_t* cv_str = rext->literal;
         if (!cv_str || cv_str->type != -RAY_STR) return -1;
         ray_index_t* dix = ray_index_payload(col->index);
@@ -816,10 +847,10 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     if (col->type == RAY_SYM && (out->op == FP_LT || out->op == FP_LE ||
                                  out->op == FP_GT || out->op == FP_GE))
         return -1;
-    /* Reject nullable columns — fp_eval_cmp doesn't read the null bitmap,
-     * so a comparison against a stored sentinel slot would diverge from
-     * the unfused null-aware kernel. */
-    if (!fp_col_supported(col)) return -1;
+    /* Nullable columns: only SYM/STR equality is safe — see
+     * fp_col_supported_op for why sentinels and in-band nulls differ. */
+    if (!fp_col_supported_op(col, out->op == FP_EQ || out->op == FP_NE))
+        return -1;
 
     ray_t* cv = rext->literal;
     /* Atom type ↔ column class compatibility — block mixed-temporal

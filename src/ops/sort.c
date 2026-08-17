@@ -3941,7 +3941,13 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
      * read and a volatile flag load per row; here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
      * string comparison only runs at run boundaries), the secondary key
-     * reads raw i64, and the bail flag is polled per 4096-row block. */
+     * reads raw i64, and the bail flag is polled per 4096-row block.
+     *
+     * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
+     * HAS_NULLS up front, including for SYM/STR).  That is not squeamishness
+     * about in-band nulls: this loop ranks sym 0 by its domain string, i.e.
+     * smallest, whereas the real sort places nulls by the `nulls_first` flag
+     * independently of payload.  See the note on ray_key_cols_sorted. */
     if (!c->descending && c->n_keys == 2 &&
         c->key_cols[0]->type == RAY_SYM &&
         (c->key_cols[1]->type == RAY_I64 ||
@@ -4009,6 +4015,19 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
  * null-free integer-family / SYM keys are decidable — anything else (float,
  * STR/LIST, or a HAS_NULLS column) returns false so the caller must NOT
  * assume sortedness (float NaN / null placement belong to the real sort).
+ *
+ * The HAS_NULLS rejection stands even for SYM/STR, whose nulls are IN-BAND
+ * ordinary values (sym id 0 is a real dictionary entry — the empty string at
+ * position 0 of every symfile; a STR null is a zero-length descriptor).  That
+ * in-band property is what lets the fused predicate evaluator compare them for
+ * EQUALITY (see fp_col_supported_op in fused_pred.c), but it does NOT extend to
+ * ORDER: the sort kernels give nulls a dedicated order class placed by the
+ * `nulls_first` flag — sort_cmp answers `nf ? -1 : 1` for a null operand
+ * without looking at the payload, and the single-key path partitions nulls out
+ * and rotates them to the requested end.  A payload-only scan such as this one
+ * would rank sym 0 as the smallest string, which is the right answer only when
+ * nulls happen to be requested first.  So sortedness of a null-bearing key is
+ * genuinely undecidable here, not merely unimplemented.
  * O(nrows) with early bail on the first violation; a 0/1-row column is
  * trivially sorted.  Used by the parted ORDER BY streaming path in query.c
  * to verify each partition is internally sorted at O(partition), never a
