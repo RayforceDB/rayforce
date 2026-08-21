@@ -212,6 +212,41 @@
 (sum (at Ttsv 'b)) -- 12
 
 ;; ════════════════════════════════════════════════════════════════════════════
+;; 18. Typed temporal parse rejects malformed input (separators / trailing
+;;     garbage) instead of silently coercing it.  fast_date / fast_time /
+;;     fast_timestamp validate the ':' and '-' separators, the 'T'|' ' date/time
+;;     separator, and require the field to be fully consumed (bar a trailing UTC
+;;     offset on a timestamp).  Well-formed values — including signed / >=24h
+;;     durations and 'Z' / ±HH:MM offsets — still parse.
+;; ════════════════════════════════════════════════════════════════════════════
+;; DATE: wrong separators ("/", "x") and trailing garbage → null; valid → value.
+(.sys.exec "printf 'a\n2024/01/02\n2024x01x02\n2024-01-02junk\n2024-01-02\n' > rf_test_csv_types_datestrict.csv") -- 0
+(set Tds (.csv.read [DATE] "rf_test_csv_types_datestrict.csv"))
+(nil? (at (at Tds 'a) 0)) -- true
+(nil? (at (at Tds 'a) 1)) -- true
+(nil? (at (at Tds 'a) 2)) -- true
+(at (at Tds 'a) 3) -- 2024.01.02
+
+;; TIME: wrong separator ("-") and trailing garbage → null; valid → value.
+(.sys.exec "printf 'a\n12-34-56\n12:34:56xyz\n12:34:56\n' > rf_test_csv_types_timestrict.csv") -- 0
+(set Tms (.csv.read [TIME] "rf_test_csv_types_timestrict.csv"))
+(nil? (at (at Tms 'a) 0)) -- true
+(nil? (at (at Tms 'a) 1)) -- true
+(at (at Tms 'a) 2) -- 12:34:56.000
+
+;; TIMESTAMP: bad date separator, bad 'D' date/time separator, trailing garbage
+;; → null; valid 'T'/space forms and a trailing UTC offset still parse.
+(.sys.exec "printf 'a\n2024x01x02T01:02:03\n2024-01-02D01:02:03\n2024-01-02T01:02:03junk\n2024-01-02T01:02:03\n2024-01-02T01:00:00+01:00\n' > rf_test_csv_types_tsstrict.csv") -- 0
+(set Tss (.csv.read [TIMESTAMP] "rf_test_csv_types_tsstrict.csv"))
+(nil? (at (at Tss 'a) 0)) -- true
+(nil? (at (at Tss 'a) 1)) -- true
+(nil? (at (at Tss 'a) 2)) -- true
+(at (at Tss 'a) 3) -- 2024.01.02D01:02:03.000000000
+;; +01:00 offset is subtracted to yield UTC.
+(at (at Tss 'a) 4) -- 2024.01.02D00:00:00.000000000
+(.sys.exec "rm -f rf_test_csv_types_datestrict.csv rf_test_csv_types_timestrict.csv rf_test_csv_types_tsstrict.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
 ;; 18. Short row guard (p >= row_end path, lines 918+/1086+)
 ;;     Row 1 has fewer fields than header → remaining columns get null/default.
 ;; ════════════════════════════════════════════════════════════════════════════
