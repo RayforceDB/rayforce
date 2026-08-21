@@ -25,6 +25,13 @@
 (sum (list 0Ni 0Ni 0Ni))   -- 0
 (sum (list))               -- 0
 
+;; ────────────── i64 overflow wraps (no signed-overflow UB) ──────────────
+;; A boxed (list ...) reduces through the scalar path.  Integer accumulation
+;; must wrap via unsigned math rather than trigger UB; 2*(2^63-1) wraps to -2.
+;; i64 atoms are read directly, so magnitudes above 2^53 stay exact.
+(sum (list 9223372036854775807 9223372036854775807)) -- -2
+(sum (list 9007199254740992 1))                       -- 9007199254740993
+
 ;; ---- RAY_IS_ERR propagation: sum(erroring arg) ----
 (sum (* 'bad 1))    !- type
 (sum (+ "a" 1))     !- type

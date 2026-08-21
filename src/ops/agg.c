@@ -461,8 +461,18 @@ ray_t* ray_sum_fn(ray_t* x) {
             continue;
         }
         if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) { has_float = 1; fsum += elems[i]->f64; }
-        else if (elems[i]->type == -RAY_I64) { isum += elems[i]->i64; fsum += (double)elems[i]->i64; }
-        else { int64_t v = (int64_t)as_f64(elems[i]); isum += v; fsum += (double)v; }
+        /* Integer accumulation wraps via unsigned math: signed overflow is UB
+         * (and the typed-vector path already wraps).  i64 atoms are read
+         * directly rather than through as_f64 to stay exact above 2^53. */
+        else if (elems[i]->type == -RAY_I64) {
+            isum = (int64_t)((uint64_t)isum + (uint64_t)elems[i]->i64);
+            fsum += (double)elems[i]->i64;
+        }
+        else {
+            int64_t v = (int64_t)as_f64(elems[i]);
+            isum = (int64_t)((uint64_t)isum + (uint64_t)v);
+            fsum += (double)v;
+        }
     }
     return has_float ? make_f64(fsum) : make_i64(isum);
 }
@@ -493,6 +503,11 @@ ray_t* ray_prod_fn(ray_t* x) {
         if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) {
             has_float = 1;
             fprod *= elems[i]->f64;
+        } else if (elems[i]->type == -RAY_I64) {
+            /* Read i64 directly: (int64_t)as_f64(atom) both loses precision
+             * above 2^53 and is UB when the value rounds to >= 2^63. */
+            iprod = (int64_t)((uint64_t)iprod * (uint64_t)elems[i]->i64);
+            fprod *= (double)elems[i]->i64;
         } else {
             int64_t v = (int64_t)as_f64(elems[i]);
             iprod = (int64_t)((uint64_t)iprod * (uint64_t)v);
