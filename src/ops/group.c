@@ -7373,8 +7373,8 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     const int64_t* restrict data = (const int64_t*)c->agg_ptrs[0];
     int64_t sum = 0;
     for (int64_t r = start; r < end; r++)
-        sum += data[r];
-    acc->sum[0].i += sum;
+        sum = wrap_add_i64(sum, data[r]);
+    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
     acc->count[0] += end - start;
 }
 
@@ -7397,7 +7397,7 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
     const agg_linear_t* lin = &c->agg_linear[0];
     int64_t n = end - start;
 
-    int64_t sum = lin->bias_i64 * n;
+    int64_t sum = wrap_mul_i64(lin->bias_i64, n);
     /* n_terms is bounded by AGG_LINEAR_MAX_TERMS (8, internal.h) — an
      * unrelated fixed cap on linear-expression arity, not a GROUP n_keys/
      * n_aggs count, so it stays uint8_t. */
@@ -7408,11 +7408,11 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
         int8_t type = lin->term_types[t];
         int64_t term_sum = 0;
         for (int64_t r = start; r < end; r++)
-            term_sum += scalar_i64_at(ptr, type, r);
-        sum += coeff * term_sum;
+            term_sum = wrap_add_i64(term_sum, scalar_i64_at(ptr, type, r));
+        sum = wrap_add_i64(sum, wrap_mul_i64(coeff, term_sum));
     }
 
-    acc->sum[0].i += sum;
+    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
     acc->count[0] += n;
 }
 
