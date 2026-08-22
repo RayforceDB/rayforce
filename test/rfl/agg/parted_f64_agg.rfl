@@ -111,5 +111,23 @@
 ;; sum on parted DATE → type error (agg_parted_sum line 129)
 (sum (at Pd 'd)) !- type
 
+;; ─── parted TIMESTAMP / LIST sum type errors ─────────────────────────
+;; TIMESTAMP is an absolute point, not a duration.  LIST is a non-numeric
+;; wrapper; this guards against using the permissive plan-time admission check
+;; as the final runtime gate, which would silently return 0 for parted LIST.
+(.sys.exec "rm -rf /tmp/rfl_agg_pts /tmp/rfl_agg_plist")
+(set Tts1 (table [ts] (list (as 'TIMESTAMP [1 2 3]))))
+(set Tts2 (table [ts] (list (as 'TIMESTAMP [4 5]))))
+(.db.splayed.set "/tmp/rfl_agg_pts/1/t/" Tts1)
+(.db.splayed.set "/tmp/rfl_agg_pts/2/t/" Tts2)
+(set Pts (.db.parted.get "/tmp/rfl_agg_pts/" 't))
+(sum (at Pts 'ts)) !- type
+(set Tl1 (table [l] (list (list [1 2] [3 4]))))
+(set Tl2 (table [l] (list (list [5 6]))))
+(.db.splayed.set "/tmp/rfl_agg_plist/1/t/" Tl1)
+(.db.splayed.set "/tmp/rfl_agg_plist/2/t/" Tl2)
+(set Pl (.db.parted.get "/tmp/rfl_agg_plist/" 't))
+(sum (at Pl 'l)) !- type
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pdate")
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pdate /tmp/rfl_agg_pts /tmp/rfl_agg_plist")

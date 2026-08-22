@@ -127,10 +127,15 @@ static ray_t* agg_atom_i64_for_type(int8_t t, int64_t v) {
 
 static ray_t* agg_parted_sum(ray_t* x) {
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
-    /* Admit exactly what the flat-vector path admits (numeric + duration-like
-     * TIME).  DATE/TIMESTAMP are absolute points and are rejected — previously
-     * this path accepted TIMESTAMP and summed it, diverging from flat sum. */
-    if (!agg_type_admitted(OP_SUM, x->type))
+    /* Explicit runtime whitelist: numeric + duration-like TIME.  NOT
+     * agg_type_admitted() — that is a permissive *plan-time* guard which only
+     * rejects the types it KNOWS are bad and admits unknown wrappers (incl.
+     * RAY_LIST); as the final runtime gate it would let a parted LIST column
+     * fall into the integer loop and silently sum to 0.  DATE/TIMESTAMP are
+     * absolute points and are rejected here too, matching flat sum (which
+     * rejects them via agg_type_admitted); the parted path previously summed a
+     * TIMESTAMP column instead. */
+    if (!agg_parted_numeric_base(base) || base == RAY_DATE || base == RAY_TIMESTAMP)
         return ray_error("type", "sum expects a numeric or time-duration parted column, got %s", ray_type_name(base));
     ray_t** segs = (ray_t**)ray_data(x);
     if (base == RAY_F64 || base == RAY_F32) {
