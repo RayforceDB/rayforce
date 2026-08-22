@@ -244,7 +244,38 @@
 (at (at Tss 'a) 3) -- 2024.01.02D01:02:03.000000000
 ;; +01:00 offset is subtracted to yield UTC.
 (at (at Tss 'a) 4) -- 2024.01.02D00:00:00.000000000
-(.sys.exec "rm -f rf_test_csv_types_datestrict.csv rf_test_csv_types_timestrict.csv rf_test_csv_types_tsstrict.csv") -- 0
+
+;; Explicit DATE stays strict: timestamp-shaped cells are malformed for a
+;; caller-requested DATE column rather than prefix-parsed.
+(.sys.exec "printf 'd\n2024-01-02T01:02:03\n2024-01-02\n' > rf_test_csv_types_datesuffix.csv") -- 0
+(set Tdx (.csv.read [DATE] "rf_test_csv_types_datesuffix.csv"))
+(nil? (at (at Tdx 'd) 0)) -- true
+(at (at Tdx 'd) 1) -- 2024.01.02
+
+;; Schema-less inference must use the same strict temporal grammar.  Temporal
+;; prefixes with unconsumed suffixes or bare fractional dots demote to STR
+;; instead of inferring TIME/TIMESTAMP and then silently nulling every row.
+(.sys.exec "awk 'BEGIN{print \"ts\"; for(i=0;i<300;i++) printf(\"2024-01-02 01:02:03 UTC%d\\n\",i)}' > rf_test_csv_types_tssuffix_auto.csv") -- 0
+(set Ttsa (.csv.read "rf_test_csv_types_tssuffix_auto.csv"))
+(type (at Ttsa 'ts)) -- 'STR
+(at (at Ttsa 'ts) 0) -- "2024-01-02 01:02:03 UTC0"
+(.sys.exec "awk 'BEGIN{print \"tm\"; for(i=0;i<300;i++) printf(\"%d:34:56 EST\\n\",i)}' > rf_test_csv_types_timesuffix_auto.csv") -- 0
+(set Tmsa (.csv.read "rf_test_csv_types_timesuffix_auto.csv"))
+(type (at Tmsa 'tm)) -- 'STR
+(at (at Tmsa 'tm) 12) -- "12:34:56 EST"
+(.sys.exec "awk 'BEGIN{print \"tm\"; for(i=0;i<300;i++) printf(\"%d:34:56.\\n\",i)}' > rf_test_csv_types_timedot_auto.csv") -- 0
+(set Tmda (.csv.read "rf_test_csv_types_timedot_auto.csv"))
+(type (at Tmda 'tm)) -- 'STR
+(at (at Tmda 'tm) 12) -- "12:34:56."
+
+;; Lowercase 't' is accepted as the ISO/RFC3339 date-time separator, matching
+;; the already-accepted lowercase 'z' UTC suffix.
+(.sys.exec "printf 'ts\n2024-01-02t01:02:03\n2024-01-02t01:02:03z\n' > rf_test_csv_types_tlower.csv") -- 0
+(set Ttl (.csv.read [TIMESTAMP] "rf_test_csv_types_tlower.csv"))
+(at (at Ttl 'ts) 0) -- 2024.01.02D01:02:03.000000000
+(at (at Ttl 'ts) 1) -- 2024.01.02D01:02:03.000000000
+(type (at (.csv.read "rf_test_csv_types_tlower.csv") 'ts)) -- 'TIMESTAMP
+(.sys.exec "rm -f rf_test_csv_types_datestrict.csv rf_test_csv_types_timestrict.csv rf_test_csv_types_tsstrict.csv rf_test_csv_types_datesuffix.csv rf_test_csv_types_tssuffix_auto.csv rf_test_csv_types_timesuffix_auto.csv rf_test_csv_types_timedot_auto.csv rf_test_csv_types_tlower.csv") -- 0
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 18. Short row guard (p >= row_end path, lines 918+/1086+)

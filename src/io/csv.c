@@ -179,6 +179,10 @@ csv_type_t csv_resolve_int_width(int64_t min, int64_t max, bool has_null) {
     return CSV_TYPE_I64;
 }
 
+RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null);
+RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null);
+RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null);
+
 static csv_type_t detect_type(const char* f, size_t len) {
     if (len == 0) return CSV_TYPE_UNKNOWN;
 
@@ -229,35 +233,20 @@ static csv_type_t detect_type(const char* f, size_t len) {
         return CSV_TYPE_F64;
     }
 
-    /* Date: YYYY-MM-DD (exactly 10 chars) or Timestamp: YYYY-MM-DD{T| }HH:MM:SS */
-    if (len >= 10 && f[4] == '-' && f[7] == '-') {
-        bool is_date = true;
-        for (int i = 0; i < 10; i++) {
-            if (i == 4 || i == 7) continue;
-            if ((unsigned)(f[i] - '0') > 9) { is_date = false; break; }
-        }
-        if (is_date) {
-            if (len == 10) return CSV_TYPE_DATE;
-            if (len >= 19 && (f[10] == 'T' || f[10] == ' ') &&
-                f[13] == ':' && f[16] == ':') {
-                const int tp[] = {11,12,14,15,17,18};
-                bool is_ts = true;
-                for (int i = 0; i < 6; i++) {
-                    if ((unsigned)(f[tp[i]] - '0') > 9) { is_ts = false; break; }
-                }
-                if (is_ts) return CSV_TYPE_TIMESTAMP;
-            }
-        }
+    /* Temporal inference must share the strict full-consumption grammar used
+     * by typed ingest.  Prefix-only checks would infer TIME/TIMESTAMP for
+     * malformed cells like "12:34:56 EST" or "2024-01-02 01:02:03 UTC", then
+     * the strict row parser would silently null the entire inferred column. */
+    bool temporal_null = true;
+    if (len >= 19) {
+        (void)fast_timestamp(f, len, &temporal_null);
+        if (!temporal_null) return CSV_TYPE_TIMESTAMP;
     }
-
-    /* Time: HH:MM:SS[.ffffff] (at least 8 chars) */
-    if (len >= 8 && f[2] == ':' && f[5] == ':') {
-        const int tp[] = {0,1,3,4,6,7};
-        bool is_time = true;
-        for (int i = 0; i < 6; i++) {
-            if ((unsigned)(f[tp[i]] - '0') > 9) { is_time = false; break; }
-        }
-        if (is_time) return CSV_TYPE_TIME;
+    (void)fast_time(f, len, &temporal_null);
+    if (!temporal_null) return CSV_TYPE_TIME;
+    if (len == 10) {
+        (void)fast_date(f, len, &temporal_null);
+        if (!temporal_null) return CSV_TYPE_DATE;
     }
 
     return CSV_TYPE_STR;
@@ -663,10 +652,10 @@ RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns, size
 }
 
 RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
-    /* Require "YYYY-MM-DD" + 'T'|' ' separator + "HH:MM:SS" (>=19 chars),
+    /* Require "YYYY-MM-DD" + 'T'|'t'|' ' separator + "HH:MM:SS" (>=19 chars),
      * matching detect_type() and csv_write_timestamp().  A malformed date/time
      * separator (e.g. "2024x01x02D01:02:03") is rejected as null. */
-    if (RAY_UNLIKELY(len < 19 || (p[10] != 'T' && p[10] != ' '))) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(len < 19 || (p[10] != 'T' && p[10] != 't' && p[10] != ' '))) { *is_null = true; return 0; }
     *is_null = false;
     int32_t days = fast_date(p, 10, is_null);
     if (*is_null) return 0;
