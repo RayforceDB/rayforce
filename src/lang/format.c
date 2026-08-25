@@ -30,6 +30,7 @@
 #include "mem/heap.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <inttypes.h>
@@ -44,8 +45,22 @@ typedef struct {
     ray_t*  block;  /* ray_alloc'd backing block */
 } fmt_buf_t;
 
+/* Terminal failure for an unrepresentable or unallocatable format buffer.
+ * The fmt_* helpers are all void, so there is no caller to return
+ * ray_error to; before this guard the doubling loop used to overflow
+ * int32 and spin forever (see fmt_ensure), and a failed ray_alloc was
+ * dereferenced unchecked.  A loud stop beats a silent hang.  SIGABRT also
+ * gives the crash handler a chance to dump state for diagnosis. */
+static void fmt_fatal(const char* why) {
+    fprintf(stderr, "error: format: %s\n", why);
+    fflush(stderr);
+    abort();
+}
+
 static void fmt_init(fmt_buf_t* b) {
     b->block = ray_alloc(256);
+    if (!b->block || RAY_IS_ERR(b->block))
+        fmt_fatal("cannot allocate the initial output buffer");
     b->buf   = (char*)ray_data(b->block);
     b->len   = 0;
     b->cap   = 256;
@@ -62,11 +77,24 @@ static void fmt_destroy(fmt_buf_t* b) {
 }
 
 static void fmt_ensure(fmt_buf_t* b, int32_t extra) {
-    if (b->len + extra <= b->cap) return;
-    int32_t new_cap = b->cap;
-    while (new_cap < b->len + extra)
+    /* Compute the requirement in int64: len/extra are int32 and both the
+     * fast-path compare and the doubling loop used to overflow silently.
+     * At cap == 2^30 one more `new_cap *= 2` overflowed int32, wrapped
+     * through negative to 0, and spun in this loop forever at 100% CPU —
+     * a full process hang from e.g. (println <100M-row vector>) whose
+     * formatted text exceeds 1 GiB. */
+    int64_t need = (int64_t)b->len + (int64_t)extra;
+    if (need <= (int64_t)b->cap) return;
+    if (extra < 0 || need > (int64_t)INT32_MAX)
+        fmt_fatal("formatted output exceeds the 2GiB buffer limit");
+    int64_t new_cap = b->cap;
+    while (new_cap < need)
         new_cap *= 2;
+    if (new_cap > (int64_t)INT32_MAX)
+        new_cap = INT32_MAX;
     ray_t* new_block = ray_alloc((size_t)new_cap);
+    if (!new_block || RAY_IS_ERR(new_block))
+        fmt_fatal("out of memory growing the output buffer");
     char*  new_buf   = (char*)ray_data(new_block);
     memcpy(new_buf, b->buf, (size_t)b->len);
     ray_free(b->block);
