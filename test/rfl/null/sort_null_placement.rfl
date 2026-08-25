@@ -77,4 +77,24 @@
 (nil? (at (at (select {n: n s: s from: B where: (!= s "zzz") asc: n take: 3}) 'n) 2)) -- true
 (nil? (at (at (select {n: n s: s from: B where: (!= s "zzz") desc: n take: 3}) 'n) 0)) -- false
 
+;; ── Window functions sort by their partition keys, and pick between three
+;;    sort paths by row count — insertion below 64 rows, radix above it, merge
+;;    otherwise.  Placement itself is not visible here, since a group is a run
+;;    of equal keys and the null run reads the same from either end; what these
+;;    pin is that the paths agree on WHICH rows are null, across the threshold
+;;    that chooses between them. ──────────────────────────────────────────────
+(set _Ws (table [k v] (list [0N 1 0N 2 1] [10 20 30 40 50])))
+(at (window {from: _Ws part: [k] funcs: {mn: (min v)}}) 'mn) -- [10 20 10 40 20]
+
+(set _Wk (concat [0N 1 0N 2 1 0N 1 0N 2 1] (til 90)))
+(set _Wl (table [k v] (list _Wk (til 100))))
+(count _Wl) -- 100
+;; the four null-key rows form one group: v = 0,2,5,7 → min 0
+(at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 0) -- 0
+(at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 2) -- 0
+(at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 5) -- 0
+(at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 7) -- 0
+;; and the non-null groups are unaffected: k=1 rows are 1,4,6,9,11 → min 1
+(at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 1) -- 1
+
 (.sys.exec "rm -f rf_np.csv") -- 0
