@@ -15136,6 +15136,30 @@ static void wj_scan_fn(void* ctx_, uint32_t worker_id, int64_t start, int64_t en
  *
  * The legacy asof fall-through ((window-join L R [keys] time)) is mode-agnostic.
  */
+static int8_t join_i64_eq_key_type(ray_t* col) {
+    if (!col) return 0;
+    int8_t t = col->type;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return t;
+}
+
+static bool join_i64_eq_key_supported(int8_t t) {
+    switch (t) {
+    case RAY_BOOL:
+    case RAY_U8:
+    case RAY_I16:
+    case RAY_I32:
+    case RAY_I64:
+    case RAY_DATE:
+    case RAY_TIME:
+    case RAY_TIMESTAMP:
+    case RAY_SYM:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
     if (n < 4) return ray_error("domain", "window-join: expects keys, intervals, left and right tables, got %lld args", (long long)n);
 
@@ -15206,20 +15230,17 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
                 return ray_error("domain", "window-join: equality key column not found in both tables");
             }
-            /* STR equality-key columns are silently mismatched: window-join
-             * sorts and probes eq cells through read_col_i64, which has no
-             * RAY_STR case (it reads one raw byte per row), so once there are
-             * enough distinct keys the byte collisions cross-contaminate
-             * groups and the aggregates are WRONG.  Decline both sides — the
-             * base equi-join has a STR-aware kernel, these window kernels do
-             * not. */
-            int8_t lct = left_eq[e]->type, rct = right_eq[e]->type;
-            if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
-            if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
-            if (lct == RAY_STR || rct == RAY_STR) {
+            /* Equality keys in the window kernels are sorted/probed through
+             * read_col_i64. Decline any type that reader cannot represent
+             * instead of silently comparing the wrong bytes. */
+            int8_t lct = join_i64_eq_key_type(left_eq[e]);
+            int8_t rct = join_i64_eq_key_type(right_eq[e]);
+            if (!join_i64_eq_key_supported(lct) ||
+                !join_i64_eq_key_supported(rct)) {
                 scratch_free(eq_hdr);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
-                return ray_error("nyi", "window-join: string equality key columns are not supported");
+                return ray_error("nyi", "window-join: equality key column types %s and %s are not supported",
+                                 ray_type_name(lct), ray_type_name(rct));
             }
         }
 
@@ -15783,15 +15804,15 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: equality key column not found"); }
         ray_t* lcol = ray_table_get_col(left_tbl, eq_elems[i]->i64);
         ray_t* rcol = ray_table_get_col(right_tbl, eq_elems[i]->i64);
-        int8_t lct = lcol ? lcol->type : (int8_t)0;
-        int8_t rct = rcol ? rcol->type : (int8_t)0;
-        if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
-        if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
-        if (lct == RAY_STR || rct == RAY_STR) {
+        int8_t lct = join_i64_eq_key_type(lcol);
+        int8_t rct = join_i64_eq_key_type(rcol);
+        if (!join_i64_eq_key_supported(lct) ||
+            !join_i64_eq_key_supported(rct)) {
             scratch_free(eqops_hdr);
             ray_graph_free(g);
             if (_bxeq) ray_release(_bxeq);
-            return ray_error("nyi", "window-join: string equality key columns are not supported");
+            return ray_error("nyi", "window-join: equality key column types %s and %s are not supported",
+                             ray_type_name(lct), ray_type_name(rct));
         }
     }
 
@@ -15903,22 +15924,19 @@ static ray_t* ray_asof_join_core(ray_t* keys_vec, ray_t* left_tbl, ray_t* right_
         if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: unknown equality key symbol"); }
         eq_ops[i] = ray_scan(g, ray_str_ptr(nm));
         if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: equality key column not found"); }
-        /* STR equality-key columns are silently mismatched: the asof kernel
-         * reads eq cells through read_col_i64 (asof_eq_lread), which has no
-         * RAY_STR case, so string keys compare as raw bytes and yield WRONG
-         * results (a key that should match can null out).  The base equi-join
-         * has a separate STR-aware kernel; asof does not, so decline both
-         * sides rather than return corrupt data. */
+        /* The asof kernel reads equality keys through read_col_i64
+         * (asof_eq_lread). Decline types it cannot represent instead of
+         * returning silently corrupted matches. */
         ray_t* lcol = ray_table_get_col(left_tbl, eq_syms[i]->i64);
         ray_t* rcol = ray_table_get_col(right_tbl, eq_syms[i]->i64);
-        int8_t lct = lcol ? lcol->type : (int8_t)0;
-        int8_t rct = rcol ? rcol->type : (int8_t)0;
-        if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
-        if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
-        if (lct == RAY_STR || rct == RAY_STR) {
+        int8_t lct = join_i64_eq_key_type(lcol);
+        int8_t rct = join_i64_eq_key_type(rcol);
+        if (!join_i64_eq_key_supported(lct) ||
+            !join_i64_eq_key_supported(rct)) {
             scratch_free(eqops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
-            return ray_error("nyi", "asof-join: string equality key columns are not supported");
+            return ray_error("nyi", "asof-join: equality key column types %s and %s are not supported",
+                             ray_type_name(lct), ray_type_name(rct));
         }
     }
 
