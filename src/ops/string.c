@@ -564,6 +564,24 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
     if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
     if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
 
+    int8_t in_type = input->type;
+    bool in_parted = RAY_IS_PARTED(in_type);
+    int8_t base_type = in_parted ? (int8_t)RAY_PARTED_BASETYPE(in_type) : in_type;
+
+    /* Shapes this executor doesn't own — scalar subjects, list-of-atom
+     * columns (the legacy STRL splayed-load shape), unsupported types —
+     * delegate to the direct builtin BEFORE reading input->len or
+     * allocating: an atom's SSO bytes alias ->len, so the result alloc
+     * below would request a garbage capacity, and the old fallthrough
+     * memset made unsupported predicates silently match nothing. */
+    bool vec_shape = in_parted ? (base_type == RAY_STR || RAY_IS_SYM(base_type))
+                               : (in_type == RAY_STR || RAY_IS_SYM(in_type));
+    if (!vec_shape) {
+        ray_t* r = ray_like_fn(input, pat_v);
+        ray_release(input); ray_release(pat_v);
+        return r;
+    }
+
     /* Get pattern string */
     const char* pat_str = ray_str_ptr(pat_v);
     size_t pat_len = ray_str_len(pat_v);
@@ -575,9 +593,6 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
     ray_glob_compiled_t pc = ray_glob_compile(pat_str, pat_len);
     bool use_simple = pc.shape != RAY_GLOB_SHAPE_NONE;
 
-    int8_t in_type = input->type;
-    bool in_parted = RAY_IS_PARTED(in_type);
-    int8_t base_type = in_parted ? (int8_t)RAY_PARTED_BASETYPE(in_type) : in_type;
     int64_t len = in_parted ? parted_row_count(input) : input->len;
     ray_t* result = ray_vec_new(RAY_BOOL, len);
     if (!result || RAY_IS_ERR(result)) {
@@ -739,21 +754,6 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
                           : ray_glob_match(sp, sl, pat_str, pat_len)) ? 1 : 0;
             }
         }
-    } else if (in_type == RAY_LIST) {
-        /* List of string/symbol atoms — the shape splayed string columns
-         * load as (col_load_str_list).  Delegate to the builtin, which
-         * owns the list branch. */
-        ray_release(result);
-        ray_t* r = ray_like_fn(input, pat_v);
-        ray_release(input); ray_release(pat_v);
-        return r;
-    } else {
-        /* Previously memset-zero: a predicate over an unsupported column
-         * type silently matched nothing.  Surface the type error the
-         * direct builtin raises instead. */
-        ray_release(result); ray_release(input); ray_release(pat_v);
-        return ray_error("type", "like: expects a string or symbol column, got %s",
-                         ray_type_name(in_type));
     }
 
     ray_release(input); ray_release(pat_v);
@@ -761,6 +761,57 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
 }
 
 /* Case-insensitive LIKE — same syntax as `like`, ASCII-fold both sides. */
+
+/* ILIKE over the shapes exec_ilike's vector loops don't own — scalar
+ * subjects, list-of-atom columns (the legacy STRL splayed-load shape) —
+ * plus the type error for everything else.  ilike has no direct builtin
+ * to delegate to, so this mirrors ray_like_fn's atom and list branches
+ * with the case-folded matcher. */
+static ray_t* ilike_non_vec(ray_t* input, const char* pat_str, size_t pat_len) {
+    if (input->type == -RAY_STR || input->type == -RAY_SYM) {
+        ray_t* sym_str = NULL;
+        const char* s; size_t sl;
+        if (input->type == -RAY_SYM) {
+            sym_str = ray_sym_str(input->i64);
+            s  = sym_str ? ray_str_ptr(sym_str) : "";
+            sl = sym_str ? ray_str_len(sym_str) : 0;
+        } else {
+            s  = ray_str_ptr(input);
+            sl = ray_str_len(input);
+        }
+        bool m = ray_glob_match_ci(s, sl, pat_str, pat_len);
+        if (sym_str) ray_release(sym_str);
+        return ray_bool(m);
+    }
+    if (input->type == RAY_LIST) {
+        int64_t n = input->len;
+        ray_t* result = ray_vec_new(RAY_BOOL, n);
+        if (!result || RAY_IS_ERR(result)) return result;
+        result->len = n;
+        uint8_t* out = (uint8_t*)ray_data(result);
+        ray_t** items = (ray_t**)ray_data(input);
+        for (int64_t i = 0; i < n; i++) {
+            ray_t* it = items[i];
+            ray_t* sym_str = NULL;
+            const char* s; size_t sl;
+            if (it && it->type == -RAY_STR) {
+                s  = ray_str_ptr(it);
+                sl = ray_str_len(it);
+            } else if (it && it->type == -RAY_SYM) {
+                sym_str = ray_sym_str(it->i64);
+                s  = sym_str ? ray_str_ptr(sym_str) : "";
+                sl = sym_str ? ray_str_len(sym_str) : 0;
+            } else {
+                ray_release(result);
+                return ray_error("type", "ilike: list items must be string or symbol atoms");
+            }
+            out[i] = ray_glob_match_ci(s, sl, pat_str, pat_len) ? 1 : 0;
+            if (sym_str) ray_release(sym_str);
+        }
+        return result;
+    }
+    return ray_error("type", "ilike: expects string or symbol");
+}
 
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
@@ -771,6 +822,16 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
     const char* pat_str = ray_str_ptr(pat_v);
     size_t pat_len = ray_str_len(pat_v);
 
+    int8_t in_type = input->type;
+    /* Dispatch before reading input->len or allocating — an atom's SSO
+     * bytes alias ->len, and the old fallthrough memset made ilike over
+     * an unsupported column type silently match nothing. */
+    if (in_type != RAY_STR && !RAY_IS_SYM(in_type)) {
+        ray_t* r = ilike_non_vec(input, pat_str, pat_len);
+        ray_release(input); ray_release(pat_v);
+        return r;
+    }
+
     int64_t len = input->len;
     ray_t* result = ray_vec_new(RAY_BOOL, len);
     if (!result || RAY_IS_ERR(result)) {
@@ -780,7 +841,6 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
     result->len = len;
     uint8_t* dst = (uint8_t*)ray_data(result);
 
-    int8_t in_type = input->type;
     if (in_type == RAY_STR) {
         const ray_str_t* elems; const char* pool;
         str_resolve(input, &elems, &pool);
@@ -834,8 +894,6 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
                 dst[i] = ray_glob_match_ci(ray_str_ptr(s), ray_str_len(s), pat_str, pat_len) ? 1 : 0;
             }
         }
-    } else {
-        memset(dst, 0, (size_t)len);
     }
 
     ray_release(input); ray_release(pat_v);
