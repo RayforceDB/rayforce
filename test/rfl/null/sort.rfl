@@ -63,16 +63,16 @@
 (at (at (xasc Tn 'k) 'k) 4) -- 3
 
 ;; ────────────── (select {asc:}) exec_sort path — nulls land LAST ──────────────
-;; NOTE: the (select {asc: k}) exec_sort path puts nulls LAST, the OPPOSITE of
-;; (asc vec)/xasc which put nulls FIRST. Same key column [2 0Nl 1 0Nl 3] yields
-;; [0Nl 0Nl 1 2 3] under xasc but [1 2 3 0Nl 0Nl] under (select {asc:}).
-;; This split is asserted to its ACTUAL behaviour, not normalised away.
-(at (select {from: Tn asc: k}) 'k) -- [1 2 3 0Nl 0Nl]
-(nil? (at (at (select {from: Tn asc: k}) 'k) 4)) -- true
-(nil? (at (at (select {from: Tn asc: k}) 'k) 3)) -- true
-;; survivors still ascend ahead of the trailing null block:
-(at (at (select {from: Tn asc: k}) 'k) 0) -- 1
-(at (at (select {from: Tn asc: k}) 'k) 2) -- 3
+;; A null is the smallest value, so ascending puts nulls first — the same
+;; answer (asc vec)/xasc give.  These two used to disagree: the query path
+;; put nulls last while the bare verb put them first, and both were asserted
+;; as correct (#417).
+(at (select {from: Tn asc: k}) 'k) -- [0Nl 0Nl 1 2 3]
+(nil? (at (at (select {from: Tn asc: k}) 'k) 0)) -- true
+(nil? (at (at (select {from: Tn asc: k}) 'k) 1)) -- true
+;; survivors still ascend behind the leading null block:
+(at (at (select {from: Tn asc: k}) 'k) 2) -- 1
+(at (at (select {from: Tn asc: k}) 'k) 4) -- 3
 (count (select {from: Tn asc: k})) -- 5
 
 ;; ────────────── take with nulls — negative count slices from tail ──────────────

@@ -124,9 +124,10 @@
 (at RSm 'Seq) -- [0 1 3]
 
 ;; ══════════════════════════════════════════════════════════════════════════
-;; POSITIVE 6 — NULL in the key.  Nulls sort LAST for asc, so a small k never
-;; selects a null unless there are < k non-null rows.  Parity with flat proves
-;; the streamed null handling matches.
+;; POSITIVE 6 — NULL in the key.  A null is the smallest value, so a small k
+;; selects the nulls first and only then real values.  Parity with flat proves
+;; the streamed null handling matches — and it is what caught the streamed
+;; path keeping its own null policy after the shared one changed (#417).
 ;; ══════════════════════════════════════════════════════════════════════════
 (.sys.exec "rm -rf /tmp/rfl_tk6")
 (set N1 (table [v Seq] (list [7 0N 3] [0 1 2])))
@@ -142,8 +143,8 @@
 (set RFn (select {v: v Seq: Seq from: NF asc: v take: 3}))
 (at RSn 'v)   -- (at RFn 'v)
 (at RSn 'Seq) -- (at RFn 'Seq)
-;; smallest three non-null: 1(Seq4),3(Seq2),7(Seq0)
-(at RSn 'Seq) -- [4 2 0]
+;; smallest three: null(Seq1), null(Seq3), then 1(Seq4)
+(at RSn 'Seq) -- [1 3 4]
 
 ;; ══════════════════════════════════════════════════════════════════════════
 ;; POSITIVE 7 — WHERE + asc + take streaming (filter THEN top-k), == flat oracle.

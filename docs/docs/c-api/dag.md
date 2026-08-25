@@ -206,6 +206,8 @@ ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input,
 
 Multi-column sort. Pass arrays of key nodes, sort directions (1=descending), and null ordering (1=nulls first). Uses parallel radix sort for numerics, merge sort for strings.
 
+Passing `NULL` for `nulls_first` takes the default, which treats a null as the smallest value: nulls first when ascending, last when descending. A top-k over a column that holds nulls therefore returns those nulls, since they are the smallest rows.
+
 ```c
 ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                     ray_op_t** keys, uint8_t* descs,
