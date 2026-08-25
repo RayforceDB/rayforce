@@ -97,4 +97,21 @@
 ;; and the non-null groups are unaffected: k=1 rows are 1,4,6,9,11 → min 1
 (at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 1) -- 1
 
+;; ── take must be a PREFIX of the sorted order.  This is the contract, not
+;;    just a matter of taste: the same data placed SYM nulls at opposite ends
+;;    depending on whether take: was present, because the take path consulted
+;;    a different rule than the sort did.  Stated as a differential rather
+;;    than as literals, so it holds whatever the placement is. ──────────────
+(take (at (select {s: s from: B asc: s}) 's) 6) -- (at (select {s: s n: n from: B where: (!= s 'zzz) asc: s take: 6}) 's)
+(take (at (select {n: n from: B desc: n}) 'n) 6) -- (at (select {s: s n: n from: B where: (!= s 'zzz) desc: n take: 6}) 'n)
+
+;; ── top/bot over a bare vector choose a bounded heap below k = len and a
+;;    full sort at or above it.  The same prefix contract applies across that
+;;    switch, so the two must not disagree about where nulls sit. ───────────
+(set _Tv [3 0N 1 0N 2])
+(take (asc _Tv) 3) -- (bot _Tv 3)
+(bot _Tv 5) -- (asc _Tv)
+(take (desc _Tv) 3) -- (top _Tv 3)
+(top _Tv 5) -- (desc _Tv)
+
 (.sys.exec "rm -f rf_np.csv") -- 0

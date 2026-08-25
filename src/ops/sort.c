@@ -3375,10 +3375,12 @@ ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
         return desc ? ray_desc_fn(v) : ray_asc_fn(v);
     }
 
-    /* Try the bounded-heap fast path.  Default nulls-last for ASC,
-     * nulls-first for DESC (matches sort defaults so the gathered
-     * non-null prefix is always K elements when nulls fit). */
-    uint8_t nf = desc ? 1 : 0;
+    /* Try the bounded-heap fast path.  It takes the placement from the
+     * shared rule, because the k >= len branch above hands the whole job
+     * to the full sort, which uses that rule: spelling out a different
+     * one here would put a null-bearing vector's nulls at one end while
+     * k < len and the other once k reaches it. */
+    uint8_t nf = sort_nulls_first(desc);
     ray_t* idx = topk_indices_single(v, desc, nf, len, k);
     if (idx && !RAY_IS_ERR(idx)) {
         const int64_t* idata = (const int64_t*)ray_data(idx);
