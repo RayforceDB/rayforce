@@ -74,3 +74,11 @@
 ;; Anonymous lambda in head position: e[0]->type == RAY_LAMBDA (not -RAY_SYM)
 ;; → try_sum_affine_expr returns NULL at line 183; sum falls back to normal path
 (sum ((fn [a b] (+ a b)) [1 2 3] 10)) -- 36
+
+;; ── affine fast path wraps on i64 overflow (no signed-overflow UB) ───────────
+;; (sum (+ v c)) folds to sum_i(v) + c*n; both the c*n multiply and the final
+;; add must wrap deterministically in int64 two's-complement, matching flat sum.
+;;   v=[MAX MAX], c=2: sum_i = -2 (wrap), + 2*2 => 2
+(sum (+ [9223372036854775807 9223372036854775807] 2)) -- 2
+;;   v=[MAX 1],  c=1: sum_i = MIN (wrap), + 1*2 => MIN+2
+(sum (+ [9223372036854775807 1] 1)) -- -9223372036854775806
