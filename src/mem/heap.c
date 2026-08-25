@@ -879,10 +879,13 @@ static void ray_release_owned_refs(ray_t* v) {
         return;
     }
 
-    /* Vector with attached index: aux[0..7] holds an owning ref to
-     * the index ray_t.  The index owns the displaced str_pool,
-     * so we must NOT also try to release those off the parent — they
-     * aren't there anymore.  Skip the STR_pool branch. */
+    /* Vector with attached index: aux[0..7] holds an owning ref to the
+     * index ray_t.  Bytes 8-15 are NOT displaced into the index for a
+     * STR or SYM parent — attach_finalize leaves the pool or domain
+     * pointer in place there (ops/idxop.c, and the layout note in
+     * rayforce.h), and ray_index_release_saved is a no-op.  So the ref
+     * taken when that pool or domain was attached is still this
+     * vector's to drop, exactly as for an unindexed one. */
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
         /* A mmap-resident index (mmod==1) is a PASSENGER in this column's file
          * mapping — the column's single munmap frees it.  Releasing it here
@@ -890,6 +893,10 @@ static void ray_release_owned_refs(ray_t* v) {
          * heap-built index (mmod==0) is released by pointer. */
         if (v->index && !RAY_IS_ERR(v->index) && v->index->mmod != 1)
             ray_release(v->index);
+        if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
+            ray_release(v->str_pool);
+        else if (v->type == RAY_SYM && v->sym_domain)
+            ray_sym_domain_release(v->sym_domain);
         return;
     }
 
@@ -1008,9 +1015,16 @@ bool ray_retain_owned_refs(ray_t* v) {
 
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
         /* Mirror ray_release_owned_refs: a mmap-resident passenger index
-         * (mmod==1) is owned by the column's mapping, not refcounted here. */
+         * (mmod==1) is owned by the column's mapping, not refcounted here,
+         * and the pool or domain at bytes 8-15 is this copy's to take a
+         * ref on — skipping it is what let a copy that later sheds its
+         * index release a reference it never held. */
         if (v->index && !RAY_IS_ERR(v->index) && v->index->mmod != 1)
             ray_retain(v->index);
+        if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
+            ray_retain(v->str_pool);
+        else if (v->type == RAY_SYM && v->sym_domain)
+            ray_sym_domain_retain(v->sym_domain);
         return true;
     }
 
