@@ -686,13 +686,27 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 ray_t* col = ray_table_get_col(tbl, ext->sym);
                 if (!col) EXPR_BAIL(EXPR_BAIL_OTHER);
                 if (col->type == RAY_MAPCOMMON) EXPR_BAIL(EXPR_BAIL_MAPCOMMON);
-                if (col->type == RAY_STR) EXPR_BAIL(EXPR_BAIL_STR); /* RAY_STR needs string comparison path */
+                /* Bail on the ELEMENT type: a parted wrapper carries
+                 * RAY_PARTED_BASE + base and would sail past checks on
+                 * col->type — a parted GUID column then zero-filled
+                 * every lane and matched everything. */
+                int8_t elem = RAY_IS_PARTED(col->type)
+                            ? (int8_t)RAY_PARTED_BASETYPE(col->type)
+                            : col->type;
+                if (elem == RAY_STR) EXPR_BAIL(EXPR_BAIL_STR); /* RAY_STR needs string comparison path */
                 /* GUID cells are 16-byte blobs the fused program has no
                  * loads or compares for — without this bail the compiled
                  * expression read garbage and predicates silently
                  * matched nothing.  The unfused executor compares GUIDs
                  * correctly. */
-                if (col->type == RAY_GUID) EXPR_BAIL(EXPR_BAIL_GUID);
+                if (elem == RAY_GUID) EXPR_BAIL(EXPR_BAIL_GUID);
+                /* Whitelist of element types expr_load_i64/f64 decode.
+                 * Anything else (RAY_LIST from a legacy STRL splayed
+                 * load, nested columns, future types) hits the loaders'
+                 * default arm, which zero-fills the lane buffer. */
+                if (!((elem >= RAY_BOOL && elem <= RAY_TIMESTAMP) ||
+                      elem == RAY_SYM))
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
                 if (col->attrs & RAY_ATTR_SLICE)     EXPR_BAIL(EXPR_BAIL_SLICE);
                 /* Length-1 columns used as scalar broadcasts are handled by the
                  * fallback's exec_elementwise_binary (which has vec/scalar routing).
@@ -3613,6 +3627,23 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                 out[i] = (opc == OP_EQ) ? eq : (uint8_t)!eq;
             }
             return result;
+        }
+    }
+
+    /* Gate vector operands on the types the numeric loops can read.
+     * Anything else (RAY_LIST from a legacy STRL splayed load, nested
+     * shapes, future types) previously fell into read_col_* default
+     * arms, which read the cells at the wrong width and silently
+     * mismatched every row. */
+    {
+        bool l_ok = l_scalar || (lhs->type >= RAY_BOOL && lhs->type <= RAY_TIMESTAMP)
+                             || RAY_IS_SYM(lhs->type);
+        bool r_ok = r_scalar || (rhs->type >= RAY_BOOL && rhs->type <= RAY_TIMESTAMP)
+                             || RAY_IS_SYM(rhs->type);
+        if (!l_ok || !r_ok) {
+            ray_release(result);
+            return ray_error("type", "expr eval: unsupported column type in binary op, got %s and %s",
+                             ray_type_name(lhs->type), ray_type_name(rhs->type));
         }
     }
 
