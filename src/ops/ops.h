@@ -878,7 +878,9 @@ void ray_graph_dump(ray_graph_t* g, ray_op_t* root, void* out);
 
 /* Sort columns and return index array (I64 vector of sorted indices).
  * Uses parallel radix sort for numerics, merge sort for strings/symbols.
- * descs/nulls_first may be NULL (all-asc / nulls-last default). */
+ * descs/nulls_first may be NULL: all-ascending, and the placement each
+ * direction gets from sort_nulls_first — a null is the smallest value,
+ * so nulls lead ascending and trail descending. */
 ray_t* ray_sort_indices(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                         uint8_t n_cols, int64_t nrows);
 
