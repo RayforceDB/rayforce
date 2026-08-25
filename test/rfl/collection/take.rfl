@@ -175,12 +175,21 @@
 (count (take [1 2 3 4 5] [2 0])) -- 0
 ;; range take with start = count → empty
 (count (take [1 2 3 4 5] [5 3])) -- 0
-;; INT64_MIN count: `-INT64_MIN` is signed-overflow UB (was tripped computing
-;; the magnitude in every scalar-count take branch — vector, string, char,
-;; scalar, list).  Its magnitude is unrepresentable as int64, so it is a range
-;; error, not UB followed by a bogus allocation.
-(take [1 2 3] -9223372036854775808) !- range
-(take "hello" -9223372036854775808) !- range
-(take "a" -9223372036854775808) !- range
-(take 42 -9223372036854775808) !- range
-(take (list 1 2 3) -9223372036854775808) !- range
+;; INT64_MIN count is the i64 null sentinel (0N), and `-INT64_MIN` is signed-
+;; overflow UB (was tripped computing the magnitude in every scalar-count take
+;; branch — vector, string, char, scalar, list).  Reject it as a *type* error,
+;; symmetric with drop and the window verbs, rather than negating a null count.
+(take [1 2 3] -9223372036854775808) !- type
+(take "hello" -9223372036854775808) !- type
+(take "a" -9223372036854775808) !- type
+(take 42 -9223372036854775808) !- type
+(take (list 1 2 3) -9223372036854775808) !- type
+;; Float counts are rejected up front as a type error.  The guard also covers
+;; F32 (as_i64 on an f32 would bit-read the storage and mis-fire the INT64_MIN
+;; check), but F32 atoms have no rfl literal / `as` form, so only F64 is pinned.
+(take [1 2 3] 2.5) !- type
+;; Range take: amount up to INT64_MAX must clamp to the available length;
+;; `start + amount` overflowed int64 (UB → bogus count → memcpy) before the fix.
+(take [1 2 3] [1 9223372036854775807]) -- [2 3]
+(take "hello" [1 9223372036854775807]) -- "ello"
+(count (take (list 1 2 3) [1 9223372036854775807])) -- 2
