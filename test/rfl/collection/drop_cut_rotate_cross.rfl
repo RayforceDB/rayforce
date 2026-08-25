@@ -4,9 +4,10 @@
 (drop [1 2 3 4 5] -2) -- [1 2 3]
 (drop [1 2 3] 10) -- []
 (drop [1 2 3] -10) -- []
-;; INT64_MIN count: `-INT64_MIN` is signed-overflow UB (was tripped in
-;; ray_drop_fn); |n| that large drops the whole collection.
-(drop [1 2 3] -9223372036854775808) -- []
+;; INT64_MIN count is the i64 null sentinel (0N), and `-INT64_MIN` is signed-
+;; overflow UB (was tripped in ray_drop_fn).  Reject it as a type error,
+;; symmetric with take, rather than silently dropping the whole collection.
+(drop [1 2 3] -9223372036854775808) !- type
 (drop "abcdef" 2) -- "cdef"
 (drop "abcdef" -2) -- "abcd"
 (drop ['a 'b 'c] 1) -- ['b 'c]

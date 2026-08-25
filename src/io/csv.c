@@ -179,6 +179,10 @@ csv_type_t csv_resolve_int_width(int64_t min, int64_t max, bool has_null) {
     return CSV_TYPE_I64;
 }
 
+RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null);
+RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null);
+RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null);
+
 static csv_type_t detect_type(const char* f, size_t len) {
     if (len == 0) return CSV_TYPE_UNKNOWN;
 
@@ -229,35 +233,20 @@ static csv_type_t detect_type(const char* f, size_t len) {
         return CSV_TYPE_F64;
     }
 
-    /* Date: YYYY-MM-DD (exactly 10 chars) or Timestamp: YYYY-MM-DD{T| }HH:MM:SS */
-    if (len >= 10 && f[4] == '-' && f[7] == '-') {
-        bool is_date = true;
-        for (int i = 0; i < 10; i++) {
-            if (i == 4 || i == 7) continue;
-            if ((unsigned)(f[i] - '0') > 9) { is_date = false; break; }
-        }
-        if (is_date) {
-            if (len == 10) return CSV_TYPE_DATE;
-            if (len >= 19 && (f[10] == 'T' || f[10] == ' ') &&
-                f[13] == ':' && f[16] == ':') {
-                const int tp[] = {11,12,14,15,17,18};
-                bool is_ts = true;
-                for (int i = 0; i < 6; i++) {
-                    if ((unsigned)(f[tp[i]] - '0') > 9) { is_ts = false; break; }
-                }
-                if (is_ts) return CSV_TYPE_TIMESTAMP;
-            }
-        }
+    /* Temporal inference must share the strict full-consumption grammar used
+     * by typed ingest.  Prefix-only checks would infer TIME/TIMESTAMP for
+     * malformed cells like "12:34:56 EST" or "2024-01-02 01:02:03 UTC", then
+     * the strict row parser would silently null the entire inferred column. */
+    bool temporal_null = true;
+    if (len >= 19) {
+        (void)fast_timestamp(f, len, &temporal_null);
+        if (!temporal_null) return CSV_TYPE_TIMESTAMP;
     }
-
-    /* Time: HH:MM:SS[.ffffff] (at least 8 chars) */
-    if (len >= 8 && f[2] == ':' && f[5] == ':') {
-        const int tp[] = {0,1,3,4,6,7};
-        bool is_time = true;
-        for (int i = 0; i < 6; i++) {
-            if ((unsigned)(f[tp[i]] - '0') > 9) { is_time = false; break; }
-        }
-        if (is_time) return CSV_TYPE_TIME;
+    (void)fast_time(f, len, &temporal_null);
+    if (!temporal_null) return CSV_TYPE_TIME;
+    if (len == 10) {
+        (void)fast_date(f, len, &temporal_null);
+        if (!temporal_null) return CSV_TYPE_DATE;
     }
 
     return CSV_TYPE_STR;
@@ -515,8 +504,20 @@ RAY_INLINE int32_t civil_to_days(int y, int m, int d) {
     return (int32_t)(era * 146097 + doe - 719468 - 10957);
 }
 
+/* Strict YYYY-MM-DD: exactly 10 chars, '-' separators at offsets 4/7, and
+ * digits in every field.  Mirrors detect_type() and csv_write_date() so that
+ * typed .csv.read [DATE] round-trips the writer's output while rejecting
+ * malformed separators or trailing garbage (e.g. "2024/01/02", "2024x01x02",
+ * "2024-01-02junk") as null instead of silently coercing them to a bogus
+ * date.  fast_timestamp() reuses this on the leading date (passing len 10). */
 RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
-    if (RAY_UNLIKELY(len < 10)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(len != 10 || p[4] != '-' || p[7] != '-')) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY((unsigned)(p[0]-'0') > 9u || (unsigned)(p[1]-'0') > 9u ||
+                     (unsigned)(p[2]-'0') > 9u || (unsigned)(p[3]-'0') > 9u ||
+                     (unsigned)(p[5]-'0') > 9u || (unsigned)(p[6]-'0') > 9u ||
+                     (unsigned)(p[8]-'0') > 9u || (unsigned)(p[9]-'0') > 9u)) {
+        *is_null = true; return 0;
+    }
     *is_null = false;
     int y = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
     int m = (p[5]-'0')*10 + (p[6]-'0');
@@ -531,11 +532,12 @@ RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
  * or >=24h duration verbatim — a leading '-' plus an unbounded hour field
  * (e.g. "-00:00:01", "25:00:00") rather than wrapping modulo a day.  Parse
  * that same shape back so .csv.write -> .csv.read [TIME] round-trips: an
- * optional sign, a variable-width hour field (NOT capped at 23), then MM:SS
- * with an optional fractional part.  MM/SS stay at the fixed offsets after
- * the hour field and the separator characters are not themselves validated,
- * matching the historical lenient behaviour.  A magnitude that overflows
- * int32 milliseconds is rejected as null. */
+ * optional sign, a variable-width hour field (NOT capped at 23), then ":MM:SS"
+ * with an optional fractional part.  The ':' separators and the MM/SS/fraction
+ * digits ARE validated and the field must be fully consumed, so malformed
+ * separators or trailing garbage (e.g. "12-34-56", "12:34:56xyz") are rejected
+ * as null rather than silently coerced.  A magnitude that overflows int32
+ * milliseconds is likewise rejected as null. */
 RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
     *is_null = false;
     size_t  o    = 0;
@@ -550,21 +552,30 @@ RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
         if (RAY_UNLIKELY(++hd - o > 7)) { *is_null = true; return 0; }
     }
     size_t w = hd - o;                        /* hour digit count */
-    /* Need the hour field plus ":MM:SS" (6 more chars). */
+    /* Need the hour field plus ":MM:SS" (6 more chars), with ':' separators
+     * and digit MM/SS fields. */
     if (RAY_UNLIKELY(w == 0 || o + w + 6 > len)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(p[o+w] != ':' || p[o+w+3] != ':')) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY((unsigned)(p[o+w+1]-'0') > 9u || (unsigned)(p[o+w+2]-'0') > 9u ||
+                     (unsigned)(p[o+w+4]-'0') > 9u || (unsigned)(p[o+w+5]-'0') > 9u)) {
+        *is_null = true; return 0;
+    }
     int mi = (p[o+w+1]-'0')*10 + (p[o+w+2]-'0');
     int s  = (p[o+w+4]-'0')*10 + (p[o+w+5]-'0');
     if (RAY_UNLIKELY(mi > 59 || s > 59)) { *is_null = true; return 0; }
     int64_t ms = h * 3600000 + (int64_t)mi * 60000 + (int64_t)s * 1000;
-    /* Fractional seconds → milliseconds */
-    size_t fi = o + w + 6;
-    if (fi < len && p[fi] == '.') {
+    /* Fractional seconds → milliseconds.  '.' must be followed by >=1 digit;
+     * only the first 3 contribute, but any further digits are consumed so the
+     * full-consumption check below still rejects non-digit trailing garbage. */
+    size_t i = o + w + 6;
+    if (i < len) {
+        if (RAY_UNLIKELY(p[i] != '.')) { *is_null = true; return 0; }
+        i++;
         int frac = 0, digits = 0;
-        for (size_t i = fi + 1; i < len && digits < 3; i++, digits++) {
-            unsigned di = (unsigned char)p[i] - '0';
-            if (di > 9) break;
-            frac = frac * 10 + (int)di;
+        for (; i < len && (unsigned)(p[i]-'0') <= 9u; i++) {
+            if (digits < 3) { frac = frac * 10 + (p[i] - '0'); digits++; }
         }
+        if (RAY_UNLIKELY(digits == 0 || i != len)) { *is_null = true; return 0; }
         while (digits < 3) { frac *= 10; digits++; }
         ms += frac;
     }
@@ -579,7 +590,12 @@ RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
  * to 9 fractional digits; shorter fractions are right-padded with
  * zeros, longer ones are truncated. */
 RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t* consumed) {
-    if (RAY_UNLIKELY(len < 8)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(len < 8 || p[2] != ':' || p[5] != ':')) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY((unsigned)(p[0]-'0') > 9u || (unsigned)(p[1]-'0') > 9u ||
+                     (unsigned)(p[3]-'0') > 9u || (unsigned)(p[4]-'0') > 9u ||
+                     (unsigned)(p[6]-'0') > 9u || (unsigned)(p[7]-'0') > 9u)) {
+        *is_null = true; return 0;
+    }
     *is_null = false;
     int h  = (p[0]-'0')*10 + (p[1]-'0');
     int mi = (p[3]-'0')*10 + (p[4]-'0');
@@ -592,11 +608,12 @@ RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t
         int64_t frac = 0;
         int digits = 0;
         size_t i = 9;
-        for (; i < len && digits < 9; i++, digits++) {
-            unsigned di = (unsigned char)p[i] - '0';
-            if (di > 9) break;
-            frac = frac * 10 + (int64_t)di;
+        /* First 9 fractional digits contribute; consume any further digits so
+         * the caller's full-consumption check still rejects trailing garbage. */
+        for (; i < len && (unsigned)(p[i]-'0') <= 9u; i++) {
+            if (digits < 9) { frac = frac * 10 + (int64_t)(p[i] - '0'); digits++; }
         }
+        if (RAY_UNLIKELY(digits == 0)) { *is_null = true; return 0; }
         while (digits < 9) { frac *= 10; digits++; }
         ns += frac;
         used = i;  /* index of the first char past the fractional seconds */
@@ -608,12 +625,12 @@ RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t
 /* Parse a trailing ISO-8601 UTC offset at p: 'Z'/'z' (== UTC) or
  * (+|-)HH[[:]MM].  On success sets *out_ns to the signed offset in
  * nanoseconds (to be SUBTRACTED from the local wall-clock value to get
- * UTC) and returns true.  Returns false if the suffix is not a
- * recognized offset (caller then leaves the value unadjusted, preserving
- * the prior behaviour of ignoring unrecognized trailing characters). */
-RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns) {
+ * UTC), reports the number of bytes consumed in *consumed, and returns
+ * true.  Returns false if the suffix is not a recognized offset; the
+ * caller treats that (and any unconsumed trailing bytes) as malformed. */
+RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns, size_t* consumed) {
     if (len == 0) return false;
-    if (p[0] == 'Z' || p[0] == 'z') { *out_ns = 0; return true; }
+    if (p[0] == 'Z' || p[0] == 'z') { *out_ns = 0; if (consumed) *consumed = 1; return true; }
     int sign;
     if (p[0] == '+') sign = 1;
     else if (p[0] == '-') sign = -1;
@@ -622,16 +639,23 @@ RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns) {
     int hh = (p[1]-'0')*10 + (p[2]-'0');
     int mm = 0;
     size_t i = 3;
-    if (len > i && p[i] == ':') i++;            /* optional ':' separator */
-    if (len >= i + 2 && p[i] >= '0' && p[i] <= '9' && p[i+1] >= '0' && p[i+1] <= '9')
-        mm = (p[i]-'0')*10 + (p[i+1]-'0');
+    size_t msep = (len > 3 && p[3] == ':') ? 1 : 0;   /* optional ':' separator */
+    if (len >= 3 + msep + 2 &&
+        p[3+msep] >= '0' && p[3+msep] <= '9' && p[4+msep] >= '0' && p[4+msep] <= '9') {
+        mm = (p[3+msep]-'0')*10 + (p[4+msep]-'0');
+        i  = 3 + msep + 2;                       /* consume ':' only with MM */
+    }
     if (RAY_UNLIKELY(hh > 23 || mm > 59)) return false;
     *out_ns = (int64_t)sign * ((int64_t)hh * 3600 + (int64_t)mm * 60) * 1000000000LL;
+    if (consumed) *consumed = i;
     return true;
 }
 
 RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
-    if (RAY_UNLIKELY(len < 19)) { *is_null = true; return 0; }
+    /* Require "YYYY-MM-DD" + 'T'|'t'|' ' separator + "HH:MM:SS" (>=19 chars),
+     * matching detect_type() and csv_write_timestamp().  A malformed date/time
+     * separator (e.g. "2024x01x02D01:02:03") is rejected as null. */
+    if (RAY_UNLIKELY(len < 19 || (p[10] != 'T' && p[10] != 't' && p[10] != ' '))) { *is_null = true; return 0; }
     *is_null = false;
     int32_t days = fast_date(p, 10, is_null);
     if (*is_null) return 0;
@@ -642,12 +666,19 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     const int64_t NS_PER_DAY = 86400000000000LL;
     int64_t result = (int64_t)days * NS_PER_DAY + time_ns;
     /* Optional trailing UTC offset (Z | ±HH:MM | ±HHMM | ±HH).  The common
-     * no-offset case ends exactly at the time component (off == len), so
-     * the hot path pays only this single predicted-not-taken bounds check. */
+     * no-offset case ends exactly at the time component (off == len), so the
+     * hot path pays only this single predicted-not-taken bounds check.  Any
+     * other trailing bytes — or an offset that does not consume to the end
+     * (e.g. "2024-01-02T01:02:03junk") — are malformed and reject the cell. */
     size_t off = 11 + time_used;
     if (RAY_UNLIKELY(off < len)) {
         int64_t adj;
-        if (parse_tz_offset(p + off, len - off, &adj)) result -= adj;
+        size_t  tz_used = 0;
+        if (RAY_UNLIKELY(!parse_tz_offset(p + off, len - off, &adj, &tz_used) ||
+                         off + tz_used != len)) {
+            *is_null = true; return 0;
+        }
+        result -= adj;
     }
     return result;
 }
