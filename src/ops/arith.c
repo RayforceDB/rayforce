@@ -277,13 +277,37 @@ ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
                          ray_type_name(a->type), ray_type_name(b->type));
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
         return ray_typed_null(-RAY_I64);
-    double bv = as_f64(b);
-    if (bv == 0.0)
+
+    /* Float operand(s): compute the quotient in double, floor it, then narrow
+     * to i64.  The range guard must exclude 2^63: the old `q > (double)INT64_MAX`
+     * never fired because (double)INT64_MAX rounds up to exactly 2^63, so
+     * `q == 2^63` fell through to `(int64_t)q` — undefined behavior. */
+    if (is_float_op(a, b)) {
+        double bv = as_f64(b);
+        if (bv == 0.0)
+            return ray_typed_null(-RAY_I64);
+        double q = floor(as_f64(a) / bv);
+        if (q < (double)INT64_MIN || q >= 9223372036854775808.0) /* 2^63 */
+            return ray_typed_null(-RAY_I64);
+        return make_i64((int64_t)q);
+    }
+
+    /* Both integer: divide in int64 space with a floor-toward-negative-infinity
+     * correction (mirrors the temporal path in ray_mod_fn).  Routing integer
+     * floor division through double lost precision above 2^53 — e.g.
+     * (div x 1) != x for any |x| > 2^53 — and cast raw doubles back into UB at
+     * the INT64 extremes. */
+    int64_t av = as_i64(a), bv = as_i64(b);
+    if (bv == 0)
         return ray_typed_null(-RAY_I64);
-    double q = floor(as_f64(a) / bv);
-    if (q < (double)INT64_MIN || q > (double)INT64_MAX)
+    /* Only INT64_MIN / -1 overflows i64 (result 2^63); INT64_MIN is the i64
+     * null sentinel so this is unreachable after the null guard, but keep it
+     * so a raw sentinel value can never trigger UB. */
+    if (av == INT64_MIN && bv == -1)
         return ray_typed_null(-RAY_I64);
-    return make_i64((int64_t)q);
+    int64_t q = av / bv;
+    if ((av ^ bv) < 0 && q * bv != av) q--; /* floor toward -inf on truncation */
+    return make_i64(q);
 }
 
 ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
