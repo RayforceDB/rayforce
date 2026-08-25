@@ -1,0 +1,80 @@
+;; Where a null lands in a sort, pinned for every path that can run.
+;;
+;; A null is the SMALLEST value: ascending puts nulls first, descending last.
+;; That policy lives in one place (sort_nulls_first, ops/internal.h) and every
+;; path takes its default from there.
+;;
+;; The reason this file exists (#417): the policy used to be spelled out
+;; separately in four places, and they did not agree — sort_cmp derived it from
+;; `desc`, sort_indices_ex and the query builder from `!desc`, and the fused
+;; top-k hardcoded its own.  Which one answered depended on the ROW COUNT (a
+;; small input takes the comparison path, a large one the radix path) and on
+;; the COLUMN TYPE (SYM, STR and numeric arms are separate).  So the same query
+;; over the same data gave different answers as the table grew.
+;;
+;; Every check below therefore comes in pairs: the same question asked under
+;; the comparison path and under the radix path, and asked of SYM, STR and a
+;; numeric column.  A single-size or single-type test would not have caught it.
+
+;; ── Small input: comparison path ───────────────────────────────────────────
+(at (asc  [3 0N 1 2]) 0) -- 0Nl
+(at (desc [3 0N 1 2]) 3) -- 0Nl
+
+;; `'` on its own is the empty symbol, which is a null.
+(set _Ss ['b ' 'c ' 'a])
+(nil? (at (asc  _Ss) 0)) -- true
+(nil? (at (asc  _Ss) 4)) -- false
+(nil? (at (desc _Ss) 4)) -- true
+(nil? (at (desc _Ss) 0)) -- false
+
+(set _St ["b" "" "c" "" "a"])
+(nil? (at (asc  _St) 0)) -- true
+(nil? (at (asc  _St) 4)) -- false
+(nil? (at (desc _St) 4)) -- true
+(nil? (at (desc _St) 0)) -- false
+
+;; ── Large input: radix / parallel path.  16384 rows is four times
+;;    RADIX_SORT_THRESHOLD, so this is a different kernel from the block
+;;    above, not the same one with more rows. ────────────────────────────────
+(.sys.exec "rm -f rf_np.csv rf_np_blk") -- 0
+(.sys.exec "printf 's,u,n\n' > rf_np.csv; printf ',,\nb,b,7\n,,\nc,c,3\n' > rf_np_blk; i=0; while [ $i -lt 12 ]; do cat rf_np_blk rf_np_blk > rf_np_blk2; mv rf_np_blk2 rf_np_blk; i=$((i+1)); done; cat rf_np_blk >> rf_np.csv; rm -f rf_np_blk") -- 0
+
+(set B (.csv.read [SYMBOL STR I64] "rf_np.csv"))
+(count B) -- 16384
+
+;; SYM: nulls first on asc, last on desc.
+(nil? (at (asc  (at B 's))     0)) -- true
+(nil? (at (asc  (at B 's)) 16383)) -- false
+(nil? (at (desc (at B 's))     0)) -- false
+(nil? (at (desc (at B 's)) 16383)) -- true
+
+;; STR: the same answers as the SYM column it mirrors.  These two used to
+;; disagree with each other at this size.
+(nil? (at (asc  (at B 'u))     0)) -- true
+(nil? (at (asc  (at B 'u)) 16383)) -- false
+(nil? (at (desc (at B 'u))     0)) -- false
+(nil? (at (desc (at B 'u)) 16383)) -- true
+
+;; Numeric: unchanged by the fix, and here to prove the three types agree.
+(nil? (at (asc  (at B 'n))     0)) -- true
+(nil? (at (desc (at B 'n)) 16383)) -- true
+
+;; ── The same question through a QUERY sort, which took its default from a
+;;    different place than the bare verb did.  The numeric column is what
+;;    shows it: a SYM or STR null is IN-BAND (sym id 0, a zero-length
+;;    descriptor) and sorts smallest on payload alone, so those columns land
+;;    nulls first whatever the policy says.  A numeric null is out of band and
+;;    only the policy places it. ────────────────────────────────────────────
+(nil? (at (at (select {from: B asc: n}) 'n)     0)) -- true
+(nil? (at (at (select {from: B asc: n}) 'n) 16383)) -- false
+(nil? (at (at (select {from: B desc: n}) 'n)     0)) -- false
+(nil? (at (at (select {from: B desc: n}) 'n) 16383)) -- true
+
+;; ── And through filter + top-k, which runs the fused comparator rather than
+;;    a sort — a separate implementation of the same policy.  The predicate
+;;    keeps every row, so the k smallest of a null-bearing column are nulls. ─
+(nil? (at (at (select {n: n s: s from: B where: (!= s "zzz") asc: n take: 3}) 'n) 0)) -- true
+(nil? (at (at (select {n: n s: s from: B where: (!= s "zzz") asc: n take: 3}) 'n) 2)) -- true
+(nil? (at (at (select {n: n s: s from: B where: (!= s "zzz") desc: n take: 3}) 'n) 0)) -- false
+
+(.sys.exec "rm -f rf_np.csv") -- 0
