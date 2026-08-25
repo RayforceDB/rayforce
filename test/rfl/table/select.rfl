@@ -121,6 +121,16 @@
 (count (select {from: trades-15 take: 0})) -- 0
 (count (select {from: trades-15 take: 15})) -- 15
 (sum (at (select {from: trades-15 take: 15}) 'size)) -- 1765
+;; negative take: (from the end), clamped to the row count
+(count (select {from: trades-15 take: -5})) -- 5
+(count (select {from: trades-15 take: -20})) -- 15
+(sum (at (select {from: trades-15 take: -15}) 'size)) -- 1765
+;; INT64_MIN take count is the i64 null sentinel (0N); negating it is signed-
+;; overflow UB.  Every select take: path — DAG tail-pushdown, sorted
+;; apply_sort_take, grouped — must reject it as a type error rather than trap.
+(select {from: trades-15 take: -9223372036854775808}) !- type
+(select {from: trades-15 asc: size take: -9223372036854775808}) !- type
+(select {c: (count size) from: trades-15 by: sym take: -9223372036854775808}) !- type
 
 ;; ── edge cases: all-pass / none-pass / single-row / by-distinct-time
 (count (select {from: trades-15 where: (> size -1)})) -- 15
