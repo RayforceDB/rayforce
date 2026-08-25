@@ -623,6 +623,12 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t atom_n = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
             ray_release(tv);
+            /* INT64_MIN is the i64 null sentinel (0N); negating it below is
+             * signed-overflow UB.  Reject it up front, matching ray_take_fn. */
+            if (atom_n == INT64_MIN) {
+                ray_release(result);
+                return ray_error("type", "select: take: count is null or out of range");
+            }
 
             int64_t nrows = (result->type == RAY_TABLE)
                           ? ray_table_nrows(result)
@@ -862,6 +868,11 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
         int64_t nrows = (sorted->type == RAY_TABLE)
                       ? ray_table_nrows(sorted)
                       : (ray_is_vec(sorted) ? sorted->len : 0);
+        /* INT64_MIN (0N) negated below is signed-overflow UB — reject it. */
+        if (atom_n == INT64_MIN) {
+            ray_release(sorted);
+            return ray_error("type", "select: take: count is null or out of range");
+        }
         int64_t start, amount;
         if (atom_n >= 0) {
             start  = 0;
@@ -9927,6 +9938,13 @@ by_dict_done:
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t n_take = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
+            /* INT64_MIN (0N) negated for a tail pushdown is signed-overflow UB;
+             * reject it before it reaches ray_tail / the TAIL kernel. */
+            if (n_take == INT64_MIN) {
+                ray_release(tv);
+                ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return ray_error("type", "select: take: count is null or out of range");
+            }
             if (group_take_push) {
                 take_pre.kind = TAKE_PRE_ATOM;
                 take_pre.a = n_take;
