@@ -532,9 +532,9 @@
 ;; never checked the end pointer or ERANGE, so trailing garbage and true
 ;; overflow were silently accepted ("1e19" → 1, "9999...9" → INT64_MAX).
 ;; All of these must now REJECT with a domain error, matching the strict
-;; DATE/TIME/TIMESTAMP string casts.  Narrow-int truncation itself still
-;; wraps (documented narrow-int rule); only unparseable/overflowing input
-;; errors.
+;; DATE/TIME/TIMESTAMP string casts.  Non-string narrow-int truncation itself
+;; still wraps (documented narrow-int rule); string ingest rejects clean
+;; values outside the target type range rather than silently wrapping them.
 (as 'i64 "123abc") !- domain
 (as 'i64 "1e19") !- domain
 (as 'i64 "12.5") !- domain
@@ -542,19 +542,28 @@
 (as 'i64 "-999999999999999999999999") !- domain
 (as 'i32 "123x") !- domain
 (as 'i32 "1e9") !- domain
+(as 'i32 "3000000000") !- domain
+(as 'i32 "-3000000000") !- domain
 (as 'i16 "40000junk") !- domain
+(as 'i16 "40000") !- domain
+(as 'i16 "-40000") !- domain
 (as 'u8 "12zz") !- domain
 (as 'u8 "300abc") !- domain
+(as 'u8 "256") !- domain
+(as 'u8 "-1") !- domain
 (as 'f64 "1.5x") !- domain
 (as 'f64 "1.5e3junk") !- domain
 ;; Clean values still parse.
 (as 'i64 " 123") -- 123
 (as 'i64 "-5") -- -5
+(as 'u8 "255") -- 0xFF
 (as 'f64 "0x10") -- 16.0
 ;; The string-VECTOR cast routes through the same per-element parser: a
 ;; malformed element rejects the whole cast, clean elements parse.
 (as 'I64 (list "42" "-7" "100")) -- [42 -7 100]
 (as 'I64 (list "42" "123abc")) !- domain
+(as 'I32 (list "42" "3000000000")) !- domain
+(as 'U8 (list "42" "256")) !- domain
 (as 'F64 (list "3.14" "1.5x")) !- domain
 
 ;; ========== NULL PRESERVATION ACROSS CASTS ==========

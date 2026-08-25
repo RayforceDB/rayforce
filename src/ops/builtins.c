@@ -25,6 +25,7 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
@@ -1381,12 +1382,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
             errno = 0;
-            long v = strtol(sp, &end, 10);
+            int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i32");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as i32, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as i32, value out of int64 range");
+            if (v < INT32_MIN || v > INT32_MAX)
+                return ray_error("domain", "as: cannot parse str as i32, value out of i32 range");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
@@ -1408,12 +1411,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
             errno = 0;
-            long v = strtol(sp, &end, 10);
+            int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i16");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as i16, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as i16, value out of int64 range");
+            if (v < INT16_MIN || v > INT16_MAX)
+                return ray_error("domain", "as: cannot parse str as i16, value out of i16 range");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
@@ -1930,12 +1935,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             char* end; errno = 0;
-            long v = strtol(sp, &end, 10);
+            int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as u8");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as u8, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as u8, value out of int64 range");
+            if (v < 0 || v > UINT8_MAX)
+                return ray_error("domain", "as: cannot parse str as u8, value out of u8 range");
             return ray_u8((uint8_t)v);
         }
         /* Vector cast */
