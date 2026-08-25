@@ -114,3 +114,12 @@
 ;; row = 2^63 (wraps to MIN); two rows sum to 0.
 (set Mlin (table [v] (list [4611686018427387904 4611686018427387904])))
 (at (select {r: (sum (+ v v)) from: Mlin}) 'r)    -- [0]
+;; Above the parallel threshold, worker-local partial sums and the final
+;; cross-worker merge must use the same wrap semantics.  131072*(2^46+1)
+;; wraps to INT64_MIN+131072, avoiding the NULL_I64 sentinel exactly.
+(set Mpar (table [g v] (list (take [1] 131072) (take [70368744177665] 131072))))
+(at (select {r: (sum v) from: Mpar}) 'r)          -- [-9223372036854644736]
+(at (select {r: (sum v) by: g from: Mpar}) 'r)    -- [-9223372036854644736]
+;; Linear expression path: 131072*(2*(2^45+1)) wraps to INT64_MIN+262144.
+(set Mparlin (table [v] (list (take [35184372088833] 131072))))
+(at (select {r: (sum (+ v v)) from: Mparlin}) 'r) -- [-9223372036854513664]

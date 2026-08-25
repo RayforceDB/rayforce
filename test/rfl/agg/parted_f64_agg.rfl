@@ -100,6 +100,18 @@
 (min (at Pi 'v)) -- 10
 (max (at Pi 'v)) -- 50
 
+;; ─── parted I64 sum wrap via raw-column expression fallback ──────────
+;; `(first (list c))` deliberately defeats expr_compile today, leaving the
+;; quoted raw column visible to the runtime agg_parted_sum path.  If the
+;; planner learns this shape later, this test may need a different wrapper.
+(.sys.exec "rm -rf /tmp/rfl_agg_pwrap")
+(set Tw1 (table [v] (list [9223372036854775807])))
+(set Tw2 (table [v] (list [9223372036854775807])))
+(.db.splayed.set "/tmp/rfl_agg_pwrap/1/t/" Tw1)
+(.db.splayed.set "/tmp/rfl_agg_pwrap/2/t/" Tw2)
+(set Pw (.db.parted.get "/tmp/rfl_agg_pwrap/" 't))
+(at (select {r: ((fn [c] (sum (first (list c)))) 'v) from: Pw}) 'r) -- [-2 -2]
+
 ;; ─── parted DATE sum type error (agg_parted_sum line 129) ────────────
 ;; DATE base type is explicitly excluded from sum — hits the type error path.
 (.sys.exec "rm -rf /tmp/rfl_agg_pdate")
@@ -121,13 +133,13 @@
 (.db.splayed.set "/tmp/rfl_agg_pts/1/t/" Tts1)
 (.db.splayed.set "/tmp/rfl_agg_pts/2/t/" Tts2)
 (set Pts (.db.parted.get "/tmp/rfl_agg_pts/" 't))
-(sum (at Pts 'ts)) !- type
+(select {r: ((fn [c] (sum c)) 'ts) from: Pts}) !- type
 (set Tl1 (table [l] (list (list [1 2] [3 4]))))
 (set Tl2 (table [l] (list (list [5 6]))))
 (.db.splayed.set "/tmp/rfl_agg_plist/1/t/" Tl1)
 (.db.splayed.set "/tmp/rfl_agg_plist/2/t/" Tl2)
 (set Pl (.db.parted.get "/tmp/rfl_agg_plist/" 't))
-(sum (at Pl 'l)) !- type
+(select {r: ((fn [c] (sum (first (list c)))) 'l) from: Pl}) !- type
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pdate /tmp/rfl_agg_pts /tmp/rfl_agg_plist")
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pwrap /tmp/rfl_agg_pdate /tmp/rfl_agg_pts /tmp/rfl_agg_plist")
