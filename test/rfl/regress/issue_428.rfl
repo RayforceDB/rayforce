@@ -1,0 +1,43 @@
+;; A name a select cannot resolve must raise, and every clause keyword must
+;; be skipped when the outputs are named.
+;;
+;; The general case was fixed with #414: an unknown column reference gets an
+;; invalid-scan marker that ray_execute rejects.  Two ways around it
+;; survived, and both produced the #428 report — a projection under the
+;; wrong label, and an aggregate answering its neutral element.
+;;
+;; 1. `_dist` was exempt from the marker unconditionally.  The exemption is
+;;    needed, because a rerank produces that column during execution and it
+;;    is genuinely absent when the query compiles — but it applied just as
+;;    well to a query with no nearest: clause, where nothing will ever
+;;    produce it.
+;;
+;; 2. `nearest:` was missing from the skip list in the loop that names the
+;;    output columns.  That walk is positional, so a keyword it fails to
+;;    skip eats an output slot and every name after it lands one column
+;;    early.  It is counted out where the outputs are counted, which is why
+;;    only the naming disagreed.
+
+(set _T (table [a b] (list [1 2 3] [4 5 6])))
+
+;; ── 1. `_dist` with no rerank to produce it: an ordinary unknown name ────
+(select {x: a d: _dist z: b from: _T})        !- schema
+(select {d: _dist from: _T})                  !- schema
+(select {s: (sum _dist) from: _T})            !- schema
+(select {c: (count _dist) from: _T})          !- schema
+(select {m: (max _dist) from: _T})            !- schema
+(select {f: (first _dist) from: _T})          !- schema
+(select {s: (sum _dist) by: a from: _T})      !- schema
+;; and the plain unknown name it used to be exempt from behaving like
+(select {x: a y: nosuch z: b from: _T})       !- schema
+
+;; ── 2. `_dist` where a rerank does produce it — still resolves, still
+;;    correct.  The nearest row is id 1 at distance 0. ───────────────────
+(set _TN (table [id Vec] (list [1 2 3 4] (list [1.0 0.0] [0.0 1.0] [1.0 1.0] [0.5 0.5]))))
+(at (select {i: id d: _dist from: _TN nearest: (knn Vec [1.0 0.0]) take: 2}) 'i) -- [1 3]
+(at (select {i: id d: _dist from: _TN nearest: (knn Vec [1.0 0.0]) take: 2}) 'd) -- [0.0 0.29]
+
+;; ── 3. the same query with nearest: written BEFORE the outputs.  Same
+;;    columns, same names — the keyword must not take one of the slots. ──
+(at (select {from: _TN nearest: (knn Vec [1.0 0.0]) i: id d: _dist take: 2}) 'i) -- [1 3]
+(at (select {from: _TN nearest: (knn Vec [1.0 0.0]) i: id d: _dist take: 2}) 'd) -- [0.0 0.29]
