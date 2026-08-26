@@ -1,0 +1,31 @@
+;; Legacy STRL string columns load as a list of string atoms
+;; (col_load_str_list), a shape the current writer never produces — so
+;; the RAY_LIST branches in like/ilike were unreachable from any test
+;; that builds its table in-memory (table construction normalizes a
+;; list of strings to a STR column).  Build the on-disk file by hand,
+;; the way col_format_generation.rfl stamps the generation byte.
+;; Format: [4B magic "STRL"][8B count][per string: 4B len + bytes].
+(.sys.exec "rm -rf /tmp/rfl_strl_pred")
+(set T-Strl (table [s v] (list (list "aaa" "bbb" "ccc") [1 2 3])))
+(.db.splayed.set "/tmp/rfl_strl_pred/" T-Strl)
+(.sys.exec "printf 'STRL\\003\\000\\000\\000\\000\\000\\000\\000\\007\\000\\000\\000keep me\\004\\000\\000\\000drop\\011\\000\\000\\000also KEEP' > /tmp/rfl_strl_pred/s") -- 0
+(set TS (.db.splayed.get "/tmp/rfl_strl_pred/"))
+
+;; the legacy file loads as a LIST column
+(type (get TS 's)) -- 'LIST
+
+;; like/ilike predicates reach the list branches in select-where
+(get (select {from: TS where: (like s "*keep*")}) 'v) -- [1]
+(get (select {from: TS where: (ilike s "*keep*")}) 'v) -- [1 3]
+
+;; direct builtin over the loaded list column
+(like (get TS 's) "*keep*") -- [true false false]
+
+;; == over the list column raises instead of silently matching nothing
+(select {from: TS where: (== s "keep me")}) !- type
+
+;; scalar subject in where: loud length error, not an aliased-length oom
+(select {from: TS where: (like "keep me" "*keep*")}) !- length
+
+;; ilike over a numeric column raises instead of matching nothing
+(select {from: TS where: (ilike v "*1*")}) !- type

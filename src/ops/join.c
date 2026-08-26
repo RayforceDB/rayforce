@@ -117,6 +117,8 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
             kh = ray_str_is_inline(str)
                ? ray_hash_bytes(str->data, str->len)
                : ray_str_t_hash32(str, pool);
+        } else if (col->type == RAY_GUID) {
+            kh = ray_hash_bytes((const uint8_t*)ray_data(col) + row * 16, 16);
         } else if (col->type == RAY_F64) {
             kh = ray_hash_f64(((double*)ray_data(col))[row]);
         } else {
@@ -583,6 +585,11 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
             const ray_str_t* ls = join_str_cell(lc, l, &lpool);
             const ray_str_t* rs = join_str_cell(rc, r, &rpool);
             if (!ray_str_t_eq(ls, lpool, rs, rpool)) return false;
+        } else if (lc->type == RAY_GUID || rc->type == RAY_GUID) {
+            if (lc->type != RAY_GUID || rc->type != RAY_GUID) return false;
+            const uint8_t* lb = (const uint8_t*)ray_data(lc) + l * 16;
+            const uint8_t* rb = (const uint8_t*)ray_data(rc) + r * 16;
+            if (memcmp(lb, rb, 16) != 0) return false;
         } else if (lc->type == RAY_F64) {
             if (((double*)ray_data(lc))[l] != ((double*)ray_data(rc))[r]) return false;
         } else {
