@@ -26,7 +26,7 @@
 /*
  * test_splay.c — focused tests for src/store/splay.c paths not covered by
  * test_store.c.  Targets: validate_sym_columns (empty sym table + I64 table,
- * and RAY_SYM column detect), ray_splay_save bad-column-name skip, NULL-dir
+ * and RAY_SYM column detect), ray_splay_save unsafe-name rejection, NULL-dir
  * error paths, missing .d schema, corrupt schema (bad name_id), and
  * splay_load_impl range/corrupt/io error branches.
  */
@@ -101,82 +101,57 @@ static test_result_t test_save_null_tbl(void) {
 }
 
 /* =========================================================================
- * 3. ray_splay_save: column name starting with '.' is skipped silently.
- *    Verify: save succeeds, but the column file is NOT on disk.
+ * 3. ray_splay_save: unsafe column names are rejected before writing.
  * ========================================================================= */
-static test_result_t test_save_skips_dot_col_name(void) {
-    const char* dir = TMP_SPLAY_BASE "/dot_col";
+static test_result_t assert_save_rejects_unsafe_col_name(const char* dir,
+                                                         const char* bad_name,
+                                                         size_t bad_name_len) {
     rm_rf(dir);
 
-    /* Intern a name that starts with '.' */
-    int64_t id_dot = ray_sym_intern(".hidden", 7);
+    int64_t id_bad = ray_sym_intern(bad_name, bad_name_len);
     int64_t id_ok  = ray_sym_intern("good", 4);
 
     int64_t raw[] = {10, 20};
-    ray_t* col_dot = ray_vec_from_raw(RAY_I64, raw, 2);
-    ray_t* col_ok  = ray_vec_from_raw(RAY_I64, raw, 2);
-    TEST_ASSERT_NOT_NULL(col_dot);
+    ray_t* col_bad = ray_vec_from_raw(RAY_I64, raw, 2);
+    ray_t* col_ok = ray_vec_from_raw(RAY_I64, raw, 2);
+    TEST_ASSERT_NOT_NULL(col_bad);
     TEST_ASSERT_NOT_NULL(col_ok);
 
     ray_t* tbl = ray_table_new(3);
-    tbl = ray_table_add_col(tbl, id_ok,  col_ok);
-    tbl = ray_table_add_col(tbl, id_dot, col_dot);
+    tbl = ray_table_add_col(tbl, id_ok, col_ok);
+    tbl = ray_table_add_col(tbl, id_bad, col_bad);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     ray_err_t err = ray_splay_save(tbl, dir, NULL);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
 
-    /* ".hidden" column file must NOT exist */
-    char bad_path[512];
-    snprintf(bad_path, sizeof(bad_path), "%s/.hidden", dir);
-    TEST_ASSERT_EQ_I(access(bad_path, F_OK), -1);
-
-    /* "good" column file must exist */
-    char good_path[512];
-    snprintf(good_path, sizeof(good_path), "%s/good", dir);
-    TEST_ASSERT_EQ_I(access(good_path, F_OK), 0);
-
-    ray_release(col_dot);
+    ray_release(col_bad);
     ray_release(col_ok);
     ray_release(tbl);
     rm_rf(dir);
     PASS();
 }
 
-/* =========================================================================
- * 4. ray_splay_save: column name containing '/' is skipped silently.
- * ========================================================================= */
-static test_result_t test_save_skips_slash_col_name(void) {
-    const char* dir = TMP_SPLAY_BASE "/slash_col";
-    rm_rf(dir);
+static test_result_t test_save_rejects_dot_col_name(void) {
+    return assert_save_rejects_unsafe_col_name(
+        TMP_SPLAY_BASE "/dot_col", ".hidden", 7);
+}
 
-    int64_t id_slash = ray_sym_intern("a/b", 3);
-    int64_t id_ok    = ray_sym_intern("val", 3);
+static test_result_t test_save_rejects_slash_col_name(void) {
+    return assert_save_rejects_unsafe_col_name(
+        TMP_SPLAY_BASE "/slash_col", "a/b", 3);
+}
 
-    int64_t raw[] = {1, 2};
-    ray_t* col_slash = ray_vec_from_raw(RAY_I64, raw, 2);
-    ray_t* col_ok    = ray_vec_from_raw(RAY_I64, raw, 2);
-    TEST_ASSERT_NOT_NULL(col_slash);
-    TEST_ASSERT_NOT_NULL(col_ok);
+static test_result_t test_save_rejects_backslash_col_name(void) {
+    return assert_save_rejects_unsafe_col_name(
+        TMP_SPLAY_BASE "/backslash_col", "a\\b", 3);
+}
 
-    ray_t* tbl = ray_table_new(3);
-    tbl = ray_table_add_col(tbl, id_ok,    col_ok);
-    tbl = ray_table_add_col(tbl, id_slash, col_slash);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
-
-    ray_err_t err = ray_splay_save(tbl, dir, NULL);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    /* "a/b" file must NOT exist (path traversal would create subdirs) */
-    char bad_path[512];
-    snprintf(bad_path, sizeof(bad_path), "%s/a", dir);
-    TEST_ASSERT_EQ_I(access(bad_path, F_OK), -1);
-
-    ray_release(col_slash);
-    ray_release(col_ok);
-    ray_release(tbl);
-    rm_rf(dir);
-    PASS();
+static test_result_t test_save_rejects_nul_col_name(void) {
+    static const char bad_name[] = { 'a', '\0', 'b' };
+    return assert_save_rejects_unsafe_col_name(
+        TMP_SPLAY_BASE "/nul_col", bad_name, sizeof(bad_name));
 }
 
 /* =========================================================================
@@ -2269,8 +2244,10 @@ const test_entry_t splay_entries[] = {
     { "splay/has_nulls_roundtrip",        test_splayed_has_nulls_roundtrip,      splay_setup, splay_teardown },
     { "splay/save_null_dir",              test_save_null_dir,                   splay_setup, splay_teardown },
     { "splay/save_null_tbl",              test_save_null_tbl,                   splay_setup, splay_teardown },
-    { "splay/save_skips_dot_col_name",    test_save_skips_dot_col_name,         splay_setup, splay_teardown },
-    { "splay/save_skips_slash_col_name",  test_save_skips_slash_col_name,       splay_setup, splay_teardown },
+    { "splay/save_rejects_dot_col_name",  test_save_rejects_dot_col_name,       splay_setup, splay_teardown },
+    { "splay/save_rejects_slash_col_name", test_save_rejects_slash_col_name,    splay_setup, splay_teardown },
+    { "splay/save_rejects_backslash_col_name", test_save_rejects_backslash_col_name, splay_setup, splay_teardown },
+    { "splay/save_rejects_nul_col_name",  test_save_rejects_nul_col_name,       splay_setup, splay_teardown },
     { "splay/load_null_dir",              test_load_null_dir,                   splay_setup, splay_teardown },
     { "splay/load_missing_schema",        test_load_missing_schema,             splay_setup, splay_teardown },
     { "splay/load_missing_col_file",      test_load_missing_col_file,           splay_setup, splay_teardown },

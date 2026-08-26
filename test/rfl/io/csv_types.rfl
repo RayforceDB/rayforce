@@ -278,6 +278,45 @@
 (.sys.exec "rm -f rf_test_csv_types_datestrict.csv rf_test_csv_types_timestrict.csv rf_test_csv_types_tsstrict.csv rf_test_csv_types_datesuffix.csv rf_test_csv_types_tssuffix_auto.csv rf_test_csv_types_timesuffix_auto.csv rf_test_csv_types_timedot_auto.csv rf_test_csv_types_tlower.csv") -- 0
 
 ;; ════════════════════════════════════════════════════════════════════════════
+;; 18b. Typed temporal parse rejects impossible CALENDAR dates instead of
+;;     silently normalizing them.  A well-formed "YYYY-MM-DD" with day <= 31
+;;     used to pass fast_date()'s coarse bound and then civil_to_days() rolled
+;;     e.g. "2024-02-31" over into a *different* real day (2024.03.02).  The day
+;;     must now be validated against the actual, leap-aware length of the month,
+;;     matching the strict (as 'DATE str) cast.  fast_timestamp() reuses
+;;     fast_date(), so [TIMESTAMP] inherits the same validation.
+;; ════════════════════════════════════════════════════════════════════════════
+;; Rows 0-4 are impossible dates → null; rows 5-7 are valid → value.
+;;   0 2024-02-31 Feb never has 31 (was silently 2024.03.02)
+;;   1 2024-04-31 Apr has 30 days (was silently 2024.05.01)
+;;   2 2024-06-31 Jun has 30 days
+;;   3 2023-02-29 non-leap Feb (was silently 2023.03.01)
+;;   4 2100-02-29 century, not divisible by 400 → not a leap year
+;;   5 2024-02-29 leap year (÷4)            → valid
+;;   6 2000-02-29 leap year (÷400)          → valid
+;;   7 2024-01-31 31-day month              → valid
+(.sys.exec "printf 'a\n2024-02-31\n2024-04-31\n2024-06-31\n2023-02-29\n2100-02-29\n2024-02-29\n2000-02-29\n2024-01-31\n' > rf_test_csv_types_caldate.csv") -- 0
+(set Tcd (.csv.read [DATE] "rf_test_csv_types_caldate.csv"))
+(count Tcd) -- 8
+(nil? (at (at Tcd 'a) 0)) -- true
+(nil? (at (at Tcd 'a) 1)) -- true
+(nil? (at (at Tcd 'a) 2)) -- true
+(nil? (at (at Tcd 'a) 3)) -- true
+(nil? (at (at Tcd 'a) 4)) -- true
+(at (at Tcd 'a) 5) -- 2024.02.29
+(at (at Tcd 'a) 6) -- 2000.02.29
+(at (at Tcd 'a) 7) -- 2024.01.31
+
+;; TIMESTAMP shares the leading date parse: an impossible calendar day nulls the
+;; whole timestamp, while a valid leap day parses.
+(.sys.exec "printf 'ts\n2024-02-31T00:00:00\n2023-02-29T12:00:00\n2024-02-29T12:00:00\n' > rf_test_csv_types_calts.csv") -- 0
+(set Tct (.csv.read [TIMESTAMP] "rf_test_csv_types_calts.csv"))
+(nil? (at (at Tct 'ts) 0)) -- true
+(nil? (at (at Tct 'ts) 1)) -- true
+(at (at Tct 'ts) 2) -- 2024.02.29D12:00:00.000000000
+(.sys.exec "rm -f rf_test_csv_types_caldate.csv rf_test_csv_types_calts.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
 ;; 18. Short row guard (p >= row_end path, lines 918+/1086+)
 ;;     Row 1 has fewer fields than header → remaining columns get null/default.
 ;; ════════════════════════════════════════════════════════════════════════════

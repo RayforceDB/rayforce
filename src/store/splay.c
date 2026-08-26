@@ -97,13 +97,13 @@ static ray_err_t splay_validate_persisted_names(ray_t* tbl) {
         if (!a || RAY_IS_ERR(a)) continue;
         const char* an = ray_str_ptr(a);
         size_t alen = ray_str_len(a);
-        if (!splay_col_name_safe(an, alen)) continue;
+        if (!splay_col_name_safe(an, alen)) return RAY_ERR_DOMAIN;
         for (int64_t j = c + 1; j < nc; j++) {
             ray_t* b = ray_sym_str(ray_table_col_name(tbl, j));
             if (!b || RAY_IS_ERR(b)) continue;
             const char* bn = ray_str_ptr(b);
             size_t blen = ray_str_len(b);
-            if (!splay_col_name_safe(bn, blen)) continue;
+            if (!splay_col_name_safe(bn, blen)) return RAY_ERR_DOMAIN;
             if (alen == blen && memcmp(an, bn, alen) == 0)
                 return RAY_ERR_DOMAIN;
         }
@@ -171,7 +171,8 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
      * This can only happen when a symfile is actually written: the table
      * has SYM columns AND the symfile lives directly in `dir`.  The default
      * symfile is the dotfile ".sym", which no column can be named (dot-led
-     * names are skipped below), so the default convention never collides —
+     * names are rejected up-front by splay_validate_persisted_names), so the
+     * default convention never collides —
      * a plain column named "sym" round-trips fine (issue #280).  But an
      * explicit sym_path (3-arg .db.splayed.set) may name anything, so the
      * guard matches the resolved symfile path, not the literal "sym". */
@@ -280,8 +281,9 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
         if (!name_atom) continue;
         const char* name = ray_str_ptr(name_atom);
         size_t name_len  = ray_str_len(name_atom);
-        if (!splay_col_name_safe(name, name_len))
-            continue; /* unsafe name: no file, no .d entry */
+        /* Name safety (dot-led, '/', '\\', NUL) is enforced up-front by
+         * splay_validate_persisted_names() at the top of this function, so
+         * every name reaching this write loop is already safe. */
 
         char path[1024];
         int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir,
