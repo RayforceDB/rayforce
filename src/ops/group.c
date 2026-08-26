@@ -2744,9 +2744,15 @@ ray_t* ray_mode_per_group_buf(ray_t* src,
  *
  * Output is a LIST of n_groups cells; cells are pre-allocated typed
  * vecs of the same element type as `src`, so workers can write into
- * cell data without locking.  Null rows are skipped (matches the
- * standalone topk_take_vec path which routes nulls-last for asc,
- * nulls-first for desc and gathers only the non-null prefix). */
+ * cell data without locking.
+ *
+ * Null rows are SKIPPED here, and that is a different policy from the
+ * standalone topk_take_vec, which orders by sort_nulls_first — a null is
+ * the smallest value — and so can return nulls in its result.  Over
+ * [3 0N 1 0N 2] the standalone (bot v 2) is [0N 0N] while the grouped
+ * one is [1 2].  Both are defensible: ordering treats a null as a value
+ * at one end, aggregation treats it as no value at all.  What is not
+ * defensible is claiming they agree, which this comment used to. */
 
 typedef struct {
     const void*    base;

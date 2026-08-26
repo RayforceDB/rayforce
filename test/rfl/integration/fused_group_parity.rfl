@@ -273,28 +273,28 @@
 ;;               id  = [10, 20,   30, 40,   50]  (non-null filter col)
 (set Tnk (table [v id] (list [3 0N 1 0N 2] [10 20 30 40 50])))
 
-;; ASC top-5: smallest non-null first, nulls go LAST in source order
-;; (stable tie-break by row index — null rows sort tied via the null
-;; leg, then row-index breaks the tie).  Order: v=1 (id=30),
-;; v=2 (id=50), v=3 (id=10), null (id=20), null (id=40).
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 0) -- 30
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 1) -- 50
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 2) -- 10
-(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'v) 3)) -- true
-(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'v) 4)) -- true
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 3) -- 20
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 4) -- 40
+;; ASC top-5: a null is the smallest value, so the nulls lead in source
+;; order (stable tie-break by row index — null rows sort tied via the null
+;; leg, then row-index breaks the tie), then the non-nulls ascending.
+;; Order: null (id=20), null (id=40), v=1 (id=30), v=2 (id=50), v=3 (id=10).
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 0) -- 20
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 1) -- 40
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 2) -- 30
+(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'v) 0)) -- true
+(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'v) 1)) -- true
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 3) -- 50
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 5}) 'id) 4) -- 10
 
-;; ASC top-3: nulls don't make the cut at all (LAST policy).
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 3}) 'id) 0) -- 30
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 3}) 'id) 1) -- 50
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 3}) 'id) 2) -- 10
+;; ASC top-3: the two nulls are the two smallest, so they take two of the
+;; three slots and only v=1 (id=30) follows.
+(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 3}) 'v) 0)) -- true
+(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 3}) 'v) 1)) -- true
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) asc: v take: 3}) 'id) 2) -- 30
 
-;; DESC top-3: nulls go FIRST.  Source order tie-break on the two
-;; null rows: id=20 then id=40.  Third entry is the largest non-
-;; null, v=3 (id=10).
-(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'v) 0)) -- true
-(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'v) 1)) -- true
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'id) 0) -- 20
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'id) 1) -- 40
-(at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'id) 2) -- 10
+;; DESC top-3: a null is the smallest value, so it goes LAST and never
+;; enters a top-3 while three larger values exist.  Descending by v:
+;; 3 (id=10), 2 (id=50), 1 (id=30).
+(nil? (at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'v) 0)) -- false
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'id) 0) -- 10
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'id) 1) -- 50
+(at (at (select {v: v id: id from: Tnk where: (>= id 0) desc: v take: 3}) 'id) 2) -- 30

@@ -179,16 +179,17 @@
 (at (at (select {v: v from: Tdesc where: (>= v 0) desc: v take: 3}) 'v) 2) -- 47
 
 ;; =====================================================================
-;; 15. Null sort key — NULLS LAST for ASC, NULLS FIRST for DESC
+;; 15. Null sort key — a null is the smallest value: NULLS FIRST for ASC,
+;;     NULLS LAST for DESC, the same rule the ordinary sort follows.
 ;; =====================================================================
 ;; 0N is the I64 null literal; the table has nulls at positions 0 and 5.
 (set Tnull (table [k v] (list [0Nl 1 2 3 4 0Nl 6 7 8 9] (til 10))))
-;; ASC: nulls go last; top 3 are smallest non-null: 1, 2, 3
-(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 0) -- 1
-(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 1) -- 2
-(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 2) -- 3
-;; DESC: nulls go first; top 4 DESC = 2 nulls then 9, 8
-(nil? (at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 0)) -- true
-(nil? (at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 1)) -- true
-(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 2) -- 9
-(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 3) -- 8
+;; ASC: the smallest rows ARE the nulls, so top 3 = 2 nulls then 1.
+(nil? (at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 0)) -- true
+(nil? (at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 1)) -- true
+(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 2) -- 1
+;; DESC: nulls go last; top 4 DESC = 9, 8, 7, 6
+(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 0) -- 9
+(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 1) -- 8
+(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 2) -- 7
+(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 3) -- 6
