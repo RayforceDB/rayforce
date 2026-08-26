@@ -127,7 +127,15 @@ static ray_t* agg_atom_i64_for_type(int8_t t, int64_t v) {
 
 static ray_t* agg_parted_sum(ray_t* x) {
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
-    if (!agg_parted_numeric_base(base) || base == RAY_DATE)
+    /* Explicit runtime whitelist: numeric + duration-like TIME.  NOT
+     * agg_type_admitted() — that is a permissive *plan-time* guard which only
+     * rejects the types it KNOWS are bad and admits unknown wrappers (incl.
+     * RAY_LIST); as the final runtime gate it would let a parted LIST column
+     * fall into the integer loop and silently sum to 0.  DATE/TIMESTAMP are
+     * absolute points and are rejected here too, matching flat sum (which
+     * rejects them via agg_type_admitted); the parted path previously summed a
+     * TIMESTAMP column instead. */
+    if (!agg_parted_numeric_base(base) || base == RAY_DATE || base == RAY_TIMESTAMP)
         return ray_error("type", "sum expects a numeric or time-duration parted column, got %s", ray_type_name(base));
     ray_t** segs = (ray_t**)ray_data(x);
     if (base == RAY_F64 || base == RAY_F32) {
@@ -150,10 +158,9 @@ static ray_t* agg_parted_sum(ray_t* x) {
         if (!seg) continue;
         int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
         for (int64_t i = 0; i < seg->len; i++)
-            if (!has_nulls || !ray_vec_is_null(seg, i)) sum += agg_read_i64(seg, i);
+            if (!has_nulls || !ray_vec_is_null(seg, i)) sum = wrap_add_i64(sum, agg_read_i64(seg, i));
     }
     if (base == RAY_TIME) return ray_time(sum);
-    if (base == RAY_TIMESTAMP) return ray_timestamp(sum);
     return make_i64(sum);
 }
 
@@ -214,7 +221,7 @@ static ray_t* agg_parted_prod(ray_t* x) {
         int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
         for (int64_t i = 0; i < seg->len; i++) {
             if (has_nulls && ray_vec_is_null(seg, i)) continue;
-            prod = (int64_t)((uint64_t)prod * (uint64_t)agg_read_i64(seg, i));
+            prod = wrap_mul_i64(prod, agg_read_i64(seg, i));
         }
     }
     return make_i64(prod);
@@ -411,37 +418,36 @@ ray_t* ray_sum_fn(ray_t* x) {
          * absolute points and SYM/STR/GUID are non-numeric → type error. */
         if (!agg_type_admitted(OP_SUM, x->type)) return ray_error("type", "sum expects a numeric or time-duration vector, got %s", ray_type_name(x->type));
         /* Narrow/temporal types need specific return constructors that the
-         * DAG executor doesn't provide — use scalar path for these. */
+         * DAG executor doesn't provide — use scalar path for these.  TIMESTAMP
+         * is rejected by agg_type_admitted() above, so only the duration-like
+         * TIME and the narrow integer widths reach here.  Accumulation wraps
+         * via wrap_add_i64 to stay UB-free (overflow needs a multi-GiB column
+         * for the narrow types, but the wrap keeps the whole family uniform). */
         if (x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8 ||
-            x->type == RAY_TIME || x->type == RAY_TIMESTAMP) {
+            x->type == RAY_TIME) {
             int64_t n = x->len;
             bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
             int64_t sum = 0;
             if (x->type == RAY_I32) {
                 int32_t* d = (int32_t*)ray_data(x);
-                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum += d[i]; }
-                else { for (int64_t i = 0; i < n; i++) sum += d[i]; }
+                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum = wrap_add_i64(sum, d[i]); }
+                else { for (int64_t i = 0; i < n; i++) sum = wrap_add_i64(sum, d[i]); }
                 return make_i64(sum);
             } else if (x->type == RAY_I16) {
                 int16_t* d = (int16_t*)ray_data(x);
-                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum += d[i]; }
-                else { for (int64_t i = 0; i < n; i++) sum += d[i]; }
+                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum = wrap_add_i64(sum, d[i]); }
+                else { for (int64_t i = 0; i < n; i++) sum = wrap_add_i64(sum, d[i]); }
                 return make_i64(sum);
             } else if (x->type == RAY_U8) {
                 uint8_t* d = (uint8_t*)ray_data(x);
-                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum += d[i]; }
-                else { for (int64_t i = 0; i < n; i++) sum += d[i]; }
+                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum = wrap_add_i64(sum, d[i]); }
+                else { for (int64_t i = 0; i < n; i++) sum = wrap_add_i64(sum, d[i]); }
                 return make_i64(sum);
-            } else if (x->type == RAY_TIME) {
-                int32_t* d = (int32_t*)ray_data(x);
-                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum += d[i]; }
-                else { for (int64_t i = 0; i < n; i++) sum += d[i]; }
-                return ray_time(sum);
             } else {
-                int64_t* d = (int64_t*)ray_data(x);
-                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum += d[i]; }
-                else { for (int64_t i = 0; i < n; i++) sum += d[i]; }
-                return ray_timestamp(sum);
+                int32_t* d = (int32_t*)ray_data(x);
+                if (has_nulls) { for (int64_t i = 0; i < n; i++) if (!ray_vec_is_null(x, i)) sum = wrap_add_i64(sum, d[i]); }
+                else { for (int64_t i = 0; i < n; i++) sum = wrap_add_i64(sum, d[i]); }
+                return ray_time(sum);
             }
         }
         /* I64/F64: parallel morsel-driven reduction via DAG executor */
@@ -461,8 +467,14 @@ ray_t* ray_sum_fn(ray_t* x) {
             continue;
         }
         if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) { has_float = 1; fsum += elems[i]->f64; }
-        else if (elems[i]->type == -RAY_I64) { isum += elems[i]->i64; fsum += (double)elems[i]->i64; }
-        else { int64_t v = (int64_t)as_f64(elems[i]); isum += v; fsum += (double)v; }
+        else {
+            /* i64 atoms are read directly (exact above 2^53); other integer /
+             * temporal atoms via as_f64.  Wrap-accumulate: signed overflow is
+             * UB, and the typed-vector path already wraps. */
+            int64_t v = (elems[i]->type == -RAY_I64) ? elems[i]->i64 : (int64_t)as_f64(elems[i]);
+            isum = wrap_add_i64(isum, v);
+            fsum += (double)v;
+        }
     }
     return has_float ? make_f64(fsum) : make_i64(isum);
 }
@@ -494,8 +506,11 @@ ray_t* ray_prod_fn(ray_t* x) {
             has_float = 1;
             fprod *= elems[i]->f64;
         } else {
-            int64_t v = (int64_t)as_f64(elems[i]);
-            iprod = (int64_t)((uint64_t)iprod * (uint64_t)v);
+            /* Read i64 directly: (int64_t)as_f64(atom) both loses precision
+             * above 2^53 and is UB when the value rounds to >= 2^63.  Wrap-
+             * multiply keeps overflow well-defined. */
+            int64_t v = (elems[i]->type == -RAY_I64) ? elems[i]->i64 : (int64_t)as_f64(elems[i]);
+            iprod = wrap_mul_i64(iprod, v);
             fprod *= (double)v;
         }
     }

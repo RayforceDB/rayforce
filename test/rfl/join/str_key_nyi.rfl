@@ -1,27 +1,30 @@
-;; str_key_nyi.rfl — STR equality-key columns are unsupported in the asof and
-;; window join kernels and must be DECLINED, not silently mis-answered.
+;; str_key_nyi.rfl -- unsupported equality-key columns in the asof and window
+;; join kernels must be DECLINED, not silently mis-answered.
 ;;
 ;; Root cause: both kernels read equality-key cells through read_col_i64
 ;; (asof via asof_eq_lread; window when it sorts/probes the right side), and
-;; read_col_i64 has no RAY_STR case — a STR column falls into the byte-wide
-;; default.  asof then mismatches outright (a key that should match nulls
-;; out); window only reads one byte per row, so small key sets coincide by
-;; luck but enough distinct keys collide and cross-contaminate groups, so the
-;; aggregates are WRONG.  The base equi-join (inner/left/anti) uses a separate
-;; STR-aware kernel and stays correct, so the fix is scoped to asof + window:
-;; reject a STR eq-key on either side with `nyi` instead of returning corrupt
-;; data.  window-join1 shares the window kernel; the 4-argument compatibility
+;; read_col_i64 can only represent bool/u8/i16/i32/i64/date/time/timestamp/sym.
+;; STR, GUID, F32, F64, and object-shaped keys otherwise compare the wrong
+;; bytes and can corrupt matches or aggregates.  The base equi-join uses a
+;; separate type-aware kernel and stays correct, so the fix is scoped to asof +
+;; window.  window-join1 shares the window kernel; the 4-argument compatibility
 ;; window forms fall through to the asof executor, so they need the same guard.
 
 ;; ── asof-join: STR equality key → nyi (both operand orders) ──────────
 (set tr (table [Sym Time Price] (list ["A" "A"] [12:00:01 12:00:04] [100 101])))(set qs (table [Sym Time Bid] (list ["A" "A"] [12:00:00 12:00:05] [99 100])))(asof-join [Sym Time] tr qs) !- nyi
 (set tr (table [Sym Time Price] (list ["A" "A"] [12:00:01 12:00:04] [100 101])))(set qs (table [Sym Time Bid] (list ["A" "A"] [12:00:00 12:00:05] [99 100])))(asof-join [Sym Time] qs tr) !- nyi
+(set G (guid 2))(set trG (table [K Time Price] (list G [12:00:01 12:00:04] [100 101])))(set qsG (table [K Time Bid] (list (at G [1 0]) [12:00:00 12:00:05] [20 10])))(asof-join [K Time] trG qsG) !- nyi
+(set trF (table [K Time Price] (list [1.5 2.5] [12:00:01 12:00:04] [100 101])))(set qsF (table [K Time Bid] (list [2.5 1.5] [12:00:00 12:00:05] [20 10])))(asof-join [K Time] trF qsF) !- nyi
 
 ;; ── window-join / window-join1: STR equality key → nyi ───────────────
 (set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set wi (map-left + [-2000 2000] (at wt 'Time)))(window-join [Sym Time] wi wt wq {minBid: (min Bid)}) !- nyi
 (set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set wi (map-left + [-2000 2000] (at wt 'Time)))(window-join1 [Sym Time] wi wt wq {minBid: (min Bid)}) !- nyi
 (set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(at (window-join wt wq [Sym] 'Time) 'Bid) !- nyi
 (set wt (table [Sym Time Price] (list ["a" "a"] [10:00:01.000 10:00:05.000] [100 200])))(set wq (table [Sym Time Bid] (list ["a" "a" "a"] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(at (window-join1 wt wq [Sym] 'Time) 'Bid) !- nyi
+(set WG (guid 2))(set wtG (table [K Time Price] (list WG [10:00:01.000 10:00:05.000] [100 200])))(set wqG (table [K Time Bid] (list (at WG [0 0 1]) [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set wiG (map-left + [-2000 2000] (at wtG 'Time)))(window-join [K Time] wiG wtG wqG {minBid: (min Bid)}) !- nyi
+(set WF (table [K Time Price] (list [1.5 2.5] [10:00:01.000 10:00:05.000] [100 200])))(set WQF (table [K Time Bid] (list [1.5 1.5 2.5] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set WIF (map-left + [-2000 2000] (at WF 'Time)))(window-join1 [K Time] WIF WF WQF {minBid: (min Bid)}) !- nyi
+(set WG (guid 2))(set wtG (table [K Time Price] (list WG [10:00:01.000 10:00:05.000] [100 200])))(set wqG (table [K Time Bid] (list (at WG [0 0 1]) [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(at (window-join wtG wqG [K] 'Time) 'Bid) !- nyi
+(set WF (table [K Time Price] (list [1.5 2.5] [10:00:01.000 10:00:05.000] [100 200])))(set WQF (table [K Time Bid] (list [1.5 1.5 2.5] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(at (window-join1 WF WQF [K] 'Time) 'Bid) !- nyi
 
 ;; ── SYM equality keys keep working and stay order-independent ────────
 (set KS (as 'sym ["AAPL" "AAPL"]))(set trS (table [Sym Time Price] (list KS [12:00:01 12:00:04] [100 101])))(set qsS (table [Sym Time Bid] (list KS [12:00:00 12:00:05] [99 100])))(at (asof-join [Sym Time] trS qsS) 'Bid) -- [99 99]
