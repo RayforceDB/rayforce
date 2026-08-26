@@ -4409,18 +4409,23 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
  * Programmatic Datalog API builtins
  * ══════════════════════════════════════════ */
 
-/* Opaque handle for dl_program_t stored in a ray_t atom.
- * We store the pointer in the i64 field. */
+/* Opaque handle for dl_program_t stored in a ray_t atom.  The pointer lives
+ * in the i64 field, tagged with RAY_ATTR_DLPROG so dl_unwrap_program can reject
+ * a plain integer (or an arithmetic copy, which does not carry the attr)
+ * instead of dereferencing an arbitrary value as a dl_program_t*.  Mirrors the
+ * RAY_ATTR_GRAPH / RAY_ATTR_HNSW handle scheme. */
 static ray_t* dl_wrap_program(dl_program_t* prog) {
     ray_t* obj = ray_alloc(0);
     if (!obj || RAY_IS_ERR(obj)) return ray_error("oom", NULL);
     obj->type = -RAY_I64;
     obj->i64 = (int64_t)(uintptr_t)prog;
+    obj->attrs |= RAY_ATTR_DLPROG;
     return obj;
 }
 
 static dl_program_t* dl_unwrap_program(ray_t* obj) {
-    if (!obj || obj->type != -RAY_I64) return NULL;
+    if (!obj || obj->type != -RAY_I64 || !(obj->attrs & RAY_ATTR_DLPROG))
+        return NULL;
     return (dl_program_t*)(uintptr_t)obj->i64;
 }
 
@@ -4514,16 +4519,22 @@ ray_t* ray_dl_provenance_fn(ray_t* prog_obj, ray_t* pred_obj) {
 /* (dl-free prog) — free a dl-program handle created by (dl-program).
  * The handle wraps a raw dl_program_t* with no automatic finalizer, so
  * without an explicit free the program block and all relation tables it
- * owns leak. Idempotent: zeroes the handle so a second call is a no-op
- * (returns false) instead of double-freeing. */
+ * owns leak.  On free we clear RAY_ATTR_DLPROG and zero the pointer, so a
+ * second call is an idempotent no-op (returns false) rather than a
+ * double-free.  A tagged pointer that isn't an i64 is a type error, and a
+ * plain/forged integer (RAY_ATTR_DLPROG absent, non-zero value) is rejected
+ * as a type error instead of being dereferenced as a dl_program_t*. */
 ray_t* ray_dl_free_fn(ray_t* x) {
     if (!x || x->type != -RAY_I64)
         return ray_error("type", "dl-free: arg must be a dl-program");
-    dl_program_t* prog = dl_unwrap_program(x);
-    if (!prog) return ray_bool(false);  /* already freed / null handle */
-    dl_program_free(prog);
-    x->i64 = 0;
-    return ray_bool(true);
+    if (x->attrs & RAY_ATTR_DLPROG) {
+        dl_program_free((dl_program_t*)(uintptr_t)x->i64);
+        x->attrs &= (uint8_t)~RAY_ATTR_DLPROG;
+        x->i64 = 0;
+        return ray_bool(true);
+    }
+    if (x->i64 == 0) return ray_bool(false);  /* already-freed handle: idempotent */
+    return ray_error("type", "dl-free: not a dl-program handle");
 }
 
 /* Reset global Datalog rule storage (called from ray_lang_destroy) */
