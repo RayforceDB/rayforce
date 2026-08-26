@@ -30,7 +30,6 @@
 #include "mem/heap.h"
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <inttypes.h>
@@ -43,24 +42,30 @@ typedef struct {
     int32_t len;
     int32_t cap;
     ray_t*  block;  /* ray_alloc'd backing block */
+    bool    err;        /* sticky: set on the 2GiB cap or a failed ray_alloc.
+                         * Once set, every append is a no-op and fmt_to_str
+                         * returns an error instead of a string. */
+    const char* err_msg;/* why err was set, surfaced by fmt_to_str */
 } fmt_buf_t;
 
-/* Terminal failure for an unrepresentable or unallocatable format buffer.
- * The fmt_* helpers are all void, so there is no caller to return
- * ray_error to; before this guard the doubling loop used to overflow
- * int32 and spin forever (see fmt_ensure), and a failed ray_alloc was
- * dereferenced unchecked.  A loud stop beats a silent hang.  SIGABRT also
- * gives the crash handler a chance to dump state for diagnosis. */
-static void fmt_fatal(const char* why) {
-    fprintf(stderr, "error: format: %s\n", why);
-    fflush(stderr);
-    abort();
-}
-
+/* The fmt_* append helpers are all void and have no caller to return an error
+ * to, so a growth failure (the 2GiB int32 buffer ceiling, or a ray_alloc that
+ * fails under memory pressure) sets the sticky `err` flag instead of writing
+ * out of bounds.  Every append checks it and becomes a no-op, and fmt_to_str
+ * turns it into a RAY_IS_ERR result.  This must NOT abort(): ray_fmt runs on
+ * IPC-server threads formatting client-supplied values (e.g. a client
+ * (println <huge vector>) or query-log of the raw payload), so a process-fatal
+ * path here is remotely triggerable — a recoverable error keeps the server up
+ * and every ray_fmt caller already checks RAY_IS_ERR. */
 static void fmt_init(fmt_buf_t* b) {
-    b->block = ray_alloc(256);
-    if (!b->block || RAY_IS_ERR(b->block))
-        fmt_fatal("cannot allocate the initial output buffer");
+    b->err     = false;
+    b->err_msg = NULL;
+    b->block   = ray_alloc(256);
+    if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
+        b->err = true; b->err_msg = "cannot allocate the initial output buffer";
+        b->buf = NULL; b->len = 0; b->cap = 0;
+        return;
+    }
     b->buf   = (char*)ray_data(b->block);
     b->len   = 0;
     b->cap   = 256;
@@ -76,46 +81,57 @@ static void fmt_destroy(fmt_buf_t* b) {
     }
 }
 
-static void fmt_ensure(fmt_buf_t* b, int32_t extra) {
-    /* Compute the requirement in int64: len/extra are int32 and both the
-     * fast-path compare and the doubling loop used to overflow silently.
-     * At cap == 2^30 one more `new_cap *= 2` overflowed int32, wrapped
-     * through negative to 0, and spun in this loop forever at 100% CPU —
-     * a full process hang from e.g. (println <100M-row vector>) whose
-     * formatted text exceeds 1 GiB. */
-    int64_t need = (int64_t)b->len + (int64_t)extra;
+/* extra is int64 so a >2GiB length from a call site reaches the ceiling check
+ * intact instead of wrapping int32 first (a length in [2^31,2^32) used to wrap
+ * negative and, via the fast path below, sneak past as a no-grow "fit"). */
+static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
+    if (b->err) return;
+    /* Guard a negative/oversize request BEFORE the fast-path return: for a
+     * negative extra, need = len + extra < len <= cap, so the fast path would
+     * otherwise return first and leave the bad length to a wild memcpy. */
+    if (extra < 0) { b->err = true; b->err_msg = "invalid negative format length"; return; }
+    int64_t need = (int64_t)b->len + extra;
     if (need <= (int64_t)b->cap) return;
-    if (extra < 0 || need > (int64_t)INT32_MAX)
-        fmt_fatal("formatted output exceeds the 2GiB buffer limit");
+    if (need > (int64_t)INT32_MAX) {
+        /* int32 buffer ceiling: the doubling loop and cap field are int32, so
+         * 2GiB is the hard limit.  Fail loud but recoverable, not abort(). */
+        b->err = true; b->err_msg = "formatted output exceeds the 2GiB buffer limit";
+        return;
+    }
     int64_t new_cap = b->cap;
     while (new_cap < need)
         new_cap *= 2;
     if (new_cap > (int64_t)INT32_MAX)
         new_cap = INT32_MAX;
     ray_t* new_block = ray_alloc((size_t)new_cap);
-    if (!new_block || RAY_IS_ERR(new_block))
-        fmt_fatal("out of memory growing the output buffer");
+    if (!new_block) {   /* ray_alloc returns NULL on failure, never an error object */
+        b->err = true; b->err_msg = "out of memory growing the output buffer";
+        return;
+    }
     char*  new_buf   = (char*)ray_data(new_block);
     memcpy(new_buf, b->buf, (size_t)b->len);
     ray_free(b->block);
     b->block = new_block;
     b->buf   = new_buf;
-    b->cap   = new_cap;
+    b->cap   = (int32_t)new_cap;   /* new_cap <= INT32_MAX by the clamp above */
 }
 
 static void fmt_putc(fmt_buf_t* b, char c) {
     fmt_ensure(b, 1);
+    if (b->err) return;
     b->buf[b->len++] = c;
 }
 
 static void fmt_puts(fmt_buf_t* b, const char* s) {
-    int32_t slen = (int32_t)strlen(s);
+    int64_t slen = (int64_t)strlen(s);
     fmt_ensure(b, slen);
+    if (b->err) return;
     memcpy(b->buf + b->len, s, (size_t)slen);
-    b->len += slen;
+    b->len += (int32_t)slen;   /* safe: fmt_ensure enforced need <= INT32_MAX */
 }
 
 static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
+    if (b->err) return;
     va_list ap;
 
     /* Try to fit in remaining space first */
@@ -132,20 +148,27 @@ static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
     }
 
     /* Need more space — grow and retry */
-    fmt_ensure(b, n + 1);
+    fmt_ensure(b, (int64_t)n + 1);
+    if (b->err) return;
     va_start(ap, fmt);
     vsnprintf(b->buf + b->len, (size_t)(b->cap - b->len), fmt, ap);
     va_end(ap);
     b->len += n;
 }
 
-static void fmt_putn(fmt_buf_t* b, const char* s, int32_t n) {
+static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
     fmt_ensure(b, n);
+    if (b->err) return;
     memcpy(b->buf + b->len, s, (size_t)n);
-    b->len += n;
+    b->len += (int32_t)n;   /* safe: fmt_ensure enforced need <= INT32_MAX */
 }
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
+    if (b->err) {
+        ray_t* e = ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
+        fmt_destroy(b);
+        return e;
+    }
     ray_t* result = ray_str(b->buf, (size_t)b->len);
     fmt_destroy(b);
     return result;
@@ -280,7 +303,7 @@ static void fmt_guid(fmt_buf_t* b, const uint8_t* bytes) {
  * owned by their table/domain; never released here). */
 static void fmt_sym_atom(fmt_buf_t* b, ray_t* s) {
     if (s && !RAY_IS_ERR(s) && ray_str_len(s) > 0) {
-        fmt_putn(b, ray_str_ptr(s), (int32_t)ray_str_len(s));
+        fmt_putn(b, ray_str_ptr(s), (int64_t)ray_str_len(s));
     } else {
         /* sym 0 (the canonical empty/null symbol) and any unresolvable id
          * render as the bare quote literal `'`; there is no separate `0Ns`. */
@@ -357,7 +380,7 @@ static void fmt_str_atom(fmt_buf_t* b, ray_t* obj, int full) {
     const char* p = ray_str_ptr(obj);
     size_t      n = ray_str_len(obj);
     fmt_putc(b, '"');
-    fmt_putn(b, p, (int32_t)n);
+    fmt_putn(b, p, (int64_t)n);
     fmt_putc(b, '"');
 }
 
@@ -417,7 +440,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
         size_t slen = 0;
         const char* p = ray_str_vec_get(vec, idx, &slen);
         fmt_putc(b, '"');
-        if (p) fmt_putn(b, p, (int32_t)slen);
+        if (p) fmt_putn(b, p, (int64_t)slen);
         fmt_putc(b, '"');
         break;
     }
@@ -429,7 +452,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
         if (child) {
             ray_t* s = ray_fmt(child, 1);
             if (s && !RAY_IS_ERR(s)) {
-                fmt_putn(b, ray_str_ptr(s), (int32_t)ray_str_len(s));
+                fmt_putn(b, ray_str_ptr(s), (int64_t)ray_str_len(s));
                 ray_release(s);
             } else {
                 fmt_puts(b, "?");
@@ -716,7 +739,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             int64_t name_id = ray_table_col_name(tbl, i);
             ray_t* name_str = ray_sym_str(name_id);
             if (name_str && !RAY_IS_ERR(name_str)) {
-                fmt_putn(b, ray_str_ptr(name_str), (int32_t)ray_str_len(name_str));
+                fmt_putn(b, ray_str_ptr(name_str), (int64_t)ray_str_len(name_str));
                 ray_release(name_str);
             }
         }
@@ -843,7 +866,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 fmt_init(&tmp);
                 fmt_raw_elem(&tmp, col_vec, ri);
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
-                memcpy(cell->str, tmp.buf, (size_t)clen);
+                if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
                 fmt_destroy(&tmp);
@@ -868,7 +891,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 fmt_init(&tmp);
                 fmt_raw_elem(&tmp, col_vec, src_idx);
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
-                memcpy(cell->str, tmp.buf, (size_t)clen);
+                if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
                 fmt_destroy(&tmp);
