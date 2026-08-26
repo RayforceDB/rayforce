@@ -1198,9 +1198,10 @@ static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
 }
 
 /* v1 routing gate for the NEW consult paths: like idx_fresh but also
- * excludes null-bearing columns.  Sort perm orders nulls LAST while
- * sentinel values order FIRST, and comparison semantics on null rows
- * follow null-as-minimum — none of the new consults model that in v1.
+ * excludes null-bearing columns.  A sort perm now orders nulls FIRST on
+ * ascending, agreeing with null-as-minimum rather than contradicting it
+ * — but a perm built before that and persisted still carries nulls last,
+ * and none of the new consults model either placement in v1.
  * (The pre-existing hash-eq probe keeps bare idx_fresh: its builder
  * skips null rows, making null-bearing probes structurally correct.) */
 static bool idx_fresh_nonull(ray_t* col, ray_idx_kind_t kind) {
@@ -2068,7 +2069,11 @@ bool ray_index_bloom_absent(ray_t* col, int64_t key) {
  * Sort index — ascending permutation of row ids
  *
  * Delegates to the existing parallel sort builder.  Result is an I64 vec of
- * length parent->len with default null-handling (nulls last for asc).
+ * length parent->len with the default null placement — a null is the
+ * smallest value, so nulls come first on ascending.  An index persisted
+ * before that rule changed carries the old order; idx_fresh_nonull keeps
+ * such an index off the consult paths, which is what makes the difference
+ * unobservable rather than merely unlikely.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_index_attach_sort(ray_t** vp) {

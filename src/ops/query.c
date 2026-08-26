@@ -743,8 +743,8 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                             ray_t* sort_col = ray_table_get_col(result, key_syms[0]);
                             if (sort_col) {
                                 topk = ray_topk_table(result, sort_col,
-                                    key_descs[0], key_descs[0]
-                                    /*nf=desc by default*/, k);
+                                    key_descs[0],
+                                    sort_nulls_first(key_descs[0]), k);
                             }
                         } else {
                             ray_t* key_cols[TOPK_MAX_KEYS];
@@ -752,7 +752,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                             int ok = 1;
                             for (uint32_t i = 0; i < n_keys; i++) {
                                 key_cols[i] = ray_table_get_col(result, key_syms[i]);
-                                nfs[i] = key_descs[i];
+                                nfs[i] = sort_nulls_first(key_descs[i]);
                                 if (!key_cols[i]) { ok = 0; break; }
                             }
                             if (ok) {
@@ -5878,8 +5878,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                 }
             }
             /* Sort keys: only verify the column exists.  Nulls are now
-             * handled by the null-aware leg in fpk_cmp (NULLS LAST for
-             * ASC, NULLS FIRST for DESC, matching sort.c's default).
+             * handled by the null-aware leg in fpk_cmp, which takes its
+             * placement from sort_nulls_first like every other sort path:
+             * a null is the smallest value, so first for ASC, last for DESC.
              * Output columns are also handled — the fused materialiser
              * propagates null bitmaps via ray_vec_set_null. */
             if (!bad_clause) {

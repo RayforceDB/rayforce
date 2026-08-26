@@ -1006,7 +1006,13 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         .type = sort_vecs[0]->type,
                         .col_attrs = sort_vecs[0]->attrs,
                         .desc = sort_descs[0],
-                        .nulls_first = sort_descs[0], /* default: NULLS FIRST for DESC */
+                        /* The other two window sort paths take the default
+                         * from sort_nulls_first via a NULL nulls_first, and
+                         * which of the three runs is decided by the row count.
+                         * Spelling the rule out here instead would put a
+                         * window's nulls at one end below 64 rows and the
+                         * other end above it. */
+                        .nulls_first = sort_nulls_first(sort_descs[0]),
                         .enum_rank = enum_ranks[0], .n_keys = 1,
                     };
                     if (sk_pool)

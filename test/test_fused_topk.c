@@ -257,8 +257,8 @@ static test_result_t test_topk_sym_key(void) {
     PASS();
 }
 
-/* Chunk 9 part 3: nulls in sort key — exercises the has_nulls leg
- * (lines 133-139).  ASC: NULLS LAST; DESC: NULLS FIRST. */
+/* Chunk 9 part 3: nulls in sort key — exercises the has_nulls leg.
+ * A null is the smallest value: ASC puts nulls FIRST, DESC puts them LAST. */
 static test_result_t test_topk_null_sort_key_asc(void) {
     int64_t N = 20;
     ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
@@ -291,14 +291,16 @@ static test_result_t test_topk_null_sort_key_asc(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(res));
     TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
 
-    /* ASC, NULLS LAST: K=5 smallest non-null k.  Non-null rows have
-     * k ∈ {1,2,3,4,6,7,8,9,11,...19}.  Top 5 ASC = {1,2,3,4,6}. */
+    /* ASC, NULLS FIRST: the three null rows are the three smallest, in
+     * source order, and the two smallest non-nulls follow: 1, 2. */
     ray_t* k_col = ray_table_get_col(res, s_k);
     TEST_ASSERT_NOT_NULL(k_col);
-    int64_t expected[5] = {1, 2, 3, 4, 6};
-    for (int64_t i = 0; i < 5; i++) {
-        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, i));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[i], expected[i]);
+    for (int64_t i = 0; i < 3; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(k_col, i));
+    int64_t expected[2] = {1, 2};
+    for (int64_t i = 0; i < 2; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, 3 + i));
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[3 + i], expected[i]);
     }
 
     ray_release(res); ray_release(where_expr); ray_release(tbl);
@@ -326,7 +328,7 @@ static test_result_t test_topk_null_sort_key_desc(void) {
 
     ray_t* where_expr = ray_parse("(>= sel 0)");
     int64_t sort_keys[1]  = { s_k };
-    uint8_t sort_descs[1] = { 1 };  /* DESC, NULLS FIRST */
+    uint8_t sort_descs[1] = { 1 };  /* DESC, so NULLS LAST */
     int64_t out_syms[2]   = { s_k, s_sel };
     int64_t k_pick = 5;
     ray_t* res = ray_fused_topk_select(tbl, where_expr,
@@ -336,20 +338,66 @@ static test_result_t test_topk_null_sort_key_desc(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(res));
     TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
 
-    /* DESC, NULLS FIRST: K=5 results — first 3 must be the null rows
-     * (rows 0, 5, 10) — followed by the 2 highest non-null values
-     * (k=19, k=18). */
+    /* DESC, NULLS LAST: a null is the smallest value, so it never enters a
+     * DESC top-5 while five larger values exist.  All five are the highest
+     * non-nulls: 19, 18, 17, 16, 15. */
     ray_t* k_col = ray_table_get_col(res, s_k);
     TEST_ASSERT_NOT_NULL(k_col);
-    /* Check that the first 3 rows are null. */
-    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 0));
-    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 1));
-    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 2));
-    /* Slots 3 and 4 are non-null with k=19 and k=18 (DESC). */
-    TEST_ASSERT_FALSE(ray_vec_is_null(k_col, 3));
-    TEST_ASSERT_FALSE(ray_vec_is_null(k_col, 4));
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[3], 19);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[4], 18);
+    for (int64_t i = 0; i < 5; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, i));
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[i], 19 - i);
+    }
+
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* DESC top-k that has to reach past the non-nulls.  With nulls last, a
+ * null enters the result only when there are fewer than k non-null rows —
+ * the back-fill leg of the bounded heap, which no other test exercises:
+ * every DESC case above has more non-nulls than k, so the null branch is
+ * only ever taken to REJECT. */
+static test_result_t test_topk_null_desc_backfill(void) {
+    int64_t N = 20;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    int64_t* kd = (int64_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) kd[i] = i;
+    /* Only rows 3, 11 and 17 are non-null: 3 values for a k of 5. */
+    for (int64_t i = 0; i < N; i++)
+        if (i != 3 && i != 11 && i != 17) ray_vec_set_null(kc, i, true);
+
+    ray_t* selc = ray_vec_new(RAY_I64, N); selc->len = N;
+    int64_t* sd = (int64_t*)ray_data(selc);
+    for (int64_t i = 0; i < N; i++) sd[i] = i;
+
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, selc); ray_release(selc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 1 };  /* DESC, so NULLS LAST */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 5;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+
+    /* 17, 11, 3, then two nulls in source order. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    TEST_ASSERT_NOT_NULL(k_col);
+    int64_t expect[3] = {17, 11, 3};
+    for (int64_t i = 0; i < 3; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, i));
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[i], expect[i]);
+    }
+    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 3));
+    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 4));
 
     ray_release(res); ray_release(where_expr); ray_release(tbl);
     PASS();
@@ -1100,7 +1148,7 @@ static test_result_t test_topk_both_nulls_tie(void) {
     tbl = ray_table_add_col(tbl, s_sel, sc);  ray_release(sc);
 
     ray_t* where_expr = ray_parse("(>= sel 0)");
-    /* Sort by k1 ASC (nulls last), then k2 ASC. */
+    /* Sort by k1 ASC (a null is smallest, so nulls lead), then k2 ASC. */
     int64_t sort_keys[2]  = { s_k1, s_k2 };
     uint8_t sort_descs[2] = { 0, 0 };
     int64_t out_syms[2]   = { s_k1, s_k2 };
@@ -1111,13 +1159,13 @@ static test_result_t test_topk_both_nulls_tie(void) {
     TEST_ASSERT_NOT_NULL(res);
     TEST_ASSERT_FALSE(RAY_IS_ERR(res));
     TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
-    /* Non-null k1 values start at row 2 (k1=0).  (k1 ASC, k2 ASC):
-     * k1=0: rows 4(k2=16), 3(k2=17), 2(k2=18).
-     * k1=1: rows 9(k2=11), 8(k2=12), 7(k2=13), 6(k2=14).
-     * Top 5 = {16, 17, 18, 11, 12}. */
+    /* (k1 ASC, k2 ASC).  The four k1-nulls are the smallest and lead; two
+     * nulls tie on k1, so k2 orders them: rows 10(k2=10), 5(k2=15),
+     * 1(k2=19), 0(k2=20).  The fifth slot is the smallest k2 of the
+     * smallest non-null k1 group (k1=0: rows 2,3,4) — row 4, k2=16. */
     ray_t* k2_col = ray_table_get_col(res, s_k2);
     TEST_ASSERT_NOT_NULL(k2_col);
-    int64_t expect_k2[] = {16, 17, 18, 11, 12};
+    int64_t expect_k2[] = {10, 15, 19, 20, 16};
     for (int64_t i = 0; i < k_pick; i++)
         TEST_ASSERT_EQ_I(((int64_t*)ray_data(k2_col))[i], expect_k2[i]);
     ray_release(res); ray_release(where_expr); ray_release(tbl);
@@ -1230,7 +1278,7 @@ static test_result_t test_topk_multi_key_null_tiebreak(void) {
     tbl = ray_table_add_col(tbl, s_sel, sc);  ray_release(sc);
 
     ray_t* where_expr = ray_parse("(>= sel 0)");
-    /* k1 ASC (nulls last), k2 DESC for tie-break. */
+    /* k1 ASC (a null is smallest, so nulls lead), k2 DESC for tie-break. */
     int64_t sort_keys[2]  = { s_k1, s_k2 };
     uint8_t sort_descs[2] = { 0, 1 };
     int64_t out_syms[3]   = { s_k1, s_k2, s_sel };
@@ -1241,12 +1289,12 @@ static test_result_t test_topk_multi_key_null_tiebreak(void) {
     TEST_ASSERT_NOT_NULL(res);
     TEST_ASSERT_FALSE(RAY_IS_ERR(res));
     TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
-    /* Non-null k1: smallest k1=0 at rows 2,3; then k1=1 at rows 4,5,6,7.
-     * For k1=0: k2 DESC → row 3(k2=3), row 2(k2=2).
-     * For k1=1: k2 DESC → row 7(k2=3), row 6(k2=2), row 5(k2=1), row 4(k2=0).
-     * Top 6 = rows 3,2,7,6,5,4. */
+    /* The four k1-nulls lead.  They tie on k1, so k2 DESC orders them and
+     * the row index breaks the remaining ties: row 1(k2=1), row 9(k2=1),
+     * row 0(k2=0), row 8(k2=0).  Then the smallest non-null k1 group
+     * (k1=0, rows 2,3) by k2 DESC: row 3(k2=3), row 2(k2=2). */
     ray_t* sel_col = ray_table_get_col(res, s_sel);
-    int64_t expect_sel[] = {3, 2, 7, 6, 5, 4};
+    int64_t expect_sel[] = {1, 9, 0, 8, 3, 2};
     for (int64_t i = 0; i < k_pick; i++)
         TEST_ASSERT_EQ_I(((int64_t*)ray_data(sel_col))[i], expect_sel[i]);
     ray_release(res); ray_release(where_expr); ray_release(tbl);
@@ -1298,7 +1346,7 @@ static test_result_t test_topk_i16_with_nulls(void) {
 
     ray_t* where_expr = ray_parse("(>= sel 0)");
     int64_t sort_keys[1]  = { s_k };
-    uint8_t sort_descs[1] = { 0 };  /* ASC, NULLS LAST */
+    uint8_t sort_descs[1] = { 0 };  /* ASC, so NULLS FIRST */
     int64_t out_syms[2]   = { s_k, s_sel };
     int64_t k_pick = 5;
     ray_t* res = ray_fused_topk_select(tbl, where_expr,
@@ -1307,12 +1355,15 @@ static test_result_t test_topk_i16_with_nulls(void) {
     TEST_ASSERT_NOT_NULL(res);
     TEST_ASSERT_FALSE(RAY_IS_ERR(res));
     TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
-    /* Non-null I16 ASC: 1,2,3,4,6 (skipping nulls at 0 and 5). */
+    /* I16 ASC: the two nulls (rows 0 and 5) lead in source order, then
+     * the smallest non-nulls 1, 2, 3. */
     ray_t* k_col  = ray_table_get_col(res, s_k);
-    int16_t expect[] = {1, 2, 3, 4, 6};
-    for (int64_t i = 0; i < k_pick; i++) {
-        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, i));
-        TEST_ASSERT_EQ_I((int64_t)((int16_t*)ray_data(k_col))[i], expect[i]);
+    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 1));
+    int16_t expect[] = {1, 2, 3};
+    for (int64_t i = 0; i < 3; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, 2 + i));
+        TEST_ASSERT_EQ_I((int64_t)((int16_t*)ray_data(k_col))[2 + i], expect[i]);
     }
     ray_release(res); ray_release(where_expr); ray_release(tbl);
     PASS();
@@ -1545,6 +1596,7 @@ const test_entry_t fused_topk_entries[] = {
     { "fused_topk/sym_key_w32",               test_topk_sym_key,                   topk_setup, topk_teardown },
     { "fused_topk/null_sort_key_asc",         test_topk_null_sort_key_asc,         topk_setup, topk_teardown },
     { "fused_topk/null_sort_key_desc",        test_topk_null_sort_key_desc,        topk_setup, topk_teardown },
+    { "fused_topk/null_desc_backfill",        test_topk_null_desc_backfill,        topk_setup, topk_teardown },
     /* Chunk 11 — gate rejections */
     { "fused_topk/gate_null_tbl",             test_topk_gate_null_tbl,             topk_setup, topk_teardown },
     { "fused_topk/gate_k_too_large",          test_topk_gate_k_too_large,          topk_setup, topk_teardown },

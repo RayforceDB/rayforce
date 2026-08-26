@@ -73,10 +73,14 @@ typedef struct {
     uint8_t     esz;
     uint8_t     desc;        /* 0 = asc, 1 = desc */
     /* When the column carries nulls, fpk_cmp consults them before
-     * reading the raw payload and orders nulls LAST for ASC, FIRST for
-     * DESC — matching sort.c's default null policy.  has_nulls is the
-     * compile-time flag that gates the per-row probe. */
+     * reading the raw payload and places them at the end this flag
+     * names.  It is filled from sort_nulls_first, the one place that
+     * says where a null goes, so this path and the ordinary sort agree:
+     * they must, since a parted top-k runs this path per partition and
+     * is checked against the flat sort.  has_nulls is the compile-time
+     * flag that gates the per-row probe. */
     uint8_t     has_nulls;
+    uint8_t     nulls_first;
     /* SYM keys only: 1 when the column's domain is the runtime
      * singleton — cell ids then index the borrowed global snapshot
      * (ctx.sym_strings).  0 routes the compare through the column's
@@ -138,18 +142,16 @@ static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) 
     for (uint32_t k = 0; k < c->n_keys; k++) {
         const fpk_keyspec_t* ks = &c->keys[k];
         int cmp = 0;
-        /* Null-aware leg.  Default policy matches sort.c: NULLS LAST
-         * for ASC, NULLS FIRST for DESC.  In the max-heap-of-K-best
-         * comparator, "worse" → evicted first, so for ASC a null is
-         * worse than any non-null (so it goes last), and for DESC a
-         * null is better than any non-null (so it goes first).  Both
-         * legs short-circuit before the raw payload read. */
+        /* Null-aware leg.  In the max-heap-of-K-best comparator, "worse"
+         * → evicted first, so a null asked for first is better than any
+         * non-null and a null asked for last is worse.  Both legs
+         * short-circuit before the raw payload read. */
         if (ks->has_nulls) {
             bool a_null = ray_vec_is_null(ks->col, row_a);
             bool b_null = ray_vec_is_null(ks->col, row_b);
             if (a_null && b_null) continue;       /* tie on this key */
-            if (a_null) return ks->desc ? -1 : 1; /* a is null */
-            if (b_null) return ks->desc ?  1 : -1;
+            if (a_null) return ks->nulls_first ? -1 : 1;
+            if (b_null) return ks->nulls_first ?  1 : -1;
         }
         if (ks->type == RAY_SYM) {
             /* cell-data: ids resolve over the COLUMN's domain.  Runtime-
@@ -216,12 +218,10 @@ static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) 
      * want stable source-order semantics on ties.
      *
      * Future: caller-specified NULLS FIRST / NULLS LAST.  The
-     * has_nulls leg above implements the default policy (LAST for
-     * ASC, FIRST for DESC).  An explicit NULLS FIRST/LAST clause
-     * in the query DSL would need to thread through fpk_keyspec_t
-     * as a third orientation flag and override the default leg —
-     * the call site already has all the data needed.  Tracked
-     * separately. */
+     * has_nulls leg above already reads a per-key flag, but the flag
+     * is filled from the direction alone; an explicit clause in the
+     * query DSL would thread the caller's choice into it instead.
+     * Tracked separately. */
     if (row_a > row_b) return  1;   /* a is worse — evict first */
     if (row_a < row_b) return -1;
     return 0;
@@ -337,6 +337,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ctx.keys[i].esz       = ray_sym_elem_size(kt, col->attrs);
         ctx.keys[i].desc      = sort_descs[i];
         ctx.keys[i].has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) ? 1 : 0;
+        ctx.keys[i].nulls_first = sort_nulls_first(sort_descs[i]);
         ctx.keys[i].dom_runtime =
             (kt == RAY_SYM &&
              ray_sym_vec_domain(col) == ray_sym_runtime_domain()) ? 1 : 0;

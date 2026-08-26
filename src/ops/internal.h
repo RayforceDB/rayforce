@@ -860,9 +860,21 @@ typedef struct {
 #define NEARLY_SORTED_FRAC   0.05  /* threshold for nearly-sorted detection */
 #define MK_PRESCAN_MAX_KEYS  8     /* max sort keys for stack allocation */
 
+/* Where a null sorts, stated once for every sort path.
+ *
+ * A null is the smallest value, so ascending puts nulls first and descending
+ * puts them last.  Any path that needs the default must ask here rather than
+ * spell it out: two paths spelling out opposite defaults is what made a null's
+ * position depend on the row count and the column type, since which path runs
+ * is chosen by both. */
+static inline uint8_t sort_nulls_first(uint8_t desc) { return (uint8_t)!desc; }
+
 typedef struct {
     ray_t**       vecs;
     uint8_t*     desc;
+    /* NULL means "the default for each key's direction" — see
+     * sort_nulls_first.  A caller with its own policy passes one flag per
+     * key. */
     uint8_t*     nulls_first;
     uint32_t     n_sort;
 } sort_cmp_ctx_t;
@@ -890,7 +902,10 @@ typedef struct {
     int8_t          type;      /* column type */
     uint8_t         col_attrs; /* RAY_SYM width attrs */
     bool            desc;
-    bool            nulls_first; /* for single-key F64: 1=nulls first */
+    /* Where this key's nulls go: 1=first, 0=last.  Read by every typed
+     * single-key arm, not just the float one; the composite encode does
+     * not consult it and declines a nullable F64 key instead. */
+    bool            nulls_first;
     /* SYM rank mapping (NULL if not sym): */
     const uint32_t* enum_rank; /* intern_id → sort rank */
     /* Composite-key fields (n_keys > 1): */
