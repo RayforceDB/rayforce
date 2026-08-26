@@ -76,3 +76,34 @@
 (.sys.exec "test -x ./rayforce || exit 0; grep -qxF '[\"one\" \"two\"]' rf_strpool_out") -- 0
 
 (.sys.exec "rm -rf rf_strpool rf_strpool_child.rfl rf_strpool_out") -- 0
+
+;; ── A large string column carries an index, and that changes the release
+;;    path.  .db.splayed.set attaches a dict index to any string column of
+;;    65536 rows or more, so the mapped column comes back with a passenger
+;;    index — and the arm that handles an indexed column used to return
+;;    before it reached the pool.  While the column still unmapped the
+;;    region itself that cost one reference; once the pool owns the region
+;;    it costs the whole mapping, every load.
+;;
+;;    Measured rather than asserted structurally: five load-and-drop cycles
+;;    must leave the mapped-byte count where they found it.  Before the fix
+;;    this grew by the size of the file each time round. ─────────────────
+(.sys.exec "rm -rf rf_bigstr") -- 0
+(set _N 70000)
+(set _BT (table [id note] (list (til _N) (at (list "alpha" "beta" "gamma" "delta") (% (til _N) 4)))))
+(.db.splayed.set "rf_bigstr/" _BT)
+(set _BT 0)
+(.idx.has? (at (.db.splayed.get "rf_bigstr/") 'note)) -- true
+
+(set _m0 (at (.sys.mem) 'sys-mapped))
+(set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
+(set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
+(set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
+(set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
+(set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
+;; One file's worth of growth would be over a million bytes; the small
+;; negative drift is the release path rounding to whole pages while the
+;; map counted the file, and predates this change.
+(< (- (at (.sys.mem) 'sys-mapped) _m0) 4096) -- true
+
+(.sys.exec "rm -rf rf_bigstr") -- 0
