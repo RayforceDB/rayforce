@@ -24,6 +24,7 @@
 #include "col.h"
 #include "core/platform.h"
 #include "mem/heap.h"
+#include "mem/sys.h"   /* ray_sys_alloc — the shared-mapping descriptor */
 #include "store/serde.h"
 #include "store/fileio.h"
 #include "table/sym.h"
@@ -1619,11 +1620,27 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
 
     if (vec->type == RAY_STR) {
         ray_t* pool = (ray_t*)((char*)cm.mapped + cm.str_pool_offset);
-        pool->mmod = 2;
         pool->order = 0;
         /* Untrusted disk attrs — mask, see COL_DISK_ATTRS_MASK. */
         pool->attrs &= COL_DISK_ATTRS_MASK;
         ray_atomic_store(&pool->rc, 1);
+
+        /* The column and its pool are one mapping, and a gathered result
+         * shares the pool by reference — so the region must outlive
+         * whichever of them is freed first.  The pool owns it; the column
+         * holds an ordinary reference to the pool and unmaps nothing.
+         * Without this the column's free took the pool's bytes with it and
+         * every selection over a mapped string column read freed memory. */
+        ray_file_map_t* m = (ray_file_map_t*)ray_sys_alloc(sizeof(*m));
+        if (!m) {
+            ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+            return ray_error("oom", NULL);
+        }
+        m->base = cm.mapped;
+        m->len  = cm.mapped_size;
+        m->rc   = 1;                 /* the pool's own reference */
+        pool->mmod = 3;
+        memcpy(pool->aux + 8, &m, sizeof(m));
         vec->str_pool = pool;
     }
 

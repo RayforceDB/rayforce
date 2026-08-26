@@ -893,8 +893,14 @@ static void ray_release_owned_refs(ray_t* v) {
         return;
     }
 
-    if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
+    if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool)) {
+        /* Return rather than fall through, the way the SYM arm below does:
+         * a mapped column's pool owns the region they share, so this
+         * release can be the one that unmaps the page `v` sits on.  None
+         * of the checks after this one apply to a STR vec anyway. */
         ray_release(v->str_pool);
+        return;
+    }
 
     /* RAY_SYM vec: drop the resolution-domain ref (aux bytes 8-15).
      * No-op for the immortal runtime singleton — the common case. */
@@ -1501,6 +1507,19 @@ ray_t* ray_alloc(size_t data_size) {
  * ray_free
  * -------------------------------------------------------------------------- */
 
+/* Drop one reference to a shared file mapping; the last one unmaps it.
+ *
+ * Not atomic: every reference is taken and dropped while building or
+ * freeing a block, both of which already run under the owning heap's
+ * single-threaded discipline.  If a mapped column ever becomes shareable
+ * across heaps this needs the same treatment as ray_t's own rc. */
+void ray_file_map_release(ray_file_map_t* m) {
+    if (!m) return;
+    if (m->rc > 1) { m->rc--; return; }
+    ray_vm_unmap_file(m->base, m->len);
+    ray_sys_free(m);
+}
+
 void ray_free(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return;
     if (v->attrs & RAY_ATTR_ARENA) return;  /* arena-owned, bulk-freed */
@@ -1512,9 +1531,35 @@ void ray_free(ray_t* v) {
      * won't merge this block prematurely (it checks buddy_rc==0). */
     ray_atomic_store(&v->rc, 1);
 
+    /* Decide the mapping question BEFORE the children go.  A mapped string
+     * column shares its region with its pool, and the pool owns it: the
+     * release below can therefore be the last reference and unmap the very
+     * page this header sits on, so nothing may be read from `v` afterwards. */
+    const bool pool_owns_map = (v->mmod == 1 && v->type == RAY_STR &&
+                                v->str_pool && !RAY_IS_ERR(v->str_pool) &&
+                                v->str_pool->mmod == 3);
+
+    /* This block owns a shared mapping: take the descriptor now, for the
+     * same reason — aux is inside the region it describes. */
+    ray_file_map_t* owned_map = NULL;
+    if (v->mmod == 3) memcpy(&owned_map, v->aux + 8, sizeof(owned_map));
+
     ray_release_owned_refs(v);
 
     ray_heap_t* h = ray_tl_heap;
+
+    if (pool_owns_map) {
+        /* The pool released just above ends the region, if it was the last
+         * one in it.  Nothing more to do here, and nothing left to read. */
+        if (h) RAY_STAT(h->stats.free_count++);
+        return;
+    }
+
+    if (owned_map) {
+        ray_file_map_release(owned_map);
+        if (h) RAY_STAT(h->stats.free_count++);
+        return;
+    }
 
     /* File-mapped: munmap */
     if (v->mmod == 1) {

@@ -156,6 +156,25 @@ typedef struct {
     uint64_t peak_live_bytes;
 } ray_mem_trace_t;
 
+/* One file mapping that more than one block lives in.
+ *
+ * A splayed string column and its pool are written contiguously and mapped
+ * together, so the region cannot end when either one of them does: a
+ * selection may hold the pool after the column it was gathered from is
+ * gone.  The descriptor lives on the heap rather than inside the mapping —
+ * it has to outlive it to unmap it — and the pool holds it (mmod 3) while
+ * the column merely references the pool.
+ *
+ * Kept off the buddy heap (ray_sys_alloc) so a block being freed can drop
+ * the last reference without re-entering the allocator it is inside. */
+typedef struct {
+    void*    base;   /* what to hand back to ray_vm_unmap_file */
+    size_t   len;
+    uint32_t rc;     /* blocks still living in the region */
+} ray_file_map_t;
+
+void ray_file_map_release(ray_file_map_t* m);
+
 /* ===== Forward Declarations (internal types) ===== */
 
 typedef struct ray_heap      ray_heap_t;

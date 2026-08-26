@@ -1,0 +1,72 @@
+;; A result gathered from a mapped string column outlives that column.
+;;
+;; A splayed string column and its pool are written contiguously and mapped
+;; together.  Any result gathered from such a column shares the pool by
+;; reference — filter, take, join and the head/tail slices all go through
+;; col_propagate_str_pool, which retains it.  That retain used to be a
+;; promise the memory could not keep: the region belonged to the COLUMN, so
+;; freeing the column unmapped the pool out from under every result still
+;; holding it.  The pool now owns the region and the column references it.
+;;
+;; Each shape runs in its own process because the second symptom only
+;; appears at teardown: with both the loaded table and the result still
+;; bound, every read is correct and the fault lands in the environment's
+;; final release.  A test that only read the values would pass on the
+;; broken build — the reporter's own case 2 printed the right answer first.
+;;
+;; The exit status is the assertion.  A crash cannot be observed from
+;; inside the process that has it.
+
+(.sys.exec "rm -rf rf_strpool rf_strpool_child.rfl") -- 0
+
+(set _T (table [id note] (list [1 2 3] ["one" "two" "three"])))
+(.db.splayed.set "rf_strpool/" _T)
+
+;; ── 1. where over a proper subset, the loaded table then dropped: the
+;;    original reproducer, which faulted before printing anything. ────────
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set u (select {from: u where: (not (== id 1))}))' '(insert (quote u) (table [id note] (list [9] [\"nine\"])))' '(print (at u (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"two\" \"three\" \"nine\"]' rf_strpool_out") -- 0
+
+;; ── 2. selection kept beside the loaded table: reads fine either way, so
+;;    only the exit status tells the two builds apart. ──────────────────────
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set v (select {from: u where: (not (== id 1))}))' '(print (at v (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -q 'SIGSEGV' rf_strpool_out; test $? -ne 0") -- 0
+
+;; ── The rest of the family.  Everything that SHARES the pool belongs here;
+;;    operations that build their strings afresh (asc, distinct, group-by)
+;;    were checked and are unaffected, so they are not repeated.  The result
+;;    is bound to a name in every case: a temporary dies before the column
+;;    it came from and never sees the dangling pool, which is why an
+;;    inline (print (take …)) passes on the broken build too. ─────────────
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set v (take (at u (quote note)) 2))' '(print v)' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"one\" \"two\"]' rf_strpool_out") -- 0
+
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set v (drop (at u (quote note)) 1))' '(print v)' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"two\" \"three\"]' rf_strpool_out") -- 0
+
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set v (select {note: note from: u take: 2}))' '(print (at v (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"one\" \"two\"]' rf_strpool_out") -- 0
+
+;; All four join flavours share the pool through the same helper.
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set r (table [id tag] (list [1 2] (list \"x\" \"y\"))))' '(set j (inner-join [id] r u))' '(print (at j (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"one\" \"two\"]' rf_strpool_out") -- 0
+
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set r (table [id tag] (list [1 2] (list \"x\" \"y\"))))' '(set j (left-join [id] r u))' '(print (at j (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"one\" \"two\"]' rf_strpool_out") -- 0
+
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set r (table [id tag] (list [1 2] (list \"x\" \"y\"))))' '(set j (full-join [id] r u))' '(print (at j (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"one\" \"two\" \"three\"]' rf_strpool_out") -- 0
+
+(.sys.exec "printf '%s\n' '(set u (.db.splayed.get \"rf_strpool/\"))' '(set r (table [id tag] (list [1 2] (list \"x\" \"y\"))))' '(set j (asof-join [id] r u))' '(print (at j (quote note)))' > rf_strpool_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_strpool_child.rfl > rf_strpool_out 2>&1") -- 0
+(.sys.exec "grep -qxF '[\"one\" \"two\"]' rf_strpool_out") -- 0
+
+(.sys.exec "rm -rf rf_strpool rf_strpool_child.rfl rf_strpool_out") -- 0
