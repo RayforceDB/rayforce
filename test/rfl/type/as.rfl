@@ -517,15 +517,27 @@
 (as 'f64 "0.0") -- 0.0
 (as 'f64 "100") -- 100.0
 
-;; INT16/INT32 boundary parses — negative-extreme literals can't be written
-;; (parser tokenises positive then negates), so verify via i64 round-trip.
-;; INT16_MIN / INT32_MIN / INT64_MIN are the respective NULL_*
-;; sentinels.  Casting these boundary literals round-trips as the
-;; typed null of the wider type.
-(as 'i64 (as 'i16 "-32768")) -- 0Nl
-(as 'i64 (as 'i16 "32767")) -- 32767
-(as 'i64 (as 'i32 "-2147483648")) -- 0Nl
-(as 'i64 (as 'i32 "2147483647")) -- 2147483647
+;; INT16/INT32/INT64 boundary string casts.  INT16_MIN / INT32_MIN / INT64_MIN
+;; are the respective NULL_* sentinels, so a non-null ATOM cannot represent the
+;; exact minimum: the scalar string cast rejects it with a domain error rather
+;; than silently yielding the typed null (0Nh / 0Ni / 0Nl).  MIN+1 and MAX parse.
+(as 'i16 "-32768") !- domain
+(as 'i16 "-32767") -- -32767h
+(as 'i16 "32767") -- 32767h
+(as 'i32 "-2147483648") !- domain
+(as 'i32 "-2147483647") -- -2147483647i
+(as 'i32 "2147483647") -- 2147483647i
+(as 'i64 "-9223372036854775808") !- domain
+(as 'i64 "-9223372036854775807") -- -9223372036854775807
+(as 'i64 "9223372036854775807") -- 9223372036854775807
+;; The string->vector cast routes each element through the same scalar cast,
+;; so it rejects the sentinel consistently — no atom/vector divergence.  (A
+;; numeric-narrowing cast still nulls a produced sentinel; that's the
+;; documented narrow-int rule.  String ingest is loud.)
+(as 'I16 (list "-32768" "1")) !- domain
+(as 'I16 (list "-32767" "1")) -- [-32767h 1h]
+(as 'I32 (list "-2147483648" "1")) !- domain
+(as 'I32 (list "-2147483647" "1")) -- [-2147483647i 1i]
 
 ;; ========== STRING → NUMERIC: FULL CONSUMPTION + OVERFLOW ==========
 ;; The old strtoll/strtol/strtod path stopped at the first non-digit and

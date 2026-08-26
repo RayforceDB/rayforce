@@ -1361,6 +1361,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 return ray_error("domain", "as: cannot parse str as i64, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as i64, value out of int64 range");
+            /* INT64_MIN is NULL_I64: a non-null i64 cannot hold it, so reject
+             * rather than silently returning 0Nl.  The string->vector cast
+             * (cast_vec_numeric) routes each element through here too, so
+             * vectors reject it consistently — string ingest is loud, unlike
+             * numeric narrowing which nulls the sentinel (see as.rfl). */
+            if (v == NULL_I64)
+                return ray_error("domain", "as: cannot parse str as i64, value is the i64 null sentinel");
             return make_i64(v);
         }
         /* Vector/list cast */
@@ -1390,6 +1397,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 return ray_error("domain", "as: cannot parse str as i32, value out of int64 range");
             if (v < INT32_MIN || v > INT32_MAX)
                 return ray_error("domain", "as: cannot parse str as i32, value out of i32 range");
+            /* INT32_MIN is NULL_I32: a non-null i32 cannot hold it, so reject
+             * rather than silently returning 0Ni.  The string->vector cast
+             * (cast_vec_numeric) routes each element through here too, so
+             * vectors reject it consistently — string ingest is loud, unlike
+             * numeric narrowing which nulls the sentinel (see as.rfl). */
+            if ((int32_t)v == NULL_I32)
+                return ray_error("domain", "as: cannot parse str as i32, value is the i32 null sentinel");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
@@ -1419,6 +1433,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 return ray_error("domain", "as: cannot parse str as i16, value out of int64 range");
             if (v < INT16_MIN || v > INT16_MAX)
                 return ray_error("domain", "as: cannot parse str as i16, value out of i16 range");
+            /* INT16_MIN is NULL_I16: a non-null i16 cannot hold it, so reject
+             * rather than silently returning 0Nh.  The string->vector cast
+             * (cast_vec_numeric) routes each element through here too, so
+             * vectors reject it consistently — string ingest is loud, unlike
+             * numeric narrowing which nulls the sentinel (see as.rfl). */
+            if ((int16_t)v == NULL_I16)
+                return ray_error("domain", "as: cannot parse str as i16, value is the i16 null sentinel");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
