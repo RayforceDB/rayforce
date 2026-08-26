@@ -97,6 +97,64 @@
 ;; and the non-null groups are unaffected: k=1 rows are 1,4,6,9,11 → min 1
 (at (at (window {from: _Wl part: [k] funcs: {mn: (min v)}}) 'mn) 1) -- 1
 
+;; ── A MULTI-KEY sort packs its keys into one 64-bit word when they fit,
+;;    and that packing has no null leg: a float null is NaN, whose bits
+;;    encode above every real number, so it would land last on ascending
+;;    whatever the rule says.  Integer keys hide this — their null is
+;;    INT64_MIN, already the smallest — so only a float key shows it, and
+;;    only at the sizes where the packing runs.  Below 64 rows the
+;;    comparator answers; above it the packed encode does, first through
+;;    introsort and then through the radix pass.  All three must agree.
+;;    (#430 review: the packed path used to disagree above 64 rows.)
+;; First the plain vector, small enough to read at a glance.  Both signs
+;; and a value on each side of zero: the encode flips a float's bits to
+;; make them sort as integers, and that flip is sign-dependent, so an
+;; all-positive vector would exercise half of it.
+;; Zero is in there because it is where the flip changes hands: every
+;; negative maps below it and every positive above, so a mistake in the
+;; sign half of the encode shows up as zero landing on the wrong side.
+(asc  [3.5 0Nf 1.5 2.5 -1.2 -2.5 -12.3 -0.8 0.3 0.0]) -- [0Nf -12.3 -2.5 -1.2 -0.8 0.0 0.3 1.5 2.5 3.5]
+(desc [3.5 0Nf 1.5 2.5 -1.2 -2.5 -12.3 -0.8 0.3 0.0]) -- [3.5 2.5 1.5 0.3 0.0 -0.8 -1.2 -2.5 -12.3 0Nf]
+
+;; Then the multi-key query on six rows — still the comparator, still
+;; readable in full.  g breaks the tie between the two -1.2s.
+(set _Ft (table [f g] (list [2.5 0Nf -1.2 0Nf -1.2 -12.3] [0 1 1 0 0 0])))
+(at (select {from: _Ft asc:  [f g]}) 'f) -- [0Nf 0Nf -12.3 -1.2 -1.2 2.5]
+(at (select {from: _Ft asc:  [f g]}) 'g) -- [0 1 0 0 1 0]
+(at (select {from: _Ft desc: [f g]}) 'f) -- [2.5 -1.2 -1.2 -12.3 0Nf 0Nf]
+
+;; Above 64 rows the packed encode takes over, and above the radix
+;; threshold a third path does.  Same question, same answer, read off the
+;; two ends.
+;; These use NON-NEGATIVE reals on purpose.  A negative value encodes far
+;; below zero, so min..max spans nearly the whole 64-bit range and the
+;; packing declines the key for not fitting — which would make the check
+;; pass for the wrong reason.  With only non-negative reals the span is
+;; small enough that the packing genuinely runs, which is the path under
+;; test: with the key ungated it answered [1.5 1.5 1.5] here, and the
+;; overflowing negative variant answered correctly while UBSan reported
+;; a signed overflow and a 64-bit shift underneath it.
+(set _Gt (table [f g] (list (at [1.5 0Nf 2.5] (% (til 100) 3)) (% (til 100) 2))))
+(take (at (select {from: _Gt asc:  [f g]}) 'f) 3) -- [0Nf 0Nf 0Nf]
+(take (at (select {from: _Gt desc: [f g]}) 'f) 3) -- [2.5 2.5 2.5]
+
+(set _Ht (table [f g] (list (at [1.5 0Nf 2.5] (% (til 5000) 3)) (% (til 5000) 2))))
+(take (at (select {from: _Ht asc:  [f g]}) 'f) 3) -- [0Nf 0Nf 0Nf]
+(take (at (select {from: _Ht desc: [f g]}) 'f) 3) -- [2.5 2.5 2.5]
+
+;; And the negative/zero span too, since it takes the other branch: the
+;; answer must be the same whichever way the packing decides.
+(set _Nt (table [f g] (list (at [1.5 0Nf -2.5 0.0] (% (til 5000) 4)) (% (til 5000) 2))))
+(take (at (select {from: _Nt asc:  [f g]}) 'f) 3) -- [0Nf 0Nf 0Nf]
+(take (at (select {from: _Nt desc: [f g]}) 'f) 3) -- [1.5 1.5 1.5]
+
+;; The integer twin, which agreed all along and must keep agreeing — its
+;; null is INT64_MIN, already the smallest, so the packing never had to
+;; place it deliberately.
+(set _It (table [f g] (list (at [1 0N 2] (% (til 5000) 3)) (% (til 5000) 2))))
+(take (at (select {from: _It asc:  [f g]}) 'f) 3) -- [0Nl 0Nl 0Nl]
+(take (at (select {from: _It desc: [f g]}) 'f) 3) -- [2 2 2]
+
 ;; ── take must be a PREFIX of the sorted order.  This is the contract, not
 ;;    just a matter of taste: the same data placed SYM nulls at opposite ends
 ;;    depending on whether take: was present, because the take path consulted

@@ -902,7 +902,10 @@ typedef struct {
     int8_t          type;      /* column type */
     uint8_t         col_attrs; /* RAY_SYM width attrs */
     bool            desc;
-    bool            nulls_first; /* for single-key F64: 1=nulls first */
+    /* Where this key's nulls go: 1=first, 0=last.  Read by every typed
+     * single-key arm, not just the float one; the composite encode does
+     * not consult it and declines a nullable F64 key instead. */
+    bool            nulls_first;
     /* SYM rank mapping (NULL if not sym): */
     const uint32_t* enum_rank; /* intern_id → sort rank */
     /* Composite-key fields (n_keys > 1): */

@@ -2279,7 +2279,8 @@ static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_key
  * cols:        array of n_cols vectors (sort keys, most significant first)
  * descs:       array of n_cols flags (0=asc, 1=desc), or NULL for all-asc
  * nulls_first: array of n_cols flags (0=nulls last, 1=nulls first), or NULL
- *              for default convention (nulls last for asc, nulls first for desc)
+ *              to take the default from sort_nulls_first — a null is the
+ *              smallest value, so nulls first for asc, last for desc
  * n_cols:      number of sort key columns (composite radix encode is used
  *              up to 16 keys; wider sorts take the merge-sort fallback)
  * nrows:       number of rows in each column
@@ -2577,10 +2578,30 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 uint16_t total_bits = 0;
                 bool fits = true;
 
+                /* A float null is NaN, and the composite encode packs a
+                 * double by flipping its bits — which puts NaN above every
+                 * real number, i.e. last on ascending, whatever
+                 * sort_nulls_first says.  The other types carry a sentinel
+                 * that already lands where the rule wants it (INT64_MIN is
+                 * the smallest), so only F64 disagrees.  Rather than teach
+                 * the packing a second placement, hand a null-bearing float
+                 * key to the rank-then-compose fallback, which ranks
+                 * through sort_indices_ex and is null-aware.  Leaving it in
+                 * the direct encode is what made a multi-key sort place
+                 * floats one way below 64 rows and the other way above. */
+                bool nullable_f64_key = false;
+                for (uint32_t k = 0; k < n_cols; k++)
+                    if (cols[k]->type == RAY_F64 &&
+                        (cols[k]->attrs & RAY_ATTR_HAS_NULLS)) {
+                        nullable_f64_key = true;
+                        break;
+                    }
+
                 ray_pool_t* mk_prescan_pool = (nrows >= SMALL_POOL_THRESHOLD) ? pool : NULL;
-                if (has_wide_key) {
+                if (has_wide_key || nullable_f64_key) {
                     /* RAY_STR / RAY_GUID can't be packed into a composite
-                     * uint64 key. Force the rank-then-compose fallback. */
+                     * uint64 key, and a nullable float must not be.  Force
+                     * the rank-then-compose fallback. */
                     total_bits = UINT16_MAX;
                     fits = false;
                 } else if (n_cols <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool) {

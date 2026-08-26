@@ -352,6 +352,57 @@ static test_result_t test_topk_null_sort_key_desc(void) {
     PASS();
 }
 
+/* DESC top-k that has to reach past the non-nulls.  With nulls last, a
+ * null enters the result only when there are fewer than k non-null rows —
+ * the back-fill leg of the bounded heap, which no other test exercises:
+ * every DESC case above has more non-nulls than k, so the null branch is
+ * only ever taken to REJECT. */
+static test_result_t test_topk_null_desc_backfill(void) {
+    int64_t N = 20;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    int64_t* kd = (int64_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) kd[i] = i;
+    /* Only rows 3, 11 and 17 are non-null: 3 values for a k of 5. */
+    for (int64_t i = 0; i < N; i++)
+        if (i != 3 && i != 11 && i != 17) ray_vec_set_null(kc, i, true);
+
+    ray_t* selc = ray_vec_new(RAY_I64, N); selc->len = N;
+    int64_t* sd = (int64_t*)ray_data(selc);
+    for (int64_t i = 0; i < N; i++) sd[i] = i;
+
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, selc); ray_release(selc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 1 };  /* DESC, so NULLS LAST */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 5;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+
+    /* 17, 11, 3, then two nulls in source order. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    TEST_ASSERT_NOT_NULL(k_col);
+    int64_t expect[3] = {17, 11, 3};
+    for (int64_t i = 0; i < 3; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, i));
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[i], expect[i]);
+    }
+    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 3));
+    TEST_ASSERT_TRUE(ray_vec_is_null(k_col, 4));
+
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
 /* Chunk 11: gate rejections.  Each call below must return NULL because
  * the inputs fail one of the runtime gates in ray_fused_topk_select.
  * The C-API shape lets us hit gates the planner already filters out
@@ -1545,6 +1596,7 @@ const test_entry_t fused_topk_entries[] = {
     { "fused_topk/sym_key_w32",               test_topk_sym_key,                   topk_setup, topk_teardown },
     { "fused_topk/null_sort_key_asc",         test_topk_null_sort_key_asc,         topk_setup, topk_teardown },
     { "fused_topk/null_sort_key_desc",        test_topk_null_sort_key_desc,        topk_setup, topk_teardown },
+    { "fused_topk/null_desc_backfill",        test_topk_null_desc_backfill,        topk_setup, topk_teardown },
     /* Chunk 11 — gate rejections */
     { "fused_topk/gate_null_tbl",             test_topk_gate_null_tbl,             topk_setup, topk_teardown },
     { "fused_topk/gate_k_too_large",          test_topk_gate_k_too_large,          topk_setup, topk_teardown },
