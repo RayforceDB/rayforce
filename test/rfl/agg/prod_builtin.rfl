@@ -8,5 +8,10 @@
 (prod []) -- 1
 (prod ['a 'b]) !- type
 
+;; i64 list product reads i64 atoms directly (not via f64), so it stays exact
+;; above 2^53 and wraps via unsigned math on overflow instead of hitting UB.
+(prod (list 9007199254740993 1)) -- 9007199254740993
+(prod (list 9223372036854775807 4)) -- -4
+
 (set Tp (table [g x] (list ['a 'a 'b] [2 3 4])))
 (at (select {from: Tp p: (prod x) by: g}) 'p) -- [6 4]

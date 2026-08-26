@@ -1092,6 +1092,31 @@ ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
         return result;
     }
 
+    /* List of string/symbol atoms — the shape splayed string columns
+     * load as (col_load_str_list).  Mirrors str-find's list branch. */
+    if (x->type == RAY_LIST) {
+        int64_t n = x->len;
+        ray_t* result = ray_vec_new(RAY_BOOL, n);
+        if (RAY_IS_ERR(result)) return result;
+        result->len = n;
+        uint8_t* out = (uint8_t*)ray_data(result);
+        ray_t** items = (ray_t**)ray_data(x);
+        for (int64_t i = 0; i < n; i++) {
+            if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) {
+                ray_release(result);
+                return ray_error("cancel", NULL);
+            }
+            const char* s; size_t sl;
+            if (!str_atom_bytes(items[i], &s, &sl, NULL)) {
+                ray_release(result);
+                return ray_error("type", "like: list items must be string or symbol atoms");
+            }
+            out[i] = (use_simple ? ray_glob_match_compiled(&pc, s, sl)
+                                 : ray_glob_match(s, sl, pat, pat_len)) ? 1 : 0;
+        }
+        return result;
+    }
+
     return ray_error("type", "like: expects string or symbol");
 }
 
