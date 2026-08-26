@@ -25,6 +25,13 @@
 (sum (list 0Ni 0Ni 0Ni))   -- 0
 (sum (list))               -- 0
 
+;; ────────────── i64 overflow wraps (no signed-overflow UB) ──────────────
+;; A boxed (list ...) reduces through the scalar path.  Integer accumulation
+;; must wrap via unsigned math rather than trigger UB; 2*(2^63-1) wraps to -2.
+;; i64 atoms are read directly, so magnitudes above 2^53 stay exact.
+(sum (list 9223372036854775807 9223372036854775807)) -- -2
+(sum (list 9007199254740992 1))                       -- 9007199254740993
+
 ;; ---- RAY_IS_ERR propagation: sum(erroring arg) ----
 (sum (* 'bad 1))    !- type
 (sum (+ "a" 1))     !- type
@@ -96,3 +103,23 @@
 (at (select {r: (sum t) by: k from: Mtm}) 'r)                  -- [18:00:00.000 01:00:00.000]
 ;; integer families still widen to I64 (no spurious type preservation)
 (type (at (select {r: (sum k) from: Mtm}) 'r))                 -- 'I64
+
+;; ---- table-scan sum kernels wrap on i64 overflow (no signed-overflow UB) ----
+;; The select scalar-sum path (group.c scalar_sum_i64_fn / _linear_i64_fn) must
+;; wrap like the flat and boxed-list reductions.  2*(2^63-1) wraps to -2.
+(set Movf (table [g v] (list (as 'I64 [1 1]) [9223372036854775807 9223372036854775807])))
+(at (select {r: (sum v) from: Movf}) 'r)          -- [-2]
+(at (select {r: (sum v) by: g from: Movf}) 'r)    -- [-2]
+;; linear affine column expr in select (scalar_sum_linear_i64_fn): 2^62+2^62 per
+;; row = 2^63 (wraps to MIN); two rows sum to 0.
+(set Mlin (table [v] (list [4611686018427387904 4611686018427387904])))
+(at (select {r: (sum (+ v v)) from: Mlin}) 'r)    -- [0]
+;; Above the parallel threshold, worker-local partial sums and the final
+;; cross-worker merge must use the same wrap semantics.  131072*(2^46+1)
+;; wraps to INT64_MIN+131072, avoiding the NULL_I64 sentinel exactly.
+(set Mpar (table [g v] (list (take [1] 131072) (take [70368744177665] 131072))))
+(at (select {r: (sum v) from: Mpar}) 'r)          -- [-9223372036854644736]
+(at (select {r: (sum v) by: g from: Mpar}) 'r)    -- [-9223372036854644736]
+;; Linear expression path: 131072*(2*(2^45+1)) wraps to INT64_MIN+262144.
+(set Mparlin (table [v] (list (take [35184372088833] 131072))))
+(at (select {r: (sum (+ v v)) from: Mparlin}) 'r) -- [-9223372036854513664]

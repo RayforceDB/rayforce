@@ -73,4 +73,17 @@ static inline uint8_t ray_cast_f64_to_bool_null(double v) {
     return (v == v && v != 0.0) ? 1 : 0;
 }
 
+/* Two's-complement wraparound integer add/mul.  Signed overflow is UB in C;
+ * aggregate reductions (sum / prod, and their parted / table-scan / affine
+ * kernels) use these so an overflowing accumulator wraps deterministically
+ * rather than trapping.  At -O2/-O3 they inline to a bare add/mul and do not
+ * inhibit autovectorization (signed and unsigned 64-bit add are the same ISA
+ * instruction). */
+static inline int64_t wrap_add_i64(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a + (uint64_t)b);
+}
+static inline int64_t wrap_mul_i64(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a * (uint64_t)b);
+}
+
 #endif /* RAY_TYPES_H */
