@@ -180,3 +180,11 @@
 
 ;; SHAPE_PREFIX with empty lit ("`*`" alone is SHAPE_ANY, not PREFIX, so use trailing only)
 ;; — covered by `(like "" "*")` above (SHAPE_ANY).
+
+;; ────────────── list of string/symbol atoms ──────────────
+;; The shape splayed string columns load as (col_load_str_list) — like
+;; used to reject it with a type error while str-find accepted it.
+(like (list "abc" "has Pending mark" "xyz") "*Pending*") -- [false true false]
+(like (list "alpha" "beta") "a*") -- [true false]
+(like (list 'alpha 'beta) "a*") -- [true false]
+(like (list "a" 1 "b") "a*") !- type

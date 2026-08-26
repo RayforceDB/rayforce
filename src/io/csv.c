@@ -522,7 +522,17 @@ RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
     int y = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
     int m = (p[5]-'0')*10 + (p[6]-'0');
     int d = (p[8]-'0')*10 + (p[9]-'0');
-    if (RAY_UNLIKELY(m < 1 || m > 12 || d < 1 || d > 31)) { *is_null = true; return 0; }
+    /* Reject impossible months (this also guards the md[] index below) and
+     * days.  A blanket d<=31 check let calendar-impossible dates like
+     * "2024-02-31" or "2024-04-31" through; civil_to_days() then normalized
+     * them into a *different* real day (2024-02-31 -> 2024.03.02), silently
+     * corrupting the value instead of nulling it.  Validate the day against
+     * the actual length of that (leap-aware) month, mirroring the strict DATE
+     * string cast in ray_cast_fn() (src/ops/builtins.c). */
+    if (RAY_UNLIKELY(m < 1 || m > 12 || d < 1)) { *is_null = true; return 0; }
+    static const int md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+    if (RAY_UNLIKELY(d > md[m] + (m == 2 && leap ? 1 : 0))) { *is_null = true; return 0; }
     return civil_to_days(y, m, d);
 }
 

@@ -4433,7 +4433,7 @@ static inline void accum_from_entry(char* row, const char* entry,
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
-                else { ROW_WR_I64(row, ly->off_sum, s) += v; }
+                else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
             }
             if (nf & GHT_NEED_MIN) {
                 int64_t* p = &ROW_WR_I64(row, ly->off_min, s);
@@ -4561,7 +4561,7 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                     }
                 } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
-                else { ROW_WR_I64(row, ly->off_sum, s) += v; }
+                else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
             }
             if (nf & GHT_NEED_MIN) {
                 int64_t* p = &ROW_WR_I64(row, ly->off_min, s);
@@ -5797,7 +5797,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                     switch (op) {
                         case OP_SUM:
                             v = ROW_RD_I64(row, ly->off_sum, s);
-                            if (ao->affine) v += ao->bias_i64 * cnt;
+                            if (ao->affine) v = wrap_add_i64(v, wrap_mul_i64(ao->bias_i64, cnt));
                             break;
                         case OP_PROD:
                             if (nn == 0) { v = int_null; grp_set_null(ao->vec, di); break; }
@@ -6738,7 +6738,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                     case OP_SUM:
                         v = sum_i64[idx];
                         if (affine && affine[a].enabled)
-                            v += affine[a].bias_i64 * counts[gi];
+                            v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, counts[gi]));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
@@ -7373,8 +7373,8 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     const int64_t* restrict data = (const int64_t*)c->agg_ptrs[0];
     int64_t sum = 0;
     for (int64_t r = start; r < end; r++)
-        sum += data[r];
-    acc->sum[0].i += sum;
+        sum = wrap_add_i64(sum, data[r]);
+    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
     acc->count[0] += end - start;
 }
 
@@ -7397,7 +7397,7 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
     const agg_linear_t* lin = &c->agg_linear[0];
     int64_t n = end - start;
 
-    int64_t sum = lin->bias_i64 * n;
+    int64_t sum = wrap_mul_i64(lin->bias_i64, n);
     /* n_terms is bounded by AGG_LINEAR_MAX_TERMS (8, internal.h) — an
      * unrelated fixed cap on linear-expression arity, not a GROUP n_keys/
      * n_aggs count, so it stays uint8_t. */
@@ -7408,11 +7408,11 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
         int8_t type = lin->term_types[t];
         int64_t term_sum = 0;
         for (int64_t r = start; r < end; r++)
-            term_sum += scalar_i64_at(ptr, type, r);
-        sum += coeff * term_sum;
+            term_sum = wrap_add_i64(term_sum, scalar_i64_at(ptr, type, r));
+        sum = wrap_add_i64(sum, wrap_mul_i64(coeff, term_sum));
     }
 
-    acc->sum[0].i += sum;
+    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
     acc->count[0] += n;
 }
 
@@ -7437,8 +7437,10 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             /* n_terms bounded by AGG_LINEAR_MAX_TERMS (8) — see the note in
              * scalar_sum_linear_i64_fn above; unrelated to n_keys/n_aggs. */
             for (uint8_t t = 0; t < lin->n_terms; t++) {
-                iv += lin->coeff_i64[t] *
-                      scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r);
+                iv = wrap_add_i64(
+                    iv,
+                    wrap_mul_i64(lin->coeff_i64[t],
+                                 scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r)));
             }
             fv = (double)iv;
         } else {
@@ -7471,7 +7473,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
                     if (nn) nn[a]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
-                acc->sum[a].i += iv;
+                acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
                 if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
                 if (nn) nn[a]++;
             }
@@ -7569,8 +7571,9 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i += group_strlen_at_cached(
-                    c->agg_cols[a], r, c->sym_strings, c->sym_count);
+                acc->sum[idx].i = wrap_add_i64(
+                    acc->sum[idx].i,
+                    group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count));
                 if (nn) nn[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
@@ -7585,7 +7588,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                 uint8_t v_attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
                 int64_t v = read_col_i64(c->agg_ptrs[a], r, c->agg_types[a], v_attrs);
                 if (RAY_LIKELY(!((inm >> a) & 1) || v != c->agg_int_null_sentinel[a])) {
-                    acc->sum[idx].i += v;
+                    acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, v);
                     if (nn) nn[idx]++;
                 }
             }
@@ -7936,7 +7939,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                     } else if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop))
                         merged->sum[idx].f += wa->sum[idx].f;
                     else
-                        merged->sum[idx].i += wa->sum[idx].i;
+                        merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                 }
             }
             if (c->need_flags & DA_NEED_MIN) {
@@ -10128,12 +10131,16 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
             for (uint32_t a = 0; a < n_aggs; a++) {                               \
                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
                 if (agg_strlen[a])                                               \
-                    sums[a].i += group_strlen_at_cached(                         \
-                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+                    sums[a].i = wrap_add_i64(                                    \
+                        sums[a].i,                                               \
+                        group_strlen_at_cached(                                  \
+                            agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
                 else if (agg_f64_mask & ((uint64_t)1 << a))                      \
                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row); \
                 else                                                             \
-                    sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0); \
+                    sums[a].i = wrap_add_i64(                                    \
+                        sums[a].i,                                               \
+                        read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0));     \
             }                                                                    \
         }                                                                        \
     } while (0)
@@ -10263,12 +10270,16 @@ dyn_dense_done:
         for (uint32_t a = 0; a < n_aggs; a++) {                                   \
             if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
             if (agg_strlen[a])                                                   \
-                sums[a].i += group_strlen_at_cached(                             \
-                    agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+                sums[a].i = wrap_add_i64(                                        \
+                    sums[a].i,                                                   \
+                    group_strlen_at_cached(                                      \
+                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
             else if (agg_f64_mask & ((uint64_t)1 << a))                          \
                 sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row);    \
             else                                                                 \
-                sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0);\
+                sums[a].i = wrap_add_i64(                                        \
+                    sums[a].i,                                                   \
+                    read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0));        \
         }                                                                        \
     } while (0)
                         if (match_idx) {
@@ -11239,7 +11250,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         if (group_fp_type(agg_types[a]))
                             m->sum[a].f += wa->sum[a].f;
                         else
-                            m->sum[a].i += wa->sum[a].i;
+                            m->sum[a].i = wrap_add_i64(m->sum[a].i, wa->sum[a].i);
                     }
                 }
             }
@@ -11908,7 +11919,7 @@ da_path:;
                                 uint16_t aop = ext->agg_ops[a];
                                 if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP || agg_is_binary_agg(aop)) {
                                     if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop)) merged->sum[idx].f += wa->sum[idx].f;
-                                    else merged->sum[idx].i += wa->sum[idx].i;
+                                    else merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                                 } else if (aop == OP_PROD) {
                                     /* Use per-(group, agg) non-null counts when
                                      * available so an all-null worker doesn't
@@ -12035,7 +12046,7 @@ da_path:;
                                      * for integer x-columns — merge as float. */
                                     merged->sum[idx].f += wa->sum[idx].f;
                                 else
-                                    merged->sum[idx].i += wa->sum[idx].i;
+                                    merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                             }
                         }
                     }
@@ -12391,14 +12402,17 @@ da_path:;
                                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                                     continue;
                                 if (agg_strlen[a])
-                                    sums[a].i += group_strlen_at_cached(
-                                        agg_vecs[a], r, strlen_sym_strings,
-                                        strlen_sym_count);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        group_strlen_at_cached(agg_vecs[a], r,
+                                                               strlen_sym_strings,
+                                                               strlen_sym_count));
                                 else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                                 else
-                                    sums[a].i += read_col_i64(agg_ptrs[a], r,
-                                                              agg_types[a], 0);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                             }
                         }
                     }
@@ -12499,14 +12513,17 @@ da_path:;
                                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                                     continue;
                                 if (agg_strlen[a])
-                                    sums[a].i += group_strlen_at_cached(
-                                        agg_vecs[a], r, strlen_sym_strings,
-                                        strlen_sym_count);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        group_strlen_at_cached(agg_vecs[a], r,
+                                                               strlen_sym_strings,
+                                                               strlen_sym_count));
                                 else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                                 else
-                                    sums[a].i += read_col_i64(agg_ptrs[a], r,
-                                                              agg_types[a], 0);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                             }
                         }
                     }
@@ -12588,13 +12605,17 @@ da_path:;
                         if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                             continue;
                         if (agg_strlen[a])
-                            sums[a].i += group_strlen_at_cached(
-                                agg_vecs[a], r, strlen_sym_strings,
-                                strlen_sym_count);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                group_strlen_at_cached(agg_vecs[a], r,
+                                                       strlen_sym_strings,
+                                                       strlen_sym_count));
                         else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                         else
-                            sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                     }
                 }
             }
@@ -12729,13 +12750,17 @@ da_path:;
                         if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                             continue;
                         if (agg_strlen[a])
-                            sums[a].i += group_strlen_at_cached(
-                                agg_vecs[a], r, strlen_sym_strings,
-                                strlen_sym_count);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                group_strlen_at_cached(agg_vecs[a], r,
+                                                       strlen_sym_strings,
+                                                       strlen_sym_count));
                         else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                         else
-                            sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                     }
                 }
             }
@@ -14525,7 +14550,8 @@ sequential_fallback:;
                 switch (agg_op) {
                     case OP_SUM:
                         v = ROW_RD_I64(row, ly->off_sum, s);
-                        if (agg_affine[a].enabled) v += agg_affine[a].bias_i64 * cnt;
+                        if (agg_affine[a].enabled)
+                            v = wrap_add_i64(v, wrap_mul_i64(agg_affine[a].bias_i64, cnt));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }

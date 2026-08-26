@@ -266,7 +266,7 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         double out = base + as_f64(c_expr) * (double)n;
         return make_f64(out);
     }
-    int64_t out = ce.sum_i + numeric_atom_i64(c_expr) * n;
+    int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(numeric_atom_i64(c_expr), n));
     return make_i64(out);
 }
 

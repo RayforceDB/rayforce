@@ -1,0 +1,25 @@
+;; guid_key.rfl -- equi-join keys must compare full 16-byte GUID cells.
+;;
+;; Regression: join hashing used read_col_i64 on GUID columns, effectively
+;; reading bytes at row offsets instead of row*16 cells. A right key vector
+;; derived through `at` has a distinct buffer, so the old path silently
+;; produced no matches.
+
+(set gs (guid 5))
+(set L (table [k x] (list gs [1 2 3 4 5])))
+(set R (table [k y] (list (at gs [1 3]) [222 444])))
+(set LJ (left-join [k] L R))
+(set IJ (inner-join [k] L R))
+(set FJ (full-join [k] L R))
+(set AJ (anti-join [k] L R))
+
+(at LJ 'y) -- [0Nl 222 0Nl 444 0Nl]
+(count IJ) -- 2
+(at IJ 'x) -- [2 4]
+(at IJ 'y) -- [222 444]
+
+;; Full join keeps the matched rows instead of treating every right row as
+;; unmatched, and anti-join excludes the two matching GUID keys.
+(count FJ) -- 5
+(sum (at FJ 'y)) -- 666
+(at AJ 'x) -- [1 3 5]
