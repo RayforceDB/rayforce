@@ -2699,17 +2699,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             out_off += n;
         }
     } else if (in_type == RAY_I64 && out_type == RAY_BOOL) {
-        if (opc == OP_ISNULL) {
-            /* ISNULL over a non-null vec: always false here; the
-             * null-propagation pass at the end of the function sets
-             * dst[i]=1 for null rows of the input. */
-            while (ray_morsel_next(&m)) {
-                int64_t n = m.morsel_len;
-                uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
-                for (int64_t i = 0; i < n; i++) dst[i] = 0;
-                out_off += n;
-            }
-        } else if (opc == OP_CAST) {
+        if (opc == OP_CAST) {
             /* (as 'BOOL i64_col) — truthy semantics; NULL_I64 = INT64_MIN
              * sentinel is non-zero but logically missing, so skip it. */
             while (ray_morsel_next(&m)) {
@@ -2854,18 +2844,10 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         }
     }
 
-    /* Propagate null bitmap from input to result.
-     * ISNULL is special: set output to 1 for null elements. */
-    if (vec_may_have_nulls(input)) {
-        if (op->opcode == OP_ISNULL) {
-            for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i))
-                    ((uint8_t*)ray_data(result))[i] = 1;
-            }
-        } else {
-            propagate_nulls(input, result, len);
-        }
-    }
+    /* Propagate null bitmap from input to result.  OP_ISNULL never reaches
+     * here — it is handled and returned before the typed dispatch above. */
+    if (vec_may_have_nulls(input))
+        propagate_nulls(input, result, len);
 
     /* OP_NEG/OP_ABS over i64: |INT64_MIN| and -INT64_MIN don't fit — surface
      * as typed null (by convention).  Loop above used unsigned wrap, so
