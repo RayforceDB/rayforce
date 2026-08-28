@@ -1128,8 +1128,22 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
          * shortcuts may make the scan dead (count/max/projection paths), but
          * execution must still reject the original column reference. */
         ray_op_t* missing = ray_scan(g, ray_str_ptr(s));
+        /* `_dist` is exempt, but only where it can legitimately appear: a
+         * rerank produces it during execution, so it is absent from the
+         * operand table at compile time.  Exempting it unconditionally let
+         * every symptom of an unknown column back in for that one name —
+         * a projection under `_dist` shifted the labels left, and an
+         * aggregate over it answered its neutral element — in queries with
+         * no nearest: clause at all. */
         int64_t dist_sym = ray_sym_find("_dist", 5);
-        if (missing && expr->i64 != dist_sym) {
+        bool exempt = false;
+        if (missing && expr->i64 == dist_sym) {
+            for (uint32_t i = 0; i < g->node_count && !exempt; i++)
+                if (g->nodes[i].opcode == OP_ANN_RERANK ||
+                    g->nodes[i].opcode == OP_KNN_RERANK)
+                    exempt = true;
+        }
+        if (missing && !exempt) {
             missing->flags |= OP_FLAG_INVALID_SCAN;
             ray_op_ext_t* ext = find_ext(g, missing->id);
             if (ext) ext->base.flags |= OP_FLAG_INVALID_SCAN;
@@ -10154,8 +10168,16 @@ by_dict_done:
                 int j = 0;
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
+                    /* Every clause keyword has to be skipped here, not just
+                     * most of them: this walk is positional, so a keyword it
+                     * fails to skip consumes an output slot and every name
+                     * after it lands on the wrong column.  nearest: was
+                     * missing, and it is counted out where the outputs are
+                     * counted, so a query naming it before its outputs
+                     * labelled them one position early. */
                     if (kid == from_id || kid == where_id || kid == by_id ||
-                        kid == take_id || kid == asc_id || kid == desc_id) continue;
+                        kid == take_id || kid == asc_id || kid == desc_id ||
+                        kid == nearest_id) continue;
                     if (n_key_cols + j < ncols)
                         ray_table_set_col_name(result, n_key_cols + j, kid);
                     j++;
