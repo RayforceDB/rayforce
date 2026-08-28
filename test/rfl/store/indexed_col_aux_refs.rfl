@@ -1,0 +1,49 @@
+;; An indexed column still owns what sits at aux bytes 8-15.
+;;
+;; A SYM column keeps its resolution domain there, a STR column its pool.
+;; Attaching an index takes bytes 0-7 for the index pointer and LEAVES 8-15
+;; alone (ops/idxop.c attach_finalize, and the layout note in rayforce.h),
+;; and ray_index_release_saved is a no-op — so the reference taken when that
+;; domain or pool was attached is still the column's to hold and to drop.
+;;
+;; Both refcount hooks used to return early for an indexed column, before
+;; reaching that field.  A copy therefore took no reference, and the moment
+;; that copy shed its index — which restores aux and makes it an ordinary
+;; owner again — freeing it released a reference it never held.  The
+;; domain's count reached zero while the store's own column was still using
+;; it, its symbol file was unmapped, and every symbol in that column read
+;; back as nothing.  No crash and no error: just a wrong answer.
+;;
+;; WHY A CHILD PROCESS.  The imbalance is invisible unless the column
+;; resolves through a FILE domain, and retain/release are no-ops on the
+;; immortal runtime one.  A process that has interned these symbols — which
+;; writing the store does — reads its own store back on the runtime domain
+;; and cannot see the bug.  Only a process that has never seen them attaches
+;; the file's domain, so the check runs in a freshly spawned rayforce and
+;; this file asserts the answer it prints.
+
+(.sys.exec "rm -rf rf_idxaux rf_idxaux_child.rfl") -- 0
+
+;; Four distinct symbols and their string twins over many rows, with a hash
+;; index on the SYM column that survives the save.
+(set _K (at ['aa 'bb 'cc 'dd] (% (til 4096) 4)))
+(set _S (at ["aa" "bb" "cc" "dd"] (% (til 4096) 4)))
+(.db.splayed.set "rf_idxaux/" (table [k s v] (list (.idx.hash _K) _S (til 4096))))
+(.idx.has? (at (.db.splayed.get "rf_idxaux/") 'k)) -- true
+
+;; The child: shed the index on a copy of the column, free the copy, then
+;; read the symbols through the column that is still open.  Prints the
+;; number of distinct symbols, which must still be 4.
+(.sys.exec "printf '%s\n' '(set T (.db.splayed.get \"rf_idxaux/\"))' '(set c (at T (quote k)))' '(set d (.idx.drop c))' '(set c 0)' '(set d 0)' '(count (distinct (at T (quote k))))' > rf_idxaux_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_idxaux_child.rfl 2>/dev/null | tail -1 | grep -qx 4") -- 0
+
+;; Twice over: the second shed is what turns an unbalanced pair into a
+;; second release of the same reference.
+(.sys.exec "printf '%s\n' '(set T (.db.splayed.get \"rf_idxaux/\"))' '(set c1 (at T (quote k)))' '(set c2 (at T (quote k)))' '(set d1 (.idx.drop c1))' '(set d2 (.idx.drop c2))' '(set c1 0)' '(set c2 0)' '(set d1 0)' '(set d2 0)' '(count (distinct (at T (quote k))))' > rf_idxaux_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_idxaux_child.rfl 2>/dev/null | tail -1 | grep -qx 4") -- 0
+
+;; And the group-by whose key column adopts that same domain.
+(.sys.exec "printf '%s\n' '(set T (.db.splayed.get \"rf_idxaux/\"))' '(set c (at T (quote k)))' '(set d (.idx.drop c))' '(set c 0)' '(set d 0)' '(count (select {n: (count v) by: {kk: k} from: T}))' > rf_idxaux_child.rfl") -- 0
+(.sys.exec "./rayforce -f rf_idxaux_child.rfl 2>/dev/null | tail -1 | grep -qx 4") -- 0
+
+(.sys.exec "rm -rf rf_idxaux rf_idxaux_child.rfl") -- 0

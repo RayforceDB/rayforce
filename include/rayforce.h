@@ -128,6 +128,11 @@ typedef enum {
  * singleton (global intern table) or a refcounted mmapped symfile. */
 struct ray_sym_domain_s;
 
+/* One file mapping shared by more than one block (src/mem/heap.h): a mapped
+ * string column and its pool live in the same region, so neither can end it
+ * alone.  Held by the pool at aux[8..15] under mmod 3. */
+struct ray_file_map_s;
+
 typedef union ray_t {
     /* Allocated: object header */
     struct {
@@ -173,9 +178,25 @@ typedef union ray_t {
              * 8-15 hold an int64 sym ID naming the target table.
              * link_lo[8] aliases bytes 0-7.  See ops/linkop.h. */
             struct { uint8_t link_lo[8];         int64_t link_target; };
+            /* mmod 3 (string pools only): the shared mapping this block
+             * lives in.  Typed rather than reached by offset, so it moves
+             * with the union if the layout is ever reshuffled. */
+            struct { uint8_t _aux_map_lo[8];     struct ray_file_map_s* file_map; };
         };
         /* Bytes 16-31: metadata + value */
-        uint8_t  mmod;       /* 0=heap, 1=file-mmap */
+        /* Where this block's memory came from, and who ends it:
+         *   0  heap — the buddy allocator owns it
+         *   1  file-mmap — this block's own free munmaps the region, whose
+         *      size it derives from its type and length
+         *   2  borrowed — somebody else owns the memory and ends it on its
+         *      own schedule; free does nothing at all
+         *   3  file-mmap, shared — the region is described by a heap-side
+         *      ray_file_map_t held in aux[8..15] and ends when the last
+         *      block referencing it is freed.  A string column and its pool
+         *      live in one mapping, and a selection may keep the pool after
+         *      the column is gone, so the pool carries this and the column
+         *      merely holds a reference to it. */
+        uint8_t  mmod;
         uint8_t  order;      /* block order (block size = 2^order) */
         int8_t   type;       /* negative=atom, positive=vector, 0=LIST */
         uint8_t  attrs;      /* attribute flags */

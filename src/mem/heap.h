@@ -165,6 +165,41 @@ typedef struct {
     uint64_t peak_live_bytes;
 } ray_mem_trace_t;
 
+/* One file mapping that more than one block lives in.
+ *
+ * A splayed string column and its pool are written contiguously and mapped
+ * together, so the region cannot end when either one of them does: a
+ * selection may hold the pool after the column it was gathered from is
+ * gone.  The descriptor lives on the heap rather than inside the mapping —
+ * it has to outlive it to unmap it — and the pool holds it (mmod 3) while
+ * the column merely references the pool.
+ *
+ * Kept off the buddy heap (ray_sys_alloc) so a block being freed can drop
+ * the last reference without re-entering the allocator it is inside. */
+typedef struct ray_file_map_s {
+    void*    base;   /* what to hand back to ray_vm_unmap_file */
+    size_t   len;
+    /* Blocks still living in the region.  Both of them take one at map
+     * time — the column as well as the pool — so a path that swaps the
+     * column's pool pointer (str_pool_cow deep-copies a mapped pool
+     * before mutating it) drops the pool's reference without pulling the
+     * region out from under the column that is mid-mutation.
+     *
+     * Atomic because a column and a result sharing its pool can be freed
+     * on different threads. */
+    uint32_t rc;
+    struct ray_file_map_s* next;   /* chain within its registry bucket */
+} ray_file_map_t;
+
+/* Make a mapping findable by the address it was mapped at.  Only needed
+ * once a block inside it loses its own route to the descriptor — see
+ * str_pool_cow — so the table holds mutated mapped columns only. */
+void ray_file_map_register(const void* base, ray_file_map_t* m);
+/* The mapping that starts at `base`, or NULL.  A mapped column's header is
+ * the start of its region, so a column passes itself. */
+ray_file_map_t* ray_file_map_lookup(const void* base);
+void ray_file_map_release(ray_file_map_t* m);
+
 /* ===== Forward Declarations (internal types) ===== */
 
 typedef struct ray_heap      ray_heap_t;

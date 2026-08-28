@@ -407,7 +407,10 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     TEST_ASSERT_EQ_U(loaded_names->mmod, 1);
     TEST_ASSERT_EQ_I(loaded_names->type, RAY_STR);
     TEST_ASSERT_NOT_NULL(loaded_names->str_pool);
-    TEST_ASSERT_EQ_U(loaded_names->str_pool->mmod, 2);
+    /* The pool owns the mapping it shares with the column (mmod 3), so a
+     * selection that keeps the pool keeps the region — the column's own
+     * free no longer takes the bytes with it. */
+    TEST_ASSERT_EQ_U(loaded_names->str_pool->mmod, 3);
     /* Empty STR roundtrips as the canonical null and retains metadata. */
     TEST_ASSERT_TRUE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE(ray_vec_is_null(loaded_names, 2));

@@ -1038,6 +1038,15 @@ static ray_t* str_pool_cow(ray_t* vec) {
     new_pool->mmod  = saved_mmod;
     ray_atomic_store(&new_pool->rc, 1);
 
+    /* A mapped pool is the column's only route to the shared region's
+     * descriptor, and this is the moment that route disappears.  Register
+     * the column under its own address first — that is what the region was
+     * mapped at — so its free can still find the reference it holds.  The
+     * registry therefore contains mutated mapped columns only, which is
+     * usually none. */
+    if (vec->str_pool->mmod == 3 && vec->mmod == 1)
+        ray_file_map_register(vec, vec->str_pool->file_map);
+
     ray_release(vec->str_pool);
     vec->str_pool = new_pool;
     return vec;
