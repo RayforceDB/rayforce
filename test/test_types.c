@@ -67,6 +67,16 @@ static test_result_t test_elem_size_macro(void) {
     TEST_ASSERT_EQ_U(ray_elem_size(RAY_BOOL), 1);
     TEST_ASSERT_EQ_U(ray_elem_size(RAY_GUID), 16);
 
+    /* Negative (atom) type tags must index the zero-filled upper half of the
+     * 256-entry table, not read out of bounds: ray_type_sizes[(int8_t)-1] is
+     * an OOB read (UBSan `index -1 out of bounds`).  Atoms carry no element
+     * size in this table, so the well-defined answer is 0.  -RAY_BOOL == -1 is
+     * the tag that hit this via ray_sym_elem_size in the query path. */
+    TEST_ASSERT_EQ_U(ray_elem_size((int8_t)-RAY_BOOL), 0);
+    TEST_ASSERT_EQ_U(ray_elem_size((int8_t)-RAY_I64), 0);
+    TEST_ASSERT_EQ_U(ray_elem_size((int8_t)-RAY_SYM), 0);
+    TEST_ASSERT_EQ_U(ray_elem_size((int8_t)-1), 0);
+
     PASS();
 }
 

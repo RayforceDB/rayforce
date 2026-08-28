@@ -39,8 +39,12 @@
 /* Type sizes lookup table (defined in types.c) */
 extern const uint8_t ray_type_sizes[256];
 
-/* Element size for a given type tag */
-#define ray_elem_size(t)  (ray_type_sizes[(t)])
+/* Element size for a given type tag.  Cast to uint8_t so a negative (atom)
+ * type tag indexes the upper, zero-filled half of the 256-entry table rather
+ * than reading out of bounds — ray_type_sizes[(int8_t)-1] is an OOB read (UB).
+ * Non-vector/atom tags legitimately have no element size and read back 0, and
+ * this matches the (uint8_t) indexing already used in vec.c. */
+#define ray_elem_size(t)  (ray_type_sizes[(uint8_t)(t)])
 
 static inline int64_t ray_cast_f64_to_i64_null(double v) {
     if (v != v) return NULL_I64;
