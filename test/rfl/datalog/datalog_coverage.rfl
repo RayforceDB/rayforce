@@ -544,6 +544,24 @@
 (dl-query FP 'edge) !- type
 (dl-free 'notprog) !- type
 
+;; --- Claim 5b: forged/copied dl-program handles must not be dereferenced ---
+;; A plain integer is NOT a dl-program handle.  Every dl-* builtin that unwraps
+;; one must reject it with a type error rather than reinterpreting the value as
+;; a dl_program_t* pointer — before the RAY_ATTR_DLPROG tag check, (dl-free 1)
+;; and friends dereferenced address 1 and crashed with SIGSEGV.
+(dl-free 1) !- type
+(dl-stratify 1) !- type
+(dl-eval 1) !- type
+(dl-query 1 'edge) !- type
+(dl-add-edb 1 'edge (table ['a 'b] (list [1] [2])) 2) !- type
+;; An arithmetic copy of a live handle drops the tag (attrs are not carried
+;; through arithmetic), so it can't be freed — which would otherwise
+;; double-free the original.  The original still frees exactly once.
+(set CP (dl-program))
+(set CPcopy (+ CP 0))
+(dl-free CPcopy) !- type
+(dl-free CP) -- true
+
 
 ;; --- Claim 4: fixpoint non-convergence must error loudly, not return a partial result ---
 ;; Reachability over a linear chain needs ~N iterations. The loop caps at 1000.

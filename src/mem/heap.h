@@ -91,6 +91,15 @@
  * Checked by HNSW builtins before dereferencing.  User must (hnsw-free h). */
 #define RAY_ATTR_HNSW         0x04
 
+/* I64 atom carries an owning dl_program_t* (a Datalog program) in its .i64
+ * slot.  Checked by the dl-* builtins before dereferencing, so a forged/plain
+ * integer or an arithmetic copy (which drops attrs) is rejected with a type
+ * error instead of being reinterpreted as a pointer — see dl_unwrap_program.
+ * Reuses 0x20 (RAY_ATTR_SORTED on vectors / ATTR_QUOTED on -RAY_SYM); the
+ * -RAY_I64 type tag disambiguates, and no free-path or generic check reads
+ * 0x20 on a -RAY_I64 atom.  User must (dl-free h). */
+#define RAY_ATTR_DLPROG       0x20
+
 /* Vector is a linked column.  The 8 bytes of the aux union at offset
  * 8 (i.e. parent->_idx_pad / parent->slice_offset / parent->str_pool
  * slot, depending on which arm is in use) hold an int64
