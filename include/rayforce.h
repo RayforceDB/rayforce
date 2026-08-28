@@ -128,6 +128,11 @@ typedef enum {
  * singleton (global intern table) or a refcounted mmapped symfile. */
 struct ray_sym_domain_s;
 
+/* One file mapping shared by more than one block (src/mem/heap.h): a mapped
+ * string column and its pool live in the same region, so neither can end it
+ * alone.  Held by the pool at aux[8..15] under mmod 3. */
+struct ray_file_map_s;
+
 typedef union ray_t {
     /* Allocated: object header */
     struct {
@@ -173,6 +178,10 @@ typedef union ray_t {
              * 8-15 hold an int64 sym ID naming the target table.
              * link_lo[8] aliases bytes 0-7.  See ops/linkop.h. */
             struct { uint8_t link_lo[8];         int64_t link_target; };
+            /* mmod 3 (string pools only): the shared mapping this block
+             * lives in.  Typed rather than reached by offset, so it moves
+             * with the union if the layout is ever reshuffled. */
+            struct { uint8_t _aux_map_lo[8];     struct ray_file_map_s* file_map; };
         };
         /* Bytes 16-31: metadata + value */
         /* Where this block's memory came from, and who ends it:

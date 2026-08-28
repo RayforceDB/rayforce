@@ -893,11 +893,10 @@ static void ray_release_owned_refs(ray_t* v) {
          * heap-built index (mmod==0) is released by pointer. */
         if (v->index && !RAY_IS_ERR(v->index) && v->index->mmod != 1)
             ray_release(v->index);
-        if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
-            ray_release(v->str_pool);
-        else if (v->type == RAY_SYM && v->sym_domain)
-            ray_sym_domain_release(v->sym_domain);
-        return;
+        /* Fall through to the STR / SYM arms below rather than repeating
+         * them: the pool or domain is still at bytes 8-15 either way, and a
+         * second copy of this dispatch is the drift this whole change is
+         * about. */
     }
 
     if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool)) {
@@ -1021,11 +1020,8 @@ bool ray_retain_owned_refs(ray_t* v) {
          * index release a reference it never held. */
         if (v->index && !RAY_IS_ERR(v->index) && v->index->mmod != 1)
             ray_retain(v->index);
-        if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
-            ray_retain(v->str_pool);
-        else if (v->type == RAY_SYM && v->sym_domain)
-            ray_sym_domain_retain(v->sym_domain);
-        return true;
+        /* Falls through to the STR / SYM arms below — see the mirror of
+         * this comment in ray_release_owned_refs. */
     }
 
     if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
@@ -1527,9 +1523,67 @@ ray_t* ray_alloc(size_t data_size) {
  * freeing a block, both of which already run under the owning heap's
  * single-threaded discipline.  If a mapped column ever becomes shareable
  * across heaps this needs the same treatment as ray_t's own rc. */
+/* Live shared mappings, keyed by base address.
+ *
+ * A block inside the region has to reach its own reference without going
+ * through a pointer somebody may swap: the pool keeps the descriptor in its
+ * header, but the column's only link to it would be str_pool, and that is
+ * exactly what str_pool_cow replaces when a mapped column is mutated.  What
+ * never changes is the column's address, and the column header IS the start
+ * of the mapping — so the column looks its reference up by that.
+ *
+ * Touched once when a column is mapped and once when it is freed, never per
+ * query, so a spin lock over a small bucket array is enough.  The
+ * descriptors are their own chain nodes. */
+#define RAY_FMAP_BUCKETS 256
+static ray_file_map_t*  g_fmap[RAY_FMAP_BUCKETS];
+static _Atomic(int)     g_fmap_lock = 0;
+
+static inline void fmap_lock(void) {
+    while (atomic_exchange_explicit(&g_fmap_lock, 1, memory_order_acquire))
+        RAY_CPU_RELAX();
+}
+static inline void fmap_unlock(void) {
+    atomic_store_explicit(&g_fmap_lock, 0, memory_order_release);
+}
+/* Bucket by the LOW bits of the page number, deliberately.  The kernel
+ * hands out consecutive file mappings a few pages apart, so those bits are
+ * what actually varies between columns — measured over forty mapped string
+ * columns, forty distinct buckets and no chain longer than one.  Hashing
+ * the high bits instead would put every column of a table in one chain. */
+static inline size_t fmap_bucket(const void* base) {
+    return ((uintptr_t)base >> 12) & (RAY_FMAP_BUCKETS - 1);
+}
+
+void ray_file_map_register(const void* base, ray_file_map_t* m) {
+    if (!m) return;
+    size_t b = fmap_bucket(base);
+    fmap_lock();
+    m->next = g_fmap[b];
+    g_fmap[b] = m;
+    fmap_unlock();
+}
+
+ray_file_map_t* ray_file_map_lookup(const void* base) {
+    size_t b = fmap_bucket(base);
+    fmap_lock();
+    ray_file_map_t* m = g_fmap[b];
+    while (m && m->base != base) m = m->next;
+    fmap_unlock();
+    return m;
+}
+
 void ray_file_map_release(ray_file_map_t* m) {
     if (!m) return;
-    if (m->rc > 1) { m->rc--; return; }
+    if (ray_atomic_dec(&m->rc) > 1) return;   /* returns the value BEFORE */
+    /* Unlink if it was ever registered; a mapping nobody mutated never
+     * entered the table and the walk simply finds nothing. */
+    size_t b = fmap_bucket(m->base);
+    fmap_lock();
+    ray_file_map_t** pp = &g_fmap[b];
+    while (*pp && *pp != m) pp = &(*pp)->next;
+    if (*pp) *pp = m->next;
+    fmap_unlock();
     ray_vm_unmap_file(m->base, m->len);
     ray_sys_free(m);
 }
@@ -1545,29 +1599,22 @@ void ray_free(ray_t* v) {
      * won't merge this block prematurely (it checks buddy_rc==0). */
     ray_atomic_store(&v->rc, 1);
 
-    /* Decide the mapping question BEFORE the children go.  A mapped string
-     * column shares its region with its pool, and the pool owns it: the
-     * release below can therefore be the last reference and unmap the very
-     * page this header sits on, so nothing may be read from `v` afterwards. */
-    const bool pool_owns_map = (v->mmod == 1 && v->type == RAY_STR &&
-                                v->str_pool && !RAY_IS_ERR(v->str_pool) &&
-                                v->str_pool->mmod == 3);
+    /* A mapped block owning a shared region takes its descriptor now: aux
+     * lives inside the region it describes. */
+    ray_file_map_t* owned_map = (v->mmod == 3) ? v->file_map : NULL;
 
-    /* This block owns a shared mapping: take the descriptor now, for the
-     * same reason — aux is inside the region it describes. */
-    ray_file_map_t* owned_map = NULL;
-    if (v->mmod == 3) memcpy(&owned_map, v->aux + 8, sizeof(owned_map));
+    /* A mapped string column reaches its own reference through its pool,
+     * which is the cheap path and needs no lock — but only while that
+     * pointer still leads to the mapped pool.  Read it before the children
+     * go, since releasing the pool may be what drops it. */
+    ray_file_map_t* col_map = NULL;
+    if (v->mmod == 1 && v->type == RAY_STR &&
+        v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->mmod == 3)
+        col_map = v->str_pool->file_map;
 
     ray_release_owned_refs(v);
 
     ray_heap_t* h = ray_tl_heap;
-
-    if (pool_owns_map) {
-        /* The pool released just above ends the region, if it was the last
-         * one in it.  Nothing more to do here, and nothing left to read. */
-        if (h) RAY_STAT(h->stats.free_count++);
-        return;
-    }
 
     if (owned_map) {
         ray_file_map_release(owned_map);
@@ -1578,6 +1625,26 @@ void ray_free(ray_t* v) {
     /* File-mapped: munmap */
     if (v->mmod == 1) {
         if (v->type == RAY_TABLE || v->type == RAY_DICT || v->type == RAY_LIST) return;
+        /* A column mapped by the store registered its region and holds one
+         * of its references.  Looking that up by address rather than through
+         * str_pool is the point: a mutated column's pool pointer no longer
+         * leads anywhere useful, while its address is what the region was
+         * registered under.  The descriptor also carries the true mapped
+         * length, so nothing has to re-derive it from a header that the
+         * children release may already have taken away. */
+        /* col_map is the answer whenever the pool pointer still led to the
+         * region, which is every column that was not mutated.  Only one
+         * that had its pool swapped — str_pool_cow deep-copies a mapped
+         * pool before appending — has to ask the registry, and only a
+         * string column was ever registered.  So the lock stays off the
+         * ordinary free entirely, and a mutated column pays it once. */
+        ray_file_map_t* m = col_map;
+        if (!m && v->type == RAY_STR) m = ray_file_map_lookup(v);
+        if (m) {
+            ray_file_map_release(m);
+            if (h) RAY_STAT(h->stats.free_count++);
+            return;
+        }
         if (v->type > 0 && v->type < RAY_TYPE_COUNT) {
             uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
             size_t data_size = 32 + (size_t)v->len * esz;
