@@ -235,6 +235,31 @@ void     ray_mem_trace_end(ray_mem_trace_t* out);
 void ray_heap_gc(void);
 void ray_heap_release_pages(void);
 
+/* ===== Idle decay =====
+ *
+ * Free blocks keep their pages so the next query reuses them without
+ * faulting.  That makes a process hold its peak footprint forever, which
+ * costs nothing to the process and everything to whatever shares the
+ * machine with it.  The decay gives those pages back once the process has
+ * been quiet for longer than a threshold, without a background thread:
+ * work stamps a timestamp, maintenance points compare it.
+ *
+ * ray_heap_note_activity  — stamp; call at the START of a unit of work (a
+ *   statement, an IPC request).  A stamp at the end would zero the elapsed
+ *   time seen by the boundary check that immediately follows it.
+ * ray_heap_decay_due_ms   — ms until a sweep is due, 0 if due now, -1 if
+ *   none is pending (nothing to release, or decay disabled).  An event loop
+ *   uses it to bound a wait it would otherwise make indefinite.
+ * ray_heap_decay          — sweep if due and if the worker pool is
+ *   quiescent; returns the number of blocks released, or -1 if it did
+ *   nothing.  Safe to call from any maintenance point.
+ *
+ * RAY_HEAP_DECAY_MS sets the threshold: negative disables the decay, 0
+ * releases at the next maintenance point after any work. */
+void    ray_heap_note_activity(void);
+int64_t ray_heap_decay_due_ms(void);
+int64_t ray_heap_decay(void);
+
 /* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */

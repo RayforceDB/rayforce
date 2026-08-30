@@ -784,6 +784,9 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
 ray_t* ray_gc_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
     ray_heap_gc();
+    /* Same statement-boundary rule as the REPL: an explicit maintenance
+     * call is also a chance to notice the process has gone quiet. */
+    ray_heap_decay();
     return ray_i64(0);
 }
 

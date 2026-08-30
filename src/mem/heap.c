@@ -31,6 +31,7 @@
 #include "cow.h"
 #include "sys.h"
 #include "core/platform.h"
+#include "core/timer.h"   /* ray_time_now_ms — idle-decay clock */
 #include "table/sym.h"
 #include "table/domain.h"
 #include "lang/eval.h"
@@ -2202,6 +2203,12 @@ static void dfd_validate_freelists(void) {
 }
 #endif
 
+/* Number of maintenance visits a free block must survive on a freelist
+ * before pass 5 hands its pages back; a block whose attrs exceed it has
+ * already been released and must not be released again.  File scope
+ * because the idle decay below shares the marker. */
+#define RAY_FREE_AGE_RELEASE   3
+
 void ray_heap_gc(void) {
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
@@ -2373,7 +2380,6 @@ void ray_heap_gc(void) {
          * full cycle instead of being double-aged; the cursor never
          * stores a block pointer — blocks may be reallocated, split or
          * coalesced between passes, only (heap, order) is stable. */
-        #define RAY_FREE_AGE_RELEASE   3
         #define RAY_P5_VISIT_BUDGET    2048
         #define RAY_P5_RELEASE_BUDGET  64
         static int s_p5_hid = 0;
@@ -2433,6 +2439,137 @@ void ray_heap_release_pages(void) {
             blk = blk->fl_next;
         }
     }
+}
+
+/* --------------------------------------------------------------------------
+ * Idle decay
+ *
+ * A free block keeps its physical pages so the next allocation of that size
+ * reuses them without faulting; that is why pass 5 ages a block before
+ * releasing it, and why a repeated query never pays to refault its own
+ * temporaries.  The price of the policy is that a process which ran one
+ * heavy query holds its peak footprint for the rest of its life even while
+ * it does nothing.  The memory is free and reusable — it is simply not
+ * available to anything else on the machine.
+ *
+ * The decay closes that gap with no background thread, no queue and no task
+ * object.  Work stamps a coarse timestamp when it STARTS, and the two points
+ * that already exist at the end of a unit of work — the statement boundary
+ * and the event loop between wakeups — compare that stamp against a
+ * threshold.  If the process has been quiet longer than the threshold, one
+ * un-aged sweep releases the pages of every free block in every heap;
+ * otherwise the check is a relaxed load, a getenv and a subtraction.
+ *
+ * The threshold is the whole point: it is what separates "the workload has
+ * stopped" from "we are between two iterations of a hot loop".  Releasing in
+ * the second case drops exactly the pages the next iteration refaults, which
+ * is why pass 5 ages blocks in the first place.
+ *
+ * The stamp is taken at the START of a unit of work, never at the end.  A
+ * stamp at the end would make the elapsed time at the immediately following
+ * boundary check zero, and the boundary check would never fire.
+ *
+ * The sweep works on EVERY registered heap, not just the caller's, and it
+ * drains each one's foreign list and slab cache before walking its
+ * freelists.  That is not incidental: in a server the main thread frees the
+ * results of a parallel query, so the blocks land on the owning WORKER's
+ * foreign list, and a worker only drains its own list when it next needs
+ * memory — which a warm heap never does.  Freelist-only, the sweep sees a
+ * small fraction of the free bytes; with the drain it sees nearly all of
+ * them.  Draining also coalesces, so the pages come back in large runs
+ * instead of scattered blocks below the order-13 floor.
+ *
+ * That is sound only because the sweep runs when ray_parallel_flag is 0.
+ * The dispatcher clears the flag only after every worker's `pending--` is
+ * visible, and a worker between `pending--` and sem_wait claims tasks and
+ * waits — it neither allocates nor frees — so no other thread is touching
+ * a worker heap's freelists or slab stack.  A concurrent cross-thread free
+ * can still PUSH onto a foreign list at any moment, and that is safe on its
+ * own terms: the drain takes the whole list with one atomic exchange, and
+ * whatever arrives afterwards is simply left for the next sweep.
+ *
+ * Unlike ray_heap_gc's pass 5 this walk has no visit or release budget.
+ * The budget exists there because gc runs inside a workload and must never
+ * become an unpredictable pause; the decay by construction only runs when
+ * there is no workload to pause.
+ *
+ * The armed flag makes this once per idle period.  After a sweep there is
+ * nothing further to give back until new work dirties memory again, so a
+ * long-idle process stops checking altogether and its event loop returns to
+ * blocking indefinitely instead of waking on a timer.
+ * -------------------------------------------------------------------------- */
+
+#define RAY_HEAP_DECAY_MS_DEFAULT   10000
+
+static _Atomic int64_t g_heap_activity_ms;
+static _Atomic bool    g_heap_decay_armed;
+
+/* Read per check rather than cached at first use.  This is policy, not a
+ * hot-path constant — it is consulted once per statement and once per event
+ * loop wakeup — and caching it would make the value depend on which code
+ * path happened to run first in the process. */
+static int64_t heap_decay_threshold_ms(void) {
+    const char* e = getenv("RAY_HEAP_DECAY_MS");
+    if (!e || !*e) return RAY_HEAP_DECAY_MS_DEFAULT;
+    char* end = NULL;
+    long long v = strtoll(e, &end, 10);
+    if (end == e) return RAY_HEAP_DECAY_MS_DEFAULT;
+    return (int64_t)v;
+}
+
+void ray_heap_note_activity(void) {
+    atomic_store_explicit(&g_heap_activity_ms, ray_time_now_ms(),
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_heap_decay_armed, true, memory_order_relaxed);
+}
+
+int64_t ray_heap_decay_due_ms(void) {
+    if (!atomic_load_explicit(&g_heap_decay_armed, memory_order_relaxed))
+        return -1;
+    int64_t threshold = heap_decay_threshold_ms();
+    if (threshold < 0) return -1;   /* decay disabled */
+    int64_t due = atomic_load_explicit(&g_heap_activity_ms,
+                                       memory_order_relaxed)
+                + threshold - ray_time_now_ms();
+    return due > 0 ? due : 0;
+}
+
+int64_t ray_heap_decay(void) {
+    if (ray_heap_decay_due_ms() != 0) return -1;
+    if (atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) != 0)
+        return -1;
+
+    /* Disarm before sweeping: what follows is everything this idle period
+     * can return, so repeating it before work resumes finds nothing. */
+    atomic_store_explicit(&g_heap_decay_armed, false, memory_order_relaxed);
+
+    /* Blocks other threads freed to us, and our own slab cache, are not on
+     * a freelist yet and would be invisible to the walk below.  Only the
+     * caller's heap: see the note above on other heaps' lists. */
+    int64_t released = 0;
+    for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+        ray_heap_t* gh = ray_heap_registry[hid];
+        if (!gh) continue;
+        /* Blocks freed to gh by another thread, and gh's own slab cache,
+         * are not on a freelist and would be invisible to the walk below —
+         * in a server that is where most of the free bytes are. */
+        heap_drain_foreign(gh);
+        heap_flush_slabs(gh);
+        for (int ord = 13; ord < RAY_HEAP_FL_SIZE; ord++) {
+            if (!(gh->avail & (1ULL << ord))) continue;
+            ray_fl_head_t* head = &gh->freelist[ord];
+            for (ray_t* blk = head->fl_next; blk != (ray_t*)head;
+                 blk = blk->fl_next) {
+                if (blk->attrs > RAY_FREE_AGE_RELEASE) continue;  /* released */
+                int pidx = heap_find_pool(gh, blk);
+                bool hp = (pidx >= 0) ? (gh->pools[pidx].hugepage != 0) : false;
+                ray_vm_release_block(blk, BSIZEOF(ord), hp);
+                blk->attrs = RAY_FREE_AGE_RELEASE + 1;
+                released++;
+            }
+        }
+    }
+    return released;
 }
 
 void ray_heap_merge(ray_heap_t* src) {

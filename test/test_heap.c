@@ -44,8 +44,11 @@
 #include "ops/ops.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -316,6 +319,122 @@ static test_result_t test_release_pages(void) {
      * past 4 KB will fault back in lazily. */
     memset(ray_data(x), 0x42, 100 * 1024);
     ray_free(x);
+    PASS();
+}
+
+/* ---- Idle decay --------------------------------------------------------- *
+ *
+ * ray_heap_gc AGES a free block before releasing its pages: a block that was
+ * just freed keeps its footprint, which is what stops a repeated query from
+ * refaulting its own temporaries between iterations.  The decay is the other
+ * half of that policy — once the process has been quiet for longer than
+ * RAY_HEAP_DECAY_MS, the same pages go back to the OS un-aged.
+ *
+ * Both halves are asserted here, on the same block, in the same test: one
+ * collector pass must NOT release it, and the decay immediately after must.
+ * The released-block count is asserted too, so the test cannot pass by
+ * sweeping nothing. */
+
+/* Resident set in KB, or 0 where /proc is unavailable. */
+static size_t heap_rss_kb(void) {
+#if defined(__linux__)
+    int fd = open("/proc/self/statm", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    const char* p = buf;
+    while (*p && *p != ' ') p++;          /* field 1 is total size */
+    unsigned long long pages = strtoull(p, NULL, 10);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    if (pgsz <= 0) return 0;
+    return (size_t)((pages * (unsigned long long)pgsz) / 1024);
+#else
+    return 0;
+#endif
+}
+
+static test_result_t test_idle_decay_releases_pages(void) {
+    /* Threshold 0 means "release at the first maintenance point after any
+     * work", so the test asserts the mechanism without sleeping on a clock. */
+    setenv("RAY_HEAP_DECAY_MS", "0", 1);
+
+    /* Order 24: comfortably above the order-13 sweep floor, and below
+     * RAY_HEAP_POOL_ORDER so it is a buddy block rather than a direct
+     * mapping that munmaps itself on free. */
+    const size_t big = (16u << 20) - 4096;
+    ray_t* v = ray_alloc(big);
+    if (!v) { unsetenv("RAY_HEAP_DECAY_MS"); SKIP("16 MB block unavailable"); }
+    memset(ray_data(v), 0xA5, big);          /* fault every page in */
+
+    size_t rss_live = heap_rss_kb();
+    ray_free(v);
+
+    /* One collector pass can only age a freshly inserted block (attrs 0 -> 1),
+     * never release it. */
+    ray_heap_gc();
+    size_t rss_gc = heap_rss_kb();
+
+    ray_heap_note_activity();
+    int64_t released = ray_heap_decay();
+    size_t rss_decay = heap_rss_kb();
+
+    unsetenv("RAY_HEAP_DECAY_MS");
+
+    TEST_ASSERT(released >= 1, "the decay sweep released at least one block");
+    if (rss_live > 0) {
+        size_t half = (big / 1024) / 2;
+        TEST_ASSERT(rss_gc + half > rss_live,
+                    "collector alone keeps the freed block resident");
+        TEST_ASSERT(rss_decay + half < rss_live,
+                    "decay handed most of the freed block back");
+    }
+
+    /* Disarmed: the sweep is triggered by work going quiet, not by asking. */
+    TEST_ASSERT(ray_heap_decay() < 0, "a second decay with no work does nothing");
+
+    /* Released pages refault: the address space is untouched. */
+    ray_t* w = ray_alloc(big);
+    TEST_ASSERT_NOT_NULL(w);
+    memset(ray_data(w), 0x5A, big);
+    ray_free(w);
+    PASS();
+}
+
+/* A decay that is not due must not sweep, however much free memory is
+ * lying around — that is the entire defence against releasing the pages a
+ * hot loop is about to reuse. */
+static test_result_t test_idle_decay_respects_threshold(void) {
+    setenv("RAY_HEAP_DECAY_MS", "600000", 1);
+
+    const size_t big = (16u << 20) - 4096;
+    ray_t* v = ray_alloc(big);
+    if (!v) { unsetenv("RAY_HEAP_DECAY_MS"); SKIP("16 MB block unavailable"); }
+    memset(ray_data(v), 0xA5, big);
+    ray_free(v);
+
+    ray_heap_note_activity();
+    int64_t due = ray_heap_decay_due_ms();
+    int64_t released = ray_heap_decay();
+
+    /* Negative threshold disables the decay outright. */
+    setenv("RAY_HEAP_DECAY_MS", "-1", 1);
+    int64_t due_off = ray_heap_decay_due_ms();
+    unsetenv("RAY_HEAP_DECAY_MS");
+
+    TEST_ASSERT(due > 0, "a sweep is pending but not yet due");
+    TEST_ASSERT(released < 0, "nothing is swept before the threshold elapses");
+    TEST_ASSERT(due_off < 0, "a negative threshold disables the decay");
+
+    /* Proof the block really was sweepable, i.e. the assertions above were
+     * not vacuous: with the threshold at 0 the same block goes. */
+    setenv("RAY_HEAP_DECAY_MS", "0", 1);
+    ray_heap_note_activity();
+    int64_t swept = ray_heap_decay();
+    unsetenv("RAY_HEAP_DECAY_MS");
+    TEST_ASSERT(swept >= 1, "the same block is released once the threshold is 0");
     PASS();
 }
 
@@ -2576,5 +2695,7 @@ const test_entry_t heap_entries[] = {
     { "heap/retain_atom_obj",          test_retain_owned_refs_atom_obj,  heap_setup, heap_teardown },
     { "heap/scratch_realloc_lazy",     test_scratch_realloc_lazy_handle, heap_setup, heap_teardown },
     { "heap/scratch_realloc_has_index", test_scratch_realloc_has_index_detach, heap_setup, heap_teardown },
+    { "heap/idle_decay_releases",      test_idle_decay_releases_pages,   heap_setup, heap_teardown },
+    { "heap/idle_decay_threshold",     test_idle_decay_respects_threshold, heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -26,6 +26,7 @@
 #include "core/poll.h"
 #include "core/timer.h"
 #include "mem/sys.h"
+#include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
 #include <sys/event.h>
 #include <unistd.h>
 #include <errno.h>
@@ -188,6 +189,16 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             }
         }
 
+        /* A process waiting here is a process doing nothing, and this is the
+         * only moment it gets to notice.  Bound the wait by the allocator's
+         * pending decay exactly as a timer would; once the decay has run
+         * there is nothing pending and the wait goes back to indefinite. */
+        {
+            int64_t decay = ray_heap_decay_due_ms();
+            if (decay >= 0 && (wait_ms < 0 || decay < wait_ms))
+                wait_ms = decay;
+        }
+
         struct timespec  ts;
         struct timespec* timeout = NULL;
         if (wait_ms >= 0) {
@@ -278,6 +289,10 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
 
         if (poll->timers)
             ray_timers_fire_expired((ray_timers_t*)poll->timers);
+        /* After the events of this wakeup, not before: a request handled
+         * above has just re-stamped the activity clock, so a busy loop
+         * finds nothing due and pays one timestamp comparison. */
+        ray_heap_decay();
         if (bounded) break;
     }
 

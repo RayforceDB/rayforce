@@ -26,6 +26,7 @@
 #endif
 
 #include "core/ipc.h"
+#include "mem/heap.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
 #include "store/journal.h"
@@ -896,6 +897,11 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
 
     if (!sel->rx.buf || sel->rx.buf->offset < cd->hdr.size)
         return NULL;
+
+    /* A complete request frame is this server's unit of work, and the server
+     * calls no allocator maintenance of its own.  Stamping here is what lets
+     * the poll loop tell an idle server from one between two requests. */
+    ray_heap_note_activity();
 
     /* Detach the payload buffer and advance the state machine to the
      * next header BEFORE dispatching: the eval below may re-enter this
