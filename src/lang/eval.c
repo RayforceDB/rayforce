@@ -3407,6 +3407,10 @@ static void ray_register_builtins(void) {
      * src/app/repl_remote.c for the state model. */
     register_unary(".repl.connect",    RAY_FN_RESTRICTED, ray_repl_connect_fn);
     register_vary( ".repl.disconnect", RAY_FN_RESTRICTED, ray_repl_disconnect_fn);
+    /* Read-only namespace completion (issue #441): builtins + keywords +
+     * user bindings whose name begins with the given prefix.  RAY_FN_NONE
+     * so remote editor clients can query it over IPC. */
+    register_unary(".repl.complete",   RAY_FN_NONE,       ray_repl_complete_fn);
 
     /* Transaction-log journaling under `.log.*` — the -l/-L feature.
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at
