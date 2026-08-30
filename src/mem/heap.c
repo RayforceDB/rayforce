@@ -656,6 +656,16 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
          * uncounted.  Freed via ray_vm_free (which subtracts) at pool teardown. */
         ray_sys_track_add((int64_t)pool_size);
         mem = (void*)aligned;
+
+        /* Unlink now that the mapping holds the inode: the file keeps its
+         * blocks until the last mapping goes away, and the kernel reclaims
+         * them on munmap or on process exit, whichever comes first.  Doing
+         * it here rather than at teardown means no path out of this heap
+         * can strand the file — a worker that abandons its heap for reuse
+         * never runs a teardown at all. */
+        unlink(swap_path);
+        ray_sys_free(swap_path);
+        swap_path = NULL;
     }
 
     /* Enable transparent huge pages on anon pools (Linux).  Self-aligned
