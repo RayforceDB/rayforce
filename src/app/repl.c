@@ -40,6 +40,7 @@
 #include "lang/parse.h"
 #include "lang/syscmd.h"
 #include "mem/heap.h"
+#include "mem/sys.h"
 #include "ops/ops.h"
 #include "core/profile.h"
 #include "core/qlog.h"
@@ -665,6 +666,56 @@ ray_t* ray_repl_disconnect_fn(ray_t** args, int64_t n) {
     g_remote_addr[0]   = '\0';
     if (g_active_term) ray_term_set_prompt_prefix(g_active_term, NULL);
     return RAY_NULL_OBJ;
+}
+
+/* strcmp comparator over char* cells, for sorting completion candidates. */
+static int repl_comp_cmp(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+/* (.repl.complete "prefix") -> sorted sym vector of namespace candidates
+ * whose name begins with `prefix`: builtins, keywords, and user bindings.
+ *
+ * This is the engine side of the REPL's own tab-completion (issue #441),
+ * exposed as a read-only verb so editor tooling can query it over IPC and
+ * get semantic completion of names the engine knows in the live session,
+ * not just a static keyword list.  It reuses ray_env_lookup_prefix — the
+ * same primitive the terminal client's completion draws from — so the two
+ * can never drift.  History-word completion is intentionally omitted: it
+ * is client-local and meaningless to a remote caller. */
+ray_t* ray_repl_complete_fn(ray_t* prefix_str) {
+    if (!ray_is_atom(prefix_str) || prefix_str->type != -RAY_STR)
+        return ray_error("type", ".repl.complete expects a string prefix, got %s",
+                         ray_type_name(prefix_str->type));
+
+    const char* prefix = ray_str_ptr(prefix_str);
+    int64_t     plen   = (int64_t)ray_str_len(prefix_str);
+
+    /* Size the candidate buffer to cover every global binding plus
+     * headroom for the static keyword list.  ray_env_lookup_prefix caps
+     * itself at max_results and dedups, so this never overruns. */
+    int64_t      cap     = (int64_t)ray_env_global_count() + 256;
+    const char** results = (const char**)ray_sys_alloc((size_t)cap * sizeof(const char*));
+    if (!results) return ray_error("oom", NULL);
+
+    int64_t count = ray_env_lookup_prefix(prefix ? prefix : "", plen, results, cap);
+
+    /* Sort for a stable, editor-friendly ordering (mirrors .fs.list). */
+    if (count > 1)
+        qsort(results, (size_t)count, sizeof(const char*), repl_comp_cmp);
+
+    ray_t* out = ray_vec_new(RAY_SYM, count);
+    if (!out || RAY_IS_ERR(out)) {
+        ray_sys_free(results);
+        return out ? out : ray_error("oom", NULL);
+    }
+    out->len = count;
+    int64_t* ids = (int64_t*)ray_data(out);
+    for (int64_t i = 0; i < count; i++)
+        ids[i] = ray_sym_intern(results[i], strlen(results[i]));
+
+    ray_sys_free(results);
+    return out;
 }
 
 /* eval_and_print's remote branch: send the raw input string to the
