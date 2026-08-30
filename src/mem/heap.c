@@ -371,15 +371,15 @@ void ray_heap_set_anon_watermark(int64_t bytes) {
 
 ray_heap_t* ray_heap_registry[RAY_HEAP_REGISTRY_SIZE];
 
-/* Serializes the registry slot writes (register/unregister) and the
- * cross-heap foreign-list purges that walk EVERY other heap's ->foreign
- * during teardown.  ray_pool_free() joins workers one at a time, but all
- * workers wake on the shutdown signal together and run ray_heap_destroy()
- * CONCURRENTLY — two destroyers splicing the same neighbour's singly-linked
- * ->foreign list (or one walking a slot another is NULLing) tears the list
- * and SEGVs on the next ->fl_next deref.  Spinlock matches the dfd_lock
- * pattern above; held only across the short registry/foreign critical
- * sections, never across munmap or syscalls. */
+/* Serializes registry slot writes (register / unregister) and the
+ * abandoned-heap LIFO.  Workers wake on the shutdown signal together and
+ * leave their heaps CONCURRENTLY, so those two structures need one owner at
+ * a time.  Spinlock matches the dfd_lock pattern above; held only across the
+ * short critical sections, never across munmap or syscalls.
+ *
+ * The free path deliberately does NOT take this lock: it only READS a
+ * registry slot, and a heap in the registry is never freed while a thread
+ * could still be freeing into it (see ray_heap_abandon). */
 static atomic_flag ray_registry_lock_flag = ATOMIC_FLAG_INIT;
 static void ray_registry_lock(void)   { while (atomic_flag_test_and_set_explicit(&ray_registry_lock_flag, memory_order_acquire)) {} }
 static void ray_registry_unlock(void) { atomic_flag_clear_explicit(&ray_registry_lock_flag, memory_order_release); }
@@ -733,67 +733,43 @@ static void heap_flush_slabs(ray_heap_t* h) {
 }
 
 /* --------------------------------------------------------------------------
- * Foreign blocks flush
+ * Foreign-list drain (owner side)
  *
- * When return_to_owner is true, returns each foreign block to its owning
- * heap (via pool header heap_id → global registry). This ensures workers
- * can reuse their pools across queries instead of allocating new ones.
+ * Every block on h->foreign is OWNED BY h: a cross-thread free routes the
+ * block to its owner rather than parking it on the freeing heap (see the
+ * foreign path in ray_free).  So the drain needs no pool-header lookup for
+ * ownership, no registry access, and no "are the workers idle?" gate — it
+ * takes the whole list with one exchange and coalesces into its own
+ * freelists, which no other thread touches.
  *
- * return_to_owner must only be true when workers are idle (on semaphore),
- * i.e. ray_parallel_flag == 0. Otherwise coalesce into current heap.
+ * The acquire on the exchange pairs with the release on the pusher's CAS,
+ * so the block contents written before the push are visible here.
  * -------------------------------------------------------------------------- */
 
-static void heap_flush_foreign(ray_heap_t* h, bool return_to_owner) {
-    /* When workers are active (return_to_owner=false), skip entirely.
-     * Foreign blocks stay queued until the proper GC flush after workers
-     * finish. Absorbing foreign blocks locally would let them be re-
-     * allocated under a different heap while pool ownership stays with
-     * the original heap, corrupting bytes_allocated accounting. */
-    if (!return_to_owner) return;
-
-    ray_t* blk = h->foreign;
+static void heap_drain_foreign(ray_heap_t* h) {
+    ray_t* blk = atomic_exchange_explicit(&h->foreign, NULL,
+                                          memory_order_acquire);
     while (blk) {
         ray_t* next = blk->fl_next;
-        ray_pool_hdr_t* phdr = ray_pool_of(blk);
-        if (!phdr) { blk = next; continue; }
-        uint16_t owner_id = phdr->heap_id;
-        ray_heap_t* owner = ray_heap_registry[owner_id % RAY_HEAP_REGISTRY_SIZE];
-        if (owner && owner->id == owner_id && owner != h) {
-            /* Return to owner and decrement owner's bytes_allocated.
-             * Safe: workers are idle (return_to_owner=true implies
-             * ray_parallel_flag==0). */
-            int pidx = heap_find_pool(owner, blk);
-            uintptr_t pb;
-            uint8_t po;
-            if (pidx >= 0) {
-                pb = (uintptr_t)owner->pools[pidx].base;
-                po = owner->pools[pidx].pool_order;
-            } else {
-                pb = (uintptr_t)phdr;
-                po = phdr->pool_order;
-            }
-            RAY_STAT(owner->stats.bytes_allocated -= BSIZEOF(blk->order));
-            heap_coalesce(owner, blk, pb, po);
+        int pidx = heap_find_pool(h, blk);
+        uintptr_t pb;
+        uint8_t po;
+        if (pidx >= 0) {
+            pb = (uintptr_t)h->pools[pidx].base;
+            po = h->pools[pidx].pool_order;
         } else {
-            /* Owner gone (destroyed/unregistered) — coalesce locally.
-             * No stats adjustment: the owner's stats were destroyed
-             * with the heap, and h never charged the alloc. */
-            int pidx = heap_find_pool(h, blk);
-            uintptr_t pb;
-            uint8_t po;
-            if (pidx >= 0) {
-                pb = (uintptr_t)h->pools[pidx].base;
-                po = h->pools[pidx].pool_order;
-            } else {
-                if (!phdr) { blk = next; continue; }
-                pb = (uintptr_t)phdr;
-                po = phdr->pool_order;
-            }
-            heap_coalesce(h, blk, pb, po);
+            /* h owns the block but does not track its pool — only reachable
+             * through ray_heap_merge's RAY_MAX_POOLS overflow, which rewrites
+             * the header's heap_id without room for the pool entry. */
+            ray_pool_hdr_t* phdr = ray_pool_of(blk);
+            if (!phdr) { blk = next; continue; }
+            pb = (uintptr_t)phdr;
+            po = phdr->pool_order;
         }
+        RAY_STAT(h->stats.bytes_allocated -= BSIZEOF(blk->order));
+        heap_coalesce(h, blk, pb, po);
         blk = next;
     }
-    h->foreign = NULL;
 }
 
 /* --------------------------------------------------------------------------
@@ -1456,25 +1432,23 @@ ray_t* ray_alloc(size_t data_size) {
      * to find a genuinely non-empty freelist. */
     uint64_t candidates = h->avail & (UINT64_MAX << order);
 
-    if (RAY_UNLIKELY(candidates == 0)) {
-        heap_flush_foreign(h, false);  /* always local in ray_alloc */
-
-        candidates = h->avail & (UINT64_MAX << order);
-
-        if (candidates == 0) {
-            if (!heap_add_pool(h, order)) return NULL;
-            candidates = h->avail & (UINT64_MAX << order);
-            if (candidates == 0) return NULL;
-        }
-    }
-
     /* Scan past stale avail bits (cross-heap fl_remove may have emptied lists) */
     uint8_t found_order;
     for (;;) {
-        if (candidates == 0) {
-            if (!heap_add_pool(h, order)) return NULL;
+        if (RAY_UNLIKELY(candidates == 0)) {
+            /* Out of blocks at this order.  Take back everything other
+             * threads have freed to us BEFORE asking the OS for another
+             * pool: those blocks are already ours, and mapping fresh memory
+             * while our own sits on the list is how a repeated query grew a
+             * server by a pool per execution (issue #439).  This ordering is
+             * the invariant — no pool is ever added without a drain first. */
+            heap_drain_foreign(h);
             candidates = h->avail & (UINT64_MAX << order);
-            if (candidates == 0) return NULL;
+            if (candidates == 0) {
+                if (!heap_add_pool(h, order)) return NULL;
+                candidates = h->avail & (UINT64_MAX << order);
+                if (candidates == 0) return NULL;
+            }
         }
         found_order = (uint8_t)__builtin_ctzll(candidates);
         if (!fl_empty(&h->freelist[found_order])) break;
@@ -1766,12 +1740,36 @@ void ray_free(ray_t* v) {
         return;
     }
 
-    /* Foreign: not in any of our pools.  Enqueue to the foreign list for
-     * return to the owner during GC.  Do NOT adjust bytes_allocated: the
-     * block stays counted on the owning heap until returned and coalesced. */
+    /* Foreign: not in any of our pools.  Push it onto the OWNER's list, not
+     * ours.  A block parked here is memory only the owner can reuse, and
+     * until this changed nothing but an explicit ray_heap_gc() ever moved it
+     * — so a server that never called one had every worker start each query
+     * short by the volume the consuming thread was sitting on, and map a
+     * fresh pool to make up the difference, forever (issue #439).  Handing
+     * the block back at free time makes the growth impossible instead of
+     * merely collectable.
+     *
+     * The registry lookup is unlocked, which is sound because a registered
+     * heap outlives every block it owns: threads abandon their heaps rather
+     * than destroying them (ray_heap_abandon).
+     *
+     * Do NOT adjust bytes_allocated: the block stays counted on the owning
+     * heap until IT drains and coalesces. */
+    ray_pool_hdr_t* phdr = ray_pool_of(v);
+    if (RAY_UNLIKELY(!phdr)) return;      /* not inside any live pool */
+    uint16_t owner_id = phdr->heap_id;
+    ray_heap_t* owner = ray_heap_registry[owner_id % RAY_HEAP_REGISTRY_SIZE];
+    /* Owner torn down: its pools went with it, so there is nothing to
+     * return the block to (and nothing to leak — the mapping is gone). */
+    if (RAY_UNLIKELY(!owner || owner->id != owner_id)) return;
+
     dfd_add(v);
-    v->fl_next = h->foreign;
-    h->foreign = v;
+    ray_t* head = atomic_load_explicit(&owner->foreign, memory_order_relaxed);
+    do {
+        v->fl_next = head;
+    } while (!atomic_compare_exchange_weak_explicit(
+                 &owner->foreign, &head, v,
+                 memory_order_release, memory_order_relaxed));
     RAY_STAT(h->stats.free_count++);
 }
 
@@ -1963,8 +1961,27 @@ void ray_mem_stats(ray_mem_stats_t* out) {
  * -------------------------------------------------------------------------- */
 
 
+/* Heaps whose thread exited: still registered, pools intact, waiting for the
+ * next thread to adopt them.  Guarded by the registry lock — pushed and
+ * popped once per thread lifetime, never on an allocation path. */
+static ray_heap_t* g_heap_idle = NULL;
+
 void ray_heap_init(void) {
     if (ray_tl_heap) return;
+
+    /* Adopt an abandoned heap before mapping a new one.  Its pools are
+     * already faulted in and its slab caches are warm, and — the reason this
+     * exists at all — a heap that is never destroyed can be looked up on the
+     * lock-free cross-thread free path without racing a munmap. */
+    ray_registry_lock();
+    ray_heap_t* reuse = g_heap_idle;
+    if (reuse) g_heap_idle = reuse->idle_next;
+    ray_registry_unlock();
+    if (reuse) {
+        reuse->idle_next = NULL;
+        ray_tl_heap = reuse;
+        return;
+    }
 
     size_t heap_sz = (sizeof(ray_heap_t) + 4095) & ~(size_t)4095;
     ray_heap_t* h = (ray_heap_t*)ray_vm_alloc(heap_sz);
@@ -1990,8 +2007,8 @@ void ray_heap_init(void) {
     }
     h->id = (uint16_t)id;
 
-    /* Register in global heap registry (lock: a concurrent destroyer may be
-     * walking the array in its foreign-purge loop). */
+    /* Register in global heap registry (lock: serialize the slot write
+     * against a concurrent register / unregister). */
     ray_registry_lock();
     ray_heap_registry[h->id % RAY_HEAP_REGISTRY_SIZE] = h;
     ray_registry_unlock();
@@ -2048,6 +2065,34 @@ void ray_heap_init(void) {
  * heap takes over.  Lives in src/lang/eval.c. */
 extern void ray_clear_error_trace(void);
 
+void ray_heap_abandon(void) {
+    ray_heap_t* h = ray_tl_heap;
+    if (!h) return;
+
+    /* Thread-local refs into this heap must go before another thread owns
+     * it, or the next ray_eval_str on the adopting thread would release a
+     * trace this thread already handed on. */
+    ray_clear_error_trace();
+
+    /* Take back whatever was freed to us while we ran, so the heap is
+     * handed on with its memory on its freelists rather than on a list the
+     * adopter has to notice. */
+    heap_drain_foreign(h);
+
+    ray_registry_lock();
+    h->idle_next = g_heap_idle;
+    g_heap_idle = h;
+    ray_registry_unlock();
+
+    ray_tl_heap = NULL;
+}
+
+/* Real teardown: unregisters the heap and munmaps its pools.
+ *
+ * ONLY valid when no other thread can still be freeing blocks that belong to
+ * this heap — process shutdown after the worker pool is joined, or a
+ * single-threaded test.  A thread that merely exits must call
+ * ray_heap_abandon instead; see the comment on that function. */
 void ray_heap_destroy(void) {
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
@@ -2066,51 +2111,24 @@ void ray_heap_destroy(void) {
 
     uint16_t saved_id = h->id;
 
-    /* Workers tear down CONCURRENTLY during ray_pool_free() (all woken by the
-     * same shutdown signal), so the unregister + the cross-heap foreign-list
-     * purge below must be serialized: otherwise two destroyers splice the same
-     * neighbour's ->foreign list at once and the ->fl_next walk SEGVs.  Held
-     * only across the registry critical section, released before munmap. */
+    /* Unregister first so a free that is still to resolve an owner cannot
+     * pick this heap up.  The lock serializes the slot write against
+     * ray_heap_init / ray_heap_abandon.
+     *
+     * The cross-heap foreign-list purge that used to live here is gone with
+     * the design it belonged to: a block of h's can no longer be sitting on
+     * some OTHER heap's foreign list, because a cross-thread free routes the
+     * block to its owner.  With it goes the tearing hazard of walking a
+     * neighbour's singly-linked list while its owner mutates it. */
     ray_registry_lock();
-
-    /* Unregister from global heap registry */
     ray_heap_registry[h->id % RAY_HEAP_REGISTRY_SIZE] = NULL;
-
-    /* Skip flush_slabs and flush_foreign — all pools are about to be
-     * munmap'd. Flushing would coalesce blocks and fl_remove buddies
-     * from other heaps' freelists, which races with concurrent worker
-     * destruction during ray_pool_free(). */
-
-    /* Purge any of h's blocks from every other heap's foreign list
-     * BEFORE we munmap.  Without this, foreign lists outlive h with
-     * dangling pointers into unmapped memory and crash on the next
-     * ray_heap_gc has_foreign walk or heap_flush_foreign. */
-    for (int fh_id = 0; fh_id < RAY_HEAP_REGISTRY_SIZE; fh_id++) {
-        ray_heap_t* fh_heap = ray_heap_registry[fh_id];
-        if (!fh_heap || fh_heap == h) continue;
-        ray_t** pp = &fh_heap->foreign;
-        ray_t* curr = *pp;
-        while (curr) {
-            ray_t* next = curr->fl_next;
-            bool in_h = false;
-            for (uint32_t i = 0; i < h->pool_count; i++) {
-                uintptr_t pb = (uintptr_t)h->pools[i].base;
-                uintptr_t pe = pb + BSIZEOF(h->pools[i].pool_order);
-                if ((uintptr_t)curr >= pb && (uintptr_t)curr < pe) {
-                    in_h = true;
-                    break;
-                }
-            }
-            if (in_h) {
-                *pp = next;
-            } else {
-                pp = &curr->fl_next;
-            }
-            curr = next;
-        }
-    }
-
     ray_registry_unlock();
+
+    /* Anything queued for us dies with the pools it lives in — the blocks are
+     * free memory inside mappings we are about to drop. */
+    atomic_store_explicit(&h->foreign, NULL, memory_order_relaxed);
+
+    /* Skip flush_slabs — all pools are about to be munmap'd. */
 
     /* Munmap all tracked pools.  File-backed pools also need their fd
      * closed and their tempfile unlinked so the swap directory doesn't
@@ -2140,58 +2158,11 @@ void ray_heap_destroy(void) {
     heap_id_release(saved_id);
 }
 
-/* --------------------------------------------------------------------------
- * Return worker-pool blocks from this heap's freelists to their owners.
- *
- * After ray_alloc flushes foreign blocks locally (coalesce + madvise),
- * worker-pool blocks sit on main's freelists with released physical pages.
- * This function walks the freelists, finds blocks whose pool header
- * heap_id != ours, removes them, and inserts into the owning worker heap.
- * Workers can then reuse their pools without allocating new ones.
- *
- * ONLY safe when workers are idle (on semaphore, ray_parallel_flag == 0).
- * -------------------------------------------------------------------------- */
-
-static void heap_return_foreign_freelist(ray_heap_t* h) {
-    /* avail bit (set on insert, cleared on remove) tells us which
-     * freelist orders have any blocks at all — skip the empty ones. */
-    if (!h->avail) return;
-    for (int order = RAY_ORDER_MIN; order < RAY_HEAP_FL_SIZE; order++) {
-        if (!(h->avail & (1ULL << order))) continue;
-        ray_fl_head_t* head = &h->freelist[order];
-        ray_t* blk = head->fl_next;
-        while (blk != (ray_t*)head) {
-            ray_t* next = blk->fl_next;
-            /* Use heap_find_pool on h first — if found, block is local */
-            int pidx = heap_find_pool(h, blk);
-            if (pidx < 0) {
-                /* Foreign block — find owner via pool header (GC path) */
-                ray_pool_hdr_t* phdr = ray_pool_of(blk);
-                if (!phdr) { blk = next; continue; }
-                ray_heap_t* owner = ray_heap_registry[phdr->heap_id % RAY_HEAP_REGISTRY_SIZE];
-                if (owner && owner->id == phdr->heap_id) {
-                    fl_remove(blk);
-                    dfd_remove(blk);
-                    if (fl_empty(head))
-                        h->avail &= ~(1ULL << order);
-                    /* Coalesce on owner for defragmentation */
-                    int opidx = heap_find_pool(owner, blk);
-                    uintptr_t pb;
-                    uint8_t po;
-                    if (opidx >= 0) {
-                        pb = (uintptr_t)owner->pools[opidx].base;
-                        po = owner->pools[opidx].pool_order;
-                    } else {
-                        pb = (uintptr_t)phdr;
-                        po = phdr->pool_order;
-                    }
-                    heap_coalesce(owner, blk, pb, po);
-                }
-            }
-            blk = next;
-        }
-    }
-}
+/* heap_return_foreign_freelist used to walk this heap's freelists looking for
+ * blocks that belong to somebody else and hand them back.  Nothing can put
+ * such a block there any more — a cross-thread free goes straight to the
+ * owner's list, and a drain only ever coalesces the draining heap's own
+ * blocks — so the whole pass is gone. */
 
 #ifdef DEBUG
 static void dfd_validate_freelists(void) {
@@ -2230,24 +2201,20 @@ void ray_heap_gc(void) {
 
     bool safe = (atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0);
 
-    /* Pass 1: Flush main heap's foreign blocks and slab caches.
-     * When safe (workers idle), return foreign blocks to their owners
-     * so worker pools become reusable. */
-    heap_flush_foreign(h, safe);
+    /* Pass 1: take back whatever other threads freed to us, and fold the
+     * slab caches back into the freelists.  The drain needs no idle-worker
+     * gate: the list holds only our own blocks. */
+    heap_drain_foreign(h);
     heap_flush_slabs(h);
 
     if (safe) {
-        /* Pass 2: Return foreign blocks absorbed onto our freelists
-         * back to their owning worker heaps. */
-        heap_return_foreign_freelist(h);
-
-        /* Pass 3: Skip worker heaps — we cannot safely touch their
-         * foreign lists or slab caches because workers may still be
-         * between pending-- and sem_wait, calling ray_free which
-         * modifies wh->foreign and wh->slabs.  Workers flush their
-         * own foreign/slabs on their next dispatch entry.
-         * TODO: full cross-heap reclamation requires a worker
-         * quiescence barrier. */
+        /* Pass 2 (return foreign blocks absorbed onto our freelists) is gone
+         * — nothing absorbs a foreign block locally any more.
+         *
+         * Pass 3: Skip worker heaps — we cannot safely touch their
+         * slab caches because workers may still be between pending--
+         * and sem_wait, calling ray_free which modifies wh->slabs.
+         * Workers fold their own slabs back on their next dispatch. */
 
         /* Pass 4: Reclaim OVERSIZED empty pools.
          * Standard pools (pool_order == RAY_HEAP_POOL_ORDER) are never
@@ -2264,17 +2231,14 @@ void ray_heap_gc(void) {
          * live_count operations on the alloc/free hot path. */
         /* Pass 4: Reclaim oversized empty pools.
          *
-         * For each candidate pool (owned by heap gh), count free bytes from:
-         *   (a) gh's own freelist + slab cache — safe, only gh modifies these
-         *   (b) ALL heaps' foreign lists (read-only) — foreign lists are
-         *       prepend-only during the race window, so a read-only walk
-         *       sees a consistent suffix. A concurrent prepend may be
-         *       missed, making us undercount — which is conservative.
-         *
-         * On removal, only unlink from gh's freelist/slabs. Blocks still
-         * in other heaps' foreign lists will be discovered as dangling on
-         * their next flush (foreign block with unmapped pool → ray_pool_of
-         * returns NULL → skipped by the NULL guard). */
+         * Emptiness is "every byte of the pool is on gh's own freelist or in
+         * its slab cache".  That single sum is now the whole test: a block of
+         * gh's that is live, or queued on gh->foreign, or queued anywhere
+         * else, is by construction NOT on those two structures, so it shows
+         * up as a shortfall.  The registry-wide foreign scan (and the
+         * destructive purge that had to follow it, because the scan raced)
+         * existed only because a free used to leave the block on whichever
+         * heap did the freeing. */
         for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
             ray_heap_t* gh = ray_heap_registry[hid];
             if (!gh) continue;
@@ -2313,38 +2277,13 @@ void ray_heap_gc(void) {
                     }
                 }
 
-                /* (b) Check if ANY blocks from this pool are still in other
-                 *     heaps' foreign lists.  If so, we cannot munmap —
-                 *     those blocks are threaded into the foreign list and
-                 *     dereferencing them after munmap would crash.
-                 *     They'll be flushed to the owner on the next GC. */
-                /* Lock the foreign-list scan + purge: keeps the registry-wide
-                 * foreign-splice invariant uniform with ray_heap_destroy.
-                 * Workers are idle here (ray_parallel_flag == 0), so this is
-                 * defensive — never contended in the live GC path. */
-                ray_registry_lock();
-                bool has_foreign = false;
-                for (int fh_id = 0; fh_id < RAY_HEAP_REGISTRY_SIZE && !has_foreign; fh_id++) {
-                    ray_heap_t* fh_heap = ray_heap_registry[fh_id];
-                    if (!fh_heap || fh_heap == gh) continue;
-                    ray_t* fb = fh_heap->foreign;
-                    while (fb) {
-                        if ((uintptr_t)fb >= pb && (uintptr_t)fb < pe) {
-                            has_foreign = true;
-                            break;
-                        }
-                        fb = fb->fl_next;
-                    }
-                }
-
-                if (free_bytes < pool_capacity || has_foreign) {
-                    ray_registry_unlock();
+                if (free_bytes < pool_capacity) {
                     p++;
-                    continue;  /* pool has live allocations or dangling foreign refs */
+                    continue;  /* pool still has live or queued blocks */
                 }
 
-                /* Pool is empty and no foreign-list refs — safe to munmap.
-                 * Remove blocks from owning heap's freelists and slab caches. */
+                /* Pool is entirely free — safe to munmap.  Remove its blocks
+                 * from the owning heap's freelists and slab caches. */
                 for (int ord = RAY_ORDER_MIN; ord < RAY_HEAP_FL_SIZE; ord++) {
                     ray_fl_head_t* fh = &gh->freelist[ord];
                     ray_t* blk = fh->fl_next;
@@ -2371,29 +2310,6 @@ void ray_heap_gc(void) {
                     }
                     gh->slabs[si].count = dst;
                 }
-
-                /* Purge any [pb, pe) blocks from every other heap's foreign
-                 * list BEFORE munmap.  The has_foreign check above is racy
-                 * vs concurrent ray_free, and any block left here becomes
-                 * a dangling pointer that crashes subsequent Pass 4 walks
-                 * at fb->fl_next.  Reading fl_next is safe here because
-                 * the pool is still mapped. */
-                for (int fh_id = 0; fh_id < RAY_HEAP_REGISTRY_SIZE; fh_id++) {
-                    ray_heap_t* fh_heap = ray_heap_registry[fh_id];
-                    if (!fh_heap || fh_heap == gh) continue;
-                    ray_t** pp = &fh_heap->foreign;
-                    ray_t* curr = *pp;
-                    while (curr) {
-                        ray_t* next = curr->fl_next;
-                        if ((uintptr_t)curr >= pb && (uintptr_t)curr < pe) {
-                            *pp = next;
-                        } else {
-                            pp = &curr->fl_next;
-                        }
-                        curr = next;
-                    }
-                }
-                ray_registry_unlock();
 
                 dfd_purge_range(pb, pe);
                 ray_vm_free(phdr->vm_base, BSIZEOF(po));
@@ -2547,8 +2463,10 @@ void ray_heap_merge(ray_heap_t* src) {
         }
     }
 
-    /* Free foreign blocks via coalescing */
-    ray_t* fblk = src->foreign;
+    /* Blocks other threads freed back to src, taken over by dst along with
+     * src's pools. */
+    ray_t* fblk = atomic_exchange_explicit(&src->foreign, NULL,
+                                           memory_order_acquire);
     while (fblk) {
         ray_t* next = fblk->fl_next;
         int pidx = heap_find_pool(dst, fblk);
@@ -2566,7 +2484,6 @@ void ray_heap_merge(ray_heap_t* src) {
         heap_coalesce(dst, fblk, pb, po);
         fblk = next;
     }
-    src->foreign = NULL;
 
     /* Merge freelists: circular list splice (src chain into dst chain) */
     for (int i = RAY_ORDER_MIN; i < RAY_HEAP_FL_SIZE; i++) {
@@ -2622,9 +2539,9 @@ void ray_heap_merge(ray_heap_t* src) {
 void ray_heap_flush_foreign(void) {
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
-    bool safe = (atomic_load_explicit(&ray_parallel_flag,
-                                       memory_order_relaxed) == 0);
-    heap_flush_foreign(h, safe);
+    /* No ray_parallel_flag gate: the list holds only this heap's own blocks,
+     * and only this thread coalesces into its own freelists. */
+    heap_drain_foreign(h);
 }
 
 /* --------------------------------------------------------------------------

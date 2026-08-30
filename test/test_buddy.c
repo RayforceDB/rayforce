@@ -404,12 +404,17 @@ static test_result_t test_cross_heap_free(void) {
 
     /* Switch to heap_a and free blocks from the wrong heap */
     ray_tl_heap = heap_a;
-    ray_free(blk1);  /* should go to heap_a->foreign */
+    ray_free(blk1);  /* routed to heap_b — the owner — not to heap_a */
     ray_free(blk2);
     ray_free(blk3);
+    TEST_ASSERT_NULL(atomic_load(&heap_a->foreign));
+    TEST_ASSERT_NOT_NULL(atomic_load(&heap_b->foreign));
 
-    /* Flush foreign blocks back to their owning heap */
+    /* heap_a has nothing of its own queued; heap_b takes its blocks back. */
     ray_heap_flush_foreign();
+    ray_tl_heap = heap_b;
+    ray_heap_flush_foreign();
+    TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
 
     /* Cleanup: destroy heap_b */
     ray_tl_heap = heap_b;
@@ -452,8 +457,8 @@ static test_result_t test_heap_pending_merge(void) {
     /* The block should still be accessible (pool transferred) */
     TEST_ASSERT_EQ_U(blk->mmod, 0);
 
-    /* Free the block — goes via foreign path (heap_id mismatch)
-     * then flush reclaims it locally */
+    /* Free the block — merge rewrote its pool header to heap_a, so this is
+     * an ordinary local free. */
     ray_free(blk);
     ray_heap_flush_foreign();
 

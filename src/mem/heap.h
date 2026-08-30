@@ -212,6 +212,17 @@ typedef struct ray_dispatch  ray_dispatch_t;
 
 void     ray_heap_init(void);
 void     ray_heap_destroy(void);
+/* Detach the calling thread from its heap WITHOUT tearing the heap down:
+ * the heap stays registered with its pools intact and is handed to the next
+ * thread that calls ray_heap_init().
+ *
+ * This is what a thread that exits must use.  A cross-thread free resolves
+ * the owning heap through ray_heap_registry and pushes the block onto it
+ * without taking a lock — that lookup is only sound while every registered
+ * heap outlives the blocks it owns, so a thread may never unregister and
+ * munmap a heap that another thread might still be freeing into.
+ * ray_heap_destroy remains the real teardown, for process shutdown. */
+void     ray_heap_abandon(void);
 void     ray_heap_merge(ray_heap_t* src);
 void     ray_heap_flush_foreign(void);
 void     ray_heap_push_pending(ray_heap_t* heap);
@@ -469,7 +480,13 @@ typedef struct {
 typedef struct ray_heap {
     uint64_t        avail;                       /* bitmask: bit N set = freelist[N] non-empty */
     uint16_t        id;                          /* heap identity (for cross-thread free) */
-    ray_t*           foreign;                     /* cross-heap freed blocks (lock-free LIFO via fl_next) */
+    /* Blocks of THIS heap freed by another thread, waiting to be taken back.
+     * A cross-thread free pushes onto the OWNER's list (CAS), and the owner
+     * drains it with one atomic_exchange on its allocation slow path — so a
+     * block always returns to the heap that has to reuse it, with no
+     * collector in the loop.  Atomic because any thread may push while the
+     * owner drains. */
+    _Atomic(ray_t*)  foreign;
     ray_slab_t       slabs[RAY_SLAB_ORDERS];       /* small-block slab caches */
     uint32_t        slab_cap[RAY_SLAB_ORDERS];   /* runtime push cap per slab order (byte-budgeted) */
     ray_fl_head_t    freelist[RAY_HEAP_FL_SIZE];   /* circular sentinel per order */
@@ -478,6 +495,7 @@ typedef struct ray_heap {
     uint32_t        last_pool_idx;               /* MRU pool index for warm-first ray_free */
     ray_pool_entry_t pools[RAY_MAX_POOLS];         /* pool tracking for destroy/merge */
     struct ray_heap* pending_next;                /* link for pending-merge LIFO queue */
+    struct ray_heap* idle_next;                   /* link for the abandoned-heap LIFO */
     char            swap_path[256];              /* dir for file-backed pool fallback (RAY_HEAP_SWAP env, default "./") */
 } ray_heap_t;
 

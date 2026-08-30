@@ -1375,7 +1375,8 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
         /* Free per-partition buffers allocated by worker threads.
          * Safe: ray_pool_dispatch_n has completed (workers are back on semaphore),
          * ray_parallel_flag is 0, and ray_free handles cross-heap deallocation
-         * via the foreign-block list flushed by ray_heap_gc at ray_parallel_end. */
+         * by handing each block to the worker heap that owns it, which takes
+         * it back on its own next allocation — no collector call involved. */
         for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
             if (pp_l_hdr[rp2]) scratch_free(pp_l_hdr[rp2]);
             if (pp_r_hdr[rp2]) scratch_free(pp_r_hdr[rp2]);
