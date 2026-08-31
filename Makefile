@@ -48,7 +48,8 @@ UNAME_S := $(shell uname -s)
 RAY_MARCH ?= native
 
 DEBUG_CFLAGS   = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=$(RAY_MARCH) -DDEBUG \
-  -fsanitize=address,undefined -fno-omit-frame-pointer
+  -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+  -fno-omit-frame-pointer
 RELEASE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) \
   -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
   -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math
