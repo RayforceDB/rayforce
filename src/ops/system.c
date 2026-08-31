@@ -1438,8 +1438,16 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     if (part_lens[1] >= sizeof(port_str)) return ray_error("domain", ".ipc.open port field too long, got %lld bytes", (long long)part_lens[1]);
     memcpy(port_str, parts[1], part_lens[1]);
     port_str[part_lens[1]] = '\0';
-    int port = atoi(port_str);
-    if (port <= 0 || port > 65535) return ray_error("domain", ".ipc.open port must be in 1..65535, got %d", port);
+    /* Strict parse: atoi("1abc") returns 1, silently accepting a malformed
+     * port with a numeric prefix.  Require the whole field to be digits. */
+    char* endp;
+    errno = 0;
+    long port_l = strtol(port_str, &endp, 10);
+    if (endp == port_str || *endp != '\0')
+        return ray_error("domain", ".ipc.open port must be numeric 1..65535, got \"%s\"", port_str);
+    if (errno == ERANGE || port_l <= 0 || port_l > 65535)
+        return ray_error("domain", ".ipc.open port must be in 1..65535, got \"%s\"", port_str);
+    int port = (int)port_l;
 
     char user[128] = "";
     char password[128] = "";

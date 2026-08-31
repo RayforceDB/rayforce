@@ -28,3 +28,14 @@
 ;; Both the value bits AND the null mask must survive serialize/deser.
 (count (de (ser [1 0N 3]))) -- 3
 (sum (de (ser [1 0N 3])))   -- 4
+
+;; ────────────── table frame: schema/column count must match ──────────────
+;; The table decoder loops over min(cols->len, schema->len), so a crafted frame
+;; whose schema names and columns disagree would be silently accepted as a
+;; truncated table.  Splice a 2-name i64 schema with a 1-column list into one
+;; table payload ([0x62 attrs] + ser(schema) + ser(cols), each self-consistent)
+;; and confirm it is rejected rather than decoded as a 1-column table.
+(set _s74p (concat (concat (as 'U8 [0x62 0x00]) (drop (ser (as 'I64 [7 7])) 16)) (drop (ser (list (as 'I64 [1]))) 16)))
+(set _s74h (take (ser 0) 16))
+(set _s74f (concat (concat (concat (take _s74h 8) (as 'U8 (enlist (count _s74p)))) (drop _s74h 9)) _s74p))
+(de _s74f) !- domain
