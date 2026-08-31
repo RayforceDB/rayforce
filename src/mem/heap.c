@@ -776,6 +776,16 @@ static void heap_drain_foreign(ray_heap_t* h) {
             if (!phdr) { blk = next; continue; }
             pb = (uintptr_t)phdr;
             po = phdr->pool_order;
+            /* Adopted from a heap that left the registry while its pools
+             * were still mapped (ray_heap_push_pending).  We never charged
+             * the allocation, so there is nothing to take off our books —
+             * unlike the merge-overflow case above, where the header was
+             * rewritten to name us. */
+            if (phdr->heap_id != h->id) {
+                heap_coalesce(h, blk, pb, po);
+                blk = next;
+                continue;
+            }
         }
         RAY_STAT(h->stats.bytes_allocated -= BSIZEOF(blk->order));
         heap_coalesce(h, blk, pb, po);
@@ -1770,9 +1780,14 @@ void ray_free(ray_t* v) {
     if (RAY_UNLIKELY(!phdr)) return;      /* not inside any live pool */
     uint16_t owner_id = phdr->heap_id;
     ray_heap_t* owner = ray_heap_registry[owner_id % RAY_HEAP_REGISTRY_SIZE];
-    /* Owner torn down: its pools went with it, so there is nothing to
-     * return the block to (and nothing to leak — the mapping is gone). */
-    if (RAY_UNLIKELY(!owner || owner->id != owner_id)) return;
+    /* Not in the registry.  Either the owner was destroyed — its pools went
+     * with it and the mapping is gone — or it is merely waiting to be merged
+     * (ray_heap_push_pending unregisters first, while the pools stay mapped).
+     * The two are indistinguishable from here, so keep the block on our own
+     * list: the drain coalesces it against its own pool header and adopts it.
+     * Dropping it instead would strand the block and pin its pool against
+     * reclamation for the life of the process. */
+    if (RAY_UNLIKELY(!owner || owner->id != owner_id)) owner = h;
 
     dfd_add(v);
     ray_t* head = atomic_load_explicit(&owner->foreign, memory_order_relaxed);
@@ -2641,6 +2656,11 @@ void ray_heap_merge(ray_heap_t* src) {
             pb = (uintptr_t)phdr;
             po = phdr->pool_order;
         }
+        /* dst inherited src's bytes_allocated above, and these blocks are
+         * still charged in it — they were freed to their owner but never
+         * drained.  Coalescing them without this leaves the charge standing
+         * for good, so .sys.mem drifts up by every merged pending block. */
+        RAY_STAT(dst->stats.bytes_allocated -= BSIZEOF(fblk->order));
         heap_coalesce(dst, fblk, pb, po);
         fblk = next;
     }

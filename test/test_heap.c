@@ -1370,13 +1370,17 @@ static test_result_t test_free_owner_unregistered(void) {
     uint16_t bid = heap_b->id;
     ray_heap_registry[bid % RAY_HEAP_REGISTRY_SIZE] = NULL;
 
-    /* Free blk from heap_a: the owner lookup on phdr->heap_id == bid finds
-     * nothing, so the block is dropped. */
+    /* Free blk from heap_a.  The owner lookup on phdr->heap_id == bid finds
+     * nothing, and an unregistered heap is indistinguishable from one merely
+     * waiting to be merged — whose pools are still mapped.  So the block is
+     * kept on the freeing heap's own list rather than dropped: dropping it
+     * would strand it and pin its pool against reclamation for good. */
     ray_tl_heap = heap_a;
     ray_free(blk);
-    TEST_ASSERT_NULL(atomic_load(&heap_a->foreign));
+    TEST_ASSERT_NOT_NULL(atomic_load(&heap_a->foreign));
     TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
 
+    /* The drain adopts it against its own pool header. */
     ray_heap_gc();
     TEST_ASSERT_NULL(atomic_load(&heap_a->foreign));
 
