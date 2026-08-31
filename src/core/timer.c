@@ -167,14 +167,16 @@ int64_t ray_timers_next_deadline_ms(ray_timers_t* t) {
     return t->heap[0]->exp_ms;
 }
 
-void ray_timers_fire_expired(ray_timers_t* t) {
-    if (!t || t->n == 0) return;
+uint32_t ray_timers_fire_expired(ray_timers_t* t) {
+    if (!t || t->n == 0) return 0;
 
     int64_t now = ray_time_now_ms();
+    uint32_t fired = 0;
 
     while (t->n > 0 && t->heap[0]->exp_ms <= now) {
         /* Pop the head: swap with tail, sift down. */
         ray_timer_t* timer = t->heap[0];
+        fired++;
         t->n--;
         if (t->n > 0) {
             t->heap[0] = t->heap[t->n];
@@ -225,6 +227,7 @@ void ray_timers_fire_expired(ray_timers_t* t) {
         /* Refresh `now` in case callbacks took meaningful time. */
         now = ray_time_now_ms();
     }
+    return fired;
 }
 
 void ray_timers_pump_for(ray_timers_t* t, int64_t budget_ms) {

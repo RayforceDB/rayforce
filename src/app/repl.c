@@ -874,6 +874,15 @@ static void eval_and_print(ray_term_t* term, const char* input,
 
     if (profiling) profile_print(use_color);
     ray_heap_gc();
+    /* Statement boundary.  Check BEFORE stamping: the clock still holds the
+     * end of the previous statement, so what we measure is the gap between
+     * statements — the time the process actually sat idle.  Stamping first
+     * would measure this statement's own duration instead, and a loop of
+     * statements longer than the threshold would then sweep after every one
+     * of them, discarding the working set the next is about to fault back
+     * in. */
+    ray_heap_decay();
+    ray_heap_note_activity();
 }
 
 /* `type_label` and `cmd_match` were inlined into the previous bespoke
@@ -1389,6 +1398,15 @@ int ray_repl_run_file(const char* path) {
 
     /* profile tree goes to stdout via profile_print; honour stdout's tty. */
     if (profiling) profile_print(color_out);
+    /* A whole file is one unit of work, and unlike the REPL there is no
+     * decay check after it — so stamp at the END, not the start.  A script
+     * that exits has nothing to give back; a script that starts a server
+     * and hands over to the poll loop leaves its load-time temporaries
+     * resident, and this is what lets the loop notice them.  Stamping at
+     * the start would instead arm a check that the script's own (.sys.gc)
+     * calls would service mid-run, which is the one thing the threshold
+     * exists to avoid. */
+    ray_heap_note_activity();
     ray_heap_gc();
     return rc;
 }

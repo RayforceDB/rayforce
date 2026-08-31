@@ -41,11 +41,17 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+
+/* Restore the shipped policy after a test drives it. */
+#define RAY_HEAP_DECAY_MS_TEST_DEFAULT 10000
 #include "ops/ops.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -362,6 +368,122 @@ static test_result_t test_release_pages(void) {
     PASS();
 }
 
+/* ---- Idle decay --------------------------------------------------------- *
+ *
+ * ray_heap_gc AGES a free block before releasing its pages: a block that was
+ * just freed keeps its footprint, which is what stops a repeated query from
+ * refaulting its own temporaries between iterations.  The decay is the other
+ * half of that policy — once the process has been quiet for longer than
+ * threshold to zero, the same pages go back to the OS un-aged.
+ *
+ * Both halves are asserted here, on the same block, in the same test: one
+ * collector pass must NOT release it, and the decay immediately after must.
+ * The released-block count is asserted too, so the test cannot pass by
+ * sweeping nothing. */
+
+/* Resident set in KB, or 0 where /proc is unavailable. */
+static size_t heap_rss_kb(void) {
+#if defined(__linux__)
+    int fd = open("/proc/self/statm", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    const char* p = buf;
+    while (*p && *p != ' ') p++;          /* field 1 is total size */
+    unsigned long long pages = strtoull(p, NULL, 10);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    if (pgsz <= 0) return 0;
+    return (size_t)((pages * (unsigned long long)pgsz) / 1024);
+#else
+    return 0;
+#endif
+}
+
+static test_result_t test_idle_decay_releases_pages(void) {
+    /* Threshold 0 means "release at the first maintenance point after any
+     * work", so the test asserts the mechanism without sleeping on a clock. */
+    ray_heap_set_decay_ms(0);
+
+    /* Order 24: comfortably above the order-13 sweep floor, and below
+     * RAY_HEAP_POOL_ORDER so it is a buddy block rather than a direct
+     * mapping that munmaps itself on free. */
+    const size_t big = (16u << 20) - 4096;
+    ray_t* v = ray_alloc(big);
+    if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
+    memset(ray_data(v), 0xA5, big);          /* fault every page in */
+
+    size_t rss_live = heap_rss_kb();
+    ray_free(v);
+
+    /* One collector pass can only age a freshly inserted block (attrs 0 -> 1),
+     * never release it. */
+    ray_heap_gc();
+    size_t rss_gc = heap_rss_kb();
+
+    ray_heap_note_activity();
+    int64_t released = ray_heap_decay();
+    size_t rss_decay = heap_rss_kb();
+
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
+
+    TEST_ASSERT(released >= 1, "the decay sweep released at least one block");
+    if (rss_live > 0) {
+        size_t half = (big / 1024) / 2;
+        TEST_ASSERT(rss_gc + half > rss_live,
+                    "collector alone keeps the freed block resident");
+        TEST_ASSERT(rss_decay + half < rss_live,
+                    "decay handed most of the freed block back");
+    }
+
+    /* Disarmed: the sweep is triggered by work going quiet, not by asking. */
+    TEST_ASSERT(ray_heap_decay() < 0, "a second decay with no work does nothing");
+
+    /* Released pages refault: the address space is untouched. */
+    ray_t* w = ray_alloc(big);
+    TEST_ASSERT_NOT_NULL(w);
+    memset(ray_data(w), 0x5A, big);
+    ray_free(w);
+    PASS();
+}
+
+/* A decay that is not due must not sweep, however much free memory is
+ * lying around — that is the entire defence against releasing the pages a
+ * hot loop is about to reuse. */
+static test_result_t test_idle_decay_respects_threshold(void) {
+    ray_heap_set_decay_ms(600000);
+
+    const size_t big = (16u << 20) - 4096;
+    ray_t* v = ray_alloc(big);
+    if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
+    memset(ray_data(v), 0xA5, big);
+    ray_free(v);
+
+    ray_heap_note_activity();
+    int64_t due = ray_heap_decay_due_ms();
+    int64_t released = ray_heap_decay();
+
+    /* Negative threshold disables the decay outright. */
+    ray_heap_set_decay_ms(-1);
+    int64_t due_off = ray_heap_decay_due_ms();
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
+
+    TEST_ASSERT(due > 0, "a sweep is pending but not yet due");
+    TEST_ASSERT(released < 0, "nothing is swept before the threshold elapses");
+    TEST_ASSERT(due_off < 0, "a negative threshold disables the decay");
+
+    /* Proof the block really was sweepable, i.e. the assertions above were
+     * not vacuous: with the threshold at 0 the same block goes. */
+    ray_heap_set_decay_ms(0);
+    ray_heap_note_activity();
+    int64_t swept = ray_heap_decay();
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
+    TEST_ASSERT(swept >= 1, "the same block is released once the threshold is 0");
+    PASS();
+}
+
 /* ---- ray_heap_gc oversized-pool reclamation ---------------------------- *
  *
  * Allocate a block large enough to force a pool > 32 MB (pool_order >
@@ -409,8 +531,8 @@ static test_result_t test_gc_reclaim_oversized_pool(void) {
 
 static test_result_t test_heap_gc_serial(void) {
     /* Build up some freelist activity, then call gc.  No oversized pools
-     * are involved; gc should still run flush_foreign + flush_slabs +
-     * return_foreign_freelist without crashing. */
+     * are involved; gc should still run its foreign drain + slab flush
+     * without crashing. */
     ray_t* xs[64];
     for (int i = 0; i < 64; i++) {
         xs[i] = ray_alloc(256 + i * 8);
@@ -428,13 +550,12 @@ static test_result_t test_heap_gc_serial(void) {
     PASS();
 }
 
-/* ---- ray_heap_gc parallel path (foreign-flush no-op) ------------------- */
+/* ---- ray_heap_gc parallel path ---------------------------------------- */
 
 static test_result_t test_heap_gc_parallel(void) {
-    /* When ray_parallel_flag != 0, heap_flush_foreign(false) is a no-op
-     * and gc must NOT touch worker heaps' state.  We only need to
-     * verify that calling gc with the flag set doesn't crash and the
-     * heap remains consistent. */
+    /* When ray_parallel_flag != 0, gc must NOT touch worker heaps' state.
+     * We only need to verify that calling gc with the flag set doesn't
+     * crash and the heap remains consistent. */
     ray_t* a = ray_alloc(128);
     TEST_ASSERT_NOT_NULL(a);
 
@@ -448,38 +569,146 @@ static test_result_t test_heap_gc_parallel(void) {
     PASS();
 }
 
-/* ---- ray_heap_flush_foreign while parallel (no-op early return) -------- */
+/* ---- Cross-thread free lands on the OWNER's list ------------------------
+ *
+ * A block freed by a thread that does not own it goes onto the OWNING heap's
+ * list, never the freeing heap's.  That is the whole point: the owner is the
+ * only heap that can reuse the memory, and it picks the block up on its own
+ * allocation path — nothing has to call a collector.  Memory parked on the
+ * freeing heap was what let a served query grow a server without bound
+ * (issue #439). */
 
-static test_result_t test_flush_foreign_during_parallel(void) {
-    /* While ray_parallel_flag is set, ray_heap_flush_foreign() must not
-     * touch h->foreign — proves the early return path. */
+static test_result_t test_free_routes_to_owner_list(void) {
     ray_heap_t* heap_a = ray_tl_heap;
 
-    /* Build heap_b and free a block from it on heap_a so heap_a->foreign
-     * is non-empty. */
     ray_tl_heap = NULL;
     ray_heap_init();
     ray_heap_t* heap_b = ray_tl_heap;
     TEST_ASSERT_NOT_NULL(heap_b);
+    TEST_ASSERT(heap_b != heap_a, "distinct heaps");
     ray_t* blk = ray_alloc(0);
     TEST_ASSERT_NOT_NULL(blk);
 
     ray_tl_heap = heap_a;
-    ray_free(blk);  /* cross-thread free: enqueues onto heap_a->foreign */
-    /* Foreign-list model: the cross-thread free sits on the freeing heap. */
-    TEST_ASSERT_NOT_NULL(heap_a->foreign);
+    ray_free(blk);
+    TEST_ASSERT_NULL(atomic_load(&heap_a->foreign));
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
 
+    /* Draining heap_a leaves heap_b's list alone — and needs no idle-worker
+     * gate any more, because a heap only ever drains its own blocks. */
     ray_parallel_begin();
     ray_heap_flush_foreign();
-    /* Foreign list should still be intact (not flushed). */
-    TEST_ASSERT_NOT_NULL(heap_a->foreign);
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
     ray_parallel_end();
-    /* parallel_end -> ray_heap_gc which DOES flush foreign now safe.  */
-    /* Foreign list should be empty after end. */
-    TEST_ASSERT_NULL(heap_a->foreign);
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
 
+    /* The owner takes it back. */
     ray_tl_heap = heap_b;
+    ray_heap_flush_foreign();
+    TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
+
     ray_heap_destroy();
+    ray_tl_heap = heap_a;
+    PASS();
+}
+
+/* ---- A cross-thread free cycle must not grow the owner's pools ----------
+ *
+ * The regression for issue #439.  Workers allocate per-group temporaries from
+ * their own heaps and the thread consuming the result frees them; before this
+ * change those blocks stayed on the consumer and only an explicit
+ * ray_heap_gc() ever moved them, so the owner started every round short by
+ * the volume the consumer was holding and mapped a fresh 32 MB pool to make
+ * up the difference — once per execution, until RAY_MAX_POOLS turned it into
+ * an OOM.  Cycle far more bytes through the owner than one pool holds,
+ * always freeing from the other heap and never calling a collector: the
+ * owner's pool count must not move. */
+
+static test_result_t test_cross_heap_cycle_bounds_pools(void) {
+    enum { WARMUP = 32, ROUNDS = 128, BLOCK = 1u << 20 };  /* 1 MB blocks */
+    ray_heap_t* heap_a = ray_tl_heap;
+
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    ray_heap_t* heap_b = ray_tl_heap;
+    TEST_ASSERT_NOT_NULL(heap_b);
+
+    /* Warm-up: let heap_b map whatever pools its steady state needs. */
+    for (int i = 0; i < WARMUP; i++) {
+        ray_tl_heap = heap_b;
+        ray_t* v = ray_alloc(BLOCK);
+        TEST_ASSERT_NOT_NULL(v);
+        ray_tl_heap = heap_a;
+        ray_free(v);
+    }
+    ray_tl_heap = heap_b;
+    uint32_t pools_before = heap_b->pool_count;
+    TEST_ASSERT((pools_before) > (0), "heap_b mapped a pool");
+
+    /* 128 MB more through a heap whose pools are 32 MB. */
+    bool saw_queued = false;
+    for (int i = 0; i < ROUNDS; i++) {
+        ray_tl_heap = heap_b;
+        ray_t* v = ray_alloc(BLOCK);
+        TEST_ASSERT_NOT_NULL(v);
+        ray_tl_heap = heap_a;
+        ray_free(v);
+        if (atomic_load(&heap_b->foreign) != NULL) saw_queued = true;
+    }
+    ray_tl_heap = heap_b;
+
+    /* Guards the assertion below against passing vacuously: if the frees had
+     * never reached heap_b's list there would be nothing for it to take back
+     * and no reuse to prove. */
+    TEST_ASSERT(saw_queued, "frees reached the owner's list");
+    TEST_ASSERT_EQ_U(heap_b->pool_count, pools_before);
+    TEST_ASSERT_NULL(atomic_load(&heap_a->foreign));
+
+    ray_heap_destroy();
+    ray_tl_heap = heap_a;
+    PASS();
+}
+
+/* ---- A thread's heap outlives the thread -------------------------------
+ *
+ * ray_free resolves the owning heap through ray_heap_registry and pushes the
+ * block onto it WITHOUT a lock.  That is only sound while a registered heap
+ * outlives every block it owns, so a thread that exits abandons its heap —
+ * still registered, pools intact — instead of unregistering and munmapping
+ * it underneath a lookup already in flight.  The next thread up adopts it. */
+
+static test_result_t test_heap_abandon_is_adopted(void) {
+    ray_heap_t* heap_a = ray_tl_heap;
+
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    ray_heap_t* heap_b = ray_tl_heap;
+    TEST_ASSERT_NOT_NULL(heap_b);
+    ray_t* blk = ray_alloc(4096);
+    TEST_ASSERT_NOT_NULL(blk);
+    uint16_t   bid    = heap_b->id;
+    uint32_t   bpools = heap_b->pool_count;
+    TEST_ASSERT((bpools) > (0), "heap_b mapped a pool");
+
+    ray_heap_abandon();
+    TEST_ASSERT_NULL(ray_tl_heap);
+    TEST_ASSERT_EQ_U((uintptr_t)ray_heap_registry[bid % RAY_HEAP_REGISTRY_SIZE],
+                     (uintptr_t)heap_b);
+    /* The pool is still mapped and still names heap_b as its owner. */
+    TEST_ASSERT_EQ_U(ray_pool_of(blk)->heap_id, bid);
+
+    /* A block of the abandoned heap, freed from elsewhere, still finds it. */
+    ray_tl_heap = heap_a;
+    ray_free(blk);
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
+
+    /* The next thread adopts it rather than mapping a new one. */
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    TEST_ASSERT_EQ_U((uintptr_t)ray_tl_heap, (uintptr_t)heap_b);
+    TEST_ASSERT_EQ_U(ray_tl_heap->pool_count, bpools);
+
+    ray_heap_destroy();   /* real teardown — no thread owns heap_b now */
     ray_tl_heap = heap_a;
     PASS();
 }
@@ -779,14 +1008,14 @@ static test_result_t test_merge_with_slabs_and_freelist(void) {
     uint32_t heap_b_pools = heap_b->pool_count;
     TEST_ASSERT((heap_b_pools) > (0), "heap_b_pools > 0");
 
-    /* Drive a foreign block into heap_b->foreign by allocating on
-     * heap_a and freeing while heap_b is current. */
-    ray_tl_heap = heap_a;
+    /* Drive a block onto heap_b->foreign: allocate it on heap_b and free it
+     * while heap_a is current — a cross-thread free goes to the owner. */
+    ray_tl_heap = heap_b;
     ray_t* fblk = ray_alloc(0);
     TEST_ASSERT_NOT_NULL(fblk);
-    ray_tl_heap = heap_b;
-    ray_free(fblk);  /* heap_b->foreign now contains fblk (foreign-list model) */
-    TEST_ASSERT_NOT_NULL(heap_b->foreign);
+    ray_tl_heap = heap_a;
+    ray_free(fblk);
+    TEST_ASSERT_NOT_NULL(atomic_load(&heap_b->foreign));
 
     /* Capture pool count AFTER any allocs heap_a has performed for fblk —
      * lazy heap_add_pool may have grown the count. */
@@ -1153,21 +1382,20 @@ static test_result_t test_release_lambda_owned_refs(void) {
     PASS();
 }
 
-/* ---- heap_flush_foreign "owner gone" branch -------------------------------
+/* ---- Cross-thread free with the owner unregistered ------------------------
  *
- * Allocate on heap_b, then destroy heap_b (unregisters it).  Free the
- * block while on heap_a — it lands in heap_a->foreign with a pool header
- * whose heap_id no longer maps to a live heap.  Calling ray_heap_gc() with
- * return_to_owner=true triggers heap_flush_foreign which hits the "owner
- * gone" else-branch and coalesces the block locally onto heap_a.
+ * If the owning heap is not in the registry its pools went with it, so there
+ * is nowhere to hand the block back to.  The free must drop it — and in
+ * particular must NOT park it on the freeing heap, which cannot reuse
+ * another heap's memory and would only be accumulating it.
  *
  * NOTE: heap_b must NOT be destroyed via ray_heap_destroy (that munmaps its
  * pools).  Instead we manually unregister it from the global registry so
- * its pool remains mapped (and addressable) while the foreign-block walk
- * proceeds.  We then push_pending the hollow heap_b to let drain_pending
- * transfer ownership properly and avoid leaking address space. */
+ * its pool remains mapped (and the block addressable) for the assertions.
+ * We then push_pending the hollow heap_b to let drain_pending transfer
+ * ownership properly and avoid leaking address space. */
 
-static test_result_t test_flush_foreign_owner_gone(void) {
+static test_result_t test_free_owner_unregistered(void) {
     ray_heap_t* heap_a = ray_tl_heap;
     TEST_ASSERT_NOT_NULL(heap_a);
 
@@ -1181,21 +1409,23 @@ static test_result_t test_flush_foreign_owner_gone(void) {
     TEST_ASSERT_NOT_NULL(blk);
 
     /* Unregister heap_b from the global registry so it looks "gone"
-     * without munmapping its pool (the pool must stay valid for the
-     * owner-lookup walk). */
+     * without munmapping its pool. */
     uint16_t bid = heap_b->id;
     ray_heap_registry[bid % RAY_HEAP_REGISTRY_SIZE] = NULL;
 
-    /* Switch to heap_a and free blk — it goes onto heap_a->foreign because
-     * phdr->heap_id == bid which != heap_a->id. */
+    /* Free blk from heap_a.  The owner lookup on phdr->heap_id == bid finds
+     * nothing, and an unregistered heap is indistinguishable from one merely
+     * waiting to be merged — whose pools are still mapped.  So the block is
+     * kept on the freeing heap's own list rather than dropped: dropping it
+     * would strand it and pin its pool against reclamation for good. */
     ray_tl_heap = heap_a;
     ray_free(blk);
-    TEST_ASSERT_NOT_NULL(heap_a->foreign);
+    TEST_ASSERT_NOT_NULL(atomic_load(&heap_a->foreign));
+    TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
 
-    /* GC with safe=true triggers heap_flush_foreign(h, true).
-     * Owner lookup returns NULL → "owner gone" else-branch. */
+    /* The drain adopts it against its own pool header. */
     ray_heap_gc();
-    TEST_ASSERT_NULL(heap_a->foreign);
+    TEST_ASSERT_NULL(atomic_load(&heap_a->foreign));
 
     /* Re-register heap_b and clean up via push_pending/drain_pending so
      * its pools are properly transferred and no address space leaks. */
@@ -1264,30 +1494,15 @@ static test_result_t test_merge_slab_overflow(void) {
     PASS();
 }
 
-/* ---- heap_return_foreign_freelist path ------------------------------------
+/* ---- GC over a heap that absorbed another one's pools ---------------------
  *
- * After ray_heap_merge, heap_a owns all of heap_b's pools.  But the pool
- * table of heap_b (now freed) tracked those pools.  Allocating on the merged
- * heap and freeing on a third heap inserts blocks with heap_b's (now
- * heap_a's) heap_id into heap_c's freelists.  GC on heap_c then calls
- * heap_return_foreign_freelist which returns those blocks to heap_a.
- *
- * Simpler route that does NOT require a 3rd heap: after merging heap_b into
- * heap_a, coalesce puts blocks back on heap_a's freelist — those blocks'
- * pool_order matches heap_a's pools.  heap_return_foreign_freelist walks
- * heap_a's freelists; blocks that ARE in heap_a's pool table are local
- * (pidx >= 0) and the inner if(pidx < 0) branch is skipped.  To reach
- * pidx < 0 we need a freelist entry whose pool is not in pool[].
- *
- * Pragmatic approach: add enough blocks to freelist and call GC; even if
- * the foreign-freelist inner body isn't hit, we still cover the outer loop
- * and the pidx >= 0 early-continue path (which currently has 0 coverage). */
+ * ray_heap_merge splices src's freelists into dst and transfers its pool
+ * entries.  Run GC on the merged heap: every pass has to cope with freelist
+ * entries whose pool arrived from somewhere else, and with the pool table
+ * having grown underneath the avail bitmap. */
 
-static test_result_t test_gc_return_foreign_freelist(void) {
-    /* Build heap_b, populate it, merge into heap_a, then run GC.
-     * heap_return_foreign_freelist walks freelists of heap_a and checks
-     * ownership of each block.  At minimum, the outer for loop and the
-     * heap_find_pool call are covered. */
+static test_result_t test_gc_after_merge(void) {
+    /* Build heap_b, populate it, merge into heap_a, then run GC. */
     ray_heap_t* heap_a = ray_tl_heap;
 
     ray_tl_heap = NULL;
@@ -1551,10 +1766,12 @@ static test_result_t test_merge_foreign_pool_fallback(void) {
     TEST_ASSERT_NOT_NULL(cblk);
 
     /* Manually enqueue cblk onto heap_b->foreign.
-     * heap_b doesn't own any of heap_c's pools. */
+     * heap_b doesn't own any of heap_c's pools — a real cross-thread free
+     * would route the block to heap_c, so this shape has to be built by
+     * hand to reach the merge fallback. */
     ray_tl_heap = heap_b;
-    cblk->fl_next  = heap_b->foreign;
-    heap_b->foreign = cblk;
+    cblk->fl_next = NULL;
+    atomic_store(&heap_b->foreign, cblk);
 
     /* Now merge heap_b into heap_a.  heap_a also doesn't know about
      * heap_c's pool, so heap_find_pool(heap_a, cblk) returns -1 → phdr. */
@@ -2469,7 +2686,9 @@ const test_entry_t heap_entries[] = {
     { "heap/gc_reclaim_oversized",     test_gc_reclaim_oversized_pool,   heap_setup, heap_teardown },
     { "heap/gc_serial",                test_heap_gc_serial,              heap_setup, heap_teardown },
     { "heap/gc_parallel",              test_heap_gc_parallel,            heap_setup, heap_teardown },
-    { "heap/flush_foreign_parallel",   test_flush_foreign_during_parallel, heap_setup, heap_teardown },
+    { "heap/free_routes_to_owner",     test_free_routes_to_owner_list,   heap_setup, heap_teardown },
+    { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
+    { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
     { "heap/str_pool_owned_ref",       test_str_pool_owned_ref,          heap_setup, heap_teardown },
     { "heap/sentinel_null_release",    test_sentinel_null_release,       heap_setup, heap_teardown },
@@ -2489,9 +2708,9 @@ const test_entry_t heap_entries[] = {
     { "heap/scratch_realloc_mapcommon",test_scratch_realloc_mapcommon,   heap_setup, heap_teardown },
     { "heap/alloc_copy_dict",          test_alloc_copy_dict_block,       heap_setup, heap_teardown },
     { "heap/release_lambda_owned_refs", test_release_lambda_owned_refs,   heap_setup, heap_teardown },
-    { "heap/flush_foreign_owner_gone", test_flush_foreign_owner_gone,    heap_setup, heap_teardown },
+    { "heap/free_owner_unregistered",  test_free_owner_unregistered,     heap_setup, heap_teardown },
     { "heap/merge_slab_overflow",      test_merge_slab_overflow,         heap_setup, heap_teardown },
-    { "heap/gc_return_foreign_fl",     test_gc_return_foreign_freelist,  heap_setup, heap_teardown },
+    { "heap/gc_after_merge",           test_gc_after_merge,              heap_setup, heap_teardown },
     { "heap/free_mmod1_atom",          test_free_mmod1_atom,             heap_setup, heap_teardown },
     { "heap/order_for_size_pow2",      test_order_for_size_pow2,         heap_setup, heap_teardown },
     { "heap/scratch_realloc_slice",    test_scratch_realloc_slice,       heap_setup, heap_teardown },
@@ -2527,5 +2746,7 @@ const test_entry_t heap_entries[] = {
     { "heap/retain_atom_obj",          test_retain_owned_refs_atom_obj,  heap_setup, heap_teardown },
     { "heap/scratch_realloc_lazy",     test_scratch_realloc_lazy_handle, heap_setup, heap_teardown },
     { "heap/scratch_realloc_has_index", test_scratch_realloc_has_index_detach, heap_setup, heap_teardown },
+    { "heap/idle_decay_releases",      test_idle_decay_releases_pages,   heap_setup, heap_teardown },
+    { "heap/idle_decay_threshold",     test_idle_decay_respects_threshold, heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };

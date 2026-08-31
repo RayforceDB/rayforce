@@ -78,7 +78,8 @@ static void worker_loop(void* arg) {
 
     ray_pool_t* pool = wctx.pool;
 
-    /* Each worker thread gets its own heap */
+    /* Each worker thread gets its own heap — a fresh one, or one abandoned
+     * by an earlier worker (pools and slab caches intact). */
     ray_heap_init();
     ray_rc_sync = true;  /* workers always use atomic refcounting */
 
@@ -113,7 +114,13 @@ static void worker_loop(void* arg) {
          * Eager madvise in heap_coalesce already releases pages on free. */
     }
 
-    ray_heap_destroy();
+    /* Abandon, do not destroy.  Another thread may still hold — and later
+     * free — a block that came out of this heap, and the cross-thread free
+     * path resolves the owning heap through the registry without a lock, so
+     * a heap that could be unregistered and munmapped underneath that lookup
+     * would be a use-after-free.  The heap stays registered with its pools
+     * and is adopted by the next worker thread that starts. */
+    ray_heap_abandon();
 }
 
 /* --------------------------------------------------------------------------
