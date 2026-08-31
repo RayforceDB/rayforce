@@ -920,6 +920,11 @@ static bool handle_command(ray_repl_t* repl, const char* str, size_t len) {
         ray_release(result);
     }
 
+    /* A piped REPL uses block-buffered stdout.  Every command response is
+     * complete at this boundary, including output printed by handlers and
+     * errors printed above, so make it visible before waiting for more input. */
+    fflush(stdout);
+
     /* Track timeit echoing so the prompt reflects current state. */
     repl->timeit = g_ray_profile.active;
     return true;
