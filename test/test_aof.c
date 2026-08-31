@@ -82,7 +82,7 @@ static bool collect_cb(int64_t lsn, const void* payload, int64_t len, void* ctx)
         c->lsns[c->n] = lsn;
         c->lens[c->n] = len;
         size_t cp = len < 31 ? (size_t)len : 31;
-        memcpy(c->payloads[c->n], payload, cp);
+        if (cp) memcpy(c->payloads[c->n], payload, cp);
         c->payloads[c->n][cp] = '\0';
     }
     c->n++;
