@@ -2500,6 +2500,7 @@ void ray_heap_release_pages(void) {
  * -------------------------------------------------------------------------- */
 
 #define RAY_HEAP_DECAY_MS_DEFAULT   10000
+#define RAY_HEAP_DECAY_MS_MAX       ((int64_t)7 * 24 * 3600 * 1000)
 
 static _Atomic int64_t g_heap_activity_ms;
 static _Atomic bool    g_heap_decay_armed;
@@ -2514,6 +2515,10 @@ static int64_t heap_decay_threshold_ms(void) {
     char* end = NULL;
     long long v = strtoll(e, &end, 10);
     if (end == e) return RAY_HEAP_DECAY_MS_DEFAULT;
+    if (v < 0) return -1;                    /* any negative disables */
+    /* Clamp so `activity + threshold` below cannot overflow.  A week is
+     * already "never" for a decay; larger values are the same thing. */
+    if (v > RAY_HEAP_DECAY_MS_MAX) return RAY_HEAP_DECAY_MS_MAX;
     return (int64_t)v;
 }
 
@@ -2543,9 +2548,6 @@ int64_t ray_heap_decay(void) {
      * can return, so repeating it before work resumes finds nothing. */
     atomic_store_explicit(&g_heap_decay_armed, false, memory_order_relaxed);
 
-    /* Blocks other threads freed to us, and our own slab cache, are not on
-     * a freelist yet and would be invisible to the walk below.  Only the
-     * caller's heap: see the note above on other heaps' lists. */
     int64_t released = 0;
     for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
         ray_heap_t* gh = ray_heap_registry[hid];
