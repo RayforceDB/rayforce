@@ -254,8 +254,9 @@ void ray_heap_release_pages(void);
  *   quiescent; returns the number of blocks released, or -1 if it did
  *   nothing.  Safe to call from any maintenance point.
  *
- * RAY_HEAP_DECAY_MS sets the threshold: negative disables the decay, 0
- * releases at the next maintenance point after any work. */
+ * The threshold is fixed policy, reachable only through
+ * ray_heap_set_decay_ms: negative disables the decay, 0 releases at the
+ * next maintenance point after any work. */
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);

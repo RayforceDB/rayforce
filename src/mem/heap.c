@@ -2490,16 +2490,20 @@ void ray_heap_release_pages(void) {
  * and the event loop between wakeups — compare that stamp against a
  * threshold.  If the process has been quiet longer than the threshold, one
  * un-aged sweep releases the pages of every free block in every heap;
- * otherwise the check is a relaxed load, a getenv and a subtraction.
+ * otherwise the check is a relaxed load and a subtraction.
  *
  * The threshold is the whole point: it is what separates "the workload has
  * stopped" from "we are between two iterations of a hot loop".  Releasing in
  * the second case drops exactly the pages the next iteration refaults, which
  * is why pass 5 ages blocks in the first place.
  *
- * The stamp is taken at the START of a unit of work, never at the end.  A
- * stamp at the end would make the elapsed time at the immediately following
- * boundary check zero, and the boundary check would never fire.
+ * The stamp is taken at the END of a unit of work, and the boundary check
+ * reads the clock BEFORE the new stamp.  What it measures is therefore the
+ * gap between one unit finishing and the next — the time the process
+ * actually sat idle.  Stamping at the start would measure the unit's own
+ * duration instead, so a loop of units longer than the threshold would
+ * sweep after every one of them, discarding the working set the next is
+ * about to fault back in.
  *
  * The sweep works on EVERY registered heap, not just the caller's, and it
  * drains each one's foreign list and slab cache before walking its
@@ -2541,10 +2545,12 @@ static _Atomic bool    g_heap_decay_armed;
  * hot-path constant — it is consulted once per statement and once per event
  * loop wakeup — and caching it would make the value depend on which code
  * path happened to run first in the process. */
-/* Resolved once: the value cannot change after exec, and this is read twice
- * per poll wakeup.  Negative disables the decay; the clamp keeps
- * `activity + threshold` from wrapping, and a week is already "never". */
-static int64_t g_heap_decay_ms = -2;         /* -2 = not yet resolved */
+/* The policy, not a knob: there is no environment override.  Negative
+ * disables the decay; the clamp keeps `activity + threshold` from wrapping,
+ * and a week is already "never".  The setter exists so a test can drive the
+ * policy — an operator-facing override, if one is ever wanted, belongs on an
+ * existing surface rather than here. */
+static int64_t g_heap_decay_ms = RAY_HEAP_DECAY_MS_DEFAULT;
 
 void ray_heap_set_decay_ms(int64_t ms) {
     if (ms > RAY_HEAP_DECAY_MS_MAX) ms = RAY_HEAP_DECAY_MS_MAX;
@@ -2552,16 +2558,6 @@ void ray_heap_set_decay_ms(int64_t ms) {
 }
 
 static int64_t heap_decay_threshold_ms(void) {
-    int64_t v = g_heap_decay_ms;
-    if (RAY_LIKELY(v != -2)) return v;
-    const char* e = getenv("RAY_HEAP_DECAY_MS");
-    v = RAY_HEAP_DECAY_MS_DEFAULT;
-    if (e && *e) {
-        char* end = NULL;
-        long long parsed = strtoll(e, &end, 10);
-        if (end != e) v = (int64_t)parsed;
-    }
-    ray_heap_set_decay_ms(v);
     return g_heap_decay_ms;
 }
 
