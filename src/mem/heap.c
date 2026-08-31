@@ -2509,17 +2509,28 @@ static _Atomic bool    g_heap_decay_armed;
  * hot-path constant — it is consulted once per statement and once per event
  * loop wakeup — and caching it would make the value depend on which code
  * path happened to run first in the process. */
+/* Resolved once: the value cannot change after exec, and this is read twice
+ * per poll wakeup.  Negative disables the decay; the clamp keeps
+ * `activity + threshold` from wrapping, and a week is already "never". */
+static int64_t g_heap_decay_ms = -2;         /* -2 = not yet resolved */
+
+void ray_heap_set_decay_ms(int64_t ms) {
+    if (ms > RAY_HEAP_DECAY_MS_MAX) ms = RAY_HEAP_DECAY_MS_MAX;
+    g_heap_decay_ms = (ms < 0) ? -1 : ms;
+}
+
 static int64_t heap_decay_threshold_ms(void) {
+    int64_t v = g_heap_decay_ms;
+    if (RAY_LIKELY(v != -2)) return v;
     const char* e = getenv("RAY_HEAP_DECAY_MS");
-    if (!e || !*e) return RAY_HEAP_DECAY_MS_DEFAULT;
-    char* end = NULL;
-    long long v = strtoll(e, &end, 10);
-    if (end == e) return RAY_HEAP_DECAY_MS_DEFAULT;
-    if (v < 0) return -1;                    /* any negative disables */
-    /* Clamp so `activity + threshold` below cannot overflow.  A week is
-     * already "never" for a decay; larger values are the same thing. */
-    if (v > RAY_HEAP_DECAY_MS_MAX) return RAY_HEAP_DECAY_MS_MAX;
-    return (int64_t)v;
+    v = RAY_HEAP_DECAY_MS_DEFAULT;
+    if (e && *e) {
+        char* end = NULL;
+        long long parsed = strtoll(e, &end, 10);
+        if (end != e) v = (int64_t)parsed;
+    }
+    ray_heap_set_decay_ms(v);
+    return g_heap_decay_ms;
 }
 
 void ray_heap_note_activity(void) {

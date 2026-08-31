@@ -898,11 +898,6 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     if (!sel->rx.buf || sel->rx.buf->offset < cd->hdr.size)
         return NULL;
 
-    /* A complete request frame is this server's unit of work, and the server
-     * calls no allocator maintenance of its own.  Stamping here is what lets
-     * the poll loop tell an idle server from one between two requests. */
-    ray_heap_note_activity();
-
     /* Detach the payload buffer and advance the state machine to the
      * next header BEFORE dispatching: the eval below may re-enter this
      * connection's rx pump (a hook doing a nested sync round-trip on
@@ -981,6 +976,11 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
             send_response((ray_sock_t)cur->fd, result);
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
+    /* The request is served: this is the end of the server's unit of work,
+     * and stamping here is what lets the poll loop tell an idle server from
+     * one between two requests.  Stamping on frame arrival instead would
+     * make the measured gap the request's own duration. */
+    ray_heap_note_activity();
 
     return NULL;
 }
@@ -1147,6 +1147,11 @@ static void conn_on_payload(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
     if (c->hdr.msgtype == RAY_IPC_MSG_SYNC)
         send_response(c->fd, result);
     if (result != RAY_NULL_OBJ) ray_release(result);
+    /* The request is served: this is the end of the server's unit of work,
+     * and stamping here is what lets the poll loop tell an idle server from
+     * one between two requests.  Stamping on frame arrival instead would
+     * make the measured gap the request's own duration. */
+    ray_heap_note_activity();
 
     ray_sys_free(c->rx_buf);
     c->rx_buf  = NULL;

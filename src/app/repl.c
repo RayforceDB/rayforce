@@ -813,11 +813,6 @@ static void eval_and_print(ray_term_t* term, const char* input,
     ray_qlog_ctx_t qc;
     ray_qlog_begin(&qc);
 
-    /* Stamp the allocator's idle clock at the START of the statement, so
-     * the decay check after it measures how long we were quiet BEFORE this
-     * line rather than how long the line took. */
-    ray_heap_note_activity();
-
     ray_term_clear_interrupt();
     ray_eval_clear_interrupt();
     if (term) ray_term_eval_begin(term);
@@ -879,11 +874,15 @@ static void eval_and_print(ray_term_t* term, const char* input,
 
     if (profiling) profile_print(use_color);
     ray_heap_gc();
-    /* Statement boundary: if the gap before this line already exceeded the
-     * decay threshold, hand the pages back now.  In a loop of short
-     * statements the gap is the statement's own duration and this is a
-     * timestamp comparison that does nothing. */
+    /* Statement boundary.  Check BEFORE stamping: the clock still holds the
+     * end of the previous statement, so what we measure is the gap between
+     * statements — the time the process actually sat idle.  Stamping first
+     * would measure this statement's own duration instead, and a loop of
+     * statements longer than the threshold would then sweep after every one
+     * of them, discarding the working set the next is about to fault back
+     * in. */
     ray_heap_decay();
+    ray_heap_note_activity();
 }
 
 /* `type_label` and `cmd_match` were inlined into the previous bespoke

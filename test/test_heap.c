@@ -41,6 +41,9 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+
+/* Restore the shipped policy after a test drives it. */
+#define RAY_HEAP_DECAY_MS_TEST_DEFAULT 10000
 #include "ops/ops.h"
 #include <string.h>
 #include <stdint.h>
@@ -328,7 +331,7 @@ static test_result_t test_release_pages(void) {
  * just freed keeps its footprint, which is what stops a repeated query from
  * refaulting its own temporaries between iterations.  The decay is the other
  * half of that policy — once the process has been quiet for longer than
- * RAY_HEAP_DECAY_MS, the same pages go back to the OS un-aged.
+ * threshold to zero, the same pages go back to the OS un-aged.
  *
  * Both halves are asserted here, on the same block, in the same test: one
  * collector pass must NOT release it, and the decay immediately after must.
@@ -359,14 +362,14 @@ static size_t heap_rss_kb(void) {
 static test_result_t test_idle_decay_releases_pages(void) {
     /* Threshold 0 means "release at the first maintenance point after any
      * work", so the test asserts the mechanism without sleeping on a clock. */
-    setenv("RAY_HEAP_DECAY_MS", "0", 1);
+    ray_heap_set_decay_ms(0);
 
     /* Order 24: comfortably above the order-13 sweep floor, and below
      * RAY_HEAP_POOL_ORDER so it is a buddy block rather than a direct
      * mapping that munmaps itself on free. */
     const size_t big = (16u << 20) - 4096;
     ray_t* v = ray_alloc(big);
-    if (!v) { unsetenv("RAY_HEAP_DECAY_MS"); SKIP("16 MB block unavailable"); }
+    if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
     memset(ray_data(v), 0xA5, big);          /* fault every page in */
 
     size_t rss_live = heap_rss_kb();
@@ -381,7 +384,7 @@ static test_result_t test_idle_decay_releases_pages(void) {
     int64_t released = ray_heap_decay();
     size_t rss_decay = heap_rss_kb();
 
-    unsetenv("RAY_HEAP_DECAY_MS");
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
 
     TEST_ASSERT(released >= 1, "the decay sweep released at least one block");
     if (rss_live > 0) {
@@ -407,11 +410,11 @@ static test_result_t test_idle_decay_releases_pages(void) {
  * lying around — that is the entire defence against releasing the pages a
  * hot loop is about to reuse. */
 static test_result_t test_idle_decay_respects_threshold(void) {
-    setenv("RAY_HEAP_DECAY_MS", "600000", 1);
+    ray_heap_set_decay_ms(600000);
 
     const size_t big = (16u << 20) - 4096;
     ray_t* v = ray_alloc(big);
-    if (!v) { unsetenv("RAY_HEAP_DECAY_MS"); SKIP("16 MB block unavailable"); }
+    if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
     memset(ray_data(v), 0xA5, big);
     ray_free(v);
 
@@ -420,9 +423,9 @@ static test_result_t test_idle_decay_respects_threshold(void) {
     int64_t released = ray_heap_decay();
 
     /* Negative threshold disables the decay outright. */
-    setenv("RAY_HEAP_DECAY_MS", "-1", 1);
+    ray_heap_set_decay_ms(-1);
     int64_t due_off = ray_heap_decay_due_ms();
-    unsetenv("RAY_HEAP_DECAY_MS");
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
 
     TEST_ASSERT(due > 0, "a sweep is pending but not yet due");
     TEST_ASSERT(released < 0, "nothing is swept before the threshold elapses");
@@ -430,10 +433,10 @@ static test_result_t test_idle_decay_respects_threshold(void) {
 
     /* Proof the block really was sweepable, i.e. the assertions above were
      * not vacuous: with the threshold at 0 the same block goes. */
-    setenv("RAY_HEAP_DECAY_MS", "0", 1);
+    ray_heap_set_decay_ms(0);
     ray_heap_note_activity();
     int64_t swept = ray_heap_decay();
-    unsetenv("RAY_HEAP_DECAY_MS");
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
     TEST_ASSERT(swept >= 1, "the same block is released once the threshold is 0");
     PASS();
 }

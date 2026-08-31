@@ -292,8 +292,14 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
         next_event:;
         }
 
-        if (poll->timers)
-            ray_timers_fire_expired((ray_timers_t*)poll->timers);
+        if (poll->timers) {
+            /* A fired timer is work, and on a timer-driven server it is the
+             * only work there is: without this stamp the decay sees an idle
+             * process mid-workload, and — having disarmed itself — never
+             * looks again. */
+            if (ray_timers_fire_expired((ray_timers_t*)poll->timers) > 0)
+                ray_heap_note_activity();
+        }
         /* After the events of this wakeup, not before: a request handled
          * above has just re-stamped the activity clock, so a busy loop
          * finds nothing due and pays one timestamp comparison. */

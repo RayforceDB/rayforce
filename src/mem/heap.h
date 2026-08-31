@@ -260,6 +260,11 @@ void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
 
+/* Set the threshold directly; negative disables.  The environment is read
+ * once on first use, so this exists to let a test drive the policy without
+ * re-exec — not as a runtime knob. */
+void ray_heap_set_decay_ms(int64_t ms);
+
 /* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */
