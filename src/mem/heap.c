@@ -2787,7 +2787,15 @@ void* ray_scratch_arena_push(ray_scratch_arena_t* a, size_t nbytes) {
     if (!blk) return NULL;
     a->backing[a->n_backing++] = blk;
     a->ptr = (char*)ray_data(blk);
-    a->end = (char*)blk + BSIZEOF(blk->order);
+    /* The window ends at the block's real capacity.  `order` describes the
+     * block size only for buddy blocks: a request at or above
+     * RAY_HEAP_POOL_ORDER comes back as a DIRECT block, mapped at its exact
+     * page-rounded size and tagged with the RAY_ORDER_DIRECT sentinel.
+     * Reading that sentinel as an order claims a 2^39-byte block, and every
+     * push after the one that triggered it is then bump-allocated past the
+     * end of the mapping — a write straight into unmapped address space.
+     * ray_block_data_bytes covers both block kinds. */
+    a->end = a->ptr + ray_block_data_bytes(blk);
 
 bump:;
     void* ret = a->ptr;

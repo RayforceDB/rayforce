@@ -295,6 +295,49 @@ static test_result_t test_scratch_arena_oversize(void) {
     PASS();
 }
 
+static test_result_t test_scratch_arena_direct_backing(void) {
+    /* A backing block at or above RAY_HEAP_POOL_ORDER is a DIRECT
+     * allocation: mapped at its exact page-rounded size and tagged with
+     * the RAY_ORDER_DIRECT sentinel instead of a real buddy order.  The
+     * arena's window has to come from the block's true capacity —
+     * reading the sentinel as an order describes a 2^39-byte block, so
+     * every later push is bump-allocated past the end of the mapping and
+     * writes into unmapped address space. */
+    ray_scratch_arena_t a;
+    ray_scratch_arena_init(&a);
+
+    size_t big = ((size_t)1 << RAY_HEAP_POOL_ORDER) + (1u << 20);
+    unsigned char* p = (unsigned char*)ray_scratch_arena_push(&a, big);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQ_I(a.n_backing, 1);
+    TEST_ASSERT_TRUE(ray_is_direct(a.backing[0]));
+
+    /* The window must stop at the backing's real capacity. */
+    char* cap_end = (char*)ray_data(a.backing[0])
+                  + ray_block_data_bytes(a.backing[0]);
+    TEST_ASSERT_TRUE(a.end <= cap_end);
+
+    /* Consequently the next push cannot be carved out of the leftover of
+     * a block that has none: it must take a backing of its own. */
+    size_t follow = 4u << 20;
+    unsigned char* q = (unsigned char*)ray_scratch_arena_push(&a, follow);
+    TEST_ASSERT_NOT_NULL(q);
+    TEST_ASSERT_EQ_I(a.n_backing, 2);
+    TEST_ASSERT_TRUE((char*)q + follow <= (char*)ray_data(a.backing[1])
+                                       + ray_block_data_bytes(a.backing[1]));
+
+    /* Both regions must be writable end to end and must not overlap. */
+    memset(p, 0x5A, big);
+    memset(q, 0xA5, follow);
+    TEST_ASSERT_EQ_U(p[0], 0x5A);
+    TEST_ASSERT_EQ_U(p[big - 1], 0x5A);
+    TEST_ASSERT_EQ_U(q[0], 0xA5);
+    TEST_ASSERT_EQ_U(q[follow - 1], 0xA5);
+
+    ray_scratch_arena_reset(&a);
+    PASS();
+}
+
 /* ---- ray_heap_release_pages -------------------------------------------- *
  *
  * Walks freelists at order >= 13 (8 KB+) and madvise-releases pages past
@@ -2638,6 +2681,7 @@ const test_entry_t heap_entries[] = {
     { "heap/scratch_arena_basic",      test_scratch_arena_basic,         heap_setup, heap_teardown },
     { "heap/scratch_arena_multi",      test_scratch_arena_multi_backing, heap_setup, heap_teardown },
     { "heap/scratch_arena_oversize",   test_scratch_arena_oversize,      heap_setup, heap_teardown },
+    { "heap/scratch_arena_direct",     test_scratch_arena_direct_backing, heap_setup, heap_teardown },
     { "heap/release_pages",            test_release_pages,               heap_setup, heap_teardown },
     { "heap/gc_reclaim_oversized",     test_gc_reclaim_oversized_pool,   heap_setup, heap_teardown },
     { "heap/gc_serial",                test_heap_gc_serial,              heap_setup, heap_teardown },
