@@ -3180,6 +3180,88 @@ static test_result_t test_serde_table_dict_de_errors(void) {
     PASS();
 }
 
+/* Splice a container frame — [type][attrs] + payload(a) + payload(b) — from two
+ * real serialized sub-objects, wrapped in a fresh ipc header.  Uses ray_ser and
+ * sizeof(ray_ipc_header_t), so it stays honest if the wire layout ever changes
+ * (rather than hard-coding the header size / field offsets). */
+static ray_t* serde_splice_container(uint8_t type_byte, ray_t* a, ray_t* b) {
+    size_t hdrsz = sizeof(ray_ipc_header_t);
+    ray_t* fa = ray_ser(a);
+    ray_t* fb = ray_ser(b);
+    if (!fa || RAY_IS_ERR(fa) || !fb || RAY_IS_ERR(fb)) {
+        if (fa) ray_release(fa);
+        if (fb) ray_release(fb);
+        return NULL;
+    }
+    size_t pa = (size_t)fa->len - hdrsz;
+    size_t pb = (size_t)fb->len - hdrsz;
+    int64_t payload = 2 + (int64_t)pa + (int64_t)pb;
+    int64_t total = (int64_t)hdrsz + payload;
+    ray_t* buf = ray_vec_new(RAY_U8, total);
+    buf->len = total;
+    uint8_t* p = (uint8_t*)ray_data(buf);
+    ray_ipc_header_t* hdr = (ray_ipc_header_t*)p;
+    hdr->prefix  = RAY_SERDE_PREFIX;
+    hdr->version = RAY_SERDE_WIRE_VERSION;
+    hdr->flags = 0; hdr->endian = 0; hdr->msgtype = 0;
+    hdr->size = payload;
+    uint8_t* pl = p + hdrsz;
+    pl[0] = type_byte;
+    pl[1] = 0;
+    memcpy(pl + 2, (uint8_t*)ray_data(fa) + hdrsz, pa);
+    memcpy(pl + 2 + pa, (uint8_t*)ray_data(fb) + hdrsz, pb);
+    ray_release(fa);
+    ray_release(fb);
+    return buf;
+}
+
+/* A container frame whose two counts disagree must be rejected, not silently
+ * accepted as the shorter of the two. */
+static test_result_t test_serde_container_count_mismatch(void) {
+    /* TABLE: 2 schema names, 1 column → rejected (not truncated to 1 column). */
+    {
+        int64_t names[] = { 7, 7 };
+        ray_t* schema = ray_vec_from_raw(RAY_I64, names, 2);
+        int64_t c0[] = { 1 };
+        ray_t* cols = ray_list_new(1);
+        cols = ray_list_append(cols, ray_vec_from_raw(RAY_I64, c0, 1));
+        ray_t* frame = serde_splice_container((uint8_t)RAY_TABLE, schema, cols);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r); ray_release(frame); ray_release(schema); ray_release(cols);
+    }
+    /* TABLE: 2 columns of unequal length (2 and 1) → rejected (ragged rows). */
+    {
+        int64_t names[] = { 7, 8 };
+        ray_t* schema = ray_vec_from_raw(RAY_I64, names, 2);
+        int64_t c0[] = { 1, 2 };
+        int64_t c1[] = { 3 };
+        ray_t* cols = ray_list_new(2);
+        cols = ray_list_append(cols, ray_vec_from_raw(RAY_I64, c0, 2));
+        cols = ray_list_append(cols, ray_vec_from_raw(RAY_I64, c1, 1));
+        ray_t* frame = serde_splice_container((uint8_t)RAY_TABLE, schema, cols);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r); ray_release(frame); ray_release(schema); ray_release(cols);
+    }
+    /* DICT: 2 keys, 1 value → rejected (a probe would index vals[idx] with
+     * idx < keys->len, an OOB read past the shorter value block). */
+    {
+        int64_t keys[] = { 7, 8 };
+        ray_t* k = ray_vec_from_raw(RAY_I64, keys, 2);
+        int64_t vals[] = { 1 };
+        ray_t* v = ray_vec_from_raw(RAY_I64, vals, 1);
+        ray_t* frame = serde_splice_container((uint8_t)RAY_DICT, k, v);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r); ray_release(frame); ray_release(k); ray_release(v);
+    }
+    PASS();
+}
+
 /* ---- serde coverage: TABLE deser type-mismatch and more error paths ------ */
 
 static test_result_t test_serde_table_de_type_mismatch(void) {
@@ -5289,6 +5371,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_save_serde_error",     test_serde_save_serde_error,     store_setup, store_teardown },
     { "store/serde_de_raw_default",       test_serde_de_raw_default_and_errors, store_setup, store_teardown },
     { "store/serde_table_dict_de_errors", test_serde_table_dict_de_errors, store_setup, store_teardown },
+    { "store/serde_container_count_mismatch", test_serde_container_count_mismatch, store_setup, store_teardown },
     { "store/serde_table_de_type_mismatch", test_serde_table_de_type_mismatch, store_setup, store_teardown },
     { "store/serde_de_size_bounds",        test_serde_de_size_bounds,        store_setup, store_teardown },
     { "store/total_ram", test_total_ram, NULL, NULL },

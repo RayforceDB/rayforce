@@ -812,6 +812,20 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return e;
         }
 
+        /* Every column must have the same length (the table's row count).  A
+         * frame with ragged columns would leave ray_table_nrows reporting
+         * column 0's length while row-wise ops read past the shorter ones. */
+        ray_t** cps = (ray_t**)ray_data(cols);
+        int64_t nrows = (cols->len > 0 && cps[0]) ? cps[0]->len : 0;
+        for (int64_t i = 1; i < cols->len; i++) {
+            if (!cps[i] || cps[i]->len != nrows) {
+                ray_t* e = ray_error("domain", "deserialize table: ragged columns (column %lld has %lld rows, expected %lld)", (long long)i, (long long)(cps[i] ? cps[i]->len : -1), (long long)nrows);
+                ray_release(schema);
+                ray_release(cols);
+                return e;
+            }
+        }
+
         int64_t ncols = cols->len;
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
@@ -822,7 +836,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
 
         void* name_data = ray_data(schema);
         ray_t** col_ptrs = (ray_t**)ray_data(cols);
-        for (int64_t i = 0; i < ncols && i < schema->len; i++) {
+        for (int64_t i = 0; i < ncols; i++) {   /* ncols == schema->len (guarded above) */
             int64_t name_id = (schema->type == RAY_I64)
                 ? ((int64_t*)name_data)[i]
                 : ray_read_sym(name_data, i, RAY_SYM, schema->attrs);
@@ -855,6 +869,18 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         if (!vals || RAY_IS_ERR(vals)) {
             ray_release(keys);
             return vals;
+        }
+
+        /* One value per key: a dict probe finds a key index in [0, keys->len)
+         * and reads the value at that index, so a crafted dict with more keys
+         * than values would index the value block out of bounds (OOB
+         * read/release).  vals may be a LIST of column vectors or a flat value
+         * vector — either way its length must equal keys->len. */
+        if (keys->len != vals->len) {
+            ray_t* e = ray_error("domain", "deserialize dict: key/value count mismatch (%lld keys, %lld values)", (long long)keys->len, (long long)vals->len);
+            ray_release(keys);
+            ray_release(vals);
+            return e;
         }
 
         /* Build dict: alloc with 2 slots */
