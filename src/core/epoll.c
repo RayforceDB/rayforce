@@ -190,9 +190,14 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
         /* A process waiting here is a process doing nothing, and this is the
          * only moment it gets to notice.  Bound the wait by the allocator's
          * pending decay exactly as a timer would; once the decay has run
-         * there is nothing pending and the wait goes back to indefinite. */
+         * there is nothing pending and the wait goes back to indefinite.
+         *
+         * Only when the loop is unbounded.  ray_poll_run_for carries the
+         * caller's own deadline and runs a single pass, so shortening its
+         * wait here returns from it early with nothing done — a timer the
+         * caller was waiting on would not have fired yet. */
         {
-            int64_t decay = ray_heap_decay_due_ms();
+            int64_t decay = bounded ? -1 : ray_heap_decay_due_ms();
             if (decay >= 0) {
                 if (decay > INT_MAX) decay = INT_MAX;
                 if (wait_ms < 0 || decay < wait_ms) wait_ms = (int)decay;
