@@ -801,6 +801,17 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return e;
         }
 
+        /* Schema names and columns must be 1:1.  The build loop below is
+         * bounded by min(cols->len, schema->len), so a crafted frame with a
+         * shorter schema (or more columns) would otherwise be accepted as a
+         * silently truncated table instead of being rejected. */
+        if (schema->len != cols->len) {
+            ray_t* e = ray_error("domain", "deserialize table: schema/column count mismatch (%lld names, %lld columns)", (long long)schema->len, (long long)cols->len);
+            ray_release(schema);
+            ray_release(cols);
+            return e;
+        }
+
         int64_t ncols = cols->len;
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
