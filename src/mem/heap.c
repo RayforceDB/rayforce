@@ -2223,6 +2223,10 @@ static void dfd_validate_freelists(void) {
  * already been released and must not be released again.  File scope
  * because the idle decay below shares the marker. */
 #define RAY_FREE_AGE_RELEASE   3
+/* Below this order a block has no whole page to give back once its first
+ * page — which carries the freelist links — is kept, so every release walk
+ * starts here. */
+#define RAY_RELEASE_MIN_ORDER  13
 
 void ray_heap_gc(void) {
     ray_heap_t* h = ray_tl_heap;
@@ -2243,10 +2247,14 @@ void ray_heap_gc(void) {
         /* Pass 2 (return foreign blocks absorbed onto our freelists) is gone
          * — nothing absorbs a foreign block locally any more.
          *
-         * Pass 3: Skip worker heaps — we cannot safely touch their
-         * slab caches because workers may still be between pending--
-         * and sem_wait, calling ray_free which modifies wh->slabs.
-         * Workers fold their own slabs back on their next dispatch. */
+         * Pass 3: Skip worker heaps.  Not for safety — ray_parallel_end
+         * drains `pending` with acquire before clearing the flag, and a
+         * worker allocates nothing between its last pending-- and sem_wait,
+         * which is what lets the decay sweep below walk those very heaps.
+         * It is a policy choice: folding a worker's slab cache back costs
+         * it a freelist pop and a split on its next allocation of that
+         * order, and the collection runs far more often than the caches
+         * are worth reclaiming. */
 
         /* Pass 4: Reclaim OVERSIZED empty pools.
          * Standard pools (pool_order == RAY_HEAP_POOL_ORDER) are never
@@ -2398,7 +2406,7 @@ void ray_heap_gc(void) {
         #define RAY_P5_VISIT_BUDGET    2048
         #define RAY_P5_RELEASE_BUDGET  64
         static int s_p5_hid = 0;
-        static int s_p5_ord = 13;
+        static int s_p5_ord = RAY_RELEASE_MIN_ORDER;
         uint64_t large_orders_mask = ~((1ULL << 13) - 1);
         int64_t p5_visited = 0, p5_released = 0;
         int p5_slots = RAY_HEAP_REGISTRY_SIZE * (RAY_HEAP_FL_SIZE - 13);
@@ -2408,7 +2416,7 @@ void ray_heap_gc(void) {
             int hid = s_p5_hid;
             int ord = s_p5_ord;
             if (++s_p5_ord >= RAY_HEAP_FL_SIZE) {
-                s_p5_ord = 13;
+                s_p5_ord = RAY_RELEASE_MIN_ORDER;
                 s_p5_hid = (s_p5_hid + 1) % RAY_HEAP_REGISTRY_SIZE;
             }
             ray_heap_t* gh = ray_heap_registry[hid];
@@ -2435,25 +2443,34 @@ void ray_heap_gc(void) {
 
 }
 
+/* Hand back the pages of every free block of `h` at or above the release
+ * floor that has not already been released, and report how many.  The three
+ * callers differ only in which heaps they visit and what they do first;
+ * the walk itself is this. */
+static int64_t heap_release_free_pages(ray_heap_t* h) {
+    int64_t released = 0;
+    for (int ord = RAY_RELEASE_MIN_ORDER; ord < RAY_HEAP_FL_SIZE; ord++) {
+        if (!(h->avail & (1ULL << ord))) continue;
+        ray_fl_head_t* head = &h->freelist[ord];
+        for (ray_t* blk = head->fl_next; blk != (ray_t*)head;
+             blk = blk->fl_next) {
+            if (blk->attrs > RAY_FREE_AGE_RELEASE) continue;  /* released */
+            int pidx = heap_find_pool(h, blk);
+            bool hp = (pidx >= 0) ? (h->pools[pidx].hugepage != 0) : false;
+            ray_vm_release_block(blk, BSIZEOF(ord), hp);
+            blk->attrs = RAY_FREE_AGE_RELEASE + 1;
+            released++;
+        }
+    }
+    return released;
+}
+
 void ray_heap_release_pages(void) {
     /* Explicit release: callers asking for pages back get them NOW —
      * no aging — but still skip blocks already released. */
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
-    for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
-        ray_fl_head_t* head = &h->freelist[i];
-        ray_t* blk = head->fl_next;
-        while (blk != (ray_t*)head) {
-            if (blk->attrs <= RAY_FREE_AGE_RELEASE) {
-                size_t bsize = BSIZEOF(i);
-                int rpidx = heap_find_pool(h, blk);
-                bool hp = (rpidx >= 0) ? (h->pools[rpidx].hugepage != 0) : false;
-                ray_vm_release_block(blk, bsize, hp);
-                blk->attrs = RAY_FREE_AGE_RELEASE + 1;
-            }
-            blk = blk->fl_next;
-        }
-    }
+    (void)heap_release_free_pages(h);
 }
 
 /* --------------------------------------------------------------------------
@@ -2583,19 +2600,7 @@ int64_t ray_heap_decay(void) {
          * in a server that is where most of the free bytes are. */
         heap_drain_foreign(gh);
         heap_flush_slabs(gh);
-        for (int ord = 13; ord < RAY_HEAP_FL_SIZE; ord++) {
-            if (!(gh->avail & (1ULL << ord))) continue;
-            ray_fl_head_t* head = &gh->freelist[ord];
-            for (ray_t* blk = head->fl_next; blk != (ray_t*)head;
-                 blk = blk->fl_next) {
-                if (blk->attrs > RAY_FREE_AGE_RELEASE) continue;  /* released */
-                int pidx = heap_find_pool(gh, blk);
-                bool hp = (pidx >= 0) ? (gh->pools[pidx].hugepage != 0) : false;
-                ray_vm_release_block(blk, BSIZEOF(ord), hp);
-                blk->attrs = RAY_FREE_AGE_RELEASE + 1;
-                released++;
-            }
-        }
+        released += heap_release_free_pages(gh);
     }
     return released;
 }

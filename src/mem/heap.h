@@ -516,7 +516,11 @@ typedef struct ray_heap {
      * block always returns to the heap that has to reuse it, with no
      * collector in the loop.  Atomic because any thread may push while the
      * owner drains. */
-    _Atomic(ray_t*)  foreign;
+    /* Remote CAS target: every cross-thread free of a block this heap owns
+     * writes it.  On its own line so those writes do not bounce the line
+     * carrying `avail` and the slab heads, which the owner touches on every
+     * allocation. */
+    _Alignas(64) _Atomic(ray_t*) foreign;
     ray_slab_t       slabs[RAY_SLAB_ORDERS];       /* small-block slab caches */
     uint32_t        slab_cap[RAY_SLAB_ORDERS];   /* runtime push cap per slab order (byte-budgeted) */
     ray_fl_head_t    freelist[RAY_HEAP_FL_SIZE];   /* circular sentinel per order */
