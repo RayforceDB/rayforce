@@ -26,6 +26,7 @@
 #endif
 
 #include "core/ipc.h"
+#include "mem/heap.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
 #include "store/journal.h"
@@ -975,6 +976,11 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
             send_response((ray_sock_t)cur->fd, result);
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
+    /* The request is served: this is the end of the server's unit of work,
+     * and stamping here is what lets the poll loop tell an idle server from
+     * one between two requests.  Stamping on frame arrival instead would
+     * make the measured gap the request's own duration. */
+    ray_heap_note_activity();
 
     return NULL;
 }
@@ -1141,6 +1147,11 @@ static void conn_on_payload(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
     if (c->hdr.msgtype == RAY_IPC_MSG_SYNC)
         send_response(c->fd, result);
     if (result != RAY_NULL_OBJ) ray_release(result);
+    /* The request is served: this is the end of the server's unit of work,
+     * and stamping here is what lets the poll loop tell an idle server from
+     * one between two requests.  Stamping on frame arrival instead would
+     * make the measured gap the request's own duration. */
+    ray_heap_note_activity();
 
     ray_sys_free(c->rx_buf);
     c->rx_buf  = NULL;

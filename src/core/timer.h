@@ -65,7 +65,8 @@ int64_t ray_timers_next_deadline_ms(ray_timers_t* t);
 /* Fire every timer whose exp_ms <= now.  Pops, calls callback via call_fn1,
  * then either re-pushes (forever / num>1) or frees (num==1 / num==0 one-shot).
  * Callback errors are printed to stderr and counted as a successful fire. */
-void ray_timers_fire_expired(ray_timers_t* t);
+/* Fire every timer whose deadline has passed; returns how many ran. */
+uint32_t ray_timers_fire_expired(ray_timers_t* t);
 
 /* Current monotonic time in milliseconds. */
 int64_t ray_time_now_ms(void);

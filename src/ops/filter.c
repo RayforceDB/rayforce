@@ -287,6 +287,13 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     if (!input || RAY_IS_ERR(input)) return input;
     if (!pred || RAY_IS_ERR(pred)) return pred;
 
+    /* An atom predicate (scalar subject in a where-clause) has no per-row
+     * bits.  Reject it before any morsel walk: ray_morsel_init derives the
+     * element size from the type, and a negative (atom) type indexes
+     * ray_type_sizes out of bounds. */
+    if (pred->type < 0)
+        return ray_error("length", "filter: predicate must be a BOOL vector matching the input length, got an atom");
+
     /* A plain contiguous BOOL predicate over a large input takes the
      * parallel chunked count/fill; anything else (lazy / morsel-backed
      * pred, small input) keeps the sequential morsel sweep. */
