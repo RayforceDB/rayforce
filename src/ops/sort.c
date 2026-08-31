@@ -2637,9 +2637,11 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         }
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits = (uint16_t)(total_bits + bits);
                     }
@@ -2699,9 +2701,11 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
 
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits = (uint16_t)(total_bits + bits);
                     }
