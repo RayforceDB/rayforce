@@ -102,16 +102,26 @@ static inline bool join_str_eq_hashed(const ray_str_t* a, const char* pool_a,
     return memcmp(pa, pb, a->len) == 0;
 }
 
+/* Hash payload for a null key cell.  One canonical value per key POSITION
+ * (the ray_hash_combine chain below still mixes in k), so every null in a
+ * given key column lands in the same bucket on both sides of the join —
+ * the precondition for join_keys_eq's null == null.  Any collision with a
+ * real key's hash is resolved by join_keys_eq, as for any other hash. */
+#define JOIN_NULL_KEY_HASH INT64_C(0x5B7A6D3F2E1C0A94)
+
 static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
     uint64_t h = 0;
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* col = key_vecs[k];
         if (!col) continue;
-        /* NULL key — produce unique hash that won't match any other row */
-        if (ray_vec_is_null(col, row))
-            return h ^ ((uint64_t)row * 0x9E3779B97F4A7C15ULL);
         uint64_t kh;
-        if (col->type == RAY_STR) {
+        if (ray_vec_is_null(col, row)) {
+            /* null == null: hash every null cell alike instead of giving the
+             * row a private hash.  A per-row hash made a null key unmatchable
+             * even against itself, so `anti-join [c] X X` came back non-empty
+             * and a null-keyed left-join row missed its real match. */
+            kh = ray_hash_i64(JOIN_NULL_KEY_HASH);
+        } else if (col->type == RAY_STR) {
             const char* pool = NULL;
             const ray_str_t* str = join_str_cell(col, row, &pool);
             kh = ray_str_is_inline(str)
@@ -576,8 +586,26 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         ray_t* lc = l_vecs[k];
         ray_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
-        /* NULL != NULL in join predicates */
-        if (ray_vec_is_null(lc, l) || ray_vec_is_null(rc, r)) return false;
+        /* null == null, null != non-null.  This is the rule the rest of the
+         * runtime already applies to key columns: collection.c's hashset
+         * folds every null into one bucket (so `distinct` keeps exactly one
+         * null and `in` matches null against null), group.c folds them into
+         * one group, and atom_eq answers 1 for two nulls.  Joins used to
+         * reject a null outright, which made `anti-join [c] X X` non-empty
+         * whenever c held a null and made left-join miss a null-keyed match.
+         * As-of join keeps its own documented NULLs-never-match rule; it
+         * does not route through here. */
+        bool l_null = ray_vec_is_null(lc, l);
+        bool r_null = ray_vec_is_null(rc, r);
+        if (l_null || r_null) {
+            if (l_null != r_null) return false;
+            /* No looser than the value arms below: they pair STR only with
+             * STR and GUID only with GUID, so two nulls of those types are
+             * equal only to their own kind. */
+            if ((lc->type == RAY_STR)  != (rc->type == RAY_STR))  return false;
+            if ((lc->type == RAY_GUID) != (rc->type == RAY_GUID)) return false;
+            continue;
+        }
         if (lc->type == RAY_STR || rc->type == RAY_STR) {
             if (lc->type != RAY_STR || rc->type != RAY_STR) return false;
             const char* lpool = NULL;
