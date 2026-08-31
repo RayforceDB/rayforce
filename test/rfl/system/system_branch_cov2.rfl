@@ -130,6 +130,11 @@
 (.ipc.open "localhost:-1") !- domain
 (.ipc.open "localhost:65536") !- domain
 (.ipc.open "localhost:abc") !- domain
+;; Partial-numeric ports must be rejected, not truncated by atoi to their
+;; numeric prefix ("1abc" -> 1).  strtol requires the whole field to be digits,
+;; so these are a domain error at parse time — never a connection attempt.
+(.ipc.open "localhost:1abc") !- domain
+(.ipc.open "localhost:19876x") !- domain
 (.ipc.open "127.0.0.1:19876") !- io
 (.ipc.open "127.0.0.1:19876:user:pass") !- io
 (.ipc.open "127.0.0.1:19876:extra") !- io
