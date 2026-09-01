@@ -126,6 +126,22 @@ The `anti-join` function keeps rows from the left table whose key does not appea
 ;  3 MSFT
 ```
 
+## Null-key semantics (equi-joins)
+
+`inner-join`, `left-join`, `full-join` and `anti-join` treat **a null key as equal to another null key**, and never equal to a non-null one:
+
+```lisp
+(set left  (table [k v] (list (as 'SYM ["a" ""]) [1 2])))
+(set right (table [k w] (list (as 'SYM ["a" ""]) [10 20])))
+
+(at (left-join [k] left right) 'w)  ; [10 20]  — the null key finds its match
+(count (anti-join [k] left left))   ; 0        — X anti-joined with itself is empty
+```
+
+This is the rule the rest of the runtime already applies to key columns: `distinct` keeps exactly one null, group-by folds nulls into a single group, and `in` matches a null against a null. It differs from SQL, where `NULL = NULL` is unknown and a self-anti-join can return rows. The invariant that follows — `(anti-join [cols] X X)` is empty for every `X` and every key set — is what makes anti-join usable for "which of these tuples have I not seen yet".
+
+As-of join is the exception — its null keys never match. See its own [Null-key semantics](#null-key-semantics) section below.
+
 ## As-of Join
 
 The `asof-join` function is designed for time-series data. For each row in the left table, it finds the most recent matching row in the right table where the time column is less than or equal to the left's time value. The last column in the key list is the temporal column; any preceding keys are exact-match equality keys.
