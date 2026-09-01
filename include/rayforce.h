@@ -563,6 +563,7 @@ ray_t* ray_vec_new(int8_t type, int64_t capacity);
 
 ray_t* ray_sym_vec_new(uint8_t sym_width, int64_t capacity);  /* RAY_SYM with adaptive width */
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
+ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);  /* one reserve + one memcpy */
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
 void* ray_vec_get(ray_t* vec, int64_t idx);
 ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len);

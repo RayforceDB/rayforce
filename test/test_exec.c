@@ -16483,12 +16483,16 @@ static test_result_t test_expr_binary_range_f64_nan_branches(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    /* F64 vectors WITHOUT HAS_NULLS — raw NaN values, no bitmap null.
-     * ray_vec_from_raw does NOT set HAS_NULLS; NaN is just a bit pattern. */
+    /* F64 vectors WITHOUT HAS_NULLS.  from_raw flags sentinel NaNs (#445),
+     * so strip the attr deliberately: this test pins the tolerance path for
+     * unflagged sentinels (legacy / flag-dropped vectors), where NaN is
+     * just a bit pattern. */
     double rawa[] = {NAN, NAN, 1.0};
     double rawb[] = {NAN, 1.0, NAN};
     ray_t* va = ray_vec_from_raw(RAY_F64, rawa, 3);
     ray_t* vb = ray_vec_from_raw(RAY_F64, rawb, 3);
+    va->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    vb->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     /* Verify: no bitmap null set */
     TEST_ASSERT_FALSE(va->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_FALSE(vb->attrs & RAY_ATTR_HAS_NULLS);
