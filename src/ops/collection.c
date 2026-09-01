@@ -1225,22 +1225,27 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     /* Parted columns store segment pointers where vector paths expect flat
-     * cells: reading a parted GUID column through ray_data() yields segment
-     * pointers, not 16-byte guids, so membership silently matched nothing.
-     * Flatten first, then run the normal path.  This mirrors distinct/except/
-     * sect, which already flatten via parted_to_flat_vec. */
+     * cells.  Flatten both operands before membership; distinct uses the same
+     * helper, while except/sect still reject parted input. */
+    ray_t* flat_val = NULL;
+    ray_t* flat_vec = NULL;
     if (val && RAY_IS_PARTED(val->type)) {
-        ray_t* fv = parted_to_flat_vec(val);
-        if (!fv || RAY_IS_ERR(fv)) return fv ? fv : ray_error("oom", NULL);
-        ray_t* r = ray_in_fn(fv, vec);
-        ray_release(fv);
-        return r;
+        flat_val = parted_to_flat_vec(val);
+        if (!flat_val || RAY_IS_ERR(flat_val)) return flat_val ? flat_val : ray_error("oom", NULL);
+        val = flat_val;
     }
     if (vec && RAY_IS_PARTED(vec->type)) {
-        ray_t* fs = parted_to_flat_vec(vec);
-        if (!fs || RAY_IS_ERR(fs)) return fs ? fs : ray_error("oom", NULL);
-        ray_t* r = ray_in_fn(val, fs);
-        ray_release(fs);
+        flat_vec = parted_to_flat_vec(vec);
+        if (!flat_vec || RAY_IS_ERR(flat_vec)) {
+            if (flat_val) ray_release(flat_val);
+            return flat_vec ? flat_vec : ray_error("oom", NULL);
+        }
+        vec = flat_vec;
+    }
+    if (flat_val || flat_vec) {
+        ray_t* r = ray_in_fn(val, vec);
+        if (flat_val) ray_release(flat_val);
+        if (flat_vec) ray_release(flat_vec);
         return r;
     }
     /* STR in STR: for each char of val, check membership in vec string */

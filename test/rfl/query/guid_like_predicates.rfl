@@ -35,6 +35,14 @@
 (at (get (select {from: t where: (in g gsub) s: (sum v)}) 's) 0) -- 40
 ;; membership against an empty set matches nothing (no all-true collapse)
 (in gs (at gs [])) -- [false false false]
+;; Scalar subjects retain builtin scalar semantics; query predicates normalize
+;; their result to a row-aligned BOOL vector and keep nulls false.
+(set gn (as 'guid "00000000-0000-0000-0000-000000000000"))
+(in gn gs) -- false
+(not (in gn gs)) -- true
+(set gns (list gn (at gs 0)))
+(in gns gs) -- [false true]
+(not (in gns gs)) -- [true false]
 
 ;; like over a string column inside select-where (table construction
 ;; normalizes the list to a STR column; the real list-of-atoms shape —
