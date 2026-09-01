@@ -65,6 +65,27 @@
 (count tg) -- 2
 (get tg 'a) -- [1 2]
 
+;; ── boxed LIST columns append in place too: pointer cells, retained ─────
+(set tb (table [a l] (list [1 2] (list [10 20] 'x))))
+(insert 'tb (list 3 [30 40])) -- 'tb
+(count tb) -- 3
+(at (get tb 'l) 2) -- [30 40]
+(insert 'tb (list 4 'y)) -- 'tb
+(at (get tb 'l) 3) -- 'y
+
+;; a table batch must supply a LIST payload for a boxed column (its own
+;; normalization turns uniform cells into a typed vector) — the error rolls
+;; the whole insert back, boxed retains included
+(insert 'tb (table [a l] (list [5] (list 'z)))) !- type
+(count tb) -- 4
+(at (get tb 'l) 0) -- [10 20]
+
+;; typeless empty LIST column still adopts a concrete type via the rebuild
+(set ta (table [a l] (list (til 0) (list))))
+(insert 'ta (list 1 2)) -- 'ta
+(insert 'ta (list 3 4)) -- 'ta
+(get ta 'l) -- [2 4]
+
 ;; ── functional form is unchanged: value in, new value out ───────────────
 (set tv (table [a] (list [1])))
 (set tw (insert tv (list 2)))

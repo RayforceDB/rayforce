@@ -11409,6 +11409,16 @@ static int8_t typeless_col_type(ray_t* payload) {
     return RAY_I64;
 }
 
+/* HAS_NULLS for a payload that may be a slice: slices carry the flag on
+ * their parent.  Over-approximation is harmless (the flag is a fast-path
+ * gate; sentinels in the payload are the source of truth). */
+static bool payload_may_have_nulls(const ray_t* v) {
+    if (v->attrs & RAY_ATTR_HAS_NULLS) return true;
+    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent)
+        return (v->slice_parent->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    return false;
+}
+
 /* Helper: convert a Rayfall list of atoms into a typed column vector by
  * appending to an existing column (for insert/upsert). */
 static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
@@ -13981,7 +13991,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
          * the slot would dangle.  Sharing also means someone is looking at
          * the pre-insert value, which is what the rebuild is for. */
         if (!col || RAY_IS_ERR(col) || col->rc != 1 ||
-            col->type == RAY_LIST ||        /* boxed or typeless-empty */
+            /* An EMPTY LIST column is typeless — the rebuild adopts a
+             * concrete type from the first payload.  A non-empty LIST
+             * column is genuinely boxed and appends like any other:
+             * pointer cells, each retained by ray_list_append. */
+            (col->type == RAY_LIST && ray_len(col) == 0) ||
             RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
             col->mmod != 0 ||
             (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) {
@@ -14005,14 +14019,34 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             ray_t* pay = row_elems[c];
             int8_t ct = col->type;
             ray_t* res;
-            if (!pay) {
+            if (ct == RAY_LIST) {
+                /* Boxed column: a table payload supplies a LIST whose cells
+                 * are rows and is spliced; any other row shape boxes its
+                 * payload (or a NULL slot) as one cell — the same contract
+                 * as append_boxed_table_col, minus the copy. */
+                if (tbl_row_list) {
+                    if (!pay || RAY_IS_ERR(pay) || pay->type != RAY_LIST) {
+                        res = ray_error("type", "insert: table payload for a LIST column must be LIST");
+                    } else {
+                        ray_t** cells = (ray_t**)ray_data(pay);
+                        int64_t m = pay->len;
+                        res = col;
+                        for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                            res = ray_list_append(res, cells[k]);
+                            if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                        }
+                    }
+                } else {
+                    res = ray_list_append(col, pay);
+                }
+            } else if (!pay) {
                 ray_t* null_atom = ray_typed_null(-ct);
                 res = append_atom_to_col(col, null_atom);
                 ray_release(null_atom);
             } else if (ray_is_atom(pay)) {
                 res = append_atom_to_col(col, pay);
             } else if (pay->type == ct && ct == RAY_STR) {
-                bool pay_nulls = (pay->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                bool pay_nulls = payload_may_have_nulls(pay);
                 res = col;
                 int64_t m = ray_len(pay);
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
@@ -14027,8 +14061,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                     }
                     if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
                 }
-            } else if (pay->type == ct && ct == RAY_SYM) {
-                bool pay_nulls = (pay->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            } else if (pay->type == ct && ct == RAY_SYM &&
+                       ((pay->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+                        pay->sym_domain != ray_sym_runtime_domain())) {
+                /* Narrow or store-domain SYM payload: translate per cell. */
+                bool pay_nulls = payload_may_have_nulls(pay);
                 res = col;
                 int64_t m = ray_len(pay);
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
@@ -14043,18 +14080,13 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                     }
                 }
             } else if (pay->type == ct) {
-                /* Same-typed fixed-width vector: raw cells carry their
-                 * null sentinels; propagate the flag with them. */
-                size_t esz = ray_sym_elem_size(ct, col->attrs);
-                uint8_t* src = (uint8_t*)ray_data(pay);
-                res = col;
-                int64_t m = ray_len(pay);
-                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
-                    res = ray_vec_append(res, src + (size_t)k * esz);
-                    if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
-                }
-                if (!RAY_IS_ERR(res))
-                    res->attrs |= (pay->attrs & RAY_ATTR_HAS_NULLS);
+                /* Same-typed fixed-width vector (SYM already W64 runtime
+                 * here, so ids are verbatim): one reserve, one memcpy.
+                 * Raw cells carry their null sentinels; propagate the
+                 * flag with them. */
+                res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
+                if (!RAY_IS_ERR(res) && payload_may_have_nulls(pay))
+                    res->attrs |= RAY_ATTR_HAS_NULLS;
             } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
                 /* Differently-typed vector or generic list: coerce cell by
                  * cell, exactly like the rebuild does. */
@@ -14082,8 +14114,17 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         if (err) {
             /* Roll the lengths back so the binding keeps its pre-insert
              * value.  The append helpers leave the passed vector alive on
-             * failure, so every slot pointer is still valid. */
-            for (int64_t c = 0; c < ncols; c++) slots[c]->len = nrows;
+             * failure, so every slot pointer is still valid.  Boxed cells
+             * were retained on append — release them before truncating. */
+            for (int64_t c = 0; c < ncols; c++) {
+                ray_t* col = slots[c];
+                if (col->type == RAY_LIST) {
+                    ray_t** cells = (ray_t**)ray_data(col);
+                    for (int64_t k = nrows; k < col->len; k++)
+                        if (cells[k]) ray_release(cells[k]);
+                }
+                col->len = nrows;
+            }
         }
         if (dict_vals) {
             ray_t** dv = (ray_t**)ray_data(dict_vals);

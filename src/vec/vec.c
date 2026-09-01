@@ -295,6 +295,67 @@ fail:
 }
 
 /* --------------------------------------------------------------------------
+ * ray_vec_append_raw
+ *
+ * Append `count` raw elements with one capacity reserve and one memcpy.
+ * Same contract as ray_vec_append (COW when shared, index drop, amortized
+ * power-of-two growth, original left alive on failure), minus the
+ * per-element call overhead — this is the batch-ingest primitive.
+ *
+ * The raw cells are copied verbatim, sentinels included; the caller
+ * propagates RAY_ATTR_HAS_NULLS from the source when it can carry nulls
+ * (for RAY_SYM the caller must also guarantee the ids are in this
+ * vector's width and domain).
+ * -------------------------------------------------------------------------- */
+
+ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
+    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+        return ray_error("type", "vec_append_raw: expects a concrete vector type, got %s", ray_type_name(vec->type));
+    if (vec->type == RAY_STR) return ray_error("type", "vec_append_raw: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
+    if (count < 0) return ray_error("range", "vec_append_raw: count must be non-negative, got %lld", (long long)count);
+    if (count == 0) return vec;
+    if (!src) return ray_error("domain", "vec_append_raw: source pointer is null but count is %lld", (long long)count);
+
+    ray_t* original = vec;
+    vec = ray_cow(vec);
+    if (!vec || RAY_IS_ERR(vec)) return vec;
+
+    vec_drop_index_inplace(vec);
+
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    int64_t cap = vec_capacity(vec);
+
+    if (vec->len > INT64_MAX - count) goto fail;
+    if (vec->len + count > cap) {
+        size_t new_data_size = (size_t)(vec->len + count) * esz;
+        if (new_data_size < 32) new_data_size = 32;
+        else {
+            size_t s = 32;
+            while (s < new_data_size) {
+                if (s > SIZE_MAX / 2) goto fail;
+                s *= 2;
+            }
+            new_data_size = s;
+        }
+        ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
+        if (!new_vec || RAY_IS_ERR(new_vec)) {
+            if (vec != original) ray_release(vec);
+            return new_vec ? new_vec : ray_error("oom", NULL);
+        }
+        vec = new_vec;
+    }
+
+    memcpy((char*)ray_data(vec) + (size_t)vec->len * esz, src, (size_t)count * esz);
+    vec->len += count;
+    return vec;
+
+fail:
+    if (vec != original) ray_release(vec);
+    return ray_error("oom", NULL);
+}
+
+/* --------------------------------------------------------------------------
  * ray_vec_set
  * -------------------------------------------------------------------------- */
 
