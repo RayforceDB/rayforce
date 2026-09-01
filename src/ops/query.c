@@ -13952,6 +13952,156 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
     ray_t** row_elems = (ray_t**)ray_data(row);
     int64_t nrows = ray_table_nrows(tbl);
 
+    /* ---- In-place append fast path (#455) -------------------------------
+     * The rebuild below copies every existing row on every call, which
+     * makes a named-table ingest O(rows present) per insert — quadratic
+     * over a feed's lifetime.  When the binding is the sole owner of the
+     * table and no column needs adoption or boxing, append the batch into
+     * the existing columns instead: ray_vec_append grows in place (the
+     * buddy allocator extends the block when the space is there), so the
+     * cost is O(rows appended), amortized — the same profile as the
+     * vector path.  Any gate miss falls through to the rebuild, which
+     * keeps its copy semantics.
+     *
+     * On a mid-batch failure the appended lengths are rolled back, so the
+     * table keeps its pre-insert value; unlike the rebuild, already-grown
+     * capacity and dropped accelerator indexes are not restored. */
+    bool inplace_ok = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
+                      !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    ray_t* live_cols = NULL;
+    if (inplace_ok) {
+        live_cols = ((ray_t**)ray_data(tbl))[1];
+        if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols)
+            inplace_ok = false;
+    }
+    for (int64_t c = 0; inplace_ok && c < ncols; c++) {
+        ray_t* col = ((ray_t**)ray_data(live_cols))[c];
+        /* col->rc != 1: a shared column would be COW'd inside the append,
+         * and ray_cow releases the slot's reference — on a mid-append OOM
+         * the slot would dangle.  Sharing also means someone is looking at
+         * the pre-insert value, which is what the rebuild is for. */
+        if (!col || RAY_IS_ERR(col) || col->rc != 1 ||
+            col->type == RAY_LIST ||        /* boxed or typeless-empty */
+            RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+            col->mmod != 0 ||
+            (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) {
+            inplace_ok = false;
+            break;
+        }
+        /* The rebuild normalizes SYM columns to W64 runtime-domain ids;
+         * appending into a narrow or store-domain column would not. */
+        if (col->type == RAY_SYM &&
+            ((col->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+             col->sym_domain != ray_sym_runtime_domain())) {
+            inplace_ok = false;
+            break;
+        }
+    }
+    if (inplace_ok) {
+        ray_t** slots = (ray_t**)ray_data(live_cols);
+        ray_t* err = NULL;
+        for (int64_t c = 0; c < ncols && !err; c++) {
+            ray_t* col = slots[c];
+            ray_t* pay = row_elems[c];
+            int8_t ct = col->type;
+            ray_t* res;
+            if (!pay) {
+                ray_t* null_atom = ray_typed_null(-ct);
+                res = append_atom_to_col(col, null_atom);
+                ray_release(null_atom);
+            } else if (ray_is_atom(pay)) {
+                res = append_atom_to_col(col, pay);
+            } else if (pay->type == ct && ct == RAY_STR) {
+                bool pay_nulls = (pay->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    int64_t at = res->len;
+                    if (pay_nulls && ray_vec_is_null(pay, k)) {
+                        res = ray_str_vec_append(res, "", 0);
+                        if (!RAY_IS_ERR(res)) ray_vec_set_null(res, at, true);
+                    } else {
+                        size_t slen = 0;
+                        const char* sp = ray_str_vec_get(pay, k, &slen);
+                        res = ray_str_vec_append(res, sp ? sp : "", sp ? slen : 0);
+                    }
+                    if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                }
+            } else if (pay->type == ct && ct == RAY_SYM) {
+                bool pay_nulls = (pay->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    int64_t sym_val = sym_cell_runtime_id(pay, k);
+                    int64_t at = res->len;
+                    res = ray_vec_append(res, &sym_val);
+                    if (!RAY_IS_ERR(res)) {
+                        slots[c] = res;
+                        col = res;
+                        if (pay_nulls && ray_vec_is_null(pay, k))
+                            ray_vec_set_null(res, at, true);
+                    }
+                }
+            } else if (pay->type == ct) {
+                /* Same-typed fixed-width vector: raw cells carry their
+                 * null sentinels; propagate the flag with them. */
+                size_t esz = ray_sym_elem_size(ct, col->attrs);
+                uint8_t* src = (uint8_t*)ray_data(pay);
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    res = ray_vec_append(res, src + (size_t)k * esz);
+                    if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                }
+                if (!RAY_IS_ERR(res))
+                    res->attrs |= (pay->attrs & RAY_ATTR_HAS_NULLS);
+            } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
+                /* Differently-typed vector or generic list: coerce cell by
+                 * cell, exactly like the rebuild does. */
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    int alloc = 0;
+                    ray_t* e = collection_elem(pay, k, &alloc);
+                    if (!e) {
+                        ray_t* na = ray_typed_null(-ct);
+                        res = append_atom_to_col(res, na);
+                        ray_release(na);
+                    } else {
+                        res = append_atom_to_col(res, e);
+                        if (alloc) ray_release(e);
+                    }
+                    if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                }
+            } else {
+                res = append_atom_to_col(col, pay);
+            }
+            if (RAY_IS_ERR(res)) err = res;
+            else slots[c] = res;
+        }
+        if (err) {
+            /* Roll the lengths back so the binding keeps its pre-insert
+             * value.  The append helpers leave the passed vector alive on
+             * failure, so every slot pointer is still valid. */
+            for (int64_t c = 0; c < ncols; c++) slots[c]->len = nrows;
+        }
+        if (dict_vals) {
+            ray_t** dv = (ray_t**)ray_data(dict_vals);
+            for (int64_t c = 0; c < ncols; c++) if (dv[c]) ray_release(dv[c]);
+            dict_vals->len = 0;
+            ray_free(dict_vals);
+        }
+        if (tbl_row_list) {
+            ray_t** trl = (ray_t**)ray_data(tbl_row_list);
+            for (int64_t c = 0; c < ncols; c++) if (trl[c]) ray_release(trl[c]);
+            tbl_row_list->len = 0;
+            ray_free(tbl_row_list);
+        }
+        ray_release(tbl);
+        ray_release(row_orig);
+        return err ? err : ray_sym(inplace_sym);
+    }
+
     ray_t* result = ray_table_new(ncols);
     if (RAY_IS_ERR(result)) return result;
 

@@ -1,0 +1,78 @@
+;; #455: (insert 't batch) into a named global appends into the existing
+;; columns in place when the binding is the sole owner — O(rows appended)
+;; instead of a full O(rows present) rebuild per call.  These tests pin
+;; that the fast path and the rebuild produce identical tables, that the
+;; rebuild still runs when the fast path's gates miss, and that a failed
+;; insert leaves the binding untouched.
+
+;; ── fast path equals the rebuild, batch shapes ──────────────────────────
+(set t1 (table [a b s] (list [1 2] (as 'F64 [1.5 2.5]) ['x 'y])))
+(insert 't1 (table [a b s] (list [3 4] (as 'F64 [3.5 4.5]) ['z 'w]))) -- 't1
+(count t1) -- 4
+(get t1 'a) -- [1 2 3 4]
+(get t1 'b) -- [1.5 2.5 3.5 4.5]
+(get t1 's) -- ['x 'y 'z 'w]
+
+;; list row of atoms
+(insert 't1 (list 5 5.5 'v)) -- 't1
+(count t1) -- 5
+(get (select {from: t1 where: (== a 5)}) 's) -- ['v]
+
+;; dict row (column order independent)
+(insert 't1 {s: 'q b: 6.5 a: 6}) -- 't1
+(get (select {from: t1 where: (== a 6)}) 'b) -- [6.5]
+
+;; repeated batch inserts stay identical to one big functional insert
+(set t2 (table [a b s] (list [1 2] (as 'F64 [1.5 2.5]) ['x 'y])))
+(set t2b (insert t2 (table [a b s] (list [3 4 5 6] (as 'F64 [3.5 4.5 5.5 6.5]) ['z 'w 'v 'q]))))
+(set t3 (table [a b s] (list [1 2] (as 'F64 [1.5 2.5]) ['x 'y])))
+(insert 't3 (table [a b s] (list [3 4] (as 'F64 [3.5 4.5]) ['z 'w])))
+(insert 't3 (table [a b s] (list [5 6] (as 'F64 [5.5 6.5]) ['v 'q])))
+(== (get t2b 'a) (get t3 'a)) -- [true true true true true true]
+(== (get t2b 's) (get t3 's)) -- [true true true true true true]
+
+;; ── nulls survive the in-place append ───────────────────────────────────
+(set tn (table [a b] (list [1] (as 'F64 [1.0]))))
+(insert 'tn (table [a b] (list [0N 3] [0Nf 3.0])))
+(count tn) -- 3
+(sum (map nil? (get tn 'a))) -- 1
+(sum (map nil? (get tn 'b))) -- 1
+
+;; ── shared table falls back to the rebuild, alias keeps the old value ───
+(set ts (table [a] (list [1 2])))
+(set alias ts)
+(insert 'ts (list 3)) -- 'ts
+(count ts) -- 3
+(count alias) -- 2
+
+;; a shared column also forces the rebuild; the held column is unchanged
+(set tc (table [a] (list [1 2])))
+(set held (get tc 'a))
+(insert 'tc (list 3)) -- 'tc
+(count tc) -- 3
+(count held) -- 2
+
+;; ── a failed insert leaves the binding untouched ────────────────────────
+(set tf (table [a b] (list [1 2] [10 20])))
+(insert 'tf (list 3 'oops)) !- type
+(count tf) -- 2
+(get tf 'b) -- [10 20]
+
+;; type error in the SECOND column after the first column already accepted
+;; its cells: the in-place path must roll the first column back
+(set tg (table [a b] (list [1 2] ['x 'y])))
+(insert 'tg (table [a b] (list [3 4] [7 8]))) !- type
+(count tg) -- 2
+(get tg 'a) -- [1 2]
+
+;; ── functional form is unchanged: value in, new value out ───────────────
+(set tv (table [a] (list [1])))
+(set tw (insert tv (list 2)))
+(count tv) -- 1
+(count tw) -- 2
+
+;; ── ingest loop: many small batches into one named table ────────────────
+(set big (table [a b] (list (til 0) (as 'F64 (til 0)))))
+(map (fn [i] (insert 'big (table [a b] (list (til 100) (as 'F64 (til 100)))))) (til 50))
+(count big) -- 5000
+(sum (get big 'a)) -- 247500
