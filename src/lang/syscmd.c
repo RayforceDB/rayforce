@@ -130,19 +130,53 @@ static ray_t* h_listen(ray_t* arg, ray_syscmd_ctx_t* ctx) {
     (void)arg;
     return ray_error("restricted", "listen disabled under fuzzing");
 #endif
-    int err = 0;
-    int64_t port = arg_as_i64(arg, &err);
-    if (err) return ray_error("type", "listen expects a port number");
+    /* Two forms: a port number binds INADDR_ANY (unchanged), and a
+     * "HOST:PORT" string confines the listener to one IPv4 address
+     * (#427) — e.g. (.sys.listen "127.0.0.1:7701") for loopback-only. */
+    char host[64];
+    const char* bind_host = NULL;
+    int64_t port;
+    const char* s    = (arg && arg->type == -RAY_STR) ? ray_str_ptr(arg) : NULL;
+    size_t      slen = s ? ray_str_len(arg) : 0;
+    const char* colon = s ? memchr(s, ':', slen) : NULL;
+    if (colon) {
+        if (colon == s || (size_t)(colon - s) >= sizeof(host))
+            return ray_error("type", "listen expects a port number or \"HOST:PORT\"");
+        memcpy(host, s, (size_t)(colon - s));
+        host[colon - s] = '\0';
+        bind_host = host;
+        /* Strict digits-only port, the .ipc.open rule: "1abc" is a
+         * malformed port, not port 1. */
+        char pbuf[16];
+        size_t plen = slen - (size_t)(colon - s) - 1;
+        if (plen == 0 || plen >= sizeof(pbuf))
+            return ray_error("domain", "listen: port out of range (1..65535)");
+        memcpy(pbuf, colon + 1, plen);
+        pbuf[plen] = '\0';
+        char* endp;
+        errno = 0;
+        long pv = strtol(pbuf, &endp, 10);
+        if (endp == pbuf || *endp != '\0' || errno == ERANGE)
+            return ray_error("domain", "listen: port must be numeric 1..65535, got \"%s\"", pbuf);
+        port = (int64_t)pv;
+    } else {
+        /* Port-only form: an i64/int atom, or (via the .sys.cmd string
+         * dispatcher) a numeric string — arg_as_i64 handles both. */
+        int err = 0;
+        port = arg_as_i64(arg, &err);
+        if (err) return ray_error("type", "listen expects a port number or \"HOST:PORT\"");
+    }
     if (port <= 0 || port > 65535) return ray_error("domain", "listen: port out of range (1..65535)");
 
     ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
     if (!poll) return ray_error("nyi", "listen: no main event loop attached");
 
-    int64_t id = ray_ipc_listen(poll, (uint16_t)port);
+    int64_t id = ray_ipc_listen_at(poll, bind_host, (uint16_t)port);
     if (id < 0) {
         int e = errno;
-        return ray_error("io", "listen: bind to port %lld failed: %s",
-                         (long long)port, strerror(e ? e : EADDRINUSE));
+        return ray_error("io", "listen: bind to %s port %lld failed: %s",
+                         bind_host ? bind_host : "*", (long long)port,
+                         strerror(e ? e : EADDRINUSE));
     }
     return ray_i64(id);
 }
@@ -241,7 +275,7 @@ static const ray_syscmd_t TABLE[] = {
     { "timeit", "t",  h_timeit, 0,                                "Toggle profiling on/off (or :t 0|1)."     },
     { "env",    NULL, h_env,    0,                                "List defined globals."                    },
     { "clear",  NULL, h_clear,  RAY_SYSCMD_REPL_ONLY,            "Clear the screen."                        },
-    { "listen", NULL, h_listen, RAY_SYSCMD_RESTRICTED,           "Start IPC listener on PORT."              },
+    { "listen", NULL, h_listen, RAY_SYSCMD_RESTRICTED,           "Start IPC listener on PORT or \"HOST:PORT\"." },
     { "q",      NULL, h_quit,   RAY_SYSCMD_REPL_ONLY,            "Exit the REPL."                           },
     { "quit",   NULL, h_quit,   RAY_SYSCMD_REPL_ONLY,            "Exit the REPL."                           },
 };

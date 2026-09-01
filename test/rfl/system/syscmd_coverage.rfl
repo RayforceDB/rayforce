@@ -78,6 +78,14 @@
 (.sys.timeit 3.14)   !- type
 (.sys.listen 1.5)    !- type
 (.sys.listen 3.14)   !- type
+
+;; ────────────── listen "HOST:PORT" form (#427): argument guards ─────
+;; All of these fail before any socket is touched.
+(.sys.listen ":123")             !- type
+(.sys.listen "127.0.0.1:")       !- domain
+(.sys.listen "127.0.0.1:1abc")   !- domain
+(.sys.listen "127.0.0.1:70000")  !- domain
+(.sys.listen "127.0.0.1:0")      !- domain
 ;; State should be untouched by the failed timeit calls above (the
 ;; type guard runs before the profiler flag is poked).  Confirm by
 ;; toggling and reading back.

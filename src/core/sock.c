@@ -48,8 +48,22 @@
 
 /* ===== Socket Implementation ===== */
 
-ray_sock_t ray_sock_listen(uint16_t port)
+ray_sock_t ray_sock_listen_at(const char* host, uint16_t port)
 {
+    /* NULL/empty host keeps the historical INADDR_ANY bind.  A host that
+     * does not parse as an IPv4 address is a loud bind failure — never a
+     * silent fallback to all interfaces, which would defeat the point of
+     * asking for a confined listener. */
+    struct in_addr bind_addr;
+    if (host && *host) {
+        if (inet_pton(AF_INET, host, &bind_addr) != 1) {
+            errno = EINVAL;
+            return RAY_INVALID_SOCK;
+        }
+    } else {
+        bind_addr.s_addr = htonl(INADDR_ANY);
+    }
+
     ray_sock_t fd = (ray_sock_t)socket(AF_INET, SOCK_STREAM, 0);
     if (fd == RAY_INVALID_SOCK) return RAY_INVALID_SOCK;
 
@@ -59,7 +73,7 @@ ray_sock_t ray_sock_listen(uint16_t port)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr        = bind_addr;
     addr.sin_port        = htons(port);
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -71,6 +85,11 @@ ray_sock_t ray_sock_listen(uint16_t port)
         return RAY_INVALID_SOCK;
     }
     return fd;
+}
+
+ray_sock_t ray_sock_listen(uint16_t port)
+{
+    return ray_sock_listen_at(NULL, port);
 }
 
 ray_sock_t ray_sock_accept(ray_sock_t srv)
