@@ -24,6 +24,18 @@
 ;; ordering on guid operands is undefined — loud, not silent
 (select {from: t where: (< g g1)}) !- type
 
+;; GUID membership: the typed `in` kernel read guid cells at the wrong width
+;; (every cell decoded to 0), so `in`/`not-in` silently matched everything.
+;; The kernel now bails guid to the guid-aware hashset path.
+(set gsub (at gs [0 2]))
+(in gs gsub) -- [true false true]
+(not (in gs gsub)) -- [false true false]
+(get (select {from: t where: (in g gsub)}) 'v) -- [10 30]
+(get (select {from: t where: (not (in g gsub))}) 'v) -- [20]
+(at (get (select {from: t where: (in g gsub) s: (sum v)}) 's) 0) -- 40
+;; membership against an empty set matches nothing (no all-true collapse)
+(in gs (at gs [])) -- [false false false]
+
 ;; like over a string column inside select-where (table construction
 ;; normalizes the list to a STR column; the real list-of-atoms shape —
 ;; a legacy STRL splayed load — is covered by legacy_strl_predicates.rfl)
@@ -56,3 +68,7 @@
 (count (get (select {from: PT where: (!= g pg1)}) 'v)) -- 4
 ;; ordering stays loud on parted guids too
 (select {from: PT where: (< g pg1)}) !- type
+
+;; partitioned guid columns take the same in/not-in fallback
+(get (select {from: PT where: (in g (at PG1 [0 1]))}) 'v) -- [10 20]
+(get (select {from: PT where: (not (in g (at PG1 [0 1])))}) 'v) -- [30 40 50]
