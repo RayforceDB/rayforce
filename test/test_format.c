@@ -541,6 +541,45 @@ static test_result_t test_fmt_table_utf8_width(void) {
     ray_release(col_s);
     ray_release(col_v);
     ray_release(tbl);
+
+    /* Combining marks are width 0: bare and pointed Hebrew are the same
+     * four letters and must occupy the same four columns, so their data
+     * lines differ by exactly the marks' byte count. */
+    const char* heb_bare   = "\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d";  /* שלום */
+    const char* heb_marked = "\xd7\xa9\xd7\x81\xd6\xb8"           /* ש + dot + qamats */
+                             "\xd7\x9c\xd7\x95\xd6\xb9\xd7\x9d";  /* ל, ו + holam, ם */
+    ray_t* tbl2 = ray_table_new(1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
+    int64_t hids[] = {
+        ray_sym_intern(heb_bare, (int64_t)strlen(heb_bare)),
+        ray_sym_intern(heb_marked, (int64_t)strlen(heb_marked)),
+    };
+    ray_t* col_h = ray_vec_from_raw(RAY_SYM, hids, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_h));
+    tbl2 = ray_table_add_col(tbl2, ray_sym_intern("h", 1), col_h);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
+
+    ray_t* result2 = ray_fmt(tbl2, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result2));
+    const char* s2 = ray_str_ptr(result2);
+    const char* bare_line   = strstr(s2, heb_bare);
+    const char* marked_line = strstr(s2, heb_marked);
+    TEST_ASSERT_NOT_NULL(bare_line);
+    TEST_ASSERT_NOT_NULL(marked_line);
+    /* strstr(heb_bare) can land on the marked row if the marked bytes embed
+     * the bare sequence — they don't (marks interleave), but anchor to line
+     * starts to be safe. */
+    while (bare_line > s2 && bare_line[-1] != '\n') bare_line--;
+    while (marked_line > s2 && marked_line[-1] != '\n') marked_line--;
+    TEST_ASSERT_TRUE(bare_line != marked_line);
+    size_t bare_len   = strcspn(bare_line, "\n");
+    size_t marked_len = strcspn(marked_line, "\n");
+    int64_t mark_bytes = (int64_t)strlen(heb_marked) - (int64_t)strlen(heb_bare);
+    TEST_ASSERT_EQ_I((int64_t)marked_len, (int64_t)bare_len + mark_bytes);
+
+    ray_release(result2);
+    ray_release(col_h);
+    ray_release(tbl2);
     PASS();
 }
 

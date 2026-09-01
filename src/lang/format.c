@@ -738,9 +738,24 @@ static int32_t fmt_utf8_width(const char* s, int32_t slen) {
         }
         if (!ok) { w += 1; i += 1; continue; }
         i += cont + 1;
-        if ((cp >= 0x0300 && cp <= 0x036F) ||       /* combining marks */
+        if ((cp >= 0x0300 && cp <= 0x036F) ||       /* Latin combining marks */
+            (cp >= 0x0483 && cp <= 0x0489) ||       /* Cyrillic combining */
+            (cp >= 0x0591 && cp <= 0x05BD) ||       /* Hebrew points (niqqud) */
+            cp == 0x05BF || cp == 0x05C1 || cp == 0x05C2 ||
+            cp == 0x05C4 || cp == 0x05C5 || cp == 0x05C7 ||
+            (cp >= 0x0610 && cp <= 0x061A) ||       /* Arabic marks */
+            (cp >= 0x064B && cp <= 0x065F) ||       /* Arabic harakat */
+            cp == 0x0670 ||
+            (cp >= 0x06D6 && cp <= 0x06DC) ||
+            (cp >= 0x0E31 && cp <= 0x0E3A) ||       /* Thai vowels above/below */
+            (cp >= 0x0E47 && cp <= 0x0E4E) ||
             (cp >= 0x200B && cp <= 0x200F) ||       /* zero-width spaces */
-            (cp >= 0xFE00 && cp <= 0xFE0F))         /* variation selectors */
+            (cp >= 0x202A && cp <= 0x202E) ||       /* bidi embedding/override */
+            (cp >= 0x2060 && cp <= 0x2064) ||       /* word joiner, invisibles */
+            (cp >= 0x2066 && cp <= 0x2069) ||       /* bidi isolates */
+            (cp >= 0xFE00 && cp <= 0xFE0F) ||       /* variation selectors */
+            (cp >= 0xFE20 && cp <= 0xFE2F) ||       /* combining half marks */
+            cp == 0xFEFF)                           /* BOM / zero-width nbsp */
             continue;                               /* width 0 */
         if ((cp >= 0x1100  && cp <= 0x115F)  ||     /* Hangul jamo */
             (cp >= 0x2E80  && cp <= 0xA4CF)  ||     /* CJK radicals..Yi */
