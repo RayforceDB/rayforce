@@ -989,13 +989,34 @@ ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
         memcpy(ray_data(v), data, data_size);
     }
 
-    if (type == RAY_SYM) {
-        for (int64_t i = 0; i < count; i++) {
-            if (ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs) == 0) {
-                v->attrs |= RAY_ATTR_HAS_NULLS;
-                break;
+    /* Raw payloads arrive with in-band null sentinels already in place
+     * (e.g. a binding passing INT64_MIN for an absent quantity), and
+     * HAS_NULLS is the fast-path gate ray_vec_is_null and the query/
+     * serde paths trust — a sentinel without the flag renders and
+     * aggregates as ordinary data.  Scan once at construction; the
+     * sentinel stays the source of truth. */
+    switch (type) {
+        case RAY_SYM:
+            for (int64_t i = 0; i < count; i++) {
+                if (ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs) == 0) {
+                    v->attrs |= RAY_ATTR_HAS_NULLS;
+                    break;
+                }
             }
-        }
+            break;
+        case RAY_F64: case RAY_F32:
+        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+        case RAY_I16: case RAY_GUID:
+            for (int64_t i = 0; i < count; i++) {
+                if (sentinel_is_null(v, i)) {
+                    v->attrs |= RAY_ATTR_HAS_NULLS;
+                    break;
+                }
+            }
+            break;
+        default:
+            break;  /* BOOL/U8/LIST/TABLE: non-nullable or pointer payloads */
     }
 
     /* LIST/TABLE elements are child pointers — retain them */
