@@ -643,6 +643,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
 
 ray_t*       ray_table_new(int64_t ncols);
 ray_t*       ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec);
+ray_t*       ray_table_validate_rectangular(ray_t* tbl, const char* context);
 ray_t*       ray_table_get_col(ray_t* tbl, int64_t name_id);
 ray_t*       ray_table_get_col_idx(ray_t* tbl, int64_t idx);
 int64_t     ray_table_col_name(ray_t* tbl, int64_t idx);

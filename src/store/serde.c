@@ -812,20 +812,6 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return e;
         }
 
-        /* Every column must have the same length (the table's row count).  A
-         * frame with ragged columns would leave ray_table_nrows reporting
-         * column 0's length while row-wise ops read past the shorter ones. */
-        ray_t** cps = (ray_t**)ray_data(cols);
-        int64_t nrows = (cols->len > 0 && cps[0]) ? cps[0]->len : 0;
-        for (int64_t i = 1; i < cols->len; i++) {
-            if (!cps[i] || cps[i]->len != nrows) {
-                ray_t* e = ray_error("domain", "deserialize table: ragged columns (column %lld has %lld rows, expected %lld)", (long long)i, (long long)(cps[i] ? cps[i]->len : -1), (long long)nrows);
-                ray_release(schema);
-                ray_release(cols);
-                return e;
-            }
-        }
-
         int64_t ncols = cols->len;
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
@@ -848,6 +834,14 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
                 return new_tbl;
             }
             tbl = new_tbl;
+        }
+
+        ray_t* shape_err = ray_table_validate_rectangular(tbl, "deserialize table");
+        if (shape_err) {
+            ray_release(tbl);
+            ray_release(schema);
+            ray_release(cols);
+            return shape_err;
         }
 
         ray_release(schema);

@@ -58,6 +58,21 @@ static inline ray_t* tbl_cols(ray_t* tbl) {
     return tbl_slots(tbl)[1];
 }
 
+static bool table_col_is_valid(ray_t* col) {
+    if (!col || RAY_IS_ERR(col)) return false;
+    return col->type == RAY_LIST ||
+           ray_is_vec(col) ||
+           RAY_IS_PARTED(col->type) ||
+           col->type == RAY_MAPCOMMON;
+}
+
+static int64_t table_col_nrows(ray_t* col) {
+    if (!col) return 0;
+    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)
+        return ray_parted_nrows(col);
+    return col->len;
+}
+
 /* --------------------------------------------------------------------------
  * ray_table_new — allocates an empty table with capacity for `ncols`.
  *
@@ -103,7 +118,9 @@ ray_t* ray_table_new(int64_t ncols) {
 
 ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
-    if (!col_vec || RAY_IS_ERR(col_vec)) return ray_error("type", "table add_col: column must be a vector, got %s", col_vec ? ray_type_name(col_vec->type) : "null");
+    if (!table_col_is_valid(col_vec))
+        return ray_error("domain", "table add_col: column must be list/vector-like, got %s",
+                         col_vec ? ray_type_name(col_vec->type) : "null");
 
     tbl = ray_cow(tbl);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
@@ -125,6 +142,41 @@ ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
     slots[1] = new_cols;
 
     return tbl;
+}
+
+ray_t* ray_table_validate_rectangular(ray_t* tbl, const char* context) {
+    const char* where = context ? context : "table";
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    if (tbl->type != RAY_TABLE)
+        return ray_error("type", "%s: expected table, got %s", where, ray_type_name(tbl->type));
+
+    ray_t* schema = tbl_schema(tbl);
+    ray_t* cols = tbl_cols(tbl);
+    if (!schema || !cols || RAY_IS_ERR(schema) || RAY_IS_ERR(cols))
+        return ray_error("domain", "%s: malformed table storage", where);
+    if (schema->len != cols->len)
+        return ray_error("domain",
+                         "%s: schema/column count mismatch (%lld names, %lld columns)",
+                         where, (long long)schema->len, (long long)cols->len);
+
+    ray_t** col_ptrs = (ray_t**)ray_data(cols);
+    int64_t expected = 0;
+    for (int64_t i = 0; i < cols->len; i++) {
+        ray_t* col = col_ptrs[i];
+        if (!table_col_is_valid(col))
+            return ray_error("domain", "%s: column must be list/vector-like, got %s",
+                             where, col ? ray_type_name(col->type) : "null");
+        int64_t got = table_col_nrows(col);
+        if (i == 0) {
+            expected = got;
+        } else if (got != expected) {
+            return ray_error("domain",
+                             "%s: ragged columns (column %lld has %lld rows, expected %lld)",
+                             where, (long long)i, (long long)got, (long long)expected);
+        }
+    }
+
+    return NULL;
 }
 
 /* --------------------------------------------------------------------------
