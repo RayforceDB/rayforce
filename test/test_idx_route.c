@@ -2168,13 +2168,15 @@ static test_result_t test_distinct_f64_nan_no_null_attr(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    /* Three rows of canonical NaN, no HAS_NULLS flag. */
+    /* Three rows of canonical NaN, no HAS_NULLS flag.  from_raw flags
+     * sentinel NaNs (#445), so strip the attr deliberately — this test pins
+     * distinct's behavior on an unflagged (legacy / flag-dropped) vector. */
     double nan_val = __builtin_nan("");
     double raw[5] = { 1.0, nan_val, nan_val, nan_val, 2.0 };
     ray_t* v_no_idx = ray_vec_from_raw(RAY_F64, raw, 5);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v_no_idx));
-    /* Confirm HAS_NULLS is NOT set */
-    TEST_ASSERT((v_no_idx->attrs & 0x40) == 0, "HAS_NULLS must not be set on raw-constructed vector");
+    v_no_idx->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    TEST_ASSERT((v_no_idx->attrs & 0x40) == 0, "HAS_NULLS stripped for the unflagged-sentinel path");
 
     ray_t* r_no_idx = distinct_vec_eager(v_no_idx);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r_no_idx));
@@ -2182,6 +2184,7 @@ static test_result_t test_distinct_f64_nan_no_null_attr(void) {
 
     ray_t* v_idx = ray_vec_from_raw(RAY_F64, raw, 5);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v_idx));
+    v_idx->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&v_idx)));
 
     ray_t* r_idx = distinct_vec_eager(v_idx);
