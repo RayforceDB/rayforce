@@ -498,6 +498,52 @@ static test_result_t test_fmt_raw_elem_list_null(void) {
 }
 
 /* ---- Test: table with short col that triggers NA in head half ---- */
+/* #454: cell padding must use DISPLAY width, not byte length.  A CJK char
+ * is 3 UTF-8 bytes but renders 2 terminal columns, so byte-based padding
+ * tore the table borders on any row holding a multi-byte symbol. */
+static test_result_t test_fmt_table_utf8_width(void) {
+    ray_t* tbl = ray_table_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* "ab牛来": 8 bytes, 6 display columns.  "abcd": 4 bytes, 4 columns. */
+    const char* wide_sym = "ab\xe7\x89\x9b\xe6\x9d\xa5";
+    int64_t ids[] = { ray_sym_intern(wide_sym, 8), ray_sym_intern("abcd", 4) };
+    int64_t vals[] = { 1, 2 };
+    ray_t* col_s = ray_vec_from_raw(RAY_SYM, ids, 2);
+    ray_t* col_v = ray_vec_from_raw(RAY_I64, vals, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_s));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_v));
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), col_s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), col_v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_t* result = ray_fmt(tbl, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    const char* s = ray_str_ptr(result);
+
+    const char* wide_line  = strstr(s, wide_sym);
+    const char* ascii_line = strstr(s, "abcd");
+    TEST_ASSERT_NOT_NULL(wide_line);
+    TEST_ASSERT_NOT_NULL(ascii_line);
+    while (wide_line > s && wide_line[-1] != '\n') wide_line--;
+    while (ascii_line > s && ascii_line[-1] != '\n') ascii_line--;
+    size_t wide_len  = strcspn(wide_line, "\n");
+    size_t ascii_len = strcspn(ascii_line, "\n");
+
+    /* Equal display width means the wide row carries exactly the byte
+     * surplus of its wide chars: 2 CJK chars x (3 bytes - 2 columns)
+     * = +2 bytes over the ASCII row.  Byte-based padding rendered the
+     * two rows byte-EQUAL (and visually torn), which this catches. */
+    TEST_ASSERT_EQ_I((int64_t)wide_len, (int64_t)ascii_len + 2);
+
+    ray_release(result);
+    ray_release(col_s);
+    ray_release(col_v);
+    ray_release(tbl);
+    PASS();
+}
+
 static test_result_t test_fmt_table_na_head(void) {
     /* With nrows=5 (half=2), a col of len=1 has ri=0 hit, ri=1 miss -> NA in head */
     int64_t nrows = 5;
@@ -1762,5 +1808,6 @@ const test_entry_t format_entries[] = {
     { "format/table/wide_tall", test_fmt_table_wide_and_tall, fmt_setup, fmt_teardown },
     { "format/table/list_col_null", test_fmt_raw_elem_list_null, fmt_setup, fmt_teardown },
     { "format/table/na_head", test_fmt_table_na_head, fmt_setup, fmt_teardown },
+    { "format/table/utf8_width", test_fmt_table_utf8_width, fmt_setup, fmt_teardown },
     { NULL, NULL, NULL, NULL },
 };
