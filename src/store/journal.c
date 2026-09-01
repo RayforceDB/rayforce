@@ -29,6 +29,7 @@
 #include "fileio.h"
 #include "serde.h"
 #include "core/ipc.h"
+#include "core/timer.h"
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "mem/sys.h"
@@ -56,12 +57,14 @@ static struct {
     char               base[RAY_JOURNAL_PATH_MAX];
     char               log_path[RAY_JOURNAL_PATH_MAX];
     bool               in_replay;
+    int64_t            log_gen;    /* live log's generation id, 0 = legacy/unknown */
 } g_journal = {
     .mode      = RAY_JOURNAL_OFF,
     .fp        = NULL,
     .base      = {0},
     .log_path  = {0},
     .in_replay = false,
+    .log_gen   = 0,
 };
 
 /* ── helpers ──────────────────────────────────────────────────────── */
@@ -79,6 +82,57 @@ static bool file_exists(const char* path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 #endif
+}
+
+/* ── log generation preamble (#420) ──────────────────────────────────
+ *
+ * Snapshot-then-roll is two renames that are individually but not
+ * jointly atomic.  A crash between them leaves a fresh <base>.qdb next
+ * to the OLD <base>.log whose entries are already baked into that
+ * snapshot; replaying it applies every entry twice (entries are
+ * arbitrary expressions — not idempotent).  The same happens without a
+ * crash when the roll's rename fails and the old log is reopened for
+ * append.
+ *
+ * The fix is identity, not ordering: a fresh log starts with a 16-byte
+ * preamble carrying a generation id, and the snapshot records inside
+ * the .qdb which (generation, byte length) it covers.  Recovery then
+ * replays the live log only PAST the covered offset when the ids
+ * match — a crash in the window replays nothing; the roll-failure
+ * append path replays exactly the post-snapshot tail.  A log without
+ * the preamble (pre-#420) keeps today's full-replay behavior.
+ *
+ * The preamble cannot be confused with a frame: entries start with
+ * RAY_SERDE_PREFIX, not this magic. */
+
+#define RAY_JLOG_MAGIC     "RAYJLG1"        /* 7 chars + NUL = 8 bytes */
+#define RAY_JLOG_PREAMBLE  16
+
+/* The sym key the snapshot dict reserves for the coverage marker; the
+ * recovery bind loop skips it.  Value: I64 vec [generation, bytes]. */
+#define RAY_JLOG_COVER_KEY ".journal.covered"
+
+/* Probe a log file's preamble.  Returns the byte offset where frames
+ * start (0 for a legacy headerless log) and sets *out_gen (0 legacy). */
+static int64_t jlog_probe(const char* path, int64_t* out_gen) {
+    if (out_gen) *out_gen = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t pre[RAY_JLOG_PREAMBLE];
+    size_t r = fread(pre, 1, sizeof(pre), f);
+    fclose(f);
+    if (r != sizeof(pre) || memcmp(pre, RAY_JLOG_MAGIC, 8) != 0) return 0;
+    int64_t gen;
+    memcpy(&gen, pre + 8, sizeof(gen));
+    if (out_gen) *out_gen = gen;
+    return RAY_JLOG_PREAMBLE;
+}
+
+/* Generation ids need only be distinct across the rolls of one journal;
+ * wall-clock ms with a low sequence salt is ample. */
+static int64_t jlog_fresh_gen(void) {
+    static int64_t seq = 0;
+    return (ray_time_now_ms() << 12) | (++seq & 0xFFF);
 }
 
 /* Read fixed-size buffer in a loop — fread can short-read on signals.
@@ -183,10 +237,15 @@ ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
     return RAY_OK;
 }
 
-ray_err_t ray_journal_replay(const char*           path,
-                             int64_t*              out_chunks,
-                             int64_t*              out_eval_errors,
-                             ray_jreplay_status_t* out_status)
+/* Replay frames from `start_off` (bytes) to EOF.  The offset is either
+ * the preamble size or the snapshot's covered length; seeking past EOF
+ * just reads a clean end (a log shorter than the covered length is a
+ * strict prefix of what the snapshot already holds — nothing to do). */
+static ray_err_t journal_replay_from(const char*           path,
+                                     int64_t               start_off,
+                                     int64_t*              out_chunks,
+                                     int64_t*              out_eval_errors,
+                                     ray_jreplay_status_t* out_status)
 {
     if (out_chunks)      *out_chunks      = 0;
     if (out_eval_errors) *out_eval_errors = 0;
@@ -194,6 +253,11 @@ ray_err_t ray_journal_replay(const char*           path,
 
     FILE* f = fopen(path, "rb");
     if (!f) {
+        if (out_status) *out_status = RAY_JREPLAY_IO;
+        return RAY_ERR_IO;
+    }
+    if (start_off > 0 && fseek(f, (long)start_off, SEEK_SET) != 0) {
+        fclose(f);
         if (out_status) *out_status = RAY_JREPLAY_IO;
         return RAY_ERR_IO;
     }
@@ -293,6 +357,15 @@ ray_err_t ray_journal_replay(const char*           path,
     return RAY_ERR_DOMAIN;
 }
 
+ray_err_t ray_journal_replay(const char*           path,
+                             int64_t*              out_chunks,
+                             int64_t*              out_eval_errors,
+                             ray_jreplay_status_t* out_status)
+{
+    return journal_replay_from(path, jlog_probe(path, NULL),
+                               out_chunks, out_eval_errors, out_status);
+}
+
 ray_err_t ray_journal_validate(const char* path,
                                int64_t*    out_chunks,
                                int64_t*    out_valid_bytes)
@@ -303,8 +376,16 @@ ray_err_t ray_journal_validate(const char* path,
     FILE* f = fopen(path, "rb");
     if (!f) return RAY_ERR_IO;
 
+    /* Frames start after the generation preamble (0 on legacy logs);
+     * valid_off stays an absolute file offset so truncate hints hold. */
+    int64_t start = jlog_probe(path, NULL);
+    if (start > 0 && fseek(f, (long)start, SEEK_SET) != 0) {
+        fclose(f);
+        return RAY_ERR_IO;
+    }
+
     int64_t chunks = 0;
-    int64_t valid_off = 0;
+    int64_t valid_off = start;
     /* Reuse one growing buffer for payload reads — most logs hold
      * many small entries plus the occasional large one, so growing on
      * demand is simpler than trying to size up front. */
@@ -344,10 +425,36 @@ ray_err_t ray_journal_validate(const char* path,
     return RAY_OK;
 }
 
-/* Open <base>.log in append mode after replay. */
+/* Open <base>.log in append mode after replay.  A fresh (empty or
+ * absent) log gets the generation preamble; an existing one keeps its
+ * generation (0 for a pre-#420 headerless log). */
 static ray_err_t open_log_for_append(void) {
+    bool fresh = true;
+    {   /* portable size probe (stat is unix-only here) */
+        FILE* probe = fopen(g_journal.log_path, "rb");
+        if (probe) {
+            if (fseek(probe, 0, SEEK_END) == 0 && ftell(probe) > 0) fresh = false;
+            fclose(probe);
+        }
+    }
+    if (!fresh) {
+        jlog_probe(g_journal.log_path, &g_journal.log_gen);
+    }
     g_journal.fp = fopen(g_journal.log_path, "ab");
     if (!g_journal.fp) return RAY_ERR_IO;
+    if (fresh) {
+        int64_t gen = jlog_fresh_gen();
+        uint8_t pre[RAY_JLOG_PREAMBLE] = {0};
+        memcpy(pre, RAY_JLOG_MAGIC, 8);
+        memcpy(pre + 8, &gen, sizeof(gen));
+        if (fwrite(pre, 1, sizeof(pre), g_journal.fp) != sizeof(pre) ||
+            fflush(g_journal.fp) != 0) {
+            fclose(g_journal.fp);
+            g_journal.fp = NULL;
+            return RAY_ERR_IO;
+        }
+        g_journal.log_gen = gen;
+    }
     /* Disable stdio buffering: every fwrite must reach the OS buffer
      * immediately so a SIGTERM (or any non-clean shutdown) still leaves
      * the entry on disk.  Without this, the default block-buffered FILE*
@@ -371,6 +478,9 @@ ray_err_t ray_journal_recover(const char* base) {
         return RAY_ERR_DOMAIN;
     if (!path_join_ext(log_path, sizeof(log_path), base, ".log"))
         return RAY_ERR_DOMAIN;
+
+    int64_t cover_gen = 0;
+    int64_t cover_len = 0;
 
     /* 1. Snapshot — load <base>.qdb if present. */
     if (file_exists(qdb_path)) {
@@ -406,6 +516,21 @@ ray_err_t ray_journal_recover(const char* base) {
             }
             int64_t sym_id = ((int64_t*)ray_data(keys))[i];
             ray_t* v = ray_list_get(vals, i);
+            /* The coverage marker (#420) is snapshot metadata, not a
+             * user binding — record it and keep it out of the env. */
+            {
+                ray_t* ks = ray_sym_str(sym_id);   /* borrowed */
+                if (ks && !RAY_IS_ERR(ks) &&
+                    ray_str_len(ks) == strlen(RAY_JLOG_COVER_KEY) &&
+                    memcmp(ray_str_ptr(ks), RAY_JLOG_COVER_KEY,
+                           strlen(RAY_JLOG_COVER_KEY)) == 0) {
+                    if (v && v->type == RAY_I64 && v->len == 2) {
+                        cover_gen = ((int64_t*)ray_data(v))[0];
+                        cover_len = ((int64_t*)ray_data(v))[1];
+                    }
+                    continue;
+                }
+            }
             if (!v) {
                 fprintf(stderr, "log: WARN  snapshot value missing for sym %lld — skipping\n",
                         (long long)sym_id);
@@ -439,11 +564,24 @@ ray_err_t ray_journal_recover(const char* base) {
         }
     }
 
-    /* 2. Log — replay <base>.log if present. */
+    /* 2. Log — replay <base>.log if present.  When the snapshot's
+     * coverage marker names THIS log generation, its prefix is already
+     * baked into the .qdb we just loaded — a crash between the .qdb
+     * rename and the roll (or a failed roll that kept appending) —
+     * so replay starts past the covered bytes instead of applying
+     * every covered entry a second time (#420). */
     if (file_exists(log_path)) {
+        int64_t log_gen = 0;
+        int64_t start = jlog_probe(log_path, &log_gen);
+        if (cover_gen != 0 && log_gen == cover_gen && cover_len > start) {
+            fprintf(stderr,
+                    "log: snapshot covers %lld bytes of %s (gen %lld) — replaying tail only\n",
+                    (long long)cover_len, log_path, (long long)log_gen);
+            start = cover_len;
+        }
         int64_t chunks = 0, errs = 0;
         ray_jreplay_status_t status = RAY_JREPLAY_OK;
-        ray_journal_replay(log_path, &chunks, &errs, &status);
+        journal_replay_from(log_path, start, &chunks, &errs, &status);
         switch (status) {
         case RAY_JREPLAY_OK: {
             fprintf(stderr, "log: replayed %lld entries (%lld eval errors) from %s\n",
@@ -742,6 +880,46 @@ ray_err_t ray_journal_snapshot(void) {
     }
     ray_sys_free(sym_ids);
     ray_sys_free(vals_buf);
+
+    /* Coverage marker (#420): record which live-log prefix this snapshot
+     * already contains, so recovery can skip it when a crash (or a failed
+     * roll) leaves that log next to the fresh .qdb.  Captured before the
+     * .qdb rename so the marker can only under-cover, never over-cover:
+     * an entry logged after this point replays as tail. */
+    if (g_journal.log_gen != 0) {
+        fflush(g_journal.fp);
+        long pos = ftell(g_journal.fp);
+        if (pos >= RAY_JLOG_PREAMBLE) {
+            int64_t marker[2] = { g_journal.log_gen, (int64_t)pos };
+            ray_t* mv = ray_vec_from_raw(RAY_I64, marker, 2);
+            if (!mv || RAY_IS_ERR(mv)) {
+                if (mv) ray_error_free(mv);
+                ray_release(keys);
+                ray_release(vals);
+                return RAY_ERR_OOM;
+            }
+            int64_t mk = ray_sym_intern(RAY_JLOG_COVER_KEY,
+                                        (int64_t)strlen(RAY_JLOG_COVER_KEY));
+            ray_t* prev_keys = keys;
+            keys = ray_vec_append(keys, &mk);
+            if (RAY_IS_ERR(keys)) {
+                ray_error_free(keys);
+                ray_release(prev_keys);
+                ray_release(vals);
+                ray_release(mv);
+                return RAY_ERR_OOM;
+            }
+            ray_t* prev_vals = vals;
+            vals = ray_list_append(vals, mv);
+            ray_release(mv);
+            if (RAY_IS_ERR(vals)) {
+                ray_error_free(vals);
+                ray_release(prev_vals);
+                ray_release(keys);
+                return RAY_ERR_OOM;
+            }
+        }
+    }
 
     ray_t* snap = ray_dict_new(keys, vals);
     if (!snap || RAY_IS_ERR(snap)) {
