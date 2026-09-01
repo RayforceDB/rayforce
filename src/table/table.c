@@ -118,9 +118,11 @@ ray_t* ray_table_new(int64_t ncols) {
 
 ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
-    if (!table_col_is_valid(col_vec))
+    if (!table_col_is_valid(col_vec)) {
+        ray_release(tbl);
         return ray_error("domain", "table add_col: column must be list/vector-like, got %s",
                          col_vec ? ray_type_name(col_vec->type) : "null");
+    }
 
     tbl = ray_cow(tbl);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
@@ -146,7 +148,10 @@ ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
 
 ray_t* ray_table_validate_rectangular(ray_t* tbl, const char* context) {
     const char* where = context ? context : "table";
-    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    if (!tbl) return ray_error("type", "%s: expected table, got null", where);
+    if (RAY_IS_ERR(tbl))
+        return ray_error(ray_err_code(tbl) ? ray_err_code(tbl) : "error",
+                         "%s: expected table, got error", where);
     if (tbl->type != RAY_TABLE)
         return ray_error("type", "%s: expected table, got %s", where, ray_type_name(tbl->type));
 

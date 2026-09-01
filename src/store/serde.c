@@ -828,7 +828,6 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
                 : ray_read_sym(name_data, i, RAY_SYM, schema->attrs);
             ray_t* new_tbl = ray_table_add_col(tbl, name_id, col_ptrs[i]);
             if (!new_tbl || RAY_IS_ERR(new_tbl)) {
-                ray_release(tbl);
                 ray_release(schema);
                 ray_release(cols);
                 return new_tbl;
