@@ -40,6 +40,10 @@
 
 #define DICT_DATA_SIZE  (2 * sizeof(ray_t*))
 
+static bool dict_side_is_list_or_vec(ray_t* side) {
+    return side && !RAY_IS_ERR(side) && (side->type == RAY_LIST || ray_is_vec(side));
+}
+
 static ray_t* dict_alloc_block(ray_t* keys, ray_t* vals) {
     ray_t* d = ray_alloc(DICT_DATA_SIZE);
     if (!d || RAY_IS_ERR(d)) return d;
@@ -68,6 +72,26 @@ ray_t* ray_dict_new(ray_t* keys, ray_t* vals) {
     if (!vals || RAY_IS_ERR(vals)) {
         ray_release(keys);
         return vals ? vals : ray_error("type", "dict: vals vector is null");
+    }
+    if (!dict_side_is_list_or_vec(keys)) {
+        ray_release(keys);
+        ray_release(vals);
+        return ray_error("domain", "dict: keys must be list/vector-like, got %s",
+                         ray_type_name(keys->type));
+    }
+    if (!dict_side_is_list_or_vec(vals)) {
+        ray_release(keys);
+        ray_release(vals);
+        return ray_error("domain", "dict: vals must be list/vector-like, got %s",
+                         ray_type_name(vals->type));
+    }
+    if (keys->len != vals->len) {
+        int64_t klen = keys->len;
+        int64_t vlen = vals->len;
+        ray_release(keys);
+        ray_release(vals);
+        return ray_error("domain", "dict: key/value count mismatch (%lld keys, %lld values)",
+                         (long long)klen, (long long)vlen);
     }
     ray_t* d = dict_alloc_block(keys, vals);
     if (!d || RAY_IS_ERR(d)) {

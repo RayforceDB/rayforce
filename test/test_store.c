@@ -643,7 +643,8 @@ static test_result_t test_splay_save_preflight_preserves_generation(void) {
                                       ray_vec_from_raw(RAY_I64, dv_raw, 2));
     ray_t* bad = ray_table_new(2);
     bad = ray_table_add_col(bad, k_id, new_k);
-    bad = ray_table_add_col(bad, v_id, unsupported);
+    bad = ray_table_add_col(bad, v_id, old_v);
+    ray_table_set_col_idx(bad, 1, unsupported);
     TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
     TEST_ASSERT_EQ_I(ray_splay_save(bad, TMP_SPLAY_DIR, NULL), RAY_ERR_NYI);
 
@@ -3180,6 +3181,128 @@ static test_result_t test_serde_table_dict_de_errors(void) {
     PASS();
 }
 
+/* Splice a container frame — [type][attrs] + payload(a) + payload(b) — from two
+ * real serialized sub-objects, wrapped in a fresh ipc header.  Uses ray_ser and
+ * sizeof(ray_ipc_header_t), so it stays honest if the wire layout ever changes
+ * (rather than hard-coding the header size / field offsets). */
+#define TEST_ASSERT_ERR_CODE_MSG(r, code, needle) do {                       \
+    TEST_ASSERT_NOT_NULL(r);                                                 \
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));                                         \
+    TEST_ASSERT_STR_EQ(ray_err_code(r), code);                               \
+    const char* _msg = ray_error_msg();                                      \
+    TEST_ASSERT_NOT_NULL(_msg);                                              \
+    TEST_ASSERT_FMT(strstr(_msg, needle) != NULL,                            \
+                    "error message \"%s\" does not contain \"%s\"",         \
+                    _msg, needle);                                           \
+} while (0)
+
+static ray_t* serde_splice_container(uint8_t type_byte, ray_t* a, ray_t* b) {
+    size_t hdrsz = sizeof(ray_ipc_header_t);
+    ray_t* fa = ray_ser(a);
+    ray_t* fb = ray_ser(b);
+    if (!fa || RAY_IS_ERR(fa) || !fb || RAY_IS_ERR(fb)) {
+        if (fa) ray_release(fa);
+        if (fb) ray_release(fb);
+        return NULL;
+    }
+    size_t pa = (size_t)fa->len - hdrsz;
+    size_t pb = (size_t)fb->len - hdrsz;
+    int64_t payload = 2 + (int64_t)pa + (int64_t)pb;
+    int64_t total = (int64_t)hdrsz + payload;
+    ray_t* buf = ray_vec_new(RAY_U8, total);
+    if (!buf || RAY_IS_ERR(buf)) {
+        ray_release(fa);
+        ray_release(fb);
+        return buf;
+    }
+    buf->len = total;
+    uint8_t* p = (uint8_t*)ray_data(buf);
+    ray_ipc_header_t* hdr = (ray_ipc_header_t*)p;
+    hdr->prefix  = RAY_SERDE_PREFIX;
+    hdr->version = RAY_SERDE_WIRE_VERSION;
+    hdr->flags = 0; hdr->endian = RAY_SERDE_ENDIAN; hdr->msgtype = 0;
+    hdr->size = payload;
+    uint8_t* pl = p + hdrsz;
+    pl[0] = type_byte;
+    pl[1] = 0;
+    memcpy(pl + 2, (uint8_t*)ray_data(fa) + hdrsz, pa);
+    memcpy(pl + 2 + pa, (uint8_t*)ray_data(fb) + hdrsz, pb);
+    ray_release(fa);
+    ray_release(fb);
+    return buf;
+}
+
+/* A container frame whose two counts disagree must be rejected, not silently
+ * accepted as the shorter of the two. */
+static test_result_t test_serde_container_count_mismatch(void) {
+    /* TABLE: 2 schema names, 1 column → rejected (not truncated to 1 column). */
+    {
+        int64_t names[] = { 7, 7 };
+        ray_t* schema = ray_vec_from_raw(RAY_I64, names, 2);
+        int64_t c0[] = { 1 };
+        ray_t* cols = ray_list_new(1);
+        ray_t* col0 = ray_vec_from_raw(RAY_I64, c0, 1);
+        cols = ray_list_append(cols, col0);
+        ray_release(col0);
+        ray_t* frame = serde_splice_container((uint8_t)RAY_TABLE, schema, cols);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_ERR_CODE_MSG(r, "domain", "schema/column count mismatch");
+        ray_error_free(r); ray_release(frame); ray_release(schema); ray_release(cols);
+    }
+    /* TABLE: 2 columns of unequal length (2 and 1) → rejected (ragged rows). */
+    {
+        int64_t names[] = { 7, 8 };
+        ray_t* schema = ray_vec_from_raw(RAY_I64, names, 2);
+        int64_t c0[] = { 1, 2 };
+        int64_t c1[] = { 3 };
+        ray_t* cols = ray_list_new(2);
+        ray_t* col0 = ray_vec_from_raw(RAY_I64, c0, 2);
+        ray_t* col1 = ray_vec_from_raw(RAY_I64, c1, 1);
+        cols = ray_list_append(cols, col0);
+        cols = ray_list_append(cols, col1);
+        ray_release(col0);
+        ray_release(col1);
+        ray_t* frame = serde_splice_container((uint8_t)RAY_TABLE, schema, cols);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_ERR_CODE_MSG(r, "domain", "ragged columns");
+        ray_error_free(r); ray_release(frame); ray_release(schema); ray_release(cols);
+    }
+    /* TABLE: atom columns are not valid columns even when their scalar payloads
+     * match, because row-wise code would read from non-existent vector data. */
+    {
+        int64_t names[] = { 7, 8 };
+        ray_t* schema = ray_vec_from_raw(RAY_I64, names, 2);
+        ray_t* cols = ray_list_new(2);
+        ray_t* col0 = ray_i64(2);
+        ray_t* col1 = ray_i64(2);
+        cols = ray_list_append(cols, col0);
+        cols = ray_list_append(cols, col1);
+        ray_release(col0);
+        ray_release(col1);
+        ray_t* frame = serde_splice_container((uint8_t)RAY_TABLE, schema, cols);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_ERR_CODE_MSG(r, "domain", "column must be list/vector-like");
+        ray_error_free(r); ray_release(frame); ray_release(schema); ray_release(cols);
+    }
+    /* DICT: 2 keys, 1 value → rejected (a probe would index vals[idx] with
+     * idx < keys->len, an OOB read past the shorter value block). */
+    {
+        int64_t keys[] = { 7, 8 };
+        ray_t* k = ray_vec_from_raw(RAY_I64, keys, 2);
+        int64_t vals[] = { 1 };
+        ray_t* v = ray_vec_from_raw(RAY_I64, vals, 1);
+        ray_t* frame = serde_splice_container((uint8_t)RAY_DICT, k, v);
+        TEST_ASSERT_NOT_NULL(frame);
+        ray_t* r = ray_de(frame);
+        TEST_ASSERT_ERR_CODE_MSG(r, "domain", "key/value count mismatch");
+        ray_error_free(r); ray_release(frame); ray_release(k); ray_release(v);
+    }
+    PASS();
+}
+
 /* ---- serde coverage: TABLE deser type-mismatch and more error paths ------ */
 
 static test_result_t test_serde_table_de_type_mismatch(void) {
@@ -5055,6 +5178,109 @@ static test_result_t test_col_recursive_table(void) {
     PASS();
 }
 
+static bool test_write_exact(FILE* f, const void* data, size_t n) {
+    return fwrite(data, 1, n, f) == n;
+}
+
+static bool test_write_i8(FILE* f, int8_t v) {
+    return test_write_exact(f, &v, sizeof(v));
+}
+
+static bool test_write_u32(FILE* f, uint32_t v) {
+    return test_write_exact(f, &v, sizeof(v));
+}
+
+static bool test_write_i64(FILE* f, int64_t v) {
+    return test_write_exact(f, &v, sizeof(v));
+}
+
+static bool test_write_i64_vec(FILE* f, const int64_t* vals, int64_t len) {
+    return test_write_i8(f, (int8_t)RAY_I64) &&
+           test_write_i64(f, len) &&
+           test_write_exact(f, vals, (size_t)len * sizeof(vals[0]));
+}
+
+/* ---- test_col_recursive_container_guards -------------------------------- */
+static test_result_t test_col_recursive_container_guards(void) {
+    enum {
+        TEST_COL_LIST_MAGIC  = 0x4754534CU, /* "LSTG" */
+        TEST_COL_TABLE_MAGIC = 0x4C425454U  /* "TTBL" */
+    };
+
+    /* TABLE with atom columns: recursive on-disk decoding must hit the same
+     * shared table invariant as the serde decoder. */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        int64_t name_a = ray_sym_intern("bad_a", 5);
+        int64_t name_b = ray_sym_intern("bad_b", 5);
+        bool ok = test_write_u32(f, TEST_COL_TABLE_MAGIC) &&
+                  test_write_i8(f, (int8_t)RAY_TABLE) &&
+                  test_write_i64(f, 2) &&
+                  test_write_i64(f, 2) &&
+                  test_write_i64(f, name_a) &&
+                  test_write_i8(f, (int8_t)-RAY_I64) &&
+                  test_write_i64(f, 2) &&
+                  test_write_i64(f, name_b) &&
+                  test_write_i8(f, (int8_t)-RAY_I64) &&
+                  test_write_i64(f, 2);
+        fclose(f);
+        TEST_ASSERT_TRUE(ok);
+
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "column must be list/vector-like");
+        ray_error_free(bad);
+    }
+
+    /* TABLE with ragged vector columns. */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        int64_t name_a = ray_sym_intern("bad_a", 5);
+        int64_t name_b = ray_sym_intern("bad_b", 5);
+        int64_t a[] = { 1, 2 };
+        int64_t b[] = { 3 };
+        bool ok = test_write_u32(f, TEST_COL_TABLE_MAGIC) &&
+                  test_write_i8(f, (int8_t)RAY_TABLE) &&
+                  test_write_i64(f, 2) &&
+                  test_write_i64(f, 2) &&
+                  test_write_i64(f, name_a) &&
+                  test_write_i64_vec(f, a, 2) &&
+                  test_write_i64(f, name_b) &&
+                  test_write_i64_vec(f, b, 1);
+        fclose(f);
+        TEST_ASSERT_TRUE(ok);
+
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "ragged columns");
+        ray_error_free(bad);
+    }
+
+    /* DICT with two keys and one value, nested inside a generic list so it is
+     * decoded by col_read_recursive. */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        int64_t keys[] = { 7, 8 };
+        int64_t vals[] = { 1 };
+        bool ok = test_write_u32(f, TEST_COL_LIST_MAGIC) &&
+                  test_write_i8(f, (int8_t)RAY_LIST) &&
+                  test_write_i64(f, 1) &&
+                  test_write_i8(f, (int8_t)RAY_DICT) &&
+                  test_write_i64_vec(f, keys, 2) &&
+                  test_write_i64_vec(f, vals, 1);
+        fclose(f);
+        TEST_ASSERT_TRUE(ok);
+
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "key/value count mismatch");
+        ray_error_free(bad);
+    }
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
 /* ---- test_col_recursive_read_corrupt ------------------------------------ */
 /* Covers col_read_recursive corruption guards:
  *   line 398/402: LIST with truncated count / count < 0 => "corrupt"
@@ -5252,6 +5478,7 @@ const test_entry_t store_entries[] = {
     { "store/col_str_validate_corrupt", test_col_str_validate_corrupt, store_setup, store_teardown },
     { "store/col_recursive_list_in_list", test_col_recursive_list_in_list, store_setup, store_teardown },
     { "store/col_recursive_table", test_col_recursive_table, store_setup, store_teardown },
+    { "store/col_recursive_container_guards", test_col_recursive_container_guards, store_setup, store_teardown },
     { "store/col_recursive_read_corrupt", test_col_recursive_read_corrupt, store_setup, store_teardown },
     { "store/col_link_sidecar_whitespace", test_col_link_sidecar_whitespace, store_setup, store_teardown },
     { "store/col_save_nyi_type", test_col_save_nyi_type, store_setup, store_teardown },
@@ -5289,6 +5516,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_save_serde_error",     test_serde_save_serde_error,     store_setup, store_teardown },
     { "store/serde_de_raw_default",       test_serde_de_raw_default_and_errors, store_setup, store_teardown },
     { "store/serde_table_dict_de_errors", test_serde_table_dict_de_errors, store_setup, store_teardown },
+    { "store/serde_container_count_mismatch", test_serde_container_count_mismatch, store_setup, store_teardown },
     { "store/serde_table_de_type_mismatch", test_serde_table_de_type_mismatch, store_setup, store_teardown },
     { "store/serde_de_size_bounds",        test_serde_de_size_bounds,        store_setup, store_teardown },
     { "store/total_ram", test_total_ram, NULL, NULL },

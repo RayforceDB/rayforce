@@ -590,6 +590,11 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
             ray_release(col);  /* table_add_col retains */
             if (!tbl || RAY_IS_ERR(tbl)) return tbl;
         }
+        ray_t* shape_err = ray_table_validate_rectangular(tbl, "col load table");
+        if (shape_err) {
+            ray_release(tbl);
+            return shape_err;
+        }
         return tbl;
     }
 

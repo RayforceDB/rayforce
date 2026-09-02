@@ -822,18 +822,25 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
 
         void* name_data = ray_data(schema);
         ray_t** col_ptrs = (ray_t**)ray_data(cols);
-        for (int64_t i = 0; i < ncols && i < schema->len; i++) {
+        for (int64_t i = 0; i < ncols; i++) {   /* ncols == schema->len (guarded above) */
             int64_t name_id = (schema->type == RAY_I64)
                 ? ((int64_t*)name_data)[i]
                 : ray_read_sym(name_data, i, RAY_SYM, schema->attrs);
             ray_t* new_tbl = ray_table_add_col(tbl, name_id, col_ptrs[i]);
             if (!new_tbl || RAY_IS_ERR(new_tbl)) {
-                ray_release(tbl);
                 ray_release(schema);
                 ray_release(cols);
                 return new_tbl;
             }
             tbl = new_tbl;
+        }
+
+        ray_t* shape_err = ray_table_validate_rectangular(tbl, "deserialize table");
+        if (shape_err) {
+            ray_release(tbl);
+            ray_release(schema);
+            ray_release(cols);
+            return shape_err;
         }
 
         ray_release(schema);
@@ -855,6 +862,18 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         if (!vals || RAY_IS_ERR(vals)) {
             ray_release(keys);
             return vals;
+        }
+
+        /* One value per key: a dict probe finds a key index in [0, keys->len)
+         * and reads the value at that index, so a crafted dict with more keys
+         * than values would index the value block out of bounds (OOB
+         * read/release).  vals may be a LIST of column vectors or a flat value
+         * vector — either way its length must equal keys->len. */
+        if (keys->len != vals->len) {
+            ray_t* e = ray_error("domain", "deserialize dict: key/value count mismatch (%lld keys, %lld values)", (long long)keys->len, (long long)vals->len);
+            ray_release(keys);
+            ray_release(vals);
+            return e;
         }
 
         /* Build dict: alloc with 2 slots */

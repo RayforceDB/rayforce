@@ -1702,14 +1702,12 @@ static test_result_t test_journal_snapshot_rename_fails(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  20. Snapshot: .qdb dict with more keys than values (missing-val path).
+ *  20. Snapshot: .qdb dict cannot be built with more keys than values.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static test_result_t test_journal_open_qdb_missing_val(void) {
-    char base[256]; make_base(base, sizeof(base), "oc_qdbmissing");
-    char qpath[270]; qdb_path(qpath, sizeof(qpath), base);
-
-    /* Build a dict: 2 sym keys, 1 value — second key has no corresponding val. */
+    /* Build a dict: 2 sym keys, 1 value.  Public construction rejects this
+     * before it can become a partially-loaded snapshot. */
     int64_t s1 = ray_sym_intern("jrn_k1", 6);
     int64_t s2 = ray_sym_intern("jrn_k2", 6);
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
@@ -1724,24 +1722,10 @@ static test_result_t test_journal_open_qdb_missing_val(void) {
 
     ray_t* d = ray_dict_new(keys, vals);
     TEST_ASSERT_NOT_NULL(d);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+    TEST_ASSERT_TRUE(RAY_IS_ERR(d));
+    TEST_ASSERT_STR_EQ(ray_err_code(d), "domain");
+    ray_error_free(d);
 
-    ray_err_t se = ray_obj_save(d, qpath);
-    ray_release(d);
-    TEST_ASSERT_EQ_I(se, RAY_OK);
-
-    /* Open: should warn about missing val for sym jrn_k2, but succeed. */
-    ray_err_t e = ray_journal_open(base, RAY_JOURNAL_ASYNC);
-    /* Partial load — bind_errs == 0 (we skipped, not failed), so OK. */
-    if (e == RAY_OK) {
-        TEST_ASSERT_TRUE(ray_journal_is_open());
-        TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    } else {
-        /* If open returned domain, still OK for test purposes. */
-        TEST_ASSERT_FALSE(ray_journal_is_open());
-    }
-
-    cleanup_base(base);
     PASS();
 }
 
