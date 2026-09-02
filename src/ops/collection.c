@@ -1224,6 +1224,30 @@ ray_t* ray_distinct_fn(ray_t* x) {
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
+    /* Parted columns store segment pointers where vector paths expect flat
+     * cells.  Flatten both operands before membership; distinct uses the same
+     * helper, while except/sect still reject parted input. */
+    ray_t* flat_val = NULL;
+    ray_t* flat_vec = NULL;
+    if (val && RAY_IS_PARTED(val->type)) {
+        flat_val = parted_to_flat_vec(val);
+        if (!flat_val || RAY_IS_ERR(flat_val)) return flat_val ? flat_val : ray_error("oom", NULL);
+        val = flat_val;
+    }
+    if (vec && RAY_IS_PARTED(vec->type)) {
+        flat_vec = parted_to_flat_vec(vec);
+        if (!flat_vec || RAY_IS_ERR(flat_vec)) {
+            if (flat_val) ray_release(flat_val);
+            return flat_vec ? flat_vec : ray_error("oom", NULL);
+        }
+        vec = flat_vec;
+    }
+    if (flat_val || flat_vec) {
+        ray_t* r = ray_in_fn(val, vec);
+        if (flat_val) ray_release(flat_val);
+        if (flat_vec) ray_release(flat_vec);
+        return r;
+    }
     /* STR in STR: for each char of val, check membership in vec string */
     if (ray_is_atom(val) && (-val->type) == RAY_STR && ray_is_atom(vec) && (-vec->type) == RAY_STR) {
         const char* vp = ray_str_ptr(val);
