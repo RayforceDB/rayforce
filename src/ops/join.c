@@ -41,6 +41,9 @@ bool ray_join_force_dup_fallback = false;
 bool ray_join_no_dup_fallback = false;
 /* Diagnostic: radix joins that fell back due to pathological key duplication. */
 uint64_t ray_join_dup_fallbacks = 0;
+/* Diagnostic: radix joins routed to the chained path upfront because the
+ * build side carries more all-null key rows than RADIX_DUP_RUN_MAX (#458). */
+uint64_t ray_join_null_fallbacks = 0;
 
 static int join_store_key_cell(ray_t* dst, int64_t dst_row,
                                ray_t* src, int64_t src_row) {
@@ -1188,6 +1191,38 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
         ray_t**  probe_keys = swap ? r_key_vecs : l_key_vecs;
         uint8_t radix_bits = radix_join_bits(build_rows);
         uint32_t n_rparts = (uint32_t)1 << radix_bits;
+
+        /* #458: every null key cell hashes to the one canonical null value,
+         * so a build side with more all-null key rows than RADIX_DUP_RUN_MAX
+         * is GUARANTEED to trip the dup-run abort mid-build and re-run the
+         * whole join chained — full hash/partition/HT work discarded, every
+         * execution.  Massive duplication is the chained HT's job either way
+         * (O(dup) build vs the open table's O(dup²)), so detect the case
+         * upfront and go there directly.  The scan runs only when a key
+         * column advertises HAS_NULLS, uses the same null predicate as
+         * hash_row_keys (so it counts exactly what would form the run), and
+         * stops at the threshold. */
+        {
+            bool any_nullable = false;
+            for (uint32_t k = 0; k < n_keys && !any_nullable; k++)
+                if (build_keys[k] && (build_keys[k]->attrs & RAY_ATTR_HAS_NULLS))
+                    any_nullable = true;
+            if (any_nullable) {
+                int64_t null_rows = 0;
+                for (int64_t r = 0; r < build_rows; r++) {
+                    bool all_null = true;
+                    for (uint32_t k = 0; k < n_keys; k++) {
+                        ray_t* col = build_keys[k];
+                        if (!col || !ray_vec_is_null(col, r)) { all_null = false; break; }
+                    }
+                    if (all_null && ++null_rows > RADIX_DUP_RUN_MAX) break;
+                }
+                if (null_rows > RADIX_DUP_RUN_MAX) {
+                    ray_join_null_fallbacks++;
+                    goto chained_ht_fallback;
+                }
+            }
+        }
 
         /* Pre-compute hashes for both sides (once, reused by histogram+scatter) */
         ray_t* r_hash_hdr = NULL;
