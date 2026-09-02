@@ -498,6 +498,91 @@ static test_result_t test_fmt_raw_elem_list_null(void) {
 }
 
 /* ---- Test: table with short col that triggers NA in head half ---- */
+/* #454: cell padding must use DISPLAY width, not byte length.  A CJK char
+ * is 3 UTF-8 bytes but renders 2 terminal columns, so byte-based padding
+ * tore the table borders on any row holding a multi-byte symbol. */
+static test_result_t test_fmt_table_utf8_width(void) {
+    ray_t* tbl = ray_table_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* "ab牛来": 8 bytes, 6 display columns.  "abcd": 4 bytes, 4 columns. */
+    const char* wide_sym = "ab\xe7\x89\x9b\xe6\x9d\xa5";
+    int64_t ids[] = { ray_sym_intern(wide_sym, 8), ray_sym_intern("abcd", 4) };
+    int64_t vals[] = { 1, 2 };
+    ray_t* col_s = ray_vec_from_raw(RAY_SYM, ids, 2);
+    ray_t* col_v = ray_vec_from_raw(RAY_I64, vals, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_s));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_v));
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), col_s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), col_v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_t* result = ray_fmt(tbl, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    const char* s = ray_str_ptr(result);
+
+    const char* wide_line  = strstr(s, wide_sym);
+    const char* ascii_line = strstr(s, "abcd");
+    TEST_ASSERT_NOT_NULL(wide_line);
+    TEST_ASSERT_NOT_NULL(ascii_line);
+    while (wide_line > s && wide_line[-1] != '\n') wide_line--;
+    while (ascii_line > s && ascii_line[-1] != '\n') ascii_line--;
+    size_t wide_len  = strcspn(wide_line, "\n");
+    size_t ascii_len = strcspn(ascii_line, "\n");
+
+    /* Equal display width means the wide row carries exactly the byte
+     * surplus of its wide chars: 2 CJK chars x (3 bytes - 2 columns)
+     * = +2 bytes over the ASCII row.  Byte-based padding rendered the
+     * two rows byte-EQUAL (and visually torn), which this catches. */
+    TEST_ASSERT_EQ_I((int64_t)wide_len, (int64_t)ascii_len + 2);
+
+    ray_release(result);
+    ray_release(col_s);
+    ray_release(col_v);
+    ray_release(tbl);
+
+    /* Combining marks are width 0: bare and pointed Hebrew are the same
+     * four letters and must occupy the same four columns, so their data
+     * lines differ by exactly the marks' byte count. */
+    const char* heb_bare   = "\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d";  /* שלום */
+    const char* heb_marked = "\xd7\xa9\xd7\x81\xd6\xb8"           /* ש + dot + qamats */
+                             "\xd7\x9c\xd7\x95\xd6\xb9\xd7\x9d";  /* ל, ו + holam, ם */
+    ray_t* tbl2 = ray_table_new(1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
+    int64_t hids[] = {
+        ray_sym_intern(heb_bare, (int64_t)strlen(heb_bare)),
+        ray_sym_intern(heb_marked, (int64_t)strlen(heb_marked)),
+    };
+    ray_t* col_h = ray_vec_from_raw(RAY_SYM, hids, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_h));
+    tbl2 = ray_table_add_col(tbl2, ray_sym_intern("h", 1), col_h);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
+
+    ray_t* result2 = ray_fmt(tbl2, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result2));
+    const char* s2 = ray_str_ptr(result2);
+    const char* bare_line   = strstr(s2, heb_bare);
+    const char* marked_line = strstr(s2, heb_marked);
+    TEST_ASSERT_NOT_NULL(bare_line);
+    TEST_ASSERT_NOT_NULL(marked_line);
+    /* strstr(heb_bare) can land on the marked row if the marked bytes embed
+     * the bare sequence — they don't (marks interleave), but anchor to line
+     * starts to be safe. */
+    while (bare_line > s2 && bare_line[-1] != '\n') bare_line--;
+    while (marked_line > s2 && marked_line[-1] != '\n') marked_line--;
+    TEST_ASSERT_TRUE(bare_line != marked_line);
+    size_t bare_len   = strcspn(bare_line, "\n");
+    size_t marked_len = strcspn(marked_line, "\n");
+    int64_t mark_bytes = (int64_t)strlen(heb_marked) - (int64_t)strlen(heb_bare);
+    TEST_ASSERT_EQ_I((int64_t)marked_len, (int64_t)bare_len + mark_bytes);
+
+    ray_release(result2);
+    ray_release(col_h);
+    ray_release(tbl2);
+    PASS();
+}
+
 static test_result_t test_fmt_table_na_head(void) {
     /* With nrows=5 (half=2), a col of len=1 has ri=0 hit, ri=1 miss -> NA in head */
     int64_t nrows = 5;
@@ -1762,5 +1847,6 @@ const test_entry_t format_entries[] = {
     { "format/table/wide_tall", test_fmt_table_wide_and_tall, fmt_setup, fmt_teardown },
     { "format/table/list_col_null", test_fmt_raw_elem_list_null, fmt_setup, fmt_teardown },
     { "format/table/na_head", test_fmt_table_na_head, fmt_setup, fmt_teardown },
+    { "format/table/utf8_width", test_fmt_table_utf8_width, fmt_setup, fmt_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -9,25 +9,26 @@
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; L35: hash_row_keys — NULL values in join key column
-;; NULL keys should produce unique hashes, so NULLs never match.
+;; NULL keys hash to one canonical value: a null matches another null and
+;; nothing else.  See test/rfl/join/null_key_equality.rfl for the semantics.
 ;; ──────────────────────────────────────────────────────────────────
 
-;; inner-join with null keys in left — nulls don't match
+;; inner-join with a null key on the left only — nothing on the right to match
 (set jL (table [id val] (list [1 0Nl 3] [10 20 30])))
 (set jR (table [id val2] (list [1 3] [100 300])))
 (count (inner-join [id] jL jR)) -- 2
 (at (inner-join [id] jL jR) 'val) -- [10 30]
 
-;; inner-join with null keys in right — nulls don't match
+;; inner-join with a null key on the right only — nothing on the left to match
 (set jL2 (table [id val] (list [1 2 3] [10 20 30])))
 (set jR2 (table [id val2] (list [1 0Nl 3] [100 200 300])))
 (count (inner-join [id] jL2 jR2)) -- 2
 (at (inner-join [id] jL2 jR2) 'val2) -- [100 300]
 
-;; inner-join with null keys in both sides — nulls never match nulls
+;; inner-join with a null key on BOTH sides — null == null, so it matches
 (set jL3 (table [id val] (list [0Nl 2 3] [10 20 30])))
 (set jR3 (table [id val2] (list [0Nl 2 3] [100 200 300])))
-(count (inner-join [id] jL3 jR3)) -- 2
+(count (inner-join [id] jL3 jR3)) -- 3
 
 ;; left-join with null keys — unmatched left rows preserved with null right
 (set jL4 (table [id val] (list [1 0Nl 3] [10 20 30])))
@@ -68,10 +69,10 @@
 (count (inner-join [k1 k2] mkL mkR)) -- 2
 (at (inner-join [k1 k2] mkL mkR) 'val2) -- [1000 3000]
 
-;; Multi-key with both nulls — no match
+;; Multi-key with a null on both sides of k1 — null == null, so it matches
 (set mkL2 (table [k1 k2 val] (list [0Nl] [10.0] [100])))
 (set mkR2 (table [k1 k2 val2] (list [0Nl] [10.0] [1000])))
-(count (inner-join [k1 k2] mkL2 mkR2)) -- 0
+(count (inner-join [k1 k2] mkL2 mkR2)) -- 1
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; anti-join with null keys
