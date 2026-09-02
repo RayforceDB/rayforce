@@ -165,6 +165,27 @@ static void sleep_ms(long ms) {
     nanosleep(&ts, NULL);
 }
 
+/* ---- bind address (#427) ------------------------------------------------- */
+
+/* A listener confined to loopback binds and accepts a loopback connect;
+ * an unparseable host is a loud io failure, never a silent INADDR_ANY. */
+static test_result_t test_ipc_listen_bind_addr(void) {
+    ray_ipc_server_t srv;
+    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&srv, "127.0.0.1", 0), RAY_OK);
+    uint16_t port = get_listen_port(srv.listen_fd);
+    TEST_ASSERT(port > 0, "port > 0");
+    ray_ipc_server_destroy(&srv);
+
+    /* NULL host keeps the historical all-interfaces bind. */
+    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&srv, NULL, 0), RAY_OK);
+    ray_ipc_server_destroy(&srv);
+
+    ray_ipc_server_t bad;
+    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&bad, "not-an-address", 0), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&bad, "999.9.9.9", 0), RAY_ERR_IO);
+    PASS();
+}
+
 /* ---- test_ipc_send_verbose ----------------------------------------------- */
 /*
  * Exercise ray_ipc_send_verbose — covers the entire function (lines 1212-1274)
@@ -2119,6 +2140,7 @@ static test_result_t test_ipc_server_push(void) {
 /* ---- Registry ------------------------------------------------------------ */
 
 const test_entry_t ipc_entries[] = {
+    { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },
     { "ipc/eval_non_string_msg",        test_ipc_eval_non_string_msg,            ipc_setup, ipc_teardown },

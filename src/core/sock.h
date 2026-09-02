@@ -37,6 +37,9 @@
 #endif
 
 ray_sock_t ray_sock_listen(uint16_t port);
+/* Bind to a specific IPv4 address; host NULL/empty means INADDR_ANY.  An
+ * unparseable host fails the listen (errno EINVAL), never falls back. */
+ray_sock_t ray_sock_listen_at(const char* host, uint16_t port);
 ray_sock_t ray_sock_accept(ray_sock_t srv);
 /* Connect to host:port.  timeout_ms > 0 bounds the connect: the socket
  * connects non-blocking and waits at most timeout_ms for completion (a
