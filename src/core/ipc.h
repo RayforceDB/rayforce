@@ -77,6 +77,8 @@ int64_t ray_ipc_current_handle(void);
 
 /* Register IPC listener on poll. Returns selector id or -1. */
 int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port);
+/* Bind to a specific IPv4 address; host NULL/empty means INADDR_ANY (#427). */
+int64_t ray_ipc_listen_at(ray_poll_t* poll, const char* host, uint16_t port);
 
 /* ===== Legacy server API (wraps poll internally for tests) ===== */
 
@@ -100,6 +102,7 @@ typedef struct ray_ipc_server {
 } ray_ipc_server_t;
 
 ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port);
+ray_err_t ray_ipc_server_init_at(ray_ipc_server_t* srv, const char* host, uint16_t port);
 void      ray_ipc_server_destroy(ray_ipc_server_t* srv);
 int       ray_ipc_poll(ray_ipc_server_t* srv, int timeout_ms);
 

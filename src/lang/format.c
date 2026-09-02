@@ -711,9 +711,72 @@ static void fmt_dict(fmt_buf_t* b, ray_t* dict, int mode) {
 
 /* ===== Table formatter helpers ===== */
 
+/* Terminal display width of a UTF-8 string.  Byte length overstates the
+ * width of any multi-byte cell (a 3-byte CJK char renders as 2 columns,
+ * not 3), which skewed every pad computed from it and tore the table
+ * borders.  Coarse East-Asian-Width classification: wide/fullwidth CJK,
+ * Hangul, fullwidth forms and emoji count 2; zero-width marks count 0;
+ * everything else, malformed bytes included, counts 1 — so a bad
+ * sequence can never desync more than its own cell. */
+static int32_t fmt_utf8_width(const char* s, int32_t slen) {
+    int32_t w = 0;
+    for (int32_t i = 0; i < slen;) {
+        uint8_t c = (uint8_t)s[i];
+        if (c < 0x80) { w += 1; i += 1; continue; }
+        uint32_t cp;
+        int32_t  cont;
+        if      ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; cont = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; cont = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; cont = 3; }
+        else                         { w += 1; i += 1; continue; }
+        if (i + cont >= slen) { w += 1; i += 1; continue; }
+        bool ok = true;
+        for (int32_t k = 1; k <= cont; k++) {
+            uint8_t cc = (uint8_t)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (!ok) { w += 1; i += 1; continue; }
+        i += cont + 1;
+        if ((cp >= 0x0300 && cp <= 0x036F) ||       /* Latin combining marks */
+            (cp >= 0x0483 && cp <= 0x0489) ||       /* Cyrillic combining */
+            (cp >= 0x0591 && cp <= 0x05BD) ||       /* Hebrew points (niqqud) */
+            cp == 0x05BF || cp == 0x05C1 || cp == 0x05C2 ||
+            cp == 0x05C4 || cp == 0x05C5 || cp == 0x05C7 ||
+            (cp >= 0x0610 && cp <= 0x061A) ||       /* Arabic marks */
+            (cp >= 0x064B && cp <= 0x065F) ||       /* Arabic harakat */
+            cp == 0x0670 ||
+            (cp >= 0x06D6 && cp <= 0x06DC) ||
+            (cp >= 0x0E31 && cp <= 0x0E3A) ||       /* Thai vowels above/below */
+            (cp >= 0x0E47 && cp <= 0x0E4E) ||
+            (cp >= 0x200B && cp <= 0x200F) ||       /* zero-width spaces */
+            (cp >= 0x202A && cp <= 0x202E) ||       /* bidi embedding/override */
+            (cp >= 0x2060 && cp <= 0x2064) ||       /* word joiner, invisibles */
+            (cp >= 0x2066 && cp <= 0x2069) ||       /* bidi isolates */
+            (cp >= 0xFE00 && cp <= 0xFE0F) ||       /* variation selectors */
+            (cp >= 0xFE20 && cp <= 0xFE2F) ||       /* combining half marks */
+            cp == 0xFEFF)                           /* BOM / zero-width nbsp */
+            continue;                               /* width 0 */
+        if ((cp >= 0x1100  && cp <= 0x115F)  ||     /* Hangul jamo */
+            (cp >= 0x2E80  && cp <= 0xA4CF)  ||     /* CJK radicals..Yi */
+            (cp >= 0xAC00  && cp <= 0xD7A3)  ||     /* Hangul syllables */
+            (cp >= 0xF900  && cp <= 0xFAFF)  ||     /* CJK compat ideographs */
+            (cp >= 0xFE30  && cp <= 0xFE4F)  ||     /* CJK compat forms */
+            (cp >= 0xFF00  && cp <= 0xFF60)  ||     /* fullwidth forms */
+            (cp >= 0xFFE0  && cp <= 0xFFE6)  ||     /* fullwidth signs */
+            (cp >= 0x1F300 && cp <= 0x1FAFF) ||     /* emoji */
+            (cp >= 0x20000 && cp <= 0x3FFFD))       /* CJK ext B+ */
+            w += 2;
+        else
+            w += 1;
+    }
+    return w;
+}
+
 static void fmt_centered(fmt_buf_t* b, const char* s, int32_t slen, int32_t width) {
-    int32_t left  = (width - slen) / 2;
-    int32_t right = width - slen - left;
+    int32_t dlen  = fmt_utf8_width(s, slen);
+    int32_t left  = (width - dlen) / 2;
+    int32_t right = width - dlen - left;
     for (int32_t i = 0; i < left; i++)  fmt_putc(b, ' ');
     fmt_putn(b, s, slen);
     for (int32_t i = 0; i < right; i++) fmt_putc(b, ' ');
@@ -851,8 +914,9 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         col_types[ci]     = tname;
         col_type_lens[ci] = (int32_t)strlen(tname);
 
-        /* Start with max of name and type lengths */
-        int32_t max_w = col_name_lens[ci];
+        /* Start with max of name and type DISPLAY widths (a multi-byte
+         * name still writes its full byte length, padded to this). */
+        int32_t max_w = fmt_utf8_width(col_names[ci], col_name_lens[ci]);
         if (col_type_lens[ci] > max_w) max_w = col_type_lens[ci];
 
         int64_t col_len = col_vec ? ray_len(col_vec) : 0;
@@ -874,7 +938,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
-            if (cell->len > max_w) max_w = cell->len;
+            int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
+            if (cell_dw > max_w) max_w = cell_dw;
         }
 
         /* Format second half (tail rows) */
@@ -899,7 +964,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
-            if (cell->len > max_w) max_w = cell->len;
+            int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
+            if (cell_dw > max_w) max_w = cell_dw;
         }
 
         col_widths[ci] = max_w + 2; /* +2 for padding (1 space each side) */
@@ -1008,7 +1074,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
             fmt_putc(b, ' ');
             fmt_putn(b, cell->str, cell->len);
-            int32_t pad = col_widths[ci] - cell->len - 1;
+            int32_t pad = col_widths[ci] - fmt_utf8_width(cell->str, cell->len) - 1;
             for (int32_t p = 0; p < pad; p++)
                 fmt_putc(b, ' ');
             fmt_puts(b, G_V);

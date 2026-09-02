@@ -788,6 +788,7 @@ extern bool     ray_join_force_dup_fallback;
 /* perf-gate bypass: disable the auto dup-fallback to measure the pre-fix O(dup²) build */
 extern bool     ray_join_no_dup_fallback;
 extern uint64_t ray_join_dup_fallbacks;
+extern uint64_t ray_join_null_fallbacks;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default off */
 void ray_expr_stats_init(void);
 

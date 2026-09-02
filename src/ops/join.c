@@ -41,6 +41,9 @@ bool ray_join_force_dup_fallback = false;
 bool ray_join_no_dup_fallback = false;
 /* Diagnostic: radix joins that fell back due to pathological key duplication. */
 uint64_t ray_join_dup_fallbacks = 0;
+/* Diagnostic: radix joins routed to the chained path upfront because the
+ * build side carries more all-null key rows than RADIX_DUP_RUN_MAX (#458). */
+uint64_t ray_join_null_fallbacks = 0;
 
 static int join_store_key_cell(ray_t* dst, int64_t dst_row,
                                ray_t* src, int64_t src_row) {
@@ -102,16 +105,26 @@ static inline bool join_str_eq_hashed(const ray_str_t* a, const char* pool_a,
     return memcmp(pa, pb, a->len) == 0;
 }
 
+/* Hash payload for a null key cell.  One canonical value per key POSITION
+ * (the ray_hash_combine chain below still mixes in k), so every null in a
+ * given key column lands in the same bucket on both sides of the join —
+ * the precondition for join_keys_eq's null == null.  Any collision with a
+ * real key's hash is resolved by join_keys_eq, as for any other hash. */
+#define JOIN_NULL_KEY_HASH INT64_C(0x5B7A6D3F2E1C0A94)
+
 static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
     uint64_t h = 0;
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* col = key_vecs[k];
         if (!col) continue;
-        /* NULL key — produce unique hash that won't match any other row */
-        if (ray_vec_is_null(col, row))
-            return h ^ ((uint64_t)row * 0x9E3779B97F4A7C15ULL);
         uint64_t kh;
-        if (col->type == RAY_STR) {
+        if (ray_vec_is_null(col, row)) {
+            /* null == null: hash every null cell alike instead of giving the
+             * row a private hash.  A per-row hash made a null key unmatchable
+             * even against itself, so `anti-join [c] X X` came back non-empty
+             * and a null-keyed left-join row missed its real match. */
+            kh = ray_hash_i64(JOIN_NULL_KEY_HASH);
+        } else if (col->type == RAY_STR) {
             const char* pool = NULL;
             const ray_str_t* str = join_str_cell(col, row, &pool);
             kh = ray_str_is_inline(str)
@@ -576,8 +589,26 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         ray_t* lc = l_vecs[k];
         ray_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
-        /* NULL != NULL in join predicates */
-        if (ray_vec_is_null(lc, l) || ray_vec_is_null(rc, r)) return false;
+        /* null == null, null != non-null.  This is the rule the rest of the
+         * runtime already applies to key columns: collection.c's hashset
+         * folds every null into one bucket (so `distinct` keeps exactly one
+         * null and `in` matches null against null), group.c folds them into
+         * one group, and atom_eq answers 1 for two nulls.  Joins used to
+         * reject a null outright, which made `anti-join [c] X X` non-empty
+         * whenever c held a null and made left-join miss a null-keyed match.
+         * As-of join keeps its own documented NULLs-never-match rule; it
+         * does not route through here. */
+        bool l_null = ray_vec_is_null(lc, l);
+        bool r_null = ray_vec_is_null(rc, r);
+        if (l_null || r_null) {
+            if (l_null != r_null) return false;
+            /* No looser than the value arms below: they pair STR only with
+             * STR and GUID only with GUID, so two nulls of those types are
+             * equal only to their own kind. */
+            if ((lc->type == RAY_STR)  != (rc->type == RAY_STR))  return false;
+            if ((lc->type == RAY_GUID) != (rc->type == RAY_GUID)) return false;
+            continue;
+        }
         if (lc->type == RAY_STR || rc->type == RAY_STR) {
             if (lc->type != RAY_STR || rc->type != RAY_STR) return false;
             const char* lpool = NULL;
@@ -1160,6 +1191,38 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
         ray_t**  probe_keys = swap ? r_key_vecs : l_key_vecs;
         uint8_t radix_bits = radix_join_bits(build_rows);
         uint32_t n_rparts = (uint32_t)1 << radix_bits;
+
+        /* #458: every null key cell hashes to the one canonical null value,
+         * so a build side with more all-null key rows than RADIX_DUP_RUN_MAX
+         * is GUARANTEED to trip the dup-run abort mid-build and re-run the
+         * whole join chained — full hash/partition/HT work discarded, every
+         * execution.  Massive duplication is the chained HT's job either way
+         * (O(dup) build vs the open table's O(dup²)), so detect the case
+         * upfront and go there directly.  The scan runs only when a key
+         * column advertises HAS_NULLS, uses the same null predicate as
+         * hash_row_keys (so it counts exactly what would form the run), and
+         * stops at the threshold. */
+        {
+            bool any_nullable = false;
+            for (uint32_t k = 0; k < n_keys && !any_nullable; k++)
+                if (build_keys[k] && (build_keys[k]->attrs & RAY_ATTR_HAS_NULLS))
+                    any_nullable = true;
+            if (any_nullable) {
+                int64_t null_rows = 0;
+                for (int64_t r = 0; r < build_rows; r++) {
+                    bool all_null = true;
+                    for (uint32_t k = 0; k < n_keys; k++) {
+                        ray_t* col = build_keys[k];
+                        if (!col || !ray_vec_is_null(col, r)) { all_null = false; break; }
+                    }
+                    if (all_null && ++null_rows > RADIX_DUP_RUN_MAX) break;
+                }
+                if (null_rows > RADIX_DUP_RUN_MAX) {
+                    ray_join_null_fallbacks++;
+                    goto chained_ht_fallback;
+                }
+            }
+        }
 
         /* Pre-compute hashes for both sides (once, reused by histogram+scatter) */
         ray_t* r_hash_hdr = NULL;
