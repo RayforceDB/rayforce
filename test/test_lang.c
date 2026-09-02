@@ -6522,6 +6522,45 @@ static test_result_t test_eval_restricted_lambda_bypass(void) {
     PASS();
 }
 
+/* #41/#44/#46-#49: mutating or destroying server-side state over restricted
+ * (-U) IPC is privilege escalation.  These builtins were registered without
+ * RAY_FN_RESTRICTED, so a restricted client could free graph/HNSW/Datalog
+ * handles, mutate a Datalog program, register a global rule, or persist WAL
+ * work that replays unrestricted.  Each must now be refused with an `access`
+ * error; dummy handles are deliberate — the restricted gate fires at the
+ * invocation boundary, before the body validates its arguments. */
+static test_result_t test_eval_restricted_server_state_ops(void) {
+    /* #44: global Datalog rule registration (a restricted special form). */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(rule (__rf_restr_probe ?x) (?x :tag 1))"));
+    /* #49: mutate a Datalog program with a new EDB relation. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(dl-add-edb 0 'rel 0 2)"));
+    /* #48: free a Datalog program handle. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(dl-free 0)"));
+    /* #46: free a server graph handle. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.graph.free 0)"));
+    /* #47: free a server HNSW index handle. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(hnsw-free 0)"));
+    /* #41: persist WAL work that would replay outside restricted mode. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(.log.write (list 'set '__rf_restr_wal 1))"));
+
+    /* The gate is scoped to restricted eval, not a blanket ban: in normal mode
+     * the same call reaches its body and fails for a non-access reason (a bogus
+     * handle), proving read-only mode is what changed, not the verb itself. */
+    ray_t* normal = ray_eval_str("(dl-free 0)");
+    TEST_ASSERT_NOT_NULL(normal);
+    if (RAY_IS_ERR(normal)) {
+        TEST_ASSERT(!ray_err_code(normal) ||
+                    strcmp(ray_err_code(normal), "access") != 0,
+                    "dl-free must not be an access denial outside restricted mode");
+        ray_error_free(normal);
+    } else {
+        ray_release(normal);
+    }
+    PASS();
+}
+
 /* --- self-recursive lambda via recursion (tests op_calls path) --- */
 static test_result_t test_eval_self_recursion_direct(void) {
     /* Direct recursion using named function — compiler may use op_calls */
@@ -9166,6 +9205,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
+    { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },
