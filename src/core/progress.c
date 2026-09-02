@@ -58,6 +58,14 @@ static uint64_t    g_phase_base;     /* qstats rows_done at dispatch start */
 static uint64_t    g_phase_total;    /* elements this dispatch will process */
 static uint64_t    g_last_pump_ns;   /* throttles the 256-slot sum */
 
+/* Byte-metered span state (main-thread only).  g_span_total != 0 is the
+ * "a span is active" flag; while it is set the dispatch pump publishes a
+ * position on the byte axis instead of raw row counts. */
+static uint64_t    g_span_total;     /* size of the axis, 0 = no span */
+static uint64_t    g_span_done;      /* monotone position on the axis */
+static uint64_t    g_span_base;      /* current phase's window start */
+static uint64_t    g_span_len;       /* current phase's window length */
+
 static inline uint64_t mono_ns(void) {
     struct timespec ts;
 #ifdef CLOCK_MONOTONIC_COARSE
@@ -93,6 +101,8 @@ static void fire(uint64_t now_ns, bool final) {
         .mem_used    = (int64_t)(ms.bytes_allocated + ms.direct_bytes),
         .mem_total   = ray_sys_total_ram(),
         .final       = final,
+        .bytes_done  = g_span_total ? g_span_done : 0,
+        .bytes_total = g_span_total,
     };
     g_cb(&snap, g_user);
     g_last_fire_ns = now_ns;
@@ -194,10 +204,59 @@ void ray_progress_pump(void) {
     g_last_pump_ns = now;
     uint64_t sum  = ray_qstats_sum_rows();
     uint64_t done = sum > g_phase_base ? sum - g_phase_base : 0;
+    if (g_span_total) {
+        /* Map this dispatch's own 0..100% into the phase's slice of the
+         * byte axis.  A dispatch that runs without a phase declared (some
+         * nested helper) simply re-covers the last slice; the monotone
+         * clamp in ray_progress_span_set turns that into a pause, never a
+         * step backwards. */
+        double frac = g_phase_total ? (double)done / (double)g_phase_total : 0.0;
+        if (frac > 1.0) frac = 1.0;
+        ray_progress_span_set(g_span_base + (uint64_t)(frac * (double)g_span_len));
+        return;
+    }
     ray_progress_update(NULL, NULL, done, g_phase_total);   /* keeps op label */
 }
 
+/* ── byte-metered span ─────────────────────────────────────────────────── */
+
+void ray_progress_span_begin(const char* op_name, uint64_t bytes_total) {
+    if (!g_cb || bytes_total == 0) return;
+    g_span_total = bytes_total;
+    g_span_done  = 0;
+    g_span_base  = 0;
+    g_span_len   = 0;
+    ray_progress_label(op_name, NULL);
+}
+
+void ray_progress_span_phase(const char* phase, uint64_t base, uint64_t len) {
+    if (!g_cb || !g_span_total) return;
+    if (base > g_span_total) base = g_span_total;
+    if (base + len > g_span_total) len = g_span_total - base;
+    g_span_base = base;
+    g_span_len  = len;
+    if (phase) g_phase = phase;
+    /* A phase boundary is also a floor: everything before it is done. */
+    ray_progress_span_set(base);
+}
+
+void ray_progress_span_set(uint64_t bytes_done) {
+    if (!g_cb || !g_span_total) return;
+    if (bytes_done > g_span_total) bytes_done = g_span_total;
+    if (bytes_done < g_span_done) return;        /* monotone by construction */
+    g_span_done = bytes_done;
+    ray_progress_update(NULL, NULL, g_span_done, g_span_total);
+}
+
+void ray_progress_span_end(void) {
+    g_span_total = 0;
+    g_span_done  = 0;
+    g_span_base  = 0;
+    g_span_len   = 0;
+}
+
 void ray_progress_end(void) {
+    ray_progress_span_end();
     if (!g_cb) {
         g_start_ns = 0;
         return;

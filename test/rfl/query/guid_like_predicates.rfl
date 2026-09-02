@@ -1,0 +1,82 @@
+;; select-where predicates that used to fail silently.
+;;
+;; GUID: the fused expression program has no 16-byte loads, and the
+;; elementwise fallback routed guid cells through the numeric loops —
+;; both silently matched nothing.  The compiler now bails GUID columns
+;; (EXPR_BAIL_GUID) and the fallback has a memcmp branch, so a guid
+;; equality predicate returns the matching rows.
+;;
+;; like: an unsupported input type in exec_like memset the result to
+;; all-false.  A list column (splayed string load shape) now delegates
+;; to the builtin's list branch; a non-string column raises.
+
+(set gs (guid 3))
+(set t (table [g v] (list gs [10 20 30])))
+(set g1 (at gs 1))
+
+;; guid equality predicate finds its row
+(get (select {from: t where: (== g g1)}) 'v) -- [20]
+(count (get (select {from: t where: (!= g g1)}) 'v)) -- 2
+
+;; guid predicate composes with aggregation
+(at (get (select {from: t where: (== g g1) s: (sum v)}) 's) 0) -- 20
+
+;; ordering on guid operands is undefined — loud, not silent
+(select {from: t where: (< g g1)}) !- type
+
+;; GUID membership: the typed `in` kernel read guid cells at the wrong width
+;; (every cell decoded to 0), so `in`/`not-in` silently matched everything.
+;; The kernel now bails guid to the guid-aware hashset path.
+(set gsub (at gs [0 2]))
+(in gs gsub) -- [true false true]
+(not (in gs gsub)) -- [false true false]
+(get (select {from: t where: (in g gsub)}) 'v) -- [10 30]
+(get (select {from: t where: (not (in g gsub))}) 'v) -- [20]
+(at (get (select {from: t where: (in g gsub) s: (sum v)}) 's) 0) -- 40
+;; membership against an empty set matches nothing (no all-true collapse)
+(in gs (at gs [])) -- [false false false]
+;; Scalar subjects retain builtin scalar semantics; query predicates normalize
+;; their result to a row-aligned BOOL vector and keep nulls false.
+(set gn (as 'guid "00000000-0000-0000-0000-000000000000"))
+(in gn gs) -- false
+(not (in gn gs)) -- true
+(set gns (list gn (at gs 0)))
+(in gns gs) -- [false true]
+(not (in gns gs)) -- [true false]
+
+;; like over a string column inside select-where (table construction
+;; normalizes the list to a STR column; the real list-of-atoms shape —
+;; a legacy STRL splayed load — is covered by legacy_strl_predicates.rfl)
+(set ts (table [s v] (list (list "keep me" "drop" "also keep") [1 2 3])))
+(get (select {from: ts where: (like s "*keep*")}) 'v) -- [1 3]
+
+;; like over a non-string column raises instead of matching nothing
+(select {from: ts where: (like v "*1*")}) !- type
+
+;; ────────────── partitioned table: parted guid columns ──────────────
+;; A parted column carries RAY_PARTED_BASE + base, which sailed past a
+;; bail testing col->type == RAY_GUID — the fused program then zero-
+;; filled every guid lane, so col-vs-col == matched ALL rows (zeros
+;; compared equal to zeros).  The bail now tests the element type.
+(.sys.exec "rm -rf /tmp/rfl_guid_parted")
+(set PG1 (guid 3))
+(set PG2 (guid 2))
+(set PT1 (table [g h v] (list PG1 (guid 3) [10 20 30])))
+(set PT2 (table [g h v] (list PG2 PG2 [40 50])))
+(.db.splayed.set "/tmp/rfl_guid_parted/1/t/" PT1)
+(.db.splayed.set "/tmp/rfl_guid_parted/2/t/" PT2)
+(set PT (.db.parted.get "/tmp/rfl_guid_parted/" 't))
+(set pg1 (at PG1 1))
+
+;; col-vs-col matches exactly the partition where g and h coincide —
+;; not all 5 rows (the parted zero-fill bug), not zero
+(get (select {from: PT where: (== g h)}) 'v) -- [40 50]
+;; col-vs-const finds its row across partitions
+(get (select {from: PT where: (== g pg1)}) 'v) -- [20]
+(count (get (select {from: PT where: (!= g pg1)}) 'v)) -- 4
+;; ordering stays loud on parted guids too
+(select {from: PT where: (< g pg1)}) !- type
+
+;; partitioned guid columns take the same in/not-in fallback
+(get (select {from: PT where: (in g (at PG1 [0 1]))}) 'v) -- [10 20]
+(get (select {from: PT where: (not (in g (at PG1 [0 1])))}) 'v) -- [30 40 50]

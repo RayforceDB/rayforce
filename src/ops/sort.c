@@ -40,7 +40,8 @@ int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
         int cmp = 0;
         int null_cmp = 0;
         int desc = ctx->desc ? ctx->desc[k] : 0;
-        int nf = ctx->nulls_first ? ctx->nulls_first[k] : desc;
+        int nf = ctx->nulls_first ? ctx->nulls_first[k]
+                                  : sort_nulls_first((uint8_t)desc);
 
         /* Check null bitmap for both elements */
         int a_null = ray_vec_is_null(col, a);
@@ -2278,7 +2279,8 @@ static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_key
  * cols:        array of n_cols vectors (sort keys, most significant first)
  * descs:       array of n_cols flags (0=asc, 1=desc), or NULL for all-asc
  * nulls_first: array of n_cols flags (0=nulls last, 1=nulls first), or NULL
- *              for default convention (nulls last for asc, nulls first for desc)
+ *              to take the default from sort_nulls_first — a null is the
+ *              smallest value, so nulls first for asc, last for desc
  * n_cols:      number of sort key columns (composite radix encode is used
  *              up to 16 keys; wider sorts take the merge-sort fallback)
  * nrows:       number of rows in each column
@@ -2319,7 +2321,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
          * internally; skips the rest of sort_indices_ex on success. */
         if (n_cols == 1 && cols[0]->type == RAY_STR) {
             bool desc = descs ? descs[0] : 0;
-            bool nf   = nulls_first ? nulls_first[0] : !desc;
+            bool nf   = nulls_first ? nulls_first[0] : sort_nulls_first((uint8_t)desc);
             if (sort_str_msd_inplace(indices, nrows, cols[0], desc, nf)) {
                 sorted_idx = indices;
                 iota_done = true;
@@ -2397,9 +2399,8 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                     (size_t)nrows * sizeof(uint64_t));
                 if (keys) {
                     bool desc = descs ? descs[0] : 0;
-                    /* Null = minimum value.
-                     * ASC → nulls first, DESC → nulls last. */
-                    bool nf = nulls_first ? nulls_first[0] : !desc;
+                    bool nf = nulls_first ? nulls_first[0]
+                                          : sort_nulls_first((uint8_t)desc);
                     radix_encode_ctx_t enc = {
                         .keys = keys, .indices = indices,
                         .data = ray_data(cols[0]),
@@ -2577,10 +2578,30 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 uint16_t total_bits = 0;
                 bool fits = true;
 
+                /* A float null is NaN, and the composite encode packs a
+                 * double by flipping its bits — which puts NaN above every
+                 * real number, i.e. last on ascending, whatever
+                 * sort_nulls_first says.  The other types carry a sentinel
+                 * that already lands where the rule wants it (INT64_MIN is
+                 * the smallest), so only F64 disagrees.  Rather than teach
+                 * the packing a second placement, hand a null-bearing float
+                 * key to the rank-then-compose fallback, which ranks
+                 * through sort_indices_ex and is null-aware.  Leaving it in
+                 * the direct encode is what made a multi-key sort place
+                 * floats one way below 64 rows and the other way above. */
+                bool nullable_f64_key = false;
+                for (uint32_t k = 0; k < n_cols; k++)
+                    if (cols[k]->type == RAY_F64 &&
+                        (cols[k]->attrs & RAY_ATTR_HAS_NULLS)) {
+                        nullable_f64_key = true;
+                        break;
+                    }
+
                 ray_pool_t* mk_prescan_pool = (nrows >= SMALL_POOL_THRESHOLD) ? pool : NULL;
-                if (has_wide_key) {
+                if (has_wide_key || nullable_f64_key) {
                     /* RAY_STR / RAY_GUID can't be packed into a composite
-                     * uint64 key. Force the rank-then-compose fallback. */
+                     * uint64 key, and a nullable float must not be.  Force
+                     * the rank-then-compose fallback. */
                     total_bits = UINT16_MAX;
                     fits = false;
                 } else if (n_cols <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool) {
@@ -2616,9 +2637,11 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         }
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits = (uint16_t)(total_bits + bits);
                     }
@@ -2678,9 +2701,11 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
 
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits = (uint16_t)(total_bits + bits);
                     }
@@ -2712,7 +2737,8 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                     uint32_t* rank_max = (uint32_t*)(rank_buf + rank_off_max);
                     for (uint32_t k = 0; k < n_cols && rank_ok; k++) {
                         uint8_t kdesc = descs ? descs[k] : 0;
-                        uint8_t knf   = nulls_first ? nulls_first[k] : !kdesc;
+                        uint8_t knf   = nulls_first ? nulls_first[k]
+                                                    : sort_nulls_first(kdesc);
                         ray_t* col_arg[1] = { cols[k] };
                         uint8_t desc_arg[1] = { kdesc };
                         uint8_t nf_arg[1]   = { knf };
@@ -2910,22 +2936,9 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
     if (!radix_done) {
         if (!iota_done)
             for (int64_t i = 0; i < nrows; i++) indices[i] = i;
-        /* Null = minimum value.
-         * ASC → nulls first (nf=1), DESC → nulls last (nf=0). */
-        ray_t* default_nf_hdr = NULL;
-        if (!nulls_first) {
-            uint8_t* default_nf = (uint8_t*)scratch_alloc(&default_nf_hdr, n_cols);
-            if (!default_nf) {
-                for (uint32_t k = 0; k < n_cols; k++)
-                    scratch_free(enum_rank_hdrs[k]);
-                scratch_free(enum_rank_hdrs_hdr);
-                scratch_free(indices_hdr);
-                return ray_error("oom", NULL);
-            }
-            for (uint32_t k = 0; k < n_cols; k++)
-                default_nf[k] = descs ? !descs[k] : 1;
-            nulls_first = default_nf;
-        }
+        /* No default array is built: a NULL nulls_first already means the
+         * default for each key's direction, and the comparator asks
+         * sort_nulls_first for it. */
         sort_cmp_ctx_t cmp_ctx = {
             .vecs = cols,
             .desc = descs,
@@ -2946,7 +2959,6 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 for (uint32_t k = 0; k < n_cols; k++)
                     scratch_free(enum_rank_hdrs[k]);
                 scratch_free(enum_rank_hdrs_hdr);
-                scratch_free(default_nf_hdr);
                 scratch_free(indices_hdr);
                 return ray_error("oom", NULL);
             }
@@ -2990,7 +3002,6 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
 
             scratch_free(tmp_hdr);
         }
-        scratch_free(default_nf_hdr);
     }
 
 str_msd_done:;
@@ -3389,10 +3400,12 @@ ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
         return desc ? ray_desc_fn(v) : ray_asc_fn(v);
     }
 
-    /* Try the bounded-heap fast path.  Default nulls-last for ASC,
-     * nulls-first for DESC (matches sort defaults so the gathered
-     * non-null prefix is always K elements when nulls fit). */
-    uint8_t nf = desc ? 1 : 0;
+    /* Try the bounded-heap fast path.  It takes the placement from the
+     * shared rule, because the k >= len branch above hands the whole job
+     * to the full sort, which uses that rule: spelling out a different
+     * one here would put a null-bearing vector's nulls at one end while
+     * k < len and the other once k reaches it. */
+    uint8_t nf = sort_nulls_first(desc);
     ray_t* idx = topk_indices_single(v, desc, nf, len, k);
     if (idx && !RAY_IS_ERR(idx)) {
         const int64_t* idata = (const int64_t*)ray_data(idx);
@@ -3531,19 +3544,17 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
                 uint8_t desc = ext->sort.desc ? ext->sort.desc[0] : 0;
                 uint8_t nf   = ext->sort.nulls_first
                               ? ext->sort.nulls_first[0]
-                              : !desc;
+                              : sort_nulls_first(desc);
                 ray_t* topk_res = ray_topk_table(tbl, key_cols[0], desc, nf, limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
                 if (topk_res && RAY_IS_ERR(topk_res)) ray_release(topk_res);
             } else {
-                /* Default nulls-first to !desc per-key when caller
-                 * didn't supply a vector. */
                 uint8_t nfs[16];
                 for (uint32_t k = 0; k < n_sort; k++) {
                     uint8_t d = ext->sort.desc ? ext->sort.desc[k] : 0;
                     nfs[k] = ext->sort.nulls_first
                              ? ext->sort.nulls_first[k]
-                             : !d;
+                             : sort_nulls_first(d);
                 }
                 ray_t* topk_res = ray_topk_table_multi(tbl, key_cols,
                     ext->sort.desc, nfs, n_sort, limit);
@@ -3605,11 +3616,10 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
      * g->selection is always NULL here (exec.c compacts it before calling
      * exec_sort); the gate still checks defensively.
      *
-     * FUTURE TRAP: lifting the null-free restriction (idx_fresh_nonull)
-     * requires reconciling nulls placement — the index perm was built with
-     * sort_indices_ex's default (nulls FIRST), while ray_sort_op defaults
-     * to nulls LAST for ASC.  Reusing the perm for a null-bearing column
-     * without that reconciliation silently misplaces the null block. */
+     * The null-free restriction (idx_fresh_nonull) is no longer about where
+     * nulls land: the perm and the sort now place them the same way, since
+     * both take the default from sort_nulls_first.  It stands only on what
+     * the index itself guarantees. */
     uint64_t* sorted_keys = NULL;
     ray_t* sorted_keys_hdr = NULL;
     ray_t* idx_vec;
@@ -3941,7 +3951,13 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
      * read and a volatile flag load per row; here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
      * string comparison only runs at run boundaries), the secondary key
-     * reads raw i64, and the bail flag is polled per 4096-row block. */
+     * reads raw i64, and the bail flag is polled per 4096-row block.
+     *
+     * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
+     * HAS_NULLS up front, including for SYM/STR).  That is not squeamishness
+     * about in-band nulls: this loop ranks sym 0 by its domain string, i.e.
+     * smallest, whereas the real sort places nulls by the `nulls_first` flag
+     * independently of payload.  See the note on ray_key_cols_sorted. */
     if (!c->descending && c->n_keys == 2 &&
         c->key_cols[0]->type == RAY_SYM &&
         (c->key_cols[1]->type == RAY_I64 ||
@@ -4009,6 +4025,21 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
  * null-free integer-family / SYM keys are decidable — anything else (float,
  * STR/LIST, or a HAS_NULLS column) returns false so the caller must NOT
  * assume sortedness (float NaN / null placement belong to the real sort).
+ *
+ * The HAS_NULLS rejection stands even for SYM/STR, whose nulls are IN-BAND
+ * ordinary values (sym id 0 is a real dictionary entry — the empty string at
+ * position 0 of every symfile; a STR null is a zero-length descriptor).  That
+ * in-band property is what lets the fused predicate evaluator compare them for
+ * EQUALITY (see fp_col_supported_op in fused_pred.c), but it does NOT extend to
+ * ORDER: the sort kernels give nulls a dedicated order class placed by the
+ * `nulls_first` flag — sort_cmp answers `nf ? -1 : 1` for a null operand
+ * without looking at the payload, and the single-key path partitions nulls out
+ * and rotates them to the requested end.  A payload-only scan such as this one
+ * ranks sym 0 as the smallest string, which now agrees with the default policy
+ * (sort_nulls_first: a null is the smallest value) but not with a caller that
+ * asked for the other end.  So the rejection is conservatism about the
+ * requested placement, not an undecidable ordering — a caller that pins the
+ * default could decide it.
  * O(nrows) with early bail on the first violation; a 0/1-row column is
  * trivially sorted.  Used by the parted ORDER BY streaming path in query.c
  * to verify each partition is internally sorted at O(partition), never a

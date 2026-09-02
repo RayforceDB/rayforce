@@ -1,0 +1,32 @@
+;; .repl.complete — prefix completion over the live namespace (issue #441).
+;;
+;; Wraps ray_env_lookup_prefix (builtins + keywords + user bindings),
+;; sorts, and returns a sym vector.  This is the engine side of "what the
+;; REPL does", now reachable over IPC so editor tooling (tree-sitter /
+;; LSP-style clients) can offer semantic completion of names the engine
+;; knows at runtime — not just static keywords.
+
+;; ── user bindings are completed, and the result is sorted ──
+(set zzq_alpha 1)
+(set zzq_gamma 3)
+(set zzq_beta  2)
+(.repl.complete "zzq_") -- ['zzq_alpha 'zzq_beta 'zzq_gamma]
+
+;; ── a narrower prefix narrows the candidate set ──
+(.repl.complete "zzq_a") -- ['zzq_alpha]
+
+;; ── no match → empty vector ──
+(count (.repl.complete "zzq_no_such_prefix_xyzzy")) -- 0
+
+;; ── the set includes builtins/keywords, not just user names
+;;    (membership so the assertion survives future additions) ──
+(in 'take   (.repl.complete "take")) -- true
+(in 'select (.repl.complete "sel"))  -- true
+
+;; ── the verb is self-discoverable, and dotted names round-trip ──
+(in '.repl.complete (.repl.complete ".repl.")) -- true
+
+;; ── type errors: the argument must be a string atom ──
+(.repl.complete 42)    !- type
+(.repl.complete 'zzq_) !- type
+(.repl.complete [1 2]) !- type

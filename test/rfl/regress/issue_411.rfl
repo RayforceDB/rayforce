@@ -1,0 +1,11 @@
+;; Issue #411 — update-by sub-table gathers must retain null metadata.
+
+(set I411 (table [k v] (list [1 2 1 2] (as 'I64 [10 0N 30 40]))))
+(set I411U (update {mn:(min v) sm:(sum v) by:k from:I411}))
+(at I411U 'mn) -- [10 40 10 40]
+(at I411U 'sm) -- [40 40 40 40]
+
+;; The broadcast update must agree with the corresponding grouped select.
+(set I411S (select {mn:(min v) sm:(sum v) from:I411 by:k}))
+(distinct (at I411U 'mn)) -- (at I411S 'mn)
+(distinct (at I411U 'sm)) -- [40]

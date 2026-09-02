@@ -1,5 +1,5 @@
 (strlen "abc") -- 3
-(strlen "") -- 0
+(strlen "") -- 0Nl
 (strlen 'alpha) -- 5
 (sum (strlen ["aa" "bbb" ""])) -- 5
 

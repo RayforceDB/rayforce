@@ -150,8 +150,8 @@
 ;; null → BOOL — produces null BOOL sentinel
 (nil? (as 'BOOL 0Nl)) -- true
 
-;; empty sym → SYMBOL (SYM has no null; ' is a value)
-(nil? (as 'SYMBOL ')) -- false
+;; empty sym → canonical SYMBOL null
+(nil? (as 'SYMBOL ')) -- true
 
 ;; null → DATE
 (nil? (as 'DATE 0Nd)) -- true
@@ -218,7 +218,7 @@
 (as 'BOOL 1.0)   -- true    ;; F64 → BOOL
 (as 'BOOL 0.0)   -- false   ;; F64 → BOOL (zero)
 (as 'BOOL "hi")  -- true    ;; STR → BOOL (non-empty)
-(nil? (as 'BOOL ""))  -- false
+(nil? (as 'BOOL ""))  -- true
 
 ;; --- Cast to STR ---
 (as 'STR "hi")   -- "hi"    ;; already STR

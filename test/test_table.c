@@ -398,7 +398,7 @@ static test_result_t test_table_add_col_null_tbl(void) {
     PASS();
 }
 
-/* NULL/error col_vec yields a type error; table is left untouched (table.c:105). */
+/* NULL/error col_vec yields a domain error and consumes the input table. */
 static test_result_t test_table_add_col_bad_colvec(void) {
     ray_t* tbl = ray_table_new(2);
 
@@ -407,14 +407,13 @@ static test_result_t test_table_add_col_bad_colvec(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     ray_error_free(r);
 
-    /* tbl was not consumed on the NULL-col_vec early return */
+    tbl = ray_table_new(2);
     ray_t* err = ray_error("test", NULL);
     r = ray_table_add_col(tbl, id, err);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     ray_error_free(r);
     ray_error_free(err);
 
-    ray_release(tbl);
     PASS();
 }
 
@@ -620,5 +619,4 @@ const test_entry_t table_entries[] = {
     { "table/nrows_empty_col", test_table_nrows_empty_col, table_setup, table_teardown },
     { NULL, NULL, NULL, NULL },
 };
-
 

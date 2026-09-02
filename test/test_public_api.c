@@ -661,12 +661,13 @@ static test_result_t test_public_nullability_matrix(void) {
         ray_typed_null(-RAY_U8),
         ray_typed_null(-RAY_F32),
     };
-    const bool requested_is_null[] = { false, false, true, true, true };
+    const bool ordinary_is_null[]  = { true, true, false, false, false };
+    const bool requested_is_null[] = { true, true, true, true, true };
 
     for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
         TEST_ASSERT_NOT_NULL(ordinary[i]);
         TEST_ASSERT_FALSE(RAY_IS_ERR(ordinary[i]));
-        TEST_ASSERT_FALSE(RAY_ATOM_IS_NULL(ordinary[i]));
+        TEST_ASSERT_EQ_I(RAY_ATOM_IS_NULL(ordinary[i]), ordinary_is_null[i]);
         TEST_ASSERT_NOT_NULL(requested_null[i]);
         TEST_ASSERT_FALSE(RAY_IS_ERR(requested_null[i]));
         TEST_ASSERT_EQ_I(RAY_ATOM_IS_NULL(requested_null[i]), requested_is_null[i]);

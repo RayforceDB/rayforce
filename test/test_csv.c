@@ -480,10 +480,7 @@ static test_result_t test_csv_null_bool(void) {
 
 static test_result_t test_csv_null_sym(void) {
     /* CSV format conflates "empty field" and "missing field" — both
-     * appear as a zero-length cell.  The Rayforce loader interns empty
-     * SYM cells as the empty SYM (not the null sentinel) so SQL-style
-     * `(!= col "")` filters work the way users expect.  RAY_STR columns
-     * and non-string types preserve the null distinction. */
+     * appear as a zero-length cell.  Empty SYM is the canonical null. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -496,7 +493,7 @@ static test_result_t test_csv_null_sym(void) {
 
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(col, 1));  /* empty → empty SYM, not null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));   /* empty → canonical SYM null */
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
 
     /* Row 1's SYM ID resolves to a zero-length string — the empty SYM.
@@ -563,10 +560,9 @@ static test_result_t test_csv_null_mixed_columns(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(val_col, 1));
     TEST_ASSERT_TRUE(ray_vec_is_null(val_col, 2));
 
-    /* name column: alice, "", bob — empty SYM cell becomes the empty
-     * SYM (not null).  See test_csv_null_sym for the rationale. */
+    /* name column: alice, canonical empty/null SYM, bob. */
     TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(name_col, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 2));
 
     ray_release(loaded);
@@ -608,9 +604,8 @@ static test_result_t test_csv_explicit_str_schema(void) {
     s = ray_str_vec_get(note, 1, &l);
     TEST_ASSERT_EQ_I((int)l, 35);
     TEST_ASSERT_MEM_EQ(35, s, "this-is-a-long-string-over-12-bytes");
-    /* A blank CSV field for a STR column is the empty string "" (a value),
-     * not a null — consistent with SYM and the STR no-null model. */
-    TEST_ASSERT_FALSE(ray_vec_is_null(note, 2));
+    /* A blank CSV field is the canonical empty/null STR. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(note, 2));
     s = ray_str_vec_get(note, 2, &l);
     TEST_ASSERT_EQ_I((int)l, 0);
     s = ray_str_vec_get(note, 3, &l);
@@ -1643,6 +1638,227 @@ static test_result_t test_csv_progress_never_goes_backwards(void) {
     PASS();
 }
 
+/* --------------------------------------------------------------------------
+ * Parallel row-offset scan — chunk-boundary stitching.
+ *
+ * build_row_offsets_par splits the file into chunks and reconciles quote
+ * parity across them, so its entire risk surface is what a boundary lands in
+ * the middle of: a quoted field carrying a newline, a "" escape run, or the
+ * two bytes of a "\r\n".  A test build shrinks the chunking (see
+ * CSV_SCAN_CHUNKS in csv.c) to RAY_POOL_INIT_TASKS chunks, which over these
+ * ~20 KB fixtures puts a boundary every ~20 bytes — i.e. essentially every
+ * position in the file is tried as a split point across the matrix.
+ *
+ * The oracle is exact and catches all three failure modes at once: every row
+ * begins with its own index, so a dropped row, a duplicated row or a row
+ * split in the wrong place all show up as either a wrong row count or a gap
+ * in column 0.
+ * -------------------------------------------------------------------------- */
+
+static uint32_t bmx_rand(uint32_t* s) {   /* xorshift32, reproducible */
+    uint32_t x = *s;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return (*s = x);
+}
+
+/* One randomized fixture + full verification.  `quoted` picks the state
+ * machine under test: the quote-parity one, or the quote-free fast path
+ * (whose terminator grammar differs — only '\n' ends a row and a following
+ * '\r' is absorbed — so it gets its own terminator menu). */
+static bool bmx_one_case(uint32_t* seed, bool quoted, int n_rows) {
+    /* Hazards for the quoted machine.  Odd and even "" runs both appear, so
+     * a boundary can land on either parity inside a run. */
+    static const char* const q_fields[] = {
+        "\"a\nb\"", "\"a\r\nb\"", "\"a\rb\"", "\"x\"\"y\"",
+        "\"x\"\"\"\"y\"", "\"\"\"\"", "\"p,q\"", "\"\"",
+        "\"pad0123456789abcdef\"", "plain", "", "\"z\nz\r\nz\rz\"",
+    };
+    static const char* const p_fields[] = {
+        "plain", "", "abc", "pad0123456789", "0", "-12", "long_field_value",
+    };
+    static const char* const q_terms[] = { "\n", "\r\n", "\r" };
+    static const char* const p_terms[] = { "\n", "\n\r" };
+
+    FILE* f = fopen(TMP_CSV, "wb");
+    if (!f) return false;
+    fputs("i,a,b\n", f);
+    for (int r = 0; r < n_rows; r++) {
+        const char* a;
+        const char* b;
+        const char* t;
+        if (quoted) {
+            a = q_fields[bmx_rand(seed) % (sizeof(q_fields) / sizeof(*q_fields))];
+            b = q_fields[bmx_rand(seed) % (sizeof(q_fields) / sizeof(*q_fields))];
+            t = q_terms[bmx_rand(seed) % (sizeof(q_terms) / sizeof(*q_terms))];
+        } else {
+            a = p_fields[bmx_rand(seed) % (sizeof(p_fields) / sizeof(*p_fields))];
+            b = p_fields[bmx_rand(seed) % (sizeof(p_fields) / sizeof(*p_fields))];
+            t = p_terms[bmx_rand(seed) % (sizeof(p_terms) / sizeof(*p_terms))];
+        }
+        fprintf(f, "%d,%s,%s%s", r, a, b, t);
+    }
+    fclose(f);
+
+    int8_t schema[] = {RAY_I64, RAY_STR, RAY_STR};
+    ray_t* t = ray_read_csv_opts(TMP_CSV, ',', true, schema, 3);
+    bool ok = t && !RAY_IS_ERR(t) && t->type == RAY_TABLE &&
+              ray_table_nrows(t) == n_rows;
+    if (ok) {
+        /* Column 0 must be exactly 0..n_rows-1: any mis-stitch either shifts
+         * a row start into the middle of a field (index parses as null) or
+         * changes how many rows there are. */
+        const int64_t* idx = (const int64_t*)ray_data(ray_table_get_col_idx(t, 0));
+        for (int r = 0; r < n_rows; r++)
+            if (idx[r] != r) { ok = false; break; }
+    }
+    if (t) ray_release(t);
+    unlink(TMP_CSV);
+    return ok;
+}
+
+static test_result_t test_csv_scan_boundary_matrix(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    uint32_t seed = 0x9e3779b9u;
+    bool ok = true;
+    /* ~700 rows keeps each fixture around 20 KB — comfortably past the test
+     * build's parallel-scan threshold, small enough that 120 of them cost a
+     * fraction of a second even under ASan. */
+    for (int i = 0; i < 60 && ok; i++) ok = bmx_one_case(&seed, true, 700);
+    for (int i = 0; i < 60 && ok; i++) ok = bmx_one_case(&seed, false, 900);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * SYM interning — id assignment order.
+ *
+ * The intern is parallelized as: per-column local dedupe (threads) -> serial
+ * intern of only the distinct strings -> per-column code->id remap (threads).
+ * That is only sound because it reproduces the id assignment of a plain
+ * row-by-row walk, and a symbol's id IS its first-encounter order, so the
+ * property to pin is: ids are allocated column by column (ascending), and
+ * within a column row by row, first occurrence only.
+ *
+ * The fixture makes that order fully predictable and then reads the ids back
+ * with ray_sym_find:
+ *   col a  "a<k>" for k = 0..NA-1, cycling  -> first occurrences in k order
+ *   col b  the same vocabulary REVERSED     -> must reuse col a's ids, not
+ *                                              allocate new ones in b's order
+ *   col c  "c<r>", one per row              -> allocated after all of a's
+ *   col d  MIXED, cycling every 3 rows:
+ *            r%3==0  "a<(7r) mod ND>"  already interned by col a
+ *            r%3==1  "d<r/3>"          NEW, must be allocated in d's ROW
+ *                                      order, after every id col c allocated
+ *            r%3==2  ""                empty -> local code 0 -> empty sym id
+ * col d is the case the whole argument leans on hardest: one column that both
+ * reuses ids from an earlier column AND allocates its own, so a step that
+ * replayed dictionaries in the wrong order, or that mixed up which entries
+ * were new, would land visibly wrong ids.  Its empties also cover the code-0
+ * remap, which is the one value step C does not read out of the dictionary.
+ *
+ * Path coverage in the one fixture: cols a, b, d are under the test build's
+ * CSV_DEDUP_MAX_ENTS (8192) so they take the local-dictionary path; col c's
+ * distinct count is over it so it takes the overflow fallback.  One expected
+ * id sequence spans both.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_csv_sym_id_order(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int NA = 5000;      /* col a distinct — under the dedupe ceiling */
+    const int NROWS = 30000;  /* col c distinct — over it */
+    /* col d: ND reused strings + ND new ones = 8000 distinct, still under the
+     * ceiling.  ND divides into NA and 7 is coprime with it, so (7r) mod ND
+     * scrambles the reuse order without ever naming a string col a missed. */
+    const int ND = 4000;
+    const int NDNEW = 4000;   /* "d0".."d3999", first seen at rows 1,4,7,... */
+
+    FILE* f = fopen(TMP_CSV, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b,c,d\n", f);
+    for (int r = 0; r < NROWS; r++) {
+        char d[32];
+        switch (r % 3) {
+            case 0:  snprintf(d, sizeof(d), "a%d", (7 * r) % ND); break;
+            case 1:  snprintf(d, sizeof(d), "d%d", (r / 3) % NDNEW); break;
+            default: d[0] = '\0'; break;      /* empty field */
+        }
+        fprintf(f, "a%d,a%d,c%d,%s\n", r % NA, NA - 1 - (r % NA), r, d);
+    }
+    fclose(f);
+
+    int8_t schema[] = {RAY_SYM, RAY_SYM, RAY_SYM, RAY_SYM};
+    ray_t* t = ray_read_csv_opts(TMP_CSV, ',', true, schema, 4);
+    bool ok = t && !RAY_IS_ERR(t) && t->type == RAY_TABLE &&
+              ray_table_nrows(t) == NROWS;
+
+    char buf[32];
+    int64_t a0 = -1;
+    if (ok) {
+        int n = snprintf(buf, sizeof(buf), "a%d", 0);
+        a0 = ray_sym_find(buf, (size_t)n);
+        ok = a0 > 0;
+    }
+    /* col a: consecutive ids in first-occurrence (k ascending) order. */
+    for (int k = 0; ok && k < NA; k++) {
+        int n = snprintf(buf, sizeof(buf), "a%d", k);
+        if (ray_sym_find(buf, (size_t)n) != a0 + k) ok = false;
+    }
+    /* col b reused those strings; had b been interned in ITS own order the
+     * "a<NA-1>" end of the range would hold the lower ids. */
+    /* col c: allocated strictly after every a<k>, in row order. */
+    for (int r = 0; ok && r < NROWS; r++) {
+        int n = snprintf(buf, sizeof(buf), "c%d", r);
+        if (ray_sym_find(buf, (size_t)n) != a0 + NA + r) ok = false;
+    }
+    /* col d's NEW strings: allocated after every id col c allocated, and in
+     * d's own row order — "d<k>" is first seen at row 3k+1, so k ascending.
+     * The reused "a<...>" values interleaved between them must have consumed
+     * no ids at all, or these would not be consecutive. */
+    for (int k = 0; ok && k < NDNEW; k++) {
+        int n = snprintf(buf, sizeof(buf), "d%d", k);
+        if (ray_sym_find(buf, (size_t)n) != a0 + NA + NROWS + k) ok = false;
+    }
+    /* And the id actually STORED in a cell is that symbol's id — the remap
+     * step has to land the right value in the row, not just intern the right
+     * string.  Row 0 of col b is "a<NA-1>", the LAST id col a allocated. */
+    if (ok) {
+        ray_t* cb = ray_table_get_col_idx(t, 1);
+        int64_t pos = ray_read_sym(ray_data(cb), 0, RAY_SYM, cb->attrs);
+        int n = snprintf(buf, sizeof(buf), "a%d", NA - 1);
+        ok = (pos == a0 + NA - 1) && (ray_sym_find(buf, (size_t)n) == pos);
+    }
+    /* Col d's three row shapes, read out of the column: a reused id, a newly
+     * allocated one, and the empty-field code-0 remap (the only value step C
+     * does not take from the dictionary). */
+    if (ok) {
+        ray_t* cd = ray_table_get_col_idx(t, 3);
+        const void* dd = ray_data(cd);
+        int64_t empty_id = ray_sym_find("", 0);
+        int64_t p0 = ray_read_sym(dd, 0, RAY_SYM, cd->attrs);   /* "a0"  */
+        int64_t p1 = ray_read_sym(dd, 1, RAY_SYM, cd->attrs);   /* "d0"  */
+        int64_t p2 = ray_read_sym(dd, 2, RAY_SYM, cd->attrs);   /* ""    */
+        int64_t p3 = ray_read_sym(dd, 3, RAY_SYM, cd->attrs);   /* "a21" */
+        ok = empty_id >= 0 &&
+             p0 == a0 &&
+             p1 == a0 + NA + NROWS &&
+             p2 == empty_id &&
+             p3 == a0 + ((7 * 3) % ND);
+    }
+
+    if (t) ray_release(t);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1697,5 +1913,7 @@ const test_entry_t csv_entries[] = {
     { "csv/resolve_int_width",    test_csv_resolve_int_width,              NULL, NULL },
     { "csv/interrupt_mid_parse",  test_csv_interrupt_mid_parse,             NULL, NULL },
     { "csv/progress_monotonic",   test_csv_progress_never_goes_backwards,   NULL, NULL },
+    { "csv/scan_boundary_matrix", test_csv_scan_boundary_matrix,            NULL, NULL },
+    { "csv/sym_id_order",         test_csv_sym_id_order,                    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

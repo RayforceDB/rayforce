@@ -25,6 +25,7 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
@@ -79,8 +80,8 @@ static const char* null_literal_str(int8_t type) {
         case RAY_DATE:      return "0Nd";
         case RAY_TIME:      return "0Nt";
         case RAY_TIMESTAMP: return "0Np";
-        /* SYM has no null literal: empty symbol is a value, never reaches
-         * here — callers gate on RAY_ATOM_IS_NULL, always false for SYM. */
+        /* SYM/STR use their empty literal as the canonical null spelling;
+         * callers keep them on their ordinary formatting paths. */
         default:            return "null";
     }
 }
@@ -100,10 +101,9 @@ void ray_lang_print(FILE* fp, ray_t* val) {
         return;
     }
     if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
-    /* STR has no distinct null — empty and null strings are the same
-     * value and print as empty content (handled by the -RAY_STR case),
-     * not a null literal. */
-    if (val->type != -RAY_STR && RAY_ATOM_IS_NULL(val)) {
+    /* STR/SYM use their empty literals as canonical null spellings. */
+    if (val->type != -RAY_STR && val->type != -RAY_SYM &&
+        RAY_ATOM_IS_NULL(val)) {
         fprintf(fp, "%s", null_literal_str(val->type));
         return;
     }
@@ -198,7 +198,8 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
             int tlen = 0;
             if (!a || RAY_IS_ERR(a)) {
                 tlen = snprintf(tmp, sizeof(tmp), "error");
-            } else if (a->type != -RAY_STR && RAY_ATOM_IS_NULL(a)) {
+            } else if (a->type != -RAY_STR && a->type != -RAY_SYM &&
+                       RAY_ATOM_IS_NULL(a)) {
                 tlen = snprintf(tmp, sizeof(tmp), "%s", null_literal_str(a->type));
             } else if (a->type == -RAY_I64) {
                 tlen = snprintf(tmp, sizeof(tmp), "%ld", (long)a->i64);
@@ -684,8 +685,10 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
 
     /* The streaming writer emits raw columns; append chunk-zone indexes to the
      * just-written files, then reload so the returned table carries them
-     * (mmap'd in place).  Without this, an on-disk column would lack the
-     * block-skip an in-memory .csv.read column has. */
+     * (mmap'd in place).  Conversion is the ONLY place a CSV load decides an
+     * index: `.csv.read` returns an index-free in-memory table, and callers
+     * that want one on it ask explicitly (.idx.hash / the attrs verbs).
+     * Without this pass, a converted store would have no block-skip at all. */
     ray_t* tbl = ray_read_splayed(dir, sym);
     if (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
         ray_splay_build_indexes(dir, tbl);
@@ -1200,6 +1203,14 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
                 if (d[i] == NULL_I64) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
             return;
         }
+        case RAY_SYM:
+            for (int64_t i = 0; i < n; i++) {
+                if (ray_read_sym(out, i, RAY_SYM, vec->attrs) == 0) {
+                    vec->attrs |= RAY_ATTR_HAS_NULLS;
+                    return;
+                }
+            }
+            return;
         default: return;
     }
 }
@@ -1350,6 +1361,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 return ray_error("domain", "as: cannot parse str as i64, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as i64, value out of int64 range");
+            /* INT64_MIN is NULL_I64: a non-null i64 cannot hold it, so reject
+             * rather than silently returning 0Nl.  The string->vector cast
+             * (cast_vec_numeric) routes each element through here too, so
+             * vectors reject it consistently — string ingest is loud, unlike
+             * numeric narrowing which nulls the sentinel (see as.rfl). */
+            if (v == NULL_I64)
+                return ray_error("domain", "as: cannot parse str as i64, value is the i64 null sentinel");
             return make_i64(v);
         }
         /* Vector/list cast */
@@ -1371,12 +1389,21 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
             errno = 0;
-            long v = strtol(sp, &end, 10);
+            int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i32");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as i32, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as i32, value out of int64 range");
+            if (v < INT32_MIN || v > INT32_MAX)
+                return ray_error("domain", "as: cannot parse str as i32, value out of i32 range");
+            /* INT32_MIN is NULL_I32: a non-null i32 cannot hold it, so reject
+             * rather than silently returning 0Ni.  The string->vector cast
+             * (cast_vec_numeric) routes each element through here too, so
+             * vectors reject it consistently — string ingest is loud, unlike
+             * numeric narrowing which nulls the sentinel (see as.rfl). */
+            if ((int32_t)v == NULL_I32)
+                return ray_error("domain", "as: cannot parse str as i32, value is the i32 null sentinel");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
@@ -1398,12 +1425,21 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
             errno = 0;
-            long v = strtol(sp, &end, 10);
+            int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as i16");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as i16, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as i16, value out of int64 range");
+            if (v < INT16_MIN || v > INT16_MAX)
+                return ray_error("domain", "as: cannot parse str as i16, value out of i16 range");
+            /* INT16_MIN is NULL_I16: a non-null i16 cannot hold it, so reject
+             * rather than silently returning 0Nh.  The string->vector cast
+             * (cast_vec_numeric) routes each element through here too, so
+             * vectors reject it consistently — string ingest is loud, unlike
+             * numeric narrowing which nulls the sentinel (see as.rfl). */
+            if ((int16_t)v == NULL_I16)
+                return ray_error("domain", "as: cannot parse str as i16, value is the i16 null sentinel");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
@@ -1920,12 +1956,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             char* end; errno = 0;
-            long v = strtol(sp, &end, 10);
+            int64_t v = strtoll(sp, &end, 10);
             if (end == sp) return ray_error("domain", "as: cannot parse str as u8");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as u8, unexpected trailing characters");
             if (errno == ERANGE)
                 return ray_error("domain", "as: cannot parse str as u8, value out of int64 range");
+            if (v < 0 || v > UINT8_MAX)
+                return ray_error("domain", "as: cannot parse str as u8, value out of u8 range");
             return ray_u8((uint8_t)v);
         }
         /* Vector cast */

@@ -72,9 +72,14 @@ static ray_t* strlen_vec(ray_t* x) {
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
     int64_t* dst = (int64_t*)ray_data(out);
-    /* STR/SYM have no null. */
-    for (int64_t i = 0; i < n; i++)
-        strlen_vec_value(x, i, &dst[i]);
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(x, i)) {
+            dst[i] = NULL_I64;
+            out->attrs |= RAY_ATTR_HAS_NULLS;
+        } else {
+            strlen_vec_value(x, i, &dst[i]);
+        }
+    }
     return out;
 }
 
@@ -97,9 +102,11 @@ static ray_t* strlen_mapcommon(ray_t* x) {
     int64_t off = 0;
     for (int64_t p = 0; p < counts->len; p++) {
         int64_t v = 0;
-        strlen_vec_value(keys, p, &v);  /* STR/SYM have no null */
+        bool is_null = ray_vec_is_null(keys, p);
+        if (!is_null) strlen_vec_value(keys, p, &v);
         for (int64_t r = 0; r < cnt[p]; r++)
-            dst[off++] = v;
+            dst[off++] = is_null ? NULL_I64 : v;
+        if (is_null) out->attrs |= RAY_ATTR_HAS_NULLS;
     }
     return out;
 }
@@ -120,9 +127,13 @@ static ray_t* strlen_parted(ray_t* x) {
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg || RAY_IS_ERR(seg)) continue;
-        /* STR/SYM have no null. */
         for (int64_t i = 0; i < seg->len; i++) {
-            strlen_vec_value(seg, i, &dst[off]);
+            if (ray_vec_is_null(seg, i)) {
+                dst[off] = NULL_I64;
+                out->attrs |= RAY_ATTR_HAS_NULLS;
+            } else {
+                strlen_vec_value(seg, i, &dst[off]);
+            }
             off++;
         }
     }
@@ -130,6 +141,8 @@ static ray_t* strlen_parted(ray_t* x) {
 }
 
 ray_t* ray_strlen_fn(ray_t* x) {
+    if (ray_is_atom(x) && RAY_ATOM_IS_NULL(x))
+        return ray_typed_null(-RAY_I64);
     int64_t len = 0;
     if (strlen_atom_value(x, &len)) return ray_i64(len);
     if (ray_is_vec(x)) return strlen_vec(x);
@@ -1075,6 +1088,31 @@ ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
                 }
                 out[i] = m ? 1 : 0;
             }
+        }
+        return result;
+    }
+
+    /* List of string/symbol atoms — the shape splayed string columns
+     * load as (col_load_str_list).  Mirrors str-find's list branch. */
+    if (x->type == RAY_LIST) {
+        int64_t n = x->len;
+        ray_t* result = ray_vec_new(RAY_BOOL, n);
+        if (RAY_IS_ERR(result)) return result;
+        result->len = n;
+        uint8_t* out = (uint8_t*)ray_data(result);
+        ray_t** items = (ray_t**)ray_data(x);
+        for (int64_t i = 0; i < n; i++) {
+            if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) {
+                ray_release(result);
+                return ray_error("cancel", NULL);
+            }
+            const char* s; size_t sl;
+            if (!str_atom_bytes(items[i], &s, &sl, NULL)) {
+                ray_release(result);
+                return ray_error("type", "like: list items must be string or symbol atoms");
+            }
+            out[i] = (use_simple ? ray_glob_match_compiled(&pc, s, sl)
+                                 : ray_glob_match(s, sl, pat, pat_len)) ? 1 : 0;
         }
         return result;
     }

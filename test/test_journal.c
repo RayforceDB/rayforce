@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <glob.h>
 
 /* ── Runtime fixture (same pattern as test_link.c) ─────────────────── */
 
@@ -997,6 +998,91 @@ static test_result_t test_journal_snapshot_when_closed(void) {
     PASS();
 }
 
+/* #420: a crash between the .qdb rename and the log roll leaves the
+ * fresh snapshot next to the OLD log whose entries it already contains.
+ * Recovery must not apply those entries a second time — and when more
+ * entries land on that log afterwards (the failed-roll append path),
+ * recovery must replay exactly the tail. */
+static test_result_t test_journal_crash_window_no_double_apply(void) {
+    char base[256]; make_base(base, sizeof(base), "cwin");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Session 1: journal an increment (non-idempotent on purpose) and
+     * apply it once, exactly like the IPC eval+log path. */
+    char src[640];
+    snprintf(src, sizeof(src),
+             "(set jw_x 0)"
+             "(.log.open 'async \"%s\")"
+             "(.log.write (quote (set jw_x (+ jw_x 1))))"
+             "(set jw_x (+ jw_x 1))",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Value the snapshot will hold. */
+    ray_t* pre = ray_eval_str("jw_x");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pre));
+    int64_t v_pre = pre->i64;
+    ray_release(pre);
+
+    /* Snapshot: writes .qdb (with the coverage marker), then rolls. */
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+
+    /* Simulate the crash IN the window: put the just-archived log back
+     * under its live name, exactly the on-disk state a crash between
+     * the two renames leaves behind. */
+    char pattern[300];
+    snprintf(pattern, sizeof(pattern), "%s.*.log", base);
+    glob_t g;
+    TEST_ASSERT_EQ_I(glob(pattern, 0, NULL, &g), 0);
+    TEST_ASSERT_EQ_I((int64_t)g.gl_pathc, 1);
+    TEST_ASSERT_EQ_I(rename(g.gl_pathv[0], lpath), 0);
+    globfree(&g);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* Restart: clobber the binding, recover.  The covered log must be
+     * skipped — jw_x comes back as the snapshot value, not value+1. */
+    ray_t* c = ray_eval_str("(set jw_x 100)");
+    if (c && !RAY_IS_ERR(c)) ray_release(c);
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    ray_t* r1 = ray_eval_str("jw_x");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->i64, v_pre);
+    ray_release(r1);
+
+    /* Failed-roll append path: more entries land on the covered log.
+     * Recovery must replay exactly that tail on top of the snapshot. */
+    char more[640];
+    snprintf(more, sizeof(more),
+             "(.log.open 'async \"%s\")"
+             "(.log.write (quote (set jw_x (+ jw_x 1))))"
+             "(.log.close)",
+             base);
+    ray_t* m = ray_eval_str(more);
+    TEST_ASSERT_NOT_NULL(m);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    if (m != RAY_NULL_OBJ) ray_release(m);
+
+    ray_t* c2 = ray_eval_str("(set jw_x 100)");
+    if (c2 && !RAY_IS_ERR(c2)) ray_release(c2);
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    ray_t* r2 = ray_eval_str("jw_x");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->i64, v_pre + 1);
+    ray_release(r2);
+
+    /* The marker key must not leak into the env as a global. */
+    ray_t* leak = ray_eval_str(".journal.covered");
+    TEST_ASSERT_TRUE(!leak || RAY_IS_ERR(leak));
+    if (leak && RAY_IS_ERR(leak)) ray_error_free(leak);
+    else if (leak && leak != RAY_NULL_OBJ) ray_release(leak);
+
+    cleanup_base(base);
+    PASS();
+}
+
 /* 7b. snapshot with bindings -> creates .qdb and rolls log. */
 static test_result_t test_journal_snapshot_basic(void) {
     char base[256]; make_base(base, sizeof(base), "snap_basic");
@@ -1616,14 +1702,12 @@ static test_result_t test_journal_snapshot_rename_fails(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  20. Snapshot: .qdb dict with more keys than values (missing-val path).
+ *  20. Snapshot: .qdb dict cannot be built with more keys than values.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static test_result_t test_journal_open_qdb_missing_val(void) {
-    char base[256]; make_base(base, sizeof(base), "oc_qdbmissing");
-    char qpath[270]; qdb_path(qpath, sizeof(qpath), base);
-
-    /* Build a dict: 2 sym keys, 1 value — second key has no corresponding val. */
+    /* Build a dict: 2 sym keys, 1 value.  Public construction rejects this
+     * before it can become a partially-loaded snapshot. */
     int64_t s1 = ray_sym_intern("jrn_k1", 6);
     int64_t s2 = ray_sym_intern("jrn_k2", 6);
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
@@ -1638,24 +1722,10 @@ static test_result_t test_journal_open_qdb_missing_val(void) {
 
     ray_t* d = ray_dict_new(keys, vals);
     TEST_ASSERT_NOT_NULL(d);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+    TEST_ASSERT_TRUE(RAY_IS_ERR(d));
+    TEST_ASSERT_STR_EQ(ray_err_code(d), "domain");
+    ray_error_free(d);
 
-    ray_err_t se = ray_obj_save(d, qpath);
-    ray_release(d);
-    TEST_ASSERT_EQ_I(se, RAY_OK);
-
-    /* Open: should warn about missing val for sym jrn_k2, but succeed. */
-    ray_err_t e = ray_journal_open(base, RAY_JOURNAL_ASYNC);
-    /* Partial load — bind_errs == 0 (we skipped, not failed), so OK. */
-    if (e == RAY_OK) {
-        TEST_ASSERT_TRUE(ray_journal_is_open());
-        TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    } else {
-        /* If open returned domain, still OK for test purposes. */
-        TEST_ASSERT_FALSE(ray_journal_is_open());
-    }
-
-    cleanup_base(base);
     PASS();
 }
 
@@ -2348,5 +2418,7 @@ const test_entry_t journal_entries[] = {
     { "journal/purge_full",                test_journal_purge_full,                jrn_setup, jrn_teardown },
     { "journal/purge_after_close",         test_journal_purge_after_close,         jrn_setup, jrn_teardown },
     { "journal/purge_ops_wrapper",         test_journal_purge_ops_wrapper,         jrn_setup, jrn_teardown },
+    /* #420: snapshot/roll crash window must not double-apply */
+    { "journal/crash_window_no_double_apply", test_journal_crash_window_no_double_apply, jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };

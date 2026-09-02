@@ -2105,7 +2105,8 @@ static test_result_t test_exec_strlen(void) {
     TEST_ASSERT_EQ_I(rdata[1], 5);   /* "WORLD" */
     TEST_ASSERT_EQ_I(rdata[2], 7);   /* "  foo  " */
     TEST_ASSERT_EQ_I(rdata[3], 7);   /* "bar_baz" */
-    TEST_ASSERT_EQ_I(rdata[4], 0);   /* "" */
+    TEST_ASSERT_EQ_I(rdata[4], NULL_I64); /* canonical empty STR is null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 4));
 
     ray_release(result);
     ray_graph_free(g);
@@ -2775,7 +2776,8 @@ static test_result_t test_exec_str_strlen(void) {
     TEST_ASSERT_EQ_I(d[1], 5);   /* "WORLD" */
     TEST_ASSERT_EQ_I(d[2], 7);   /* "  foo  " */
     TEST_ASSERT_EQ_I(d[3], 7);   /* "bar_baz" */
-    TEST_ASSERT_EQ_I(d[4], 0);   /* "" */
+    TEST_ASSERT_EQ_I(d[4], NULL_I64); /* canonical empty STR is null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 4));
 
     ray_release(result);
     ray_graph_free(g);
@@ -3286,8 +3288,8 @@ static test_result_t test_exec_str_upper_null(void) {
     TEST_ASSERT_EQ_U(len, 5);
     TEST_ASSERT_MEM_EQ(5, s0, "HELLO");
 
-    /* Row 1: empty -> empty (STR has no null) */
-    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    /* Row 1: canonical empty/null propagates. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
     (void)ray_str_vec_get(result, 1, &len);
     TEST_ASSERT_EQ_U(len, 0);
 
@@ -3329,7 +3331,8 @@ static test_result_t test_exec_str_strlen_null(void) {
     TEST_ASSERT_EQ_I(result->type, RAY_I64);
     int64_t* d = (int64_t*)ray_data(result);
     TEST_ASSERT_EQ_I(d[0], 5);
-    TEST_ASSERT_EQ_I(d[1], 0);  /* empty string -> length 0 (STR has no null) */
+    TEST_ASSERT_EQ_I(d[1], NULL_I64); /* canonical empty STR is null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
     TEST_ASSERT_EQ_I(d[2], 3);
 
     ray_release(result);
@@ -3372,8 +3375,8 @@ static test_result_t test_exec_str_substr_null(void) {
     TEST_ASSERT_EQ_U(len, 3);
     TEST_ASSERT_MEM_EQ(3, s0, "hel");
 
-    /* Row 1: empty in -> empty out (STR has no null) */
-    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    /* Row 1: canonical empty/null propagates. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
     (void)ray_str_vec_get(result, 1, &len);
     TEST_ASSERT_EQ_U(len, 0);
 
@@ -3421,8 +3424,8 @@ static test_result_t test_exec_str_replace_null(void) {
     TEST_ASSERT_EQ_U(len, 5);
     TEST_ASSERT_MEM_EQ(5, s0, "hell0");
 
-    /* Row 1: empty in -> empty out (STR has no null) */
-    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    /* Row 1: canonical empty/null propagates. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
     (void)ray_str_vec_get(result, 1, &len);
     TEST_ASSERT_EQ_U(len, 0);
 
@@ -3479,7 +3482,7 @@ static test_result_t test_exec_str_concat_null(void) {
     TEST_ASSERT_EQ_U(len, 8);
     TEST_ASSERT_MEM_EQ(8, s0, "John Doe");
 
-    /* Row 1: empty first arg -> "" + " Smith" = " Smith" (STR has no null) */
+    /* Row 1: canonical empty/null contributes zero bytes to concat. */
     TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
     const char* s1c = ray_str_vec_get(result, 1, &len);
     TEST_ASSERT_EQ_U(len, 6);
@@ -9844,8 +9847,8 @@ static test_result_t test_expr_sym_w64_cmp(void) {
     cnt = ray_count(g, flt);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* id1 at positions 0 and 3 (null slot raw = id1 == id1 → true): 2 matches */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* Only the non-null id1 at position 0 matches. */
+    TEST_ASSERT_EQ_I(result->i64, 1);
     ray_release(result);
     ray_graph_free(g);
 
@@ -15402,7 +15405,8 @@ static test_result_t test_expr_binary_bool_float_path_lhs(void) {
             op = ray_or(g, a, b); s = ray_sum(g, op);
             result = ray_execute(g, s);
             TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-            TEST_ASSERT_EQ_I(result->i64, 3);
+            /* The canonical empty/null SYM lane does not contribute. */
+            TEST_ASSERT_EQ_I(result->i64, 2);
             ray_release(result); ray_graph_free(g);
 
             ray_release(tbl);
@@ -16479,12 +16483,16 @@ static test_result_t test_expr_binary_range_f64_nan_branches(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    /* F64 vectors WITHOUT HAS_NULLS — raw NaN values, no bitmap null.
-     * ray_vec_from_raw does NOT set HAS_NULLS; NaN is just a bit pattern. */
+    /* F64 vectors WITHOUT HAS_NULLS.  from_raw flags sentinel NaNs (#445),
+     * so strip the attr deliberately: this test pins the tolerance path for
+     * unflagged sentinels (legacy / flag-dropped vectors), where NaN is
+     * just a bit pattern. */
     double rawa[] = {NAN, NAN, 1.0};
     double rawb[] = {NAN, 1.0, NAN};
     ray_t* va = ray_vec_from_raw(RAY_F64, rawa, 3);
     ray_t* vb = ray_vec_from_raw(RAY_F64, rawb, 3);
+    va->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    vb->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     /* Verify: no bitmap null set */
     TEST_ASSERT_FALSE(va->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_FALSE(vb->attrs & RAY_ATTR_HAS_NULLS);

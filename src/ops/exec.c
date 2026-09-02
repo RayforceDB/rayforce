@@ -680,7 +680,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
      * Null rows emit 0 regardless of negate (isn masks after the OR).
      * Bit-identical to the generic loops below; additive, chosen once. */
     /* SYM verdict-LUT fast path: one byte load per row, no set scan.
-     * SYM has no null, so there is no per-element null branch either. */
+     * Canonical null is raw id 0 and is handled by the same LUT lookup. */
     if (!c->col_is_atom && c->symlut && ct == RAY_SYM) {
         const uint8_t* lut = c->symlut;
         uint8_t neg = (uint8_t)negate;
@@ -870,6 +870,12 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
 
     if (ct == RAY_STR || st == RAY_STR) return IN_CTX_UNSUPPORTED;
+    /* GUID cells are 16-byte blobs; the typed kernel's READ_I64/IN_READ_I64
+     * loops have no guid case and read them at the wrong width (every cell
+     * decodes to 0, so membership silently matched everything).  Bail so the
+     * caller routes to the guid-aware hashset path, mirroring how RAY_STR bails
+     * above and the guid == fix. */
+    if (ct == RAY_GUID || st == RAY_GUID) return IN_CTX_UNSUPPORTED;
 
     /* Classify each side: 0=int-family, 1=float-family, 2=sym. */
     #define CLASSIFY(t)                                                    \
@@ -1094,6 +1100,76 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
     return out;
 }
 
+static ray_t* flatten_parted_col(ray_t* col);
+
+/* GUID membership fallback: the typed `in` kernel bails on guid operands
+ * (16-byte cells it can't compare), so route them through the general
+ * ray_in_fn path, which builds a guid-aware hashset.  `col` is a materialized
+ * column vector, so ray_in_fn returns a fresh RAY_BOOL vector we own and may
+ * invert in place for not-in. */
+static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
+    ray_t* input = col;
+    bool owns_input = false;
+    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) {
+        input = flatten_parted_col(col);
+        if (!input || RAY_IS_ERR(input)) return input ? input : ray_error("oom", NULL);
+        owns_input = true;
+    }
+
+    ray_t* r = ray_in_fn(input, set);
+    if (!r || RAY_IS_ERR(r)) {
+        if (owns_input) ray_release(input);
+        return r;
+    }
+
+    /* ray_in_fn returns a scalar for a scalar GUID subject.  Normalize it to
+     * the vector contract of exec_in before applying not-in. */
+    if (ray_is_atom(r) && r->type == -RAY_BOOL) {
+        ray_t* out = ray_vec_new(RAY_BOOL, 1);
+        if (!out || RAY_IS_ERR(out)) {
+            ray_release(r);
+            return out ? out : ray_error("oom", NULL);
+        }
+        out->len = 1;
+        ((uint8_t*)ray_data(out))[0] = r->b8;
+        ray_release(r);
+        r = out;
+    }
+
+    if (r->type == RAY_BOOL) {
+        uint8_t* b = (uint8_t*)ray_data(r);
+        if (negate)
+            for (int64_t i = 0; i < r->len; i++) b[i] = (uint8_t)!b[i];
+
+        /* Mask after inversion: null rows must remain false for both IN and
+         * NOT_IN, while the underlying membership helper may match null. */
+        if (ray_is_atom(col)) {
+            if (RAY_ATOM_IS_NULL(col)) b[0] = 0;
+        } else if (input->type == RAY_GUID) {
+            /* GUID nulls are all-zero cells; older table construction paths
+             * may omit HAS_NULLS even though the sentinel is present. */
+            static const uint8_t null_guid[16] = {0};
+            const uint8_t* data = (const uint8_t*)ray_data(input);
+            for (int64_t i = 0; i < r->len; i++)
+                if (memcmp(data + i * 16, null_guid, 16) == 0) b[i] = 0;
+        } else if (col->attrs & RAY_ATTR_HAS_NULLS) {
+            for (int64_t i = 0; i < r->len; i++)
+                if (ray_vec_is_null(input, i)) b[i] = 0;
+        }
+    }
+    if (owns_input) ray_release(input);
+    return r;
+}
+
+/* True when either operand is a guid column/atom (parted base included). */
+static bool in_is_guid(ray_t* col, ray_t* set) {
+    int8_t ct = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
+    int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
+    if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
+    if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
+    return ct == RAY_GUID || st == RAY_GUID;
+}
+
 static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     (void)g;
     bool negate = (op->opcode == OP_NOT_IN);
@@ -1122,8 +1198,11 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     in_ctx_status_t st = in_build_worker_ctx(col, set, negate,
                                              svf_stack, svi_stack,
                                              &in_ctx, &sv_hdr, &lut_hdr);
-    if (st == IN_CTX_UNSUPPORTED)
+    if (st == IN_CTX_UNSUPPORTED) {
+        if (in_is_guid(col, set))
+            return exec_in_guid_fallback(col, set, negate);
         return ray_error("nyi", "OP_IN on RAY_STR not yet implemented");
+    }
     if (st == IN_CTX_OOM)
         return ray_error("oom", NULL);
 
@@ -3723,6 +3802,30 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
 
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
 
+/* Validate compiler-marked missing scans before execution.  Optimizer rewrites
+ * may replace a root or eliminate such a scan from the live DAG (for example
+ * count/missing-column), but that must not turn an invalid reference into a
+ * result.  Do not revalidate every OP_SCAN against g->table here: graph APIs
+ * legitimately scan derived columns produced by upstream operators. */
+static ray_t* validate_scan_columns(ray_graph_t* g) {
+    if (!g) return ray_error("nyi", NULL);
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if (op->opcode != OP_SCAN ||
+            !(op->flags & OP_FLAG_INVALID_SCAN)) continue;
+
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext) return ray_error("schema", "scan metadata missing");
+        ray_t* name = ray_sym_str(ext->sym);
+        if (name)
+            return ray_error("schema", "column '%.*s' not found",
+                             (int)ray_str_len(name), ray_str_ptr(name));
+        return ray_error("schema", "column not found");
+    }
+    return NULL;
+}
+
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* The qstats capture mode is armed once per query at the eval boundary
      * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
@@ -3735,6 +3838,8 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* Progress ends at the eval boundary (the true query end), not here —
      * a query can drive several ray_execute calls, and ending after each
      * would reset the elapsed clock and fire premature "final" ticks. */
+    ray_t* scan_err = validate_scan_columns(g);
+    if (scan_err) return scan_err;
     return ray_execute_inner(g, root);
 }
 

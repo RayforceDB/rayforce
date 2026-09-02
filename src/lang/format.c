@@ -42,10 +42,30 @@ typedef struct {
     int32_t len;
     int32_t cap;
     ray_t*  block;  /* ray_alloc'd backing block */
+    bool    err;        /* sticky: set on the 2GiB cap or a failed ray_alloc.
+                         * Once set, every append is a no-op and fmt_to_str
+                         * returns an error instead of a string. */
+    const char* err_msg;/* why err was set, surfaced by fmt_to_str */
 } fmt_buf_t;
 
+/* The fmt_* append helpers are all void and have no caller to return an error
+ * to, so a growth failure (the 2GiB int32 buffer ceiling, or a ray_alloc that
+ * fails under memory pressure) sets the sticky `err` flag instead of writing
+ * out of bounds.  Every append checks it and becomes a no-op, and fmt_to_str
+ * turns it into a RAY_IS_ERR result.  This must NOT abort(): ray_fmt runs on
+ * IPC-server threads formatting client-supplied values (e.g. a client
+ * (println <huge vector>) or query-log of the raw payload), so a process-fatal
+ * path here is remotely triggerable — a recoverable error keeps the server up
+ * and every ray_fmt caller already checks RAY_IS_ERR. */
 static void fmt_init(fmt_buf_t* b) {
-    b->block = ray_alloc(256);
+    b->err     = false;
+    b->err_msg = NULL;
+    b->block   = ray_alloc(256);
+    if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
+        b->err = true; b->err_msg = "cannot allocate the initial output buffer";
+        b->buf = NULL; b->len = 0; b->cap = 0;
+        return;
+    }
     b->buf   = (char*)ray_data(b->block);
     b->len   = 0;
     b->cap   = 256;
@@ -61,33 +81,57 @@ static void fmt_destroy(fmt_buf_t* b) {
     }
 }
 
-static void fmt_ensure(fmt_buf_t* b, int32_t extra) {
-    if (b->len + extra <= b->cap) return;
-    int32_t new_cap = b->cap;
-    while (new_cap < b->len + extra)
+/* extra is int64 so a >2GiB length from a call site reaches the ceiling check
+ * intact instead of wrapping int32 first (a length in [2^31,2^32) used to wrap
+ * negative and, via the fast path below, sneak past as a no-grow "fit"). */
+static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
+    if (b->err) return;
+    /* Guard a negative/oversize request BEFORE the fast-path return: for a
+     * negative extra, need = len + extra < len <= cap, so the fast path would
+     * otherwise return first and leave the bad length to a wild memcpy. */
+    if (extra < 0) { b->err = true; b->err_msg = "invalid negative format length"; return; }
+    int64_t need = (int64_t)b->len + extra;
+    if (need <= (int64_t)b->cap) return;
+    if (need > (int64_t)INT32_MAX) {
+        /* int32 buffer ceiling: the doubling loop and cap field are int32, so
+         * 2GiB is the hard limit.  Fail loud but recoverable, not abort(). */
+        b->err = true; b->err_msg = "formatted output exceeds the 2GiB buffer limit";
+        return;
+    }
+    int64_t new_cap = b->cap;
+    while (new_cap < need)
         new_cap *= 2;
+    if (new_cap > (int64_t)INT32_MAX)
+        new_cap = INT32_MAX;
     ray_t* new_block = ray_alloc((size_t)new_cap);
+    if (!new_block) {   /* ray_alloc returns NULL on failure, never an error object */
+        b->err = true; b->err_msg = "out of memory growing the output buffer";
+        return;
+    }
     char*  new_buf   = (char*)ray_data(new_block);
     memcpy(new_buf, b->buf, (size_t)b->len);
     ray_free(b->block);
     b->block = new_block;
     b->buf   = new_buf;
-    b->cap   = new_cap;
+    b->cap   = (int32_t)new_cap;   /* new_cap <= INT32_MAX by the clamp above */
 }
 
 static void fmt_putc(fmt_buf_t* b, char c) {
     fmt_ensure(b, 1);
+    if (b->err) return;
     b->buf[b->len++] = c;
 }
 
 static void fmt_puts(fmt_buf_t* b, const char* s) {
-    int32_t slen = (int32_t)strlen(s);
+    int64_t slen = (int64_t)strlen(s);
     fmt_ensure(b, slen);
+    if (b->err) return;
     memcpy(b->buf + b->len, s, (size_t)slen);
-    b->len += slen;
+    b->len += (int32_t)slen;   /* safe: fmt_ensure enforced need <= INT32_MAX */
 }
 
 static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
+    if (b->err) return;
     va_list ap;
 
     /* Try to fit in remaining space first */
@@ -104,20 +148,27 @@ static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
     }
 
     /* Need more space — grow and retry */
-    fmt_ensure(b, n + 1);
+    fmt_ensure(b, (int64_t)n + 1);
+    if (b->err) return;
     va_start(ap, fmt);
     vsnprintf(b->buf + b->len, (size_t)(b->cap - b->len), fmt, ap);
     va_end(ap);
     b->len += n;
 }
 
-static void fmt_putn(fmt_buf_t* b, const char* s, int32_t n) {
+static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
     fmt_ensure(b, n);
+    if (b->err) return;
     memcpy(b->buf + b->len, s, (size_t)n);
-    b->len += n;
+    b->len += (int32_t)n;   /* safe: fmt_ensure enforced need <= INT32_MAX */
 }
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
+    if (b->err) {
+        ray_t* e = ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
+        fmt_destroy(b);
+        return e;
+    }
     ray_t* result = ray_str(b->buf, (size_t)b->len);
     fmt_destroy(b);
     return result;
@@ -252,11 +303,10 @@ static void fmt_guid(fmt_buf_t* b, const uint8_t* bytes) {
  * owned by their table/domain; never released here). */
 static void fmt_sym_atom(fmt_buf_t* b, ray_t* s) {
     if (s && !RAY_IS_ERR(s) && ray_str_len(s) > 0) {
-        fmt_putn(b, ray_str_ptr(s), (int32_t)ray_str_len(s));
+        fmt_putn(b, ray_str_ptr(s), (int64_t)ray_str_len(s));
     } else {
-        /* sym 0 (the empty symbol, resolves to "") and any unresolvable
-         * id render as the bare quote literal `'` — the canonical spelling
-         * of the empty symbol.  SYM has no null, so there is no `0Ns`. */
+        /* sym 0 (the canonical empty/null symbol) and any unresolvable id
+         * render as the bare quote literal `'`; there is no separate `0Ns`. */
         fmt_putc(b, '\'');
     }
 }
@@ -330,7 +380,7 @@ static void fmt_str_atom(fmt_buf_t* b, ray_t* obj, int full) {
     const char* p = ray_str_ptr(obj);
     size_t      n = ray_str_len(obj);
     fmt_putc(b, '"');
-    fmt_putn(b, p, (int32_t)n);
+    fmt_putn(b, p, (int64_t)n);
     fmt_putc(b, '"');
 }
 
@@ -352,10 +402,8 @@ static const char* null_literal(int8_t type) {
     case RAY_DATE:      return "0Nd";
     case RAY_TIME:      return "0Nt";
     case RAY_TIMESTAMP: return "0Np";
-    /* SYM has no null literal: the empty symbol is a value (renders as ')
-     * and never reaches this table — callers gate on null, false for SYM.
-     * RAY_STR likewise has no null literal: empty and null strings both
-     * render as "" (handled directly by the STR paths, never via this table). */
+    /* SYM/STR have no separate null literal: their canonical empty/null values
+     * render as ' / "" on their ordinary formatting paths. */
     case RAY_GUID:      return "0Ng";
     default:            return "null";
     }
@@ -392,7 +440,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
         size_t slen = 0;
         const char* p = ray_str_vec_get(vec, idx, &slen);
         fmt_putc(b, '"');
-        if (p) fmt_putn(b, p, (int32_t)slen);
+        if (p) fmt_putn(b, p, (int64_t)slen);
         fmt_putc(b, '"');
         break;
     }
@@ -404,7 +452,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
         if (child) {
             ray_t* s = ray_fmt(child, 1);
             if (s && !RAY_IS_ERR(s)) {
-                fmt_putn(b, ray_str_ptr(s), (int32_t)ray_str_len(s));
+                fmt_putn(b, ray_str_ptr(s), (int64_t)ray_str_len(s));
                 ray_release(s);
             } else {
                 fmt_puts(b, "?");
@@ -663,9 +711,72 @@ static void fmt_dict(fmt_buf_t* b, ray_t* dict, int mode) {
 
 /* ===== Table formatter helpers ===== */
 
+/* Terminal display width of a UTF-8 string.  Byte length overstates the
+ * width of any multi-byte cell (a 3-byte CJK char renders as 2 columns,
+ * not 3), which skewed every pad computed from it and tore the table
+ * borders.  Coarse East-Asian-Width classification: wide/fullwidth CJK,
+ * Hangul, fullwidth forms and emoji count 2; zero-width marks count 0;
+ * everything else, malformed bytes included, counts 1 — so a bad
+ * sequence can never desync more than its own cell. */
+static int32_t fmt_utf8_width(const char* s, int32_t slen) {
+    int32_t w = 0;
+    for (int32_t i = 0; i < slen;) {
+        uint8_t c = (uint8_t)s[i];
+        if (c < 0x80) { w += 1; i += 1; continue; }
+        uint32_t cp;
+        int32_t  cont;
+        if      ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; cont = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; cont = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; cont = 3; }
+        else                         { w += 1; i += 1; continue; }
+        if (i + cont >= slen) { w += 1; i += 1; continue; }
+        bool ok = true;
+        for (int32_t k = 1; k <= cont; k++) {
+            uint8_t cc = (uint8_t)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (!ok) { w += 1; i += 1; continue; }
+        i += cont + 1;
+        if ((cp >= 0x0300 && cp <= 0x036F) ||       /* Latin combining marks */
+            (cp >= 0x0483 && cp <= 0x0489) ||       /* Cyrillic combining */
+            (cp >= 0x0591 && cp <= 0x05BD) ||       /* Hebrew points (niqqud) */
+            cp == 0x05BF || cp == 0x05C1 || cp == 0x05C2 ||
+            cp == 0x05C4 || cp == 0x05C5 || cp == 0x05C7 ||
+            (cp >= 0x0610 && cp <= 0x061A) ||       /* Arabic marks */
+            (cp >= 0x064B && cp <= 0x065F) ||       /* Arabic harakat */
+            cp == 0x0670 ||
+            (cp >= 0x06D6 && cp <= 0x06DC) ||
+            (cp >= 0x0E31 && cp <= 0x0E3A) ||       /* Thai vowels above/below */
+            (cp >= 0x0E47 && cp <= 0x0E4E) ||
+            (cp >= 0x200B && cp <= 0x200F) ||       /* zero-width spaces */
+            (cp >= 0x202A && cp <= 0x202E) ||       /* bidi embedding/override */
+            (cp >= 0x2060 && cp <= 0x2064) ||       /* word joiner, invisibles */
+            (cp >= 0x2066 && cp <= 0x2069) ||       /* bidi isolates */
+            (cp >= 0xFE00 && cp <= 0xFE0F) ||       /* variation selectors */
+            (cp >= 0xFE20 && cp <= 0xFE2F) ||       /* combining half marks */
+            cp == 0xFEFF)                           /* BOM / zero-width nbsp */
+            continue;                               /* width 0 */
+        if ((cp >= 0x1100  && cp <= 0x115F)  ||     /* Hangul jamo */
+            (cp >= 0x2E80  && cp <= 0xA4CF)  ||     /* CJK radicals..Yi */
+            (cp >= 0xAC00  && cp <= 0xD7A3)  ||     /* Hangul syllables */
+            (cp >= 0xF900  && cp <= 0xFAFF)  ||     /* CJK compat ideographs */
+            (cp >= 0xFE30  && cp <= 0xFE4F)  ||     /* CJK compat forms */
+            (cp >= 0xFF00  && cp <= 0xFF60)  ||     /* fullwidth forms */
+            (cp >= 0xFFE0  && cp <= 0xFFE6)  ||     /* fullwidth signs */
+            (cp >= 0x1F300 && cp <= 0x1FAFF) ||     /* emoji */
+            (cp >= 0x20000 && cp <= 0x3FFFD))       /* CJK ext B+ */
+            w += 2;
+        else
+            w += 1;
+    }
+    return w;
+}
+
 static void fmt_centered(fmt_buf_t* b, const char* s, int32_t slen, int32_t width) {
-    int32_t left  = (width - slen) / 2;
-    int32_t right = width - slen - left;
+    int32_t dlen  = fmt_utf8_width(s, slen);
+    int32_t left  = (width - dlen) / 2;
+    int32_t right = width - dlen - left;
     for (int32_t i = 0; i < left; i++)  fmt_putc(b, ' ');
     fmt_putn(b, s, slen);
     for (int32_t i = 0; i < right; i++) fmt_putc(b, ' ');
@@ -691,7 +802,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             int64_t name_id = ray_table_col_name(tbl, i);
             ray_t* name_str = ray_sym_str(name_id);
             if (name_str && !RAY_IS_ERR(name_str)) {
-                fmt_putn(b, ray_str_ptr(name_str), (int32_t)ray_str_len(name_str));
+                fmt_putn(b, ray_str_ptr(name_str), (int64_t)ray_str_len(name_str));
                 ray_release(name_str);
             }
         }
@@ -803,8 +914,9 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         col_types[ci]     = tname;
         col_type_lens[ci] = (int32_t)strlen(tname);
 
-        /* Start with max of name and type lengths */
-        int32_t max_w = col_name_lens[ci];
+        /* Start with max of name and type DISPLAY widths (a multi-byte
+         * name still writes its full byte length, padded to this). */
+        int32_t max_w = fmt_utf8_width(col_names[ci], col_name_lens[ci]);
         if (col_type_lens[ci] > max_w) max_w = col_type_lens[ci];
 
         int64_t col_len = col_vec ? ray_len(col_vec) : 0;
@@ -818,7 +930,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 fmt_init(&tmp);
                 fmt_raw_elem(&tmp, col_vec, ri);
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
-                memcpy(cell->str, tmp.buf, (size_t)clen);
+                if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
                 fmt_destroy(&tmp);
@@ -826,7 +938,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
-            if (cell->len > max_w) max_w = cell->len;
+            int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
+            if (cell_dw > max_w) max_w = cell_dw;
         }
 
         /* Format second half (tail rows) */
@@ -843,7 +956,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 fmt_init(&tmp);
                 fmt_raw_elem(&tmp, col_vec, src_idx);
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
-                memcpy(cell->str, tmp.buf, (size_t)clen);
+                if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
                 fmt_destroy(&tmp);
@@ -851,7 +964,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
-            if (cell->len > max_w) max_w = cell->len;
+            int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
+            if (cell_dw > max_w) max_w = cell_dw;
         }
 
         col_widths[ci] = max_w + 2; /* +2 for padding (1 space each side) */
@@ -960,7 +1074,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
             fmt_putc(b, ' ');
             fmt_putn(b, cell->str, cell->len);
-            int32_t pad = col_widths[ci] - cell->len - 1;
+            int32_t pad = col_widths[ci] - fmt_utf8_width(cell->str, cell->len) - 1;
             for (int32_t p = 0; p < pad; p++)
                 fmt_putc(b, ' ');
             fmt_puts(b, G_V);
@@ -1031,11 +1145,9 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
 
     int8_t type = obj->type;
     if (type < 0) {
-        /* Typed null atom: null bit set → display as 0Nx.  STR is the
-         * exception — it has no distinct null (empty and null are the
-         * same value), so it always falls through to fmt_str_atom and
-         * renders as "", never 0Nc (which the parser cannot read back). */
-        if (-type != RAY_STR && RAY_ATOM_IS_NULL(obj)) {
+        /* STR/SYM use their empty literals as canonical null spellings, so
+         * retain those parseable representations instead of inventing 0Nc/0Ns. */
+        if (-type != RAY_STR && -type != RAY_SYM && RAY_ATOM_IS_NULL(obj)) {
             fmt_puts(b, null_literal(-type));
             return;
         }

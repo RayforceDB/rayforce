@@ -4,7 +4,7 @@
 ;; Empty string is an ordinary STR value, so split-of-"" yields a
 ;; one-element vector whose only element is not null.
 (count (split "" ",")) -- 1
-(nil? (at (split "" ",") 0)) -- false
+(nil? (at (split "" ",") 0)) -- true
 (split "abc" ",") -- ["abc"]
 
 ;; joining splits back equals input (when separator present)

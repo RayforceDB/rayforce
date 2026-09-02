@@ -61,5 +61,6 @@ const char* ray_repl_remote_addr(void);
 
 ray_t* ray_repl_connect_fn(ray_t* host_port_str);
 ray_t* ray_repl_disconnect_fn(ray_t** args, int64_t n);
+ray_t* ray_repl_complete_fn(ray_t* prefix_str);
 
 #endif /* RAY_IO_REPL_H */

@@ -28,3 +28,8 @@
 ;; Both the value bits AND the null mask must survive serialize/deser.
 (count (de (ser [1 0N 3]))) -- 3
 (sum (de (ser [1 0N 3])))   -- 4
+
+;; Container-frame count/length validation (table schema-vs-columns, ragged
+;; columns, dict keys-vs-values) is covered in test/test_store.c
+;; (store/serde_container_count_mismatch), which builds frames via
+;; sizeof(ray_ipc_header_t) rather than hard-coding the wire layout.

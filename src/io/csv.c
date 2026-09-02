@@ -43,10 +43,9 @@
 #include "core/numparse.h"
 #include "core/pool.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
-#include "core/qstats.h"     /* suppress progress for internal finalize tasks */
 #include "lang/format.h"
 #include "ops/hash.h"
-#include "ops/idxop.h"      /* attach per-chunk zone index after load */
+#include "ops/idxop.h"      /* ray_index_payload — shared hash-upgrade policy */
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"
@@ -76,6 +75,29 @@
 #define CSV_SAMPLE_ROWS   4096
 #define CSV_STR_DISTINCT_MIN 256
 #define CSV_PART_ROWS_DEFAULT 1000000
+
+/* --------------------------------------------------------------------------
+ * Whole-load progress axis.
+ *
+ * A CSV load is four phases that each traverse the file once, so no single
+ * counter (rows, morsels, dispatched elements) describes the load as a whole
+ * and every per-dispatch bar restarts at zero.  The honest shared metric is
+ * BYTES OF INPUT, and each phase owns a fixed slice of that axis, weighted by
+ * its measured cost.  Measured on an 8.1 GB / 10M-row / 105-column load with
+ * the parallel scan, per-column finalize and no load-time index attach:
+ * row-offset scan 4.34 s, parse 6.68 s, finalize (str fill + sym intern)
+ * 4.60 s, tail (sym max/narrow, table build) 0.58 s of 16.2 s.  Rounded to
+ * 27 / 41 / 32, the tail riding in the finalize slice.  The mix shifts with
+ * column types and core count, so these are pacing estimates — nothing
+ * depends on them for correctness.
+ * -------------------------------------------------------------------------- */
+#define CSV_PROG_PCT_SCAN   27
+#define CSV_PROG_PCT_PARSE  41
+
+/* Byte position of `pct` percent along a file-sized axis. */
+static inline uint64_t csv_prog_at(size_t file_size, unsigned pct) {
+    return (uint64_t)((double)file_size * (double)pct / 100.0);
+}
 
 /* --------------------------------------------------------------------------
  * mmap flags
@@ -157,6 +179,10 @@ csv_type_t csv_resolve_int_width(int64_t min, int64_t max, bool has_null) {
     return CSV_TYPE_I64;
 }
 
+RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null);
+RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null);
+RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null);
+
 static csv_type_t detect_type(const char* f, size_t len) {
     if (len == 0) return CSV_TYPE_UNKNOWN;
 
@@ -207,35 +233,20 @@ static csv_type_t detect_type(const char* f, size_t len) {
         return CSV_TYPE_F64;
     }
 
-    /* Date: YYYY-MM-DD (exactly 10 chars) or Timestamp: YYYY-MM-DD{T| }HH:MM:SS */
-    if (len >= 10 && f[4] == '-' && f[7] == '-') {
-        bool is_date = true;
-        for (int i = 0; i < 10; i++) {
-            if (i == 4 || i == 7) continue;
-            if ((unsigned)(f[i] - '0') > 9) { is_date = false; break; }
-        }
-        if (is_date) {
-            if (len == 10) return CSV_TYPE_DATE;
-            if (len >= 19 && (f[10] == 'T' || f[10] == ' ') &&
-                f[13] == ':' && f[16] == ':') {
-                const int tp[] = {11,12,14,15,17,18};
-                bool is_ts = true;
-                for (int i = 0; i < 6; i++) {
-                    if ((unsigned)(f[tp[i]] - '0') > 9) { is_ts = false; break; }
-                }
-                if (is_ts) return CSV_TYPE_TIMESTAMP;
-            }
-        }
+    /* Temporal inference must share the strict full-consumption grammar used
+     * by typed ingest.  Prefix-only checks would infer TIME/TIMESTAMP for
+     * malformed cells like "12:34:56 EST" or "2024-01-02 01:02:03 UTC", then
+     * the strict row parser would silently null the entire inferred column. */
+    bool temporal_null = true;
+    if (len >= 19) {
+        (void)fast_timestamp(f, len, &temporal_null);
+        if (!temporal_null) return CSV_TYPE_TIMESTAMP;
     }
-
-    /* Time: HH:MM:SS[.ffffff] (at least 8 chars) */
-    if (len >= 8 && f[2] == ':' && f[5] == ':') {
-        const int tp[] = {0,1,3,4,6,7};
-        bool is_time = true;
-        for (int i = 0; i < 6; i++) {
-            if ((unsigned)(f[tp[i]] - '0') > 9) { is_time = false; break; }
-        }
-        if (is_time) return CSV_TYPE_TIME;
+    (void)fast_time(f, len, &temporal_null);
+    if (!temporal_null) return CSV_TYPE_TIME;
+    if (len == 10) {
+        (void)fast_date(f, len, &temporal_null);
+        if (!temporal_null) return CSV_TYPE_DATE;
     }
 
     return CSV_TYPE_STR;
@@ -493,13 +504,35 @@ RAY_INLINE int32_t civil_to_days(int y, int m, int d) {
     return (int32_t)(era * 146097 + doe - 719468 - 10957);
 }
 
+/* Strict YYYY-MM-DD: exactly 10 chars, '-' separators at offsets 4/7, and
+ * digits in every field.  Mirrors detect_type() and csv_write_date() so that
+ * typed .csv.read [DATE] round-trips the writer's output while rejecting
+ * malformed separators or trailing garbage (e.g. "2024/01/02", "2024x01x02",
+ * "2024-01-02junk") as null instead of silently coercing them to a bogus
+ * date.  fast_timestamp() reuses this on the leading date (passing len 10). */
 RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
-    if (RAY_UNLIKELY(len < 10)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(len != 10 || p[4] != '-' || p[7] != '-')) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY((unsigned)(p[0]-'0') > 9u || (unsigned)(p[1]-'0') > 9u ||
+                     (unsigned)(p[2]-'0') > 9u || (unsigned)(p[3]-'0') > 9u ||
+                     (unsigned)(p[5]-'0') > 9u || (unsigned)(p[6]-'0') > 9u ||
+                     (unsigned)(p[8]-'0') > 9u || (unsigned)(p[9]-'0') > 9u)) {
+        *is_null = true; return 0;
+    }
     *is_null = false;
     int y = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
     int m = (p[5]-'0')*10 + (p[6]-'0');
     int d = (p[8]-'0')*10 + (p[9]-'0');
-    if (RAY_UNLIKELY(m < 1 || m > 12 || d < 1 || d > 31)) { *is_null = true; return 0; }
+    /* Reject impossible months (this also guards the md[] index below) and
+     * days.  A blanket d<=31 check let calendar-impossible dates like
+     * "2024-02-31" or "2024-04-31" through; civil_to_days() then normalized
+     * them into a *different* real day (2024-02-31 -> 2024.03.02), silently
+     * corrupting the value instead of nulling it.  Validate the day against
+     * the actual length of that (leap-aware) month, mirroring the strict DATE
+     * string cast in ray_cast_fn() (src/ops/builtins.c). */
+    if (RAY_UNLIKELY(m < 1 || m > 12 || d < 1)) { *is_null = true; return 0; }
+    static const int md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+    if (RAY_UNLIKELY(d > md[m] + (m == 2 && leap ? 1 : 0))) { *is_null = true; return 0; }
     return civil_to_days(y, m, d);
 }
 
@@ -509,11 +542,12 @@ RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
  * or >=24h duration verbatim — a leading '-' plus an unbounded hour field
  * (e.g. "-00:00:01", "25:00:00") rather than wrapping modulo a day.  Parse
  * that same shape back so .csv.write -> .csv.read [TIME] round-trips: an
- * optional sign, a variable-width hour field (NOT capped at 23), then MM:SS
- * with an optional fractional part.  MM/SS stay at the fixed offsets after
- * the hour field and the separator characters are not themselves validated,
- * matching the historical lenient behaviour.  A magnitude that overflows
- * int32 milliseconds is rejected as null. */
+ * optional sign, a variable-width hour field (NOT capped at 23), then ":MM:SS"
+ * with an optional fractional part.  The ':' separators and the MM/SS/fraction
+ * digits ARE validated and the field must be fully consumed, so malformed
+ * separators or trailing garbage (e.g. "12-34-56", "12:34:56xyz") are rejected
+ * as null rather than silently coerced.  A magnitude that overflows int32
+ * milliseconds is likewise rejected as null. */
 RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
     *is_null = false;
     size_t  o    = 0;
@@ -528,21 +562,30 @@ RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
         if (RAY_UNLIKELY(++hd - o > 7)) { *is_null = true; return 0; }
     }
     size_t w = hd - o;                        /* hour digit count */
-    /* Need the hour field plus ":MM:SS" (6 more chars). */
+    /* Need the hour field plus ":MM:SS" (6 more chars), with ':' separators
+     * and digit MM/SS fields. */
     if (RAY_UNLIKELY(w == 0 || o + w + 6 > len)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(p[o+w] != ':' || p[o+w+3] != ':')) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY((unsigned)(p[o+w+1]-'0') > 9u || (unsigned)(p[o+w+2]-'0') > 9u ||
+                     (unsigned)(p[o+w+4]-'0') > 9u || (unsigned)(p[o+w+5]-'0') > 9u)) {
+        *is_null = true; return 0;
+    }
     int mi = (p[o+w+1]-'0')*10 + (p[o+w+2]-'0');
     int s  = (p[o+w+4]-'0')*10 + (p[o+w+5]-'0');
     if (RAY_UNLIKELY(mi > 59 || s > 59)) { *is_null = true; return 0; }
     int64_t ms = h * 3600000 + (int64_t)mi * 60000 + (int64_t)s * 1000;
-    /* Fractional seconds → milliseconds */
-    size_t fi = o + w + 6;
-    if (fi < len && p[fi] == '.') {
+    /* Fractional seconds → milliseconds.  '.' must be followed by >=1 digit;
+     * only the first 3 contribute, but any further digits are consumed so the
+     * full-consumption check below still rejects non-digit trailing garbage. */
+    size_t i = o + w + 6;
+    if (i < len) {
+        if (RAY_UNLIKELY(p[i] != '.')) { *is_null = true; return 0; }
+        i++;
         int frac = 0, digits = 0;
-        for (size_t i = fi + 1; i < len && digits < 3; i++, digits++) {
-            unsigned di = (unsigned char)p[i] - '0';
-            if (di > 9) break;
-            frac = frac * 10 + (int)di;
+        for (; i < len && (unsigned)(p[i]-'0') <= 9u; i++) {
+            if (digits < 3) { frac = frac * 10 + (p[i] - '0'); digits++; }
         }
+        if (RAY_UNLIKELY(digits == 0 || i != len)) { *is_null = true; return 0; }
         while (digits < 3) { frac *= 10; digits++; }
         ms += frac;
     }
@@ -557,7 +600,12 @@ RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
  * to 9 fractional digits; shorter fractions are right-padded with
  * zeros, longer ones are truncated. */
 RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t* consumed) {
-    if (RAY_UNLIKELY(len < 8)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(len < 8 || p[2] != ':' || p[5] != ':')) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY((unsigned)(p[0]-'0') > 9u || (unsigned)(p[1]-'0') > 9u ||
+                     (unsigned)(p[3]-'0') > 9u || (unsigned)(p[4]-'0') > 9u ||
+                     (unsigned)(p[6]-'0') > 9u || (unsigned)(p[7]-'0') > 9u)) {
+        *is_null = true; return 0;
+    }
     *is_null = false;
     int h  = (p[0]-'0')*10 + (p[1]-'0');
     int mi = (p[3]-'0')*10 + (p[4]-'0');
@@ -570,11 +618,12 @@ RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t
         int64_t frac = 0;
         int digits = 0;
         size_t i = 9;
-        for (; i < len && digits < 9; i++, digits++) {
-            unsigned di = (unsigned char)p[i] - '0';
-            if (di > 9) break;
-            frac = frac * 10 + (int64_t)di;
+        /* First 9 fractional digits contribute; consume any further digits so
+         * the caller's full-consumption check still rejects trailing garbage. */
+        for (; i < len && (unsigned)(p[i]-'0') <= 9u; i++) {
+            if (digits < 9) { frac = frac * 10 + (int64_t)(p[i] - '0'); digits++; }
         }
+        if (RAY_UNLIKELY(digits == 0)) { *is_null = true; return 0; }
         while (digits < 9) { frac *= 10; digits++; }
         ns += frac;
         used = i;  /* index of the first char past the fractional seconds */
@@ -586,12 +635,12 @@ RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t
 /* Parse a trailing ISO-8601 UTC offset at p: 'Z'/'z' (== UTC) or
  * (+|-)HH[[:]MM].  On success sets *out_ns to the signed offset in
  * nanoseconds (to be SUBTRACTED from the local wall-clock value to get
- * UTC) and returns true.  Returns false if the suffix is not a
- * recognized offset (caller then leaves the value unadjusted, preserving
- * the prior behaviour of ignoring unrecognized trailing characters). */
-RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns) {
+ * UTC), reports the number of bytes consumed in *consumed, and returns
+ * true.  Returns false if the suffix is not a recognized offset; the
+ * caller treats that (and any unconsumed trailing bytes) as malformed. */
+RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns, size_t* consumed) {
     if (len == 0) return false;
-    if (p[0] == 'Z' || p[0] == 'z') { *out_ns = 0; return true; }
+    if (p[0] == 'Z' || p[0] == 'z') { *out_ns = 0; if (consumed) *consumed = 1; return true; }
     int sign;
     if (p[0] == '+') sign = 1;
     else if (p[0] == '-') sign = -1;
@@ -600,16 +649,23 @@ RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns) {
     int hh = (p[1]-'0')*10 + (p[2]-'0');
     int mm = 0;
     size_t i = 3;
-    if (len > i && p[i] == ':') i++;            /* optional ':' separator */
-    if (len >= i + 2 && p[i] >= '0' && p[i] <= '9' && p[i+1] >= '0' && p[i+1] <= '9')
-        mm = (p[i]-'0')*10 + (p[i+1]-'0');
+    size_t msep = (len > 3 && p[3] == ':') ? 1 : 0;   /* optional ':' separator */
+    if (len >= 3 + msep + 2 &&
+        p[3+msep] >= '0' && p[3+msep] <= '9' && p[4+msep] >= '0' && p[4+msep] <= '9') {
+        mm = (p[3+msep]-'0')*10 + (p[4+msep]-'0');
+        i  = 3 + msep + 2;                       /* consume ':' only with MM */
+    }
     if (RAY_UNLIKELY(hh > 23 || mm > 59)) return false;
     *out_ns = (int64_t)sign * ((int64_t)hh * 3600 + (int64_t)mm * 60) * 1000000000LL;
+    if (consumed) *consumed = i;
     return true;
 }
 
 RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
-    if (RAY_UNLIKELY(len < 19)) { *is_null = true; return 0; }
+    /* Require "YYYY-MM-DD" + 'T'|'t'|' ' separator + "HH:MM:SS" (>=19 chars),
+     * matching detect_type() and csv_write_timestamp().  A malformed date/time
+     * separator (e.g. "2024x01x02D01:02:03") is rejected as null. */
+    if (RAY_UNLIKELY(len < 19 || (p[10] != 'T' && p[10] != 't' && p[10] != ' '))) { *is_null = true; return 0; }
     *is_null = false;
     int32_t days = fast_date(p, 10, is_null);
     if (*is_null) return 0;
@@ -620,12 +676,19 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     const int64_t NS_PER_DAY = 86400000000000LL;
     int64_t result = (int64_t)days * NS_PER_DAY + time_ns;
     /* Optional trailing UTC offset (Z | ±HH:MM | ±HHMM | ±HH).  The common
-     * no-offset case ends exactly at the time component (off == len), so
-     * the hot path pays only this single predicted-not-taken bounds check. */
+     * no-offset case ends exactly at the time component (off == len), so the
+     * hot path pays only this single predicted-not-taken bounds check.  Any
+     * other trailing bytes — or an offset that does not consume to the end
+     * (e.g. "2024-01-02T01:02:03junk") — are malformed and reject the cell. */
     size_t off = 11 + time_used;
     if (RAY_UNLIKELY(off < len)) {
         int64_t adj;
-        if (parse_tz_offset(p + off, len - off, &adj)) result -= adj;
+        size_t  tz_used = 0;
+        if (RAY_UNLIKELY(!parse_tz_offset(p + off, len - off, &adj, &tz_used) ||
+                         off + tz_used != len)) {
+            *is_null = true; return 0;
+        }
+        result -= adj;
     }
     return result;
 }
@@ -688,9 +751,329 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
  * Allocates offsets via scratch_alloc. Caller frees with scratch_free.
  * -------------------------------------------------------------------------- */
 
-static int64_t build_row_offsets(const char* buf, size_t buf_size,
-                                  size_t data_offset,
-                                  int64_t** offsets_out, ray_t** hdr_out) {
+/* --------------------------------------------------------------------------
+ * Parallel row-offset scan.
+ *
+ * The serial scan below is a pure state machine over the byte stream, and its
+ * only cross-position state is the QUOTE PARITY (an odd number of '"' seen so
+ * far means "inside a quoted field", where newlines are data).  Parity is an
+ * XOR-scan, so it can be reconciled: count the quotes in every chunk first,
+ * prefix-XOR the counts, and each chunk then starts its scan with exactly the
+ * parity the serial scanner would have had there.  Escaped quotes need no
+ * special case — a doubled "" flips parity twice, which is what the serial
+ * loop does too.
+ *
+ * The one place a decision spans a chunk boundary is a "\r\n" pair split down
+ * the middle: the left chunk consumes both bytes and records the row start
+ * after them, so the right chunk must not treat the orphan '\n' as a fresh
+ * terminator.  Boundaries are nudged one byte right in that case
+ * (csv_scan_split_at) so the pair always lands whole in the left chunk.  The
+ * quote-free fast path has the mirror case ("\n\r"), handled the same way.
+ *
+ * Sizing: the counting pass also counts line-terminator bytes, which is an
+ * exact upper bound on the rows a chunk can emit.  Each chunk therefore writes
+ * straight into a reserved slice of one array (no per-worker allocation, no
+ * locks) and a final compaction closes the gaps.
+ * -------------------------------------------------------------------------- */
+
+/* Chunking is normally sized for throughput: a few chunks per worker, each at
+ * least CSV_SCAN_CHUNK_MIN bytes, and the parallel path is skipped entirely
+ * below CSV_SCAN_PAR_MIN_BYTES.  That puts ~31 boundaries in a 6 MB file,
+ * which exercises almost none of the stitching this scan is built out of —
+ * the interesting states (a boundary inside a quoted field, between the two
+ * bytes of a "\r\n", in the middle of a "" run) only show up when boundaries
+ * are dense.  A test build therefore shrinks all three so that even a small
+ * fixture is cut into RAY_POOL_INIT_TASKS chunks a few dozen bytes wide, and
+ * every CSV the suite reads becomes a boundary-stitching test.
+ *
+ * DENSER IS NOT STRICTLY BETTER, so do not "improve" the 64-byte floor
+ * downward.  Sensitivity to the two bug classes runs in OPPOSITE directions:
+ *   - boundary/stitching bugs (parity prefix, csv_scan_split_at) are most
+ *     visible with tiny spans, since every byte becomes a boundary;
+ *   - intra-chunk state-machine bugs are most visible with LARGER spans,
+ *     because a chunk has to walk real distance under its own in_quote state
+ *     to expose them.  At span 1 the parity prefix does essentially all the
+ *     work and the state machine is barely exercised — a review mutant that
+ *     corrupted in_quote handling was INVISIBLE at span 1 and caught only at
+ *     span >= 17.
+ * 64 bytes sits in the range that is sensitive to both.
+ *
+ * The chunk count is a constant, not a function of the core count, so a
+ * failure reproduces the same way on any machine.  Gated exactly like
+ * group.c's GHT_LANES_WHOLE assertions — this is a test affordance, and
+ * deliberately NOT a runtime knob. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
+#define CSV_SCAN_PAR_MIN_BYTES  (8u << 10)
+#define CSV_SCAN_CHUNK_MIN      64u
+#define CSV_SCAN_CHUNKS(pool)   ((int64_t)RAY_POOL_INIT_TASKS)
+#else
+/* Minimum bytes before the parallel scan is worth its two passes. */
+#define CSV_SCAN_PAR_MIN_BYTES  (4u << 20)
+/* Minimum bytes per chunk — below this the per-task overhead dominates. */
+#define CSV_SCAN_CHUNK_MIN      (256u << 10)
+#define CSV_SCAN_CHUNKS(pool)   ((int64_t)ray_pool_total_workers(pool) * 4)
+#endif
+
+typedef struct {
+    const char*  buf;
+    size_t       file_size;
+    const size_t* bound;         /* [n_chunks+1] chunk start byte offsets   */
+    uint64_t*    quote_cnt;      /* [n_chunks] '"' per chunk (pass 1 out)   */
+    uint64_t*    term_cnt;       /* [n_chunks] '\n'+'\r' per chunk (pass 1) */
+    const uint8_t* start_quoted; /* [n_chunks] parity at chunk start        */
+    const int64_t* slot;         /* [n_chunks] write base into offs         */
+    int64_t*     n_out;          /* [n_chunks] rows written (pass 2 out)    */
+    int64_t*     offs;           /* row-offset array being filled           */
+    bool         has_quotes;     /* pick the fast/slow state machine        */
+} csv_scan_ctx_t;
+
+static void csv_scan_count_fn(void* arg, uint32_t worker_id,
+                              int64_t start, int64_t end_i) {
+    (void)worker_id;
+    csv_scan_ctx_t* ctx = (csv_scan_ctx_t*)arg;
+    for (int64_t i = start; i < end_i; i++) {
+        const char* p = ctx->buf + ctx->bound[i];
+        const char* e = ctx->buf + ctx->bound[i + 1];
+        uint64_t q = 0, t = 0;
+        while (p < e) {
+            const char* stop = p + (1 << 20);
+            if (stop > e) stop = e;
+            for (; p < stop; p++) {
+                char c = *p;
+                q += (c == '"');
+                t += (c == '\n' || c == '\r');
+            }
+            if (RAY_UNLIKELY(ray_interrupted())) break;
+        }
+        ctx->quote_cnt[i] = q;
+        ctx->term_cnt[i]  = t;
+    }
+}
+
+static void csv_scan_rows_fn(void* arg, uint32_t worker_id,
+                             int64_t start, int64_t end_i) {
+    (void)worker_id;
+    csv_scan_ctx_t* ctx = (csv_scan_ctx_t*)arg;
+    const char* buf = ctx->buf;
+    const char* end = buf + ctx->file_size;
+
+    for (int64_t i = start; i < end_i; i++) {
+        const char* p    = buf + ctx->bound[i];
+        const char* cend = buf + ctx->bound[i + 1];
+        int64_t* out = ctx->offs + ctx->slot[i];
+        int64_t  n   = 0;
+
+        if (RAY_LIKELY(!ctx->has_quotes)) {
+            /* Mirrors the serial fast path exactly: only '\n' terminates a
+             * row, and an optional '\r' immediately after it is absorbed. */
+            size_t checked = 0;
+            while (p < cend) {
+                if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
+                const char* nl = (const char*)memchr(p, '\n', (size_t)(cend - p));
+                if (!nl) break;
+                p = nl + 1;
+                if (p < end && *p == '\r') p++;
+                if (p >= end) break;
+                out[n++] = (int64_t)(p - buf);
+            }
+        } else {
+            /* Mirrors the serial slow path exactly: quote parity gates the
+             * terminators, '\r' alone ends a row, "\r\n" ends exactly one.
+             *
+             * One shortcut, provably equivalent: INSIDE a quoted field the
+             * serial loop's only reachable action is "p++" until it meets the
+             * closing '"' (the newline arm is gated on !in_quote), so memchr
+             * can jump straight to that quote.  Worth doing because a quoted
+             * field is where the byte-at-a-time loop spends its time — long
+             * URL/title columns are exactly the quoted ones. */
+            bool in_quote = ctx->start_quoted[i] != 0;
+            size_t checked = 0;
+            while (p < cend) {
+                if (in_quote) {
+                    if (RAY_UNLIKELY((++checked & 0xFFF) == 0 && ray_interrupted())) break;
+                    /* Bounding the search at cend is defensive, not required:
+                     * the `p < cend` guard above already stops the loop after
+                     * an overshoot, so searching to the file end would find
+                     * the same offsets (it would just do the next chunk's
+                     * work).  Bounded because a chunk has no business reading
+                     * past its own slice. */
+                    const char* q = (const char*)memchr(p, '"', (size_t)(cend - p));
+                    if (!q) { p = cend; break; }
+                    p = q + 1;
+                    in_quote = false;
+                    continue;
+                }
+                /* Outside a quoted field (in_quote is false for the rest of
+                 * this iteration by construction). */
+                if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
+                char c = *p;
+                if (c == '"') {
+                    in_quote = true;
+                    p++;
+                } else if (c == '\n' || c == '\r') {
+                    if (c == '\r' && p + 1 < end && *(p + 1) == '\n') p++;
+                    p++;
+                    if (p < end) out[n++] = (int64_t)(p - buf);
+                } else {
+                    p++;
+                }
+            }
+        }
+        ctx->n_out[i] = n;
+    }
+}
+
+/* Nudge a chunk boundary right so a two-byte line terminator is never split.
+ * Quoted or not, the left chunk's state machine consumes both bytes of the
+ * pair, so the byte after it must belong to the left chunk as well. */
+static size_t csv_scan_split_at(const char* buf, size_t file_size, size_t s,
+                                bool has_quotes) {
+    if (s == 0 || s >= file_size) return s;
+    char prev = buf[s - 1], cur = buf[s];
+    if (has_quotes) { if (prev == '\r' && cur == '\n') s++; }
+    else            { if (prev == '\n' && cur == '\r') s++; }
+    return s;
+}
+
+/* Returns the row count (>=0), -1 if interrupted, or -2 when the parallel
+ * path does not apply and the caller should run the serial scan. */
+static int64_t build_row_offsets_par(const char* buf, size_t buf_size,
+                                     size_t data_offset,
+                                     uint64_t prog_base, uint64_t prog_len,
+                                     int64_t** offsets_out, ray_t** hdr_out) {
+    *offsets_out = NULL;
+    *hdr_out = NULL;
+
+    size_t remaining = buf_size - data_offset;
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, (int64_t)remaining,
+                                  (int64_t)CSV_SCAN_PAR_MIN_BYTES))
+        return -2;
+
+    int64_t n_chunks = CSV_SCAN_CHUNKS(pool);
+    /* Never exceed the task ring's initial capacity: growth failure inside
+     * ray_pool_dispatch_n silently DROPS tasks, which here would silently
+     * drop rows.  The span floor below can only lower n_chunks (it triggers
+     * exactly when remaining < n_chunks * CHUNK_MIN), so the cap holds. */
+    if (n_chunks > (int64_t)RAY_POOL_INIT_TASKS) n_chunks = RAY_POOL_INIT_TASKS;
+    size_t span = remaining / (size_t)n_chunks;
+    if (span < CSV_SCAN_CHUNK_MIN) {
+        span = CSV_SCAN_CHUNK_MIN;
+        n_chunks = (int64_t)((remaining + span - 1) / span);
+    }
+    if (n_chunks < 2) return -2;
+
+    /* One block for every per-chunk array: bounds, counts, parity, slots. */
+    size_t hdr_bytes = (size_t)(n_chunks + 1) * sizeof(size_t)
+                     + (size_t)n_chunks * (2 * sizeof(uint64_t)
+                                           + 2 * sizeof(int64_t)
+                                           + sizeof(uint8_t));
+    void* blk = ray_sys_alloc(hdr_bytes);
+    if (!blk) return -2;
+    size_t*   bound     = (size_t*)blk;
+    uint64_t* quote_cnt = (uint64_t*)(bound + n_chunks + 1);
+    uint64_t* term_cnt  = quote_cnt + n_chunks;
+    int64_t*  slot      = (int64_t*)(term_cnt + n_chunks);
+    int64_t*  n_out     = slot + n_chunks;
+    uint8_t*  start_q   = (uint8_t*)(n_out + n_chunks);
+
+    csv_scan_ctx_t ctx = {
+        .buf = buf, .file_size = buf_size, .bound = bound,
+        .quote_cnt = quote_cnt, .term_cnt = term_cnt,
+        .start_quoted = start_q, .slot = slot, .n_out = n_out,
+        .offs = NULL, .has_quotes = false,
+    };
+
+    /* Pass-1 boundaries are the raw even split: counting is boundary-shape
+     * agnostic, and the quote-aware nudge below needs has_quotes, which only
+     * pass 1 can establish. */
+    bound[0] = data_offset;
+    for (int64_t i = 1; i < n_chunks; i++) {
+        size_t s = data_offset + (size_t)i * span;
+        if (s > buf_size) s = buf_size;
+        if (s < bound[i - 1]) s = bound[i - 1];
+        bound[i] = s;
+    }
+    bound[n_chunks] = buf_size;
+
+    /* Pass 1 is the bandwidth-bound count; pass 2 is the byte-at-a-time state
+     * machine.  Measured 0.90 s / 3.42 s of the scan on the 8 GB file. */
+    ray_progress_span_phase("scan: quotes", prog_base, prog_len / 5);
+    ray_pool_dispatch_n(pool, csv_scan_count_fn, &ctx, (uint32_t)n_chunks);
+    if (ray_interrupted()) { ray_sys_free(blk); return -1; }
+
+    uint64_t total_q = 0, total_term = 0;
+    for (int64_t i = 0; i < n_chunks; i++) {
+        start_q[i] = (uint8_t)(total_q & 1u);
+        total_q    += quote_cnt[i];
+        total_term += term_cnt[i];
+    }
+    ctx.has_quotes = total_q != 0;
+
+    /* Now nudge the boundaries for the state machine pass 1 just chose.  The
+     * byte skipped is always '\n' or '\r', never '"', so the parities
+     * computed above stay exact. */
+    for (int64_t i = 1; i < n_chunks; i++) {
+        size_t s = csv_scan_split_at(buf, buf_size, bound[i], ctx.has_quotes);
+        if (s < bound[i - 1]) s = bound[i - 1];
+        bound[i] = s;
+    }
+
+    /* Slice sizing: a chunk emits at most one row start per line-terminator
+     * byte it walks over.  The nudge can hand a chunk one terminator from its
+     * right neighbour, and the last row of a chunk can be recorded from a
+     * terminator one byte past cend, so reserve term_cnt + 2.  Slot 0 is
+     * reserved for the first row — the data section always starts one. */
+    uint64_t slack = 2u * (uint64_t)n_chunks + 1u;
+    if (total_term > (uint64_t)INT64_MAX / (uint64_t)sizeof(int64_t) - slack) {
+        ray_sys_free(blk);
+        return -2;
+    }
+    int64_t cap = (int64_t)(total_term + slack);
+    {
+        int64_t base = 1;
+        for (int64_t i = 0; i < n_chunks; i++) {
+            slot[i] = base;
+            base += (int64_t)term_cnt[i] + 2;
+        }
+    }
+
+    ray_t* hdr = NULL;
+    int64_t* offs = (int64_t*)scratch_alloc(&hdr, (size_t)cap * sizeof(int64_t));
+    if (!offs) { ray_sys_free(blk); return -2; }
+    offs[0] = (int64_t)data_offset;
+    ctx.offs = offs;
+
+    ray_progress_span_phase("scan: rows", prog_base + prog_len / 5,
+                            prog_len - prog_len / 5);
+    ray_pool_dispatch_n(pool, csv_scan_rows_fn, &ctx, (uint32_t)n_chunks);
+    if (ray_interrupted()) {
+        scratch_free(hdr);
+        ray_sys_free(blk);
+        return -1;
+    }
+
+    /* Compact the per-chunk slices into one dense, ascending array. */
+    int64_t n = 1;
+    for (int64_t i = 0; i < n_chunks; i++) {
+        int64_t cnt = n_out[i];
+        if (cnt <= 0) continue;
+        if (n != slot[i])
+            memmove(offs + n, offs + slot[i], (size_t)cnt * sizeof(int64_t));
+        n += cnt;
+    }
+
+    ray_sys_free(blk);
+    *offsets_out = offs;
+    *hdr_out = hdr;
+    return n;
+}
+
+/* Serial scan — the reference semantics the parallel scan above mirrors. */
+static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
+                                        size_t data_offset,
+                                        uint64_t prog_base, uint64_t prog_len,
+                                        int64_t** offsets_out, ray_t** hdr_out) {
     const char* p = buf + data_offset;
     const char* end = buf + buf_size;
 
@@ -720,11 +1103,16 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
          * Only scans for \n; pure \r line endings (old Mac) treated as single row.
          * Empty lines are preserved as rows (for NULL handling). */
         for (;;) {
-            if (RAY_UNLIKELY((n & 0xFFFF) == 0 && ray_interrupted())) {
-                scratch_free(hdr);
-                *offsets_out = NULL;
-                *hdr_out = NULL;
-                return -1;
+            if (RAY_UNLIKELY((n & 0xFFFF) == 0)) {
+                if (ray_interrupted()) {
+                    scratch_free(hdr);
+                    *offsets_out = NULL;
+                    *hdr_out = NULL;
+                    return -1;
+                }
+                ray_progress_span_set(prog_base +
+                    (uint64_t)((double)prog_len * (double)(size_t)(p - buf - (ptrdiff_t)data_offset)
+                               / (double)remaining));
             }
             const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
             if (!nl) break;
@@ -756,6 +1144,9 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
                     *hdr_out = NULL;
                     return -1;
                 }
+                ray_progress_span_set(prog_base +
+                    (uint64_t)((double)prog_len * (double)(size_t)(p - buf - (ptrdiff_t)data_offset)
+                               / (double)remaining));
             }
             char c = *p;
             if (c == '"') {
@@ -783,6 +1174,26 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
     *offsets_out = offs;
     *hdr_out = hdr;
     return n;
+}
+
+static int64_t build_row_offsets(const char* buf, size_t buf_size,
+                                 size_t data_offset,
+                                 uint64_t prog_base, uint64_t prog_len,
+                                 int64_t** offsets_out, ray_t** hdr_out) {
+    if (data_offset >= buf_size) { *offsets_out = NULL; *hdr_out = NULL; return 0; }
+
+    /* Large files: chunked parallel scan with quote-parity reconciliation.
+     * -2 means "not applicable" (small file, no pool, allocation refused) and
+     * falls back to the serial scan, which defines the semantics. */
+    int64_t par = build_row_offsets_par(buf, buf_size, data_offset,
+                                        prog_base, prog_len,
+                                        offsets_out, hdr_out);
+    if (par != -2) return par;
+
+    ray_progress_span_phase("scan", prog_base, prog_len);
+    return build_row_offsets_serial(buf, buf_size, data_offset,
+                                    prog_base, prog_len,
+                                    offsets_out, hdr_out);
 }
 
 static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
@@ -885,62 +1296,307 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
 }
 
 /* --------------------------------------------------------------------------
- * Batch-intern string columns after parse.
- * Single-threaded — walks each string column, interns into global sym table,
- * writes sym IDs into the final uint32_t column.
+ * Per-column local dedupe — the parallel front half of the sym intern.
+ *
+ * The serial intern below walks every SYM column row by row and calls
+ * ray_sym_intern_no_split_unlocked once per row.  That is n_rows probes into
+ * the process-global dictionary per column and it cannot be threaded: the
+ * "unlocked" contract assumes no concurrent writers, and a symbol's id IS its
+ * first-encounter order, so racing threads would hand out different ids.
+ *
+ * It splits, though, because interning is idempotent: only the FIRST
+ * occurrence of a string allocates an id, every later one is a lookup.  So:
+ *
+ *   A) in parallel, one task per column, dedupe locally — build a dictionary
+ *      of the column's distinct strings IN FIRST-OCCURRENCE ORDER and write a
+ *      dense local code per row (code 0 reserved for empty/missing);
+ *   B) serially, columns in ascending index order, intern each dictionary's
+ *      entries in insertion order and record the global id each one got;
+ *   C) in parallel, one task per column, map local codes to global ids.
+ *
+ * ID-ORDER PRESERVATION (why ids come out bit-identical to the serial walk):
+ * the sequence of intern calls that ALLOCATE an id is what fixes the id
+ * assignment, and step B reproduces that sequence exactly.  The serial walk
+ * allocates in the order (column ascending, then row ascending, first
+ * occurrence only); step A records precisely the first occurrences of one
+ * column in row order, step B replays columns in ascending order, so the
+ * concatenation is the same sequence of first occurrences in the same order.
+ * Every other call in the serial walk is a repeat that returns an existing id
+ * and allocates nothing, so dropping them changes no assignment.  The
+ * empty-symbol intern stays the first call of step B, as it was the first call
+ * of the serial walk.  This is verified empirically, not just argued: see
+ * .superpowers/csv-load-report.md for the per-column raw-id comparison
+ * against the pre-change build.
+ *
+ * A column whose distinct set exceeds CSV_DEDUP_MAX_ENTS gives up its local
+ * dictionary (the dedupe stops paying for itself once the local table is as
+ * cache-hostile as the global one) and is interned the old row-by-row way in
+ * step B — at its own position in column order, so the id sequence is still
+ * the same one.
  * -------------------------------------------------------------------------- */
 
-static bool csv_intern_strings(csv_strref_t** str_refs, int n_cols,
-                                const csv_type_t* col_types,
-                                const int8_t* resolved_types,
-                                void** col_data, int64_t n_rows,
-                                int64_t* col_max_ids) {
+/* Distinct-strings ceiling per column.  Past this the local table no longer
+ * fits a private cache, so it buys nothing over probing the global dictionary
+ * — the fallback in csv_intern_dicts costs speed, never correctness.
+ *
+ * It bounds the PER-COLUMN scratch only, and that is the honest limit: a
+ * dictionary at the ceiling is 1M entries (24 B each) plus a 2M-slot u32
+ * array, ~32 MB, and every SYM column's dictionary is live simultaneously
+ * from dispatch 1 until step C releases them.  So the aggregate bound is
+ * ~32 MB x live SYM columns — ~700 MB for the 22 SYM columns of the
+ * ClickBench hits file if each were at the ceiling (they are nowhere near
+ * it), and ~8 GB in the worst case allowed by CSV_MAX_COLS=256.  Transient,
+ * and it takes a file with hundreds of million-distinct SYM columns to get
+ * there, but it is not bounded by a constant.
+ *
+ * A test build lowers it far enough that a few-thousand-distinct fixture
+ * crosses it, so the overflow fallback in csv_intern_dicts is exercised by
+ * the suite instead of only by 1M-distinct columns nobody puts in a test.
+ * Same gate and same reasoning as CSV_SCAN_CHUNKS above: compile-time, never
+ * a runtime knob. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
+#define CSV_DEDUP_MAX_ENTS   8192u
+#else
+#define CSV_DEDUP_MAX_ENTS   (1u << 20)
+#endif
+#define CSV_DEDUP_MIN_SLOTS  64u
+
+typedef struct {
+    uint32_t    hash;
+    uint32_t    len;
+    const char* ptr;
+    int64_t     gid;      /* global sym id, filled in step B */
+} csv_dedup_ent_t;
+
+typedef struct {
+    uint32_t*        slots;     /* [n_slots] 0 = empty, else entry index + 1 */
+    uint32_t         n_slots;   /* power of two */
+    csv_dedup_ent_t* ents;      /* [n_ents] distinct strings, insertion order */
+    uint32_t         n_ents;
+    uint32_t         ents_cap;
+    bool            done;      /* task ran to completion */
+    bool            overflow;  /* too many distinct — intern this column serially */
+} csv_dedup_t;
+
+static void csv_dedup_release(csv_dedup_t* d) {
+    if (d->slots) { ray_sys_free(d->slots); d->slots = NULL; }
+    if (d->ents)  { ray_sys_free(d->ents);  d->ents  = NULL; }
+    d->n_slots = 0; d->n_ents = 0; d->ents_cap = 0;
+}
+
+/* Grow slots to 2x and reinsert.  Entry order is untouched — rehashing moves
+ * slot positions, never the insertion-ordered ents array the ids come from. */
+static bool csv_dedup_grow(csv_dedup_t* d) {
+    uint32_t new_slots = d->n_slots ? d->n_slots * 2 : CSV_DEDUP_MIN_SLOTS;
+    uint32_t* s = (uint32_t*)ray_sys_alloc((size_t)new_slots * sizeof(uint32_t));
+    if (!s) return false;
+    memset(s, 0, (size_t)new_slots * sizeof(uint32_t));
+    uint32_t mask = new_slots - 1;
+    for (uint32_t i = 0; i < d->n_ents; i++) {
+        uint32_t j = d->ents[i].hash & mask;
+        while (s[j]) j = (j + 1) & mask;
+        s[j] = i + 1;
+    }
+    if (d->slots) ray_sys_free(d->slots);
+    d->slots = s;
+    d->n_slots = new_slots;
+    return true;
+}
+
+static bool csv_dedup_grow_ents(csv_dedup_t* d) {
+    uint32_t cap = d->ents_cap ? d->ents_cap * 2 : CSV_DEDUP_MIN_SLOTS;
+    csv_dedup_ent_t* e = (csv_dedup_ent_t*)ray_sys_realloc(
+        d->ents, (size_t)cap * sizeof(csv_dedup_ent_t));
+    if (!e) return false;
+    d->ents = e;
+    d->ents_cap = cap;
+    return true;
+}
+
+typedef struct {
+    csv_strref_t** str_refs;
+    void**         col_data;
+    const int*     cols;      /* [n] SYM column indices, ascending */
+    csv_dedup_t*   dicts;     /* [n] */
+    int64_t        n_rows;
+    int64_t        empty_gid; /* global id of "" — step B fills it in */
+    /* [n_cols] "this column wrote a canonical null", recorded where the value
+     * is written.  See csv_note_empty. */
+    bool*          empties;
+} csv_dedup_ctx_t;
+
+/* HAS_NULLS accounting for SYM/STR columns (step 9c).
+ *
+ * bfb5b380 made an empty SYM/STR cell a canonical null and, where the parse
+ * had not already flagged the column, fell back to a per-row ray_vec_is_null
+ * scan to find out.  Every writer of those cells already has the value in a
+ * register, so the same predicate is evaluated there instead — SYM null is
+ * id == 0, STR null is len == 0, exactly what ray_vec_is_null tests.  Same
+ * semantics, same flag, no extra pass: the fallback scan cost 0.207 s on the
+ * 8 GB file walking 5 columns to find nothing (it cannot find anything the
+ * parse missed, but this way that is a property of the code rather than of
+ * an argument about the parser). */
+static inline void csv_note_empty(bool* empties, int col, bool is_null) {
+    if (is_null && empties) empties[col] = true;
+}
+
+static void csv_dedup_task(void* arg, uint32_t worker_id,
+                           int64_t start, int64_t end_i) {
+    (void)worker_id; (void)end_i;
+    csv_dedup_ctx_t* ctx = (csv_dedup_ctx_t*)arg;
+    csv_dedup_t* d = &ctx->dicts[start];
+    const csv_strref_t* refs = ctx->str_refs[ctx->cols[start]];
+    /* Local codes land in the destination id array and are replaced in place
+     * by step C, so the dedupe needs no per-row scratch of its own. */
+    uint32_t* codes = (uint32_t*)ctx->col_data[ctx->cols[start]];
+    int64_t n_rows = ctx->n_rows;
+
+    if (!csv_dedup_grow(d) || !csv_dedup_grow_ents(d)) {
+        d->overflow = true;
+        d->done = true;
+        csv_dedup_release(d);
+        return;
+    }
+
+    for (int64_t r = 0; r < n_rows; r++) {
+        if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
+        if (refs[r].ptr == NULL) { codes[r] = 0; continue; }
+        uint32_t h = (uint32_t)ray_hash_bytes(refs[r].ptr, refs[r].len);
+        uint32_t mask = d->n_slots - 1;
+        uint32_t j = h & mask;
+        uint32_t found = 0;
+        for (;;) {
+            uint32_t slot = d->slots[j];
+            if (!slot) break;
+            const csv_dedup_ent_t* e = &d->ents[slot - 1];
+            if (e->hash == h && e->len == refs[r].len &&
+                memcmp(e->ptr, refs[r].ptr, refs[r].len) == 0) {
+                found = slot;
+                break;
+            }
+            j = (j + 1) & mask;
+        }
+        if (found) { codes[r] = found; continue; }
+
+        if (d->n_ents >= CSV_DEDUP_MAX_ENTS) {
+            d->overflow = true;
+            d->done = true;
+            csv_dedup_release(d);
+            return;
+        }
+        if (d->n_ents == d->ents_cap && !csv_dedup_grow_ents(d)) {
+            d->overflow = true; d->done = true; csv_dedup_release(d); return;
+        }
+        csv_dedup_ent_t* e = &d->ents[d->n_ents];
+        e->hash = h;
+        e->len  = refs[r].len;
+        e->ptr  = refs[r].ptr;
+        e->gid  = 0;
+        d->n_ents++;
+        codes[r] = d->n_ents;                 /* code = entry index + 1 */
+        d->slots[j] = d->n_ents;
+        /* Keep the load factor under 3/4. */
+        if (d->n_ents * 4u >= d->n_slots * 3u && !csv_dedup_grow(d)) {
+            d->overflow = true; d->done = true; csv_dedup_release(d); return;
+        }
+    }
+    d->done = true;
+}
+
+/* Step C: local code -> global sym id, in place. */
+static void csv_dedup_map_task(void* arg, uint32_t worker_id,
+                               int64_t start, int64_t end_i) {
+    (void)worker_id; (void)end_i;
+    csv_dedup_ctx_t* ctx = (csv_dedup_ctx_t*)arg;
+    const csv_dedup_t* d = &ctx->dicts[start];
+    if (d->overflow) return;              /* step B already wrote real ids */
+    uint32_t* ids = (uint32_t*)ctx->col_data[ctx->cols[start]];
+    int64_t n_rows = ctx->n_rows;
+    uint32_t empty = (uint32_t)ctx->empty_gid;
+    bool saw_null = false;
+    for (int64_t r = 0; r < n_rows; r++) {
+        if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
+        uint32_t code = ids[r];
+        uint32_t id = code ? (uint32_t)d->ents[code - 1].gid : empty;
+        ids[r] = id;
+        saw_null |= (id == 0);
+    }
+    csv_note_empty(ctx->empties, ctx->cols[start], saw_null);
+}
+
+/* Step B — the only serial part left: intern each column's distinct strings,
+ * columns in ascending order, entries in first-occurrence order.  See the
+ * ID-ORDER PRESERVATION note above for why this reproduces the serial walk's
+ * id assignment exactly.
+ *
+ * CSV/TSV import policy for SYM columns, unchanged: an empty field writes the
+ * canonical empty-symbol id (always 0, reserved by ray_sym_init).  SYM columns
+ * carry no null bitmap by design — sym 0 is "missing", "empty" and "absent"
+ * all at once.  The CSV format cannot distinguish a missing field from an
+ * empty string anyway, so collapsing them is the only deterministic answer the
+ * parser can give.  Empty fields are local code 0 out of the dedupe and are
+ * mapped to that id by step C. */
+static bool csv_intern_dicts(csv_dedup_ctx_t* dd, int n_sym,
+                             int64_t* col_max_ids,
+                             uint64_t prog_base, uint64_t prog_len) {
     bool ok = true;
 
-    /* CSV/TSV import policy for SYM columns: empty fields write the
-     * canonical empty-symbol ID (always 0, reserved by ray_sym_init).
-     * SYM columns carry no null bitmap by design — sym 0 is the
-     * representation of "missing", "empty", and "absent" all at once.
-     * The CSV format can't distinguish "missing field" from "empty
-     * string" anyway, so collapsing them is the only deterministic
-     * answer the parser can give.
-     *
-     * Sym 0 is guaranteed to exist by ray_sym_init; the intern call
-     * here is a fast-path lookup that returns it without growing the
-     * dictionary. */
+    /* Same first call, same reason, as the serial walk: sym 0 is reserved by
+     * ray_sym_init, so this is a lookup that allocates nothing — but it must
+     * stay FIRST for the id sequence to match on a table where it somehow
+     * would allocate. */
     int64_t empty_sym_id = ray_sym_intern_prehashed(
         (uint32_t)ray_hash_bytes("", 0), "", 0);
-    if (empty_sym_id < 0) empty_sym_id = 0;  /* shouldn't happen — sym 0 is reserved */
+    if (empty_sym_id < 0) empty_sym_id = 0;
+    dd->empty_gid = empty_sym_id;
 
-    for (int c = 0; c < n_cols; c++) {
-        if (col_types[c] != CSV_TYPE_STR) continue;
-        /* RAY_STR columns are materialized directly; skip sym interning. */
-        if (resolved_types[c] == RAY_STR) continue;
-        csv_strref_t* refs = str_refs[c];
-        if (!refs) continue;
-        uint32_t* ids = (uint32_t*)col_data[c];
+    for (int i = 0; i < n_sym; i++) {
+        int c = dd->cols[i];
+        csv_dedup_t* d = &dd->dicts[i];
         int64_t max_id = empty_sym_id;
 
-        /* Pre-grow: upper bound is n_rows unique strings */
+        /* Pre-grow: upper bound is n_rows unique strings (unchanged). */
         uint32_t current = ray_sym_count();
-        if (!ray_sym_ensure_cap(current + (uint32_t)(n_rows < UINT32_MAX ? n_rows : UINT32_MAX)))
-            return false;  /* OOM: cannot grow sym table */
+        if (!ray_sym_ensure_cap(current +
+                (uint32_t)(dd->n_rows < UINT32_MAX ? dd->n_rows : UINT32_MAX)))
+            return false;
 
-        for (int64_t r = 0; r < n_rows; r++) {
-            if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
-                return false;
-            if (refs[r].ptr == NULL) {
-                /* Empty/missing field → sym 0 (the canonical empty
-                 * symbol).  SYM columns are no-null by design. */
-                ids[r] = (uint32_t)empty_sym_id;
-                continue;
+        if (d->done && !d->overflow) {
+            for (uint32_t e = 0; e < d->n_ents; e++) {
+                if (RAY_UNLIKELY((e & 1023) == 0 && ray_interrupted())) return false;
+                int64_t id = ray_sym_intern_no_split_unlocked(d->ents[e].ptr,
+                                                              d->ents[e].len);
+                if (id < 0) { ok = false; id = 0; }
+                d->ents[e].gid = id;
+                if (id > max_id) max_id = id;
             }
-            int64_t id = ray_sym_intern_no_split_unlocked(refs[r].ptr, refs[r].len);
-            if (id < 0) { ok = false; id = 0; }
-            ids[r] = (uint32_t)id;
-            if (id > max_id) max_id = id;
+        } else {
+            /* No usable dictionary (distinct set over the ceiling, or the task
+             * never ran).  Intern row by row exactly where the serial walk
+             * would have, so the id sequence is still the same one. */
+            const csv_strref_t* refs = dd->str_refs[c];
+            uint32_t* ids = (uint32_t*)dd->col_data[c];
+            bool saw_null = false;
+            for (int64_t r = 0; r < dd->n_rows; r++) {
+                if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return false;
+                if (refs[r].ptr == NULL) {
+                    /* Empty/missing field → canonical sym-0 null. */
+                    ids[r] = (uint32_t)empty_sym_id;
+                    saw_null |= (empty_sym_id == 0);
+                    continue;
+                }
+                int64_t id = ray_sym_intern_no_split_unlocked(refs[r].ptr, refs[r].len);
+                if (id < 0) { ok = false; id = 0; }
+                ids[r] = (uint32_t)id;
+                saw_null |= (id == 0);
+                if (id > max_id) max_id = id;
+            }
+            csv_note_empty(dd->empties, c, saw_null);
         }
         if (col_max_ids) col_max_ids[c] = max_id;
+        if (prog_len)
+            ray_progress_span_set(prog_base + (uint64_t)((double)prog_len *
+                (double)(i + 1) / (double)n_sym));
     }
     return ok;
 }
@@ -967,16 +1623,14 @@ static void csv_free_escaped_strrefs(csv_strref_t** str_refs, int n_cols,
     }
 }
 
-/* Materialize RAY_STR columns from parsed strrefs. Two-pass so the per-column
- * string pool is sized exactly once — avoids the repeated realloc/COW path
- * that ray_str_vec_set would take for a freshly-owned vector. */
-static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
-                              const int8_t* resolved_types,
-                              ray_t** col_vecs, int64_t n_rows) {
-    for (int c = 0; c < n_cols; c++) {
-        if (resolved_types[c] != RAY_STR) continue;
-        csv_strref_t* refs = str_refs[c];
-        ray_t* vec = col_vecs[c];
+/* Materialize ONE RAY_STR column from its parsed strrefs.  Two-pass so the
+ * per-column string pool is sized exactly once — avoids the repeated
+ * realloc/COW path that ray_str_vec_set would take for a freshly-owned
+ * vector.  Columns are independent (own vector, own pool), which is what
+ * lets the finalizer run one task per column. */
+static bool csv_fill_str_col(csv_strref_t* refs, ray_t* vec, int64_t n_rows,
+                             bool* saw_null_out) {
+    {
         ray_str_t* dst = (ray_str_t*)ray_data(vec);
 
         /* ray_str_t.pool_off is u32 — the per-column pool is capped at 4 GiB.
@@ -1002,11 +1656,14 @@ static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
 
         char* pool_base = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL;
         uint32_t pool_off = 0;
+        bool saw_null = false;
 
         for (int64_t r = 0; r < n_rows; r++) {
             if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
                 return false;
             memset(&dst[r], 0, sizeof(ray_str_t));
+            /* len 0 is what ray_vec_is_null tests for a STR cell. */
+            if (refs[r].ptr == NULL || refs[r].len == 0) { saw_null = true; }
             if (refs[r].ptr == NULL) continue;
             const char* p = refs[r].ptr;
             uint32_t l = refs[r].len;
@@ -1022,16 +1679,33 @@ static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
             }
         }
         if (vec->str_pool) vec->str_pool->len = (int64_t)pool_off;
+        if (saw_null_out) *saw_null_out = saw_null;
     }
     return true;
 }
 
 /* --------------------------------------------------------------------------
- * Stage 9b helper: dispatch csv_fill_str_cols and csv_intern_strings on
- * separate threads when a pool is available.  They write to disjoint
- * column data, and intern_strings is the only one that touches the
- * global sym table (so it stays single-threaded; we just run it in
- * parallel with fill_str_cols).
+ * Stage 9b: finalize the text columns.
+ *
+ * Three steps, laid out so only the middle one is serial:
+ *
+ *   dispatch 1  one task per RAY_STR column (materialize its vector + string
+ *               pool) AND one task per SYM column (local dedupe, above).
+ *               Everything here is column-private.
+ *   serial      intern each SYM column's distinct strings into the global
+ *               symbol table, columns in ascending order (csv_intern_dicts).
+ *               Bounded by DISTINCT strings, not rows.
+ *   dispatch 2  one task per SYM column, mapping local codes to global ids.
+ *
+ * This started as exactly two tasks -- "all the fills" and "the whole intern"
+ * -- which on a 105-column file left 8 cores running 2 threads for ~5 s, and
+ * then as per-column fills plus one monolithic intern, where the intern was
+ * the critical path at 3.9 s.  Only the distinct-string interning is
+ * genuinely serial, and that is all that is left of it.
+ *
+ * Fills are dispatched before dedupes because they are the longer tasks
+ * (whole-column copies vs. one hash probe per row), and longest-first is what
+ * balances a fixed task list.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -1043,22 +1717,111 @@ typedef struct {
     ray_t**           col_vecs;
     int64_t           n_rows;
     int64_t*          sym_max_ids;
-    bool              fill_ok;
+    const int*        fill_cols;   /* [n_fill] RAY_STR column indices */
+    int               n_fill;
+    bool*             fill_ok;     /* [n_fill] per-task result */
+    csv_dedup_ctx_t   dd;          /* SYM columns: cols[], dicts[] */
+    int               n_sym;
+    bool*             empties;     /* [n_cols] SYM/STR column wrote a null */
     bool              intern_ok;
 } csv_finalize_ctx_t;
 
+/* dispatch 1: [0, n_fill) fill a RAY_STR column, [n_fill, n_fill+n_sym) dedupe
+ * a SYM column. */
 static void csv_finalize_task(void* arg, uint32_t worker_id,
                               int64_t start, int64_t end_idx) {
-    (void)worker_id; (void)end_idx;
     csv_finalize_ctx_t* ctx = (csv_finalize_ctx_t*)arg;
-    if (start == 0) {
-        ctx->fill_ok = csv_fill_str_cols(ctx->str_refs, ctx->n_cols,
-            ctx->resolved_types, ctx->col_vecs, ctx->n_rows);
+    if (start < (int64_t)ctx->n_fill) {
+        int c = ctx->fill_cols[start];
+        bool saw_null = false;
+        ctx->fill_ok[start] = csv_fill_str_col(ctx->str_refs[c],
+                                               ctx->col_vecs[c], ctx->n_rows,
+                                               &saw_null);
+        csv_note_empty(ctx->empties, c, saw_null);
     } else {
-        ctx->intern_ok = csv_intern_strings(ctx->str_refs, ctx->n_cols,
-            ctx->parse_types, ctx->resolved_types, ctx->col_data,
-            ctx->n_rows, ctx->sym_max_ids);
+        csv_dedup_task(&ctx->dd, worker_id, start - (int64_t)ctx->n_fill, end_idx);
     }
+}
+
+/* Run the finalize steps, in parallel when the pool allows.  Returns false if
+ * any step failed or the load was cancelled.  fill_cols/fill_ok/sym_cols/dicts
+ * are caller-owned scratch of at least n_cols entries, uninitialised — this
+ * function zeroes the dictionaries itself before dispatching (a task the pool
+ * skips on cancellation must read as "not done"), and releases every one of
+ * them before it returns, on every path.
+ *
+ * prog_base/prog_len describe this phase's slice of the load's byte axis; pass
+ * len 0 when no progress span is active (the streaming conversion path). */
+static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
+                             bool* fill_ok, int* sym_cols, csv_dedup_t* dicts,
+                             bool* empties,
+                             uint64_t prog_base, uint64_t prog_len) {
+    int n_fill = 0, n_sym = 0;
+    for (int c = 0; c < ctx->n_cols; c++) {
+        if (ctx->parse_types[c] != CSV_TYPE_STR || !ctx->str_refs[c]) continue;
+        if (ctx->resolved_types[c] == RAY_STR) fill_cols[n_fill++] = c;
+        else                                   sym_cols[n_sym++] = c;
+    }
+    for (int i = 0; i < n_fill; i++) fill_ok[i] = true;
+    memset(dicts, 0, (size_t)n_sym * sizeof(csv_dedup_t));
+
+    ctx->fill_cols = fill_cols;
+    ctx->n_fill    = n_fill;
+    ctx->fill_ok   = fill_ok;
+    ctx->n_sym     = n_sym;
+    ctx->empties   = empties;
+    ctx->intern_ok = true;
+    ctx->dd.str_refs  = ctx->str_refs;
+    ctx->dd.col_data  = ctx->col_data;
+    ctx->dd.cols      = sym_cols;
+    ctx->dd.dicts     = dicts;
+    ctx->dd.n_rows    = ctx->n_rows;
+    ctx->dd.empty_gid = 0;
+    ctx->dd.empties   = ctx->empties;
+
+    /* Slice the phase: dedupe+fill is the bulk, the serial intern touches only
+     * distinct strings, the remap is one linear pass per SYM column.  Measured
+     * roughly 60 / 10 / 30 on the 8 GB file. */
+    uint64_t w1 = prog_len * 6 / 10;
+    uint64_t w2 = prog_len / 10;
+
+    int64_t n_tasks = (int64_t)n_fill + (int64_t)n_sym;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && ray_pool_total_workers(pool) >= 2 &&
+               n_tasks > 0 && n_tasks <= (int64_t)RAY_POOL_INIT_TASKS;
+
+    if (prog_len) ray_progress_span_phase("finalize", prog_base, w1);
+    if (par) ray_pool_dispatch_n(pool, csv_finalize_task, ctx, (uint32_t)n_tasks);
+    else for (int64_t i = 0; i < n_tasks; i++) csv_finalize_task(ctx, 0, i, i + 1);
+    /* Cancellation drains the ticket queue WITHOUT running fn, so a skipped
+     * dedupe leaves dicts[i].done == false and codes unwritten.  Bail here
+     * rather than letting step B fall back on 105 columns' worth of scratch we
+     * are about to throw away. */
+    if (ray_interrupted()) goto fail;
+
+    if (prog_len) ray_progress_span_phase("intern", prog_base + w1, w2);
+    ctx->intern_ok = csv_intern_dicts(&ctx->dd, n_sym, ctx->sym_max_ids,
+                                      prog_base + w1, w2);
+    if (!ctx->intern_ok || ray_interrupted()) goto fail;
+
+    if (n_sym > 0) {
+        if (prog_len)
+            ray_progress_span_phase("sym ids", prog_base + w1 + w2,
+                                    prog_len - w1 - w2);
+        if (par) ray_pool_dispatch_n(pool, csv_dedup_map_task, &ctx->dd,
+                                     (uint32_t)n_sym);
+        else for (int64_t i = 0; i < n_sym; i++)
+            csv_dedup_map_task(&ctx->dd, 0, i, i + 1);
+        if (ray_interrupted()) goto fail;
+    }
+
+    for (int i = 0; i < n_sym; i++) csv_dedup_release(&dicts[i]);
+    for (int i = 0; i < n_fill; i++) if (!fill_ok[i]) return false;
+    return true;
+
+fail:
+    for (int i = 0; i < n_sym; i++) csv_dedup_release(&dicts[i]);
+    return false;
 }
 
 /* --------------------------------------------------------------------------
@@ -1466,10 +2229,14 @@ static int csv_hash_elem_size(int8_t t) {
  * BOOL/U8/I16 where the index would dwarf the column.
  *
  * Returns 1 to attach, 0 to skip. */
-/* Payload-level core of the hash-upgrade decision, shared with the
- * .csv.splayed index builder (ray_splay_build_indexes) so the on-disk
- * store makes the SAME hash-vs-zone decision the in-memory load does --
- * a reloaded store must not query slower than a fresh .csv.read. */
+/* Payload-level core of the hash-upgrade decision.  Its only caller is the
+ * .csv.splayed index builder (ray_splay_build_indexes): indexing is a
+ * CONVERSION-time decision, made once and persisted with the column files.
+ * A `.csv.read` into memory attaches nothing (it used to run this same
+ * heuristic over every column and throw the result away — 19.7 s of a 46 s
+ * 8 GB load), so there is no in-memory decision left for the on-disk one to
+ * match.  It lives here because the heuristic is written against the
+ * chunk-zone payload the CSV type machinery defines. */
 int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
                                const void* index_payload) {
     const ray_index_t* ix = (const ray_index_t*)index_payload;
@@ -1548,13 +2315,6 @@ int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
     if (aux_bytes > 5u * data_bytes) return 0;
 
     return 1;
-}
-
-static int csv_should_attach_hash(ray_t* v) {
-    if (!v || RAY_IS_ERR(v)) return 0;
-    if (!(v->attrs & RAY_ATTR_HAS_INDEX) || !v->index) return 0;
-    return ray_csv_hash_upgrade_check(v->type, v->len,
-                                      ray_index_payload(v->index));
 }
 
 /* --------------------------------------------------------------------------
@@ -1736,6 +2496,10 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
 
     bool col_had_null[CSV_MAX_COLS];
     if (ncols > 0) memset(col_had_null, 0, (size_t)ncols * sizeof(bool));
+    /* Set by the finalizer for any SYM/STR column that WROTE a canonical null
+     * (sym id 0 / zero-length descriptor) — see csv_note_empty. */
+    bool col_wrote_null[CSV_MAX_COLS];
+    if (ncols > 0) memset(col_wrote_null, 0, (size_t)ncols * sizeof(bool));
     bool col_had_escaped[CSV_MAX_COLS];
     memset(col_had_escaped, 0, sizeof(col_had_escaped));
 
@@ -1866,20 +2630,15 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             .col_vecs       = col_vecs,
             .n_rows         = n_rows,
             .sym_max_ids    = sym_max_ids,
-            .fill_ok        = true,
-            .intern_ok      = true,
         };
-        ray_pool_t* fpool = ray_pool_get();
-        if (fpool && ray_pool_total_workers(fpool) >= 2) {
-            uint32_t qmode = ray_qstats_mode();
-            ray_qstats_set_mode(qmode & ~RAY_QS_PROGRESS);
-            ray_pool_dispatch_n(fpool, csv_finalize_task, &fctx, 2);
-            ray_qstats_set_mode(qmode);
-        } else {
-            csv_finalize_task(&fctx, 0, 0, 1);
-            csv_finalize_task(&fctx, 0, 1, 2);
-        }
-        if (!fctx.fill_ok || !fctx.intern_ok || ray_interrupted()) {
+        int  fill_cols[CSV_MAX_COLS];
+        int  sym_cols[CSV_MAX_COLS];
+        bool fill_ok[CSV_MAX_COLS];
+        csv_dedup_t dicts[CSV_MAX_COLS];
+        /* No progress span on the conversion path — pass a zero-length slice. */
+        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
+                                       sym_cols, dicts, col_wrote_null, 0, 0);
+        if (!fin_ok || ray_interrupted()) {
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, row_done, col_had_escaped);
             for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
@@ -1887,15 +2646,6 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
             return ray_interrupted() ? ray_error("cancel", "interrupted") : NULL;
         }
-    }
-
-    for (int c = 0; c < ncols; c++) {
-        if (resolved_types[c] != RAY_SYM) continue;
-        uint32_t* ids = (uint32_t*)col_data[c];
-        int64_t max_id = 0;
-        for (int64_t r = 0; r < n_rows; r++)
-            if ((int64_t)ids[r] > max_id) max_id = ids[r];
-        sym_max_ids[c] = max_id;
     }
 
     csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
@@ -1907,12 +2657,16 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         return ray_error("cancel", "interrupted");
     }
 
+    /* HAS_NULLS, same rule as the in-memory read path (step 9c there).
+     * SYM/STR use sym 0 / a zero-length descriptor as their canonical null
+     * (bfb5b380), and this path had been left behind on the pre-bfb5b380 rule
+     * that cleared the bit for those two types — so a converted store and a
+     * fresh .csv.read of the same file disagreed about the same empty cells
+     * (issue #416).  The SYM/STR answer comes from col_wrote_null[], recorded
+     * by the finalizer at each write site, so it costs no extra pass. */
     for (int c = 0; c < ncols; c++) {
         ray_t* vec = col_vecs[c];
-        /* SYM and STR both represent a blank cell as the empty string ("" /
-         * sym 0) — there is no null distinct from empty, so neither type
-         * carries HAS_NULLS (a per-row null check on them is pure waste). */
-        if (col_had_null[c] && vec->type != RAY_SYM && vec->type != RAY_STR)
+        if (col_had_null[c] || col_wrote_null[c])
             vec->attrs |= RAY_ATTR_HAS_NULLS;
         else
             vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
@@ -1954,65 +2708,12 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         col_data[c] = dst;
     }
 
-    /* Per-chunk min/max + null bit on every column big enough to be worth
-     * indexing — gives the reduce min/max and the filter chunk-skip paths
-     * an O(n_chunks) scan instead of O(n_rows).  Attach is best-effort:
-     * unsupported types (RAY_STR/RAY_SYM/RAY_GUID in v1) just stay
-     * unindexed and the consumer falls back to a row scan.
-     *
-     * After the chunk_zone attaches we re-walk the same columns and
-     * upgrade the high-entropy ones to a hash index (the chunk_zone
-     * stays as well — it's the entropy signal we just measured).  See
-     * csv_should_attach_hash for the selectivity + memory cap.
-     *
-     * Progress: same treatment as the finalize dispatch above — the
-     * per-column index builds run their own pool dispatches whose row
-     * totals are not n_rows, so letting them drive the progress pump
-     * resets a completed parse to arbitrary fractions (visibly
-     * 100% -> 50% -> ...).  Suppress progress for the whole index
-     * phase; the parse's completed row count stays on screen. */
-    uint32_t idx_qmode = ray_qstats_mode();
-    ray_qstats_set_mode(idx_qmode & ~RAY_QS_PROGRESS);
-    for (int c = 0; c < ncols; c++) {
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        ray_t* v = col_vecs[c];
-        if (!v || RAY_IS_ERR(v)) continue;
-        if (v->len < (1 << 16)) continue;        /* < one chunk, skip */
-        ray_t* r = ray_index_attach_chunk_zone(&v, 16);
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;  /* attach succeeded */
-        /* On failure the original column stays in col_vecs[c]; ignore. */
-    }
-    for (int c = 0; c < ncols; c++) {
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        ray_t* v = col_vecs[c];
-        if (!csv_should_attach_hash(v)) continue;
-        /* ray_index_attach_hash drops any existing index on the
-         * column first; the chunk_zone we just built is sacrificed
-         * for the hash.  That's the right trade — once the column
-         * is known to be high-entropy, chunk-skip never fires
-         * anyway, so the chunk_zone is dead weight. */
-        ray_t* r = ray_index_attach_hash(&v);
-        if (ray_interrupted()) {
-            ray_qstats_set_mode(idx_qmode);
-            for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
-            return ray_error("cancel", "interrupted");
-        }
-        if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
-    }
-    ray_qstats_set_mode(idx_qmode);
+    /* No index attach here.  This function feeds the streaming csv→splayed /
+     * →parted writers: every column it produces is immediately serialised to
+     * disk and thrown away, and store/splay.c decides and persists the real
+     * index (chunk-zone / dict, upgraded to hash by
+     * ray_csv_hash_upgrade_check) at conversion time.  Building an in-memory
+     * index per 1M-row chunk here was pure waste. */
 
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) {
@@ -2060,9 +2761,12 @@ static const char* csv_skip_matching_header(const char* p, const char* buf_end,
  * ray_read_csv_opts — main CSV parser
  * -------------------------------------------------------------------------- */
 
-ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
-                               const int8_t* col_types_in, int32_t n_types,
-                               const int64_t* col_names_in, int32_t n_names) {
+/* Body of ray_read_csv_named_opts.  Split out so the byte-metered progress
+ * span is closed on exactly one path, whichever of the dozen returns below
+ * fires. */
+static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool header,
+                                        const int8_t* col_types_in, int32_t n_types,
+                                        const int64_t* col_names_in, int32_t n_names) {
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
 
     /* ---- 1. Open file and get size ---- */
@@ -2087,6 +2791,11 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
 
     const char* buf_end = buf + file_size;
     ray_t* result = NULL;
+
+    /* One monotone bar for the whole load, metered in bytes of input.  Every
+     * return path below runs through ray_progress_span_end (the executor's
+     * ray_progress_end also clears it, so an early error cannot strand it). */
+    ray_progress_span_begin(NULL, (uint64_t)file_size);
 
     /* ---- 3. Detect delimiter ---- */
     /* Delimiter auto-detected from header row only. Files where the header
@@ -2171,7 +2880,11 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
     /* ---- 6. Build row offsets (memchr-accelerated) ---- */
     ray_t* row_offsets_hdr = NULL;
     int64_t* row_offsets = NULL;
+    uint64_t prog_scan_end  = csv_prog_at(file_size, CSV_PROG_PCT_SCAN);
+    uint64_t prog_parse_end  = csv_prog_at(file_size,
+                                           CSV_PROG_PCT_SCAN + CSV_PROG_PCT_PARSE);
     int64_t n_rows = build_row_offsets(buf, file_size, data_offset,
+                                        0, prog_scan_end,
                                         &row_offsets, &row_offsets_hdr);
 
     if (n_rows < 0) {
@@ -2248,6 +2961,11 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
     bool col_had_null[CSV_MAX_COLS];
     if (ncols > 0) memset(col_had_null, 0, (size_t)ncols * sizeof(bool));
 
+    /* Set by the finalizer for any SYM/STR column that WROTE a canonical null
+     * (sym id 0 / zero-length descriptor).  Feeds step 9c below. */
+    bool col_wrote_null[CSV_MAX_COLS];
+    if (ncols > 0) memset(col_wrote_null, 0, (size_t)ncols * sizeof(bool));
+
     bool col_had_escaped[CSV_MAX_COLS];
     memset(col_had_escaped, 0, sizeof(col_had_escaped));
 
@@ -2308,6 +3026,7 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
         }
     }
 
+    ray_progress_span_phase("parse", prog_scan_end, prog_parse_end - prog_scan_end);
     {
         ray_pool_t* pool = ray_pool_get();
         bool use_parallel = pool && n_rows > 8192;
@@ -2380,24 +3099,21 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
             .col_vecs       = col_vecs,
             .n_rows         = n_rows,
             .sym_max_ids    = sym_max_ids,
-            .fill_ok        = true,
-            .intern_ok      = true,
         };
-        ray_pool_t* fpool = ray_pool_get();
-        if (fpool && ray_pool_total_workers(fpool) >= 2) {
-            /* Finalization has two coarse internal tasks, not rows.  Letting
-             * the generic pool progress pump expose them resets a completed
-             * n_rows parse to 0/2 (visibly 100% -> 50%).  Keep profiling
-             * active, but preserve the row progress until query completion. */
-            uint32_t qmode = ray_qstats_mode();
-            ray_qstats_set_mode(qmode & ~RAY_QS_PROGRESS);
-            ray_pool_dispatch_n(fpool, csv_finalize_task, &fctx, 2);
-            ray_qstats_set_mode(qmode);
-        } else {
-            csv_finalize_task(&fctx, 0, 0, 1);
-            csv_finalize_task(&fctx, 0, 1, 2);
-        }
-        if (!fctx.fill_ok || !fctx.intern_ok || ray_interrupted()) {
+        /* Finalization used to be hidden from the progress pump entirely (its
+         * 0/2 would have reset a completed n_rows parse to 50%), which left
+         * the terminal frozen for the rest of the load.  On the byte axis it
+         * is simply the last slice, and csv_finalize_run subdivides it across
+         * its three steps. */
+        int  fill_cols[CSV_MAX_COLS];
+        int  sym_cols[CSV_MAX_COLS];
+        bool fill_ok[CSV_MAX_COLS];
+        csv_dedup_t dicts[CSV_MAX_COLS];
+        bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
+                                       sym_cols, dicts, col_wrote_null,
+                                       prog_parse_end,
+                                       (uint64_t)file_size - prog_parse_end);
+        if (!fin_ok || ray_interrupted()) {
             if (ray_interrupted()) goto fail_parsed_cancel;
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, NULL, col_had_escaped);
@@ -2408,41 +3124,37 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
         }
     }
 
-    for (int c = 0; c < ncols; c++) {
-        if (resolved_types[c] != RAY_SYM) continue;
-        uint32_t* ids = (uint32_t*)col_data[c];
-        int64_t max_id = 0;
-        for (int64_t r = 0; r < n_rows; r++) {
-            if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted()))
-                goto fail_parsed_cancel;
-            if ((int64_t)ids[r] > max_id) max_id = ids[r];
-        }
-        sym_max_ids[c] = max_id;
-    }
-
     /* Free heap-allocated escaped string copies, then strref buffers */
     csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                              buf, file_size, NULL, col_had_escaped);
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
     scratch_free(row_done_hdr);
 
-    /* ---- 9c. Set HAS_NULLS for columns that saw a null ----
+    /* ---- 9c. Set HAS_NULLS for columns that saw a canonical null ----
      *
      * Sentinels in the payload carry the null state; HAS_NULLS is the
-     * vec-level fast-path bit.  SYM columns are no-null by design —
-     * empty fields were already remapped to sym 0 in step 9b. */
+     * vec-level fast-path bit.  SYM/STR use sym 0 / empty descriptors as
+     * canonical nulls, including explicitly quoted empty CSV fields.
+     *
+     * For SYM/STR the answer comes from col_wrote_null[], which the finalizer
+     * records at the point it writes each cell using ray_vec_is_null's own
+     * predicate (id == 0 / len == 0).  That replaced a per-row
+     * ray_vec_is_null fallback scan over any SYM/STR column the parse had not
+     * already flagged — same semantics, but free instead of 0.207 s of
+     * whole-column passes on the 8 GB file. */
     for (int c = 0; c < ncols; c++) {
         ray_t* vec = col_vecs[c];
-        /* SYM and STR both represent a blank cell as the empty string ("" /
-         * sym 0) — there is no null distinct from empty, so neither type
-         * carries HAS_NULLS (a per-row null check on them is pure waste). */
-        if (col_had_null[c] && vec->type != RAY_SYM && vec->type != RAY_STR)
+        bool has_null = col_had_null[c] || col_wrote_null[c];
+        if (has_null)
             vec->attrs |= RAY_ATTR_HAS_NULLS;
         else
             vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     }
 
-    /* ---- 10. Narrow sym columns to optimal width ---- */
+    /* ---- 10. Narrow sym columns to optimal width ----
+     * sym_max_ids[] comes from csv_intern_dicts, which already saw every id it
+     * handed out; the full 10M-row rescan that used to recompute it here was
+     * pure duplication (0.26 s on the 8 GB file). */
     for (int c = 0; c < ncols; c++) {
         if (resolved_types[c] != RAY_SYM) continue;
         uint8_t new_w = ray_sym_dict_width(sym_max_ids[c]);
@@ -2479,34 +3191,13 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
 
     /* ---- 11. Build table ---- */
     {
-        /* Best-effort per-chunk zone index attach (see comment on the
-         * matching loop in build_table_from_cols) — unsupported types
-         * fall through to the unindexed path inside the consumer.
-         * Second pass upgrades high-entropy columns to a hash index;
-         * see csv_should_attach_hash.
-         * Progress suppressed for the whole phase (same rationale as the
-         * finalize dispatch): the index builds' pool dispatches would
-         * reset the completed parse progress to arbitrary fractions. */
-        uint32_t idx_qmode = ray_qstats_mode();
-        ray_qstats_set_mode(idx_qmode & ~RAY_QS_PROGRESS);
-        for (int c = 0; c < ncols; c++) {
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            ray_t* v = col_vecs[c];
-            if (!v || RAY_IS_ERR(v)) continue;
-            if (v->len < (1 << 16)) continue;
-            ray_t* r = ray_index_attach_chunk_zone(&v, 16);
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
-        }
-        for (int c = 0; c < ncols; c++) {
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            ray_t* v = col_vecs[c];
-            if (!csv_should_attach_hash(v)) continue;
-            ray_t* r = ray_index_attach_hash(&v);
-            if (ray_interrupted()) { ray_qstats_set_mode(idx_qmode); goto fail_cols_cancel; }
-            if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
-        }
-        ray_qstats_set_mode(idx_qmode);
+        /* No index attach at load time.  Index policy lives at csv→splayed
+         * CONVERSION (store/splay.c: chunk-zone / dict, upgraded to a hash
+         * index by ray_csv_hash_upgrade_check) where the decision is made
+         * once and persisted.  A `.csv.read` into memory used to pay for a
+         * chunk-zone AND a hash index on all 105 columns of an 8 GB file —
+         * 3.6 s + 16.1 s of a 46 s load — for indexes most in-memory reads
+         * never probe.  Columns that need one can be indexed explicitly. */
 
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
@@ -2544,6 +3235,16 @@ fail_offsets:
 fail_unmap:
     ray_vm_unmap_file(buf, file_size);
     return ray_error("oom", NULL);
+}
+
+ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
+                               const int8_t* col_types_in, int32_t n_types,
+                               const int64_t* col_names_in, int32_t n_names) {
+    ray_t* r = csv_read_named_opts_inner(path, delimiter, header,
+                                         col_types_in, n_types,
+                                         col_names_in, n_names);
+    ray_progress_span_end();
+    return r;
 }
 
 ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
@@ -2625,6 +3326,14 @@ static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
                                                     ray_str_len(s));
                 if (pos < 0) return RAY_ERR_OOM;
                 buf[i] = (uint32_t)pos;
+                /* Position 0 of any symfile is the empty string (domain.c
+                 * enforces that reservation on open), so a re-encoded cell is
+                 * the canonical SYM null exactly when its position is 0.
+                 * Testing the value WRITTEN keeps the on-disk HAS_NULLS honest
+                 * without trusting the chunk vec's attrs — and this arm is why
+                 * streamed SYM columns used to lose the bit entirely: only the
+                 * non-SYM arm below propagated it (issue #416). */
+                if (pos == 0) w->had_nulls = true;
             }
             if (fwrite(buf, sizeof(uint32_t), (size_t)cnt, w->fp) != (size_t)cnt)
                 return RAY_ERR_IO;

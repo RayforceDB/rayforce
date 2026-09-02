@@ -128,6 +128,11 @@ typedef enum {
  * singleton (global intern table) or a refcounted mmapped symfile. */
 struct ray_sym_domain_s;
 
+/* One file mapping shared by more than one block (src/mem/heap.h): a mapped
+ * string column and its pool live in the same region, so neither can end it
+ * alone.  Held by the pool at aux[8..15] under mmod 3. */
+struct ray_file_map_s;
+
 typedef union ray_t {
     /* Allocated: object header */
     struct {
@@ -173,9 +178,25 @@ typedef union ray_t {
              * 8-15 hold an int64 sym ID naming the target table.
              * link_lo[8] aliases bytes 0-7.  See ops/linkop.h. */
             struct { uint8_t link_lo[8];         int64_t link_target; };
+            /* mmod 3 (string pools only): the shared mapping this block
+             * lives in.  Typed rather than reached by offset, so it moves
+             * with the union if the layout is ever reshuffled. */
+            struct { uint8_t _aux_map_lo[8];     struct ray_file_map_s* file_map; };
         };
         /* Bytes 16-31: metadata + value */
-        uint8_t  mmod;       /* 0=heap, 1=file-mmap */
+        /* Where this block's memory came from, and who ends it:
+         *   0  heap — the buddy allocator owns it
+         *   1  file-mmap — this block's own free munmaps the region, whose
+         *      size it derives from its type and length
+         *   2  borrowed — somebody else owns the memory and ends it on its
+         *      own schedule; free does nothing at all
+         *   3  file-mmap, shared — the region is described by a heap-side
+         *      ray_file_map_t held in aux[8..15] and ends when the last
+         *      block referencing it is freed.  A string column and its pool
+         *      live in one mapping, and a selection may keep the pool after
+         *      the column is gone, so the pool carries this and the column
+         *      merely holds a reference to it. */
+        uint8_t  mmod;
         uint8_t  order;      /* block order (block size = 2^order) */
         int8_t   type;       /* negative=atom, positive=vector, 0=LIST */
         uint8_t  attrs;      /* attribute flags */
@@ -360,6 +381,10 @@ bool     ray_interrupted(void);
 typedef struct {
     const char* op_name;      /* coarse: scan, group, pivot, join, ... */
     const char* phase;        /* optional finer label, e.g. "pivot: dedupe" */
+    /* Units follow the op: normally rows, but while a byte-metered span is
+     * active (see ray_progress_span_begin) these two carry BYTES — the same
+     * values as bytes_done/bytes_total below — so that the percentage a
+     * callback derives from them is the span's, not some inner dispatch's. */
     uint64_t    rows_done;
     uint64_t    rows_total;   /* 0 = indeterminate */
     double      elapsed_sec;
@@ -367,6 +392,12 @@ typedef struct {
     int64_t     mem_total;    /* bytes: total physical RAM (the disk-spill threshold) */
     bool        final;        /* true on the last tick of a query — renderers
                                  use this to clear the line */
+    /* Byte-metered ops (currently .csv.read) publish their real progress on a
+     * byte axis as well as the row counters, so a renderer can show
+     * "3.2G/8.1G" instead of a row count nobody can size.  bytes_total == 0
+     * means the op is not byte-metered and these two must be ignored. */
+    uint64_t    bytes_done;
+    uint64_t    bytes_total;
 } ray_progress_t;
 
 typedef void (*ray_progress_cb)(const ray_progress_t* snapshot, void* user);
@@ -407,6 +438,25 @@ bool ray_progress_active(void);
 void ray_progress_dispatch_begin(uint64_t phase_rows_total);
 void ray_progress_pump(void);
 
+/* ===== Byte-metered span (main-thread only) =====
+ *
+ * An op made of several internal phases — each of which may run its own pool
+ * dispatch over a different element count — cannot report honest progress
+ * through the per-dispatch pump: every dispatch restarts at 0%, so the bar
+ * saws.  A SPAN gives such an op one monotone axis (bytes of input) that all
+ * of its phases share.
+ *
+ * ray_progress_span_begin declares the axis (bytes_total, e.g. the file size).
+ * ray_progress_span_phase declares that whatever runs next occupies
+ * [base, base+len) of that axis: the dispatch pump maps its own 0..100% into
+ * that window instead of publishing raw row counts, and a serial phase can
+ * drive the same window directly with ray_progress_span_set.  The published
+ * value never decreases.  All are no-ops with no callback registered. */
+void ray_progress_span_begin(const char* op_name, uint64_t bytes_total);
+void ray_progress_span_phase(const char* phase, uint64_t base, uint64_t len);
+void ray_progress_span_set(uint64_t bytes_done);
+void ray_progress_span_end(void);
+
 /* ===== COW / Ref Counting API ===== */
 
 void     ray_retain(ray_t* v);
@@ -444,14 +494,14 @@ ray_t* ray_typed_null(int8_t type);
  *   F32/F64           NaN                       NaN
  *   GUID              16 all-zero bytes         16 all-zero bytes
  *   BOOL/U8           ray_typed_null aux bit    non-nullable
- *   SYM/STR           no distinct null          non-nullable
+ *   SYM/STR           canonical empty value     canonical empty value
  *
- * Empty SYM/STR values are ordinary values.  A requested typed or input null
- * for either type collapses to the ordinary empty value; its public null
- * predicate remains false and a vector does not acquire HAS_NULLS.  Callers
- * compare sentinel-backed payloads directly (for example `x == NULL_I64` or
- * `x != x` for NaN).  Temporal types reuse NULL_I32 or NULL_I64 according to
- * storage width. */
+ * Empty SYM/STR values are their canonical in-band nulls.  A requested typed
+ * or input null for either type collapses to that empty representation; the
+ * public null predicate recognizes it and vectors containing it acquire
+ * HAS_NULLS.  Callers compare sentinel-backed payloads directly (for example
+ * `x == NULL_I64` or `x != x` for NaN).  Temporal types reuse NULL_I32 or
+ * NULL_I64 according to storage width. */
 #define NULL_I16  ((int16_t)INT16_MIN)
 #define NULL_I32  ((int32_t)INT32_MIN)
 #define NULL_I64  ((int64_t)INT64_MIN)
@@ -460,8 +510,8 @@ ray_t* ray_typed_null(int8_t type);
 
 /* Atom null check.  RAY_NULL_OBJ is the untyped null singleton.
  * Sentinel-backed atoms use payload comparison.  BOOL/U8 typed-null atoms
- * use the aux[0]&1 bit written by ray_typed_null.  SYM/STR always return
- * false because their empty payloads are ordinary values. */
+ * use the aux[0]&1 bit written by ray_typed_null.  SYM/STR use their
+ * canonical in-band empty values (sym 0 / "") as null. */
 static inline bool ray_atom_is_null_fn(const union ray_t* x) {
     if (RAY_IS_NULL(x)) return true;
     if (x->type >= 0) return false;
@@ -479,14 +529,11 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
         case RAY_TIME:      return x->i32 == NULL_I32;
         case RAY_I16:       return x->i16 == NULL_I16;
         case RAY_SYM:
-            /* SYM has no null — sym 0 is the empty symbol ' (a value), mirroring
-             * STR's empty "" below.  A SYM atom is never null. */
-            return false;
+            return x->i64 == 0;
         case RAY_STR:
-            /* STR has no null distinct from "" (char lists have no null, only
-             * symbols do).  A STR atom is never null — the empty
-             * string is a value. */
-            return false;
+            /* Empty SSO is the only STR atom whose value union is all zero;
+             * non-empty SSO and long-string pointers are both non-NULL. */
+            return x->obj == NULL;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes in obj's U8 buffer.
              * obj is always populated by ray_guid / ray_typed_null —
@@ -516,6 +563,7 @@ ray_t* ray_vec_new(int8_t type, int64_t capacity);
 
 ray_t* ray_sym_vec_new(uint8_t sym_width, int64_t capacity);  /* RAY_SYM with adaptive width */
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
+ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);  /* one reserve + one memcpy */
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
 void* ray_vec_get(ray_t* vec, int64_t idx);
 ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len);
@@ -596,6 +644,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
 
 ray_t*       ray_table_new(int64_t ncols);
 ray_t*       ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec);
+ray_t*       ray_table_validate_rectangular(ray_t* tbl, const char* context);
 ray_t*       ray_table_get_col(ray_t* tbl, int64_t name_id);
 ray_t*       ray_table_get_col_idx(ray_t* tbl, int64_t idx);
 int64_t     ray_table_col_name(ray_t* tbl, int64_t idx);

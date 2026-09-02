@@ -870,6 +870,31 @@ static test_result_t test_eval_in(void) {
     PASS();
 }
 
+/* ---- Test: GUID OP_NOT_IN preserves null semantics ---------------------- */
+static test_result_t test_eval_select_where_in_guid_nulls(void) {
+    ray_t* table = ray_eval_str(
+        "(do (set g (guid 2)) "
+        "(set probe (as 'guid \"00000000-0000-0000-0000-000000000000\")) "
+        "(set t (table ['g 'v] (list g [10 20]))) t)");
+    TEST_ASSERT_NOT_NULL(table);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+
+    ray_t* col = ray_table_get_col(table, ray_sym_intern("g", 1));
+    TEST_ASSERT_NOT_NULL(col);
+    TEST_ASSERT_EQ_I(col->type, RAY_GUID);
+    ray_vec_set_null(col, 0, true);
+
+    ray_t* result = ray_eval_str(
+        "(select {from: t where: (not-in g probe)})");
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+
+    ray_release(result);
+    ray_release(table);
+    PASS();
+}
+
 /* ---- Test: except ---- */
 static test_result_t test_eval_except(void) {
     ray_t* result = ray_eval_str("(except [1 2 3] [2])");
@@ -8907,6 +8932,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/apply", test_eval_apply, lang_setup, lang_teardown },
     { "lang/eval/distinct", test_eval_distinct, lang_setup, lang_teardown },
     { "lang/eval/in", test_eval_in, lang_setup, lang_teardown },
+    { "lang/eval/select_where_in_guid_nulls", test_eval_select_where_in_guid_nulls, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
     { "lang/eval/sect", test_eval_sect, lang_setup, lang_teardown },

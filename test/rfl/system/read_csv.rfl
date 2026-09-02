@@ -71,7 +71,7 @@
 (.sys.exec "test $(find rf_test_csv_parted_rows -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 3") -- 0
 (.sys.exec "rm -rf rf_test_csv_parted_rows rf_test_csv_rows.csv") -- 0
 
-;; ── R6 regression: empty TSV/CSV fields → empty SYM (not null sentinel) ──
+;; ── R6 regression: empty TSV/CSV fields → canonical empty/null SYM ──
 ;; CSV format conflates "missing" and "empty"; the loader treats empty
 ;; SYM cells as the interned empty string so SQL-style `(!= col "")`
 ;; filters work consistently with the row-level semantics most CSV
@@ -80,10 +80,9 @@
 (.sys.exec "printf 'name\\nalice\\n\\nbob\\n\\ncarol\\n' > rf_test_empty.csv") -- 0
 (set _t (.csv.read [SYMBOL] "rf_test_empty.csv"))
 (count _t)                                                            -- 5
-;; The empty SYM cell is the interned empty string (sym id 0), a real
-;; comparable value — SQL-style filtering on SYM columns compares by
-;; value, not by null.  `(!= name "")` therefore excludes the two empty
-;; rows (alice, bob, carol survive) and `(== name "")` selects them.
+;; The empty SYM cell is canonical null (sym id 0). Equality remains an
+;; in-band id comparison, so `(!= name "")` excludes the two empty rows
+;; (alice, bob, carol survive) and `(== name "")` selects them.
 ;; (See the str-resolved comparison path in src/ops/expr.c, which skips
 ;; the null-comparison fixup once a string constant resolves to a sym id.)
 (count (select {x: name from: _t where: (!= name "")}))               -- 3

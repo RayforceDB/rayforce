@@ -1,0 +1,17 @@
+;; Issue #414 — an unknown query column is always a schema error.  `i` is
+;; not a virtual row-index column; arbitrary missing names follow the same rule.
+
+(set I414 (table [g d v] (list ['a 'a 'b 'b] [2026.01.01 2026.01.02 2026.01.01 2026.01.02] [10 20 30 40])))
+
+(select {x:i from:I414}) !- schema
+(select {n:(count i) from:I414}) !- schema
+(select {n:(count i) from:I414 by:d}) !- schema
+(select {n:(max i) from:I414 by:d}) !- schema
+(select {n:(count i) from:I414 where:(== g 'a) by:d}) !- schema
+(select {from:I414 where:(< i 2)}) !- schema
+
+(select {n:(count missing) from:I414 by:d}) !- schema
+(select {n:(max missing) from:I414 by:d}) !- schema
+
+;; Existing columns remain valid across the same planner paths.
+(at (select {n:(count v) from:I414 where:(== g 'a) by:d}) 'n) -- [1 1]

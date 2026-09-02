@@ -40,6 +40,7 @@
 #include "lang/parse.h"
 #include "lang/syscmd.h"
 #include "mem/heap.h"
+#include "mem/sys.h"
 #include "ops/ops.h"
 #include "core/profile.h"
 #include "core/qlog.h"
@@ -133,7 +134,8 @@ static const char* fmt_bytes(int64_t bytes, char* buf, size_t bufsz) {
 static void render_progress_full(int64_t done, int64_t total,
                                    const char* op, const char* phase,
                                    double elapsed_sec,
-                                   int64_t mem_used, int64_t mem_total) {
+                                   int64_t mem_used, int64_t mem_total,
+                                   int64_t bytes_done, int64_t bytes_total) {
     int cols = progress_term_cols();
     /* Reserve a chunk for labels + percent + elapsed; give the rest
      * to the bar. Minimum bar is 10 cells, maximum 40. */
@@ -169,11 +171,22 @@ static void render_progress_full(int64_t done, int64_t total,
                        (op && *op) ? ": " : " \xc2\xb7 ", phase);
     if (elapsed_sec > 0.0)
         tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %.1fs", elapsed_sec);
+    /* Byte-metered ops (CSV load) show input consumed / input size.  It goes
+     * before the memory gauge because it is the thing the percentage is
+     * actually measuring. */
+    if (bytes_total > 0) {
+        char db[16], tbb[16];
+        fmt_bytes(bytes_done, db, sizeof(db));
+        fmt_bytes(bytes_total, tbb, sizeof(tbb));
+        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", db, tbb);
+    }
+    /* Live heap footprint against physical RAM — explicitly labelled "mem"
+     * so it can't be misread as a position in the input. */
     if (mem_used > 0 && mem_total > 0) {
         char ub[16], tb[16];
         fmt_bytes(mem_used, ub, sizeof(ub));
         fmt_bytes(mem_total, tb, sizeof(tb));
-        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", ub, tb);
+        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 mem %s/%s", ub, tb);
     }
 
     /* Clear the line first, then draw. Using \e[2K avoids leaving
@@ -215,7 +228,8 @@ static void repl_query_progress_cb(const ray_progress_t* p, void* user) {
     if (p->final) { clear_progress(); return; }
     render_progress_full((int64_t)p->rows_done, (int64_t)p->rows_total,
                          p->op_name, p->phase, p->elapsed_sec,
-                         p->mem_used, p->mem_total);
+                         p->mem_used, p->mem_total,
+                         (int64_t)p->bytes_done, (int64_t)p->bytes_total);
 }
 
 /* ===== Profiler span tree printer (reads from g_ray_profile) ===== */
@@ -654,6 +668,56 @@ ray_t* ray_repl_disconnect_fn(ray_t** args, int64_t n) {
     return RAY_NULL_OBJ;
 }
 
+/* strcmp comparator over char* cells, for sorting completion candidates. */
+static int repl_comp_cmp(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+/* (.repl.complete "prefix") -> sorted sym vector of namespace candidates
+ * whose name begins with `prefix`: builtins, keywords, and user bindings.
+ *
+ * This is the engine side of the REPL's own tab-completion (issue #441),
+ * exposed as a read-only verb so editor tooling can query it over IPC and
+ * get semantic completion of names the engine knows in the live session,
+ * not just a static keyword list.  It reuses ray_env_lookup_prefix — the
+ * same primitive the terminal client's completion draws from — so the two
+ * can never drift.  History-word completion is intentionally omitted: it
+ * is client-local and meaningless to a remote caller. */
+ray_t* ray_repl_complete_fn(ray_t* prefix_str) {
+    if (!ray_is_atom(prefix_str) || prefix_str->type != -RAY_STR)
+        return ray_error("type", ".repl.complete expects a string prefix, got %s",
+                         ray_type_name(prefix_str->type));
+
+    const char* prefix = ray_str_ptr(prefix_str);
+    int64_t     plen   = (int64_t)ray_str_len(prefix_str);
+
+    /* Size the candidate buffer to cover every global binding plus
+     * headroom for the static keyword list.  ray_env_lookup_prefix caps
+     * itself at max_results and dedups, so this never overruns. */
+    int64_t      cap     = (int64_t)ray_env_global_count() + 256;
+    const char** results = (const char**)ray_sys_alloc((size_t)cap * sizeof(const char*));
+    if (!results) return ray_error("oom", NULL);
+
+    int64_t count = ray_env_lookup_prefix(prefix ? prefix : "", plen, results, cap);
+
+    /* Sort for a stable, editor-friendly ordering (mirrors .fs.list). */
+    if (count > 1)
+        qsort(results, (size_t)count, sizeof(const char*), repl_comp_cmp);
+
+    ray_t* out = ray_vec_new(RAY_SYM, count);
+    if (!out || RAY_IS_ERR(out)) {
+        ray_sys_free(results);
+        return out ? out : ray_error("oom", NULL);
+    }
+    out->len = count;
+    int64_t* ids = (int64_t*)ray_data(out);
+    for (int64_t i = 0; i < count; i++)
+        ids[i] = ray_sym_intern(results[i], strlen(results[i]));
+
+    ray_sys_free(results);
+    return out;
+}
+
 /* eval_and_print's remote branch: send the raw input string to the
  * connected server with RAY_IPC_FLAG_VERBOSE set so server-side
  * stdout/stderr written during eval are captured and returned to us
@@ -810,6 +874,15 @@ static void eval_and_print(ray_term_t* term, const char* input,
 
     if (profiling) profile_print(use_color);
     ray_heap_gc();
+    /* Statement boundary.  Check BEFORE stamping: the clock still holds the
+     * end of the previous statement, so what we measure is the gap between
+     * statements — the time the process actually sat idle.  Stamping first
+     * would measure this statement's own duration instead, and a loop of
+     * statements longer than the threshold would then sweep after every one
+     * of them, discarding the working set the next is about to fault back
+     * in. */
+    ray_heap_decay();
+    ray_heap_note_activity();
 }
 
 /* `type_label` and `cmd_match` were inlined into the previous bespoke
@@ -855,6 +928,11 @@ static bool handle_command(ray_repl_t* repl, const char* str, size_t len) {
          * through the regular eval path. */
         ray_release(result);
     }
+
+    /* A piped REPL uses block-buffered stdout.  Every command response is
+     * complete at this boundary, including output printed by handlers and
+     * errors printed above, so make it visible before waiting for more input. */
+    fflush(stdout);
 
     /* Track timeit echoing so the prompt reflects current state. */
     repl->timeit = g_ray_profile.active;
@@ -1320,6 +1398,15 @@ int ray_repl_run_file(const char* path) {
 
     /* profile tree goes to stdout via profile_print; honour stdout's tty. */
     if (profiling) profile_print(color_out);
+    /* A whole file is one unit of work, and unlike the REPL there is no
+     * decay check after it — so stamp at the END, not the start.  A script
+     * that exits has nothing to give back; a script that starts a server
+     * and hands over to the poll loop leaves its load-time temporaries
+     * resident, and this is what lets the loop notice them.  Stamping at
+     * the start would instead arm a check that the script's own (.sys.gc)
+     * calls would service mid-run, which is the one thing the threshold
+     * exists to avoid. */
+    ray_heap_note_activity();
     ray_heap_gc();
     return rc;
 }

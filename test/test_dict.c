@@ -1174,8 +1174,8 @@ static test_result_t test_dict_find_idx_str_with_nulls(void) {
     TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), 2);
     ray_release(ka);
 
-    /* STR has no distinct null.  ray_vec_set_null above collapses slot 1 to
-     * the ordinary empty string, so lookup resolves by ordinary equality. */
+    /* STR's canonical null is empty.  Dictionary lookup still resolves that
+     * in-band key by ordinary equality. */
     ka = ray_str("", 0);
     TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), 1);
     ray_release(ka);

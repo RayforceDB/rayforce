@@ -257,10 +257,71 @@
 (sum (at Rheal 'px)) -- 7.5
 (at (at Rheal 's) 1) -- 'bb
 
+;; ════════════════════════════════════════════════════════════════
+;; 7. HAS_NULLS on a CONVERTED SYM column — the two csv.c store sites
+;;    of issue #416, one per conversion route.
+;;
+;; Empty cells in a SYM column are canonical nulls (bfb5b380: sym id 0,
+;; which domain.c reserves as the empty string at position 0 of every
+;; symfile).  An in-memory `.csv.read` and a store built from the SAME
+;; csv must therefore agree that those cells are null.  Two separate
+;; places used to drop the bit on the way to disk, and each one is
+;; reachable through exactly ONE route — so they need two fixtures:
+;;
+;;   csv_splayed_writer_append   -> `.csv.splayed` (streaming; only the
+;;     NON-SYM arm propagated HAS_NULLS, the SYM arm re-encodes cells as
+;;     domain positions and never set had_nulls).  Reverting that hunk
+;;     flips the splayed byte below 0x42 -> 0x02 and NOTHING else.
+;;
+;;   csv_materialize_rows        -> `.csv.parted` (the per-chunk table it
+;;     builds is what ray_splay_save persists per part; it carried the
+;;     pre-bfb5b380 rule and explicitly CLEARED HAS_NULLS for SYM/STR).
+;;     Reverting that hunk flips the parted byte 0x40 -> 0x00 and
+;;     NOTHING else.  The streaming writer does not depend on it,
+;;     because its SYM arm tests the position it WRITES rather than the
+;;     chunk vec's attrs.
+;;
+;; Both routes need an explicit all-SYMBOL schema: `.csv.splayed` falls
+;; back to a full in-memory read + ray_splay_save the moment any column
+;; resolves to RAY_STR, which is a third site (ray_col_save_sym_encoded,
+;; covered at C level by splay/has_nulls_roundtrip).
+;;
+;; The assertion reads the on-disk column header directly, because no
+;; language verb exposes attrs: byte 0x13 of the 32-byte header is
+;; `attrs` (aux[16] then mmod, order, type, attrs).  The low bits are the
+;; SYM width, so the whole byte is asserted and the widths are pinned
+;; too: 0x42 = HAS_NULLS|W32 (the streaming writer is fixed-W32),
+;; 0x40 = HAS_NULLS|W8 (ray_splay_save sizes to the part's domain,
+;; 3 symbols -> W8), 0x00 = neither.
+;;
+;; Fixture: 3 rows, both columns holding exactly one empty cell, split
+;; into 2-row parts so part 0 has the empties and part 1 has none —
+;; the negative case proves the bit is DERIVED, not stamped blindly.
+;;   a,b = ("", "x") / ("p", "") / ("q", "y")
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf rf_test_splayed_nullbit rf_test_splayed_nullpart") -- 0
+(.sys.exec "printf 'a,b\\n,x\\np,\\nq,y\\n' > rf_test_splayed_nullbit.csv") -- 0
+
+;; ── route 1: streaming .csv.splayed ──
+(count (.csv.splayed [a b] [SYMBOL SYMBOL] "rf_test_splayed_nullbit.csv" "rf_test_splayed_nullbit/")) -- 3
+(at (read-bytes "rf_test_splayed_nullbit/a") 19) -- 0x42
+(at (read-bytes "rf_test_splayed_nullbit/b") 19) -- 0x42
+;; and the reloaded column really does read those cells as null
+(count (select {from: (.db.splayed.get "rf_test_splayed_nullbit/") where: (== a "")})) -- 1
+
+;; ── route 2: .csv.parted (csv_materialize_rows -> per-part splay save) ──
+(count (.csv.parted [a b] [SYMBOL SYMBOL] "rf_test_splayed_nullbit.csv" 2 "rf_test_splayed_nullpart/" 'ct)) -- 3
+;; part 0 = rows ("","x") and ("p","") — one empty in each column
+(at (read-bytes "rf_test_splayed_nullpart/0/ct/a") 19) -- 0x40
+(at (read-bytes "rf_test_splayed_nullpart/0/ct/b") 19) -- 0x40
+;; part 1 = row ("q","y") — no empty anywhere, so no bit
+(at (read-bytes "rf_test_splayed_nullpart/1/ct/a") 19) -- 0x00
+(at (read-bytes "rf_test_splayed_nullpart/1/ct/b") 19) -- 0x00
+
 ;; ────────────── cleanup ──────────────
 ;; CSV files match the Makefile's `rf_test_*.csv` clean rule; splayed
 ;; dirs we created need explicit removal.
-(.sys.exec "rm -rf rf_test_splayed_basic rf_test_splayed_nulls rf_test_splayed_str rf_test_splayed_sym rf_test_splayed_torn rf_test_splayed_*.csv") -- 0
+(.sys.exec "rm -rf rf_test_splayed_basic rf_test_splayed_nulls rf_test_splayed_str rf_test_splayed_sym rf_test_splayed_torn rf_test_splayed_nullbit rf_test_splayed_nullpart rf_test_splayed_*.csv") -- 0
 
 ;; ────────────── reachability notes ──────────────
 ;; csv_splayed_writer_zero_nulls — only the count<=0 early-return is

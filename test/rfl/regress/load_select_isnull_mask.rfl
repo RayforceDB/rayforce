@@ -1,0 +1,51 @@
+;; Regression: load → select ISNULL WHERE-mask corruption.
+;;
+;; exec_elementwise_unary once had dedicated ISNULL kernels for only some
+;; input types; every other type fell through the typed morsel dispatch
+;; without writing a byte, so the BOOL result buffer came back as whatever
+;; the allocator recycled.  Trigger: a splayed table with a file .sym
+;; domain, queried after a `load` interned new symbols — the FILE-domain
+;; SYM column then bails from the fused expression path
+;; (EXPR_BAIL_SYM_DOMAIN) into the typed fallback, and
+;; `(select {where: (nil? sym)})` over 1000 rows returned 0, 539, 570 or
+;; 1000 rows depending only on the size of the previously loaded file.
+;;
+;; OP_ISNULL is now answered for every input type before the typed
+;; dispatch (expr.c exec_elementwise_unary); this file pins the original
+;; end-to-end symptom.
+
+(.sys.exec "rm -rf /tmp/rfl_isnull_mask") -- 0
+(.sys.exec "mkdir -p /tmp/rfl_isnull_mask") -- 0
+
+;; 1000-row table: SYM column cycling aa..dd (never null), I64 column with
+;; nulls at rows 0 and 999, F64 column with a null at row 500.
+(set SymM (at [aa bb cc dd] (% (til 1000) 4)))
+(set QtyM (concat (concat [0N] (+ 1 (til 998))) [0N]))
+(set PxM (as 'F64 (concat (concat (til 500) [0N]) (+ 501 (til 499)))))
+(set T-Mask (table [sym qty px] (list SymM QtyM PxM)))
+(.db.splayed.set "/tmp/rfl_isnull_mask/t" T-Mask "/tmp/rfl_isnull_mask/sym")
+
+;; Pad script: 60 `(set padN 1)` lines.  Loading it interns 60 symbols the
+;; file .sym domain doesn't have, reproducing the original trigger.
+(.sys.exec "awk 'BEGIN{for(i=1;i<=60;i++) printf \"(set pad%d 1)\\n\", i}' > /tmp/rfl_isnull_mask/pad.rfl") -- 0
+(load "/tmp/rfl_isnull_mask/pad.rfl")
+pad60 -- 1
+
+(set S-Mask (.db.splayed.get "/tmp/rfl_isnull_mask/t" "/tmp/rfl_isnull_mask/sym"))
+(count S-Mask) -- 1000
+
+;; SYM: no null syms, so the mask must be all-false — every row survives
+;; `not nil?` and none survives `nil?`.  Pre-fix this pair was the garbage
+;; readout (0 / 539 / 570 of 1000).
+(count (select {from: S-Mask where: (not (nil? sym))})) -- 1000
+(count (select {from: S-Mask where: (nil? sym)})) -- 0
+
+;; Sentinel nulls survive the round trip and drive the mask exactly.
+(count (select {from: S-Mask where: (nil? qty)})) -- 2
+(count (select {from: S-Mask where: (not (nil? qty))})) -- 998
+(count (select {from: S-Mask where: (nil? px)})) -- 1
+
+;; The WHERE mask agrees with per-element evaluation of the same predicate.
+(sum (map nil? (at S-Mask 'sym))) -- 0
+(sum (map nil? (at S-Mask 'qty))) -- 2
+(sum (map nil? (at S-Mask 'px))) -- 1

@@ -1582,7 +1582,6 @@ typedef struct {
  * hot loop avoids the ray_t pointer indirection. */
 static inline bool cdpg_is_null(const void* base, int64_t r,
                                 int8_t in_type, uint8_t esz) {
-    (void)esz;  /* width only mattered for the (now removed) SYM arm */
     switch (in_type) {
         case RAY_F64: { double f = ((const double*)base)[r]; return f != f; }
         case RAY_F32: { float  f = ((const float*) base)[r]; return f != f; }
@@ -1592,9 +1591,11 @@ static inline bool cdpg_is_null(const void* base, int64_t r,
             return ((const int32_t*)base)[r] == NULL_I32;
         case RAY_I16:
             return ((const int16_t*)base)[r] == NULL_I16;
-        /* SYM has no null — the empty sym (id 0) is a value, not null.  This
-         * helper is only reached behind a has_nulls guard (= src HAS_NULLS,
-         * never set on SYM), so an in_type==RAY_SYM call cannot occur. */
+        case RAY_SYM:
+            if (esz == 1) return ((const uint8_t*)base)[r] == 0;
+            if (esz == 2) return ((const uint16_t*)base)[r] == 0;
+            if (esz == 4) return ((const uint32_t*)base)[r] == 0;
+            return ((const int64_t*)base)[r] == 0;
         default:  /* BOOL / U8 — non-nullable */
             return false;
     }
@@ -2743,9 +2744,15 @@ ray_t* ray_mode_per_group_buf(ray_t* src,
  *
  * Output is a LIST of n_groups cells; cells are pre-allocated typed
  * vecs of the same element type as `src`, so workers can write into
- * cell data without locking.  Null rows are skipped (matches the
- * standalone topk_take_vec path which routes nulls-last for asc,
- * nulls-first for desc and gathers only the non-null prefix). */
+ * cell data without locking.
+ *
+ * Null rows are SKIPPED here, and that is a different policy from the
+ * standalone topk_take_vec, which orders by sort_nulls_first — a null is
+ * the smallest value — and so can return nulls in its result.  Over
+ * [3 0N 1 0N 2] the standalone (bot v 2) is [0N 0N] while the grouped
+ * one is [1 2].  Both are defensible: ordering treats a null as a value
+ * at one end, aggregation treats it as no value at all.  What is not
+ * defensible is claiming they agree, which this comment used to. */
 
 typedef struct {
     const void*    base;
@@ -4432,7 +4439,7 @@ static inline void accum_from_entry(char* row, const char* entry,
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
-                else { ROW_WR_I64(row, ly->off_sum, s) += v; }
+                else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
             }
             if (nf & GHT_NEED_MIN) {
                 int64_t* p = &ROW_WR_I64(row, ly->off_min, s);
@@ -4560,7 +4567,7 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                     }
                 } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
-                else { ROW_WR_I64(row, ly->off_sum, s) += v; }
+                else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
             }
             if (nf & GHT_NEED_MIN) {
                 int64_t* p = &ROW_WR_I64(row, ly->off_min, s);
@@ -5570,7 +5577,6 @@ typedef struct {
     int8_t*       key_types;
     uint8_t*      key_attrs;
     uint8_t*      key_esizes;
-    ray_t**       key_cols;       /* [n_keys] output key vecs (for null bit writes) */
     uint32_t      n_keys;         /* full width — a uint8 here wrapped 256 keys to 0 */
     agg_out_t*    agg_outs;
     uint32_t      n_aggs;
@@ -5618,12 +5624,26 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 int8_t kt = c->key_types[k];
                 size_t doff = (size_t)di * esz;
                 if (nullw[k >> 6] & ((int64_t)((uint64_t)1 << (k & 63)))) {
-                    if (c->key_cols && c->key_cols[k])
-                        grp_set_null(c->key_cols[k], di);
-                    /* Fill the correct-width sentinel. */
+                    /* Fill the correct-width canonical null.  EVERY key type
+                     * must land in an arm here: the destination element is
+                     * freshly allocated and NOT zeroed (ray_vec_new /
+                     * ray_sym_vec_new), so falling through would emit
+                     * uninitialized bytes as the group's key — for a SYM key
+                     * that stale word resolves through the source domain to an
+                     * arbitrary dictionary entry, i.e. a silent wrong answer
+                     * whose counts still look right.
+                     *
+                     * The payload is the whole job here.  HAS_NULLS is seeded
+                     * from the source column before the dispatch and
+                     * re-derived serially afterwards by grp_finalize_nulls, so
+                     * no worker stores into the shared attrs byte that every
+                     * other worker reads non-atomically through ray_data(). */
                     switch (kt) {
                         case RAY_F64: {
                             double v = NULL_F64; memcpy(dst + doff, &v, 8); break;
+                        }
+                        case RAY_F32: {
+                            float v = NULL_F32; memcpy(dst + doff, &v, 4); break;
                         }
                         case RAY_I64: case RAY_TIMESTAMP: {
                             int64_t v = NULL_I64; memcpy(dst + doff, &v, 8); break;
@@ -5634,8 +5654,18 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case RAY_I16: {
                             int16_t v = NULL_I16; memcpy(dst + doff, &v, 2); break;
                         }
-                        case RAY_STR: { memset(dst + doff, 0, sizeof(ray_str_t)); break; }
-                        default: break;
+                        default:
+                            /* SYM (domain position 0 == ""), STR (len 0) and
+                             * GUID (16 zero bytes) all encode their canonical
+                             * null as all-zero bytes at the column's element
+                             * width — the same payload
+                             * ray_vec_set_null_checked writes on the serial
+                             * emit path.  The HAS_NULLS bit these three need
+                             * (par_set_null does not write it for them) is
+                             * seeded from the source column BEFORE the
+                             * dispatch, so no worker touches attrs here. */
+                            memset(dst + doff, 0, esz);
+                            break;
                     }
                     continue;
                 }
@@ -5773,7 +5803,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                     switch (op) {
                         case OP_SUM:
                             v = ROW_RD_I64(row, ly->off_sum, s);
-                            if (ao->affine) v += ao->bias_i64 * cnt;
+                            if (ao->affine) v = wrap_add_i64(v, wrap_mul_i64(ao->bias_i64, cnt));
                             break;
                         case OP_PROD:
                             if (nn == 0) { v = int_null; grp_set_null(ao->vec, di); break; }
@@ -6714,7 +6744,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                     case OP_SUM:
                         v = sum_i64[idx];
                         if (affine && affine[a].enabled)
-                            v += affine[a].bias_i64 * counts[gi];
+                            v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, counts[gi]));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
@@ -7349,8 +7379,8 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     const int64_t* restrict data = (const int64_t*)c->agg_ptrs[0];
     int64_t sum = 0;
     for (int64_t r = start; r < end; r++)
-        sum += data[r];
-    acc->sum[0].i += sum;
+        sum = wrap_add_i64(sum, data[r]);
+    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
     acc->count[0] += end - start;
 }
 
@@ -7373,7 +7403,7 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
     const agg_linear_t* lin = &c->agg_linear[0];
     int64_t n = end - start;
 
-    int64_t sum = lin->bias_i64 * n;
+    int64_t sum = wrap_mul_i64(lin->bias_i64, n);
     /* n_terms is bounded by AGG_LINEAR_MAX_TERMS (8, internal.h) — an
      * unrelated fixed cap on linear-expression arity, not a GROUP n_keys/
      * n_aggs count, so it stays uint8_t. */
@@ -7384,11 +7414,11 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
         int8_t type = lin->term_types[t];
         int64_t term_sum = 0;
         for (int64_t r = start; r < end; r++)
-            term_sum += scalar_i64_at(ptr, type, r);
-        sum += coeff * term_sum;
+            term_sum = wrap_add_i64(term_sum, scalar_i64_at(ptr, type, r));
+        sum = wrap_add_i64(sum, wrap_mul_i64(coeff, term_sum));
     }
 
-    acc->sum[0].i += sum;
+    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
     acc->count[0] += n;
 }
 
@@ -7413,8 +7443,10 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             /* n_terms bounded by AGG_LINEAR_MAX_TERMS (8) — see the note in
              * scalar_sum_linear_i64_fn above; unrelated to n_keys/n_aggs. */
             for (uint8_t t = 0; t < lin->n_terms; t++) {
-                iv += lin->coeff_i64[t] *
-                      scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r);
+                iv = wrap_add_i64(
+                    iv,
+                    wrap_mul_i64(lin->coeff_i64[t],
+                                 scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r)));
             }
             fv = (double)iv;
         } else {
@@ -7447,7 +7479,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
                     if (nn) nn[a]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
-                acc->sum[a].i += iv;
+                acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
                 if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
                 if (nn) nn[a]++;
             }
@@ -7545,8 +7577,9 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i += group_strlen_at_cached(
-                    c->agg_cols[a], r, c->sym_strings, c->sym_count);
+                acc->sum[idx].i = wrap_add_i64(
+                    acc->sum[idx].i,
+                    group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count));
                 if (nn) nn[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
@@ -7561,7 +7594,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                 uint8_t v_attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
                 int64_t v = read_col_i64(c->agg_ptrs[a], r, c->agg_types[a], v_attrs);
                 if (RAY_LIKELY(!((inm >> a) & 1) || v != c->agg_int_null_sentinel[a])) {
-                    acc->sum[idx].i += v;
+                    acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, v);
                     if (nn) nn[idx]++;
                 }
             }
@@ -7912,7 +7945,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                     } else if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop))
                         merged->sum[idx].f += wa->sum[idx].f;
                     else
-                        merged->sum[idx].i += wa->sum[idx].i;
+                        merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                 }
             }
             if (c->need_flags & DA_NEED_MIN) {
@@ -10104,12 +10137,16 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
             for (uint32_t a = 0; a < n_aggs; a++) {                               \
                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
                 if (agg_strlen[a])                                               \
-                    sums[a].i += group_strlen_at_cached(                         \
-                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+                    sums[a].i = wrap_add_i64(                                    \
+                        sums[a].i,                                               \
+                        group_strlen_at_cached(                                  \
+                            agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
                 else if (agg_f64_mask & ((uint64_t)1 << a))                      \
                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row); \
                 else                                                             \
-                    sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0); \
+                    sums[a].i = wrap_add_i64(                                    \
+                        sums[a].i,                                               \
+                        read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0));     \
             }                                                                    \
         }                                                                        \
     } while (0)
@@ -10239,12 +10276,16 @@ dyn_dense_done:
         for (uint32_t a = 0; a < n_aggs; a++) {                                   \
             if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
             if (agg_strlen[a])                                                   \
-                sums[a].i += group_strlen_at_cached(                             \
-                    agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+                sums[a].i = wrap_add_i64(                                        \
+                    sums[a].i,                                                   \
+                    group_strlen_at_cached(                                      \
+                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
             else if (agg_f64_mask & ((uint64_t)1 << a))                          \
                 sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row);    \
             else                                                                 \
-                sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0);\
+                sums[a].i = wrap_add_i64(                                        \
+                    sums[a].i,                                                   \
+                    read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0));        \
         }                                                                        \
     } while (0)
                         if (match_idx) {
@@ -11215,7 +11256,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         if (group_fp_type(agg_types[a]))
                             m->sum[a].f += wa->sum[a].f;
                         else
-                            m->sum[a].i += wa->sum[a].i;
+                            m->sum[a].i = wrap_add_i64(m->sum[a].i, wa->sum[a].i);
                     }
                 }
             }
@@ -11884,7 +11925,7 @@ da_path:;
                                 uint16_t aop = ext->agg_ops[a];
                                 if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP || agg_is_binary_agg(aop)) {
                                     if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop)) merged->sum[idx].f += wa->sum[idx].f;
-                                    else merged->sum[idx].i += wa->sum[idx].i;
+                                    else merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                                 } else if (aop == OP_PROD) {
                                     /* Use per-(group, agg) non-null counts when
                                      * available so an all-null worker doesn't
@@ -12011,7 +12052,7 @@ da_path:;
                                      * for integer x-columns — merge as float. */
                                     merged->sum[idx].f += wa->sum[idx].f;
                                 else
-                                    merged->sum[idx].i += wa->sum[idx].i;
+                                    merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                             }
                         }
                     }
@@ -12367,14 +12408,17 @@ da_path:;
                                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                                     continue;
                                 if (agg_strlen[a])
-                                    sums[a].i += group_strlen_at_cached(
-                                        agg_vecs[a], r, strlen_sym_strings,
-                                        strlen_sym_count);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        group_strlen_at_cached(agg_vecs[a], r,
+                                                               strlen_sym_strings,
+                                                               strlen_sym_count));
                                 else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                                 else
-                                    sums[a].i += read_col_i64(agg_ptrs[a], r,
-                                                              agg_types[a], 0);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                             }
                         }
                     }
@@ -12475,14 +12519,17 @@ da_path:;
                                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                                     continue;
                                 if (agg_strlen[a])
-                                    sums[a].i += group_strlen_at_cached(
-                                        agg_vecs[a], r, strlen_sym_strings,
-                                        strlen_sym_count);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        group_strlen_at_cached(agg_vecs[a], r,
+                                                               strlen_sym_strings,
+                                                               strlen_sym_count));
                                 else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                                 else
-                                    sums[a].i += read_col_i64(agg_ptrs[a], r,
-                                                              agg_types[a], 0);
+                                    sums[a].i = wrap_add_i64(
+                                        sums[a].i,
+                                        read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                             }
                         }
                     }
@@ -12564,13 +12611,17 @@ da_path:;
                         if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                             continue;
                         if (agg_strlen[a])
-                            sums[a].i += group_strlen_at_cached(
-                                agg_vecs[a], r, strlen_sym_strings,
-                                strlen_sym_count);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                group_strlen_at_cached(agg_vecs[a], r,
+                                                       strlen_sym_strings,
+                                                       strlen_sym_count));
                         else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                         else
-                            sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                     }
                 }
             }
@@ -12705,13 +12756,17 @@ da_path:;
                         if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                             continue;
                         if (agg_strlen[a])
-                            sums[a].i += group_strlen_at_cached(
-                                agg_vecs[a], r, strlen_sym_strings,
-                                strlen_sym_count);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                group_strlen_at_cached(agg_vecs[a], r,
+                                                       strlen_sym_strings,
+                                                       strlen_sym_count));
                         else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
                         else
-                            sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
+                            sums[a].i = wrap_add_i64(
+                                sums[a].i,
+                                read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                     }
                 }
             }
@@ -13658,6 +13713,26 @@ v2_emit:;
                 new_col = ray_vec_new(src_col->type, (int64_t)total_grps);
             if (!new_col || RAY_IS_ERR(new_col)) continue;
             new_col->len = (int64_t)total_grps;
+            /* Seed HAS_NULLS from the source key column, exactly as the
+             * gather-based emit does (agg_gather_key_col).  radix_phase3_fn
+             * runs in parallel and par_set_null writes this bit for the
+             * sentinel types only, so setting it once here — serially,
+             * before the dispatch — keeps SYM/STR/GUID null keys flagged
+             * without a worker ever storing into a shared attrs byte that
+             * other workers read non-atomically via ray_data().
+             *
+             * Hop the slice parent, exactly as ray_key_may_be_null does: a
+             * SLICE carries no HAS_NULLS of its own, so reading src_col->attrs
+             * directly would set the null-mask bits (which that predicate
+             * gates) while leaving the emitted column unflagged.  Benign for
+             * SYM/STR (is_null reads the payload) and recoverable for the
+             * sentinel types (grp_finalize_nulls rescans), but GUID nullness
+             * rests SOLELY on this attr — its reader gates on HAS_NULLS before
+             * looking at the 16 zero bytes. */
+            const ray_t* null_src = (src_col->attrs & RAY_ATTR_SLICE)
+                                    ? src_col->slice_parent : src_col;
+            if (null_src && (null_src->attrs & RAY_ATTR_HAS_NULLS))
+                new_col->attrs |= RAY_ATTR_HAS_NULLS;
             key_cols[k] = new_col;
             key_dsts[k] = (char*)ray_data(new_col);
             key_out_types[k] = src_col->type;
@@ -13737,7 +13812,6 @@ v2_emit:;
                 .key_types    = key_out_types,
                 .key_attrs    = key_attrs,
                 .key_esizes   = key_esizes,
-                .key_cols     = key_cols,
                 .n_keys       = n_keys,
                 .agg_outs     = agg_outs,
                 .n_aggs       = n_aggs,
@@ -14482,7 +14556,8 @@ sequential_fallback:;
                 switch (agg_op) {
                     case OP_SUM:
                         v = ROW_RD_I64(row, ly->off_sum, s);
-                        if (agg_affine[a].enabled) v += agg_affine[a].bias_i64 * cnt;
+                        if (agg_affine[a].enabled)
+                            v = wrap_add_i64(v, wrap_mul_i64(agg_affine[a].bias_i64, cnt));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }

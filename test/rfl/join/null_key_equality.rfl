@@ -1,0 +1,95 @@
+;; null_key_equality.rfl -- a null equi-join key equals another null key.
+;;
+;; Regression: hash_row_keys handed every null-keyed row a private, row-derived
+;; hash and join_keys_eq returned false the moment either side was null, so a
+;; null key matched nothing -- not even a null sitting in the same cell of the
+;; same table.  Two consequences, both pinned below:
+;;
+;;   * `anti-join [cols] X X` was NON-EMPTY whenever a key column held a null.
+;;     Self-anti-join must be empty for every table and every key set; a service
+;;     using anti-join to find not-yet-seen tuples re-reported every null-keyed
+;;     tuple on every pass and grew without bound.
+;;   * left-join filled a null payload for a left row whose null key DID have a
+;;     match on the right, instead of returning that match.
+;;
+;; null == null is the rule the rest of the runtime already applies to key
+;; columns: `distinct` keeps exactly one null (test/rfl/null/distinct.rfl),
+;; group-by folds nulls into a single group, and `in`/atom_eq answer true for
+;; two nulls (collection.c).  As-of join is the ONE documented exception and is
+;; unchanged -- pinned at the bottom.
+
+;; ── The reported reproduction ─────────────────────────────────────────────
+;; A left-join miss produces a null V; anti-joining the result against ITSELF
+;; on V must still be empty.
+(set NKL (table [K] (list (as 'I32 [1 2 3]))))
+(set NKR (table [K V] (list (as 'I32 [1 2]) (as 'F64 [10.0 20.0]))))
+(set NKJ (left-join [K] NKL NKR))
+(count (select {from: NKJ where: (nil? V)})) -- 1
+(count (anti-join [V] NKJ NKJ)) -- 0
+(count (anti-join [K] NKJ NKJ)) -- 0
+
+;; ── Self-anti-join is empty for every key type that can carry a null ──────
+(set NKT (table [i f s u] (list [1 0N 3] (as 'F64 [1.0 0N 3.0]) (as 'SYM ["a" "" "c"]) (as 'STR ["a" "" "c"]))))
+(count (anti-join [i] NKT NKT))     -- 0
+(count (anti-join [f] NKT NKT))     -- 0
+(count (anti-join [s] NKT NKT))     -- 0
+(count (anti-join [u] NKT NKT))     -- 0
+(count (anti-join [i f] NKT NKT))   -- 0
+(count (anti-join [i f s u] NKT NKT)) -- 0
+
+;; ── A null key MATCHES a null key: it is not merely "kept" ────────────────
+(set NKA (table [s x] (list (as 'SYM ["a" "" "c"]) [1 2 3])))
+(set NKB (table [s y] (list (as 'SYM ["" "c"]) [20 30])))
+(at (left-join [s] NKA NKB) 'y)  -- [0Nl 20 30]
+(count (inner-join [s] NKA NKB)) -- 2
+(at (anti-join [s] NKA NKB) 'x)  -- [1]
+
+;; ── ...and a null still never equals a NON-null ───────────────────────────
+(set NKC (table [s z] (list (as 'SYM ["a" "b"]) [10 20])))
+(count (inner-join [s] NKA NKC)) -- 1
+(at (anti-join [s] NKA NKC) 'x)  -- [2 3]
+
+;; ── F64: the null is a NaN payload, so `!=` alone would reject it ─────────
+(set NKF (table [f n] (list (as 'F64 [1.0 0N 3.0]) [1 2 3])))
+(set NKG (table [f m] (list (as 'F64 [0N 3.0]) [200 300])))
+(at (left-join [f] NKF NKG) 'm) -- [0Nl 200 300]
+(count (anti-join [f] NKF NKG)) -- 1
+
+;; ── STR keys: the radix path specializes single STR keys onto raw
+;;    descriptors, the chained path goes through join_keys_eq.  Same answer.
+(set NKU (table [u x] (list (as 'STR ["a" "" "c"]) [1 2 3])))
+(set NKV (table [u y] (list (as 'STR ["" "c"]) [20 30])))
+(at (left-join [u] NKU NKV) 'y)  -- [0Nl 20 30]
+(at (anti-join [u] NKU NKV) 'x)  -- [1]
+
+;; ── Multi-key: a null in ONE key column does not swallow the other ────────
+(set NKM (table [a b w] (list (as 'SYM ["p" "p" ""]) [1 0N 1] [10 20 30])))
+(set NKN2 (table [a b] (list (as 'SYM ["p" ""]) [0N 1])))
+(at (anti-join [a b] NKM NKN2) 'w) -- [10]
+(count (anti-join [a b] NKM NKM))  -- 0
+
+;; ── The radix path (build side past RAY_PARALLEL_THRESHOLD = 65536) reaches
+;;    the same conclusion as the chained hash table used for small inputs.
+;;    NKBIG key k: row 0 null, row i (i>0) holds i-1; payload v holds 100+i.
+;;    Asserted on sums, not positions: the radix path consolidates per
+;;    partition, so left-row output order is not part of the contract here.
+(set NKN 70000)
+(set NKBIG (table [k v] (list (concat [0N] (til (- NKN 1))) (+ 100 (til NKN)))))
+(count NKBIG) -- 70000
+(set NKPROBE (table [k p] (list [0N 5 999999] [1 2 3])))
+(set NKLJ (left-join [k] NKPROBE NKBIG))
+(count NKLJ) -- 3
+;; 100 (the null key matched right row 0) + 106 (k=5 sits at right row 6)
+(sum (at NKLJ 'v)) -- 206
+(count (select {from: NKLJ where: (nil? v)})) -- 1
+(count (inner-join [k] NKPROBE NKBIG)) -- 2
+(at (anti-join [k] NKPROBE NKBIG) 'p)  -- [3]
+(count (anti-join [k] NKBIG NKBIG))    -- 0
+
+;; ── As-of join is the documented exception and is NOT changed.  Its merge
+;;    walk skips null-keyed right rows and lets null-keyed left rows fall
+;;    through to the left-outer null fill; it never routes through
+;;    join_keys_eq.  See docs/queries/joins.md, "Null-key semantics".
+(set NKAT (table [S Time Price] (list (as 'SYM ["" "b"]) [10:00:01.000 10:00:01.000] (as 'F64 [1.0 2.0]))))
+(set NKAQ (table [S Time Bid] (list (as 'SYM ["" "b"]) [10:00:00.000 10:00:00.000] (as 'F64 [99.0 88.0]))))
+(at (asof-join [S Time] NKAT NKAQ) 'Bid) -- (as 'F64 [0Nf 88.0])

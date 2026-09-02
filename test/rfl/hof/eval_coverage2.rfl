@@ -32,10 +32,10 @@
 (count (where (!= sv8 'y))) -- 2
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 3. SYM compare: empty-symbol atom (') is a value absent from the vec
+;; 3. SYM compare: canonical empty/null atom (') is absent from the vec
 ;;    Compare a SYM vec {a,b,c} against the empty symbol ' (sym id 0).
-;;    ' is a VALUE, not a null (SYM has no null); it matches no row →
-;;    == all-false, != all-true.  Hits the per-width compare loop.
+;;    Canonical null is compared as raw id 0; it matches no row here →
+;;    == all-false, != all-true. Hits the per-width compare loop.
 ;; ═══════════════════════════════════════════════════════════════════
 (set snull ')
 (set snv (as 'SYM ['a 'b 'c]))
@@ -45,19 +45,18 @@
 (sum (as 'I64 (!= snv snull))) -- 3
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 4. SYM compare: empty symbol in the vec is a value, not a null
+;; 4. SYM compare: canonical empty/null symbol in the vec
 ;;    Build a SYM vec containing the empty symbol ' and compare against
-;;    a specific sym atom.  The vec carries no nulls (SYM has no null);
-;;    the ' cell is just another value.
+;;    a specific sym atom. Equality still compares the in-band raw id.
 ;; ═══════════════════════════════════════════════════════════════════
-;; SYM vec [a ' a b] — the ' cell is the empty-symbol VALUE, not a null
+;; SYM vec [a ' a b] — the ' cell is canonical null (raw id 0)
 (set t_sym (table ['s] (list (as 'SYM ['a ' 'a 'b]))))
 (set col_s (at t_sym 's))
 ;; == 'a → [true, false, true, false] (the ' cell simply isn't 'a)
 (count (where (== col_s 'a))) -- 2
 (count (where (!= col_s 'a))) -- 2
-;; empty sym == empty sym atom → value equality (SYM has no null; ' is a value,
-;; mirroring STR "" == "").  The ' row equals the ' atom → 1 match.
+;; empty sym == empty sym atom → in-band id equality. The ' row equals the
+;; ' atom → 1 match.
 (sum (as 'I64 (== col_s '))) -- 1
 (sum (as 'I64 (!= col_s '))) -- 3
 

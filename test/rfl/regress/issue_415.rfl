@@ -1,0 +1,22 @@
+;; Issue #415 — empty STR/SYM are their canonical in-band null values.
+
+(nil? "") -- true
+(nil? ') -- true
+(nil? "present") -- false
+(nil? 'present) -- false
+
+(set I415S (as 'STR ["" "present"]))
+(nil? (at I415S 0)) -- true
+(nil? (at I415S 1)) -- false
+(set I415Y (as 'SYM [' 'present]))
+(nil? (at I415Y 0)) -- true
+(nil? (at I415Y 1)) -- false
+
+;; A left-join miss uses the same canonical empty/null representation.  A real
+;; matched empty value is intentionally indistinguishable under this model.
+(set I415R (table [k s] (list (list "a" "b") (list "" "present"))))
+(set I415J (left-join [k] (table [k] (list (list "a" "b" "missing"))) I415R))
+(nil? (at (at I415J 's) 0)) -- true
+(nil? (at (at I415J 's) 1)) -- false
+(nil? (at (at I415J 's) 2)) -- true
+(at (select {missing:(nil? s) from:I415J}) 'missing) -- [true false true]

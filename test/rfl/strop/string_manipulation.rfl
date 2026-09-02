@@ -212,7 +212,7 @@
 (set TLen (table [s] (list ["" "a" "abcdefg" "abcdefghijkl" "abcdefghijklm" "abcdefghijklmnopqrst" "aaaaabbbbbcccccdddddeeeeefffffggggghhhhh" "aaaaabbbbbcccccdddddeeeeefffffggggghhhhhiiii" "xy" "wxyz"])))
 (set RLen (at (select {r: (strlen s) from: TLen}) 'r))
 (count RLen) -- 10
-(at RLen 0) -- 0
+(at RLen 0) -- 0Nl
 (at RLen 1) -- 1
 (at RLen 2) -- 7
 (at RLen 3) -- 12
@@ -222,7 +222,7 @@
 (at RLen 7) -- 44
 (at RLen 8) -- 2
 (at RLen 9) -- 4
-(sum (== RLen [0 1 7 12 13 20 40 44 2 4])) -- 10
+(sum (== RLen [0 1 7 12 13 20 40 44 2 4])) -- 9
 (sum RLen) -- 143
 
 ;; ════════════════════════════════════════════════════════════════════
@@ -476,6 +476,6 @@
 (concat (concat "hello" " ") "world") -- "hello world"
 (strlen "abcdefghijkl") -- 12
 (strlen "abcdefghijklm") -- 13
-(strlen "") -- 0
+(strlen "") -- 0Nl
 (strlen 'abcdefghijkl) -- 12
 (strlen 'abcdefghijklm) -- 13

@@ -1224,6 +1224,30 @@ ray_t* ray_distinct_fn(ray_t* x) {
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
+    /* Parted columns store segment pointers where vector paths expect flat
+     * cells.  Flatten both operands before membership; distinct uses the same
+     * helper, while except/sect still reject parted input. */
+    ray_t* flat_val = NULL;
+    ray_t* flat_vec = NULL;
+    if (val && RAY_IS_PARTED(val->type)) {
+        flat_val = parted_to_flat_vec(val);
+        if (!flat_val || RAY_IS_ERR(flat_val)) return flat_val ? flat_val : ray_error("oom", NULL);
+        val = flat_val;
+    }
+    if (vec && RAY_IS_PARTED(vec->type)) {
+        flat_vec = parted_to_flat_vec(vec);
+        if (!flat_vec || RAY_IS_ERR(flat_vec)) {
+            if (flat_val) ray_release(flat_val);
+            return flat_vec ? flat_vec : ray_error("oom", NULL);
+        }
+        vec = flat_vec;
+    }
+    if (flat_val || flat_vec) {
+        ray_t* r = ray_in_fn(val, vec);
+        if (flat_val) ray_release(flat_val);
+        if (flat_vec) ray_release(flat_vec);
+        return r;
+    }
     /* STR in STR: for each char of val, check membership in vec string */
     if (ray_is_atom(val) && (-val->type) == RAY_STR && ray_is_atom(vec) && (-vec->type) == RAY_STR) {
         const char* vp = ray_str_ptr(val);
@@ -1629,7 +1653,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
      * floats up front: as_i64(f64) reads the bit pattern and would cause
      * e.g. (take 1.0 2.0) to attempt a 4.6-quintillion-element allocation
      * and surface as "oom" — misleading for what is really a type error. */
-    if (ray_is_atom(n_obj) && n_obj->type == -RAY_F64)
+    if (ray_is_atom(n_obj) && (n_obj->type == -RAY_F64 || n_obj->type == -RAY_F32))
         return ray_error("type", "take: count must be an integer, got %s", ray_type_name(n_obj->type));
     /* Range take: (take collection [start amount]) — slice from start for amount elements */
     if (ray_is_vec(n_obj) && n_obj->type == RAY_I64 && ray_len(n_obj) == 2) {
@@ -1662,8 +1686,9 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             if (start < 0) start = slen + start;
             if (start < 0) start = 0;
             if (start >= slen) return ray_str("", 0);
-            int64_t end = start + amount;
-            if (end > slen) end = slen;
+            /* amount can be up to INT64_MAX, so `start + amount` overflows;
+             * take min(amount, slen - start) instead (0 <= start < slen). */
+            int64_t end = (amount < slen - start) ? start + amount : slen;
             return ray_str(s + start, (size_t)(end - start));
         }
 
@@ -1680,8 +1705,9 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                     col_propagate_str_pool(empty, vec);
                 return empty;
             }
-            int64_t end = start + amount;
-            if (end > len) end = len;
+            /* Overflow-safe clamp: amount may be up to INT64_MAX, so avoid
+             * computing start+amount unless it is known to fit (0 <= start < len). */
+            int64_t end = (amount < len - start) ? start + amount : len;
             int64_t count = end - start;
             int8_t vtype = vec->type;
             int esz = ray_sym_elem_size(vtype, vec->attrs);
@@ -1716,8 +1742,9 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             int64_t len = keys ? keys->len : 0;
             if (start < 0) start = len + start;
             if (start < 0) start = 0;
-            int64_t end = start + amount;
-            if (end > len) end = len;
+            /* Overflow-safe clamp (amount up to INT64_MAX); keep the end<start
+             * guard because the dict branch does not early-return start>=len. */
+            int64_t end = (amount < len - start) ? start + amount : len;
             if (end < start) end = start;
             int64_t count = end - start;
 
@@ -1754,8 +1781,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                 result->len = 0;
                 return result;
             }
-            int64_t end = start + amount;
-            if (end > len) end = len;
+            int64_t end = (amount < len - start) ? start + amount : len;
             int64_t count = end - start;
             ray_t** elems = (ray_t**)ray_data(vec);
             ray_t* result = ray_alloc(count * sizeof(ray_t*));
@@ -1773,11 +1799,13 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         return ray_error("type", "take: range take unsupported for %s", ray_type_name(vec->type));
     }
     /* Every scalar-count branch below turns the count into a magnitude with
-     * `n < 0 ? -n : n`; `-INT64_MIN` is signed-overflow UB and |INT64_MIN| is
-     * unallocatable anyway, so reject an INT64_MIN count (also the i64 null
-     * sentinel) once here, up front, for all of them. */
-    if (ray_is_atom(n_obj) && is_numeric(n_obj) && as_i64(n_obj) == INT64_MIN)
-        return ray_error("range", "take: count magnitude out of range");
+     * `n < 0 ? -n : n`, and `-INT64_MIN` is signed-overflow UB.  INT64_MIN is
+     * also the i64 null sentinel (0N), so reject it once here as a type error
+     * — symmetric with drop and the window verbs — rather than letting a null
+     * count through.  Float counts are already rejected above, so is_numeric
+     * here only admits integer atoms (and implies ray_is_atom). */
+    if (is_numeric(n_obj) && as_i64(n_obj) == INT64_MIN)
+        return ray_error("type", "take: count is null or out of range");
     /* Char take: (take 'a' n) → string of n copies of char */
     if (ray_is_atom(vec) && vec->type == -RAY_STR && ray_str_len(vec) == 1 && ray_is_atom(n_obj) && is_numeric(n_obj)) {
         int64_t n = as_i64(n_obj);
@@ -2015,16 +2043,18 @@ ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj) {
         return ray_error("type", "drop: expected a collection, got %s", vec ? ray_type_name(vec->type) : "null");
 
     int64_t n = as_i64(n_obj);
+    /* INT64_MIN is the i64 null sentinel (0N) and `-INT64_MIN` is signed-
+     * overflow UB; reject it as a type error, symmetric with take, rather
+     * than silently dropping the whole collection. */
+    if (n == INT64_MIN)
+        return ray_error("type", "drop: count is null or out of range");
     int64_t start = 0;
     int64_t amount = len;
     if (n >= 0) {
         start = n < len ? n : len;
         amount = len - start;
     } else {
-        /* `-INT64_MIN` is signed-overflow UB; a drop-from-end of that
-         * magnitude removes the whole collection (|n| >= len), so treat it as
-         * cut == len (amount 0) rather than negating. */
-        int64_t cut = (n == INT64_MIN) ? len : -n;
+        int64_t cut = -n;   /* n != INT64_MIN here, so negation is safe */
         amount = cut < len ? len - cut : 0;
     }
     return collection_slice(vec, start, amount);

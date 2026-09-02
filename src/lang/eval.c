@@ -266,7 +266,7 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         double out = base + as_f64(c_expr) * (double)n;
         return make_f64(out);
     }
-    int64_t out = ce.sum_i + numeric_atom_i64(c_expr) * n;
+    int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(numeric_atom_i64(c_expr), n));
     return make_i64(out);
 }
 
@@ -610,7 +610,8 @@ static void strvec_cmp_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
 /* Pool worker for the R7/R8 SYM compare fast paths.  rd == NULL means the
  * right side is a scalar target id (R7); otherwise element-wise vec-vec
  * (R8), optionally translating left ids through a vocabulary LUT when the
- * domains differ.  SYM has no null: pure value compares. */
+ * domains differ.  Canonical SYM null is raw id 0, so the same value compare
+ * handles it without a separate bitmap. */
 typedef struct {
     const void* ld;
     const void* rd;         /* NULL for the vec-vs-atom shape */
@@ -906,9 +907,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
      * thrash dominates: `(!= URL nu)` standalone takes 113 ms when the
      * raw work is one i64 lookup + N width-truncated cmpneq.
      *
-     * Handles either operand order; output is RAY_BOOL.  SYM has no
-     * null (ray_vec_is_null / RAY_ATOM_IS_NULL are both false for SYM),
-     * so this is a pure value compare — no per-element null rules. */
+     * Handles either operand order; output is RAY_BOOL.  Canonical empty SYM
+     * uses id 0, so value comparison also preserves empty/null equality. */
     if (!force_boxed && (dag_opcode == OP_EQ || dag_opcode == OP_NE) &&
         out_type == RAY_BOOL) {
         int l_is_sym_vec = left_coll  && ray_is_vec(left)  && left->type  == RAY_SYM;
@@ -934,9 +934,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                  * atom carries a runtime id — re-express it in the
                  * column's domain once before the loops.  Runtime-domain
                  * columns keep the raw id (byte-identical fast path).
-                 * Literal absent from the domain ⇒ equals no cell (SYM has
-                 * no null, so there is no null row either): == all-false,
-                 * != all-true. */
+                 * Literal absent from the domain ⇒ equals no cell: ==
+                 * all-false, != all-true. */
                 int target_absent = 0;
                 struct ray_sym_domain_s* dom = ray_sym_vec_domain(vv);
                 if (dom != ray_sym_runtime_domain()) {
@@ -953,8 +952,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     bool fill = invert; /* != absent → true; == absent → false */
                     for (int64_t i = 0; i < n; i++) obuf[i] = fill;
                 } else {
-                    /* SYM has no null: the compare reduces to a tight
-                     * per-width raw-id loop, pool-parallel above the
+                    /* Canonical null is raw id 0, so the compare remains a
+                     * tight per-width raw-id loop, pool-parallel above the
                      * shared morsel threshold (symcmp_eq_fn). */
                     symcmp_ctx_t sctx = {
                         .ld = src, .rd = NULL, .lattrs = va, .rattrs = 0,
@@ -980,7 +979,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
      * compare raw cell ids width-aware.  Cross-domain pairs translate the
      * LEFT vocabulary into the RIGHT domain once — positions, not rows —
      * then compare in the right id space; an untranslatable left id
-     * matches nothing.  SYM has no null: pure value compare. */
+     * matches nothing.  Canonical null is raw id 0 and needs no side bitmap. */
     if (!force_boxed && (dag_opcode == OP_EQ || dag_opcode == OP_NE) &&
         out_type == RAY_BOOL &&
         left_coll && right_coll && ray_is_vec(left) && ray_is_vec(right) &&
@@ -1036,7 +1035,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
      * comparator) is precomputed once over the domain VOCABULARY — a rank
      * LUT for vec-vec (union-ranked across two domains so equal strings
      * rank equal), a three-way verdict LUT for vec-vs-atom — then the row
-     * loop is pure integer reads, pool-parallel.  SYM has no null. */
+     * loop is pure integer reads, pool-parallel; canonical null is id 0. */
     if (!force_boxed && out_type == RAY_BOOL &&
         (dag_opcode == OP_LT || dag_opcode == OP_LE ||
          dag_opcode == OP_GT || dag_opcode == OP_GE)) {
@@ -3408,6 +3407,10 @@ static void ray_register_builtins(void) {
      * src/app/repl_remote.c for the state model. */
     register_unary(".repl.connect",    RAY_FN_RESTRICTED, ray_repl_connect_fn);
     register_vary( ".repl.disconnect", RAY_FN_RESTRICTED, ray_repl_disconnect_fn);
+    /* Read-only namespace completion (issue #441): builtins + keywords +
+     * user bindings whose name begins with the given prefix.  RAY_FN_NONE
+     * so remote editor clients can query it over IPC. */
+    register_unary(".repl.complete",   RAY_FN_NONE,       ray_repl_complete_fn);
 
     /* Transaction-log journaling under `.log.*` — the -l/-L feature.
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at

@@ -52,8 +52,8 @@
 ;; --- regression: a literal `by:` symbol naming NO column must produce a
 ;; clean column-not-found error (domain) — the SAME as a bare `by: nonexistent`
 ;; — never a UBSan crash from ray_elem_size on a literal symbol.
-(select {n: (count price) from: Tlit by: 'nope}) !- domain
-(select {n: (count price) from: Tlit by: nope}) !- domain
+(select {n: (count price) from: Tlit by: 'nope}) !- schema
+(select {n: (count price) from: Tlit by: nope}) !- schema
 
 ;; --- AST-shape boundary: `(quote x)` is value-equivalent to the tick form
 ;; `'x` (both literal symbols), but the two are different AST SHAPES — `'x` is

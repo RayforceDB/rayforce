@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
     int interactive = 0;
     const char* file = NULL;
     uint16_t port = 0;
+    char bind_host[64] = "";   /* -p HOST:PORT bind address; empty = all interfaces */
     int n_cores = -1;      /* total execution cores; -1 = leave pool lazy */
     int timeit_init = 0;   /* -t N: enable profiler at startup */
     int qlog_init = 0;     /* -Q N: enable query-statistics logging at startup */
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
 
     /* Parse args. Supported flags:
      *   -f FILE          run script file
-     *   -p PORT          IPC listen port
+     *   -p PORT|HOST:PORT  IPC listen port, optionally bound to HOST
      *   -c N             total execution cores, main included (0 = auto)
      *   -t N             enable timeit at startup (N != 0 turns on)
      *   -Q N             enable query-statistics logging (N != 0 turns on)
@@ -103,8 +104,32 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0)
             interactive = 1;
-        else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc)
-            port = (uint16_t)atoi(argv[++i]);
+        else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc) {
+            /* PORT binds all interfaces; HOST:PORT confines the listener
+             * to one IPv4 address (#427).  Strict digits-only port — a
+             * silently truncated "65536x" listener is worse than exiting. */
+            const char* parg  = argv[++i];
+            const char* colon = strchr(parg, ':');
+            const char* pstr  = parg;
+            if (colon) {
+                size_t hlen = (size_t)(colon - parg);
+                if (hlen == 0 || hlen >= sizeof(bind_host)) {
+                    fprintf(stderr, "bad -p bind address: %s\n", parg);
+                    return 2;
+                }
+                memcpy(bind_host, parg, hlen);
+                bind_host[hlen] = '\0';
+                pstr = colon + 1;
+            }
+            char* endp;
+            errno = 0;
+            long pv = strtol(pstr, &endp, 10);
+            if (endp == pstr || *endp != '\0' || errno == ERANGE || pv <= 0 || pv > 65535) {
+                fprintf(stderr, "bad -p port (must be 1..65535): %s\n", parg);
+                return 2;
+            }
+            port = (uint16_t)pv;
+        }
         else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) && i + 1 < argc) {
             int v = atoi(argv[++i]);
             if (v < 0) v = 0;
@@ -151,7 +176,8 @@ int main(int argc, char** argv) {
                 "usage: %s [-f file] [-p port] [-c cores] [-t 0|1] [-i]"
                 " [-u PW | -U PW] [-l BASE | -L BASE] [-m SIZE] [file.rfl] [-- app args]\n"
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
-                "  -p, --port PORT     listen for IPC clients on PORT\n"
+                "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
+                "      --port HOST:PORT  bind the listener to HOST only (e.g. 127.0.0.1:7701)\n"
                 "  -c, --cores N       total execution cores, main included (0 = auto)\n"
                 "  -t, --timeit N      enable profiler at startup (N != 0)\n"
                 "  -i, --interactive   start the REPL even after running a file\n"
@@ -238,11 +264,12 @@ int main(int argc, char** argv) {
 
     /* Start IPC server if port specified */
     if (port > 0) {
-        if (poll && ray_ipc_listen(poll, port) >= 0)
-            fprintf(stderr, "listening on port %u\n", port);
+        const char* bh = bind_host[0] ? bind_host : NULL;
+        if (poll && ray_ipc_listen_at(poll, bh, port) >= 0)
+            fprintf(stderr, "listening on %s:%u\n", bh ? bh : "*", port);
         else
-            fprintf(stderr, "failed to listen on port %u: %s\n",
-                    port, strerror(errno));
+            fprintf(stderr, "failed to listen on %s:%u: %s\n",
+                    bh ? bh : "*", port, strerror(errno));
     }
 
     /* Load script if specified */

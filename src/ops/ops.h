@@ -379,6 +379,7 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 /* Op flags */
 #define OP_FLAG_PUSHED       0x01  /* filter interposed below a GROUP by predicate pushdown */
 #define OP_FLAG_DEAD         0x02
+#define OP_FLAG_INVALID_SCAN 0x04  /* query compiler emitted an unknown column */
 
 /* Sentinel node id for "no input".  Node id 0 is a valid node (the first
  * one allocated), so zero cannot mean "none" — use the max value.  All
@@ -390,7 +391,7 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 typedef struct ray_op {
     uint16_t       opcode;     /* OP_ADD, OP_SCAN, OP_FILTER, etc. */
     uint8_t        arity;      /* 0, 1, or 2 */
-    uint8_t        flags;      /* PUSHED, DEAD */
+    uint8_t        flags;      /* PUSHED, DEAD, INVALID_SCAN */
     int8_t         out_type;   /* inferred output type */
     uint8_t        pad[3];
     uint32_t       id;         /* unique node ID (== index into g->nodes) */
@@ -877,7 +878,9 @@ void ray_graph_dump(ray_graph_t* g, ray_op_t* root, void* out);
 
 /* Sort columns and return index array (I64 vector of sorted indices).
  * Uses parallel radix sort for numerics, merge sort for strings/symbols.
- * descs/nulls_first may be NULL (all-asc / nulls-last default). */
+ * descs/nulls_first may be NULL: all-ascending, and the placement each
+ * direction gets from sort_nulls_first — a null is the smallest value,
+ * so nulls lead ascending and trail descending. */
 ray_t* ray_sort_indices(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                         uint8_t n_cols, int64_t nrows);
 

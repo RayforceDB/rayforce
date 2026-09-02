@@ -26,6 +26,7 @@
 #endif
 
 #include "core/ipc.h"
+#include "mem/heap.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
 #include "store/journal.h"
@@ -975,6 +976,11 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
             send_response((ray_sock_t)cur->fd, result);
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
+    /* The request is served: this is the end of the server's unit of work,
+     * and stamping here is what lets the poll loop tell an idle server from
+     * one between two requests.  Stamping on frame arrival instead would
+     * make the measured gap the request's own duration. */
+    ray_heap_note_activity();
 
     return NULL;
 }
@@ -1012,12 +1018,12 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
     ray_sock_close((ray_sock_t)sel->fd);
 }
 
-int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port)
+int64_t ray_ipc_listen_at(ray_poll_t* poll, const char* host, uint16_t port)
 {
     if (!poll) return -1;
     ipc_install_oob_cancel();   /* enable client Ctrl-C → SIGURG query cancel */
 
-    ray_sock_t fd = ray_sock_listen(port);
+    ray_sock_t fd = ray_sock_listen_at(host, port);
     if (fd == RAY_INVALID_SOCK) return -1;
     ray_sock_set_nonblocking(fd);
 
@@ -1033,6 +1039,11 @@ int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port)
         return -1;
     }
     return id;
+}
+
+int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port)
+{
+    return ray_ipc_listen_at(poll, NULL, port);
 }
 
 /* ======================================================================
@@ -1141,6 +1152,11 @@ static void conn_on_payload(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
     if (c->hdr.msgtype == RAY_IPC_MSG_SYNC)
         send_response(c->fd, result);
     if (result != RAY_NULL_OBJ) ray_release(result);
+    /* The request is served: this is the end of the server's unit of work,
+     * and stamping here is what lets the poll loop tell an idle server from
+     * one between two requests.  Stamping on frame arrival instead would
+     * make the measured gap the request's own duration. */
+    ray_heap_note_activity();
 
     ray_sys_free(c->rx_buf);
     c->rx_buf  = NULL;
@@ -1213,10 +1229,10 @@ static void conn_on_readable(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
     }
 }
 
-ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port)
+ray_err_t ray_ipc_server_init_at(ray_ipc_server_t* srv, const char* host, uint16_t port)
 {
     memset(srv, 0, sizeof(*srv));
-    srv->listen_fd = ray_sock_listen(port);
+    srv->listen_fd = ray_sock_listen_at(host, port);
     if (srv->listen_fd == RAY_INVALID_SOCK) return RAY_ERR_IO;
     ray_sock_set_nonblocking(srv->listen_fd);
 
@@ -1243,6 +1259,11 @@ ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port)
 
     srv->running = true;
     return RAY_OK;
+}
+
+ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port)
+{
+    return ray_ipc_server_init_at(srv, NULL, port);
 }
 
 void ray_ipc_server_destroy(ray_ipc_server_t* srv)

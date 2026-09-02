@@ -24,6 +24,7 @@
 #include "col.h"
 #include "core/platform.h"
 #include "mem/heap.h"
+#include "mem/sys.h"   /* ray_sys_alloc — the shared-mapping descriptor */
 #include "store/serde.h"
 #include "store/fileio.h"
 #include "table/sym.h"
@@ -589,6 +590,11 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
             ray_release(col);  /* table_add_col retains */
             if (!tbl || RAY_IS_ERR(tbl)) return tbl;
         }
+        ray_t* shape_err = ray_table_validate_rectangular(tbl, "col load table");
+        if (shape_err) {
+            ray_release(tbl);
+            return shape_err;
+        }
         return tbl;
     }
 
@@ -916,6 +922,12 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             memset(&pool_header, 0, sizeof(pool_header));
             if (vec->str_pool && !RAY_IS_ERR(vec->str_pool)) {
                 memcpy(&pool_header, vec->str_pool, 32);
+                /* aux is runtime-only state and one of its arms is a live
+                 * heap pointer — the shared-mapping descriptor a mapped pool
+                 * carries.  Only bytes 16-31 were being scrubbed, so that
+                 * address went to disk verbatim and survived into the next
+                 * generation of the file. */
+                memset(pool_header.aux, 0, 16);
             }
             pool_header.mmod = 0;
             pool_header.order = 0;
@@ -1080,7 +1092,15 @@ ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
         /* Same-domain saves preserve positions, hence order; re-encoding
          * from another domain reorders ids — drop SORTED then. */
         uint8_t keep_sorted = (src == target) ? (vec->attrs & RAY_ATTR_SORTED) : 0;
-        header.attrs = (uint8_t)(w | keep_sorted);
+        /* attrs is REBUILT here rather than inherited, because the width bits
+         * change with the target domain's size.  Every other persisted bit has
+         * to be carried across explicitly: HAS_NULLS is one, and forgetting it
+         * silently dropped canonical sym-0 nulls on every splayed SYM column
+         * (issue #416) — an all-empty SYM column round-tripped as attrs 0.
+         * Re-encoding cannot change WHETHER a null is present: position 0 of
+         * any domain is the empty symbol, so a sym-0 cell stays sym-0. */
+        header.attrs = (uint8_t)(w | keep_sorted |
+                                 (vec->attrs & RAY_ATTR_HAS_NULLS));
         memset(header.aux, 0, 16); /* domain ptr is runtime-only state;
                                     * aux reserved (postponed index), never
                                     * the version (lives in `order` above). */
@@ -1611,11 +1631,41 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
 
     if (vec->type == RAY_STR) {
         ray_t* pool = (ray_t*)((char*)cm.mapped + cm.str_pool_offset);
-        pool->mmod = 2;
         pool->order = 0;
         /* Untrusted disk attrs — mask, see COL_DISK_ATTRS_MASK. */
         pool->attrs &= COL_DISK_ATTRS_MASK;
         ray_atomic_store(&pool->rc, 1);
+
+        /* The column and its pool are one mapping, and a gathered result
+         * shares the pool by reference — so the region must outlive
+         * whichever of them is freed first.  The pool owns it; the column
+         * holds an ordinary reference to the pool and unmaps nothing.
+         * Without this the column's free took the pool's bytes with it and
+         * every selection over a mapped string column read freed memory. */
+        /* Two references: one for the pool, one for the column.  The column
+         * needs its own because its pool pointer is not permanent —
+         * str_pool_cow swaps in a heap copy before mutating a mapped
+         * column, and that release must not be the one that unmaps the
+         * region the column is standing in.  Until such a swap the column
+         * reaches the descriptor through the pool, so nothing is
+         * registered here; str_pool_cow registers the column when it takes
+         * that path away. */
+        ray_file_map_t* m = (ray_file_map_t*)ray_sys_alloc(sizeof(*m));
+        if (!m) {
+            ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+            return ray_error("oom", NULL);
+        }
+        m->base = cm.mapped;
+        m->len  = cm.mapped_size;
+        m->rc   = 2;
+        m->next = NULL;
+        /* Two references: one for the pool, one for the column.  The
+         * column needs its own because its pool pointer is not permanent
+         * — str_pool_cow swaps in a heap copy before mutating a mapped
+         * column, and that release must not be the one that unmaps the
+         * region the column is standing in. */
+        pool->mmod = 3;
+        pool->file_map = m;
         vec->str_pool = pool;
     }
 

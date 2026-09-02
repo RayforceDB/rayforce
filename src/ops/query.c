@@ -623,6 +623,12 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t atom_n = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
             ray_release(tv);
+            /* INT64_MIN is the i64 null sentinel (0N); negating it below is
+             * signed-overflow UB.  Reject it up front, matching ray_take_fn. */
+            if (atom_n == INT64_MIN) {
+                ray_release(result);
+                return ray_error("type", "select: take: count is null or out of range");
+            }
 
             int64_t nrows = (result->type == RAY_TABLE)
                           ? ray_table_nrows(result)
@@ -737,8 +743,8 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                             ray_t* sort_col = ray_table_get_col(result, key_syms[0]);
                             if (sort_col) {
                                 topk = ray_topk_table(result, sort_col,
-                                    key_descs[0], key_descs[0]
-                                    /*nf=desc by default*/, k);
+                                    key_descs[0],
+                                    sort_nulls_first(key_descs[0]), k);
                             }
                         } else {
                             ray_t* key_cols[TOPK_MAX_KEYS];
@@ -746,7 +752,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                             int ok = 1;
                             for (uint32_t i = 0; i < n_keys; i++) {
                                 key_cols[i] = ray_table_get_col(result, key_syms[i]);
-                                nfs[i] = key_descs[i];
+                                nfs[i] = sort_nulls_first(key_descs[i]);
                                 if (!key_cols[i]) { ok = 0; break; }
                             }
                             if (ok) {
@@ -862,6 +868,11 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
         int64_t nrows = (sorted->type == RAY_TABLE)
                       ? ray_table_nrows(sorted)
                       : (ray_is_vec(sorted) ? sorted->len : 0);
+        /* INT64_MIN (0N) negated below is signed-overflow UB — reject it. */
+        if (atom_n == INT64_MIN) {
+            ray_release(sorted);
+            return ray_error("type", "select: take: count is null or out of range");
+        }
         int64_t start, amount;
         if (atom_n >= 0) {
             start  = 0;
@@ -1113,9 +1124,31 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
         }
-        /* Unknown name — let ray_scan produce a column-not-found
-         * error at exec time, matching prior behavior. */
-        return ray_scan(g, ray_str_ptr(s));
+        /* Unknown name — retain an explicit invalid-scan marker.  Optimizer
+         * shortcuts may make the scan dead (count/max/projection paths), but
+         * execution must still reject the original column reference. */
+        ray_op_t* missing = ray_scan(g, ray_str_ptr(s));
+        /* `_dist` is exempt, but only where it can legitimately appear: a
+         * rerank produces it during execution, so it is absent from the
+         * operand table at compile time.  Exempting it unconditionally let
+         * every symptom of an unknown column back in for that one name —
+         * a projection under `_dist` shifted the labels left, and an
+         * aggregate over it answered its neutral element — in queries with
+         * no nearest: clause at all. */
+        int64_t dist_sym = ray_sym_find("_dist", 5);
+        bool exempt = false;
+        if (missing && expr->i64 == dist_sym) {
+            for (uint32_t i = 0; i < g->node_count && !exempt; i++)
+                if (g->nodes[i].opcode == OP_ANN_RERANK ||
+                    g->nodes[i].opcode == OP_KNN_RERANK)
+                    exempt = true;
+        }
+        if (missing && !exempt) {
+            missing->flags |= OP_FLAG_INVALID_SCAN;
+            ray_op_ext_t* ext = find_ext(g, missing->id);
+            if (ext) ext->base.flags |= OP_FLAG_INVALID_SCAN;
+        }
+        return missing;
     }
 
     /* Symbol literal (ATTR_QUOTED set; name refs handled above).  Inside a
@@ -5859,8 +5892,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                 }
             }
             /* Sort keys: only verify the column exists.  Nulls are now
-             * handled by the null-aware leg in fpk_cmp (NULLS LAST for
-             * ASC, NULLS FIRST for DESC, matching sort.c's default).
+             * handled by the null-aware leg in fpk_cmp, which takes its
+             * placement from sort_nulls_first like every other sort path:
+             * a null is the smallest value, so first for ASC, last for DESC.
              * Output columns are also handled — the fused materialiser
              * propagates null bitmaps via ray_vec_set_null. */
             if (!bad_clause) {
@@ -9919,6 +9953,13 @@ by_dict_done:
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
         if (ray_is_atom(tv) && (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
             int64_t n_take = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
+            /* INT64_MIN (0N) negated for a tail pushdown is signed-overflow UB;
+             * reject it before it reaches ray_tail / the TAIL kernel. */
+            if (n_take == INT64_MIN) {
+                ray_release(tv);
+                ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return ray_error("type", "select: take: count is null or out of range");
+            }
             if (group_take_push) {
                 take_pre.kind = TAKE_PRE_ATOM;
                 take_pre.a = n_take;
@@ -10127,8 +10168,16 @@ by_dict_done:
                 int j = 0;
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
+                    /* Every clause keyword has to be skipped here, not just
+                     * most of them: this walk is positional, so a keyword it
+                     * fails to skip consumes an output slot and every name
+                     * after it lands on the wrong column.  nearest: was
+                     * missing, and it is counted out where the outputs are
+                     * counted, so a query naming it before its outputs
+                     * labelled them one position early. */
                     if (kid == from_id || kid == where_id || kid == by_id ||
-                        kid == take_id || kid == asc_id || kid == desc_id) continue;
+                        kid == take_id || kid == asc_id || kid == desc_id ||
+                        kid == nearest_id) continue;
                     if (n_key_cols + j < ncols)
                         ray_table_set_col_name(result, n_key_cols + j, kid);
                     j++;
@@ -11360,6 +11409,16 @@ static int8_t typeless_col_type(ray_t* payload) {
     return RAY_I64;
 }
 
+/* HAS_NULLS for a payload that may be a slice: slices carry the flag on
+ * their parent.  Over-approximation is harmless (the flag is a fast-path
+ * gate; sentinels in the payload are the source of truth). */
+static bool payload_may_have_nulls(const ray_t* v) {
+    if (v->attrs & RAY_ATTR_HAS_NULLS) return true;
+    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent)
+        return (v->slice_parent->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    return false;
+}
+
 /* Helper: convert a Rayfall list of atoms into a typed column vector by
  * appending to an existing column (for insert/upsert). */
 static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
@@ -11675,8 +11734,16 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     char* src = (char*)ray_data(full_col);
                     char* dst = (char*)ray_data(sub_col);
                     int64_t* idxs = (int64_t*)ray_data(idx_vec);
-                    for (int64_t r = 0; r < gsize; r++)
+                    bool copied_null = false;
+                    for (int64_t r = 0; r < gsize; r++) {
                         memcpy(dst + r * esz, src + idxs[r] * esz, esz);
+                        copied_null |= ray_vec_is_null(full_col, idxs[r]);
+                    }
+                    /* Raw payload gathers do not carry vector metadata.  The
+                     * aggregate kernels use HAS_NULLS as their fast-path gate,
+                     * so preserve it when any gathered row is null. */
+                    if (copied_null)
+                        sub_col->attrs |= RAY_ATTR_HAS_NULLS;
                     sub_tbl = ray_table_add_col(sub_tbl, cn, sub_col);
                     ray_release(sub_col);
                     if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
@@ -13895,6 +13962,187 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
     ray_t** row_elems = (ray_t**)ray_data(row);
     int64_t nrows = ray_table_nrows(tbl);
 
+    /* ---- In-place append fast path (#455) -------------------------------
+     * The rebuild below copies every existing row on every call, which
+     * makes a named-table ingest O(rows present) per insert — quadratic
+     * over a feed's lifetime.  When the binding is the sole owner of the
+     * table and no column needs adoption or boxing, append the batch into
+     * the existing columns instead: ray_vec_append grows in place (the
+     * buddy allocator extends the block when the space is there), so the
+     * cost is O(rows appended), amortized — the same profile as the
+     * vector path.  Any gate miss falls through to the rebuild, which
+     * keeps its copy semantics.
+     *
+     * On a mid-batch failure the appended lengths are rolled back, so the
+     * table keeps its pre-insert value; unlike the rebuild, already-grown
+     * capacity and dropped accelerator indexes are not restored. */
+    bool inplace_ok = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
+                      !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    ray_t* live_cols = NULL;
+    if (inplace_ok) {
+        live_cols = ((ray_t**)ray_data(tbl))[1];
+        if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols)
+            inplace_ok = false;
+    }
+    for (int64_t c = 0; inplace_ok && c < ncols; c++) {
+        ray_t* col = ((ray_t**)ray_data(live_cols))[c];
+        /* col->rc != 1: a shared column would be COW'd inside the append,
+         * and ray_cow releases the slot's reference — on a mid-append OOM
+         * the slot would dangle.  Sharing also means someone is looking at
+         * the pre-insert value, which is what the rebuild is for. */
+        if (!col || RAY_IS_ERR(col) || col->rc != 1 ||
+            /* An EMPTY LIST column is typeless — the rebuild adopts a
+             * concrete type from the first payload.  A non-empty LIST
+             * column is genuinely boxed and appends like any other:
+             * pointer cells, each retained by ray_list_append. */
+            (col->type == RAY_LIST && ray_len(col) == 0) ||
+            RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+            col->mmod != 0 ||
+            (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) {
+            inplace_ok = false;
+            break;
+        }
+        /* The rebuild normalizes SYM columns to W64 runtime-domain ids;
+         * appending into a narrow or store-domain column would not. */
+        if (col->type == RAY_SYM &&
+            ((col->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+             col->sym_domain != ray_sym_runtime_domain())) {
+            inplace_ok = false;
+            break;
+        }
+    }
+    if (inplace_ok) {
+        ray_t** slots = (ray_t**)ray_data(live_cols);
+        ray_t* err = NULL;
+        for (int64_t c = 0; c < ncols && !err; c++) {
+            ray_t* col = slots[c];
+            ray_t* pay = row_elems[c];
+            int8_t ct = col->type;
+            ray_t* res;
+            if (ct == RAY_LIST) {
+                /* Boxed column: a table payload supplies a LIST whose cells
+                 * are rows and is spliced; any other row shape boxes its
+                 * payload (or a NULL slot) as one cell — the same contract
+                 * as append_boxed_table_col, minus the copy. */
+                if (tbl_row_list) {
+                    if (!pay || RAY_IS_ERR(pay) || pay->type != RAY_LIST) {
+                        res = ray_error("type", "insert: table payload for a LIST column must be LIST");
+                    } else {
+                        ray_t** cells = (ray_t**)ray_data(pay);
+                        int64_t m = pay->len;
+                        res = col;
+                        for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                            res = ray_list_append(res, cells[k]);
+                            if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                        }
+                    }
+                } else {
+                    res = ray_list_append(col, pay);
+                }
+            } else if (!pay) {
+                ray_t* null_atom = ray_typed_null(-ct);
+                res = append_atom_to_col(col, null_atom);
+                ray_release(null_atom);
+            } else if (ray_is_atom(pay)) {
+                res = append_atom_to_col(col, pay);
+            } else if (pay->type == ct && ct == RAY_STR) {
+                bool pay_nulls = payload_may_have_nulls(pay);
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    int64_t at = res->len;
+                    if (pay_nulls && ray_vec_is_null(pay, k)) {
+                        res = ray_str_vec_append(res, "", 0);
+                        if (!RAY_IS_ERR(res)) ray_vec_set_null(res, at, true);
+                    } else {
+                        size_t slen = 0;
+                        const char* sp = ray_str_vec_get(pay, k, &slen);
+                        res = ray_str_vec_append(res, sp ? sp : "", sp ? slen : 0);
+                    }
+                    if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                }
+            } else if (pay->type == ct && ct == RAY_SYM &&
+                       ((pay->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+                        pay->sym_domain != ray_sym_runtime_domain())) {
+                /* Narrow or store-domain SYM payload: translate per cell. */
+                bool pay_nulls = payload_may_have_nulls(pay);
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    int64_t sym_val = sym_cell_runtime_id(pay, k);
+                    int64_t at = res->len;
+                    res = ray_vec_append(res, &sym_val);
+                    if (!RAY_IS_ERR(res)) {
+                        slots[c] = res;
+                        col = res;
+                        if (pay_nulls && ray_vec_is_null(pay, k))
+                            ray_vec_set_null(res, at, true);
+                    }
+                }
+            } else if (pay->type == ct) {
+                /* Same-typed fixed-width vector (SYM already W64 runtime
+                 * here, so ids are verbatim): one reserve, one memcpy.
+                 * Raw cells carry their null sentinels; propagate the
+                 * flag with them. */
+                res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
+                if (!RAY_IS_ERR(res) && payload_may_have_nulls(pay))
+                    res->attrs |= RAY_ATTR_HAS_NULLS;
+            } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
+                /* Differently-typed vector or generic list: coerce cell by
+                 * cell, exactly like the rebuild does. */
+                res = col;
+                int64_t m = ray_len(pay);
+                for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
+                    int alloc = 0;
+                    ray_t* e = collection_elem(pay, k, &alloc);
+                    if (!e) {
+                        ray_t* na = ray_typed_null(-ct);
+                        res = append_atom_to_col(res, na);
+                        ray_release(na);
+                    } else {
+                        res = append_atom_to_col(res, e);
+                        if (alloc) ray_release(e);
+                    }
+                    if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
+                }
+            } else {
+                res = append_atom_to_col(col, pay);
+            }
+            if (RAY_IS_ERR(res)) err = res;
+            else slots[c] = res;
+        }
+        if (err) {
+            /* Roll the lengths back so the binding keeps its pre-insert
+             * value.  The append helpers leave the passed vector alive on
+             * failure, so every slot pointer is still valid.  Boxed cells
+             * were retained on append — release them before truncating. */
+            for (int64_t c = 0; c < ncols; c++) {
+                ray_t* col = slots[c];
+                if (col->type == RAY_LIST) {
+                    ray_t** cells = (ray_t**)ray_data(col);
+                    for (int64_t k = nrows; k < col->len; k++)
+                        if (cells[k]) ray_release(cells[k]);
+                }
+                col->len = nrows;
+            }
+        }
+        if (dict_vals) {
+            ray_t** dv = (ray_t**)ray_data(dict_vals);
+            for (int64_t c = 0; c < ncols; c++) if (dv[c]) ray_release(dv[c]);
+            dict_vals->len = 0;
+            ray_free(dict_vals);
+        }
+        if (tbl_row_list) {
+            ray_t** trl = (ray_t**)ray_data(tbl_row_list);
+            for (int64_t c = 0; c < ncols; c++) if (trl[c]) ray_release(trl[c]);
+            tbl_row_list->len = 0;
+            ray_free(tbl_row_list);
+        }
+        ray_release(tbl);
+        ray_release(row_orig);
+        return err ? err : ray_sym(inplace_sym);
+    }
+
     ray_t* result = ray_table_new(ncols);
     if (RAY_IS_ERR(result)) return result;
 
@@ -15102,6 +15350,30 @@ static void wj_scan_fn(void* ctx_, uint32_t worker_id, int64_t start, int64_t en
  *
  * The legacy asof fall-through ((window-join L R [keys] time)) is mode-agnostic.
  */
+static int8_t join_i64_eq_key_type(ray_t* col) {
+    if (!col) return 0;
+    int8_t t = col->type;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return t;
+}
+
+static bool join_i64_eq_key_supported(int8_t t) {
+    switch (t) {
+    case RAY_BOOL:
+    case RAY_U8:
+    case RAY_I16:
+    case RAY_I32:
+    case RAY_I64:
+    case RAY_DATE:
+    case RAY_TIME:
+    case RAY_TIMESTAMP:
+    case RAY_SYM:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
     if (n < 4) return ray_error("domain", "window-join: expects keys, intervals, left and right tables, got %lld args", (long long)n);
 
@@ -15172,20 +15444,17 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
                 return ray_error("domain", "window-join: equality key column not found in both tables");
             }
-            /* STR equality-key columns are silently mismatched: window-join
-             * sorts and probes eq cells through read_col_i64, which has no
-             * RAY_STR case (it reads one raw byte per row), so once there are
-             * enough distinct keys the byte collisions cross-contaminate
-             * groups and the aggregates are WRONG.  Decline both sides — the
-             * base equi-join has a STR-aware kernel, these window kernels do
-             * not. */
-            int8_t lct = left_eq[e]->type, rct = right_eq[e]->type;
-            if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
-            if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
-            if (lct == RAY_STR || rct == RAY_STR) {
+            /* Equality keys in the window kernels are sorted/probed through
+             * read_col_i64. Decline any type that reader cannot represent
+             * instead of silently comparing the wrong bytes. */
+            int8_t lct = join_i64_eq_key_type(left_eq[e]);
+            int8_t rct = join_i64_eq_key_type(right_eq[e]);
+            if (!join_i64_eq_key_supported(lct) ||
+                !join_i64_eq_key_supported(rct)) {
                 scratch_free(eq_hdr);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
-                return ray_error("nyi", "window-join: string equality key columns are not supported");
+                return ray_error("nyi", "window-join: equality key column types %s and %s are not supported",
+                                 ray_type_name(lct), ray_type_name(rct));
             }
         }
 
@@ -15749,15 +16018,15 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: equality key column not found"); }
         ray_t* lcol = ray_table_get_col(left_tbl, eq_elems[i]->i64);
         ray_t* rcol = ray_table_get_col(right_tbl, eq_elems[i]->i64);
-        int8_t lct = lcol ? lcol->type : (int8_t)0;
-        int8_t rct = rcol ? rcol->type : (int8_t)0;
-        if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
-        if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
-        if (lct == RAY_STR || rct == RAY_STR) {
+        int8_t lct = join_i64_eq_key_type(lcol);
+        int8_t rct = join_i64_eq_key_type(rcol);
+        if (!join_i64_eq_key_supported(lct) ||
+            !join_i64_eq_key_supported(rct)) {
             scratch_free(eqops_hdr);
             ray_graph_free(g);
             if (_bxeq) ray_release(_bxeq);
-            return ray_error("nyi", "window-join: string equality key columns are not supported");
+            return ray_error("nyi", "window-join: equality key column types %s and %s are not supported",
+                             ray_type_name(lct), ray_type_name(rct));
         }
     }
 
@@ -15869,22 +16138,19 @@ static ray_t* ray_asof_join_core(ray_t* keys_vec, ray_t* left_tbl, ray_t* right_
         if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: unknown equality key symbol"); }
         eq_ops[i] = ray_scan(g, ray_str_ptr(nm));
         if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: equality key column not found"); }
-        /* STR equality-key columns are silently mismatched: the asof kernel
-         * reads eq cells through read_col_i64 (asof_eq_lread), which has no
-         * RAY_STR case, so string keys compare as raw bytes and yield WRONG
-         * results (a key that should match can null out).  The base equi-join
-         * has a separate STR-aware kernel; asof does not, so decline both
-         * sides rather than return corrupt data. */
+        /* The asof kernel reads equality keys through read_col_i64
+         * (asof_eq_lread). Decline types it cannot represent instead of
+         * returning silently corrupted matches. */
         ray_t* lcol = ray_table_get_col(left_tbl, eq_syms[i]->i64);
         ray_t* rcol = ray_table_get_col(right_tbl, eq_syms[i]->i64);
-        int8_t lct = lcol ? lcol->type : (int8_t)0;
-        int8_t rct = rcol ? rcol->type : (int8_t)0;
-        if (RAY_IS_PARTED(lct)) lct = (int8_t)RAY_PARTED_BASETYPE(lct);
-        if (RAY_IS_PARTED(rct)) rct = (int8_t)RAY_PARTED_BASETYPE(rct);
-        if (lct == RAY_STR || rct == RAY_STR) {
+        int8_t lct = join_i64_eq_key_type(lcol);
+        int8_t rct = join_i64_eq_key_type(rcol);
+        if (!join_i64_eq_key_supported(lct) ||
+            !join_i64_eq_key_supported(rct)) {
             scratch_free(eqops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
-            return ray_error("nyi", "asof-join: string equality key columns are not supported");
+            return ray_error("nyi", "asof-join: equality key column types %s and %s are not supported",
+                             ray_type_name(lct), ray_type_name(rct));
         }
     }
 

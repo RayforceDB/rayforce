@@ -28,7 +28,9 @@
 #include "vec/embedding.h"
 #include "table/sym.h"
 #include "core/platform.h"
+#include "store/serde.h"
 #include <string.h>
+#include <math.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -983,12 +985,13 @@ static test_result_t test_str_vec_null_insert_compact(void) {
     ray_err_t err = ray_vec_set_null_checked(sv, 0, true);
     TEST_ASSERT_EQ_I(err, RAY_ERR_TYPE);  /* slice → error */
     ray_release(sv);
-    /* On the real vec, SYM is rejected (use U8 vec test) */
+    /* On the real vec, SYM writes its canonical id-0 null. */
     ray_t* sym_v = ray_sym_vec_new(RAY_SYM_W64, 2);
     uint64_t sid = 1;
     sym_v = ray_vec_append(sym_v, &sid);
     ray_err_t sym_err = ray_vec_set_null_checked(sym_v, 0, true);
-    TEST_ASSERT_EQ_I(sym_err, RAY_ERR_TYPE);
+    TEST_ASSERT_EQ_I(sym_err, RAY_OK);
+    TEST_ASSERT_TRUE(ray_vec_is_null(sym_v, 0));
     ray_release(sym_v);
 
     /* insert_at: insert at end */
@@ -1167,11 +1170,11 @@ static test_result_t test_vec_sym_is_null_path(void) {
     w32 = ray_vec_append(w32, &id32);
     w64 = ray_vec_append(w64, &id64);
 
-    /* SYM never null via public API */
-    TEST_ASSERT_FALSE(ray_vec_is_null(w8,  0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(w16, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(w32, 0));
-    TEST_ASSERT_FALSE(ray_vec_is_null(w64, 0));
+    /* Every adaptive width recognizes id 0 as canonical null. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(w8,  0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(w16, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(w32, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(w64, 0));
 
     ray_release(w8); ray_release(w16); ray_release(w32); ray_release(w64);
     ray_sym_destroy();
@@ -1692,8 +1695,8 @@ static test_result_t test_vec_concat_str_null(void) {
     ray_t* a = ray_vec_new(RAY_STR, 2);
     a = ray_str_vec_append(a, "x", 1);
     a = ray_str_vec_append(a, "yy", 2);
-    ray_vec_set_null(a, 0, true);  /* STR: set_null -> "" */
-    TEST_ASSERT_FALSE(ray_vec_is_null(a, 0));
+    ray_vec_set_null(a, 0, true);  /* STR: set_null -> canonical "" */
+    TEST_ASSERT_TRUE(ray_vec_is_null(a, 0));
 
     ray_t* b = ray_vec_new(RAY_STR, 1);
     b = ray_str_vec_append(b, "zzz", 3);
@@ -1703,9 +1706,9 @@ static test_result_t test_vec_concat_str_null(void) {
     TEST_ASSERT_NOT_NULL(c);
     TEST_ASSERT_FALSE(RAY_IS_ERR(c));
     TEST_ASSERT_EQ_I(c->len, 3);
-    TEST_ASSERT_FALSE(ray_vec_is_null(c, 0));  /* a[0] -> "" (STR no-null) */
+    TEST_ASSERT_TRUE(ray_vec_is_null(c, 0));   /* a[0] -> canonical null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 1));  /* a[1]=yy */
-    TEST_ASSERT_FALSE(ray_vec_is_null(c, 2));  /* b[0] -> "" (STR no-null) */
+    TEST_ASSERT_TRUE(ray_vec_is_null(c, 2));   /* b[0] -> canonical null */
 
     ray_release(a);
     ray_release(b);
@@ -1893,8 +1896,8 @@ static test_result_t test_str_vec_compact_paths(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
 
     /* set element 1 null (STR is nullable). */
-    ray_vec_set_null(v, 1, true);  /* STR: set_null -> "" */
-    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
+    ray_vec_set_null(v, 1, true);  /* STR: set_null -> canonical "" */
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
 
     /* compact reclaims dead bytes; null + inline elements are skipped. */
     v = ray_str_vec_compact(v);
@@ -1906,8 +1909,8 @@ static test_result_t test_str_vec_compact_paths(void) {
     const char* s2 = ray_str_vec_get(v, 2, &l);
     TEST_ASSERT_EQ_I((int64_t)l, 32);
     TEST_ASSERT_MEM_EQ(32, s2, "pooled_gamma_string_three_here!!");
-    /* element 1 is "" after compact (STR no-null). */
-    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
+    /* element 1 remains the canonical empty/null after compact. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
 
     /* compact with no dead bytes is a no-op early return (line 1182). */
     ray_t* same = ray_str_vec_compact(v);
@@ -2149,6 +2152,76 @@ static test_result_t test_vec_from_raw_sym(void) {
     PASS();
 }
 
+/* ---- from_raw: sentinel nulls in raw input must set HAS_NULLS ---------- */
+
+static test_result_t test_vec_from_raw_sentinel_nulls(void) {
+    /* #445: a binding passing INT64_MIN through from_raw got a vector whose
+     * payload held the null sentinel while HAS_NULLS stayed clear, so
+     * ray_vec_is_null (gated on the attr for numeric types) denied the null
+     * and it rendered as -9223372036854775808 — including after an IPC
+     * round trip.  Construction must scan the raw payload. */
+    int64_t iv[] = { 1, NULL_I64, 3 };
+    ray_t* v = ray_vec_from_raw(RAY_I64, iv, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+
+    /* Serialize/deserialize keeps both the flag and the null. */
+    ray_t* wire = ray_ser(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(wire));
+    ray_t* back = ray_de(wire);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(back, 1));
+    ray_release(back);
+    ray_release(wire);
+    ray_release(v);
+
+    /* F64: any NaN bit pattern is the sentinel. */
+    double fv[] = { 1.5, (double)NAN, 3.5 };
+    ray_t* f = ray_vec_from_raw(RAY_F64, fv, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(f));
+    TEST_ASSERT_TRUE(f->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(f, 1));
+    ray_t* fwire = ray_ser(f);
+    ray_t* fback = ray_de(fwire);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fback));
+    TEST_ASSERT_TRUE(ray_vec_is_null(fback, 1));
+    ray_release(fback);
+    ray_release(fwire);
+    ray_release(f);
+
+    /* I32/DATE width, I16, and GUID all-zero sentinel. */
+    int32_t dv[] = { 100, NULL_I32 };
+    ray_t* d = ray_vec_from_raw(RAY_DATE, dv, 2);
+    TEST_ASSERT_TRUE(d->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(d, 1));
+    ray_release(d);
+
+    int16_t sv[] = { 7, NULL_I16 };
+    ray_t* s = ray_vec_from_raw(RAY_I16, sv, 2);
+    TEST_ASSERT_TRUE(s->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(s, 1));
+    ray_release(s);
+
+    uint8_t gv[32];
+    memset(gv, 0xAB, 16);
+    memset(gv + 16, 0, 16);
+    ray_t* g = ray_vec_from_raw(RAY_GUID, gv, 2);
+    TEST_ASSERT_TRUE(g->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_FALSE(ray_vec_is_null(g, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(g, 1));
+    ray_release(g);
+
+    /* Clean input must NOT pick up the flag. */
+    int64_t cv[] = { 1, 2, 3 };
+    ray_t* c = ray_vec_from_raw(RAY_I64, cv, 3);
+    TEST_ASSERT_FALSE(c->attrs & RAY_ATTR_HAS_NULLS);
+    ray_release(c);
+    PASS();
+}
+
 /* ---- slice: NULL/error passthrough + zero-length ----------------------- */
 
 static test_result_t test_vec_slice_guards(void) {
@@ -2246,8 +2319,8 @@ const test_entry_t vec_entries[] = {
     { "vec/insert_many_atom", test_vec_insert_many_atom, vec_setup, vec_teardown },
     { "vec/insert_many_guards", test_vec_insert_many_guards, vec_setup, vec_teardown },
     { "vec/from_raw_sym", test_vec_from_raw_sym, vec_setup, vec_teardown },
+    { "vec/from_raw_sentinel_nulls", test_vec_from_raw_sentinel_nulls, vec_setup, vec_teardown },
     { "vec/slice_guards", test_vec_slice_guards, vec_setup, vec_teardown },
     { NULL, NULL, NULL, NULL },
 };
-
 

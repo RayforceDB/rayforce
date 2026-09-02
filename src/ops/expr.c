@@ -549,7 +549,7 @@ bool     ray_expr_disable; /* test knob: force the fallback path */
 static void expr_stats_dump(void) {
     static const char* names[EXPR_BAIL__N] = {
         "root-shape", "graph-size", "depth", "regs", "ins",
-        "mapcommon", "str", "nulls", "slice", "sym-domain",
+        "mapcommon", "str", "guid", "nulls", "slice", "sym-domain",
         "const", "null-shape", "other",
     };
     fprintf(stderr, "expr_compile ok=%llu\n",
@@ -686,7 +686,27 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 ray_t* col = ray_table_get_col(tbl, ext->sym);
                 if (!col) EXPR_BAIL(EXPR_BAIL_OTHER);
                 if (col->type == RAY_MAPCOMMON) EXPR_BAIL(EXPR_BAIL_MAPCOMMON);
-                if (col->type == RAY_STR) EXPR_BAIL(EXPR_BAIL_STR); /* RAY_STR needs string comparison path */
+                /* Bail on the ELEMENT type: a parted wrapper carries
+                 * RAY_PARTED_BASE + base and would sail past checks on
+                 * col->type — a parted GUID column then zero-filled
+                 * every lane and matched everything. */
+                int8_t elem = RAY_IS_PARTED(col->type)
+                            ? (int8_t)RAY_PARTED_BASETYPE(col->type)
+                            : col->type;
+                if (elem == RAY_STR) EXPR_BAIL(EXPR_BAIL_STR); /* RAY_STR needs string comparison path */
+                /* GUID cells are 16-byte blobs the fused program has no
+                 * loads or compares for — without this bail the compiled
+                 * expression read garbage and predicates silently
+                 * matched nothing.  The unfused executor compares GUIDs
+                 * correctly. */
+                if (elem == RAY_GUID) EXPR_BAIL(EXPR_BAIL_GUID);
+                /* Whitelist of element types expr_load_i64/f64 decode.
+                 * Anything else (RAY_LIST from a legacy STRL splayed
+                 * load, nested columns, future types) hits the loaders'
+                 * default arm, which zero-fills the lane buffer. */
+                if (!((elem >= RAY_BOOL && elem <= RAY_TIMESTAMP) ||
+                      elem == RAY_SYM))
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
                 if (col->attrs & RAY_ATTR_SLICE)     EXPR_BAIL(EXPR_BAIL_SLICE);
                 /* Length-1 columns used as scalar broadcasts are handled by the
                  * fallback's exec_elementwise_binary (which has vec/scalar routing).
@@ -2441,6 +2461,22 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (!result || RAY_IS_ERR(result)) return result;
     result->len = len;
 
+    /* ISNULL is defined for every vector type, including the canonical
+     * empty/null STR and width-adaptive SYM representations.  Handle it
+     * before numeric opcode dispatch so unsupported input types cannot leave
+     * the BOOL result buffer unwritten. */
+    if (op->opcode == OP_ISNULL) {
+        uint8_t* dst = (uint8_t*)ray_data(result);
+        if (input->type != RAY_STR && input->type != RAY_SYM &&
+            !vec_may_have_nulls(input)) {
+            memset(dst, 0, (size_t)len);
+        } else {
+            for (int64_t i = 0; i < len; i++)
+                dst[i] = ray_vec_is_null(input, i) ? 1 : 0;
+        }
+        return result;
+    }
+
     /* Hoist in_type, out_type, and opcode dispatch entirely outside the
      * morsel loop so each inner loop is a tight, single-type kernel.
      * This allows autovectorisation and eliminates per-element branch predict slots. */
@@ -2663,17 +2699,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             out_off += n;
         }
     } else if (in_type == RAY_I64 && out_type == RAY_BOOL) {
-        if (opc == OP_ISNULL) {
-            /* ISNULL over a non-null vec: always false here; the
-             * null-propagation pass at the end of the function sets
-             * dst[i]=1 for null rows of the input. */
-            while (ray_morsel_next(&m)) {
-                int64_t n = m.morsel_len;
-                uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
-                for (int64_t i = 0; i < n; i++) dst[i] = 0;
-                out_off += n;
-            }
-        } else if (opc == OP_CAST) {
+        if (opc == OP_CAST) {
             /* (as 'BOOL i64_col) — truthy semantics; NULL_I64 = INT64_MIN
              * sentinel is non-zero but logically missing, so skip it. */
             while (ray_morsel_next(&m)) {
@@ -2818,18 +2844,10 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         }
     }
 
-    /* Propagate null bitmap from input to result.
-     * ISNULL is special: set output to 1 for null elements. */
-    if (vec_may_have_nulls(input)) {
-        if (op->opcode == OP_ISNULL) {
-            for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(input, i))
-                    ((uint8_t*)ray_data(result))[i] = 1;
-            }
-        } else {
-            propagate_nulls(input, result, len);
-        }
-    }
+    /* Propagate null bitmap from input to result.  OP_ISNULL never reaches
+     * here — it is handled and returned before the typed dispatch above. */
+    if (vec_may_have_nulls(input))
+        propagate_nulls(input, result, len);
 
     /* OP_NEG/OP_ABS over i64: |INT64_MIN| and -INT64_MIN don't fit — surface
      * as typed null (by convention).  Loop above used unsigned wrap, so
@@ -3553,6 +3571,61 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             binary_range_str(op, lhs, rhs, result, l_scalar, r_scalar, 0, len);
             fix_null_comparisons(lhs, rhs, result, l_scalar, r_scalar, len, op->opcode);
             return result;
+        }
+    }
+
+    /* GUID comparison: 16-byte cells, memcmp equality.  Without this
+     * branch a guid predicate fell into the numeric loops, which read
+     * the cells at the wrong width and silently matched nothing.  Only
+     * == and != are defined for guid operands here (cmp.c orders guid
+     * ATOMS, but a ranged guid predicate over a column has no use). */
+    {
+        bool l_guid = (l_scalar ? (lhs->type == -RAY_GUID || lhs->type == RAY_GUID)
+                                : lhs->type == RAY_GUID);
+        bool r_guid = (r_scalar ? (rhs->type == -RAY_GUID || rhs->type == RAY_GUID)
+                                : rhs->type == RAY_GUID);
+        if (l_guid || r_guid) {
+            uint16_t opc = op->opcode;
+            if (!l_guid || !r_guid) {
+                ray_release(result);
+                return ray_error("type", "expr eval: cannot compare %s and %s",
+                                 ray_type_name(lhs->type), ray_type_name(rhs->type));
+            }
+            if (opc != OP_EQ && opc != OP_NE) {
+                ray_release(result);
+                return ray_error("type", "expr eval: guid operands support only == and !=");
+            }
+            uint8_t* out = (uint8_t*)ray_data(result);
+            const uint8_t* lb = (lhs->type == -RAY_GUID)
+                              ? (const uint8_t*)ray_data(lhs->obj)
+                              : (const uint8_t*)ray_data(lhs);
+            const uint8_t* rb = (rhs->type == -RAY_GUID)
+                              ? (const uint8_t*)ray_data(rhs->obj)
+                              : (const uint8_t*)ray_data(rhs);
+            for (int64_t i = 0; i < len; i++) {
+                const uint8_t* lp = lb + (l_scalar ? 0 : i * 16);
+                const uint8_t* rp = rb + (r_scalar ? 0 : i * 16);
+                uint8_t eq = (memcmp(lp, rp, 16) == 0) ? 1 : 0;
+                out[i] = (opc == OP_EQ) ? eq : (uint8_t)!eq;
+            }
+            return result;
+        }
+    }
+
+    /* Gate vector operands on the types the numeric loops can read.
+     * Anything else (RAY_LIST from a legacy STRL splayed load, nested
+     * shapes, future types) previously fell into read_col_* default
+     * arms, which read the cells at the wrong width and silently
+     * mismatched every row. */
+    {
+        bool l_ok = l_scalar || (lhs->type >= RAY_BOOL && lhs->type <= RAY_TIMESTAMP)
+                             || RAY_IS_SYM(lhs->type);
+        bool r_ok = r_scalar || (rhs->type >= RAY_BOOL && rhs->type <= RAY_TIMESTAMP)
+                             || RAY_IS_SYM(rhs->type);
+        if (!l_ok || !r_ok) {
+            ray_release(result);
+            return ray_error("type", "expr eval: unsupported column type in binary op, got %s and %s",
+                             ray_type_name(lhs->type), ray_type_name(rhs->type));
         }
     }
 

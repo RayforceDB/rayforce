@@ -1,16 +1,15 @@
-;; SYM has no null — the empty symbol ' (sym 0) is a value, mirroring STR "".
-;; Parity: empty STR and empty SYM behave identically (no null).
-(nil? ')                       -- false
-(nil? "")                      -- false
-;; the empty symbol round-trips through a SYM vector as a value, not null
+;; Empty SYM ' and empty STR "" are their canonical in-band null values.
+(nil? ')                       -- true
+(nil? "")                      -- true
+;; the empty symbol round-trips through a SYM vector as canonical null
 (== ' (at (as 'SYM [' a]) 0)) -- true
-(nil? (at (as 'SYM [' a]) 0)) -- false
-;; FIRST of an all-empty-symbol group is the empty symbol, not null
+(nil? (at (as 'SYM [' a]) 0)) -- true
+;; FIRST of an all-empty-symbol group is canonical null
 (set Te (table [k v] (list (as 'SYM [' ']) [1 2])))
-(nil? (at (at (select {f: (first k) by: v from: Te}) 'f) 0)) -- false
-;; an empty-symbol vector carries no nulls
+(nil? (at (at (select {f: (first k) by: v from: Te}) 'f) 0)) -- true
+;; empty-symbol vector cells are detected as null
 (set sv (as 'SYM [a ' c]))
-(nil? (at sv 1))               -- false
+(nil? (at sv 1))               -- true
 ;; ── Task 2 surface: the empty symbol renders as ' (not 0Ns) ──
 ;; format interpolation of the empty symbol prints the bare quote literal
 (format "%" ')                 -- "'"
@@ -18,15 +17,13 @@
 (== ' (eval (parse "'")))      -- true
 ;; 0Ns is no longer a literal — it parses as `0 Ns`; eval raises (undefined name)
 (== 'caught (try (eval (parse "0Ns")) (fn [e] 'caught))) -- true
-;; ── Task 4: empty-symbol count-distinct parity (no-null hardening) ──
-;; Under the old null-skipping behavior, count(distinct [a ' a ' b]) would
-;; give 2 (empty sym skipped as null).  With no-null it must give 3.
+;; Empty/null remains a distinct and groupable key, matching other typed nulls.
 (set Tcd (table [s] (list (as 'SYM ['a ' 'a ' 'b]))))
-;; distinct count: {a, ', b} = 3 distinct values (not 2)
+;; distinct count: {a, ', b} = 3 distinct values
 (count (distinct (at Tcd 's)))                                         -- 3
 ;; group-by produces 3 groups (one per distinct key)
 (count (select {c: (count s) by: s from: Tcd}))                       -- 3
-;; STR parity: empty STR "" and empty SYM ' are both values → same distinct count
+;; STR parity: canonical empty STR/SYM nulls give the same distinct count
 (count (distinct (list "a" "" "a" "" "b")))                           -- 3
 ;; explicitly assert STR and SYM give the same answer
 (== (count (distinct (at Tcd 's))) (count (distinct (list "a" "" "a" "" "b")))) -- true

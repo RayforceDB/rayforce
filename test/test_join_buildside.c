@@ -928,6 +928,61 @@ static test_result_t test_jb_trip_boundary(void) {
     return rr;
 }
 
+/* ── Null-run upfront fallback (#458) ──────────────────────────────────────
+ * Every null key cell hashes to one canonical value, so >RADIX_DUP_RUN_MAX
+ * build-side nulls used to START the radix build and then discard it on the
+ * dup-run abort.  Now the null count routes the join to the chained path
+ * upfront: the null-fallback counter advances, the dup-abort counter does
+ * NOT (nothing was built and thrown away), and the answer still matches the
+ * forced-chained oracle — nulls pairing with nulls included.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_null_run_upfront_fallback(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+
+    /* Build side: low per-key duplication (~35/key, below the dup trip) plus
+     * 600 nulls — above RADIX_DUP_RUN_MAX, so only the null gate can fire.
+     * Probe side: a couple of nulls to exercise null==null output. */
+    for (int64_t i = 0; i < n_r; i++) rv[i] = (i % 100 == 0 && i < 60000) ? NULL_I64 : i % 2000;
+    for (int64_t i = 0; i < n_l; i++) lv[i] = (i == 7 || i == 4001 - 2000) ? NULL_I64 : i % 2000;
+
+    ray_join_no_build_swap = true;                            /* build = right */
+
+    uint64_t null_before = ray_join_null_fallbacks;
+    uint64_t dup_before  = ray_join_dup_fallbacks;
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff_dup(lt, "lk", rt, "rk", /*join_type=*/0, /*expect_trip=*/false);
+    if (rr.status == TEST_PASS && ray_join_null_fallbacks == null_before)
+        rr = (test_result_t){ TEST_FAIL, "expected the null-run upfront fallback to fire" };
+    if (rr.status == TEST_PASS && ray_join_dup_fallbacks != dup_before)
+        rr = (test_result_t){ TEST_FAIL, "dup-run abort fired — radix work was built and discarded" };
+    ray_release(lt); ray_release(rt);
+
+    /* Few nulls (< RADIX_DUP_RUN_MAX): the gate must NOT fire. */
+    if (rr.status == TEST_PASS) {
+        for (int64_t i = 0; i < n_r; i++) rv[i] = (i < 100) ? NULL_I64 : i % 2000;
+        uint64_t nb2 = ray_join_null_fallbacks;
+        ray_t* rt2 = jb_table1("rk", rv, n_r);
+        ray_t* lt2 = jb_table1("lk", lv, n_l);
+        rr = jb_diff_dup(lt2, "lk", rt2, "rk", /*join_type=*/0, /*expect_trip=*/false);
+        if (rr.status == TEST_PASS && ray_join_null_fallbacks != nb2)
+            rr = (test_result_t){ TEST_FAIL, "null gate fired below its threshold" };
+        ray_release(lt2); ray_release(rt2);
+    }
+
+    ray_join_no_build_swap = false;                           /* reset */
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
 /* ── Not sticky ────────────────────────────────────────────────────────────
  * The pathological flag is per-join (reset each exec_join), not a sticky
  * global.  Run a tripping join then a non-tripping join in the SAME heap
@@ -1037,5 +1092,6 @@ const test_entry_t join_buildside_entries[] = {
     { "join_buildside/trip_boundary", test_jb_trip_boundary, NULL, NULL },
     { "join_buildside/not_sticky", test_jb_not_sticky, NULL, NULL },
     { "join_buildside/mixed_type_radix", test_jb_mixed_type_radix, NULL, NULL },
+    { "join_buildside/null_run_upfront_fallback", test_jb_null_run_upfront_fallback, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

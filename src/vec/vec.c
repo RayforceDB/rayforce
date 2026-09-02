@@ -68,8 +68,8 @@ static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
             return ((const int32_t*)p)[idx] == NULL_I32;
         case RAY_I16:
             return ((const int16_t*)p)[idx] == NULL_I16;
-        /* SYM has no null (sym id 0 is the empty value, not null) —
-         * no arm here; ray_vec_is_null short-circuits SYM before this switch. */
+        /* SYM uses id 0 as its canonical in-band null.  Width-aware handling
+         * lives in ray_vec_is_null, so there is no arm here. */
         case RAY_STR:
             return ((const ray_str_t*)p)[idx].len == 0;
         case RAY_GUID: {
@@ -282,8 +282,72 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     /* Append element */
     char* dst = (char*)ray_data(vec) + vec->len * esz;
     memcpy(dst, elem, esz);
+    if (vec->type == RAY_SYM &&
+        ray_read_sym(elem, 0, RAY_SYM, vec->attrs) == 0)
+        vec->attrs |= RAY_ATTR_HAS_NULLS;
     vec->len++;
 
+    return vec;
+
+fail:
+    if (vec != original) ray_release(vec);
+    return ray_error("oom", NULL);
+}
+
+/* --------------------------------------------------------------------------
+ * ray_vec_append_raw
+ *
+ * Append `count` raw elements with one capacity reserve and one memcpy.
+ * Same contract as ray_vec_append (COW when shared, index drop, amortized
+ * power-of-two growth, original left alive on failure), minus the
+ * per-element call overhead — this is the batch-ingest primitive.
+ *
+ * The raw cells are copied verbatim, sentinels included; the caller
+ * propagates RAY_ATTR_HAS_NULLS from the source when it can carry nulls
+ * (for RAY_SYM the caller must also guarantee the ids are in this
+ * vector's width and domain).
+ * -------------------------------------------------------------------------- */
+
+ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
+    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+        return ray_error("type", "vec_append_raw: expects a concrete vector type, got %s", ray_type_name(vec->type));
+    if (vec->type == RAY_STR) return ray_error("type", "vec_append_raw: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
+    if (count < 0) return ray_error("range", "vec_append_raw: count must be non-negative, got %lld", (long long)count);
+    if (count == 0) return vec;
+    if (!src) return ray_error("domain", "vec_append_raw: source pointer is null but count is %lld", (long long)count);
+
+    ray_t* original = vec;
+    vec = ray_cow(vec);
+    if (!vec || RAY_IS_ERR(vec)) return vec;
+
+    vec_drop_index_inplace(vec);
+
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    int64_t cap = vec_capacity(vec);
+
+    if (vec->len > INT64_MAX - count) goto fail;
+    if (vec->len + count > cap) {
+        size_t new_data_size = (size_t)(vec->len + count) * esz;
+        if (new_data_size < 32) new_data_size = 32;
+        else {
+            size_t s = 32;
+            while (s < new_data_size) {
+                if (s > SIZE_MAX / 2) goto fail;
+                s *= 2;
+            }
+            new_data_size = s;
+        }
+        ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
+        if (!new_vec || RAY_IS_ERR(new_vec)) {
+            if (vec != original) ray_release(vec);
+            return new_vec ? new_vec : ray_error("oom", NULL);
+        }
+        vec = new_vec;
+    }
+
+    memcpy((char*)ray_data(vec) + (size_t)vec->len * esz, src, (size_t)count * esz);
+    vec->len += count;
     return vec;
 
 fail:
@@ -311,6 +375,9 @@ ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem) {
     uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     char* dst = (char*)ray_data(vec) + idx * esz;
     memcpy(dst, elem, esz);
+    if (vec->type == RAY_SYM &&
+        ray_read_sym(elem, 0, RAY_SYM, vec->attrs) == 0)
+        vec->attrs |= RAY_ATTR_HAS_NULLS;
 
     return vec;
 }
@@ -922,6 +989,36 @@ ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
         memcpy(ray_data(v), data, data_size);
     }
 
+    /* Raw payloads arrive with in-band null sentinels already in place
+     * (e.g. a binding passing INT64_MIN for an absent quantity), and
+     * HAS_NULLS is the fast-path gate ray_vec_is_null and the query/
+     * serde paths trust — a sentinel without the flag renders and
+     * aggregates as ordinary data.  Scan once at construction; the
+     * sentinel stays the source of truth. */
+    switch (type) {
+        case RAY_SYM:
+            for (int64_t i = 0; i < count; i++) {
+                if (ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs) == 0) {
+                    v->attrs |= RAY_ATTR_HAS_NULLS;
+                    break;
+                }
+            }
+            break;
+        case RAY_F64: case RAY_F32:
+        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+        case RAY_I16: case RAY_GUID:
+            for (int64_t i = 0; i < count; i++) {
+                if (sentinel_is_null(v, i)) {
+                    v->attrs |= RAY_ATTR_HAS_NULLS;
+                    break;
+                }
+            }
+            break;
+        default:
+            break;  /* BOOL/U8/LIST/TABLE: non-nullable or pointer payloads */
+    }
+
     /* LIST/TABLE elements are child pointers — retain them */
     if (type == RAY_LIST || type == RAY_TABLE) {
         ray_t** ptrs = (ray_t**)ray_data(v);
@@ -940,7 +1037,7 @@ ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
  * the payload (F64/F32 NaN, NULL_I64 / NULL_I32 / NULL_I16, ray_str_t{0,0},
  * 16 zero bytes for GUID).  A vec-level RAY_ATTR_HAS_NULLS flag is a
  * cheap fast-path gate; ray_vec_is_null reads the payload as source of
- * truth.  BOOL/U8/SYM are non-nullable.
+ * truth.  BOOL/U8 are non-nullable; SYM/STR use canonical empty payloads.
  * -------------------------------------------------------------------------- */
 
 ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
@@ -948,14 +1045,9 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
     if (vec->attrs & RAY_ATTR_SLICE) return RAY_ERR_TYPE; /* cannot set null on slice — COW first */
     if (idx < 0 || idx >= vec->len) return RAY_ERR_RANGE;
 
-    /* Types that don't accept set-null:
-     *   - SYM: sym ID 0 (interned empty string, reserved by
-     *     ray_sym_init) is the canonical "missing" value; callers
-     *     write 0 directly.
-     *   - BOOL / U8: non-nullable; they have nowhere to store a
+    /* BOOL / U8 are non-nullable; they have nowhere to store a
      *     null, so reject to keep the producer surface clean. */
-    if (vec->type == RAY_SYM ||
-        vec->type == RAY_BOOL ||
+    if (vec->type == RAY_BOOL ||
         vec->type == RAY_U8) return RAY_ERR_TYPE;
 
     /* Mutation invalidates any attached accelerator index — drop it inline.
@@ -977,11 +1069,13 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
             case RAY_I64: case RAY_TIMESTAMP:      ((int64_t*)p)[idx] = NULL_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
             case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
+            case RAY_SYM:
+                ray_write_sym(p, idx, 0, RAY_SYM, vec->attrs);
+                break;
             case RAY_STR:
-                /* STR has no null distinct from "": write the
-                 * empty string but do NOT mark the column nullable. */
+                /* Empty string is STR's canonical in-band null. */
                 memset(&((ray_str_t*)p)[idx], 0, sizeof(ray_str_t));
-                return RAY_OK;
+                break;
             case RAY_GUID:
                 memset((uint8_t*)p + idx * 16, 0, 16);
                 break;
@@ -1025,6 +1119,15 @@ static ray_t* str_pool_cow(ray_t* vec) {
     new_pool->order = saved_order;
     new_pool->mmod  = saved_mmod;
     ray_atomic_store(&new_pool->rc, 1);
+
+    /* A mapped pool is the column's only route to the shared region's
+     * descriptor, and this is the moment that route disappears.  Register
+     * the column under its own address first — that is what the region was
+     * mapped at — so its free can still find the reference it holds.  The
+     * registry therefore contains mutated mapped columns only, which is
+     * usually none. */
+    if (vec->str_pool->mmod == 3 && vec->mmod == 1)
+        ray_file_map_register(vec, vec->str_pool->file_map);
 
     ray_release(vec->str_pool);
     vec->str_pool = new_pool;
@@ -1138,6 +1241,7 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
     }
 
     vec->len++;
+    if (len == 0) vec->attrs |= RAY_ATTR_HAS_NULLS;
     return vec;
 
 fail_oom:
@@ -1154,9 +1258,9 @@ fail_range:
  * Allocates the string pool once (not per-element like ray_str_vec_append).
  * Pass 1 sums pooled bytes; pass 2 fills descriptors and pool in one sweep.
  * ptrs[i] may be NULL when lens[i]==0.  nulls may be NULL (no missing
- * inputs); when non-NULL, nulls[i]!=0 requests a missing input.  STR cannot
- * represent a distinct null, so that request collapses to an ordinary empty
- * string (len==0) without RAY_ATTR_HAS_NULLS.
+ * inputs); when non-NULL, nulls[i]!=0 requests a missing input.  Empty STR is
+ * the canonical null representation, so both requests and zero lengths mark
+ * the output HAS_NULLS.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
@@ -1199,10 +1303,12 @@ ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
         ray_str_t* d = &elems[i];
         memset(d, 0, sizeof(ray_str_t));
         if (nulls && nulls[i]) {
-            /* Missing STR input collapses to ordinary empty: already len=0. */
+            /* Missing STR input is the canonical empty representation. */
+            v->attrs |= RAY_ATTR_HAS_NULLS;
         } else if (lens[i] <= RAY_STR_INLINE_MAX) {
             d->len = lens[i];
             if (lens[i] > 0) memcpy(d->data, ptrs[i], lens[i]);
+            else v->attrs |= RAY_ATTR_HAS_NULLS;
         } else {
             if ((uint64_t)pool_used > UINT32_MAX ||
                 (uint64_t)lens[i] > UINT32_MAX - (uint64_t)pool_used) {
@@ -1283,6 +1389,7 @@ ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len) {
         memset(elem, 0, sizeof(ray_str_t));
         elem->len = (uint32_t)len;
         if (len > 0) memcpy(elem->data, s, len);
+        else vec->attrs |= RAY_ATTR_HAS_NULLS;
     } else {
         if (!vec->str_pool) {
             size_t init_pool = len < 256 ? 256 : len * 2;
@@ -1439,17 +1546,20 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     if (!vec || RAY_IS_ERR(vec)) return false;
     if (idx < 0 || idx >= vec->len) return false;
 
-    /* SYM and STR columns are no-null by design (empty "" / sym 0 is the
-     * convention — there is no null distinct from empty).  Consumers
-     * that need empty detection test the value (sym id 0 / str len 0) directly. */
-    if (vec->type == RAY_SYM || vec->type == RAY_STR) return false;
-
     /* Slice: delegate to parent with adjusted index */
     if (vec->attrs & RAY_ATTR_SLICE) {
         ray_t* parent = vec->slice_parent;
         int64_t pidx = vec->slice_offset + idx;
         return ray_vec_is_null(parent, pidx);
     }
+
+    /* SYM/STR nulls are canonical empty payloads.  Check them directly even
+     * when HAS_NULLS is absent so older/persisted vectors and raw gathers
+     * observe the same semantics. */
+    if (vec->type == RAY_SYM)
+        return ray_read_sym(ray_data(vec), idx, RAY_SYM, vec->attrs) == 0;
+    if (vec->type == RAY_STR)
+        return ((const ray_str_t*)ray_data(vec))[idx].len == 0;
 
     /* Vec-level fast-path gate: HAS_NULLS clear means no null anywhere. */
     if (!vec_any_nulls(vec)) return false;
@@ -1463,7 +1573,6 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
         case RAY_I64: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME:
         case RAY_I16:
-        case RAY_STR:
         case RAY_GUID:
             return sentinel_is_null(vec, idx);
         default:
