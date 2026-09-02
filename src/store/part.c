@@ -33,6 +33,7 @@
 #include "store/splay.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "lang/cal.h"   /* MONTHDAYS, date_leap_year — calendar-date validation */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +41,11 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-/* Validate YYYY.MM.DD format: exactly 10 chars, dots at pos 4/7,
- * month 01-12, day 01-31. */
+/* Validate YYYY.MM.DD format: exactly 10 chars, dots at pos 4/7, and a real
+ * calendar date.  A blanket day 01-31 check let calendar-impossible names like
+ * 2024.02.31 through; parse_date_dir then silently normalised them into a
+ * different real day (2024.03.02) — a mislabelled partition key.  Validate the
+ * day against the leap-aware length of its month instead. */
 static bool is_date_dir(const char* name) {
     if (strlen(name) != 10) return false;
     if (name[4] != '.' || name[7] != '.') return false;
@@ -49,9 +53,14 @@ static bool is_date_dir(const char* name) {
         if (i == 4 || i == 7) continue;
         if (name[i] < '0' || name[i] > '9') return false;
     }
+    int year  = (name[0]-'0')*1000 + (name[1]-'0')*100 +
+                (name[2]-'0')*10   + (name[3]-'0');
     int month = (name[5] - '0') * 10 + (name[6] - '0');
     int day   = (name[8] - '0') * 10 + (name[9] - '0');
-    return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+    if (month < 1 || month > 12 || day < 1) return false;
+    int leap = date_leap_year(year);
+    int dim  = (int)(MONTHDAYS[leap][month] - MONTHDAYS[leap][month - 1]);
+    return day <= dim;
 }
 
 /* Check if string is a pure integer (digits only, possibly with leading minus). */
