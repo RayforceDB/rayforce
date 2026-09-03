@@ -6530,11 +6530,16 @@ static test_result_t test_eval_restricted_lambda_bypass(void) {
  * error; dummy handles are deliberate — the restricted gate fires at the
  * invocation boundary, before the body validates its arguments. */
 static test_result_t test_eval_restricted_server_state_ops(void) {
+    /* alter can bypass the restricted `set` path and mutate a global vector. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(alter 'x set 0 1)"));
     /* #44: global Datalog rule registration (a restricted special form). */
     TEST_ASSERT_TRUE(restricted_expr_returns_access(
         "(rule (__rf_restr_probe ?x) (?x :tag 1))"));
     /* #49: mutate a Datalog program with a new EDB relation. */
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(dl-add-edb 0 'rel 0 2)"));
+    /* Stratification and evaluation rewrite a Datalog program in place. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(dl-stratify 0)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(dl-eval 0)"));
     /* #48: free a Datalog program handle. */
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(dl-free 0)"));
     /* #46: free a server graph handle. */

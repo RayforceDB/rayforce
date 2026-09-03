@@ -3335,7 +3335,7 @@ static void ray_register_builtins(void) {
     register_unary("guid",       RAY_FN_NONE, ray_guid_fn);
 
     /* In-place mutation */
-    register_vary("alter",       RAY_FN_SPECIAL_FORM, ray_alter_fn);
+    register_vary("alter",       RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_alter_fn);
 
     /* Pattern matching */
     register_binary("like",      RAY_FN_NONE, ray_like_fn);
@@ -3490,8 +3490,8 @@ static void ray_register_builtins(void) {
     /* Programmatic Datalog API */
     register_vary("dl-program",    RAY_FN_NONE, ray_dl_program_fn);
     register_vary("dl-add-edb",    RAY_FN_RESTRICTED, ray_dl_add_edb_fn);
-    register_unary("dl-stratify",  RAY_FN_NONE, ray_dl_stratify_fn);
-    register_unary("dl-eval",      RAY_FN_NONE, ray_dl_eval_fn);
+    register_unary("dl-stratify",  RAY_FN_RESTRICTED, ray_dl_stratify_fn);
+    register_unary("dl-eval",      RAY_FN_RESTRICTED, ray_dl_eval_fn);
     register_binary("dl-query",    RAY_FN_NONE, ray_dl_query_fn);
     register_binary("dl-provenance", RAY_FN_NONE, ray_dl_provenance_fn);
     register_unary("dl-free",      RAY_FN_RESTRICTED, ray_dl_free_fn);
