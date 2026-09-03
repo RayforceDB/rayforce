@@ -3335,7 +3335,7 @@ static void ray_register_builtins(void) {
     register_unary("guid",       RAY_FN_NONE, ray_guid_fn);
 
     /* In-place mutation */
-    register_vary("alter",       RAY_FN_SPECIAL_FORM, ray_alter_fn);
+    register_vary("alter",       RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_alter_fn);
 
     /* Pattern matching */
     register_binary("like",      RAY_FN_NONE, ray_like_fn);
@@ -3417,7 +3417,7 @@ static void ray_register_builtins(void) {
      * startup; these builtins expose the same machinery to Rayfall code
      * for manual control (open from a script, snapshot on demand, etc). */
     register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
-    register_unary(".log.write",   RAY_FN_NONE,       ray_log_write_fn);
+    register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
     register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
     register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
@@ -3484,17 +3484,17 @@ static void ray_register_builtins(void) {
     register_vary("pull",          RAY_FN_NONE, ray_pull_fn);
 
     /* Datalog */
-    register_vary("rule",         RAY_FN_SPECIAL_FORM, ray_rule_fn);
+    register_vary("rule",         RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_rule_fn);
     register_vary("query",        RAY_FN_SPECIAL_FORM, ray_query_fn);
 
     /* Programmatic Datalog API */
     register_vary("dl-program",    RAY_FN_NONE, ray_dl_program_fn);
-    register_vary("dl-add-edb",    RAY_FN_NONE, ray_dl_add_edb_fn);
-    register_unary("dl-stratify",  RAY_FN_NONE, ray_dl_stratify_fn);
-    register_unary("dl-eval",      RAY_FN_NONE, ray_dl_eval_fn);
+    register_vary("dl-add-edb",    RAY_FN_RESTRICTED, ray_dl_add_edb_fn);
+    register_unary("dl-stratify",  RAY_FN_RESTRICTED, ray_dl_stratify_fn);
+    register_unary("dl-eval",      RAY_FN_RESTRICTED, ray_dl_eval_fn);
     register_binary("dl-query",    RAY_FN_NONE, ray_dl_query_fn);
     register_binary("dl-provenance", RAY_FN_NONE, ray_dl_provenance_fn);
-    register_unary("dl-free",      RAY_FN_NONE, ray_dl_free_fn);
+    register_unary("dl-free",      RAY_FN_RESTRICTED, ray_dl_free_fn);
 
     /* Vector similarity / embeddings / HNSW */
     register_binary("cos-dist",    RAY_FN_NONE, ray_cos_dist_fn);
@@ -3504,7 +3504,7 @@ static void ray_register_builtins(void) {
     register_vary  ("knn",         RAY_FN_NONE, ray_knn_fn);
     register_vary  ("hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
     register_vary  ("ann",         RAY_FN_NONE, ray_ann_fn);
-    register_unary ("hnsw-free",   RAY_FN_NONE, ray_hnsw_free_fn);
+    register_unary ("hnsw-free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
     register_binary("hnsw-save",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
     register_unary ("hnsw-load",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
     register_unary ("hnsw-info",   RAY_FN_NONE, ray_hnsw_info_fn);
@@ -3536,7 +3536,7 @@ static void ray_register_builtins(void) {
      * Lifecycle handles auto-free on rc→0 (see RAY_ATTR_GRAPH branch in
      * src/mem/heap.c). */
     register_vary (".graph.build",         RAY_FN_NONE, ray_graph_build_fn);
-    register_unary(".graph.free",          RAY_FN_NONE, ray_graph_free_fn);
+    register_unary(".graph.free",          RAY_FN_RESTRICTED, ray_graph_free_fn);
     register_unary(".graph.info",          RAY_FN_NONE, ray_graph_info_fn);
     register_vary (".graph.pagerank",      RAY_FN_NONE, ray_graph_pagerank_fn);
     register_vary (".graph.connected",     RAY_FN_NONE, ray_graph_connected_fn);
