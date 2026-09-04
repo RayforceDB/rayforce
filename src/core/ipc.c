@@ -356,6 +356,31 @@ static int hook_call_auth(ray_poll_t* poll, int64_t handle,
     return ok;
 }
 
+/* A partially-sent multicast frame lives on sel->tx.buf until EPOLLOUT/
+ * EVFILT_WRITE drains it.  Any OTHER write to the same fd (a sync RESP, an
+ * async push) must not splice its bytes into the middle of that half-sent
+ * frame, or the peer parses the two framings into each other and the stream
+ * for that connection is corrupt.  Flush the queued remainder first, blocking
+ * on write-readiness the way ray_sock_send already does, so the direct write
+ * that follows starts on a frame boundary.  Fast-path returns 0 when nothing
+ * is queued (the common, non-subscriber case).  Returns -1 on socket error. */
+static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel)
+{
+    if (!sel || !sel->tx.buf) return 0;
+    while (sel->tx.buf) {
+        ray_poll_buf_t* buf = sel->tx.buf;
+        int64_t rem = buf->size - buf->offset;
+        if (rem > 0 &&
+            ray_sock_send(sel->fd, buf->data + buf->offset, (size_t)rem) < 0)
+            return -1;
+        sel->tx.buf = buf->next;
+        buf->next = NULL;
+        ray_poll_buf_free(buf);
+    }
+    ray_poll_tx_cancel(poll, sel);
+    return 0;
+}
+
 static void send_response(ray_sock_t fd, ray_t* result)
 {
     int64_t ser_size = ray_serde_size(result);
@@ -995,7 +1020,12 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * selector before writing to its fd. */
     if (hdr.msgtype == RAY_IPC_MSG_SYNC) {
         ray_selector_t* cur = ray_poll_get(poll, id);
-        if (cur && cur->data == (void*)cd)
+        /* Flush any multicast frame still queued to this fd before the RESP,
+         * so the reply lands on a frame boundary instead of splicing into a
+         * half-sent push.  A drain error means the peer is gone — skip the
+         * write and let the poll/pump layer deregister it. */
+        if (cur && cur->data == (void*)cd &&
+            conn_tx_drain_blocking(poll, cur) == 0)
             send_response((ray_sock_t)cur->fd, result);
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
@@ -1595,8 +1625,11 @@ static ray_poll_buf_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
 
 /* Serialize + frame + write one message to a connection's fd.
  * ray_sock_send loops on partial writes/EAGAIN internally, so this is
- * safe on the nonblocking fds the poll owns.  Returns 0 on success,
- * -1 on serialization or socket failure. */
+ * safe on the nonblocking fds the poll owns.  Writes directly and does NOT
+ * consult sel->tx.buf, so a caller whose fd may carry a queued multicast
+ * frame must conn_tx_drain_blocking() first (see sync_send /
+ * ray_ipc_send_async).  Returns 0 on success, -1 on serialization or
+ * socket failure. */
 static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
                               uint8_t extra_flags)
 {
@@ -1765,7 +1798,10 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
         return ray_error("io", "nested sync send on busy handle");
     }
 
-    if (conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
+    /* Drain any half-sent multicast frame queued to this fd before writing the
+     * sync request, so its bytes can't interleave into the pending frame. */
+    if (conn_tx_drain_blocking(poll, sel) < 0 ||
+        conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
                        extra_flags) < 0) {
         if (owned) ray_release(msg);
         return ray_error("io", "ipc send failed");
@@ -1841,9 +1877,11 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
         }
         owned = true;
     }
-    ray_selector_t* sel = conn_resolve(NULL, handle);
-    ray_err_t rc = (!sel || conn_write_msg((ray_sock_t)sel->fd, msg,
-                                           RAY_IPC_MSG_ASYNC, 0) < 0)
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    ray_err_t rc = (!sel || conn_tx_drain_blocking(poll, sel) < 0 ||
+                    conn_write_msg((ray_sock_t)sel->fd, msg,
+                                   RAY_IPC_MSG_ASYNC, 0) < 0)
                    ? RAY_ERR_IO : RAY_OK;
     if (owned) ray_release(msg);
     return rc;

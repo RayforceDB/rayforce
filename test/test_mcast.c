@@ -759,6 +759,100 @@ static test_result_t test_mcast_failed_send_defers_close(void) {
     PASS();
 }
 
+/* Regression: a sync request from a subscriber whose multicast frame is still
+ * queued must not corrupt the stream.  test_mcast_large_payload_queues drains
+ * the queue before pinging; here the ping races the still-pending frame.  Before
+ * the tx-drain fix, send_response spliced the RESP into the half-sent `upd`
+ * frame, so h1's reply came back garbled (or never framed) and the payload was
+ * truncated.  With the fix the server drains the queued frame first, then
+ * replies on a frame boundary. */
+static test_result_t test_mcast_sync_reply_after_queued_frame(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_last_len 0)"
+        "(set _mc_open_count 0)"
+        "(set _mc_sub_handle -1)"
+        "(set upd (fn [topic seq payload] "
+        "  (do "
+        "    (set _mc_count (+ _mc_count 1))"
+        "    (set _mc_last_len (count payload)))))"
+        "(set .ipc.on.open (fn [h] "
+        "  (do "
+        "    (set _mc_open_count (+ _mc_open_count 1))"
+        "    (if (== _mc_open_count 1) (set _mc_sub_handle h) 0))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"big\" null)", strlen("(.mc.sub \"big\" null)"));
+    ray_t* sub = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+#ifndef RAY_OS_WINDOWS
+    /* Shrink the server->h1 send buffer so a big frame parks on sel->tx.buf
+     * instead of leaving in a single write. */
+    ray_t* server_h = ray_env_get(ray_sym_intern("_mc_sub_handle", 14));
+    TEST_ASSERT_NOT_NULL(server_h);
+    TEST_ASSERT_EQ_I(server_h->type, -RAY_I64);
+    ray_selector_t* server_sel = ray_poll_get(poll, server_h->i64);
+    TEST_ASSERT_NOT_NULL(server_sel);
+    int sndbuf = 4096;
+    setsockopt((ray_sock_t)server_sel->fd, SOL_SOCKET, SO_SNDBUF,
+               &sndbuf, sizeof(sndbuf));
+#endif
+
+    const char* pub_src =
+        "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
+    msg = ray_str(pub_src, strlen(pub_src));
+    ray_t* pub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+
+    /* Do NOT drain h1 first: the ~800 KB frame is still queued on the server's
+     * tx.buf for h1.  Issue a sync ping from h1 now — as h1 reads for its RESP
+     * it consumes the queued frame (firing `upd`), and with the fix the RESP
+     * only follows once that frame is fully flushed. */
+    msg = ray_str("(+ 21 21)", strlen("(+ 21 21)"));
+    ray_t* ping = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(ping);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ping));
+    TEST_ASSERT_EQ_I(ping->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(ping->i64, 42);   /* clean reply, not bytes from the frame */
+    ray_release(ping);
+
+    /* The queued `upd` was delivered whole, not truncated by the interleave. */
+    ray_t* cnt = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* len = ray_env_get(ray_sym_intern("_mc_last_len", 12));
+    TEST_ASSERT_NOT_NULL(cnt);
+    TEST_ASSERT_NOT_NULL(len);
+    TEST_ASSERT_EQ_I(cnt->i64, 1);
+    TEST_ASSERT_EQ_I(len->i64, 100000);
+
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 const test_entry_t mcast_entries[] = {
     { "mcast/single_client_pub",          test_mcast_single_client_pub,          mcast_setup, mcast_teardown },
     { "mcast/two_clients_unsub_close",    test_mcast_two_clients_unsub_close_stats, mcast_setup, mcast_teardown },
@@ -768,6 +862,7 @@ const test_entry_t mcast_entries[] = {
     { "mcast/restricted_sub_not_pub",     test_mcast_restricted_sub_but_not_pub, mcast_setup, mcast_teardown },
     { "mcast/sub_requires_ipc_context",   test_mcast_requires_ipc_context_for_sub, mcast_setup, mcast_teardown },
     { "mcast/large_payload_queues",       test_mcast_large_payload_queues_until_writable, mcast_setup, mcast_teardown },
+    { "mcast/sync_reply_after_queued",    test_mcast_sync_reply_after_queued_frame, mcast_setup, mcast_teardown },
     { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };
