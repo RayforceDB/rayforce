@@ -24,6 +24,7 @@
 #if defined(__APPLE__)
 
 #include "core/poll.h"
+#include "core/mcast.h"
 #include "core/timer.h"
 #include "mem/sys.h"
 #include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
@@ -81,6 +82,10 @@ void ray_poll_destroy(ray_poll_t* poll)
     if (poll->timers) {
         ray_timers_destroy((ray_timers_t*)poll->timers);
         poll->timers = NULL;
+    }
+    if (poll->mcast) {
+        ray_mcast_destroy((ray_mcast_t*)poll->mcast);
+        poll->mcast = NULL;
     }
     ray_sys_free(poll);
 }
@@ -155,6 +160,7 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
 
     if (sel->close_fn) sel->close_fn(poll, sel);
+    ray_mcast_on_close(poll, id);
     if (sel->rx.buf) ray_poll_buf_free(sel->rx.buf);
     ray_poll_buf_free(sel->tx.buf);
     ray_sys_free(sel);

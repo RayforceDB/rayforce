@@ -1,0 +1,48 @@
+;; Real multicast negative/API scenario against a running `./rayforce -p PORT`.
+;;
+;;   ./rayforce test/rfl/system/mcast_real_negative.rfl -- --addr 127.0.0.1:PORT
+
+(set _mc_addr (get (at (.sys.args) 'user) 'addr))
+
+(set _mc_fail (fn [msg]
+  (do
+    (println "REAL_MCAST_NEGATIVE_FAIL %" msg)
+    (exit 1))))
+
+(set _mc_assert (fn [ok msg]
+  (if ok 1 (_mc_fail msg))))
+
+(_mc_assert (!= _mc_addr "") "missing --addr")
+
+(set h (.ipc.open _mc_addr 2000))
+(_mc_assert (>= h 0) "open")
+
+(set st0 (.ipc.send h "(.mc.stats)"))
+(_mc_assert (== (at st0 'topics) 0) "initial topics")
+(_mc_assert (== (at st0 'subscriptions) 0) "initial subscriptions")
+
+(.ipc.send h "(.mc.pub \"orphan\" 99)")
+(set st1 (.ipc.send h "(.mc.stats)"))
+(_mc_assert (== (at st1 'topics) 1) "orphan topic created")
+(_mc_assert (== (at st1 'subscriptions) 0) "orphan subscriptions")
+(_mc_assert (== (at st1 'published) 1) "orphan published")
+(_mc_assert (== (at st1 'delivered) 0) "orphan delivered")
+(_mc_assert (== (at st1 'dropped) 0) "orphan dropped")
+
+(set bad_filter (try (.ipc.send h "(.mc.sub \"bad-filter\" 1)") (fn [e] "nyi")))
+(_mc_assert (== bad_filter "nyi") "bad filter error")
+
+(set bad_topic (try (.ipc.send h "(.mc.pub [1 2] 1)") (fn [e] "type")))
+(_mc_assert (== bad_topic "type") "bad topic error")
+
+(set bad_drop (try (.ipc.send h "(.mc.drop -1)") (fn [e] "domain")))
+(_mc_assert (== bad_drop "domain") "bad drop error")
+
+(.ipc.send h "(.mc.unsub \"missing\")")
+(set st2 (.ipc.send h "(.mc.stats)"))
+(_mc_assert (== (at st2 'published) 1) "unsub missing does not publish")
+(_mc_assert (== (at st2 'subscriptions) 0) "unsub missing leaves subscriptions")
+
+(.ipc.close h)
+
+(println "REAL_MCAST_NEGATIVE_OK topics=% published=% delivered=%" (at st2 'topics) (at st2 'published) (at st2 'delivered))

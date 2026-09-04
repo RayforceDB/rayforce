@@ -1,0 +1,67 @@
+;; Real multicast payload coverage against a running `./rayforce -p PORT`.
+;;
+;;   ./rayforce test/rfl/system/mcast_real_payloads.rfl -- --addr 127.0.0.1:PORT
+
+(set _mc_addr (get (at (.sys.args) 'user) 'addr))
+
+(set _mc_fail (fn [msg]
+  (do
+    (println "REAL_MCAST_PAYLOADS_FAIL %" msg)
+    (exit 1))))
+
+(set _mc_assert (fn [ok msg]
+  (if ok 1 (_mc_fail msg))))
+
+(set _mc_count 0)
+(set _mc_last_topic "")
+(set _mc_last_seq 0)
+(set _mc_last_payload null)
+
+(set upd (fn [topic seq payload]
+  (do
+    (set _mc_count (+ _mc_count 1))
+    (set _mc_last_topic topic)
+    (set _mc_last_seq seq)
+    (set _mc_last_payload payload)
+    null)))
+
+(_mc_assert (!= _mc_addr "") "missing --addr")
+
+(set h (.ipc.open _mc_addr 2000))
+(_mc_assert (>= h 0) "open")
+
+(.ipc.send h "(.mc.sub 'payloads null)")
+
+(.ipc.send h "(.mc.pub \"payloads\" 42)")
+(_mc_assert (== _mc_count 1) "i64 delivered")
+(_mc_assert (== _mc_last_topic "payloads") "i64 topic")
+(_mc_assert (== _mc_last_seq 1) "i64 seq")
+(_mc_assert (== _mc_last_payload 42) "i64 payload")
+
+(.ipc.send h "(.mc.pub 'payloads [1 2 3])")
+(_mc_assert (== _mc_count 2) "vector delivered")
+(_mc_assert (== _mc_last_seq 2) "vector seq")
+(_mc_assert (== (sum _mc_last_payload) 6) "vector payload")
+
+(.ipc.send h "(.mc.pub \"payloads\" 'IBM)")
+(_mc_assert (== _mc_count 3) "symbol delivered")
+(_mc_assert (== _mc_last_seq 3) "symbol seq")
+(_mc_assert (== (type _mc_last_payload) 'sym) "symbol payload type")
+(_mc_assert (== _mc_last_payload 'IBM) "symbol payload")
+
+(.ipc.send h "(.mc.pub 'payloads (dict ['a 'b] (list 7 \"seven\")))")
+(_mc_assert (== _mc_count 4) "dict delivered")
+(_mc_assert (== _mc_last_seq 4) "dict seq")
+(_mc_assert (== (at _mc_last_payload 'a) 7) "dict numeric payload")
+(_mc_assert (== (at _mc_last_payload 'b) "seven") "dict string payload")
+
+(set st (.ipc.send h "(.mc.stats)"))
+(_mc_assert (== (at st 'topics) 1) "stats topics")
+(_mc_assert (== (at st 'subscriptions) 1) "stats subscriptions")
+(_mc_assert (== (at st 'published) 4) "stats published")
+(_mc_assert (== (at st 'delivered) 4) "stats delivered")
+(_mc_assert (== (at st 'dropped) 0) "stats dropped")
+
+(.ipc.close h)
+
+(println "REAL_MCAST_PAYLOADS_OK count=% last=%" _mc_count (format "%" _mc_last_payload))

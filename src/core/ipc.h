@@ -72,6 +72,7 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * class keeps the value scoped to the dispatch thread should that ever
  * change. */
 int64_t ray_ipc_current_handle(void);
+ray_poll_t* ray_ipc_active_poll(void);
 
 /* ===== Poll-based IPC (new API) ===== */
 

@@ -252,7 +252,7 @@ static void ipc_ctx_set(int64_t handle, ray_poll_t* poll) {
     __VM->ipc_poll   = poll;
 }
 
-static ray_poll_t* ipc_active_poll(void) {
+ray_poll_t* ray_ipc_active_poll(void) {
     ray_poll_t* p = ipc_ctx_poll();
     return p ? p : (ray_poll_t*)ray_runtime_get_poll();
 }
@@ -1448,7 +1448,7 @@ static int64_t recv_full(ray_sock_t fd, void* buf, size_t len) {
  * integer can never write to a non-IPC fd. */
 static ray_selector_t* conn_resolve(ray_poll_t** poll_out, int64_t handle)
 {
-    ray_poll_t* poll = ipc_active_poll();
+    ray_poll_t* poll = ray_ipc_active_poll();
     if (!poll) return NULL;
     ray_selector_t* sel = ray_poll_get(poll, handle);
     if (!sel || sel->type != RAY_SEL_SOCKET || !sel->data) return NULL;
@@ -1560,7 +1560,7 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     /* The connection lives in the active poll's selector table — its
      * selector id IS the handle.  No poll, no handle namespace: refuse
      * up front rather than hand out an integer nothing can resolve. */
-    ray_poll_t* poll = ipc_active_poll();
+    ray_poll_t* poll = ray_ipc_active_poll();
     if (!poll) return -1;
 
     /* Default the connect/handshake budget to 5s when the caller gives

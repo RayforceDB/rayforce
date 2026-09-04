@@ -1,0 +1,77 @@
+;; Real multicast IPC end-to-end scenario.
+;;
+;; Run against a separately-started `./rayforce -p PORT` server:
+;;   ./rayforce test/rfl/system/mcast_real_e2e.rfl -- --addr 127.0.0.1:PORT
+;;
+;; The client process opens two real IPC handles, subscribes both to one
+;; topic, publishes through the server, and verifies server-pushed `upd`
+;; callbacks in this client process.
+
+(set _mc_user_args (at (.sys.args) 'user))
+(set _mc_addr (get _mc_user_args 'addr))
+
+(set _mc_count 0)
+(set _mc_sum 0)
+(set _mc_last_topic "")
+(set _mc_last_seq 0)
+(set _mc_last_payload 0)
+
+(set _mc_fail (fn [msg]
+  (do
+    (println "REAL_MCAST_E2E_FAIL %" msg)
+    (exit 1))))
+
+(set _mc_assert (fn [ok msg]
+  (if ok 1 (_mc_fail msg))))
+
+(set upd (fn [topic seq payload]
+  (do
+    (set _mc_count (+ _mc_count 1))
+    (set _mc_sum (+ _mc_sum payload))
+    (set _mc_last_topic topic)
+    (set _mc_last_seq seq)
+    (set _mc_last_payload payload)
+    null)))
+
+(_mc_assert (!= _mc_addr "") "missing --addr")
+
+(set h1 (.ipc.open _mc_addr 2000))
+(set h2 (.ipc.open _mc_addr 2000))
+(_mc_assert (>= h1 0) "h1 open")
+(_mc_assert (>= h2 0) "h2 open")
+
+(.ipc.send h1 "(.mc.sub \"ticks\" null)")
+(.ipc.send h2 "(.mc.sub \"ticks\" null)")
+
+(set st1 (.ipc.send h1 "(.mc.stats)"))
+(_mc_assert (== (at st1 'topics) 1) "stats topics after sub")
+(_mc_assert (== (at st1 'subscriptions) 2) "stats subscriptions after sub")
+
+(.ipc.send h1 "(.mc.pub \"ticks\" 10)")
+(.ipc.send h2 "(+ 0 0)")
+
+(_mc_assert (== _mc_count 2) "two subscribers received first publish")
+(_mc_assert (== _mc_sum 20) "first publish payload sum")
+(_mc_assert (== _mc_last_topic "ticks") "first publish topic")
+(_mc_assert (== _mc_last_payload 10) "first publish payload")
+
+(.ipc.send h2 "(.mc.unsub \"ticks\")")
+(.ipc.send h1 "(.mc.pub \"ticks\" 7)")
+(.ipc.send h2 "(+ 0 0)")
+
+(_mc_assert (== _mc_count 3) "one subscriber received second publish")
+(_mc_assert (== _mc_sum 27) "second publish payload sum")
+(_mc_assert (== _mc_last_topic "ticks") "second publish topic")
+(_mc_assert (== _mc_last_payload 7) "second publish payload")
+
+(set st2 (.ipc.send h1 "(.mc.stats)"))
+(_mc_assert (== (at st2 'topics) 1) "stats topics after unsub")
+(_mc_assert (== (at st2 'subscriptions) 1) "stats subscriptions after unsub")
+(_mc_assert (== (at st2 'published) 2) "stats published")
+(_mc_assert (== (at st2 'delivered) 3) "stats delivered")
+(_mc_assert (== (at st2 'dropped) 0) "stats dropped")
+
+(.ipc.close h2)
+(.ipc.close h1)
+
+(println "REAL_MCAST_E2E_OK count=% sum=% topic=% payload=%" _mc_count _mc_sum _mc_last_topic _mc_last_payload)
