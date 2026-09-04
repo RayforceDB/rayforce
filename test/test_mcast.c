@@ -24,6 +24,7 @@
   #include <unistd.h>
 #endif
 
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -546,6 +547,111 @@ static test_result_t test_mcast_requires_ipc_context_for_sub(void) {
     PASS();
 }
 
+static test_result_t test_mcast_failed_send_defers_close(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_sum 0)"
+        "(set _mc_open_count 0)"
+        "(set _mc_dead_handle -1)"
+        "(set upd (fn [topic seq payload] "
+        "  (set _mc_count (+ _mc_count 1))"
+        "  (set _mc_sum (+ _mc_sum payload))))"
+        "(set .ipc.on.open (fn [h] "
+        "  (do "
+        "    (set _mc_open_count (+ _mc_open_count 1))"
+        "    (if (== _mc_open_count 1) (set _mc_dead_handle h) 0))))"
+        "(set .ipc.on.close (fn [h] "
+        "  (do "
+        "    (.mc.sub \"hook-grow\" null)"
+        "    (.mc.unsub \"hook-grow\")"
+        "    null)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    for (int i = 0; i < 7; i++) {
+        char src[64];
+        int n = snprintf(src, sizeof(src), "(.mc.sub \"fill%d\" null)", i);
+        TEST_ASSERT((n) > (0), "format filler sub");
+        TEST_ASSERT((size_t)n < sizeof(src), "filler sub fits buffer");
+        ray_t* msg = ray_str(src, (size_t)n);
+        ray_t* sub = ray_ipc_send(h2, msg);
+        ray_release(msg);
+        TEST_ASSERT_NOT_NULL(sub);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+        ray_release(sub);
+    }
+
+    ray_t* msg = ray_str("(.mc.sub \"target\" null)", strlen("(.mc.sub \"target\" null)"));
+    ray_t* sub = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+    msg = ray_str("(.mc.sub \"target\" null)", strlen("(.mc.sub \"target\" null)"));
+    sub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+    ray_t* dead_v = ray_env_get(ray_sym_intern("_mc_dead_handle", 15));
+    TEST_ASSERT_NOT_NULL(dead_v);
+    TEST_ASSERT_EQ_I(dead_v->type, -RAY_I64);
+    ray_selector_t* dead_sel = ray_poll_get(poll, dead_v->i64);
+    TEST_ASSERT_NOT_NULL(dead_sel);
+    ray_sock_t old_dead_fd = (ray_sock_t)dead_sel->fd;
+    TEST_ASSERT(old_dead_fd != RAY_INVALID_SOCK, "dead selector has fd");
+    dead_sel->fd = RAY_INVALID_SOCK;
+
+    msg = ray_str("(.mc.pub \"target\" 7)", strlen("(.mc.pub \"target\" 7)"));
+    ray_t* pub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+    pump_client();
+
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* sum = ray_env_get(ray_sym_intern("_mc_sum", 7));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(sum);
+    TEST_ASSERT_EQ_I(c->i64, 1);
+    TEST_ASSERT_EQ_I(sum->i64, 7);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 8);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 8);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 1);
+    ray_release(st);
+
+    ray_sock_close(old_dead_fd);
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 const test_entry_t mcast_entries[] = {
     { "mcast/single_client_pub",          test_mcast_single_client_pub,          mcast_setup, mcast_teardown },
     { "mcast/two_clients_unsub_close",    test_mcast_two_clients_unsub_close_stats, mcast_setup, mcast_teardown },
@@ -554,5 +660,6 @@ const test_entry_t mcast_entries[] = {
     { "mcast/no_subscribers_api_errors",  test_mcast_no_subscribers_and_api_errors, mcast_setup, mcast_teardown },
     { "mcast/restricted_sub_not_pub",     test_mcast_restricted_sub_but_not_pub, mcast_setup, mcast_teardown },
     { "mcast/sub_requires_ipc_context",   test_mcast_requires_ipc_context_for_sub, mcast_setup, mcast_teardown },
+    { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };
