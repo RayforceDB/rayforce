@@ -316,9 +316,21 @@ static int8_t if_value_type(ray_t* v) {
     return (t == RAY_F32) ? RAY_F64 : t;
 }
 
+/* Same predicate as graph.c's type_is_temporal, which is file-local there.
+ * query.c carries its own copy too — three call sites, three copies. */
+static bool if_type_is_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
 static int8_t if_promote_type(int8_t a, int8_t b) {
     if (a == 0) return b;
     if (b == 0) return a;
+    /* Two branches of the same temporal type keep it — the graph's own rule
+     * (promote_if_type in graph.c) says so, and the node's out_type was
+     * derived with it.  Without this the widening below reads TIMESTAMP as
+     * its I64 storage and hands back a plain integer, so the same expression
+     * answered TIMESTAMP or I64 depending on which arm of exec_if ran. */
+    if (a == b && if_type_is_temporal(a)) return a;
     if (a == RAY_STR || b == RAY_STR) return RAY_STR;
     if (a == RAY_SYM || b == RAY_SYM) return RAY_SYM;
     if (a == RAY_F64 || b == RAY_F64 || a == RAY_F32 || b == RAY_F32)

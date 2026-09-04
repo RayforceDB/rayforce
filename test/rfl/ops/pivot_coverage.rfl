@@ -663,3 +663,23 @@ RDatedead -- [2024.01.01 2023.01.02]
 (count RTimedead) -- 2
 (type RTimedead) -- 'TIME
 RTimedead -- [09:30:00.000 11:00:00.000]
+
+;; ── (if …) over two branches of one temporal type keeps that type ───────
+;; The graph derives the node's type with promote_if_type, which returns the
+;; temporal type unchanged when both branches share it — an `if` selects a
+;; value, it does not compute one, so nothing is widened.  exec_if then has
+;; two arms, and the one that runs when the pool has no workers re-derives
+;; the type from the values it actually materialised.  Its ladder read a
+;; temporal as its integer storage, so the same expression answered
+;; TIMESTAMP with workers and I64 without them.
+;;
+;; The re-derivation itself is load-bearing — it narrows F64 to I64 when the
+;; float branch supplied no rows — so only the temporal case is aligned.
+(set TIF (table [x d tm ts] (list [true false true] (as 'DATE [1 2 3]) (as 'TIME [10 20 30]) (as 'TIMESTAMP [100 200 300]))))
+(type (at (select {r: (if x d d) from: TIF}) 'r)) -- 'DATE
+(type (at (select {r: (if x tm tm) from: TIF}) 'r)) -- 'TIME
+(type (at (select {r: (if x ts ts) from: TIF}) 'r)) -- 'TIMESTAMP
+;; values are untouched by the type fix
+(as 'I64 (at (select {r: (if x ts ts) from: TIF}) 'r)) -- [100 200 300]
+;; branches of DIFFERENT temporal types have no shared meaning — still widened
+(type (at (select {r: (if x d ts) from: TIF}) 'r)) -- 'I64
