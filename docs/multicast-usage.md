@@ -16,7 +16,7 @@ It supports:
 - aggregate runtime statistics
 - restricted-mode guard: restricted clients can subscribe but cannot publish
 
-It does not yet provide durable replay, topic filters, wildcard topics, ACLs, per-topic stats, per-client lag, backpressure, or queue limits.
+It does not yet provide durable replay, topic filters, wildcard topics, ACLs, per-topic stats, per-client lag, or queued backpressure.
 
 ## API
 
@@ -25,7 +25,6 @@ It does not yet provide durable replay, topic filters, wildcard topics, ACLs, pe
 (.mc.unsub topic)          ;; unsubscribe the current IPC handle from topic
 (.mc.pub topic payload)    ;; publish payload to all current subscribers
 (.mc.stats)                ;; return aggregate multicast stats
-(.mc.drop handle)          ;; remove and close a handle
 ```
 
 `topic` can be a string or a symbol:
@@ -63,6 +62,8 @@ The client must define `upd` before subscribing:
 ```
 
 The delivered `topic` is a string even if the publisher used a symbol. This avoids Rayfall symbol name-resolution surprises in pushed expression-list messages.
+
+The delivered `payload` is wrapped with `quote` on the wire, so lists, dicts, symbols, and other serializable values arrive as data rather than being evaluated as code by the subscriber.
 
 `seq` is a per-topic publish sequence number. It is currently useful for logging and gap detection, but there is no replay API yet.
 
@@ -126,7 +127,7 @@ Example result:
 
 Fields:
 
-- `topics`: number of topic records currently known to the server
+- `topics`: number of topic records with active subscriptions
 - `subscriptions`: number of active topic subscriptions
 - `published`: number of publish calls accepted by the module
 - `delivered`: number of async messages successfully queued/sent to subscribers
@@ -217,9 +218,9 @@ For topic dispatch, keep `upd` small and delegate to topic-specific handlers:
 - `.mc.sub` must run in an inbound IPC evaluation context because it uses the current IPC handle.
 - Local `.mc.sub` outside IPC returns `domain`.
 - `.mc.pub` returns the assigned sequence number.
+- `.mc.pub` returns `0` when there is no active subscriber for the topic; it does not create an orphan topic.
 - Duplicate subscription of the same handle to the same topic is idempotent.
-- Publishing to a topic with no subscribers is allowed and increments `published`, but not `delivered`.
-- If async delivery to a subscriber fails, that subscriber is removed and `dropped` increments.
+- If async delivery to a subscriber would block or fails, that subscriber is removed, its IPC handle is closed, and `dropped` increments.
 - Closing an IPC handle removes its subscriptions.
 - Restricted IPC clients can subscribe but cannot publish.
 

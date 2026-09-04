@@ -73,6 +73,7 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * change. */
 int64_t ray_ipc_current_handle(void);
 ray_poll_t* ray_ipc_active_poll(void);
+ray_poll_t* ray_ipc_context_poll(void);
 
 /* ===== Poll-based IPC (new API) ===== */
 
@@ -128,6 +129,7 @@ int64_t   ray_ipc_connect(const char* host, uint16_t port,
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
+ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg);
 
 /* Remote-REPL helper: send a SYNC message with RAY_IPC_FLAG_VERBOSE
  * set, returning a 2-element list [captured_str, result] where

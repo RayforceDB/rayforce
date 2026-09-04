@@ -26,6 +26,7 @@
 #endif
 
 #include "core/ipc.h"
+#include "core/mcast.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
@@ -255,6 +256,10 @@ static void ipc_ctx_set(int64_t handle, ray_poll_t* poll) {
 ray_poll_t* ray_ipc_active_poll(void) {
     ray_poll_t* p = ipc_ctx_poll();
     return p ? p : (ray_poll_t*)ray_runtime_get_poll();
+}
+
+ray_poll_t* ray_ipc_context_poll(void) {
+    return ipc_ctx_poll();
 }
 
 int64_t ray_ipc_current_handle(void) {
@@ -987,7 +992,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
 
 static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
 {
-    (void)poll;
+    ray_mcast_on_close(poll, sel ? sel->id : -1);
     /* Fire `.ipc.on.close` BEFORE tearing the per-conn state down so a
      * hook reading `.ipc.handle` still sees this connection's id, and
      * before the listener's own close path (which would otherwise also
@@ -1791,6 +1796,83 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
                    ? RAY_ERR_IO : RAY_OK;
     if (owned) ray_release(msg);
     return rc;
+}
+
+static int try_send_bytes(ray_sock_t fd, const void* buf, size_t len)
+{
+    const uint8_t* p = (const uint8_t*)buf;
+    size_t off = 0;
+    while (off < len) {
+#ifdef RAY_OS_WINDOWS
+        int n = send(fd, (const char*)p + off, (int)(len - off), 0);
+        if (n < 0) {
+            int e = WSAGetLastError();
+            if (e == WSAEINTR) continue;
+            if (e == WSAEWOULDBLOCK) return 1;
+            return -1;
+        }
+#else
+        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            return -1;
+        }
+#endif
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
+{
+    bool owned = false;
+    if (ray_is_lazy(msg)) {
+        ray_retain(msg);
+        msg = ray_lazy_materialize(msg);
+        if (RAY_IS_ERR(msg)) {
+            ray_err_t code = ray_err_from_obj(msg);
+            ray_error_free(msg);
+            return code;
+        }
+        owned = true;
+    }
+
+    ray_selector_t* sel = conn_resolve(NULL, handle);
+    if (!sel) {
+        if (owned) ray_release(msg);
+        return RAY_ERR_IO;
+    }
+
+    int64_t ser_size = ray_serde_size(msg);
+    if (ser_size <= 0) {
+        if (owned) ray_release(msg);
+        return RAY_ERR_TYPE;
+    }
+
+    uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)ser_size);
+    if (!payload) {
+        if (owned) ray_release(msg);
+        return RAY_ERR_OOM;
+    }
+    ray_ser_raw(payload, msg);
+
+    ray_ipc_header_t hdr = {
+        .prefix  = RAY_SERDE_PREFIX,
+        .version = RAY_SERDE_WIRE_VERSION,
+        .flags   = 0,
+        .endian  = RAY_SERDE_ENDIAN,
+        .msgtype = RAY_IPC_MSG_ASYNC,
+        .size    = ser_size,
+    };
+
+    int rc = try_send_bytes((ray_sock_t)sel->fd, &hdr, sizeof(hdr));
+    if (rc == 0)
+        rc = try_send_bytes((ray_sock_t)sel->fd, payload, (size_t)ser_size);
+    ray_sys_free(payload);
+    if (owned) ray_release(msg);
+    return rc == 0 ? RAY_OK : RAY_ERR_IO;
 }
 
 /* Verbose-eval sync send: sets RAY_IPC_FLAG_VERBOSE on the outbound

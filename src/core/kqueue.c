@@ -160,7 +160,6 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
 
     if (sel->close_fn) sel->close_fn(poll, sel);
-    ray_mcast_on_close(poll, id);
     if (sel->rx.buf) ray_poll_buf_free(sel->rx.buf);
     ray_poll_buf_free(sel->tx.buf);
     ray_sys_free(sel);

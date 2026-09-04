@@ -649,7 +649,6 @@ ray_t* ray_mc_sub_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_unsub_fn(ray_t* topic);
 ray_t* ray_mc_pub_fn(ray_t* topic, ray_t* payload);
 ray_t* ray_mc_stats_fn(ray_t** args, int64_t n);
-ray_t* ray_mc_drop_fn(ray_t* handle);
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_get_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_get_parted_fn(ray_t** args, int64_t n);

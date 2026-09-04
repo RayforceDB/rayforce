@@ -3402,12 +3402,11 @@ static void ray_register_builtins(void) {
     register_vary(  ".ipc.handle", RAY_FN_NONE,       ray_ipc_handle_fn);
 
     /* Multicast/pub-sub over IPC.  Subscriptions are allowed under
-     * restricted IPC; publishing and administrative drop stay privileged. */
+     * restricted IPC; publishing stays privileged. */
     register_vary(  ".mc.sub",   RAY_FN_NONE,       ray_mc_sub_fn);
     register_unary( ".mc.unsub", RAY_FN_NONE,       ray_mc_unsub_fn);
     register_binary(".mc.pub",   RAY_FN_RESTRICTED, ray_mc_pub_fn);
     register_vary(  ".mc.stats", RAY_FN_NONE,       ray_mc_stats_fn);
-    register_unary( ".mc.drop",  RAY_FN_RESTRICTED, ray_mc_drop_fn);
 
     /* Remote-REPL session control under `.repl.*`.  Once .repl.connect
      * succeeds, the local REPL line-loop reroutes each subsequent input

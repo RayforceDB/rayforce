@@ -22,9 +22,7 @@ Expose multicast under reserved namespace `.mc.*`.
 (.mc.sub topic filter)
 (.mc.unsub topic)
 (.mc.pub topic payload)
-(.mc.replay topic from-seq)
 (.mc.stats)
-(.mc.drop handle)
 ```
 
 Initial semantics:
@@ -33,6 +31,7 @@ Initial semantics:
 - `filter`: null, symbol vector/list, dict, or lambda. MVP should support only null and simple dict filters; lambdas can be a later phase.
 - `payload`: any serializable Rayforce value, normally a table, vector, dict, or list.
 - `.mc.pub` returns the assigned sequence number.
+- `.mc.pub` returns `0` and does not create a topic when there are no active subscribers.
 - `.mc.sub` uses `(.ipc.handle)` when called during inbound IPC evaluation. Optionally support explicit handle form later.
 - pushed client message is an async IPC frame containing:
 
@@ -43,7 +42,8 @@ Initial semantics:
 This mirrors the common pub/sub convention where downstream clients implement `upd`. In
 Rayforce the delivered `topic` should be a string, not a bare symbol, because
 unquoted symbol atoms in expression position are name references in Rayfall.
-Symbol payload atoms must be sent as quoted/literal symbols for the same reason.
+The payload argument must be wrapped as data on the wire, for example with
+`(quote payload)`, so list payloads are not evaluated on the subscriber.
 
 ## Module Boundary
 
@@ -213,7 +213,6 @@ Recommended builtin flags:
 - `.mc.unsub`: allowed in restricted IPC mode.
 - `.mc.stats`: allowed, unless it leaks sensitive details.
 - `.mc.pub`: restricted by default.
-- `.mc.drop`: restricted.
 - `.mc.replay`: allowed only if it returns data the caller is already authorized to receive.
 
 Auth should remain at IPC handshake level. Fine-grained authorization can be added through `.ipc.on.auth` or a future `.mc.auth` policy hook, but do not add that in MVP.
@@ -222,7 +221,7 @@ Auth should remain at IPC handshake level. Fine-grained authorization can be add
 
 1. Initialize `poll->mcast` lazily on first `.mc.*` call.
 2. Destroy it in `ray_poll_destroy`.
-3. Call `ray_mcast_on_close(poll, sel->id)` from IPC close handling for inbound and outbound IPC connections.
+3. Call `ray_mcast_on_close(poll, sel->id)` from IPC close handling before `.ipc.on.close` runs.
 4. Ensure selector id reuse cannot leak subscriptions: close cleanup must run before the selector slot can be reused.
 5. If listener teardown destroys all selectors, multicast cleanup should release every retained filter and queued message.
 
@@ -248,7 +247,7 @@ Recommended decisions:
 - Add `void* mcast` to `ray_poll_t`.
 - Add create/destroy/lazy-get helpers.
 - Implement topic lookup, subscribe, unsubscribe, close cleanup, stats.
-- Implement publish using current `ray_ipc_send_async` or a small internal enqueue placeholder if TX queue work is started immediately.
+- Implement publish using a bounded nonblocking send path or a small internal enqueue placeholder if TX queue work is started immediately.
 - Register `.mc.sub`, `.mc.unsub`, `.mc.pub`, `.mc.stats`.
 - Add docs page with MVP semantics and limitations.
 

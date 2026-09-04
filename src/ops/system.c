@@ -1524,10 +1524,14 @@ ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n) {
     if (n != 2)
         return ray_error("domain", ".mc.sub expects 2 arguments");
+    if (!ray_ipc_context_poll())
+        return ray_error("domain", ".mc.sub requires a poll IPC context");
     return ray_mcast_sub(ray_ipc_active_poll(), ray_ipc_current_handle(), args[0], args[1]);
 }
 
 ray_t* ray_mc_unsub_fn(ray_t* topic) {
+    if (!ray_ipc_context_poll())
+        return ray_error("domain", ".mc.unsub requires a poll IPC context");
     return ray_mcast_unsub(ray_ipc_active_poll(), ray_ipc_current_handle(), topic);
 }
 
@@ -1539,11 +1543,4 @@ ray_t* ray_mc_stats_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("domain", ".mc.stats takes no arguments");
     return ray_mcast_stats(ray_ipc_active_poll());
-}
-
-ray_t* ray_mc_drop_fn(ray_t* handle) {
-    if (!ray_is_atom(handle) || (handle->type != -RAY_I64 && handle->type != -RAY_I32))
-        return ray_error("type", ".mc.drop expects an i64 or i32 handle, got %s", ray_type_name(handle->type));
-    int64_t h = (handle->type == -RAY_I64) ? handle->i64 : handle->i32;
-    return ray_mcast_drop(ray_ipc_active_poll(), h);
 }

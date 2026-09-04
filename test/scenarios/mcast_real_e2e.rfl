@@ -1,7 +1,7 @@
 ;; Real multicast IPC end-to-end scenario.
 ;;
 ;; Run against a separately-started `./rayforce -p PORT` server:
-;;   ./rayforce test/rfl/system/mcast_real_e2e.rfl -- --addr 127.0.0.1:PORT
+;;   ./rayforce test/scenarios/mcast_real_e2e.rfl -- --addr 127.0.0.1:PORT
 ;;
 ;; The client process opens two real IPC handles, subscribes both to one
 ;; topic, publishes through the server, and verifies server-pushed `upd`

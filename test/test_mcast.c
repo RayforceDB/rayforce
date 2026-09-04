@@ -220,6 +220,27 @@ static test_result_t test_mcast_single_client_pub(void) {
     TEST_ASSERT_NOT_NULL(ps);
     TEST_ASSERT_STR_EQ(ray_str_ptr(ps), "IBM");
 
+    pub_msg = ray_str("(.mc.pub \"ticks\" (list (first ['+]) 20 22))",
+                      strlen("(.mc.pub \"ticks\" (list (first ['+]) 20 22))"));
+    pub = ray_ipc_send(h, pub_msg);
+    ray_release(pub_msg);
+    ok = assert_ok(pub, "pub list payload");
+    if (ok.status != TEST_PASS) return ok;
+    TEST_ASSERT_EQ_I(pub->i64, 3);
+    ray_release(pub);
+    pump_client();
+
+    c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
+    p = ray_env_get(ray_sym_intern("_mc_last_payload", 16));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQ_I(c->i64, 3);
+    TEST_ASSERT_EQ_I(s->i64, 3);
+    TEST_ASSERT_EQ_I(p->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(ray_len(p), 3);
+
     ray_ipc_close(h);
     stop_server(poll, port, vm, tid);
     PASS();
@@ -447,7 +468,7 @@ static test_result_t test_mcast_no_subscribers_and_api_errors(void) {
     ray_release(msg);
     TEST_ASSERT_NOT_NULL(pub);
     TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
-    TEST_ASSERT_EQ_I(pub->i64, 1);
+    TEST_ASSERT_EQ_I(pub->i64, 0);
     ray_release(pub);
 
     msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
@@ -455,9 +476,9 @@ static test_result_t test_mcast_no_subscribers_and_api_errors(void) {
     ray_release(msg);
     TEST_ASSERT_NOT_NULL(st);
     TEST_ASSERT_FALSE(RAY_IS_ERR(st));
-    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 0);
     TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 0);
-    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 0);
     TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 0);
     TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 0);
     ray_release(st);
@@ -476,14 +497,6 @@ static test_result_t test_mcast_no_subscribers_and_api_errors(void) {
     TEST_ASSERT_NOT_NULL(err);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     TEST_ASSERT_STR_EQ(ray_err_code(err), "type");
-    ray_error_free(err);
-
-    msg = ray_str("(.mc.drop -1)", strlen("(.mc.drop -1)"));
-    err = ray_ipc_send(h, msg);
-    ray_release(msg);
-    TEST_ASSERT_NOT_NULL(err);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
-    TEST_ASSERT_STR_EQ(ray_err_code(err), "domain");
     ray_error_free(err);
 
     ray_ipc_close(h);

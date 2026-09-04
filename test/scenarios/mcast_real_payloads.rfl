@@ -1,6 +1,6 @@
 ;; Real multicast payload coverage against a running `./rayforce -p PORT`.
 ;;
-;;   ./rayforce test/rfl/system/mcast_real_payloads.rfl -- --addr 127.0.0.1:PORT
+;;   ./rayforce test/scenarios/mcast_real_payloads.rfl -- --addr 127.0.0.1:PORT
 
 (set _mc_addr (get (at (.sys.args) 'user) 'addr))
 
@@ -31,6 +31,7 @@
 (_mc_assert (>= h 0) "open")
 
 (.ipc.send h "(.mc.sub 'payloads null)")
+(set st0 (.ipc.send h "(.mc.stats)"))
 
 (.ipc.send h "(.mc.pub \"payloads\" 42)")
 (_mc_assert (== _mc_count 1) "i64 delivered")
@@ -58,9 +59,9 @@
 (set st (.ipc.send h "(.mc.stats)"))
 (_mc_assert (== (at st 'topics) 1) "stats topics")
 (_mc_assert (== (at st 'subscriptions) 1) "stats subscriptions")
-(_mc_assert (== (at st 'published) 4) "stats published")
-(_mc_assert (== (at st 'delivered) 4) "stats delivered")
-(_mc_assert (== (at st 'dropped) 0) "stats dropped")
+(_mc_assert (== (at st 'published) (+ (at st0 'published) 4)) "stats published")
+(_mc_assert (== (at st 'delivered) (+ (at st0 'delivered) 4)) "stats delivered")
+(_mc_assert (== (at st 'dropped) (at st0 'dropped)) "stats dropped")
 
 (.ipc.close h)
 

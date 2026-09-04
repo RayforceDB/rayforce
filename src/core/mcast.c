@@ -45,8 +45,10 @@ static int64_t topic_sym(ray_t* topic) {
         const char* s = ray_str_vec_get(topic, 0, &len);
         return s ? ray_sym_intern(s, len) : -1;
     }
-    if (topic->type == RAY_SYM && ray_len(topic) == 1)
-        return ray_read_sym(ray_data(topic), 0, RAY_SYM, topic->attrs);
+    if (topic->type == RAY_SYM && ray_len(topic) == 1) {
+        ray_t* cell = ray_sym_vec_cell(topic, 0);
+        return cell ? ray_sym_intern(ray_str_ptr(cell), ray_str_len(cell)) : -1;
+    }
     return -1;
 }
 
@@ -118,6 +120,43 @@ static void remove_sub(ray_mcast_topic_t* t, int32_t idx) {
     t->n_subs--;
 }
 
+static void remove_topic(ray_mcast_t* mc, int32_t idx) {
+    if (!mc || idx < 0 || idx >= mc->n_topics) return;
+    ray_mcast_topic_t* t = &mc->topics[idx];
+    for (int32_t j = 0; j < t->n_subs; j++) {
+        if (t->subs[j].filter && t->subs[j].filter != RAY_NULL_OBJ)
+            ray_release(t->subs[j].filter);
+    }
+    if (t->subs) ray_sys_free(t->subs);
+    if (idx + 1 < mc->n_topics)
+        memmove(&mc->topics[idx], &mc->topics[idx + 1],
+                (size_t)(mc->n_topics - idx - 1) * sizeof(ray_mcast_topic_t));
+    mc->n_topics--;
+}
+
+static int32_t topic_index(ray_mcast_t* mc, int64_t sym) {
+    if (!mc) return -1;
+    for (int32_t i = 0; i < mc->n_topics; i++)
+        if (mc->topics[i].topic_sym == sym) return i;
+    return -1;
+}
+
+static ray_t* make_quoted_payload(ray_t* payload) {
+    ray_t* q = ray_list_new(2);
+    if (!q || RAY_IS_ERR(q)) return q ? q : ray_error("oom", NULL);
+    ray_t* head = ray_sym(ray_sym_intern("quote", 5));
+    if (!head || RAY_IS_ERR(head)) {
+        if (head && RAY_IS_ERR(head)) ray_error_free(head);
+        ray_release(q);
+        return ray_error("oom", NULL);
+    }
+    q = ray_list_append(q, head);
+    ray_release(head);
+    if (RAY_IS_ERR(q)) return q;
+    q = ray_list_append(q, payload);
+    return q;
+}
+
 static ray_t* make_upd_msg(int64_t topic, int64_t seq, ray_t* payload) {
     ray_t* msg = ray_list_new(4);
     if (!msg || RAY_IS_ERR(msg)) return msg ? msg : ray_error("oom", NULL);
@@ -132,16 +171,12 @@ static ray_t* make_upd_msg(int64_t topic, int64_t seq, ray_t* payload) {
     ray_t* head = ray_sym(ray_sym_intern("upd", 3));
     ray_t* top  = ray_str(ray_str_ptr(topic_name), ray_str_len(topic_name));
     ray_t* s    = ray_i64(seq);
-    ray_t* body = payload;
-    if (payload && ray_is_atom(payload) && payload->type == -RAY_SYM) {
-        body = ray_alloc_copy(payload);
-        if (body && !RAY_IS_ERR(body)) body->attrs |= ATTR_QUOTED;
-    }
+    ray_t* body = make_quoted_payload(payload);
     if (!head || RAY_IS_ERR(head) || !top || RAY_IS_ERR(top) || !s || RAY_IS_ERR(s)) {
         if (head && !RAY_IS_ERR(head)) ray_release(head);
         if (top && !RAY_IS_ERR(top)) ray_release(top);
         if (s && !RAY_IS_ERR(s)) ray_release(s);
-        if (body && body != payload && !RAY_IS_ERR(body)) ray_release(body);
+        if (body && !RAY_IS_ERR(body)) ray_release(body);
         ray_release(msg);
         return ray_error("oom", NULL);
     }
@@ -158,9 +193,9 @@ static ray_t* make_upd_msg(int64_t topic, int64_t seq, ray_t* payload) {
     msg = ray_list_append(msg, top);  ray_release(top);
     if (RAY_IS_ERR(msg)) { if (body != payload) ray_release(body); return msg; }
     msg = ray_list_append(msg, s);    ray_release(s);
-    if (RAY_IS_ERR(msg)) { if (body != payload) ray_release(body); return msg; }
+    if (RAY_IS_ERR(msg)) { ray_release(body); return msg; }
     msg = ray_list_append(msg, body);
-    if (body != payload) ray_release(body);
+    ray_release(body);
     return msg;
 }
 
@@ -218,11 +253,13 @@ ray_t* ray_mcast_unsub(ray_poll_t* poll, int64_t handle, ray_t* topic) {
     int64_t sym = topic_sym(topic);
     if (sym < 0) return ray_error("type", ".mc.unsub topic must be a symbol or string");
     ray_mcast_t* mc = (ray_mcast_t*)(poll ? poll->mcast : NULL);
-    ray_mcast_topic_t* t = find_topic(mc, sym);
-    if (!t) return RAY_NULL_OBJ;
+    int32_t ti = topic_index(mc, sym);
+    if (ti < 0) return RAY_NULL_OBJ;
+    ray_mcast_topic_t* t = &mc->topics[ti];
     for (int32_t i = 0; i < t->n_subs; i++) {
         if (t->subs[i].handle == handle) {
             remove_sub(t, i);
+            if (t->n_subs == 0) remove_topic(mc, ti);
             break;
         }
     }
@@ -236,28 +273,35 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
     if (ray_serde_size(payload) <= 0)
         return ray_error("type", ".mc.pub payload is not serializable");
 
-    ray_mcast_t* mc = poll_mcast(poll);
-    if (!mc) return ray_error("oom", NULL);
-    ray_mcast_topic_t* t = ensure_topic(mc, sym);
-    if (!t) return ray_error("oom", NULL);
+    ray_mcast_t* mc = (ray_mcast_t*)poll->mcast;
+    ray_mcast_topic_t* t = find_topic(mc, sym);
+    if (!t || t->n_subs == 0) return ray_i64(0);
 
-    int64_t seq = t->next_seq++;
+    int64_t seq = t->next_seq;
+    ray_t* msg = make_upd_msg(sym, seq, payload);
+    if (!msg || RAY_IS_ERR(msg)) return msg ? msg : ray_error("oom", NULL);
+
+    t->next_seq++;
     mc->published++;
 
     for (int32_t i = 0; i < t->n_subs;) {
-        ray_t* msg = make_upd_msg(sym, seq, payload);
-        if (!msg || RAY_IS_ERR(msg)) return msg ? msg : ray_error("oom", NULL);
-        ray_err_t rc = ray_ipc_send_async(t->subs[i].handle, msg);
-        ray_release(msg);
+        ray_err_t rc = ray_ipc_try_send_async(t->subs[i].handle, msg);
         if (rc == RAY_OK) {
             t->subs[i].last_sent_seq = seq;
             mc->delivered++;
             i++;
         } else {
+            int64_t dead = t->subs[i].handle;
             t->subs[i].dropped++;
             mc->dropped++;
             remove_sub(t, i);
+            ray_ipc_close(dead);
         }
+    }
+    ray_release(msg);
+    if (t->n_subs == 0) {
+        int32_t ti = topic_index(mc, sym);
+        if (ti >= 0) remove_topic(mc, ti);
     }
 
     return ray_i64(seq);
@@ -305,22 +349,16 @@ ray_t* ray_mcast_stats(ray_poll_t* poll) {
     return ray_dict_new(keys, vals);
 }
 
-ray_t* ray_mcast_drop(ray_poll_t* poll, int64_t handle) {
-    if (!poll) return ray_error("domain", ".mc.drop requires an active poll");
-    if (handle < 0) return ray_error("domain", ".mc.drop handle must be >= 0");
-    ray_mcast_on_close(poll, handle);
-    ray_ipc_close(handle);
-    return RAY_NULL_OBJ;
-}
-
 void ray_mcast_on_close(ray_poll_t* poll, int64_t handle) {
     ray_mcast_t* mc = (ray_mcast_t*)(poll ? poll->mcast : NULL);
     if (!mc || handle < 0) return;
-    for (int32_t i = 0; i < mc->n_topics; i++) {
+    for (int32_t i = 0; i < mc->n_topics;) {
         ray_mcast_topic_t* t = &mc->topics[i];
         for (int32_t j = 0; j < t->n_subs;) {
             if (t->subs[j].handle == handle) remove_sub(t, j);
             else j++;
         }
+        if (t->n_subs == 0) remove_topic(mc, i);
+        else i++;
     }
 }
