@@ -6,3 +6,31 @@
 
 ;; Idempotent under nulls
 (count (distinct (distinct [1 0N 2 0N]))) -- (count (distinct [1 0N 2 0N]))
+
+;; The same rule has to survive a grouped count, and specifically the parallel
+;; per-group kernel — a different implementation from the ungrouped builtin
+;; above and from the serial fallback beside it.  It is selected only when the
+;; pool has at least two workers and the query has at least four groups, so the
+;; shapes below are built to reach it: the suite runs with TEST_CORES=2, and
+;; each has four groups.  The kernel used to drop nulls rather than fold them,
+;; which made the answer depend on the core count.
+;;
+;; group 0 -> 10, 0N, 10  = {10, null}       = 2
+;; group 1 -> 0N, 20, 20  = {20, null}       = 2
+;; group 2 -> 20, 0N, 30  = {20, 30, null}   = 3
+;; group 3 -> 30, 30, 0N  = {30, null}       = 2
+(set _dn (table [k v] (list [0 1 2 3 0 1 2 3 0 1 2 3] [10 0N 20 30 0N 20 0N 30 10 20 30 0N])))
+(at (select {d: (count (distinct v)) by: k from: _dn}) 'd) -- [2 2 3 2]
+
+;; A group whose every value is null still holds one distinct value, not zero.
+(set _dz (table [k v] (list [0 1 2 3 0 1 2 3] [0N 1 2 3 0N 1 2 3])))
+(at (select {d: (count (distinct v)) by: k from: _dz}) 'd) -- [1 1 1 1]
+
+;; F64 nulls take a separate arm of the same kernel.
+(set _df (table [k v] (list [0 1 2 3 0 1 2 3] [1.5 0Nf 2.5 3.5 0Nf 0Nf 2.5 0Nf])))
+(at (select {d: (count (distinct v)) by: k from: _df}) 'd) -- [2 1 1 2]
+
+;; A SYM null is the empty symbol.  It was already counted, through the flag the
+;; table keeps for the literal 0 — pinned so the two arms stay in step.
+(set _ds (table [k v] (list [0 1 2 3 0 1 2 3] (as 'SYM ["a" "" "b" "c" "" "" "b" "c"]))))
+(at (select {d: (count (distinct v)) by: k from: _ds}) 'd) -- [2 1 1 1]
