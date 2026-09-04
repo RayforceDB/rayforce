@@ -12592,9 +12592,14 @@ static bool parted_segment_attrs_valid(int8_t base, uint8_t attrs) {
     if (base == RAY_SYM) allowed |= RAY_SYM_W_MASK;
     if (base == RAY_I32 || base == RAY_I64)
         allowed |= RAY_ATTR_HAS_LINK;
+    /* SYM/STR nulls (the empty symbol / empty string) are in-band — the bit
+     * only marks their presence, the payload is unchanged — and the store
+     * carries it across a save, so every mapped partition holding one blank
+     * cell arrives here with it set. */
     if (base == RAY_I16 || base == RAY_I32 || base == RAY_I64 ||
         base == RAY_F32 || base == RAY_F64 || base == RAY_DATE ||
-        base == RAY_TIME || base == RAY_TIMESTAMP || base == RAY_GUID)
+        base == RAY_TIME || base == RAY_TIMESTAMP || base == RAY_GUID ||
+        base == RAY_SYM || base == RAY_STR)
         allowed |= RAY_ATTR_HAS_NULLS;
     return (attrs & (uint8_t)~allowed) == 0;
 }
