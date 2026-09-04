@@ -105,46 +105,47 @@
 (set Tcd-null (table [g v] (list Ggrp Vnull)))
 ;; 11) has_nulls arm with I64 data — exercises the read_col_i64 fallback
 ;;     at L1223 inside the has_nulls block (esz==8, in_type==RAY_I64).
-;;     CONVENTION: the per-group count(distinct) has_nulls kernel SKIPS
-;;     nulls (does NOT count a null as a distinct value).  Probed here:
-;;     group 0 = {0Nl, 0}; were the null counted this would be 2, but the
-;;     kernel returns 1 (the lone non-null 0).  This differs from the
-;;     scalar `(count (distinct [1 0N ...]))` which keeps one null
-;;     (null/distinct.rfl:3) — a per-group-vs-scalar behavior difference.
+;;     A null is one distinct value, the same rule the scalar
+;;     `(count (distinct [1 0N ...]))` follows (null/distinct.rfl).  The
+;;     per-group kernels used to skip nulls instead, and this block pinned
+;;     that as a deliberate per-group-vs-scalar difference — but it made the
+;;     answer depend on the core count and on the group count, since the
+;;     three kernels disagreed among themselves.  One rule now.
 ;;
 ;;     Layout: Vnull[i] = (i-5)%7 for i>=5, prefix [null 1 null 2 null].
 ;;     Group k<9000 = rows {k, k+51000}; partner value = k%7 (because
 ;;     (k+51000-5)%7 = k%7).  Per-group distinct values:
-;;       g0 row0=null,   partner 0%7=0 → {0}        = 1
+;;       g0 row0=null,   partner 0%7=0 → {null,0}   = 2
 ;;       g1 row1=1,      partner 1%7=1 → {1}        = 1
-;;       g2 row2=null,   partner 2%7=2 → {2}        = 1
+;;       g2 row2=null,   partner 2%7=2 → {null,2}   = 2
 ;;       g3 row3=2,      partner 3%7=3 → {2,3}      = 2
-;;       g4 row4=null,   partner 4%7=4 → {4}        = 1
+;;       g4 row4=null,   partner 4%7=4 → {null,4}   = 2
 ;;       g5..g8999 (bulk 2-row): (k-5)%7 vs k%7 differ → 2 each (8995*2)
 ;;       g9000..g50999 (1-row): (k-5)%7              → 1 each (42000*1)
-;;     Sum = 6 + 8995*2 + 42000 = 59996.
+;;     Sum = 9 + 8995*2 + 42000 = 59999.
 (set Rcdnull (select {n: (count (distinct v)) from: Tcd-null by: g}))
 (count Rcdnull) -- 51000
-;; Group 0 = {0Nl, 0} → null skipped → 1 distinct.
-(at (at Rcdnull 'n) 0) -- 1
+;; Group 0 = {0Nl, 0} → the null is one value → 2 distinct.
+(at (at Rcdnull 'n) 0) -- 2
 ;; Group 3 = {2, 3} → no null, two values → 2 distinct.
 (at (at Rcdnull 'n) 3) -- 2
 ;; Group 5 = bulk 2-row {(0)%7=0, 5%7=5} → 2 distinct.
 (at (at Rcdnull 'n) 5) -- 2
-(sum (at Rcdnull 'n)) -- 59996
+(sum (at Rcdnull 'n)) -- 59999
 
 ;; 12) has_nulls arm with F64 data — exercises the F64 NaN / -0.0
 ;;     normalisation inside the has_nulls block.  Same group structure
-;;     and same null-skip convention; 0Nf (NaN) rows are skipped.
+;;     and the same rule; every NaN payload folds to one canonical NaN, so a
+;;     null counts once here too.
 (set Vnullf (as 'F64 Vnull))
 (set Tcd-fnull (table [g v] (list Ggrp Vnullf)))
 (set Rcdfnull (select {n: (count (distinct v)) from: Tcd-fnull by: g}))
 (count Rcdfnull) -- 51000
-;; Group 0 = {0Nf, 0.0} → NaN skipped → 1 distinct.
-(at (at Rcdfnull 'n) 0) -- 1
+;; Group 0 = {0Nf, 0.0} → the null is one value → 2 distinct.
+(at (at Rcdfnull 'n) 0) -- 2
 ;; Group 3 = {2.0, 3.0} → 2 distinct.
 (at (at Rcdfnull 'n) 3) -- 2
-(sum (at Rcdfnull 'n)) -- 59996
+(sum (at Rcdfnull 'n)) -- 59999
 
 ;; ────────── count_distinct_per_group_groups (eval-fallback) ──────────
 ;; STR or LIST by-key flips use_eval_group=1 at query.c:4498, which

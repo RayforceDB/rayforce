@@ -1580,26 +1580,6 @@ typedef struct {
 /* Type-correct null check for the column row r.  Mirrors sentinel_is_null
  * but specialised for cdpg's pre-resolved (base, in_type, esz) ctx so the
  * hot loop avoids the ray_t pointer indirection. */
-static inline bool cdpg_is_null(const void* base, int64_t r,
-                                int8_t in_type, uint8_t esz) {
-    switch (in_type) {
-        case RAY_F64: { double f = ((const double*)base)[r]; return f != f; }
-        case RAY_F32: { float  f = ((const float*) base)[r]; return f != f; }
-        case RAY_I64: case RAY_TIMESTAMP:
-            return ((const int64_t*)base)[r] == NULL_I64;
-        case RAY_I32: case RAY_DATE: case RAY_TIME:
-            return ((const int32_t*)base)[r] == NULL_I32;
-        case RAY_I16:
-            return ((const int16_t*)base)[r] == NULL_I16;
-        case RAY_SYM:
-            if (esz == 1) return ((const uint8_t*)base)[r] == 0;
-            if (esz == 2) return ((const uint16_t*)base)[r] == 0;
-            if (esz == 4) return ((const uint32_t*)base)[r] == 0;
-            return ((const int64_t*)base)[r] == 0;
-        default:  /* BOOL / U8 — non-nullable */
-            return false;
-    }
-}
 
 /* Read column row r as int64.  Width-typed fast path; F64 bitcasts. */
 static inline int64_t cdpg_read(const void* base, int64_t r,
@@ -1634,7 +1614,6 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
     for (int64_t r = start; r < end; r++) {
         int64_t gid = x->row_gid[r];
         if (gid < 0 || gid >= x->n_groups) continue;
-        if (x->has_nulls && cdpg_is_null(x->base, r, x->in_type, esz)) continue;
         /* Partition by gid (not gid×val) so the dedup pass can write to
          * odata[gid] without atomics. */
         uint64_t h = CDPG_PART_HASH(gid + 1);
@@ -1657,7 +1636,6 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
     for (int64_t r = start; r < end; r++) {
         int64_t gid = x->row_gid[r];
         if (gid < 0 || gid >= x->n_groups) continue;
-        if (x->has_nulls && cdpg_is_null(x->base, r, x->in_type, esz)) continue;
         int64_t val = cdpg_read(x->base, r, x->in_type, esz);
         int64_t gid_p1 = gid + 1;
         uint64_t h = CDPG_PART_HASH(gid_p1);
@@ -2088,7 +2066,6 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
         for (int64_t r = 0; r < n_rows; r++) {
             int64_t gid = row_gid[r];
             if (gid < 0 || gid >= n_groups) continue;
-            if (cdpg_is_null(base, r, in_type, esz)) continue;
             /* Use a different name from the macro's inner `val` so
              * clang doesn't see an `int64_t val = (val);` self-init
              * after macro expansion. */

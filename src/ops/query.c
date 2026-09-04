@@ -3404,13 +3404,6 @@ typedef struct {
  * two cache-line accesses (used byte + set int64) into a single
  * int64 read on the hot path.  Hits high-cardinality count_distinct
  * grouped queries where the per-group HT churn was thrashing L2. */
-/* A null is one distinct value, however many rows carry it — the same rule
- * the serial path and the ungrouped builtin follow.  Kept out of the table
- * for the same reason the literal 0 is: slot 0 means empty. */
-#define CDPG_BUF_NULL() do {                                        \
-    if (!saw_null) { saw_null = 1; distinct++; }                    \
-} while (0)
-
 #define CDPG_BUF_INSERT(VAL_EXPR) do {                              \
     int64_t _ins_v = (int64_t)(VAL_EXPR);                           \
     if (RAY_UNLIKELY(_ins_v == 0)) {                                \
@@ -3466,53 +3459,35 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
 
         int64_t distinct = 0;
         int saw_zero = 0;
-        int saw_null = 0;
-        bool has_nulls = ctx->has_nulls;
 
         if (ctx->is_f64) {
             const double* d = (const double*)ctx->base;
             for (int64_t i = 0; i < cnt; i++) {
                 int64_t r = idxs[i];
                 double fv = d[r];
-                if (has_nulls && fv != fv) { CDPG_BUF_NULL(); continue; }
-                fv = clear_neg_zero(fv);
+                /* Every NaN payload folds to one canonical NaN, so a null is
+                 * one key however many rows carry it — no side flag needed. */
+                if (fv != fv) fv = (double)NAN;
+                else fv = clear_neg_zero(fv);
                 int64_t vbits = 0;
                 memcpy(&vbits, &fv, sizeof(int64_t));
                 CDPG_BUF_INSERT(vbits);
             }
         } else if (ctx->esz == 8) {
+            /* The null sentinels are INT_MIN: nonzero, and unique once widened
+             * to int64_t, so they hash as an ordinary key and a null counts
+             * exactly once with no special case. */
             const int64_t* d = (const int64_t*)ctx->base;
-            if (has_nulls) {
-                for (int64_t i = 0; i < cnt; i++) {
-                    int64_t v = d[idxs[i]];
-                    if (v == NULL_I64) { CDPG_BUF_NULL(); continue; }
-                    CDPG_BUF_INSERT(v);
-                }
-            } else {
-                for (int64_t i = 0; i < cnt; i++) {
-                    CDPG_BUF_INSERT(d[idxs[i]]);
-                }
-            }
+            for (int64_t i = 0; i < cnt; i++)
+                CDPG_BUF_INSERT(d[idxs[i]]);
         } else if (ctx->esz == 4) {
             const int32_t* d = (const int32_t*)ctx->base;
-            if (has_nulls) {
-                for (int64_t i = 0; i < cnt; i++) {
-                    int32_t v = d[idxs[i]];
-                    if (v == NULL_I32) { CDPG_BUF_NULL(); continue; }
-                    CDPG_BUF_INSERT((int64_t)v);
-                }
-            } else {
-                for (int64_t i = 0; i < cnt; i++) {
-                    CDPG_BUF_INSERT((int64_t)d[idxs[i]]);
-                }
-            }
+            for (int64_t i = 0; i < cnt; i++)
+                CDPG_BUF_INSERT((int64_t)d[idxs[i]]);
         } else if (ctx->esz == 2) {
             const int16_t* d = (const int16_t*)ctx->base;
-            for (int64_t i = 0; i < cnt; i++) {
-                int16_t v = d[idxs[i]];
-                if (has_nulls && v == NULL_I16) { CDPG_BUF_NULL(); continue; }
-                CDPG_BUF_INSERT((int64_t)v);
-            }
+            for (int64_t i = 0; i < cnt; i++)
+                CDPG_BUF_INSERT((int64_t)d[idxs[i]]);
         } else { /* esz == 1 — BOOL/U8 are non-nullable */
             const uint8_t* d = (const uint8_t*)ctx->base;
             for (int64_t i = 0; i < cnt; i++) {
@@ -3525,7 +3500,6 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
     }
 }
 #undef CDPG_BUF_INSERT
-#undef CDPG_BUF_NULL
 
 /* Parallel idx_buf construction from row_gid.  Builds the
  * groupwise inverted index used by per-group-slice consumers

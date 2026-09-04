@@ -34,3 +34,21 @@
 ;; table keeps for the literal 0 — pinned so the two arms stay in step.
 (set _ds (table [k v] (list [0 1 2 3 0 1 2 3] (as 'SYM ["a" "" "b" "c" "" "" "b" "c"]))))
 (at (select {d: (count (distinct v)) by: k from: _ds}) 'd) -- [2 1 1 1]
+
+;; Above 50000 groups the query leaves the kernel above entirely and routes to
+;; ray_count_distinct_per_group in group.c — a third implementation of the same
+;; rule, with its own serial and partitioned loops.  Both sides of the routing
+;; boundary must answer alike, or the count depends on how many groups the data
+;; happens to have.  120002 rows alternating {10, null}: every group holds one
+;; value and one null, so every group counts 2.
+(set _dg (table [k v] (list (% (til 120002) 60001) (at [10 0N] (% (til 120002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: k from: _dg}) 'd)) -- [2]
+
+;; The same data below the boundary, through the other kernel.
+(set _dl (table [k v] (list (% (til 120002) 40001) (at [10 0N] (% (til 120002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: k from: _dl}) 'd)) -- [2]
+
+;; A column that is entirely null still holds one distinct value per group on
+;; both sides — it read 0 above the boundary and 1 below it.
+(set _dan (table [k v] (list (% (til 120002) 60001) (take [0N] 120002))))
+(distinct (at (select {d: (count (distinct v)) by: k from: _dan}) 'd)) -- [1]
