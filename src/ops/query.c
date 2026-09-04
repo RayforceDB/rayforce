@@ -3373,9 +3373,13 @@ static ray_t* aggr_med_per_group_buf(ray_t* expr, ray_t* tbl,
  * no intermediate compaction.
  *
  * Specialised on element width (1/2/4/8 bytes + F64) so the inner read
- * folds to a typed pointer dereference.  Has-nulls falls through to
- * ray_count_distinct_per_group_buf serial path (acceptable: null-bearing
- * columns are rare in wide analytical aggregates). */
+ * folds to a typed pointer dereference.
+ *
+ * A null counts as one distinct value, matching the serial path and the
+ * ungrouped builtin — `distinct` keeps at most one null, so `count` over it
+ * sees exactly one.  It cannot go in the table (the empty slot is encoded as
+ * 0 and a null's payload is not a usable key), so it rides a side flag the
+ * same way the literal 0 does. */
 typedef struct {
     int8_t          in_type;
     uint8_t         in_attrs;
@@ -3400,6 +3404,13 @@ typedef struct {
  * two cache-line accesses (used byte + set int64) into a single
  * int64 read on the hot path.  Hits high-cardinality count_distinct
  * grouped queries where the per-group HT churn was thrashing L2. */
+/* A null is one distinct value, however many rows carry it — the same rule
+ * the serial path and the ungrouped builtin follow.  Kept out of the table
+ * for the same reason the literal 0 is: slot 0 means empty. */
+#define CDPG_BUF_NULL() do {                                        \
+    if (!saw_null) { saw_null = 1; distinct++; }                    \
+} while (0)
+
 #define CDPG_BUF_INSERT(VAL_EXPR) do {                              \
     int64_t _ins_v = (int64_t)(VAL_EXPR);                           \
     if (RAY_UNLIKELY(_ins_v == 0)) {                                \
@@ -3455,6 +3466,7 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
 
         int64_t distinct = 0;
         int saw_zero = 0;
+        int saw_null = 0;
         bool has_nulls = ctx->has_nulls;
 
         if (ctx->is_f64) {
@@ -3462,7 +3474,7 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
             for (int64_t i = 0; i < cnt; i++) {
                 int64_t r = idxs[i];
                 double fv = d[r];
-                if (has_nulls && fv != fv) continue;
+                if (has_nulls && fv != fv) { CDPG_BUF_NULL(); continue; }
                 fv = clear_neg_zero(fv);
                 int64_t vbits = 0;
                 memcpy(&vbits, &fv, sizeof(int64_t));
@@ -3473,7 +3485,7 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
             if (has_nulls) {
                 for (int64_t i = 0; i < cnt; i++) {
                     int64_t v = d[idxs[i]];
-                    if (v == NULL_I64) continue;
+                    if (v == NULL_I64) { CDPG_BUF_NULL(); continue; }
                     CDPG_BUF_INSERT(v);
                 }
             } else {
@@ -3486,7 +3498,7 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
             if (has_nulls) {
                 for (int64_t i = 0; i < cnt; i++) {
                     int32_t v = d[idxs[i]];
-                    if (v == NULL_I32) continue;
+                    if (v == NULL_I32) { CDPG_BUF_NULL(); continue; }
                     CDPG_BUF_INSERT((int64_t)v);
                 }
             } else {
@@ -3498,7 +3510,7 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
             const int16_t* d = (const int16_t*)ctx->base;
             for (int64_t i = 0; i < cnt; i++) {
                 int16_t v = d[idxs[i]];
-                if (has_nulls && v == NULL_I16) continue;
+                if (has_nulls && v == NULL_I16) { CDPG_BUF_NULL(); continue; }
                 CDPG_BUF_INSERT((int64_t)v);
             }
         } else { /* esz == 1 — BOOL/U8 are non-nullable */
@@ -3513,6 +3525,7 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
     }
 }
 #undef CDPG_BUF_INSERT
+#undef CDPG_BUF_NULL
 
 /* Parallel idx_buf construction from row_gid.  Builds the
  * groupwise inverted index used by per-group-slice consumers
