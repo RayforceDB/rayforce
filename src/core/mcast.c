@@ -281,6 +281,17 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
     ray_t* msg = make_upd_msg(sym, seq, payload);
     if (!msg || RAY_IS_ERR(msg)) return msg ? msg : ray_error("oom", NULL);
 
+    int32_t dead_cap = t->n_subs;
+    int32_t dead_n = 0;
+    int64_t* dead_handles = NULL;
+    if (dead_cap > 0) {
+        dead_handles = (int64_t*)ray_sys_alloc((size_t)dead_cap * sizeof(int64_t));
+        if (!dead_handles) {
+            ray_release(msg);
+            return ray_error("oom", NULL);
+        }
+    }
+
     t->next_seq++;
     mc->published++;
 
@@ -295,7 +306,7 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
             t->subs[i].dropped++;
             mc->dropped++;
             remove_sub(t, i);
-            ray_ipc_close(dead);
+            dead_handles[dead_n++] = dead;
         }
     }
     ray_release(msg);
@@ -303,6 +314,9 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
         int32_t ti = topic_index(mc, sym);
         if (ti >= 0) remove_topic(mc, ti);
     }
+    for (int32_t i = 0; i < dead_n; i++)
+        ray_ipc_close(dead_handles[i]);
+    if (dead_handles) ray_sys_free(dead_handles);
 
     return ray_i64(seq);
 }
