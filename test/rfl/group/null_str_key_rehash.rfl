@@ -1,0 +1,67 @@
+;; null_str_key_rehash.rfl — a null key must hash identically wherever the
+;; hash is computed (#466).
+;;
+;; Regression: every phase-1 key builder stores a null key as a zeroed slot
+;; plus a null-mask bit and hashes it as ray_hash_i64(0).  hash_keys_inline
+;; (rehash / lookup / partial-table merge) read the stored slot back BY TYPE:
+;; a zeroed inline-STR descriptor hashed as the empty string and a zeroed
+;; wide (GUID) slot as source row 0.  After the table's first growth the
+;; rehashed group sat under a hash no probe computes, so every later row
+;; with the same keys opened a fresh group — one group per null-keyed row,
+;; silently wrong aggregates, no error.
+
+;; ─── the reported shape: long STR keys beside an all-null STR column ────
+(set G1 "c0f1979caacf5d1021f8cc8fbd5a67aea133f9851c4100e1f6939baf939901cf")
+(set KA "5e3ceb01534e06c927d06cb03492aafca56057df49937395af4f6ad7a4763c4c")
+(set KB "971723c2bc887c9f7b67f8f399a05944f31a6c7f9010ee9232d8a80478c4f37a")
+(set PAD (take (enlist "") 3))
+(set R (table [g1 g2 g3 v] (list (list G1 G1 G1) (list KA KB KB) PAD [1 2 3])))
+(set Q (select {n: (count v) from: R by: [g1 g2 g3]}))
+(count Q) -- 2
+(sum (at Q 'n)) -- 3
+(max (at Q 'n)) -- 2
+;; the same rows in the other order fold too
+(set Rb (table [g1 g2 g3 v] (list (list G1 G1 G1) (list KB KB KA) PAD [2 3 1])))
+(count (select {n: (count v) from: Rb by: [g1 g2 g3]})) -- 2
+;; two keys, null column second
+(count (select {n: (count v) from: R by: [g2 g3]})) -- 2
+;; the null column alone, and without the null column — unchanged
+(count (select {n: (count v) from: R by: g3})) -- 1
+(count (select {n: (count v) from: R by: [g1 g2]})) -- 2
+
+;; ─── short (SSO) strings behave the same ─────────────────────────────
+(set Rs (table [g1 g2 g3 v] (list (list "x" "x" "x") (list "a" "b" "b") PAD [1 2 3])))
+(count (select {n: (count v) from: Rs by: [g1 g2 g3]})) -- 2
+
+;; ─── sorted keys and a copying select take the same path ─────────────
+(count (select {n: (count v) from: (xasc R [g1 g2 g3]) by: [g1 g2 g3]})) -- 2
+(set Rc (select {g1: g1 g2: g2 g3: g3 v: v from: R}))
+(count (select {n: (count v) from: Rc by: [g1 g2 g3]})) -- 2
+
+;; ─── one null among real values in the second key ────────────────────
+(set Rm (table [g1 g2 v] (list (list "x" "x" "x" "x") (list "" "" "x" "") [1 2 3 4])))
+(set Qm (select {n: (count v) from: Rm by: [g1 g2]}))
+(count Qm) -- 2
+(max (at Qm 'n)) -- 3
+
+;; ─── many rows: several rehashes between equal null-keyed rows ───────
+;; 20000 rows over 300 distinct (I64, STR) pairs; the STR key is null on
+;; every third row so a third of the groups carry a null key.
+(set N 20000)
+(set Kn (as 'I64 (% (til N) 300)))
+(set Ks (take (list "" "a" "b") N))
+(set Rbig (table [k s v] (list Kn Ks (as 'I64 (til N)))))
+(set Qbig (select {n: (count v) from: Rbig by: [k s]}))
+(count Qbig) -- 300
+(sum (at Qbig 'n)) -- 20000
+(min (at Qbig 'n)) -- 66
+(max (at Qbig 'n)) -- 67
+;; STR key first, so it is key 0 in the layout
+(count (select {n: (count v) from: Rbig by: [s k]})) -- 300
+
+;; ─── a null GUID key beside a STR key (wide slot must not read as row 0) ─
+(set Gg (as 'GUID (list "00000000-0000-0000-0000-000000000001" "" "" "00000000-0000-0000-0000-000000000001")))
+(set Rg (table [g s v] (list Gg (list "a" "a" "a" "a") [1 2 3 4])))
+(set Qg (select {n: (count v) from: Rg by: [g s]}))
+(count Qg) -- 2
+(max (at Qg 'n)) -- 2

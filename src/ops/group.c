@@ -4163,15 +4163,25 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
                                          uint16_t n_keys, void* const* key_data,
                                          const ght_layout_t* ly,
                                          const void* const* key_pool) {
+    /* A null key is stored as a zeroed slot with its null-mask bit set, and
+     * every phase-1 builder hashes it as ray_hash_i64(0) REGARDLESS of the
+     * key's type.  Consult the mask before reading the slot back by type:
+     * a zeroed inline-STR descriptor would otherwise hash as the empty
+     * string, and a zeroed wide (GUID) slot as source row 0 — neither is
+     * what the entry was created under, so after the first rehash the group
+     * would sit under a hash no probe computes and never be found again. */
     if (ly->any_inline_str) {
         /* Inline-STR layout: key offsets are shifted by 16-byte descriptors,
          * so address every key via key_off[k] and hash the inline descriptor. */
         uint64_t h = 0;
+        const int64_t* nullw = (const int64_t*)((const char*)keys + ly->key_off[n_keys]);
+        const bool nullable = ly->null_words != 0;
         for (uint32_t k = 0; k < n_keys; k++) {
-            uint64_t kh = inline_layout_key_hash(ly, k, key_types, keys, key_data, key_pool);
+            uint64_t kh = (nullable && ((uint64_t)nullw[k >> 6] >> (k & 63)) & 1u)
+                        ? ray_hash_i64(0)
+                        : inline_layout_key_hash(ly, k, key_types, keys, key_data, key_pool);
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
-        const int64_t* nullw = (const int64_t*)((const char*)keys + ly->key_off[n_keys]);
         return ght_hash_null_words(h, nullw, ly->null_words);
     }
     /* Packed tuple: one avalanche over the whole key region.  MUST stay in
@@ -4180,10 +4190,15 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
     if (ly->packed_key)
         return ght_hash_lanes(keys, (uint32_t)n_keys + ly->null_words);
     const uint8_t* const kflags = ly->key_flags;
+    const bool nullable = ly->null_words != 0;
     uint64_t h = 0;
     for (uint32_t k = 0; k < n_keys; k++) {
         uint64_t kh;
-        if (kflags[k] & GHT_KEYF_WIDE) {
+        if (nullable && ((uint64_t)keys[n_keys + (k >> 6)] >> (k & 63)) & 1u) {
+            /* Null key (see above): the builder stored 0 and hashed
+             * ray_hash_i64(0), whatever the key type. */
+            kh = ray_hash_i64(0);
+        } else if (kflags[k] & GHT_KEYF_WIDE) {
             /* Wide key: keys[k] is the source row index.  Resolve + hash the
              * actual bytes (GUID fixed / STR SSO via pool). */
             kh = wide_key_hash_at(ly, k, key_data, key_pool, keys[k]);
