@@ -316,39 +316,34 @@ static int8_t if_value_type(ray_t* v) {
     return (t == RAY_F32) ? RAY_F64 : t;
 }
 
-/* Same predicate as graph.c's type_is_temporal, which is file-local there.
- * query.c carries its own copy too — three call sites, three copies. */
-static bool if_type_is_temporal(int8_t t) {
-    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
-}
 
-static int8_t if_promote_type(int8_t a, int8_t b) {
-    if (a == 0) return b;
-    if (b == 0) return a;
-    /* Two branches of the same temporal type keep it — the graph's own rule
-     * (promote_if_type in graph.c) says so, and the node's out_type was
-     * derived with it.  Without this the widening below reads TIMESTAMP as
-     * its I64 storage and hands back a plain integer, so the same expression
-     * answered TIMESTAMP or I64 depending on which arm of exec_if ran. */
-    if (a == b && if_type_is_temporal(a)) return a;
-    if (a == RAY_STR || b == RAY_STR) return RAY_STR;
-    if (a == RAY_SYM || b == RAY_SYM) return RAY_SYM;
-    if (a == RAY_F64 || b == RAY_F64 || a == RAY_F32 || b == RAY_F32)
-        return RAY_F64;
-    if (a == RAY_I64 || b == RAY_I64 ||
-        a == RAY_TIMESTAMP || b == RAY_TIMESTAMP)
-        return RAY_I64;
-    if (a == RAY_I32 || b == RAY_I32 ||
-        a == RAY_DATE || b == RAY_DATE || a == RAY_TIME || b == RAY_TIME)
-        return RAY_I32;
-    if (a == RAY_I16 || b == RAY_I16) return RAY_I16;
-    if (a == RAY_U8 || b == RAY_U8) return RAY_U8;
-    return RAY_BOOL;
-}
 
-static int8_t if_selected_type(ray_t* then_v, ray_t* else_v, int8_t fallback) {
-    int8_t t = if_promote_type(if_value_type(then_v), if_value_type(else_v));
-    return t ? t : fallback;
+/* The graph already promoted the two branch types into op->out_type, and that
+ * is the answer — with one exception it cannot know statically.  A branch that
+ * ends up supplying no rows never materialises its type, so an F64 demanded by
+ * a float branch that never ran should not survive: the integer side keeps its
+ * own width.  That is the whole of the narrowing this arm does, and it is why
+ * (if (> v 0) v (sqrt s)) sums to 15 rather than 15.0 when every row is
+ * positive.
+ *
+ * And only where the eager arm could not have handled the node at all — a STR
+ * output, or a branch it cannot fill elementwise.  Where it could, it fills
+ * every row from op->out_type and never narrows, so narrowing here would make
+ * the same expression answer differently by worker count, which is the defect
+ * being fixed.
+ *
+ * Anything beyond that was a second promotion ladder living beside the graph's,
+ * and the two had drifted: it folded two matching temporal types down to their
+ * integer storage, so the same expression answered TIMESTAMP or I64 depending
+ * on which arm of exec_if ran. */
+static int8_t if_selected_type(ray_t* then_v, ray_t* else_v, int8_t declared,
+                               bool eager_possible) {
+    if (eager_possible) return declared;
+    if (then_v && else_v) return declared;
+    ray_t* live = then_v ? then_v : else_v;
+    if (!live) return declared;
+    int8_t lt = if_value_type(live);
+    return lt ? lt : declared;
 }
 
 static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
@@ -508,13 +503,19 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
      * here.  Only when workers exist: with a 0-worker pool (-c 1) the
      * eager fill runs serially over ALL rows for BOTH branches, which
      * loses to the selected path's touch-only-passing-rows scheme. */
+    /* Whether the eager arm is even a candidate for this node — not whether
+     * it runs, which also depends on the pool.  Where it is, this arm must
+     * answer exactly as it would, or the same expression gets two types
+     * depending on the worker count.  Where it is not, this arm is the only
+     * one there is and may report the type the rows actually have. */
+    bool eager_possible = op->out_type != RAY_STR &&
+                          if_branch_trivial(g, then_op) &&
+                          if_branch_trivial(g, else_op) &&
+                          if_type_eager_ok(then_op->out_type, op->out_type) &&
+                          if_type_eager_ok(else_op->out_type, op->out_type);
     {
         ray_pool_t* rp = ray_pool_get();
-        if (rp && rp->n_workers > 0 &&
-            op->out_type != RAY_STR &&
-            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op) &&
-            if_type_eager_ok(then_op->out_type, op->out_type) &&
-            if_type_eager_ok(else_op->out_type, op->out_type))
+        if (rp && rp->n_workers > 0 && eager_possible)
             return NULL;
     }
 
@@ -556,7 +557,7 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
         return else_v;
     }
 
-    int8_t out_type = if_selected_type(then_v, else_v, op->out_type);
+    int8_t out_type = if_selected_type(then_v, else_v, op->out_type, eager_possible);
     if (!if_lazy_supported_type(out_type)) {
         if (then_v) ray_release(then_v);
         if (else_v) ray_release(else_v);

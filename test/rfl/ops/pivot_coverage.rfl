@@ -664,22 +664,41 @@ RDatedead -- [2024.01.01 2023.01.02]
 (type RTimedead) -- 'TIME
 RTimedead -- [09:30:00.000 11:00:00.000]
 
-;; ── (if …) over two branches of one temporal type keeps that type ───────
-;; The graph derives the node's type with promote_if_type, which returns the
-;; temporal type unchanged when both branches share it — an `if` selects a
-;; value, it does not compute one, so nothing is widened.  exec_if then has
-;; two arms, and the one that runs when the pool has no workers re-derives
-;; the type from the values it actually materialised.  Its ladder read a
-;; temporal as its integer storage, so the same expression answered
-;; TIMESTAMP with workers and I64 without them.
+;; ── (if …) and the two arms of exec_if ────────────────────────────────
+;; exec_if picks between an eager arm, which fills every row from the node's
+;; static out_type, and a selected arm, which touches only the rows each
+;; branch supplies and reports the type those rows actually have.  The eager
+;; arm is a candidate only for a non-STR output whose branches are both
+;; trivial column reads, and it is taken only when workers exist — so the two
+;; arms have to agree wherever both could apply, or an expression answers
+;; differently depending on the core count.
 ;;
-;; The re-derivation itself is load-bearing — it narrows F64 to I64 when the
-;; float branch supplied no rows — so only the temporal case is aligned.
+;; NOTE on shape: both branches below are deliberately NON-trivial (a nested
+;; if), which keeps the eager arm out of the picture at any core count.  With
+;; bare column scans the eager arm answers under the default TEST_CORES=2 and
+;; the selected arm is never reached, so such a case passes with or without
+;; the fix — it tests nothing.
+;;
+;; An `if` selects a value, it does not compute one, so two branches of one
+;; temporal type yield that type.  The selected arm used to re-derive it with
+;; a promotion ladder of its own, which folded a temporal down to the integer
+;; it is stored as — right for arithmetic, since the difference of two
+;; timestamps is a span, wrong for a choice between two of them.
 (set TIF (table [x d tm ts] (list [true false true] (as 'DATE [1 2 3]) (as 'TIME [10 20 30]) (as 'TIMESTAMP [100 200 300]))))
-(type (at (select {r: (if x d d) from: TIF}) 'r)) -- 'DATE
-(type (at (select {r: (if x tm tm) from: TIF}) 'r)) -- 'TIME
-(type (at (select {r: (if x ts ts) from: TIF}) 'r)) -- 'TIMESTAMP
-;; values are untouched by the type fix
-(as 'I64 (at (select {r: (if x ts ts) from: TIF}) 'r)) -- [100 200 300]
+(type (at (select {r: (if x ts (if x ts ts)) from: TIF}) 'r)) -- 'TIMESTAMP
+(type (at (select {r: (if x d (if x d d)) from: TIF}) 'r)) -- 'DATE
+(type (at (select {r: (if x tm (if x tm tm)) from: TIF}) 'r)) -- 'TIME
+;; values are untouched by the type rule
+(as 'I64 (at (select {r: (if x ts (if x ts ts)) from: TIF}) 'r)) -- [100 200 300]
 ;; branches of DIFFERENT temporal types have no shared meaning — still widened
-(type (at (select {r: (if x d ts) from: TIF}) 'r)) -- 'I64
+(type (at (select {r: (if x d (if x ts ts)) from: TIF}) 'r)) -- 'I64
+
+;; A branch that supplies no rows must not change the answer either.  With an
+;; all-true condition the else branch is empty, and the selected arm used to
+;; adopt the surviving branch's raw type — so these read TIMESTAMP/DATE
+;; serially and I64/F64 under workers.  Both branches are trivial here, so
+;; the eager arm could handle them: the answer must be its answer.
+(set TAT (table [x ts d] (list [true true true] (as 'TIMESTAMP [100 200 300]) (as 'DATE [1 2 3]))))
+(type (at (select {r: (if x ts 5) from: TAT}) 'r)) -- 'I64
+(type (at (select {r: (if x ts 5.5) from: TAT}) 'r)) -- 'F64
+(type (at (select {r: (if x d ts) from: TAT}) 'r)) -- 'I64
