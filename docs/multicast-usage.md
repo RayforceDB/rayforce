@@ -1,6 +1,6 @@
 # Rayforce Multicast Usage Guide
 
-This document describes how to use the current Rayforce multicast module and how to migrate existing IPC fan-out or kdb-style pub/sub code to it.
+This document describes how to use the current Rayforce multicast module and how to migrate existing IPC fan-out or legacy topic pub/sub code to it.
 
 ## Status
 
@@ -171,15 +171,15 @@ If the producer itself is remote, publish through IPC:
 (.ipc.send h "(.mc.pub \"ticks\" payload_expr)")
 ```
 
-## Migrating From kdb/q-Style Pub/Sub
+## Migrating From Legacy Topic Pub/Sub
 
-The shape is intentionally close to tickerplant-style q systems:
+The shape is intentionally close to traditional ticker-plant style systems:
 
 ```text
-.u.sub[sym]        -> (.mc.sub "sym" null)
-.u.del[sym]        -> (.mc.unsub "sym")
-.u.pub[sym; data]  -> (.mc.pub "sym" data)
-upd[sym; data]     -> upd[topic seq payload]
+sub(topic)         -> (.mc.sub "topic" null)
+unsub(topic)       -> (.mc.unsub "topic")
+pub(topic, data)   -> (.mc.pub "topic" data)
+upd(topic, data)   -> upd(topic, seq, payload)
 ```
 
 Main differences:

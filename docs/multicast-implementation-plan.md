@@ -4,7 +4,7 @@
 
 Add a first-class multicast/pub-sub subsystem to Rayforce as a core engine module, exposed to Rayfall through a `.mc.*` namespace and delivered over the existing IPC wire.
 
-The target model is close to kdb tickerplant pub/sub, but adapted to Rayforce's current architecture:
+The target model is close to traditional ticker-plant style pub/sub, but adapted to Rayforce's current architecture:
 
 - IPC handles are poll selector ids.
 - Server-side code can push to connected clients through the same handle namespace.
@@ -40,7 +40,7 @@ Initial semantics:
 (upd topic seq payload)
 ```
 
-This mirrors the kdb convention where downstream clients implement `upd`. In
+This mirrors the common pub/sub convention where downstream clients implement `upd`. In
 Rayforce the delivered `topic` should be a string, not a bare symbol, because
 unquoted symbol atoms in expression position are name references in Rayfall.
 Symbol payload atoms must be sent as quoted/literal symbols for the same reason.
@@ -309,7 +309,7 @@ Tests:
 - Add `.mc.subs topic`.
 - Add `.mc.config` for queue limits and policy.
 - Add querylog/profile integration if needed.
-- Add documentation examples for tickerplant-style market data.
+- Add documentation examples for ticker-plant style market data.
 
 ## Test Strategy
 
