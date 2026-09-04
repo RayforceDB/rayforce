@@ -18,15 +18,15 @@
 #include "table/dict.h"
 #include "mem/sys.h"
 
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
   #include <netinet/in.h>
   #include <unistd.h>
 #endif
-
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
 
 extern ray_runtime_t* __RUNTIME;
 
@@ -64,6 +64,21 @@ static void pump_client(void) {
         ray_poll_run_for(poll, 10);
         sleep_ms(1);
     }
+}
+
+static bool pump_until_env_i64_at_least(const char* name, size_t len,
+                                        int64_t want, int rounds) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    if (!poll) return false;
+    int64_t sym = ray_sym_intern(name, len);
+    for (int i = 0; i < rounds; i++) {
+        ray_t* v = ray_env_get(sym);
+        if (v && v->type == -RAY_I64 && v->i64 >= want)
+            return true;
+        ray_poll_run_for(poll, 10);
+        sleep_ms(1);
+    }
+    return false;
 }
 
 static uint16_t get_listen_port(ray_sock_t fd) {
@@ -547,6 +562,98 @@ static test_result_t test_mcast_requires_ipc_context_for_sub(void) {
     PASS();
 }
 
+static test_result_t test_mcast_large_payload_queues_until_writable(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_last_len 0)"
+        "(set _mc_open_count 0)"
+        "(set _mc_sub_handle -1)"
+        "(set upd (fn [topic seq payload] "
+        "  (do "
+        "    (set _mc_count (+ _mc_count 1))"
+        "    (set _mc_last_len (count payload)))))"
+        "(set .ipc.on.open (fn [h] "
+        "  (do "
+        "    (set _mc_open_count (+ _mc_open_count 1))"
+        "    (if (== _mc_open_count 1) (set _mc_sub_handle h) 0))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"big\" null)", strlen("(.mc.sub \"big\" null)"));
+    ray_t* sub = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+#ifndef RAY_OS_WINDOWS
+    ray_t* server_h = ray_env_get(ray_sym_intern("_mc_sub_handle", 14));
+    TEST_ASSERT_NOT_NULL(server_h);
+    TEST_ASSERT_EQ_I(server_h->type, -RAY_I64);
+    ray_selector_t* server_sel = ray_poll_get(poll, server_h->i64);
+    TEST_ASSERT_NOT_NULL(server_sel);
+    int sndbuf = 4096;
+    setsockopt((ray_sock_t)server_sel->fd, SOL_SOCKET, SO_SNDBUF,
+               &sndbuf, sizeof(sndbuf));
+#endif
+
+    const char* pub_src =
+        "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
+    msg = ray_str(pub_src, strlen(pub_src));
+    ray_t* pub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_count", 9, 1, 1000));
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* len = ray_env_get(ray_sym_intern("_mc_last_len", 12));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(len);
+    TEST_ASSERT_EQ_I(c->i64, 1);
+    TEST_ASSERT_EQ_I(len->i64, 100000);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 0);
+    ray_release(st);
+
+    msg = ray_str("(+ 0 0)", strlen("(+ 0 0)"));
+    ray_t* ping = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(ping);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ping));
+    TEST_ASSERT_EQ_I(ping->i64, 0);
+    ray_release(ping);
+
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 static test_result_t test_mcast_failed_send_defers_close(void) {
     ray_t* r = ray_eval_str(
         "(set _mc_count 0)"
@@ -660,6 +767,7 @@ const test_entry_t mcast_entries[] = {
     { "mcast/no_subscribers_api_errors",  test_mcast_no_subscribers_and_api_errors, mcast_setup, mcast_teardown },
     { "mcast/restricted_sub_not_pub",     test_mcast_restricted_sub_but_not_pub, mcast_setup, mcast_teardown },
     { "mcast/sub_requires_ipc_context",   test_mcast_requires_ipc_context_for_sub, mcast_setup, mcast_teardown },
+    { "mcast/large_payload_queues",       test_mcast_large_payload_queues_until_writable, mcast_setup, mcast_teardown },
     { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };

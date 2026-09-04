@@ -220,7 +220,8 @@ For topic dispatch, keep `upd` small and delegate to topic-specific handlers:
 - `.mc.pub` returns the assigned sequence number.
 - `.mc.pub` returns `0` when there is no active subscriber for the topic; it does not create an orphan topic.
 - Duplicate subscription of the same handle to the same topic is idempotent.
-- If async delivery to a subscriber would block or fails, that subscriber is removed, its IPC handle is closed, and `dropped` increments.
+- Async delivery is non-blocking. If the socket cannot accept the whole frame immediately, the remaining bytes are queued on that IPC handle and flushed when it becomes writable.
+- If async delivery fails or the per-connection TX backlog exceeds the IPC frame budget, that subscriber is removed, its IPC handle is closed, and `dropped` increments.
 - Closing an IPC handle removes its subscriptions.
 - Restricted IPC clients can subscribe but cannot publish.
 

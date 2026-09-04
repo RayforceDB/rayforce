@@ -117,5 +117,8 @@ ray_poll_buf_t* ray_poll_buf_new(int64_t size);
 void            ray_poll_buf_free(ray_poll_buf_t* buf);
 void            ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel,
                                     int64_t size);
+void            ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel);
+void            ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel);
+int             ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel);
 
 #endif /* RAY_POLL_H */

@@ -37,6 +37,15 @@
 #define RAY_POLL_MAX_EVENTS 64
 #define RAY_POLL_INITIAL_CAP 16
 
+static void kqueue_set_write(ray_poll_t* poll, ray_selector_t* sel, int flags)
+{
+    if (!poll || !sel) return;
+    struct kevent kev;
+    EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_WRITE, flags, 0, 0,
+           (void*)(uintptr_t)sel->id);
+    kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
+}
+
 ray_poll_t* ray_poll_create(void)
 {
     int fd = kqueue();
@@ -71,6 +80,8 @@ void ray_poll_destroy(ray_poll_t* poll)
         struct kevent kev;
         EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
+        EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
         if (sel->rx.buf) ray_poll_buf_free(sel->rx.buf);
         ray_poll_buf_free(sel->tx.buf);
         ray_sys_free(sel);
@@ -88,6 +99,16 @@ void ray_poll_destroy(ray_poll_t* poll)
         poll->mcast = NULL;
     }
     ray_sys_free(poll);
+}
+
+void ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel)
+{
+    kqueue_set_write(poll, sel, EV_ADD | EV_ENABLE);
+}
+
+void ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel)
+{
+    kqueue_set_write(poll, sel, EV_DELETE);
 }
 
 int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
@@ -157,6 +178,8 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
 
     struct kevent kev;
     EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
+    EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
     kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
 
     if (sel->close_fn) sel->close_fn(poll, sel);
@@ -279,6 +302,21 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
                     sel = poll->sels[eid];
                     if (!sel->rx.buf) break;
                     if (sel->rx.buf->offset >= sel->rx.buf->size) continue;
+                }
+            }
+
+            if (events[i].filter == EVFILT_WRITE) {
+                if (eid >= poll->n_sels || !poll->sels[eid]) goto next_event;
+                sel = poll->sels[eid];
+                if (ray_poll_tx_flush(poll, sel) < 0) {
+                    if (eid < poll->n_sels && poll->sels[eid]) {
+                        sel = poll->sels[eid];
+                        if (sel->error_fn)
+                            sel->error_fn(poll, sel);
+                        else
+                            ray_poll_deregister(poll, sel->id);
+                    }
+                    goto next_event;
                 }
             }
 

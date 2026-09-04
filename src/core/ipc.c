@@ -167,6 +167,7 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 #define RAY_IPC_PHASE_HEADER    1
 #define RAY_IPC_PHASE_PAYLOAD   2
 #define RAY_IPC_PHASE_CREDS     3
+#define RAY_IPC_TX_MAX_BYTES    (256LL * 1024LL * 1024LL)
 
 /* Constant-time comparison — prevents timing side-channel on password. */
 static bool ct_eq(const void* a, const void* b, size_t len) {
@@ -697,6 +698,22 @@ static int64_t ipc_recv_fn(int64_t fd, uint8_t* buf, int64_t len) {
     return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
 }
 
+static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
+{
+#ifdef RAY_OS_WINDOWS
+    int n = send((ray_sock_t)fd, (const char*)buf, (int)len, 0);
+    if (n < 0) {
+        int e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) errno = EAGAIN;
+        else if (e == WSAEINTR) errno = EINTR;
+    }
+    return n;
+#else
+    return send((ray_sock_t)fd, buf, (size_t)len,
+                MSG_NOSIGNAL | MSG_DONTWAIT);
+#endif
+}
+
 /* ── Out-of-band cancel: client Ctrl-C → SIGURG → cancel the running query ──
  * The server evaluates single-threaded, so while a query runs it is NOT reading
  * the socket — an ordinary cancel message would sit unread until the query
@@ -759,6 +776,7 @@ static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
     reg.fd       = (int64_t)new_fd;
     reg.type     = RAY_SEL_SOCKET;
     reg.recv_fn  = ipc_recv_fn;
+    reg.send_fn  = ipc_send_fn;
     reg.read_fn  = ipc_read_handshake;
     reg.close_fn = ipc_on_close;
     reg.data     = cd;
@@ -1497,18 +1515,21 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
     }
 }
 
-/* Serialize + frame + write one message to a connection's fd.
- * ray_sock_send loops on partial writes/EAGAIN internally, so this is
- * safe on the nonblocking fds the poll owns.  Returns 0 on success,
- * -1 on serialization or socket failure. */
-static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
-                              uint8_t extra_flags)
+static ray_poll_buf_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
+                                      uint8_t extra_flags, ray_err_t* err_out)
 {
+    if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
-    if (ser_size <= 0) return -1;
+    if (ser_size <= 0) {
+        if (err_out) *err_out = RAY_ERR_TYPE;
+        return NULL;
+    }
 
     uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)ser_size);
-    if (!payload) return -1;
+    if (!payload) {
+        if (err_out) *err_out = RAY_ERR_OOM;
+        return NULL;
+    }
     ray_ser_raw(payload, msg);
 
     uint8_t* send_buf = NULL;
@@ -1549,12 +1570,41 @@ static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
         .size    = (int64_t)send_len,
     };
 
-    int64_t rc = ray_sock_send(fd, &hdr, sizeof(hdr));
-    if (rc < 0) { ray_sys_free(send_buf); if (payload) ray_sys_free(payload); return -1; }
-    rc = ray_sock_send(fd, send_buf, send_len);
+    size_t total = sizeof(hdr) + send_len;
+    if (total > (size_t)RAY_IPC_TX_MAX_BYTES) {
+        ray_sys_free(send_buf);
+        if (payload) ray_sys_free(payload);
+        if (err_out) *err_out = RAY_ERR_IO;
+        return NULL;
+    }
+
+    ray_poll_buf_t* frame = ray_poll_buf_new((int64_t)total);
+    if (!frame) {
+        ray_sys_free(send_buf);
+        if (payload) ray_sys_free(payload);
+        if (err_out) *err_out = RAY_ERR_OOM;
+        return NULL;
+    }
+    memcpy(frame->data, &hdr, sizeof(hdr));
+    memcpy(frame->data + sizeof(hdr), send_buf, send_len);
 
     ray_sys_free(send_buf);
     if (payload) ray_sys_free(payload);
+    return frame;
+}
+
+/* Serialize + frame + write one message to a connection's fd.
+ * ray_sock_send loops on partial writes/EAGAIN internally, so this is
+ * safe on the nonblocking fds the poll owns.  Returns 0 on success,
+ * -1 on serialization or socket failure. */
+static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
+                              uint8_t extra_flags)
+{
+    ray_err_t err = RAY_OK;
+    ray_poll_buf_t* frame = conn_frame_msg(msg, msgtype, extra_flags, &err);
+    if (!frame) return -1;
+    int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
+    ray_poll_buf_free(frame);
     return rc < 0 ? -1 : 0;
 }
 
@@ -1656,6 +1706,7 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     reg.fd       = (int64_t)fd;
     reg.type     = RAY_SEL_SOCKET;
     reg.recv_fn  = ipc_recv_fn;
+    reg.send_fn  = ipc_send_fn;
     reg.read_fn  = ipc_read_header;
     reg.close_fn = ipc_on_close;
     reg.data     = cd;
@@ -1798,29 +1849,49 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
     return rc;
 }
 
-static int try_send_bytes(ray_sock_t fd, const void* buf, size_t len)
+static int64_t conn_tx_pending(ray_selector_t* sel)
 {
-    const uint8_t* p = (const uint8_t*)buf;
-    size_t off = 0;
-    while (off < len) {
-#ifdef RAY_OS_WINDOWS
-        int n = send(fd, (const char*)p + off, (int)(len - off), 0);
-        if (n < 0) {
-            int e = WSAGetLastError();
-            if (e == WSAEINTR) continue;
-            if (e == WSAEWOULDBLOCK) return 1;
-            return -1;
+    int64_t pending = 0;
+    for (ray_poll_buf_t* b = sel ? sel->tx.buf : NULL; b; b = b->next) {
+        if (b->size > b->offset) {
+            int64_t rem = b->size - b->offset;
+            if (pending > RAY_IPC_TX_MAX_BYTES - rem)
+                return RAY_IPC_TX_MAX_BYTES + 1;
+            pending += rem;
         }
-#else
-        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (n < 0) {
+    }
+    return pending;
+}
+
+static int conn_tx_append(ray_selector_t* sel, ray_poll_buf_t* frame)
+{
+    if (!sel || !frame || frame->offset > frame->size) return -1;
+
+    int64_t add = frame->size - frame->offset;
+    int64_t pending = conn_tx_pending(sel);
+    if (add < 0 || pending < 0 || pending > RAY_IPC_TX_MAX_BYTES - add)
+        return -1;
+
+    ray_poll_buf_t** tail = &sel->tx.buf;
+    while (*tail) tail = &(*tail)->next;
+    *tail = frame;
+    return 0;
+}
+
+static int conn_try_send_frame(ray_selector_t* sel, ray_poll_buf_t* frame)
+{
+    while (frame->offset < frame->size) {
+        int64_t nw = sel->tx.send_fn(
+            sel->fd,
+            frame->data + frame->offset,
+            frame->size - frame->offset);
+        if (nw < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
             return -1;
         }
-#endif
-        if (n == 0) return -1;
-        off += (size_t)n;
+        if (nw == 0) return -1;
+        frame->offset += nw;
     }
     return 0;
 }
@@ -1839,40 +1910,41 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
         owned = true;
     }
 
-    ray_selector_t* sel = conn_resolve(NULL, handle);
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
     if (!sel) {
         if (owned) ray_release(msg);
         return RAY_ERR_IO;
     }
 
-    int64_t ser_size = ray_serde_size(msg);
-    if (ser_size <= 0) {
+    ray_err_t err = RAY_OK;
+    ray_poll_buf_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0, &err);
+    if (!frame) {
         if (owned) ray_release(msg);
-        return RAY_ERR_TYPE;
+        return err == RAY_OK ? RAY_ERR_IO : err;
     }
 
-    uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)ser_size);
-    if (!payload) {
-        if (owned) ray_release(msg);
-        return RAY_ERR_OOM;
+    int rc = 0;
+    if (sel->tx.buf) {
+        rc = 1;
+    } else {
+        rc = conn_try_send_frame(sel, frame);
     }
-    ray_ser_raw(payload, msg);
 
-    ray_ipc_header_t hdr = {
-        .prefix  = RAY_SERDE_PREFIX,
-        .version = RAY_SERDE_WIRE_VERSION,
-        .flags   = 0,
-        .endian  = RAY_SERDE_ENDIAN,
-        .msgtype = RAY_IPC_MSG_ASYNC,
-        .size    = ser_size,
-    };
-
-    int rc = try_send_bytes((ray_sock_t)sel->fd, &hdr, sizeof(hdr));
-    if (rc == 0)
-        rc = try_send_bytes((ray_sock_t)sel->fd, payload, (size_t)ser_size);
-    ray_sys_free(payload);
+    if (rc == 0) {
+        ray_poll_buf_free(frame);
+    } else if (rc > 0) {
+        if (conn_tx_append(sel, frame) < 0) {
+            ray_poll_buf_free(frame);
+            if (owned) ray_release(msg);
+            return RAY_ERR_IO;
+        }
+        ray_poll_tx_request(poll, sel);
+    } else {
+        ray_poll_buf_free(frame);
+    }
     if (owned) ray_release(msg);
-    return rc == 0 ? RAY_OK : RAY_ERR_IO;
+    return rc >= 0 ? RAY_OK : RAY_ERR_IO;
 }
 
 /* Verbose-eval sync send: sets RAY_IPC_FLAG_VERBOSE on the outbound
