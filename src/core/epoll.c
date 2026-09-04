@@ -24,6 +24,7 @@
 #if defined(__linux__)
 
 #include "core/poll.h"
+#include "core/mcast.h"
 #include "core/timer.h"
 #include "mem/sys.h"
 #include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
@@ -35,6 +36,22 @@
 
 #define RAY_POLL_MAX_EVENTS 64
 #define RAY_POLL_INITIAL_CAP 16
+
+static uint32_t epoll_selector_events(ray_selector_t* sel)
+{
+    uint32_t events = EPOLLIN | EPOLLRDHUP;
+    if (sel && sel->tx.buf) events |= EPOLLOUT;
+    return events;
+}
+
+static void epoll_selector_mod(ray_poll_t* poll, ray_selector_t* sel)
+{
+    if (!poll || !sel) return;
+    struct epoll_event ev;
+    ev.events  = epoll_selector_events(sel);
+    ev.data.u64 = (uint64_t)sel->id;
+    epoll_ctl((int)poll->fd, EPOLL_CTL_MOD, (int)sel->fd, &ev);
+}
 
 ray_poll_t* ray_poll_create(void)
 {
@@ -80,6 +97,10 @@ void ray_poll_destroy(ray_poll_t* poll)
     if (poll->timers) {
         ray_timers_destroy((ray_timers_t*)poll->timers);
         poll->timers = NULL;
+    }
+    if (poll->mcast) {
+        ray_mcast_destroy((ray_mcast_t*)poll->mcast);
+        poll->mcast = NULL;
     }
     ray_sys_free(poll);
 }
@@ -130,7 +151,7 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
 
     /* Register with epoll */
     struct epoll_event ev;
-    ev.events  = EPOLLIN;
+    ev.events  = epoll_selector_events(sel);
     ev.data.u64 = (uint64_t)id;
 
     if (epoll_ctl((int)poll->fd, EPOLL_CTL_ADD, (int)reg->fd, &ev) < 0) {
@@ -141,6 +162,16 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
 
     if (sel->open_fn) sel->open_fn(poll, sel);
     return id;
+}
+
+void ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel)
+{
+    epoll_selector_mod(poll, sel);
+}
+
+void ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel)
+{
+    epoll_selector_mod(poll, sel);
 }
 
 void ray_poll_deregister(ray_poll_t* poll, int64_t id)
@@ -272,6 +303,21 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
                     /* If buffer already has enough data for next phase, loop */
                     if (sel->rx.buf->offset >= sel->rx.buf->size) continue;
                     /* Otherwise try reading more (may EAGAIN → break) */
+                }
+            }
+
+            if (events[i].events & EPOLLOUT) {
+                if (eid >= poll->n_sels || !poll->sels[eid]) goto next_event;
+                sel = poll->sels[eid];
+                if (ray_poll_tx_flush(poll, sel) < 0) {
+                    if (eid < poll->n_sels && poll->sels[eid]) {
+                        sel = poll->sels[eid];
+                        if (sel->error_fn)
+                            sel->error_fn(poll, sel);
+                        else
+                            ray_poll_deregister(poll, sel->id);
+                    }
+                    goto next_event;
                 }
             }
 
