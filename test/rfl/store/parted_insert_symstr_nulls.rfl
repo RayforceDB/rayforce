@@ -1,0 +1,56 @@
+;; parted_insert_symstr_nulls.rfl — a live `insert` into a parted table must
+;; accept SYM/STR segments carrying HAS_NULLS (#465).
+;;
+;; Regression: since the empty symbol / empty string became their types'
+;; canonical nulls, the store carries RAY_ATTR_HAS_NULLS for them across a
+;; save, so every mapped partition holding one blank SYM/STR cell arrives with
+;; the bit set.  parted_segment_attrs_valid (src/ops/query.c) allowed the bit
+;; only for the numeric, temporal and GUID bases, so the whole insert was
+;; refused as `corrupt: insert: segment metadata/length/type mismatch`.
+;; The null is in-band — the payload is what it always was — so nothing about
+;; the append changes.
+(.sys.exec "rm -rf /tmp/rfl_pins_nulls")
+
+;; ─── 1. same process: first batch into a NEW day holds a blank ───────────
+;; one clean day on disk so the parted root exists
+(.db.splayed.set "/tmp/rfl_pins_nulls/a/2026.01.01/t/" (table ['d 's 'x 'n] (list [2026.01.01] (as 'SYM ['a]) (list "p") [1])))
+(.db.parted.fill "/tmp/rfl_pins_nulls/a/")
+(set W (.db.parted.get "/tmp/rfl_pins_nulls/a/" 't))
+;; first live batch into a new day, blank STR — materialises the partition,
+;; which maps back with HAS_NULLS set
+(insert 'W 2026.01.02 (table ['d 's 'x 'n] (list [2026.01.02] (as 'SYM ['a]) (list "") [2])))
+;; the day's second batch (no blanks at all) was the one refused
+(insert 'W 2026.01.02 (table ['d 's 'x 'n] (list [2026.01.02] (as 'SYM ['b]) (list "r") [3])))
+;; and a blank SYM in a later batch
+(insert 'W 2026.01.02 (table ['d 's 'x 'n] (list [2026.01.02] (as 'SYM [']) (list "q") [4])))
+(insert 'W 2026.01.02 (table ['d 's 'x 'n] (list [2026.01.02] (as 'SYM ['c]) (list "s") [5])))
+(count (select {from: W})) -- 5
+(sum (at (select {from: W}) 'n)) -- 15
+(count (select {from: W where: (== x "")})) -- 1
+(count (select {from: W where: (nil? s)})) -- 1
+(first (at (select {from: W where: (== n 3)}) 'x)) -- "r"
+
+;; ─── 2. across a reopen: a day saved with a blank, then inserted into ─────
+(.db.splayed.set "/tmp/rfl_pins_nulls/sym/2026.01.01/t/" (table ['d 's 'x 'n] (list [2026.01.01 2026.01.01] (as 'SYM ['a ']) (list "p" "q") [1 2])))
+(.db.parted.fill "/tmp/rfl_pins_nulls/sym/")
+(set Vs (.db.parted.get "/tmp/rfl_pins_nulls/sym/" 't))
+(insert 'Vs 2026.01.01 (table ['d 's 'x 'n] (list [2026.01.01] (as 'SYM ['z]) (list "zz") [9])))
+(count (select {from: Vs})) -- 3
+(sum (at (select {from: Vs}) 'n)) -- 12
+(count (select {from: Vs where: (nil? s)})) -- 1
+
+(.db.splayed.set "/tmp/rfl_pins_nulls/str/2026.01.01/t/" (table ['d 's 'x 'n] (list [2026.01.01 2026.01.01] (as 'SYM ['a 'b]) (list "p" "") [1 2])))
+(.db.parted.fill "/tmp/rfl_pins_nulls/str/")
+(set Vx (.db.parted.get "/tmp/rfl_pins_nulls/str/" 't))
+(insert 'Vx 2026.01.01 (table ['d 's 'x 'n] (list [2026.01.01] (as 'SYM ['z]) (list "zz") [9])))
+(count (select {from: Vx})) -- 3
+(sum (at (select {from: Vx}) 'n)) -- 12
+(count (select {from: Vx where: (== x "")})) -- 1
+
+;; ─── 3. the numeric-null case that always worked stays accepted ───────────
+(.db.splayed.set "/tmp/rfl_pins_nulls/i64/2026.01.01/t/" (table ['d 's 'x 'n] (list [2026.01.01 2026.01.01] (as 'SYM ['a 'b]) (list "p" "q") [1 0Nl])))
+(.db.parted.fill "/tmp/rfl_pins_nulls/i64/")
+(set Vn (.db.parted.get "/tmp/rfl_pins_nulls/i64/" 't))
+(insert 'Vn 2026.01.01 (table ['d 's 'x 'n] (list [2026.01.01] (as 'SYM ['z]) (list "zz") [9])))
+(count (select {from: Vn})) -- 3
+(.sys.exec "rm -rf /tmp/rfl_pins_nulls") -- 0
