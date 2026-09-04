@@ -98,6 +98,7 @@ struct ray_poll {
     char             auth_secret[256]; /* password from -u/-U, empty = no auth */
     bool             restricted;       /* true if -U (read-only IPC mode) */
     void*            timers;           /* opaque ray_timers_t*; lazily allocated */
+    void*            mcast;            /* opaque ray_mcast_t*; lazily allocated */
 };
 
 /* ===== API ===== */
@@ -116,5 +117,8 @@ ray_poll_buf_t* ray_poll_buf_new(int64_t size);
 void            ray_poll_buf_free(ray_poll_buf_t* buf);
 void            ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel,
                                     int64_t size);
+void            ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel);
+void            ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel);
+int             ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel);
 
 #endif /* RAY_POLL_H */

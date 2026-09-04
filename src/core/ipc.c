@@ -26,6 +26,7 @@
 #endif
 
 #include "core/ipc.h"
+#include "core/mcast.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
@@ -166,6 +167,7 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 #define RAY_IPC_PHASE_HEADER    1
 #define RAY_IPC_PHASE_PAYLOAD   2
 #define RAY_IPC_PHASE_CREDS     3
+#define RAY_IPC_TX_MAX_BYTES    (256LL * 1024LL * 1024LL)
 
 /* Constant-time comparison — prevents timing side-channel on password. */
 static bool ct_eq(const void* a, const void* b, size_t len) {
@@ -252,9 +254,13 @@ static void ipc_ctx_set(int64_t handle, ray_poll_t* poll) {
     __VM->ipc_poll   = poll;
 }
 
-static ray_poll_t* ipc_active_poll(void) {
+ray_poll_t* ray_ipc_active_poll(void) {
     ray_poll_t* p = ipc_ctx_poll();
     return p ? p : (ray_poll_t*)ray_runtime_get_poll();
+}
+
+ray_poll_t* ray_ipc_context_poll(void) {
+    return ipc_ctx_poll();
 }
 
 int64_t ray_ipc_current_handle(void) {
@@ -348,6 +354,31 @@ static int hook_call_auth(ray_poll_t* poll, int64_t handle,
     }
     if (r && r != RAY_NULL_OBJ) ray_release(r);
     return ok;
+}
+
+/* A partially-sent multicast frame lives on sel->tx.buf until EPOLLOUT/
+ * EVFILT_WRITE drains it.  Any OTHER write to the same fd (a sync RESP, an
+ * async push) must not splice its bytes into the middle of that half-sent
+ * frame, or the peer parses the two framings into each other and the stream
+ * for that connection is corrupt.  Flush the queued remainder first, blocking
+ * on write-readiness the way ray_sock_send already does, so the direct write
+ * that follows starts on a frame boundary.  Fast-path returns 0 when nothing
+ * is queued (the common, non-subscriber case).  Returns -1 on socket error. */
+static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel)
+{
+    if (!sel || !sel->tx.buf) return 0;
+    while (sel->tx.buf) {
+        ray_poll_buf_t* buf = sel->tx.buf;
+        int64_t rem = buf->size - buf->offset;
+        if (rem > 0 &&
+            ray_sock_send(sel->fd, buf->data + buf->offset, (size_t)rem) < 0)
+            return -1;
+        sel->tx.buf = buf->next;
+        buf->next = NULL;
+        ray_poll_buf_free(buf);
+    }
+    ray_poll_tx_cancel(poll, sel);
+    return 0;
 }
 
 static void send_response(ray_sock_t fd, ray_t* result)
@@ -692,6 +723,22 @@ static int64_t ipc_recv_fn(int64_t fd, uint8_t* buf, int64_t len) {
     return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
 }
 
+static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
+{
+#ifdef RAY_OS_WINDOWS
+    int n = send((ray_sock_t)fd, (const char*)buf, (int)len, 0);
+    if (n < 0) {
+        int e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) errno = EAGAIN;
+        else if (e == WSAEINTR) errno = EINTR;
+    }
+    return n;
+#else
+    return send((ray_sock_t)fd, buf, (size_t)len,
+                MSG_NOSIGNAL | MSG_DONTWAIT);
+#endif
+}
+
 /* ── Out-of-band cancel: client Ctrl-C → SIGURG → cancel the running query ──
  * The server evaluates single-threaded, so while a query runs it is NOT reading
  * the socket — an ordinary cancel message would sit unread until the query
@@ -754,6 +801,7 @@ static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
     reg.fd       = (int64_t)new_fd;
     reg.type     = RAY_SEL_SOCKET;
     reg.recv_fn  = ipc_recv_fn;
+    reg.send_fn  = ipc_send_fn;
     reg.read_fn  = ipc_read_handshake;
     reg.close_fn = ipc_on_close;
     reg.data     = cd;
@@ -972,7 +1020,12 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * selector before writing to its fd. */
     if (hdr.msgtype == RAY_IPC_MSG_SYNC) {
         ray_selector_t* cur = ray_poll_get(poll, id);
-        if (cur && cur->data == (void*)cd)
+        /* Flush any multicast frame still queued to this fd before the RESP,
+         * so the reply lands on a frame boundary instead of splicing into a
+         * half-sent push.  A drain error means the peer is gone — skip the
+         * write and let the poll/pump layer deregister it. */
+        if (cur && cur->data == (void*)cd &&
+            conn_tx_drain_blocking(poll, cur) == 0)
             send_response((ray_sock_t)cur->fd, result);
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
@@ -987,7 +1040,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
 
 static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
 {
-    (void)poll;
+    ray_mcast_on_close(poll, sel ? sel->id : -1);
     /* Fire `.ipc.on.close` BEFORE tearing the per-conn state down so a
      * hook reading `.ipc.handle` still sees this connection's id, and
      * before the listener's own close path (which would otherwise also
@@ -1448,7 +1501,7 @@ static int64_t recv_full(ray_sock_t fd, void* buf, size_t len) {
  * integer can never write to a non-IPC fd. */
 static ray_selector_t* conn_resolve(ray_poll_t** poll_out, int64_t handle)
 {
-    ray_poll_t* poll = ipc_active_poll();
+    ray_poll_t* poll = ray_ipc_active_poll();
     if (!poll) return NULL;
     ray_selector_t* sel = ray_poll_get(poll, handle);
     if (!sel || sel->type != RAY_SEL_SOCKET || !sel->data) return NULL;
@@ -1492,18 +1545,21 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
     }
 }
 
-/* Serialize + frame + write one message to a connection's fd.
- * ray_sock_send loops on partial writes/EAGAIN internally, so this is
- * safe on the nonblocking fds the poll owns.  Returns 0 on success,
- * -1 on serialization or socket failure. */
-static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
-                              uint8_t extra_flags)
+static ray_poll_buf_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
+                                      uint8_t extra_flags, ray_err_t* err_out)
 {
+    if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
-    if (ser_size <= 0) return -1;
+    if (ser_size <= 0) {
+        if (err_out) *err_out = RAY_ERR_TYPE;
+        return NULL;
+    }
 
     uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)ser_size);
-    if (!payload) return -1;
+    if (!payload) {
+        if (err_out) *err_out = RAY_ERR_OOM;
+        return NULL;
+    }
     ray_ser_raw(payload, msg);
 
     uint8_t* send_buf = NULL;
@@ -1544,12 +1600,44 @@ static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
         .size    = (int64_t)send_len,
     };
 
-    int64_t rc = ray_sock_send(fd, &hdr, sizeof(hdr));
-    if (rc < 0) { ray_sys_free(send_buf); if (payload) ray_sys_free(payload); return -1; }
-    rc = ray_sock_send(fd, send_buf, send_len);
+    size_t total = sizeof(hdr) + send_len;
+    if (total > (size_t)RAY_IPC_TX_MAX_BYTES) {
+        ray_sys_free(send_buf);
+        if (payload) ray_sys_free(payload);
+        if (err_out) *err_out = RAY_ERR_IO;
+        return NULL;
+    }
+
+    ray_poll_buf_t* frame = ray_poll_buf_new((int64_t)total);
+    if (!frame) {
+        ray_sys_free(send_buf);
+        if (payload) ray_sys_free(payload);
+        if (err_out) *err_out = RAY_ERR_OOM;
+        return NULL;
+    }
+    memcpy(frame->data, &hdr, sizeof(hdr));
+    memcpy(frame->data + sizeof(hdr), send_buf, send_len);
 
     ray_sys_free(send_buf);
     if (payload) ray_sys_free(payload);
+    return frame;
+}
+
+/* Serialize + frame + write one message to a connection's fd.
+ * ray_sock_send loops on partial writes/EAGAIN internally, so this is
+ * safe on the nonblocking fds the poll owns.  Writes directly and does NOT
+ * consult sel->tx.buf, so a caller whose fd may carry a queued multicast
+ * frame must conn_tx_drain_blocking() first (see sync_send /
+ * ray_ipc_send_async).  Returns 0 on success, -1 on serialization or
+ * socket failure. */
+static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
+                              uint8_t extra_flags)
+{
+    ray_err_t err = RAY_OK;
+    ray_poll_buf_t* frame = conn_frame_msg(msg, msgtype, extra_flags, &err);
+    if (!frame) return -1;
+    int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
+    ray_poll_buf_free(frame);
     return rc < 0 ? -1 : 0;
 }
 
@@ -1560,7 +1648,7 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     /* The connection lives in the active poll's selector table — its
      * selector id IS the handle.  No poll, no handle namespace: refuse
      * up front rather than hand out an integer nothing can resolve. */
-    ray_poll_t* poll = ipc_active_poll();
+    ray_poll_t* poll = ray_ipc_active_poll();
     if (!poll) return -1;
 
     /* Default the connect/handshake budget to 5s when the caller gives
@@ -1651,6 +1739,7 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     reg.fd       = (int64_t)fd;
     reg.type     = RAY_SEL_SOCKET;
     reg.recv_fn  = ipc_recv_fn;
+    reg.send_fn  = ipc_send_fn;
     reg.read_fn  = ipc_read_header;
     reg.close_fn = ipc_on_close;
     reg.data     = cd;
@@ -1709,7 +1798,10 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
         return ray_error("io", "nested sync send on busy handle");
     }
 
-    if (conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
+    /* Drain any half-sent multicast frame queued to this fd before writing the
+     * sync request, so its bytes can't interleave into the pending frame. */
+    if (conn_tx_drain_blocking(poll, sel) < 0 ||
+        conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
                        extra_flags) < 0) {
         if (owned) ray_release(msg);
         return ray_error("io", "ipc send failed");
@@ -1785,12 +1877,112 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
         }
         owned = true;
     }
-    ray_selector_t* sel = conn_resolve(NULL, handle);
-    ray_err_t rc = (!sel || conn_write_msg((ray_sock_t)sel->fd, msg,
-                                           RAY_IPC_MSG_ASYNC, 0) < 0)
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    ray_err_t rc = (!sel || conn_tx_drain_blocking(poll, sel) < 0 ||
+                    conn_write_msg((ray_sock_t)sel->fd, msg,
+                                   RAY_IPC_MSG_ASYNC, 0) < 0)
                    ? RAY_ERR_IO : RAY_OK;
     if (owned) ray_release(msg);
     return rc;
+}
+
+static int64_t conn_tx_pending(ray_selector_t* sel)
+{
+    int64_t pending = 0;
+    for (ray_poll_buf_t* b = sel ? sel->tx.buf : NULL; b; b = b->next) {
+        if (b->size > b->offset) {
+            int64_t rem = b->size - b->offset;
+            if (pending > RAY_IPC_TX_MAX_BYTES - rem)
+                return RAY_IPC_TX_MAX_BYTES + 1;
+            pending += rem;
+        }
+    }
+    return pending;
+}
+
+static int conn_tx_append(ray_selector_t* sel, ray_poll_buf_t* frame)
+{
+    if (!sel || !frame || frame->offset > frame->size) return -1;
+
+    int64_t add = frame->size - frame->offset;
+    int64_t pending = conn_tx_pending(sel);
+    if (add < 0 || pending < 0 || pending > RAY_IPC_TX_MAX_BYTES - add)
+        return -1;
+
+    ray_poll_buf_t** tail = &sel->tx.buf;
+    while (*tail) tail = &(*tail)->next;
+    *tail = frame;
+    return 0;
+}
+
+static int conn_try_send_frame(ray_selector_t* sel, ray_poll_buf_t* frame)
+{
+    while (frame->offset < frame->size) {
+        int64_t nw = sel->tx.send_fn(
+            sel->fd,
+            frame->data + frame->offset,
+            frame->size - frame->offset);
+        if (nw < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            return -1;
+        }
+        if (nw == 0) return -1;
+        frame->offset += nw;
+    }
+    return 0;
+}
+
+ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
+{
+    bool owned = false;
+    if (ray_is_lazy(msg)) {
+        ray_retain(msg);
+        msg = ray_lazy_materialize(msg);
+        if (RAY_IS_ERR(msg)) {
+            ray_err_t code = ray_err_from_obj(msg);
+            ray_error_free(msg);
+            return code;
+        }
+        owned = true;
+    }
+
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    if (!sel) {
+        if (owned) ray_release(msg);
+        return RAY_ERR_IO;
+    }
+
+    ray_err_t err = RAY_OK;
+    ray_poll_buf_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0, &err);
+    if (!frame) {
+        if (owned) ray_release(msg);
+        return err == RAY_OK ? RAY_ERR_IO : err;
+    }
+
+    int rc = 0;
+    if (sel->tx.buf) {
+        rc = 1;
+    } else {
+        rc = conn_try_send_frame(sel, frame);
+    }
+
+    if (rc == 0) {
+        ray_poll_buf_free(frame);
+    } else if (rc > 0) {
+        if (conn_tx_append(sel, frame) < 0) {
+            ray_poll_buf_free(frame);
+            if (owned) ray_release(msg);
+            return RAY_ERR_IO;
+        }
+        ray_poll_tx_request(poll, sel);
+    } else {
+        ray_poll_buf_free(frame);
+    }
+    if (owned) ray_release(msg);
+    return rc >= 0 ? RAY_OK : RAY_ERR_IO;
 }
 
 /* Verbose-eval sync send: sets RAY_IPC_FLAG_VERBOSE on the outbound

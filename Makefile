@@ -215,6 +215,8 @@ dist: release
 # caps it; children inherit the env. Override for a fuller parallel stress,
 # e.g. `make test TEST_CORES=0` (serial) or `make test TEST_CORES=8`.
 TEST_CORES ?= 2
+TEST_FILTER ?=
+TEST_ARGS = $(if $(TEST_FILTER),-f $(TEST_FILTER),)
 
 # Tests.  Depends on $(TARGET) because test/rfl/system/ipc_diff.rfl
 # spawns ./$(TARGET) as an IPC server via .sys.exec — both binaries
@@ -224,7 +226,7 @@ test: LDFLAGS = $(DEBUG_LDFLAGS)
 test: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
-	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test
+	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
 
 # ─── ThreadSanitizer ────────────────────────────────────────────────
 # Data-race detection for the lock-free pool/heap paths, which the
