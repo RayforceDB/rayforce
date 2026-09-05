@@ -426,6 +426,15 @@ static bool type_is_temporal(int8_t t) {
 }
 
 static int8_t promote_if_type(int8_t a, int8_t b) {
+    /* A column of a parted table carries its type in a wrapper, and the
+     * ladder below knows nothing about those — a wrapped type matches none
+     * of its cases and falls through to RAY_BOOL, so `(if c ts ts)` over a
+     * parted table claimed B8 and truncated every value to a byte.  The
+     * result of an if is a materialised vector, never a parted column, so
+     * the base type is what it should carry.  query.c's dag_type_is_temporal
+     * unwraps for the same reason. */
+    if (RAY_IS_PARTED(a)) a = (int8_t)RAY_PARTED_BASETYPE(a);
+    if (RAY_IS_PARTED(b)) b = (int8_t)RAY_PARTED_BASETYPE(b);
     if (a == b && type_is_temporal(a)) return a;
     return promote(a, b);
 }

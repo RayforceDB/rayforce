@@ -289,6 +289,23 @@ static double if_atom_f64(ray_t* v) {
          ? v->f64 : (double)if_atom_i64(v);
 }
 
+/* Does this branch value contribute a null to the output?  A vector says so
+ * with its attr; an atom says so by BEING the sentinel, and nothing sets the
+ * attr for it — so `(if x d 0Nd)` wrote the sentinel and then rendered it as
+ * an ordinary date, since the formatter reads the attr, not the value. */
+static bool if_val_has_null(ray_t* v, int8_t out_type) {
+    if (!v) return false;
+    if (!ray_is_atom(v)) return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    switch (out_type) {
+        case RAY_F64: { double d = if_atom_f64(v); return d != d; }
+        case RAY_I64: case RAY_TIMESTAMP: return if_atom_i64(v) == NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+            return if_atom_i64(v) == NULL_I32;
+        case RAY_I16: return if_atom_i64(v) == NULL_I16;
+        default: return false;
+    }
+}
+
 static int64_t if_vec_i64(ray_t* v, int64_t idx) {
     if (v->type == RAY_F64) return (int64_t)((double*)ray_data(v))[idx];
     if (v->type == RAY_F32) return (int64_t)((float*)ray_data(v))[idx];
@@ -473,7 +490,8 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
     if (out == RAY_SYM)
         return b == RAY_SYM || bt == -RAY_STR;
     switch (b) {
-        /* No RAY_F32: if_fill_range has no F32 fill case, so an F32 branch
+        
+/* No RAY_F32: if_fill_range has no F32 fill case, so an F32 branch
          * must stay on the selected path (unreachable today — kept off the
          * whitelist so a future if_lazy_supported_type change cannot route
          * it to an unwritten result buffer). */
@@ -573,6 +591,8 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
         return result;
     }
     result->len = nrows;
+    if (if_val_has_null(then_v, out_type) || if_val_has_null(else_v, out_type))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
     if (out_type == RAY_STR)
         memset(ray_data(result), 0, (size_t)nrows * sizeof(ray_str_t));
     else
@@ -721,6 +741,11 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         return result;
     }
     result->len = len;
+    /* Same reason as the selected arm: an atom null is the sentinel value and
+     * carries no attr of its own, so without this the sentinel is rendered as
+     * an ordinary date or timestamp. */
+    if (if_val_has_null(then_v, out_type) || if_val_has_null(else_v, out_type))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
 
     uint8_t* cond_p = (uint8_t*)ray_data(cond_v);
 
