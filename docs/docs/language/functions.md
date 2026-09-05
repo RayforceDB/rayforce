@@ -299,6 +299,8 @@ A non-empty functional insert returns a new logical table view; the quoted-symbo
 
 `upsert` is not supported on parted tables. Materialize a flat table or use an application-level update strategy when key-based replacement is required.
 
+`upsert` into a named flat table (`(upsert 'book 'px row)`) writes matched rows in place and appends new keys, so its cost is proportional to the payload rather than to the rows already present. A multi-row payload (a table, or a list of column vectors) is applied in one pass; a key repeated inside the payload resolves to its last row. A single-row `upsert` locates its row through a `.idx.hash` index on the key column when one is attached and fresh, and by one scan of the key column otherwise. A payload with a mistyped value is rejected before anything is written.
+
 ## Joins
 
 Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joins.

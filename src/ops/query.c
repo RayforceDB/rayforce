@@ -14284,6 +14284,493 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
 /* (upsert table key_col (list val1 val2 ...)) — update row if key matches, else insert.
  * Special form: first arg may be 'sym for in-place, other args are evaluated. */
+/* ---- Upsert one-pass path (#475) ------------------------------------
+ * The legacy arms below find the target row with a linear key scan and
+ * rebuild the whole table to write one cell — per payload row, so a
+ * named-table upsert costs O(rows present) per row and a batch costs
+ * the same as the equivalent loop.  This path does one pass per call:
+ * matched rows have their cells written in place, missing keys append
+ * (amortized, as in insert's #455 path), and a batch resolves its keys
+ * through one hash over the target built once per call.  A single-row
+ * call consults a fresh hash index on the key column when one is
+ * attached, and otherwise runs one typed scan.
+ *
+ * When the binding is the sole owner the live columns are mutated;
+ * otherwise (a value target, or a shared table/column) the columns are
+ * copied once and the same pass runs on the copy, which keeps the
+ * value semantics of the rebuild at O(rows + payload) per call rather
+ * than per row.  Any gate miss returns NULL with *handled = false and
+ * the legacy arms run unchanged.
+ *
+ * Every cell is type-checked before anything is written, so a bad
+ * payload leaves the table untouched.  Only an allocation failure can
+ * interrupt the pass; appended rows are then rolled back, while cells
+ * already overwritten in place keep their new values. */
+
+static bool upsert_key_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_F64: case RAY_SYM: case RAY_STR: case RAY_GUID:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool upsert_col_ok(ray_t* col) {
+    if (!col || RAY_IS_ERR(col)) return false;
+    /* An EMPTY LIST column is typeless — the legacy insert arm adopts a
+     * concrete type from the first payload; a non-empty LIST column is
+     * genuinely boxed and is written like any other. */
+    if (col->type == RAY_LIST && ray_len(col) == 0) return false;
+    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return false;
+    if (col->mmod != 0) return false;
+    if (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)) return false;
+    /* Cells are written as W64 runtime-domain ids (append_atom_to_col);
+     * a narrow or store-domain column needs the legacy re-expression. */
+    if (col->type == RAY_SYM &&
+        ((col->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+         col->sym_domain != ray_sym_runtime_domain()))
+        return false;
+    return true;
+}
+
+/* Integer-family cell widened to int64 through its storage width. */
+static int64_t upsert_int_cell(const ray_t* col, int64_t r) {
+    const void* d = ray_data((ray_t*)col);
+    switch (col->type) {
+    case RAY_BOOL: case RAY_U8: return (int64_t)((const uint8_t*)d)[r];
+    case RAY_I16:               return (int64_t)((const int16_t*)d)[r];
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+                                return (int64_t)((const int32_t*)d)[r];
+    default:                    return ((const int64_t*)d)[r];
+    }
+}
+
+static int64_t upsert_atom_int(ray_t* a) {
+    return a->type == -RAY_BOOL ? (int64_t)a->b8 : elem_as_i64(a);
+}
+
+static uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
+    switch (col->type) {
+    case RAY_F64: return ray_hash_f64(((const double*)ray_data(col))[r]);
+    case RAY_SYM: return ray_hash_i64(ray_read_sym(ray_data(col), r, col->type, col->attrs));
+    case RAY_STR: {
+        size_t n = 0;
+        const char* s = ray_str_vec_get(col, r, &n);
+        return ray_hash_bytes(s ? s : "", n);
+    }
+    case RAY_GUID: return ray_hash_bytes((const uint8_t*)ray_data(col) + r * 16, 16);
+    default:       return ray_hash_i64(upsert_int_cell(col, r));
+    }
+}
+
+static uint64_t upsert_hash_atom(int8_t ct, ray_t* a) {
+    static const uint8_t zero_guid[16] = {0};
+    switch (ct) {
+    case RAY_F64: return ray_hash_f64(as_f64(a));
+    case RAY_SYM: return ray_hash_i64(a->i64);
+    case RAY_STR: {
+        const char* s = ray_str_ptr(a);
+        return ray_hash_bytes(s ? s : "", ray_str_len(a));
+    }
+    case RAY_GUID: return ray_hash_bytes(a->obj ? ray_data(a->obj) : zero_guid, 16);
+    default:       return ray_hash_i64(upsert_atom_int(a));
+    }
+}
+
+/* Cell-vs-atom equality with the legacy scan's semantics: F64 by value
+ * (NaN never matches, so a null F64 key always appends), SYM by raw id,
+ * STR by bytes, integers widened. */
+static bool upsert_cell_eq_atom(ray_t* col, int64_t r, ray_t* a) {
+    static const uint8_t zero_guid[16] = {0};
+    switch (col->type) {
+    case RAY_F64: return ((const double*)ray_data(col))[r] == as_f64(a);
+    case RAY_SYM: return ray_read_sym(ray_data(col), r, col->type, col->attrs) == a->i64;
+    case RAY_STR: {
+        size_t n = 0;
+        const char* s = ray_str_vec_get(col, r, &n);
+        size_t m = ray_str_len(a);
+        const char* p = ray_str_ptr(a);
+        return n == m && (m == 0 || (s && p && memcmp(s, p, m) == 0));
+    }
+    case RAY_GUID:
+        return memcmp((const uint8_t*)ray_data(col) + r * 16,
+                      a->obj ? ray_data(a->obj) : zero_guid, 16) == 0;
+    default: return upsert_int_cell(col, r) == upsert_atom_int(a);
+    }
+}
+
+#define UPSERT_HASH_SEED 0x9E3779B97F4A7C15ULL
+
+static uint64_t upsert_hash_row(ray_t** slots, const int64_t* kci, int64_t nk, int64_t r) {
+    uint64_t h = UPSERT_HASH_SEED;
+    for (int64_t k = 0; k < nk; k++)
+        h = ray_hash_combine(h, upsert_hash_cell(slots[kci[k]], r));
+    return h;
+}
+
+static uint64_t upsert_hash_atoms(ray_t** slots, const int64_t* kci, int64_t nk, ray_t** cells) {
+    uint64_t h = UPSERT_HASH_SEED;
+    for (int64_t k = 0; k < nk; k++)
+        h = ray_hash_combine(h, upsert_hash_atom(slots[kci[k]]->type, cells[kci[k]]));
+    return h;
+}
+
+static bool upsert_row_eq_atoms(ray_t** slots, const int64_t* kci, int64_t nk, int64_t r, ray_t** cells) {
+    for (int64_t k = 0; k < nk; k++)
+        if (!upsert_cell_eq_atom(slots[kci[k]], r, cells[kci[k]])) return false;
+    return true;
+}
+
+/* Open-addressing map from key tuple to row: slots hold row+1, 0 is
+ * empty.  Every target row is entered in row order, so a probe walking
+ * from the hash slot meets duplicates lowest-row first — the same row
+ * the legacy scan picks.  Rows appended during the pass are entered as
+ * they land, so a key repeated inside one batch updates the row its
+ * first occurrence appended. */
+typedef struct {
+    ray_t*   hdr;
+    int64_t* slot;
+    uint64_t mask;
+} upsert_map_t;
+
+static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
+    uint64_t cap = 16;
+    while (cap < (uint64_t)entries * 2) cap <<= 1;
+    mp->slot = (int64_t*)scratch_alloc(&mp->hdr, cap * sizeof(int64_t));
+    if (!mp->slot) return false;
+    memset(mp->slot, 0, cap * sizeof(int64_t));
+    mp->mask = cap - 1;
+    return true;
+}
+
+static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
+    uint64_t s = h & mp->mask;
+    while (mp->slot[s] != 0) s = (s + 1) & mp->mask;
+    mp->slot[s] = row + 1;
+}
+
+static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
+                               const int64_t* kci, int64_t nk, ray_t** cells) {
+    uint64_t s = h & mp->mask;
+    for (;;) {
+        int64_t e = mp->slot[s];
+        if (e == 0) return -1;
+        if (upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
+        s = (s + 1) & mp->mask;
+    }
+}
+
+/* Single-row lookup: a fresh hash index on a lone key column answers in
+ * O(1); otherwise one typed scan. */
+static int64_t upsert_find_row(ray_t** slots, const int64_t* kci, int64_t nk,
+                               ray_t** cells, int64_t nrows) {
+    if (nk == 1) {
+        ray_t* col = slots[kci[0]];
+        ray_t* a = cells[kci[0]];
+        int8_t t = col->type;
+        if (t == RAY_SYM || (t != RAY_F64 && t != RAY_STR && t != RAY_GUID)) {
+            int64_t key = (t == RAY_SYM) ? a->i64 : upsert_atom_int(a);
+            int64_t hit = ray_index_find_row(col, key);
+            if (hit >= -1) return hit;
+            if (t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_SYM) {
+                const int64_t* d = (const int64_t*)ray_data(col);
+                for (int64_t r = 0; r < nrows; r++) if (d[r] == key) return r;
+                return -1;
+            }
+            if (t == RAY_I32 || t == RAY_DATE || t == RAY_TIME) {
+                const int32_t* d = (const int32_t*)ray_data(col);
+                for (int64_t r = 0; r < nrows; r++) if ((int64_t)d[r] == key) return r;
+                return -1;
+            }
+        }
+    }
+    for (int64_t r = 0; r < nrows; r++)
+        if (upsert_row_eq_atoms(slots, kci, nk, r, cells)) return r;
+    return -1;
+}
+
+/* Would append_atom_to_col accept `cell` for a column of type `ct`?
+ * NULL on yes, the error it would raise otherwise. */
+static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
+    if (ct == RAY_LIST) return NULL;
+    if (!ray_is_atom(cell))
+        return ray_error("type", "upsert: %s column requires an atom value, got %s",
+                         ray_type_name(ct), ray_type_name(cell->type));
+    if (RAY_ATOM_IS_NULL(cell)) return NULL;
+    int8_t at = cell->type;
+    bool is_int = (at == -RAY_I64 || at == -RAY_I32 || at == -RAY_I16 || at == -RAY_U8);
+    bool ok;
+    switch (ct) {
+    case RAY_BOOL:      ok = (at == -RAY_BOOL); break;
+    case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+                        ok = is_int; break;
+    case RAY_F64:       ok = (at == -RAY_F64 || is_int); break;
+    case RAY_DATE:      ok = (at == -RAY_DATE); break;
+    case RAY_TIME:      ok = (at == -RAY_TIME); break;
+    case RAY_TIMESTAMP: ok = (at == -RAY_TIMESTAMP); break;
+    case RAY_GUID:      ok = (at == -RAY_GUID); break;
+    case RAY_SYM:       ok = (at == -RAY_SYM); break;
+    case RAY_STR:       ok = (at == -RAY_STR); break;
+    default:
+        return ray_error("type", "upsert: unsupported column type %s", ray_type_name(ct));
+    }
+    if (ok) return NULL;
+    return ray_error("type", "upsert: value type %s does not match %s column",
+                     ray_type_name(at), ray_type_name(ct));
+}
+
+/* Overwrite one cell of slots[c] with `cell`.  Boxed columns swap the
+ * pointer; STR columns write through ray_str_vec_set; fixed-width
+ * columns append through append_atom_to_col (which owns the coercion
+ * and null encoding) and move the new tail cell into place.  Any
+ * attached index is dropped first: an overwritten cell would otherwise
+ * leave a fresh-looking index answering with stale rows. */
+static ray_t* upsert_write_cell(ray_t** slots, int64_t c, int64_t row, ray_t* cell) {
+    ray_t* col = slots[c];
+    if (col->type == RAY_LIST) {
+        ray_t** cells = (ray_t**)ray_data(col);
+        ray_t* old = cells[row];
+        ray_retain(cell);
+        cells[row] = cell;
+        if (old) ray_release(old);
+        return NULL;
+    }
+    ray_index_drop(&slots[c]);
+    col = slots[c];
+    if (RAY_IS_ERR(col)) return col;
+    col->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+    ray_t* res;
+    if (col->type == RAY_STR) {
+        res = RAY_ATOM_IS_NULL(cell)
+            ? ray_str_vec_set(col, row, "", 0)
+            : ray_str_vec_set(col, row, ray_str_ptr(cell), ray_str_len(cell));
+        if (RAY_IS_ERR(res)) return res;
+        slots[c] = res;
+        return NULL;
+    }
+    int64_t tail = col->len;
+    res = append_atom_to_col(col, cell);
+    if (RAY_IS_ERR(res)) return res;
+    slots[c] = res;
+    size_t esz = ray_sym_elem_size(res->type, res->attrs);
+    uint8_t* d = (uint8_t*)ray_data(res);
+    memcpy(d + (size_t)row * esz, d + (size_t)tail * esz, esz);
+    res->len = tail;
+    return NULL;
+}
+
+/* Append one row; a NULL cell lands as the column's null (a NULL slot
+ * for a boxed column), mirroring the legacy insert arm. */
+static ray_t* upsert_append_row(ray_t** slots, int64_t ncols, ray_t** cells) {
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = slots[c];
+        ray_t* cell = cells[c];
+        ray_t* res;
+        if (col->type == RAY_LIST) {
+            res = ray_list_append(col, cell);
+        } else if (!cell) {
+            ray_t* na = ray_typed_null(-col->type);
+            res = append_atom_to_col(col, na);
+            ray_release(na);
+        } else {
+            res = append_atom_to_col(col, cell);
+        }
+        if (RAY_IS_ERR(res)) return res;
+        slots[c] = res;
+    }
+    return NULL;
+}
+
+static void upsert_rollback_appends(ray_t** slots, int64_t ncols, int64_t nrows0) {
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = slots[c];
+        if (col->type == RAY_LIST) {
+            ray_t** cells = (ray_t**)ray_data(col);
+            for (int64_t k = nrows0; k < col->len; k++)
+                if (cells[k]) ray_release(cells[k]);
+        }
+        col->len = nrows0;
+    }
+}
+
+/* One-pass upsert.  `kci[nk]` are the key column positions.  The
+ * payload is either `src_cols` (ncols collections-or-NULL, each `m`
+ * rows) or, when src_cols is NULL, `atoms` (ncols atoms-or-NULL, m==1).
+ * `tbl` is borrowed.  Returns the result (the binding's symbol, or a
+ * fresh table) or an error, and sets *handled; returns NULL with
+ * *handled false when a gate misses and the legacy arms should run. */
+static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
+                           const int64_t* kci, int64_t nk,
+                           ray_t** src_cols, ray_t** atoms, int64_t m,
+                           bool* handled) {
+    *handled = false;
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t nrows0 = ray_table_nrows(tbl);
+    if (ncols <= 0 || m <= 0) return NULL;
+
+    for (int64_t c = 0; c < ncols; c++)
+        if (!upsert_col_ok(ray_table_get_col_idx(tbl, c))) return NULL;
+    for (int64_t k = 0; k < nk; k++) {
+        ray_t* kc = ray_table_get_col_idx(tbl, kci[k]);
+        if (!upsert_key_type_ok(kc->type)) return NULL;
+    }
+
+    /* Sole-owner check, as in insert's in-place path: the binding holds
+     * one reference and the caller the other; the column list and every
+     * column must be unshared so a write cannot be observed elsewhere. */
+    bool inplace = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
+                   !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    ray_t* live_cols = NULL;
+    if (inplace) {
+        live_cols = ((ray_t**)ray_data(tbl))[1];
+        if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols)
+            inplace = false;
+    }
+    for (int64_t c = 0; inplace && c < ncols; c++)
+        if (((ray_t**)ray_data(live_cols))[c]->rc != 1) inplace = false;
+
+    /* Materialize the payload cells once: cells[r*ncols + c], with a
+     * parallel ownership byte for atoms allocated out of typed vectors. */
+    ray_t* cells_hdr = NULL; ray_t* owned_hdr = NULL;
+    size_t ncell = (size_t)m * (size_t)ncols;
+    ray_t** cells = (ray_t**)scratch_alloc(&cells_hdr, ncell * sizeof(ray_t*));
+    uint8_t* owned = cells ? (uint8_t*)scratch_alloc(&owned_hdr, ncell) : NULL;
+    if (!cells || !owned) {
+        if (cells_hdr) scratch_free(cells_hdr);
+        if (owned_hdr) scratch_free(owned_hdr);
+        *handled = true;
+        return ray_error("oom", NULL);
+    }
+    memset(cells, 0, ncell * sizeof(ray_t*));
+    memset(owned, 0, ncell);
+
+    ray_t* err = NULL;
+    upsert_map_t map = { NULL, NULL, 0 };
+    ray_t* work = NULL;
+
+    if (src_cols) {
+        for (int64_t c = 0; c < ncols && !err; c++) {
+            ray_t* sc = src_cols[c];
+            if (!sc) continue;
+            if (!is_collection(sc)) {
+                err = ray_error("type", "upsert: multi-row value for column %lld must be a list or vector, got %s",
+                                (long long)c, ray_type_name(sc->type));
+                break;
+            }
+            if (ray_len(sc) != m) {
+                err = ray_error("length", "upsert: column %lld has %lld values, key has %lld",
+                                (long long)c, (long long)ray_len(sc), (long long)m);
+                break;
+            }
+            for (int64_t r = 0; r < m; r++) {
+                int alloc = 0;
+                ray_t* e = collection_elem(sc, r, &alloc);
+                if (e && RAY_IS_ERR(e)) { err = e; break; }
+                cells[(size_t)r * ncols + c] = e;
+                owned[(size_t)r * ncols + c] = (uint8_t)(alloc && e);
+            }
+        }
+    } else {
+        for (int64_t c = 0; c < ncols; c++) cells[c] = atoms[c];
+    }
+
+    /* Type-check every cell before writing anything. */
+    for (int64_t r = 0; r < m && !err; r++) {
+        ray_t** rc = cells + (size_t)r * ncols;
+        for (int64_t k = 0; k < nk && !err; k++) {
+            ray_t* kc = ray_table_get_col_idx(tbl, kci[k]);
+            ray_t* a = rc[kci[k]];
+            if (!a) {
+                err = ray_error("domain", "upsert: key value missing");
+            } else if (kc->type == RAY_STR && a->type != -RAY_STR) {
+                err = ray_error("type", "upsert: key column is str but key value is %s", ray_type_name(a->type));
+            } else if (kc->type == RAY_SYM && a->type != -RAY_SYM) {
+                err = ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(a->type));
+            }
+        }
+        for (int64_t c = 0; c < ncols && !err; c++)
+            if (rc[c]) err = upsert_cell_fits(ray_table_get_col_idx(tbl, c)->type, rc[c]);
+    }
+
+    /* Work table: the live columns, or a private copy of them. */
+    ray_t** slots = NULL;
+    if (!err) {
+        if (inplace) {
+            slots = (ray_t**)ray_data(live_cols);
+        } else {
+            work = ray_table_new(ncols);
+            if (RAY_IS_ERR(work)) { err = work; work = NULL; }
+            for (int64_t c = 0; c < ncols && !err; c++) {
+                ray_t* orig = ray_table_get_col_idx(tbl, c);
+                ray_retain(orig);
+                ray_t* cp = ray_cow(orig);
+                if (!cp || RAY_IS_ERR(cp)) { err = cp ? cp : ray_error("oom", NULL); break; }
+                work = ray_table_add_col(work, ray_table_col_name(tbl, c), cp);
+                ray_release(cp);
+                if (RAY_IS_ERR(work)) { err = work; work = NULL; }
+            }
+            if (!err) slots = (ray_t**)ray_data(((ray_t**)ray_data(work))[1]);
+        }
+    }
+
+    if (!err && m > 1) {
+        if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
+        for (int64_t r = 0; r < nrows0 && !err; r++)
+            upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+    }
+
+    int64_t nrows = nrows0;
+    for (int64_t r = 0; r < m && !err; r++) {
+        ray_t** rc = cells + (size_t)r * ncols;
+        uint64_t h = 0;
+        int64_t hit;
+        if (map.slot) {
+            h = upsert_hash_atoms(slots, kci, nk, rc);
+            hit = upsert_map_find(&map, h, slots, kci, nk, rc);
+        } else {
+            hit = upsert_find_row(slots, kci, nk, rc, nrows);
+        }
+        if (hit >= 0) {
+            for (int64_t c = 0; c < ncols && !err; c++) {
+                if (!rc[c]) continue;               /* partial payload: keep */
+                bool is_key = false;
+                for (int64_t k = 0; k < nk; k++) if (kci[k] == c) { is_key = true; break; }
+                if (is_key) continue;               /* matched: already equal */
+                err = upsert_write_cell(slots, c, hit, rc[c]);
+            }
+        } else {
+            err = upsert_append_row(slots, ncols, rc);
+            if (!err) {
+                if (map.slot) upsert_map_put(&map, h, nrows);
+                nrows++;
+            }
+        }
+    }
+
+    if (err && slots) upsert_rollback_appends(slots, ncols, nrows0);
+
+    if (map.hdr) scratch_free(map.hdr);
+    for (size_t i = 0; i < ncell; i++) if (owned[i] && cells[i]) ray_release(cells[i]);
+    scratch_free(cells_hdr);
+    scratch_free(owned_hdr);
+
+    *handled = true;
+    if (err) {
+        if (work) ray_release(work);
+        return err;
+    }
+    if (inplace) return ray_sym(inplace_sym);
+    if (inplace_sym >= 0) {
+        ray_env_set(inplace_sym, work);
+        ray_release(work);
+        return ray_sym(inplace_sym);
+    }
+    return work;
+}
+
 ray_t* ray_upsert_fn(ray_t** args, int64_t n) {
     return ray_upsert(args, n);
 }
@@ -14408,19 +14895,47 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 return ray_error("value", NULL);
             }
         }
+        /* Key column positions in the target.  Every key name is a
+         * payload column, and each payload column matches exactly one
+         * target column (checked above), so each resolves uniquely. */
+        ray_t* tkci_hdr = NULL;
+        int64_t* tkci = (int64_t*)scratch_alloc(&tkci_hdr, (size_t)n_key * sizeof(int64_t));
+        if (!tkci) { scratch_free(keynames_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
+        for (int64_t k = 0; k < n_key; k++) {
+            tkci[k] = -1;
+            for (int64_t c = 0; c < ncols; c++)
+                if (ray_table_col_name(tbl, c) == key_names[k]) { tkci[k] = c; break; }
+            if (tkci[k] < 0) {
+                scratch_free(tkci_hdr); scratch_free(keynames_hdr);
+                ray_release(tbl); ray_release(key_sym); ray_release(row);
+                return ray_error("domain", "upsert: key column not found in target table");
+            }
+        }
         scratch_free(keynames_hdr);
 
         /* Gather source columns in target order (now guaranteed 1-to-1). */
-        ray_t* src_cols[64];
-        for (int64_t c = 0; c < ncols && c < 64; c++) {
+        ray_t* srcs_hdr = NULL;
+        ray_t** src_cols = (ray_t**)scratch_alloc(&srcs_hdr, (size_t)ncols * sizeof(ray_t*));
+        if (!src_cols) { scratch_free(tkci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
+        for (int64_t c = 0; c < ncols; c++) {
             int64_t cn = ray_table_col_name(tbl, c);
             src_cols[c] = ray_table_get_col(row, cn);
         }
+
+        bool fast_handled = false;
+        ray_t* fast = upsert_apply(tbl, inplace_sym, tkci, n_key, src_cols, NULL, src_nrows, &fast_handled);
+        scratch_free(tkci_hdr);
+        if (fast_handled) {
+            scratch_free(srcs_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return fast;
+        }
+
         ray_t* cur_tbl = tbl;
         ray_retain(cur_tbl);
         for (int64_t r = 0; r < src_nrows; r++) {
             ray_t* single = ray_alloc(ncols * sizeof(ray_t*));
-            if (!single) { ray_release(cur_tbl); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
+            if (!single) { scratch_free(srcs_hdr); ray_release(cur_tbl); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
             single->type = RAY_LIST;
             single->len = ncols;
             ray_t** sr = (ray_t**)ray_data(single);
@@ -14435,9 +14950,10 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             single->len = 0;
             ray_free(single);
             ray_release(cur_tbl);
-            if (RAY_IS_ERR(new_tbl)) { ray_release(tbl); ray_release(key_sym); ray_release(row); return new_tbl; }
+            if (RAY_IS_ERR(new_tbl)) { scratch_free(srcs_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return new_tbl; }
             cur_tbl = new_tbl;
         }
+        scratch_free(srcs_hdr);
         ray_release(tbl);
         ray_release(key_sym);
         ray_release(row);
@@ -14542,6 +15058,19 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
 
     /* Multi-row upsert: if row values are vectors, iterate row-by-row */
     ray_t* key_elem = row_elems[key_col_indices[0]];
+    if (!key_elem) { scratch_free(kci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("domain", "upsert: key value missing"); }
+    {
+        bool multi = ray_is_vec(key_elem) || key_elem->type == RAY_LIST;
+        bool fast_handled = false;
+        ray_t* fast = multi
+            ? upsert_apply(tbl, inplace_sym, key_col_indices, n_key_cols, row_elems, NULL, ray_len(key_elem), &fast_handled)
+            : upsert_apply(tbl, inplace_sym, key_col_indices, n_key_cols, NULL, row_elems, 1, &fast_handled);
+        if (fast_handled) {
+            scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return fast;
+        }
+    }
     if (ray_is_vec(key_elem) || key_elem->type == RAY_LIST) {
         int64_t new_nrows = ray_len(key_elem);
         ray_t* cur_tbl = tbl;
