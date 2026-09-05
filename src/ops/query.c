@@ -11544,6 +11544,374 @@ static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
  * and replace those column values. Returns a new table. */
 /* Forward declarations */
 
+/* ---- update with WHERE, in place (#475 follow-up) -------------------
+ * The WHERE arm below evaluates the predicate and every update
+ * expression over the whole table and then rebuilds each updated column
+ * cell by cell, so a keyed update into a named table costs O(rows
+ * present) per call with a large constant, and an attached hash index
+ * on the key column is never consulted.  When the binding is the sole
+ * owner, this path resolves the rows first — through a fresh hash index
+ * when the predicate is a plain equality on an indexed column, otherwise
+ * through the same mask the legacy arm computes — gathers just those
+ * rows into a sub-table, evaluates the update expressions there, and
+ * scatters the results into the live columns in place.
+ *
+ * Expressions carrying an aggregation (or a call whose head is not a
+ * plain symbol) keep the legacy arm, where the aggregate ranges over the
+ * whole table.  Every result is type-checked before anything is written,
+ * so a mistyped or wrong-length value leaves the table untouched; only
+ * an allocation failure inside a STR write can interrupt the scatter. */
+
+static bool    upsert_col_ok(ray_t* col);      /* defined with the upsert path below */
+static int64_t upsert_atom_int(ray_t* a);
+
+static bool update_expr_rowwise(ray_t* e) {
+    if (!e || RAY_IS_ERR(e)) return true;
+    if (e->type == RAY_DICT) return false;
+    if (e->type != RAY_LIST) return true;
+    if (expr_contains_agg(e)) return false;
+    int64_t n = ray_len(e);
+    if (n == 0) return true;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (!el[0] || el[0]->type != -RAY_SYM) return false;
+    for (int64_t i = 1; i < n; i++)
+        if (!update_expr_rowwise(el[i])) return false;
+    return true;
+}
+
+/* Rows matching `(== col atom)` through a fresh hash index on col.
+ * Returns 1 with rows copied into *rows (n in *n_out), 0 when the
+ * predicate is not of that shape or the index cannot answer. */
+static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
+                                   ray_t** rows_hdr, int64_t** rows, int64_t* n_out) {
+    if (!where_expr || where_expr->type != RAY_LIST || ray_len(where_expr) != 3) return 0;
+    ray_t** el = (ray_t**)ray_data(where_expr);
+    if (!el[0] || el[0]->type != -RAY_SYM) return 0;
+    if (el[0]->i64 != ray_sym_intern("==", 2)) return 0;
+    ray_t* col = NULL; ray_t* val_node = NULL;
+    for (int side = 1; side <= 2 && !col; side++) {
+        ray_t* a = el[side];
+        if (a && a->type == -RAY_SYM && ray_table_get_col(tbl, a->i64)) {
+            col = ray_table_get_col(tbl, a->i64);
+            val_node = el[3 - side];
+        }
+    }
+    if (!col || !val_node || RAY_IS_ERR(val_node)) return 0;
+    /* The other side must be a value: a literal, a quoted symbol, or a
+     * variable — never a column name (that is a column-column compare). */
+    if (val_node->type == -RAY_SYM && ray_table_get_col(tbl, val_node->i64)) return 0;
+    if (!ray_is_atom(val_node)) return 0;
+    if (col->attrs & RAY_ATTR_HAS_NULLS) return 0;
+    if (ray_index_kind(col) != RAY_IDX_HASH) return 0;
+    if (col->type == RAY_F64 || col->type == RAY_STR || col->type == RAY_GUID) return 0;
+    ray_t* v = ray_eval(val_node);
+    if (!v) return 0;
+    if (RAY_IS_ERR(v)) { ray_error_free(v); return 0; }
+    int ok = ray_is_atom(v) && !RAY_ATOM_IS_NULL(v) &&
+             (col->type == RAY_SYM ? v->type == -RAY_SYM
+                                   : (v->type == -col->type || v->type == -RAY_I64 ||
+                                      v->type == -RAY_I32 || v->type == -RAY_I16 ||
+                                      v->type == -RAY_U8));
+    int64_t key = ok ? (col->type == RAY_SYM ? v->i64 : upsert_atom_int(v)) : 0;
+    ray_release(v);
+    if (!ok) return 0;
+    const int64_t* ids = NULL; int64_t n = 0;
+    int hit = ray_index_hash_group(col, key, &ids, &n);
+    if (hit < 0) return 0;
+    int64_t* out = (int64_t*)scratch_alloc(rows_hdr, (size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    if (!out) return 0;
+    if (n > 0) memcpy(out, ids, (size_t)n * sizeof(int64_t));
+    *rows = out; *n_out = n;
+    return 1;
+}
+
+/* Legacy-shaped mask evaluation (DAG, then eval with column bindings). */
+static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
+    ray_t* mask_vec = NULL;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (g) {
+        ray_op_t* pred = compile_expr_dag(g, where_expr);
+        if (pred) {
+            pred = ray_optimize(g, pred);
+            mask_vec = ray_execute(g, pred);
+        }
+        ray_graph_free(g);
+    }
+    if (!mask_vec || RAY_IS_ERR(mask_vec)) {
+        int64_t ncols = ray_table_ncols(tbl);
+        ray_env_push_query_scope();
+        for (int64_t c = 0; c < ncols; c++)
+            ray_env_set_query_local(ray_table_col_name(tbl, c), ray_table_get_col_idx(tbl, c));
+        mask_vec = ray_eval(where_expr);
+        ray_env_pop_scope();
+    }
+    if (!mask_vec) return ray_error("type", "update: `where:` predicate evaluation failed");
+    if (RAY_IS_ERR(mask_vec)) return mask_vec;
+    if (mask_vec->type != RAY_BOOL || mask_vec->len != ray_table_nrows(tbl)) {
+        int8_t mask_t = mask_vec->type;
+        ray_release(mask_vec);
+        return ray_error("type", "update: `where:` must produce a bool mask matching row count, got %s", ray_type_name(mask_t));
+    }
+    return mask_vec;
+}
+
+static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
+    ray_t* out = NULL;
+    ray_graph_t* g = ray_graph_new(sub);
+    if (g) {
+        ray_op_t* op = compile_expr_dag(g, expr);
+        if (op) {
+            op = ray_optimize(g, op);
+            out = ray_execute(g, op);
+        }
+        ray_graph_free(g);
+    }
+    if (!out || RAY_IS_ERR(out)) {
+        if (out) ray_error_free(out);
+        int64_t ncols = ray_table_ncols(sub);
+        ray_env_push_query_scope();
+        for (int64_t c = 0; c < ncols; c++)
+            ray_env_set_query_local(ray_table_col_name(sub, c), ray_table_get_col_idx(sub, c));
+        out = ray_eval(expr);
+        ray_env_pop_scope();
+    }
+    if (!out) return ray_error("type", "update: failed to evaluate column update expression");
+    if (RAY_IS_ERR(out)) return out;
+    if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    return out;
+}
+
+static bool update_numeric_promo(int8_t ct, int8_t et) {
+    return (ct == RAY_I64 || ct == RAY_I32 || ct == RAY_F64) &&
+           (et == RAY_I64 || et == RAY_I32 || et == RAY_F64);
+}
+
+/* Validate one evaluated update value against its column: NULL on ok,
+ * the error otherwise.  Mirrors the legacy WHERE arm's acceptance. */
+static ray_t* update_value_check(ray_t* col, ray_t* val, int64_t k) {
+    int8_t ct = col->type;
+    if (val->type < 0) {
+        int ok = (val->type == -ct) ||
+                 (ct == RAY_F64 && val->type == -RAY_I64) ||
+                 (ct == RAY_LIST && val->type == -RAY_SYM);
+        if (!ok) return ray_error("type", "update: cannot assign %s value to %s column",
+                                  ray_type_name(val->type), ray_type_name(ct));
+        return NULL;
+    }
+    if (!ray_is_vec(val) && val->type != RAY_LIST)
+        return ray_error("type", "update: cannot assign %s expression to %s column",
+                         ray_type_name(val->type), ray_type_name(ct));
+    if (ray_len(val) != k)
+        return ray_error("length", "update: expression yields %lld values for %lld matched rows",
+                         (long long)ray_len(val), (long long)k);
+    if (val->type == ct) return NULL;
+    if (update_numeric_promo(ct, val->type)) return NULL;
+    return ray_error("type", "update: expression type %s does not match %s column",
+                     ray_type_name(val->type), ray_type_name(ct));
+}
+
+static double update_cell_f64(ray_t* v, int64_t i) {
+    switch (v->type) {
+    case RAY_F64: return ((const double*)ray_data(v))[i];
+    case RAY_I32: return (double)((const int32_t*)ray_data(v))[i];
+    default:      return (double)((const int64_t*)ray_data(v))[i];
+    }
+}
+
+/* Scatter `val` (checked) into slots[c] at rows[0..k). */
+static ray_t* update_scatter(ray_t** slots, int64_t c, const int64_t* rows, int64_t k, ray_t* val) {
+    ray_t* col = slots[c];
+    int8_t ct = col->type;
+    if (ct == RAY_LIST) {
+        ray_t** cells = (ray_t**)ray_data(col);
+        for (int64_t i = 0; i < k; i++) {
+            ray_t* nv = (val->type < 0) ? val : ((ray_t**)ray_data(val))[i];
+            ray_t* old = cells[rows[i]];
+            if (nv) ray_retain(nv);
+            cells[rows[i]] = nv;
+            if (old) ray_release(old);
+        }
+        return NULL;
+    }
+    ray_index_drop(&slots[c]);
+    col = slots[c];
+    if (RAY_IS_ERR(col)) return col;
+    col->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+
+    if (ct == RAY_STR) {
+        for (int64_t i = 0; i < k; i++) {
+            const char* sp; size_t sl;
+            if (val->type < 0) { sp = ray_str_ptr(val); sl = ray_str_len(val); }
+            else               { sl = 0; sp = ray_str_vec_get(val, i, &sl); }
+            ray_t* res = ray_str_vec_set(col, rows[i], sp ? sp : "", sp ? sl : 0);
+            if (RAY_IS_ERR(res)) return res;
+            slots[c] = col = res;
+        }
+        return NULL;
+    }
+
+    size_t esz = ray_sym_elem_size(ct, col->attrs);
+    uint8_t* d = (uint8_t*)ray_data(col);
+    if (val->type < 0) {
+        /* Atom broadcast: one encoded cell, written k times. */
+        uint8_t elem[16] = {0};
+        bool is_null = RAY_ATOM_IS_NULL(val);
+        if (ct == RAY_GUID) {
+            if (val->obj) memcpy(elem, ray_data(val->obj), 16);
+        } else if (ct == RAY_F64 && val->type == -RAY_I64) {
+            double p = (double)val->i64; memcpy(elem, &p, sizeof p);
+        } else {
+            memcpy(elem, &val->i64, esz);
+        }
+        for (int64_t i = 0; i < k; i++) {
+            if (is_null) ray_vec_set_null(col, rows[i], true);
+            else {
+                memcpy(d + (size_t)rows[i] * esz, elem, esz);
+                if (ct == RAY_SYM && val->i64 == 0) col->attrs |= RAY_ATTR_HAS_NULLS;
+            }
+        }
+        return NULL;
+    }
+
+    if (val->type != ct) {
+        /* Numeric promotion among I64 / I32 / F64, null-aware. */
+        for (int64_t i = 0; i < k; i++) {
+            int64_t r = rows[i];
+            if (ray_vec_is_null(val, i)) { ray_vec_set_null(col, r, true); continue; }
+            if (ct == RAY_F64) {
+                ((double*)d)[r] = update_cell_f64(val, i);
+            } else if (val->type == RAY_F64) {
+                double x = ((const double*)ray_data(val))[i];
+                if (ct == RAY_I64) ((int64_t*)d)[r] = ray_cast_f64_to_i64_null(x);
+                else               ((int32_t*)d)[r] = ray_cast_f64_to_i32_null(x);
+                if (ray_vec_is_null(col, r)) col->attrs |= RAY_ATTR_HAS_NULLS;
+            } else if (ct == RAY_I64) {
+                ((int64_t*)d)[r] = (int64_t)((const int32_t*)ray_data(val))[i];
+            } else {
+                ((int32_t*)d)[r] = (int32_t)((const int64_t*)ray_data(val))[i];
+            }
+        }
+        return NULL;
+    }
+
+    if (ct == RAY_SYM) {
+        for (int64_t i = 0; i < k; i++) {
+            int64_t id = sym_cell_runtime_id(val, i);
+            ((int64_t*)d)[rows[i]] = id;
+            if (id == 0) col->attrs |= RAY_ATTR_HAS_NULLS;
+        }
+        return NULL;
+    }
+    const uint8_t* s = (const uint8_t*)ray_data(val);
+    bool vn = payload_may_have_nulls(val);
+    for (int64_t i = 0; i < k; i++) {
+        if (vn && ray_vec_is_null(val, i)) { ray_vec_set_null(col, rows[i], true); continue; }
+        memcpy(d + (size_t)rows[i] * esz, s + (size_t)i * esz, esz);
+    }
+    return NULL;
+}
+
+static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
+                                   ray_t* where_expr, bool* handled) {
+    *handled = false;
+    int64_t ncols = ray_table_ncols(tbl);
+    if (inplace_sym < 0 || ncols <= 0) return NULL;
+    if (tbl->rc != 2 || tbl->mmod != 0 || (tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) return NULL;
+    ray_t* live_cols = ((ray_t**)ray_data(tbl))[1];
+    if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols) return NULL;
+    ray_t** slots = (ray_t**)ray_data(live_cols);
+    for (int64_t c = 0; c < ncols; c++)
+        if (slots[c]->rc != 1 || !upsert_col_ok(slots[c])) return NULL;
+
+    DICT_VIEW_DECL(updf);
+    DICT_VIEW_OPEN(dict, updf);
+    if (DICT_VIEW_OVERFLOW(updf)) { DICT_VIEW_CLOSE(updf); *handled = true; return ray_error("oom", NULL); }
+    int64_t from_id = ray_sym_intern("from", 4);
+    int64_t where_id = ray_sym_intern("where", 5);
+    int64_t by_id = ray_sym_intern("by", 2);
+
+    /* One update per target column, first dict entry wins (legacy order). */
+    ray_t* ucol_hdr = NULL; ray_t* uexpr_hdr = NULL; ray_t* uval_hdr = NULL;
+    int64_t* ucol = (int64_t*)scratch_alloc(&ucol_hdr, (size_t)ncols * sizeof(int64_t));
+    ray_t** uexpr = (ray_t**)scratch_alloc(&uexpr_hdr, (size_t)ncols * sizeof(ray_t*));
+    ray_t** uval = (ray_t**)scratch_alloc(&uval_hdr, (size_t)ncols * sizeof(ray_t*));
+    if (!ucol || !uexpr || !uval) {
+        if (ucol_hdr) scratch_free(ucol_hdr);
+        if (uexpr_hdr) scratch_free(uexpr_hdr);
+        if (uval_hdr) scratch_free(uval_hdr);
+        DICT_VIEW_CLOSE(updf); *handled = true; return ray_error("oom", NULL);
+    }
+    int64_t nu = 0;
+    bool rowwise = true;
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        for (int64_t d = 0; d + 1 < updf_n; d += 2) {
+            int64_t kid = updf[d]->i64;
+            if (kid == from_id || kid == where_id || kid == by_id) continue;
+            if (kid != cn) continue;
+            ucol[nu] = c; uexpr[nu] = updf[d + 1]; uval[nu] = NULL; nu++;
+            if (!update_expr_rowwise(updf[d + 1])) rowwise = false;
+            break;
+        }
+    }
+    if (!rowwise) {
+        scratch_free(ucol_hdr); scratch_free(uexpr_hdr); scratch_free(uval_hdr);
+        DICT_VIEW_CLOSE(updf);
+        return NULL;
+    }
+    *handled = true;
+
+    /* Matched rows: index probe, else the legacy mask. */
+    ray_t* rows_hdr = NULL; int64_t* rows = NULL; int64_t k = 0;
+    ray_t* err = NULL;
+    if (!update_where_index_rows(tbl, where_expr, &rows_hdr, &rows, &k)) {
+        ray_t* mask = update_where_mask_vec(tbl, where_expr);
+        if (RAY_IS_ERR(mask)) err = mask;
+        else {
+            int64_t nrows = mask->len;
+            const uint8_t* m = (const uint8_t*)ray_data(mask);
+            int64_t cnt = 0;
+            for (int64_t r = 0; r < nrows; r++) cnt += (m[r] != 0);
+            rows = (int64_t*)scratch_alloc(&rows_hdr, (size_t)(cnt > 0 ? cnt : 1) * sizeof(int64_t));
+            if (!rows) err = ray_error("oom", NULL);
+            else for (int64_t r = 0; r < nrows; r++) if (m[r]) rows[k++] = r;
+            ray_release(mask);
+        }
+    }
+
+    /* Sub-table of the matched rows; expressions evaluate against it. */
+    ray_t* idxv = NULL; ray_t* sub = NULL;
+    if (!err && nu > 0) {
+        idxv = ray_vec_new(RAY_I64, k > 0 ? k : 1);
+        if (RAY_IS_ERR(idxv)) { err = idxv; idxv = NULL; }
+        else if (k > 0) {
+            ray_t* r2 = ray_vec_append_raw(idxv, rows, k);
+            if (RAY_IS_ERR(r2)) { err = r2; } else idxv = r2;
+        }
+        if (!err) {
+            sub = ray_at_fn(tbl, idxv);
+            if (!sub || RAY_IS_ERR(sub)) { err = sub ? sub : ray_error("oom", NULL); sub = NULL; }
+        }
+    }
+    for (int64_t u = 0; u < nu && !err; u++) {
+        ray_t* v = update_eval_on(sub, uexpr[u]);
+        if (RAY_IS_ERR(v)) { err = v; break; }
+        uval[u] = v;
+        err = update_value_check(slots[ucol[u]], v, k);
+    }
+    for (int64_t u = 0; u < nu && !err && k > 0; u++)
+        err = update_scatter(slots, ucol[u], rows, k, uval[u]);
+
+    for (int64_t u = 0; u < nu; u++) if (uval[u]) ray_release(uval[u]);
+    if (sub) ray_release(sub);
+    if (idxv) ray_release(idxv);
+    if (rows_hdr) scratch_free(rows_hdr);
+    scratch_free(ucol_hdr); scratch_free(uexpr_hdr); scratch_free(uval_hdr);
+    DICT_VIEW_CLOSE(updf);
+    if (err) return err;
+    return ray_sym(inplace_sym);
+}
+
 ray_t* ray_update_fn(ray_t** args, int64_t n) {
     return ray_update(args, n);
 }
@@ -11853,6 +12221,12 @@ ray_t* ray_update(ray_t** args, int64_t n) {
     /* Evaluate WHERE using the DAG to get a boolean mask */
     int64_t nrows = ray_table_nrows(tbl);
     uint8_t* mask = NULL;
+
+    if (where_expr) {
+        bool fast_handled = false;
+        ray_t* fast = update_where_inplace(tbl, inplace_sym, dict, where_expr, &fast_handled);
+        if (fast_handled) { ray_release(tbl); return fast; }
+    }
 
     if (where_expr) {
         /* Try DAG compilation first, fall back to eval-level */
