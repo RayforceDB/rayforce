@@ -1,0 +1,23 @@
+;; timer_overrun.rfl — a periodic timer does not replay missed intervals,
+;; and a failing callback's line carries the message (#474).
+;;
+;; Regression 1: a forever timer was re-pushed with exp += tic and the
+;; firing loop ran while exp <= now, so a callback that overran by T
+;; fired T/tic more times back-to-back before the poll loop served any
+;; I/O.  Regression 2: the error arm printed ray_fmt(err), which is the
+;; code alone (`timer 0: error: io`), dropping the message.
+;;
+;; Timers only fire inside ray_poll_run, so both halves run a server
+;; subprocess for a bounded time (backgrounded and killed by pid, since
+;; macOS has no `timeout`) and read its output.  A 100 ms timer
+;; whose first fire sleeps 1 s: with replay the ten missed fires land
+;; back-to-back (about 23 fires in 2.4 s); without, it resumes its cadence
+;; after the sleep (about 13).  Bounds are wide for slow builds.
+(.sys.exec "printf '%s\n' '(set N 0)' '(.time.timer.set 100 0 (fn [t] (do (set N (+ N 1)) (if (== N 1) (.sys.exec \"sleep 1\") 0) (println \"fire\"))))' > /tmp/rfl_timer_ov.rfl")
+(.sys.exec "./rayforce -p 19979 /tmp/rfl_timer_ov.rfl </dev/null >/tmp/rfl_timer_ov.out 2>/dev/null & p=$!; sleep 2.4; kill $p; wait $p 2>/dev/null; n=$(grep -c ^fire /tmp/rfl_timer_ov.out); [ \"$n\" -ge 4 ] && [ \"$n\" -le 17 ]") -- 0
+
+;; the error line names the cause, not just the code
+(.sys.exec "printf '%s\n' '(.time.timer.set 50 1 (fn [t] (.ipc.open \"127.0.0.1:19974\" 200)))' > /tmp/rfl_timer_err.rfl")
+(.sys.exec "./rayforce -p 19979 /tmp/rfl_timer_err.rfl </dev/null >/tmp/rfl_timer_err.out 2>&1 & p=$!; sleep 1.5; kill $p; wait $p 2>/dev/null; grep -q 'timer 0: error: io: connection refused: 127.0.0.1:19974' /tmp/rfl_timer_err.out") -- 0
+
+(.sys.exec "rm -f /tmp/rfl_timer_ov.rfl /tmp/rfl_timer_err.rfl /tmp/rfl_timer_ov.out /tmp/rfl_timer_err.out; true")
