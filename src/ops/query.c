@@ -11775,29 +11775,31 @@ static ray_t* update_scatter(ray_t** slots, int64_t c, const int64_t* rows, int6
 
     if (val->type != ct) {
         /* Numeric promotion among I64 / I32 / F64, null-aware. */
+        void* p = ray_data(col);
         for (int64_t i = 0; i < k; i++) {
             int64_t r = rows[i];
             if (ray_vec_is_null(val, i)) { ray_vec_set_null(col, r, true); continue; }
             if (ct == RAY_F64) {
-                ((double*)d)[r] = update_cell_f64(val, i);
+                ((double*)p)[r] = update_cell_f64(val, i);
             } else if (val->type == RAY_F64) {
                 double x = ((const double*)ray_data(val))[i];
-                if (ct == RAY_I64) ((int64_t*)d)[r] = ray_cast_f64_to_i64_null(x);
-                else               ((int32_t*)d)[r] = ray_cast_f64_to_i32_null(x);
+                if (ct == RAY_I64) ((int64_t*)p)[r] = ray_cast_f64_to_i64_null(x);
+                else               ((int32_t*)p)[r] = ray_cast_f64_to_i32_null(x);
                 if (ray_vec_is_null(col, r)) col->attrs |= RAY_ATTR_HAS_NULLS;
             } else if (ct == RAY_I64) {
-                ((int64_t*)d)[r] = (int64_t)((const int32_t*)ray_data(val))[i];
+                ((int64_t*)p)[r] = (int64_t)((const int32_t*)ray_data(val))[i];
             } else {
-                ((int32_t*)d)[r] = (int32_t)((const int64_t*)ray_data(val))[i];
+                ((int32_t*)p)[r] = (int32_t)((const int64_t*)ray_data(val))[i];
             }
         }
         return NULL;
     }
 
     if (ct == RAY_SYM) {
+        int64_t* ids = (int64_t*)ray_data(col);
         for (int64_t i = 0; i < k; i++) {
             int64_t id = sym_cell_runtime_id(val, i);
-            ((int64_t*)d)[rows[i]] = id;
+            ids[rows[i]] = id;
             if (id == 0) col->attrs |= RAY_ATTR_HAS_NULLS;
         }
         return NULL;
