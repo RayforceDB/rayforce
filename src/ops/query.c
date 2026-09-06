@@ -11556,26 +11556,42 @@ static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
  * rows into a sub-table, evaluates the update expressions there, and
  * scatters the results into the live columns in place.
  *
- * Expressions carrying an aggregation (or a call whose head is not a
- * plain symbol) keep the legacy arm, where the aggregate ranges over the
- * whole table.  Every result is type-checked before anything is written,
+ * Only elementwise expressions take this path (see
+ * update_expr_elementwise); anything else, and a predicate matching no
+ * row, keeps the legacy arm.  Every result is type-checked before
+ * anything is written,
  * so a mistyped or wrong-length value leaves the table untouched; only
  * an allocation failure inside a STR write can interrupt the scatter. */
 
 static bool    upsert_col_ok(ray_t* col);      /* defined with the upsert path below */
 static int64_t upsert_atom_int(ray_t* a);
 
-static bool update_expr_rowwise(ray_t* e) {
-    if (!e || RAY_IS_ERR(e)) return true;
-    if (e->type == RAY_DICT) return false;
-    if (e->type != RAY_LIST) return true;
-    if (expr_contains_agg(e)) return false;
+/* The sub-table evaluation is only equivalent to the legacy whole-table
+ * evaluation for elementwise expressions.  Accept a call only when its
+ * head resolves to a builtin flagged RAY_FN_ATOMIC and every argument is
+ * a column of `tbl`, a literal, a quoted symbol, or such a call.  A bare
+ * symbol that is not a column (a free variable, possibly a table-length
+ * vector), an order-dependent function (deltas, sums, ...), an
+ * aggregate, a special form, or a lambda call keeps the legacy arm. */
+static bool update_expr_elementwise(ray_t* e, ray_t* tbl) {
+    if (!e || RAY_IS_ERR(e)) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        return ray_table_get_col(tbl, e->i64) != NULL;
+    }
+    if (e->type < 0) return true;
+    if (e->type != RAY_LIST) return false;
     int64_t n = ray_len(e);
-    if (n == 0) return true;
+    if (n < 2) return false;
     ray_t** el = (ray_t**)ray_data(e);
-    if (!el[0] || el[0]->type != -RAY_SYM) return false;
+    ray_t* head = el[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || RAY_IS_ERR(fn)) return false;
+    if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) return false;
+    if (!(fn->attrs & RAY_FN_ATOMIC)) return false;
     for (int64_t i = 1; i < n; i++)
-        if (!update_expr_rowwise(el[i])) return false;
+        if (!update_expr_elementwise(el[i], tbl)) return false;
     return true;
 }
 
@@ -11852,7 +11868,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
             if (kid == from_id || kid == where_id || kid == by_id) continue;
             if (kid != cn) continue;
             ucol[nu] = c; uexpr[nu] = updf[d + 1]; uval[nu] = NULL; nu++;
-            if (!update_expr_rowwise(updf[d + 1])) rowwise = false;
+            if (!update_expr_elementwise(updf[d + 1], tbl)) rowwise = false;
             break;
         }
     }
@@ -11881,12 +11897,23 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
         }
     }
 
+    /* No matched row: the legacy arm still evaluates every expression
+     * over the table and reports its errors; evaluating over an empty
+     * sub-table could raise where it would not, so leave it to them. */
+    if (!err && k == 0) {
+        if (rows_hdr) scratch_free(rows_hdr);
+        scratch_free(ucol_hdr); scratch_free(uexpr_hdr); scratch_free(uval_hdr);
+        DICT_VIEW_CLOSE(updf);
+        *handled = false;
+        return NULL;
+    }
+
     /* Sub-table of the matched rows; expressions evaluate against it. */
     ray_t* idxv = NULL; ray_t* sub = NULL;
     if (!err && nu > 0) {
-        idxv = ray_vec_new(RAY_I64, k > 0 ? k : 1);
+        idxv = ray_vec_new(RAY_I64, k);
         if (RAY_IS_ERR(idxv)) { err = idxv; idxv = NULL; }
-        else if (k > 0) {
+        else {
             ray_t* r2 = ray_vec_append_raw(idxv, rows, k);
             if (RAY_IS_ERR(r2)) { err = r2; } else idxv = r2;
         }
@@ -11901,7 +11928,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
         uval[u] = v;
         err = update_value_check(slots[ucol[u]], v, k);
     }
-    for (int64_t u = 0; u < nu && !err && k > 0; u++)
+    for (int64_t u = 0; u < nu && !err; u++)
         err = update_scatter(slots, ucol[u], rows, k, uval[u]);
 
     for (int64_t u = 0; u < nu; u++) if (uval[u]) ray_release(uval[u]);
@@ -15083,7 +15110,11 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                 ray_t* orig = ray_table_get_col_idx(tbl, c);
                 ray_retain(orig);
                 ray_t* cp = ray_cow(orig);
-                if (!cp || RAY_IS_ERR(cp)) { err = cp ? cp : ray_error("oom", NULL); break; }
+                if (!cp || RAY_IS_ERR(cp)) {
+                    ray_release(orig);      /* ray_cow leaves the input alive on failure */
+                    err = cp ? cp : ray_error("oom", NULL);
+                    break;
+                }
                 work = ray_table_add_col(work, ray_table_col_name(tbl, c), cp);
                 ray_release(cp);
                 if (RAY_IS_ERR(work)) { err = work; work = NULL; }

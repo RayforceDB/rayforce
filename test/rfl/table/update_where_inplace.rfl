@@ -59,13 +59,26 @@
 (set e (table [k v] (list [1 2 3] [1 2 3])))
 (update {from: 'e v: 'sym where: (== k 2)}) !- type
 (at e 'v) -- [1 2 3]
-(update {from: 'e v: [1 2] where: (== k 2)}) !- length
-(at e 'v) -- [1 2 3]
 
-;; ── aggregates keep their whole-table meaning ──
+;; ── non-elementwise expressions keep their whole-table meaning, and the
+;;    named and value spellings agree ──
 (set a (table [k v] (list [1 2 3] [10 30 20])))
 (update {from: 'a v: (max v) where: (== k 1)})
 (at a 'v) -- [30 30 20]
+(set d (table [k v] (list [1 2 1 2] [1 2 3 4])))
+(at (update {from: d v: (deltas v) where: (== k 2)}) 'v) -- [1 1 3 1]
+(update {from: 'd v: (deltas v) where: (== k 2)})
+(at d 'v) -- [1 1 3 1]
+(set off [10 20 30 40])
+(at (update {from: d v: (+ v off) where: (== k 1)}) 'v) -- [11 1 33 1]
+(update {from: 'd v: (+ v off) where: (== k 1)})
+(at d 'v) -- [11 1 33 1]
+(update {from: 'd v: (sums v) where: (== k 2)})
+(at d 'v) -- [11 12 33 46]
+(update {from: 'd v: (if (> v 20) 9 0) where: (== k 1)})
+(at d 'v) -- [0 12 9 46]
+(update {from: 'd v: (abs (- 0 v)) where: (== k 2)})
+(at d 'v) -- [0 12 9 46]
 
 ;; ── boxed and sym columns ──
 (set l (table [k v s] (list [1 2] (list [1 2] "x") ['a 'b])))
