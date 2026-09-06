@@ -781,6 +781,15 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (at (select {r: (if false f 1.0) from: TZ}) 'r) -- [1.0 1.0 1.0]
 (at (select {r: (if true f 1.0) from: TZ}) 'r) -- [1.5 2.5 3.5]
 
+
+;; ── the null symbol needs no width handling ───────────────────────────
+;; SYM has no typed null and no `0Ns` literal (parse.c): the empty symbol `'`
+;; IS the null, in-band, so it survives the branch as a SYM instead of being
+;; widened the way the out-of-band integer and float sentinels had to be.
+(set TN (table [c s] (list [true false true] (as 'SYM ["a" "b" "c"]))))
+(type (at (select {r: (if c s ') from: TN}) 'r)) -- 'SYM
+(format "%s" (at (select {r: (if c s ') from: TN}) 'r)) -- "[a null c]s"
+
 ;; ── a parted column answers as the same data flattened does ────────────
 ;; Its type is carried in a wrapper that no promotion ladder knows, so the
 ;; wrapper is stripped at the scan node: arithmetic through an if kept its

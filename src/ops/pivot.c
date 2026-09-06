@@ -297,8 +297,7 @@ static double if_atom_f64(ray_t* v) {
  * with its attr; an atom says so by BEING the sentinel, and nothing sets the
  * attr for it — so `(if x d 0Nd)` wrote the sentinel and then rendered it as
  * an ordinary date, since the formatter reads the attr, not the value. */
-static bool if_val_has_null(ray_t* v, int8_t out_type) {
-    (void)out_type;
+static bool if_val_has_null(ray_t* v) {
     if (!v) return false;
     if (!ray_is_atom(v)) return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
     /* RAY_ATOM_IS_NULL answers for the atom's OWN type, which is the right
@@ -648,7 +647,7 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
         return result;
     }
     result->len = nrows;
-    if (if_val_has_null(then_v, out_type) || if_val_has_null(else_v, out_type))
+    if (if_val_has_null(then_v) || if_val_has_null(else_v))
         result->attrs |= RAY_ATTR_HAS_NULLS;
     if (out_type == RAY_STR)
         memset(ray_data(result), 0, (size_t)nrows * sizeof(ray_str_t));
@@ -821,7 +820,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     /* Same reason as the selected arm: an atom null is the sentinel value and
      * carries no attr of its own, so without this the sentinel is rendered as
      * an ordinary date or timestamp. */
-    if (if_val_has_null(then_v, out_type) || if_val_has_null(else_v, out_type))
+    if (if_val_has_null(then_v) || if_val_has_null(else_v))
         result->attrs |= RAY_ATTR_HAS_NULLS;
 
     uint8_t* cond_p = (uint8_t*)ray_data(cond_v);
