@@ -634,10 +634,13 @@ static test_result_t test_pool_zero_workers(void) {
     TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 3);
     TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), 8192LL * 3);
 
-    /* Worker 0 (main) must have participated; worker 1 may or may not have
-     * picked up tasks depending on scheduling — at least worker 0 is set. */
-    uint32_t mask = atomic_load(&ctx.saw_worker);
-    TEST_ASSERT_TRUE((mask & 0x1u) != 0);  /* main thread always = worker 0 */
+    /* No per-id participation assert, for the reason workers_participate
+     * gives: which claimant wins is pure scheduling.  With one worker and
+     * three tasks the worker can drain all three before main enters its
+     * claim loop, leaving bit 0 unset — observed on macOS CI.  Completion
+     * is asserted exactly above; some bit is necessarily set once
+     * calls == 3. */
+    TEST_ASSERT_TRUE(atomic_load(&ctx.saw_worker) != 0);
 
     ray_pool_free(&pool);
     ray_heap_destroy();
