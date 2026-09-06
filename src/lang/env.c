@@ -114,6 +114,20 @@ static struct {
 int32_t ray_env_scope_depth(void) { return __VM ? __VM->scope_depth : 0; }
 int32_t ray_env_global_count(void) { return g_env.count; }
 
+/* Reverse-map a builtin function object to the symbol it is bound under in the
+ * global environment.  Builtins inline only the first 13 bytes of their name
+ * (see fn_set_name / ray_fn_name), so serialization — which must round-trip the
+ * full name — cannot read it off the object.  Every builtin, dotted reserved
+ * names included, is also bound flat in g_env (see reg_bind's ray_env_bind_flat
+ * call), so a pointer scan recovers the full name.  Returns the sym_id, or -1
+ * if `fn` is not a registered global builtin. */
+int64_t ray_env_builtin_sym(const ray_t* fn) {
+    if (!fn) return -1;
+    for (int32_t i = 0; i < g_env.count; i++)
+        if (g_env.vals[i] == fn) return g_env.keys[i];
+    return -1;
+}
+
 /* Query scopes are synthetic and must not eclipse a caller's lexical
  * parameter/let binding.  Other query frames are deliberately ignored so
  * an inner query can bind a same-named column over an outer query column.

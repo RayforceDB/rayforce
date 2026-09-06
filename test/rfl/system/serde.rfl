@@ -33,3 +33,14 @@
 ;; columns, dict keys-vs-values) is covered in test/test_store.c
 ;; (store/serde_container_count_mismatch), which builds frames via
 ;; sizeof(ray_ipc_header_t) rather than hard-coding the wire layout.
+
+;; ────────────── builtins serialize by their FULL name ──────────────
+;; Regression: the encoder capped builtin names at 15 bytes, so any longer
+;; name was written truncated and failed to resolve on decode.  Both of these
+;; registered builtins exceed 15 chars and must survive a round-trip.
+(de (ser .db.parted.tables))    -- .db.parted.tables
+(de (ser .sys.querylog.enable)) -- .sys.querylog.enable
+;; Identity, not just "some builtin": the decoded value is the real function,
+;; so calling it still raises its own argument error.  Before the fix the
+;; truncated name failed to resolve during decode (a 'name error) instead.
+((de (ser .db.parted.tables)) 123) !- type
