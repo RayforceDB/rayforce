@@ -3373,14 +3373,19 @@ static ray_t* aggr_med_per_group_buf(ray_t* expr, ray_t* tbl,
  * no intermediate compaction.
  *
  * Specialised on element width (1/2/4/8 bytes + F64) so the inner read
- * folds to a typed pointer dereference.  Has-nulls falls through to
- * ray_count_distinct_per_group_buf serial path (acceptable: null-bearing
- * columns are rare in wide analytical aggregates). */
+ * folds to a typed pointer dereference.
+ *
+ * A null counts as one distinct value, matching the serial path and the
+ * ungrouped builtin — `distinct` keeps at most one null, so `count` over it
+ * sees exactly one.  Nothing special is needed to make that happen: an
+ * integer null is INT_MIN, nonzero and unique once widened, so it hashes as
+ * an ordinary key; canon_f64_key folds every NaN payload to one; and a SYM
+ * null is id 0, which the table cannot hold and which therefore rides the
+ * side flag the literal 0 already uses. */
 typedef struct {
     int8_t          in_type;
     uint8_t         in_attrs;
     const void*     base;
-    bool            has_nulls;
     uint8_t         esz;        /* 1/2/4/8 */
     bool            is_f64;
     const int64_t*  idx_buf;
@@ -3455,52 +3460,28 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
 
         int64_t distinct = 0;
         int saw_zero = 0;
-        bool has_nulls = ctx->has_nulls;
 
         if (ctx->is_f64) {
             const double* d = (const double*)ctx->base;
             for (int64_t i = 0; i < cnt; i++) {
                 int64_t r = idxs[i];
-                double fv = d[r];
-                if (has_nulls && fv != fv) continue;
-                fv = clear_neg_zero(fv);
-                int64_t vbits = 0;
-                memcpy(&vbits, &fv, sizeof(int64_t));
-                CDPG_BUF_INSERT(vbits);
+                CDPG_BUF_INSERT(canon_f64_key(d[r]));
             }
         } else if (ctx->esz == 8) {
+            /* The null sentinels are INT_MIN: nonzero, and unique once widened
+             * to int64_t, so they hash as an ordinary key and a null counts
+             * exactly once with no special case. */
             const int64_t* d = (const int64_t*)ctx->base;
-            if (has_nulls) {
-                for (int64_t i = 0; i < cnt; i++) {
-                    int64_t v = d[idxs[i]];
-                    if (v == NULL_I64) continue;
-                    CDPG_BUF_INSERT(v);
-                }
-            } else {
-                for (int64_t i = 0; i < cnt; i++) {
-                    CDPG_BUF_INSERT(d[idxs[i]]);
-                }
-            }
+            for (int64_t i = 0; i < cnt; i++)
+                CDPG_BUF_INSERT(d[idxs[i]]);
         } else if (ctx->esz == 4) {
             const int32_t* d = (const int32_t*)ctx->base;
-            if (has_nulls) {
-                for (int64_t i = 0; i < cnt; i++) {
-                    int32_t v = d[idxs[i]];
-                    if (v == NULL_I32) continue;
-                    CDPG_BUF_INSERT((int64_t)v);
-                }
-            } else {
-                for (int64_t i = 0; i < cnt; i++) {
-                    CDPG_BUF_INSERT((int64_t)d[idxs[i]]);
-                }
-            }
+            for (int64_t i = 0; i < cnt; i++)
+                CDPG_BUF_INSERT((int64_t)d[idxs[i]]);
         } else if (ctx->esz == 2) {
             const int16_t* d = (const int16_t*)ctx->base;
-            for (int64_t i = 0; i < cnt; i++) {
-                int16_t v = d[idxs[i]];
-                if (has_nulls && v == NULL_I16) continue;
-                CDPG_BUF_INSERT((int64_t)v);
-            }
+            for (int64_t i = 0; i < cnt; i++)
+                CDPG_BUF_INSERT((int64_t)d[idxs[i]]);
         } else { /* esz == 1 — BOOL/U8 are non-nullable */
             const uint8_t* d = (const uint8_t*)ctx->base;
             for (int64_t i = 0; i < cnt; i++) {
@@ -4030,7 +4011,6 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                 .in_type   = st,
                 .in_attrs  = src->attrs,
                 .base      = ray_data(src),
-                .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
                 .esz       = ray_sym_elem_size(st, src->attrs),
                 .is_f64    = (st == RAY_F64),
                 .idx_buf   = idx_buf,
