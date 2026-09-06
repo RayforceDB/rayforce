@@ -273,13 +273,24 @@ static int64_t if_value_index(ray_t* v, int64_t* ids, int64_t j,
     return -1;
 }
 
+/* A double with no integer image — a NaN (the F64 null) or a magnitude past
+ * the int64 range — must not be cast.  The cast is undefined, and where it
+ * does not trap the result differs per target, so a null would narrow into a
+ * different arbitrary number on each platform.  The integer null is the one
+ * in-band value that means "no representable answer", so use it for both. */
+static inline int64_t if_f64_to_i64(double x) {
+    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0))
+        return NULL_I64;
+    return (int64_t)x;
+}
+
 static int64_t if_atom_i64(ray_t* v) {
     switch (-v->type) {
     case RAY_I64: case RAY_TIMESTAMP: return v->i64;
     case RAY_I32: case RAY_DATE: case RAY_TIME: return v->i32;
     case RAY_I16: return v->i16;
     case RAY_BOOL: case RAY_U8: return v->b8;
-    case RAY_F64: case RAY_F32: return (int64_t)v->f64;
+    case RAY_F64: case RAY_F32: return if_f64_to_i64(v->f64);
     default: return 0;
     }
 }
@@ -308,8 +319,8 @@ static bool if_val_has_null(ray_t* v) {
 }
 
 static int64_t if_vec_i64(ray_t* v, int64_t idx) {
-    if (v->type == RAY_F64) return (int64_t)((double*)ray_data(v))[idx];
-    if (v->type == RAY_F32) return (int64_t)((float*)ray_data(v))[idx];
+    if (v->type == RAY_F64) return if_f64_to_i64(((double*)ray_data(v))[idx]);
+    if (v->type == RAY_F32) return if_f64_to_i64((double)((float*)ray_data(v))[idx]);
     return read_col_i64(ray_data(v), idx, v->type, v->attrs);
 }
 
