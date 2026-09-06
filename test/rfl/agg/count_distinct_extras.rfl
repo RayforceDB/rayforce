@@ -96,15 +96,16 @@
 ;;     51000 groups in unspecified order, so pin g==0 with where:.
 (at (at (select {n: (count (distinct v)) from: Tcd-f64 by: g where: (== g 0)}) 'n) 0) -- 1
 
-;; ────────── has_nulls fallback (group.c L1204-1227) ──────────
+;; ────────── null-bearing columns through ray_count_distinct_per_group ──
 ;; Build a null-bearing I64 column: cast a small null-bearing prefix
 ;; and concat with a plain-I64 tail.  `[1 0Nl 2 0Nl 3]` is an I64 vec
 ;; with HAS_NULLS attr (see distinct.rfl L22); concat preserves the
 ;; null bitmap into the merged vector (see distinct.rfl L37-40).
 (set Vnull (concat [0Nl 1 0Nl 2 0Nl] (% (til (- Nser 5)) 7)))
 (set Tcd-null (table [g v] (list Ggrp Vnull)))
-;; 11) has_nulls arm with I64 data — exercises the read_col_i64 fallback
-;;     at L1223 inside the has_nulls block (esz==8, in_type==RAY_I64).
+;; 11) an I64 column carrying nulls, through the typed esz==8 loop.  There
+;;     used to be a separate has-nulls arm here going through read_col_i64
+;;     per row; it computed the same keys, so it is gone.
 ;;     A null is one distinct value, the same rule the scalar
 ;;     `(count (distinct [1 0N ...]))` follows (null/distinct.rfl).  The
 ;;     per-group kernels used to skip nulls instead, and this block pinned

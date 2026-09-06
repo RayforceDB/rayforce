@@ -1554,7 +1554,6 @@ typedef struct {
     const int64_t*  row_gid;
     int64_t         n_rows;
     int64_t         n_groups;
-    bool            has_nulls;
     uint64_t        p_mask;          /* P - 1, P = number of partitions */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
      * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
@@ -1577,21 +1576,10 @@ typedef struct {
     int64_t*        odata;           /* n_groups, atomic per-group distinct count */
 } cdpg_ctx_t;
 
-/* Type-correct null check for the column row r.  Mirrors sentinel_is_null
- * but specialised for cdpg's pre-resolved (base, in_type, esz) ctx so the
- * hot loop avoids the ray_t pointer indirection. */
-
 /* Read column row r as int64.  Width-typed fast path; F64 bitcasts. */
 static inline int64_t cdpg_read(const void* base, int64_t r,
                                 int8_t in_type, uint8_t esz) {
-    if (in_type == RAY_F64) {
-        double fv = ((const double*)base)[r];
-        if (fv != fv) fv = (double)NAN;
-        else fv = clear_neg_zero(fv);
-        int64_t v;
-        memcpy(&v, &fv, sizeof(int64_t));
-        return v;
-    }
+    if (in_type == RAY_F64) return canon_f64_key(((const double*)base)[r]);
     switch (esz) {
     case 1:  return (int64_t)((const uint8_t*)base)[r];
     case 2:  return (int64_t)((const int16_t*)base)[r];
@@ -1604,7 +1592,6 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
                          int64_t start, int64_t end) {
     (void)worker_id;
     cdpg_ctx_t* x = (cdpg_ctx_t*)ctx_;
-    uint8_t esz = ray_sym_elem_size(x->in_type, x->in_attrs);
     uint64_t p_mask = x->p_mask;
     /* Per-task private hist slot — task_id is derived from `start` so
      * scat_fn computes the SAME task_id and reads cursor[task_id*P+p]
@@ -1619,7 +1606,6 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
         uint64_t h = CDPG_PART_HASH(gid + 1);
         my_hist[h & p_mask]++;
     }
-    (void)esz;
 }
 
 static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
@@ -1729,7 +1715,6 @@ static ray_t* count_distinct_per_group_parallel(
         .row_gid = row_gid,
         .n_rows = n_rows,
         .n_groups = n_groups,
-        .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
         .p_mask = p_mask,
         .odata = (int64_t*)ray_data(out),
     };
@@ -1982,7 +1967,6 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     }
 
     void* base = ray_data(src);
-    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
 
     /* Per-type read width — hoist the type dispatch out of the hot loop.
      * read_col_i64 was branching on `in_type` every iteration plus paying
@@ -2014,20 +1998,19 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
 
     /* Specialised per-type loops.  Each version reads the column with a
      * width-typed pointer dereference instead of dispatching through
-     * read_col_i64 every row.  The has_nulls / no-nulls split keeps the
-     * fast path branch-free for the common no-null SYM/I64 columns. */
-    if (!has_nulls) {
+     * read_col_i64 every row.  They run whether or not the column has
+     * nulls: a null is one distinct value like any other, and every null
+     * reads back as a single key — the sentinels are ordinary nonzero
+     * integers, a SYM null is id 0, and canon_f64_key folds every NaN to
+     * one.  The has-nulls fallback that used to sit here computed the same
+     * keys through a slower per-row dispatch. */
+    {
         if (in_type == RAY_F64) {
             const double* d = (const double*)base;
             for (int64_t r = 0; r < n_rows; r++) {
                 int64_t gid = row_gid[r];
                 if (gid < 0 || gid >= n_groups) continue;
-                double fv = d[r];
-                if (fv != fv) fv = (double)NAN;
-                else fv = clear_neg_zero(fv);
-                int64_t v;
-                memcpy(&v, &fv, sizeof(int64_t));
-                CD_INSERT(v);
+                CD_INSERT(canon_f64_key(d[r]));
             }
         } else if (esz == 8) {
             const int64_t* d = (const int64_t*)base;
@@ -2057,28 +2040,6 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                 if (gid < 0 || gid >= n_groups) continue;
                 CD_INSERT((int64_t)d[r]);
             }
-        }
-    } else {
-        /* Has-nulls fallback: keep the per-row null bitmap probe and
-         * the generic read_col_i64 dispatch.  Adding eight specialised
-         * has-nulls loops costs more code than the small gain on
-         * already-rare null-bearing columns. */
-        for (int64_t r = 0; r < n_rows; r++) {
-            int64_t gid = row_gid[r];
-            if (gid < 0 || gid >= n_groups) continue;
-            /* Use a different name from the macro's inner `val` so
-             * clang doesn't see an `int64_t val = (val);` self-init
-             * after macro expansion. */
-            int64_t row_val;
-            if (in_type == RAY_F64) {
-                double fv = ((double*)base)[r];
-                if (fv != fv) fv = (double)NAN;
-                else fv = clear_neg_zero(fv);
-                memcpy(&row_val, &fv, sizeof(int64_t));
-            } else {
-                row_val = read_col_i64(base, r, in_type, src->attrs);
-            }
-            CD_INSERT(row_val);
         }
     }
 

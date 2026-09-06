@@ -36,10 +36,12 @@
 (at (select {d: (count (distinct v)) by: k from: _ds}) 'd) -- [2 1 1 1]
 
 ;; Above 50000 groups the query leaves the kernel above entirely and routes to
-;; ray_count_distinct_per_group in group.c — a third implementation of the same
-;; rule, with its own serial and partitioned loops.  Both sides of the routing
-;; boundary must answer alike, or the count depends on how many groups the data
-;; happens to have.  120002 rows alternating {10, null}: every group holds one
+;; ray_count_distinct_per_group in group.c.  That one has two loops of its own,
+;; and which runs depends on the ROW count, not the group count: below 200000
+;; rows the serial one, at or above it the partitioned one.  Both sides of both
+;; boundaries must answer alike, or the count depends on the shape of the data.
+;;
+;; These two stay under 200000 rows on purpose — they pin the serial loop.  120002 rows alternating {10, null}: every group holds one
 ;; value and one null, so every group counts 2.
 (set _dg (table [k v] (list (% (til 120002) 60001) (at [10 0N] (% (til 120002) 2)))))
 (distinct (at (select {d: (count (distinct v)) by: k from: _dg}) 'd)) -- [2]
@@ -52,3 +54,24 @@
 ;; both sides — it read 0 above the boundary and 1 below it.
 (set _dan (table [k v] (list (% (til 120002) 60001) (take [0N] 120002))))
 (distinct (at (select {d: (count (distinct v)) by: k from: _dan}) 'd)) -- [1]
+
+;; And these cross 200000 rows as well, so the partitioned loop runs: its
+;; histogram and scatter passes skipped nulls too, and a regression there would
+;; otherwise pass the whole suite.  60001 groups keeps it above the group
+;; boundary; 240002 rows puts it above the row one.
+(set _dp (table [g v] (list (% (til 240002) 60001) (at [10 0N] (% (til 240002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dp}) 'd)) -- [2]
+
+;; An entirely null column through the same path: one distinct value per group,
+;; not zero.
+(set _dpn (table [g v] (list (% (til 240002) 60001) (take [0N] 240002))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dpn}) 'd)) -- [1]
+
+;; F64 takes a separate arm of the partitioned kernel — its null is a NaN, and
+;; every NaN payload has to fold to the same key for the count to be one.
+(set _dpf (table [g v] (list (% (til 240002) 60001) (at [10.5 0Nf] (% (til 240002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dpf}) 'd)) -- [2]
+
+;; A SYM null is the empty symbol, which is a legal key rather than a sentinel.
+(set _dps (table [g v] (list (% (til 240002) 60001) (at (as 'SYM ["a" ""]) (% (til 240002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dps}) 'd)) -- [2]
