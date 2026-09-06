@@ -1,0 +1,156 @@
+;; upsert_inplace.rfl — upsert into a named table writes matched rows in
+;; place and appends new keys, in one pass per call (#475).
+;;
+;; Regression: ray_upsert found the target row with a linear key scan and
+;; rebuilt the whole table to write one cell — per payload row, so a
+;; 1000-row batch was 1000 scans and 1000 rebuilds.  The rewrite keeps
+;; every observable result below; these lines pin the semantics the fast
+;; path must preserve (update-vs-append, last-wins inside a batch, partial
+;; payloads, nulls, boxed cells, str/sym/f64/i32 keys, value-semantic
+;; targets, indexed keys, and error atomicity).
+
+;; ── single-row: update in place, append on miss, returns the symbol ──
+(set b (table [px sz] (list [10 20 30] [1 2 3])))
+(upsert 'b 'px (list 20 99)) -- 'b
+(at b 'sz) -- [1 99 3]
+(upsert 'b 'px (list 40 4)) -- 'b
+(at b 'px) -- [10 20 30 40]
+(at b 'sz) -- [1 99 3 4]
+;; a shared owner sees the pre-upsert value (copy-on-write, not aliasing)
+(set alias b)
+(upsert 'b 'px (list 10 111))
+(at b 'sz) -- [111 99 3 4]
+(at alias 'sz) -- [1 99 3 4]
+
+;; ── batch (vector row): one pass, existing keys update, new keys append,
+;;    a key repeated inside the batch resolves to its LAST value ──
+(set b (table [px sz] (list [10 20 30] [1 2 3])))
+(upsert 'b 'px (list [20 40 20 50 40] [200 400 201 500 401])) -- 'b
+(at b 'px) -- [10 20 30 40 50]
+(at b 'sz) -- [1 201 3 401 500]
+(count b) -- 5
+
+;; ── batch (table payload): partial columns keep the old values ──
+(set b (table [px sz side] (list [10 20 30] [1 2 3] ['bid 'ask 'bid])))
+(upsert 'b 'px (table [px sz] (list [30 40] [33 44]))) -- 'b
+(at b 'sz) -- [1 2 33 44]
+(at b 'side) -- [bid ask bid ']
+(upsert 'b 'px (table [side px] (list ['ask 'ask] [10 50]))) -- 'b
+(at b 'side) -- [ask ask bid ' ask]
+(at b 'sz) -- [1 2 33 44 0Nl]
+
+;; ── composite key (first N columns) ──
+(set k (table [sym side px sz] (list ['a 'a 'b] ['bid 'ask 'bid] [1.0 2.0 1.0] [10 20 30])))
+(upsert 'k 3 (list ['a 'b 'b] ['ask 'bid 'ask] [2.0 1.0 5.0] [21 31 51])) -- 'k
+(at k 'sz) -- [10 21 31 51]
+(at k 'sym) -- [a a b b]
+(upsert 'k 3 (list 'a 'bid 1.0 11))
+(at k 'sz) -- [11 21 31 51]
+
+;; ── key column types: str, sym, f64, i32, date, timestamp, bool ──
+(set ts (table [k v] (list (list "x" "y") [1 2])))
+(upsert 'ts 'k (list "y" 22))
+(upsert 'ts 'k (list "z" 33))
+(at ts 'v) -- [1 22 33]
+(at ts 'k) -- (list "x""y""z")
+(upsert 'ts 'k (list (list "z" "w" "x") [333 44 111]))
+(at ts 'v) -- [111 22 333 44]
+(upsert 'ts 'k (list 5 1)) !- type
+(set tsym (table [k v] (list ['a 'b] [1 2])))
+(upsert 'tsym 'k (list 'b 22))
+(upsert 'tsym 'k (list ['c 'a] [33 11]))
+(at tsym 'v) -- [11 22 33]
+(upsert 'tsym 'k (list 5 1)) !- type
+(set tf (table [k v] (list [1.5 2.5] [1 2])))
+(upsert 'tf 'k (list 2.5 22))
+(upsert 'tf 'k (list 3 33))
+(at tf 'k) -- [1.5 2.5 3.0]
+(at tf 'v) -- [1 22 33]
+(set ti (table [k v] (list [1i 2i] [1 2])))
+(upsert 'ti 'k (list 2i 22))
+(upsert 'ti 'k (list [3i 1i] [33 11]))
+(at ti 'k) -- [1i 2i 3i]
+(at ti 'v) -- [11 22 33]
+(set td (table [d v] (list [2024.01.01 2024.01.02] [1 2])))
+(upsert 'td 'd (list 2024.01.02 22))
+(upsert 'td 'd (list 2024.01.03 33))
+(at td 'v) -- [1 22 33]
+(set tt (table [t v] (list [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000002] [1 2])))
+(upsert 'tt 't (list 2000.01.01D00:00:00.000000002 22))
+(at tt 'v) -- [1 22]
+(set tb (table [k v] (list [true false] [1 2])))
+(upsert 'tb 'k (list false 22))
+(at tb 'v) -- [1 22]
+
+;; ── nulls: payload nulls land, untouched nulls survive, key nulls match ──
+(set tn (table [k p q] (list [1 2 3] [1.5 0Nf 4.1] [10 0Nl 40])))
+(upsert 'tn 'k (list 3 0Nf 0Nl))
+(nil? (at (at tn 'p) 2)) -- true
+(nil? (at (at tn 'q) 2)) -- true
+(nil? (at (at tn 'q) 1)) -- true
+(sum (at tn 'q)) -- 10
+(upsert 'tn 'k (list [1 4] [11.0 44.0] [11 44]))
+(sum (at tn 'q)) -- 55
+(sum (at tn 'p)) -- 55.0
+(set tnk (table [k v] (list [1 0Nl 3] [1 2 3])))
+(upsert 'tnk 'k (list 0Nl 22))
+(at tnk 'v) -- [1 22 3]
+(count tnk) -- 3
+
+;; ── boxed (LIST) column: cell replaced in place, appended on miss ──
+(set tl (table [k v] (list [1 2] (list [1 2] "s"))))
+(upsert 'tl 'k (list 2 [7 8 9]))
+(at (at tl 'v) 1) -- [7 8 9]
+(upsert 'tl 'k (list 3 "t"))
+(at (at tl 'v) 2) -- "t"
+(count tl) -- 3
+(upsert 'tl 'k (list [1 4] (list "a" [0])))
+(at (at tl 'v) 0) -- "a"
+(at (at tl 'v) 3) -- [0]
+(count tl) -- 4
+
+;; ── value-semantic target: returns a fresh table, binding untouched ──
+(set v (table [px sz] (list [10 20 30] [1 2 3])))
+(upsert v 'px (list 20 99)) -- (table [px sz] (list [10 20 30] [1 99 3]))
+(upsert v 'px (list [20 40] [99 4])) -- (table [px sz] (list [10 20 30 40] [1 99 3 4]))
+(upsert v 'px (table [px sz] (list [20 40] [99 4]))) -- (table [px sz] (list [10 20 30 40] [1 99 3 4]))
+(at v 'sz) -- [1 2 3]
+(count v) -- 3
+
+;; ── hash-indexed key column: lookups stay correct, index never stale ──
+(set hb (table [px sz] (list (til 1000) (til 1000))))
+(set hb (update {from: hb px: (.idx.hash px)}))
+(upsert 'hb 'px (list 500 -1))
+(at (at hb 'sz) 500) -- -1
+(count hb) -- 1000
+(upsert 'hb 'px (list [1000 7] [1000 -7]))
+(count hb) -- 1001
+(at (at hb 'sz) 7) -- -7
+(select {from: hb where: (== px 1000)}) -- (table [px sz] (list [1000] [1000]))
+(select {from: hb where: (== px 7)}) -- (table [px sz] (list [7] [-7]))
+;; index on a NON-key column that gets overwritten must not answer stale
+(set hv (table [px sz] (list [1 2 3] [10 20 30])))
+(set hv (update {from: hv sz: (.idx.hash sz)}))
+(upsert 'hv 'px (list 2 99))
+(select {from: hv where: (== sz 20)}) -- (table [px sz] (list (as 'I64 []) (as 'I64 [])))
+(select {from: hv where: (== sz 99)}) -- (table [px sz] (list [2] [99]))
+
+;; ── errors: a bad cell anywhere in the batch leaves the table untouched ──
+(set e (table [px sz] (list [10 20 30] [1 2 3])))
+(upsert 'e 'px (list [20 40 50] (list 200 400 'oops))) !- type
+(at e 'sz) -- [1 2 3]
+(count e) -- 3
+(upsert 'e 'px (list [20 40] [200])) !- length
+(at e 'sz) -- [1 2 3]
+(upsert 'e 'nope (list 1 2)) !- domain
+(upsert 'e 'px (list 1 2 3)) !- domain
+
+;; ── larger batch: correctness at a size where the scan matters ──
+(set big (table [px sz] (list (til 5000) (til 5000))))
+(set batch (table [px sz] (list (+ 2500 (til 5000)) (- 0 (+ 2500 (til 5000))))))
+(upsert 'big 'px batch)
+(count big) -- 7500
+(at (at big 'sz) 2499) -- 2499
+(at (at big 'sz) 2500) -- -2500
+(at (at big 'sz) 7499) -- -7499
+(sum (at big 'px)) -- 28121250
