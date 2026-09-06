@@ -504,14 +504,15 @@ RAY_INLINE int32_t civil_to_days(int y, int m, int d) {
     return (int32_t)(era * 146097 + doe - 719468 - 10957);
 }
 
-/* Strict YYYY-MM-DD: exactly 10 chars, '-' separators at offsets 4/7, and
- * digits in every field.  Mirrors detect_type() and csv_write_date() so that
- * typed .csv.read [DATE] round-trips the writer's output while rejecting
- * malformed separators or trailing garbage (e.g. "2024/01/02", "2024x01x02",
- * "2024-01-02junk") as null instead of silently coercing them to a bogus
- * date.  fast_timestamp() reuses this on the leading date (passing len 10). */
+/* Strict date parser: exactly 10 chars, either YYYY-MM-DD (CSV writer output)
+ * or YYYY.MM.DD (Rayfall display form), with matching separators at offsets
+ * 4/7 and digits in every field.  Reject malformed separators or trailing
+ * garbage (e.g. "2024/01/02", "2024x01x02", "2024-01-02junk") as null instead
+ * of silently coercing them to a bogus date.  fast_timestamp() reuses this on
+ * the leading date (passing len 10). */
 RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
-    if (RAY_UNLIKELY(len != 10 || p[4] != '-' || p[7] != '-')) { *is_null = true; return 0; }
+    bool sep_ok = len == 10 && (p[4] == '-' || p[4] == '.') && p[7] == p[4];
+    if (RAY_UNLIKELY(!sep_ok)) { *is_null = true; return 0; }
     if (RAY_UNLIKELY((unsigned)(p[0]-'0') > 9u || (unsigned)(p[1]-'0') > 9u ||
                      (unsigned)(p[2]-'0') > 9u || (unsigned)(p[3]-'0') > 9u ||
                      (unsigned)(p[5]-'0') > 9u || (unsigned)(p[6]-'0') > 9u ||
@@ -662,10 +663,15 @@ RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns, size
 }
 
 RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
-    /* Require "YYYY-MM-DD" + 'T'|'t'|' ' separator + "HH:MM:SS" (>=19 chars),
-     * matching detect_type() and csv_write_timestamp().  A malformed date/time
-     * separator (e.g. "2024x01x02D01:02:03") is rejected as null. */
-    if (RAY_UNLIKELY(len < 19 || (p[10] != 'T' && p[10] != 't' && p[10] != ' '))) { *is_null = true; return 0; }
+    /* Require a strict date + separator + "HH:MM:SS" (>=19 chars).  Accept the
+     * CSV writer's ISO-ish separators ('T'|'t'|' ') and Rayfall display's
+     * dotted-date + 'D' form.  Malformed date/time separators (e.g.
+     * "2024x01x02D01:02:03" or "2024-01-02D01:02:03") reject as null. */
+    if (RAY_UNLIKELY(len < 19)) { *is_null = true; return 0; }
+    bool rayfall_sep = (p[10] == 'D');
+    bool dt_sep_ok = p[10] == 'T' || p[10] == 't' || p[10] == ' ' ||
+                     (rayfall_sep && p[4] == '.');
+    if (RAY_UNLIKELY(!dt_sep_ok)) { *is_null = true; return 0; }
     *is_null = false;
     int32_t days = fast_date(p, 10, is_null);
     if (*is_null) return 0;
