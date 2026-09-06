@@ -284,7 +284,11 @@ static int64_t if_atom_i64(ray_t* v) {
     }
 }
 
+/* A null atom stays null across the widths.  Converting the value instead —
+ * an I64 sentinel read as a double — produces an ordinary huge number, so
+ * `(if c f 0N)` over an F64 column wrote -9.22e18 where a null belongs. */
 static double if_atom_f64(ray_t* v) {
+    if (RAY_ATOM_IS_NULL(v)) return (double)NAN;
     return (v->type == -RAY_F64 || v->type == -RAY_F32)
          ? v->f64 : (double)if_atom_i64(v);
 }
@@ -294,16 +298,14 @@ static double if_atom_f64(ray_t* v) {
  * attr for it — so `(if x d 0Nd)` wrote the sentinel and then rendered it as
  * an ordinary date, since the formatter reads the attr, not the value. */
 static bool if_val_has_null(ray_t* v, int8_t out_type) {
+    (void)out_type;
     if (!v) return false;
     if (!ray_is_atom(v)) return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
-    switch (out_type) {
-        case RAY_F64: { double d = if_atom_f64(v); return d != d; }
-        case RAY_I64: case RAY_TIMESTAMP: return if_atom_i64(v) == NULL_I64;
-        case RAY_I32: case RAY_DATE: case RAY_TIME:
-            return if_atom_i64(v) == NULL_I32;
-        case RAY_I16: return if_atom_i64(v) == NULL_I16;
-        default: return false;
-    }
+    /* RAY_ATOM_IS_NULL answers for the atom's OWN type, which is the right
+     * question: keying off out_type missed a null whose sentinel is a
+     * different width from the promoted result, so `(if c f 0N)` over an F64
+     * column wrote the I64 sentinel as a number with no null marked. */
+    return RAY_ATOM_IS_NULL(v);
 }
 
 static int64_t if_vec_i64(ray_t* v, int64_t idx) {
@@ -353,14 +355,70 @@ static int8_t if_value_type(ray_t* v) {
  * and the two had drifted: it folded two matching temporal types down to their
  * integer storage, so the same expression answered TIMESTAMP or I64 depending
  * on which arm of exec_if ran. */
+/* How wide a value of this type is as a hash/store key, for the widen-only
+ * merge below.  Only the numeric ladder is ordered; anything else answers 0
+ * and is never used to widen. */
+static int if_type_rank(int8_t t) {
+    switch (t) {
+        case RAY_BOOL: return 1;
+        case RAY_U8:   return 2;
+        case RAY_I16:  return 3;
+        case RAY_I32:  return 4;
+        case RAY_I64:  return 5;
+        case RAY_F64:  return 6;
+        default:       return 0;
+    }
+}
+
+/* The graph promoted the branch types into op->out_type, but it promoted the
+ * declared types of the branch EXPRESSIONS, and arithmetic widens beyond
+ * them: (* a a) over an I32 column is computed and stored as I64, and calling
+ * the result I32 truncates every value.  So the declared type is a floor, not
+ * an answer — whichever of it and the materialised values is wider wins.
+ *
+ * Narrowing is only ever right for a branch that supplied no rows, where the
+ * type it would have contributed never materialised; even then it is limited
+ * to nodes the eager arm could not have taken, since that arm fills from
+ * op->out_type and never narrows, and the two answering differently by worker
+ * count is the defect this is all about. */
 static int8_t if_selected_type(ray_t* then_v, ray_t* else_v, int8_t declared,
                                bool eager_possible) {
-    if (eager_possible) return declared;
-    if (then_v && else_v) return declared;
-    ray_t* live = then_v ? then_v : else_v;
-    if (!live) return declared;
-    int8_t lt = if_value_type(live);
-    return lt ? lt : declared;
+    int8_t tt = if_value_type(then_v);
+    int8_t et = if_value_type(else_v);
+
+    /* Narrowing is for a branch that supplied no rows, and only where the
+     * declared type came FROM that branch — otherwise it is not narrowing but
+     * disagreeing with the eager arm.  Two shapes qualify:
+     *
+     *   a float branch that never ran, leaving integers that keep their own
+     *   width — this is what makes (if (> v 0) v (sqrt s)) sum to 15 and not
+     *   15.0;
+     *
+     *   a string branch that never ran, leaving a number that would otherwise
+     *   be written into a string column and read back as empty.
+     *
+     * Two temporal branches do not qualify: their I64 comes from the pair, not
+     * from either one, so narrowing to the survivor made a nested-if branch
+     * answer DATE where the same expression with a bare column answered I64. */
+    if (!eager_possible && (!then_v || !else_v)) {
+        int8_t live = then_v ? tt : et;
+        int lr = if_type_rank(live);
+        bool float_branch_absent = declared == RAY_F64 &&
+                                   lr && lr < if_type_rank(RAY_F64);
+        bool string_branch_absent = (declared == RAY_STR || declared == RAY_SYM) &&
+                                    lr > 0;
+        if (float_branch_absent || string_branch_absent) return live;
+    }
+
+    int dr = if_type_rank(declared);
+    if (dr) {
+        int8_t widest = declared;
+        int wr = dr;
+        if (if_type_rank(tt) > wr) { widest = tt; wr = if_type_rank(tt); }
+        if (if_type_rank(et) > wr) { widest = et; }
+        return widest;
+    }
+    return declared;
 }
 
 static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
@@ -490,8 +548,7 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
     if (out == RAY_SYM)
         return b == RAY_SYM || bt == -RAY_STR;
     switch (b) {
-        
-/* No RAY_F32: if_fill_range has no F32 fill case, so an F32 branch
+        /* No RAY_F32: if_fill_range has no F32 fill case, so an F32 branch
          * must stay on the selected path (unreachable today — kept off the
          * whitelist so a future if_lazy_supported_type change cannot route
          * it to an unwritten result buffer). */
@@ -726,6 +783,26 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     if (!else_v || RAY_IS_ERR(else_v)) {
         ray_release(cond_v); ray_release(then_v);
         return else_v;
+    }
+
+    /* A scalar condition has one cell, and the fills below index it per row —
+     * reading past it, so `(if false f 1.0)` returned a mixture of both
+     * branches.  Expand it once so every consumer sees a full-length mask;
+     * the selected arm declines a scalar condition outright, which is why
+     * this only ever mattered here. */
+    if (ray_is_atom(cond_v)) {
+        int64_t n = ray_is_atom(then_v) ? (ray_is_atom(else_v) ? 1 : else_v->len)
+                                        : then_v->len;
+        uint8_t on = cond_v->b8 ? 1 : 0;
+        ray_t* mask = ray_vec_new(RAY_BOOL, n);
+        if (!mask || RAY_IS_ERR(mask)) {
+            ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+            return mask ? mask : ray_error("oom", NULL);
+        }
+        memset(ray_data(mask), on, (size_t)n);
+        mask->len = n;
+        ray_release(cond_v);
+        cond_v = mask;
     }
 
     int64_t len = cond_v->len;

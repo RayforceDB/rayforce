@@ -204,6 +204,18 @@ void ray_graph_free(ray_graph_t* g) {
  * Source ops
  * -------------------------------------------------------------------------- */
 
+/* A column of a parted table carries its type in a wrapper.  Nothing that
+ * reads a node's out_type knows about wrappers — the promotion ladders match
+ * none of their cases and fall out the bottom as RAY_BOOL, and the SYM
+ * override in ray_if compares against a bare RAY_SYM — so the node reports
+ * the base type and the wrapper stays where it belongs, on the column.  The
+ * executor decides how to read a parted column from the column itself, never
+ * from the node. */
+static int8_t scan_out_type(int8_t col_type) {
+    return RAY_IS_PARTED(col_type) ? (int8_t)RAY_PARTED_BASETYPE(col_type)
+                                   : col_type;
+}
+
 ray_op_t* ray_scan(ray_graph_t* g, const char* col_name) {
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
@@ -219,7 +231,7 @@ ray_op_t* ray_scan(ray_graph_t* g, const char* col_name) {
     if (g->table) {
         ray_t* col = ray_table_get_col(g->table, sym_id);
         if (col) {
-            ext->base.out_type = col->type;
+            ext->base.out_type = scan_out_type(col->type);
             ext->base.est_rows = (uint32_t)col->len;
         }
     }
@@ -426,15 +438,6 @@ static bool type_is_temporal(int8_t t) {
 }
 
 static int8_t promote_if_type(int8_t a, int8_t b) {
-    /* A column of a parted table carries its type in a wrapper, and the
-     * ladder below knows nothing about those — a wrapped type matches none
-     * of its cases and falls through to RAY_BOOL, so `(if c ts ts)` over a
-     * parted table claimed B8 and truncated every value to a byte.  The
-     * result of an if is a materialised vector, never a parted column, so
-     * the base type is what it should carry.  query.c's dag_type_is_temporal
-     * unwraps for the same reason. */
-    if (RAY_IS_PARTED(a)) a = (int8_t)RAY_PARTED_BASETYPE(a);
-    if (RAY_IS_PARTED(b)) b = (int8_t)RAY_PARTED_BASETYPE(b);
     if (a == b && type_is_temporal(a)) return a;
     return promote(a, b);
 }
@@ -1301,7 +1304,7 @@ ray_op_t* ray_scan_table(ray_graph_t* g, uint16_t table_id, const char* col_name
     if (tbl) {
         ray_t* col = ray_table_get_col(tbl, sym_id);
         if (col) {
-            ext->base.out_type = col->type;
+            ext->base.out_type = scan_out_type(col->type);
             ext->base.est_rows = (uint32_t)col->len;
         }
     }
