@@ -1469,7 +1469,9 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     int64_t h = ray_ipc_connect(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
+    if (h == -4) return ray_error("io", "wire version mismatch: %s:%d", host, port);
     if (h == -5) return ray_error("io", "connection timed out: %s:%d", host, port);
+    if (h == -6) return ray_error("io", "connect failed: %s:%d: %s", host, port, strerror(errno));
     if (h < 0) return ray_error("io", "connection refused: %s:%d", host, port);
 
     return make_i64(h);

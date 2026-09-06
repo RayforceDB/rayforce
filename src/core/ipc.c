@@ -1489,7 +1489,8 @@ static int64_t recv_full(ray_sock_t fd, void* buf, size_t len) {
     size_t total = 0;
     while (total < len) {
         int64_t n = ray_sock_recv(fd, (uint8_t*)buf + total, len - total);
-        if (n <= 0) return -1;
+        if (n == 0) { errno = ECONNRESET; return -1; }   /* peer closed: not a timeout */
+        if (n < 0) return -1;
         total += (size_t)n;
     }
     return (int64_t)total;
@@ -1641,6 +1642,27 @@ static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
     return rc < 0 ? -1 : 0;
 }
 
+/* Classify a failed connect or handshake step by errno.  The connect
+ * and the two-byte wire handshake share one budget: ray_sock_connect
+ * installs it as SO_RCVTIMEO / SO_SNDTIMEO once the connect completes,
+ * so a handshake that the peer never answers surfaces as EAGAIN /
+ * EWOULDBLOCK — a server that is alive and listening but inside a long
+ * evaluation.  That must not read as "refused", which is what a dead
+ * port says, instantly.
+ *   -5  no answer within the budget (ETIMEDOUT, EAGAIN, EWOULDBLOCK)
+ *   -1  ECONNREFUSED
+ *   -6  anything else; errno is left holding it for the caller's
+ *       strerror. */
+static int64_t connect_fail_code(int err) {
+    if (err == ETIMEDOUT || err == EAGAIN) return -5;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    if (err == EWOULDBLOCK) return -5;
+#endif
+    if (err == ECONNREFUSED) return -1;
+    errno = err;
+    return -6;
+}
+
 int64_t ray_ipc_connect(const char* host, uint16_t port,
                          const char* user, const char* password,
                          int timeout_ms)
@@ -1655,18 +1677,20 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
      * no explicit timeout, matching the long-standing handshake timeout. */
     int connect_to = timeout_ms > 0 ? timeout_ms : 5000;
     ray_sock_t fd = ray_sock_connect(host, port, connect_to);
-    if (fd == RAY_INVALID_SOCK) return (errno == ETIMEDOUT) ? -5 : -1;
+    if (fd == RAY_INVALID_SOCK) return connect_fail_code(errno);
 
     uint8_t hs[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
     if (ray_sock_send(fd, hs, 2) < 0) {
+        int e = errno;                  /* close() may clobber it */
         ray_sock_close(fd);
-        return -1;
+        return connect_fail_code(e);
     }
 
     uint8_t resp[2];
     if (recv_full(fd, resp, 2) < 0) {
+        int e = errno;
         ray_sock_close(fd);
-        return -1;
+        return connect_fail_code(e);
     }
 
     /* Refuse a peer that speaks a different wire version.  This gives
