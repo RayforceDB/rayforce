@@ -35,12 +35,14 @@
 ;; sizeof(ray_ipc_header_t) rather than hard-coding the wire layout.
 
 ;; ────────────── builtins serialize by their FULL name ──────────────
-;; Regression: the encoder capped builtin names at 15 bytes, so any longer
-;; name was written truncated and failed to resolve on decode.  Both of these
-;; registered builtins exceed 15 chars and must survive a round-trip.
-(de (ser .db.parted.tables))    -- .db.parted.tables
-(de (ser .sys.querylog.enable)) -- .sys.querylog.enable
-;; Identity, not just "some builtin": the decoded value is the real function,
-;; so calling it still raises its own argument error.  Before the fix the
-;; truncated name failed to resolve during decode (a 'name error) instead.
-((de (ser .db.parted.tables)) 123) !- type
+;; Regression: the encoder capped builtin names at 15 bytes, so a longer name
+;; was written truncated and failed to resolve on decode.  Both of these
+;; registered builtins exceed 15 chars.  Prove the round-trip BEHAVIOURALLY —
+;; the decoded value is the real function, so calling it reaches that
+;; function's own argument check; before the fix decode raised a 'name error.
+;; A `-- .db.parted.tables` golden could NOT prove this: the formatter renders
+;; a builtin through ray_fn_name's 13-byte inline copy, so both sides would
+;; read `.db.parted.ta` and match on dev too.  Pointer identity is asserted at
+;; the C level in test_store.c (store/serde_builtin_name_roundtrip).
+((de (ser .db.parted.tables)) 123)    !- type
+((de (ser .sys.querylog.enable)) 1 2) !- domain
