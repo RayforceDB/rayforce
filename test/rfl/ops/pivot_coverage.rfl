@@ -663,3 +663,144 @@ RDatedead -- [2024.01.01 2023.01.02]
 (count RTimedead) -- 2
 (type RTimedead) -- 'TIME
 RTimedead -- [09:30:00.000 11:00:00.000]
+
+;; ── (if …) and the two arms of exec_if ────────────────────────────────
+;; exec_if picks between an eager arm, which fills every row from the node's
+;; static out_type, and a selected arm, which touches only the rows each
+;; branch supplies and reports the type those rows actually have.  The eager
+;; arm is a candidate only for a non-STR output whose branches are both
+;; trivial column reads, and it is taken only when workers exist — so the two
+;; arms have to agree wherever both could apply, or an expression answers
+;; differently depending on the core count.
+;;
+;; NOTE on shape: both branches below are deliberately NON-trivial (a nested
+;; if), which keeps the eager arm out of the picture at any core count.  With
+;; bare column scans the eager arm answers under the default TEST_CORES=2 and
+;; the selected arm is never reached, so such a case passes with or without
+;; the fix — it tests nothing.
+;;
+;; An `if` selects a value, it does not compute one, so two branches of one
+;; temporal type yield that type.  The selected arm used to re-derive it with
+;; a promotion ladder of its own, which folded a temporal down to the integer
+;; it is stored as — right for arithmetic, since the difference of two
+;; timestamps is a span, wrong for a choice between two of them.
+(set TIF (table [x d tm ts] (list [true false true] (as 'DATE [1 2 3]) (as 'TIME [10 20 30]) (as 'TIMESTAMP [100 200 300]))))
+(type (at (select {r: (if x ts (if x ts ts)) from: TIF}) 'r)) -- 'TIMESTAMP
+(type (at (select {r: (if x d (if x d d)) from: TIF}) 'r)) -- 'DATE
+(type (at (select {r: (if x tm (if x tm tm)) from: TIF}) 'r)) -- 'TIME
+;; values are untouched by the type rule
+(as 'I64 (at (select {r: (if x ts (if x ts ts)) from: TIF}) 'r)) -- [100 200 300]
+;; branches of DIFFERENT temporal types have no shared meaning — still widened
+(type (at (select {r: (if x d (if x ts ts)) from: TIF}) 'r)) -- 'I64
+
+;; A branch that supplies no rows must not change the answer either.  With an
+;; all-true condition the else branch is empty, and the selected arm used to
+;; adopt the surviving branch's raw type — so these read TIMESTAMP/DATE
+;; serially and I64/F64 under workers.  Both branches are trivial here, so
+;; the eager arm could handle them: the answer must be its answer.
+(set TAT (table [x ts d] (list [true true true] (as 'TIMESTAMP [100 200 300]) (as 'DATE [1 2 3]))))
+(type (at (select {r: (if x ts 5) from: TAT}) 'r)) -- 'I64
+(type (at (select {r: (if x ts 5.5) from: TAT}) 'r)) -- 'F64
+(type (at (select {r: (if x d ts) from: TAT}) 'r)) -- 'I64
+
+;; ── a null branch value must still read as a null ───────────────────────
+;; An atom null IS the sentinel value and carries no attribute of its own, so
+;; nothing marked the output as null-bearing.  `nil?` still answered true — it
+;; reads the value — but the vector formatter reads the attribute, so the
+;; sentinel came out as an ordinary date.  Rendering is what has to be pinned;
+;; a value comparison passes either way and would test nothing.
+;;
+;; Both arms of exec_if had to learn this: the trivial branches put the eager
+;; arm in charge under workers, the nested-if forms force the selected one.
+(set TN (table [x d ts] (list [true false true] (as 'DATE [1 2 3]) (as 'TIMESTAMP [100 200 300]))))
+(format "%s" (at (select {r: (if x d 0Nd) from: TN}) 'r)) -- "[2000.01.02 0Nd 2000.01.04]s"
+(format "%s" (at (select {r: (if x (if x d d) 0Nd) from: TN}) 'r)) -- "[2000.01.02 0Nd 2000.01.04]s"
+(nil? (at (at (select {r: (if x ts 0Np) from: TN}) 'r) 1)) -- true
+;; the non-null rows are untouched
+(as 'I64 (at (at (select {r: (if x d 0Nd) from: TN}) 'r) 0)) -- 1
+
+;; ── an empty branch, whichever one it is ───────────────────────────────
+;; The narrowing looks at whichever branch survived, so an all-false condition
+;; has to be pinned alongside the all-true one: either side can be the empty
+;; one.
+(set TT (table [x ts] (list [true true true] (as 'TIMESTAMP [100 200 300]))))
+(set TFa (table [x ts] (list [false false false] (as 'TIMESTAMP [100 200 300]))))
+(type (at (select {r: (if x ts 5) from: TT}) 'r)) -- 'I64
+(type (at (select {r: (if x 5 ts) from: TFa}) 'r)) -- 'I64
+(type (at (select {r: (if x ts 5.5) from: TT}) 'r)) -- 'F64
+(type (at (select {r: (if x 5.5 ts) from: TFa}) 'r)) -- 'F64
+
+;; ── a column of a parted table carries a wrapped type ──────────────────
+;; graph.c's promotion ladder knows nothing about the wrapper, so a wrapped
+;; type matched none of its cases and fell through to RAY_BOOL: the result
+;; claimed B8 and every value was truncated to a byte.  It hit any type, not
+;; only temporal ones, and printing the B8 column aborted under UBSan.
+;;
+;; NOTE on shape: the condition must be a literal.  With a computed predicate
+;; the branch types arrive already unwrapped and the case passes on the parent
+;; commit, testing nothing.  Two partitions are needed for the same reason.
+(.sys.exec "rm -rf /tmp/rfl_ifpt")
+(.db.splayed.set "/tmp/rfl_ifpt/2024.01.01/t/" (table [ts v] (list (as 'TIMESTAMP [100 200 300]) [1 2 3])))
+(.db.splayed.set "/tmp/rfl_ifpt/2024.01.02/t/" (table [ts v] (list (as 'TIMESTAMP [45 145 245]) [4 5 6])))
+(set PT (.db.parted.get "/tmp/rfl_ifpt/" 't))
+(type (at (select {r: (if true v v) from: PT}) 'r)) -- 'I64
+(type (at (select {r: (if true ts ts) from: PT}) 'r)) -- 'TIMESTAMP
+(at (select {r: (if true v v) from: PT}) 'r) -- [1 2 3 4 5 6]
+(as 'I64 (at (select {r: (if true ts ts) from: PT}) 'r)) -- [100 200 300 45 145 245]
+(.sys.exec "rm -rf /tmp/rfl_ifpt")
+
+;; ── the declared type is a floor, not the answer ───────────────────────
+;; The graph promotes the declared types of the branch EXPRESSIONS, but
+;; arithmetic widens past them: (* a a) over an I32 column is computed and
+;; stored as I64.  Reporting the declared I32 does not relabel the result, it
+;; truncates every value.  Non-trivial branches keep the eager arm away, so
+;; this is the selected arm's own answer.
+(set TW (table [c a b] (list [true false true] (as 'I32 [100000 100000 100000]) (as 'I16 [30000 30000 30000]))))
+(at (select {r: (if c (* a a) (* a a)) from: TW}) 'r) -- [10000000000 10000000000 10000000000]
+(at (select {r: (if c (+ b b) (+ b b)) from: TW}) 'r) -- [60000 60000 60000]
+
+;; ── narrowing belongs to the branch that supplied nothing ──────────────
+;; Two temporal branches promote to I64 because of the pair, not because of
+;; either one, so an empty branch must not hand the answer to the survivor:
+;; the nested form and the plain form are the same expression.
+(set TD (table [x d ts] (list [true true true] (as 'DATE [1 2 3]) (as 'TIMESTAMP [100 200 300]))))
+(type (at (select {r: (if x (if x d d) ts) from: TD}) 'r)) -- 'I64
+(type (at (select {r: (if x d ts) from: TD}) 'r)) -- 'I64
+
+;; ── a null atom stays null when the width changes ──────────────────────
+;; 0N is the I64 sentinel; converting it into an F64 column as a number gave
+;; -9.22e18.  Both spellings have to land as the F64 null.
+(set TZ (table [c f] (list [true false true] [1.5 2.5 3.5])))
+(format "%s" (at (select {r: (if c f 0N) from: TZ}) 'r)) -- "[1.5 0Nf 3.5]s"
+(format "%s" (at (select {r: (if c f 0Nf) from: TZ}) 'r)) -- "[1.5 0Nf 3.5]s"
+
+;; ── a scalar condition applies to every row ────────────────────────────
+;; It has one cell and the eager fill indexed it per row, reading past it, so
+;; the result mixed both branches.  The selected arm declines a scalar
+;; condition outright, which is why only the eager one was affected.
+(at (select {r: (if false f 1.0) from: TZ}) 'r) -- [1.0 1.0 1.0]
+(at (select {r: (if true f 1.0) from: TZ}) 'r) -- [1.5 2.5 3.5]
+
+
+;; ── the null symbol needs no width handling ───────────────────────────
+;; SYM has no typed null and no `0Ns` literal (parse.c): the empty symbol `'`
+;; IS the null, in-band, so it survives the branch as a SYM instead of being
+;; widened the way the out-of-band integer and float sentinels had to be.
+(set TN (table [c s] (list [true false true] (as 'SYM ["a" "b" "c"]))))
+(type (at (select {r: (if c s ') from: TN}) 'r)) -- 'SYM
+(format "%s" (at (select {r: (if c s ') from: TN}) 'r)) -- "[a null c]s"
+
+;; ── a parted column answers as the same data flattened does ────────────
+;; Its type is carried in a wrapper that no promotion ladder knows, so the
+;; wrapper is stripped at the scan node: arithmetic through an if kept its
+;; width, and the SYM override in ray_if — which compares against a bare
+;; RAY_SYM — fires again instead of leaking dictionary ids.
+(.sys.exec "rm -rf /tmp/rfl_ifpw")
+(.db.splayed.set "/tmp/rfl_ifpw/2024.01.01/t/" (table [ts v sy] (list (as 'TIMESTAMP [100 200 300]) [1 2 3] (as 'SYM ["a" "b" "c"]))))
+(.db.splayed.set "/tmp/rfl_ifpw/2024.01.02/t/" (table [ts v sy] (list (as 'TIMESTAMP [45 145 245]) [4 5 6] (as 'SYM ["d" "e" "f"]))))
+(set PW (.db.parted.get "/tmp/rfl_ifpw/" 't))
+(set FW (table [ts v sy] (list (as 'TIMESTAMP [100 200 300 45 145 245]) [1 2 3 4 5 6] (as 'SYM ["a" "b" "c" "d" "e" "f"]))))
+(at (select {r: (if (> v 2) sy sy) from: PW}) 'r) -- (at (select {r: (if (> v 2) sy sy) from: FW}) 'r)
+(at (select {r: (if (> v 2) (+ v v) (+ v v)) from: PW}) 'r) -- [2 4 6 8 10 12]
+(type (at (select {r: (if (> v 0) v 1.5) from: PW}) 'r)) -- (type (at (select {r: (if (> v 0) v 1.5) from: FW}) 'r))
+(.sys.exec "rm -rf /tmp/rfl_ifpw")
