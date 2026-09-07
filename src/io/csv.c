@@ -666,7 +666,13 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     /* Require a strict date + separator + "HH:MM:SS" (>=19 chars).  Accept the
      * CSV writer's ISO-ish separators ('T'|'t'|' ') and Rayfall display's
      * dotted-date + 'D' form.  Malformed date/time separators (e.g.
-     * "2024x01x02D01:02:03" or "2024-01-02D01:02:03") reject as null. */
+     * "2024x01x02D01:02:03" or "2024-01-02D01:02:03") reject as null.
+     *
+     * Grammar note: 'T'|'t'|' ' are accepted after either date form, so a
+     * dotted date paired with one of them ("2024.01.02T01:02:03") also infers
+     * TIMESTAMP even though no writer emits that mixed shape; only 'D' is tied
+     * to the dotted date.  This is deliberate leniency on input, not a form we
+     * produce. */
     if (RAY_UNLIKELY(len < 19)) { *is_null = true; return 0; }
     bool rayfall_sep = (p[10] == 'D');
     bool dt_sep_ok = p[10] == 'T' || p[10] == 't' || p[10] == ' ' ||
