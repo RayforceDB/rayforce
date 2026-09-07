@@ -2709,6 +2709,54 @@ static test_result_t test_serde_function_types(void) {
     PASS();
 }
 
+/* ---- test_serde_builtin_name_roundtrip ---------------------------------- */
+
+static test_result_t test_serde_builtin_name_roundtrip(void) {
+    /* Regression: builtins serialize by name, but the encoder capped the name
+     * at 15 bytes.  A builtin whose registered name is longer was written
+     * truncated and could not be resolved on decode, so (de (ser fn)) raised a
+     * name error instead of round-tripping.  test_serde_function_types only
+     * exercises short names (neg, +, list), so it never caught this. */
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+
+    static const char* const long_names[] = {
+        ".db.parted.tables",    /* 17 bytes, RAY_VARY */
+        ".sys.querylog.enable", /* 20 bytes           */
+    };
+
+    for (size_t i = 0; i < sizeof(long_names) / sizeof(long_names[0]); i++) {
+        const char* name = long_names[i];
+        TEST_ASSERT(strlen(name) > 15, "test name must exceed the old 15-byte cap");
+
+        /* Borrowed: ray_env_get returns the env-owned object, do not release. */
+        ray_t* orig = ray_env_get(ray_sym_intern(name, strlen(name)));
+        TEST_ASSERT_NOT_NULL(orig);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(orig));
+
+        ray_t* wire = ray_ser(orig);
+        TEST_ASSERT_NOT_NULL(wire);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(wire));
+
+        ray_t* back = ray_de(wire);
+        TEST_ASSERT_NOT_NULL(back);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+
+        /* The decoder resolves the full name in the global env, so it returns
+         * the very same builtin — identity is the strongest proof and implies
+         * the name survived intact.  A truncated name would either miss or
+         * resolve to a different entry. */
+        TEST_ASSERT_EQ_PTR(back, orig);
+        TEST_ASSERT_EQ_I(back->type, orig->type);
+
+        ray_release(back);
+        ray_release(wire);
+    }
+
+    ray_runtime_destroy(rt);
+    PASS();
+}
+
 /* ---- serde coverage: ERROR object roundtrip ------------------------------ */
 
 static test_result_t test_serde_error_roundtrip(void) {
@@ -5509,6 +5557,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_de_error_paths",       test_serde_de_error_paths,       store_setup, store_teardown },
     { "store/serde_list_null_elem",       test_serde_list_with_null_elem,  store_setup, store_teardown },
     { "store/serde_function_types",       test_serde_function_types,       NULL,        NULL           },
+    { "store/serde_builtin_name_roundtrip", test_serde_builtin_name_roundtrip, NULL,     NULL           },
     { "store/serde_error_roundtrip",      test_serde_error_roundtrip,      store_setup, store_teardown },
     { "store/serde_large_null_vec",       test_serde_large_null_vec,       store_setup, store_teardown },
     { "store/serde_f32_atom",             test_serde_f32_atom_and_edge_cases, store_setup, store_teardown },

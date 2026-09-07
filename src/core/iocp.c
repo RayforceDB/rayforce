@@ -51,6 +51,16 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     (void)poll; (void)id;
 }
 
+void ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel)
+{
+    (void)poll; (void)sel;
+}
+
+void ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel)
+{
+    (void)poll; (void)sel;
+}
+
 int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
 {
     (void)poll; (void)timeout_ms;

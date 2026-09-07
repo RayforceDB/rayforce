@@ -38,6 +38,7 @@
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
+#include "core/mcast.h"
 #include "core/poll.h"
 #include "core/timer.h"
 
@@ -1468,7 +1469,9 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     int64_t h = ray_ipc_connect(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
+    if (h == -4) return ray_error("io", "wire version mismatch: %s:%d", host, port);
     if (h == -5) return ray_error("io", "connection timed out: %s:%d", host, port);
+    if (h == -6) return ray_error("io", "connect failed: %s:%d: %s", host, port, strerror(errno));
     if (h < 0) return ray_error("io", "connection refused: %s:%d", host, port);
 
     return make_i64(h);
@@ -1518,4 +1521,28 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg) {
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
     return make_i64(ray_ipc_current_handle());
+}
+
+ray_t* ray_mc_sub_fn(ray_t** args, int64_t n) {
+    if (n != 2)
+        return ray_error("domain", ".mc.sub expects 2 arguments");
+    if (!ray_ipc_context_poll())
+        return ray_error("domain", ".mc.sub requires a poll IPC context");
+    return ray_mcast_sub(ray_ipc_active_poll(), ray_ipc_current_handle(), args[0], args[1]);
+}
+
+ray_t* ray_mc_unsub_fn(ray_t* topic) {
+    if (!ray_ipc_context_poll())
+        return ray_error("domain", ".mc.unsub requires a poll IPC context");
+    return ray_mcast_unsub(ray_ipc_active_poll(), ray_ipc_current_handle(), topic);
+}
+
+ray_t* ray_mc_pub_fn(ray_t* topic, ray_t* payload) {
+    return ray_mcast_pub(ray_ipc_active_poll(), topic, payload);
+}
+
+ray_t* ray_mc_stats_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("domain", ".mc.stats takes no arguments");
+    return ray_mcast_stats(ray_ipc_active_poll());
 }

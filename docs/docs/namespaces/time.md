@@ -44,7 +44,9 @@ Errors:
 - `type` — non-`i64` `ms` / `num`, or `fn` not a lambda.
 - `oom` — heap allocation failed.
 
-The callback's return value is released and discarded — timers are side-effecting procedures. If the callback raises an error, the error is printed to `stderr` (prefixed `timer <id>:`) and the timer continues as if the call had succeeded; one fire is still counted toward `num`.
+The callback's return value is released and discarded — timers are side-effecting procedures. If the callback raises an error, the error is printed to `stderr` as `timer <id>: error: <code>: <message>` (the same line the REPL would print) and the timer continues as if the call had succeeded; one fire is still counted toward `num`.
+
+A callback that overruns its period does not replay the fires it missed. After each fire the timer re-arms at its next scheduled deadline, or one period from now if that deadline has already passed, so a periodic timer fires at most once per `ms` and the poll loop gets back to serving I/O between fires.
 
 ```lisp
 ;; Print "tick" every second, three times

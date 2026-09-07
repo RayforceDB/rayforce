@@ -265,11 +265,18 @@ int main(int argc, char** argv) {
     /* Start IPC server if port specified */
     if (port > 0) {
         const char* bh = bind_host[0] ? bind_host : NULL;
-        if (poll && ray_ipc_listen_at(poll, bh, port) >= 0)
+        if (poll && ray_ipc_listen_at(poll, bh, port) >= 0) {
             fprintf(stderr, "listening on %s:%u\n", bh ? bh : "*", port);
-        else
+        } else {
+            /* The process was asked to serve.  Carrying on would run the
+             * script and exit 0 (or sit on its timers) with no listener,
+             * and a supervisor would learn of it from the first client's
+             * ECONNREFUSED.  Fail like every other server does. */
             fprintf(stderr, "failed to listen on %s:%u: %s\n",
                     bh ? bh : "*", port, strerror(errno));
+            rc = 1;
+            goto done;
+        }
     }
 
     /* Load script if specified */

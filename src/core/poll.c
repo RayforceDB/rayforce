@@ -23,6 +23,7 @@
 
 #include "core/poll.h"
 #include "mem/sys.h"
+#include <errno.h>
 
 /* ===== Shared (platform-independent) poll helpers ===== */
 
@@ -76,4 +77,34 @@ void ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel, int64_t size)
         ray_poll_buf_free(sel->rx.buf);
     }
     sel->rx.buf = ray_poll_buf_new(size);
+}
+
+int ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel)
+{
+    if (!poll || !sel || !sel->tx.send_fn) return -1;
+
+    while (sel->tx.buf) {
+        ray_poll_buf_t* buf = sel->tx.buf;
+        while (buf->offset < buf->size) {
+            int64_t nw = sel->tx.send_fn(
+                sel->fd,
+                buf->data + buf->offset,
+                buf->size - buf->offset);
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    return 0;
+                return -1;
+            }
+            if (nw == 0) return -1;
+            buf->offset += nw;
+        }
+
+        sel->tx.buf = buf->next;
+        buf->next = NULL;
+        ray_poll_buf_free(buf);
+    }
+
+    ray_poll_tx_cancel(poll, sel);
+    return 1;
 }

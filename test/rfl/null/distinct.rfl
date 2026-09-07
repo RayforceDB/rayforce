@@ -6,3 +6,72 @@
 
 ;; Idempotent under nulls
 (count (distinct (distinct [1 0N 2 0N]))) -- (count (distinct [1 0N 2 0N]))
+
+;; The same rule has to survive a grouped count, and specifically the parallel
+;; per-group kernel — a different implementation from the ungrouped builtin
+;; above and from the serial fallback beside it.  It is selected only when the
+;; pool has at least two workers and the query has at least four groups, so the
+;; shapes below are built to reach it: the suite runs with TEST_CORES=2, and
+;; each has four groups.  The kernel used to drop nulls rather than fold them,
+;; which made the answer depend on the core count.
+;;
+;; group 0 -> 10, 0N, 10  = {10, null}       = 2
+;; group 1 -> 0N, 20, 20  = {20, null}       = 2
+;; group 2 -> 20, 0N, 30  = {20, 30, null}   = 3
+;; group 3 -> 30, 30, 0N  = {30, null}       = 2
+(set _dn (table [k v] (list [0 1 2 3 0 1 2 3 0 1 2 3] [10 0N 20 30 0N 20 0N 30 10 20 30 0N])))
+(at (select {d: (count (distinct v)) by: k from: _dn}) 'd) -- [2 2 3 2]
+
+;; A group whose every value is null still holds one distinct value, not zero.
+(set _dz (table [k v] (list [0 1 2 3 0 1 2 3] [0N 1 2 3 0N 1 2 3])))
+(at (select {d: (count (distinct v)) by: k from: _dz}) 'd) -- [1 1 1 1]
+
+;; F64 nulls take a separate arm of the same kernel.
+(set _df (table [k v] (list [0 1 2 3 0 1 2 3] [1.5 0Nf 2.5 3.5 0Nf 0Nf 2.5 0Nf])))
+(at (select {d: (count (distinct v)) by: k from: _df}) 'd) -- [2 1 1 2]
+
+;; A SYM null is the empty symbol.  It was already counted, through the flag the
+;; table keeps for the literal 0 — pinned so the two arms stay in step.
+(set _ds (table [k v] (list [0 1 2 3 0 1 2 3] (as 'SYM ["a" "" "b" "c" "" "" "b" "c"]))))
+(at (select {d: (count (distinct v)) by: k from: _ds}) 'd) -- [2 1 1 1]
+
+;; Above 50000 groups the query leaves the kernel above entirely and routes to
+;; ray_count_distinct_per_group in group.c.  That one has two loops of its own,
+;; and which runs depends on the ROW count, not the group count: below 200000
+;; rows the serial one, at or above it the partitioned one.  Both sides of both
+;; boundaries must answer alike, or the count depends on the shape of the data.
+;;
+;; These two stay under 200000 rows on purpose — they pin the serial loop.  120002 rows alternating {10, null}: every group holds one
+;; value and one null, so every group counts 2.
+(set _dg (table [k v] (list (% (til 120002) 60001) (at [10 0N] (% (til 120002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: k from: _dg}) 'd)) -- [2]
+
+;; The same data below the boundary, through the other kernel.
+(set _dl (table [k v] (list (% (til 120002) 40001) (at [10 0N] (% (til 120002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: k from: _dl}) 'd)) -- [2]
+
+;; A column that is entirely null still holds one distinct value per group on
+;; both sides — it read 0 above the boundary and 1 below it.
+(set _dan (table [k v] (list (% (til 120002) 60001) (take [0N] 120002))))
+(distinct (at (select {d: (count (distinct v)) by: k from: _dan}) 'd)) -- [1]
+
+;; And these cross 200000 rows as well, so the partitioned loop runs: its
+;; histogram and scatter passes skipped nulls too, and a regression there would
+;; otherwise pass the whole suite.  60001 groups keeps it above the group
+;; boundary; 240002 rows puts it above the row one.
+(set _dp (table [g v] (list (% (til 240002) 60001) (at [10 0N] (% (til 240002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dp}) 'd)) -- [2]
+
+;; An entirely null column through the same path: one distinct value per group,
+;; not zero.
+(set _dpn (table [g v] (list (% (til 240002) 60001) (take [0N] 240002))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dpn}) 'd)) -- [1]
+
+;; F64 takes a separate arm of the partitioned kernel — its null is a NaN, and
+;; every NaN payload has to fold to the same key for the count to be one.
+(set _dpf (table [g v] (list (% (til 240002) 60001) (at [10.5 0Nf] (% (til 240002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dpf}) 'd)) -- [2]
+
+;; A SYM null is the empty symbol, which is a legal key rather than a sentinel.
+(set _dps (table [g v] (list (% (til 240002) 60001) (at (as 'SYM ["a" ""]) (% (til 240002) 2)))))
+(distinct (at (select {d: (count (distinct v)) by: g from: _dps}) 'd)) -- [2]

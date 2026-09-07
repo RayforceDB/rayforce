@@ -273,25 +273,54 @@ static int64_t if_value_index(ray_t* v, int64_t* ids, int64_t j,
     return -1;
 }
 
+/* A double with no integer image — a NaN (the F64 null) or a magnitude past
+ * the int64 range — must not be cast.  The cast is undefined, and where it
+ * does not trap the result differs per target, so a null would narrow into a
+ * different arbitrary number on each platform.  The integer null is the one
+ * in-band value that means "no representable answer", so use it for both. */
+static inline int64_t if_f64_to_i64(double x) {
+    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0))
+        return NULL_I64;
+    return (int64_t)x;
+}
+
 static int64_t if_atom_i64(ray_t* v) {
     switch (-v->type) {
     case RAY_I64: case RAY_TIMESTAMP: return v->i64;
     case RAY_I32: case RAY_DATE: case RAY_TIME: return v->i32;
     case RAY_I16: return v->i16;
     case RAY_BOOL: case RAY_U8: return v->b8;
-    case RAY_F64: case RAY_F32: return (int64_t)v->f64;
+    case RAY_F64: case RAY_F32: return if_f64_to_i64(v->f64);
     default: return 0;
     }
 }
 
+/* A null atom stays null across the widths.  Converting the value instead —
+ * an I64 sentinel read as a double — produces an ordinary huge number, so
+ * `(if c f 0N)` over an F64 column wrote -9.22e18 where a null belongs. */
 static double if_atom_f64(ray_t* v) {
+    if (RAY_ATOM_IS_NULL(v)) return (double)NAN;
     return (v->type == -RAY_F64 || v->type == -RAY_F32)
          ? v->f64 : (double)if_atom_i64(v);
 }
 
+/* Does this branch value contribute a null to the output?  A vector says so
+ * with its attr; an atom says so by BEING the sentinel, and nothing sets the
+ * attr for it — so `(if x d 0Nd)` wrote the sentinel and then rendered it as
+ * an ordinary date, since the formatter reads the attr, not the value. */
+static bool if_val_has_null(ray_t* v) {
+    if (!v) return false;
+    if (!ray_is_atom(v)) return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    /* RAY_ATOM_IS_NULL answers for the atom's OWN type, which is the right
+     * question: keying off out_type missed a null whose sentinel is a
+     * different width from the promoted result, so `(if c f 0N)` over an F64
+     * column wrote the I64 sentinel as a number with no null marked. */
+    return RAY_ATOM_IS_NULL(v);
+}
+
 static int64_t if_vec_i64(ray_t* v, int64_t idx) {
-    if (v->type == RAY_F64) return (int64_t)((double*)ray_data(v))[idx];
-    if (v->type == RAY_F32) return (int64_t)((float*)ray_data(v))[idx];
+    if (v->type == RAY_F64) return if_f64_to_i64(((double*)ray_data(v))[idx]);
+    if (v->type == RAY_F32) return if_f64_to_i64((double)((float*)ray_data(v))[idx]);
     return read_col_i64(ray_data(v), idx, v->type, v->attrs);
 }
 
@@ -316,27 +345,90 @@ static int8_t if_value_type(ray_t* v) {
     return (t == RAY_F32) ? RAY_F64 : t;
 }
 
-static int8_t if_promote_type(int8_t a, int8_t b) {
-    if (a == 0) return b;
-    if (b == 0) return a;
-    if (a == RAY_STR || b == RAY_STR) return RAY_STR;
-    if (a == RAY_SYM || b == RAY_SYM) return RAY_SYM;
-    if (a == RAY_F64 || b == RAY_F64 || a == RAY_F32 || b == RAY_F32)
-        return RAY_F64;
-    if (a == RAY_I64 || b == RAY_I64 ||
-        a == RAY_TIMESTAMP || b == RAY_TIMESTAMP)
-        return RAY_I64;
-    if (a == RAY_I32 || b == RAY_I32 ||
-        a == RAY_DATE || b == RAY_DATE || a == RAY_TIME || b == RAY_TIME)
-        return RAY_I32;
-    if (a == RAY_I16 || b == RAY_I16) return RAY_I16;
-    if (a == RAY_U8 || b == RAY_U8) return RAY_U8;
-    return RAY_BOOL;
+
+
+/* The graph already promoted the two branch types into op->out_type, and that
+ * is the answer — with one exception it cannot know statically.  A branch that
+ * ends up supplying no rows never materialises its type, so an F64 demanded by
+ * a float branch that never ran should not survive: the integer side keeps its
+ * own width.  That is the whole of the narrowing this arm does, and it is why
+ * (if (> v 0) v (sqrt s)) sums to 15 rather than 15.0 when every row is
+ * positive.
+ *
+ * And only where the eager arm could not have handled the node at all — a STR
+ * output, or a branch it cannot fill elementwise.  Where it could, it fills
+ * every row from op->out_type and never narrows, so narrowing here would make
+ * the same expression answer differently by worker count, which is the defect
+ * being fixed.
+ *
+ * Anything beyond that was a second promotion ladder living beside the graph's,
+ * and the two had drifted: it folded two matching temporal types down to their
+ * integer storage, so the same expression answered TIMESTAMP or I64 depending
+ * on which arm of exec_if ran. */
+/* How wide a value of this type is as a hash/store key, for the widen-only
+ * merge below.  Only the numeric ladder is ordered; anything else answers 0
+ * and is never used to widen. */
+static int if_type_rank(int8_t t) {
+    switch (t) {
+        case RAY_BOOL: return 1;
+        case RAY_U8:   return 2;
+        case RAY_I16:  return 3;
+        case RAY_I32:  return 4;
+        case RAY_I64:  return 5;
+        case RAY_F64:  return 6;
+        default:       return 0;
+    }
 }
 
-static int8_t if_selected_type(ray_t* then_v, ray_t* else_v, int8_t fallback) {
-    int8_t t = if_promote_type(if_value_type(then_v), if_value_type(else_v));
-    return t ? t : fallback;
+/* The graph promoted the branch types into op->out_type, but it promoted the
+ * declared types of the branch EXPRESSIONS, and arithmetic widens beyond
+ * them: (* a a) over an I32 column is computed and stored as I64, and calling
+ * the result I32 truncates every value.  So the declared type is a floor, not
+ * an answer — whichever of it and the materialised values is wider wins.
+ *
+ * Narrowing is only ever right for a branch that supplied no rows, where the
+ * type it would have contributed never materialised; even then it is limited
+ * to nodes the eager arm could not have taken, since that arm fills from
+ * op->out_type and never narrows, and the two answering differently by worker
+ * count is the defect this is all about. */
+static int8_t if_selected_type(ray_t* then_v, ray_t* else_v, int8_t declared,
+                               bool eager_possible) {
+    int8_t tt = if_value_type(then_v);
+    int8_t et = if_value_type(else_v);
+
+    /* Narrowing is for a branch that supplied no rows, and only where the
+     * declared type came FROM that branch — otherwise it is not narrowing but
+     * disagreeing with the eager arm.  Two shapes qualify:
+     *
+     *   a float branch that never ran, leaving integers that keep their own
+     *   width — this is what makes (if (> v 0) v (sqrt s)) sum to 15 and not
+     *   15.0;
+     *
+     *   a string branch that never ran, leaving a number that would otherwise
+     *   be written into a string column and read back as empty.
+     *
+     * Two temporal branches do not qualify: their I64 comes from the pair, not
+     * from either one, so narrowing to the survivor made a nested-if branch
+     * answer DATE where the same expression with a bare column answered I64. */
+    if (!eager_possible && (!then_v || !else_v)) {
+        int8_t live = then_v ? tt : et;
+        int lr = if_type_rank(live);
+        bool float_branch_absent = declared == RAY_F64 &&
+                                   lr && lr < if_type_rank(RAY_F64);
+        bool string_branch_absent = (declared == RAY_STR || declared == RAY_SYM) &&
+                                    lr > 0;
+        if (float_branch_absent || string_branch_absent) return live;
+    }
+
+    int dr = if_type_rank(declared);
+    if (dr) {
+        int8_t widest = declared;
+        int wr = dr;
+        if (if_type_rank(tt) > wr) { widest = tt; wr = if_type_rank(tt); }
+        if (if_type_rank(et) > wr) { widest = et; }
+        return widest;
+    }
+    return declared;
 }
 
 static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
@@ -496,13 +588,19 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
      * here.  Only when workers exist: with a 0-worker pool (-c 1) the
      * eager fill runs serially over ALL rows for BOTH branches, which
      * loses to the selected path's touch-only-passing-rows scheme. */
+    /* Whether the eager arm is even a candidate for this node — not whether
+     * it runs, which also depends on the pool.  Where it is, this arm must
+     * answer exactly as it would, or the same expression gets two types
+     * depending on the worker count.  Where it is not, this arm is the only
+     * one there is and may report the type the rows actually have. */
+    bool eager_possible = op->out_type != RAY_STR &&
+                          if_branch_trivial(g, then_op) &&
+                          if_branch_trivial(g, else_op) &&
+                          if_type_eager_ok(then_op->out_type, op->out_type) &&
+                          if_type_eager_ok(else_op->out_type, op->out_type);
     {
         ray_pool_t* rp = ray_pool_get();
-        if (rp && rp->n_workers > 0 &&
-            op->out_type != RAY_STR &&
-            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op) &&
-            if_type_eager_ok(then_op->out_type, op->out_type) &&
-            if_type_eager_ok(else_op->out_type, op->out_type))
+        if (rp && rp->n_workers > 0 && eager_possible)
             return NULL;
     }
 
@@ -544,7 +642,7 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
         return else_v;
     }
 
-    int8_t out_type = if_selected_type(then_v, else_v, op->out_type);
+    int8_t out_type = if_selected_type(then_v, else_v, op->out_type, eager_possible);
     if (!if_lazy_supported_type(out_type)) {
         if (then_v) ray_release(then_v);
         if (else_v) ray_release(else_v);
@@ -560,6 +658,8 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
         return result;
     }
     result->len = nrows;
+    if (if_val_has_null(then_v) || if_val_has_null(else_v))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
     if (out_type == RAY_STR)
         memset(ray_data(result), 0, (size_t)nrows * sizeof(ray_str_t));
     else
@@ -695,6 +795,26 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         return else_v;
     }
 
+    /* A scalar condition has one cell, and the fills below index it per row —
+     * reading past it, so `(if false f 1.0)` returned a mixture of both
+     * branches.  Expand it once so every consumer sees a full-length mask;
+     * the selected arm declines a scalar condition outright, which is why
+     * this only ever mattered here. */
+    if (ray_is_atom(cond_v)) {
+        int64_t n = ray_is_atom(then_v) ? (ray_is_atom(else_v) ? 1 : else_v->len)
+                                        : then_v->len;
+        uint8_t on = cond_v->b8 ? 1 : 0;
+        ray_t* mask = ray_vec_new(RAY_BOOL, n);
+        if (!mask || RAY_IS_ERR(mask)) {
+            ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+            return mask ? mask : ray_error("oom", NULL);
+        }
+        memset(ray_data(mask), on, (size_t)n);
+        mask->len = n;
+        ray_release(cond_v);
+        cond_v = mask;
+    }
+
     int64_t len = cond_v->len;
     bool then_scalar = ray_is_atom(then_v) || (then_v->type > 0 && then_v->len == 1);
     bool else_scalar = ray_is_atom(else_v) || (else_v->type > 0 && else_v->len == 1);
@@ -708,6 +828,11 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         return result;
     }
     result->len = len;
+    /* Same reason as the selected arm: an atom null is the sentinel value and
+     * carries no attr of its own, so without this the sentinel is rendered as
+     * an ordinary date or timestamp. */
+    if (if_val_has_null(then_v) || if_val_has_null(else_v))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
 
     uint8_t* cond_p = (uint8_t*)ray_data(cond_v);
 

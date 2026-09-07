@@ -1,0 +1,868 @@
+/*
+ *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+ */
+
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+#define _GNU_SOURCE
+
+#include "test.h"
+#include <rayforce.h>
+#include "core/ipc.h"
+#include "core/poll.h"
+#include "core/runtime.h"
+#include "core/sock.h"
+#include "lang/env.h"
+#include "table/dict.h"
+#include "mem/sys.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#ifndef RAY_OS_WINDOWS
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <unistd.h>
+#endif
+
+extern ray_runtime_t* __RUNTIME;
+
+typedef struct {
+    ray_poll_t* poll;
+    ray_vm_t*   vm;
+} poll_thread_ctx_t;
+
+static poll_thread_ctx_t g_server_ctx;
+
+static void mcast_setup(void) {
+    ray_runtime_create(0, NULL);
+    ray_poll_t* p = ray_poll_create();
+    if (p) ray_runtime_set_poll(p);
+}
+
+static void mcast_teardown(void) {
+    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
+    if (p) {
+        ray_runtime_set_poll(NULL);
+        ray_poll_destroy(p);
+    }
+    ray_runtime_destroy(__RUNTIME);
+}
+
+static void sleep_ms(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static void pump_client(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    if (!poll) return;
+    for (int i = 0; i < 20; i++) {
+        ray_poll_run_for(poll, 10);
+        sleep_ms(1);
+    }
+}
+
+static bool pump_until_env_i64_at_least(const char* name, size_t len,
+                                        int64_t want, int rounds) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    if (!poll) return false;
+    int64_t sym = ray_sym_intern(name, len);
+    for (int i = 0; i < rounds; i++) {
+        ray_t* v = ray_env_get(sym);
+        if (v && v->type == -RAY_I64 && v->i64 >= want)
+            return true;
+        ray_poll_run_for(poll, 10);
+        sleep_ms(1);
+    }
+    return false;
+}
+
+static uint16_t get_listen_port(ray_sock_t fd) {
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*)&addr, &len) < 0) return 0;
+    return ntohs(addr.sin_port);
+}
+
+static ray_vm_t* make_server_vm(void) {
+    ray_vm_t* vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
+    if (!vm) return NULL;
+    ray_vm_init(vm, 77);
+    return vm;
+}
+
+static void poll_server_thread_fn(void* arg) {
+    poll_thread_ctx_t* ctx = (poll_thread_ctx_t*)arg;
+    __VM = ctx->vm;
+    ray_poll_run(ctx->poll);
+}
+
+static void poll_stop(ray_poll_t* poll, uint16_t port) {
+    ray_poll_exit(poll, 0);
+    ray_sock_t k = ray_sock_connect("127.0.0.1", port, 200);
+    if (k != RAY_INVALID_SOCK) ray_sock_close(k);
+}
+
+static int64_t dict_i64(ray_t* d, const char* key) {
+    ray_t* k = ray_sym(ray_sym_intern(key, strlen(key)));
+    if (!k || RAY_IS_ERR(k)) return -1;
+    ray_t* v = ray_dict_get(d, k);
+    ray_release(k);
+    if (!v) return -1;
+    int64_t out = (v->type == -RAY_I64) ? v->i64 : -1;
+    ray_release(v);
+    return out;
+}
+
+static test_result_t assert_ok(ray_t* x, const char* label) {
+    TEST_ASSERT_NOT_NULL(x);
+    if (RAY_IS_ERR(x)) {
+        const char* code = ray_err_code(x);
+        TEST_ASSERT_FMT(false, "%s returned error: %s", label, code ? code : "error");
+    }
+    PASS();
+}
+
+static test_result_t start_server(ray_poll_t** poll_out, uint16_t* port_out,
+                                  ray_vm_t** vm_out, ray_thread_t* tid_out) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+    int64_t listener_id = ray_ipc_listen(poll, 0);
+    TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
+    ray_selector_t* listener_sel = ray_poll_get(poll, listener_id);
+    TEST_ASSERT_NOT_NULL(listener_sel);
+    uint16_t port = get_listen_port((ray_sock_t)listener_sel->fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(vm);
+    g_server_ctx.poll = poll;
+    g_server_ctx.vm = vm;
+    ray_thread_create(tid_out, poll_server_thread_fn, &g_server_ctx);
+    sleep_ms(20);
+
+    *poll_out = poll;
+    *port_out = port;
+    *vm_out = vm;
+    PASS();
+}
+
+static void stop_server(ray_poll_t* poll, uint16_t port, ray_vm_t* vm, ray_thread_t tid) {
+    poll_stop(poll, port);
+    ray_thread_join(tid);
+    ray_poll_destroy(poll);
+    ray_sys_free(vm);
+}
+
+static test_result_t test_mcast_single_client_pub(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_last_seq 0)"
+        "(set _mc_last_topic \"\")"
+        "(set _mc_last_payload 0)"
+        "(set upd (fn [topic seq payload] "
+        "  (set _mc_count (+ _mc_count 1))"
+        "  (set _mc_last_seq seq)"
+        "  (set _mc_last_topic topic)"
+        "  (set _mc_last_payload payload)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "client connected");
+
+    ray_t* sub_msg = ray_str("(.mc.sub \"ticks\" null)", strlen("(.mc.sub \"ticks\" null)"));
+    ray_t* sub = ray_ipc_send(h, sub_msg);
+    ray_release(sub_msg);
+    test_result_t ok = assert_ok(sub, "sub");
+    if (ok.status != TEST_PASS) return ok;
+    TEST_ASSERT_EQ_I(sub->i64, 1);
+    ray_release(sub);
+
+    ray_t* pub_msg = ray_str("(.mc.pub \"ticks\" 42)", strlen("(.mc.pub \"ticks\" 42)"));
+    ray_t* pub = ray_ipc_send(h, pub_msg);
+    ray_release(pub_msg);
+    ok = assert_ok(pub, "pub");
+    if (ok.status != TEST_PASS) return ok;
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+    pump_client();
+
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
+    ray_t* t = ray_env_get(ray_sym_intern("_mc_last_topic", 14));
+    ray_t* p = ray_env_get(ray_sym_intern("_mc_last_payload", 16));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQ_I(c->i64, 1);
+    TEST_ASSERT_EQ_I(s->i64, 1);
+    TEST_ASSERT_EQ_I(t->type, -RAY_STR);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(t), "ticks");
+    TEST_ASSERT_EQ_I(p->i64, 42);
+
+    pub_msg = ray_str("(.mc.pub \"ticks\" 'IBM)", strlen("(.mc.pub \"ticks\" 'IBM)"));
+    pub = ray_ipc_send(h, pub_msg);
+    ray_release(pub_msg);
+    ok = assert_ok(pub, "pub symbol");
+    if (ok.status != TEST_PASS) return ok;
+    TEST_ASSERT_EQ_I(pub->i64, 2);
+    ray_release(pub);
+    pump_client();
+
+    c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
+    p = ray_env_get(ray_sym_intern("_mc_last_payload", 16));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQ_I(c->i64, 2);
+    TEST_ASSERT_EQ_I(s->i64, 2);
+    TEST_ASSERT_EQ_I(p->type, -RAY_SYM);
+    ray_t* ps = ray_sym_str(p->i64);
+    TEST_ASSERT_NOT_NULL(ps);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(ps), "IBM");
+
+    pub_msg = ray_str("(.mc.pub \"ticks\" (list (first ['+]) 20 22))",
+                      strlen("(.mc.pub \"ticks\" (list (first ['+]) 20 22))"));
+    pub = ray_ipc_send(h, pub_msg);
+    ray_release(pub_msg);
+    ok = assert_ok(pub, "pub list payload");
+    if (ok.status != TEST_PASS) return ok;
+    TEST_ASSERT_EQ_I(pub->i64, 3);
+    ray_release(pub);
+    pump_client();
+
+    c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
+    p = ray_env_get(ray_sym_intern("_mc_last_payload", 16));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQ_I(c->i64, 3);
+    TEST_ASSERT_EQ_I(s->i64, 3);
+    TEST_ASSERT_EQ_I(p->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(ray_len(p), 3);
+
+    ray_ipc_close(h);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_two_clients_unsub_close_stats(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set upd (fn [topic seq payload] (set _mc_count (+ _mc_count payload))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"ticks\" null)", strlen("(.mc.sub \"ticks\" null)"));
+    ray_t* r1 = ray_ipc_send(h1, msg);
+    ray_t* r2 = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(r1); TEST_ASSERT_FALSE(RAY_IS_ERR(r1)); ray_release(r1);
+    TEST_ASSERT_NOT_NULL(r2); TEST_ASSERT_FALSE(RAY_IS_ERR(r2)); ray_release(r2);
+
+    ray_t* st_msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h1, st_msg);
+    ray_release(st_msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 2);
+    ray_release(st);
+
+    ray_t* unsub_msg = ray_str("(.mc.unsub \"ticks\")", strlen("(.mc.unsub \"ticks\")"));
+    ray_t* ur = ray_ipc_send(h2, unsub_msg);
+    ray_release(unsub_msg);
+    TEST_ASSERT_NOT_NULL(ur);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ur));
+    ray_release(ur);
+
+    ray_t* pub_msg = ray_str("(.mc.pub \"ticks\" 5)", strlen("(.mc.pub \"ticks\" 5)"));
+    ray_t* pub = ray_ipc_send(h1, pub_msg);
+    ray_release(pub_msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    ray_release(pub);
+    pump_client();
+
+    ray_t* barrier_msg = ray_str("(+ 0 0)", strlen("(+ 0 0)"));
+    ray_t* barrier = ray_ipc_send(h2, barrier_msg);
+    ray_release(barrier_msg);
+    TEST_ASSERT_NOT_NULL(barrier);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(barrier));
+    ray_release(barrier);
+
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->i64, 5);
+
+    msg = ray_str("(.mc.sub \"ticks\" null)", strlen("(.mc.sub \"ticks\" null)"));
+    r2 = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(r2); TEST_ASSERT_FALSE(RAY_IS_ERR(r2)); ray_release(r2);
+    ray_ipc_close(h2);
+    sleep_ms(50);
+
+    st_msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    st = ray_ipc_send(h1, st_msg);
+    ray_release(st_msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 1);
+    ray_release(st);
+
+    ray_ipc_close(h1);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_duplicate_sub_is_idempotent(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set upd (fn [topic seq payload] (set _mc_count (+ _mc_count 1))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "client connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"dup\" null)", strlen("(.mc.sub \"dup\" null)"));
+    ray_t* sub1 = ray_ipc_send(h, msg);
+    ray_t* sub2 = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub1); TEST_ASSERT_FALSE(RAY_IS_ERR(sub1)); ray_release(sub1);
+    TEST_ASSERT_NOT_NULL(sub2); TEST_ASSERT_FALSE(RAY_IS_ERR(sub2)); ray_release(sub2);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 1);
+    ray_release(st);
+
+    msg = ray_str("(.mc.pub \"dup\" 1)", strlen("(.mc.pub \"dup\" 1)"));
+    ray_t* pub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+    pump_client();
+
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->i64, 1);
+
+    ray_ipc_close(h);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_multi_topic_routing(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_sum 0)"
+        "(set _mc_last_topic \"\")"
+        "(set upd (fn [topic seq payload] "
+        "  (set _mc_count (+ _mc_count 1))"
+        "  (set _mc_sum (+ _mc_sum payload))"
+        "  (set _mc_last_topic topic)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "client connected");
+
+    ray_t* msg = ray_str("(.mc.sub 'alpha null)", strlen("(.mc.sub 'alpha null)"));
+    ray_t* sub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub); TEST_ASSERT_FALSE(RAY_IS_ERR(sub)); ray_release(sub);
+
+    msg = ray_str("(.mc.sub \"beta\" null)", strlen("(.mc.sub \"beta\" null)"));
+    sub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub); TEST_ASSERT_FALSE(RAY_IS_ERR(sub)); ray_release(sub);
+
+    msg = ray_str("(.mc.pub \"alpha\" 11)", strlen("(.mc.pub \"alpha\" 11)"));
+    ray_t* pub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub); TEST_ASSERT_FALSE(RAY_IS_ERR(pub)); ray_release(pub);
+    pump_client();
+
+    msg = ray_str("(.mc.pub 'beta 13)", strlen("(.mc.pub 'beta 13)"));
+    pub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub); TEST_ASSERT_FALSE(RAY_IS_ERR(pub)); ray_release(pub);
+    pump_client();
+
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* sum = ray_env_get(ray_sym_intern("_mc_sum", 7));
+    ray_t* topic = ray_env_get(ray_sym_intern("_mc_last_topic", 14));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(sum);
+    TEST_ASSERT_NOT_NULL(topic);
+    TEST_ASSERT_EQ_I(c->i64, 2);
+    TEST_ASSERT_EQ_I(sum->i64, 24);
+    TEST_ASSERT_EQ_I(topic->type, -RAY_STR);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(topic), "beta");
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 2);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 2);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 2);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 2);
+    ray_release(st);
+
+    ray_ipc_close(h);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_no_subscribers_and_api_errors(void) {
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "client connected");
+
+    ray_t* msg = ray_str("(.mc.pub \"orphan\" 99)", strlen("(.mc.pub \"orphan\" 99)"));
+    ray_t* pub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 0);
+    ray_release(pub);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 0);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 0);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 0);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 0);
+    TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 0);
+    ray_release(st);
+
+    msg = ray_str("(.mc.sub \"bad-filter\" 1)", strlen("(.mc.sub \"bad-filter\" 1)"));
+    ray_t* err = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "nyi");
+    ray_error_free(err);
+
+    msg = ray_str("(.mc.pub [1 2] 1)", strlen("(.mc.pub [1 2] 1)"));
+    err = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "type");
+    ray_error_free(err);
+
+    ray_ipc_close(h);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_restricted_sub_but_not_pub(void) {
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+    strcpy(poll->auth_secret, "secret");
+    ray_poll_set_restricted(poll, true);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "u", "secret", 0);
+    TEST_ASSERT((h) >= (0), "restricted client connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"ticks\" null)", strlen("(.mc.sub \"ticks\" null)"));
+    ray_t* sub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+    msg = ray_str("(.mc.pub \"ticks\" 1)", strlen("(.mc.pub \"ticks\" 1)"));
+    ray_t* pub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(pub));
+    TEST_ASSERT_STR_EQ(ray_err_code(pub), "access");
+    ray_error_free(pub);
+
+    ray_ipc_close(h);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_requires_ipc_context_for_sub(void) {
+    ray_t* sub = ray_eval_str("(.mc.sub \"ticks\" null)");
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(sub));
+    TEST_ASSERT_STR_EQ(ray_err_code(sub), "domain");
+    ray_error_free(sub);
+    PASS();
+}
+
+static test_result_t test_mcast_large_payload_queues_until_writable(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_last_len 0)"
+        "(set _mc_open_count 0)"
+        "(set _mc_sub_handle -1)"
+        "(set upd (fn [topic seq payload] "
+        "  (do "
+        "    (set _mc_count (+ _mc_count 1))"
+        "    (set _mc_last_len (count payload)))))"
+        "(set .ipc.on.open (fn [h] "
+        "  (do "
+        "    (set _mc_open_count (+ _mc_open_count 1))"
+        "    (if (== _mc_open_count 1) (set _mc_sub_handle h) 0))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"big\" null)", strlen("(.mc.sub \"big\" null)"));
+    ray_t* sub = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+#ifndef RAY_OS_WINDOWS
+    ray_t* server_h = ray_env_get(ray_sym_intern("_mc_sub_handle", 14));
+    TEST_ASSERT_NOT_NULL(server_h);
+    TEST_ASSERT_EQ_I(server_h->type, -RAY_I64);
+    ray_selector_t* server_sel = ray_poll_get(poll, server_h->i64);
+    TEST_ASSERT_NOT_NULL(server_sel);
+    int sndbuf = 4096;
+    setsockopt((ray_sock_t)server_sel->fd, SOL_SOCKET, SO_SNDBUF,
+               &sndbuf, sizeof(sndbuf));
+#endif
+
+    const char* pub_src =
+        "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
+    msg = ray_str(pub_src, strlen(pub_src));
+    ray_t* pub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_count", 9, 1, 1000));
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* len = ray_env_get(ray_sym_intern("_mc_last_len", 12));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(len);
+    TEST_ASSERT_EQ_I(c->i64, 1);
+    TEST_ASSERT_EQ_I(len->i64, 100000);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 0);
+    ray_release(st);
+
+    msg = ray_str("(+ 0 0)", strlen("(+ 0 0)"));
+    ray_t* ping = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(ping);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ping));
+    TEST_ASSERT_EQ_I(ping->i64, 0);
+    ray_release(ping);
+
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+static test_result_t test_mcast_failed_send_defers_close(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_sum 0)"
+        "(set _mc_open_count 0)"
+        "(set _mc_dead_handle -1)"
+        "(set upd (fn [topic seq payload] "
+        "  (set _mc_count (+ _mc_count 1))"
+        "  (set _mc_sum (+ _mc_sum payload))))"
+        "(set .ipc.on.open (fn [h] "
+        "  (do "
+        "    (set _mc_open_count (+ _mc_open_count 1))"
+        "    (if (== _mc_open_count 1) (set _mc_dead_handle h) 0))))"
+        "(set .ipc.on.close (fn [h] "
+        "  (do "
+        "    (.mc.sub \"hook-grow\" null)"
+        "    (.mc.unsub \"hook-grow\")"
+        "    null)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    for (int i = 0; i < 7; i++) {
+        char src[64];
+        int n = snprintf(src, sizeof(src), "(.mc.sub \"fill%d\" null)", i);
+        TEST_ASSERT((n) > (0), "format filler sub");
+        TEST_ASSERT((size_t)n < sizeof(src), "filler sub fits buffer");
+        ray_t* msg = ray_str(src, (size_t)n);
+        ray_t* sub = ray_ipc_send(h2, msg);
+        ray_release(msg);
+        TEST_ASSERT_NOT_NULL(sub);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+        ray_release(sub);
+    }
+
+    ray_t* msg = ray_str("(.mc.sub \"target\" null)", strlen("(.mc.sub \"target\" null)"));
+    ray_t* sub = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+    msg = ray_str("(.mc.sub \"target\" null)", strlen("(.mc.sub \"target\" null)"));
+    sub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+    ray_t* dead_v = ray_env_get(ray_sym_intern("_mc_dead_handle", 15));
+    TEST_ASSERT_NOT_NULL(dead_v);
+    TEST_ASSERT_EQ_I(dead_v->type, -RAY_I64);
+    ray_selector_t* dead_sel = ray_poll_get(poll, dead_v->i64);
+    TEST_ASSERT_NOT_NULL(dead_sel);
+    ray_sock_t old_dead_fd = (ray_sock_t)dead_sel->fd;
+    TEST_ASSERT(old_dead_fd != RAY_INVALID_SOCK, "dead selector has fd");
+    dead_sel->fd = RAY_INVALID_SOCK;
+
+    msg = ray_str("(.mc.pub \"target\" 7)", strlen("(.mc.pub \"target\" 7)"));
+    ray_t* pub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+    pump_client();
+
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* sum = ray_env_get(ray_sym_intern("_mc_sum", 7));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(sum);
+    TEST_ASSERT_EQ_I(c->i64, 1);
+    TEST_ASSERT_EQ_I(sum->i64, 7);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "topics"), 8);
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 8);
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 1);
+    ray_release(st);
+
+    ray_sock_close(old_dead_fd);
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+/* Regression: a sync request from a subscriber whose multicast frame is still
+ * queued must not corrupt the stream.  test_mcast_large_payload_queues drains
+ * the queue before pinging; here the ping races the still-pending frame.  Before
+ * the tx-drain fix, send_response spliced the RESP into the half-sent `upd`
+ * frame, so h1's reply came back garbled (or never framed) and the payload was
+ * truncated.  With the fix the server drains the queued frame first, then
+ * replies on a frame boundary. */
+static test_result_t test_mcast_sync_reply_after_queued_frame(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_last_len 0)"
+        "(set _mc_open_count 0)"
+        "(set _mc_sub_handle -1)"
+        "(set upd (fn [topic seq payload] "
+        "  (do "
+        "    (set _mc_count (+ _mc_count 1))"
+        "    (set _mc_last_len (count payload)))))"
+        "(set .ipc.on.open (fn [h] "
+        "  (do "
+        "    (set _mc_open_count (+ _mc_open_count 1))"
+        "    (if (== _mc_open_count 1) (set _mc_sub_handle h) 0))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"big\" null)", strlen("(.mc.sub \"big\" null)"));
+    ray_t* sub = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    ray_release(sub);
+
+#ifndef RAY_OS_WINDOWS
+    /* Shrink the server->h1 send buffer so a big frame parks on sel->tx.buf
+     * instead of leaving in a single write. */
+    ray_t* server_h = ray_env_get(ray_sym_intern("_mc_sub_handle", 14));
+    TEST_ASSERT_NOT_NULL(server_h);
+    TEST_ASSERT_EQ_I(server_h->type, -RAY_I64);
+    ray_selector_t* server_sel = ray_poll_get(poll, server_h->i64);
+    TEST_ASSERT_NOT_NULL(server_sel);
+    int sndbuf = 4096;
+    setsockopt((ray_sock_t)server_sel->fd, SOL_SOCKET, SO_SNDBUF,
+               &sndbuf, sizeof(sndbuf));
+#endif
+
+    const char* pub_src =
+        "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
+    msg = ray_str(pub_src, strlen(pub_src));
+    ray_t* pub = ray_ipc_send(h2, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+
+    /* Do NOT drain h1 first: the ~800 KB frame is still queued on the server's
+     * tx.buf for h1.  Issue a sync ping from h1 now — as h1 reads for its RESP
+     * it consumes the queued frame (firing `upd`), and with the fix the RESP
+     * only follows once that frame is fully flushed. */
+    msg = ray_str("(+ 21 21)", strlen("(+ 21 21)"));
+    ray_t* ping = ray_ipc_send(h1, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(ping);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ping));
+    TEST_ASSERT_EQ_I(ping->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(ping->i64, 42);   /* clean reply, not bytes from the frame */
+    ray_release(ping);
+
+    /* The queued `upd` was delivered whole, not truncated by the interleave. */
+    ray_t* cnt = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* len = ray_env_get(ray_sym_intern("_mc_last_len", 12));
+    TEST_ASSERT_NOT_NULL(cnt);
+    TEST_ASSERT_NOT_NULL(len);
+    TEST_ASSERT_EQ_I(cnt->i64, 1);
+    TEST_ASSERT_EQ_I(len->i64, 100000);
+
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+const test_entry_t mcast_entries[] = {
+    { "mcast/single_client_pub",          test_mcast_single_client_pub,          mcast_setup, mcast_teardown },
+    { "mcast/two_clients_unsub_close",    test_mcast_two_clients_unsub_close_stats, mcast_setup, mcast_teardown },
+    { "mcast/duplicate_sub_idempotent",   test_mcast_duplicate_sub_is_idempotent, mcast_setup, mcast_teardown },
+    { "mcast/multi_topic_routing",        test_mcast_multi_topic_routing,        mcast_setup, mcast_teardown },
+    { "mcast/no_subscribers_api_errors",  test_mcast_no_subscribers_and_api_errors, mcast_setup, mcast_teardown },
+    { "mcast/restricted_sub_not_pub",     test_mcast_restricted_sub_but_not_pub, mcast_setup, mcast_teardown },
+    { "mcast/sub_requires_ipc_context",   test_mcast_requires_ipc_context_for_sub, mcast_setup, mcast_teardown },
+    { "mcast/large_payload_queues",       test_mcast_large_payload_queues_until_writable, mcast_setup, mcast_teardown },
+    { "mcast/sync_reply_after_queued",    test_mcast_sync_reply_after_queued_frame, mcast_setup, mcast_teardown },
+    { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
+    { NULL, NULL, NULL, NULL },
+};

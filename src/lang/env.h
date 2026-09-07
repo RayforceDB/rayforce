@@ -132,6 +132,12 @@ int32_t ray_env_list_user(int64_t* sym_ids, ray_t** vals, int32_t max_entries);
  * user).  Useful for sizing buffers before ray_env_list. */
 int32_t ray_env_global_count(void);
 
+/* Reverse-map a builtin function object to the sym_id it is bound under in the
+ * global env, or -1 if it is not a registered global builtin.  Serialization
+ * uses this to recover a builtin's full name, which the object only inlines to
+ * 13 bytes (ray_fn_name). */
+int64_t ray_env_builtin_sym(const ray_t* fn);
+
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
 ray_err_t ray_env_push_query_scope(void);

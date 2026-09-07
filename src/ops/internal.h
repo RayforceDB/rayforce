@@ -1721,4 +1721,20 @@ static inline double clear_neg_zero(double v) {
     return v;
 }
 
+/* One F64 value as one hash key.  Every NaN payload folds to the same
+ * canonical NaN and -0.0 to +0.0, so a null counts once however it was
+ * produced and 0.0 keys the same whichever sign it carries.
+ *
+ * Shared rather than open-coded because agreement between kernels is the
+ * point: count-distinct answers from a serial loop, a partitioned one and a
+ * per-group buffer depending on the row and group counts, and they have to
+ * key a value identically or the count depends on the shape of the data. */
+static inline int64_t canon_f64_key(double v) {
+    if (v != v) v = (double)NAN;
+    else v = clear_neg_zero(v);
+    int64_t k;
+    memcpy(&k, &v, sizeof(int64_t));
+    return k;
+}
+
 #endif /* RAY_EXEC_INTERNAL_H */

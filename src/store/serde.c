@@ -131,6 +131,26 @@ static int64_t ser_schema_names(uint8_t* buf, ray_t* schema) {
     return c;
 }
 
+/* Builtins inline only the first 13 bytes of their name (ray_fn_name), so a
+ * longer registered name cannot be read off the object.  Recover the full name
+ * from the global-env binding; the returned pointer is borrowed from the sym
+ * table (stable through the read-only serialization phase — no release).  Sets
+ * *nlen to the byte length and returns the bytes.  Falls back to the object's
+ * inline name for anything not found as a registered global builtin. */
+static const char* serde_builtin_name(ray_t* obj, size_t* nlen) {
+    int64_t sym = ray_env_builtin_sym(obj);
+    if (sym >= 0) {
+        ray_t* s = ray_sym_str(sym);
+        if (s && !RAY_IS_ERR(s)) {
+            *nlen = ray_str_len(s);
+            return ray_str_ptr(s);
+        }
+    }
+    const char* name = ray_fn_name(obj);
+    *nlen = strlen(name);
+    return name;
+}
+
 /* --------------------------------------------------------------------------
  * ray_serde_size — calculate serialized size (excluding IPC header)
  * -------------------------------------------------------------------------- */
@@ -239,9 +259,12 @@ int64_t ray_serde_size(ray_t* obj) {
     case RAY_UNARY:
     case RAY_BINARY:
     case RAY_VARY: {
-        /* Serialize by name (null-terminated string in aux) */
-        const char* name = ray_fn_name(obj);
-        size_t nlen = strlen(name); if (nlen > 15) nlen = 15;
+        /* Serialize by name: type + full NUL-terminated name.  The name comes
+         * from the env binding (serde_builtin_name), not the object's 13-byte
+         * inline copy, so a long builtin name round-trips instead of resolving
+         * to a truncated, non-existent name on decode. */
+        size_t nlen;
+        (void)serde_builtin_name(obj, &nlen);
         return 1 + (int64_t)nlen + 1; /* type + name + null terminator */
     }
     case RAY_ERROR:
@@ -487,9 +510,12 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     case RAY_UNARY:
     case RAY_BINARY:
     case RAY_VARY: {
-        /* Serialize builtin by name (null-terminated) */
-        const char* name = ray_fn_name(obj);
-        size_t nlen = strlen(name); if (nlen > 15) nlen = 15;
+        /* Serialize builtin by its full NUL-terminated name, recovered from the
+         * env binding (the object only inlines 13 bytes).  ray_serde_size
+         * reserves 1 + nlen + 1 the same way; the decoder resolves the name in
+         * the global environment. */
+        size_t nlen;
+        const char* name = serde_builtin_name(obj, &nlen);
         memcpy(buf, name, nlen);
         buf[nlen] = 0;
         return 1 + (int64_t)nlen + 1;

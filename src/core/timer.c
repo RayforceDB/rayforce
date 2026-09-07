@@ -29,6 +29,7 @@
 #endif
 
 #include "core/timer.h"
+#include "core/runtime.h"   /* ray_error_msg */
 #include "lang/internal.h"
 #include "mem/sys.h"
 #include <stdio.h>
@@ -191,30 +192,32 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
         ray_release(arg);
         if (result) {
             if (RAY_IS_ERR(result)) {
-                ray_t* msg = ray_fmt(result, 0);
-                if (msg && ray_str_ptr(msg)) {
-                    fprintf(stderr, "timer %lld: %.*s\n",
-                            (long long)timer->id,
-                            (int)ray_str_len(msg),
-                            ray_str_ptr(msg));
-                }
-                if (msg) ray_release(msg);
+                /* An error formats as its code alone; the message lives
+                 * in the runtime's last-error slot.  Print both, as the
+                 * REPL does, so a failing poll names its peer and cause. */
+                char code[8] = {0};
+                memcpy(code, result->sdata, result->slen < 7 ? result->slen : 7);
+                const char* detail = ray_error_msg();
+                fprintf(stderr, "timer %lld: error: %s%s%s\n",
+                        (long long)timer->id, code,
+                        detail ? ": " : "", detail ? detail : "");
                 ray_error_free(result);
             } else {
                 ray_release(result);
             }
         }
 
-        /* Re-schedule or free. */
-        if (timer->num == 0) {
-            /* Forever: re-push. */
+        /* Re-schedule or free.  Re-arm from the schedule, so the cadence
+         * stays exact while callbacks are cheap, but never into the past:
+         * a callback that overran its period would otherwise leave the
+         * timer T/tic deadlines behind, and this loop would fire it that
+         * many times back-to-back before the poll loop served any I/O.
+         * Missed intervals are skipped, not replayed. */
+        if (timer->num == 0 || timer->num > 1) {
+            if (timer->num > 1) timer->num--;
+            now = ray_time_now_ms();
             timer->exp_ms += timer->tic_ms;
-            t->heap[t->n] = timer;
-            heap_up(t->heap, t->n);
-            t->n++;
-        } else if (timer->num > 1) {
-            timer->num--;
-            timer->exp_ms += timer->tic_ms;
+            if (timer->exp_ms <= now) timer->exp_ms = now + timer->tic_ms;
             t->heap[t->n] = timer;
             heap_up(t->heap, t->n);
             t->n++;

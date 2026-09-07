@@ -1,0 +1,36 @@
+;; ipc_open_errors.rfl — `.ipc.open` names the failure it actually hit.
+;;
+;; Regression (#472): the connect and the wire handshake share one budget,
+;; installed as SO_RCVTIMEO/SO_SNDTIMEO after the connect.  A server that
+;; is alive and listening but inside a long evaluation completes the TCP
+;; handshake in the kernel and never answers the wire handshake, so the
+;; recv timed out — and ray_ipc_connect returned the generic -1 that
+;; `.ipc.open` printed as "connection refused", byte-identical to a dead
+;; port that fails instantly.
+;;
+;; Server lifecycle is shell-driven like ipc_diff.rfl (by pid, so no pattern
+;; can match the shell that runs it): a second rayforce
+;; on port 19976 whose script sleeps, so the listener is up (-p binds
+;; before the script runs) and nobody serves the handshake.
+(.sys.exec "[ -f /tmp/rfl_ipc_deaf.pid ] && kill $(cat /tmp/rfl_ipc_deaf.pid) 2>/dev/null; rm -f /tmp/rfl_ipc_deaf.pid; true")
+(.sys.exec "printf '(.sys.exec \"sleep 6\")\n' > /tmp/rfl_ipc_deaf.rfl")
+(.sys.exec "./rayforce -p 19976 /tmp/rfl_ipc_deaf.rfl </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_ipc_deaf.pid")
+;; the kernel accepts into the backlog even though nobody answers
+(.sys.exec "for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19976) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+
+(.sys.exec "printf '(println (.ipc.open \"127.0.0.1:19976\" 300))\n' > /tmp/rfl_ipc_c1.rfl")
+(.sys.exec "printf '(println (.ipc.open \"127.0.0.1:19975\" 300))\n' > /tmp/rfl_ipc_c2.rfl")
+(.sys.exec "printf '(println (.ipc.open \"no-such-host.invalid:19975\" 300))\n' > /tmp/rfl_ipc_c3.rfl")
+
+;; listening but not answering: the budget expires, and the line says so
+(.ipc.open "127.0.0.1:19976" 300) !- io
+(.sys.exec "./rayforce /tmp/rfl_ipc_c1.rfl </dev/null 2>&1 | grep -q 'error: io: connection timed out: 127.0.0.1:19976'") -- 0
+
+;; nothing bound: refused, and instantly
+(.ipc.open "127.0.0.1:19975" 300) !- io
+(.sys.exec "./rayforce /tmp/rfl_ipc_c2.rfl </dev/null 2>&1 | grep -q 'error: io: connection refused: 127.0.0.1:19975'") -- 0
+
+;; a host that does not resolve is neither
+(.sys.exec "./rayforce /tmp/rfl_ipc_c3.rfl </dev/null 2>&1 | grep -q 'error: io: connect failed: no-such-host.invalid:19975: '") -- 0
+
+(.sys.exec "kill $(cat /tmp/rfl_ipc_deaf.pid) 2>/dev/null; for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19976) 2>/dev/null' || break; sleep 0.1; done; rm -f /tmp/rfl_ipc_deaf.pid /tmp/rfl_ipc_deaf.rfl /tmp/rfl_ipc_c1.rfl /tmp/rfl_ipc_c2.rfl /tmp/rfl_ipc_c3.rfl; true")
