@@ -1,0 +1,9 @@
+;; CSV type inference must recognize Rayfall's display temporal forms.
+;; These are the forms users see when DATE/TIMESTAMP values are printed.
+(.sys.exec "printf 'd,ts\n2024.01.02,2024.01.02D01:02:03.004005006\n' > rf_test_csv_rayfall_temporal.csv") -- 0
+(set T (.csv.read "rf_test_csv_rayfall_temporal.csv"))
+(type (at T 'd)) -- 'DATE
+(type (at T 'ts)) -- 'TIMESTAMP
+(at (at T 'd) 0) -- 2024.01.02
+(at (at T 'ts) 0) -- 2024.01.02D01:02:03.004005006
+(.sys.exec "rm -f rf_test_csv_rayfall_temporal.csv") -- 0
