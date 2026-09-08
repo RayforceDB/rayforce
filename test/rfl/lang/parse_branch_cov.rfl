@@ -104,16 +104,17 @@
 ;; 3.  BARE-0N IDENTIFIER-CONTINUATION GUARDS  (parse_number :214-218)
 ;; ════════════════════════════════════════════════════════════════════
 ;; `0N` followed by a letter/digit/underscore that is NOT a suffix is
-;; *not* a null — the digit `0` is taken and the continuation parsed as a
-;; separate trailing name, so `(do 0 <name>)` evaluates to the name value.
+;; *not* a null — the digit `0` is taken, and what follows is a second
+;; token glued to it, which is a parse error since #484 (before, it was
+;; silently read as `(do 0 <name>)` and evaluated to the name's value).
 (set Na 7)
-0Na -- 7
+0Na !- parse
 (set Nz 9)
-0Nz -- 9
+0Nz !- parse
 (set N3 3)
-0N3 -- 3
+0N3 !- parse
 (set N_x 11)
-0N_x -- 11
+0N_x !- parse
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 4.  FLOAT / EXPONENT / INTEGER-OVERFLOW PROMOTION  (parse_number)
@@ -164,13 +165,13 @@
 ;; time without sub-second fraction is still valid; eval pins the value.
 (type (parse "12:30:45")) -- 'time
 (eval (parse "12:30:45")) -- 12:30:45.000
-;; 2-digit + colon where try_parse_time fails → fall through to number,
-;; then the remainder is re-lexed (parse_number :281-289, try_parse_time
-;; NULL at MM :151, at MM-colon :157, at SS digits).  Each yields
-;; `(do 12 <keyword>)` whose value is the trailing keyword sym.
-(eval (parse "12:3x")) -- '3x
-(eval (parse "12:30x")) -- '30x
-(eval (parse "12:30:4x")) -- '4x
+;; 2-digit + colon where try_parse_time fails → fall through to number
+;; (parse_number, try_parse_time NULL at MM / MM-colon / SS digits); the
+;; remainder is then a second token glued to the number, a parse error
+;; since #484 (before, each re-lexed to `(do 12 <keyword>)`).
+(parse "12:3x") !- parse
+(parse "12:30x") !- parse
+(parse "12:30:4x") !- parse
 ;; timestamp YYYY.MM.DDDhh:mm:ss.nnnnnnnnn
 2024.01.15D12:30:45.000000000 -- 2024.01.15D12:30:45.000000000
 (type 2024.01.15D12:30:45.000000000) -- 'timestamp

@@ -852,6 +852,7 @@ static ray_t* parse_expr_inner(ray_parser_t *p) {
     int32_t sl = p->line, sc = p->col;
     const char *before = p->pos;
     ray_t *result;
+    bool leaf = true;   /* symbol / keyword / name / number: must end at a delimiter */
 
     switch (PA(*p->pos)) {
         case PA_END:    return ray_error("parse", NULL);
@@ -863,11 +864,11 @@ static ray_t* parse_expr_inner(ray_parser_t *p) {
                 result = parse_name(p);  /* standalone '-' or '-name' */
             break;
         case PA_ALPHA:  result = parse_name(p); break;
-        case PA_STRING: result = parse_string(p); break;
+        case PA_STRING: result = parse_string(p); leaf = false; break;
         case PA_QUOTE:  result = parse_symbol(p); break;
-        case PA_LPAREN: result = parse_list(p); break;
-        case PA_LBRACK: result = parse_vector(p); break;
-        case PA_LBRACE: result = parse_dict(p); break;
+        case PA_LPAREN: result = parse_list(p);   leaf = false; break;
+        case PA_LBRACK: result = parse_vector(p); leaf = false; break;
+        case PA_LBRACE: result = parse_dict(p);   leaf = false; break;
         case PA_RPAREN: return ray_error("parse", NULL);
         case PA_RBRACK: return ray_error("parse", NULL);
         case PA_RBRACE: return ray_error("parse", NULL);
@@ -887,6 +888,26 @@ static ray_t* parse_expr_inner(ray_parser_t *p) {
             break;
         }
         default:        result = parse_name(p); break;  /* operators like +, *, etc. */
+    }
+
+    /* A leaf token must not be glued to another: a quote, a colon, or a
+     * name/number character directly after a symbol, keyword, name or
+     * number is a parse error.  Without this, nothing separated adjacent
+     * tokens, so `['a:1]` lexed as the symbol `a` followed by the keyword
+     * symbol `:1` (a two-element vector printed as `[a 1]`), and `(+ 1'a)`
+     * or `0Na` quietly became something other than what was written.
+     * Brackets and strings stay self-delimiting on both sides: `fn[x]`,
+     * `gds(take ..)`, `(f x)(g y)` and `(list "A""B")` are established
+     * usage. */
+    if (leaf && result && !RAY_IS_ERR(result)) {
+        char c = *p->pos;
+        bool glued = c == '\'' || c == ':' || PA(c) == PA_ALPHA || PA(c) == PA_DIGIT ||
+                     c == '_' || c == '.' || c == '-' || c == '?' || c == '!';
+        if (glued) {
+            ray_release(result);
+            fixup_pos(p, before);
+            return ray_error("parse", "unexpected '%c' directly after a token; separate tokens with whitespace", c);
+        }
     }
 
     /* Fixup line/col: leaf parsers advance pos without updating line/col.

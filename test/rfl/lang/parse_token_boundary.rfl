@@ -1,0 +1,54 @@
+;; parse_token_boundary.rfl — a leaf token cannot be glued to another (#484).
+;;
+;; Regression: nothing required a delimiter between tokens, so `['a:1]`
+;; lexed as the symbol `a` followed by the keyword symbol `:1` — a
+;; two-element symbol vector that printed as `[a 1]` — and `(+ 1'a)` or
+;; `0Na` quietly became something else.  A symbol, keyword, name or
+;; number directly followed by a quote, a colon, or another name/number
+;; character is now a parse error at that position.  Brackets and strings
+;; stay self-delimiting on both sides: `fn[x]`, `gds(take ..)`,
+;; `(f x)(g y)` and `(list "A""B")` still parse as before.
+
+;; ── the reported case and its relatives ──
+(count ['a:1]) !- parse
+['a:1] !- parse
+[a:1] !- parse
+(list 'a:1) !- parse
+['a'b] !- parse
+[1'a] !- parse
+(+ 1'a) !- parse
+(nil?'a) !- parse
+:a:b !- parse
+0Na !- parse
+1x !- parse
+(parse "12:3x") !- parse
+
+;; ── a colon inside a symbol is spelled through a cast ──
+(count (list (as 'symbol "a:1"))) -- 1
+(type (as 'symbol "a:1")) -- 'sym
+
+;; ── everything delimited stays as it was ──
+(count ['a 'b]) -- 2
+['a :b] -- [a b]
+(count [1 2 3]) -- 3
+(+ 1 2) -- 3
+{a: 1} -- {a:1}
+{a:1} -- {a:1}
+(at {a: 1} 'a) -- 1
+(list "A""B""C") -- (list "A" "B" "C")
+((fn [x] x) 5) -- 5
+(set _tb 1)(+ _tb 1) -- 2
+(count (list [1 2]3)) -- 2
+(count (list 1[2])) -- 2
+((fn[x] x) 5) -- 5
+(count (list [1 2] [3 4])) -- 2
+(count [2024.01.02D01:02:03.004005006 0Np]) -- 2
+(nil? ') -- true
+-1 -- -1
+(- 5 2) -- 3
+[1 -2] -- [1 -2]
+(count (quote (+ 1 2))) -- 3
+'a' -- "a"
+'\n' -- "\n"
+;; a comment right after a token is a delimiter too
+(+ 1 2);; trailing comment
