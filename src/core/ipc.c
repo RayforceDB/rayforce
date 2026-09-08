@@ -1546,8 +1546,12 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
     }
 }
 
-static ray_poll_buf_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
-                                      uint8_t extra_flags, ray_err_t* err_out)
+/* Serialize + compress + frame one message into an immutable, reference-
+ * counted frame (rc = 1 to the caller).  Built once per message however
+ * many connections it goes to: ray_mcast_pub shares one frame across
+ * every subscriber's queue (#487). */
+static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
+                                        uint8_t extra_flags, ray_err_t* err_out)
 {
     if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
@@ -1609,7 +1613,7 @@ static ray_poll_buf_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
         return NULL;
     }
 
-    ray_poll_buf_t* frame = ray_poll_buf_new((int64_t)total);
+    ray_poll_frame_t* frame = ray_poll_frame_new((int64_t)total);
     if (!frame) {
         ray_sys_free(send_buf);
         if (payload) ray_sys_free(payload);
@@ -1635,10 +1639,10 @@ static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
                               uint8_t extra_flags)
 {
     ray_err_t err = RAY_OK;
-    ray_poll_buf_t* frame = conn_frame_msg(msg, msgtype, extra_flags, &err);
+    ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags, &err);
     if (!frame) return -1;
     int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
-    ray_poll_buf_free(frame);
+    ray_poll_frame_release(frame);
     return rc < 0 ? -1 : 0;
 }
 
@@ -1958,8 +1962,10 @@ static int conn_try_send_frame(ray_selector_t* sel, ray_poll_buf_t* frame)
     return 0;
 }
 
-ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
+ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out)
 {
+    if (!out) return RAY_ERR_TYPE;
+    *out = NULL;
     bool owned = false;
     if (ray_is_lazy(msg)) {
         ray_retain(msg);
@@ -1971,42 +1977,54 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
         }
         owned = true;
     }
+    ray_err_t err = RAY_OK;
+    ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0, &err);
+    if (owned) ray_release(msg);
+    if (!frame) return err == RAY_OK ? RAY_ERR_IO : err;
+    *out = frame;
+    return RAY_OK;
+}
 
+ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame)
+{
+    if (!frame) return RAY_ERR_TYPE;
     ray_poll_t* poll;
     ray_selector_t* sel = conn_resolve(&poll, handle);
-    if (!sel) {
-        if (owned) ray_release(msg);
-        return RAY_ERR_IO;
-    }
+    if (!sel) return RAY_ERR_IO;
 
-    ray_err_t err = RAY_OK;
-    ray_poll_buf_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0, &err);
-    if (!frame) {
-        if (owned) ray_release(msg);
-        return err == RAY_OK ? RAY_ERR_IO : err;
-    }
+    /* The queue node holds its own reference; the caller keeps its own. */
+    ray_poll_buf_t* node = ray_poll_buf_from_frame(frame);
+    if (!node) return RAY_ERR_OOM;
 
     int rc = 0;
     if (sel->tx.buf) {
-        rc = 1;
+        rc = 1;                         /* keep ordering behind queued bytes */
     } else {
-        rc = conn_try_send_frame(sel, frame);
+        rc = conn_try_send_frame(sel, node);
     }
 
     if (rc == 0) {
-        ray_poll_buf_free(frame);
+        ray_poll_buf_free(node);
     } else if (rc > 0) {
-        if (conn_tx_append(sel, frame) < 0) {
-            ray_poll_buf_free(frame);
-            if (owned) ray_release(msg);
+        if (conn_tx_append(sel, node) < 0) {
+            ray_poll_buf_free(node);
             return RAY_ERR_IO;
         }
         ray_poll_tx_request(poll, sel);
     } else {
-        ray_poll_buf_free(frame);
+        ray_poll_buf_free(node);
     }
-    if (owned) ray_release(msg);
     return rc >= 0 ? RAY_OK : RAY_ERR_IO;
+}
+
+ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
+{
+    ray_poll_frame_t* frame = NULL;
+    ray_err_t err = ray_ipc_frame_async(msg, &frame);
+    if (err != RAY_OK) return err;
+    err = ray_ipc_try_send_frame(handle, frame);
+    ray_poll_frame_release(frame);
+    return err;
 }
 
 /* Verbose-eval sync send: sets RAY_IPC_FLAG_VERBOSE on the outbound

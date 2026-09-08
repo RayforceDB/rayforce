@@ -44,11 +44,27 @@ typedef ray_t*  (*ray_poll_data_fn)(ray_poll_t* poll, ray_selector_t* sel, void*
 
 /* ===== Buffer ===== */
 
+/* Immutable, reference-counted bytes.  A frame built once for a multicast
+ * publication is shared by every subscriber's transmit queue; each queue
+ * holds its own ray_poll_buf_t node (offset, link) pointing at the same
+ * frame, and the frame is freed when the last node is done with it. */
+typedef struct ray_poll_frame {
+    int32_t rc;
+    int64_t size;
+    uint8_t data[];
+} ray_poll_frame_t;
+
+/* A queue node.  `data` points either at the node's own trailing storage
+ * (ray_poll_buf_new: rx buffers, one-off tx frames) or into a shared
+ * ray_poll_frame_t (ray_poll_buf_from_frame), which `frame` then owns a
+ * reference to.  Readers use data/size/offset the same way either way. */
 typedef struct ray_poll_buf {
     struct ray_poll_buf* next;
     int64_t              size;
     int64_t              offset;
-    uint8_t              data[];
+    uint8_t*             data;
+    ray_poll_frame_t*    frame;
+    uint8_t              storage[];
 } ray_poll_buf_t;
 
 /* ===== Selector — one per registered fd ===== */
@@ -117,6 +133,10 @@ ray_poll_buf_t* ray_poll_buf_new(int64_t size);
 void            ray_poll_buf_free(ray_poll_buf_t* buf);
 void            ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel,
                                     int64_t size);
+ray_poll_frame_t* ray_poll_frame_new(int64_t size);          /* rc = 1 */
+void              ray_poll_frame_retain(ray_poll_frame_t* f);
+void              ray_poll_frame_release(ray_poll_frame_t* f);
+ray_poll_buf_t*   ray_poll_buf_from_frame(ray_poll_frame_t* f); /* node holding a new ref */
 void            ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel);
 void            ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel);
 int             ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel);

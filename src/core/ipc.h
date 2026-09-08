@@ -131,6 +131,16 @@ ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg);
 
+/* Fan-out building blocks (#487): frame a message once into an immutable
+ * reference-counted frame, then hand the same frame to any number of
+ * connections.  ray_ipc_try_send_frame takes its own reference for the
+ * queue; the caller releases the one it got from ray_ipc_frame_async when
+ * it is done handing the frame out.  Same send-or-queue semantics and
+ * return codes as ray_ipc_try_send_async, which is now the one-connection
+ * composition of the two. */
+ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out);
+ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame);
+
 /* Remote-REPL helper: send a SYNC message with RAY_IPC_FLAG_VERBOSE
  * set, returning a 2-element list [captured_str, result] where
  * captured_str is whatever the server's eval wrote to stdout/stderr

@@ -654,6 +654,116 @@ static test_result_t test_mcast_large_payload_queues_until_writable(void) {
     PASS();
 }
 
+/* One publication, N subscribers: the wire bytes are built once and shared
+ * (#487).  A 4 KiB SO_SNDBUF on every server-side subscriber socket forces
+ * the large frame to queue on all of them; the stats `framed` counter must
+ * read 1 for the publication, every subscriber must still receive the whole
+ * payload, and a subscriber that closes while its copy is only partly
+ * written must not disturb the others or leak the shared bytes (ASan
+ * would report a leak or a use-after-free at teardown). */
+static test_result_t test_mcast_shared_frame_across_subscribers(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_len_sum 0)"
+        "(set _mc_handles [])"
+        "(set upd (fn [topic seq payload] "
+        "  (do "
+        "    (set _mc_count (+ _mc_count 1))"
+        "    (set _mc_len_sum (+ _mc_len_sum (count payload))))))"
+        "(set .ipc.on.open (fn [h] (set _mc_handles (concat _mc_handles h))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t hs[3];
+    for (int i = 0; i < 3; i++) {
+        hs[i] = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+        TEST_ASSERT((hs[i]) >= (0), "subscriber connected");
+        ray_t* msg = ray_str("(.mc.sub \"big\" null)", strlen("(.mc.sub \"big\" null)"));
+        ray_t* sub = ray_ipc_send(hs[i], msg);
+        ray_release(msg);
+        TEST_ASSERT_NOT_NULL(sub);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+        ray_release(sub);
+    }
+    int64_t hp = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((hp) >= (0), "publisher connected");
+
+#ifndef RAY_OS_WINDOWS
+    ray_t* server_hs = ray_env_get(ray_sym_intern("_mc_handles", 11));
+    TEST_ASSERT_NOT_NULL(server_hs);
+    TEST_ASSERT((ray_len(server_hs)) >= (3), "three server-side subscriber handles");
+    for (int i = 0; i < 3; i++) {
+        int64_t sh = ((int64_t*)ray_data(server_hs))[i];
+        ray_selector_t* ssel = ray_poll_get(poll, sh);
+        TEST_ASSERT_NOT_NULL(ssel);
+        int sndbuf = 4096;
+        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+#endif
+
+    const char* pub_src = "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
+    ray_t* msg = ray_str(pub_src, strlen(pub_src));
+    ray_t* pub = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    TEST_ASSERT_EQ_I(pub->i64, 1);
+    ray_release(pub);
+
+    /* One subscriber goes away while its copy is at best partly written. */
+    ray_ipc_close(hs[2]);
+
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_count", 9, 2, 2000));
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    ray_t* lsum = ray_env_get(ray_sym_intern("_mc_len_sum", 11));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(lsum);
+    TEST_ASSERT_EQ_I(c->i64, 2);
+    TEST_ASSERT_EQ_I(lsum->i64, 200000);
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "published"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 3);
+    TEST_ASSERT_EQ_I(dict_i64(st, "framed"), 1);   /* built once, not per subscriber */
+    ray_release(st);
+
+    /* A second publication to the two survivors: still one frame each time. */
+    msg = ray_str("(.mc.pub \"big\" (til 50000))", strlen("(.mc.pub \"big\" (til 50000))"));
+    pub = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    ray_release(pub);
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_count", 9, 4, 2000));
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    st = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "framed"), 2);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 5);
+    ray_release(st);
+
+    ray_ipc_close(hs[0]);
+    ray_ipc_close(hs[1]);
+    ray_ipc_close(hp);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 static test_result_t test_mcast_failed_send_defers_close(void) {
     ray_t* r = ray_eval_str(
         "(set _mc_count 0)"
@@ -864,5 +974,6 @@ const test_entry_t mcast_entries[] = {
     { "mcast/large_payload_queues",       test_mcast_large_payload_queues_until_writable, mcast_setup, mcast_teardown },
     { "mcast/sync_reply_after_queued",    test_mcast_sync_reply_after_queued_frame, mcast_setup, mcast_teardown },
     { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
+    { "mcast/shared_frame_across_subs",   test_mcast_shared_frame_across_subscribers, mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };
