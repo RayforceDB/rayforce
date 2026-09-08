@@ -124,9 +124,18 @@ sentinel for their type:
 
 Symbols have no typed null literal (there is no `0Ns`).
 
-Inside `select` and `update` expressions, `(nil? col)` lowers to the DAG
-null-check opcode and returns a boolean per row, so it can be used directly in
-`where:` predicates and projections.
+`nil?` is element-wise: given a vector or a list it returns a `B8` vector with
+one entry per element, so `(where (nil? v))` and `(sum (as 'I64 (nil? v)))`
+work without a `map`. An atom answers for itself, and so does any other
+container (a table or a dict is never null). Inside `select` and `update`
+expressions, `(nil? col)` lowers to the DAG null-check opcode, which gives the
+same per-row answer and can be used directly in `where:` predicates and
+projections.
+
+```lisp
+(nil? [1 0N 3])   ; [false true false]
+(nil? [a ' b])    ; [false true false]  — the empty symbol is SYM's null
+```
 
 ## Vectors
 

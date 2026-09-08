@@ -2334,11 +2334,36 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
     return ray_dict_new(keys, vlist);
 }
 
-/* (nil? x) -> true if x is null */
+/* (nil? x) -> true if x is null.
+ *
+ * Element-wise over a vector or a boxed list: one BOOL per element, the
+ * same answer the query path's OP_ISNULL gives per row, so `nil?` means
+ * the same thing inside and outside a query (#485).  Nulls are in-band
+ * (sentinels, the empty symbol, the empty string), so ray_vec_is_null
+ * decides per element regardless of the HAS_NULLS hint.  A list element
+ * that is not an atom is not null.  Atoms, the null object, and any
+ * other container (a table, a dict) answer for the object itself. */
 ray_t* ray_nil_fn(ray_t* x) {
     RAY_ASSERT_VALUE(x);
     if (RAY_IS_NULL(x)) return ray_bool(true);
-    if (ray_is_atom(x) && RAY_ATOM_IS_NULL(x)) return ray_bool(true);
+    if (ray_is_atom(x)) return ray_bool(RAY_ATOM_IS_NULL(x));
+    if (ray_is_vec(x) || x->type == RAY_LIST) {
+        int64_t n = ray_len(x);
+        ray_t* out = ray_vec_new(RAY_BOOL, n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        uint8_t* o = (uint8_t*)ray_data(out);
+        if (x->type == RAY_LIST) {
+            ray_t** e = (ray_t**)ray_data(x);
+            for (int64_t i = 0; i < n; i++)
+                o[i] = (uint8_t)(!e[i] || RAY_IS_NULL(e[i]) ||
+                                 (ray_is_atom(e[i]) && RAY_ATOM_IS_NULL(e[i])));
+        } else {
+            for (int64_t i = 0; i < n; i++)
+                o[i] = (uint8_t)ray_vec_is_null(x, i);
+        }
+        out->len = n;
+        return out;
+    }
     return ray_bool(false);
 }
 

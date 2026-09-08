@@ -13,7 +13,8 @@
 (quote 42) -- 42
 (quote 'hello) -- 'hello
 (quote [1 2 3]) -- [1 2 3]
-(nil? (quote (+ 1 2))) -- false
+;; a quoted form is a 3-element list; nil? is element-wise over it (#485)
+(nil? (quote (+ 1 2))) -- [false false false]
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_return_fn  (lines 590-593)
