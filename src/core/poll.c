@@ -52,6 +52,8 @@ ray_poll_buf_t* ray_poll_buf_new(int64_t size)
     buf->next   = NULL;
     buf->size   = size;
     buf->offset = 0;
+    buf->data   = buf->storage;
+    buf->frame  = NULL;
     return buf;
 }
 
@@ -59,9 +61,44 @@ void ray_poll_buf_free(ray_poll_buf_t* buf)
 {
     while (buf) {
         ray_poll_buf_t* next = buf->next;
+        if (buf->frame) ray_poll_frame_release(buf->frame);
         ray_sys_free(buf);
         buf = next;
     }
+}
+
+ray_poll_frame_t* ray_poll_frame_new(int64_t size)
+{
+    ray_poll_frame_t* f = (ray_poll_frame_t*)ray_sys_alloc(
+        sizeof(ray_poll_frame_t) + (size_t)size);
+    if (!f) return NULL;
+    f->rc   = 1;
+    f->size = size;
+    return f;
+}
+
+void ray_poll_frame_retain(ray_poll_frame_t* f)
+{
+    if (f) f->rc++;
+}
+
+void ray_poll_frame_release(ray_poll_frame_t* f)
+{
+    if (f && --f->rc == 0) ray_sys_free(f);
+}
+
+ray_poll_buf_t* ray_poll_buf_from_frame(ray_poll_frame_t* f)
+{
+    if (!f) return NULL;
+    ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_sys_alloc(sizeof(ray_poll_buf_t));
+    if (!buf) return NULL;
+    buf->next   = NULL;
+    buf->size   = f->size;
+    buf->offset = 0;
+    buf->data   = f->data;
+    buf->frame  = f;
+    ray_poll_frame_retain(f);
+    return buf;
 }
 
 void ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel, int64_t size)

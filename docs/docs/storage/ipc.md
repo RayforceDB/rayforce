@@ -175,6 +175,20 @@ The query is assembled as data: while the `(list ...)` is built, `(quote price)`
 !!! note "Message types"
     `.ipc.send` uses synchronous messaging — it blocks until the server returns a result. For asynchronous (fire-and-forget) messaging, use `.ipc.post`, which sends without waiting for a response (the C equivalent is `ray_ipc_send_async`).
 
+### .ipc.txlimit
+
+Every connection queues outbound bytes the socket cannot take immediately (asynchronous `.ipc.post` sends and multicast fan-out). The queue is bounded per connection: a frame that would push the backlog past the limit is refused, and for a multicast subscriber that means it is dropped from the topic and closed, so a lagging consumer learns of the loss explicitly instead of silently missing updates.
+
+```lisp
+(.ipc.txlimit)                 ; {bytes:268435456 frames:0} — the process default
+(.ipc.txlimit 8388608)         ; 8 MiB per connection, frames unlimited
+(.ipc.txlimit 8388608 64)      ; at most 8 MiB or 64 queued frames, whichever first
+(.ipc.txlimit h 67108864 0)    ; one connection may hold 64 MiB
+(.ipc.handle h)                ; {handle limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
+```
+
+The default is 256 MiB with no frame cap; the minimum is 4 KiB, and `frames` of `0` means unlimited. Changing the default applies to every connection without an override, including ones already open. `.mc.stats` reports the default as `tx_limit_bytes` / `tx_limit_frames` and the largest backlog any connection has held as `tx_hwm_bytes`. `.ipc.txlimit` is restricted: it decides when a peer is dropped.
+
 ## Connection Hooks
 
 The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.

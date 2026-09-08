@@ -726,7 +726,8 @@ TCP-based IPC for connecting to remote Rayforce instances. Uses binary serializa
 | `.ipc.open` | variadic | restricted | Open TCP connection to host:port (optional connect timeout in ms), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
 | `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
-| `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside | `(.ipc.handle)` |
+| `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside; given a live connection handle, that connection's transmit-queue view (`limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes`) | `(.ipc.handle)`, `(.ipc.handle h)` |
+| `.ipc.txlimit` | variadic | restricted | Transmit backlog policy: `()` reads the process default, `(bytes [frames])` sets it, `(h bytes frames)` overrides one connection; a frame that would exceed a connection's limit is refused and a multicast subscriber is dropped and closed | `(.ipc.txlimit 8388608 64)` |
 | `.ipc.on.open` | hook | user-settable | Fires after inbound connection completes handshake; arg = handle | `(set .ipc.on.open (fn [h] ...))` |
 | `.ipc.on.close` | hook | user-settable | Fires before inbound connection teardown; arg = handle | `(set .ipc.on.close (fn [h] ...))` |
 | `.ipc.on.sync` | hook | user-settable | Intercepts sync messages; return value becomes the response | `(set .ipc.on.sync (fn [m] (eval (parse m))))` |
