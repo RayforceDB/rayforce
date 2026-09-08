@@ -343,8 +343,8 @@ ray_t* ray_mcast_stats(ray_poll_t* poll) {
             subs += mc->topics[i].n_subs;
     }
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 6);
-    ray_t* vals = ray_list_new(6);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 9);
+    ray_t* vals = ray_list_new(9);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
         if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
         if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
@@ -376,6 +376,21 @@ ray_t* ray_mcast_stats(ray_poll_t* poll) {
     k = ray_sym_intern("framed", 6);      keys = ray_vec_append(keys, &k);
     if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
     v = ray_i64(mc ? mc->framed : 0);     vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    /* Backlog policy in force and the largest backlog seen (#486). */
+    int64_t lim_bytes = 0, lim_frames = 0;
+    ray_ipc_tx_limit_get(&lim_bytes, &lim_frames);
+    k = ray_sym_intern("tx_limit_bytes", 14); keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(lim_bytes);               vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    k = ray_sym_intern("tx_limit_frames", 15); keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(lim_frames);              vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    k = ray_sym_intern("tx_hwm_bytes", 12); keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(ray_ipc_tx_hwm_bytes(poll)); vals = ray_list_append(vals, v); ray_release(v);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     return ray_dict_new(keys, vals);
 }

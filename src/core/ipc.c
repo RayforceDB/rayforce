@@ -167,7 +167,12 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 #define RAY_IPC_PHASE_HEADER    1
 #define RAY_IPC_PHASE_PAYLOAD   2
 #define RAY_IPC_PHASE_CREDS     3
-#define RAY_IPC_TX_MAX_BYTES    (256LL * 1024LL * 1024LL)
+/* Hard cap on a single wire frame; the backlog a connection may hold is
+ * the separately configurable transmit limit (ray_ipc_tx_limit_set). */
+#define RAY_IPC_FRAME_MAX_BYTES (256LL * 1024LL * 1024LL)
+
+static int64_t g_tx_limit_bytes  = RAY_IPC_TX_DEFAULT_BYTES;
+static int64_t g_tx_limit_frames = 0;   /* unlimited */
 
 /* Constant-time comparison — prevents timing side-channel on password. */
 static bool ct_eq(const void* a, const void* b, size_t len) {
@@ -1606,7 +1611,7 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
     };
 
     size_t total = sizeof(hdr) + send_len;
-    if (total > (size_t)RAY_IPC_TX_MAX_BYTES) {
+    if (total > (size_t)RAY_IPC_FRAME_MAX_BYTES) {
         ray_sys_free(send_buf);
         if (payload) ray_sys_free(payload);
         if (err_out) *err_out = RAY_ERR_IO;
@@ -1915,32 +1920,48 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
     return rc;
 }
 
-static int64_t conn_tx_pending(ray_selector_t* sel)
+static void conn_tx_limits(ray_selector_t* sel, int64_t* bytes, int64_t* frames)
 {
-    int64_t pending = 0;
+    *bytes  = (sel && sel->tx.limit_bytes  > 0) ? sel->tx.limit_bytes  : g_tx_limit_bytes;
+    *frames = (sel && sel->tx.limit_frames > 0) ? sel->tx.limit_frames : g_tx_limit_frames;
+}
+
+/* Bytes still to be written across the queue, and the number of queued
+ * frames.  Saturates at INT64_MAX rather than overflowing. */
+static int64_t conn_tx_pending(ray_selector_t* sel, int64_t* frames_out)
+{
+    int64_t pending = 0, frames = 0;
     for (ray_poll_buf_t* b = sel ? sel->tx.buf : NULL; b; b = b->next) {
         if (b->size > b->offset) {
             int64_t rem = b->size - b->offset;
-            if (pending > RAY_IPC_TX_MAX_BYTES - rem)
-                return RAY_IPC_TX_MAX_BYTES + 1;
-            pending += rem;
+            pending = (pending > INT64_MAX - rem) ? INT64_MAX : pending + rem;
+            frames++;
         }
     }
+    if (frames_out) *frames_out = frames;
     return pending;
 }
 
-static int conn_tx_append(ray_selector_t* sel, ray_poll_buf_t* frame)
+/* Admit `frame` to the queue if the configured backlog allows it. */
+static int conn_tx_append(ray_poll_t* poll, ray_selector_t* sel, ray_poll_buf_t* frame)
 {
     if (!sel || !frame || frame->offset > frame->size) return -1;
 
     int64_t add = frame->size - frame->offset;
-    int64_t pending = conn_tx_pending(sel);
-    if (add < 0 || pending < 0 || pending > RAY_IPC_TX_MAX_BYTES - add)
-        return -1;
+    int64_t limit_bytes, limit_frames;
+    conn_tx_limits(sel, &limit_bytes, &limit_frames);
+    int64_t frames = 0;
+    int64_t pending = conn_tx_pending(sel, &frames);
+    if (add < 0 || pending > limit_bytes - add) return -1;
+    if (limit_frames > 0 && frames + 1 > limit_frames) return -1;
 
     ray_poll_buf_t** tail = &sel->tx.buf;
     while (*tail) tail = &(*tail)->next;
     *tail = frame;
+
+    int64_t now = pending + add;
+    if (now > sel->tx.hwm_bytes) sel->tx.hwm_bytes = now;
+    if (poll && now > poll->tx_hwm_bytes) poll->tx_hwm_bytes = now;
     return 0;
 }
 
@@ -2006,7 +2027,7 @@ ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame)
     if (rc == 0) {
         ray_poll_buf_free(node);
     } else if (rc > 0) {
-        if (conn_tx_append(sel, node) < 0) {
+        if (conn_tx_append(poll, sel, node) < 0) {
             ray_poll_buf_free(node);
             return RAY_ERR_IO;
         }
@@ -2015,6 +2036,48 @@ ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame)
         ray_poll_buf_free(node);
     }
     return rc >= 0 ? RAY_OK : RAY_ERR_IO;
+}
+
+void ray_ipc_tx_limit_get(int64_t* bytes, int64_t* frames)
+{
+    if (bytes)  *bytes  = g_tx_limit_bytes;
+    if (frames) *frames = g_tx_limit_frames;
+}
+
+ray_err_t ray_ipc_tx_limit_set(int64_t bytes, int64_t frames)
+{
+    if (bytes < RAY_IPC_TX_MIN_BYTES || frames < 0) return RAY_ERR_DOMAIN;
+    g_tx_limit_bytes  = bytes;
+    g_tx_limit_frames = frames;
+    return RAY_OK;
+}
+
+ray_err_t ray_ipc_tx_limit_set_handle(int64_t handle, int64_t bytes, int64_t frames)
+{
+    if (bytes < RAY_IPC_TX_MIN_BYTES || frames < 0) return RAY_ERR_DOMAIN;
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    if (!sel) return RAY_ERR_IO;
+    sel->tx.limit_bytes  = bytes;
+    sel->tx.limit_frames = frames;
+    return RAY_OK;
+}
+
+ray_err_t ray_ipc_tx_info(int64_t handle, ray_ipc_tx_info_t* out)
+{
+    if (!out) return RAY_ERR_TYPE;
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    if (!sel) return RAY_ERR_IO;
+    conn_tx_limits(sel, &out->limit_bytes, &out->limit_frames);
+    out->queued_bytes = conn_tx_pending(sel, &out->queued_frames);
+    out->hwm_bytes    = sel->tx.hwm_bytes;
+    return RAY_OK;
+}
+
+int64_t ray_ipc_tx_hwm_bytes(ray_poll_t* poll)
+{
+    return poll ? poll->tx_hwm_bytes : 0;
 }
 
 ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)

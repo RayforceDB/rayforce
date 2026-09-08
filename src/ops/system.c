@@ -1518,9 +1518,100 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg) {
  * hook, or -1 outside any hook.  Registered variadic so both
  * `(.ipc.handle)` (no args) and `(.ipc.handle 0)` (one arg, ignored)
  * work — matches the convention of `.sys.gc` / `.sys.info`. */
+/* Build {handle limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
+ * for a live connection. */
+static ray_t* ipc_tx_info_dict(int64_t h, const ray_ipc_tx_info_t* ti) {
+    static const char* const names[6] = { "handle", "limit_bytes", "limit_frames",
+                                          "queued_bytes", "queued_frames", "hwm_bytes" };
+    int64_t vals_i[6] = { h, ti->limit_bytes, ti->limit_frames,
+                          ti->queued_bytes, ti->queued_frames, ti->hwm_bytes };
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 6);
+    ray_t* vals = ray_list_new(6);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    for (int i = 0; i < 6; i++) {
+        int64_t k = ray_sym_intern(names[i], strlen(names[i]));
+        keys = ray_vec_append(keys, &k);
+        if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+        ray_t* v = make_i64(vals_i[i]);
+        vals = ray_list_append(vals, v); ray_release(v);
+        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    }
+    return ray_dict_new(keys, vals);
+}
+
+static bool ipc_arg_i64(ray_t* x, int64_t* out) {
+    if (!x || !ray_is_atom(x)) return false;
+    if (x->type == -RAY_I64) { *out = x->i64; return true; }
+    if (x->type == -RAY_I32) { *out = x->i32; return true; }
+    return false;
+}
+
+/* `(.ipc.handle)` (no args) and `(.ipc.handle 0)` (one arg, ignored)
+ * answer the current connection's handle, -1 outside a hook.  Given a
+ * LIVE connection handle, `(.ipc.handle h)` instead returns that
+ * connection's transmit-queue view (#486): its effective backlog limits,
+ * the bytes and frames queued right now, and its high-water mark. */
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    int64_t h;
+    if (n == 1 && ipc_arg_i64(args[0], &h)) {
+        ray_ipc_tx_info_t ti;
+        if (ray_ipc_tx_info(h, &ti) == RAY_OK) return ipc_tx_info_dict(h, &ti);
+    }
     return make_i64(ray_ipc_current_handle());
+}
+
+static ray_t* ipc_txlimit_dict(int64_t bytes, int64_t frames) {
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
+    ray_t* vals = ray_list_new(2);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    int64_t k = ray_sym_intern("bytes", 5);  keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    k = ray_sym_intern("frames", 6);         keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    ray_t* v = make_i64(bytes);  vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    v = make_i64(frames);        vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    return ray_dict_new(keys, vals);
+}
+
+/* (.ipc.txlimit)                 -> {bytes frames}: the process default
+ * (.ipc.txlimit bytes [frames])  -> set the default; frames 0 = unlimited
+ * (.ipc.txlimit h bytes frames)  -> override one live connection
+ * Every form answers with the limits now in force for its target. */
+ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n) {
+    if (n > 3) return ray_error("rank", ".ipc.txlimit takes 0 to 3 arguments, got %lld", (long long)n);
+    int64_t a[3] = {0, 0, 0};
+    for (int64_t i = 0; i < n; i++)
+        if (!ipc_arg_i64(args[i], &a[i]))
+            return ray_error("type", ".ipc.txlimit expects integer arguments, got %s", ray_type_name(args[i]->type));
+    int64_t bytes, frames;
+    if (n == 0) {
+        ray_ipc_tx_limit_get(&bytes, &frames);
+        return ipc_txlimit_dict(bytes, frames);
+    }
+    if (n == 3) {
+        ray_err_t rc = ray_ipc_tx_limit_set_handle(a[0], a[1], a[2]);
+        if (rc == RAY_ERR_DOMAIN)
+            return ray_error("domain", ".ipc.txlimit: bytes must be >= %lld and frames >= 0", (long long)RAY_IPC_TX_MIN_BYTES);
+        if (rc != RAY_OK)
+            return ray_error("domain", ".ipc.txlimit: %lld is not a live connection handle", (long long)a[0]);
+        return ipc_txlimit_dict(a[1], a[2]);
+    }
+    ray_ipc_tx_limit_get(&bytes, &frames);
+    bytes = a[0];
+    if (n == 2) frames = a[1];
+    if (ray_ipc_tx_limit_set(bytes, frames) != RAY_OK)
+        return ray_error("domain", ".ipc.txlimit: bytes must be >= %lld and frames >= 0", (long long)RAY_IPC_TX_MIN_BYTES);
+    return ipc_txlimit_dict(bytes, frames);
 }
 
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n) {

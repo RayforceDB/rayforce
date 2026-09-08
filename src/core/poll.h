@@ -79,7 +79,13 @@ struct ray_selector {
     ray_event_fn     error_fn;
     ray_poll_data_fn      data_fn;
     struct { ray_poll_buf_t* buf; ray_io_fn recv_fn; ray_read_fn read_fn; } rx;
-    struct { ray_poll_buf_t* buf; ray_io_fn send_fn; }                      tx;
+    struct {
+        ray_poll_buf_t* buf;
+        ray_io_fn       send_fn;
+        int64_t         limit_bytes;   /* per-connection backlog override; 0 = process default */
+        int64_t         limit_frames;  /* idem; 0 = process default (which may be unlimited) */
+        int64_t         hwm_bytes;     /* largest backlog ever queued on this connection */
+    } tx;
 };
 
 /* ===== Registration ===== */
@@ -115,6 +121,7 @@ struct ray_poll {
     bool             restricted;       /* true if -U (read-only IPC mode) */
     void*            timers;           /* opaque ray_timers_t*; lazily allocated */
     void*            mcast;            /* opaque ray_mcast_t*; lazily allocated */
+    int64_t          tx_hwm_bytes;     /* largest backlog ever queued on any connection */
 };
 
 /* ===== API ===== */

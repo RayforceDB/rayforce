@@ -3400,6 +3400,9 @@ static void ray_register_builtins(void) {
     /* Current connection handle inside any `.ipc.on.*` hook, -1 otherwise.
      * Variadic for the `(.ipc.handle)` / `(.ipc.handle 0)` convention. */
     register_vary(  ".ipc.handle", RAY_FN_NONE,       ray_ipc_handle_fn);
+    /* Transmit backlog policy: read, set the process default, or override
+     * one connection.  Privileged — it decides when a peer is dropped. */
+    register_vary(  ".ipc.txlimit", RAY_FN_RESTRICTED, ray_ipc_txlimit_fn);
 
     /* Multicast/pub-sub over IPC.  Subscriptions are allowed under
      * restricted IPC; publishing stays privileged. */

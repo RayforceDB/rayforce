@@ -764,6 +764,136 @@ static test_result_t test_mcast_shared_frame_across_subscribers(void) {
     PASS();
 }
 
+/* Configurable transmit backlog (#486): a subscriber whose queue would
+ * exceed the process default is dropped and closed at admission, while a
+ * subscriber with a per-connection override large enough to hold the
+ * frame keeps receiving.  The active limits and the high-water mark are
+ * readable from .mc.stats and per handle from (.ipc.handle h). */
+static test_result_t test_mcast_txlimit_overflow_disconnects(void) {
+    ray_t* r = ray_eval_str(
+        "(set _mc_count 0)"
+        "(set _mc_close_count 0)"
+        "(set _mc_handles [])"
+        "(set upd (fn [topic seq payload] (set _mc_count (+ _mc_count 1))))"
+        "(set .ipc.on.open (fn [h] (set _mc_handles (concat _mc_handles h))))"
+        "(set .ipc.on.close (fn [h] (set _mc_close_count (+ _mc_close_count 1))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t hp = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0), "h1 connected");
+    TEST_ASSERT((h2) >= (0), "h2 connected");
+    TEST_ASSERT((hp) >= (0), "publisher connected");
+    for (int i = 0; i < 2; i++) {
+        ray_t* msg = ray_str("(.mc.sub \"cap\" null)", strlen("(.mc.sub \"cap\" null)"));
+        ray_t* sub = ray_ipc_send(i == 0 ? h1 : h2, msg);
+        ray_release(msg);
+        TEST_ASSERT_NOT_NULL(sub);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+        ray_release(sub);
+    }
+
+    ray_t* server_hs = ray_env_get(ray_sym_intern("_mc_handles", 11));
+    TEST_ASSERT_NOT_NULL(server_hs);
+    TEST_ASSERT((ray_len(server_hs)) >= (2), "two server-side subscriber handles");
+    int64_t s1 = ((int64_t*)ray_data(server_hs))[0];
+    int64_t s2 = ((int64_t*)ray_data(server_hs))[1];
+#ifndef RAY_OS_WINDOWS
+    for (int i = 0; i < 2; i++) {
+        ray_selector_t* ssel = ray_poll_get(poll, i == 0 ? s1 : s2);
+        TEST_ASSERT_NOT_NULL(ssel);
+        int sndbuf = 4096;
+        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+#endif
+
+    /* Process default: 64 KiB.  h2 alone may hold 4 MiB. */
+    ray_t* msg = ray_str("(.ipc.txlimit 65536 0)", strlen("(.ipc.txlimit 65536 0)"));
+    ray_t* lim = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(lim);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lim));
+    TEST_ASSERT_EQ_I(dict_i64(lim, "bytes"), 65536);
+    TEST_ASSERT_EQ_I(dict_i64(lim, "frames"), 0);
+    ray_release(lim);
+    char src[96];
+    int n = snprintf(src, sizeof(src), "(.ipc.txlimit %lld 4194304 0)", (long long)s2);
+    TEST_ASSERT((n) > (0) && (size_t)n < sizeof(src), "format override");
+    msg = ray_str(src, (size_t)n);
+    lim = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(lim);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lim));
+    TEST_ASSERT_EQ_I(dict_i64(lim, "bytes"), 4194304);
+    ray_release(lim);
+
+    /* ~800 KiB on the wire: over h1's 64 KiB, under h2's 4 MiB. */
+    const char* pub_src = "(.mc.pub \"cap\" (+ (* (til 100000) 1103515245) 12345))";
+    msg = ray_str(pub_src, strlen(pub_src));
+    ray_t* pub = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(pub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pub));
+    ray_release(pub);
+
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_count", 9, 1, 2000));
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_close_count", 15, 1, 2000));
+    ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->i64, 1);              /* only h2 received it */
+
+    msg = ray_str("(.mc.stats)", strlen("(.mc.stats)"));
+    ray_t* st = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(st));
+    TEST_ASSERT_EQ_I(dict_i64(st, "subscriptions"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "delivered"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "dropped"), 1);
+    TEST_ASSERT_EQ_I(dict_i64(st, "tx_limit_bytes"), 65536);
+    TEST_ASSERT_EQ_I(dict_i64(st, "tx_limit_frames"), 0);
+    TEST_ASSERT((dict_i64(st, "tx_hwm_bytes")) > (65536), "the override let a larger backlog form");
+    TEST_ASSERT((dict_i64(st, "tx_hwm_bytes")) <= (4194304), "never past the override");
+    ray_release(st);
+
+    n = snprintf(src, sizeof(src), "(.ipc.handle %lld)", (long long)s2);
+    msg = ray_str(src, (size_t)n);
+    ray_t* info = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(info);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    TEST_ASSERT_EQ_I(dict_i64(info, "handle"), s2);
+    TEST_ASSERT_EQ_I(dict_i64(info, "limit_bytes"), 4194304);
+    TEST_ASSERT_EQ_I(dict_i64(info, "limit_frames"), 0);
+    TEST_ASSERT((dict_i64(info, "hwm_bytes")) > (65536), "per-handle high-water mark");
+    TEST_ASSERT((dict_i64(info, "queued_bytes")) >= (0), "queue drained or draining");
+    ray_release(info);
+
+    /* Restore the process default so later tests see the built-in limit. */
+    msg = ray_str("(.ipc.txlimit 268435456 0)", strlen("(.ipc.txlimit 268435456 0)"));
+    lim = ray_ipc_send(hp, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(lim);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lim));
+    ray_release(lim);
+
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    ray_ipc_close(hp);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 static test_result_t test_mcast_failed_send_defers_close(void) {
     ray_t* r = ray_eval_str(
         "(set _mc_count 0)"
@@ -975,5 +1105,6 @@ const test_entry_t mcast_entries[] = {
     { "mcast/sync_reply_after_queued",    test_mcast_sync_reply_after_queued_frame, mcast_setup, mcast_teardown },
     { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
     { "mcast/shared_frame_across_subs",   test_mcast_shared_frame_across_subscribers, mcast_setup, mcast_teardown },
+    { "mcast/txlimit_overflow_disconnects", test_mcast_txlimit_overflow_disconnects, mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };
