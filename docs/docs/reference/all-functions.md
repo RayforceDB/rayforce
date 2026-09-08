@@ -585,7 +585,7 @@ Type checking, casting, null testing, and object inspection.
 |---|---|---|---|---|
 | `type` | unary | — | Get the type name of a value | `(type 42)` → `i64` |
 | `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
-| `nil?` | unary | DAG in queries | Test if value is null; element-wise in query expressions | `(nil? 0Ni)` → `true` |
+| `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 

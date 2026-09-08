@@ -1,0 +1,53 @@
+;; nil_elementwise.rfl — `nil?` is element-wise over vectors and lists
+;; everywhere, not only inside queries (#485).
+;;
+;; Before: outside a query `nil?` tested whether the argument OBJECT was
+;; null, so `(nil? [1 0N 3])` was `false` while `(select {n: (nil? v)})`
+;; gave one bool per row.  Now a vector or list argument yields a BOOL
+;; vector, one entry per element, agreeing with the query opcode.  Atoms
+;; and the null object answer as before.
+
+;; ── atoms and the null object: unchanged ──
+(nil? 0Nl) -- true
+(nil? 1) -- false
+(nil? 0Nf) -- true
+(nil? 1.5) -- false
+(nil? ') -- true
+(nil? 'a) -- false
+(nil? "") -- true
+(nil? "x") -- false
+(nil? null) -- true
+
+;; ── typed vectors: one bool per element, B8 result ──
+(nil? [1 0N 3]) -- [false true false]
+(type (nil? [1 0N 3])) -- 'B8
+(nil? [1.5 0Nf 2.5]) -- [false true false]
+(nil? [1i 0Ni]) -- [false true]
+(nil? [2024.01.01 0Nd]) -- [false true]
+(nil? [2000.01.01D00:00:00.000000001 0Np]) -- [false true]
+(nil? [a ' b]) -- [false true false]
+(nil? (list "x" "" "y")) -- [false true false]
+(nil? [true false]) -- [false false]
+(nil? [1 2 3]) -- [false false false]
+(nil? (as 'I64 [])) -- (as 'B8 [])
+;; sentinel is the truth, whatever the HAS_NULLS hint says
+(nil? (concat [1 0N] [0N 2])) -- [false true true false]
+
+;; ── boxed lists: null atoms are null, anything else is not ──
+(nil? (list 1 0N "x" [1 2])) -- [false true false false]
+(nil? (list (list 0N))) -- [false]
+(nil? (list)) -- (as 'B8 [])
+
+;; ── the result composes without a cast ──
+(where (nil? [1 0N 3 0N])) -- [1 3]
+(count (where (nil? [0N 0N 1]))) -- 2
+(sum (as 'I64 (nil? [1 0N 3]))) -- 1
+
+;; ── containers other than vectors and lists are whole objects, as before ──
+(nil? (table [a] (list [1]))) -- false
+(nil? (dict ['a] [1])) -- false
+
+;; ── the query path answers the same ──
+(set t (table [v] (list [1 0N 3])))
+(at (select {n: (nil? v) from: t}) 'n) -- (nil? (at t 'v))
+(count (select {from: t where: (nil? v)})) -- 1

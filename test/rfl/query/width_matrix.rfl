@@ -1041,7 +1041,8 @@
 ;; reflect how the vector's own consumers (sum, the DA accumulator)
 ;; treat it: they gate on the VECTOR's HAS_NULLS attribute first, which
 ;; is correctly unset here.
-(nil? wm5_va) -- false
+;; (element-wise since #485: no element is null)
+(nil? wm5_va) -- [false false false false]
 (sum wm5_va) -- -2147483518
 (at wm5_va 1) -- 100
 (set wm5_vf [7i 7i 3i 3i])

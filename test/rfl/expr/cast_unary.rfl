@@ -76,9 +76,9 @@
 
 ;; ===================================================================
 ;; ISNULL over I64 vec (exec_elementwise_unary lines 1320-1327)
-;; Non-null vec: result is all false
+;; Non-null vec: result is all false — one bool per element (#485)
 ;; ===================================================================
-(nil? (til 5))   -- false
+(nil? (til 5))   -- [false false false false false]
 (map nil? (til 3)) -- [false false false]
 
 ;; ISNULL on nullable vector detects null positions
