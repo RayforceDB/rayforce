@@ -39,6 +39,8 @@ false       ; boolean false
 
 Symbols are interned identifiers used for column names, dictionary keys, and categorical data. Prefix with a single quote to create a literal symbol.
 
+A symbol literal runs over letters, digits, `_`, `.` and `-`. A symbol, keyword, name or number cannot be directly followed by a quote, a colon, or another name or number character: `['a:1]` is a parse error rather than the two symbols `a` and `1`, and `0Na` is not `0` followed by `Na`. A symbol that must contain a colon is built from a string, `(as 'symbol "a:1")`.
+
 ```lisp
 'AAPL       ; symbol atom
 'price      ; used as column reference
