@@ -1,0 +1,22 @@
+;; ipc_txlimit.rfl — the per-connection transmit backlog is configurable
+;; at runtime (#486).  (.ipc.txlimit) reads the process default,
+;; (.ipc.txlimit bytes [frames]) sets it, (.ipc.txlimit h bytes frames)
+;; overrides one live connection.  The overflow behaviour itself is
+;; exercised with real sockets in test/test_mcast.c.
+(at (.ipc.txlimit) 'bytes) -- 268435456
+(at (.ipc.txlimit) 'frames) -- 0
+(at (.ipc.txlimit 1048576) 'bytes) -- 1048576
+(at (.ipc.txlimit 1048576) 'frames) -- 0
+(at (.ipc.txlimit 2097152 8) 'frames) -- 8
+(at (.ipc.txlimit) 'bytes) -- 2097152
+;; bounds: at least one 4 KiB frame, frames >= 0 (0 = unlimited)
+(.ipc.txlimit 0) !- domain
+(.ipc.txlimit 1024) !- domain
+(.ipc.txlimit 65536 -1) !- domain
+(.ipc.txlimit "x") !- type
+(.ipc.txlimit 1 2 3 4) !- rank
+;; a per-connection override needs a live connection handle
+(.ipc.txlimit 12345 65536 0) !- domain
+(.ipc.handle 12345) -- -1
+;; restore the built-in default
+(at (.ipc.txlimit 268435456 0) 'bytes) -- 268435456

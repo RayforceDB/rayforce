@@ -27,8 +27,8 @@
 ;; getenv, setenv
 (count .fs) -- 2
 ;; size, list
-(count .ipc) -- 5
-;; open, close, send, post, handle
+(count .ipc) -- 6
+;; open, close, send, post, handle, txlimit
 (count .csv) -- 4
 ;; read, splayed, parted, write
 ;; .db.* — three-level reserved namespace for storage I/O.  The
