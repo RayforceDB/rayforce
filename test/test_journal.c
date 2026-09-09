@@ -1164,6 +1164,36 @@ static test_result_t test_journal_snapshot_empty_env(void) {
     PASS();
 }
 
+/* 7e. Snapshot restores user-defined functions without binding errors. */
+static test_result_t test_journal_snapshot_function_binding_recovers(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_fn");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str("(set jrn_snap_fn (fn [x] (+ x 1)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    int64_t sym = ray_sym_intern("jrn_snap_fn", 11);
+    ray_t* zero = ray_i64(0);
+    TEST_ASSERT_NOT_NULL(zero);
+    TEST_ASSERT_EQ_I(ray_env_set(sym, zero), RAY_OK);
+    ray_release(zero);
+
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    ray_t* val = ray_eval_str("(jrn_snap_fn 41)");
+    TEST_ASSERT_NOT_NULL(val);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(val));
+    TEST_ASSERT_EQ_I(val->i64, 42);
+    ray_release(val);
+
+    cleanup_base(base);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  8. is_open
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -2369,6 +2399,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_basic",            test_journal_snapshot_basic,            jrn_setup, jrn_teardown },
     { "journal/open_with_qdb",             test_journal_open_with_qdb,             jrn_setup, jrn_teardown },
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
+    { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */
