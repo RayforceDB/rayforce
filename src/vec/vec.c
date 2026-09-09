@@ -435,7 +435,13 @@ ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len) {
     if (!s || RAY_IS_ERR(s)) return s;
 
     s->type = parent->type;
-    s->attrs = RAY_ATTR_SLICE | (parent->attrs & RAY_SYM_W_MASK);
+    /* A slice inherits the parent's HAS_NULLS hint: it is a window onto
+     * the same sentinel-encoded payload, and every fast-path gate that
+     * reads the bit (aggregates, raze, the morsel null bitmap, the save
+     * path) would otherwise read a window with nulls as null-free and
+     * fold the sentinel in as a value (#495).  Over-approximation when
+     * the window happens to hold no null is the bit's documented role. */
+    s->attrs = RAY_ATTR_SLICE | (parent->attrs & (RAY_SYM_W_MASK | RAY_ATTR_HAS_NULLS));
     s->len = len;
     s->slice_parent = parent;
     s->slice_offset = parent_offset;

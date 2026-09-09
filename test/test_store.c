@@ -73,6 +73,48 @@ static void store_teardown(void) {
     ray_heap_destroy();
 }
 
+/* ---- test_col_save_derives_has_nulls ----------------------------------- */
+
+/* The on-disk HAS_NULLS bit is load-bearing and nothing rescans on load,
+ * so the save path derives it from the payload (#495): a column whose
+ * producer left the bit clear while writing a sentinel is persisted with
+ * the bit set, on both the read and the mmap loader. */
+static test_result_t test_col_save_derives_has_nulls(void) {
+    int64_t raw[] = {1, NULL_I64, 3};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;   /* the forgetful producer */
+
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_TRUE((loaded->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE(ray_vec_is_null(loaded, 1));
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_TRUE((mapped->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE(ray_vec_is_null(mapped, 1));
+    ray_release(mapped);
+
+    /* A null-free column stays null-free: the scan only ever sets. */
+    int64_t clean[] = {1, 2, 3};
+    ray_t* cvec = ray_vec_from_raw(RAY_I64, clean, 3);
+    TEST_ASSERT_EQ_I(ray_col_save(cvec, TMP_COL_PATH), RAY_OK);
+    ray_t* cl = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(cl);
+    TEST_ASSERT_TRUE((cl->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    ray_release(cl);
+    ray_release(cvec);
+    ray_release(vec);
+    PASS();
+}
+
 /* ---- test_col_mmap_i64 ------------------------------------------------- */
 
 static test_result_t test_col_mmap_i64(void) {
@@ -5479,6 +5521,7 @@ static test_result_t test_col_save_nyi_type(void) {
 
 const test_entry_t store_entries[] = {
     { "store/col_mmap_i64", test_col_mmap_i64, store_setup, store_teardown },
+    { "store/col_save_derives_has_nulls", test_col_save_derives_has_nulls, store_setup, store_teardown },
     { "store/col_mmap_f64", test_col_mmap_f64, store_setup, store_teardown },
     { "store/col_mmap_f32", test_col_mmap_f32, store_setup, store_teardown },
     { "store/col_mmap_cow", test_col_mmap_cow, store_setup, store_teardown },

@@ -33,6 +33,7 @@ struct ray_mcast {
     int64_t published;
     int64_t delivered;
     int64_t dropped;
+    int64_t framed;      /* wire frames built: one per publication, not per subscriber */
 };
 
 static int64_t topic_sym(ray_t* topic) {
@@ -292,11 +293,23 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
         }
     }
 
+    /* Serialize and compress once; every subscriber's queue shares the
+     * frame and keeps only its own write offset (#487). */
+    ray_poll_frame_t* frame = NULL;
+    ray_err_t ferr = ray_ipc_frame_async(msg, &frame);
+    ray_release(msg);
+    if (ferr != RAY_OK || !frame) {
+        if (dead_handles) ray_sys_free(dead_handles);
+        return ferr == RAY_ERR_OOM ? ray_error("oom", NULL)
+                                   : ray_error("io", ".mc.pub could not frame the payload");
+    }
+    mc->framed++;
+
     t->next_seq++;
     mc->published++;
 
     for (int32_t i = 0; i < t->n_subs;) {
-        ray_err_t rc = ray_ipc_try_send_async(t->subs[i].handle, msg);
+        ray_err_t rc = ray_ipc_try_send_frame(t->subs[i].handle, frame);
         if (rc == RAY_OK) {
             t->subs[i].last_sent_seq = seq;
             mc->delivered++;
@@ -309,7 +322,7 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
             dead_handles[dead_n++] = dead;
         }
     }
-    ray_release(msg);
+    ray_poll_frame_release(frame);
     if (t->n_subs == 0) {
         int32_t ti = topic_index(mc, sym);
         if (ti >= 0) remove_topic(mc, ti);
@@ -330,8 +343,8 @@ ray_t* ray_mcast_stats(ray_poll_t* poll) {
             subs += mc->topics[i].n_subs;
     }
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
-    ray_t* vals = ray_list_new(5);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 9);
+    ray_t* vals = ray_list_new(9);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
         if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
         if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
@@ -359,6 +372,25 @@ ray_t* ray_mcast_stats(ray_poll_t* poll) {
     k = ray_sym_intern("dropped", 7);     keys = ray_vec_append(keys, &k);
     if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
     v = ray_i64(mc ? mc->dropped : 0);    vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    k = ray_sym_intern("framed", 6);      keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(mc ? mc->framed : 0);     vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    /* Backlog policy in force and the largest backlog seen (#486). */
+    int64_t lim_bytes = 0, lim_frames = 0;
+    ray_ipc_tx_limit_get(&lim_bytes, &lim_frames);
+    k = ray_sym_intern("tx_limit_bytes", 14); keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(lim_bytes);               vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    k = ray_sym_intern("tx_limit_frames", 15); keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(lim_frames);              vals = ray_list_append(vals, v); ray_release(v);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    k = ray_sym_intern("tx_hwm_bytes", 12); keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+    v = ray_i64(ray_ipc_tx_hwm_bytes(poll)); vals = ray_list_append(vals, v); ray_release(v);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     return ray_dict_new(keys, vals);
 }

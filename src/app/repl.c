@@ -32,6 +32,7 @@
 #include "app/term.h"
 #include "core/ipc.h"
 #include "core/poll.h"
+#include "core/timer.h"
 #include "core/pool.h"
 #include "lang/env.h"
 #include "lang/eval.h"
@@ -58,6 +59,7 @@
 #define STDIN_FD 0
 #else
 #include <unistd.h>
+#include <errno.h>
 #include <sys/ioctl.h>
 #define STDIN_FD STDIN_FILENO
 #endif
@@ -1180,13 +1182,111 @@ static int32_t count_unmatched(const char* s, size_t len) {
     return d > 0 ? d : 0;
 }
 
+/* ── Piped stdin, read through the poll loop ──────────────────────────
+ * fgets() on a pipe blocks outside the poll loop, so while a producer
+ * held the pipe open nothing else ran: no timer fired, no IPC request
+ * was served, until the writer closed (#493).  The piped REPL now reads
+ * stdin through a small line reader: when it needs bytes and a poll
+ * exists, stdin is a registered selector whose read_fn pumps the pipe
+ * into the reader's buffer, and the reader waits in bounded poll passes
+ * — which fire due timers and serve every other selector.  Without a
+ * poll it reads directly, as before. */
+typedef struct {
+    ray_repl_t* repl;
+    char        buf[PIPE_BUF_SIZE * 2];
+    size_t      head, tail;
+    bool        eof;
+    int64_t     sel_id;          /* -1 once deregistered (EOF) or never registered */
+} pipe_rd_t;
+
+static ray_t* piped_pump(ray_poll_t* poll, ray_selector_t* sel) {
+    pipe_rd_t* rd = (pipe_rd_t*)sel->data;
+    if (rd->tail >= sizeof(rd->buf)) return NULL;   /* consumer drains first */
+    ssize_t n = read(STDIN_FD, rd->buf + rd->tail, sizeof(rd->buf) - rd->tail);
+    if (n > 0) { rd->tail += (size_t)n; return NULL; }
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return NULL;
+    rd->eof = true;
+    ray_poll_deregister(poll, sel->id);      /* close_fn clears sel_id */
+    return NULL;
+}
+
+/* The poller deregisters a selector on hangup after serving its last
+ * readable event, without another read_fn call — a pipe's data and its
+ * hangup arrive in one event.  Mark the reader so it stops waiting on
+ * the poll and drains whatever the pipe still holds with direct reads
+ * (which never block once the writer is gone). */
+static void piped_closed(ray_poll_t* poll, ray_selector_t* sel) {
+    (void)poll;
+    pipe_rd_t* rd = (pipe_rd_t*)sel->data;
+    if (rd) rd->sel_id = -1;
+}
+
+/* fgets semantics over the reader: returns `line` holding up to size-1
+ * bytes including a trailing newline when one was seen, or NULL at EOF
+ * with nothing left.  A line longer than size-1 comes back in pieces,
+ * exactly as fgets hands it out. */
+static char* piped_fgets(pipe_rd_t* rd, char* line, size_t size) {
+    for (;;) {
+        size_t avail = rd->tail - rd->head;
+        size_t maxn  = size - 1 < avail ? size - 1 : avail;
+        char* nl = maxn ? memchr(rd->buf + rd->head, '\n', maxn) : NULL;
+        if (nl) {
+            size_t n = (size_t)(nl - (rd->buf + rd->head)) + 1;
+            memcpy(line, rd->buf + rd->head, n); line[n] = '\0';
+            rd->head += n;
+            return line;
+        }
+        if (avail >= size - 1) {
+            memcpy(line, rd->buf + rd->head, size - 1); line[size - 1] = '\0';
+            rd->head += size - 1;
+            return line;
+        }
+        if (rd->eof) {
+            if (avail == 0) return NULL;
+            memcpy(line, rd->buf + rd->head, avail); line[avail] = '\0';
+            rd->head = rd->tail;
+            return line;
+        }
+        if (rd->head > 0) {                      /* compact, then refill */
+            memmove(rd->buf, rd->buf + rd->head, avail);
+            rd->head = 0; rd->tail = avail;
+        }
+        ray_poll_t* poll = rd->repl ? rd->repl->poll : NULL;
+        if (poll && rd->sel_id >= 0) {
+            if (ray_poll_run_for(poll, 1000) < 0 || poll->code >= 0) {
+                /* The loop was told to exit (an IPC hook, a callback):
+                 * stop reading, let run_piped wind down. */
+                rd->eof = true;
+            }
+        } else {
+            ssize_t n = read(STDIN_FD, rd->buf + rd->tail, sizeof(rd->buf) - rd->tail);
+            if (n > 0) rd->tail += (size_t)n;
+            else if (n < 0 && errno == EINTR) continue;
+            else rd->eof = true;
+        }
+    }
+}
+
 static void run_piped(ray_repl_t* repl) {
     char line[PIPE_BUF_SIZE];
     char accum[PIPE_BUF_SIZE];
     size_t accum_len = 0;
     bool mid_line = false;
 
-    while (fgets(line, PIPE_BUF_SIZE, stdin)) {
+    pipe_rd_t rd = { .repl = repl, .head = 0, .tail = 0, .eof = false, .sel_id = -1 };
+    if (repl->poll) {
+        ray_poll_reg_t reg = {0};
+        reg.fd      = STDIN_FD;
+        reg.type    = RAY_SEL_STDIN;
+        reg.read_fn  = piped_pump;
+        reg.close_fn = piped_closed;
+        reg.data     = &rd;
+        rd.sel_id = ray_poll_register(repl->poll, &reg);
+        /* A registration failure (an fd the poller cannot watch) falls
+         * back to direct reads, exactly the old behaviour. */
+    }
+
+    while (piped_fgets(&rd, line, PIPE_BUF_SIZE)) {
         size_t len = strlen(line);
         bool had_newline = (len > 0 && line[len - 1] == '\n');
         if (had_newline) line[--len] = '\0';
@@ -1226,7 +1326,7 @@ static void run_piped(ray_repl_t* repl) {
             accum_len = 0;
             mid_line = false;
             while (!had_newline) {
-                if (!fgets(line, PIPE_BUF_SIZE, stdin)) break;
+                if (!piped_fgets(&rd, line, PIPE_BUF_SIZE)) break;
                 len = strlen(line);
                 had_newline = (len > 0 && line[len - 1] == '\n');
                 if (had_newline) {
@@ -1236,7 +1336,7 @@ static void run_piped(ray_repl_t* repl) {
                 depth += bracket_delta_s(line, len, &bs);
             }
             while (depth > 0) {
-                if (!fgets(line, PIPE_BUF_SIZE, stdin)) break;
+                if (!piped_fgets(&rd, line, PIPE_BUF_SIZE)) break;
                 len = strlen(line);
                 had_newline = (len > 0 && line[len - 1] == '\n');
                 if (had_newline) {
@@ -1245,7 +1345,7 @@ static void run_piped(ray_repl_t* repl) {
                 }
                 depth += bracket_delta_s(line, len, &bs);
                 while (!had_newline) {
-                    if (!fgets(line, PIPE_BUF_SIZE, stdin)) break;
+                    if (!piped_fgets(&rd, line, PIPE_BUF_SIZE)) break;
                     len = strlen(line);
                     had_newline = (len > 0 && line[len - 1] == '\n');
                     if (had_newline) {
@@ -1275,9 +1375,16 @@ static void run_piped(ray_repl_t* repl) {
         eval_and_print(NULL, accum, false, repl->timeit);
     }
 
-    /* If poll has registered selectors (IPC server), enter poll_run after stdin */
-    if (repl->poll && repl->poll->n_sels > 0)
-        ray_poll_run(repl->poll);
+    if (repl->poll) {
+        if (rd.sel_id >= 0) ray_poll_deregister(repl->poll, rd.sel_id);
+        /* After stdin: a listener or connections keep the process serving
+         * (as before, now counting live selectors rather than slots);
+         * with none, stay only until pending timers are spent. */
+        if (repl->poll->n_live > 0)
+            ray_poll_run(repl->poll);
+        else
+            ray_poll_drain_timers(repl->poll);
+    }
 }
 
 void ray_repl_run(ray_repl_t* repl) {

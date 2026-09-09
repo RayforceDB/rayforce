@@ -39,6 +39,8 @@ false       ; boolean false
 
 Symbols are interned identifiers used for column names, dictionary keys, and categorical data. Prefix with a single quote to create a literal symbol.
 
+A symbol literal runs over letters, digits, `_`, `.` and `-`. A symbol, keyword, name or number cannot be directly followed by a quote, a colon, or another name or number character: `['a:1]` is a parse error rather than the two symbols `a` and `1`, and `0Na` is not `0` followed by `Na`. A symbol that must contain a colon is built from a string, `(as 'symbol "a:1")`.
+
 ```lisp
 'AAPL       ; symbol atom
 'price      ; used as column reference
@@ -124,9 +126,18 @@ sentinel for their type:
 
 Symbols have no typed null literal (there is no `0Ns`).
 
-Inside `select` and `update` expressions, `(nil? col)` lowers to the DAG
-null-check opcode and returns a boolean per row, so it can be used directly in
-`where:` predicates and projections.
+`nil?` is element-wise: given a vector or a list it returns a `B8` vector with
+one entry per element, so `(where (nil? v))` and `(sum (as 'I64 (nil? v)))`
+work without a `map`. An atom answers for itself, and so does any other
+container (a table or a dict is never null). Inside `select` and `update`
+expressions, `(nil? col)` lowers to the DAG null-check opcode, which gives the
+same per-row answer and can be used directly in `where:` predicates and
+projections.
+
+```lisp
+(nil? [1 0N 3])   ; [false true false]
+(nil? [a ' b])    ; [false true false]  — the empty symbol is SYM's null
+```
 
 ## Vectors
 

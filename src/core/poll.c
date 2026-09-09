@@ -22,6 +22,7 @@
  */
 
 #include "core/poll.h"
+#include "core/timer.h"
 #include "mem/sys.h"
 #include <errno.h>
 
@@ -44,6 +45,25 @@ ray_selector_t* ray_poll_get(ray_poll_t* poll, int64_t id)
     return poll->sels[id];
 }
 
+bool ray_poll_idle(ray_poll_t* poll)
+{
+    if (!poll) return true;
+    if (poll->n_live > 0) return false;
+    if (!poll->timers) return true;
+    return ray_timers_next_deadline_ms((ray_timers_t*)poll->timers) == INT64_MAX;
+}
+
+void ray_poll_drain_timers(ray_poll_t* poll)
+{
+    if (!poll) return;
+    while (poll->code < 0 && poll->timers &&
+           ray_timers_next_deadline_ms((ray_timers_t*)poll->timers) != INT64_MAX) {
+        /* One bounded pass: wakes for the next deadline (the loop trims
+         * the wait to it) or for any selector event, fires what is due. */
+        if (ray_poll_run_for(poll, 1000) < 0) break;
+    }
+}
+
 ray_poll_buf_t* ray_poll_buf_new(int64_t size)
 {
     ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_sys_alloc(
@@ -52,6 +72,8 @@ ray_poll_buf_t* ray_poll_buf_new(int64_t size)
     buf->next   = NULL;
     buf->size   = size;
     buf->offset = 0;
+    buf->data   = buf->storage;
+    buf->frame  = NULL;
     return buf;
 }
 
@@ -59,9 +81,44 @@ void ray_poll_buf_free(ray_poll_buf_t* buf)
 {
     while (buf) {
         ray_poll_buf_t* next = buf->next;
+        if (buf->frame) ray_poll_frame_release(buf->frame);
         ray_sys_free(buf);
         buf = next;
     }
+}
+
+ray_poll_frame_t* ray_poll_frame_new(int64_t size)
+{
+    ray_poll_frame_t* f = (ray_poll_frame_t*)ray_sys_alloc(
+        sizeof(ray_poll_frame_t) + (size_t)size);
+    if (!f) return NULL;
+    f->rc   = 1;
+    f->size = size;
+    return f;
+}
+
+void ray_poll_frame_retain(ray_poll_frame_t* f)
+{
+    if (f) f->rc++;
+}
+
+void ray_poll_frame_release(ray_poll_frame_t* f)
+{
+    if (f && --f->rc == 0) ray_sys_free(f);
+}
+
+ray_poll_buf_t* ray_poll_buf_from_frame(ray_poll_frame_t* f)
+{
+    if (!f) return NULL;
+    ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_sys_alloc(sizeof(ray_poll_buf_t));
+    if (!buf) return NULL;
+    buf->next   = NULL;
+    buf->size   = f->size;
+    buf->offset = 0;
+    buf->data   = f->data;
+    buf->frame  = f;
+    ray_poll_frame_retain(f);
+    return buf;
 }
 
 void ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel, int64_t size)

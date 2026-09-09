@@ -74,6 +74,10 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 int64_t ray_ipc_current_handle(void);
 ray_poll_t* ray_ipc_active_poll(void);
 ray_poll_t* ray_ipc_context_poll(void);
+bool ray_ipc_auto_journal_eval(void);
+#ifdef DEBUG
+void ray_ipc_set_auto_journal_eval_for_test(bool enabled);
+#endif
 
 /* ===== Poll-based IPC (new API) ===== */
 
@@ -130,6 +134,38 @@ void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg);
+
+/* Fan-out building blocks (#487): frame a message once into an immutable
+ * reference-counted frame, then hand the same frame to any number of
+ * connections.  ray_ipc_try_send_frame takes its own reference for the
+ * queue; the caller releases the one it got from ray_ipc_frame_async when
+ * it is done handing the frame out.  Same send-or-queue semantics and
+ * return codes as ray_ipc_try_send_async, which is now the one-connection
+ * composition of the two. */
+ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out);
+ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame);
+
+/* Transmit backlog (#486).  A connection's queue admits a frame only while
+ * the bytes and frames already queued stay under its limit; a frame that
+ * would exceed it is refused (RAY_ERR_IO), which multicast turns into an
+ * explicit drop-and-close of that subscriber.  The process default applies
+ * to every connection without an override.  frames == 0 means unlimited. */
+#define RAY_IPC_TX_DEFAULT_BYTES  (256LL * 1024LL * 1024LL)
+#define RAY_IPC_TX_MIN_BYTES      4096LL
+
+typedef struct {
+    int64_t limit_bytes;    /* effective limit on this connection */
+    int64_t limit_frames;
+    int64_t queued_bytes;   /* backlog right now */
+    int64_t queued_frames;
+    int64_t hwm_bytes;      /* largest backlog ever queued here */
+} ray_ipc_tx_info_t;
+
+void      ray_ipc_tx_limit_get(int64_t* bytes, int64_t* frames);
+ray_err_t ray_ipc_tx_limit_set(int64_t bytes, int64_t frames);       /* process default */
+ray_err_t ray_ipc_tx_limit_set_handle(int64_t handle, int64_t bytes, int64_t frames);
+ray_err_t ray_ipc_tx_info(int64_t handle, ray_ipc_tx_info_t* out);   /* RAY_ERR_IO: not a live connection */
+int64_t   ray_ipc_tx_hwm_bytes(ray_poll_t* poll);
 
 /* Remote-REPL helper: send a SYNC message with RAY_IPC_FLAG_VERBOSE
  * set, returning a 2-element list [captured_str, result] where

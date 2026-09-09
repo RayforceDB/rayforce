@@ -1164,6 +1164,36 @@ static test_result_t test_journal_snapshot_empty_env(void) {
     PASS();
 }
 
+/* 7e. Snapshot restores user-defined functions without binding errors. */
+static test_result_t test_journal_snapshot_function_binding_recovers(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_fn");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str("(set jrn_snap_fn (fn [x] (+ x 1)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    int64_t sym = ray_sym_intern("jrn_snap_fn", 11);
+    ray_t* zero = ray_i64(0);
+    TEST_ASSERT_NOT_NULL(zero);
+    TEST_ASSERT_EQ_I(ray_env_set(sym, zero), RAY_OK);
+    ray_release(zero);
+
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    ray_t* val = ray_eval_str("(jrn_snap_fn 41)");
+    TEST_ASSERT_NOT_NULL(val);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(val));
+    TEST_ASSERT_EQ_I(val->i64, 42);
+    ray_release(val);
+
+    cleanup_base(base);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  8. is_open
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -1993,7 +2023,30 @@ static test_result_t test_ops_write_noopen(void) {
     PASS();
 }
 
-/* 22q. ray_log_write_fn: pay_size <= 0 (lines 100-103).
+/* 22q. ray_log_write_fn: reject explicit writes from auto-journaled IPC eval. */
+static test_result_t test_ops_write_rejects_auto_journal_eval(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_auto_eval");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+
+    ray_t* expr = ray_i64(42);
+    TEST_ASSERT_NOT_NULL(expr);
+    ray_ipc_set_auto_journal_eval_for_test(true);
+    ray_t* r = ray_log_write_fn(expr);
+    ray_ipc_set_auto_journal_eval_for_test(false);
+    ray_release(expr);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+    ray_error_free(r);
+
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+}
+
+/* 22r. ray_log_write_fn: pay_size <= 0 (lines 100-103).
  *
  *  ray_serde_size returns 0 for object types not in its switch (any type
  *  value that is not a known atom/vector/container type).  We manufacture
@@ -2369,6 +2422,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_basic",            test_journal_snapshot_basic,            jrn_setup, jrn_teardown },
     { "journal/open_with_qdb",             test_journal_open_with_qdb,             jrn_setup, jrn_teardown },
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
+    { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */
@@ -2407,6 +2461,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_open_sync_mode",        test_ops_open_sync_mode,               jrn_setup, jrn_teardown },
     { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
+    { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
     { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },

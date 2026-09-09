@@ -517,7 +517,9 @@ static test_result_t test_index_aux_helper_slice(void) {
     ray_t* s = ray_vec_slice(v, 2, 4);
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
     TEST_ASSERT_TRUE(s->attrs & RAY_ATTR_SLICE);
-    TEST_ASSERT_FALSE(s->attrs & RAY_ATTR_HAS_NULLS);
+    /* A slice inherits the parent's HAS_NULLS hint (#495): the gates
+     * that read the bit would otherwise treat the window as null-free. */
+    TEST_ASSERT_TRUE(s->attrs & RAY_ATTR_HAS_NULLS);
 
     /* ray_vec_is_null still works correctly on the slice. */
     TEST_ASSERT_FALSE(ray_vec_is_null(s, 0));   /* parent row 2 — not null */

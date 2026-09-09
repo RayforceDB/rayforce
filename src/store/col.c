@@ -732,6 +732,45 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     return RAY_OK;
 }
 
+/* Does the payload hold the type's null sentinel anywhere?  Sequential
+ * read with an early return on the first hit; resolves a slice through
+ * its parent like every other reader.  Types without a sentinel (BOOL,
+ * U8, SYM, STR, GUID, LIST) answer false — their null state is in-band
+ * or absent, and the bit means nothing to them on disk. */
+static bool col_payload_has_nulls(ray_t* vec) {
+    int64_t n = vec->len;
+    if (n <= 0) return false;
+    const void* p = ray_data(vec);
+    switch (vec->type) {
+        case RAY_F64: {
+            const double* d = (const double*)p;
+            for (int64_t i = 0; i < n; i++) if (d[i] != d[i]) return true;
+            return false;
+        }
+        case RAY_F32: {
+            const float* d = (const float*)p;
+            for (int64_t i = 0; i < n; i++) if (d[i] != d[i]) return true;
+            return false;
+        }
+        case RAY_I64: case RAY_TIMESTAMP: {
+            const int64_t* d = (const int64_t*)p;
+            for (int64_t i = 0; i < n; i++) if (d[i] == NULL_I64) return true;
+            return false;
+        }
+        case RAY_I32: case RAY_DATE: case RAY_TIME: {
+            const int32_t* d = (const int32_t*)p;
+            for (int64_t i = 0; i < n; i++) if (d[i] == NULL_I32) return true;
+            return false;
+        }
+        case RAY_I16: {
+            const int16_t* d = (const int16_t*)p;
+            for (int64_t i = 0; i < n; i++) if (d[i] == NULL_I16) return true;
+            return false;
+        }
+        default: return false;
+    }
+}
+
 static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
     if (!vec || RAY_IS_ERR(vec)) return RAY_ERR_TYPE;
     if (!path) return RAY_ERR_IO;
@@ -849,8 +888,21 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             memset(header.aux + 8, 0, 8);
         }
 
-        /* Clear slice flag — slices are materialized on save. */
-        header.attrs &= (uint8_t)~RAY_ATTR_SLICE;
+        /* Clear slice flag — slices are materialized on save.  A slice's
+         * aux holds the parent pointer and window offset, which must
+         * never reach disk. */
+        if (vec->attrs & RAY_ATTR_SLICE) {
+            header.attrs &= (uint8_t)~RAY_ATTR_SLICE;
+            memset(header.aux, 0, 16);
+        }
+        /* The persisted HAS_NULLS bit is load-bearing for every reader
+         * (nothing rescans on load), so derive it from the payload rather
+         * than trust the producer: a column that holds a sentinel is
+         * written with the bit set whatever the in-memory header said
+         * (#495).  Only ever sets — a spurious set costs a slow path, a
+         * missing one costs the answer. */
+        if (!(header.attrs & RAY_ATTR_HAS_NULLS) && col_payload_has_nulls(vec))
+            header.attrs |= RAY_ATTR_HAS_NULLS;
         if (!(header.attrs & RAY_ATTR_HAS_NULLS))
             memset(header.aux, 0, 16);
 
