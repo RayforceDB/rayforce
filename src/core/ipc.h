@@ -74,6 +74,10 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 int64_t ray_ipc_current_handle(void);
 ray_poll_t* ray_ipc_active_poll(void);
 ray_poll_t* ray_ipc_context_poll(void);
+bool ray_ipc_auto_journal_eval(void);
+#ifdef DEBUG
+void ray_ipc_set_auto_journal_eval_for_test(bool enabled);
+#endif
 
 /* ===== Poll-based IPC (new API) ===== */
 

@@ -91,6 +91,8 @@ ray_t* ray_log_open_fn(ray_t** args, int64_t n) {
 ray_t* ray_log_write_fn(ray_t* expr) {
     if (!ray_journal_is_open())
         return ray_error("noopen", ".log.write: no journal open (start with -l/-L)");
+    if (ray_ipc_auto_journal_eval())
+        return ray_error("domain", ".log.write is disabled inside auto-journaled IPC eval");
     if (!expr) return ray_error("type", ".log.write expects an argument");
 
     bool owned = false;

@@ -259,6 +259,18 @@ static void ipc_ctx_set(int64_t handle, ray_poll_t* poll) {
     __VM->ipc_poll   = poll;
 }
 
+static _Thread_local bool g_auto_journal_eval = false;
+
+bool ray_ipc_auto_journal_eval(void) {
+    return g_auto_journal_eval;
+}
+
+#ifdef DEBUG
+void ray_ipc_set_auto_journal_eval_for_test(bool enabled) {
+    g_auto_journal_eval = enabled;
+}
+#endif
+
 ray_poll_t* ray_ipc_active_poll(void) {
     ray_poll_t* p = ipc_ctx_poll();
     return p ? p : (ray_poll_t*)ray_runtime_get_poll();
@@ -512,6 +524,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
      * behaviour: "the message has not been logged so we cannot
      * accept it".  Silently evaluating un-logged mutations defeats
      * the entire durability premise of `-l`/`-L`. */
+    bool auto_journaled = false;
     if (ray_journal_is_open() && hdr->msgtype == RAY_IPC_MSG_SYNC) {
         ray_ipc_header_t log_hdr = *hdr;
         if (ray_eval_get_restricted())
@@ -521,6 +534,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
             fprintf(stderr, "log: ERROR  journal write failed (rc=%d) — refusing to evaluate\n", (int)je);
             return ray_error("io", "journal write failed; mutation refused");
         }
+        auto_journaled = true;
     }
 
     /* Query-statistics ring: bracket the eval so the server records one
@@ -552,6 +566,8 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     }
 
     ray_t* result = NULL;
+    bool prev_auto_journal_eval = g_auto_journal_eval;
+    if (auto_journaled) g_auto_journal_eval = true;
     if (msg && !RAY_IS_ERR(msg)) {
         if (msg->type == RAY_LIST) {
             ray_t** elems = (ray_t**)ray_data(msg);
@@ -598,6 +614,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
             ray_release(msg);
         }
     }
+    g_auto_journal_eval = prev_auto_journal_eval;
     /* A lazy result is an internal deferred-DAG representation that cannot
      * be serialized — force it to a concrete value before it reaches the
      * wire.  The direct ray_eval(msg) path (non-STR payloads, e.g. an
