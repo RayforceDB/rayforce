@@ -1,6 +1,6 @@
 # `.time.*` — clock and timers
 
-Monotonic clock access plus a recurring-callback scheduler. Timers integrate into the runtime's poll loop — they only fire when control is back in `ray_poll_run`, i.e. between REPL inputs, between IPC requests, or while idling in server-only mode. A long-running synchronous evaluation will defer pending timers until it returns.
+Monotonic clock access plus a recurring-callback scheduler. Timers integrate into the runtime's poll loop — they only fire when control is back in the loop, i.e. between REPL inputs (interactive or piped: both read stdin through the loop), between IPC requests, or while idling in server-only mode. A long-running synchronous evaluation will defer pending timers until it returns. A script, or a piped session that reached end of input, stays alive until its pending timers are spent, so a one-shot timer set by a script fires before the process exits; a periodic timer keeps it running until the script ends the process itself. An open client handle does not keep a script alive.
 
 The clock is the same `CLOCK_MONOTONIC` source the scheduler uses for its deadlines, so `(.time.now)` is directly comparable to the `ms` argument passed to `.time.timer.set`. Wall-clock time is intentionally not exposed here: a host sleep / resume must not retroactively shift a scheduled deadline.
 

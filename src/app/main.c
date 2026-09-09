@@ -282,7 +282,14 @@ int main(int argc, char** argv) {
     /* Load script if specified */
     if (file) {
         rc = ray_repl_run_file(file);
-        if (!interactive && !(port > 0)) goto done;
+        if (!interactive && !(port > 0)) {
+            /* A script that armed timers means to run them: stay until
+             * they are spent (a one-shot fires once, a periodic one until
+             * the script ends the process).  Nothing else keeps a script
+             * alive — a client handle it left open is not a reason. */
+            if (poll) ray_poll_drain_timers(poll);
+            goto done;
+        }
     }
 
     /* REPL or pure server mode.

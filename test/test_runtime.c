@@ -744,6 +744,51 @@ static test_result_t test_poll_run_for_fires_timer(void) {
     PASS();
 }
 
+/* An unbounded ray_poll_run with nothing registered and nothing scheduled
+ * returns instead of blocking forever, and one that has only a pending
+ * timer returns once the timer has fired (#493: a script or a piped
+ * session stays for its timers, then ends).  ray_poll_drain_timers is the
+ * bounded form used by main.c and the piped REPL. */
+static test_result_t test_poll_run_returns_when_idle(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+    TEST_ASSERT_EQ_U(poll->n_live, 0u);
+    TEST_ASSERT_TRUE(ray_poll_idle(poll));
+
+    int64_t t0 = ray_time_now_ms();
+    TEST_ASSERT_EQ_I(ray_poll_run(poll), 0);        /* nothing to wait for */
+    TEST_ASSERT_TRUE(ray_time_now_ms() - t0 < 500);
+
+    ray_t* r = ray_eval_str("(set idle_timer_fired 0)"
+                            "(.time.timer.set 20 1 (fn [t] (set idle_timer_fired 1)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_FALSE(ray_poll_idle(poll));
+
+    t0 = ray_time_now_ms();
+    TEST_ASSERT_EQ_I(ray_poll_run(poll), 0);        /* fires, then idle */
+    TEST_ASSERT_TRUE(ray_time_now_ms() - t0 < 2000);
+    ray_t* f = ray_eval_str("idle_timer_fired");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(f->i64, 1);
+    ray_release(f);
+    TEST_ASSERT_TRUE(ray_poll_idle(poll));
+
+    r = ray_eval_str("(set idle_timer_fired 0)"
+                     "(.time.timer.set 20 1 (fn [t] (set idle_timer_fired 2)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_poll_drain_timers(poll);
+    f = ray_eval_str("idle_timer_fired");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(f->i64, 2);
+    ray_release(f);
+    TEST_ASSERT_TRUE(ray_poll_idle(poll));
+    PASS();
+}
+
 /* ─── timer.c deep coverage (heap helpers + edge paths) ───────
  *
  * The static heap helpers (heap_less, heap_swap, heap_up sift body,
@@ -1202,6 +1247,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_time_timer_set_del",   test_syscov_time_timer_set_del,   sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_time_timer_fires",     test_syscov_time_timer_fires,     sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/poll_run_for_fires_timer",    test_poll_run_for_fires_timer,    sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/poll_run_returns_when_idle",    test_poll_run_returns_when_idle,    sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_heap_grow_past_initial_cap", test_timer_heap_grow_past_initial_cap, sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_next_deadline_ms",      test_timer_next_deadline_ms,      sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_heap_sift_paths",       test_timer_heap_sift_paths,       sys_setup_with_poll, sys_teardown_with_poll },
