@@ -659,6 +659,36 @@ static test_result_t test_repl_pty_ctrl_d(void) {
     PASS();
 }
 
+/* Timers keep firing while the interactive prompt is idle (#493).  The
+ * interactive REPL registers stdin as a poll selector and sits in
+ * ray_poll_run, whose wait is bounded by the next timer deadline, so a
+ * callback must run without any further input.  The poll has to be the
+ * runtime's published poll (run_pty_listen_with_poll), which is where
+ * .time.timer.set looks — as main.c does.  The callback itself
+ * ends the session with a distinctive exit code: a clean exit with that
+ * code proves it ran while the prompt was idle, and the helper's 5 s
+ * timeout (-2) is what a starved timer would produce.  Nothing after
+ * the timer line is ever written to the pty. */
+static int run_pty_listen_with_poll(const char* input);
+static test_result_t test_repl_pty_timer_fires_while_idle(void) {
+#ifndef RAY_OS_WINDOWS
+    int rc = run_pty_listen_with_poll("(.time.timer.set 150 1 (fn [t] (exit 7)))\n");
+    TEST_ASSERT_FMT(rc == 7, "one-shot timer did not fire at an idle prompt: child rc %d", rc);
+#endif
+    PASS();
+}
+
+/* Same for a periodic timer: three fires, none prompted by input. */
+static test_result_t test_repl_pty_periodic_timer_while_idle(void) {
+#ifndef RAY_OS_WINDOWS
+    int rc = run_pty_listen_with_poll(
+        "(set _n 0)\n"
+        "(.time.timer.set 100 0 (fn [t] (do (set _n (+ _n 1)) (if (>= _n 3) (exit 3) 0))))\n");
+    TEST_ASSERT_FMT(rc == 3, "periodic timer did not keep firing at an idle prompt: child rc %d", rc);
+#endif
+    PASS();
+}
+
 /* No-poll fallback: ray_repl_create(NULL) keeps repl->poll == NULL so
  * run_interactive uses the blocking-read fallback loop (lines ~940-998
  * in repl.c).  :q breaks out via the inline command dispatch in that
@@ -3077,6 +3107,8 @@ const test_entry_t repl_entries[] = {
     { "repl/pty/backslash_exit",             test_repl_pty_backslash_exit,             repl_setup, repl_teardown },
     { "repl/pty/eval_then_quit",             test_repl_pty_eval_then_quit,             repl_setup, repl_teardown },
     { "repl/pty/ctrl_d",                     test_repl_pty_ctrl_d,                     repl_setup, repl_teardown },
+    { "repl/pty/timer_fires_while_idle",     test_repl_pty_timer_fires_while_idle,     repl_setup, repl_teardown },
+    { "repl/pty/periodic_timer_while_idle",  test_repl_pty_periodic_timer_while_idle,  repl_setup, repl_teardown },
     { "repl/pty/no_poll_quit",               test_repl_pty_no_poll_quit,               repl_setup, repl_teardown },
     { "repl/pty/no_poll_eval",               test_repl_pty_no_poll_eval,               repl_setup, repl_teardown },
     { "repl/pty/no_poll_ctrl_d",             test_repl_pty_no_poll_ctrl_d,             repl_setup, repl_teardown },
