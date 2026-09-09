@@ -1,0 +1,60 @@
+;; slice_has_nulls.rfl — a slice sees its parent's nulls, in memory and on
+;; disk (#495).
+;;
+;; Regression: ray_vec_slice built the slice header without the parent's
+;; RAY_ATTR_HAS_NULLS hint, and every fast-path gate that trusts the hint
+;; (sum/min/max/avg, raze, the save path) read a window holding a null
+;; sentinel as null-free — folding INT64_MIN into a sum, materialising it
+;; as a plain number through raze, and persisting the column with the bit
+;; clear so every later reader was wrong too.  (take D <range>) on a dict
+;; slices the key vector, so three ordinary verbs produced one.
+
+;; ── in memory: the slice answers what the whole vector answers ──
+(set D (dict (as 'I64 [1 0N 3 4]) [10 20 30 40]))
+(set W (key D))
+(set S (key (take D [0 3])))
+(format "%s" S) -- "[1 0Nl 3]s"
+(sum S) -- 4
+(sum (take W 3)) -- 4
+(min S) -- 1
+(max S) -- 3
+(avg S) -- 2.0
+(nil? S) -- [false true false]
+(count (where (nil? S))) -- 1
+
+;; ── raze keeps the null, whichever path it takes ──
+(set R (raze (enlist S)))
+(format "%s" R) -- "[1 0Nl 3]s"
+(sum R) -- 4
+(sum (raze (list S S))) -- 8
+(sum (concat S (take S 0))) -- 4
+(sum (at S (til 3))) -- 4
+
+;; ── the same through F64 and a nested slice ──
+(set DF (dict (as 'F64 [1.5 0Nf 2.5 4.0]) [10 20 30 40]))
+(set SF (key (take DF [0 3])))
+(sum SF) -- 4.0
+(min SF) -- 1.5
+(sum (take SF 2)) -- 1.5
+(sum (raze (enlist SF))) -- 4.0
+
+;; a slice whose window holds no null still answers correctly
+(set S2 (key (take D [2 4])))
+(sum S2) -- 7
+(nil? S2) -- [false false]
+
+;; ── on disk: the persisted bit is derived from the payload ──
+(.sys.exec "rm -rf /tmp/rfl_slice_nulls")
+(set G (as 'I64 [1 0N 3]))
+(.db.splayed.set "/tmp/rfl_slice_nulls/good/" (table ['x] (list G)))
+(.db.splayed.set "/tmp/rfl_slice_nulls/slice/" (table ['x] (list S)))
+(.db.splayed.set "/tmp/rfl_slice_nulls/razed/" (table ['x] (list R)))
+(.db.splayed.set "/tmp/rfl_slice_nulls/f64/" (table ['x] (list SF)))
+(sum (at (.db.splayed.get "/tmp/rfl_slice_nulls/good/") 'x)) -- 4
+(sum (at (.db.splayed.get "/tmp/rfl_slice_nulls/slice/") 'x)) -- 4
+(sum (at (.db.splayed.get "/tmp/rfl_slice_nulls/razed/") 'x)) -- 4
+(format "%s" (at (.db.splayed.get "/tmp/rfl_slice_nulls/razed/") 'x)) -- "[1 0Nl 3]s"
+(sum (at (.db.splayed.get "/tmp/rfl_slice_nulls/f64/") 'x)) -- 4.0
+;; the header byte itself: 0x40 (HAS_NULLS) on every one of them
+(.sys.exec "for d in good slice razed f64; do [ \"$(xxd -s 19 -l 1 -p /tmp/rfl_slice_nulls/$d/x)\" = 40 ] || exit 1; done") -- 0
+(.sys.exec "rm -rf /tmp/rfl_slice_nulls")

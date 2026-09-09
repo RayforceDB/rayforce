@@ -58,7 +58,8 @@
  *   Bit  0x10       vectors:         RAY_ATTR_SLICE
  *   Bit  0x20       -RAY_SYM:        ATTR_QUOTED (quoted/literal symbol; default = name reference)
  *   Bit  0x20       vectors:         RAY_ATTR_SORTED (non-descending order marker)
- *   Bit  0x40       vectors:         RAY_ATTR_HAS_NULLS (sentinel-encoded; payload is truth)
+ *   Bit  0x40       vectors:         RAY_ATTR_HAS_NULLS (sentinel-encoded; payload is truth;
+ *                                    a slice inherits its parent's bit)
  *   Bit  0x80       all types:       RAY_ATTR_ARENA (arena-allocated, no refcount)
  *
  * Overlapping bit values are safe because consumers always check the type tag

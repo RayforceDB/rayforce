@@ -5716,13 +5716,14 @@ static test_result_t test_temporal_extract_slice_nulls(void) {
     TEST_ASSERT_TRUE((v->attrs & RAY_ATTR_HAS_NULLS) != 0);
     TEST_ASSERT_TRUE(ray_vec_is_null(v, 2));
 
-    /* Slice [1..4): {2s, null, 4s}.  Slice itself does not carry
-     * HAS_NULLS; only the parent does. */
+    /* Slice [1..4): {2s, null, 4s}.  Since #495 the slice header carries
+     * the parent's HAS_NULLS hint too, so the bit-only gates see it; the
+     * slice-aware detection below is still what reads the cell. */
     ray_t* s = ray_vec_slice(v, 1, 3);
     TEST_ASSERT_NOT_NULL(s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
     TEST_ASSERT_TRUE((s->attrs & RAY_ATTR_SLICE) != 0);
-    TEST_ASSERT_FALSE((s->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((s->attrs & RAY_ATTR_HAS_NULLS) != 0);
     TEST_ASSERT_TRUE(ray_vec_is_null(s, 1));
 
     /* Extract seconds.  Without slice-aware null detection this path
