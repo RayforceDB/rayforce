@@ -393,5 +393,35 @@
 (at (at (at Rnested 'n) 1) 0) -- 9.0
 (.sys.exec "rm -rf /tmp/rfl_part_nested")
 
+;; ────── calendar-impossible date dirs are not date partitions ──────
+;; is_date_dir accepted any day 01-31, so a shaped-but-impossible dir like
+;; 2024.02.31 classified as RAY_MC_DATE and parse_date_dir silently normalised
+;; it to a real but WRONG day (2024.03.02).  It must fail date validation: the
+;; set then drops to RAY_MC_SYM (partition-key column 'part, keys kept literal)
+;; instead of masquerading as a mislabelled date.
+(.sys.exec "rm -rf /tmp/rfl_part_badcal /tmp/rfl_part_leap")
+(set BC-A (table [v] (list [1 2 3])))
+(set BC-B (table [v] (list [4 5])))
+(.db.splayed.set "/tmp/rfl_part_badcal/2024.02.28/t/" BC-A)
+(.db.splayed.set "/tmp/rfl_part_badcal/2024.02.31/t/" BC-B)
+(set Pbad (.db.parted.get "/tmp/rfl_part_badcal/" 't))
+;; not 'date: the impossible Feb 31 defeats the all-date classification
+(first (key Pbad)) -- 'part
+(key Pbad) -- ['part 'v]
+(count Pbad) -- 5
+(sum (at Pbad 'v)) -- 15
+;; The impossible day is kept LITERAL, not remapped: the partition-key column
+;; holds the exact directory names.  On dev this column is 'date and Feb 31's
+;; rows read back 2024.03.02 — the silent mislabel this fix removes.
+(at Pbad 'part) -- (as 'sym ["2024.02.28" "2024.02.28" "2024.02.28" "2024.02.31" "2024.02.31"])
+;; No over-rejection: 2024 is a leap year, so the real leap day 2024.02.29
+;; still classifies as a date partition ('date column).
+(set LP (table [v] (list [7 8])))
+(.db.splayed.set "/tmp/rfl_part_leap/2024.02.29/t/" LP)
+(set Pleap (.db.parted.get "/tmp/rfl_part_leap/" 't))
+(first (key Pleap)) -- 'date
+(sum (at Pleap 'v)) -- 15
+(.sys.exec "rm -rf /tmp/rfl_part_badcal /tmp/rfl_part_leap")
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like /tmp/rfl_part_mc /tmp/rfl_part_mb")
