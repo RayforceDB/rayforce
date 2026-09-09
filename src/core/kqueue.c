@@ -166,6 +166,7 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
         return -1;
     }
 
+    poll->n_live++;
     if (sel->open_fn) sel->open_fn(poll, sel);
     return id;
 }
@@ -187,6 +188,7 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     ray_poll_buf_free(sel->tx.buf);
     ray_sys_free(sel);
     poll->sels[id] = NULL;
+    if (poll->n_live > 0) poll->n_live--;
 }
 
 int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
@@ -204,6 +206,11 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             if (remaining < 0) remaining = 0;
             wait_ms = remaining;
         }
+
+        /* Nothing registered and nothing scheduled: an unbounded loop
+         * would block here forever.  Return instead, so a process that
+         * stayed only for its timers can end once they are spent. */
+        if (!bounded && ray_poll_idle(poll)) return 0;
 
         if (poll->timers) {
             int64_t deadline = ray_timers_next_deadline_ms(

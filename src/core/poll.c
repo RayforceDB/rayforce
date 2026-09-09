@@ -22,6 +22,7 @@
  */
 
 #include "core/poll.h"
+#include "core/timer.h"
 #include "mem/sys.h"
 #include <errno.h>
 
@@ -42,6 +43,25 @@ ray_selector_t* ray_poll_get(ray_poll_t* poll, int64_t id)
     if (!poll || id < 0 || (uint32_t)id >= poll->n_sels)
         return NULL;
     return poll->sels[id];
+}
+
+bool ray_poll_idle(ray_poll_t* poll)
+{
+    if (!poll) return true;
+    if (poll->n_live > 0) return false;
+    if (!poll->timers) return true;
+    return ray_timers_next_deadline_ms((ray_timers_t*)poll->timers) == INT64_MAX;
+}
+
+void ray_poll_drain_timers(ray_poll_t* poll)
+{
+    if (!poll) return;
+    while (poll->code < 0 && poll->timers &&
+           ray_timers_next_deadline_ms((ray_timers_t*)poll->timers) != INT64_MAX) {
+        /* One bounded pass: wakes for the next deadline (the loop trims
+         * the wait to it) or for any selector event, fires what is due. */
+        if (ray_poll_run_for(poll, 1000) < 0) break;
+    }
 }
 
 ray_poll_buf_t* ray_poll_buf_new(int64_t size)

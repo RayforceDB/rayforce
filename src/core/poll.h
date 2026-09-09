@@ -115,7 +115,8 @@ struct ray_poll {
      * compiler hoist the load out of the loop. */
     _Atomic int64_t  code;     /* exit code (-1 = running) */
     ray_selector_t** sels;     /* selector array */
-    uint32_t         n_sels;
+    uint32_t         n_sels;   /* slots (deregistered slots stay NULL) */
+    uint32_t         n_live;   /* registered selectors right now */
     uint32_t         sel_cap;
     char             auth_secret[256]; /* password from -u/-U, empty = no auth */
     bool             restricted;       /* true if -U (read-only IPC mode) */
@@ -127,6 +128,14 @@ struct ray_poll {
 /* ===== API ===== */
 
 ray_poll_t*     ray_poll_create(void);
+/* True when the loop has nothing to wait for: no registered selector and
+ * no pending timer.  ray_poll_run returns instead of blocking forever. */
+bool            ray_poll_idle(ray_poll_t* poll);
+/* Run bounded passes until no timer is pending (or the loop was told to
+ * exit).  Serves whatever selectors exist meanwhile, but does not stay
+ * for them: a script's lingering client handle must not keep the
+ * process alive once its timers are spent. */
+void            ray_poll_drain_timers(ray_poll_t* poll);
 void            ray_poll_destroy(ray_poll_t* poll);
 void            ray_poll_set_restricted(ray_poll_t* poll, bool restricted);
 int64_t         ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg);

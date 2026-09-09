@@ -1,0 +1,39 @@
+;; piped_timers.rfl — timers keep firing while a piped (non-TTY) stdin is
+;; held open, and a process stays for its pending timers after input ends
+;; (#493, the narrowed report).
+;;
+;; Regression: run_piped blocked in fgets(), so with a producer holding
+;; the pipe open a 100 ms timer fired only when the writer closed; and at
+;; EOF the poll loop was entered only for registered selectors, so a
+;; timer-only run printed the timer id and exited without firing it.
+;;
+;; Each case runs ./rayforce as a subprocess.  The callback exits with a
+;; distinctive code, so the exit code says whether it ran; the wall clock
+;; says whether it ran before the producer let go.  Process substitution
+;; keeps the write end open in the background without making the shell
+;; wait for it, so the elapsed time is rayforce's alone.
+(.sys.exec "rm -f /tmp/rfl_pt.sh /tmp/rfl_pt.rfl")
+(.sys.exec "printf '%s\n' '(.time.timer.set 100 1 (fn [t] (exit 7)))' > /tmp/rfl_pt.rfl")
+(.sys.exec "printf '%s\n' 's=$(date +%s)' 'exec 3< <(printf \"(.time.timer.set 100 1 (fn [t] (exit 7)))\\n\"; sleep 4)' './rayforce -i <&3; rc=$?' 'exec 3<&-' 'e=$(date +%s)' '[ $rc -eq 7 ] && [ $((e-s)) -le 1 ]' > /tmp/rfl_pt.sh")
+
+;; pipe held open for 4 s: the callback runs at 100 ms, not at close
+(.sys.exec "bash /tmp/rfl_pt.sh") -- 0
+
+;; the same with a listener: IPC is served while stdin is open, and the
+;; timer still fires early
+(.sys.exec "sed -i.bak 's#./rayforce -i#./rayforce -i -p 19973#' /tmp/rfl_pt.sh; bash /tmp/rfl_pt.sh") -- 0
+
+;; timer-only input that reaches EOF at once: the process stays for the
+;; timer instead of exiting 0 with it unfired
+(.sys.exec "./rayforce -i < /tmp/rfl_pt.rfl; [ $? -eq 7 ]") -- 0
+
+;; a script file that armed a one-shot timer, no listener: same
+(.sys.exec "./rayforce /tmp/rfl_pt.rfl </dev/null; [ $? -eq 7 ]") -- 0
+
+;; a script with no timers still exits promptly with its own status
+(.sys.exec "s=$(date +%s); printf '(+ 1 1)\n' | ./rayforce -i; rc=$?; e=$(date +%s); [ $rc -eq 0 ] && [ $((e-s)) -le 1 ]") -- 0
+
+;; a script that opened a client handle and set no timer still exits
+(.sys.exec "printf '%s\n' '(set h (.ipc.open \"127.0.0.1:19972\" 200))' > /tmp/rfl_pt2.rfl; s=$(date +%s); ./rayforce /tmp/rfl_pt2.rfl </dev/null >/dev/null 2>&1; e=$(date +%s); [ $((e-s)) -le 1 ]") -- 0
+
+(.sys.exec "rm -f /tmp/rfl_pt.sh /tmp/rfl_pt.sh.bak /tmp/rfl_pt.rfl /tmp/rfl_pt2.rfl")
