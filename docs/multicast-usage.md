@@ -21,7 +21,8 @@ It does not yet provide durable replay, topic filters, wildcard topics, ACLs, pe
 ## API
 
 ```clj
-(.mc.sub topic null)       ;; subscribe the current IPC handle to topic
+(.mc.sub topic)            ;; subscribe the current IPC handle to topic
+(.mc.sub topic null)       ;; explicit no-filter form
 (.mc.unsub topic)          ;; unsubscribe the current IPC handle from topic
 (.mc.pub topic payload)    ;; publish payload to all current subscribers
 (.mc.stats)                ;; return aggregate multicast stats
@@ -30,6 +31,7 @@ It does not yet provide durable replay, topic filters, wildcard topics, ACLs, pe
 `topic` can be a string or a symbol:
 
 ```clj
+(.mc.sub "ticks")
 (.mc.sub "ticks" null)
 (.mc.sub 'ticks null)
 
@@ -37,9 +39,10 @@ It does not yet provide durable replay, topic filters, wildcard topics, ACLs, pe
 (.mc.pub 'ticks (dict ['sym 'price] (list 'AAPL 185.5)))
 ```
 
-Filters are reserved for later work. For now, pass `null`:
+Filters are reserved for later work. For now, omit the filter or pass `null`:
 
 ```clj
+(.mc.sub "ticks")          ;; ok
 (.mc.sub "ticks" null)     ;; ok
 (.mc.sub "ticks" 1)        ;; nyi
 ```

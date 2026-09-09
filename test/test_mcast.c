@@ -520,6 +520,38 @@ static test_result_t test_mcast_no_subscribers_and_api_errors(void) {
     PASS();
 }
 
+static test_result_t test_mcast_bare_subscribe_shorthand(void) {
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "client connected");
+
+    ray_t* msg = ray_str("(.mc.sub \"bare\")", strlen("(.mc.sub \"bare\")"));
+    ray_t* sub = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
+    TEST_ASSERT_EQ_I(sub->i64, 1);
+    ray_release(sub);
+
+    msg = ray_str("(.mc.sub)", strlen("(.mc.sub)"));
+    ray_t* err = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "domain");
+    ray_error_free(err);
+
+    ray_ipc_close(h);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 static test_result_t test_mcast_restricted_sub_but_not_pub(void) {
     ray_poll_t* poll;
     ray_vm_t* vm;
@@ -1099,6 +1131,7 @@ const test_entry_t mcast_entries[] = {
     { "mcast/duplicate_sub_idempotent",   test_mcast_duplicate_sub_is_idempotent, mcast_setup, mcast_teardown },
     { "mcast/multi_topic_routing",        test_mcast_multi_topic_routing,        mcast_setup, mcast_teardown },
     { "mcast/no_subscribers_api_errors",  test_mcast_no_subscribers_and_api_errors, mcast_setup, mcast_teardown },
+    { "mcast/bare_sub_shorthand",         test_mcast_bare_subscribe_shorthand, mcast_setup, mcast_teardown },
     { "mcast/restricted_sub_not_pub",     test_mcast_restricted_sub_but_not_pub, mcast_setup, mcast_teardown },
     { "mcast/sub_requires_ipc_context",   test_mcast_requires_ipc_context_for_sub, mcast_setup, mcast_teardown },
     { "mcast/large_payload_queues",       test_mcast_large_payload_queues_until_writable, mcast_setup, mcast_teardown },

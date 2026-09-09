@@ -1615,11 +1615,12 @@ ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n) {
-    if (n != 2)
-        return ray_error("domain", ".mc.sub expects 2 arguments");
+    if (n < 1 || n > 2)
+        return ray_error("domain", ".mc.sub expects 1 or 2 arguments");
     if (!ray_ipc_context_poll())
         return ray_error("domain", ".mc.sub requires a poll IPC context");
-    return ray_mcast_sub(ray_ipc_active_poll(), ray_ipc_current_handle(), args[0], args[1]);
+    ray_t* filter = (n == 2) ? args[1] : RAY_NULL_OBJ;
+    return ray_mcast_sub(ray_ipc_active_poll(), ray_ipc_current_handle(), args[0], filter);
 }
 
 ray_t* ray_mc_unsub_fn(ray_t* topic) {
