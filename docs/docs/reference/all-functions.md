@@ -616,7 +616,7 @@ Printing, file I/O, CSV loading, and script execution.
 | `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
 | `write` | binary | restricted | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | restricted | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
-| `load` | unary | restricted | Load and evaluate a Rayfall script file | `(load "lib.rfl")` |
+| `load` | unary | restricted | Load and evaluate a Rayfall script file. A relative path is tried against the working directory, then below `RAYFORCE_HOME` when set; absolute paths are used as given; a failure names every path tried | `(load "lib.rfl")` |
 | `exit` | unary | restricted | Exit the process with status code | `(exit 0)` |
 | `resolve` | variadic | special | Resolve a symbol in the current scope | `(resolve 'x)` |
 | `timeit` | variadic | special | Benchmark an expression (prints elapsed time) | `(timeit (sum (til 1000000)))` |

@@ -595,15 +595,21 @@ static test_result_t test_build_sys_args_edges(void) {
     PASS();
 }
 
-/* .sys.args builtin: empty when unset; reflects stored dict when set */
+/* .sys.args builtin: only `source` when unset; reflects stored dict when set */
 static test_result_t test_sys_args_builtin(void) {
-    /* unset → empty dict, never NULL */
+    /* unset → a dict holding just `source` (empty here: ray_eval_str is
+     * no file, #506), never NULL */
     ray_t* e = ray_eval_str("(.sys.args)");
     TEST_ASSERT_NOT_NULL(e);
     TEST_ASSERT_FALSE(RAY_IS_ERR(e));
     TEST_ASSERT_EQ_I(e->type, RAY_DICT);
-    TEST_ASSERT_EQ_I(ray_dict_len(e), 0);
+    TEST_ASSERT_EQ_I(ray_dict_len(e), 1);
     ray_release(e);
+    ray_t* src = ray_eval_str("(count (at (.sys.args) 'source))");
+    TEST_ASSERT_NOT_NULL(src);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(src));
+    TEST_ASSERT_EQ_I(src->i64, 0);
+    ray_release(src);
 
     /* set, then read back through the builtin */
     char* argv[] = { "rayforce", "-p", "5000", "--", "-opt", "123" };
