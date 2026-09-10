@@ -2090,11 +2090,11 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 #if defined(RAY_OS_WINDOWS)
     /* Windows: fall back to fread */
     FILE* fp = fopen(path, "r");
-    if (!fp) return ray_error("io", NULL);
+    if (!fp) return ray_error("io", "load \"%s\": %s", path, strerror(errno));
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
+    if (sz < 0) { int e = errno; fclose(fp); return ray_error("io", "load \"%s\": cannot determine size: %s", path, strerror(e)); }
     if (sz == 0) { fclose(fp); return ray_i64(0); }
     char* buf = (char*)ray_alloc_raw((size_t)sz + 1);
     if (!buf) { fclose(fp); return ray_error("oom", NULL); }
@@ -2116,15 +2116,22 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     ray_free_raw(buf);
     return result;
 #else
+    /* Every failure names the file and the OS cause: a bare `io` from a
+     * script's load is indistinguishable from an IPC, journal or storage
+     * failure and sends diagnosis the wrong way (#505). */
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return ray_error("io", NULL);
+    if (fd < 0) return ray_error("io", "load \"%s\": %s", path, strerror(errno));
     struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size < 0) { close(fd); return ray_error("io", NULL); }
+    if (fstat(fd, &st) < 0 || st.st_size < 0) {
+        int e = errno; close(fd);
+        return ray_error("io", "load \"%s\": cannot stat: %s", path, strerror(e));
+    }
+    if (S_ISDIR(st.st_mode)) { close(fd); return ray_error("io", "load \"%s\": is a directory", path); }
     size_t sz = (size_t)st.st_size;
     if (sz == 0) { close(fd); return ray_i64(0); }
     char* map = (char*)ray_vm_map_fd_ro(fd, sz);
-    close(fd);
-    if (!map) return ray_error("io", NULL);
+    { int e = errno; close(fd); errno = e; }
+    if (!map) return ray_error("io", "load \"%s\": cannot map %zu bytes: %s", path, sz, strerror(errno));
     /* Copy to NUL-terminated buffer -- mmap region may not have a trailing NUL */
     char* buf = (char*)ray_alloc_raw(sz + 1);
     if (!buf) { ray_vm_unmap_file(map, sz); return ray_error("oom", NULL); }
