@@ -1521,22 +1521,23 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg) {
 /* Build {handle limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
  * for a live connection. */
 static ray_t* ipc_tx_info_dict(int64_t h, const ray_ipc_tx_info_t* ti) {
-    static const char* const names[6] = { "handle", "limit_bytes", "limit_frames",
+    static const char* const names[7] = { "handle", "inbound", "limit_bytes", "limit_frames",
                                           "queued_bytes", "queued_frames", "hwm_bytes" };
-    int64_t vals_i[6] = { h, ti->limit_bytes, ti->limit_frames,
+    int64_t vals_i[7] = { h, ti->inbound ? 1 : 0, ti->limit_bytes, ti->limit_frames,
                           ti->queued_bytes, ti->queued_frames, ti->hwm_bytes };
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 6);
-    ray_t* vals = ray_list_new(6);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 7);
+    ray_t* vals = ray_list_new(7);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
         if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
         if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
         return ray_error("oom", NULL);
     }
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         int64_t k = ray_sym_intern(names[i], strlen(names[i]));
         keys = ray_vec_append(keys, &k);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-        ray_t* v = make_i64(vals_i[i]);
+        /* `inbound` is the direction: accepted here, or opened by .ipc.open */
+        ray_t* v = (i == 1) ? ray_bool(vals_i[i] != 0) : make_i64(vals_i[i]);
         vals = ray_list_append(vals, v); ray_release(v);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
