@@ -4028,7 +4028,7 @@ out:
 
 ray_t* ray_eval_str(const char* source) {
     ray_clear_error_trace();
-    ray_t* nfo = ray_nfo_create("repl", 4, source, strlen(source));
+    ray_t* nfo = ray_nfo_create(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME), source, strlen(source));
     ray_t* parsed = ray_parse_with_nfo(source, nfo);
     if (RAY_IS_ERR(parsed)) { ray_release(nfo); return parsed; }
 
