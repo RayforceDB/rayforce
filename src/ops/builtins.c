@@ -2080,16 +2080,50 @@ ray_t* ray_read_bytes_fn(ray_t* path_obj) {
     return read_file_bytes(path_obj, "read-bytes");
 }
 
-/* (load path) — read and evaluate a Rayfall script file via mmap */
+static bool load_path_is_absolute(const char* p) {
+    if (p[0] == '/' || p[0] == '\\') return true;
+#if defined(RAY_OS_WINDOWS)
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return true;
+#endif
+    return false;
+}
+
+/* Where a relative load path is looked for after the working directory:
+ * below $RAYFORCE_HOME, q's QHOME fallback (#506).  Fills `alt` with the
+ * candidate and returns true when a home is set and the path is relative. */
+static bool load_home_candidate(const char* path, char* alt, size_t cap) {
+    if (load_path_is_absolute(path)) return false;
+    const char* home = getenv("RAYFORCE_HOME");
+    if (!home || !*home) return false;
+    size_t hl = strlen(home);
+    while (hl > 1 && (home[hl - 1] == '/' || home[hl - 1] == '\\')) hl--;
+    int n = snprintf(alt, cap, "%.*s/%s", (int)hl, home, path);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* (load path) — read and evaluate a Rayfall script file via mmap.
+ *
+ * A relative path is resolved against the working directory first and,
+ * when that does not exist and RAYFORCE_HOME is set, below the home;
+ * an absolute path is used as given.  Nested loads follow the same rule
+ * (relative to the working directory, not to the loading file, as q
+ * does).  The path that was actually opened is what (.sys.args)
+ * reports as `source` while the file runs. */
 ray_t* ray_load_file_fn(ray_t* path_obj) {
     if (path_obj->type != -RAY_STR) return ray_error("type", "load: path must be str, got %s", ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
     if (!path) return ray_error("domain", "load: empty path");
     size_t path_len = ray_str_len(path_obj);
+    char alt[4096];
 
 #if defined(RAY_OS_WINDOWS)
     /* Windows: fall back to fread */
     FILE* fp = fopen(path, "r");
+    if (!fp && errno == ENOENT && load_home_candidate(path, alt, sizeof(alt))) {
+        fp = fopen(alt, "r");
+        if (!fp) return ray_error("io", "load \"%s\": %s (also tried \"%s\")", path, strerror(ENOENT), alt);
+        path = alt; path_len = strlen(alt);
+    }
     if (!fp) return ray_error("io", "load \"%s\": %s", path, strerror(errno));
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
@@ -2120,6 +2154,11 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
      * script's load is indistinguishable from an IPC, journal or storage
      * failure and sends diagnosis the wrong way (#505). */
     int fd = open(path, O_RDONLY);
+    if (fd < 0 && errno == ENOENT && load_home_candidate(path, alt, sizeof(alt))) {
+        fd = open(alt, O_RDONLY);
+        if (fd < 0) return ray_error("io", "load \"%s\": %s (also tried \"%s\")", path, strerror(ENOENT), alt);
+        path = alt; path_len = strlen(alt);
+    }
     if (fd < 0) return ray_error("io", "load \"%s\": %s", path, strerror(errno));
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size < 0) {

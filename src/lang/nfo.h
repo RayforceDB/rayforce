@@ -49,6 +49,10 @@ typedef union ray_span_t {
  *   [3] vals      (RAY_I64 vector — span ids)
  */
 
+/* Filename an nfo carries for input that came from no file — the REPL,
+ * ray_eval_str, a pipe.  (.sys.args) reports `source` as empty for it. */
+#define RAY_NFO_REPL_NAME  "repl"
+
 #define NFO_FILENAME(nfo)  ray_list_get((nfo), 0)
 #define NFO_SOURCE(nfo)    ray_list_get((nfo), 1)
 #define NFO_KEYS(nfo)      ray_list_get((nfo), 2)

@@ -24,6 +24,7 @@
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "lang/eval.h"  /* LAMBDA_PARAMS */
+#include "lang/nfo.h"   /* NFO_FILENAME */
 #include "lang/parse.h"
 #include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
 #include "ops/internal.h"   /* ray_group_perpart_runs — (.sys.mem) counter */
@@ -1372,12 +1373,37 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
 }
 
 /* (.sys.args) -- return the application-arguments dict (empty if unset) */
+/* The launcher dict is built once at startup; `source` is the one key
+ * that changes while the process runs — the file currently being
+ * evaluated (the innermost `load`, or the command-line script), by the
+ * path that was actually opened, so a script can locate its neighbours
+ * from any working directory (#506).  Empty at the REPL, under a pipe,
+ * or in a hook or timer outside any file — the same convention as
+ * `file`.  bash's $BASH_SOURCE next to $0. */
 ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("domain", ".sys.args takes no arguments");
     ray_t* d = (ray_t*)ray_runtime_get_sys_args();
-    if (d) { ray_retain(d); return d; }
-    return ray_dict_new(ray_sym_vec_new(RAY_SYM_W64, 0), ray_list_new(0));
+    ray_t* keys; ray_t* vals;
+    if (d) {
+        keys = ray_dict_keys(d); ray_retain(keys);   /* append COWs the shared vectors */
+        vals = ray_dict_vals(d); ray_retain(vals);
+    } else {
+        keys = ray_sym_vec_new(RAY_SYM_W64, 1);
+        vals = ray_list_new(1);
+    }
+    ray_t* nfo = ray_eval_get_nfo();
+    ray_t* src = (nfo && !RAY_IS_ERR(nfo)) ? NFO_FILENAME(nfo) : NULL;
+    bool is_file = src && !RAY_IS_ERR(src) && src->type == -RAY_STR &&
+                   !(ray_str_len(src) == strlen(RAY_NFO_REPL_NAME) &&
+                     memcmp(ray_str_ptr(src), RAY_NFO_REPL_NAME, ray_str_len(src)) == 0);
+    ray_t* sv = is_file ? (ray_retain(src), src) : ray_str("", 0);
+    int64_t k = ray_sym_intern("source", 6);
+    keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); ray_release(sv); return keys; }
+    vals = ray_list_append(vals, sv); ray_release(sv);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    return ray_dict_new(keys, vals);
 }
 
 /* ══════════════════════════════════════════
