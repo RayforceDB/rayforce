@@ -108,6 +108,9 @@
 ;; user-visible reads still return plain intern ids
 (sym-name (at (at (query sd (find ?n) (where (1 :name ?n))) '?n) 0)) -- 'Alice
 (sym-name (get (pull sd 1) 'name)) -- 'Alice
+;; a "foo" STR literal means the symbol named "foo" (assert-fact only ever
+;; stores an integer or a symbol), so it matches the SYM-tagged cell too.
+(count (query sd (find ?e) (where (?e :name "Alice")))) -- 1
 (set sd (retract-fact sd 1 'name 'Alice))
 (count (query sd (find ?e) (where (?e :name 'Alice)))) -- 0
 (count sd) -- 1

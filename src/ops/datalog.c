@@ -1092,7 +1092,17 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
  * wrongly call that a match. Callers pass strict_tag only for that
  * column — every other column (the "a" column included, and any
  * rule-derived relation) is never DATOM-tagged, so the lenient direct
- * compare remains correct and necessary there. */
+ * compare remains correct and necessary there.
+ *
+ * Audit #1.5 is about integers vs symbols, not strings vs symbols:
+ * assert-fact only ever stores an integer or a symbol, so a `"foo"` STR
+ * literal in a triple pattern can only mean the symbol named "foo" — the
+ * frontend comment above already interns a STR literal as a sym for
+ * exactly this reason. So under strict_tag a RAY_STR literal matches a
+ * DL_DATOM_TAG_SYM-tagged cell by payload (as well as a STR-tagged one,
+ * should a future frontend ever write that tag); a RAY_SYM literal
+ * matches only a SYM-tagged cell; a RAY_I64 literal matches only a
+ * genuinely untagged cell, numerically. */
 static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
                           int8_t const_type, bool strict_tag) {
     if (col->type == RAY_F64) {
@@ -1111,7 +1121,7 @@ static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
         if (cell_tag == 0) return false;  /* plain int column */
         int64_t cell_payload = cell & DL_DATOM_PAYLOAD;
         if (const_type == RAY_STR &&
-            cell_tag == DL_DATOM_TAG_STR)
+            (cell_tag == DL_DATOM_TAG_STR || cell_tag == DL_DATOM_TAG_SYM))
             return cell_payload == value;
         if (const_type == RAY_SYM &&
             cell_tag == DL_DATOM_TAG_SYM)
