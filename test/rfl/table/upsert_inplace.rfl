@@ -242,3 +242,17 @@
 (count x) -- 5
 (at (at x 'v) 3) -- 444
 (at (at x 'k) 4) -- 5
+
+;; An update that writes no key column leaves the key->row mapping exactly as
+;; it was, so the map is kept rather than dropped; one that writes a key
+;; column still has to drop it, which the `u` case above pins.
+(set q (table [k v] (list [1 2 3] [10 20 30])))
+(upsert 'q 1 (table [k v] (list [4 5] [40 50])))
+(count q) -- 5
+(update {from: 'q v: 99 where: (== k 2)})
+(count q) -- 5
+(at (at q 'v) 1) -- 99
+(upsert 'q 1 (table [k v] (list [2 6] [222 60])))
+(count q) -- 6
+(at (at q 'v) 1) -- 222
+(at (at q 'k) 5) -- 6

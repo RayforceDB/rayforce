@@ -11821,10 +11821,6 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     for (int64_t c = 0; c < ncols; c++)
         if (slots[c]->rc != 1 || !upsert_col_ok(slots[c])) return NULL;
 
-    /* This path can rewrite a key cell while leaving the row count alone,
-     * which is precisely what upsert's key map cannot detect.  Drop it. */
-    ray_table_ukey_drop(tbl);
-
     DICT_VIEW_DECL(updf);
     DICT_VIEW_OPEN(dict, updf);
     if (DICT_VIEW_OVERFLOW(updf)) { DICT_VIEW_CLOSE(updf); *handled = true; return ray_error("oom", NULL); }
@@ -11862,6 +11858,23 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
         return NULL;
     }
     *handled = true;
+
+    /* Only a write into a key column can invalidate upsert's key map, and
+     * that is the one mutation its recorded row count cannot see: a cell
+     * rewrite leaves the count alone.  An update of any other column leaves
+     * the mapping exactly as it was — dropping it there would send the next
+     * batch back to rebuilding over every row for nothing.  ucol[0..nu) is
+     * the complete set of columns this path writes. */
+    {
+        ray_index_t* kix = ray_table_ukey_get(tbl);
+        if (kix) {
+            bool hits_key = false;
+            for (int64_t i = 0; i < nu && !hits_key; i++)
+                for (int64_t kk = 0; kk < kix->u.ukey.nk; kk++)
+                    if (kix->u.ukey.kci[kk] == (int32_t)ucol[i]) { hits_key = true; break; }
+            if (hits_key) ray_table_ukey_drop(tbl);
+        }
+    }
 
     /* Matched rows: index probe, else the legacy mask. */
     ray_t* rows_hdr = NULL; int64_t* rows = NULL; int64_t k = 0;
@@ -13966,6 +13979,10 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
 
 /* (insert table (list val1 val2 ...)) — append a row to a table
  * (insert parted partition-key rows) — grow the explicit live tail */
+/* Defined with the rest of the upsert key-map helpers below; the in-place
+ * insert arm needs it here. */
+static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0);
+
 ray_t* ray_insert_fn(ray_t** args, int64_t n) {
     return ray_insert(args, n);
 }
@@ -14517,6 +14534,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 }
                 col->len = nrows;
             }
+        } else {
+            /* insert appends without consulting keys, and in ascending row
+             * order, so the map's "duplicates answer lowest row first"
+             * invariant survives entering the new rows as they landed. */
+            ukey_extend_after_append(tbl, nrows);
         }
         if (dict_vals) {
             ray_t** dv = (ray_t**)ray_data(dict_vals);
@@ -14837,6 +14859,32 @@ static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     uint64_t s = h & mp->mask;
     while (mp->slot[s] != 0) s = (s + 1) & mp->mask;
     mp->slot[s] = row + 1;
+}
+
+/* Rows nrows0..n-1 were just appended in row order.  Entering them costs
+ * what the append already cost, and it keeps the map describing the table:
+ * left behind, it sends the next upsert back to rebuilding over every row,
+ * which is the whole cost this map exists to avoid.  A map that cannot take
+ * them is dropped rather than left naming a shorter table. */
+static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
+    ray_index_t* ix = ray_table_ukey_get(tbl);
+    if (!ix) return;
+    int64_t n = ray_table_nrows(tbl);
+    if (ix->u.ukey.nrows != nrows0 || n < nrows0 ||
+        (uint64_t)n * 2 > ix->u.ukey.mask + 1) {
+        ray_table_ukey_drop(tbl);
+        return;
+    }
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    if (!cols || RAY_IS_ERR(cols)) { ray_table_ukey_drop(tbl); return; }
+    ray_t** slots = (ray_t**)ray_data(cols);
+    int64_t kci[RAY_UKEY_MAX_COLS];
+    int64_t nk = ix->u.ukey.nk;
+    for (int64_t k = 0; k < nk; k++) kci[k] = ix->u.ukey.kci[k];
+    upsert_map_t map = { NULL, (int64_t*)ray_data(ix->u.ukey.slots), ix->u.ukey.mask };
+    for (int64_t r = nrows0; r < n; r++)
+        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+    ix->u.ukey.nrows = n;
 }
 
 /* Does this table-resident map still describe the table, and can it take
