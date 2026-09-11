@@ -2052,6 +2052,33 @@ static test_result_t test_query_admission_errors(void) {
     PASS();
 }
 
+/* Task 11: a stratum with an assignment literal can manufacture new values
+ * forever, so it keeps the DL_MAX_ITER_NONMONOTONE cap and must report the
+ * specific "fixpoint did not converge" message (not just a generic
+ * "evaluation failed") when it hits that cap. One row grows by exactly one
+ * new integer per iteration, so 1000 iterations finish quickly even under
+ * ASan. */
+static test_result_t test_fixpoint_nonconvergence_message(void) {
+    ray_t* seed = ray_eval_str(
+        "(do (set __fnm_db (datoms)) (set __fnm_db (assert-fact __fnm_db 0 'edge 1)))");
+    TEST_ASSERT_NOT_NULL(seed);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(seed));
+    ray_release(seed);
+
+    ray_t* r = ray_eval_str(
+        "(query __fnm_db (find ?x) (where (nat ?x)) "
+        "  (rules ((nat ?x) (?x :edge ?y)) "
+        "         ((nat ?y) (nat ?x) (= ?y (+ ?x 1)))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_TRUE(strstr(msg, "fixpoint did not converge") != NULL);
+    ray_error_free(r);
+
+    PASS();
+}
+
 /* ray_release() is a deliberate no-op for RAY_ERROR objects, so callers
  * that claim to be "releasing" an error under the refcount API actually
  * leak the block.  ray_error_free() is the escape hatch that calls
@@ -2378,6 +2405,142 @@ static test_result_t test_builtin_abs(void) {
     PASS();
 }
 
+/* Audit final review #2: a rule clause whose expression tree is built but
+ * then rejected must free that tree.  Three shapes:
+ *   - a comparison where one operand parses and the other does not,
+ *   - a comparison at DL_MAX_BODY capacity (dl_rule_add_cmp_expr fails),
+ *   - an assignment at DL_MAX_BODY capacity (dl_rule_add_assign fails).
+ *   - a nested arithmetic expression whose inner operand parses and whose
+ *     outer one does not (dl_build_expr's own binop path).
+ * Each leaked one or more dl_expr_t blocks before the fix, so live bytes
+ * climbed linearly with the repetition count.  (The equivalent RFL check is
+ * not possible: catching the error with `try` leaks ~64 bytes per call on
+ * its own, unrelated to datalog.) */
+static test_result_t test_rule_expr_error_paths_no_leak(void) {
+    /* 16 body atoms == DL_MAX_BODY, so the 17th clause is always rejected. */
+    #define SIXTEEN "(a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) " \
+                    "(a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) "
+    static const char* const srcs[] = {
+        "(rule (q ?x) (a ?x) (> (+ ?x 1) \"z\"))",
+        "(rule (q ?y) (a ?x) (= ?y (+ (+ ?x 1) \"z\")))",
+        "(rule (q ?x) " SIXTEEN "(> (+ ?x 1) (* ?x 2)))",
+        "(rule (q ?y) " SIXTEEN "(= ?y (+ ?x 1)))",
+    };
+    #undef SIXTEEN
+    const int n_srcs = (int)(sizeof(srcs) / sizeof(srcs[0]));
+
+    /* Warm up: the first evaluation of each form interns symbols and grows
+     * parser-side caches, which is a one-off cost, not a leak. */
+    for (int i = 0; i < n_srcs; i++)
+        for (int w = 0; w < 4; w++) {
+            ray_t* e = ray_eval_str(srcs[i]);
+            TEST_ASSERT_NOT_NULL(e);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+            ray_error_free(e);
+        }
+
+    ray_mem_stats_t before, after;
+    ray_mem_stats(&before);
+    for (int it = 0; it < 200; it++)
+        for (int i = 0; i < n_srcs; i++) {
+            ray_t* e = ray_eval_str(srcs[i]);
+            TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+            ray_error_free(e);
+        }
+    ray_mem_stats(&after);
+
+    TEST_ASSERT((after.bytes_allocated) <= (before.bytes_allocated),
+                "rejected rule clauses free their expression trees");
+    PASS();
+}
+
+/* Audit final review #4: dl_builtin_duration_since must not compute a
+ * signed overflow (UB).  T2 = INT64_MAX, T1 = -1 overflows, and a NULL_I64
+ * operand poisons the result; both yield the I64 null. */
+static test_result_t test_builtin_duration_since_overflow(void) {
+    /* One row only: a key column holding two values this far apart makes
+     * the group-by engine's (max - min + 1) range computation overflow,
+     * which is a separate, pre-existing issue not under test here. */
+    int64_t t1_vals[] = { -1 };
+    int64_t t2_vals[] = { INT64_MAX };
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, t1_vals, 1);
+    ray_t* c2 = ray_vec_from_raw(RAY_I64, t2_vals, 1);
+    ray_t* span = ray_table_new(2);
+    span = ray_table_add_col(span, ray_sym_intern("span__c0", 8), c1);
+    span = ray_table_add_col(span, ray_sym_intern("span__c1", 8), c2);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "span", span, 2), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "dur", 3);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    dl_rule_head_var(&r, 2, 2);
+    int body = dl_rule_add_atom(&r, "span", 2);
+    dl_body_set_var(&r, body, 0, 0);
+    dl_body_set_var(&r, body, 1, 1);
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_DURATION_SINCE, 3);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 1);
+    dl_body_set_var(&r, bi, 2, 2);
+    r.n_vars = 3;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "dur");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
+    ray_t* dcol = ray_table_get_col_idx(out, 2);
+    TEST_ASSERT_NOT_NULL(dcol);
+    int64_t* dd = (int64_t*)ray_data(dcol);
+    TEST_ASSERT(dd[0] == NULL_I64, "INT64_MAX - (-1) is the I64 null");
+
+    dl_program_free(prog);
+    ray_release(span); ray_release(c1); ray_release(c2);
+    PASS();
+}
+
+/* Audit final review #4: -INT64_MIN is not representable, so dl_builtin_abs
+ * must yield the I64 null there instead of negating (UB). */
+static test_result_t test_builtin_abs_int64_min(void) {
+    /* One row only — see the note in the duration_since test above. */
+    int64_t vals[] = { INT64_MIN };
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, 1);
+    ray_t* signed_t = ray_table_new(1);
+    signed_t = ray_table_add_col(signed_t, ray_sym_intern("signed__c0", 10), col);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "signed", signed_t, 1), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "pos", 2);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    int body = dl_rule_add_atom(&r, "signed", 1);
+    dl_body_set_var(&r, body, 0, 0);
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_ABS, 2);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 1);
+    r.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "pos");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
+    ray_t* ycol = ray_table_get_col_idx(out, 1);
+    TEST_ASSERT_NOT_NULL(ycol);
+    int64_t* yd = (int64_t*)ray_data(ycol);
+    TEST_ASSERT(yd[0] == NULL_I64, "|INT64_MIN| is the I64 null");
+
+    dl_program_free(prog);
+    ray_release(signed_t); ray_release(col);
+    PASS();
+}
+
 /* dl_rule_add_builtin guard: returning -1 when n_body has reached
  * DL_MAX_BODY.  Saturate the body literals first, then the next
  * builtin add must report -1. */
@@ -2551,6 +2714,62 @@ static test_result_t test_nonlinear_closure_chain(void) {
     PASS();
 }
 
+/* Old/new split (Task 14): a rule with THREE recursive atoms.  Positions 0
+ * and 1 read the pre-iteration prefix of `p` whenever the delta sits to
+ * their right, so every derivation must still be found exactly as with the
+ * full relation.  The third rule is logically redundant (it derives nothing
+ * the two-atom rule misses), so the oracle stays the plain transitive
+ * closure of a 7-edge chain: 8 nodes, 28 ordered pairs. */
+static test_result_t test_nonlinear_three_atom_closure(void) {
+    int64_t src[7], dst[7];
+    for (int i = 0; i < 7; i++) { src[i] = i + 1; dst[i] = i + 2; }
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, src, 7);
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, dst, 7);
+    ray_t* edge = ray_table_new(2);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c0", 8), c0);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c1", 8), c1);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "edge", edge, 2), 0);
+
+    dl_rule_t r1;                      /* p(X,Y) :- edge(X,Y) */
+    dl_rule_init(&r1, "p", 2);
+    dl_rule_head_var(&r1, 0, 0); dl_rule_head_var(&r1, 1, 1);
+    int b = dl_rule_add_atom(&r1, "edge", 2);
+    dl_body_set_var(&r1, b, 0, 0); dl_body_set_var(&r1, b, 1, 1);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r1), 0);
+
+    dl_rule_t r2;                      /* p(X,Z) :- p(X,Y), p(Y,Z) */
+    dl_rule_init(&r2, "p", 2);
+    dl_rule_head_var(&r2, 0, 0); dl_rule_head_var(&r2, 1, 2);
+    int b1 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b1, 0, 0); dl_body_set_var(&r2, b1, 1, 1);
+    int b2 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b2, 0, 1); dl_body_set_var(&r2, b2, 1, 2);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r2), 1);
+
+    dl_rule_t r3;                      /* p(X,W) :- p(X,Y), p(Y,Z), p(Z,W) */
+    dl_rule_init(&r3, "p", 2);
+    dl_rule_head_var(&r3, 0, 0); dl_rule_head_var(&r3, 1, 3);
+    int b3 = dl_rule_add_atom(&r3, "p", 2);
+    dl_body_set_var(&r3, b3, 0, 0); dl_body_set_var(&r3, b3, 1, 1);
+    int b4 = dl_rule_add_atom(&r3, "p", 2);
+    dl_body_set_var(&r3, b4, 0, 1); dl_body_set_var(&r3, b4, 1, 2);
+    int b5 = dl_rule_add_atom(&r3, "p", 2);
+    dl_body_set_var(&r3, b5, 0, 2); dl_body_set_var(&r3, b5, 1, 3);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r3), 2);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "p");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 28);
+
+    dl_program_free(prog);
+    ray_release(edge); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
 /* Audit §1.4: an I64 literal against an F64 EDB column must filter, not
  * pass the whole table through. */
 static test_result_t test_const_filter_f64_column(void) {
@@ -2710,6 +2929,250 @@ static test_result_t test_rule_expr_ownership(void) {
     PASS();
 }
 
+/* ===== dl_rowset_t: incremental row set (Task 12) ===== */
+
+/* Candidate rows are deduped against the existing relation AND among
+ * themselves, in first-occurrence order. */
+static test_result_t test_rowset_extract_new(void) {
+    int64_t a0[] = {1, 2, 3}, a1[] = {10, 20, 30};
+    ray_t* fa = ray_table_new(2);
+    fa = ray_table_add_col(fa, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, a0, 3));
+    fa = ray_table_add_col(fa, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, a1, 3));
+    int64_t c0[] = {2, 4, 4, 3}, c1[] = {20, 40, 40, 31};   /* (2,20) dup of full; (4,40) twice; (3,31) new */
+    ray_t* ca = ray_table_new(2);
+    ca = ray_table_add_col(ca, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, c0, 4));
+    ca = ray_table_add_col(ca, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, c1, 4));
+
+    dl_rowset_t s;
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 4), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, fa), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 3);
+    ray_t* delta = dl_rowset_extract_new(&s, fa, ca);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta), 2);
+    TEST_ASSERT_EQ_I((int)s.n, 5);
+    int64_t* dx = (int64_t*)ray_data(ray_table_get_col_idx(delta, 0));
+    TEST_ASSERT_EQ_I((int)dx[0], 4);
+    TEST_ASSERT_EQ_I((int)dx[1], 3);
+    ray_release(delta); dl_rowset_free(&s);
+    ray_release(fa); ray_release(ca);
+    PASS();
+}
+
+/* SYM columns: the two tables' sym vectors are built independently and at
+ * different adaptive widths (W64 vs W8).  Both resolve against the runtime
+ * domain, so equal symbols carry equal ids and must dedupe -- this is the
+ * property dl_rowset_comparable() guards before the fast path is taken. */
+static test_result_t test_rowset_extract_new_sym(void) {
+    int64_t sa = ray_sym_intern("alpha", 5);
+    int64_t sb = ray_sym_intern("beta", 4);
+    int64_t sc = ray_sym_intern("gamma", 5);
+
+    ray_t* fcol = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_NOT_NULL(fcol);
+    fcol->len = 2;
+    ray_write_sym(ray_data(fcol), 0, (uint64_t)sa, fcol->type, fcol->attrs);
+    ray_write_sym(ray_data(fcol), 1, (uint64_t)sb, fcol->type, fcol->attrs);
+    ray_t* full = ray_table_new(1);
+    full = ray_table_add_col(full, ray_sym_intern("s", 1), fcol);
+
+    /* Independently built, narrower storage, same runtime domain. */
+    ray_t* ccol = ray_sym_vec_new(RAY_SYM_W8, 3);
+    TEST_ASSERT_NOT_NULL(ccol);
+    ccol->len = 3;
+    ray_write_sym(ray_data(ccol), 0, (uint64_t)sb, ccol->type, ccol->attrs);   /* dup of full */
+    ray_write_sym(ray_data(ccol), 1, (uint64_t)sc, ccol->type, ccol->attrs);   /* new */
+    ray_write_sym(ray_data(ccol), 2, (uint64_t)sc, ccol->type, ccol->attrs);   /* dup within cand */
+    ray_t* cand = ray_table_new(1);
+    cand = ray_table_add_col(cand, ray_sym_intern("s", 1), ccol);
+
+    dl_rowset_t s;
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 2), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, full), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 2);
+    ray_t* delta = dl_rowset_extract_new(&s, full, cand);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta), 1);
+    TEST_ASSERT_EQ_I((int)s.n, 3);
+    ray_t* dcol = ray_table_get_col_idx(delta, 0);
+    TEST_ASSERT_EQ_I((int)ray_read_sym(ray_data(dcol), 0, dcol->type, dcol->attrs), (int)sc);
+    ray_release(delta); dl_rowset_free(&s);
+    ray_release(full); ray_release(cand);
+    ray_release(fcol); ray_release(ccol);
+    PASS();
+}
+
+/* F64 row identity must fold exactly as the engine's distinct does
+ * (canon_f64_key / group.c): -0.0 keys as +0.0 and every NaN payload as one
+ * canonical NaN.  If it did not, an IDB with an F64 column would give
+ * different answers depending on whether an iteration went through the row
+ * set or through the vectorised table_distinct in front of it. */
+static test_result_t test_rowset_f64_canonical_keys(void) {
+    int64_t k0[] = {1};
+    double  v0[] = {0.0};                      /* relation holds (1, +0.0) */
+    ray_t* full = ray_table_new(2);
+    full = ray_table_add_col(full, ray_sym_intern("k", 1), ray_vec_from_raw(RAY_I64, k0, 1));
+    full = ray_table_add_col(full, ray_sym_intern("v", 1), ray_vec_from_raw(RAY_F64, v0, 1));
+
+    /* Two NaNs with different payloads, built by punning so the bit
+     * patterns really do differ. */
+    uint64_t nan_a_bits = 0x7FF8000000000001ULL;
+    uint64_t nan_b_bits = 0x7FF8000000000002ULL;
+    double nan_a, nan_b;
+    memcpy(&nan_a, &nan_a_bits, sizeof(nan_a));
+    memcpy(&nan_b, &nan_b_bits, sizeof(nan_b));
+    TEST_ASSERT_TRUE(nan_a != nan_a);
+    TEST_ASSERT_TRUE(nan_b != nan_b);
+
+    int64_t k1[] = {1, 1, 1};
+    double  v1[] = {-0.0, 0.0, 0.0};
+    ray_t* cand = ray_table_new(2);
+    cand = ray_table_add_col(cand, ray_sym_intern("k", 1), ray_vec_from_raw(RAY_I64, k1, 3));
+    ray_t* cv = ray_vec_from_raw(RAY_F64, v1, 3);
+    ((double*)ray_data(cv))[1] = nan_a;
+    ((double*)ray_data(cv))[2] = nan_b;
+    cand = ray_table_add_col(cand, ray_sym_intern("v", 1), cv);
+
+    dl_rowset_t s;
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 4), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, full), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 1);
+
+    /* (1,-0.0) folds onto the stored (1,+0.0); the two NaNs fold onto each
+     * other, so exactly one new row survives. */
+    ray_t* delta = dl_rowset_extract_new(&s, full, cand);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta), 1);
+    TEST_ASSERT_EQ_I((int)s.n, 2);
+    double dv = ((double*)ray_data(ray_table_get_col_idx(delta, 1)))[0];
+    TEST_ASSERT_TRUE(dv != dv);   /* the surviving row is the NaN one */
+
+    ray_release(delta); dl_rowset_free(&s);
+    ray_release(full); ray_release(cand); ray_release(cv);
+    PASS();
+}
+
+/* The fallback path in dl_eval rebuilds the set from the merged relation
+ * (free + init + add_table) after a distinct/antijoin iteration, because
+ * ray_vec_concat may have re-expressed SYM cells.  Exercise that exact
+ * sequence: entries seeded from A must be discarded and re-derived against
+ * A-union-B, and a later extraction must reject candidates matching rows
+ * from either half. */
+static test_result_t test_rowset_rebuild_after_fallback(void) {
+    int64_t a0[] = {1, 2}, a1[] = {10, 20};
+    ray_t* ta = ray_table_new(2);
+    ta = ray_table_add_col(ta, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, a0, 2));
+    ta = ray_table_add_col(ta, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, a1, 2));
+
+    dl_rowset_t s;
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 2), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, ta), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 2);
+
+    /* An iteration took the generic path and appended B to the relation. */
+    int64_t m0[] = {1, 2, 3, 4}, m1[] = {10, 20, 30, 40};
+    ray_t* merged = ray_table_new(2);
+    merged = ray_table_add_col(merged, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, m0, 4));
+    merged = ray_table_add_col(merged, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, m1, 4));
+
+    dl_rowset_free(&s);
+    TEST_ASSERT_EQ_I((int)s.cap, 0);
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 4), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, merged), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 4);
+
+    /* Candidates overlapping the A half (1,10), the B half (4,40), a repeat
+     * of the B half, and one genuinely new row. */
+    int64_t c0[] = {1, 4, 4, 5}, c1[] = {10, 40, 40, 50};
+    ray_t* cand = ray_table_new(2);
+    cand = ray_table_add_col(cand, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, c0, 4));
+    cand = ray_table_add_col(cand, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, c1, 4));
+
+    ray_t* delta = dl_rowset_extract_new(&s, merged, cand);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta), 1);
+    TEST_ASSERT_EQ_I((int)s.n, 5);
+    TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(delta, 0)))[0], 5);
+    TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(delta, 1)))[0], 50);
+
+    /* The new row was recorded at index nrows(merged) + 0, so re-offering it
+     * against the once-more-extended relation must still be rejected. */
+    int64_t u0[] = {1, 2, 3, 4, 5}, u1[] = {10, 20, 30, 40, 50};
+    ray_t* merged2 = ray_table_new(2);
+    merged2 = ray_table_add_col(merged2, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, u0, 5));
+    merged2 = ray_table_add_col(merged2, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, u1, 5));
+    ray_t* delta2 = dl_rowset_extract_new(&s, merged2, cand);
+    TEST_ASSERT_NOT_NULL(delta2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta2));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta2), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 5);
+
+    ray_release(delta); ray_release(delta2); dl_rowset_free(&s);
+    ray_release(ta); ray_release(merged); ray_release(merged2); ray_release(cand);
+    PASS();
+}
+
+/* dl_eval's fallback branch, end to end: an IDB whose columns are RAY_STR
+ * cannot be keyed by the row set (dl_cell_key reads only I64/SYM/F64), so
+ * seeding fails, `set_off` latches, and the whole stratum runs on
+ * table_distinct + table_antijoin.  The closure must still come out right.
+ * Recursion is required — a non-recursive rule never reaches the merge
+ * block this guards. */
+static test_result_t test_rowset_fallback_unsupported_coltype(void) {
+    static const char* const froms[] = {"a", "b", "c"};
+    static const char* const tos[]   = {"b", "c", "d"};
+    const uint32_t lens[] = {1, 1, 1};
+    ray_t* fc = ray_str_vec_from_parts(froms, lens, NULL, 3);
+    ray_t* tc_col = ray_str_vec_from_parts(tos, lens, NULL, 3);
+    TEST_ASSERT_NOT_NULL(fc);
+    TEST_ASSERT_NOT_NULL(tc_col);
+    TEST_ASSERT_EQ_I(fc->type, RAY_STR);
+
+    ray_t* edge = ray_table_new(2);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c0", 8), fc);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c1", 8), tc_col);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_TRUE(dl_add_edb(prog, "edge", edge, 2) >= 0);
+
+    /* tc(?x, ?y) :- (edge ?x ?y) */
+    dl_rule_t base; dl_rule_init(&base, "tc", 2);
+    dl_rule_head_var(&base, 0, 0);
+    dl_rule_head_var(&base, 1, 1);
+    int b0 = dl_rule_add_atom(&base, "edge", 2);
+    dl_body_set_var(&base, b0, 0, 0);
+    dl_body_set_var(&base, b0, 1, 1);
+    base.n_vars = 2;
+    dl_add_rule(prog, &base);
+
+    /* tc(?x, ?z) :- (edge ?x ?y) (tc ?y ?z) */
+    dl_rule_t rec; dl_rule_init(&rec, "tc", 2);
+    dl_rule_head_var(&rec, 0, 0);
+    dl_rule_head_var(&rec, 1, 2);
+    int r0 = dl_rule_add_atom(&rec, "edge", 2);
+    dl_body_set_var(&rec, r0, 0, 0);
+    dl_body_set_var(&rec, r0, 1, 1);
+    int r1 = dl_rule_add_atom(&rec, "tc", 2);
+    dl_body_set_var(&rec, r1, 0, 1);
+    dl_body_set_var(&rec, r1, 1, 2);
+    rec.n_vars = 3;
+    dl_add_rule(prog, &rec);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "tc");
+    TEST_ASSERT_NOT_NULL(out);
+    /* a->b,c,d  b->c,d  c->d */
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 6);
+
+    dl_program_free(prog);
+    ray_release(edge); ray_release(fc); ray_release(tc_col);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2759,6 +3222,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/env_bound_agg_auto_register", test_env_bound_agg_auto_register, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/eval_surfaces_compile_failure", test_eval_surfaces_compile_failure, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/query_admission_errors", test_query_admission_errors, datalog_rf_setup, datalog_rf_teardown },
+    { "datalog/fixpoint_nonconvergence_message", test_fixpoint_nonconvergence_message, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/error_free_reclaims", test_error_free_reclaims, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/agg_scalar_f64", test_agg_scalar_f64, datalog_setup, datalog_teardown },
     { "datalog/agg_scalar_f64_sum_empty", test_agg_scalar_f64_sum_empty, datalog_setup, datalog_teardown },
@@ -2772,13 +3236,22 @@ const test_entry_t datalog_entries[] = {
     { "datalog/builtin_before_empty", test_builtin_before_empty, datalog_setup, datalog_teardown },
     { "datalog/builtin_duration_since", test_builtin_duration_since, datalog_setup, datalog_teardown },
     { "datalog/builtin_abs", test_builtin_abs, datalog_setup, datalog_teardown },
+    { "datalog/rule_expr_error_paths_no_leak", test_rule_expr_error_paths_no_leak, datalog_rf_setup, datalog_rf_teardown },
+    { "datalog/builtin_duration_since_overflow", test_builtin_duration_since_overflow, datalog_setup, datalog_teardown },
+    { "datalog/builtin_abs_int64_min", test_builtin_abs_int64_min, datalog_setup, datalog_teardown },
     { "datalog/rule_add_builtin_overflow", test_rule_add_builtin_overflow, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval", test_rule_add_interval, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
     { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
+    { "datalog/nonlinear_three_atom_closure", test_nonlinear_three_atom_closure, datalog_setup, datalog_teardown },
     { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
     { "datalog/rule_expr_ownership", test_rule_expr_ownership, datalog_setup, datalog_teardown },
+    { "datalog/rowset_extract_new", test_rowset_extract_new, datalog_setup, datalog_teardown },
+    { "datalog/rowset_extract_new_sym", test_rowset_extract_new_sym, datalog_setup, datalog_teardown },
+    { "datalog/rowset_f64_canonical_keys", test_rowset_f64_canonical_keys, datalog_setup, datalog_teardown },
+    { "datalog/rowset_rebuild_after_fallback", test_rowset_rebuild_after_fallback, datalog_setup, datalog_teardown },
+    { "datalog/rowset_fallback_unsupported_coltype", test_rowset_fallback_unsupported_coltype, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

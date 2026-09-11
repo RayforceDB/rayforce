@@ -569,15 +569,22 @@
 
 
 ;; --- Claim 4: fixpoint non-convergence must error loudly, not return a partial result ---
-;; Reachability over a linear chain needs ~N iterations. The loop caps at 1000.
+;; Reachability over a linear chain needs ~N iterations. Pure relational
+;; (monotone) strata run uncapped as of Task 11 -- see
+;; docs/superpowers/specs/2026-09-08-datalog-audit.md §4 -- so this always
+;; converges to the correct count regardless of chain length; the
+;; 1000-iteration cap now applies only to strata with assignment/builtin/
+;; interval literals (see test/rfl/datalog/audit_regressions.rfl §4 for that
+;; non-convergence case).
 (set DbF (datoms))
 (set seedF (table ['n] (list [0])))
-;; 500-edge chain converges (~500 iters < 1000) -> correct count.
+;; 500-edge chain converges (~500 iters) -> correct count.
 (set edge500 (table ['from 'to] (list (til 500) (+ (til 500) 1))))
 (count (query DbF (find ?y) (where (reachA ?y)) (rules ((reachA ?y) (seedF ?x) (edge500 ?x ?y)) ((reachA ?y) (reachA ?x) (edge500 ?x ?y))))) -- 500
-;; 1100-edge chain needs >1000 iters -> non-convergence -> loud error (was silent partial).
+;; 1100-edge chain (>1000 iters -- would have hit the old blanket cap) ->
+;; still converges correctly now that the cap only guards non-monotone strata.
 (set edge1100 (table ['from 'to] (list (til 1100) (+ (til 1100) 1))))
-(query DbF (find ?y) (where (reachB ?y)) (rules ((reachB ?y) (seedF ?x) (edge1100 ?x ?y)) ((reachB ?y) (reachB ?x) (edge1100 ?x ?y)))) !- domain
+(count (query DbF (find ?y) (where (reachB ?y)) (rules ((reachB ?y) (seedF ?x) (edge1100 ?x ?y)) ((reachB ?y) (reachB ?x) (edge1100 ?x ?y))))) -- 1100
 
 ;; --- Claim 7: repeated-variable self-join (?x :edge ?x) returns only self-loops ---
 ;; Verified-correct behavior (review flagged as possibly asymmetric; it is not).

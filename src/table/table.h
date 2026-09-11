@@ -37,4 +37,10 @@
 
 int64_t ray_parted_nrows(ray_t* parted_col);
 
+/* Borrowed column-slot array of `tbl`, or NULL unless the table block and its
+ * column list are both uniquely owned.  For in-place column growth: the caller
+ * overwrites a slot with a column it grew (and thus owns); the previous
+ * pointer must NOT be released — a reallocating append already freed it. */
+ray_t** ray_table_cols_mut(ray_t* tbl);
+
 #endif /* RAY_TABLE_H */

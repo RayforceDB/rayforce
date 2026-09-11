@@ -90,6 +90,39 @@ static test_result_t test_vec_append(void) {
     PASS();
 }
 
+/* ---- vec_append_raw (bulk append: growth + COW isolation) -------------- */
+
+static test_result_t test_vec_append_raw_grows(void) {
+    int64_t a[] = {1, 2}, b[] = {3, 4, 5};
+    ray_t* v = ray_vec_from_raw(RAY_I64, a, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    /* Bulk append past the initial capacity keeps both runs in order. */
+    v = ray_vec_append_raw(v, b, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 5);
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int i = 0; i < 5; i++) TEST_ASSERT_EQ_I(d[i], i + 1);
+
+    /* Appending n == 0 is a no-op that returns the same vector. */
+    ray_t* same = ray_vec_append_raw(v, b, 0);
+    TEST_ASSERT_TRUE(same == v);
+
+    /* Shared vector (rc == 2) must be copied, leaving the sharer intact. */
+    ray_t* shared = v;
+    ray_retain(shared);
+    ray_t* w = ray_vec_append_raw(v, b, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    TEST_ASSERT_TRUE(w != shared);
+    TEST_ASSERT_EQ_I(shared->len, 5);
+    TEST_ASSERT_EQ_I(w->len, 6);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(w))[5], 3);
+
+    ray_release(w);
+    ray_release(shared);
+    PASS();
+}
+
 /* ---- vec_get ----------------------------------------------------------- */
 
 static test_result_t test_vec_get(void) {
@@ -2266,6 +2299,7 @@ const test_entry_t vec_entries[] = {
     { "vec/slice_release_parent_ref", test_vec_slice_release_parent_ref, vec_setup, vec_teardown },
     { "vec/null_large_release", test_vec_null_large_release, vec_setup, vec_teardown },
     { "vec/append_grow", test_vec_append_grow, vec_setup, vec_teardown },
+    { "vec/append_raw_grows", test_vec_append_raw_grows, vec_setup, vec_teardown },
     { "vec/type_correctness", test_vec_type_correctness, vec_setup, vec_teardown },
     { "vec/empty", test_vec_empty, vec_setup, vec_teardown },
     { "vec/bool", test_vec_bool, vec_setup, vec_teardown },

@@ -61,6 +61,12 @@
 
 #define DL_AGG_MAX_KEYS 8
 
+/* Fixpoint iteration cap for strata whose rules can manufacture new values
+ * (DL_ASSIGN / DL_BUILTIN / DL_INTERVAL literals) and therefore are not
+ * guaranteed to terminate over a finite domain. Purely relational
+ * (monotone) strata run uncapped -- see dl_eval in datalog.c. */
+#define DL_MAX_ITER_NONMONOTONE 1000
+
 /* ===== Assignment operators (for DL_ASSIGN) ===== */
 #define DL_OP_EQ    0   /* simple assignment: X = expr */
 
@@ -205,6 +211,14 @@ typedef struct {
     int     arity;                  /* number of columns */
     bool    is_idb;                 /* true = derived (intensional) */
     int64_t col_names[DL_MAX_ARITY]; /* interned column name symbols */
+    /* Per-column "may carry a DATOM tag" provenance.  Only values that came
+     * from a datoms `v` column can be tagged, so only those columns are
+     * untagged on output (dl_untag_i64_col in ray_query_fn) -- a plain I64
+     * column of large hashes, or an arithmetic result >= 2^61, must be
+     * returned verbatim.  Seeded in dl_add_edb for the `eav` relation's v
+     * column -- the only EDB column that can hold a tagged value -- and
+     * propagated into IDB head columns by dl_compile_rule's projection. */
+    bool    col_from_v[DL_MAX_ARITY];
     ray_t*  prov_col;               /* provenance column (when DL_FLAG_PROVENANCE) */
     ray_t*  prov_src_offsets;       /* CSR offsets into prov_src_data, length nrows+1 */
     ray_t*  prov_src_data;          /* packed source refs: (rel_idx << 32) | row_idx */
@@ -417,6 +431,17 @@ int dl_ensure_idb(dl_program_t* prog, const char* name, int arity);
 typedef struct {
     int     pos;    /* index into rule->body[] */
     ray_t*  table;  /* delta table for that position (borrowed) */
+    /* Textbook semi-naive old/new split, indexed by relation index:
+     * the number of rows relation r had at the START of the previous
+     * iteration -- i.e. the length of the prefix of rel->table that is
+     * "old" with respect to this iteration's delta.  Body atoms BEFORE
+     * `pos` read that prefix, the atom at `pos` reads `table`, and atoms
+     * AFTER `pos` read the full relation, so a rule with several
+     * recursive atoms derives delta x delta exactly once instead of once
+     * per recursive position.  -1 means "no prefix known, use the full
+     * relation" (EDBs, relations outside the current stratum); NULL means
+     * the whole array is unavailable (full, non-semi-naive evaluation). */
+    const int64_t* prev_nrows;
 } dl_delta_t;
 
 /* Compile one rule into a ray_graph_t for one fixpoint iteration.
@@ -426,5 +451,44 @@ typedef struct {
  * Returns the output node in g that produces new head tuples. */
 ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                           const dl_delta_t* delta, int rule_idx, ray_graph_t* g);
+
+/* ===== internal — exposed for tests ===== */
+
+/* Open-addressing set of relation rows, maintained across one stratum's
+ * fixpoint so each iteration probes only the candidate tuples instead of
+ * re-hashing the whole derived relation (table_distinct + table_antijoin).
+ *
+ * `rows[]` are row indices into the relation table the set was built from;
+ * the contract is that accepted delta rows are appended to that table, in
+ * order, immediately after dl_rowset_extract_new returns. */
+typedef struct {
+    ray_t*    hblock;   /* backing allocation for hashes (ray_alloc) */
+    ray_t*    rblock;   /* backing allocation for rows   (ray_alloc) */
+    uint64_t* hashes;   /* 0 = empty slot; a stored hash is always |1 */
+    int64_t*  rows;     /* row index into the owning relation's table */
+    int64_t   cap;      /* power of two */
+    int64_t   n;        /* live entries */
+} dl_rowset_t;
+
+/* Allocate a table sized for `expected_rows` at <=70% load. Returns 0, or
+ * -1 on OOM (the set is left zeroed, i.e. safe to free and unusable). */
+int dl_rowset_init(dl_rowset_t* s, int64_t expected_rows);
+
+/* Release the set's storage and zero it. NULL-safe on an already-freed set. */
+void dl_rowset_free(dl_rowset_t* s);
+
+/* Insert every distinct row of `tbl` with its own row index. Returns 0/-1. */
+int dl_rowset_add_table(dl_rowset_t* s, ray_t* tbl);
+
+/* Rows of `cand` that are neither in the set (whose entries index `full`)
+ * nor earlier duplicates within `cand`, as an owned table in candidate
+ * order; accepted rows enter the set as nrows(full) + k. Caller must append
+ * the result to `full` in order. Returns an owned table or RAY_ERROR.
+ *
+ * Rows are compared as raw cell keys, so the caller MUST first establish
+ * that `full` and `cand` agree column-wise on type and — for SYM — on
+ * resolution domain; dl_eval does this with dl_rowset_comparable() and
+ * falls back to table_distinct + table_antijoin when they do not. */
+ray_t* dl_rowset_extract_new(dl_rowset_t* s, ray_t* full, ray_t* cand);
 
 #endif /* RAYFORCE_DATALOG_H */

@@ -506,8 +506,16 @@ A datoms table whose `v` column is a real symbol vector (hand-built or
 loaded) is also recognised as holding symbols. A legacy table whose `v`
 column holds bare integer intern ids is not — those integers stay integers
 and are not matched against a symbol or keyword literal. Positive integer
-values of 2^61 and above cannot be stored in the `v` column or returned
-from a query without being masked; this is a limit of the tag encoding.
+values of 2^61 and above cannot be stored in the `v` column without being
+masked on the way out; this is a limit of the tag encoding, and it applies
+only to values that live in (or are derived from) the datoms `v` column.
+Every other column — an ordinary relation's column, or a value computed by
+Datalog arithmetic — is returned verbatim, whatever its magnitude.
+
+A derived relation fed both a symbol projected from `v` and an equal bare
+integer from another source matches both on a symbol literal: outside the
+`eav` relation the comparison is deliberately lenient about the tag, so the
+two values are indistinguishable once they share a column.
 
 ## Complete Example
 

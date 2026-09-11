@@ -23,6 +23,7 @@
 
 #include "table.h"
 #include "mem/heap.h"
+#include "mem/cow.h"    /* ray_rc_sync */
 #include "ops/ops.h"
 #include "lang/format.h"
 #include <string.h>
@@ -233,6 +234,26 @@ void ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec) {
     ray_retain(col_vec);
     ray_release(cv[idx]);
     cv[idx] = col_vec;
+}
+
+/* --------------------------------------------------------------------------
+ * ray_table_cols_mut — borrowed slot array of the column list, but only when
+ * the table block and that list are both uniquely owned (rc == 1, not arena
+ * backed).  NULL otherwise, so a caller can never mutate a list another table
+ * still sees.  Unlike ray_table_set_col_idx this hands out the raw slots: it
+ * is for in-place column growth, where ray_vec_append_raw may realloc (and
+ * free) the old column block and the slot must simply be overwritten with the
+ * new pointer — releasing the previous one would touch freed memory.
+ * -------------------------------------------------------------------------- */
+
+ray_t** ray_table_cols_mut(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return NULL;
+    if (tbl->attrs & RAY_ATTR_ARENA) return NULL;
+    if ((RAY_LIKELY(!ray_rc_sync) ? tbl->rc : ray_atomic_load(&tbl->rc)) != 1) return NULL;
+    ray_t* cols = tbl_cols(tbl);
+    if (!cols || RAY_IS_ERR(cols) || (cols->attrs & RAY_ATTR_ARENA)) return NULL;
+    if ((RAY_LIKELY(!ray_rc_sync) ? cols->rc : ray_atomic_load(&cols->rc)) != 1) return NULL;
+    return (ray_t**)ray_data(cols);
 }
 
 /* --------------------------------------------------------------------------
