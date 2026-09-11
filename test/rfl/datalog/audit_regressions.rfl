@@ -74,6 +74,12 @@
 (set ld (assert-fact ld 2 'v 2))
 (set lq (fn [i] (count (query ld (find ?e ?y) (where (?e :v ?x) (= ?y (+ ?x 1)))))))
 (map lq (til 50))
+;; Two throw-away (.sys.mem) reads warm the measurement path itself -- each
+;; (get (.sys.mem) 'bytes-allocated) call retains its own boxed result, a
+;; fixed cost unrelated to the datalog query loop below -- before the real
+;; baseline is taken, so lb0 and the final read are directly comparable.
+(set lb_warm1 (get (.sys.mem) 'bytes-allocated))
+(set lb_warm2 (get (.sys.mem) 'bytes-allocated))
 (set lb0 (get (.sys.mem) 'bytes-allocated))
 (map lq (til 200))
 (- (get (.sys.mem) 'bytes-allocated) lb0) -- 0
