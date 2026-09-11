@@ -1418,14 +1418,10 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
                     }
                     ray_t* next = ray_table_add_col(out, head_rel->col_names[c], ecol);
                     ray_release(ecol);
-                    if (!next) {
-                        ray_release(out);
-                        return ray_error("memory", "dl_project: add_col");
-                    }
-                    if (RAY_IS_ERR(next)) {
-                        ray_release(out);
-                        return next;
-                    }
+                    /* ray_table_add_col releases its input table on every
+                     * failure path, so `out` must not be released again. */
+                    if (!next) return ray_error("memory", "dl_project: add_col");
+                    if (RAY_IS_ERR(next)) return next;
                     out = next;
                     continue;
                 }
@@ -2747,14 +2743,10 @@ static ray_t* table_union(ray_t* a, ray_t* b) {
         }
         ray_t* next = ray_table_add_col(out, ray_table_col_name(a, c), merged);
         ray_release(merged);
-        if (!next) {
-            ray_release(out);
-            return ray_error("memory", "table_union: add_col");
-        }
-        if (RAY_IS_ERR(next)) {
-            ray_release(out);
-            return next;
-        }
+        /* ray_table_add_col releases its input table on every failure
+         * path, so `out` must not be released again here. */
+        if (!next) return ray_error("memory", "table_union: add_col");
+        if (RAY_IS_ERR(next)) return next;
         out = next;
     }
     return out;
@@ -3722,6 +3714,13 @@ int dl_eval(dl_program_t* prog) {
                          * (mirroring the cancellation cleanup above). */
                         prog->eval_err = true;
                         if (merged) ray_error_free(merged);
+                        /* Candidate tables belonging to relations further
+                         * along this pass have not been consumed yet (the
+                         * ones already visited were released above). */
+                        for (int q = p + 1; q < prog->strata_sizes[s]; q++) {
+                            ray_t* nt = new_tuples_per_rel[prog->strata[s][q]];
+                            if (nt && !RAY_IS_ERR(nt)) ray_release(nt);
+                        }
                         for (int q = 0; q < prog->strata_sizes[s]; q++) {
                             int rq = prog->strata[s][q];
                             if (delta_tables[rq] && !RAY_IS_ERR(delta_tables[rq]))
@@ -5150,15 +5149,15 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                 } else {
                     next_clean = ray_table_add_col(clean, ray_table_col_name(env_val, c), col);
                 }
+                /* ray_table_add_col releases `clean` on every failure
+                 * path, so it must not be released again here. */
                 if (!next_clean) {
-                    ray_release(clean);
                     dl_program_free(prog);
                     ray_release(db);
                     return ray_error("memory", "query: failed to build env-backed EDB table");
                 }
                 if (RAY_IS_ERR(next_clean)) {
                     ray_error_free(next_clean);
-                    ray_release(clean);
                     dl_program_free(prog);
                     ray_release(db);
                     return ray_error("memory", "query: failed to build env-backed EDB table");
