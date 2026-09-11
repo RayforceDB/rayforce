@@ -805,7 +805,7 @@ static ray_t* dl_eval_expr(dl_expr_t* expr, ray_t* accum,
                 case OP_ADD: od[r] = ld[r] + rd[r]; break;
                 case OP_SUB: od[r] = ld[r] - rd[r]; break;
                 case OP_MUL: od[r] = ld[r] * rd[r]; break;
-                case OP_DIV: od[r] = rd[r] != 0.0 ? ld[r] / rd[r] : 0.0; break;
+                case OP_DIV: od[r] = ld[r] / rd[r]; break;
                 default:     od[r] = 0.0; break;
                 }
             }
@@ -823,12 +823,14 @@ static ray_t* dl_eval_expr(dl_expr_t* expr, ray_t* accum,
         int64_t* rd = (int64_t*)ray_data(rv);
         int64_t* od = (int64_t*)ray_data(out);
         for (int64_t r = 0; r < nrows; r++) {
+            int64_t a = ld[r], b = rd[r], o;
+            if (a == NULL_I64 || b == NULL_I64) { od[r] = NULL_I64; continue; }
             switch (expr->binop) {
-            case OP_ADD: od[r] = ld[r] + rd[r]; break;
-            case OP_SUB: od[r] = ld[r] - rd[r]; break;
-            case OP_MUL: od[r] = ld[r] * rd[r]; break;
-            case OP_DIV: od[r] = rd[r] != 0 ? ld[r] / rd[r] : 0; break;
-            default:     od[r] = 0; break;
+            case OP_ADD: od[r] = __builtin_add_overflow(a, b, &o) ? NULL_I64 : o; break;
+            case OP_SUB: od[r] = __builtin_sub_overflow(a, b, &o) ? NULL_I64 : o; break;
+            case OP_MUL: od[r] = __builtin_mul_overflow(a, b, &o) ? NULL_I64 : o; break;
+            case OP_DIV: od[r] = (b == 0 || (a == INT64_MIN && b == -1)) ? NULL_I64 : a / b; break;
+            default:     od[r] = NULL_I64; break;
             }
         }
         ray_release(lv);

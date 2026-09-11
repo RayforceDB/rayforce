@@ -87,3 +87,11 @@
 (set lb0 (get (.sys.mem) 'bytes-allocated))
 (map lq (til 200))
 (- (get (.sys.mem) 'bytes-allocated) lb0) -- 0
+
+;; §2.2 integer overflow and division by zero are null, never undefined behaviour.
+(set ad (datoms))
+(set ad (assert-fact ad 1 'v 1))
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (+ ?x 9223372036854775807)))) '?y) 0) -- 0Nl
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (* ?x -9223372036854775807)))) '?y) 0) -- -9223372036854775807
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (/ ?x 0)))) '?y) 0) -- 0Nl
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (- ?x 3)))) '?y) 0) -- -2
