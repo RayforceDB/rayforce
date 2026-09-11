@@ -412,8 +412,11 @@
 (count (query Edb (find ?e) (where (gi ?e)) (rules ((gi ?e) (?e :age (+ 10 20)))))) -- 1
 ;; (first ['admin 'user]) → sym 'admin ; matches entity 1's role.
 (count (query Edb (find ?e) (where (gs ?e)) (rules ((gs ?e) (?e :role (first ['admin 'user])))))) -- 1
-;; evaluates to a float → unsupported constant type in body.
-(query Edb (find ?e) (where (gb ?e)) (rules ((gb ?e) (?e :age (+ 1.0 2.0))))) !- type
+;; evaluates to a float → F64 body constants are now supported (audit
+;; §1.4, task 4): compares numerically against the I64 age column, and
+;; 3.0 matches neither entity's age, so the result is empty rather than
+;; an error.
+(count (query Edb (find ?e) (where (gb ?e)) (rules ((gb ?e) (?e :age (+ 1.0 2.0)))))) -- 0
 
 ;; ════════════════════════ recursive rule via inline rules (no globals) ═════════════════════════
 ;; Chain 1→2→3→4: TC pairs = (1,2),(1,3),(1,4),(2,3),(2,4),(3,4) — 6 rows.

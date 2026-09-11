@@ -2513,6 +2513,36 @@ static test_result_t test_nonlinear_closure_chain(void) {
     PASS();
 }
 
+/* Audit §1.4: an I64 literal against an F64 EDB column must filter, not
+ * pass the whole table through. */
+static test_result_t test_const_filter_f64_column(void) {
+    int64_t ids[] = {1, 2, 3};
+    double  xs[]  = {1.0, 2.0, 3.0};
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, ids, 3);
+    ray_t* c1 = ray_vec_from_raw(RAY_F64, xs, 3);
+    ray_t* pts = ray_table_new(2);
+    pts = ray_table_add_col(pts, ray_sym_intern("pts__c0", 7), c0);
+    pts = ray_table_add_col(pts, ray_sym_intern("pts__c1", 7), c1);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "pts", pts, 2), 0);
+    dl_rule_t r;                          /* q(X) :- pts(X, 2) */
+    dl_rule_init(&r, "q", 1);
+    dl_rule_head_var(&r, 0, 0);
+    int b = dl_rule_add_atom(&r, "pts", 2);
+    dl_body_set_var(&r, b, 0, 0);
+    dl_body_set_const_typed(&r, b, 1, 2, RAY_I64);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "q");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
+    TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(out, 0)))[0], 2);
+    dl_program_free(prog);
+    ray_release(pts); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2578,6 +2608,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
     { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
+    { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

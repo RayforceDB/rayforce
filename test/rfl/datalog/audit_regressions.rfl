@@ -35,3 +35,18 @@
 (count (query g (find ?x) (where (?x :edge ?y) (not (1 :edge 9))))) -- 7
 (count (query g (find ?x) (where (?x :edge ?y) (not (_ :edge 8))))) -- 0
 (count (query g (find ?x) (where (?x :edge ?y) (not (_ :edge 99))))) -- 7
+
+;; §1.4 constant filters over F64 columns match numerically; other types error.
+(set pts (table [pts__c0 pts__c1] (list [1 2 3] [1.0 2.0 3.0])))
+(count (query g (find ?x) (where (pts ?x 2)))) -- 1
+(count (query g (find ?x) (where (pts ?x 2.0)))) -- 1
+(at (at (query g (find ?x) (where (pts ?x 2.0))) '?x) 0) -- 2
+(count (query g (find ?x) (where (pts ?x 7)))) -- 0
+(set strs (table [strs__c0 strs__c1] (list [1 2] ["a" "b"])))
+;; ray_fmt() only renders a RAY_ERROR's 7-byte code, not the detail text
+;; ray_error() stashes in the thread-local buffer, so the visible text is
+;; "error: domain" (query: evaluation failed wraps the inner "type" error
+;; from dl_filter_eq as "domain") -- matches the existing `query: ... !-
+;; domain` idiom used elsewhere for evaluation failures, e.g.
+;; datalog_branch_cov.rfl:274.
+(query g (find ?x) (where (strs ?x 1))) !- domain

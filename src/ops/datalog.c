@@ -1025,8 +1025,15 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
  * storage without the frontend having to know which is which. */
 static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
                           int8_t const_type) {
+    if (col->type == RAY_F64) {
+        double cell = ((double*)ray_data(col))[row];
+        if (const_type == RAY_F64) { double v; memcpy(&v, &value, sizeof v); return cell == v; }
+        if (const_type == RAY_I64) return cell == (double)value;
+        return false;
+    }
     if (col->type == RAY_I64) {
         int64_t cell = ((int64_t*)ray_data(col))[row];
+        if (const_type == RAY_F64) { double v; memcpy(&v, &value, sizeof v); return (double)cell == v; }
         if (cell == value) return true;
         int64_t cell_tag = cell & (int64_t)0x6000000000000000;
         if (cell_tag == 0) return false;  /* plain int column */
@@ -1095,12 +1102,11 @@ static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
 
     ray_t* col = ray_table_get_col_idx(tbl, col_idx);
     if (!col) { ray_retain(tbl); return tbl; }
-    /* Non-numeric, non-sym keys: not supported by this filter — pass
-     * through (retained) rather than miscompare via raw memcpy. */
-    if (col->type != RAY_I64 && col->type != RAY_SYM) {
-        ray_retain(tbl);
-        return tbl;
-    }
+    /* Non-numeric, non-sym keys: not supported by this filter — raise a
+     * type error rather than silently passing every row through. */
+    if (col->type != RAY_I64 && col->type != RAY_SYM && col->type != RAY_F64)
+        return ray_error("type", "datalog: constant filter on unsupported column type %s",
+                         ray_type_name(col->type));
 
     /* sym-domain Phase 2: for a SYM column, `value` is a runtime-domain
      * literal id (datalog constants intern at parse), while the cells
@@ -3736,6 +3742,11 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
         dl_body_set_const_typed(rule, bidx, pos, node->i64, RAY_I64);
         return NULL;
     }
+    if (node->type == -RAY_F64) {
+        int64_t bits; memcpy(&bits, &node->f64, sizeof bits);
+        dl_body_set_const_typed(rule, bidx, pos, bits, RAY_F64);
+        return NULL;
+    }
     if (node->type == -RAY_SYM) {
         ray_t* s = ray_sym_str(node->i64);
         if (s && strcmp(ray_str_ptr(s), "_") == 0) {
@@ -3768,6 +3779,9 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
         return val ? val : ray_error("type", "rule: cannot evaluate constant in body");
     if (val->type == -RAY_I64) {
         dl_body_set_const_typed(rule, bidx, pos, val->i64, RAY_I64);
+    } else if (val->type == -RAY_F64) {
+        int64_t bits; memcpy(&bits, &val->f64, sizeof bits);
+        dl_body_set_const_typed(rule, bidx, pos, bits, RAY_F64);
     } else if (val->type == -RAY_SYM) {
         dl_body_set_const_typed(rule, bidx, pos, val->i64, RAY_SYM);
     } else {
