@@ -124,3 +124,13 @@
 (set handbuilt (table ['e 'a 'v] (list [1 2] ['name 'name] ['Alice 'Bob])))
 (count (query handbuilt (find ?e) (where (?e :name 'Alice)))) -- 1
 (sym-name (at (at (query handbuilt (find ?v) (where (1 :name ?v))) '?v) 0)) -- 'Alice
+
+;; §4 pure Datalog is never cut off by an iteration cap.
+(set longedge (table [longedge__c0 longedge__c1] (list (til 1100) (+ 1 (til 1100)))))
+(rule (reach ?y) (longedge 0 ?y))
+(rule (reach ?z) (reach ?y) (longedge ?y ?z))
+(count (query g (find ?y) (where (reach ?y)))) -- 1100
+;; ... but a rule that manufactures new integers forever is still stopped.
+(rule (nat ?x) (longedge 0 ?x))
+(rule (nat ?y) (nat ?x) (= ?y (+ ?x 1)))
+(query g (find ?x) (where (nat ?x))) !- domain

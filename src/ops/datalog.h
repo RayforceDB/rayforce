@@ -61,6 +61,12 @@
 
 #define DL_AGG_MAX_KEYS 8
 
+/* Fixpoint iteration cap for strata whose rules can manufacture new values
+ * (DL_ASSIGN / DL_BUILTIN / DL_INTERVAL literals) and therefore are not
+ * guaranteed to terminate over a finite domain. Purely relational
+ * (monotone) strata run uncapped -- see dl_eval in datalog.c. */
+#define DL_MAX_ITER_NONMONOTONE 1000
+
 /* ===== Assignment operators (for DL_ASSIGN) ===== */
 #define DL_OP_EQ    0   /* simple assignment: X = expr */
 

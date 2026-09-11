@@ -3082,10 +3082,22 @@ int dl_eval(dl_program_t* prog) {
             }
         }
 
-        /* Semi-naive iteration */
-        int max_iter = 1000;
+        /* Semi-naive iteration.
+         *
+         * Iteration budget: a stratum whose rules contain only relational
+         * literals is monotone over a finite domain and must converge, so it
+         * runs uncapped (cancellation still checked each iteration). Rules
+         * that compute new values (assignment / builtin / interval) can grow
+         * the domain forever and keep the cap. */
+        bool monotone = true;
+        for (int ri = 0; ri < n_stratum_rules && monotone; ri++)
+            for (int b = 0; b < stratum_rules[ri]->n_body; b++) {
+                int t = stratum_rules[ri]->body[b].type;
+                if (t == DL_ASSIGN || t == DL_BUILTIN || t == DL_INTERVAL) { monotone = false; break; }
+            }
+        int64_t max_iter = monotone ? INT64_MAX : DL_MAX_ITER_NONMONOTONE;
         bool converged = false;
-        for (int iter = 0; iter < max_iter; iter++) {
+        for (int64_t iter = 0; iter < max_iter; iter++) {
             /* Cancellation checkpoint (per fixpoint iteration).  prev_tables /
              * delta_tables are live here, so mirror the stratum cleanup below
              * before returning to avoid a leak. */
@@ -3249,8 +3261,16 @@ int dl_eval(dl_program_t* prog) {
          * returning the truncated fixpoint. For well-formed Datalog over a
          * finite EDB the loop converges in far fewer than max_iter steps, so
          * hitting the cap signals a runaway/ill-formed program. */
-        if (!converged)
+        if (!converged) {
             prog->eval_err = true;
+            /* Creating (and immediately freeing) the error leaves its
+             * detail text in the thread-local buffer that ray_query_fn
+             * reads via ray_error_msg() after dl_eval fails -- see
+             * ray_verror in src/core/runtime.c, which writes the message
+             * at creation time, not at free time. */
+            ray_error_free(ray_error("domain",
+                "fixpoint did not converge after %d iterations", DL_MAX_ITER_NONMONOTONE));
+        }
 
         /* Cleanup stratum temporaries */
         for (int p = 0; p < prog->strata_sizes[s]; p++) {

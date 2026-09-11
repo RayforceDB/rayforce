@@ -2052,6 +2052,33 @@ static test_result_t test_query_admission_errors(void) {
     PASS();
 }
 
+/* Task 11: a stratum with an assignment literal can manufacture new values
+ * forever, so it keeps the DL_MAX_ITER_NONMONOTONE cap and must report the
+ * specific "fixpoint did not converge" message (not just a generic
+ * "evaluation failed") when it hits that cap. One row grows by exactly one
+ * new integer per iteration, so 1000 iterations finish quickly even under
+ * ASan. */
+static test_result_t test_fixpoint_nonconvergence_message(void) {
+    ray_t* seed = ray_eval_str(
+        "(do (set __fnm_db (datoms)) (set __fnm_db (assert-fact __fnm_db 0 'edge 1)))");
+    TEST_ASSERT_NOT_NULL(seed);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(seed));
+    ray_release(seed);
+
+    ray_t* r = ray_eval_str(
+        "(query __fnm_db (find ?x) (where (nat ?x)) "
+        "  (rules ((nat ?x) (?x :edge ?y)) "
+        "         ((nat ?y) (nat ?x) (= ?y (+ ?x 1)))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_TRUE(strstr(msg, "fixpoint did not converge") != NULL);
+    ray_error_free(r);
+
+    PASS();
+}
+
 /* ray_release() is a deliberate no-op for RAY_ERROR objects, so callers
  * that claim to be "releasing" an error under the refcount API actually
  * leak the block.  ray_error_free() is the escape hatch that calls
@@ -2759,6 +2786,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/env_bound_agg_auto_register", test_env_bound_agg_auto_register, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/eval_surfaces_compile_failure", test_eval_surfaces_compile_failure, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/query_admission_errors", test_query_admission_errors, datalog_rf_setup, datalog_rf_teardown },
+    { "datalog/fixpoint_nonconvergence_message", test_fixpoint_nonconvergence_message, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/error_free_reclaims", test_error_free_reclaims, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/agg_scalar_f64", test_agg_scalar_f64, datalog_setup, datalog_teardown },
     { "datalog/agg_scalar_f64_sum_empty", test_agg_scalar_f64_sum_empty, datalog_setup, datalog_teardown },
