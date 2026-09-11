@@ -42,6 +42,14 @@
 (count (query g (find ?x) (where (pts ?x 2.0)))) -- 1
 (at (at (query g (find ?x) (where (pts ?x 2.0))) '?x) 0) -- 2
 (count (query g (find ?x) (where (pts ?x 7)))) -- 0
+;; review follow-up: an F64 literal against an I64 EDB column must also
+;; match numerically (dl_col_eq_row's `col->type == RAY_I64 &&
+;; const_type == RAY_F64` branch) -- the assertions above only exercise
+;; F64/I64 literals against an F64 column.
+(set ints (table [ints__c0 ints__c1] (list [1 2 3] [10 20 30])))
+(count (query g (find ?x) (where (ints ?x 20.0)))) -- 1
+(at (at (query g (find ?x) (where (ints ?x 20.0))) '?x) 0) -- 2
+(count (query g (find ?x) (where (ints ?x 21.0)))) -- 0
 (set strs (table [strs__c0 strs__c1] (list [1 2] ["a" "b"])))
 ;; ray_fmt() only renders a RAY_ERROR's 7-byte code, not the detail text
 ;; ray_error() stashes in the thread-local buffer, so the visible text is

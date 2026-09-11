@@ -2533,13 +2533,107 @@ static test_result_t test_const_filter_f64_column(void) {
     dl_body_set_var(&r, b, 0, 0);
     dl_body_set_const_typed(&r, b, 1, 2, RAY_I64);
     TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+
+    /* q2(Y) :- pts(1.0, Y) — an F64 literal against the I64 id column
+     * (pos 0), exercising dl_col_eq_row's `col->type == RAY_I64 &&
+     * const_type == RAY_F64` branch (`(double)cell == v`), which the
+     * first rule above never reaches (its F64 literal always targets
+     * the F64 column). */
+    double one = 1.0;
+    int64_t one_bits; memcpy(&one_bits, &one, sizeof one_bits);
+    dl_rule_t r2;
+    dl_rule_init(&r2, "q2", 1);
+    dl_rule_head_var(&r2, 0, 0);
+    int b2 = dl_rule_add_atom(&r2, "pts", 2);
+    dl_body_set_const_typed(&r2, b2, 0, one_bits, RAY_F64);
+    dl_body_set_var(&r2, b2, 1, 0);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r2), 1);
+
     TEST_ASSERT_EQ_I(dl_eval(prog), 0);
     ray_t* out = dl_query(prog, "q");
     TEST_ASSERT_NOT_NULL(out);
     TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
     TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(out, 0)))[0], 2);
+
+    ray_t* out2 = dl_query(prog, "q2");
+    TEST_ASSERT_NOT_NULL(out2);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out2), 1);
+    TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(out2, 0)))[0], 1.0, 1e-12);
+
     dl_program_free(prog);
     ray_release(pts); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
+/* Audit §1.4 (review follow-up): source provenance for a constant body
+ * slot must use the same type-aware equality as dl_filter_eq (an F64
+ * literal against an I64 column), not a raw int64 bit-compare — see
+ * dl_build_source_prov's const-slot branch, which previously read
+ * `((int64_t*)ray_data(bcol))[br] != body->const_vals[c]` directly. */
+static test_result_t test_source_prov_f64_const_body_slot(void) {
+    int64_t e_vals[] = {1, 2, 3};
+    int64_t k_vals[] = {7, 7, 9};
+    ray_t* e_col = ray_vec_from_raw(RAY_I64, e_vals, 3);
+    ray_t* k_col = ray_vec_from_raw(RAY_I64, k_vals, 3);
+    TEST_ASSERT_NOT_NULL(e_col);
+    TEST_ASSERT_NOT_NULL(k_col);
+
+    ray_t* kv = ray_table_new(2);
+    kv = ray_table_add_col(kv, ray_sym_intern("kv__c0", 6), e_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    kv = ray_table_add_col(kv, ray_sym_intern("kv__c1", 6), k_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    prog->flags |= DL_FLAG_PROVENANCE;
+
+    int kv_idx = dl_add_edb(prog, "kv", kv, 2);
+    TEST_ASSERT_EQ_I(kv_idx, 0);
+
+    /* hit(E) :- kv(E, 7.0) — F64 literal against the I64 k column. */
+    double seven = 7.0;
+    int64_t seven_bits; memcpy(&seven_bits, &seven, sizeof seven_bits);
+    dl_rule_t rule;
+    dl_rule_init(&rule, "hit", 1);
+    dl_rule_head_var(&rule, 0, 0);
+    int body = dl_rule_add_atom(&rule, "kv", 2);
+    dl_body_set_var(&rule, body, 0, 0);                          /* E */
+    dl_body_set_const_typed(&rule, body, 1, seven_bits, RAY_F64); /* constant 7.0 */
+    rule.n_vars = 1;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "hit");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 2);
+
+    ray_t* offsets = dl_get_provenance_src_offsets(prog, "hit");
+    ray_t* data    = dl_get_provenance_src_data(prog, "hit");
+    TEST_ASSERT_NOT_NULL(offsets);
+    TEST_ASSERT_NOT_NULL(data);
+    TEST_ASSERT_EQ_I((int)ray_len(offsets), 3);
+    TEST_ASSERT_EQ_I((int)ray_len(data), 2);
+    int64_t* off = (int64_t*)ray_data(offsets);
+    TEST_ASSERT_EQ_I((int)off[0], 0);
+    TEST_ASSERT_EQ_I((int)off[1], 1);
+    TEST_ASSERT_EQ_I((int)off[2], 2);
+    /* Both refs must point at relation kv (idx 0), rows 0 and 1 — never row 2
+     * (kv(3,9), which does not equal 7.0). Before routing through
+     * dl_col_eq_row, the raw int64 compare `9 != <bits of 7.0>` happened to
+     * still reject row 2, but rows 0/1 (`7 != <bits of 7.0>`) would also have
+     * been wrongly rejected, leaving provenance empty. */
+    int64_t* sd = (int64_t*)ray_data(data);
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_EQ_I((int)(sd[i] >> 32), kv_idx);
+        TEST_ASSERT_TRUE((sd[i] & 0xffffffff) != 2);
+    }
+
+    dl_program_free(prog);
+    ray_release(kv);
+    ray_release(e_col);
+    ray_release(k_col);
     PASS();
 }
 
@@ -2547,6 +2641,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
     { "datalog/source_prov_const_body_slot", test_source_prov_const_body_slot, datalog_setup, datalog_teardown },
+    { "datalog/source_prov_f64_const_body_slot", test_source_prov_f64_const_body_slot, datalog_setup, datalog_teardown },
     { "datalog/source_prov_buffer_grow", test_source_prov_buffer_grow, datalog_setup, datalog_teardown },
     { "datalog/cmp_const_filter", test_cmp_const_filter, datalog_setup, datalog_teardown },
     { "datalog/arith_assignment", test_arith_assignment, datalog_setup, datalog_teardown },

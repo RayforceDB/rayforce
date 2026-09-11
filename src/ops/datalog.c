@@ -2717,11 +2717,20 @@ static void dl_build_source_prov(dl_program_t* prog, dl_rel_t* rel,
                 for (int c = 0; c < body->arity; c++) {
                     ray_t* bcol = ray_table_get_col_idx(brel->table, c);
                     if (!bcol) { match = false; break; }
-                    int64_t cell = ((int64_t*)ray_data(bcol))[br];
                     int     v    = body->vars[c];
                     if (v == DL_CONST) {
-                        if (cell != body->const_vals[c]) { match = false; break; }
+                        /* Type-aware compare — matches dl_col_eq_row's
+                         * rules (incl. F64 columns/literals and
+                         * DATOM-tagged I64 columns) rather than a raw
+                         * int64 bit-compare, which would silently
+                         * mismatch an F64 literal against an I64 column
+                         * (and vice versa). */
+                        if (!dl_col_eq_row(bcol, br, body->const_vals[c],
+                                           body->const_types[c])) {
+                            match = false; break;
+                        }
                     } else if (var_set[v]) {
+                        int64_t cell = ((int64_t*)ray_data(bcol))[br];
                         if (cell != var_vals[v])         { match = false; break; }
                     }
                     /* body-only variable: unconstrained, always matches */
