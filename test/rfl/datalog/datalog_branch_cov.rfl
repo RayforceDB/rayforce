@@ -168,10 +168,14 @@
 
 ;; ════════════════════════ string literal in body position ═════════════════════════
 ;; Exercises the RAY_STR branch in dl_set_body_pos (line 3582-3589).
-;; "Alice" interned as sym matches the DATOM-tagged cell via tag-aware compare.
+;; Updated for audit #1.5 (task 8): assert-fact now tags a symbol value
+;; with DL_DATOM_TAG_SYM, and dl_col_eq_row requires an exact tag match, so
+;; a "foo" STR literal (which targets a STR-tagged cell) no longer matches
+;; a value stored via a 'foo SYM literal -- a string and a symbol are now
+;; distinct values, same as an integer and a symbol are.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'name 'Alice))
-(count (query Db (find ?e) (where (?e :name "Alice")))) -- 1
+(count (query Db (find ?e) (where (?e :name "Alice")))) -- 0
 ;; string that does NOT match any stored value
 (count (query Db (find ?e) (where (?e :name "Nonexistent")))) -- 0
 

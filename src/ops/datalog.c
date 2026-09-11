@@ -1080,9 +1080,21 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
  * back to a payload compare when the cell carries the matching tag —
  * so a body literal can pin both an untagged RAY_SYM column built
  * from a rule head and a DATOM-tagged RAY_I64 column built from EAV
- * storage without the frontend having to know which is which. */
+ * storage without the frontend having to know which is which.
+ *
+ * `strict_tag` narrows that leniency for the one column where it would
+ * otherwise reopen the audit #1.5 ambiguity: the "eav" relation's v
+ * column, the only column any frontend ever writes a DATOM tag into.
+ * A plain integer stored there via assert-fact (e.g. a symbol's own
+ * intern id, round-tripped through pull as a bare I64 and re-asserted)
+ * can coincide numerically with a symbol/string literal's intern id;
+ * without strict_tag the direct `cell == value` compare below would
+ * wrongly call that a match. Callers pass strict_tag only for that
+ * column — every other column (the "a" column included, and any
+ * rule-derived relation) is never DATOM-tagged, so the lenient direct
+ * compare remains correct and necessary there. */
 static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
-                          int8_t const_type) {
+                          int8_t const_type, bool strict_tag) {
     if (col->type == RAY_F64) {
         double cell = ((double*)ray_data(col))[row];
         if (const_type == RAY_F64) { double v; memcpy(&v, &value, sizeof v); return cell == v; }
@@ -1092,15 +1104,17 @@ static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
     if (col->type == RAY_I64) {
         int64_t cell = ((int64_t*)ray_data(col))[row];
         if (const_type == RAY_F64) { double v; memcpy(&v, &value, sizeof v); return (double)cell == v; }
-        if (cell == value) return true;
-        int64_t cell_tag = cell & (int64_t)0x6000000000000000;
+        if (!strict_tag || (const_type != RAY_STR && const_type != RAY_SYM)) {
+            if (cell == value) return true;
+        }
+        int64_t cell_tag = cell & DL_DATOM_TAG_MASK;
         if (cell_tag == 0) return false;  /* plain int column */
-        int64_t cell_payload = cell & (int64_t)0x1FFFFFFFFFFFFFFF;
+        int64_t cell_payload = cell & DL_DATOM_PAYLOAD;
         if (const_type == RAY_STR &&
-            cell_tag == (int64_t)0x4000000000000000)
+            cell_tag == DL_DATOM_TAG_STR)
             return cell_payload == value;
         if (const_type == RAY_SYM &&
-            cell_tag == (int64_t)0x2000000000000000)
+            cell_tag == DL_DATOM_TAG_SYM)
             return cell_payload == value;
         return false;
     }
@@ -1148,8 +1162,28 @@ static ray_t* dl_table_take_mask(ray_t* tbl, const uint8_t* keep, int64_t count)
     return out;
 }
 
+/* Strip the DATOM tag from every cell of an I64 result column so
+ * query projection returns plain intern ids like the rest of the
+ * user-visible API (pull, scan-eav). Returns a retained reference to
+ * `col` unchanged when it's not I64 or carries no tagged cell, so the
+ * common case is a cheap no-op. */
+static ray_t* dl_untag_i64_col(ray_t* col) {
+    if (col->type != RAY_I64) { ray_retain(col); return col; }
+    int64_t n = col->len;
+    const int64_t* d = (const int64_t*)ray_data(col);
+    int64_t i = 0;
+    while (i < n && !(d[i] & DL_DATOM_TAG_MASK)) i++;
+    if (i == n) { ray_retain(col); return col; }
+    ray_t* out = ray_vec_new(RAY_I64, n);
+    if (!out || RAY_IS_ERR(out)) return out;
+    out->len = n;
+    int64_t* o = (int64_t*)ray_data(out);
+    for (int64_t r = 0; r < n; r++) o[r] = dl_datom_untag(d[r]);
+    return out;
+}
+
 static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
-                           int8_t const_type) {
+                           int8_t const_type, bool strict_tag) {
     /* Contract: always return an owned reference (rc bumped) so the
      * caller can release uniformly.  Every pass-through must therefore
      * retain — else the caller's `ray_release(body_tbl); body_tbl =
@@ -1190,7 +1224,7 @@ static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
     uint8_t* keep = (uint8_t*)ray_data(keep_block);
     int64_t count = 0;
     for (int64_t r = 0; r < nrows; r++) {
-        keep[r] = dl_col_eq_row(col, r, value, const_type) ? 1 : 0;
+        keep[r] = dl_col_eq_row(col, r, value, const_type, strict_tag) ? 1 : 0;
         count += keep[r];
     }
 
@@ -1476,8 +1510,13 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         /* Apply constant filters */
         for (int c = 0; c < body->arity; c++) {
             if (body->vars[c] == DL_CONST) {
+                /* Only the "eav" relation's v column (position 2) is ever
+                 * DATOM-tagged (audit #1.5) — everywhere else (the "a"
+                 * column included) a plain I64/SYM cell is a genuine,
+                 * untagged value and the lenient compare is correct. */
+                bool strict_tag = c == 2 && strcmp(body->pred, "eav") == 0;
                 ray_t* filtered = dl_filter_eq(body_tbl, c, body->const_vals[c],
-                                                body->const_types[c]);
+                                                body->const_types[c], strict_tag);
                 ray_release(body_tbl);
                 if (!filtered) {
                     /* Treat as genuine failure — dl_filter_eq returns an
@@ -1647,8 +1686,9 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             ray_retain(neg_tbl);
             for (int c = 0; c < body->arity; c++) {
                 if (body->vars[c] == DL_CONST) {
+                    bool strict_tag = c == 2 && strcmp(body->pred, "eav") == 0;
                     ray_t* filtered = dl_filter_eq(neg_tbl, c, body->const_vals[c],
-                                                    body->const_types[c]);
+                                                    body->const_types[c], strict_tag);
                     ray_release(neg_tbl);
                     if (!filtered) {
                         ray_release(accum);
@@ -2782,9 +2822,11 @@ static void dl_build_source_prov(dl_program_t* prog, dl_rel_t* rel,
                          * DATOM-tagged I64 columns) rather than a raw
                          * int64 bit-compare, which would silently
                          * mismatch an F64 literal against an I64 column
-                         * (and vice versa). */
+                         * (and vice versa). strict_tag mirrors dl_compile_rule:
+                         * only the "eav" relation's v column is ever tagged. */
+                        bool strict_tag = c == 2 && strcmp(body->pred, "eav") == 0;
                         if (!dl_col_eq_row(bcol, br, body->const_vals[c],
-                                           body->const_types[c])) {
+                                           body->const_types[c], strict_tag)) {
                             match = false; break;
                         }
                     } else if (var_set[v]) {
@@ -3317,7 +3359,7 @@ ray_t* ray_assert_fact_fn(ray_t** args, int64_t n) {
     if (value->type == -RAY_I64) {
         v_val = value->i64;
     } else if (value->type == -RAY_SYM) {
-        v_val = value->i64;  /* sym intern ID is already i64 */
+        v_val = DL_DATOM_TAG_SYM | value->i64;  /* tag so it can't collide with a plain integer */
     } else {
         return ray_error("type", "assert-fact: value must be an integer or symbol");
     }
@@ -3385,7 +3427,7 @@ ray_t* ray_retract_fact_fn(ray_t** args, int64_t n) {
     if (value->type == -RAY_I64)
         match_v = value->i64;
     else if (value->type == -RAY_SYM)
-        match_v = value->i64;
+        match_v = DL_DATOM_TAG_SYM | value->i64;  /* same tag assert-fact wrote */
     else
         return ray_error("type", "retract-fact: value must be an integer or symbol");
 
@@ -3484,7 +3526,8 @@ ray_t* ray_scan_eav_fn(ray_t** args, int64_t n) {
             if (a_val == attr_id) {
                 re = ray_vec_append(re, &e_data[r]);
                 if (RAY_IS_ERR(re)) { ray_release(rv); return re; }
-                rv = ray_vec_append(rv, &v_data[r]);
+                int64_t v_val = dl_datom_untag(v_data[r]);
+                rv = ray_vec_append(rv, &v_val);
                 if (RAY_IS_ERR(rv)) { ray_release(re); return rv; }
             }
         }
@@ -3527,7 +3570,7 @@ ray_t* ray_scan_eav_fn(ray_t** args, int64_t n) {
             if (e_data[r] != entity_id) continue;
             int64_t a_val = ray_read_sym(ray_data(a_col), r, a_col->type, a_col->attrs);
             if (a_val == attr_id) {
-                return ray_i64(v_data[r]);
+                return ray_i64(dl_datom_untag(v_data[r]));
             }
         }
 
@@ -3598,7 +3641,7 @@ ray_t* ray_pull_fn(ray_t** args, int64_t n) {
         keys = ray_vec_append(keys, &a_val);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
 
-        ray_t* val = ray_i64(v_data[r]);
+        ray_t* val = ray_i64(dl_datom_untag(v_data[r]));
         if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
         vals = ray_list_append(vals, val);
         ray_release(val);
@@ -3816,22 +3859,35 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
     }
     if (node->type == -RAY_SYM) {
         ray_t* s = ray_sym_str(node->i64);
-        if (s && strcmp(ray_str_ptr(s), "_") == 0) {
-            /* Wildcard: create a fresh variable. Bound-check against the
-             * fixed var-map size — the named path (dl_var_get_or_create)
-             * already guards this; without the same guard here a rule with
-             * >256 wildcards would write past vars->syms[]. */
+        bool is_wildcard = s && strcmp(ray_str_ptr(s), "_") == 0;
+        if (is_wildcard) {
+            /* Wildcard: create a fresh variable, quoted or not ('_' and
+             * bare _ are both the wildcard, never a variable reference).
+             * Bound-check against the fixed var-map size — the named path
+             * (dl_var_get_or_create) already guards this; without the same
+             * guard here a rule with >256 wildcards would write past
+             * vars->syms[]. */
             if (vars->n >= DL_MAX_ARITY * DL_MAX_BODY)
                 return ray_error("domain", "rule: too many variables");
             int vi = vars->n++;
             vars->syms[vi] = -1 - vi;
             dl_body_set_var(rule, bidx, pos, vi);
-        } else {
-            dl_body_set_const_typed(rule, bidx, pos, node->i64, RAY_SYM);
+            return NULL;
         }
-        return NULL;
-    }
-    if (node->type == -RAY_STR) {
+        if (node->attrs & ATTR_QUOTED) {
+            /* 'foo / :foo — a literal symbol constant. */
+            dl_body_set_const_typed(rule, bidx, pos, node->i64, RAY_SYM);
+            return NULL;
+        }
+        /* Bare, unquoted symbol: a reference to a host-language bound
+         * variable (e.g. `sid` from `(set sid ...)`), not a literal.
+         * Fall through to the ray_eval fallback below so it resolves to
+         * the variable's current value instead of being (mis)treated as
+         * the literal symbol sharing its name — audit #1.5: this is
+         * exactly the kind of value that can carry a DATOM-tagged v-column
+         * payload, so it must reach dl_col_eq_row with the *evaluated*
+         * constant's real type (I64/SYM/...), not always RAY_SYM. */
+    } else if (node->type == -RAY_STR) {
         /* Quoted string literal in body: intern as sym so it compares
          * equal to other sym-interned constants. Record the source type
          * as RAY_STR so the row-equality helper can also try a tagged-
@@ -4578,8 +4634,12 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
     ray_t* result = ray_table_new(n_find_vars);
     for (int i = 0; i < n_find_vars && i < (int)ncols; i++) {
         ray_t* col = ray_table_get_col_idx(raw, i);
-        if (col)
-            result = ray_table_add_col(result, find_var_syms[i], col);
+        if (!col) continue;
+        ray_t* clean = dl_untag_i64_col(col);   /* returns retained col when nothing is tagged */
+        if (!clean || RAY_IS_ERR(clean)) { ray_release(result); dl_program_free(prog); ray_release(db);
+            return clean ? clean : ray_error("memory", "query: untag"); }
+        result = ray_table_add_col(result, find_var_syms[i], clean);
+        ray_release(clean);
     }
 
     /* Handle empty result: ensure schema is correct */

@@ -90,6 +90,25 @@ typedef struct dl_expr {
 /* Variable index sentinel: constant value, not a variable */
 #define DL_CONST    (-1)
 
+/* ===== DATOM value tag scheme (v column of a datoms table) =====
+ * assert-fact stores a symbol/string value in an otherwise-plain I64
+ * cell with one of these tags OR'd into the top bits so it can never
+ * collide with a bare integer equal to the same intern id. dl_col_eq_row
+ * strips the tag (via the const_type of the body literal) to compare;
+ * user-visible reads (pull, scan-eav, query projection) strip it via
+ * dl_datom_untag so callers keep seeing plain intern ids. */
+#define DL_DATOM_TAG_SYM   ((int64_t)0x2000000000000000)
+#define DL_DATOM_TAG_STR   ((int64_t)0x4000000000000000)
+#define DL_DATOM_TAG_MASK  ((int64_t)0x6000000000000000)
+#define DL_DATOM_PAYLOAD   ((int64_t)0x1FFFFFFFFFFFFFFF)
+/* A negative plain integer has every high bit set by sign extension, so it
+ * spuriously matches DL_DATOM_TAG_MASK; guard with v >= 0 since a genuine
+ * tagged cell is always non-negative (built from a small, non-negative
+ * intern id OR'd with a tag that never sets the sign bit) -- without this,
+ * untagging would corrupt ordinary negative I64 result values (e.g. from
+ * datalog arithmetic) by masking off their sign-extended high bits. */
+static inline int64_t dl_datom_untag(int64_t v) { return (v >= 0 && (v & DL_DATOM_TAG_MASK)) ? (v & DL_DATOM_PAYLOAD) : v; }
+
 /* Maximum arity for any relation */
 #define DL_MAX_ARITY 16
 
