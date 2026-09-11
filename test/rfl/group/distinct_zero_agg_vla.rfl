@@ -1,0 +1,20 @@
+;; distinct_zero_agg_vla.rfl — table `distinct` is a grouped plan with no
+;; aggregates (#515).
+;;
+;; Regression: once the input is large enough to take the hash group path,
+;; exec_group_run sized its agg result scratch as `agg_outs[n_aggs]` with
+;; n_aggs == 0.  A zero-length VLA is undefined behaviour; the release build
+;; tolerated it and answered correctly, the sanitized debug build aborted with
+;; "variable length array bound evaluates to non-positive value 0".  The
+;; reported shape is a STR key column at 100,000 rows / 9,000 distinct values.
+(set N 100000)
+(set x (til N))
+(set m (- x (* 9000 (div x 9000))))
+(set sk (map (fn [i] (concat "acct" (as 'str i))) (til 9000)))
+(set s (at sk m))
+(count (distinct (table ['a] (list s)))) -- 9000
+
+;; Same zero-aggregate path with a SYM key and with a two-column key.
+(set ss (as 'sym s))
+(count (distinct (table ['a] (list ss)))) -- 9000
+(count (distinct (table ['a 'b] (list s (- x (* 7 (div x 7))))))) -- 63000

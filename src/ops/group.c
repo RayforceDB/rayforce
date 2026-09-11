@@ -13695,9 +13695,12 @@ v2_emit:;
         /* Pre-allocate agg result vectors.  These VLAs scale with n_aggs
          * (the ≤8-agg ht_path guard is retired — 9/17/65-agg legacy shapes
          * reach here); ght_compute_layout has already accepted this n_aggs,
-         * so it is within the layout stride/slot budget. */
-        agg_out_t agg_outs[n_aggs];
-        ray_t* agg_cols[n_aggs];
+         * so it is within the layout stride/slot budget.  Sized by vla_aggs,
+         * not n_aggs: a table `distinct` is a grouped plan with zero
+         * aggregates, and a zero-length VLA is UB (#515) — the sanitized
+         * build aborted here.  Every loop below is bounded by n_aggs. */
+        agg_out_t agg_outs[vla_aggs];
+        ray_t* agg_cols[vla_aggs];
         for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t agg_op = ext->agg_ops[a];
             ray_t* agg_col = agg_vecs[a];
