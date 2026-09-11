@@ -1626,6 +1626,13 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 ray_t* result = dl_antijoin_tables(accum, neg_tbl, lkeys, rkeys, n_keys);
                 ray_release(accum);
                 accum = result;
+            } else if (ray_table_nrows(neg_tbl) > 0) {
+                /* No join keys: the negated literal is ground (or all-fresh
+                 * variables). A non-empty match falsifies every accumulated
+                 * row (audit §1.3); an empty match leaves accum untouched. */
+                ray_t* empty = dl_table_take_mask(accum, NULL, 0);
+                ray_release(accum);
+                accum = empty;
             }
             ray_release(neg_tbl);
             break;

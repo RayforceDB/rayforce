@@ -29,3 +29,9 @@
 (at (at (query g2 (find ?x) (where (?x :edge ?x))) '?x) 0) -- 5
 ;; ... and inside a negated atom: every node except the one with a self-loop
 (count (query g2 (find ?x) (where (?x :edge ?y) (not (?x :edge ?x))))) -- 6
+
+;; §1.3 a negated atom with no shared variables is a guard, not a no-op.
+(count (query g (find ?x) (where (?x :edge ?y) (not (1 :edge 2))))) -- 0
+(count (query g (find ?x) (where (?x :edge ?y) (not (1 :edge 9))))) -- 7
+(count (query g (find ?x) (where (?x :edge ?y) (not (_ :edge 8))))) -- 0
+(count (query g (find ?x) (where (?x :edge ?y) (not (_ :edge 99))))) -- 7
