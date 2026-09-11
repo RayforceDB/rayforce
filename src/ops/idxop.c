@@ -215,6 +215,68 @@ static ray_t* ray_index_alloc(ray_idx_kind_t kind, int8_t parent_type, int64_t p
 }
 
 /* --------------------------------------------------------------------------
+ * Table-resident key index (RAY_IDX_UKEY)
+ *
+ * A table's aux is zero-init, so unlike a vector there is nothing to snapshot
+ * and restore — attach is a pointer write plus the attrs bit, detach clears
+ * both.  Refcounting rides the type-agnostic RAY_ATTR_HAS_INDEX arms of
+ * ray_retain_owned_refs / ray_release_owned_refs, so the index dies with the
+ * table and a copied table is handled by the caller (a fresh table starts
+ * without one).
+ * -------------------------------------------------------------------------- */
+
+ray_t* ray_index_build_ukey(const int64_t* kci, int64_t nk, int64_t entries) {
+    if (nk <= 0 || nk > RAY_UKEY_MAX_COLS) return NULL;
+    uint64_t cap = 16;
+    while (cap < (uint64_t)entries * 2) {
+        if (cap > (UINT64_MAX >> 1)) return ray_error("oom", NULL);
+        cap <<= 1;
+    }
+    ray_t* slots = ray_vec_new(RAY_I64, (int64_t)cap);
+    if (!slots || RAY_IS_ERR(slots)) return slots ? slots : ray_error("oom", NULL);
+    slots->len = (int64_t)cap;
+    memset(ray_data(slots), 0, (size_t)cap * sizeof(int64_t));
+
+    ray_t* idx = ray_index_alloc(RAY_IDX_UKEY, RAY_TABLE, 0);
+    if (!idx || RAY_IS_ERR(idx)) { ray_release(slots); return idx ? idx : ray_error("oom", NULL); }
+    ray_index_t* ix = ray_index_payload(idx);
+    ix->u.ukey.slots = slots;
+    ix->u.ukey.mask  = cap - 1;
+    ix->u.ukey.nrows = 0;
+    ix->u.ukey.nk    = nk;
+    for (int64_t k = 0; k < nk; k++) ix->u.ukey.kci[k] = (int32_t)kci[k];
+    return idx;
+}
+
+bool ray_table_ukey_attach(ray_t* tbl, ray_t* idx) {
+    if (!tbl || tbl->type != RAY_TABLE || !idx || RAY_IS_ERR(idx)) return false;
+    if (tbl->attrs & RAY_ATTR_HAS_INDEX) return false;
+    tbl->index    = idx;
+    tbl->_idx_pad = NULL;
+    tbl->attrs   |= RAY_ATTR_HAS_INDEX;
+    return true;
+}
+
+ray_index_t* ray_table_ukey_get(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE) return NULL;
+    if (!(tbl->attrs & RAY_ATTR_HAS_INDEX)) return NULL;
+    ray_t* idx = tbl->index;
+    if (!idx || RAY_IS_ERR(idx) || idx->type != RAY_INDEX) return NULL;
+    ray_index_t* ix = ray_index_payload(idx);
+    return ix->kind == RAY_IDX_UKEY ? ix : NULL;
+}
+
+void ray_table_ukey_drop(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE) return;
+    if (!(tbl->attrs & RAY_ATTR_HAS_INDEX)) return;
+    ray_t* idx = tbl->index;
+    tbl->index    = NULL;
+    tbl->_idx_pad = NULL;
+    tbl->attrs   &= (uint8_t)~RAY_ATTR_HAS_INDEX;
+    if (idx && !RAY_IS_ERR(idx)) ray_release(idx);
+}
+
+/* --------------------------------------------------------------------------
  * Saved-aux retain / release
  *
  * The 16 byte snapshot preserves the parent's original aux-union bytes
@@ -240,6 +302,10 @@ void ray_index_retain_saved(ray_index_t* ix) {
 
 void ray_index_release_payload(ray_index_t* ix) {
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:
+        if (ix->u.ukey.slots && !RAY_IS_ERR(ix->u.ukey.slots))
+            ray_release(ix->u.ukey.slots);
+        break;
     case RAY_IDX_HASH:
         if (ix->u.hash.table && !RAY_IS_ERR(ix->u.hash.table))
             ray_release(ix->u.hash.table);
@@ -292,6 +358,10 @@ void ray_index_release_payload(ray_index_t* ix) {
 
 void ray_index_retain_payload(ray_index_t* ix) {
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:
+        if (ix->u.ukey.slots && !RAY_IS_ERR(ix->u.ukey.slots))
+            ray_retain(ix->u.ukey.slots);
+        break;
     case RAY_IDX_HASH:
         if (ix->u.hash.table && !RAY_IS_ERR(ix->u.hash.table))
             ray_retain(ix->u.hash.table);
@@ -823,6 +893,10 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
 static int idx_child_slots(ray_index_t* ix, ray_t** slots[4]) {
     int n = 0;
     switch (ix->kind) {
+    /* RAY_IDX_UKEY is runtime-only and lives on a table, which is never
+     * written as a column, so it has nothing to persist.  Named rather
+     * than left to the default so the omission reads as deliberate. */
+    case RAY_IDX_UKEY: break;
     case RAY_IDX_HASH:
         slots[n++] = &ix->u.hash.table; slots[n++] = &ix->u.hash.gkeys;
         slots[n++] = &ix->u.hash.offs;  slots[n++] = &ix->u.hash.rows;  break;
@@ -2445,6 +2519,14 @@ ray_t* ray_index_info(ray_t* v) {
     if (RAY_IS_ERR(r)) goto fail;
 
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:
+        r = dict_append_sym_i64(&keys, &vals, "n_keys", ix->u.ukey.nrows);
+        if (RAY_IS_ERR(r)) goto fail;
+        r = dict_append_sym_i64(&keys, &vals, "capacity", (int64_t)(ix->u.ukey.mask + 1));
+        if (RAY_IS_ERR(r)) goto fail;
+        r = dict_append_sym_i64(&keys, &vals, "n_key_cols", ix->u.ukey.nk);
+        if (RAY_IS_ERR(r)) goto fail;
+        break;
     case RAY_IDX_ZONE:
         if (ix->parent_type == RAY_F32 || ix->parent_type == RAY_F64) {
             int64_t kmin = ray_sym_intern("min", 3);

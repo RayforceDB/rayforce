@@ -585,6 +585,7 @@ static size_t objsize_shallow(ray_t* v) {
 static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) {
 #define OBJSIZE_PUSH(child) do { if (!objsize_stack_push(w, (child))) return false; } while (0)
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:       OBJSIZE_PUSH(ix->u.ukey.slots); break;
     case RAY_IDX_HASH:
         OBJSIZE_PUSH(ix->u.hash.table); OBJSIZE_PUSH(ix->u.hash.gkeys);
         OBJSIZE_PUSH(ix->u.hash.offs);  OBJSIZE_PUSH(ix->u.hash.rows);

@@ -154,3 +154,76 @@
 (at (at big 'sz) 2500) -- -2500
 (at (at big 'sz) 7499) -- -7499
 (sum (at big 'px)) -- 28121250
+
+;; ── the key map now outlives the call, so what invalidates it matters ────
+;; A named table mutated in place keeps its key->row map between upserts
+;; instead of rebuilding it over every existing row, which is what made a
+;; sequence of batches quadratic in the table size.  The cases below pin the
+;; answers that a stale map would get wrong; they pass on either engine, and
+;; their job is to fail if the map ever outlives what it describes.
+
+;; Repeated batches: the reused map must place every later key correctly and
+;; still recognise a key from an earlier batch as an update, not an append.
+(set s (table [k v] (list (take [0] 0) (take [0] 0))))
+(map (fn [i] (upsert 's 1 (table [k v] (list (+ (til 100) (* i 100)) (take [1] 100))))) (til 20))
+(count s) -- 2000
+(sum (at s 'v)) -- 2000
+(upsert 's 1 (table [k v] (list [0 999 1999 2000] [7 7 7 7])))
+(count s) -- 2001
+(at (at s 'v) 0) -- 7
+(at (at s 'v) 999) -- 7
+(at (at s 'v) 1999) -- 7
+(at (at s 'k) 2000) -- 2000
+(at (at s 'v) 2000) -- 7
+
+;; An in-place where-update can rewrite a key cell without moving the row
+;; count, which is exactly what the map's staleness check cannot see.  Every
+;; upsert here carries two rows on purpose: a one-row upsert never builds a
+;; map at all, so a single-row batch would test nothing.  Against a map left
+;; behind by the update, key 99 is absent and appends a second copy of a key
+;; the table already holds.
+(set u (table [k v] (list [1 2 3 4] [10 20 30 40])))
+(upsert 'u 1 (table [k v] (list [5 6] [50 60])))
+(count u) -- 6
+(update {from: 'u k: 99 where: (== k 2)})
+(count u) -- 6
+(upsert 'u 1 (table [k v] (list [99 7] [990 70])))
+(count u) -- 7
+(at (at u 'v) 1) -- 990
+(at (at u 'k) 6) -- 7
+
+;; An insert between upserts moves the row count, so the map must be rebuilt
+;; rather than trusted: the inserted key is an update, not a duplicate.
+(set n (table [k v] (list [1 2] [10 20])))
+(upsert 'n 1 (table [k v] (list [3 6] [30 60])))
+(insert 'n (list 4 40))
+(upsert 'n 1 (table [k v] (list [4 5] [444 50])))
+(count n) -- 6
+(at (at n 'v) 4) -- 444
+
+;; The same table upserted on a different key width must not reuse a map
+;; built for the other key.
+(set w (table [a b v] (list [1 1 2] [1 2 1] [10 20 30])))
+(upsert 'w 2 (table [a b v] (list [1 3] [2 3] [200 330])))
+(count w) -- 4
+(at (at w 'v) 1) -- 200
+(upsert 'w 1 (table [a b v] (list [2] [9] [900])))
+(count w) -- 4
+(at (at w 'v) 2) -- 900
+;; with a one-column key `b` is no longer part of it, so the matched row
+;; takes the batch's b as an ordinary non-key update
+(at (at w 'b) 2) -- 9
+
+;; A refused batch leaves the table untouched and the next one still lands
+;; correctly.  The refusal happens in the type check, before the map is built,
+;; so this pins the observable behaviour rather than the map's own rollback —
+;; that needs a mid-append failure, which RFL cannot provoke.
+(set f (table [k v] (list [1 2] [10 20])))
+(upsert 'f 1 (table [k v] (list [3 4] [30 40])))
+(count f) -- 4
+(upsert 'f 1 (list [5 6] (list 50 'bad))) !- type
+(count f) -- 4
+(upsert 'f 1 (table [k v] (list [5 3] [50 333])))
+(count f) -- 5
+(at (at f 'v) 2) -- 333
+(at (at f 'k) 4) -- 5

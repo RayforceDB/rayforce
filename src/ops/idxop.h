@@ -48,6 +48,11 @@
 #include <rayforce.h>
 #include "mem/heap.h"  /* RAY_ATTR_HAS_INDEX */
 
+/* Maximum key columns a RAY_IDX_UKEY map covers.  Chosen so the arm fits
+ * the existing union (see the static assert below); a wider key simply gets
+ * no index and falls back to the per-call build. */
+#define RAY_UKEY_MAX_COLS 8
+
 /* Index kinds.  Stored in ray_index_t.kind. */
 typedef enum {
     RAY_IDX_NONE       = 0,
@@ -73,6 +78,12 @@ typedef enum {
      * permitted on RAY_STR (it stores codes alongside the descriptors, leaving
      * the column's own representation untouched). */
     RAY_IDX_DICT       = 7,
+    /* Key-tuple -> row map for keyed upsert.  RUNTIME-ONLY and attached to
+     * the RAY_TABLE object rather than to a column, because the key spans
+     * several columns.  Never persisted: serde masks attrs down to
+     * HAS_NULLS and col_save strips HAS_INDEX, so it cannot reach a file.
+     * See the ukey arm of ray_index_t.u below. */
+    RAY_IDX_UKEY       = 8,
 } ray_idx_kind_t;
 
 /* Marker bits stored in ray_index_t.markers (block-resident attributes
@@ -172,8 +183,31 @@ typedef struct {
             ray_t*   first_occ; /* RAY_I32 vec, n_distinct entries: first-occ row  */
             int64_t  n_distinct;
         } dict;
+        struct {                /* RAY_IDX_UKEY */
+            /* Open addressing over the whole key tuple: slot = row + 1,
+             * 0 = empty.  Rows are entered in row order, so a probe from
+             * the hash slot meets duplicates lowest-row first — the row
+             * the linear scan would have picked.
+             *
+             * `nrows` is the table row count this map describes.  Any
+             * mutation that changes the row count leaves it behind and the
+             * map is rebuilt; a rewrite of a key cell that keeps the count
+             * must drop the index explicitly (upsert itself never rewrites
+             * key cells — a matched row updates non-key columns only). */
+            ray_t*   slots;     /* RAY_I64 vec, mask+1 entries */
+            uint64_t mask;      /* capacity - 1 (capacity is a power of two) */
+            int64_t  nrows;
+            int64_t  nk;        /* number of key columns */
+            int32_t  kci[RAY_UKEY_MAX_COLS];  /* key column positions */
+        } ukey;
     } u;
 } ray_index_t;
+
+/* The ukey arm is sized to land exactly on the hash arm's 64 bytes so
+ * ray_index_t does not grow: it is stored inline in persisted column files,
+ * and a larger payload would change that on-disk layout for every kind. */
+_Static_assert(sizeof(((ray_index_t*)0)->u.ukey) <= sizeof(((ray_index_t*)0)->u.hash),
+               "RAY_IDX_UKEY payload must not grow ray_index_t");
 
 /* On-disk index persistence stores the RAY_INDEX object and its child vecs as
  * contiguous 32-byte-aligned ray_t blocks mmap'd in place (no serialization).
@@ -242,6 +276,28 @@ ray_t*  ray_index_inline_map(uint8_t* region);
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach aux state byte-for-byte.  Returns *vp. */
 ray_t* ray_index_drop(ray_t** vp);
+
+/* ===== Table-resident key index (RAY_IDX_UKEY) =====
+ * Attached to a RAY_TABLE, not to a vector, so the generic attach path does
+ * not apply: a table's aux is zero-init, there is nothing to snapshot and
+ * restore.  Retain/release ride the type-agnostic RAY_ATTR_HAS_INDEX arms in
+ * heap.c, so the index dies with the table. */
+
+/* Build a standalone RAY_IDX_UKEY sized for `entries` rows (caller attaches
+ * or releases).  The slot vector is allocated zeroed. */
+ray_t* ray_index_build_ukey(const int64_t* kci, int64_t nk, int64_t entries);
+
+/* Attach `idx` to `tbl`, taking ownership of the caller's reference.
+ * Returns false (and keeps the caller's reference) if `tbl` already carries
+ * an index — the caller drops first. */
+bool ray_table_ukey_attach(ray_t* tbl, ray_t* idx);
+
+/* The attached ukey payload, or NULL when the table carries no index or one
+ * of another kind. */
+ray_index_t* ray_table_ukey_get(ray_t* tbl);
+
+/* Detach and release any index on `tbl`.  Safe on a table with none. */
+void ray_table_ukey_drop(ray_t* tbl);
 
 /* ===== Introspection ===== */
 

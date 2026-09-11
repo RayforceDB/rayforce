@@ -11821,6 +11821,10 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     for (int64_t c = 0; c < ncols; c++)
         if (slots[c]->rc != 1 || !upsert_col_ok(slots[c])) return NULL;
 
+    /* This path can rewrite a key cell while leaving the row count alone,
+     * which is precisely what upsert's key map cannot detect.  Drop it. */
+    ray_table_ukey_drop(tbl);
+
     DICT_VIEW_DECL(updf);
     DICT_VIEW_OPEN(dict, updf);
     if (DICT_VIEW_OVERFLOW(updf)) { DICT_VIEW_CLOSE(updf); *handled = true; return ray_error("oom", NULL); }
@@ -14835,6 +14839,18 @@ static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     mp->slot[s] = row + 1;
 }
 
+/* Does this table-resident map still describe the table, and can it take
+ * `m` more rows at the load factor it was sized for?  A row count that moved
+ * without the map means something else wrote the table; a different key
+ * means a different upsert. */
+static bool ukey_fits(ray_index_t* ix, const int64_t* kci, int64_t nk,
+                      int64_t nrows0, int64_t m) {
+    if (ix->u.ukey.nrows != nrows0 || ix->u.ukey.nk != nk) return false;
+    for (int64_t k = 0; k < nk; k++)
+        if (ix->u.ukey.kci[k] != (int32_t)kci[k]) return false;
+    return (uint64_t)(nrows0 + m) * 2 <= ix->u.ukey.mask + 1;
+}
+
 static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
                                const int64_t* kci, int64_t nk, ray_t** cells) {
     uint64_t s = h & mp->mask;
@@ -15032,6 +15048,7 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
 
     ray_t* err = NULL;
     upsert_map_t map = { NULL, NULL, 0 };
+    ray_index_t* ukey = NULL;   /* table-resident map, borrowed from tbl */
     ray_t* work = NULL;
 
     if (src_cols) {
@@ -15103,10 +15120,46 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         }
     }
 
+    /* The key->row map is what a bulk upsert actually costs.  Built over every
+     * existing row on entry and freed on exit, it made a sequence of batches
+     * quadratic in the table size: the profile of a growing table is almost
+     * entirely hashing rows that were already there.  When the table is a
+     * named binding mutated in place its object identity survives between
+     * calls, so the map lives on the table and is carried across them; the
+     * per-call cost becomes the batch, not the table.  Every other shape
+     * builds a scratch map exactly as before. */
     if (!err && m > 1) {
-        if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
-        for (int64_t r = 0; r < nrows0 && !err; r++)
-            upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+        if (inplace && nk <= RAY_UKEY_MAX_COLS) {
+            ukey = ray_table_ukey_get(tbl);
+            if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
+                ray_table_ukey_drop(tbl);
+                ukey = NULL;
+            }
+            if (!ukey) {
+                ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
+                if (idx && !RAY_IS_ERR(idx)) {
+                    if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
+                    else ray_release(idx);
+                }
+                /* A map we could not build or attach is not an error: fall
+                 * through to the scratch one and answer at the old cost. */
+                if (ukey) {
+                    map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                    map.mask = ukey->u.ukey.mask;
+                    for (int64_t r = 0; r < nrows0 && !err; r++)
+                        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+                    ukey->u.ukey.nrows = nrows0;
+                }
+            } else {
+                map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                map.mask = ukey->u.ukey.mask;
+            }
+        }
+        if (!ukey && !err) {
+            if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
+            for (int64_t r = 0; r < nrows0 && !err; r++)
+                upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+        }
     }
 
     int64_t nrows = nrows0;
@@ -15138,6 +15191,14 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     }
 
     if (err && slots) upsert_rollback_appends(slots, ncols, nrows0);
+
+    /* A rolled-back batch leaves the map naming rows that no longer exist and
+     * a half-built one names nothing, so a failed call must not leave it on
+     * the table.  A successful one records the row count it now describes. */
+    if (ukey) {
+        if (err) { ray_table_ukey_drop(tbl); ukey = NULL; }
+        else ukey->u.ukey.nrows = nrows;
+    }
 
     if (map.hdr) scratch_free(map.hdr);
     for (size_t i = 0; i < ncell; i++) if (owned[i] && cells[i]) ray_release(cells[i]);
