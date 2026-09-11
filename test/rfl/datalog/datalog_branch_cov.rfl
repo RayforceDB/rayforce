@@ -117,14 +117,16 @@
 (sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (+ ?x 0.5)) (> ?y 20.0))) '?y)) -- 51.0
 
 ;; ════════════════════════ integer division by zero in expressions ═════════════════════════
-;; Exercises the rd[r] != 0 ? ... : 0 branch in i64 binop path (line 748).
-;; Division by 0 → result is 0 for each row; ?y = 0 for all 3 rows.
+;; Exercises the (b == 0 || ...) ? NULL_I64 : a / b branch in the i64 binop path.
+;; §2.2: division by 0 is null, matching the host `/`; ?y = 0Nl for all 3 rows,
+;; and sum() over an all-null i64 column is null.
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0))))) -- 3
-(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0)))) '?y)) -- 0
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0)))) '?y)) -- 0Nl
 
-;; Exercises the rd[r] != 0.0 ? ... : 0.0 branch in f64 binop path (line 725).
+;; §2.2: f64 division by zero follows IEEE (matches the host `/`): ?x/0.0 -> +inf
+;; for each row, and sum() of all-+inf collapses to NaN (formats as 0Nf).
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0.0))))) -- 3
-(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0.0)))) '?y)) -- 0.0
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0.0)))) '?y)) -- 0Nf
 
 ;; ════════════════════════ f64 subtraction, multiplication, division in expressions ═════════════════════════
 ;; - ?x 0.5: {9.5, 19.5, 29.5}; > 10.0 keeps {19.5, 29.5} = 49.0.
@@ -212,8 +214,9 @@
 (count (query Empty (find ?n) (where (zero-count ?n)) (rules ((zero-count ?n) (count ?n empty_src))))) -- 1
 
 ;; ════════════════════════ query with inline rules — body references unknown predicate ═════════════════════════
+;; nonexistent-rel resolves to no relation at all — admission error, not empty (audit §7.3).
 (set Db (datoms))
-(count (query Db (find ?x) (where (phantom ?x)) (rules ((phantom ?x) (nonexistent-rel ?x))))) -- 0
+(query Db (find ?x) (where (phantom ?x)) (rules ((phantom ?x) (nonexistent-rel ?x)))) !- domain
 
 ;; ════════════════════════ neg with no shared keys (n_keys==0) ═════════════════════════
 (set Db (datoms))
@@ -366,12 +369,12 @@
 (at (at (query Db (find ?s) (where (asum ?s)) (rules ((asum ?s) (sum ?s agg_env 1)))) '?s) 0) -- 100
 
 ;; ════════════════════════ dl_find_rel returns -1 for unknown body pred ═════════════════════════
-;; Exercises line 1297 (rel_idx < 0 => return NULL) in dl_compile_rule.
 ;; When a positive body atom references a predicate unknown to the program,
-;; compile_rule returns NULL silently (no eval_err, just 0 rows).
+;; the admission check now rejects it up front (audit §7.3), instead of
+;; compile_rule silently returning NULL (no eval_err, just 0 rows).
 (set Db (datoms))
 (set Db (assert-fact Db 1 'tag 'x))
-(count (query Db (find ?e) (where (uses-unknown ?e)) (rules ((uses-unknown ?e) (no-such-pred ?e ?v))))) -- 0
+(query Db (find ?e) (where (uses-unknown ?e)) (rules ((uses-unknown ?e) (no-such-pred ?e ?v)))) !- domain
 
 ;; ════════════════════════ table_antijoin: left empty ═════════════════════════
 ;; Exercises the ray_table_nrows(left)==0 early return in table_antijoin (line 2368).

@@ -303,8 +303,9 @@
 
 ;; body shape guards — non-list body clause
 (query Db (find ?e) (where 1)) !- type
-;; reference to unknown predicate at eval time — empty result, not error
-(count (query Db (find ?e) (where ('weird ?e)))) -- 0
+;; reference to unknown predicate at eval time is now an admission error,
+;; not an empty result (audit §7.3).
+(query Db (find ?e) (where ('weird ?e))) !- domain
 
 ;; ════════════════════════ empty-result schema preservation (4201-4211) ═════════════════════════
 ;; Even when the result is empty, the schema must reflect the find vars.
@@ -353,9 +354,10 @@
 (asc (at qPairs '?l)) -- [1 2 3]
 (asc (at qPairs '?r)) -- [10 20 30]
 
-;; reference relation with arity-mismatch — not registered, 0 rows.
+;; reference relation with arity-mismatch — not registered, so `tri` is now
+;; an unknown relation (admission error, not 0 rows; audit §7.3).
 (set tri (table ['a 'b 'c] (list [1] [2] [3])))
-(count (query Db2 (find ?x ?y) (where (tri ?x ?y)))) -- 0
+(query Db2 (find ?x ?y) (where (tri ?x ?y))) !- domain
 
 ;; env-backed table whose 2nd column is RAY_SYM (auto-converted to I64 via
 ;; ray_read_sym branch — lines 4120-4140).
@@ -412,8 +414,11 @@
 (count (query Edb (find ?e) (where (gi ?e)) (rules ((gi ?e) (?e :age (+ 10 20)))))) -- 1
 ;; (first ['admin 'user]) → sym 'admin ; matches entity 1's role.
 (count (query Edb (find ?e) (where (gs ?e)) (rules ((gs ?e) (?e :role (first ['admin 'user])))))) -- 1
-;; evaluates to a float → unsupported constant type in body.
-(query Edb (find ?e) (where (gb ?e)) (rules ((gb ?e) (?e :age (+ 1.0 2.0))))) !- type
+;; evaluates to a float → F64 body constants are now supported (audit
+;; §1.4, task 4): compares numerically against the I64 age column, and
+;; 3.0 matches neither entity's age, so the result is empty rather than
+;; an error.
+(count (query Edb (find ?e) (where (gb ?e)) (rules ((gb ?e) (?e :age (+ 1.0 2.0)))))) -- 0
 
 ;; ════════════════════════ recursive rule via inline rules (no globals) ═════════════════════════
 ;; Chain 1→2→3→4: TC pairs = (1,2),(1,3),(1,4),(2,3),(2,4),(3,4) — 6 rows.
