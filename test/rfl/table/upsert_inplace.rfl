@@ -227,3 +227,18 @@
 (count f) -- 5
 (at (at f 'v) 2) -- 333
 (at (at f 'k) 4) -- 5
+
+;; A single row rides the same map now, so it has to maintain it: an appended
+;; row the map never learns about is invisible to the next batch, which then
+;; appends a second copy of a key the table already holds.
+(set x (table [k v] (list (take [0] 0) (take [0] 0))))
+(upsert 'x 1 (table [k v] (list [1 2 3] [10 20 30])))
+(upsert 'x 1 (table [k v] (list (enlist 4) (enlist 40))))
+(count x) -- 4
+(upsert 'x 1 (table [k v] (list (enlist 2) (enlist 222))))
+(count x) -- 4
+(at (at x 'v) 1) -- 222
+(upsert 'x 1 (table [k v] (list [4 5] [444 50])))
+(count x) -- 5
+(at (at x 'v) 3) -- 444
+(at (at x 'k) 4) -- 5

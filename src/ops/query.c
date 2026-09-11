@@ -15126,9 +15126,15 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
      * entirely hashing rows that were already there.  When the table is a
      * named binding mutated in place its object identity survives between
      * calls, so the map lives on the table and is carried across them; the
-     * per-call cost becomes the batch, not the table.  Every other shape
-     * builds a scratch map exactly as before. */
-    if (!err && m > 1) {
+     * per-call cost becomes the batch, not the table.
+     *
+     * This covers a single-row upsert too, which otherwise scans the table
+     * for its one key.  It matters less for the scan it saves than for the
+     * map it keeps honest: a single row appended outside the map moves the
+     * row count, and the next batch then finds the map stale and rebuilds
+     * it over everything — one interleaved row per batch was enough to put
+     * the whole quadratic back. */
+    if (!err) {
         if (inplace && nk <= RAY_UKEY_MAX_COLS) {
             ukey = ray_table_ukey_get(tbl);
             if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
@@ -15155,7 +15161,10 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                 map.mask = ukey->u.ukey.mask;
             }
         }
-        if (!ukey && !err) {
+        /* Without a table to hang it on, a map is only worth building for a
+         * batch: for one row it costs the scan it would replace and is then
+         * thrown away.  A single row keeps the scan. */
+        if (!ukey && !err && m > 1) {
             if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
             for (int64_t r = 0; r < nrows0 && !err; r++)
                 upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
