@@ -2689,7 +2689,7 @@ static ray_t* table_antijoin(ray_t* left, ray_t* right) {
  * ======================================================================== */
 
 /* Hash all columns of ref at row r into a single key. */
-static uint64_t dl_row_hash(int64_t** col_data, int64_t ncols, int64_t r) {
+static uint64_t dl_prov_row_hash(int64_t** col_data, int64_t ncols, int64_t r) {
     uint64_t h = ray_hash_i64(col_data[0][r]);
     for (int64_t c = 1; c < ncols; c++)
         h = ray_hash_combine(h, ray_hash_i64(col_data[c][r]));
@@ -2697,7 +2697,7 @@ static uint64_t dl_row_hash(int64_t** col_data, int64_t ncols, int64_t r) {
 }
 
 /* Check if rows match across `ncols` columns. */
-static bool dl_row_eq(int64_t** a_cols, int64_t ar,
+static bool dl_prov_row_eq(int64_t** a_cols, int64_t ar,
                      int64_t** b_cols, int64_t br, int64_t ncols) {
     for (int64_t c = 0; c < ncols; c++)
         if (a_cols[c][ar] != b_cols[c][br]) return false;
@@ -2716,9 +2716,9 @@ typedef struct {
     int64_t  mask;
     int64_t** ref_cols;    /* cached column data ptrs for ref */
     int64_t  ncols;
-} dl_rowset_t;
+} dl_provset_t;
 
-static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
+static bool dl_provset_init(dl_provset_t* rs, ray_t* ref) {
     int64_t ncols = ray_table_ncols(ref);
     int64_t nrows = ray_table_nrows(ref);
     rs->ncols = ncols;
@@ -2742,7 +2742,7 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
     for (int64_t i = 0; i < cap; i++) rs->slots[i] = -1;
 
     for (int64_t r = 0; r < nrows; r++) {
-        uint64_t h = dl_row_hash(rs->ref_cols, ncols, r);
+        uint64_t h = dl_prov_row_hash(rs->ref_cols, ncols, r);
         int64_t s = (int64_t)(h & (uint64_t)rs->mask);
         while (rs->slots[s] != -1) s = (s + 1) & rs->mask;
         rs->slots[s] = r;
@@ -2750,18 +2750,18 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
     return true;
 }
 
-static void dl_rowset_destroy(dl_rowset_t* rs) {
+static void dl_provset_destroy(dl_provset_t* rs) {
     if (rs->block) { ray_release(rs->block); rs->block = NULL; }
     if (rs->ref_cols) { ray_sys_free(rs->ref_cols); rs->ref_cols = NULL; }
 }
 
 /* True if the row at `tbl_cols[..][row]` is present in the set. */
-static bool dl_rowset_contains(dl_rowset_t* rs, int64_t** tbl_cols, int64_t row) {
-    uint64_t h = dl_row_hash(tbl_cols, rs->ncols, row);
+static bool dl_provset_contains(dl_provset_t* rs, int64_t** tbl_cols, int64_t row) {
+    uint64_t h = dl_prov_row_hash(tbl_cols, rs->ncols, row);
     int64_t s = (int64_t)(h & (uint64_t)rs->mask);
     while (rs->slots[s] != -1) {
         int64_t r = rs->slots[s];
-        if (dl_row_eq(tbl_cols, row, rs->ref_cols, r, rs->ncols))
+        if (dl_prov_row_eq(tbl_cols, row, rs->ref_cols, r, rs->ncols))
             return true;
         s = (s + 1) & rs->mask;
     }
@@ -2935,8 +2935,8 @@ static void dl_build_provenance(dl_program_t* prog) {
             /* Mark rows in rel->table that appear in derived.  Build a
              * hashset over `derived` once and probe per row of rel —
              * was O(nrows × derived_rows × ncols), now O(nrows + derived_rows). */
-            dl_rowset_t rs;
-            if (dl_rowset_init(&rs, derived)) {
+            dl_provset_t rs;
+            if (dl_provset_init(&rs, derived)) {
                 int64_t ncols_t = ray_table_ncols(rel->table);
                 int64_t** tbl_cols = (int64_t**)ray_sys_alloc(sizeof(int64_t*) * (size_t)ncols_t);
                 if (tbl_cols) {
@@ -2946,12 +2946,12 @@ static void dl_build_provenance(dl_program_t* prog) {
                     }
                     for (int64_t row = 0; row < nrows; row++) {
                         if (pd[row] >= 0) continue;
-                        if (dl_rowset_contains(&rs, tbl_cols, row))
+                        if (dl_provset_contains(&rs, tbl_cols, row))
                             pd[row] = r;
                     }
                     ray_sys_free(tbl_cols);
                 }
-                dl_rowset_destroy(&rs);
+                dl_provset_destroy(&rs);
             }
             ray_release(derived);
         }
@@ -2961,6 +2961,223 @@ static void dl_build_provenance(dl_program_t* prog) {
 
         dl_build_source_prov(prog, rel, nrows, pd);
     }
+}
+
+/* ========================================================================
+ * Incremental row set (dl_rowset_t)
+ *
+ * The semi-naive loop used to run table_distinct(new) + table_antijoin(new,
+ * rel->table) every iteration, re-hashing the whole derived relation each
+ * time — O(iterations x |relation|).  Instead each IDB keeps one
+ * open-addressing set of its rows alive for the whole stratum: a candidate
+ * tuple is probed once and inserted on acceptance.
+ *
+ * Row-index contract: entries are row indices into the relation table the
+ * set was built from.  dl_rowset_extract_new hands accepted candidate k the
+ * index nrows(full) + k, so the caller MUST append the returned delta to
+ * `full` in order (table_union concatenates column-wise, preserving a's rows
+ * then b's) and must not otherwise rebuild the table.
+ *
+ * Cell comparison: cells are compared as raw 64-bit keys (SYM ids read at
+ * the column's adaptive width, F64 bit patterns).  A SYM id is only
+ * meaningful within its column's domain, so dl_rowset_comparable() gates the
+ * fast path on `full` and `cand` agreeing on type and SYM domain per column;
+ * when they don't, dl_eval falls back to distinct+antijoin for that
+ * iteration and rebuilds the set afterwards (ray_vec_concat re-expresses
+ * cross-domain SYM cells into the runtime domain, which would invalidate
+ * every stored hash).
+ * ======================================================================== */
+
+/* The 64-bit key a cell contributes to the row identity. */
+static uint64_t dl_cell_key(ray_t* col, int64_t row) {
+    if (col->type == RAY_F64) {
+        uint64_t v;
+        memcpy(&v, &((const double*)ray_data(col))[row], sizeof(v));
+        return v;
+    }
+    return (uint64_t)dl_cell_i64(col, row);
+}
+
+static uint64_t dl_row_hash(ray_t* tbl, int64_t row, int64_t ncols) {
+    uint64_t h = 0x243F6A8885A308D3ULL;
+    for (int64_t c = 0; c < ncols; c++) {
+        uint64_t v = dl_cell_key(ray_table_get_col_idx(tbl, c), row);
+        h = (h ^ v) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 29;
+    }
+    return h | 1;   /* never 0: 0 marks an empty slot */
+}
+
+static bool dl_row_eq(ray_t* ta, int64_t ra, ray_t* tb, int64_t rb, int64_t ncols) {
+    for (int64_t c = 0; c < ncols; c++) {
+        if (dl_cell_key(ray_table_get_col_idx(ta, c), ra) !=
+            dl_cell_key(ray_table_get_col_idx(tb, c), rb))
+            return false;
+    }
+    return true;
+}
+
+/* Every column must be one of the types dl_cell_key can read. */
+static bool dl_rowset_types_ok(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl)) return false;
+    int64_t nc = ray_table_ncols(tbl);
+    if (nc <= 0) return false;
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col) return false;
+        if (col->type != RAY_I64 && col->type != RAY_SYM && col->type != RAY_F64)
+            return false;
+    }
+    return true;
+}
+
+/* True when rows of `full` and `cand` may be compared as raw cell keys:
+ * matching column count, matching per-column type, and — for SYM — the same
+ * resolution domain (ids from different domains index different
+ * dictionaries and must never be raw-compared). */
+static bool dl_rowset_comparable(ray_t* full, ray_t* cand) {
+    if (!dl_rowset_types_ok(full) || !dl_rowset_types_ok(cand)) return false;
+    int64_t nc = ray_table_ncols(full);
+    if (nc != ray_table_ncols(cand)) return false;
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* a = ray_table_get_col_idx(full, c);
+        ray_t* b = ray_table_get_col_idx(cand, c);
+        if (a->type != b->type) return false;
+        if (a->type == RAY_SYM && ray_sym_vec_domain(a) != ray_sym_vec_domain(b))
+            return false;
+    }
+    return true;
+}
+
+int dl_rowset_init(dl_rowset_t* s, int64_t expected_rows) {
+    memset(s, 0, sizeof(*s));
+    int64_t cap = 16;
+    while (cap < (int64_t)1 << 40 && cap * 7 < expected_rows * 10) cap <<= 1;
+    ray_t* hb = ray_alloc((size_t)cap * sizeof(uint64_t));
+    ray_t* rb = ray_alloc((size_t)cap * sizeof(int64_t));
+    if (!hb || RAY_IS_ERR(hb) || !rb || RAY_IS_ERR(rb)) {
+        if (hb) { if (RAY_IS_ERR(hb)) ray_error_free(hb); else ray_free(hb); }
+        if (rb) { if (RAY_IS_ERR(rb)) ray_error_free(rb); else ray_free(rb); }
+        return -1;
+    }
+    s->hblock = hb;
+    s->rblock = rb;
+    s->hashes = (uint64_t*)ray_data(hb);
+    s->rows = (int64_t*)ray_data(rb);
+    memset(s->hashes, 0, (size_t)cap * sizeof(uint64_t));
+    s->cap = cap;
+    s->n = 0;
+    return 0;
+}
+
+void dl_rowset_free(dl_rowset_t* s) {
+    if (!s) return;
+    if (s->hblock) ray_free(s->hblock);
+    if (s->rblock) ray_free(s->rblock);
+    memset(s, 0, sizeof(*s));
+}
+
+/* Rehash into a larger table.  Hash and row index are both stored, so this
+ * needs no access to the relation. */
+static int dl_rowset_grow(dl_rowset_t* s) {
+    dl_rowset_t t;
+    if (dl_rowset_init(&t, s->n * 2 + 16) < 0) return -1;
+    for (int64_t i = 0; i < s->cap; i++) {
+        if (!s->hashes[i]) continue;
+        int64_t j = (int64_t)(s->hashes[i] & (uint64_t)(t.cap - 1));
+        while (t.hashes[j]) j = (j + 1) & (t.cap - 1);
+        t.hashes[j] = s->hashes[i];
+        t.rows[j] = s->rows[i];
+    }
+    t.n = s->n;
+    dl_rowset_free(s);
+    *s = t;
+    return 0;
+}
+
+int dl_rowset_add_table(dl_rowset_t* s, ray_t* tbl) {
+    if (!s || !s->cap) return -1;
+    if (!tbl || RAY_IS_ERR(tbl)) return -1;
+    int64_t n = ray_table_nrows(tbl);
+    if (n == 0) return 0;
+    if (!dl_rowset_types_ok(tbl)) return -1;
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t r = 0; r < n; r++) {
+        if ((s->n + 1) * 10 > s->cap * 7 && dl_rowset_grow(s) < 0) return -1;
+        uint64_t h = dl_row_hash(tbl, r, ncols);
+        int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
+        bool found = false;
+        while (s->hashes[j]) {
+            if (s->hashes[j] == h && dl_row_eq(tbl, s->rows[j], tbl, r, ncols)) {
+                found = true;
+                break;
+            }
+            j = (j + 1) & (s->cap - 1);
+        }
+        if (found) continue;   /* duplicate row inside tbl */
+        s->hashes[j] = h;
+        s->rows[j] = r;
+        s->n++;
+    }
+    return 0;
+}
+
+ray_t* dl_rowset_extract_new(dl_rowset_t* s, ray_t* full, ray_t* cand) {
+    if (!s || !s->cap) return ray_error("domain", "rowset: uninitialized set");
+    if (!cand || RAY_IS_ERR(cand)) return ray_error("domain", "rowset: bad candidate");
+    int64_t n = ray_table_nrows(cand);
+    int64_t ncols = ray_table_ncols(cand);
+    int64_t base = full && !RAY_IS_ERR(full) ? ray_table_nrows(full) : 0;
+
+    ray_t* keep_block = ray_alloc((size_t)(n > 0 ? n : 1));
+    if (!keep_block || RAY_IS_ERR(keep_block)) {
+        if (keep_block) ray_error_free(keep_block);
+        return ray_error("memory", "rowset: mask alloc");
+    }
+    uint8_t* keep = (uint8_t*)ray_data(keep_block);
+    memset(keep, 0, (size_t)(n > 0 ? n : 1));
+
+    /* kmap[k] = the cand row accepted as set entry base + k, so a probe can
+     * resolve an entry that refers to a row not yet appended to `full`. */
+    ray_t* map_block = ray_alloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    if (!map_block || RAY_IS_ERR(map_block)) {
+        if (map_block) ray_error_free(map_block);
+        ray_free(keep_block);
+        return ray_error("memory", "rowset: map alloc");
+    }
+    int64_t* kmap = (int64_t*)ray_data(map_block);
+
+    int64_t accepted = 0;
+    for (int64_t r = 0; r < n; r++) {
+        if ((s->n + 1) * 10 > s->cap * 7 && dl_rowset_grow(s) < 0) {
+            ray_free(keep_block);
+            ray_free(map_block);
+            return ray_error("memory", "rowset: grow");
+        }
+        uint64_t h = dl_row_hash(cand, r, ncols);
+        int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
+        bool found = false;
+        while (s->hashes[j]) {
+            if (s->hashes[j] == h) {
+                int64_t rr = s->rows[j];
+                bool eq = rr < base ? dl_row_eq(full, rr, cand, r, ncols)
+                                    : dl_row_eq(cand, kmap[rr - base], cand, r, ncols);
+                if (eq) { found = true; break; }
+            }
+            j = (j + 1) & (s->cap - 1);
+        }
+        if (found) continue;
+        s->hashes[j] = h;
+        s->rows[j] = base + accepted;
+        s->n++;
+        kmap[accepted++] = r;
+        keep[r] = 1;
+    }
+
+    ray_t* out = dl_table_take_mask(cand, keep, accepted);
+    ray_free(keep_block);
+    ray_free(map_block);
+    return out;
 }
 
 /* ========================================================================
@@ -3054,8 +3271,13 @@ int dl_eval(dl_program_t* prog) {
          * difference between current and previous table states. */
         ray_t* prev_tables[DL_MAX_RELS];
         ray_t* delta_tables[DL_MAX_RELS];
+        /* One persistent row set per IDB, alive for the whole stratum: the
+         * per-iteration delta is "candidate rows whose key is new" instead
+         * of table_distinct + table_antijoin over the full relation. */
+        dl_rowset_t sets[DL_MAX_RELS];
         memset(prev_tables, 0, sizeof(prev_tables));
         memset(delta_tables, 0, sizeof(delta_tables));
+        memset(sets, 0, sizeof(sets));
 
         /* Initially, delta = full table (all tuples are new) */
         for (int p = 0; p < prog->strata_sizes[s]; p++) {
@@ -3079,6 +3301,13 @@ int dl_eval(dl_program_t* prog) {
                         ray_release(empty_col);
                     }
                 }
+                /* Seed the row set from the post-Phase-A relation.  A
+                 * failure (OOM, or a column type the set can't key on)
+                 * leaves the set zeroed, which simply keeps the generic
+                 * distinct+antijoin path for this relation. */
+                if (dl_rowset_init(&sets[rel_idx], ray_table_nrows(rel->table) * 2 + 16) == 0 &&
+                    dl_rowset_add_table(&sets[rel_idx], rel->table) < 0)
+                    dl_rowset_free(&sets[rel_idx]);
             }
         }
 
@@ -3108,6 +3337,7 @@ int dl_eval(dl_program_t* prog) {
                         ray_release(prev_tables[rel_idx]);
                     if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
                         ray_release(delta_tables[rel_idx]);
+                    dl_rowset_free(&sets[rel_idx]);
                 }
                 prog->eval_err = true;
                 return -1;
@@ -3215,33 +3445,86 @@ int dl_eval(dl_program_t* prog) {
                     continue;
                 }
 
-                /* Deduplicate */
-                ray_t* deduped = table_distinct(new_tuples);
-                ray_release(new_tuples);
-                if (!deduped) { prog->eval_err = true; continue; }
-                if (RAY_IS_ERR(deduped)) { prog->eval_err = true; ray_error_free(deduped); continue; }
+                /* A candidate table larger than the relation itself comes
+                 * from a join that manufactured mostly duplicates (the
+                 * non-linear `tc(x,y),tc(y,z)` shape): collapse it with the
+                 * vectorised table_distinct first, which is far cheaper per
+                 * row than the scalar probe below.  When the candidate is
+                 * already no bigger than the relation the probe alone wins,
+                 * since it avoids building a second hash table.  The budget
+                 * is the relation's own size — no new tunable. */
+                if (ray_table_nrows(new_tuples) > ray_table_nrows(rel->table)) {
+                    ray_t* pre = table_distinct(new_tuples);
+                    if (pre && !RAY_IS_ERR(pre)) {
+                        ray_release(new_tuples);
+                        new_tuples = pre;
+                    } else if (pre) {
+                        /* A distinct failure is not fatal on its own: the
+                         * paths below still produce a correct delta from
+                         * the un-deduplicated candidate. */
+                        ray_error_free(pre);
+                    }
+                }
 
-                /* Subtract existing relation to get true delta */
-                ray_t* delta = table_antijoin(deduped, rel->table);
-                ray_release(deduped);
-                if (!delta) { prog->eval_err = true; continue; }
-                if (RAY_IS_ERR(delta)) { prog->eval_err = true; ray_error_free(delta); continue; }
+                /* Delta = candidate rows not already in the relation,
+                 * deduplicated among themselves. */
+                ray_t* delta;
+                bool rebuild_set = false;
+                if (sets[rel_idx].cap &&
+                    dl_rowset_comparable(rel->table, new_tuples)) {
+                    delta = dl_rowset_extract_new(&sets[rel_idx], rel->table, new_tuples);
+                    ray_release(new_tuples);
+                    if (!delta || RAY_IS_ERR(delta)) {
+                        prog->eval_err = true;
+                        if (delta) ray_error_free(delta);
+                        /* Row indices in the set may now be inconsistent. */
+                        dl_rowset_free(&sets[rel_idx]);
+                        continue;
+                    }
+                } else {
+                    /* No usable set, or `new_tuples` disagrees with the
+                     * relation on column type or SYM resolution domain —
+                     * raw cell keys are not comparable across domains, and
+                     * the table_union below would re-express both sides into
+                     * the runtime domain, invalidating every stored hash.
+                     * Take the generic path and rebuild the set after. */
+                    rebuild_set = true;
+                    ray_t* deduped = table_distinct(new_tuples);
+                    ray_release(new_tuples);
+                    if (!deduped) { prog->eval_err = true; continue; }
+                    if (RAY_IS_ERR(deduped)) { prog->eval_err = true; ray_error_free(deduped); continue; }
+
+                    delta = table_antijoin(deduped, rel->table);
+                    ray_release(deduped);
+                    if (!delta) { prog->eval_err = true; continue; }
+                    if (RAY_IS_ERR(delta)) { prog->eval_err = true; ray_error_free(delta); continue; }
+                }
 
                 delta_tables[rel_idx] = delta;
 
                 /* Merge delta into full relation.  A merge failure here
                  * leaves delta_tables set but rel->table stale — that would
-                 * desync the fixpoint, so treat it as a hard failure. */
+                 * desync the fixpoint, so treat it as a hard failure.
+                 * This must stay immediately after the extraction: the set
+                 * assigned accepted candidate k the row index
+                 * nrows(rel->table) + k, and table_union concatenates
+                 * column-wise, so the relation's rows keep that order. */
                 if (ray_table_nrows(delta) > 0) {
                     ray_t* merged = table_union(rel->table, delta);
-                    if (!merged) { prog->eval_err = true; continue; }
-                    if (RAY_IS_ERR(merged)) {
+                    if (!merged || RAY_IS_ERR(merged)) {
                         prog->eval_err = true;
-                        ray_error_free(merged);
+                        if (merged) ray_error_free(merged);
+                        dl_rowset_free(&sets[rel_idx]);
                         continue;
                     }
                     ray_release(rel->table);
                     rel->table = merged;
+                }
+                if (rebuild_set) {
+                    dl_rowset_free(&sets[rel_idx]);
+                    if (dl_rowset_init(&sets[rel_idx], ray_table_nrows(rel->table) * 2 + 16) == 0 &&
+                        dl_rowset_add_table(&sets[rel_idx], rel->table) < 0)
+                        dl_rowset_free(&sets[rel_idx]);
                 }
             }
 
@@ -3279,6 +3562,7 @@ int dl_eval(dl_program_t* prog) {
                 ray_release(prev_tables[rel_idx]);
             if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
                 ray_release(delta_tables[rel_idx]);
+            dl_rowset_free(&sets[rel_idx]);
         }
     }
 

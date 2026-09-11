@@ -433,4 +433,38 @@ typedef struct {
 ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                           const dl_delta_t* delta, int rule_idx, ray_graph_t* g);
 
+/* ===== internal — exposed for tests ===== */
+
+/* Open-addressing set of relation rows, maintained across one stratum's
+ * fixpoint so each iteration probes only the candidate tuples instead of
+ * re-hashing the whole derived relation (table_distinct + table_antijoin).
+ *
+ * `rows[]` are row indices into the relation table the set was built from;
+ * the contract is that accepted delta rows are appended to that table, in
+ * order, immediately after dl_rowset_extract_new returns. */
+typedef struct {
+    ray_t*    hblock;   /* backing allocation for hashes (ray_alloc) */
+    ray_t*    rblock;   /* backing allocation for rows   (ray_alloc) */
+    uint64_t* hashes;   /* 0 = empty slot; a stored hash is always |1 */
+    int64_t*  rows;     /* row index into the owning relation's table */
+    int64_t   cap;      /* power of two */
+    int64_t   n;        /* live entries */
+} dl_rowset_t;
+
+/* Allocate a table sized for `expected_rows` at <=70% load. Returns 0, or
+ * -1 on OOM (the set is left zeroed, i.e. safe to free and unusable). */
+int dl_rowset_init(dl_rowset_t* s, int64_t expected_rows);
+
+/* Release the set's storage and zero it. NULL-safe on an already-freed set. */
+void dl_rowset_free(dl_rowset_t* s);
+
+/* Insert every distinct row of `tbl` with its own row index. Returns 0/-1. */
+int dl_rowset_add_table(dl_rowset_t* s, ray_t* tbl);
+
+/* Rows of `cand` that are neither in the set (whose entries index `full`)
+ * nor earlier duplicates within `cand`, as an owned table in candidate
+ * order; accepted rows enter the set as nrows(full) + k. Caller must append
+ * the result to `full` in order. Returns an owned table or RAY_ERROR. */
+ray_t* dl_rowset_extract_new(dl_rowset_t* s, ray_t* full, ray_t* cand);
+
 #endif /* RAYFORCE_DATALOG_H */

@@ -2737,6 +2737,81 @@ static test_result_t test_rule_expr_ownership(void) {
     PASS();
 }
 
+/* ===== dl_rowset_t: incremental row set (Task 12) ===== */
+
+/* Candidate rows are deduped against the existing relation AND among
+ * themselves, in first-occurrence order. */
+static test_result_t test_rowset_extract_new(void) {
+    int64_t a0[] = {1, 2, 3}, a1[] = {10, 20, 30};
+    ray_t* fa = ray_table_new(2);
+    fa = ray_table_add_col(fa, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, a0, 3));
+    fa = ray_table_add_col(fa, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, a1, 3));
+    int64_t c0[] = {2, 4, 4, 3}, c1[] = {20, 40, 40, 31};   /* (2,20) dup of full; (4,40) twice; (3,31) new */
+    ray_t* ca = ray_table_new(2);
+    ca = ray_table_add_col(ca, ray_sym_intern("x", 1), ray_vec_from_raw(RAY_I64, c0, 4));
+    ca = ray_table_add_col(ca, ray_sym_intern("y", 1), ray_vec_from_raw(RAY_I64, c1, 4));
+
+    dl_rowset_t s;
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 4), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, fa), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 3);
+    ray_t* delta = dl_rowset_extract_new(&s, fa, ca);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta), 2);
+    TEST_ASSERT_EQ_I((int)s.n, 5);
+    int64_t* dx = (int64_t*)ray_data(ray_table_get_col_idx(delta, 0));
+    TEST_ASSERT_EQ_I((int)dx[0], 4);
+    TEST_ASSERT_EQ_I((int)dx[1], 3);
+    ray_release(delta); dl_rowset_free(&s);
+    ray_release(fa); ray_release(ca);
+    PASS();
+}
+
+/* SYM columns: the two tables' sym vectors are built independently and at
+ * different adaptive widths (W64 vs W8).  Both resolve against the runtime
+ * domain, so equal symbols carry equal ids and must dedupe -- this is the
+ * property dl_rowset_comparable() guards before the fast path is taken. */
+static test_result_t test_rowset_extract_new_sym(void) {
+    int64_t sa = ray_sym_intern("alpha", 5);
+    int64_t sb = ray_sym_intern("beta", 4);
+    int64_t sc = ray_sym_intern("gamma", 5);
+
+    ray_t* fcol = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_NOT_NULL(fcol);
+    fcol->len = 2;
+    ray_write_sym(ray_data(fcol), 0, (uint64_t)sa, fcol->type, fcol->attrs);
+    ray_write_sym(ray_data(fcol), 1, (uint64_t)sb, fcol->type, fcol->attrs);
+    ray_t* full = ray_table_new(1);
+    full = ray_table_add_col(full, ray_sym_intern("s", 1), fcol);
+
+    /* Independently built, narrower storage, same runtime domain. */
+    ray_t* ccol = ray_sym_vec_new(RAY_SYM_W8, 3);
+    TEST_ASSERT_NOT_NULL(ccol);
+    ccol->len = 3;
+    ray_write_sym(ray_data(ccol), 0, (uint64_t)sb, ccol->type, ccol->attrs);   /* dup of full */
+    ray_write_sym(ray_data(ccol), 1, (uint64_t)sc, ccol->type, ccol->attrs);   /* new */
+    ray_write_sym(ray_data(ccol), 2, (uint64_t)sc, ccol->type, ccol->attrs);   /* dup within cand */
+    ray_t* cand = ray_table_new(1);
+    cand = ray_table_add_col(cand, ray_sym_intern("s", 1), ccol);
+
+    dl_rowset_t s;
+    TEST_ASSERT_EQ_I(dl_rowset_init(&s, 2), 0);
+    TEST_ASSERT_EQ_I(dl_rowset_add_table(&s, full), 0);
+    TEST_ASSERT_EQ_I((int)s.n, 2);
+    ray_t* delta = dl_rowset_extract_new(&s, full, cand);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(delta));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(delta), 1);
+    TEST_ASSERT_EQ_I((int)s.n, 3);
+    ray_t* dcol = ray_table_get_col_idx(delta, 0);
+    TEST_ASSERT_EQ_I((int)ray_read_sym(ray_data(dcol), 0, dcol->type, dcol->attrs), (int)sc);
+    ray_release(delta); dl_rowset_free(&s);
+    ray_release(full); ray_release(cand);
+    ray_release(fcol); ray_release(ccol);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2807,6 +2882,8 @@ const test_entry_t datalog_entries[] = {
     { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
     { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
     { "datalog/rule_expr_ownership", test_rule_expr_ownership, datalog_setup, datalog_teardown },
+    { "datalog/rowset_extract_new", test_rowset_extract_new, datalog_setup, datalog_teardown },
+    { "datalog/rowset_extract_new_sym", test_rowset_extract_new_sym, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

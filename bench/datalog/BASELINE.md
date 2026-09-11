@@ -52,3 +52,42 @@ linear N= 1024 rows=  524800 min_ms=  10853 ok
 ```
 
 N=1024 linear, which previously reported `WRONG(error: domain: query: evaluation failed)`, now reports `ok` with the correct 524800 rows. Timings at N<=512 are within noise of the pre-Task-11 baseline (same monotone-stratum code path, just no longer capped), confirming the uncapped loop adds no measurable overhead for chains that already converged well under 1000 iterations.
+
+## After Task 12 (pre-commit HEAD 9707dd00 + the Task 12 working-tree changes)
+
+- Date: 2026-09-11
+- Commit: 9707dd00 (branch `perf/datalog-fixpoint`) plus the uncommitted Task 12 working-tree changes this section's own commit introduces (same convention as the sections above).
+- Change under test: each IDB keeps one open-addressing row set (`dl_rowset_t`) alive for the whole stratum. A fixpoint iteration probes only the candidate tuples and inserts the accepted ones, instead of `table_distinct(new)` + `table_antijoin(new, rel->table)` re-hashing the entire derived relation every iteration. A candidate table *larger* than the relation is still collapsed by the vectorised `table_distinct` first (the non-linear rule shape manufactures far more duplicates than the relation holds, and the vectorised hash beats the scalar probe there); the budget is the relation's own row count, no new tunable.
+- Same methodology and machine as above (min-of-3 wall time via `date +%s%N`, `RAYFORCE_CORES=2`, `./rayforce` freshly built with `make -j8 release`). Load average at run time: 1.19 0.91 0.70.
+
+```
+linear N=   64 rows=    2080 min_ms=     14 ok
+linear N=  128 rows=    8256 min_ms=     24 ok
+linear N=  256 rows=   32896 min_ms=     53 ok
+linear N=  512 rows=  131328 min_ms=    161 ok
+linear N= 1024 rows=  524800 min_ms=   1324 ok
+```
+
+```
+nonlinear N=   64 rows=    2080 min_ms=     10 ok
+nonlinear N=  128 rows=    8256 min_ms=     28 ok
+nonlinear N=  256 rows=   32896 min_ms=    126 ok
+nonlinear N=  512 rows=  131328 min_ms=    879 ok
+nonlinear N= 1024 rows=  524800 min_ms=   8295 ok
+```
+
+Every N reports `ok` with the expected row count.
+
+Linear (the shape this task targets — a small delta joined against a growing relation):
+
+| N | After Task 11 | After Task 12 | speedup |
+|---|---|---|---|
+| 64 | 37 ms | 14 ms | 2.6x |
+| 128 | 105 ms | 24 ms | 4.4x |
+| 256 | 499 ms | 53 ms | 9.4x |
+| 512 | 1733 ms | 161 ms | **10.8x** |
+| 1024 | 10853 ms | 1324 ms | **8.2x** |
+
+Non-linear is unchanged within noise (889 -> 879 ms at N=512, 8310 -> 8295 ms at N=1024): there the candidate table dwarfs the relation, so the pre-dedup guard keeps the vectorised `table_distinct` in front of the row-set probe and only the per-iteration `table_antijoin` is removed — a cost that is small next to the join and the distinct at that shape.
+
+Measured without the pre-dedup guard, non-linear regressed sharply (N=512 1810 ms, N=1024 22819 ms) because the scalar per-row probe and the per-row `dl_table_take_mask` copy ran over a candidate table many times the size of the relation. That measurement is why the guard exists.
