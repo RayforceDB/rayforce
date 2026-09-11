@@ -226,12 +226,15 @@ Use `_` to match any value without binding it to a variable:
 
 ### How queries compile to the DAG
 
-Under the hood, each query compiles to Rayforce's DAG execution pipeline:
-
-- Each triple pattern `(?e :attr ?v)` becomes a `ray_scan` + `ray_filter` on the datoms table
-- Shared variables across patterns become `ray_join` operations
-- The `find` clause becomes a final projection selecting the requested columns
-- The optimizer applies predicate pushdown, filter reorder, and fusion — the same passes used for `select`
+Under the hood each rule is evaluated by materialisation: every positive body
+atom is filtered on its constants and repeated variables, joined with the
+accumulated result on shared variables (hash join, morsel-parallel), then
+negations, comparisons, assignments and aggregates are applied in declared
+order, and the head projection is de-duplicated and merged into the derived
+relation. Recursive rules run to fixpoint with semi-naive evaluation. Joins
+execute on the same operators as `select`, but a whole rule is not planned as
+one DAG: body atoms are joined in the order written, and comparisons are
+applied after the joins that bind their variables.
 
 ## Negation
 
@@ -459,7 +462,52 @@ Every Datalog concept compiles down to existing Rayforce DAG operations. The Dat
 
 !!! note "Performance"
 
-    Because Datalog compiles to the same DAG as `select`/`update`, queries benefit from all optimizer passes: predicate pushdown, filter reorder, fusion, and morsel-parallel execution with SIMD.
+    Joins and distinct inside a rule use the parallel `select` operators. Rule-level
+    join ordering, predicate pushdown across atoms and plan reuse between queries are
+    not performed; write the most selective atom first.
+
+## Constants in patterns
+
+In a `where` clause or rule body, a quoted symbol (`'Alice`) or keyword
+(`:name`) is a literal; a bare unquoted symbol (`sid`) is evaluated as a
+variable reference to a bound value (integer, float, symbol or string). Head
+arguments still treat a bare symbol as a literal constant.
+
+## Arithmetic
+
+Integer expressions in `(= ?y (+ ?x 1))` and comparisons are 64-bit and checked:
+overflow, division by zero, `INT64_MIN / -1` and any null operand produce the
+null integer `0Nl`. Float expressions follow IEEE 754 (division by zero gives
+`0Nf`). The error code surfaced for a failed query evaluation is `domain`.
+
+## Limits
+
+| Limit | Value | On overflow |
+|---|---|---|
+| Variables in `find` | 16 | error `find supports at most 16 variables` |
+| Arity of a relation | 16 | error at rule or EDB registration |
+| Body literals per rule | 16 | error `too many body literals` |
+| Rules per program | 128 | error `too many rules` |
+| Relations per program | 64 | error |
+| Strata | 16 | error |
+| Group keys in an aggregate | 8 | error |
+
+An unknown relation name in a body is an error (`unknown relation 'name'`),
+not an empty result.
+
+## Symbol storage
+
+`assert-fact` stores symbol values in the `v` column with a type tag, so the
+symbol `'Alice` and the integer equal to its intern id are different values.
+Query results, `pull` and `scan-eav` return the plain intern id; use `sym-name`
+to read it back. Inspecting the raw datoms table shows the tagged encoding.
+
+A datoms table whose `v` column is a real symbol vector (hand-built or
+loaded) is also recognised as holding symbols. A legacy table whose `v`
+column holds bare integer intern ids is not — those integers stay integers
+and are not matched against a symbol or keyword literal. Positive integer
+values of 2^61 and above cannot be stored in the `v` column or returned
+from a query without being masked; this is a limit of the tag encoding.
 
 ## Complete Example
 
