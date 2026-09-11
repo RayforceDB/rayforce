@@ -351,11 +351,19 @@ int dl_find_rel(dl_program_t* prog, const char* name);
  * Creates it with the correct arity if it doesn't exist yet. */
 int dl_ensure_idb(dl_program_t* prog, const char* name, int arity);
 
+/* Which body position, if any, reads the semi-naive delta instead of
+ * the full relation. NULL delta = evaluate against full relations. */
+typedef struct {
+    int     pos;    /* index into rule->body[] */
+    ray_t*  table;  /* delta table for that position (borrowed) */
+} dl_delta_t;
+
 /* Compile one rule into a ray_graph_t for one fixpoint iteration.
- * delta_pos: which body atom uses the delta relation (-1 for initial pass).
+ * delta: which body position (if any) reads the semi-naive delta table
+ * instead of the full relation; NULL means evaluate against full relations.
  * rule_idx: index of this rule in prog->rules (used for provenance).
  * Returns the output node in g that produces new head tuples. */
 ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
-                          int delta_pos, int rule_idx, ray_graph_t* g);
+                          const dl_delta_t* delta, int rule_idx, ray_graph_t* g);
 
 #endif /* RAYFORCE_DATALOG_H */

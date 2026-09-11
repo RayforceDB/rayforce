@@ -1328,7 +1328,7 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
 }
 
 ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
-                          int delta_pos, int rule_idx, ray_graph_t* g) {
+                          const dl_delta_t* delta, int rule_idx, ray_graph_t* g) {
     /* Materializing approach: execute body atoms one at a time.
      *
      * For each positive body atom, we get the relation table and apply
@@ -1352,7 +1352,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         int rel_idx = dl_find_rel(prog, body->pred);
         if (rel_idx < 0) { if (accum) ray_release(accum); return NULL; }
         dl_rel_t* rel = &prog->rels[rel_idx];
-        ray_t* body_tbl = rel->table;
+        /* Semi-naive: exactly one body position reads the iteration delta;
+         * every other occurrence of the same predicate reads the full
+         * relation so old×new combinations are derived (audit §1.1). */
+        ray_t* body_tbl = (delta && delta->pos == b && delta->table)
+                        ? delta->table : rel->table;
         ray_retain(body_tbl);
 
         /* Apply constant filters */
@@ -2711,7 +2715,7 @@ static void dl_build_provenance(dl_program_t* prog) {
             ray_graph_t* g = ray_graph_new(NULL);
             if (!g) continue;
 
-            ray_op_t* output = dl_compile_rule(prog, rule, -1, r, g);
+            ray_op_t* output = dl_compile_rule(prog, rule, NULL, r, g);
             if (!output) { ray_graph_free(g); continue; }
 
             ray_t* raw = ray_execute(g, output);
@@ -2806,7 +2810,7 @@ int dl_eval(dl_program_t* prog) {
             ray_graph_t* g = ray_graph_new(NULL);
             if (!g) { prog->eval_err = true; continue; }
 
-            ray_op_t* output = dl_compile_rule(prog, rule, -1, stratum_rule_idx[ri], g);
+            ray_op_t* output = dl_compile_rule(prog, rule, NULL, stratum_rule_idx[ri], g);
             if (!output) {
                 /* dl_compile_rule marks eval_err on genuine failures; a bare
                  * NULL means "rule has no rows this pass" — not a fault. */
@@ -2924,21 +2928,13 @@ int dl_eval(dl_program_t* prog) {
                     if (!delta_tables[body_rel] ||
                         ray_table_nrows(delta_tables[body_rel]) == 0) continue;
 
-                    /* Swap in delta relation for this body position */
-                    ray_t* saved = prog->rels[body_rel].table;
-                    prog->rels[body_rel].table = delta_tables[body_rel];
-
+                    dl_delta_t d = { b, delta_tables[body_rel] };
                     ray_graph_t* g = ray_graph_new(NULL);
-                    if (!g) {
-                        prog->rels[body_rel].table = saved;
-                        prog->eval_err = true;
-                        continue;
-                    }
+                    if (!g) { prog->eval_err = true; continue; }
 
-                    ray_op_t* output = dl_compile_rule(prog, rule, b, stratum_rule_idx[ri], g);
+                    ray_op_t* output = dl_compile_rule(prog, rule, &d, stratum_rule_idx[ri], g);
                     if (!output) {
                         ray_graph_free(g);
-                        prog->rels[body_rel].table = saved;
                         /* dl_compile_rule sets eval_err itself on genuine
                          * failures; NULL without the flag means "rule yields
                          * no rows this iteration" and should not fault. */
@@ -2947,7 +2943,6 @@ int dl_eval(dl_program_t* prog) {
 
                     ray_t* raw_result = ray_execute(g, output);
                     ray_graph_free(g);
-                    prog->rels[body_rel].table = saved;
 
                     if (!raw_result) continue;
                     if (RAY_IS_ERR(raw_result)) { prog->eval_err = true; ray_error_free(raw_result); continue; }

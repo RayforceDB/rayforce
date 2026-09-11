@@ -2470,6 +2470,49 @@ static test_result_t test_edb_over_arity_domain_guard(void) {
     PASS();
 }
 
+/* Audit §1.1: p(X,Z) :- p(X,Y), p(Y,Z) over a 7-edge chain must produce the
+ * same 28 pairs as the linear formulation. The old fixpoint loop swapped the
+ * whole relation for its delta, so both body occurrences of `p` read the
+ * delta and old×new combinations were never joined. */
+static test_result_t test_nonlinear_closure_chain(void) {
+    int64_t src[7], dst[7];
+    for (int i = 0; i < 7; i++) { src[i] = i + 1; dst[i] = i + 2; }
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, src, 7);
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, dst, 7);
+    ray_t* edge = ray_table_new(2);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c0", 8), c0);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c1", 8), c1);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "edge", edge, 2), 0);
+
+    dl_rule_t r1;                      /* p(X,Y) :- edge(X,Y) */
+    dl_rule_init(&r1, "p", 2);
+    dl_rule_head_var(&r1, 0, 0); dl_rule_head_var(&r1, 1, 1);
+    int b = dl_rule_add_atom(&r1, "edge", 2);
+    dl_body_set_var(&r1, b, 0, 0); dl_body_set_var(&r1, b, 1, 1);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r1), 0);
+
+    dl_rule_t r2;                      /* p(X,Z) :- p(X,Y), p(Y,Z) */
+    dl_rule_init(&r2, "p", 2);
+    dl_rule_head_var(&r2, 0, 0); dl_rule_head_var(&r2, 1, 2);
+    int b1 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b1, 0, 0); dl_body_set_var(&r2, b1, 1, 1);
+    int b2 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b2, 0, 1); dl_body_set_var(&r2, b2, 1, 2);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r2), 1);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "p");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 28);
+
+    dl_program_free(prog);
+    ray_release(edge); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2534,6 +2577,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/rule_add_interval", test_rule_add_interval, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
+    { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

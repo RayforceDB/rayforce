@@ -1,0 +1,22 @@
+;; Regressions for docs/superpowers/specs/2026-09-08-datalog-audit.md.
+;; Chain 1->2->...->8 (7 edges). Full transitive closure = 7*8/2 = 28 pairs.
+(set g (datoms))
+(set g (assert-fact g 1 'edge 2))
+(set g (assert-fact g 2 'edge 3))
+(set g (assert-fact g 3 'edge 4))
+(set g (assert-fact g 4 'edge 5))
+(set g (assert-fact g 5 'edge 6))
+(set g (assert-fact g 6 'edge 7))
+(set g (assert-fact g 7 'edge 8))
+
+;; §1.1 linear (already correct) and non-linear closure must agree.
+(rule (lin ?x ?y) (?x :edge ?y))
+(rule (lin ?x ?z) (?x :edge ?y) (lin ?y ?z))
+(count (query g (find ?x ?y) (where (lin ?x ?y)))) -- 28
+(rule (nl ?x ?y) (?x :edge ?y))
+(rule (nl ?x ?z) (nl ?x ?y) (nl ?y ?z))
+(count (query g (find ?x ?y) (where (nl ?x ?y)))) -- 28
+;; the three pairs the old evaluator dropped
+(count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 1) (== ?y 6)))) -- 1
+(count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 2) (== ?y 7)))) -- 1
+(count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 3) (== ?y 8)))) -- 1
