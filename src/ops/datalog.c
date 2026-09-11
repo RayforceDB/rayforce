@@ -2988,13 +2988,17 @@ static void dl_build_provenance(dl_program_t* prog) {
  * every stored hash).
  * ======================================================================== */
 
-/* The 64-bit key a cell contributes to the row identity. */
+/* The 64-bit key a cell contributes to the row identity.
+ *
+ * F64 goes through canon_f64_key (ops/internal.h) — the same fold the
+ * grouping kernels use for ray_distinct: -0.0 keys as +0.0 and every NaN
+ * payload as one canonical NaN.  Raw bit patterns would make this set and
+ * the vectorised table_distinct in front of it disagree about row identity,
+ * so on an F64-keyed IDB whether two rows counted as the same would depend
+ * on which of the two paths an iteration happened to take. */
 static uint64_t dl_cell_key(ray_t* col, int64_t row) {
-    if (col->type == RAY_F64) {
-        uint64_t v;
-        memcpy(&v, &((const double*)ray_data(col))[row], sizeof(v));
-        return v;
-    }
+    if (col->type == RAY_F64)
+        return (uint64_t)canon_f64_key(((const double*)ray_data(col))[row]);
     return (uint64_t)dl_cell_i64(col, row);
 }
 
@@ -3125,6 +3129,12 @@ int dl_rowset_add_table(dl_rowset_t* s, ray_t* tbl) {
 ray_t* dl_rowset_extract_new(dl_rowset_t* s, ray_t* full, ray_t* cand) {
     if (!s || !s->cap) return ray_error("domain", "rowset: uninitialized set");
     if (!cand || RAY_IS_ERR(cand)) return ray_error("domain", "rowset: bad candidate");
+    /* A populated set's entries index `full`; without a readable `full`
+     * they cannot be resolved, and treating base as 0 would silently
+     * reinterpret every existing entry as a candidate row. */
+    if (!full || RAY_IS_ERR(full)) {
+        if (s->n > 0) return ray_error("domain", "rowset: missing relation for a populated set");
+    }
     int64_t n = ray_table_nrows(cand);
     int64_t ncols = ray_table_ncols(cand);
     int64_t base = full && !RAY_IS_ERR(full) ? ray_table_nrows(full) : 0;
@@ -3275,9 +3285,13 @@ int dl_eval(dl_program_t* prog) {
          * per-iteration delta is "candidate rows whose key is new" instead
          * of table_distinct + table_antijoin over the full relation. */
         dl_rowset_t sets[DL_MAX_RELS];
+        /* Latched once a relation's set cannot be built (unsupported column
+         * type, or OOM): stop retrying and stay on the generic path. */
+        bool set_off[DL_MAX_RELS];
         memset(prev_tables, 0, sizeof(prev_tables));
         memset(delta_tables, 0, sizeof(delta_tables));
         memset(sets, 0, sizeof(sets));
+        memset(set_off, 0, sizeof(set_off));
 
         /* Initially, delta = full table (all tuples are new) */
         for (int p = 0; p < prog->strata_sizes[s]; p++) {
@@ -3303,11 +3317,17 @@ int dl_eval(dl_program_t* prog) {
                 }
                 /* Seed the row set from the post-Phase-A relation.  A
                  * failure (OOM, or a column type the set can't key on)
-                 * leaves the set zeroed, which simply keeps the generic
-                 * distinct+antijoin path for this relation. */
-                if (dl_rowset_init(&sets[rel_idx], ray_table_nrows(rel->table) * 2 + 16) == 0 &&
-                    dl_rowset_add_table(&sets[rel_idx], rel->table) < 0)
+                 * leaves the set zeroed and latches set_off, which keeps
+                 * the generic distinct+antijoin path for this relation for
+                 * the rest of the stratum.  The latch matters: an
+                 * unsupported column type cannot change mid-fixpoint, and
+                 * without it every iteration would pay a failed
+                 * init+add_table before falling back anyway. */
+                if (dl_rowset_init(&sets[rel_idx], ray_table_nrows(rel->table) * 2 + 16) < 0 ||
+                    dl_rowset_add_table(&sets[rel_idx], rel->table) < 0) {
                     dl_rowset_free(&sets[rel_idx]);
+                    set_off[rel_idx] = true;
+                }
             }
         }
 
@@ -3520,11 +3540,13 @@ int dl_eval(dl_program_t* prog) {
                     ray_release(rel->table);
                     rel->table = merged;
                 }
-                if (rebuild_set) {
+                if (rebuild_set && !set_off[rel_idx]) {
                     dl_rowset_free(&sets[rel_idx]);
-                    if (dl_rowset_init(&sets[rel_idx], ray_table_nrows(rel->table) * 2 + 16) == 0 &&
-                        dl_rowset_add_table(&sets[rel_idx], rel->table) < 0)
+                    if (dl_rowset_init(&sets[rel_idx], ray_table_nrows(rel->table) * 2 + 16) < 0 ||
+                        dl_rowset_add_table(&sets[rel_idx], rel->table) < 0) {
                         dl_rowset_free(&sets[rel_idx]);
+                        set_off[rel_idx] = true;
+                    }
                 }
             }
 

@@ -464,7 +464,12 @@ int dl_rowset_add_table(dl_rowset_t* s, ray_t* tbl);
 /* Rows of `cand` that are neither in the set (whose entries index `full`)
  * nor earlier duplicates within `cand`, as an owned table in candidate
  * order; accepted rows enter the set as nrows(full) + k. Caller must append
- * the result to `full` in order. Returns an owned table or RAY_ERROR. */
+ * the result to `full` in order. Returns an owned table or RAY_ERROR.
+ *
+ * Rows are compared as raw cell keys, so the caller MUST first establish
+ * that `full` and `cand` agree column-wise on type and — for SYM — on
+ * resolution domain; dl_eval does this with dl_rowset_comparable() and
+ * falls back to table_distinct + table_antijoin when they do not. */
 ray_t* dl_rowset_extract_new(dl_rowset_t* s, ray_t* full, ray_t* cand);
 
 #endif /* RAYFORCE_DATALOG_H */
