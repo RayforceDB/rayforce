@@ -1891,6 +1891,19 @@ ray_t* ray_alloc_copy(ray_t* v) {
         ray_atomic_store(&copy->rc, 1);
     else
         copy->rc = 1;
+    /* A table's key map (RAY_IDX_UKEY, ops/idxop.h) describes the rows of the
+     * table it was built for and upsert mutates it in place, recording the
+     * row count it now covers.  Two tables sharing one would each be writing
+     * their own count into it, so a copy starts without it and builds its own
+     * on demand.  Nothing else attaches an index to a RAY_TABLE, so clearing
+     * the bit here cannot discard anything else.  Before retain, so the copy
+     * never takes a reference it does not keep. */
+    if (copy->type == RAY_TABLE && (copy->attrs & RAY_ATTR_HAS_INDEX)) {
+        copy->index    = NULL;
+        copy->_idx_pad = NULL;
+        copy->attrs   &= (uint8_t)~RAY_ATTR_HAS_INDEX;
+    }
+
     if (!ray_retain_owned_refs(copy)) {
         /* Deep-clone of an owned resource failed (e.g. HNSW index OOM).
          * The copy's owned state has already been neutralized, so a plain
