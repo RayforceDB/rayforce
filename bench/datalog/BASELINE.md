@@ -136,3 +136,47 @@ Total allocation for linear N=512, measured with `(.mem.ts (count (query db (fin
 | after | 73,245,632 | 22,891 | 36,702,400 | 102,932,959 |
 
 25.8x less total allocation. Peak live is unchanged (the relation itself is the same size); what disappears is the full copy of the relation made once per iteration.
+
+## After Task 14 (old/new split for multi-recursive rules, `8c75dade` + this commit)
+
+- Change under test: `dl_delta_t` carries `prev_nrows[]` — the row count each IDB of the stratum had at the start of the previous iteration. Since `table_union` appends the delta at the end of the relation, that count is the length of the "old" prefix. A positive body atom **before** the delta position now reads a `dl_table_head` view of that prefix (zero-copy `ray_vec_slice` columns) instead of the full relation; the atom at the delta position reads Δ, atoms after it read the full relation. `p(X,Z) :- p(X,Y), p(Y,Z)` therefore derives Δ⋈Δ once instead of twice. An empty prefix (iteration 0) short-circuits the rule instance entirely.
+- Prefix-path trigger counts (temporary counter, removed before commit), `tc_chain` N=128: nonlinear 6 head views + 1 empty-prefix short-circuit; linear 0 / 0 — the linear rule's recursive atom is the last positive atom, so nothing ever sits before the delta position and the path is never taken. Linear is unaffected by construction.
+- Same methodology and machine as above (min-of-3 wall time via `date +%s%N`, `RAYFORCE_CORES=2`, `./rayforce` freshly built with `make -j8 release`). Load average right after the run: 1.20 0.97 0.77.
+
+```
+linear N=   64 rows=    2080 min_ms=     14 ok
+linear N=  128 rows=    8256 min_ms=     25 ok
+linear N=  256 rows=   32896 min_ms=     47 ok
+linear N=  512 rows=  131328 min_ms=    110 ok
+linear N= 1024 rows=  524800 min_ms=    332 ok
+```
+
+```
+nonlinear N=   64 rows=    2080 min_ms=     10 ok
+nonlinear N=  128 rows=    8256 min_ms=     26 ok
+nonlinear N=  256 rows=   32896 min_ms=    136 ok
+nonlinear N=  512 rows=  131328 min_ms=    837 ok
+nonlinear N= 1024 rows=  524800 min_ms=   7495 ok
+```
+
+Every N reports `ok` with the expected row count.
+
+| N | After Task 13 (nonlinear) | After Task 14 (nonlinear) | speedup |
+|---|---|---|---|
+| 64 | 10 ms | 10 ms | 1.0x |
+| 128 | 27 ms | 26 ms | 1.0x |
+| 256 | 142 ms | 136 ms | 1.04x |
+| 512 | 905 ms | 837 ms | 1.08x |
+| 1024 | 8304 ms | 7495 ms | 1.11x |
+
+| N | After Task 13 (linear) | After Task 14 (linear) |
+|---|---|---|
+| 64 | 14 ms | 14 ms |
+| 128 | 24 ms | 25 ms |
+| 256 | 49 ms | 47 ms |
+| 512 | 112 ms | 110 ms |
+| 1024 | 340 ms | 332 ms |
+
+Linear does not regress (it is within noise, and the prefix path is provably never taken there).
+
+Non-linear gains ~8-11% at the large N, not the order-of-magnitude the linear shape got from Task 13. The reason is the shape of the work that is removed: on a chain, the second delta rule instance (`p_old ⋈ Δp`) loses exactly the `Δp ⋈ Δp` pairs, which are a small fraction of `P ⋈ Δp` once `P` is much larger than `Δp` — by construction the saving is bounded by |Δ|²/(|P|·|Δ|) = |Δ|/|P| of the join work per iteration. The nonlinear shape remains dominated by the join producing a candidate table far larger than the relation and the `table_distinct` that collapses it; closing that gap needs a different plan (index-nested-loop on the delta, or dedup fused into the join), not a better delta split.

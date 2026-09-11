@@ -2578,6 +2578,62 @@ static test_result_t test_nonlinear_closure_chain(void) {
     PASS();
 }
 
+/* Old/new split (Task 14): a rule with THREE recursive atoms.  Positions 0
+ * and 1 read the pre-iteration prefix of `p` whenever the delta sits to
+ * their right, so every derivation must still be found exactly as with the
+ * full relation.  The third rule is logically redundant (it derives nothing
+ * the two-atom rule misses), so the oracle stays the plain transitive
+ * closure of a 7-edge chain: 8 nodes, 28 ordered pairs. */
+static test_result_t test_nonlinear_three_atom_closure(void) {
+    int64_t src[7], dst[7];
+    for (int i = 0; i < 7; i++) { src[i] = i + 1; dst[i] = i + 2; }
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, src, 7);
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, dst, 7);
+    ray_t* edge = ray_table_new(2);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c0", 8), c0);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c1", 8), c1);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "edge", edge, 2), 0);
+
+    dl_rule_t r1;                      /* p(X,Y) :- edge(X,Y) */
+    dl_rule_init(&r1, "p", 2);
+    dl_rule_head_var(&r1, 0, 0); dl_rule_head_var(&r1, 1, 1);
+    int b = dl_rule_add_atom(&r1, "edge", 2);
+    dl_body_set_var(&r1, b, 0, 0); dl_body_set_var(&r1, b, 1, 1);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r1), 0);
+
+    dl_rule_t r2;                      /* p(X,Z) :- p(X,Y), p(Y,Z) */
+    dl_rule_init(&r2, "p", 2);
+    dl_rule_head_var(&r2, 0, 0); dl_rule_head_var(&r2, 1, 2);
+    int b1 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b1, 0, 0); dl_body_set_var(&r2, b1, 1, 1);
+    int b2 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b2, 0, 1); dl_body_set_var(&r2, b2, 1, 2);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r2), 1);
+
+    dl_rule_t r3;                      /* p(X,W) :- p(X,Y), p(Y,Z), p(Z,W) */
+    dl_rule_init(&r3, "p", 2);
+    dl_rule_head_var(&r3, 0, 0); dl_rule_head_var(&r3, 1, 3);
+    int b3 = dl_rule_add_atom(&r3, "p", 2);
+    dl_body_set_var(&r3, b3, 0, 0); dl_body_set_var(&r3, b3, 1, 1);
+    int b4 = dl_rule_add_atom(&r3, "p", 2);
+    dl_body_set_var(&r3, b4, 0, 1); dl_body_set_var(&r3, b4, 1, 2);
+    int b5 = dl_rule_add_atom(&r3, "p", 2);
+    dl_body_set_var(&r3, b5, 0, 2); dl_body_set_var(&r3, b5, 1, 3);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r3), 2);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "p");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 28);
+
+    dl_program_free(prog);
+    ray_release(edge); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
 /* Audit §1.4: an I64 literal against an F64 EDB column must filter, not
  * pass the whole table through. */
 static test_result_t test_const_filter_f64_column(void) {
@@ -3049,6 +3105,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
     { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
+    { "datalog/nonlinear_three_atom_closure", test_nonlinear_three_atom_closure, datalog_setup, datalog_teardown },
     { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
     { "datalog/rule_expr_ownership", test_rule_expr_ownership, datalog_setup, datalog_teardown },
     { "datalog/rowset_extract_new", test_rowset_extract_new, datalog_setup, datalog_teardown },

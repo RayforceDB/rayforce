@@ -423,6 +423,17 @@ int dl_ensure_idb(dl_program_t* prog, const char* name, int arity);
 typedef struct {
     int     pos;    /* index into rule->body[] */
     ray_t*  table;  /* delta table for that position (borrowed) */
+    /* Textbook semi-naive old/new split, indexed by relation index:
+     * the number of rows relation r had at the START of the previous
+     * iteration -- i.e. the length of the prefix of rel->table that is
+     * "old" with respect to this iteration's delta.  Body atoms BEFORE
+     * `pos` read that prefix, the atom at `pos` reads `table`, and atoms
+     * AFTER `pos` read the full relation, so a rule with several
+     * recursive atoms derives delta x delta exactly once instead of once
+     * per recursive position.  -1 means "no prefix known, use the full
+     * relation" (EDBs, relations outside the current stratum); NULL means
+     * the whole array is unavailable (full, non-semi-naive evaluation). */
+    const int64_t* prev_nrows;
 } dl_delta_t;
 
 /* Compile one rule into a ray_graph_t for one fixpoint iteration.

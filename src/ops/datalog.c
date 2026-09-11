@@ -1493,6 +1493,43 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
     return out;
 }
 
+/* Zero-copy view of the first `n` rows of `tbl`.
+ *
+ * Each column becomes a ray_vec_slice view onto the parent column, so the
+ * view costs one header per column instead of a full copy.  Every reader in
+ * this file goes through ray_data(), which resolves RAY_ATTR_SLICE to the
+ * parent's storage plus the offset (and ray_sym_vec_domain follows
+ * slice_parent for SYM), so the views are safe to filter, join and project.
+ *
+ * The slices retain the parent columns, which would block the in-place
+ * append in table_union -- but the view lives only inside dl_compile_rule
+ * (dl_project copies out of it, and accum is released before the rule's
+ * graph is executed), and the fixpoint merges only after every rule of the
+ * iteration has run, so refcounts are back to 1 by then.
+ *
+ * Returns an owned table, or a RAY_ERROR. */
+static ray_t* dl_table_head(ray_t* tbl, int64_t n) {
+    int64_t ncols = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new((int)ncols);
+    if (!out) return ray_error("memory", "dl_table_head: table_new");
+    if (RAY_IS_ERR(out)) return out;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* src = ray_table_get_col_idx(tbl, c);
+        if (!src) { ray_release(out); return ray_error("domain", "dl_table_head: missing source column"); }
+        ray_t* view = ray_vec_slice(src, 0, n);
+        if (!view) { ray_release(out); return ray_error("memory", "dl_table_head: vec_slice"); }
+        if (RAY_IS_ERR(view)) { ray_release(out); return view; }
+        ray_t* next = ray_table_add_col(out, ray_table_col_name(tbl, c), view);
+        ray_release(view);
+        /* ray_table_add_col releases its input table on every failure
+         * path, so `out` must not be released again here. */
+        if (!next || RAY_IS_ERR(next))
+            return next ? next : ray_error("memory", "dl_table_head: add_col");
+        out = next;
+    }
+    return out;
+}
+
 ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                           const dl_delta_t* delta, int rule_idx, ray_graph_t* g) {
     /* Materializing approach: execute body atoms one at a time.
@@ -1521,9 +1558,32 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         /* Semi-naive: exactly one body position reads the iteration delta;
          * every other occurrence of the same predicate reads the full
          * relation so old×new combinations are derived (audit §1.1). */
-        ray_t* body_tbl = (delta && delta->pos == b && delta->table)
-                        ? delta->table : rel->table;
-        ray_retain(body_tbl);
+        ray_t* body_tbl;
+        int64_t head_n = -1;
+        if (delta && delta->prev_nrows && delta->pos > b && rel->is_idb)
+            head_n = delta->prev_nrows[rel_idx];
+        if (delta && delta->pos == b && delta->table) {
+            body_tbl = delta->table;
+            ray_retain(body_tbl);
+        } else if (head_n >= 0 && head_n < ray_table_nrows(rel->table)) {
+            /* Old/new split: this atom sits before the delta position, so it
+             * must read the relation as it was BEFORE the delta was merged.
+             * An empty prefix makes the rule's inner join empty -- bail out
+             * with "no rows this iteration" (NULL without eval_err) rather
+             * than build a zero-row view whose column schema would be
+             * rebuilt by the empty-join path. */
+            if (head_n == 0) { if (accum) ray_release(accum); return NULL; }
+            body_tbl = dl_table_head(rel->table, head_n);
+            if (!body_tbl || RAY_IS_ERR(body_tbl)) {
+                if (body_tbl) ray_error_free(body_tbl);
+                if (accum) ray_release(accum);
+                prog->eval_err = true;
+                return NULL;
+            }
+        } else {
+            body_tbl = rel->table;
+            ray_retain(body_tbl);
+        }
 
         /* Apply constant filters */
         for (int c = 0; c < body->arity; c++) {
@@ -3353,9 +3413,18 @@ int dl_eval(dl_program_t* prog) {
         /* Latched once a relation's set cannot be built (unsupported column
          * type, or OOM): stop retrying and stay on the generic path. */
         bool set_off[DL_MAX_RELS];
+        /* Old/new split (see dl_delta_t): the row count each IDB of this
+         * stratum had at the start of the PREVIOUS iteration, i.e. the
+         * length of the prefix of rel->table that predates the current
+         * delta.  table_union appends the delta to the end of the
+         * relation, so "old" is always a prefix.  -1 = no prefix (EDBs and
+         * relations outside this stratum: they never change here, so every
+         * atom reads them in full). */
+        int64_t prev_nrows[DL_MAX_RELS];
         memset(delta_tables, 0, sizeof(delta_tables));
         memset(sets, 0, sizeof(sets));
         memset(set_off, 0, sizeof(set_off));
+        for (int i = 0; i < DL_MAX_RELS; i++) prev_nrows[i] = -1;
 
         /* Initially, delta = full table (all tuples are new) */
         for (int p = 0; p < prog->strata_sizes[s]; p++) {
@@ -3364,6 +3433,9 @@ int dl_eval(dl_program_t* prog) {
             if (rel->is_idb) {
                 ray_retain(rel->table);
                 delta_tables[rel_idx] = rel->table;
+                /* The first delta is the whole relation, so nothing is
+                 * old yet: the prefix before it is empty. */
+                prev_nrows[rel_idx] = 0;
                 /* Seed the row set from the post-Phase-A relation.  A
                  * failure (OOM, or a column type the set can't key on)
                  * leaves the set zeroed and latches set_off, which keeps
@@ -3443,7 +3515,7 @@ int dl_eval(dl_program_t* prog) {
                     if (!delta_tables[body_rel] ||
                         ray_table_nrows(delta_tables[body_rel]) == 0) continue;
 
-                    dl_delta_t d = { b, delta_tables[body_rel] };
+                    dl_delta_t d = { b, delta_tables[body_rel], prev_nrows };
                     ray_graph_t* g = ray_graph_new(NULL);
                     if (!g) { prog->eval_err = true; continue; }
 
@@ -3497,6 +3569,15 @@ int dl_eval(dl_program_t* prog) {
                 int rel_idx = prog->strata[s][p];
                 dl_rel_t* rel = &prog->rels[rel_idx];
                 if (!rel->is_idb) continue;
+
+                /* Snapshot the pre-merge size before anything below can
+                 * grow the relation: from the next iteration's point of
+                 * view this is exactly the "old" prefix, whatever path the
+                 * delta extraction below takes.  It must be updated even
+                 * when this relation derives nothing this round (another
+                 * relation's delta can keep the fixpoint running), or an
+                 * atom reading the prefix would miss rows derived earlier. */
+                prev_nrows[rel_idx] = ray_table_nrows(rel->table);
 
                 /* Free old delta */
                 if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
