@@ -125,6 +125,29 @@
 (count (query handbuilt (find ?e) (where (?e :name 'Alice)))) -- 1
 (sym-name (at (at (query handbuilt (find ?v) (where (1 :name ?v))) '?v) 0)) -- 'Alice
 
+;; Final review #9: `eav` is the built-in datoms relation; a rule may not
+;; derive into it.
+(rule (eav ?x ?y ?z) (?x :edge ?y)) !- domain
+
+;; Final review #5: only values that can have come from a datoms `v` column
+;; are untagged on output.  A plain I64 EDB column holding 2^61 / 2^62 --
+;; whose top bits look like a DATOM tag -- must come back verbatim.
+(set big (table [big__c0] (list [2305843009213693952 4611686018427387904])))
+(count (query g (find ?x) (where (big ?x)))) -- 2
+(at (at (query g (find ?x) (where (big ?x))) '?x) 0) -- 2305843009213693952
+(at (at (query g (find ?x) (where (big ?x))) '?x) 1) -- 4611686018427387904
+
+(query g (find ?x) (where (?x :edge ?y) (> (+ ?x 1) "z"))) !- type
+;; (the no-leak side of this is test_datalog.c's rule_expr_error_paths_no_leak:
+;;  `try` itself leaks ~64 bytes per caught error, which would swamp the
+;;  bytes-allocated technique used in §2.1 above.)
+
+;; Final review #3: a stale global rule naming an unbound relation only
+;; fails the queries that actually use it.
+(rule (stale ?x) (nosuchtable ?x))
+(count (query g (find ?x ?y) (where (lin ?x ?y)))) -- 28
+(query g (find ?x) (where (stale ?x))) !- domain
+
 ;; §4 pure Datalog is never cut off by an iteration cap.
 (set longedge (table [longedge__c0 longedge__c1] (list (til 1100) (+ 1 (til 1100)))))
 (rule (reach ?y) (longedge 0 ?y))

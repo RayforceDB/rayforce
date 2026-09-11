@@ -180,3 +180,54 @@ Every N reports `ok` with the expected row count.
 Linear does not regress (it is within noise, and the prefix path is provably never taken there).
 
 Non-linear gains ~8-11% at the large N, not the order-of-magnitude the linear shape got from Task 13. The reason is the shape of the work that is removed: on a chain, the second delta rule instance (`p_old ⋈ Δp`) loses exactly the `Δp ⋈ Δp` pairs, which are a small fraction of `P ⋈ Δp` once `P` is much larger than `Δp` — by construction the saving is bounded by |Δ|²/(|P|·|Δ|) = |Δ|/|P| of the join work per iteration. The nonlinear shape remains dominated by the join producing a candidate table far larger than the relation and the `table_distinct` that collapses it; closing that gap needs a different plan (index-nested-loop on the delta, or dedup fused into the join), not a better delta split.
+
+## After final fix wave (9b32dd4c + the final-review fixes this commit introduces)
+
+- Date: 2026-09-11
+- Change under test: the whole-branch final-review fixes. The only one that
+  touches the hot compile path is the narrowed DATOM untagging: `dl_compile_rule`
+  now carries a `bool var_from_v[DL_MAX_ARITY * DL_MAX_BODY]` alongside
+  `var_col[]` and propagates it into `dl_rel_t.col_from_v` at projection, so
+  `ray_query_fn` untags only result columns that can hold a value from a datoms
+  `v` column. That is one extra 256-byte memset per rule compile plus a few
+  per-variable boolean assignments — no extra passes over data.
+- Same methodology and machine as the sections above (min-of-3 wall time via
+  `date +%s%N`, `RAYFORCE_CORES=2`, `./rayforce` freshly built with
+  `make -j8 release`). Load average right after the run: 1.34 0.98 0.59.
+
+```
+linear N=   64 rows=    2080 min_ms=     14 ok
+linear N=  128 rows=    8256 min_ms=     24 ok
+linear N=  256 rows=   32896 min_ms=     47 ok
+linear N=  512 rows=  131328 min_ms=    108 ok
+linear N= 1024 rows=  524800 min_ms=    332 ok
+```
+
+```
+nonlinear N=   64 rows=    2080 min_ms=     10 ok
+nonlinear N=  128 rows=    8256 min_ms=     26 ok
+nonlinear N=  256 rows=   32896 min_ms=    134 ok
+nonlinear N=  512 rows=  131328 min_ms=    831 ok
+nonlinear N= 1024 rows=  524800 min_ms=   7421 ok
+```
+
+Every N still reports `ok` with the expected row count.
+
+| N | After Task 14 (linear) | After final fix wave | delta |
+|---|---|---|---|
+| 64 | 14 ms | 14 ms | 0% |
+| 128 | 25 ms | 24 ms | -4% |
+| 256 | 47 ms | 47 ms | 0% |
+| 512 | 110 ms | 108 ms | -2% |
+| 1024 | 332 ms | 332 ms | 0% |
+
+| N | After Task 14 (nonlinear) | After final fix wave | delta |
+|---|---|---|---|
+| 64 | 10 ms | 10 ms | 0% |
+| 128 | 26 ms | 26 ms | 0% |
+| 256 | 136 ms | 134 ms | -1% |
+| 512 | 837 ms | 831 ms | -1% |
+| 1024 | 7495 ms | 7421 ms | -1% |
+
+Every point is within run-to-run noise of the Task 14 numbers; the
+per-variable tag tracking costs nothing measurable.

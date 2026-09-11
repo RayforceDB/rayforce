@@ -60,7 +60,7 @@ dl_program_t* dl_program_new(void) {
 
 /* Recover the ray_t header from a dl_program_t pointer for ray_free. */
 static inline ray_t* dl_prog_block(dl_program_t* prog) {
-    return (ray_t*)((char*)prog - 32);  /* ray_data is at offset 32 */
+    return (ray_t*)((char*)prog - offsetof(ray_t, data));
 }
 
 void dl_program_free(dl_program_t* prog) {
@@ -130,6 +130,12 @@ int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
         if (!col) { ray_release(new_tbl); return -1; }
         new_tbl = ray_table_add_col(new_tbl, rel->col_names[c], col);
         if (RAY_IS_ERR(new_tbl)) return -1;
+        /* Tag provenance (see dl_rel_t.col_from_v): the `eav` relation's v
+         * column is the only EDB column that can hold a DATOM-tagged value.
+         * Sniffing other EDBs for tag-shaped bits is not an option -- a
+         * plain integer >= 2^61 is indistinguishable from a tagged cell,
+         * which is the very confusion this flag removes. */
+        if (c == 2 && strcmp(name, DL_EAV_PRED) == 0) rel->col_from_v[c] = true;
     }
     rel->table = new_tbl;
 
@@ -442,7 +448,9 @@ dl_expr_t* dl_expr_binop(int op, dl_expr_t* left, dl_expr_t* right) {
 
 /* dl_expr_alloc allocates a ray_alloc block whose ray_data() is the
  * dl_expr_t node; recover the block header to free it. */
-static inline ray_t* dl_expr_block(dl_expr_t* e) { return (ray_t*)((char*)e - 32); }
+static inline ray_t* dl_expr_block(dl_expr_t* e) {
+    return (ray_t*)((char*)e - offsetof(ray_t, data));
+}
 
 void dl_expr_free(dl_expr_t* e) {
     if (!e) return;
@@ -916,8 +924,13 @@ static ray_t* dl_builtin_duration_since(ray_t* tbl, int t1_col, int t2_col,
     if (!col || RAY_IS_ERR(col)) { ray_retain(tbl); return tbl; }
     col->len = nrows;
     int64_t* d = (int64_t*)ray_data(col);
-    for (int64_t r = 0; r < nrows; r++)
-        d[r] = t2[r] - t1[r];
+    /* Checked arithmetic, same contract as dl_eval_expr: a null operand or
+     * an overflowing subtraction yields the I64 null. */
+    for (int64_t r = 0; r < nrows; r++) {
+        int64_t a = t2[r], b = t1[r], o;
+        if (a == NULL_I64 || b == NULL_I64) { d[r] = NULL_I64; continue; }
+        d[r] = __builtin_sub_overflow(a, b, &o) ? NULL_I64 : o;
+    }
 
     ray_t* out = dl_table_add_computed_col(tbl, col, out_name);
     ray_release(col);
@@ -934,8 +947,12 @@ static ray_t* dl_builtin_abs(ray_t* tbl, int x_col, const char* out_name) {
     if (!col || RAY_IS_ERR(col)) { ray_retain(tbl); return tbl; }
     col->len = nrows;
     int64_t* d = (int64_t*)ray_data(col);
-    for (int64_t r = 0; r < nrows; r++)
-        d[r] = xd[r] < 0 ? -xd[r] : xd[r];
+    /* Checked arithmetic, same contract as dl_eval_expr: a null operand, or
+     * INT64_MIN whose negation is not representable, yields the I64 null. */
+    for (int64_t r = 0; r < nrows; r++) {
+        int64_t x = xd[r];
+        d[r] = (x == NULL_I64) ? NULL_I64 : (x < 0 ? -x : x);
+    }
 
     ray_t* out = dl_table_add_computed_col(tbl, col, out_name);
     ray_release(col);
@@ -1167,8 +1184,10 @@ static ray_t* dl_table_take_mask(ray_t* tbl, const uint8_t* keep, int64_t count)
         if (src->type == RAY_STR) col_propagate_str_pool(dst, src);
         ray_t* next = ray_table_add_col(out, ray_table_col_name(tbl, c), dst);
         ray_release(dst);
-        if (!next) { ray_release(out); return ray_error("memory", "dl_table_take_mask: add_col"); }
-        if (RAY_IS_ERR(next)) { ray_release(out); return next; }
+        /* ray_table_add_col releases its input table on every failure
+         * path, so `out` must not be released again here. */
+        if (!next) return ray_error("memory", "dl_table_take_mask: add_col");
+        if (RAY_IS_ERR(next)) return next;
         out = next;
     }
     return out;
@@ -1447,16 +1466,10 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
             if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(dst, src);
             ray_t* next = ray_table_add_col(out, head_rel->col_names[c], dst);
             ray_release(dst);
-            /* Release the partial `out` on failure — ray_table_add_col
-             * does not free its input on error. */
-            if (!next) {
-                ray_release(out);
-                return ray_error("memory", "dl_project: add_col");
-            }
-            if (RAY_IS_ERR(next)) {
-                ray_release(out);
-                return next;
-            }
+            /* ray_table_add_col releases its input table on every failure
+             * path, so `out` must not be released again here. */
+            if (!next) return ray_error("memory", "dl_project: add_col");
+            if (RAY_IS_ERR(next)) return next;
             out = next;
         } else {
             /* Constant head slot: materialize an owned broadcast column. */
@@ -1479,14 +1492,10 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
             }
             ray_t* next = ray_table_add_col(out, head_rel->col_names[c], bcast);
             ray_release(bcast);
-            if (!next) {
-                ray_release(out);
-                return ray_error("memory", "dl_project: add_col");
-            }
-            if (RAY_IS_ERR(next)) {
-                ray_release(out);
-                return next;
-            }
+            /* ray_table_add_col releases its input table on every failure
+             * path, so `out` must not be released again here. */
+            if (!next) return ray_error("memory", "dl_project: add_col");
+            if (RAY_IS_ERR(next)) return next;
             out = next;
         }
     }
@@ -1516,6 +1525,8 @@ static ray_t* dl_table_head(ray_t* tbl, int64_t n) {
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* src = ray_table_get_col_idx(tbl, c);
         if (!src) { ray_release(out); return ray_error("domain", "dl_table_head: missing source column"); }
+        /* Offset is always 0 here (a prefix view), which keeps this clear of
+         * ray_data_slice_path's byte-vs-element offset scaling. */
         ray_t* view = ray_vec_slice(src, 0, n);
         if (!view) { ray_release(out); return ray_error("memory", "dl_table_head: vec_slice"); }
         if (RAY_IS_ERR(view)) { ray_release(out); return view; }
@@ -1543,7 +1554,14 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
      */
     int var_col[DL_MAX_ARITY * DL_MAX_BODY];  /* column index in accum per variable */
     bool var_bound[DL_MAX_ARITY * DL_MAX_BODY];
+    /* var_from_v[v]: the value bound to v may carry a DATOM tag because it
+     * came (possibly transitively) from a datoms `v` column.  Only such
+     * columns are untagged on query output -- see dl_rel_t.col_from_v.
+     * A variable joined from two sources keeps the flag if either side had
+     * it (conservative). */
+    bool var_from_v[DL_MAX_ARITY * DL_MAX_BODY];
     memset(var_bound, 0, sizeof(var_bound));
+    memset(var_from_v, 0, sizeof(var_from_v));
     memset(var_col, -1, sizeof(var_col));
 
     ray_t* accum = NULL;  /* accumulated result table */
@@ -1633,6 +1651,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 if (!var_bound[v]) {
                     var_bound[v] = true;
                     var_col[v] = c;
+                    var_from_v[v] = c < DL_MAX_ARITY && rel->col_from_v[c];
                 }
             }
         } else {
@@ -1646,6 +1665,8 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     lkeys[n_jk] = var_col[v];
                     rkeys[n_jk] = c;
                     n_jk++;
+                    /* Conservative: a join key is "from v" if either side was. */
+                    if (c < DL_MAX_ARITY && rel->col_from_v[c]) var_from_v[v] = true;
                 }
             }
 
@@ -1662,6 +1683,14 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             ray_release(accum);
             ray_release(body_tbl);
             accum = joined;
+            /* A failed join must not leave accum NULL: the next body atom
+             * would then be treated as the first one and the rule would
+             * silently produce an unjoined (wrong) result. */
+            if (!accum || RAY_IS_ERR(accum)) {
+                if (accum) ray_error_free(accum);
+                prog->eval_err = true;
+                return NULL;
+            }
 
             /* Bind new variables: their columns come after left columns in join output.
              * Join output = [all left cols] + [non-key right cols].
@@ -1686,6 +1715,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 if (!var_bound[v]) {
                     var_bound[v] = true;
                     var_col[v] = right_col_map[c];
+                    var_from_v[v] = c < DL_MAX_ARITY && rel->col_from_v[c];
                 }
             }
         }
@@ -1727,16 +1757,14 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         int64_t unit_sym = ray_sym_intern("_unit", 5);
         ray_t* accum_unit = ray_table_add_col(accum, unit_sym, one_val);
         ray_release(one_val);
-        /* ray_table_add_col doesn't free `accum` on error — release it
-         * ourselves so the partially-built table isn't leaked. */
+        /* ray_table_add_col releases `accum` on every failure path, so it
+         * must not be released again here. */
         if (!accum_unit) {
-            ray_release(accum);
             prog->eval_err = true;
             return NULL;
         }
         if (RAY_IS_ERR(accum_unit)) {
             ray_error_free(accum_unit);
-            ray_release(accum);
             prog->eval_err = true;
             return NULL;
         }
@@ -1854,6 +1882,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
 
             var_bound[body->assign_var] = true;
             var_col[body->assign_var] = new_col_idx;
+            var_from_v[body->assign_var] = false;  /* computed value */
             break;
         }
 
@@ -2005,10 +2034,21 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     int kv = body->agg_group_key_vars[i];
                     var_bound[kv] = true;
                     var_col[kv] = i;
+                    int gkc = body->agg_group_key_cols[i];
+                    var_from_v[kv] = src_rel && gkc >= 0 && gkc < DL_MAX_ARITY &&
+                                     src_rel->col_from_v[gkc];
                 }
                 /* Bind target variable to the aggregate column (last column) */
                 var_bound[body->agg_target_var] = true;
                 var_col[body->agg_target_var] = nk;  /* agg column immediately follows keys */
+                /* min/max carry a source cell through verbatim, so they keep
+                 * the source column's tag provenance; count/sum/avg compute a
+                 * fresh number that is never tagged. */
+                var_from_v[body->agg_target_var] =
+                    (body->agg_op == DL_AGG_MIN || body->agg_op == DL_AGG_MAX) &&
+                    src_rel && body->agg_value_col >= 0 &&
+                    body->agg_value_col < DL_MAX_ARITY &&
+                    src_rel->col_from_v[body->agg_value_col];
                 break;
             }
             /* -------- existing scalar path below unchanged -------- */
@@ -2184,6 +2224,10 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
 
             var_bound[body->agg_target_var] = true;
             var_col[body->agg_target_var] = new_col_idx;
+            var_from_v[body->agg_target_var] =
+                (body->agg_op == DL_AGG_MIN || body->agg_op == DL_AGG_MAX) &&
+                body->agg_value_col >= 0 && body->agg_value_col < DL_MAX_ARITY &&
+                prog->rels[src_idx].col_from_v[body->agg_value_col];
             break;
         }
 
@@ -2209,6 +2253,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 accum = result;
                 var_bound[d_var] = true;
                 var_col[d_var] = new_idx;
+                var_from_v[d_var] = false;  /* computed value */
                 break;
             }
             case DL_BUILTIN_ABS: {
@@ -2222,6 +2267,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 accum = result;
                 var_bound[y_var] = true;
                 var_col[y_var] = new_idx;
+                var_from_v[y_var] = false;  /* computed value */
                 break;
             }
             }
@@ -2426,15 +2472,17 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(dst, src);
                 ray_t* next = ray_table_add_col(out, ray_table_col_name(accum, c), dst);
                 ray_release(dst);
+                /* ray_table_add_col releases `out` on every failure path,
+                 * so it must not be released again here. */
                 if (!next) {
-                    ray_release(out); ray_free(mask_block);
+                    ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
                     return NULL;
                 }
                 if (RAY_IS_ERR(next)) {
                     ray_error_free(next);
-                    ray_release(out); ray_free(mask_block);
+                    ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
                     return NULL;
@@ -2454,9 +2502,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
 
             var_bound[body->interval_start_var] = true;
             var_col[body->interval_start_var] = start_col;
+            var_from_v[body->interval_start_var] = false;
 
             var_bound[body->interval_end_var] = true;
             var_col[body->interval_end_var] = end_col;
+            var_from_v[body->interval_end_var] = false;
             break;
         }
         } /* switch */
@@ -2474,6 +2524,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             proj_cols[c] = -1;
         } else {
             proj_cols[c] = var_col[v];
+            /* Tag provenance flows with the value into the head column, and
+             * is OR-accumulated across rules and fixpoint iterations: a
+             * column is "from v" if any derivation could put a tagged value
+             * there (conservative, matching the old unconditional untag). */
+            if (c < DL_MAX_ARITY && var_from_v[v]) head_rel->col_from_v[c] = true;
         }
     }
 
@@ -3660,10 +3715,20 @@ int dl_eval(dl_program_t* prog) {
                 if (ray_table_nrows(delta) > 0) {
                     ray_t* merged = table_union(rel->table, delta);
                     if (!merged || RAY_IS_ERR(merged)) {
+                        /* The relation could not absorb its delta, so the
+                         * fixpoint is desynced.  Continuing would re-derive
+                         * the same rows forever in an uncapped monotone
+                         * stratum, so bail out of the whole evaluation
+                         * (mirroring the cancellation cleanup above). */
                         prog->eval_err = true;
                         if (merged) ray_error_free(merged);
-                        dl_rowset_free(&sets[rel_idx]);
-                        continue;
+                        for (int q = 0; q < prog->strata_sizes[s]; q++) {
+                            int rq = prog->strata[s][q];
+                            if (delta_tables[rq] && !RAY_IS_ERR(delta_tables[rq]))
+                                ray_release(delta_tables[rq]);
+                            dl_rowset_free(&sets[rq]);
+                        }
+                        return -1;
                     }
                     ray_release(rel->table);
                     rel->table = merged;
@@ -4199,7 +4264,13 @@ static dl_expr_t* dl_build_expr(ray_t* node, dl_var_map_t* vars) {
                 if (op >= 0) {
                     dl_expr_t* l = dl_build_expr(elems[1], vars);
                     dl_expr_t* r = dl_build_expr(elems[2], vars);
-                    if (l && r) return dl_expr_binop(op, l, r);
+                    /* dl_expr_binop only takes ownership when it succeeds;
+                     * a half-built operand pair must not leak either. */
+                    dl_expr_t* b = (l && r) ? dl_expr_binop(op, l, r) : NULL;
+                    if (b) return b;
+                    dl_expr_free(l);
+                    dl_expr_free(r);
+                    return NULL;
                 }
             }
         }
@@ -4557,8 +4628,11 @@ static ray_t* dl_parse_body_clause(dl_rule_t* rule, ray_t* clause,
         dl_expr_t* expr = dl_build_expr(ce[2], vars);
         if (!expr)
             return ray_error("type", "rule: cannot parse assignment expression");
-        if (dl_rule_add_assign(rule, target_vi, DL_OP_EQ, expr) < 0)
+        if (dl_rule_add_assign(rule, target_vi, DL_OP_EQ, expr) < 0) {
+            /* dl_rule_add_assign takes ownership only when it succeeds. */
+            dl_expr_free(expr);
             return ray_error("domain", "rule: too many body literals");
+        }
         return NULL;
     }
 
@@ -4603,10 +4677,19 @@ static ray_t* dl_parse_body_clause(dl_rule_t* rule, ray_t* clause,
             dl_expr_t* le = dl_build_expr(ce[1], vars);
             dl_expr_t* re = (clen > 2) ? dl_build_expr(ce[2], vars) : NULL;
             if (le && re) {
-                if (dl_rule_add_cmp_expr(rule, cmp_op, le, re) < 0)
+                /* dl_rule_add_cmp_expr takes ownership of both trees only
+                 * when it succeeds; free them on the error return. */
+                if (dl_rule_add_cmp_expr(rule, cmp_op, le, re) < 0) {
+                    dl_expr_free(le);
+                    dl_expr_free(re);
                     return ray_error("domain", "rule: too many body literals");
-            } else
+                }
+            } else {
+                /* One operand may have parsed fine — free whichever did. */
+                dl_expr_free(le);
+                dl_expr_free(re);
                 return ray_error("type", "rule: cannot parse comparison operands");
+            }
         }
         return NULL;
     }
@@ -4649,6 +4732,13 @@ static ray_t* dl_parse_rule_from_head_and_body(dl_rule_t* out, ray_t* head,
 
     if (ray_str_len(head_name_str) == 1 && ray_str_ptr(head_name_str)[0] == '_')
         return ray_error("domain", "rule: _ is reserved as wildcard");
+
+    /* The `eav` relation is the built-in datoms EDB registered by
+     * ray_query_fn, and its v column is the only DATOM-tagged column in the
+     * engine.  A user rule deriving into it would either be silently
+     * shadowed by the EDB or feed untagged rows into tag-aware compares. */
+    if (strcmp(ray_str_ptr(head_name_str), DL_EAV_PRED) == 0)
+        return ray_error("domain", "rule: head predicate 'eav' is reserved");
 
     int head_arity = (int)(hlen - 1);
     /* head_vars[]/head_consts[] are fixed-size (DL_MAX_ARITY). A head literal
@@ -4731,6 +4821,14 @@ ray_t* ray_rule_fn(ray_t** args, int64_t n) {
      * ray_dl_reset_rules — no clone/free here. */
     memcpy(&g_dl_rules[g_dl_n_rules++], &rule, sizeof(dl_rule_t));
     return ray_bool(true);
+}
+
+/* Predicate a body literal reads from, or NULL when the literal is not a
+ * relational one (comparison, assignment, builtin, interval). */
+static const char* dl_body_pred_name(const dl_body_t* bd) {
+    return (bd->type == DL_POS || bd->type == DL_NEG) ? bd->pred
+         : (bd->type == DL_AGG)                       ? bd->agg_pred
+                                                      : NULL;
 }
 
 /* (query db (find ?a ?b ...) (where clause1 clause2 ...) [(rules ...)])
@@ -5079,13 +5177,38 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
 
     /* Admission: every body predicate must now resolve to a relation —
      * an EDB, an env-bound table registered above, or a rule head (IDB
-     * created by dl_add_rule). Anything else is a typo, not "no rows". */
+     * created by dl_add_rule). Anything else is a typo, not "no rows".
+     *
+     * Only rules this query can actually reach are checked.  All global
+     * rules are copied into the program (stratification must see them),
+     * but a stale global rule mentioning a relation that is not bound in
+     * this session must not fail every unrelated query — only queries that
+     * depend on it. */
+    bool rule_live[DL_MAX_RULES];
+    memset(rule_live, 0, sizeof(rule_live));
+    for (int ri = 0; ri < prog->n_rules; ri++)
+        if (strcmp(prog->rules[ri].head_pred, "__query") == 0) rule_live[ri] = true;
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (int ri = 0; ri < prog->n_rules; ri++) {
+            if (!rule_live[ri]) continue;
+            dl_rule_t* rr = &prog->rules[ri];
+            for (int bi = 0; bi < rr->n_body; bi++) {
+                const char* pn = dl_body_pred_name(&rr->body[bi]);
+                if (!pn || !pn[0]) continue;
+                for (int rj = 0; rj < prog->n_rules; rj++)
+                    if (!rule_live[rj] && strcmp(prog->rules[rj].head_pred, pn) == 0) {
+                        rule_live[rj] = true;
+                        changed = true;
+                    }
+            }
+        }
+    }
     for (int ri = 0; ri < prog->n_rules; ri++) {
+        if (!rule_live[ri]) continue;
         dl_rule_t* rr = &prog->rules[ri];
         for (int bi = 0; bi < rr->n_body; bi++) {
-            dl_body_t* bd = &rr->body[bi];
-            const char* pn = (bd->type == DL_POS || bd->type == DL_NEG) ? bd->pred
-                           : (bd->type == DL_AGG) ? bd->agg_pred : NULL;
+            const char* pn = dl_body_pred_name(&rr->body[bi]);
             if (!pn || !pn[0] || dl_find_rel(prog, pn) >= 0) continue;
             dl_program_free(prog);
             ray_release(db);
@@ -5133,10 +5256,21 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
     int64_t nrows = ray_table_nrows(raw);
     int64_t ncols = ray_table_ncols(raw);
     ray_t* result = ray_table_new(n_find_vars);
+    /* Only columns whose values can have come from a datoms `v` column are
+     * untagged (dl_rel_t.col_from_v): a plain I64 column of large hashes, or
+     * an arithmetic result >= 2^61, must reach the caller verbatim. */
+    int qidx = dl_find_rel(prog, "__query");
+    const bool* from_v = (qidx >= 0) ? prog->rels[qidx].col_from_v : NULL;
     for (int i = 0; i < n_find_vars && i < (int)ncols; i++) {
         ray_t* col = ray_table_get_col_idx(raw, i);
         if (!col) continue;
-        ray_t* clean = dl_untag_i64_col(col);   /* returns retained col when nothing is tagged */
+        ray_t* clean;
+        if (from_v && i < DL_MAX_ARITY && from_v[i]) {
+            clean = dl_untag_i64_col(col);  /* returns retained col when nothing is tagged */
+        } else {
+            ray_retain(col);
+            clean = col;
+        }
         if (!clean || RAY_IS_ERR(clean)) { ray_release(result); dl_program_free(prog); ray_release(db);
             return clean ? clean : ray_error("memory", "query: untag"); }
         result = ray_table_add_col(result, find_var_syms[i], clean);

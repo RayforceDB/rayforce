@@ -211,6 +211,14 @@ typedef struct {
     int     arity;                  /* number of columns */
     bool    is_idb;                 /* true = derived (intensional) */
     int64_t col_names[DL_MAX_ARITY]; /* interned column name symbols */
+    /* Per-column "may carry a DATOM tag" provenance.  Only values that came
+     * from a datoms `v` column can be tagged, so only those columns are
+     * untagged on output (dl_untag_i64_col in ray_query_fn) -- a plain I64
+     * column of large hashes, or an arithmetic result >= 2^61, must be
+     * returned verbatim.  Seeded in dl_add_edb for the `eav` relation's v
+     * column -- the only EDB column that can hold a tagged value -- and
+     * propagated into IDB head columns by dl_compile_rule's projection. */
+    bool    col_from_v[DL_MAX_ARITY];
     ray_t*  prov_col;               /* provenance column (when DL_FLAG_PROVENANCE) */
     ray_t*  prov_src_offsets;       /* CSR offsets into prov_src_data, length nrows+1 */
     ray_t*  prov_src_data;          /* packed source refs: (rel_idx << 32) | row_idx */

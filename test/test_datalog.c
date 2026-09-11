@@ -2405,6 +2405,142 @@ static test_result_t test_builtin_abs(void) {
     PASS();
 }
 
+/* Audit final review #2: a rule clause whose expression tree is built but
+ * then rejected must free that tree.  Three shapes:
+ *   - a comparison where one operand parses and the other does not,
+ *   - a comparison at DL_MAX_BODY capacity (dl_rule_add_cmp_expr fails),
+ *   - an assignment at DL_MAX_BODY capacity (dl_rule_add_assign fails).
+ *   - a nested arithmetic expression whose inner operand parses and whose
+ *     outer one does not (dl_build_expr's own binop path).
+ * Each leaked one or more dl_expr_t blocks before the fix, so live bytes
+ * climbed linearly with the repetition count.  (The equivalent RFL check is
+ * not possible: catching the error with `try` leaks ~64 bytes per call on
+ * its own, unrelated to datalog.) */
+static test_result_t test_rule_expr_error_paths_no_leak(void) {
+    /* 16 body atoms == DL_MAX_BODY, so the 17th clause is always rejected. */
+    #define SIXTEEN "(a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) " \
+                    "(a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) (a ?x) "
+    static const char* const srcs[] = {
+        "(rule (q ?x) (a ?x) (> (+ ?x 1) \"z\"))",
+        "(rule (q ?y) (a ?x) (= ?y (+ (+ ?x 1) \"z\")))",
+        "(rule (q ?x) " SIXTEEN "(> (+ ?x 1) (* ?x 2)))",
+        "(rule (q ?y) " SIXTEEN "(= ?y (+ ?x 1)))",
+    };
+    #undef SIXTEEN
+    const int n_srcs = (int)(sizeof(srcs) / sizeof(srcs[0]));
+
+    /* Warm up: the first evaluation of each form interns symbols and grows
+     * parser-side caches, which is a one-off cost, not a leak. */
+    for (int i = 0; i < n_srcs; i++)
+        for (int w = 0; w < 4; w++) {
+            ray_t* e = ray_eval_str(srcs[i]);
+            TEST_ASSERT_NOT_NULL(e);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+            ray_error_free(e);
+        }
+
+    ray_mem_stats_t before, after;
+    ray_mem_stats(&before);
+    for (int it = 0; it < 200; it++)
+        for (int i = 0; i < n_srcs; i++) {
+            ray_t* e = ray_eval_str(srcs[i]);
+            TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+            ray_error_free(e);
+        }
+    ray_mem_stats(&after);
+
+    TEST_ASSERT((after.bytes_allocated) <= (before.bytes_allocated),
+                "rejected rule clauses free their expression trees");
+    PASS();
+}
+
+/* Audit final review #4: dl_builtin_duration_since must not compute a
+ * signed overflow (UB).  T2 = INT64_MAX, T1 = -1 overflows, and a NULL_I64
+ * operand poisons the result; both yield the I64 null. */
+static test_result_t test_builtin_duration_since_overflow(void) {
+    /* One row only: a key column holding two values this far apart makes
+     * the group-by engine's (max - min + 1) range computation overflow,
+     * which is a separate, pre-existing issue not under test here. */
+    int64_t t1_vals[] = { -1 };
+    int64_t t2_vals[] = { INT64_MAX };
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, t1_vals, 1);
+    ray_t* c2 = ray_vec_from_raw(RAY_I64, t2_vals, 1);
+    ray_t* span = ray_table_new(2);
+    span = ray_table_add_col(span, ray_sym_intern("span__c0", 8), c1);
+    span = ray_table_add_col(span, ray_sym_intern("span__c1", 8), c2);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "span", span, 2), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "dur", 3);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    dl_rule_head_var(&r, 2, 2);
+    int body = dl_rule_add_atom(&r, "span", 2);
+    dl_body_set_var(&r, body, 0, 0);
+    dl_body_set_var(&r, body, 1, 1);
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_DURATION_SINCE, 3);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 1);
+    dl_body_set_var(&r, bi, 2, 2);
+    r.n_vars = 3;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "dur");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
+    ray_t* dcol = ray_table_get_col_idx(out, 2);
+    TEST_ASSERT_NOT_NULL(dcol);
+    int64_t* dd = (int64_t*)ray_data(dcol);
+    TEST_ASSERT(dd[0] == NULL_I64, "INT64_MAX - (-1) is the I64 null");
+
+    dl_program_free(prog);
+    ray_release(span); ray_release(c1); ray_release(c2);
+    PASS();
+}
+
+/* Audit final review #4: -INT64_MIN is not representable, so dl_builtin_abs
+ * must yield the I64 null there instead of negating (UB). */
+static test_result_t test_builtin_abs_int64_min(void) {
+    /* One row only — see the note in the duration_since test above. */
+    int64_t vals[] = { INT64_MIN };
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, 1);
+    ray_t* signed_t = ray_table_new(1);
+    signed_t = ray_table_add_col(signed_t, ray_sym_intern("signed__c0", 10), col);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "signed", signed_t, 1), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "pos", 2);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    int body = dl_rule_add_atom(&r, "signed", 1);
+    dl_body_set_var(&r, body, 0, 0);
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_ABS, 2);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 1);
+    r.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "pos");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
+    ray_t* ycol = ray_table_get_col_idx(out, 1);
+    TEST_ASSERT_NOT_NULL(ycol);
+    int64_t* yd = (int64_t*)ray_data(ycol);
+    TEST_ASSERT(yd[0] == NULL_I64, "|INT64_MIN| is the I64 null");
+
+    dl_program_free(prog);
+    ray_release(signed_t); ray_release(col);
+    PASS();
+}
+
 /* dl_rule_add_builtin guard: returning -1 when n_body has reached
  * DL_MAX_BODY.  Saturate the body literals first, then the next
  * builtin add must report -1. */
@@ -3100,6 +3236,9 @@ const test_entry_t datalog_entries[] = {
     { "datalog/builtin_before_empty", test_builtin_before_empty, datalog_setup, datalog_teardown },
     { "datalog/builtin_duration_since", test_builtin_duration_since, datalog_setup, datalog_teardown },
     { "datalog/builtin_abs", test_builtin_abs, datalog_setup, datalog_teardown },
+    { "datalog/rule_expr_error_paths_no_leak", test_rule_expr_error_paths_no_leak, datalog_rf_setup, datalog_rf_teardown },
+    { "datalog/builtin_duration_since_overflow", test_builtin_duration_since_overflow, datalog_setup, datalog_teardown },
+    { "datalog/builtin_abs_int64_min", test_builtin_abs_int64_min, datalog_setup, datalog_teardown },
     { "datalog/rule_add_builtin_overflow", test_rule_add_builtin_overflow, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval", test_rule_add_interval, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
