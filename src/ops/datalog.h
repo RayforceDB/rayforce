@@ -90,13 +90,33 @@ typedef struct dl_expr {
 /* Variable index sentinel: constant value, not a variable */
 #define DL_CONST    (-1)
 
+/* Predicate name of the built-in 3-arity entity/attribute/value relation
+ * that ray_query_fn registers from the `db` argument (and that the triple-
+ * pattern `(?e :attr ?v)` sugar compiles atoms against). This is the only
+ * relation whose column 2 (the v column) is ever DATOM-tagged (below) --
+ * the strict_tag gates in dl_col_eq_row's callers, and the two
+ * dl_rule_add_atom(rule, DL_EAV_PRED, 3) triple-pattern call sites, all key
+ * off this one name so the coupling between "this predicate" and "this
+ * column may carry a DATOM tag" is explicit and in one place. */
+#define DL_EAV_PRED "eav"
+
 /* ===== DATOM value tag scheme (v column of a datoms table) =====
  * assert-fact stores a symbol/string value in an otherwise-plain I64
  * cell with one of these tags OR'd into the top bits so it can never
  * collide with a bare integer equal to the same intern id. dl_col_eq_row
  * strips the tag (via the const_type of the body literal) to compare;
  * user-visible reads (pull, scan-eav, query projection) strip it via
- * dl_datom_untag so callers keep seeing plain intern ids. */
+ * dl_datom_untag so callers keep seeing plain intern ids.
+ *
+ * Value-range limit: only the top 3 bits (61-63) are reserved for the tag
+ * and its sign guard (see dl_datom_untag below), so a *positive* I64 value
+ * of 2^61 or greater stored in the datoms v column -- or appearing in any
+ * I64 query result column that flows through dl_untag_i64_col -- has its
+ * top bits indistinguishable from a tag and is masked down to its low 61
+ * bits on output. This is a pre-existing limit of reusing the top bits for
+ * tagging, not something this fix introduces further constraints on; it
+ * simply means the v column (and any I64 result derived from it) is not a
+ * safe place to store the full 63-bit positive integer range. */
 #define DL_DATOM_TAG_SYM   ((int64_t)0x2000000000000000)
 #define DL_DATOM_TAG_STR   ((int64_t)0x4000000000000000)
 #define DL_DATOM_TAG_MASK  ((int64_t)0x6000000000000000)

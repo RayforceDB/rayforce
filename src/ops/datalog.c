@@ -1182,7 +1182,13 @@ static ray_t* dl_untag_i64_col(ray_t* col) {
     int64_t n = col->len;
     const int64_t* d = (const int64_t*)ray_data(col);
     int64_t i = 0;
-    while (i < n && !(d[i] & DL_DATOM_TAG_MASK)) i++;
+    /* Same v >= 0 guard as dl_datom_untag: a negative cell can never be a
+     * genuine tag (sign extension spuriously sets the tag bits), so the
+     * pre-scan must not treat it as one -- otherwise a column that is all
+     * plain, untagged, possibly-negative integers would still take the
+     * (needlessly allocating, and for negatives previously corrupting)
+     * per-cell path below instead of the no-op retain. */
+    while (i < n && !(d[i] >= 0 && (d[i] & DL_DATOM_TAG_MASK))) i++;
     if (i == n) { ray_retain(col); return col; }
     ray_t* out = ray_vec_new(RAY_I64, n);
     if (!out || RAY_IS_ERR(out)) return out;
@@ -1524,7 +1530,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                  * DATOM-tagged (audit #1.5) — everywhere else (the "a"
                  * column included) a plain I64/SYM cell is a genuine,
                  * untagged value and the lenient compare is correct. */
-                bool strict_tag = c == 2 && strcmp(body->pred, "eav") == 0;
+                bool strict_tag = c == 2 && strcmp(body->pred, DL_EAV_PRED) == 0;
                 ray_t* filtered = dl_filter_eq(body_tbl, c, body->const_vals[c],
                                                 body->const_types[c], strict_tag);
                 ray_release(body_tbl);
@@ -1696,7 +1702,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             ray_retain(neg_tbl);
             for (int c = 0; c < body->arity; c++) {
                 if (body->vars[c] == DL_CONST) {
-                    bool strict_tag = c == 2 && strcmp(body->pred, "eav") == 0;
+                    bool strict_tag = c == 2 && strcmp(body->pred, DL_EAV_PRED) == 0;
                     ray_t* filtered = dl_filter_eq(neg_tbl, c, body->const_vals[c],
                                                     body->const_types[c], strict_tag);
                     ray_release(neg_tbl);
@@ -2834,7 +2840,7 @@ static void dl_build_source_prov(dl_program_t* prog, dl_rel_t* rel,
                          * mismatch an F64 literal against an I64 column
                          * (and vice versa). strict_tag mirrors dl_compile_rule:
                          * only the "eav" relation's v column is ever tagged. */
-                        bool strict_tag = c == 2 && strcmp(body->pred, "eav") == 0;
+                        bool strict_tag = c == 2 && strcmp(body->pred, DL_EAV_PRED) == 0;
                         if (!dl_col_eq_row(bcol, br, body->const_vals[c],
                                            body->const_types[c], strict_tag)) {
                             match = false; break;
@@ -3917,6 +3923,13 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
         dl_body_set_const_typed(rule, bidx, pos, bits, RAY_F64);
     } else if (val->type == -RAY_SYM) {
         dl_body_set_const_typed(rule, bidx, pos, val->i64, RAY_SYM);
+    } else if (val->type == -RAY_STR) {
+        /* Same treatment as the literal STR branch above: intern as sym
+         * so `(set s "Alice")` followed by `(where (?e :name s))` agrees
+         * with writing the literal `(where (?e :name "Alice"))` inline —
+         * both end up as a RAY_STR-typed constant naming the same sym. */
+        int64_t sym = ray_sym_intern(ray_str_ptr(val), ray_str_len(val));
+        dl_body_set_const_typed(rule, bidx, pos, sym, RAY_STR);
     } else {
         ray_release(val);
         return ray_error("type", "rule: unsupported constant type in body");
@@ -3938,9 +3951,9 @@ static ray_t* dl_parse_body_clause(dl_rule_t* rule, ray_t* clause,
 
     /* -- Triple pattern: (?e :attr ?v) -- */
     if (dl_is_triple_pattern(clause)) {
-        /* Register as 3-arity atom on "eav" relation:
+        /* Register as 3-arity atom on the DL_EAV_PRED relation:
          * position 0 = entity, 1 = attr (constant), 2 = value */
-        int bidx = dl_rule_add_atom(rule, "eav", 3);
+        int bidx = dl_rule_add_atom(rule, DL_EAV_PRED, 3);
         if (bidx < 0) return ray_error("domain", "rule: too many body literals");
 
         ray_t* err;
@@ -3963,7 +3976,7 @@ static ray_t* dl_parse_body_clause(dl_rule_t* rule, ray_t* clause,
 
         if (dl_is_triple_pattern(inner)) {
             /* Negated triple: (not (?e :attr ?v)) */
-            int bidx = dl_rule_add_neg(rule, "eav", 3);
+            int bidx = dl_rule_add_neg(rule, DL_EAV_PRED, 3);
             if (bidx < 0) return ray_error("domain", "rule: too many body literals");
 
             ray_t* err;
@@ -4211,6 +4224,10 @@ static ray_t* dl_parse_rule_from_head_and_body(dl_rule_t* out, ray_t* head,
         } else if (harg->type == -RAY_I64) {
             dl_rule_head_const_typed(out, i, harg->i64, RAY_I64);
         } else if (harg->type == -RAY_SYM) {
+            /* Unlike dl_set_body_pos (body positions), a head position
+             * never evaluates a bare symbol as a bound-variable reference
+             * -- it is always taken as the literal symbol constant here,
+             * quoted or not. */
             dl_rule_head_const_typed(out, i, harg->i64, RAY_SYM);
         } else if (harg->type == -RAY_F64) {
             int64_t bits;
@@ -4407,13 +4424,29 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                  * RUNTIME id (sym-domain Phase 2) — the EAV table may
                  * carry FILE-domain columns.  Raw-copy fast path when
                  * the column is runtime-domain (exact no-op pre-flip).
-                 * Mirrors the env-backed EDB conversion below. */
+                 * Mirrors the env-backed EDB conversion below.
+                 *
+                 * v column (c == 2), audit #1.5: a hand-built or
+                 * deserialized datoms table can carry the value column as
+                 * a genuine RAY_SYM vector rather than assert-fact's
+                 * DATOM-tagged I64 encoding. A RAY_SYM column can only
+                 * ever hold a symbol, never an integer, so OR-ing in
+                 * DL_DATOM_TAG_SYM here is unambiguous — it makes these
+                 * cells agree with assert-fact's own tagging so
+                 * dl_col_eq_row's strict_tag path (below) matches a SYM/
+                 * STR literal against them instead of silently returning
+                 * zero rows. A *legacy* I64 v column holding bare
+                 * (untagged) sym ids is deliberately left unmatched by
+                 * strict_tag -- that bare-integer ambiguity is exactly
+                 * what tagging removes (see DL_DATOM_TAG_SYM above). */
                 ray_t* i64col = ray_vec_new(RAY_I64, nrows_db);
                 if (i64col && !RAY_IS_ERR(i64col)) {
                     i64col->len = nrows_db;
                     int64_t* d = (int64_t*)ray_data(i64col);
-                    for (int64_t r = 0; r < nrows_db; r++)
-                        d[r] = sym_cell_runtime_id(col, r);
+                    for (int64_t r = 0; r < nrows_db; r++) {
+                        int64_t id = sym_cell_runtime_id(col, r);
+                        d[r] = (c == 2) ? (DL_DATOM_TAG_SYM | id) : id;
+                    }
                     eav_tbl = ray_table_add_col(eav_tbl, ray_table_col_name(db, c), i64col);
                     ray_release(i64col);
                 }
@@ -4421,7 +4454,7 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                 eav_tbl = ray_table_add_col(eav_tbl, ray_table_col_name(db, c), col);
             }
         }
-        dl_add_edb(prog, "eav", eav_tbl, 3);
+        dl_add_edb(prog, DL_EAV_PRED, eav_tbl, 3);
         ray_release(eav_tbl);
     }
 
@@ -4497,7 +4530,7 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
             }
 
             if (!pred_name || pred_name[0] == '\0') continue;
-            if (strcmp(pred_name, "eav") == 0) continue;
+            if (strcmp(pred_name, DL_EAV_PRED) == 0) continue;
             if (dl_find_rel(prog, pred_name) >= 0) continue;
 
             int64_t env_sym = ray_sym_intern(pred_name, strlen(pred_name));
@@ -4553,9 +4586,24 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                      * so each cell must be re-expressed as a RUNTIME id
                      * (sym-domain Phase 2) — env tables may carry
                      * FILE-domain columns.  Raw-copy fast path when the
-                     * column is runtime-domain (exact no-op pre-flip). */
-                    for (int64_t r = 0; r < nrows_env; r++)
-                        d[r] = sym_cell_runtime_id(col, r);
+                     * column is runtime-domain (exact no-op pre-flip).
+                     *
+                     * DL_DATOM_TAG_SYM (audit #1.5): tag column 2 (the v
+                     * column) the same way the primary eav table above
+                     * does, but ONLY when this table is registered under
+                     * DL_EAV_PRED itself -- every other env-bound relation
+                     * is an ordinary user predicate, never DATOM-tagged.
+                     * The `strcmp(pred_name, DL_EAV_PRED) == 0 continue`
+                     * a few lines up currently makes that case
+                     * unreachable (a rule body can't yet name an
+                     * env-bound table "eav"), but the check is kept here
+                     * so this loop stays correct if that skip is ever
+                     * relaxed. */
+                    bool tag_v = c == 2 && strcmp(pred_name, DL_EAV_PRED) == 0;
+                    for (int64_t r = 0; r < nrows_env; r++) {
+                        int64_t id = sym_cell_runtime_id(col, r);
+                        d[r] = tag_v ? (DL_DATOM_TAG_SYM | id) : id;
+                    }
                     next_clean = ray_table_add_col(clean, ray_table_col_name(env_val, c), i64col);
                     ray_release(i64col);
                 } else {

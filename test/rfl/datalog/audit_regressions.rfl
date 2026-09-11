@@ -114,3 +114,13 @@
 (set sd (retract-fact sd 1 'name 'Alice))
 (count (query sd (find ?e) (where (?e :name 'Alice)))) -- 0
 (count sd) -- 1
+
+;; §1.5 a hand-built datoms table whose v column is a genuine RAY_SYM
+;; vector (not assert-fact's DATOM-tagged I64 encoding) must still match
+;; a SYM/STR literal -- ray_query_fn tags column 2 the same way when
+;; converting a RAY_SYM v column to I64. A *legacy* I64 v column holding
+;; bare (untagged) sym ids stays deliberately unmatched by strict_tag:
+;; that bare-integer ambiguity is exactly what tagging removes.
+(set handbuilt (table ['e 'a 'v] (list [1 2] ['name 'name] ['Alice 'Bob])))
+(count (query handbuilt (find ?e) (where (?e :name 'Alice)))) -- 1
+(sym-name (at (at (query handbuilt (find ?v) (where (1 :name ?v))) '?v) 0)) -- 'Alice
