@@ -34,6 +34,8 @@
 #include "ops/hash.h"          /* ray_hash_i64, ray_hash_combine */
 #include "ops/internal.h"      /* col_propagate_str_pool */
 #include "mem/sys.h"           /* ray_sys_alloc / ray_sys_free */
+#include "mem/cow.h"           /* ray_rc_sync (unique-ownership test) */
+#include "table/table.h"       /* ray_table_cols_mut */
 #include "lang/format.h"       /* ray_type_name (error context) */
 #include <string.h>
 #include <stdio.h>
@@ -2502,6 +2504,13 @@ static ray_t* restore_names(ray_t* tbl, ray_t* src) {
     return out;
 }
 
+/* Uniquely owned by us: rc == 1 and not arena backed (ray_cow refuses to copy
+ * arena blocks, so a shared arena block would be mutated in place). */
+static inline bool dl_sole_owner(ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || (v->attrs & RAY_ATTR_ARENA)) return false;
+    return (RAY_LIKELY(!ray_rc_sync) ? v->rc : ray_atomic_load(&v->rc)) == 1;
+}
+
 /* Create a table by concatenating all rows from tables a and b (same schema).
  * Uses column-wise ray_vec_concat. Returns new owned table with a's names. */
 static ray_t* table_union(ray_t* a, ray_t* b) {
@@ -2537,8 +2546,54 @@ static ray_t* table_union(ray_t* a, ray_t* b) {
         return ray_error("schema", "table_union: column count mismatch");
     int64_t ncols = ncols_a;
 
-    if (ray_table_nrows(a) == 0) { ray_retain(b); return b; }
-    if (ray_table_nrows(b) == 0) { ray_retain(a); return a; }
+    int64_t nrows_a = ray_table_nrows(a), nrows_b = ray_table_nrows(b);
+    if (nrows_a == 0) { ray_retain(b); return b; }
+    if (nrows_b == 0) { ray_retain(a); return a; }
+
+    /* Fast path: `a` owns everything it holds, so b's rows can be appended to
+     * a's columns in place instead of concatenating into a fresh table.  This
+     * is the fixpoint loop's merge (rel->table <- rel->table + delta), which
+     * is otherwise O(relation) per iteration.  Preconditions, all required:
+     *   - a and b are distinct tables (else the memcpy source is the block
+     *     being reallocated);
+     *   - a's table block and column list are uniquely owned
+     *     (ray_table_cols_mut), so no other table sees these slots;
+     *   - every column of a is a uniquely owned, non-slice, non-arena fixed
+     *     width vector whose type matches b's, and neither SYM (domain/width
+     *     adoption is ray_vec_concat's job) nor STR (pooled payloads).
+     * Rectangularity is checked too: a short column would silently misalign.
+     * The row order is a's rows then b's — the row set built in the fixpoint
+     * loop indexes rows of a and depends on it. */
+    ray_t** slots = a != b && ncols > 0 ? ray_table_cols_mut(a) : NULL;
+    if (slots) {
+        bool ok = true;
+        for (int64_t c = 0; c < ncols && ok; c++) {
+            ray_t* ca = slots[c];
+            ray_t* cb = ray_table_get_col_idx(b, c);
+            ok = ca && cb && !RAY_IS_ERR(cb) && ca->type == cb->type &&
+                 ray_is_vec(ca) && ca->type != RAY_SYM && ca->type != RAY_STR &&
+                 !(ca->attrs & RAY_ATTR_SLICE) && dl_sole_owner(ca) &&
+                 ca->len == nrows_a && cb->len == nrows_b;
+        }
+        if (ok) {
+            for (int64_t c = 0; c < ncols; c++) {
+                ray_t* cb = ray_table_get_col_idx(b, c);
+                ray_t* grown = ray_vec_append_raw(slots[c], ray_data(cb), cb->len);
+                if (!grown || RAY_IS_ERR(grown)) {
+                    /* Columns before c already grew; a is left inconsistent,
+                     * which every caller treats as a hard evaluation failure
+                     * (the relation is dropped, not reused). */
+                    return grown ? grown : ray_error("memory", "table_union: append");
+                }
+                /* A reallocating append frees the old block, so the slot is
+                 * overwritten, never released. */
+                slots[c] = grown;
+                if (cb->attrs & RAY_ATTR_HAS_NULLS) grown->attrs |= RAY_ATTR_HAS_NULLS;
+            }
+            ray_retain(a);
+            return a;
+        }
+    }
 
     ray_t* out = ray_table_new((int)ncols);
     if (!out || RAY_IS_ERR(out))
@@ -3279,7 +3334,6 @@ int dl_eval(dl_program_t* prog) {
         /* Phase B: Semi-naive loop — iterate with delta relations */
         /* For each IDB predicate in this stratum, compute delta as the
          * difference between current and previous table states. */
-        ray_t* prev_tables[DL_MAX_RELS];
         ray_t* delta_tables[DL_MAX_RELS];
         /* One persistent row set per IDB, alive for the whole stratum: the
          * per-iteration delta is "candidate rows whose key is new" instead
@@ -3288,7 +3342,6 @@ int dl_eval(dl_program_t* prog) {
         /* Latched once a relation's set cannot be built (unsupported column
          * type, or OOM): stop retrying and stay on the generic path. */
         bool set_off[DL_MAX_RELS];
-        memset(prev_tables, 0, sizeof(prev_tables));
         memset(delta_tables, 0, sizeof(delta_tables));
         memset(sets, 0, sizeof(sets));
         memset(set_off, 0, sizeof(set_off));
@@ -3300,21 +3353,6 @@ int dl_eval(dl_program_t* prog) {
             if (rel->is_idb) {
                 ray_retain(rel->table);
                 delta_tables[rel_idx] = rel->table;
-                /* prev = empty table with same schema as the relation.
-                 * Column types must match rel->table so later ray_vec_concat
-                 * calls don't reject the merge when the relation has
-                 * non-i64 columns (e.g. RAY_SYM from head-constant slots). */
-                prev_tables[rel_idx] = ray_table_new(rel->arity);
-                for (int c = 0; c < rel->arity && c < DL_MAX_ARITY; c++) {
-                    ray_t* src = ray_table_get_col_idx(rel->table, c);
-                    int8_t ctype = src ? src->type : RAY_I64;
-                    ray_t* empty_col = ray_vec_new(ctype, 0);
-                    if (empty_col && !RAY_IS_ERR(empty_col)) {
-                        prev_tables[rel_idx] = ray_table_add_col(
-                            prev_tables[rel_idx], rel->col_names[c], empty_col);
-                        ray_release(empty_col);
-                    }
-                }
                 /* Seed the row set from the post-Phase-A relation.  A
                  * failure (OOM, or a column type the set can't key on)
                  * leaves the set zeroed and latches set_off, which keeps
@@ -3347,14 +3385,12 @@ int dl_eval(dl_program_t* prog) {
         int64_t max_iter = monotone ? INT64_MAX : DL_MAX_ITER_NONMONOTONE;
         bool converged = false;
         for (int64_t iter = 0; iter < max_iter; iter++) {
-            /* Cancellation checkpoint (per fixpoint iteration).  prev_tables /
-             * delta_tables are live here, so mirror the stratum cleanup below
-             * before returning to avoid a leak. */
+            /* Cancellation checkpoint (per fixpoint iteration).  delta_tables
+             * and the row sets are live here, so mirror the stratum cleanup
+             * below before returning to avoid a leak. */
             if (RAY_UNLIKELY(ray_interrupted())) {
                 for (int p = 0; p < prog->strata_sizes[s]; p++) {
                     int rel_idx = prog->strata[s][p];
-                    if (prev_tables[rel_idx] && !RAY_IS_ERR(prev_tables[rel_idx]))
-                        ray_release(prev_tables[rel_idx]);
                     if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
                         ray_release(delta_tables[rel_idx]);
                     dl_rowset_free(&sets[rel_idx]);
@@ -3549,15 +3585,6 @@ int dl_eval(dl_program_t* prog) {
                     }
                 }
             }
-
-            /* Update prev tables */
-            for (int p = 0; p < prog->strata_sizes[s]; p++) {
-                int rel_idx = prog->strata[s][p];
-                if (prev_tables[rel_idx] && !RAY_IS_ERR(prev_tables[rel_idx]))
-                    ray_release(prev_tables[rel_idx]);
-                ray_retain(prog->rels[rel_idx].table);
-                prev_tables[rel_idx] = prog->rels[rel_idx].table;
-            }
         }
 
         /* Non-convergence: the fixpoint loop exhausted max_iter while deltas
@@ -3580,8 +3607,6 @@ int dl_eval(dl_program_t* prog) {
         /* Cleanup stratum temporaries */
         for (int p = 0; p < prog->strata_sizes[s]; p++) {
             int rel_idx = prog->strata[s][p];
-            if (prev_tables[rel_idx] && !RAY_IS_ERR(prev_tables[rel_idx]))
-                ray_release(prev_tables[rel_idx]);
             if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
                 ray_release(delta_tables[rel_idx]);
             dl_rowset_free(&sets[rel_idx]);

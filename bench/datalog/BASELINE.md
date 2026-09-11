@@ -91,3 +91,48 @@ Linear (the shape this task targets — a small delta joined against a growing r
 Non-linear is unchanged within noise (889 -> 879 ms at N=512, 8310 -> 8295 ms at N=1024): there the candidate table dwarfs the relation, so the pre-dedup guard keeps the vectorised `table_distinct` in front of the row-set probe and only the per-iteration `table_antijoin` is removed — a cost that is small next to the join and the distinct at that shape.
 
 Measured without the pre-dedup guard, non-linear regressed sharply (N=512 1810 ms, N=1024 22819 ms) because the scalar per-row probe and the per-row `dl_table_take_mask` copy ran over a candidate table many times the size of the relation. That measurement is why the guard exists.
+
+## After Task 13 (pre-commit HEAD 32e65461 + the Task 13 working-tree changes)
+
+- Date: 2026-09-11
+- Commit: 32e65461 (branch `perf/datalog-fixpoint`) plus the uncommitted Task 13 working-tree changes this section's own commit introduces (same convention as the sections above).
+- Change under test: `dl_eval` no longer keeps the dead `prev_tables[]` (set and released every iteration, never read), which pinned every IDB column at refcount > 1; and `table_union` appends `b`'s rows into `a`'s columns in place (`ray_vec_append_raw`) when `a`, its column list and every column are uniquely owned, non-slice, non-arena, same-typed and neither SYM nor STR. The per-iteration merge is then amortised O(delta) instead of O(relation).
+- Fast-path hit rate on this benchmark (measured with a temporary counter, removed before commit): linear N=512 1021 hits / 0 misses, nonlinear N=512 26 hits / 0 misses — 100%.
+- Same methodology and machine as above (min-of-3 wall time via `date +%s%N`, `RAYFORCE_CORES=2`, `./rayforce` freshly built with `make -j8 release`). Load average at run time: 1.23 1.07 0.81.
+
+```
+linear N=   64 rows=    2080 min_ms=     14 ok
+linear N=  128 rows=    8256 min_ms=     24 ok
+linear N=  256 rows=   32896 min_ms=     49 ok
+linear N=  512 rows=  131328 min_ms=    112 ok
+linear N= 1024 rows=  524800 min_ms=    340 ok
+```
+
+```
+nonlinear N=   64 rows=    2080 min_ms=     10 ok
+nonlinear N=  128 rows=    8256 min_ms=     27 ok
+nonlinear N=  256 rows=   32896 min_ms=    142 ok
+nonlinear N=  512 rows=  131328 min_ms=    905 ok
+nonlinear N= 1024 rows=  524800 min_ms=   8304 ok
+```
+
+Every N reports `ok` with the expected row count.
+
+| N | After Task 12 (linear) | After Task 13 (linear) | speedup |
+|---|---|---|---|
+| 64 | 14 ms | 14 ms | 1.0x |
+| 128 | 24 ms | 24 ms | 1.0x |
+| 256 | 53 ms | 49 ms | 1.1x |
+| 512 | 161 ms | 112 ms | 1.4x |
+| 1024 | 1324 ms | 340 ms | **3.9x** |
+
+The win grows with N because the copy this removes was proportional to the relation size times the iteration count. Non-linear is unchanged within noise (879 -> 905 ms at N=512, 8295 -> 8304 ms at N=1024): that shape converges in ~26 iterations, so only 26 unions happen and the copy was never the bottleneck there; its cost is the join and the distinct over a candidate table much larger than the relation.
+
+Total allocation for linear N=512, measured with `(.mem.ts (count (query db (find ?x ?y) (where (tc ?x ?y)))))` on release builds before and after this task's changes:
+
+| | allocated-bytes | alloc-count | peak-live-bytes | time-ns |
+|---|---|---|---|---|
+| before (32e65461) | 1,888,396,288 | 27,988 | 35,654,208 | 162,667,333 |
+| after | 73,245,632 | 22,891 | 36,702,400 | 102,932,959 |
+
+25.8x less total allocation. Peak live is unchanged (the relation itself is the same size); what disappears is the full copy of the relation made once per iteration.
