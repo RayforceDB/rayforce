@@ -2563,7 +2563,11 @@ static ray_t* table_union(ray_t* a, ray_t* b) {
      *     adoption is ray_vec_concat's job) nor STR (pooled payloads).
      * Rectangularity is checked too: a short column would silently misalign.
      * The row order is a's rows then b's — the row set built in the fixpoint
-     * loop indexes rows of a and depends on it. */
+     * loop indexes rows of a and depends on it.
+     * ray_vec_append_raw also clears RAY_ATTR_SORTED and drops any attached
+     * index, but it does not clear RAY_ATTR_HAS_LINK; datalog IDB columns are
+     * plain derived vectors and are never link-tagged, so that is moot here —
+     * a future caller of this path with linked columns would have to. */
     ray_t** slots = a != b && ncols > 0 ? ray_table_cols_mut(a) : NULL;
     if (slots) {
         bool ok = true;
@@ -2580,9 +2584,16 @@ static ray_t* table_union(ray_t* a, ray_t* b) {
                 ray_t* cb = ray_table_get_col_idx(b, c);
                 ray_t* grown = ray_vec_append_raw(slots[c], ray_data(cb), cb->len);
                 if (!grown || RAY_IS_ERR(grown)) {
-                    /* Columns before c already grew; a is left inconsistent,
-                     * which every caller treats as a hard evaluation failure
-                     * (the relation is dropped, not reused). */
+                    /* Roll the already-grown columns back to a's row count so
+                     * `a` stays rectangular.  The callers set eval_err and
+                     * *continue* the fixpoint loop, which keeps reading
+                     * rel->table (ray_table_nrows reports column 0's length),
+                     * so a half-grown relation would be read out of bounds on
+                     * every later column.  Only the length is rewound: the
+                     * capacity and the rows up to nrows_a are untouched, and
+                     * column c itself never changed (ray_vec_append_raw fails
+                     * before mutating when its reserve fails). */
+                    for (int64_t k = 0; k < c; k++) slots[k]->len = nrows_a;
                     return grown ? grown : ray_error("memory", "table_union: append");
                 }
                 /* A reallocating append frees the old block, so the slot is
