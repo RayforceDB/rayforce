@@ -2675,6 +2675,41 @@ static test_result_t test_source_prov_f64_const_body_slot(void) {
     PASS();
 }
 
+/* Audit §2.1: dl_add_rule deep-copies expression trees, so two programs can
+ * hold the same rule and each free its own copy; the caller frees the
+ * original. Under ASan a shared tree would double-free here. */
+static test_result_t test_rule_expr_ownership(void) {
+    dl_rule_t r;                              /* q(Y) :- p(X), Y = X + 1 */
+    dl_rule_init(&r, "q", 1);
+    dl_rule_head_var(&r, 0, 1);
+    int b = dl_rule_add_atom(&r, "p", 1);
+    dl_body_set_var(&r, b, 0, 0);
+    dl_expr_t* e = dl_expr_binop(OP_ADD, dl_expr_var(0), dl_expr_const(1));
+    TEST_ASSERT_TRUE(dl_rule_add_assign(&r, 1, OP_ADD, e) >= 0);
+
+    int64_t v[] = {1};
+    ray_t* c = ray_vec_from_raw(RAY_I64, v, 1);
+    ray_t* p = ray_table_new(1);
+    p = ray_table_add_col(p, ray_sym_intern("p__c0", 5), c);
+
+    dl_program_t* a = dl_program_new();
+    dl_program_t* bprog = dl_program_new();
+    dl_add_edb(a, "p", p, 1);  dl_add_edb(bprog, "p", p, 1);
+    TEST_ASSERT_EQ_I(dl_add_rule(a, &r), 0);
+    TEST_ASSERT_EQ_I(dl_add_rule(bprog, &r), 0);
+    TEST_ASSERT_TRUE(a->rules[0].body[1].assign_expr != r.body[1].assign_expr);
+    TEST_ASSERT_TRUE(a->rules[0].body[1].assign_expr != bprog->rules[0].body[1].assign_expr);
+    TEST_ASSERT_EQ_I(dl_eval(a), 0);
+    TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(dl_query(a, "q"), 0)))[0], 2);
+
+    dl_program_free(a);
+    dl_program_free(bprog);
+    dl_rule_free_exprs(&r);
+    TEST_ASSERT_TRUE(r.body[1].assign_expr == NULL);
+    ray_release(p); ray_release(c);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2743,6 +2778,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
     { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
     { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
+    { "datalog/rule_expr_ownership", test_rule_expr_ownership, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

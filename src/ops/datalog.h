@@ -342,6 +342,28 @@ dl_expr_t* dl_expr_var(int var_idx);
 /* Create a binary operation expression (OP_ADD, OP_SUB, OP_MUL, OP_DIV) */
 dl_expr_t* dl_expr_binop(int op, dl_expr_t* left, dl_expr_t* right);
 
+/* ===== Expression tree ownership =====
+ *
+ * A dl_rule_t owns the expression trees its body[] points to
+ * (assign_expr, cmp_lhs_expr, cmp_rhs_expr). dl_add_rule deep-clones the
+ * rule it is given, so the caller retains ownership of the trees it built
+ * and must free them itself (dl_rule_free_exprs). dl_program_free frees
+ * the expression trees owned by every rule in the program. The rules in
+ * g_dl_rules[] own their trees until ray_dl_reset_rules frees them. */
+
+/* Recursively free an expression tree. NULL-safe. */
+void dl_expr_free(dl_expr_t* e);
+
+/* Deep-copy an expression tree. NULL -> NULL. Returns NULL on OOM. */
+dl_expr_t* dl_expr_clone(const dl_expr_t* e);
+
+/* Free and NULL every expression tree owned by rule->body[]. */
+void dl_rule_free_exprs(dl_rule_t* rule);
+
+/* Replace every expression in rule->body[] with a deep clone of itself.
+ * Returns 0 on success, -1 on OOM (rule is left expr-free on failure). */
+int dl_rule_clone_exprs(dl_rule_t* rule);
+
 /* ===== Internal (used by compiler) ===== */
 
 /* Find relation by name. Returns index or -1. */

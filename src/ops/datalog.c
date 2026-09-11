@@ -73,6 +73,8 @@ void dl_program_free(dl_program_t* prog) {
         if (prog->rels[i].prov_src_data && !RAY_IS_ERR(prog->rels[i].prov_src_data))
             ray_release(prog->rels[i].prov_src_data);
     }
+    for (int i = 0; i < prog->n_rules; i++)
+        dl_rule_free_exprs(&prog->rules[i]);
     ray_free(dl_prog_block(prog));
 }
 
@@ -245,6 +247,7 @@ int dl_add_rule(dl_program_t* prog, const dl_rule_t* rule) {
     int idx = prog->n_rules++;
     memcpy(&prog->rules[idx], rule, sizeof(dl_rule_t));
     prog->rules[idx].stratum = -1;
+    if (dl_rule_clone_exprs(&prog->rules[idx]) < 0) { prog->n_rules--; return -1; }
 
     /* Ensure IDB relation exists for the head predicate */
     dl_ensure_idb(prog, rule->head_pred, rule->head_arity);
@@ -433,6 +436,59 @@ dl_expr_t* dl_expr_binop(int op, dl_expr_t* left, dl_expr_t* right) {
     e->left = left;
     e->right = right;
     return e;
+}
+
+/* dl_expr_alloc allocates a ray_alloc block whose ray_data() is the
+ * dl_expr_t node; recover the block header to free it. */
+static inline ray_t* dl_expr_block(dl_expr_t* e) { return (ray_t*)((char*)e - 32); }
+
+void dl_expr_free(dl_expr_t* e) {
+    if (!e) return;
+    dl_expr_free(e->left);
+    dl_expr_free(e->right);
+    ray_free(dl_expr_block(e));
+}
+
+dl_expr_t* dl_expr_clone(const dl_expr_t* e) {
+    if (!e) return NULL;
+    dl_expr_t* c = dl_expr_alloc();
+    if (!c) return NULL;
+    *c = *e;
+    c->left = c->right = NULL;
+    if (e->left)  { c->left  = dl_expr_clone(e->left);  if (!c->left)  { dl_expr_free(c); return NULL; } }
+    if (e->right) { c->right = dl_expr_clone(e->right); if (!c->right) { dl_expr_free(c); return NULL; } }
+    return c;
+}
+
+void dl_rule_free_exprs(dl_rule_t* rule) {
+    if (!rule) return;
+    for (int i = 0; i < rule->n_body; i++) {
+        dl_body_t* b = &rule->body[i];
+        dl_expr_free(b->assign_expr);  b->assign_expr  = NULL;
+        dl_expr_free(b->cmp_lhs_expr); b->cmp_lhs_expr = NULL;
+        dl_expr_free(b->cmp_rhs_expr); b->cmp_rhs_expr = NULL;
+    }
+}
+
+int dl_rule_clone_exprs(dl_rule_t* rule) {
+    for (int i = 0; i < rule->n_body; i++) {
+        dl_body_t* b = &rule->body[i];
+        dl_expr_t* a = dl_expr_clone(b->assign_expr);
+        dl_expr_t* l = dl_expr_clone(b->cmp_lhs_expr);
+        dl_expr_t* r = dl_expr_clone(b->cmp_rhs_expr);
+        if ((b->assign_expr && !a) || (b->cmp_lhs_expr && !l) || (b->cmp_rhs_expr && !r)) {
+            dl_expr_free(a); dl_expr_free(l); dl_expr_free(r);
+            /* Detach the shared originals so a later free of this copy
+             * cannot touch the caller's trees, then free what we cloned. */
+            for (int j = 0; j < rule->n_body; j++) {
+                if (j < i) { dl_expr_free(rule->body[j].assign_expr); dl_expr_free(rule->body[j].cmp_lhs_expr); dl_expr_free(rule->body[j].cmp_rhs_expr); }
+                rule->body[j].assign_expr = rule->body[j].cmp_lhs_expr = rule->body[j].cmp_rhs_expr = NULL;
+            }
+            return -1;
+        }
+        b->assign_expr = a; b->cmp_lhs_expr = l; b->cmp_rhs_expr = r;
+    }
+    return 0;
 }
 
 /* ========================================================================
@@ -4136,9 +4192,15 @@ ray_t* ray_rule_fn(ray_t** args, int64_t n) {
     dl_var_map_t vars;
     memset(&vars, 0, sizeof(vars));
     dl_rule_t rule;
+    /* dl_parse_rule_from_head_and_body can fail before its own dl_rule_init
+     * runs (e.g. malformed head); zero rule up front so n_body == 0 in that
+     * case and dl_rule_free_exprs below is always safe. */
+    memset(&rule, 0, sizeof(rule));
     ray_t* perr = dl_parse_rule_from_head_and_body(&rule, args[0], &args[1], n - 1, &vars, NULL);
-    if (perr) return perr;
+    if (perr) { dl_rule_free_exprs(&rule); return perr; }
 
+    /* Success: rule's trees move into g_dl_rules, which owns them until
+     * ray_dl_reset_rules — no clone/free here. */
     memcpy(&g_dl_rules[g_dl_n_rules++], &rule, sizeof(dl_rule_t));
     return ray_bool(true);
 }
@@ -4253,7 +4315,7 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
     /* Parse body clauses into the query rule */
     for (int64_t i = 1; i < where_len; i++) {
         ray_t* err = dl_parse_body_clause(&qrule, where_elems[i], &vars, NULL);
-        if (err) { ray_release(db); return err; }
+        if (err) { dl_rule_free_exprs(&qrule); ray_release(db); return err; }
     }
     qrule.n_vars = vars.n;
 
@@ -4300,25 +4362,41 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
         int64_t rlen = ray_len(rules_clause);
         for (int64_t i = 1; i < rlen; i++) {
             dl_rule_t irule;
+            /* dl_parse_inline_rule can fail before its own dl_rule_init runs
+             * (e.g. malformed head); zero irule up front so n_body == 0 in
+             * that case and dl_rule_free_exprs below is always safe. */
+            memset(&irule, 0, sizeof(irule));
             ray_t* rerr = dl_parse_inline_rule(&irule, re[i], prog);
             if (rerr) {
+                dl_rule_free_exprs(&irule);
+                dl_rule_free_exprs(&qrule);
                 dl_program_free(prog);
                 ray_release(db);
                 return rerr;
             }
             if (dl_add_rule(prog, &irule) < 0) {
+                dl_rule_free_exprs(&irule);
+                dl_rule_free_exprs(&qrule);
                 dl_program_free(prog);
                 ray_release(db);
                 return ray_error("domain", "query: too many rules");
             }
+            dl_rule_free_exprs(&irule);
         }
     } else {
         for (int i = 0; i < g_dl_n_rules; i++)
             dl_add_rule(prog, &g_dl_rules[i]);
     }
 
-    /* Add the synthetic query rule */
-    dl_add_rule(prog, &qrule);
+    /* Add the synthetic query rule. dl_add_rule deep-clones the trees into
+     * prog, so qrule's own trees must be freed here on every path below. */
+    if (dl_add_rule(prog, &qrule) < 0) {
+        dl_rule_free_exprs(&qrule);
+        dl_program_free(prog);
+        ray_release(db);
+        return ray_error("memory", "query: cannot add query rule");
+    }
+    dl_rule_free_exprs(&qrule);
 
     /* Auto-register env-bound EDB tables referenced from rule bodies.
      *
@@ -4654,5 +4732,7 @@ ray_t* ray_dl_free_fn(ray_t* x) {
 
 /* Reset global Datalog rule storage (called from ray_lang_destroy) */
 void ray_dl_reset_rules(void) {
+    for (int i = 0; i < g_dl_n_rules; i++)
+        dl_rule_free_exprs(&g_dl_rules[i]);
     g_dl_n_rules = 0;
 }

@@ -67,3 +67,13 @@
 ;; §7.3 an unknown relation is an error, not an empty result.
 (query g (find ?x) (where (nosuch ?x))) !- domain
 (query g (find ?x) (where (?x :edge ?y) (not (nosuch ?x)))) !- domain
+
+;; §2.1 repeated queries with an arithmetic expression must not grow the heap.
+(set ld (datoms))
+(set ld (assert-fact ld 1 'v 1))
+(set ld (assert-fact ld 2 'v 2))
+(set lq (fn [i] (count (query ld (find ?e ?y) (where (?e :v ?x) (= ?y (+ ?x 1)))))))
+(map lq (til 50))
+(set lb0 (get (.sys.mem) 'bytes-allocated))
+(map lq (til 200))
+(- (get (.sys.mem) 'bytes-allocated) lb0) -- 0
