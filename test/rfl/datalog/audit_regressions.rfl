@@ -74,12 +74,16 @@
 (set ld (assert-fact ld 2 'v 2))
 (set lq (fn [i] (count (query ld (find ?e ?y) (where (?e :v ?x) (= ?y (+ ?x 1)))))))
 (map lq (til 50))
-;; Two throw-away (.sys.mem) reads warm the measurement path itself -- each
-;; (get (.sys.mem) 'bytes-allocated) call retains its own boxed result, a
-;; fixed cost unrelated to the datalog query loop below -- before the real
-;; baseline is taken, so lb0 and the final read are directly comparable.
-(set lb_warm1 (get (.sys.mem) 'bytes-allocated))
-(set lb_warm2 (get (.sys.mem) 'bytes-allocated))
+;; `(set lb0 ...)` permanently retains its own boxed result -- a fixed cost
+;; unrelated to the datalog query loop below -- which would bias a single
+;; capture against every later comparison. Re-binding lb0 a second time
+;; replaces that box with an identically-sized one: the old box's release
+;; and the new box's allocation net to zero, so this second, self-paid
+;; capture is the true zero-cost baseline (verified empirically: a single
+;; capture reads a nonzero, non-scaling residual on every later read no
+;; matter how many throw-away reads precede it; re-binding the same name
+;; converges to exactly 0).
+(set lb0 (get (.sys.mem) 'bytes-allocated))
 (set lb0 (get (.sys.mem) 'bytes-allocated))
 (map lq (til 200))
 (- (get (.sys.mem) 'bytes-allocated) lb0) -- 0
