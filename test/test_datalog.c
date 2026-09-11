@@ -36,6 +36,10 @@
 #include <stdlib.h>        /* abort in datalog_rf_setup */
 #include <string.h>
 
+/* ray_error_msg() isn't in the public <rayforce.h> surface — src/ops/datalog.c
+ * itself reaches it the same way (see its own `extern` near the top). */
+extern const char* ray_error_msg(void);
+
 /* Full-runtime fixtures use the public runtime API from <rayforce.h>. */
 
 static void datalog_setup(void) {
@@ -2014,6 +2018,40 @@ static test_result_t test_eval_surfaces_compile_failure(void) {
     PASS();
 }
 
+/* Admission errors: a `find` clause wider than DL_MAX_ARITY (16) must be
+ * rejected instead of silently truncated, and a body predicate that
+ * resolves to no relation at all (not an EDB, env-bound table, or rule
+ * head) must be an error instead of an empty result.  Audit §1.6, §7.3. */
+static test_result_t test_query_admission_errors(void) {
+    ray_t* db = ray_eval_str(
+        "(do (set __qae_db (datoms)) (set __qae_db (assert-fact __qae_db 1 'a 1)))");
+    TEST_ASSERT_NOT_NULL(db);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(db));
+    ray_release(db);
+
+    /* (a) 17 find variables exceeds DL_MAX_ARITY (16). */
+    ray_t* r_wide = ray_eval_str(
+        "(query __qae_db (find ?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p ?q) "
+        "  (where (?a :a ?b)))");
+    TEST_ASSERT_NOT_NULL(r_wide);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r_wide));
+    const char* msg_wide = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg_wide);
+    TEST_ASSERT_TRUE(strstr(msg_wide, "find supports at most 16 variables") != NULL);
+    ray_error_free(r_wide);
+
+    /* (b) unknown relation referenced in the body. */
+    ray_t* r_unk = ray_eval_str("(query __qae_db (find ?x) (where (nosuch ?x)))");
+    TEST_ASSERT_NOT_NULL(r_unk);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r_unk));
+    const char* msg_unk = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg_unk);
+    TEST_ASSERT_TRUE(strstr(msg_unk, "unknown relation 'nosuch'") != NULL);
+    ray_error_free(r_unk);
+
+    PASS();
+}
+
 /* ray_release() is a deliberate no-op for RAY_ERROR objects, so callers
  * that claim to be "releasing" an error under the refcount API actually
  * leak the block.  ray_error_free() is the escape hatch that calls
@@ -2685,6 +2723,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/env_bound_edb_auto_register", test_env_bound_edb_auto_register, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/env_bound_agg_auto_register", test_env_bound_agg_auto_register, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/eval_surfaces_compile_failure", test_eval_surfaces_compile_failure, datalog_rf_setup, datalog_rf_teardown },
+    { "datalog/query_admission_errors", test_query_admission_errors, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/error_free_reclaims", test_error_free_reclaims, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/agg_scalar_f64", test_agg_scalar_f64, datalog_setup, datalog_teardown },
     { "datalog/agg_scalar_f64_sum_empty", test_agg_scalar_f64_sum_empty, datalog_setup, datalog_teardown },

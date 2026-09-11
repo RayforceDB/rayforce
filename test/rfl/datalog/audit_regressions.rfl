@@ -58,3 +58,12 @@
 ;; domain` idiom used elsewhere for evaluation failures, e.g.
 ;; datalog_branch_cov.rfl:274.
 (query g (find ?x) (where (strs ?x 1))) !- domain
+
+;; §1.6 a find clause wider than DL_MAX_ARITY (16) errors instead of truncating.
+(set w (datoms))
+(set w (assert-fact w 1 'a 1))
+(count (key (query w (find ?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p) (where (?a :a ?b) (?a :a ?c) (?a :a ?d) (?a :a ?e) (?a :a ?f) (?a :a ?g) (?a :a ?h) (?a :a ?i) (?a :a ?j) (?a :a ?k) (?a :a ?l) (?a :a ?m) (?a :a ?n) (?a :a ?o) (?a :a ?p))))) -- 16
+(query w (find ?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p ?q) (where (?a :a ?b))) !- domain
+;; §7.3 an unknown relation is an error, not an empty result.
+(query g (find ?x) (where (nosuch ?x))) !- domain
+(query g (find ?x) (where (?x :edge ?y) (not (nosuch ?x)))) !- domain

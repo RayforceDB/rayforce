@@ -4177,6 +4177,12 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
         return ray_error("type", "query: expected (find ...) as second argument");
     }
 
+    if (find_len - 1 > DL_MAX_ARITY) {
+        ray_release(db);
+        return ray_error("domain", "query: find supports at most %d variables, got %lld",
+                         DL_MAX_ARITY, (long long)(find_len - 1));
+    }
+
     /* Collect find variable sym IDs */
     int64_t find_var_syms[DL_MAX_ARITY];
     int n_find_vars = 0;
@@ -4431,6 +4437,22 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                 return ray_error("domain", "query: failed to register env-backed EDB table");
             }
             ray_release(clean);
+        }
+    }
+
+    /* Admission: every body predicate must now resolve to a relation —
+     * an EDB, an env-bound table registered above, or a rule head (IDB
+     * created by dl_add_rule). Anything else is a typo, not "no rows". */
+    for (int ri = 0; ri < prog->n_rules; ri++) {
+        dl_rule_t* rr = &prog->rules[ri];
+        for (int bi = 0; bi < rr->n_body; bi++) {
+            dl_body_t* bd = &rr->body[bi];
+            const char* pn = (bd->type == DL_POS || bd->type == DL_NEG) ? bd->pred
+                           : (bd->type == DL_AGG) ? bd->agg_pred : NULL;
+            if (!pn || !pn[0] || dl_find_rel(prog, pn) >= 0) continue;
+            dl_program_free(prog);
+            ray_release(db);
+            return ray_error("domain", "query: unknown relation '%s'", pn);
         }
     }
 
