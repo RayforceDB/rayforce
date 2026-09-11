@@ -20,3 +20,12 @@
 (count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 1) (== ?y 6)))) -- 1
 (count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 2) (== ?y 7)))) -- 1
 (count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 3) (== ?y 8)))) -- 1
+
+;; §1.2 a repeated variable inside one atom is an equality constraint.
+(count (query g (find ?x) (where (?x :edge ?x)))) -- 0
+(count (query g (find ?x) (where (lin ?x ?x)))) -- 0
+(set g2 (assert-fact g 5 'edge 5))
+(count (query g2 (find ?x) (where (?x :edge ?x)))) -- 1
+(at (at (query g2 (find ?x) (where (?x :edge ?x))) '?x) 0) -- 5
+;; ... and inside a negated atom: every node except the one with a self-loop
+(count (query g2 (find ?x) (where (?x :edge ?y) (not (?x :edge ?x))))) -- 6

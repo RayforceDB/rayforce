@@ -1044,6 +1044,45 @@ static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
     return false;
 }
 
+/* Copy the rows of tbl where keep[r] != 0 (count = number of such rows)
+ * into a new table with identical schema (SYM width/domain preserved).
+ * keep == NULL with count == 0 builds the empty table of the same schema.
+ * Returns an owned table or RAY_ERROR. */
+static ray_t* dl_table_take_mask(ray_t* tbl, const uint8_t* keep, int64_t count) {
+    int64_t nrows = ray_table_nrows(tbl);
+    int64_t ncols = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new((int)ncols);
+    if (!out) return ray_error("memory", "dl_table_take_mask: table_new");
+    if (RAY_IS_ERR(out)) return out;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* src = ray_table_get_col_idx(tbl, c);
+        if (!src) { ray_release(out); return ray_error("domain", "dl_table_take_mask: missing source column"); }
+        ray_t* dst = (src->type == RAY_SYM)
+            ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, count)
+            : ray_vec_new(src->type, count);
+        if (!dst) { ray_release(out); return ray_error("memory", "dl_table_take_mask: vec_new"); }
+        if (RAY_IS_ERR(dst)) { ray_error_free(dst); ray_release(out); return ray_error("memory", "dl_table_take_mask: vec_new"); }
+        dst->len = count;
+        if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(dst, src);
+        uint8_t esz = ray_sym_elem_size(src->type, src->attrs);
+        const uint8_t* src_b = (const uint8_t*)ray_data(src);
+        uint8_t* dst_b = (uint8_t*)ray_data(dst);
+        int64_t j = 0;
+        for (int64_t r = 0; keep && r < nrows; r++) {
+            if (!keep[r]) continue;
+            memcpy(dst_b + (size_t)j * esz, src_b + (size_t)r * esz, (size_t)esz);
+            j++;
+        }
+        if (src->type == RAY_STR) col_propagate_str_pool(dst, src);
+        ray_t* next = ray_table_add_col(out, ray_table_col_name(tbl, c), dst);
+        ray_release(dst);
+        if (!next) { ray_release(out); return ray_error("memory", "dl_table_take_mask: add_col"); }
+        if (RAY_IS_ERR(next)) { ray_release(out); return next; }
+        out = next;
+    }
+    return out;
+}
+
 static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
                            int8_t const_type) {
     /* Contract: always return an owned reference (rc bumped) so the
@@ -1080,63 +1119,74 @@ static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
     }
 
     int64_t nrows = ray_table_nrows(tbl);
-    int64_t ncols = ray_table_ncols(tbl);
 
-    /* Count matching rows — type-aware read for RAY_SYM adaptive width. */
+    /* Compute the keep mask — type-aware read for RAY_SYM adaptive width. */
+    ray_t* keep_block = ray_alloc((size_t)nrows);
+    if (!keep_block || RAY_IS_ERR(keep_block)) return ray_error("memory", "dl_filter_eq: mask alloc");
+    uint8_t* keep = (uint8_t*)ray_data(keep_block);
     int64_t count = 0;
-    for (int64_t r = 0; r < nrows; r++)
-        if (dl_col_eq_row(col, r, value, const_type)) count++;
+    for (int64_t r = 0; r < nrows; r++) {
+        keep[r] = dl_col_eq_row(col, r, value, const_type) ? 1 : 0;
+        count += keep[r];
+    }
 
-    if (count == nrows) { ray_retain(tbl); return tbl; }
+    if (count == nrows) { ray_free(keep_block); ray_retain(tbl); return tbl; }
 
     /* Build filtered table.  Each surviving column is allocated with
      * its source's element-size (via ray_sym_elem_size) so narrow-SYM
      * stays narrow rather than being silently widened to W64. */
-    ray_t* out = ray_table_new((int)ncols);
-    if (!out) return ray_error("memory", "dl_filter_eq: table_new");
-    if (RAY_IS_ERR(out)) return out;
-    for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (!src) {
-            ray_release(out);
-            return ray_error("domain", "dl_filter_eq: missing source column");
-        }
-        ray_t* dst = (src->type == RAY_SYM)
-            ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, count)
-            : ray_vec_new(src->type, count);
-        if (!dst) { ray_release(out); return ray_error("memory", "dl_filter_eq: vec_new"); }
-        if (RAY_IS_ERR(dst)) { ray_error_free(dst); ray_release(out); return ray_error("memory", "dl_filter_eq: vec_new"); }
-        dst->len = count;
-        /* raw SYM cell-id copies resolve over the source's dictionary */
-        if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(dst, src);
-        uint8_t esz = ray_sym_elem_size(src->type, src->attrs);
-        const uint8_t* src_b = (const uint8_t*)ray_data(src);
-        uint8_t* dst_b = (uint8_t*)ray_data(dst);
-        int64_t j = 0;
-        for (int64_t r = 0; r < nrows; r++) {
-            if (dl_col_eq_row(col, r, value, const_type)) {
-                memcpy(dst_b + (size_t)j * esz,
-                       src_b + (size_t)r * esz,
-                       (size_t)esz);
-                j++;
-            }
-        }
-        if (src->type == RAY_STR) col_propagate_str_pool(dst, src);
-        ray_t* next = ray_table_add_col(out, ray_table_col_name(tbl, c), dst);
-        ray_release(dst);
-        /* ray_table_add_col does not release `out` on failure, so we
-         * must release the partially-built table before bailing out. */
-        if (!next) {
-            ray_release(out);
-            return ray_error("memory", "dl_filter_eq: add_col");
-        }
-        if (RAY_IS_ERR(next)) {
-            ray_release(out);
-            return next;
-        }
-        out = next;
-    }
+    ray_t* out = dl_table_take_mask(tbl, keep, count);
+    ray_free(keep_block);
     return out;
+}
+
+static int64_t dl_cell_i64(ray_t* col, int64_t row) {
+    if (col->type == RAY_SYM)
+        return ray_read_sym(ray_data(col), row, col->type, col->attrs);
+    return ((int64_t*)ray_data(col))[row];
+}
+
+/* Rows where column c1 == column c2 (I64/SYM cells read as int64).
+ * Owned result; retains and returns tbl unchanged when all rows match. */
+static ray_t* dl_filter_col_eq(ray_t* tbl, int c1, int c2) {
+    if (!tbl || RAY_IS_ERR(tbl)) { if (tbl) ray_retain(tbl); return tbl; }
+    int64_t nrows = ray_table_nrows(tbl);
+    if (nrows == 0) { ray_retain(tbl); return tbl; }
+    ray_t* a = ray_table_get_col_idx(tbl, c1);
+    ray_t* b = ray_table_get_col_idx(tbl, c2);
+    if (!a || !b) return ray_error("domain", "datalog: repeated-variable filter on missing column");
+    if ((a->type != RAY_I64 && a->type != RAY_SYM) || (b->type != RAY_I64 && b->type != RAY_SYM))
+        return ray_error("type", "datalog: repeated variable over unsupported column type %s",
+                         ray_type_name(a->type != RAY_I64 && a->type != RAY_SYM ? a->type : b->type));
+    ray_t* keep_block = ray_alloc((size_t)nrows);
+    if (!keep_block || RAY_IS_ERR(keep_block)) return ray_error("memory", "datalog: mask alloc");
+    uint8_t* keep = (uint8_t*)ray_data(keep_block);
+    int64_t count = 0;
+    for (int64_t r = 0; r < nrows; r++) {
+        keep[r] = dl_cell_i64(a, r) == dl_cell_i64(b, r);
+        count += keep[r];
+    }
+    ray_t* out;
+    if (count == nrows) { ray_retain(tbl); out = tbl; }
+    else out = dl_table_take_mask(tbl, keep, count);
+    ray_free(keep_block);
+    return out;
+}
+
+/* Apply dl_filter_col_eq for every pair of positions in body sharing a
+ * variable. Consumes tbl, returns an owned table or RAY_ERROR/NULL. */
+static ray_t* dl_filter_repeated_vars(ray_t* tbl, const dl_body_t* body) {
+    for (int i = 0; i < body->arity && tbl && !RAY_IS_ERR(tbl); i++) {
+        if (body->vars[i] == DL_CONST) continue;
+        for (int j = i + 1; j < body->arity; j++) {
+            if (body->vars[j] != body->vars[i]) continue;
+            ray_t* f = dl_filter_col_eq(tbl, i, j);
+            ray_release(tbl);
+            tbl = f;
+            if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+        }
+    }
+    return tbl;
 }
 
 /* Helper: build a fully-owned broadcast column for a constant head slot.
@@ -1383,6 +1433,15 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             }
         }
 
+        body_tbl = dl_filter_repeated_vars(body_tbl, body);
+        if (!body_tbl) { if (accum) ray_release(accum); prog->eval_err = true; return NULL; }
+        if (RAY_IS_ERR(body_tbl)) {
+            ray_error_free(body_tbl);
+            if (accum) ray_release(accum);
+            prog->eval_err = true;
+            return NULL;
+        }
+
         if (accum == NULL) {
             /* First body atom: accum = body_tbl */
             accum = body_tbl;
@@ -1540,6 +1599,15 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     }
                     neg_tbl = filtered;
                 }
+            }
+
+            neg_tbl = dl_filter_repeated_vars(neg_tbl, body);
+            if (!neg_tbl) { ray_release(accum); prog->eval_err = true; return NULL; }
+            if (RAY_IS_ERR(neg_tbl)) {
+                ray_error_free(neg_tbl);
+                ray_release(accum);
+                prog->eval_err = true;
+                return NULL;
             }
 
             int lkeys[DL_MAX_ARITY], rkeys[DL_MAX_ARITY];
