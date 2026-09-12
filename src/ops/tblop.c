@@ -1310,7 +1310,18 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
          * extra ref. */
         ray_t* original_var = var;
         ray_retain(var);
-        ray_t* cow_result = ray_cow(var);
+        /* `alter` amends in place, and ray_cow only copies what is shared —
+         * but the retain above is unconditional, so ray_cow's own `rc == 1`
+         * test could never be true here and the copy path fired on every
+         * call.  A one-element write copied the whole vector, and the cost
+         * of an alter scaled with the vector's length rather than with the
+         * write.  Sole ownership after our retain is `rc == 2`: the
+         * binding's reference and ours.  The other three exclusions keep the
+         * previous behaviour exactly — ray_cow returns an arena block as-is,
+         * and a slice or a mapped block is not ours to write through. */
+        bool sole = var->rc == 2 && var->mmod == 0 &&
+                    !(var->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+        ray_t* cow_result = sole ? var : ray_cow(var);
         /* ray_cow returns NULL when ray_alloc_copy returned NULL (heap
          * exhaustion past RAY_HEAP_MAX_ORDER) and a RAY_ERROR pointer
          * when alloc_copy hit its own len-overflow guard.  Both leave

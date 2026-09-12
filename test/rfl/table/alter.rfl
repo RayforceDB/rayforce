@@ -22,3 +22,36 @@
 (set v [1h 2h 3h]) (alter 'v set 0 99h) v -- [99h 2h 3h]
 (set v ['a 'b 'c]) (alter 'v set 1 'X) v -- ['a 'X 'c]
 (set v [true false true]) (alter 'v set 0 false) v -- [false false true]
+
+;; ── a sole-owned target is amended in place, a shared one is not ────────
+;; alter set used to hand ray_cow a reference it had just retained, so the
+;; `rc == 1` test inside could never be true and every write copied the whole
+;; vector.  Sole ownership is rc == 2 here — the binding's reference and
+;; alter's own.  What must not change is the observable part: a value another
+;; binding can still see is copied before the write, so that binding keeps the
+;; value it had.
+(set AA [1 2 3 4])
+(set BB AA)
+(alter 'AA set 0 99)
+AA -- [99 2 3 4]
+BB -- [1 2 3 4]
+
+(set CC (list 1 2 3))
+(set DD CC)
+(alter 'CC set 1 88)
+CC -- (list 1 88 3)
+DD -- (list 1 2 3)
+
+;; sole owner: the amend lands and nothing else observes it
+(set EE [10 20 30])
+(alter 'EE set 2 7)
+EE -- [10 20 7]
+(alter 'EE set [0 1] 5)
+EE -- [5 5 7]
+
+;; a slice is not ours to write through, so it keeps taking the copy path
+(set FF [1 2 3 4 5])
+(set GG (drop FF 2))
+(alter 'GG set 0 42)
+GG -- [42 4 5]
+FF -- [1 2 3 4 5]
