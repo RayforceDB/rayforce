@@ -52,6 +52,7 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
+#include "vec/vec.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -4123,10 +4124,7 @@ static void csv_col_info_init(csv_col_info_t* ci, ray_t* col) {
     /* has_nulls must consult the slice_parent, since a slice view
      * never carries its own null bitmap — ray_vec_is_null handles the
      * redirect but we still want a fast bypass when neither has nulls. */
-    ci->has_nulls = false;
-    if (col && (col->attrs & RAY_ATTR_HAS_NULLS)) ci->has_nulls = true;
-    if (ci->data_owner && (ci->data_owner->attrs & RAY_ATTR_HAS_NULLS))
-        ci->has_nulls = true;
+    ci->has_nulls = ray_vec_may_have_nulls(col);
 }
 
 static void csv_write_cell(csv_writer_t* w, const csv_col_info_t* ci, int64_t r) {

@@ -258,7 +258,7 @@ static bool query_key_reader_read(query_key_reader_t* r, int64_t row,
     *out = 0;
 
     if (!RAY_IS_PARTED(r->col->type) && r->col->type != RAY_MAPCOMMON) {
-        *is_null = (r->col->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(r->col, row);
+        *is_null = ray_vec_is_null(r->col, row);
         if (*is_null) return true;
         if (r->base_type == RAY_F64) memcpy(out, &((double*)ray_data(r->col))[row], 8);
         else *out = read_col_i64(ray_data(r->col), row, r->base_type, r->col->attrs);
@@ -287,7 +287,7 @@ static bool query_key_reader_read(query_key_reader_t* r, int64_t row,
     ray_t* seg = r->segs[r->seg_idx];
     if (!seg) return false;
     int64_t local = row - r->seg_start;
-    *is_null = (seg->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(seg, local);
+    *is_null = ray_vec_is_null(seg, local);
     if (*is_null) return true;
     if (r->base_type == RAY_F64) memcpy(out, &((double*)ray_data(seg))[local], 8);
     else *out = read_col_i64(ray_data(seg), local, r->base_type, seg->attrs);
@@ -2694,7 +2694,7 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
     if (!col_expr || col_expr->type != -RAY_SYM || (col_expr->attrs & ATTR_QUOTED))
         return false;
     ray_t* col = ray_table_get_col(tbl, col_expr->i64);
-    if (!col || (col->attrs & RAY_ATTR_HAS_NULLS)) return false;
+    if (!col || ray_vec_may_have_nulls(col)) return false;
 
     *op_out = is_first ? OP_MIN : OP_MAX;
     *arg_out = col_expr;
@@ -3719,7 +3719,7 @@ static ray_t* try_count_distinct_v2_rewrite(
         if (!K_cols[j]) return NULL;
         int8_t kct_j = K_cols[j]->type;
         if (RAY_IS_PARTED(kct_j) || kct_j == RAY_MAPCOMMON) return NULL;
-        if (K_cols[j]->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+        if (ray_vec_may_have_nulls(K_cols[j])) return NULL;
         int kct_ok_j = (kct_j == RAY_SYM  || kct_j == RAY_BOOL || kct_j == RAY_U8 ||
                         kct_j == RAY_I16  || kct_j == RAY_I32  || kct_j == RAY_I64 ||
                         kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP);
@@ -3730,7 +3730,7 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
-    if (X_col->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+    if (ray_vec_may_have_nulls(X_col)) return NULL;
     int X_esz = ray_sym_elem_size(xct, X_col->attrs);
     if (K_esz_total + X_esz > 16) return NULL;
     /* X gets the same per-type acceptability check as the K columns
@@ -5111,7 +5111,7 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
 
     ray_t* col = ray_table_get_col(tbl, col_expr->i64);
     if (!col || col->len != ray_table_nrows(tbl)) return 0;
-    if ((col->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0) return 0;
+    if (ray_vec_may_have_nulls(col)) return 0;
 
     switch (col->type) {
     case RAY_BOOL:
@@ -6016,7 +6016,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         if (dep_candidate && base_sym >= 0) {
             ray_t* base_col = ray_table_get_col(tbl, base_sym);
             dep_candidate = base_col && key_type_i64_projectable(base_col->type) &&
-                            !(base_col->attrs & RAY_ATTR_HAS_NULLS);
+                            !ray_vec_may_have_nulls(base_col);
         }
         /* Exact-size carve (unbounded): at most nk dependent-key entries can
          * ever be collected (one per by-dict pair).  On the dependent-key
@@ -7819,7 +7819,7 @@ by_dict_done:
                         ray_t* dst = NULL;
                         if (sc->type == RAY_STR) {
                             dst = ray_vec_new(RAY_STR, out_groups);
-                            bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             for (int64_t gi = 0; gi < out_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 if (src_has_nulls && ray_vec_is_null(sc, fi[gi])) {
                                     dst = ray_str_vec_append(dst, "", 0);
@@ -8008,7 +8008,7 @@ by_dict_done:
                             uint8_t esz = ray_sym_elem_size(sct, dst->attrs);
                             const char* sb = (const char*)ray_data(sc);
                             char* db = (char*)ray_data(dst);
-                            bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             if (src_has_nulls) {
                                 for (int64_t gi = 0; gi < ngroups; gi++) {
                                     memcpy(db + (size_t)gi * esz,
@@ -8029,7 +8029,7 @@ by_dict_done:
                             uint8_t esz = ray_sym_elem_size(sct, sc->attrs);
                             const char* sb = (const char*)ray_data(sc);
                             char* db = (char*)ray_data(dst);
-                            bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             if (src_has_nulls) {
                                 for (int64_t gi = 0; gi < ngroups; gi++) {
                                     memcpy(db + (size_t)gi * esz,
@@ -8444,7 +8444,7 @@ by_dict_done:
                     ray_t* dst = NULL;
                     if (sc->type == RAY_STR) {
                         dst = ray_vec_new(RAY_STR, n_groups);
-                        bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                        bool src_has_nulls = ray_vec_may_have_nulls(sc);
                         if (src_has_nulls) {
                             for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 if (ray_vec_is_null(sc, fi[gi])) {
@@ -9338,7 +9338,7 @@ by_dict_done:
             memset(gk_null, 0, (size_t)n_groups * sizeof(uint8_t));
 
             if (grp_key_col) {
-                bool gk_has_nulls = (grp_key_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                bool gk_has_nulls = ray_vec_may_have_nulls(grp_key_col);
                 if (gk_has_nulls) {
                     for (int64_t gi = 0; gi < n_groups; gi++) {
                         if (kt == RAY_F64) {
@@ -9428,7 +9428,7 @@ by_dict_done:
                  * that maps to it.  Terminate early once every group has
                  * a first-row. */
                 bool orig_nulls_flag = orig_key_col
-                    && (orig_key_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                    && ray_vec_may_have_nulls(orig_key_col);
                 int64_t found = 0;
                 for (int64_t r = 0; r < nrows_orig && found < n_groups; r++) {
                     bool r_null = orig_nulls_flag && ray_vec_is_null(orig_key_col, r);
@@ -10048,7 +10048,7 @@ by_dict_done:
                                 new_col->len = nrows_r;
                                 char* src = (char*)ray_data(col);
                                 char* dst = (char*)ray_data(new_col);
-                                bool has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                                bool has_nulls = ray_vec_may_have_nulls(col);
                                 if (has_nulls) {
                                     for (int64_t r = 0; r < nrows_r; r++) {
                                         memcpy(dst + r * esz, src + (nrows_r - 1 - r) * esz, esz);
@@ -11306,7 +11306,7 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
 
         /* Propagate nulls if present.  Walk per-element via
          * ray_vec_is_null (sentinel-based). */
-        if (col->attrs & RAY_ATTR_HAS_NULLS) {
+        if (ray_vec_may_have_nulls(col)) {
             for (int64_t i = 0; i < n; i++)
                 if (ray_vec_is_null(col, i))
                     ray_vec_set_null(out, i, true);
@@ -11387,16 +11387,6 @@ static int8_t typeless_col_type(ray_t* payload) {
         return t;
     }
     return RAY_I64;
-}
-
-/* HAS_NULLS for a payload that may be a slice: slices carry the flag on
- * their parent.  Over-approximation is harmless (the flag is a fast-path
- * gate; sentinels in the payload are the source of truth). */
-static bool payload_may_have_nulls(const ray_t* v) {
-    if (v->attrs & RAY_ATTR_HAS_NULLS) return true;
-    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent)
-        return (v->slice_parent->attrs & RAY_ATTR_HAS_NULLS) != 0;
-    return false;
 }
 
 /* Helper: convert a Rayfall list of atoms into a typed column vector by
@@ -11801,7 +11791,7 @@ static ray_t* update_scatter(ray_t** slots, int64_t c, const int64_t* rows, int6
         return NULL;
     }
     const uint8_t* s = (const uint8_t*)ray_data(val);
-    bool vn = payload_may_have_nulls(val);
+    bool vn = ray_vec_may_have_nulls(val);
     for (int64_t i = 0; i < k; i++) {
         if (vn && ray_vec_is_null(val, i)) { ray_vec_set_null(col, rows[i], true); continue; }
         memcpy(d + (size_t)rows[i] * esz, s + (size_t)i * esz, esz);
@@ -13404,7 +13394,7 @@ static ray_t* validate_parted_payloads(ray_t* tbl,
             ray_t* owner = (payload->attrs & RAY_ATTR_SLICE)
                          ? payload->slice_parent : payload;
             if ((dst == RAY_BOOL || dst == RAY_U8) &&
-                (!owner || (owner->attrs & RAY_ATTR_HAS_NULLS)))
+                (!owner || ray_vec_may_have_nulls(owner)))
                 return ray_error("type", "insert: physical column %lld (%s) has no null representation",
                                  (long long)c, ray_type_name(dst));
             if (dst == RAY_SYM) {
@@ -14434,7 +14424,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             } else if (ray_is_atom(pay)) {
                 res = append_atom_to_col(col, pay);
             } else if (pay->type == ct && ct == RAY_STR) {
-                bool pay_nulls = payload_may_have_nulls(pay);
+                bool pay_nulls = ray_vec_may_have_nulls(pay);
                 res = col;
                 int64_t m = ray_len(pay);
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
@@ -14453,7 +14443,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                        ((pay->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
                         pay->sym_domain != ray_sym_runtime_domain())) {
                 /* Narrow or store-domain SYM payload: translate per cell. */
-                bool pay_nulls = payload_may_have_nulls(pay);
+                bool pay_nulls = ray_vec_may_have_nulls(pay);
                 res = col;
                 int64_t m = ray_len(pay);
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
@@ -14473,7 +14463,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                  * Raw cells carry their null sentinels; propagate the
                  * flag with them. */
                 res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
-                if (!RAY_IS_ERR(res) && payload_may_have_nulls(pay))
+                if (!RAY_IS_ERR(res) && ray_vec_may_have_nulls(pay))
                     res->attrs |= RAY_ATTR_HAS_NULLS;
             } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
                 /* Differently-typed vector or generic list: coerce cell by
@@ -14562,7 +14552,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
 
         /* Copy existing data */
-        bool src_has_nulls = (orig_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool src_has_nulls = ray_vec_may_have_nulls(orig_col);
         if (ct == RAY_STR) {
             for (int64_t r = 0; r < nrows; r++) {
                 if (src_has_nulls && ray_vec_is_null(orig_col, r)) {
@@ -15606,7 +15596,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         /* Copied rows must carry their null state across the rebuild —
          * mirror ray_insert_fn's copy loops (sentinel survives the raw
          * copy but RAY_ATTR_HAS_NULLS would otherwise be dropped). */
-        bool src_has_nulls = (orig_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool src_has_nulls = ray_vec_may_have_nulls(orig_col);
         if (ct == RAY_STR) {
             for (int64_t r = 0; r < nrows; r++) {
                 if (r == match_row && has_new_val) {
@@ -16639,7 +16629,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             if (agg_raw[a] || agg_ops[a] == OP_COUNT) continue;
             ray_t* src = agg_src_vecs[a];
             if (!src || right_nrows == 0) continue;
-            bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            bool has_nulls = ray_vec_may_have_nulls(src);
             if (has_nulls) {
                 sorted_nn[a] = (uint8_t*)scratch_alloc(&sorted_nn_hdr[a],
                                                         (size_t)right_nrows);

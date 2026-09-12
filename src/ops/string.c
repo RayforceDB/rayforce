@@ -1166,7 +1166,7 @@ static bool substr_scalar_arg(ray_t* v, int64_t* out) {
         default: return false;
         }
     }
-    if (!ray_is_vec(v) || v->len != 1 || (v->attrs & RAY_ATTR_HAS_NULLS))
+    if (!ray_is_vec(v) || v->len != 1 || ray_vec_may_have_nulls(v))
         return false;
     switch (v->type) {
     case RAY_I64:  *out = ((int64_t*)ray_data(v))[0]; return true;
@@ -1180,7 +1180,7 @@ static bool substr_scalar_arg(ray_t* v, int64_t* out) {
 }
 
 static ray_t* substr_str_scalar_view(ray_t* input, int64_t start, int64_t length) {
-    if (!input || input->type != RAY_STR || (input->attrs & RAY_ATTR_HAS_NULLS))
+    if (!input || input->type != RAY_STR)
         return NULL;
 
     int64_t nrows = input->len;
@@ -1240,7 +1240,7 @@ static ray_t* substr_str_scalar_view(ray_t* input, int64_t start, int64_t length
 
 static bool substr_len_at(ray_t* len_v, int64_t row, int64_t* out) {
     if (!len_v || !out) return false;
-    if (len_v->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(len_v)) {
         if (ray_vec_is_null(len_v, row)) return false;
     }
     switch (len_v->type) {
@@ -1264,8 +1264,7 @@ static bool substr_len_at(ray_t* len_v, int64_t row, int64_t* out) {
 static ray_t* substr_str_scalar_start_len_view(ray_t* input,
                                                int64_t start,
                                                ray_t* len_v) {
-    if (!input || input->type != RAY_STR || !len_v ||
-        (input->attrs & RAY_ATTR_HAS_NULLS))
+    if (!input || input->type != RAY_STR || !len_v)
         return NULL;
     if (len_v->type != RAY_I64 && len_v->type != RAY_I32)
         return NULL;
@@ -1340,7 +1339,7 @@ static ray_t* substr_str_scalar_start_len_view(ray_t* input,
 static bool substr_scalar_is_null(ray_t* v) {
     if (!v) return false;
     if (ray_is_atom(v)) return RAY_ATOM_IS_NULL(v);
-    if (ray_is_vec(v) && v->len == 1 && (v->attrs & RAY_ATTR_HAS_NULLS))
+    if (ray_is_vec(v) && v->len == 1 && ray_vec_may_have_nulls(v))
         return ray_vec_is_null(v, 0);
     return false;
 }

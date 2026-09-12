@@ -34,6 +34,7 @@
  * fused_group.h (ray_fused_group_supported).
  */
 
+#include "vec/vec.h"
 #include "ops/fused_group.h"  /* ray_fused_group_supported decl */
 #include "ops/fused_pred.h"
 #include "table/domain.h"     /* sym-domain resolution */
@@ -132,7 +133,7 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
  * and losing the fused path cost them ~70x for an identical result. */
 static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
     if (!col) return 0;
-    if (col->attrs & RAY_ATTR_HAS_NULLS)
+    if (ray_vec_may_have_nulls(col))
         return eq_or_ne && (col->type == RAY_SYM || col->type == RAY_STR);
     return 1;
 }
@@ -754,7 +755,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         int64_t nsv = ray_len(sv);
         int64_t out_n = 0;
         for (int64_t i = 0; i < nsv; i++) {
-            if ((sv->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(sv, i))
+            if (ray_vec_may_have_nulls(sv) && ray_vec_is_null(sv, i))
                 continue;
             switch (st) {
             case RAY_BOOL:

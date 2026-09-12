@@ -840,8 +840,8 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         if (!then_scalar && !else_scalar &&
             then_v->type == RAY_STR && else_v->type == RAY_STR &&
             len <= then_v->len && len <= else_v->len &&
-            !(then_v->attrs & RAY_ATTR_HAS_NULLS) &&
-            !(else_v->attrs & RAY_ATTR_HAS_NULLS)) {
+            !ray_vec_may_have_nulls(then_v) &&
+            !ray_vec_may_have_nulls(else_v)) {
             ray_t* then_pool = str_vec_pool_obj(then_v);
             ray_t* else_pool = str_vec_pool_obj(else_v);
             if (then_pool == else_pool || !then_pool || !else_pool) {

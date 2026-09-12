@@ -49,7 +49,7 @@ static int join_store_key_cell(ray_t* dst, int64_t dst_row,
                                ray_t* src, int64_t src_row) {
     if (!dst || !src || dst_row < 0 || src_row < 0) return -1;
 
-    if ((src->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(src, src_row)) {
+    if (ray_vec_may_have_nulls(src) && ray_vec_is_null(src, src_row)) {
         ray_vec_set_null(dst, dst_row, true);
         return 0;
     }
@@ -1205,7 +1205,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
         {
             bool any_nullable = false;
             for (uint32_t k = 0; k < n_keys && !any_nullable; k++)
-                if (build_keys[k] && (build_keys[k]->attrs & RAY_ATTR_HAS_NULLS))
+                if (build_keys[k] && ray_vec_may_have_nulls(build_keys[k]))
                     any_nullable = true;
             if (any_nullable) {
                 int64_t null_rows = 0;
@@ -3506,17 +3506,17 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
     }
     if (left_n > 0) memset(lt_null, 0, (size_t)left_n);
     if (right_n > 0) memset(rt_null, 0, (size_t)right_n);
-    if (lt_time_vec->attrs & RAY_ATTR_HAS_NULLS)
+    if (ray_vec_may_have_nulls(lt_time_vec))
         for (int64_t i = 0; i < left_n; i++)
             if (ray_vec_is_null(lt_time_vec, i)) lt_null[i] = 1;
-    if (rt_time_vec->attrs & RAY_ATTR_HAS_NULLS)
+    if (ray_vec_may_have_nulls(rt_time_vec))
         for (int64_t i = 0; i < right_n; i++)
             if (ray_vec_is_null(rt_time_vec, i)) rt_null[i] = 1;
     for (uint32_t k = 0; k < n_eq; k++) {
-        if (lt_eq[k]->attrs & RAY_ATTR_HAS_NULLS)
+        if (ray_vec_may_have_nulls(lt_eq[k]))
             for (int64_t i = 0; i < left_n; i++)
                 if (ray_vec_is_null(lt_eq[k], i)) lt_null[i] = 1;
-        if (rt_eq[k]->attrs & RAY_ATTR_HAS_NULLS)
+        if (ray_vec_may_have_nulls(rt_eq[k]))
             for (int64_t i = 0; i < right_n; i++)
                 if (ray_vec_is_null(rt_eq[k], i)) rt_null[i] = 1;
     }
@@ -3550,9 +3550,9 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
      * key answers groups with no right pass at all).  Falls back to the
      * sort-merge when the per-group right-time monotonicity precondition
      * fails. */
-    bool rt_no_nulls = !(rt_time_vec->attrs & RAY_ATTR_HAS_NULLS);
+    bool rt_no_nulls = !ray_vec_may_have_nulls(rt_time_vec);
     for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
-        if (rt_eq[k]->attrs & RAY_ATTR_HAS_NULLS) rt_no_nulls = false;
+        if (ray_vec_may_have_nulls(rt_eq[k])) rt_no_nulls = false;
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
@@ -3603,14 +3603,14 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
     bool l_presorted = !eq_xdomain
         && ((n_eq == 0 && ray_attr_is_sorted(lt_time_vec))
         || (n_eq == 1
-            && !(lt_time_vec->attrs & RAY_ATTR_HAS_NULLS)
+            && !ray_vec_may_have_nulls(lt_time_vec)
             && ray_index_kind(lt_eq[0]) == RAY_IDX_PART
             /* reject a stale part index (parent length changed since build) */
             && ray_index_payload(lt_eq[0]->index)->built_for_len == lt_eq[0]->len
             && asof_time_sorted_within_parts(lt_eq[0], lt_time)));
     bool r_presorted = (n_eq == 0 && ray_attr_is_sorted(rt_time_vec))
         || (n_eq == 1
-            && !(rt_time_vec->attrs & RAY_ATTR_HAS_NULLS)
+            && !ray_vec_may_have_nulls(rt_time_vec)
             && ray_index_kind(rt_eq[0]) == RAY_IDX_PART
             /* reject a stale part index (parent length changed since build) */
             && ray_index_payload(rt_eq[0]->index)->built_for_len == rt_eq[0]->len

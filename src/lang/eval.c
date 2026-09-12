@@ -226,7 +226,7 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         *handled = 0;
         return NULL;
     }
-    if (vec->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(vec)) {
         ray_release(vec);
         *handled = 0;
         return NULL;
@@ -1145,9 +1145,9 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
          dag_opcode == OP_LT || dag_opcode == OP_LE ||
          dag_opcode == OP_GT || dag_opcode == OP_GE)) {
         int l_str_vec = left_coll  && ray_is_vec(left)  && left->type  == RAY_STR &&
-                        !(left->attrs & RAY_ATTR_HAS_NULLS);
+                        !ray_vec_may_have_nulls(left);
         int r_str_vec = right_coll && ray_is_vec(right) && right->type == RAY_STR &&
-                        !(right->attrs & RAY_ATTR_HAS_NULLS);
+                        !ray_vec_may_have_nulls(right);
         int l_str_atom = !left_coll  && left  && left->type  == -RAY_STR &&
                          !RAY_ATOM_IS_NULL(left);
         int r_str_atom = !right_coll && right && right->type == -RAY_STR &&
@@ -1503,9 +1503,7 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     int8_t type = vec->type;
 
     /* Check nulls once — resolve through slices */
-    bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) ||
-                     ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
-                      (vec->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+    bool has_nulls = ray_vec_may_have_nulls(vec);
 
     if (type == RAY_STR) {
         ray_t* result = ray_vec_new(type, n);

@@ -33,6 +33,30 @@
  */
 
 #include <rayforce.h>
+#include "mem/heap.h"
+
+/* Conservative null-check gate, not an exact count of nulls. SYM/STR encode
+ * null as id 0 / length 0 independently of metadata, including old persisted
+ * columns and raw gathers. Other vectors retain their HAS_NULLS fast path.
+ * Resolve slices here so callers never interpret their view attrs as proof
+ * that the underlying payload is null-free. */
+static inline bool ray_vec_may_have_nulls(const ray_t* v) {
+    if (!v) return false;
+    if (v->type == RAY_SYM || v->type == RAY_STR) return true;
+    while ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent)
+        v = v->slice_parent;
+    return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
+}
+
+/* Exact admission check for optimizations which require null-free input.
+ * Text columns cannot prove that from attrs; inspect their payload instead.
+ * Keep this out of per-row loops (use may_have_nulls + is_null there). */
+static inline bool ray_vec_has_nulls(const ray_t* v) {
+    if (!ray_vec_may_have_nulls(v)) return false;
+    for (int64_t i = 0; i < v->len; i++)
+        if (ray_vec_is_null((ray_t*)v, i)) return true;
+    return false;
+}
 
 /* Copy null bits from src to dst (sentinel-based). dst and src must have
  * the same length. Internal helper. */

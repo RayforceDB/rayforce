@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "vec/vec.h"
 #include "idiom.h"
 #include "opt.h"
 #include "mem/sys.h"
@@ -127,14 +128,14 @@ static bool pre_no_nulls_on_asc_input(ray_graph_t* g, ray_op_t* node) {
         ray_t* lit = ext->literal;
         /* Only safe to rewrite if the literal is a vector with no nulls. */
         if (!ray_is_vec(lit)) return false;
-        return !(lit->attrs & RAY_ATTR_HAS_NULLS);
+        return !ray_vec_may_have_nulls(lit);
     }
 
     if (src->opcode == OP_SCAN) {
         ray_t* col = scan_source_col(g, src);
         if (!col) return false;
         if (!ray_is_vec(col) && !RAY_IS_PARTED(col->type)) return false;
-        return !(col->attrs & RAY_ATTR_HAS_NULLS);
+        return !ray_vec_may_have_nulls(col);
     }
 
     return false;

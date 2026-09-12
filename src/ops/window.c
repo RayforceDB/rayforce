@@ -988,7 +988,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 uint8_t key_nbytes = radix_key_bytes(sort_vecs[0]->type);
                 /* Narrow-int + has_nulls uses a +1-shifted encoding —
                  * keep the radix pass aligned with the wider key. */
-                if ((sort_vecs[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                if (ray_vec_may_have_nulls(sort_vecs[0]) &&
                     (sort_vecs[0]->type == RAY_BOOL ||
                      sort_vecs[0]->type == RAY_U8 ||
                      sort_vecs[0]->type == RAY_I16) &&

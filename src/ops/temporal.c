@@ -307,9 +307,7 @@ ray_t* ray_temporal_extract(ray_t* input, int field) {
     /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
      * themselves, so inspect the parent when input is a slice. */
     bool src_has_nulls =
-        (input->attrs & RAY_ATTR_HAS_NULLS) ||
-        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
-         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+        ray_vec_may_have_nulls(input);
     /* src_has_nulls and the 32-/64-bit element dispatch are hoisted into the
      * context so the inner body is a tight typed kernel with no per-element
      * branches; the row range is chunked over the pool for large columns. */
@@ -414,9 +412,7 @@ ray_t* ray_temporal_truncate(ray_t* input, int kind) {
     /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
      * themselves, so inspect the parent when input is a slice. */
     bool src_has_nulls =
-        (input->attrs & RAY_ATTR_HAS_NULLS) ||
-        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
-         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+        ray_vec_may_have_nulls(input);
     const char* base = (const char*)ray_data(input);
     int64_t bucket = (kind == RAY_EXTRACT_DAY)
         ? RTE_USEC_PER_DAY
@@ -614,9 +610,7 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
     /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
      * themselves, so inspect the parent when input is a slice. */
     bool src_has_nulls =
-        (input->attrs & RAY_ATTR_HAS_NULLS) ||
-        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
-         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+        ray_vec_may_have_nulls(input);
 
     /* Preserve ray_morsel_init's one-time sequential-readahead hint for
      * mmap'd columns.  The per-worker ray_morsel_init_range deliberately
@@ -832,9 +826,7 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
     /* Slice-aware HAS_NULLS check: slices don't carry HAS_NULLS on
      * themselves, so inspect the parent when input is a slice. */
     bool src_has_nulls =
-        (input->attrs & RAY_ATTR_HAS_NULLS) ||
-        ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
-         (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+        ray_vec_may_have_nulls(input);
 
     /* Preserve ray_morsel_init's one-time sequential-readahead hint for
      * mmap'd columns.  The per-worker ray_morsel_init_range deliberately

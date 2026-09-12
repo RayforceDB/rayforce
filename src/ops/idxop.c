@@ -102,7 +102,7 @@ static uint64_t numeric_key_word(const uint8_t* base, int8_t type, int64_t i) {
 static bool vec_is_ascending(const ray_t* v) {
     int64_t n = v->len;
     if (n < 2) return true;
-    if (v->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(v)) {
         for (int64_t i = 0; i < n; i++)
             if (ray_vec_is_null((ray_t*)v, i)) return false;
     }
@@ -1205,7 +1205,9 @@ static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
  * (The pre-existing hash-eq probe keeps bare idx_fresh: its builder
  * skips null rows, making null-bearing probes structurally correct.) */
 static bool idx_fresh_nonull(ray_t* col, ray_idx_kind_t kind) {
-    return idx_fresh(col, kind) && !(col->attrs & RAY_ATTR_HAS_NULLS);
+    return idx_fresh(col, kind) &&
+        ((col->type == RAY_SYM && kind == RAY_IDX_PART) ||
+         !ray_vec_may_have_nulls(col));
 }
 
 /* --------------------------------------------------------------------------
@@ -1944,7 +1946,7 @@ ray_t* ray_index_range_rowsel(ray_t* col, uint16_t cmp_op,
 ray_t* ray_sorted_range_rowsel(ray_t* col, uint16_t cmp_op,
                                int64_t key_i, double key_f, bool is_float) {
     if (!col || RAY_IS_ERR(col) || cmp_op == OP_NE) return NULL;
-    if (!ray_attr_is_sorted(col) || (col->attrs & RAY_ATTR_HAS_NULLS))
+    if (!ray_attr_is_sorted(col) || ray_vec_may_have_nulls(col))
         return NULL;
 
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
@@ -2237,7 +2239,7 @@ ray_t* ray_index_attach_part(ray_t** vp) {
 
     if (v->type != RAY_SYM && !vec_is_ascending(v))
         return ray_error("domain", "parted: column is not laid out as ascending value-blocks");
-    if (v->type == RAY_SYM && (v->attrs & RAY_ATTR_HAS_NULLS)) {
+    if (v->type == RAY_SYM && ray_vec_may_have_nulls(v)) {
         for (int64_t i = 0; i < n; i++)
             if (ray_vec_is_null(v, i))
                 return ray_error("domain", "parted: column contains nulls");
