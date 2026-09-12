@@ -18140,3 +18140,214 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     ray_release(left); ray_release(right); ray_release(keys_vec);
     return r;
 }
+
+
+/* ══════════════════════════════════════════
+ * delete — remove the rows a predicate matches
+ * ══════════════════════════════════════════ */
+
+
+/* Move the survivors down over the deleted rows.  Every column type stores a
+ * fixed-width element — a RAY_STR cell is a 16-byte descriptor and the pool it
+ * points into does not move with the row — so this is a memmove of the runs
+ * between deletions, not a per-cell copy.  A boxed column releases the cells
+ * it drops first.  Row order is preserved, so RAY_ATTR_SORTED stays true;
+ * an attached accelerator index does not, and is dropped. */
+static ray_t* delete_compact_cols(ray_t** slots, int64_t ncols, int64_t nrows,
+                                  const int64_t* rows, int64_t k) {
+    for (int64_t c = 0; c < ncols; c++) {
+        if (slots[c]->attrs & RAY_ATTR_HAS_INDEX) {
+            ray_t* drop_r = ray_index_drop(&slots[c]);
+            if (RAY_IS_ERR(drop_r)) return drop_r;
+        }
+        ray_t* col = slots[c];
+        size_t esz = (col->type == RAY_LIST) ? sizeof(ray_t*)
+                                             : ray_sym_elem_size(col->type, col->attrs);
+        uint8_t* d = (uint8_t*)ray_data(col);
+        if (col->type == RAY_LIST) {
+            ray_t** cells = (ray_t**)d;
+            for (int64_t i = 0; i < k; i++)
+                if (cells[rows[i]]) ray_release(cells[rows[i]]);
+        }
+        int64_t dst = rows[0];
+        for (int64_t i = 0; i < k; i++) {
+            int64_t src = rows[i] + 1;
+            int64_t end = (i + 1 < k) ? rows[i + 1] : nrows;
+            int64_t cnt = end - src;
+            if (cnt > 0) {
+                memmove(d + (size_t)dst * esz, d + (size_t)src * esz, (size_t)cnt * esz);
+                dst += cnt;
+            }
+        }
+        col->len = nrows - k;
+    }
+    return NULL;
+}
+
+/* Compaction moves a surviving row from r to r - (deletions before r) and
+ * changes no key, so every entry keeps its bucket and only the row number it
+ * stores has to shift: one pass over the slot array, no hashing and no key
+ * reads.  Entries naming a deleted row become tombstones.
+ *
+ * Patching costs that one pass whatever k is, while rebuilding costs a hash
+ * per survivor — so a large deletion is handed to the next upsert instead,
+ * which also reclaims the tombstones a patch would leave behind. */
+static void ukey_patch_after_delete(ray_t* tbl, const int64_t* rows, int64_t k,
+                                    int64_t nrows0) {
+    ray_index_t* ix = ray_table_ukey_get(tbl);
+    if (!ix) return;
+    int64_t left = nrows0 - k;
+    if (ix->u.ukey.nrows != nrows0 || k * 2 >= nrows0 ||
+        (uint64_t)(nrows0 + ix->u.ukey.n_tomb) * 2 > ix->u.ukey.mask + 1) {
+        ray_table_ukey_drop(tbl);
+        return;
+    }
+    /* Old row -> new row, or -1 for a deleted one, built in one pass.  Asking
+     * a binary search per slot instead cost log(k) on every slot of the
+     * capacity and dominated the patch; this is O(1) per slot. */
+    ray_t* nr_hdr = NULL;
+    int64_t* newrow = (int64_t*)scratch_alloc(&nr_hdr, (size_t)nrows0 * sizeof(int64_t));
+    if (!newrow) { ray_table_ukey_drop(tbl); return; }
+    for (int64_t r = 0, next = 0, ri = 0; r < nrows0; r++) {
+        if (ri < k && rows[ri] == r) { newrow[r] = -1; ri++; }
+        else newrow[r] = next++;
+    }
+
+    int64_t* slot = (int64_t*)ray_data(ix->u.ukey.slots);
+    uint64_t cap = ix->u.ukey.mask + 1;
+    int64_t tomb = 0;
+    for (uint64_t s = 0; s < cap; s++) {
+        int64_t e = slot[s];
+        if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
+        int64_t nr = newrow[e - 1];
+        if (nr < 0) { slot[s] = UKEY_SLOT_TOMB; tomb++; }
+        else slot[s] = nr + 1;
+    }
+    scratch_free(nr_hdr);
+    ix->u.ukey.n_tomb += tomb;
+    ix->u.ukey.nrows = left;
+}
+
+ray_t* ray_delete_fn(ray_t** args, int64_t n) {
+    return ray_delete(args, n);
+}
+
+/* (delete {from: t where: <pred>}) — remove the rows the predicate matches.
+ *
+ * `from: 't` (a quoted symbol) removes them from the named table in place,
+ * keeping its upsert key map; `from: t` returns a new table without them.
+ * Both forms evaluate the predicate once and compact the same matched-row
+ * list with the same code, so they cannot disagree about which rows go.  The
+ * functional form is deliberately NOT `select` over a negated predicate: that
+ * would be a second expression to keep in step with this one. */
+ray_t* ray_delete(ray_t** args, int64_t n) {
+    if (n < 1) return ray_error("arity", "delete: expects a query dict, got %lld args", (long long)n);
+    ray_t* dict = args[0];
+    if (!dict || dict->type != RAY_DICT)
+        return ray_error("type", "delete: query must be a dict, got %s", dict ? ray_type_name(dict->type) : "null");
+
+    ray_t* from_expr = dict_get(dict, "from");
+    if (!from_expr) return ray_error("domain", "delete: missing `from:` clause");
+    ray_t* where_expr = dict_get(dict, "where");
+    /* A delete with no predicate would empty the table, which is too easy to
+     * reach by leaving a clause out.  Say so instead. */
+    if (!where_expr) return ray_error("domain", "delete: missing `where:` clause");
+    if (dict_get(dict, "by")) return ray_error("domain", "delete: `by:` is not supported");
+
+    int64_t inplace_sym = -1;
+    ray_t* tbl = ray_eval(from_expr);
+    if (RAY_IS_ERR(tbl)) return tbl;
+    if (tbl->type == -RAY_SYM) {
+        inplace_sym = tbl->i64;
+        ray_release(tbl);
+        tbl = ray_env_get(inplace_sym);
+        if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "delete: `from:` symbol is unbound");
+        ray_retain(tbl);
+    }
+    if (tbl->type != RAY_TABLE) {
+        int8_t t = tbl->type; ray_release(tbl);
+        return ray_error("type", "delete: `from:` must be a table, got %s", ray_type_name(t));
+    }
+
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t nrows0 = ray_table_nrows(tbl);
+    if (ncols <= 0) { ray_release(tbl); return ray_error("domain", "delete: table has no columns"); }
+
+    /* Decide in-place BEFORE evaluating the predicate.  The predicate machinery
+     * binds the table's columns into a query scope (and builds a graph over
+     * the table), so reference counts are only quiet enough to read here. */
+    bool inplace = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
+                   !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    ray_t* live_cols = NULL;
+    if (inplace) {
+        live_cols = ((ray_t**)ray_data(tbl))[1];
+        if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols) inplace = false;
+    }
+    for (int64_t c = 0; inplace && c < ncols; c++) {
+        ray_t* col = ((ray_t**)ray_data(live_cols))[c];
+        if (col->rc != 1 || !upsert_col_ok(col)) inplace = false;
+    }
+
+    /* Matched rows, ascending — the same two paths the in-place where-update
+     * uses, so an indexed equality predicate is answered by the index here
+     * too. */
+    ray_t* rows_hdr = NULL; int64_t* rows = NULL; int64_t k = 0;
+    ray_t* err = NULL;
+    if (!update_where_index_rows(tbl, where_expr, &rows_hdr, &rows, &k)) {
+        ray_t* mask = update_where_mask_vec(tbl, where_expr);
+        if (RAY_IS_ERR(mask)) { ray_release(tbl); return mask; }
+        int64_t mlen = mask->len;
+        const uint8_t* m = (const uint8_t*)ray_data(mask);
+        int64_t cnt = 0;
+        for (int64_t r = 0; r < mlen; r++) cnt += (m[r] != 0);
+        rows = (int64_t*)scratch_alloc(&rows_hdr, (size_t)(cnt > 0 ? cnt : 1) * sizeof(int64_t));
+        if (!rows) err = ray_error("oom", NULL);
+        else for (int64_t r = 0; r < mlen; r++) if (m[r]) rows[k++] = r;
+        ray_release(mask);
+        if (err) { ray_release(tbl); return err; }
+    }
+
+    /* Nothing matched: the in-place form leaves the binding and its map
+     * untouched, the functional form answers with the table as it stands. */
+    if (k == 0) {
+        if (rows_hdr) scratch_free(rows_hdr);
+        if (inplace_sym >= 0) { ray_release(tbl); return ray_sym(inplace_sym); }
+        return tbl;
+    }
+
+    if (inplace) {
+        ray_t** slots = (ray_t**)ray_data(live_cols);
+        ray_t* cerr = delete_compact_cols(slots, ncols, nrows0, rows, k);
+        if (cerr) { scratch_free(rows_hdr); ray_release(tbl); return cerr; }
+        ukey_patch_after_delete(tbl, rows, k, nrows0);
+        scratch_free(rows_hdr);
+        ray_release(tbl);
+        return ray_sym(inplace_sym);
+    }
+
+    /* Functional form (and the fallback when a gate misses): private copies of
+     * the columns, then the same compaction.  A fresh table carries no key
+     * map, which is correct — it describes rows this one does not have. */
+    ray_t* work = ray_table_new(ncols);
+    if (!work || RAY_IS_ERR(work)) {
+        scratch_free(rows_hdr); ray_release(tbl);
+        return work ? work : ray_error("oom", NULL);
+    }
+    for (int64_t c = 0; c < ncols && !err; c++) {
+        ray_t* orig = ray_table_get_col_idx(tbl, c);
+        ray_retain(orig);
+        ray_t* cp = ray_cow(orig);
+        if (!cp || RAY_IS_ERR(cp)) { ray_release(orig); err = cp ? cp : ray_error("oom", NULL); break; }
+        work = ray_table_add_col(work, ray_table_col_name(tbl, c), cp);
+        ray_release(cp);
+        if (!work || RAY_IS_ERR(work)) { err = work ? work : ray_error("oom", NULL); work = NULL; }
+    }
+    if (!err) {
+        ray_t** wslots = (ray_t**)ray_data(((ray_t**)ray_data(work))[1]);
+        err = delete_compact_cols(wslots, ncols, nrows0, rows, k);
+    }
+    scratch_free(rows_hdr);
+    ray_release(tbl);
+    if (err) { if (work) ray_release(work); return err; }
+    return work;
+}

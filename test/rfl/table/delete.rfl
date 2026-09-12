@@ -1,0 +1,101 @@
+;; delete.rfl — (delete {from: … where: …}) removes the rows a predicate
+;; matches.  `from: 't` amends the named table in place and keeps its upsert
+;; key map; `from: t` answers with a new table.  Both forms evaluate the
+;; predicate once and compact the same matched-row list, so they cannot
+;; disagree about which rows go.
+;;
+;; NOTE ON THE TESTS: every in-place case below builds its columns with `til`
+;; or arithmetic, never from a literal vector.  A literal is held by the parse
+;; tree, so a table built from one has columns at rc 2 and the in-place gate
+;; declines — a literal-built table would quietly test the copying fallback
+;; instead.  The same is true of upsert's in-place path.
+
+;; ── functional form: a new table, the original untouched ────────────────
+(set dt (table [k v] (list (til 5) (* 10 (til 5)))))
+(set dr (delete {from: dt where: (== k 2)}))
+(at dr 'k) -- [0 1 3 4]
+(at dr 'v) -- [0 10 30 40]
+(at dt 'k) -- [0 1 2 3 4]
+(count dt) -- 5
+
+;; ── in-place form: the binding shrinks, the verb answers with the symbol ─
+(set du (table [k v] (list (til 5) (* 10 (til 5)))))
+(delete {from: 'du where: (> k 2)}) -- 'du
+(at du 'k) -- [0 1 2]
+(at du 'v) -- [0 10 20]
+(count du) -- 3
+
+;; a leading run, a trailing run and an interior one all compact correctly
+(set dl (table [k] (list (til 8))))
+(delete {from: 'dl where: (in k [0 1 4 7])})
+(at dl 'k) -- [2 3 5 6]
+
+;; ── no match leaves everything alone ────────────────────────────────────
+(set dn (table [k] (list (til 3))))
+(delete {from: 'dn where: (== k 99)}) -- 'dn
+(at dn 'k) -- [0 1 2]
+(count dn) -- 3
+
+;; ── every row can go ────────────────────────────────────────────────────
+(set da (table [k] (list (til 4))))
+(delete {from: 'da where: (>= k 0)})
+(count da) -- 0
+
+;; ── row order survives, so a sorted column stays sorted ─────────────────
+(set ds (table [k] (list (til 6))))
+(delete {from: 'ds where: (== k 3)})
+(at ds 'k) -- [0 1 2 4 5]
+(asc (at ds 'k)) -- [0 1 2 4 5]
+
+;; ── a string column: descriptors move, the pool they point into does not ─
+(set dstr (table [k s] (list (til 4) (map (fn [i] (concat "row" (as 'str i))) (til 4)))))
+(delete {from: 'dstr where: (in k [1 2])})
+(at dstr 'k) -- [0 3]
+(format "%s" (at dstr 's)) -- "[\"row0\" \"row3\"]s"
+
+;; ── a symbol column ─────────────────────────────────────────────────────
+(set dsym (table [k s] (list (til 4) (as 'SYM (til 4)))))
+(delete {from: 'dsym where: (== k 2)})
+(at dsym 'k) -- [0 1 3]
+(format "%s" (at dsym 's)) -- "[0 1 3]s"
+
+;; ── the key map survives the delete: this is the point of doing it here ──
+;; A batch upsert builds the map, the delete patches it, and the next batch
+;; has to place both a surviving key (an update) and a deleted one (an append)
+;; correctly.  Against a map left describing the pre-delete rows, the
+;; surviving keys point at the wrong rows and the deleted ones look present.
+(set dm (table [k v] (list (take [0] 0) (take [0] 0))))
+(upsert 'dm 1 (table [k v] (list (til 10) (* 10 (til 10)))))
+(count dm) -- 10
+(delete {from: 'dm where: (in k [3 7])})
+(count dm) -- 8
+(at dm 'k) -- [0 1 2 4 5 6 8 9]
+(upsert 'dm 1 (table [k v] (list [5 3] [555 333])))
+(count dm) -- 9
+(at (at dm 'v) 4) -- 555
+(at (at dm 'k) 8) -- 3
+(at (at dm 'v) 8) -- 333
+
+;; ── tombstones and probe chains at a size where collisions are certain ──
+;; 200 keys, every third deleted, then all 200 upserted back: the survivors
+;; must be found as updates and the deleted ones appended exactly once.  A
+;; cleared slot instead of a tombstone would truncate the chain it sits in and
+;; the keys displaced past it would be appended a second time.
+(set dc (table [k v] (list (take [0] 0) (take [0] 0))))
+(upsert 'dc 1 (table [k v] (list (til 200) (take [1] 200))))
+(count dc) -- 200
+(delete {from: 'dc where: (== 0 (% k 3))})
+(count dc) -- 133
+(upsert 'dc 1 (table [k v] (list (til 200) (take [2] 200))))
+(count dc) -- 200
+(sum (at dc 'v)) -- 400
+(count (distinct (at dc 'k))) -- 200
+
+;; ── errors ──────────────────────────────────────────────────────────────
+(set de (table [k] (list (til 3))))
+(delete {from: de}) !- domain
+(delete {from: de where: (== k 1) by: k}) !- domain
+(delete {where: (== k 1)}) !- domain
+(delete {from: 'no_such_table_for_delete where: (== k 1)}) !- domain
+(delete {from: 42 where: (== k 1)}) !- type
+(delete de) !- type
