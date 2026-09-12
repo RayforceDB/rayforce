@@ -11849,6 +11849,23 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     }
     *handled = true;
 
+    /* Only a write into a key column can invalidate upsert's key map, and
+     * that is the one mutation its recorded row count cannot see: a cell
+     * rewrite leaves the count alone.  An update of any other column leaves
+     * the mapping exactly as it was — dropping it there would send the next
+     * batch back to rebuilding over every row for nothing.  ucol[0..nu) is
+     * the complete set of columns this path writes. */
+    {
+        ray_index_t* kix = ray_table_ukey_get(tbl);
+        if (kix) {
+            bool hits_key = false;
+            for (int64_t i = 0; i < nu && !hits_key; i++)
+                for (int64_t kk = 0; kk < kix->u.ukey.nk; kk++)
+                    if (kix->u.ukey.kci[kk] == (int32_t)ucol[i]) { hits_key = true; break; }
+            if (hits_key) ray_table_ukey_drop(tbl);
+        }
+    }
+
     /* Matched rows: index probe, else the legacy mask. */
     ray_t* rows_hdr = NULL; int64_t* rows = NULL; int64_t k = 0;
     ray_t* err = NULL;
@@ -13952,6 +13969,10 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
 
 /* (insert table (list val1 val2 ...)) — append a row to a table
  * (insert parted partition-key rows) — grow the explicit live tail */
+/* Defined with the rest of the upsert key-map helpers below; the in-place
+ * insert arm needs it here. */
+static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0);
+
 ray_t* ray_insert_fn(ray_t** args, int64_t n) {
     return ray_insert(args, n);
 }
@@ -14503,6 +14524,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 }
                 col->len = nrows;
             }
+        } else {
+            /* insert appends without consulting keys, and in ascending row
+             * order, so the map's "duplicates answer lowest row first"
+             * invariant survives entering the new rows as they landed. */
+            ukey_extend_after_append(tbl, nrows);
         }
         if (dict_vals) {
             ray_t** dv = (ray_t**)ray_data(dict_vals);
@@ -14825,6 +14851,44 @@ static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     mp->slot[s] = row + 1;
 }
 
+/* Rows nrows0..n-1 were just appended in row order.  Entering them costs
+ * what the append already cost, and it keeps the map describing the table:
+ * left behind, it sends the next upsert back to rebuilding over every row,
+ * which is the whole cost this map exists to avoid.  A map that cannot take
+ * them is dropped rather than left naming a shorter table. */
+static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
+    ray_index_t* ix = ray_table_ukey_get(tbl);
+    if (!ix) return;
+    int64_t n = ray_table_nrows(tbl);
+    if (ix->u.ukey.nrows != nrows0 || n < nrows0 ||
+        (uint64_t)n * 2 > ix->u.ukey.mask + 1) {
+        ray_table_ukey_drop(tbl);
+        return;
+    }
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    if (!cols || RAY_IS_ERR(cols)) { ray_table_ukey_drop(tbl); return; }
+    ray_t** slots = (ray_t**)ray_data(cols);
+    int64_t kci[RAY_UKEY_MAX_COLS];
+    int64_t nk = ix->u.ukey.nk;
+    for (int64_t k = 0; k < nk; k++) kci[k] = ix->u.ukey.kci[k];
+    upsert_map_t map = { NULL, (int64_t*)ray_data(ix->u.ukey.slots), ix->u.ukey.mask };
+    for (int64_t r = nrows0; r < n; r++)
+        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+    ix->u.ukey.nrows = n;
+}
+
+/* Does this table-resident map still describe the table, and can it take
+ * `m` more rows at the load factor it was sized for?  A row count that moved
+ * without the map means something else wrote the table; a different key
+ * means a different upsert. */
+static bool ukey_fits(ray_index_t* ix, const int64_t* kci, int64_t nk,
+                      int64_t nrows0, int64_t m) {
+    if (ix->u.ukey.nrows != nrows0 || ix->u.ukey.nk != nk) return false;
+    for (int64_t k = 0; k < nk; k++)
+        if (ix->u.ukey.kci[k] != (int32_t)kci[k]) return false;
+    return (uint64_t)(nrows0 + m) * 2 <= ix->u.ukey.mask + 1;
+}
+
 static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
                                const int64_t* kci, int64_t nk, ray_t** cells) {
     uint64_t s = h & mp->mask;
@@ -15022,6 +15086,7 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
 
     ray_t* err = NULL;
     upsert_map_t map = { NULL, NULL, 0 };
+    ray_index_t* ukey = NULL;   /* table-resident map, borrowed from tbl */
     ray_t* work = NULL;
 
     if (src_cols) {
@@ -15093,10 +15158,55 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         }
     }
 
-    if (!err && m > 1) {
-        if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
-        for (int64_t r = 0; r < nrows0 && !err; r++)
-            upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+    /* The key->row map is what a bulk upsert actually costs.  Built over every
+     * existing row on entry and freed on exit, it made a sequence of batches
+     * quadratic in the table size: the profile of a growing table is almost
+     * entirely hashing rows that were already there.  When the table is a
+     * named binding mutated in place its object identity survives between
+     * calls, so the map lives on the table and is carried across them; the
+     * per-call cost becomes the batch, not the table.
+     *
+     * This covers a single-row upsert too, which otherwise scans the table
+     * for its one key.  It matters less for the scan it saves than for the
+     * map it keeps honest: a single row appended outside the map moves the
+     * row count, and the next batch then finds the map stale and rebuilds
+     * it over everything — one interleaved row per batch was enough to put
+     * the whole quadratic back. */
+    if (!err) {
+        if (inplace && nk <= RAY_UKEY_MAX_COLS) {
+            ukey = ray_table_ukey_get(tbl);
+            if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
+                ray_table_ukey_drop(tbl);
+                ukey = NULL;
+            }
+            if (!ukey) {
+                ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
+                if (idx && !RAY_IS_ERR(idx)) {
+                    if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
+                    else ray_release(idx);
+                }
+                /* A map we could not build or attach is not an error: fall
+                 * through to the scratch one and answer at the old cost. */
+                if (ukey) {
+                    map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                    map.mask = ukey->u.ukey.mask;
+                    for (int64_t r = 0; r < nrows0 && !err; r++)
+                        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+                    ukey->u.ukey.nrows = nrows0;
+                }
+            } else {
+                map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                map.mask = ukey->u.ukey.mask;
+            }
+        }
+        /* Without a table to hang it on, a map is only worth building for a
+         * batch: for one row it costs the scan it would replace and is then
+         * thrown away.  A single row keeps the scan. */
+        if (!ukey && !err && m > 1) {
+            if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
+            for (int64_t r = 0; r < nrows0 && !err; r++)
+                upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+        }
     }
 
     int64_t nrows = nrows0;
@@ -15128,6 +15238,14 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     }
 
     if (err && slots) upsert_rollback_appends(slots, ncols, nrows0);
+
+    /* A rolled-back batch leaves the map naming rows that no longer exist and
+     * a half-built one names nothing, so a failed call must not leave it on
+     * the table.  A successful one records the row count it now describes. */
+    if (ukey) {
+        if (err) { ray_table_ukey_drop(tbl); ukey = NULL; }
+        else ukey->u.ukey.nrows = nrows;
+    }
 
     if (map.hdr) scratch_free(map.hdr);
     for (size_t i = 0; i < ncell; i++) if (owned[i] && cells[i]) ray_release(cells[i]);
