@@ -197,8 +197,19 @@ typedef struct {
             ray_t*   slots;     /* RAY_I64 vec, mask+1 entries */
             uint64_t mask;      /* capacity - 1 (capacity is a power of two) */
             int64_t  nrows;
+            /* Slots vacated by a deleted row.  They are not free: clearing a
+             * slot in the middle of a probe chain would orphan whatever was
+             * displaced past it, so a deleted entry becomes UKEY_SLOT_TOMB and
+             * probing walks over it.  Counted because a tombstone occupies a
+             * slot without being a row, and a capacity test that ignored them
+             * would let the array fill completely — at which point the
+             * free-slot scan in upsert_map_put would not terminate. */
+            int64_t  n_tomb;
             int64_t  nk;        /* number of key columns */
-            int32_t  kci[RAY_UKEY_MAX_COLS];  /* key column positions */
+            /* Column positions.  int16 keeps this arm inside the hash arm's
+             * 64 bytes now that n_tomb shares it; a table with more than
+             * INT16_MAX columns simply gets no map. */
+            int16_t  kci[RAY_UKEY_MAX_COLS];
         } ukey;
     } u;
 } ray_index_t;

@@ -11871,7 +11871,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
             bool hits_key = false;
             for (int64_t i = 0; i < nu && !hits_key; i++)
                 for (int64_t kk = 0; kk < kix->u.ukey.nk; kk++)
-                    if (kix->u.ukey.kci[kk] == (int32_t)ucol[i]) { hits_key = true; break; }
+                    if (kix->u.ukey.kci[kk] == (int16_t)ucol[i]) { hits_key = true; break; }
             if (hits_key) ray_table_ukey_drop(tbl);
         }
     }
@@ -14845,6 +14845,13 @@ typedef struct {
     uint64_t mask;
 } upsert_map_t;
 
+/* Slot encoding.  An occupied slot holds row + 1, so it is always >= 1 and
+ * the whole negative range is free for markers.  A deleted entry becomes a
+ * tombstone rather than being cleared: a hole in the middle of a probe chain
+ * would end the walk early and orphan every entry displaced past it. */
+#define UKEY_SLOT_EMPTY ((int64_t)0)
+#define UKEY_SLOT_TOMB  ((int64_t)-1)
+
 static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
     uint64_t cap = 16;
     while (cap < (uint64_t)entries * 2) cap <<= 1;
@@ -14855,9 +14862,12 @@ static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
     return true;
 }
 
+/* Entries are written in ascending row order, and a tombstone is never
+ * reused: taking one would put a later row ahead of an earlier one in its
+ * chain, which changes which of two duplicate keys a keyed upsert updates. */
 static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     uint64_t s = h & mp->mask;
-    while (mp->slot[s] != 0) s = (s + 1) & mp->mask;
+    while (mp->slot[s] != UKEY_SLOT_EMPTY) s = (s + 1) & mp->mask;
     mp->slot[s] = row + 1;
 }
 
@@ -14871,7 +14881,7 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
     if (!ix) return;
     int64_t n = ray_table_nrows(tbl);
     if (ix->u.ukey.nrows != nrows0 || n < nrows0 ||
-        (uint64_t)n * 2 > ix->u.ukey.mask + 1) {
+        (uint64_t)(n + ix->u.ukey.n_tomb) * 2 > ix->u.ukey.mask + 1) {
         ray_table_ukey_drop(tbl);
         return;
     }
@@ -14895,8 +14905,10 @@ static bool ukey_fits(ray_index_t* ix, const int64_t* kci, int64_t nk,
                       int64_t nrows0, int64_t m) {
     if (ix->u.ukey.nrows != nrows0 || ix->u.ukey.nk != nk) return false;
     for (int64_t k = 0; k < nk; k++)
-        if (ix->u.ukey.kci[k] != (int32_t)kci[k]) return false;
-    return (uint64_t)(nrows0 + m) * 2 <= ix->u.ukey.mask + 1;
+        if (ix->u.ukey.kci[k] != (int16_t)kci[k]) return false;
+    /* Tombstones hold slots without being rows, so the load test counts them
+     * alongside the live entries. */
+    return (uint64_t)(nrows0 + m + ix->u.ukey.n_tomb) * 2 <= ix->u.ukey.mask + 1;
 }
 
 static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
@@ -14904,8 +14916,9 @@ static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
     uint64_t s = h & mp->mask;
     for (;;) {
         int64_t e = mp->slot[s];
-        if (e == 0) return -1;
-        if (upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
+        if (e == UKEY_SLOT_EMPTY) return -1;
+        if (e != UKEY_SLOT_TOMB &&
+            upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
         s = (s + 1) & mp->mask;
     }
 }

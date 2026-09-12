@@ -227,6 +227,8 @@ static ray_t* ray_index_alloc(ray_idx_kind_t kind, int8_t parent_type, int64_t p
 
 ray_t* ray_index_build_ukey(const int64_t* kci, int64_t nk, int64_t entries) {
     if (nk <= 0 || nk > RAY_UKEY_MAX_COLS) return NULL;
+    for (int64_t k = 0; k < nk; k++)
+        if (kci[k] < 0 || kci[k] > INT16_MAX) return NULL;  /* kci is int16 */
     uint64_t cap = 16;
     while (cap < (uint64_t)entries * 2) {
         if (cap > (UINT64_MAX >> 1)) return ray_error("oom", NULL);
@@ -243,8 +245,9 @@ ray_t* ray_index_build_ukey(const int64_t* kci, int64_t nk, int64_t entries) {
     ix->u.ukey.slots = slots;
     ix->u.ukey.mask  = cap - 1;
     ix->u.ukey.nrows = 0;
+    ix->u.ukey.n_tomb = 0;
     ix->u.ukey.nk    = nk;
-    for (int64_t k = 0; k < nk; k++) ix->u.ukey.kci[k] = (int32_t)kci[k];
+    for (int64_t k = 0; k < nk; k++) ix->u.ukey.kci[k] = (int16_t)kci[k];
     return idx;
 }
 
@@ -2525,6 +2528,8 @@ ray_t* ray_index_info(ray_t* v) {
         r = dict_append_sym_i64(&keys, &vals, "capacity", (int64_t)(ix->u.ukey.mask + 1));
         if (RAY_IS_ERR(r)) goto fail;
         r = dict_append_sym_i64(&keys, &vals, "n_key_cols", ix->u.ukey.nk);
+        if (RAY_IS_ERR(r)) goto fail;
+        r = dict_append_sym_i64(&keys, &vals, "n_tombstones", ix->u.ukey.n_tomb);
         if (RAY_IS_ERR(r)) goto fail;
         break;
     case RAY_IDX_ZONE:
