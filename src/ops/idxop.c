@@ -102,7 +102,7 @@ static uint64_t numeric_key_word(const uint8_t* base, int8_t type, int64_t i) {
 static bool vec_is_ascending(const ray_t* v) {
     int64_t n = v->len;
     if (n < 2) return true;
-    if (v->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(v)) {
         for (int64_t i = 0; i < n; i++)
             if (ray_vec_is_null((ray_t*)v, i)) return false;
     }
@@ -973,7 +973,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
             ray_release(gkeys);
             return ray_error("cancel", "interrupted");
         }
-        if (ray_vec_is_null(v, i)) { rgid[i] = -1; continue; }  /* SYM is null-free → always false */
+        if (ray_vec_is_null(v, i)) { rgid[i] = -1; continue; }
         int64_t kw = (v->type == RAY_SYM)
             ? ray_read_sym(base, i, RAY_SYM, v->attrs)  /* domain id, width-aware */
             : (int64_t)numeric_key_word(base, v->type, i);
@@ -1157,6 +1157,9 @@ static ray_index_t* hash_probe_setup(ray_t* col, int64_t key,
     if (ix->kind != RAY_IDX_HASH) return NULL;
     if (ix->built_for_len != col->len) return NULL;
     if (!hash_key_in_range(col->type, key)) return NULL;
+    /* Hash builders omit null rows. A zero-symbol probe must use the scan
+     * path, which also handles indexes persisted before this convention. */
+    if (col->type == RAY_SYM && key == 0) return NULL;
     /* SYM ids are valid probe keys (non-negative domain ids); all other
      * non-numeric types are rejected by hash_key_in_range above. */
     if (col->type != RAY_SYM && numeric_elem_size(col->type) == 0) return NULL;
@@ -1205,7 +1208,18 @@ static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
  * (The pre-existing hash-eq probe keeps bare idx_fresh: its builder
  * skips null rows, making null-bearing probes structurally correct.) */
 static bool idx_fresh_nonull(ray_t* col, ray_idx_kind_t kind) {
-    return idx_fresh(col, kind) && !(col->attrs & RAY_ATTR_HAS_NULLS);
+    if (!idx_fresh(col, kind)) return false;
+    if (col->type == RAY_SYM) {
+        ray_index_t* ix = ray_index_payload(col->index);
+        /* Builders already counted non-null rows. Keep admission O(1)
+         * instead of rescanning the column on each indexed lookup. */
+        if (kind == RAY_IDX_HASH)
+            return ix->u.hash.rows && ix->u.hash.rows->len == col->len;
+        if (kind == RAY_IDX_BLOOM) return ix->u.bloom.n_keys == col->len;
+        if (kind == RAY_IDX_ZONE) return ix->u.zone.n_nulls == 0;
+        if (kind == RAY_IDX_PART) return true; /* builder rejects nulls */
+    }
+    return !ray_vec_has_nulls(col);
 }
 
 /* --------------------------------------------------------------------------
@@ -1555,7 +1569,8 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     /* Gate: integer-family or SYM column with a fresh hash/part index. */
     ray_idx_kind_t kind = ray_index_kind(col);
     if ((kind != RAY_IDX_HASH && kind != RAY_IDX_PART) ||
-        !idx_fresh_nonull(col, kind)) return NULL;
+        !(col && col->type == RAY_SYM ? idx_fresh(col, kind)
+                                      : idx_fresh_nonull(col, kind))) return NULL;
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
     if (col_is_float) return NULL;
     bool col_is_sym = (col->type == RAY_SYM);
@@ -1595,6 +1610,10 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
                 if (!s) continue;
                 int64_t dom_id = ray_sym_vec_lookup(col, ray_str_ptr(s),
                                                     ray_str_len(s));
+                if (dom_id == 0 && kind == RAY_IDX_HASH) {
+                    ray_release(set_hdr);
+                    return NULL; /* null membership needs the scan path */
+                }
                 if (dom_id >= 0)
                     set_scratch[ulen++] = dom_id;
             } else {
@@ -1944,7 +1963,7 @@ ray_t* ray_index_range_rowsel(ray_t* col, uint16_t cmp_op,
 ray_t* ray_sorted_range_rowsel(ray_t* col, uint16_t cmp_op,
                                int64_t key_i, double key_f, bool is_float) {
     if (!col || RAY_IS_ERR(col) || cmp_op == OP_NE) return NULL;
-    if (!ray_attr_is_sorted(col) || (col->attrs & RAY_ATTR_HAS_NULLS))
+    if (!ray_attr_is_sorted(col) || ray_vec_may_have_nulls(col))
         return NULL;
 
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
@@ -2237,7 +2256,7 @@ ray_t* ray_index_attach_part(ray_t** vp) {
 
     if (v->type != RAY_SYM && !vec_is_ascending(v))
         return ray_error("domain", "parted: column is not laid out as ascending value-blocks");
-    if (v->type == RAY_SYM && (v->attrs & RAY_ATTR_HAS_NULLS)) {
+    if (v->type == RAY_SYM && ray_vec_may_have_nulls(v)) {
         for (int64_t i = 0; i < n; i++)
             if (ray_vec_is_null(v, i))
                 return ray_error("domain", "parted: column contains nulls");
@@ -2726,8 +2745,10 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
     int8_t t = col->type;
     if (t == RAY_F32 || t == RAY_F64) return -2;
 
-    /* idx_fresh_nonull: freshness + kind check + null-bearing gate. */
-    if (!idx_fresh_nonull(col, RAY_IDX_HASH)) return -2;
+    /* Nonzero symbol equality is safe even when other rows are null. */
+    if (t == RAY_SYM) {
+        if (key == 0 || !idx_fresh(col, RAY_IDX_HASH)) return -2;
+    } else if (!idx_fresh_nonull(col, RAY_IDX_HASH)) return -2;
 
     /* Out-of-range key cannot equal any stored value of this type. */
     if (!hash_key_in_range(t, key)) return -1;
@@ -2755,7 +2776,7 @@ int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
     if (col->type != RAY_SYM) return -1;
     ray_idx_kind_t kind = ray_index_kind(col);
     if ((kind != RAY_IDX_HASH && kind != RAY_IDX_PART) ||
-        !idx_fresh_nonull(col, kind)) return -1;
+        !idx_fresh(col, kind)) return -1;
 
     bool atom = (keys->type == -RAY_SYM);
     int64_t nkeys;
@@ -2774,6 +2795,7 @@ int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
         ray_t* str = atom ? ray_sym_str(keys->i64) : ray_sym_vec_cell(keys, i);
         if (!str) continue;
         int64_t dom = ray_sym_vec_lookup(col, ray_str_ptr(str), ray_str_len(str));
+        if (dom == 0 && kind == RAY_IDX_HASH) { ray_free(dhdr); return -1; }
         if (dom >= 0) doms[nd++] = dom;
     }
     if (nd == 0) { ray_free(dhdr); return 0; }

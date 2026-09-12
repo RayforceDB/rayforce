@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "vec/vec.h"
 #include "core/morsel.h"
 #include "core/platform.h"
 #include "mem/heap.h"
@@ -80,7 +81,7 @@ bool ray_morsel_next(ray_morsel_t* m) {
      * directly would give stale zeros.  Cost is one O(morsel_len)
      * sentinel scan per chunk; cheap given morsel_len <= 1024. */
     m->null_bits = NULL;
-    if (m->vec->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(m->vec)) {
         int64_t bit0 = m->offset & 7;
         int64_t base_byte = m->offset / 8;
         int64_t total_bits = bit0 + m->morsel_len;

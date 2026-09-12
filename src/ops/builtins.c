@@ -842,7 +842,7 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
      * null contract.  Narrowing casts require writing the dest-width
      * sentinel directly — propagating through the cast macro produces
      * (int16_t)NULL_I32 = 0 etc., which collides with a legitimate value. */
-    if (val->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(val)) {
         switch (vec->type) {
             case RAY_F64: {
                 double* d = (double*)ray_data(vec);
@@ -3440,7 +3440,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         /* Null propagation: propagate null-ness of the leading atom
          * (a typed-null sentinel written raw at slot 0) and any nulls in the
          * trailing vector b. */
-        if (RAY_ATOM_IS_NULL(a) || (b->attrs & RAY_ATTR_HAS_NULLS))
+        if (RAY_ATOM_IS_NULL(a) || ray_vec_may_have_nulls(b))
             result->attrs |= RAY_ATTR_HAS_NULLS;
         if (b->type == RAY_SYM) {
             /* Mixed sources: the atom id is runtime-domain by design, b's
@@ -3491,7 +3491,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         result->len = na + 1;
         /* Null propagation: propagate nulls in the leading vector a
          * and null-ness of the trailing atom (sentinel written raw at na). */
-        if ((a->attrs & RAY_ATTR_HAS_NULLS) || RAY_ATOM_IS_NULL(b))
+        if (ray_vec_may_have_nulls(a) || RAY_ATOM_IS_NULL(b))
             result->attrs |= RAY_ATTR_HAS_NULLS;
         return result;
     }
@@ -3689,7 +3689,7 @@ ray_t* ray_raze_fn(ray_t* x) {
             for (int64_t i = 0; i < n; i++) {
                 ray_t* it = items[i];
                 if (!ray_is_vec(it) || it->type != t
-                    || (it->attrs & RAY_ATTR_HAS_NULLS)) {
+                    || ray_vec_may_have_nulls(it)) {
                     fast = false; break;
                 }
                 total += it->len;

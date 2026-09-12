@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "vec/vec.h"
 #include "opt.h"
 #include "idiom.h"
 #include "core/profile.h"
@@ -2054,7 +2055,7 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             /* Read set elements — skip nulls in the literal so a null
              * sentinel can never match a partition key. */
             int64_t next = 0;
-            bool set_has_nulls = (lit->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            bool set_has_nulls = ray_vec_may_have_nulls(lit);
             for (int64_t i = 0; i < set_len; i++) {
                 if (set_has_nulls && ray_vec_is_null(lit, i)) continue;
                 if (narrow32) {

@@ -336,7 +336,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ctx.keys[i].attrs     = col->attrs;
         ctx.keys[i].esz       = ray_sym_elem_size(kt, col->attrs);
         ctx.keys[i].desc      = sort_descs[i];
-        ctx.keys[i].has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) ? 1 : 0;
+        ctx.keys[i].has_nulls = ray_vec_may_have_nulls(col) ? 1 : 0;
         ctx.keys[i].nulls_first = sort_nulls_first(sort_descs[i]);
         ctx.keys[i].dom_runtime =
             (kt == RAY_SYM &&

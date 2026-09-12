@@ -397,7 +397,7 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
          * any nullable term would poison the sum with NULL_I{16,32,64}
          * sentinels.  Refuse the fast plan and let the caller fall back
          * to the generic masked path. */
-        if (col->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (ray_vec_may_have_nulls(col)) return false;
         out_plan->term_ptrs[i] = ray_data(col);
         out_plan->term_types[i] = col->type;
         out_plan->coeff_i64[i] = lin.coeff_i64[i];
@@ -428,7 +428,7 @@ bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     if (!ca || !cb || RAY_IS_ERR(ca) || RAY_IS_ERR(cb)) return false;
     if (RAY_IS_PARTED(ca->type) || ca->type == RAY_MAPCOMMON) return false;
     if (RAY_IS_PARTED(cb->type) || cb->type == RAY_MAPCOMMON) return false;
-    if ((ca->attrs & RAY_ATTR_HAS_NULLS) || (cb->attrs & RAY_ATTR_HAS_NULLS))
+    if (ray_vec_may_have_nulls(ca) || ray_vec_may_have_nulls(cb))
         return false;
     #define PROD_OK_T(t) ((t) == RAY_F64 || (t) == RAY_I64 || (t) == RAY_I32 || \
                           (t) == RAY_I16 || (t) == RAY_U8  || (t) == RAY_BOOL)
@@ -731,11 +731,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 /* Determine whether any lane in this column may be null.
                  * For parted columns the wrapper attrs may not reflect
                  * individual segments — scan all segments. */
-                bool col_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                bool col_nulls = ray_vec_has_nulls(col);
                 if (RAY_IS_PARTED(col->type)) {
                     ray_t** segs = (ray_t**)ray_data(col);
                     for (int64_t s = 0; s < col->len; s++)
-                        if (segs[s] && (segs[s]->attrs & RAY_ATTR_HAS_NULLS))
+                        if (segs[s] && ray_vec_has_nulls(segs[s]))
                             col_nulls = true;
                 }
                 /* Nullable SYM is out of scope: sym ids are indistinguishable
@@ -2268,7 +2268,7 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
  * the per-element walk is required since there is no per-row bitmap to
  * bulk-OR. */
 static void propagate_nulls(ray_t* src, ray_t* dst, int64_t len) {
-    if (!(src->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE))) return;
+    if (!ray_vec_may_have_nulls(src)) return;
     for (int64_t i = 0; i < len; i++) {
         if (ray_vec_is_null(src, i))
             ray_vec_set_null(dst, i, true);
@@ -2291,7 +2291,7 @@ static bool scalar_is_null(ray_t* x) {
 
 /* Check if a vector might contain nulls (accounts for slices). */
 static bool vec_may_have_nulls(ray_t* v) {
-    return (v->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0;
+    return ray_vec_may_have_nulls(v);
 }
 
 static int8_t ew_value_base_type(ray_t* x) {

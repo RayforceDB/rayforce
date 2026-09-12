@@ -90,7 +90,7 @@ static inline double group_fp_at(const void* data, int8_t t, int64_t row) {
 static inline double group_pack_i64_as_f64(ray_t* col, int64_t row) {
     int64_t v = read_col_i64(ray_data(col), row, col->type, col->attrs);
     ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
-    if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
+    if (src && ray_vec_may_have_nulls(src)) {
         int64_t sent = agg_int_null_sentinel_for(col->type);
         if (sent != 0 && v == sent) return (double)NAN;
     }
@@ -103,7 +103,7 @@ static inline double group_pack_i64_as_f64(ray_t* col, int64_t row) {
 static inline int64_t group_pack_y_i64(ray_t* col, int64_t row) {
     int64_t v = read_col_i64(ray_data(col), row, col->type, col->attrs);
     ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
-    if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
+    if (src && ray_vec_may_have_nulls(src)) {
         int64_t sent = agg_int_null_sentinel_for(col->type);
         if (sent != 0 && v == sent) return NULL_I64;
     }
@@ -1365,7 +1365,7 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
         /* The kernel canonicalizes every NaN to one value.  The eager
          * hashset only does that under the HAS_NULLS gate (ungated NaNs
          * are pairwise-distinct there) — bail so behavior is identical. */
-        if (!(input->attrs & RAY_ATTR_HAS_NULLS)) return NULL;
+        if (!ray_vec_may_have_nulls(input)) return NULL;
         break;
     default:
         return NULL;
@@ -2227,7 +2227,7 @@ static ray_t* rank_per_group_buf(ray_t* src,
     med_par_ctx_t ctx = {
         .base = ray_data(src),
         .src_type = t,
-        .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
+        .has_nulls = ray_vec_may_have_nulls(src),
         .use_quantile = use_quantile,
         .q = q,
         .idx_buf = idx_buf,
@@ -2378,7 +2378,7 @@ static int64_t mode_scalar_group(ray_t* src, const int64_t* rows,
         &hdr, (size_t)cap * sizeof(mode_scalar_entry_t));
     if (!ht) return -2;
     uint64_t mask = cap - 1;
-    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(src);
     int64_t best_count = 0, best_row = -1, best_pos = INT64_MAX;
     for (int64_t i = 0; i < cnt; i++) {
         if ((i & 65535) == 0 && ray_interrupted()) {
@@ -2432,7 +2432,7 @@ static int64_t mode_guid_group(ray_t* src, const int64_t* rows,
     if (!ht) return -2;
     uint64_t mask = cap - 1;
     const uint8_t* base = (const uint8_t*)ray_data(src);
-    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(src);
     int64_t best_count = 0, best_row = -1, best_pos = INT64_MAX;
     for (int64_t i = 0; i < cnt; i++) {
         if ((i & 65535) == 0 && ray_interrupted()) {
@@ -2939,7 +2939,7 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
     topk_par_ctx_t ctx = {
         .base = ray_data(src),
         .src_type = t,
-        .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
+        .has_nulls = ray_vec_may_have_nulls(src),
         .k = k,
         .desc = desc,
         .idx_buf = idx_buf,
@@ -2990,7 +2990,7 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
                                      int64_t n_groups) {
     if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
     if (!agg_needs_row_gather(src->type, op)) return NULL;  /* caller falls back */
-    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(src);
 
     ray_t* out = src->type == RAY_LIST
         ? ray_list_new(n_groups)
@@ -3106,7 +3106,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     /* Sentinel-based per-element null detection happens inside
      * REDUCE_LOOP_I/F via the type-correct NULL_* constant; the
      * has_nulls attribute below is the vec-level fast-path gate. */
-    bool has_nulls = (input->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(input);
 
     /* Selection-aware reduction: when a lazy WHERE filter has installed
      * g->selection on the graph and the column we're reducing matches
@@ -3550,7 +3550,7 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
         if (vslot >= 0 && agg_vecs[a]) {
             ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
                          ? agg_vecs[a]->slice_parent : agg_vecs[a];
-            if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
+            if (src && ray_vec_may_have_nulls(src)) {
                 af2 |= GHT_AF2_NULLABLE;
                 sent = agg_int_null_sentinel_for(agg_vecs[a]->type);
                 out->any_agg_null = 1;
@@ -3564,7 +3564,7 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             agg_vecs2 && agg_vecs2[a]) {
             ray_t* ysrc = (agg_vecs2[a]->attrs & RAY_ATTR_SLICE)
                           ? agg_vecs2[a]->slice_parent : agg_vecs2[a];
-            if (ysrc && (ysrc->attrs & RAY_ATTR_HAS_NULLS)) {
+            if (ysrc && ray_vec_may_have_nulls(ysrc)) {
                 af2 |= GHT_AF2_Y_NULLABLE;
                 out->any_agg_null = 1;
             }
@@ -3998,16 +3998,16 @@ static inline const int64_t* ght_null_words_at(const ght_layout_t* ly,
                                          ly->key_off[ly->n_keys]);
 }
 
-/* True when key column kv (or its slice parent) carries the HAS_NULLS attr and
- * so may yield a null at some row.  Replaces the old per-key `1u << k` nullable
+/* True when a key needs a separate null marker. SYM/STR canonical empty
+ * payloads already identify their null group; other types need the marker.  Replaces the old per-key `1u << k` nullable
  * bitmask (which silently dropped keys past index 7 / was UB past 31): callers
  * hoist a single any_nullable summary out of the row loop, then re-test this
  * per key ONLY on the rare null-bearing path — correct at any key count
  * (unbounded-slots cut 4). */
 static inline bool ray_key_may_be_null(const ray_t* kv) {
-    if (!kv) return false;
+    if (!kv || kv->type == RAY_SYM || kv->type == RAY_STR) return false;
     const ray_t* src = (kv->attrs & RAY_ATTR_SLICE) ? kv->slice_parent : kv;
-    return src && (src->attrs & RAY_ATTR_HAS_NULLS);
+    return src && ray_vec_may_have_nulls(src);
 }
 
 /* ── Inline-STR key resolution (descriptor stored in the entry/row) ──
@@ -6441,6 +6441,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
                 int64_t r = match_idx ? match_idx[i] : i; \
                 if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
                 int64_t v = (int64_t)CAST kd[r]; \
+                if (t == RAY_SYM && v == 0) continue; \
                 if (v < kmin) kmin = v; \
                 if (v > kmax) kmax = v; \
             } \
@@ -7058,6 +7059,7 @@ static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     for (uint32_t k = 0; k < c->n_keys; k++) {
         int64_t val = read_signed_by_esz(c->key_ptrs[k], r, c->key_esz[k],
                                          da_key_is_unsigned(c->key_types[k]));
+        if (c->key_types[k] == RAY_SYM && val == 0) val = c->key_mins[k];
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
     }
     return gid;
@@ -7070,6 +7072,7 @@ static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
     int32_t gid = 0; \
     for (uint32_t k = 0; k < c->n_keys; k++) { \
         int64_t val = (int64_t)((const KTYPE*)c->key_ptrs[k])[r]; \
+        if (c->key_types[k] == RAY_SYM && val == 0) val = c->key_mins[k]; \
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]); \
     } \
     return gid; \
@@ -7471,7 +7474,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             }
         } else if (op == OP_MIN) {
             if (is_f) { if (fv == fv && fv < acc->min_val[a].f) acc->min_val[a].f = fv; }
-            else if (c->agg_types[a] == RAY_SYM) {
+            else if (c->agg_types[a] == RAY_SYM && !int_null) {
                 /* Lex compare for SYM; INT64_MAX = "not seen yet". */
                 if (acc->min_val[a].i == INT64_MAX ||
                     sym_lex_lt(ray_sym_vec_domain(c->agg_cols[a]), iv, acc->min_val[a].i))
@@ -7481,7 +7484,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             if (!is_null && nn) nn[a]++;
         } else if (op == OP_MAX) {
             if (is_f) { if (fv == fv && fv > acc->max_val[a].f) acc->max_val[a].f = fv; }
-            else if (c->agg_types[a] == RAY_SYM) {
+            else if (c->agg_types[a] == RAY_SYM && !int_null) {
                 if (acc->max_val[a].i == INT64_MIN ||
                     sym_lex_gt(ray_sym_vec_domain(c->agg_cols[a]), iv, acc->max_val[a].i))
                     acc->max_val[a].i = iv;
@@ -7673,7 +7676,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                 /* NaN comparisons are always false, but make the skip
                  * explicit. */
                 if (fv == fv && fv < acc->min_val[idx].f) acc->min_val[idx].f = fv;
-            } else if (c->agg_types[a] == RAY_SYM) {
+            } else if (c->agg_types[a] == RAY_SYM && !int_null) {
                 /* Lex compare for SYM; INT64_MAX = "not seen yet". */
                 if (acc->min_val[idx].i == INT64_MAX ||
                     sym_lex_lt(ray_sym_vec_domain(c->agg_cols[a]), iv, acc->min_val[idx].i))
@@ -7685,7 +7688,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         } else if (op == OP_MAX) {
             if (is_f) {
                 if (fv == fv && fv > acc->max_val[idx].f) acc->max_val[idx].f = fv;
-            } else if (c->agg_types[a] == RAY_SYM) {
+            } else if (c->agg_types[a] == RAY_SYM && !int_null) {
                 if (acc->max_val[idx].i == INT64_MIN ||
                     sym_lex_gt(ray_sym_vec_domain(c->agg_cols[a]), iv, acc->max_val[idx].i))
                     acc->max_val[idx].i = iv;
@@ -7726,11 +7729,13 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
                 int64_t pfk = (int64_t)KCAST kp[pf_r]; \
+                if (c->key_types[0] == RAY_SYM && pfk == 0) pfk = kmin; \
                 __builtin_prefetch(&acc->count[(int32_t)(pfk - kmin)], 1, 1); \
                 if (acc->sum) __builtin_prefetch( \
                     &acc->sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
             } \
             int64_t kv = (int64_t)KCAST kp[r]; \
+            if (c->key_types[0] == RAY_SYM && kv == 0) kv = kmin; \
             da_accum_row(c, acc, (int32_t)(kv - kmin), r); \
         } \
     } while (0)
@@ -9464,7 +9469,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!ae || ae->base.opcode != OP_SCAN) return false;
         ray_t* col = ray_table_get_col(tbl, ae->sym);
         if (!col || ray_is_atom(col)) return false;
-        if (col->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (ray_vec_has_nulls(col)) return false;
         if (!agg_type_admitted(aop, col->type)) return false;
         switch (col->type) {
             case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
@@ -9480,7 +9485,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (!ae2 || ae2->base.opcode != OP_SCAN) return false;
             ray_t* col2 = ray_table_get_col(tbl, ae2->sym);
             if (!col2 || ray_is_atom(col2)) return false;
-            if (col2->attrs & RAY_ATTR_HAS_NULLS) return false;
+            if (ray_vec_has_nulls(col2)) return false;
             if (!agg_type_admitted(aop, col2->type)) return false;
             switch (col2->type) {
                 case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
@@ -10899,15 +10904,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 agg_types[a] = agg_vecs[a]->type;
                 sc_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
                 /* Only flag int-null for storage types whose sentinel is
-                 * meaningful.  BOOL/U8/SYM use 0 as their default
-                 * "sentinel" which collides with legitimate values
-                 * (FALSE / zero byte / SYM id 0); gating those would silently
-                 * drop real rows from SUM/MIN/MAX.  F64 has its own NaN path. */
+                 * meaningful. BOOL/U8 are non-nullable; SYM zero is the
+                 * canonical empty value and must be skipped by aggregates.
+                 * F64 has its own NaN path. */
                 int8_t t = agg_vecs[a]->type;
                 bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP);
-                sc_int_null_has[a] = is_sentinel_typed && (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS);
-                if ((agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) &&
+                                          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                sc_int_null_has[a] = is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]);
+                if (ray_vec_may_have_nulls(agg_vecs[a]) &&
                     (group_fp_type(agg_vecs[a]->type) || is_sentinel_typed))
                     sc_any_nullable = true;
             } else {
@@ -11159,7 +11163,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         bool agg0_has_nulls = n_aggs > 0 &&
             (sc_int_null_has[0] ||
              (agg_vecs[0] && group_fp_type(agg_vecs[0]->type) &&
-              (agg_vecs[0]->attrs & RAY_ATTR_HAS_NULLS)));
+              ray_vec_may_have_nulls(agg_vecs[0])));
         if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls) {
             uint16_t op0 = ext->agg_ops[0];
             int8_t   t0  = agg_types[0];
@@ -11297,7 +11301,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     wscan = sm->total_pass;
                 }
             }
-            bool hn = (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            bool hn = ray_vec_may_have_nulls(agg_vecs[a]);
             ray_t* atom = agg_wide_reduce(agg_vecs[a], aop, wsel, wscan, hn);
             if (wsel_blk) ray_release(wsel_blk);
             ray_t* col = agg_vecs[a]->type == RAY_LIST
@@ -11452,7 +11456,7 @@ da_path:;
                     ray_t* ysrc = (yv2->attrs & RAY_ATTR_SLICE)
                                   ? yv2->slice_parent : yv2;
                     if (!y_fp && !y_int) da_eligible = false;           /* SYM/STR/GUID/… */
-                    else if (!y_fp && ysrc && (ysrc->attrs & RAY_ATTR_HAS_NULLS))
+                    else if (!y_fp && ysrc && ray_vec_may_have_nulls(ysrc))
                         da_eligible = false;                            /* nullable int y */
                 }
             }
@@ -11475,11 +11479,12 @@ da_path:;
                 && t != RAY_BOOL && t != RAY_U8 && t != RAY_I16) {
                 da_eligible = false;
             }
-            /* DA path cannot represent nulls — fall back to HT path. */
+            /* SYM zero is a valid dense group index. Other nullable key
+             * types still require the hash path for their sentinels. */
             if (key_vecs[k]) {
                 ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
                              ? key_vecs[k]->slice_parent : key_vecs[k];
-                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                if (t != RAY_SYM && ray_vec_may_have_nulls(src))
                     da_eligible = false;
             }
         }
@@ -11557,6 +11562,14 @@ da_path:;
                 for (uint32_t w = 0; w < mm_n; w++) {
                     if (mm_mins[w] < kmin) kmin = mm_mins[w];
                     if (mm_maxs[w] > kmax) kmax = mm_maxs[w];
+                }
+                /* Reserve slot 0 for the canonical empty symbol without
+                 * spanning the gap from id 0 to this column's nonempty ids.
+                 * Runtime ids are shared across all columns, so that gap can
+                 * dwarf the actual key range (e.g. after a wide CSV import). */
+                if (key_types[k] == RAY_SYM) {
+                    if (kmin == INT64_MAX) { kmin = 1; kmax = 0; }
+                    kmin--;
                 }
                 da_key_min[k]   = kmin;
                 /* kmax - kmin may overflow i64 when keys span full range.
@@ -11646,7 +11659,7 @@ da_path:;
                     ray_t* ysrc = (agg_vecs2[a]->attrs & RAY_ATTR_SLICE)
                                   ? agg_vecs2[a]->slice_parent : agg_vecs2[a];
                     if (group_fp_type(agg_vecs2[a]->type) &&
-                        ysrc && (ysrc->attrs & RAY_ATTR_HAS_NULLS))
+                        ysrc && ray_vec_may_have_nulls(ysrc))
                         da_any_nullable = true;
                 }
                 if (agg_prod[a].enabled) {
@@ -11664,16 +11677,14 @@ da_path:;
                         agg_f64_mask |= ((uint64_t)1 << a);
                     da_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
                     /* Only set the int-null mask bit for storage types whose
-                     * sentinel is meaningful.  BOOL/U8/SYM use 0 as their default
-                     * "sentinel" which collides with legitimate values
-                     * (FALSE / zero byte / SYM id 0); gating those would silently
-                     * drop real rows from SUM/MIN/MAX.  F64 has its own NaN path. */
+                     * sentinel is meaningful. BOOL/U8 are non-nullable; SYM
+                     * zero is skipped by aggregates. F64 has its own NaN path. */
                     int8_t t = agg_vecs[a]->type;
                     bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                              t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP);
-                    if (is_sentinel_typed && (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS))
+                                              t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                    if (is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]))
                         da_int_null_mask |= ((uint64_t)1 << a);
-                    if ((agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) &&
+                    if (ray_vec_may_have_nulls(agg_vecs[a]) &&
                         (group_fp_type(agg_vecs[a]->type) || is_sentinel_typed))
                         da_any_nullable = true;
                 } else {
@@ -12114,7 +12125,8 @@ da_path:;
                 for (uint32_t s = 0; s < n_slots; s++) {
                     if (da_count[s] < da_keep_min) continue;
                     int64_t offset = ((int64_t)s / da_key_stride[k]) % da_key_range[k];
-                    int64_t key_val = da_key_min[k] + offset;
+                    int64_t key_val = (src_col->type == RAY_SYM && offset == 0)
+                        ? 0 : da_key_min[k] + offset;
                     write_col_i64(ray_data(key_col), gi, key_val, src_col->type, key_col->attrs);
                     gi++;
                 }
@@ -12199,7 +12211,7 @@ da_path:;
         if (sp_eligible && key_vecs[0]) {
             ray_t* src = (key_vecs[0]->attrs & RAY_ATTR_SLICE)
                          ? key_vecs[0]->slice_parent : key_vecs[0];
-            if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+            if (kt != RAY_SYM && ray_vec_may_have_nulls(src))
                 sp_eligible = false;
         }
         bool sp_need_sum = false;
@@ -12215,7 +12227,7 @@ da_path:;
                  * NULL_F64 sentinels.  Fall back to slower paths that
                  * mask nulls properly.  (The multi-key radix HT at
                  * accum_from_entry inherits the same nullable-agg gap.) */
-                if (agg_vecs[a] && (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS))
+                if (agg_vecs[a] && ray_vec_may_have_nulls(agg_vecs[a]))
                     sp_eligible = false;
                 else
                     sp_need_sum = true;
@@ -12987,7 +12999,7 @@ ht_path:;
             if (agg_vecs[a]) {
                 ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
                              ? agg_vecs[a]->slice_parent : agg_vecs[a];
-                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                if (src && ray_vec_may_have_nulls(src))
                     v2_ok = false;
             }
         }
