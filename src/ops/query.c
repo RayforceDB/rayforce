@@ -2694,7 +2694,7 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
     if (!col_expr || col_expr->type != -RAY_SYM || (col_expr->attrs & ATTR_QUOTED))
         return false;
     ray_t* col = ray_table_get_col(tbl, col_expr->i64);
-    if (!col || ray_vec_may_have_nulls(col)) return false;
+    if (!col || ray_vec_has_nulls(col)) return false;
 
     *op_out = is_first ? OP_MIN : OP_MAX;
     *arg_out = col_expr;
@@ -3719,7 +3719,7 @@ static ray_t* try_count_distinct_v2_rewrite(
         if (!K_cols[j]) return NULL;
         int8_t kct_j = K_cols[j]->type;
         if (RAY_IS_PARTED(kct_j) || kct_j == RAY_MAPCOMMON) return NULL;
-        if (ray_vec_may_have_nulls(K_cols[j])) return NULL;
+        if (ray_vec_has_nulls(K_cols[j])) return NULL;
         int kct_ok_j = (kct_j == RAY_SYM  || kct_j == RAY_BOOL || kct_j == RAY_U8 ||
                         kct_j == RAY_I16  || kct_j == RAY_I32  || kct_j == RAY_I64 ||
                         kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP);
@@ -3730,7 +3730,7 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
-    if (ray_vec_may_have_nulls(X_col)) return NULL;
+    if (ray_vec_has_nulls(X_col)) return NULL;
     int X_esz = ray_sym_elem_size(xct, X_col->attrs);
     if (K_esz_total + X_esz > 16) return NULL;
     /* X gets the same per-type acceptability check as the K columns
@@ -6016,7 +6016,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         if (dep_candidate && base_sym >= 0) {
             ray_t* base_col = ray_table_get_col(tbl, base_sym);
             dep_candidate = base_col && key_type_i64_projectable(base_col->type) &&
-                            !ray_vec_may_have_nulls(base_col);
+                            !ray_vec_has_nulls(base_col);
         }
         /* Exact-size carve (unbounded): at most nk dependent-key entries can
          * ever be collected (one per by-dict pair).  On the dependent-key

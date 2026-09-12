@@ -133,9 +133,8 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
  * and losing the fused path cost them ~70x for an identical result. */
 static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
     if (!col) return 0;
-    if (ray_vec_may_have_nulls(col))
-        return eq_or_ne && (col->type == RAY_SYM || col->type == RAY_STR);
-    return 1;
+    if (eq_or_ne && (col->type == RAY_SYM || col->type == RAY_STR)) return 1;
+    return !ray_vec_has_nulls(col);
 }
 
 /* Strict form — no nullable column at all.  Used by the shapes whose

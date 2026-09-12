@@ -39,7 +39,9 @@
  * null as id 0 / length 0 independently of metadata, including old persisted
  * columns and raw gathers. Other vectors retain their HAS_NULLS fast path.
  * Resolve slices here so callers never interpret their view attrs as proof
- * that the underlying payload is null-free. */
+ * that the underlying payload is null-free. This is a row-kernel gate, not
+ * a reason to reject a text optimization: equality can compare canonical
+ * payloads directly; paths requiring null-free data use has_nulls below. */
 static inline bool ray_vec_may_have_nulls(const ray_t* v) {
     if (!v) return false;
     if (v->type == RAY_SYM || v->type == RAY_STR) return true;

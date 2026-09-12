@@ -1305,8 +1305,6 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
      * this predicate is one conjunct of several, not the whole filter. */
     if (!in0 || in0->opcode == OP_FILTER) return false;
     if (by_col->type != RAY_SYM || ray_is_atom(by_col)) return false;
-    if (ray_vec_may_have_nulls(by_col) && ray_index_kind(by_col) != RAY_IDX_PART)
-        return false;
     ray_idx_kind_t kind = ray_index_kind(by_col);
     if (kind != RAY_IDX_HASH && kind != RAY_IDX_PART) return false;
     ray_op_t* pred = op_child(g, root, 1);
@@ -2265,12 +2263,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
 
-                    /* 3. Hash/part EQ: integer or SYM; re-check HAS_NULLS.
+                    /* 3. Hash/part EQ: nonzero SYM keys remain eligible
+                     * even when other rows are null; indexes omit null rows.
                      * A part hit is already one contiguous physical span, so
                      * it stays eligible at any density. */
                     if (cmp_op == OP_EQ && !is_float &&
-                        (!ray_vec_may_have_nulls(col) ||
-                         (col->type == RAY_SYM && ray_index_kind(col) == RAY_IDX_PART))) {
+                        (col->type == RAY_SYM ? key_i != 0 :
+                         !ray_vec_may_have_nulls(col))) {
                         /* SYM equality: idx_filter_decode passes the global intern id;
                          * the hash was built over per-column domain ids.  Resolve here. */
                         bool sym_probe_skip = false;
@@ -2364,7 +2363,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         if (cop == OP_EQ && !eq_col &&
                             ray_index_kind(c) == RAY_IDX_HASH &&
-                            !ray_vec_may_have_nulls(c)) {
+                            (c->type == RAY_SYM ? ki != 0 : !ray_vec_may_have_nulls(c))) {
                             eq_col = c; eq_key = ki;
                         } else if (cop == OP_GE || cop == OP_GT ||
                                    cop == OP_LE || cop == OP_LT) {

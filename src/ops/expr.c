@@ -731,11 +731,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 /* Determine whether any lane in this column may be null.
                  * For parted columns the wrapper attrs may not reflect
                  * individual segments — scan all segments. */
-                bool col_nulls = ray_vec_may_have_nulls(col);
+                bool col_nulls = ray_vec_has_nulls(col);
                 if (RAY_IS_PARTED(col->type)) {
                     ray_t** segs = (ray_t**)ray_data(col);
                     for (int64_t s = 0; s < col->len; s++)
-                        if (segs[s] && ray_vec_may_have_nulls(segs[s]))
+                        if (segs[s] && ray_vec_has_nulls(segs[s]))
                             col_nulls = true;
                 }
                 /* Nullable SYM is out of scope: sym ids are indistinguishable

@@ -9469,7 +9469,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!ae || ae->base.opcode != OP_SCAN) return false;
         ray_t* col = ray_table_get_col(tbl, ae->sym);
         if (!col || ray_is_atom(col)) return false;
-        if (ray_vec_may_have_nulls(col)) return false;
+        if (ray_vec_has_nulls(col)) return false;
         if (!agg_type_admitted(aop, col->type)) return false;
         switch (col->type) {
             case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
@@ -9485,7 +9485,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (!ae2 || ae2->base.opcode != OP_SCAN) return false;
             ray_t* col2 = ray_table_get_col(tbl, ae2->sym);
             if (!col2 || ray_is_atom(col2)) return false;
-            if (ray_vec_may_have_nulls(col2)) return false;
+            if (ray_vec_has_nulls(col2)) return false;
             if (!agg_type_admitted(aop, col2->type)) return false;
             switch (col2->type) {
                 case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:

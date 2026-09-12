@@ -1145,9 +1145,9 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
          dag_opcode == OP_LT || dag_opcode == OP_LE ||
          dag_opcode == OP_GT || dag_opcode == OP_GE)) {
         int l_str_vec = left_coll  && ray_is_vec(left)  && left->type  == RAY_STR &&
-                        !ray_vec_may_have_nulls(left);
+                        !ray_vec_has_nulls(left);
         int r_str_vec = right_coll && ray_is_vec(right) && right->type == RAY_STR &&
-                        !ray_vec_may_have_nulls(right);
+                        !ray_vec_has_nulls(right);
         int l_str_atom = !left_coll  && left  && left->type  == -RAY_STR &&
                          !RAY_ATOM_IS_NULL(left);
         int r_str_atom = !right_coll && right && right->type == -RAY_STR &&
