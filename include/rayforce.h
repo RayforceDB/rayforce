@@ -768,6 +768,7 @@ ray_t* ray_select(ray_t** args, int64_t n);
 ray_t* ray_update(ray_t** args, int64_t n);
 ray_t* ray_insert(ray_t** args, int64_t n);
 ray_t* ray_upsert(ray_t** args, int64_t n);
+ray_t* ray_delete(ray_t** args, int64_t n);
 ray_t* ray_fmt(ray_t* obj, int mode);
 
 /* ===== IPC Client API =====
