@@ -560,6 +560,24 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
             continue;
         }
 
+        /* Explicit STR index: a grouped / unique hash on a STR column is keyed
+         * on byte hashes and row ids — neither depends on a domain — so the
+         * in-memory index persists verbatim, regardless of length.  It takes
+         * the column's single index slot: the size-gated auto dictionary
+         * below is not built for it. */
+        if (col->type == RAY_STR && ray_index_kind(col) == RAY_IDX_HASH) {
+            ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+            if (nstr && !RAY_IS_ERR(nstr)) {
+                char path[1024];
+                int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                                 (int)ray_str_len(nstr), ray_str_ptr(nstr));
+                if (n > 0 && n < (int)sizeof(path))
+                    (void)ray_col_append_index(path, ray_index_payload(col->index),
+                                               col->len, RAY_STR);
+            }
+            continue;
+        }
+
         if (col->len < (1 << 16)) continue;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal

@@ -262,9 +262,10 @@
 (.idx.sort ['x 'y]) !- nyi
 (.idx.bloom ['p 'q]) !- nyi
 
-;; ── string vec also unsupported in v1 ──
+;; ── string vec: hash supported (byte-keyed, see ops/idx_find_in.rfl), the rest nyi ──
 (.idx.zone ["alpha" "beta"]) !- nyi
-(.idx.hash ["a" "b"]) !- nyi
+(.idx.has? (.idx.hash ["a" "b"])) -- true
+(.idx.sort ["a" "b"]) !- nyi
 
 ;; ── non-vector input (atom): ray_is_vec -> false -> "type" error ──
 (.idx.zone 42) !- type
