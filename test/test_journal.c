@@ -982,6 +982,15 @@ static test_result_t test_journal_roll_twice(void) {
     ray_journal_validate(lpath, &chunks, NULL);
     TEST_ASSERT_EQ_I(chunks, 0);
 
+    /* Two rolls in one second must leave both archived segments intact. */
+    char pattern[300];
+    snprintf(pattern, sizeof(pattern), "%s.*.log", base);
+    glob_t archives;
+    memset(&archives, 0, sizeof(archives));
+    TEST_ASSERT_EQ_I(glob(pattern, 0, NULL, &archives), 0);
+    TEST_ASSERT_EQ_U(archives.gl_pathc, 2);
+    globfree(&archives);
+
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     cleanup_base(base);
     PASS();
