@@ -1,0 +1,154 @@
+;; Vector-needle find / in / dict lookup against an attached hash index, the
+;; STR hash attach, and the index carried across concat (issue #519).
+;;
+;; Every indexed answer is cross-checked against the same call on the plain
+;; vector (drop-differential): positions, duplicates, misses → null.  The
+;; index is consulted by find / in / at directly on the vector, so no query
+;; wrapper is needed to reach the routing site.
+
+;; ─────────────────────────── I64: find / in with a vector of needles ────────
+(set hi [10 20 30 10 50 10 70 10 90 100])          ;; 10 repeats: first at row 0
+(set gi (.attr.set 'grouped hi))
+(.attr.get gi) -- ['grouped]
+(find gi [50 10 999 100 10]) -- [4 0 0N 9 0]
+(find gi [50 10 999 100 10]) -- (find hi [50 10 999 100 10])
+(find gi [999]) -- [0N]
+(find gi []) -- (find hi [])
+(in [50 999 10] gi) -- [true false true]
+(in [50 999 10] gi) -- (in [50 999 10] hi)
+;; narrower needles probe the same keys; a float needle keeps the scan path
+(find gi (as 'i32 [30 31])) -- (find hi (as 'i32 [30 31]))
+(find gi [30.0 31.5]) -- (find hi [30.0 31.5])
+;; scalar find still answers through the index
+(find gi 70) -- 6
+(find gi 71) -- 0N
+;; unique marker on top of grouped: the same probes
+(set ui (.attr.set 'unique (.attr.set 'grouped [5 6 7 8])))
+(.attr.get ui) -- ['unique 'grouped]
+(find ui [8 5 9]) -- [3 0 0N]
+(in [8 9] ui) -- [true false]
+
+;; ─────────────────────────── the needle side hashed when smaller ───────────
+;; no index: fewer needles than rows hashes the needles and scans once — the
+;; answers (first occurrence, duplicates, misses, null needle) are unchanged
+(set big (concat (til 1000) [7 7 7]))
+(find big [7 999 1002 5000 7]) -- [7 999 0N 0N 7]
+(find big [0N 3]) -- [0N 3]
+(set bn (concat [1 0N 2] (til 500)))
+(find bn [0N 2 499]) -- [1 2 502]
+(in [7 5000 0] big) -- [true false true]
+(in [0N 2] bn) -- [true true]
+
+;; ─────────────────────────── SYM: same domain and a different one ──────────
+(set hs ['a 'b 'a 'c 'a 'b])
+(set gs (.attr.set 'grouped hs))
+(find gs ['c 'a 'z 'b]) -- [3 0 0N 1]
+(find gs ['c 'a 'z 'b]) -- (find hs ['c 'a 'z 'b])
+(in ['z 'b] gs) -- [false true]
+(find gs 'c) -- 3
+(find gs 'z) -- 0N
+;; unique now admits SYM
+(.attr.get (.attr.set 'unique ['x 'y 'z])) -- ['unique]
+(.attr.set 'unique ['x 'y 'x]) !- domain
+;; a splayed round trip puts the column in a FILE domain; the needles stay
+;; runtime-domain — the probe translates them through the column's domain
+(.sys.exec "rm -rf /tmp/rf-idx-find-sym")
+(.db.splayed.set "/tmp/rf-idx-find-sym/" (table ['k 'v] (list gs [1 2 3 4 5 6])))
+(set ls (at (.db.splayed.get "/tmp/rf-idx-find-sym/") 'k))
+(.attr.get ls) -- ['grouped]
+(find ls ['c 'a 'z 'b]) -- [3 0 0N 1]
+(in ['z 'b 'a] ls) -- [false true true]
+(find ls 'b) -- 1
+
+;; ─────────────────────────── STR: the hash attach is admitted ──────────────
+(set hstr ["alpha" "beta" "alpha" "gamma" "delta" "beta"])
+(set gstr (.attr.set 'grouped hstr))
+(.attr.get gstr) -- ['grouped]
+(.idx.has? gstr) -- true
+(at (.idx.info gstr) 'kind) -- 'hash
+(at (.idx.info gstr) 'n_groups) -- 4
+(find gstr ["gamma" "alpha" "zeta" "delta" "beta"]) -- [3 0 0N 4 1]
+(find gstr ["gamma" "alpha" "zeta" "delta" "beta"]) -- (find hstr ["gamma" "alpha" "zeta" "delta" "beta"])
+(in ["zeta" "beta" "delta"] gstr) -- [false true true]
+(in ["zeta" "beta" "delta"] gstr) -- (in ["zeta" "beta" "delta"] hstr)
+(find gstr "gamma") -- 3
+(find gstr "zeta") -- 0N
+;; an empty string is the STR null: such a vector keeps the scan semantics
+(find (.attr.set 'grouped ["a" "" "b"]) ["" "b" "c"]) -- (find ["a" "" "b"] ["" "b" "c"])
+;; the index rides the vector through ordinary reads
+(at gstr 3) -- "gamma"
+(count gstr) -- 6
+;; unique on STR: verified, then a marker on the hash
+(set ustr (.attr.set 'unique (.attr.set 'grouped ["k1" "k2" "k3"])))
+(.attr.get ustr) -- ['unique 'grouped]
+(.attr.set 'unique ["k1" "k2" "k1"]) !- domain
+(.attr.get (.attr.set 'unique ["k1" "k2"])) -- ['unique]
+;; long (out-of-line) strings hash and compare by their bytes too
+(set lstr (.attr.set 'grouped (as 'str (+ 1000000000000000000 (til 300)))))
+(find lstr (as 'str [1000000000000000299 1000000000000000000 1000000000000000300])) -- [299 0 0N]
+;; a splayed round trip keeps the STR hash
+(.sys.exec "rm -rf /tmp/rf-idx-find-str")
+(.db.splayed.set "/tmp/rf-idx-find-str/" (table ['k 'v] (list gstr [1 2 3 4 5 6])))
+(set lstr2 (at (.db.splayed.get "/tmp/rf-idx-find-str/") 'k))
+(.attr.get lstr2) -- ['grouped]
+(find lstr2 ["gamma" "alpha" "zeta" "delta" "beta"]) -- [3 0 0N 4 1]
+(in ["zeta" "beta"] lstr2) -- [false true]
+
+;; ─────────────────────────── dict lookup through the keys' index ───────────
+(set d (dict gstr [1 2 3 4 5 6]))
+(at d "gamma") -- 4
+(at d "zeta") -- 0N
+(at d ["gamma" "alpha" "zeta" "beta"]) -- (list 4 1 0N 2)
+(at d ["gamma" "alpha" "zeta" "beta"]) -- (at (dict hstr [1 2 3 4 5 6]) ["gamma" "alpha" "zeta" "beta"])
+(set di (dict gi (til 10)))
+(at di [50 10 999 100]) -- (list 4 0 0N 9)
+(at di [50 10 999 100]) -- (at (dict hi (til 10)) [50 10 999 100])
+(at di 70) -- 6
+(at di 71) -- 0N
+;; a dict with list values gathers the same elements
+(set dl (dict (.attr.set 'grouped [1 2 3]) (list "one" "two" "three")))
+(at dl [3 1 9]) -- (list "three" "one" 0N)
+
+;; ─────────────────────────── concat keeps the index for new keys ───────────
+(set c0 (.attr.set 'unique (.attr.set 'grouped [100 200 300])))
+(set c1 (concat c0 [400 500]))
+(.attr.get c1) -- ['unique 'grouped]
+(count c1) -- 5
+(find c1 [500 100 300 999]) -- [4 0 2 0N]
+(find c1 [500 100 300 999]) -- (find [100 200 300 400 500] [500 100 300 999])
+(in [400 999] c1) -- [true false]
+;; an atom appended is the same motion
+(set c2 (concat c1 600))
+(.attr.get c2) -- ['unique 'grouped]
+(find c2 [600 100]) -- [5 0]
+;; a repeated key is not carried: the result is a plain vector, as before
+(.attr.get (concat c0 [300 700])) -- (.attr.get [1 2])
+(find (concat c0 [300 700]) [300 700]) -- [2 4]
+;; grouped without unique: new keys carry, a repeat drops
+(.attr.get (concat gi [1 2 3])) -- ['grouped]
+(find (concat gi [1 2 3]) [3 10 1]) -- [12 0 10]
+(.attr.get (concat gi [10])) -- (.attr.get [1 2])
+;; many appends grow the bucket table past its load factor
+(set cg (concat (.attr.set 'grouped (til 5)) (+ 5 (til 2000))))
+(.attr.get cg) -- ['grouped]
+(at (.idx.info cg) 'n_groups) -- 2005
+(find cg [0 4 5 2004 2005]) -- [0 4 5 2004 0N]
+(find cg [0 4 5 2004 2005]) -- (find (til 2005) [0 4 5 2004 2005])
+(sum (find cg (til 2005))) -- (sum (til 2005))
+;; STR and SYM appends carry too
+(set cs (concat gstr ["epsilon"]))
+(.attr.get cs) -- ['grouped]
+(find cs ["epsilon" "alpha"]) -- [6 0]
+(.attr.get (concat gstr ["alpha"])) -- (.attr.get [1 2])
+(set csy (concat gs ['d]))
+(.attr.get csy) -- ['grouped]
+(find csy ['d 'a 'z]) -- [6 0 0N]
+;; a null appended leaves the result unindexed
+(.attr.get (concat c0 [0N])) -- (.attr.get [1 2])
+(find (concat c0 [0N]) [0N 300]) -- [3 2]
+;; the carried index persists like a built one
+(.sys.exec "rm -rf /tmp/rf-idx-find-carry")
+(.db.splayed.set "/tmp/rf-idx-find-carry/" (table ['k] (list c1)))
+(.attr.get (at (.db.splayed.get "/tmp/rf-idx-find-carry/") 'k)) -- ['unique 'grouped]
+(find (at (.db.splayed.get "/tmp/rf-idx-find-carry/") 'k) [500 999]) -- [4 0N]
+(.sys.exec "rm -rf /tmp/rf-idx-find-sym /tmp/rf-idx-find-str /tmp/rf-idx-find-carry")
