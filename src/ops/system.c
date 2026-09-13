@@ -640,7 +640,11 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
          * aux bytes 8..15; the index pointer only occupies bytes 0..7. */
         if (v->type == RAY_STR && v->str_pool)
             OBJSIZE_PUSH(v->str_pool);
-        return true;
+        /* A TABLE carries the keyed-upsert map here, but its schema and
+         * columns are still its own children: returning now would report a
+         * mapped table as nothing but its map.  Fall through to the arm
+         * below.  Only a vector has nothing further to walk. */
+        if (v->type != RAY_TABLE) return true;
     }
     if (v->type == RAY_STR && v->str_pool)
         OBJSIZE_PUSH(v->str_pool);

@@ -2540,7 +2540,11 @@ ray_t* ray_index_drop(ray_t** vp) {
     /* After ray_cow, *vp may be a freshly copied block.  In ray_alloc_copy,
      * the index pointer was retained by ray_retain_owned_refs (via the
      * RAY_ATTR_HAS_INDEX branch we add in heap.c), so v->index here is
-     * still the live, owned index ray_t. */
+     * still the live, owned index ray_t — EXCEPT for a table, whose key map
+     * ray_alloc_copy deliberately does not carry to the copy.  The copy has
+     * no index left to detach, which is the state this function exists to
+     * reach, so it is already done. */
+    if (!(v->attrs & RAY_ATTR_HAS_INDEX) || !v->index) return v;
     ray_t* idx = v->index;
     ray_index_t* ix = ray_index_payload(idx);
 

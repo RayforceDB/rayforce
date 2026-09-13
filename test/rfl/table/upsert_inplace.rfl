@@ -256,3 +256,40 @@
 (count q) -- 6
 (at (at q 'v) 1) -- 222
 (at (at q 'k) 5) -- 6
+
+;; ── a key wider than the map's arm must drop the map, not skip it ───────
+;; RAY_UKEY_MAX_COLS is 8.  A wider key gets no map, but an already attached
+;; one cannot simply be left alone: the call still writes every non-key column
+;; of a matched row in place, and those may be the attached map's key columns.
+;; With no row appended the row count does not move either, so the staleness
+;; check would accept it as fresh and the next upsert would answer from rows
+;; that no longer hold the keys it recorded — appending a duplicate.
+(set w9 (table [c1 c2 c3 c4 c5 c6 c7 c8 c9 key] (list (til 3) (til 3) (til 3) (til 3) (til 3) (til 3) (til 3) (til 3) (til 3) (* 10 (til 3)))))
+(upsert 'w9 'key (table [key] (list [0 10])))
+(count w9) -- 3
+(upsert 'w9 9 (table [c1 c2 c3 c4 c5 c6 c7 c8 c9 key] (list (enlist 0) (enlist 0) (enlist 0) (enlist 0) (enlist 0) (enlist 0) (enlist 0) (enlist 0) (enlist 0) (enlist 999))))
+(count w9) -- 3
+(at w9 'key) -- [999 10 20]
+(upsert 'w9 'key (table [key c1] (list (enlist 999) (enlist 777))))
+(count w9) -- 3
+(at w9 'c1) -- [777 1 2]
+
+;; ── .idx.drop on a table carrying the key map ───────────────────────────
+;; ray_index_drop COWs its target first, and ray_alloc_copy deliberately does
+;; not carry a table's key map to the copy — so the copy has no index left to
+;; detach.  Reading it anyway dereferenced NULL.
+(set idt (table [k v] (list (til 5) (* 2 (til 5)))))
+(upsert 'idt 1 (table [k v] (list [5 6] [50 60])))
+(.idx.has? idt) -- true
+(count (.idx.drop idt)) -- 7
+(count idt) -- 7
+
+;; ── .mem.objsize counts a mapped table's columns, not just its map ──────
+;; The HAS_INDEX arm returned early, which was harmless while only vectors
+;; could carry an index; a table reported as nothing but its map came out
+;; smaller than the same table without one.
+(set osa (table [k v] (list (til 20000) (* 2 (til 20000)))))
+(set osb (table [k v] (list (take [0] 0) (take [0] 0))))
+(upsert 'osb 1 (table [k v] (list (til 20000) (* 2 (til 20000)))))
+(.idx.has? osb) -- true
+(> (.mem.objsize osb) (.mem.objsize osa)) -- true
