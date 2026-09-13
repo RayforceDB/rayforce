@@ -15173,6 +15173,13 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
      * it over everything — one interleaved row per batch was enough to put
      * the whole quadratic back. */
     if (!err) {
+        /* A key wider than the arm gets no map — but an already attached one
+         * must go, not simply be skipped.  This call still writes every
+         * non-key column of a matched row in place, and those may be the
+         * attached map's key columns; with no row appended the row count does
+         * not move either, so ukey_fits would accept it as fresh next time
+         * and answer from stale rows. */
+        if (inplace && nk > RAY_UKEY_MAX_COLS) ray_table_ukey_drop(tbl);
         if (inplace && nk <= RAY_UKEY_MAX_COLS) {
             ukey = ray_table_ukey_get(tbl);
             if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
