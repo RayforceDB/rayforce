@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
+#include "ops/idxop.h"       /* ray_index_carry_append: keep a hash index across concat */
 #include "lang/env.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "vec/vec.h"
@@ -3344,8 +3345,13 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         return str_vec_concat_atom(b, a, true);
     /* Vector concat: same type — delegate to ray_vec_concat which handles
      * null bitmap propagation, SYM width promotion, and STR pool merging. */
-    if (ray_is_vec(a) && ray_is_vec(b) && a->type == b->type)
-        return ray_vec_concat(a, b);
+    if (ray_is_vec(a) && ray_is_vec(b) && a->type == b->type) {
+        ray_t* r = ray_vec_concat(a, b);
+        /* An append onto an indexed vector keeps the index when every
+         * appended key is new (see ray_index_carry_append). */
+        if (r && !RAY_IS_ERR(r) && ray_index_has(a)) ray_index_carry_append(a, r);
+        return r;
+    }
     /* Concat typed vec + boxed list or boxed list + typed vec -> boxed list */
     if ((ray_is_vec(a) && b->type == RAY_LIST) || (a->type == RAY_LIST && ray_is_vec(b))) {
         ray_t* la = (a->type == RAY_LIST) ? a : NULL;
@@ -3493,6 +3499,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
          * and null-ness of the trailing atom (sentinel written raw at na). */
         if (ray_vec_may_have_nulls(a) || RAY_ATOM_IS_NULL(b))
             result->attrs |= RAY_ATTR_HAS_NULLS;
+        if (ray_index_has(a)) ray_index_carry_append(a, result);
         return result;
     }
     /* Atom + atom of same type -> 2-element vector */

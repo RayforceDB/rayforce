@@ -3,13 +3,13 @@
 Semantic properties stamped onto columns — `sorted`, `unique`, `grouped`, `parted`.  Where an [accelerator index](indexes.md) is a *physical* structure (a hash table, a permutation), a column attribute is an *assertion about meaning*: this column is non-descending, these values are distinct.  The `.attr.*` family layers over the same storage as `.idx.*`, but its contract is semantic, not structural.
 
 !!! note "v1 status"
-    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `unique` are numeric; the backing-index attributes `grouped` and `parted` also support symbol columns.
+    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `parted` are numeric (`parted` also takes symbols); `unique` and `grouped` take numeric, symbol and string columns.
 
 ## Why Attributes Are Separate from Indexes
 
 An [accelerator index](indexes.md) answers *"what structure is attached?"* — a zonemap, a hash table, a sort permutation.  A column attribute answers a different question: *"what is semantically true of these values?"*  The two markers (`sorted`, `unique`) carry no allocation at all — they are cheap flags.  The two backing-index attributes (`grouped`, `parted`) do reuse the index layer underneath (so a `grouped` or `parted` column also shows up via `.idx.has?` and `.idx.info`), but `.attr.*` exists to assert a *property* the engine can trust, not merely to build a structure.
 
-The payoff is that consumers can trust a stamped attribute unconditionally. Besides the [as-of join executor](joins.md#pre-sorted-fast-path), filters and grouped aggregation use the physical layout directly.
+The payoff is that consumers can trust a stamped attribute unconditionally. Besides the [as-of join executor](joins.md#pre-sorted-fast-path), filters and grouped aggregation use the physical layout directly, and a keyed lookup against a `grouped` vector — `find` or `in` with a vector of needles, `at` on a dict keyed by it — probes the hash once per needle instead of building one over the whole vector per call.
 
 ## The Four Attributes
 
@@ -108,7 +108,9 @@ But a column holds at most one backing index — setting `grouped` or `parted` r
 
 ## Conservative Propagation
 
-Attributes propagate **conservatively**.  Only operations that trivially preserve the values — a refcount / copy-on-write copy, a plain rebind — keep the attributes.  *Any* transform that could change ordering, length, or values (arithmetic, `filter` / `where`, `reverse`, `concat`, reordering `take`) **drops** them.  This keeps the invariant honest: a held attribute always reflects the current bytes.
+Attributes propagate **conservatively**.  Only operations that trivially preserve the values — a refcount / copy-on-write copy, a plain rebind — keep the attributes.  *Any* transform that could change ordering, length, or values (arithmetic, `filter` / `where`, `reverse`, reordering `take`) **drops** them.  This keeps the invariant honest: a held attribute always reflects the current bytes.
+
+One append shape is the exception.  `(concat v rows)` and `(concat v atom)` on a `grouped` vector keep the hash (and a `unique` marker) when **every appended key is new** — the existing groups are copied and each appended row becomes a group of its own, so an append-only keyed vector never pays a rebuild.  An appended row that repeats a key, a null, or a symbol from another domain leaves the result a plain vector, exactly as before; `sorted` is always dropped by `concat`.
 
 ```lisp
 ; Arithmetic drops the marker (and a backing index).
@@ -118,6 +120,10 @@ Attributes propagate **conservatively**.  Only operations that trivially preserv
 ; Reorder / concat drop the marker.
 (.attr.get (reverse (.attr.set 'sorted [1 2 3])))               ; ⇒ no attributes
 (.attr.get (concat (.attr.set 'sorted [1 2 3]) [0 1]))          ; ⇒ no attributes
+
+; An append of NEW keys carries a hash index (and `unique`); a repeat drops it.
+(.attr.get (concat (.attr.set 'unique (.attr.set 'grouped [1 2 3])) [4 5]))   ; ⇒ ['unique 'grouped]
+(.attr.get (concat (.attr.set 'grouped [1 2 3]) [3]))                          ; ⇒ no attributes
 
 ; Plain rebind preserves.
 (set _s (.attr.set 'sorted [1 2 3]))
@@ -162,9 +168,9 @@ For a partitioned join `(asof-join [Key Time] L R)`, if the single numeric equal
 
 ## Caveats and Limits
 
-- **Type support.** `sorted` and `unique` accept numeric types. `grouped` and `parted` also accept `SYM`; `STR` remains unsupported.
+- **Type support.** `sorted` accepts numeric types; `parted` numeric and `SYM`. `unique` and `grouped` accept numeric, `SYM` and `STR` — a `STR` hash is keyed on a 64-bit hash of the bytes with the payload compared on every hit, so a content-keyed column (a digest) carries an index like any other.  A `STR` `grouped` column persists its hash through a splayed save in place of the automatic string dictionary (one index per column).
 - **Strict verify, no silent stamping.**  `.attr.set` errors on violation rather than recording a property it cannot confirm; this is what lets consumers trust the stamp unconditionally.
-- **Conservative propagation.**  Only copy / rebind preserve attributes; every transform drops them.  Re-assert with `.attr.set` after a transform.
+- **Conservative propagation.**  Only copy / rebind preserve attributes; every transform drops them, except an append of new keys onto a `grouped` vector (see above).  Re-assert with `.attr.set` after any other transform.
 - **One backing index per column.**  `grouped` and `parted` share the [accelerator-index](indexes.md) slot, so a column carries at most one of them at a time; the markers are separate and free.
 
 ## Quick Reference
