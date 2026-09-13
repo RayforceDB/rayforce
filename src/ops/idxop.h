@@ -369,6 +369,35 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
  * scan correctly surfaces null-equality searches. */
 int64_t ray_index_find_row(ray_t* col, int64_t key);
 
+/* ===== Hash-index find: one atom / a vector of needles =====
+ *
+ * ray_index_find_atom: like ray_index_find_row but keyed by an ATOM, so it
+ * also serves SYM columns (the symbol re-expressed in the column's domain)
+ * and STR columns (the bytes).  Same contract: >= 0 first row, -1 provably
+ * absent, -2 not eligible (no fresh null-free hash index, null / float /
+ * cross-family needle) — caller falls back to the scan.
+ *
+ * ray_index_find_vec: one probe per needle of the typed vector `needles`
+ * into `out[needles->len]` (first matching row, NULL_I64 on a miss; a null
+ * needle misses — the index is only consulted on null-free columns).
+ * Returns 1 when handled, 0 when not eligible (out is then unspecified and
+ * the caller builds its own hash).  Integer-family needles for an
+ * integer-family column, SYM for SYM (any domain), STR for STR. */
+int64_t ray_index_find_atom(ray_t* col, ray_t* atom);
+int ray_index_find_vec(ray_t* col, ray_t* needles, int64_t* out, bool* any_miss);
+
+/* ===== Hash-index carry across an append =====
+ *
+ * `dst` is a fresh (rc=1, unsliced, unindexed, null-free) vector whose first
+ * src->len rows are src's rows and whose tail is appended rows.  When src
+ * carries a fresh null-free hash index and every appended row is a NEW key,
+ * dst gets an equivalent index in O(groups + appended) without re-hashing the
+ * old rows; markers (`unique`) and the within-group order symbol carry over.
+ * A repeated key, a float column, a SYM domain change or OOM leave dst
+ * unindexed (the caller re-attaches if it wants one).  Best-effort: never
+ * fails the append. */
+void ray_index_carry_append(ray_t* src, ray_t* dst);
+
 /* ===== Hash-index group slice (CSR accessor) =====
  *
  * Resolve `key` to its group's contiguous ascending row-id slice.
