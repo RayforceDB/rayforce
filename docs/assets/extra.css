@@ -173,35 +173,38 @@
   --md-typeset-a-color: #c4821a;
 }
 
+/* Material also applies .md-typeset to search-result articles. Keep the
+   site's display typography out of those compact result snippets. */
+
 /* ── Headings: Oswald, marketing-style ────────────────────────── */
 
-.md-typeset h1,
-.md-typeset h2,
-.md-typeset h3,
-.md-typeset h4,
-.md-typeset h5,
-.md-typeset h6,
+.md-typeset:not(.md-search-result__article) h1,
+.md-typeset:not(.md-search-result__article) h2,
+.md-typeset:not(.md-search-result__article) h3,
+.md-typeset:not(.md-search-result__article) h4,
+.md-typeset:not(.md-search-result__article) h5,
+.md-typeset:not(.md-search-result__article) h6,
 .md-header__title {
   font-family: 'Oswald', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-weight: 700;
   letter-spacing: 0.01em;
 }
 
-.md-typeset h1 {
+.md-typeset:not(.md-search-result__article) h1 {
   font-weight: 700;
   font-size: 2.4rem;
   line-height: 1.1;
   color: #f1f5f9;
 }
 
-.md-typeset h2 {
+.md-typeset:not(.md-search-result__article) h2 {
   font-size: 1.7rem;
   border-bottom: 1px solid rgba(233, 160, 51, 0.15);
   padding-bottom: 0.3rem;
   margin-top: 2.5rem;
 }
 
-.md-typeset h3 {
+.md-typeset:not(.md-search-result__article) h3 {
   font-size: 1.3rem;
   color: #f0b954;
 }
@@ -269,7 +272,7 @@
 
 /* ── Inline code & code blocks ───────────────────────────────── */
 
-.md-typeset code {
+.md-typeset:not(.md-search-result__article) code {
   background: rgba(233, 160, 51, 0.1);
   color: #f5d080;
   padding: 0.12em 0.35em;
@@ -277,7 +280,7 @@
   font-size: 0.88em;
 }
 
-.md-typeset pre > code {
+.md-typeset:not(.md-search-result__article) pre > code {
   background: #0d1219;
   color: #f1f5f9;
   border: 1px solid rgba(233, 160, 51, 0.08);
@@ -285,12 +288,12 @@
 
 /* ── Tables ──────────────────────────────────────────────────── */
 
-.md-typeset table:not([class]) {
+.md-typeset:not(.md-search-result__article) table:not([class]) {
   border: 1px solid rgba(233, 160, 51, 0.1);
   background: rgba(17, 24, 32, 0.4);
 }
 
-.md-typeset table:not([class]) th {
+.md-typeset:not(.md-search-result__article) table:not([class]) th {
   background: rgba(233, 160, 51, 0.08);
   color: #f0b954;
   font-family: 'Oswald', sans-serif;
@@ -302,15 +305,15 @@
 
 /* ── Admonitions: match info-box look ────────────────────────── */
 
-.md-typeset .admonition,
-.md-typeset details {
+.md-typeset:not(.md-search-result__article) .admonition,
+.md-typeset:not(.md-search-result__article) details {
   border-left: 3px solid #e9a033;
   background: rgba(17, 24, 32, 0.5);
   font-size: 0.85rem;
 }
 
-.md-typeset .admonition-title,
-.md-typeset summary {
+.md-typeset:not(.md-search-result__article) .admonition-title,
+.md-typeset:not(.md-search-result__article) summary {
   background: rgba(233, 160, 51, 0.08);
   font-family: 'Oswald', sans-serif;
   font-weight: 600;
@@ -325,7 +328,7 @@
      .md-button          → outlined "ghost" pill
      .md-button--primary → filled gradient pill with glow lift. */
 
-.md-typeset .md-button {
+.md-typeset:not(.md-search-result__article) .md-button {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 13px 30px; border-radius: 100px;
   font-weight: 600; font-size: .9rem;
@@ -336,20 +339,20 @@
   transition: color .2s, border-color .2s, background .2s, box-shadow .2s, transform .2s;
 }
 
-.md-typeset .md-button:hover {
+.md-typeset:not(.md-search-result__article) .md-button:hover {
   color: var(--text, #f1f5f9);
   border-color: var(--border-hover, rgba(233, 160, 51, 0.4));
   background: rgba(233, 160, 51, 0.05);
 }
 
-.md-typeset .md-button--primary {
+.md-typeset:not(.md-search-result__article) .md-button--primary {
   color: var(--text, #f1f5f9);
   border: 0;
   background: linear-gradient(135deg, var(--primary, #e9a033), var(--primary-light, #f0b954));
   box-shadow: 0 4px 20px rgba(233, 160, 51, 0.35);
 }
 
-.md-typeset .md-button--primary:hover {
+.md-typeset:not(.md-search-result__article) .md-button--primary:hover {
   color: var(--text, #f1f5f9);
   background: linear-gradient(135deg, var(--primary, #e9a033), var(--primary-light, #f0b954));
   box-shadow: 0 8px 32px rgba(233, 160, 51, 0.5);
@@ -369,12 +372,12 @@
 
 /* ── Links inside body ──────────────────────────────────────── */
 
-.md-typeset a {
+.md-typeset:not(.md-search-result__article) a {
   color: #f0b954;
   transition: color .15s;
 }
 
-.md-typeset a:hover {
+.md-typeset:not(.md-search-result__article) a:hover {
   color: #5eead4;
 }
 
@@ -586,49 +589,49 @@ html.landing-page body .footer.landing-footer { display: block; }
   border-left: 2px solid #e9a033;
 }
 
-.md-typeset h1 {
+.md-typeset:not(.md-search-result__article) h1 {
   margin-bottom: 2.2rem;
   color: #f8fafc;
   font-size: clamp(2.8rem, 5vw, 4.6rem);
   line-height: .96;
   letter-spacing: -.025em;
 }
-.md-typeset h2 {
+.md-typeset:not(.md-search-result__article) h2 {
   margin-top: 3.4rem;
   padding-bottom: .55rem;
   border-bottom-color: rgba(233,160,51,.22);
   font-size: 2rem;
 }
-.md-typeset h3 { color: #f3c46b; }
-.md-typeset p,
-.md-typeset li { line-height: 1.7; }
+.md-typeset:not(.md-search-result__article) h3 { color: #f3c46b; }
+.md-typeset:not(.md-search-result__article) p,
+.md-typeset:not(.md-search-result__article) li { line-height: 1.7; }
 
-.md-typeset .md-button {
+.md-typeset:not(.md-search-result__article) .md-button {
   min-height: 48px;
   padding: 12px 22px;
   border-radius: 0;
   font-family: 'JetBrains Mono', monospace;
   font-size: .72rem;
 }
-.md-typeset .md-button--primary {
+.md-typeset:not(.md-search-result__article) .md-button--primary {
   color: #171109;
   border: 1px solid #e9a033;
   background: #e9a033;
   box-shadow: 0 12px 36px rgba(233,160,51,.16);
 }
-.md-typeset .md-button--primary:hover {
+.md-typeset:not(.md-search-result__article) .md-button--primary:hover {
   color: #171109;
   background: #f3c46b;
   box-shadow: 0 16px 44px rgba(233,160,51,.22);
 }
-.md-typeset code { border-radius: 0; }
-.md-typeset pre > code,
-.md-typeset .highlight,
-.md-typeset table:not([class]),
-.md-typeset .admonition,
-.md-typeset details { border-radius: 0; }
-.md-typeset pre > code { border-color: rgba(255,255,255,.1); }
-.md-typeset table:not([class]) { border-color: rgba(255,255,255,.1); }
+.md-typeset:not(.md-search-result__article) code { border-radius: 0; }
+.md-typeset:not(.md-search-result__article) pre > code,
+.md-typeset:not(.md-search-result__article) .highlight,
+.md-typeset:not(.md-search-result__article) table:not([class]),
+.md-typeset:not(.md-search-result__article) .admonition,
+.md-typeset:not(.md-search-result__article) details { border-radius: 0; }
+.md-typeset:not(.md-search-result__article) pre > code { border-color: rgba(255,255,255,.1); }
+.md-typeset:not(.md-search-result__article) table:not([class]) { border-color: rgba(255,255,255,.1); }
 .md-footer { border-top-color: rgba(255,255,255,.1); }
 
 [data-md-color-scheme="slate"] .md-search__output { border-radius: 0; }
@@ -706,15 +709,15 @@ html.landing-page body .footer.landing-footer { display: block; }
 .docs-nav-github svg { width: 17px; height: 17px; fill: currentColor; }
 
 /* Docs typography follows the same editorial hierarchy as the home sections. */
-.md-typeset h1,
-.md-typeset h2,
-.md-typeset h3,
-.md-typeset h4 {
+.md-typeset:not(.md-search-result__article) h1,
+.md-typeset:not(.md-search-result__article) h2,
+.md-typeset:not(.md-search-result__article) h3,
+.md-typeset:not(.md-search-result__article) h4 {
   font-family: 'Oswald', 'Oswald Fallback', sans-serif;
   text-transform: uppercase;
 }
-.md-typeset h1 { letter-spacing: -.035em; }
-.md-typeset h2 { letter-spacing: -.02em; }
+.md-typeset:not(.md-search-result__article) h1 { letter-spacing: -.035em; }
+.md-typeset:not(.md-search-result__article) h2 { letter-spacing: -.02em; }
 .md-nav__title {
   font-family: 'JetBrains Mono', monospace;
   font-size: .62rem;
@@ -778,14 +781,14 @@ html:not(.landing-page) .md-content__inner {
   padding-bottom: 5rem;
 }
 html:not(.landing-page) .md-content__inner::before { display: none; }
-html:not(.landing-page) .md-typeset h1 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 {
   margin: 0 0 36px;
   color: #f8fafc;
   font-size: clamp(3.6rem, 5vw, 5.8rem);
   line-height: .9;
   letter-spacing: -.045em;
 }
-html:not(.landing-page) .md-typeset h1::before {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1::before {
   content: 'RAYFORCE / DOCUMENTATION';
   display: block;
   margin-bottom: 26px;
@@ -795,26 +798,26 @@ html:not(.landing-page) .md-typeset h1::before {
   font: 600 10px/1.2 'JetBrains Mono', monospace;
   letter-spacing: .13em;
 }
-html:not(.landing-page) .md-typeset h1 + p {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 + p {
   color: #c1cad3;
   font-size: 1.02rem;
   line-height: 1.75;
 }
-html:not(.landing-page) .md-typeset h2 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h2 {
   margin-top: 4.2rem;
   padding-bottom: .7rem;
   border-bottom: 1px solid rgba(233,160,51,.24);
   font-size: clamp(2.25rem, 3.2vw, 3.5rem);
   line-height: 1;
 }
-html:not(.landing-page) .md-typeset h3 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h3 {
   margin-top: 2.5rem;
   font-size: 1.6rem;
   letter-spacing: -.01em;
 }
-html:not(.landing-page) .md-typeset p,
-html:not(.landing-page) .md-typeset li { color: #aab5bf; }
-html:not(.landing-page) .md-typeset strong { color: #edf2f6; }
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) p,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) li { color: #aab5bf; }
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) strong { color: #edf2f6; }
 html:not(.landing-page) .md-sidebar {
   color: #8f9daa;
 }
@@ -843,10 +846,10 @@ html:not(.landing-page) .md-nav__link--active {
   border-left: 2px solid #e9a033;
   color: #f3c46b;
 }
-html:not(.landing-page) .md-typeset pre > code,
-html:not(.landing-page) .md-typeset table:not([class]),
-html:not(.landing-page) .md-typeset .admonition,
-html:not(.landing-page) .md-typeset details {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) pre > code,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) table:not([class]),
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) .admonition,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) details {
   border-color: rgba(255,255,255,.12);
   background-color: rgba(11,16,23,.88);
 }
@@ -864,11 +867,11 @@ html:not(.landing-page) .md-footer {
     padding-inline: clamp(18px, 5vw, 48px);
     border-inline: 0;
   }
-  html:not(.landing-page) .md-typeset h1 { font-size: clamp(3rem, 12vw, 4.6rem); }
+  html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 { font-size: clamp(3rem, 12vw, 4.6rem); }
 }
 
 @media screen and (max-width: 30em) {
-  html:not(.landing-page) .md-typeset .md-button {
+  html:not(.landing-page) .md-typeset:not(.md-search-result__article) .md-button {
     display: table;
     width: fit-content;
     max-width: 100%;
@@ -1021,7 +1024,20 @@ html:not(.landing-page) .docs-site-nav .md-search__inner {
   width: 0;
   overflow: hidden;
 }
+/* Results are absolutely positioned below the form on desktop. Keep the
+   closed search collapsed, but allow its results panel to extend when open. */
+html:not(.landing-page) [data-md-toggle="search"]:checked ~ .docs-site-nav .md-search__inner {
+  overflow: visible;
+}
 html:not(.landing-page) .docs-site-nav .md-search__form { width: 100%; }
+@media screen and (max-width: 59.984375em) {
+  /* A filtered ancestor makes the fixed mobile search panel relative to
+     the 70px header instead of the viewport, clipping nearly all results. */
+  html:not(.landing-page) [data-md-toggle="search"]:checked ~ .docs-site-nav {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
 
 /* Full-bleed technical canvas: navigation + article, with the third Material
    column removed. Empty space is intentional and carries the engine artwork. */
@@ -1114,28 +1130,28 @@ html:not(.landing-page) .md-nav__link--active {
 
 /* Same editorial scale as the main site's copy—not Material's wide-screen
    root scaling and not a second marketing hero inside the docs. */
-html:not(.landing-page) .md-typeset {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) {
   color: #a9b4bf;
   font-size: 1rem;
   line-height: 1.72;
 }
-html:not(.landing-page) .md-typeset h1,
-html:not(.landing-page) .md-typeset h2,
-html:not(.landing-page) .md-typeset h3,
-html:not(.landing-page) .md-typeset h4 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h2,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h3,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h4 {
   color: #f8fafc;
   font-family: Oswald, 'Oswald Fallback', sans-serif;
   font-weight: 700;
   text-transform: uppercase;
 }
-html:not(.landing-page) .md-typeset h1 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 {
   max-width: 800px;
   margin: 0 0 30px;
   font-size: clamp(3.25rem, 4.2vw, 4.5rem);
   line-height: .94;
   letter-spacing: -.04em;
 }
-html:not(.landing-page) .md-typeset h1::before {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1::before {
   content: 'RAYFORCE / DOCUMENTATION';
   display: block;
   margin-bottom: 24px;
@@ -1145,13 +1161,13 @@ html:not(.landing-page) .md-typeset h1::before {
   font: 600 .62rem/1.2 'JetBrains Mono', monospace;
   letter-spacing: .13em;
 }
-html:not(.landing-page) .md-typeset h1 + p {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 + p {
   max-width: 760px;
   color: #c1cad3;
   font-size: 1.12rem;
   line-height: 1.7;
 }
-html:not(.landing-page) .md-typeset h2 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h2 {
   margin-top: 4rem;
   padding-bottom: .65rem;
   border-bottom: 1px solid rgba(233,160,51,.24);
@@ -1159,20 +1175,20 @@ html:not(.landing-page) .md-typeset h2 {
   line-height: 1;
   letter-spacing: -.025em;
 }
-html:not(.landing-page) .md-typeset h3 {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) h3 {
   margin-top: 2.6rem;
   color: #f3c46b;
   font-size: 1.55rem;
   line-height: 1.2;
 }
-html:not(.landing-page) .md-typeset p,
-html:not(.landing-page) .md-typeset li { color: #a9b4bf; }
-html:not(.landing-page) .md-typeset strong { color: #edf2f6; }
-html:not(.landing-page) .md-typeset hr {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) p,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) li { color: #a9b4bf; }
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) strong { color: #edf2f6; }
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) hr {
   margin: 30px 0;
   border-color: rgba(255,255,255,.12);
 }
-html:not(.landing-page) .md-typeset .md-button {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) .md-button {
   min-height: 50px;
   margin-right: 8px;
   padding: 13px 22px;
@@ -1180,16 +1196,16 @@ html:not(.landing-page) .md-typeset .md-button {
   font: 600 .76rem/1 'JetBrains Mono', monospace;
   letter-spacing: .03em;
 }
-html:not(.landing-page) .md-typeset .md-button--primary {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) .md-button--primary {
   color: #15100a;
   border: 1px solid #e9a033;
   background: #e9a033;
   box-shadow: 0 10px 40px rgba(233,160,51,.16);
 }
-html:not(.landing-page) .md-typeset pre > code,
-html:not(.landing-page) .md-typeset table:not([class]),
-html:not(.landing-page) .md-typeset .admonition,
-html:not(.landing-page) .md-typeset details {
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) pre > code,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) table:not([class]),
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) .admonition,
+html:not(.landing-page) .md-typeset:not(.md-search-result__article) details {
   border-radius: 0;
   border-color: rgba(255,255,255,.12);
   background-color: rgba(11,16,23,.88);
@@ -1321,17 +1337,17 @@ html:not(.landing-page) .md-footer {
     width: calc(100% - 32px);
     padding: 44px 0 80px;
   }
-  html:not(.landing-page) .md-typeset h1 {
+  html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 {
     font-size: clamp(2.8rem, 14vw, 4rem);
   }
-  html:not(.landing-page) .md-typeset h1::before {
+  html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1::before {
     margin-bottom: 20px;
     padding-left: 34px;
     background-size: 22px 1px;
     font-size: .56rem;
   }
-  html:not(.landing-page) .md-typeset h1 + p { font-size: 1rem; }
-  html:not(.landing-page) .md-typeset .md-button {
+  html:not(.landing-page) .md-typeset:not(.md-search-result__article) h1 + p { font-size: 1rem; }
+  html:not(.landing-page) .md-typeset:not(.md-search-result__article) .md-button {
     display: table;
     width: fit-content;
     max-width: 100%;

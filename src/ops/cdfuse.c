@@ -511,8 +511,8 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     if (!key_col || !val_col || nrows <= 0) return NULL;
     if (!ray_is_vec(key_col) || !ray_is_vec(val_col)) return NULL;
     if (!cdf_type_ok(key_col->type) || !cdf_type_ok(val_col->type)) return NULL;
-    if ((key_col->attrs & RAY_ATTR_HAS_NULLS) ||
-        (val_col->attrs & RAY_ATTR_HAS_NULLS))
+    if (ray_vec_may_have_nulls(key_col) ||
+        ray_vec_may_have_nulls(val_col))
         return NULL;
     if (key_col->len < nrows || val_col->len < nrows) return NULL;
     if (nrows < CDF_MIN_ROWS) return NULL; /* small: existing path fine */

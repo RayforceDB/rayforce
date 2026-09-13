@@ -189,7 +189,7 @@ static inline int hs_row_is_null(ray_t* src, int64_t i, void* data) {
         ray_t* e = ((ray_t**)data)[i];
         return !e || RAY_ATOM_IS_NULL(e);
     }
-    return (src->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(src, i);
+    return ray_vec_may_have_nulls(src) && ray_vec_is_null(src, i);
 }
 
 static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
@@ -207,7 +207,7 @@ static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     hs->null_idx = HS_EMPTY;
     hs->src = src;
     hs->src_type = src ? src->type : 0;
-    hs->src_has_nulls = src ? ((src->attrs & RAY_ATTR_HAS_NULLS) != 0) : false;
+    hs->src_has_nulls = src ? ray_vec_may_have_nulls(src) : false;
     hs->src_data = src ? ray_data(src) : NULL;
     return true;
 }
@@ -580,7 +580,7 @@ static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
 static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
     if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
         return NULL;
-    if (vec->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+    if (ray_vec_may_have_nulls(vec)) return NULL;
     ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
     int op;                                   /* 0:< 1:> 2:<= 3:>= 4:== 5:!= */
     if      (bf == ray_lt_fn)  op = 0;
@@ -1308,8 +1308,8 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
              * the WHERE kernel uses null-matches-nothing semantics — the
              * two must not be conflated.  NULL result = unsupported shape
              * (STR etc.): fall through to the hashset probe below. */
-            if (!(val->attrs & RAY_ATTR_HAS_NULLS) &&
-                !(vec->attrs & RAY_ATTR_HAS_NULLS)) {
+            if (!ray_vec_may_have_nulls(val) &&
+                !ray_vec_may_have_nulls(vec)) {
                 ray_t* fast = ray_in_vec_exec(val, vec, false);
                 if (fast) return fast;
             }
@@ -1381,7 +1381,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
         int64_t len = vec->len;
-        bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
@@ -1724,9 +1724,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
              * (with retain) so the result owns a valid backing store. */
             if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
             /* Propagate null bitmap — check parent's flag for slices */
-            bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) ||
-                             ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
-                              (vec->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+            bool has_nulls = ray_vec_may_have_nulls(vec);
             if (has_nulls) {
                 for (int64_t i = 0; i < count; i++)
                     if (ray_vec_is_null(vec, start + i))
@@ -1929,10 +1927,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         /* SYM ids copied verbatim — resolve over the source domain. */
         if (vtype == RAY_SYM) ray_sym_vec_adopt_domain(result, vec);
         /* Propagate null bitmap — check parent's flag for slices */
-        bool has_nulls = len > 0 &&
-                         ((vec->attrs & RAY_ATTR_HAS_NULLS) ||
-                          ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
-                           (vec->slice_parent->attrs & RAY_ATTR_HAS_NULLS)));
+        bool has_nulls = len > 0 && ray_vec_may_have_nulls(vec);
         if (has_nulls) {
             if (n >= 0) {
                 for (int64_t i = 0; i < abs_n; i++)
@@ -2363,7 +2358,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         int64_t idxlen = ray_len(idx);
         int64_t vlen = ray_len(vec);
         int64_t* ids = (int64_t*)ray_data(idx);
-        bool idx_has_nulls = (idx->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool idx_has_nulls = ray_vec_may_have_nulls(idx);
         bool valid = true;
         for (int64_t j = 0; j < idxlen; j++) {
             if ((idx_has_nulls && ray_vec_is_null(idx, j)) ||
@@ -2492,7 +2487,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec)) {
         int64_t len = vec->len;
-        bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
 
         /* Hash-index fast path: integer-family needle against an indexed
@@ -2594,7 +2589,7 @@ ray_t* reverse_vec_eager(ray_t* x) {
     if (vtype == RAY_STR) {
         ray_t* result = ray_vec_new(RAY_STR, len);
         if (RAY_IS_ERR(result)) return result;
-        bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool has_nulls = ray_vec_may_have_nulls(x);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
                 if (ray_vec_is_null(x, len - 1 - i)) {
@@ -2627,7 +2622,7 @@ ray_t* reverse_vec_eager(ray_t* x) {
     if (vtype == RAY_SYM) esz = ray_sym_elem_size(vtype, x->attrs);
     char* src = (char*)ray_data(x);
     char* dst = (char*)ray_data(result);
-    bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(x);
     if (has_nulls) {
         for (int64_t i = 0; i < len; i++) {
             memcpy(dst + i * esz, src + (len - 1 - i) * esz, esz);
@@ -2838,7 +2833,7 @@ ray_t* deltas_vec_eager(ray_t* x) {
         .src = x,
         .dst = out,
         .pool = pool,
-        .has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0
+        .has_nulls = ray_vec_may_have_nulls(x)
     };
     ray_pool_dispatch(pool, ts_deltas_fn, &ctx, n - 1);
     if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
@@ -2903,7 +2898,7 @@ ray_t* ratios_vec_eager(ray_t* x) {
         .src = x,
         .dst = out,
         .pool = pool,
-        .has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0
+        .has_nulls = ray_vec_may_have_nulls(x)
     };
     ray_pool_dispatch(pool, ts_ratios_fn, &ctx, n - 1);
     if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
@@ -3000,7 +2995,7 @@ ray_t* fills_vec_eager(ray_t* x) {
     }
     if (x->type == RAY_SYM || x->type == RAY_STR ||
         x->type == RAY_BOOL || x->type == RAY_U8 ||
-        (!(x->attrs & RAY_ATTR_HAS_NULLS) && !(x->attrs & RAY_ATTR_SLICE))) {
+        (!ray_vec_may_have_nulls(x) && !(x->attrs & RAY_ATTR_SLICE))) {
         ray_retain(x);
         return x;
     }
@@ -3320,7 +3315,7 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
         .summary = summary, .carry = carry,
         .opcode = opcode,
         .is_float = (x->type == RAY_F64 || x->type == RAY_F32),
-        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .has_nulls = ray_vec_may_have_nulls(x),
         .nblocks = nblocks
     };
 
@@ -3674,7 +3669,7 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         .prefix_count = prefix_count,
         .summary = summary, .carry = carry,
         .opcode = opcode,
-        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .has_nulls = ray_vec_may_have_nulls(x),
         .window = window
     };
 
@@ -3826,7 +3821,7 @@ static ray_t* moving_minmax_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         .src = x, .dst = out, .pool = pool,
         .opcode = opcode,
         .is_float = (x->type == RAY_F64 || x->type == RAY_F32),
-        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .has_nulls = ray_vec_may_have_nulls(x),
         .window = window,
         .ntasks = (int64_t)ntasks
     };

@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "vec/vec.h"
 #include "dict.h"
 #include "table.h"
 #include "table/sym.h"
@@ -207,7 +208,7 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
      * to the first non-null zero — re-introducing the conflation we just
      * fixed in grouping. */
     bool key_is_null = RAY_ATOM_IS_NULL(key_atom);
-    bool keys_have_nulls = (keys->attrs & RAY_ATTR_HAS_NULLS) != 0
+    bool keys_have_nulls = ray_vec_may_have_nulls(keys)
                             || (keys->attrs & RAY_ATTR_SLICE);
     if (key_is_null) {
         if (!keys_have_nulls) return -1;

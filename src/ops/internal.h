@@ -287,7 +287,7 @@ static inline void col_propagate_str_pool_parted(ray_t* dst, ray_t** segs, int64
 static inline void col_propagate_nulls_gather(ray_t* dst, const ray_t* src,
                                                const int64_t* indices,
                                                int64_t count) {
-    bool src_has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool src_has_nulls = ray_vec_may_have_nulls(src);
     for (int64_t r = 0; r < count; r++) {
         if (indices[r] < 0 ||
             (src_has_nulls && ray_vec_is_null((ray_t*)src, indices[r])))
@@ -300,7 +300,7 @@ static inline void col_propagate_nulls_gather(ray_t* dst, const ray_t* src,
 static inline void col_propagate_nulls_range(ray_t* dst, int64_t dst_off,
                                               const ray_t* src, int64_t src_off,
                                               int64_t count) {
-    if (!(src->attrs & RAY_ATTR_HAS_NULLS)) return;
+    if (!ray_vec_may_have_nulls(src)) return;
     for (int64_t i = 0; i < count; i++) {
         if (ray_vec_is_null((ray_t*)src, src_off + i))
             ray_vec_set_null(dst, dst_off + i, true);
@@ -312,7 +312,7 @@ static inline void col_propagate_nulls_range(ray_t* dst, int64_t dst_off,
 static inline void col_propagate_nulls_filter(ray_t* dst, const ray_t* src,
                                                const uint8_t* mask,
                                                int64_t src_len) {
-    if (!(src->attrs & RAY_ATTR_HAS_NULLS)) return;
+    if (!ray_vec_may_have_nulls(src)) return;
     int64_t out = 0;
     for (int64_t i = 0; i < src_len; i++) {
         if (mask[i]) {
@@ -327,7 +327,7 @@ static inline void col_propagate_nulls_filter(ray_t* dst, const ray_t* src,
 static inline ray_t* parted_str_append_elem(ray_t* out, ray_t* seg,
                                             int64_t local_idx,
                                             const char* pool_base) {
-    if ((seg->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(seg, local_idx)) {
+    if (ray_vec_may_have_nulls(seg) && ray_vec_is_null(seg, local_idx)) {
         out = ray_str_vec_append(out, "", 0);
         if (!RAY_IS_ERR(out))
             ray_vec_set_null(out, out->len - 1, true);
