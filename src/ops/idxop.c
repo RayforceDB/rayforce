@@ -3104,7 +3104,7 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
 
     int64_t n0 = src->len, n1 = dst->len, add = n1 - n0;
     int64_t og = sx->u.hash.n_groups, ok = sx->u.hash.n_keys;
-    if (og + add < og || ok + add < ok) return;
+    if (add > INT64_MAX - og || add > INT64_MAX - ok) return;   /* no signed overflow below */
     bool is_str = (t == RAY_STR);
 
     ray_t* gkeys = ray_vec_new(RAY_I64, og + add > 0 ? og + add : 1);
