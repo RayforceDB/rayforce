@@ -502,6 +502,12 @@ void ray_index_retain_saved(ray_index_t* ix);
 
 /* Release per-kind payload children (keys/table/perm/bits...). */
 void ray_index_release_payload(ray_index_t* ix);
+/* The payload child blocks of an index (the same set retain/release walk),
+ * written to out[0..cap) — returns the count (at most 4).  Footprint
+ * accounting (ray_shallow_bytes / ray_retained_bytes) sums them; a
+ * RAY_MARK_MMAP index's children live inside the column's mapping and are
+ * charged there, so callers skip them. */
+int  ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap);
 
 /* Retain per-kind payload children. */
 void ray_index_retain_payload(ray_index_t* ix);
