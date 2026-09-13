@@ -790,6 +790,15 @@ ray_err_t ray_journal_roll(void) {
     int  n = snprintf(archive, sizeof(archive), "%s.%s.log", g_journal.base, stamp);
     if (n <= 0 || (size_t)n >= sizeof(archive)) return RAY_ERR_DOMAIN;
 
+    /* Rolls can happen more than once during a single UTC second.  Keep the
+     * readable timestamp for the common case, but never let rename() replace
+     * an earlier archive when the timestamp collides. */
+    for (unsigned int suffix = 1; file_exists(archive); suffix++) {
+        n = snprintf(archive, sizeof(archive), "%s.%s.%u.log",
+                     g_journal.base, stamp, suffix);
+        if (n <= 0 || (size_t)n >= sizeof(archive)) return RAY_ERR_DOMAIN;
+    }
+
     int flush_rc = fflush(g_journal.fp);
     int close_rc = fclose(g_journal.fp);
     g_journal.fp = NULL;
