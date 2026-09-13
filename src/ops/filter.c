@@ -62,7 +62,7 @@ static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
         int64_t seg_start = (seg > 0) ? seg_ends[seg - 1] : 0;
         int64_t local_row = row - seg_start;
         parted_copy_cells(dst, base, out_attrs, i, segs[seg], local_row, 1);
-        if ((segs[seg]->attrs & RAY_ATTR_HAS_NULLS) &&
+        if (ray_vec_may_have_nulls(segs[seg]) &&
             ray_vec_is_null(segs[seg], local_row))
             ray_vec_set_null(dst_col, i, true);
     }
@@ -182,7 +182,7 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
         if (!segs[s]) continue;
         int64_t seg_len = segs[s]->len;
         char* dst = (char*)ray_data(result);
-        bool seg_has_nulls = (segs[s]->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool seg_has_nulls = ray_vec_may_have_nulls(segs[s]);
         if (seg_has_nulls) {
             for (int64_t i = 0; i < seg_len; i++) {
                 if (pred_data[pred_off + i]) {

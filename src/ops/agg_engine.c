@@ -147,7 +147,7 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
             case RAY_TIMESTAMP: case RAY_SYM: break;
             default: return false;
         }
-        if (kc->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (kc->type != RAY_SYM && ray_vec_may_have_nulls(kc)) return false;
         if (nrows <= 0) return false;   /* empty → no min/max, max<min guard */
 
         /* Narrow SYM codes are bounded by their representation width. Use that
@@ -516,14 +516,14 @@ static bool agg_desc_init(agg_desc_t* d, ray_graph_t* g, ray_op_ext_t* ext,
         ray_t* vc = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
         d->val_data[a]    = vc ? ray_data(vc) : NULL;
         d->val_types[a]   = vc ? vc->type : RAY_I64;
-        d->val_hasnull[a] = vc ? ((vc->attrs & RAY_ATTR_HAS_NULLS) != 0) : false;
+        d->val_hasnull[a] = vc ? ray_vec_may_have_nulls(vc) : false;
         d->val_esz[a]     = vc ? col_esz(vc) : 0;
         /* Binary agg (pearson): resolve the y-side column from agg_ins2[a]. */
         ray_t* vc2 = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
             ? ray_table_get_col(tbl, find_ext(g, ext->agg_ins2[a])->sym) : NULL;
         d->val2_data[a]    = vc2 ? ray_data(vc2) : NULL;
         d->val2_types[a]   = vc2 ? vc2->type : RAY_I64;
-        d->val2_hasnull[a] = vc2 ? ((vc2->attrs & RAY_ATTR_HAS_NULLS) != 0) : false;
+        d->val2_hasnull[a] = vc2 ? ray_vec_may_have_nulls(vc2) : false;
         d->val2_esz[a]     = vc2 ? col_esz(vc2) : 0;
     }
     return true;
@@ -659,7 +659,7 @@ static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
             case RAY_TIMESTAMP: case RAY_SYM: break;
             default: return false;
         }
-        if (kc->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (kc->type != RAY_SYM && ray_vec_may_have_nulls(kc)) return false;
         out->mins[k] = INT64_MAX; out->ranges[k] = 0;   /* sentinels; filled below */
     }
 
@@ -2959,7 +2959,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 case RAY_TIMESTAMP: case RAY_SYM: break;
                 default: keys_intsym = false;
             }
-            if (kc->attrs & RAY_ATTR_HAS_NULLS) keys_intsym = false;
+            if (kc->type != RAY_SYM && ray_vec_may_have_nulls(kc)) keys_intsym = false;
         }
 
         if (dense_par_ok) {
@@ -3181,7 +3181,7 @@ ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
 
     ray_valid_t valid = { val_col ? ray_data(val_col) : NULL,
                           val_col ? val_col->type : RAY_I64,
-                          val_col ? ((val_col->attrs & RAY_ATTR_HAS_NULLS) != 0) : false };
+                          val_col ? ray_vec_may_have_nulls(val_col) : false };
     const void* vals = val_col ? ray_data(val_col) : NULL;
     vt->update_batch(states, vt->state_size, gids, vals, &valid, nrows, NULL);
 
@@ -3221,9 +3221,9 @@ ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
         vt->init(states + (size_t)gi * vt->state_size);
 
     ray_valid_t vx = { ray_data(x_col), x_col->type,
-                       (x_col->attrs & RAY_ATTR_HAS_NULLS) != 0 };
+                       ray_vec_may_have_nulls(x_col) };
     ray_valid_t vy = { ray_data(y_col), y_col->type,
-                       (y_col->attrs & RAY_ATTR_HAS_NULLS) != 0 };
+                       ray_vec_may_have_nulls(y_col) };
     vt->update_batch2(states, vt->state_size, gids,
                       ray_data(x_col), ray_data(y_col), &vx, &vy, nrows, NULL);
 

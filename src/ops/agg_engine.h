@@ -79,7 +79,7 @@ typedef struct {
 } dense_plan_t;
 
 /* Decide if dense grouping applies to (key_cols, aggs).  Eligible iff:
- *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} and NOT HAS_NULLS
+ *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} with no nullable non-SYM keys
  *  - product of per-key ranges is no larger than the contributing row count
  *    (so dense state is O(input), never controlled by a machine-size budget)
  * Does one min/max prescan over the key columns.  Sets out->ok accordingly.

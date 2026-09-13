@@ -84,13 +84,6 @@ static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
     }
 }
 
-/* True if v has any nulls.  HAS_NULLS is preserved on the parent across
- * index attach/detach (see attach_finalize), so this is the same one-bit
- * test in both indexed and non-indexed cases. */
-static inline bool vec_any_nulls(const ray_t* v) {
-    return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
-}
-
 /* In-place drop of attached index — caller must hold a unique ref (rc==1)
  * on `v` itself.  Used by mutation paths to invalidate the (now stale)
  * index before writing.  HAS_NULLS was preserved through the attachment
@@ -524,8 +517,8 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
 
         /* Propagate null bitmaps from a and b.
          * Slices don't carry RAY_ATTR_HAS_NULLS — check RAY_ATTR_SLICE too. */
-        if ((a->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) ||
-            (b->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE))) {
+        if (ray_vec_may_have_nulls(a) ||
+            ray_vec_may_have_nulls(b)) {
             for (int64_t i = 0; i < a->len; i++) {
                 if (ray_vec_is_null((ray_t*)a, i)) {
                     ray_err_t err = ray_vec_set_null_checked(result, i, true);
@@ -659,8 +652,8 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
 
     /* Propagate null bitmaps from a and b.
      * Slices don't carry RAY_ATTR_HAS_NULLS — check RAY_ATTR_SLICE too. */
-    if ((a->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) ||
-        (b->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE))) {
+    if (ray_vec_may_have_nulls(a) ||
+        ray_vec_may_have_nulls(b)) {
         for (int64_t i = 0; i < a->len; i++) {
             if (ray_vec_is_null((ray_t*)a, i)) {
                 ray_err_t err = ray_vec_set_null_checked(result, i, true);
@@ -1568,7 +1561,7 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
         return ((const ray_str_t*)ray_data(vec))[idx].len == 0;
 
     /* Vec-level fast-path gate: HAS_NULLS clear means no null anywhere. */
-    if (!vec_any_nulls(vec)) return false;
+    if (!(vec->attrs & RAY_ATTR_HAS_NULLS)) return false;
 
     /* Sentinels are the sole source of truth.  BOOL/U8 are non-nullable
      * (rejected at the producer) so they can never reach here with
@@ -1598,14 +1591,7 @@ ray_err_t ray_vec_copy_nulls(ray_t* dst, const ray_t* src) {
 
     /* Use ray_vec_is_null which handles slices and sentinel reads
      * transparently. For non-null sources this returns immediately. */
-    bool has_any = false;
-    if (src->attrs & RAY_ATTR_SLICE) {
-        const ray_t* parent = src->slice_parent;
-        if (parent && (parent->attrs & RAY_ATTR_HAS_NULLS)) has_any = true;
-    } else {
-        if (src->attrs & RAY_ATTR_HAS_NULLS) has_any = true;
-    }
-    if (!has_any) return RAY_OK;
+    if (!ray_vec_may_have_nulls(src)) return RAY_OK;
 
     for (int64_t i = 0; i < dst->len && i < src->len; i++) {
         if (ray_vec_is_null((ray_t*)src, i)) {

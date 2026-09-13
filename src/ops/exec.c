@@ -904,9 +904,9 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
      * context.  Also skip null elements when building the probe
      * buffer so a non-null col row doesn't accidentally match the
      * sentinel value of a null set element. */
-    bool col_has_nulls = !ray_is_atom(col) && (col->attrs & RAY_ATTR_HAS_NULLS);
+    bool col_has_nulls = !ray_is_atom(col) && ray_vec_may_have_nulls(col);
     bool col_atom_null = ray_is_atom(col) && RAY_ATOM_IS_NULL(col);
-    bool set_has_nulls = !ray_is_atom(set) && (set->attrs & RAY_ATTR_HAS_NULLS);
+    bool set_has_nulls = !ray_is_atom(set) && ray_vec_may_have_nulls(set);
 
     #define READ_I64(dst, vec, type, idx) do {                             \
         const void* _d = ray_data(vec);                                    \
@@ -1152,7 +1152,7 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
             const uint8_t* data = (const uint8_t*)ray_data(input);
             for (int64_t i = 0; i < r->len; i++)
                 if (memcmp(data + i * 16, null_guid, 16) == 0) b[i] = 0;
-        } else if (col->attrs & RAY_ATTR_HAS_NULLS) {
+        } else if (ray_vec_may_have_nulls(col)) {
             for (int64_t i = 0; i < r->len; i++)
                 if (ray_vec_is_null(input, i)) b[i] = 0;
         }
@@ -1305,7 +1305,6 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
      * this predicate is one conjunct of several, not the whole filter. */
     if (!in0 || in0->opcode == OP_FILTER) return false;
     if (by_col->type != RAY_SYM || ray_is_atom(by_col)) return false;
-    if (by_col->attrs & RAY_ATTR_HAS_NULLS) return false;
     ray_idx_kind_t kind = ray_index_kind(by_col);
     if (kind != RAY_IDX_HASH && kind != RAY_IDX_PART) return false;
     ray_op_t* pred = op_child(g, root, 1);
@@ -2264,11 +2263,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
 
-                    /* 3. Hash/part EQ: integer or SYM; re-check HAS_NULLS.
+                    /* 3. Hash/part EQ: nonzero SYM keys remain eligible
+                     * even when other rows are null; indexes omit null rows.
                      * A part hit is already one contiguous physical span, so
                      * it stays eligible at any density. */
                     if (cmp_op == OP_EQ && !is_float &&
-                        !(col->attrs & RAY_ATTR_HAS_NULLS)) {
+                        (col->type == RAY_SYM ? key_i != 0 :
+                         !ray_vec_may_have_nulls(col))) {
                         /* SYM equality: idx_filter_decode passes the global intern id;
                          * the hash was built over per-column domain ids.  Resolve here. */
                         bool sym_probe_skip = false;
@@ -2362,11 +2363,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         if (cop == OP_EQ && !eq_col &&
                             ray_index_kind(c) == RAY_IDX_HASH &&
-                            !(c->attrs & RAY_ATTR_HAS_NULLS)) {
+                            (c->type == RAY_SYM ? ki != 0 : !ray_vec_may_have_nulls(c))) {
                             eq_col = c; eq_key = ki;
                         } else if (cop == OP_GE || cop == OP_GT ||
                                    cop == OP_LE || cop == OP_LT) {
-                            if (c->attrs & RAY_ATTR_HAS_NULLS) { shape_ok = false; break; }
+                            if (ray_vec_may_have_nulls(c)) { shape_ok = false; break; }
                             if (!rg_col) rg_col = c;
                             else if (rg_col != c) { shape_ok = false; break; }
                             if (cop == OP_GE)      { if (ki > lo) lo = ki; }

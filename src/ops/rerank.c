@@ -183,9 +183,7 @@ static ray_t* gather_rows_with_dist(ray_t* tbl,
              * HAS_NULLS on the parent.  Mirror sort.c:3315's slice-aware
              * check so sliced source columns don't lose their nulls. */
             bool src_has_nulls =
-                (src_col->attrs & RAY_ATTR_HAS_NULLS) ||
-                ((src_col->attrs & RAY_ATTR_SLICE) && src_col->slice_parent &&
-                 (src_col->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+                ray_vec_may_have_nulls(src_col);
             if (src_has_nulls) {
                 for (int64_t r = 0; r < k; r++) {
                     if (ray_vec_is_null(src_col, rowids[r]))
