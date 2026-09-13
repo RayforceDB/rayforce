@@ -1319,7 +1319,15 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
          * binding's reference and ours.  The other three exclusions keep the
          * previous behaviour exactly — ray_cow returns an arena block as-is,
          * and a slice or a mapped block is not ours to write through. */
-        bool sole = var->rc == 2 && var->mmod == 0 &&
+        /* A dotted name is NOT a candidate.  ray_env_get resolves `d.x` to the
+         * leaf living inside the container, which typically holds the only
+         * reference to it — so the leaf passes an rc test that says nothing
+         * about whether the CONTAINER is shared.  Writing through it would be
+         * seen by every alias of the dict or table, and env_set_dotted's
+         * COW-rebuild of the chain cannot undo a write that already
+         * happened.  The copy is what made that safe. */
+        bool sole = !ray_sym_is_dotted(name_sym->i64) &&
+                    var->rc == 2 && var->mmod == 0 &&
                     !(var->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
         ray_t* cow_result = sole ? var : ray_cow(var);
         /* ray_cow returns NULL when ray_alloc_copy returned NULL (heap
