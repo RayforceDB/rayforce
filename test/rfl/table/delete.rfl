@@ -4,11 +4,12 @@
 ;; predicate once and compact the same matched-row list, so they cannot
 ;; disagree about which rows go.
 ;;
-;; NOTE ON THE TESTS: every in-place case below builds its columns with `til`
-;; or arithmetic, never from a literal vector.  A literal is held by the parse
-;; tree, so a table built from one has columns at rc 2 and the in-place gate
-;; declines — a literal-built table would quietly test the copying fallback
-;; instead.  The same is true of upsert's in-place path.
+;; NOTE ON THE TESTS: every case meant to exercise the IN-PLACE path builds
+;; its columns with `til` or arithmetic, never from a literal vector.  A
+;; literal is held by the parse tree, so a table built from one has columns at
+;; rc 2 and the gate declines to the copying form — which answers correctly,
+;; but is not the path those cases are there to test.  The same is true of
+;; upsert's in-place path.
 
 ;; ── functional form: a new table, the original untouched ────────────────
 (set dt (table [k v] (list (til 5) (* 10 (til 5)))))
@@ -207,3 +208,28 @@
 (upsert 'e8 1 (table [k v] (list (til 9) (take [7] 9))))
 (count e8) -- 9
 (count (distinct (at e8 'k))) -- 9
+
+;; ── `from: 't` rebinds whether or not the gate held ─────────────────────
+;; The gate can miss for reasons the caller cannot see — a column at rc 2
+;; because a literal holds it, a second binding on the table, an mmapped or
+;; narrow-SYM column.  The verb still promises the binding is amended and the
+;; symbol comes back; returning the new table instead would leave the binding
+;; with all its rows and hand back a value nobody asked for.
+
+;; literal columns: rc 2, so the copying form runs
+(set rb (table [k v] (list [1 2 3 4] [10 20 30 40])))
+(delete {from: 'rb where: (> k 2)}) -- 'rb
+(count rb) -- 2
+(at rb 'k) -- [1 2]
+
+;; a second binding on the table: the gate misses on the table's own rc
+(set rc1 (table [k] (list (til 5))))
+(set rc2 rc1)
+(delete {from: 'rc1 where: (== k 2)}) -- 'rc1
+(at rc1 'k) -- [0 1 3 4]
+(at rc2 'k) -- [0 1 2 3 4]
+
+;; and the answer matches what the copying form gives for the same predicate
+(set rb2 (table [k v] (list [1 2 3 4] [10 20 30 40])))
+(at (delete {from: rb2 where: (> k 2)}) 'k) -- [1 2]
+(count rb2) -- 4

@@ -18259,9 +18259,40 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         return ray_error("type", "delete: `from:` must be a table, got %s", ray_type_name(t));
     }
 
+    /* A parted table's columns carry the RAY_PARTED_BASE wrapper and its
+     * partition key is RAY_MAPCOMMON; neither describes a flat element the
+     * compaction could move.  Flatten once, as ray_update does — the in-place
+     * path declines a parted table anyway (upsert_col_ok rejects the
+     * wrapper), so this only feeds the copying form. */
+    if (table_has_parted_columns(tbl)) {
+        ray_t* flat = ray_table_new(ray_table_ncols(tbl));
+        if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
+        int64_t nc = ray_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* fc = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+            if (!fc || RAY_IS_ERR(fc)) { ray_release(flat); ray_release(tbl); return fc ? fc : ray_error("oom", NULL); }
+            flat = ray_table_add_col(flat, ray_table_col_name(tbl, c), fc);
+            ray_release(fc);
+            if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
+        }
+        ray_release(tbl);
+        tbl = flat;
+    }
+
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows0 = ray_table_nrows(tbl);
     if (ncols <= 0) { ray_release(tbl); return ray_error("domain", "delete: table has no columns"); }
+
+    /* A slice column is a header-only view: ray_cow copies the header and
+     * leaves ray_data resolving into the parent's storage, so compacting the
+     * copy would move the PARENT's elements.  The in-place path declines one
+     * through upsert_col_ok; the copying form has no such backstop, so refuse
+     * rather than corrupt a buffer somebody else owns. */
+    for (int64_t c = 0; c < ncols; c++)
+        if (ray_table_get_col_idx(tbl, c)->attrs & RAY_ATTR_SLICE) {
+            ray_release(tbl);
+            return ray_error("domain", "delete: column %lld is a slice view", (long long)c);
+        }
 
     /* Decide in-place BEFORE evaluating the predicate.  The predicate machinery
      * binds the table's columns into a query scope (and builds a graph over
@@ -18339,5 +18370,14 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
     scratch_free(rows_hdr);
     ray_release(tbl);
     if (err) { if (work) ray_release(work); return err; }
+    /* `from: 't` promises the binding is amended and the symbol comes back,
+     * whether or not the in-place gate held — every sibling verb rebinds on
+     * this path.  Returning the table instead left the binding with all its
+     * rows and handed the caller a value it did not ask for. */
+    if (inplace_sym >= 0) {
+        ray_env_set(inplace_sym, work);
+        ray_release(work);
+        return ray_sym(inplace_sym);
+    }
     return work;
 }
