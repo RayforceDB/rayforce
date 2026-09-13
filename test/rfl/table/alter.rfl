@@ -55,3 +55,23 @@ EE -- [5 5 7]
 (alter 'GG set 0 42)
 GG -- [42 4 5]
 FF -- [1 2 3 4 5]
+
+;; ── a dotted target keeps taking the copy ───────────────────────────────
+;; `ray_env_get` resolves `d.x` to the leaf inside the container, and that
+;; leaf usually holds the only reference to itself — so an rc test on it says
+;; nothing about whether the container is shared.  Writing through it would be
+;; seen by every alias of the dict, and env_set_dotted's COW-rebuild of the
+;; chain cannot undo a write that already landed.
+(set DA (dict ['x] (list (til 3))))
+(set DB DA)
+(alter 'DA.x set 0 99)
+DA.x -- [99 1 2]
+DB.x -- [0 1 2]
+
+;; a table head is the same resolution, and keeps its previous behaviour:
+;; env_set_dotted refuses it, so the amend is discarded rather than applied
+(set TA (table [c] (list (til 3))))
+(set TB TA)
+(alter 'TA.c set 0 77)
+(at TA 'c) -- [0 1 2]
+(at TB 'c) -- [0 1 2]
