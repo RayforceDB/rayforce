@@ -328,6 +328,35 @@ void ray_index_release_payload(ray_index_t* ix) {
     }
 }
 
+int ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap) {
+    ray_t* c[4] = { NULL, NULL, NULL, NULL };
+    switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_HASH:
+        c[0] = ix->u.hash.table; c[1] = ix->u.hash.gkeys;
+        c[2] = ix->u.hash.offs;  c[3] = ix->u.hash.rows;
+        break;
+    case RAY_IDX_SORT:       c[0] = ix->u.sort.perm; break;
+    case RAY_IDX_BLOOM:      c[0] = ix->u.bloom.bits; break;
+    case RAY_IDX_CHUNK_ZONE:
+        c[0] = ix->u.chunk_zone.mins; c[1] = ix->u.chunk_zone.maxs;
+        c[2] = ix->u.chunk_zone.null_bits;
+        break;
+    case RAY_IDX_PART:
+        c[0] = ix->u.part.keys; c[1] = ix->u.part.starts; c[2] = ix->u.part.lens;
+        break;
+    case RAY_IDX_DICT:
+        c[0] = ix->u.dict.codes; c[1] = ix->u.dict.first_occ;
+        break;
+    case RAY_IDX_ZONE:
+    case RAY_IDX_NONE:
+        break;
+    }
+    int n = 0;
+    for (int i = 0; i < 4 && n < cap; i++)
+        if (c[i] && !RAY_IS_ERR(c[i])) out[n++] = c[i];
+    return n;
+}
+
 void ray_index_retain_payload(ray_index_t* ix) {
     switch ((ray_idx_kind_t)ix->kind) {
     case RAY_IDX_HASH:
