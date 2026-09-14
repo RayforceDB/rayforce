@@ -585,6 +585,7 @@ static size_t objsize_shallow(ray_t* v) {
 static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) {
 #define OBJSIZE_PUSH(child) do { if (!objsize_stack_push(w, (child))) return false; } while (0)
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:       OBJSIZE_PUSH(ix->u.ukey.slots); break;
     case RAY_IDX_HASH:
         OBJSIZE_PUSH(ix->u.hash.table); OBJSIZE_PUSH(ix->u.hash.gkeys);
         OBJSIZE_PUSH(ix->u.hash.offs);  OBJSIZE_PUSH(ix->u.hash.rows);
@@ -639,7 +640,11 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
          * aux bytes 8..15; the index pointer only occupies bytes 0..7. */
         if (v->type == RAY_STR && v->str_pool)
             OBJSIZE_PUSH(v->str_pool);
-        return true;
+        /* A TABLE carries the keyed-upsert map here, but its schema and
+         * columns are still its own children: returning now would report a
+         * mapped table as nothing but its map.  Fall through to the arm
+         * below.  Only a vector has nothing further to walk. */
+        if (v->type != RAY_TABLE) return true;
     }
     if (v->type == RAY_STR && v->str_pool)
         OBJSIZE_PUSH(v->str_pool);
