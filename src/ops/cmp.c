@@ -70,6 +70,18 @@ int sym_atom_cmp(ray_t* a, ray_t* b) {
     return r;
 }
 
+/* Both operands integer-family atoms (I64/I32/I16/U8): order them as
+ * int64.  A double is exact only to 2^53, so every i64 above it — any
+ * TIMESTAMP, a 64-bit hash, a packed key — would otherwise merge with its
+ * neighbours under <, >, <=, >= (and the dyadic min/max built on them) while
+ * == already told them apart (#524).  Mixed float/int and BOOL/char pairs
+ * keep the double compare: their values are exact in a double. */
+static inline int both_int_atoms(const ray_t* a, const ray_t* b) {
+    int ia = a->type == -RAY_I64 || a->type == -RAY_I32 || a->type == -RAY_I16 || a->type == -RAY_U8;
+    int ib = b->type == -RAY_I64 || b->type == -RAY_I32 || b->type == -RAY_I16 || b->type == -RAY_U8;
+    return ia && ib;
+}
+
 /* Comparison */
 ray_t* ray_gt_fn(ray_t* a, ray_t* b) {
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c > 0 ? 1 : 0); }
@@ -90,6 +102,7 @@ ray_t* ray_gt_fn(ray_t* a, ray_t* b) {
     if (na && nb) return make_bool(0);       /* null == null → not > */
     if (na) return make_bool(0);             /* null > X → false */
     if (nb) return make_bool(1);             /* X > null → true */
+    if (both_int_atoms(a, b)) return make_bool(as_i64(a) > as_i64(b) ? 1 : 0);
     return make_bool(as_f64(a) > as_f64(b) ? 1 : 0);
 }
 
@@ -111,6 +124,7 @@ ray_t* ray_lt_fn(ray_t* a, ray_t* b) {
     if (na && nb) return make_bool(0);       /* null == null → not < */
     if (na) return make_bool(1);             /* null < X → true */
     if (nb) return make_bool(0);             /* X < null → false */
+    if (both_int_atoms(a, b)) return make_bool(as_i64(a) < as_i64(b) ? 1 : 0);
     return make_bool(as_f64(a) < as_f64(b) ? 1 : 0);
 }
 
@@ -133,6 +147,7 @@ ray_t* ray_gte_fn(ray_t* a, ray_t* b) {
     if (na && nb) return make_bool(1);       /* null == null → >= true */
     if (na) return make_bool(0);             /* null >= X → false */
     if (nb) return make_bool(1);             /* X >= null → true */
+    if (both_int_atoms(a, b)) return make_bool(as_i64(a) >= as_i64(b) ? 1 : 0);
     return make_bool(as_f64(a) >= as_f64(b) ? 1 : 0);
 }
 
@@ -155,6 +170,7 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
     if (na && nb) return make_bool(1);       /* null == null → <= true */
     if (na) return make_bool(1);             /* null <= X → true */
     if (nb) return make_bool(0);             /* X <= null → false */
+    if (both_int_atoms(a, b)) return make_bool(as_i64(a) <= as_i64(b) ? 1 : 0);
     return make_bool(as_f64(a) <= as_f64(b) ? 1 : 0);
 }
 

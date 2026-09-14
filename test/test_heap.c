@@ -2668,11 +2668,157 @@ static test_result_t test_scratch_realloc_has_index_detach(void) {
     PASS();
 }
 
+
+/* ---- Native footprint: ray_shallow_bytes / ray_retained_bytes ---------- *
+ *
+ * The contract (rayforce.h): shallow = own block + private storage only this
+ * value releases; retained = shallow of everything reachable through
+ * ownership edges, each block once.  Pin the shapes a binding relies on:
+ * atoms, vectors, string pools, slices, lists (shared elements once), dicts
+ * and tables (columns not charged twice), an attached index, the null
+ * singleton, and a direct (mmap'd) block. */
+
+static test_result_t test_footprint_atoms_and_vectors(void) {
+    TEST_ASSERT_EQ_U(ray_shallow_bytes(NULL), 0);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(NULL), 0);
+    TEST_ASSERT_EQ_U(ray_shallow_bytes(RAY_NULL_OBJ), 0);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(RAY_NULL_OBJ), 0);
+
+    ray_t* a = ray_i64(7);
+    size_t sa = ray_shallow_bytes(a);
+    TEST_ASSERT_EQ_U(sa, BSIZEOF(a->order));          /* the whole buddy block */
+    TEST_ASSERT_TRUE(sa >= 32 && (sa & (sa - 1)) == 0);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(a), sa);
+    ray_release(a);
+
+    /* Short string: SSO, one block.  Long string: payload block added. */
+    ray_t* s1 = ray_str("abc", 3);
+    TEST_ASSERT_EQ_U(ray_shallow_bytes(s1), BSIZEOF(s1->order));
+    ray_t* s2 = ray_str("a string well past the inline limit", 35);
+    size_t ss2 = ray_shallow_bytes(s2);
+    TEST_ASSERT_TRUE(ss2 > BSIZEOF(s2->order));
+    TEST_ASSERT_TRUE(ss2 >= BSIZEOF(s2->order) + 32 + 35);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(s2), ss2);
+    ray_release(s1); ray_release(s2);
+
+    ray_t* v = ray_vec_new(RAY_I64, 1000);
+    v->len = 1000;
+    size_t sv = ray_shallow_bytes(v);
+    TEST_ASSERT_TRUE(sv >= 32 + 1000 * 8);
+    TEST_ASSERT_EQ_U(sv, BSIZEOF(v->order));
+    TEST_ASSERT_EQ_U(ray_retained_bytes(v), sv);
+
+    /* A slice charges only its header; retained reaches the parent. */
+    ray_t* sl = ray_vec_slice(v, 10, 100);
+    TEST_ASSERT_TRUE(sl->attrs & RAY_ATTR_SLICE);
+    size_t ssl = ray_shallow_bytes(sl);
+    TEST_ASSERT_EQ_U(ssl, BSIZEOF(sl->order));
+    TEST_ASSERT_TRUE(ssl < sv);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(sl), ssl + sv);
+    ray_release(sl);
+    ray_release(v);
+
+    /* A string vector charges its pool. */
+    ray_t* sv1 = ray_vec_new(RAY_STR, 0);
+    for (int i = 0; i < 64; i++)
+        sv1 = ray_str_vec_append(sv1, "twenty-four bytes long..", 24);
+    TEST_ASSERT_TRUE(sv1->str_pool != NULL);
+    size_t ssv = ray_shallow_bytes(sv1);
+    TEST_ASSERT_EQ_U(ssv, BSIZEOF(sv1->order) + BSIZEOF(sv1->str_pool->order));
+    TEST_ASSERT_TRUE(ssv >= 32 + 64 * 16 + 64 * 24);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(sv1), ssv);
+    ray_release(sv1);
+    PASS();
+}
+
+static test_result_t test_footprint_containers(void) {
+    ray_t* c0 = ray_vec_new(RAY_I64, 500); c0->len = 500;
+    ray_t* c1 = ray_vec_new(RAY_F64, 300); c1->len = 300;
+    size_t s0 = ray_shallow_bytes(c0), s1 = ray_shallow_bytes(c1);
+
+    /* List: the list block only; retained adds each element once even when
+     * the same vector sits in two slots. */
+    ray_t* l = ray_list_new(3);
+    ray_retain(c0); l = ray_list_append(l, c0);
+    ray_retain(c1); l = ray_list_append(l, c1);
+    ray_retain(c0); l = ray_list_append(l, c0);
+    TEST_ASSERT_EQ_U(ray_shallow_bytes(l), BSIZEOF(l->order));
+    TEST_ASSERT_EQ_U(ray_retained_bytes(l), BSIZEOF(l->order) + s0 + s1);
+
+    /* Table: shallow is the table block; retained is table + names + the
+     * column list + the columns — no column charged twice. */
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), c0);   /* consumes c0 */
+    t = ray_table_add_col(t, ray_sym_intern("b", 1), c1);   /* consumes c1 */
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    size_t st = ray_shallow_bytes(t);
+    TEST_ASSERT_EQ_U(st, BSIZEOF(t->order));
+    size_t rt = ray_retained_bytes(t);
+    TEST_ASSERT_TRUE(rt >= st + s0 + s1);
+    ray_t** slots = (ray_t**)ray_data(t);
+    TEST_ASSERT_EQ_U(rt, st + ray_retained_bytes(slots[0]) + ray_retained_bytes(slots[1]));
+    /* The list still holds c0/c1: their bytes appear in both walks, and the
+     * table walk did not count them twice. */
+    TEST_ASSERT_EQ_U(ray_retained_bytes(l), BSIZEOF(l->order) + s0 + s1);
+    ray_release(l);
+
+    /* Dict: same shape as a table (two slots). */
+    ray_t* k = ray_vec_new(RAY_I64, 4); k->len = 4;
+    ray_t* vv = ray_vec_new(RAY_I64, 4); vv->len = 4;
+    size_t sk = ray_shallow_bytes(k), svv = ray_shallow_bytes(vv);
+    ray_t* d = ray_dict_new(k, vv);
+    TEST_ASSERT_EQ_U(ray_shallow_bytes(d), BSIZEOF(d->order));
+    TEST_ASSERT_EQ_U(ray_retained_bytes(d), BSIZEOF(d->order) + sk + svv);
+    ray_release(d);
+    ray_release(t);
+    PASS();
+}
+
+static test_result_t test_footprint_index_and_direct(void) {
+    /* An attached hash index is private storage: shallow grows by the index
+     * block and its tables, and retained agrees. */
+    ray_t* v = ray_vec_new(RAY_I64, 2000);
+    v->len = 2000;
+    for (int64_t i = 0; i < 2000; i++) ((int64_t*)ray_data(v))[i] = i % 97;
+    size_t plain = ray_shallow_bytes(v);
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_INDEX);
+    size_t indexed = ray_shallow_bytes(v);
+    TEST_ASSERT_TRUE(indexed > plain);
+    TEST_ASSERT_EQ_U(indexed, plain + ray_shallow_bytes(v->index));
+    TEST_ASSERT_EQ_U(ray_retained_bytes(v), indexed);
+    ray_t* kids[4];
+    int k = ray_index_child_blocks(ray_index_payload(v->index), kids, 4);
+    TEST_ASSERT_EQ_I(k, 4);
+    size_t sum = BSIZEOF(v->index->order);
+    for (int i = 0; i < k; i++) sum += BSIZEOF(kids[i]->order);
+    TEST_ASSERT_EQ_U(ray_shallow_bytes(v->index), sum);
+    ray_release(v);
+
+    /* A direct block (larger than the standard pool order) reports its exact
+     * page-rounded mapping, not a power of two. */
+    size_t big = (size_t)40 << 20;
+    ray_t* d = ray_alloc(big);
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d));
+    TEST_ASSERT_TRUE(ray_is_direct(d));
+    size_t sd = ray_shallow_bytes(d);
+    TEST_ASSERT_TRUE(sd >= big + 32);
+    TEST_ASSERT_EQ_U(sd, ray_direct_map_size(d));
+    TEST_ASSERT_EQ_U(sd & 4095, 0);
+    TEST_ASSERT_EQ_U(ray_retained_bytes(d), sd);
+    ray_free(d);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t heap_entries[] = {
     { "heap/slab_overflow",            test_slab_overflow_falls_through, heap_setup, heap_teardown },
     { "heap/multi_pool_growth",        test_multi_pool_growth,           heap_setup, heap_teardown },
+    { "heap/footprint_atoms_vectors",  test_footprint_atoms_and_vectors, heap_setup, heap_teardown },
+    { "heap/footprint_containers",     test_footprint_containers,        heap_setup, heap_teardown },
+    { "heap/footprint_index_direct",   test_footprint_index_and_direct,  heap_setup, heap_teardown },
     { "heap/scratch_realloc_atom",     test_scratch_realloc_atom,        heap_setup, heap_teardown },
     { "heap/scratch_realloc_vec_grow", test_scratch_realloc_vec_grow,    heap_setup, heap_teardown },
     { "heap/scratch_realloc_vec_shrink", test_scratch_realloc_vec_shrink, heap_setup, heap_teardown },

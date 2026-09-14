@@ -689,9 +689,8 @@ ray_err_t ray_journal_purge(void) {
     /* Close the active log FIRST: never unlink a path out from under
      * buffered writes (and Windows refuses to unlink an open file). */
     if (g_journal.fp) {
-        fflush(g_journal.fp);
-        fclose(g_journal.fp);
-        g_journal.fp = NULL;
+        ray_err_t close_result = ray_journal_close();
+        if (close_result != RAY_OK) return close_result;
     }
 
     ray_err_t result = RAY_OK;
