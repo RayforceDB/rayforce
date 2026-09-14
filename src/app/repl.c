@@ -819,7 +819,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
     ray_eval_clear_interrupt();
     if (term) ray_term_eval_begin(term);
 
-    ray_t* nfo = ray_nfo_create("repl", 4, input, strlen(input));
+    ray_t* nfo = ray_nfo_create(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME), input, strlen(input));
     ray_clear_error_trace();
 
     ray_t* parsed = ray_parse_with_nfo(input, nfo);

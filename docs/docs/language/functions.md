@@ -442,7 +442,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `read-bytes` | unary | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
 | `write` | binary | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
-| `load` | unary | Load and evaluate a Rayfall script | `(load "lib.rfl")` |
+| `load` | unary | Load and evaluate a Rayfall script; a relative path is tried against the working directory, then below `RAYFORCE_HOME` | `(load "lib.rfl")` |
 
 ## Control Flow
 

@@ -948,7 +948,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         switch (c->type) {
         case RAY_I64: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)c->data;
-            bool has_nulls = c->col && (c->col->attrs & RAY_ATTR_HAS_NULLS);
+            bool has_nulls = c->col && ray_vec_may_have_nulls(c->col);
             bool nf = c->nulls_first;
             bool desc = c->desc;
             /* Null key: nf=true→sort first, nf=false→sort last.
@@ -1025,7 +1025,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         }
         case RAY_I32: case RAY_DATE: case RAY_TIME: {
             const int32_t* d = (const int32_t*)c->data;
-            bool has_nulls = c->col && (c->col->attrs & RAY_ATTR_HAS_NULLS);
+            bool has_nulls = c->col && ray_vec_may_have_nulls(c->col);
             bool nf = c->nulls_first;
             bool desc = c->desc;
             uint64_t null_e = (nf ^ desc) ? 0 : UINT64_MAX;
@@ -1066,7 +1066,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         }
         case RAY_I16: {
             const int16_t* d = (const int16_t*)c->data;
-            bool has_nulls = c->col && (c->col->attrs & RAY_ATTR_HAS_NULLS);
+            bool has_nulls = c->col && ray_vec_may_have_nulls(c->col);
             bool nf = c->nulls_first;
             bool desc = c->desc;
             if (has_nulls) {
@@ -1098,7 +1098,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         }
         case RAY_BOOL: case RAY_U8: {
             const uint8_t* d = (const uint8_t*)c->data;
-            bool has_nulls = c->col && (c->col->attrs & RAY_ATTR_HAS_NULLS);
+            bool has_nulls = c->col && ray_vec_may_have_nulls(c->col);
             bool nf = c->nulls_first;
             bool desc = c->desc;
             if (has_nulls) {
@@ -1711,9 +1711,7 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
      * from slice_parent, so check both attr slots — matches the
      * exec_sort post-sort propagation pattern. */
     int64_t null_count = 0;
-    bool has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) ||
-                     ((col->attrs & RAY_ATTR_SLICE) && col->slice_parent &&
-                      (col->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+    bool has_nulls = ray_vec_may_have_nulls(col);
     if (has_nulls) {
         int64_t w = 0;
         int64_t null_pos;
@@ -2383,7 +2381,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 /* Narrow-int + has_nulls uses a +1-shifted encoding so
                  * the null sentinel sits one byte beyond the data
                  * range; reserve that extra byte for the radix pass. */
-                if ((cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                if (ray_vec_may_have_nulls(cols[0]) &&
                     (cols[0]->type == RAY_BOOL || cols[0]->type == RAY_U8 ||
                      cols[0]->type == RAY_I16) &&
                     key_nbytes_max < 8) {
@@ -2592,7 +2590,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 bool nullable_f64_key = false;
                 for (uint32_t k = 0; k < n_cols; k++)
                     if (cols[k]->type == RAY_F64 &&
-                        (cols[k]->attrs & RAY_ATTR_HAS_NULLS)) {
+                        ray_vec_may_have_nulls(cols[k])) {
                         nullable_f64_key = true;
                         break;
                     }
@@ -3459,7 +3457,7 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                                       &sorted_keys, &keys_hdr);
         if (!idx || RAY_IS_ERR(idx)) return idx;
 
-        bool c0_shifted = (cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+        bool c0_shifted = ray_vec_may_have_nulls(cols[0]) &&
                           (cols[0]->type == RAY_BOOL ||
                            cols[0]->type == RAY_U8 ||
                            cols[0]->type == RAY_I16);
@@ -3475,7 +3473,7 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
             radix_decode_into(ray_data(result), cols[0]->type, sorted_keys,
                               nrows, descs ? descs[0] : 0);
             /* Propagate null bitmap using sorted indices */
-            if (cols[0]->attrs & RAY_ATTR_HAS_NULLS) {
+            if (ray_vec_may_have_nulls(cols[0])) {
                 int64_t* idx_data = (int64_t*)ray_data(idx);
                 for (int64_t i = 0; i < nrows; i++)
                     if (ray_vec_is_null(cols[0], idx_data[i]))
@@ -3734,7 +3732,7 @@ sort_idx_ready:;
      * doesn't invert, so fall back to gather there. */
     int8_t sk0_type = sort_vecs[0] ? sort_vecs[0]->type : 0;
     bool sk0_shifted = sort_vecs[0] &&
-                       (sort_vecs[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                       ray_vec_may_have_nulls(sort_vecs[0]) &&
                        (sk0_type == RAY_BOOL || sk0_type == RAY_U8 ||
                         sk0_type == RAY_I16);
     int64_t sort_key_sym = -1;
@@ -3801,9 +3799,7 @@ sort_idx_ready:;
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         /* Gather null bits in sorted order */
-        bool src_has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) ||
-                             ((col->attrs & RAY_ATTR_SLICE) && col->slice_parent &&
-                              (col->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+        bool src_has_nulls = ray_vec_may_have_nulls(col);
         if (src_has_nulls) {
             for (int64_t r = 0; r < gather_rows; r++)
                 if (ray_vec_is_null(col, sorted_idx[r]))
@@ -3954,7 +3950,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
      * reads raw i64, and the bail flag is polled per 4096-row block.
      *
      * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
-     * HAS_NULLS up front, including for SYM/STR).  That is not squeamishness
+     * actual nulls up front, including for SYM).  That is not squeamishness
      * about in-band nulls: this loop ranks sym 0 by its domain string, i.e.
      * smallest, whereas the real sort places nulls by the `nulls_first` flag
      * independently of payload.  See the note on ray_key_cols_sorted. */
@@ -3963,7 +3959,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
         (c->key_cols[1]->type == RAY_I64 ||
          c->key_cols[1]->type == RAY_TIME ||
          c->key_cols[1]->type == RAY_TIMESTAMP) &&
-        !(c->key_cols[1]->attrs & RAY_ATTR_HAS_NULLS)) {
+        !ray_vec_may_have_nulls(c->key_cols[1])) {
         ray_t* sc = c->key_cols[0];
         const void* sd = ray_data(sc);
         uint8_t sattrs = sc->attrs;
@@ -4023,10 +4019,10 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
 /* Public: are these key columns already in sorted order under the sort's
  * lexicographic ordering (single uniform direction across all keys)?  Only
  * null-free integer-family / SYM keys are decidable — anything else (float,
- * STR/LIST, or a HAS_NULLS column) returns false so the caller must NOT
+ * STR/LIST, or a column containing nulls) returns false so the caller must NOT
  * assume sortedness (float NaN / null placement belong to the real sort).
  *
- * The HAS_NULLS rejection stands even for SYM/STR, whose nulls are IN-BAND
+ * The null rejection stands even for SYM/STR, whose nulls are IN-BAND
  * ordinary values (sym id 0 is a real dictionary entry — the empty string at
  * position 0 of every symfile; a STR null is a zero-length descriptor).  That
  * in-band property is what lets the fused predicate evaluator compare them for
@@ -4053,7 +4049,7 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
      * than silently treating an unorderable column as ordered. */
     for (int64_t k = 0; k < n_keys; k++) {
         int8_t t = key_cols[k]->type;
-        if (key_cols[k]->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (ray_vec_has_nulls(key_cols[k])) return false;
         if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 && t != RAY_I32 &&
             t != RAY_I64 && t != RAY_DATE && t != RAY_TIME &&
             t != RAY_TIMESTAMP && t != RAY_SYM)
@@ -4087,7 +4083,8 @@ static void sort_note_part_order(ray_t* col, int64_t order_sym) {
 }
 
 static ray_t* sort_stamp_part_col_owned(ray_t* col, int64_t order_sym) {
-    if (!col || RAY_IS_ERR(col) || (col->attrs & RAY_ATTR_HAS_NULLS) ||
+    if (!col || RAY_IS_ERR(col) ||
+        (col->type != RAY_SYM && ray_vec_may_have_nulls(col)) ||
         !sort_part_key_type(col->type))
         return NULL;
     ray_t* w = col;
@@ -4102,7 +4099,8 @@ static ray_t* sort_stamp_part_col_owned(ray_t* col, int64_t order_sym) {
 
 static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
                                        ray_t* key_col, int64_t order_sym) {
-    if (!key_col || (key_col->attrs & RAY_ATTR_HAS_NULLS) ||
+    if (!key_col ||
+        (key_col->type != RAY_SYM && ray_vec_may_have_nulls(key_col)) ||
         !sort_part_key_type(key_col->type)) {
         ray_retain(tbl);
         return tbl;
@@ -4219,7 +4217,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         bool detectable = true;
         for (int64_t k = 0; k < n_keys && detectable; k++) {
             int8_t t = key_cols[k]->type;
-            if (key_cols[k]->attrs & RAY_ATTR_HAS_NULLS) detectable = false;
+            if (ray_vec_has_nulls(key_cols[k])) detectable = false;
             else if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 &&
                      t != RAY_I32 && t != RAY_I64 && t != RAY_DATE &&
                      t != RAY_TIME && t != RAY_TIMESTAMP && t != RAY_SYM)
@@ -4333,7 +4331,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * so fall back to gather in that case. */
     int64_t decode_col_idx = -1;
     int8_t k0_type = key_cols[0]->type;
-    bool k0_shifted = (key_cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+    bool k0_shifted = ray_vec_may_have_nulls(key_cols[0]) &&
                       (k0_type == RAY_BOOL || k0_type == RAY_U8 ||
                        k0_type == RAY_I16);
     if (sorted_keys && n_keys == 1 && !RAY_IS_SYM(k0_type) && !k0_shifted) {
@@ -4394,9 +4392,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         ray_t* col = ray_table_get_col_idx(tbl, c);
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
-        bool src_has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) ||
-                             ((col->attrs & RAY_ATTR_SLICE) && col->slice_parent &&
-                              (col->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+        bool src_has_nulls = ray_vec_may_have_nulls(col);
         if (src_has_nulls) {
             for (int64_t r = 0; r < nrows; r++)
                 if (ray_vec_is_null(col, idx_data[r]))
@@ -4413,13 +4409,13 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * semantics are not what downstream consumers (asof presort/index
      * paths) assume. */
     if (!descending &&
-        !(key_cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+        !ray_vec_may_have_nulls(key_cols[0]) &&
         (k0_type == RAY_BOOL || k0_type == RAY_U8  || k0_type == RAY_I16 ||
          k0_type == RAY_I32  || k0_type == RAY_I64 || k0_type == RAY_DATE ||
          k0_type == RAY_TIME || k0_type == RAY_TIMESTAMP)) {
         for (int64_t c = 0; c < ncols; c++) {
             if (col_names[c] == key_ids[0] && new_cols[c] &&
-                !(new_cols[c]->attrs & RAY_ATTR_HAS_NULLS)) {
+                !ray_vec_may_have_nulls(new_cols[c])) {
                 new_cols[c]->attrs |= RAY_ATTR_SORTED;
                 break;
             }

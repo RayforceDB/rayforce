@@ -1,0 +1,126 @@
+;; Regressions for docs/superpowers/specs/2026-09-08-datalog-audit.md.
+;; Chain 1->2->...->8 (7 edges). Full transitive closure = 7*8/2 = 28 pairs.
+(set g (datoms))
+(set g (assert-fact g 1 'edge 2))
+(set g (assert-fact g 2 'edge 3))
+(set g (assert-fact g 3 'edge 4))
+(set g (assert-fact g 4 'edge 5))
+(set g (assert-fact g 5 'edge 6))
+(set g (assert-fact g 6 'edge 7))
+(set g (assert-fact g 7 'edge 8))
+
+;; §1.1 linear (already correct) and non-linear closure must agree.
+(rule (lin ?x ?y) (?x :edge ?y))
+(rule (lin ?x ?z) (?x :edge ?y) (lin ?y ?z))
+(count (query g (find ?x ?y) (where (lin ?x ?y)))) -- 28
+(rule (nl ?x ?y) (?x :edge ?y))
+(rule (nl ?x ?z) (nl ?x ?y) (nl ?y ?z))
+(count (query g (find ?x ?y) (where (nl ?x ?y)))) -- 28
+;; the three pairs the old evaluator dropped
+(count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 1) (== ?y 6)))) -- 1
+(count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 2) (== ?y 7)))) -- 1
+(count (query g (find ?x ?y) (where (nl ?x ?y) (== ?x 3) (== ?y 8)))) -- 1
+
+;; §1.2 a repeated variable inside one atom is an equality constraint.
+(count (query g (find ?x) (where (?x :edge ?x)))) -- 0
+(count (query g (find ?x) (where (lin ?x ?x)))) -- 0
+(set g2 (assert-fact g 5 'edge 5))
+(count (query g2 (find ?x) (where (?x :edge ?x)))) -- 1
+(at (at (query g2 (find ?x) (where (?x :edge ?x))) '?x) 0) -- 5
+;; ... and inside a negated atom: every node except the one with a self-loop
+(count (query g2 (find ?x) (where (?x :edge ?y) (not (?x :edge ?x))))) -- 6
+
+;; §1.3 a negated atom with no shared variables is a guard, not a no-op.
+(count (query g (find ?x) (where (?x :edge ?y) (not (1 :edge 2))))) -- 0
+(count (query g (find ?x) (where (?x :edge ?y) (not (1 :edge 9))))) -- 7
+(count (query g (find ?x) (where (?x :edge ?y) (not (_ :edge 8))))) -- 0
+(count (query g (find ?x) (where (?x :edge ?y) (not (_ :edge 99))))) -- 7
+
+;; §1.4 constant filters over F64 columns match numerically; other types error.
+(set pts (table [pts__c0 pts__c1] (list [1 2 3] [1.0 2.0 3.0])))
+(count (query g (find ?x) (where (pts ?x 2)))) -- 1
+(count (query g (find ?x) (where (pts ?x 2.0)))) -- 1
+(at (at (query g (find ?x) (where (pts ?x 2.0))) '?x) 0) -- 2
+(count (query g (find ?x) (where (pts ?x 7)))) -- 0
+;; review follow-up: an F64 literal against an I64 EDB column must also
+;; match numerically (dl_col_eq_row's `col->type == RAY_I64 &&
+;; const_type == RAY_F64` branch) -- the assertions above only exercise
+;; F64/I64 literals against an F64 column.
+(set ints (table [ints__c0 ints__c1] (list [1 2 3] [10 20 30])))
+(count (query g (find ?x) (where (ints ?x 20.0)))) -- 1
+(at (at (query g (find ?x) (where (ints ?x 20.0))) '?x) 0) -- 2
+(count (query g (find ?x) (where (ints ?x 21.0)))) -- 0
+(set strs (table [strs__c0 strs__c1] (list [1 2] ["a" "b"])))
+;; ray_fmt() only renders a RAY_ERROR's 7-byte code, not the detail text
+;; ray_error() stashes in the thread-local buffer, so the visible text is
+;; "error: domain" (query: evaluation failed wraps the inner "type" error
+;; from dl_filter_eq as "domain") -- matches the existing `query: ... !-
+;; domain` idiom used elsewhere for evaluation failures, e.g.
+;; datalog_branch_cov.rfl:274.
+(query g (find ?x) (where (strs ?x 1))) !- domain
+
+;; §1.6 a find clause wider than DL_MAX_ARITY (16) errors instead of truncating.
+(set w (datoms))
+(set w (assert-fact w 1 'a 1))
+(count (key (query w (find ?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p) (where (?a :a ?b) (?a :a ?c) (?a :a ?d) (?a :a ?e) (?a :a ?f) (?a :a ?g) (?a :a ?h) (?a :a ?i) (?a :a ?j) (?a :a ?k) (?a :a ?l) (?a :a ?m) (?a :a ?n) (?a :a ?o) (?a :a ?p))))) -- 16
+(query w (find ?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p ?q) (where (?a :a ?b))) !- domain
+;; §7.3 an unknown relation is an error, not an empty result.
+(query g (find ?x) (where (nosuch ?x))) !- domain
+(query g (find ?x) (where (?x :edge ?y) (not (nosuch ?x)))) !- domain
+
+;; §2.1 repeated queries with an arithmetic expression must not grow the heap.
+(set ld (datoms))
+(set ld (assert-fact ld 1 'v 1))
+(set ld (assert-fact ld 2 'v 2))
+(set lq (fn [i] (count (query ld (find ?e ?y) (where (?e :v ?x) (= ?y (+ ?x 1)))))))
+(map lq (til 50))
+;; `(set lb0 ...)` permanently retains its own boxed result -- a fixed cost
+;; unrelated to the datalog query loop below -- which would bias a single
+;; capture against every later comparison. Re-binding lb0 a second time
+;; replaces that box with an identically-sized one: the old box's release
+;; and the new box's allocation net to zero, so this second, self-paid
+;; capture is the true zero-cost baseline (verified empirically: a single
+;; capture reads a nonzero, non-scaling residual on every later read no
+;; matter how many throw-away reads precede it; re-binding the same name
+;; converges to exactly 0).
+(set lb0 (get (.sys.mem) 'bytes-allocated))
+(set lb0 (get (.sys.mem) 'bytes-allocated))
+(map lq (til 200))
+(- (get (.sys.mem) 'bytes-allocated) lb0) -- 0
+
+;; §2.2 integer overflow and division by zero are null, never undefined behaviour.
+(set ad (datoms))
+(set ad (assert-fact ad 1 'v 1))
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (+ ?x 9223372036854775807)))) '?y) 0) -- 0Nl
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (* ?x -9223372036854775807)))) '?y) 0) -- -9223372036854775807
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (/ ?x 0)))) '?y) 0) -- 0Nl
+(at (at (query ad (find ?y) (where (?e :v ?x) (= ?y (- ?x 3)))) '?y) 0) -- -2
+
+;; §1.5 a symbol value and an integer equal to its intern id are different values.
+(set sd (datoms))
+(set sd (assert-fact sd 1 'name 'Alice))
+(set sid (get (pull sd 1) 'name))
+(set sd (assert-fact sd 2 'name sid))
+(count (query sd (find ?e) (where (?e :name 'Alice)))) -- 1
+(at (at (query sd (find ?e) (where (?e :name 'Alice))) '?e) 0) -- 1
+(count (query sd (find ?e) (where (?e :name sid)))) -- 1
+(at (at (query sd (find ?e) (where (?e :name sid))) '?e) 0) -- 2
+;; user-visible reads still return plain intern ids
+(sym-name (at (at (query sd (find ?n) (where (1 :name ?n))) '?n) 0)) -- 'Alice
+(sym-name (get (pull sd 1) 'name)) -- 'Alice
+;; a "foo" STR literal means the symbol named "foo" (assert-fact only ever
+;; stores an integer or a symbol), so it matches the SYM-tagged cell too.
+(count (query sd (find ?e) (where (?e :name "Alice")))) -- 1
+(set sd (retract-fact sd 1 'name 'Alice))
+(count (query sd (find ?e) (where (?e :name 'Alice)))) -- 0
+(count sd) -- 1
+
+;; §1.5 a hand-built datoms table whose v column is a genuine RAY_SYM
+;; vector (not assert-fact's DATOM-tagged I64 encoding) must still match
+;; a SYM/STR literal -- ray_query_fn tags column 2 the same way when
+;; converting a RAY_SYM v column to I64. A *legacy* I64 v column holding
+;; bare (untagged) sym ids stays deliberately unmatched by strict_tag:
+;; that bare-integer ambiguity is exactly what tagging removes.
+(set handbuilt (table ['e 'a 'v] (list [1 2] ['name 'name] ['Alice 'Bob])))
+(count (query handbuilt (find ?e) (where (?e :name 'Alice)))) -- 1
+(sym-name (at (at (query handbuilt (find ?v) (where (1 :name ?v))) '?v) 0)) -- 'Alice

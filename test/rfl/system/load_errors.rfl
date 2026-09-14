@@ -1,0 +1,15 @@
+;; load_errors.rfl — a failing `load` names the file and the OS cause (#505).
+;;
+;; Regression: ray_load_file_fn returned a bare `io` for every failure, so
+;; a missing dependency in a startup script printed `error: io`, which reads
+;; like an IPC, journal or storage failure and sent diagnosis the wrong way.
+;; The harness compares error codes only, so the message is checked on a
+;; subprocess's stderr.
+(load "missing/persistent_connection.rfl") !- io
+(load "/") !- io
+(.sys.exec "rm -rf /tmp/rfl_load_err && mkdir -p /tmp/rfl_load_err && printf '(load \"missing/persistent_connection.rfl\")\n' > /tmp/rfl_load_err/main.rfl")
+(.sys.exec "./rayforce /tmp/rfl_load_err/main.rfl </dev/null 2>&1 | grep -q 'error: io: load \"missing/persistent_connection.rfl\": No such file or directory'") -- 0
+(.sys.exec "printf '(load \"/tmp/rfl_load_err\")\n' > /tmp/rfl_load_err/dir.rfl; ./rayforce /tmp/rfl_load_err/dir.rfl </dev/null 2>&1 | grep -q 'error: io: load \"/tmp/rfl_load_err\": is a directory'") -- 0
+;; a script that fails to load still exits non-zero
+(.sys.exec "./rayforce /tmp/rfl_load_err/main.rfl </dev/null >/dev/null 2>&1; [ $? -ne 0 ]") -- 0
+(.sys.exec "rm -rf /tmp/rfl_load_err")

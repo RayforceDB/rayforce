@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
+#include "ops/idxop.h"       /* ray_index_carry_append: keep a hash index across concat */
 #include "lang/env.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "vec/vec.h"
@@ -842,7 +843,7 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
      * null contract.  Narrowing casts require writing the dest-width
      * sentinel directly — propagating through the cast macro produces
      * (int16_t)NULL_I32 = 0 etc., which collides with a legitimate value. */
-    if (val->attrs & RAY_ATTR_HAS_NULLS) {
+    if (ray_vec_may_have_nulls(val)) {
         switch (vec->type) {
             case RAY_F64: {
                 double* d = (double*)ray_data(vec);
@@ -2080,21 +2081,55 @@ ray_t* ray_read_bytes_fn(ray_t* path_obj) {
     return read_file_bytes(path_obj, "read-bytes");
 }
 
-/* (load path) — read and evaluate a Rayfall script file via mmap */
+static bool load_path_is_absolute(const char* p) {
+    if (p[0] == '/' || p[0] == '\\') return true;
+#if defined(RAY_OS_WINDOWS)
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return true;
+#endif
+    return false;
+}
+
+/* Where a relative load path is looked for after the working directory:
+ * below $RAYFORCE_HOME, q's QHOME fallback (#506).  Fills `alt` with the
+ * candidate and returns true when a home is set and the path is relative. */
+static bool load_home_candidate(const char* path, char* alt, size_t cap) {
+    if (load_path_is_absolute(path)) return false;
+    const char* home = getenv("RAYFORCE_HOME");
+    if (!home || !*home) return false;
+    size_t hl = strlen(home);
+    while (hl > 1 && (home[hl - 1] == '/' || home[hl - 1] == '\\')) hl--;
+    int n = snprintf(alt, cap, "%.*s/%s", (int)hl, home, path);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* (load path) — read and evaluate a Rayfall script file via mmap.
+ *
+ * A relative path is resolved against the working directory first and,
+ * when that does not exist and RAYFORCE_HOME is set, below the home;
+ * an absolute path is used as given.  Nested loads follow the same rule
+ * (relative to the working directory, not to the loading file, as q
+ * does).  The path that was actually opened is what (.sys.args)
+ * reports as `source` while the file runs. */
 ray_t* ray_load_file_fn(ray_t* path_obj) {
     if (path_obj->type != -RAY_STR) return ray_error("type", "load: path must be str, got %s", ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
     if (!path) return ray_error("domain", "load: empty path");
     size_t path_len = ray_str_len(path_obj);
+    char alt[4096];
 
 #if defined(RAY_OS_WINDOWS)
     /* Windows: fall back to fread */
     FILE* fp = fopen(path, "r");
-    if (!fp) return ray_error("io", NULL);
+    if (!fp && errno == ENOENT && load_home_candidate(path, alt, sizeof(alt))) {
+        fp = fopen(alt, "r");
+        if (!fp) return ray_error("io", "load \"%s\": %s (also tried \"%s\")", path, strerror(ENOENT), alt);
+        path = alt; path_len = strlen(alt);
+    }
+    if (!fp) return ray_error("io", "load \"%s\": %s", path, strerror(errno));
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
+    if (sz < 0) { int e = errno; fclose(fp); return ray_error("io", "load \"%s\": cannot determine size: %s", path, strerror(e)); }
     if (sz == 0) { fclose(fp); return ray_i64(0); }
     char* buf = (char*)ray_alloc_raw((size_t)sz + 1);
     if (!buf) { fclose(fp); return ray_error("oom", NULL); }
@@ -2116,15 +2151,27 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     ray_free_raw(buf);
     return result;
 #else
+    /* Every failure names the file and the OS cause: a bare `io` from a
+     * script's load is indistinguishable from an IPC, journal or storage
+     * failure and sends diagnosis the wrong way (#505). */
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return ray_error("io", NULL);
+    if (fd < 0 && errno == ENOENT && load_home_candidate(path, alt, sizeof(alt))) {
+        fd = open(alt, O_RDONLY);
+        if (fd < 0) return ray_error("io", "load \"%s\": %s (also tried \"%s\")", path, strerror(ENOENT), alt);
+        path = alt; path_len = strlen(alt);
+    }
+    if (fd < 0) return ray_error("io", "load \"%s\": %s", path, strerror(errno));
     struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size < 0) { close(fd); return ray_error("io", NULL); }
+    if (fstat(fd, &st) < 0 || st.st_size < 0) {
+        int e = errno; close(fd);
+        return ray_error("io", "load \"%s\": cannot stat: %s", path, strerror(e));
+    }
+    if (S_ISDIR(st.st_mode)) { close(fd); return ray_error("io", "load \"%s\": is a directory", path); }
     size_t sz = (size_t)st.st_size;
     if (sz == 0) { close(fd); return ray_i64(0); }
     char* map = (char*)ray_vm_map_fd_ro(fd, sz);
-    close(fd);
-    if (!map) return ray_error("io", NULL);
+    { int e = errno; close(fd); errno = e; }
+    if (!map) return ray_error("io", "load \"%s\": cannot map %zu bytes: %s", path, sz, strerror(errno));
     /* Copy to NUL-terminated buffer -- mmap region may not have a trailing NUL */
     char* buf = (char*)ray_alloc_raw(sz + 1);
     if (!buf) { ray_vm_unmap_file(map, sz); return ray_error("oom", NULL); }
@@ -3298,8 +3345,13 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         return str_vec_concat_atom(b, a, true);
     /* Vector concat: same type — delegate to ray_vec_concat which handles
      * null bitmap propagation, SYM width promotion, and STR pool merging. */
-    if (ray_is_vec(a) && ray_is_vec(b) && a->type == b->type)
-        return ray_vec_concat(a, b);
+    if (ray_is_vec(a) && ray_is_vec(b) && a->type == b->type) {
+        ray_t* r = ray_vec_concat(a, b);
+        /* An append onto an indexed vector keeps the index when every
+         * appended key is new (see ray_index_carry_append). */
+        if (r && !RAY_IS_ERR(r) && ray_index_has(a)) ray_index_carry_append(a, r);
+        return r;
+    }
     /* Concat typed vec + boxed list or boxed list + typed vec -> boxed list */
     if ((ray_is_vec(a) && b->type == RAY_LIST) || (a->type == RAY_LIST && ray_is_vec(b))) {
         ray_t* la = (a->type == RAY_LIST) ? a : NULL;
@@ -3394,7 +3446,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         /* Null propagation: propagate null-ness of the leading atom
          * (a typed-null sentinel written raw at slot 0) and any nulls in the
          * trailing vector b. */
-        if (RAY_ATOM_IS_NULL(a) || (b->attrs & RAY_ATTR_HAS_NULLS))
+        if (RAY_ATOM_IS_NULL(a) || ray_vec_may_have_nulls(b))
             result->attrs |= RAY_ATTR_HAS_NULLS;
         if (b->type == RAY_SYM) {
             /* Mixed sources: the atom id is runtime-domain by design, b's
@@ -3445,8 +3497,9 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         result->len = na + 1;
         /* Null propagation: propagate nulls in the leading vector a
          * and null-ness of the trailing atom (sentinel written raw at na). */
-        if ((a->attrs & RAY_ATTR_HAS_NULLS) || RAY_ATOM_IS_NULL(b))
+        if (ray_vec_may_have_nulls(a) || RAY_ATOM_IS_NULL(b))
             result->attrs |= RAY_ATTR_HAS_NULLS;
+        if (ray_index_has(a)) ray_index_carry_append(a, result);
         return result;
     }
     /* Atom + atom of same type -> 2-element vector */
@@ -3643,7 +3696,7 @@ ray_t* ray_raze_fn(ray_t* x) {
             for (int64_t i = 0; i < n; i++) {
                 ray_t* it = items[i];
                 if (!ray_is_vec(it) || it->type != t
-                    || (it->attrs & RAY_ATTR_HAS_NULLS)) {
+                    || ray_vec_may_have_nulls(it)) {
                     fast = false; break;
                 }
                 total += it->len;

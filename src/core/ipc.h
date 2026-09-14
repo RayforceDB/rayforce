@@ -159,6 +159,7 @@ typedef struct {
     int64_t queued_bytes;   /* backlog right now */
     int64_t queued_frames;
     int64_t hwm_bytes;      /* largest backlog ever queued here */
+    bool    inbound;        /* accepted by a listener here (true) or opened by .ipc.open (false) */
 } ray_ipc_tx_info_t;
 
 void      ray_ipc_tx_limit_get(int64_t* bytes, int64_t* frames);

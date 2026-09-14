@@ -879,7 +879,10 @@ static test_result_t test_mcast_txlimit_overflow_disconnects(void) {
     ray_release(pub);
 
     TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_count", 9, 1, 2000));
-    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_close_count", 15, 1, 2000));
+    /* Two closes: the server dropping h1 (inbound), and h1's own side
+     * seeing the EOF (outbound, #503) — the signal a subscriber needs
+     * to notice it was evicted and reconnect. */
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_mc_close_count", 15, 2, 2000));
     ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
     TEST_ASSERT_NOT_NULL(c);
     TEST_ASSERT_EQ_I(c->i64, 1);              /* only h2 received it */
@@ -922,6 +925,114 @@ static test_result_t test_mcast_txlimit_overflow_disconnects(void) {
     ray_ipc_close(h1);
     ray_ipc_close(h2);
     ray_ipc_close(hp);
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+/* .ipc.on.close fires for outbound connections too (#503), once per
+ * established connection on any teardown: the peer's orderly close, a
+ * peer reset, and a local .ipc.close.  .ipc.on.open stays inbound-only,
+ * and (.ipc.handle h) reports `inbound` so one handler can tell the two
+ * apart.  The hook lambda is shared by the server thread (inbound
+ * closes) and the client poll (outbound closes), so it records the
+ * direction it saw rather than bare handle ids, which the two polls
+ * number independently. */
+static test_result_t test_ipc_outbound_close_hook(void) {
+    ray_t* r = ray_eval_str(
+        "(set _oc_in 0)"
+        "(set _oc_out 0)"
+        "(set _oc_open 0)"
+        "(set _oc_srv [])"
+        "(set .ipc.on.open (fn [h] (do (set _oc_open (+ _oc_open 1)) (set _oc_srv (concat _oc_srv h)))))"
+        "(set .ipc.on.close (fn [h] "
+        "  (if (at (.ipc.handle h) 'inbound) (set _oc_in (+ _oc_in 1)) (set _oc_out (+ _oc_out 1)))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t h3 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    int64_t hc = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);   /* control */
+    TEST_ASSERT((h1) >= (0) && (h2) >= (0) && (h3) >= (0) && (hc) >= (0), "connected");
+    pump_client();
+
+    /* open fired once per inbound connection and never for an outbound one */
+    ray_t* op = ray_env_get(ray_sym_intern("_oc_open", 8));
+    TEST_ASSERT_NOT_NULL(op);
+    TEST_ASSERT_EQ_I(op->i64, 4);
+
+    /* direction is visible on both sides */
+    ray_t* msg = ray_str("(at (.ipc.handle (.ipc.handle)) 'inbound)", strlen("(at (.ipc.handle (.ipc.handle)) 'inbound)"));
+    ray_t* inb = ray_ipc_send(hc, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(inb);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inb));
+    TEST_ASSERT_EQ_I(inb->type, -RAY_BOOL);
+    TEST_ASSERT_TRUE(inb->b8);
+    ray_release(inb);
+    {
+        ray_ipc_tx_info_t ti;
+        TEST_ASSERT_EQ_I(ray_ipc_tx_info(h1, &ti), RAY_OK);
+        TEST_ASSERT_FALSE(ti.inbound);
+    }
+
+    ray_t* srv = ray_env_get(ray_sym_intern("_oc_srv", 7));
+    TEST_ASSERT_NOT_NULL(srv);
+    TEST_ASSERT((ray_len(srv)) >= (3), "server-side handles captured");
+    int64_t s1 = ((int64_t*)ray_data(srv))[0];
+    int64_t s2 = ((int64_t*)ray_data(srv))[1];
+
+    /* A: the peer closes h1 in an orderly way (server-side .ipc.close) */
+    char src[96];
+    int n = snprintf(src, sizeof(src), "(.ipc.close %lld)", (long long)s1);
+    msg = ray_str(src, (size_t)n);
+    ray_t* cr = ray_ipc_send(hc, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(cr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cr));
+    ray_release(cr);
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_oc_out", 7, 1, 1000));
+
+    /* B: the peer resets h2 (linger zero, then close → RST) */
+#ifndef RAY_OS_WINDOWS
+    {
+        ray_selector_t* ssel = ray_poll_get(poll, s2);
+        TEST_ASSERT_NOT_NULL(ssel);
+        struct linger lg = { 1, 0 };
+        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
+#endif
+    n = snprintf(src, sizeof(src), "(.ipc.close %lld)", (long long)s2);
+    msg = ray_str(src, (size_t)n);
+    cr = ray_ipc_send(hc, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(cr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cr));
+    ray_release(cr);
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_oc_out", 7, 2, 1000));
+
+    /* C: local close of h3 fires the hook too — one rule for any teardown */
+    ray_ipc_close(h3);
+    TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_oc_out", 7, 3, 1000));
+
+    /* exactly once each; the inbound side saw its own three closes */
+    ray_t* out = ray_env_get(ray_sym_intern("_oc_out", 7));
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I(out->i64, 3);
+    sleep_ms(50);
+    ray_t* in = ray_env_get(ray_sym_intern("_oc_in", 6));
+    TEST_ASSERT_NOT_NULL(in);
+    TEST_ASSERT((in->i64) >= (3), "inbound closes observed on the server");
+
+    ray_ipc_close(hc);
     stop_server(poll, port, vm, tid);
     PASS();
 }
@@ -1139,5 +1250,6 @@ const test_entry_t mcast_entries[] = {
     { "mcast/failed_send_defers_close",   test_mcast_failed_send_defers_close,   mcast_setup, mcast_teardown },
     { "mcast/shared_frame_across_subs",   test_mcast_shared_frame_across_subscribers, mcast_setup, mcast_teardown },
     { "mcast/txlimit_overflow_disconnects", test_mcast_txlimit_overflow_disconnects, mcast_setup, mcast_teardown },
+    { "ipc/outbound_close_hook",          test_ipc_outbound_close_hook,          mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };

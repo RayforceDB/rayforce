@@ -36,6 +36,10 @@
 #include <stdlib.h>        /* abort in datalog_rf_setup */
 #include <string.h>
 
+/* ray_error_msg() isn't in the public <rayforce.h> surface — src/ops/datalog.c
+ * itself reaches it the same way (see its own `extern` near the top). */
+extern const char* ray_error_msg(void);
+
 /* Full-runtime fixtures use the public runtime API from <rayforce.h>. */
 
 static void datalog_setup(void) {
@@ -2014,6 +2018,40 @@ static test_result_t test_eval_surfaces_compile_failure(void) {
     PASS();
 }
 
+/* Admission errors: a `find` clause wider than DL_MAX_ARITY (16) must be
+ * rejected instead of silently truncated, and a body predicate that
+ * resolves to no relation at all (not an EDB, env-bound table, or rule
+ * head) must be an error instead of an empty result.  Audit §1.6, §7.3. */
+static test_result_t test_query_admission_errors(void) {
+    ray_t* db = ray_eval_str(
+        "(do (set __qae_db (datoms)) (set __qae_db (assert-fact __qae_db 1 'a 1)))");
+    TEST_ASSERT_NOT_NULL(db);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(db));
+    ray_release(db);
+
+    /* (a) 17 find variables exceeds DL_MAX_ARITY (16). */
+    ray_t* r_wide = ray_eval_str(
+        "(query __qae_db (find ?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p ?q) "
+        "  (where (?a :a ?b)))");
+    TEST_ASSERT_NOT_NULL(r_wide);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r_wide));
+    const char* msg_wide = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg_wide);
+    TEST_ASSERT_TRUE(strstr(msg_wide, "find supports at most 16 variables") != NULL);
+    ray_error_free(r_wide);
+
+    /* (b) unknown relation referenced in the body. */
+    ray_t* r_unk = ray_eval_str("(query __qae_db (find ?x) (where (nosuch ?x)))");
+    TEST_ASSERT_NOT_NULL(r_unk);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r_unk));
+    const char* msg_unk = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg_unk);
+    TEST_ASSERT_TRUE(strstr(msg_unk, "unknown relation 'nosuch'") != NULL);
+    ray_error_free(r_unk);
+
+    PASS();
+}
+
 /* ray_release() is a deliberate no-op for RAY_ERROR objects, so callers
  * that claim to be "releasing" an error under the refcount API actually
  * leak the block.  ray_error_free() is the escape hatch that calls
@@ -2470,10 +2508,213 @@ static test_result_t test_edb_over_arity_domain_guard(void) {
     PASS();
 }
 
+/* Audit §1.1: p(X,Z) :- p(X,Y), p(Y,Z) over a 7-edge chain must produce the
+ * same 28 pairs as the linear formulation. The old fixpoint loop swapped the
+ * whole relation for its delta, so both body occurrences of `p` read the
+ * delta and old×new combinations were never joined. */
+static test_result_t test_nonlinear_closure_chain(void) {
+    int64_t src[7], dst[7];
+    for (int i = 0; i < 7; i++) { src[i] = i + 1; dst[i] = i + 2; }
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, src, 7);
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, dst, 7);
+    ray_t* edge = ray_table_new(2);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c0", 8), c0);
+    edge = ray_table_add_col(edge, ray_sym_intern("edge__c1", 8), c1);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "edge", edge, 2), 0);
+
+    dl_rule_t r1;                      /* p(X,Y) :- edge(X,Y) */
+    dl_rule_init(&r1, "p", 2);
+    dl_rule_head_var(&r1, 0, 0); dl_rule_head_var(&r1, 1, 1);
+    int b = dl_rule_add_atom(&r1, "edge", 2);
+    dl_body_set_var(&r1, b, 0, 0); dl_body_set_var(&r1, b, 1, 1);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r1), 0);
+
+    dl_rule_t r2;                      /* p(X,Z) :- p(X,Y), p(Y,Z) */
+    dl_rule_init(&r2, "p", 2);
+    dl_rule_head_var(&r2, 0, 0); dl_rule_head_var(&r2, 1, 2);
+    int b1 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b1, 0, 0); dl_body_set_var(&r2, b1, 1, 1);
+    int b2 = dl_rule_add_atom(&r2, "p", 2);
+    dl_body_set_var(&r2, b2, 0, 1); dl_body_set_var(&r2, b2, 1, 2);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r2), 1);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "p");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 28);
+
+    dl_program_free(prog);
+    ray_release(edge); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
+/* Audit §1.4: an I64 literal against an F64 EDB column must filter, not
+ * pass the whole table through. */
+static test_result_t test_const_filter_f64_column(void) {
+    int64_t ids[] = {1, 2, 3};
+    double  xs[]  = {1.0, 2.0, 3.0};
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, ids, 3);
+    ray_t* c1 = ray_vec_from_raw(RAY_F64, xs, 3);
+    ray_t* pts = ray_table_new(2);
+    pts = ray_table_add_col(pts, ray_sym_intern("pts__c0", 7), c0);
+    pts = ray_table_add_col(pts, ray_sym_intern("pts__c1", 7), c1);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "pts", pts, 2), 0);
+    dl_rule_t r;                          /* q(X) :- pts(X, 2) */
+    dl_rule_init(&r, "q", 1);
+    dl_rule_head_var(&r, 0, 0);
+    int b = dl_rule_add_atom(&r, "pts", 2);
+    dl_body_set_var(&r, b, 0, 0);
+    dl_body_set_const_typed(&r, b, 1, 2, RAY_I64);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+
+    /* q2(Y) :- pts(1.0, Y) — an F64 literal against the I64 id column
+     * (pos 0), exercising dl_col_eq_row's `col->type == RAY_I64 &&
+     * const_type == RAY_F64` branch (`(double)cell == v`), which the
+     * first rule above never reaches (its F64 literal always targets
+     * the F64 column). */
+    double one = 1.0;
+    int64_t one_bits; memcpy(&one_bits, &one, sizeof one_bits);
+    dl_rule_t r2;
+    dl_rule_init(&r2, "q2", 1);
+    dl_rule_head_var(&r2, 0, 0);
+    int b2 = dl_rule_add_atom(&r2, "pts", 2);
+    dl_body_set_const_typed(&r2, b2, 0, one_bits, RAY_F64);
+    dl_body_set_var(&r2, b2, 1, 0);
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r2), 1);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+    ray_t* out = dl_query(prog, "q");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 1);
+    TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(out, 0)))[0], 2);
+
+    ray_t* out2 = dl_query(prog, "q2");
+    TEST_ASSERT_NOT_NULL(out2);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out2), 1);
+    TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(out2, 0)))[0], 1.0, 1e-12);
+
+    dl_program_free(prog);
+    ray_release(pts); ray_release(c0); ray_release(c1);
+    PASS();
+}
+
+/* Audit §1.4 (review follow-up): source provenance for a constant body
+ * slot must use the same type-aware equality as dl_filter_eq (an F64
+ * literal against an I64 column), not a raw int64 bit-compare — see
+ * dl_build_source_prov's const-slot branch, which previously read
+ * `((int64_t*)ray_data(bcol))[br] != body->const_vals[c]` directly. */
+static test_result_t test_source_prov_f64_const_body_slot(void) {
+    int64_t e_vals[] = {1, 2, 3};
+    int64_t k_vals[] = {7, 7, 9};
+    ray_t* e_col = ray_vec_from_raw(RAY_I64, e_vals, 3);
+    ray_t* k_col = ray_vec_from_raw(RAY_I64, k_vals, 3);
+    TEST_ASSERT_NOT_NULL(e_col);
+    TEST_ASSERT_NOT_NULL(k_col);
+
+    ray_t* kv = ray_table_new(2);
+    kv = ray_table_add_col(kv, ray_sym_intern("kv__c0", 6), e_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    kv = ray_table_add_col(kv, ray_sym_intern("kv__c1", 6), k_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    prog->flags |= DL_FLAG_PROVENANCE;
+
+    int kv_idx = dl_add_edb(prog, "kv", kv, 2);
+    TEST_ASSERT_EQ_I(kv_idx, 0);
+
+    /* hit(E) :- kv(E, 7.0) — F64 literal against the I64 k column. */
+    double seven = 7.0;
+    int64_t seven_bits; memcpy(&seven_bits, &seven, sizeof seven_bits);
+    dl_rule_t rule;
+    dl_rule_init(&rule, "hit", 1);
+    dl_rule_head_var(&rule, 0, 0);
+    int body = dl_rule_add_atom(&rule, "kv", 2);
+    dl_body_set_var(&rule, body, 0, 0);                          /* E */
+    dl_body_set_const_typed(&rule, body, 1, seven_bits, RAY_F64); /* constant 7.0 */
+    rule.n_vars = 1;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "hit");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 2);
+
+    ray_t* offsets = dl_get_provenance_src_offsets(prog, "hit");
+    ray_t* data    = dl_get_provenance_src_data(prog, "hit");
+    TEST_ASSERT_NOT_NULL(offsets);
+    TEST_ASSERT_NOT_NULL(data);
+    TEST_ASSERT_EQ_I((int)ray_len(offsets), 3);
+    TEST_ASSERT_EQ_I((int)ray_len(data), 2);
+    int64_t* off = (int64_t*)ray_data(offsets);
+    TEST_ASSERT_EQ_I((int)off[0], 0);
+    TEST_ASSERT_EQ_I((int)off[1], 1);
+    TEST_ASSERT_EQ_I((int)off[2], 2);
+    /* Both refs must point at relation kv (idx 0), rows 0 and 1 — never row 2
+     * (kv(3,9), which does not equal 7.0). Before routing through
+     * dl_col_eq_row, the raw int64 compare `9 != <bits of 7.0>` happened to
+     * still reject row 2, but rows 0/1 (`7 != <bits of 7.0>`) would also have
+     * been wrongly rejected, leaving provenance empty. */
+    int64_t* sd = (int64_t*)ray_data(data);
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_EQ_I((int)(sd[i] >> 32), kv_idx);
+        TEST_ASSERT_TRUE((sd[i] & 0xffffffff) != 2);
+    }
+
+    dl_program_free(prog);
+    ray_release(kv);
+    ray_release(e_col);
+    ray_release(k_col);
+    PASS();
+}
+
+/* Audit §2.1: dl_add_rule deep-copies expression trees, so two programs can
+ * hold the same rule and each free its own copy; the caller frees the
+ * original. Under ASan a shared tree would double-free here. */
+static test_result_t test_rule_expr_ownership(void) {
+    dl_rule_t r;                              /* q(Y) :- p(X), Y = X + 1 */
+    dl_rule_init(&r, "q", 1);
+    dl_rule_head_var(&r, 0, 1);
+    int b = dl_rule_add_atom(&r, "p", 1);
+    dl_body_set_var(&r, b, 0, 0);
+    dl_expr_t* e = dl_expr_binop(OP_ADD, dl_expr_var(0), dl_expr_const(1));
+    TEST_ASSERT_TRUE(dl_rule_add_assign(&r, 1, OP_ADD, e) >= 0);
+
+    int64_t v[] = {1};
+    ray_t* c = ray_vec_from_raw(RAY_I64, v, 1);
+    ray_t* p = ray_table_new(1);
+    p = ray_table_add_col(p, ray_sym_intern("p__c0", 5), c);
+
+    dl_program_t* a = dl_program_new();
+    dl_program_t* bprog = dl_program_new();
+    dl_add_edb(a, "p", p, 1);  dl_add_edb(bprog, "p", p, 1);
+    TEST_ASSERT_EQ_I(dl_add_rule(a, &r), 0);
+    TEST_ASSERT_EQ_I(dl_add_rule(bprog, &r), 0);
+    TEST_ASSERT_TRUE(a->rules[0].body[1].assign_expr != r.body[1].assign_expr);
+    TEST_ASSERT_TRUE(a->rules[0].body[1].assign_expr != bprog->rules[0].body[1].assign_expr);
+    TEST_ASSERT_EQ_I(dl_eval(a), 0);
+    TEST_ASSERT_EQ_I((int)((int64_t*)ray_data(ray_table_get_col_idx(dl_query(a, "q"), 0)))[0], 2);
+
+    dl_program_free(a);
+    dl_program_free(bprog);
+    dl_rule_free_exprs(&r);
+    TEST_ASSERT_TRUE(r.body[1].assign_expr == NULL);
+    ray_release(p); ray_release(c);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
     { "datalog/source_prov_const_body_slot", test_source_prov_const_body_slot, datalog_setup, datalog_teardown },
+    { "datalog/source_prov_f64_const_body_slot", test_source_prov_f64_const_body_slot, datalog_setup, datalog_teardown },
     { "datalog/source_prov_buffer_grow", test_source_prov_buffer_grow, datalog_setup, datalog_teardown },
     { "datalog/cmp_const_filter", test_cmp_const_filter, datalog_setup, datalog_teardown },
     { "datalog/arith_assignment", test_arith_assignment, datalog_setup, datalog_teardown },
@@ -2517,6 +2758,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/env_bound_edb_auto_register", test_env_bound_edb_auto_register, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/env_bound_agg_auto_register", test_env_bound_agg_auto_register, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/eval_surfaces_compile_failure", test_eval_surfaces_compile_failure, datalog_rf_setup, datalog_rf_teardown },
+    { "datalog/query_admission_errors", test_query_admission_errors, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/error_free_reclaims", test_error_free_reclaims, datalog_rf_setup, datalog_rf_teardown },
     { "datalog/agg_scalar_f64", test_agg_scalar_f64, datalog_setup, datalog_teardown },
     { "datalog/agg_scalar_f64_sum_empty", test_agg_scalar_f64_sum_empty, datalog_setup, datalog_teardown },
@@ -2534,6 +2776,9 @@ const test_entry_t datalog_entries[] = {
     { "datalog/rule_add_interval", test_rule_add_interval, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
     { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
+    { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
+    { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
+    { "datalog/rule_expr_ownership", test_rule_expr_ownership, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

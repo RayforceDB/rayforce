@@ -875,7 +875,11 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             ray_index_t* ix = ray_index_payload(vec->index);
             header.attrs &= ~RAY_ATTR_HAS_INDEX;
             memcpy(header.aux, ix->saved_aux, 16);
-            persist_index = (vec->index != NULL);
+            /* STR indexes (dict, hash) are appended after the pool by the
+             * splayed builder (ray_col_append_index), which stamps the marker
+             * itself and refuses a file already carrying one — so a STR save
+             * must not stamp it here. */
+            persist_index = (vec->index != NULL) && vec->type != RAY_STR;
         }
 
         /* HAS_LINK rebase: target sym ID lives at header.aux[8..15],

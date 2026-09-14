@@ -2,7 +2,7 @@
 
 Five user-installable lambdas under `.ipc.on.*` that intercept the server-side connection lifecycle, plus the `.ipc.handle` accessor for the current connection's handle.
 
-The handle a hook receives is a first-class connection handle — the same namespace `.ipc.open` allocates from. Pass it to `.ipc.post` (async push to the connected client), `.ipc.send` (sync round-trip), or `.ipc.close` (kick the client), from inside the hook or any time later. Lifecycle hooks fire for **inbound** connections only; connections the process itself opened via `.ipc.open` never trigger `on.open`/`on.close`.
+The handle a hook receives is a first-class connection handle — the same namespace `.ipc.open` allocates from. Pass it to `.ipc.post` (async push to the connected client), `.ipc.send` (sync round-trip), or `.ipc.close` (kick the client), from inside the hook or any time later. `on.open`, `on.sync`, `on.async` and `on.auth` fire for **inbound** connections only. `on.close` fires for **both** directions: a connection the process opened with `.ipc.open` reports its close too, so a receive-only client (a multicast subscriber, say) learns that the peer went away without probing. `(at (.ipc.handle h) 'inbound)` tells the two apart inside the hook.
 
 !!! note "See also"
     The [IPC & Serialization](ipc.md) page documents the client-side `.ipc.open` / `.ipc.send` / `.ipc.close` and the wire format. Hooks live on the server and fire in response to inbound connections.
@@ -14,7 +14,7 @@ The server side exposes the inbound connection lifecycle to Rayfall code through
 | Name | Signature | Fires | Return value |
 |---|---|---|---|
 | `.ipc.on.open` | `(fn [h] ...)` | Inbound connection fully handshaked (and authed when `-u`/`-U` is on), just before the first header read. | Ignored. |
-| `.ipc.on.close` | `(fn [h] ...)` | Inbound connection about to close, before its socket is closed and per-conn state is freed. Pairs 1-to-1 with `.ipc.on.open` — never fires for connections that died mid-handshake. | Ignored. |
+| `.ipc.on.close` | `(fn [h] ...)` | An established connection, inbound or outbound, about to close, before its socket is closed and per-conn state is freed. Fires exactly once per connection on any teardown: the peer's close or reset, a socket error, a local `.ipc.close`, or a multicast eviction seen from the subscriber's side. Never fires for a connection that died mid-handshake. Inbound closes pair 1-to-1 with `.ipc.on.open`; outbound ones have no open event. | Ignored. |
 | `.ipc.on.sync` | `(fn [m] ...)` | Inbound sync request, after the payload is deserialised into `m`. Replaces the default in-process `eval`. | Serialised and shipped to the client as the response. |
 | `.ipc.on.async` | `(fn [m] ...)` | Inbound async message. Same dispatch point as `on.sync`, but the wire produces no response. | Ignored (errors are logged to stderr). |
 | `.ipc.on.auth` | `(fn [u p] ...)` | After the constant-time secret compare in `-u`/`-U` auth passes. Servers started without auth never reach this hook. | Truthy = accept connection, falsy / error = reject and close. |
@@ -86,3 +86,13 @@ Inside any hook, `(.ipc.handle)` returns the handle of the connection that trigg
 The argument `h` passed to `on.open` / `on.close` always equals `(.ipc.handle)` at the moment the hook fires — the builtin is the only way to reach the handle from `on.sync` / `on.async` / `on.auth`, whose signatures don't include it directly.
 
 A handle read here stays valid for the connection's lifetime: store it and `.ipc.post` to it later (publish/subscribe), or `.ipc.close` it to drop the client. After the connection closes, the integer may be reused by a future connection — don't cache handles across `on.close`.
+
+Inside `on.close` the handle still resolves — `(.ipc.handle h)` answers, with `inbound` saying which direction closed — but the peer is gone or going, so sending on it is pointless. The hook runs inside the poller's teardown of that connection; reconnect from a timer (`.time.timer.set`) rather than from inside the hook.
+
+```lisp
+;; a subscriber that notices its publisher dropped it
+(set .ipc.on.close (fn [h]
+  (if (not (at (.ipc.handle h) 'inbound))
+      (.time.timer.set 1000 1 (fn [t] (reconnect-and-resubscribe)))
+      null)))
+```

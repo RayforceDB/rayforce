@@ -1891,6 +1891,19 @@ ray_t* ray_alloc_copy(ray_t* v) {
         ray_atomic_store(&copy->rc, 1);
     else
         copy->rc = 1;
+    /* A table's key map (RAY_IDX_UKEY, ops/idxop.h) describes the rows of the
+     * table it was built for and upsert mutates it in place, recording the
+     * row count it now covers.  Two tables sharing one would each be writing
+     * their own count into it, so a copy starts without it and builds its own
+     * on demand.  Nothing else attaches an index to a RAY_TABLE, so clearing
+     * the bit here cannot discard anything else.  Before retain, so the copy
+     * never takes a reference it does not keep. */
+    if (copy->type == RAY_TABLE && (copy->attrs & RAY_ATTR_HAS_INDEX)) {
+        copy->index    = NULL;
+        copy->_idx_pad = NULL;
+        copy->attrs   &= (uint8_t)~RAY_ATTR_HAS_INDEX;
+    }
+
     if (!ray_retain_owned_refs(copy)) {
         /* Deep-clone of an owned resource failed (e.g. HNSW index OOM).
          * The copy's owned state has already been neutralized, so a plain
@@ -2819,4 +2832,176 @@ void ray_parallel_begin(void) { atomic_store(&ray_parallel_flag, 1); }
 void ray_parallel_end(void) {
     atomic_store(&ray_parallel_flag, 0);
     ray_heap_gc();
+}
+
+/* --------------------------------------------------------------------------
+ * Native footprint — ray_shallow_bytes / ray_retained_bytes (rayforce.h)
+ *
+ * Read-only mirrors of the ownership rules in ray_release_owned_refs and
+ * of the mapping arithmetic in ray_free.  Keep the three in step: a new
+ * owned child kind belongs in retained_walk, a new private-storage kind
+ * (one only its holder releases and no API hands out) in shallow too.
+ * -------------------------------------------------------------------------- */
+
+/* Bytes of a file mapping owned by block v (mmod 1) — the size ray_free
+ * hands to the unmap.  A string column reaches its region descriptor
+ * through its pool (or the registry once the pool was swapped); anything
+ * else is the page-rounded payload plus an inline passenger index. */
+static size_t mapped_block_bytes(const ray_t* v) {
+    if (v->type == RAY_TABLE || v->type == RAY_DICT || v->type == RAY_LIST) return 0;
+    if (v->type == RAY_STR) {
+        ray_file_map_t* m = NULL;
+        if (v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->mmod == 3)
+            m = v->str_pool->file_map;
+        if (!m) m = ray_file_map_lookup(v);
+        if (m) return m->len;
+    }
+    if (v->type <= 0 || v->type >= RAY_TYPE_COUNT) return 0;
+    uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
+    size_t data_size = 32 + (size_t)v->len * esz;
+    if (v->type == RAY_STR) {
+        size_t pool_len = 0;
+        if (v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->len > 0)
+            pool_len = (size_t)v->str_pool->len;
+        data_size += 32 + pool_len;
+    }
+    if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index)) {
+        ray_index_t* ix = ray_index_payload(v->index);
+        if (ix->markers & RAY_MARK_MMAP) {
+            int64_t region_off = ((int64_t)data_size + 31) & ~(int64_t)31;
+            data_size = (size_t)(region_off + ray_index_inline_size(ix));
+        }
+    }
+    return (data_size + 4095) & ~(size_t)4095;
+}
+
+/* The allocation behind one block, and nothing it points at. */
+static size_t block_own_bytes(const ray_t* v) {
+    if (!v) return 0;
+    if (v->attrs & RAY_ATTR_ARENA) return 0;          /* singletons, arena values */
+    switch (v->mmod) {
+    case 1:  return mapped_block_bytes(v);            /* owns its mapping */
+    case 2:  return 0;                                /* borrowed */
+    case 3:  return 0;                                /* pool inside a column's region */
+    default: break;
+    }
+    if (ray_is_direct(v)) return ray_direct_map_size(v);
+    if (v->order < RAY_ORDER_MIN || v->order > RAY_HEAP_MAX_ORDER) return 0;
+    return BSIZEOF(v->order);
+}
+
+/* Heap-resident index: its block plus its tables.  A mapping passenger is
+ * charged through the column's mapping. */
+static size_t index_own_bytes(const ray_t* idx) {
+    if (!idx || RAY_IS_ERR(idx) || idx->mmod == 1) return 0;
+    ray_index_t* ix = ray_index_payload((ray_t*)idx);
+    if (ix->markers & RAY_MARK_MMAP) return 0;
+    size_t n = block_own_bytes(idx);
+    ray_t* kids[4];
+    int k = ray_index_child_blocks(ix, kids, 4);
+    for (int i = 0; i < k; i++) n += block_own_bytes(kids[i]);
+    return n;
+}
+
+size_t ray_shallow_bytes(const ray_t* v) {
+    if (!v) return 0;
+    size_t n = block_own_bytes(v);
+    if (RAY_IS_ERR(v)) return n;
+    if (ray_is_atom(v)) {
+        if (ray_atom_owns_obj(v) && v->obj && !RAY_IS_ERR(v->obj))
+            n += block_own_bytes(v->obj);
+        return n;
+    }
+    if (v->attrs & RAY_ATTR_SLICE) return n;
+    if (v->type == RAY_INDEX) return index_own_bytes(v);
+    if (v->attrs & RAY_ATTR_HAS_INDEX) n += index_own_bytes(v->index);
+    if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
+        n += block_own_bytes(v->str_pool);
+    return n;
+}
+
+/* Pointer set for the retained walk: open addressing over ray_sys_alloc,
+ * so the walk never touches the heap it is measuring.  On OOM the set stops
+ * growing and add() answers "new" for everything — the walk then still
+ * terminates (the value graph is acyclic) and can only over-count. */
+typedef struct { const ray_t** slots; size_t cap; size_t n; } ptrset_t;
+
+static bool ptrset_add(ptrset_t* s, const ray_t* p) {
+    if (s->n * 2 >= s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 64;
+        const ray_t** ns = (const ray_t**)ray_sys_alloc(ncap * sizeof(*ns));
+        if (!ns) return true;
+        memset(ns, 0, ncap * sizeof(*ns));
+        for (size_t i = 0; i < s->cap; i++) {
+            const ray_t* q = s->slots[i];
+            if (!q) continue;
+            size_t h = ((uintptr_t)q >> 5) & (ncap - 1);
+            while (ns[h]) h = (h + 1) & (ncap - 1);
+            ns[h] = q;
+        }
+        if (s->slots) ray_sys_free((void*)s->slots);
+        s->slots = ns; s->cap = ncap;
+    }
+    size_t h = ((uintptr_t)p >> 5) & (s->cap - 1);
+    while (s->slots[h]) {
+        if (s->slots[h] == p) return false;
+        h = (h + 1) & (s->cap - 1);
+    }
+    s->slots[h] = p; s->n++;
+    return true;
+}
+
+static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
+    if (!v || RAY_IS_ERR(v)) return 0;
+    if (!ptrset_add(seen, v)) return 0;
+    size_t n = block_own_bytes(v);
+
+    if (ray_is_atom(v)) {
+        if (v->type == RAY_LAMBDA) {
+            ray_t*  lam   = (ray_t*)v;
+            ray_t** slots = (ray_t**)ray_data(lam);
+            for (int i = 0; i < 4; i++) n += retained_walk(slots[i], seen);
+            n += retained_walk(LAMBDA_NFO(lam), seen);
+            n += retained_walk(LAMBDA_DBG(lam), seen);
+            n += retained_walk(LAMBDA_CLOSURE(lam), seen);
+            return n;
+        }
+        if (ray_atom_owns_obj(v)) n += retained_walk(v->obj, seen);
+        return n;
+    }
+    if (v->attrs & RAY_ATTR_SLICE) return n + retained_walk(v->slice_parent, seen);
+    if (v->type == RAY_INDEX) {
+        ray_index_t* ix = ray_index_payload((ray_t*)v);
+        if (v->mmod == 1 || (ix->markers & RAY_MARK_MMAP)) return 0;
+        ray_t* kids[4];
+        int k = ray_index_child_blocks(ix, kids, 4);
+        for (int i = 0; i < k; i++) n += retained_walk(kids[i], seen);
+        return n;
+    }
+    if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index) &&
+        v->index->mmod != 1)
+        n += retained_walk(v->index, seen);
+    if (v->type == RAY_STR) {
+        if (v->str_pool && !RAY_IS_ERR(v->str_pool)) n += retained_walk(v->str_pool, seen);
+        return n;
+    }
+    if (v->type == RAY_SYM) return n;   /* the domain is not a ray_t */
+    if (RAY_IS_PARTED(v->type) || v->type == RAY_LIST) {
+        ray_t** ptrs = (ray_t**)ray_data((ray_t*)v);
+        for (int64_t i = 0; i < v->len; i++) n += retained_walk(ptrs[i], seen);
+        return n;
+    }
+    if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
+        ray_t** slots = (ray_t**)ray_data((ray_t*)v);
+        n += retained_walk(slots[0], seen);
+        n += retained_walk(slots[1], seen);
+    }
+    return n;
+}
+
+size_t ray_retained_bytes(const ray_t* v) {
+    ptrset_t seen = { NULL, 0, 0 };
+    size_t n = retained_walk(v, &seen);
+    if (seen.slots) ray_sys_free((void*)seen.slots);
+    return n;
 }

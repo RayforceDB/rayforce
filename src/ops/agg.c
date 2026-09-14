@@ -143,7 +143,7 @@ static ray_t* agg_parted_sum(ray_t* x) {
         for (int64_t s = 0; s < x->len; s++) {
             ray_t* seg = segs[s];
             if (!seg) continue;
-            int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            int has_nulls = ray_vec_may_have_nulls(seg);
             for (int64_t i = 0; i < seg->len; i++)
                 if (!has_nulls || !ray_vec_is_null(seg, i)) {
                     if (base == RAY_F64) sum += ((double*)ray_data(seg))[i];
@@ -156,7 +156,7 @@ static ray_t* agg_parted_sum(ray_t* x) {
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg) continue;
-        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        int has_nulls = ray_vec_may_have_nulls(seg);
         for (int64_t i = 0; i < seg->len; i++)
             if (!has_nulls || !ray_vec_is_null(seg, i)) sum = wrap_add_i64(sum, agg_read_i64(seg, i));
     }
@@ -173,7 +173,7 @@ static ray_t* agg_parted_avg(ray_t* x) {
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg) continue;
-        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        int has_nulls = ray_vec_may_have_nulls(seg);
         if (base == RAY_F64 || base == RAY_F32) {
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
@@ -204,7 +204,7 @@ static ray_t* agg_parted_prod(ray_t* x) {
         for (int64_t s = 0; s < x->len; s++) {
             ray_t* seg = segs[s];
             if (!seg) continue;
-            int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            int has_nulls = ray_vec_may_have_nulls(seg);
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
                 if (base == RAY_F64) prod *= ((double*)ray_data(seg))[i];
@@ -218,7 +218,7 @@ static ray_t* agg_parted_prod(ray_t* x) {
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg) continue;
-        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        int has_nulls = ray_vec_may_have_nulls(seg);
         for (int64_t i = 0; i < seg->len; i++) {
             if (has_nulls && ray_vec_is_null(seg, i)) continue;
             prod = wrap_mul_i64(prod, agg_read_i64(seg, i));
@@ -237,7 +237,7 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg) continue;
-        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        int has_nulls = ray_vec_may_have_nulls(seg);
         if (base == RAY_F64 || base == RAY_F32) {
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
@@ -294,7 +294,7 @@ static ray_t* agg_parted_truth(ray_t* x, int want_all) {
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg) continue;
-        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        int has_nulls = ray_vec_may_have_nulls(seg);
         for (int64_t i = 0; i < seg->len; i++) {
             if (((i | s) & 65535) == 0 && ray_interrupted())
                 return ray_error("cancel", "interrupted");
@@ -317,7 +317,7 @@ static ray_t* agg_truth_vec(ray_t* x, int want_all) {
         return ray_error("type", want_all ? "all expects a numeric vector, got %s"
                                           : "any expects a numeric vector, got %s",
                          ray_type_name(x->type));
-    bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(x);
     int64_t seen = 0, truthy = 0;
     for (int64_t i = 0; i < x->len; i++) {
         if ((i & 65535) == 0 && ray_interrupted())
@@ -363,8 +363,8 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
     if (!agg_numeric_flat_type(x->type) || !agg_numeric_flat_type(y->type))
         return ray_error("type", "%s expects numeric vectors, got %s and %s", name, ray_type_name(x->type), ray_type_name(y->type));
 
-    bool xn = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
-    bool yn = (y->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool xn = ray_vec_may_have_nulls(x);
+    bool yn = ray_vec_may_have_nulls(y);
     int64_t cnt = 0;
     double sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
     for (int64_t i = 0; i < x->len; i++) {
@@ -426,7 +426,7 @@ ray_t* ray_sum_fn(ray_t* x) {
         if (x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8 ||
             x->type == RAY_TIME) {
             int64_t n = x->len;
-            bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            bool has_nulls = ray_vec_may_have_nulls(x);
             int64_t sum = 0;
             if (x->type == RAY_I32) {
                 int32_t* d = (int32_t*)ray_data(x);

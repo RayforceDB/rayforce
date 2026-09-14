@@ -21,10 +21,12 @@
  *   SOFTWARE.
  */
 
+#include "vec/vec.h"
 #include "dict.h"
 #include "table.h"
 #include "table/sym.h"
 #include "lang/internal.h"   /* atom_eq for RAY_LIST key compares */
+#include "ops/idxop.h"       /* ray_index_find_atom: keyed lookup via an attached hash */
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -200,6 +202,13 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
     /* Typed-vector keys: atom type must match. */
     if (key_atom->type != -kt) return -1;
 
+    /* Keys carrying a hash index (`.attr.set 'grouped` / `'unique`): one
+     * probe instead of the scan below.  -2 = not eligible → scan. */
+    if (ray_index_has(keys)) {
+        int64_t r = ray_index_find_atom(keys, key_atom);
+        if (r >= -1) return r;
+    }
+
     /* Null-aware probe: a null key atom matches only null slots; a non-null
      * key atom must match a non-null slot of equal value.  Without this, a
      * group dict containing both `0Nl` and `0` keys (now produced as
@@ -207,7 +216,7 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
      * to the first non-null zero — re-introducing the conflation we just
      * fixed in grouping. */
     bool key_is_null = RAY_ATOM_IS_NULL(key_atom);
-    bool keys_have_nulls = (keys->attrs & RAY_ATTR_HAS_NULLS) != 0
+    bool keys_have_nulls = ray_vec_may_have_nulls(keys)
                             || (keys->attrs & RAY_ATTR_SLICE);
     if (key_is_null) {
         if (!keys_have_nulls) return -1;

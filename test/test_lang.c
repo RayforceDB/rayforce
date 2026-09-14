@@ -5055,7 +5055,8 @@ static test_result_t test_datalog_query_inline_rules(void) {
     TEST_ASSERT_EQ_I((int)ray_table_nrows(r_inline), 6);
     ray_release(r_inline);
 
-    /* Global foo rule — inline rules omit it; foo yields no rows */
+    /* Global foo rule — inline rules omit it, so `foo` resolves to no
+     * relation at all: an unknown-relation error, not an empty result. */
     ray_t* r_foo = ray_eval_str(
         "(do"
         "  (set db (datoms))"
@@ -5065,9 +5066,8 @@ static test_result_t test_datalog_query_inline_rules(void) {
         "    (rules ((path ?x ?y) (?x :edge ?y)))))"
     );
     TEST_ASSERT_TRUE(r_foo != NULL);
-    TEST_ASSERT_TRUE(!RAY_IS_ERR(r_foo));
-    TEST_ASSERT_EQ_I((int)ray_table_nrows(r_foo), 0);
-    ray_release(r_foo);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r_foo));
+    ray_error_free(r_foo);
 
     ray_t* r_global = ray_eval_str(
         "(do"

@@ -258,7 +258,7 @@ static bool query_key_reader_read(query_key_reader_t* r, int64_t row,
     *out = 0;
 
     if (!RAY_IS_PARTED(r->col->type) && r->col->type != RAY_MAPCOMMON) {
-        *is_null = (r->col->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(r->col, row);
+        *is_null = ray_vec_is_null(r->col, row);
         if (*is_null) return true;
         if (r->base_type == RAY_F64) memcpy(out, &((double*)ray_data(r->col))[row], 8);
         else *out = read_col_i64(ray_data(r->col), row, r->base_type, r->col->attrs);
@@ -287,7 +287,7 @@ static bool query_key_reader_read(query_key_reader_t* r, int64_t row,
     ray_t* seg = r->segs[r->seg_idx];
     if (!seg) return false;
     int64_t local = row - r->seg_start;
-    *is_null = (seg->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(seg, local);
+    *is_null = ray_vec_is_null(seg, local);
     if (*is_null) return true;
     if (r->base_type == RAY_F64) memcpy(out, &((double*)ray_data(seg))[local], 8);
     else *out = read_col_i64(ray_data(seg), local, r->base_type, seg->attrs);
@@ -2694,7 +2694,7 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
     if (!col_expr || col_expr->type != -RAY_SYM || (col_expr->attrs & ATTR_QUOTED))
         return false;
     ray_t* col = ray_table_get_col(tbl, col_expr->i64);
-    if (!col || (col->attrs & RAY_ATTR_HAS_NULLS)) return false;
+    if (!col || ray_vec_has_nulls(col)) return false;
 
     *op_out = is_first ? OP_MIN : OP_MAX;
     *arg_out = col_expr;
@@ -3719,7 +3719,7 @@ static ray_t* try_count_distinct_v2_rewrite(
         if (!K_cols[j]) return NULL;
         int8_t kct_j = K_cols[j]->type;
         if (RAY_IS_PARTED(kct_j) || kct_j == RAY_MAPCOMMON) return NULL;
-        if (K_cols[j]->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+        if (ray_vec_has_nulls(K_cols[j])) return NULL;
         int kct_ok_j = (kct_j == RAY_SYM  || kct_j == RAY_BOOL || kct_j == RAY_U8 ||
                         kct_j == RAY_I16  || kct_j == RAY_I32  || kct_j == RAY_I64 ||
                         kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP);
@@ -3730,7 +3730,7 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
-    if (X_col->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+    if (ray_vec_has_nulls(X_col)) return NULL;
     int X_esz = ray_sym_elem_size(xct, X_col->attrs);
     if (K_esz_total + X_esz > 16) return NULL;
     /* X gets the same per-type acceptability check as the K columns
@@ -5111,7 +5111,7 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
 
     ray_t* col = ray_table_get_col(tbl, col_expr->i64);
     if (!col || col->len != ray_table_nrows(tbl)) return 0;
-    if ((col->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0) return 0;
+    if (ray_vec_may_have_nulls(col)) return 0;
 
     switch (col->type) {
     case RAY_BOOL:
@@ -6016,7 +6016,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         if (dep_candidate && base_sym >= 0) {
             ray_t* base_col = ray_table_get_col(tbl, base_sym);
             dep_candidate = base_col && key_type_i64_projectable(base_col->type) &&
-                            !(base_col->attrs & RAY_ATTR_HAS_NULLS);
+                            !ray_vec_has_nulls(base_col);
         }
         /* Exact-size carve (unbounded): at most nk dependent-key entries can
          * ever be collected (one per by-dict pair).  On the dependent-key
@@ -7819,7 +7819,7 @@ by_dict_done:
                         ray_t* dst = NULL;
                         if (sc->type == RAY_STR) {
                             dst = ray_vec_new(RAY_STR, out_groups);
-                            bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             for (int64_t gi = 0; gi < out_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 if (src_has_nulls && ray_vec_is_null(sc, fi[gi])) {
                                     dst = ray_str_vec_append(dst, "", 0);
@@ -8008,7 +8008,7 @@ by_dict_done:
                             uint8_t esz = ray_sym_elem_size(sct, dst->attrs);
                             const char* sb = (const char*)ray_data(sc);
                             char* db = (char*)ray_data(dst);
-                            bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             if (src_has_nulls) {
                                 for (int64_t gi = 0; gi < ngroups; gi++) {
                                     memcpy(db + (size_t)gi * esz,
@@ -8029,7 +8029,7 @@ by_dict_done:
                             uint8_t esz = ray_sym_elem_size(sct, sc->attrs);
                             const char* sb = (const char*)ray_data(sc);
                             char* db = (char*)ray_data(dst);
-                            bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             if (src_has_nulls) {
                                 for (int64_t gi = 0; gi < ngroups; gi++) {
                                     memcpy(db + (size_t)gi * esz,
@@ -8444,7 +8444,7 @@ by_dict_done:
                     ray_t* dst = NULL;
                     if (sc->type == RAY_STR) {
                         dst = ray_vec_new(RAY_STR, n_groups);
-                        bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                        bool src_has_nulls = ray_vec_may_have_nulls(sc);
                         if (src_has_nulls) {
                             for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 if (ray_vec_is_null(sc, fi[gi])) {
@@ -9338,7 +9338,7 @@ by_dict_done:
             memset(gk_null, 0, (size_t)n_groups * sizeof(uint8_t));
 
             if (grp_key_col) {
-                bool gk_has_nulls = (grp_key_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                bool gk_has_nulls = ray_vec_may_have_nulls(grp_key_col);
                 if (gk_has_nulls) {
                     for (int64_t gi = 0; gi < n_groups; gi++) {
                         if (kt == RAY_F64) {
@@ -9428,7 +9428,7 @@ by_dict_done:
                  * that maps to it.  Terminate early once every group has
                  * a first-row. */
                 bool orig_nulls_flag = orig_key_col
-                    && (orig_key_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                    && ray_vec_may_have_nulls(orig_key_col);
                 int64_t found = 0;
                 for (int64_t r = 0; r < nrows_orig && found < n_groups; r++) {
                     bool r_null = orig_nulls_flag && ray_vec_is_null(orig_key_col, r);
@@ -10048,7 +10048,7 @@ by_dict_done:
                                 new_col->len = nrows_r;
                                 char* src = (char*)ray_data(col);
                                 char* dst = (char*)ray_data(new_col);
-                                bool has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                                bool has_nulls = ray_vec_may_have_nulls(col);
                                 if (has_nulls) {
                                     for (int64_t r = 0; r < nrows_r; r++) {
                                         memcpy(dst + r * esz, src + (nrows_r - 1 - r) * esz, esz);
@@ -11306,7 +11306,7 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
 
         /* Propagate nulls if present.  Walk per-element via
          * ray_vec_is_null (sentinel-based). */
-        if (col->attrs & RAY_ATTR_HAS_NULLS) {
+        if (ray_vec_may_have_nulls(col)) {
             for (int64_t i = 0; i < n; i++)
                 if (ray_vec_is_null(col, i))
                     ray_vec_set_null(out, i, true);
@@ -11387,16 +11387,6 @@ static int8_t typeless_col_type(ray_t* payload) {
         return t;
     }
     return RAY_I64;
-}
-
-/* HAS_NULLS for a payload that may be a slice: slices carry the flag on
- * their parent.  Over-approximation is harmless (the flag is a fast-path
- * gate; sentinels in the payload are the source of truth). */
-static bool payload_may_have_nulls(const ray_t* v) {
-    if (v->attrs & RAY_ATTR_HAS_NULLS) return true;
-    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent)
-        return (v->slice_parent->attrs & RAY_ATTR_HAS_NULLS) != 0;
-    return false;
 }
 
 /* Helper: convert a Rayfall list of atoms into a typed column vector by
@@ -11801,7 +11791,7 @@ static ray_t* update_scatter(ray_t** slots, int64_t c, const int64_t* rows, int6
         return NULL;
     }
     const uint8_t* s = (const uint8_t*)ray_data(val);
-    bool vn = payload_may_have_nulls(val);
+    bool vn = ray_vec_may_have_nulls(val);
     for (int64_t i = 0; i < k; i++) {
         if (vn && ray_vec_is_null(val, i)) { ray_vec_set_null(col, rows[i], true); continue; }
         memcpy(d + (size_t)rows[i] * esz, s + (size_t)i * esz, esz);
@@ -11858,6 +11848,23 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
         return NULL;
     }
     *handled = true;
+
+    /* Only a write into a key column can invalidate upsert's key map, and
+     * that is the one mutation its recorded row count cannot see: a cell
+     * rewrite leaves the count alone.  An update of any other column leaves
+     * the mapping exactly as it was — dropping it there would send the next
+     * batch back to rebuilding over every row for nothing.  ucol[0..nu) is
+     * the complete set of columns this path writes. */
+    {
+        ray_index_t* kix = ray_table_ukey_get(tbl);
+        if (kix) {
+            bool hits_key = false;
+            for (int64_t i = 0; i < nu && !hits_key; i++)
+                for (int64_t kk = 0; kk < kix->u.ukey.nk; kk++)
+                    if (kix->u.ukey.kci[kk] == (int16_t)ucol[i]) { hits_key = true; break; }
+            if (hits_key) ray_table_ukey_drop(tbl);
+        }
+    }
 
     /* Matched rows: index probe, else the legacy mask. */
     ray_t* rows_hdr = NULL; int64_t* rows = NULL; int64_t k = 0;
@@ -13404,7 +13411,7 @@ static ray_t* validate_parted_payloads(ray_t* tbl,
             ray_t* owner = (payload->attrs & RAY_ATTR_SLICE)
                          ? payload->slice_parent : payload;
             if ((dst == RAY_BOOL || dst == RAY_U8) &&
-                (!owner || (owner->attrs & RAY_ATTR_HAS_NULLS)))
+                (!owner || ray_vec_may_have_nulls(owner)))
                 return ray_error("type", "insert: physical column %lld (%s) has no null representation",
                                  (long long)c, ray_type_name(dst));
             if (dst == RAY_SYM) {
@@ -13962,6 +13969,10 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
 
 /* (insert table (list val1 val2 ...)) — append a row to a table
  * (insert parted partition-key rows) — grow the explicit live tail */
+/* Defined with the rest of the upsert key-map helpers below; the in-place
+ * insert arm needs it here. */
+static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0);
+
 ray_t* ray_insert_fn(ray_t** args, int64_t n) {
     return ray_insert(args, n);
 }
@@ -14434,7 +14445,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             } else if (ray_is_atom(pay)) {
                 res = append_atom_to_col(col, pay);
             } else if (pay->type == ct && ct == RAY_STR) {
-                bool pay_nulls = payload_may_have_nulls(pay);
+                bool pay_nulls = ray_vec_may_have_nulls(pay);
                 res = col;
                 int64_t m = ray_len(pay);
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
@@ -14453,7 +14464,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                        ((pay->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
                         pay->sym_domain != ray_sym_runtime_domain())) {
                 /* Narrow or store-domain SYM payload: translate per cell. */
-                bool pay_nulls = payload_may_have_nulls(pay);
+                bool pay_nulls = ray_vec_may_have_nulls(pay);
                 res = col;
                 int64_t m = ray_len(pay);
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
@@ -14473,7 +14484,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                  * Raw cells carry their null sentinels; propagate the
                  * flag with them. */
                 res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
-                if (!RAY_IS_ERR(res) && payload_may_have_nulls(pay))
+                if (!RAY_IS_ERR(res) && ray_vec_may_have_nulls(pay))
                     res->attrs |= RAY_ATTR_HAS_NULLS;
             } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
                 /* Differently-typed vector or generic list: coerce cell by
@@ -14513,6 +14524,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 }
                 col->len = nrows;
             }
+        } else {
+            /* insert appends without consulting keys, and in ascending row
+             * order, so the map's "duplicates answer lowest row first"
+             * invariant survives entering the new rows as they landed. */
+            ukey_extend_after_append(tbl, nrows);
         }
         if (dict_vals) {
             ray_t** dv = (ray_t**)ray_data(dict_vals);
@@ -14562,7 +14578,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
 
         /* Copy existing data */
-        bool src_has_nulls = (orig_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool src_has_nulls = ray_vec_may_have_nulls(orig_col);
         if (ct == RAY_STR) {
             for (int64_t r = 0; r < nrows; r++) {
                 if (src_has_nulls && ray_vec_is_null(orig_col, r)) {
@@ -14819,6 +14835,13 @@ typedef struct {
     uint64_t mask;
 } upsert_map_t;
 
+/* Slot encoding.  An occupied slot holds row + 1, so it is always >= 1 and
+ * the whole negative range is free for markers.  A deleted entry becomes a
+ * tombstone rather than being cleared: a hole in the middle of a probe chain
+ * would end the walk early and orphan every entry displaced past it. */
+#define UKEY_SLOT_EMPTY ((int64_t)0)
+#define UKEY_SLOT_TOMB  ((int64_t)-1)
+
 static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
     uint64_t cap = 16;
     while (cap < (uint64_t)entries * 2) cap <<= 1;
@@ -14829,10 +14852,53 @@ static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
     return true;
 }
 
+/* Entries are written in ascending row order, and a tombstone is never
+ * reused: taking one would put a later row ahead of an earlier one in its
+ * chain, which changes which of two duplicate keys a keyed upsert updates. */
 static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     uint64_t s = h & mp->mask;
-    while (mp->slot[s] != 0) s = (s + 1) & mp->mask;
+    while (mp->slot[s] != UKEY_SLOT_EMPTY) s = (s + 1) & mp->mask;
     mp->slot[s] = row + 1;
+}
+
+/* Rows nrows0..n-1 were just appended in row order.  Entering them costs
+ * what the append already cost, and it keeps the map describing the table:
+ * left behind, it sends the next upsert back to rebuilding over every row,
+ * which is the whole cost this map exists to avoid.  A map that cannot take
+ * them is dropped rather than left naming a shorter table. */
+static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
+    ray_index_t* ix = ray_table_ukey_get(tbl);
+    if (!ix) return;
+    int64_t n = ray_table_nrows(tbl);
+    if (ix->u.ukey.nrows != nrows0 || n < nrows0 ||
+        (uint64_t)(n + ix->u.ukey.n_tomb) * 2 > ix->u.ukey.mask + 1) {
+        ray_table_ukey_drop(tbl);
+        return;
+    }
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    if (!cols || RAY_IS_ERR(cols)) { ray_table_ukey_drop(tbl); return; }
+    ray_t** slots = (ray_t**)ray_data(cols);
+    int64_t kci[RAY_UKEY_MAX_COLS];
+    int64_t nk = ix->u.ukey.nk;
+    for (int64_t k = 0; k < nk; k++) kci[k] = ix->u.ukey.kci[k];
+    upsert_map_t map = { NULL, (int64_t*)ray_data(ix->u.ukey.slots), ix->u.ukey.mask };
+    for (int64_t r = nrows0; r < n; r++)
+        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+    ix->u.ukey.nrows = n;
+}
+
+/* Does this table-resident map still describe the table, and can it take
+ * `m` more rows at the load factor it was sized for?  A row count that moved
+ * without the map means something else wrote the table; a different key
+ * means a different upsert. */
+static bool ukey_fits(ray_index_t* ix, const int64_t* kci, int64_t nk,
+                      int64_t nrows0, int64_t m) {
+    if (ix->u.ukey.nrows != nrows0 || ix->u.ukey.nk != nk) return false;
+    for (int64_t k = 0; k < nk; k++)
+        if (ix->u.ukey.kci[k] != (int16_t)kci[k]) return false;
+    /* Tombstones hold slots without being rows, so the load test counts them
+     * alongside the live entries. */
+    return (uint64_t)(nrows0 + m + ix->u.ukey.n_tomb) * 2 <= ix->u.ukey.mask + 1;
 }
 
 static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
@@ -14840,8 +14906,9 @@ static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
     uint64_t s = h & mp->mask;
     for (;;) {
         int64_t e = mp->slot[s];
-        if (e == 0) return -1;
-        if (upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
+        if (e == UKEY_SLOT_EMPTY) return -1;
+        if (e != UKEY_SLOT_TOMB &&
+            upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
         s = (s + 1) & mp->mask;
     }
 }
@@ -15032,6 +15099,7 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
 
     ray_t* err = NULL;
     upsert_map_t map = { NULL, NULL, 0 };
+    ray_index_t* ukey = NULL;   /* table-resident map, borrowed from tbl */
     ray_t* work = NULL;
 
     if (src_cols) {
@@ -15103,10 +15171,62 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         }
     }
 
-    if (!err && m > 1) {
-        if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
-        for (int64_t r = 0; r < nrows0 && !err; r++)
-            upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+    /* The key->row map is what a bulk upsert actually costs.  Built over every
+     * existing row on entry and freed on exit, it made a sequence of batches
+     * quadratic in the table size: the profile of a growing table is almost
+     * entirely hashing rows that were already there.  When the table is a
+     * named binding mutated in place its object identity survives between
+     * calls, so the map lives on the table and is carried across them; the
+     * per-call cost becomes the batch, not the table.
+     *
+     * This covers a single-row upsert too, which otherwise scans the table
+     * for its one key.  It matters less for the scan it saves than for the
+     * map it keeps honest: a single row appended outside the map moves the
+     * row count, and the next batch then finds the map stale and rebuilds
+     * it over everything — one interleaved row per batch was enough to put
+     * the whole quadratic back. */
+    if (!err) {
+        /* A key wider than the arm gets no map — but an already attached one
+         * must go, not simply be skipped.  This call still writes every
+         * non-key column of a matched row in place, and those may be the
+         * attached map's key columns; with no row appended the row count does
+         * not move either, so ukey_fits would accept it as fresh next time
+         * and answer from stale rows. */
+        if (inplace && nk > RAY_UKEY_MAX_COLS) ray_table_ukey_drop(tbl);
+        if (inplace && nk <= RAY_UKEY_MAX_COLS) {
+            ukey = ray_table_ukey_get(tbl);
+            if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
+                ray_table_ukey_drop(tbl);
+                ukey = NULL;
+            }
+            if (!ukey) {
+                ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
+                if (idx && !RAY_IS_ERR(idx)) {
+                    if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
+                    else ray_release(idx);
+                }
+                /* A map we could not build or attach is not an error: fall
+                 * through to the scratch one and answer at the old cost. */
+                if (ukey) {
+                    map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                    map.mask = ukey->u.ukey.mask;
+                    for (int64_t r = 0; r < nrows0 && !err; r++)
+                        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+                    ukey->u.ukey.nrows = nrows0;
+                }
+            } else {
+                map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                map.mask = ukey->u.ukey.mask;
+            }
+        }
+        /* Without a table to hang it on, a map is only worth building for a
+         * batch: for one row it costs the scan it would replace and is then
+         * thrown away.  A single row keeps the scan. */
+        if (!ukey && !err && m > 1) {
+            if (!upsert_map_init(&map, nrows0 + m)) err = ray_error("oom", NULL);
+            for (int64_t r = 0; r < nrows0 && !err; r++)
+                upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+        }
     }
 
     int64_t nrows = nrows0;
@@ -15138,6 +15258,14 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     }
 
     if (err && slots) upsert_rollback_appends(slots, ncols, nrows0);
+
+    /* A rolled-back batch leaves the map naming rows that no longer exist and
+     * a half-built one names nothing, so a failed call must not leave it on
+     * the table.  A successful one records the row count it now describes. */
+    if (ukey) {
+        if (err) { ray_table_ukey_drop(tbl); ukey = NULL; }
+        else ukey->u.ukey.nrows = nrows;
+    }
 
     if (map.hdr) scratch_free(map.hdr);
     for (size_t i = 0; i < ncell; i++) if (owned[i] && cells[i]) ray_release(cells[i]);
@@ -15606,7 +15734,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         /* Copied rows must carry their null state across the rebuild —
          * mirror ray_insert_fn's copy loops (sentinel survives the raw
          * copy but RAY_ATTR_HAS_NULLS would otherwise be dropped). */
-        bool src_has_nulls = (orig_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool src_has_nulls = ray_vec_may_have_nulls(orig_col);
         if (ct == RAY_STR) {
             for (int64_t r = 0; r < nrows; r++) {
                 if (r == match_row && has_new_val) {
@@ -16639,7 +16767,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             if (agg_raw[a] || agg_ops[a] == OP_COUNT) continue;
             ray_t* src = agg_src_vecs[a];
             if (!src || right_nrows == 0) continue;
-            bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            bool has_nulls = ray_vec_may_have_nulls(src);
             if (has_nulls) {
                 sorted_nn[a] = (uint8_t*)scratch_alloc(&sorted_nn_hdr[a],
                                                         (size_t)right_nrows);
@@ -18008,4 +18136,255 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     ray_t* r = ray_asof_join_core(keys_vec, left, right);
     ray_release(left); ray_release(right); ray_release(keys_vec);
     return r;
+}
+
+
+/* ══════════════════════════════════════════
+ * delete — remove the rows a predicate matches
+ * ══════════════════════════════════════════ */
+
+
+/* Move the survivors down over the deleted rows.  Every column type stores a
+ * fixed-width element — a RAY_STR cell is a 16-byte descriptor and the pool it
+ * points into does not move with the row — so this is a memmove of the runs
+ * between deletions, not a per-cell copy.  A boxed column releases the cells
+ * it drops first.  Row order is preserved, so RAY_ATTR_SORTED stays true;
+ * an attached accelerator index does not, and is dropped. */
+static ray_t* delete_compact_cols(ray_t** slots, int64_t ncols, int64_t nrows,
+                                  const int64_t* rows, int64_t k) {
+    for (int64_t c = 0; c < ncols; c++) {
+        if (slots[c]->attrs & RAY_ATTR_HAS_INDEX) {
+            ray_t* drop_r = ray_index_drop(&slots[c]);
+            if (RAY_IS_ERR(drop_r)) return drop_r;
+        }
+        ray_t* col = slots[c];
+        size_t esz = (col->type == RAY_LIST) ? sizeof(ray_t*)
+                                             : ray_sym_elem_size(col->type, col->attrs);
+        uint8_t* d = (uint8_t*)ray_data(col);
+        if (col->type == RAY_LIST) {
+            ray_t** cells = (ray_t**)d;
+            for (int64_t i = 0; i < k; i++)
+                if (cells[rows[i]]) ray_release(cells[rows[i]]);
+        }
+        int64_t dst = rows[0];
+        for (int64_t i = 0; i < k; i++) {
+            int64_t src = rows[i] + 1;
+            int64_t end = (i + 1 < k) ? rows[i + 1] : nrows;
+            int64_t cnt = end - src;
+            if (cnt > 0) {
+                memmove(d + (size_t)dst * esz, d + (size_t)src * esz, (size_t)cnt * esz);
+                dst += cnt;
+            }
+        }
+        col->len = nrows - k;
+    }
+    return NULL;
+}
+
+/* Compaction moves a surviving row from r to r - (deletions before r) and
+ * changes no key, so every entry keeps its bucket and only the row number it
+ * stores has to shift: one pass over the slot array, no hashing and no key
+ * reads.  Entries naming a deleted row become tombstones.
+ *
+ * Patching costs that one pass whatever k is, while rebuilding costs a hash
+ * per survivor — so a large deletion is handed to the next upsert instead,
+ * which also reclaims the tombstones a patch would leave behind. */
+static void ukey_patch_after_delete(ray_t* tbl, const int64_t* rows, int64_t k,
+                                    int64_t nrows0) {
+    ray_index_t* ix = ray_table_ukey_get(tbl);
+    if (!ix) return;
+    int64_t left = nrows0 - k;
+    if (ix->u.ukey.nrows != nrows0 || k * 2 >= nrows0 ||
+        (uint64_t)(nrows0 + ix->u.ukey.n_tomb) * 2 > ix->u.ukey.mask + 1) {
+        ray_table_ukey_drop(tbl);
+        return;
+    }
+    /* Old row -> new row, or -1 for a deleted one, built in one pass.  Asking
+     * a binary search per slot instead cost log(k) on every slot of the
+     * capacity and dominated the patch; this is O(1) per slot. */
+    ray_t* nr_hdr = NULL;
+    int64_t* newrow = (int64_t*)scratch_alloc(&nr_hdr, (size_t)nrows0 * sizeof(int64_t));
+    if (!newrow) { ray_table_ukey_drop(tbl); return; }
+    for (int64_t r = 0, next = 0, ri = 0; r < nrows0; r++) {
+        if (ri < k && rows[ri] == r) { newrow[r] = -1; ri++; }
+        else newrow[r] = next++;
+    }
+
+    int64_t* slot = (int64_t*)ray_data(ix->u.ukey.slots);
+    uint64_t cap = ix->u.ukey.mask + 1;
+    int64_t tomb = 0;
+    for (uint64_t s = 0; s < cap; s++) {
+        int64_t e = slot[s];
+        if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
+        int64_t nr = newrow[e - 1];
+        if (nr < 0) { slot[s] = UKEY_SLOT_TOMB; tomb++; }
+        else slot[s] = nr + 1;
+    }
+    scratch_free(nr_hdr);
+    ix->u.ukey.n_tomb += tomb;
+    ix->u.ukey.nrows = left;
+}
+
+ray_t* ray_delete_fn(ray_t** args, int64_t n) {
+    return ray_delete(args, n);
+}
+
+/* (delete {from: t where: <pred>}) — remove the rows the predicate matches.
+ *
+ * `from: 't` (a quoted symbol) removes them from the named table in place,
+ * keeping its upsert key map; `from: t` returns a new table without them.
+ * Both forms evaluate the predicate once and compact the same matched-row
+ * list with the same code, so they cannot disagree about which rows go.  The
+ * functional form is deliberately NOT `select` over a negated predicate: that
+ * would be a second expression to keep in step with this one. */
+ray_t* ray_delete(ray_t** args, int64_t n) {
+    if (n < 1) return ray_error("arity", "delete: expects a query dict, got %lld args", (long long)n);
+    ray_t* dict = args[0];
+    if (!dict || dict->type != RAY_DICT)
+        return ray_error("type", "delete: query must be a dict, got %s", dict ? ray_type_name(dict->type) : "null");
+
+    ray_t* from_expr = dict_get(dict, "from");
+    if (!from_expr) return ray_error("domain", "delete: missing `from:` clause");
+    ray_t* where_expr = dict_get(dict, "where");
+    /* A delete with no predicate would empty the table, which is too easy to
+     * reach by leaving a clause out.  Say so instead. */
+    if (!where_expr) return ray_error("domain", "delete: missing `where:` clause");
+    if (dict_get(dict, "by")) return ray_error("domain", "delete: `by:` is not supported");
+
+    int64_t inplace_sym = -1;
+    ray_t* tbl = ray_eval(from_expr);
+    if (RAY_IS_ERR(tbl)) return tbl;
+    if (tbl->type == -RAY_SYM) {
+        inplace_sym = tbl->i64;
+        ray_release(tbl);
+        tbl = ray_env_get(inplace_sym);
+        if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "delete: `from:` symbol is unbound");
+        ray_retain(tbl);
+    }
+    if (tbl->type != RAY_TABLE) {
+        int8_t t = tbl->type; ray_release(tbl);
+        return ray_error("type", "delete: `from:` must be a table, got %s", ray_type_name(t));
+    }
+
+    /* A parted table's columns carry the RAY_PARTED_BASE wrapper and its
+     * partition key is RAY_MAPCOMMON; neither describes a flat element the
+     * compaction could move.  Flatten once, as ray_update does — the in-place
+     * path declines a parted table anyway (upsert_col_ok rejects the
+     * wrapper), so this only feeds the copying form. */
+    if (table_has_parted_columns(tbl)) {
+        ray_t* flat = ray_table_new(ray_table_ncols(tbl));
+        if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
+        int64_t nc = ray_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* fc = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+            if (!fc || RAY_IS_ERR(fc)) { ray_release(flat); ray_release(tbl); return fc ? fc : ray_error("oom", NULL); }
+            flat = ray_table_add_col(flat, ray_table_col_name(tbl, c), fc);
+            ray_release(fc);
+            if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
+        }
+        ray_release(tbl);
+        tbl = flat;
+    }
+
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t nrows0 = ray_table_nrows(tbl);
+    if (ncols <= 0) { ray_release(tbl); return ray_error("domain", "delete: table has no columns"); }
+
+    /* A slice column is a header-only view: ray_cow copies the header and
+     * leaves ray_data resolving into the parent's storage, so compacting the
+     * copy would move the PARENT's elements.  The in-place path declines one
+     * through upsert_col_ok; the copying form has no such backstop, so refuse
+     * rather than corrupt a buffer somebody else owns. */
+    for (int64_t c = 0; c < ncols; c++)
+        if (ray_table_get_col_idx(tbl, c)->attrs & RAY_ATTR_SLICE) {
+            ray_release(tbl);
+            return ray_error("domain", "delete: column %lld is a slice view", (long long)c);
+        }
+
+    /* Decide in-place BEFORE evaluating the predicate.  The predicate machinery
+     * binds the table's columns into a query scope (and builds a graph over
+     * the table), so reference counts are only quiet enough to read here. */
+    bool inplace = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
+                   !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    ray_t* live_cols = NULL;
+    if (inplace) {
+        live_cols = ((ray_t**)ray_data(tbl))[1];
+        if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols) inplace = false;
+    }
+    for (int64_t c = 0; inplace && c < ncols; c++) {
+        ray_t* col = ((ray_t**)ray_data(live_cols))[c];
+        if (col->rc != 1 || !upsert_col_ok(col)) inplace = false;
+    }
+
+    /* Matched rows, ascending — the same two paths the in-place where-update
+     * uses, so an indexed equality predicate is answered by the index here
+     * too. */
+    ray_t* rows_hdr = NULL; int64_t* rows = NULL; int64_t k = 0;
+    ray_t* err = NULL;
+    if (!update_where_index_rows(tbl, where_expr, &rows_hdr, &rows, &k)) {
+        ray_t* mask = update_where_mask_vec(tbl, where_expr);
+        if (RAY_IS_ERR(mask)) { ray_release(tbl); return mask; }
+        int64_t mlen = mask->len;
+        const uint8_t* m = (const uint8_t*)ray_data(mask);
+        int64_t cnt = 0;
+        for (int64_t r = 0; r < mlen; r++) cnt += (m[r] != 0);
+        rows = (int64_t*)scratch_alloc(&rows_hdr, (size_t)(cnt > 0 ? cnt : 1) * sizeof(int64_t));
+        if (!rows) err = ray_error("oom", NULL);
+        else for (int64_t r = 0; r < mlen; r++) if (m[r]) rows[k++] = r;
+        ray_release(mask);
+        if (err) { ray_release(tbl); return err; }
+    }
+
+    /* Nothing matched: the in-place form leaves the binding and its map
+     * untouched, the functional form answers with the table as it stands. */
+    if (k == 0) {
+        if (rows_hdr) scratch_free(rows_hdr);
+        if (inplace_sym >= 0) { ray_release(tbl); return ray_sym(inplace_sym); }
+        return tbl;
+    }
+
+    if (inplace) {
+        ray_t** slots = (ray_t**)ray_data(live_cols);
+        ray_t* cerr = delete_compact_cols(slots, ncols, nrows0, rows, k);
+        if (cerr) { scratch_free(rows_hdr); ray_release(tbl); return cerr; }
+        ukey_patch_after_delete(tbl, rows, k, nrows0);
+        scratch_free(rows_hdr);
+        ray_release(tbl);
+        return ray_sym(inplace_sym);
+    }
+
+    /* Functional form (and the fallback when a gate misses): private copies of
+     * the columns, then the same compaction.  A fresh table carries no key
+     * map, which is correct — it describes rows this one does not have. */
+    ray_t* work = ray_table_new(ncols);
+    if (!work || RAY_IS_ERR(work)) {
+        scratch_free(rows_hdr); ray_release(tbl);
+        return work ? work : ray_error("oom", NULL);
+    }
+    for (int64_t c = 0; c < ncols && !err; c++) {
+        ray_t* orig = ray_table_get_col_idx(tbl, c);
+        ray_retain(orig);
+        ray_t* cp = ray_cow(orig);
+        if (!cp || RAY_IS_ERR(cp)) { ray_release(orig); err = cp ? cp : ray_error("oom", NULL); break; }
+        work = ray_table_add_col(work, ray_table_col_name(tbl, c), cp);
+        ray_release(cp);
+        if (!work || RAY_IS_ERR(work)) { err = work ? work : ray_error("oom", NULL); work = NULL; }
+    }
+    if (!err) {
+        ray_t** wslots = (ray_t**)ray_data(((ray_t**)ray_data(work))[1]);
+        err = delete_compact_cols(wslots, ncols, nrows0, rows, k);
+    }
+    scratch_free(rows_hdr);
+    ray_release(tbl);
+    if (err) { if (work) ray_release(work); return err; }
+    /* `from: 't` promises the binding is amended and the symbol comes back,
+     * whether or not the in-place gate held — every sibling verb rebinds on
+     * this path.  Returning the table instead left the binding with all its
+     * rows and handed the caller a value it did not ask for. */
+    if (inplace_sym >= 0) {
+        ray_env_set(inplace_sym, work);
+        ray_release(work);
+        return ray_sym(inplace_sym);
+    }
+    return work;
 }

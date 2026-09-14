@@ -1845,7 +1845,9 @@ static test_result_t test_ipc_hooks_lifecycle(void) {
     ray_sys_free(srv_vm);
 
     /* Read counters back through the global env.  on.open + on.sync
-     * + on.close each fired exactly once.  `_hook_sync_handle` records
+     * fired exactly once; on.close fired twice — once on the client for
+     * its own outbound handle (ray_ipc_close, #503) and once on the
+     * server for the inbound one.  `_hook_sync_handle` records
      * `.ipc.handle` as seen INSIDE the sync hook — must equal the
      * legacy server's conn-array index (0 for the only active conn). */
     int64_t sym_open  = ray_sym_intern("_hook_open",        strlen("_hook_open"));
@@ -1859,7 +1861,7 @@ static test_result_t test_ipc_hooks_lifecycle(void) {
     ray_t* v_msg   = ray_env_get(sym_msg);    TEST_ASSERT_NOT_NULL(v_msg);
 
     TEST_ASSERT_EQ_I(v_open->i64,  1);
-    TEST_ASSERT_EQ_I(v_close->i64, 1);
+    TEST_ASSERT_EQ_I(v_close->i64, 2);
     TEST_ASSERT_EQ_I(v_msg->i64,   1);
     TEST_ASSERT_EQ_I(v_h->i64,     0);
 

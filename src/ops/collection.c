@@ -189,7 +189,7 @@ static inline int hs_row_is_null(ray_t* src, int64_t i, void* data) {
         ray_t* e = ((ray_t**)data)[i];
         return !e || RAY_ATOM_IS_NULL(e);
     }
-    return (src->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(src, i);
+    return ray_vec_may_have_nulls(src) && ray_vec_is_null(src, i);
 }
 
 static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
@@ -207,7 +207,7 @@ static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     hs->null_idx = HS_EMPTY;
     hs->src = src;
     hs->src_type = src ? src->type : 0;
-    hs->src_has_nulls = src ? ((src->attrs & RAY_ATTR_HAS_NULLS) != 0) : false;
+    hs->src_has_nulls = src ? ray_vec_may_have_nulls(src) : false;
     hs->src_data = src ? ray_data(src) : NULL;
     return true;
 }
@@ -378,6 +378,55 @@ static bool hashset_insert(hashset_t* hs, int64_t i) {
     }
     hs->slots[s] = i;
     hs->count++;
+    return true;
+}
+
+/* Vector-needle find with the NEEDLES hashed and the haystack scanned once:
+ * out[i] = first row of `hay` equal to needle i, NULL_I64 on a miss.  The
+ * alternative (hash the haystack, probe the needles) costs a hash build over
+ * the big side per call; this costs one over the small side plus a scan that
+ * stops as soon as every distinct needle has been seen.  `first` is indexed
+ * by the hashset's representative row (the first needle inserted with that
+ * key), so duplicate needles share one answer and a null needle matches the
+ * haystack's first null exactly as the haystack-hashed path does.
+ * Returns false only on OOM (caller falls back). */
+static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    int64_t m = nd->len, n = hay->len;
+    hashset_t hs;
+    if (!hashset_init(&hs, nd, m)) return false;
+    int64_t* first = (int64_t*)ray_sys_alloc((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
+    if (!first) { hashset_destroy(&hs); return false; }
+    int64_t distinct = 0;
+    for (int64_t j = 0; j < m; j++) {
+        first[j] = -1;
+        if (hashset_insert(&hs, j)) distinct++;
+    }
+    int8_t ht = hay->type; void* hd = ray_data(hay);
+    int64_t found = 0;
+    for (int64_t r = 0; r < n && found < distinct; r++) {
+        int64_t rep = hashset_find_xrow(&hs, hay, r, ht, hd);
+        if (rep != HS_EMPTY && first[rep] < 0) { first[rep] = r; found++; }
+    }
+    int8_t nt = nd->type; void* ndd = ray_data(nd);
+    for (int64_t i = 0; i < m; i++) {
+        int64_t rep = hashset_find_xrow(&hs, nd, i, nt, ndd);
+        int64_t pos = (rep == HS_EMPTY) ? -1 : first[rep];
+        if (pos < 0) { out[i] = NULL_I64; *any_null = true; }
+        else out[i] = pos;
+    }
+    ray_sys_free(first);
+    hashset_destroy(&hs);
+    return true;
+}
+
+/* Hash the smaller side only when the scan side probes cheaply: SYM rows
+ * from a DIFFERENT domain than the needles would need a per-row string
+ * translation (hashset_find_xrow's cross-domain arm) — hashing the
+ * haystack and translating the few needles is the right orientation there. */
+static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
+    if (nd->len >= hay->len) return false;
+    if (hay->type == RAY_SYM && nd->type == RAY_SYM &&
+        ray_sym_vec_domain(hay) != ray_sym_vec_domain(nd)) return false;
     return true;
 }
 
@@ -580,7 +629,7 @@ static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
 static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
     if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
         return NULL;
-    if (vec->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+    if (ray_vec_may_have_nulls(vec)) return NULL;
     ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
     int op;                                   /* 0:< 1:> 2:<= 3:>= 4:== 5:!= */
     if      (bf == ray_lt_fn)  op = 0;
@@ -1301,6 +1350,26 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
          * hashset over `vec` once, probe per element of `val`.  Was
          * O(len(val)×len(vec)); now O(len(val)+len(vec)). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
+            /* Attached hash index on the set: one probe per needle, nothing
+             * built per call.  Null needles miss (the index is consulted on
+             * null-free sets only), matching the hashset path below. */
+            if (ray_index_has(vec)) {
+                ray_idx_consults[IDX_SITE_IN]++;
+                int64_t* pos = (int64_t*)ray_sys_alloc((size_t)vlen * sizeof(int64_t));
+                if (!pos) return ray_error("oom", NULL);
+                bool miss = false;
+                if (ray_index_find_vec(vec, val, pos, &miss)) {
+                    ray_idx_hits[IDX_SITE_IN]++;
+                    ray_t* result = ray_vec_new(RAY_BOOL, vlen);
+                    if (RAY_IS_ERR(result)) { ray_sys_free(pos); return result; }
+                    result->len = vlen;
+                    bool* out = (bool*)ray_data(result);
+                    for (int64_t i = 0; i < vlen; i++) out[i] = pos[i] != NULL_I64;
+                    ray_sys_free(pos);
+                    return result;
+                }
+                ray_sys_free(pos);
+            }
             /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
              * ints, pool-parallel — the same engine the fused WHERE path
              * uses.  Gated off null-bearing operands: this hashset path
@@ -1308,8 +1377,8 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
              * the WHERE kernel uses null-matches-nothing semantics — the
              * two must not be conflated.  NULL result = unsupported shape
              * (STR etc.): fall through to the hashset probe below. */
-            if (!(val->attrs & RAY_ATTR_HAS_NULLS) &&
-                !(vec->attrs & RAY_ATTR_HAS_NULLS)) {
+            if (!ray_vec_may_have_nulls(val) &&
+                !ray_vec_may_have_nulls(vec)) {
                 ray_t* fast = ray_in_vec_exec(val, vec, false);
                 if (fast) return fast;
             }
@@ -1317,6 +1386,18 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             if (RAY_IS_ERR(result)) return result;
             result->len = vlen;
             bool* out = (bool*)ray_data(result);
+            /* Fewer needles than set rows: hash the needles and scan the
+             * set once instead of hashing the whole set per call. */
+            if (find_needle_side_ok(vec, val)) {
+                int64_t* pos = (int64_t*)ray_sys_alloc((size_t)vlen * sizeof(int64_t));
+                bool miss = false;
+                if (pos && find_hash_needles(vec, val, pos, &miss)) {
+                    for (int64_t i = 0; i < vlen; i++) out[i] = pos[i] != NULL_I64;
+                    ray_sys_free(pos);
+                    return result;
+                }
+                if (pos) ray_sys_free(pos);
+            }
             hashset_t hs;
             if (!hashset_init(&hs, vec, vec->len)) {
                 ray_release(result);
@@ -1381,7 +1462,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
         int64_t len = vec->len;
-        bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
@@ -1724,9 +1805,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
              * (with retain) so the result owns a valid backing store. */
             if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
             /* Propagate null bitmap — check parent's flag for slices */
-            bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) ||
-                             ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
-                              (vec->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
+            bool has_nulls = ray_vec_may_have_nulls(vec);
             if (has_nulls) {
                 for (int64_t i = 0; i < count; i++)
                     if (ray_vec_is_null(vec, start + i))
@@ -1929,10 +2008,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         /* SYM ids copied verbatim — resolve over the source domain. */
         if (vtype == RAY_SYM) ray_sym_vec_adopt_domain(result, vec);
         /* Propagate null bitmap — check parent's flag for slices */
-        bool has_nulls = len > 0 &&
-                         ((vec->attrs & RAY_ATTR_HAS_NULLS) ||
-                          ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
-                           (vec->slice_parent->attrs & RAY_ATTR_HAS_NULLS)));
+        bool has_nulls = len > 0 && ray_vec_may_have_nulls(vec);
         if (has_nulls) {
             if (n >= 0) {
                 for (int64_t i = 0; i < abs_n; i++)
@@ -2306,6 +2382,41 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             int64_t n = ray_len(idx);
             ray_t* out = ray_list_new(n);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+            /* Typed keys probed by a typed vector of the same type: resolve
+             * every position in one `find` (attached hash index, else one
+             * hash build) instead of a scan of the keys per probe.  The
+             * per-key path below stays for mixed shapes; a sliced key vector
+             * probed with nulls also stays there — the scalar lookup reads a
+             * slice's nulls through its parent, which the hash does not. */
+            ray_t* dkeys = ray_dict_keys(vec);
+            ray_t* dvals = ray_dict_vals(vec);
+            if (dkeys && dvals && ray_is_vec(dkeys) && ray_is_vec(idx) &&
+                idx->type == dkeys->type &&
+                !((dkeys->attrs & RAY_ATTR_SLICE) && (idx->attrs & RAY_ATTR_HAS_NULLS))) {
+                ray_t* pos = ray_find_fn(dkeys, idx);
+                if (!pos || RAY_IS_ERR(pos)) { ray_release(out); return pos ? pos : ray_error("oom", NULL); }
+                const int64_t* pd = (const int64_t*)ray_data(pos);
+                int64_t nvals = ray_len(dvals);
+                for (int64_t i = 0; i < n; i++) {
+                    ray_t* value;
+                    if (pd[i] == NULL_I64 || pd[i] < 0 || pd[i] >= nvals) {
+                        value = ray_typed_null(-RAY_I64);   /* 0Nl for missing key */
+                    } else {
+                        int alloc = 0;
+                        value = collection_elem(dvals, pd[i], &alloc);
+                        if (value && !RAY_IS_ERR(value) && !alloc) ray_retain(value);
+                    }
+                    if (!value || RAY_IS_ERR(value)) {
+                        ray_release(pos); ray_release(out);
+                        return value ? value : ray_error("oom", NULL);
+                    }
+                    out = ray_list_append(out, value);
+                    ray_release(value);
+                    if (!out || RAY_IS_ERR(out)) { ray_release(pos); return out ? out : ray_error("oom", NULL); }
+                }
+                ray_release(pos);
+                return out;
+            }
             for (int64_t i = 0; i < n; i++) {
                 int allocated = 0;
                 ray_t* key = collection_elem(idx, i, &allocated);
@@ -2363,7 +2474,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         int64_t idxlen = ray_len(idx);
         int64_t vlen = ray_len(vec);
         int64_t* ids = (int64_t*)ray_data(idx);
-        bool idx_has_nulls = (idx->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool idx_has_nulls = ray_vec_may_have_nulls(idx);
         bool valid = true;
         for (int64_t j = 0; j < idxlen; j++) {
             if ((idx_has_nulls && ray_vec_is_null(idx, j)) ||
@@ -2461,18 +2572,35 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         int64_t* out = (int64_t*)ray_data(result);
         bool any_null = false;
 
-        /* Hash fast path: both sides typed vecs — O(n+m), mirrors ray_in_fn. */
+        /* Both sides typed vecs — O(n+m).  In order of preference:
+         *   1. an attached hash index on the haystack: one probe per needle,
+         *      nothing built per call;
+         *   2. fewer needles than rows: hash the needles, scan the haystack
+         *      once (find_hash_needles);
+         *   3. hash the haystack, probe the needles (mirrors ray_in_fn). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
-            hashset_t hs;
-            if (!hashset_init(&hs, vec, vec->len)) { ray_release(result); return ray_error("oom", NULL); }
-            for (int64_t j = 0; j < vec->len; j++) hashset_insert(&hs, j);
-            int8_t vt = val->type; void* vd = ray_data(val);
-            for (int64_t i = 0; i < vlen; i++) {
-                int64_t row = hashset_find_xrow(&hs, val, i, vt, vd);
-                if (row == HS_EMPTY) { out[i] = NULL_I64; any_null = true; }
-                else out[i] = row;
+            bool done = false;
+            if (ray_index_has(vec)) {
+                ray_idx_consults[IDX_SITE_FIND]++;
+                if (ray_index_find_vec(vec, val, out, &any_null)) {
+                    ray_idx_hits[IDX_SITE_FIND]++;
+                    done = true;
+                }
             }
-            hashset_destroy(&hs);
+            if (!done && find_needle_side_ok(vec, val))
+                done = find_hash_needles(vec, val, out, &any_null);
+            if (!done) {
+                hashset_t hs;
+                if (!hashset_init(&hs, vec, vec->len)) { ray_release(result); return ray_error("oom", NULL); }
+                for (int64_t j = 0; j < vec->len; j++) hashset_insert(&hs, j);
+                int8_t vt = val->type; void* vd = ray_data(val);
+                for (int64_t i = 0; i < vlen; i++) {
+                    int64_t row = hashset_find_xrow(&hs, val, i, vt, vd);
+                    if (row == HS_EMPTY) { out[i] = NULL_I64; any_null = true; }
+                    else out[i] = row;
+                }
+                hashset_destroy(&hs);
+            }
         } else {
             /* Fallback (LIST/mixed): per-element scalar find into the dense buffer. */
             for (int64_t j = 0; j < vlen; j++) {
@@ -2492,36 +2620,23 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec)) {
         int64_t len = vec->len;
-        bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
 
-        /* Hash-index fast path: integer-family needle against an indexed
-         * integer-family column without nulls.  Float and cross-family
-         * needles fall through to the scan (the scan owns promotion
-         * semantics; we do not replicate them here). */
-        if (!has_nulls && !val_null && ray_is_atom(val) && ray_index_has(vec)) {
-            int64_t needle = 0;
-            int eligible = 1;
-            switch (val->type) {
-            case -RAY_I64:
-            case -RAY_TIMESTAMP: needle = val->i64;              break;
-            case -RAY_I32:
-            case -RAY_DATE:
-            case -RAY_TIME:      needle = (int64_t)val->i32;     break;
-            case -RAY_I16:       needle = (int64_t)val->i16;     break;
-            case -RAY_BOOL:
-            case -RAY_U8:        needle = (int64_t)val->b8;      break;
-            default:             eligible = 0;                   break;
-            }
-            if (eligible) {
-                ray_idx_consults[IDX_SITE_FIND]++;
-                int64_t row = ray_index_find_row(vec, needle);
-                if (row >= -1) {   /* -2 means not eligible — fall through */
-                    ray_idx_hits[IDX_SITE_FIND]++;
-                    if (row < 0)
-                        return ray_typed_null(-RAY_I64);
-                    return make_i64(row);
-                }
+        /* Hash-index fast path: an integer-family, symbol or string needle
+         * against an indexed column of the same family (ray_index_find_atom
+         * owns the type matrix).  Float and cross-family needles fall
+         * through to the scan (the scan owns promotion semantics; we do
+         * not replicate them here). */
+        if (!val_null && ray_is_atom(val) && ray_index_has(vec) &&
+            (!has_nulls || vec->type == RAY_SYM)) {
+            ray_idx_consults[IDX_SITE_FIND]++;
+            int64_t row = ray_index_find_atom(vec, val);
+            if (row >= -1) {   /* -2 means not eligible — fall through */
+                ray_idx_hits[IDX_SITE_FIND]++;
+                if (row < 0)
+                    return ray_typed_null(-RAY_I64);
+                return make_i64(row);
             }
         }
 
@@ -2594,7 +2709,7 @@ ray_t* reverse_vec_eager(ray_t* x) {
     if (vtype == RAY_STR) {
         ray_t* result = ray_vec_new(RAY_STR, len);
         if (RAY_IS_ERR(result)) return result;
-        bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool has_nulls = ray_vec_may_have_nulls(x);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
                 if (ray_vec_is_null(x, len - 1 - i)) {
@@ -2627,7 +2742,7 @@ ray_t* reverse_vec_eager(ray_t* x) {
     if (vtype == RAY_SYM) esz = ray_sym_elem_size(vtype, x->attrs);
     char* src = (char*)ray_data(x);
     char* dst = (char*)ray_data(result);
-    bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool has_nulls = ray_vec_may_have_nulls(x);
     if (has_nulls) {
         for (int64_t i = 0; i < len; i++) {
             memcpy(dst + i * esz, src + (len - 1 - i) * esz, esz);
@@ -2838,7 +2953,7 @@ ray_t* deltas_vec_eager(ray_t* x) {
         .src = x,
         .dst = out,
         .pool = pool,
-        .has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0
+        .has_nulls = ray_vec_may_have_nulls(x)
     };
     ray_pool_dispatch(pool, ts_deltas_fn, &ctx, n - 1);
     if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
@@ -2903,7 +3018,7 @@ ray_t* ratios_vec_eager(ray_t* x) {
         .src = x,
         .dst = out,
         .pool = pool,
-        .has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0
+        .has_nulls = ray_vec_may_have_nulls(x)
     };
     ray_pool_dispatch(pool, ts_ratios_fn, &ctx, n - 1);
     if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
@@ -3000,7 +3115,7 @@ ray_t* fills_vec_eager(ray_t* x) {
     }
     if (x->type == RAY_SYM || x->type == RAY_STR ||
         x->type == RAY_BOOL || x->type == RAY_U8 ||
-        (!(x->attrs & RAY_ATTR_HAS_NULLS) && !(x->attrs & RAY_ATTR_SLICE))) {
+        (!ray_vec_may_have_nulls(x) && !(x->attrs & RAY_ATTR_SLICE))) {
         ray_retain(x);
         return x;
     }
@@ -3320,7 +3435,7 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
         .summary = summary, .carry = carry,
         .opcode = opcode,
         .is_float = (x->type == RAY_F64 || x->type == RAY_F32),
-        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .has_nulls = ray_vec_may_have_nulls(x),
         .nblocks = nblocks
     };
 
@@ -3674,7 +3789,7 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         .prefix_count = prefix_count,
         .summary = summary, .carry = carry,
         .opcode = opcode,
-        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .has_nulls = ray_vec_may_have_nulls(x),
         .window = window
     };
 
@@ -3826,7 +3941,7 @@ static ray_t* moving_minmax_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         .src = x, .dst = out, .pool = pool,
         .opcode = opcode,
         .is_float = (x->type == RAY_F64 || x->type == RAY_F32),
-        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .has_nulls = ray_vec_may_have_nulls(x),
         .window = window,
         .ntasks = (int64_t)ntasks
     };

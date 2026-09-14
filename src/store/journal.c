@@ -689,9 +689,8 @@ ray_err_t ray_journal_purge(void) {
     /* Close the active log FIRST: never unlink a path out from under
      * buffered writes (and Windows refuses to unlink an open file). */
     if (g_journal.fp) {
-        fflush(g_journal.fp);
-        fclose(g_journal.fp);
-        g_journal.fp = NULL;
+        ray_err_t close_result = ray_journal_close();
+        if (close_result != RAY_OK) return close_result;
     }
 
     ray_err_t result = RAY_OK;
@@ -789,6 +788,15 @@ ray_err_t ray_journal_roll(void) {
     char archive[RAY_JOURNAL_PATH_MAX];
     int  n = snprintf(archive, sizeof(archive), "%s.%s.log", g_journal.base, stamp);
     if (n <= 0 || (size_t)n >= sizeof(archive)) return RAY_ERR_DOMAIN;
+
+    /* Rolls can happen more than once during a single UTC second.  Keep the
+     * readable timestamp for the common case, but never let rename() replace
+     * an earlier archive when the timestamp collides. */
+    for (unsigned int suffix = 1; file_exists(archive); suffix++) {
+        n = snprintf(archive, sizeof(archive), "%s.%s.%u.log",
+                     g_journal.base, stamp, suffix);
+        if (n <= 0 || (size_t)n >= sizeof(archive)) return RAY_ERR_DOMAIN;
+    }
 
     int flush_rc = fflush(g_journal.fp);
     int close_rc = fclose(g_journal.fp);

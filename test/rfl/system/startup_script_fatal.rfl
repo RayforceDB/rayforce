@@ -1,0 +1,14 @@
+;; startup_script_fatal.rfl — a failing startup script under -p is fatal
+;; non-interactively (#507).
+;;
+;; Regression: -p opened the listener before the script, and when the
+;; script failed the process printed the error and kept serving the port
+;; with none of the script's definitions installed.  A supervisor's port
+;; check passed and Restart=on-failure never fired.
+(.sys.exec "rm -rf /tmp/rfl_ssf && mkdir -p /tmp/rfl_ssf && printf '(load \"does-not-exist.rfl\")\n' > /tmp/rfl_ssf/bad.rfl && printf '(set ok 1)\n' > /tmp/rfl_ssf/good.rfl")
+;; bad script: exits 1 within a second and leaves nothing listening
+(.sys.exec "s=$(date +%s); ./rayforce -p 19969 /tmp/rfl_ssf/bad.rfl </dev/null >/tmp/rfl_ssf/out 2>&1; rc=$?; e=$(date +%s); grep -q 'error: io' /tmp/rfl_ssf/out && grep -q 'startup script /tmp/rfl_ssf/bad.rfl failed' /tmp/rfl_ssf/out && [ $rc -eq 1 ] && [ $((e-s)) -le 1 ]") -- 0
+(.sys.exec "bash -c '(echo > /dev/tcp/127.0.0.1/19969) 2>/dev/null' && exit 1; exit 0") -- 0
+;; good script: still serves after the script (killed by pid once up)
+(.sys.exec "./rayforce -p 19969 /tmp/rfl_ssf/good.rfl </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_ssf/pid; for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19969) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "kill $(cat /tmp/rfl_ssf/pid) 2>/dev/null; rm -rf /tmp/rfl_ssf; true")

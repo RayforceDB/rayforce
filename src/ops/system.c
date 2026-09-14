@@ -24,6 +24,7 @@
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "lang/eval.h"  /* LAMBDA_PARAMS */
+#include "lang/nfo.h"   /* NFO_FILENAME */
 #include "lang/parse.h"
 #include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
 #include "ops/internal.h"   /* ray_group_perpart_runs — (.sys.mem) counter */
@@ -584,6 +585,7 @@ static size_t objsize_shallow(ray_t* v) {
 static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) {
 #define OBJSIZE_PUSH(child) do { if (!objsize_stack_push(w, (child))) return false; } while (0)
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:       OBJSIZE_PUSH(ix->u.ukey.slots); break;
     case RAY_IDX_HASH:
         OBJSIZE_PUSH(ix->u.hash.table); OBJSIZE_PUSH(ix->u.hash.gkeys);
         OBJSIZE_PUSH(ix->u.hash.offs);  OBJSIZE_PUSH(ix->u.hash.rows);
@@ -638,7 +640,11 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
          * aux bytes 8..15; the index pointer only occupies bytes 0..7. */
         if (v->type == RAY_STR && v->str_pool)
             OBJSIZE_PUSH(v->str_pool);
-        return true;
+        /* A TABLE carries the keyed-upsert map here, but its schema and
+         * columns are still its own children: returning now would report a
+         * mapped table as nothing but its map.  Fall through to the arm
+         * below.  Only a vector has nothing further to walk. */
+        if (v->type != RAY_TABLE) return true;
     }
     if (v->type == RAY_STR && v->str_pool)
         OBJSIZE_PUSH(v->str_pool);
@@ -1372,12 +1378,37 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
 }
 
 /* (.sys.args) -- return the application-arguments dict (empty if unset) */
+/* The launcher dict is built once at startup; `source` is the one key
+ * that changes while the process runs — the file currently being
+ * evaluated (the innermost `load`, or the command-line script), by the
+ * path that was actually opened, so a script can locate its neighbours
+ * from any working directory (#506).  Empty at the REPL, under a pipe,
+ * or in a hook or timer outside any file — the same convention as
+ * `file`.  bash's $BASH_SOURCE next to $0. */
 ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("domain", ".sys.args takes no arguments");
     ray_t* d = (ray_t*)ray_runtime_get_sys_args();
-    if (d) { ray_retain(d); return d; }
-    return ray_dict_new(ray_sym_vec_new(RAY_SYM_W64, 0), ray_list_new(0));
+    ray_t* keys; ray_t* vals;
+    if (d) {
+        keys = ray_dict_keys(d); ray_retain(keys);   /* append COWs the shared vectors */
+        vals = ray_dict_vals(d); ray_retain(vals);
+    } else {
+        keys = ray_sym_vec_new(RAY_SYM_W64, 1);
+        vals = ray_list_new(1);
+    }
+    ray_t* nfo = ray_eval_get_nfo();
+    ray_t* src = (nfo && !RAY_IS_ERR(nfo)) ? NFO_FILENAME(nfo) : NULL;
+    bool is_file = src && !RAY_IS_ERR(src) && src->type == -RAY_STR &&
+                   !(ray_str_len(src) == strlen(RAY_NFO_REPL_NAME) &&
+                     memcmp(ray_str_ptr(src), RAY_NFO_REPL_NAME, ray_str_len(src)) == 0);
+    ray_t* sv = is_file ? (ray_retain(src), src) : ray_str("", 0);
+    int64_t k = ray_sym_intern("source", 6);
+    keys = ray_vec_append(keys, &k);
+    if (RAY_IS_ERR(keys)) { ray_release(vals); ray_release(sv); return keys; }
+    vals = ray_list_append(vals, sv); ray_release(sv);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    return ray_dict_new(keys, vals);
 }
 
 /* ══════════════════════════════════════════
@@ -1521,22 +1552,23 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg) {
 /* Build {handle limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
  * for a live connection. */
 static ray_t* ipc_tx_info_dict(int64_t h, const ray_ipc_tx_info_t* ti) {
-    static const char* const names[6] = { "handle", "limit_bytes", "limit_frames",
+    static const char* const names[7] = { "handle", "inbound", "limit_bytes", "limit_frames",
                                           "queued_bytes", "queued_frames", "hwm_bytes" };
-    int64_t vals_i[6] = { h, ti->limit_bytes, ti->limit_frames,
+    int64_t vals_i[7] = { h, ti->inbound ? 1 : 0, ti->limit_bytes, ti->limit_frames,
                           ti->queued_bytes, ti->queued_frames, ti->hwm_bytes };
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 6);
-    ray_t* vals = ray_list_new(6);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 7);
+    ray_t* vals = ray_list_new(7);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
         if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
         if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
         return ray_error("oom", NULL);
     }
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         int64_t k = ray_sym_intern(names[i], strlen(names[i]));
         keys = ray_vec_append(keys, &k);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-        ray_t* v = make_i64(vals_i[i]);
+        /* `inbound` is the direction: accepted here, or opened by .ipc.open */
+        ray_t* v = (i == 1) ? ray_bool(vals_i[i] != 0) : make_i64(vals_i[i]);
         vals = ray_list_append(vals, v); ray_release(v);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }

@@ -199,7 +199,10 @@ int main(int argc, char** argv) {
                 "  and stderr to a file/journal — anything (println ...)\n"
                 "  prints from the server side goes there.  Example:\n"
                 "    nohup rayforce -p 5000 > rayforce.log 2>&1 &\n"
-                "    systemd:  StandardOutput=journal StandardError=journal\n",
+                "    systemd:  StandardOutput=journal StandardError=journal\n"
+                "  With -p and a script, a script that fails to parse or\n"
+                "  evaluate is fatal: the listener closes and the process\n"
+                "  exits non-zero (with -i the REPL stays up instead).\n",
                 argv[0]);
             ray_runtime_destroy(rt);
             return 0;
@@ -282,6 +285,18 @@ int main(int argc, char** argv) {
     /* Load script if specified */
     if (file) {
         rc = ray_repl_run_file(file);
+        /* The listener is already up (so the script may use it), which
+         * means a failed startup script would otherwise leave a port
+         * that accepts connections in front of an empty workspace: a
+         * supervisor's port check passes and Restart=on-failure never
+         * fires.  Non-interactively, a script that fails to parse or
+         * evaluate is fatal; the listener goes down with the process.
+         * With -i the REPL stays up for the user to look around. */
+        if (rc != 0 && !interactive && port > 0) {
+            fprintf(stderr, "startup script %s failed; closing listener on %s:%u and exiting\n",
+                    file, bind_host[0] ? bind_host : "*", port);
+            goto done;
+        }
         if (!interactive && !(port > 0)) {
             /* A script that armed timers means to run them: stay until
              * they are spent (a one-shot fires once, a periodic one until

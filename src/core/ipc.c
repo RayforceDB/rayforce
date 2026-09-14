@@ -1068,17 +1068,20 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
      * before the listener's own close path (which would otherwise also
      * route through here) runs the hook with a stale fd.  Guard on:
      *   - sel->data: the listener itself has no conn data.
-     *   - listener_id ≥ 0: lifecycle hooks pair with inbound on.open
-     *     only — outbound conns (ray_ipc_connect) never fired on.open,
-     *     so they must not fire on.close either.
-     *   - phase ≥ HEADER: the connection actually completed handshake
-     *     (otherwise no matching on.open was fired, so on.close must
-     *     also stay silent to keep the pair balanced for the user). */
+     *   - phase ≥ HEADER: the connection actually completed handshake.
+     *     An inbound one that died mid-handshake never fired on.open;
+     *     an outbound one is registered after its handshake, so it
+     *     always qualifies.
+     * The hook fires for both directions (#503): a receive-only client —
+     * every multicast subscriber — otherwise learns of the peer's close
+     * only by probing.  It fires once per established connection on any
+     * teardown (peer EOF, socket error, local .ipc.close, eviction);
+     * on.open stays inbound-only, and (.ipc.handle h) reports `inbound`
+     * so one handler can tell the direction. */
     if (sel->data) {
         ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
-        if (cd->listener_id >= 0 &&
-            (cd->phase == RAY_IPC_PHASE_HEADER ||
-             cd->phase == RAY_IPC_PHASE_PAYLOAD)) {
+        if (cd->phase == RAY_IPC_PHASE_HEADER ||
+            cd->phase == RAY_IPC_PHASE_PAYLOAD) {
             hook_call_lifecycle(poll, IPC_HOOK_CLOSE, sel->id);
         }
         /* A RESP deposited for a sync wait that never consumed it
@@ -1780,7 +1783,7 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     if (!cd) { ray_sock_close(fd); return -1; }
     memset(cd, 0, sizeof(*cd));
     cd->phase       = RAY_IPC_PHASE_HEADER;
-    cd->listener_id = -1;               /* outbound — no lifecycle hooks */
+    cd->listener_id = -1;               /* outbound: on.open never fires, on.close does */
     cd->restricted  = poll->restricted; /* -U narrows pushed evals too */
 
     ray_sock_set_nonblocking(fd);
@@ -2089,6 +2092,8 @@ ray_err_t ray_ipc_tx_info(int64_t handle, ray_ipc_tx_info_t* out)
     conn_tx_limits(sel, &out->limit_bytes, &out->limit_frames);
     out->queued_bytes = conn_tx_pending(sel, &out->queued_frames);
     out->hwm_bytes    = sel->tx.hwm_bytes;
+    out->inbound      = sel->data &&
+                        ((ray_ipc_conn_data_t*)sel->data)->listener_id >= 0;
     return RAY_OK;
 }
 

@@ -36,9 +36,16 @@ Signature: `(.sys.args)`. Returns the process's command-line arguments as a dict
 | `querylog` | bool | `-Q` | Query-statistics logging enabled at startup. |
 | `interactive` | bool | `-i` | Force the REPL after a script. |
 | `log` | str | `-l` / `-L` | Journal base path; empty if none. |
+| `source` | str | — | The file currently being evaluated: the innermost `load`, or the command-line script, by the path that was actually opened. Empty at the REPL, under a pipe, or in a hook or timer that runs outside any file. `file` is the script named on the command line (`$0`); `source` follows nested loads (`$BASH_SOURCE`). |
 | `user` | dict | after `--` | The application's own arguments. |
 
 The top-level schema is **stable** — every launcher key is always present with its effective value (the default when the flag wasn't passed), so `(get (.sys.args) 'port)` never misses. Auth passwords (`-u` / `-U`) are deliberately **not** exposed.
+
+```lisp
+;; load a sibling of the running file, whichever directory it was started from
+(set here (str-join (drop -1 (split (at (.sys.args) 'source) "/")) "/"))
+(load (concat here "/lib.rfl"))
+```
 
 **`user` parsing.** Tokens after `--` are paired `-key value` / `--key value`: a token starting with `-` is a key (leading dashes stripped to a symbol), and the next token is its value — unless that token also starts with `-`, in which case the value is the empty string (a bare flag). Duplicate keys keep the last value.
 

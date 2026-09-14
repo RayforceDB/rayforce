@@ -1,0 +1,40 @@
+;; load_home.rfl — relative `load` paths fall back to RAYFORCE_HOME, and
+;; (.sys.args) reports the file being evaluated as `source` (#506).
+;;
+;; Layout: a project at /tmp/rfl_lh/proj and a home at /tmp/rfl_lh/home.
+;;   proj/main.rfl       loads "lib/a.rfl" (only in home) and "lib/b.rfl"
+;;                       (in both: the working directory must win)
+;;   home/lib/a.rfl      records its own `source`, then loads "lib/c.rfl"
+;;   home/lib/c.rfl      records its `source`
+;;   proj/lib/b.rfl      sets b_from 'proj;  home/lib/b.rfl sets b_from 'home
+;; Each case runs a subprocess from the project directory.
+(.sys.exec "rm -rf /tmp/rfl_lh && mkdir -p /tmp/rfl_lh/proj/lib /tmp/rfl_lh/home/lib")
+(.sys.exec "printf '%s\n' '(set a_src (at (.sys.args) (quote source)))' '(load \"lib/c.rfl\")' '(set a_src_after (at (.sys.args) (quote source)))' > /tmp/rfl_lh/home/lib/a.rfl")
+(.sys.exec "printf '%s\n' '(set c_src (at (.sys.args) (quote source)))' > /tmp/rfl_lh/home/lib/c.rfl")
+(.sys.exec "printf '%s\n' '(set b_from (quote home))' > /tmp/rfl_lh/home/lib/b.rfl")
+(.sys.exec "printf '%s\n' '(set b_from (quote proj))' > /tmp/rfl_lh/proj/lib/b.rfl")
+(.sys.exec "printf '%s\n' '(load \"lib/a.rfl\")' '(load \"lib/b.rfl\")' '(println (str-join (list a_src c_src a_src_after (as (quote str) b_from) (at (.sys.args) (quote source)) (at (.sys.args) (quote file))) \"|\"))' > /tmp/rfl_lh/proj/main.rfl")
+
+;; home fallback, nested load, source restored after a nested load,
+;; working directory wins for b, top-level source == file
+(.sys.exec "cd /tmp/rfl_lh/proj && RAYFORCE_HOME=/tmp/rfl_lh/home $OLDPWD/rayforce main.rfl </dev/null 2>&1 | grep -qx '/tmp/rfl_lh/home/lib/a.rfl|/tmp/rfl_lh/home/lib/c.rfl|/tmp/rfl_lh/home/lib/a.rfl|proj|main.rfl|main.rfl'") -- 0
+
+;; a trailing slash on the home is fine
+(.sys.exec "cd /tmp/rfl_lh/proj && RAYFORCE_HOME=/tmp/rfl_lh/home/ $OLDPWD/rayforce main.rfl </dev/null 2>&1 | grep -q '^/tmp/rfl_lh/home/lib/a.rfl|'") -- 0
+
+;; without a home the same script fails, naming only the working-directory path
+(.sys.exec "cd /tmp/rfl_lh/proj && $OLDPWD/rayforce main.rfl </dev/null 2>&1 | grep -q 'error: io: load \"lib/a.rfl\": No such file or directory$'") -- 0
+
+;; missing in both places: both attempts are named
+(.sys.exec "printf '(load \"lib/zz.rfl\")\n' > /tmp/rfl_lh/proj/miss.rfl; cd /tmp/rfl_lh/proj && RAYFORCE_HOME=/tmp/rfl_lh/home $OLDPWD/rayforce miss.rfl </dev/null 2>&1 | grep -q 'error: io: load \"lib/zz.rfl\": No such file or directory (also tried \"/tmp/rfl_lh/home/lib/zz.rfl\")'") -- 0
+
+;; an absolute path never consults the home
+(.sys.exec "printf '(load \"/tmp/rfl_lh/nowhere.rfl\")\n' > /tmp/rfl_lh/proj/abs.rfl; cd /tmp/rfl_lh/proj && RAYFORCE_HOME=/tmp/rfl_lh/home $OLDPWD/rayforce abs.rfl </dev/null 2>&1 | grep -q 'error: io: load \"/tmp/rfl_lh/nowhere.rfl\": No such file or directory$'") -- 0
+
+;; under a pipe there is no file: source is empty, and so is file
+(.sys.exec "printf '(println (count (at (.sys.args) (quote source))))\n' | ./rayforce -i 2>&1 | grep -qx 0") -- 0
+
+;; in-process: this harness runs each .rfl through eval, not load, so
+;; source is whatever the harness set — only the key's presence is pinned
+(type (at (.sys.args) 'source)) -- 'str
+(.sys.exec "rm -rf /tmp/rfl_lh")
