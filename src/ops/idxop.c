@@ -397,6 +397,7 @@ void ray_index_release_payload(ray_index_t* ix) {
 int ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap) {
     ray_t* c[4] = { NULL, NULL, NULL, NULL };
     switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_UKEY:       c[0] = ix->u.ukey.slots; break;
     case RAY_IDX_HASH:
         c[0] = ix->u.hash.table; c[1] = ix->u.hash.gkeys;
         c[2] = ix->u.hash.offs;  c[3] = ix->u.hash.rows;
