@@ -233,3 +233,27 @@
 (set rb2 (table [k v] (list [1 2 3 4] [10 20 30 40])))
 (at (delete {from: rb2 where: (> k 2)}) 'k) -- [1 2]
 (count rb2) -- 4
+
+;; ── a parted table ──────────────────────────────────────────────────────
+;; Its columns carry the RAY_PARTED_BASE wrapper and its partition key is
+;; RAY_MAPCOMMON, neither of which describes a flat element the compaction
+;; could move, so the table is flattened once at entry the way ray_update
+;; does it.  The in-place path declines a parted table anyway (upsert_col_ok
+;; rejects the wrapper), so this only ever feeds the copying form — and with
+;; `from: 'p` the binding comes back flat, which is worth knowing.
+(.sys.exec "rm -rf /tmp/rfl_delpart")
+(.db.splayed.set "/tmp/rfl_delpart/2024.01.01/t/" (table [k v] (list [1 2 3] [10 20 30])))
+(.db.splayed.set "/tmp/rfl_delpart/2024.01.02/t/" (table [k v] (list [4 5 6] [40 50 60])))
+(set dp (.db.parted.get "/tmp/rfl_delpart/" 't))
+(count dp) -- 6
+(at (delete {from: dp where: (in k [2 5])}) 'k) -- [1 3 4 6]
+(count dp) -- 6
+(delete {from: 'dp where: (> k 4)}) -- 'dp
+(at dp 'k) -- [1 2 3 4]
+(at dp 'v) -- [10 20 30 40]
+(.sys.exec "rm -rf /tmp/rfl_delpart")
+
+;; NOT covered: the guard that refuses a column carrying RAY_ATTR_SLICE.  No
+;; producer reachable from the language puts a slice into a table column —
+;; drop/take/select/by all materialise — so the guard is defensive only and
+;; cannot be exercised from a .rfl case.
