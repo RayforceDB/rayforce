@@ -91,6 +91,32 @@ Decrements the reference count. When `rc` reaches zero, the object and any owned
 void ray_release(ray_t* v);
 ```
 
+### ray_shallow_bytes / ray_retained_bytes
+
+How many bytes of native memory a value stands for, so an embedding runtime (an OCaml or Python binding that wraps a `ray_t*` in a finalized object) can charge its garbage collector for the wrapper. Neither call allocates on the Rayforce heap.
+
+```c
+size_t ray_shallow_bytes(const ray_t* v);
+size_t ray_retained_bytes(const ray_t* v);
+```
+
+`ray_shallow_bytes` is what this value's own release gives back: the block the allocator committed for it (header plus capacity; a buddy block is a power of two, a large direct block its exact page-rounded mapping) plus the private storage that no public API hands out on its own and that only this value releases:
+
+- a long string atom's payload and a GUID atom's payload;
+- a string vector's pool;
+- an attached accelerator index with its tables;
+- a file-mapped column's mapping (a splayed string column's region is charged to the column; the pool block inside it reports 0).
+
+Values that are reachable but are values in their own right are **not** included: list elements, table and dict slots, lambda parts, a slice's parent. A table and its separately wrapped columns are therefore never charged twice; a slice reports only its header block. Non-owning values report 0: the null and OOM singletons, arena-allocated values, borrowed blocks, an index that is a passenger in a column's mapping. A string pool shared by copy-on-write copies of one vector is charged to each copy. Symbol domains, lazy DAGs and opaque native handles (HNSW, graph) are outside the accounting.
+
+`ray_retained_bytes` is the shallow figure of the value plus that of everything reachable through ownership edges (list elements, table and dict slots, lambda parts, slice parents, parted segments), each distinct block counted once. Sharing inside the walked graph is not double counted, but two calls on two values that share children both report the shared part. Use it for diagnostics; drive GC pressure with the shallow figure.
+
+```c
+ray_t* col = ray_vec_new(RAY_I64, 1000000);
+/* ... */
+caml_alloc_custom_mem(&ops, sizeof(ray_t*), ray_shallow_bytes(col));  /* OCaml: charge the GC */
+```
+
 ### ray_cow
 
 Copy-on-write: if `v` is the sole owner (`rc == 1`), returns `v` unchanged. Otherwise, creates a deep copy and returns it with `rc = 1`. The original is not modified. After `ray_cow()`, if the returned pointer differs from the original, the caller must release it on error paths.

@@ -1,0 +1,76 @@
+;; Integers above 2^53 are ordered and combined exactly (issue #524).
+;;
+;; A double is exact only to 2^53.  Atom ordering (<, >, <=, >= and the
+;; dyadic min/max built on them) went through as_f64, and the integer-output
+;; arms of the vector-with-vector kernel read each operand as a double before
+;; the integer op — so the answer depended on the SHAPE of the operands:
+;; right against a constant, wrong against a column.  Every TIMESTAMP is such
+;; an integer (nanoseconds, ~8.4e17, double spacing 128 ns).
+
+(set P53 9007199254740992)
+(set Q (+ P53 1))
+(set P62 (* 2147483648 2147483648))
+(set R (concat (enlist (- P62 1)) (concat (enlist P62) (enlist (+ P62 1)))))
+(set t0 2026.08.13D10:00:00.001)
+(set C (concat (enlist t0) (concat (enlist (+ t0 1000000)) (enlist (+ t0 2000000)))))
+(set D (+ C 1000000))
+
+;; ── atoms: ordering agrees with == ──────────────────────────────────────────
+(> Q P53) -- true
+(< P53 Q) -- true
+(>= P53 Q) -- false
+(<= Q P53) -- false
+(>= Q P53) -- true
+(== Q P53) -- false
+(min Q P53) -- P53
+(max P53 Q) -- Q
+(> (enlist Q) P53) -- [true]
+;; narrower integer atoms take the same exact path
+(> Q (as 'i32 5)) -- true
+(< (as 'i16 -5) Q) -- true
+;; a float operand keeps the double compare (exact for these values)
+(> 1.5 1) -- true
+(< 1 1.5) -- true
+(> true false) -- true
+
+;; ── vector with vector: each operand read exactly ───────────────────────────
+(> (take Q 3) (take P53 3)) -- [true true true]
+(< (take P53 3) (take Q 3)) -- [true true true]
+(>= (take P53 3) (take Q 3)) -- [false false false]
+(== R (take P62 3)) -- [false true false]
+(!= R (take P62 3)) -- [true false true]
+(< R (take P62 3)) -- [true false false]
+(> R (take P62 3)) -- [false false true]
+(+ R (take 0 3)) -- R
+(- R (take 0 3)) -- R
+(* R (take 1 3)) -- R
+(+ R (til 3)) -- (concat (enlist (- P62 1)) (concat (enlist (+ P62 1)) (enlist (+ P62 3))))
+(- R (til 3)) -- (concat (enlist (- P62 1)) (concat (enlist (- P62 1)) (enlist (- P62 1))))
+(% R (take 1000 3)) -- [903 904 905]
+(min R (take P62 3)) -- (concat (enlist (- P62 1)) (concat (enlist P62) (enlist P62)))
+(max R (take P62 3)) -- (concat (enlist P62) (concat (enlist P62) (enlist (+ P62 1))))
+(div R (take 1 3)) -- R
+;; mixed widths: an I32 column against an I64 column stays exact
+(+ (take Q 3) (as 'i32 [1 2 3])) -- (concat (enlist (+ Q 1)) (concat (enlist (+ Q 2)) (enlist (+ Q 3))))
+(> (take Q 3) (as 'i32 [1 2 3])) -- [true true true]
+
+;; ── timestamps: nanosecond arithmetic and ordering ──────────────────────────
+(- D C) -- [1000000 1000000 1000000]
+(> (take (+ t0 2) 3) (take (+ t0 1) 3)) -- [true true true]
+(== (take (+ t0 1) 3) (take (+ t0 1) 3)) -- [true true true]
+(!= (take (+ t0 2) 3) (take (+ t0 1) 3)) -- [true true true]
+(> (+ t0 2) (+ t0 1)) -- true
+(min (+ t0 2) (+ t0 1)) -- (+ t0 1)
+
+;; ── unchanged shapes stay exact: vector with atom, reductions ───────────────
+(> (take Q 3) P53) -- [true true true]
+(> R P62) -- [false false true]
+(+ R 0) -- R
+(max R) -- (+ P62 1)
+(- (+ t0 1000000) t0) -- 1000000
+
+;; ── nulls and floats through the same arms are unchanged ────────────────────
+(+ [1 0N 3] [1 1 1]) -- [2 0N 4]
+(> [1 0N 3] [0 0 0]) -- [true false true]
+(+ [1.5 2.5] [1 1]) -- [2.5 3.5]
+(> [1.5 2.5] [1 3]) -- [true false]

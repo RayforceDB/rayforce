@@ -462,6 +462,43 @@ void ray_progress_span_end(void);
 void     ray_retain(ray_t* v);
 void     ray_release(ray_t* v);
 
+/* ===== Native footprint (foreign-runtime GC accounting) =====
+ *
+ * How many bytes of native memory a value stands for, in two well-defined
+ * senses, so an embedding runtime can charge its garbage collector for a
+ * wrapper that keeps a Rayforce value alive.  Both are O(size of the value
+ * graph walked) and never allocate on the Rayforce heap.
+ *
+ * ray_shallow_bytes — what this value's own release gives back: the block
+ * the allocator committed for it (header + capacity — a buddy block is a
+ * power of two, a large "direct" block its exact page-rounded mapping) PLUS
+ * the private storage no public API hands out on its own and that only
+ * this value releases: a long string atom's payload, a GUID atom's payload,
+ * a string vector's pool, an attached accelerator index with its tables.
+ * A file-mapped column reports the length of its mapping (a splayed string
+ * column's region is charged to the column; the pool block inside it
+ * reports 0).  Slices report only their own header block.  Children that
+ * are values in their own right — list elements, table and dict slots,
+ * lambda parts, a slice's parent — are NOT included, so a table and its
+ * separately wrapped columns are never charged twice.  Non-owning values
+ * report 0: the null and OOM singletons, arena-allocated values, borrowed
+ * blocks, an index that is a passenger in a column's mapping.  A string
+ * pool shared by copy-on-write copies of one vector is charged to each
+ * copy.  Symbol domains, lazy DAGs and opaque native handles (HNSW, graph)
+ * are outside the accounting.
+ *
+ * ray_retained_bytes — the shallow bytes of this value and of every value
+ * reachable from it through ownership edges (list elements, table and dict
+ * slots, lambda parts, slice parents, parted segments), each distinct block
+ * counted once.  Sharing between the walked values is therefore not double
+ * counted, but two calls on two values that share children both report the
+ * shared part.  Meant for diagnostics; drive GC pressure with the shallow
+ * figure.
+ *
+ * Errors are ordinary blocks (a RAY_ERROR reports its block).  NULL → 0. */
+size_t   ray_shallow_bytes(const ray_t* v);
+size_t   ray_retained_bytes(const ray_t* v);
+
 /* ===== Atom Constructors ===== */
 
 ray_t* ray_bool(bool val);
