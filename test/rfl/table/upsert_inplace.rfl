@@ -293,3 +293,20 @@
 (upsert 'osb 1 (table [k v] (list (til 20000) (* 2 (til 20000)))))
 (.idx.has? osb) -- true
 (> (.mem.objsize osb) (.mem.objsize osa)) -- true
+
+;; ── a copied table does not carry the original's key map ────────────────
+;; ray_alloc_copy clears it deliberately: the map records the row count it
+;; describes and upsert mutates it in place, so two tables sharing one would
+;; each write their own count into it.  The observable consequence is that a
+;; second binding keeps its own rows — the second upsert here declines the
+;; in-place path (the table is at rc 3) and works on a private copy.
+(set cwA (table [k v] (list (take [0] 0) (take [0] 0))))
+(upsert 'cwA 1 (table [k v] (list (til 3) (* 10 (til 3)))))
+(.idx.has? cwA) -- true
+(set cwB cwA)
+(upsert 'cwA 1 (table [k v] (list [3] [30])))
+(upsert 'cwB 1 (table [k v] (list [4] [40])))
+(at cwA 'k) -- [0 1 2 3]
+(at cwB 'k) -- [0 1 2 4]
+(at cwA 'v) -- [0 10 20 30]
+(at cwB 'v) -- [0 10 20 40]
