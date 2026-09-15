@@ -360,9 +360,10 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
      * whole morsel from chunk extrema without reading a single value.
      * Only integer/temporal comparisons (EQ/NE/LT/LE/GT/GE) — LIKE/IN
      * have their own evaluators below and SYM ordering is rejected at
-     * compile time anyway.  The all-pass shortcut is gated on "no
-     * nulls in this chunk" because SQL `(x op c)` is FALSE/NULL when x
-     * is NULL; the all-fail shortcut needs no such guard. */
+     * compile time anyway.  Extrema exclude nulls and the null-aware
+     * kernels rank a null below every value (null != c, null < c,
+     * null <= c are TRUE), so a chunk holding a null is never decided
+     * all-pass for EQ/GT/GE nor all-fail for NE/LT/LE from extrema. */
     if (p->col_obj && (p->col_obj->attrs & RAY_ATTR_HAS_INDEX) &&
         p->col_obj->index)
     {
@@ -392,14 +393,14 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
                         break;
                     case FP_NE:
                         if (!has_nulls && (cval < cmin || cval > cmax)) decision = 1;
-                        else if (cmin == cmax && cval == cmin)          decision = 0;
+                        else if (!has_nulls && cmin == cmax && cval == cmin) decision = 0;
                         break;
                     case FP_LT:
-                        if (cmin >= cval)                      decision = 0;
+                        if (!has_nulls && cmin >= cval)        decision = 0;
                         else if (!has_nulls && cmax < cval)    decision = 1;
                         break;
                     case FP_LE:
-                        if (cmin >  cval)                      decision = 0;
+                        if (!has_nulls && cmin >  cval)        decision = 0;
                         else if (!has_nulls && cmax <= cval)   decision = 1;
                         break;
                     case FP_GT:

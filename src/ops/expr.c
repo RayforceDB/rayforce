@@ -653,6 +653,48 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
     uint8_t node_reg[nc];
     memset(node_reg, 0xFF, nc * sizeof(uint8_t));
 
+    /* Issue #533: which nodes may skip the SYM null proof.  A null SYM is
+     * id 0, below every real intern id, and the fallback ranks a null SYM
+     * below everything in all six comparisons (null == null, null != x,
+     * null < x hold; null == x, x < null do not).  Raw id compares in the
+     * fused lane produce the same table, so a SYM column whose every
+     * consumer in this subtree is EQ..GE against a non-null constant (a
+     * null literal bails at OP_CONST) or another SYM scan needs no O(n)
+     * ray_vec_has_nulls walk.  Any other consumer — ISNULL, CAST,
+     * arithmetic — reads the lane as a value and keeps the proof. */
+    uint8_t sym_cmp_safe[nc];
+    memset(sym_cmp_safe, 1, nc * sizeof(uint8_t));
+    {
+        uint8_t  seen[nc];
+        uint32_t stk[nc];
+        uint32_t ssp = 0;
+        memset(seen, 0, nc * sizeof(uint8_t));
+        if (root->id < nc) { seen[root->id] = 1; stk[ssp++] = root->id; }
+        while (ssp > 0) {
+            ray_op_t* n = &g->nodes[stk[--ssp]];
+            bool cmp = n->arity == 2 && n->opcode >= OP_EQ && n->opcode <= OP_GE;
+            for (int i = 0; i < n->arity; i++) {
+                ray_op_t* ch = op_child(g, n, i);
+                if (!ch || ch->id >= nc) continue;
+                bool safe = false;
+                if (cmp) {
+                    ray_op_t* other = op_child(g, n, 1 - i);
+                    if (other && other->opcode == OP_CONST) safe = true;
+                    else if (other && other->opcode == OP_SCAN) {
+                        ray_op_ext_t* oe = find_ext(g, other->id);
+                        ray_t* oc = oe ? ray_table_get_col(tbl, oe->sym) : NULL;
+                        if (oc && (RAY_IS_PARTED(oc->type)
+                                   ? RAY_PARTED_BASETYPE(oc->type) == RAY_SYM
+                                   : oc->type == RAY_SYM))
+                            safe = true;
+                    }
+                }
+                if (!safe) sym_cmp_safe[ch->id] = 0;
+                if (!seen[ch->id]) { seen[ch->id] = 1; stk[ssp++] = ch->id; }
+            }
+        }
+    }
+
     /* Post-order DFS with explicit stack */
     /* Depth limit 64 — expressions deeper than 64 levels fall back to non-fused path. */
     typedef struct { ray_op_t* node; uint8_t phase; } dfs_t;
@@ -730,16 +772,23 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 }
                 /* Determine whether any lane in this column may be null.
                  * For parted columns the wrapper attrs may not reflect
-                 * individual segments — scan all segments. */
-                bool col_nulls = ray_vec_has_nulls(col);
-                if (RAY_IS_PARTED(col->type)) {
+                 * individual segments — scan all segments.  SYM columns
+                 * consumed only by null-safe comparisons skip the proof
+                 * (see sym_cmp_safe above): their raw-id lanes already
+                 * give the null-aware answers, so they compile as
+                 * non-nullable whether or not id 0 is present. */
+                bool need_proof = !(elem == RAY_SYM && node->id < nc &&
+                                    sym_cmp_safe[node->id]);
+                bool col_nulls = need_proof && ray_vec_has_nulls(col);
+                if (need_proof && RAY_IS_PARTED(col->type)) {
                     ray_t** segs = (ray_t**)ray_data(col);
                     for (int64_t s = 0; s < col->len; s++)
                         if (segs[s] && ray_vec_has_nulls(segs[s]))
                             col_nulls = true;
                 }
-                /* Nullable SYM is out of scope: sym ids are indistinguishable
-                 * from the null sentinel (id 0) in raw integer lanes. */
+                /* Nullable SYM read as a value is out of scope: sym ids are
+                 * indistinguishable from the null sentinel (id 0) in raw
+                 * integer lanes. */
                 if (col_nulls && (col->type == RAY_SYM ||
                     (RAY_IS_PARTED(col->type) &&
                      RAY_PARTED_BASETYPE(col->type) == RAY_SYM)))
@@ -1682,9 +1731,11 @@ static inline uint16_t zone_swap_op(uint16_t op) {
 }
 
 /* Decide one comparison (col cmp_op cval) over chunk `ch` from its int64
- * extrema.  cmp_op is normalized so the column is the left operand.  The
- * all-pass arm is gated on "no nulls in the chunk" (a NULL lane yields BOOL 0,
- * never 1); the all-fail arm needs no guard (NULL op const is never TRUE). */
+ * extrema.  cmp_op is normalized so the column is the left operand.  Extrema
+ * exclude nulls, and the null-aware kernels rank a null below every value
+ * (null != c, null < c, null <= c are TRUE; null == c, null > c, null >= c
+ * are FALSE), so a chunk that holds a null can never be decided all-pass for
+ * EQ/GT/GE nor all-fail for NE/LT/LE from its extrema alone. */
 static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
                              uint16_t cmp_op, int64_t cval) {
     const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
@@ -1700,14 +1751,14 @@ static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
         break;
     case OP_NE:
         if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
-        if (cmin == cmax && cval == cmin)               return 0;
+        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
         break;
     case OP_LT:
-        if (cmin >= cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 0;
         if (!has_nulls && cmax <  cval)                 return 1;
         break;
     case OP_LE:
-        if (cmin >  cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 0;
         if (!has_nulls && cmax <= cval)                 return 1;
         break;
     case OP_GT:
