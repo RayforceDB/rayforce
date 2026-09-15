@@ -3923,9 +3923,10 @@ static test_result_t test_eval_insert_parted_key_types_impl(const char* root) {
     TEST_ASSERT(ni > 0 && (size_t)ni < sizeof(iroot), "format i64 root");
     TEST_ASSERT(ns > 0 && (size_t)ns < sizeof(sroot), "format sym root");
 
-    /* collect_part_dirs is byte-lexical, so these become [10,2].  The
-     * insert validator must reject that malformed numeric MAPCOMMON order
-     * instead of treating 2 as a growable tail after 10. */
+    /* collect_part_dirs orders an all-integer set by VALUE (by name these
+     * would be [10,2]), so the I64 MAPCOMMON keys load as [2,10]: 10 is the
+     * growable tail, a later key appends after it, and an earlier one is
+     * historical. */
     TEST_ASSERT(lang_parted_insert_onecol(iroot, "10", 10),
                 "save integer partition 10");
     TEST_ASSERT(lang_parted_insert_onecol(iroot, "2", 2),
@@ -3937,7 +3938,10 @@ static test_result_t test_eval_insert_parted_key_types_impl(const char* root) {
     TEST_ASSERT_NOT_NULL(setup);
     TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
     ray_release(setup);
-    ASSERT_ER_CODE("(insert pi 11 (list 11))", "corrupt");
+    ASSERT_EQ("(at (select {from: pi where: (> id 0)}) 'part)", "[2 10]");
+    ASSERT_EQ("(count (insert pi 11 (list 11)))", "3");
+    ASSERT_EQ("(count (insert pi 10 (list 12)))", "3");
+    ASSERT_ER_CODE("(insert pi 5 (list 5))", "domain");
     ASSERT_EQ("(count pi)", "2");
 
     /* Opaque directory names use a SYM MAPCOMMON key.  Equal-key growth and

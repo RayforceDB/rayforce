@@ -63,14 +63,40 @@ static bool is_date_dir(const char* name) {
     return day <= dim;
 }
 
-/* Check if string is a pure integer (digits only, possibly with leading minus). */
-static bool is_integer_str(const char* s) {
+/* Parse an integer partition name (digits only, possibly with a leading
+ * minus) into *out.  False when the name is not all digits OR its value does
+ * not fit int64_t: a 20-digit name used to be classified as an integer and
+ * then accumulated straight past INT64_MAX — signed-overflow UB that wrapped
+ * the partition key to an unrelated number (and aborts under UBSan).  Such a
+ * name now fails integer classification, so infer_mc_type falls through to
+ * symbol partitioning and the name is kept literal, as an impossible date
+ * (2024.02.31) already is. */
+static bool parse_int_name(const char* s, int64_t* out) {
     if (!*s) return false;
-    if (*s == '-') s++;
+    bool neg = false;
+    if (*s == '-') { neg = true; s++; }
     if (!*s) return false;
-    for (; *s; s++)
+    /* Accumulate the magnitude negatively: -INT64_MAX-1 is representable,
+     * +INT64_MAX+1 is not, so the negative side covers both signs. */
+    int64_t v = 0;
+    for (; *s; s++) {
         if (*s < '0' || *s > '9') return false;
+        int d = *s - '0';
+        if (v < (INT64_MIN + d) / 10) return false;   /* v*10 - d would overflow */
+        v = v * 10 - d;
+    }
+    if (!neg) {
+        if (v == INT64_MIN) return false;              /* +9223372036854775808 */
+        v = -v;
+    }
+    if (out) *out = v;
     return true;
+}
+
+/* Check if string is a pure integer (digits only, possibly with leading minus)
+ * whose value fits int64_t. */
+static bool is_integer_str(const char* s) {
+    return parse_int_name(s, NULL);
 }
 
 /* Infer MAPCOMMON sub-type from partition directory names. */
@@ -103,11 +129,9 @@ static int32_t parse_date_dir(const char* name) {
 
 /* Parse integer string → int64_t. Caller guarantees is_integer_str(). */
 static int64_t parse_int_dir(const char* s) {
-    int neg = 0;
-    if (*s == '-') { neg = 1; s++; }
     int64_t v = 0;
-    for (; *s; s++) v = v * 10 + (*s - '0');
-    return neg ? -v : v;
+    parse_int_name(s, &v);
+    return v;
 }
 
 /* --------------------------------------------------------------------------
@@ -126,7 +150,8 @@ static int64_t parse_int_dir(const char* s) {
 /* --------------------------------------------------------------------------
  * collect_part_dirs — scan db_root for partition directories
  *
- * Collects directory names that match digit/dot pattern, bubble-sorts them.
+ * Collects directory names that match digit/dot pattern, bubble-sorts them
+ * into partition-key order (by value for an all-integer set, else by name).
  * The symfile (".sym") and its lock are dotfiles, and partition names are
  * digit/dot-only, so neither is ever picked up here.
  * Caller must free each entry with ray_sys_free and the array itself.
@@ -187,17 +212,43 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
         return RAY_OK;
     }
 
-    /* Sort partition names for deterministic order.
+    /* Sort partition names for deterministic order — the key order every
+     * consumer relies on: ray_read_parted emits the MAPCOMMON keys in this
+     * order (and query paths take DATE keys as ascending), ray_parted_tables
+     * and ray_parted_fill read the "most recent" partition as the LAST one.
+     * Date names (fixed-width YYYY.MM.DD) and symbol names sort as strings;
+     * an all-integer set must sort by VALUE — by string, 10 lands before 2
+     * and the last partition of 1..12 is "9", so a table first added in
+     * partition 12 was invisible to .db.parted.tables and I64 keys came out
+     * unordered.  Mirrors infer_mc_type: the set sorts numerically exactly
+     * when it will be classified RAY_MC_I64.
      * O(n^2) but partition count is typically small (< 1000 daily partitions). */
+    int64_t* int_keys = (int64_t*)ray_alloc_raw((size_t)part_count * sizeof(int64_t));
+    if (!int_keys) {
+        for (int64_t i = 0; i < part_count; i++) ray_free_raw(part_dirs[i]);
+        ray_free_raw(part_dirs);
+        return RAY_ERR_OOM;
+    }
+    bool all_int = true;
+    for (int64_t i = 0; all_int && i < part_count; i++)
+        all_int = parse_int_name(part_dirs[i], &int_keys[i]);
     for (int64_t i = 0; i < part_count - 1; i++) {
         for (int64_t j = i + 1; j < part_count; j++) {
-            if (strcmp(part_dirs[i], part_dirs[j]) > 0) {
+            bool after = all_int ? int_keys[i] > int_keys[j]
+                                 : strcmp(part_dirs[i], part_dirs[j]) > 0;
+            if (after) {
                 char* tmp = part_dirs[i];
                 part_dirs[i] = part_dirs[j];
                 part_dirs[j] = tmp;
+                if (all_int) {
+                    int64_t k = int_keys[i];
+                    int_keys[i] = int_keys[j];
+                    int_keys[j] = k;
+                }
             }
         }
     }
+    ray_free_raw(int_keys);
 
     *out_dirs = part_dirs;
     *out_count = part_count;
