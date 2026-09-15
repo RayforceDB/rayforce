@@ -1731,9 +1731,11 @@ static inline uint16_t zone_swap_op(uint16_t op) {
 }
 
 /* Decide one comparison (col cmp_op cval) over chunk `ch` from its int64
- * extrema.  cmp_op is normalized so the column is the left operand.  The
- * all-pass arm is gated on "no nulls in the chunk" (a NULL lane yields BOOL 0,
- * never 1); the all-fail arm needs no guard (NULL op const is never TRUE). */
+ * extrema.  cmp_op is normalized so the column is the left operand.  Extrema
+ * exclude nulls, and the null-aware kernels rank a null below every value
+ * (null != c, null < c, null <= c are TRUE; null == c, null > c, null >= c
+ * are FALSE), so a chunk that holds a null can never be decided all-pass for
+ * EQ/GT/GE nor all-fail for NE/LT/LE from its extrema alone. */
 static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
                              uint16_t cmp_op, int64_t cval) {
     const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
@@ -1749,14 +1751,14 @@ static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
         break;
     case OP_NE:
         if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
-        if (cmin == cmax && cval == cmin)               return 0;
+        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
         break;
     case OP_LT:
-        if (cmin >= cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 0;
         if (!has_nulls && cmax <  cval)                 return 1;
         break;
     case OP_LE:
-        if (cmin >  cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 0;
         if (!has_nulls && cmax <= cval)                 return 1;
         break;
     case OP_GT:
