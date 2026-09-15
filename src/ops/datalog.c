@@ -33,7 +33,6 @@
 #include "ops/ops.h"
 #include "ops/hash.h"          /* ray_hash_i64, ray_hash_combine */
 #include "ops/internal.h"      /* col_propagate_str_pool */
-#include "mem/sys.h"           /* ray_sys_alloc / ray_sys_free */
 #include "lang/format.h"       /* ray_type_name (error context) */
 #include <string.h>
 #include <stdio.h>
@@ -2722,7 +2721,7 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
     int64_t ncols = ray_table_ncols(ref);
     int64_t nrows = ray_table_nrows(ref);
     rs->ncols = ncols;
-    rs->ref_cols = (int64_t**)ray_sys_alloc(sizeof(int64_t*) * (size_t)ncols);
+    rs->ref_cols = (int64_t**)ray_calloc_raw(sizeof(int64_t*) * (size_t)ncols);
     if (!rs->ref_cols) return false;
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_get_col_idx(ref, c);
@@ -2732,7 +2731,7 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
     while (cap < (nrows > 0 ? nrows * 2 : 16)) cap *= 2;
     rs->block = ray_alloc((size_t)cap * sizeof(int64_t));
     if (!rs->block || RAY_IS_ERR(rs->block)) {
-        ray_sys_free(rs->ref_cols);
+        ray_free_raw(rs->ref_cols);
         rs->ref_cols = NULL;
         return false;
     }
@@ -2752,7 +2751,7 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
 
 static void dl_rowset_destroy(dl_rowset_t* rs) {
     if (rs->block) { ray_release(rs->block); rs->block = NULL; }
-    if (rs->ref_cols) { ray_sys_free(rs->ref_cols); rs->ref_cols = NULL; }
+    if (rs->ref_cols) { ray_free_raw(rs->ref_cols); rs->ref_cols = NULL; }
 }
 
 /* True if the row at `tbl_cols[..][row]` is present in the set. */
@@ -2938,7 +2937,7 @@ static void dl_build_provenance(dl_program_t* prog) {
             dl_rowset_t rs;
             if (dl_rowset_init(&rs, derived)) {
                 int64_t ncols_t = ray_table_ncols(rel->table);
-                int64_t** tbl_cols = (int64_t**)ray_sys_alloc(sizeof(int64_t*) * (size_t)ncols_t);
+                int64_t** tbl_cols = (int64_t**)ray_calloc_raw(sizeof(int64_t*) * (size_t)ncols_t);
                 if (tbl_cols) {
                     for (int64_t c = 0; c < ncols_t; c++) {
                         ray_t* col = ray_table_get_col_idx(rel->table, c);
@@ -2949,7 +2948,7 @@ static void dl_build_provenance(dl_program_t* prog) {
                         if (dl_rowset_contains(&rs, tbl_cols, row))
                             pd[row] = r;
                     }
-                    ray_sys_free(tbl_cols);
+                    ray_free_raw(tbl_cols);
                 }
                 dl_rowset_destroy(&rs);
             }

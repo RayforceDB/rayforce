@@ -79,12 +79,12 @@ static int list_vec_validate(ray_t* list, int32_t* out_dim) {
 }
 
 /* Flatten LIST of numeric vectors into a new float[] buffer.
- * Caller frees with ray_sys_free. */
+ * Caller frees with ray_free_raw. */
 static float* list_flatten_floats(ray_t* list, int32_t dim, int64_t* out_n) {
     int64_t n = list->len;
     *out_n = n;
     if (n == 0) return NULL;
-    float* buf = (float*)ray_sys_alloc((size_t)n * (size_t)dim * sizeof(float));
+    float* buf = (float*)ray_calloc_raw((size_t)n * (size_t)dim * sizeof(float));
     if (!buf) return NULL;
     for (int64_t i = 0; i < n; i++) {
         ray_t* e = ray_list_get(list, i);
@@ -124,7 +124,7 @@ static double row_score(metric_kind_t k, ray_t* row,
 
 /* Extract query vector to a double[] scratch buffer. */
 static double* query_to_doubles(ray_t* q, int32_t dim, double* q_norm_out) {
-    double* buf = (double*)ray_sys_alloc((size_t)dim * sizeof(double));
+    double* buf = (double*)ray_calloc_raw((size_t)dim * sizeof(double));
     if (!buf) return NULL;
     double ns = 0.0;
     for (int32_t j = 0; j < dim; j++) {
@@ -171,7 +171,7 @@ static ray_t* vec_binary_metric(metric_kind_t kind, ray_t* a, ray_t* b) {
 
         int64_t n = list->len;
         ray_t* result = ray_vec_new(RAY_F64, n);
-        if (!result || RAY_IS_ERR(result)) { ray_sys_free(q); return ray_error("oom", NULL); }
+        if (!result || RAY_IS_ERR(result)) { ray_free_raw(q); return ray_error("oom", NULL); }
         result->len = n;
         double* out = (double*)ray_data(result);
         for (int64_t i = 0; i < n; i++) {
@@ -180,7 +180,7 @@ static ray_t* vec_binary_metric(metric_kind_t kind, ray_t* a, ray_t* b) {
              * non-finite (NaN/Inf) → canonicalize to NULL_F64. */
             out[i] = ray_f64_fin(row_score(kind, row, q, q_norm, dim));
         }
-        ray_sys_free(q);
+        ray_free_raw(q);
         mark_f64_nonfinite_as_null(result, 0, n);
         return result;
     }
@@ -198,7 +198,7 @@ static ray_t* vec_binary_metric(metric_kind_t kind, ray_t* a, ray_t* b) {
     double* q = query_to_doubles(b, dim, &q_norm);
     if (!q) return ray_error("oom", NULL);
     double v = row_score(kind, a, q, q_norm, dim);
-    ray_sys_free(q);
+    ray_free_raw(q);
     return make_f64(v);
 }
 
@@ -313,8 +313,8 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n) {
 
     /* Max-heap on distance (root = farthest of top-K kept). */
     typedef struct { double d; int64_t id; } ent_t;
-    ent_t* heap = (ent_t*)ray_sys_alloc((size_t)k * sizeof(ent_t));
-    if (!heap) { ray_sys_free(q); return ray_error("oom", NULL); }
+    ent_t* heap = (ent_t*)ray_calloc_raw((size_t)k * sizeof(ent_t));
+    if (!heap) { ray_free_raw(q); return ray_error("oom", NULL); }
     int64_t hsz = 0;
 
     for (int64_t i = 0; i < nrows; i++) {
@@ -357,7 +357,7 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n) {
         }
     }
 
-    ray_sys_free(q);
+    ray_free_raw(q);
 
     /* Sort ascending by distance. */
     for (int64_t i = 1; i < hsz; i++) {
@@ -373,7 +373,7 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n) {
     ray_t* rv = ray_vec_new(RAY_I64, hsz);
     ray_t* dv = ray_vec_new(RAY_F64, hsz);
     if (!rv || RAY_IS_ERR(rv) || !dv || RAY_IS_ERR(dv)) {
-        ray_sys_free(heap);
+        ray_free_raw(heap);
         if (rv && !RAY_IS_ERR(rv)) ray_release(rv);
         if (dv && !RAY_IS_ERR(dv)) ray_release(dv);
         return ray_error("oom", NULL);
@@ -383,7 +383,7 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n) {
     for (int64_t i = 0; i < hsz; i++) { rd[i] = heap[i].id; dd[i] = heap[i].d; }
     rv->len = hsz;
     dv->len = hsz;
-    ray_sys_free(heap);
+    ray_free_raw(heap);
 
     ray_t* tbl = ray_table_new(2);
     if (!tbl || RAY_IS_ERR(tbl)) { ray_release(rv); ray_release(dv); return ray_error("oom", NULL); }
@@ -449,7 +449,7 @@ ray_t* ray_hnsw_build_fn(ray_t** args, int64_t n) {
 
     ray_hnsw_t* idx = ray_hnsw_build(flat, n_rows, dim, metric, M, ef_c);
     /* ray_hnsw_build COPIES the vectors (idx->owns_data == true), so free our scratch. */
-    if (flat) ray_sys_free(flat);
+    if (flat) ray_free_raw(flat);
     if (!idx) return ray_interrupted() ? ray_error("cancel", "interrupted")
                                        : ray_error("oom", NULL);
 
@@ -485,29 +485,29 @@ ray_t* ray_ann_fn(ray_t** args, int64_t n) {
     }
 
     /* Copy query into float[] scratch. */
-    float* qbuf = (float*)ray_sys_alloc((size_t)dim * sizeof(float));
+    float* qbuf = (float*)ray_calloc_raw((size_t)dim * sizeof(float));
     if (!qbuf) return ray_error("oom", NULL);
     rayvec_to_floats(args[1], qbuf, dim);
 
-    int64_t* out_ids = (int64_t*)ray_sys_alloc((size_t)k * sizeof(int64_t));
-    double*  out_ds  = (double*)ray_sys_alloc((size_t)k * sizeof(double));
+    int64_t* out_ids = (int64_t*)ray_calloc_raw((size_t)k * sizeof(int64_t));
+    double*  out_ds  = (double*)ray_calloc_raw((size_t)k * sizeof(double));
     if (!out_ids || !out_ds) {
-        ray_sys_free(qbuf);
-        if (out_ids) ray_sys_free(out_ids);
-        if (out_ds)  ray_sys_free(out_ds);
+        ray_free_raw(qbuf);
+        if (out_ids) ray_free_raw(out_ids);
+        if (out_ds)  ray_free_raw(out_ds);
         return ray_error("oom", NULL);
     }
 
     int64_t found = ray_hnsw_search(idx, qbuf, dim, k, ef, out_ids, out_ds);
     if (found < 0) {
-        ray_sys_free(qbuf); ray_sys_free(out_ids); ray_sys_free(out_ds);
+        ray_free_raw(qbuf); ray_free_raw(out_ids); ray_free_raw(out_ds);
         return ray_error("oom", NULL);
     }
 
     ray_t* rv = ray_vec_new(RAY_I64, found);
     ray_t* dv = ray_vec_new(RAY_F64, found);
     if (!rv || RAY_IS_ERR(rv) || !dv || RAY_IS_ERR(dv)) {
-        ray_sys_free(qbuf); ray_sys_free(out_ids); ray_sys_free(out_ds);
+        ray_free_raw(qbuf); ray_free_raw(out_ids); ray_free_raw(out_ds);
         if (rv && !RAY_IS_ERR(rv)) ray_release(rv);
         if (dv && !RAY_IS_ERR(dv)) ray_release(dv);
         return ray_error("oom", NULL);
@@ -517,7 +517,7 @@ ray_t* ray_ann_fn(ray_t** args, int64_t n) {
     for (int64_t i = 0; i < found; i++) { rd[i] = out_ids[i]; dd[i] = out_ds[i]; }
     rv->len = found;
     dv->len = found;
-    ray_sys_free(qbuf); ray_sys_free(out_ids); ray_sys_free(out_ds);
+    ray_free_raw(qbuf); ray_free_raw(out_ids); ray_free_raw(out_ds);
 
     ray_t* tbl = ray_table_new(2);
     if (!tbl || RAY_IS_ERR(tbl)) { ray_release(rv); ray_release(dv); return ray_error("oom", NULL); }
