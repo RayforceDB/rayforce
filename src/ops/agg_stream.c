@@ -65,9 +65,9 @@ static void count_init(void* s) { ((count_state*)s)->n = 0; }
 static void count_update(void* base, size_t stride, const uint32_t* gids,
                          const void* vals, const ray_valid_t* valid,
                          int64_t n, acc_arena_t* a) {
-    (void)vals; (void)a;
-    AGG_UPDATE_LOOP(valid, n,
-        ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++);
+    (void)vals; (void)a; (void)valid;
+    for (int64_t i = 0; i < n; i++)
+        ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++;
 }
 static void count_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; ((count_state*)d)->n += ((const count_state*)s)->n;
@@ -365,6 +365,7 @@ static void pearson_init(void* s) {
  * caller to materialize an F64 copy. */
 static inline double pearson_read_f64(const ray_valid_t* v, int64_t i) {
     switch (v->type) {
+        case RAY_F32:                       return ((const float*)v->base)[i];
         case RAY_F64:                       return ((const double*)v->base)[i];
         case RAY_I64: case RAY_TIMESTAMP:   return (double)((const int64_t*)v->base)[i];
         case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -455,6 +456,7 @@ typedef struct { int64_t n; int64_t truthy; } truth_state;
 static void truth_init(void* s) { truth_state* st = s; st->n = 0; st->truthy = 0; }
 static inline int truth_read(const ray_valid_t* v, int64_t i) {
     switch (v->type) {
+        case RAY_F32:                       return ((const float*)v->base)[i] != 0.0f;
         case RAY_F64:                       return ((const double*)v->base)[i] != 0.0;
         case RAY_I64: case RAY_TIMESTAMP:   return ((const int64_t*)v->base)[i] != 0;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -595,14 +597,1118 @@ static const agg_vtable_t TOPK_F64 = { .state_size=sizeof(topk_f64_state), .kind
 static const agg_vtable_t BOTK_F64 = { .state_size=sizeof(topk_f64_state), .kind=ACC_BUFFERED, .out_type=RAY_LIST,
     .init=topk_f64_init, .update_batch=topk_f64_update, .merge=topk_f64_merge, .finalize=botN_f64_final, .destroy=topk_f64_destroy };
 
+/* Native-width streaming readers share the established accumulator states. */
+
+static void min_bool_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_bool_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(uint8_t*)dst = st->cnt ? (uint8_t)st->v : 0;
+    return !st->cnt;
+}
+static ray_t* ext_bool_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_bool(st->v) : ray_typed_null(-RAY_BOOL);
+}
+
+static const agg_vtable_t MIN_BOOL_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
+    .init = min_i64_init, .update_batch = min_bool_native_update,
+    .merge = min_i64_merge, .finalize = ext_bool_native_final, .finalize_value = ext_bool_native_value,
+};
+
+static void max_bool_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_BOOL_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
+    .init = max_i64_init, .update_batch = max_bool_native_update,
+    .merge = max_i64_merge, .finalize = ext_bool_native_final, .finalize_value = ext_bool_native_value,
+};
+
+static void avg_bool_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_BOOL_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_bool_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_bool_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_BOOL_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_bool_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_BOOL_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_bool_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_BOOL_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_bool_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_BOOL_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_bool_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+static void sum_bool_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* arena) {
+    (void)arena;
+    const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        sum_i64_state* st = (sum_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum = (int64_t)((uint64_t)st->sum + (uint64_t)d[i]); /* unsigned wrap: group.c:185 */
+    });
+}
+
+static const agg_vtable_t SUM_BOOL_NATIVE = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = sum_i64_init, .update_batch = sum_bool_native_update,
+    .merge = sum_i64_merge, .finalize = sum_i64_final,
+};
+
+static void min_u8_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_u8_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(uint8_t*)dst = st->cnt ? (uint8_t)st->v : 0;
+    return !st->cnt;
+}
+static ray_t* ext_u8_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_u8(st->v) : ray_typed_null(-RAY_U8);
+}
+
+static const agg_vtable_t MIN_U8_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_U8,
+    .init = min_i64_init, .update_batch = min_u8_native_update,
+    .merge = min_i64_merge, .finalize = ext_u8_native_final, .finalize_value = ext_u8_native_value,
+};
+
+static void max_u8_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_U8_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_U8,
+    .init = max_i64_init, .update_batch = max_u8_native_update,
+    .merge = max_i64_merge, .finalize = ext_u8_native_final, .finalize_value = ext_u8_native_value,
+};
+
+static void avg_u8_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_U8_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_u8_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_u8_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_U8_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_u8_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_U8_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_u8_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_U8_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_u8_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_U8_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_u8_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+static void sum_u8_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* arena) {
+    (void)arena;
+    const uint8_t* d = (const uint8_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        sum_i64_state* st = (sum_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum = (int64_t)((uint64_t)st->sum + (uint64_t)d[i]); /* unsigned wrap: group.c:185 */
+    });
+}
+
+static const agg_vtable_t SUM_U8_NATIVE = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = sum_i64_init, .update_batch = sum_u8_native_update,
+    .merge = sum_i64_merge, .finalize = sum_i64_final,
+};
+
+static void min_i16_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int16_t* d = (const int16_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_i16_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(int16_t*)dst = st->cnt ? (int16_t)st->v : NULL_I16;
+    return !st->cnt;
+}
+static ray_t* ext_i16_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_i16(st->v) : ray_typed_null(-RAY_I16);
+}
+
+static const agg_vtable_t MIN_I16_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I16,
+    .init = min_i64_init, .update_batch = min_i16_native_update,
+    .merge = min_i64_merge, .finalize = ext_i16_native_final, .finalize_value = ext_i16_native_value,
+};
+
+static void max_i16_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int16_t* d = (const int16_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_I16_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I16,
+    .init = max_i64_init, .update_batch = max_i16_native_update,
+    .merge = max_i64_merge, .finalize = ext_i16_native_final, .finalize_value = ext_i16_native_value,
+};
+
+static void avg_i16_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int16_t* d = (const int16_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_I16_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_i16_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_i16_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int16_t* d = (const int16_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_I16_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i16_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_I16_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i16_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_I16_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i16_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_I16_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i16_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+static void sum_i16_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* arena) {
+    (void)arena;
+    const int16_t* d = (const int16_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        sum_i64_state* st = (sum_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum = (int64_t)((uint64_t)st->sum + (uint64_t)d[i]); /* unsigned wrap: group.c:185 */
+    });
+}
+
+static const agg_vtable_t SUM_I16_NATIVE = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = sum_i64_init, .update_batch = sum_i16_native_update,
+    .merge = sum_i64_merge, .finalize = sum_i64_final,
+};
+
+static void min_i32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_i32_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(int32_t*)dst = st->cnt ? (int32_t)st->v : NULL_I32;
+    return !st->cnt;
+}
+static ray_t* ext_i32_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_i32(st->v) : ray_typed_null(-RAY_I32);
+}
+
+static const agg_vtable_t MIN_I32_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I32,
+    .init = min_i64_init, .update_batch = min_i32_native_update,
+    .merge = min_i64_merge, .finalize = ext_i32_native_final, .finalize_value = ext_i32_native_value,
+};
+
+static void max_i32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_I32_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I32,
+    .init = max_i64_init, .update_batch = max_i32_native_update,
+    .merge = max_i64_merge, .finalize = ext_i32_native_final, .finalize_value = ext_i32_native_value,
+};
+
+static void avg_i32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_I32_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_i32_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_i32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_I32_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i32_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_I32_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i32_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_I32_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i32_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_I32_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_i32_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+static void sum_i32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* arena) {
+    (void)arena;
+    const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        sum_i64_state* st = (sum_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum = (int64_t)((uint64_t)st->sum + (uint64_t)d[i]); /* unsigned wrap: group.c:185 */
+    });
+}
+
+static const agg_vtable_t SUM_I32_NATIVE = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = sum_i64_init, .update_batch = sum_i32_native_update,
+    .merge = sum_i64_merge, .finalize = sum_i64_final,
+};
+
+static void avg_i64_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_I64_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_i64_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void min_f32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const float* d = (const float*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_f64_state* st = (ext_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MIN_F32_NATIVE = {
+    .state_size = sizeof(ext_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = min_f64_init, .update_batch = min_f32_native_update,
+    .merge = min_f64_merge, .finalize = ext_f64_final,
+};
+
+static void max_f32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const float* d = (const float*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_f64_state* st = (ext_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_F32_NATIVE = {
+    .state_size = sizeof(ext_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = max_f64_init, .update_batch = max_f32_native_update,
+    .merge = max_f64_merge, .finalize = ext_f64_final,
+};
+
+static void avg_f32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const float* d = (const float*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_F32_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_f32_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_f32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const float* d = (const float*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_f64_state* st = (var_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        double v = d[i]; st->sum += v; st->sumsq += v*v; st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_F32_NATIVE = {
+    .state_size = sizeof(var_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_f64_init, .update_batch = var_f32_native_update,
+    .merge = var_f64_merge, .finalize = fin_var_f64,
+};
+
+static const agg_vtable_t VAR_POP_F32_NATIVE = {
+    .state_size = sizeof(var_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_f64_init, .update_batch = var_f32_native_update,
+    .merge = var_f64_merge, .finalize = fin_var_pop_f64,
+};
+
+static const agg_vtable_t STDDEV_F32_NATIVE = {
+    .state_size = sizeof(var_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_f64_init, .update_batch = var_f32_native_update,
+    .merge = var_f64_merge, .finalize = fin_stddev_f64,
+};
+
+static const agg_vtable_t STDDEV_POP_F32_NATIVE = {
+    .state_size = sizeof(var_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_f64_init, .update_batch = var_f32_native_update,
+    .merge = var_f64_merge, .finalize = fin_stddev_pop_f64,
+};
+
+static void sum_f32_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const float* d = (const float*)vals;
+    AGG_UPDATE_LOOP(valid, n,
+        ((sum_f64_state*)((char*)base + (size_t)gids[i]*stride))->sum += d[i]);
+}
+
+static const agg_vtable_t SUM_F32_NATIVE = {
+    .state_size = sizeof(sum_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = sum_f64_init, .update_batch = sum_f32_native_update,
+    .merge = sum_f64_merge, .finalize = sum_f64_final,
+};
+
+static void min_date_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_date_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(int32_t*)dst = st->cnt ? (int32_t)st->v : NULL_I32;
+    return !st->cnt;
+}
+static ray_t* ext_date_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_date(st->v) : ray_typed_null(-RAY_DATE);
+}
+
+static const agg_vtable_t MIN_DATE_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_DATE,
+    .init = min_i64_init, .update_batch = min_date_native_update,
+    .merge = min_i64_merge, .finalize = ext_date_native_final, .finalize_value = ext_date_native_value,
+};
+
+static void max_date_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_DATE_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_DATE,
+    .init = max_i64_init, .update_batch = max_date_native_update,
+    .merge = max_i64_merge, .finalize = ext_date_native_final, .finalize_value = ext_date_native_value,
+};
+
+static void avg_date_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_DATE_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_date_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_date_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_DATE_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_date_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_DATE_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_date_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_DATE_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_date_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_DATE_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_date_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+static void min_time_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_time_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(int32_t*)dst = st->cnt ? (int32_t)st->v : NULL_I32;
+    return !st->cnt;
+}
+static ray_t* ext_time_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_time(st->v) : ray_typed_null(-RAY_TIME);
+}
+
+static const agg_vtable_t MIN_TIME_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
+    .init = min_i64_init, .update_batch = min_time_native_update,
+    .merge = min_i64_merge, .finalize = ext_time_native_final, .finalize_value = ext_time_native_value,
+};
+
+static void max_time_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_TIME_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
+    .init = max_i64_init, .update_batch = max_time_native_update,
+    .merge = max_i64_merge, .finalize = ext_time_native_final, .finalize_value = ext_time_native_value,
+};
+
+static void avg_time_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_TIME_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_time_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_time_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_TIME_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_time_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_TIME_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_time_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_TIME_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_time_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_TIME_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_time_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+static void sum_time_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* arena) {
+    (void)arena;
+    const int32_t* d = (const int32_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        sum_i64_state* st = (sum_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum = (int64_t)((uint64_t)st->sum + (uint64_t)d[i]); /* unsigned wrap: group.c:185 */
+    });
+}
+
+static ray_t* sum_time_native_final(const void* s, acc_arena_t* a, int64_t p) {
+    (void)a; (void)p; return ray_time(((const sum_i64_state*)s)->sum);
+}
+
+static const agg_vtable_t SUM_TIME_NATIVE = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
+    .init = sum_i64_init, .update_batch = sum_time_native_update,
+    .merge = sum_i64_merge, .finalize = sum_time_native_final,
+};
+
+static void min_timestamp_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] < st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static bool ext_timestamp_native_value(const void* s, void* dst) {
+    const ext_i64_state* st = s;
+    *(int64_t*)dst = st->cnt ? (int64_t)st->v : NULL_I64;
+    return !st->cnt;
+}
+static ray_t* ext_timestamp_native_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_timestamp(st->v) : ray_typed_null(-RAY_TIMESTAMP);
+}
+
+static const agg_vtable_t MIN_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESTAMP,
+    .init = min_i64_init, .update_batch = min_timestamp_native_update,
+    .merge = min_i64_merge, .finalize = ext_timestamp_native_final, .finalize_value = ext_timestamp_native_value,
+};
+
+static void max_timestamp_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        if (d[i] > st->v) st->v = d[i];
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t MAX_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESTAMP,
+    .init = max_i64_init, .update_batch = max_timestamp_native_update,
+    .merge = max_i64_merge, .finalize = ext_timestamp_native_final, .finalize_value = ext_timestamp_native_value,
+};
+
+static void avg_timestamp_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
+        st->sum += d[i]; st->cnt++;
+    });
+}
+
+static const agg_vtable_t AVG_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(avg_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = avg_f64_init, .update_batch = avg_timestamp_native_update,
+    .merge = avg_f64_merge, .finalize = avg_f64_final,
+};
+
+static void var_timestamp_native_update(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid,
+                           int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        int64_t v = d[i]; st->sum += (double)v;
+        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
+        st->cnt++;
+    });
+}
+
+static const agg_vtable_t VAR_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_timestamp_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_i64,
+};
+
+static const agg_vtable_t VAR_POP_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_timestamp_native_update,
+    .merge = var_i64_merge, .finalize = fin_var_pop_i64,
+};
+
+static const agg_vtable_t STDDEV_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_timestamp_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_i64,
+};
+
+static const agg_vtable_t STDDEV_POP_TIMESTAMP_NATIVE = {
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = var_i64_init, .update_batch = var_timestamp_native_update,
+    .merge = var_i64_merge, .finalize = fin_stddev_pop_i64,
+};
+
+typedef struct { int64_t sum, cnt; } prod_i64_state;
+typedef struct { double sum; int64_t cnt; } prod_f64_state;
+static ray_t* prod_i64_final(const void* s, acc_arena_t* a, int64_t p) {
+    (void)a; (void)p; const prod_i64_state* st = s;
+    return st->cnt ? ray_i64(st->sum) : ray_typed_null(-RAY_I64);
+}
+static ray_t* prod_f64_final(const void* s, acc_arena_t* a, int64_t p) {
+    (void)a; (void)p; const prod_f64_state* st = s;
+    return st->cnt ? ray_f64(ray_f64_fin(st->sum)) : ray_typed_null(-RAY_F64);
+}
+static void prod_bool_init(void* s) { ((prod_i64_state*)s)->sum = 1; ((prod_i64_state*)s)->cnt = 0; }
+static void prod_bool_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_i64_state* st = (prod_i64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = (int64_t)((uint64_t)st->sum * (uint64_t)d[i]);
+    });
+}
+static void prod_bool_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_i64_state* dst = d; const prod_i64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = (int64_t)((uint64_t)dst->sum * (uint64_t)src->sum);
+}
+static const agg_vtable_t PROD_BOOL = {
+    .state_size = sizeof(prod_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = prod_bool_init, .update_batch = prod_bool_update,
+    .merge = prod_bool_merge, .finalize = prod_i64_final,
+};
+
+static void prod_u8_init(void* s) { ((prod_i64_state*)s)->sum = 1; ((prod_i64_state*)s)->cnt = 0; }
+static void prod_u8_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const uint8_t* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_i64_state* st = (prod_i64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = (int64_t)((uint64_t)st->sum * (uint64_t)d[i]);
+    });
+}
+static void prod_u8_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_i64_state* dst = d; const prod_i64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = (int64_t)((uint64_t)dst->sum * (uint64_t)src->sum);
+}
+static const agg_vtable_t PROD_U8 = {
+    .state_size = sizeof(prod_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = prod_u8_init, .update_batch = prod_u8_update,
+    .merge = prod_u8_merge, .finalize = prod_i64_final,
+};
+
+static void prod_i16_init(void* s) { ((prod_i64_state*)s)->sum = 1; ((prod_i64_state*)s)->cnt = 0; }
+static void prod_i16_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const int16_t* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_i64_state* st = (prod_i64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = (int64_t)((uint64_t)st->sum * (uint64_t)d[i]);
+    });
+}
+static void prod_i16_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_i64_state* dst = d; const prod_i64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = (int64_t)((uint64_t)dst->sum * (uint64_t)src->sum);
+}
+static const agg_vtable_t PROD_I16 = {
+    .state_size = sizeof(prod_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = prod_i16_init, .update_batch = prod_i16_update,
+    .merge = prod_i16_merge, .finalize = prod_i64_final,
+};
+
+static void prod_i32_init(void* s) { ((prod_i64_state*)s)->sum = 1; ((prod_i64_state*)s)->cnt = 0; }
+static void prod_i32_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const int32_t* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_i64_state* st = (prod_i64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = (int64_t)((uint64_t)st->sum * (uint64_t)d[i]);
+    });
+}
+static void prod_i32_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_i64_state* dst = d; const prod_i64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = (int64_t)((uint64_t)dst->sum * (uint64_t)src->sum);
+}
+static const agg_vtable_t PROD_I32 = {
+    .state_size = sizeof(prod_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = prod_i32_init, .update_batch = prod_i32_update,
+    .merge = prod_i32_merge, .finalize = prod_i64_final,
+};
+
+static void prod_i64_init(void* s) { ((prod_i64_state*)s)->sum = 1; ((prod_i64_state*)s)->cnt = 0; }
+static void prod_i64_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_i64_state* st = (prod_i64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = (int64_t)((uint64_t)st->sum * (uint64_t)d[i]);
+    });
+}
+static void prod_i64_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_i64_state* dst = d; const prod_i64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = (int64_t)((uint64_t)dst->sum * (uint64_t)src->sum);
+}
+static const agg_vtable_t PROD_I64 = {
+    .state_size = sizeof(prod_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
+    .init = prod_i64_init, .update_batch = prod_i64_update,
+    .merge = prod_i64_merge, .finalize = prod_i64_final,
+};
+
+static void prod_f32_init(void* s) { ((prod_f64_state*)s)->sum = 1; ((prod_f64_state*)s)->cnt = 0; }
+static void prod_f32_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const float* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_f64_state* st = (prod_f64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = st->sum * d[i];
+    });
+}
+static void prod_f32_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_f64_state* dst = d; const prod_f64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = dst->sum * src->sum;
+}
+static const agg_vtable_t PROD_F32 = {
+    .state_size = sizeof(prod_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = prod_f32_init, .update_batch = prod_f32_update,
+    .merge = prod_f32_merge, .finalize = prod_f64_final,
+};
+
+static void prod_f64_init(void* s) { ((prod_f64_state*)s)->sum = 1; ((prod_f64_state*)s)->cnt = 0; }
+static void prod_f64_update(void* base, size_t stride, const uint32_t* gids,
+        const void* vals, const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)a; const double* d = vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        prod_f64_state* st = (prod_f64_state*)((char*)base + (size_t)gids[i] * stride);
+        st->cnt++;
+        st->sum = st->sum * d[i];
+    });
+}
+static void prod_f64_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; prod_f64_state* dst = d; const prod_f64_state* src = s;
+    dst->cnt += src->cnt;
+    dst->sum = dst->sum * src->sum;
+}
+static const agg_vtable_t PROD_F64 = {
+    .state_size = sizeof(prod_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = prod_f64_init, .update_batch = prod_f64_update,
+    .merge = prod_f64_merge, .finalize = prod_f64_final,
+};
+
 const agg_vtable_t* agg_resolve(uint16_t agg_kind, int8_t in_type) {
+    if (agg_kind == OP_PROD && in_type == RAY_BOOL) return &PROD_BOOL;
+    if (agg_kind == OP_PROD && in_type == RAY_U8) return &PROD_U8;
+    if (agg_kind == OP_PROD && in_type == RAY_I16) return &PROD_I16;
+    if (agg_kind == OP_PROD && in_type == RAY_I32) return &PROD_I32;
+    if (agg_kind == OP_PROD && in_type == RAY_I64) return &PROD_I64;
+    if (agg_kind == OP_PROD && in_type == RAY_F32) return &PROD_F32;
+    if (agg_kind == OP_PROD && in_type == RAY_F64) return &PROD_F64;
+    if (agg_kind == OP_MIN && in_type == RAY_BOOL) return &MIN_BOOL_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_BOOL) return &MAX_BOOL_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_BOOL) return &AVG_BOOL_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_BOOL) return &VAR_BOOL_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_BOOL) return &VAR_POP_BOOL_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_BOOL) return &STDDEV_BOOL_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_BOOL) return &STDDEV_POP_BOOL_NATIVE;
+    if (agg_kind == OP_SUM && in_type == RAY_BOOL) return &SUM_BOOL_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_U8) return &MIN_U8_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_U8) return &MAX_U8_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_U8) return &AVG_U8_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_U8) return &VAR_U8_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_U8) return &VAR_POP_U8_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_U8) return &STDDEV_U8_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_U8) return &STDDEV_POP_U8_NATIVE;
+    if (agg_kind == OP_SUM && in_type == RAY_U8) return &SUM_U8_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_I16) return &MIN_I16_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_I16) return &MAX_I16_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_I16) return &AVG_I16_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_I16) return &VAR_I16_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_I16) return &VAR_POP_I16_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_I16) return &STDDEV_I16_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_I16) return &STDDEV_POP_I16_NATIVE;
+    if (agg_kind == OP_SUM && in_type == RAY_I16) return &SUM_I16_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_I32) return &MIN_I32_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_I32) return &MAX_I32_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_I32) return &AVG_I32_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_I32) return &VAR_I32_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_I32) return &VAR_POP_I32_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_I32) return &STDDEV_I32_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_I32) return &STDDEV_POP_I32_NATIVE;
+    if (agg_kind == OP_SUM && in_type == RAY_I32) return &SUM_I32_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_I64) return &AVG_I64_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_F32) return &MIN_F32_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_F32) return &MAX_F32_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_F32) return &AVG_F32_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_F32) return &VAR_F32_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_F32) return &VAR_POP_F32_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_F32) return &STDDEV_F32_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_F32) return &STDDEV_POP_F32_NATIVE;
+    if (agg_kind == OP_SUM && in_type == RAY_F32) return &SUM_F32_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_DATE) return &MIN_DATE_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_DATE) return &MAX_DATE_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_DATE) return &AVG_DATE_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_DATE) return &VAR_DATE_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_DATE) return &VAR_POP_DATE_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_DATE) return &STDDEV_DATE_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_DATE) return &STDDEV_POP_DATE_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_TIME) return &MIN_TIME_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_TIME) return &MAX_TIME_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_TIME) return &AVG_TIME_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_TIME) return &VAR_TIME_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_TIME) return &VAR_POP_TIME_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_TIME) return &STDDEV_TIME_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_TIME) return &STDDEV_POP_TIME_NATIVE;
+    if (agg_kind == OP_SUM && in_type == RAY_TIME) return &SUM_TIME_NATIVE;
+    if (agg_kind == OP_MIN && in_type == RAY_TIMESTAMP) return &MIN_TIMESTAMP_NATIVE;
+    if (agg_kind == OP_MAX && in_type == RAY_TIMESTAMP) return &MAX_TIMESTAMP_NATIVE;
+    if (agg_kind == OP_AVG && in_type == RAY_TIMESTAMP) return &AVG_TIMESTAMP_NATIVE;
+    if (agg_kind == OP_VAR && in_type == RAY_TIMESTAMP) return &VAR_TIMESTAMP_NATIVE;
+    if (agg_kind == OP_VAR_POP && in_type == RAY_TIMESTAMP) return &VAR_POP_TIMESTAMP_NATIVE;
+    if (agg_kind == OP_STDDEV && in_type == RAY_TIMESTAMP) return &STDDEV_TIMESTAMP_NATIVE;
+    if (agg_kind == OP_STDDEV_POP && in_type == RAY_TIMESTAMP) return &STDDEV_POP_TIMESTAMP_NATIVE;
     if (agg_kind == OP_TOP_N && in_type == RAY_I64) return &TOPK_I64;
     if (agg_kind == OP_BOT_N && in_type == RAY_I64) return &BOTK_I64;
     if (agg_kind == OP_TOP_N && in_type == RAY_F64) return &TOPK_F64;
     if (agg_kind == OP_BOT_N && in_type == RAY_F64) return &BOTK_F64;
     if (agg_kind == OP_MEDIAN && in_type == RAY_I64) return &MEDIAN_I64;
     if (agg_kind == OP_MEDIAN && in_type == RAY_F64) return &MEDIAN_F64;
-    if (in_type == RAY_F64 || in_type == RAY_I64 || in_type == RAY_I32 ||
+    if (in_type == RAY_F32 || in_type == RAY_F64 || in_type == RAY_I64 || in_type == RAY_I32 ||
         in_type == RAY_I16 || in_type == RAY_U8  || in_type == RAY_BOOL) {
         if (agg_kind == OP_ALL) return &ALL_BOOL;
         if (agg_kind == OP_ANY) return &ANY_BOOL;

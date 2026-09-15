@@ -22,6 +22,7 @@ typedef enum {
     AGG_V2_PARAMETER,
     AGG_V2_DISABLED,
     AGG_V2_EMIT_FILTER,
+    AGG_V2_PARALLEL_WIDE,
 } agg_v2_reason_t;
 
 agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
@@ -37,6 +38,7 @@ typedef enum {
     AGG_ROUTE_V2_RADIX,
     AGG_ROUTE_V2_HASH,
     AGG_ROUTE_V2_SMALLHASH,
+    AGG_ROUTE_V2_INDEXED,
     AGG_ROUTE_COUNT,
 } agg_route_t;
 
@@ -50,7 +52,8 @@ typedef struct {
     agg_v2_reason_t last_v2_reason;
     bool nullable_key;              /* last v2 run: non-SYM key may contain nulls */
     bool dense_plan_available;      /* last v2 run: bounded dense range exists */
-    bool dense_worker_budget;       /* that plan exceeded the per-worker slot budget */
+    bool dense_worker_budget;       /* worker allocation or sampled traffic budget exceeded */
+    uint32_t dense_tasks;           /* selected logical dense tasks, may be less than pool workers */
 } agg_route_stats_t;
 void agg_route_reset(void);
 agg_route_stats_t agg_route_stats(void);
@@ -76,8 +79,9 @@ typedef struct {
     int64_t   ngroups;
 } agg_groups_t;
 
-/* Multi-key grouping, key count unbounded. Reads each key as an int64
- * (intern id for SYM) and hashes the tuple. Assigns gids incrementally on first sight → gid
+/* Multi-key grouping, key count unbounded. Uses native integer/SYM,
+ * canonical float, byte/string, and structural LIST hash/equality. Assigns
+ * gids incrementally on first sight → gid
  * order == first-occurrence order; first_row[gid] records the row where the
  * group first appeared. Returns 0 on success (caller releases out via
  * agg_groups_free()), -1 on allocation failure.
@@ -119,6 +123,8 @@ ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
 typedef struct {
     bool     ok;
     uint32_t n_keys;        /* mirrors ext->n_keys' width; value stays 1..16 (dense self-limit) */
+    bool nullable[16];
+    int64_t nulls[16];
     int64_t  mins[16];      /* [16]: dense direct-index routing self-limits to <=16 keys (agg_dense_plan) */
     int64_t  ranges[16];    /* [16]: dense direct-index routing self-limits to <=16 keys (agg_dense_plan) */
     int64_t  strides[16];   /* [16]: dense self-limit <=16; composite packing: slot = sum_k (key_k - min_k)*strides[k] */

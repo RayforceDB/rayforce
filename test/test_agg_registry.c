@@ -154,14 +154,11 @@ static test_result_t test_nulls_match_reduction(void) {
         TEST_ASSERT_EQ_I(got->i64, want->i64);   /* sentinels skipped identically */
         ray_release(got); ray_release(want);
     }
-    /* count over a HAS_NULLS column = live rows only = 3.
-     * This is the redesign's COMMITTED behavior (live-rows-only). We assert the
-     * literal 3, NOT a comparison to the legacy count (which counts slots incl.
-     * nulls per design §2.10) — this is an intentional corrected-behavior pin. */
+    /* COUNT counts all input rows, including nulls, on every route. */
     const agg_vtable_t* vt = agg_resolve(OP_COUNT, RAY_I64);
     TEST_ASSERT_NOT_NULL(vt);
     ray_t* got = run_single_group(vt, col);
-    TEST_ASSERT_EQ_I(got->i64, 3);
+    TEST_ASSERT_EQ_I(got->i64, 5);
     ray_release(got); ray_release(col);
 
     ray_sym_destroy();

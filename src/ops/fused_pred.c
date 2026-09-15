@@ -75,6 +75,8 @@ static int fp_op_from_1char(const char* op, size_t len) {
  * here are the negative-typed (-RAY_*) atom encoding from values. */
 static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
     switch (col_type) {
+    case RAY_STR: return atom_type == -RAY_STR;
+    case RAY_GUID: return atom_type == -RAY_GUID;
     case RAY_SYM:
         /* SYM compares against a symbol-id atom or a string literal
          * (string is intern-resolved to a sym id at compile time). */
@@ -89,58 +91,33 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
     case RAY_U8:
     case RAY_I16:
     case RAY_I32:
+    case RAY_F32: case RAY_F64:
     case RAY_I64:
         /* Any signed/unsigned integer literal; we still range-check
          * cval against the column width to fold out-of-range. */
         return atom_type == -RAY_BOOL || atom_type == -RAY_U8
             || atom_type == -RAY_I16  || atom_type == -RAY_I32
-            || atom_type == -RAY_I64;
+            || atom_type == -RAY_I64 || atom_type == -RAY_F32 || atom_type == -RAY_F64;
     default:
         return 0;
     }
 }
 
-/* Reject columns the fused per-row compare can't read safely.
- *
- * The fused evaluator reads raw payload bytes.  For a NUMERIC or TEMPORAL
- * column the null is an OUT-OF-BAND SENTINEL (NULL_I64, NULL_I32, NaN, ...)
- * that does not stand for any real value, so comparing it would answer a
- * question about the sentinel rather than about the null — a different result
- * from the unfused null-aware kernel.  Those stay rejected.
- *
- * SYM and STR are different in kind: their null is an IN-BAND ORDINARY VALUE.
- * A SYM null is id 0, which is a genuine dictionary entry — the empty string,
- * held at position 0 of every symfile by construction (domain.c enforces the
- * reservation on open).  A STR null is a zero-length descriptor.  Comparing
- * those raw payloads for EQUALITY therefore gives exactly the answer the
- * unfused kernel gives: `== ""` is true precisely on the null cells, `!= ""`
- * false precisely on them.  Nothing is being skipped or guessed.
- *
- * Deliberately limited to EQ/NE:
- *   - ORDERING (LT/LE/GT/GE) is NOT safe by this argument.  The sort kernels
- *     treat nulls as a separate order class placed by the `nulls_first` flag
- *     (sort_cmp; the single-key path partitions them out and rotates), NOT by
- *     their payload — so "" sorting as the smallest string is not the ordering
- *     a null-aware comparison implies.  (SYM ordering ops are rejected outright
- *     a few lines below in any case.)
- *   - LIKE is not safe either: bfb5b380 made the string kernels
- *     null-propagating (e.g. `strlen` of a null SYM/STR is NULL_I64), so a
- *     pattern match against the empty payload need not equal the null-aware
- *     answer.  LIKE keeps the strict gate.
- *
- * This mattered the moment converted stores started carrying HAS_NULLS on SYM
- * columns (#416): ClickBench q24/q25/q26 are `where: (!= SearchPhrase "")`,
- * and losing the fused path cost them ~70x for an identical result. */
+/* Numeric, temporal, STR and GUID comparisons have an explicit typed leg
+ * with null-as-minimum ordering. SYM equality uses domain codes. LIKE/IN keep
+ * their stricter null-free admission because they use different evaluators. */
 static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
     if (!col) return 0;
-    if (eq_or_ne && (col->type == RAY_SYM || col->type == RAY_STR)) return 1;
+    if (col->type >= RAY_BOOL && col->type <= RAY_TIMESTAMP) return 1;
+    if (col->type == RAY_GUID || col->type == RAY_STR) return 1;
+    if (eq_or_ne && col->type == RAY_SYM) return 1;
     return !ray_vec_has_nulls(col);
 }
 
 /* Strict form — no nullable column at all.  Used by the shapes whose
  * evaluator arm is not an equality compare (LIKE, IN). */
 static int fp_col_supported(const ray_t* col) {
-    return fp_col_supported_op(col, 0);
+    return col && !ray_vec_has_nulls(col);
 }
 
 static int fp_expr_const_str(ray_t* expr) {
@@ -203,11 +180,12 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
         int is_dict_str = (ct == RAY_STR && !is_ord
                            && rhs->type == -RAY_STR
                            && ray_index_kind(col) == RAY_IDX_DICT);
-        /* F32/F64/non-dict-STR not supported by phase-3 evaluator. */
+        /* Only types with a matching typed comparison implementation. */
         if (!is_dict_str
             && ct != RAY_SYM && ct != RAY_BOOL && ct != RAY_U8
             && ct != RAY_I16 && ct != RAY_I32 && ct != RAY_I64
-            && ct != RAY_DATE && ct != RAY_TIME && ct != RAY_TIMESTAMP)
+            && ct != RAY_DATE && ct != RAY_TIME && ct != RAY_TIMESTAMP
+            && ct != RAY_F32 && ct != RAY_F64 && ct != RAY_STR && ct != RAY_GUID)
             return -1;
         if (!fp_col_supported_op(col, code == 0 || code == 1)) return -1;
         if (!is_dict_str && !fp_atom_col_compatible(rhs->type, ct)) return -1;
@@ -335,6 +313,41 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
     fp_op_t op = p->op;
     int8_t  ct = p->col_type;
     uint8_t esz = p->col_esz;
+
+    if (p->typed_compare) {
+        for (int64_t r = start; r < end; r++) {
+            bool an = ray_vec_is_null(p->col_obj, r), bn = p->constant_null;
+            int cmp;
+            if (an || bn) cmp = an == bn ? 0 : an ? -1 : 1;
+            else if (ct == RAY_STR) {
+                size_t len = 0, clen = ray_str_len(p->literal);
+                const char* str = ray_str_vec_get(p->col_obj, r, &len);
+                size_t common = len < clen ? len : clen;
+                cmp = common ? memcmp(str, ray_str_ptr(p->literal), common) : 0;
+                if (!cmp) cmp = (len > clen) - (len < clen);
+            } else if (ct == RAY_GUID) {
+                cmp = memcmp((const char*)p->col_base + (size_t)r * 16, ray_data(p->literal->obj), 16);
+            } else if (p->float_compare) {
+                double v = ct == RAY_F32 ? ((const float*)p->col_base)[r]
+                    : ct == RAY_F64 ? ((const double*)p->col_base)[r]
+                    : (double)read_col_i64(p->col_base, r, ct, p->col_attrs);
+                cmp = (v > p->fval) - (v < p->fval);
+            } else {
+                int64_t v = read_col_i64(p->col_base, r, ct, p->col_attrs);
+                cmp = (v > cval) - (v < cval);
+            }
+            switch (op) {
+                case FP_EQ: bits[r - start] = cmp == 0; break;
+                case FP_NE: bits[r - start] = cmp != 0; break;
+                case FP_LT: bits[r - start] = cmp < 0; break;
+                case FP_LE: bits[r - start] = cmp <= 0; break;
+                case FP_GT: bits[r - start] = cmp > 0; break;
+                case FP_GE: bits[r - start] = cmp >= 0; break;
+                default: bits[r - start] = 0; break;
+            }
+        }
+        return;
+    }
 
     /* Compile-time fold: out-of-range constant ⇒ all-true or all-false. */
     if (p->fold) {
@@ -848,8 +861,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     if (col->type == RAY_SYM && (out->op == FP_LT || out->op == FP_LE ||
                                  out->op == FP_GT || out->op == FP_GE))
         return -1;
-    /* Nullable columns: only SYM/STR equality is safe — see
-     * fp_col_supported_op for why sentinels and in-band nulls differ. */
+    /* Admission and execution share the typed comparison/null contract. */
     if (!fp_col_supported_op(col, out->op == FP_EQ || out->op == FP_NE))
         return -1;
 
@@ -865,6 +877,13 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     out->col_base  = ray_data(col);
     out->col_obj   = col;
     out->col_len   = col->len;
+
+    out->literal = cv;
+    out->constant_null = RAY_ATOM_IS_NULL(cv);
+    out->float_compare = col->type == RAY_F32 || col->type == RAY_F64 || cv->type == -RAY_F32 || cv->type == -RAY_F64;
+    out->typed_compare = col->type == RAY_STR || col->type == RAY_GUID ||
+        (col->type != RAY_SYM && (out->float_compare || out->constant_null || ray_vec_may_have_nulls(col)));
+    if (col->type == RAY_STR || col->type == RAY_GUID) return 0;
 
     if (out->col_type == RAY_SYM) {
         /* The constant must be expressed in the COLUMN's domain — cells
@@ -897,6 +916,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
          * fp_atom_col_compatible above, so each branch knows the
          * stored unit matches the column's. */
         switch (cv->type) {
+        case -RAY_F32: case -RAY_F64: out->fval = cv->f64; break;
         case -RAY_I64:       case -RAY_TIMESTAMP: out->cval = cv->i64;            break;
         case -RAY_I32:       case -RAY_DATE:
         case -RAY_TIME:                            out->cval = (int64_t)cv->i32;  break;
@@ -905,6 +925,11 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         default: return -1;
         }
         out->cval_in_dict = 1;
+    }
+
+    if (out->typed_compare) {
+        if (cv->type != -RAY_F32 && cv->type != -RAY_F64) out->fval = (double)out->cval;
+        return 0;
     }
 
     /* Range-check cval against the column's representable range and
