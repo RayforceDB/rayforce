@@ -2076,7 +2076,7 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
  * cache-missing on the source column, but those misses overlap with
  * parallel tasks on other cores — the 27-core dispatch hides them.
  *
- * Type support: F64 native; I64/I32/I16/U8 cast-to-double on read.
+ * Type support: floating, integer, boolean and temporal values widened to F64.
  * Null rows are skipped pairwise.
  *
  * Returns: F64 vec of length n_groups, or NULL on unsupported type
@@ -2128,30 +2128,31 @@ typedef struct {
 static inline double med_read_as_f64(const void* base, int8_t t, int64_t row) {
     switch (t) {
         case RAY_F64: { double v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v; }
+        case RAY_F32: { float v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
         case RAY_I64: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
         case RAY_I32: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
         case RAY_DATE:
         case RAY_TIME: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
         case RAY_TIMESTAMP: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
         case RAY_I16: { int16_t v; memcpy(&v, (const char*)base + (size_t)row * 2, 2); return (double)v; }
-        case RAY_U8:  return (double)((const uint8_t*)base)[row];
+        case RAY_BOOL: case RAY_U8: return (double)((const uint8_t*)base)[row];
         default:      return 0.0;
     }
 }
 
-/* Type-correct sentinel null check for the med_par paths.  U8 is
- * non-nullable; med only accepts the listed types so SYM/STR/GUID/F32
- * never reach here. */
+/* Type-correct sentinel null check for the med_par paths. BOOL/U8 are
+ * non-nullable; text and GUID inputs are rejected by rank_per_group_buf. */
 static inline bool med_is_null(const void* base, int8_t t, int64_t row) {
     switch (t) {
         case RAY_F64: { double v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v != v; }
+        case RAY_F32: { float v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return v != v; }
         case RAY_I64: return ((const int64_t*)base)[row] == NULL_I64;
         case RAY_I32: return ((const int32_t*)base)[row] == NULL_I32;
         case RAY_DATE:
         case RAY_TIME: return ((const int32_t*)base)[row] == NULL_I32;
         case RAY_TIMESTAMP: return ((const int64_t*)base)[row] == NULL_I64;
         case RAY_I16: return ((const int16_t*)base)[row] == NULL_I16;
-        case RAY_U8:  return false;  /* non-nullable */
+        case RAY_BOOL: case RAY_U8: return false;  /* non-nullable */
         default:      return false;
     }
 }
@@ -2163,7 +2164,7 @@ static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
     for (int64_t g = start; g < end; g++) {
         int64_t cnt = c->grp_cnt[g];
         int64_t off = c->offsets[g];
-        double* slice = c->scratch_pool + off;
+        double* slice = c->scratch_pool ? c->scratch_pool + off : NULL;
         int64_t actual = 0;
         if (c->has_nulls) {
             for (int64_t i = 0; i < cnt; i++) {
@@ -2178,8 +2179,7 @@ static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
             }
         }
         if (actual == 0) {
-            c->out_data[g] = NULL_F64;
-            ray_vec_set_null(c->out, g, true);
+            par_set_null(c->out, g);
         } else {
             c->out_data[g] = c->use_quantile
                 ? ray_quantile_dbl_inplace(slice, actual, c->q)
@@ -2203,8 +2203,8 @@ static ray_t* rank_per_group_buf(ray_t* src,
                                  bool use_quantile) {
     if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
     int8_t t = src->type;
-    if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 &&
-        t != RAY_I16 && t != RAY_U8 && t != RAY_DATE &&
+    if (t != RAY_F64 && t != RAY_F32 && t != RAY_I64 && t != RAY_I32 &&
+        t != RAY_I16 && t != RAY_U8 && t != RAY_BOOL && t != RAY_DATE &&
         t != RAY_TIME && t != RAY_TIMESTAMP) return NULL;
     if (use_quantile && (!__builtin_isfinite(q) || q < 0.0 || q > 1.0))
         return ray_error("domain", "quantile: probability out of range");
@@ -10333,7 +10333,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * produced and continue on the generic paths. */
     if (g->sg_col) {
         ray_t* sgr = exec_group_slices(g, op, tbl, group_limit);
-        if (sgr) { sg_hint_release(g); return sgr; }
+        if (sgr) { agg_route_record(AGG_ROUTE_SLICES); sg_hint_release(g); return sgr; }
         ray_t* err = sg_hint_to_selection(g, tbl);
         if (err) return err;
     }
@@ -10344,6 +10344,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (int64_t c = 0; c < nc; c++) {
             ray_t* col = ray_table_get_col_idx(tbl, c);
             if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+                agg_route_record(AGG_ROUTE_PARTED);
                 return exec_group_parted(g, op, tbl, group_limit);
             }
         }
@@ -10358,9 +10359,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * it down to the radix strategy's bounded emit and the caller trims the
      * result either way, so a positive limit stays on v2 rather than falling
      * back to the (slower, full-materialization) legacy ladder. */
-    if (ray_agg_engine_v2 && group_limit >= 0
-        && !ray_group_emit_filter_get().enabled
-        && agg_v2_can_handle(g, op, tbl))
+    agg_v2_reason_t admission = !ray_agg_engine_v2 ? AGG_V2_DISABLED
+        : group_limit < 0 ? AGG_V2_SHAPE
+        : ray_group_emit_filter_get().enabled ? AGG_V2_EMIT_FILTER
+        : agg_v2_admission(g, op, tbl);
+    agg_route_reason(admission);
+    if (admission == AGG_V2_ADMITTED)
         return exec_group_v2(g, op, tbl, group_limit);
 
     /* Emit-filter shape on a wide-domain SYM key: the sp dense/sparse
@@ -10428,6 +10432,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (r) return r;
     }
 
+    agg_route_record(AGG_ROUTE_LEGACY);
     int64_t nrows = ray_table_nrows(tbl);
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
