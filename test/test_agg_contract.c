@@ -6,6 +6,8 @@
 #include "ops/agg_engine.h"
 #include "ops/agg_registry.h"
 #include "core/pool.h"
+#include "ops/fused_pred.h"
+#include "ops/cdfuse.h"
 #include "lang/internal.h"
 #include <math.h>
 
@@ -158,15 +160,18 @@ static test_result_t test_registry_admission_contracts(void) {
         for (size_t a = 0; a < sizeof(operations)/sizeof(operations[0]); a++) {
             uint16_t op = operations[a];
             bool numeric = type == RAY_BOOL || type == RAY_U8 || type == RAY_I16 ||
-                type == RAY_I32 || type == RAY_I64 || type == RAY_F64;
+                type == RAY_I32 || type == RAY_I64 || type == RAY_F32 || type == RAY_F64;
             bool wide_numeric = type == RAY_I64 || type == RAY_F64;
             bool binary = agg_is_binary_agg(op);
             bool buffered = op == OP_MEDIAN || op == OP_TOP_N || op == OP_BOT_N;
+            bool temporal = type == RAY_DATE || type == RAY_TIME || type == RAY_TIMESTAMP;
             bool registered = op == OP_COUNT ||
-                ((op == OP_SUM || op == OP_MIN || op == OP_MAX ||
+                ((op == OP_MIN || op == OP_MAX || op == OP_AVG ||
                   op == OP_VAR || op == OP_VAR_POP || op == OP_STDDEV ||
-                  op == OP_STDDEV_POP || buffered) && wide_numeric) ||
-                (op == OP_AVG && type == RAY_F64) ||
+                  op == OP_STDDEV_POP) && (numeric || temporal)) ||
+                (op == OP_SUM && (numeric || type == RAY_TIME)) ||
+                (op == OP_PROD && numeric) ||
+                (buffered && wide_numeric) ||
                 ((op == OP_ALL || op == OP_ANY || binary) && numeric);
             const agg_vtable_t* vt = agg_resolve(op, type);
             TEST_ASSERT_FMT((vt != NULL) == registered, "registry %u/%s changed", op, ray_type_name(type));
@@ -176,7 +181,11 @@ static test_result_t test_registry_admission_contracts(void) {
             int64_t param[] = { op == OP_TOP_N || op == OP_BOT_N ? 2 : 0 };
             ray_op_t* group = ray_group_build(graph, keys, 1, &op, ins,
                                                binary ? ins : NULL, param, 1);
-            agg_v2_reason_t want = !registered ? AGG_V2_AGG_TYPE
+            bool indexed = ((op == OP_FIRST || op == OP_LAST) && (numeric || temporal || type == RAY_GUID || type == RAY_SYM || type == RAY_STR || type == RAY_LIST)) ||
+                ((op == OP_MIN || op == OP_MAX) && (type == RAY_GUID || type == RAY_SYM || type == RAY_STR)) ||
+                ((op == OP_MEDIAN || op == OP_QUANTILE) && (numeric || temporal)) ||
+                ((op == OP_MODE || op == OP_TOP_N || op == OP_BOT_N) && (numeric || temporal || type == RAY_GUID || type == RAY_SYM || type == RAY_STR));
+            agg_v2_reason_t want = indexed ? AGG_V2_ADMITTED : !registered ? AGG_V2_AGG_TYPE
                 : buffered ? AGG_V2_BUFFERED : AGG_V2_ADMITTED;
             TEST_ASSERT_FMT(agg_v2_admission(graph, group, tbl) == want,
                             "admission %u/%s differs", op, ray_type_name(type));
@@ -202,7 +211,7 @@ static test_result_t test_group_routes_and_bool_outputs(void) {
         { 32, 1, AGG_ROUTE_V2_SERIAL_HASH },
         { RAY_PARALLEL_THRESHOLD, 0, AGG_ROUTE_V2_DENSE },
         { RAY_PARALLEL_THRESHOLD, 1, AGG_ROUTE_V2_RADIX },
-        { RAY_PARALLEL_THRESHOLD, 2, AGG_ROUTE_V2_HASH },
+        { RAY_PARALLEL_THRESHOLD, 2, AGG_ROUTE_V2_DENSE },
         { RAY_PARALLEL_THRESHOLD, 3, AGG_ROUTE_V2_RADIX },
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
@@ -250,8 +259,23 @@ static test_result_t test_group_routes_and_bool_outputs(void) {
     ray_t* r = ray_eval_str("(select {from:(table [k v] (list [0 0 1 1] (as 'TIME [1 2 3 4]))) by:k s:(min v)})");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     agg_route_stats_t stats = agg_route_stats();
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 1);
-    TEST_ASSERT_EQ_I(stats.last_v2_reason, AGG_V2_AGG_TYPE);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_SERIAL_DENSE], 1);
+    TEST_ASSERT_EQ_I(stats.last_v2_reason, AGG_V2_ADMITTED);
+    /* A dense allocation can fit while repeated worker ranges make its
+     * update/merge traffic more expensive than radix scatter. */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str("(set traffic_i (til 1000000)) (set traffic_g (% (* traffic_i 17) 80000)) (set traffic_t (table [k v] (list (as 'I32 (+ (* traffic_g 2) (div traffic_g 4))) (as 'TIME traffic_g))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    r = ray_eval_str("(select {from:traffic_t by:k s:(min v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    stats = agg_route_stats();
+    TEST_ASSERT_TRUE(stats.dense_plan_available);
+    TEST_ASSERT_TRUE(stats.dense_worker_budget);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 1);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 80000);
+    ray_release(r);
     PASS();
 }
 
@@ -343,11 +367,218 @@ static test_result_t test_pairwise_numeric_contracts(void) {
     PASS();
 }
 
+static test_result_t test_nullable_differential(void) {
+    const char* types[] = {"I16", "I32", "I64", "F32", "F64", "DATE", "TIME", "TIMESTAMP", "SYM", "STR"};
+    const char* operations[] = {"sum v", "min v", "max v", "avg v", "var v", "var_pop v", "stddev v", "stddev_pop v", "prod v", "first v", "last v", "med v", "mode v", "quantile v 0.25", "top v 2", "bot v 2"};
+    for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
+        char source[512];
+        if (t < 8) {
+            const int8_t ts[] = { RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64, RAY_DATE, RAY_TIME, RAY_TIMESTAMP };
+            ray_t* v = ray_vec_new(ts[t], 6); v->len = 6;
+            const int vals[] = {0, 7, 0, 0, 9, 3};
+            for (int i = 0; i < 6; i++) {
+                if (ts[t] == RAY_F32) ((float*)ray_data(v))[i] = vals[i];
+                else if (ts[t] == RAY_F64) ((double*)ray_data(v))[i] = vals[i];
+                else if (ts[t] == RAY_I16) ((int16_t*)ray_data(v))[i] = vals[i];
+                else if (ts[t] == RAY_I64 || ts[t] == RAY_TIMESTAMP) ((int64_t*)ray_data(v))[i] = vals[i];
+                else ((int32_t*)ray_data(v))[i] = vals[i];
+            }
+            ray_vec_set_null(v, 0, true); ray_vec_set_null(v, 2, true); ray_vec_set_null(v, 3, true);
+            ray_env_set(ray_sym_intern("v", 1), v); ray_release(v);
+            snprintf(source, sizeof(source), "(set t (table [k v] (list [0 0 1 1 2 2] v)))");
+        } else snprintf(source, sizeof(source), "(set t (table [k v] (list [0 0 1 1 2 2] (as '%s [\"\" \"b\" \"\" \"\" \"z\" \"a\"]))))", types[t]);
+        ray_t* init = ray_eval_str(source);
+        TEST_ASSERT_FMT(init && !RAY_IS_ERR(init), "fixture %s", types[t]); ray_release(init);
+        for (size_t a = 0; a < sizeof(operations)/sizeof(operations[0]); a++) {
+            snprintf(source, sizeof(source), "(at (select {from:t by:k asc:k s:(%s)}) 's)", operations[a]);
+            ray_agg_engine_v2 = false; ray_t* old = ray_eval_str(source);
+            ray_agg_engine_v2 = true; ray_t* got = ray_eval_str(source);
+            bool oe = old && RAY_IS_ERR(old), ge = got && RAY_IS_ERR(got);
+            TEST_ASSERT_FMT(oe == ge, "%s/%s error parity", types[t], operations[a]);
+            if (oe) { ray_error_free(old); ray_error_free(got); continue; }
+            TEST_ASSERT_FMT(old && got && old->type == got->type && old->len == got->len,
+                            "%s/%s output shape", types[t], operations[a]);
+            ray_t* os = ray_fmt(old, 0); ray_t* gs = ray_fmt(got, 0);
+            const char* of = ray_str_ptr(os); const char* gf = ray_str_ptr(gs);
+            bool same = of && gf && strcmp(of, gf) == 0;
+            TEST_ASSERT_FMT(same, "%s/%s: old %s, new %s", types[t], operations[a], of, gf);
+            ray_release(os); ray_release(gs); ray_release(old); ray_release(got);
+        }
+    }
+    PASS();
+}
+
+static test_result_t test_wide_key_routes(void) {
+    const int8_t types[] = {RAY_F32, RAY_F64, RAY_GUID, RAY_STR, RAY_LIST};
+    for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
+        ray_t* k;
+        if (types[t] == RAY_STR) k = ray_eval_str("[\"long pooled duplicate value\" \"long pooled duplicate value\" \"a\" \"a\" \"\" \"\"]");
+        else if (types[t] == RAY_LIST) k = ray_eval_str("(list ['a 'b] ['a 'b] [\"long pooled string value\" \"x\"] [\"long pooled string value\" \"x\"] [1 2] [1 2])");
+        else {
+            k = ray_vec_new(types[t], 6); k->len = 6;
+            if (types[t] == RAY_GUID) {
+                memset(ray_data(k), 0, 6 * 16);
+                for (int i = 0; i < 4; i++) ((uint8_t*)ray_data(k))[i * 16] = (uint8_t)(i / 2 + 1);
+            } else for (int i = 0; i < 6; i++) {
+                double v = i < 2 ? (i ? -0.0 : 0.0) : i < 4 ? 1 : NAN;
+                if (types[t] == RAY_F32) ((float*)ray_data(k))[i] = (float)v;
+                else ((double*)ray_data(k))[i] = v;
+            }
+            ray_vec_set_null(k, 4, true);
+        }
+        TEST_ASSERT_NOT_NULL(k); TEST_ASSERT_FALSE(RAY_IS_ERR(k));
+        if (types[t] == RAY_F32 || types[t] == RAY_F64) {
+            k->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+            if (types[t] == RAY_F32) {
+                uint32_t bits[] = { UINT32_C(0x7fc00001), UINT32_C(0x7fc00002) };
+                memcpy((float*)ray_data(k) + 4, bits, sizeof(bits));
+            } else {
+                uint64_t bits[] = { UINT64_C(0x7ff8000000000001), UINT64_C(0x7ff8000000000002) };
+                memcpy((double*)ray_data(k) + 4, bits, sizeof(bits));
+            }
+            agg_groups_t groups = {0}; ray_t* one_key[] = {k};
+            TEST_ASSERT_EQ_I(agg_group_keys(one_key, 1, 6, &groups), 0);
+            TEST_ASSERT_EQ_I(groups.ngroups, 4); /* unflagged payloads stay distinct */
+            agg_groups_free(&groups);
+            k->attrs |= RAY_ATTR_HAS_NULLS; /* flagged NaNs merge as null below */
+        }
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), k); ray_release(k);
+        ray_graph_t* graph = ray_graph_new(tbl);
+        ray_op_t* keys[] = {ray_scan(graph, "k")};
+        uint16_t op = OP_COUNT;
+        ray_op_t* group = ray_group(graph, keys, 1, &op, keys, 1);
+        agg_route_reset();
+        ray_t* out = ray_execute(graph, group);
+        TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "key type %s failed", ray_type_name(types[t]));
+        TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_INDEXED], 1);
+        TEST_ASSERT_EQ_I(ray_table_nrows(out), 3);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(out, 0)->type, types[t]);
+        ray_t* counts = ray_table_get_col_idx(out, 1);
+        for (int i = 0; i < 3; i++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[i], 2);
+        ray_release(out); ray_graph_free(graph); ray_release(tbl);
+    }
+    agg_route_reset();
+    ray_t* large = ray_eval_str("(select {from:(table [k] (list (take [\"a\" \"b\"] 65536))) by:k n:(count k)})");
+    TEST_ASSERT_NOT_NULL(large); TEST_ASSERT_FALSE(RAY_IS_ERR(large));
+    TEST_ASSERT_EQ_I(agg_route_stats().last_v2_reason, AGG_V2_PARALLEL_WIDE);
+    TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_LEGACY], 1);
+    TEST_ASSERT_EQ_I(ray_table_nrows(large), 2);
+    ray_release(large);
+    agg_route_reset();
+    large = ray_eval_str("(select {from:(table [k j] (list (take [\"a\" \"b\"] 65536) (map (fn [x] (list (% x 2))) (til 65536)))) by:[k j] n:(count k)})");
+    TEST_ASSERT_NOT_NULL(large); TEST_ASSERT_FALSE(RAY_IS_ERR(large));
+    TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_INDEXED], 1);
+    TEST_ASSERT_EQ_I(ray_table_nrows(large), 2);
+    ray_release(large);
+    agg_route_reset();
+    ray_t* out = ray_eval_str("(select {from:(table [k a b] (list [0 0 1 1] (as 'TIME [1 2 3 4]) (as 'TIME [5 7 10 12]))) by:k s:(sum (- b a))})");
+    TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_SERIAL_DENSE], 1);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(out, 1)->type, RAY_TIME);
+    ray_release(out);
+    PASS();
+}
+
+static test_result_t test_fused_typed_comparisons(void) {
+    const int8_t types[] = {RAY_I64, RAY_F32, RAY_F64, RAY_TIME, RAY_GUID, RAY_STR};
+    ray_op_t* (*ctors[])(ray_graph_t*, ray_op_t*, ray_op_t*) = {ray_eq, ray_ne, ray_lt, ray_le, ray_gt, ray_ge};
+    ray_t* (*fns[])(ray_t*, ray_t*) = {ray_eq_fn, ray_neq_fn, ray_lt_fn, ray_lte_fn, ray_gt_fn, ray_gte_fn};
+    for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
+        ray_t* col = contract_fixture(types[t]);
+        ray_vec_set_null(col, 0, true);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), col);
+        for (int c = 0; c < 2; c++) {
+            int allocated = 0;
+            ray_t* constant = collection_elem(col, c, &allocated);
+            for (int op = 0; op < 6; op++) {
+                ray_graph_t* graph = ray_graph_new(tbl);
+                ray_op_t* lhs = ray_scan(graph, "v");
+                uint32_t id = lhs->id;
+                ray_op_t* rhs = ray_const_atom(graph, constant);
+                ray_op_t* predicate = ctors[op](graph, &graph->nodes[id], rhs);
+                fp_pred_t compiled = {0};
+                TEST_ASSERT_FMT(fp_compile_pred(graph, predicate, tbl, &compiled) == 0,
+                                "fused %s comparison %d declined", ray_type_name(types[t]), op);
+                uint8_t bits[4]; fp_eval_pred(&compiled, 0, 4, bits);
+                for (int r = 0; r < 4; r++) {
+                    int al = 0; ray_t* cell = collection_elem(col, r, &al);
+                    ray_t* expected = fns[op](cell, constant);
+                    TEST_ASSERT_FMT(expected && !RAY_IS_ERR(expected), "comparison oracle failed");
+                    TEST_ASSERT_FMT(bits[r] == expected->b8, "%s op %d row %d null constant %d", ray_type_name(types[t]), op, r, c == 0);
+                    ray_release(expected); if (al) ray_release(cell);
+                }
+                fp_pred_cleanup(&compiled); ray_graph_free(graph);
+            }
+            if (allocated) ray_release(constant);
+        }
+        ray_release(col); ray_release(tbl);
+    }
+    PASS();
+}
+
+static test_result_t test_count_distinct_typed_routes(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    const int8_t types[] = { RAY_BOOL, RAY_U8, RAY_I32, RAY_TIME, RAY_TIMESTAMP, RAY_SYM, RAY_F32, RAY_F64 };
+    const int64_t n = 262144;
+    for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
+        int8_t type = types[t];
+        ray_t* k = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, n) : ray_vec_new(type, n);
+        ray_t* v = ray_vec_new(RAY_F32, n); k->len = v->len = n;
+        int64_t sym = ray_sym_intern("typed_cdf", 9);
+        for (int64_t i = 0; i < n; i++) {
+            int64_t key = i % 2;
+            if (type == RAY_BOOL || type == RAY_U8) ((uint8_t*)ray_data(k))[i] = (uint8_t)key;
+            else if (type == RAY_I32 || type == RAY_TIME) ((int32_t*)ray_data(k))[i] = key ? 1 : NULL_I32;
+            else if (type == RAY_TIMESTAMP) ((int64_t*)ray_data(k))[i] = key ? 1 : NULL_I64;
+            else if (type == RAY_SYM) ((int64_t*)ray_data(k))[i] = key ? sym : 0;
+            else if (type == RAY_F32) ((float*)ray_data(k))[i] = key ? 1 : NAN;
+            else ((double*)ray_data(k))[i] = key ? 1 : NAN;
+            int value = (int)((i / 2) % 3);
+            ((float*)ray_data(v))[i] = value ? (float)value : NAN;
+        }
+        if (type != RAY_BOOL && type != RAY_U8) k->attrs |= RAY_ATTR_HAS_NULLS;
+        v->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* result = ray_cd_fused(k, v, n);
+        TEST_ASSERT_FMT(result && !RAY_IS_ERR(result), "count-distinct route %s declined", ray_type_name(type));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 2);
+        ray_t* counts = ray_table_get_col_idx(result, 1);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 3);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 3);
+        ray_release(result); ray_release(k); ray_release(v);
+    }
+    PASS();
+}
+
+static test_result_t test_cancelled_group(void) {
+    ray_t* tbl = ray_eval_str("(table [k v] (list [0 0 1 1] (as 'TIME [1 2 3 4])))");
+    TEST_ASSERT_NOT_NULL(tbl); TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    ray_graph_t* graph = ray_graph_new(tbl);
+    ray_op_t* keys[] = {ray_scan(graph, "k")};
+    ray_op_t* values[] = {ray_scan(graph, "v")};
+    uint16_t kind = OP_MIN;
+    ray_op_t* group = ray_group(graph, keys, 1, &kind, values, 1);
+    ray_pool_t* pool = ray_pool_get();
+    atomic_store_explicit(&pool->cancelled, 1, memory_order_relaxed);
+    ray_t* out = exec_group_v2(graph, group, tbl, 0);
+    atomic_store_explicit(&pool->cancelled, 0, memory_order_relaxed);
+    TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    TEST_ASSERT_STR_EQ(ray_err_code(out), "cancel");
+    ray_error_free(out); ray_graph_free(graph); ray_release(tbl);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
+    { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
+    { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },
+    { "agg_contract/fused_typed_comparisons", test_fused_typed_comparisons, contract_setup, contract_teardown },
+    { "agg_contract/count_distinct_typed_routes", test_count_distinct_typed_routes, contract_setup, contract_teardown },
+    { "agg_contract/cancelled_group", test_cancelled_group, contract_setup, contract_teardown },
     { NULL, NULL, NULL, NULL },
 };
