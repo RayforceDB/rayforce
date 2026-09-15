@@ -1333,6 +1333,172 @@ static test_result_t test_parallel_selected_composite(void) {
     PASS();
 }
 
+static test_result_t test_parallel_native_gather(void) {
+    const int8_t types[] = {RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64,
+        RAY_F32, RAY_F64, RAY_DATE, RAY_TIME, RAY_TIMESTAMP, RAY_GUID, RAY_SYM};
+    const uint8_t widths[] = {RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64};
+    const int64_t n = 131072;
+    int64_t* rows = ray_alloc_raw((size_t)n * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(rows);
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int8_t type = types[t];
+        bool nullable = type != RAY_BOOL && type != RAY_U8;
+        for (unsigned w = 0; w < (type == RAY_SYM ? 4u : 1u); w++) {
+            ray_t* source = type == RAY_SYM ? ray_sym_vec_new(widths[w], 4) : contract_fixture(type);
+            TEST_ASSERT_NOT_NULL(source); TEST_ASSERT_FALSE(RAY_IS_ERR(source));
+            if (type == RAY_SYM) {
+                source->len = 4;
+                for (int64_t i = 0; i < 4; i++) ray_write_sym(ray_data(source), i, i + 1, type, source->attrs);
+            }
+            if (nullable) ray_vec_set_null(source, 2, true);
+            ray_t* view = ray_vec_slice(source, 1, 3);
+            TEST_ASSERT_NOT_NULL(view); TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+            /* Null metadata inherited from a sliced parent must survive. */
+            view->attrs &= ~RAY_ATTR_HAS_NULLS;
+            for (int64_t i = 0; i < n; i++) rows[i] = nullable && i % 7 == 0 ? -1 : i * 17 % 3;
+            ray_t* out = ray_group_gather(view, rows, n);
+            TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+            TEST_ASSERT_EQ_I(out->type, type); TEST_ASSERT_EQ_I(out->len, n);
+            size_t width = col_esz(view);
+            if (type == RAY_SYM) {
+                TEST_ASSERT_EQ_I(out->attrs & RAY_SYM_W_MASK, widths[w]);
+                TEST_ASSERT_TRUE(ray_sym_vec_domain(out) == ray_sym_vec_domain(source));
+            }
+            for (int64_t i = 0; i < n; i++) {
+                bool missing = rows[i] < 0 || (nullable && rows[i] == 1);
+                TEST_ASSERT_FMT(ray_vec_is_null(out, i) == missing,
+                    "gather %s width=%zu output=%lld source=%lld: null mismatch",
+                    ray_type_name(type), width, (long long)i, (long long)rows[i]);
+                if (rows[i] >= 0)
+                    TEST_ASSERT_TRUE(memcmp((char*)ray_data(out) + (size_t)i * width,
+                        (char*)ray_data(source) + (size_t)(rows[i] + 1) * width, width) == 0);
+            }
+            ray_t* empty = ray_group_gather(view, NULL, 0);
+            TEST_ASSERT_NOT_NULL(empty); TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+            TEST_ASSERT_EQ_I(empty->type, type); TEST_ASSERT_EQ_I(empty->len, 0);
+            ray_release(empty); ray_release(out); ray_release(view); ray_release(source);
+        }
+    }
+    ray_free_raw(rows);
+    PASS();
+}
+
+static bool contract_same_cell(ray_t* out, int64_t at, ray_t* src, int64_t row) {
+    if (row < 0) return src->type == RAY_BOOL || src->type == RAY_U8
+        ? ((uint8_t*)ray_data(out))[at] == 0 : ray_vec_is_null(out, at);
+    if (src->type == RAY_STR) {
+        size_t na = 0, nb = 0;
+        const char* a = ray_str_vec_get(out, at, &na);
+        const char* b = ray_str_vec_get(src, row, &nb);
+        return na == nb && (!na || memcmp(a, b, na) == 0);
+    }
+    size_t width = col_esz(src);
+    return memcmp((char*)ray_data(out) + (size_t)at * width,
+                  (char*)ray_data(src) + (size_t)row * width, width) == 0;
+}
+static test_result_t test_parallel_dominant_consumers(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(3), RAY_OK);
+    const int64_t n = 524288, counts[] = {262144, 262144, 17, 0};
+    const int64_t offsets[] = {0, 262144, n, n + 17};
+    const int8_t types[] = {RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64,
+        RAY_F32, RAY_F64, RAY_DATE, RAY_TIME, RAY_TIMESTAMP, RAY_GUID, RAY_SYM, RAY_STR};
+    int64_t* rows = ray_alloc_raw((size_t)(n + 17) * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(rows);
+    /* Deliberately not source-row order: tie priority follows index order. */
+    for (int64_t i = 0; i < n + 17; i++) rows[i] = i < n / 2 ? (i % 2 ? 1 : 3) : i < n ? 2 : 0;
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int8_t type = types[t];
+        bool nullable = type != RAY_BOOL && type != RAY_U8;
+        ray_t* src = contract_fixture(type);
+        TEST_ASSERT_NOT_NULL(src); TEST_ASSERT_FALSE(RAY_IS_ERR(src));
+        if (type == RAY_GUID) {
+            memset(ray_data(src), 0, 64);
+            for (int i = 0; i < 4; i++) ((uint8_t*)ray_data(src))[16 * i] = i + 1;
+        }
+        if (nullable) ray_vec_set_null(src, 2, true);
+        if (type == RAY_I64 || type == RAY_F64) {
+            const int64_t tiny_rows[] = {3, 2, 1, 0}, off = 0, count = 4;
+            for (int desc = 0; desc < 2; desc++) {
+                ray_t* tiny = ray_topk_per_group_buf(src, 10, desc, tiny_rows, &off, &count, 1);
+                TEST_ASSERT_NOT_NULL(tiny); TEST_ASSERT_FALSE(RAY_IS_ERR(tiny));
+                ray_t* cell = ray_list_get(tiny, 0);
+                const int64_t expected_rows[] = {0, 1, 3};
+                TEST_ASSERT_EQ_I(cell->len, 3);
+                for (int i = 0; i < 3; i++)
+                    TEST_ASSERT_TRUE(contract_same_cell(cell, i, src, expected_rows[desc ? 2 - i : i]));
+                ray_release(tiny);
+            }
+        }
+        int64_t expected[] = {3, nullable && type != RAY_STR ? -1 : 2, 0, -1};
+        ray_t* mode = ray_mode_per_group_buf(src, rows, offsets, counts, 4);
+        TEST_ASSERT_NOT_NULL(mode); TEST_ASSERT_FALSE(RAY_IS_ERR(mode));
+        TEST_ASSERT_EQ_I(mode->type, type); TEST_ASSERT_EQ_I(mode->len, 4);
+        for (int g = 0; g < 4; g++)
+            TEST_ASSERT_FMT(contract_same_cell(mode, g, src, expected[g]),
+                "dominant mode %s group %d", ray_type_name(type), g);
+        ray_release(mode);
+        const int64_t ks[] = {3, 10000, 300000};
+        for (int ki = 0; ki < 3; ki++) for (int desc = 0; desc < 2; desc++) {
+            ray_t* top = ray_topk_per_group_buf(src, ks[ki], desc, rows, offsets, counts, 4);
+            TEST_ASSERT_NOT_NULL(top); TEST_ASSERT_FALSE(RAY_IS_ERR(top));
+            for (int g = 0; g < 4; g++) {
+                ray_t* cell = ray_list_get(top, g);
+                TEST_ASSERT_NOT_NULL(cell); TEST_ASSERT_EQ_I(cell->type, type);
+                int64_t length = g == 3 || (g == 1 && nullable) ? 0 : counts[g] < ks[ki] ? counts[g] : ks[ki];
+                TEST_ASSERT_EQ_I(cell->len, length);
+                for (int64_t j = 0; j < length; j++)
+                    TEST_ASSERT_FMT(contract_same_cell(cell, j, src, g == 0 ? ((desc == (j < counts[g] / 2)) ? 3 : 1) : g == 1 ? 2 : 0),
+                        "dominant top/bot %s group %d k=%lld desc=%d row=%lld", ray_type_name(type), g, (long long)ks[ki], desc, (long long)j);
+            }
+            ray_release(top);
+        }
+        if (type == RAY_GUID || type == RAY_STR) {
+            const uint16_t ops[] = {OP_MIN, OP_MAX, OP_FIRST, OP_LAST};
+            const int64_t first_group[] = {1, 3, 3, 1};
+            for (int op = 0; op < 4; op++) {
+                ray_t* out = ray_wide_minmax_per_group_buf(src, ops[op], rows, offsets, counts, 4);
+                TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+                for (int g = 0; g < 4; g++)
+                    TEST_ASSERT_TRUE(contract_same_cell(out, g, src, g == 0 ? first_group[op] : g == 2 ? 0 : -1));
+                ray_release(out);
+            }
+        }
+        ray_release(src);
+    }
+    /* Many values force local collisions and exact partition merging. All
+     * frequencies tie, so the first position must beat the smallest row id. */
+    ray_t* values = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(values); values->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(values))[i] = i % 4096;
+        rows[i] = n - 1 - i;
+    }
+    const int64_t zero = 0;
+    ray_t* mode = ray_mode_per_group_buf(values, rows, &zero, &n, 1);
+    TEST_ASSERT_NOT_NULL(mode); TEST_ASSERT_FALSE(RAY_IS_ERR(mode));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(mode))[0], 4095);
+    ray_release(mode);
+    const int64_t uneven = n - 3, large_k = 100003;
+    int64_t histogram[4096] = {0};
+    for (int64_t i = 0; i < uneven; i++) histogram[rows[i] % 4096]++;
+    for (int desc = 0; desc < 2; desc++) {
+        ray_t* result = ray_topk_per_group_buf(values, large_k, desc, rows, &zero, &uneven, 1);
+        TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* cell = ray_list_get(result, 0);
+        TEST_ASSERT_EQ_I(cell->len, large_k);
+        int64_t at = 0;
+        for (int c = 0; c < 4096 && at < large_k; c++) {
+            int value = desc ? 4095 - c : c;
+            for (int64_t j = 0; j < histogram[value] && at < large_k; j++)
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(cell))[at++], value);
+        }
+        TEST_ASSERT_EQ_I(at, large_k);
+        ray_release(result);
+    }
+    ray_release(values); ray_free_raw(rows);
+    PASS();
+}
+
 static test_result_t test_cancelled_group(void) {
     ray_t* tbl = ray_eval_str("(table [k v] (list [0 0 1 1] (as 'TIME [1 2 3 4])))");
     TEST_ASSERT_NOT_NULL(tbl); TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
@@ -1371,6 +1537,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/parallel_rank_dominant", test_parallel_rank_dominant, contract_setup, contract_teardown },
     { "agg_contract/parallel_float_oracle", test_parallel_float_oracle, contract_setup, contract_teardown },
     { "agg_contract/parallel_selected_composite", test_parallel_selected_composite, contract_setup, contract_teardown },
+    { "agg_contract/parallel_native_gather", test_parallel_native_gather, contract_setup, contract_teardown },
+    { "agg_contract/parallel_dominant_consumers", test_parallel_dominant_consumers, contract_setup, contract_teardown },
     { "agg_contract/cancelled_group", test_cancelled_group, contract_setup, contract_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -1755,6 +1755,12 @@ static inline int64_t canon_f64_key(double v) {
 /* Dispatch contiguous group slices by their row counts. */
 void ray_group_dispatch(ray_pool_fn fn, void* context, const int64_t* counts, int64_t groups);
 
+/* Associative winner reductions over stable source-row slices. The callback
+ * also merges two non-null partial winners, in original slice order. */
+typedef int64_t (*ray_group_winner_fn)(void* context, const int64_t* rows, int64_t count);
+void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* rows,
+    const int64_t* offsets, const int64_t* counts, int64_t groups, int64_t* winners);
+
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
 

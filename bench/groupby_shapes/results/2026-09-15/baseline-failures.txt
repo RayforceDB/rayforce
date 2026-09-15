@@ -14,3 +14,11 @@ error: type: vec_new: type must be a positive concrete vector type, got LIST
 
 mixed-distinct-list-keys:
 error: type: vec_new: type must be a positive concrete vector type, got LIST
+
+Direct indexed top/bottom-K kernel, nullable I64, K at group size:
+Build topk_consumer.c against the baseline static library, then run:
+RAYFORCE_CORES=1 /path/to/baseline-topk-consumer 10000 10000
+Result: top/bottom K differs from histogram oracle
+The native serial heap was not heapified when nulls left fewer than K values.
+No baseline speedup is reported for this failing shape; candidate worker runs
+are checked against the histogram oracle.

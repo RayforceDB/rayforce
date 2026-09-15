@@ -92,6 +92,18 @@ for kind in ("string", "guid", "list"):
 CASES["mixed-distinct-string-values"] = (
     CASES["wide-extrema"][0], "s:(count (distinct text)) total:(sum v)", "k", "")
 
+# A single large group must share work across workers too.
+for family in ("first-last", "symbol-extrema", "wide-extrema", "mode",
+               "wide-mode", "top-bottom", "wide-top-bottom", "symbol-top-bottom"):
+    prep, fields, keys, selection = CASES[family]
+    prep += "\n(set t (update {from:t k:(as 'I32 0)}))"
+    if family == "first-last":
+        prep += "\n(set t (update {from:t v:0N}))"
+    CASES[f"hot-{family}"] = (prep, fields, keys, selection)
+
+CASES["hot-max-k"] = ("(set t (update {from:t k:(as 'I32 0)}))",
+    "s:(top v 1024) b:(bot v 1024)", "k", "")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)

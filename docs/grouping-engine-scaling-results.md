@@ -17,10 +17,11 @@ oracles cover ordering, nulls, rank and distinct semantics.
 
 ## Correctness
 
-- Complete ASan/UBSan suite: **3,822/3,822 passed**.
-- Targeted TSan: **5/5 passed**, four workers, `setarch x86_64 -R`, no suppressions.
+- Complete ASan/UBSan suite: **3,824/3,824 passed**.
+- Targeted TSan: **6/6 passed**, three/four workers, `setarch x86_64 -R`, no suppressions.
 - Coverage includes native widths, source symbol domains, structural LIST keys,
-  stable row indices, dominant-group exact `med`/quantile and typed empty output.
+  stable row indices, dominant-group exact `med`/quantile, frequency ties,
+  parallel top/bottom-K merges, adaptive symbol slices and typed empty output.
 
 Four synthetic cases fail in the baseline: STR-valued count-distinct and its
 mixed form crash; LIST-key count-distinct and its mixed form raise a type error.

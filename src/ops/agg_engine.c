@@ -198,8 +198,8 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 /* ── Dense grouping eligibility selector (mirrors group.c DA path) ────────
  * Decides whether the key tuple packs into a bounded direct-index slot space
  * (gid = sum_k (key_k - min_k)*strides[k]) so grouping can skip hashing.
- * Eligible iff: 1..16 keys, every key is an integer/temporal/SYM type with no
- * nulls, and the product of per-key ranges is no larger than the input row
+ * Eligible iff: 1..16 integer/temporal/SYM keys, including reserved null slots,
+ * and the product of per-key ranges is no larger than the input row
  * count (computed overflow-safely). Performs one min/max prescan per key column.
  * Aggregates may be ACC_STREAMING or ACC_BUFFERED (median/top-k): the dense
  * serial driver carries the per-group destroy lifecycle for buffered state. */
@@ -434,6 +434,40 @@ int64_t agg_result_col_name(int64_t in_sym, uint16_t agg_op) {
     return in_sym;
 }
 
+typedef struct {
+    const char* source;
+    char* output;
+    const int64_t* rows;
+    size_t width;
+    char null_value[16];
+    _Atomic(bool) any_null;
+} agg_gather_native_t;
+
+static void agg_gather_native_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; agg_gather_native_t* c = raw;
+    bool any_null = false;
+    /* Constant byte widths let the compiler emit direct loads/stores. Workers
+     * own disjoint payload slots and never mutate the output object header. */
+    #define GATHER_NATIVE(WIDTH) \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = c->rows[i]; \
+            if (row < 0) { \
+                memcpy(c->output + (size_t)i * (WIDTH), c->null_value, (WIDTH)); \
+                any_null = true; \
+            } else memcpy(c->output + (size_t)i * (WIDTH), \
+                          c->source + (size_t)row * (WIDTH), (WIDTH)); \
+        }
+    switch (c->width) {
+        case 1: GATHER_NATIVE(1); break;
+        case 2: GATHER_NATIVE(2); break;
+        case 4: GATHER_NATIVE(4); break;
+        case 8: GATHER_NATIVE(8); break;
+        case 16: GATHER_NATIVE(16); break;
+    }
+    #undef GATHER_NATIVE
+    if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
+}
+
 /* Build a result key column of src_col's type by gathering the first-row cell
  * of each group at native (type-exact) byte width.  For SYM, adopts the source
  * domain so the intern ids resolve correctly.  Caller owns the returned column. */
@@ -465,14 +499,27 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
     if (out->type == RAY_SYM)
         ray_sym_vec_adopt_domain(out, sym_domain_rep(src_col));
     out->len = n;
-    size_t esz = col_esz(src_col);
-    const char* src = (const char*)ray_data(src_col);
-    char* dst = (char*)ray_data(out);
-    for (int64_t gi = 0; gi < n; gi++) {
-        if (first_row[gi] < 0) { ray_vec_set_null(out, gi, true); continue; }
-        memcpy(dst + (size_t)gi * esz, src + (size_t)first_row[gi] * esz, esz);
+    agg_gather_native_t c = {.source = ray_data(src_col), .output = ray_data(out),
+        .rows = first_row, .width = col_esz(src_col)};
+    #define GATHER_NULL(TYPE, VALUE) do { TYPE value = (VALUE); memcpy(c.null_value, &value, sizeof(value)); } while (0)
+    switch (src_col->type) {
+        case RAY_F64: GATHER_NULL(double, NULL_F64); break;
+        case RAY_F32: GATHER_NULL(float, NULL_F32); break;
+        case RAY_I64: case RAY_TIMESTAMP: GATHER_NULL(int64_t, NULL_I64); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: GATHER_NULL(int32_t, NULL_I32); break;
+        case RAY_I16: GATHER_NULL(int16_t, NULL_I16); break;
+        default: break; /* SYM/GUID use zero payloads; BOOL/U8 have no null. */
     }
-    if (ray_vec_may_have_nulls(src_col)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    #undef GATHER_NULL
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, agg_gather_native_run, &c, n);
+    else agg_gather_native_run(&c, 0, 0, n);
+    if (agg_cancelled()) { ray_release(out); return ray_error("cancel", NULL); }
+    if (ray_vec_may_have_nulls(src_col) ||
+            (atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
+             src_col->type != RAY_BOOL && src_col->type != RAY_U8))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
 }
 
@@ -3658,30 +3705,24 @@ done:
 typedef struct {
     ray_t* src;
     uint16_t kind;
-    const int64_t* rows;
-    const int64_t* offsets;
-    int64_t* winners;
     ray_group_sym_view_t symbols;
 } agg_index_winners_t;
-static void agg_index_winners(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; agg_index_winners_t* c = raw;
+static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
+    agg_index_winners_t* c = raw;
     const void* data = ray_data(c->src);
-    for (int64_t gi = start; gi < end; gi++) {
-        int64_t best = -1;
-        int64_t count = c->offsets[gi + 1] - c->offsets[gi];
-        for (int64_t j = 0; j < count; j++) {
-            int64_t pos = c->kind == OP_LAST ? c->offsets[gi + 1] - 1 - j : c->offsets[gi] + j;
-            int64_t r = c->rows[pos];
-            if (ray_vec_is_null(c->src, r)) continue;
-            if (best < 0) best = r;
-            if (c->kind == OP_FIRST || c->kind == OP_LAST) break;
-            ray_t* x = ray_group_sym_read(&c->symbols, ray_sym_vec_domain(c->src), ray_read_sym(data, r, c->src->type, c->src->attrs));
-            ray_t* y = ray_group_sym_read(&c->symbols, ray_sym_vec_domain(c->src), ray_read_sym(data, best, c->src->type, c->src->attrs));
-            int cmp = ray_str_cmp(x, y);
-            if (c->kind == OP_MIN ? cmp < 0 : cmp > 0) best = r;
-        }
-        c->winners[gi] = best;
+    int64_t best = -1;
+    for (int64_t j = 0; j < count; j++) {
+        if ((j & 65535) == 0 && ray_interrupted()) return -1;
+        int64_t r = rows[c->kind == OP_LAST ? count - 1 - j : j];
+        if (ray_vec_is_null(c->src, r)) continue;
+        if (best < 0) best = r;
+        if (c->kind == OP_FIRST || c->kind == OP_LAST) break;
+        ray_t* x = ray_group_sym_read(&c->symbols, ray_sym_vec_domain(c->src), ray_read_sym(data, r, c->src->type, c->src->attrs));
+        ray_t* y = ray_group_sym_read(&c->symbols, ray_sym_vec_domain(c->src), ray_read_sym(data, best, c->src->type, c->src->attrs));
+        int cmp = ray_str_cmp(x, y);
+        if (c->kind == OP_MIN ? cmp < 0 : cmp > 0) best = r;
     }
+    return best;
 }
 
 typedef struct {
@@ -3755,7 +3796,7 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.dense_plan_available = dense;
     int rc = dense ? agg_group_keys_dense(keys, nrows, &dp, &groups)
                    : agg_group_keys(keys, ext->n_keys, nrows, &groups);
-    if (rc) return ray_error("oom", NULL);
+    if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     if (agg_cancelled()) { agg_groups_free(&groups); return ray_error("cancel", NULL); }
     int64_t ng = groups.ngroups;
     int64_t* counts = ray_calloc_raw((size_t)(ng + 1) * sizeof(int64_t));
@@ -3786,6 +3827,7 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         result = ray_table_add_col(result, key_syms[k], col); ray_release(col);
         if (!result || RAY_IS_ERR(result)) goto done;
     }
+    ray_profile_tick("indexed: emitted keys");
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
         uint16_t kind = ext->agg_ops[a];
@@ -3806,11 +3848,12 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 /* Native first/last and lexical SYM extrema retain the source
                  * column's domain by gathering winning original row indices. */
                 int64_t* winners = cursor;
-                agg_index_winners_t work = {src, kind, rows, offsets, winners, {0}};
+                agg_index_winners_t work = {src, kind, {0}};
                 if (src->type == RAY_SYM)
                     ray_sym_strings_borrow(&work.symbols.strings, &work.symbols.count);
-                ray_group_dispatch(agg_index_winners, &work, counts, ng);
+                ray_group_winners(agg_index_winner, &work, rows, offsets, counts, ng, winners);
                 if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
+                ray_profile_tick("indexed: selected winning rows");
                 col = ray_group_gather(src, winners, ng);
                 /* F32 reduction results follow the existing F64 contract. */
                 if (col && !RAY_IS_ERR(col) && src->type == RAY_F32) {
@@ -3833,6 +3876,7 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         } else col = agg_index_streaming(agg_resolve(kind, src ? src->type : RAY_I64),
                                         src, NULL, &groups, rows, offsets, nrows, param);
         if (!col || RAY_IS_ERR(col)) { ray_release(result); result = col; goto done; }
+        ray_profile_tick("indexed: emitted aggregate");
         result = ray_table_add_col(result, agg_result_col_name(ie ? ie->sym : 0, kind), col);
         ray_release(col);
         if (!result || RAY_IS_ERR(result)) goto done;

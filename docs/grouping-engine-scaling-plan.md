@@ -5,7 +5,7 @@ consumer and distinct changes are implemented locally; the final worker sweep
 and delivery are pending. This extends the type-coverage plan.
 
 Acceptance compares immutable release binaries with identical generated inputs.
-The rebased ASan/UBSan suite passes 3,822/3,822 tests. Current measurements
+The rebased ASan/UBSan suite passes 3,824/3,824 tests. Current measurements
 and reproducible commands are in [the results report](grouping-engine-scaling-results.md).
 
 ## Objective
@@ -29,7 +29,7 @@ additional data structures. Each family needs its own baseline and scaling proof
 | Selected and composite dense keys | Partitioned native payload; selected source-row indices shared across inputs | Final repeated scaling sweep |
 | Sparse integer/temporal/SYM keys | Radix | Measure scatter, skew, merge and output costs across cardinalities |
 | Float, STR, GUID and other supported wide keys | Shared parallel directory with complete key equality and deterministic first-row IDs | Final repeated scaling sweep and race checks |
-| First/last, wide extrema, median, quantile, mode, top/bottom K | Shared stable row slices; independent groups scheduled by row count | Final repeated scaling sweep; dominant-group phase profiles |
+| First/last, wide extrema, median, quantile, mode, top/bottom K | Shared stable row slices; row-balanced groups and splitting within dominant groups | Final repeated scaling sweep and race checks |
 | Count-distinct | Pair-hash partitioning; parallel radix ordering and output | Large ordering oracle and final repeated scaling sweep |
 | Mixed streaming/indexed aggregates and expressions | Shared groups and stable row slices; streaming tasks split by rows | Final repeated scaling sweep |
 
@@ -37,7 +37,7 @@ additional data structures. Each family needs its own baseline and scaling proof
 
 ### G0 — Reproducible baseline and coverage census
 
-1. Preserve release at ec988ec6 and current release separately; record revisions
+1. Preserve release at bb81e621 and current release separately; record revisions
    and worker settings. Unit-test builds must not replace benchmark binaries.
 2. Cover aggregate families with reproducible synthetic fixtures and typed
    result comparisons. Keep native temporal extrema as a control.
@@ -122,9 +122,46 @@ The current min(time) result and passing tests do not close the whole plan.
 - Shared parallel key directory with full float, string, GUID and LIST equality.
 - Stable row slices reused by mixed streaming and indexed consumers.
 - Row-weighted ordered/wide consumers and exact dominant-group rank selection.
+- Row-split winner selection, bounded partial top/bottom-K heaps, and exact
+  partitioned mode frequencies with bounded local preaggregation.
+- Parallel native result gathering and adaptive-width symbol slice offsets.
 - Bounded exact distinct preaggregation and parallel stable output ordering.
 - Domain-aware symbol read views during immutable worker phases.
 - Typed empty output columns and corrected wide distinct admission.
 
-Full ASan/UBSan validation passes 3,822/3,822 tests; targeted TSan passes 5/5.
+Full ASan/UBSan validation passes 3,824/3,824 tests; targeted TSan passes 6/6.
 Performance acceptance and delivery remain open.
+
+## Dominant-group execution stages
+
+Assigning a whole group to one worker leaves a single large group serial even
+when grouping itself scales. Consumer scheduling therefore considers rows
+within groups as well as independent groups:
+
+- First/last and wide extrema select candidates from contiguous row chunks and
+  merge them in original index order. Null-only chunks contribute no candidate.
+- Small top/bottom K uses one bounded heap per source chunk, then selects from
+  their union. Larger candidate sets merge in parallel. Large K first uses
+  exact three-way selection, then sorts only the retained K rows and merges
+  their sorted chunks. Each merge is split by output rank, including the final
+  pair. Two row-index buffers bound scratch storage by input rows rather than
+  workers times K. Partially filled serial heaps are heapified before sorting.
+- Mode locally combines exact value counts in a fixed-size table, partitions
+  partial counts by full value hash, and reduces partitions independently.
+  Equality checks resolve hash collisions. Counts carry the earliest original
+  position, preserving ties even when source-row indices are reordered.
+- Median and quantile use exact parallel rank selection within large groups.
+- Native output gathering writes disjoint result payload ranges and publishes
+  null metadata after workers finish.
+
+All stages are query-local. No previously computed query answers are retained.
+The synthetic matrix includes single-group first/last, symbol/string extrema,
+numeric/string mode, and numeric/string/symbol top/bottom K. Independent tests
+also cover temporal and narrow native widths, null-only and empty groups,
+frequency ties, reordered row indices, and local frequency-table flushing.
+
+The grouped query compiler currently accepts K from 1 through 1024. This change
+preserves that language contract. `topk_consumer.c` separately exercises the
+internal indexed kernel with K near the group size; `topk_scaling.py` checks
+all output values against an independent histogram and records cold/warm times
+and peak RSS. This prevents a query-front-end limit from hiding kernel gaps.
