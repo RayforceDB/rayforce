@@ -1,6 +1,8 @@
 # Query fast-path type coverage: implementation plan
 
-Status: P0 implementation batch complete; P1–P10 remain planned.
+Status: P0–P10 complete; implementation, regression tests, and performance closure recorded below. ThreadSanitizer could not start on this host; see the results for that validation limitation.
+
+Implementation, route decisions, and measurements: [results](aggregation-fast-path-results.md).
 
 Baseline: `70a539e8`, 2026-09-15. Motivation: GrandU
 `(select {from:t s:(min time) by:client_order_id})`.
@@ -23,18 +25,56 @@ Baseline: `70a539e8`, 2026-09-15. Motivation: GrandU
 - The new value/path tests exposed two additional existing bugs, fixed in this
   batch: BOOL all/any outputs used int64 store strides, and radix source-row
   positions used unaligned int64 accesses after narrow aggregate values.
-  General narrow/temporal output support is still P1; only already-registered
-  BOOL outputs were enabled in the emitters here.
+  P0 enabled only already-registered BOOL outputs in the emitters; P1 in
+  the continuation below adds general narrow/temporal output support.
 - Validation: full ASan/UBSan suite passed 3,794/3,794 before the final extra
   pairwise test was added; the final five contract tests passed with harness
   core counts 1 and 2 (the route test explicitly selects two cores), and the
   new Rayfall rank regression passed. Release build and profiler-route smoke
-  checks passed. The historical CSV below remains the
-  original baseline snapshot, not the post-fix outcome.
+  checks passed. The original columns in the CSV below remain the baseline snapshot;
+  current route columns describe the continuation.
 
-Next: P1 general typed validity/read/output plumbing, then P2 streaming kernels
-and P3 nullable-key routing. GrandU's MIN(TIME) still uses legacy grouping in
-this batch; no performance improvement for that query is claimed yet.
+### P1–P9 continuation — 2026-09-15
+
+- Native-width streaming kernels and emitters cover legal numeric/temporal
+  inputs; F32 validity, binary/truth readers, product nulls, and row-count
+  semantics are explicit.
+- Nullable dense slots and canonical signed radix keys are enabled. Dense
+  allocation and sampled worker traffic are byte-budgeted; initialization, merge, and emission run
+  across the pool. The full-input-per-worker generic hash strategy was removed.
+- One stable row-index layout supports ordered/wide and holistic aggregates,
+  mixed with streaming aggregates. Wide/F32 top-K uses O(K) scratch.
+- Float/GUID/STR/LIST keys have bounded shared-index grouping. Large float/wide
+  streaming queries retain the existing faster parallel route; this is an
+  explicit strategy decision backed by measurements, not a missing type gate.
+- Count-distinct accepts nullable numeric/temporal/SYM pairs and F32/F64;
+  wide/dynamic values keep exact generic execution and the 16-byte rewrite
+  limit remains explicit.
+- Typed fused comparisons, float/GUID top-k, composite F32 rank/radix sorting,
+  F32/GUID/STR broadcasts, and F32 numeric DAG admission are implemented.
+- Pure temporal arithmetic is evaluated once with the unit-aware evaluator,
+  then passed as a typed column to grouping; raw temporal DAG arithmetic
+  remains guarded.
+- The census retains its baseline columns and adds current registry/route
+  columns. See the results document for all A/K/Q mappings and justified
+  generic strategies.
+
+### P10 closure — 2026-09-15
+
+- Full ASan/UBSan C/Rayfall suite: **3,801/3,801 passed** after the final changes.
+  Ten contract tests also pass with one- and four-core harness settings; route
+  fixtures explicitly exercise two and eight cores.
+- Clean release build passed. Alternating full GrandU runs measured a warm
+  median of **130.6 ms baseline versus 75.6 / 78.5 ms current**, with identical
+  sorted serialized results, including types and null payloads.
+- Portable benchmarks caught and corrected wide-key serial grouping and
+  duplicated dense-worker traffic regressions. Remaining cases with no clear
+  timing improvement are reported rather than described as speedups.
+- Every A/K/Q census gap has an implemented route or a documented, justified
+  generic/rejected strategy. Final measurements and reproduction fixtures are
+  linked in the results document.
+- TSan builds succeeded, but normal and non-PIE runs both failed at startup
+  with `unexpected memory mapping`; no TSan race verdict is claimed.
 
 ## Objective and scope
 
@@ -96,7 +136,7 @@ source, but are not represented by this CSV.
 Source: `src/ops/agg_stream.c:agg_resolve`, with admission in
 `src/ops/agg_engine.c:agg_v2_can_handle`.
 
-| ID | Operation family | Registered today | Missing coverage to implement |
+| ID | Operation family | Registered at baseline | Coverage planned |
 |---|---|---|---|
 | A1 | sum | I64, F64 | BOOL/U8/I16/I32/F32 and TIME |
 | A2 | min/max | I64, F64 | BOOL/U8/I16/I32/F32; DATE/TIME/TIMESTAMP; SYM/STR/GUID |
@@ -401,7 +441,7 @@ Performance fixtures:
 
 1. GrandU full-schema load followed by repeated query-only timings, and a
    deterministic distributable synthetic fixture matching nullable I32 keys,
-   TIME values, row count/cardinality/skew. Keep the private CSV outside the repo.
+   TIME values and row count/cardinality; retain the private-data run for its exact skew. Keep the private CSV outside the repo.
 2. Same workload with I16/I32/I64/F32/F64/TIME/TIMESTAMP value columns and legal
    aggregates, nullable and null-free variants. Measure mixed aggregates too.
 3. Low/high-cardinality SYM count-distinct, temporal count-distinct, float

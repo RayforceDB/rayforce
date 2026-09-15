@@ -2342,7 +2342,8 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             if (!cols[k]) { can_radix = false; break; }
             int8_t t = cols[k]->type;
             if (t == RAY_STR || t == RAY_GUID) { has_wide_key = true; continue; }
-            if (t == RAY_F32 && n_cols != 1) { can_radix = false; break; }
+            /* Reuse the single-key float transform, then radix-compose ranks. */
+            if (t == RAY_F32 && n_cols != 1) { has_wide_key = true; continue; }
             if (t != RAY_I64 && t != RAY_F64 && t != RAY_F32 &&
                 t != RAY_I32 && t != RAY_I16 &&
                 t != RAY_BOOL && t != RAY_U8 && t != RAY_SYM &&

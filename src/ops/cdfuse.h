@@ -40,7 +40,8 @@
  * (keys, distinct counts, first source row) in stable first-seen key
  * order, or NULL when the shape is unsupported (caller falls back to the
  * existing rewrite).  key_col/val_col must be flat vectors of
- * I64/I32/I16/SYM with no nulls. */
+ * numeric/temporal/SYM types, including nulls. Float keys in `k` are
+ * canonical bit encodings; callers restore the source logical type. */
 ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows);
 
 #endif /* RAY_OPS_CDFUSE_H */
