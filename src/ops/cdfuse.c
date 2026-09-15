@@ -130,13 +130,28 @@ typedef struct {
     _Atomic(int64_t) rows_done;
 } cdf_p1_ctx_t;
 
+static int64_t cdf_read(const void* data, int64_t r, int8_t type, uint8_t attrs) {
+    if (type == RAY_F32) {
+        float v = ((const float*)data)[r];
+        if (v != v) return INT64_C(0x7fc00000);
+        if (v == 0) return 0;
+        uint32_t bits; memcpy(&bits, &v, sizeof(bits)); return bits;
+    }
+    if (type == RAY_F64) {
+        double v = ((const double*)data)[r];
+        if (v != v) return INT64_C(0x7ff8000000000000);
+        if (v == 0) return 0;
+        int64_t bits; memcpy(&bits, &v, sizeof(bits)); return bits;
+    }
+    return read_col_i64(data, r, type, attrs);
+}
 static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     cdf_p1_ctx_t* c = (cdf_p1_ctx_t*)vctx;
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
     cdf_buf_t* my = &c->bufs[(size_t)(wid % c->nw) * c->n_parts];
     for (int64_t r = start; r < end; r++) {
-        int64_t k = read_col_i64(c->kdata, r, c->ktype, c->kattrs);
-        int64_t v = read_col_i64(c->vdata, r, c->vtype, c->vattrs);
+        int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
+        int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
         /* PAIR hash: uniform even when one key owns most of the table.
          * The odd-multiplier on the k side is LOAD-BEARING, not decoration: a
          * bare `hash(k) ^ hash(v)` cancels to 0 for every row where k == v, so
@@ -493,7 +508,9 @@ static uint32_t cdf_part_count(uint32_t nworkers, int64_t nrows) {
 }
 
 static int cdf_type_ok(int8_t t) {
-    return t == RAY_I64 || t == RAY_I32 || t == RAY_I16 || RAY_IS_SYM(t);
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
+        t == RAY_I32 || t == RAY_I64 || t == RAY_DATE ||
+        t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_F32 || t == RAY_F64 || RAY_IS_SYM(t);
 }
 
 /* Free every phase-1/2 buffer; used by both the fallback and success paths. */
@@ -511,9 +528,7 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     if (!key_col || !val_col || nrows <= 0) return NULL;
     if (!ray_is_vec(key_col) || !ray_is_vec(val_col)) return NULL;
     if (!cdf_type_ok(key_col->type) || !cdf_type_ok(val_col->type)) return NULL;
-    if (ray_vec_may_have_nulls(key_col) ||
-        ray_vec_may_have_nulls(val_col))
-        return NULL;
+
     if (key_col->len < nrows || val_col->len < nrows) return NULL;
     if (nrows < CDF_MIN_ROWS) return NULL; /* small: existing path fine */
 

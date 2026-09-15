@@ -62,6 +62,11 @@ typedef struct {
     ray_t*       col_obj;
     int64_t      col_len;
     int64_t      cval;
+    ray_t*       literal; /* borrowed from the predicate graph */
+    uint8_t      typed_compare;
+    double       fval;
+    bool         constant_null;
+    bool         float_compare;
     int          cval_in_dict;
     int64_t      cvals[16];
     uint8_t      n_cvals;

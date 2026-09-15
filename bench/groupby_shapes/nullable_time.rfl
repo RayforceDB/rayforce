@@ -1,0 +1,9 @@
+;; Distributable GrandU-shaped fixture: 13,916,401 rows, 1,104,673 groups,
+;; nullable I32 keys spread over about 2.48 million values, TIME aggregate.
+(set n 13916401)
+(set group_count 1104673)
+(set i (til n))
+(set g (% (* i 17) group_count))
+(set t (table [k tm] (list (as 'I32 (+ (* g 2) (div g 4))) (as 'TIME (% (* i 13) 86400000)))))
+(set t (update {from:t k:(as 'I32 0N) where:(== k 0)}))
+(map (fn [_] (println (timeit (select {from:t by:k s:(min tm)})))) (til 8))

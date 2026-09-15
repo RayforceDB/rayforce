@@ -189,6 +189,13 @@ static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) 
                 else if (la > lb) cmp = 1;
             }
             if (cmp == 0) continue;
+        } else if (ks->type == RAY_GUID) {
+            cmp = memcmp((const char*)ks->base + (size_t)row_a * 16,
+                         (const char*)ks->base + (size_t)row_b * 16, 16);
+        } else if (ks->type == RAY_F32 || ks->type == RAY_F64) {
+            double va = ks->type == RAY_F32 ? ((const float*)ks->base)[row_a] : ((const double*)ks->base)[row_a];
+            double vb = ks->type == RAY_F32 ? ((const float*)ks->base)[row_b] : ((const double*)ks->base)[row_b];
+            cmp = (va > vb) - (va < vb);
         } else if (ks->esz == 8) {
             int64_t va = ((const int64_t*)ks->base)[row_a];
             int64_t vb = ((const int64_t*)ks->base)[row_b];
@@ -330,7 +337,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         if (RAY_IS_PARTED(kt) || kt == RAY_MAPCOMMON) return NULL;
         if (kt != RAY_SYM && kt != RAY_STR && kt != RAY_BOOL && kt != RAY_U8
             && kt != RAY_I16 && kt != RAY_I32 && kt != RAY_I64
-            && kt != RAY_DATE && kt != RAY_TIME && kt != RAY_TIMESTAMP)
+            && kt != RAY_DATE && kt != RAY_TIME && kt != RAY_TIMESTAMP
+            && kt != RAY_F32 && kt != RAY_F64 && kt != RAY_GUID)
             return NULL;
         ctx.keys[i].type      = kt;
         ctx.keys[i].attrs     = col->attrs;

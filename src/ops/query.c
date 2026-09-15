@@ -301,7 +301,7 @@ static bool dag_numeric_type_admitted(int8_t t) {
     if (t <= 0) return true;  /* unknown/uninferred: let executor validate */
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
 static bool dag_pow_type_admitted(int8_t t) {
@@ -3718,10 +3718,9 @@ static ray_t* try_count_distinct_v2_rewrite(
         if (!K_cols[j]) return NULL;
         int8_t kct_j = K_cols[j]->type;
         if (RAY_IS_PARTED(kct_j) || kct_j == RAY_MAPCOMMON) return NULL;
-        if (ray_vec_has_nulls(K_cols[j])) return NULL;
         int kct_ok_j = (kct_j == RAY_SYM  || kct_j == RAY_BOOL || kct_j == RAY_U8 ||
                         kct_j == RAY_I16  || kct_j == RAY_I32  || kct_j == RAY_I64 ||
-                        kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP);
+                        kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP || kct_j == RAY_F32 || kct_j == RAY_F64);
         if (!kct_ok_j) return NULL;
         K_esz_total += ray_sym_elem_size(kct_j, K_cols[j]->attrs);
     }
@@ -3729,7 +3728,6 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
-    if (ray_vec_has_nulls(X_col)) return NULL;
     int X_esz = ray_sym_elem_size(xct, X_col->attrs);
     if (K_esz_total + X_esz > 16) return NULL;
     /* X gets the same per-type acceptability check as the K columns
@@ -3737,7 +3735,7 @@ static ray_t* try_count_distinct_v2_rewrite(
      * it by storage width into the composite key. */
     int xct_ok = (xct == RAY_SYM  || xct == RAY_BOOL || xct == RAY_U8 ||
                   xct == RAY_I16  || xct == RAY_I32  || xct == RAY_I64 ||
-                  xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP);
+                  xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP || xct == RAY_F32 || xct == RAY_F64);
     if (!xct_ok) return NULL;
 
     if (where_expr && !ray_fused_group_supported(where_expr, tbl))
@@ -3782,8 +3780,12 @@ static ray_t* try_count_distinct_v2_rewrite(
                 {
                     const int64_t* src = (const int64_t*)ray_data(fk);
                     void* dst = ray_data(kv);
-                    for (int64_t i = 0; i < ng; i++)
-                        write_col_i64(dst, i, src[i], kv->type, kv->attrs);
+                    for (int64_t i = 0; i < ng; i++) {
+                        if (kv->type == RAY_F32) { uint32_t bits = (uint32_t)src[i]; memcpy((float*)dst + i, &bits, 4); }
+                        else if (kv->type == RAY_F64) memcpy((double*)dst + i, &src[i], 8);
+                        else write_col_i64(dst, i, src[i], kv->type, kv->attrs);
+                    }
+                    if (ray_vec_may_have_nulls(K_cols[0])) kv->attrs |= RAY_ATTR_HAS_NULLS;
                 }
                 ray_t* out = ray_table_new(2);
                 if (out && !RAY_IS_ERR(out))
@@ -4424,7 +4426,7 @@ static int can_atom_broadcast(ray_t* a) {
     switch (vt) {
     case RAY_BOOL: case RAY_U8:
     case RAY_I16:  case RAY_I32:
-    case RAY_I64:  case RAY_F64:
+    case RAY_I64: case RAY_F32: case RAY_F64: case RAY_GUID: case RAY_STR:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
     case RAY_SYM:
         return 1;
@@ -4441,7 +4443,7 @@ static int can_atom_broadcast(ray_t* a) {
  * per group, scaling with output cardinality, not row count).  Allocate
  * once and fill — Q35 falls back into parity with Q34.
  *
- * Returns NULL for atom types not yet handled (RAY_STR, RAY_GUID, F32);
+ * Returns NULL for unsupported atom kinds;
  * caller falls back to the per-cell LIST path. */
 static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     if (!a || !ray_is_atom(a) || n <= 0) return NULL;
@@ -4496,6 +4498,22 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
         for (int64_t i = 0; i < n; i++) d[i] = val;
         break;
     }
+    case RAY_F32: {
+        float* d = dst;
+        for (int64_t i = 0; i < n; i++) d[i] = (float)a->f64;
+        break;
+    }
+    case RAY_GUID:
+        for (int64_t i = 0; i < n; i++)
+            memcpy((char*)dst + (size_t)i * 16, ray_data(a->obj), 16);
+        break;
+    case RAY_STR:
+        for (int64_t i = 0; i < n; i++) {
+            ray_t* next = ray_str_vec_set(v, i, ray_str_ptr(a), ray_str_len(a));
+            if (!next || RAY_IS_ERR(next)) { ray_release(v); return NULL; }
+            v = next;
+        }
+        break;
     case RAY_F64: {
         double val = a->f64;
         double* d = (double*)dst;
@@ -4528,16 +4546,11 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     }
 
     /* Propagate atom-null: an entirely-null broadcast keeps the null bit
-     * of every cell so `is_null` and aggregations behave the same as
-     * the LIST path would have.  The aux memset is a bitmap-era residue
-     * (no vec-level consumer reads aux null bits since the sentinel
-     * migration); it MUST skip RAY_SYM, whose aux bytes 8-15 now carry
-     * the resolution-domain pointer — clobbering it would corrupt the
-     * header and crash the owned-ref release on free. */
+     * of every cell so `is_null` and aggregations retain their semantics.
+     * Payloads already contain typed sentinels; aux belongs to owners/domains. */
     if (RAY_ATOM_IS_NULL(a)) {
         v->attrs |= RAY_ATTR_HAS_NULLS;
-        if (vec_type != RAY_SYM)
-            memset(v->aux, 0xFF, 16);
+
     }
     return v;
 }
@@ -5613,6 +5626,106 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
     return n;
 }
 
+/* Materialize pure temporal arithmetic with the unit-aware evaluator once,
+ * then let the normal typed GROUP pipeline reduce that column. The expression
+ * DAG's raw integer arithmetic remains guarded for mixed temporal units. */
+static bool temporal_materialize_pure(ray_t* expr, ray_t* tbl) {
+    if (!expr) return false;
+    if (ray_is_atom(expr)) {
+        if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
+            ray_t* col = ray_table_get_col(tbl, expr->i64);
+            return col && !RAY_IS_PARTED(col->type) && col->type != RAY_MAPCOMMON;
+        }
+        return true;
+    }
+    if (expr->type != RAY_LIST || expr->len != 3) return false;
+    ray_t** es = ray_data(expr);
+    if (!es[0] || es[0]->type != -RAY_SYM) return false;
+    ray_t* name = ray_sym_str(es[0]->i64);
+    if (!name || ray_str_len(name) != 1) return false;
+    char c = ray_str_ptr(name)[0];
+    return (c == '+' || c == '-' || c == '*') &&
+        temporal_materialize_pure(es[1], tbl) && temporal_materialize_pure(es[2], tbl);
+}
+static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl) {
+    if (!dict_get(dict, "by")) return NULL;
+    ray_t* vals = ray_dict_vals(dict);
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* rewritten = NULL;
+    ray_t* extended = NULL;
+    uint32_t seq = 0;
+    ray_t* replacement = NULL;
+    ray_t* failure = NULL;
+    #define MAT_CHECK(value) do { if (!(value) || RAY_IS_ERR(value)) { failure = (value); (value) = NULL; goto oom; } } while (0)
+    for (int64_t i = 0; i < ray_dict_len(dict); i++) {
+        ray_t* expr = ray_list_get(vals, i);
+        if (!expr || !is_group_dag_agg_expr(expr)) continue;
+        ray_t** es = ray_data(expr);
+        uint16_t kind = resolve_agg_opcode(es[0]->i64);
+        int argc = agg_is_binary_agg(kind) ? 2 : 1;
+        replacement = NULL;
+        for (int arg = 1; arg <= argc; arg++) {
+            if (arg >= expr->len || !expr_contains_temporal_arith(es[arg], tbl) ||
+                !temporal_materialize_pure(es[arg], tbl)) continue;
+            if (ray_env_push_query_scope() != RAY_OK) goto oom;
+            ray_t* previous = bind_all_columns(tbl);
+            ray_t* value = ray_eval(es[arg]);
+            g_active_query_table = previous;
+            ray_env_pop_scope();
+            if (value && !RAY_IS_ERR(value) && ray_is_lazy(value)) value = ray_lazy_materialize(value);
+            if (!value || RAY_IS_ERR(value)) {
+                if (replacement) ray_release(replacement);
+                if (rewritten) ray_release(rewritten);
+                if (extended) ray_release(extended);
+                return value ? value : ray_error("oom", NULL);
+            }
+            if (!ray_is_vec(value) || value->len != ray_table_nrows(tbl)) { ray_release(value); continue; }
+            if (!extended) { extended = tbl; ray_retain(extended); }
+            char name[48]; int64_t sym;
+            do {
+                int len = snprintf(name, sizeof(name), "_temporal_agg_%u", seq++);
+                sym = ray_sym_intern(name, (size_t)len);
+            } while (ray_table_get_col(extended, sym));
+            extended = ray_table_add_col(extended, sym, value); ray_release(value);
+            MAT_CHECK(extended);
+            if (!replacement) {
+                replacement = ray_list_new(expr->len);
+                MAT_CHECK(replacement);
+                for (int64_t j = 0; j < expr->len; j++) {
+                    replacement = ray_list_append(replacement, es[j]); MAT_CHECK(replacement);
+                }
+            }
+            ray_t* ref = ray_sym(sym);
+            MAT_CHECK(ref);
+            replacement = ray_list_set(replacement, arg, ref); ray_release(ref);
+            MAT_CHECK(replacement);
+        }
+        if (replacement) {
+            if (!rewritten) { rewritten = dict; ray_retain(rewritten); }
+            int alloc = 0;
+            ray_t* key = collection_elem(keys, i, &alloc);
+            rewritten = ray_dict_upsert(rewritten, key, replacement);
+            if (alloc) ray_release(key);
+            ray_release(replacement); replacement = NULL;
+            MAT_CHECK(rewritten);
+        }
+    }
+    if (!rewritten) { if (extended) ray_release(extended); return NULL; }
+    ray_t* from = ray_sym(ray_sym_intern("from", 4));
+    rewritten = ray_dict_upsert(rewritten, from, extended);
+    ray_release(from); ray_release(extended); extended = NULL;
+    MAT_CHECK(rewritten);
+    ray_t* result = ray_select(&rewritten, 1);
+    ray_release(rewritten);
+    return result;
+oom:
+    if (replacement) ray_release(replacement);
+    if (rewritten) ray_release(rewritten);
+    if (extended) ray_release(extended);
+    return failure ? failure : ray_error("oom", NULL);
+    #undef MAT_CHECK
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
@@ -5663,6 +5776,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         ray_group_emit_filter_set(prev_emit_filter);
     if (RAY_IS_ERR(tbl)) return tbl;
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
+
+    ray_t* temporal_result = try_temporal_group_materialize(dict, tbl);
+    if (temporal_result) { ray_release(tbl); return temporal_result; }
 
     ray_t* by_expr = dict_get(dict, "by");
     ray_t* take_expr = dict_get(dict, "take");
@@ -7043,9 +7159,9 @@ by_dict_done:
             }
         }
 
-        /* Decide routing.  LIST/STR always fall to the eval-level
-         * grouping because the DAG HT path can't pack them into
-         * 8-byte key slots.  GUID is packed via row-indirection in
+        /* LIST keys with plain aggregates use v2 structural indexed grouping.
+         * Eval retains dynamic projections and partitioned LIST shapes.
+         * GUID is packed via row-indirection in
          * the HT layout (wide_key_mask), so it uses the parallel DAG
          * path *except* for queries with non-aggregate expressions
          * (the non-agg scatter still requires 8-byte-packable key
@@ -7056,7 +7172,8 @@ by_dict_done:
             if (key_col) {
                 int8_t kct = key_col->type;
                 if (RAY_IS_PARTED(kct)) kct = (int8_t)RAY_PARTED_BASETYPE(kct);
-                if (kct == RAY_LIST)
+                if (kct == RAY_LIST && (any_nonagg || n_out == 0 ||
+                    RAY_IS_PARTED(key_col->type) || !ray_agg_engine_v2))
                     use_eval_group = 1;
                 else if (kct == RAY_GUID && (any_nonagg || n_out == 0))
                     /* RAY_GUID routes to eval-level ray_group_indices_fn only
@@ -7089,9 +7206,10 @@ by_dict_done:
                 /* STR keys (dict-encoded OR plain) take the parallel DAG path:
                  * dict-STR substitutes int32 codes; plain/computed STR groups
                  * via the wide-key HT (row-indirected key slots).  Both beat the
-                 * O(N*ngroups) eval toy-grouper (33% allocator churn).  Only
-                 * RAY_LIST composite keys still need eval's structural compare. */
-                if (kct == RAY_LIST) {
+                 * O(N*ngroups) eval toy-grouper (33% allocator churn). LIST
+                 * composites with plain aggregates use v2 structural grouping. */
+                if (kct == RAY_LIST && (any_nonagg || n_out == 0 ||
+                    RAY_IS_PARTED(key_col->type) || !ray_agg_engine_v2)) {
                     use_eval_group = 1;
                     break;
                 }

@@ -1027,9 +1027,27 @@ static int64_t cd_sym_dense_count(ray_t* input) {
  *                              global set.  Distinct values land in the same
  *                              partition, so the global count is the sum of
  *                              per-partition counts. */
+/* Lossless F32 widening shares the exact F64 dedupe implementation. The
+ * fused narrow-pair route reads F32 directly and avoids this buffer. */
+static ray_t* cd_widen_f32(ray_t* src) {
+    ray_t* out = ray_vec_new(RAY_F64, src->len);
+    if (!out || RAY_IS_ERR(out)) return out;
+    out->len = src->len;
+    const float* in = ray_data(src); double* dst = ray_data(out);
+    for (int64_t i = 0; i < src->len; i++) dst[i] = in[i];
+    if (ray_vec_may_have_nulls(src)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     (void)g; (void)op;
     if (!input || RAY_IS_ERR(input)) return input;
+
+    if (input->type == RAY_F32) {
+        ray_t* wide = cd_widen_f32(input);
+        if (!wide || RAY_IS_ERR(wide)) return wide ? wide : ray_error("oom", NULL);
+        ray_t* result = exec_count_distinct(g, op, wide); ray_release(wide); return result;
+    }
 
     int8_t in_type = input->type;
     int64_t len = input->len;
@@ -1896,6 +1914,12 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups) {
     if (!src || RAY_IS_ERR(src)) return ray_error("domain", "count distinct per group: invalid source column");
     if (n_groups < 0) return ray_error("domain", "count distinct per group: group count must be non-negative, got %lld", (long long)n_groups);
+    if (src->type == RAY_F32) {
+        ray_t* wide = cd_widen_f32(src);
+        if (!wide || RAY_IS_ERR(wide)) return wide ? wide : ray_error("oom", NULL);
+        ray_t* result = ray_count_distinct_per_group(wide, row_gid, n_rows, n_groups);
+        ray_release(wide); return result;
+    }
     int8_t in_type = src->type;
     switch (in_type) {
     case RAY_BOOL: case RAY_U8:
@@ -2893,6 +2917,79 @@ static void topk_per_group_fn(void* ctx_v, uint32_t worker_id,
     }
 }
 
+/* Wide and F32 top-K retain source row ids, so domains/string owners never
+ * enter worker state. Scratch is bounded by K, independent of group size. */
+static int topk_row_cmp(ray_t* src, int64_t a, int64_t b) {
+    const void* data = ray_data(src);
+    if (src->type == RAY_F32) {
+        float x = ((const float*)data)[a], y = ((const float*)data)[b];
+        return (x > y) - (x < y);
+    }
+    if (src->type == RAY_GUID)
+        return memcmp((const char*)data + (size_t)a * 16, (const char*)data + (size_t)b * 16, 16);
+    if (src->type == RAY_SYM) {
+        ray_t* x = ray_sym_domain_str(ray_sym_vec_domain(src), ray_read_sym(data, a, src->type, src->attrs));
+        ray_t* y = ray_sym_domain_str(ray_sym_vec_domain(src), ray_read_sym(data, b, src->type, src->attrs));
+        return ray_str_cmp(x, y);
+    }
+    size_t na = 0, nb = 0;
+    const char* x = ray_str_vec_get(src, a, &na);
+    const char* y = ray_str_vec_get(src, b, &nb);
+    size_t common = na < nb ? na : nb;
+    int cmp = common ? memcmp(x, y, common) : 0;
+    return cmp ? cmp : (na > nb) - (na < nb);
+}
+static void topk_rows_sift(ray_t* src, int64_t* heap, int64_t n, int64_t root, bool desc) {
+    for (;;) {
+        int64_t child = root * 2 + 1;
+        if (child >= n) return;
+        if (child + 1 < n) {
+            int cmp = topk_row_cmp(src, heap[child + 1], heap[child]);
+            if (desc ? cmp < 0 : cmp > 0) child++;
+        }
+        int cmp = topk_row_cmp(src, heap[child], heap[root]);
+        if (!(desc ? cmp < 0 : cmp > 0)) return;
+        int64_t tmp = heap[root]; heap[root] = heap[child]; heap[child] = tmp;
+        root = child;
+    }
+}
+static ray_t* topk_wide_per_group_buf(ray_t* src, int64_t k, bool desc,
+        const int64_t* rows, const int64_t* offsets, const int64_t* counts, int64_t ng) {
+    int64_t max_count = 0;
+    for (int64_t g = 0; g < ng; g++) if (counts[g] > max_count) max_count = counts[g];
+    int64_t cap = k < max_count ? k : max_count;
+    int64_t* heap = ray_alloc_raw((size_t)(cap > 0 ? cap : 1) * sizeof(int64_t));
+    ray_t* out = ray_list_new(ng);
+    if (!heap || !out || RAY_IS_ERR(out)) { ray_free_raw(heap); if (out && !RAY_IS_ERR(out)) ray_release(out); return ray_error("oom", NULL); }
+    for (int64_t g = 0; g < ng; g++) {
+        int64_t kept = 0;
+        for (int64_t j = 0; j < counts[g]; j++) {
+            int64_t row = rows[offsets[g] + j];
+            if (ray_vec_is_null(src, row)) continue;
+            if (kept < cap) {
+                heap[kept++] = row;
+                if (kept == cap)
+                    for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc);
+            } else {
+                int cmp = topk_row_cmp(src, row, heap[0]);
+                if (desc ? cmp > 0 : cmp < 0) { heap[0] = row; topk_rows_sift(src, heap, kept, 0, desc); }
+            }
+        }
+        if (kept < cap)
+            for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc);
+        for (int64_t n = kept; n > 1; n--) {
+            int64_t tmp = heap[0]; heap[0] = heap[n - 1]; heap[n - 1] = tmp;
+            topk_rows_sift(src, heap, n - 1, 0, desc);
+        }
+        ray_t* cell = gather_by_idx(src, heap, kept);
+        if (!cell || RAY_IS_ERR(cell)) { ray_free_raw(heap); ray_release(out); return cell ? cell : ray_error("oom", NULL); }
+        out = ray_list_append(out, cell); ray_release(cell);
+        if (!out || RAY_IS_ERR(out)) { ray_free_raw(heap); return out ? out : ray_error("oom", NULL); }
+    }
+    ray_free_raw(heap);
+    return out;
+}
+
 ray_t* ray_topk_per_group_buf(ray_t* src,
                               int64_t k,
                               uint8_t desc,
@@ -2903,6 +3000,8 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
     if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
     if (k < 1) return NULL;
     int8_t t = src->type;
+    if (t == RAY_F32 || t == RAY_GUID || t == RAY_SYM || t == RAY_STR)
+        return topk_wide_per_group_buf(src, k, desc, idx_buf, offsets, grp_cnt, n_groups);
     if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 && t != RAY_I16 &&
         t != RAY_U8  && t != RAY_BOOL && t != RAY_DATE && t != RAY_TIME &&
         t != RAY_TIMESTAMP)
