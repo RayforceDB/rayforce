@@ -3487,7 +3487,7 @@ typedef struct {
     const uint32_t* gids;
     int64_t nrows;
     uint32_t tasks, parts, bits, slices;
-    int64_t slots;
+    int64_t slots, local_stride;
     int64_t* local;
     const int64_t* offsets;
     uint32_t part_slices[257];
@@ -3521,7 +3521,7 @@ static void agg_index_pack(void* raw, uint32_t wid, int64_t start, int64_t end) 
 static void agg_index_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_index_layout_t* c = raw;
     for (int64_t task = start; task < end; task++) {
-        int64_t* counts = c->local + task * c->slots;
+        int64_t* counts = c->local + task * c->local_stride;
         for (int64_t i = c->slice_begin[task]; i < c->slice_end[task]; i++)
             counts[(c->packed[i] >> 32) & (c->slots - 1)]++;
     }
@@ -3532,7 +3532,7 @@ static void agg_index_merge_counts(void* raw, uint32_t wid, int64_t start, int64
         uint32_t part = g >> c->bits;
         int64_t count = 0;
         for (uint32_t task = c->part_slices[part]; task < c->part_slices[part + 1]; task++)
-            count += c->local[task * c->slots + (g & (c->slots - 1))];
+            count += c->local[task * c->local_stride + (g & (c->slots - 1))];
         c->counts[g] = count;
     }
 }
@@ -3542,7 +3542,7 @@ static void agg_index_slice_cursors(void* raw, uint32_t wid, int64_t start, int6
         uint32_t part = g >> c->bits;
         int64_t offset = c->offsets[g];
         for (uint32_t task = c->part_slices[part]; task < c->part_slices[part + 1]; task++) {
-            int64_t* slot = &c->local[task * c->slots + (g & (c->slots - 1))];
+            int64_t* slot = &c->local[task * c->local_stride + (g & (c->slots - 1))];
             int64_t count = *slot; *slot = offset; offset += count;
         }
     }
@@ -3550,7 +3550,7 @@ static void agg_index_slice_cursors(void* raw, uint32_t wid, int64_t start, int6
 static void agg_index_fill(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_index_layout_t* c = raw;
     for (int64_t task = start; task < end; task++) {
-        int64_t* cursor = c->local + task * c->slots;
+        int64_t* cursor = c->local + task * c->local_stride;
         for (int64_t i = c->slice_begin[task]; i < c->slice_end[task]; i++) {
             uint64_t record = c->packed[i];
             c->rows[cursor[(record >> 32) & (c->slots - 1)]++] = (uint32_t)record;
@@ -3628,7 +3628,7 @@ static int agg_index_layout(const agg_groups_t* groups, int64_t nrows,
     uint32_t slots = 1;
     while (slots < (ng + parts - 1) / parts) slots *= 2;
     agg_index_layout_t c = {.gids = groups->gids, .nrows = nrows, .tasks = tasks,
-        .parts = parts, .bits = (uint32_t)__builtin_ctz(slots), .slots = slots,
+        .parts = parts, .bits = (uint32_t)__builtin_ctz(slots), .slots = slots, .local_stride = slots + 8,
         .offsets = offsets, .counts = counts, .cursor = cursor, .rows = rows};
     c.hist = ray_calloc_raw(((size_t)tasks * parts + parts + 1) * sizeof(int64_t));
     c.packed = ray_alloc_raw((size_t)nrows * sizeof(uint64_t));
@@ -3650,7 +3650,8 @@ static int agg_index_layout(const agg_groups_t* groups, int64_t nrows,
     int rc = -1;
     if (agg_cancelled()) goto done;
     /* Split hot partitions by rows. There are at most 2*parts slices, each
-     * storing a power-of-two group range: at most four group slabs.
+     * storing a power-of-two group range plus a cache-line gap. This uses
+     * at most four group slabs plus bounded task padding.
      * Packed rows and slice prefixes both retain source order. */
     int64_t grain = (nrows + parts - 1) / parts;
     for (uint32_t part = 0; part < parts; part++) {
@@ -3662,7 +3663,7 @@ static int agg_index_layout(const agg_groups_t* groups, int64_t nrows,
         }
     }
     c.part_slices[parts] = c.slices;
-    c.local = ray_calloc_raw((size_t)c.slices * c.slots * sizeof(int64_t));
+    c.local = ray_calloc_raw((size_t)c.slices * c.local_stride * sizeof(int64_t));
     if (!c.local) goto done;
     ray_pool_dispatch_n(pool, agg_index_count, &c, c.slices);
     ray_pool_dispatch(pool, agg_index_merge_counts, &c, ng);
@@ -4752,81 +4753,124 @@ ray_t* agg_count_distinct_indexed(ray_t* src, const int64_t* rows,
 typedef struct {
     ray_t** keys;
     const void** data;
-    uint32_t nkeys, tasks;
-    int64_t rows, capacity;
+    uint32_t nkeys, tasks, init_tasks;
+    int64_t rows, capacity, init_pages;
     const dense_plan_t* dense;
-    _Atomic(int64_t)* first;
+    void* first;
+    bool narrow;
     uint8_t* unique;
     int64_t* offsets;
     agg_groups_t* out;
     ray_group_sym_view_t symbols;
 } agg_key_build_t;
 
+/* Coarse aligned ranges avoid concurrent first writes to common 2 MiB
+ * huge pages. Small directories initialize inline; large ones retain
+ * enough independent ranges to use the worker pool. */
+enum { AGG_DIRECTORY_INIT_BYTES = 2 * 1024 * 1024 };
 static void agg_key_directory_init(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
-    for (int64_t i = start; i < end; i++) atomic_init(&c->first[i], INT64_MAX);
+#define KEY_DIRECTORY_INIT(TYPE, EMPTY) do { \
+        _Atomic(TYPE)* first_slots = c->first; \
+        uint64_t offset = (uintptr_t)c->first & (AGG_DIRECTORY_INIT_BYTES - 1); \
+        for (int64_t task = start; task < end; task++) { \
+            uint64_t lo = (uint64_t)(c->init_pages * task / c->init_tasks) * AGG_DIRECTORY_INIT_BYTES; \
+            uint64_t hi = (uint64_t)(c->init_pages * (task + 1) / c->init_tasks) * AGG_DIRECTORY_INIT_BYTES; \
+            int64_t begin = lo < offset ? 0 : (int64_t)((lo - offset) / sizeof(*first_slots)); \
+            int64_t limit = (int64_t)((hi - offset) / sizeof(*first_slots)); \
+            if (limit > c->capacity) limit = c->capacity; \
+            for (int64_t i = begin; i < limit; i++) atomic_init(&first_slots[i], EMPTY); \
+        } \
+    } while (0)
+    if (c->narrow) KEY_DIRECTORY_INIT(int32_t, INT32_MAX);
+    else KEY_DIRECTORY_INIT(int64_t, INT64_MAX);
+#undef KEY_DIRECTORY_INIT
 }
 static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
-    for (int64_t r = start; r < end; r++) {
-        uint64_t slot = 0;
-        if (c->dense) {
-            for (uint32_t k = 0; k < c->nkeys; k++)
-                slot += agg_dense_component(c->dense, k, agg_read_key_i64(c->keys[k], c->data[k], r))
-                    * c->dense->strides[k];
-        } else {
-            uint64_t hash = UINT64_C(1469598103934665603);
-            for (uint32_t k = 0; k < c->nkeys; k++) {
-                hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, &c->symbols);
-                hash *= UINT64_C(1099511628211);
-            }
-            slot = hash & (c->capacity - 1);
-        }
-        for (;;) {
-            int64_t first = atomic_load_explicit(&c->first[slot], memory_order_relaxed);
-            if (!c->dense && first != INT64_MAX) {
-                bool equal = true;
-                for (uint32_t k = 0; k < c->nkeys && equal; k++)
-                    equal = agg_key_eq_at(c->keys[k], c->data[k], r, first, &c->symbols);
-                if (!equal) { slot = (slot + 1) & (c->capacity - 1); continue; }
-            }
-            if (r < first && !atomic_compare_exchange_weak_explicit(&c->first[slot], &first, r,
-                    memory_order_relaxed, memory_order_relaxed)) continue;
-            c->out->gids[r] = (uint32_t)slot;
-            break;
-        }
-    }
+#define KEY_DIRECTORY_INSERT(TYPE, EMPTY) do { \
+        _Atomic(TYPE)* first_slots = c->first; \
+        for (int64_t r = start; r < end; r++) { \
+            uint64_t slot = 0; \
+            if (c->dense) { \
+                for (uint32_t k = 0; k < c->nkeys; k++) \
+                    slot += agg_dense_component(c->dense, k, agg_read_key_i64(c->keys[k], c->data[k], r)) \
+                        * c->dense->strides[k]; \
+            } else { \
+                uint64_t hash = UINT64_C(1469598103934665603); \
+                for (uint32_t k = 0; k < c->nkeys; k++) { \
+                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, &c->symbols); \
+                    hash *= UINT64_C(1099511628211); \
+                } \
+                slot = hash & (c->capacity - 1); \
+            } \
+            for (;;) { \
+                TYPE first = atomic_load_explicit(&first_slots[slot], memory_order_relaxed); \
+                if (!c->dense && first != EMPTY) { \
+                    bool equal = true; \
+                    for (uint32_t k = 0; k < c->nkeys && equal; k++) \
+                        equal = agg_key_eq_at(c->keys[k], c->data[k], r, first, &c->symbols); \
+                    if (!equal) { slot = (slot + 1) & (c->capacity - 1); continue; } \
+                } \
+                if (r < first && !atomic_compare_exchange_weak_explicit(&first_slots[slot], &first, (TYPE)r, \
+                        memory_order_relaxed, memory_order_relaxed)) continue; \
+                c->out->gids[r] = (uint32_t)slot; \
+                break; \
+            } \
+        } \
+    } while (0)
+    if (c->narrow) KEY_DIRECTORY_INSERT(int32_t, INT32_MAX);
+    else KEY_DIRECTORY_INSERT(int64_t, INT64_MAX);
+#undef KEY_DIRECTORY_INSERT
 }
 static void agg_key_directory_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
-    for (int64_t task = start; task < end; task++) {
-        int64_t begin = c->rows / c->tasks * task;
-        int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1);
-        int64_t count = 0;
-        for (int64_t r = begin; r < limit; r++) {
-            bool first = atomic_load_explicit(&c->first[c->out->gids[r]], memory_order_relaxed) == r;
-            c->unique[r] = first;
-            count += first;
-        }
-        c->offsets[task + 1] = count;
-    }
+#define KEY_DIRECTORY_COUNT(TYPE, EMPTY) do { \
+        _Atomic(TYPE)* first_slots = c->first; \
+        for (int64_t task = start; task < end; task++) { \
+            int64_t begin = c->rows / c->tasks * task; \
+            int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1); \
+            int64_t count = 0; \
+            for (int64_t r = begin; r < limit; r++) { \
+                bool first = atomic_load_explicit(&first_slots[c->out->gids[r]], memory_order_relaxed) == r; \
+                c->unique[r] = first; \
+                count += first; \
+            } \
+            c->offsets[task + 1] = count; \
+        } \
+    } while (0)
+    if (c->narrow) KEY_DIRECTORY_COUNT(int32_t, INT32_MAX);
+    else KEY_DIRECTORY_COUNT(int64_t, INT64_MAX);
+#undef KEY_DIRECTORY_COUNT
 }
 static void agg_key_directory_compact(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
-    for (int64_t task = start; task < end; task++) {
-        int64_t begin = c->rows / c->tasks * task;
-        int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1);
-        int64_t gid = c->offsets[task];
-        for (int64_t r = begin; r < limit; r++) if (c->unique[r]) {
-            c->out->first_row[gid] = r;
-            atomic_store_explicit(&c->first[c->out->gids[r]], gid++, memory_order_relaxed);
-        }
-    }
+#define KEY_DIRECTORY_COMPACT(TYPE, EMPTY) do { \
+        _Atomic(TYPE)* first_slots = c->first; \
+        for (int64_t task = start; task < end; task++) { \
+            int64_t begin = c->rows / c->tasks * task; \
+            int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1); \
+            int64_t gid = c->offsets[task]; \
+            for (int64_t r = begin; r < limit; r++) if (c->unique[r]) { \
+                c->out->first_row[gid] = r; \
+                atomic_store_explicit(&first_slots[c->out->gids[r]], (TYPE)gid++, memory_order_relaxed); \
+            } \
+        } \
+    } while (0)
+    if (c->narrow) KEY_DIRECTORY_COMPACT(int32_t, INT32_MAX);
+    else KEY_DIRECTORY_COMPACT(int64_t, INT64_MAX);
+#undef KEY_DIRECTORY_COMPACT
 }
 static void agg_key_directory_remap(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
-    for (int64_t r = start; r < end; r++)
-        c->out->gids[r] = (uint32_t)atomic_load_explicit(&c->first[c->out->gids[r]], memory_order_relaxed);
+#define KEY_DIRECTORY_REMAP(TYPE, EMPTY) do { \
+        _Atomic(TYPE)* first_slots = c->first; \
+        for (int64_t r = start; r < end; r++) \
+            c->out->gids[r] = (uint32_t)atomic_load_explicit(&first_slots[c->out->gids[r]], memory_order_relaxed); \
+    } while (0)
+    if (c->narrow) KEY_DIRECTORY_REMAP(int32_t, INT32_MAX);
+    else KEY_DIRECTORY_REMAP(int64_t, INT64_MAX);
+#undef KEY_DIRECTORY_REMAP
 }
 static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
                                     const dense_plan_t* dp, agg_groups_t* out) {
@@ -4836,28 +4880,45 @@ static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
     int64_t cap = dp ? dp->total_slots : 16;
     if (!dp) while (cap < rows * 2) cap *= 2;
     agg_key_build_t c = {.keys = keys, .nkeys = nkeys, .tasks = tasks, .rows = rows,
-        .capacity = cap, .dense = dp, .out = out};
+        .capacity = cap, .dense = dp, .out = out, .narrow = rows <= INT32_MAX};
     for (uint32_t k = 0; k < nkeys; k++) if (keys[k]->type == RAY_LIST) {
         ray_sym_strings_borrow(&c.symbols.strings, &c.symbols.count); break;
     }
     c.data = ray_alloc_raw((size_t)nkeys * sizeof(*c.data));
-    c.first = ray_alloc_raw((size_t)cap * sizeof(*c.first));
+    /* Row and group ids below INT32_MAX leave its maximum value available
+     * as the empty sentinel. Larger dense inputs retain full-width entries. */
+    c.first = ray_alloc_raw((size_t)cap * (c.narrow ? sizeof(_Atomic(int32_t)) : sizeof(_Atomic(int64_t))));
     c.unique = ray_alloc_raw((size_t)rows);
     c.offsets = ray_calloc_raw((tasks + 1) * sizeof(*c.offsets));
     out->gids = ray_alloc_raw((size_t)rows * sizeof(*out->gids));
-    out->first_row = ray_alloc_raw((size_t)rows * sizeof(*out->first_row));
+    out->first_row = NULL;
     int rc = -1;
-    if (!c.data || !c.first || !c.unique || !c.offsets || !out->gids || !out->first_row) goto done;
+    if (!c.data || !c.first || !c.unique || !c.offsets || !out->gids) goto done;
     for (uint32_t k = 0; k < nkeys; k++) c.data[k] = ray_data(keys[k]);
-    ray_pool_dispatch(pool, agg_key_directory_init, &c, cap);
+    ray_profile_tick("directory: allocated");
+    size_t entry_size = c.narrow ? sizeof(_Atomic(int32_t)) : sizeof(_Atomic(int64_t));
+    uint64_t init_bytes = ((uintptr_t)c.first & (AGG_DIRECTORY_INIT_BYTES - 1)) + (uint64_t)cap * entry_size;
+    c.init_pages = (init_bytes + AGG_DIRECTORY_INIT_BYTES - 1) / AGG_DIRECTORY_INIT_BYTES;
+    c.init_tasks = c.init_pages < tasks ? (uint32_t)c.init_pages : tasks;
+    if (c.init_tasks == 1) agg_key_directory_init(&c, 0, 0, 1);
+    else ray_pool_dispatch_n(pool, agg_key_directory_init, &c, c.init_tasks);
+    ray_profile_tick("directory: initialized");
     ray_pool_dispatch(pool, agg_key_directory_insert, &c, rows);
+    ray_profile_tick("directory: inserted keys");
     if (agg_cancelled()) goto done;
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
+    ray_profile_tick("directory: counted groups");
     if (agg_cancelled()) goto done;
     for (uint32_t t = 0; t < tasks; t++) c.offsets[t + 1] += c.offsets[t];
     out->ngroups = c.offsets[tasks];
+    /* Representatives need one entry per group, not per input row. Delay
+     * allocation until the prefix counts give the exact output capacity. */
+    out->first_row = ray_alloc_raw((size_t)(out->ngroups ? out->ngroups : 1) * sizeof(*out->first_row));
+    if (!out->first_row) goto done;
     ray_pool_dispatch_n(pool, agg_key_directory_compact, &c, tasks);
+    ray_profile_tick("directory: compacted groups");
     ray_pool_dispatch(pool, agg_key_directory_remap, &c, rows);
+    ray_profile_tick("directory: remapped rows");
     if (!agg_cancelled()) rc = 0;
 done:
     ray_free_raw(c.data); ray_free_raw(c.first); ray_free_raw(c.unique); ray_free_raw(c.offsets);
