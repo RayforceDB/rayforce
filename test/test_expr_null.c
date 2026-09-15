@@ -1593,23 +1593,32 @@ static test_result_t test_zone_skip_keeps_nulls_expr(void) {
     PASS();
 }
 
-/* fused_pred.c has the same chunk-zone arms.  Its compiler currently
- * rejects nullable numeric columns (fp_col_supported_op), so those arms
- * never see a chunk with the null bit set.  Pin that rejection: if it is
- * ever lifted, the fp_eval_cmp zone decision needs the same per-row
- * coverage as test_zone_skip_keeps_nulls_expr above. */
-static test_result_t test_zone_skip_fused_pred_rejects_nullable(void) {
+/* fused_pred.c has the same chunk-zone arms.  It admits nullable numeric
+ * columns with null-as-minimum ordering and today routes them through the
+ * typed per-row compare ahead of the zone block, so the guarded arms are
+ * not reached with nulls yet.  Drive fp_eval_pred one chunk at a time,
+ * exactly as the morsel loop does, and check every row, so the contract
+ * holds whichever path a future change sends nullable columns down. */
+static test_result_t test_zone_skip_keeps_nulls_fused_pred(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* tbl = make_zone_null_table();
     TEST_ASSERT(tbl && !RAY_IS_ERR(tbl), "zone table");
-    zn_op = OP_NE;
-    ray_graph_t* g = ray_graph_new(tbl);
-    fp_pred_t fp;
-    int rc = fp_compile_pred(g, b_zone_cmp(g), tbl, &fp);
-    fp_pred_cleanup(&fp);
-    ray_graph_free(g);
+    static const uint16_t ops[] = { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
+    static uint8_t bits[ZN_ROWS];
+    for (size_t k = 0; k < 6; k++) {
+        zn_op = ops[k];
+        ray_graph_t* g = ray_graph_new(tbl);
+        fp_pred_t fp;
+        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp) == 0, "fp compiles");
+        for (int64_t ms = 0; ms < ZN_ROWS; ms += 1024)
+            fp_eval_pred(&fp, ms, ms + 1024, bits + ms);
+        for (int64_t i = 0; i < ZN_ROWS; i++)
+            TEST_ASSERT_FMT((int)bits[i] == zn_expect(i, ops[k]),
+                            "fp op %u row %lld: got %d want %d",
+                            (unsigned)ops[k], (long long)i, (int)bits[i], zn_expect(i, ops[k]));
+        fp_pred_cleanup(&fp); ray_graph_free(g);
+    }
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
-    TEST_ASSERT(rc != 0, "nullable I64 admitted to fused_pred: cover its zone arms with nulls");
     PASS();
 }
 
@@ -1674,6 +1683,6 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_sym_nulls_parted",      test_diff_sym_nulls_parted,         NULL, NULL },
     /* chunk-zone all-fail arms must not drop null rows for NE/LT/LE */
     { "expr_null/zone_skip_keeps_nulls_expr",       test_zone_skip_keeps_nulls_expr,       NULL, NULL },
-    { "expr_null/zone_skip_fused_pred_rejects_nullable", test_zone_skip_fused_pred_rejects_nullable, NULL, NULL },
+    { "expr_null/zone_skip_keeps_nulls_fused_pred", test_zone_skip_keeps_nulls_fused_pred, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
