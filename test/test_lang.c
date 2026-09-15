@@ -46,6 +46,7 @@
 #include "lang/eval.h"
 #include "lang/nfo.h"
 #include "lang/format.h"
+#include "core/runtime.h"   /* ray_error_msg */
 #include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/temporal.h"
@@ -3917,11 +3918,16 @@ static bool lang_parted_insert_onecol(const char* root, const char* part,
 }
 
 static test_result_t test_eval_insert_parted_key_types_impl(const char* root) {
-    char iroot[900], sroot[900], src[1400], next_path[1200];
+    char iroot[900], sroot[900], droot[900], oroot[900], src[1400],
+         next_path[1200];
     int ni = snprintf(iroot, sizeof(iroot), "%s/i64", root);
     int ns = snprintf(sroot, sizeof(sroot), "%s/sym", root);
+    int nd = snprintf(droot, sizeof(droot), "%s/dup", root);
+    int no = snprintf(oroot, sizeof(oroot), "%s/ovf", root);
     TEST_ASSERT(ni > 0 && (size_t)ni < sizeof(iroot), "format i64 root");
     TEST_ASSERT(ns > 0 && (size_t)ns < sizeof(sroot), "format sym root");
+    TEST_ASSERT(nd > 0 && (size_t)nd < sizeof(droot), "format dup root");
+    TEST_ASSERT(no > 0 && (size_t)no < sizeof(oroot), "format ovf root");
 
     /* collect_part_dirs orders an all-integer set by VALUE (by name these
      * would be [10,2]), so the I64 MAPCOMMON keys load as [2,10]: 10 is the
@@ -3943,6 +3949,42 @@ static test_result_t test_eval_insert_parted_key_types_impl(const char* root) {
     ASSERT_EQ("(count (insert pi 10 (list 12)))", "3");
     ASSERT_ER_CODE("(insert pi 5 (list 5))", "domain");
     ASSERT_EQ("(count pi)", "2");
+
+    /* Two spellings of one value ("02" and "2") both parse to key 2.  They
+     * sort by name after the value (so the order is filesystem-independent)
+     * and load as equal I64 keys, which the insert validator must reject as
+     * corrupt rather than treat as a growable tail. */
+    TEST_ASSERT(lang_parted_insert_onecol(droot, "2", 2),
+                "save integer partition 2");
+    TEST_ASSERT(lang_parted_insert_onecol(droot, "02", 20),
+                "save integer partition 02");
+    n = snprintf(src, sizeof(src),
+                 "(set pd (.db.parted.get \"%s\" 'trades))", droot);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format dup parted get");
+    setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    ASSERT_EQ("(at (select {from: pd where: (> id 0)}) 'part)", "[2 2]");
+    ASSERT_EQ("(at (select {from: pd where: (> id 0)}) 'id)", "[20 2]");
+    ASSERT_ER_CODE("(insert pd 3 (list 3))", "corrupt");
+
+    /* A digit-only name past int64 makes the set unreadable: the error names
+     * the directory instead of silently retyping every key to SYM. */
+    TEST_ASSERT(lang_parted_insert_onecol(oroot, "1", 1),
+                "save integer partition 1");
+    TEST_ASSERT(lang_parted_insert_onecol(oroot, "99999999999999999999", 2),
+                "save overflowing integer partition");
+    n = snprintf(src, sizeof(src), "(.db.parted.get \"%s\" 'trades)", oroot);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format overflow parted get");
+    ray_t* ovf = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(ovf);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(ovf));
+    TEST_ASSERT_STR_EQ(ray_err_code(ovf), "corrupt");
+    const char* ovf_msg = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(ovf_msg);
+    TEST_ASSERT_TRUE(strstr(ovf_msg, "99999999999999999999") != NULL);
+    ray_error_free(ovf);
 
     /* Opaque directory names use a SYM MAPCOMMON key.  Equal-key growth and
      * a lexically later key follow the same immutable-tail contract. */

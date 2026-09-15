@@ -34,6 +34,7 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "lang/cal.h"   /* MONTHDAYS, date_leap_year — calendar-date validation */
+#include "core/numparse.h"  /* ray_parse_i64 — overflow-checked integer names */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,53 +64,51 @@ static bool is_date_dir(const char* name) {
     return day <= dim;
 }
 
-/* Parse an integer partition name (digits only, possibly with a leading
- * minus) into *out.  False when the name is not all digits OR its value does
- * not fit int64_t: a 20-digit name used to be classified as an integer and
- * then accumulated straight past INT64_MAX — signed-overflow UB that wrapped
- * the partition key to an unrelated number (and aborts under UBSan).  Such a
- * name now fails integer classification, so infer_mc_type falls through to
- * symbol partitioning and the name is kept literal, as an impossible date
- * (2024.02.31) already is. */
-static bool parse_int_name(const char* s, int64_t* out) {
+/* Digit-only name: integer-shaped.  Names get here through the digit/dot
+ * filter in collect_part_dirs, so a sign never occurs. */
+static bool is_digits(const char* s) {
     if (!*s) return false;
-    bool neg = false;
-    if (*s == '-') { neg = true; s++; }
-    if (!*s) return false;
-    /* Accumulate the magnitude negatively: -INT64_MAX-1 is representable,
-     * +INT64_MAX+1 is not, so the negative side covers both signs. */
-    int64_t v = 0;
-    for (; *s; s++) {
+    for (; *s; s++)
         if (*s < '0' || *s > '9') return false;
-        int d = *s - '0';
-        if (v < (INT64_MIN + d) / 10) return false;   /* v*10 - d would overflow */
-        v = v * 10 - d;
-    }
-    if (!neg) {
-        if (v == INT64_MIN) return false;              /* +9223372036854775808 */
-        v = -v;
-    }
-    if (out) *out = v;
     return true;
 }
 
-/* Check if string is a pure integer (digits only, possibly with leading minus)
- * whose value fits int64_t. */
-static bool is_integer_str(const char* s) {
-    return parse_int_name(s, NULL);
+/* Parse a digit-only partition name into *out; false when its value does not
+ * fit int64_t.  ray_parse_i64 is the overflow-checked parser the tokenizer
+ * and the CSV reader use — a 20-digit name used to be accumulated straight
+ * past INT64_MAX here, signed-overflow UB that wrapped the partition key to
+ * an unrelated number in release and aborts under UBSan. */
+static bool parse_int_dir(const char* s, int64_t* out) {
+    size_t n = strlen(s);
+    return n > 0 && ray_parse_i64(s, n, out) == n;
 }
 
-/* Infer MAPCOMMON sub-type from partition directory names. */
-static uint8_t infer_mc_type(char** part_dirs, int64_t part_count) {
-    bool all_date = true, all_int = true;
-    for (int64_t i = 0; i < part_count; i++) {
-        if (all_date && !is_date_dir(part_dirs[i])) all_date = false;
-        if (all_int && !is_integer_str(part_dirs[i])) all_int = false;
-        if (!all_date && !all_int) break;
+/* Classify a partition set by its directory names into the MAPCOMMON key
+ * type: all YYYY.MM.DD → DATE; all digit-only and within int64 → I64;
+ * anything else → SYM (opaque names in string order).
+ *
+ * A digit-only name past int64 in an otherwise all-integer set is
+ * RAY_ERR_CORRUPT with *out_bad = its index rather than a fall-back to SYM:
+ * its intent is unambiguous, and silently retyping the whole set would make
+ * `(== part 2)` match nothing while `(>= part 2)` returned partition 1 too.
+ * In a mixed set every name is an opaque SYM key, so a long digit-only one
+ * is as valid there as any other. */
+static ray_err_t infer_mc_type(char** part_dirs, int64_t part_count,
+                               uint8_t* out_type, int64_t* out_bad) {
+    bool all_date = true, all_digits = true;
+    int64_t unfit = -1;                  /* first digit-only name past int64 */
+    for (int64_t i = 0; i < part_count && (all_date || all_digits); i++) {
+        const char* name = part_dirs[i];
+        if (all_date && !is_date_dir(name)) all_date = false;
+        if (all_digits && !is_digits(name)) all_digits = false;
+        int64_t v;
+        if (all_digits && unfit < 0 && !parse_int_dir(name, &v)) unfit = i;
     }
-    if (all_date) return RAY_MC_DATE;
-    if (all_int) return RAY_MC_I64;
-    return RAY_MC_SYM;
+    if (all_date) { *out_type = RAY_MC_DATE; return RAY_OK; }
+    if (!all_digits) { *out_type = RAY_MC_SYM; return RAY_OK; }
+    if (unfit >= 0) { *out_bad = unfit; return RAY_ERR_CORRUPT; }
+    *out_type = RAY_MC_I64;
+    return RAY_OK;
 }
 
 /* Parse "YYYY.MM.DD" → days since 2000-01-01 (Rayforce epoch).
@@ -127,13 +126,6 @@ static int32_t parse_date_dir(const char* name) {
     return (int32_t)(era * 146097 + (int64_t)doe - 719468 - 10957);
 }
 
-/* Parse integer string → int64_t. Caller guarantees is_integer_str(). */
-static int64_t parse_int_dir(const char* s) {
-    int64_t v = 0;
-    parse_int_name(s, &v);
-    return v;
-}
-
 /* --------------------------------------------------------------------------
  * Partitioned table: date-partitioned directory of splayed tables
  *
@@ -147,20 +139,50 @@ static int64_t parse_int_dir(const char* s) {
  * cover main attack vector.
  * -------------------------------------------------------------------------- */
 
+/* qsort comparators for partition names.  Date names (fixed-width
+ * YYYY.MM.DD) and opaque names sort as strings; an all-integer set sorts by
+ * value, with the name as tie-break so two spellings of one value ("01" and
+ * "1") keep a filesystem-independent order — they load as equal keys, which
+ * the insert validator then reports as corrupt.  Every name of an integer
+ * set passed infer_mc_type's fit check, so the parse here cannot fail. */
+static int name_cmp(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+static int int_name_cmp(const void* a, const void* b) {
+    const char* sa = *(const char* const*)a;
+    const char* sb = *(const char* const*)b;
+    int64_t va = 0, vb = 0;
+    parse_int_dir(sa, &va);
+    parse_int_dir(sb, &vb);
+    if (va != vb) return va < vb ? -1 : 1;
+    return strcmp(sa, sb);
+}
+
 /* --------------------------------------------------------------------------
  * collect_part_dirs — scan db_root for partition directories
  *
- * Collects directory names that match digit/dot pattern, bubble-sorts them
- * into partition-key order (by value for an all-integer set, else by name).
+ * Collects directory names that match digit/dot pattern, classifies the set
+ * (*out_mc_type: RAY_MC_DATE / I64 / SYM) and sorts it into partition-key
+ * order — by value for an integer set, else by name.  Every consumer relies
+ * on that order: ray_read_parted emits the MAPCOMMON keys in it (and query
+ * paths take DATE keys as ascending), ray_parted_tables and ray_parted_fill
+ * read the "most recent" partition as the LAST one.  By name, 10 sorted
+ * before 2 and the last of 1..12 was "9": I64 keys came out unordered and a
+ * table first added in partition 12 was invisible to .db.parted.tables.
  * The symfile (".sym") and its lock are dotfiles, and partition names are
  * digit/dot-only, so neither is ever picked up here.
+ * Returns NULL on success (count may be 0: an empty or non-parted root),
+ * else the error object to hand back to the caller.
  * Caller must free each entry with ray_sys_free and the array itself.
  * -------------------------------------------------------------------------- */
 
-static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
-                                   int64_t* out_count) {
+static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
+                                int64_t* out_count, uint8_t* out_mc_type) {
+    if (out_mc_type) *out_mc_type = RAY_MC_SYM;
     DIR* d = opendir(db_root);
-    if (!d) return RAY_ERR_IO;
+    if (!d)
+        return ray_error("io", "parted %s: cannot enumerate partition directories", db_root);
 
     char** part_dirs = NULL;
     int64_t part_count = 0;
@@ -198,7 +220,8 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
     if (err != RAY_OK) {
         for (int64_t i = 0; i < part_count; i++) ray_free_raw(part_dirs[i]);
         ray_free_raw(part_dirs);
-        return err;
+        return ray_error(ray_err_code_str(err),
+            "parted %s: cannot enumerate partition directories", db_root);
     }
 
     if (part_count == 0) {
@@ -209,50 +232,29 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
         ray_free_raw(part_dirs);
         *out_dirs = NULL;
         *out_count = 0;
-        return RAY_OK;
+        return NULL;
     }
 
-    /* Sort partition names for deterministic order — the key order every
-     * consumer relies on: ray_read_parted emits the MAPCOMMON keys in this
-     * order (and query paths take DATE keys as ascending), ray_parted_tables
-     * and ray_parted_fill read the "most recent" partition as the LAST one.
-     * Date names (fixed-width YYYY.MM.DD) and symbol names sort as strings;
-     * an all-integer set must sort by VALUE — by string, 10 lands before 2
-     * and the last partition of 1..12 is "9", so a table first added in
-     * partition 12 was invisible to .db.parted.tables and I64 keys came out
-     * unordered.  Mirrors infer_mc_type: the set sorts numerically exactly
-     * when it will be classified RAY_MC_I64.
-     * O(n^2) but partition count is typically small (< 1000 daily partitions). */
-    int64_t* int_keys = (int64_t*)ray_alloc_raw((size_t)part_count * sizeof(int64_t));
-    if (!int_keys) {
+    /* Classify, then sort into key order (see above).  A digit-only name
+     * past int64 in an otherwise integer set is a key of no type: fail
+     * naming it rather than hand every consumer a silently retyped set. */
+    uint8_t mc_type = RAY_MC_SYM;
+    int64_t bad = 0;
+    if (infer_mc_type(part_dirs, part_count, &mc_type, &bad) != RAY_OK) {
+        ray_t* e = ray_error("corrupt",
+            "parted %s: partition directory %s: integer name does not fit int64",
+            db_root, part_dirs[bad]);
         for (int64_t i = 0; i < part_count; i++) ray_free_raw(part_dirs[i]);
         ray_free_raw(part_dirs);
-        return RAY_ERR_OOM;
+        return e;
     }
-    bool all_int = true;
-    for (int64_t i = 0; all_int && i < part_count; i++)
-        all_int = parse_int_name(part_dirs[i], &int_keys[i]);
-    for (int64_t i = 0; i < part_count - 1; i++) {
-        for (int64_t j = i + 1; j < part_count; j++) {
-            bool after = all_int ? int_keys[i] > int_keys[j]
-                                 : strcmp(part_dirs[i], part_dirs[j]) > 0;
-            if (after) {
-                char* tmp = part_dirs[i];
-                part_dirs[i] = part_dirs[j];
-                part_dirs[j] = tmp;
-                if (all_int) {
-                    int64_t k = int_keys[i];
-                    int_keys[i] = int_keys[j];
-                    int_keys[j] = k;
-                }
-            }
-        }
-    }
-    ray_free_raw(int_keys);
+    qsort(part_dirs, (size_t)part_count, sizeof(char*),
+          mc_type == RAY_MC_I64 ? int_name_cmp : name_cmp);
 
     *out_dirs = part_dirs;
     *out_count = part_count;
-    return RAY_OK;
+    if (out_mc_type) *out_mc_type = mc_type;
+    return NULL;
 }
 
 /* --------------------------------------------------------------------------
@@ -296,17 +298,18 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
                 "or missing \"\" at position 0)", sym_path);
     }
 
-    /* Scan db_root for partition directories (the ".sym" dotfile is skipped) */
+    /* Scan db_root for partition directories (the ".sym" dotfile is skipped);
+     * the set comes back in key order together with its MAPCOMMON key type. */
     char** part_dirs = NULL;
     int64_t part_count = 0;
-    ray_err_t collect_err = collect_part_dirs(db_root, &part_dirs, &part_count);
-    if (collect_err != RAY_OK) {
+    uint8_t mc_type = RAY_MC_SYM;
+    ray_t* collect_err = collect_part_dirs(db_root, &part_dirs, &part_count, &mc_type);
+    if (collect_err) {
         if (trace)
             fprintf(stderr, "parted.get: collect dirs failed err=%s\n",
-                    ray_err_code_str(collect_err));
+                    ray_err_code(collect_err));
         if (dom) ray_sym_domain_release(dom);
-        return ray_error(ray_err_code_str(collect_err),
-            "parted %s: cannot enumerate partition directories", db_root);
+        return collect_err;
     }
     if (trace)
         fprintf(stderr, "parted.get: parts=%" PRId64 "\n", part_count);
@@ -407,9 +410,6 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         }
     }
 
-    /* Infer MAPCOMMON sub-type from partition directory names */
-    uint8_t mc_type = infer_mc_type(part_dirs, part_count);
-
     /* Build result table: 1 MAPCOMMON + ncols data columns */
     ray_t* result = ray_table_new(ncols + 2);
     if (!result || RAY_IS_ERR(result)) goto fail_tables;
@@ -440,7 +440,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         } else if (mc_type == RAY_MC_I64) {
             int64_t* kv_data = (int64_t*)ray_data(key_values);
             for (int64_t p = 0; p < part_count; p++) {
-                kv_data[p] = parse_int_dir(part_dirs[p]);
+                parse_int_dir(part_dirs[p], &kv_data[p]);
                 rc_data[p] = ray_table_nrows(part_tables[p]);
             }
         } else {
@@ -660,10 +660,8 @@ ray_t* ray_parted_tables(const char* db_root) {
 
     char** part_dirs = NULL;
     int64_t part_count = 0;
-    ray_err_t e = collect_part_dirs(db_root, &part_dirs, &part_count);
-    if (e != RAY_OK)
-        return ray_error(ray_err_code_str(e),
-            "parted %s: cannot enumerate partition directories", db_root);
+    ray_t* e = collect_part_dirs(db_root, &part_dirs, &part_count, NULL);
+    if (e) return e;
     if (part_count <= 0) {
         /* Existing-but-empty (or non-parted) root → no tables.  Return an
          * empty SYM vector rather than an error: a freshly-created db root
@@ -721,10 +719,8 @@ ray_t* ray_parted_fill(const char* db_root) {
 
     char** part_dirs = NULL;
     int64_t part_count = 0;
-    ray_err_t e = collect_part_dirs(db_root, &part_dirs, &part_count);
-    if (e != RAY_OK)
-        return ray_error(ray_err_code_str(e),
-            "parted %s: cannot enumerate partition directories", db_root);
+    ray_t* e = collect_part_dirs(db_root, &part_dirs, &part_count, NULL);
+    if (e) return e;
     if (part_count <= 0) {
         /* Empty (or non-parted) root → nothing to fill.  Matches the
          * "empty vector when nothing needed fixing" contract, so a fill on
