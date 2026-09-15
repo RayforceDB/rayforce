@@ -12,6 +12,30 @@
 
 bool ray_agg_engine_v2 = true;   /* knob; default on */
 
+static _Thread_local agg_route_stats_t route_stats;
+void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
+agg_route_stats_t agg_route_stats(void) { return route_stats; }
+void agg_route_record(agg_route_t route) {
+    static const char* const names[AGG_ROUTE_COUNT] = {
+        "group: none", "group: legacy", "group: slices", "group: parted",
+        "group: v2 serial dense", "group: v2 serial hash", "group: v2 dense",
+        "group: v2 radix", "group: v2 hash", "group: v2 smallhash"
+    };
+    route_stats.routes[route]++;
+    ray_profile_tick(names[route]);
+}
+void agg_route_reason(agg_v2_reason_t reason) {
+    route_stats.last_v2_reason = reason;
+    static const char* const names[] = {
+        "group: v2 admitted", "group: v2 unsupported shape",
+        "group: v2 key expression", "group: v2 unsupported key type",
+        "group: v2 aggregate expression", "group: v2 unsupported aggregate type",
+        "group: v2 buffered aggregate", "group: v2 unsupported parameter",
+        "group: v2 disabled", "group: v2 emit filter"
+    };
+    if (reason != AGG_V2_ADMITTED) ray_profile_tick(names[reason]);
+}
+
 /* Read element `row` of an integer/temporal/SYM column widened to int64. */
 static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row);
 /* Write a finalized scalar cell into output column slot i, marking nulls. */
@@ -24,16 +48,17 @@ ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
                        const uint32_t* gids, int64_t nrows, int64_t ngroups,
                        int64_t kparam);
 
-bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
+agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
+    if (!g || !op || !tbl) return AGG_V2_SHAPE;
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return false;
+    if (!ext) return AGG_V2_SHAPE;
     /* Unbounded keys (>=1): every per-run key buffer the v2 engine touches
      * (key_cols/key_syms, the radix scatter's per-worker key row, key_data,
      * agg_group_keys' data[]) is now an exact carve, and the key-count params
      * downstream are uint32_t — so there is no fixed [16]/[255] cap left to
      * protect.  ext->n_keys is uint32_t (widened, Task 1); dense direct-index
      * routing still self-limits to <=16 inside agg_dense_plan (see there). */
-    if (ext->n_keys < 1) return false;  /* need >=1 key */
+    if (ext->n_keys < 1) return AGG_V2_SHAPE;  /* need >=1 key */
     /* n_aggs == 0 (table-distinct: ray_group(keys, n_keys, NULL, NULL, 0)) is
      * now ADMITTED (cut-3): every strategy below — dense/smallhash/radix
      * parallel, and the serial dense/hash tail in exec_group_v2_run — sizes
@@ -45,7 +70,6 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * `n_keys > 8` guard (group.c) died `nyi` on any 9+-column
      * `(distinct t)` — a live bug, not a deliberate width cap; fixed here
      * instead of adding a parallel distinct-only route. */
-    if (!tbl) return false;
     /* A pushed WHERE filter (g->selection set) is now handled by exec_group_v2's
      * compact-table prologue: it gathers the selected rows of the keys/agg-inputs
      * and runs the normal strategy dispatch on that compact table.  No bail. */
@@ -57,64 +81,70 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
         if (ke && ke->sym == ray_sym_intern("_src", 4)) {
             ray_t* cnt = ray_table_get_col(tbl, ray_sym_intern("_count", 6));
-            if (cnt && cnt->type == RAY_I64) return false;
+            if (cnt && cnt->type == RAY_I64) return AGG_V2_SHAPE;
         }
     }
 
     /* every key must be a plain column scan of a supported type */
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_op_t* key = op_node(g, ext->keys[k]);
-        if (!key || key->opcode != OP_SCAN) return false;
+        if (!key || key->opcode != OP_SCAN) return AGG_V2_KEY_EXPRESSION;
         ray_op_ext_t* kext = find_ext(g, key->id);
         ray_t* kc = kext ? ray_table_get_col(tbl, kext->sym) : NULL;
-        if (!kc) return false;
+        if (!kc) return AGG_V2_SHAPE;
         switch (kc->type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
             case RAY_TIMESTAMP: case RAY_SYM: break;
-            default: return false;
+            default: return AGG_V2_KEY_TYPE;
         }
     }
 
     /* every aggregate must be a registry-resolvable plain-column scan */
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         if (ext->agg_k && ext->agg_k[a]) {
-            if (ext->agg_ops[a] != OP_TOP_N && ext->agg_ops[a] != OP_BOT_N) return false;
-            if (ext->agg_k[a] < 1) return false;
+            if (ext->agg_ops[a] != OP_TOP_N && ext->agg_ops[a] != OP_BOT_N) return AGG_V2_PARAMETER;
+            if (ext->agg_k[a] < 1) return AGG_V2_PARAMETER;
             ray_op_t* in = op_node(g, ext->agg_ins[a]);
-            if (!in || in->opcode != OP_SCAN) return false;
+            if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* ie = find_ext(g, in->id);
             ray_t* ic = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
             const agg_vtable_t* vt = ic ? agg_resolve(ext->agg_ops[a], ic->type) : NULL;
-            if (!vt || vt->kind != ACC_STREAMING) return false;
+            if (!vt) return AGG_V2_AGG_TYPE;
+            if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
             continue;  /* admitted */
         }
         if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
-            if (!agg_is_binary_agg(ext->agg_ops[a])) return false;
+            if (!agg_is_binary_agg(ext->agg_ops[a])) return AGG_V2_SHAPE;
             ray_op_t* xin = op_node(g, ext->agg_ins[a]); ray_op_t* yin = op_node(g, ext->agg_ins2[a]);
-            if (!xin || xin->opcode != OP_SCAN || !yin || yin->opcode != OP_SCAN) return false;
+            if (!xin || xin->opcode != OP_SCAN || !yin || yin->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* xe = find_ext(g, xin->id); ray_op_ext_t* ye = find_ext(g, yin->id);
             ray_t* xc = xe ? ray_table_get_col(tbl, xe->sym) : NULL;
             ray_t* yc = ye ? ray_table_get_col(tbl, ye->sym) : NULL;
-            if (!xc || !yc) return false;
-            if (!agg_resolve(ext->agg_ops[a], xc->type)) return false;
-            if (!agg_resolve(ext->agg_ops[a], yc->type)) return false;
+            if (!xc || !yc) return AGG_V2_SHAPE;
+            if (!agg_resolve(ext->agg_ops[a], xc->type)) return AGG_V2_AGG_TYPE;
+            if (!agg_resolve(ext->agg_ops[a], yc->type)) return AGG_V2_AGG_TYPE;
             continue;  /* admitted */
         }
         if (ext->agg_ops[a] == OP_COUNT) {
             /* count: needs no typed input column */
-            if (!agg_resolve(OP_COUNT, RAY_I64)) return false;
+            if (!agg_resolve(OP_COUNT, RAY_I64)) return AGG_V2_SHAPE;
             continue;
         }
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
-        if (!in || in->opcode != OP_SCAN) return false;
+        if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
         ray_op_ext_t* ie = find_ext(g, in->id);
         ray_t* ic = (ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
-        if (!ic) return false;
+        if (!ic) return AGG_V2_SHAPE;
         const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], ic->type);
-        if (!vt || vt->kind != ACC_STREAMING) return false;
+        if (!vt) return AGG_V2_AGG_TYPE;
+        if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
     }
-    return true;
+    return AGG_V2_ADMITTED;
+}
+
+bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
+    return agg_v2_admission(g, op, tbl) == AGG_V2_ADMITTED;
 }
 
 /* ── Dense grouping eligibility selector (mirrors group.c DA path) ────────
@@ -1629,6 +1659,7 @@ static ray_t* exec_group_v2_parallel_smallhash(
         ray_t** key_cols, int64_t* key_syms,
         const agg_vtable_t** vts, const size_t* off, size_t block,
         ray_t* sel, const int64_t* sel_prefix, int64_t n_sel) {
+    agg_route_record(AGG_ROUTE_V2_SMALLHASH);
     ray_op_ext_t* ext = find_ext(g, op->id);
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     ray_pool_t* pool = ray_pool_get();
@@ -2002,7 +2033,7 @@ static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
         }
     }
     if (c->needs_row)
-        *(int64_t*)(rec + c->row_off) = input_order;
+        memcpy(rec + c->row_off, &input_order, sizeof(input_order));
     return 0;
 }
 
@@ -2129,7 +2160,8 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
             const char* rec = b->buf;
             for (uint32_t i = 0; i < b->n; i++, rec += c->rec) {
                 const int64_t* keys = (const int64_t*)rec;
-                int64_t r = c->needs_row ? *(const int64_t*)(rec + c->row_off) : 0;
+                int64_t r = 0;
+                if (c->needs_row) memcpy(&r, rec + c->row_off, sizeof(r));
                 /* Gather this row's agg values into the dense per-agg buffers
                  * (sequential record read → sequential dense write). */
                 for (uint32_t a = 0; a < n_aggs; a++) {
@@ -2351,6 +2383,7 @@ typedef struct {
 static inline bool agg_put_cell_value(ray_t* out, int64_t i, ray_t* cell) {
     bool is_null = RAY_ATOM_IS_NULL(cell);
     switch (out->type) {
+        case RAY_BOOL: ((uint8_t*)ray_data(out))[i] = cell->b8; break;
         case RAY_F64: ((double*)ray_data(out))[i]  = is_null ? NULL_F64 : cell->f64; break;
         default:      ((int64_t*)ray_data(out))[i] = is_null ? NULL_I64 : cell->i64; break;
     }
@@ -2872,6 +2905,9 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t nrows, ray_t* sel,
                                 const int64_t* sel_prefix, int64_t n_sel,
                                 int64_t group_limit) {
+    agg_route_reason(AGG_V2_ADMITTED);
+    route_stats.nullable_key = false;
+    route_stats.dense_worker_budget = false;
     ray_op_ext_t* ext = find_ext(g, op->id);
 
     /* Exact-size carve for the per-key column pointers + syms (one block, both
@@ -2903,6 +2939,10 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     dense_plan_t dp;
     bool dense = sel ? agg_dense_plan_sel(key_cols, ext->n_keys, n_sel, sel, sel_prefix, &dp)
                      : agg_dense_plan(key_cols, ext->n_keys, vts, ext->n_aggs, nrows, &dp);
+    route_stats.dense_plan_available = dense;
+    for (uint32_t k = 0; k < ext->n_keys; k++)
+        if (key_cols[k]->type != RAY_SYM && ray_vec_may_have_nulls(key_cols[k]))
+            route_stats.nullable_key = true;
 
     /* Compact-fallback helper for the non-chunked shapes (hash-fallback keys,
      * and the serial path): gather selected rows into a compact table once and
@@ -2945,6 +2985,9 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         uint32_t dense_workers = ray_pool_total_workers(pool);
         bool dense_par_ok = dp.ok && dense_workers > 0
             && dp.total_slots <= eff_n / (int64_t)dense_workers;
+        route_stats.dense_worker_budget = dp.ok && !dense_par_ok;
+        if (route_stats.nullable_key) ray_profile_tick("group: nullable key excludes dense/radix");
+        if (route_stats.dense_worker_budget) ray_profile_tick("group: dense worker budget exceeded");
 
         /* RADIX eligibility: every key an int/SYM type with no nulls (same
          * type-set check as agg_dense_plan).  Radix takes the high-card
@@ -2963,11 +3006,13 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
 
         if (dense_par_ok) {
+            agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp,
                                                     sel, sel_prefix, n_sel);
             agg_vo_free(&vo); scratch_free(kc_hdr); return r;
         }
         if (keys_intsym) {
+            agg_route_record(AGG_ROUTE_V2_RADIX);
             /* Sparse integer/SYM ranges use radix deterministically. No sampled
              * cardinality or cache-size crossover is baked into routing. */
             ray_t* r = exec_group_v2_parallel_radix(g, op, tbl, nrows,
@@ -2977,6 +3022,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */
         if (sel) AGG_RUN_COMPACT_FALLBACK();
+        agg_route_record(AGG_ROUTE_V2_HASH);
         { ray_t* r = exec_group_v2_parallel(g, op, tbl, nrows, key_cols, key_syms, vts, off, block);
           agg_vo_free(&vo); scratch_free(kc_hdr); return r; }
     }
@@ -2989,6 +3035,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * count is below the parallel threshold here → small; not a perf blocker). */
     if (sel) AGG_RUN_COMPACT_FALLBACK();
 
+    agg_route_record(dense ? AGG_ROUTE_V2_SERIAL_DENSE : AGG_ROUTE_V2_SERIAL_HASH);
     agg_groups_t groups = {0};
     int grp_rc = dense ? agg_group_keys_dense(key_cols, nrows, &dp, &groups)
                        : agg_group_keys(key_cols, ext->n_keys, nrows, &groups);
@@ -3162,6 +3209,8 @@ static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row
  * Shared by agg_run_one (serial) and the parallel finalize. */
 static void agg_put_cell(ray_t* out, int64_t i, ray_t* cell) {
     switch (out->type) {
+        case RAY_BOOL:
+            ((uint8_t*)ray_data(out))[i] = cell->b8; break;
         case RAY_F64:
             ((double*)ray_data(out))[i] = cell->f64; break;
         default: /* RAY_I64 (and temporal widths if they arise) */

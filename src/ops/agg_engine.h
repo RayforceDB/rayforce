@@ -7,8 +7,55 @@
 #include "ops/agg_acc.h"    /* agg_vtable_t */
 
 /* Test/feature knob: route OP_GROUP through the v2 engine when it can handle
- * the query (see agg_v2_can_handle). Default false → zero behavioral change. */
+ * the query (see agg_v2_can_handle). Enabled by default. */
 extern bool ray_agg_engine_v2;
+
+/* Admission is pure: inspecting a plan must not change execution diagnostics. */
+typedef enum {
+    AGG_V2_ADMITTED,
+    AGG_V2_SHAPE,
+    AGG_V2_KEY_EXPRESSION,
+    AGG_V2_KEY_TYPE,
+    AGG_V2_AGG_EXPRESSION,
+    AGG_V2_AGG_TYPE,
+    AGG_V2_BUFFERED,
+    AGG_V2_PARAMETER,
+    AGG_V2_DISABLED,
+    AGG_V2_EMIT_FILTER,
+} agg_v2_reason_t;
+
+agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+
+typedef enum {
+    AGG_ROUTE_NONE,
+    AGG_ROUTE_LEGACY,
+    AGG_ROUTE_SLICES,
+    AGG_ROUTE_PARTED,
+    AGG_ROUTE_V2_SERIAL_DENSE,
+    AGG_ROUTE_V2_SERIAL_HASH,
+    AGG_ROUTE_V2_DENSE,
+    AGG_ROUTE_V2_RADIX,
+    AGG_ROUTE_V2_HASH,
+    AGG_ROUTE_V2_SMALLHASH,
+    AGG_ROUTE_COUNT,
+} agg_route_t;
+
+/* Per-calling-thread dispatch counts since reset, not a whole-query trace.
+ * Nested/partitioned groups may record multiple routes. Incremented only at
+ * dispatch boundaries, never inside worker row loops. A count records an
+ * attempted dispatch (which may subsequently fail), not successful completion.
+ * last_v2_reason describes the most recent legacy/v2 admission decision. */
+typedef struct {
+    uint64_t routes[AGG_ROUTE_COUNT];
+    agg_v2_reason_t last_v2_reason;
+    bool nullable_key;              /* last v2 run: non-SYM key may contain nulls */
+    bool dense_plan_available;      /* last v2 run: bounded dense range exists */
+    bool dense_worker_budget;       /* that plan exceeded the per-worker slot budget */
+} agg_route_stats_t;
+void agg_route_reset(void);
+agg_route_stats_t agg_route_stats(void);
+void agg_route_record(agg_route_t route);
+void agg_route_reason(agg_v2_reason_t reason);
 
 /* True iff the v2 engine fully supports this group node over this table.
  * Conservative: any uncertainty → false → caller uses the existing engine. */

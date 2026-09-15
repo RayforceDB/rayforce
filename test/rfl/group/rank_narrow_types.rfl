@@ -1,0 +1,25 @@
+;; Grouped BOOL/F32 med and quantile share the rank kernel. Check values,
+;; output types, nulls, selections and parameter validation end to end.
+(set B (table [k v] (list [0 0 1 1] [false true true true])))
+(set BM (select {from:B by:k m:(med v) q:(quantile v 0.25) asc:k}))
+(at BM 'm) -- [0.5 1.0]
+(at BM 'q) -- [0.25 1.0]
+(type (at BM 'm)) -- 'F64
+(at (select {from:B by:k m:(med v) where:(== k 0)}) 'm) -- [0.5]
+
+(set D (table [k v] (list [0 0 1 1 2 2] [1.25 3.25 0N 4.5 0N 0N])))
+(set F (select {from:D k:k v:(as 'F32 v)}))
+(type (at F 'v)) -- 'F32
+(set FM (select {from:F by:k m:(med v) q:(quantile v 0.25) asc:k}))
+(at FM 'm) -- [2.25 4.5 0N]
+(at FM 'q) -- [1.75 4.5 0N]
+(type (at FM 'm)) -- 'F64
+(at (select {from:F by:k m:(med v) where:(< k 2) asc:k}) 'm) -- [2.25 4.5]
+(at (select {from:F m:(med v)}) 'm) -- [3.25]
+(at (select {from:F by:k q:(percentile v 25) asc:k}) 'q) -- [1.75 4.5 0N]
+(count (select {from:F by:k m:(med v) where:(< k 0)})) -- 0
+(select {from:F by:k q:(quantile v 2.0)}) !- domain
+
+;; Adding another aggregate must not change rank semantics.
+(at (select {from:F by:k m:(med v) n:(count v) lo:(min v) asc:k}) 'm) -- [2.25 4.5 0N]
+(at (select {from:B by:k m:(med v) n:(count v) a:(any v) asc:k}) 'm) -- [0.5 1.0]

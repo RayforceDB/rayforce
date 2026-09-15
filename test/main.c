@@ -123,6 +123,7 @@ extern const test_entry_t fvec_entries[];
 extern const test_entry_t graph_entries[];
 extern const test_entry_t agg_registry_entries[];
 extern const test_entry_t agg_engine_entries[];
+extern const test_entry_t agg_contract_entries[];
 extern const test_entry_t graph_builtin_entries[];
 extern const test_entry_t group_extra_entries[];
 extern const test_entry_t group_pushdown_entries[];
@@ -181,6 +182,7 @@ static const test_entry_t* const compiled_groups[] = {
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
     agg_registry_entries,
     agg_engine_entries,
+    agg_contract_entries,
     group_extra_entries,
     group_pushdown_entries,
     fused_topk_entries,
