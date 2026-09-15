@@ -17,7 +17,7 @@ The `rayforce` binary operates in three modes depending on how it is invoked:
 echo '(+ 1 2)' | ./rayforce
 ```
 
-Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, and core count, then shows the `‣` prompt.
+Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool includes every online logical CPU, including SMT threads. Use `-c N` to choose a total worker count explicitly. Individual operations may use fewer tasks when their workload or memory budget requires it.
 
 ## REPL Commands
 

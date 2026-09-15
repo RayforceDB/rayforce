@@ -35,6 +35,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -1313,7 +1314,27 @@ static test_result_t test_epoll_hup_no_errfn(void) {
  * Suite definition
  * -------------------------------------------------------------------------- */
 
+#if defined(__linux__) || defined(__APPLE__)
+static test_result_t test_auto_all_logical_cpus(void) {
+    const char* current = getenv("RAYFORCE_CORES");
+    char* saved = current ? strdup(current) : NULL;
+    TEST_ASSERT_TRUE(!current || saved);
+    unsetenv("RAYFORCE_CORES");
+    ray_pool_t local;
+    ray_err_t rc = ray_pool_create(&local, 0);
+    uint32_t total = rc == RAY_OK ? ray_pool_total_workers(&local) : 0;
+    if (rc == RAY_OK) ray_pool_free(&local);
+    if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(total, ray_thread_count());
+    PASS();
+}
+#endif
+
 const test_entry_t pool_entries[] = {
+#if defined(__linux__) || defined(__APPLE__)
+    { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
+#endif
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
     { "pool/parallel_group_sum", test_parallel_group_sum, NULL, NULL },

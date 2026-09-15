@@ -402,7 +402,7 @@ static void print_banner(void) {
     fprintf(stdout,
         "\033[1m"
         "  RayforceDB: %s %s\n"
-        "  %s %"PRId64"(MB) %d core(s)\n"
+        "  %s %"PRId64"(MB) %d logical CPU(s)\n"
         "  Using %u worker(s)\n"
 #ifdef DEBUG
         "  Build: debug (ASan + UBSan, -O0)\n"

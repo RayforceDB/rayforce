@@ -1,6 +1,6 @@
 # Aggregation and query type coverage results
 
-Status: P0–P10 complete. Validation limitation: ThreadSanitizer could not start on this host (details below).
+Status: default-launch correction implemented and validated. The original eight-core results remain below for context; they did not establish default-launch performance. ThreadSanitizer could not start on this host (details below).
 
 Baseline binary: release build at `500ea392` (P0). The allocator-only comparison
 and initial census remain in [the plan](aggregation-fast-path-plan.md).
@@ -46,7 +46,7 @@ indices instead of streaming accumulator states.
 - Eval-level `as 'F32` remains outside this change's language surface. F32 test
   and benchmark fixtures use the existing query projection cast or C constructors.
 
-## GrandU
+## GrandU: original eight-core measurements
 
 Same CSV and 95-column schema, eight cores, repeated query-only timings after
 loading. Input: 13,916,401 rows. Output: 1,104,673 groups. Query:
@@ -83,6 +83,69 @@ whose workers repeatedly traverse the entire key domain.
 `make test` relinks `rayforce` with sanitizers. Performance runs therefore use
 saved immutable release binaries; sanitizer timings are excluded.
 
+
+## Default-launch correction
+
+The original completion claim was too broad: every performance comparison
+forced `-c 8`. On the same machine, an ordinary launch used 20 physical-core
+workers and rejected dense aggregation because 20 full slot slabs exceeded its
+budget. Reproduction on the cached GrandU columns measured 119.4 ms at P0,
+121.6 ms at `4286de9f`, and 55.4 ms only when forcing eight workers. The user
+correctly reported no default-launch improvement.
+
+Dense execution now allocates slabs per logical task, with the task count chosen
+from the existing byte budget and capped by pool size. Tasks own their slabs by
+task index, never by whichever physical worker steals the task. Initialization,
+selected/unselected accumulation, merge, and emission retain explicit ownership.
+A large pool can therefore execute the dense plan without reserving a full slab
+for every worker or changing the global pool setting. Sampled worker-traffic
+admission uses the same logical input partitions.
+
+The requested default pool policy now uses all online logical CPUs, including
+SMT threads. On this i7-14700, the interactive banner verifies **28 logical CPUs /
+28 workers**. Explicit `-c N` remains an override. The old banner mislabeled
+logical CPUs as cores.
+
+Validation after the correction: **3,802/3,802 ASan/UBSan tests passed**,
+including automatic logical-CPU sizing. The ten aggregation contract tests also
+passed after the final guard against reading an invalid dense plan. A 20-worker
+fixture verifies that fewer logical tasks execute dense grouping correctly,
+with and without a pushed selection, while leaving pool size unchanged.
+The corrected interactive release banner was checked directly.
+
+Exact full CSV/schema/query, five warm repetitions per process, no concurrent
+build/test work. Baseline here is the previously pushed `4286de9f`:
+
+| Launch | Old warm median (range), ms | Corrected warm median (range), ms |
+|---|---:|---:|
+| Default, first pair | 180.7 (174.3–281.1), 20 workers | 97.7 (95.6–100.2), 28 workers |
+| Default, reverse-order pair | 187.2 (175.3–209.9), 20 workers | 93.4 (86.2–99.8), 28 workers |
+| Explicit 28 workers | 169.6 (164.5–190.0) | Same 28-worker execution as corrected default above |
+| Explicit 20 workers | Same 20-worker execution as old default above | 91.7 (88.3–97.9) |
+
+The default-run comparison improves by approximately **1.85–2.00x** on this
+machine. Fixed-count controls distinguish the dispatch fix from the requested
+change to all logical CPUs. Cold default queries were 193.6 / 257.8 ms old and
+103.8 / 107.7 ms corrected. Sorted serialized full-query results are byte-for-byte
+identical, including types and nulls. The default synthetic fixture measured
+63.6 ms old versus 61.4 ms corrected, with overlapping ranges.
+
+Cached GrandU two-column warm medians across explicit worker counts:
+
+| Workers | Old ms | Corrected ms |
+|---|---:|---:|
+| 1 | 81.0 | 79.5 |
+| 2 | 59.5 | 58.7 |
+| 4 | 47.5 | 48.0 |
+| 8 | 56.0 | 52.7 |
+| 20 | 126.5 | 59.6 |
+| 28 | 113.6 | 59.5 |
+
+[grandu_csv.rfl](../bench/groupby_shapes/grandu_csv.rfl) contains the exact
+reported schema and query. Run it from the directory containing `GrandU.csv`,
+using saved old/new release binaries **without `-c`**, then repeat in reverse
+order. The first printed time is CSV loading; input/output row counts are
+separate; the first query time is cold. No private data is included in the repo.
 
 ## Portable performance matrix
 

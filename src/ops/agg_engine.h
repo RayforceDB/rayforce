@@ -53,6 +53,7 @@ typedef struct {
     bool nullable_key;              /* last v2 run: non-SYM key may contain nulls */
     bool dense_plan_available;      /* last v2 run: bounded dense range exists */
     bool dense_worker_budget;       /* worker allocation or sampled traffic budget exceeded */
+    uint32_t dense_tasks;           /* selected logical dense tasks, may be less than pool workers */
 } agg_route_stats_t;
 void agg_route_reset(void);
 agg_route_stats_t agg_route_stats(void);

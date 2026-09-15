@@ -276,6 +276,35 @@ static test_result_t test_group_routes_and_bool_outputs(void) {
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 1);
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 80000);
     ray_release(r);
+    /* A larger machine must not lose dense execution solely because a slab
+     * for every physical worker would exceed the budget. Logical task IDs
+     * own the slabs, including selected-row tasks run by a larger pool. */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(20), RAY_OK);
+    setup = ray_eval_str("(set traffic_g (div traffic_i 13)) (set traffic_t (table [k v] (list (as 'I32 (+ (* traffic_g 2) (div traffic_g 4))) (as 'TIME traffic_g))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    const char* queries[] = {
+        "(select {from:traffic_t by:k s:(min v)})",
+        "(select {from:traffic_t by:k s:(min v) where:(> v 100)})"
+    };
+    for (int selected = 0; selected < 2; selected++) {
+        agg_route_reset(); r = ray_eval_str(queries[selected]);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        stats = agg_route_stats();
+        TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+        TEST_ASSERT_TRUE(stats.dense_tasks > 0 && stats.dense_tasks < 20);
+        TEST_ASSERT_EQ_I(ray_pool_total_workers(ray_pool_get()), 20);
+        TEST_ASSERT_EQ_I(ray_table_nrows(r), 76924 - selected * 101);
+        ray_t* keys = ray_table_get_col_idx(r, 0);
+        ray_t* values = ray_table_get_col_idx(r, 1);
+        TEST_ASSERT_EQ_I(values->type, RAY_TIME);
+        for (int64_t row = 0; row < values->len; row++) {
+            int32_t value = ((int32_t*)ray_data(values))[row];
+            TEST_ASSERT_EQ_I(((int32_t*)ray_data(keys))[row], value * 2 + value / 4);
+            TEST_ASSERT_TRUE(!selected || value > 100);
+        }
+        ray_release(r);
+    }
     PASS();
 }
 

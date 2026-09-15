@@ -1,0 +1,11 @@
+;; Run from the directory containing GrandU.csv, with no -c override.
+;; Exact reported schema/query; load and row counts are printed separately.
+(println (timeit (set t (.csv.read ['DATE 'I32 'SYM 'I32 'SYM 'SYM 'TIME 'TIME 'F64 'F64 'I64 'I64 'I64 'SYM 'GUID 'SYM 'LIST 'LIST 'I64 'I64 'F64 'I64 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'LIST 'SYM 'SYM 'F64 'LIST 'LIST 'LIST 'LIST 'LIST 'LIST 'SYM 'GUID 'F64 'LIST 'I64 'LIST 'SYM 'SYM 'I64 'LIST 'LIST 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'SYM 'F64 'LIST 'I32 'I64 'I32 'F64 'F64 'F64 'F64 'I64 'I64 'I64 'I64 'SYM 'I32 'I64] "GrandU.csv"))))
+(println (count t))
+(println (timeit (set r (select {from:t s:(min time) by:client_order_id}))))
+(println (count r))
+(println (timeit (select {from:t s:(min time) by:client_order_id})))
+(println (timeit (select {from:t s:(min time) by:client_order_id})))
+(println (timeit (select {from:t s:(min time) by:client_order_id})))
+(println (timeit (select {from:t s:(min time) by:client_order_id})))
+(println (timeit (select {from:t s:(min time) by:client_order_id})))

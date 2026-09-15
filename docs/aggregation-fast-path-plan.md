@@ -1,6 +1,6 @@
 # Query fast-path type coverage: implementation plan
 
-Status: P0–P10 complete; implementation, regression tests, and performance closure recorded below. ThreadSanitizer could not start on this host; see the results for that validation limitation.
+Status: P10 default-launch correction implemented and validated. The original eight-core closure missed the default-worker regression; the follow-up below supersedes that completion claim. See the results for measurements and the TSan validation limitation.
 
 Implementation, route decisions, and measurements: [results](aggregation-fast-path-results.md).
 
@@ -75,6 +75,25 @@ Baseline: `70a539e8`, 2026-09-15. Motivation: GrandU
   linked in the results document.
 - TSan builds succeeded, but normal and non-PIE runs both failed at startup
   with `unexpected memory mapping`; no TSan race verdict is claimed.
+
+### P10 default-launch correction — 2026-09-15
+
+The user reproduced unchanged GrandU performance after `4286de9f`. The original
+benchmarks forced eight workers; the default 20-worker pool exceeded the dense
+allocation budget and fell back to radix. This was an actual missed dispatch
+case, not evidence that the user ran the wrong test or binary.
+
+Dense slabs are now owned by a budgeted number of logical tasks, independent
+of pool size and physical worker IDs. The requested default uses all online
+logical CPUs (28 here), and the banner names that count correctly. A 20-worker
+test covers bounded dense tasks and pushed selections; a separate pool test
+checks the default against the logical CPU count.
+
+Full suite: **3,802/3,802 passed**. The exact full GrandU CSV/query without `-c`
+measured 180.7 / 187.2 ms old versus 97.7 / 93.4 ms corrected, with identical
+sorted serialized output. Fixed 20/28-worker controls and a 1/2/4/8/20/28-worker
+sweep are recorded in the results. The exact CSV benchmark is now checked in;
+private data remains outside the repository.
 
 ## Objective and scope
 
