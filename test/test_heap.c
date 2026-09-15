@@ -41,6 +41,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "core/pool.h"
 
 /* Restore the shipped policy after a test drives it. */
 #define RAY_HEAP_DECAY_MS_TEST_DEFAULT 10000
@@ -2463,10 +2464,105 @@ static test_result_t test_order_overflow_guards(void) {
     PASS();
 }
 
-/* Anon watermark: once our anonymous (RAM) footprint would cross the watermark,
- * further large allocations spill to a disk-backed file instead of anonymous
- * RAM (which the kernel could accept then OOM-kill).  Drive it with a low
- * watermark so the crossing is deterministic regardless of machine RAM. */
+/* Direct-cache reuse must follow the byte budget, not a fixed entry count or
+ * admission order. Check retained-byte accounting as well as payload reuse. */
+static test_result_t test_direct_cache_many_entries(void) {
+    enum { N = 24 };
+    const size_t size = 40u * 1024 * 1024;
+    ray_t* blocks[N] = {0};
+    ray_heap_direct_cache_drain();
+    int64_t base = ray_heap_anon_committed();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark((int64_t)size * 16 * 32);
+    int64_t bytes = 0;
+    bool ok = true;
+    for (int i = 0; i < N; i++) {
+        blocks[i] = ray_alloc(size);
+        if (!blocks[i]) { ok = false; break; }
+        bytes += (int64_t)ray_direct_map_size(blocks[i]);
+        *(uint64_t*)ray_data(blocks[i]) = UINT64_C(0x123456789abcdef0);
+    }
+    for (int i = 0; i < N; i++) { if (blocks[i]) ray_free(blocks[i]); blocks[i] = NULL; }
+    bool retained = ray_heap_anon_committed() == base + bytes;
+    for (int i = 0; i < N && ok; i++) {
+        blocks[i] = ray_alloc(size);
+        if (!blocks[i] || *(uint64_t*)ray_data(blocks[i]) != UINT64_C(0x123456789abcdef0)) ok = false;
+    }
+    bool reused = ray_heap_anon_committed() == base + bytes;
+    for (int i = 0; i < N; i++) if (blocks[i]) ray_free(blocks[i]);
+    ray_heap_direct_cache_drain();
+    bool drained = ray_heap_anon_committed() == base;
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_TRUE(ok && retained && reused && drained);
+    PASS();
+}
+
+static test_result_t test_direct_cache_replaces_old_blocks(void) {
+    const size_t small = 40u * 1024 * 1024, large = 55u * 1024 * 1024;
+    ray_heap_direct_cache_drain();
+    int64_t base = ray_heap_anon_committed();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(96) * 1024 * 1024 * 16);
+    ray_t* a = ray_alloc(small);
+    ray_t* b = ray_alloc(small);
+    ray_t* c = ray_alloc(large);
+    bool ok = a && b && c;
+    int64_t expected = base;
+    if (ok) {
+        expected += (int64_t)ray_direct_map_size(b) + (int64_t)ray_direct_map_size(c);
+        *(uint64_t*)ray_data(b) = 42;
+        *(uint64_t*)ray_data(c) = 99;
+    }
+    if (a) ray_free(a);
+    if (b) ray_free(b);
+    if (c) ray_free(c);
+    bool replaced = ray_heap_anon_committed() == expected;
+    a = ray_alloc(small); b = ray_alloc(large);
+    bool reused = a && b && *(uint64_t*)ray_data(a) == 42 && *(uint64_t*)ray_data(b) == 99;
+    if (a) ray_free(a);
+    if (b) ray_free(b);
+    ray_heap_direct_cache_drain();
+    bool drained = ray_heap_anon_committed() == base;
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_TRUE(ok && replaced && reused && drained);
+    PASS();
+}
+
+static void direct_cache_churn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    _Atomic(int)* errors = raw;
+    for (int64_t task = start; task < end; task++) {
+        for (int round = 0; round < 8; round++) {
+            const size_t sa = 40u * 1024 * 1024, sb = 55u * 1024 * 1024;
+            ray_t* a = ray_alloc(sa);
+            uint64_t tag = (uint64_t)(task * 16 + round + 1);
+            if (a) { ((uint64_t*)ray_data(a))[0] = tag; ((uint8_t*)ray_data(a))[sa - 1] = (uint8_t)tag; }
+            ray_t* b = ray_alloc(sb);
+            if (b) { ((uint64_t*)ray_data(b))[0] = tag; ((uint8_t*)ray_data(b))[sb - 1] = (uint8_t)tag; }
+            if (task == 0 && round == 3) ray_heap_direct_cache_drain();
+            if (!a || !b || ((uint64_t*)ray_data(a))[0] != tag || ((uint8_t*)ray_data(a))[sa - 1] != (uint8_t)tag)
+                atomic_fetch_add_explicit(errors, 1, memory_order_relaxed);
+            if (a) ray_free(a);
+            if (b && (((uint64_t*)ray_data(b))[0] != tag || ((uint8_t*)ray_data(b))[sb - 1] != (uint8_t)tag))
+                atomic_fetch_add_explicit(errors, 1, memory_order_relaxed);
+            if (b) ray_free(b);
+        }
+    }
+}
+
+static test_result_t test_direct_cache_concurrent_replacement(void) {
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(96) * 1024 * 1024 * 16);
+    _Atomic(int) errors = 0;
+    ray_pool_dispatch_n(ray_pool_get(), direct_cache_churn, &errors, 8);
+    ray_heap_direct_cache_drain();
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_EQ_I(atomic_load_explicit(&errors, memory_order_relaxed), 0);
+    PASS();
+}
+
+/* Drive the anon-to-file crossing with a low watermark, independent of RAM. */
 static test_result_t test_anon_watermark_spill(void) {
     size_t sz = 40 * 1024 * 1024 - 128;   /* order 26 → direct path */
     /* Start from an empty reuse cache: leftover cached blocks from earlier
@@ -2886,6 +2982,9 @@ const test_entry_t heap_entries[] = {
     { "heap/free_no_heap",             test_free_no_heap,                      heap_setup, heap_teardown },
     { "heap/pool_of_oversized_walk",   test_pool_of_oversized_walk,            heap_setup, heap_teardown },
     { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
+    { "heap/direct_cache_many_entries", test_direct_cache_many_entries, heap_setup, heap_teardown },
+    { "heap/direct_cache_replaces_old", test_direct_cache_replaces_old_blocks, heap_setup, heap_teardown },
+    { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },
     { "heap/slab_gc_drains_wide",      test_slab_gc_drains_wide,         heap_setup, heap_teardown },

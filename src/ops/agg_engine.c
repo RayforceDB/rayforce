@@ -1167,6 +1167,7 @@ static ray_t* exec_group_v2_parallel_dense(
     agg_dense_merge_ctx_t merge_ctx = { .locals = locals, .slots = total_slots,
         .vts = vts, .off = off, .block = block, .n_aggs = n_aggs, .nw = nw };
     ray_pool_dispatch_n(pool, agg_dense_init_fn, &merge_ctx, nw);
+    ray_profile_tick("dense: initialized slabs");
     int alloc_oom = 0;
     for (uint32_t w = 0; w < nw; w++) if (!locals[w].ready) alloc_oom = 1;
     if (alloc_oom) {
@@ -1196,6 +1197,7 @@ static ray_t* exec_group_v2_parallel_dense(
     /* Sel mode dispatches over the SELECTED-row space [0,n_sel); each worker
      * range maps to a segment span via sel_prefix.  Non-sel dispatches over rows. */
     ray_pool_dispatch_n(pool, agg_dense_task_fn, &ctx, nw);
+    ray_profile_tick("dense: accumulated rows");
 
     for (uint32_t w = 0; w < nw; w++)
         if (locals[w].oom || agg_cancelled()) {
@@ -1221,6 +1223,7 @@ static ray_t* exec_group_v2_parallel_dense(
     }
     merge_ctx.states = gstates; merge_ctx.first = gfirst;
     ray_pool_dispatch(pool, agg_dense_merge_fn, &merge_ctx, total_slots);
+    ray_profile_tick("dense: merged slabs");
     if (agg_cancelled()) {
         for (uint32_t i = 0; i < nw; i++) agg_dense_local_destroy(&locals[i]);
         ray_free_raw(locals); ray_free_raw(gstates); ray_free_raw(gfirst);
@@ -1240,6 +1243,7 @@ static ray_t* exec_group_v2_parallel_dense(
      * still the gather index (any member row) for the key columns. */
     int64_t ng = 0;
     for (int64_t s = 0; s < total_slots; s++) if (gfirst[s] != INT64_MAX) ng++;
+    ray_profile_tick("dense: freed slabs and counted groups");
 
     int64_t* occupied_slot     = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
     int64_t* first_row_ordered = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));

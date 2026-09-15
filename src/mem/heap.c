@@ -1232,17 +1232,24 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
  * again on reuse.  Under watermark pressure the cache is drained before
  * new memory is committed.  File-backed spill blocks are never cached.
  *
- * Fit: first block with map_size in [need, need + max(need/4, 2MB)] — the
+ * Fit: best block with map_size in [need, need + max(need/4, 2MB)] — the
  * repeat-query case hits exactly; the bound keeps waste at <= 25%.
- * Concurrency: any thread may alloc or free a direct block, so a global
- * spinlock guards the table — direct ops are a handful per query, so
- * contention is nil.  Budget: 1/16 of the anon watermark (physical RAM
- * by default, the -m budget when set), capped at 512MB — no knob; the
- * cache is invisible to correctness and self-drains under pressure. */
-#define RAY_DIRECT_CACHE_SLOTS 16
-typedef struct { void* base; size_t map_size; } ray_direct_cache_slot_t;
-static ray_direct_cache_slot_t g_direct_cache[RAY_DIRECT_CACHE_SLOTS];
-static size_t          g_direct_cache_bytes = 0;
+ * Concurrency: any thread may alloc or free a direct block. A global lock
+ * guards an intrusive FIFO of recently freed blocks. Its links reuse the dead
+ * allocation's prefix, so entry count needs no allocation or arbitrary cap.
+ * Replacement evicts the oldest cached blocks to admit newly freed scratch;
+ * obsolete CSV buffers cannot monopolize the byte budget indefinitely.
+ * Detached mappings are returned to the OS outside the cache lock. */
+typedef struct ray_direct_cache_node {
+    struct ray_direct_cache_node* next;
+    struct ray_direct_cache_node* prev;
+    size_t map_size;
+} ray_direct_cache_node_t;
+_Static_assert(sizeof(ray_direct_cache_node_t) <= RAY_DIRECT_HDR,
+               "cached links must fit in the dead direct-allocation prefix");
+static ray_direct_cache_node_t* g_direct_cache_head;
+static ray_direct_cache_node_t* g_direct_cache_tail;
+static size_t g_direct_cache_bytes;
 static _Atomic(int)    g_direct_cache_spin = 0;
 
 static inline void direct_cache_lock(void) {
@@ -1267,65 +1274,83 @@ static size_t direct_cache_budget(void) {
     return b;
 }
 
-/* Take a cached block whose map_size fits [need, need + waste bound].
- * Returns the base pointer (its map_size in *out_size) or NULL. */
+/* Caller holds the lock. Ownership transfers from the cache to the caller. */
+static void direct_cache_unlink(ray_direct_cache_node_t* node) {
+    if (node->prev) node->prev->next = node->next;
+    else g_direct_cache_head = node->next;
+    if (node->next) node->next->prev = node->prev;
+    else g_direct_cache_tail = node->prev;
+    g_direct_cache_bytes -= node->map_size;
+}
+
+/* Only detached nodes are passed here. No cache lock is held across munmap. */
+static void direct_cache_release(ray_direct_cache_node_t* node) {
+    while (node) {
+        ray_direct_cache_node_t* next = node->next;
+        size_t bytes = node->map_size;
+        atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)bytes, memory_order_relaxed);
+        ray_vm_free(node, bytes);
+        node = next;
+    }
+}
+
+/* Best fitting cached block within the existing waste bound. Exact matches
+ * stop the search; similar-sized analytical scratch is the common case. */
 static void* direct_cache_take(size_t need, size_t* out_size) {
-    void* base = NULL;
     direct_cache_lock();
     size_t slack = need / 4;
     if (slack < (2u << 20)) slack = (2u << 20);
-    for (int i = 0; i < RAY_DIRECT_CACHE_SLOTS; i++) {
-        size_t ms = g_direct_cache[i].map_size;
-        if (g_direct_cache[i].base && ms >= need && ms - need <= slack) {
-            base = g_direct_cache[i].base;
-            *out_size = ms;
-            g_direct_cache[i].base = NULL;
-            g_direct_cache[i].map_size = 0;
-            g_direct_cache_bytes -= ms;
-            break;
+    ray_direct_cache_node_t* best = NULL;
+    for (ray_direct_cache_node_t* node = g_direct_cache_head; node; node = node->next) {
+        size_t bytes = node->map_size;
+        if (bytes >= need && bytes - need <= slack && (!best || bytes < best->map_size)) {
+            best = node;
+            if (bytes == need) break;
         }
     }
+    if (best) {
+        *out_size = best->map_size;
+        direct_cache_unlink(best);
+    }
     direct_cache_unlock();
-    return base;
+    return best;
 }
 
-/* Stash a freed ANON block; returns true when cached (caller must then
- * NOT munmap or un-commit it). */
+/* Recently freed blocks replace the oldest cached blocks within the unchanged
+ * byte budget. The caller has already removed this block from live statistics. */
 static bool direct_cache_put(void* base, size_t map_size) {
     size_t budget = direct_cache_budget();
-    if (budget == 0) return false;
-    bool cached = false;
+    if (map_size > budget) return false;
+    ray_direct_cache_node_t* evicted = NULL;
     direct_cache_lock();
-    if (g_direct_cache_bytes + map_size <= budget) {
-        for (int i = 0; i < RAY_DIRECT_CACHE_SLOTS; i++) {
-            if (!g_direct_cache[i].base) {
-                g_direct_cache[i].base = base;
-                g_direct_cache[i].map_size = map_size;
-                g_direct_cache_bytes += map_size;
-                cached = true;
-                break;
-            }
-        }
+    while (g_direct_cache_bytes > budget - map_size) {
+        ray_direct_cache_node_t* old = g_direct_cache_head;
+        direct_cache_unlink(old);
+        old->next = evicted;
+        evicted = old;
     }
+    ray_direct_cache_node_t* node = base;
+    node->map_size = map_size;
+    node->next = NULL;
+    node->prev = g_direct_cache_tail;
+    if (g_direct_cache_tail) g_direct_cache_tail->next = node;
+    else g_direct_cache_head = node;
+    g_direct_cache_tail = node;
+    g_direct_cache_bytes += map_size;
     direct_cache_unlock();
-    return cached;
+    direct_cache_release(evicted);
+    return true;
 }
 
-/* Release every cached block back to the kernel (memory pressure). */
+/* Detach under the lock; return mappings to the OS without blocking alloc/free
+ * callers on kernel unmapping and TLB invalidation. */
 static void direct_cache_drain(void) {
     direct_cache_lock();
-    for (int i = 0; i < RAY_DIRECT_CACHE_SLOTS; i++) {
-        if (g_direct_cache[i].base) {
-            size_t ms = g_direct_cache[i].map_size;
-            atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)ms,
-                                      memory_order_relaxed);
-            ray_vm_free(g_direct_cache[i].base, ms);
-            g_direct_cache[i].base = NULL;
-            g_direct_cache[i].map_size = 0;
-            g_direct_cache_bytes -= ms;
-        }
-    }
+    ray_direct_cache_node_t* nodes = g_direct_cache_head;
+    g_direct_cache_head = g_direct_cache_tail = NULL;
+    g_direct_cache_bytes = 0;
     direct_cache_unlock();
+    direct_cache_release(nodes);
 }
 
 void ray_heap_direct_cache_drain(void) {
