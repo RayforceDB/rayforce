@@ -1,0 +1,16 @@
+Baseline failures reproduced on bb81e621
+
+Use the baseline binary identified in environment.json:
+python3 bench/groupby_shapes/grouping_scaling.py --binary /path/to/baseline --workers 1 --rounds 1 --cases CASE --output /tmp/CASE.json
+
+distinct-string-values:
+=== rayforce fatal SIGSEGV at fault addr 0x0000000000000008 ===
+
+mixed-distinct-string-values:
+=== rayforce fatal SIGSEGV at fault addr 0x0000000000000000 ===
+
+distinct-list-keys:
+error: type: vec_new: type must be a positive concrete vector type, got LIST
+
+mixed-distinct-list-keys:
+error: type: vec_new: type must be a positive concrete vector type, got LIST

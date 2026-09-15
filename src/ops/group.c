@@ -32,6 +32,7 @@
 #include "vec/str.h"        /* ray_str_t SSO hash/eq for wide STR group keys */
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
 #include "core/runtime.h"   /* __VM — per-thread group-key cardinality hint */
+#include "core/profile.h"
 
 #include <stdlib.h>
 
@@ -2121,6 +2122,8 @@ typedef struct {
     double*        scratch_pool; /* flat shared scratch, sized at sum(grp_cnt) */
     double*        out_data;     /* ray_data(out) */
     ray_t*         out;          /* for set_null */
+    _Atomic(bool)  any_null;
+    const uint8_t* handled;
 } med_par_ctx_t;
 
 typedef struct {
@@ -2147,6 +2150,7 @@ typedef struct {
     const int64_t* grp_cnt;
     _Atomic(int)   oom;
     _Atomic(int)   cancel;
+    _Atomic(bool)  any_null;
 } mode_par_ctx_t;
 
 static inline double med_read_as_f64(const void* base, int8_t t, int64_t row) {
@@ -2181,11 +2185,52 @@ static inline bool med_is_null(const void* base, int8_t t, int64_t row) {
     }
 }
 
+/* Balance contiguous groups by input work, keeping large groups in separate
+ * tasks. The bounded wrapper also avoids dispatch_n's ring-growth failure path. */
+typedef struct {
+    ray_pool_fn fn;
+    void* context;
+    int64_t begin[RAY_POOL_INIT_TASKS];
+    int64_t end[RAY_POOL_INIT_TASKS];
+} group_work_t;
+static void group_work_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    group_work_t* c = raw;
+    for (int64_t t = start; t < end; t++) c->fn(c->context, wid, c->begin[t], c->end[t]);
+}
+void ray_group_dispatch(ray_pool_fn fn, void* context, const int64_t* counts, int64_t groups) {
+    ray_pool_t* pool = ray_pool_get();
+    int64_t work = 0;
+    for (int64_t g = 0; g < groups; g++) work += counts[g] + 1;
+    if (groups < 2 || !ray_pool_par_dispatch_ok(pool, work, 4096)) {
+        fn(context, 0, 0, groups); return;
+    }
+    uint32_t budget = ray_pool_total_workers(pool) * 8;
+    if (budget > RAY_POOL_INIT_TASKS / 2) budget = RAY_POOL_INIT_TASKS / 2;
+    int64_t grain = (work + budget - 1) / budget;
+    group_work_t tasks = {.fn = fn, .context = context};
+    uint32_t n = 0;
+    int64_t begin = 0, cost = 0;
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t next = counts[g] + 1;
+        if (g > begin && cost + next > grain) {
+            tasks.begin[n] = begin; tasks.end[n++] = g; begin = g; cost = 0;
+        }
+        cost += next;
+        if (cost >= grain) {
+            tasks.begin[n] = begin; tasks.end[n++] = g + 1; begin = g + 1; cost = 0;
+        }
+    }
+    if (begin < groups) { tasks.begin[n] = begin; tasks.end[n++] = groups; }
+    ray_pool_dispatch_n(pool, group_work_run, &tasks, n);
+}
+
 static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
                              int64_t start, int64_t end) {
     (void)worker_id;
     med_par_ctx_t* c = (med_par_ctx_t*)ctx_v;
+    bool any_null = false;
     for (int64_t g = start; g < end; g++) {
+        if (c->handled && c->handled[g]) continue;
         int64_t cnt = c->grp_cnt[g];
         int64_t off = c->offsets[g];
         double* slice = c->scratch_pool ? c->scratch_pool + off : NULL;
@@ -2203,13 +2248,158 @@ static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
             }
         }
         if (actual == 0) {
-            par_set_null(c->out, g);
+            c->out_data[g] = NULL_F64;
+            any_null = true;
         } else {
             c->out_data[g] = c->use_quantile
                 ? ray_quantile_dbl_inplace(slice, actual, c->q)
                 : ray_median_dbl_inplace(slice, actual);
         }
     }
+    if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
+}
+
+/* Exact selection within a dominant group. Count the pivot partitions in
+ * parallel and retain only the partition containing the requested adjacent
+ * ranks. The sample chooses work, never the answer. At most one extra double
+ * buffer is live; a depth bound falls back to the existing exact nth kernel. */
+typedef struct {
+    int64_t less, equal, count, offset;
+    double max_less, min_greater;
+} rank_task_t;
+typedef struct {
+    const med_par_ctx_t* source;
+    const int64_t* rows;
+    double* input;
+    double* output;
+    int64_t n;
+    uint32_t tasks;
+    double pivot;
+    bool keep_less;
+    rank_task_t task[RAY_POOL_INIT_TASKS];
+} rank_split_t;
+
+static void rank_gather_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; rank_split_t* c = raw;
+    const med_par_ctx_t* s = c->source;
+    for (int64_t t = start; t < end; t++) {
+        int64_t begin = c->n / c->tasks * t;
+        int64_t limit = t + 1 == c->tasks ? c->n : c->n / c->tasks * (t + 1);
+        int64_t count = 0;
+        for (int64_t i = begin; i < limit; i++) {
+            int64_t row = c->rows[i];
+            if (s->has_nulls && med_is_null(s->base, s->src_type, row)) continue;
+            c->input[begin + count++] = med_read_as_f64(s->base, s->src_type, row);
+        }
+        c->task[t].count = count;
+    }
+}
+static void rank_compact_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; rank_split_t* c = raw;
+    for (int64_t t = start; t < end; t++)
+        memcpy(c->output + c->task[t].offset, c->input + c->n / c->tasks * t,
+               (size_t)c->task[t].count * sizeof(double));
+}
+static void rank_count_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; rank_split_t* c = raw;
+    for (int64_t t = start; t < end; t++) {
+        int64_t begin = c->n / c->tasks * t;
+        int64_t limit = t + 1 == c->tasks ? c->n : c->n / c->tasks * (t + 1);
+        int64_t less = 0, equal = 0;
+        double max_less = -INFINITY, min_greater = INFINITY;
+        for (int64_t i = begin; i < limit; i++) {
+            double v = c->input[i];
+            if (v < c->pivot) { less++; if (v > max_less) max_less = v; }
+            else if (v > c->pivot) { if (v < min_greater) min_greater = v; }
+            else equal++;
+        }
+        c->task[t].less = less; c->task[t].equal = equal;
+        c->task[t].max_less = max_less; c->task[t].min_greater = min_greater;
+    }
+}
+static void rank_scatter_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; rank_split_t* c = raw;
+    for (int64_t t = start; t < end; t++) {
+        int64_t begin = c->n / c->tasks * t;
+        int64_t limit = t + 1 == c->tasks ? c->n : c->n / c->tasks * (t + 1);
+        int64_t at = c->task[t].offset;
+        for (int64_t i = begin; i < limit; i++) {
+            double v = c->input[i];
+            if (c->keep_less ? v < c->pivot : v > c->pivot) c->output[at++] = v;
+        }
+    }
+}
+static bool rank_large_group(med_par_ctx_t* source, int64_t group,
+        double* temporary, ray_pool_t* pool, double* answer) {
+    rank_split_t c = {.source = source, .rows = source->idx_buf + source->offsets[group],
+        .input = source->scratch_pool + source->offsets[group], .output = temporary,
+        .n = source->grp_cnt[group], .tasks = ray_pool_total_workers(pool) * 4};
+    if (c.tasks > RAY_POOL_INIT_TASKS) c.tasks = RAY_POOL_INIT_TASKS;
+    ray_pool_dispatch_n(pool, rank_gather_run, &c, c.tasks);
+    if (ray_interrupted() || atomic_load(&pool->cancelled)) return false;
+    int64_t valid = 0;
+    for (uint32_t t = 0; t < c.tasks; t++) {
+        c.task[t].offset = valid; valid += c.task[t].count;
+    }
+    if (!valid) { *answer = NULL_F64; atomic_store(&source->any_null, true); return true; }
+    if (valid != c.n) {
+        ray_pool_dispatch_n(pool, rank_compact_run, &c, c.tasks);
+        if (ray_interrupted() || atomic_load(&pool->cancelled)) return false;
+        double* swap = c.input; c.input = c.output; c.output = swap;
+    }
+    c.n = valid;
+    double fraction = 0;
+    int64_t lo, hi;
+    if (source->use_quantile) {
+        double position = source->q * (double)(valid - 1);
+        lo = (int64_t)position; fraction = position - (double)lo;
+        hi = fraction > 0 ? lo + 1 : lo;
+    } else { lo = (valid - 1) / 2; hi = valid / 2; }
+    double lower = 0, upper = 0;
+    bool found = false;
+    for (unsigned depth = 0; depth < 32 && c.n >= RAY_PARALLEL_THRESHOLD; depth++) {
+        double sample[33];
+        int64_t step = c.n / 33;
+        for (int i = 0; i < 33; i++)
+            sample[i] = c.input[i * step + ray_hash_i64(i + depth * 33) % step];
+        c.pivot = ray_median_dbl_inplace(sample, 33);
+        ray_pool_dispatch_n(pool, rank_count_run, &c, c.tasks);
+        if (ray_interrupted() || atomic_load(&pool->cancelled)) return false;
+        int64_t less = 0, equal = 0;
+        double max_less = -INFINITY, min_greater = INFINITY;
+        for (uint32_t t = 0; t < c.tasks; t++) {
+            less += c.task[t].less; equal += c.task[t].equal;
+            if (c.task[t].max_less > max_less) max_less = c.task[t].max_less;
+            if (c.task[t].min_greater < min_greater) min_greater = c.task[t].min_greater;
+        }
+        if (hi < less) c.keep_less = true;
+        else if (lo >= less + equal) c.keep_less = false;
+        else {
+            lower = lo < less ? max_less : c.pivot;
+            upper = hi >= less + equal ? min_greater : c.pivot;
+            found = true; break;
+        }
+        int64_t next = 0;
+        for (uint32_t t = 0; t < c.tasks; t++) {
+            c.task[t].offset = next;
+            int64_t begin = c.n / c.tasks * t;
+            int64_t limit = t + 1 == c.tasks ? c.n : c.n / c.tasks * (t + 1);
+            next += c.keep_less ? c.task[t].less : limit - begin - c.task[t].less - c.task[t].equal;
+        }
+        ray_pool_dispatch_n(pool, rank_scatter_run, &c, c.tasks);
+        if (ray_interrupted() || atomic_load(&pool->cancelled)) return false;
+        if (!c.keep_less) { lo -= less + equal; hi -= less + equal; }
+        c.n = next;
+        double* swap = c.input; c.input = c.output; c.output = swap;
+    }
+    if (!found) {
+        lower = ray_nth_dbl_inplace(c.input, c.n, lo);
+        upper = hi == lo ? lower : ray_nth_dbl_inplace(c.input, c.n, hi);
+    }
+    *answer = source->use_quantile
+        ? (fraction > 0 ? lower + fraction * (upper - lower) : lower)
+        : (valid % 2 ? lower : (lower + upper) / 2.0);
+    return true;
 }
 
 static double decode_agg_f64_param(int64_t bits) {
@@ -2263,20 +2453,32 @@ static ray_t* rank_per_group_buf(ray_t* src,
     };
 
     ray_pool_t* pool = ray_pool_get();
-    bool par = pool && n_groups >= 8 && total >= 4096;
-    if (par) {
-        /* dispatch_n's task ring is capped at MAX_RING_CAP (65536); when
-         * n_groups exceeds that, fall back to elements-based dispatch
-         * (auto-grows grain so every group is covered).  Under the cap,
-         * one task per group gives the best parallelism for small K
-         * per-group work like quickselect. */
-        if (n_groups < (1 << 16))
-            ray_pool_dispatch_n(pool, med_per_group_fn, &ctx, (uint32_t)n_groups);
-        else
-            ray_pool_dispatch(pool, med_per_group_fn, &ctx, n_groups);
-    } else {
-        med_per_group_fn(&ctx, 0, 0, n_groups);
+    int64_t threshold = 262144, largest = 0;
+    if (ray_pool_par_dispatch_ok(pool, total, threshold)) {
+        int64_t share = total / ray_pool_total_workers(pool);
+        if (share > threshold) threshold = share;
+        for (int64_t g = 0; g < n_groups; g++)
+            if (grp_cnt[g] >= threshold && grp_cnt[g] > largest) largest = grp_cnt[g];
     }
+    double* temporary = largest ? ray_alloc_raw((size_t)largest * sizeof(double)) : NULL;
+    uint8_t* handled = temporary ? ray_calloc_raw((size_t)n_groups) : NULL;
+    if (handled) {
+        ctx.handled = handled;
+        for (int64_t g = 0; g < n_groups; g++) if (grp_cnt[g] >= threshold) {
+            if (!rank_large_group(&ctx, g, temporary, pool, &ctx.out_data[g])) break;
+            handled[g] = 1;
+        }
+    }
+    ray_free_raw(temporary);
+    ray_profile_tick("rank: selected dominant groups");
+    ray_group_dispatch(med_per_group_fn, &ctx, grp_cnt, n_groups);
+    ray_profile_tick("rank: reduced remaining groups");
+    ray_free_raw(handled);
+    if (ray_interrupted() || (pool && atomic_load(&pool->cancelled))) {
+        if (buf_hdr) scratch_free(buf_hdr);
+        ray_release(out); return ray_error("cancel", NULL);
+    }
+    if (atomic_load_explicit(&ctx.any_null, memory_order_relaxed)) out->attrs |= RAY_ATTR_HAS_NULLS;
 
     if (buf_hdr) scratch_free(buf_hdr);
     return out;
@@ -2362,21 +2564,15 @@ static inline void mode_copy_fixed_cell(ray_t* out, int64_t dst,
 }
 
 static inline void mode_set_null_cell(ray_t* out, int64_t dst) {
+    void* data = ray_data(out);
     switch (out->type) {
-        case RAY_F64:
-        case RAY_F32:
-        case RAY_I64:
-        case RAY_TIMESTAMP:
-        case RAY_I32:
-        case RAY_DATE:
-        case RAY_TIME:
-        case RAY_I16:
-            par_set_null(out, dst);
-            return;
+        case RAY_F64: ((double*)data)[dst] = NULL_F64; return;
+        case RAY_F32: ((float*)data)[dst] = NULL_F32; return;
+        case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)data)[dst] = NULL_I64; return;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)data)[dst] = NULL_I32; return;
+        case RAY_I16: ((int16_t*)data)[dst] = NULL_I16; return;
         case RAY_GUID:
-            memset((uint8_t*)ray_data(out) + (size_t)dst * 16, 0, 16);
-            __atomic_fetch_or(&out->attrs, (uint8_t)RAY_ATTR_HAS_NULLS,
-                              __ATOMIC_RELAXED);
+            memset((uint8_t*)data + (size_t)dst * 16, 0, 16);
             return;
         case RAY_STR:
             memset((ray_str_t*)ray_data(out) + dst, 0, sizeof(ray_str_t));
@@ -2506,6 +2702,7 @@ static void mode_fixed_per_group_fn(void* ctx_v, uint32_t worker_id,
                                     int64_t start, int64_t end) {
     (void)worker_id;
     mode_par_ctx_t* c = (mode_par_ctx_t*)ctx_v;
+    bool any_null = false;
     for (int64_t g = start; g < end; g++) {
         if (atomic_load_explicit(&c->oom, memory_order_relaxed) ||
             atomic_load_explicit(&c->cancel, memory_order_relaxed))
@@ -2524,42 +2721,48 @@ static void mode_fixed_per_group_fn(void* ctx_v, uint32_t worker_id,
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             return;
         }
-        if (best < 0) mode_set_null_cell(c->out, g);
+        if (best < 0) {
+            mode_set_null_cell(c->out, g);
+            any_null = true;
+        }
         else mode_copy_fixed_cell(c->out, g, c->src, best);
     }
+    if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
 }
 
-static ray_t* mode_str_per_group_buf(ray_t* src,
-                                     const int64_t* idx_buf,
-                                     const int64_t* offsets,
-                                     const int64_t* grp_cnt,
-                                     int64_t n_groups) {
-    ray_t* out = col_vec_new(src, n_groups);
-    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-    out->len = n_groups;
-
-    for (int64_t g = 0; g < n_groups; g++) {
+typedef struct {
+    ray_t* src;
+    const int64_t* rows;
+    const int64_t* offsets;
+    const int64_t* counts;
+    int64_t* winners;
+    _Atomic(bool) oom, cancel;
+} mode_str_work_t;
+static void mode_str_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; mode_str_work_t* c = raw;
+    ray_t* src = c->src;
+    const int64_t* idx_buf = c->rows;
+    const int64_t* offsets = c->offsets;
+    const int64_t* grp_cnt = c->counts;
+    for (int64_t g = start; g < end; g++) {
         int64_t cnt = grp_cnt[g];
         int64_t off = offsets[g];
         uint64_t cap = mode_hash_cap(cnt);
         if (!cap || cap > SIZE_MAX / sizeof(mode_wide_entry_t)) {
-            ray_release(out);
-            return ray_error("oom", NULL);
+            atomic_store(&c->oom, true); return;
         }
         ray_t* hdr = NULL;
         mode_wide_entry_t* ht = (mode_wide_entry_t*)scratch_calloc(
             &hdr, (size_t)cap * sizeof(mode_wide_entry_t));
         if (!ht) {
-            ray_release(out);
-            return ray_error("oom", NULL);
+            atomic_store(&c->oom, true); return;
         }
         uint64_t mask = cap - 1;
         int64_t best_count = 0, best_row = -1, best_pos = INT64_MAX;
         for (int64_t i = 0; i < cnt; i++) {
             if ((i & 65535) == 0 && ray_interrupted()) {
                 scratch_free(hdr);
-                ray_release(out);
-                return ray_error("cancel", "interrupted");
+                atomic_store(&c->cancel, true); return;
             }
             int64_t row = idx_buf[off + i];
             size_t len = 0;
@@ -2600,19 +2803,21 @@ static ray_t* mode_str_per_group_buf(ray_t* src,
             }
         }
         scratch_free(hdr);
-        if (best_row < 0) {
-            mode_set_null_cell(out, g);
-        } else {
-            size_t len = 0;
-            const char* s = ray_str_vec_get(src, best_row, &len);
-            ray_t* nv = ray_str_vec_set(out, g, s ? s : "", s ? len : 0);
-            if (!nv || RAY_IS_ERR(nv)) {
-                ray_release(out);
-                return nv ? nv : ray_error("oom", NULL);
-            }
-            out = nv;
-        }
+        c->winners[g] = best_row;
     }
+}
+static ray_t* mode_str_per_group_buf(ray_t* src, const int64_t* rows,
+        const int64_t* offsets, const int64_t* counts, int64_t ng) {
+    int64_t* winners = ray_alloc_raw((size_t)(ng ? ng : 1) * sizeof(int64_t));
+    if (!winners) return ray_error("oom", NULL);
+    mode_str_work_t work = {.src = src, .rows = rows, .offsets = offsets,
+        .counts = counts, .winners = winners, .oom = false, .cancel = false};
+    ray_group_dispatch(mode_str_run, &work, counts, ng);
+    ray_pool_t* pool = ray_pool_get();
+    bool cancel = atomic_load(&work.cancel) || (pool && atomic_load(&pool->cancelled));
+    ray_t* out = cancel ? ray_error("cancel", NULL) : atomic_load(&work.oom)
+        ? ray_error("oom", NULL) : ray_group_gather(src, winners, ng);
+    ray_free_raw(winners);
     return out;
 }
 
@@ -2643,8 +2848,6 @@ ray_t* ray_mode_per_group_buf(ray_t* src,
     if (src->type == RAY_STR)
         return mode_str_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups);
 
-    int64_t total = 0;
-    for (int64_t g = 0; g < n_groups; g++) total += grp_cnt[g];
 
     ray_t* out = col_vec_new(src, n_groups);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -2662,17 +2865,7 @@ ray_t* ray_mode_per_group_buf(ray_t* src,
         .cancel = 0,
     };
 
-    ray_pool_t* pool = ray_pool_get();
-    bool par = pool && n_groups >= 8 && total >= 4096;
-    if (par) {
-        if (n_groups < (1 << 16))
-            ray_pool_dispatch_n(pool, mode_fixed_per_group_fn, &ctx,
-                                (uint32_t)n_groups);
-        else
-            ray_pool_dispatch(pool, mode_fixed_per_group_fn, &ctx, n_groups);
-    } else {
-        mode_fixed_per_group_fn(&ctx, 0, 0, n_groups);
-    }
+    ray_group_dispatch(mode_fixed_per_group_fn, &ctx, grp_cnt, n_groups);
 
     if (atomic_load_explicit(&ctx.cancel, memory_order_relaxed) ||
         ray_interrupted()) {
@@ -2683,9 +2876,9 @@ ray_t* ray_mode_per_group_buf(ray_t* src,
         ray_release(out);
         return ray_error("oom", NULL);
     }
-    if (out->type != RAY_STR && out->type != RAY_BOOL &&
-        out->type != RAY_U8 && out->type != RAY_SYM)
-        par_finalize_nulls(out);
+    if (atomic_load_explicit(&ctx.any_null, memory_order_relaxed) &&
+        out->type != RAY_BOOL && out->type != RAY_U8)
+        out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
 }
 
@@ -2919,7 +3112,7 @@ static void topk_per_group_fn(void* ctx_v, uint32_t worker_id,
 
 /* Wide and F32 top-K retain source row ids, so domains/string owners never
  * enter worker state. Scratch is bounded by K, independent of group size. */
-static int topk_row_cmp(ray_t* src, int64_t a, int64_t b) {
+static int topk_row_cmp(ray_t* src, int64_t a, int64_t b, const ray_group_sym_view_t* view) {
     const void* data = ray_data(src);
     if (src->type == RAY_F32) {
         float x = ((const float*)data)[a], y = ((const float*)data)[b];
@@ -2928,8 +3121,8 @@ static int topk_row_cmp(ray_t* src, int64_t a, int64_t b) {
     if (src->type == RAY_GUID)
         return memcmp((const char*)data + (size_t)a * 16, (const char*)data + (size_t)b * 16, 16);
     if (src->type == RAY_SYM) {
-        ray_t* x = ray_sym_domain_str(ray_sym_vec_domain(src), ray_read_sym(data, a, src->type, src->attrs));
-        ray_t* y = ray_sym_domain_str(ray_sym_vec_domain(src), ray_read_sym(data, b, src->type, src->attrs));
+        ray_t* x = ray_group_sym_read(view, ray_sym_vec_domain(src), ray_read_sym(data, a, src->type, src->attrs));
+        ray_t* y = ray_group_sym_read(view, ray_sym_vec_domain(src), ray_read_sym(data, b, src->type, src->attrs));
         return ray_str_cmp(x, y);
     }
     size_t na = 0, nb = 0;
@@ -2939,29 +3132,45 @@ static int topk_row_cmp(ray_t* src, int64_t a, int64_t b) {
     int cmp = common ? memcmp(x, y, common) : 0;
     return cmp ? cmp : (na > nb) - (na < nb);
 }
-static void topk_rows_sift(ray_t* src, int64_t* heap, int64_t n, int64_t root, bool desc) {
+static void topk_rows_sift(ray_t* src, int64_t* heap, int64_t n, int64_t root, bool desc, const ray_group_sym_view_t* view) {
     for (;;) {
         int64_t child = root * 2 + 1;
         if (child >= n) return;
         if (child + 1 < n) {
-            int cmp = topk_row_cmp(src, heap[child + 1], heap[child]);
+            int cmp = topk_row_cmp(src, heap[child + 1], heap[child], view);
             if (desc ? cmp < 0 : cmp > 0) child++;
         }
-        int cmp = topk_row_cmp(src, heap[child], heap[root]);
+        int cmp = topk_row_cmp(src, heap[child], heap[root], view);
         if (!(desc ? cmp < 0 : cmp > 0)) return;
         int64_t tmp = heap[root]; heap[root] = heap[child]; heap[child] = tmp;
         root = child;
     }
 }
-static ray_t* topk_wide_per_group_buf(ray_t* src, int64_t k, bool desc,
-        const int64_t* rows, const int64_t* offsets, const int64_t* counts, int64_t ng) {
+typedef struct {
+    ray_t* src;
+    int64_t k;
+    bool desc;
+    const int64_t* rows;
+    const int64_t* offsets;
+    const int64_t* counts;
+    ray_t** cells;
+    _Atomic(bool) oom;
+    _Atomic(ray_t*) error;
+    ray_group_sym_view_t symbols;
+} topk_wide_work_t;
+static void topk_wide_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; topk_wide_work_t* c = raw;
+    ray_t* src = c->src;
+    const int64_t* rows = c->rows;
+    const int64_t* offsets = c->offsets;
+    const int64_t* counts = c->counts;
+    bool desc = c->desc;
     int64_t max_count = 0;
-    for (int64_t g = 0; g < ng; g++) if (counts[g] > max_count) max_count = counts[g];
-    int64_t cap = k < max_count ? k : max_count;
+    for (int64_t g = start; g < end; g++) if (counts[g] > max_count) max_count = counts[g];
+    int64_t cap = c->k < max_count ? c->k : max_count;
     int64_t* heap = ray_alloc_raw((size_t)(cap > 0 ? cap : 1) * sizeof(int64_t));
-    ray_t* out = ray_list_new(ng);
-    if (!heap || !out || RAY_IS_ERR(out)) { ray_free_raw(heap); if (out && !RAY_IS_ERR(out)) ray_release(out); return ray_error("oom", NULL); }
-    for (int64_t g = 0; g < ng; g++) {
+    if (!heap) { atomic_store(&c->oom, true); return; }
+    for (int64_t g = start; g < end; g++) {
         int64_t kept = 0;
         for (int64_t j = 0; j < counts[g]; j++) {
             int64_t row = rows[offsets[g] + j];
@@ -2969,24 +3178,48 @@ static ray_t* topk_wide_per_group_buf(ray_t* src, int64_t k, bool desc,
             if (kept < cap) {
                 heap[kept++] = row;
                 if (kept == cap)
-                    for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc);
+                    for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc, &c->symbols);
             } else {
-                int cmp = topk_row_cmp(src, row, heap[0]);
-                if (desc ? cmp > 0 : cmp < 0) { heap[0] = row; topk_rows_sift(src, heap, kept, 0, desc); }
+                int cmp = topk_row_cmp(src, row, heap[0], &c->symbols);
+                if (desc ? cmp > 0 : cmp < 0) { heap[0] = row; topk_rows_sift(src, heap, kept, 0, desc, &c->symbols); }
             }
         }
         if (kept < cap)
-            for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc);
+            for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc, &c->symbols);
         for (int64_t n = kept; n > 1; n--) {
             int64_t tmp = heap[0]; heap[0] = heap[n - 1]; heap[n - 1] = tmp;
-            topk_rows_sift(src, heap, n - 1, 0, desc);
+            topk_rows_sift(src, heap, n - 1, 0, desc, &c->symbols);
         }
         ray_t* cell = gather_by_idx(src, heap, kept);
-        if (!cell || RAY_IS_ERR(cell)) { ray_free_raw(heap); ray_release(out); return cell ? cell : ray_error("oom", NULL); }
-        out = ray_list_append(out, cell); ray_release(cell);
-        if (!out || RAY_IS_ERR(out)) { ray_free_raw(heap); return out ? out : ray_error("oom", NULL); }
+        if (!cell || RAY_IS_ERR(cell)) {
+            if (cell) {
+                ray_t* expected = NULL;
+                if (!atomic_compare_exchange_strong(&c->error, &expected, cell)) ray_release(cell);
+            }
+            atomic_store(&c->oom, true); break;
+        }
+        c->cells[g] = cell; /* transfer ownership to a disjoint list slot */
     }
     ray_free_raw(heap);
+}
+static ray_t* topk_wide_per_group_buf(ray_t* src, int64_t k, bool desc,
+        const int64_t* rows, const int64_t* offsets, const int64_t* counts, int64_t ng) {
+    ray_t* out = ray_list_new(ng);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = ng;
+    memset(ray_data(out), 0, (size_t)ng * sizeof(ray_t*));
+    topk_wide_work_t work = {.src = src, .k = k, .desc = desc, .rows = rows,
+        .offsets = offsets, .counts = counts, .cells = ray_data(out), .oom = false, .error = NULL};
+    if (src->type == RAY_SYM) ray_sym_strings_borrow(&work.symbols.strings, &work.symbols.count);
+    ray_group_dispatch(topk_wide_run, &work, counts, ng);
+    ray_pool_t* pool = ray_pool_get();
+    bool cancel = pool && atomic_load(&pool->cancelled);
+    ray_t* error = atomic_load(&work.error);
+    if (cancel || atomic_load(&work.oom)) {
+        ray_release(out);
+        if (error) return error;
+        return ray_error(cancel ? "cancel" : "oom", NULL);
+    }
     return out;
 }
 
@@ -3007,8 +3240,6 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
         t != RAY_TIMESTAMP)
         return NULL;
 
-    int64_t total = 0;
-    for (int64_t g = 0; g < n_groups; g++) total += grp_cnt[g];
 
     ray_t* out = ray_list_new(n_groups);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -3048,18 +3279,7 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
         .oom = &oom,
     };
 
-    ray_pool_t* pool = ray_pool_get();
-    bool par = pool && n_groups >= 8 && total >= 4096;
-    if (par) {
-        /* See ray_median_per_group_buf for the rationale on the
-         * dispatch_n vs dispatch split. */
-        if (n_groups < (1 << 16))
-            ray_pool_dispatch_n(pool, topk_per_group_fn, &ctx, (uint32_t)n_groups);
-        else
-            ray_pool_dispatch(pool, topk_per_group_fn, &ctx, n_groups);
-    } else {
-        topk_per_group_fn(&ctx, 0, 0, n_groups);
-    }
+    ray_group_dispatch(topk_per_group_fn, &ctx, grp_cnt, n_groups);
 
     if (atomic_load_explicit(&oom, memory_order_relaxed)) {
         ray_release(out);
@@ -3067,6 +3287,21 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
     }
 
     return out;
+}
+
+typedef struct {
+    ray_t* src;
+    uint16_t op;
+    const int64_t* rows;
+    const int64_t* offsets;
+    const int64_t* counts;
+    int64_t* winners;
+    bool has_nulls;
+} wide_winners_t;
+static void wide_winners_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; wide_winners_t* c = raw;
+    for (int64_t g = start; g < end; g++)
+        c->winners[g] = wide_winner_row(c->src, c->op, c->rows + c->offsets[g], c->counts[g], c->has_nulls);
 }
 
 /* ─── ray_wide_minmax_per_group_buf ───────────────────────────────────────
@@ -3079,9 +3314,8 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
  * materialises that element into a typed result column.  LIST elements retain
  * the selected boxed child into a new owning list.
  *
- * Runs SERIAL: ray_str_vec_set COW-mutates the result vector and its shared
- * string pool, so concurrent group writers would corrupt the pool.  Wide
- * min/max is a cold path, not a vectorised bench kernel, so this is fine. */
+ * Winner selection runs in parallel over immutable source columns. Result
+ * ownership and pooled string construction are handled after the barrier. */
 ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
                                      const int64_t* idx_buf,
                                      const int64_t* offsets,
@@ -3091,38 +3325,16 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
     if (!agg_needs_row_gather(src->type, op)) return NULL;  /* caller falls back */
     bool has_nulls = ray_vec_may_have_nulls(src);
 
-    ray_t* out = src->type == RAY_LIST
-        ? ray_list_new(n_groups)
-        : col_vec_new(src, n_groups);
-    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-    /* LIST length advances with initialized child slots so every error path
-     * releases exactly the children whose ownership has been retained. */
-    out->len = src->type == RAY_LIST ? 0 : n_groups;
-
-    for (int64_t g = 0; g < n_groups; g++) {
-        int64_t cnt = grp_cnt[g];
-        int64_t off = offsets[g];
-        int64_t best = wide_winner_row(src, op, &idx_buf[off], cnt, has_nulls);
-        if (src->type == RAY_LIST) {
-            ray_t* e = best < 0 ? NULL : ((ray_t**)ray_data(src))[best];
-            if (e) ray_retain(e);
-            ((ray_t**)ray_data(out))[g] = e;
-            out->len = g + 1;
-            continue;
-        }
-        if (best < 0) { ray_vec_set_null(out, g, true); continue; }
-        int alloc;
-        ray_t* e = collection_elem(src, best, &alloc);
-        if (src->type == RAY_STR) {
-            ray_t* nv = ray_str_vec_set(out, g, ray_str_ptr(e), ray_str_len(e));
-            if (alloc) ray_release(e);
-            if (!nv || RAY_IS_ERR(nv)) { if (nv != out) ray_release(out); return nv ? nv : ray_error("oom", NULL); }
-            out = nv;
-        } else {  /* RAY_GUID — fixed 16-byte in-place store */
-            store_typed_elem(out, g, e);
-            if (alloc) ray_release(e);
-        }
+    int64_t* winners = ray_alloc_raw((size_t)(n_groups ? n_groups : 1) * sizeof(int64_t));
+    if (!winners) return ray_error("oom", NULL);
+    wide_winners_t work = {src, op, idx_buf, offsets, grp_cnt, winners, has_nulls};
+    ray_group_dispatch(wide_winners_run, &work, grp_cnt, n_groups);
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+        ray_free_raw(winners); return ray_error("cancel", NULL);
     }
+    ray_t* out = ray_group_gather(src, winners, n_groups);
+    ray_free_raw(winners);
     return out;
 }
 

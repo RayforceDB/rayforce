@@ -83,6 +83,56 @@ static const agg_vtable_t COUNT_ANY = {
 
 /* ---- min / max I64 (empty group → typed null) ------------------------ */
 typedef struct { int64_t v; int64_t cnt; } ext_i64_state;
+/* Narrow native extrema need a value and validity, not a 64-bit count. */
+typedef struct { _Alignas(8) int32_t v; uint32_t seen; } ext_i32_state;
+_Static_assert(sizeof(ext_i32_state) == 8, "shared extrema require one aligned 64-bit state");
+static void min_i32_init(void* s) { *(ext_i32_state*)s = (ext_i32_state){ INT32_MAX, 0 }; }
+static void max_i32_init(void* s) { *(ext_i32_state*)s = (ext_i32_state){ INT32_MIN, 0 }; }
+static void min_i32_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; const ext_i32_state* src = s; ext_i32_state* dst = d;
+    if (src->seen && src->v < dst->v) dst->v = src->v;
+    dst->seen |= src->seen;
+}
+static void max_i32_merge(void* d, const void* s, acc_arena_t* a) {
+    (void)a; const ext_i32_state* src = s; ext_i32_state* dst = d;
+    if (src->seen && src->v > dst->v) dst->v = src->v;
+    dst->seen |= src->seen;
+}
+/* Extrema only write when a value improves the result. Repeated hot keys
+ * therefore become shared reads once their current bound is established. */
+#if ATOMIC_LLONG_LOCK_FREE == 2
+#define NARROW_SHARED(NAME, T, CMP) \
+static void NAME(void* base, size_t stride, const uint32_t* gids, \
+                 const void* vals, const ray_valid_t* valid, int64_t n) { \
+    const T* d = vals; \
+    AGG_UPDATE_LOOP(valid, n, { \
+        ext_i32_state* state = (ext_i32_state*)((char*)base + (size_t)gids[i] * stride); \
+        ext_i32_state old; \
+        __atomic_load(state, &old, __ATOMIC_RELAXED); \
+        while (!old.seen || d[i] CMP old.v) { \
+            ext_i32_state next; next.v = d[i]; next.seen = 1; \
+            if (__atomic_compare_exchange(state, &old, &next, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break; \
+        } \
+    }); \
+}
+NARROW_SHARED(min_bool_shared, uint8_t, <)
+NARROW_SHARED(max_bool_shared, uint8_t, >)
+NARROW_SHARED(min_u8_shared, uint8_t, <)
+NARROW_SHARED(max_u8_shared, uint8_t, >)
+NARROW_SHARED(min_i16_shared, int16_t, <)
+NARROW_SHARED(max_i16_shared, int16_t, >)
+NARROW_SHARED(min_i32_shared, int32_t, <)
+NARROW_SHARED(max_i32_shared, int32_t, >)
+NARROW_SHARED(min_date_shared, int32_t, <)
+NARROW_SHARED(max_date_shared, int32_t, >)
+NARROW_SHARED(min_time_shared, int32_t, <)
+NARROW_SHARED(max_time_shared, int32_t, >)
+#undef NARROW_SHARED
+#define SHARED_UPDATE(NAME) .update_shared = NAME,
+#else
+#define SHARED_UPDATE(NAME)
+#endif
+
 static void min_i64_init(void* s) { ((ext_i64_state*)s)->v = INT64_MAX; ((ext_i64_state*)s)->cnt = 0; }
 static void max_i64_init(void* s) { ((ext_i64_state*)s)->v = INT64_MIN; ((ext_i64_state*)s)->cnt = 0; }
 static void min_i64_update(void* base, size_t stride, const uint32_t* gids,
@@ -604,26 +654,27 @@ static void min_bool_native_update(void* base, size_t stride, const uint32_t* gi
                            int64_t n, acc_arena_t* a) {
     (void)a; const uint8_t* d = (const uint8_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static bool ext_bool_native_value(const void* s, void* dst) {
-    const ext_i64_state* st = s;
-    *(uint8_t*)dst = st->cnt ? (uint8_t)st->v : 0;
-    return !st->cnt;
+    const ext_i32_state* st = s;
+    *(uint8_t*)dst = st->seen ? (uint8_t)st->v : 0;
+    return !st->seen;
 }
 static ray_t* ext_bool_native_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param; const ext_i64_state* st = s;
-    return st->cnt ? ray_bool(st->v) : ray_typed_null(-RAY_BOOL);
+    (void)a; (void)param; const ext_i32_state* st = s;
+    return st->seen ? ray_bool(st->v) : ray_typed_null(-RAY_BOOL);
 }
 
 static const agg_vtable_t MIN_BOOL_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
-    .init = min_i64_init, .update_batch = min_bool_native_update,
-    .merge = min_i64_merge, .finalize = ext_bool_native_final, .finalize_value = ext_bool_native_value,
+    SHARED_UPDATE(min_bool_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
+    .init = min_i32_init, .update_batch = min_bool_native_update,
+    .merge = min_i32_merge, .finalize = ext_bool_native_final, .finalize_value = ext_bool_native_value,
 };
 
 static void max_bool_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -631,16 +682,17 @@ static void max_bool_native_update(void* base, size_t stride, const uint32_t* gi
                            int64_t n, acc_arena_t* a) {
     (void)a; const uint8_t* d = (const uint8_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static const agg_vtable_t MAX_BOOL_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
-    .init = max_i64_init, .update_batch = max_bool_native_update,
-    .merge = max_i64_merge, .finalize = ext_bool_native_final, .finalize_value = ext_bool_native_value,
+    SHARED_UPDATE(max_bool_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
+    .init = max_i32_init, .update_batch = max_bool_native_update,
+    .merge = max_i32_merge, .finalize = ext_bool_native_final, .finalize_value = ext_bool_native_value,
 };
 
 static void avg_bool_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -717,26 +769,27 @@ static void min_u8_native_update(void* base, size_t stride, const uint32_t* gids
                            int64_t n, acc_arena_t* a) {
     (void)a; const uint8_t* d = (const uint8_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static bool ext_u8_native_value(const void* s, void* dst) {
-    const ext_i64_state* st = s;
-    *(uint8_t*)dst = st->cnt ? (uint8_t)st->v : 0;
-    return !st->cnt;
+    const ext_i32_state* st = s;
+    *(uint8_t*)dst = st->seen ? (uint8_t)st->v : 0;
+    return !st->seen;
 }
 static ray_t* ext_u8_native_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param; const ext_i64_state* st = s;
-    return st->cnt ? ray_u8(st->v) : ray_typed_null(-RAY_U8);
+    (void)a; (void)param; const ext_i32_state* st = s;
+    return st->seen ? ray_u8(st->v) : ray_typed_null(-RAY_U8);
 }
 
 static const agg_vtable_t MIN_U8_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_U8,
-    .init = min_i64_init, .update_batch = min_u8_native_update,
-    .merge = min_i64_merge, .finalize = ext_u8_native_final, .finalize_value = ext_u8_native_value,
+    SHARED_UPDATE(min_u8_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_U8,
+    .init = min_i32_init, .update_batch = min_u8_native_update,
+    .merge = min_i32_merge, .finalize = ext_u8_native_final, .finalize_value = ext_u8_native_value,
 };
 
 static void max_u8_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -744,16 +797,17 @@ static void max_u8_native_update(void* base, size_t stride, const uint32_t* gids
                            int64_t n, acc_arena_t* a) {
     (void)a; const uint8_t* d = (const uint8_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static const agg_vtable_t MAX_U8_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_U8,
-    .init = max_i64_init, .update_batch = max_u8_native_update,
-    .merge = max_i64_merge, .finalize = ext_u8_native_final, .finalize_value = ext_u8_native_value,
+    SHARED_UPDATE(max_u8_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_U8,
+    .init = max_i32_init, .update_batch = max_u8_native_update,
+    .merge = max_i32_merge, .finalize = ext_u8_native_final, .finalize_value = ext_u8_native_value,
 };
 
 static void avg_u8_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -830,26 +884,27 @@ static void min_i16_native_update(void* base, size_t stride, const uint32_t* gid
                            int64_t n, acc_arena_t* a) {
     (void)a; const int16_t* d = (const int16_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static bool ext_i16_native_value(const void* s, void* dst) {
-    const ext_i64_state* st = s;
-    *(int16_t*)dst = st->cnt ? (int16_t)st->v : NULL_I16;
-    return !st->cnt;
+    const ext_i32_state* st = s;
+    *(int16_t*)dst = st->seen ? (int16_t)st->v : NULL_I16;
+    return !st->seen;
 }
 static ray_t* ext_i16_native_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param; const ext_i64_state* st = s;
-    return st->cnt ? ray_i16(st->v) : ray_typed_null(-RAY_I16);
+    (void)a; (void)param; const ext_i32_state* st = s;
+    return st->seen ? ray_i16(st->v) : ray_typed_null(-RAY_I16);
 }
 
 static const agg_vtable_t MIN_I16_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I16,
-    .init = min_i64_init, .update_batch = min_i16_native_update,
-    .merge = min_i64_merge, .finalize = ext_i16_native_final, .finalize_value = ext_i16_native_value,
+    SHARED_UPDATE(min_i16_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_I16,
+    .init = min_i32_init, .update_batch = min_i16_native_update,
+    .merge = min_i32_merge, .finalize = ext_i16_native_final, .finalize_value = ext_i16_native_value,
 };
 
 static void max_i16_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -857,16 +912,17 @@ static void max_i16_native_update(void* base, size_t stride, const uint32_t* gid
                            int64_t n, acc_arena_t* a) {
     (void)a; const int16_t* d = (const int16_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static const agg_vtable_t MAX_I16_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I16,
-    .init = max_i64_init, .update_batch = max_i16_native_update,
-    .merge = max_i64_merge, .finalize = ext_i16_native_final, .finalize_value = ext_i16_native_value,
+    SHARED_UPDATE(max_i16_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_I16,
+    .init = max_i32_init, .update_batch = max_i16_native_update,
+    .merge = max_i32_merge, .finalize = ext_i16_native_final, .finalize_value = ext_i16_native_value,
 };
 
 static void avg_i16_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -943,26 +999,27 @@ static void min_i32_native_update(void* base, size_t stride, const uint32_t* gid
                            int64_t n, acc_arena_t* a) {
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static bool ext_i32_native_value(const void* s, void* dst) {
-    const ext_i64_state* st = s;
-    *(int32_t*)dst = st->cnt ? (int32_t)st->v : NULL_I32;
-    return !st->cnt;
+    const ext_i32_state* st = s;
+    *(int32_t*)dst = st->seen ? (int32_t)st->v : NULL_I32;
+    return !st->seen;
 }
 static ray_t* ext_i32_native_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param; const ext_i64_state* st = s;
-    return st->cnt ? ray_i32(st->v) : ray_typed_null(-RAY_I32);
+    (void)a; (void)param; const ext_i32_state* st = s;
+    return st->seen ? ray_i32(st->v) : ray_typed_null(-RAY_I32);
 }
 
 static const agg_vtable_t MIN_I32_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I32,
-    .init = min_i64_init, .update_batch = min_i32_native_update,
-    .merge = min_i64_merge, .finalize = ext_i32_native_final, .finalize_value = ext_i32_native_value,
+    SHARED_UPDATE(min_i32_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_I32,
+    .init = min_i32_init, .update_batch = min_i32_native_update,
+    .merge = min_i32_merge, .finalize = ext_i32_native_final, .finalize_value = ext_i32_native_value,
 };
 
 static void max_i32_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -970,16 +1027,17 @@ static void max_i32_native_update(void* base, size_t stride, const uint32_t* gid
                            int64_t n, acc_arena_t* a) {
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static const agg_vtable_t MAX_I32_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I32,
-    .init = max_i64_init, .update_batch = max_i32_native_update,
-    .merge = max_i64_merge, .finalize = ext_i32_native_final, .finalize_value = ext_i32_native_value,
+    SHARED_UPDATE(max_i32_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_I32,
+    .init = max_i32_init, .update_batch = max_i32_native_update,
+    .merge = max_i32_merge, .finalize = ext_i32_native_final, .finalize_value = ext_i32_native_value,
 };
 
 static void avg_i32_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -1170,26 +1228,27 @@ static void min_date_native_update(void* base, size_t stride, const uint32_t* gi
                            int64_t n, acc_arena_t* a) {
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static bool ext_date_native_value(const void* s, void* dst) {
-    const ext_i64_state* st = s;
-    *(int32_t*)dst = st->cnt ? (int32_t)st->v : NULL_I32;
-    return !st->cnt;
+    const ext_i32_state* st = s;
+    *(int32_t*)dst = st->seen ? (int32_t)st->v : NULL_I32;
+    return !st->seen;
 }
 static ray_t* ext_date_native_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param; const ext_i64_state* st = s;
-    return st->cnt ? ray_date(st->v) : ray_typed_null(-RAY_DATE);
+    (void)a; (void)param; const ext_i32_state* st = s;
+    return st->seen ? ray_date(st->v) : ray_typed_null(-RAY_DATE);
 }
 
 static const agg_vtable_t MIN_DATE_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_DATE,
-    .init = min_i64_init, .update_batch = min_date_native_update,
-    .merge = min_i64_merge, .finalize = ext_date_native_final, .finalize_value = ext_date_native_value,
+    SHARED_UPDATE(min_date_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_DATE,
+    .init = min_i32_init, .update_batch = min_date_native_update,
+    .merge = min_i32_merge, .finalize = ext_date_native_final, .finalize_value = ext_date_native_value,
 };
 
 static void max_date_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -1197,16 +1256,17 @@ static void max_date_native_update(void* base, size_t stride, const uint32_t* gi
                            int64_t n, acc_arena_t* a) {
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static const agg_vtable_t MAX_DATE_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_DATE,
-    .init = max_i64_init, .update_batch = max_date_native_update,
-    .merge = max_i64_merge, .finalize = ext_date_native_final, .finalize_value = ext_date_native_value,
+    SHARED_UPDATE(max_date_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_DATE,
+    .init = max_i32_init, .update_batch = max_date_native_update,
+    .merge = max_i32_merge, .finalize = ext_date_native_final, .finalize_value = ext_date_native_value,
 };
 
 static void avg_date_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -1266,26 +1326,27 @@ static void min_time_native_update(void* base, size_t stride, const uint32_t* gi
                            int64_t n, acc_arena_t* a) {
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static bool ext_time_native_value(const void* s, void* dst) {
-    const ext_i64_state* st = s;
-    *(int32_t*)dst = st->cnt ? (int32_t)st->v : NULL_I32;
-    return !st->cnt;
+    const ext_i32_state* st = s;
+    *(int32_t*)dst = st->seen ? (int32_t)st->v : NULL_I32;
+    return !st->seen;
 }
 static ray_t* ext_time_native_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param; const ext_i64_state* st = s;
-    return st->cnt ? ray_time(st->v) : ray_typed_null(-RAY_TIME);
+    (void)a; (void)param; const ext_i32_state* st = s;
+    return st->seen ? ray_time(st->v) : ray_typed_null(-RAY_TIME);
 }
 
 static const agg_vtable_t MIN_TIME_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
-    .init = min_i64_init, .update_batch = min_time_native_update,
-    .merge = min_i64_merge, .finalize = ext_time_native_final, .finalize_value = ext_time_native_value,
+    SHARED_UPDATE(min_time_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
+    .init = min_i32_init, .update_batch = min_time_native_update,
+    .merge = min_i32_merge, .finalize = ext_time_native_final, .finalize_value = ext_time_native_value,
 };
 
 static void max_time_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -1293,16 +1354,17 @@ static void max_time_native_update(void* base, size_t stride, const uint32_t* gi
                            int64_t n, acc_arena_t* a) {
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
-        ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        ext_i32_state* st = (ext_i32_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
-        st->cnt++;
+        st->seen = 1;
     });
 }
 
 static const agg_vtable_t MAX_TIME_NATIVE = {
-    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
-    .init = max_i64_init, .update_batch = max_time_native_update,
-    .merge = max_i64_merge, .finalize = ext_time_native_final, .finalize_value = ext_time_native_value,
+    SHARED_UPDATE(max_time_shared)
+    .state_size = sizeof(ext_i32_state), .kind = ACC_STREAMING, .out_type = RAY_TIME,
+    .init = max_i32_init, .update_batch = max_time_native_update,
+    .merge = max_i32_merge, .finalize = ext_time_native_final, .finalize_value = ext_time_native_value,
 };
 
 static void avg_time_native_update(void* base, size_t stride, const uint32_t* gids,

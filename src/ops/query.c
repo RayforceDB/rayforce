@@ -3208,6 +3208,25 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
  * result into a pre-sized typed vec.  Mirrors the eval-fallback's AGG
  * branch (`query.c:~1955`) but with the idx_buf+offsets+grp_cnt
  * layout the DAG path produces. */
+/* Infer an empty grouped column from the aggregate's empty-input result.
+ * Preserve source domains/widths when the result has the source element type. */
+static ray_t* empty_unary_group_result(ray_unary_fn fn, ray_t* source) {
+    if (!source) return ray_error("domain", "aggregation source missing");
+    ray_t* input = ray_group_gather(source, NULL, 0);
+    if (!input || RAY_IS_ERR(input)) return input ? input : ray_error("oom", NULL);
+    ray_t* value = fn(input);
+    if (value && !RAY_IS_ERR(value) && ray_is_lazy(value)) value = ray_lazy_materialize(value);
+    if (!value || RAY_IS_ERR(value)) {
+        ray_release(input); return value ? value : ray_error("domain", "aggregate produced no result");
+    }
+    ray_t* out;
+    if (ray_is_atom(value) && -value->type == input->type) {
+        out = input; input = NULL;
+    } else out = ray_is_atom(value) ? ray_vec_new(-value->type, 0) : ray_list_new(0);
+    ray_release(input); ray_release(value);
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
                                        const int64_t* idx_buf,
                                        const int64_t* offsets,
@@ -3246,6 +3265,11 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
             src = ray_lazy_materialize(src);
             if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to materialize aggregation source");
         }
+    }
+
+    if (n_groups == 0) {
+        ray_t* out = empty_unary_group_result(uf, src);
+        ray_release(src); return out;
     }
 
     /* Reusable I64 idx wrapper. */
@@ -3599,10 +3623,8 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
  *
  * Returns NULL on shape miss (caller falls through to the existing
  * count-distinct path); returns a result table on success.  Gates:
- *  - single scalar K column (not SYM, no nulls)
- *  - cd_inner is a column ref X (not SYM, no nulls) — composite key
- *    fits in 16 bytes (v2's wide-key cap)
- *  - K + X ≤ 16 bytes packed
+ *  - plain K and X columns with supported grouping key types
+ *  - at most 15 K columns, leaving one component for X
  *  - WHERE optional; if present, must be supported by the fused predicate
  *  - desc/take optional, must be on the cd output column when present */
 static ray_t* try_count_distinct_v2_rewrite(
@@ -3709,10 +3731,9 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (asc_col_sym  >= 0 && asc_col_sym  != cd_c_sym) return NULL;
     if (desc_col_sym >= 0 && asc_col_sym  >= 0) return NULL;
 
-    /* Type checks on every K column and on X.  Composite must fit in
-     * the mk_compile 16-byte budget (sum of K storage widths + X). */
+    /* General grouping retains full keys when a tuple does not fit the
+     * packed kernel. Its byte-width limit must not restrict this rewrite. */
     ray_t* K_cols[15];
-    int K_esz_total = 0;
     for (int j = 0; j < n_K; j++) {
         K_cols[j] = ray_table_get_col(tbl, K_syms[j]);
         if (!K_cols[j]) return NULL;
@@ -3720,22 +3741,21 @@ static ray_t* try_count_distinct_v2_rewrite(
         if (RAY_IS_PARTED(kct_j) || kct_j == RAY_MAPCOMMON) return NULL;
         int kct_ok_j = (kct_j == RAY_SYM  || kct_j == RAY_BOOL || kct_j == RAY_U8 ||
                         kct_j == RAY_I16  || kct_j == RAY_I32  || kct_j == RAY_I64 ||
-                        kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP || kct_j == RAY_F32 || kct_j == RAY_F64);
+                        kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP || kct_j == RAY_F32 || kct_j == RAY_F64 ||
+                        kct_j == RAY_STR || kct_j == RAY_GUID || kct_j == RAY_LIST);
         if (!kct_ok_j) return NULL;
-        K_esz_total += ray_sym_elem_size(kct_j, K_cols[j]->attrs);
     }
     ray_t* X_col = ray_table_get_col(tbl, cd_X_sym);
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
-    int X_esz = ray_sym_elem_size(xct, X_col->attrs);
-    if (K_esz_total + X_esz > 16) return NULL;
     /* X gets the same per-type acceptability check as the K columns
      * (validated in the loop above).  SYM is allowed — mk_compile packs
      * it by storage width into the composite key. */
     int xct_ok = (xct == RAY_SYM  || xct == RAY_BOOL || xct == RAY_U8 ||
                   xct == RAY_I16  || xct == RAY_I32  || xct == RAY_I64 ||
-                  xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP || xct == RAY_F32 || xct == RAY_F64);
+                  xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP || xct == RAY_F32 || xct == RAY_F64 ||
+                  xct == RAY_STR || xct == RAY_GUID || xct == RAY_LIST);
     if (!xct_ok) return NULL;
 
     if (where_expr && !ray_fused_group_supported(where_expr, tbl))
@@ -3966,6 +3986,12 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
     }
 
+    if (src->type == RAY_STR || src->type == RAY_GUID || src->type == RAY_LIST) {
+        ray_t* wide = agg_count_distinct_indexed(src, idx_buf, offsets, grp_cnt, n_groups);
+        ray_release(src);
+        return wide;
+    }
+
     ray_t* out = ray_vec_new(RAY_I64, n_groups);
     if (!out || RAY_IS_ERR(out)) {
         ray_release(src);
@@ -4021,7 +4047,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                 .sym_cap_bound = sym_cap_bound,
                 .oom       = 0,
             };
-            ray_pool_dispatch_n(pool, cdpg_buf_par_fn, &pctx, (uint32_t)n_groups);
+            ray_group_dispatch(cdpg_buf_par_fn, &pctx, grp_cnt, n_groups);
             if (!atomic_load_explicit(&pctx.oom, memory_order_relaxed)) {
                 ray_release(src);
                 return out;
@@ -8205,7 +8231,7 @@ by_dict_done:
                     /* Key column first */
                     { ray_t* sc = ray_table_get_col(eval_tbl, by_key_sym);
                       if (sc) {
-                        ray_t* ev = ray_vec_new(sc->type, 0);
+                        ray_t* ev = ray_group_gather(sc, NULL, 0);
                         if (ev && !RAY_IS_ERR(ev)) { empty = ray_table_add_col(empty, by_key_sym, ev); ray_release(ev); }
                       }
                     }
@@ -8298,12 +8324,27 @@ by_dict_done:
                     /* For each group, compute aggregation */
                     ray_t* agg_vec = NULL;
                     ray_t** grp_items = (ray_t**)ray_data(groups);
+                    if (n_groups == 0) {
+                        ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
+                        agg_vec = fn_obj && fn_obj->type == RAY_UNARY
+                            ? empty_unary_group_result((ray_unary_fn)(uintptr_t)fn_obj->i64, src_col_val)
+                            : ray_error("type", "aggregate must be a unary function");
+                        if (!agg_vec || RAY_IS_ERR(agg_vec)) {
+                            ray_release(src_col_val);
+                            for (int ai = 0; ai < n_agg_out; ai++) ray_release(agg_results[ai]);
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                            ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                            return agg_vec ? agg_vec : ray_error("oom", NULL);
+                        }
+                    }
+
 
                     /* Median fast path — flatten `groups` into
                      * (idx_buf, offsets, grp_cnt) then call the parallel
                      * ray_median_per_group_buf kernel.  See twin site
                      * above for the design rationale. */
-                    if (is_med_call(val_expr_item)) {
+                    if (n_groups > 0 && is_med_call(val_expr_item)) {
                         ray_t* ix_hdr = NULL;
                         ray_t* off_hdr = NULL;
                         ray_t* cnt_hdr = NULL;
@@ -8503,6 +8544,10 @@ by_dict_done:
                         size_t slen = ray_str_len(k);
                         key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
                     }
+                } else if (ktype == RAY_LIST) {
+                    key_vec = ray_list_new(n_groups);
+                    for (int64_t gi = 0; gi < n_groups && key_vec && !RAY_IS_ERR(key_vec); gi++)
+                        key_vec = ray_list_append(key_vec, grp_items[gi * 2]);
                 } else {
                     uint8_t kattrs = key_col_src ? key_col_src->attrs : 0;
                     if (ktype == RAY_SYM)
@@ -9168,9 +9213,7 @@ by_dict_done:
                     if (key_sym >= 0) {
                         ray_t* sc = ray_table_get_col(filtered_tbl, key_sym);
                         if (sc) {
-                            empty_key_vec = (sc->type == RAY_STR)
-                                            ? ray_vec_new(RAY_STR, 0)
-                                            : ray_vec_new(sc->type, 0);
+                            empty_key_vec = ray_group_gather(sc, NULL, 0);
                         }
                     } else {
                         /* Match the computed-key fallback's naming
@@ -10873,6 +10916,14 @@ by_dict_done:
                                             cd_inner->type == -RAY_SYM &&
                                             !(cd_inner->attrs & ATTR_QUOTED) &&
                                             n_groups > 50000);
+                    if (simple_cd_global) {
+                        ray_t* source = ray_table_get_col(tbl, cd_inner->i64);
+                        int8_t type = source ? source->type : 0;
+                        simple_cd_global = type == RAY_BOOL || type == RAY_U8 ||
+                            type == RAY_I16 || type == RAY_I32 || type == RAY_I64 ||
+                            type == RAY_F32 || type == RAY_F64 || type == RAY_DATE ||
+                            type == RAY_TIME || type == RAY_TIMESTAMP || type == RAY_SYM;
+                    }
                     if (!simple_cd_global) needs_slice_idx = 1;
                 }
 
@@ -11222,11 +11273,13 @@ by_dict_done:
                 }
                 #undef RELEASE_SCAN_KEY
             } else {
-                /* Empty group set: add empty LIST columns so the
-                 * output schema still includes the user-declared
-                 * non-agg columns. */
+                /* Empty grouped aggregates retain their result type;
+                 * ordinary row expressions produce per-group LIST cells. */
                 for (int64_t ni = 0; ni < n_nonaggs; ni++) {
-                    ray_t* empty_list = ray_list_new(0);
+                    ray_t* expr = nonagg_exprs[ni];
+                    ray_t* empty_list = match_count_distinct(expr) ? ray_vec_new(RAY_I64, 0)
+                        : is_streaming_aggr_unary_call(expr) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
+                        : can_atom_broadcast(expr) ? atom_broadcast_vec(expr, 0) : ray_list_new(0);
                     if (!empty_list || RAY_IS_ERR(empty_list)) {
                         ray_release(result); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty_list ? empty_list : ray_error("oom", NULL);

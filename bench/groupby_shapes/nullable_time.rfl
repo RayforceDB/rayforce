@@ -1,0 +1,8 @@
+;; Synthetic nullable I32 keys with TIME values.
+(set n 16000000)
+(set group_count 1000000)
+(set i (til n))
+(set g (% (* i 17) group_count))
+(set t (table [k tm] (list (as 'I32 (+ (* g 2) (div g 4))) (as 'TIME (% (* i 13) 86400000)))))
+(set t (update {from:t k:(as 'I32 0N) where:(== k 0)}))
+(map (fn [_] (println (timeit (select {from:t by:k s:(min tm)})))) (til 8))

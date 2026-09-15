@@ -21,9 +21,9 @@
  *   SOFTWARE.
  */
 
-/* Fused grouped count-distinct (spec Part B).  Single pass over rows:
- * phase 1 scatters compact [pairhash][k][v][row] records into per-(worker,
- * partition) buffers; phase 2 walks each partition once with two
+/* Fused grouped count-distinct (spec Part B). A histogram sizes one payload;
+ * phase 1 scatters compact [pairhash][k][v][row] records into disjoint source/
+ * partition slices; phase 2 walks each partition once with two
  * partition-local open-addressing tables — a (k,v) dedupe table and a k
  * table — producing PARTIAL per-key (distinct count, first_row) laid out in
  * key-hash buckets; phase 3 dispatches one task per bucket to merge those
@@ -49,6 +49,7 @@
 #include <string.h>
 #include "rayforce.h"
 #include "core/pool.h"
+#include "core/profile.h"
 #include "mem/heap.h"      /* ray_heap_anon_watermark */
 #include "ops/internal.h"  /* scratch_*, read_col_i64 */
 #include "ops/hash.h"      /* ray_hash_i64 */
@@ -79,7 +80,7 @@ static inline uint64_t cdf_fmix64(uint64_t h) {
     return h;
 }
 
-/* Growable per-(worker, partition) record buffer. */
+/* A disjoint source/partition slice of one query-owned record payload. */
 typedef struct {
     char* buf;
     uint32_t n, cap;
@@ -94,19 +95,6 @@ typedef struct {
  * ray_pool_dispatch_n never needs to grow its ring). */
 #define CDF_MAX_PARTS 1024u
 
-/* Reserve room for one more record; returns dest ptr or NULL on OOM. */
-static char* cdf_reserve(cdf_buf_t* b, uint32_t prime) {
-    if (b->n == b->cap) {
-        if (b->cap > UINT32_MAX / 2) return NULL;
-        uint32_t nc = b->cap ? b->cap * 2 : (prime ? prime : 64);
-        char* nb = (char*)ray_realloc_raw(b->buf, (size_t)nc * CDF_REC);
-        if (!nb) return NULL;
-        b->buf = nb;
-        b->cap = nc;
-    }
-    return b->buf + (size_t)b->n++ * CDF_REC;
-}
-
 /* ══════════════════════════════════════════
  * Phase 1 — scatter
  * ══════════════════════════════════════════ */
@@ -120,13 +108,11 @@ typedef struct {
     uint8_t vattrs;
     uint32_t n_parts, nw;
     cdf_buf_t* bufs; /* [nw * n_parts] */
-    uint32_t prime;  /* first-allocation capacity per buf */
+    int64_t nrows;
+    bool dedup;
     _Atomic(int) oom;
-    /* Rows actually scattered.  ray_pool_dispatch clamps its task count to
-     * the ring capacity but RECOMPUTES the grain, so no row is dropped by
-     * clamping — however a cancelled pool (pool->cancelled) skips claimed
-     * tasks outright.  Comparing this against nrows turns any such silent
-     * row loss into a NULL decline instead of a short answer. */
+    /* Rows completed in each pass. Logical source tasks are bounded by the
+     * pool ring; cancellation must decline rather than return a short answer. */
     _Atomic(int64_t) rows_done;
 } cdf_p1_ctx_t;
 
@@ -145,35 +131,76 @@ static int64_t cdf_read(const void* data, int64_t r, int8_t type, uint8_t attrs)
     }
     return read_col_i64(data, r, type, attrs);
 }
-static void cdf_p1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    cdf_p1_ctx_t* c = (cdf_p1_ctx_t*)vctx;
-    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
-    cdf_buf_t* my = &c->bufs[(size_t)(wid % c->nw) * c->n_parts];
-    for (int64_t r = start; r < end; r++) {
-        int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
-        int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
-        /* PAIR hash: uniform even when one key owns most of the table.
-         * The odd-multiplier on the k side is LOAD-BEARING, not decoration: a
-         * bare `hash(k) ^ hash(v)` cancels to 0 for every row where k == v, so
-         * a `(count (distinct k)) by: k` — or any strongly correlated column
-         * pair — would pile every row into partition 0 at dedupe slot 0 and run
-         * one giant serial probe cluster (measured: 2m42s on 20M rows vs 0.09s
-         * uncorrelated).  Multiplying one side by the golden-ratio constant
-         * makes the combine asymmetric, so k == v hashes like any other pair. */
-        uint64_t h = cdf_fmix64(ray_hash_i64(k) * 0x9E3779B97F4A7C15ULL ^
-                                ray_hash_i64(v));
-        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
-        char* rec = cdf_reserve(&my[p], c->prime);
-        if (!rec) {
-            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
-            return;
-        }
-        ((uint64_t*)rec)[0] = h;
-        ((int64_t*)rec)[1] = k;
-        ((int64_t*)rec)[2] = v;
-        ((int64_t*)rec)[3] = r;
+/* Keep the pair hash asymmetric: hash(k)^hash(v) collapses correlated
+ * k==v inputs into one partition. Both passes use the same exact transform. */
+static inline uint64_t cdf_pair_hash(int64_t key, int64_t value) {
+    return cdf_fmix64(ray_hash_i64(key) * 0x9E3779B97F4A7C15ULL ^ ray_hash_i64(value));
+}
+/* Bounded, exact source-local preaggregation. A collision only forgets an
+ * earlier pair; the partition deduper still sees and reconciles extra copies.
+ * Nothing persists across source tasks or queries. */
+typedef struct { int64_t key, value; bool used; } cdf_recent_t;
+static bool cdf_repeat(cdf_recent_t* recent, uint64_t hash, int64_t key, int64_t value) {
+    cdf_recent_t* entry = &recent[hash & 63];
+    if (entry->used && entry->key == key && entry->value == value) return true;
+    entry->key = key; entry->value = value; entry->used = true;
+    return false;
+}
+static bool cdf_sample_repetition(const cdf_p1_ctx_t* c) {
+    if (c->nrows < 1024) return false;
+    cdf_recent_t recent[64] = {{0}};
+    int repeats = 0;
+    int64_t step = c->nrows / 1024;
+    for (int i = 0; i < 1024; i++) {
+        int64_t row = i * step + ray_hash_i64(i) % step;
+        int64_t key = cdf_read(c->kdata, row, c->ktype, c->kattrs);
+        int64_t value = cdf_read(c->vdata, row, c->vtype, c->vattrs);
+        repeats += cdf_repeat(recent, cdf_pair_hash(key, value), key, value);
     }
-    atomic_fetch_add_explicit(&c->rows_done, end - start, memory_order_relaxed);
+    return repeats >= 128;
+}
+static void cdf_p1_hist(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; cdf_p1_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        cdf_buf_t* my = c->bufs + (size_t)task * c->n_parts;
+        cdf_recent_t recent[64];
+        if (c->dedup) memset(recent, 0, sizeof(recent));
+        int64_t begin = c->nrows / c->nw * task;
+        int64_t limit = task + 1 == c->nw ? c->nrows : c->nrows / c->nw * (task + 1);
+        for (int64_t r = begin; r < limit; r++) {
+            int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
+            int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
+            uint64_t hash = cdf_pair_hash(k, v);
+            if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
+            uint32_t part = hash & (c->n_parts - 1);
+            if (my[part].cap == UINT32_MAX) { atomic_store(&c->oom, 1); return; }
+            my[part].cap++;
+        }
+        atomic_fetch_add_explicit(&c->rows_done, limit - begin, memory_order_relaxed);
+    }
+}
+static void cdf_p1_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; cdf_p1_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        cdf_buf_t* my = c->bufs + (size_t)task * c->n_parts;
+        cdf_recent_t recent[64];
+        if (c->dedup) memset(recent, 0, sizeof(recent));
+        int64_t begin = c->nrows / c->nw * task;
+        int64_t limit = task + 1 == c->nw ? c->nrows : c->nrows / c->nw * (task + 1);
+        for (int64_t r = begin; r < limit; r++) {
+            int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
+            int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
+            uint64_t hash = cdf_pair_hash(k, v);
+            if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
+            uint32_t part = hash & (c->n_parts - 1);
+            char* record = my[part].buf + (size_t)my[part].n++ * CDF_REC;
+            ((uint64_t*)record)[0] = hash;
+            ((int64_t*)record)[1] = k;
+            ((int64_t*)record)[2] = v;
+            ((int64_t*)record)[3] = r;
+        }
+        atomic_fetch_add_explicit(&c->rows_done, limit - begin, memory_order_relaxed);
+    }
 }
 
 /* ══════════════════════════════════════════
@@ -495,6 +522,22 @@ static int cdf_grp_cmp(const void* a, const void* b) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
+typedef struct {
+    const cdf_grp_t* groups;
+    const uint64_t* order;
+    uint64_t mask;
+    int64_t* keys;
+    int64_t* counts;
+    int64_t* firsts;
+} cdf_emit_t;
+static void cdf_emit(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; cdf_emit_t* c = raw;
+    for (int64_t i = start; i < end; i++) {
+        const cdf_grp_t* group = &c->groups[c->order ? c->order[i] & c->mask : (uint64_t)i];
+        c->keys[i] = group->key; c->counts[i] = group->cnt; c->firsts[i] = group->first;
+    }
+}
+
 /* Same sqrt-style sizing as agg_radix_part_count: at least one partition per
  * worker, and enough partitions that each holds ~sqrt(nrows) records — capped
  * at CDF_MAX_PARTS to bound phase 3's merge input. */
@@ -513,11 +556,10 @@ static int cdf_type_ok(int8_t t) {
         t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_F32 || t == RAY_F64 || RAY_IS_SYM(t);
 }
 
-/* Free every phase-1/2 buffer; used by both the fallback and success paths. */
-static void cdf_free_all(cdf_buf_t* bufs, size_t nbuf, cdf_part_t* parts,
+/* Free the shared payload and phase-2 outputs on fallback and success. */
+static void cdf_free_all(cdf_buf_t* bufs, char* records, cdf_part_t* parts,
                          uint32_t n_parts) {
-    if (bufs)
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
+    ray_free_raw(records);
     ray_free_raw(bufs);
     if (parts)
         for (uint32_t p = 0; p < n_parts; p++) ray_free_raw(parts[p].g);
@@ -558,14 +600,17 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     if (wm > 0 && (double)nrows * CDF_BYTES_PER_ROW > (double)wm / 4.0)
         return NULL;
 
-    uint32_t nw = ray_pool_total_workers(pool);
-
-    uint32_t n_parts = cdf_part_count(nw, nrows);
+    if ((uint64_t)nrows > SIZE_MAX / CDF_REC) return NULL;
+    uint32_t workers = ray_pool_total_workers(pool);
+    uint32_t nw = workers * 4;
+    if (nw > RAY_POOL_INIT_TASKS) nw = RAY_POOL_INIT_TASKS;
+    uint32_t n_parts = cdf_part_count(workers, nrows);
+    char* records = NULL;
     size_t nbuf = (size_t)nw * n_parts;
     cdf_buf_t* bufs = (cdf_buf_t*)ray_calloc_raw(nbuf * sizeof(cdf_buf_t));
     cdf_part_t* parts = (cdf_part_t*)ray_calloc_raw((size_t)n_parts * sizeof(cdf_part_t));
     if (!bufs || !parts) {
-        cdf_free_all(bufs, nbuf, parts, n_parts);
+        cdf_free_all(bufs, records, parts, n_parts);
         return NULL;
     }
 
@@ -573,15 +618,32 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         .kdata = ray_data(key_col), .ktype = key_col->type, .kattrs = key_col->attrs,
         .vdata = ray_data(val_col), .vtype = val_col->type, .vattrs = val_col->attrs,
         .n_parts = n_parts, .nw = nw, .bufs = bufs,
-        /* Uniform-hash expectation with 25% slack; ≥8 so tiny buffers don't
-         * immediately re-double. */
-        .prime = (uint32_t)((uint64_t)nrows / ((uint64_t)nw * n_parts) * 5 / 4 + 8),
+        .nrows = nrows,
         .oom = 0, .rows_done = 0,
     };
-    ray_pool_dispatch(pool, cdf_p1_fn, &p1, nrows);
+    p1.dedup = cdf_sample_repetition(&p1);
+    if (p1.dedup) ray_profile_tick("count-distinct: source preaggregation");
+    ray_profile_tick("count-distinct: prepared");
+    ray_pool_dispatch_n(pool, cdf_p1_hist, &p1, nw);
+    if (atomic_load(&p1.oom) || atomic_load(&p1.rows_done) != nrows) {
+        cdf_free_all(bufs, records, parts, n_parts); return NULL;
+    }
+    int64_t record_count = 0;
+    for (size_t b = 0; b < nbuf; b++) record_count += bufs[b].cap;
+    records = ray_alloc_raw((size_t)record_count * CDF_REC);
+    if (!records) { cdf_free_all(bufs, records, parts, n_parts); return NULL; }
+    int64_t record_offset = 0;
+    for (size_t b = 0; b < nbuf; b++) {
+        bufs[b].buf = records + (size_t)record_offset * CDF_REC;
+        record_offset += bufs[b].cap;
+    }
+    atomic_store(&p1.rows_done, 0);
+    ray_profile_tick("count-distinct: histogram");
+    ray_pool_dispatch_n(pool, cdf_p1_fn, &p1, nw);
+    ray_profile_tick("count-distinct: scattered pairs");
     if (atomic_load_explicit(&p1.oom, memory_order_relaxed) ||
         atomic_load_explicit(&p1.rows_done, memory_order_relaxed) != nrows) {
-        cdf_free_all(bufs, nbuf, parts, n_parts);
+        cdf_free_all(bufs, records, parts, n_parts);
         return NULL; /* fallback, not an error */
     }
 
@@ -590,9 +652,10 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         .part_bits = (uint32_t)__builtin_ctz(n_parts), .oom = 0, .done = 0,
     };
     ray_pool_dispatch_n(pool, cdf_p2_fn, &p2, n_parts);
+    ray_profile_tick("count-distinct: deduplicated pairs");
     if (atomic_load_explicit(&p2.oom, memory_order_relaxed) ||
         atomic_load_explicit(&p2.done, memory_order_relaxed) != (int64_t)n_parts) {
-        cdf_free_all(bufs, nbuf, parts, n_parts);
+        cdf_free_all(bufs, records, parts, n_parts);
         return NULL;
     }
 
@@ -612,13 +675,14 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         .parts = parts, .n_parts = n_parts, .mg = mg, .oom = 0, .done = 0,
     };
     ray_pool_dispatch_n(pool, cdf_p3_fn, &p3, CDF_MERGE_PARTS);
+    ray_profile_tick("count-distinct: merged counts");
     if (atomic_load_explicit(&p3.oom, memory_order_relaxed) ||
         atomic_load_explicit(&p3.done, memory_order_relaxed) != CDF_MERGE_PARTS) {
         for (uint32_t m = 0; m < CDF_MERGE_PARTS; m++) ray_free_raw(mg[m].g);
-        cdf_free_all(bufs, nbuf, parts, n_parts);
+        cdf_free_all(bufs, records, parts, n_parts);
         return NULL;
     }
-    cdf_free_all(bufs, nbuf, parts, n_parts);
+    cdf_free_all(bufs, records, parts, n_parts);
 
     int64_t ng = 0;
     for (uint32_t m = 0; m < CDF_MERGE_PARTS; m++) ng += mg[m].n;
@@ -635,8 +699,32 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         mo += mg[m].n;
         ray_free_raw(mg[m].g);
     }
-    /* Global stable first-seen order. */
-    qsort(merged, (size_t)ng, sizeof(cdf_grp_t), cdf_grp_cmp);
+    /* Restore stable first-seen order with integer radix sorting. The packed
+     * row/order key replaces a serial comparison sort of 24-byte records.
+     * Free the unused sort buffer before allocating outputs: peak remains
+     * at most 56 bytes per group, within the existing row-based admission. */
+    uint64_t* order = NULL;
+    uint64_t mask = 0;
+    if (ng >= RADIX_SORT_THRESHOLD && nrows > 1) {
+        unsigned bits = 64 - __builtin_clzll((uint64_t)ng - 1);
+        unsigned row_bits = 64 - __builtin_clzll((uint64_t)nrows - 1);
+        if (bits + row_bits <= 64) {
+            uint64_t* a = ray_alloc_raw((size_t)ng * sizeof(uint64_t));
+            uint64_t* b = ray_alloc_raw((size_t)ng * sizeof(uint64_t));
+            if (a && b) {
+                mask = (UINT64_C(1) << bits) - 1;
+                for (int64_t i = 0; i < ng; i++) a[i] = ((uint64_t)merged[i].first << bits) | (uint64_t)i;
+                order = packed_radix_sort_run(pool, a, b, ng, (uint8_t)((bits + row_bits + 7) / 8));
+            }
+            if (a != order) ray_free_raw(a);
+            if (b != order) ray_free_raw(b);
+        }
+    }
+    if (atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+        ray_free_raw(order); ray_free_raw(merged); return NULL;
+    }
+    if (!order) qsort(merged, (size_t)ng, sizeof(cdf_grp_t), cdf_grp_cmp);
+    ray_profile_tick("count-distinct: ordered groups");
 
     ray_t* keys = ray_vec_new(RAY_I64, ng);
     ray_t* cnts = ray_vec_new(RAY_I64, ng);
@@ -645,19 +733,16 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     if (!keys || RAY_IS_ERR(keys) || !cnts || RAY_IS_ERR(cnts) ||
         !firsts || RAY_IS_ERR(firsts) || !tbl || RAY_IS_ERR(tbl)) {
         ray_release(keys); ray_release(cnts); ray_release(firsts); ray_release(tbl);
-        ray_free_raw(merged);
+        ray_free_raw(order); ray_free_raw(merged);
         return NULL;
     }
     keys->len = cnts->len = firsts->len = ng;
-    int64_t* kd = (int64_t*)ray_data(keys);
-    int64_t* cd = (int64_t*)ray_data(cnts);
-    int64_t* fd = (int64_t*)ray_data(firsts);
-    for (int64_t i = 0; i < ng; i++) {
-        kd[i] = merged[i].key;
-        cd[i] = merged[i].cnt;
-        fd[i] = merged[i].first;
+    cdf_emit_t emit = {merged, order, mask, ray_data(keys), ray_data(cnts), ray_data(firsts)};
+    ray_pool_dispatch(pool, cdf_emit, &emit, ng);
+    ray_free_raw(order); ray_free_raw(merged);
+    if (atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+        ray_release(keys); ray_release(cnts); ray_release(firsts); ray_release(tbl); return NULL;
     }
-    ray_free_raw(merged);
 
     tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), keys);
     tbl = ray_table_add_col(tbl, ray_sym_intern("u", 1), cnts);
