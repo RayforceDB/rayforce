@@ -627,6 +627,72 @@ static test_result_t test_sym_vec_widths(void) {
     PASS();
 }
 
+/* ---- has_nulls: text types are proven null-free by payload scan -------- */
+
+/* SYM/STR always "may have nulls", so ray_vec_has_nulls must inspect the
+ * payload.  Pin the contract at every SYM width, on STR, and through a
+ * slice, with lengths that are not multiples of any vector width so the
+ * scan's tail handling is exercised: a single id-0 cell anywhere flips
+ * the answer. */
+static test_result_t test_vec_has_nulls_text(void) {
+    static const uint8_t widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
+    const int64_t n = 37;
+    for (size_t wi = 0; wi < sizeof(widths); wi++) {
+        ray_t* v = ray_sym_vec_new(widths[wi], n);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        for (int64_t i = 0; i < n; i++) {
+            uint64_t id = (uint64_t)(i + 1);
+            uint8_t  b8 = (uint8_t)id; uint16_t b16 = (uint16_t)id;
+            uint32_t b32 = (uint32_t)id; int64_t b64 = (int64_t)id;
+            const void* src = widths[wi] == RAY_SYM_W8  ? (const void*)&b8  :
+                              widths[wi] == RAY_SYM_W16 ? (const void*)&b16 :
+                              widths[wi] == RAY_SYM_W32 ? (const void*)&b32 :
+                                                          (const void*)&b64;
+            v = ray_vec_append(v, src);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        }
+        TEST_ASSERT_EQ_I(v->len, n);
+        TEST_ASSERT_TRUE(ray_vec_may_have_nulls(v));
+        TEST_ASSERT_FALSE(ray_vec_has_nulls(v));
+
+        /* null in the unaligned tail */
+        ray_write_sym(ray_data(v), n - 1, 0, RAY_SYM, v->attrs);
+        TEST_ASSERT_TRUE(ray_vec_has_nulls(v));
+        ray_write_sym(ray_data(v), n - 1, (uint64_t)n, RAY_SYM, v->attrs);
+        TEST_ASSERT_FALSE(ray_vec_has_nulls(v));
+
+        /* null in the body; a slice that excludes it stays null-free */
+        ray_write_sym(ray_data(v), 5, 0, RAY_SYM, v->attrs);
+        TEST_ASSERT_TRUE(ray_vec_has_nulls(v));
+        ray_t* clean = ray_vec_slice(v, 6, n - 6);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(clean));
+        TEST_ASSERT_FALSE(ray_vec_has_nulls(clean));
+        ray_t* dirty = ray_vec_slice(v, 3, 4);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(dirty));
+        TEST_ASSERT_TRUE(ray_vec_has_nulls(dirty));
+        ray_release(clean);
+        ray_release(dirty);
+        ray_release(v);
+    }
+
+    /* STR: canonical "" is the null */
+    ray_t* s = ray_vec_new(RAY_STR, 3);
+    s = ray_str_vec_append(s, "a", 1);
+    s = ray_str_vec_append(s, "a long pooled string value", 26);
+    s = ray_str_vec_append(s, "bb", 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    TEST_ASSERT_FALSE(ray_vec_has_nulls(s));
+    ray_vec_set_null(s, 2, true);
+    TEST_ASSERT_TRUE(ray_vec_has_nulls(s));
+    ray_release(s);
+
+    /* empty text vec is trivially null-free */
+    ray_t* e = ray_sym_vec_new(RAY_SYM_W16, 0);
+    TEST_ASSERT_FALSE(ray_vec_has_nulls(e));
+    ray_release(e);
+    PASS();
+}
+
 /* ---- slice_of_slice (parent_offset accumulation) ----------------------- */
 
 static test_result_t test_vec_slice_of_slice(void) {
@@ -2315,6 +2381,7 @@ const test_entry_t vec_entries[] = {
     { "vec/copy_nulls_paths", test_vec_copy_nulls_paths, vec_setup, vec_teardown },
     { "vec/get_paths", test_vec_get_paths, vec_setup, vec_teardown },
     { "vec/sym_vec_w64", test_sym_vec_w64, vec_setup, vec_teardown },
+    { "vec/has_nulls_text", test_vec_has_nulls_text, vec_setup, vec_teardown },
     { "vec/concat_sym_same_width", test_vec_concat_sym_same_width, vec_setup, vec_teardown },
     { "vec/insert_many_atom", test_vec_insert_many_atom, vec_setup, vec_teardown },
     { "vec/insert_many_guards", test_vec_insert_many_guards, vec_setup, vec_teardown },

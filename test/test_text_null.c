@@ -184,6 +184,11 @@ static test_result_t test_sym_hash_routes(void) {
     PASS();
 }
 
+/* Fused admission for SYM columns ignores the HAS_NULLS flag either way:
+ * a comparison against a constant compiles whether or not id 0 is present
+ * (issue #533: raw-id compares already give the null-aware answers), while
+ * a consumer that reads the lane as a value is admitted only when the
+ * payload itself is null-free. */
 static test_result_t test_sym_expr_admission(void) {
     for (int nullable = 0; nullable < 2; nullable++) {
         for (int flagged = 0; flagged < 2; flagged++) {
@@ -195,9 +200,11 @@ static test_result_t test_sym_expr_admission(void) {
             tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), v);
             ray_release(v);
             ray_graph_t* g = ray_graph_new(tbl);
-            ray_op_t* pred = ray_eq(g, ray_scan(g, "k"), ray_const_str(g, "beta", 4));
+            ray_op_t* cmp = ray_eq(g, ray_scan(g, "k"), ray_const_str(g, "beta", 4));
+            ray_op_t* val = ray_isnull(g, ray_scan(g, "k"));
             ray_expr_t expr;
-            TEST_ASSERT_EQ_I(expr_compile(g, tbl, pred, &expr), !nullable);
+            TEST_ASSERT_EQ_I(expr_compile(g, tbl, cmp, &expr), 1);
+            TEST_ASSERT_EQ_I(expr_compile(g, tbl, val, &expr), !nullable);
             ray_graph_free(g);
             ray_release(tbl);
         }
