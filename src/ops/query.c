@@ -45,7 +45,6 @@
 #include "table/domain.h"
 #include "table/dict.h"
 #include "mem/heap.h"
-#include "mem/sys.h"
 
 #include <string.h>
 #include <math.h>
@@ -6808,7 +6807,7 @@ by_dict_done:
 
         /* Copy query into a fresh float[] that the DAG op borrows; freed
          * after ray_execute completes. */
-        nearest_query_owned = (float*)ray_sys_alloc((size_t)dim * sizeof(float));
+        nearest_query_owned = (float*)ray_calloc_raw((size_t)dim * sizeof(float));
         if (!nearest_query_owned) {
             ray_release(qvec);
             ray_graph_free(g); ray_release(tbl);
@@ -6839,12 +6838,12 @@ by_dict_done:
         if (head->i64 == ann_sym_id) {
             ray_t* hobj = ray_eval(nlist[1]);
             if (!hobj || RAY_IS_ERR(hobj)) {
-                ray_sys_free(nearest_query_owned);
+                ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hobj ? hobj : ray_error("domain", "nearest (ann): failed to evaluate HNSW handle");
             }
             if (hobj->type != -RAY_I64 || !(hobj->attrs & RAY_ATTR_HNSW)) {
-                ray_release(hobj); ray_sys_free(nearest_query_owned);
+                ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                     "nearest (ann): first arg must be an HNSW handle (from hnsw-build)");
@@ -6852,13 +6851,13 @@ by_dict_done:
             ray_hnsw_t* idx = (ray_hnsw_t*)(uintptr_t)hobj->i64;
             if (!idx) {
                 /* Defensive: attr set but pointer cleared — treat as invalid. */
-                ray_release(hobj); ray_sys_free(nearest_query_owned);
+                ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                     "nearest (ann): HNSW handle has been freed");
             }
             if (idx->dim != dim) {
-                ray_release(hobj); ray_sys_free(nearest_query_owned);
+                ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length",
                     "nearest (ann): query dim does not match index dim");
@@ -6867,7 +6866,7 @@ by_dict_done:
             if (nlen >= 4) {
                 ray_t* ev = ray_eval(nlist[3]);
                 if (!ev || RAY_IS_ERR(ev)) {
-                    ray_release(hobj); ray_sys_free(nearest_query_owned);
+                    ray_release(hobj); ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ev ? ev : ray_error("domain",
                         "nearest (ann): ef expression failed to evaluate");
@@ -6876,7 +6875,7 @@ by_dict_done:
                 else if (ev->type == -RAY_I32) ef = ev->i32;
                 else {
                     ray_release(ev); ray_release(hobj);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                         "nearest (ann): ef must be an integer atom");
@@ -6892,7 +6891,7 @@ by_dict_done:
         } else if (head->i64 == knn_sym_id) {
             ray_t* col_expr = nlist[1];
             if (col_expr->type != -RAY_SYM) {
-                ray_sys_free(nearest_query_owned);
+                ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                     "nearest (knn): first arg must be an unquoted column name");
@@ -6907,7 +6906,7 @@ by_dict_done:
                     else if (mid == ray_sym_find("ip", 2))     metric = RAY_HNSW_IP;
                     else if (mid == ray_sym_find("cosine", 6)) metric = RAY_HNSW_COSINE;
                     else {
-                        ray_sys_free(nearest_query_owned);
+                        ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
                             "nearest (knn): metric must be 'cosine, 'l2, or 'ip");
@@ -6916,14 +6915,14 @@ by_dict_done:
             }
             root = ray_knn_rerank(g, root, col_sym, nearest_query_owned, dim, k_req, metric);
         } else {
-            ray_sys_free(nearest_query_owned);
+            ray_free_raw(nearest_query_owned);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
                 "nearest: expected `ann` or `knn` as the first element");
         }
         if (!root) {
             if (nearest_handle_owned) ray_release(nearest_handle_owned);
-            ray_sys_free(nearest_query_owned);
+            ray_free_raw(nearest_query_owned);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
         }
@@ -6941,18 +6940,18 @@ by_dict_done:
             int64_t src_ncols = ray_table_ncols(tbl);
             if (src_ncols > 255) {
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                ray_sys_free(nearest_query_owned);
+                ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("limit",
                     "nearest: implicit projection exceeds 255 source columns — "
                     "specify output columns explicitly");
             }
             if (src_ncols > 0) {
-                ray_op_t** col_ops = (ray_op_t**)ray_sys_alloc(
+                ray_op_t** col_ops = (ray_op_t**)ray_calloc_raw(
                     (size_t)src_ncols * sizeof(ray_op_t*));
                 if (!col_ops) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
@@ -6967,17 +6966,17 @@ by_dict_done:
                     col_ops[nc++] = scan_op;
                 }
                 if (scan_err) {
-                    ray_sys_free(col_ops);
+                    ray_free_raw(col_ops);
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
                 root = ray_select_op(g, root, col_ops, nc);
-                ray_sys_free(col_ops);
+                ray_free_raw(col_ops);
                 if (!root) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
@@ -9756,7 +9755,7 @@ by_dict_done:
                         fres = ray_lazy_materialize(fres);
                     if (!fres || RAY_IS_ERR(fres)) {
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: `where:` filter produced no result");
@@ -9766,7 +9765,7 @@ by_dict_done:
                     g = ray_graph_new(tbl);
                     if (!g) {
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
@@ -9775,7 +9774,7 @@ by_dict_done:
                 ray_t* result = ray_table_new(0);
                 if (!result || RAY_IS_ERR(result)) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                    if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(colops_hdr);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result ? result : ray_error("oom", NULL);
@@ -9797,7 +9796,7 @@ by_dict_done:
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return err;
@@ -9812,7 +9811,7 @@ by_dict_done:
                         ray_release(col);
                         ray_release(result);
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length", "select: output column length %lld does not match %lld", (long long)col_len, (long long)out_len);
@@ -9821,14 +9820,14 @@ by_dict_done:
                     ray_release(col);
                     if (RAY_IS_ERR(result)) {
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                     }
                 }
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 result = apply_sort_take(result, dict_elems, dict_n,
                                          asc_id, desc_id, take_id, NULL);
@@ -9993,7 +9992,7 @@ by_dict_done:
     ray_graph_free(g);
     /* The nearest-query buffer was only referenced by ext->rerank.query_vec
      * and is safe to free once the graph (and thus the op ext) is gone. */
-    if (nearest_query_owned) ray_sys_free(nearest_query_owned);
+    if (nearest_query_owned) ray_free_raw(nearest_query_owned);
     /* The HNSW handle was kept alive through ray_execute so the rerank
      * ext's idx pointer stayed valid.  Safe to release now that the
      * graph (and its ext nodes) has been freed. */

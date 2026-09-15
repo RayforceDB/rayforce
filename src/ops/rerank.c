@@ -30,7 +30,6 @@
 #include "ops/internal.h"
 #include "ops/rowsel.h"
 #include "lang/format.h"
-#include "mem/sys.h"
 #include "store/hnsw.h"
 #include <math.h>
 #include <string.h>
@@ -254,7 +253,7 @@ static int64_t* accepted_rowids(ray_graph_t* g, int64_t nrows, int64_t* count) {
         return NULL;
     }
 
-    int64_t* dense = (int64_t*)ray_sys_alloc((size_t)n_accepted * sizeof(int64_t));
+    int64_t* dense = (int64_t*)ray_calloc_raw((size_t)n_accepted * sizeof(int64_t));
     if (!dense) {
         ray_release(idx_blk);
         ray_release(sel);
@@ -368,12 +367,12 @@ ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     int32_t ef_search = ef;
     if ((int64_t)ef_search < k) ef_search = (int32_t)k;
 
-    int64_t* out_ids = (int64_t*)ray_sys_alloc((size_t)k * sizeof(int64_t));
-    double*  out_ds  = (double*)ray_sys_alloc((size_t)k * sizeof(double));
+    int64_t* out_ids = (int64_t*)ray_calloc_raw((size_t)k * sizeof(int64_t));
+    double*  out_ds  = (double*)ray_calloc_raw((size_t)k * sizeof(double));
     if (!out_ids || !out_ds) {
-        if (out_ids) ray_sys_free(out_ids);
-        if (out_ds)  ray_sys_free(out_ds);
-        if (accepted) ray_sys_free(accepted);
+        if (out_ids) ray_free_raw(out_ids);
+        if (out_ds)  ray_free_raw(out_ds);
+        if (accepted) ray_free_raw(accepted);
         return ray_error("oom", NULL);
     }
 
@@ -385,9 +384,9 @@ ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
         /* Build membership bitmap over the index's row space and hand it
          * to the filtered iterative scan as a predicate callback. */
         size_t bm_size = ((size_t)n_nodes + 7) / 8;
-        uint8_t* member = (uint8_t*)ray_sys_alloc(bm_size);
+        uint8_t* member = (uint8_t*)ray_calloc_raw(bm_size);
         if (!member) {
-            ray_sys_free(out_ids); ray_sys_free(out_ds); ray_sys_free(accepted);
+            ray_free_raw(out_ids); ray_free_raw(out_ds); ray_free_raw(accepted);
             return ray_error("oom", NULL);
         }
         memset(member, 0, bm_size);
@@ -395,28 +394,28 @@ ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
             int64_t rid = accepted[i];
             if (rid >= 0 && rid < n_nodes) member[rid / 8] |= (uint8_t)(1u << (rid % 8));
         }
-        ray_sys_free(accepted);
+        ray_free_raw(accepted);
         accepted = NULL;
 
         rr_member_ctx_t cb_ctx = { .member = member, .n_nodes = n_nodes };
         n_found = ray_hnsw_search_filter(idx, query, dim, k, ef_search,
                                           rr_member_accept, &cb_ctx,
                                           out_ids, out_ds);
-        ray_sys_free(member);
+        ray_free_raw(member);
     }
-    if (accepted) ray_sys_free(accepted);
+    if (accepted) ray_free_raw(accepted);
 
     /* ray_hnsw_search / _filter return -1 on internal OOM — surface it as
      * an error rather than silently returning a zero-row table. */
     if (n_found < 0) {
-        ray_sys_free(out_ids);
-        ray_sys_free(out_ds);
+        ray_free_raw(out_ids);
+        ray_free_raw(out_ds);
         return ray_error("oom", NULL);
     }
 
     ray_t* result = gather_rows_with_dist(src, out_ids, out_ds, n_found);
-    ray_sys_free(out_ids);
-    ray_sys_free(out_ds);
+    ray_free_raw(out_ids);
+    ray_free_raw(out_ds);
     if (!result) return ray_error("oom", NULL);
     return result;
 }
@@ -466,8 +465,8 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     }
 
     /* Convert query float* → double[] + norm. */
-    double* q_buf = (double*)ray_sys_alloc((size_t)dim * sizeof(double));
-    if (!q_buf) { if (accepted) ray_sys_free(accepted); return ray_error("oom", NULL); }
+    double* q_buf = (double*)ray_calloc_raw((size_t)dim * sizeof(double));
+    if (!q_buf) { if (accepted) ray_free_raw(accepted); return ray_error("oom", NULL); }
     double q_norm_sq = 0.0;
     for (int32_t j = 0; j < dim; j++) {
         q_buf[j] = (double)query[j];
@@ -478,9 +477,9 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     int64_t k_eff = k;
     if (k_eff > accepted_count) k_eff = accepted_count;
 
-    rr_ent_t* heap = (rr_ent_t*)ray_sys_alloc((size_t)k_eff * sizeof(rr_ent_t));
+    rr_ent_t* heap = (rr_ent_t*)ray_calloc_raw((size_t)k_eff * sizeof(rr_ent_t));
     if (!heap) {
-        ray_sys_free(q_buf); if (accepted) ray_sys_free(accepted);
+        ray_free_raw(q_buf); if (accepted) ray_free_raw(accepted);
         return ray_error("oom", NULL);
     }
     int64_t heap_size = 0;
@@ -494,7 +493,7 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
             if (!rr_is_numeric(row) || row->len != dim) {
                 int8_t  rt = row ? row->type : RAY_NULL;
                 int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
-                ray_sys_free(heap); ray_sys_free(q_buf); ray_sys_free(accepted);
+                ray_free_raw(heap); ray_free_raw(q_buf); ray_free_raw(accepted);
                 if (rl >= 0)
                     return ray_error("type", "knn rerank: each row vector must have length %lld, got %lld", (long long)dim, (long long)rl);
                 return ray_error("type", "knn rerank: each row must be a numeric vector (f32/f64/i32/i64), got %s", ray_type_name(rt));
@@ -508,7 +507,7 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
             if (!rr_is_numeric(row) || row->len != dim) {
                 int8_t  rt = row ? row->type : RAY_NULL;
                 int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
-                ray_sys_free(heap); ray_sys_free(q_buf);
+                ray_free_raw(heap); ray_free_raw(q_buf);
                 if (rl >= 0)
                     return ray_error("type", "knn rerank: each row vector must have length %lld, got %lld", (long long)dim, (long long)rl);
                 return ray_error("type", "knn rerank: each row must be a numeric vector (f32/f64/i32/i64), got %s", ray_type_name(rt));
@@ -517,28 +516,28 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
             rr_heap_insert(heap, k_eff, &heap_size, d, i);
         }
     }
-    ray_sys_free(q_buf);
-    if (accepted) ray_sys_free(accepted);
+    ray_free_raw(q_buf);
+    if (accepted) ray_free_raw(accepted);
 
     rr_heap_sort(heap, heap_size);
 
-    int64_t* out_ids = (int64_t*)ray_sys_alloc((size_t)heap_size * sizeof(int64_t));
-    double*  out_ds  = (double*)ray_sys_alloc((size_t)heap_size * sizeof(double));
+    int64_t* out_ids = (int64_t*)ray_calloc_raw((size_t)heap_size * sizeof(int64_t));
+    double*  out_ds  = (double*)ray_calloc_raw((size_t)heap_size * sizeof(double));
     if ((!out_ids || !out_ds) && heap_size > 0) {
-        if (out_ids) ray_sys_free(out_ids);
-        if (out_ds)  ray_sys_free(out_ds);
-        ray_sys_free(heap);
+        if (out_ids) ray_free_raw(out_ids);
+        if (out_ds)  ray_free_raw(out_ds);
+        ray_free_raw(heap);
         return ray_error("oom", NULL);
     }
     for (int64_t i = 0; i < heap_size; i++) {
         out_ids[i] = heap[i].id;
         out_ds[i]  = heap[i].d;
     }
-    ray_sys_free(heap);
+    ray_free_raw(heap);
 
     ray_t* result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
-    if (out_ids) ray_sys_free(out_ids);
-    if (out_ds)  ray_sys_free(out_ds);
+    if (out_ids) ray_free_raw(out_ids);
+    if (out_ds)  ray_free_raw(out_ds);
     if (!result) return ray_error("oom", NULL);
     return result;
 }

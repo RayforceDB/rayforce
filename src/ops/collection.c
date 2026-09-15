@@ -26,7 +26,6 @@
 #include "lang/internal.h"
 #include "core/types.h"
 #include "core/pool.h"
-#include "mem/sys.h"
 #include "ops/hash.h"
 #include "ops/internal.h"   /* col_propagate_str_pool */
 #include "ops/idxop.h"
@@ -394,7 +393,7 @@ static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_nul
     int64_t m = nd->len, n = hay->len;
     hashset_t hs;
     if (!hashset_init(&hs, nd, m)) return false;
-    int64_t* first = (int64_t*)ray_sys_alloc((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
+    int64_t* first = (int64_t*)ray_alloc_raw((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
     if (!first) { hashset_destroy(&hs); return false; }
     int64_t distinct = 0;
     for (int64_t j = 0; j < m; j++) {
@@ -414,7 +413,7 @@ static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_nul
         if (pos < 0) { out[i] = NULL_I64; *any_null = true; }
         else out[i] = pos;
     }
-    ray_sys_free(first);
+    ray_free_raw(first);
     hashset_destroy(&hs);
     return true;
 }
@@ -1043,7 +1042,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
     }
 
     int64_t idx_stack[256];
-    int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len * sizeof(int64_t));
+    int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_alloc_raw((size_t)len * sizeof(int64_t));
     if (!idx) return ray_error("oom", NULL);
 
     /* SYM presence-bitmap dedup: a SYM code is a position in [0, domain_count),
@@ -1054,9 +1053,8 @@ ray_t* distinct_vec_eager(ray_t* x) {
     if (x->type == RAY_SYM) {
         int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(x));
         if (dc > 0 && dc <= 65536 && dc <= len) {
-            uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)dc);
-            if (!seen) { if (idx != idx_stack) ray_sys_free(idx); return ray_error("oom", NULL); }
-            memset(seen, 0, (size_t)dc);
+            uint8_t* seen = (uint8_t*)ray_calloc_raw((size_t)dc);
+            if (!seen) { if (idx != idx_stack) ray_free_raw(idx); return ray_error("oom", NULL); }
             const void* data = ray_data(x);
             int8_t ty = x->type; uint16_t at = x->attrs;
             int64_t count = 0;
@@ -1064,9 +1062,9 @@ ray_t* distinct_vec_eager(ray_t* x) {
                 int64_t code = ray_read_sym(data, i, ty, at);
                 if (!seen[code]) { seen[code] = 1; idx[count++] = i; }
             }
-            ray_sys_free(seen);
+            ray_free_raw(seen);
             ray_t* result = gather_by_idx(x, idx, count);
-            if (idx != idx_stack) ray_sys_free(idx);
+            if (idx != idx_stack) ray_free_raw(idx);
             return result;
         }
     }
@@ -1082,17 +1080,16 @@ ray_t* distinct_vec_eager(ray_t* x) {
         if (nd > 0 && nd <= len && codes_v && !RAY_IS_ERR(codes_v)
             && codes_v->len == len) {
             const int32_t* codes = (const int32_t*)ray_data(codes_v);
-            uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)nd);
-            if (!seen) { if (idx != idx_stack) ray_sys_free(idx); return ray_error("oom", NULL); }
-            memset(seen, 0, (size_t)nd);
+            uint8_t* seen = (uint8_t*)ray_calloc_raw((size_t)nd);
+            if (!seen) { if (idx != idx_stack) ray_free_raw(idx); return ray_error("oom", NULL); }
             int64_t count = 0;
             for (int64_t i = 0; i < len; i++) {
                 int32_t c = codes[i];
                 if (c >= 0 && c < nd && !seen[c]) { seen[c] = 1; idx[count++] = i; }
             }
-            ray_sys_free(seen);
+            ray_free_raw(seen);
             ray_t* result = gather_by_idx(x, idx, count);
-            if (idx != idx_stack) ray_sys_free(idx);
+            if (idx != idx_stack) ray_free_raw(idx);
             return result;
         }
     }
@@ -1106,7 +1103,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
     int64_t count = 0;
     ray_t* rids = distinct_radix_first_ids(x);
     if (rids && RAY_IS_ERR(rids)) {
-        if (idx != idx_stack) ray_sys_free(idx);
+        if (idx != idx_stack) ray_free_raw(idx);
         return rids;
     }
     if (rids) {
@@ -1116,7 +1113,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
     } else {
         hashset_t hs;
         if (!hashset_init(&hs, x, len)) {
-            if (idx != idx_stack) ray_sys_free(idx);
+            if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
         for (int64_t i = 0; i < len; i++) {
@@ -1132,7 +1129,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
     }
 
     ray_t* result = gather_by_idx(x, idx, count);
-    if (idx != idx_stack) ray_sys_free(idx);
+    if (idx != idx_stack) ray_free_raw(idx);
     return result;
 }
 
@@ -1355,20 +1352,20 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
              * null-free sets only), matching the hashset path below. */
             if (ray_index_has(vec)) {
                 ray_idx_consults[IDX_SITE_IN]++;
-                int64_t* pos = (int64_t*)ray_sys_alloc((size_t)vlen * sizeof(int64_t));
+                int64_t* pos = (int64_t*)ray_calloc_raw((size_t)vlen * sizeof(int64_t));
                 if (!pos) return ray_error("oom", NULL);
                 bool miss = false;
                 if (ray_index_find_vec(vec, val, pos, &miss)) {
                     ray_idx_hits[IDX_SITE_IN]++;
                     ray_t* result = ray_vec_new(RAY_BOOL, vlen);
-                    if (RAY_IS_ERR(result)) { ray_sys_free(pos); return result; }
+                    if (RAY_IS_ERR(result)) { ray_free_raw(pos); return result; }
                     result->len = vlen;
                     bool* out = (bool*)ray_data(result);
                     for (int64_t i = 0; i < vlen; i++) out[i] = pos[i] != NULL_I64;
-                    ray_sys_free(pos);
+                    ray_free_raw(pos);
                     return result;
                 }
-                ray_sys_free(pos);
+                ray_free_raw(pos);
             }
             /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
              * ints, pool-parallel — the same engine the fused WHERE path
@@ -1389,14 +1386,14 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             /* Fewer needles than set rows: hash the needles and scan the
              * set once instead of hashing the whole set per call. */
             if (find_needle_side_ok(vec, val)) {
-                int64_t* pos = (int64_t*)ray_sys_alloc((size_t)vlen * sizeof(int64_t));
+                int64_t* pos = (int64_t*)ray_calloc_raw((size_t)vlen * sizeof(int64_t));
                 bool miss = false;
                 if (pos && find_hash_needles(vec, val, pos, &miss)) {
                     for (int64_t i = 0; i < vlen; i++) out[i] = pos[i] != NULL_I64;
-                    ray_sys_free(pos);
+                    ray_free_raw(pos);
                     return result;
                 }
-                if (pos) ray_sys_free(pos);
+                if (pos) ray_free_raw(pos);
             }
             hashset_t hs;
             if (!hashset_init(&hs, vec, vec->len)) {
@@ -1536,7 +1533,7 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
     if (ray_is_vec(vec1) && (ray_is_vec(vec2) || ray_is_atom(vec2))) {
         int64_t len1 = vec1->len;
         int64_t idx_stack[256];
-        int64_t* idx = (len1 <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len1 * sizeof(int64_t));
+        int64_t* idx = (len1 <= 256) ? idx_stack : (int64_t*)ray_alloc_raw((size_t)len1 * sizeof(int64_t));
         if (!idx) return ray_error("oom", NULL);
         int64_t count = 0;
         if (ray_is_atom(vec2)) {
@@ -1551,7 +1548,7 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
         } else {
             hashset_t hs;
             if (!hashset_init(&hs, vec2, vec2->len)) {
-                if (idx != idx_stack) ray_sys_free(idx);
+                if (idx != idx_stack) ray_free_raw(idx);
                 return ray_error("oom", NULL);
             }
             for (int64_t j = 0; j < vec2->len; j++) hashset_insert(&hs, j);
@@ -1564,7 +1561,7 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
             hashset_destroy(&hs);
         }
         ray_t* result = gather_by_idx(vec1, idx, count);
-        if (idx != idx_stack) ray_sys_free(idx);
+        if (idx != idx_stack) ray_free_raw(idx);
         return result;
     }
 
@@ -1616,11 +1613,11 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
     if (ray_is_vec(vec1) && ray_is_vec(vec2)) {
         int64_t len2 = vec2->len;
         int64_t idx_stack[256];
-        int64_t* idx = (len2 <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len2 * sizeof(int64_t));
+        int64_t* idx = (len2 <= 256) ? idx_stack : (int64_t*)ray_alloc_raw((size_t)len2 * sizeof(int64_t));
         if (!idx) return ray_error("oom", NULL);
         hashset_t hs;
         if (!hashset_init(&hs, vec1, vec1->len)) {
-            if (idx != idx_stack) ray_sys_free(idx);
+            if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
         for (int64_t j = 0; j < vec1->len; j++) hashset_insert(&hs, j);
@@ -1633,7 +1630,7 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
         }
         hashset_destroy(&hs);
         ray_t* part2 = gather_by_idx(vec2, idx, extra);
-        if (idx != idx_stack) ray_sys_free(idx);
+        if (idx != idx_stack) ray_free_raw(idx);
         if (RAY_IS_ERR(part2)) return part2;
         ray_t* result = ray_concat_fn(vec1, part2);
         ray_release(part2);
@@ -1678,11 +1675,11 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2) {
     if (ray_is_vec(vec1) && ray_is_vec(vec2)) {
         int64_t len1 = vec1->len;
         int64_t idx_stack[256];
-        int64_t* idx = (len1 <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len1 * sizeof(int64_t));
+        int64_t* idx = (len1 <= 256) ? idx_stack : (int64_t*)ray_alloc_raw((size_t)len1 * sizeof(int64_t));
         if (!idx) return ray_error("oom", NULL);
         hashset_t hs;
         if (!hashset_init(&hs, vec2, vec2->len)) {
-            if (idx != idx_stack) ray_sys_free(idx);
+            if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
         for (int64_t j = 0; j < vec2->len; j++) hashset_insert(&hs, j);
@@ -1695,7 +1692,7 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2) {
         }
         hashset_destroy(&hs);
         ray_t* result = gather_by_idx(vec1, idx, count);
-        if (idx != idx_stack) ray_sys_free(idx);
+        if (idx != idx_stack) ray_free_raw(idx);
         return result;
     }
 
@@ -4310,7 +4307,7 @@ static ray_t* map_iterate(ray_t* fn, ray_t* fixed, ray_t* vec, int fixed_is_left
     ray_t* stack_results[4096];
     ray_t** results = stack_results;
     if (vn > 4096) {
-        results = (ray_t**)ray_sys_alloc((size_t)vn * sizeof(ray_t*));
+        results = (ray_t**)ray_calloc_raw((size_t)vn * sizeof(ray_t*));
         if (!results) return ray_error("oom", NULL);
     }
 
@@ -4325,13 +4322,13 @@ static ray_t* map_iterate(ray_t* fn, ray_t* fixed, ray_t* vec, int fixed_is_left
         if (RAY_IS_ERR(results[i])) {
             ray_t* err = results[i];
             for (int64_t j = 0; j < i; j++) ray_release(results[j]);
-            if (results != stack_results) ray_sys_free(results);
+            if (results != stack_results) ray_free_raw(results);
             return err;
         }
     }
     ray_t* out = ray_enlist_fn(results, vn);
     for (int64_t i = 0; i < vn; i++) ray_release(results[i]);
-    if (results != stack_results) ray_sys_free(results);
+    if (results != stack_results) ray_free_raw(results);
     return out;
 }
 
