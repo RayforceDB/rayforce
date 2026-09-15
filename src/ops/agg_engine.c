@@ -914,6 +914,8 @@ typedef struct {
     ray_t*              sel;
     const int64_t*      sel_prefix;
     agg_valdesc_t       vd;
+    int64_t             task_rows;
+    uint32_t            n_tasks;
 } agg_dense_ctx_t;
 
 /* Initialize every slot's agg states in a freshly-allocated slab (min/max need
@@ -1125,16 +1127,26 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
     ray_free_raw(cgid);
 }
 
+/* One slab per logical task, independent of the physical worker executing it.
+ * A large pool can run a memory-bounded number of dense tasks safely. */
+static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_ctx_t* c = raw;
+    int64_t chunk = c->task_rows / c->n_tasks;
+    for (int64_t task = start; task < end; task++)
+        agg_dense_phaseA_fn(c, (uint32_t)task, chunk * task,
+            task + 1 == c->n_tasks ? c->task_rows : chunk * (task + 1));
+}
+
 /* Parallel dense path.  Precondition: dp->ok, all aggs ACC_STREAMING, per-worker
  * budget already gated by the caller. */
 static ray_t* exec_group_v2_parallel_dense(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext, int64_t nrows,
-        ray_pool_t* pool, const dense_plan_t* dp,
+        ray_pool_t* pool, const dense_plan_t* dp, uint32_t nw,
         ray_t* sel, const int64_t* sel_prefix, int64_t n_sel) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     int64_t total_slots = dp->total_slots;
-    uint32_t nw = ray_pool_total_workers(pool);
 
     /* Re-derive the AoS layout (same order as exec_group_v2). */
     agg_vo_t vo;
@@ -1175,6 +1187,7 @@ static ray_t* exec_group_v2_parallel_dense(
         .val_data = val_data, .val_types = val_types, .val_hasnull = val_hasnull, .val_esz = val_esz,
         .val2_data = val2_data, .val2_types = val2_types, .val2_hasnull = val2_hasnull, .val2_esz = val2_esz,
         .locals = locals,
+        .task_rows = sel ? n_sel : nrows, .n_tasks = nw,
         .sel = sel, .sel_prefix = sel_prefix,
         .vd = { .n_aggs = n_aggs, .vts = vts, .off = off, .block = block,
                 .val_data = val_data, .val_types = val_types, .val_hasnull = val_hasnull, .val_esz = val_esz,
@@ -1182,7 +1195,7 @@ static ray_t* exec_group_v2_parallel_dense(
     };
     /* Sel mode dispatches over the SELECTED-row space [0,n_sel); each worker
      * range maps to a segment span via sel_prefix.  Non-sel dispatches over rows. */
-    ray_pool_dispatch(pool, agg_dense_phaseA_fn, &ctx, sel ? n_sel : nrows);
+    ray_pool_dispatch_n(pool, agg_dense_task_fn, &ctx, nw);
 
     for (uint32_t w = 0; w < nw; w++)
         if (locals[w].oom || agg_cancelled()) {
@@ -2888,6 +2901,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.nullable_key = false;
     route_stats.dense_plan_available = false;
     route_stats.dense_worker_budget = false;
+    route_stats.dense_tasks = 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
 
     /* Exact-size carve for the per-key column pointers + syms (one block, both
@@ -2987,12 +3001,17 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * when the aggregate slot count across all workers remains O(input);
          * this is data-derived and independent of cache or RAM size. */
         uint32_t dense_workers = ray_pool_total_workers(pool);
-        double dense_bytes = (double)dp.total_slots * ((double)dense_workers + 1) * (block + sizeof(int64_t))
-            + (double)eff_n * sizeof(uint32_t);
         double scatter_budget = (double)eff_n * 2 * (8.0 * (ext->n_keys + ext->n_aggs + 1));
         int64_t watermark = ray_heap_anon_watermark();
-        bool dense_par_ok = dp.ok && dense_workers > 0 && dense_bytes <= scatter_budget
-            && dense_bytes <= (double)SIZE_MAX && (watermark <= 0 || dense_bytes <= (double)watermark / 4);
+        double dense_budget = scatter_budget;
+        if (dense_budget > (double)SIZE_MAX) dense_budget = (double)SIZE_MAX;
+        if (watermark > 0 && dense_budget > (double)watermark / 4) dense_budget = (double)watermark / 4;
+        double slab_bytes = dp.ok ? (double)dp.total_slots * (block + sizeof(int64_t)) : 0;
+        if (dp.ok && slab_bytes > 0) {
+            double fit = (dense_budget - (double)eff_n * sizeof(uint32_t)) / slab_bytes - 1;
+            if (fit < dense_workers) dense_workers = fit >= 2 ? (uint32_t)fit : 0;
+        }
+        bool dense_par_ok = dp.ok && dense_workers > 0;
         /* Allocation size alone misses repeated wide-range worker updates.
          * Estimate touched slot traffic from evenly spaced key samples in each
          * worker-sized input range. Prefer radix when duplicated state traffic
@@ -3039,8 +3058,9 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
 
         if (dense_par_ok) {
+            route_stats.dense_tasks = dense_workers;
             agg_route_record(AGG_ROUTE_V2_DENSE);
-            ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp,
+            ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp, dense_workers,
                                                     sel, sel_prefix, n_sel);
             agg_vo_free(&vo); scratch_free(kc_hdr); return r;
         }

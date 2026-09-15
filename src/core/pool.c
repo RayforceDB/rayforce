@@ -154,13 +154,9 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
             long v = strtol(env, NULL, 10);
             n_workers = (v > 0) ? (uint32_t)v : 0;
         } else {
-            /* Physical cores, not SMT threads: the pool's kernels are
-             * memory-bound, and hyperthread pairs sharing one core's
-             * load/store machinery only contend (full ClickBench suite
-             * measured ~11% slower at 32 SMT threads than at the 16
-             * physical cores of a 5950X).  ray_physical_core_count falls
-             * back to the logical count when topology is unreadable. */
-            uint32_t ncpu = ray_physical_core_count();
+            /* Default to every online logical CPU. Individual operations may
+             * bound their task count to their workload or memory budget. */
+            uint32_t ncpu = ray_thread_count();
             n_workers = (ncpu > 1) ? ncpu - 1 : 0;
         }
     }
