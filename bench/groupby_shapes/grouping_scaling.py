@@ -60,6 +60,14 @@ for name, value in (("extrema-ascending", "i"), ("extrema-descending", "(- 0 i)"
     CASES[name] = (f"(set t (select {{from:t i:i k:k j:j v:(as 'I32 {value}) f:f w:w}}))",
                    "s:(min v) hi:(max v)", "k", "")
 
+CASES["few-groups-indexed"] = (
+    "(set t (update {from:t k:(as 'I32 (% i 7))}))",
+    "n:(count v) f:(first v) l:(last v)", "k", "")
+
+CASES["hot-top-ascending"] = (
+    "(set t (select {from:t i:i k:(as 'I32 (* i 0)) j:j v:i f:f w:w}))",
+    "s:(top v 3) b:(bot v 3)", "k", "")
+
 CASES["guid-key"] = (
     "(set g (as 'GUID (list \"00000000-0000-0000-0000-000000000001\" \"00000000-0000-0000-0000-000000000002\" \"00000000-0000-0000-0000-000000000003\" \"\")))\n"
     "(set t (table [i k j v f w] (list i (at g (% i 4)) (at t 'j) (at t 'v) (at t 'f) (at t 'w))))",
@@ -128,6 +136,7 @@ def main():
     binaries = [("current", args.binary.resolve())]
     if args.baseline:
         binaries.insert(0, ("baseline", args.baseline.resolve()))
+    hashes = {name: hashlib.sha256(binary.read_bytes()).hexdigest() for name, binary in binaries}
     env = os.environ.copy()
     env.pop("RAYFORCE_CORES", None)
     log_dir = args.output.with_suffix(".runs")
@@ -140,6 +149,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rayforce-grouping-") as temp:
         directory = Path(temp)
         script, result, schema, rss, input_schema = (directory / f for f in ("query.rfl", "result.csv", "schema.csv", "rss", "input-schema.csv"))
+        warm_result, warm_schema = directory / "warm-result.csv", directory / "warm-schema.csv"
         references = set()
         for round_number in range(1, args.rounds + 1):
             for case, worker, name, binary in matrix if round_number % 2 else reversed(matrix):
@@ -158,10 +168,13 @@ def main():
                 text = setup + f"(println (count t))\n(println (timeit (set r {query})))\n(println (count r))\n"
                 text += (f"(println (timeit {query}))\n" * 5)
                 text += f"(set ordered (xasc r {key_list}))\n(.csv.write ordered {json.dumps(str(result))})\n"
+                # Untimed re-execution checks that warming does not change results.
+                text += f"(set warm_ordered (xasc {query} {key_list}))\n(.csv.write warm_ordered {json.dumps(str(warm_result))})\n"
+                text += "(.csv.write (table [column kind] (list (key warm_ordered) (map (fn [c] (at (meta (at warm_ordered c)) 'type)) (key warm_ordered)))) " + json.dumps(str(warm_schema)) + ")\n"
                 text += "(.csv.write (table [column kind] (list (key ordered) (map (fn [c] (at (meta (at ordered c)) 'type)) (key ordered)))) " + json.dumps(str(schema)) + ")\n"
                 text += "(.csv.write (table [column kind] (list (key t) (map (fn [c] (at (meta (at t c)) 'type)) (key t)))) " + json.dumps(str(input_schema)) + ")\n"
                 script.write_text(text)
-                for p in (result, schema, rss):
+                for p in (result, schema, warm_result, warm_schema, input_schema, rss):
                     p.unlink(missing_ok=True)
                 command = ["/usr/bin/time", "-f", "%M", "-o", str(rss), str(binary), str(script)]
                 if worker != "default":
@@ -173,13 +186,16 @@ def main():
                 if run.returncode:
                     raise RuntimeError(f"{case} failed: {run.stdout}\n{run.stderr}")
                 values = [float(line) for line in run.stdout.splitlines() if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", line.strip())]
-                if len(values) < 8 or not result.is_file() or not schema.is_file():
+                if len(values) < 8 or not all(p.is_file() for p in (result, schema, warm_result, warm_schema, input_schema)):
                     raise RuntimeError(f"Incomplete {case}: {run.stdout}\n{run.stderr}")
                 reference, ref_schema = directory / f"{case}.csv", directory / f"{case}-schema.csv"
                 if case not in references:
                     shutil.copyfile(result, reference)
                     shutil.copyfile(schema, ref_schema)
                     references.add(case)
+                if schema.read_bytes() != warm_schema.read_bytes():
+                    raise RuntimeError(f"Cold/warm result types differ for {case}")
+                compare_csv(result, warm_result, schema, key_names=("k", "j"))
                 if schema.read_bytes() != ref_schema.read_bytes():
                     raise RuntimeError(f"Result types differ for {case}")
                 try:
@@ -202,7 +218,7 @@ def main():
                 if case.startswith("wide-") and input_types["text"] != "STR":
                     raise RuntimeError("Wide fixture did not produce STR values")
                 records.append(dict(input_types=input_types, phases=profile_phases(run.stdout + run.stderr),
-                                    case=case, workers=worker, binary=name, path=str(binary), round=round_number,
+                                    case=case, workers=worker, binary=name, path=str(binary), sha256=hashes[name], round=round_number,
                                     rows=int(values[0]), groups=int(values[2]), cold_ms=values[1], warm_ms=values[3:8],
                                     peak_rss_kib=int(rss.read_text()), result_sha256=hashlib.sha256(result.read_bytes()).hexdigest()))
                 args.output.write_text(json.dumps(records, indent=2) + "\n")

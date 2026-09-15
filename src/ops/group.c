@@ -3321,6 +3321,28 @@ static int topk_row_cmp(ray_t* src, int64_t a, int64_t b, const ray_group_sym_vi
     return cmp ? cmp : (na > nb) - (na < nb);
 }
 static void topk_rows_sift(ray_t* src, int64_t* heap, int64_t n, int64_t root, bool desc, const ray_group_sym_view_t* view) {
+#define TOPK_SIFT_NATIVE(TYPE) do { \
+        const TYPE* data = ray_data(src); \
+        for (;;) { \
+            int64_t child = root * 2 + 1; \
+            if (child >= n) return; \
+            if (child + 1 < n && (desc ? data[heap[child + 1]] < data[heap[child]] : \
+                                        data[heap[child + 1]] > data[heap[child]])) child++; \
+            if (!(desc ? data[heap[child]] < data[heap[root]] : data[heap[child]] > data[heap[root]])) return; \
+            int64_t swap = heap[root]; heap[root] = heap[child]; heap[child] = swap; \
+            root = child; \
+        } \
+    } while (0)
+    switch (src->type) {
+        case RAY_BOOL: case RAY_U8: TOPK_SIFT_NATIVE(uint8_t);
+        case RAY_I16: TOPK_SIFT_NATIVE(int16_t);
+        case RAY_I32: case RAY_DATE: case RAY_TIME: TOPK_SIFT_NATIVE(int32_t);
+        case RAY_I64: case RAY_TIMESTAMP: TOPK_SIFT_NATIVE(int64_t);
+        case RAY_F32: TOPK_SIFT_NATIVE(float);
+        case RAY_F64: TOPK_SIFT_NATIVE(double);
+        default: break;
+    }
+#undef TOPK_SIFT_NATIVE
     for (;;) {
         int64_t child = root * 2 + 1;
         if (child >= n) return;
@@ -3482,8 +3504,8 @@ static ray_t* topk_regular_per_group_buf(ray_t* src,
 typedef struct {
     ray_t* source;
     const int64_t* rows;
-    int64_t count, k;
-    uint32_t tasks;
+    int64_t count, k, heap_stride;
+    uint32_t tasks, source_tasks;
     bool desc, sorted;
     int64_t* heaps;
     int64_t kept[RAY_POOL_INIT_TASKS];
@@ -3503,28 +3525,78 @@ static void topk_keep_row(topk_chunks_t* c, int64_t* heap, int64_t* kept, int64_
         }
     }
 }
-static void topk_chunks_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+static void topk_sort_chunk(topk_chunks_t* c, int64_t t, int64_t kept) {
+    int64_t* heap = c->heaps + t * (c->heap_stride ? c->heap_stride : c->k);
+    if (kept < c->k)
+        for (int64_t h = kept / 2; h > 0; h--)
+            topk_rows_sift(c->source, heap, kept, h - 1, c->desc, &c->symbols);
+    for (int64_t n = kept; n > 1; n--) {
+        int64_t swap = heap[0]; heap[0] = heap[n - 1]; heap[n - 1] = swap;
+        topk_rows_sift(c->source, heap, n - 1, 0, c->desc, &c->symbols);
+    }
+}
+static void topk_sort_chunks_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; topk_chunks_t* c = raw;
+    for (int64_t t = start; t < end; t++) topk_sort_chunk(c, t, c->kept[t]);
+}
+static void topk_chunks_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    topk_chunks_t* c = raw;
+    uint32_t sources = c->source_tasks ? c->source_tasks : c->tasks;
     for (int64_t t = start; t < end; t++) {
-        int64_t remainder = c->count % c->tasks;
-        int64_t begin = c->count / c->tasks * t + (t < remainder ? t : remainder);
-        int64_t limit = begin + c->count / c->tasks + (t < remainder);
-        for (int64_t i = begin; i < limit; i++) {
-            if ((i & 65535) == 0 && ray_interrupted()) return;
-            if (!ray_vec_is_null(c->source, c->rows[i]))
-                topk_keep_row(c, c->heaps + t * c->k, &c->kept[t], c->rows[i]);
+        int64_t remainder = c->count % sources;
+        int64_t begin = c->count / sources * t + (t < remainder ? t : remainder);
+        int64_t limit = begin + c->count / sources + (t < remainder);
+        int64_t heap_id = c->source_tasks ? wid : t;
+        int64_t kept = c->source_tasks ? c->kept[heap_id] : 0;
+        int64_t* heap = c->heaps + heap_id * (c->heap_stride ? c->heap_stride : c->k);
+        bool has_nulls = ray_vec_may_have_nulls(c->source);
+        /* Most rows lose against the heap root. Dispatch native types once,
+         * and enter the general comparator only when the heap must change. */
+#define TOPK_SCAN_NATIVE(TYPE, VALID) do { \
+            const TYPE* data = ray_data(c->source); \
+            for (int64_t i = begin; i < limit; i++) { \
+                if ((i & 65535) == 0 && ray_interrupted()) return; \
+                int64_t row = c->rows[i]; \
+                TYPE value = data[row]; \
+                if (has_nulls && !(VALID)) continue; \
+                if (kept < c->k) { \
+                    topk_keep_row(c, heap, &kept, row); \
+                } else if (c->desc ? value > data[heap[0]] : value < data[heap[0]]) { \
+                    heap[0] = row; \
+                    int64_t root = 0; \
+                    for (;;) { \
+                        int64_t child = root * 2 + 1; \
+                        if (child >= kept) break; \
+                        if (child + 1 < kept && (c->desc ? data[heap[child + 1]] < data[heap[child]] : \
+                                                          data[heap[child + 1]] > data[heap[child]])) child++; \
+                        if (!(c->desc ? data[heap[child]] < data[heap[root]] : \
+                                        data[heap[child]] > data[heap[root]])) break; \
+                        int64_t swap = heap[root]; heap[root] = heap[child]; heap[child] = swap; \
+                        root = child; \
+                    } \
+                } \
+            } \
+        } while (0)
+        switch (c->source->type) {
+            case RAY_BOOL: case RAY_U8: TOPK_SCAN_NATIVE(uint8_t, true); break;
+            case RAY_I16: TOPK_SCAN_NATIVE(int16_t, value != NULL_I16); break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME:
+                TOPK_SCAN_NATIVE(int32_t, value != NULL_I32); break;
+            case RAY_I64: case RAY_TIMESTAMP:
+                TOPK_SCAN_NATIVE(int64_t, value != NULL_I64); break;
+            case RAY_F32: TOPK_SCAN_NATIVE(float, value == value); break;
+            case RAY_F64: TOPK_SCAN_NATIVE(double, value == value); break;
+            default:
+                for (int64_t i = begin; i < limit; i++) {
+                    if ((i & 65535) == 0 && ray_interrupted()) return;
+                    if (!ray_vec_is_null(c->source, c->rows[i]))
+                        topk_keep_row(c, heap, &kept, c->rows[i]);
+                }
+                break;
         }
-        if (c->sorted) {
-            int64_t* heap = c->heaps + t * c->k;
-            int64_t kept = c->kept[t];
-            if (kept < c->k)
-                for (int64_t h = kept / 2; h > 0; h--)
-                    topk_rows_sift(c->source, heap, kept, h - 1, c->desc, &c->symbols);
-            for (int64_t n = kept; n > 1; n--) {
-                int64_t swap = heap[0]; heap[0] = heap[n - 1]; heap[n - 1] = swap;
-                topk_rows_sift(c->source, heap, n - 1, 0, c->desc, &c->symbols);
-            }
-        }
+#undef TOPK_SCAN_NATIVE
+        if (c->sorted && !c->source_tasks) topk_sort_chunk(c, heap_id, kept);
+        c->kept[heap_id] = kept;
     }
 }
 /* Large K can approach the group size. Sort bounded chunk candidates, then
@@ -3598,6 +3670,33 @@ static void topk_select_compact(void* raw, uint32_t wid, int64_t start, int64_t 
 }
 static void topk_select_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; topk_select_t* c = raw;
+    ray_t* src = c->values->source;
+#define TOPK_SELECT_COUNT(TYPE) do { \
+        const TYPE* data = ray_data(src); \
+        TYPE pivot = data[c->pivot]; \
+        for (int64_t t = start; t < end; t++) { \
+            int64_t less = 0, equal = 0; \
+            for (int64_t i = c->task[t].begin; i < c->task[t].end; i++) { \
+                if ((i & 65535) == 0 && ray_interrupted()) return; \
+                TYPE value = data[c->input[i]]; \
+                int cmp = (value > pivot) - (value < pivot); \
+                if (!cmp) equal++; \
+                else if (c->values->desc ? cmp > 0 : cmp < 0) less++; \
+            } \
+            c->task[t].less = less; c->task[t].equal = equal; \
+        } \
+        return; \
+    } while (0)
+    switch (src->type) {
+        case RAY_BOOL: case RAY_U8: TOPK_SELECT_COUNT(uint8_t);
+        case RAY_I16: TOPK_SELECT_COUNT(int16_t);
+        case RAY_I32: case RAY_DATE: case RAY_TIME: TOPK_SELECT_COUNT(int32_t);
+        case RAY_I64: case RAY_TIMESTAMP: TOPK_SELECT_COUNT(int64_t);
+        case RAY_F32: TOPK_SELECT_COUNT(float);
+        case RAY_F64: TOPK_SELECT_COUNT(double);
+        default: break;
+    }
+#undef TOPK_SELECT_COUNT
     for (int64_t t = start; t < end; t++) {
         int64_t less = 0, equal = 0;
         for (int64_t i = c->task[t].begin; i < c->task[t].end; i++) {
@@ -3611,6 +3710,38 @@ static void topk_select_count(void* raw, uint32_t wid, int64_t start, int64_t en
 }
 static void topk_select_scatter(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; topk_select_t* c = raw;
+    ray_t* src = c->values->source;
+#define TOPK_SELECT_SCATTER(TYPE) do { \
+        const TYPE* data = ray_data(src); \
+        TYPE pivot = data[c->pivot]; \
+        for (int64_t t = start; t < end; t++) { \
+            int64_t lo = c->task[t].lo, eq = c->task[t].eq, hi = c->task[t].hi; \
+            /* Keep the already selected prefix when exchanging scratch buffers. */ \
+            int64_t begin = c->base / c->values->tasks * t; \
+            int64_t limit = t + 1 == c->values->tasks ? c->base : c->base / c->values->tasks * (t + 1); \
+            memcpy(c->output + begin, c->input + begin, (size_t)(limit - begin) * sizeof(int64_t)); \
+            for (int64_t i = c->task[t].begin; i < c->task[t].end; i++) { \
+                if ((i & 65535) == 0 && ray_interrupted()) return; \
+                int64_t row = c->input[i]; \
+                TYPE value = data[row]; \
+                int cmp = (value > pivot) - (value < pivot); \
+                if (!cmp) c->output[eq++] = row; \
+                else if (c->values->desc ? cmp > 0 : cmp < 0) c->output[lo++] = row; \
+                else c->output[hi++] = row; \
+            } \
+        } \
+        return; \
+    } while (0)
+    switch (src->type) {
+        case RAY_BOOL: case RAY_U8: TOPK_SELECT_SCATTER(uint8_t);
+        case RAY_I16: TOPK_SELECT_SCATTER(int16_t);
+        case RAY_I32: case RAY_DATE: case RAY_TIME: TOPK_SELECT_SCATTER(int32_t);
+        case RAY_I64: case RAY_TIMESTAMP: TOPK_SELECT_SCATTER(int64_t);
+        case RAY_F32: TOPK_SELECT_SCATTER(float);
+        case RAY_F64: TOPK_SELECT_SCATTER(double);
+        default: break;
+    }
+#undef TOPK_SELECT_SCATTER
     for (int64_t t = start; t < end; t++) {
         int64_t lo = c->task[t].lo, eq = c->task[t].eq, hi = c->task[t].hi;
         /* Keep the already selected prefix when exchanging scratch buffers. */
@@ -3706,7 +3837,18 @@ static int64_t topk_select_rows(const topk_chunks_t* values, int64_t** input,
 }
 static ray_t* topk_sorted_large_group(ray_t* src, const int64_t* rows, int64_t count,
         int64_t k, bool desc, uint32_t tasks) {
-    bool select = k > count / tasks / 2;
+    /* Sorting each chunk's K candidates costs K*log2(K). Select first
+     * once that work approaches a full scan of the source rows. */
+    unsigned levels = 64 - (unsigned)__builtin_clzll((uint64_t)k);
+    bool select = k > count / tasks / levels / 2;
+    /* A near-full result also needs sorting. Bound each sorting run so
+     * small pools do not sort multi-million-row heaps on one worker. */
+    if (select) {
+        uint32_t limit = tasks * 4;
+        if (limit > RAY_POOL_INIT_TASKS / 2) limit = RAY_POOL_INIT_TASKS / 2;
+        while (tasks < limit && k / tasks > 262144) tasks *= 2;
+        if (tasks > limit) tasks = limit;
+    }
     int64_t cap = (count + tasks - 1) / tasks;
     if (cap > k) cap = k;
     if ((uint64_t)cap > SIZE_MAX / tasks / sizeof(int64_t) ||
@@ -3725,13 +3867,26 @@ static ray_t* topk_sorted_large_group(ray_t* src, const int64_t* rows, int64_t c
     if (select) {
         int64_t kept = topk_select_rows(&c, &input, &output, k);
         if (kept < 0) goto cancelled;
+        ray_profile_tick("topK: selected rows");
         c.rows = input; c.count = kept;
         cap = (kept + tasks - 1) / tasks;
         if (cap < 1) cap = 1;
         c.k = cap; c.heaps = output;
         ray_pool_dispatch_n(pool, topk_chunks_run, &c, tasks);
         int64_t* swap = input; input = output; output = swap;
-    } else ray_pool_dispatch_n(pool, topk_chunks_run, &c, tasks);
+    } else {
+        /* Work stealing balances source chunks without multiplying K-sized
+         * heaps. Each physical worker owns one heap across its claimed tasks. */
+        if (tasks == ray_pool_total_workers(pool)) {
+            c.source_tasks = tasks * 4;
+            if (c.source_tasks > RAY_POOL_INIT_TASKS / 2) c.source_tasks = RAY_POOL_INIT_TASKS / 2;
+        }
+        ray_pool_dispatch_n(pool, topk_chunks_run, &c, c.source_tasks ? c.source_tasks : tasks);
+        if (ray_interrupted() || atomic_load(&pool->cancelled)) goto cancelled;
+        ray_profile_tick("topK: scanned chunks");
+        if (c.source_tasks) ray_pool_dispatch_n(pool, topk_sort_chunks_run, &c, tasks);
+    }
+    ray_profile_tick("topK: sorted chunks");
     int64_t offsets[RAY_POOL_INIT_TASKS], next_offsets[RAY_POOL_INIT_TASKS], next_counts[RAY_POOL_INIT_TASKS];
     for (uint32_t t = 0; t < tasks; t++) offsets[t] = t * cap;
     topk_merge_t merge = {.values = &c, .input = input, .output = output};
@@ -3759,6 +3914,7 @@ static ray_t* topk_sorted_large_group(ray_t* src, const int64_t* rows, int64_t c
             }
         }
         if (jobs) ray_pool_dispatch_n(pool, topk_merge_run, &merge, jobs);
+        ray_profile_tick("topK: merged level");
         const int64_t* swap = merge.input; merge.input = merge.output; merge.output = (int64_t*)swap;
         memcpy(offsets, next_offsets, pairs * sizeof(int64_t));
         memcpy(c.kept, next_counts, pairs * sizeof(int64_t));
@@ -3766,6 +3922,7 @@ static ray_t* topk_sorted_large_group(ray_t* src, const int64_t* rows, int64_t c
     }
     if (ray_interrupted() || atomic_load(&pool->cancelled)) goto cancelled;
     out = ray_group_gather(src, merge.input, c.kept[0]);
+    ray_profile_tick("topK: gathered output");
     goto done;
 cancelled:
     out = ray_error("cancel", NULL);
@@ -3779,19 +3936,26 @@ static ray_t* topk_large_group(ray_t* src, const int64_t* rows, int64_t count,
     if (k >= 64 || k > count / tasks / 2)
         return topk_sorted_large_group(src, rows, count, k, desc, tasks);
     topk_chunks_t c = {.source = src, .rows = rows, .count = count, .k = k,
-        .tasks = tasks, .desc = desc};
-    c.heaps = ray_alloc_raw((size_t)(tasks + 1) * (size_t)k * sizeof(int64_t));
+        .tasks = tasks, .desc = desc, .heap_stride = ((k + 7) & ~INT64_C(7)) + 8};
+    /* Updating adjacent tiny heaps must not bounce the same cache line
+     * between workers when every incoming row improves the current winner. */
+    c.heaps = ray_alloc_raw((size_t)(tasks + 1) * (size_t)c.heap_stride * sizeof(int64_t));
     if (!c.heaps) return ray_error("oom", NULL);
     if (src->type == RAY_SYM) ray_sym_strings_borrow(&c.symbols.strings, &c.symbols.count);
     ray_pool_t* pool = ray_pool_get();
-    ray_pool_dispatch_n(pool, topk_chunks_run, &c, tasks);
+    if (tasks == ray_pool_total_workers(pool)) {
+        c.source_tasks = tasks * 4;
+        if (c.source_tasks > RAY_POOL_INIT_TASKS / 2) c.source_tasks = RAY_POOL_INIT_TASKS / 2;
+    }
+    ray_pool_dispatch_n(pool, topk_chunks_run, &c, c.source_tasks ? c.source_tasks : tasks);
+    ray_profile_tick("topK: selected chunk candidates");
     if (ray_interrupted() || atomic_load(&pool->cancelled)) {
         ray_free_raw(c.heaps); return ray_error("cancel", NULL);
     }
-    int64_t* heap = c.heaps + tasks * k;
+    int64_t* heap = c.heaps + tasks * c.heap_stride;
     int64_t kept = 0;
     for (uint32_t t = 0; t < tasks; t++)
-        for (int64_t i = 0; i < c.kept[t]; i++) topk_keep_row(&c, heap, &kept, c.heaps[t * k + i]);
+        for (int64_t i = 0; i < c.kept[t]; i++) topk_keep_row(&c, heap, &kept, c.heaps[t * c.heap_stride + i]);
     if (kept < k)
         for (int64_t h = kept / 2; h > 0; h--) topk_rows_sift(src, heap, kept, h - 1, desc, &c.symbols);
     for (int64_t n = kept; n > 1; n--) {
@@ -3811,7 +3975,9 @@ ray_t* ray_topk_per_group_buf(ray_t* src, int64_t k, uint8_t desc,
     if (ray_interrupted() || (pool && atomic_load(&pool->cancelled))) return ray_error("cancel", NULL);
     if (!ray_pool_par_dispatch_ok(pool, total, 262144))
         return topk_regular_per_group_buf(src, k, desc, rows, offsets, counts, groups);
-    uint32_t tasks = ray_pool_total_workers(pool) * 4;
+    /* Keep one candidate heap per available worker; source tasks can be
+     * smaller without replicating heap capacity or sorting work. */
+    uint32_t tasks = ray_pool_total_workers(pool);
     if (tasks > RAY_POOL_INIT_TASKS / 2) tasks = RAY_POOL_INIT_TASKS / 2;
     int64_t threshold = total / ray_pool_total_workers(pool);
     if (threshold < 262144) threshold = 262144;

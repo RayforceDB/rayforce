@@ -165,3 +165,29 @@ preserves that language contract. `topk_consumer.c` separately exercises the
 internal indexed kernel with K near the group size; `topk_scaling.py` checks
 all output values against an independent histogram and records cold/warm times
 and peak RSS. This prevents a query-front-end limit from hiding kernel gaps.
+
+## Follow-up on low-worker overhead
+
+- When task-local group counters fit in 256 KiB, build stable row slices with
+  direct source-task histograms and prefix offsets. This avoids a second row
+  buffer and partitioning passes while retaining source order. Larger group
+  directories keep the bounded partitioned layout.
+- Partition larger directories into contiguous group-id ranges so workers
+  own adjacent output regions instead of scattering interleaved groups across
+  the same pages. Use one source range per worker; split hot partitions by rows.
+- Dispatch native top-K input types outside the scan loop. Discard losing rows
+  before entering heap maintenance, and specialize native heap comparisons.
+- Separate top-K scheduling from heap ownership: each worker retains one
+  private heap across smaller source tasks, then sorts it once after the scan.
+  Exact preselection handles larger K, followed by bounded sorting runs and
+  merges split by output rank.
+- Read native first/last null sentinels directly after type dispatch; retain
+  periodic cancellation checks and source-row winner semantics.
+
+- For task-local dense states, sample each source range before choosing eager
+  initialization. Narrow local key ranges retain lazy initialization instead of
+  initializing the entire global domain. Sampling controls work only.
+- Use one dense scatter source range per worker to reduce adjacent writes;
+  partition reduction still splits dominant partitions by their row counts.
+
+These changes still require final performance and sanitizer acceptance.

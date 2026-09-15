@@ -1713,7 +1713,7 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
         ray_pool_t* pool, const dense_plan_t* plan, int64_t rows,
         const agg_vo_t* vo, const agg_desc_t* d, ray_t* selection) {
     uint32_t workers = ray_pool_total_workers(pool);
-    uint32_t sources = workers * 4;
+    uint32_t sources = workers;
     if (sources > RAY_POOL_INIT_TASKS / 2) sources = RAY_POOL_INIT_TASKS / 2;
     uint32_t parts = agg_dense_partition_parts(workers, plan->total_slots);
     uint32_t bits = (uint32_t)__builtin_ctz(parts);
@@ -1943,6 +1943,21 @@ static ray_t* exec_group_v2_parallel_dense(
          * two rows per possible slot. It preserves a tight row loop for
          * densely occupied domains; sparse worker slices remain lazy. */
         locals[w].eager = !sel && n_keys == 1 && total_slots <= nrows / nw / 2;
+        if (locals[w].eager && total_slots > 1) {
+            /* A clustered source range may visit only a small part of the
+             * global domain. Sampling chooses initialization work only;
+             * every actual row still initializes its state on the lazy path. */
+            int64_t begin = nrows / nw * w;
+            int64_t end = w + 1 == nw ? nrows : nrows / nw * (w + 1);
+            int64_t low = total_slots, high = 0;
+            for (int64_t sample = 0; sample < 64; sample++) {
+                int64_t row = begin + (end - begin - 1) * sample / 63;
+                int64_t slot = agg_dense_component(dp, 0, agg_read_key_i64(key_cols[0], key_data[0], row));
+                if (slot < low) low = slot;
+                if (slot > high) high = slot;
+            }
+            locals[w].eager = high - low + 1 >= total_slots - total_slots / 4;
+        }
         size_t slots = locals[w].slots;
         size_t bytes = slots * (block + sizeof(int64_t)) + (slots + 63) / 64 * sizeof(uint64_t);
         locals[w].states = cursor;
@@ -3465,8 +3480,9 @@ static ray_t* exec_group_v2_parallel_radix(
 static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t* idx, int64_t n_sel);
 
-/* Stable row slices shared by ordered and streaming consumers. Histogram
- * metadata is bounded by task/partition counts, never workers times groups. */
+/* Stable row slices shared by ordered and streaming consumers. Large group
+ * directories use O(groups) counters; replicated small-directory counters
+ * have a fixed memory budget independent of input size. */
 typedef struct {
     const uint32_t* gids;
     int64_t nrows;
@@ -3489,7 +3505,7 @@ static void agg_index_hist(void* raw, uint32_t wid, int64_t start, int64_t end) 
         int64_t* hist = c->hist + task * c->parts;
         int64_t begin = c->nrows / c->tasks * task;
         int64_t limit = task + 1 == c->tasks ? c->nrows : c->nrows / c->tasks * (task + 1);
-        for (int64_t r = begin; r < limit; r++) hist[c->gids[r] & (c->parts - 1)]++;
+        for (int64_t r = begin; r < limit; r++) hist[c->gids[r] >> c->bits]++;
     }
 }
 static void agg_index_pack(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -3499,7 +3515,7 @@ static void agg_index_pack(void* raw, uint32_t wid, int64_t start, int64_t end) 
         int64_t begin = c->nrows / c->tasks * task;
         int64_t limit = task + 1 == c->tasks ? c->nrows : c->nrows / c->tasks * (task + 1);
         for (int64_t r = begin; r < limit; r++)
-            c->packed[cursor[c->gids[r] & (c->parts - 1)]++] = ((uint64_t)c->gids[r] << 32) | (uint32_t)r;
+            c->packed[cursor[c->gids[r] >> c->bits]++] = ((uint64_t)c->gids[r] << 32) | (uint32_t)r;
     }
 }
 static void agg_index_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -3507,26 +3523,26 @@ static void agg_index_count(void* raw, uint32_t wid, int64_t start, int64_t end)
     for (int64_t task = start; task < end; task++) {
         int64_t* counts = c->local + task * c->slots;
         for (int64_t i = c->slice_begin[task]; i < c->slice_end[task]; i++)
-            counts[(c->packed[i] >> 32) >> c->bits]++;
+            counts[(c->packed[i] >> 32) & (c->slots - 1)]++;
     }
 }
 static void agg_index_merge_counts(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_index_layout_t* c = raw;
     for (int64_t g = start; g < end; g++) {
-        uint32_t part = g & (c->parts - 1);
+        uint32_t part = g >> c->bits;
         int64_t count = 0;
         for (uint32_t task = c->part_slices[part]; task < c->part_slices[part + 1]; task++)
-            count += c->local[task * c->slots + (g >> c->bits)];
+            count += c->local[task * c->slots + (g & (c->slots - 1))];
         c->counts[g] = count;
     }
 }
 static void agg_index_slice_cursors(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_index_layout_t* c = raw;
     for (int64_t g = start; g < end; g++) {
-        uint32_t part = g & (c->parts - 1);
+        uint32_t part = g >> c->bits;
         int64_t offset = c->offsets[g];
         for (uint32_t task = c->part_slices[part]; task < c->part_slices[part + 1]; task++) {
-            int64_t* slot = &c->local[task * c->slots + (g >> c->bits)];
+            int64_t* slot = &c->local[task * c->slots + (g & (c->slots - 1))];
             int64_t count = *slot; *slot = offset; offset += count;
         }
     }
@@ -3537,14 +3553,58 @@ static void agg_index_fill(void* raw, uint32_t wid, int64_t start, int64_t end) 
         int64_t* cursor = c->local + task * c->slots;
         for (int64_t i = c->slice_begin[task]; i < c->slice_end[task]; i++) {
             uint64_t record = c->packed[i];
-            c->rows[cursor[(record >> 32) >> c->bits]++] = (uint32_t)record;
+            c->rows[cursor[(record >> 32) & (c->slots - 1)]++] = (uint32_t)record;
         }
+    }
+}
+/* For a small group directory, bounded task-local counters avoid packing
+ * another row buffer. Source-task prefixes preserve order within each group. */
+static void agg_index_direct_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; agg_index_layout_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        int64_t* counts = c->local + task * c->slots;
+        int64_t begin = c->nrows / c->tasks * task;
+        int64_t limit = task + 1 == c->tasks ? c->nrows : c->nrows / c->tasks * (task + 1);
+        for (int64_t r = begin; r < limit; r++) counts[c->gids[r]]++;
+    }
+}
+static void agg_index_direct_fill(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; agg_index_layout_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        int64_t* cursor = c->local + task * c->slots;
+        int64_t begin = c->nrows / c->tasks * task;
+        int64_t limit = task + 1 == c->tasks ? c->nrows : c->nrows / c->tasks * (task + 1);
+        for (int64_t r = begin; r < limit; r++) c->rows[cursor[c->gids[r]]++] = r;
     }
 }
 static int agg_index_layout(const agg_groups_t* groups, int64_t nrows,
         int64_t* counts, int64_t* offsets, int64_t* cursor, int64_t* rows) {
     ray_pool_t* pool = ray_pool_get();
     int64_t ng = groups->ngroups;
+    uint32_t direct_tasks = pool ? ray_pool_total_workers(pool) * 4 : 0;
+    if (direct_tasks > RAY_POOL_INIT_TASKS) direct_tasks = RAY_POOL_INIT_TASKS;
+    /* Cap replicated counters at 256 KiB, including cache-line padding. */
+    int64_t direct_slots = ((ng + 7) & ~INT64_C(7)) + 8;
+    if (ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD) && direct_slots > 0 &&
+            direct_tasks && direct_slots <= 32768 / direct_tasks) {
+        agg_index_layout_t direct = {.gids = groups->gids, .nrows = nrows,
+            .tasks = direct_tasks, .slots = direct_slots, .rows = rows};
+        direct.local = ray_calloc_raw((size_t)direct_tasks * direct_slots * sizeof(int64_t));
+        if (!direct.local) return -1;
+        ray_pool_dispatch_n(pool, agg_index_direct_count, &direct, direct_tasks);
+        if (agg_cancelled()) { ray_free_raw(direct.local); return -1; }
+        for (int64_t g = 0; g < ng; g++) {
+            int64_t at = offsets[g];
+            for (uint32_t task = 0; task < direct_tasks; task++) {
+                int64_t* slot = direct.local + task * direct_slots + g;
+                int64_t count = *slot; *slot = at; at += count;
+            }
+            counts[g] = at - offsets[g]; offsets[g + 1] = at;
+        }
+        ray_pool_dispatch_n(pool, agg_index_direct_fill, &direct, direct_tasks);
+        ray_free_raw(direct.local);
+        return agg_cancelled() ? -1 : 0;
+    }
     /* Packed row addresses use 32 bits; retain full-width indices above it. */
     /* Histogram/packing adds two full row passes. With fewer than four
      * workers, the direct count/fill layout uses less time and memory. */
@@ -3556,12 +3616,19 @@ static int agg_index_layout(const agg_groups_t* groups, int64_t nrows,
         for (int64_t r = 0; r < nrows; r++) rows[cursor[groups->gids[r]]++] = r;
         return 0;
     }
-    uint32_t tasks = ray_pool_total_workers(pool) * 4;
+    /* One source range per worker avoids scattering tiny adjacent ranges
+     * into the same pages. Partition slices supply additional skew tasks. */
+    uint32_t tasks = ray_pool_total_workers(pool);
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     uint32_t parts = 1;
     while (parts < tasks && parts < 256) parts *= 2;
+    /* Adjacent group ids own adjacent output ranges. Partition by the high
+     * bits so different workers do not scatter interleaved groups into the
+     * same output pages. Hot partitions still split into source-order slices. */
+    uint32_t slots = 1;
+    while (slots < (ng + parts - 1) / parts) slots *= 2;
     agg_index_layout_t c = {.gids = groups->gids, .nrows = nrows, .tasks = tasks,
-        .parts = parts, .bits = (uint32_t)__builtin_ctz(parts), .slots = (ng + parts - 1) / parts,
+        .parts = parts, .bits = (uint32_t)__builtin_ctz(slots), .slots = slots,
         .offsets = offsets, .counts = counts, .cursor = cursor, .rows = rows};
     c.hist = ray_calloc_raw(((size_t)tasks * parts + parts + 1) * sizeof(int64_t));
     c.packed = ray_alloc_raw((size_t)nrows * sizeof(uint64_t));
@@ -3583,7 +3650,7 @@ static int agg_index_layout(const agg_groups_t* groups, int64_t nrows,
     int rc = -1;
     if (agg_cancelled()) goto done;
     /* Split hot partitions by rows. There are at most 2*parts slices, each
-     * storing only ceil(groups/parts) counters: at most two group slabs.
+     * storing a power-of-two group range: at most four group slabs.
      * Packed rows and slice prefixes both retain source order. */
     int64_t grain = (nrows + parts - 1) / parts;
     for (uint32_t part = 0; part < parts; part++) {
@@ -3710,6 +3777,33 @@ typedef struct {
 static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
     agg_index_winners_t* c = raw;
     const void* data = ray_data(c->src);
+    if (c->kind == OP_FIRST || c->kind == OP_LAST) {
+        bool last = c->kind == OP_LAST;
+        if (!count || ray_interrupted()) return -1;
+        if (!ray_vec_may_have_nulls(c->src) && c->src->type != RAY_SYM && c->src->type != RAY_STR)
+            return rows[last ? count - 1 : 0];
+#define INDEX_FIRST_VALID(TYPE, VALID) do { \
+            const TYPE* values = data; \
+            for (int64_t j = 0; j < count; j++) { \
+                if ((j & 65535) == 0 && ray_interrupted()) return -1; \
+                int64_t row = rows[last ? count - 1 - j : j]; \
+                TYPE value = values[row]; \
+                if (VALID) return row; \
+            } \
+            return -1; \
+        } while (0)
+        switch (c->src->type) {
+            case RAY_I16: INDEX_FIRST_VALID(int16_t, value != NULL_I16);
+            case RAY_I32: case RAY_DATE: case RAY_TIME:
+                INDEX_FIRST_VALID(int32_t, value != NULL_I32);
+            case RAY_I64: case RAY_TIMESTAMP:
+                INDEX_FIRST_VALID(int64_t, value != NULL_I64);
+            case RAY_F32: INDEX_FIRST_VALID(float, value == value);
+            case RAY_F64: INDEX_FIRST_VALID(double, value == value);
+            default: break;
+        }
+#undef INDEX_FIRST_VALID
+    }
     int64_t best = -1;
     for (int64_t j = 0; j < count; j++) {
         if ((j & 65535) == 0 && ray_interrupted()) return -1;
@@ -4080,7 +4174,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Partition ownership amortizes scatter through concurrent reducers.
          * With one worker, direct task-local updates avoid that extra payload. */
         if (dp.ok && dense_workers > 1 && group_limit <= 0 && eff_n <= UINT32_MAX && dp.total_slots >= 4096) {
-            uint32_t sources = dense_workers * 4;
+            uint32_t sources = dense_workers;
             if (sources > RAY_POOL_INIT_TASKS / 2) sources = RAY_POOL_INIT_TASKS / 2;
             uint32_t parts = agg_dense_partition_parts(dense_workers, dp.total_slots);
             uint32_t split_budget = sources * 4 < parts ? sources * 4 : parts;

@@ -5,6 +5,7 @@
 #include <rayforce.h>
 #include "ops/internal.h"
 #include "core/pool.h"
+#include "core/profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -51,11 +52,18 @@ int main(int argc, char** argv) {
         rows[i] = n - 1 - i;
     }
     double ms[6];
+    g_ray_profile.active = getenv("TOPK_PROFILE") != NULL;
     for (unsigned run = 0; run < 6; run++) {
+        ray_profile_reset(); ray_profile_tick("topK: begin");
         double begin = now_ms();
         ray_t* top = ray_topk_per_group_buf(src, k, 1, rows, &offset, &n, 1);
         ray_t* bot = ray_topk_per_group_buf(src, k, 0, rows, &offset, &n, 1);
         ms[run] = now_ms() - begin;
+        if (g_ray_profile.active) {
+            for (int32_t i = 1; i < g_ray_profile.n; i++)
+                fprintf(stderr, "run=%u %s %.6f ms\n", run, g_ray_profile.spans[i].msg,
+                    (g_ray_profile.spans[i].ts - g_ray_profile.spans[i - 1].ts) / 1000000.0);
+        }
         int64_t expected = k < valid ? k : valid;
         if (!verify(top, histogram, expected, true) || !verify(bot, histogram, expected, false)) {
             fprintf(stderr, "top/bottom K differs from histogram oracle\n"); return 1;

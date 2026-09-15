@@ -985,114 +985,119 @@ static test_result_t test_wide_count_distinct(void) {
 }
 
 static test_result_t test_indexed_parallel_layout(void) {
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    const int64_t n = 131072, ng = 4096;
-    int64_t symbols[4096];
-    for (int64_t k = 0; k < ng; k++) {
-        char name[32]; int len = snprintf(name, sizeof(name), "nested-key-%lld", (long long)k);
-        symbols[k] = ray_sym_intern(name, len);
-    }
-    const int8_t types[] = {RAY_I32, RAY_I64, RAY_F64, RAY_GUID, RAY_STR, RAY_LIST};
-    for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
-        int8_t type = types[ti];
-        ray_t* key = type == RAY_LIST ? ray_list_new(n) : ray_vec_new(type, n);
-        ray_t* val = ray_vec_new(RAY_I64, n);
-        TEST_ASSERT_NOT_NULL(key); TEST_ASSERT_NOT_NULL(val);
-        key->len = val->len = n;
-        key->attrs |= RAY_ATTR_HAS_NULLS; val->attrs |= RAY_ATTR_HAS_NULLS;
-        int64_t count[4096] = {0}, valid[4096] = {0}, sum[4096] = {0};
-        int64_t first[4096], last[4096], first_row[4096];
-        uint32_t* hist = ray_calloc_raw((size_t)ng * 101 * sizeof(uint32_t));
-        TEST_ASSERT_NOT_NULL(hist);
-        for (int64_t k = 0; k < ng; k++) first[k] = last[k] = first_row[k] = -1;
-        for (int64_t r = 0; r < n; r++) {
-            int64_t k = r % 3 == 0 ? 0 : r % ng;
-            int64_t v = r % 101;
-            bool null = r % 97 == 0 || k == 17;
-            if (type == RAY_I32) ((int32_t*)ray_data(key))[r] = k ? k : NULL_I32;
-            else if (type == RAY_I64) ((int64_t*)ray_data(key))[r] = k ? k * INT64_C(1000000007) : NULL_I64;
-            else if (type == RAY_F64) ((double*)ray_data(key))[r] = k ? (double)k : NAN;
-            else if (type == RAY_GUID) { memset((char*)ray_data(key) + r * 16, 0, 16); memcpy((char*)ray_data(key) + r * 16, &k, sizeof(k)); }
-            else if (type == RAY_LIST) {
-                ray_t* item = NULL;
-                if (k) {
-                    item = ray_sym_vec_new(r % 2 ? RAY_SYM_W32 : RAY_SYM_W64, 1);
-                    TEST_ASSERT_NOT_NULL(item); item->len = 1;
-                    ray_write_sym(ray_data(item), 0, symbols[k], RAY_SYM, item->attrs);
-                }
-                ((ray_t**)ray_data(key))[r] = item;
-            }
-            else {
-                char text[32]; int len = k ? snprintf(text, sizeof(text), "key%lld", (long long)k) : 0;
-                key = ray_str_vec_set(key, r, text, len);
-                TEST_ASSERT_NOT_NULL(key); TEST_ASSERT_FALSE(RAY_IS_ERR(key));
-            }
-            ((int64_t*)ray_data(val))[r] = null ? NULL_I64 : v;
-            if (first_row[k] < 0) first_row[k] = r;
-            count[k]++;
-            if (!null) {
-                if (first[k] < 0) first[k] = v;
-                last[k] = v; valid[k]++; sum[k] += v; hist[k * 101 + v]++;
-            }
+    const int64_t n = 131075;
+    const int64_t group_counts[] = {4096, 17, 7, 17};
+    for (int shape = 0; shape < 4; shape++) {
+        ray_pool_destroy();
+        if (shape < 3) TEST_ASSERT_EQ_I(ray_pool_init_total(shape ? 3 : 4), RAY_OK);
+        const int64_t ng = group_counts[shape];
+        int64_t symbols[4096];
+        for (int64_t k = 0; k < ng; k++) {
+            char name[32]; int len = snprintf(name, sizeof(name), "nested-key-%lld", (long long)k);
+            symbols[k] = ray_sym_intern(name, len);
         }
-        ray_t* tbl = ray_table_new(2);
-        tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
-        tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), val);
-        ray_release(key); ray_release(val);
-        for (int repeat = 0; repeat < 2; repeat++) {
-            ray_graph_t* graph = ray_graph_new(tbl);
-            ray_op_t* keys[] = {ray_scan(graph, "k")};
-            ray_op_t* v = ray_scan(graph, "v");
-            ray_op_t* inputs[] = {v, v, v, v, v};
-            uint16_t ops[] = {OP_SUM, OP_FIRST, OP_LAST, OP_MEDIAN, OP_COUNT};
-            ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, 5);
-            agg_route_reset();
-            ray_t* out = ray_execute(graph, group);
-            TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
-            TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_INDEXED], 1);
-            TEST_ASSERT_EQ_I(ray_table_nrows(out), ng);
-            ray_t* ko = ray_table_get_col_idx(out, 0);
-            TEST_ASSERT_EQ_I(ko->type, type);
-            int64_t previous = -1;
-            for (int64_t r = 0; r < ng; r++) {
-                int64_t k;
-                if (type == RAY_I32) { k = ((int32_t*)ray_data(ko))[r]; if (k == NULL_I32) k = 0; }
-                else if (type == RAY_I64) { k = ((int64_t*)ray_data(ko))[r]; k = k == NULL_I64 ? 0 : k / INT64_C(1000000007); }
-                else if (type == RAY_F64) { double f = ((double*)ray_data(ko))[r]; k = isnan(f) ? 0 : (int64_t)f; }
-                else if (type == RAY_GUID) memcpy(&k, (char*)ray_data(ko) + r * 16, sizeof(k));
+        const int8_t types[] = {RAY_I32, RAY_I64, RAY_F64, RAY_GUID, RAY_STR, RAY_LIST};
+        for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
+            int8_t type = types[ti];
+            ray_t* key = type == RAY_LIST ? ray_list_new(n) : ray_vec_new(type, n);
+            ray_t* val = ray_vec_new(RAY_I64, n);
+            TEST_ASSERT_NOT_NULL(key); TEST_ASSERT_NOT_NULL(val);
+            key->len = val->len = n;
+            key->attrs |= RAY_ATTR_HAS_NULLS; val->attrs |= RAY_ATTR_HAS_NULLS;
+            int64_t count[4096] = {0}, valid[4096] = {0}, sum[4096] = {0};
+            int64_t first[4096], last[4096], first_row[4096];
+            uint32_t* hist = ray_calloc_raw((size_t)ng * 101 * sizeof(uint32_t));
+            TEST_ASSERT_NOT_NULL(hist);
+            for (int64_t k = 0; k < ng; k++) first[k] = last[k] = first_row[k] = -1;
+            for (int64_t r = 0; r < n; r++) {
+                int64_t k = r % 3 == 0 ? 0 : r % ng;
+                int64_t v = r % 101;
+                bool null = r % 97 == 0 || k == 17;
+                if (type == RAY_I32) ((int32_t*)ray_data(key))[r] = k ? k : NULL_I32;
+                else if (type == RAY_I64) ((int64_t*)ray_data(key))[r] = k ? k * INT64_C(1000000007) : NULL_I64;
+                else if (type == RAY_F64) ((double*)ray_data(key))[r] = k ? (double)k : NAN;
+                else if (type == RAY_GUID) { memset((char*)ray_data(key) + r * 16, 0, 16); memcpy((char*)ray_data(key) + r * 16, &k, sizeof(k)); }
                 else if (type == RAY_LIST) {
-                    ray_t* item = ray_list_get(ko, r);
-                    k = 0;
-                    if (item) {
-                        int64_t id = ray_read_sym(ray_data(item), 0, RAY_SYM, item->attrs);
-                        while (k < ng && symbols[k] != id) k++;
+                    ray_t* item = NULL;
+                    if (k) {
+                        item = ray_sym_vec_new(r % 2 ? RAY_SYM_W32 : RAY_SYM_W64, 1);
+                        TEST_ASSERT_NOT_NULL(item); item->len = 1;
+                        ray_write_sym(ray_data(item), 0, symbols[k], RAY_SYM, item->attrs);
                     }
+                    ((ray_t**)ray_data(key))[r] = item;
                 }
                 else {
-                    size_t len = 0; const char* text = ray_str_vec_get(ko, r, &len);
-                    k = 0; for (size_t i = 3; i < len; i++) k = k * 10 + text[i] - '0';
+                    char text[32]; int len = k ? snprintf(text, sizeof(text), "key%lld", (long long)k) : 0;
+                    key = ray_str_vec_set(key, r, text, len);
+                    TEST_ASSERT_NOT_NULL(key); TEST_ASSERT_FALSE(RAY_IS_ERR(key));
                 }
-                TEST_ASSERT_TRUE(k >= 0 && k < ng);
-                TEST_ASSERT_TRUE(first_row[k] > previous); previous = first_row[k];
-                TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 1)))[r], sum[k]);
-                TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 2)))[r], first[k] < 0 ? NULL_I64 : first[k]);
-                TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 3)))[r], last[k] < 0 ? NULL_I64 : last[k]);
-                TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 5)))[r], count[k]);
-                double median = ((double*)ray_data(ray_table_get_col_idx(out, 4)))[r];
-                if (!valid[k]) TEST_ASSERT_TRUE(isnan(median));
-                else {
-                    int64_t cumulative = 0, a = -1, b = -1;
-                    for (int value = 0; value <= 100; value++) {
-                        cumulative += hist[k * 101 + value];
-                        if (a < 0 && cumulative > (valid[k] - 1) / 2) a = value;
-                        if (b < 0 && cumulative > valid[k] / 2) b = value;
-                    }
-                    TEST_ASSERT_TRUE(median == (a + b) / 2.0);
+                ((int64_t*)ray_data(val))[r] = null ? NULL_I64 : v;
+                if (first_row[k] < 0) first_row[k] = r;
+                count[k]++;
+                if (!null) {
+                    if (first[k] < 0) first[k] = v;
+                    last[k] = v; valid[k]++; sum[k] += v; hist[k * 101 + v]++;
                 }
             }
-            ray_release(out); ray_graph_free(graph);
+            ray_t* tbl = ray_table_new(2);
+            tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
+            tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), val);
+            ray_release(key); ray_release(val);
+            for (int repeat = 0; repeat < 2; repeat++) {
+                ray_graph_t* graph = ray_graph_new(tbl);
+                ray_op_t* keys[] = {ray_scan(graph, "k")};
+                ray_op_t* v = ray_scan(graph, "v");
+                ray_op_t* inputs[] = {v, v, v, v, v};
+                uint16_t ops[] = {OP_SUM, OP_FIRST, OP_LAST, OP_MEDIAN, OP_COUNT};
+                ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, 5);
+                agg_route_reset();
+                ray_t* out = ray_execute(graph, group);
+                TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+                TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_INDEXED], 1);
+                TEST_ASSERT_EQ_I(ray_table_nrows(out), ng);
+                ray_t* ko = ray_table_get_col_idx(out, 0);
+                TEST_ASSERT_EQ_I(ko->type, type);
+                int64_t previous = -1;
+                for (int64_t r = 0; r < ng; r++) {
+                    int64_t k;
+                    if (type == RAY_I32) { k = ((int32_t*)ray_data(ko))[r]; if (k == NULL_I32) k = 0; }
+                    else if (type == RAY_I64) { k = ((int64_t*)ray_data(ko))[r]; k = k == NULL_I64 ? 0 : k / INT64_C(1000000007); }
+                    else if (type == RAY_F64) { double f = ((double*)ray_data(ko))[r]; k = isnan(f) ? 0 : (int64_t)f; }
+                    else if (type == RAY_GUID) memcpy(&k, (char*)ray_data(ko) + r * 16, sizeof(k));
+                    else if (type == RAY_LIST) {
+                        ray_t* item = ray_list_get(ko, r);
+                        k = 0;
+                        if (item) {
+                            int64_t id = ray_read_sym(ray_data(item), 0, RAY_SYM, item->attrs);
+                            while (k < ng && symbols[k] != id) k++;
+                        }
+                    }
+                    else {
+                        size_t len = 0; const char* text = ray_str_vec_get(ko, r, &len);
+                        k = 0; for (size_t i = 3; i < len; i++) k = k * 10 + text[i] - '0';
+                    }
+                    TEST_ASSERT_TRUE(k >= 0 && k < ng);
+                    TEST_ASSERT_TRUE(first_row[k] > previous); previous = first_row[k];
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 1)))[r], sum[k]);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 2)))[r], first[k] < 0 ? NULL_I64 : first[k]);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 3)))[r], last[k] < 0 ? NULL_I64 : last[k]);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(out, 5)))[r], count[k]);
+                    double median = ((double*)ray_data(ray_table_get_col_idx(out, 4)))[r];
+                    if (!valid[k]) TEST_ASSERT_TRUE(isnan(median));
+                    else {
+                        int64_t cumulative = 0, a = -1, b = -1;
+                        for (int value = 0; value <= 100; value++) {
+                            cumulative += hist[k * 101 + value];
+                            if (a < 0 && cumulative > (valid[k] - 1) / 2) a = value;
+                            if (b < 0 && cumulative > valid[k] / 2) b = value;
+                        }
+                        TEST_ASSERT_TRUE(median == (a + b) / 2.0);
+                    }
+                }
+                ray_release(out); ray_graph_free(graph);
+            }
+            ray_free_raw(hist); ray_release(tbl);
         }
-        ray_free_raw(hist); ray_release(tbl);
     }
     PASS();
 }

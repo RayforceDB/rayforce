@@ -17,6 +17,9 @@ oracles cover ordering, nulls, rank and distinct semantics.
 
 ## Correctness
 
+The following completed checks apply to revision `806a002d`. The local follow-up
+changes require another complete acceptance run before publication.
+
 - Complete ASan/UBSan suite: **3,824/3,824 passed**.
 - Targeted TSan: **6/6 passed**, three/four workers, `setarch x86_64 -R`, no suppressions.
 - Coverage includes native widths, source symbol domains, structural LIST keys,
