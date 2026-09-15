@@ -53,8 +53,11 @@ static inline bool ray_vec_may_have_nulls(const ray_t* v) {
 /* Exact admission check for optimizations which require null-free input.
  * Text columns cannot prove that from attrs; inspect their payload instead.
  * Keep this out of per-row loops (use may_have_nulls + is_null there). */
+bool ray_vec_text_has_nulls(const ray_t* v);
 static inline bool ray_vec_has_nulls(const ray_t* v) {
     if (!ray_vec_may_have_nulls(v)) return false;
+    if (v->type == RAY_SYM || v->type == RAY_STR)
+        return ray_vec_text_has_nulls(v);
     for (int64_t i = 0; i < v->len; i++)
         if (ray_vec_is_null((ray_t*)v, i)) return true;
     return false;
