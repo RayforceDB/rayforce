@@ -14959,6 +14959,20 @@ typedef struct {
 #define UKEY_SLOT_EMPTY ((int64_t)0)
 #define UKEY_SLOT_TOMB  ((int64_t)-1)
 
+/* An occupied slot carries the key's hash beside the row: the low 32 bits of
+ * the hash in the high half, row + 1 in the low half.  The hash makes two
+ * things cheap that used to read the table: a probe rejects a colliding slot
+ * without touching its key cells, and growing the map re-places every entry
+ * from the slots themselves (ukey_grow) instead of re-hashing every row.
+ * Both markers stay reserved: row + 1 is never 0 and never all-ones. */
+#define UKEY_PACK(h, row) ((int64_t)(((uint64_t)(uint32_t)(h) << 32) | (uint64_t)((row) + 1)))
+#define UKEY_ROW(e)       ((int64_t)((uint64_t)(e) & 0xFFFFFFFFULL) - 1)
+#define UKEY_H32(e)       ((uint32_t)((uint64_t)(e) >> 32))
+/* Rows must fit the low half (the two markers take the ends), and the slot
+ * index must come from the stored 32 bits, so the table stops at 2^32 slots. */
+#define UKEY_MAX_ROWS     ((int64_t)0xFFFFFFFDLL)
+#define UKEY_MAX_CAP      ((uint64_t)1 << 32)
+
 static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
     uint64_t cap = 16;
     while (cap < (uint64_t)entries * 2) cap <<= 1;
@@ -14975,7 +14989,7 @@ static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
 static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     uint64_t s = h & mp->mask;
     while (mp->slot[s] != UKEY_SLOT_EMPTY) s = (s + 1) & mp->mask;
-    mp->slot[s] = row + 1;
+    mp->slot[s] = UKEY_PACK(h, row);
 }
 
 /* Rows nrows0..n-1 were just appended in row order.  Entering them costs
@@ -15008,14 +15022,54 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
  * `m` more rows at the load factor it was sized for?  A row count that moved
  * without the map means something else wrote the table; a different key
  * means a different upsert. */
-static bool ukey_fits(ray_index_t* ix, const int64_t* kci, int64_t nk,
-                      int64_t nrows0, int64_t m) {
+static bool ukey_describes(ray_index_t* ix, const int64_t* kci, int64_t nk,
+                           int64_t nrows0) {
     if (ix->u.ukey.nrows != nrows0 || ix->u.ukey.nk != nk) return false;
     for (int64_t k = 0; k < nk; k++)
         if (ix->u.ukey.kci[k] != (int16_t)kci[k]) return false;
-    /* Tombstones hold slots without being rows, so the load test counts them
-     * alongside the live entries. */
+    return true;
+}
+
+/* Tombstones hold slots without being rows, so the load test counts them
+ * alongside the live entries. */
+static bool ukey_has_room(ray_index_t* ix, int64_t nrows0, int64_t m) {
     return (uint64_t)(nrows0 + m + ix->u.ukey.n_tomb) * 2 <= ix->u.ukey.mask + 1;
+}
+
+/* Grow a map that still describes the table but has run out of room, the way
+ * sym.c's ht_grow_to grows the intern table: every slot already carries its
+ * key's hash, so the bigger table is filled from the old slots — no key column
+ * is read and no key is hashed again.  Tombstones vanish on the way, which is
+ * what makes this worth doing after a delete too.  On failure the caller keeps
+ * the old map and falls back to dropping it. */
+static bool ukey_grow(ray_index_t* ix, int64_t entries) {
+    uint64_t old_cap = ix->u.ukey.mask + 1;
+    uint64_t cap = 16;
+    while (cap < (uint64_t)entries * 2) {
+        if (cap >= UKEY_MAX_CAP) return false;
+        cap <<= 1;
+    }
+    if (cap < old_cap) cap = old_cap;
+    if (cap > UKEY_MAX_CAP) return false;
+    ray_t* fresh = ray_vec_new(RAY_I64, (int64_t)cap);
+    if (!fresh || RAY_IS_ERR(fresh)) { if (fresh) ray_release(fresh); return false; }
+    fresh->len = (int64_t)cap;
+    int64_t* dst = (int64_t*)ray_data(fresh);
+    memset(dst, 0, (size_t)cap * sizeof(int64_t));
+    const int64_t* src = (const int64_t*)ray_data(ix->u.ukey.slots);
+    uint64_t mask = cap - 1;
+    for (uint64_t s = 0; s < old_cap; s++) {
+        int64_t e = src[s];
+        if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
+        uint64_t t = (uint64_t)UKEY_H32(e) & mask;
+        while (dst[t] != UKEY_SLOT_EMPTY) t = (t + 1) & mask;
+        dst[t] = e;
+    }
+    ray_release(ix->u.ukey.slots);
+    ix->u.ukey.slots  = fresh;
+    ix->u.ukey.mask   = mask;
+    ix->u.ukey.n_tomb = 0;
+    return true;
 }
 
 static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
@@ -15024,8 +15078,8 @@ static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
     for (;;) {
         int64_t e = mp->slot[s];
         if (e == UKEY_SLOT_EMPTY) return -1;
-        if (e != UKEY_SLOT_TOMB &&
-            upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
+        if (e != UKEY_SLOT_TOMB && UKEY_H32(e) == (uint32_t)h &&
+            upsert_row_eq_atoms(slots, kci, nk, UKEY_ROW(e), cells)) return UKEY_ROW(e);
         s = (s + 1) & mp->mask;
     }
 }
@@ -15222,8 +15276,8 @@ upsert_map_find_src(upsert_map_t* mp, uint64_t h, ray_t** slots,
     for (;;) {
         int64_t e = mp->slot[s];
         if (e == UKEY_SLOT_EMPTY) return -1;
-        if (e != UKEY_SLOT_TOMB) {
-            int64_t row = e - 1;
+        if (e != UKEY_SLOT_TOMB && UKEY_H32(e) == (uint32_t)h) {
+            int64_t row = UKEY_ROW(e);
             bool eq = true;
             for (int64_t k = 0; k < nk && eq; k++) {
                 ray_t* sc = src[kci[k]];
@@ -15353,9 +15407,10 @@ upsert_resolve_impl(upsert_map_t* map, ray_t** slots, const int64_t* kci, int64_
                 __builtin_prefetch(&map->slot[(uint64_t)dst[r + PF_SLOT] & map->mask]);
             if (r + PF_ROW < m) {
                 int64_t e = map->slot[(uint64_t)dst[r + PF_ROW] & map->mask];
-                if (e > 0 && e - 1 < nrows0)
+                if (e != UKEY_SLOT_EMPTY && e != UKEY_SLOT_TOMB &&
+                    UKEY_ROW(e) < nrows0)
                     for (int64_t k = 0; k < npf; k++)
-                        __builtin_prefetch(kbase[k] + (size_t)(e - 1) * kesz[k]);
+                        __builtin_prefetch(kbase[k] + (size_t)UKEY_ROW(e) * kesz[k]);
             }
             h = (uint64_t)dst[r];
         } else {
@@ -15614,11 +15669,16 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         if (inplace && nk > RAY_UKEY_MAX_COLS) ray_table_ukey_drop(tbl);
         if (inplace && nk <= RAY_UKEY_MAX_COLS) {
             ukey = ray_table_ukey_get(tbl);
-            if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
+            /* A map that no longer describes the table is stale and must go.
+             * One that only ran out of room is grown from its own slots — the
+             * rebuild it replaces re-reads and re-hashes every key column. */
+            if (ukey && (!ukey_describes(ukey, kci, nk, nrows0) ||
+                         (!ukey_has_room(ukey, nrows0, m) &&
+                          !ukey_grow(ukey, nrows0 + m)))) {
                 ray_table_ukey_drop(tbl);
                 ukey = NULL;
             }
-            if (!ukey) {
+            if (!ukey && nrows0 + m <= UKEY_MAX_ROWS) {
                 ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
                 if (idx && !RAY_IS_ERR(idx)) {
                     if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
@@ -18637,9 +18697,9 @@ static void ukey_patch_after_delete(ray_t* tbl, const int64_t* rows, int64_t k,
     for (uint64_t s = 0; s < cap; s++) {
         int64_t e = slot[s];
         if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
-        int64_t nr = newrow[e - 1];
+        int64_t nr = newrow[UKEY_ROW(e)];
         if (nr < 0) { slot[s] = UKEY_SLOT_TOMB; tomb++; }
-        else slot[s] = nr + 1;
+        else slot[s] = UKEY_PACK(UKEY_H32(e), nr);
     }
     scratch_free(nr_hdr);
     ix->u.ukey.n_tomb += tomb;

@@ -156,6 +156,31 @@ AL -- (book (til 500) (til 500))
 (.attr.get (at S 'v)) -- (take ['a] 0)
 (select {from: S where: (== v -1)}) -- (table [k v] (list [3] [-1]))
 
+;; ── growing the map past its capacity keeps every entry ──
+;; A batch that does not fit re-places the live entries from the slots
+;; themselves (each carries its key's hash) instead of rebuilding from the
+;; columns; a delete first leaves tombstones for that pass to drop.
+(set A (table [k v w] (list (til 300) (til 300) (as 'F64 (til 300)))))
+(set B (table [k v w] (list (til 300) (til 300) (as 'F64 (til 300)))))
+(set P (table [k v w] (list (+ 150 (til 4000)) (+ 1000 (til 4000)) (/ (as 'F64 (til 4000)) 8))))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k v w])
+A -- B
+(count A) -- 4150
+(delete {from: 'A where: (< k 100)})
+(delete {from: 'B where: (< k 100)})
+(set P (table [k v w] (list (+ 4150 (til 12000)) (+ 5000 (til 12000)) (/ (as 'F64 (til 12000)) 4))))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k v w])
+A -- B
+(count A) -- 16050
+;; two keys the grown map holds, and one the delete took out — appended again
+(set P (table [k v w] (list [4149 16149 99] [-1 -2 -3] [1.0 2.0 3.0])))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k v w])
+A -- B
+(count A) -- 16051
+
 ;; ── the key map stays exact across mixed writers ──
 (set A (book (til 500) (til 500)))
 (set B (book (til 500) (til 500)))
