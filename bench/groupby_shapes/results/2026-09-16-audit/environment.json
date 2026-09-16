@@ -1,0 +1,39 @@
+{
+  "kernel": "Linux-6.17.9-76061709-generic-x86_64-with-glibc2.35",
+  "cpu": {
+    "Architecture": "x86_64",
+    "CPU(s)": "28",
+    "On-line CPU(s) list": "0-27",
+    "Model name": "Intel(R) Core(TM) i7-14700",
+    "Thread(s) per core": "2",
+    "Core(s) per socket": "20",
+    "Socket(s)": "1",
+    "L2 cache": "28 MiB (11 instances)",
+    "L3 cache": "33 MiB (1 instance)"
+  },
+  "compiler": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+  "build_flags": "-O3 -march=native -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math",
+  "governor": "powersave",
+  "scaling_driver": "intel_pstate",
+  "candidate_revision": "fdf365f3a52af3ceeb0814c59ba7be272d8b419f",
+  "baseline_revision": "f61a4eda",
+  "candidate_sha256": "ab1f19e100f89164af1ef511fe6390cf3e634114a1fb0c5df9bd039c578e343b",
+  "baseline_sha256": "1003a83830e8b12ae1cb86bdec98af3d649ae54404b59a1466ec31548b149353",
+  "workers": [
+    "1",
+    "8",
+    "default"
+  ],
+  "fresh_processes_per_case": 3,
+  "warm_executions_per_process": 5,
+  "typed_result_comparisons": 144,
+  "asan_ubsan_tests": 3832,
+  "extra_query_fixture_total_threads": 28,
+  "repeat_typed_result_comparisons": 30,
+  "repeat_cases": [
+    "binary",
+    "clustered",
+    "symbol-key"
+  ],
+  "repeat_processes_per_binary_case": 5
+}

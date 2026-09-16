@@ -1,7 +1,63 @@
 # Grouping engine scaling results
 
-Status: local acceptance is complete for `f61a4eda`. This report contains
-only synthetic fixtures and generic engine validation. Required PR checks gate merging.
+Status: the full scaling matrix was validated at `f61a4eda`; the audit
+follow-up below covers the query regression fixes. This report contains only synthetic
+fixtures and generic engine validation. Required PR checks gate merging.
+
+## Audit follow-up
+
+The PR audit identified missing query coverage and an empty-result inference
+regression after the measured revision above.
+
+- Restored the original W32 SYM single-key query and kept the additional
+  two-key radix fixture. The single-key result is normalized after query
+  execution by its unique numeric row value before checking every source key
+  and aggregate. This preserves query-path coverage and key/value association
+  checks without assuming a group output order that the engine does not promise.
+- Added query fixtures for all nine STR/GUID/LIST key/value combinations,
+  selected and mixed count-distinct queries, full key-column emission, and
+  composite keys wider than 16 bytes. Expected counts come from a four-row
+  pattern, with values differing beyond a shared prefix.
+- Added empty-input and selected-out query fixtures, including aggregate
+  aliases that exercise generic unary evaluation. Empty-input domain/type
+  errors no longer turn a zero-group query into an error. A separate injected
+  error test checks that OOM and cancellation still propagate.
+- Added task-array bounds assertions, a dense partition capacity assertion,
+  a generic native-width copy fallback, and invalid rank-selection checks.
+
+The cancellation concern does not require clearing every slab on the
+coordinator: dispatch joins its tasks, cancellation is checked before merge,
+and destruction already skips slabs whose `ready` flag is false. Cancellation
+after that check cannot undo a completed task's initialization.
+
+Validation at `fdf365f3`: **3,832/3,832 ASan/UBSan tests passed**. The restored
+symbol fixture and wide count-distinct fixture also passed separately with
+28 total threads. Injected empty-result errors and invalid rank boundaries
+are covered in the full suite.
+
+A clean release of `fdf365f3` completed without warnings (SHA-256
+`ab1f19e100f89164af1ef511fe6390cf3e634114a1fb0c5df9bd039c578e343b`).
+The follow-up compared eight dense-query shapes against `f61a4eda` at 1, 8,
+and default workers: **144/144 fresh-process typed comparisons passed**.
+Three default-worker warm slowdowns were repeated with five processes per
+binary, adding **30/30 passing comparisons**. Their slower medians did not
+reproduce in that follow-up; both samples remain available.
+
+| Default-worker case | Initial baseline / candidate warm ms | Repeat baseline / candidate warm ms |
+|---|---:|---:|
+| Binary aggregates | 2.431 / 3.034 | 2.349 / 2.316 |
+| Clustered keys | 0.630 / 0.730 | 0.626 / 0.603 |
+| Symbol keys | 0.232 / 0.249 | 0.237 / 0.229 |
+
+See the [environment](../bench/groupby_shapes/results/2026-09-16-audit/environment.json),
+[summary](../bench/groupby_shapes/results/2026-09-16-audit/grouping.csv),
+[all process samples](../bench/groupby_shapes/results/2026-09-16-audit/processes.csv),
+[repeat summary](../bench/groupby_shapes/results/2026-09-16-audit/repeat.csv), and
+[repeat process samples](../bench/groupby_shapes/results/2026-09-16-audit/repeat-processes.csv).
+This focused comparison does not establish a new general speedup.
+
+The timing tables below remain measurements of `f61a4eda`; they are not
+presented as a new full sweep of the audit follow-up.
 
 ## Method
 
