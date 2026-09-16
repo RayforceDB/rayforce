@@ -32,6 +32,7 @@
 #include "ops/ops.h"
 #include "store/journal.h"
 #include <string.h>
+#include <limits.h>
 #include <stdio.h>
 #include <errno.h>
 #include <signal.h>
@@ -76,7 +77,21 @@ static void mark_ipc_literal_fallbacks(ray_t* obj) {
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
                         uint8_t* dst, size_t dst_cap)
 {
-    if (len <= RAY_IPC_COMPRESS_THRESHOLD) return 0;
+    return ray_ipc_compress_at(src, len, dst, dst_cap,
+                               (size_t)RAY_IPC_COMPRESS_THRESHOLD);
+}
+
+size_t ray_ipc_link_threshold(ray_sock_t fd)
+{
+    return ray_sock_peer_is_local(fd) ? RAY_IPC_COMPRESS_NEVER
+                                      : (size_t)RAY_IPC_COMPRESS_THRESHOLD;
+}
+
+size_t ray_ipc_compress_at(const uint8_t* src, size_t len,
+                           uint8_t* dst, size_t dst_cap, size_t threshold)
+{
+    /* RAY_IPC_COMPRESS_NEVER is SIZE_MAX, so this rejects every length. */
+    if (len <= threshold) return 0;
 
     /* Step 1: delta-encode into temporary buffer */
     uint8_t* delta = (uint8_t*)ray_alloc_raw(len);
@@ -303,8 +318,7 @@ static ray_t* hook_lookup(int idx) {
  * Errors are logged and swallowed — a buggy logging hook must never
  * wedge connection teardown.  `poll` is the poll the connection lives
  * in, exposed thread-locally so the hook body can use the handle with
- * `.ipc.post` / `.ipc.send` / `.ipc.close`; the legacy server path
- * passes NULL (its conn-index handles are not selector ids). */
+ * `.ipc.post` / `.ipc.send` / `.ipc.close`. */
 static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
     ray_t* fn = hook_lookup(idx);
     if (!fn) return;
@@ -398,7 +412,7 @@ static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel)
     return 0;
 }
 
-static void send_response(ray_sock_t fd, ray_t* result)
+static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 {
     int64_t ser_size = ray_serde_size(result);
 
@@ -425,11 +439,11 @@ static void send_response(ray_sock_t fd, ray_t* result)
     size_t   send_len = 0;
     uint8_t  flags    = 0;
 
-    if ((size_t)ser_size > RAY_IPC_COMPRESS_THRESHOLD) {
+    if ((size_t)ser_size > threshold) {
         uint8_t* comp = (uint8_t*)ray_alloc_raw((size_t)ser_size);
         if (comp) {
-            size_t clen = ray_ipc_compress(payload, (size_t)ser_size,
-                                           comp, (size_t)ser_size);
+            size_t clen = ray_ipc_compress_at(payload, (size_t)ser_size,
+                                              comp, (size_t)ser_size, threshold);
             if (clen > 0 && clen + 4 < (size_t)ser_size) {
                 send_len = clen + 4;
                 send_buf = (uint8_t*)ray_alloc_raw(send_len);
@@ -723,6 +737,10 @@ typedef struct {
     ray_ipc_header_t hdr;
     uint8_t          phase;
     int64_t          listener_id;  /* id of the listener selector; -1 = outbound */
+    /* Compression policy for this link, resolved once when the connection
+     * is established (ray_ipc_link_threshold) so the send paths do not pay
+     * a getpeername per frame. */
+    size_t           compress_threshold;
     bool             auth_required;  /* server has -u/-U */
     bool             restricted;     /* server has -U */
     /* Sync round-trip state: while a ray_ipc_send waits on this conn it
@@ -818,6 +836,7 @@ static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
     cd->listener_id = sel->id;
     cd->auth_required = (poll->auth_secret[0] != '\0');
     cd->restricted    = poll->restricted;
+    cd->compress_threshold = ray_ipc_link_threshold(new_fd);
 
     ray_poll_reg_t reg = {0};
     reg.fd       = (int64_t)new_fd;
@@ -1048,7 +1067,12 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * write and let the poll/pump layer deregister it. */
         if (cur && cur->data == (void*)cd &&
             conn_tx_drain_blocking(poll, cur) == 0)
-            send_response((ray_sock_t)cur->fd, result);
+            {
+                ray_ipc_conn_data_t* rcd = (ray_ipc_conn_data_t*)cur->data;
+                send_response((ray_sock_t)cur->fd, result,
+                              rcd ? rcd->compress_threshold
+                                  : ray_ipc_link_threshold((ray_sock_t)cur->fd));
+            }
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
     /* The request is served: this is the end of the server's unit of work,
@@ -1122,383 +1146,6 @@ int64_t ray_ipc_listen_at(ray_poll_t* poll, const char* host, uint16_t port)
 int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port)
 {
     return ray_ipc_listen_at(poll, NULL, port);
-}
-
-/* ======================================================================
- * Server API
- * ====================================================================== */
-
-static void conn_close(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
-{
-    /* `.ipc.on.close` fires only for conns that were actually opened —
-     * a slot whose phase never advanced past HANDSHAKE/CREDS was never
-     * announced via on.open and so shouldn't be announced via on.close.
-     * Keeps the pair balanced for the user. */
-    if (c->phase == RAY_IPC_PHASE_HEADER ||
-        c->phase == RAY_IPC_PHASE_PAYLOAD) {
-        hook_call_lifecycle(NULL, IPC_HOOK_CLOSE, (int64_t)(c - srv->conns));
-    }
-
-#if defined(__linux__)
-    epoll_ctl(srv->poll_fd, EPOLL_CTL_DEL, c->fd, NULL);
-#elif defined(__APPLE__)
-    struct kevent kev;
-    EV_SET(&kev, c->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    kevent(srv->poll_fd, &kev, 1, NULL, 0, NULL);
-#else
-    (void)srv;
-#endif
-
-    ray_sock_close(c->fd);
-    if (c->rx_buf) ray_free_raw(c->rx_buf);
-    c->fd      = RAY_INVALID_SOCK;
-    c->rx_buf  = NULL;
-    c->rx_len  = 0;
-    c->rx_need = 0;
-
-    uint32_t idx = (uint32_t)(c - srv->conns);
-    if (idx + 1 < srv->n_conns)
-        srv->conns[idx] = srv->conns[srv->n_conns - 1];
-    if (srv->n_conns > 0) srv->n_conns--;
-}
-
-static void conn_on_handshake(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
-{
-    /* Refuse peers speaking a different wire version up front — see the
-     * matching check in ipc_read_handshake. */
-    if (!c->rx_buf || c->rx_buf[0] != RAY_SERDE_WIRE_VERSION) {
-        conn_close(srv, c);
-        return;
-    }
-
-    bool auth_req = (srv->auth_secret[0] != '\0');
-    uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, auth_req ? 0x01 : 0x00 };
-    ray_sock_send(c->fd, resp, 2);
-
-    ray_free_raw(c->rx_buf);
-    c->rx_buf  = NULL;
-    c->rx_len  = 0;
-
-    if (auth_req) {
-        c->rx_need = 1; /* length byte */
-        c->phase   = RAY_IPC_PHASE_CREDS;
-        return;
-    }
-
-    c->rx_need = sizeof(ray_ipc_header_t);
-    c->phase   = RAY_IPC_PHASE_HEADER;
-    /* Legacy path mirror of the poll-path post-handshake fire. */
-    hook_call_lifecycle(NULL, IPC_HOOK_OPEN, (int64_t)(c - srv->conns));
-}
-
-static void conn_on_header(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
-{
-    memcpy(&c->hdr, c->rx_buf, sizeof(ray_ipc_header_t));
-
-    if (c->hdr.prefix != RAY_SERDE_PREFIX) { conn_close(srv, c); return; }
-    if (c->hdr.version != RAY_SERDE_WIRE_VERSION) { conn_close(srv, c); return; }
-    if (c->hdr.endian != RAY_SERDE_ENDIAN) { conn_close(srv, c); return; }
-    if (c->hdr.size <= 0)                  { conn_close(srv, c); return; }
-    if (c->hdr.size > 256 * 1024 * 1024)   { conn_close(srv, c); return; }
-
-    ray_free_raw(c->rx_buf);
-    c->rx_buf = (uint8_t*)ray_alloc_raw((size_t)c->hdr.size);
-    if (!c->rx_buf) { conn_close(srv, c); return; }
-    c->rx_len  = 0;
-    c->rx_need = (size_t)c->hdr.size;
-    c->phase   = RAY_IPC_PHASE_PAYLOAD;
-}
-
-static void conn_on_payload(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
-{
-    bool prev = ray_eval_get_restricted();
-    ray_eval_set_restricted(srv->restricted);
-
-    /* Conn-array index doubles as the handle on the legacy path —
-     * stable for the connection's lifetime, distinct across active
-     * connections, freed back to the pool on close.  Mirrored shape
-     * of the poll path's sel->id. */
-    int64_t prev_handle = ipc_ctx_handle();
-    ray_poll_t* prev_poll = ipc_ctx_poll();
-    ipc_ctx_set((int64_t)(c - srv->conns), prev_poll);
-
-    ray_t* result = eval_payload(c->rx_buf, c->rx_len, &c->hdr);
-
-    ipc_ctx_set(prev_handle, prev_poll);
-    ray_eval_set_restricted(prev);
-
-    if (c->hdr.msgtype == RAY_IPC_MSG_SYNC)
-        send_response(c->fd, result);
-    if (result != RAY_NULL_OBJ) ray_release(result);
-    /* The request is served: this is the end of the server's unit of work,
-     * and stamping here is what lets the poll loop tell an idle server from
-     * one between two requests.  Stamping on frame arrival instead would
-     * make the measured gap the request's own duration. */
-    ray_heap_note_activity();
-
-    ray_free_raw(c->rx_buf);
-    c->rx_buf  = NULL;
-    c->rx_len  = 0;
-    c->rx_need = sizeof(ray_ipc_header_t);
-    c->phase   = RAY_IPC_PHASE_HEADER;
-}
-
-static void conn_on_creds(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
-{
-    if (c->rx_len == 1) {
-        /* Got length byte — reallocate buffer for full credential */
-        uint8_t cred_len = c->rx_buf[0];
-        size_t need = 1 + (size_t)cred_len;
-        uint8_t* newbuf = (uint8_t*)ray_alloc_raw(need);
-        if (!newbuf) { conn_close(srv, c); return; }
-        newbuf[0] = cred_len;
-        ray_free_raw(c->rx_buf);
-        c->rx_buf  = newbuf;
-        c->rx_need = need;
-        return;
-    }
-
-    uint8_t cred_len = c->rx_buf[0];
-    bool ok = validate_creds(c->rx_buf + 1, cred_len, srv->auth_secret);
-
-    /* Legacy path mirror of the poll-path on.auth call: same handle-as-
-     * conn-index convention, same narrowing semantics. */
-    if (ok) {
-        int hook_ok = hook_call_auth(NULL, (int64_t)(c - srv->conns),
-                                     c->rx_buf + 1, cred_len);
-        if (hook_ok == 0) ok = false;
-    }
-
-    uint8_t result = ok ? 0x00 : 0x01;
-    ray_sock_send(c->fd, &result, 1);
-
-    if (!ok) {
-        conn_close(srv, c);
-        return;
-    }
-
-    ray_free_raw(c->rx_buf);
-    c->rx_buf  = NULL;
-    c->rx_len  = 0;
-    c->rx_need = sizeof(ray_ipc_header_t);
-    c->phase   = RAY_IPC_PHASE_HEADER;
-    hook_call_lifecycle(NULL, IPC_HOOK_OPEN, (int64_t)(c - srv->conns));
-}
-
-static void conn_on_readable(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
-{
-    if (!c->rx_buf) {
-        c->rx_buf = (uint8_t*)ray_alloc_raw(c->rx_need);
-        if (!c->rx_buf) { conn_close(srv, c); return; }
-    }
-
-    int64_t n = ray_sock_recv(c->fd, c->rx_buf + c->rx_len,
-                              c->rx_need - c->rx_len);
-    if (n <= 0) { conn_close(srv, c); return; }
-    c->rx_len += (size_t)n;
-
-    if (c->rx_len < c->rx_need) return;
-
-    switch (c->phase) {
-    case RAY_IPC_PHASE_HANDSHAKE: conn_on_handshake(srv, c); break;
-    case RAY_IPC_PHASE_CREDS:     conn_on_creds(srv, c);     break;
-    case RAY_IPC_PHASE_HEADER:    conn_on_header(srv, c);    break;
-    case RAY_IPC_PHASE_PAYLOAD:   conn_on_payload(srv, c);   break;
-    }
-}
-
-ray_err_t ray_ipc_server_init_at(ray_ipc_server_t* srv, const char* host, uint16_t port)
-{
-    memset(srv, 0, sizeof(*srv));
-    srv->listen_fd = ray_sock_listen_at(host, port);
-    if (srv->listen_fd == RAY_INVALID_SOCK) return RAY_ERR_IO;
-    ray_sock_set_nonblocking(srv->listen_fd);
-
-#if defined(__linux__)
-    srv->poll_fd = epoll_create1(0);
-    if (srv->poll_fd < 0) {
-        ray_sock_close(srv->listen_fd);
-        return RAY_ERR_IO;
-    }
-    struct epoll_event ev = { .events = EPOLLIN, .data.fd = srv->listen_fd };
-    epoll_ctl(srv->poll_fd, EPOLL_CTL_ADD, srv->listen_fd, &ev);
-#elif defined(__APPLE__)
-    srv->poll_fd = kqueue();
-    if (srv->poll_fd < 0) {
-        ray_sock_close(srv->listen_fd);
-        return RAY_ERR_IO;
-    }
-    struct kevent kev;
-    EV_SET(&kev, srv->listen_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    kevent(srv->poll_fd, &kev, 1, NULL, 0, NULL);
-#else
-    srv->poll_fd = -1;
-#endif
-
-    srv->running = true;
-    return RAY_OK;
-}
-
-ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port)
-{
-    return ray_ipc_server_init_at(srv, NULL, port);
-}
-
-void ray_ipc_server_destroy(ray_ipc_server_t* srv)
-{
-    for (uint32_t i = 0; i < srv->n_conns; i++) {
-        ray_ipc_conn_t* c = &srv->conns[i];
-        if (c->fd != RAY_INVALID_SOCK) {
-            if (c->rx_buf) ray_free_raw(c->rx_buf);
-            ray_sock_close(c->fd);
-        }
-    }
-    srv->n_conns = 0;
-
-    ray_sock_close(srv->listen_fd);
-    srv->listen_fd = RAY_INVALID_SOCK;
-
-    if (srv->poll_fd >= 0) {
-#ifndef RAY_OS_WINDOWS
-        close(srv->poll_fd);
-#endif
-    }
-    srv->poll_fd = -1;
-    srv->running = false;
-}
-
-int ray_ipc_poll(ray_ipc_server_t* srv, int timeout_ms)
-{
-    int ready = 0;
-
-#if defined(__linux__)
-    struct epoll_event events[RAY_IPC_MAX_EVENTS];
-    int nfds = epoll_wait(srv->poll_fd, events, RAY_IPC_MAX_EVENTS, timeout_ms);
-    if (nfds < 0) return (errno == EINTR) ? 0 : -1;
-
-    for (int i = 0; i < nfds; i++) {
-        int fd = events[i].data.fd;
-
-        if (fd == srv->listen_fd) {
-            ray_sock_t new_fd = ray_sock_accept(srv->listen_fd);
-            if (new_fd == RAY_INVALID_SOCK) continue;
-            ray_sock_set_nonblocking(new_fd);
-            if (srv->n_conns >= RAY_IPC_MAX_CONNS) {
-                ray_sock_close(new_fd);
-                continue;
-            }
-            ray_ipc_conn_t* c = &srv->conns[srv->n_conns++];
-            c->fd      = new_fd;
-            c->rx_buf  = NULL;
-            c->rx_len  = 0;
-            c->rx_need = 2;
-            c->phase   = RAY_IPC_PHASE_HANDSHAKE;
-            struct epoll_event cev = { .events = EPOLLIN, .data.fd = new_fd };
-            epoll_ctl(srv->poll_fd, EPOLL_CTL_ADD, new_fd, &cev);
-        } else {
-            bool found = false;
-            for (uint32_t j = 0; j < srv->n_conns; j++) {
-                if (srv->conns[j].fd == fd) {
-                    conn_on_readable(srv, &srv->conns[j]);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) ready++;
-        }
-    }
-
-#elif defined(__APPLE__)
-    struct kevent events[RAY_IPC_MAX_EVENTS];
-    struct timespec ts;
-    struct timespec* tsp = NULL;
-    if (timeout_ms >= 0) {
-        ts.tv_sec  = timeout_ms / 1000;
-        ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
-        tsp = &ts;
-    }
-    int nfds = kevent(srv->poll_fd, NULL, 0, events, RAY_IPC_MAX_EVENTS, tsp);
-    if (nfds < 0) return (errno == EINTR) ? 0 : -1;
-
-    for (int i = 0; i < nfds; i++) {
-        int fd = (int)events[i].ident;
-
-        if (fd == srv->listen_fd) {
-            ray_sock_t new_fd = ray_sock_accept(srv->listen_fd);
-            if (new_fd == RAY_INVALID_SOCK) continue;
-            ray_sock_set_nonblocking(new_fd);
-            if (srv->n_conns >= RAY_IPC_MAX_CONNS) {
-                ray_sock_close(new_fd);
-                continue;
-            }
-            ray_ipc_conn_t* c = &srv->conns[srv->n_conns++];
-            c->fd      = new_fd;
-            c->rx_buf  = NULL;
-            c->rx_len  = 0;
-            c->rx_need = 2;
-            c->phase   = RAY_IPC_PHASE_HANDSHAKE;
-            struct kevent kev;
-            EV_SET(&kev, new_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-            kevent(srv->poll_fd, &kev, 1, NULL, 0, NULL);
-        } else {
-            bool found = false;
-            for (uint32_t j = 0; j < srv->n_conns; j++) {
-                if (srv->conns[j].fd == fd) {
-                    conn_on_readable(srv, &srv->conns[j]);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) ready++;
-        }
-    }
-
-#else  /* Windows: select-based fallback */
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(srv->listen_fd, &rfds);
-    ray_sock_t maxfd = srv->listen_fd;
-    for (uint32_t i = 0; i < srv->n_conns; i++) {
-        FD_SET(srv->conns[i].fd, &rfds);
-        if (srv->conns[i].fd > maxfd) maxfd = srv->conns[i].fd;
-    }
-
-    struct timeval tv;
-    struct timeval* tvp = NULL;
-    if (timeout_ms >= 0) {
-        tv.tv_sec  = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        tvp = &tv;
-    }
-
-    int nfds = select((int)(maxfd + 1), &rfds, NULL, NULL, tvp);
-    if (nfds < 0) return (errno == EINTR) ? 0 : -1;
-
-    if (FD_ISSET(srv->listen_fd, &rfds)) {
-        ray_sock_t new_fd = ray_sock_accept(srv->listen_fd);
-        if (new_fd != RAY_INVALID_SOCK) {
-            ray_sock_set_nonblocking(new_fd);
-            if (srv->n_conns >= RAY_IPC_MAX_CONNS) {
-                ray_sock_close(new_fd);
-            } else {
-                ray_ipc_conn_t* c = &srv->conns[srv->n_conns++];
-                c->fd      = new_fd;
-                c->rx_buf  = NULL;
-                c->rx_len  = 0;
-                c->rx_need = 2;
-                c->phase   = RAY_IPC_PHASE_HANDSHAKE;
-            }
-        }
-    }
-
-    for (uint32_t i = srv->n_conns; i > 0; ) {
-        --i;
-        if (srv->conns[i].fd != RAY_INVALID_SOCK && FD_ISSET(srv->conns[i].fd, &rfds))
-            conn_on_readable(srv, &srv->conns[i]);
-    }
-#endif
-
-    return ready;
 }
 
 /* ===== Connection-handle API =====
@@ -1576,7 +1223,8 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
  * many connections it goes to: ray_mcast_pub shares one frame across
  * every subscriber's queue (#487). */
 static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
-                                        uint8_t extra_flags, ray_err_t* err_out)
+                                        uint8_t extra_flags, size_t threshold,
+                                        ray_err_t* err_out)
 {
     if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
@@ -1596,11 +1244,11 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
     size_t   send_len = 0;
     uint8_t  flags    = 0;
 
-    if ((size_t)ser_size > RAY_IPC_COMPRESS_THRESHOLD) {
+    if ((size_t)ser_size > threshold) {
         uint8_t* comp = (uint8_t*)ray_alloc_raw((size_t)ser_size);
         if (comp) {
-            size_t clen = ray_ipc_compress(payload, (size_t)ser_size,
-                                           comp, (size_t)ser_size);
+            size_t clen = ray_ipc_compress_at(payload, (size_t)ser_size,
+                                              comp, (size_t)ser_size, threshold);
             if (clen > 0 && clen + 4 < (size_t)ser_size) {
                 send_len = clen + 4;
                 send_buf = (uint8_t*)ray_alloc_raw(send_len);
@@ -1660,11 +1308,24 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
  * frame must conn_tx_drain_blocking() first (see sync_send /
  * ray_ipc_send_async).  Returns 0 on success, -1 on serialization or
  * socket failure. */
+/* The compression policy of an established connection.  Prefer the value
+ * cached on the conn data — it carries any explicit `compress` option from
+ * .ipc.open, which re-deriving from the peer address would silently
+ * discard — and fall back to link locality when there is no conn data. */
+static size_t conn_threshold(ray_selector_t* sel)
+{
+    if (!sel) return (size_t)RAY_IPC_COMPRESS_THRESHOLD;
+    ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
+    if (cd) return cd->compress_threshold;
+    return ray_ipc_link_threshold((ray_sock_t)sel->fd);
+}
+
 static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
-                              uint8_t extra_flags)
+                              uint8_t extra_flags, size_t threshold)
 {
     ray_err_t err = RAY_OK;
-    ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags, &err);
+    ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags,
+                                             threshold, &err);
     if (!frame) return -1;
     int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
     ray_poll_frame_release(frame);
@@ -1695,6 +1356,14 @@ static int64_t connect_fail_code(int err) {
 int64_t ray_ipc_connect(const char* host, uint16_t port,
                          const char* user, const char* password,
                          int timeout_ms)
+{
+    return ray_ipc_connect_opts(host, port, user, password, timeout_ms,
+                                RAY_IPC_COMPRESS_AUTO);
+}
+
+int64_t ray_ipc_connect_opts(const char* host, uint16_t port,
+                         const char* user, const char* password,
+                         int timeout_ms, size_t compress_threshold)
 {
     /* The connection lives in the active poll's selector table — its
      * selector id IS the handle.  No poll, no handle namespace: refuse
@@ -1785,6 +1454,9 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     cd->phase       = RAY_IPC_PHASE_HEADER;
     cd->listener_id = -1;               /* outbound: on.open never fires, on.close does */
     cd->restricted  = poll->restricted; /* -U narrows pushed evals too */
+    cd->compress_threshold = (compress_threshold == RAY_IPC_COMPRESS_AUTO)
+                           ? ray_ipc_link_threshold(fd)
+                           : compress_threshold;
 
     ray_sock_set_nonblocking(fd);
 
@@ -1855,7 +1527,7 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
      * sync request, so its bytes can't interleave into the pending frame. */
     if (conn_tx_drain_blocking(poll, sel) < 0 ||
         conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
-                       extra_flags) < 0) {
+                       extra_flags, conn_threshold(sel)) < 0) {
         if (owned) ray_release(msg);
         return ray_error("io", "ipc send failed");
     }
@@ -1917,6 +1589,14 @@ ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
     return sync_send(handle, msg, 0);
 }
 
+size_t ray_ipc_handle_threshold(int64_t handle)
+{
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    if (!sel) return RAY_IPC_COMPRESS_AUTO;
+    return conn_threshold(sel);
+}
+
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
 {
     bool owned = false;
@@ -1934,7 +1614,8 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
     ray_selector_t* sel = conn_resolve(&poll, handle);
     ray_err_t rc = (!sel || conn_tx_drain_blocking(poll, sel) < 0 ||
                     conn_write_msg((ray_sock_t)sel->fd, msg,
-                                   RAY_IPC_MSG_ASYNC, 0) < 0)
+                                   RAY_IPC_MSG_ASYNC, 0,
+                                   conn_threshold(sel)) < 0)
                    ? RAY_ERR_IO : RAY_OK;
     if (owned) ray_release(msg);
     return rc;
@@ -2019,7 +1700,16 @@ ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out)
         owned = true;
     }
     ray_err_t err = RAY_OK;
-    ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0, &err);
+    /* One frame is shared by every subscriber of a topic (#487), so it
+     * cannot carry a per-peer policy: a mix of local and remote
+     * subscribers would need two framings.  So this keeps the
+     * compiled-in default, which means local subscribers still pay
+     * decompression — there is no listener-level option for topics to
+     * inherit yet.  Bucketing a topic's subscribers into at most two
+     * framings is the way out, and is not in this PR. */
+    ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0,
+                                             (size_t)RAY_IPC_COMPRESS_THRESHOLD,
+                                             &err);
     if (owned) ray_release(msg);
     if (!frame) return err == RAY_OK ? RAY_ERR_IO : err;
     *out = frame;
@@ -2119,4 +1809,107 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
 ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
 {
     return sync_send(handle, msg, RAY_IPC_FLAG_VERBOSE);
+}
+
+/* ===== .ipc.open options ===== */
+
+/* Read one optional integer field.  Returns 1 if present, 0 if absent,
+ * -1 on a type error (with *err set). */
+static int opts_i64(ray_t* d, const char* name, int64_t* out, ray_t** err)
+{
+    ray_t* key = ray_sym(ray_sym_intern(name, strlen(name)));
+    if (!key) { *err = ray_error("oom", ".ipc.open options"); return -1; }
+    ray_t* v = ray_dict_get(d, key);
+    ray_release(key);
+    if (!v) return 0;
+    if (!ray_is_atom(v) || (v->type != -RAY_I64 && v->type != -RAY_I32)) {
+        *err = ray_error("type", ".ipc.open option `%s` must be an integer, got %s",
+                         name, ray_type_name(v->type));
+        ray_release(v);
+        return -1;
+    }
+    *out = (v->type == -RAY_I64) ? v->i64 : (int64_t)v->i32;
+    ray_release(v);
+    return 1;
+}
+
+ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
+                               size_t* compress_threshold)
+{
+    *timeout_ms         = 0;
+    *compress_threshold = RAY_IPC_COMPRESS_AUTO;
+    if (!arg) return NULL;
+
+    /* Backwards-compatible form: a bare integer is the connect timeout. */
+    if (ray_is_atom(arg) && (arg->type == -RAY_I64 || arg->type == -RAY_I32)) {
+        int64_t tv = (arg->type == -RAY_I64) ? arg->i64 : (int64_t)arg->i32;
+        if (tv == NULL_I64) return NULL;             /* 0N -> default budget */
+        if (tv < 0)
+            return ray_error("domain", ".ipc.open timeout must be >= 0, got %lld",
+                             (long long)tv);
+        *timeout_ms = (tv > INT_MAX) ? INT_MAX : (int)tv;
+        return NULL;
+    }
+
+    if (arg->type != RAY_DICT)
+        return ray_error("type", ".ipc.open expects an integer timeout or an options dict, got %s",
+                         ray_type_name(arg->type));
+
+    /* Reject unknown keys: a typo must not silently mean "default".
+     *
+     * Every key must be a symbol and must be validated.  ray_dict_find_idx
+     * returns -1 on a key-type mismatch rather than erroring, so a dict
+     * keyed by anything else would make both lookups miss and this
+     * function return success with defaults — reinstating the very silent
+     * default this check exists to prevent, and swallowing a typo with
+     * it. */
+    ray_t* keys = ray_dict_keys(arg);
+    if (keys && keys->len > 0) {
+        for (int64_t i = 0; i < keys->len; i++) {
+            const char* p = NULL;
+            size_t      n = 0;
+            if (keys->type == RAY_SYM) {
+                const int64_t* kd = (const int64_t*)ray_data(keys);
+                ray_t* ks = ray_sym_str(kd[i]);
+                if (ks) { p = ray_str_ptr(ks); n = ray_str_len(ks); }
+            } else if (keys->type == RAY_LIST) {
+                ray_t* ke = ((ray_t**)ray_data(keys))[i];
+                if (!ke || ke->type != -RAY_SYM)
+                    return ray_error("type", ".ipc.open: option keys must be symbols, got %s",
+                                     ke ? ray_type_name(ke->type) : "null");
+                ray_t* ks = ray_sym_str(ke->i64);
+                if (ks) { p = ray_str_ptr(ks); n = ray_str_len(ks); }
+            } else {
+                return ray_error("type", ".ipc.open: option keys must be symbols, got %s",
+                                 ray_type_name(keys->type));
+            }
+            bool known = (n == 7 && memcmp(p, "timeout",  7) == 0)
+                      || (n == 8 && memcmp(p, "compress", 8) == 0);
+            if (!known)
+                return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout` or `compress`)",
+                                 (int)n, p ? p : "");
+        }
+    }
+
+    ray_t*  err = NULL;
+    int64_t tv  = 0;
+    int     got = opts_i64(arg, "timeout", &tv, &err);
+    if (got < 0) return err;
+    if (got == 1 && tv != NULL_I64) {
+        if (tv < 0)
+            return ray_error("domain", ".ipc.open timeout must be >= 0, got %lld",
+                             (long long)tv);
+        *timeout_ms = (tv > INT_MAX) ? INT_MAX : (int)tv;
+    }
+
+    int64_t cv = 0;
+    got = opts_i64(arg, "compress", &cv, &err);
+    if (got < 0) return err;
+    if (got == 1) {
+        /* 0N = never.  0 = always.  n = compress payloads larger than n. */
+        if (cv == NULL_I64)      *compress_threshold = RAY_IPC_COMPRESS_NEVER;
+        else if (cv < 0)         return ray_error("domain", ".ipc.open compress threshold must be >= 0 or 0N (never), got %lld", (long long)cv);
+        else                     *compress_threshold = (size_t)cv;
+    }
+    return NULL;
 }
