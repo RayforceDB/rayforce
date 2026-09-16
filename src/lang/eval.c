@@ -2080,6 +2080,13 @@ static void add_eval_error_frame(ray_t* nfo, ray_t* node) {
 /* Execute compiled bytecode for a lambda. */
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
 
+/* Sym ID of "self" for call_lambda's frame.  It belongs to the current sym
+ * table: runtime destroy tears the table down and the next runtime can give
+ * "self" a different ID, so ray_lang_destroy resets it, as ray_compile_reset
+ * does for the compiler's special-form IDs.  A stale ID bound the lambda under
+ * a name that was no longer "self", shadowing whatever variable owned it. */
+static int64_t g_call_self_sym = -1;
+
 /* Call a lambda: compile on first call, then execute bytecode. */
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     /* Lazy compilation on first call */
@@ -2110,11 +2117,8 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     }
 
     /* Bind 'self' to the current lambda for recursion */
-    {
-        static int64_t self_sym_id = -1;
-        if (self_sym_id < 0) self_sym_id = ray_sym_intern("self", 4);
-        ray_env_set_local(self_sym_id, lambda);
-    }
+    if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
+    ray_env_set_local(g_call_self_sym, lambda);
 
     int64_t* param_ids = (int64_t*)ray_data(params_list);
     for (int64_t i = 0; i < param_count && i < argc; i++) {
@@ -3587,6 +3591,7 @@ void ray_lang_destroy(void) {
     ray_dl_reset_rules();
     ray_env_destroy();
     ray_compile_reset();
+    g_call_self_sym = -1;
 }
 
 /* ══════════════════════════════════════════
