@@ -1297,11 +1297,8 @@ static test_result_t test_parallel_wide_consumers(void) {
     PASS();
 }
 
-/* Independent long-double moments and pair sums validate reassociation in
- * both partitioned streaming and shared indexed consumers. */
-static test_result_t test_parallel_rank_dominant(void) {
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    const int64_t n = 1048576;
+/* Histogram ranks independently check both sides of the parallel grain. */
+static test_result_t test_parallel_rank_size(int64_t n) {
     const int64_t counts[] = {n / 2, n / 2 - 17, 17};
     const int64_t offsets[] = {0, n / 2, n - 17};
     const int8_t types[] = {RAY_I64, RAY_F32, RAY_TIME, RAY_BOOL};
@@ -1358,6 +1355,18 @@ static test_result_t test_parallel_rank_dominant(void) {
     PASS();
 }
 
+static test_result_t test_parallel_rank_dominant(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    const int64_t sizes[] = {131072, 400000, 1048576};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        test_result_t result = test_parallel_rank_size(sizes[i]);
+        if (result.status != TEST_PASS) return result;
+    }
+    PASS();
+}
+
+/* Independent long-double moments and pair sums validate reassociation in
+ * both partitioned streaming and shared indexed consumers. */
 static test_result_t test_parallel_float_oracle(void) {
     ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
     const int64_t n = 262144, ng = 4096;

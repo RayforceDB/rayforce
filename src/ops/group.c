@@ -2520,7 +2520,9 @@ static ray_t* rank_per_group_buf(ray_t* src,
     };
 
     ray_pool_t* pool = ray_pool_get();
-    int64_t threshold = 262144, largest = 0;
+    /* Use the common parallel grain so a few medium groups can share the
+     * pool. The per-worker share still prevents splitting ordinary small groups. */
+    int64_t threshold = RAY_PARALLEL_THRESHOLD, largest = 0;
     if (ray_pool_par_dispatch_ok(pool, total, threshold)) {
         int64_t share = total / ray_pool_total_workers(pool);
         if (share > threshold) threshold = share;
