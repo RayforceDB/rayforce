@@ -105,32 +105,6 @@ int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port);
 /* Bind to a specific IPv4 address; host NULL/empty means INADDR_ANY (#427). */
 int64_t ray_ipc_listen_at(ray_poll_t* poll, const char* host, uint16_t port);
 
-/* ===== Legacy server API (wraps poll internally for tests) ===== */
-
-typedef struct ray_ipc_conn {
-    ray_sock_t        fd;
-    uint8_t*          rx_buf;
-    size_t            rx_len;
-    size_t            rx_need;
-    uint8_t           phase;
-    ray_ipc_header_t  hdr;
-} ray_ipc_conn_t;
-
-typedef struct ray_ipc_server {
-    ray_sock_t        listen_fd;
-    int               poll_fd;
-    ray_ipc_conn_t    conns[RAY_IPC_MAX_CONNS];
-    uint32_t          n_conns;
-    bool              running;
-    char              auth_secret[256]; /* password from -u/-U */
-    bool              restricted;       /* -U mode */
-} ray_ipc_server_t;
-
-ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port);
-ray_err_t ray_ipc_server_init_at(ray_ipc_server_t* srv, const char* host, uint16_t port);
-void      ray_ipc_server_destroy(ray_ipc_server_t* srv);
-int       ray_ipc_poll(ray_ipc_server_t* srv, int timeout_ms);
-
 /* ===== Connection-handle API =====
  *
  * One handle namespace: a handle is the poll selector id of an IPC

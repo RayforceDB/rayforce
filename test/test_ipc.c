@@ -25,11 +25,10 @@
  * test_ipc.c — focused coverage for src/core/ipc.c.
  *
  * Existing coverage (test_store.c) already covers:
- *   - ray_ipc_server_init/destroy lifecycle
  *   - sync/async round-trips (no-auth and with-auth)
  *   - auth rejection + no-creds rejection
  *   - restricted mode
- *   - handshake version mismatch via legacy server API
+ *   - handshake version mismatch
  *   - ray_ipc_compress / ray_ipc_decompress basics
  *
  * This file covers the gaps:
@@ -54,6 +53,7 @@
 #define _GNU_SOURCE
 
 #include "test.h"
+#include "ipc_harness.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
@@ -120,18 +120,6 @@ static uint16_t get_listen_port(ray_sock_t fd) {
     return ntohs(addr.sin_port);
 }
 
-typedef struct {
-    ray_ipc_server_t *srv;
-    ray_vm_t         *vm;
-} ipc_thread_ctx_t;
-
-static void server_thread_fn(void* arg) {
-    ipc_thread_ctx_t* ctx = (ipc_thread_ctx_t*)arg;
-    __VM = ctx->vm;
-    while (ctx->srv->running)
-        ray_ipc_poll(ctx->srv, 10);
-}
-
 /* Poll-based server thread */
 typedef struct {
     ray_poll_t  *poll;
@@ -176,8 +164,8 @@ static void sleep_ms(long ms) {
  * an unparseable host is a loud io failure, never a silent INADDR_ANY. */
 /* ---- Shared poll-based server harness ----------------------------------
  * The one way to stand up an IPC server in tests.  Mirrors test_mcast.c's
- * start_server; the legacy ray_ipc_server_t path is being retired onto
- * this. */
+ * start_server.  Kept here for the wire-level tests below; the shared
+ * version lives in ipc_harness.h. */
 typedef struct {
     ray_poll_t*  poll;
     ray_vm_t*    vm;
@@ -219,19 +207,24 @@ static void wire_stop_server(ray_poll_t* poll, uint16_t port,
 }
 
 static test_result_t test_ipc_listen_bind_addr(void) {
-    ray_ipc_server_t srv;
-    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&srv, "127.0.0.1", 0), RAY_OK);
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT(port > 0, "port > 0");
-    ray_ipc_server_destroy(&srv);
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* An explicit loopback bind gets a real ephemeral port. */
+    int64_t id = ray_ipc_listen_at(poll, "127.0.0.1", 0);
+    TEST_ASSERT((id) >= (0), "loopback bind");
+    ray_selector_t* sel = ray_poll_get(poll, id);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_TRUE(ray_test_listen_port((ray_sock_t)sel->fd) > 0);
 
     /* NULL host keeps the historical all-interfaces bind. */
-    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&srv, NULL, 0), RAY_OK);
-    ray_ipc_server_destroy(&srv);
+    TEST_ASSERT((ray_ipc_listen_at(poll, NULL, 0)) >= (0), "NULL host binds");
 
-    ray_ipc_server_t bad;
-    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&bad, "not-an-address", 0), RAY_ERR_IO);
-    TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&bad, "999.9.9.9", 0), RAY_ERR_IO);
+    /* An unparseable host is a loud failure, never a silent INADDR_ANY. */
+    TEST_ASSERT((ray_ipc_listen_at(poll, "not-an-address", 0)) < (0), "bad host refused");
+    TEST_ASSERT((ray_ipc_listen_at(poll, "999.9.9.9", 0)) < (0), "bad octets refused");
+
+    ray_poll_destroy(poll);
     PASS();
 }
 
@@ -241,19 +234,9 @@ static test_result_t test_ipc_listen_bind_addr(void) {
  * plus the verbose eval_payload wrapper (lines 341-402).
  */
 static test_result_t test_ipc_send_verbose(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -284,10 +267,7 @@ static test_result_t test_ipc_send_verbose(void) {
     ray_release(resp);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -298,19 +278,9 @@ static test_result_t test_ipc_send_verbose(void) {
  * Covers lines 368-375: captured output non-empty path in eval_payload.
  */
 static test_result_t test_ipc_send_verbose_captures_output(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -336,10 +306,7 @@ static test_result_t test_ipc_send_verbose_captures_output(void) {
 
     ray_release(resp);
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -349,26 +316,16 @@ static test_result_t test_ipc_send_verbose_captures_output(void) {
  * has a branch for non-STR messages that calls ray_eval(msg) directly
  * (lines 315-317).  To exercise it we need to send a serialized non-STR
  * object.  We do this by building a serialized i64 directly and injecting
- * it into the server using the legacy blocking API.
+ * it into the server using the blocking client API.
  *
  * The simplest approach: connect raw, do handshake, build header with
  * msgtype=SYNC, payload = serialized integer, send it.  The server will
  * eval the integer (returns itself as a value) and send us a response.
  */
 static test_result_t test_ipc_eval_non_string_msg(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     /* Connect raw socket, do manual handshake */
     ray_sock_t s = ray_sock_connect("127.0.0.1", port, 2000);
@@ -448,27 +405,14 @@ static test_result_t test_ipc_eval_non_string_msg(void) {
     if (result != RAY_NULL_OBJ) ray_release(result);
 
     ray_sock_close(s);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
 static test_result_t test_ipc_send_list_select_msg(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -496,27 +440,14 @@ static test_result_t test_ipc_send_list_select_msg(void) {
     ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
 static test_result_t test_ipc_send_compiled_lambda_msg(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -545,27 +476,14 @@ static test_result_t test_ipc_send_compiled_lambda_msg(void) {
     ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
 static test_result_t test_ipc_send_list_dict_arg_literal(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -668,10 +586,7 @@ static test_result_t test_ipc_send_list_dict_arg_literal(void) {
     ray_release(result2);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -693,20 +608,9 @@ static test_result_t test_ipc_connect_fail_no_server(void) {
  * format (line 1082-1083).
  */
 static test_result_t test_ipc_connect_auth_no_user(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    strcpy(srv.auth_secret, "mypass");
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, "mypass", false);
+    uint16_t port = srv.port;
 
     /* Connect with NULL user but valid password */
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, "mypass", 0);
@@ -721,10 +625,7 @@ static test_result_t test_ipc_connect_auth_no_user(void) {
     ray_release(r);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -1027,19 +928,9 @@ static test_result_t test_ipc_poll_handshake_version_mismatch(void) {
  * characters and highly repetitive so it actually compresses.
  */
 static test_result_t test_ipc_send_large_compressible(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1074,10 +965,7 @@ static test_result_t test_ipc_send_large_compressible(void) {
     ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -1101,19 +989,9 @@ static test_result_t test_ipc_journal_path(void) {
         PASS();
     }
 
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1128,10 +1006,7 @@ static test_result_t test_ipc_journal_path(void) {
     ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
 
     ray_journal_close();
     system(cmd); /* cleanup */
@@ -1371,19 +1246,9 @@ static test_result_t test_ipc_poll_bad_header(void) {
  * (lines 1173-1188).
  */
 static test_result_t test_ipc_send_large_result(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1405,10 +1270,7 @@ static test_result_t test_ipc_send_large_result(void) {
     if (result != RAY_NULL_OBJ) ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -1428,19 +1290,9 @@ static test_result_t test_ipc_send_large_result(void) {
  * also compresses, covering the other direction again).
  */
 static test_result_t test_ipc_send_large_msg_client_compress(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1474,10 +1326,7 @@ static test_result_t test_ipc_send_large_msg_client_compress(void) {
     if (result != RAY_NULL_OBJ) ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -1489,19 +1338,9 @@ static test_result_t test_ipc_send_large_msg_client_compress(void) {
  * path in ray_ipc_send_verbose (lines 1250-1265).
  */
 static test_result_t test_ipc_send_verbose_large_result(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1526,146 +1365,7 @@ static test_result_t test_ipc_send_verbose_large_result(void) {
 
     ray_release(resp);
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    PASS();
-}
-
-/* ---- test_ipc_server_destroy_active_conns ------------------------------- */
-/*
- * Destroy the server while a client connection is still active (client did
- * not call ray_ipc_close before ray_ipc_server_destroy).
- * Covers lines 804-810: the n_conns > 0 cleanup loop in
- * ray_ipc_server_destroy.
- */
-static test_result_t test_ipc_server_destroy_active_conns(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
-
-    /* Connect two clients */
-    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
-    TEST_ASSERT((h1) >= (0), "h1 >= 0");
-    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
-    TEST_ASSERT((h2) >= (0), "h2 >= 0");
-
-    /* Do one round-trip to ensure the server has accepted the connections */
-    ray_t* msg = ray_str("(+ 1 1)", 7);
-    ray_t* r = ray_ipc_send(h1, msg);
-    ray_release(msg);
-    if (r && !RAY_IS_ERR(r)) ray_release(r);
-
-    /* Stop the server thread first */
-    srv.running = false;
-    ray_thread_join(tid);
-
-    /* Leave h2 open (don't call ray_ipc_close(h2)).
-     * srv->n_conns may still have the h2 conn registered.
-     * ray_ipc_server_destroy must clean it up gracefully. */
-    ray_ipc_close(h1);
-    /* Don't close h2 — let destroy handle it */
-
-    /* This must not crash even when n_conns > 0 */
-    ray_ipc_server_destroy(&srv);
-
-    /* Clean up the client-side handle after server is destroyed */
-    ray_ipc_close(h2);
-    ray_sys_free(srv_vm);
-    PASS();
-}
-
-/* ---- test_ipc_server_conn_swap ------------------------------------------ */
-/*
- * Cover line 647 in conn_close: `srv->conns[idx] = srv->conns[srv->n_conns - 1]`
- * This swap only executes when closing a non-last connection (idx + 1 < n_conns).
- *
- * Setup: two raw-socket clients do a successful handshake so the server has
- * n_conns == 2 (conns[0]=c1, conns[1]=c2).  c1 then sends a bad header
- * (wrong prefix) which triggers conn_on_header → conn_close(&conns[0]).
- * Since idx=0 and n_conns=2, the swap executes: conns[0] = conns[1].
- */
-static test_result_t test_ipc_server_conn_swap(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
-
-    /* Connect two raw sockets and do handshakes so n_conns == 2 */
-    ray_sock_t s1 = ray_sock_connect("127.0.0.1", port, 2000);
-    TEST_ASSERT_TRUE(s1 != RAY_INVALID_SOCK);
-    ray_sock_t s2 = ray_sock_connect("127.0.0.1", port, 2000);
-    TEST_ASSERT_TRUE(s2 != RAY_INVALID_SOCK);
-
-    uint8_t hs[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
-    ray_sock_send(s1, hs, 2);
-    ray_sock_send(s2, hs, 2);
-
-    /* Read handshake responses */
-    uint8_t r1[2], r2[2];
-    size_t got = 0;
-    while (got < 2) {
-        int64_t n = ray_sock_recv(s1, r1 + got, 2 - got);
-        if (n <= 0) break;
-        got += (size_t)n;
-    }
-    got = 0;
-    while (got < 2) {
-        int64_t n = ray_sock_recv(s2, r2 + got, 2 - got);
-        if (n <= 0) break;
-        got += (size_t)n;
-    }
-
-    /* Give server time to process both accepts */
-    sleep_ms(20);
-
-    /* s1 sends a bad header (wrong prefix) → conn_close(&conns[0]) → swap */
-    ray_ipc_header_t bad_hdr;
-    memset(&bad_hdr, 0, sizeof(bad_hdr));
-    bad_hdr.prefix  = 0xBADBAD00;
-    bad_hdr.version = RAY_SERDE_WIRE_VERSION;
-    bad_hdr.size    = 8;
-    ray_sock_send(s1, &bad_hdr, sizeof(bad_hdr));
-
-    /* Give the server time to process the bad header and close s1 */
-    sleep_ms(30);
-    ray_sock_close(s1);
-
-    /* s2 should still work; do a proper round-trip on it */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
-    if (h >= 0) {
-        ray_t* msg = ray_str("(+ 1 1)", 7);
-        ray_t* r = ray_ipc_send(h, msg);
-        ray_release(msg);
-        if (r && !RAY_IS_ERR(r)) ray_release(r);
-        ray_ipc_close(h);
-    }
-
-    ray_sock_close(s2);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -1690,22 +1390,9 @@ static test_result_t test_ipc_journal_restricted(void) {
         PASS(); /* journal not supported; skip */
     }
 
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    /* Enable restricted mode on the server */
-    srv.restricted = true;
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1724,10 +1411,7 @@ static test_result_t test_ipc_journal_restricted(void) {
     }
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
 
     ray_journal_close();
     system(cmd);
@@ -1742,19 +1426,9 @@ static test_result_t test_ipc_journal_restricted(void) {
  * fixes the wire would carry a RAY_LAZY type the server can't deserialise.
  */
 static test_result_t test_ipc_send_lazy_msg(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1803,16 +1477,13 @@ static test_result_t test_ipc_send_lazy_msg(void) {
 
     ray_release(vec);
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
 /* ---- test_ipc_hooks_lifecycle ------------------------------------------- */
 /*
- * End-to-end exercise of the `.ipc.on.*` connection hooks on the legacy
+ * End-to-end exercise of the `.ipc.on.*` connection hooks on the
  * server path.  Three hooks are installed via `set`; a single round-trip
  * (open → SYNC eval → close) drives them all.  We track side effects
  * through plain user-bound globals that hooks mutate, then read those
@@ -1851,19 +1522,9 @@ static test_result_t test_ipc_hooks_lifecycle(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     if (r != RAY_NULL_OBJ) ray_release(r);
 
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -1888,17 +1549,16 @@ static test_result_t test_ipc_hooks_lifecycle(void) {
 
     /* Stop the server before reading hook side effects — guarantees
      * the close hook has fired (otherwise we'd race the poll loop). */
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
 
     /* Read counters back through the global env.  on.open + on.sync
      * fired exactly once; on.close fired twice — once on the client for
      * its own outbound handle (ray_ipc_close, #503) and once on the
      * server for the inbound one.  `_hook_sync_handle` records
-     * `.ipc.handle` as seen INSIDE the sync hook — must equal the
-     * legacy server's conn-array index (0 for the only active conn). */
+     * `.ipc.handle` as seen INSIDE the sync hook.  A handle is the
+     * connection's selector id, so assert it is a real handle rather
+     * than a fixed number — the exact id depends on selector allocation
+     * (the listener takes one first). */
     int64_t sym_open  = ray_sym_intern("_hook_open",        strlen("_hook_open"));
     int64_t sym_close = ray_sym_intern("_hook_close",       strlen("_hook_close"));
     int64_t sym_h     = ray_sym_intern("_hook_sync_handle", strlen("_hook_sync_handle"));
@@ -1912,7 +1572,7 @@ static test_result_t test_ipc_hooks_lifecycle(void) {
     TEST_ASSERT_EQ_I(v_open->i64,  1);
     TEST_ASSERT_EQ_I(v_close->i64, 2);
     TEST_ASSERT_EQ_I(v_msg->i64,   1);
-    TEST_ASSERT_EQ_I(v_h->i64,     0);
+    TEST_ASSERT((v_h->i64) >= (0), "sync hook saw a real handle, not -1");
 
     /* `.ipc.handle` outside any hook reads back -1. */
     ray_t* handle_outside = ray_eval_str("(.ipc.handle)");
@@ -1996,19 +1656,9 @@ static test_result_t test_ipc_post_delivery(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     if (r != RAY_NULL_OBJ) ray_release(r);
 
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = make_server_vm();
-    TEST_ASSERT_NOT_NULL(srv_vm);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -2036,10 +1686,7 @@ static test_result_t test_ipc_post_delivery(void) {
     if (resp && !RAY_IS_ERR(resp)) ray_release(resp);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
+    ray_test_server_stop(&srv);
 
     /* Now that the server thread is gone, it is safe to assert. */
     TEST_ASSERT_FALSE(pr_is_err);
@@ -2790,8 +2437,6 @@ const test_entry_t ipc_entries[] = {
     { "ipc/send_large_result",          test_ipc_send_large_result,              ipc_setup, ipc_teardown },
     { "ipc/send_large_msg_client_compress", test_ipc_send_large_msg_client_compress, ipc_setup, ipc_teardown },
     { "ipc/send_verbose_large_result",  test_ipc_send_verbose_large_result,      ipc_setup, ipc_teardown },
-    { "ipc/server_destroy_active_conns", test_ipc_server_destroy_active_conns,   ipc_setup, ipc_teardown },
-    { "ipc/server_conn_swap",            test_ipc_server_conn_swap,               ipc_setup, ipc_teardown },
     { "ipc/journal_restricted",          test_ipc_journal_restricted,             ipc_setup, ipc_teardown },
     { "ipc/send_lazy_msg",               test_ipc_send_lazy_msg,                  ipc_setup, ipc_teardown },
     { "ipc/hooks_lifecycle",             test_ipc_hooks_lifecycle,                ipc_setup, ipc_teardown },
