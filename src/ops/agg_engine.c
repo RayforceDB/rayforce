@@ -4780,7 +4780,7 @@ enum { AGG_DIRECTORY_INIT_BYTES = 2 * 1024 * 1024 };
 static void agg_key_directory_init(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
 #define KEY_DIRECTORY_INIT(TYPE, EMPTY) do { \
-        _Atomic(TYPE)* first_slots = c->first; \
+        _Atomic TYPE* first_slots = c->first; \
         uint64_t offset = (uintptr_t)c->first & (AGG_DIRECTORY_INIT_BYTES - 1); \
         for (int64_t task = start; task < end; task++) { \
             uint64_t lo = (uint64_t)(c->init_pages * task / c->init_tasks) * AGG_DIRECTORY_INIT_BYTES; \
@@ -4798,7 +4798,7 @@ static void agg_key_directory_init(void* raw, uint32_t wid, int64_t start, int64
 static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
 #define KEY_DIRECTORY_INSERT(TYPE, EMPTY) do { \
-        _Atomic(TYPE)* first_slots = c->first; \
+        _Atomic TYPE* first_slots = c->first; \
         for (int64_t r = start; r < end; r++) { \
             uint64_t slot = 0; \
             if (c->dense) { \
@@ -4835,7 +4835,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
 static void agg_key_directory_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
 #define KEY_DIRECTORY_COUNT(TYPE, EMPTY) do { \
-        _Atomic(TYPE)* first_slots = c->first; \
+        _Atomic TYPE* first_slots = c->first; \
         for (int64_t task = start; task < end; task++) { \
             int64_t begin = c->rows / c->tasks * task; \
             int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1); \
@@ -4855,7 +4855,7 @@ static void agg_key_directory_count(void* raw, uint32_t wid, int64_t start, int6
 static void agg_key_directory_compact(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
 #define KEY_DIRECTORY_COMPACT(TYPE, EMPTY) do { \
-        _Atomic(TYPE)* first_slots = c->first; \
+        _Atomic TYPE* first_slots = c->first; \
         for (int64_t task = start; task < end; task++) { \
             int64_t begin = c->rows / c->tasks * task; \
             int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1); \
@@ -4873,7 +4873,7 @@ static void agg_key_directory_compact(void* raw, uint32_t wid, int64_t start, in
 static void agg_key_directory_remap(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_key_build_t* c = raw;
 #define KEY_DIRECTORY_REMAP(TYPE, EMPTY) do { \
-        _Atomic(TYPE)* first_slots = c->first; \
+        _Atomic TYPE* first_slots = c->first; \
         for (int64_t r = start; r < end; r++) \
             c->out->gids[r] = (uint32_t)atomic_load_explicit(&first_slots[c->out->gids[r]], memory_order_relaxed); \
     } while (0)
