@@ -56,6 +56,16 @@ See the [environment](../bench/groupby_shapes/results/2026-09-16-audit/environme
 [repeat process samples](../bench/groupby_shapes/results/2026-09-16-audit/repeat-processes.csv).
 This focused comparison does not establish a new general speedup.
 
+The restored query fixture also exposed two sorting races under hosted TSan.
+The shared sortedness flag now uses relaxed atomic accesses, and in-place key
+packing no longer reads a neighboring task's element; the existing coordinator
+pass checks boundary pairs after the dispatch barrier. The triggering fixture
+reproduced both races before the fix and passed afterward. Follow-up validation:
+**130/130 sort ASan/UBSan tests** and **41/41 parallel TSan tests** passed without
+race reports, using four total threads for TSan. The aggregation TSan suite at
+`fdf365f3` also passed **26/26** without suppressions. These sorting fixes do not
+change the grouping traversal measured above.
+
 The timing tables below remain measurements of `f61a4eda`; they are not
 presented as a new full sweep of the audit follow-up.
 
