@@ -793,6 +793,30 @@ int64_t ray_sym_intern_prehashed(uint32_t hash, const char* str, size_t len) {
 }
 
 /* --------------------------------------------------------------------------
+ * ray_sym_intern_batch -- intern n pre-hashed strings under one lock.
+ *
+ * For decoders that have already deduplicated their input: each distinct
+ * string costs one probe, and the whole batch one lock round-trip.  The
+ * per-string work is exactly ray_sym_intern's (search_lazy = true), so ids
+ * and dotted-segment caching are identical.
+ * Returns 0, or -1 if any intern failed (out_ids then partially filled).
+ * -------------------------------------------------------------------------- */
+
+int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
+                             const size_t* lens, int64_t n, int64_t* out_ids) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
+    if (n <= 0) return 0;
+    sym_lock();
+    for (int64_t i = 0; i < n; i++) {
+        int64_t id = sym_intern_nolock(hashes[i], strs[i], lens[i], true);
+        if (id < 0) { sym_unlock(); return -1; }
+        out_ids[i] = id;
+    }
+    sym_unlock();
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
  * ray_sym_intern_no_split — persistence-only bulk intern
  * -------------------------------------------------------------------------- */
 
