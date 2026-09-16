@@ -15058,8 +15058,18 @@ static bool ukey_grow(ray_index_t* ix, int64_t entries) {
     memset(dst, 0, (size_t)cap * sizeof(int64_t));
     const int64_t* src = (const int64_t*)ray_data(ix->u.ukey.slots);
     uint64_t mask = cap - 1;
-    for (uint64_t s = 0; s < old_cap; s++) {
-        int64_t e = src[s];
+    /* Start at an empty slot and walk the old table cyclically, rather than
+     * from slot 0: entries that share a probe chain must be re-placed in the
+     * order they sit in it, or two rows carrying the same key swap places
+     * whenever their chain wraps past the end of the array — and the next
+     * keyed upsert then updates the later row instead of the lowest one.  A
+     * chain never contains an empty slot, so starting at one enters every
+     * chain at its beginning; the load factor of at most a half guarantees
+     * such a slot exists. */
+    uint64_t start = 0;
+    while (start < old_cap && src[start] != UKEY_SLOT_EMPTY) start++;
+    for (uint64_t i = 0; i < old_cap; i++) {
+        int64_t e = src[(start + i) & (old_cap - 1)];
         if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
         uint64_t t = (uint64_t)UKEY_H32(e) & mask;
         while (dst[t] != UKEY_SLOT_EMPTY) t = (t + 1) & mask;

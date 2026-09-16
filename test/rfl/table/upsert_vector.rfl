@@ -181,6 +181,18 @@ A -- B
 A -- B
 (count A) -- 16051
 
+;; ── duplicate keys keep their row order when the map grows ──
+;; `insert` can append a second row carrying a key the table already holds.
+;; The map enters rows in row order, so a keyed upsert updates the lowest of
+;; them; re-placing the map into a bigger table must not change that, which it
+;; does whenever a probe chain wraps past the end of the slot array.  Both
+;; sizes below expose such a chain.
+(set dupgrow (fn [n dk] (do (set A (table [k v] (list (til n) (til n)))) (set B (table [k v] (list (til n) (til n)))) (upsert 'A 'k (table [k v] (list [0 1] [0 1]))) (upsert 'B 'k (table [k v] (list [0 1] [0 1]))) (insert 'A (list dk 999)) (insert 'B (list dk 999)) (set P (table [k v] (list (+ (* 10 n) (til (* 4 n))) (take [7] (* 4 n))))) (upsert 'A 'k P) (rowwise 'B 'k P [k v]) (set Q (table [k v] (list (as 'I64 (list dk (+ (* 10 n) 1))) (as 'I64 (list -1 -2))))) (upsert 'A 'k Q) (rowwise 'B 'k Q [k v]) (list (at (at A 'v) dk) (at (at A 'v) n) (count A)))))
+(dupgrow 480 470) -- (list -1 999 2401)
+A -- B
+(dupgrow 640 470) -- (list -1 999 3201)
+A -- B
+
 ;; ── the key map stays exact across mixed writers ──
 (set A (book (til 500) (til 500)))
 (set B (book (til 500) (til 500)))
