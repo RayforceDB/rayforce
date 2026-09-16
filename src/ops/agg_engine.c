@@ -1557,20 +1557,31 @@ static void agg_dense_partition_scatter(void* raw, uint32_t wid, int64_t start, 
             }
             #undef SCATTER_UNARY
         } else {
-            for (int64_t r = begin; r < limit; r++) {
-                uint32_t slot = c->gids[r], part = slot & (c->parts - 1), gid = slot >> c->bits;
-                char* dst = c->payload + cursor[part]++ * c->record_size;
-                memcpy(dst, &gid, 4);
-            }
-            size_t emitted = sizeof(uint32_t);
-            for (uint32_t a = 0; a < vd->n_aggs; a++) {
-                if (vd->val_data[a] && c->value_offsets[a] >= emitted) {
-                    agg_dense_partition_field(c, vd->val_data[a], vd->val_esz[a], c->value_offsets[a], starts, begin, limit);
-                    emitted = c->value_offsets[a] + vd->val_esz[a];
+            /* Complete nearby records before advancing through a source
+             * range. Whole-column passes repeatedly read/write the same large
+             * output buffer when several input fields share each record. */
+            int64_t chunk_rows = (64 * 1024) / c->record_size;
+            if (chunk_rows > AGG_SEL_CHUNK) chunk_rows = AGG_SEL_CHUNK;
+            if (chunk_rows < 1) chunk_rows = 1;
+            uint64_t chunk_starts[RAY_POOL_INIT_TASKS / 2];
+            for (int64_t chunk = begin; chunk < limit; chunk += chunk_rows) {
+                int64_t chunk_end = limit - chunk < chunk_rows ? limit : chunk + chunk_rows;
+                memcpy(chunk_starts, cursor, c->parts * sizeof(*cursor));
+                for (int64_t r = chunk; r < chunk_end; r++) {
+                    uint32_t slot = c->gids[r], part = slot & (c->parts - 1), gid = slot >> c->bits;
+                    char* dst = c->payload + cursor[part]++ * c->record_size;
+                    memcpy(dst, &gid, 4);
                 }
-                if (vd->val2_data[a] && c->value2_offsets[a] >= emitted) {
-                    agg_dense_partition_field(c, vd->val2_data[a], vd->val2_esz[a], c->value2_offsets[a], starts, begin, limit);
-                    emitted = c->value2_offsets[a] + vd->val2_esz[a];
+                size_t emitted = sizeof(uint32_t);
+                for (uint32_t a = 0; a < vd->n_aggs; a++) {
+                    if (vd->val_data[a] && c->value_offsets[a] >= emitted) {
+                        agg_dense_partition_field(c, vd->val_data[a], vd->val_esz[a], c->value_offsets[a], chunk_starts, chunk, chunk_end);
+                        emitted = c->value_offsets[a] + vd->val_esz[a];
+                    }
+                    if (vd->val2_data[a] && c->value2_offsets[a] >= emitted) {
+                        agg_dense_partition_field(c, vd->val2_data[a], vd->val2_esz[a], c->value2_offsets[a], chunk_starts, chunk, chunk_end);
+                        emitted = c->value2_offsets[a] + vd->val2_esz[a];
+                    }
                 }
             }
         }
