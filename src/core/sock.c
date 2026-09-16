@@ -38,6 +38,7 @@
   #include <fcntl.h>
   #include <netdb.h>
   #include <sys/socket.h>
+  #include <sys/un.h>
   #include <sys/time.h>
   #include <arpa/inet.h>
   #include <unistd.h>
@@ -356,4 +357,49 @@ ray_err_t ray_sock_set_blocking(ray_sock_t s)
         return RAY_ERR_IO;
 #endif
     return RAY_OK;
+}
+
+/* ===== Link locality ===== */
+
+bool ray_sock_addr_is_local(const void* sa, size_t salen)
+{
+    if (!sa || salen < sizeof(sa_family_t)) return false;
+    const struct sockaddr* a = (const struct sockaddr*)sa;
+
+    switch (a->sa_family) {
+#ifndef RAY_OS_WINDOWS
+    case AF_UNIX:
+        /* Same machine by construction. */
+        return true;
+#endif
+    case AF_INET: {
+        if (salen < sizeof(struct sockaddr_in)) return false;
+        const struct sockaddr_in* s4 = (const struct sockaddr_in*)sa;
+        /* The whole 127/8 block is loopback, not just 127.0.0.1. */
+        uint32_t h = ntohl(s4->sin_addr.s_addr);
+        return (h >> 24) == 127u;
+    }
+    case AF_INET6: {
+        if (salen < sizeof(struct sockaddr_in6)) return false;
+        const struct sockaddr_in6* s6 = (const struct sockaddr_in6*)sa;
+        const uint8_t* b = (const uint8_t*)&s6->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr)) return true;
+        /* A dual-stack listener reports a v4 peer as ::ffff:a.b.c.d, so
+         * unwrap the mapping before judging it. */
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) return b[12] == 127u;
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+bool ray_sock_peer_is_local(ray_sock_t s)
+{
+    if (s == RAY_INVALID_SOCK) return false;
+    struct sockaddr_storage ss;
+    socklen_t len = (socklen_t)sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+    if (getpeername((int)s, (struct sockaddr*)&ss, &len) != 0) return false;
+    return ray_sock_addr_is_local(&ss, (size_t)len);
 }

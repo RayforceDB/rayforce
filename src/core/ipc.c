@@ -76,7 +76,21 @@ static void mark_ipc_literal_fallbacks(ray_t* obj) {
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
                         uint8_t* dst, size_t dst_cap)
 {
-    if (len <= RAY_IPC_COMPRESS_THRESHOLD) return 0;
+    return ray_ipc_compress_at(src, len, dst, dst_cap,
+                               (size_t)RAY_IPC_COMPRESS_THRESHOLD);
+}
+
+size_t ray_ipc_link_threshold(ray_sock_t fd)
+{
+    return ray_sock_peer_is_local(fd) ? RAY_IPC_COMPRESS_NEVER
+                                      : (size_t)RAY_IPC_COMPRESS_THRESHOLD;
+}
+
+size_t ray_ipc_compress_at(const uint8_t* src, size_t len,
+                           uint8_t* dst, size_t dst_cap, size_t threshold)
+{
+    /* RAY_IPC_COMPRESS_NEVER is SIZE_MAX, so this rejects every length. */
+    if (len <= threshold) return 0;
 
     /* Step 1: delta-encode into temporary buffer */
     uint8_t* delta = (uint8_t*)ray_alloc_raw(len);
@@ -398,7 +412,7 @@ static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel)
     return 0;
 }
 
-static void send_response(ray_sock_t fd, ray_t* result)
+static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 {
     int64_t ser_size = ray_serde_size(result);
 
@@ -425,11 +439,11 @@ static void send_response(ray_sock_t fd, ray_t* result)
     size_t   send_len = 0;
     uint8_t  flags    = 0;
 
-    if ((size_t)ser_size > RAY_IPC_COMPRESS_THRESHOLD) {
+    if ((size_t)ser_size > threshold) {
         uint8_t* comp = (uint8_t*)ray_alloc_raw((size_t)ser_size);
         if (comp) {
-            size_t clen = ray_ipc_compress(payload, (size_t)ser_size,
-                                           comp, (size_t)ser_size);
+            size_t clen = ray_ipc_compress_at(payload, (size_t)ser_size,
+                                              comp, (size_t)ser_size, threshold);
             if (clen > 0 && clen + 4 < (size_t)ser_size) {
                 send_len = clen + 4;
                 send_buf = (uint8_t*)ray_alloc_raw(send_len);
@@ -723,6 +737,10 @@ typedef struct {
     ray_ipc_header_t hdr;
     uint8_t          phase;
     int64_t          listener_id;  /* id of the listener selector; -1 = outbound */
+    /* Compression policy for this link, resolved once when the connection
+     * is established (ray_ipc_link_threshold) so the send paths do not pay
+     * a getpeername per frame. */
+    size_t           compress_threshold;
     bool             auth_required;  /* server has -u/-U */
     bool             restricted;     /* server has -U */
     /* Sync round-trip state: while a ray_ipc_send waits on this conn it
@@ -818,6 +836,7 @@ static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
     cd->listener_id = sel->id;
     cd->auth_required = (poll->auth_secret[0] != '\0');
     cd->restricted    = poll->restricted;
+    cd->compress_threshold = ray_ipc_link_threshold(new_fd);
 
     ray_poll_reg_t reg = {0};
     reg.fd       = (int64_t)new_fd;
@@ -1048,7 +1067,12 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * write and let the poll/pump layer deregister it. */
         if (cur && cur->data == (void*)cd &&
             conn_tx_drain_blocking(poll, cur) == 0)
-            send_response((ray_sock_t)cur->fd, result);
+            {
+                ray_ipc_conn_data_t* rcd = (ray_ipc_conn_data_t*)cur->data;
+                send_response((ray_sock_t)cur->fd, result,
+                              rcd ? rcd->compress_threshold
+                                  : ray_ipc_link_threshold((ray_sock_t)cur->fd));
+            }
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
     /* The request is served: this is the end of the server's unit of work,
@@ -1228,7 +1252,7 @@ static void conn_on_payload(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
     ray_eval_set_restricted(prev);
 
     if (c->hdr.msgtype == RAY_IPC_MSG_SYNC)
-        send_response(c->fd, result);
+        send_response(c->fd, result, ray_ipc_link_threshold(c->fd));
     if (result != RAY_NULL_OBJ) ray_release(result);
     /* The request is served: this is the end of the server's unit of work,
      * and stamping here is what lets the poll loop tell an idle server from
@@ -1576,7 +1600,8 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
  * many connections it goes to: ray_mcast_pub shares one frame across
  * every subscriber's queue (#487). */
 static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
-                                        uint8_t extra_flags, ray_err_t* err_out)
+                                        uint8_t extra_flags, size_t threshold,
+                                        ray_err_t* err_out)
 {
     if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
@@ -1596,11 +1621,11 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
     size_t   send_len = 0;
     uint8_t  flags    = 0;
 
-    if ((size_t)ser_size > RAY_IPC_COMPRESS_THRESHOLD) {
+    if ((size_t)ser_size > threshold) {
         uint8_t* comp = (uint8_t*)ray_alloc_raw((size_t)ser_size);
         if (comp) {
-            size_t clen = ray_ipc_compress(payload, (size_t)ser_size,
-                                           comp, (size_t)ser_size);
+            size_t clen = ray_ipc_compress_at(payload, (size_t)ser_size,
+                                              comp, (size_t)ser_size, threshold);
             if (clen > 0 && clen + 4 < (size_t)ser_size) {
                 send_len = clen + 4;
                 send_buf = (uint8_t*)ray_alloc_raw(send_len);
@@ -1664,7 +1689,8 @@ static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
                               uint8_t extra_flags)
 {
     ray_err_t err = RAY_OK;
-    ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags, &err);
+    ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags,
+                                             ray_ipc_link_threshold(fd), &err);
     if (!frame) return -1;
     int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
     ray_poll_frame_release(frame);
@@ -1785,6 +1811,7 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     cd->phase       = RAY_IPC_PHASE_HEADER;
     cd->listener_id = -1;               /* outbound: on.open never fires, on.close does */
     cd->restricted  = poll->restricted; /* -U narrows pushed evals too */
+    cd->compress_threshold = ray_ipc_link_threshold(fd);
 
     ray_sock_set_nonblocking(fd);
 
@@ -2019,7 +2046,13 @@ ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out)
         owned = true;
     }
     ray_err_t err = RAY_OK;
-    ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0, &err);
+    /* One frame is shared by every subscriber of a topic (#487), so it
+     * cannot carry a per-peer policy: a mix of local and remote
+     * subscribers would need two framings.  Keep the compiled-in default
+     * here; the listener-level option is what topics inherit. */
+    ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0,
+                                             (size_t)RAY_IPC_COMPRESS_THRESHOLD,
+                                             &err);
     if (owned) ray_release(msg);
     if (!frame) return err == RAY_OK ? RAY_ERR_IO : err;
     *out = frame;

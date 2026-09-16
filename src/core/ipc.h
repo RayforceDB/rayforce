@@ -33,8 +33,22 @@
 
 #define RAY_IPC_COMPRESS_THRESHOLD 2000
 
+/* Sentinel threshold: no payload length can exceed it, so a link carrying
+ * it never compresses.  Compression is a sender-side, per-frame decision
+ * signalled by RAY_IPC_FLAG_COMPRESSED, so a link may skip it unilaterally
+ * without any negotiation — a peer on any build still reads the frame. */
+#define RAY_IPC_COMPRESS_NEVER ((size_t)-1)
+
+/* Compression policy for one link: loopback and UNIX-domain peers never
+ * compress (no bandwidth to buy with the CPU), everything else keeps the
+ * compiled-in default.  An unknown peer keeps the default. */
+size_t ray_ipc_link_threshold(ray_sock_t fd);
+
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
                         uint8_t* dst, size_t dst_cap);
+/* As ray_ipc_compress, with an explicit threshold instead of the default. */
+size_t ray_ipc_compress_at(const uint8_t* src, size_t len,
+                           uint8_t* dst, size_t dst_cap, size_t threshold);
 size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
                           uint8_t* dst, size_t dst_len);
 

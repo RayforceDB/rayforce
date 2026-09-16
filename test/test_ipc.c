@@ -54,6 +54,11 @@
 #define _GNU_SOURCE
 
 #include "test.h"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #include <rayforce.h>
 #include "core/ipc.h"
 #include "core/sock.h"
@@ -2141,6 +2146,160 @@ static test_result_t test_ipc_server_push(void) {
 
 /* ---- Registry ------------------------------------------------------------ */
 
+/* ---- Link locality -> compression policy (#541 layer 1) ----------------
+ * Compression is a sender-side, per-frame decision (the receiver honours
+ * RAY_IPC_FLAG_COMPRESSED), so a link may skip it unilaterally.  On
+ * loopback and UNIX-domain links there is no bandwidth to buy with the
+ * CPU, so those default to never compressing. */
+
+static test_result_t test_ipc_addr_local_ipv4_loopback(void) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
+    TEST_ASSERT_TRUE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+/* The whole 127/8 block is loopback, not just 127.0.0.1. */
+static test_result_t test_ipc_addr_local_ipv4_loopback_block(void) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET, "127.5.6.7", &sa.sin_addr), 1);
+    TEST_ASSERT_TRUE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+static test_result_t test_ipc_addr_local_ipv4_remote(void) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    /* A private-LAN peer is NOT local: same-host detection must not be
+     * confused with "cheap link" — that is layer 2's explicit option. */
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET, "10.0.0.5", &sa.sin_addr), 1);
+    TEST_ASSERT_FALSE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET, "8.8.8.8", &sa.sin_addr), 1);
+    TEST_ASSERT_FALSE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+static test_result_t test_ipc_addr_local_ipv6_loopback(void) {
+    struct sockaddr_in6 sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin6_family = AF_INET6;
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET6, "::1", &sa.sin6_addr), 1);
+    TEST_ASSERT_TRUE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+/* A v4-mapped loopback peer (::ffff:127.0.0.1) arrives on a dual-stack
+ * listener and is just as local. */
+static test_result_t test_ipc_addr_local_ipv6_mapped_loopback(void) {
+    struct sockaddr_in6 sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin6_family = AF_INET6;
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET6, "::ffff:127.0.0.1", &sa.sin6_addr), 1);
+    TEST_ASSERT_TRUE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+static test_result_t test_ipc_addr_local_ipv6_remote(void) {
+    struct sockaddr_in6 sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin6_family = AF_INET6;
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET6, "2001:db8::1", &sa.sin6_addr), 1);
+    TEST_ASSERT_FALSE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    /* A v4-mapped non-loopback peer must stay non-local. */
+    TEST_ASSERT_EQ_I(inet_pton(AF_INET6, "::ffff:10.0.0.5", &sa.sin6_addr), 1);
+    TEST_ASSERT_FALSE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+static test_result_t test_ipc_addr_local_af_unix(void) {
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    TEST_ASSERT_TRUE(ray_sock_addr_is_local(&sa, sizeof(sa)));
+    PASS();
+}
+
+static test_result_t test_ipc_addr_local_rejects_garbage(void) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    /* Too short to hold the address it claims: treat as non-local rather
+     * than reading past the end. */
+    TEST_ASSERT_FALSE(ray_sock_addr_is_local(&sa, 2));
+    TEST_ASSERT_FALSE(ray_sock_addr_is_local(NULL, sizeof(sa)));
+    PASS();
+}
+
+/* A real AF_UNIX pair resolves as local through getpeername. */
+static test_result_t test_ipc_peer_is_local_socketpair(void) {
+    int sv[2];
+    TEST_ASSERT_EQ_I(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    TEST_ASSERT_TRUE(ray_sock_peer_is_local((ray_sock_t)sv[0]));
+    TEST_ASSERT_TRUE(ray_sock_peer_is_local((ray_sock_t)sv[1]));
+    close(sv[0]);
+    close(sv[1]);
+    PASS();
+}
+
+/* An unconnected socket has no peer: getpeername fails, and an unknown
+ * peer must fall back to the compressing default, not to "local". */
+static test_result_t test_ipc_peer_is_local_unconnected(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT_TRUE(fd >= 0);
+    TEST_ASSERT_FALSE(ray_sock_peer_is_local((ray_sock_t)fd));
+    close(fd);
+    PASS();
+}
+
+static test_result_t test_ipc_peer_is_local_invalid_fd(void) {
+    TEST_ASSERT_FALSE(ray_sock_peer_is_local(RAY_INVALID_SOCK));
+    PASS();
+}
+
+/* The policy the send paths consult: local links never compress, others
+ * keep the compiled-in default. */
+static test_result_t test_ipc_link_threshold_local_vs_remote(void) {
+    int sv[2];
+    TEST_ASSERT_EQ_I(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    TEST_ASSERT_EQ_U(ray_ipc_link_threshold((ray_sock_t)sv[0]),
+                     RAY_IPC_COMPRESS_NEVER);
+    close(sv[0]);
+    close(sv[1]);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT_TRUE(fd >= 0);
+    TEST_ASSERT_EQ_U(ray_ipc_link_threshold((ray_sock_t)fd),
+                     (size_t)RAY_IPC_COMPRESS_THRESHOLD);
+    close(fd);
+    PASS();
+}
+
+/* RAY_IPC_COMPRESS_NEVER must actually suppress compression, not merely
+ * raise the bar: a payload far above the default threshold stays raw. */
+static test_result_t test_ipc_compress_never_suppresses(void) {
+    size_t n = (size_t)RAY_IPC_COMPRESS_THRESHOLD * 4;
+    uint8_t* src = (uint8_t*)ray_alloc_raw(n);
+    uint8_t* dst = (uint8_t*)ray_alloc_raw(n);
+    TEST_ASSERT_NOT_NULL(src);
+    TEST_ASSERT_NOT_NULL(dst);
+    memset(src, 0x5a, n);   /* highly compressible under delta+RLE */
+
+    /* Above the default threshold it compresses... */
+    TEST_ASSERT_TRUE(ray_ipc_compress_at(src, n, dst, n,
+                                         (size_t)RAY_IPC_COMPRESS_THRESHOLD) > 0);
+    /* ...and at NEVER it does not, however compressible the input is. */
+    TEST_ASSERT_EQ_U(ray_ipc_compress_at(src, n, dst, n,
+                                         RAY_IPC_COMPRESS_NEVER), 0);
+    ray_free_raw(src);
+    ray_free_raw(dst);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
@@ -2180,5 +2339,20 @@ const test_entry_t ipc_entries[] = {
     { "ipc/post_invalid_handle",         test_ipc_post_invalid_handle,            ipc_setup, ipc_teardown },
     { "ipc/post_non_serializable",       test_ipc_post_non_serializable,          ipc_setup, ipc_teardown },
     { "ipc/server_push",                 test_ipc_server_push,                    ipc_setup, ipc_teardown },
+    /* link locality -> compression policy (#541 layer 1) */
+    { "ipc/addr_local/ipv4_loopback",       test_ipc_addr_local_ipv4_loopback,        ipc_setup, ipc_teardown },
+    { "ipc/addr_local/ipv4_loopback_block", test_ipc_addr_local_ipv4_loopback_block,  ipc_setup, ipc_teardown },
+    { "ipc/addr_local/ipv4_remote",         test_ipc_addr_local_ipv4_remote,          ipc_setup, ipc_teardown },
+    { "ipc/addr_local/ipv6_loopback",       test_ipc_addr_local_ipv6_loopback,        ipc_setup, ipc_teardown },
+    { "ipc/addr_local/ipv6_mapped_loopback",test_ipc_addr_local_ipv6_mapped_loopback, ipc_setup, ipc_teardown },
+    { "ipc/addr_local/ipv6_remote",         test_ipc_addr_local_ipv6_remote,          ipc_setup, ipc_teardown },
+    { "ipc/addr_local/af_unix",             test_ipc_addr_local_af_unix,              ipc_setup, ipc_teardown },
+    { "ipc/addr_local/rejects_garbage",     test_ipc_addr_local_rejects_garbage,      ipc_setup, ipc_teardown },
+    { "ipc/peer_is_local/socketpair",       test_ipc_peer_is_local_socketpair,        ipc_setup, ipc_teardown },
+    { "ipc/peer_is_local/unconnected",      test_ipc_peer_is_local_unconnected,       ipc_setup, ipc_teardown },
+    { "ipc/peer_is_local/invalid_fd",       test_ipc_peer_is_local_invalid_fd,        ipc_setup, ipc_teardown },
+    { "ipc/link_threshold/local_vs_remote", test_ipc_link_threshold_local_vs_remote,  ipc_setup, ipc_teardown },
+    { "ipc/compress_never_suppresses",      test_ipc_compress_never_suppresses,       ipc_setup, ipc_teardown },
+
     { NULL, NULL, NULL, NULL },
 };
