@@ -2217,14 +2217,19 @@ void ray_group_dispatch(ray_pool_fn fn, void* context, const int64_t* counts, in
     for (int64_t g = 0; g < groups; g++) {
         int64_t next = counts[g] + 1;
         if (g > begin && cost + next > grain) {
+            assert(n < RAY_POOL_INIT_TASKS);
             tasks.begin[n] = begin; tasks.end[n++] = g; begin = g; cost = 0;
         }
         cost += next;
         if (cost >= grain) {
+            assert(n < RAY_POOL_INIT_TASKS);
             tasks.begin[n] = begin; tasks.end[n++] = g + 1; begin = g + 1; cost = 0;
         }
     }
-    if (begin < groups) { tasks.begin[n] = begin; tasks.end[n++] = groups; }
+    if (begin < groups) {
+        assert(n < RAY_POOL_INIT_TASKS);
+        tasks.begin[n] = begin; tasks.end[n++] = groups;
+    }
     ray_pool_dispatch_n(pool, group_work_run, &tasks, n);
 }
 
@@ -2268,6 +2273,7 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
         for (int64_t g = 0; g < groups; g++) if (counts[g] >= c.threshold) {
             winners[g] = -1;
             for (int64_t off = 0; off < counts[g]; off += grain) {
+                assert(tasks < RAY_POOL_INIT_TASKS);
                 c.partial[tasks].group = g;
                 c.partial[tasks].begin = offsets[g] + off;
                 c.partial[tasks].count = counts[g] - off < grain ? counts[g] - off : grain;

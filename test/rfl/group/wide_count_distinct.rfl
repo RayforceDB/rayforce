@@ -1,0 +1,138 @@
+;; Full-value equality must survive the count-distinct query rewrite.
+;; Every four rows contain (A,x), (A,y), (B,x), (B,x).
+;; The vocabulary differs only after a long shared prefix.
+(set r (til 131072))
+(set ki (at [0 0 1 1] (% r 4)))
+(set vi (at [0 1 0 0] (% r 4)))
+
+;; STR keys, STR values: pure rewrite, mixed aggregation, and selection.
+(set keys ["same sixteen byte prefix alpha" "same sixteen byte prefix omega"])
+(set vals ["same sixteen byte prefix alpha" "same sixteen byte prefix omega"])
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; STR keys, GUID values: pure rewrite, mixed aggregation, and selection.
+(set keys ["same sixteen byte prefix alpha" "same sixteen byte prefix omega"])
+(set vals (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002")))
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; STR keys, LIST values: pure rewrite, mixed aggregation, and selection.
+(set keys ["same sixteen byte prefix alpha" "same sixteen byte prefix omega"])
+(set vals (list [11 22 33 44 55] [11 22 33 44 66]))
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; GUID keys, STR values: pure rewrite, mixed aggregation, and selection.
+(set keys (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002")))
+(set vals ["same sixteen byte prefix alpha" "same sixteen byte prefix omega"])
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; GUID keys, GUID values: pure rewrite, mixed aggregation, and selection.
+(set keys (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002")))
+(set vals (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002")))
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; GUID keys, LIST values: pure rewrite, mixed aggregation, and selection.
+(set keys (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002")))
+(set vals (list [11 22 33 44 55] [11 22 33 44 66]))
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; LIST keys, STR values: pure rewrite, mixed aggregation, and selection.
+(set keys (list [11 22 33 44 55] [11 22 33 44 66]))
+(set vals ["same sixteen byte prefix alpha" "same sixteen byte prefix omega"])
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; LIST keys, GUID values: pure rewrite, mixed aggregation, and selection.
+(set keys (list [11 22 33 44 55] [11 22 33 44 66]))
+(set vals (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002")))
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; LIST keys, LIST values: pure rewrite, mixed aggregation, and selection.
+(set keys (list [11 22 33 44 55] [11 22 33 44 66]))
+(set vals (list [11 22 33 44 55] [11 22 33 44 66]))
+(set t (table [k v i] (list (at keys ki) (at vals vi) r)))
+(set result (select {from:t by:k n:(count (distinct v))}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(set result (select {from:t by:k n:(count (distinct v)) c:(count i)}))
+(at result 'k) -- keys
+(at result 'n) -- [2 1]
+(at result 'c) -- [65536 65536]
+(at (select {from:t by:k n:(count (distinct v)) where:(!= (% i 4) 1)}) 'n) -- [1 1]
+
+;; Two GUID fields plus a STR field exceed the former 16-byte key budget.
+;; The second GUID distinguishes keys whose first field is identical.
+(set ga (as 'GUID (list "11111111-1111-1111-1111-111111111111")))
+(set gb (as 'GUID (list "22222222-2222-2222-2222-222222222221" "22222222-2222-2222-2222-222222222222")))
+(set t (table [a b c v i] (list (at ga (* 0 r)) (at gb ki) (at ["common wide key"] (* 0 r)) (at ["identical prefix value a" "identical prefix value b"] vi) r)))
+(set result (select {from:t by:{a:a b:b c:c} n:(count (distinct v))}))
+(at result 'a) -- (at ga [0 0])
+(at result 'b) -- gb
+(at result 'c) -- ["common wide key" "common wide key"]
+(at result 'n) -- [2 1]
+(set result (select {from:t by:{a:a b:b c:c} n:(count (distinct v)) crows:(count i)}))
+(at result 'b) -- gb
+(at result 'n) -- [2 1]
+(at result 'crows) -- [65536 65536]

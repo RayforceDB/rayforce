@@ -3217,7 +3217,16 @@ static ray_t* empty_unary_group_result(ray_unary_fn fn, ray_t* source) {
     ray_t* value = fn(input);
     if (value && !RAY_IS_ERR(value) && ray_is_lazy(value)) value = ray_lazy_materialize(value);
     if (!value || RAY_IS_ERR(value)) {
-        ray_release(input); return value ? value : ray_error("domain", "aggregate produced no result");
+        ray_release(input);
+        if (!value) return ray_error("oom", NULL);
+        /* No group invokes this aggregate. An empty-input domain/type error
+         * only means its result type cannot be inferred; preserve the former
+         * empty LIST result. Resource failures still abort the query. */
+        const char* code = ray_err_code(value);
+        if (strcmp(code, "domain") && strcmp(code, "type")) return value;
+        ray_release(value);
+        ray_t* out = ray_list_new(0);
+        return out ? out : ray_error("oom", NULL);
     }
     ray_t* out;
     if (ray_is_atom(value) && -value->type == input->type) {

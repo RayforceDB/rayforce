@@ -11,6 +11,7 @@
 #include "ops/cdfuse.h"
 #include "ops/internal.h"
 #include "lang/internal.h"
+#include "lang/env.h"
 #include <math.h>
 
 static ray_runtime_t* contract_runtime;
@@ -1631,6 +1632,48 @@ static test_result_t test_parallel_dominant_consumers(void) {
     PASS();
 }
 
+/* Exercise inference failures without relying on allocator fault timing. */
+static const char* empty_probe_error;
+static ray_t* empty_probe(ray_t* input) {
+    (void)input;
+    return ray_error(empty_probe_error, "empty inference probe");
+}
+static test_result_t test_empty_inference_errors(void) {
+    ray_t* fn = ray_fn_unary("empty_probe", RAY_FN_AGGR, empty_probe);
+    TEST_ASSERT_NOT_NULL(fn);
+    ray_env_set(ray_sym_intern("empty_probe", 11), fn);
+    ray_release(fn);
+    const char* codes[] = {"domain", "type", "oom", "cancel"};
+    for (int i = 0; i < 4; i++) {
+        empty_probe_error = codes[i];
+        ray_t* out = ray_eval_str("(select {from:(table [k v] (list [1 2] [3 4])) by:k where:(< k 0) a:(empty_probe v)})");
+        TEST_ASSERT_NOT_NULL(out);
+        if (i < 2) {
+            TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+            TEST_ASSERT_EQ_I(ray_table_nrows(out), 0);
+            ray_t* col = ray_table_get_col(out, ray_sym_intern("a", 1));
+            TEST_ASSERT_NOT_NULL(col);
+            TEST_ASSERT_EQ_I(col->type, RAY_LIST);
+        } else {
+            TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+            TEST_ASSERT_STR_EQ(ray_err_code(out), codes[i]);
+        }
+        ray_release(out);
+    }
+    PASS();
+}
+
+static test_result_t test_nth_bounds(void) {
+    double values[] = {3.0, 1.0, 2.0};
+    TEST_ASSERT_TRUE(isnan(ray_nth_dbl_inplace(NULL, 0, 0)));
+    TEST_ASSERT_TRUE(isnan(ray_nth_dbl_inplace(values, 0, 0)));
+    TEST_ASSERT_TRUE(isnan(ray_nth_dbl_inplace(values, 3, -1)));
+    TEST_ASSERT_TRUE(isnan(ray_nth_dbl_inplace(values, 3, 3)));
+    TEST_ASSERT_TRUE(ray_nth_dbl_inplace(values, 3, 0) == 1.0);
+    TEST_ASSERT_TRUE(ray_nth_dbl_inplace(values, 3, 2) == 3.0);
+    PASS();
+}
+
 static test_result_t test_cancelled_group(void) {
     ray_t* tbl = ray_eval_str("(table [k v] (list [0 0 1 1] (as 'TIME [1 2 3 4])))");
     TEST_ASSERT_NOT_NULL(tbl); TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
@@ -1650,6 +1693,8 @@ static test_result_t test_cancelled_group(void) {
 }
 
 const test_entry_t agg_contract_entries[] = {
+    { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
+    { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },

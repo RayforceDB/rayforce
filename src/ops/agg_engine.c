@@ -451,12 +451,14 @@ static void agg_gather_native_run(void* raw, uint32_t wid, int64_t start, int64_
             } else memcpy(c->output + (size_t)i * (WIDTH), \
                           c->source + (size_t)row * (WIDTH), (WIDTH)); \
         }
+    assert(c->width > 0 && c->width <= sizeof(c->null_value));
     switch (c->width) {
         case 1: GATHER_NATIVE(1); break;
         case 2: GATHER_NATIVE(2); break;
         case 4: GATHER_NATIVE(4); break;
         case 8: GATHER_NATIVE(8); break;
         case 16: GATHER_NATIVE(16); break;
+        default: GATHER_NATIVE(c->width); break;
     }
     #undef GATHER_NATIVE
     if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
@@ -1359,11 +1361,17 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
     { int64_t i = 0;
-      for (int64_t s = 0; s < total_slots; s++)
+      /* Partition slabs interleave logical dense slots. Enumerate the logical
+       * domain so changing the execution strategy retains dense key order. */
+      for (int64_t logical = 0; logical < total_slots; logical++) {
+          int64_t s = key_bits
+              ? (logical & ((INT64_C(1) << key_bits) - 1)) * key_part_slots + (logical >> key_bits)
+              : logical;
           if (gfirst[s] != INT64_MAX) {
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
               occupied_slot[i] = s; i++;
           }
+      }
     }
 
     ray_t* result = ray_table_new(n_keys + n_aggs);
@@ -1512,6 +1520,7 @@ static void agg_dense_partition_count(void* raw, uint32_t wid, int64_t start, in
 static void agg_dense_partition_field(agg_dense_partition_ctx_t* c, const void* data,
         uint8_t width, size_t field, const uint64_t* starts, int64_t begin, int64_t end) {
     uint64_t cursor[RAY_POOL_INIT_TASKS / 2];
+    assert(c->parts <= RAY_POOL_INIT_TASKS / 2);
     memcpy(cursor, starts, c->parts * sizeof(*cursor));
     #define SCATTER_FIELD(W) do { \
         for (int64_t r = begin; r < end; r++) { \
@@ -1537,6 +1546,7 @@ static void agg_dense_partition_scatter(void* raw, uint32_t wid, int64_t start, 
         int64_t limit = task + 1 == c->sources ? c->rows : c->rows / c->sources * (task + 1);
         const uint64_t* starts = c->counts + task * c->parts;
         uint64_t cursor[RAY_POOL_INIT_TASKS / 2];
+        assert(c->parts <= RAY_POOL_INIT_TASKS / 2);
         memcpy(cursor, starts, c->parts * sizeof(*cursor));
         const agg_valdesc_t* vd = &c->values;
         if (vd->n_aggs == 1 && vd->val_data[0] && !vd->val2_data[0]) {
@@ -1710,6 +1720,9 @@ static size_t agg_partition_record(const agg_desc_t* d, uint32_t n,
 
 static uint32_t agg_dense_partition_parts(uint32_t sources, int64_t slots) {
     /* Leave room for skew subtasks; dispatch_n must never truncate work. */
+    _Static_assert(RAY_POOL_INIT_TASKS >= 2 &&
+        (RAY_POOL_INIT_TASKS & (RAY_POOL_INIT_TASKS - 1)) == 0,
+        "dense partition cursor capacity must be a power of two");
     uint32_t parts = 1;
     while (parts < RAY_POOL_INIT_TASKS / 2 &&
            (parts < sources * 4 || (int64_t)parts * 32768 < slots)) parts *= 2;
@@ -2000,6 +2013,9 @@ static ray_t* exec_group_v2_parallel_dense(
             return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
         }
 
+    /* dispatch_n has joined every task. If cancellation skipped a task, the
+     * check above returns before reading its bitmap; destroy also checks ready.
+     * Cancellation after this point cannot uninitialize a completed slab. */
     /* ── Phase B: merge task slabs into a global slab in parallel ── */
     char*    gstates  = ray_alloc_raw((size_t)total_slots * block);
     int64_t* gfirst   = ray_alloc_raw((size_t)total_slots * sizeof(int64_t));
