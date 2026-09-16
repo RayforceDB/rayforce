@@ -1,7 +1,7 @@
 # Grouping engine scaling results
 
-Status: synthetic acceptance is complete for `91569b8d`. This report contains
-only synthetic fixtures and generic engine validation. Delivery checks are in progress.
+Status: local acceptance is complete for `f61a4eda`. This report contains
+only synthetic fixtures and generic engine validation. Required PR checks gate merging.
 
 ## Method
 
@@ -17,17 +17,17 @@ oracles cover ordering, nulls, rank and distinct semantics.
 
 ## Correctness
 
-The following completed checks apply to revision `91569b8d`.
+The following completed checks apply to revision `f61a4eda`.
 
 - **2,700 fresh-process runs**, 77 synthetic cases, six worker settings and three rounds: all typed cold/warm result comparisons passed.
-- Complete ASan/UBSan suite: **3,826/3,826 passed**.
+- Complete ASan/UBSan suite: **3,828/3,828 passed**.
 - Targeted TSan: **24/24 passed**, `RAYFORCE_CORES=3` (four total threads), `setarch x86_64 -R`, no suppressions.
 - Coverage includes native widths, source symbol domains, structural LIST keys,
   stable row indices, dominant-group exact `med`/quantile, frequency ties,
   parallel top/bottom-K merges, adaptive symbol slices and typed empty output.
 
-TSan runs with five total threads stalled during pool shutdown before the
-aggregation checks; they are not counted as passes. The completed run used four
+Earlier TSan attempts with five total threads stalled during pool shutdown before
+the aggregation checks; they are not counted as passes. The final run used four
 total threads and reported no races. No pool implementation or suppression was
 changed to obtain that result.
 
@@ -45,65 +45,81 @@ retain every cold time, five warm times, result/binary hashes and peak RSS.
 
 | Synthetic case | Baseline, 28 | Current, 8 | Current, 28 | Baseline/current at 28 |
 |---|---:|---:|---:|---:|
-| `extrema-time` | 5.857 | 1.914 | 0.970 | 6.04x |
-| `sum-time` | 5.699 | 1.352 | 0.677 | 8.42x |
-| `sum-i64` | 6.460 | 0.730 | 0.713 | 9.07x |
-| `count` | 3.866 | 1.276 | 0.562 | 6.87x |
-| `statistics` | 9.655 | 1.947 | 1.330 | 7.26x |
-| `binary` | 18.892 | 3.655 | 2.356 | 8.02x |
-| `product` | 6.732 | 1.442 | 0.743 | 9.06x |
-| `truth` | 7.278 | 1.841 | 1.023 | 7.12x |
-| `median` | 5.860 | 3.195 | 1.975 | 2.97x |
-| `quantile` | 6.367 | 3.744 | 2.054 | 3.10x |
-| `mode` | 6.957 | 4.156 | 2.382 | 2.92x |
-| `top-bottom` | 8.914 | 5.772 | 4.354 | 2.05x |
-| `first-last` | 9.837 | 2.643 | 1.875 | 5.25x |
-| `distinct` | 12.875 | 5.739 | 4.500 | 2.86x |
-| `mixed` | 9.012 | 4.195 | 2.412 | 3.74x |
-| `composite` | 13.697 | 3.921 | 2.078 | 6.59x |
-| `selected` | 2.502 | 1.317 | 0.956 | 2.62x |
-| `sparse` | 7.352 | 7.960 | 5.407 | 1.36x |
-| `float-key` | 5.688 | 4.103 | 2.294 | 2.48x |
-| `string-key` | 8.623 | 2.354 | 1.525 | 5.66x |
-| `guid-key` | 10.565 | 2.869 | 3.411 | 3.10x |
-| `list-key` | 27.611 | 4.230 | 3.473 | 7.95x |
+| `extrema-time` | 6.379 | 1.816 | 0.958 | 6.66x |
+| `sum-time` | 5.228 | 1.098 | 0.678 | 7.72x |
+| `sum-i64` | 6.013 | 1.101 | 0.724 | 8.30x |
+| `count` | 3.350 | 1.249 | 0.571 | 5.86x |
+| `statistics` | 10.153 | 2.320 | 1.313 | 7.73x |
+| `binary` | 17.848 | 4.203 | 2.415 | 7.39x |
+| `product` | 5.789 | 1.221 | 0.737 | 7.85x |
+| `truth` | 8.331 | 1.802 | 1.004 | 8.30x |
+| `median` | 6.209 | 3.247 | 2.021 | 3.07x |
+| `quantile` | 6.110 | 3.323 | 2.022 | 3.02x |
+| `mode` | 6.682 | 4.346 | 2.264 | 2.95x |
+| `top-bottom` | 9.028 | 5.655 | 4.373 | 2.06x |
+| `first-last` | 9.594 | 2.808 | 1.738 | 5.52x |
+| `distinct` | 12.735 | 6.107 | 4.112 | 3.10x |
+| `mixed` | 8.763 | 3.857 | 2.397 | 3.66x |
+| `composite` | 13.981 | 3.886 | 2.119 | 6.60x |
+| `selected` | 2.525 | 1.191 | 0.968 | 2.61x |
+| `sparse` | 5.975 | 7.922 | 7.014 | 0.85x |
+| `float-key` | 6.357 | 4.220 | 2.208 | 2.88x |
+| `string-key` | 8.497 | 2.628 | 1.652 | 5.14x |
+| `guid-key` | 10.530 | 2.948 | 2.518 | 4.18x |
+| `list-key` | 27.750 | 3.764 | 2.762 | 10.05x |
 
-Aggregate costs differ. For example, the I64 sum is nearly flat from eight to
-28 workers in this fixture. The four-group GUID/mixed case has overlapping
-process ranges and a slower median at 28 than eight. These measurements do
-not establish linear scaling or a universal best worker count.
+Aggregate costs differ, and these measurements do not establish linear scaling
+or a universal best worker count. I64 sum improves from eight to 28 workers in
+this final sweep; its strategy changes from task-local state to partitioned
+state. The GUID case now splits medium-sized rank groups using the common
+parallel grain, closing the scheduling gap found during phase review.
 
-## Cold costs and low-worker tradeoffs
+## Cold costs and repeatability
 
-The main sweep retains the following regressions. They are included in the
-complete CSVs rather than excluded from the summary.
+The main sweep retains these regressions. The follow-up used five additional
+fresh processes per binary for every configuration that was over 5% slower in
+at least two main-sweep rounds: 13 configurations and **130 verified runs**.
+All [follow-up process records](../bench/groupby_shapes/results/2026-09-15/regression-repeat.csv)
+are retained; they do not replace the main samples.
 
-| Case / workers | Metric | Baseline ms | Current ms | Investigation |
-|---|---|---:|---:|---|
-| `clustered` / 8 | cold | 1.995 | 2.727 | Partition histogram/scatter setup; lower warm time |
-| `product` / 8 | cold | 2.353 | 3.191 | First slab allocation/initialization; follow-up cold ranges overlap |
-| `nonnull` / 8 | cold | 2.438 | 3.088 | Partition histogram/scatter setup; follow-up cold ranges overlap |
-| `float-key` / default | cold | 3.814 | 5.097 | Directory allocation/initialization and initial row-index writes |
-| `symbol-key` / 1 | cold | 1.184 | 1.313 | Small-domain accumulation and fixed setup |
-| `symbol-key` / 2 | warm | 0.496 | 0.548 | About 0.05 ms additional accumulation work |
-| `quantile` / 2 | warm | 7.077 | 8.521 | Variable in follow-up; five further processes show a 2% median difference |
+| Case / workers | Metric | Main baseline ms | Main current ms | Repeat baseline ms | Repeat current ms |
+|---|---|---:|---:|---:|---:|
+| `clustered` / 4 | cold | 1.700 | 2.588 | 2.248 | 1.709 |
+| `clustered` / 8 | cold | 2.145 | 2.596 | 1.938 | 2.506 |
+| `hot-min-descending` / 8 | cold | 1.446 | 2.047 | 1.409 | 2.099 |
+| `float-key` / default | cold | 3.841 | 4.994 | 3.921 | 5.040 |
+| `nonnull` / 8 | cold | 3.062 | 3.411 | 2.493 | 3.191 |
+| `product` / 8 | cold | 2.348 | 2.615 | 2.260 | 2.600 |
+| `symbol-key` / 2 | cold | 0.647 | 0.885 | 0.750 | 0.710 |
+| `symbol-key` / 2 | warm | 0.527 | 0.763 | 0.671 | 0.559 |
+| `sparse` / default | warm | 5.975 | 7.014 | 6.196 | 5.890 |
 
-[Phase profiles](../bench/groupby_shapes/results/2026-09-15/phase-profiles.csv)
-locate the cold costs in working-buffer allocation and first writes. For the
-clustered case at eight workers, histogram and scatter together take about
-2.0 ms cold versus 0.7 ms warm. For float keys at 28 workers, directory
-allocation/initialization and row-index filling account for most of the
-cold/warm difference. The partitioned/shared strategies reduce repeated state
-initialization and merging, while retaining this first-execution cost.
+Neither warm slowdown reproduced in the five-process follow-up. The symbol
+and sparse samples vary across runs; these fixtures support neither a fixed
+warm regression nor a universal speedup claim. The additional cold flags for
+`extrema-f32`, `sum-f64`, `truth`, `extrema-i32` and `sum-time` also did not
+retain a median regression above 5% in the follow-up.
 
-The small-domain symbol case spends the extra time in accumulation. Its
-candidate uses fixed 8,192-row ID batches and bounded task-local state; the
-baseline allocates an ID buffer for each whole source range. We retain the
-bounded working-memory strategy and report its low-worker latency cost.
-The [five-process follow-up](../bench/groupby_shapes/results/2026-09-15/low-worker-repeat.csv)
-measured symbol warm medians of 0.529 versus 0.578 ms, and quantile medians of
-7.035 versus 7.172 ms. The original quantile samples remain in the main report;
-the larger slowdown was not stable across fresh processes.
+Cold regressions remain for the eight-worker descending-min, clustered,
+nonnull and product fixtures, and for default-worker float keys. The
+[68 profiled runs](../bench/groupby_shapes/results/2026-09-15/phase-profiles.csv)
+place the extra time in slab allocation, histogram/scatter, directory setup
+and filling row indices:
+
+- Descending-min and product spend about 0.66 and 0.64 ms, respectively, in
+  cold slab allocation; the corresponding warm phase rounds to zero.
+- Clustered histogram/scatter takes about 1.83 ms cold versus 0.49 ms warm.
+- Float-key directory allocation/initialization takes about 1.05 ms cold
+  versus 0.09 ms warm; row-index filling takes 1.49 versus 0.59 ms.
+
+The bounded state and shared-directory strategies reduce repeated state
+initialization and merging, while retaining these first-execution costs.
+The report keeps those costs alongside the warm improvements.
+
+The rank profiles also confirm the medium-group scheduling change: the
+four-group GUID fixture now uses parallel rank selection within its groups.
+Small groups retain the direct consumer; task counts remain bounded by work
+and scratch storage. All query state is rebuilt per execution.
 
 ## Coverage ledger
 
@@ -129,15 +145,15 @@ and memory budget.
 
 ## Internal top/bottom-K kernel
 
-All **90 runs** at revision `91569b8d` matched the independent histogram oracle.
+All **90 runs** at revision `f61a4eda` matched the independent histogram oracle.
 These synthetic inputs have 4,000,003 rows; K above 1024 exercises the internal
 kernel, without changing the query language limit.
 
 | K | 1 worker warm ms | 8 workers warm ms | Default (28) warm ms |
 |---:|---:|---:|---:|
-| 1024 | 11.151 | 2.324 | 1.825 |
-| 65536 | 53.655 | 20.064 | 14.530 |
-| 4000003 | 756.862 | 150.147 | 94.078 |
+| 1024 | 11.206 | 2.148 | 1.795 |
+| 65536 | 53.571 | 20.432 | 17.512 |
+| 4000003 | 772.737 | 159.594 | 89.194 |
 
 Values are medians of the three process warm medians. The CSV in
 `bench/groupby_shapes/results/2026-09-15/topk.csv` retains process ranges,
@@ -156,3 +172,8 @@ python3 bench/groupby_shapes/grouping_scaling.py \
 python3 bench/groupby_shapes/summarize_scaling.py /tmp/grouping.json /tmp/grouping.csv \
   --process-output /tmp/grouping-processes.csv
 ```
+
+To investigate one configuration, use the same driver with, for example,
+`--cases symbol-key --workers 2 --rounds 5`. Add `--profile` for a separate
+phase-timing run; profiling measurements are kept separate from the main sweep
+and unprofiled repeats.

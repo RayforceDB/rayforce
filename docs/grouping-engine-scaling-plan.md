@@ -1,10 +1,11 @@
 # Grouping engine scaling plan
 
-Status: implementation and synthetic acceptance are complete at `91569b8d`.
-Final delivery checks are in progress. This extends the type-coverage plan.
+Status: implementation and local acceptance are complete at `f61a4eda`.
+The feature is ready for PR review into `dev`; required CI checks gate merging.
+This extends the type-coverage plan.
 
 Acceptance compares immutable release binaries with identical generated inputs.
-The rebased ASan/UBSan suite passes 3,826/3,826 tests. Current measurements
+The rebased ASan/UBSan suite passes 3,828/3,828 tests. Current measurements
 and reproducible commands are in [the results report](grouping-engine-scaling-results.md).
 
 ## Objective
@@ -34,7 +35,7 @@ additional data structures. Each family needs its own baseline and scaling proof
 
 The [results report](grouping-engine-scaling-results.md) links the complete
 900-configuration summary, all 2,700 process records, phase investigations and
-low-worker repeats. Baseline failures receive no speedup claim. Measured cold
+regression repeats. Baseline failures receive no speedup claim. Measured cold
 setup and bounded-memory tradeoffs remain explicit.
 
 ## Work-package status
@@ -42,10 +43,10 @@ setup and bounded-memory tradeoffs remain explicit.
 | Package | Status | Evidence |
 |---|---|---|
 | G0 — Baseline and census | Complete | Immutable baseline/candidate hashes; 77 cases and 2,700 typed process comparisons; complete timings and peak RSS |
-| G1 — Dense streaming | Implementation complete; final flat-scaling phase review pending | All streaming writers, unary/binary/mixed contracts, bounded state budget tests, dense route profiles and worker matrix |
+| G1 — Dense streaming | Complete | All streaming writers, unary/binary/mixed contracts, bounded state budget tests, dense route profiles and worker matrix |
 | G2 — Shared key layouts | Complete | Selection/composite/sparse/wide-key oracles and full worker matrix; shared stable row indices |
 | G3 — Ordered and distinct consumers | Complete | Dominant-group worker matrix, exact rank/order/frequency tests and 90 top/bottom-K histogram checks |
-| G4 — Acceptance and delivery | Validation review in progress; publication pending | ASan/UBSan 3,826/3,826, TSan 24/24 at four total threads, synthetic acceptance complete; final review before PR |
+| G4 — Acceptance and delivery | Local acceptance complete; ready for PR review | ASan/UBSan 3,828/3,828, TSan 24/24 at four total threads, 2,700 synthetic runs, 90 kernel oracles, 130 regression repeats and 68 profiles; immutable release and privacy checks |
 
 ## Work packages, in dependency order
 
@@ -144,9 +145,9 @@ The current min(time) result and passing tests do not close the whole plan.
 - Domain-aware symbol read views during immutable worker phases.
 - Typed empty output columns and corrected wide distinct admission.
 
-Full ASan/UBSan validation passes 3,826/3,826 tests; targeted TSan passes 24/24.
+Full ASan/UBSan validation passes 3,828/3,828 tests; targeted TSan passes 24/24.
 The complete synthetic acceptance and regression investigations are recorded in
-the results report. Publication remains the final delivery step.
+the results report. Integration is gated by the required PR checks.
 
 ## Dominant-group execution stages
 
@@ -155,7 +156,8 @@ when grouping itself scales. Consumer scheduling therefore considers rows
 within groups as well as independent groups:
 
 - First/last and wide extrema select candidates from contiguous row chunks and
-  merge them in original index order. Null-only chunks contribute no candidate.
+  merge them in original index order. For extrema, null-only chunks contribute
+  no candidate.
 - Small top/bottom K uses one bounded heap per source chunk, then selects from
   their union. Larger candidate sets merge in parallel. Large K first uses
   exact three-way selection, then sorts only the retained K rows and merges
@@ -167,6 +169,9 @@ within groups as well as independent groups:
   Equality checks resolve hash collisions. Counts carry the earliest original
   position, preserving ties even when source-row indices are reordered.
 - Median and quantile use exact parallel rank selection within large groups.
+  Splitting uses the common parallel grain and the per-worker row share, so a
+  few medium-sized groups can also use the pool. Histogram oracles cover the
+  grain boundary, medium groups and dominant groups.
 - Native output gathering writes disjoint result payload ranges and publishes
   null metadata after workers finish.
 

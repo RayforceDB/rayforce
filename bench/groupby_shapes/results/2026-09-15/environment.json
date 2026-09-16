@@ -25,9 +25,9 @@
   "baseline_revision": "bb81e6215321a7cf2cdd83d7223d62909804dee8",
   "governor": "powersave",
   "scaling_driver": "intel_pstate",
-  "candidate_revision": "91569b8d",
+  "candidate_revision": "f61a4eda",
   "baseline_sha256": "f9ed90d41e7bff92707a796e4677772351a23e53a6e148cf831a3feb92ae880e",
-  "candidate_sha256": "9829cf25c2079c3c381e21481b04726c2a8d8a849459a5facaf1aa700b92f97f",
+  "candidate_sha256": "1003a83830e8b12ae1cb86bdec98af3d649ae54404b59a1466ec31548b149353",
   "build_flags": "-O3 -march=native -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math",
   "physical_memory_kib": 65633828,
   "allowed_cpus": [
@@ -61,15 +61,17 @@
     27
   ],
   "kernel_baseline_sha256": "e174e083c2a474b6da59888401b742d784df685db28d8a0c63bf9e4ad424fe73",
-  "kernel_candidate_sha256": "785c2c7cd45af4b0d51666d757a289deed49a832efed5685bb584e518b80ab40",
-  "acceptance_status": "running",
-  "sanitizer_tests": "3826/3826",
+  "kernel_candidate_sha256": "96944ec28f56bdc442fbfc86b9578e9d553d97122976d3a2db6512fac1447825",
+  "acceptance_status": "complete",
+  "sanitizer_tests": "3828/3828",
   "thread_sanitizer_tests": "24/24",
   "kernel_oracle_runs": 90,
   "thread_sanitizer_command": "RAYFORCE_CORES=3 setarch x86_64 -R ./rayforce.test.tsan -f agg_contract",
   "synthetic_acceptance_status": "complete",
   "synthetic_query_runs": 2700,
   "synthetic_cases": 77,
-  "profile_runs": 96,
-  "low_worker_repeat_runs": 20
+  "profile_runs": 68,
+  "integration_base_revision": "cb6b0371",
+  "kernel_candidate_revision": "f61a4eda",
+  "regression_repeat_runs": 130
 }

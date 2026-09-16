@@ -1,5 +1,0 @@
-case,workers,binary,processes,cold_median_ms,cold_min_ms,cold_max_ms,warm_median_ms,warm_min_ms,warm_max_ms,peak_rss_kib
-quantile,2,baseline,5,8.46182,8.37864,10.352,7.03501,6.81817,7.07395,108468
-quantile,2,current,5,8.64425,8.59878,8.81514,7.17215,7.14019,7.8417,108428
-symbol-key,2,baseline,5,0.667705,0.638643,0.779798,0.529178,0.490624,0.541591,98196
-symbol-key,2,current,5,0.700812,0.694455,0.709671,0.577723,0.550278,0.600249,98220

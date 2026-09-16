@@ -32,7 +32,7 @@ def main():
     if not rows:
         parser.error('no measurements')
     with args.output.open('w', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     if args.process_output:
@@ -45,7 +45,7 @@ def main():
             row.update({f'warm_{i + 1}_ms': value for i, value in enumerate(record['warm_ms'])})
             process_rows.append(row)
         with args.process_output.open('w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(process_rows[0]))
+            writer = csv.DictWriter(stream, fieldnames=list(process_rows[0]), lineterminator="\n")
             writer.writeheader()
             writer.writerows(process_rows)
     pairs = {(row['case'], row['workers'], row['binary']): row for row in rows}
