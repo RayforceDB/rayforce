@@ -318,9 +318,10 @@ static test_result_t test_scratch_arena_direct_backing(void) {
                   + ray_block_data_bytes(a.backing[0]);
     TEST_ASSERT_TRUE(a.end <= cap_end);
 
-    /* Consequently the next push cannot be carved out of the leftover of
-     * a block that has none: it must take a backing of its own. */
-    size_t follow = 4u << 20;
+    /* A reused direct block may be larger than the request. Exceed its
+     * actual remaining capacity so the next push needs a new backing,
+     * independently of allocations made by earlier tests. */
+    size_t follow = (size_t)(cap_end - a.ptr) + (4u << 20);
     unsigned char* q = (unsigned char*)ray_scratch_arena_push(&a, follow);
     TEST_ASSERT_NOT_NULL(q);
     TEST_ASSERT_EQ_I(a.n_backing, 2);

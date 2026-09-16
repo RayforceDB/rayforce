@@ -42,17 +42,11 @@ void agg_route_reason(agg_v2_reason_t reason) {
 
 /* Read element `row` of an integer/temporal/SYM column widened to int64. */
 static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row);
-/* Write a finalized scalar cell into output column slot i, marking nulls. */
-static void agg_put_cell(ray_t* out, int64_t i, ray_t* cell);
 /* Dense direct-index serial grouping; defined below agg_run_one. */
 static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
                                 const dense_plan_t* dp, agg_groups_t* out);
 static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
                                     const dense_plan_t* dp, agg_groups_t* out);
-/* Binary-aggregate (pearson) serial driver; defined below agg_run_one. */
-ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
-                       const uint32_t* gids, int64_t nrows, int64_t ngroups,
-                       int64_t kparam);
 
 static bool agg_cancelled(void) {
     ray_pool_t* pool = ray_pool_get();
@@ -1098,6 +1092,19 @@ static void agg_dense_merge_fn(void* raw, uint32_t wid, int64_t start, int64_t e
     }
 }
 static inline bool agg_put_cell_value(ray_t* out, int64_t i, ray_t* cell);
+/* Caller owns null metadata: parallel emitters reduce this flag after the
+ * barrier, while serial emitters may set it immediately. LISTs retain their
+ * separate ownership-aware path. */
+static inline bool agg_finalize_value(const agg_vtable_t* vt, const void* state,
+                                      ray_t* out, int64_t i, int64_t param) {
+    if (vt->finalize_value)
+        return vt->finalize_value(state, (char*)ray_data(out) + (size_t)i * col_esz(out));
+    ray_t* cell = vt->finalize(state, NULL, param);
+    bool is_null = agg_put_cell_value(out, i, cell);
+    ray_release(cell);
+    return is_null;
+}
+
 typedef struct {
     const agg_vtable_t* vt;
     ray_t* out;
@@ -1110,15 +1117,9 @@ typedef struct {
 static void agg_dense_emit_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; agg_dense_emit_ctx_t* c = raw;
     bool any = false;
-    size_t esz = col_esz(c->out);
-    void* dst = ray_data(c->out);
     for (int64_t i = start; i < end; i++) {
         const void* st = c->states + (size_t)(c->slots ? c->slots[i] : i) * c->block + c->off;
-        if (c->vt->finalize_value) any |= c->vt->finalize_value(st, (char*)dst + (size_t)i * esz);
-        else {
-            ray_t* cell = c->vt->finalize(st, NULL, c->param);
-            any |= agg_put_cell_value(c->out, i, cell); ray_release(cell);
-        }
+        any |= agg_finalize_value(c->vt, st, c->out, i, c->param);
     }
     if (any) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
 }
@@ -1410,16 +1411,11 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             ray_pool_dispatch(pool, agg_dense_emit_fn, &emit, ng);
             if (atomic_load_explicit(&emit.any_null, memory_order_relaxed)) out->attrs |= RAY_ATTR_HAS_NULLS;
         } else {
-        for (int64_t i = 0; i < ng; i++) {
-            ray_t* cell = vts[a]->finalize(gstates + (size_t)occupied_slot[i] * block + off[a], NULL, kparam);
-            if (is_list) {
+            for (int64_t i = 0; i < ng; i++) {
+                ray_t* cell = vts[a]->finalize(gstates + (size_t)occupied_slot[i] * block + off[a], NULL, kparam);
                 out = ray_list_set(out, i, cell);   /* retains cell */
-                ray_release(cell);                  /* drop our local ref */
-            } else {
-                agg_put_cell(out, i, cell);
                 ray_release(cell);
             }
-        }
         }
         int64_t agg_name = agg_result_col_name(agg_syms[a], ext->agg_ops[a]);
         result = ray_table_add_col(result, agg_name, out);
@@ -2354,9 +2350,8 @@ static ray_t* exec_group_v2_parallel_smallhash(
         out->len = ng;
         int64_t kparam = (ext->agg_k ? ext->agg_k[a] : 0);
         for (int64_t i = 0; i < ng; i++) {
-            ray_t* cell = vts[a]->finalize(gt.states + (size_t)i * block + off[a], NULL, kparam);
-            agg_put_cell(out, i, cell);
-            ray_release(cell);
+            if (agg_finalize_value(vts[a], gt.states + (size_t)i * block + off[a], out, i, kparam))
+                out->attrs |= RAY_ATTR_HAS_NULLS;
         }
         int64_t agg_name = agg_result_col_name(agg_syms[a], ext->agg_ops[a]);
         result = ray_table_add_col(result, agg_name, out);
@@ -2862,7 +2857,7 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
  *   - Each worker writes disjoint output element ranges → no payload contention.
  *   - Per-group buffered states are read (finalize) here; the buffered destroy
  *     stays SERIAL afterward (agg_radix_parts_destroy) → exactly-once, no race.
- *   - agg_put_cell would OR RAY_ATTR_HAS_NULLS into the SHARED out->attrs (a
+ *   - a serial emitter would OR RAY_ATTR_HAS_NULLS into the SHARED out->attrs (a
  *     racy read-modify-write).  So the worker writes the null sentinel directly
  *     (disjoint idx, safe) and records a per-worker "saw null" flag; the caller
  *     ORs RAY_ATTR_HAS_NULLS once, serially, after the parallel pass.
@@ -2961,7 +2956,7 @@ typedef struct {
 
 /* Write a finalized scalar cell's payload at disjoint index i WITHOUT touching
  * the shared out->attrs flag; report null via the return value.  Byte-identical
- * to the serial agg_put_cell + ray_vec_set_null pair: a null cell stores the
+ * to serial emission followed by ray_vec_set_null: a null cell stores the
  * type's NULL sentinel (overwriting cell->f64/i64), matching ray_vec_set_null's
  * payload write — only the RAY_ATTR_HAS_NULLS flag set is deferred to the
  * caller (set once serially) to avoid a racy shared read-modify-write. */
@@ -2992,13 +2987,7 @@ static void agg_radix_finalize_fn(void* vctx, uint32_t wid, int64_t start, int64
             uint32_t p  = (uint32_t)(c->pairs[i].idx >> 32);
             uint32_t gg = (uint32_t)(c->pairs[i].idx & 0xffffffffu);
             const void* state = c->parts[p].states + (size_t)gg * c->block + c->off[a];
-            if (c->vts[a]->finalize_value) {
-                if (c->vts[a]->finalize_value(state, (char*)ray_data(out) + (size_t)i * col_esz(out))) any_null = true;
-            } else {
-                ray_t* cell = c->vts[a]->finalize(state, NULL, kparam);
-                if (agg_put_cell_value(out, i, cell)) any_null = true;
-                ray_release(cell);
-            }
+            any_null |= agg_finalize_value(c->vts[a], state, out, i, kparam);
         }
         if (any_null) c->saw_null[(size_t)wid * n_aggs + a] = 1;
     }
@@ -3451,13 +3440,13 @@ static ray_t* exec_group_v2_parallel_radix(
             for (int64_t i = 0; i < n_emit; i++) {
                 uint32_t p  = (uint32_t)(pairs[i].idx >> 32);
                 uint32_t gg = (uint32_t)(pairs[i].idx & 0xffffffffu);
-                ray_t* cell = vts[a]->finalize(parts[p].states + (size_t)gg * block + off[a], NULL, kparams[a]);
+                const void* state = parts[p].states + (size_t)gg * block + off[a];
                 if (is_list) {
+                    ray_t* cell = vts[a]->finalize(state, NULL, kparams[a]);
                     out = ray_list_set(out, i, cell);   /* retains cell */
-                    ray_release(cell);                  /* drop our local ref */
-                } else {
-                    agg_put_cell(out, i, cell);
                     ray_release(cell);
+                } else if (agg_finalize_value(vts[a], state, out, i, kparams[a])) {
+                    out->attrs |= RAY_ATTR_HAS_NULLS;
                 }
             }
             outs[a] = out;   /* ray_list_set may COW-realloc */
@@ -4271,7 +4260,8 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * multiplying large state slabs or retaining prior query state. */
             uint32_t extra_tasks = dense_workers * 4;
             if (extra_tasks > RAY_POOL_INIT_TASKS) extra_tasks = RAY_POOL_INIT_TASKS;
-            if (dense_workers > 1 && extra_tasks * slab_bytes <= scatter_budget / 8)
+            if (dense_workers > 1 && extra_tasks * slab_bytes <= scatter_budget / 8 &&
+                    (extra_tasks + 1.0) * slab_bytes + (double)eff_n * sizeof(uint32_t) <= dense_budget)
                 dense_workers = extra_tasks;
             route_stats.dense_tasks = dense_workers;
             route_stats.dense_local_slots = 0;
@@ -4476,14 +4466,6 @@ static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row
     }
 }
 
-/* Write a finalized scalar cell into output column slot i, marking nulls.
- * Shared by agg_run_one (serial) and the parallel finalize. */
-static void agg_put_cell(ray_t* out, int64_t i, ray_t* cell) {
-    if (agg_put_cell_value(out, i, cell))
-        ray_vec_set_null(out, i, true);
-
-}
-
 ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
                    const uint32_t* gids, int64_t nrows, int64_t ngroups,
                    int64_t kparam) {
@@ -4508,13 +4490,13 @@ ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
     }
     out->len = ngroups;
     for (int64_t gi = 0; gi < ngroups; gi++) {
-        ray_t* cell = vt->finalize(states + (size_t)gi * vt->state_size, NULL, kparam);
+        const void* state = states + (size_t)gi * vt->state_size;
         if (is_list) {
+            ray_t* cell = vt->finalize(state, NULL, kparam);
             out = ray_list_set(out, gi, cell);   /* retains cell */
-            ray_release(cell);                    /* drop our local ref */
-        } else {
-            agg_put_cell(out, gi, cell);
             ray_release(cell);
+        } else if (agg_finalize_value(vt, state, out, gi, kparam)) {
+            out->attrs |= RAY_ATTR_HAS_NULLS;
         }
         if (vt->destroy) vt->destroy(states + (size_t)gi * vt->state_size);
     }
@@ -4549,9 +4531,8 @@ ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
     }
     out->len = ngroups;
     for (int64_t gi = 0; gi < ngroups; gi++) {
-        ray_t* cell = vt->finalize(states + (size_t)gi * vt->state_size, NULL, kparam);
-        agg_put_cell(out, gi, cell);
-        ray_release(cell);
+        if (agg_finalize_value(vt, states + (size_t)gi * vt->state_size, out, gi, kparam))
+            out->attrs |= RAY_ATTR_HAS_NULLS;
         if (vt->destroy) vt->destroy(states + (size_t)gi * vt->state_size);
     }
     ray_free_raw(states);

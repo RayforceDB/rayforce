@@ -130,6 +130,9 @@ ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms
 ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
                    const uint32_t* gids, int64_t nrows, int64_t ngroups,
                    int64_t kparam);
+ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
+                       const uint32_t* gids, int64_t nrows, int64_t ngroups,
+                       int64_t kparam);
 
 /* ── Dense grouping eligibility selector (compact-range int/SYM keys) ──
  * When dense applies, a group id is the packed key offset (O(1) direct index)

@@ -6,6 +6,7 @@
 #include "ops/agg_engine.h"
 #include "ops/agg_registry.h"
 #include "core/pool.h"
+#include "mem/heap.h"
 #include "ops/fused_pred.h"
 #include "ops/cdfuse.h"
 #include "ops/internal.h"
@@ -140,6 +141,77 @@ static test_result_t test_unary_contracts(void) {
     PASS();
 }
 
+/* Exercise the direct serial emitter against scalar language semantics,
+ * including states with no rows, no live rows, and wrapped/null results. */
+static test_result_t test_native_streaming_output(void) {
+    const uint16_t ops[] = { OP_COUNT, OP_SUM, OP_AVG, OP_MIN, OP_MAX, OP_FIRST,
+        OP_LAST, OP_PROD, OP_VAR, OP_VAR_POP, OP_STDDEV, OP_STDDEV_POP, OP_ALL, OP_ANY, OP_MEDIAN };
+    const uint32_t gids[] = { 0, 0, 1, 1 };
+    for (size_t t = 0; t < 10; t++) {
+        int8_t type = unary_contracts[t].input;
+        for (int shape = 0; shape < 3; shape++) {
+            ray_t* v = contract_fixture(type);
+            if (shape == 1 && type != RAY_BOOL && type != RAY_U8) {
+                for (int i = 0; i < 4; i++) ray_vec_set_null(v, i, true);
+            } else if (shape == 2) {
+                if (type == RAY_I64) {
+                    int64_t* d = ray_data(v);
+                    d[0] = INT64_MAX; d[1] = 1; d[2] = INT64_MAX; d[3] = 2;
+                } else if (type == RAY_TIME) {
+                    int32_t* d = ray_data(v);
+                    d[0] = INT32_MAX; d[1] = 1; d[2] = INT32_MAX; d[3] = 2;
+                } else if (type == RAY_F64) {
+                    double* d = ray_data(v);
+                    d[0] = 1e308; d[1] = 1e308; d[2] = INFINITY; d[3] = -INFINITY;
+                }
+            }
+            ray_env_set(ray_sym_intern("v", 1), v);
+            for (size_t a = 0; a < sizeof(ops)/sizeof(ops[0]); a++) {
+                /* Integer grouped statistics intentionally retain wrapped
+                 * sum-of-squares semantics; scalar variance uses another
+                 * algorithm. Overflow here tests sum/product output only. */
+                if (shape == 2 && ops[a] != OP_SUM && ops[a] != OP_PROD) continue;
+                const agg_vtable_t* vt = agg_resolve(ops[a], type);
+                if (!vt || vt->kind != ACC_STREAMING) continue;
+                ray_t* out = agg_run_one(vt, v, gids, 4, 3, 0);
+                TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+                for (int g = 0; g < 3; g++) {
+                    /* Non-nullable extrema have no representable empty vector
+                     * cell; real grouping never emits an absent group. */
+                    if (g == 2 && (type == RAY_BOOL || type == RAY_U8) &&
+                            (ops[a] == OP_MIN || ops[a] == OP_MAX)) continue;
+                    char source[128];
+                    if (g == 2) snprintf(source, sizeof(source), "(%s (take v 0))", unary_names[a]);
+                    else snprintf(source, sizeof(source), "(%s (at v [%d %d]))", unary_names[a], 2*g, 2*g+1);
+                    /* Grouped product is null when there are no live rows. */
+                    ray_t* want = ops[a] == OP_PROD && (g == 2 ||
+                        (shape == 1 && type != RAY_BOOL && type != RAY_U8))
+                        ? ray_typed_null(-vt->out_type) : ray_eval_str(source);
+                    TEST_ASSERT_NOT_NULL(want); TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+                    ray_t* index = ray_i64(g);
+                    ray_t* got = ray_at_fn(out, index); ray_release(index);
+                    TEST_ASSERT_EQ_I(got->type, want->type);
+                    bool same;
+                    if (want->type == -RAY_F64)
+                        same = (isnan(got->f64) && isnan(want->f64)) ||
+                            fabs(got->f64 - want->f64) <= 1e-12 * fmax(1.0, fabs(want->f64));
+                    else {
+                        ray_t* gs = ray_fmt(got, 0); ray_t* ws = ray_fmt(want, 0);
+                        same = strcmp(ray_str_ptr(gs), ray_str_ptr(ws)) == 0;
+                        ray_release(gs); ray_release(ws);
+                    }
+                    if (RAY_ATOM_IS_NULL(want)) TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
+                    ray_release(got); ray_release(want);
+                    TEST_ASSERT_FMT(same, "native %s/%s shape %d group %d", unary_names[a], ray_type_name(type), shape, g);
+                }
+                ray_release(out);
+            }
+            ray_release(v);
+        }
+    }
+    PASS();
+}
+
 /* Registry presence and execution admission are different contracts: buffered
  * I64/F64 vtables exist today, but must not silently pass streaming admission. */
 static test_result_t test_registry_admission_contracts(void) {
@@ -176,6 +248,9 @@ static test_result_t test_registry_admission_contracts(void) {
                 ((op == OP_ALL || op == OP_ANY || binary) && numeric);
             const agg_vtable_t* vt = agg_resolve(op, type);
             TEST_ASSERT_FMT((vt != NULL) == registered, "registry %u/%s changed", op, ray_type_name(type));
+            if (vt && vt->kind == ACC_STREAMING)
+                TEST_ASSERT_FMT(vt->finalize_value != NULL,
+                                "streaming %u/%s must emit native values", op, ray_type_name(type));
             ray_graph_t* graph = ray_graph_new(tbl);
             ray_op_t* keys[] = { ray_scan(graph, "k") };
             ray_op_t* ins[] = { ray_scan(graph, "v") };
@@ -548,18 +623,29 @@ static test_result_t test_dense_task_local(void) {
         tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
         tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), val);
         ray_release(key); ray_release(val);
-        for (int repeat = 0; repeat < 2; repeat++) {
+        for (int repeat = 0; repeat < 3; repeat++) {
             ray_graph_t* graph = ray_graph_new(tbl);
             ray_op_t* keys[] = {ray_scan(graph, "k")};
             ray_op_t* values[] = {ray_scan(graph, "v"), ray_scan(graph, "v"), ray_scan(graph, "v")};
             uint16_t ops[] = {OP_MIN, OP_MAX, OP_COUNT};
             ray_op_t* group = ray_group(graph, keys, 1, ops, values, 3);
             agg_route_reset();
+            int64_t watermark = ray_heap_anon_watermark();
+            if (repeat == 2) {
+                /* Allow four task slabs and the final state, but not sixteen.
+                 * A small spill budget must constrain extra scheduling tasks. */
+                size_t block = 2 * agg_resolve(OP_MIN, RAY_TIME)->state_size
+                    + agg_resolve(OP_COUNT, RAY_TIME)->state_size;
+                int64_t slab = 321 * (block + sizeof(int64_t) + 1);
+                ray_heap_set_anon_watermark(4 * (n * (int64_t)sizeof(uint32_t) + 5 * slab));
+            }
             ray_t* out = ray_execute(graph, group);
+            ray_heap_set_anon_watermark(watermark);
             TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
             agg_route_stats_t stats = agg_route_stats();
             TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
             TEST_ASSERT_TRUE(stats.dense_tasks >= 4 && stats.dense_tasks <= 16);
+            if (repeat == 2) TEST_ASSERT_EQ_I(stats.dense_tasks, 4);
             TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
             TEST_ASSERT_EQ_I(stats.dense_local_slots, stats.dense_tasks * 321);
             TEST_ASSERT_EQ_I(ray_table_nrows(out), 193);
@@ -683,6 +769,38 @@ static test_result_t test_pairwise_numeric_contracts(void) {
             }
         }
     }
+    PASS();
+}
+
+static test_result_t test_native_binary_output(void) {
+    const uint16_t ops[] = { OP_PEARSON_CORR, OP_COV, OP_SCOV, OP_WSUM, OP_WAVG };
+    const double expected[][4] = {
+        {1.0, NULL_F64, NULL_F64, NULL_F64},
+        {0.5, 0.0, NULL_F64, NULL_F64},
+        {1.0, 0.0, NULL_F64, NULL_F64},
+        {10.0, 0.0, 0.0, 0.0},
+        {10.0/3.0, NULL_F64, NULL_F64, NULL_F64},
+    };
+    const double xs[] = {1, 2, 0, 0, NULL_F64, NULL_F64};
+    const double ys[] = {2, 4, 3, 5, 7, NULL_F64};
+    const uint32_t gids[] = {0, 0, 1, 1, 2, 2};
+    ray_t* x = ray_vec_new(RAY_F64, 6); x->len = 6;
+    ray_t* y = ray_vec_new(RAY_F64, 6); y->len = 6;
+    memcpy(ray_data(x), xs, sizeof(xs)); memcpy(ray_data(y), ys, sizeof(ys));
+    x->attrs |= RAY_ATTR_HAS_NULLS; y->attrs |= RAY_ATTR_HAS_NULLS;
+    for (size_t a = 0; a < sizeof(ops)/sizeof(ops[0]); a++) {
+        ray_t* out = agg_run_one_bin(agg_resolve(ops[a], RAY_F64), x, y, gids, 6, 4, 0);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        TEST_ASSERT_EQ_I(out->type, RAY_F64); TEST_ASSERT_EQ_I(out->len, 4);
+        for (int g = 0; g < 4; g++) {
+            if (isnan(expected[a][g])) {
+                TEST_ASSERT_TRUE(ray_vec_is_null(out, g));
+                TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
+            } else TEST_ASSERT_EQ_F(((double*)ray_data(out))[g], expected[a][g], 1e-12);
+        }
+        ray_release(out);
+    }
+    ray_release(x); ray_release(y);
     PASS();
 }
 
@@ -1523,6 +1641,8 @@ static test_result_t test_cancelled_group(void) {
 }
 
 const test_entry_t agg_contract_entries[] = {
+    { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
+    { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
