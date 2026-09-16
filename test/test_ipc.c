@@ -174,6 +174,50 @@ static void sleep_ms(long ms) {
 
 /* A listener confined to loopback binds and accepts a loopback connect;
  * an unparseable host is a loud io failure, never a silent INADDR_ANY. */
+/* ---- Shared poll-based server harness ----------------------------------
+ * The one way to stand up an IPC server in tests.  Mirrors test_mcast.c's
+ * start_server; the legacy ray_ipc_server_t path is being retired onto
+ * this. */
+typedef struct {
+    ray_poll_t*  poll;
+    ray_vm_t*    vm;
+} wire_srv_ctx_t;
+
+static wire_srv_ctx_t g_wire_ctx;
+
+static test_result_t wire_start_server(ray_poll_t** poll_out, uint16_t* port_out,
+                                       ray_vm_t** vm_out, ray_thread_t* tid_out) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+    int64_t listener_id = ray_ipc_listen(poll, 0);
+    TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
+    ray_selector_t* sel = ray_poll_get(poll, listener_id);
+    TEST_ASSERT_NOT_NULL(sel);
+    uint16_t port = get_listen_port((ray_sock_t)sel->fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(vm);
+    g_wire_ctx.poll = poll;
+    g_wire_ctx.vm   = vm;
+
+    static poll_thread_ctx_t pctx;
+    pctx.poll = poll; pctx.vm = vm; pctx.running = 1;
+    ray_thread_create(tid_out, (void(*)(void*))poll_server_thread_fn, &pctx);
+    sleep_ms(20);
+
+    *poll_out = poll; *port_out = port; *vm_out = vm;
+    PASS();
+}
+
+static void wire_stop_server(ray_poll_t* poll, uint16_t port,
+                             ray_vm_t* vm, ray_thread_t tid) {
+    poll_stop(poll, port);
+    ray_thread_join(tid);
+    ray_poll_destroy(poll);
+    ray_sys_free(vm);
+}
+
 static test_result_t test_ipc_listen_bind_addr(void) {
     ray_ipc_server_t srv;
     TEST_ASSERT_EQ_I(ray_ipc_server_init_at(&srv, "127.0.0.1", 0), RAY_OK);
@@ -2483,6 +2527,240 @@ static test_result_t test_ipc_open_opts_wrong_arg_type(void) {
     PASS();
 }
 
+/* ---- Wire-level characterization ---------------------------------------
+ * These drive a raw socket against a poll-based server and assert on the
+ * BYTES of the frames that come back — header fields and the compression
+ * flag — rather than on the deserialized result.
+ *
+ * They exist because the suite had no such coverage: a bug that framed
+ * every loopback response uncompressed when an explicit threshold asked
+ * for compression passed all 3800+ tests and was only caught by counting
+ * bytes on a socket outside the suite.  Anything that restructures the
+ * IPC server must keep these green. */
+
+/* Read exactly n bytes, or fail. */
+static int wire_recv_exact(ray_sock_t s, void* buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        int64_t r = ray_sock_recv(s, (uint8_t*)buf + got, n - got);
+        if (r <= 0) return -1;
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+/* Connect a raw socket and complete the 2-byte handshake. */
+static ray_sock_t wire_connect(uint16_t port) {
+    ray_sock_t s = ray_sock_connect("127.0.0.1", port, 2000);
+    if (s == RAY_INVALID_SOCK) return RAY_INVALID_SOCK;
+    uint8_t hs[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+    if (ray_sock_send(s, hs, 2) < 0) { ray_sock_close(s); return RAY_INVALID_SOCK; }
+    uint8_t resp[2];
+    if (wire_recv_exact(s, resp, 2) < 0 || resp[0] != RAY_SERDE_WIRE_VERSION) {
+        ray_sock_close(s);
+        return RAY_INVALID_SOCK;
+    }
+    return s;
+}
+
+/* Frame and send one message with an explicit msgtype, uncompressed. */
+static int wire_send(ray_sock_t s, uint8_t msgtype, ray_t* obj) {
+    int64_t n = ray_serde_size(obj);
+    if (n <= 0) return -1;
+    uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)n);
+    if (!payload) return -1;
+    ray_ser_raw(payload, obj);
+    ray_ipc_header_t hdr = {
+        .prefix  = RAY_SERDE_PREFIX,
+        .version = RAY_SERDE_WIRE_VERSION,
+        .flags   = 0,
+        .endian  = RAY_SERDE_ENDIAN,
+        .msgtype = msgtype,
+        .size    = n,
+    };
+    int rc = (ray_sock_send(s, &hdr, sizeof hdr) < 0 ||
+              ray_sock_send(s, payload, (size_t)n) < 0) ? -1 : 0;
+    ray_free_raw(payload);
+    return rc;
+}
+
+/* Every field of a RESP header, byte for byte. */
+static test_result_t test_ipc_wire_resp_header_fields(void) {
+    ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
+    test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    ray_sock_t s = wire_connect(port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+
+    ray_t* q = ray_str("(+ 20 22)", 9);
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_SYNC, q), 0);
+    ray_release(q);
+
+    ray_ipc_header_t hdr;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &hdr, sizeof hdr), 0);
+    TEST_ASSERT_EQ_U(hdr.prefix,  RAY_SERDE_PREFIX);
+    TEST_ASSERT_EQ_I(hdr.version, RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(hdr.endian,  RAY_SERDE_ENDIAN);
+    TEST_ASSERT_EQ_I(hdr.msgtype, RAY_IPC_MSG_RESP);
+    TEST_ASSERT_EQ_I(hdr.flags,   0);          /* tiny payload: never compressed */
+    TEST_ASSERT_TRUE(hdr.size > 0 && hdr.size < 256);
+
+    uint8_t* body = (uint8_t*)ray_alloc_raw((size_t)hdr.size);
+    TEST_ASSERT_NOT_NULL(body);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, body, (size_t)hdr.size), 0);
+    int64_t blen = hdr.size;
+    ray_t* val = ray_de_raw(body, &blen);
+    TEST_ASSERT_NOT_NULL(val);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(val));
+    TEST_ASSERT_EQ_I(val->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(val->i64, 42);
+    ray_release(val);
+    ray_free_raw(body);
+
+    ray_sock_close(s);
+    wire_stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+/* Layer 1 (#541) at the wire: a loopback peer gets raw frames however
+ * large and however compressible the result is. */
+static test_result_t test_ipc_wire_loopback_never_compressed(void) {
+    ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
+    test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    ray_sock_t s = wire_connect(port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+
+    /* 40k of a highly compressible run — far above the 2000 default. */
+    ray_t* q = ray_str("(take [7] 5000)", 15);
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_SYNC, q), 0);
+    ray_release(q);
+
+    ray_ipc_header_t hdr;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &hdr, sizeof hdr), 0);
+    TEST_ASSERT_EQ_I(hdr.msgtype, RAY_IPC_MSG_RESP);
+    TEST_ASSERT_TRUE(hdr.size > 2000);
+    /* The whole point: the compression bit stays clear on a local link. */
+    TEST_ASSERT_EQ_I(hdr.flags & RAY_IPC_FLAG_COMPRESSED, 0);
+
+    uint8_t* body = (uint8_t*)ray_alloc_raw((size_t)hdr.size);
+    TEST_ASSERT_NOT_NULL(body);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, body, (size_t)hdr.size), 0);
+    int64_t blen = hdr.size;
+    ray_t* val = ray_de_raw(body, &blen);
+    TEST_ASSERT_NOT_NULL(val);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(val));
+    TEST_ASSERT_EQ_I(val->len, 5000);
+    ray_release(val);
+    ray_free_raw(body);
+
+    ray_sock_close(s);
+    wire_stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+/* An ASYNC frame is evaluated and produces no reply at all. */
+static test_result_t test_ipc_wire_async_no_reply(void) {
+    ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
+    test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    ray_sock_t s = wire_connect(port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+
+    ray_t* q = ray_str("(set _wire_async 11)", 20);
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_ASYNC, q), 0);
+    ray_release(q);
+
+    /* Nothing comes back... */
+    TEST_ASSERT_EQ_I(ray_sock_wait_readable(s, 150), 0);
+
+    /* ...but it did run: read the binding back over a SYNC frame. */
+    ray_t* q2 = ray_str("(+ _wire_async 0)", 17);
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_SYNC, q2), 0);
+    ray_release(q2);
+
+    ray_ipc_header_t hdr;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &hdr, sizeof hdr), 0);
+    TEST_ASSERT_EQ_I(hdr.msgtype, RAY_IPC_MSG_RESP);
+    uint8_t* body = (uint8_t*)ray_alloc_raw((size_t)hdr.size);
+    TEST_ASSERT_NOT_NULL(body);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, body, (size_t)hdr.size), 0);
+    int64_t blen = hdr.size;
+    ray_t* val = ray_de_raw(body, &blen);
+    TEST_ASSERT_EQ_I(val->i64, 11);
+    ray_release(val);
+    ray_free_raw(body);
+
+    ray_sock_close(s);
+    wire_stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+/* A peer speaking another wire version is dropped without a reply. */
+static test_result_t test_ipc_wire_version_mismatch_drops(void) {
+    ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
+    test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    ray_sock_t s = ray_sock_connect("127.0.0.1", port, 2000);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    uint8_t hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
+    ray_sock_send(s, hs, 2);
+
+    /* The server deregisters instead of answering: readable with 0 bytes
+     * (EOF) rather than a 2-byte handshake reply. */
+    uint8_t resp[2];
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 2), -1);
+
+    ray_sock_close(s);
+    wire_stop_server(poll, port, vm, tid);
+    PASS();
+}
+
+/* CHARACTERIZATION OF A WART, not an endorsement: ipc_read_header does
+ * not validate msgtype, and ipc_read_payload treats anything that is not
+ * RESP as async — so an unknown msgtype is EVALUATED and silently
+ * answered with nothing.  Pinned here so a refactor cannot change it by
+ * accident; when msgtype validation lands this test should be updated
+ * deliberately to expect a dropped connection. */
+static test_result_t test_ipc_wire_unknown_msgtype_is_evaluated(void) {
+    ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
+    test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    ray_sock_t s = wire_connect(port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+
+    ray_t* q = ray_str("(set _wire_svc 99)", 18);
+    TEST_ASSERT_EQ_I(wire_send(s, 3 /* no such msgtype */, q), 0);
+    ray_release(q);
+
+    TEST_ASSERT_EQ_I(ray_sock_wait_readable(s, 150), 0);   /* no reply */
+
+    ray_t* q2 = ray_str("(+ _wire_svc 0)", 15);
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_SYNC, q2), 0);
+    ray_release(q2);
+
+    ray_ipc_header_t hdr;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &hdr, sizeof hdr), 0);
+    uint8_t* body = (uint8_t*)ray_alloc_raw((size_t)hdr.size);
+    TEST_ASSERT_NOT_NULL(body);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, body, (size_t)hdr.size), 0);
+    int64_t blen = hdr.size;
+    ray_t* val = ray_de_raw(body, &blen);
+    /* It ran. */
+    TEST_ASSERT_EQ_I(val->i64, 99);
+    ray_release(val);
+    ray_free_raw(body);
+
+    ray_sock_close(s);
+    wire_stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
@@ -2549,6 +2827,13 @@ const test_entry_t ipc_entries[] = {
     { "ipc/open_opts/timeout_null",      test_ipc_open_opts_timeout_null_is_default, ipc_setup, ipc_teardown },
     { "ipc/open_opts/empty_dict",        test_ipc_open_opts_empty_dict,          ipc_setup, ipc_teardown },
     { "ipc/open_opts/wrong_arg_type",    test_ipc_open_opts_wrong_arg_type,      ipc_setup, ipc_teardown },
+
+    /* wire-level characterization (refactor guard) */
+    { "ipc/wire/resp_header_fields",       test_ipc_wire_resp_header_fields,        ipc_setup, ipc_teardown },
+    { "ipc/wire/loopback_never_compressed",test_ipc_wire_loopback_never_compressed, ipc_setup, ipc_teardown },
+    { "ipc/wire/async_no_reply",           test_ipc_wire_async_no_reply,            ipc_setup, ipc_teardown },
+    { "ipc/wire/version_mismatch_drops",   test_ipc_wire_version_mismatch_drops,    ipc_setup, ipc_teardown },
+    { "ipc/wire/unknown_msgtype_evaluated",test_ipc_wire_unknown_msgtype_is_evaluated, ipc_setup, ipc_teardown },
 
     { NULL, NULL, NULL, NULL },
 };
