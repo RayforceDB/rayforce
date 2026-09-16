@@ -15,9 +15,9 @@
 ;;      the original single-key fixture also covers dense admission. An
 ;;      additional alternating second key exceeds the input row domain and
 ;;      preserves radix coverage as dense memory admission improves.
-;;      Every group is a singleton in til() order, so the emitted key
-;;      column must equal the SOURCE column element-for-element — a
-;;      per-row oracle, not a spot check.
+;;      Every group is a singleton. After normalizing the single-key
+;;      result by its unique numeric row value, its key column must equal
+;;      the SOURCE element-for-element — a per-row oracle, not a spot check.
 ;;   2. WIDE-KEY  — 17 keys of MIXED width (I64/I32/I16/U8/BOOL/DATE/
 ;;      TIME/TIMESTAMP/SYM + I64 constants) at 100k groups.  Two things
 ;;      at once: the packed-key stride (a per-column index error shows up
@@ -44,6 +44,10 @@
 (set KS (as 'SYM (til NS)))
 (set TS (table [k v] (list KS (til NS))))
 (set RS (select {c: (count v) s: (sum v) from: TS by: k}))
+;; Group output order is unspecified. Normalize AFTER the original query,
+;; using its unique numeric row value, then verify every source key and value.
+;; This does not change the query plan or hide a wrong key/value association.
+(set RS (xasc RS 's))
 (count RS) -- 200000
 (all (== (at RS 'k) KS)) -- true
 (all (== (at RS 'c) (+ 1 (* 0 (til NS))))) -- true

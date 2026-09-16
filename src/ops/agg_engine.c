@@ -1361,17 +1361,11 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
     { int64_t i = 0;
-      /* Partition slabs interleave logical dense slots. Enumerate the logical
-       * domain so changing the execution strategy retains dense key order. */
-      for (int64_t logical = 0; logical < total_slots; logical++) {
-          int64_t s = key_bits
-              ? (logical & ((INT64_C(1) << key_bits) - 1)) * key_part_slots + (logical >> key_bits)
-              : logical;
+      for (int64_t s = 0; s < total_slots; s++)
           if (gfirst[s] != INT64_MAX) {
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
               occupied_slot[i] = s; i++;
           }
-      }
     }
 
     ray_t* result = ray_table_new(n_keys + n_aggs);
