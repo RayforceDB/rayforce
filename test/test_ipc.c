@@ -2163,6 +2163,73 @@ static test_result_t test_ipc_open_opts_empty_dict(void) {
     PASS();
 }
 
+/* A dict whose keys are not symbols must be refused, not silently
+ * ignored.  ray_dict_find_idx returns -1 on a key-type mismatch rather
+ * than erroring, so skipping validation here would reinstate exactly the
+ * silent default the unknown-key check exists to prevent — and would
+ * accept a typo alongside it. */
+static test_result_t test_ipc_open_opts_string_keys_rejected(void) {
+    ray_t* k = ray_vec_new(RAY_STR, 1);
+    k->len = 1;
+    ray_t** kd = (ray_t**)ray_data(k);
+    kd[0] = ray_str("compress", 8);
+    ray_t* v = ray_list_new(1);
+    ray_t* val = ray_i64(0);
+    ray_list_append(v, val);
+    ray_release(val);
+    ray_t* d = ray_dict_new(k, v);
+
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(d);
+    PASS();
+}
+
+/* Keys built programmatically as a list of sym atoms still validate. */
+static test_result_t test_ipc_open_opts_list_sym_keys(void) {
+    ray_t* k = ray_list_new(1);
+    ray_t* ks = ray_sym(ray_sym_intern("compress", 8));
+    ray_list_append(k, ks);
+    ray_release(ks);
+    ray_t* v = ray_list_new(1);
+    ray_t* val = ray_i64(4096);
+    ray_list_append(v, val);
+    ray_release(val);
+    ray_t* d = ray_dict_new(k, v);
+
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_U(thr, 4096);
+    ray_release(d);
+    PASS();
+}
+
+/* ...and an unknown name in that form is still caught. */
+static test_result_t test_ipc_open_opts_list_sym_keys_unknown(void) {
+    ray_t* k = ray_list_new(1);
+    ray_t* ks = ray_sym(ray_sym_intern("compres", 7));
+    ray_list_append(k, ks);
+    ray_release(ks);
+    ray_t* v = ray_list_new(1);
+    ray_t* val = ray_i64(1);
+    ray_list_append(v, val);
+    ray_release(val);
+    ray_t* d = ray_dict_new(k, v);
+
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(d);
+    PASS();
+}
+
 static test_result_t test_ipc_open_opts_wrong_arg_type(void) {
     ray_t* a = ray_str("nope", 4);
     int    timeout = -1;
@@ -2171,6 +2238,53 @@ static test_result_t test_ipc_open_opts_wrong_arg_type(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(a);
+    PASS();
+}
+
+/* A compressed frame must survive a real socket round trip.
+ *
+ * Since #541 a loopback link never compresses, so every existing
+ * localhost test now exercises only the raw path — including
+ * ipc_diff.rfl's "compression boundary" section, whose comment claimed
+ * that coverage.  Force it back on for this connection and send a
+ * payload well past the threshold, so ray_ipc_compress on the way out
+ * and deser_frame's decompression on the way in are both exercised and
+ * the value is checked for equality, not just for arriving. */
+static test_result_t test_ipc_compressed_roundtrip(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+
+    /* threshold 0 = compress everything, overriding the loopback default */
+    int64_t h = ray_ipc_connect_opts("127.0.0.1", srv.port, NULL, NULL, 0, 0);
+    TEST_ASSERT((h) >= (0), "connected with compression forced");
+    TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h), 0);
+
+    /* A long, highly compressible source string: >2 KB serialized, and
+     * delta+RLE actually shrinks it, so the COMPRESSED branch is taken
+     * rather than falling back to raw on a poor ratio. */
+    size_t pad_len = 4096;
+    size_t cap     = pad_len + 64;
+    char*  expr    = (char*)ray_alloc_raw(cap);
+    TEST_ASSERT_NOT_NULL(expr);
+    int n = snprintf(expr, cap, "(count \"");
+    memset(expr + n, 'A', pad_len);
+    n += (int)pad_len;
+    n += snprintf(expr + n, cap - (size_t)n, "\")");
+
+    ray_t* msg = ray_str(expr, (size_t)n);
+    TEST_ASSERT_TRUE(ray_serde_size(msg) > 2000);
+    ray_t* r = ray_ipc_send(h, msg);
+    ray_release(msg);
+    ray_free_raw(expr);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r->i64, (int64_t)pad_len);   /* exact value, not just arrival */
+    ray_release(r);
+
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
     PASS();
 }
 
@@ -2472,6 +2586,11 @@ const test_entry_t ipc_entries[] = {
     { "ipc/open_opts/timeout_null",      test_ipc_open_opts_timeout_null_is_default, ipc_setup, ipc_teardown },
     { "ipc/open_opts/empty_dict",        test_ipc_open_opts_empty_dict,          ipc_setup, ipc_teardown },
     { "ipc/open_opts/wrong_arg_type",    test_ipc_open_opts_wrong_arg_type,      ipc_setup, ipc_teardown },
+    { "ipc/open_opts/string_keys_rejected", test_ipc_open_opts_string_keys_rejected, ipc_setup, ipc_teardown },
+    { "ipc/open_opts/list_sym_keys",        test_ipc_open_opts_list_sym_keys,        ipc_setup, ipc_teardown },
+    { "ipc/open_opts/list_sym_keys_unknown",test_ipc_open_opts_list_sym_keys_unknown,ipc_setup, ipc_teardown },
+
+    { "ipc/compressed_roundtrip",          test_ipc_compressed_roundtrip,           ipc_setup, ipc_teardown },
 
     /* wire-level characterization (refactor guard) */
     { "ipc/wire/resp_header_fields",       test_ipc_wire_resp_header_fields,        ipc_setup, ipc_teardown },

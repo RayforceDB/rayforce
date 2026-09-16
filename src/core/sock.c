@@ -38,7 +38,6 @@
   #include <fcntl.h>
   #include <netdb.h>
   #include <sys/socket.h>
-  #include <sys/un.h>
   #include <sys/time.h>
   #include <arpa/inet.h>
   #include <unistd.h>
@@ -363,7 +362,8 @@ ray_err_t ray_sock_set_blocking(ray_sock_t s)
 
 bool ray_sock_addr_is_local(const void* sa, size_t salen)
 {
-    if (!sa || salen < sizeof(sa_family_t)) return false;
+    /* sa_family_t is not a Win32 type; take the size from the member. */
+    if (!sa || salen < sizeof(((const struct sockaddr*)0)->sa_family)) return false;
     const struct sockaddr* a = (const struct sockaddr*)sa;
 
     switch (a->sa_family) {

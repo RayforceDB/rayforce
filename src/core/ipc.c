@@ -1702,8 +1702,11 @@ ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out)
     ray_err_t err = RAY_OK;
     /* One frame is shared by every subscriber of a topic (#487), so it
      * cannot carry a per-peer policy: a mix of local and remote
-     * subscribers would need two framings.  Keep the compiled-in default
-     * here; the listener-level option is what topics inherit. */
+     * subscribers would need two framings.  So this keeps the
+     * compiled-in default, which means local subscribers still pay
+     * decompression — there is no listener-level option for topics to
+     * inherit yet.  Bucketing a topic's subscribers into at most two
+     * framings is the way out, and is not in this PR. */
     ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0,
                                              (size_t)RAY_IPC_COMPRESS_THRESHOLD,
                                              &err);
@@ -1852,19 +1855,39 @@ ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
         return ray_error("type", ".ipc.open expects an integer timeout or an options dict, got %s",
                          ray_type_name(arg->type));
 
-    /* Reject unknown keys: a typo must not silently mean "default". */
+    /* Reject unknown keys: a typo must not silently mean "default".
+     *
+     * Every key must be a symbol and must be validated.  ray_dict_find_idx
+     * returns -1 on a key-type mismatch rather than erroring, so a dict
+     * keyed by anything else would make both lookups miss and this
+     * function return success with defaults — reinstating the very silent
+     * default this check exists to prevent, and swallowing a typo with
+     * it. */
     ray_t* keys = ray_dict_keys(arg);
-    if (keys && keys->type == RAY_SYM) {
-        const int64_t* kd = (const int64_t*)ray_data(keys);
+    if (keys && keys->len > 0) {
         for (int64_t i = 0; i < keys->len; i++) {
-            ray_t* ks = ray_sym_str(kd[i]);
-            size_t n = ks ? ray_str_len(ks) : 0;
-            const char* p = ks ? ray_str_ptr(ks) : "";
+            const char* p = NULL;
+            size_t      n = 0;
+            if (keys->type == RAY_SYM) {
+                const int64_t* kd = (const int64_t*)ray_data(keys);
+                ray_t* ks = ray_sym_str(kd[i]);
+                if (ks) { p = ray_str_ptr(ks); n = ray_str_len(ks); }
+            } else if (keys->type == RAY_LIST) {
+                ray_t* ke = ((ray_t**)ray_data(keys))[i];
+                if (!ke || ke->type != -RAY_SYM)
+                    return ray_error("type", ".ipc.open: option keys must be symbols, got %s",
+                                     ke ? ray_type_name(ke->type) : "null");
+                ray_t* ks = ray_sym_str(ke->i64);
+                if (ks) { p = ray_str_ptr(ks); n = ray_str_len(ks); }
+            } else {
+                return ray_error("type", ".ipc.open: option keys must be symbols, got %s",
+                                 ray_type_name(keys->type));
+            }
             bool known = (n == 7 && memcmp(p, "timeout",  7) == 0)
                       || (n == 8 && memcmp(p, "compress", 8) == 0);
             if (!known)
                 return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout` or `compress`)",
-                                 (int)n, p);
+                                 (int)n, p ? p : "");
         }
     }
 

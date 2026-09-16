@@ -35,3 +35,10 @@
 
 ;; a second argument that is neither an integer nor a dict
 (.ipc.open "127.0.0.1:19974" "soon") !- type
+
+;; string keys are NOT symbols: dict lookups would miss and every option
+;; would silently default, so the whole dict is refused up front.
+(.ipc.open "127.0.0.1:19974" (dict ["compress"] [0N])) !- type
+(.ipc.open "127.0.0.1:19974" (dict ["timeout"] [200])) !- type
+;; ...including a typo that would otherwise be swallowed with them
+(.ipc.open "127.0.0.1:19974" (dict ["compres"] [0N])) !- type

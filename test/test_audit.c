@@ -1540,9 +1540,14 @@ static test_result_t test_public_runtime_api_not_redeclared(void) {
  * The send paths therefore take conn_threshold(sel), which prefers the
  * stored value.  ray_ipc_link_threshold belongs only where a connection
  * is being set up (ipc_accept / ray_ipc_connect_opts) or where there is
- * no conn data at all (the legacy server path, conn_threshold's own
- * fallback).  Guard that: no conn_write_msg or conn_frame_msg call may
+ * no conn data at all (conn_threshold's own fallback).  Guard that: no conn_write_msg or conn_frame_msg call may
  * pass it.
+ *
+ * This is a tripwire, not a proof: it matches source text with strstr,
+ * uses ';' as a statement terminator and a 3-line proximity window, so
+ * reformatting the calls it guards can silently defeat it.  It catches
+ * the specific regression that already happened once; it does not
+ * enforce the invariant in general.
  * ------------------------------------------------------------------ */
 static test_result_t test_audit_conn_threshold_not_rederived(void) {
     FILE* f = fopen("src/core/ipc.c", "r");
