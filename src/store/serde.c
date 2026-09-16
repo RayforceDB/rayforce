@@ -33,6 +33,7 @@
 #include "vec/str.h"
 #include "vec/vec.h"
 #include "ops/ops.h"
+#include "ops/hash.h"
 
 #ifndef RAY_OS_WINDOWS
 #  include <unistd.h>
@@ -704,16 +705,83 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         if (!vec || RAY_IS_ERR(vec)) return vec;
         vec->len = l;
         int64_t* ids = (int64_t*)ray_data(vec);
-        for (int64_t i = 0; i < l; i++) {
-            size_t slen = safe_strlen(buf, *len);
-            if ((int64_t)slen >= *len) {
-                vec->len = i;
+        if (l > 0) {
+            /* Interning cell by cell takes the global sym lock once per row,
+             * so a column of two distinct values still pays l full interns.
+             * Instead: dedupe lock-free, then intern the distinct strings
+             * once, under a single lock. */
+            size_t cap = 16;
+            while (cap < (size_t)l * 2) cap <<= 1;
+            size_t nd_max = (size_t)l;
+            size_t work_sz = cap * sizeof(uint32_t)
+                           + nd_max * (sizeof(uint32_t) + sizeof(const char*) +
+                                       sizeof(size_t) + sizeof(int64_t));
+            uint8_t* work = (uint8_t*)ray_alloc_raw(work_sz);
+            if (!work) {
+                vec->len = 0;
                 ray_release(vec);
-                return ray_error("domain", "deserialize sym vector: unterminated sym at index %lld, no NUL within %lld bytes", (long long)i, (long long)*len);
+                return ray_error("oom", "deserialize sym vector: scratch alloc failed");
             }
-            ids[i] = ray_sym_intern((const char*)buf, slen);
-            buf += slen + 1;
-            *len -= (int64_t)slen + 1;
+            /* slots holds distinct-index + 1, so 0 means "empty bucket".
+             * nd <= l <= 1e9 (range-checked above), so 32 bits suffice, and
+             * only this region needs zeroing — the d_* arrays are written
+             * before they are read.  cap is a power of two, so the 8-byte
+             * arrays that follow stay 8-byte aligned; the 4-byte hashes go
+             * last so alignment holds whatever nd_max is. */
+            memset(work, 0, cap * sizeof(uint32_t));
+            uint32_t*    slots  = (uint32_t*)work;
+            uint8_t*     cur    = work + cap * sizeof(uint32_t);
+            const char** d_str  = (const char**)cur; cur += nd_max * sizeof(const char*);
+            size_t*      d_len  = (size_t*)cur;      cur += nd_max * sizeof(size_t);
+            int64_t*     d_id   = (int64_t*)cur;     cur += nd_max * sizeof(int64_t);
+            uint32_t*    d_hash = (uint32_t*)cur;
+            int64_t      nd     = 0;
+
+            /* Pass 1, lock-free: delimit and hash every cell, dedupe into a
+             * local open-addressing table.  ids[i] temporarily holds the
+             * cell's distinct index. */
+            for (int64_t i = 0; i < l; i++) {
+                size_t slen = safe_strlen(buf, *len);
+                if ((int64_t)slen >= *len) {
+                    ray_free_raw(work);
+                    vec->len = 0;
+                    ray_release(vec);
+                    return ray_error("domain", "deserialize sym vector: unterminated sym at index %lld, no NUL within %lld bytes", (long long)i, (long long)*len);
+                }
+                uint32_t h = (uint32_t)ray_hash_bytes((const char*)buf, slen);
+                size_t   s = h & (cap - 1);
+                int64_t  e;
+                for (;;) {
+                    uint32_t v = slots[s];
+                    if (v == 0) {
+                        e = nd++;
+                        d_hash[e] = h;
+                        d_str[e]  = (const char*)buf;
+                        d_len[e]  = slen;
+                        slots[s]  = (uint32_t)(e + 1);
+                        break;
+                    }
+                    e = (int64_t)v - 1;
+                    if (d_hash[e] == h && d_len[e] == slen &&
+                        memcmp(d_str[e], buf, slen) == 0) break;
+                    s = (s + 1) & (cap - 1);
+                }
+                ids[i] = e;
+                buf += slen + 1;
+                *len -= (int64_t)slen + 1;
+            }
+
+            /* Pass 2: one lock, one probe per distinct string. */
+            if (ray_sym_intern_batch(d_hash, d_str, d_len, nd, d_id) < 0) {
+                ray_free_raw(work);
+                vec->len = 0;
+                ray_release(vec);
+                return ray_error("oom", "deserialize sym vector: intern failed");
+            }
+
+            /* Pass 3: distinct index -> sym id. */
+            for (int64_t i = 0; i < l; i++) ids[i] = d_id[ids[i]];
+            ray_free_raw(work);
         }
 
         if (attrs & RAY_ATTR_HAS_NULLS) vec->attrs |= RAY_ATTR_HAS_NULLS;
