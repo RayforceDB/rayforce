@@ -22,13 +22,12 @@
   ],
   "fresh_processes_per_case": 3,
   "warm_executions_per_process": 5,
-  "baseline_revision": "bb81e621",
+  "baseline_revision": "bb81e6215321a7cf2cdd83d7223d62909804dee8",
   "governor": "powersave",
   "scaling_driver": "intel_pstate",
-  "candidate_revision": "4326fb61",
-  "implementation_revision": "27b1830f",
-  "baseline_sha256": "4ed216820289c8ee65025566ab36e8ca44b2108caeea56a64e10d1c32f0f7c00",
-  "candidate_sha256": "59636889903e01de213243acac6696462c3d4a2870a49764514500a30ee978a1",
+  "candidate_revision": "91569b8d",
+  "baseline_sha256": "f9ed90d41e7bff92707a796e4677772351a23e53a6e148cf831a3feb92ae880e",
+  "candidate_sha256": "9829cf25c2079c3c381e21481b04726c2a8d8a849459a5facaf1aa700b92f97f",
   "build_flags": "-O3 -march=native -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math",
   "physical_memory_kib": 65633828,
   "allowed_cpus": [
@@ -60,5 +59,17 @@
     25,
     26,
     27
-  ]
+  ],
+  "kernel_baseline_sha256": "e174e083c2a474b6da59888401b742d784df685db28d8a0c63bf9e4ad424fe73",
+  "kernel_candidate_sha256": "785c2c7cd45af4b0d51666d757a289deed49a832efed5685bb584e518b80ab40",
+  "acceptance_status": "running",
+  "sanitizer_tests": "3826/3826",
+  "thread_sanitizer_tests": "24/24",
+  "kernel_oracle_runs": 90,
+  "thread_sanitizer_command": "RAYFORCE_CORES=3 setarch x86_64 -R ./rayforce.test.tsan -f agg_contract",
+  "synthetic_acceptance_status": "complete",
+  "synthetic_query_runs": 2700,
+  "synthetic_cases": 77,
+  "profile_runs": 96,
+  "low_worker_repeat_runs": 20
 }

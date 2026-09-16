@@ -24,14 +24,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', type=Path)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--process-output', type=Path,
+                        help='also retain each process and all five warm timings')
     args = parser.parse_args()
-    rows = list(summarize(json.loads(args.input.read_text())))
+    records = json.loads(args.input.read_text())
+    rows = list(summarize(records))
     if not rows:
         parser.error('no measurements')
     with args.output.open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    if args.process_output:
+        process_rows = []
+        for record in records:
+            row = {key: record[key] for key in (
+                'case', 'workers', 'binary', 'sha256', 'round', 'rows', 'groups',
+                'cold_ms', 'peak_rss_kib', 'result_sha256')}
+            row['warm_median_ms'] = statistics.median(record['warm_ms'])
+            row.update({f'warm_{i + 1}_ms': value for i, value in enumerate(record['warm_ms'])})
+            process_rows.append(row)
+        with args.process_output.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(process_rows[0]))
+            writer.writeheader()
+            writer.writerows(process_rows)
     pairs = {(row['case'], row['workers'], row['binary']): row for row in rows}
     for row in rows:
         old = pairs.get((row['case'], row['workers'], 'baseline'))

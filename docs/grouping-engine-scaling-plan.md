@@ -1,11 +1,10 @@
 # Grouping engine scaling plan
 
-Status: implementation and acceptance in progress. Dense, shared indexed, wide
-consumer and distinct changes are implemented locally; the final worker sweep
-and delivery are pending. This extends the type-coverage plan.
+Status: implementation and synthetic acceptance are complete at `91569b8d`.
+Final delivery checks are in progress. This extends the type-coverage plan.
 
 Acceptance compares immutable release binaries with identical generated inputs.
-The rebased ASan/UBSan suite passes 3,824/3,824 tests. Current measurements
+The rebased ASan/UBSan suite passes 3,826/3,826 tests. Current measurements
 and reproducible commands are in [the results report](grouping-engine-scaling-results.md).
 
 ## Objective
@@ -19,19 +18,34 @@ Equal latency across aggregates is not an acceptance criterion. Sum consumes
 every valid value; extrema can avoid updates; exact median and distinct need
 additional data structures. Each family needs its own baseline and scaling proof.
 
-## Current implementation and gaps
+## Implementation and evidence
 
-| Family / shape | Current execution | Remaining proof or implementation |
+| Family / shape | Execution | Completed evidence |
 |---|---|---|
-| BOOL/U8/I16/I32/DATE/TIME min/max, eligible dense single key | Shared state through explicit concurrent-update capability | Adversarial value order, key skew, nullable values, contention crossover |
-| Numeric sums, count, average, statistics, product, boolean and binary reductions | Partitioned dense for eligible single keys; task-local or radix otherwise | Separate aggregate scaling on synthetic fixtures, mixed aggregates, payload and state traffic |
-| I64/TIMESTAMP/F32/F64 extrema | Partitioned dense | Measure before considering additional shared kernels; preserve NaN and null contracts |
-| Selected and composite dense keys | Partitioned native payload; selected source-row indices shared across inputs | Final repeated scaling sweep |
-| Sparse integer/temporal/SYM keys | Radix | Measure scatter, skew, merge and output costs across cardinalities |
-| Float, STR, GUID and other supported wide keys | Shared parallel directory with complete key equality and deterministic first-row IDs | Final repeated scaling sweep and race checks |
-| First/last, wide extrema, median, quantile, mode, top/bottom K | Shared stable row slices; row-balanced groups and splitting within dominant groups | Final repeated scaling sweep and race checks |
-| Count-distinct | Pair-hash partitioning; parallel radix ordering and output | Large ordering oracle and final repeated scaling sweep |
-| Mixed streaming/indexed aggregates and expressions | Shared groups and stable row slices; streaming tasks split by rows | Final repeated scaling sweep |
+| BOOL/U8/I16/I32/DATE/TIME min/max, eligible dense single key | Shared state through explicit concurrent-update capability | Native/null contracts; adversarial value order and dominant-key cases at every worker count |
+| Numeric sums, count, average, statistics, product, boolean and binary reductions | Bounded partitioned or task-local dense states; native scalar output | Registry-wide writer contracts, independent arithmetic oracles and separate family timings |
+| I64/TIMESTAMP/F32/F64 extrema | Partitioned dense | Native-width, null and non-finite contracts; repeated worker sweep |
+| Selected and composite dense keys | Deduplicated native payload and shared source-row indices | Selected-row identity, empty selection and composite/mixed contracts; worker sweep |
+| Sparse integer/temporal/SYM keys | Radix | Sparse/skew/null matrix; phase profiles and memory measurements |
+| Float, STR, GUID and LIST keys | Shared parallel directory with complete equality and deterministic first-row IDs | Full-value/canonicalization oracles, race checks and repeated worker sweep |
+| First/last, wide extrema, median, quantile, mode, top/bottom K | Shared stable row slices, row-balanced groups and dominant-group splitting | Independent order/rank/frequency oracles; 90 internal K runs; dominant-group worker sweep |
+| Count-distinct | Pair-hash partitioning and parallel stable output ordering | Native/wide value and ordering oracles; repeated worker sweep |
+| Mixed streaming/indexed aggregates and expressions | Shared groups and stable row slices | Independent mixed contracts and repeated worker sweep |
+
+The [results report](grouping-engine-scaling-results.md) links the complete
+900-configuration summary, all 2,700 process records, phase investigations and
+low-worker repeats. Baseline failures receive no speedup claim. Measured cold
+setup and bounded-memory tradeoffs remain explicit.
+
+## Work-package status
+
+| Package | Status | Evidence |
+|---|---|---|
+| G0 — Baseline and census | Complete | Immutable baseline/candidate hashes; 77 cases and 2,700 typed process comparisons; complete timings and peak RSS |
+| G1 — Dense streaming | Implementation complete; final flat-scaling phase review pending | All streaming writers, unary/binary/mixed contracts, bounded state budget tests, dense route profiles and worker matrix |
+| G2 — Shared key layouts | Complete | Selection/composite/sparse/wide-key oracles and full worker matrix; shared stable row indices |
+| G3 — Ordered and distinct consumers | Complete | Dominant-group worker matrix, exact rank/order/frequency tests and 90 top/bottom-K histogram checks |
+| G4 — Acceptance and delivery | Validation review in progress; publication pending | ASan/UBSan 3,826/3,826, TSan 24/24 at four total threads, synthetic acceptance complete; final review before PR |
 
 ## Work packages, in dependency order
 
@@ -50,7 +64,8 @@ additional data structures. Each family needs its own baseline and scaling proof
    operation/type pairs remain explicit errors, not artificial fast-path goals.
 
 Exit: a coverage ledger with baseline, current route, correctness oracle and
-worker sweep for every family above. The final synthetic sweep remains outstanding.
+worker sweep for every family above. Complete: 77 synthetic cases, six worker
+settings and three rounds; immutable binary hashes accompany the process records.
 
 ### G1 — Close the dense streaming refactor
 
@@ -114,7 +129,7 @@ engine work with profiles; documentation alone does not close a measured defect.
 Completion requires all packages above to have evidence and explicit status.
 The current min(time) result and passing tests do not close the whole plan.
 
-## Implemented changes awaiting final acceptance
+## Implemented changes
 
 - Native-width payload scatter and shared input-field deduplication.
 - Bounded dense state allocation, task-local initialization, and parallel output.
@@ -129,8 +144,9 @@ The current min(time) result and passing tests do not close the whole plan.
 - Domain-aware symbol read views during immutable worker phases.
 - Typed empty output columns and corrected wide distinct admission.
 
-Full ASan/UBSan validation passes 3,824/3,824 tests; targeted TSan passes 6/6.
-Performance acceptance and delivery remain open.
+Full ASan/UBSan validation passes 3,826/3,826 tests; targeted TSan passes 24/24.
+The complete synthetic acceptance and regression investigations are recorded in
+the results report. Publication remains the final delivery step.
 
 ## Dominant-group execution stages
 
@@ -190,4 +206,44 @@ and peak RSS. This prevents a query-front-end limit from hiding kernel gaps.
 - Use one dense scatter source range per worker to reduce adjacent writes;
   partition reduction still splits dominant partitions by their row counts.
 
-These changes still require final performance and sanitizer acceptance.
+These changes are included in the final synthetic sweep and sanitizer checks.
+
+## Shared directory allocation
+
+- Use 32-bit atomic representatives when row IDs fit, retaining 64-bit entries
+  for larger dense inputs. The empty sentinel remains outside the valid row range.
+- Allocate representative output storage after exact group counts are known.
+- Initialize the directory in coarse aligned ranges to reduce concurrent first
+  writes to the same huge pages. Pad partition counters between worker slices.
+
+## Native validity and small-domain scheduling
+
+- Native accumulator loops select the sentinel reader from the registered input
+  representation at compile time. Nullable rows no longer repeat type dispatch.
+- Use additional independent source tasks for small dense domains when their
+  replicated state fits within one eighth of the existing scatter budget.
+  Larger domains retain the bounded partition or task-local strategy.
+
+## Native streaming output
+
+Every registered streaming accumulator provides a native scalar writer. Sums,
+counts, averages, statistics, products, truth and binary reductions now join
+extrema on this path. The added writers share a primitive result calculation with boxed output,
+including typed nulls, wrapped integers and finite-float canonicalization.
+Dense, small-hash, radix and indexed serial emission use the same interface;
+parallel emitters publish null metadata after their worker barrier.
+
+Registry tests require this capability for every streaming operation/type pair.
+Independent scalar and grouped contracts cover empty/all-null states, arithmetic
+overflow, non-finite results, zero weights and covariance. Small-domain task
+expansion also observes the heap watermark, including row IDs and final states;
+a constrained-budget test checks that it falls back to fewer tasks.
+
+## Mixed payload scatter
+
+Complete all deduplicated input fields for a bounded row chunk before advancing
+through each source range. This avoids repeatedly traversing the full output
+buffer for binary and mixed streaming reductions. The existing native-width
+readers, source selection and partition ownership remain shared. Chunk sizing
+bounds the active payload footprint; scratch consists of partition cursors,
+without another row-sized buffer.

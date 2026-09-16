@@ -1,0 +1,254 @@
+case,workers,binary,phase,processes,cold_median_ms,cold_min_ms,cold_max_ms,warm_median_ms,warm_min_ms,warm_max_ms
+symbol-key,1,baseline,group: v2 dense,3,0.012,0.011,0.014,0.003,0.003,0.005
+symbol-key,1,baseline,dense: initialized slabs,3,0.002,0.002,0.002,0.001,0.001,0.001
+symbol-key,1,baseline,dense: accumulated rows,3,1.157,1.153,1.186,1.046,0.979,1.166
+symbol-key,1,baseline,dense: merged slabs,3,0.002,0.002,0.002,0.001,0.001,0.001
+symbol-key,1,baseline,dense: freed slabs and counted groups,3,0.001,0.0,0.001,0.0,0.0,0.0
+symbol-key,1,current,group: v2 dense,3,0.014,0.014,0.014,0.003,0.002,0.003
+symbol-key,1,current,dense: allocated slabs,3,0.001,0.001,0.001,0.0,0.0,0.0
+symbol-key,1,current,dense: accumulated rows,3,1.253,1.221,1.31,1.082,1.053,1.162
+symbol-key,1,current,dense: merged slabs,3,0.002,0.001,0.002,0.001,0.001,0.001
+symbol-key,1,current,dense: freed slabs and counted groups,3,0.001,0.001,0.001,0.0,0.0,0.0
+symbol-key,2,baseline,group: v2 dense,3,0.015,0.014,0.018,0.005,0.005,0.005
+symbol-key,2,baseline,dense: initialized slabs,3,0.003,0.003,0.003,0.002,0.002,0.002
+symbol-key,2,baseline,dense: accumulated rows,3,0.624,0.622,0.637,0.495,0.479,0.508
+symbol-key,2,baseline,dense: merged slabs,3,0.003,0.002,0.003,0.002,0.002,0.002
+symbol-key,2,baseline,dense: freed slabs and counted groups,3,0.0,0.0,0.001,0.0,0.0,0.0
+symbol-key,2,current,group: v2 dense,3,0.016,0.015,0.016,0.004,0.004,0.004
+symbol-key,2,current,dense: allocated slabs,3,0.003,0.002,0.003,0.001,0.001,0.001
+symbol-key,2,current,dense: accumulated rows,3,0.65,0.63,0.651,0.535,0.533,0.535
+symbol-key,2,current,dense: merged slabs,3,0.002,0.002,0.003,0.001,0.001,0.002
+symbol-key,2,current,dense: freed slabs and counted groups,3,0.001,0.001,0.001,0.0,0.0,0.0
+quantile,1,baseline,group: v2 indexed,3,0.01,0.01,0.01,0.002,0.002,0.002
+quantile,1,current,group: v2 indexed,3,0.01,0.009,0.015,0.002,0.001,0.002
+quantile,1,current,indexed: grouped keys,3,2.281,2.263,2.313,1.478,1.451,1.479
+quantile,1,current,indexed: stable row slices,3,3.502,3.374,3.756,3.037,3.032,3.337
+quantile,1,current,indexed: emitted keys,3,0.045,0.04,0.047,0.04,0.039,0.042
+quantile,1,current,rank: selected dominant groups,3,0.014,0.011,0.017,0.012,0.011,0.013
+quantile,1,current,rank: reduced remaining groups,3,5.07,5.061,5.206,4.601,4.556,4.814
+quantile,1,current,indexed: emitted aggregate,3,0.001,0.001,0.001,0.0,0.0,0.001
+quantile,2,baseline,group: v2 indexed,3,0.008,0.008,0.009,0.002,0.001,0.002
+quantile,2,current,group: v2 indexed,3,0.012,0.008,0.013,0.002,0.001,0.002
+quantile,2,current,indexed: grouped keys,3,2.243,2.155,2.486,1.358,1.345,1.65
+quantile,2,current,indexed: stable row slices,3,3.436,3.409,5.172,3.175,3.107,3.214
+quantile,2,current,indexed: emitted keys,3,0.029,0.026,0.042,0.024,0.023,0.039
+quantile,2,current,rank: selected dominant groups,3,0.065,0.054,0.066,0.057,0.056,0.059
+quantile,2,current,rank: reduced remaining groups,3,2.789,2.719,3.863,2.448,2.34,3.584
+quantile,2,current,indexed: emitted aggregate,3,0.0,0.0,0.001,0.0,0.0,0.0
+clustered,4,baseline,group: v2 dense,2,0.20550000000000002,0.194,0.217,0.184,0.182,0.186
+clustered,4,baseline,dense: initialized slabs,2,0.265,0.175,0.355,0.4615,0.311,0.612
+clustered,4,baseline,dense: accumulated rows,2,0.515,0.336,0.694,0.48650000000000004,0.31,0.663
+clustered,4,baseline,dense: merged slabs,2,0.38,0.349,0.411,0.3775,0.343,0.412
+clustered,4,baseline,dense: freed slabs and counted groups,2,0.0225,0.022,0.023,0.022,0.022,0.022
+clustered,4,current,group: v2 dense,2,0.1455,0.072,0.219,0.0525,0.052,0.053
+clustered,4,current,dense: allocated slabs,2,0.647,0.636,0.658,0.001,0.001,0.001
+clustered,4,current,dense: accumulated rows,2,0.8505,0.609,1.092,0.381,0.381,0.381
+clustered,4,current,dense: merged slabs,2,0.1605,0.159,0.162,0.156,0.156,0.156
+clustered,4,current,dense: freed slabs and counted groups,2,0.02,0.02,0.02,0.02,0.02,0.02
+clustered,8,baseline,group: v2 dense,2,0.22,0.212,0.228,0.2005,0.185,0.216
+clustered,8,baseline,dense: initialized slabs,2,0.376,0.36,0.392,0.766,0.745,0.787
+clustered,8,baseline,dense: accumulated rows,2,0.46499999999999997,0.412,0.518,0.386,0.331,0.441
+clustered,8,baseline,dense: merged slabs,2,0.4715,0.357,0.586,0.40700000000000003,0.305,0.509
+clustered,8,baseline,dense: freed slabs and counted groups,2,0.0275,0.026,0.029,0.0245,0.023,0.026
+clustered,8,current,group: v2 dense,2,0.112,0.112,0.112,0.10200000000000001,0.101,0.103
+clustered,8,current,dense partition: histogram,2,0.874,0.847,0.901,0.196,0.195,0.197
+clustered,8,current,dense partition: scattered rows,2,1.125,1.088,1.162,0.5155000000000001,0.483,0.548
+clustered,8,current,dense partition: reduced groups,2,0.276,0.273,0.279,0.222,0.222,0.222
+clustered,8,current,dense partition: merged split partitions,2,0.008,0.008,0.008,0.007,0.007,0.007
+clustered,8,current,dense: freed slabs and counted groups,2,0.0225,0.022,0.023,0.0205,0.02,0.021
+clustered,default,baseline,group: v2 dense,2,0.2235,0.218,0.229,0.2255,0.223,0.228
+clustered,default,baseline,dense: initialized slabs,2,0.8514999999999999,0.841,0.862,1.5765,1.455,1.698
+clustered,default,baseline,dense: accumulated rows,2,0.386,0.345,0.427,0.40349999999999997,0.396,0.411
+clustered,default,baseline,dense: merged slabs,2,2.0895,1.735,2.444,1.9655,1.953,1.978
+clustered,default,baseline,dense: freed slabs and counted groups,2,0.0265,0.023,0.03,0.024,0.024,0.024
+clustered,default,current,group: v2 dense,2,0.059,0.058,0.06,0.0565,0.046,0.067
+clustered,default,current,dense partition: histogram,2,0.7855,0.752,0.819,0.093,0.072,0.114
+clustered,default,current,dense partition: scattered rows,2,1.5955,1.506,1.685,0.2465,0.216,0.277
+clustered,default,current,dense partition: reduced groups,2,0.221,0.203,0.239,0.1685,0.137,0.2
+clustered,default,current,dense partition: merged split partitions,2,0.026000000000000002,0.018,0.034,0.023,0.017,0.029
+clustered,default,current,dense: freed slabs and counted groups,2,0.0295,0.023,0.036,0.0285,0.022,0.035
+product,4,baseline,group: v2 dense,2,0.266,0.26,0.272,0.198,0.189,0.207
+product,4,baseline,dense: initialized slabs,2,0.2435,0.213,0.274,0.323,0.275,0.371
+product,4,baseline,dense: accumulated rows,2,1.161,1.15,1.172,0.8395,0.774,0.905
+product,4,baseline,dense: merged slabs,2,0.5375000000000001,0.516,0.559,0.5325,0.518,0.547
+product,4,baseline,dense: freed slabs and counted groups,2,0.013999999999999999,0.013,0.015,0.0125,0.012,0.013
+product,4,current,group: v2 dense,2,0.102,0.102,0.102,0.053,0.053,0.053
+product,4,current,dense: allocated slabs,2,0.0015,0.001,0.002,0.001,0.001,0.001
+product,4,current,dense: accumulated rows,2,0.565,0.548,0.582,0.472,0.47,0.474
+product,4,current,dense: merged slabs,2,0.1305,0.128,0.133,0.1165,0.116,0.117
+product,4,current,dense: freed slabs and counted groups,2,0.01,0.01,0.01,0.0095,0.009,0.01
+product,8,baseline,group: v2 dense,2,0.3165,0.275,0.358,0.2315,0.23,0.233
+product,8,baseline,dense: initialized slabs,2,0.29200000000000004,0.269,0.315,0.6699999999999999,0.638,0.702
+product,8,baseline,dense: accumulated rows,2,0.77,0.751,0.789,0.739,0.735,0.743
+product,8,baseline,dense: merged slabs,2,0.623,0.61,0.636,0.578,0.576,0.58
+product,8,baseline,dense: freed slabs and counted groups,2,0.014499999999999999,0.013,0.016,0.014499999999999999,0.014,0.015
+product,8,current,group: v2 dense,2,0.13899999999999998,0.103,0.175,0.0825,0.05,0.115
+product,8,current,dense: allocated slabs,2,0.6335,0.623,0.644,0.0,0.0,0.0
+product,8,current,dense: accumulated rows,2,0.8845000000000001,0.685,1.084,0.5735,0.359,0.788
+product,8,current,dense: merged slabs,2,0.2395,0.168,0.311,0.1775,0.131,0.224
+product,8,current,dense: freed slabs and counted groups,2,0.0125,0.012,0.013,0.011,0.011,0.011
+product,default,baseline,group: dense worker budget exceeded,2,0.326,0.323,0.329,0.329,0.326,0.332
+product,default,baseline,group: v2 radix,2,0.0,0.0,0.0,0.0,0.0,0.0
+product,default,current,group: v2 dense,2,0.089,0.088,0.09,0.042499999999999996,0.042,0.043
+product,default,current,dense partition: histogram,2,0.81,0.79,0.83,0.1925,0.178,0.207
+product,default,current,dense partition: scattered rows,2,1.7055,1.653,1.758,0.16799999999999998,0.155,0.181
+product,default,current,dense partition: reduced groups,2,0.22899999999999998,0.216,0.242,0.161,0.157,0.165
+product,default,current,dense partition: merged split partitions,2,0.0195,0.019,0.02,0.019,0.019,0.019
+product,default,current,dense: freed slabs and counted groups,2,0.0125,0.012,0.013,0.011,0.011,0.011
+nonnull,4,baseline,group: v2 dense,2,0.265,0.263,0.267,0.2225,0.218,0.227
+nonnull,4,baseline,dense: initialized slabs,2,0.276,0.253,0.299,0.249,0.203,0.295
+nonnull,4,baseline,dense: accumulated rows,2,1.553,1.496,1.61,0.9775,0.714,1.241
+nonnull,4,baseline,dense: merged slabs,2,0.4095,0.345,0.474,0.38849999999999996,0.299,0.478
+nonnull,4,baseline,dense: freed slabs and counted groups,2,0.013,0.013,0.013,0.0115,0.011,0.012
+nonnull,4,current,group: v2 dense,2,0.187,0.109,0.265,0.0655,0.061,0.07
+nonnull,4,current,dense: allocated slabs,2,0.6495,0.64,0.659,0.001,0.001,0.001
+nonnull,4,current,dense: accumulated rows,2,1.5695000000000001,1.273,1.866,0.8665,0.807,0.926
+nonnull,4,current,dense: merged slabs,2,0.307,0.246,0.368,0.24,0.235,0.245
+nonnull,4,current,dense: freed slabs and counted groups,2,0.0115,0.011,0.012,0.01,0.01,0.01
+nonnull,8,baseline,group: v2 dense,2,0.2715,0.266,0.277,0.2415,0.239,0.244
+nonnull,8,baseline,dense: initialized slabs,2,0.3905,0.38,0.401,0.7845,0.755,0.814
+nonnull,8,baseline,dense: accumulated rows,2,1.7625000000000002,1.671,1.854,1.5485,1.228,1.869
+nonnull,8,baseline,dense: merged slabs,2,0.5674999999999999,0.566,0.569,0.559,0.558,0.56
+nonnull,8,baseline,dense: freed slabs and counted groups,2,0.013,0.013,0.013,0.0135,0.013,0.014
+nonnull,8,current,group: v2 dense,2,0.1385,0.126,0.151,0.10200000000000001,0.101,0.103
+nonnull,8,current,dense partition: histogram,2,1.2275,1.17,1.285,0.536,0.502,0.57
+nonnull,8,current,dense partition: scattered rows,2,1.1195,1.039,1.2,0.6495,0.546,0.753
+nonnull,8,current,dense partition: reduced groups,2,0.752,0.717,0.787,0.6965,0.626,0.767
+nonnull,8,current,dense partition: merged split partitions,2,0.0035,0.003,0.004,0.004,0.004,0.004
+nonnull,8,current,dense: freed slabs and counted groups,2,0.0125,0.012,0.013,0.0115,0.011,0.012
+nonnull,default,baseline,group: dense worker budget exceeded,2,0.322,0.318,0.326,0.34450000000000003,0.337,0.352
+nonnull,default,baseline,group: v2 radix,2,0.0,0.0,0.0,0.0,0.0,0.0
+nonnull,default,current,group: v2 dense,2,0.0935,0.09,0.097,0.041999999999999996,0.041,0.043
+nonnull,default,current,dense partition: histogram,2,0.8195,0.809,0.83,0.197,0.18,0.214
+nonnull,default,current,dense partition: scattered rows,2,1.7494999999999998,1.702,1.797,0.22949999999999998,0.222,0.237
+nonnull,default,current,dense partition: reduced groups,2,0.3105,0.304,0.317,0.236,0.233,0.239
+nonnull,default,current,dense partition: merged split partitions,2,0.0195,0.019,0.02,0.018,0.018,0.018
+nonnull,default,current,dense: freed slabs and counted groups,2,0.0115,0.011,0.012,0.011,0.011,0.011
+float-key,4,baseline,group: parallel wide-key strategy,2,0.006500000000000001,0.006,0.007,0.0015,0.001,0.002
+float-key,4,baseline,group: legacy,2,0.0,0.0,0.0,0.0,0.0,0.0
+float-key,4,current,group: parallel wide-key strategy,2,0.006,0.006,0.006,0.001,0.001,0.001
+float-key,4,current,group: legacy,2,0.001,0.0,0.002,0.0,0.0,0.0
+float-key,8,baseline,group: parallel wide-key strategy,2,0.007,0.007,0.007,0.0015,0.001,0.002
+float-key,8,baseline,group: legacy,2,0.0,0.0,0.0,0.0,0.0,0.0
+float-key,8,current,group: parallel wide-key strategy,2,0.0095,0.007,0.012,0.002,0.002,0.002
+float-key,8,current,group: legacy,2,0.0,0.0,0.0,0.0,0.0,0.0
+float-key,default,baseline,group: parallel wide-key strategy,2,0.006500000000000001,0.006,0.007,0.0025,0.002,0.003
+float-key,default,baseline,group: legacy,2,0.0005,0.0,0.001,0.0,0.0,0.0
+float-key,default,current,group: v2 indexed,2,0.009999999999999998,0.009,0.011,0.002,0.002,0.002
+float-key,default,current,directory: allocated,2,0.668,0.663,0.673,0.0005,0.0,0.001
+float-key,default,current,directory: initialized,2,0.39149999999999996,0.364,0.419,0.118,0.111,0.125
+float-key,default,current,directory: inserted keys,2,1.3485,1.262,1.435,0.724,0.719,0.729
+float-key,default,current,directory: counted groups,2,0.183,0.141,0.225,0.0955,0.092,0.099
+float-key,default,current,directory: compacted groups,2,0.1235,0.123,0.124,0.1205,0.12,0.121
+float-key,default,current,directory: remapped rows,2,0.1195,0.111,0.128,0.101,0.1,0.102
+float-key,default,current,indexed: grouped keys,2,0.056,0.054,0.058,0.041,0.035,0.047
+float-key,default,current,indexed slices: histogram,2,0.07100000000000001,0.068,0.074,0.07200000000000001,0.063,0.081
+float-key,default,current,indexed slices: packed,2,0.091,0.089,0.093,0.095,0.095,0.095
+float-key,default,current,indexed slices: counted groups,2,0.123,0.122,0.124,0.108,0.105,0.111
+float-key,default,current,indexed slices: filled,2,1.2614999999999998,1.228,1.295,0.5015000000000001,0.501,0.502
+float-key,default,current,indexed: stable row slices,2,0.001,0.001,0.001,0.0,0.0,0.0
+float-key,default,current,indexed: emitted keys,2,0.0665,0.065,0.068,0.0495,0.049,0.05
+float-key,default,current,indexed: emitted aggregate,2,0.397,0.388,0.406,0.21250000000000002,0.201,0.224
+hot-min-descending,4,baseline,group: v2 dense,2,0.222,0.218,0.226,0.186,0.182,0.19
+hot-min-descending,4,baseline,dense: initialized slabs,2,0.1525,0.106,0.199,0.14500000000000002,0.098,0.192
+hot-min-descending,4,baseline,dense: accumulated rows,2,0.7095,0.692,0.727,0.387,0.371,0.403
+hot-min-descending,4,baseline,dense: merged slabs,2,0.201,0.169,0.233,0.161,0.16,0.162
+hot-min-descending,4,baseline,dense: freed slabs and counted groups,2,0.0125,0.01,0.015,0.0115,0.011,0.012
+hot-min-descending,4,current,group: v2 dense,2,0.1315,0.115,0.148,0.15,0.074,0.226
+hot-min-descending,4,current,dense: allocated slabs,2,0.001,0.001,0.001,0.001,0.001,0.001
+hot-min-descending,4,current,dense: accumulated rows,2,0.557,0.311,0.803,0.44799999999999995,0.295,0.601
+hot-min-descending,4,current,dense: merged slabs,2,0.119,0.096,0.142,0.12,0.093,0.147
+hot-min-descending,4,current,dense: freed slabs and counted groups,2,0.011,0.011,0.011,0.01,0.01,0.01
+hot-min-descending,8,baseline,group: v2 dense,2,0.23049999999999998,0.225,0.236,0.229,0.227,0.231
+hot-min-descending,8,baseline,dense: initialized slabs,2,0.27049999999999996,0.257,0.284,0.637,0.624,0.65
+hot-min-descending,8,baseline,dense: accumulated rows,2,0.5860000000000001,0.521,0.651,0.5985,0.525,0.672
+hot-min-descending,8,baseline,dense: merged slabs,2,0.344,0.329,0.359,0.281,0.269,0.293
+hot-min-descending,8,baseline,dense: freed slabs and counted groups,2,0.0155,0.015,0.016,0.0135,0.013,0.014
+hot-min-descending,8,current,group: v2 dense,2,0.177,0.175,0.179,0.135,0.134,0.136
+hot-min-descending,8,current,dense: allocated slabs,2,0.6385000000000001,0.629,0.648,0.0,0.0,0.0
+hot-min-descending,8,current,dense: accumulated rows,2,0.8835,0.869,0.898,0.489,0.474,0.504
+hot-min-descending,8,current,dense: merged slabs,2,0.157,0.153,0.161,0.14350000000000002,0.14,0.147
+hot-min-descending,8,current,dense: freed slabs and counted groups,2,0.0115,0.011,0.012,0.011,0.011,0.011
+hot-min-descending,default,baseline,group: dense worker budget exceeded,2,0.2585,0.254,0.263,0.3355,0.333,0.338
+hot-min-descending,default,baseline,group: v2 radix,2,0.0,0.0,0.0,0.0,0.0,0.0
+hot-min-descending,default,current,group: v2 dense,2,0.113,0.112,0.114,0.07300000000000001,0.062,0.084
+hot-min-descending,default,current,dense partition: histogram,2,0.1875,0.156,0.219,0.159,0.153,0.165
+hot-min-descending,default,current,dense partition: scattered rows,2,0.34950000000000003,0.326,0.373,0.2915,0.289,0.294
+hot-min-descending,default,current,dense partition: reduced groups,2,0.139,0.136,0.142,0.1085,0.107,0.11
+hot-min-descending,default,current,dense partition: merged split partitions,2,0.0195,0.018,0.021,0.0205,0.02,0.021
+hot-min-descending,default,current,dense: freed slabs and counted groups,2,0.015,0.013,0.017,0.018000000000000002,0.011,0.025
+extrema-i64,4,baseline,group: v2 dense,2,0.274,0.267,0.281,0.2345,0.234,0.235
+extrema-i64,4,baseline,dense: initialized slabs,2,0.382,0.38,0.384,0.423,0.369,0.477
+extrema-i64,4,baseline,dense: accumulated rows,2,1.2355,1.08,1.391,1.125,1.119,1.131
+extrema-i64,4,baseline,dense: merged slabs,2,0.3285,0.327,0.33,0.335,0.335,0.335
+extrema-i64,4,baseline,dense: freed slabs and counted groups,2,0.0115,0.011,0.012,0.0115,0.011,0.012
+extrema-i64,4,current,group: v2 dense,2,0.20700000000000002,0.161,0.253,0.196,0.189,0.203
+extrema-i64,4,current,dense: allocated slabs,2,0.6475,0.643,0.652,0.001,0.001,0.001
+extrema-i64,4,current,dense: accumulated rows,2,1.767,1.376,2.158,1.456,1.44,1.472
+extrema-i64,4,current,dense: merged slabs,2,0.5765,0.453,0.7,0.45199999999999996,0.43,0.474
+extrema-i64,4,current,dense: freed slabs and counted groups,2,0.0115,0.011,0.012,0.01,0.01,0.01
+extrema-i64,8,baseline,group: v2 dense,2,0.281,0.272,0.29,0.27,0.261,0.279
+extrema-i64,8,baseline,dense: initialized slabs,2,0.7015,0.604,0.799,1.036,0.893,1.179
+extrema-i64,8,baseline,dense: accumulated rows,2,1.0855,0.965,1.206,1.3399999999999999,1.317,1.363
+extrema-i64,8,baseline,dense: merged slabs,2,0.509,0.39,0.628,0.5675,0.549,0.586
+extrema-i64,8,baseline,dense: freed slabs and counted groups,2,0.017,0.016,0.018,0.017,0.016,0.018
+extrema-i64,8,current,group: v2 dense,2,0.14250000000000002,0.131,0.154,0.1025,0.102,0.103
+extrema-i64,8,current,dense partition: histogram,2,1.2005,1.085,1.316,0.485,0.461,0.509
+extrema-i64,8,current,dense partition: scattered rows,2,0.98,0.901,1.059,0.5225,0.477,0.568
+extrema-i64,8,current,dense partition: reduced groups,2,0.958,0.817,1.099,0.7295,0.717,0.742
+extrema-i64,8,current,dense partition: merged split partitions,2,0.0045000000000000005,0.004,0.005,0.003,0.003,0.003
+extrema-i64,8,current,dense: freed slabs and counted groups,2,0.0115,0.011,0.012,0.011,0.011,0.011
+extrema-i64,default,baseline,group: dense worker budget exceeded,2,0.3155,0.311,0.32,0.318,0.313,0.323
+extrema-i64,default,baseline,group: v2 radix,2,0.0,0.0,0.0,0.0,0.0,0.0
+extrema-i64,default,current,group: v2 dense,2,0.08199999999999999,0.074,0.09,0.0655,0.051,0.08
+extrema-i64,default,current,dense partition: histogram,2,0.8414999999999999,0.825,0.858,0.267,0.184,0.35
+extrema-i64,default,current,dense partition: scattered rows,2,1.7080000000000002,1.588,1.828,0.3205,0.226,0.415
+extrema-i64,default,current,dense partition: reduced groups,2,0.6325000000000001,0.586,0.679,0.4405,0.309,0.572
+extrema-i64,default,current,dense partition: merged split partitions,2,0.027000000000000003,0.02,0.034,0.026000000000000002,0.018,0.034
+extrema-i64,default,current,dense: freed slabs and counted groups,2,0.0175,0.014,0.021,0.016,0.011,0.021
+sum-i64,8,baseline,group: v2 dense,2,0.3205,0.281,0.36,0.22699999999999998,0.209,0.245
+sum-i64,8,baseline,dense: initialized slabs,2,0.2195,0.205,0.234,0.4325,0.307,0.558
+sum-i64,8,baseline,dense: accumulated rows,2,0.597,0.484,0.71,0.5680000000000001,0.402,0.734
+sum-i64,8,baseline,dense: merged slabs,2,0.9045000000000001,0.545,1.264,0.904,0.577,1.231
+sum-i64,8,baseline,dense: freed slabs and counted groups,2,0.0125,0.012,0.013,0.0125,0.012,0.013
+sum-i64,8,current,group: v2 dense,2,0.128,0.121,0.135,0.1185,0.112,0.125
+sum-i64,8,current,dense: allocated slabs,2,0.6799999999999999,0.669,0.691,0.0,0.0,0.0
+sum-i64,8,current,dense: accumulated rows,2,1.3210000000000002,1.3,1.342,0.956,0.947,0.965
+sum-i64,8,current,dense: merged slabs,2,0.29300000000000004,0.267,0.319,0.2505,0.232,0.269
+sum-i64,8,current,dense: freed slabs and counted groups,2,0.0135,0.012,0.015,0.012,0.011,0.013
+sum-i64,default,baseline,group: dense worker budget exceeded,2,0.312,0.295,0.329,0.336,0.331,0.341
+sum-i64,default,baseline,group: v2 radix,2,0.0,0.0,0.0,0.0,0.0,0.0
+sum-i64,default,current,group: v2 dense,2,0.141,0.104,0.178,0.042,0.042,0.042
+sum-i64,default,current,dense partition: histogram,2,0.85,0.833,0.867,0.1935,0.189,0.198
+sum-i64,default,current,dense partition: scattered rows,2,1.5605,1.483,1.638,0.1765,0.162,0.191
+sum-i64,default,current,dense partition: reduced groups,2,0.238,0.236,0.24,0.1285,0.127,0.13
+sum-i64,default,current,dense partition: merged split partitions,2,0.019,0.019,0.019,0.0175,0.017,0.018
+sum-i64,default,current,dense: freed slabs and counted groups,2,0.012,0.011,0.013,0.011,0.011,0.011
+guid-key,8,baseline,group: v2 indexed,2,0.0085,0.008,0.009,0.002,0.002,0.002
+guid-key,8,current,group: v2 indexed,2,0.009,0.009,0.009,0.002,0.002,0.002
+guid-key,8,current,directory: allocated,2,0.6495,0.625,0.674,0.0,0.0,0.0
+guid-key,8,current,directory: initialized,2,0.2455,0.227,0.264,0.1525,0.149,0.156
+guid-key,8,current,directory: inserted keys,2,0.7705,0.738,0.803,0.679,0.635,0.723
+guid-key,8,current,directory: counted groups,2,0.089,0.088,0.09,0.0745,0.073,0.076
+guid-key,8,current,directory: compacted groups,2,0.032,0.032,0.032,0.0325,0.032,0.033
+guid-key,8,current,directory: remapped rows,2,0.0645,0.06,0.069,0.064,0.058,0.07
+guid-key,8,current,indexed: grouped keys,2,0.001,0.001,0.001,0.0005,0.0,0.001
+guid-key,8,current,indexed: stable row slices,2,0.4185,0.396,0.441,0.1605,0.157,0.164
+guid-key,8,current,indexed: emitted keys,2,0.001,0.001,0.001,0.0,0.0,0.0
+guid-key,8,current,indexed: emitted aggregate,2,0.4435,0.433,0.454,0.36,0.33,0.39
+guid-key,8,current,rank: selected dominant groups,2,0.0045000000000000005,0.004,0.005,0.001,0.001,0.001
+guid-key,8,current,rank: reduced remaining groups,2,1.2625,1.26,1.265,2.1399999999999997,2.057,2.223
+guid-key,default,baseline,group: v2 indexed,2,0.0075,0.007,0.008,0.002,0.002,0.002
+guid-key,default,current,group: v2 indexed,2,0.0085,0.008,0.009,0.002,0.002,0.002
+guid-key,default,current,directory: allocated,2,0.6645000000000001,0.664,0.665,0.0005,0.0,0.001
+guid-key,default,current,directory: initialized,2,0.359,0.317,0.401,0.22349999999999998,0.21,0.237
+guid-key,default,current,directory: inserted keys,2,1.1435,0.959,1.328,0.4065,0.406,0.407
+guid-key,default,current,directory: counted groups,2,0.093,0.083,0.103,0.0435,0.042,0.045
+guid-key,default,current,directory: compacted groups,2,0.0275,0.027,0.028,0.021,0.021,0.021
+guid-key,default,current,directory: remapped rows,2,0.054,0.053,0.055,0.0455,0.045,0.046
+guid-key,default,current,indexed: grouped keys,2,0.0015,0.001,0.002,0.001,0.001,0.001
+guid-key,default,current,indexed: stable row slices,2,2.5455,1.979,3.112,0.08499999999999999,0.084,0.086
+guid-key,default,current,indexed: emitted keys,2,0.0025,0.002,0.003,0.001,0.001,0.001
+guid-key,default,current,indexed: emitted aggregate,2,0.7375,0.498,0.977,0.243,0.212,0.274
+guid-key,default,current,rank: selected dominant groups,2,0.0085,0.006,0.011,0.001,0.001,0.001
+guid-key,default,current,rank: reduced remaining groups,2,2.0675,1.303,2.832,2.4000000000000004,2.221,2.579
