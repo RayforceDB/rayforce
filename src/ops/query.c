@@ -14868,7 +14868,7 @@ static int64_t upsert_atom_int(ray_t* a) {
     return a->type == -RAY_BOOL ? (int64_t)a->b8 : elem_as_i64(a);
 }
 
-static uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
+static inline __attribute__((always_inline)) uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
     switch (col->type) {
     case RAY_F64: return ray_hash_f64(((const double*)ray_data(col))[r]);
     case RAY_SYM: return ray_hash_i64(ray_read_sym(ray_data(col), r, col->type, col->attrs));
@@ -15163,6 +15163,301 @@ static void upsert_rollback_appends(ray_t** slots, int64_t ncols, int64_t nrows0
     }
 }
 
+/* Can a multi-row payload be written column by column, without boxing a
+ * cell?  Every target column needs a payload vector of its exact type and
+ * width class: no coercion, no partial payload, no boxed or STR column,
+ * and SYM ids already in the runtime domain the target stores. */
+static bool upsert_vec_payload_ok(ray_t* tbl, ray_t** src_cols, int64_t ncols, int64_t m) {
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* sc = src_cols[c];
+        ray_t* tc = ray_table_get_col_idx(tbl, c);
+        if (!sc || RAY_IS_ERR(sc) || sc->type != tc->type) return false;
+        if (sc->attrs & RAY_ATTR_SLICE) return false;
+        if (sc->len != m) return false;
+        switch (tc->type) {
+        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_GUID:
+            break;
+        case RAY_SYM:
+            if (ray_sym_vec_domain(sc) != ray_sym_runtime_domain()) return false;
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Cell-vs-cell equality for two columns of one type, with the semantics of
+ * upsert_cell_eq_atom: F64 by value, SYM by runtime id, integers widened. */
+static inline __attribute__((always_inline)) bool
+upsert_cell_eq_cell(ray_t* a, int64_t ra, ray_t* b, int64_t rb) {
+    switch (a->type) {
+    case RAY_F64:
+        return ((const double*)ray_data(a))[ra] == ((const double*)ray_data(b))[rb];
+    case RAY_SYM:
+        return ray_read_sym(ray_data(a), ra, RAY_SYM, a->attrs) ==
+               ray_read_sym(ray_data(b), rb, RAY_SYM, b->attrs);
+    case RAY_GUID:
+        return memcmp((const uint8_t*)ray_data(a) + ra * 16,
+                      (const uint8_t*)ray_data(b) + rb * 16, 16) == 0;
+    default:
+        return upsert_int_cell(a, ra) == upsert_int_cell(b, rb);
+    }
+}
+
+/* Map probe for payload row `r`.  An entry past nrows0 names a row this
+ * batch appends but has not written yet, so its key is read from the
+ * payload row that will land there (app[row - nrows0]). */
+/* Per-row probe on the column-wise path.  Forced inline, with the hash and the
+ * cell compare below it: once the resolve loop exists in two instances GCC's
+ * inline budget leaves these as calls, and a call per row cost 10-20% on
+ * tables that fit in cache. */
+static inline __attribute__((always_inline)) int64_t
+upsert_map_find_src(upsert_map_t* mp, uint64_t h, ray_t** slots,
+                    const int64_t* kci, int64_t nk, ray_t** src,
+                    int64_t r, int64_t nrows0, const int64_t* app) {
+    uint64_t s = h & mp->mask;
+    for (;;) {
+        int64_t e = mp->slot[s];
+        if (e == UKEY_SLOT_EMPTY) return -1;
+        if (e != UKEY_SLOT_TOMB) {
+            int64_t row = e - 1;
+            bool eq = true;
+            for (int64_t k = 0; k < nk && eq; k++) {
+                ray_t* sc = src[kci[k]];
+                eq = row < nrows0
+                    ? upsert_cell_eq_cell(slots[kci[k]], row, sc, r)
+                    : upsert_cell_eq_cell(sc, app[row - nrows0], sc, r);
+            }
+            if (eq) return row;
+        }
+        s = (s + 1) & mp->mask;
+    }
+}
+
+/* Move `n` elements of `src` into `dst`: dst[di(i)] = src[si(i)], where a
+ * NULL index array means the identity.  Null state travels in-band as the
+ * sentinel; the HAS_NULLS gate is raised when a written value is null. */
+/* Past this much memory a keyed upsert's probes and scattered writes miss the
+ * per-core cache, and loading them ahead pays; below it the extra pass and
+ * the prefetches are pure overhead.  Measured with a 512 KiB L2: a 640 KiB
+ * probe set was 3-8% slower with them, an 890 KiB one 19% faster. */
+#define UPSERT_PF_MIN_BYTES ((size_t)768 << 10)
+
+static inline __attribute__((always_inline)) void
+upsert_vec_move_impl(ray_t* dst, const int64_t* di, int64_t dbase,
+                     ray_t* src, const int64_t* si, int64_t n, bool pf) {
+    void* d = ray_data(dst);
+    const void* s = ray_data(src);
+    #define UPSERT_MOVE(T) do {                                              \
+        for (int64_t i = 0; i < n; i++) {                                    \
+            if (pf && i + 16 < n && di[i + 16] >= 0)                         \
+                __builtin_prefetch(&((T*)d)[di[i + 16]], 1);                 \
+            int64_t o = di ? di[i] : dbase + i;                              \
+            if (o < 0) continue;                                             \
+            ((T*)d)[o] = ((const T*)s)[si ? si[i] : i];                      \
+        } } while (0)
+    switch (dst->type) {
+    case RAY_BOOL: case RAY_U8:  UPSERT_MOVE(uint8_t); break;
+    case RAY_I16:                UPSERT_MOVE(int16_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: UPSERT_MOVE(int32_t); break;
+    case RAY_I64: case RAY_TIMESTAMP: UPSERT_MOVE(int64_t); break;
+    case RAY_F64:                UPSERT_MOVE(double); break;
+    case RAY_GUID:
+        for (int64_t i = 0; i < n; i++) {
+            int64_t o = di ? di[i] : dbase + i;
+            if (o < 0) continue;
+            memcpy((uint8_t*)d + o * 16, (const uint8_t*)s + (si ? si[i] : i) * 16, 16);
+        }
+        break;
+    case RAY_SYM: {
+        bool any_null = false;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t o = di ? di[i] : dbase + i;
+            if (o < 0) continue;
+            int64_t id = ray_read_sym(s, si ? si[i] : i, RAY_SYM, src->attrs);
+            ((int64_t*)d)[o] = id;
+            any_null |= (id == 0);
+        }
+        if (any_null) dst->attrs |= RAY_ATTR_HAS_NULLS;
+        return;
+    }
+    default: return;
+    }
+    #undef UPSERT_MOVE
+    if (!ray_vec_may_have_nulls(src)) return;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t o = di ? di[i] : dbase + i;
+        if (o >= 0 && ray_vec_is_null(src, si ? si[i] : i)) {
+            dst->attrs |= RAY_ATTR_HAS_NULLS;
+            return;
+        }
+    }
+}
+
+/* Each look-ahead loop exists twice, with its flag a compile-time constant,
+ * and the choice is made once per batch or column.  A runtime flag tested
+ * inside the loops cost 15-30% on tables that fit in cache, more than the
+ * prefetching itself: the plain instances must compile to the loops that
+ * never had it. */
+static void upsert_vec_move(ray_t* dst, const int64_t* di, int64_t dbase,
+                            ray_t* src, const int64_t* si, int64_t n) {
+    upsert_vec_move_impl(dst, di, dbase, src, si, n, false);
+}
+
+static void upsert_vec_scatter_ahead(ray_t* dst, const int64_t* di, ray_t* src, int64_t n) {
+    upsert_vec_move_impl(dst, di, 0, src, NULL, n, true);
+}
+
+/* Resolve every payload row to its target row, in payload order: dst[r] is
+ * the matched row or -1 for a row this batch appends, app[] lists the payload
+ * rows to append.  A new key enters the map at the row it will take, so a
+ * repeat inside the batch finds it.
+ *
+ * On a table larger than the cache nearly all of a probe's time is two
+ * misses — the slot, then the key cells of the row it names — and taken one
+ * row at a time they never overlap.  The look-ahead instance hashes the batch
+ * first (dst[r] holds row r's hash until this pass overwrites it) and loads
+ * both a few rows ahead.  The separate hash pass pays on such a table even for
+ * a batch shorter than the lookahead, where no prefetch fires. */
+static inline __attribute__((always_inline)) void
+upsert_resolve_impl(upsert_map_t* map, ray_t** slots, const int64_t* kci, int64_t nk,
+                    ray_t** src, int64_t m, int64_t nrows0, int64_t* dst, int64_t* app,
+                    int64_t* napp_out, int64_t* nhit_out, bool ahead) {
+    enum { PF_SLOT = 16, PF_ROW = 8 };
+    const char* kbase[RAY_UKEY_MAX_COLS];
+    size_t kesz[RAY_UKEY_MAX_COLS];
+    int64_t npf = 0;
+    if (ahead) {
+        npf = nk < RAY_UKEY_MAX_COLS ? nk : RAY_UKEY_MAX_COLS;
+        for (int64_t k = 0; k < npf; k++) {
+            ray_t* kc = slots[kci[k]];
+            kbase[k] = (const char*)ray_data(kc);
+            kesz[k] = ray_sym_elem_size(kc->type, kc->attrs);
+        }
+        for (int64_t r = 0; r < m; r++) {
+            uint64_t h = UPSERT_HASH_SEED;
+            for (int64_t k = 0; k < nk; k++)
+                h = ray_hash_combine(h, upsert_hash_cell(src[kci[k]], r));
+            dst[r] = (int64_t)h;
+        }
+    }
+
+    int64_t napp = 0, nhit = 0;
+    for (int64_t r = 0; r < m; r++) {
+        uint64_t h;
+        if (ahead) {
+            if (r + PF_SLOT < m)
+                __builtin_prefetch(&map->slot[(uint64_t)dst[r + PF_SLOT] & map->mask]);
+            if (r + PF_ROW < m) {
+                int64_t e = map->slot[(uint64_t)dst[r + PF_ROW] & map->mask];
+                if (e > 0 && e - 1 < nrows0)
+                    for (int64_t k = 0; k < npf; k++)
+                        __builtin_prefetch(kbase[k] + (size_t)(e - 1) * kesz[k]);
+            }
+            h = (uint64_t)dst[r];
+        } else {
+            h = UPSERT_HASH_SEED;
+            for (int64_t k = 0; k < nk; k++)
+                h = ray_hash_combine(h, upsert_hash_cell(src[kci[k]], r));
+        }
+        int64_t hit = upsert_map_find_src(map, h, slots, kci, nk, src, r, nrows0, app);
+        if (hit < 0) {
+            upsert_map_put(map, h, nrows0 + napp);
+            app[napp++] = r;
+            dst[r] = -1;                    /* written by the append */
+        } else {
+            dst[r] = hit;
+            nhit++;
+        }
+    }
+    *napp_out = napp;
+    *nhit_out = nhit;
+}
+
+/* Only the look-ahead instance is out of line; the plain one is expanded in
+ * upsert_apply_vectors itself, where the loop lived before the look-ahead
+ * existed — out of line it measured 4-9% slower on tables that fit in cache.
+ * The look-ahead one must stay out of line: expanded into its only caller it
+ * measured 12-26% slower on inserts into large tables. */
+__attribute__((noinline))
+static void upsert_resolve_ahead(upsert_map_t* map, ray_t** slots, const int64_t* kci, int64_t nk,
+                                 ray_t** src, int64_t m, int64_t nrows0, int64_t* dst, int64_t* app,
+                                 int64_t* napp, int64_t* nhit) {
+    upsert_resolve_impl(map, slots, kci, nk, src, m, nrows0, dst, app, napp, nhit, true);
+}
+
+/* Column-wise body of upsert_apply for a payload upsert_vec_payload_ok
+ * admitted.  Rows resolve in payload order exactly as the per-row loop
+ * does — a new key enters the map at the row it will take, so a repeat
+ * inside the batch finds it — then each column is written once: the new
+ * rows appended in one go, and every matched cell scattered in payload
+ * order, so a key repeated in the batch still ends at its last value.
+ * Appends come first because a repeat may target a row just appended. */
+static ray_t* upsert_apply_vectors(ray_t** slots, int64_t ncols,
+                                   const int64_t* kci, int64_t nk,
+                                   ray_t** src, int64_t m, int64_t nrows0,
+                                   upsert_map_t* map, int64_t* nrows) {
+    ray_t* dst_hdr = NULL; ray_t* app_hdr = NULL; ray_t* buf_hdr = NULL;
+    int64_t* dst = (int64_t*)scratch_alloc(&dst_hdr, (size_t)m * sizeof(int64_t));
+    int64_t* app = dst ? (int64_t*)scratch_alloc(&app_hdr, (size_t)m * sizeof(int64_t)) : NULL;
+    ray_t* err = NULL;
+    if (!dst || !app) { err = ray_error("oom", NULL); goto out; }
+
+    /* The probed memory is the slots plus the key columns; past the per-core
+     * cache the look-ahead instance pays, below it only costs. */
+    size_t probe_bytes = (size_t)(map->mask + 1) * sizeof(int64_t);
+    for (int64_t k = 0; k < nk && k < RAY_UKEY_MAX_COLS; k++) {
+        ray_t* kc = slots[kci[k]];
+        probe_bytes += (size_t)nrows0 * ray_sym_elem_size(kc->type, kc->attrs);
+    }
+    int64_t napp = 0, nhit = 0;
+    if (probe_bytes >= UPSERT_PF_MIN_BYTES)
+        upsert_resolve_ahead(map, slots, kci, nk, src, m, nrows0, dst, app, &napp, &nhit);
+    else
+        upsert_resolve_impl(map, slots, kci, nk, src, m, nrows0, dst, app, &napp, &nhit, false);
+
+    if (napp > 0) {
+        void* buf = scratch_alloc(&buf_hdr, (size_t)napp * 16);
+        if (!buf) { err = ray_error("oom", NULL); goto out; }
+        memset(buf, 0, (size_t)napp * 16);
+        for (int64_t c = 0; c < ncols; c++) {
+            /* Grow the column by napp zeroed cells in one step (and drop
+             * its index), then gather the new rows straight into the tail. */
+            int64_t tail = slots[c]->len;
+            ray_t* res = ray_vec_append_raw(slots[c], buf, napp);
+            if (RAY_IS_ERR(res)) { err = res; goto out; }
+            slots[c] = res;
+            upsert_vec_move(res, NULL, tail, src[c], app, napp);
+        }
+    }
+
+    if (nhit > 0) {
+        for (int64_t c = 0; c < ncols; c++) {
+            bool is_key = false;
+            for (int64_t k = 0; k < nk; k++) if (kci[k] == c) { is_key = true; break; }
+            if (is_key) continue;           /* matched: already equal */
+            ray_index_drop(&slots[c]);
+            if (RAY_IS_ERR(slots[c])) { err = slots[c]; goto out; }
+            slots[c]->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+            ray_t* col = slots[c];
+            if ((size_t)col->len * ray_sym_elem_size(col->type, col->attrs) >= UPSERT_PF_MIN_BYTES)
+                upsert_vec_scatter_ahead(col, dst, src[c], m);
+            else
+                upsert_vec_move(col, dst, 0, src[c], NULL, m);
+        }
+    }
+    *nrows = nrows0 + napp;
+
+out:
+    if (buf_hdr) scratch_free(buf_hdr);
+    if (app_hdr) scratch_free(app_hdr);
+    if (dst_hdr) scratch_free(dst_hdr);
+    return err;
+}
+
 /* One-pass upsert.  `kci[nk]` are the key column positions.  The
  * payload is either `src_cols` (ncols collections-or-NULL, each `m`
  * rows) or, when src_cols is NULL, `atoms` (ncols atoms-or-NULL, m==1).
@@ -15199,10 +15494,14 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     for (int64_t c = 0; inplace && c < ncols; c++)
         if (((ray_t**)ray_data(live_cols))[c]->rc != 1) inplace = false;
 
+    /* A batch of typed vectors matching the target is written column by
+     * column; everything else is boxed into cells below. */
+    bool vec_path = src_cols && m > 1 && upsert_vec_payload_ok(tbl, src_cols, ncols, m);
+
     /* Materialize the payload cells once: cells[r*ncols + c], with a
      * parallel ownership byte for atoms allocated out of typed vectors. */
     ray_t* cells_hdr = NULL; ray_t* owned_hdr = NULL;
-    size_t ncell = (size_t)m * (size_t)ncols;
+    size_t ncell = vec_path ? 1 : (size_t)m * (size_t)ncols;
     ray_t** cells = (ray_t**)scratch_alloc(&cells_hdr, ncell * sizeof(ray_t*));
     uint8_t* owned = cells ? (uint8_t*)scratch_alloc(&owned_hdr, ncell) : NULL;
     if (!cells || !owned) {
@@ -15219,7 +15518,9 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     ray_index_t* ukey = NULL;   /* table-resident map, borrowed from tbl */
     ray_t* work = NULL;
 
-    if (src_cols) {
+    if (vec_path) {
+        /* typed payload vectors are read in place */
+    } else if (src_cols) {
         for (int64_t c = 0; c < ncols && !err; c++) {
             ray_t* sc = src_cols[c];
             if (!sc) continue;
@@ -15245,8 +15546,9 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         for (int64_t c = 0; c < ncols; c++) cells[c] = atoms[c];
     }
 
-    /* Type-check every cell before writing anything. */
-    for (int64_t r = 0; r < m && !err; r++) {
+    /* Type-check every cell before writing anything.  An admitted vector
+     * payload was checked once per column by upsert_vec_payload_ok. */
+    for (int64_t r = 0; r < m && !err && !vec_path; r++) {
         ray_t** rc = cells + (size_t)r * ncols;
         for (int64_t k = 0; k < nk && !err; k++) {
             ray_t* kc = ray_table_get_col_idx(tbl, kci[k]);
@@ -15347,7 +15649,9 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     }
 
     int64_t nrows = nrows0;
-    for (int64_t r = 0; r < m && !err; r++) {
+    if (vec_path && !err)
+        err = upsert_apply_vectors(slots, ncols, kci, nk, src_cols, m, nrows0, &map, &nrows);
+    for (int64_t r = 0; r < m && !err && !vec_path; r++) {
         ray_t** rc = cells + (size_t)r * ncols;
         uint64_t h = 0;
         int64_t hit;
