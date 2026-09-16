@@ -39,6 +39,11 @@
  * without any negotiation — a peer on any build still reads the frame. */
 #define RAY_IPC_COMPRESS_NEVER ((size_t)-1)
 
+/* "Not specified": the link decides from peer locality
+ * (ray_ipc_link_threshold).  Never stored on a connection — resolved to a
+ * concrete threshold when the connection is established. */
+#define RAY_IPC_COMPRESS_AUTO  ((size_t)-2)
+
 /* Compression policy for one link: loopback and UNIX-domain peers never
  * compress (no bandwidth to buy with the CPU), everything else keeps the
  * compiled-in default.  An unknown peer keeps the default. */
@@ -144,6 +149,24 @@ int       ray_ipc_poll(ray_ipc_server_t* srv, int timeout_ms);
 int64_t   ray_ipc_connect(const char* host, uint16_t port,
                            const char* user, const char* password,
                            int timeout_ms);
+/* As ray_ipc_connect, with an explicit compression threshold for the new
+ * link.  RAY_IPC_COMPRESS_AUTO keeps the locality-derived default. */
+int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
+                           const char* user, const char* password,
+                           int timeout_ms, size_t compress_threshold);
+
+/* Parse .ipc.open's optional second argument: an integer timeout in
+ * milliseconds, or a dict with optional `timeout` and `compress`.
+ * `compress` is a threshold in bytes — 0N never compresses, 0 always
+ * does, n compresses payloads larger than n; absent leaves
+ * RAY_IPC_COMPRESS_AUTO.  Returns NULL on success, or an error object
+ * the caller returns as-is. */
+ray_t*    ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
+                                  size_t* compress_threshold);
+
+/* The compression threshold in force on an open handle, or
+ * RAY_IPC_COMPRESS_AUTO if the handle does not resolve. */
+size_t    ray_ipc_handle_threshold(int64_t handle);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);

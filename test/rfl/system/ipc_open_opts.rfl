@@ -1,0 +1,37 @@
+;; ipc_open_opts.rfl — `.ipc.open`'s second argument (#541).
+;;
+;; It stays an integer connect timeout, or becomes an options dict with
+;; optional `timeout` and `compress`.  `compress` is a threshold in bytes,
+;; not a flag: 0N never compresses, 0 always does, n compresses payloads
+;; larger than n.  Absent means auto — loopback and UNIX-domain links
+;; default to never compressing, everything else to the built-in 2000.
+;;
+;; Nothing is bound on 19974, so a well-formed call reaches connect and
+;; fails with `io`; a malformed one is rejected before that, with `type`
+;; or `domain`.  The two error classes are what distinguish "the option
+;; parsed" from "the option was accepted silently".
+
+;; the existing integer form still means timeout
+(.ipc.open "127.0.0.1:19974" 200) !- io
+
+;; options dict: each accepted key reaches connect
+(.ipc.open "127.0.0.1:19974" (dict [timeout] [200])) !- io
+(.ipc.open "127.0.0.1:19974" (dict [compress] [0N])) !- io
+(.ipc.open "127.0.0.1:19974" (dict [compress] [0])) !- io
+(.ipc.open "127.0.0.1:19974" (dict [compress] [5000])) !- io
+(.ipc.open "127.0.0.1:19974" (dict [timeout compress] [200 0N])) !- io
+
+;; an empty dict is valid — everything defaults
+(.ipc.open "127.0.0.1:19974" (dict [] [])) !- io
+
+;; a typo must not silently mean "default"
+(.ipc.open "127.0.0.1:19974" (dict [compres] [0N])) !- domain
+(.ipc.open "127.0.0.1:19974" (dict [timeuot] [200])) !- domain
+
+;; wrong value types and out-of-range values are rejected up front
+(.ipc.open "127.0.0.1:19974" (dict [compress] ["lots"])) !- type
+(.ipc.open "127.0.0.1:19974" (dict [compress] [-5])) !- domain
+(.ipc.open "127.0.0.1:19974" (dict [timeout] [-1])) !- domain
+
+;; a second argument that is neither an integer nor a dict
+(.ipc.open "127.0.0.1:19974" "soon") !- type

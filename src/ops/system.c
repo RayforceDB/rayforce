@@ -1432,15 +1432,14 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     if (!ray_is_atom(x) || x->type != -RAY_STR)
         return ray_error("type", ".ipc.open expects a string \"host:port[:user:password]\", got %s", ray_type_name(x->type));
 
-    /* Optional connect timeout in milliseconds (0 = use default). */
-    int timeout_ms = 0;
+    /* Optional second argument: an integer connect timeout in
+     * milliseconds (0 = use default), or an options dict carrying
+     * `timeout` and/or `compress` (#541). */
+    int    timeout_ms = 0;
+    size_t compress   = RAY_IPC_COMPRESS_AUTO;
     if (n == 2) {
-        ray_t* t = args[1];
-        if (!ray_is_atom(t) || (t->type != -RAY_I64 && t->type != -RAY_I32))
-            return ray_error("type", ".ipc.open timeout must be an integer (milliseconds), got %s", ray_type_name(t->type));
-        int64_t tv = (t->type == -RAY_I64) ? t->i64 : t->i32;
-        if (tv < 0) return ray_error("domain", ".ipc.open timeout must be >= 0, got %lld", (long long)tv);
-        timeout_ms = (tv > INT_MAX) ? INT_MAX : (int)tv;
+        ray_t* err = ray_ipc_parse_open_opts(args[1], &timeout_ms, &compress);
+        if (err) return err;
     }
 
     const char* s = ray_str_ptr(x);
@@ -1497,7 +1496,7 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     const char* pw_ptr = (n_parts >= 4) ? password : NULL;
     const char* us_ptr = (n_parts >= 4) ? user : NULL;
 
-    int64_t h = ray_ipc_connect(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms);
+    int64_t h = ray_ipc_connect_opts(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms, compress);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
     if (h == -4) return ray_error("io", "wire version mismatch: %s:%d", host, port);

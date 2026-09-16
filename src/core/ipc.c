@@ -32,6 +32,7 @@
 #include "ops/ops.h"
 #include "store/journal.h"
 #include <string.h>
+#include <limits.h>
 #include <stdio.h>
 #include <errno.h>
 #include <signal.h>
@@ -1685,12 +1686,24 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
  * frame must conn_tx_drain_blocking() first (see sync_send /
  * ray_ipc_send_async).  Returns 0 on success, -1 on serialization or
  * socket failure. */
+/* The compression policy of an established connection.  Prefer the value
+ * cached on the conn data — it carries any explicit `compress` option from
+ * .ipc.open, which re-deriving from the peer address would silently
+ * discard — and fall back to link locality when there is no conn data. */
+static size_t conn_threshold(ray_selector_t* sel)
+{
+    if (!sel) return (size_t)RAY_IPC_COMPRESS_THRESHOLD;
+    ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
+    if (cd) return cd->compress_threshold;
+    return ray_ipc_link_threshold((ray_sock_t)sel->fd);
+}
+
 static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
-                              uint8_t extra_flags)
+                              uint8_t extra_flags, size_t threshold)
 {
     ray_err_t err = RAY_OK;
     ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags,
-                                             ray_ipc_link_threshold(fd), &err);
+                                             threshold, &err);
     if (!frame) return -1;
     int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
     ray_poll_frame_release(frame);
@@ -1721,6 +1734,14 @@ static int64_t connect_fail_code(int err) {
 int64_t ray_ipc_connect(const char* host, uint16_t port,
                          const char* user, const char* password,
                          int timeout_ms)
+{
+    return ray_ipc_connect_opts(host, port, user, password, timeout_ms,
+                                RAY_IPC_COMPRESS_AUTO);
+}
+
+int64_t ray_ipc_connect_opts(const char* host, uint16_t port,
+                         const char* user, const char* password,
+                         int timeout_ms, size_t compress_threshold)
 {
     /* The connection lives in the active poll's selector table — its
      * selector id IS the handle.  No poll, no handle namespace: refuse
@@ -1811,7 +1832,9 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
     cd->phase       = RAY_IPC_PHASE_HEADER;
     cd->listener_id = -1;               /* outbound: on.open never fires, on.close does */
     cd->restricted  = poll->restricted; /* -U narrows pushed evals too */
-    cd->compress_threshold = ray_ipc_link_threshold(fd);
+    cd->compress_threshold = (compress_threshold == RAY_IPC_COMPRESS_AUTO)
+                           ? ray_ipc_link_threshold(fd)
+                           : compress_threshold;
 
     ray_sock_set_nonblocking(fd);
 
@@ -1882,7 +1905,7 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
      * sync request, so its bytes can't interleave into the pending frame. */
     if (conn_tx_drain_blocking(poll, sel) < 0 ||
         conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
-                       extra_flags) < 0) {
+                       extra_flags, conn_threshold(sel)) < 0) {
         if (owned) ray_release(msg);
         return ray_error("io", "ipc send failed");
     }
@@ -1944,6 +1967,14 @@ ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
     return sync_send(handle, msg, 0);
 }
 
+size_t ray_ipc_handle_threshold(int64_t handle)
+{
+    ray_poll_t* poll;
+    ray_selector_t* sel = conn_resolve(&poll, handle);
+    if (!sel) return RAY_IPC_COMPRESS_AUTO;
+    return conn_threshold(sel);
+}
+
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
 {
     bool owned = false;
@@ -1961,7 +1992,8 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
     ray_selector_t* sel = conn_resolve(&poll, handle);
     ray_err_t rc = (!sel || conn_tx_drain_blocking(poll, sel) < 0 ||
                     conn_write_msg((ray_sock_t)sel->fd, msg,
-                                   RAY_IPC_MSG_ASYNC, 0) < 0)
+                                   RAY_IPC_MSG_ASYNC, 0,
+                                   conn_threshold(sel)) < 0)
                    ? RAY_ERR_IO : RAY_OK;
     if (owned) ray_release(msg);
     return rc;
@@ -2152,4 +2184,87 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
 ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
 {
     return sync_send(handle, msg, RAY_IPC_FLAG_VERBOSE);
+}
+
+/* ===== .ipc.open options ===== */
+
+/* Read one optional integer field.  Returns 1 if present, 0 if absent,
+ * -1 on a type error (with *err set). */
+static int opts_i64(ray_t* d, const char* name, int64_t* out, ray_t** err)
+{
+    ray_t* key = ray_sym(ray_sym_intern(name, strlen(name)));
+    if (!key) { *err = ray_error("oom", ".ipc.open options"); return -1; }
+    ray_t* v = ray_dict_get(d, key);
+    ray_release(key);
+    if (!v) return 0;
+    if (!ray_is_atom(v) || (v->type != -RAY_I64 && v->type != -RAY_I32)) {
+        *err = ray_error("type", ".ipc.open option `%s` must be an integer, got %s",
+                         name, ray_type_name(v->type));
+        ray_release(v);
+        return -1;
+    }
+    *out = (v->type == -RAY_I64) ? v->i64 : (int64_t)v->i32;
+    ray_release(v);
+    return 1;
+}
+
+ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
+                               size_t* compress_threshold)
+{
+    *timeout_ms         = 0;
+    *compress_threshold = RAY_IPC_COMPRESS_AUTO;
+    if (!arg) return NULL;
+
+    /* Backwards-compatible form: a bare integer is the connect timeout. */
+    if (ray_is_atom(arg) && (arg->type == -RAY_I64 || arg->type == -RAY_I32)) {
+        int64_t tv = (arg->type == -RAY_I64) ? arg->i64 : (int64_t)arg->i32;
+        if (tv == NULL_I64) return NULL;             /* 0N -> default budget */
+        if (tv < 0)
+            return ray_error("domain", ".ipc.open timeout must be >= 0, got %lld",
+                             (long long)tv);
+        *timeout_ms = (tv > INT_MAX) ? INT_MAX : (int)tv;
+        return NULL;
+    }
+
+    if (arg->type != RAY_DICT)
+        return ray_error("type", ".ipc.open expects an integer timeout or an options dict, got %s",
+                         ray_type_name(arg->type));
+
+    /* Reject unknown keys: a typo must not silently mean "default". */
+    ray_t* keys = ray_dict_keys(arg);
+    if (keys && keys->type == RAY_SYM) {
+        const int64_t* kd = (const int64_t*)ray_data(keys);
+        for (int64_t i = 0; i < keys->len; i++) {
+            ray_t* ks = ray_sym_str(kd[i]);
+            size_t n = ks ? ray_str_len(ks) : 0;
+            const char* p = ks ? ray_str_ptr(ks) : "";
+            bool known = (n == 7 && memcmp(p, "timeout",  7) == 0)
+                      || (n == 8 && memcmp(p, "compress", 8) == 0);
+            if (!known)
+                return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout` or `compress`)",
+                                 (int)n, p);
+        }
+    }
+
+    ray_t*  err = NULL;
+    int64_t tv  = 0;
+    int     got = opts_i64(arg, "timeout", &tv, &err);
+    if (got < 0) return err;
+    if (got == 1 && tv != NULL_I64) {
+        if (tv < 0)
+            return ray_error("domain", ".ipc.open timeout must be >= 0, got %lld",
+                             (long long)tv);
+        *timeout_ms = (tv > INT_MAX) ? INT_MAX : (int)tv;
+    }
+
+    int64_t cv = 0;
+    got = opts_i64(arg, "compress", &cv, &err);
+    if (got < 0) return err;
+    if (got == 1) {
+        /* 0N = never.  0 = always.  n = compress payloads larger than n. */
+        if (cv == NULL_I64)      *compress_threshold = RAY_IPC_COMPRESS_NEVER;
+        else if (cv < 0)         return ray_error("domain", ".ipc.open compress threshold must be >= 0 or 0N (never), got %lld", (long long)cv);
+        else                     *compress_threshold = (size_t)cv;
+    }
+    return NULL;
 }

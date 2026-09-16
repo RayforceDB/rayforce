@@ -2300,6 +2300,189 @@ static test_result_t test_ipc_compress_never_suppresses(void) {
     PASS();
 }
 
+/* ---- .ipc.open options (#541 layer 2) ----------------------------------
+ * The second argument stays an integer timeout, or becomes a dict with
+ * optional `timeout` and `compress`.  `compress` is a threshold in bytes,
+ * not a flag: 0N never compresses, 0 always does, n compresses payloads
+ * larger than n.  Absent means auto — the link-locality default. */
+
+static ray_t* mk_opts(const char** keys, ray_t** vals, int64_t n) {
+    ray_t* k = ray_vec_new(RAY_SYM, n);
+    k->len = n;
+    int64_t* kd = (int64_t*)ray_data(k);
+    for (int64_t i = 0; i < n; i++) kd[i] = ray_sym_intern(keys[i], strlen(keys[i]));
+    ray_t* v = ray_list_new(n);
+    for (int64_t i = 0; i < n; i++) ray_list_append(v, vals[i]);
+    return ray_dict_new(k, v);
+}
+
+/* An integer second argument keeps meaning "timeout", unchanged. */
+static test_result_t test_ipc_open_opts_int_timeout(void) {
+    ray_t* a = ray_i64(250);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(a, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_I(timeout, 250);
+    TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_AUTO);
+    ray_release(a);
+    PASS();
+}
+
+static test_result_t test_ipc_open_opts_dict_timeout(void) {
+    const char* keys[] = { "timeout" };
+    ray_t* vals[] = { ray_i64(400) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_I(timeout, 400);
+    TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_AUTO);
+    ray_release(vals[0]);
+    ray_release(d);
+    PASS();
+}
+
+/* 0N is "never compress", however large the payload. */
+static test_result_t test_ipc_open_opts_compress_null_never(void) {
+    const char* keys[] = { "compress" };
+    ray_t* vals[] = { ray_i64(NULL_I64) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_NEVER);
+    TEST_ASSERT_EQ_I(timeout, 0);      /* unset -> default budget */
+    ray_release(vals[0]);
+    ray_release(d);
+    PASS();
+}
+
+static test_result_t test_ipc_open_opts_compress_threshold(void) {
+    const char* keys[] = { "compress", "timeout" };
+    ray_t* vals[] = { ray_i64(5000), ray_i64(75) };
+    ray_t* d = mk_opts(keys, vals, 2);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_U(thr, 5000);
+    TEST_ASSERT_EQ_I(timeout, 75);
+    ray_release(vals[0]); ray_release(vals[1]);
+    ray_release(d);
+    PASS();
+}
+
+/* 0 is a legitimate threshold: compress everything. */
+static test_result_t test_ipc_open_opts_compress_zero_always(void) {
+    const char* keys[] = { "compress" };
+    ray_t* vals[] = { ray_i64(0) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 99;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_U(thr, 0);
+    ray_release(vals[0]);
+    ray_release(d);
+    PASS();
+}
+
+/* An unknown key is a typo, not a silent no-op. */
+static test_result_t test_ipc_open_opts_unknown_key(void) {
+    const char* keys[] = { "compres" };
+    ray_t* vals[] = { ray_i64(1) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(vals[0]);
+    ray_release(d);
+    PASS();
+}
+
+static test_result_t test_ipc_open_opts_bad_value_type(void) {
+    const char* keys[] = { "compress" };
+    ray_t* vals[] = { ray_str("lots", 4) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(vals[0]);
+    ray_release(d);
+    PASS();
+}
+
+static test_result_t test_ipc_open_opts_negative_rejected(void) {
+    const char* keys[] = { "compress" };
+    ray_t* vals[] = { ray_i64(-5) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(vals[0]);
+    ray_release(d);
+
+    const char* k2[] = { "timeout" };
+    ray_t* v2[] = { ray_i64(-1) };
+    ray_t* d2 = mk_opts(k2, v2, 1);
+    err = ray_ipc_parse_open_opts(d2, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(v2[0]);
+    ray_release(d2);
+    PASS();
+}
+
+/* 0N timeout means "use the default budget", matching an absent key. */
+static test_result_t test_ipc_open_opts_timeout_null_is_default(void) {
+    const char* keys[] = { "timeout" };
+    ray_t* vals[] = { ray_i64(NULL_I64) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_I(timeout, 0);
+    ray_release(vals[0]);
+    ray_release(d);
+    PASS();
+}
+
+/* An empty dict is valid: everything defaults. */
+static test_result_t test_ipc_open_opts_empty_dict(void) {
+    ray_t* k = ray_vec_new(RAY_SYM, 0); k->len = 0;
+    ray_t* v = ray_list_new(0);
+    ray_t* d = ray_dict_new(k, v);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_I(timeout, 0);
+    TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_AUTO);
+    ray_release(d);
+    PASS();
+}
+
+static test_result_t test_ipc_open_opts_wrong_arg_type(void) {
+    ray_t* a = ray_str("nope", 4);
+    int    timeout = -1;
+    size_t thr     = 0;
+    ray_t* err = ray_ipc_parse_open_opts(a, &timeout, &thr);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(a);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
@@ -2353,6 +2536,19 @@ const test_entry_t ipc_entries[] = {
     { "ipc/peer_is_local/invalid_fd",       test_ipc_peer_is_local_invalid_fd,        ipc_setup, ipc_teardown },
     { "ipc/link_threshold/local_vs_remote", test_ipc_link_threshold_local_vs_remote,  ipc_setup, ipc_teardown },
     { "ipc/compress_never_suppresses",      test_ipc_compress_never_suppresses,       ipc_setup, ipc_teardown },
+
+    /* .ipc.open options dict (#541 layer 2) */
+    { "ipc/open_opts/int_timeout",       test_ipc_open_opts_int_timeout,         ipc_setup, ipc_teardown },
+    { "ipc/open_opts/dict_timeout",      test_ipc_open_opts_dict_timeout,        ipc_setup, ipc_teardown },
+    { "ipc/open_opts/compress_null",     test_ipc_open_opts_compress_null_never, ipc_setup, ipc_teardown },
+    { "ipc/open_opts/compress_threshold",test_ipc_open_opts_compress_threshold,  ipc_setup, ipc_teardown },
+    { "ipc/open_opts/compress_zero",     test_ipc_open_opts_compress_zero_always,ipc_setup, ipc_teardown },
+    { "ipc/open_opts/unknown_key",       test_ipc_open_opts_unknown_key,         ipc_setup, ipc_teardown },
+    { "ipc/open_opts/bad_value_type",    test_ipc_open_opts_bad_value_type,      ipc_setup, ipc_teardown },
+    { "ipc/open_opts/negative_rejected", test_ipc_open_opts_negative_rejected,   ipc_setup, ipc_teardown },
+    { "ipc/open_opts/timeout_null",      test_ipc_open_opts_timeout_null_is_default, ipc_setup, ipc_teardown },
+    { "ipc/open_opts/empty_dict",        test_ipc_open_opts_empty_dict,          ipc_setup, ipc_teardown },
+    { "ipc/open_opts/wrong_arg_type",    test_ipc_open_opts_wrong_arg_type,      ipc_setup, ipc_teardown },
 
     { NULL, NULL, NULL, NULL },
 };
