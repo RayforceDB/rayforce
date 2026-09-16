@@ -10,6 +10,19 @@
 #include <stdlib.h>         /* realloc/free for the buffered median accumulator */
 #include <string.h>         /* memcpy for the top_n/bot_n native buffer */
 
+/* Registry dispatch already fixes each native kernel's input representation.
+ * Select its sentinel reader at compile time, preserving the validity view's
+ * base pointer without repeating a runtime type switch for every row. */
+static inline bool agg_live_i16(const void* p, int64_t i) { return ((const int16_t*)p)[i] != NULL_I16; }
+static inline bool agg_live_i32(const void* p, int64_t i) { return ((const int32_t*)p)[i] != NULL_I32; }
+static inline bool agg_live_i64(const void* p, int64_t i) { return ((const int64_t*)p)[i] != NULL_I64; }
+static inline bool agg_live_f32(const void* p, int64_t i) { float v = ((const float*)p)[i]; return v == v; }
+static inline bool agg_live_f64(const void* p, int64_t i) { double v = ((const double*)p)[i]; return v == v; }
+static inline bool agg_live_u8(const void* p, int64_t i) { (void)p; (void)i; return true; }
+#define AGG_NATIVE_LIVE(data, validity, row) _Generic(*(data), \
+    int16_t: agg_live_i16, int32_t: agg_live_i32, int64_t: agg_live_i64, \
+    float: agg_live_f32, double: agg_live_f64, uint8_t: agg_live_u8)((validity)->base, row)
+
 /* No-null fast path.  has_nulls is loop-invariant, but the compiler does NOT
  * reliably hoist ray_valid_at out of the per-row update — it shows up as ~12% of
  * a sum group-by in profiling.  Branch on it ONCE: the common non-null column
@@ -21,7 +34,7 @@
             for (int64_t i = 0; i < (n); i++) { BODY; }            \
         } else {                                                   \
             for (int64_t i = 0; i < (n); i++) {                    \
-                if (!ray_valid_at((valid), i)) continue;           \
+                if (!AGG_NATIVE_LIVE(d, (valid), i)) continue;           \
                 BODY;                                              \
             }                                                      \
         }                                                          \

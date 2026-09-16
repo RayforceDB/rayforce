@@ -559,9 +559,9 @@ static test_result_t test_dense_task_local(void) {
             TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
             agg_route_stats_t stats = agg_route_stats();
             TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
-            TEST_ASSERT_EQ_I(stats.dense_tasks, 4);
+            TEST_ASSERT_TRUE(stats.dense_tasks >= 4 && stats.dense_tasks <= 16);
             TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
-            TEST_ASSERT_EQ_I(stats.dense_local_slots, 4 * 321);
+            TEST_ASSERT_EQ_I(stats.dense_local_slots, stats.dense_tasks * 321);
             TEST_ASSERT_EQ_I(ray_table_nrows(out), 193);
             ray_t* ko = ray_table_get_col_idx(out, 0);
             ray_t* mn = ray_table_get_col_idx(out, 1);

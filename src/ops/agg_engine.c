@@ -4266,6 +4266,13 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
 
         if (dense_par_ok) {
+            /* Small domains can afford more independent source tasks. This
+             * lets work stealing absorb uneven worker throughput without
+             * multiplying large state slabs or retaining prior query state. */
+            uint32_t extra_tasks = dense_workers * 4;
+            if (extra_tasks > RAY_POOL_INIT_TASKS) extra_tasks = RAY_POOL_INIT_TASKS;
+            if (dense_workers > 1 && extra_tasks * slab_bytes <= scatter_budget / 8)
+                dense_workers = extra_tasks;
             route_stats.dense_tasks = dense_workers;
             route_stats.dense_local_slots = 0;
             for (uint32_t w = 0; w < dense_workers; w++)
