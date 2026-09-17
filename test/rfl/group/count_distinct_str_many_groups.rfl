@@ -1,0 +1,15 @@
+;; count (distinct STR) over many groups with a tiny string vocabulary.
+;; Before the fix this crashed (SIGSEGV) once the group count was large.
+;; Rows i and i+65536 share a group; the text index is shifted by the row's
+;; block so a two-row group sees two distinct strings and a one-row group one.
+(set I (til 100000))
+(set TX (% (+ (% I 4) (div I 65536)) 4))
+(set T (table [k text] (list (as 'I32 (% (* I 17) 65536)) (at ["pooled long alpha value" "beta" "gamma" "delta"] TX))))
+(set R (xasc (select {from: T by: k n: (count text) s: (count (distinct text))}) 'k))
+(count R) -- 65536
+(min (at R 's)) -- 1
+(max (at R 's)) -- 2
+(sum (at R 'n)) -- 100000
+;; every group's distinct count equals its row count
+(count (select {from: R where: (!= n s)})) -- 0
+(count (select {from: R where: (== s 2)})) -- 34464

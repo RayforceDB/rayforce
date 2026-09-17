@@ -1,0 +1,12 @@
+;; top/bot K is admitted for 1..1024 and rejected outside that range,
+;; on a small table and past the parallel threshold alike.
+(set T (table [k v] (list [1 1 2] [3 1 2])))
+(at (at (select {from: T by: k t: (top v 1)}) 't) 0) -- [3]
+(at (at (select {from: T by: k t: (top v 1024)}) 't) 0) -- [3 1]
+(try (select {from: T by: k t: (top v 0)}) (fn [e] 'rejected)) -- 'rejected
+(try (select {from: T by: k t: (top v 1025)}) (fn [e] 'rejected)) -- 'rejected
+(try (select {from: T by: k t: (bot v -1)}) (fn [e] 'rejected)) -- 'rejected
+(set B (table [k v] (list (take [1] 200000) (% (til 200000) 977))))
+(count (at (at (select {from: B by: k t: (top v 1024)}) 't) 0)) -- 1024
+(count (at (at (select {from: B by: k b: (bot v 1)}) 'b) 0)) -- 1
+(try (select {from: B by: k t: (top v 1025)}) (fn [e] 'rejected)) -- 'rejected

@@ -1,0 +1,28 @@
+;; top/bot with K >= the group's value count must return the values SORTED
+;; (top descending, bot ascending), also when nulls leave fewer than K values.
+;; Before the fix the partially filled heap was emitted in heap order.
+
+(set T (table [k v] (list [1 1 1 1 1 2 2] [5.0 3.0 9.0 1.0 7.0 2.0 8.0])))
+(set R (xasc (select {from: T by: k b: (bot v 1024) t: (top v 1024) b3: (bot v 3) t3: (top v 3)}) 'k))
+(at (at R 'b) 0) -- [1.0 3.0 5.0 7.0 9.0]
+(at (at R 't) 0) -- [9.0 7.0 5.0 3.0 1.0]
+(at (at R 'b) 1) -- [2.0 8.0]
+(at (at R 't) 1) -- [8.0 2.0]
+(at (at R 'b3) 1) -- [2.0 8.0]
+(at (at R 't3) 1) -- [8.0 2.0]
+
+;; nulls are skipped; the survivors must still come out sorted
+(set N (table [k v] (list [1 1 1 1 1 1 2 2 2] [5 0Nl 0Nl 9 0Nl 1 0Nl 0Nl 3])))
+(set RN (xasc (select {from: N by: k t: (top v 8) b: (bot v 8) t2: (top v 2)}) 'k))
+(at (at RN 't) 0) -- [9 5 1]
+(at (at RN 'b) 0) -- [1 5 9]
+(at (at RN 't2) 0) -- [9 5]
+(at (at RN 't) 1) -- [3]
+
+;; a group large enough for the parallel consumer: every list sorted
+(set B (table [k w] (list (take [1] 200000) (/ (as 'F64 (% (* 31 (til 200000)) 977)) 4))))
+(set RB (select {from: B by: k b: (bot w 1024) t: (top w 1024)}))
+(set LB (at (at RB 'b) 0))
+(set LT (at (at RB 't) 0))
+(min (>= (- (at LB (+ 1 (til 1023))) (at LB (til 1023))) 0)) -- true
+(min (<= (- (at LT (+ 1 (til 1023))) (at LT (til 1023))) 0)) -- true

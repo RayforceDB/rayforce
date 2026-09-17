@@ -1099,6 +1099,32 @@ static test_result_t test_wide_count_distinct(void) {
         TEST_ASSERT_EQ_I(ray_table_get_col(out, ray_sym_intern("m", 1))->type, RAY_F64);
         ray_release(out);
 
+        /* Key-dependent values: an even key sees every vocabulary entry across
+         * the four blocks, an odd key only entry 0, so a count landing on the
+         * wrong key is visible (the uniform table above cannot tell). */
+        snprintf(script, sizeof(script),
+            "(set t2 (table [i k v] (list i (as 'I32 (%% i 65536)) (at %s (* (as 'I64 (/ i 65536)) (- 1 (%% i 2)))))))",
+            vocabularies[kind]);
+        setup = ray_eval_str(script);
+        TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+        for (int shape = 0; shape < 4; shape++) {
+            int selected = shape & 1;
+            snprintf(script, sizeof(script), "(select {from:t2 by:k s:(count (distinct v)) %s %s})",
+                selected ? "where:(< i 196608)" : "", shape >= 2 ? "total:(sum i)" : "");
+            ray_t* keyed = ray_eval_str(script);
+            TEST_ASSERT_FMT(keyed && !RAY_IS_ERR(keyed), "keyed wide count distinct failed, type %d", types[kind]);
+            TEST_ASSERT_EQ_I(ray_table_nrows(keyed), 65536);
+            ray_t* keys = ray_table_get_col(keyed, ray_sym_intern("k", 1));
+            ray_t* cnt = ray_table_get_col(keyed, ray_sym_intern("s", 1));
+            TEST_ASSERT_NOT_NULL(keys); TEST_ASSERT_NOT_NULL(cnt);
+            TEST_ASSERT_EQ_I(keys->type, RAY_I32);
+            for (int64_t g = 0; g < cnt->len; g++) {
+                int32_t key = ((int32_t*)ray_data(keys))[g];
+                int64_t expect = (key & 1) ? 1 : (selected ? 2 : 3);
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt))[g], expect);
+            }
+            ray_release(keyed);
+        }
     }
     PASS();
 }
