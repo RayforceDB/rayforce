@@ -386,31 +386,10 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     ray_rc_sync = false;
 }
 
-/* --------------------------------------------------------------------------
- * ray_pool_dispatch_n — dispatch exactly n_tasks tasks, each [i, i+1)
- * -------------------------------------------------------------------------- */
-
-void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                         uint32_t n_tasks) {
-    if (n_tasks == 0) return;
-
-    /* Grow ring if needed */
-    if (n_tasks > pool->task_cap) {
-        uint32_t new_cap = pool->task_cap;
-        while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
-        if (new_cap > pool->task_cap) {
-            ray_pool_task_t* new_tasks = (ray_pool_task_t*)ray_sys_realloc(
-                pool->tasks, new_cap * sizeof(ray_pool_task_t));
-            if (new_tasks) {
-                pool->tasks = new_tasks;
-                pool->task_cap = new_cap;
-            }
-        }
-    }
-
-    /* Clamp n_tasks to task_cap to prevent ring overflow */
-    if (n_tasks > pool->task_cap) n_tasks = pool->task_cap;
-
+/* One round of ray_pool_dispatch_n: tasks [first, first+n_tasks), each handed
+ * to fn as [i, i+1) with its ABSOLUTE index, n_tasks <= task_cap. */
+static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             uint32_t first, uint32_t n_tasks) {
     /* Carve a fresh window [base, base+n_tasks) off the monotonic high-water
      * mark (the prior dispatch is fully claimed, so base == task_claim). */
     uint64_t base = atomic_load_explicit(&pool->task_limit, memory_order_relaxed);
@@ -420,8 +399,8 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         uint32_t slot = (uint32_t)((base + i) & (pool->task_cap - 1));
         pool->tasks[slot].fn = fn;
         pool->tasks[slot].ctx = ctx;
-        pool->tasks[slot].start = (int64_t)i;
-        pool->tasks[slot].end = (int64_t)i + 1;
+        pool->tasks[slot].start = (int64_t)(first + i);
+        pool->tasks[slot].end = (int64_t)(first + i) + 1;
     }
 
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
@@ -471,6 +450,40 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
     ray_rc_sync = false;
+}
+
+/* --------------------------------------------------------------------------
+ * ray_pool_dispatch_n — dispatch exactly n_tasks tasks, each [i, i+1)
+ * -------------------------------------------------------------------------- */
+
+void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                         uint32_t n_tasks) {
+    if (n_tasks == 0) return;
+
+    /* Grow ring if needed */
+    if (n_tasks > pool->task_cap) {
+        uint32_t new_cap = pool->task_cap;
+        while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
+        if (new_cap > pool->task_cap) {
+            ray_pool_task_t* new_tasks = (ray_pool_task_t*)ray_sys_realloc(
+                pool->tasks, new_cap * sizeof(ray_pool_task_t));
+            if (new_tasks) {
+                pool->tasks = new_tasks;
+                pool->task_cap = new_cap;
+            }
+        }
+    }
+
+    /* The ring holds task_cap tasks at a time.  Anything past that runs in
+     * further rounds rather than being dropped: a window with more
+     * partitions than the ring, or a join with more morsels, used to lose
+     * every task past the cap silently. */
+    for (uint32_t first = 0; first < n_tasks; ) {
+        uint32_t batch = n_tasks - first;
+        if (batch > pool->task_cap) batch = pool->task_cap;
+        dispatch_n_round(pool, fn, ctx, first, batch);
+        first += batch;
+    }
 }
 
 /* --------------------------------------------------------------------------
