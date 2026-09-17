@@ -282,12 +282,15 @@ static test_result_t test_group_routes_and_bool_outputs(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
     /* 65536 rows exercises parallel finalization with one output per group.
-     * all/any BOOL outputs previously wrote at 8-byte strides into byte vectors. */
+     * all/any BOOL outputs previously wrote at 8-byte strides into byte vectors.
+     * Mode 1 is four sparse keys: the cardinality probe keeps that off the
+     * radix scatter and on the per-worker small hash; mode 4 is 65536 sparse
+     * keys, which the probe cannot bound, so radix keeps it. */
     const struct { int64_t n; int mode; agg_route_t route; } cases[] = {
         { 32, 0, AGG_ROUTE_V2_SERIAL_DENSE },
         { 32, 1, AGG_ROUTE_V2_SERIAL_HASH },
         { RAY_PARALLEL_THRESHOLD, 0, AGG_ROUTE_V2_DENSE },
-        { RAY_PARALLEL_THRESHOLD, 1, AGG_ROUTE_V2_RADIX },
+        { RAY_PARALLEL_THRESHOLD, 1, AGG_ROUTE_V2_SMALLHASH },
         { RAY_PARALLEL_THRESHOLD, 2, AGG_ROUTE_V2_DENSE },
         { RAY_PARALLEL_THRESHOLD, 3, AGG_ROUTE_V2_DENSE },
         { RAY_PARALLEL_THRESHOLD, 4, AGG_ROUTE_V2_RADIX },

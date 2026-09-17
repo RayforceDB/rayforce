@@ -1,0 +1,61 @@
+;; Sparse integer keys with few groups, or one hot key, are grouped through
+;; per-worker hash tables instead of the radix scatter.  The results must not
+;; depend on the strategy: every aggregate is checked against a recomputation
+;; over the rows of that group.
+(set N 300000)
+(set U (% (* 7919 (til N)) 40))
+(set V (+ 1 (% (* 13 (til N)) 101)))
+(set W (/ (as 'F64 (% (* 31 (til N)) 977)) 4))
+(set T (table [k v w] (list (* 1000003 (+ 1 U)) V W)))
+(set R (xasc (select {from: T by: k s: (sum v) c: (count v) mn: (min w) mx: (max w) a: (avg w)}) 'k))
+(count R) -- 40
+(set ORACLE (fn [kk] (do (set rows (select {from: T where: (== k kk)})) (list (sum (at rows 'v)) (count (at rows 'v)) (min (at rows 'w)) (max (at rows 'w))))))
+(set CHK (fn [i] (do (set kk (at (at R 'k) i)) (set o (ORACLE kk)) (all (list (== (at (at R 's) i) (at o 0)) (== (at (at R 'c) i) (at o 1)) (== (at (at R 'mn) i) (at o 2)) (== (at (at R 'mx) i) (at o 3)))))))
+(all (map CHK (til 40))) -- true
+(sum (at R 'c)) -- N
+;; a hot key: nine rows in ten fall in one group
+(set H (* U (as 'I64 (== 0 (% (til N) 10)))))
+(set TH (table [k v w] (list (* 1000003 (+ 1 H)) V W)))
+(set RH (xasc (select {from: TH by: k s: (sum v) c: (count v) mn: (min w)}) 'k))
+(at (at RH 'c) 0) -- (count (select {from: TH where: (== k 1000003)}))
+(at (at RH 's) 0) -- (sum (at (select {from: TH where: (== k 1000003)}) 'v))
+(sum (at RH 'c)) -- N
+;; a selection stays on its own path and agrees
+(set RS (xasc (select {from: T where: (> v 50) by: k s: (sum v) c: (count v)}) 'k))
+(sum (at RS 'c)) -- (count (select {from: T where: (> v 50)}))
+;; past the estimate the radix path still runs: many groups, same oracle
+(set B (% (* 7919 (til N)) 60000))
+(set TB (table [k v] (list (* 1000003 (+ 1 B)) V)))
+(set RB (select {from: TB by: k s: (sum v) c: (count v)}))
+(count RB) -- 60000
+(sum (at RB 'c)) -- N
+(sum (at RB 's)) -- (sum V)
+;; runs of equal keys (the single-key table caches the last key -> group)
+(set RUNS (* 1000003 (+ 1 (div (til N) 3000))))
+(set TR (table [k v] (list RUNS V)))
+(set RR (xasc (select {from: TR by: k s: (sum v) c: (count v)}) 'k))
+(count RR) -- 100
+(at RR 'c) -- (take (enlist 3000) 100)
+(sum (at RR 's)) -- (sum V)
+(at (at RR 's) 7) -- (sum (at (select {from: TR where: (== k 8000024)}) 'v))
+;; the probe underestimates a stepped key: more groups than the table was
+;; sized for, so it has to grow while grouping
+(set STEP (* 1000003 (+ 1 (% (* (div (til N) 7) 977) 4000))))
+(set TS (table [k v] (list STEP V)))
+(set RSTEP (select {from: TS by: k s: (sum v) c: (count v)}))
+(count RSTEP) -- (count (distinct STEP))
+(sum (at RSTEP 'c)) -- N
+(sum (at RSTEP 's)) -- (sum V)
+;; a null key among few groups is its own group: every fifth row is null,
+;; which swallows the four residues 0/5/10/15 of the 20 entirely, so 16 keys
+;; survive beside the null group
+(set NK (as 'I64 (map (fn [i] (if (== 0 (% i 5)) 0Nl (* 1000003 (+ 1 (% i 20))))) (til N))))
+(set TN (table [k v] (list NK V)))
+(set RN (select {from: TN by: k c: (count v) s: (sum v)}))
+(count RN) -- 17
+(sum (at RN 'c)) -- N
+(at (at (select {from: RN where: (== k 0Nl)}) 'c) 0) -- (count (select {from: TN where: (== k 0Nl)}))
+;; I32 and DATE keys take the same path
+(set T32 (table [k v] (list (as 'I32 (* 100003 (+ 1 U))) V)))
+(sum (at (select {from: T32 by: k s: (sum v)}) 's)) -- (sum V)
+(count (select {from: T32 by: k s: (sum v)})) -- 40

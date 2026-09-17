@@ -2072,10 +2072,13 @@ typedef struct {
     int64_t  htcap;
     uint64_t htmask;
     int64_t* first_row;   /* [cap] representative (MIN) row idx per local group */
+    int64_t* keys;        /* [cap] the group's key, single-key tables only (else NULL) */
     char*    states;      /* [cap*block] AoS group state */
     int64_t  ng, cap;
     size_t   block;
     int      oom;
+    int64_t  last_key;    /* single-key: the key of the last probed row ... */
+    int32_t  last_gid;    /* ... and its gid, -1 when nothing cached */
 } agg_sh_t;
 
 static int agg_sh_init(agg_sh_t* sh, int64_t cap, size_t block) {
@@ -2087,14 +2090,23 @@ static int agg_sh_init(agg_sh_t* sh, int64_t cap, size_t block) {
     sh->ht        = ray_alloc_raw((size_t)htcap * sizeof(int32_t));
     sh->first_row = ray_alloc_raw((size_t)cap * sizeof(int64_t));
     sh->states    = ray_alloc_raw((size_t)cap * block);
+    sh->keys = NULL; sh->last_gid = -1; sh->last_key = 0;
     if (!sh->ht || !sh->first_row || !sh->states) { sh->oom = 1; return -1; }
     for (int64_t i = 0; i < htcap; i++) sh->ht[i] = -1;
     return 0;
 }
+/* Single-key tables keep the key next to the gid so a probe compares one
+ * int64 instead of re-reading two rows through the typed key column. */
+static int agg_sh_init1(agg_sh_t* sh, int64_t cap, size_t block) {
+    if (agg_sh_init(sh, cap, block) != 0) return -1;
+    sh->keys = ray_alloc_raw((size_t)sh->cap * sizeof(int64_t));
+    if (!sh->keys) { sh->oom = 1; return -1; }
+    return 0;
+}
 
 static void agg_sh_destroy(agg_sh_t* sh) {
-    ray_free_raw(sh->ht); ray_free_raw(sh->first_row); ray_free_raw(sh->states);
-    sh->ht = NULL; sh->first_row = NULL; sh->states = NULL;
+    ray_free_raw(sh->ht); ray_free_raw(sh->first_row); ray_free_raw(sh->states); ray_free_raw(sh->keys);
+    sh->ht = NULL; sh->first_row = NULL; sh->states = NULL; sh->keys = NULL;
 }
 
 /* Grow capacity (states + first_row) when ng would exceed cap.  Doubles cap. */
@@ -2106,6 +2118,11 @@ static int agg_sh_grow_cap(agg_sh_t* sh) {
     char* nst = ray_realloc_raw(sh->states, (size_t)nc * sh->block);
     if (!nst) { sh->oom = 1; return -1; }
     sh->states = nst;
+    if (sh->keys) {
+        int64_t* nk = ray_realloc_raw(sh->keys, (size_t)nc * sizeof(int64_t));
+        if (!nk) { sh->oom = 1; return -1; }
+        sh->keys = nk;
+    }
     sh->cap = nc;
     return 0;
 }
@@ -2122,7 +2139,8 @@ static int agg_sh_grow_ht(agg_sh_t* sh, ray_t** key_cols, const void** key_data,
     uint64_t nmask = (uint64_t)nc - 1;
     for (int64_t i = 0; i < nc; i++) nht[i] = -1;
     for (int64_t g = 0; g < sh->ng; g++) {
-        uint64_t h = agg_tuple_hash(key_cols, key_data, n_keys, sh->first_row[g]);
+        uint64_t h = sh->keys ? ray_hash_i64(sh->keys[g])
+                              : agg_tuple_hash(key_cols, key_data, n_keys, sh->first_row[g]);
         uint64_t slot = h & nmask;
         while (nht[slot] >= 0) slot = (slot + 1) & nmask;
         nht[slot] = (int32_t)g;
@@ -2190,6 +2208,41 @@ static inline int32_t agg_sh_find_or_insert(
     }
 }
 
+/* Single-key probe-or-insert: the key is read once, hashed with the same
+ * finalizer the rehash uses, and compared against the key stored with the
+ * group.  A run of equal keys costs one compare per row. */
+static inline int32_t agg_sh_find_or_insert1(agg_sh_t* sh, int64_t key,
+        const agg_vtable_t** vts, const size_t* off, uint32_t n_aggs, int64_t r) {
+    if (sh->last_gid >= 0 && key == sh->last_key) return sh->last_gid;
+    uint64_t h = ray_hash_i64(key);
+    uint64_t slot = h & sh->htmask;
+    for (;;) {
+        int32_t gp = sh->ht[slot];
+        if (gp < 0) {
+            if (sh->ng == sh->cap && agg_sh_grow_cap(sh) != 0) return -1;
+            if ((sh->ng + 1) * 2 > sh->htcap) {
+                if (agg_sh_grow_ht(sh, NULL, NULL, 1) != 0) return -1;
+                slot = h & sh->htmask;
+                while (sh->ht[slot] >= 0) slot = (slot + 1) & sh->htmask;
+            }
+            int32_t g = (int32_t)sh->ng;
+            sh->ht[slot] = g;
+            sh->first_row[g] = r;
+            sh->keys[g] = key;
+            for (uint32_t a = 0; a < n_aggs; a++)
+                vts[a]->init(sh->states + (size_t)g * sh->block + off[a]);
+            sh->ng++;
+            sh->last_key = key; sh->last_gid = g;
+            return g;
+        }
+        if (sh->keys[gp] == key) {
+            sh->last_key = key; sh->last_gid = gp;
+            return gp;
+        }
+        slot = (slot + 1) & sh->htmask;
+    }
+}
+
 /* Phase A: per-worker small-hash group + accumulate over chunk [start,end),
  * processed in fixed-size sub-chunks so the gid buffer is O(CHUNK), not O(N). */
 static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -2227,11 +2280,21 @@ static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
     for (int64_t cs = start; cs < end; cs += AGG_SH_CHUNK) {
         int64_t ce = cs + AGG_SH_CHUNK; if (ce > end) ce = end;
         int64_t n = ce - cs;
-        for (int64_t r = cs; r < ce; r++) {
-            int32_t g = agg_sh_find_or_insert(sh, c->key_cols, c->key_data, c->n_keys,
-                                              c->vts, c->off, c->n_aggs, r);
-            if (g < 0) { sh->oom = 1; return; }
-            gid[r - cs] = (uint32_t)g;
+        if (sh->keys) {
+            ray_t* kc = c->key_cols[0]; const void* kd = c->key_data[0];
+            for (int64_t r = cs; r < ce; r++) {
+                int32_t g = agg_sh_find_or_insert1(sh, agg_read_key_i64(kc, kd, r),
+                                                   c->vts, c->off, c->n_aggs, r);
+                if (g < 0) { sh->oom = 1; return; }
+                gid[r - cs] = (uint32_t)g;
+            }
+        } else {
+            for (int64_t r = cs; r < ce; r++) {
+                int32_t g = agg_sh_find_or_insert(sh, c->key_cols, c->key_data, c->n_keys,
+                                                  c->vts, c->off, c->n_aggs, r);
+                if (g < 0) { sh->oom = 1; return; }
+                gid[r - cs] = (uint32_t)g;
+            }
         }
         for (uint32_t a = 0; a < c->n_aggs; a++) {
             if (c->vts[a]->update_batch2) {             /* binary agg (pearson) */
@@ -2260,7 +2323,8 @@ static ray_t* exec_group_v2_parallel_smallhash(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
         ray_t** key_cols, int64_t* key_syms,
         const agg_vtable_t** vts, const size_t* off, size_t block,
-        ray_t* sel, const int64_t* sel_prefix, int64_t n_sel) {
+        ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
+        int64_t cap_hint) {
     agg_route_record(AGG_ROUTE_V2_SMALLHASH);
     ray_op_ext_t* ext = find_ext(g, op->id);
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
@@ -2280,7 +2344,7 @@ static ray_t* exec_group_v2_parallel_smallhash(
     if (!locals) { agg_desc_free(&d); return ray_error("oom", NULL); }
     int alloc_oom = 0;
     for (uint32_t w = 0; w < nw; w++)
-        if (agg_sh_init(&locals[w], 1, block) != 0) { alloc_oom = 1; break; }
+        if ((n_keys == 1 && !sel ? agg_sh_init1 : agg_sh_init)(&locals[w], cap_hint > 0 ? cap_hint : 1, block) != 0) { alloc_oom = 1; break; }
     if (alloc_oom) {
         for (uint32_t w = 0; w < nw; w++) agg_sh_destroy(&locals[w]);
         ray_free_raw(locals);
@@ -3149,7 +3213,7 @@ static ray_t* exec_group_v2_parallel_radix(
         ray_free_raw(bufs); ray_free_raw(parts);
         scratch_free(off_hdr); agg_desc_free(&d);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
-                key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+                key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel, 1);
     }
 
     agg_radix_ctx_t ctx = {
@@ -3194,7 +3258,7 @@ static ray_t* exec_group_v2_parallel_radix(
         ray_free_raw(bufs); ray_free_raw(parts);
         agg_desc_free(&d);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
-                key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+                key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel, 1);
     }
 
     /* Phase 3: restore stable first-seen order across partitions. */
@@ -4006,6 +4070,40 @@ done:
     return result ? result : ray_error("oom", NULL);
 }
 
+/* Cheap cardinality probe on the first key: 1024 stratified samples give the
+ * number of distinct keys seen and the share of the most frequent one.  Both
+ * are lower bounds on the table's group count / hot-key share; the caller
+ * only uses them to keep a low-cardinality or hot-key query off the radix
+ * path, where the scatter costs more than the grouping.  Probe-local, no
+ * aggregate state, no answer feeds execution. */
+static void agg_card_probe(ray_t* key, int64_t rows, int64_t* groups_est, int* top_count) {
+    enum { SAMPLES = 1024, CAP = 2048 };
+    *groups_est = INT64_MAX; *top_count = 1;
+    if (rows < SAMPLES) return;
+    int16_t map[CAP]; int64_t values[SAMPLES]; int16_t counts[SAMPLES];
+    memset(map, -1, sizeof(map));
+    int nd = 0, top = 1;
+    int64_t step = rows / SAMPLES;
+    const void* data = ray_data(key);
+    for (int i = 0; i < SAMPLES; i++) {
+        uint64_t jitter = ray_hash_i64(i);
+        int64_t row = i * step + (int64_t)(jitter % (uint64_t)step);
+        int64_t v = agg_read_key_i64(key, data, row);
+        uint32_t at = ray_hash_i64(v) & (CAP - 1);
+        while (map[at] >= 0 && values[map[at]] != v) at = (at + 1) & (CAP - 1);
+        if (map[at] < 0) { map[at] = (int16_t)nd; values[nd] = v; counts[nd] = 1; nd++; }
+        else { int16_t c = ++counts[map[at]]; if (c > top) top = c; }
+    }
+    /* Good-Turing: the share of keys seen once is the share of the mass still
+     * unseen, so groups ~ distinct / (1 - singletons/samples).  A sample that
+     * is nearly all singletons says nothing beyond "many" — leave it at
+     * INT64_MAX and let radix have it. */
+    int f1 = 0;
+    for (int g = 0; g < nd; g++) f1 += (counts[g] == 1);
+    if (f1 <= SAMPLES - 64) *groups_est = (int64_t)nd * SAMPLES / (SAMPLES - f1);
+    *top_count = top;
+}
+
 /* Shared extrema help when repeated keys let workers skip state writes.
  * A deterministic, stratified sample exercises the registered capability with
  * its own state, so this decision needs no aggregate/type-specific predicates.
@@ -4182,6 +4280,59 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (dense_budget > (double)SIZE_MAX) dense_budget = (double)SIZE_MAX;
         if (watermark > 0 && dense_budget > (double)watermark / 4) dense_budget = (double)watermark / 4;
         double slab_bytes = dp.ok ? (double)dp.total_slots * (block + sizeof(int64_t) + 1) : 0;
+        /* Low cardinality or a hot key.  Radix scatters every row into
+         * per-partition payload buffers and then groups each partition alone,
+         * so with few groups the scatter dominates, and a hot key lands in
+         * one partition and one task; a dense plan over a sparse key domain
+         * pays for every slot in the domain instead.  Per-worker hash tables sized from a
+         * probe, merged once, do the same work without the scatter and split
+         * the hot key across workers.  Per-worker tables cost groups x
+         * workers x state, all of it merged at the end and live in cache
+         * during the scan; radix costs one scatter of every row.  Measured on
+         * a 24-thread box the two cross near 10-20k groups for an 8-byte
+         * state and near 5-10k for a 4-agg one: an 8 MiB budget on the
+         * replicated state reproduces both. */
+        bool probe_ok = ext->n_keys == 1 && !sel && group_limit <= 0;
+        if (probe_ok) {
+            switch (key_cols[0]->type) {
+                case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
+                case RAY_BOOL: case RAY_DATE: case RAY_TIME:
+                case RAY_TIMESTAMP: case RAY_SYM: break;
+                default: probe_ok = false;
+            }
+        }
+        /* A dense plan over a small domain is a direct index; nothing here
+         * beats it, so do not pay for the probe. */
+        if (probe_ok && dp.ok && dp.total_slots <= 65536) probe_ok = false;
+        if (probe_ok) {
+            int64_t est; int top;
+            agg_card_probe(key_cols[0], nrows, &est, &top);
+            uint32_t nw_est = ray_pool_total_workers(pool);
+            /* The merge of est x workers states is a fixed cost against a
+             * scatter proportional to the rows: on small tables it wins only
+             * while it stays under half the row count (100k rows x 10k groups
+             * x 24 workers measured 2x slower than radix, 300k x 5k 0.7x). */
+            bool low = est != INT64_MAX &&
+                       (double)est * (double)nw_est * (double)(block + 8) <= 8.0 * 1024 * 1024 &&
+                       (double)est * (double)nw_est <= (double)nrows / 2;
+            bool hot = top >= 512;              /* one key holds >= half the rows */
+            /* A dense plan whose slot domain is close to the group count is
+             * a direct index and beats any hash; leave those alone.  Only a
+             * domain that dwarfs the groups (sparse keys admitted to the
+             * partitioned dense plan on a large table: 10 keys spanning 10M
+             * slots measured 29 ms against 1.6 ms) is worth pre-empting. */
+            bool sparse_domain = !dp.ok || (double)dp.total_slots >= 64.0 * (double)(est == INT64_MAX ? 1 : est);
+            low = low && sparse_domain;
+            hot = hot && sparse_domain;
+            if (low || hot) {
+                int64_t hint = est == INT64_MAX ? 65536 : est * 2;
+                if (hint < 16) hint = 16;
+                if (hint > 65536) hint = 65536;
+                ray_t* r = exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
+                        key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel, hint);
+                agg_vo_free(&vo); scratch_free(kc_hdr); return r;
+            }
+        }
         /* A bounded group emit selects first-seen groups. Dense slot order
          * cannot satisfy that contract; retain radix's bounded selection. */
         bool shared_plan = dp.ok && group_limit <= 0 && !sel && ext->n_keys == 1 && dp.total_slots >= 4096;
