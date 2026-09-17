@@ -19,6 +19,7 @@ bool ray_agg_engine_v2 = true;   /* knob; default on */
 static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
 agg_route_stats_t agg_route_stats(void) { return route_stats; }
+void agg_route_note_key_domain(void) { route_stats.key_domain_evals++; }
 void agg_route_record(agg_route_t route) {
     static const char* const names[AGG_ROUTE_COUNT] = {
         "group: none", "group: legacy", "group: slices", "group: parted",

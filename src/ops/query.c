@@ -2839,6 +2839,14 @@ static bool derived_key_expr_ok(ray_t* e, ray_t* tbl, int64_t col_sym, int64_t* 
     ray_t** el = (ray_t**)ray_data(e);
     if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED) || !derived_key_head_ok(el[0]->i64))
         return false;
+    /* The name must still mean the builtin: the DAG compiler inlines a
+     * global lambda of that name ahead of the builtin, and a let-bound
+     * name shadows it too. */
+    for (int i = 0; i < nbound; i++) if (bound[i] == el[0]->i64) return false;
+    {
+        ray_t* gv = ray_env_get(el[0]->i64);          /* borrowed */
+        if (gv && gv->type == RAY_LAMBDA) return false;
+    }
     ray_t* hs = ray_sym_str(el[0]->i64);
     size_t hl = ray_str_len(hs);
     const char* hp = ray_str_ptr(hs);
@@ -2900,11 +2908,12 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     const void* cd = ray_data(C);
     {
         const int64_t probe_rows = nrows < 65536 ? nrows : 65536;
-        enum { PROBE_SLOTS = 131072 };
+        int64_t PROBE_SLOTS = 1024;               /* power of two, load <= 1/2 */
+        while (PROBE_SLOTS < 2 * probe_rows) PROBE_SLOTS <<= 1;
         ray_t* set_hdr = NULL;
-        int64_t* set = (int64_t*)scratch_alloc(&set_hdr, PROBE_SLOTS * sizeof(int64_t));
+        int64_t* set = (int64_t*)scratch_alloc(&set_hdr, (size_t)PROBE_SLOTS * sizeof(int64_t));
         if (!set) return NULL;
-        memset(set, 0xff, PROBE_SLOTS * sizeof(int64_t));
+        memset(set, 0xff, (size_t)PROBE_SLOTS * sizeof(int64_t));
         int64_t seen = 0;
         for (int64_t r = 0; r < probe_rows; r++) {
             int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
@@ -2977,6 +2986,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
     if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
     if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    agg_route_note_key_domain();
     return spread;
 }
 

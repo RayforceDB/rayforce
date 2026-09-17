@@ -277,6 +277,43 @@ static test_result_t test_registry_admission_contracts(void) {
     PASS();
 }
 
+/* A single-expression `by:` over one SYM column with few distinct symbols
+ * is evaluated once per symbol (agg_route_stats().key_domain_evals); a
+ * positional expression, a two-column expression, a shadowed builtin and a
+ * table below the row gate all take the row-wise key. */
+static test_result_t test_derived_key_per_symbol_route(void) {
+    static const char* const setup =
+        "(set i (til 8192)) "
+        "(set s (as 'SYMBOL (map (fn [k] (format \"h%.x\" (% k 16))) i))) "
+        "(set v (as 'F64 (% i 7))) "
+        "(set T (table [s v] (list s v))) "
+        "(set T3 (take T 3000))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; uint64_t evals; } cases[] = {
+        { "(select {from: T by: (substr s 0 2) c: (count v)})", 1 },
+        { "(select {from: T by: (let p (str-find s \".\") (if (> p 1) (substr s 0 p) s)) c: (count v)})", 1 },
+        { "(select {from: T by: (differ s) c: (count v)})", 0 },
+        { "(select {from: T by: (if (> v 3) (substr s 0 2) s) c: (count v)})", 0 },
+        { "(select {from: T3 by: (substr s 0 2) c: (count v)})", 0 },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        agg_route_reset();
+        ray_t* out = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        ray_release(out);
+        TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, cases[c].evals);
+    }
+    /* A user lambda shadowing `substr` is what the compiled key would call. */
+    r = ray_eval_str("(set substr (fn [x a b] x))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(select {from: T by: (substr s 0 2) c: (count v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
+    PASS();
+}
+
 static test_result_t test_group_routes_and_bool_outputs(void) {
     /* Route expectations below use two cores regardless of harness settings. */
     ray_pool_destroy();
@@ -1701,6 +1738,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },
+    { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
