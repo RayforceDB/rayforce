@@ -1,0 +1,36 @@
+;; count (distinct x) with a composite key written as a symbol vector,
+;; `by: [k1 k2]`, must give the same answer as the dict form and as a
+;; per-group recomputation, with and without where / desc / take, at a size
+;; past the fused kernel's row floor so that path is the one exercised.
+(set N 300000)
+(set I (til N))
+(set P (as 'SYMBOL (map (fn [k] (format "p%" k)) (til 50))))
+(set M (as 'SYMBOL (map (fn [k] (if (== k 0) "" (format "m%" k))) (til 300))))
+(set T (table [a b u] (list (at P (% (* 7 I) 50)) (at M (% (* 13 I) 300)) (% (* 7919 I) 51000))))
+(set V  (select {from: T by: [a b] u: (count (distinct u))}))
+(set D  (select {from: T by: {a: a b: b} u: (count (distinct u))}))
+(count V) -- (count D)
+(sum (at V 'u)) -- (sum (at D 'u))
+(cols V) -- ['a 'b 'u]
+;; per-group oracle on a few groups
+(set ORA (fn [aa bb] (count (distinct (at (select {from: T where: (and (== a aa) (== b bb))}) 'u)))))
+(set CHK (fn [i] (== (at (at V 'u) i) (ORA (at (at V 'a) i) (at (at V 'b) i)))))
+(all (map CHK (list 0 1 2 (div (count V) 3) (- (count V) 1)))) -- true
+;; where + desc + take (the ClickBench Q12 shape): the ten rows must carry
+;; the ten largest counts of the full, filtered result — ties past the cut
+;; may pick either group, so the keys are checked through their counts
+(set VW (select {from: T by: [a b] u: (count (distinct u)) where: (!= b "") desc: u take: 10}))
+(set FULL (select {from: T by: [a b] u: (count (distinct u)) where: (!= b "")}))
+(count VW) -- 10
+(at VW 'u) -- (at (desc (at FULL 'u)) (til 10))
+(count (select {from: VW where: (== b "")})) -- 0
+(set CHKW (fn [i] (== (at (at VW 'u) i) (ORA (at (at VW 'a) i) (at (at VW 'b) i)))))
+(all (map CHKW (til 10))) -- true
+;; three keys
+(set C (% (* 3 I) 4))
+(set T3 (table [a b c u] (list (at P (% (* 7 I) 50)) (at M (% (* 13 I) 300)) C (% (* 7919 I) 51000))))
+(set V3 (select {from: T3 by: [a b c] u: (count (distinct u))}))
+(set D3 (select {from: T3 by: {a: a b: b c: c} u: (count (distinct u))}))
+(count V3) -- (count D3)
+(sum (at V3 'u)) -- (sum (at D3 'u))
+(cols V3) -- ['a 'b 'c 'u]
