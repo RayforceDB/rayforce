@@ -42,6 +42,13 @@ typedef enum {
     AGG_ROUTE_COUNT,
 } agg_route_t;
 
+typedef enum {
+    AGG_DENSE_NONE,
+    AGG_DENSE_TASK_LOCAL,
+    AGG_DENSE_PARTITIONED,
+    AGG_DENSE_SHARED,
+} agg_dense_strategy_t;
+
 /* Per-calling-thread dispatch counts since reset, not a whole-query trace.
  * Nested/partitioned groups may record multiple routes. Incremented only at
  * dispatch boundaries, never inside worker row loops. A count records an
@@ -53,7 +60,9 @@ typedef struct {
     bool nullable_key;              /* last v2 run: non-SYM key may contain nulls */
     bool dense_plan_available;      /* last v2 run: bounded dense range exists */
     bool dense_worker_budget;       /* worker allocation or sampled traffic budget exceeded */
-    uint32_t dense_tasks;           /* selected logical dense tasks, may be less than pool workers */
+    agg_dense_strategy_t dense_strategy;
+    uint64_t dense_local_slots;     /* allocated group-state slots, including partials */
+    uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
 } agg_route_stats_t;
 void agg_route_reset(void);
 agg_route_stats_t agg_route_stats(void);
@@ -89,6 +98,12 @@ typedef struct {
  * (the GROUP path and the keys-only DISTINCT path) and the fixed data[16]
  * inside became an exact carve, so any key count groups correctly. */
 int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_t* out);
+/* Exact wide-value distinct counts over an existing stable group index. */
+ray_t* agg_count_distinct_indexed(ray_t* src, const int64_t* rows,
+    const int64_t* offsets, const int64_t* counts, int64_t groups);
+/* Large flat grouping: return first-occurrence keys and stable index vectors,
+ * or NULL when the existing serial implementation should handle the input. */
+ray_t* agg_group_indices(ray_t* source);
 
 /* Release the buffers an agg_groups_t holds (buddy-backed, NOT libc malloc — so
  * callers must use this, not free()).  Idempotent; NULLs the pointers. */
@@ -115,6 +130,9 @@ ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms
 ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
                    const uint32_t* gids, int64_t nrows, int64_t ngroups,
                    int64_t kparam);
+ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
+                       const uint32_t* gids, int64_t nrows, int64_t ngroups,
+                       int64_t kparam);
 
 /* ── Dense grouping eligibility selector (compact-range int/SYM keys) ──
  * When dense applies, a group id is the packed key offset (O(1) direct index)
@@ -132,7 +150,7 @@ typedef struct {
 } dense_plan_t;
 
 /* Decide if dense grouping applies to (key_cols, aggs).  Eligible iff:
- *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} with no nullable non-SYM keys
+ *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} with a dedicated slot for nullable keys
  *  - product of per-key ranges is no larger than the contributing row count
  *    (so dense state is O(input), never controlled by a machine-size budget)
  * Does one min/max prescan over the key columns.  Sets out->ok accordingly.

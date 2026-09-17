@@ -2771,6 +2771,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
         return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
     int64_t n = x->len;
+    ray_t* parallel = agg_group_indices(x);
+    if (parallel) return parallel;
     if (n == 0) {
         ray_t* keys = ray_list_new(0);
         if (RAY_IS_ERR(keys)) return keys;

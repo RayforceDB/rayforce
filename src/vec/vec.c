@@ -385,7 +385,7 @@ ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem) {
  * dead inline copy in every TU that includes the public header. */
 void* ray_data_slice_path(ray_t* v) {
     return (char*)v->slice_parent->data
-           + v->slice_offset * ray_type_sizes[(uint8_t)v->type];
+           + v->slice_offset * ray_sym_elem_size(v->type, v->attrs);
 }
 
 void* ray_vec_get(ray_t* vec, int64_t idx) {

@@ -71,8 +71,14 @@ typedef struct {
     /* param: per-aggregate integer parameter (K for top_n/bot_n via ext->agg_k[a];
      * 0 and ignored for all other aggregates). */
     ray_t* (*finalize)    (const void* state, acc_arena_t* arena, int64_t param);
-    /* Optional native scalar emit. Writes one payload, returns whether null. */
+    /* Native scalar emit: supplied by every registered streaming kernel,
+     * optional for buffered kernels. Writes one payload, returns whether null. */
     bool (*finalize_value)(const void* state, void* dst);
+    /* Optional concurrent update of the same initialized state. Init and
+     * finalize still run outside the update dispatch. The state layout and
+     * null semantics must match update_batch; no separately owned memory. */
+    void (*update_shared)(void* states_base, size_t stride, const uint32_t* gids,
+                          const void* vals, const ray_valid_t* valid, int64_t n);
     /* Release heap state owned by a per-group state slab. NULL for ACC_STREAMING.
      * The engine calls this on every init'd state once it won't be used again. */
     void   (*destroy)(void* state);

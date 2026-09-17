@@ -674,7 +674,10 @@ static void packed_detect_fn(void* arg, uint32_t wid,
     uint8_t kb = c->key_bits;
     uint64_t km = c->key_mask;
     int64_t unsorted = 0, not_rev = 0;
-    uint64_t prev = (start > 0) ? (k[start - 1] & km) : 0;
+    /* Only compare within this task while keys are packed in place. The
+     * coordinator checks cross-task pairs after dispatch has joined. Reading
+     * k[start - 1] here would race with the preceding task's packed store. */
+    uint64_t prev = 0;
     for (int64_t i = start; i < end; i++) {
         uint64_t cur = k[i] & km;  /* mask to significant bytes */
         if (i > start) {
@@ -3930,12 +3933,13 @@ ray_t* ray_rank_fn(ray_t* x) {
 /* Pool worker for the already-in-order detection scan: each task verifies
  * consecutive-row order over [start,end) INCLUDING the (start-1,start)
  * boundary pair, so chunk edges are covered.  The shared flag only ever
- * transitions 1 -> 0 (benign race) and doubles as a bail signal. */
+ * transitions 1 -> 0 atomically and doubles as a bail signal. No payload is
+ * published through it; the dispatch barrier joins all tasks before return. */
 typedef struct {
     ray_t**  key_cols;
     int64_t  n_keys;
     uint8_t  descending;
-    volatile int* ordered;
+    _Atomic int* ordered;
 } sorted_check_ctx_t;
 
 static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -3945,7 +3949,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
 
     /* Specialized (SYM, i64-family) two-key loop — the canonical
      * (sym, time) shape.  The generic loop below pays a type-switch per
-     * read and a volatile flag load per row; here adjacent sym ids
+     * read and an atomic flag load per row; here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
      * string comparison only runs at run boundaries), the secondary key
      * reads raw i64, and the bail flag is polled per 4096-row block.
@@ -3967,13 +3971,13 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
         const int64_t* restrict tv = (const int64_t*)ray_data(c->key_cols[1]);
         struct ray_sym_domain_s* dom = ray_sym_vec_domain(sc);
         for (int64_t b = start; b < end; b += 4096) {
-            if (!*c->ordered) return;
+            if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return;
             int64_t e = b + 4096 < end ? b + 4096 : end;
             for (int64_t i = b; i < e; i++) {
                 int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs);
                 int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs);
                 if (RAY_LIKELY(ia == ib)) {
-                    if (tv[i] < tv[i - 1]) { *c->ordered = 0; return; }
+                    if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
                 } else {
                     ray_t* sa = ray_sym_domain_str(dom, ia);
                     ray_t* sb = ray_sym_domain_str(dom, ib);
@@ -3982,7 +3986,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
                     uint32_t ml = la < lb ? la : lb;
                     int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
                     if (cmp == 0) cmp = (la > lb) - (la < lb);
-                    if (cmp > 0) { *c->ordered = 0; return; }
+                    if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
                 }
             }
         }
@@ -3990,7 +3994,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     }
 
     for (int64_t i = start; i < end; i++) {
-        if (!*c->ordered) return;   /* another task already found a violation */
+        if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return;   /* another task already found a violation */
         int cmp = 0;
         for (int64_t k = 0; k < c->n_keys && cmp == 0; k++) {
             ray_t* col = c->key_cols[k];
@@ -4013,7 +4017,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
                 cmp = (va > vb) - (va < vb);
             }
         }
-        if (c->descending ? (cmp < 0) : (cmp > 0)) { *c->ordered = 0; return; }
+        if (c->descending ? (cmp < 0) : (cmp > 0)) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
     }
 }
 
@@ -4057,7 +4061,7 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
             return false;
     }
     if (nrows < 2) return true;
-    volatile int ordered = 1;
+    _Atomic int ordered = 1;
     sorted_check_ctx_t sctx = {
         .key_cols = key_cols, .n_keys = n_keys,
         .descending = descending, .ordered = &ordered,
@@ -4067,7 +4071,7 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
         ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
     else
         sorted_check_fn(&sctx, 0, 1, nrows);
-    return ordered != 0;
+    return atomic_load_explicit(&ordered, memory_order_relaxed) != 0;
 }
 
 static bool sort_part_key_type(int8_t t) {
@@ -4225,7 +4229,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 detectable = false;
         }
         if (detectable) {
-            volatile int ordered = 1;
+            _Atomic int ordered = 1;
             sorted_check_ctx_t sctx = {
                 .key_cols = key_cols, .n_keys = n_keys,
                 .descending = descending, .ordered = &ordered,
@@ -4235,7 +4239,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
             else
                 sorted_check_fn(&sctx, 0, 1, nrows);
-            if (ordered) {
+            if (atomic_load_explicit(&ordered, memory_order_relaxed)) {
                 ray_t* out = (descending || n_keys <= 1) ? NULL
                     : sort_stamp_ordered_table(tbl, key_ids[0], key_cols[0],
                                                n_keys > 1 ? key_ids[1] : -1);

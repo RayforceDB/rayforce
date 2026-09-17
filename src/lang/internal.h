@@ -461,6 +461,7 @@ ray_t* ray_max2_fn(ray_t* a, ray_t* b);
  * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in
  * query.c for the fast per-group median path. */
 double ray_median_dbl_inplace(double* a, int64_t n);
+double ray_nth_dbl_inplace(double* a, int64_t n, int64_t k);
 double ray_quantile_dbl_inplace(double* a, int64_t n, double q);
 ray_t* ray_mode_per_group_buf(ray_t* src,
                               const int64_t* idx_buf,
@@ -672,6 +673,7 @@ ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
 
 /* Group (formerly static in eval.c, now extern for query.c) */
 ray_t* ray_group_indices_fn(ray_t* x);
+ray_t* agg_group_indices(ray_t* source);
 
 /* I/O and formatting builtins (formerly in eval.c, now in ops/builtins.c) */
 ray_t* ray_println_fn(ray_t** args, int64_t n);

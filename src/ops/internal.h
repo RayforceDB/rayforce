@@ -46,6 +46,21 @@
 #include "vec/vec.h"
 #include <string.h>
 #include <math.h>
+
+/* Borrow only while the symbol table stays read-only through the dispatch
+ * barrier. Workers compare or copy source-domain codes without interning.
+ * File-domain lookup keeps its own publication/lifetime contract. */
+typedef struct {
+    ray_t** strings;
+    uint32_t count;
+} ray_group_sym_view_t;
+static inline ray_t* ray_group_sym_read(const ray_group_sym_view_t* view, struct ray_sym_domain_s* domain, int64_t id) {
+    if (domain == ray_sym_runtime_domain())
+        return id >= 0 && (uint64_t)id < view->count ? view->strings[id] : NULL;
+    return ray_sym_domain_str(domain, id);
+}
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <float.h>
@@ -1736,5 +1751,17 @@ static inline int64_t canon_f64_key(double v) {
     memcpy(&k, &v, sizeof(int64_t));
     return k;
 }
+
+/* Dispatch contiguous group slices by their row counts. */
+void ray_group_dispatch(ray_pool_fn fn, void* context, const int64_t* counts, int64_t groups);
+
+/* Associative winner reductions over stable source-row slices. The callback
+ * also merges two non-null partial winners, in original slice order. */
+typedef int64_t (*ray_group_winner_fn)(void* context, const int64_t* rows, int64_t count);
+void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* rows,
+    const int64_t* offsets, const int64_t* counts, int64_t groups, int64_t* winners);
+
+/* Gather winning group rows, retaining source domains and native types. */
+ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
 
 #endif /* RAY_EXEC_INTERNAL_H */
