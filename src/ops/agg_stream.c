@@ -312,27 +312,64 @@ static const agg_vtable_t AVG_F64 = {
 };
 
 /* ---- variance family, I64 (sumsq as int64 unsigned-wrap; formula group.c:2190) -- */
-typedef struct { double sum; int64_t sumsq; int64_t cnt; } var_i64_state;
-static void var_i64_init(void* s) { var_i64_state* st = s; st->sum = 0; st->sumsq = 0; st->cnt = 0; }
+/* Shifted-data accumulator: sums are of (v - k), where k is the first
+ * value this state sees.  The textbook one-pass form sumsq/n - mean^2
+ * subtracts two nearly equal large numbers once values reach ~1e9, and
+ * cancels to zero; the clamp then reported a clean 0.0, so the wrong
+ * answer looked plausible (#554).  Centring on k keeps both terms small
+ * whatever the magnitude, and the result is translation-invariant as
+ * variance is defined to be.  An integer sum of squares wrapped on top of
+ * that, which is why TIMESTAMP (~8e17 ns) failed on the first row; the
+ * shifted squares are doubles for every input type. */
+typedef struct { int64_t k; double sum; double sumsq; int64_t cnt; } var_i64_state;
+static void var_i64_init(void* s) { var_i64_state* st = s; st->k = 0; st->sum = 0; st->sumsq = 0; st->cnt = 0; }
+/* One accumulate step.  Integer inputs take the difference in INTEGER
+ * arithmetic before converting: a TIMESTAMP near 8e17 ns has a double ULP
+ * of 128, so converting first would quantise every value to 128 ns and
+ * leave a relative error around 1e-7 in the result.  The subtraction is
+ * done on unsigned to be wrap-defined; for any span under 2^63 it is
+ * exact, and beyond that the shift cannot help anyway.  Float inputs have
+ * no exact form to preserve, so they subtract in double. */
+#define VAR_ACC_STEP_INT(st, val) do {                                      \
+        int64_t v_ = (int64_t)(val);                                        \
+        if ((st)->cnt == 0) (st)->k = v_;                                   \
+        double d_ = (double)(int64_t)((uint64_t)v_ - (uint64_t)(st)->k);    \
+        (st)->sum += d_; (st)->sumsq += d_ * d_; (st)->cnt++;               \
+    } while (0)
+
+#define VAR_ACC_STEP_FLT(st, val) do {                                      \
+        double v_ = (double)(val);                                          \
+        if ((st)->cnt == 0) (st)->k = v_;                                   \
+        double d_ = v_ - (st)->k;                                           \
+        (st)->sum += d_; (st)->sumsq += d_ * d_; (st)->cnt++;               \
+    } while (0)
+
 static void var_i64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const int64_t* d = (const int64_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
+/* Combining two shifted states means re-centring one on the other's k:
+ *   sum'   = sum   + n*dk
+ *   sumsq' = sumsq + 2*dk*sum + n*dk^2      (dk = k_src - k_dst)
+ * which is exact in the same sense the update is. */
 static void var_i64_merge(void* dd, const void* ss, acc_arena_t* a) {
     (void)a; var_i64_state* d = dd; const var_i64_state* s = ss;
-    d->sum += s->sum; d->sumsq = (int64_t)((uint64_t)d->sumsq + (uint64_t)s->sumsq); d->cnt += s->cnt;
+    if (s->cnt == 0) return;
+    if (d->cnt == 0) { *d = *s; return; }
+    double dk = (double)(int64_t)((uint64_t)s->k - (uint64_t)d->k), sn = (double)s->cnt;
+    d->sumsq += s->sumsq + 2.0*dk*s->sum + sn*dk*dk;
+    d->sum   += s->sum + sn*dk;
+    d->cnt   += s->cnt;
 }
 static inline double var_i64_varpop(const var_i64_state* st) {
-    double mean = st->sum / (double)st->cnt;
-    double vp = (double)st->sumsq / (double)st->cnt - mean*mean;
-    return vp < 0 ? 0 : vp;
+    double n = (double)st->cnt;
+    double vp = (st->sumsq - st->sum*st->sum/n) / n;
+    return vp < 0 ? 0 : vp;   /* -0.0 / tiny negative residue */
 }
 static double fin_var_pop_i64_result(const void* s) {
     const var_i64_state* st = s;
@@ -380,25 +417,31 @@ static const agg_vtable_t STDDEV_POP_I64 = {
 };
 
 /* ---- variance family, F64 (sumsq as double) -------------------------- */
-typedef struct { double sum; double sumsq; int64_t cnt; } var_f64_state;
-static void var_f64_init(void* s) { var_f64_state* st = s; st->sum = 0; st->sumsq = 0; st->cnt = 0; }
+/* Same shifted accumulator as the integer family — see VAR_ACC_STEP. */
+typedef struct { double k; double sum; double sumsq; int64_t cnt; } var_f64_state;
+static void var_f64_init(void* s) { var_f64_state* st = s; st->k = 0; st->sum = 0; st->sumsq = 0; st->cnt = 0; }
 static void var_f64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const double* d = (const double*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_f64_state* st = (var_f64_state*)((char*)base + (size_t)gids[i]*stride);
-        double v = d[i]; st->sum += v; st->sumsq += v*v; st->cnt++;
+        VAR_ACC_STEP_FLT(st, d[i]);
     });
 }
 static void var_f64_merge(void* dd, const void* ss, acc_arena_t* a) {
     (void)a; var_f64_state* d = dd; const var_f64_state* s = ss;
-    d->sum += s->sum; d->sumsq += s->sumsq; d->cnt += s->cnt;
+    if (s->cnt == 0) return;
+    if (d->cnt == 0) { *d = *s; return; }
+    double dk = s->k - d->k, sn = (double)s->cnt;
+    d->sumsq += s->sumsq + 2.0*dk*s->sum + sn*dk*dk;
+    d->sum   += s->sum + sn*dk;
+    d->cnt   += s->cnt;
 }
 static inline double var_f64_varpop(const var_f64_state* st) {
-    double mean = st->sum / (double)st->cnt;
-    double vp = st->sumsq / (double)st->cnt - mean*mean;
-    return vp < 0 ? 0 : vp;
+    double n = (double)st->cnt;
+    double vp = (st->sumsq - st->sum*st->sum/n) / n;
+    return vp < 0 ? 0 : vp;   /* -0.0 / tiny negative residue */
 }
 static double fin_var_pop_f64_result(const void* s) {
     const var_f64_state* st = s;
@@ -764,9 +807,7 @@ static void var_bool_native_update(void* base, size_t stride, const uint32_t* gi
     (void)a; const uint8_t* d = (const uint8_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
@@ -879,9 +920,7 @@ static void var_u8_native_update(void* base, size_t stride, const uint32_t* gids
     (void)a; const uint8_t* d = (const uint8_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
@@ -994,9 +1033,7 @@ static void var_i16_native_update(void* base, size_t stride, const uint32_t* gid
     (void)a; const int16_t* d = (const int16_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
@@ -1109,9 +1146,7 @@ static void var_i32_native_update(void* base, size_t stride, const uint32_t* gid
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
@@ -1228,7 +1263,7 @@ static void var_f32_native_update(void* base, size_t stride, const uint32_t* gid
     (void)a; const float* d = (const float*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_f64_state* st = (var_f64_state*)((char*)base + (size_t)gids[i]*stride);
-        double v = d[i]; st->sum += v; st->sumsq += v*v; st->cnt++;
+        VAR_ACC_STEP_FLT(st, d[i]);
     });
 }
 
@@ -1338,9 +1373,7 @@ static void var_date_native_update(void* base, size_t stride, const uint32_t* gi
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
@@ -1436,9 +1469,7 @@ static void var_time_native_update(void* base, size_t stride, const uint32_t* gi
     (void)a; const int32_t* d = (const int32_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
@@ -1554,9 +1585,7 @@ static void var_timestamp_native_update(void* base, size_t stride, const uint32_
     (void)a; const int64_t* d = (const int64_t*)vals;
     AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        int64_t v = d[i]; st->sum += (double)v;
-        st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
-        st->cnt++;
+        VAR_ACC_STEP_INT(st, d[i]);
     });
 }
 
