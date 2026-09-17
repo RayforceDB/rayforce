@@ -74,3 +74,13 @@
 (set RG (select {from: T by: (if (> G 3) (substr ref 0 4) ref) c: (count v)}))
 (set OG (select {from: (select {from: T k: (if (> G 3) (substr ref 0 4) ref) v: v}) by: k c: (count v)}))
 (all (== (FP2 RG) (FP2 OG))) -- true
+
+;; the derived name yields to an aggregate of the same name
+(== (cols (select {from: T by: (substr ref 0 2) ref: (min ref) c: (count v)})) ['key 'ref 'c]) -- [true true true]
+;; a quoted symbol that names a column of the table resolves to that column
+;; in the compiled key — such a key is not a function of the symbol alone
+(set RQ (select {from: T by: (if (== 'v ref) "same" "diff") c: (count v)}))
+(set OQ (select {from: (select {from: T k: (if (== 'v ref) "same" "diff") v: v}) by: k c: (count v)}))
+(count RQ) -- 1
+(== (at (value RQ) 0) (at (value OQ) 0)) -- [true]
+(== (at RQ 'c) (at OQ 'c)) -- [true]
