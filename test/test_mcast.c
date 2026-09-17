@@ -937,6 +937,44 @@ static test_result_t test_mcast_txlimit_overflow_disconnects(void) {
  * closes) and the client poll (outbound closes), so it records the
  * direction it saw rather than bare handle ids, which the two polls
  * number independently. */
+/* An explicit `compress` from .ipc.open must survive onto the connection
+ * and be used by the send paths.  Regression: conn_write_msg re-derived
+ * the threshold from the peer address per frame, so a loopback link
+ * silently ignored the override and never compressed. */
+static test_result_t test_ipc_connect_compress_override(void) {
+    ray_poll_t* poll;
+    ray_vm_t* vm;
+    uint16_t port;
+    ray_thread_t tid;
+    test_result_t sr = start_server(&poll, &port, &vm, &tid);
+    if (sr.status != TEST_PASS) return sr;
+
+    /* Auto: a loopback peer never compresses. */
+    int64_t h_auto = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h_auto) >= (0), "auto connected");
+    TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h_auto), RAY_IPC_COMPRESS_NEVER);
+
+    /* Explicit threshold wins over the locality default... */
+    int64_t h_on = ray_ipc_connect_opts("127.0.0.1", port, NULL, NULL, 0, 2000);
+    TEST_ASSERT((h_on) >= (0), "override connected");
+    TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h_on), 2000);
+
+    /* ...in both directions: NEVER stays NEVER on a link that would
+     * otherwise have compressed. */
+    int64_t h_off = ray_ipc_connect_opts("127.0.0.1", port, NULL, NULL, 0,
+                                         RAY_IPC_COMPRESS_NEVER);
+    TEST_ASSERT((h_off) >= (0), "never connected");
+    TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h_off), RAY_IPC_COMPRESS_NEVER);
+
+    pump_client();
+    ray_ipc_close(h_auto);
+    ray_ipc_close(h_on);
+    ray_ipc_close(h_off);
+    pump_client();
+    stop_server(poll, port, vm, tid);
+    PASS();
+}
+
 static test_result_t test_ipc_outbound_close_hook(void) {
     ray_t* r = ray_eval_str(
         "(set _oc_in 0)"
@@ -1251,5 +1289,6 @@ const test_entry_t mcast_entries[] = {
     { "mcast/shared_frame_across_subs",   test_mcast_shared_frame_across_subscribers, mcast_setup, mcast_teardown },
     { "mcast/txlimit_overflow_disconnects", test_mcast_txlimit_overflow_disconnects, mcast_setup, mcast_teardown },
     { "ipc/outbound_close_hook",          test_ipc_outbound_close_hook,          mcast_setup, mcast_teardown },
+    { "ipc/connect_compress_override",    test_ipc_connect_compress_override,    mcast_setup, mcast_teardown },
     { NULL, NULL, NULL, NULL },
 };
