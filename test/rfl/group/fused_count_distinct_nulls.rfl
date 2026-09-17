@@ -1,0 +1,64 @@
+;; Fused grouped count-distinct (ray_cd_fused), on the paths whose
+;; null-admission guard was removed.
+;;
+;; cdfuse.c used to decline a nullable key or value outright:
+;;     if (ray_vec_may_have_nulls(key_col) || ray_vec_may_have_nulls(val_col))
+;;         return NULL;
+;; and cdf_type_ok has since widened to BOOL/U8/DATE/TIME/TIMESTAMP/F32/F64.
+;; try_count_distinct_v2_rewrite dropped the matching ray_vec_has_nulls
+;; checks on K and X.
+;;
+;; wide_count_distinct.rfl cannot reach any of that: it uses (til 131072),
+;; half of CDF_MIN_ROWS (262144), and STR/GUID columns, which cdf_type_ok
+;; does not accept.  So the fused kernel was never entered by any test.
+;; Everything below is >= CDF_MIN_ROWS and typed so the kernel admits it.
+;;
+;; Four groups over an eight-value cycle, so each group sees exactly two
+;; of the vocabulary:
+;;   g0 -> 0Nf, 0Nf   one distinct  (all-null group holds one value)
+;;   g1 -> 1.5, 1.5   one distinct
+;;   g2 -> -0.0, 0.0  one distinct  (cdf_read canonicalises -0.0 to 0)
+;;   g3 -> 2.5, 3.5   two distinct
+(set N 262144)
+(set r (til N))
+(set g (% r 4))
+(set vals [0Nf 1.5 -0.0 2.5 0Nf 1.5 0.0 3.5])
+(set v (at vals (% r 8)))
+
+;; I64 key, nullable F64 value
+(set t (table [k x] (list g v)))
+(set a (select {from:t by:k n:(count (distinct x))}))
+(at a 'k) -- [0 1 2 3]
+(at a 'n) -- [1 1 1 2]
+
+;; SYM key, same values — the other key family the kernel packs
+(set t2 (table [k x] (list (at ['g0 'g1 'g2 'g3] g) v)))
+(set b (select {from:t2 by:k n:(count (distinct x))}))
+(at b 'k) -- ['g0 'g1 'g2 'g3]
+(at b 'n) -- [1 1 1 2]
+
+;; nullable KEY column: the null key is a group of its own
+(set t3 (table [k x] (list (at [0N 1 2 3] g) v)))
+(set c (select {from:t3 by:k n:(count (distinct x))}))
+(at c 'n) -- [1 1 1 2]
+(count c) -- 4
+
+;; NaN reaches the kernel as the F64 null: it must not read as a separate
+;; distinct value from an explicit 0Nf (g0), but must still be distinct
+;; from a real value (g2).
+(set nan (% 0.0 0.0))
+(set v2 (at (list nan 1.5 nan 2.5 0Nf 1.5 7.5 3.5) (% r 8)))
+(set t4 (table [k x] (list g v2)))
+(set d (select {from:t4 by:k n:(count (distinct x))}))
+(at d 'n) -- [1 1 2 2]
+
+;; NOTE: the F32 arm of the widened cdf_type_ok is NOT covered here.
+;; `as` has no F32 target (src/ops/builtins.c ~1322 lists I64/I32/I16/U8/
+;; F64/BOOL/SYMBOL/DATE/TIME/TIMESTAMP/GUID/STR only), so an F32 column
+;; cannot be built from Rayfall at all.  Covering it needs either an F32
+;; cast target or a C-level test.
+
+;; a count-distinct beside another aggregate still rewrites correctly
+(set f (select {from:t by:k n:(count (distinct x)) c:(count x)}))
+(at f 'n) -- [1 1 1 2]
+(at f 'c) -- [65536 65536 65536 65536]
