@@ -1,0 +1,7 @@
+case,workers,binary,processes,cold_median_ms,cold_min_ms,cold_max_ms,warm_median_ms,warm_min_ms,warm_max_ms,peak_rss_kib
+binary,default,baseline,5,5.89175,5.44895,6.13455,2.34941,2.28711,2.39357,391496
+binary,default,current,5,5.78132,5.11199,6.49526,2.31598,2.29456,2.36222,391788
+clustered,default,baseline,5,2.91438,2.85804,2.92659,0.626003,0.58954,0.669892,368932
+clustered,default,current,5,2.82288,2.77178,2.91088,0.603448,0.579778,0.610024,368920
+symbol-key,default,baseline,5,0.585992,0.560579,0.597973,0.237495,0.222821,0.270357,364932
+symbol-key,default,current,5,0.586222,0.565357,0.602685,0.229149,0.211118,0.257872,364764

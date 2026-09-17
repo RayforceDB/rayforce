@@ -1,0 +1,21 @@
+(set f32 (fn [x] (at (select {from:(table [v] (list x)) v:(as 'F32 v)}) 'v)))
+;; Type coverage across streaming, row-index, expression, and sort paths.
+(set ft (table [k v] (list (as 'I32 [0N 0N 0 0 1 1]) (as 'TIME [9 3 8 2 7 1]))))
+(at (select {from:ft by:k asc:k s:(min v)}) 's) -- (as 'TIME [3 2 1])
+(count (select {from:ft by:k s:(min v) where:(== k 0N)})) -- 1
+(at (select {from:ft by:k s:(min v) where:(== k 0N)}) 's) -- (as 'TIME [3])
+(set exact (table [k v] (list [0 0 1 1] [9007199254740993 9007199254740992 9223372036854775807 9223372036854775806])))
+(at (select {from:exact by:k asc:k m:(min v)}) 'm) -- [9007199254740992 9223372036854775806]
+(at (select {from:exact by:k asc:k m:(max v)}) 'm) -- [9007199254740993 9223372036854775807]
+(set mixed (table [k v] (list [0 1 0 1 0 1] (f32 [3.0 9.0 1.0 7.0 2.0 8.0]))))
+(at (select {from:mixed by:k asc:k m:(med v) s:(sum v) f:(first v) l:(last v)}) 'm) -- [2.0 8.0]
+(at (select {from:mixed by:k asc:k m:(med v) s:(sum v) f:(first v) l:(last v)}) 'f) -- [3.0 9.0]
+(at (select {from:mixed by:k asc:k t:(top v 2)}) 't) -- (list (f32 [3.0 2.0]) (f32 [9.0 8.0]))
+(set words (table [k v] (list [0 0 0 1 1 1] ["long pooled zebra string" "a" "m" "z" "b" "y"])))
+(at (select {from:words by:k asc:k t:(top v 2)}) 't) -- (list ["m" "long pooled zebra string"] ["z" "y"])
+(at (select {from:words by:k asc:k t:(bot v 1)}) 't) -- (list ["a"] ["b"])
+(set tm (table [k a b] (list [0 0 1 1] (as 'TIME [1 2 3 4]) (as 'TIME [5 7 10 12]))))
+(at (select {from:tm by:k asc:k s:(sum (- b a))}) 's) -- (as 'TIME [9 15])
+(set fc (table [k v] (list (f32 [0.0 -0.0 1.0 1.0]) [1 1 2 3])))
+(at (select {from:fc by:k asc:k n:(count (distinct v))}) 'n) -- [1 2]
+(at (select {from:fc by:k asc:k n:(count v) lit:(at (f32 [1.5]) 0)}) 'lit) -- (f32 [1.5 1.5])

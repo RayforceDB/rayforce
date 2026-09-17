@@ -184,10 +184,16 @@ typedef struct {
             int64_t  n_distinct;
         } dict;
         struct {                /* RAY_IDX_UKEY */
-            /* Open addressing over the whole key tuple: slot = row + 1,
-             * 0 = empty.  Rows are entered in row order, so a probe from
-             * the hash slot meets duplicates lowest-row first — the row
-             * the linear scan would have picked.
+            /* Open addressing over the whole key tuple.  An occupied slot
+             * packs the low 32 bits of the key's hash in its high half and
+             * row + 1 in its low half (0 = empty, all-ones = tombstone), so
+             * a probe rejects a colliding slot without reading its row, and
+             * a map that outgrows its capacity is re-placed from the slots
+             * themselves instead of being rebuilt from the key columns.
+             * Rows are entered in row order, and the re-placement walks each
+             * chain from its beginning, so a probe from the hash slot meets
+             * duplicates lowest-row first — the row the linear scan would
+             * have picked.
              *
              * `nrows` is the table row count this map describes.  Any
              * mutation that changes the row count leaves it behind and the

@@ -1,0 +1,40 @@
+;; Variance is translation-invariant: shifting every value by a constant
+;; must not change var or stddev.  The grouped accumulator computed
+;; sumsq/cnt - mean*mean in one pass, which cancels catastrophically once
+;; values reach ~1e9 — the clamp then turned the negative residue into a
+;; clean 0.0, so the wrong answer looked plausible (#554).
+;;
+;; The oracle here is the identity itself, so the test needs no reference
+;; implementation: the same spread at three magnitudes must agree.
+(set N 1000) (set r (til N)) (set k (% r 4))
+(set mk (fn [base] (table [k v] (list k (as 'F64 (+ base (% r 7)))))))
+(set v0 (at (select {from:(mk 0)          by:k s:(var v)}) 's))
+(set v6 (at (select {from:(mk 1000000)    by:k s:(var v)}) 's))
+(set v9 (at (select {from:(mk 2000000000) by:k s:(var v)}) 's))
+(all (< (abs (- v0 v6)) 0.000001)) -- true
+(all (< (abs (- v0 v9)) 0.000001)) -- true
+;; and it is the real variance, not merely self-consistent
+(all (< (abs (- v0 4.0)) 0.05)) -- true
+
+;; stddev likewise
+(set s0 (at (select {from:(mk 0)          by:k s:(stddev v)}) 's))
+(set s9 (at (select {from:(mk 2000000000) by:k s:(stddev v)}) 's))
+(all (< (abs (- s0 s9)) 0.000001)) -- true
+
+;; integer inputs: the sum of squares used to wrap in an int64, so I32
+;; near 2^31 overflowed after two rows
+(set i0 (at (select {from:(table [k v] (list k (as 'I32 (% r 7))))               by:k s:(var v)}) 's))
+(set i9 (at (select {from:(table [k v] (list k (as 'I32 (+ 2000000000 (% r 7)))))by:k s:(var v)}) 's))
+(all (< (abs (- i0 i9)) 0.000001)) -- true
+
+(set l0 (at (select {from:(table [k v] (list k (as 'I64 (% r 7))))               by:k s:(var v)}) 's))
+(set l9 (at (select {from:(table [k v] (list k (as 'I64 (+ 4000000000 (% r 7)))))by:k s:(var v)}) 's))
+(all (< (abs (- l0 l9)) 0.000001)) -- true
+
+;; TIMESTAMP is ns since 2000, so values are ~8e17 — the worst case
+(set t0 (at (select {from:(table [k v] (list k (as 'TIMESTAMP (* (% r 7) 1000000)))) by:k s:(var v)}) 's))
+(set t9 (at (select {from:(table [k v] (list k (as 'TIMESTAMP (+ 800000000000000000 (* (% r 7) 1000000))))) by:k s:(var v)}) 's))
+(all (< (abs (- t0 t9)) 1.0)) -- true
+
+;; a zero-variance group is still exactly zero, not noise
+(at (select {from:(table [k v] (list k (as 'F64 (take [2000000000.0] N)))) by:k s:(var v)}) 's) -- [0.0 0.0 0.0 0.0]

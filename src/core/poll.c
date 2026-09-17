@@ -66,7 +66,7 @@ void ray_poll_drain_timers(ray_poll_t* poll)
 
 ray_poll_buf_t* ray_poll_buf_new(int64_t size)
 {
-    ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_sys_alloc(
+    ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_alloc_raw(
         sizeof(ray_poll_buf_t) + (size_t)size);
     if (!buf) return NULL;
     buf->next   = NULL;
@@ -82,14 +82,14 @@ void ray_poll_buf_free(ray_poll_buf_t* buf)
     while (buf) {
         ray_poll_buf_t* next = buf->next;
         if (buf->frame) ray_poll_frame_release(buf->frame);
-        ray_sys_free(buf);
+        ray_free_raw(buf);
         buf = next;
     }
 }
 
 ray_poll_frame_t* ray_poll_frame_new(int64_t size)
 {
-    ray_poll_frame_t* f = (ray_poll_frame_t*)ray_sys_alloc(
+    ray_poll_frame_t* f = (ray_poll_frame_t*)ray_alloc_raw(
         sizeof(ray_poll_frame_t) + (size_t)size);
     if (!f) return NULL;
     f->rc   = 1;
@@ -104,13 +104,13 @@ void ray_poll_frame_retain(ray_poll_frame_t* f)
 
 void ray_poll_frame_release(ray_poll_frame_t* f)
 {
-    if (f && --f->rc == 0) ray_sys_free(f);
+    if (f && --f->rc == 0) ray_free_raw(f);
 }
 
 ray_poll_buf_t* ray_poll_buf_from_frame(ray_poll_frame_t* f)
 {
     if (!f) return NULL;
-    ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_sys_alloc(sizeof(ray_poll_buf_t));
+    ray_poll_buf_t* buf = (ray_poll_buf_t*)ray_alloc_raw(sizeof(ray_poll_buf_t));
     if (!buf) return NULL;
     buf->next   = NULL;
     buf->size   = f->size;

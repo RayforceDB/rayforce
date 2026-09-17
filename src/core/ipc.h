@@ -33,8 +33,27 @@
 
 #define RAY_IPC_COMPRESS_THRESHOLD 2000
 
+/* Sentinel threshold: no payload length can exceed it, so a link carrying
+ * it never compresses.  Compression is a sender-side, per-frame decision
+ * signalled by RAY_IPC_FLAG_COMPRESSED, so a link may skip it unilaterally
+ * without any negotiation — a peer on any build still reads the frame. */
+#define RAY_IPC_COMPRESS_NEVER ((size_t)-1)
+
+/* "Not specified": the link decides from peer locality
+ * (ray_ipc_link_threshold).  Never stored on a connection — resolved to a
+ * concrete threshold when the connection is established. */
+#define RAY_IPC_COMPRESS_AUTO  ((size_t)-2)
+
+/* Compression policy for one link: loopback and UNIX-domain peers never
+ * compress (no bandwidth to buy with the CPU), everything else keeps the
+ * compiled-in default.  An unknown peer keeps the default. */
+size_t ray_ipc_link_threshold(ray_sock_t fd);
+
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
                         uint8_t* dst, size_t dst_cap);
+/* As ray_ipc_compress, with an explicit threshold instead of the default. */
+size_t ray_ipc_compress_at(const uint8_t* src, size_t len,
+                           uint8_t* dst, size_t dst_cap, size_t threshold);
 size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
                           uint8_t* dst, size_t dst_len);
 
@@ -86,32 +105,6 @@ int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port);
 /* Bind to a specific IPv4 address; host NULL/empty means INADDR_ANY (#427). */
 int64_t ray_ipc_listen_at(ray_poll_t* poll, const char* host, uint16_t port);
 
-/* ===== Legacy server API (wraps poll internally for tests) ===== */
-
-typedef struct ray_ipc_conn {
-    ray_sock_t        fd;
-    uint8_t*          rx_buf;
-    size_t            rx_len;
-    size_t            rx_need;
-    uint8_t           phase;
-    ray_ipc_header_t  hdr;
-} ray_ipc_conn_t;
-
-typedef struct ray_ipc_server {
-    ray_sock_t        listen_fd;
-    int               poll_fd;
-    ray_ipc_conn_t    conns[RAY_IPC_MAX_CONNS];
-    uint32_t          n_conns;
-    bool              running;
-    char              auth_secret[256]; /* password from -u/-U */
-    bool              restricted;       /* -U mode */
-} ray_ipc_server_t;
-
-ray_err_t ray_ipc_server_init(ray_ipc_server_t* srv, uint16_t port);
-ray_err_t ray_ipc_server_init_at(ray_ipc_server_t* srv, const char* host, uint16_t port);
-void      ray_ipc_server_destroy(ray_ipc_server_t* srv);
-int       ray_ipc_poll(ray_ipc_server_t* srv, int timeout_ms);
-
 /* ===== Connection-handle API =====
  *
  * One handle namespace: a handle is the poll selector id of an IPC
@@ -130,6 +123,24 @@ int       ray_ipc_poll(ray_ipc_server_t* srv, int timeout_ms);
 int64_t   ray_ipc_connect(const char* host, uint16_t port,
                            const char* user, const char* password,
                            int timeout_ms);
+/* As ray_ipc_connect, with an explicit compression threshold for the new
+ * link.  RAY_IPC_COMPRESS_AUTO keeps the locality-derived default. */
+int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
+                           const char* user, const char* password,
+                           int timeout_ms, size_t compress_threshold);
+
+/* Parse .ipc.open's optional second argument: an integer timeout in
+ * milliseconds, or a dict with optional `timeout` and `compress`.
+ * `compress` is a threshold in bytes — 0N never compresses, 0 always
+ * does, n compresses payloads larger than n; absent leaves
+ * RAY_IPC_COMPRESS_AUTO.  Returns NULL on success, or an error object
+ * the caller returns as-is. */
+ray_t*    ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
+                                  size_t* compress_threshold);
+
+/* The compression threshold in force on an open handle, or
+ * RAY_IPC_COMPRESS_AUTO if the handle does not resolve. */
+size_t    ray_ipc_handle_threshold(int64_t handle);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
@@ -143,6 +154,11 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg);
  * return codes as ray_ipc_try_send_async, which is now the one-connection
  * composition of the two. */
 ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out);
+/* As ray_ipc_frame_async, framing at an explicit compression threshold.
+ * Multicast builds one framing per distinct subscriber policy with this, so
+ * a topic whose subscribers are all local never compresses (#551). */
+ray_err_t ray_ipc_frame_async_at(ray_t* msg, size_t compress_threshold,
+                                 ray_poll_frame_t** out);
 ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame);
 
 /* Transmit backlog (#486).  A connection's queue admits a frame only while

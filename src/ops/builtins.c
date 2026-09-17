@@ -168,7 +168,7 @@ void ray_lang_print(FILE* fp, ray_t* val) {
 }
 
 /* Helper: format string with % placeholders, substituting args.
- * Returns a heap-allocated char* (caller must ray_sys_free) and sets *out_len.
+ * Returns a heap-allocated char* (caller must ray_free_raw) and sets *out_len.
  * If fmt has no %, returns NULL (caller falls back to plain print). */
 static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t nargs, int64_t arg_start, size_t* out_len) {
     /* Quick scan: any % in fmt? */
@@ -178,7 +178,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
 
     /* Build result in a dynamic buffer */
     size_t cap = flen + 256;
-    char* buf = ray_sys_alloc(cap);
+    char* buf = ray_calloc_raw(cap);
     if (!buf) return NULL;
     size_t pos = 0;
     int64_t ai = arg_start;
@@ -213,7 +213,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
             } else if (a->type == -RAY_STR) {
                 const char* sp = ray_str_ptr(a);
                 size_t sl = ray_str_len(a);
-                while (pos + sl + 1 > cap) { cap *= 2; buf = ray_sys_realloc(buf, cap); }
+                while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
                 memcpy(buf + pos, sp, sl);
                 pos += sl;
                 if (a_owned) ray_release(a_owned);
@@ -225,7 +225,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                     size_t sl = ray_str_len(ss);
                     /* sym 0 resolves to "" — the empty symbol shows as ' */
                     if (sl == 0) { sp = "'"; sl = 1; }
-                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_sys_realloc(buf, cap); }
+                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
                     memcpy(buf + pos, sp, sl);
                     pos += sl;
                     ray_release(ss);
@@ -239,7 +239,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 if (formatted && !RAY_IS_ERR(formatted)) {
                     const char* sp = ray_str_ptr(formatted);
                     size_t sl = ray_str_len(formatted);
-                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_sys_realloc(buf, cap); }
+                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
                     memcpy(buf + pos, sp, sl);
                     pos += sl;
                     ray_release(formatted);
@@ -250,11 +250,11 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 tlen = snprintf(tmp, sizeof(tmp), "<type:%d>", a->type);
             }
             if (a_owned && !RAY_IS_ERR(a_owned)) ray_release(a_owned);
-            while (pos + (size_t)tlen + 1 > cap) { cap *= 2; buf = ray_sys_realloc(buf, cap); }
+            while (pos + (size_t)tlen + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
             memcpy(buf + pos, tmp, (size_t)tlen);
             pos += (size_t)tlen;
         } else {
-            if (pos + 2 > cap) { cap *= 2; buf = ray_sys_realloc(buf, cap); }
+            if (pos + 2 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
             buf[pos++] = fmt[i];
         }
     }
@@ -281,7 +281,7 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
             fwrite(result, 1, out_len, stdout);
             fputc('\n', stdout);
             fflush(stdout);
-            ray_sys_free(result);
+            ray_free_raw(result);
             return RAY_NULL_OBJ;
         }
     }
@@ -308,7 +308,7 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fflush(stdout);
-            ray_sys_free(result);
+            ray_free_raw(result);
             return RAY_NULL_OBJ;
         }
     }
@@ -353,7 +353,7 @@ ray_t* ray_format_fn(ray_t** args, int64_t n) {
     char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len);
     if (result) {
         ray_t* s = ray_str(result, out_len);
-        ray_sys_free(result);
+        ray_free_raw(result);
         return s;
     }
     /* No placeholders: return fmt as-is */
@@ -2771,6 +2771,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
         return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
     int64_t n = x->len;
+    ray_t* parallel = agg_group_indices(x);
+    if (parallel) return parallel;
     if (n == 0) {
         ray_t* keys = ray_list_new(0);
         if (RAY_IS_ERR(keys)) return keys;
@@ -3294,7 +3296,7 @@ static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
         char sbuf[8192];
         char* buf = sbuf;
         if (total > sizeof(sbuf)) {
-            buf = ray_sys_alloc(total);
+            buf = ray_calloc_raw(total);
             if (!buf) {
                 ray_release(out);
                 return ray_error("oom", NULL);
@@ -3309,7 +3311,7 @@ static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
         }
         ray_t* prev = out;
         out = ray_str_vec_append(out, buf, total);
-        if (buf != sbuf) ray_sys_free(buf);
+        if (buf != sbuf) ray_free_raw(buf);
         if (RAY_IS_ERR(out)) {
             ray_release(prev);
             return out;

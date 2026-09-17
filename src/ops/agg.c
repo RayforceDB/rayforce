@@ -959,6 +959,12 @@ static ray_t* quantile_prob_arg(ray_t* q_obj, double scale, const char* name,
     return NULL;
 }
 
+double ray_nth_dbl_inplace(double* a, int64_t n, int64_t k) {
+    if (!a || n <= 0 || k < 0 || k >= n) return NULL_F64;
+    nth_element_dbl(a, 0, n - 1, k);
+    return a[k];
+}
+
 double ray_quantile_dbl_inplace(double* a, int64_t n, double q) {
     if (n <= 0) return 0.0;
     if (n == 1) return a[0];

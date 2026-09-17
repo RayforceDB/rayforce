@@ -1,0 +1,210 @@
+;; upsert_vector.rfl — a multi-row upsert whose payload columns are typed
+;; vectors of the target's own types is written column by column (#535):
+;; keys resolve in payload order, the new rows append once per column, and
+;; the matched cells scatter in payload order.  Every case applies one batch
+;; twice — as a vector payload (the column-wise path) and row by row as atoms
+;; (the per-cell path) — and requires the two tables to be identical.  The
+;; batches repeat keys, mix hits with misses, and carry nulls.
+
+(set rowwise (fn [tn nk P cols] (map (fn [r] (upsert tn nk (map (fn [c] (at (at P c) r)) cols))) (til (count P)))))
+(set NI 37)
+(set insts (as 'SYMBOL (map (fn [i] (format "i%" i)) (til NI))))
+(set TS 2026.09.15D12:00:00.000000000)
+(set G (guid 64))
+;; 400 keys over 100 distinct ids in 350..649: each repeated four times,
+;; ids below 500 update, the rest append (and then update themselves)
+(set KP (+ 350 (% (* 7919 (til 400)) 300)))
+
+;; ── the order-book shape: sym/sym/i64 key, i64 and timestamp values ──
+(set book (fn [ids vals] (table [instrument side px sz ts_evt ts_recv] (list (at insts (% ids NI)) (at ['B 'A] (% ids 2)) (+ 100000 ids) vals (+ TS vals) (+ TS (* 2 vals))))))
+(set A (book (til 500) (til 500)))
+(set B (book (til 500) (til 500)))
+(set P (book KP (+ 1000 (til 400))))
+(upsert 'A 3 P) -- 'A
+(rowwise 'B 3 P [instrument side px sz ts_evt ts_recv])
+A -- B
+(count A) -- 650
+(.idx.has? A) -- true
+;; a second batch rides the map the first one left
+(set P (book (% (* 104729 (til 400)) 700) (+ 5000 (til 400))))
+(upsert 'A 3 P)
+(rowwise 'B 3 P [instrument side px sz ts_evt ts_recv])
+A -- B
+
+;; ── every fixed-width value type behind an i64 key ──
+(set wide (fn [ks vs] (table [k a b c d e f g h i j] (list ks (as 'I16 vs) (as 'I32 vs) (/ (as 'F64 vs) 4) (+ 2024.01.01 vs) (as 'TIME vs) (+ TS vs) (== 0 (% vs 3)) (as 'U8 (% vs 250)) (at G (% vs 64)) (at insts (% vs NI))))))
+(set A (wide (til 500) (til 500)))
+(set B (wide (til 500) (til 500)))
+(set P (wide KP (+ 7 (til 400))))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k a b c d e f g h i j])
+A -- B
+
+;; ── key types: each built from the same ids ──
+(set kcase (fn [conv] (do (set A (table [k v w] (list (conv (til 500)) (til 500) (as 'F64 (til 500))))) (set B (table [k v w] (list (conv (til 500)) (til 500) (as 'F64 (til 500))))) (set P (table [k v w] (list (conv KP) (+ 1000 (til 400)) (/ (as 'F64 (til 400)) 8)))) (upsert 'A 'k P) (rowwise 'B 'k P [k v w]) (count A))))
+(kcase (fn [x] (as 'I32 x))) -- 650
+A -- B
+(kcase (fn [x] (as 'I16 x))) -- 650
+A -- B
+(kcase (fn [x] (+ 2024.01.01 x))) -- 650
+A -- B
+(kcase (fn [x] (as 'TIME x))) -- 650
+A -- B
+(kcase (fn [x] (+ TS x))) -- 650
+A -- B
+(kcase (fn [x] (/ (as 'F64 x) 2))) -- 650
+A -- B
+(kcase (fn [x] (at insts (% x NI))))
+A -- B
+(kcase (fn [x] (at G (% x 64))))
+A -- B
+;; duplicate keys already in the target: the lowest row is the one updated
+(kcase (fn [x] (as 'U8 (% x 256))))
+A -- B
+(kcase (fn [x] (== 0 (% x 2))))
+A -- B
+
+;; ── nulls: payload nulls land and raise the null gate; null keys match ──
+(set nul (fn [ids] (table [k q p s i] (list ids (at [1 0Nl 3 4 0Nl] (% ids 5)) (at [1.5 0Nf 2.5] (% ids 3)) (at ['x ' 'y] (% ids 3)) (at [1i 2i 0Ni] (% ids 3))))))
+(set A (table [k q p s i] (list (til 500) (til 500) (as 'F64 (til 500)) (at insts (% (til 500) NI)) (as 'I32 (til 500)))))
+(set B (table [k q p s i] (list (til 500) (til 500) (as 'F64 (til 500)) (at insts (% (til 500) NI)) (as 'I32 (til 500)))))
+(set P (nul KP))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k q p s i])
+A -- B
+(sum (at A 'q)) -- (sum (at B 'q))
+(avg (at A 'p)) -- (avg (at B 'p))
+(sum (at A 'i)) -- (sum (at B 'i))
+(count (select {from: A where: (nil? q)})) -- (count (select {from: B where: (nil? q)}))
+(count (select {from: A where: (== s ')})) -- (count (select {from: B where: (== s ')}))
+;; the null gate itself travels with a serialized column
+(ser (at A 'q)) -- (ser (at B 'q))
+(ser (at A 'p)) -- (ser (at B 'p))
+(ser (at A 's)) -- (ser (at B 's))
+(ser (at A 'i)) -- (ser (at B 'i))
+;; a null i64 key matches the null already in the target
+(set A (table [k v w] (list [1 0Nl 3] [1 2 3] [1.0 2.0 3.0])))
+(upsert 'A 'k (table [k v w] (list [0Nl 4 0Nl] [22 44 222] [2.2 4.4 22.2])))
+(at A 'v) -- [1 222 3 44]
+;; a NaN f64 key never matches, so each one appends
+(set A (table [k v] (list [1.0 0Nf] [1 2])))
+(upsert 'A 'k (table [k v] (list [0Nf 1.0 0Nf] [3 11 4])))
+(at A 'v) -- [11 2 3 4]
+
+;; ── a table past the prefetch threshold resolves through the look-ahead
+;;    pass (hashes first, probes loaded ahead); the result must not move.
+;;    Compared as serialized bytes: the whole table, attrs included ──
+(set A (book (til 100000) (til 100000)))
+(set B (book (til 100000) (til 100000)))
+(set P (book (+ 99000 (% (* 7919 (til 3000)) 2000)) (+ 1000 (til 3000))))
+(upsert 'A 3 P)
+(rowwise 'B 3 P [instrument side px sz ts_evt ts_recv])
+(count A) -- 101000
+(count (ser A)) -- (count (ser B))
+(sum (== (ser A) (ser B))) -- (count (ser A))
+(set A (table [k q p s i] (list (til 200000) (til 200000) (as 'F64 (til 200000)) (at insts (% (til 200000) NI)) (as 'I32 (til 200000)))))
+(set B (table [k q p s i] (list (til 200000) (til 200000) (as 'F64 (til 200000)) (at insts (% (til 200000) NI)) (as 'I32 (til 200000)))))
+(set P (nul (+ 199000 (% (* 7919 (til 3000)) 2000))))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k q p s i])
+(count A) -- 201000
+(count (ser A)) -- (count (ser B))
+(sum (== (ser A) (ser B))) -- (count (ser A))
+(sum (at A 'q)) -- (sum (at B 'q))
+
+;; ── the vector-row form takes the same path ──
+(set A (table [k v w] (list (til 500) (til 500) (as 'F64 (til 500)))))
+(set B (table [k v w] (list (til 500) (til 500) (as 'F64 (til 500)))))
+(upsert 'A 'k (list KP (til 400) (as 'F64 (til 400)))) -- 'A
+(rowwise 'B 'k (table [k v w] (list KP (til 400) (as 'F64 (til 400)))) [k v w])
+A -- B
+
+;; ── a shared target is copied, not written through ──
+(set A (book (til 500) (til 500)))
+(set AL A)
+(set B (book (til 500) (til 500)))
+(set P (book KP (+ 1000 (til 400))))
+(upsert 'A 3 P)
+(rowwise 'B 3 P [instrument side px sz ts_evt ts_recv])
+A -- B
+AL -- (book (til 500) (til 500))
+;; and a value target returns a fresh table
+(upsert (book (til 500) (til 500)) 3 P) -- B
+
+;; ── indexes and the sorted attribute never answer from stale cells ──
+(set H (table [k v] (list (til 1000) (til 1000))))
+(set H (update {from: H v: (.idx.hash v)}))
+(upsert 'H 'k (table [k v] (list [5 7 1000 1001 7] [-5 -70 -1000 -1001 -7])))
+(select {from: H where: (== v 5)}) -- (table [k v] (list (as 'I64 []) (as 'I64 [])))
+(select {from: H where: (== v -7)}) -- (table [k v] (list [7] [-7]))
+(select {from: H where: (== v -1001)}) -- (table [k v] (list [1001] [-1001]))
+;; an update-only batch appends nothing, so only the scatter drops the index
+(set H (table [k v] (list (til 1000) (til 1000))))
+(set H (update {from: H v: (.idx.hash v)}))
+(.idx.has? (at H 'v)) -- true
+(upsert 'H 'k (table [k v] (list [5 7 9 7] [-5 -70 -9 -7])))
+(count H) -- 1000
+(select {from: H where: (== v 7)}) -- (table [k v] (list (as 'I64 []) (as 'I64 [])))
+(select {from: H where: (== v -7)}) -- (table [k v] (list [7] [-7]))
+(set H (table [k v] (list (til 1000) (til 1000))))
+(set H (update {from: H k: (.idx.hash k)}))
+(upsert 'H 'k (table [k v] (list [1001 3 1002] [1 -3 2])))
+(select {from: H where: (== k 1002)}) -- (table [k v] (list [1002] [2]))
+(count H) -- 1002
+(set S (table [k v] (list (til 10) (.attr.set 'sorted (til 10)))))
+(upsert 'S 'k (table [k v] (list [2 3] [100 -1])))
+(.attr.get (at S 'v)) -- (take ['a] 0)
+(select {from: S where: (== v -1)}) -- (table [k v] (list [3] [-1]))
+
+;; ── growing the map past its capacity keeps every entry ──
+;; A batch that does not fit re-places the live entries from the slots
+;; themselves (each carries its key's hash) instead of rebuilding from the
+;; columns; a delete first leaves tombstones for that pass to drop.
+(set A (table [k v w] (list (til 300) (til 300) (as 'F64 (til 300)))))
+(set B (table [k v w] (list (til 300) (til 300) (as 'F64 (til 300)))))
+(set P (table [k v w] (list (+ 150 (til 4000)) (+ 1000 (til 4000)) (/ (as 'F64 (til 4000)) 8))))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k v w])
+A -- B
+(count A) -- 4150
+(delete {from: 'A where: (< k 100)})
+(delete {from: 'B where: (< k 100)})
+(set P (table [k v w] (list (+ 4150 (til 12000)) (+ 5000 (til 12000)) (/ (as 'F64 (til 12000)) 4))))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k v w])
+A -- B
+(count A) -- 16050
+;; two keys the grown map holds, and one the delete took out — appended again
+(set P (table [k v w] (list [4149 16149 99] [-1 -2 -3] [1.0 2.0 3.0])))
+(upsert 'A 'k P)
+(rowwise 'B 'k P [k v w])
+A -- B
+(count A) -- 16051
+
+;; ── duplicate keys keep their row order when the map grows ──
+;; `insert` can append a second row carrying a key the table already holds.
+;; The map enters rows in row order, so a keyed upsert updates the lowest of
+;; them; re-placing the map into a bigger table must not change that, which it
+;; does whenever a probe chain wraps past the end of the slot array.  Both
+;; sizes below expose such a chain.
+(set dupgrow (fn [n dk] (do (set A (table [k v] (list (til n) (til n)))) (set B (table [k v] (list (til n) (til n)))) (upsert 'A 'k (table [k v] (list [0 1] [0 1]))) (upsert 'B 'k (table [k v] (list [0 1] [0 1]))) (insert 'A (list dk 999)) (insert 'B (list dk 999)) (set P (table [k v] (list (+ (* 10 n) (til (* 4 n))) (take [7] (* 4 n))))) (upsert 'A 'k P) (rowwise 'B 'k P [k v]) (set Q (table [k v] (list (as 'I64 (list dk (+ (* 10 n) 1))) (as 'I64 (list -1 -2))))) (upsert 'A 'k Q) (rowwise 'B 'k Q [k v]) (list (at (at A 'v) dk) (at (at A 'v) n) (count A)))))
+(dupgrow 480 470) -- (list -1 999 2401)
+A -- B
+(dupgrow 640 470) -- (list -1 999 3201)
+A -- B
+
+;; ── the key map stays exact across mixed writers ──
+(set A (book (til 500) (til 500)))
+(set B (book (til 500) (til 500)))
+(set P (book KP (+ 1000 (til 400))))
+(upsert 'A 3 P)
+(rowwise 'B 3 P [instrument side px sz ts_evt ts_recv])
+(upsert 'A 3 (list 'i3 'A 100003 -1 TS TS))
+(upsert 'B 3 (list 'i3 'A 100003 -1 TS TS))
+(delete {from: 'A where: (< sz 100)})
+(delete {from: 'B where: (< sz 100)})
+(set P (book (% (* 104729 (til 400)) 700) (+ 5000 (til 400))))
+(upsert 'A 3 P)
+(rowwise 'B 3 P [instrument side px sz ts_evt ts_recv])
+A -- B
+(count A) -- (count (distinct (at A 'px)))

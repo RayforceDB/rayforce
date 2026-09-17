@@ -1,0 +1,181 @@
+case,workers,binary,phase,processes,cold_median_ms,cold_min_ms,cold_max_ms,warm_median_ms,warm_min_ms,warm_max_ms
+extrema-f32,4,baseline,group: v2 dense,2,0.277,0.266,0.288,0.22599999999999998,0.214,0.238
+extrema-f32,4,baseline,dense: initialized slabs,2,0.5525,0.438,0.667,0.3625,0.36,0.365
+extrema-f32,4,baseline,dense: accumulated rows,2,1.1284999999999998,1.069,1.188,1.111,1.091,1.131
+extrema-f32,4,baseline,dense: merged slabs,2,0.34199999999999997,0.34,0.344,0.34,0.338,0.342
+extrema-f32,4,baseline,dense: freed slabs and counted groups,2,0.012,0.012,0.012,0.011,0.011,0.011
+extrema-f32,4,current,group: v2 dense,2,0.107,0.103,0.111,0.0605,0.058,0.063
+extrema-f32,4,current,dense: allocated slabs,2,0.642,0.633,0.651,0.001,0.001,0.001
+extrema-f32,4,current,dense: accumulated rows,2,1.2205,1.217,1.224,0.8109999999999999,0.801,0.821
+extrema-f32,4,current,dense: merged slabs,2,0.3565,0.349,0.364,0.273,0.273,0.273
+extrema-f32,4,current,dense: freed slabs and counted groups,2,0.0135,0.013,0.014,0.009,0.009,0.009
+clustered,4,baseline,group: v2 dense,2,0.202,0.195,0.209,0.1815,0.181,0.182
+clustered,4,baseline,dense: initialized slabs,2,0.23149999999999998,0.168,0.295,0.4205,0.313,0.528
+clustered,4,baseline,dense: accumulated rows,2,0.515,0.35,0.68,0.4615,0.32,0.603
+clustered,4,baseline,dense: merged slabs,2,0.35050000000000003,0.342,0.359,0.351,0.343,0.359
+clustered,4,baseline,dense: freed slabs and counted groups,2,0.0225,0.022,0.023,0.0215,0.021,0.022
+clustered,4,current,group: v2 dense,2,0.2515,0.249,0.254,0.1275,0.055,0.2
+clustered,4,current,dense: allocated slabs,2,0.624,0.62,0.628,0.001,0.001,0.001
+clustered,4,current,dense: accumulated rows,2,1.141,1.134,1.148,0.5840000000000001,0.401,0.767
+clustered,4,current,dense: merged slabs,2,0.1655,0.161,0.17,0.1585,0.157,0.16
+clustered,4,current,dense: freed slabs and counted groups,2,0.02,0.02,0.02,0.019,0.019,0.019
+symbol-key,2,baseline,group: v2 dense,2,0.013999999999999999,0.013,0.015,0.005,0.004,0.006
+symbol-key,2,baseline,dense: initialized slabs,2,0.003,0.003,0.003,0.0025,0.002,0.003
+symbol-key,2,baseline,dense: accumulated rows,2,0.762,0.625,0.899,0.7025,0.547,0.858
+symbol-key,2,baseline,dense: merged slabs,2,0.003,0.003,0.003,0.002,0.002,0.002
+symbol-key,2,baseline,dense: freed slabs and counted groups,2,0.0005,0.0,0.001,0.0005,0.0,0.001
+symbol-key,2,current,group: v2 dense,2,0.0155,0.014,0.017,0.005,0.005,0.005
+symbol-key,2,current,dense: allocated slabs,2,0.0025,0.002,0.003,0.002,0.002,0.002
+symbol-key,2,current,dense: accumulated rows,2,0.7255,0.645,0.806,0.5694999999999999,0.568,0.571
+symbol-key,2,current,dense: merged slabs,2,0.002,0.002,0.002,0.0015,0.001,0.002
+symbol-key,2,current,dense: freed slabs and counted groups,2,0.001,0.001,0.001,0.0,0.0,0.0
+hot-min-descending,8,baseline,group: v2 dense,2,0.2495,0.238,0.261,0.2265,0.203,0.25
+hot-min-descending,8,baseline,dense: initialized slabs,2,0.2,0.19,0.21,0.4115,0.403,0.42
+hot-min-descending,8,baseline,dense: accumulated rows,2,0.36,0.343,0.377,0.3685,0.353,0.384
+hot-min-descending,8,baseline,dense: merged slabs,2,0.21300000000000002,0.203,0.223,0.21000000000000002,0.167,0.253
+hot-min-descending,8,baseline,dense: freed slabs and counted groups,2,0.015,0.014,0.016,0.013999999999999999,0.013,0.015
+hot-min-descending,8,current,group: v2 dense,2,0.1355,0.135,0.136,0.1335,0.129,0.138
+hot-min-descending,8,current,dense: allocated slabs,2,0.6595,0.643,0.676,0.0,0.0,0.0
+hot-min-descending,8,current,dense: accumulated rows,2,0.996,0.99,1.002,0.5740000000000001,0.56,0.588
+hot-min-descending,8,current,dense: merged slabs,2,0.19,0.172,0.208,0.14,0.137,0.143
+hot-min-descending,8,current,dense: freed slabs and counted groups,2,0.013,0.013,0.013,0.0115,0.011,0.012
+sum-f64,8,baseline,group: v2 dense,2,0.324,0.272,0.376,0.21800000000000003,0.203,0.233
+sum-f64,8,baseline,dense: initialized slabs,2,0.2275,0.221,0.234,0.44599999999999995,0.329,0.563
+sum-f64,8,baseline,dense: accumulated rows,2,0.885,0.712,1.058,0.716,0.397,1.035
+sum-f64,8,baseline,dense: merged slabs,2,1.3785,1.366,1.391,1.147,0.931,1.363
+sum-f64,8,baseline,dense: freed slabs and counted groups,2,0.013999999999999999,0.013,0.015,0.012,0.012,0.012
+sum-f64,8,current,group: v2 dense,2,0.1285,0.114,0.143,0.112,0.111,0.113
+sum-f64,8,current,dense: allocated slabs,2,0.6355,0.633,0.638,0.0,0.0,0.0
+sum-f64,8,current,dense: accumulated rows,2,1.525,1.323,1.727,1.1185,0.933,1.304
+sum-f64,8,current,dense: merged slabs,2,0.296,0.29,0.302,0.2425,0.241,0.244
+sum-f64,8,current,dense: freed slabs and counted groups,2,0.012,0.012,0.012,0.011,0.011,0.011
+float-key,default,baseline,group: parallel wide-key strategy,2,0.0075,0.007,0.008,0.0025,0.002,0.003
+float-key,default,baseline,group: legacy,2,0.001,0.001,0.001,0.0,0.0,0.0
+float-key,default,current,group: v2 indexed,2,0.008,0.007,0.009,0.002,0.002,0.002
+float-key,default,current,directory: allocated,2,0.677,0.639,0.715,0.0,0.0,0.0
+float-key,default,current,directory: initialized,2,0.374,0.331,0.417,0.094,0.086,0.102
+float-key,default,current,directory: inserted keys,2,1.545,1.399,1.691,0.7795,0.705,0.854
+float-key,default,current,directory: counted groups,2,0.153,0.152,0.154,0.107,0.086,0.128
+float-key,default,current,directory: compacted groups,2,0.124,0.116,0.132,0.14150000000000001,0.118,0.165
+float-key,default,current,directory: remapped rows,2,0.1275,0.104,0.151,0.119,0.096,0.142
+float-key,default,current,indexed: grouped keys,2,0.066,0.056,0.076,0.043,0.043,0.043
+float-key,default,current,indexed slices: histogram,2,0.093,0.062,0.124,0.07300000000000001,0.062,0.084
+float-key,default,current,indexed slices: packed,2,0.138,0.093,0.183,0.1115,0.096,0.127
+float-key,default,current,indexed slices: counted groups,2,0.1645,0.128,0.201,0.119,0.109,0.129
+float-key,default,current,indexed slices: filled,2,1.4855,1.16,1.811,0.5885,0.507,0.67
+float-key,default,current,indexed: stable row slices,2,0.001,0.001,0.001,0.0,0.0,0.0
+float-key,default,current,indexed: emitted keys,2,0.08399999999999999,0.065,0.103,0.0565,0.05,0.063
+float-key,default,current,indexed: emitted aggregate,2,0.4235,0.378,0.469,0.2395,0.204,0.275
+clustered,8,baseline,group: v2 dense,2,0.208,0.205,0.211,0.1885,0.186,0.191
+clustered,8,baseline,dense: initialized slabs,2,0.3695,0.352,0.387,0.617,0.478,0.756
+clustered,8,baseline,dense: accumulated rows,2,0.4385,0.382,0.495,0.35150000000000003,0.343,0.36
+clustered,8,baseline,dense: merged slabs,2,0.40549999999999997,0.352,0.459,0.324,0.319,0.329
+clustered,8,baseline,dense: freed slabs and counted groups,2,0.027999999999999997,0.026,0.03,0.024,0.024,0.024
+clustered,8,current,group: v2 dense,2,0.088,0.059,0.117,0.10350000000000001,0.101,0.106
+clustered,8,current,dense partition: histogram,2,0.819,0.817,0.821,0.179,0.178,0.18
+clustered,8,current,dense partition: scattered rows,2,1.0070000000000001,0.93,1.084,0.308,0.297,0.319
+clustered,8,current,dense partition: reduced groups,2,0.2175,0.205,0.23,0.2095,0.208,0.211
+clustered,8,current,dense partition: merged split partitions,2,0.0055,0.005,0.006,0.0055,0.005,0.006
+clustered,8,current,dense: freed slabs and counted groups,2,0.0215,0.021,0.022,0.02,0.02,0.02
+sparse,default,baseline,group: v2 radix,2,0.3655,0.352,0.379,0.40249999999999997,0.395,0.41
+sparse,default,current,group: v2 radix,2,0.07150000000000001,0.07,0.073,0.1305,0.126,0.135
+sparse,default,current,radix: scattered rows,2,1.4155,1.381,1.45,2.0185,1.932,2.105
+sparse,default,current,radix: reduced partitions,2,1.3475000000000001,1.252,1.443,1.6475,1.623,1.672
+sparse,default,current,radix: ordered groups,2,1.6724999999999999,1.656,1.689,0.9005000000000001,0.883,0.918
+truth,2,baseline,group: v2 dense,2,0.263,0.26,0.266,0.223,0.213,0.233
+truth,2,baseline,dense: initialized slabs,2,0.3105,0.307,0.314,0.403,0.398,0.408
+truth,2,baseline,dense: accumulated rows,2,1.913,1.883,1.943,2.1065,1.89,2.323
+truth,2,baseline,dense: merged slabs,2,0.3035,0.301,0.306,0.3105,0.306,0.315
+truth,2,baseline,dense: freed slabs and counted groups,2,0.017,0.017,0.017,0.0135,0.012,0.015
+truth,2,current,group: v2 dense,2,0.1625,0.161,0.164,0.093,0.093,0.093
+truth,2,current,dense: allocated slabs,2,0.001,0.001,0.001,0.0,0.0,0.0
+truth,2,current,dense: accumulated rows,2,1.809,1.807,1.811,1.7515,1.747,1.756
+truth,2,current,dense: merged slabs,2,1.0205,1.011,1.03,0.247,0.247,0.247
+truth,2,current,dense: freed slabs and counted groups,2,0.013000000000000001,0.012,0.014,0.008,0.008,0.008
+nonnull,8,baseline,group: v2 dense,2,0.275,0.274,0.276,0.2455,0.243,0.248
+nonnull,8,baseline,dense: initialized slabs,2,0.39149999999999996,0.37,0.413,0.755,0.707,0.803
+nonnull,8,baseline,dense: accumulated rows,2,0.8140000000000001,0.793,0.835,0.857,0.855,0.859
+nonnull,8,baseline,dense: merged slabs,2,0.515,0.511,0.519,0.45999999999999996,0.434,0.486
+nonnull,8,baseline,dense: freed slabs and counted groups,2,0.015,0.015,0.015,0.014499999999999999,0.014,0.015
+nonnull,8,current,group: v2 dense,2,0.166,0.161,0.171,0.10300000000000001,0.101,0.105
+nonnull,8,current,dense partition: histogram,2,1.1825,1.073,1.292,0.5549999999999999,0.478,0.632
+nonnull,8,current,dense partition: scattered rows,2,0.9944999999999999,0.886,1.103,0.6305000000000001,0.615,0.646
+nonnull,8,current,dense partition: reduced groups,2,0.7070000000000001,0.648,0.766,0.702,0.636,0.768
+nonnull,8,current,dense partition: merged split partitions,2,0.0035,0.003,0.004,0.004,0.004,0.004
+nonnull,8,current,dense: freed slabs and counted groups,2,0.012,0.012,0.012,0.011,0.011,0.011
+product,8,baseline,group: v2 dense,2,0.2755,0.274,0.277,0.235,0.232,0.238
+product,8,baseline,dense: initialized slabs,2,0.2955,0.273,0.318,0.6265000000000001,0.585,0.668
+product,8,baseline,dense: accumulated rows,2,0.8185,0.528,1.109,0.8280000000000001,0.555,1.101
+product,8,baseline,dense: merged slabs,2,0.606,0.576,0.636,0.604,0.572,0.636
+product,8,baseline,dense: freed slabs and counted groups,2,0.0135,0.013,0.014,0.014,0.014,0.014
+product,8,current,group: v2 dense,2,0.16999999999999998,0.141,0.199,0.113,0.113,0.113
+product,8,current,dense: allocated slabs,2,0.636,0.631,0.641,0.0,0.0,0.0
+product,8,current,dense: accumulated rows,2,1.7905,1.436,2.145,1.361,0.993,1.729
+product,8,current,dense: merged slabs,2,0.30100000000000005,0.271,0.331,0.2385,0.224,0.253
+product,8,current,dense: freed slabs and counted groups,2,0.0125,0.012,0.013,0.0115,0.011,0.012
+extrema-i32,4,baseline,group: v2 dense,2,0.266,0.262,0.27,0.2145,0.207,0.222
+extrema-i32,4,baseline,dense: initialized slabs,2,0.522,0.422,0.622,0.5175,0.463,0.572
+extrema-i32,4,baseline,dense: accumulated rows,2,1.3185,0.995,1.642,1.244,1.053,1.435
+extrema-i32,4,baseline,dense: merged slabs,2,0.4455,0.325,0.566,0.4165,0.333,0.5
+extrema-i32,4,baseline,dense: freed slabs and counted groups,2,0.011,0.011,0.011,0.0115,0.011,0.012
+extrema-i32,4,current,group: v2 dense,2,0.224,0.187,0.261,0.1575,0.085,0.23
+extrema-i32,4,current,dense: allocated slabs,2,0.0015,0.001,0.002,0.001,0.001,0.001
+extrema-i32,4,current,dense: accumulated rows,2,1.565,1.562,1.568,1.101,0.764,1.438
+extrema-i32,4,current,dense: merged slabs,2,0.498,0.466,0.53,0.3725,0.287,0.458
+extrema-i32,4,current,dense: freed slabs and counted groups,2,0.0215,0.011,0.032,0.010499999999999999,0.01,0.011
+sum-time,4,baseline,group: v2 dense,2,0.2665,0.264,0.269,0.1965,0.193,0.2
+sum-time,4,baseline,dense: initialized slabs,2,0.20950000000000002,0.199,0.22,0.42000000000000004,0.389,0.451
+sum-time,4,baseline,dense: accumulated rows,2,1.097,0.946,1.248,0.766,0.749,0.783
+sum-time,4,baseline,dense: merged slabs,2,0.489,0.489,0.489,0.476,0.471,0.481
+sum-time,4,baseline,dense: freed slabs and counted groups,2,0.0155,0.014,0.017,0.0115,0.011,0.012
+sum-time,4,current,group: v2 dense,2,0.22449999999999998,0.164,0.285,0.1295,0.059,0.2
+sum-time,4,current,dense: allocated slabs,2,0.0015,0.001,0.002,0.001,0.001,0.001
+sum-time,4,current,dense: accumulated rows,2,1.0025,0.99,1.015,0.6655,0.447,0.884
+sum-time,4,current,dense: merged slabs,2,0.2415,0.239,0.244,0.1925,0.15,0.235
+sum-time,4,current,dense: freed slabs and counted groups,2,0.01,0.01,0.01,0.01,0.01,0.01
+sum-i64,8,baseline,group: v2 dense,2,0.36550000000000005,0.275,0.456,0.22699999999999998,0.212,0.242
+sum-i64,8,baseline,dense: initialized slabs,2,0.242,0.242,0.242,0.5545,0.532,0.577
+sum-i64,8,baseline,dense: accumulated rows,2,0.877,0.696,1.058,0.8815,0.731,1.032
+sum-i64,8,baseline,dense: merged slabs,2,1.2375,1.183,1.292,1.2565,1.244,1.269
+sum-i64,8,baseline,dense: freed slabs and counted groups,2,0.0125,0.012,0.013,0.012,0.012,0.012
+sum-i64,8,current,group: v2 dense,2,0.183,0.173,0.193,0.11499999999999999,0.112,0.118
+sum-i64,8,current,dense: allocated slabs,2,0.6255,0.622,0.629,0.0,0.0,0.0
+sum-i64,8,current,dense: accumulated rows,2,1.3519999999999999,1.03,1.674,0.94,0.898,0.982
+sum-i64,8,current,dense: merged slabs,2,0.26049999999999995,0.236,0.285,0.251,0.225,0.277
+sum-i64,8,current,dense: freed slabs and counted groups,2,0.012,0.011,0.013,0.0115,0.011,0.012
+sum-i64,default,baseline,group: dense worker budget exceeded,2,0.4585,0.358,0.559,0.3425,0.333,0.352
+sum-i64,default,baseline,group: v2 radix,2,0.0,0.0,0.0,0.0,0.0,0.0
+sum-i64,default,current,group: v2 dense,2,0.08199999999999999,0.072,0.092,0.0475,0.045,0.05
+sum-i64,default,current,dense partition: histogram,2,0.8315,0.809,0.854,0.202,0.202,0.202
+sum-i64,default,current,dense partition: scattered rows,2,1.6,1.558,1.642,0.196,0.191,0.201
+sum-i64,default,current,dense partition: reduced groups,2,0.23199999999999998,0.225,0.239,0.1365,0.134,0.139
+sum-i64,default,current,dense partition: merged split partitions,2,0.02,0.019,0.021,0.019000000000000003,0.017,0.021
+sum-i64,default,current,dense: freed slabs and counted groups,2,0.024,0.012,0.036,0.018000000000000002,0.011,0.025
+guid-key,8,baseline,group: v2 indexed,2,0.008,0.008,0.008,0.0025,0.002,0.003
+guid-key,8,current,group: v2 indexed,2,0.0095,0.009,0.01,0.003,0.003,0.003
+guid-key,8,current,directory: allocated,2,0.6715,0.662,0.681,0.0005,0.0,0.001
+guid-key,8,current,directory: initialized,2,0.279,0.246,0.312,0.163,0.162,0.164
+guid-key,8,current,directory: inserted keys,2,1.001,0.836,1.166,0.744,0.707,0.781
+guid-key,8,current,directory: counted groups,2,0.089,0.078,0.1,0.074,0.074,0.074
+guid-key,8,current,directory: compacted groups,2,0.038000000000000006,0.034,0.042,0.0345,0.034,0.035
+guid-key,8,current,directory: remapped rows,2,0.068,0.057,0.079,0.069,0.069,0.069
+guid-key,8,current,indexed: grouped keys,2,0.001,0.001,0.001,0.001,0.001,0.001
+guid-key,8,current,indexed: stable row slices,2,0.5820000000000001,0.511,0.653,0.164,0.163,0.165
+guid-key,8,current,indexed: emitted keys,2,0.0015,0.001,0.002,0.001,0.001,0.001
+guid-key,8,current,indexed: emitted aggregate,2,0.502,0.495,0.509,0.3825,0.367,0.398
+guid-key,8,current,rank: selected dominant groups,2,1.4835,1.423,1.544,1.4020000000000001,1.37,1.434
+guid-key,8,current,rank: reduced remaining groups,2,0.003,0.003,0.003,0.003,0.003,0.003
+guid-key,default,baseline,group: v2 indexed,2,0.008,0.008,0.008,0.002,0.002,0.002
+guid-key,default,current,group: v2 indexed,2,0.010499999999999999,0.009,0.012,0.0025,0.002,0.003
+guid-key,default,current,directory: allocated,2,0.622,0.603,0.641,0.001,0.001,0.001
+guid-key,default,current,directory: initialized,2,0.3805,0.366,0.395,0.2245,0.224,0.225
+guid-key,default,current,directory: inserted keys,2,1.297,1.253,1.341,0.40249999999999997,0.395,0.41
+guid-key,default,current,directory: counted groups,2,0.078,0.076,0.08,0.0485,0.043,0.054
+guid-key,default,current,directory: compacted groups,2,0.022,0.021,0.023,0.0215,0.021,0.022
+guid-key,default,current,directory: remapped rows,2,0.0455,0.045,0.046,0.045,0.045,0.045
+guid-key,default,current,indexed: grouped keys,2,0.001,0.001,0.001,0.001,0.001,0.001
+guid-key,default,current,indexed: stable row slices,2,1.884,1.805,1.963,0.082,0.081,0.083
+guid-key,default,current,indexed: emitted keys,2,0.009999999999999998,0.009,0.011,0.001,0.001,0.001
+guid-key,default,current,indexed: emitted aggregate,2,0.4935,0.476,0.511,0.211,0.21,0.212
+guid-key,default,current,rank: selected dominant groups,2,1.7025000000000001,1.512,1.893,1.682,1.377,1.987
+guid-key,default,current,rank: reduced remaining groups,2,0.016,0.013,0.019,0.014499999999999999,0.014,0.015

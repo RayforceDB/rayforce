@@ -62,7 +62,7 @@
 ;; non-date partition keys land under the 'part column name
 (first (key Pi)) -- 'part
 (key Pi) -- ['part 'n]
-;; verify the actual column VALUES read off disk, in lexical partition order
+;; verify the actual column VALUES read off disk, in numeric partition order
 ;; (100, 200, 300): IT-A=[100 101], IT-B=[200 201 202], IT-C=[300]
 ;; BUG: a whole-column read of a parted INT column returns it UN-materialized
 ;;   (still segmented) — `(at Pi 'n)` yields "<?>" instead of the vector.
@@ -117,10 +117,10 @@
 (at (select {from: Psp where: (> x 7)}) 'x) -- [8 9 10]
 
 ;; ────────────── three-partition concatenation ordering ──────────────
-;; Bubble-sort in collect_part_dirs (lines 164-172) reorders dir
-;; entries lexically.  Insert in reverse to prove the sort runs;
-;; the row count would be the same either way, but iterating the
-;; outer loop more than once exercises the i-then-j swap branch.
+;; collect_part_dirs sorts dir entries into key order — by name for a
+;; date set, whose fixed-width names sort chronologically.  Insert in
+;; reverse to prove the sort runs; the row count would be the same
+;; either way.
 (set TR-1 (table [n] (list [1])))
 (set TR-2 (table [n] (list [2 2])))
 (set TR-3 (table [n] (list [3 3 3])))
@@ -422,6 +422,63 @@
 (first (key Pleap)) -- 'date
 (sum (at Pleap 'v)) -- 15
 (.sys.exec "rm -rf /tmp/rfl_part_badcal /tmp/rfl_part_leap")
+
+;; ────── integer partitions order by VALUE, not by name ──────
+;; collect_part_dirs sorted every scheme with strcmp, so an integer set with
+;; keys of unequal width came out 1, 10, 2: the I64 partition-key column was
+;; unordered, rows interleaved across keys, and the "most recent" (last)
+;; partition that .db.parted.tables / .db.parted.fill read was "9" rather
+;; than "12" — a table first added in the newest partition was invisible.
+(.sys.exec "rm -rf /tmp/rfl_part_intord /tmp/rfl_part_intovf")
+(set IO-1  (table [n] (list [1])))
+(set IO-2  (table [n] (list [2])))
+(set IO-10 (table [n] (list [10])))
+(.db.splayed.set "/tmp/rfl_part_intord/1/t/" IO-1)
+(.db.splayed.set "/tmp/rfl_part_intord/2/t/" IO-2)
+(.db.splayed.set "/tmp/rfl_part_intord/10/t/" IO-10)
+;; a table that exists only in the newest (largest-key) partition
+(.db.splayed.set "/tmp/rfl_part_intord/10/late/" IO-10)
+(set Pord (.db.parted.get "/tmp/rfl_part_intord/" 't))
+(first (key Pord)) -- 'part
+;; keys and rows follow numeric key order (by name this was [1 10 2])
+(at (select {from: Pord where: (> n 0)}) 'part) -- [1 2 10]
+(at (select {from: Pord where: (> n 0)}) 'n)    -- [1 2 10]
+;; the newest partition is 10, so its table set includes 'late
+(.db.parted.tables "/tmp/rfl_part_intord/") -- ['late 't]
+;; and an int-partition range predicate still prunes on the ordered keys
+(at (select {from: Pord where: (>= part 2)}) 'n) -- [2 10]
+
+;; ────── an integer name that does not fit int64 is a corrupt partition set ──────
+;; parse_int_dir accumulated a 20-digit name straight past INT64_MAX —
+;; signed-overflow UB (a UBSan abort here) that in release wrapped the key
+;; to an unrelated number.  A digit-only name can only mean an integer key,
+;; so rather than silently retyping the whole set to sym keys — where
+;; (== part 2) matches nothing and (>= part 2) returns partition 1 too —
+;; every reader of the set fails with `corrupt`, naming the directory.
+(set OV-A (table [n] (list [1])))
+(set OV-B (table [n] (list [2])))
+(.db.splayed.set "/tmp/rfl_part_intovf/1/t/" OV-A)
+(.db.splayed.set "/tmp/rfl_part_intovf/99999999999999999999/t/" OV-B)
+(.db.parted.get "/tmp/rfl_part_intovf/" 't) !- corrupt
+(.db.parted.tables "/tmp/rfl_part_intovf/") !- corrupt
+(.db.parted.fill "/tmp/rfl_part_intovf/") !- corrupt
+;; beside a non-integer name the set is sym-keyed and the long name is just a
+;; name like any other, kept literal
+(.db.splayed.set "/tmp/rfl_part_intovf/1.5/t/" OV-A)
+(set Pmix (.db.parted.get "/tmp/rfl_part_intovf/" 't))
+(first (key Pmix)) -- 'part
+(at Pmix 'part) -- (as 'sym ["1" "1.5" "99999999999999999999"])
+;; the largest value that does fit is still an integer key ...
+(.sys.exec "rm -rf /tmp/rfl_part_intovf")
+(.db.splayed.set "/tmp/rfl_part_intovf/1/t/" OV-A)
+(.db.splayed.set "/tmp/rfl_part_intovf/9223372036854775807/t/" OV-B)
+(set Pmax (.db.parted.get "/tmp/rfl_part_intovf/" 't))
+(at (select {from: Pmax where: (> n 0)}) 'part) -- [1 9223372036854775807]
+;; ... and one past it is not
+(.sys.exec "rm -rf /tmp/rfl_part_intovf/9223372036854775807")
+(.db.splayed.set "/tmp/rfl_part_intovf/9223372036854775808/t/" OV-B)
+(.db.parted.get "/tmp/rfl_part_intovf/" 't) !- corrupt
+(.sys.exec "rm -rf /tmp/rfl_part_intord /tmp/rfl_part_intovf")
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like /tmp/rfl_part_mc /tmp/rfl_part_mb")

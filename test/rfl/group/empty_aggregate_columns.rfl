@@ -1,0 +1,35 @@
+;; No output groups: retain known result types across mixed query routes.
+(set t (table [k v] (list ["a" "b"] (as 'TIME [1 2]))))
+(set z (select {from:t by:k where:(== k "missing") s:(sum v) m:(med v) n:(count (distinct v)) f:(first v)}))
+(count z) -- 0
+(type (at z 'k)) -- 'STR
+(type (at z 's)) -- 'TIME
+(type (at z 'm)) -- 'F64
+(type (at z 'n)) -- 'I64
+(type (at z 'f)) -- 'TIME
+(set e (table [k v] (list (as 'I64 []) (as 'TIME []))))
+(set z (select {from:e by:k m:(med v) d:(dev v) a:(avg v)}))
+(count z) -- 0
+(type (at z 'm)) -- 'F64
+(type (at z 'd)) -- 'F64
+(type (at z 'a)) -- 'F64
+
+;; Aliases take the generic unary route. Empty LIST aggregates reject direct
+;; invocation, but zero groups must not invoke an aggregate semantically.
+(set empty_avg avg)
+(set empty_min min)
+(set empty_max max)
+(set t (table [k v] (list ["a" "b"] (list [1 2] [3 4]))))
+(set z (select {from:t by:k where:(== k "missing") a:(empty_avg v) lo:(empty_min v) hi:(empty_max v)}))
+(count z) -- 0
+(type (at z 'a)) -- 'LIST
+(type (at z 'lo)) -- 'LIST
+(type (at z 'hi)) -- 'LIST
+(set z (select {from:t by:k where:(== k "missing") c:(count k) a:(empty_avg v)}))
+(count z) -- 0
+(type (at z 'a)) -- 'LIST
+;; Inference still succeeds for an alias with a typed source.
+(set empty_med med)
+(set t (table [k v] (list [1 2] (as 'TIME [1 2]))))
+(set z (select {from:t by:k where:(< k 0) m:(empty_med v)}))
+(type (at z 'm)) -- 'F64

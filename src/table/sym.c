@@ -117,7 +117,14 @@ static int64_t sym_intern_nolock(uint32_t hash, const char* str, size_t len,
  * ray_sym_init
  * -------------------------------------------------------------------------- */
 
+static _Atomic uint64_t g_sym_epoch_ctr = 0;
+
+uint64_t ray_sym_epoch(void) {
+    return atomic_load_explicit(&g_sym_epoch_ctr, memory_order_acquire);
+}
+
 ray_err_t ray_sym_init(void) {
+    atomic_fetch_add_explicit(&g_sym_epoch_ctr, 1, memory_order_release);
     bool expected = false;
     if (!atomic_compare_exchange_strong_explicit(&g_sym_inited, &expected, true,
             memory_order_acq_rel, memory_order_acquire))
@@ -213,6 +220,7 @@ ray_err_t ray_sym_init(void) {
  * -------------------------------------------------------------------------- */
 
 void ray_sym_destroy(void) {
+    atomic_fetch_add_explicit(&g_sym_epoch_ctr, 1, memory_order_release);
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
 
     if (g_sym.lazy_map) {
@@ -790,6 +798,30 @@ int64_t ray_sym_intern_runtime(const char* str, size_t len) {
 int64_t ray_sym_intern_prehashed(uint32_t hash, const char* str, size_t len) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
     return sym_intern_nolock(hash, str, len, true);
+}
+
+/* --------------------------------------------------------------------------
+ * ray_sym_intern_batch -- intern n pre-hashed strings under one lock.
+ *
+ * For decoders that have already deduplicated their input: each distinct
+ * string costs one probe, and the whole batch one lock round-trip.  The
+ * per-string work is exactly ray_sym_intern's (search_lazy = true), so ids
+ * and dotted-segment caching are identical.
+ * Returns 0, or -1 if any intern failed (out_ids then partially filled).
+ * -------------------------------------------------------------------------- */
+
+int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
+                             const size_t* lens, int64_t n, int64_t* out_ids) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
+    if (n <= 0) return 0;
+    sym_lock();
+    for (int64_t i = 0; i < n; i++) {
+        int64_t id = sym_intern_nolock(hashes[i], strs[i], lens[i], true);
+        if (id < 0) { sym_unlock(); return -1; }
+        out_ids[i] = id;
+    }
+    sym_unlock();
+    return 0;
 }
 
 /* --------------------------------------------------------------------------

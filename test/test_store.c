@@ -26,6 +26,7 @@
 #endif
 
 #include "test.h"
+#include "ipc_harness.h"
 #include <rayforce.h>
 #include <rayforce.h>
 #include <time.h>
@@ -3655,88 +3656,18 @@ static test_result_t test_ipc_compress_zeros(void) {
     PASS();
 }
 
-/* ---- IPC server lifecycle ----------------------------------------------- */
-
-static test_result_t test_ipc_server_lifecycle(void) {
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);  /* ephemeral port */
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    TEST_ASSERT_TRUE(srv.running);
-    TEST_ASSERT((srv.listen_fd) != (RAY_INVALID_SOCK), "srv.listen_fd != RAY_INVALID_SOCK");
-
-    /* Verify we can retrieve the OS-assigned port */
-    struct sockaddr_in addr;
-    socklen_t alen = sizeof(addr);
-    int rc = getsockname(srv.listen_fd, (struct sockaddr*)&addr, &alen);
-    TEST_ASSERT_EQ_I(rc, 0);
-    uint16_t port = ntohs(addr.sin_port);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_ipc_server_destroy(&srv);
-    TEST_ASSERT_FALSE(srv.running);
-    PASS();
-}
-
 /* ---- IPC sync round-trip ------------------------------------------------ */
-
-/* Helper: get ephemeral port from listen socket */
-static uint16_t get_listen_port(ray_sock_t fd) {
-    struct sockaddr_in addr;
-    socklen_t len = sizeof(addr);
-    if (getsockname(fd, (struct sockaddr*)&addr, &len) < 0) return 0;
-    return ntohs(addr.sin_port);
-}
-
-/* Server poll thread context — carries a VM for eval */
-typedef struct {
-    ray_ipc_server_t *srv;
-    ray_vm_t         *vm;
-} ipc_thread_ctx_t;
-
-static void server_thread_fn(void* arg) {
-    ipc_thread_ctx_t* ctx = (ipc_thread_ctx_t*)arg;
-    /* Set up TLS VM so ray_eval_str works in this thread */
-    __VM = ctx->vm;
-    while (ctx->srv->running)
-        ray_ipc_poll(ctx->srv, 10);
-}
-
-/* Unified IPC handles are poll selector ids resolved in the runtime
- * poll, so every client-side ray_ipc_connect below needs one published —
- * mirroring what main.c does at startup. */
-static ray_poll_t* ipc_client_poll(void) {
-    ray_poll_t* p = ray_poll_create();
-    if (p) ray_runtime_set_poll(p);
-    return p;
-}
-static void ipc_client_poll_done(void) {
-    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
-    if (p) { ray_runtime_set_poll(NULL); ray_poll_destroy(p); }
-}
 
 static test_result_t test_ipc_sync_roundtrip(void) {
     /* Full runtime needed for ray_eval_str in server thread */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    /* Create a VM for the server thread */
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-
-    /* Start server poll thread */
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
 
     /* Client: connect */
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
@@ -3758,11 +3689,8 @@ static test_result_t test_ipc_sync_roundtrip(void) {
     ray_ipc_close(h);
 
     /* Stop server */
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3773,22 +3701,12 @@ static test_result_t test_ipc_sync_roundtrip(void) {
 static test_result_t test_ipc_async_send(void) {
     /* Full runtime needed for eval on server side */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_ipc_server_init(&srv, 0);
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -3803,11 +3721,8 @@ static test_result_t test_ipc_async_send(void) {
     { struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; nanosleep(&ts, NULL); }
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3817,23 +3732,13 @@ static test_result_t test_ipc_async_send(void) {
 
 static test_result_t test_ipc_auth_success(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_ipc_server_init(&srv, 0);
-    strcpy(srv.auth_secret, "secret123");
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, "secret123", false);
+    uint16_t port = srv.port;
 
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123", 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -3848,11 +3753,8 @@ static test_result_t test_ipc_auth_success(void) {
     ray_release(result);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3862,32 +3764,19 @@ static test_result_t test_ipc_auth_success(void) {
 
 static test_result_t test_ipc_auth_reject(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_ipc_server_init(&srv, 0);
-    strcpy(srv.auth_secret, "secret123");
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, "secret123", false);
+    uint16_t port = srv.port;
 
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "wrong", 0);
     TEST_ASSERT_EQ_I(h, -3);
 
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3897,32 +3786,19 @@ static test_result_t test_ipc_auth_reject(void) {
 
 static test_result_t test_ipc_auth_no_creds(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_ipc_server_init(&srv, 0);
-    strcpy(srv.auth_secret, "secret123");
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, "secret123", false);
+    uint16_t port = srv.port;
 
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT_EQ_I(h, -2);
 
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3932,24 +3808,13 @@ static test_result_t test_ipc_auth_no_creds(void) {
 
 static test_result_t test_ipc_restricted(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_ipc_server_init(&srv, 0);
-    strcpy(srv.auth_secret, "secret123");
-    srv.restricted = true;
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, "secret123", true);
+    uint16_t port = srv.port;
 
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
-
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123", 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
@@ -4012,11 +3877,8 @@ static test_result_t test_ipc_restricted(void) {
     ray_release(r6);
 
     ray_ipc_close(h);
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -4030,22 +3892,13 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
      * to any framed payload.  This is the defense-in-depth layer that
      * protects an old peer from ever seeing a new-format message. */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
-    ipc_client_poll();
+    ray_test_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
-    ray_ipc_server_t srv;
-    ray_err_t err = ray_ipc_server_init(&srv, 0);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    uint16_t port = get_listen_port(srv.listen_fd);
-    TEST_ASSERT((port) > (0), "port > 0");
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    uint16_t port = srv.port;
 
-    ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    TEST_ASSERT_NOT_NULL(srv_vm);
-    ray_vm_init(srv_vm, 1);
-
-    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
-    ray_thread_t tid;
-    ray_thread_create(&tid, server_thread_fn, &ctx);
 
     /* Connect raw socket and send a version-byte that doesn't match. */
     ray_sock_t s = ray_sock_connect("127.0.0.1", port, 2000);
@@ -4074,11 +3927,8 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
     TEST_ASSERT((h) >= (0), "h >= 0");
     ray_ipc_close(h);
 
-    srv.running = false;
-    ray_thread_join(tid);
-    ray_ipc_server_destroy(&srv);
-    ray_sys_free(srv_vm);
-    ipc_client_poll_done();
+    ray_test_server_stop(&srv);
+    ray_test_client_poll_done();
     ray_runtime_destroy(rt);
     PASS();
 }
@@ -5615,7 +5465,6 @@ const test_entry_t store_entries[] = {
     { "store/ipc/compress_rt", test_ipc_compress_rt, NULL, NULL },
     { "store/ipc/compress_threshold", test_ipc_compress_threshold, NULL, NULL },
     { "store/ipc/compress_zeros", test_ipc_compress_zeros, NULL, NULL },
-    { "store/ipc/server_lifecycle", test_ipc_server_lifecycle, NULL, NULL },
     { "store/ipc/sync_roundtrip", test_ipc_sync_roundtrip, NULL, NULL },
     { "store/ipc/async_send", test_ipc_async_send, NULL, NULL },
     { "store/ipc/auth_success", test_ipc_auth_success, NULL, NULL },

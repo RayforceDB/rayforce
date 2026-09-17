@@ -119,7 +119,7 @@ static test_result_t test_gate_admits_two_keys(void) {
 }
 
 /* Case 3: single I64 key + OP_SUM over an I32 column (not registered) → defer. */
-static test_result_t test_gate_defers_sum_i32(void) {
+static test_result_t test_gate_admits_sum_i32(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -136,7 +136,7 @@ static test_result_t test_gate_defers_sum_i32(void) {
     ray_op_t* grp = ray_group(g, keys, 1, ops, ins, 1);
     TEST_ASSERT_NOT_NULL(grp);
 
-    TEST_ASSERT_FALSE(agg_v2_can_handle(g, grp, tbl));
+    TEST_ASSERT_TRUE(agg_v2_can_handle(g, grp, tbl));
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -343,8 +343,9 @@ static test_result_t test_dense_plan_nullable_key(void) {
     dense_plan_t pl = {0};
     bool ok = agg_dense_plan(keys, 1, vts, 1, 8, &pl);
 
-    TEST_ASSERT_FALSE(ok);
-    TEST_ASSERT_FALSE(pl.ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(pl.ok);
+    TEST_ASSERT_EQ_I(pl.ranges[0], 5);
 
     ray_release(k);
     ray_sym_destroy();
@@ -2090,7 +2091,7 @@ const test_entry_t agg_engine_entries[] = {
     { "sel_2k_median",               test_sel_2k_median,               NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
-    { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
+    { "gate_admits_sum_i32",         test_gate_admits_sum_i32,         NULL, NULL },
     { "gate_admits_count",           test_gate_admits_count,           NULL, NULL },
     { "dense_plan_single_i64",       test_dense_plan_single_i64,       NULL, NULL },
     { "dense_plan_two_keys",         test_dense_plan_two_keys,         NULL, NULL },

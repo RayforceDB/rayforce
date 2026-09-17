@@ -122,6 +122,20 @@ static inline int64_t ray_sym_vec_lookup(ray_t* vec, const char* s, size_t n) {
  * Caller must guarantee single-threaded access. */
 int64_t ray_sym_intern_prehashed(uint32_t hash, const char* str, size_t len);
 
+/* Intern n pre-hashed, already-deduplicated strings under a single lock.
+ * Semantically identical to n ray_sym_intern calls (same ids, same dotted-
+ * segment caching); it only amortizes the lock round-trip, which matters
+ * for decoders that intern a whole column at once.  Returns 0, or -1 if
+ * any intern failed, in which case out_ids is only partially filled. */
+int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
+                             const size_t* lens, int64_t n, int64_t* out_ids);
+
+/* Monotonic counter bumped by ray_sym_init and ray_sym_destroy.  A cache
+ * keyed on sym ids is valid only while this is unchanged: ids are stable
+ * for the table's lifetime, but a teardown frees the atoms they point at. */
+uint64_t ray_sym_epoch(void);
+
+
 /* ---- Dotted name resolution (namespace paths) ---------------------------
  * A symbol whose name contains one or more '.' is a *dotted* sym.  At intern
  * time we memchr once, split the name on '.', intern each segment, and cache

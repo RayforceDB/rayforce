@@ -194,6 +194,46 @@ static test_result_t test_create_with_sym_load_preserves_user_ids(void) {
     PASS();
 }
 
+/* A tree-walked lambda call binds `self` under the interned sym ID of
+ * "self".  That ID must belong to the runtime doing the call: the destroy
+ * path tears the sym table down, and a fresh runtime that interns names in
+ * a different order gives "self" a different ID.  An ID cached from an
+ * earlier runtime binds the lambda under a name that is no longer "self" —
+ * shadowing whatever variable owns it — and `self` in the body no longer
+ * names the call's own lambda (without the fix, the second runtime below
+ * fails with a stack-limit error instead of returning 42).
+ *
+ * The inner fn is built inside a lambda body, so it captures a closure and
+ * is never compiled: every call map makes to it takes the tree walker.  Two
+ * runtimes pad the sym table by different amounts before "self" is first
+ * interned, so "self" gets two different IDs; one process-wide cached ID
+ * cannot match both, whichever runtime (or an earlier test) filled it. */
+static test_result_t test_lambda_self_sym_per_runtime(void) {
+    int64_t self_ids[2];
+    for (int pass = 0; pass < 2; pass++) {
+        ray_runtime_t* rt = ray_runtime_create(0, NULL);
+        TEST_ASSERT_NOT_NULL(rt);
+        for (int i = 0; i < pass * 7; i++) {
+            char name[32];
+            int n = snprintf(name, sizeof(name), "self_sym_pad_%d", i);
+            ray_sym_intern(name, (size_t)n);
+        }
+        ray_t* r = ray_eval_str(
+            "((fn [n] (first (map (fn [k] (if (== k 0) n (self (- k 1)))) [3]))) 42)");
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I((int)r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I((int)r->i64, 42);
+        ray_release(r);
+        self_ids[pass] = ray_sym_intern("self", 4);
+        ray_runtime_destroy(rt);
+    }
+    /* Guard the premise: with equal IDs a stale cache would go unnoticed. */
+    TEST_ASSERT(self_ids[0] != self_ids[1],
+                "padding must give \"self\" a different ID in each runtime");
+    PASS();
+}
+
 /* Sym file whose stat st_size exceeds half of physical RAM must trigger the
  * pre-flight OOM guard and surface RAY_ERR_OOM through out_sym_err.
  * We use ftruncate to create a SPARSE file (no backing bytes), sized from
@@ -1232,6 +1272,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/create_with_sym_plain_variant_absent", test_create_with_sym_plain_variant_absent, NULL, NULL },
     { "runtime/create_with_sym_corrupt_file", test_create_with_sym_corrupt_file, NULL, NULL },
     { "runtime/create_with_sym_load_preserves_user_ids", test_create_with_sym_load_preserves_user_ids, NULL, NULL },
+    { "runtime/lambda_self_sym_per_runtime", test_lambda_self_sym_per_runtime, NULL, NULL },
     { "runtime/create_with_sym_oversized_file", test_create_with_sym_oversized_file, NULL, NULL },
     { "runtime/oom_sentinel_is_well_formed", test_oom_sentinel_is_well_formed, NULL, NULL },
     { "runtime/sock_close_invalid",                  test_sock_close_invalid,                  NULL, NULL },

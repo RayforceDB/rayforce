@@ -1,0 +1,211 @@
+input,operation,registry,scalar_result,grouped_result,current_streaming_registry,current_group_route
+BOOL,count,yes,i64,I64,yes,typed streaming
+BOOL,sum,no,i64,I64,yes,typed streaming
+BOOL,avg,no,f64,F64,yes,typed streaming
+BOOL,min,no,b8,B8,yes,typed streaming
+BOOL,max,no,b8,B8,yes,typed streaming
+BOOL,first,no,b8,B8,no,shared row indices
+BOOL,last,no,b8,B8,no,shared row indices
+BOOL,prod,no,i64,I64,yes,typed streaming
+BOOL,var,no,f64,F64,yes,typed streaming
+BOOL,var_pop,no,f64,F64,yes,typed streaming
+BOOL,stddev,no,f64,F64,yes,typed streaming
+BOOL,stddev_pop,no,f64,F64,yes,typed streaming
+BOOL,all,yes,b8,B8,yes,typed streaming
+BOOL,any,yes,b8,B8,yes,typed streaming
+BOOL,med,no,f64,ERROR,no,rejected: language type contract
+U8,count,yes,i64,I64,yes,typed streaming
+U8,sum,no,i64,I64,yes,typed streaming
+U8,avg,no,f64,F64,yes,typed streaming
+U8,min,no,u8,U8,yes,typed streaming
+U8,max,no,u8,U8,yes,typed streaming
+U8,first,no,u8,U8,no,shared row indices
+U8,last,no,u8,U8,no,shared row indices
+U8,prod,no,i64,I64,yes,typed streaming
+U8,var,no,f64,F64,yes,typed streaming
+U8,var_pop,no,f64,F64,yes,typed streaming
+U8,stddev,no,f64,F64,yes,typed streaming
+U8,stddev_pop,no,f64,F64,yes,typed streaming
+U8,all,yes,b8,B8,yes,typed streaming
+U8,any,yes,b8,B8,yes,typed streaming
+U8,med,no,f64,F64,no,shared row indices
+I16,count,yes,i64,I64,yes,typed streaming
+I16,sum,no,i64,I64,yes,typed streaming
+I16,avg,no,f64,F64,yes,typed streaming
+I16,min,no,i16,I16,yes,typed streaming
+I16,max,no,i16,I16,yes,typed streaming
+I16,first,no,i16,I16,no,shared row indices
+I16,last,no,i16,I16,no,shared row indices
+I16,prod,no,i64,I64,yes,typed streaming
+I16,var,no,f64,F64,yes,typed streaming
+I16,var_pop,no,f64,F64,yes,typed streaming
+I16,stddev,no,f64,F64,yes,typed streaming
+I16,stddev_pop,no,f64,F64,yes,typed streaming
+I16,all,yes,b8,B8,yes,typed streaming
+I16,any,yes,b8,B8,yes,typed streaming
+I16,med,no,f64,F64,no,shared row indices
+I32,count,yes,i64,I64,yes,typed streaming
+I32,sum,no,i64,I64,yes,typed streaming
+I32,avg,no,f64,F64,yes,typed streaming
+I32,min,no,i32,I32,yes,typed streaming
+I32,max,no,i32,I32,yes,typed streaming
+I32,first,no,i32,I32,no,shared row indices
+I32,last,no,i32,I32,no,shared row indices
+I32,prod,no,i64,I64,yes,typed streaming
+I32,var,no,f64,F64,yes,typed streaming
+I32,var_pop,no,f64,F64,yes,typed streaming
+I32,stddev,no,f64,F64,yes,typed streaming
+I32,stddev_pop,no,f64,F64,yes,typed streaming
+I32,all,yes,b8,B8,yes,typed streaming
+I32,any,yes,b8,B8,yes,typed streaming
+I32,med,no,f64,F64,no,shared row indices
+I64,count,yes,i64,I64,yes,typed streaming
+I64,sum,yes,i64,I64,yes,typed streaming
+I64,avg,no,f64,F64,yes,typed streaming
+I64,min,yes,i64,I64,yes,typed streaming
+I64,max,yes,i64,I64,yes,typed streaming
+I64,first,no,i64,I64,no,shared row indices
+I64,last,no,i64,I64,no,shared row indices
+I64,prod,no,i64,I64,yes,typed streaming
+I64,var,yes,f64,F64,yes,typed streaming
+I64,var_pop,yes,f64,F64,yes,typed streaming
+I64,stddev,yes,f64,F64,yes,typed streaming
+I64,stddev_pop,yes,f64,F64,yes,typed streaming
+I64,all,yes,b8,B8,yes,typed streaming
+I64,any,yes,b8,B8,yes,typed streaming
+I64,med,yes,f64,F64,no,shared row indices
+F32,count,yes,i64,I64,yes,typed streaming
+F32,sum,no,f64,F64,yes,typed streaming
+F32,avg,no,f64,F64,yes,typed streaming
+F32,min,no,f64,F64,yes,typed streaming
+F32,max,no,f64,F64,yes,typed streaming
+F32,first,no,f64,F64,no,shared row indices
+F32,last,no,f64,F64,no,shared row indices
+F32,prod,no,f64,F64,yes,typed streaming
+F32,var,no,f64,F64,yes,typed streaming
+F32,var_pop,no,f64,F64,yes,typed streaming
+F32,stddev,no,f64,F64,yes,typed streaming
+F32,stddev_pop,no,f64,F64,yes,typed streaming
+F32,all,no,b8,B8,yes,typed streaming
+F32,any,no,b8,B8,yes,typed streaming
+F32,med,no,f64,ERROR,no,rejected: language type contract
+F64,count,yes,i64,I64,yes,typed streaming
+F64,sum,yes,f64,F64,yes,typed streaming
+F64,avg,yes,f64,F64,yes,typed streaming
+F64,min,yes,f64,F64,yes,typed streaming
+F64,max,yes,f64,F64,yes,typed streaming
+F64,first,no,f64,F64,no,shared row indices
+F64,last,no,f64,F64,no,shared row indices
+F64,prod,no,f64,F64,yes,typed streaming
+F64,var,yes,f64,F64,yes,typed streaming
+F64,var_pop,yes,f64,F64,yes,typed streaming
+F64,stddev,yes,f64,F64,yes,typed streaming
+F64,stddev_pop,yes,f64,F64,yes,typed streaming
+F64,all,yes,b8,B8,yes,typed streaming
+F64,any,yes,b8,B8,yes,typed streaming
+F64,med,yes,f64,F64,no,shared row indices
+DATE,count,yes,i64,I64,yes,typed streaming
+DATE,sum,no,ERROR,ERROR,no,rejected: language type contract
+DATE,avg,no,f64,F64,yes,typed streaming
+DATE,min,no,date,DATE,yes,typed streaming
+DATE,max,no,date,DATE,yes,typed streaming
+DATE,first,no,date,DATE,no,shared row indices
+DATE,last,no,date,DATE,no,shared row indices
+DATE,prod,no,ERROR,ERROR,no,rejected: language type contract
+DATE,var,no,f64,F64,yes,typed streaming
+DATE,var_pop,no,f64,F64,yes,typed streaming
+DATE,stddev,no,f64,F64,yes,typed streaming
+DATE,stddev_pop,no,f64,F64,yes,typed streaming
+DATE,all,no,ERROR,ERROR,no,rejected: language type contract
+DATE,any,no,ERROR,ERROR,no,rejected: language type contract
+DATE,med,no,f64,F64,no,shared row indices
+TIME,count,yes,i64,I64,yes,typed streaming
+TIME,sum,no,time,TIME,yes,typed streaming
+TIME,avg,no,f64,F64,yes,typed streaming
+TIME,min,no,time,TIME,yes,typed streaming
+TIME,max,no,time,TIME,yes,typed streaming
+TIME,first,no,time,TIME,no,shared row indices
+TIME,last,no,time,TIME,no,shared row indices
+TIME,prod,no,ERROR,ERROR,no,rejected: language type contract
+TIME,var,no,f64,F64,yes,typed streaming
+TIME,var_pop,no,f64,F64,yes,typed streaming
+TIME,stddev,no,f64,F64,yes,typed streaming
+TIME,stddev_pop,no,f64,F64,yes,typed streaming
+TIME,all,no,ERROR,ERROR,no,rejected: language type contract
+TIME,any,no,ERROR,ERROR,no,rejected: language type contract
+TIME,med,no,f64,F64,no,shared row indices
+TIMESTAMP,count,yes,i64,I64,yes,typed streaming
+TIMESTAMP,sum,no,ERROR,ERROR,no,rejected: language type contract
+TIMESTAMP,avg,no,f64,F64,yes,typed streaming
+TIMESTAMP,min,no,timestamp,TIMESTAMP,yes,typed streaming
+TIMESTAMP,max,no,timestamp,TIMESTAMP,yes,typed streaming
+TIMESTAMP,first,no,timestamp,TIMESTAMP,no,shared row indices
+TIMESTAMP,last,no,timestamp,TIMESTAMP,no,shared row indices
+TIMESTAMP,prod,no,ERROR,ERROR,no,rejected: language type contract
+TIMESTAMP,var,no,f64,F64,yes,typed streaming
+TIMESTAMP,var_pop,no,f64,F64,yes,typed streaming
+TIMESTAMP,stddev,no,f64,F64,yes,typed streaming
+TIMESTAMP,stddev_pop,no,f64,F64,yes,typed streaming
+TIMESTAMP,all,no,ERROR,ERROR,no,rejected: language type contract
+TIMESTAMP,any,no,ERROR,ERROR,no,rejected: language type contract
+TIMESTAMP,med,no,f64,F64,no,shared row indices
+GUID,count,yes,i64,I64,yes,typed streaming
+GUID,sum,no,ERROR,ERROR,no,rejected: language type contract
+GUID,avg,no,ERROR,ERROR,no,rejected: language type contract
+GUID,min,no,guid,GUID,no,shared row indices
+GUID,max,no,guid,GUID,no,shared row indices
+GUID,first,no,guid,GUID,no,shared row indices
+GUID,last,no,guid,GUID,no,shared row indices
+GUID,prod,no,ERROR,ERROR,no,rejected: language type contract
+GUID,var,no,ERROR,ERROR,no,rejected: language type contract
+GUID,var_pop,no,ERROR,ERROR,no,rejected: language type contract
+GUID,stddev,no,ERROR,ERROR,no,rejected: language type contract
+GUID,stddev_pop,no,ERROR,ERROR,no,rejected: language type contract
+GUID,all,no,ERROR,ERROR,no,rejected: language type contract
+GUID,any,no,ERROR,ERROR,no,rejected: language type contract
+GUID,med,no,ERROR,ERROR,no,rejected: language type contract
+SYM,count,yes,i64,I64,yes,typed streaming
+SYM,sum,no,ERROR,ERROR,no,rejected: language type contract
+SYM,avg,no,ERROR,ERROR,no,rejected: language type contract
+SYM,min,no,sym,SYM,no,shared row indices
+SYM,max,no,sym,SYM,no,shared row indices
+SYM,first,no,sym,SYM,no,shared row indices
+SYM,last,no,sym,SYM,no,shared row indices
+SYM,prod,no,ERROR,ERROR,no,rejected: language type contract
+SYM,var,no,ERROR,ERROR,no,rejected: language type contract
+SYM,var_pop,no,ERROR,ERROR,no,rejected: language type contract
+SYM,stddev,no,ERROR,ERROR,no,rejected: language type contract
+SYM,stddev_pop,no,ERROR,ERROR,no,rejected: language type contract
+SYM,all,no,ERROR,ERROR,no,rejected: language type contract
+SYM,any,no,ERROR,ERROR,no,rejected: language type contract
+SYM,med,no,ERROR,ERROR,no,rejected: language type contract
+STR,count,yes,i64,I64,yes,typed streaming
+STR,sum,no,ERROR,ERROR,no,rejected: language type contract
+STR,avg,no,ERROR,ERROR,no,rejected: language type contract
+STR,min,no,str,STR,no,shared row indices
+STR,max,no,str,STR,no,shared row indices
+STR,first,no,str,STR,no,shared row indices
+STR,last,no,str,STR,no,shared row indices
+STR,prod,no,ERROR,ERROR,no,rejected: language type contract
+STR,var,no,ERROR,ERROR,no,rejected: language type contract
+STR,var_pop,no,ERROR,ERROR,no,rejected: language type contract
+STR,stddev,no,ERROR,ERROR,no,rejected: language type contract
+STR,stddev_pop,no,ERROR,ERROR,no,rejected: language type contract
+STR,all,no,ERROR,ERROR,no,rejected: language type contract
+STR,any,no,ERROR,ERROR,no,rejected: language type contract
+STR,med,no,ERROR,ERROR,no,rejected: language type contract
+LIST,count,yes,i64,I64,yes,typed streaming
+LIST,sum,no,i64,I64,no,generic: dynamic LIST values
+LIST,avg,no,f64,F64,no,generic: dynamic LIST values
+LIST,min,no,i64,I64,no,generic: dynamic LIST values
+LIST,max,no,i64,I64,no,generic: dynamic LIST values
+LIST,first,no,i64,I64,no,shared row indices
+LIST,last,no,i64,I64,no,shared row indices
+LIST,prod,no,i64,I64,no,generic: dynamic LIST values
+LIST,var,no,f64,F64,no,generic: dynamic LIST values
+LIST,var_pop,no,f64,F64,no,generic: dynamic LIST values
+LIST,stddev,no,f64,F64,no,generic: dynamic LIST values
+LIST,stddev_pop,no,f64,F64,no,generic: dynamic LIST values
+LIST,all,no,b8,B8,no,generic: dynamic LIST values
+LIST,any,no,b8,B8,no,generic: dynamic LIST values
+LIST,med,no,f64,F64,no,generic: dynamic LIST values

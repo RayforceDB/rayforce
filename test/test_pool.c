@@ -35,6 +35,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -855,29 +856,42 @@ static test_result_t test_dispatch_workers_participate(void) {
 /* --------------------------------------------------------------------------
  * Test: ray_pool_dispatch_n with n_tasks exceeding MAX_RING_CAP (1<<16).
  *
- * Drives the growth-loop early-out (`new_cap < MAX_RING_CAP`) on line ~335
- * and the post-growth clamp (`if (n_tasks > pool->task_cap) n_tasks = ...`)
- * on line ~347. With n_tasks = 70000 and MAX_RING_CAP = 65536, the ring
- * grows to 65536 then clamps n_tasks down to 65536; only 65536 tasks fire.
+ * The ring grows to MAX_RING_CAP and stops; the tasks past it must still run,
+ * in further rounds, each with its absolute index.  Until the rounds were
+ * added the pool clamped n_tasks to the ring and silently dropped the rest
+ * (a window with more partitions than the ring lost every partition past
+ * 65536).
  * -------------------------------------------------------------------------- */
+typedef struct {
+    _Atomic(int64_t) calls;
+    _Atomic(int64_t) start_sum;    /* sum of every task's absolute index */
+    _Atomic(int64_t) start_max;
+} pool_index_ctx_t;
+
+static void pool_index_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    pool_index_ctx_t* c = (pool_index_ctx_t*)ctx;
+    if (end != start + 1) return;   /* a range would break the [i, i+1) contract: leave calls short */
+    atomic_fetch_add_explicit(&c->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&c->start_sum, start, memory_order_relaxed);
+    int64_t seen = atomic_load_explicit(&c->start_max, memory_order_relaxed);
+    while (start > seen && !atomic_compare_exchange_weak_explicit(&c->start_max, &seen, start,
+                memory_order_relaxed, memory_order_relaxed)) {}
+}
 
 static test_result_t test_dispatch_n_max_ring_cap_clamp(void) {
     ray_heap_init();
-
     ray_pool_t pool;
     TEST_ASSERT_EQ_I(ray_pool_create(&pool, 1), RAY_OK);
-
-    pool_count_ctx_t ctx = {0};
-    /* MAX_RING_CAP is 1<<16 = 65536; ask for 70000 → growth caps at 65536,
-     * then n_tasks is clamped to task_cap. */
+    pool_index_ctx_t ctx = {0};
     uint32_t requested = 70000;
-    ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, requested);
-
-    /* task_cap should have grown to MAX_RING_CAP exactly */
+    ray_pool_dispatch_n(&pool, pool_index_fn, &ctx, requested);
+    /* the ring grows to MAX_RING_CAP exactly ... */
     TEST_ASSERT_EQ_U(pool.task_cap, 65536u);
-    /* Calls should equal the clamped count, not the requested one. */
-    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 65536);
-
+    /* ... and every requested task still runs, once, with its own index */
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), (int64_t)requested);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.start_max), (int64_t)requested - 1);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.start_sum), (int64_t)requested * (requested - 1) / 2);
     ray_pool_free(&pool);
     ray_heap_destroy();
     PASS();
@@ -1313,7 +1327,27 @@ static test_result_t test_epoll_hup_no_errfn(void) {
  * Suite definition
  * -------------------------------------------------------------------------- */
 
+#if defined(__linux__) || defined(__APPLE__)
+static test_result_t test_auto_all_logical_cpus(void) {
+    const char* current = getenv("RAYFORCE_CORES");
+    char* saved = current ? strdup(current) : NULL;
+    TEST_ASSERT_TRUE(!current || saved);
+    unsetenv("RAYFORCE_CORES");
+    ray_pool_t local;
+    ray_err_t rc = ray_pool_create(&local, 0);
+    uint32_t total = rc == RAY_OK ? ray_pool_total_workers(&local) : 0;
+    if (rc == RAY_OK) ray_pool_free(&local);
+    if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(total, ray_thread_count());
+    PASS();
+}
+#endif
+
 const test_entry_t pool_entries[] = {
+#if defined(__linux__) || defined(__APPLE__)
+    { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
+#endif
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
     { "pool/parallel_group_sum", test_parallel_group_sum, NULL, NULL },

@@ -1,0 +1,17 @@
+;; pivot emits its index rows and pivot columns in first-seen order, whatever
+;; the parallel ingest's partitioning did.  Past the parallel threshold the
+;; old code walked the hash partitions in task-claim order, so the column
+;; order differed between worker counts and between runs of one binary.
+(set N 200000)
+(set T (table [r c v] (list (% (til N) 10) (% (* 7 (til N)) 13) (til N))))
+(set P (pivot T 'r 'c 'v sum))
+(at P 'r) -- (til 10)
+(cols P) -- ['r '0 '7 '1 '8 '2 '9 '3 '10 '4 '11 '5 '12 '6]
+;; a shape whose first-seen order is not ascending
+(set T2 (table [r c v] (list (% (* 7919 (til N)) 1000) (% (- N (til N)) 3) (til N))))
+(set P2 (pivot T2 'r 'c 'v sum))
+(at (at P2 'r) (til 6)) -- [0 919 838 757 676 595]
+(cols P2) -- ['r '2 '1 '0]
+;; the small (serial) path agrees
+(set S (table [r c v] (list (% (til 100) 10) (% (* 7 (til 100)) 13) (til 100))))
+(cols (pivot S 'r 'c 'v sum)) -- (cols P)

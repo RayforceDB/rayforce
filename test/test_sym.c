@@ -30,6 +30,8 @@
 #include "store/col.h"
 #include "lang/internal.h"
 #include "ops/hash.h"
+#include "store/serde.h"
+#include "vec/vec.h"
 #include "ops/glob.h"
 #include <string.h>
 #include <stdio.h>
@@ -2623,6 +2625,167 @@ static test_result_t test_glob_match_class_edge(void) {
 /* ---- Suite definition -------------------------------------------------- */
 
 
+/* ---- ray_sym_intern_batch (#542 fix 1) ---------------------------------- */
+
+/* A batch intern must be indistinguishable from the same sequence of
+ * ray_sym_intern calls: same ids, same dotted-segment caching, same
+ * treatment of "" (the SYM null, id 0). */
+static test_result_t test_sym_intern_batch_matches_intern(void) {
+    static const char* names[] = { "batch_a", "batch_b", "batch_a", ".ns.batch_c", "" };
+    static const size_t lens[] = { 7, 7, 7, 11, 0 };
+    const char* strs[5];
+    uint32_t    hashes[5];
+    int64_t     got[5];
+
+    for (int i = 0; i < 5; i++) {
+        strs[i]   = names[i];
+        hashes[i] = (uint32_t)ray_hash_bytes(names[i], lens[i]);
+    }
+
+    TEST_ASSERT_EQ_I(ray_sym_intern_batch(hashes, strs, lens, 5, got), 0);
+
+    /* Re-interning through the single-cell path must return the same ids. */
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT_EQ_I(got[i], ray_sym_intern(names[i], lens[i]));
+
+    TEST_ASSERT_EQ_I(got[0], got[2]);   /* duplicate -> same id */
+    TEST_ASSERT_EQ_I(got[4], 0);        /* "" is the SYM null  */
+    PASS();
+}
+
+/* Dotted names interned in a batch must get their segments cached, exactly
+ * as ray_sym_intern does — env lookup depends on it. */
+static test_result_t test_sym_intern_batch_caches_segments(void) {
+    const char* strs[1]   = { ".ns.deep" };
+    size_t      lens[1]   = { 8 };
+    uint32_t    hashes[1] = { (uint32_t)ray_hash_bytes(".ns.deep", 8) };
+    int64_t     got[1];
+
+    TEST_ASSERT_EQ_I(ray_sym_intern_batch(hashes, strs, lens, 1, got), 0);
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(got[0]));
+
+    const int64_t* segs = NULL;
+    TEST_ASSERT_EQ_I(ray_sym_segs(got[0], &segs), 2);
+    TEST_ASSERT_NOT_NULL(segs);
+    TEST_ASSERT_EQ_I(segs[0], ray_sym_intern(".ns", 3));
+    TEST_ASSERT_EQ_I(segs[1], ray_sym_intern("deep", 4));
+    PASS();
+}
+
+static test_result_t test_sym_intern_batch_empty(void) {
+    int64_t out[1] = { -7 };
+    TEST_ASSERT_EQ_I(ray_sym_intern_batch(NULL, NULL, NULL, 0, out), 0);
+    TEST_ASSERT_EQ_I(out[0], -7);   /* untouched */
+    PASS();
+}
+
+/* ---- SYM vector deserialization (#542 fix 1, decode side) --------------- */
+
+/* Build a RAY_SYM_W64 vector from names, round-trip it through ser/de, and
+ * require the decoded ids to be identical to the originals. */
+static test_result_t sym_serde_roundtrip_names(const char** names, int64_t n) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        d[i] = ray_sym_intern(names[i], strlen(names[i]));
+
+    ray_t* bytes = ray_ser(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bytes));
+    ray_t* back = ray_de(bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(back->len, n);
+
+    const int64_t* b = (const int64_t*)ray_data(back);
+    for (int64_t i = 0; i < n; i++) {
+        TEST_ASSERT_EQ_I(b[i], d[i]);
+        /* Borrowed atom — valid for the sym table's lifetime, not released. */
+        ray_t* s = ray_sym_str(b[i]);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_U(ray_str_len(s), strlen(names[i]));
+        if (strlen(names[i]))
+            TEST_ASSERT_MEM_EQ(strlen(names[i]), ray_str_ptr(s), names[i]);
+    }
+
+    ray_release(back);
+    ray_release(bytes);
+    ray_release(v);
+    PASS();
+}
+
+/* Heavy duplication is the tickerplant case: a 'side' column of two
+ * distinct values repeated across the batch. */
+static test_result_t test_sym_serde_vec_duplicates(void) {
+    static const char* names[12] = {
+        "B", "A", "B", "A", "B", "A", "B", "A", "B", "A", "B", "A"
+    };
+    return sym_serde_roundtrip_names(names, 12);
+}
+
+/* Duplicates mixed with "" (SYM null) and dotted names. */
+static test_result_t test_sym_serde_vec_mixed(void) {
+    static const char* names[8] = {
+        "bfu", "", ".ns.deep", "bfu", "", "bfu", ".ns.deep", "zzz"
+    };
+    return sym_serde_roundtrip_names(names, 8);
+}
+
+/* All-distinct, past the dedupe table's initial capacity, so the decode's
+ * open-addressing table has to grow/probe heavily. */
+static test_result_t test_sym_serde_vec_high_cardinality(void) {
+    enum { N = 500 };
+    static char  bufs[N][24];
+    const char*  names[N];
+    for (int i = 0; i < N; i++) {
+        snprintf(bufs[i], sizeof(bufs[i]), "BFU:BTCUSDT%d", i);
+        names[i] = bufs[i];
+    }
+    return sym_serde_roundtrip_names(names, N);
+}
+
+/* A single-element vector exercises the smallest dedupe table. */
+static test_result_t test_sym_serde_vec_single(void) {
+    static const char* names[1] = { "solo" };
+    return sym_serde_roundtrip_names(names, 1);
+}
+
+static test_result_t test_sym_serde_vec_empty(void) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = 0;
+    ray_t* bytes = ray_ser(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bytes));
+    ray_t* back = ray_de(bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(back->len, 0);
+    ray_release(back);
+    ray_release(bytes);
+    ray_release(v);
+    PASS();
+}
+
+/* A SYM vector whose last cell has no NUL terminator: the decoder must
+ * report a domain error rather than run off the end of the buffer.  Built
+ * by hand — ray_de rejects a truncated envelope before the vector body. */
+static test_result_t test_sym_serde_vec_unterminated(void) {
+    /* [type][attrs][int64 count=2]["aa\0" "bb" with no trailing NUL] */
+    uint8_t wire[1 + 1 + 8 + 5];
+    wire[0] = (uint8_t)RAY_SYM;
+    wire[1] = 0;
+    int64_t count = 2;
+    memcpy(wire + 2, &count, 8);
+    memcpy(wire + 10, "aa\0bb", 5);
+
+    int64_t len  = (int64_t)sizeof(wire);
+    ray_t*  back = ray_de_raw(wire, &len);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(back));
+    ray_error_free(back);
+    PASS();
+}
+
 const test_entry_t sym_entries[] = {
     { "sym/init_destroy", test_sym_init_destroy, sym_setup, sym_teardown },
     { "sym/intern_basic", test_sym_intern_basic, sym_setup, sym_teardown },
@@ -2737,7 +2900,16 @@ const test_entry_t sym_entries[] = {
     { "sym/glob/match_ci_class_branches",       test_glob_match_ci_class_branches,       sym_setup, sym_teardown },
     { "sym/glob/match_class_edge",              test_glob_match_class_edge,              sym_setup, sym_teardown },
 
+    /* ray_sym_intern_batch + SYM vector decode (#542) */
+    { "sym/intern_batch/matches_intern",   test_sym_intern_batch_matches_intern,  sym_setup, sym_teardown },
+    { "sym/intern_batch/caches_segments",  test_sym_intern_batch_caches_segments, sym_setup, sym_teardown },
+    { "sym/intern_batch/empty",            test_sym_intern_batch_empty,           sym_setup, sym_teardown },
+    { "sym/serde/vec_duplicates",          test_sym_serde_vec_duplicates,         sym_setup, sym_teardown },
+    { "sym/serde/vec_mixed",               test_sym_serde_vec_mixed,              sym_setup, sym_teardown },
+    { "sym/serde/vec_high_cardinality",    test_sym_serde_vec_high_cardinality,   sym_setup, sym_teardown },
+    { "sym/serde/vec_single",              test_sym_serde_vec_single,             sym_setup, sym_teardown },
+    { "sym/serde/vec_empty",               test_sym_serde_vec_empty,              sym_setup, sym_teardown },
+    { "sym/serde/vec_unterminated",        test_sym_serde_vec_unterminated,       sym_setup, sym_teardown },
+
     { NULL, NULL, NULL, NULL },
 };
-
-

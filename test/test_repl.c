@@ -41,6 +41,7 @@
 #define _DEFAULT_SOURCE 1
 
 #include "test.h"
+#include "ipc_harness.h"
 #include <rayforce.h>
 #include "app/repl.h"
 #include "core/profile.h"
@@ -906,64 +907,26 @@ static test_result_t test_repl_run_piped_error_with_trace(void) {
 
 /* ─── Remote-REPL session ───────────────────────────────────────── */
 
-/* Helper: read OS-assigned port from a listen socket. */
-static uint16_t get_listen_port(ray_sock_t fd) {
-    struct sockaddr_in addr;
-    socklen_t len = sizeof(addr);
-    if (getsockname(fd, (struct sockaddr*)&addr, &len) < 0) return 0;
-    return ntohs(addr.sin_port);
-}
-
-/* Server poll thread — same pattern as test_store.c. */
+/* Spin up an in-process IPC server on the shared poll-based harness and
+ * return its bound port.  Returns 0 on success, -1 on failure; caller
+ * releases via repl_stop_server. */
 typedef struct {
-    ray_ipc_server_t* srv;
-    ray_vm_t*         vm;
-} repl_ipc_ctx_t;
-
-static void repl_server_thread_fn(void* arg) {
-    repl_ipc_ctx_t* ctx = (repl_ipc_ctx_t*)arg;
-    __VM = ctx->vm;
-    while (ctx->srv->running)
-        ray_ipc_poll(ctx->srv, 10);
-}
-
-/* Spin up an in-process IPC server, return its bound port via *port_out.
- * Returns 0 on success, -1 on failure.  Caller releases via
- * repl_stop_server. */
-typedef struct {
-    ray_ipc_server_t srv;
-    ray_vm_t*        srv_vm;
-    repl_ipc_ctx_t   ctx;
-    ray_thread_t     tid;
-    uint16_t         port;
-    bool             alive;
+    ray_test_server_t srv;
+    uint16_t          port;   /* mirrors srv.port for the call sites below */
+    bool              alive;
 } repl_server_t;
 
 static int repl_start_server(repl_server_t* s) {
     memset(s, 0, sizeof(*s));
-    if (ray_ipc_server_init(&s->srv, 0) != RAY_OK) return -1;
-    s->port = get_listen_port(s->srv.listen_fd);
-    if (s->port == 0) { ray_ipc_server_destroy(&s->srv); return -1; }
-    s->srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
-    if (!s->srv_vm) { ray_ipc_server_destroy(&s->srv); return -1; }
-    ray_vm_init(s->srv_vm, 1);
-    s->ctx.srv = &s->srv;
-    s->ctx.vm  = s->srv_vm;
-    if (ray_thread_create(&s->tid, repl_server_thread_fn, &s->ctx) != RAY_OK) {
-        ray_sys_free(s->srv_vm);
-        ray_ipc_server_destroy(&s->srv);
-        return -1;
-    }
+    if (ray_test_server_start(&s->srv) != 0) return -1;
+    s->port  = s->srv.port;
     s->alive = true;
     return 0;
 }
 
 static void repl_stop_server(repl_server_t* s) {
     if (!s->alive) return;
-    s->srv.running = false;
-    ray_thread_join(s->tid);
-    ray_ipc_server_destroy(&s->srv);
-    ray_sys_free(s->srv_vm);
+    ray_test_server_stop(&s->srv);
     s->alive = false;
 }
 

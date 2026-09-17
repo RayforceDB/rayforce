@@ -501,7 +501,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
                     memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
             }
         }
-    } else if (pool) {
+    } else if (ray_pool_par_dispatch_ok(pool, pass_count, RAY_PARALLEL_THRESHOLD)) {
         /* Batched fused multi-column gather (≤MGATHER_MAX_COLS per dispatch) */
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
@@ -1019,7 +1019,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                     memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
             }
         }
-    } else if (pool) {
+    } else if (ray_pool_par_dispatch_ok(pool, pass_count, RAY_PARALLEL_THRESHOLD)) {
         /* Batched multi-column gather: fill mgctx with up to MGATHER_MAX_COLS
          * kept columns, dispatch, then continue with the next batch.  This is
          * column-count-agnostic — no per-column fallback. */

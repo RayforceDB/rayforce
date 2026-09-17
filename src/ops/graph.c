@@ -25,7 +25,6 @@
 #include "internal.h"   /* EXT_TRAIL, graph_alloc_ext_node_ex */
 #include "store/csr.h"
 #include "store/hnsw.h"
-#include "mem/sys.h"
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -46,7 +45,7 @@ ray_op_t* graph_alloc_node(ray_graph_t* g) {
            doubling would wrap around to a smaller value. */
         if (g->node_cap > UINT32_MAX / 2) return NULL;
         uint32_t new_cap = g->node_cap * 2;
-        ray_op_t* new_nodes = (ray_op_t*)ray_sys_realloc(g->nodes,
+        ray_op_t* new_nodes = (ray_op_t*)ray_realloc_raw(g->nodes,
                                                       new_cap * sizeof(ray_op_t));
         if (!new_nodes) return NULL;
         g->nodes = new_nodes;
@@ -62,19 +61,18 @@ ray_op_t* graph_alloc_node(ray_graph_t* g) {
 
 ray_op_ext_t* graph_alloc_ext_node_ex(ray_graph_t* g, size_t extra) {
     /* Extended nodes are 64 bytes; extra bytes appended for inline arrays */
-    ray_op_ext_t* ext = (ray_op_ext_t*)ray_sys_alloc(sizeof(ray_op_ext_t) + extra);
+    ray_op_ext_t* ext = (ray_op_ext_t*)ray_calloc_raw(sizeof(ray_op_ext_t) + extra);
     if (!ext) return NULL;
-    memset(ext, 0, sizeof(ray_op_ext_t) + extra);
     ext->base.in_id[0] = ext->base.in_id[1] = RAY_OP_NONE;
     ext->third_in = RAY_OP_NONE;
 
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
-        if (g->node_cap > UINT32_MAX / 2) { ray_sys_free(ext); return NULL; }
+        if (g->node_cap > UINT32_MAX / 2) { ray_free_raw(ext); return NULL; }
         uint32_t new_cap = g->node_cap * 2;
-        ray_op_t* new_nodes = (ray_op_t*)ray_sys_realloc(g->nodes,
+        ray_op_t* new_nodes = (ray_op_t*)ray_realloc_raw(g->nodes,
                                                       new_cap * sizeof(ray_op_t));
-        if (!new_nodes) { ray_sys_free(ext); return NULL; }
+        if (!new_nodes) { ray_free_raw(ext); return NULL; }
         g->nodes = new_nodes;
         g->node_cap = new_cap;
     }
@@ -88,11 +86,11 @@ ray_op_ext_t* graph_alloc_ext_node_ex(ray_graph_t* g, size_t extra) {
 
     /* Track ext node for cleanup */
     if (g->ext_count >= g->ext_cap) {
-        if (g->ext_cap > UINT32_MAX / 2) { g->node_count--; ray_sys_free(ext); return NULL; }
+        if (g->ext_cap > UINT32_MAX / 2) { g->node_count--; ray_free_raw(ext); return NULL; }
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
-        ray_op_ext_t** new_exts = (ray_op_ext_t**)ray_sys_realloc(g->ext_nodes,
+        ray_op_ext_t** new_exts = (ray_op_ext_t**)ray_realloc_raw(g->ext_nodes,
                                                                new_cap * sizeof(ray_op_ext_t*));
-        if (!new_exts) { g->node_count--; ray_sys_free(ext); return NULL; }
+        if (!new_exts) { g->node_count--; ray_free_raw(ext); return NULL; }
         g->ext_nodes = new_exts;
         g->ext_cap = new_cap;
     }
@@ -113,11 +111,11 @@ static ray_op_ext_t* graph_alloc_ext_node(ray_graph_t* g) {
  * -------------------------------------------------------------------------- */
 
 ray_graph_t* ray_graph_new(ray_t* tbl) {
-    ray_graph_t* g = (ray_graph_t*)ray_sys_alloc(sizeof(ray_graph_t));
+    ray_graph_t* g = (ray_graph_t*)ray_calloc_raw(sizeof(ray_graph_t));
     if (!g) return NULL;
 
-    g->nodes = (ray_op_t*)ray_sys_alloc(GRAPH_INIT_CAP * sizeof(ray_op_t));
-    if (!g->nodes) { ray_sys_free(g); return NULL; }
+    g->nodes = (ray_op_t*)ray_alloc_raw(GRAPH_INIT_CAP * sizeof(ray_op_t));
+    if (!g->nodes) { ray_free_raw(g); return NULL; }
     g->node_cap = GRAPH_INIT_CAP;
     g->node_count = 0;
     g->table = tbl;
@@ -176,16 +174,16 @@ void ray_graph_free(ray_graph_t* g) {
                 if (g->ext_nodes[j] && g->ext_nodes[j]->seg_mask == mask)
                     g->ext_nodes[j]->seg_mask = NULL;
             }
-            ray_sys_free(mask);
+            ray_free_raw(mask);
         }
     }
     /* Free extended nodes */
     for (uint32_t i = 0; i < g->ext_count; i++) {
-        ray_sys_free(g->ext_nodes[i]);
+        ray_free_raw(g->ext_nodes[i]);
     }
-    ray_sys_free(g->ext_nodes);
+    ray_free_raw(g->ext_nodes);
 
-    ray_sys_free(g->nodes);
+    ray_free_raw(g->nodes);
     if (g->table) ray_release(g->table);
 
     /* Release table registry */
@@ -193,11 +191,11 @@ void ray_graph_free(ray_graph_t* g) {
         for (uint16_t i = 0; i < g->n_tables; i++) {
             if (g->tables[i]) ray_release(g->tables[i]);
         }
-        ray_sys_free(g->tables);
+        ray_free_raw(g->tables);
     }
 
     if (g->selection) ray_release(g->selection);
-    ray_sys_free(g);
+    ray_free_raw(g);
 }
 
 /* --------------------------------------------------------------------------
@@ -1272,7 +1270,7 @@ uint16_t ray_graph_add_table(ray_graph_t* g, ray_t* table) {
     uint16_t id = g->n_tables;
     uint16_t new_cap = id + 1;
 
-    ray_t** new_tables = (ray_t**)ray_sys_realloc(g->tables,
+    ray_t** new_tables = (ray_t**)ray_realloc_raw(g->tables,
                                                 (size_t)new_cap * sizeof(ray_t*));
     if (!new_tables) return UINT16_MAX;  /* error sentinel */
     g->tables = new_tables;

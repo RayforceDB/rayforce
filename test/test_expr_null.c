@@ -29,6 +29,8 @@
 #include "ops/internal.h"
 #include "mem/heap.h"
 #include "table/sym.h"
+#include "ops/idxop.h"
+#include "ops/fused_pred.h"
 #include <limits.h>
 #include <string.h>
 #include <math.h>
@@ -1389,6 +1391,237 @@ static test_result_t test_diff_f64_andor_chokes(void) {
     return res;
 }
 
+
+/* ---- Issue #533: null-bearing SYM columns fuse when every consumer is a
+ * comparison against a non-null constant or another SYM column -------------
+ *
+ * A null SYM is id 0, below every real intern id, and the fallback treats a
+ * null SYM as "smaller than everything" in all six comparisons (null == null,
+ * null != x, null < x are true; null == x, x < null are false).  Raw id
+ * compares in the fused lane give the same table, so the per-query null scan
+ * is unnecessary for those shapes.  Consumers that read the lane as a value
+ * (ISNULL, CAST, arithmetic) still need the proof and must bail. */
+
+/* SYM column at the given width: "a","b",NULL,"a","c",NULL,"b","a","c" */
+static ray_t* make_sym_col_with_nulls(uint8_t width) {
+    const char* names[] = {"a","b","","a","c","","b","a","c"};
+    ray_t* v = ray_sym_vec_new(width, 9);
+    for (int i = 0; i < 9; i++) {
+        int64_t id = names[i][0] ? ray_sym_intern(names[i], 1) : 0;
+        uint8_t b8 = (uint8_t)id; uint16_t b16 = (uint16_t)id;
+        uint32_t b32 = (uint32_t)id; int64_t b64 = id;
+        const void* src = width == RAY_SYM_W8  ? (const void*)&b8  :
+                          width == RAY_SYM_W16 ? (const void*)&b16 :
+                          width == RAY_SYM_W32 ? (const void*)&b32 : (const void*)&b64;
+        v = ray_vec_append(v, src);
+    }
+    return v;
+}
+
+/* second SYM column, W64: "a",NULL,NULL,"c","c","b",NULL,"a","b" */
+static ray_t* make_sym_col2_with_nulls(void) {
+    const char* names[] = {"a","","","c","c","b","","a","b"};
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 9);
+    for (int i = 0; i < 9; i++) {
+        int64_t id = names[i][0] ? ray_sym_intern(names[i], 1) : 0;
+        v = ray_vec_append(v, &id);
+    }
+    return v;
+}
+
+static ray_t* make_sym_null_table(void) {
+    ray_t* s  = make_sym_col_with_nulls(RAY_SYM_W8);
+    ray_t* s2 = make_sym_col2_with_nulls();
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), s);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s2", 2), s2);
+    ray_release(s); ray_release(s2);
+    return tbl;
+}
+
+static ray_op_t* b_sym_eq_const(ray_graph_t* g) { return ray_eq(g, ray_scan(g, "s"), ray_const_str(g, "b", 1)); }
+static ray_op_t* b_sym_ne_const(ray_graph_t* g) { return ray_ne(g, ray_scan(g, "s"), ray_const_str(g, "b", 1)); }
+static ray_op_t* b_sym_lt_const(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "s"), ray_const_str(g, "b", 1)); }
+static ray_op_t* b_sym_le_const(ray_graph_t* g) { return ray_le(g, ray_scan(g, "s"), ray_const_str(g, "b", 1)); }
+static ray_op_t* b_sym_gt_const(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "s"), ray_const_str(g, "b", 1)); }
+static ray_op_t* b_sym_ge_const(ray_graph_t* g) { return ray_ge(g, ray_scan(g, "s"), ray_const_str(g, "b", 1)); }
+static ray_op_t* b_const_eq_sym(ray_graph_t* g) { return ray_eq(g, ray_const_str(g, "b", 1), ray_scan(g, "s")); }
+static ray_op_t* b_sym_and_or(ray_graph_t* g) {
+    return ray_or(g, ray_and(g, ray_ne(g, ray_scan(g, "s"), ray_const_str(g, "a", 1)),
+                                ray_lt(g, ray_scan(g, "s"), ray_const_str(g, "c", 1))),
+                     ray_eq(g, ray_scan(g, "s"), ray_const_str(g, "c", 1)));
+}
+static ray_op_t* b_sym_eq_col(ray_graph_t* g) { return ray_eq(g, ray_scan(g, "s"), ray_scan(g, "s2")); }
+static ray_op_t* b_sym_ne_col(ray_graph_t* g) { return ray_ne(g, ray_scan(g, "s"), ray_scan(g, "s2")); }
+static ray_op_t* b_sym_isnull(ray_graph_t* g) { return ray_isnull(g, ray_scan(g, "s")); }
+static ray_op_t* b_sym_eq_and_isnull(ray_graph_t* g) {
+    return ray_or(g, ray_eq(g, ray_scan(g, "s"), ray_const_str(g, "a", 1)),
+                     ray_isnull(g, ray_scan(g, "s")));
+}
+
+static test_result_t test_diff_sym_nulls_cmp_const(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_sym_null_table();
+    static const expr_builder_t builders[] = {
+        b_sym_eq_const, b_sym_ne_const, b_sym_lt_const, b_sym_le_const,
+        b_sym_gt_const, b_sym_ge_const, b_const_eq_sym, b_sym_and_or,
+    };
+    test_result_t r = { TEST_PASS, NULL };
+    for (size_t i = 0; i < sizeof(builders) / sizeof(builders[0]) && r.status == TEST_PASS; i++)
+        r = diff_run(tbl, builders[i], true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_sym_nulls_cmp_col(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_sym_null_table();
+    test_result_t r = diff_run(tbl, b_sym_eq_col, true);
+    if (r.status == TEST_PASS) r = diff_run(tbl, b_sym_ne_col, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* A consumer that reads the SYM lane as a value keeps the null proof: with
+ * nulls present the compile must bail EXPR_BAIL_NULLS, even when the same
+ * column also feeds a null-safe comparison elsewhere in the tree. */
+static test_result_t test_sym_nulls_value_consumer_bails(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_sym_null_table();
+    test_result_t r = { TEST_PASS, NULL };
+    static const expr_builder_t builders[] = { b_sym_isnull, b_sym_eq_and_isnull };
+    for (size_t i = 0; i < 2 && r.status == TEST_PASS; i++) {
+        uint64_t nulls_before = ray_expr_bail_counts[EXPR_BAIL_NULLS];
+        r = diff_run(tbl, builders[i], false);
+        if (r.status == TEST_PASS && ray_expr_bail_counts[EXPR_BAIL_NULLS] == nulls_before)
+            r = (test_result_t){ TEST_FAIL, "value consumer of null SYM did not bail NULLS" };
+    }
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_sym_nulls_parted(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* s0 = make_sym_col_with_nulls(RAY_SYM_W8);
+    ray_t* s1 = make_sym_col_with_nulls(RAY_SYM_W16);
+    ray_t* s2 = make_sym_col_with_nulls(RAY_SYM_W64);
+    ray_t* col = ray_alloc(3 * sizeof(ray_t*));
+    col->type = (int8_t)(RAY_PARTED_BASE + RAY_SYM);
+    col->len  = 3;
+    col->attrs = 0;
+    memset(col->aux, 0, sizeof(col->aux));
+    ray_t** ptrs = (ray_t**)ray_data(col);
+    ptrs[0] = s0; ptrs[1] = s1; ptrs[2] = s2;
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), col);
+    ray_release(col);
+    test_result_t r = diff_run(tbl, b_sym_eq_const, true);
+    if (r.status == TEST_PASS) r = diff_run(tbl, b_sym_ne_const, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+
+/* ---- Chunk-zone skip must keep null rows for NE / LT / LE ---------------
+ *
+ * The null-aware truth table ranks a null below every value: null != c,
+ * null < c and null <= c are TRUE.  Zone extrema exclude nulls, so an
+ * all-fail decision taken from extrema alone drops those rows whenever the
+ * chunk also holds a null.  Layout: chunk_log2 = 10 so each 1024-row morsel
+ * is exactly one chunk.  Chunk 0 is all 5 with a null at row 7, chunk 1 is
+ * all 9 with a null at row 1030, chunk 2 is all 5, chunk 3 is 1..1024. */
+#define ZN_ROWS 4096
+static int64_t zn_vals[ZN_ROWS];
+static bool    zn_null[ZN_ROWS];
+
+static ray_t* make_zone_null_table(void) {
+    ray_t* v = ray_vec_new(RAY_I64, ZN_ROWS);
+    for (int64_t i = 0; i < ZN_ROWS; i++) {
+        int64_t x = i < 1024 ? 5 : i < 2048 ? 9 : i < 3072 ? 5 : (i - 3072 + 1);
+        zn_vals[i] = x; zn_null[i] = false;
+        v = ray_vec_append(v, &x);
+    }
+    ray_vec_set_null(v, 7, true);    zn_null[7] = true;
+    ray_vec_set_null(v, 1030, true); zn_null[1030] = true;
+    ray_t* r = ray_index_attach_chunk_zone(&v, 10);
+    if (RAY_IS_ERR(r)) { ray_release(v); return r; }
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), v);
+    ray_release(v);
+    return tbl;
+}
+
+static int zn_expect(int64_t i, uint16_t op) {
+    const int64_t c = 5;
+    if (zn_null[i]) return op == OP_NE || op == OP_LT || op == OP_LE;
+    int64_t v = zn_vals[i];
+    switch (op) {
+        case OP_EQ: return v == c; case OP_NE: return v != c;
+        case OP_LT: return v <  c; case OP_LE: return v <= c;
+        case OP_GT: return v >  c; default:    return v >= c;
+    }
+}
+
+static uint16_t zn_op;
+static ray_op_t* b_zone_cmp(ray_graph_t* g) {
+    ray_op_t* x = ray_scan(g, "x"); ray_op_t* c = ray_const_i64(g, 5);
+    switch (zn_op) {
+        case OP_EQ: return ray_eq(g, x, c); case OP_NE: return ray_ne(g, x, c);
+        case OP_LT: return ray_lt(g, x, c); case OP_LE: return ray_le(g, x, c);
+        case OP_GT: return ray_gt(g, x, c); default:    return ray_ge(g, x, c);
+    }
+}
+
+static test_result_t test_zone_skip_keeps_nulls_expr(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_zone_null_table();
+    TEST_ASSERT(tbl && !RAY_IS_ERR(tbl), "zone table");
+    static const uint16_t ops[] = { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
+    for (size_t k = 0; k < 6; k++) {
+        zn_op = ops[k];
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_t* r = ray_execute(g, b_zone_cmp(g));
+        TEST_ASSERT(r && !RAY_IS_ERR(r) && r->type == RAY_BOOL && r->len == ZN_ROWS, "bool result");
+        const uint8_t* d = (const uint8_t*)ray_data(r);
+        for (int64_t i = 0; i < ZN_ROWS; i++)
+            TEST_ASSERT_FMT((int)d[i] == zn_expect(i, ops[k]),
+                            "op %u row %lld: got %d want %d",
+                            (unsigned)ops[k], (long long)i, (int)d[i], zn_expect(i, ops[k]));
+        ray_release(r); ray_graph_free(g);
+    }
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fused_pred.c has the same chunk-zone arms.  It admits nullable numeric
+ * columns with null-as-minimum ordering and today routes them through the
+ * typed per-row compare ahead of the zone block, so the guarded arms are
+ * not reached with nulls yet.  Drive fp_eval_pred one chunk at a time,
+ * exactly as the morsel loop does, and check every row, so the contract
+ * holds whichever path a future change sends nullable columns down. */
+static test_result_t test_zone_skip_keeps_nulls_fused_pred(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_zone_null_table();
+    TEST_ASSERT(tbl && !RAY_IS_ERR(tbl), "zone table");
+    static const uint16_t ops[] = { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
+    static uint8_t bits[ZN_ROWS];
+    for (size_t k = 0; k < 6; k++) {
+        zn_op = ops[k];
+        ray_graph_t* g = ray_graph_new(tbl);
+        fp_pred_t fp;
+        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp) == 0, "fp compiles");
+        for (int64_t ms = 0; ms < ZN_ROWS; ms += 1024)
+            fp_eval_pred(&fp, ms, ms + 1024, bits + ms);
+        for (int64_t i = 0; i < ZN_ROWS; i++)
+            TEST_ASSERT_FMT((int)bits[i] == zn_expect(i, ops[k]),
+                            "fp op %u row %lld: got %d want %d",
+                            (unsigned)ops[k], (long long)i, (int)bits[i], zn_expect(i, ops[k]));
+        fp_pred_cleanup(&fp); ray_graph_free(g);
+    }
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -1443,5 +1676,13 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_parted_nullable",    test_diff_parted_nullable,             NULL, NULL },
     /* F64 AND/OR choke: nullable F64 operands must bail EXPR_BAIL_NULL_SHAPE */
     { "expr_null/diff_f64_andor_chokes",   test_diff_f64_andor_chokes,            NULL, NULL },
+    /* Issue #533: null-bearing SYM comparisons fuse without the null scan */
+    { "expr_null/diff_sym_nulls_cmp_const",   test_diff_sym_nulls_cmp_const,      NULL, NULL },
+    { "expr_null/diff_sym_nulls_cmp_col",     test_diff_sym_nulls_cmp_col,        NULL, NULL },
+    { "expr_null/sym_nulls_value_consumer_bails", test_sym_nulls_value_consumer_bails, NULL, NULL },
+    { "expr_null/diff_sym_nulls_parted",      test_diff_sym_nulls_parted,         NULL, NULL },
+    /* chunk-zone all-fail arms must not drop null rows for NE/LT/LE */
+    { "expr_null/zone_skip_keeps_nulls_expr",       test_zone_skip_keeps_nulls_expr,       NULL, NULL },
+    { "expr_null/zone_skip_keeps_nulls_fused_pred", test_zone_skip_keeps_nulls_fused_pred, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

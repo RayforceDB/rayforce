@@ -1,0 +1,31 @@
+;; The radix key width is derived from the data range.  A high byte that only
+;; differs BETWEEN dispatch tasks (8192 rows each) must still widen the key;
+;; if it is missed, asc/desc silently sort by the low bytes alone.
+
+;; rows 40960..49151 carry bit 16, everything else lives in [0, 8192)
+(set N 200000)
+(set X (% (* 7919 (til N)) 8192))
+(set HI (as 'I64 (>= (til N) 40960)))
+(set HI (* HI (as 'I64 (< (til N) 49152))))
+(set V (+ X (* 65536 HI)))
+
+(set SA (asc V))
+(min (>= (- (at SA (+ 1 (til (- N 1)))) (at SA (til (- N 1)))) 0)) -- true
+(count SA) -- N
+(sum SA) -- (sum V)
+
+(set SD (desc V))
+(min (<= (- (at SD (+ 1 (til (- N 1)))) (at SD (til (- N 1)))) 0)) -- true
+
+(set T (table [v] (list V)))
+(set SV (at (select {from: T asc: v}) 'v))
+(min (>= (- (at SV (+ 1 (til (- N 1)))) (at SV (til (- N 1)))) 0)) -- true
+
+;; a nearly sorted vector: one swap past the 65536th element
+(set W (til 70000))
+(set W (at W (at (til 70000) (til 70000))))
+(set W (+ W (* (as 'I64 (== (til 70000) 66000)) 1)))
+(set W (- W (* (as 'I64 (== (til 70000) 66001)) 1)))
+(set SW (asc W))
+(min (>= (- (at SW (+ 1 (til 69999))) (at SW (til 69999))) 0)) -- true
+(at SW (+ 65990 (til 4))) -- [65990 65991 65992 65993]

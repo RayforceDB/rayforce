@@ -29,7 +29,6 @@
 #include "opt.h"
 #include "idiom.h"
 #include "core/profile.h"
-#include "mem/sys.h"
 #include "mem/heap.h"
 #include <float.h>
 #include <math.h>
@@ -122,16 +121,16 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
     uint32_t stack_cap = nc * 2 + 64;  /* extra space for high fan-out nodes */
     uint32_t stack_local[256], order_local[256];
     bool visited_stack[256];
-    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)ray_sys_alloc(stack_cap * sizeof(uint32_t));
-    uint32_t *order = nc <= 256 ? order_local : (uint32_t*)ray_sys_alloc(nc * sizeof(uint32_t));
+    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)ray_alloc_raw(stack_cap * sizeof(uint32_t));
+    uint32_t *order = nc <= 256 ? order_local : (uint32_t*)ray_alloc_raw(nc * sizeof(uint32_t));
     bool* visited;
     if (nc <= 256) {
         visited = visited_stack;
     } else {
-        visited = (bool*)ray_sys_alloc(nc * sizeof(bool));
+        visited = (bool*)ray_alloc_raw(nc * sizeof(bool));
     }
     if (!stack || !order || !visited) {
-        { if (stack_cap > 256) ray_sys_free(stack); if (nc > 256) { ray_sys_free(order); ray_sys_free(visited); } }
+        { if (stack_cap > 256) ray_free_raw(stack); if (nc > 256) { ray_free_raw(order); ray_free_raw(visited); } }
         return;
     }
     memset(visited, 0, nc * sizeof(bool));
@@ -231,7 +230,7 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
     for (int i = oc - 1; i >= 0; i--)
         infer_type_for_node(g, &g->nodes[order[i]]);
 
-    { if (stack_cap > 256) ray_sys_free(stack); if (nc > 256) { ray_sys_free(order); ray_sys_free(visited); } }
+    { if (stack_cap > 256) ray_free_raw(stack); if (nc > 256) { ray_free_raw(order); ray_free_raw(visited); } }
 }
 
 /* --------------------------------------------------------------------------
@@ -261,7 +260,7 @@ static bool track_ext_node(ray_graph_t* g, ray_op_ext_t* ext) {
         if (g->ext_cap > UINT32_MAX / 2) return false;
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
         ray_op_ext_t** new_exts =
-            (ray_op_ext_t**)ray_sys_realloc(g->ext_nodes, new_cap * sizeof(ray_op_ext_t*));
+            (ray_op_ext_t**)ray_realloc_raw(g->ext_nodes, new_cap * sizeof(ray_op_ext_t*));
         if (!new_exts) return false;
         g->ext_nodes = new_exts;
         g->ext_cap = new_cap;
@@ -274,14 +273,13 @@ static ray_op_ext_t* ensure_ext_node(ray_graph_t* g, uint32_t node_id) {
     ray_op_ext_t* ext = find_ext(g, node_id);
     if (ext) return ext;
 
-    ext = (ray_op_ext_t*)ray_sys_alloc(sizeof(ray_op_ext_t));
+    /* Zero-filled so no field (literal, keys, agg_ins, ...) is read
+       uninitialised before the caller populates it. */
+    ext = (ray_op_ext_t*)ray_calloc_raw(sizeof(ray_op_ext_t));
     if (!ext) return NULL;
-    /* M1: Zero-init to prevent use of uninitialized fields (literal,
-       keys, agg_ins, etc.) before the caller populates them. */
-    memset(ext, 0, sizeof(*ext));
     ext->base.id = node_id;
     if (!track_ext_node(g, ext)) {
-        ray_sys_free(ext);
+        ray_free_raw(ext);
         return NULL;
     }
     return ext;
@@ -722,16 +720,16 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
     uint32_t stack_cap = nc * 2 + 64;  /* extra space for high fan-out nodes */
     uint32_t stack_local[256], order_local[256];
     bool visited_stack[256];
-    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)ray_sys_alloc(stack_cap * sizeof(uint32_t));
-    uint32_t *order = nc <= 256 ? order_local : (uint32_t*)ray_sys_alloc(nc * sizeof(uint32_t));
+    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)ray_alloc_raw(stack_cap * sizeof(uint32_t));
+    uint32_t *order = nc <= 256 ? order_local : (uint32_t*)ray_alloc_raw(nc * sizeof(uint32_t));
     bool* visited;
     if (nc <= 256) {
         visited = visited_stack;
     } else {
-        visited = (bool*)ray_sys_alloc(nc * sizeof(bool));
+        visited = (bool*)ray_alloc_raw(nc * sizeof(bool));
     }
     if (!stack || !order || !visited) {
-        { if (stack_cap > 256) ray_sys_free(stack); if (nc > 256) { ray_sys_free(order); ray_sys_free(visited); } }
+        { if (stack_cap > 256) ray_free_raw(stack); if (nc > 256) { ray_free_raw(order); ray_free_raw(visited); } }
         return;
     }
     memset(visited, 0, nc * sizeof(bool));
@@ -831,7 +829,7 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
     for (int i = oc - 1; i >= 0; i--)
         fold_node(g, &g->nodes[order[i]]);
 
-    { if (stack_cap > 256) ray_sys_free(stack); if (nc > 256) { ray_sys_free(order); ray_sys_free(visited); } }
+    { if (stack_cap > 256) ray_free_raw(stack); if (nc > 256) { ray_free_raw(order); ray_free_raw(visited); } }
 }
 
 /* --------------------------------------------------------------------------
@@ -849,7 +847,7 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
        but nc*2 is a safe upper bound for the stack. */
     uint32_t stack_cap = nc * 2;
     uint32_t stack_local[256];
-    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)ray_sys_alloc(stack_cap * sizeof(uint32_t));
+    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)ray_alloc_raw(stack_cap * sizeof(uint32_t));
     if (!stack) return;
     int sp = 0;
     stack[sp++] = root->id;
@@ -968,7 +966,7 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
             }
         }
     }
-    if (stack_cap > 256) ray_sys_free(stack);
+    if (stack_cap > 256) ray_free_raw(stack);
 }
 
 static void pass_dce(ray_graph_t* g, ray_op_t* root) {
@@ -978,7 +976,7 @@ static void pass_dce(ray_graph_t* g, ray_op_t* root) {
     if (nc <= 256) {
         live = live_stack;
     } else {
-        live = (bool*)ray_sys_alloc(nc * sizeof(bool));
+        live = (bool*)ray_alloc_raw(nc * sizeof(bool));
         if (!live) return;
     }
     memset(live, 0, nc * sizeof(bool));
@@ -990,7 +988,7 @@ static void pass_dce(ray_graph_t* g, ray_op_t* root) {
             g->nodes[i].flags |= OP_FLAG_DEAD;
         }
     }
-    if (nc > 256) ray_sys_free(live);
+    if (nc > 256) ray_free_raw(live);
 }
 
 /* --------------------------------------------------------------------------
@@ -1699,7 +1697,7 @@ static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
     if (nc <= 256) {
         visited = visited_stack;
     } else {
-        visited = (bool*)ray_sys_alloc(nc * sizeof(bool));
+        visited = (bool*)ray_alloc_raw(nc * sizeof(bool));
         if (!visited) return &g->nodes[root_id];
     }
     memset(visited, 0, nc * sizeof(bool));
@@ -1763,7 +1761,7 @@ static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
         }
     }
 
-    if (nc > 256) ray_sys_free(visited);
+    if (nc > 256) ray_free_raw(visited);
     return &g->nodes[root_id];
 }
 
@@ -1780,10 +1778,10 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
     uint32_t nc = g->node_count;
 
     bool live_stack[256];
-    bool* live = nc <= 256 ? live_stack : (bool*)ray_sys_alloc(nc * sizeof(bool));
+    bool* live = nc <= 256 ? live_stack : (bool*)ray_alloc_raw(nc * sizeof(bool));
     uint32_t q_stack[256];
-    uint32_t* q = nc <= 256 ? q_stack : (uint32_t*)ray_sys_alloc(nc * sizeof(uint32_t));
-    if (!live || !q) { if (nc > 256) { ray_sys_free(live); ray_sys_free(q); } return false; }
+    uint32_t* q = nc <= 256 ? q_stack : (uint32_t*)ray_alloc_raw(nc * sizeof(uint32_t));
+    if (!live || !q) { if (nc > 256) { ray_free_raw(live); ray_free_raw(q); } return false; }
     memset(live, 0, nc * sizeof(bool));
 
     /* BFS from root */
@@ -1908,7 +1906,7 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
             g->nodes[i].flags |= OP_FLAG_DEAD;
     }
 
-    if (nc > 256) { ray_sys_free(live); ray_sys_free(q); }
+    if (nc > 256) { ray_free_raw(live); ray_free_raw(q); }
     return true;
 }
 
@@ -1999,9 +1997,8 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
 
         /* Allocate seg_mask bitmap */
         uint32_t n_words = (uint32_t)((n_parts + 63) / 64);
-        uint64_t* mask = (uint64_t*)ray_sys_alloc(n_words * sizeof(uint64_t));
+        uint64_t* mask = (uint64_t*)ray_calloc_raw(n_words * sizeof(uint64_t));
         if (!mask) continue;
-        memset(mask, 0, n_words * sizeof(uint64_t));
 
         /* OP_IN / OP_NOT_IN expects a literal vector const on the RHS.
          * For the scalar ops, the const is a single atom or 1-elem vec. */
@@ -2010,7 +2007,7 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
 
         /* For IN/NOT_IN the scan must be the LHS (col IN set), not
          * swapped — we never pruned on `const IN col_set` anyway. */
-        if ((is_in || is_nin) && swapped) { ray_sys_free(mask); continue; }
+        if ((is_in || is_nin) && swapped) { ray_free_raw(mask); continue; }
 
         /* Extract constant(s) for comparison.  Scalar ops take one
          * value; IN ops take an array of values read from the vec
@@ -2028,14 +2025,14 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         bool narrow32 = (lt == RAY_I32 || lt == RAY_DATE || lt == RAY_TIME);
         bool wide64   = (lt == RAY_I64 || lt == RAY_TIMESTAMP || lt == RAY_SYM);
         if (!narrow32 && !wide64) {
-            ray_sys_free(mask);
+            ray_free_raw(mask);
             continue;  /* unsupported type for partition pruning */
         }
 
         if (is_in || is_nin) {
             /* Literal must be a vector (ray_const_vec carries the vec
              * pointer unchanged in ext->literal). */
-            if (lit->type <= 0) { ray_sys_free(mask); continue; }
+            if (lit->type <= 0) { ray_free_raw(mask); continue; }
             set_len = lit->len;
             if (set_len <= 0) {
                 /* Empty set: for IN no partition can match → mask stays 0
@@ -2049,7 +2046,7 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             }
             if (set_len > 32) {
                 set_heap = ray_alloc((size_t)set_len * sizeof(int64_t));
-                if (!set_heap) { ray_sys_free(mask); continue; }
+                if (!set_heap) { ray_free_raw(mask); continue; }
                 set_vals = (int64_t*)ray_data(set_heap);
             }
             /* Read set elements — skip nulls in the literal so a null
@@ -2174,7 +2171,7 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
                 mask_owned = true;
             }
         }
-        if (!mask_owned) ray_sys_free(mask);
+        if (!mask_owned) ray_free_raw(mask);
 
         n->est_rows = 1;
     }

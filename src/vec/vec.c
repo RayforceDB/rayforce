@@ -385,7 +385,7 @@ ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem) {
  * dead inline copy in every TU that includes the public header. */
 void* ray_data_slice_path(ray_t* v) {
     return (char*)v->slice_parent->data
-           + v->slice_offset * ray_type_sizes[(uint8_t)v->type];
+           + v->slice_offset * ray_sym_elem_size(v->type, v->attrs);
 }
 
 void* ray_vec_get(ray_t* vec, int64_t idx) {
@@ -1540,6 +1540,50 @@ ray_t* ray_embedding_new(int64_t nrows, int32_t dim) {
     v->len = total;
     return v;
 }
+
+/* Width-specific null scan for text vectors (issue #533).  SYM nulls are
+ * id 0 and STR nulls are length 0, so "any null?" is "any zero in the id /
+ * length lane".  The per-row ray_vec_is_null walk cost an out-of-line call
+ * plus a width dispatch per cell; this reduces each chunk with a branch-free
+ * OR that the compiler vectorizes, and exits after the first chunk that
+ * holds a zero.  Still O(n): callers that need the proof once per query
+ * should also cache or skip it where the predicate is null-safe. */
+#define RAY_TEXT_NULL_SCAN(T, ZERO_EXPR)                                  \
+    do {                                                                  \
+        const T* p = (const T*)data;                                      \
+        int64_t i = 0;                                                    \
+        for (; i + 256 <= len; i += 256) {                                \
+            unsigned acc = 0;                                             \
+            for (int64_t j = i; j < i + 256; j++) acc |= (ZERO_EXPR);     \
+            if (acc) return true;                                         \
+        }                                                                 \
+        unsigned acc = 0;                                                 \
+        for (int64_t j = i; j < len; j++) acc |= (ZERO_EXPR);             \
+        return acc != 0;                                                  \
+    } while (0)
+
+bool ray_vec_text_has_nulls(const ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    int64_t len = v->len, off = 0;
+    while ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent) {
+        off += v->slice_offset;
+        v = v->slice_parent;
+    }
+    if (len <= 0) return false;
+    if (v->type == RAY_STR) {
+        const ray_str_t* data = (const ray_str_t*)ray_data((ray_t*)v) + off;
+        RAY_TEXT_NULL_SCAN(ray_str_t, p[j].len == 0);
+    }
+    if (v->type != RAY_SYM) return false;
+    const uint8_t* base = (const uint8_t*)ray_data((ray_t*)v);
+    switch (v->attrs & RAY_SYM_W_MASK) {
+        case RAY_SYM_W8:  { const void* data = base + off;     RAY_TEXT_NULL_SCAN(uint8_t,  p[j] == 0); }
+        case RAY_SYM_W16: { const void* data = base + off * 2; RAY_TEXT_NULL_SCAN(uint16_t, p[j] == 0); }
+        case RAY_SYM_W32: { const void* data = base + off * 4; RAY_TEXT_NULL_SCAN(uint32_t, p[j] == 0); }
+        default:          { const void* data = base + off * 8; RAY_TEXT_NULL_SCAN(int64_t,  p[j] == 0); }
+    }
+}
+#undef RAY_TEXT_NULL_SCAN
 
 bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     if (!vec || RAY_IS_ERR(vec)) return false;

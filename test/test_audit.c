@@ -1528,7 +1528,56 @@ static test_result_t test_public_runtime_api_not_redeclared(void) {
  * Test array + suite registration
  * ----------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------
+ * A connection's compression threshold must come from the connection.
+ *
+ * ray_ipc_link_threshold derives a policy from the PEER ADDRESS alone.
+ * That is the right default when a connection is established, and wrong
+ * everywhere after: .ipc.open's `compress` option is stored on the conn
+ * data, so re-deriving from the address on a send silently discards it.
+ * A loopback link asked to compress would quietly never compress.
+ *
+ * The send paths therefore take conn_threshold(sel), which prefers the
+ * stored value.  ray_ipc_link_threshold belongs only where a connection
+ * is being set up (ipc_accept / ray_ipc_connect_opts) or where there is
+ * no conn data at all (conn_threshold's own fallback).  Guard that: no conn_write_msg or conn_frame_msg call may
+ * pass it.
+ *
+ * This is a tripwire, not a proof: it matches source text with strstr,
+ * uses ';' as a statement terminator and a 3-line proximity window, so
+ * reformatting the calls it guards can silently defeat it.  It catches
+ * the specific regression that already happened once; it does not
+ * enforce the invariant in general.
+ * ------------------------------------------------------------------ */
+static test_result_t test_audit_conn_threshold_not_rederived(void) {
+    FILE* f = fopen("src/core/ipc.c", "r");
+    if (!f) FAILF("cannot open src/core/ipc.c");
+
+    /* Calls span lines, so track the most recent call opened. */
+    const char* pending = NULL;
+    int   pending_line  = 0;
+    int   bad_line      = 0;
+    char  line[1024];
+    for (int line_no = 1; fgets(line, sizeof line, f); line_no++) {
+        if (strstr(line, "conn_write_msg(")) { pending = "conn_write_msg"; pending_line = line_no; }
+        else if (strstr(line, "conn_frame_msg(")) { pending = "conn_frame_msg"; pending_line = line_no; }
+        if (pending && strstr(line, "ray_ipc_link_threshold")) {
+            /* within a few lines of the call opening = an argument to it */
+            if (line_no - pending_line <= 3) { bad_line = line_no; break; }
+        }
+        if (strchr(line, ';')) pending = NULL;
+    }
+    fclose(f);
+
+    if (bad_line)
+        FAILF("src/core/ipc.c:%d passes ray_ipc_link_threshold to a frame/send "
+              "call; use conn_threshold(sel) so .ipc.open's `compress` survives",
+              bad_line);
+    PASS();
+}
+
 const test_entry_t audit_entries[] = {
+    { "audit/conn_threshold_not_rederived", test_audit_conn_threshold_not_rederived, NULL, NULL },
     { "audit/smoke", test_audit_smoke, NULL, NULL },
     { "audit/sel_group_sum", test_sel_group_sum, NULL, NULL },
     { "audit/sel_group_count", test_sel_group_count, NULL, NULL },

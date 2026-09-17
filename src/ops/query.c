@@ -45,7 +45,6 @@
 #include "table/domain.h"
 #include "table/dict.h"
 #include "mem/heap.h"
-#include "mem/sys.h"
 
 #include <string.h>
 #include <math.h>
@@ -302,7 +301,7 @@ static bool dag_numeric_type_admitted(int8_t t) {
     if (t <= 0) return true;  /* unknown/uninferred: let executor validate */
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
 static bool dag_pow_type_admitted(int8_t t) {
@@ -2794,6 +2793,204 @@ static int collect_col_refs(ray_t* expr, ray_t* tbl,
     return n;
 }
 
+/* A group-key expression that reads exactly ONE flat SYM column is a
+ * function of the symbol alone.  Evaluate it once per symbol actually
+ * present in the column (du distinct ids, first-seen order, as a SYM
+ * vector adopting the column's domain) and spread the du results over the
+ * rows — instead of running every string op over every row, where each
+ * substr/str-find over SYM interns its output per row.  Returns a fresh
+ * nrows-long key vector, or NULL when the shape does not apply (caller
+ * falls back to the plain evaluation).  Only when the distinct count is
+ * well below the row count: the expression costs O(du) here, the spread
+ * O(nrows) plain reads. */
+/* Is `e` a pure, row-local function of the column `col_sym` (plus
+ * let-bound names)?  Heads must come from a fixed list of elementwise
+ * operators — anything positional (differ, fills, deltas, moving windows),
+ * a user function, or a free symbol that is not the column (a global
+ * vector of table length) disqualifies the per-symbol evaluation. */
+static bool derived_key_head_ok(int64_t head) {
+    static const char* const ok[] = {
+        "let", "if", "cond", "and", "or", "not",
+        "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%",
+        "abs", "neg", "floor", "ceil", "round", "xbar", "as",
+        "substr", "str-find", "strlen", "within", "nil?", "upper", "lower", "like",
+    };
+    ray_t* name = ray_sym_str(head);
+    if (!name || RAY_IS_ERR(name)) return false;
+    size_t n = ray_str_len(name);
+    const char* q = ray_str_ptr(name);
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+        if (strlen(ok[i]) == n && memcmp(ok[i], q, n) == 0) return true;
+    return false;
+}
+static bool derived_key_expr_ok(ray_t* e, ray_t* tbl, int64_t col_sym, int64_t* bound, int nbound) {
+    if (!e) return false;
+    if (e->type == -RAY_SYM) {
+        /* A symbol literal — unless it names a column of the table, which
+         * the DAG compiler resolves to that column. */
+        if (e->attrs & ATTR_QUOTED) return ray_table_get_col(tbl, e->i64) == NULL;
+        if (e->i64 == col_sym) return true;
+        for (int i = 0; i < nbound; i++) if (bound[i] == e->i64) return true;
+        return false;                                       /* free name */
+    }
+    if (e->type != RAY_LIST) return true;                   /* atom / vector literal */
+    int64_t n = ray_len(e);
+    if (n < 1) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED) || !derived_key_head_ok(el[0]->i64))
+        return false;
+    /* The name must still mean the builtin: the DAG compiler inlines a
+     * global lambda of that name ahead of the builtin, and a let-bound
+     * name shadows it too. */
+    for (int i = 0; i < nbound; i++) if (bound[i] == el[0]->i64) return false;
+    {
+        ray_t* gv = ray_env_get(el[0]->i64);          /* borrowed */
+        if (gv && gv->type == RAY_LAMBDA) return false;
+    }
+    ray_t* hs = ray_sym_str(el[0]->i64);
+    size_t hl = ray_str_len(hs);
+    const char* hp = ray_str_ptr(hs);
+    if (hl == 3 && memcmp(hp, "let", 3) == 0) {
+        if (n != 4 || el[1]->type != -RAY_SYM || nbound >= 32) return false;
+        if (!derived_key_expr_ok(el[2], tbl, col_sym, bound, nbound)) return false;
+        bound[nbound] = el[1]->i64;
+        return derived_key_expr_ok(el[3], tbl, col_sym, bound, nbound + 1);
+    }
+    if (hl == 4 && memcmp(hp, "cond", 4) == 0) {
+        for (int64_t i = 1; i < n; i++) {
+            if (el[i]->type != RAY_LIST || ray_len(el[i]) != 2) return false;
+            ray_t** cp = (ray_t**)ray_data(el[i]);
+            bool is_else = cp[0]->type == -RAY_SYM && !(cp[0]->attrs & ATTR_QUOTED) &&
+                           ray_str_len(ray_sym_str(cp[0]->i64)) == 4 &&
+                           memcmp(ray_str_ptr(ray_sym_str(cp[0]->i64)), "else", 4) == 0;
+            if (!is_else && !derived_key_expr_ok(cp[0], tbl, col_sym, bound, nbound)) return false;
+            if (!derived_key_expr_ok(cp[1], tbl, col_sym, bound, nbound)) return false;
+        }
+        return true;
+    }
+    for (int64_t i = 1; i < n; i++)
+        if (!derived_key_expr_ok(el[i], tbl, col_sym, bound, nbound)) return false;
+    return true;
+}
+
+/* Name for a computed group key: the last bare (unquoted) symbol of the
+ * form, else `key` — the rule the eval-level group path applies. */
+static int64_t derived_key_name(ray_t* by_expr) {
+    if (by_expr && by_expr->type == RAY_LIST && by_expr->len >= 2) {
+        ray_t** be = (ray_t**)ray_data(by_expr);
+        for (int64_t i = by_expr->len - 1; i >= 1; i--)
+            if (be[i]->type == -RAY_SYM && !(be[i]->attrs & ATTR_QUOTED)) return be[i]->i64;
+    }
+    return ray_sym_intern("key", 3);
+}
+#define DERIVED_KEY_MAX_DOMAIN (64LL * 1024 * 1024)
+static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
+    if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
+    int64_t ref_syms[2];
+    int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
+    if (nref != 1) return NULL;
+    int64_t bound[32];
+    if (!derived_key_expr_ok(by_expr, tbl, ref_syms[0], bound, 0)) return NULL;
+    ray_t* C = ray_table_get_col(tbl, ref_syms[0]);
+    int64_t nrows = ray_table_nrows(tbl);
+    if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 4096)
+        return NULL;
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
+    int64_t dn = dom ? ray_sym_domain_count(dom) : 0;
+    /* The slot table is dn ints: refuse a domain far wider than the table
+     * (a process-wide symbol domain behind a small in-memory column). */
+    if (dn <= 0 || dn > DERIVED_KEY_MAX_DOMAIN || dn > 16 * nrows) return NULL;
+
+    /* Probe the first block before touching anything domain-sized: a
+     * distinct share above 3/4 over the first 65536 rows means a
+     * near-unique column, for which the per-symbol evaluation cannot win.
+     * A 128k-slot open-addressing set on scratch — no dn-sized memory. */
+    const void* cd = ray_data(C);
+    {
+        const int64_t probe_rows = nrows < 65536 ? nrows : 65536;
+        int64_t PROBE_SLOTS = 1024;               /* power of two, load <= 1/2 */
+        while (PROBE_SLOTS < 2 * probe_rows) PROBE_SLOTS <<= 1;
+        ray_t* set_hdr = NULL;
+        int64_t* set = (int64_t*)scratch_alloc(&set_hdr, (size_t)PROBE_SLOTS * sizeof(int64_t));
+        if (!set) return NULL;
+        memset(set, 0xff, (size_t)PROBE_SLOTS * sizeof(int64_t));
+        int64_t seen = 0;
+        for (int64_t r = 0; r < probe_rows; r++) {
+            int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
+            if (id < 0 || id >= dn) { seen = probe_rows; break; }
+            uint64_t h = (((uint64_t)id * 0x9E3779B97F4A7C15ull) >> 32) & (uint64_t)(PROBE_SLOTS - 1);
+            while (set[h] >= 0 && set[h] != id) h = (h + 1) & (uint64_t)(PROBE_SLOTS - 1);
+            if (set[h] < 0) { set[h] = id; seen++; }
+        }
+        scratch_free(set_hdr);
+        if (seen * 4 > probe_rows * 3) return NULL;
+    }
+
+    /* Pass 1: first-seen slot per symbol id; bail on an id outside the
+     * domain (a foreign domain) or once du crosses the gate.  The null
+     * symbol is id 0, inside the domain: it gets a slot and the expression
+     * sees it once, exactly as the row-wise evaluation sees it per row. */
+    ray_t* pos_hdr = NULL;
+    int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
+    if (!pos) return NULL;
+    memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
+    ray_t* dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), dn);
+    if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); scratch_free(pos_hdr); return NULL; }
+    ray_sym_vec_adopt_domain(dom_vec, C);
+    int64_t du = 0, du_max = nrows / 2;
+    if (du_max > INT32_MAX) du_max = INT32_MAX;       /* slots are int32 */
+    bool ok = true;
+    for (int64_t r = 0; r < nrows; r++) {
+        int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
+        if (id < 0 || id >= dn) { ok = false; break; }
+        if (pos[id] < 0) {
+            if (du >= du_max) { ok = false; break; }
+            pos[id] = (int32_t)du;
+            write_col_i64(ray_data(dom_vec), du, id, dom_vec->type, dom_vec->attrs);
+            du++;
+        }
+    }
+    if (!ok || du == 0) { ray_release(dom_vec); scratch_free(pos_hdr); return NULL; }
+    dom_vec->len = du;
+
+    /* Evaluate the expression over the du distinct symbols through the
+     * same DAG compiler the row-wise key would take, against a one-column
+     * table holding the distinct vector under the referenced name. */
+    ray_t* key_dom = NULL;
+    ray_t* mini = ray_table_new(0);
+    if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
+    ray_release(dom_vec);
+    if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
+    ray_graph_t* g2 = ray_graph_new(mini);
+    if (g2) {
+        ray_op_t* kop = compile_expr_dag(g2, by_expr);
+        if (kop) kop = ray_optimize(g2, kop);
+        if (kop) key_dom = ray_execute(g2, kop);
+        ray_graph_free(g2);
+    }
+    ray_release(mini);
+    if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
+    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
+    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+
+    /* Pass 2: spread by slot. */
+    ray_t* ids = ray_vec_new(RAY_I64, nrows);
+    if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+    ids->len = nrows;
+    int64_t* idp = (int64_t*)ray_data(ids);
+    for (int64_t r = 0; r < nrows; r++)
+        idp[r] = pos[ray_read_sym(cd, r, C->type, C->attrs)];
+    scratch_free(pos_hdr);
+    ray_t* spread = ray_at_fn(key_dom, ids);
+    ray_release(ids);
+    ray_release(key_dom);
+    if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
+    if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
+    if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    agg_route_note_key_domain();
+    return spread;
+}
+
 /* Bind a single column-id to a slice of its column under `idx_list`.
  * Helper used inside the per-group hot loop (slices the table's column
  * via ray_at_fn, hands the slice to env_bind_local which retains, then
@@ -2884,6 +3081,39 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     ray_t* result = NULL;       /* typed vec OR list col */
     int direct_typed = 0;       /* non-zero → result is a typed vec */
     int8_t typed_t = 0;         /* atom type sentinel for the typed path */
+    if (n_groups == 0) {
+        /* No group to walk, but the column must still exist.  Probe the
+         * expression once over an EMPTY slice of every referenced column so
+         * the result keeps the type a non-empty result would have had; an
+         * expression that cannot evaluate on zero rows yields a LIST column,
+         * the same shape the per-group path falls back to. */
+        ray_t* empty_idx = ray_vec_new(RAY_I64, 0);
+        int8_t vt = 0;
+        if (empty_idx && !RAY_IS_ERR(empty_idx)) {
+            empty_idx->len = 0;
+            int bound = 1;
+            for (int i = 0; i < n_cols && bound; i++) {
+                ray_t* err = bind_col_slice(col_syms[i], cols[i], empty_idx);
+                if (err) { ray_error_free(err); bound = 0; }
+            }
+            if (bound) {
+                ray_t* cell = ray_eval(expr);
+                if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
+                if (cell && !RAY_IS_ERR(cell)) {
+                    int8_t t = cell->type;
+                    if (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) vt = (int8_t)(-t);
+                    ray_release(cell);
+                } else if (cell) ray_error_free(cell);
+            }
+            ray_release(empty_idx);
+        } else if (empty_idx) ray_error_free(empty_idx);
+        result = vt ? ray_vec_new(vt, 0) : ray_list_new(0);
+        if (result && !RAY_IS_ERR(result)) result->len = 0;
+        g_active_query_table = _aqt;
+        ray_env_pop_scope();
+        scratch_free(refs_hdr);
+        return result ? result : ray_error("oom", NULL);
+    }
 
     for (int64_t gi = 0; gi < n_groups; gi++) {
         ray_t* idx_list = feeder(gi, fstate);
@@ -3202,6 +3432,32 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     return result;
 }
 
+/* Zero groups still need the aggregate's column.  Run the aggregate once over
+ * an empty vector of the source's type so the empty column keeps the type a
+ * non-empty result would have had; if that probe cannot run, an empty LIST
+ * column stands in, the shape the per-group path itself falls back to. */
+static ray_t* empty_agg_column(ray_t* fn_name, ray_t* src) {
+    ray_t* out = NULL;
+    ray_t* fn_obj = fn_name ? ray_env_get(fn_name->i64) : NULL;
+    if (fn_obj && fn_obj->type == RAY_UNARY && src && ray_is_vec(src) && src->type != RAY_LIST) {
+        ray_t* empty = ray_vec_new(src->type, 0);
+        if (empty && !RAY_IS_ERR(empty)) {
+            empty->len = 0;
+            ray_t* v = ((ray_unary_fn)(uintptr_t)fn_obj->i64)(empty);
+            if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
+            if (v && !RAY_IS_ERR(v)) {
+                int8_t t = v->type;
+                if (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) out = ray_vec_new((int8_t)(-t), 0);
+                ray_release(v);
+            } else if (v) ray_error_free(v);
+            ray_release(empty);
+        } else if (empty) ray_error_free(empty);
+    }
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); out = ray_list_new(0); }
+    if (out && !RAY_IS_ERR(out)) out->len = 0;
+    return out;
+}
+
 /* Streaming-style per-group AGG body, DAG flavor.  For an expression
  * like `(med v)` (head is RAY_FN_AGGR + RAY_UNARY, second elem is a
  * column ref or full-table-eval-able sub-expression), slice src per
@@ -3209,6 +3465,34 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
  * result into a pre-sized typed vec.  Mirrors the eval-fallback's AGG
  * branch (`query.c:~1955`) but with the idx_buf+offsets+grp_cnt
  * layout the DAG path produces. */
+/* Infer an empty grouped column from the aggregate's empty-input result.
+ * Preserve source domains/widths when the result has the source element type. */
+static ray_t* empty_unary_group_result(ray_unary_fn fn, ray_t* source) {
+    if (!source) return ray_error("domain", "aggregation source missing");
+    ray_t* input = ray_group_gather(source, NULL, 0);
+    if (!input || RAY_IS_ERR(input)) return input ? input : ray_error("oom", NULL);
+    ray_t* value = fn(input);
+    if (value && !RAY_IS_ERR(value) && ray_is_lazy(value)) value = ray_lazy_materialize(value);
+    if (!value || RAY_IS_ERR(value)) {
+        ray_release(input);
+        if (!value) return ray_error("oom", NULL);
+        /* No group invokes this aggregate. An empty-input domain/type error
+         * only means its result type cannot be inferred; preserve the former
+         * empty LIST result. Resource failures still abort the query. */
+        const char* code = ray_err_code(value);
+        if (strcmp(code, "domain") && strcmp(code, "type")) return value;
+        ray_release(value);
+        ray_t* out = ray_list_new(0);
+        return out ? out : ray_error("oom", NULL);
+    }
+    ray_t* out;
+    if (ray_is_atom(value) && -value->type == input->type) {
+        out = input; input = NULL;
+    } else out = ray_is_atom(value) ? ray_vec_new(-value->type, 0) : ray_list_new(0);
+    ray_release(input); ray_release(value);
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
                                        const int64_t* idx_buf,
                                        const int64_t* offsets,
@@ -3247,6 +3531,11 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
             src = ray_lazy_materialize(src);
             if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to materialize aggregation source");
         }
+    }
+
+    if (n_groups == 0) {
+        ray_t* out = empty_unary_group_result(uf, src);
+        ray_release(src); return out;
     }
 
     /* Reusable I64 idx wrapper. */
@@ -3299,13 +3588,18 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
         ray_release(agg_val);
     }
 
-    ray_release(idx_vec); ray_release(src);
+    ray_release(idx_vec);
     if (!agg_vec) {
-        /* No groups produced a value (all empty?) — return an empty typed
-         * vec sized n_groups; default to I64 for lack of a better guess. */
-        agg_vec = ray_vec_new(RAY_I64, n_groups);
-        if (agg_vec && !RAY_IS_ERR(agg_vec)) agg_vec->len = n_groups;
+        /* No group produced a value.  With zero groups the column must still
+         * carry the type a value would have had; with groups that were all
+         * empty keep the I64 default sized to n_groups. */
+        if (n_groups == 0) agg_vec = empty_agg_column(fn_name, src);
+        else {
+            agg_vec = ray_vec_new(RAY_I64, n_groups);
+            if (agg_vec && !RAY_IS_ERR(agg_vec)) agg_vec->len = n_groups;
+        }
     }
+    ray_release(src);
     return agg_vec;
 }
 
@@ -3600,10 +3894,8 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
  *
  * Returns NULL on shape miss (caller falls through to the existing
  * count-distinct path); returns a result table on success.  Gates:
- *  - single scalar K column (not SYM, no nulls)
- *  - cd_inner is a column ref X (not SYM, no nulls) — composite key
- *    fits in 16 bytes (v2's wide-key cap)
- *  - K + X ≤ 16 bytes packed
+ *  - plain K and X columns with supported grouping key types
+ *  - at most 15 K columns, leaving one component for X
  *  - WHERE optional; if present, must be supported by the fused predicate
  *  - desc/take optional, must be on the cd output column when present */
 static ray_t* try_count_distinct_v2_rewrite(
@@ -3616,16 +3908,25 @@ static ray_t* try_count_distinct_v2_rewrite(
     int64_t nearest_id)
 {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
-    /* by: accepts either a single bare column name ((by: K), single-key)
-     * or a {Name: Col Name: Col ...} dict (multi-key composite).  In
-     * either case we collect the source column syms into K_syms[].
-     * The output aliases for multi-key (dict keys) are looked up from
-     * by_expr again when the inner pass renames its output columns. */
+    /* by: accepts a single bare column name ((by: K), single-key), a
+     * [K1 K2 ...] symbol vector (multi-key, output columns keep the source
+     * names), or a {Name: Col Name: Col ...} dict (multi-key composite with
+     * aliases).  In every case we collect the source column syms into
+     * K_syms[].  The vector form is how a composite key is normally written
+     * (`by: [MobilePhone MobilePhoneModel]`); without this branch it fell
+     * to the general per-group path, seven times slower than the dict form
+     * of the same query. */
     int64_t K_syms[15];  /* leave room for X in the composite */
     int n_K = 0;
     if (by_expr && by_expr->type == -RAY_SYM &&
         !(by_expr->attrs & ATTR_QUOTED)) {
         K_syms[n_K++] = by_expr->i64;
+    } else if (by_expr && by_expr->type == RAY_SYM && ray_is_vec(by_expr) &&
+               !(by_expr->attrs & ATTR_QUOTED)) {
+        int64_t n = ray_len(by_expr);
+        if (n == 0 || n > 15) return NULL;
+        for (int64_t i = 0; i < n; i++)
+            K_syms[n_K++] = ray_read_sym(ray_data(by_expr), i, by_expr->type, by_expr->attrs);
     } else if (by_expr && by_expr->type == RAY_DICT) {
         DICT_VIEW_DECL(byv);
         DICT_VIEW_OPEN(by_expr, byv);
@@ -3710,35 +4011,31 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (asc_col_sym  >= 0 && asc_col_sym  != cd_c_sym) return NULL;
     if (desc_col_sym >= 0 && asc_col_sym  >= 0) return NULL;
 
-    /* Type checks on every K column and on X.  Composite must fit in
-     * the mk_compile 16-byte budget (sum of K storage widths + X). */
+    /* General grouping retains full keys when a tuple does not fit the
+     * packed kernel. Its byte-width limit must not restrict this rewrite. */
     ray_t* K_cols[15];
-    int K_esz_total = 0;
     for (int j = 0; j < n_K; j++) {
         K_cols[j] = ray_table_get_col(tbl, K_syms[j]);
         if (!K_cols[j]) return NULL;
         int8_t kct_j = K_cols[j]->type;
         if (RAY_IS_PARTED(kct_j) || kct_j == RAY_MAPCOMMON) return NULL;
-        if (ray_vec_has_nulls(K_cols[j])) return NULL;
         int kct_ok_j = (kct_j == RAY_SYM  || kct_j == RAY_BOOL || kct_j == RAY_U8 ||
                         kct_j == RAY_I16  || kct_j == RAY_I32  || kct_j == RAY_I64 ||
-                        kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP);
+                        kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP || kct_j == RAY_F32 || kct_j == RAY_F64 ||
+                        kct_j == RAY_STR || kct_j == RAY_GUID || kct_j == RAY_LIST);
         if (!kct_ok_j) return NULL;
-        K_esz_total += ray_sym_elem_size(kct_j, K_cols[j]->attrs);
     }
     ray_t* X_col = ray_table_get_col(tbl, cd_X_sym);
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
-    if (ray_vec_has_nulls(X_col)) return NULL;
-    int X_esz = ray_sym_elem_size(xct, X_col->attrs);
-    if (K_esz_total + X_esz > 16) return NULL;
     /* X gets the same per-type acceptability check as the K columns
      * (validated in the loop above).  SYM is allowed — mk_compile packs
      * it by storage width into the composite key. */
     int xct_ok = (xct == RAY_SYM  || xct == RAY_BOOL || xct == RAY_U8 ||
                   xct == RAY_I16  || xct == RAY_I32  || xct == RAY_I64 ||
-                  xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP);
+                  xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP || xct == RAY_F32 || xct == RAY_F64 ||
+                  xct == RAY_STR || xct == RAY_GUID || xct == RAY_LIST);
     if (!xct_ok) return NULL;
 
     if (where_expr && !ray_fused_group_supported(where_expr, tbl))
@@ -3783,8 +4080,12 @@ static ray_t* try_count_distinct_v2_rewrite(
                 {
                     const int64_t* src = (const int64_t*)ray_data(fk);
                     void* dst = ray_data(kv);
-                    for (int64_t i = 0; i < ng; i++)
-                        write_col_i64(dst, i, src[i], kv->type, kv->attrs);
+                    for (int64_t i = 0; i < ng; i++) {
+                        if (kv->type == RAY_F32) { uint32_t bits = (uint32_t)src[i]; memcpy((float*)dst + i, &bits, 4); }
+                        else if (kv->type == RAY_F64) memcpy((double*)dst + i, &src[i], 8);
+                        else write_col_i64(dst, i, src[i], kv->type, kv->attrs);
+                    }
+                    if (ray_vec_may_have_nulls(K_cols[0])) kv->attrs |= RAY_ATTR_HAS_NULLS;
                 }
                 ray_t* out = ray_table_new(2);
                 if (out && !RAY_IS_ERR(out))
@@ -3965,6 +4266,12 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
     }
 
+    if (src->type == RAY_STR || src->type == RAY_GUID || src->type == RAY_LIST) {
+        ray_t* wide = agg_count_distinct_indexed(src, idx_buf, offsets, grp_cnt, n_groups);
+        ray_release(src);
+        return wide;
+    }
+
     ray_t* out = ray_vec_new(RAY_I64, n_groups);
     if (!out || RAY_IS_ERR(out)) {
         ray_release(src);
@@ -4020,7 +4327,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                 .sym_cap_bound = sym_cap_bound,
                 .oom       = 0,
             };
-            ray_pool_dispatch_n(pool, cdpg_buf_par_fn, &pctx, (uint32_t)n_groups);
+            ray_group_dispatch(cdpg_buf_par_fn, &pctx, grp_cnt, n_groups);
             if (!atomic_load_explicit(&pctx.oom, memory_order_relaxed)) {
                 ray_release(src);
                 return out;
@@ -4425,7 +4732,7 @@ static int can_atom_broadcast(ray_t* a) {
     switch (vt) {
     case RAY_BOOL: case RAY_U8:
     case RAY_I16:  case RAY_I32:
-    case RAY_I64:  case RAY_F64:
+    case RAY_I64: case RAY_F32: case RAY_F64: case RAY_GUID: case RAY_STR:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
     case RAY_SYM:
         return 1;
@@ -4442,10 +4749,15 @@ static int can_atom_broadcast(ray_t* a) {
  * per group, scaling with output cardinality, not row count).  Allocate
  * once and fill — Q35 falls back into parity with Q34.
  *
- * Returns NULL for atom types not yet handled (RAY_STR, RAY_GUID, F32);
+ * Returns NULL for unsupported atom kinds;
  * caller falls back to the per-cell LIST path. */
 static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
-    if (!a || !ray_is_atom(a) || n <= 0) return NULL;
+    /* n == 0 is a legitimate request, not a failure: a grouped select that
+     * matched no row still owes its caller a typed, empty column for every
+     * literal projection.  Returning NULL here made the sole call site
+     * (which treats NULL as allocation failure) report `oom` for an
+     * ordinary `select {by: k where: <no match> lit: 1 ...}`. */
+    if (!a || !ray_is_atom(a) || n < 0) return NULL;
     int8_t vec_type = (int8_t)(-a->type);
     if (vec_type <= 0) return NULL;
 
@@ -4468,6 +4780,7 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     }
     if (!v || RAY_IS_ERR(v)) return NULL;
     v->len = n;
+    if (n == 0) return v;   /* typed and empty; nothing to broadcast into */
 
     void* dst = ray_data(v);
     switch (vec_type) {
@@ -4497,6 +4810,22 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
         for (int64_t i = 0; i < n; i++) d[i] = val;
         break;
     }
+    case RAY_F32: {
+        float* d = dst;
+        for (int64_t i = 0; i < n; i++) d[i] = (float)a->f64;
+        break;
+    }
+    case RAY_GUID:
+        for (int64_t i = 0; i < n; i++)
+            memcpy((char*)dst + (size_t)i * 16, ray_data(a->obj), 16);
+        break;
+    case RAY_STR:
+        for (int64_t i = 0; i < n; i++) {
+            ray_t* next = ray_str_vec_set(v, i, ray_str_ptr(a), ray_str_len(a));
+            if (!next || RAY_IS_ERR(next)) { ray_release(v); return NULL; }
+            v = next;
+        }
+        break;
     case RAY_F64: {
         double val = a->f64;
         double* d = (double*)dst;
@@ -4529,16 +4858,11 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     }
 
     /* Propagate atom-null: an entirely-null broadcast keeps the null bit
-     * of every cell so `is_null` and aggregations behave the same as
-     * the LIST path would have.  The aux memset is a bitmap-era residue
-     * (no vec-level consumer reads aux null bits since the sentinel
-     * migration); it MUST skip RAY_SYM, whose aux bytes 8-15 now carry
-     * the resolution-domain pointer — clobbering it would corrupt the
-     * header and crash the owned-ref release on free. */
+     * of every cell so `is_null` and aggregations retain their semantics.
+     * Payloads already contain typed sentinels; aux belongs to owners/domains. */
     if (RAY_ATOM_IS_NULL(a)) {
         v->attrs |= RAY_ATTR_HAS_NULLS;
-        if (vec_type != RAY_SYM)
-            memset(v->aux, 0xFF, 16);
+
     }
     return v;
 }
@@ -5614,6 +5938,106 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
     return n;
 }
 
+/* Materialize pure temporal arithmetic with the unit-aware evaluator once,
+ * then let the normal typed GROUP pipeline reduce that column. The expression
+ * DAG's raw integer arithmetic remains guarded for mixed temporal units. */
+static bool temporal_materialize_pure(ray_t* expr, ray_t* tbl) {
+    if (!expr) return false;
+    if (ray_is_atom(expr)) {
+        if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
+            ray_t* col = ray_table_get_col(tbl, expr->i64);
+            return col && !RAY_IS_PARTED(col->type) && col->type != RAY_MAPCOMMON;
+        }
+        return true;
+    }
+    if (expr->type != RAY_LIST || expr->len != 3) return false;
+    ray_t** es = ray_data(expr);
+    if (!es[0] || es[0]->type != -RAY_SYM) return false;
+    ray_t* name = ray_sym_str(es[0]->i64);
+    if (!name || ray_str_len(name) != 1) return false;
+    char c = ray_str_ptr(name)[0];
+    return (c == '+' || c == '-' || c == '*') &&
+        temporal_materialize_pure(es[1], tbl) && temporal_materialize_pure(es[2], tbl);
+}
+static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl) {
+    if (!dict_get(dict, "by")) return NULL;
+    ray_t* vals = ray_dict_vals(dict);
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* rewritten = NULL;
+    ray_t* extended = NULL;
+    uint32_t seq = 0;
+    ray_t* replacement = NULL;
+    ray_t* failure = NULL;
+    #define MAT_CHECK(value) do { if (!(value) || RAY_IS_ERR(value)) { failure = (value); (value) = NULL; goto oom; } } while (0)
+    for (int64_t i = 0; i < ray_dict_len(dict); i++) {
+        ray_t* expr = ray_list_get(vals, i);
+        if (!expr || !is_group_dag_agg_expr(expr)) continue;
+        ray_t** es = ray_data(expr);
+        uint16_t kind = resolve_agg_opcode(es[0]->i64);
+        int argc = agg_is_binary_agg(kind) ? 2 : 1;
+        replacement = NULL;
+        for (int arg = 1; arg <= argc; arg++) {
+            if (arg >= expr->len || !expr_contains_temporal_arith(es[arg], tbl) ||
+                !temporal_materialize_pure(es[arg], tbl)) continue;
+            if (ray_env_push_query_scope() != RAY_OK) goto oom;
+            ray_t* previous = bind_all_columns(tbl);
+            ray_t* value = ray_eval(es[arg]);
+            g_active_query_table = previous;
+            ray_env_pop_scope();
+            if (value && !RAY_IS_ERR(value) && ray_is_lazy(value)) value = ray_lazy_materialize(value);
+            if (!value || RAY_IS_ERR(value)) {
+                if (replacement) ray_release(replacement);
+                if (rewritten) ray_release(rewritten);
+                if (extended) ray_release(extended);
+                return value ? value : ray_error("oom", NULL);
+            }
+            if (!ray_is_vec(value) || value->len != ray_table_nrows(tbl)) { ray_release(value); continue; }
+            if (!extended) { extended = tbl; ray_retain(extended); }
+            char name[48]; int64_t sym;
+            do {
+                int len = snprintf(name, sizeof(name), "_temporal_agg_%u", seq++);
+                sym = ray_sym_intern(name, (size_t)len);
+            } while (ray_table_get_col(extended, sym));
+            extended = ray_table_add_col(extended, sym, value); ray_release(value);
+            MAT_CHECK(extended);
+            if (!replacement) {
+                replacement = ray_list_new(expr->len);
+                MAT_CHECK(replacement);
+                for (int64_t j = 0; j < expr->len; j++) {
+                    replacement = ray_list_append(replacement, es[j]); MAT_CHECK(replacement);
+                }
+            }
+            ray_t* ref = ray_sym(sym);
+            MAT_CHECK(ref);
+            replacement = ray_list_set(replacement, arg, ref); ray_release(ref);
+            MAT_CHECK(replacement);
+        }
+        if (replacement) {
+            if (!rewritten) { rewritten = dict; ray_retain(rewritten); }
+            int alloc = 0;
+            ray_t* key = collection_elem(keys, i, &alloc);
+            rewritten = ray_dict_upsert(rewritten, key, replacement);
+            if (alloc) ray_release(key);
+            ray_release(replacement); replacement = NULL;
+            MAT_CHECK(rewritten);
+        }
+    }
+    if (!rewritten) { if (extended) ray_release(extended); return NULL; }
+    ray_t* from = ray_sym(ray_sym_intern("from", 4));
+    rewritten = ray_dict_upsert(rewritten, from, extended);
+    ray_release(from); ray_release(extended); extended = NULL;
+    MAT_CHECK(rewritten);
+    ray_t* result = ray_select(&rewritten, 1);
+    ray_release(rewritten);
+    return result;
+oom:
+    if (replacement) ray_release(replacement);
+    if (rewritten) ray_release(rewritten);
+    if (extended) ray_release(extended);
+    return failure ? failure : ray_error("oom", NULL);
+    #undef MAT_CHECK
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
@@ -5664,6 +6088,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         ray_group_emit_filter_set(prev_emit_filter);
     if (RAY_IS_ERR(tbl)) return tbl;
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
+
+    ray_t* temporal_result = try_temporal_group_materialize(dict, tbl);
+    if (temporal_result) { ray_release(tbl); return temporal_result; }
 
     ray_t* by_expr = dict_get(dict, "by");
     ray_t* take_expr = dict_get(dict, "take");
@@ -5927,6 +6354,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * a SYM vec of the ALIAS names.  parted_bydict_deferred stays false on the
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
+    bool   computed_single_key = false;   /* by: is one expression, compiled or const */
     ray_t* deferred_bydict = NULL;
     int64_t deferred_nk = 0;
     int64_t dep_key_base_sym = -1;
@@ -6808,7 +7236,7 @@ by_dict_done:
 
         /* Copy query into a fresh float[] that the DAG op borrows; freed
          * after ray_execute completes. */
-        nearest_query_owned = (float*)ray_sys_alloc((size_t)dim * sizeof(float));
+        nearest_query_owned = (float*)ray_calloc_raw((size_t)dim * sizeof(float));
         if (!nearest_query_owned) {
             ray_release(qvec);
             ray_graph_free(g); ray_release(tbl);
@@ -6839,12 +7267,12 @@ by_dict_done:
         if (head->i64 == ann_sym_id) {
             ray_t* hobj = ray_eval(nlist[1]);
             if (!hobj || RAY_IS_ERR(hobj)) {
-                ray_sys_free(nearest_query_owned);
+                ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hobj ? hobj : ray_error("domain", "nearest (ann): failed to evaluate HNSW handle");
             }
             if (hobj->type != -RAY_I64 || !(hobj->attrs & RAY_ATTR_HNSW)) {
-                ray_release(hobj); ray_sys_free(nearest_query_owned);
+                ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                     "nearest (ann): first arg must be an HNSW handle (from hnsw-build)");
@@ -6852,13 +7280,13 @@ by_dict_done:
             ray_hnsw_t* idx = (ray_hnsw_t*)(uintptr_t)hobj->i64;
             if (!idx) {
                 /* Defensive: attr set but pointer cleared — treat as invalid. */
-                ray_release(hobj); ray_sys_free(nearest_query_owned);
+                ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                     "nearest (ann): HNSW handle has been freed");
             }
             if (idx->dim != dim) {
-                ray_release(hobj); ray_sys_free(nearest_query_owned);
+                ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length",
                     "nearest (ann): query dim does not match index dim");
@@ -6867,7 +7295,7 @@ by_dict_done:
             if (nlen >= 4) {
                 ray_t* ev = ray_eval(nlist[3]);
                 if (!ev || RAY_IS_ERR(ev)) {
-                    ray_release(hobj); ray_sys_free(nearest_query_owned);
+                    ray_release(hobj); ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ev ? ev : ray_error("domain",
                         "nearest (ann): ef expression failed to evaluate");
@@ -6876,7 +7304,7 @@ by_dict_done:
                 else if (ev->type == -RAY_I32) ef = ev->i32;
                 else {
                     ray_release(ev); ray_release(hobj);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                         "nearest (ann): ef must be an integer atom");
@@ -6892,7 +7320,7 @@ by_dict_done:
         } else if (head->i64 == knn_sym_id) {
             ray_t* col_expr = nlist[1];
             if (col_expr->type != -RAY_SYM) {
-                ray_sys_free(nearest_query_owned);
+                ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
                     "nearest (knn): first arg must be an unquoted column name");
@@ -6907,7 +7335,7 @@ by_dict_done:
                     else if (mid == ray_sym_find("ip", 2))     metric = RAY_HNSW_IP;
                     else if (mid == ray_sym_find("cosine", 6)) metric = RAY_HNSW_COSINE;
                     else {
-                        ray_sys_free(nearest_query_owned);
+                        ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
                             "nearest (knn): metric must be 'cosine, 'l2, or 'ip");
@@ -6916,14 +7344,14 @@ by_dict_done:
             }
             root = ray_knn_rerank(g, root, col_sym, nearest_query_owned, dim, k_req, metric);
         } else {
-            ray_sys_free(nearest_query_owned);
+            ray_free_raw(nearest_query_owned);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
                 "nearest: expected `ann` or `knn` as the first element");
         }
         if (!root) {
             if (nearest_handle_owned) ray_release(nearest_handle_owned);
-            ray_sys_free(nearest_query_owned);
+            ray_free_raw(nearest_query_owned);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
         }
@@ -6941,18 +7369,18 @@ by_dict_done:
             int64_t src_ncols = ray_table_ncols(tbl);
             if (src_ncols > 255) {
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                ray_sys_free(nearest_query_owned);
+                ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("limit",
                     "nearest: implicit projection exceeds 255 source columns — "
                     "specify output columns explicitly");
             }
             if (src_ncols > 0) {
-                ray_op_t** col_ops = (ray_op_t**)ray_sys_alloc(
+                ray_op_t** col_ops = (ray_op_t**)ray_calloc_raw(
                     (size_t)src_ncols * sizeof(ray_op_t*));
                 if (!col_ops) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
@@ -6967,17 +7395,17 @@ by_dict_done:
                     col_ops[nc++] = scan_op;
                 }
                 if (scan_err) {
-                    ray_sys_free(col_ops);
+                    ray_free_raw(col_ops);
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
                 root = ray_select_op(g, root, col_ops, nc);
-                ray_sys_free(col_ops);
+                ray_free_raw(col_ops);
                 if (!root) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    ray_sys_free(nearest_query_owned);
+                    ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
@@ -7044,9 +7472,9 @@ by_dict_done:
             }
         }
 
-        /* Decide routing.  LIST/STR always fall to the eval-level
-         * grouping because the DAG HT path can't pack them into
-         * 8-byte key slots.  GUID is packed via row-indirection in
+        /* LIST keys with plain aggregates use v2 structural indexed grouping.
+         * Eval retains dynamic projections and partitioned LIST shapes.
+         * GUID is packed via row-indirection in
          * the HT layout (wide_key_mask), so it uses the parallel DAG
          * path *except* for queries with non-aggregate expressions
          * (the non-agg scatter still requires 8-byte-packable key
@@ -7057,7 +7485,8 @@ by_dict_done:
             if (key_col) {
                 int8_t kct = key_col->type;
                 if (RAY_IS_PARTED(kct)) kct = (int8_t)RAY_PARTED_BASETYPE(kct);
-                if (kct == RAY_LIST)
+                if (kct == RAY_LIST && (any_nonagg || n_out == 0 ||
+                    RAY_IS_PARTED(key_col->type) || !ray_agg_engine_v2))
                     use_eval_group = 1;
                 else if (kct == RAY_GUID && (any_nonagg || n_out == 0))
                     /* RAY_GUID routes to eval-level ray_group_indices_fn only
@@ -7090,9 +7519,10 @@ by_dict_done:
                 /* STR keys (dict-encoded OR plain) take the parallel DAG path:
                  * dict-STR substitutes int32 codes; plain/computed STR groups
                  * via the wide-key HT (row-indirected key slots).  Both beat the
-                 * O(N*ngroups) eval toy-grouper (33% allocator churn).  Only
-                 * RAY_LIST composite keys still need eval's structural compare. */
-                if (kct == RAY_LIST) {
+                 * O(N*ngroups) eval toy-grouper (33% allocator churn). LIST
+                 * composites with plain aggregates use v2 structural grouping. */
+                if (kct == RAY_LIST && (any_nonagg || n_out == 0 ||
+                    RAY_IS_PARTED(key_col->type) || !ray_agg_engine_v2)) {
                     use_eval_group = 1;
                     break;
                 }
@@ -7709,6 +8139,7 @@ by_dict_done:
                                 ray_release(agg_val);
                             }
                         }
+                        if (!agg_vec && out_groups == 0) agg_vec = empty_agg_column(agg_fn_name, src_col_val);
                         ray_release(src_col_val);
                         agg_names[n_agg_out] = kid;
                         agg_results[n_agg_out] = agg_vec;
@@ -8088,7 +8519,7 @@ by_dict_done:
                     /* Key column first */
                     { ray_t* sc = ray_table_get_col(eval_tbl, by_key_sym);
                       if (sc) {
-                        ray_t* ev = ray_vec_new(sc->type, 0);
+                        ray_t* ev = ray_group_gather(sc, NULL, 0);
                         if (ev && !RAY_IS_ERR(ev)) { empty = ray_table_add_col(empty, by_key_sym, ev); ray_release(ev); }
                       }
                     }
@@ -8181,12 +8612,27 @@ by_dict_done:
                     /* For each group, compute aggregation */
                     ray_t* agg_vec = NULL;
                     ray_t** grp_items = (ray_t**)ray_data(groups);
+                    if (n_groups == 0) {
+                        ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
+                        agg_vec = fn_obj && fn_obj->type == RAY_UNARY
+                            ? empty_unary_group_result((ray_unary_fn)(uintptr_t)fn_obj->i64, src_col_val)
+                            : ray_error("type", "aggregate must be a unary function");
+                        if (!agg_vec || RAY_IS_ERR(agg_vec)) {
+                            ray_release(src_col_val);
+                            for (int ai = 0; ai < n_agg_out; ai++) ray_release(agg_results[ai]);
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                            ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                            return agg_vec ? agg_vec : ray_error("oom", NULL);
+                        }
+                    }
+
 
                     /* Median fast path — flatten `groups` into
                      * (idx_buf, offsets, grp_cnt) then call the parallel
                      * ray_median_per_group_buf kernel.  See twin site
                      * above for the design rationale. */
-                    if (is_med_call(val_expr_item)) {
+                    if (n_groups > 0 && is_med_call(val_expr_item)) {
                         ray_t* ix_hdr = NULL;
                         ray_t* off_hdr = NULL;
                         ray_t* cnt_hdr = NULL;
@@ -8251,6 +8697,7 @@ by_dict_done:
                         store_typed_elem(agg_vec, gi, agg_val);
                         ray_release(agg_val);
                     }
+                    if (!agg_vec && n_groups == 0) agg_vec = empty_agg_column(agg_fn_name, src_col_val);
                     ray_release(src_col_val);
                     agg_names[n_agg_out] = kid;
                     agg_results[n_agg_out] = agg_vec;
@@ -8386,6 +8833,10 @@ by_dict_done:
                         size_t slen = ray_str_len(k);
                         key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
                     }
+                } else if (ktype == RAY_LIST) {
+                    key_vec = ray_list_new(n_groups);
+                    for (int64_t gi = 0; gi < n_groups && key_vec && !RAY_IS_ERR(key_vec); gi++)
+                        key_vec = ray_list_append(key_vec, grp_items[gi * 2]);
                 } else {
                     uint8_t kattrs = key_col_src ? key_col_src->attrs : 0;
                     if (ktype == RAY_SYM)
@@ -8774,8 +9225,19 @@ by_dict_done:
                 n_keys++;
             }
         } else {
-            /* Single key expression */
-            key_ops[0] = compile_expr_dag(g, by_expr);
+            /* Single key expression.  Over a lone SYM column evaluate it per
+             * distinct symbol and feed the spread key as a constant node,
+             * named the way the eval-level path names a computed key. */
+            ray_t* dom_key = derived_key_over_sym_domain(by_expr, tbl);
+            if (dom_key) {
+                key_ops[0] = ray_const_vec(g, dom_key);
+                ray_release(dom_key);
+            } else {
+                key_ops[0] = compile_expr_dag(g, by_expr);
+            }
+            /* Only a real expression is renamed: a bare column symbol lands
+             * here too and keeps its own name. */
+            computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
             if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
@@ -9051,9 +9513,7 @@ by_dict_done:
                     if (key_sym >= 0) {
                         ray_t* sc = ray_table_get_col(filtered_tbl, key_sym);
                         if (sc) {
-                            empty_key_vec = (sc->type == RAY_STR)
-                                            ? ray_vec_new(RAY_STR, 0)
-                                            : ray_vec_new(sc->type, 0);
+                            empty_key_vec = ray_group_gather(sc, NULL, 0);
                         }
                     } else {
                         /* Match the computed-key fallback's naming
@@ -9144,7 +9604,8 @@ by_dict_done:
                     ray_t* cv = ray_table_get_col_idx(filtered_tbl, c);
                     ray_env_set_query_local(cn, cv);
                 }
-                ray_t* computed_key = ray_eval(by_expr);
+                ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl);
+                if (!computed_key) computed_key = ray_eval(by_expr);
                 ray_env_pop_scope();
                 if (!computed_key || RAY_IS_ERR(computed_key)) {
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
@@ -9756,7 +10217,7 @@ by_dict_done:
                         fres = ray_lazy_materialize(fres);
                     if (!fres || RAY_IS_ERR(fres)) {
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: `where:` filter produced no result");
@@ -9766,7 +10227,7 @@ by_dict_done:
                     g = ray_graph_new(tbl);
                     if (!g) {
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
@@ -9775,7 +10236,7 @@ by_dict_done:
                 ray_t* result = ray_table_new(0);
                 if (!result || RAY_IS_ERR(result)) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                    if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                    if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(colops_hdr);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result ? result : ray_error("oom", NULL);
@@ -9797,7 +10258,7 @@ by_dict_done:
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return err;
@@ -9812,7 +10273,7 @@ by_dict_done:
                         ray_release(col);
                         ray_release(result);
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length", "select: output column length %lld does not match %lld", (long long)col_len, (long long)out_len);
@@ -9821,14 +10282,14 @@ by_dict_done:
                     ray_release(col);
                     if (RAY_IS_ERR(result)) {
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                     }
                 }
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
-                if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 result = apply_sort_take(result, dict_elems, dict_n,
                                          asc_id, desc_id, take_id, NULL);
@@ -9985,6 +10446,20 @@ by_dict_done:
     /* Optimize and execute */
     root = ray_optimize(g, root);
     ray_t* result = ray_execute(g, root);
+    /* A computed key takes its column name from its op's ext sym, which is
+     * not a name (a const node's slot holds the literal; an expression node's
+     * ext resolves to whatever shares its id) — name it the way the
+     * eval-level path names a computed key, whichever key path ran. */
+    if (computed_single_key && result && !RAY_IS_ERR(result) && ray_is_lazy(result))
+        result = ray_lazy_materialize(result);
+    if (computed_single_key && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
+        ray_table_ncols(result) > 0) {
+        int64_t kname = derived_key_name(by_expr);
+        int64_t rc = ray_table_ncols(result);
+        for (int64_t c = 1; c < rc; c++)
+            if (ray_table_col_name(result, c) == kname) { kname = ray_sym_intern("key", 3); break; }
+        ray_table_set_col_name(result, 0, kname);
+    }
     if (self_emit_set)
         ray_group_emit_filter_set(prev_self_emit);
     if (post_group_where_expr && result && !RAY_IS_ERR(result))
@@ -9993,7 +10468,7 @@ by_dict_done:
     ray_graph_free(g);
     /* The nearest-query buffer was only referenced by ext->rerank.query_vec
      * and is safe to free once the graph (and thus the op ext) is gone. */
-    if (nearest_query_owned) ray_sys_free(nearest_query_owned);
+    if (nearest_query_owned) ray_free_raw(nearest_query_owned);
     /* The HNSW handle was kept alive through ray_execute so the rerank
      * ext's idx pointer stayed valid.  Safe to release now that the
      * graph (and its ext nodes) has been freed. */
@@ -10141,6 +10616,16 @@ by_dict_done:
                  * Non-agg/fallback columns are named at scatter time. */
                 for (int64_t j = 0; j < n_aggs_real && n_key_cols + j < ncols; j++)
                     ray_table_set_col_name(result, n_key_cols + j, agg_names[j]);
+                /* The computed key's derived name yields to an output alias
+                 * that spells the same. */
+                if (computed_single_key && ncols > 1) {
+                    int64_t kname = ray_table_col_name(result, 0);
+                    for (int64_t c = 1; c < ncols; c++)
+                        if (ray_table_col_name(result, c) == kname) {
+                            ray_table_set_col_name(result, 0, ray_sym_intern("key", 3));
+                            break;
+                        }
+                }
             } else {
                 /* Projection-only: columns are in dict order.  Rename each
                  * output column directly — a projection may have any number
@@ -10756,6 +11241,14 @@ by_dict_done:
                                             cd_inner->type == -RAY_SYM &&
                                             !(cd_inner->attrs & ATTR_QUOTED) &&
                                             n_groups > 50000);
+                    if (simple_cd_global) {
+                        ray_t* source = ray_table_get_col(tbl, cd_inner->i64);
+                        int8_t type = source ? source->type : 0;
+                        simple_cd_global = type == RAY_BOOL || type == RAY_U8 ||
+                            type == RAY_I16 || type == RAY_I32 || type == RAY_I64 ||
+                            type == RAY_F32 || type == RAY_F64 || type == RAY_DATE ||
+                            type == RAY_TIME || type == RAY_TIMESTAMP || type == RAY_SYM;
+                    }
                     if (!simple_cd_global) needs_slice_idx = 1;
                 }
 
@@ -11105,11 +11598,13 @@ by_dict_done:
                 }
                 #undef RELEASE_SCAN_KEY
             } else {
-                /* Empty group set: add empty LIST columns so the
-                 * output schema still includes the user-declared
-                 * non-agg columns. */
+                /* Empty grouped aggregates retain their result type;
+                 * ordinary row expressions produce per-group LIST cells. */
                 for (int64_t ni = 0; ni < n_nonaggs; ni++) {
-                    ray_t* empty_list = ray_list_new(0);
+                    ray_t* expr = nonagg_exprs[ni];
+                    ray_t* empty_list = match_count_distinct(expr) ? ray_vec_new(RAY_I64, 0)
+                        : is_streaming_aggr_unary_call(expr) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
+                        : can_atom_broadcast(expr) ? atom_broadcast_vec(expr, 0) : ray_list_new(0);
                     if (!empty_list || RAY_IS_ERR(empty_list)) {
                         ray_release(result); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty_list ? empty_list : ray_error("oom", NULL);
@@ -14751,7 +15246,7 @@ static int64_t upsert_atom_int(ray_t* a) {
     return a->type == -RAY_BOOL ? (int64_t)a->b8 : elem_as_i64(a);
 }
 
-static uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
+static inline __attribute__((always_inline)) uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
     switch (col->type) {
     case RAY_F64: return ray_hash_f64(((const double*)ray_data(col))[r]);
     case RAY_SYM: return ray_hash_i64(ray_read_sym(ray_data(col), r, col->type, col->attrs));
@@ -14842,6 +15337,20 @@ typedef struct {
 #define UKEY_SLOT_EMPTY ((int64_t)0)
 #define UKEY_SLOT_TOMB  ((int64_t)-1)
 
+/* An occupied slot carries the key's hash beside the row: the low 32 bits of
+ * the hash in the high half, row + 1 in the low half.  The hash makes two
+ * things cheap that used to read the table: a probe rejects a colliding slot
+ * without touching its key cells, and growing the map re-places every entry
+ * from the slots themselves (ukey_grow) instead of re-hashing every row.
+ * Both markers stay reserved: row + 1 is never 0 and never all-ones. */
+#define UKEY_PACK(h, row) ((int64_t)(((uint64_t)(uint32_t)(h) << 32) | (uint64_t)((row) + 1)))
+#define UKEY_ROW(e)       ((int64_t)((uint64_t)(e) & 0xFFFFFFFFULL) - 1)
+#define UKEY_H32(e)       ((uint32_t)((uint64_t)(e) >> 32))
+/* Rows must fit the low half (the two markers take the ends), and the slot
+ * index must come from the stored 32 bits, so the table stops at 2^32 slots. */
+#define UKEY_MAX_ROWS     ((int64_t)0xFFFFFFFDLL)
+#define UKEY_MAX_CAP      ((uint64_t)1 << 32)
+
 static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
     uint64_t cap = 16;
     while (cap < (uint64_t)entries * 2) cap <<= 1;
@@ -14858,7 +15367,7 @@ static bool upsert_map_init(upsert_map_t* mp, int64_t entries) {
 static void upsert_map_put(upsert_map_t* mp, uint64_t h, int64_t row) {
     uint64_t s = h & mp->mask;
     while (mp->slot[s] != UKEY_SLOT_EMPTY) s = (s + 1) & mp->mask;
-    mp->slot[s] = row + 1;
+    mp->slot[s] = UKEY_PACK(h, row);
 }
 
 /* Rows nrows0..n-1 were just appended in row order.  Entering them costs
@@ -14891,14 +15400,64 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
  * `m` more rows at the load factor it was sized for?  A row count that moved
  * without the map means something else wrote the table; a different key
  * means a different upsert. */
-static bool ukey_fits(ray_index_t* ix, const int64_t* kci, int64_t nk,
-                      int64_t nrows0, int64_t m) {
+static bool ukey_describes(ray_index_t* ix, const int64_t* kci, int64_t nk,
+                           int64_t nrows0) {
     if (ix->u.ukey.nrows != nrows0 || ix->u.ukey.nk != nk) return false;
     for (int64_t k = 0; k < nk; k++)
         if (ix->u.ukey.kci[k] != (int16_t)kci[k]) return false;
-    /* Tombstones hold slots without being rows, so the load test counts them
-     * alongside the live entries. */
+    return true;
+}
+
+/* Tombstones hold slots without being rows, so the load test counts them
+ * alongside the live entries. */
+static bool ukey_has_room(ray_index_t* ix, int64_t nrows0, int64_t m) {
     return (uint64_t)(nrows0 + m + ix->u.ukey.n_tomb) * 2 <= ix->u.ukey.mask + 1;
+}
+
+/* Grow a map that still describes the table but has run out of room, the way
+ * sym.c's ht_grow_to grows the intern table: every slot already carries its
+ * key's hash, so the bigger table is filled from the old slots — no key column
+ * is read and no key is hashed again.  Tombstones vanish on the way, which is
+ * what makes this worth doing after a delete too.  On failure the caller keeps
+ * the old map and falls back to dropping it. */
+static bool ukey_grow(ray_index_t* ix, int64_t entries) {
+    uint64_t old_cap = ix->u.ukey.mask + 1;
+    uint64_t cap = 16;
+    while (cap < (uint64_t)entries * 2) {
+        if (cap >= UKEY_MAX_CAP) return false;
+        cap <<= 1;
+    }
+    if (cap < old_cap) cap = old_cap;
+    if (cap > UKEY_MAX_CAP) return false;
+    ray_t* fresh = ray_vec_new(RAY_I64, (int64_t)cap);
+    if (!fresh || RAY_IS_ERR(fresh)) { if (fresh) ray_release(fresh); return false; }
+    fresh->len = (int64_t)cap;
+    int64_t* dst = (int64_t*)ray_data(fresh);
+    memset(dst, 0, (size_t)cap * sizeof(int64_t));
+    const int64_t* src = (const int64_t*)ray_data(ix->u.ukey.slots);
+    uint64_t mask = cap - 1;
+    /* Start at an empty slot and walk the old table cyclically, rather than
+     * from slot 0: entries that share a probe chain must be re-placed in the
+     * order they sit in it, or two rows carrying the same key swap places
+     * whenever their chain wraps past the end of the array — and the next
+     * keyed upsert then updates the later row instead of the lowest one.  A
+     * chain never contains an empty slot, so starting at one enters every
+     * chain at its beginning; the load factor of at most a half guarantees
+     * such a slot exists. */
+    uint64_t start = 0;
+    while (start < old_cap && src[start] != UKEY_SLOT_EMPTY) start++;
+    for (uint64_t i = 0; i < old_cap; i++) {
+        int64_t e = src[(start + i) & (old_cap - 1)];
+        if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
+        uint64_t t = (uint64_t)UKEY_H32(e) & mask;
+        while (dst[t] != UKEY_SLOT_EMPTY) t = (t + 1) & mask;
+        dst[t] = e;
+    }
+    ray_release(ix->u.ukey.slots);
+    ix->u.ukey.slots  = fresh;
+    ix->u.ukey.mask   = mask;
+    ix->u.ukey.n_tomb = 0;
+    return true;
 }
 
 static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
@@ -14907,8 +15466,8 @@ static int64_t upsert_map_find(upsert_map_t* mp, uint64_t h, ray_t** slots,
     for (;;) {
         int64_t e = mp->slot[s];
         if (e == UKEY_SLOT_EMPTY) return -1;
-        if (e != UKEY_SLOT_TOMB &&
-            upsert_row_eq_atoms(slots, kci, nk, e - 1, cells)) return e - 1;
+        if (e != UKEY_SLOT_TOMB && UKEY_H32(e) == (uint32_t)h &&
+            upsert_row_eq_atoms(slots, kci, nk, UKEY_ROW(e), cells)) return UKEY_ROW(e);
         s = (s + 1) & mp->mask;
     }
 }
@@ -15046,6 +15605,302 @@ static void upsert_rollback_appends(ray_t** slots, int64_t ncols, int64_t nrows0
     }
 }
 
+/* Can a multi-row payload be written column by column, without boxing a
+ * cell?  Every target column needs a payload vector of its exact type and
+ * width class: no coercion, no partial payload, no boxed or STR column,
+ * and SYM ids already in the runtime domain the target stores. */
+static bool upsert_vec_payload_ok(ray_t* tbl, ray_t** src_cols, int64_t ncols, int64_t m) {
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* sc = src_cols[c];
+        ray_t* tc = ray_table_get_col_idx(tbl, c);
+        if (!sc || RAY_IS_ERR(sc) || sc->type != tc->type) return false;
+        if (sc->attrs & RAY_ATTR_SLICE) return false;
+        if (sc->len != m) return false;
+        switch (tc->type) {
+        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_GUID:
+            break;
+        case RAY_SYM:
+            if (ray_sym_vec_domain(sc) != ray_sym_runtime_domain()) return false;
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Cell-vs-cell equality for two columns of one type, with the semantics of
+ * upsert_cell_eq_atom: F64 by value, SYM by runtime id, integers widened. */
+static inline __attribute__((always_inline)) bool
+upsert_cell_eq_cell(ray_t* a, int64_t ra, ray_t* b, int64_t rb) {
+    switch (a->type) {
+    case RAY_F64:
+        return ((const double*)ray_data(a))[ra] == ((const double*)ray_data(b))[rb];
+    case RAY_SYM:
+        return ray_read_sym(ray_data(a), ra, RAY_SYM, a->attrs) ==
+               ray_read_sym(ray_data(b), rb, RAY_SYM, b->attrs);
+    case RAY_GUID:
+        return memcmp((const uint8_t*)ray_data(a) + ra * 16,
+                      (const uint8_t*)ray_data(b) + rb * 16, 16) == 0;
+    default:
+        return upsert_int_cell(a, ra) == upsert_int_cell(b, rb);
+    }
+}
+
+/* Map probe for payload row `r`.  An entry past nrows0 names a row this
+ * batch appends but has not written yet, so its key is read from the
+ * payload row that will land there (app[row - nrows0]). */
+/* Per-row probe on the column-wise path.  Forced inline, with the hash and the
+ * cell compare below it: once the resolve loop exists in two instances GCC's
+ * inline budget leaves these as calls, and a call per row cost 10-20% on
+ * tables that fit in cache. */
+static inline __attribute__((always_inline)) int64_t
+upsert_map_find_src(upsert_map_t* mp, uint64_t h, ray_t** slots,
+                    const int64_t* kci, int64_t nk, ray_t** src,
+                    int64_t r, int64_t nrows0, const int64_t* app) {
+    uint64_t s = h & mp->mask;
+    for (;;) {
+        int64_t e = mp->slot[s];
+        if (e == UKEY_SLOT_EMPTY) return -1;
+        if (e != UKEY_SLOT_TOMB && UKEY_H32(e) == (uint32_t)h) {
+            int64_t row = UKEY_ROW(e);
+            bool eq = true;
+            for (int64_t k = 0; k < nk && eq; k++) {
+                ray_t* sc = src[kci[k]];
+                eq = row < nrows0
+                    ? upsert_cell_eq_cell(slots[kci[k]], row, sc, r)
+                    : upsert_cell_eq_cell(sc, app[row - nrows0], sc, r);
+            }
+            if (eq) return row;
+        }
+        s = (s + 1) & mp->mask;
+    }
+}
+
+/* Move `n` elements of `src` into `dst`: dst[di(i)] = src[si(i)], where a
+ * NULL index array means the identity.  Null state travels in-band as the
+ * sentinel; the HAS_NULLS gate is raised when a written value is null. */
+/* Past this much memory a keyed upsert's probes and scattered writes miss the
+ * per-core cache, and loading them ahead pays; below it the extra pass and
+ * the prefetches are pure overhead.  Measured with a 512 KiB L2: a 640 KiB
+ * probe set was 3-8% slower with them, an 890 KiB one 19% faster. */
+#define UPSERT_PF_MIN_BYTES ((size_t)768 << 10)
+
+static inline __attribute__((always_inline)) void
+upsert_vec_move_impl(ray_t* dst, const int64_t* di, int64_t dbase,
+                     ray_t* src, const int64_t* si, int64_t n, bool pf) {
+    void* d = ray_data(dst);
+    const void* s = ray_data(src);
+    #define UPSERT_MOVE(T) do {                                              \
+        for (int64_t i = 0; i < n; i++) {                                    \
+            if (pf && i + 16 < n && di[i + 16] >= 0)                         \
+                __builtin_prefetch(&((T*)d)[di[i + 16]], 1);                 \
+            int64_t o = di ? di[i] : dbase + i;                              \
+            if (o < 0) continue;                                             \
+            ((T*)d)[o] = ((const T*)s)[si ? si[i] : i];                      \
+        } } while (0)
+    switch (dst->type) {
+    case RAY_BOOL: case RAY_U8:  UPSERT_MOVE(uint8_t); break;
+    case RAY_I16:                UPSERT_MOVE(int16_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: UPSERT_MOVE(int32_t); break;
+    case RAY_I64: case RAY_TIMESTAMP: UPSERT_MOVE(int64_t); break;
+    case RAY_F64:                UPSERT_MOVE(double); break;
+    case RAY_GUID:
+        for (int64_t i = 0; i < n; i++) {
+            int64_t o = di ? di[i] : dbase + i;
+            if (o < 0) continue;
+            memcpy((uint8_t*)d + o * 16, (const uint8_t*)s + (si ? si[i] : i) * 16, 16);
+        }
+        break;
+    case RAY_SYM: {
+        bool any_null = false;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t o = di ? di[i] : dbase + i;
+            if (o < 0) continue;
+            int64_t id = ray_read_sym(s, si ? si[i] : i, RAY_SYM, src->attrs);
+            ((int64_t*)d)[o] = id;
+            any_null |= (id == 0);
+        }
+        if (any_null) dst->attrs |= RAY_ATTR_HAS_NULLS;
+        return;
+    }
+    default: return;
+    }
+    #undef UPSERT_MOVE
+    if (!ray_vec_may_have_nulls(src)) return;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t o = di ? di[i] : dbase + i;
+        if (o >= 0 && ray_vec_is_null(src, si ? si[i] : i)) {
+            dst->attrs |= RAY_ATTR_HAS_NULLS;
+            return;
+        }
+    }
+}
+
+/* Each look-ahead loop exists twice, with its flag a compile-time constant,
+ * and the choice is made once per batch or column.  A runtime flag tested
+ * inside the loops cost 15-30% on tables that fit in cache, more than the
+ * prefetching itself: the plain instances must compile to the loops that
+ * never had it. */
+static void upsert_vec_move(ray_t* dst, const int64_t* di, int64_t dbase,
+                            ray_t* src, const int64_t* si, int64_t n) {
+    upsert_vec_move_impl(dst, di, dbase, src, si, n, false);
+}
+
+static void upsert_vec_scatter_ahead(ray_t* dst, const int64_t* di, ray_t* src, int64_t n) {
+    upsert_vec_move_impl(dst, di, 0, src, NULL, n, true);
+}
+
+/* Resolve every payload row to its target row, in payload order: dst[r] is
+ * the matched row or -1 for a row this batch appends, app[] lists the payload
+ * rows to append.  A new key enters the map at the row it will take, so a
+ * repeat inside the batch finds it.
+ *
+ * On a table larger than the cache nearly all of a probe's time is two
+ * misses — the slot, then the key cells of the row it names — and taken one
+ * row at a time they never overlap.  The look-ahead instance hashes the batch
+ * first (dst[r] holds row r's hash until this pass overwrites it) and loads
+ * both a few rows ahead.  The separate hash pass pays on such a table even for
+ * a batch shorter than the lookahead, where no prefetch fires. */
+static inline __attribute__((always_inline)) void
+upsert_resolve_impl(upsert_map_t* map, ray_t** slots, const int64_t* kci, int64_t nk,
+                    ray_t** src, int64_t m, int64_t nrows0, int64_t* dst, int64_t* app,
+                    int64_t* napp_out, int64_t* nhit_out, bool ahead) {
+    enum { PF_SLOT = 16, PF_ROW = 8 };
+    const char* kbase[RAY_UKEY_MAX_COLS];
+    size_t kesz[RAY_UKEY_MAX_COLS];
+    int64_t npf = 0;
+    if (ahead) {
+        npf = nk < RAY_UKEY_MAX_COLS ? nk : RAY_UKEY_MAX_COLS;
+        for (int64_t k = 0; k < npf; k++) {
+            ray_t* kc = slots[kci[k]];
+            kbase[k] = (const char*)ray_data(kc);
+            kesz[k] = ray_sym_elem_size(kc->type, kc->attrs);
+        }
+        for (int64_t r = 0; r < m; r++) {
+            uint64_t h = UPSERT_HASH_SEED;
+            for (int64_t k = 0; k < nk; k++)
+                h = ray_hash_combine(h, upsert_hash_cell(src[kci[k]], r));
+            dst[r] = (int64_t)h;
+        }
+    }
+
+    int64_t napp = 0, nhit = 0;
+    for (int64_t r = 0; r < m; r++) {
+        uint64_t h;
+        if (ahead) {
+            if (r + PF_SLOT < m)
+                __builtin_prefetch(&map->slot[(uint64_t)dst[r + PF_SLOT] & map->mask]);
+            if (r + PF_ROW < m) {
+                int64_t e = map->slot[(uint64_t)dst[r + PF_ROW] & map->mask];
+                if (e != UKEY_SLOT_EMPTY && e != UKEY_SLOT_TOMB &&
+                    UKEY_ROW(e) < nrows0)
+                    for (int64_t k = 0; k < npf; k++)
+                        __builtin_prefetch(kbase[k] + (size_t)UKEY_ROW(e) * kesz[k]);
+            }
+            h = (uint64_t)dst[r];
+        } else {
+            h = UPSERT_HASH_SEED;
+            for (int64_t k = 0; k < nk; k++)
+                h = ray_hash_combine(h, upsert_hash_cell(src[kci[k]], r));
+        }
+        int64_t hit = upsert_map_find_src(map, h, slots, kci, nk, src, r, nrows0, app);
+        if (hit < 0) {
+            upsert_map_put(map, h, nrows0 + napp);
+            app[napp++] = r;
+            dst[r] = -1;                    /* written by the append */
+        } else {
+            dst[r] = hit;
+            nhit++;
+        }
+    }
+    *napp_out = napp;
+    *nhit_out = nhit;
+}
+
+/* Only the look-ahead instance is out of line; the plain one is expanded in
+ * upsert_apply_vectors itself, where the loop lived before the look-ahead
+ * existed — out of line it measured 4-9% slower on tables that fit in cache.
+ * The look-ahead one must stay out of line: expanded into its only caller it
+ * measured 12-26% slower on inserts into large tables. */
+__attribute__((noinline))
+static void upsert_resolve_ahead(upsert_map_t* map, ray_t** slots, const int64_t* kci, int64_t nk,
+                                 ray_t** src, int64_t m, int64_t nrows0, int64_t* dst, int64_t* app,
+                                 int64_t* napp, int64_t* nhit) {
+    upsert_resolve_impl(map, slots, kci, nk, src, m, nrows0, dst, app, napp, nhit, true);
+}
+
+/* Column-wise body of upsert_apply for a payload upsert_vec_payload_ok
+ * admitted.  Rows resolve in payload order exactly as the per-row loop
+ * does — a new key enters the map at the row it will take, so a repeat
+ * inside the batch finds it — then each column is written once: the new
+ * rows appended in one go, and every matched cell scattered in payload
+ * order, so a key repeated in the batch still ends at its last value.
+ * Appends come first because a repeat may target a row just appended. */
+static ray_t* upsert_apply_vectors(ray_t** slots, int64_t ncols,
+                                   const int64_t* kci, int64_t nk,
+                                   ray_t** src, int64_t m, int64_t nrows0,
+                                   upsert_map_t* map, int64_t* nrows) {
+    ray_t* dst_hdr = NULL; ray_t* app_hdr = NULL; ray_t* buf_hdr = NULL;
+    int64_t* dst = (int64_t*)scratch_alloc(&dst_hdr, (size_t)m * sizeof(int64_t));
+    int64_t* app = dst ? (int64_t*)scratch_alloc(&app_hdr, (size_t)m * sizeof(int64_t)) : NULL;
+    ray_t* err = NULL;
+    if (!dst || !app) { err = ray_error("oom", NULL); goto out; }
+
+    /* The probed memory is the slots plus the key columns; past the per-core
+     * cache the look-ahead instance pays, below it only costs. */
+    size_t probe_bytes = (size_t)(map->mask + 1) * sizeof(int64_t);
+    for (int64_t k = 0; k < nk && k < RAY_UKEY_MAX_COLS; k++) {
+        ray_t* kc = slots[kci[k]];
+        probe_bytes += (size_t)nrows0 * ray_sym_elem_size(kc->type, kc->attrs);
+    }
+    int64_t napp = 0, nhit = 0;
+    if (probe_bytes >= UPSERT_PF_MIN_BYTES)
+        upsert_resolve_ahead(map, slots, kci, nk, src, m, nrows0, dst, app, &napp, &nhit);
+    else
+        upsert_resolve_impl(map, slots, kci, nk, src, m, nrows0, dst, app, &napp, &nhit, false);
+
+    if (napp > 0) {
+        void* buf = scratch_alloc(&buf_hdr, (size_t)napp * 16);
+        if (!buf) { err = ray_error("oom", NULL); goto out; }
+        memset(buf, 0, (size_t)napp * 16);
+        for (int64_t c = 0; c < ncols; c++) {
+            /* Grow the column by napp zeroed cells in one step (and drop
+             * its index), then gather the new rows straight into the tail. */
+            int64_t tail = slots[c]->len;
+            ray_t* res = ray_vec_append_raw(slots[c], buf, napp);
+            if (RAY_IS_ERR(res)) { err = res; goto out; }
+            slots[c] = res;
+            upsert_vec_move(res, NULL, tail, src[c], app, napp);
+        }
+    }
+
+    if (nhit > 0) {
+        for (int64_t c = 0; c < ncols; c++) {
+            bool is_key = false;
+            for (int64_t k = 0; k < nk; k++) if (kci[k] == c) { is_key = true; break; }
+            if (is_key) continue;           /* matched: already equal */
+            ray_index_drop(&slots[c]);
+            if (RAY_IS_ERR(slots[c])) { err = slots[c]; goto out; }
+            slots[c]->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+            ray_t* col = slots[c];
+            if ((size_t)col->len * ray_sym_elem_size(col->type, col->attrs) >= UPSERT_PF_MIN_BYTES)
+                upsert_vec_scatter_ahead(col, dst, src[c], m);
+            else
+                upsert_vec_move(col, dst, 0, src[c], NULL, m);
+        }
+    }
+    *nrows = nrows0 + napp;
+
+out:
+    if (buf_hdr) scratch_free(buf_hdr);
+    if (app_hdr) scratch_free(app_hdr);
+    if (dst_hdr) scratch_free(dst_hdr);
+    return err;
+}
+
 /* One-pass upsert.  `kci[nk]` are the key column positions.  The
  * payload is either `src_cols` (ncols collections-or-NULL, each `m`
  * rows) or, when src_cols is NULL, `atoms` (ncols atoms-or-NULL, m==1).
@@ -15082,10 +15937,14 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     for (int64_t c = 0; inplace && c < ncols; c++)
         if (((ray_t**)ray_data(live_cols))[c]->rc != 1) inplace = false;
 
+    /* A batch of typed vectors matching the target is written column by
+     * column; everything else is boxed into cells below. */
+    bool vec_path = src_cols && m > 1 && upsert_vec_payload_ok(tbl, src_cols, ncols, m);
+
     /* Materialize the payload cells once: cells[r*ncols + c], with a
      * parallel ownership byte for atoms allocated out of typed vectors. */
     ray_t* cells_hdr = NULL; ray_t* owned_hdr = NULL;
-    size_t ncell = (size_t)m * (size_t)ncols;
+    size_t ncell = vec_path ? 1 : (size_t)m * (size_t)ncols;
     ray_t** cells = (ray_t**)scratch_alloc(&cells_hdr, ncell * sizeof(ray_t*));
     uint8_t* owned = cells ? (uint8_t*)scratch_alloc(&owned_hdr, ncell) : NULL;
     if (!cells || !owned) {
@@ -15102,7 +15961,9 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     ray_index_t* ukey = NULL;   /* table-resident map, borrowed from tbl */
     ray_t* work = NULL;
 
-    if (src_cols) {
+    if (vec_path) {
+        /* typed payload vectors are read in place */
+    } else if (src_cols) {
         for (int64_t c = 0; c < ncols && !err; c++) {
             ray_t* sc = src_cols[c];
             if (!sc) continue;
@@ -15128,8 +15989,9 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         for (int64_t c = 0; c < ncols; c++) cells[c] = atoms[c];
     }
 
-    /* Type-check every cell before writing anything. */
-    for (int64_t r = 0; r < m && !err; r++) {
+    /* Type-check every cell before writing anything.  An admitted vector
+     * payload was checked once per column by upsert_vec_payload_ok. */
+    for (int64_t r = 0; r < m && !err && !vec_path; r++) {
         ray_t** rc = cells + (size_t)r * ncols;
         for (int64_t k = 0; k < nk && !err; k++) {
             ray_t* kc = ray_table_get_col_idx(tbl, kci[k]);
@@ -15195,24 +16057,36 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         if (inplace && nk > RAY_UKEY_MAX_COLS) ray_table_ukey_drop(tbl);
         if (inplace && nk <= RAY_UKEY_MAX_COLS) {
             ukey = ray_table_ukey_get(tbl);
-            if (ukey && !ukey_fits(ukey, kci, nk, nrows0, m)) {
+            /* A map that no longer describes the table is stale and must go.
+             * One that only ran out of room is grown from its own slots — the
+             * rebuild it replaces re-reads and re-hashes every key column. */
+            if (ukey && (!ukey_describes(ukey, kci, nk, nrows0) ||
+                         (!ukey_has_room(ukey, nrows0, m) &&
+                          !ukey_grow(ukey, nrows0 + m)))) {
                 ray_table_ukey_drop(tbl);
                 ukey = NULL;
             }
+            /* Split on `ukey` first.  Folding the row-count test into the
+             * same condition sent the `ukey == NULL && too many rows` case
+             * into the else, which dereferences the map that is not there.
+             * Declining the map for size must fall through to the scratch
+             * one below, exactly as a failed build does. */
             if (!ukey) {
-                ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
-                if (idx && !RAY_IS_ERR(idx)) {
-                    if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
-                    else ray_release(idx);
-                }
-                /* A map we could not build or attach is not an error: fall
-                 * through to the scratch one and answer at the old cost. */
-                if (ukey) {
-                    map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
-                    map.mask = ukey->u.ukey.mask;
-                    for (int64_t r = 0; r < nrows0 && !err; r++)
-                        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
-                    ukey->u.ukey.nrows = nrows0;
+                if (nrows0 + m <= UKEY_MAX_ROWS) {
+                    ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
+                    if (idx && !RAY_IS_ERR(idx)) {
+                        if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
+                        else ray_release(idx);
+                    }
+                    /* A map we could not build or attach is not an error: fall
+                     * through to the scratch one and answer at the old cost. */
+                    if (ukey) {
+                        map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                        map.mask = ukey->u.ukey.mask;
+                        for (int64_t r = 0; r < nrows0 && !err; r++)
+                            upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+                        ukey->u.ukey.nrows = nrows0;
+                    }
                 }
             } else {
                 map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
@@ -15230,7 +16104,9 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     }
 
     int64_t nrows = nrows0;
-    for (int64_t r = 0; r < m && !err; r++) {
+    if (vec_path && !err)
+        err = upsert_apply_vectors(slots, ncols, kci, nk, src_cols, m, nrows0, &map, &nrows);
+    for (int64_t r = 0; r < m && !err && !vec_path; r++) {
         ray_t** rc = cells + (size_t)r * ncols;
         uint64_t h = 0;
         int64_t hit;
@@ -18216,9 +19092,9 @@ static void ukey_patch_after_delete(ray_t* tbl, const int64_t* rows, int64_t k,
     for (uint64_t s = 0; s < cap; s++) {
         int64_t e = slot[s];
         if (e == UKEY_SLOT_EMPTY || e == UKEY_SLOT_TOMB) continue;
-        int64_t nr = newrow[e - 1];
+        int64_t nr = newrow[UKEY_ROW(e)];
         if (nr < 0) { slot[s] = UKEY_SLOT_TOMB; tomb++; }
-        else slot[s] = nr + 1;
+        else slot[s] = UKEY_PACK(UKEY_H32(e), nr);
     }
     scratch_free(nr_hdr);
     ix->u.ukey.n_tomb += tomb;

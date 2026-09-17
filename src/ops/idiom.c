@@ -24,7 +24,6 @@
 #include "vec/vec.h"
 #include "idiom.h"
 #include "opt.h"
-#include "mem/sys.h"
 #include "mem/heap.h"
 #include <string.h>
 
@@ -260,20 +259,20 @@ ray_op_t* ray_idiom_pass(ray_graph_t* g, ray_op_t* root) {
 
     uint32_t cap = nc * 2;
     uint32_t stk1_local[256], stk2_local[256];
-    uint32_t* stk1 = cap <= 256 ? stk1_local : (uint32_t*)ray_sys_alloc(cap * sizeof(uint32_t));
-    uint32_t* stk2 = cap <= 256 ? stk2_local : (uint32_t*)ray_sys_alloc(cap * sizeof(uint32_t));
+    uint32_t* stk1 = cap <= 256 ? stk1_local : (uint32_t*)ray_alloc_raw(cap * sizeof(uint32_t));
+    uint32_t* stk2 = cap <= 256 ? stk2_local : (uint32_t*)ray_alloc_raw(cap * sizeof(uint32_t));
     if (!stk1 || !stk2) {
-        if (stk1 && stk1 != stk1_local) ray_sys_free(stk1);
-        if (stk2 && stk2 != stk2_local) ray_sys_free(stk2);
+        if (stk1 && stk1 != stk1_local) ray_free_raw(stk1);
+        if (stk2 && stk2 != stk2_local) ray_free_raw(stk2);
         return root;
     }
 
     /* Visited-bit guard against re-entry on shared subgraphs. */
     uint8_t visited_local[256];
-    uint8_t* visited = nc <= 256 ? visited_local : (uint8_t*)ray_sys_alloc(nc);
+    uint8_t* visited = nc <= 256 ? visited_local : (uint8_t*)ray_alloc_raw(nc);
     if (!visited) {
-        if (stk1 != stk1_local) ray_sys_free(stk1);
-        if (stk2 != stk2_local) ray_sys_free(stk2);
+        if (stk1 != stk1_local) ray_free_raw(stk1);
+        if (stk2 != stk2_local) ray_free_raw(stk2);
         return root;
     }
     memset(visited, 0, nc);
@@ -308,8 +307,8 @@ ray_op_t* ray_idiom_pass(ray_graph_t* g, ray_op_t* root) {
         }
     }
 
-    if (visited != visited_local) ray_sys_free(visited);
-    if (stk1 != stk1_local) ray_sys_free(stk1);
-    if (stk2 != stk2_local) ray_sys_free(stk2);
+    if (visited != visited_local) ray_free_raw(visited);
+    if (stk1 != stk1_local) ray_free_raw(stk1);
+    if (stk2 != stk2_local) ray_free_raw(stk2);
     return root;
 }
