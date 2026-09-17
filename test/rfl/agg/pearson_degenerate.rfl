@@ -1,0 +1,28 @@
+;; A correlation coefficient is bounded by |r| <= 1.  A group with no
+;; variance on either side has no defined correlation, and must come back
+;; null rather than as a fabricated finite number (#555).
+;;
+;; pearson_final_result computed num / sqrt(dx*dy) with no guard.  dx and dy
+;; are >= 0 mathematically (Cauchy-Schwarz) but a CONSTANT column cancels to
+;; a small NEGATIVE residue in doubles.  With one side negative the product
+;; is negative, sqrt is NaN and the null model caught it; with BOTH negative
+;; the product is positive, sqrt is finite, and garbage was emitted.
+(set N 400) (set r (til N)) (set k (% r 4))
+(set c  (as 'F64 (take [10000001.0] N)))
+(set c2 (as 'F64 (take [20000003.0] N)))
+
+;; both sides constant and identical: used to give -1.0
+(all (== (at (select {from:(table [k x y] (list k c c)) by:k p:(pearson_corr x y)}) 'p) 0Nf)) -- true
+
+;; two different constants: used to give 2.13 — not a correlation at all
+(all (== (at (select {from:(table [k x y] (list k c c2)) by:k p:(pearson_corr x y)}) 'p) 0Nf)) -- true
+
+;; one side constant, the other varying: still undefined
+(all (== (at (select {from:(table [k x y] (list k c (as 'F64 r))) by:k p:(pearson_corr x y)}) 'p) 0Nf)) -- true
+
+;; a single-row group has no correlation either (n < 2)
+(at (select {from:(table [k x y] (list [0] (as 'F64 [5.0]) (as 'F64 [7.0]))) by:k p:(pearson_corr x y)}) 'p) -- [0Nf]
+
+;; ...and the ordinary cases are untouched
+(at (select {from:(table [k x y] (list k (as 'F64 r) (as 'F64 (* 2 r)))) by:k p:(pearson_corr x y)}) 'p) -- [1.0 1.0 1.0 1.0]
+(at (select {from:(table [k x y] (list k (as 'F64 r) (as 'F64 (* -3 r)))) by:k p:(pearson_corr x y)}) 'p) -- [-1.0 -1.0 -1.0 -1.0]
