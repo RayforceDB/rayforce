@@ -1,0 +1,27 @@
+;; first/last on a group larger than the parallel split grain, checked against
+;; the rows themselves rather than against another grouping path.  With the
+;; suite's two workers the grain is total/2, so a 280k-row group splits.
+(set N 300000)
+(set K (as 'I64 (== 0 (% (til N) 15))))
+(set V (+ 1 (% (* 7919 (til N)) 100003)))
+(set W (/ (as 'F64 (% (* 31 (til N)) 977)) 4))
+(set W (+ W (at [0.0 0.0 0Nf 0.0 0.0] (% (til N) 5))))
+(set T (table [k v w] (list K V W)))
+(set R (xasc (select {from: T by: k f: (first v) l: (last v) fw: (first w) lw: (last w) n: (count v)}) 'k))
+(at R 'n) -- [280000 20000]
+;; group 0 is every row with i%15 != 0: first is row 1, last is row N-1
+(at (at R 'f) 0) -- (at V 1)
+(at (at R 'l) 0) -- (at V (- N 1))
+;; group 1 is every row with i%15 == 0: first is row 0, last is the top multiple of 15
+(at (at R 'f) 1) -- (at V 0)
+(at (at R 'l) 1) -- (at V (* 15 (div (- N 1) 15)))
+;; first/last of a nullable column report the row's value (the probed rows are non-null; row 2 of every five is null)
+(at (at R 'fw) 0) -- (at W 1)
+(at (at R 'lw) 0) -- (at W (- N 1))
+(at (at R 'fw) 1) -- (at W 0)
+(at (at R 'lw) 1) -- (at W (* 15 (div (- N 1) 15)))
+;; a selection keeps row order: first/last come from the selected rows
+(set S (xasc (select {from: T where: (> v 50000) by: k f: (first v) l: (last v)}) 'k))
+(set SEL (select {from: T where: (> v 50000)}))
+(at (at S 'f) 0) -- (first (at (select {from: SEL where: (== k 0)}) 'v))
+(at (at S 'l) 0) -- (last (at (select {from: SEL where: (== k 0)}) 'v))
