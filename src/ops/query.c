@@ -15822,20 +15822,27 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                 ray_table_ukey_drop(tbl);
                 ukey = NULL;
             }
-            if (!ukey && nrows0 + m <= UKEY_MAX_ROWS) {
-                ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
-                if (idx && !RAY_IS_ERR(idx)) {
-                    if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
-                    else ray_release(idx);
-                }
-                /* A map we could not build or attach is not an error: fall
-                 * through to the scratch one and answer at the old cost. */
-                if (ukey) {
-                    map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
-                    map.mask = ukey->u.ukey.mask;
-                    for (int64_t r = 0; r < nrows0 && !err; r++)
-                        upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
-                    ukey->u.ukey.nrows = nrows0;
+            /* Split on `ukey` first.  Folding the row-count test into the
+             * same condition sent the `ukey == NULL && too many rows` case
+             * into the else, which dereferences the map that is not there.
+             * Declining the map for size must fall through to the scratch
+             * one below, exactly as a failed build does. */
+            if (!ukey) {
+                if (nrows0 + m <= UKEY_MAX_ROWS) {
+                    ray_t* idx = ray_index_build_ukey(kci, nk, nrows0 + m);
+                    if (idx && !RAY_IS_ERR(idx)) {
+                        if (ray_table_ukey_attach(tbl, idx)) ukey = ray_table_ukey_get(tbl);
+                        else ray_release(idx);
+                    }
+                    /* A map we could not build or attach is not an error: fall
+                     * through to the scratch one and answer at the old cost. */
+                    if (ukey) {
+                        map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
+                        map.mask = ukey->u.ukey.mask;
+                        for (int64_t r = 0; r < nrows0 && !err; r++)
+                            upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
+                        ukey->u.ukey.nrows = nrows0;
+                    }
                 }
             } else {
                 map.slot = (int64_t*)ray_data(ukey->u.ukey.slots);
