@@ -71,11 +71,12 @@
 ;; ── string ops ─────────────────────────────────────────────────────
 (like "hello" "h*")  -- (.ipc.send h "(like \"hello\" \"h*\")")
 
-;; ── compression boundary ───────────────────────────────────────────
-;; RAY_IPC_COMPRESS_THRESHOLD = 2000 bytes (src/core/ipc.h).  An i64
-;; vector of length 1000 is 8 KB serialised, so the response payload
-;; goes through ray_ipc_compress / ray_ipc_decompress — coverage that
-;; the small-payload cases above cannot reach.
+;; ── large payloads ─────────────────────────────────────────────────
+;; Multi-KB results over the framing path.  These no longer exercise
+;; ray_ipc_compress: since #541 a loopback link never compresses, so
+;; both sides here take the raw path however large the payload.  The
+;; compressed path has its own coverage in test_ipc.c
+;; (ipc/compressed_roundtrip), which forces a threshold on the link.
 (count (til 10000))  -- (.ipc.send h "(count (til 10000))")
 (sum (til 1000))     -- (.ipc.send h "(sum (til 1000))")
 

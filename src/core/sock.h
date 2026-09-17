@@ -66,4 +66,16 @@ void       ray_sock_close(ray_sock_t s);
 ray_err_t  ray_sock_set_nonblocking(ray_sock_t s);
 ray_err_t  ray_sock_set_blocking(ray_sock_t s);
 
+/* ===== Link locality =====
+ * True when the peer is on this machine: AF_UNIX, IPv4 127/8, IPv6 ::1,
+ * or a v4-mapped loopback.  `sa` points at a `struct sockaddr`; it is
+ * taken as void* so this header stays free of <sys/socket.h>.  A short
+ * or NULL address reads as non-local rather than being trusted.
+ *
+ * ray_sock_peer_is_local resolves the peer with getpeername and answers
+ * false when there is none (unconnected socket, bad fd) — an unknown
+ * link must fall back to the conservative default, never to "local". */
+bool ray_sock_addr_is_local(const void* sa, size_t salen);
+bool ray_sock_peer_is_local(ray_sock_t s);
+
 #endif /* RAY_SOCK_H */
