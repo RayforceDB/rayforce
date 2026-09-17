@@ -2522,6 +2522,114 @@ static test_result_t test_ipc_wire_unknown_msgtype_is_evaluated(void) {
     PASS();
 }
 
+/* Framing a message must honour the threshold it is given: the SAME payload
+ * frames compressed at the default and raw at NEVER.  This is what lets a
+ * multicast topic build one framing per distinct subscriber policy (#551)
+ * instead of one framing at the compiled-in default for everybody. */
+static test_result_t test_ipc_frame_async_at_threshold(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+
+    /* Ascending i64 run: every delta is 1, so delta+RLE shrinks it hard. */
+    ray_t* big = ray_eval_str("(til 5000)");
+    TEST_ASSERT_NOT_NULL(big);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(big));
+    TEST_ASSERT_TRUE(ray_serde_size(big) > 2000);
+
+    ray_poll_frame_t* f_def = NULL;
+    TEST_ASSERT_EQ_I(ray_ipc_frame_async_at(big, (size_t)RAY_IPC_COMPRESS_THRESHOLD, &f_def), RAY_OK);
+    TEST_ASSERT_NOT_NULL(f_def);
+    ray_ipc_header_t hd;
+    memcpy(&hd, f_def->data, sizeof hd);
+    TEST_ASSERT_TRUE((hd.flags & RAY_IPC_FLAG_COMPRESSED) != 0);
+
+    ray_poll_frame_t* f_raw = NULL;
+    TEST_ASSERT_EQ_I(ray_ipc_frame_async_at(big, RAY_IPC_COMPRESS_NEVER, &f_raw), RAY_OK);
+    TEST_ASSERT_NOT_NULL(f_raw);
+    ray_ipc_header_t hr;
+    memcpy(&hr, f_raw->data, sizeof hr);
+    TEST_ASSERT_EQ_I(hr.flags & RAY_IPC_FLAG_COMPRESSED, 0);
+
+    /* The raw framing is the bigger one — that is the trade #541 measured. */
+    TEST_ASSERT_TRUE(f_raw->size > f_def->size);
+
+    ray_poll_frame_release(f_def);
+    ray_poll_frame_release(f_raw);
+    ray_release(big);
+    ray_test_server_stop(&srv);
+    PASS();
+}
+
+/* A multicast publication to loopback subscribers must not be compressed.
+ *
+ * #549 made compression per-link, but the fan-out frame is shared by every
+ * subscriber of a topic (#487), so publish still framed at the compiled-in
+ * threshold: a tickerplant with only local subscribers compressed on every
+ * publication and every subscriber decompressed (#551).  Subscribing a raw
+ * socket lets us read the published frame's header directly. */
+static test_result_t test_ipc_mcast_local_not_compressed(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+
+    ray_sock_t s = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+
+    /* .mc.sub binds to .ipc.handle — the connection the eval runs on. */
+    const char* ssrc = "(.mc.sub 'depth null)";
+    ray_t* sub = ray_str(ssrc, strlen(ssrc));
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_SYNC, sub), 0);
+    ray_release(sub);
+    ray_ipc_header_t rh;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &rh, sizeof rh), 0);
+    TEST_ASSERT_EQ_I(rh.msgtype, RAY_IPC_MSG_RESP);
+    uint8_t* rb = (uint8_t*)ray_alloc_raw((size_t)rh.size);
+    TEST_ASSERT_NOT_NULL(rb);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, rb, (size_t)rh.size), 0);
+    ray_free_raw(rb);
+
+    /* Publish well past the threshold and highly compressible: an ascending
+     * i64 run, so every delta is 1. */
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "control handle");
+    const char* psrc = "(.mc.pub 'depth (til 5000))";
+    ray_t* pub = ray_str(psrc, strlen(psrc));
+    ray_t* pr = ray_ipc_send(h, pub);
+    ray_release(pub);
+    /* .mc.pub returns the topic's SEQUENCE number, not a subscriber count,
+     * so this only says the publish itself did not error.  What actually
+     * rules out a vacuous pass is that the read below must produce a real
+     * frame: if the publication never fanned out, ray_sock_wait_readable
+     * times out and the test fails there. */
+    TEST_ASSERT_NOT_NULL(pr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pr));
+    TEST_ASSERT_EQ_I(pr->type, -RAY_I64);
+    ray_release(pr);
+
+    /* The publication arrives as an ASYNC frame on the subscriber. */
+    TEST_ASSERT_EQ_I(ray_sock_wait_readable(s, 5000), 1);
+    ray_ipc_header_t ph;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &ph, sizeof ph), 0);
+    TEST_ASSERT_EQ_I(ph.msgtype, RAY_IPC_MSG_ASYNC);
+    TEST_ASSERT_TRUE(ph.size > 2000);
+    /* The point of #551: a loopback subscriber gets raw bytes. */
+    TEST_ASSERT_EQ_I(ph.flags & RAY_IPC_FLAG_COMPRESSED, 0);
+
+    uint8_t* pb = (uint8_t*)ray_alloc_raw((size_t)ph.size);
+    TEST_ASSERT_NOT_NULL(pb);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, pb, (size_t)ph.size), 0);
+    int64_t plen = ph.size;
+    ray_t* body = ray_de_raw(pb, &plen);
+    TEST_ASSERT_NOT_NULL(body);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(body));
+    ray_release(body);
+    ray_free_raw(pb);
+
+    ray_ipc_close(h);
+    ray_sock_close(s);
+    ray_test_server_stop(&srv);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
@@ -2590,6 +2698,8 @@ const test_entry_t ipc_entries[] = {
     { "ipc/open_opts/list_sym_keys",        test_ipc_open_opts_list_sym_keys,        ipc_setup, ipc_teardown },
     { "ipc/open_opts/list_sym_keys_unknown",test_ipc_open_opts_list_sym_keys_unknown,ipc_setup, ipc_teardown },
 
+    { "ipc/mcast_local_not_compressed",    test_ipc_mcast_local_not_compressed,     ipc_setup, ipc_teardown },
+    { "ipc/frame_async_at_threshold",       test_ipc_frame_async_at_threshold,       ipc_setup, ipc_teardown },
     { "ipc/compressed_roundtrip",          test_ipc_compressed_roundtrip,           ipc_setup, ipc_teardown },
 
     /* wire-level characterization (refactor guard) */

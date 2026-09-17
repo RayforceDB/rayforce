@@ -33,7 +33,9 @@ struct ray_mcast {
     int64_t published;
     int64_t delivered;
     int64_t dropped;
-    int64_t framed;      /* wire frames built: one per publication, not per subscriber */
+    int64_t framed;      /* wire frames built: one per DISTINCT compression
+                          * policy per publication (#551), not one per publication
+                          * and not one per subscriber */
 };
 
 static int64_t topic_sym(ray_t* topic) {
@@ -267,6 +269,42 @@ ray_t* ray_mcast_unsub(ray_poll_t* poll, int64_t handle, ray_t* topic) {
     return RAY_NULL_OBJ;
 }
 
+/* At most this many distinct compression policies get their own framing per
+ * publication.  Two covers the local/remote split that motivates this; the
+ * spare slots absorb explicit per-connection `compress` thresholds without
+ * letting a pathological topic serialize once per subscriber. */
+#define MC_MAX_FRAMINGS 4
+
+typedef struct {
+    size_t             thr;
+    ray_poll_frame_t*  frame;
+} mc_framing_t;
+
+/* The framing this subscriber's link wants, building it on first use.  Past
+ * MC_MAX_FRAMINGS distinct thresholds everyone shares the first framing —
+ * correct for any peer (the receiver honours the per-frame COMPRESSED flag),
+ * just not that peer's preference. */
+static ray_poll_frame_t* mc_frame_for(ray_mcast_t* mc, ray_t* msg, int64_t handle,
+                                      mc_framing_t* framings, int32_t* n,
+                                      ray_err_t* ferr) {
+    size_t thr = ray_ipc_handle_threshold(handle);
+    if (thr == RAY_IPC_COMPRESS_AUTO) thr = (size_t)RAY_IPC_COMPRESS_THRESHOLD;
+
+    for (int32_t f = 0; f < *n; f++)
+        if (framings[f].thr == thr) return framings[f].frame;
+    if (*n == MC_MAX_FRAMINGS) return framings[0].frame;
+
+    ray_poll_frame_t* frame = NULL;
+    ray_err_t e = ray_ipc_frame_async_at(msg, thr, &frame);
+    if (e != RAY_OK || !frame) { *ferr = e == RAY_OK ? RAY_ERR_IO : e; return NULL; }
+    framings[*n].thr = thr;
+    framings[*n].frame = frame;
+    (*n)++;
+    mc->framed++;
+    return frame;
+}
+
+
 ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
     if (!poll) return ray_error("domain", ".mc.pub requires an active poll");
     int64_t sym = topic_sym(topic);
@@ -293,22 +331,30 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
         }
     }
 
-    /* Serialize and compress once; every subscriber's queue shares the
-     * frame and keeps only its own write offset (#487). */
-    ray_poll_frame_t* frame = NULL;
-    ray_err_t ferr = ray_ipc_frame_async(msg, &frame);
-    ray_release(msg);
-    if (ferr != RAY_OK || !frame) {
-        if (dead_handles) ray_sys_free(dead_handles);
-        return ferr == RAY_ERR_OOM ? ray_error("oom", NULL)
-                                   : ray_error("io", ".mc.pub could not frame the payload");
-    }
-    mc->framed++;
+    /* Serialize once per distinct compression policy; every subscriber that
+     * wants that policy shares the frame and keeps only its own write offset
+     * (#487).  A topic whose subscribers are all local — the tickerplant
+     * case — still builds exactly one framing, and never compresses it
+     * (#551).  A mixed topic pays one extra serialization rather than one
+     * per subscriber. */
+    mc_framing_t framings[MC_MAX_FRAMINGS];
+    int32_t n_framings = 0;
+    ray_err_t ferr = RAY_OK;
 
     t->next_seq++;
     mc->published++;
 
-    for (int32_t i = 0; i < t->n_subs;) {
+    /* Build every framing this topic needs BEFORE sending any of them.  A
+     * framing failure is a local resource failure that says nothing about
+     * any peer, so it must neither drop a subscriber the way a failed send
+     * does nor leave the publication half fanned out: with nothing sent
+     * yet, the error below leaves every subscription exactly as it was. */
+    for (int32_t i = 0; i < t->n_subs && ferr == RAY_OK; i++)
+        (void)mc_frame_for(mc, msg, t->subs[i].handle, framings, &n_framings, &ferr);
+
+    for (int32_t i = 0; ferr == RAY_OK && i < t->n_subs;) {
+        ray_poll_frame_t* frame = mc_frame_for(mc, msg, t->subs[i].handle,
+                                               framings, &n_framings, &ferr);
         ray_err_t rc = ray_ipc_try_send_frame(t->subs[i].handle, frame);
         if (rc == RAY_OK) {
             t->subs[i].last_sent_seq = seq;
@@ -322,7 +368,18 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
             dead_handles[dead_n++] = dead;
         }
     }
-    ray_poll_frame_release(frame);
+    for (int32_t f = 0; f < n_framings; f++)
+        ray_poll_frame_release(framings[f].frame);
+    ray_release(msg);
+    if (ferr != RAY_OK) {
+        /* Framing is all done before the first send, so nothing was
+         * delivered and no subscriber was dropped (dead_n is 0 here).
+         * Report the failure instead of returning a sequence number for a
+         * publication that never fanned out. */
+        if (dead_handles) ray_sys_free(dead_handles);
+        return ferr == RAY_ERR_OOM ? ray_error("oom", NULL)
+                                   : ray_error("io", ".mc.pub could not frame the payload");
+    }
     if (t->n_subs == 0) {
         int32_t ti = topic_index(mc, sym);
         if (ti >= 0) remove_topic(mc, ti);

@@ -1686,6 +1686,12 @@ static int conn_try_send_frame(ray_selector_t* sel, ray_poll_buf_t* frame)
 
 ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out)
 {
+    return ray_ipc_frame_async_at(msg, (size_t)RAY_IPC_COMPRESS_THRESHOLD, out);
+}
+
+ray_err_t ray_ipc_frame_async_at(ray_t* msg, size_t compress_threshold,
+                                 ray_poll_frame_t** out)
+{
     if (!out) return RAY_ERR_TYPE;
     *out = NULL;
     bool owned = false;
@@ -1700,16 +1706,12 @@ ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out)
         owned = true;
     }
     ray_err_t err = RAY_OK;
-    /* One frame is shared by every subscriber of a topic (#487), so it
-     * cannot carry a per-peer policy: a mix of local and remote
-     * subscribers would need two framings.  So this keeps the
-     * compiled-in default, which means local subscribers still pay
-     * decompression — there is no listener-level option for topics to
-     * inherit yet.  Bucketing a topic's subscribers into at most two
-     * framings is the way out, and is not in this PR. */
+    /* A frame is shared by every subscriber that wants this threshold
+     * (#487), so the policy belongs to the framing, not to the peer: the
+     * caller groups its subscribers by threshold and asks for one framing
+     * per distinct value (#551). */
     ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_ASYNC, 0,
-                                             (size_t)RAY_IPC_COMPRESS_THRESHOLD,
-                                             &err);
+                                             compress_threshold, &err);
     if (owned) ray_release(msg);
     if (!frame) return err == RAY_OK ? RAY_ERR_IO : err;
     *out = frame;

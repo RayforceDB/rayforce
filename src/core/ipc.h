@@ -154,6 +154,11 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg);
  * return codes as ray_ipc_try_send_async, which is now the one-connection
  * composition of the two. */
 ray_err_t ray_ipc_frame_async(ray_t* msg, ray_poll_frame_t** out);
+/* As ray_ipc_frame_async, framing at an explicit compression threshold.
+ * Multicast builds one framing per distinct subscriber policy with this, so
+ * a topic whose subscribers are all local never compresses (#551). */
+ray_err_t ray_ipc_frame_async_at(ray_t* msg, size_t compress_threshold,
+                                 ray_poll_frame_t** out);
 ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame);
 
 /* Transmit backlog (#486).  A connection's queue admits a frame only while
