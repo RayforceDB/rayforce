@@ -9215,7 +9215,9 @@ by_dict_done:
             } else {
                 key_ops[0] = compile_expr_dag(g, by_expr);
             }
-            computed_single_key = (key_ops[0] != NULL);
+            /* Only a real expression is renamed: a bare column symbol lands
+             * here too and keeps its own name. */
+            computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
             if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
