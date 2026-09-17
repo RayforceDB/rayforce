@@ -1,0 +1,30 @@
+;; A grouped select whose selection matches no row must still return every
+;; requested column, whatever aggregate family produces it, for a single key
+;; and for a composite key alike.  Before the fix the streaming aggregates and
+;; the per-group projections were silently dropped (or the composite query
+;; failed outright) because their result columns were only created on the
+;; first group.
+(set T (table [k s v tm sy] (list ["a" "b" "c"] (as 'I64 [1 2 3]) [1.5 2.5 3.5] (as 'TIME [1 2 3]) ['x 'y 'z])))
+(set Z (select {from: T by: k where: (== k "missing") s: (sum s) m: (med v) q: (quantile v 0.5) mo: (mode v) f: (first tm) l: (last sy) tp: (top v 3) bt: (bot s 2) d: (distinct v) cd: (count (distinct v)) n: (count v) mn: (min sy) mx: (max s) av: (avg s) fs: (first s) ls: (last k)}))
+(set F (select {from: T by: k s: (sum s) m: (med v) q: (quantile v 0.5) mo: (mode v) f: (first tm) l: (last sy) tp: (top v 3) bt: (bot s 2) d: (distinct v) cd: (count (distinct v)) n: (count v) mn: (min sy) mx: (max s) av: (avg s) fs: (first s) ls: (last k)}))
+(count Z) -- 0
+(cols Z) -- (cols F)
+(count (cols Z)) -- 17
+;; the empty columns carry the type their non-empty counterparts have
+(type (at Z 's)) -- (type (at F 's))
+(type (at Z 'm)) -- (type (at F 'm))
+(type (at Z 'n)) -- (type (at F 'n))
+(type (at Z 'f)) -- (type (at F 'f))
+(type (at Z 'av)) -- (type (at F 'av))
+;; composite key, nothing selected
+(set ZC (select {from: T by: [k sy] where: (== k "missing") s: (sum s) n: (count v) f: (first v) m: (med v) d: (distinct v) cd: (count (distinct v)) tp: (top v 2)}))
+(set FC (select {from: T by: [k sy] s: (sum s) n: (count v) f: (first v) m: (med v) d: (distinct v) cd: (count (distinct v)) tp: (top v 2)}))
+(count ZC) -- 0
+(cols ZC) -- (cols FC)
+(count (cols ZC)) -- 9
+(type (at ZC 'n)) -- (type (at FC 'n))
+(type (at ZC 'f)) -- (type (at FC 'f))
+;; a non-empty selection is untouched
+(set P (select {from: T by: [k sy] where: (> s 1) s: (sum s) n: (count v) f: (first v) d: (distinct v)}))
+(count P) -- 2
+(cols P) -- [k sy s n f d]
