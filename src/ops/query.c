@@ -2883,6 +2883,39 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     ray_t* result = NULL;       /* typed vec OR list col */
     int direct_typed = 0;       /* non-zero → result is a typed vec */
     int8_t typed_t = 0;         /* atom type sentinel for the typed path */
+    if (n_groups == 0) {
+        /* No group to walk, but the column must still exist.  Probe the
+         * expression once over an EMPTY slice of every referenced column so
+         * the result keeps the type a non-empty result would have had; an
+         * expression that cannot evaluate on zero rows yields a LIST column,
+         * the same shape the per-group path falls back to. */
+        ray_t* empty_idx = ray_vec_new(RAY_I64, 0);
+        int8_t vt = 0;
+        if (empty_idx && !RAY_IS_ERR(empty_idx)) {
+            empty_idx->len = 0;
+            int bound = 1;
+            for (int i = 0; i < n_cols && bound; i++) {
+                ray_t* err = bind_col_slice(col_syms[i], cols[i], empty_idx);
+                if (err) { ray_error_free(err); bound = 0; }
+            }
+            if (bound) {
+                ray_t* cell = ray_eval(expr);
+                if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
+                if (cell && !RAY_IS_ERR(cell)) {
+                    int8_t t = cell->type;
+                    if (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) vt = (int8_t)(-t);
+                    ray_release(cell);
+                } else if (cell) ray_error_free(cell);
+            }
+            ray_release(empty_idx);
+        } else if (empty_idx) ray_error_free(empty_idx);
+        result = vt ? ray_vec_new(vt, 0) : ray_list_new(0);
+        if (result && !RAY_IS_ERR(result)) result->len = 0;
+        g_active_query_table = _aqt;
+        ray_env_pop_scope();
+        scratch_free(refs_hdr);
+        return result ? result : ray_error("oom", NULL);
+    }
 
     for (int64_t gi = 0; gi < n_groups; gi++) {
         ray_t* idx_list = feeder(gi, fstate);
@@ -3201,6 +3234,32 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     return result;
 }
 
+/* Zero groups still need the aggregate's column.  Run the aggregate once over
+ * an empty vector of the source's type so the empty column keeps the type a
+ * non-empty result would have had; if that probe cannot run, an empty LIST
+ * column stands in, the shape the per-group path itself falls back to. */
+static ray_t* empty_agg_column(ray_t* fn_name, ray_t* src) {
+    ray_t* out = NULL;
+    ray_t* fn_obj = fn_name ? ray_env_get(fn_name->i64) : NULL;
+    if (fn_obj && fn_obj->type == RAY_UNARY && src && ray_is_vec(src) && src->type != RAY_LIST) {
+        ray_t* empty = ray_vec_new(src->type, 0);
+        if (empty && !RAY_IS_ERR(empty)) {
+            empty->len = 0;
+            ray_t* v = ((ray_unary_fn)(uintptr_t)fn_obj->i64)(empty);
+            if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
+            if (v && !RAY_IS_ERR(v)) {
+                int8_t t = v->type;
+                if (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) out = ray_vec_new((int8_t)(-t), 0);
+                ray_release(v);
+            } else if (v) ray_error_free(v);
+            ray_release(empty);
+        } else if (empty) ray_error_free(empty);
+    }
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); out = ray_list_new(0); }
+    if (out && !RAY_IS_ERR(out)) out->len = 0;
+    return out;
+}
+
 /* Streaming-style per-group AGG body, DAG flavor.  For an expression
  * like `(med v)` (head is RAY_FN_AGGR + RAY_UNARY, second elem is a
  * column ref or full-table-eval-able sub-expression), slice src per
@@ -3331,13 +3390,18 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
         ray_release(agg_val);
     }
 
-    ray_release(idx_vec); ray_release(src);
+    ray_release(idx_vec);
     if (!agg_vec) {
-        /* No groups produced a value (all empty?) — return an empty typed
-         * vec sized n_groups; default to I64 for lack of a better guess. */
-        agg_vec = ray_vec_new(RAY_I64, n_groups);
-        if (agg_vec && !RAY_IS_ERR(agg_vec)) agg_vec->len = n_groups;
+        /* No group produced a value.  With zero groups the column must still
+         * carry the type a value would have had; with groups that were all
+         * empty keep the I64 default sized to n_groups. */
+        if (n_groups == 0) agg_vec = empty_agg_column(fn_name, src);
+        else {
+            agg_vec = ray_vec_new(RAY_I64, n_groups);
+            if (agg_vec && !RAY_IS_ERR(agg_vec)) agg_vec->len = n_groups;
+        }
     }
+    ray_release(src);
     return agg_vec;
 }
 
@@ -7861,6 +7925,7 @@ by_dict_done:
                                 ray_release(agg_val);
                             }
                         }
+                        if (!agg_vec && out_groups == 0) agg_vec = empty_agg_column(agg_fn_name, src_col_val);
                         ray_release(src_col_val);
                         agg_names[n_agg_out] = kid;
                         agg_results[n_agg_out] = agg_vec;
@@ -8418,6 +8483,7 @@ by_dict_done:
                         store_typed_elem(agg_vec, gi, agg_val);
                         ray_release(agg_val);
                     }
+                    if (!agg_vec && n_groups == 0) agg_vec = empty_agg_column(agg_fn_name, src_col_val);
                     ray_release(src_col_val);
                     agg_names[n_agg_out] = kid;
                     agg_results[n_agg_out] = agg_vec;
