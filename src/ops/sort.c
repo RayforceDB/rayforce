@@ -661,6 +661,7 @@ typedef struct {
     uint64_t  key_mask;       /* mask for significant key bytes */
     int64_t*  pw_unsorted;    /* count of forward inversions */
     int64_t*  pw_not_reverse; /* count of strict ascending pairs */
+    int64_t*  pw_equal;       /* count of equal neighbours (ties) */
 } packed_detect_ctx_t;
 
 static void packed_detect_fn(void* arg, uint32_t wid,
@@ -669,7 +670,7 @@ static void packed_detect_fn(void* arg, uint32_t wid,
     uint64_t* k = c->keys;
     uint8_t kb = c->key_bits;
     uint64_t km = c->key_mask;
-    int64_t unsorted = 0, not_rev = 0;
+    int64_t unsorted = 0, not_rev = 0, equal = 0;
     /* Only compare within this task while keys are packed in place. The
      * coordinator checks cross-task pairs after dispatch has joined. Reading
      * k[start - 1] here would race with the preceding task's packed store. */
@@ -678,7 +679,8 @@ static void packed_detect_fn(void* arg, uint32_t wid,
         uint64_t cur = k[i] & km;  /* mask to significant bytes */
         if (i > start) {
             if (cur < prev) unsorted++;
-            if (cur > prev) not_rev++;
+            else if (cur > prev) not_rev++;
+            else equal++;
         }
         /* Pack: significant key bits | (index << key_bits) */
         k[i] = cur | ((uint64_t)i << kb);
@@ -686,6 +688,7 @@ static void packed_detect_fn(void* arg, uint32_t wid,
     }
     c->pw_unsorted[wid] += unsorted;
     c->pw_not_reverse[wid] += not_rev;
+    c->pw_equal[wid] += equal;
 }
 
 /* Parallel unpack: extract indices (and optionally sorted keys) from
@@ -1237,9 +1240,24 @@ static inline uint64_t strkey_load_part(const char* src, int64_t len, int offset
  * only fires if both records have len > parts*8 and their packed
  * prefixes are equal — touches pool memory via ray_str_t_cmp only
  * at the base case, never during the radix partitioning loop. */
+/* String order only (no row tie-break): 0 means the two strings are equal. */
+static int strkey_cmp_full(const ray_strkey_t* a, const ray_strkey_t* b,
+                           int parts,
+                           const ray_str_t* elems, const char* pool);
+
 static int strkey_cmp(const ray_strkey_t* a, const ray_strkey_t* b,
                       int parts,
                       const ray_str_t* elems, const char* pool) {
+    int r = strkey_cmp_full(a, b, parts, elems, pool);
+    if (r != 0) return r;
+    /* Equal strings: order by source row so every comparison sort below
+     * is stable, whatever the in-place radix passes did to the bucket. */
+    return (a->row > b->row) - (a->row < b->row);
+}
+
+static int strkey_cmp_full(const ray_strkey_t* a, const ray_strkey_t* b,
+                           int parts,
+                           const ray_str_t* elems, const char* pool) {
     for (int p = 0; p < parts; p++) {
         if (a->parts[p] < b->parts[p]) return -1;
         if (a->parts[p] > b->parts[p]) return  1;
@@ -1459,6 +1477,7 @@ static void strsort_top_scatter_fn(void* vctx, uint32_t wid,
 /* Bucket dispatch context: each task sorts one top-level bucket. */
 typedef struct {
     ray_strkey_t*    keys;
+    ray_strkey_t*    scratch;   /* same size as keys; buckets use disjoint slices */
     const int64_t*   starts;
     const int64_t*   counts;
     int              parts_bytes;
@@ -1469,7 +1488,8 @@ typedef struct {
     int              start_bp;  /* byte position to begin radix within bucket */
 } strsort_bucket_ctx_t;
 
-static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
+static void strsort_aflag(ray_strkey_t* keys, ray_strkey_t* scratch,
+                          int64_t n, int bp,
                           int parts_bytes, int64_t base_offset,
                           const ray_str_t* elems, const char* pool,
                           int parts);
@@ -1480,10 +1500,17 @@ static void strsort_bucket_fn(void* vctx, uint32_t wid, int64_t s, int64_t e) {
     for (int64_t b = s; b < e; b++) {
         int64_t cnt = c->counts[b];
         if (cnt <= 1) continue;
-        strsort_aflag(c->keys + c->starts[b], cnt, c->start_bp,
+        strsort_aflag(c->keys + c->starts[b], c->scratch + c->starts[b], cnt, c->start_bp,
                       c->parts_bytes, c->base_offset,
                       c->elems, c->pool, c->parts);
     }
+}
+
+/* (len, row) order for records that tie on their packed prefix: shorter
+ * first, equal length means equal strings, which then keep row order. */
+static inline bool strkey_lenrow_lt(const ray_strkey_t* a, const ray_strkey_t* b) {
+    if (a->len != b->len) return a->len < b->len;
+    return a->row < b->row;
 }
 
 /* In-place quicksort by packed key `len` field.  Used as the
@@ -1498,15 +1525,15 @@ static void strkey_qsort_by_len(ray_strkey_t* a, int64_t lo, int64_t hi) {
     while (hi - lo > 16) {
         int64_t mid = lo + (hi - lo) / 2;
         /* Median-of-3. */
-        if (a[lo].len  > a[hi].len)  { ray_strkey_t t=a[lo];  a[lo]=a[hi];  a[hi]=t;  }
-        if (a[mid].len > a[hi].len)  { ray_strkey_t t=a[mid]; a[mid]=a[hi]; a[hi]=t;  }
-        if (a[lo].len  > a[mid].len) { ray_strkey_t t=a[lo];  a[lo]=a[mid]; a[mid]=t; }
-        uint32_t pivot = a[mid].len;
+        if (strkey_lenrow_lt(&a[hi],  &a[lo]))  { ray_strkey_t t=a[lo];  a[lo]=a[hi];  a[hi]=t;  }
+        if (strkey_lenrow_lt(&a[hi],  &a[mid])) { ray_strkey_t t=a[mid]; a[mid]=a[hi]; a[hi]=t;  }
+        if (strkey_lenrow_lt(&a[mid], &a[lo]))  { ray_strkey_t t=a[lo];  a[lo]=a[mid]; a[mid]=t; }
+        ray_strkey_t pivot = a[mid];
         /* Hoare partition. */
         int64_t i = lo - 1, j = hi + 1;
         for (;;) {
-            do { i++; } while (a[i].len < pivot);
-            do { j--; } while (a[j].len > pivot);
+            do { i++; } while (strkey_lenrow_lt(&a[i], &pivot));
+            do { j--; } while (strkey_lenrow_lt(&pivot, &a[j]));
             if (i >= j) break;
             ray_strkey_t t = a[i]; a[i] = a[j]; a[j] = t;
         }
@@ -1523,7 +1550,7 @@ static void strkey_qsort_by_len(ray_strkey_t* a, int64_t lo, int64_t hi) {
     for (int64_t i = lo + 1; i <= hi; i++) {
         ray_strkey_t cur = a[i];
         int64_t j = i - 1;
-        while (j >= lo && a[j].len > cur.len) {
+        while (j >= lo && strkey_lenrow_lt(&cur, &a[j])) {
             a[j + 1] = a[j];
             j--;
         }
@@ -1574,8 +1601,8 @@ static bool strsort_repack_window(ray_strkey_t* keys, int64_t n,
          * differ in length.  A string of length 3 whose bytes match
          * a prefix of a length-5 string must sort before it (per
          * ray_str_t_cmp), so finalize the bucket by sorting on len.
-         * When min_len == max_len every record is bitwise equal and
-         * any order is valid — we skip the sort entirely. */
+         * When min_len == max_len every record is bitwise equal and the
+         * stable scatter has kept them in source order — nothing to do. */
         strkey_qsort_by_len(keys, 0, n - 1);
     }
     return any_tail;
@@ -1590,7 +1617,8 @@ static bool strsort_repack_window(ray_strkey_t* keys, int64_t n,
  *
  * parts_bytes = parts * 8 (cached).  base_offset tracks how many bytes
  * of the original string have already been consumed by earlier windows. */
-static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
+static void strsort_aflag(ray_strkey_t* keys, ray_strkey_t* scratch,
+                          int64_t n, int bp,
                           int parts_bytes, int64_t base_offset,
                           const ray_str_t* elems, const char* pool,
                           int parts) {
@@ -1652,26 +1680,19 @@ static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
             }
         }
 
-        /* In-place swap loop: classic American Flag.  For each bucket b,
-         * drain records out of its slice whose current byte != b into
-         * their correct destination, cycling until the bucket slice
-         * contains only records that belong in b. */
-        int64_t cursors[256];
-        memcpy(cursors, starts, sizeof(cursors));
-        for (int b = 0; b < 256; b++) {
-            while (cursors[b] < ends[b]) {
-                ray_strkey_t v = keys[cursors[b]];
-                int bb = strkey_byte_at(&v, bp);
-                while (bb != b) {
-                    ray_strkey_t tmp = keys[cursors[bb]];
-                    keys[cursors[bb]] = v;
-                    cursors[bb]++;
-                    v = tmp;
-                    bb = strkey_byte_at(&v, bp);
-                }
-                keys[cursors[b]] = v;
-                cursors[b]++;
-            }
+        /* Stable scatter: records go to their bucket in scan order, so
+         * equal strings keep their source order all the way down and the
+         * sort stays stable.  (The in-place American-Flag swap loop this
+         * replaces shuffled records inside a bucket.)  The scatter goes
+         * through the caller's scratch slice and comes back with one
+         * memcpy — the same traffic the swap loop's moves cost. */
+        {
+            int64_t cursors[256];
+            memcpy(cursors, starts, sizeof(cursors));
+            (void)ends;
+            for (int64_t i = 0; i < n; i++)
+                scratch[cursors[strkey_byte_at(&keys[i], bp)]++] = keys[i];
+            memcpy(keys, scratch, (size_t)n * sizeof(ray_strkey_t));
         }
 
         /* Find the largest bucket; recurse on the rest and loop on the
@@ -1685,13 +1706,40 @@ static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
             if (b == big_b) continue;
             int64_t cnt = counts[b];
             if (cnt > 1) {
-                strsort_aflag(keys + starts[b], cnt, bp + 1,
+                strsort_aflag(keys + starts[b], scratch + starts[b], cnt, bp + 1,
                               parts_bytes, base_offset, elems, pool, parts);
             }
         }
         keys += starts[big_b];
+        scratch += starts[big_b];
         n = big_cnt;
         bp++;
+    }
+}
+
+/* Emit `keys` (ascending, stable) into `out` in DESCENDING order while
+ * keeping every run of equal strings in its ascending (source-row) order:
+ * a stable descending sort.  A plain reversal mirrored the ties. */
+static void strsort_emit_desc_stable(int64_t* out, const ray_strkey_t* keys,
+                                     int64_t n, int parts,
+                                     const ray_str_t* elems, const char* pool) {
+    (void)parts;
+    /* Run boundaries are found on the strings themselves: after the radix
+     * passes a record's packed parts hold whatever window was repacked last,
+     * so they no longer identify the string. */
+    int64_t o = 0;
+    int64_t run_end = n;
+    while (run_end > 0) {
+        int64_t run_start = run_end - 1;
+        while (run_start > 0) {
+            const ray_str_t* sa = &elems[keys[run_start - 1].row];
+            const ray_str_t* sb = &elems[keys[run_start].row];
+            if (sa->len != sb->len) break;          /* different strings */
+            if (sa->len && memcmp(ray_str_t_ptr(sa, pool), ray_str_t_ptr(sb, pool), sa->len) != 0) break;
+            run_start--;
+        }
+        for (int64_t i = run_start; i < run_end; i++) out[o++] = (int64_t)keys[i].row;
+        run_end = run_start;
     }
 }
 
@@ -1767,15 +1815,16 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
             else
                 strsort_emit_fn(&ectx, 0, 0, n_live);
         } else if (run_dir != 0) {
-            /* Single run but wrong direction — emit row-indices reversed. */
-            for (int64_t i = 0, j = n_live - 1; i < j; i++, j--) {
-                ray_strkey_t t = keys[i]; keys[i] = keys[j]; keys[j] = t;
+            /* Single run but wrong direction: emit the runs of equal strings
+             * in reverse run order, each run in its source order (stable). */
+            if (run_dir == 1) {
+                /* ascending input, descending wanted */
+                strsort_emit_desc_stable(sorted_idx, keys, n_live, parts, elems, pool);
+            } else {
+                /* descending input, ascending wanted: the same walk — the
+                 * runs from the back, each in its source order. */
+                strsort_emit_desc_stable(sorted_idx, keys, n_live, parts, elems, pool);
             }
-            strsort_emit_ctx_t ectx = { sorted_idx, keys };
-            if (go_parallel)
-                ray_pool_dispatch(pool_p, strsort_emit_fn, &ectx, n_live);
-            else
-                strsort_emit_fn(&ectx, 0, 0, n_live);
         } else {
             /* --- Top-level byte-0 partition. ---
              * When parallel: per-task histograms, prefix-sum, parallel
@@ -1784,18 +1833,17 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
              * single-pass American-Flag in-place swap loop. */
             ray_t* tmp_hdr = NULL;
             ray_strkey_t* keys_sorted = keys;  /* where the final data lands */
-
+            /* One buffer of n_live records: the stable-scatter scratch when
+             * sequential, or the top-level scatter target when parallel —
+             * after which the drained source doubles as the scratch. */
+            ray_strkey_t* tmp = (ray_strkey_t*)scratch_alloc(&tmp_hdr,
+                                    (size_t)n_live * sizeof(ray_strkey_t));
+            if (!tmp) { scratch_free(keys_hdr); return false; }
             if (!go_parallel || parts_bytes == 0) {
-                strsort_aflag(keys, n_live, /*bp=*/0, parts_bytes,
+                strsort_aflag(keys, tmp, n_live, /*bp=*/0, parts_bytes,
                               /*base_offset=*/0, elems, pool, parts);
             } else {
-                ray_strkey_t* tmp = (ray_strkey_t*)scratch_alloc(&tmp_hdr,
-                                        (size_t)n_live * sizeof(ray_strkey_t));
-                if (!tmp) {
-                    /* Fall back to sequential sort on OOM. */
-                    strsort_aflag(keys, n_live, /*bp=*/0, parts_bytes,
-                                  /*base_offset=*/0, elems, pool, parts);
-                } else {
+                {
                     uint32_t n_tasks = ray_pool_total_workers(pool_p);
                     if (n_tasks < 1) n_tasks = 1;
 
@@ -1810,7 +1858,7 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
                          * belongs to the outer cleanup block (line below) and
                          * MUST NOT be freed twice. */
                         scratch_free(hist_hdr); scratch_free(off_hdr);
-                        strsort_aflag(keys, n_live, /*bp=*/0, parts_bytes,
+                        strsort_aflag(keys, tmp, n_live, /*bp=*/0, parts_bytes,
                                       /*base_offset=*/0, elems, pool, parts);
                     } else {
                         strsort_top_ctx_t tctx = {
@@ -1849,8 +1897,11 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
                         scratch_free(off_hdr);
 
                         /* Pass 4: parallel per-bucket recursive sort. */
+                        /* keys (the scatter source) is free now: it becomes
+                         * the per-bucket scratch of the recursive passes. */
                         strsort_bucket_ctx_t bctx = {
                             .keys        = tmp,
+                            .scratch     = keys,
                             .starts      = bucket_starts,
                             .counts      = bucket_counts,
                             .parts_bytes = parts_bytes,
@@ -1868,23 +1919,21 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
                 }
             }
 
-            /* Scatter row indices back (ASC order, parallel). */
-            strsort_emit_ctx_t ectx = { sorted_idx, keys_sorted };
-            if (go_parallel)
-                ray_pool_dispatch(pool_p, strsort_emit_fn, &ectx, n_live);
-            else
-                strsort_emit_fn(&ectx, 0, 0, n_live);
-
-            if (tmp_hdr) scratch_free(tmp_hdr);
-
-            /* DESC reverses the sorted non-null range. */
-            if (desc) {
-                for (int64_t i = 0, j = n_live - 1; i < j; i++, j--) {
-                    int64_t t = sorted_idx[i];
-                    sorted_idx[i] = sorted_idx[j];
-                    sorted_idx[j] = t;
-                }
+            if (!desc) {
+                /* Scatter row indices back (ASC order, parallel). */
+                strsort_emit_ctx_t ectx = { sorted_idx, keys_sorted };
+                if (go_parallel)
+                    ray_pool_dispatch(pool_p, strsort_emit_fn, &ectx, n_live);
+                else
+                    strsort_emit_fn(&ectx, 0, 0, n_live);
+            } else {
+                /* DESC: the runs of equal strings in reverse run order, each
+                 * run kept in ascending (source-row) order — a stable
+                 * descending sort.  Walks keys_sorted, so it runs before the
+                 * scratch that may hold it is freed. */
+                strsort_emit_desc_stable(sorted_idx, keys_sorted, n_live, parts, elems, pool);
             }
+            if (tmp_hdr) scratch_free(tmp_hdr);
         }
 
         scratch_free(keys_hdr);
@@ -2444,15 +2493,17 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             if (ptmp) {
                                 /* Fuse packing with sortedness + reverse detection */
                                 uint32_t pd_nw = sk_pool ? ray_pool_total_workers(sk_pool) : 1;
-                                int64_t pd_pw[pd_nw], pd_nr[pd_nw];
+                                int64_t pd_pw[pd_nw], pd_nr[pd_nw], pd_eq[pd_nw];
                                 memset(pd_pw, 0, (size_t)pd_nw * sizeof(int64_t));
                                 memset(pd_nr, 0, (size_t)pd_nw * sizeof(int64_t));
+                                memset(pd_eq, 0, (size_t)pd_nw * sizeof(int64_t));
                                 uint64_t key_mask_pd =
                                     (key_bits < 64) ? ((1ULL << key_bits) - 1) : ~0ULL;
                                 packed_detect_ctx_t pd_ctx = {
                                     .keys = keys, .key_bits = key_bits,
                                     .key_mask = key_mask_pd,
                                     .pw_unsorted = pd_pw, .pw_not_reverse = pd_nr,
+                                    .pw_equal = pd_eq,
                                 };
 
                                 if (sk_pool)
@@ -2461,10 +2512,11 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                     packed_detect_fn(&pd_ctx, 0, 0, nrows);
 
                                 /* Aggregate sortedness results */
-                                int64_t total_unsorted = 0, total_not_rev = 0;
+                                int64_t total_unsorted = 0, total_not_rev = 0, total_equal = 0;
                                 for (uint32_t t = 0; t < pd_nw; t++) {
                                     total_unsorted += pd_pw[t];
                                     total_not_rev += pd_nr[t];
+                                    total_equal += pd_eq[t];
                                 }
                                 /* Check cross-task boundaries */
                                 int64_t grain = RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
@@ -2474,17 +2526,38 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                     uint64_t ka = keys[b-1] & key_mask_s;
                                     uint64_t kb2 = keys[b] & key_mask_s;
                                     if (kb2 < ka) total_unsorted++;
-                                    if (kb2 > ka) total_not_rev++;
+                                    else if (kb2 > ka) total_not_rev++;
+                                    else total_equal++;
                                 }
 
                                 if (total_unsorted == 0) {
                                     /* Already sorted - identity permutation */
                                     sorted_idx = indices;
                                     radix_done = true;
-                                } else if (total_not_rev == 0 && nrows > 1) {
-                                    /* Reverse-sorted - reverse indices in O(n) */
+                                } else if (total_not_rev == 0 && nrows > 1 && total_equal == 0) {
+                                    /* Strictly reverse-sorted: reverse in O(n). */
                                     for (int64_t i = 0; i < nrows; i++)
                                         indices[i] = nrows - 1 - i;
+                                    sorted_idx = indices;
+                                    radix_done = true;
+                                } else if (total_not_rev == 0 && nrows > 1) {
+                                    /* Reverse-sorted with ties: emit the runs of
+                                     * equal keys in reverse run order, each run
+                                     * in its original row order, so ties stay
+                                     * stable.  A plain n-1-i mirrored every
+                                     * plateau of duplicates. */
+                                    int64_t out = 0;
+                                    int64_t run_end = nrows;
+                                    while (run_end > 0) {
+                                        int64_t run_start = run_end - 1;
+                                        uint64_t kr = keys[run_start] & key_mask_s;
+                                        while (run_start > 0 &&
+                                               (keys[run_start - 1] & key_mask_s) == kr)
+                                            run_start--;
+                                        for (int64_t i = run_start; i < run_end; i++)
+                                            indices[out++] = i;
+                                        run_end = run_start;
+                                    }
                                     sorted_idx = indices;
                                     radix_done = true;
                                 } else {

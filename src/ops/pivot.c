@@ -1205,11 +1205,22 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     const uint32_t pvt_null_word  = n_idx >> 6;
     const int64_t  pvt_null_bit   = (int64_t)((uint64_t)1 << (n_idx & 63));
 
+    /* Radix partitioning is an execution detail: positions are handed out
+     * in the order a value's or index tuple's earliest source row appears,
+     * so the pivot columns and the index rows come out in first-seen order
+     * whatever the partition or task-claim order was (group-by orders its
+     * output the same way).  Both walks below stay linear over the
+     * partitions; the earliest row per position is tracked as they go and
+     * the positions are renumbered once at the end. */
+    ray_t* pv_first_hdr = NULL;
+    uint32_t pv_first_cap = 64;
+    int64_t* pv_first = (int64_t*)scratch_alloc(&pv_first_hdr, pv_first_cap * sizeof(int64_t));
+    if (!pv_first) { pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
     /* Collect distinct pivot values */
     uint32_t pv_cap = 64, pv_count = 0;
     ray_t* pv_hdr = NULL;
     int64_t* pv_vals = (int64_t*)scratch_alloc(&pv_hdr, pv_cap * sizeof(int64_t));
-    if (!pv_vals) { pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
+    if (!pv_vals) { scratch_free(pv_first_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
 
     const char* pvt_base = pvt_wide ? (const char*)key_data[n_idx] : NULL;
     for (uint32_t _p = 0; _p < pg.n_parts; _p++) {
@@ -1220,13 +1231,15 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             const int64_t* rkeys = (const int64_t*)(row + 8);
             if (rkeys[n_keys + pvt_null_word] & pvt_null_bit) continue;
             int64_t pval = rkeys[n_idx];
+            int64_t gfirst;
+            memcpy(&gfirst, row + ly.off_group_first, 8);
             bool found = false;
             for (uint32_t p = 0; p < pv_count; p++) {
                 if (pvt_wide) {
                     if (memcmp(pvt_base + (size_t)pv_vals[p] * 16,
-                               pvt_base + (size_t)pval * 16, 16) == 0) { found = true; break; }
+                               pvt_base + (size_t)pval * 16, 16) == 0) { found = true; if (gfirst < pv_first[p]) pv_first[p] = gfirst; break; }
                 } else {
-                    if (pv_vals[p] == pval) { found = true; break; }
+                    if (pv_vals[p] == pval) { found = true; if (gfirst < pv_first[p]) pv_first[p] = gfirst; break; }
                 }
             }
             if (!found) {
@@ -1234,10 +1247,13 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     uint32_t new_cap = pv_cap * 2;
                     int64_t* new_pv = (int64_t*)scratch_realloc(&pv_hdr,
                         pv_cap * sizeof(int64_t), new_cap * sizeof(int64_t));
-                    if (!new_pv) { pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
-                    pv_vals = new_pv;
-                    pv_cap = new_cap;
+                    int64_t* new_pf = (int64_t*)scratch_realloc(&pv_first_hdr,
+                        pv_first_cap * sizeof(int64_t), new_cap * sizeof(int64_t));
+                    if (!new_pv || !new_pf) { scratch_free(pv_first_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
+                    pv_vals = new_pv; pv_first = new_pf;
+                    pv_cap = new_cap; pv_first_cap = new_cap;
                 }
+                pv_first[pv_count] = gfirst;
                 pv_vals[pv_count++] = pval;
             }
         }
@@ -1258,7 +1274,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_t* ix_hdr = NULL;
     size_t ix_entry = 8 + (size_t)n_idx * 8 + (size_t)null_words * 8;
     char* ix_rows = (char*)scratch_alloc(&ix_hdr, ix_cap * ix_entry);
-    if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
+    if (!ix_rows) { scratch_free(pv_first_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
+    ray_t* ix_first_hdr = NULL;
+    int64_t* ix_first = (int64_t*)scratch_alloc(&ix_first_hdr, ix_cap * sizeof(int64_t));
+    if (!ix_first) { scratch_free(ix_hdr); scratch_free(pv_first_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
 
     /* Secondary HT: hash slot -> ix_row index; empty = UINT32_MAX. */
     uint32_t ix_ht_cap = 256;
@@ -1268,6 +1287,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!ix_ht) {
         scratch_free(ix_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly);
         scratch_free(key_hdr);
+        scratch_free(ix_first_hdr); scratch_free(pv_first_hdr);
         return ray_error("oom", NULL);
     }
     memset(ix_ht, 0xFF, ix_ht_cap * sizeof(uint32_t));
@@ -1280,6 +1300,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         scratch_free(ix_ht_hdr); scratch_free(ix_hdr); scratch_free(pv_hdr);
         pivot_ingest_free(&pg); ght_layout_free(&ly);
         scratch_free(key_hdr);
+        scratch_free(ix_first_hdr); scratch_free(pv_first_hdr);
         return ray_error("oom", NULL);
     }
     uint32_t* grp_pv = grp_ix + grp_count;
@@ -1300,6 +1321,8 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 grp_pv[gi] = UINT32_MAX;
                 continue;
             }
+            int64_t gfirst;
+            memcpy(&gfirst, row + ly.off_group_first, 8);
         /* Index-key null words: keys[n_keys .. n_keys+null_words) as-is.
          * The pivot key's own null bit (position n_idx, word pvt_null_word)
          * is guaranteed 0 here — the check just above already `continue`d
@@ -1349,7 +1372,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     const int64_t* ent_nwords = (const int64_t*)(ix_entry_p + 8 + (size_t)n_idx * 8);
                     eq = (memcmp(ent_nwords, idx_nwords, (size_t)null_words * 8) == 0);
                 }
-                if (eq) { ix_row = ent; break; }
+                if (eq) { ix_row = ent; if (gfirst < ix_first[ent]) ix_first[ent] = gfirst; break; }
             }
             slot = (slot + 1) & ix_ht_mask;
         }
@@ -1362,12 +1385,23 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     scratch_free(map_hdr); scratch_free(ix_ht_hdr);
                     scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly);
                     scratch_free(key_hdr);
+                    scratch_free(ix_first_hdr); scratch_free(pv_first_hdr);
                     return ray_error("oom", NULL);
                 }
+                int64_t* new_first = (int64_t*)scratch_realloc(&ix_first_hdr,
+                    ix_cap * sizeof(int64_t), new_cap * sizeof(int64_t));
+                if (!new_first) {
+                    scratch_free(map_hdr); scratch_free(ix_ht_hdr); scratch_free(ix_first_hdr);
+                    scratch_free(ix_hdr); scratch_free(pv_first_hdr); scratch_free(pv_hdr);
+                    pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr);
+                    return ray_error("oom", NULL);
+                }
+                ix_first = new_first;
                 ix_rows = new_rows;
                 ix_cap = new_cap;
             }
             ix_row = ix_count++;
+            ix_first[ix_row] = gfirst;
             char* dst = ix_rows + (size_t)ix_row * ix_entry;
             *(uint64_t*)dst = ih;
             memcpy(dst + 8, keys, (size_t)n_idx * 8);
@@ -1395,6 +1429,103 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
     /* Pass 3: Build output table */
+    /* Renumber: rank pivot values and index rows by their earliest source
+     * row, permute pv_vals / ix_rows into rank order, and point every group
+     * at its new positions.  A linear scan over the row domain ranks the
+     * index rows when there are many of them; a merge on ids does otherwise. */
+    {
+        /* 8-byte array first, the 4-byte ranks after it, so every array
+         * starts aligned whatever the counts are. */
+        ray_t* rank_hdr = NULL;
+        int64_t* pv_tmp = (int64_t*)scratch_alloc(&rank_hdr,
+            ((size_t)pv_count + 1) * sizeof(int64_t) + ((size_t)pv_count + (size_t)ix_count + 1) * sizeof(uint32_t));
+        uint32_t* pv_rank = pv_tmp ? (uint32_t*)(pv_tmp + pv_count + 1) : NULL;
+        if (!pv_rank) {
+            scratch_free(map_hdr); scratch_free(ix_ht_hdr); scratch_free(ix_first_hdr);
+            scratch_free(ix_hdr); scratch_free(pv_first_hdr); scratch_free(pv_hdr);
+            pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr);
+            return ray_error("oom", NULL);
+        }
+        uint32_t* ix_rank = pv_rank + pv_count;
+        /* pivot values: few — insertion sort of old positions by first row */
+        for (uint32_t p = 0; p < pv_count; p++) pv_rank[p] = p;
+        for (uint32_t i = 1; i < pv_count; i++) {
+            uint32_t v = pv_rank[i]; uint32_t j = i;
+            while (j > 0 && pv_first[pv_rank[j - 1]] > pv_first[v]) { pv_rank[j] = pv_rank[j - 1]; j--; }
+            pv_rank[j] = v;
+        }
+        for (uint32_t r = 0; r < pv_count; r++) pv_tmp[r] = pv_vals[pv_rank[r]];
+        memcpy(pv_vals, pv_tmp, (size_t)pv_count * sizeof(int64_t));
+        for (uint32_t r = 0; r < pv_count; r++) pv_tmp[pv_rank[r]] = r;   /* invert: old -> new */
+        for (uint32_t p = 0; p < pv_count; p++) pv_rank[p] = (uint32_t)pv_tmp[p];
+        /* index rows */
+        bool ranked = false;
+        if ((uint64_t)ix_count * 16 >= (uint64_t)nrows && nrows > 0) {
+            ray_t* pos_hdr = NULL;
+            uint32_t* pos = (uint32_t*)scratch_alloc(&pos_hdr, (size_t)nrows * sizeof(uint32_t));
+            if (pos) {
+                memset(pos, 0xFF, (size_t)nrows * sizeof(uint32_t));
+                bool ok = true;
+                for (uint32_t i = 0; i < ix_count && ok; i++) {
+                    int64_t f = ix_first[i];
+                    if (f < 0 || f >= nrows || pos[f] != UINT32_MAX) ok = false; else pos[f] = i;
+                }
+                if (ok) {
+                    uint32_t next = 0;
+                    for (int64_t r = 0; r < nrows; r++)
+                        if (pos[r] != UINT32_MAX) ix_rank[pos[r]] = next++;
+                    ranked = (next == ix_count);
+                }
+                scratch_free(pos_hdr);
+            }
+        }
+        if (!ranked && ix_count > 0) {
+            ray_t* tmp_hdr = NULL;
+            uint32_t* buf = (uint32_t*)scratch_alloc(&tmp_hdr, 2 * (size_t)ix_count * sizeof(uint32_t));
+            if (!buf) {
+                scratch_free(rank_hdr); scratch_free(map_hdr); scratch_free(ix_ht_hdr); scratch_free(ix_first_hdr);
+                scratch_free(ix_hdr); scratch_free(pv_first_hdr); scratch_free(pv_hdr);
+                pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr);
+                return ray_error("oom", NULL);
+            }
+            uint32_t* src = buf; uint32_t* dst = buf + ix_count;
+            for (uint32_t i = 0; i < ix_count; i++) src[i] = i;
+            for (uint32_t w = 1; w < ix_count; w *= 2) {
+                for (uint32_t lo = 0; lo < ix_count; lo += 2 * w) {
+                    uint32_t mid = lo + w < ix_count ? lo + w : ix_count;
+                    uint32_t hi  = lo + 2 * w < ix_count ? lo + 2 * w : ix_count;
+                    uint32_t a = lo, b = mid, o = lo;
+                    while (a < mid && b < hi) dst[o++] = (ix_first[src[b]] < ix_first[src[a]]) ? src[b++] : src[a++];
+                    while (a < mid) dst[o++] = src[a++];
+                    while (b < hi)  dst[o++] = src[b++];
+                }
+                uint32_t* t = src; src = dst; dst = t;
+            }
+            for (uint32_t r = 0; r < ix_count; r++) ix_rank[src[r]] = r;   /* old -> new */
+            scratch_free(tmp_hdr);
+        }
+        if (ix_count > 0) {
+            ray_t* perm_hdr = NULL;
+            char* perm = (char*)scratch_alloc(&perm_hdr, (size_t)ix_count * ix_entry);
+            if (!perm) {
+                scratch_free(rank_hdr); scratch_free(map_hdr); scratch_free(ix_ht_hdr); scratch_free(ix_first_hdr);
+                scratch_free(ix_hdr); scratch_free(pv_first_hdr); scratch_free(pv_hdr);
+                pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr);
+                return ray_error("oom", NULL);
+            }
+            for (uint32_t i = 0; i < ix_count; i++)
+                memcpy(perm + (size_t)ix_rank[i] * ix_entry, ix_rows + (size_t)i * ix_entry, ix_entry);
+            memcpy(ix_rows, perm, (size_t)ix_count * ix_entry);
+            scratch_free(perm_hdr);
+        }
+        for (uint32_t gi = 0; gi < grp_count; gi++) {
+            if (grp_ix[gi] != UINT32_MAX) grp_ix[gi] = ix_rank[grp_ix[gi]];
+            if (grp_pv[gi] != UINT32_MAX) grp_pv[gi] = pv_rank[grp_pv[gi]];
+        }
+        scratch_free(rank_hdr);
+    }
+    scratch_free(ix_first_hdr);
+    scratch_free(pv_first_hdr);
     ray_progress_update("pivot", "scatter", 0, (uint64_t)pv_count);
     bool val_is_f64 = vcol->type == RAY_F64;
     int8_t out_agg_type;

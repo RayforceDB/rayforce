@@ -1,0 +1,41 @@
+;; Sorting is stable in every size regime and every direction: equal keys keep
+;; their source-row order.  Each block sits just past a regime boundary where
+;; the shortcut or kernel changes (merge sort ≤64 → radix; packed-radix
+;; "reverse-sorted" shortcut past 4096; STR American-flag past 64).
+
+;; --- integer keys, descending-with-duplicates input hits the reverse shortcut
+(set N 4097)
+(set K (reverse (asc (% (til N) 100))))
+(set T (table [k v] (list K (til N))))
+(at (at (xasc T 'k) 'v) (til 4)) -- [4056 4057 4058 4059]
+(at (at (xdesc T 'k) 'v) (til 4)) -- [0 1 2 3]
+(set G (select {from: (xasc T 'k) by: k l: (last v) f: (first v)}))
+(at (at G 'l) (til 2)) -- [4096 4055]
+(at (at G 'f) (til 2)) -- [4056 4015]
+;; the same at the boundary itself, where the introsort path runs
+(set N2 4096)
+(set T2 (table [k v] (list (reverse (asc (% (til N2) 100))) (til N2))))
+(at (at (xasc T2 'k) 'v) (til 4)) -- [4055 4056 4057 4058]
+;; iasc/idesc agree with xasc/xdesc on the tie rule
+(at (iasc K) (til 4)) -- [4056 4057 4058 4059]
+(at (idesc K) (til 4)) -- [0 1 2 3]
+
+;; --- STR keys, ties everywhere, past the 64-row merge-sort regime
+(set MK (fn [n m] (as 'STR (map (fn [i] (format "s%" (% i m))) (til n)))))
+(at (iasc (MK 64 4)) (til 6)) -- [0 4 8 12 16 20]
+(at (iasc (MK 100 4)) (til 6)) -- [0 4 8 12 16 20]
+(at (iasc (MK 100000 4)) (til 6)) -- [0 4 8 12 16 20]
+(at (idesc (MK 100 4)) (til 6)) -- [3 7 11 15 19 23]
+(at (idesc (MK 100000 4)) (til 6)) -- [3 7 11 15 19 23]
+;; descending on already-sorted STR input (the run shortcut)
+(set SA (as 'STR (map (fn [i] (format "s%" i)) (asc (% (til 100) 4)))))
+(at (idesc SA) (til 6)) -- [75 76 77 78 79 80]
+(at (iasc (as 'STR (map (fn [i] (format "s%" i)) (desc (% (til 100) 4))))) (til 6)) -- [75 76 77 78 79 80]
+;; strings longer than the packed prefix, ties on the tail
+(set LK (as 'STR (map (fn [i] (format "a-long-common-prefix-of-many-bytes-%" (% i 3))) (til 300))))
+(at (iasc LK) (til 4)) -- [0 3 6 9]
+(at (idesc LK) (til 4)) -- [2 5 8 11]
+;; a table sort by a STR column
+(set ST (table [k v] (list (MK 100 4) (til 100))))
+(at (at (xasc ST 'k) 'v) (til 4)) -- [0 4 8 12]
+(at (at (xdesc ST 'k) 'v) (til 4)) -- [3 7 11 15]
