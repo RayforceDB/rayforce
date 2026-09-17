@@ -15,7 +15,7 @@
 ;; per-group oracle on a few groups
 (set ORA (fn [aa bb] (count (distinct (at (select {from: T where: (and (== a aa) (== b bb))}) 'u)))))
 (set CHK (fn [i] (== (at (at V 'u) i) (ORA (at (at V 'a) i) (at (at V 'b) i)))))
-(all (map CHK [0 1 2 (div (count V) 3) (- (count V) 1)])) -- true
+(all (map CHK (list 0 1 2 (div (count V) 3) (- (count V) 1)))) -- true
 ;; where + desc + take (the ClickBench Q12 shape): the ten rows must carry
 ;; the ten largest counts of the full, filtered result — ties past the cut
 ;; may pick either group, so the keys are checked through their counts
