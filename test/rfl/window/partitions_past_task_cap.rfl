@@ -1,0 +1,18 @@
+;; A window with more partitions than the pool's task ring can hold at once
+;; (65536) must still compute every partition.  Before the fix the pool
+;; silently dropped the tasks past the ring, and the tail partitions came back
+;; as the NULL placeholder the result was pre-filled with.
+(set N 70000)
+(set K (til N))
+(set V (til N))
+(set T (table [k v] (list K V)))
+(set R (window {from: T part: [k] funcs: {mx: (max v)}}))
+(count R) -- N
+(all (== (at R 'mx) V)) -- true
+(sum (as 'I64 (== (at R 'mx) 0Nl))) -- 0
+(set R2 (window {from: T part: [k] order: [v] frame: 'running funcs: {cs: (sum v)}}))
+(all (== (at R2 'cs) V)) -- true
+;; exactly one past the ring
+(set N1 65537)
+(set T1 (table [k v] (list (til N1) (til N1))))
+(all (== (at (window {from: T1 part: [k] funcs: {mx: (max v)}}) 'mx) (til N1))) -- true
