@@ -117,7 +117,14 @@ static int64_t sym_intern_nolock(uint32_t hash, const char* str, size_t len,
  * ray_sym_init
  * -------------------------------------------------------------------------- */
 
+static _Atomic uint64_t g_sym_epoch_ctr = 0;
+
+uint64_t ray_sym_epoch(void) {
+    return atomic_load_explicit(&g_sym_epoch_ctr, memory_order_acquire);
+}
+
 ray_err_t ray_sym_init(void) {
+    atomic_fetch_add_explicit(&g_sym_epoch_ctr, 1, memory_order_release);
     bool expected = false;
     if (!atomic_compare_exchange_strong_explicit(&g_sym_inited, &expected, true,
             memory_order_acq_rel, memory_order_acquire))
@@ -213,6 +220,7 @@ ray_err_t ray_sym_init(void) {
  * -------------------------------------------------------------------------- */
 
 void ray_sym_destroy(void) {
+    atomic_fetch_add_explicit(&g_sym_epoch_ctr, 1, memory_order_release);
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
 
     if (g_sym.lazy_map) {

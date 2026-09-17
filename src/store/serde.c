@@ -39,6 +39,7 @@
 #  include <unistd.h>
 #endif
 #include "table/sym.h"
+#include "table/domain.h"
 #include "lang/env.h"
 #include "lang/eval.h"
 #include "lang/format.h"
@@ -152,6 +153,64 @@ static const char* serde_builtin_name(ray_t* obj, size_t* nlen) {
     return name;
 }
 
+
+/* ---- SYM encode: a per-thread id -> (bytes, len) cache -------------------
+ *
+ * ray_sym_str takes the global sym spinlock around a single array read, so
+ * walking a SYM column cost one atomic exchange per cell — and both
+ * ray_serde_size and ray_ser_raw walk it, so a frame paid 2 * rows * cols
+ * lock round-trips for a handful of distinct strings (#561).  On a
+ * single-threaded tickerplant that spinning is entirely uncontended.
+ * ray_str_len and ray_str_ptr are out-of-line calls made per cell on top of
+ * that, and profiled at 30% of encode on their own.
+ *
+ * A hit avoids all three.  Sym ids are stable positions for the lifetime of
+ * the table, so the cache persists across calls and needs no per-column
+ * setup; ray_sym_epoch changes when the table is torn down and re-inited,
+ * which is the only event that can invalidate it.
+ *
+ * Direct-mapped, and a collision simply re-resolves: nothing is ever
+ * dropped, so the size is a speed/space tradeoff rather than a limit.  It
+ * lives in thread-local storage, so encode allocates nothing — the path it
+ * replaces allocated nothing either.
+ *
+ * A column with far more distinct symbols than slots would otherwise pay
+ * the probe and the store on top of a resolve it still has to do, which
+ * measured 15% SLOWER than not caching at all.  So the first
+ * SYM_ENC_SAMPLE cells are sampled and the cache is switched off for the
+ * rest of the column if fewer than a quarter of them hit.  Both numbers
+ * are a heuristic, not a limit: either way every cell resolves correctly,
+ * and the worst case is the probe on a bounded prefix. */
+#define SYM_ENC_CACHE_BITS 10
+#define SYM_ENC_CACHE_N    (1u << SYM_ENC_CACHE_BITS)
+
+#define SYM_ENC_SAMPLE     256u
+
+typedef struct {
+    const char* ptr;          /* NULL = empty slot */
+    uint32_t    len;
+    int64_t     id;
+} sym_enc_ent;
+
+
+static _Thread_local sym_enc_ent g_sym_enc_cache[SYM_ENC_CACHE_N];
+static _Thread_local uint64_t    g_sym_enc_epoch;
+
+/* True when cells may be resolved through the cache: the runtime domain
+ * (others already resolve lock-free) and no audit hook (which is a
+ * per-cell contract). */
+static inline bool sym_enc_cacheable(ray_t* obj) {
+    if (ray_g_sym_audit) return false;
+    if (ray_sym_vec_domain(obj) != ray_sym_runtime_domain()) return false;
+    uint64_t ep = ray_sym_epoch();
+    if (ep != g_sym_enc_epoch) {
+        memset(g_sym_enc_cache, 0, sizeof(g_sym_enc_cache));
+        g_sym_enc_epoch = ep;
+    }
+    return true;
+}
+
+
 /* --------------------------------------------------------------------------
  * ray_serde_size — calculate serialized size (excluding IPC header)
  * -------------------------------------------------------------------------- */
@@ -221,9 +280,30 @@ int64_t ray_serde_size(ray_t* obj) {
          * singleton).  Also honors narrow W8/16/32 index widths.  Must
          * stay in lockstep with the ray_ser_raw RAY_SYM loop below. */
         int64_t size = 1 + 1 + 8;
-        for (int64_t i = 0; i < obj->len; i++) {
-            ray_t* s = ray_sym_vec_cell(obj, i);
-            size += (s ? (int64_t)ray_str_len(s) : 0) + 1;
+        int64_t i = 0;
+        if (sym_enc_cacheable(obj)) {
+            const void* data = ray_data(obj);
+            uint8_t attrs = obj->attrs;
+            uint32_t seen = 0, hits = 0;
+            for (; i < obj->len; i++) {
+                int64_t id = ray_read_sym(data, i, RAY_SYM, attrs);
+                sym_enc_ent* e = &g_sym_enc_cache[(uint64_t)id & (SYM_ENC_CACHE_N - 1)];
+                if (e->ptr && e->id == id) { size += (int64_t)e->len + 1; hits++; }
+                else {
+                    ray_t* a = ray_sym_str(id);
+                    uint32_t l = a ? (uint32_t)ray_str_len(a) : 0u;
+                    const char* pp = a ? ray_str_ptr(a) : NULL;
+                    if (pp) { e->ptr = pp; e->len = l; e->id = id; }
+                    size += (int64_t)l + 1;
+                }
+                /* Thrashing column: leave the rest to the plain loop below,
+                 * which is what this path costs without a cache. */
+                if (++seen == SYM_ENC_SAMPLE && hits * 4u < seen) { i++; break; }
+            }
+        }
+        for (; i < obj->len; i++) {
+            ray_t* a = ray_sym_vec_cell(obj, i);
+            size += (a ? (int64_t)ray_str_len(a) : 0) + 1;
         }
         return size;
     }
@@ -436,15 +516,37 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         buf[0] = wire_attrs; buf++;
         memcpy(buf, &obj->len, 8); buf += 8;
         c = 0;
-        for (int64_t i = 0; i < obj->len; i++) {
-            ray_t* s = ray_sym_vec_cell(obj, i);
-            if (s) {
-                size_t slen = ray_str_len(s);
-                memcpy(buf + c, ray_str_ptr(s), slen);
-                c += (int64_t)slen;
+        {
+            int64_t i = 0;
+            if (sym_enc_cacheable(obj)) {
+                const void* data = ray_data(obj);
+                uint8_t attrs = obj->attrs;
+                uint32_t seen = 0, hits = 0;
+                for (; i < obj->len; i++) {
+                    int64_t id = ray_read_sym(data, i, RAY_SYM, attrs);
+                    sym_enc_ent* e = &g_sym_enc_cache[(uint64_t)id & (SYM_ENC_CACHE_N - 1)];
+                    const char* pp; uint32_t slen;
+                    if (e->ptr && e->id == id) { pp = e->ptr; slen = e->len; hits++; }
+                    else {
+                        ray_t* a = ray_sym_str(id);
+                        slen = a ? (uint32_t)ray_str_len(a) : 0u;
+                        pp   = a ? ray_str_ptr(a) : NULL;
+                        if (pp) { e->ptr = pp; e->len = slen; e->id = id; }
+                    }
+                    if (slen) { memcpy(buf + c, pp, slen); c += (int64_t)slen; }
+                    buf[c++] = '\0';
+                    if (++seen == SYM_ENC_SAMPLE && hits * 4u < seen) { i++; break; }
+                }
             }
-            buf[c] = '\0';
-            c++;
+            for (; i < obj->len; i++) {
+                ray_t* a = ray_sym_vec_cell(obj, i);
+                if (a) {
+                    size_t slen = ray_str_len(a);
+                    memcpy(buf + c, ray_str_ptr(a), slen);
+                    c += (int64_t)slen;
+                }
+                buf[c++] = '\0';
+            }
         }
         return 1 + 1 + 8 + c;
     }
