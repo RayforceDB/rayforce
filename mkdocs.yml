@@ -132,6 +132,7 @@ nav:
           - .idx — Indexes: docs/namespaces/idx.md
           - .ipc — IPC client: docs/namespaces/ipc.md
           - .log — Write-ahead log: docs/namespaces/log.md
+          - .mc — Multicast: multicast-usage.md
           - .mem — Measurement: docs/namespaces/mem.md
           - .os — Process env: docs/namespaces/os.md
           - .repl — REPL control: docs/namespaces/repl.md
@@ -170,6 +171,10 @@ nav:
           - Pipeline & Optimizer: docs/architecture/pipeline.md
           - Memory Model: docs/architecture/memory.md
           - Block Offloading: docs/architecture/offloading.md
+      - Design Notes:
+          - Aggregation Fast Paths: aggregation-fast-path-plan.md
+          - Grouping Engine Scaling: grouping-engine-scaling-plan.md
+          - Multicast Implementation: multicast-implementation-plan.md
       - C API:
           - Core API: docs/c-api/core.md
           - DAG API: docs/c-api/dag.md
