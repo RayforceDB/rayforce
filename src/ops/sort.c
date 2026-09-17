@@ -1477,6 +1477,7 @@ static void strsort_top_scatter_fn(void* vctx, uint32_t wid,
 /* Bucket dispatch context: each task sorts one top-level bucket. */
 typedef struct {
     ray_strkey_t*    keys;
+    ray_strkey_t*    scratch;   /* same size as keys; buckets use disjoint slices */
     const int64_t*   starts;
     const int64_t*   counts;
     int              parts_bytes;
@@ -1487,7 +1488,8 @@ typedef struct {
     int              start_bp;  /* byte position to begin radix within bucket */
 } strsort_bucket_ctx_t;
 
-static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
+static void strsort_aflag(ray_strkey_t* keys, ray_strkey_t* scratch,
+                          int64_t n, int bp,
                           int parts_bytes, int64_t base_offset,
                           const ray_str_t* elems, const char* pool,
                           int parts);
@@ -1498,7 +1500,7 @@ static void strsort_bucket_fn(void* vctx, uint32_t wid, int64_t s, int64_t e) {
     for (int64_t b = s; b < e; b++) {
         int64_t cnt = c->counts[b];
         if (cnt <= 1) continue;
-        strsort_aflag(c->keys + c->starts[b], cnt, c->start_bp,
+        strsort_aflag(c->keys + c->starts[b], c->scratch + c->starts[b], cnt, c->start_bp,
                       c->parts_bytes, c->base_offset,
                       c->elems, c->pool, c->parts);
     }
@@ -1593,15 +1595,14 @@ static bool strsort_repack_window(ray_strkey_t* keys, int64_t n,
                 : 0;
         }
     }
-    if (!any_tail && n > 1) {
+    if (!any_tail && n > 1 && min_len != max_len) {
         /* Every string ended at or before base_offset, they tied on
          * the zero-padded packed prefix, and at least two of them
          * differ in length.  A string of length 3 whose bytes match
          * a prefix of a length-5 string must sort before it (per
          * ray_str_t_cmp), so finalize the bucket by sorting on len.
-         * When min_len == max_len every record is bitwise equal, and the
-         * in-place radix passes have shuffled them: the (len, row) sort
-         * puts them back in source order, which a stable sort owes. */
+         * When min_len == max_len every record is bitwise equal and the
+         * stable scatter has kept them in source order — nothing to do. */
         strkey_qsort_by_len(keys, 0, n - 1);
     }
     return any_tail;
@@ -1616,7 +1617,8 @@ static bool strsort_repack_window(ray_strkey_t* keys, int64_t n,
  *
  * parts_bytes = parts * 8 (cached).  base_offset tracks how many bytes
  * of the original string have already been consumed by earlier windows. */
-static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
+static void strsort_aflag(ray_strkey_t* keys, ray_strkey_t* scratch,
+                          int64_t n, int bp,
                           int parts_bytes, int64_t base_offset,
                           const ray_str_t* elems, const char* pool,
                           int parts) {
@@ -1678,26 +1680,19 @@ static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
             }
         }
 
-        /* In-place swap loop: classic American Flag.  For each bucket b,
-         * drain records out of its slice whose current byte != b into
-         * their correct destination, cycling until the bucket slice
-         * contains only records that belong in b. */
-        int64_t cursors[256];
-        memcpy(cursors, starts, sizeof(cursors));
-        for (int b = 0; b < 256; b++) {
-            while (cursors[b] < ends[b]) {
-                ray_strkey_t v = keys[cursors[b]];
-                int bb = strkey_byte_at(&v, bp);
-                while (bb != b) {
-                    ray_strkey_t tmp = keys[cursors[bb]];
-                    keys[cursors[bb]] = v;
-                    cursors[bb]++;
-                    v = tmp;
-                    bb = strkey_byte_at(&v, bp);
-                }
-                keys[cursors[b]] = v;
-                cursors[b]++;
-            }
+        /* Stable scatter: records go to their bucket in scan order, so
+         * equal strings keep their source order all the way down and the
+         * sort stays stable.  (The in-place American-Flag swap loop this
+         * replaces shuffled records inside a bucket.)  The scatter goes
+         * through the caller's scratch slice and comes back with one
+         * memcpy — the same traffic the swap loop's moves cost. */
+        {
+            int64_t cursors[256];
+            memcpy(cursors, starts, sizeof(cursors));
+            (void)ends;
+            for (int64_t i = 0; i < n; i++)
+                scratch[cursors[strkey_byte_at(&keys[i], bp)]++] = keys[i];
+            memcpy(keys, scratch, (size_t)n * sizeof(ray_strkey_t));
         }
 
         /* Find the largest bucket; recurse on the rest and loop on the
@@ -1711,11 +1706,12 @@ static void strsort_aflag(ray_strkey_t* keys, int64_t n, int bp,
             if (b == big_b) continue;
             int64_t cnt = counts[b];
             if (cnt > 1) {
-                strsort_aflag(keys + starts[b], cnt, bp + 1,
+                strsort_aflag(keys + starts[b], scratch + starts[b], cnt, bp + 1,
                               parts_bytes, base_offset, elems, pool, parts);
             }
         }
         keys += starts[big_b];
+        scratch += starts[big_b];
         n = big_cnt;
         bp++;
     }
@@ -1735,10 +1731,13 @@ static void strsort_emit_desc_stable(int64_t* out, const ray_strkey_t* keys,
     int64_t run_end = n;
     while (run_end > 0) {
         int64_t run_start = run_end - 1;
-        while (run_start > 0 &&
-               ray_str_t_cmp(&elems[keys[run_start - 1].row], pool,
-                             &elems[keys[run_start].row], pool) == 0)
+        while (run_start > 0) {
+            const ray_str_t* sa = &elems[keys[run_start - 1].row];
+            const ray_str_t* sb = &elems[keys[run_start].row];
+            if (sa->len != sb->len) break;          /* different strings */
+            if (sa->len && memcmp(ray_str_t_ptr(sa, pool), ray_str_t_ptr(sb, pool), sa->len) != 0) break;
             run_start--;
+        }
         for (int64_t i = run_start; i < run_end; i++) out[o++] = (int64_t)keys[i].row;
         run_end = run_start;
     }
@@ -1834,18 +1833,17 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
              * single-pass American-Flag in-place swap loop. */
             ray_t* tmp_hdr = NULL;
             ray_strkey_t* keys_sorted = keys;  /* where the final data lands */
-
+            /* One buffer of n_live records: the stable-scatter scratch when
+             * sequential, or the top-level scatter target when parallel —
+             * after which the drained source doubles as the scratch. */
+            ray_strkey_t* tmp = (ray_strkey_t*)scratch_alloc(&tmp_hdr,
+                                    (size_t)n_live * sizeof(ray_strkey_t));
+            if (!tmp) { scratch_free(keys_hdr); return false; }
             if (!go_parallel || parts_bytes == 0) {
-                strsort_aflag(keys, n_live, /*bp=*/0, parts_bytes,
+                strsort_aflag(keys, tmp, n_live, /*bp=*/0, parts_bytes,
                               /*base_offset=*/0, elems, pool, parts);
             } else {
-                ray_strkey_t* tmp = (ray_strkey_t*)scratch_alloc(&tmp_hdr,
-                                        (size_t)n_live * sizeof(ray_strkey_t));
-                if (!tmp) {
-                    /* Fall back to sequential sort on OOM. */
-                    strsort_aflag(keys, n_live, /*bp=*/0, parts_bytes,
-                                  /*base_offset=*/0, elems, pool, parts);
-                } else {
+                {
                     uint32_t n_tasks = ray_pool_total_workers(pool_p);
                     if (n_tasks < 1) n_tasks = 1;
 
@@ -1860,7 +1858,7 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
                          * belongs to the outer cleanup block (line below) and
                          * MUST NOT be freed twice. */
                         scratch_free(hist_hdr); scratch_free(off_hdr);
-                        strsort_aflag(keys, n_live, /*bp=*/0, parts_bytes,
+                        strsort_aflag(keys, tmp, n_live, /*bp=*/0, parts_bytes,
                                       /*base_offset=*/0, elems, pool, parts);
                     } else {
                         strsort_top_ctx_t tctx = {
@@ -1899,8 +1897,11 @@ static bool sort_str_msd_inplace(int64_t* sorted_idx, int64_t nrows,
                         scratch_free(off_hdr);
 
                         /* Pass 4: parallel per-bucket recursive sort. */
+                        /* keys (the scatter source) is free now: it becomes
+                         * the per-bucket scratch of the recursive passes. */
                         strsort_bucket_ctx_t bctx = {
                             .keys        = tmp,
+                            .scratch     = keys,
                             .starts      = bucket_starts,
                             .counts      = bucket_counts,
                             .parts_bytes = parts_bytes,
