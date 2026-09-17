@@ -33,7 +33,9 @@ struct ray_mcast {
     int64_t published;
     int64_t delivered;
     int64_t dropped;
-    int64_t framed;      /* wire frames built: one per publication, not per subscriber */
+    int64_t framed;      /* wire frames built: one per DISTINCT compression
+                          * policy per publication (#551), not one per publication
+                          * and not one per subscriber */
 };
 
 static int64_t topic_sym(ray_t* topic) {
@@ -342,19 +344,17 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
     t->next_seq++;
     mc->published++;
 
-    for (int32_t i = 0; i < t->n_subs;) {
+    /* Build every framing this topic needs BEFORE sending any of them.  A
+     * framing failure is a local resource failure that says nothing about
+     * any peer, so it must neither drop a subscriber the way a failed send
+     * does nor leave the publication half fanned out: with nothing sent
+     * yet, the error below leaves every subscription exactly as it was. */
+    for (int32_t i = 0; i < t->n_subs && ferr == RAY_OK; i++)
+        (void)mc_frame_for(mc, msg, t->subs[i].handle, framings, &n_framings, &ferr);
+
+    for (int32_t i = 0; ferr == RAY_OK && i < t->n_subs;) {
         ray_poll_frame_t* frame = mc_frame_for(mc, msg, t->subs[i].handle,
                                                framings, &n_framings, &ferr);
-        if (!frame) {
-            /* Could not frame for this subscriber: drop it rather than
-             * silently delivering nothing, same as a failed send. */
-            int64_t dead0 = t->subs[i].handle;
-            t->subs[i].dropped++;
-            mc->dropped++;
-            remove_sub(t, i);
-            dead_handles[dead_n++] = dead0;
-            continue;
-        }
         ray_err_t rc = ray_ipc_try_send_frame(t->subs[i].handle, frame);
         if (rc == RAY_OK) {
             t->subs[i].last_sent_seq = seq;
@@ -371,7 +371,11 @@ ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload) {
     for (int32_t f = 0; f < n_framings; f++)
         ray_poll_frame_release(framings[f].frame);
     ray_release(msg);
-    if (n_framings == 0 && ferr != RAY_OK && t->n_subs == 0 && dead_n == 0) {
+    if (ferr != RAY_OK) {
+        /* Framing is all done before the first send, so nothing was
+         * delivered and no subscriber was dropped (dead_n is 0 here).
+         * Report the failure instead of returning a sequence number for a
+         * publication that never fanned out. */
         if (dead_handles) ray_sys_free(dead_handles);
         return ferr == RAY_ERR_OOM ? ray_error("oom", NULL)
                                    : ray_error("io", ".mc.pub could not frame the payload");

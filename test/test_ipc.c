@@ -2595,12 +2595,14 @@ static test_result_t test_ipc_mcast_local_not_compressed(void) {
     ray_t* pub = ray_str(psrc, strlen(psrc));
     ray_t* pr = ray_ipc_send(h, pub);
     ray_release(pub);
-    /* .mc.pub returns the number of subscribers it reached; 0 would mean
-     * the publication never fanned out and the assertions below vacuous. */
+    /* .mc.pub returns the topic's SEQUENCE number, not a subscriber count,
+     * so this only says the publish itself did not error.  What actually
+     * rules out a vacuous pass is that the read below must produce a real
+     * frame: if the publication never fanned out, ray_sock_wait_readable
+     * times out and the test fails there. */
     TEST_ASSERT_NOT_NULL(pr);
     TEST_ASSERT_FALSE(RAY_IS_ERR(pr));
     TEST_ASSERT_EQ_I(pr->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(pr->i64, 1);
     ray_release(pr);
 
     /* The publication arrives as an ASYNC frame on the subscriber. */
