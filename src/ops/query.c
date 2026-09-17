@@ -2803,6 +2803,66 @@ static int collect_col_refs(ray_t* expr, ray_t* tbl,
  * falls back to the plain evaluation).  Only when the distinct count is
  * well below the row count: the expression costs O(du) here, the spread
  * O(nrows) plain reads. */
+/* Is `e` a pure, row-local function of the column `col_sym` (plus
+ * let-bound names)?  Heads must come from a fixed list of elementwise
+ * operators — anything positional (differ, fills, deltas, moving windows),
+ * a user function, or a free symbol that is not the column (a global
+ * vector of table length) disqualifies the per-symbol evaluation. */
+static bool derived_key_head_ok(int64_t head) {
+    static const char* const ok[] = {
+        "let", "if", "cond", "and", "or", "not",
+        "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%",
+        "abs", "neg", "floor", "ceil", "round", "xbar", "as",
+        "substr", "str-find", "strlen", "within", "nil?", "upper", "lower", "like",
+    };
+    ray_t* name = ray_sym_str(head);
+    if (!name || RAY_IS_ERR(name)) return false;
+    size_t n = ray_str_len(name);
+    const char* q = ray_str_ptr(name);
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+        if (strlen(ok[i]) == n && memcmp(ok[i], q, n) == 0) return true;
+    return false;
+}
+static bool derived_key_expr_ok(ray_t* e, int64_t col_sym, int64_t* bound, int nbound) {
+    if (!e) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;            /* symbol literal */
+        if (e->i64 == col_sym) return true;
+        for (int i = 0; i < nbound; i++) if (bound[i] == e->i64) return true;
+        return false;                                       /* free name */
+    }
+    if (e->type != RAY_LIST) return true;                   /* atom / vector literal */
+    int64_t n = ray_len(e);
+    if (n < 1) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED) || !derived_key_head_ok(el[0]->i64))
+        return false;
+    ray_t* hs = ray_sym_str(el[0]->i64);
+    size_t hl = ray_str_len(hs);
+    const char* hp = ray_str_ptr(hs);
+    if (hl == 3 && memcmp(hp, "let", 3) == 0) {
+        if (n != 4 || el[1]->type != -RAY_SYM || nbound >= 32) return false;
+        if (!derived_key_expr_ok(el[2], col_sym, bound, nbound)) return false;
+        bound[nbound] = el[1]->i64;
+        return derived_key_expr_ok(el[3], col_sym, bound, nbound + 1);
+    }
+    if (hl == 4 && memcmp(hp, "cond", 4) == 0) {
+        for (int64_t i = 1; i < n; i++) {
+            if (el[i]->type != RAY_LIST || ray_len(el[i]) != 2) return false;
+            ray_t** cp = (ray_t**)ray_data(el[i]);
+            bool is_else = cp[0]->type == -RAY_SYM && !(cp[0]->attrs & ATTR_QUOTED) &&
+                           ray_str_len(ray_sym_str(cp[0]->i64)) == 4 &&
+                           memcmp(ray_str_ptr(ray_sym_str(cp[0]->i64)), "else", 4) == 0;
+            if (!is_else && !derived_key_expr_ok(cp[0], col_sym, bound, nbound)) return false;
+            if (!derived_key_expr_ok(cp[1], col_sym, bound, nbound)) return false;
+        }
+        return true;
+    }
+    for (int64_t i = 1; i < n; i++)
+        if (!derived_key_expr_ok(el[i], col_sym, bound, nbound)) return false;
+    return true;
+}
+
 /* Name for a computed group key: the last bare (unquoted) symbol of the
  * form, else `key` — the rule the eval-level group path applies. */
 static int64_t derived_key_name(ray_t* by_expr) {
@@ -2819,6 +2879,8 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     int64_t ref_syms[2];
     int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
     if (nref != 1) return NULL;
+    int64_t bound[32];
+    if (!derived_key_expr_ok(by_expr, ref_syms[0], bound, 0)) return NULL;
     ray_t* C = ray_table_get_col(tbl, ref_syms[0]);
     int64_t nrows = ray_table_nrows(tbl);
     if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 4096)
@@ -2829,8 +2891,10 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
      * (a process-wide symbol domain behind a small in-memory column). */
     if (dn <= 0 || dn > DERIVED_KEY_MAX_DOMAIN || dn > 16 * nrows) return NULL;
 
-    /* Pass 1: first-seen slot per symbol id; bail on any id outside the
-     * domain (nulls or a foreign domain) or once du crosses the gate. */
+    /* Pass 1: first-seen slot per symbol id; bail on an id outside the
+     * domain (a foreign domain) or once du crosses the gate.  The null
+     * symbol is id 0, inside the domain: it gets a slot and the expression
+     * sees it once, exactly as the row-wise evaluation sees it per row. */
     ray_t* pos_hdr = NULL;
     int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
     if (!pos) return NULL;
@@ -6250,7 +6314,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * a SYM vec of the ALIAS names.  parted_bydict_deferred stays false on the
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
-    bool   dom_key_used = false;   /* single computed key fed as a const node */
+    bool   computed_single_key = false;   /* by: is one expression, compiled or const */
     ray_t* deferred_bydict = NULL;
     int64_t deferred_nk = 0;
     int64_t dep_key_base_sym = -1;
@@ -9126,13 +9190,12 @@ by_dict_done:
              * named the way the eval-level path names a computed key. */
             ray_t* dom_key = derived_key_over_sym_domain(by_expr, tbl);
             if (dom_key) {
-                ray_op_t* ck = ray_const_vec(g, dom_key);
+                key_ops[0] = ray_const_vec(g, dom_key);
                 ray_release(dom_key);
-                key_ops[0] = ck;
-                dom_key_used = (ck != NULL);
             } else {
                 key_ops[0] = compile_expr_dag(g, by_expr);
             }
+            computed_single_key = (key_ops[0] != NULL);
             if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
@@ -10341,9 +10404,11 @@ by_dict_done:
     /* Optimize and execute */
     root = ray_optimize(g, root);
     ray_t* result = ray_execute(g, root);
-    /* A const key node carries no column name (its ext slot holds the
-     * literal) — name the key column the way a computed key is named. */
-    if (dom_key_used && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
+    /* A computed key takes its column name from its op's ext sym, which is
+     * not a name (a const node's slot holds the literal; an expression node's
+     * ext resolves to whatever shares its id) — name it the way the
+     * eval-level path names a computed key, whichever key path ran. */
+    if (computed_single_key && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
         ray_table_ncols(result) > 0)
         ray_table_set_col_name(result, 0, derived_key_name(by_expr));
     if (self_emit_set)

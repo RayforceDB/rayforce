@@ -52,3 +52,25 @@
 (set R3 (select {from: T by: (if (> v 50) (substr ref 0 4) ref) c: (count ref)}))
 (set O3 (select {from: (select {from: T k: (if (> v 50) (substr ref 0 4) ref) ref: ref}) by: k c: (count ref)}))
 (all (== (FP2 R3) (FP2 O3))) -- true
+
+;; the key column is named by the same rule whether or not the per-symbol
+;; path ran: below 4096 rows the row-wise path names it identically
+(== (at (cols R) 0) 'p) -- true
+(== (at (cols (KEYQ (take T 3000))) 0) 'p) -- true
+(== (at (cols (select {from: T by: (substr ref 0 3) c: (count v)})) 0) 'ref) -- true
+(== (at (cols (select {from: (take T 3000) by: (substr ref 0 3) c: (count v)})) 0) 'ref) -- true
+
+;; positional operators are NOT functions of the symbol alone: they must be
+;; evaluated over the rows, never over the distinct symbols
+(set RD (select {from: T by: (differ ref) c: (count v)}))
+(set OD (select {from: (select {from: T k: (differ ref) v: v}) by: k c: (count v)}))
+(all (== (FP2 RD) (FP2 OD))) -- true
+(set RF (select {from: TN by: (fills ref) c: (count v)}))
+(set OF (select {from: (select {from: TN k: (fills ref) v: v}) by: k c: (count v)}))
+(all (== (FP2 RF) (FP2 OF))) -- true
+
+;; a free name that is a table-length global vector, not a column
+(set G (as 'I64 (% (* i 13) 7)))
+(set RG (select {from: T by: (if (> G 3) (substr ref 0 4) ref) c: (count v)}))
+(set OG (select {from: (select {from: T k: (if (> G 3) (substr ref 0 4) ref) v: v}) by: k c: (count v)}))
+(all (== (FP2 RG) (FP2 OG))) -- true
