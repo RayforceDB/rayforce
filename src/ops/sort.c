@@ -301,11 +301,15 @@ typedef struct {
     uint64_t*       pw_or;   /* per-worker XOR-diff accumulator */
 } key_range_ctx_t;
 
+/* Every task diffs against keys[0], the same reference the serial path uses.
+ * Diffing against the task's own first element only covers differences
+ * INSIDE a task; a byte that changes only between tasks is then invisible
+ * and the radix sort silently drops it. */
 static void key_range_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     key_range_ctx_t* c = (key_range_ctx_t*)arg;
     const uint64_t* keys = c->keys;
     uint64_t local_or = c->pw_or[wid];
-    uint64_t first = keys[start];
+    uint64_t first = keys[0];
     for (int64_t i = start; i < end; i++)
         local_or |= keys[i] ^ first;
     c->pw_or[wid] = local_or;
@@ -323,14 +327,6 @@ uint8_t compute_key_nbytes(ray_pool_t* pool, const uint64_t* keys,
         ray_pool_dispatch(pool, key_range_fn, &ctx, n);
         diff = 0;
         for (uint32_t w = 0; w < nw; w++) diff |= pw_or[w];
-        /* Also XOR the first element from different worker ranges to
-         * catch cross-worker differences (workers' "first" may differ) */
-        uint64_t first = keys[0];
-        int64_t chunk = (n + nw - 1) / nw;
-        for (uint32_t w = 1; w < nw; w++) {
-            int64_t wstart = (int64_t)w * chunk;
-            if (wstart < n) diff |= keys[wstart] ^ first;
-        }
     } else {
         diff = 0;
         uint64_t first = keys[0];
