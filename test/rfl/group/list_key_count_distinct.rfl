@@ -1,0 +1,14 @@
+;; LIST-typed keys with count (distinct) and a streaming aggregate beside it.
+;; Before the fix the key emit tried to build a LIST result column through the
+;; typed-vector constructor and failed with a type error.
+(set I (til 100000))
+(set G (list [1 2] [3 4] ['a 'b] ["pooled list string" "x"]))
+(set T (table [k v] (list (at G (% I 4)) (% I 7))))
+(set R (select {from: T by: k s: (count (distinct v)) n: (count v) t: (sum v)}))
+(count R) -- 4
+(asc (at R 'n)) -- [25000 25000 25000 25000]
+(at R 's) -- [7 7 7 7]
+(sum (at R 't)) -- (sum (% I 7))
+(set S (select {from: T where: (< v 3) by: k s: (count (distinct v))}))
+(count S) -- 4
+(at S 's) -- [3 3 3 3]
