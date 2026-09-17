@@ -2840,6 +2840,10 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     ray_sym_vec_adopt_domain(dom_vec, C);
     const void* cd = ray_data(C);
     int64_t du = 0, du_max = nrows / 2;
+    /* Give up early on a near-unique column: past the first block the
+     * distinct share must stay under 3/4, so an all-distinct column costs
+     * one block of slot writes rather than half a pass. */
+    const int64_t probe_rows = nrows < 65536 ? nrows : 65536;
     bool ok = true;
     for (int64_t r = 0; r < nrows; r++) {
         int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
@@ -2850,6 +2854,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
             write_col_i64(ray_data(dom_vec), du, id, dom_vec->type, dom_vec->attrs);
             du++;
         }
+        if (r == probe_rows - 1 && du * 4 > probe_rows * 3) { ok = false; break; }
     }
     if (!ok || du == 0) { ray_release(dom_vec); scratch_free(pos_hdr); return NULL; }
     dom_vec->len = du;
