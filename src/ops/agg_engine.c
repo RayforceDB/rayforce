@@ -3253,8 +3253,21 @@ static ray_t* exec_group_v2_parallel_radix(
     bool order_ok = true;
     int64_t ordered = 0;
     bool ord_parallel_done = false;
-    if (pool && nw > 1 && input_count >= (1 << 20)) {
-        const int64_t ORD_CHUNK = 1 << 17;
+    /* The compaction below writes into `pairs` in place.  Its safety
+     * argument (see agg_ord_compact_fn) only shows that an EARLIER chunk
+     * cannot clobber a LATER chunk's unread input; the reverse is not
+     * true, because a later chunk writes at its prefix offset, which sits
+     * far below its own input range whenever groups are sparse relative
+     * to rows — i.e. any ordinary group-by with duplicates.  Running the
+     * chunks in ascending order on one task is what makes that safe, and
+     * ray_pool_dispatch only ever produced one task here because its
+     * grain is 8192 ELEMENTS and the extent is n_chunks.  Say so instead
+     * of depending on it: above the grain the compaction runs serially
+     * rather than racing (#556). */
+    const int64_t ORD_CHUNK = 1 << 17;
+    const int64_t ORD_MAX_CHUNKS = RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (pool && nw > 1 && input_count >= (1 << 20) &&
+        (input_count + ORD_CHUNK - 1) / ORD_CHUNK <= ORD_MAX_CHUNKS) {
         int64_t n_chunks = (input_count + ORD_CHUNK - 1) / ORD_CHUNK;
         ray_t* ordcnt_hdr = NULL;
         int64_t* ord_counts = (int64_t*)scratch_alloc(&ordcnt_hdr,

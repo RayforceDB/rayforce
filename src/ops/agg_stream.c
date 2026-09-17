@@ -530,9 +530,16 @@ static double pearson_final_result(const void* s) {
     double num = dn*st->sxy - st->sx*st->sy,
            dx  = dn*st->sxx - st->sx*st->sx,
            dy  = dn*st->syy - st->sy*st->sy;
-    /* Single-null float model: undefined pearson (n<2 → 0/0, or a constant
-     * side → sqrt(≤0)) yields NaN/Inf → canonicalize to NULL_F64.  agg_put_cell
-     * sees the NaN sentinel and sets HAS_NULLS. */
+    /* dx and dy are >= 0 mathematically (Cauchy-Schwarz), but a CONSTANT
+     * column cancels to a small NEGATIVE residue in doubles.  Relying on
+     * sqrt(<=0) to produce NaN only works when exactly ONE side is
+     * negative: with both negative the product is positive, the root is
+     * finite and a garbage "correlation" outside [-1,1] is emitted
+     * (#555).  Test the two denominators separately, as the legacy keyed
+     * path does (group.c), and report the undefined case as null.
+     *
+     * n < 2 leaves dx = dy = 0, so the same guard covers it. */
+    if (dx <= 0.0 || dy <= 0.0) return NULL_F64;
     return ray_f64_fin(num / sqrt(dx*dy));
 }
 AGG_SCALAR_FINAL(pearson_final, double, ray_f64, value != value)
