@@ -677,7 +677,19 @@ ray_err_t ray_sym_load(const char* path);
 ray_t*    ray_env_get(int64_t sym_id);
 ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
 
-/* ===== Table API ===== */
+/* ===== Table API =====
+ *
+ * The accessors below are total over ray_t: handed a value whose type is not
+ * RAY_TABLE — an atom, a vector, a dict, an error, NULL — each returns the
+ * empty answer (0, NULL, -1) and each mutator is a no-op.  They never read the
+ * argument's payload as table storage, so an embedder holding an opaque
+ * ray_t* can call them without first establishing the type.
+ *
+ * ray_table_validate_rectangular() remains the way to get a *diagnosable*
+ * rejection: it returns a typed error naming what it got, where these
+ * accessors answer 0/NULL indistinguishably from a genuinely empty table.
+ * Use it when the difference matters.
+ */
 
 ray_t*       ray_table_new(int64_t ncols);
 ray_t*       ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec);

@@ -564,6 +564,55 @@ static test_result_t test_table_accessors_null_and_err(void) {
     PASS();
 }
 
+/* Every public table accessor is total over ray_t: handed a value that is not
+ * a table it returns the empty answer, it does not read the payload as slot
+ * pointers.  Issue #567 — an embedder sees one opaque ray_t*, so there is
+ * nothing to check against but the tag the accessor already has.  The payload
+ * here is poisoned so that any accessor still treating it as slots dereferences
+ * 0x4141... and takes the process down rather than quietly returning garbage. */
+static test_result_t test_table_accessors_wrong_type(void) {
+    int64_t poison[] = {0x4141414141414141LL, 0x4141414141414141LL,
+                        0x4141414141414141LL, 0x4141414141414141LL};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, poison, 4);
+    TEST_ASSERT_NOT_NULL(vec);
+
+    TEST_ASSERT_EQ_I(ray_table_ncols(vec), 0);
+    TEST_ASSERT_EQ_I(ray_table_nrows(vec), 0);
+    TEST_ASSERT_NULL(ray_table_schema(vec));
+    TEST_ASSERT_NULL(ray_table_get_col(vec, ray_sym_intern("c", 1)));
+    TEST_ASSERT_NULL(ray_table_get_col_idx(vec, 0));
+    TEST_ASSERT_EQ_I(ray_table_col_name(vec, 0), -1);
+
+    /* Mutators must be no-ops rather than writes through a decoded payload. */
+    ray_table_set_col_name(vec, 0, ray_sym_intern("c", 1));
+    ray_table_set_col_idx(vec, 0, vec);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(vec))[0], 0x4141414141414141LL);
+
+    ray_release(vec);
+    PASS();
+}
+
+/* A dict shares the table's two-slot layout, so the accessors would happily
+ * read real pointers out of it and answer with a dict's shape.  The tag is the
+ * only thing separating the two; assert it is honoured. */
+static test_result_t test_table_accessors_reject_dict(void) {
+    int64_t kraw[] = {1, 2, 3};
+    int64_t vraw[] = {10, 20, 30};
+    ray_t* keys = ray_vec_from_raw(RAY_I64, kraw, 3);
+    ray_t* vals = ray_vec_from_raw(RAY_I64, vraw, 3);
+    ray_t* d = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_EQ_I(d->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(ray_dict_len(d), 3);
+
+    TEST_ASSERT_EQ_I(ray_table_ncols(d), 0);
+    TEST_ASSERT_EQ_I(ray_table_nrows(d), 0);
+    TEST_ASSERT_NULL(ray_table_schema(d));
+
+    ray_release(d);
+    PASS();
+}
+
 /* ray_parted_nrows on a plain (non-parted) vector returns vec->len directly. */
 static test_result_t test_parted_nrows_plain_vec(void) {
     int64_t raw[] = {1, 2, 3, 4};
@@ -615,6 +664,8 @@ const test_entry_t table_entries[] = {
     { "table/set_col_name", test_table_set_col_name, table_setup, table_teardown },
     { "table/set_col_name_shared", test_table_set_col_name_shared, table_setup, table_teardown },
     { "table/accessors_null_and_err", test_table_accessors_null_and_err, table_setup, table_teardown },
+    { "table/accessors_wrong_type", test_table_accessors_wrong_type, table_setup, table_teardown },
+    { "table/accessors_reject_dict", test_table_accessors_reject_dict, table_setup, table_teardown },
     { "table/parted_nrows_plain_vec", test_parted_nrows_plain_vec, table_setup, table_teardown },
     { "table/nrows_empty_col", test_table_nrows_empty_col, table_setup, table_teardown },
     { NULL, NULL, NULL, NULL },
