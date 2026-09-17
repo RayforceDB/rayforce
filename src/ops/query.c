@@ -3710,16 +3710,25 @@ static ray_t* try_count_distinct_v2_rewrite(
     int64_t nearest_id)
 {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
-    /* by: accepts either a single bare column name ((by: K), single-key)
-     * or a {Name: Col Name: Col ...} dict (multi-key composite).  In
-     * either case we collect the source column syms into K_syms[].
-     * The output aliases for multi-key (dict keys) are looked up from
-     * by_expr again when the inner pass renames its output columns. */
+    /* by: accepts a single bare column name ((by: K), single-key), a
+     * [K1 K2 ...] symbol vector (multi-key, output columns keep the source
+     * names), or a {Name: Col Name: Col ...} dict (multi-key composite with
+     * aliases).  In every case we collect the source column syms into
+     * K_syms[].  The vector form is how a composite key is normally written
+     * (`by: [MobilePhone MobilePhoneModel]`); without this branch it fell
+     * to the general per-group path, seven times slower than the dict form
+     * of the same query. */
     int64_t K_syms[15];  /* leave room for X in the composite */
     int n_K = 0;
     if (by_expr && by_expr->type == -RAY_SYM &&
         !(by_expr->attrs & ATTR_QUOTED)) {
         K_syms[n_K++] = by_expr->i64;
+    } else if (by_expr && by_expr->type == RAY_SYM && ray_is_vec(by_expr) &&
+               !(by_expr->attrs & ATTR_QUOTED)) {
+        int64_t n = ray_len(by_expr);
+        if (n == 0 || n > 15) return NULL;
+        for (int64_t i = 0; i < n; i++)
+            K_syms[n_K++] = ray_read_sym(ray_data(by_expr), i, by_expr->type, by_expr->attrs);
     } else if (by_expr && by_expr->type == RAY_DICT) {
         DICT_VIEW_DECL(byv);
         DICT_VIEW_OPEN(by_expr, byv);
