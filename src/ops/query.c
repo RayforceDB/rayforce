@@ -4545,7 +4545,12 @@ static int can_atom_broadcast(ray_t* a) {
  * Returns NULL for unsupported atom kinds;
  * caller falls back to the per-cell LIST path. */
 static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
-    if (!a || !ray_is_atom(a) || n <= 0) return NULL;
+    /* n == 0 is a legitimate request, not a failure: a grouped select that
+     * matched no row still owes its caller a typed, empty column for every
+     * literal projection.  Returning NULL here made the sole call site
+     * (which treats NULL as allocation failure) report `oom` for an
+     * ordinary `select {by: k where: <no match> lit: 1 ...}`. */
+    if (!a || !ray_is_atom(a) || n < 0) return NULL;
     int8_t vec_type = (int8_t)(-a->type);
     if (vec_type <= 0) return NULL;
 
@@ -4568,6 +4573,7 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     }
     if (!v || RAY_IS_ERR(v)) return NULL;
     v->len = n;
+    if (n == 0) return v;   /* typed and empty; nothing to broadcast into */
 
     void* dst = ray_data(v);
     switch (vec_type) {

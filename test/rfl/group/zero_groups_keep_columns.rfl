@@ -28,3 +28,30 @@
 (set P (select {from: T by: [k sy] where: (> s 1) s: (sum s) n: (count v) f: (first v) d: (distinct v)}))
 (count P) -- 2
 (cols P) -- [k sy s n f d]
+
+;; ── literal projections at zero groups ─────────────────────────────
+;; A constant column is not an aggregate: it is built by broadcasting the
+;; atom across the groups.  With no groups that broadcast is zero-length,
+;; which must still produce a typed empty column.  atom_broadcast_vec
+;; returned NULL for n == 0 and the caller reported it as `oom`, so these
+;; shapes failed with an out-of-memory error on an ordinary query.
+(set ZL (select {from: T by: k where: (== k "missing") one: 1 tag: 'x r: 1.5 b: true c: (count v)}))
+(set FL (select {from: T by: k one: 1 tag: 'x r: 1.5 b: true c: (count v)}))
+(count ZL) -- 0
+(cols ZL) -- (cols FL)
+(count (cols ZL)) -- 6
+;; each constant column keeps the type its non-empty counterpart has
+(type (at ZL 'one)) -- (type (at FL 'one))
+(type (at ZL 'tag)) -- (type (at FL 'tag))
+(type (at ZL 'r))   -- (type (at FL 'r))
+(type (at ZL 'b))   -- (type (at FL 'b))
+
+;; a projection with no aggregate at all still returns its columns
+(set ZO (select {from: T by: k where: (== k "missing") one: 1}))
+(count ZO) -- 0
+(count (cols ZO)) -- 2
+
+;; and the same under a composite key
+(set ZLC (select {from: T by: [k sy] where: (== k "missing") one: 1 n: (count v)}))
+(count ZLC) -- 0
+(count (cols ZLC)) -- 4
