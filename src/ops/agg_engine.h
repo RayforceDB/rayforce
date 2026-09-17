@@ -63,8 +63,10 @@ typedef struct {
     agg_dense_strategy_t dense_strategy;
     uint64_t dense_local_slots;     /* allocated group-state slots, including partials */
     uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
+    uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
 } agg_route_stats_t;
 void agg_route_reset(void);
+void agg_route_note_key_domain(void);
 agg_route_stats_t agg_route_stats(void);
 void agg_route_record(agg_route_t route);
 void agg_route_reason(agg_v2_reason_t reason);

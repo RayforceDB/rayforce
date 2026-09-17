@@ -2793,6 +2793,204 @@ static int collect_col_refs(ray_t* expr, ray_t* tbl,
     return n;
 }
 
+/* A group-key expression that reads exactly ONE flat SYM column is a
+ * function of the symbol alone.  Evaluate it once per symbol actually
+ * present in the column (du distinct ids, first-seen order, as a SYM
+ * vector adopting the column's domain) and spread the du results over the
+ * rows — instead of running every string op over every row, where each
+ * substr/str-find over SYM interns its output per row.  Returns a fresh
+ * nrows-long key vector, or NULL when the shape does not apply (caller
+ * falls back to the plain evaluation).  Only when the distinct count is
+ * well below the row count: the expression costs O(du) here, the spread
+ * O(nrows) plain reads. */
+/* Is `e` a pure, row-local function of the column `col_sym` (plus
+ * let-bound names)?  Heads must come from a fixed list of elementwise
+ * operators — anything positional (differ, fills, deltas, moving windows),
+ * a user function, or a free symbol that is not the column (a global
+ * vector of table length) disqualifies the per-symbol evaluation. */
+static bool derived_key_head_ok(int64_t head) {
+    static const char* const ok[] = {
+        "let", "if", "cond", "and", "or", "not",
+        "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%",
+        "abs", "neg", "floor", "ceil", "round", "xbar", "as",
+        "substr", "str-find", "strlen", "within", "nil?", "upper", "lower", "like",
+    };
+    ray_t* name = ray_sym_str(head);
+    if (!name || RAY_IS_ERR(name)) return false;
+    size_t n = ray_str_len(name);
+    const char* q = ray_str_ptr(name);
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+        if (strlen(ok[i]) == n && memcmp(ok[i], q, n) == 0) return true;
+    return false;
+}
+static bool derived_key_expr_ok(ray_t* e, ray_t* tbl, int64_t col_sym, int64_t* bound, int nbound) {
+    if (!e) return false;
+    if (e->type == -RAY_SYM) {
+        /* A symbol literal — unless it names a column of the table, which
+         * the DAG compiler resolves to that column. */
+        if (e->attrs & ATTR_QUOTED) return ray_table_get_col(tbl, e->i64) == NULL;
+        if (e->i64 == col_sym) return true;
+        for (int i = 0; i < nbound; i++) if (bound[i] == e->i64) return true;
+        return false;                                       /* free name */
+    }
+    if (e->type != RAY_LIST) return true;                   /* atom / vector literal */
+    int64_t n = ray_len(e);
+    if (n < 1) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED) || !derived_key_head_ok(el[0]->i64))
+        return false;
+    /* The name must still mean the builtin: the DAG compiler inlines a
+     * global lambda of that name ahead of the builtin, and a let-bound
+     * name shadows it too. */
+    for (int i = 0; i < nbound; i++) if (bound[i] == el[0]->i64) return false;
+    {
+        ray_t* gv = ray_env_get(el[0]->i64);          /* borrowed */
+        if (gv && gv->type == RAY_LAMBDA) return false;
+    }
+    ray_t* hs = ray_sym_str(el[0]->i64);
+    size_t hl = ray_str_len(hs);
+    const char* hp = ray_str_ptr(hs);
+    if (hl == 3 && memcmp(hp, "let", 3) == 0) {
+        if (n != 4 || el[1]->type != -RAY_SYM || nbound >= 32) return false;
+        if (!derived_key_expr_ok(el[2], tbl, col_sym, bound, nbound)) return false;
+        bound[nbound] = el[1]->i64;
+        return derived_key_expr_ok(el[3], tbl, col_sym, bound, nbound + 1);
+    }
+    if (hl == 4 && memcmp(hp, "cond", 4) == 0) {
+        for (int64_t i = 1; i < n; i++) {
+            if (el[i]->type != RAY_LIST || ray_len(el[i]) != 2) return false;
+            ray_t** cp = (ray_t**)ray_data(el[i]);
+            bool is_else = cp[0]->type == -RAY_SYM && !(cp[0]->attrs & ATTR_QUOTED) &&
+                           ray_str_len(ray_sym_str(cp[0]->i64)) == 4 &&
+                           memcmp(ray_str_ptr(ray_sym_str(cp[0]->i64)), "else", 4) == 0;
+            if (!is_else && !derived_key_expr_ok(cp[0], tbl, col_sym, bound, nbound)) return false;
+            if (!derived_key_expr_ok(cp[1], tbl, col_sym, bound, nbound)) return false;
+        }
+        return true;
+    }
+    for (int64_t i = 1; i < n; i++)
+        if (!derived_key_expr_ok(el[i], tbl, col_sym, bound, nbound)) return false;
+    return true;
+}
+
+/* Name for a computed group key: the last bare (unquoted) symbol of the
+ * form, else `key` — the rule the eval-level group path applies. */
+static int64_t derived_key_name(ray_t* by_expr) {
+    if (by_expr && by_expr->type == RAY_LIST && by_expr->len >= 2) {
+        ray_t** be = (ray_t**)ray_data(by_expr);
+        for (int64_t i = by_expr->len - 1; i >= 1; i--)
+            if (be[i]->type == -RAY_SYM && !(be[i]->attrs & ATTR_QUOTED)) return be[i]->i64;
+    }
+    return ray_sym_intern("key", 3);
+}
+#define DERIVED_KEY_MAX_DOMAIN (64LL * 1024 * 1024)
+static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
+    if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
+    int64_t ref_syms[2];
+    int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
+    if (nref != 1) return NULL;
+    int64_t bound[32];
+    if (!derived_key_expr_ok(by_expr, tbl, ref_syms[0], bound, 0)) return NULL;
+    ray_t* C = ray_table_get_col(tbl, ref_syms[0]);
+    int64_t nrows = ray_table_nrows(tbl);
+    if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 4096)
+        return NULL;
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
+    int64_t dn = dom ? ray_sym_domain_count(dom) : 0;
+    /* The slot table is dn ints: refuse a domain far wider than the table
+     * (a process-wide symbol domain behind a small in-memory column). */
+    if (dn <= 0 || dn > DERIVED_KEY_MAX_DOMAIN || dn > 16 * nrows) return NULL;
+
+    /* Probe the first block before touching anything domain-sized: a
+     * distinct share above 3/4 over the first 65536 rows means a
+     * near-unique column, for which the per-symbol evaluation cannot win.
+     * A 128k-slot open-addressing set on scratch — no dn-sized memory. */
+    const void* cd = ray_data(C);
+    {
+        const int64_t probe_rows = nrows < 65536 ? nrows : 65536;
+        int64_t PROBE_SLOTS = 1024;               /* power of two, load <= 1/2 */
+        while (PROBE_SLOTS < 2 * probe_rows) PROBE_SLOTS <<= 1;
+        ray_t* set_hdr = NULL;
+        int64_t* set = (int64_t*)scratch_alloc(&set_hdr, (size_t)PROBE_SLOTS * sizeof(int64_t));
+        if (!set) return NULL;
+        memset(set, 0xff, (size_t)PROBE_SLOTS * sizeof(int64_t));
+        int64_t seen = 0;
+        for (int64_t r = 0; r < probe_rows; r++) {
+            int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
+            if (id < 0 || id >= dn) { seen = probe_rows; break; }
+            uint64_t h = (((uint64_t)id * 0x9E3779B97F4A7C15ull) >> 32) & (uint64_t)(PROBE_SLOTS - 1);
+            while (set[h] >= 0 && set[h] != id) h = (h + 1) & (uint64_t)(PROBE_SLOTS - 1);
+            if (set[h] < 0) { set[h] = id; seen++; }
+        }
+        scratch_free(set_hdr);
+        if (seen * 4 > probe_rows * 3) return NULL;
+    }
+
+    /* Pass 1: first-seen slot per symbol id; bail on an id outside the
+     * domain (a foreign domain) or once du crosses the gate.  The null
+     * symbol is id 0, inside the domain: it gets a slot and the expression
+     * sees it once, exactly as the row-wise evaluation sees it per row. */
+    ray_t* pos_hdr = NULL;
+    int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
+    if (!pos) return NULL;
+    memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
+    ray_t* dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), dn);
+    if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); scratch_free(pos_hdr); return NULL; }
+    ray_sym_vec_adopt_domain(dom_vec, C);
+    int64_t du = 0, du_max = nrows / 2;
+    if (du_max > INT32_MAX) du_max = INT32_MAX;       /* slots are int32 */
+    bool ok = true;
+    for (int64_t r = 0; r < nrows; r++) {
+        int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
+        if (id < 0 || id >= dn) { ok = false; break; }
+        if (pos[id] < 0) {
+            if (du >= du_max) { ok = false; break; }
+            pos[id] = (int32_t)du;
+            write_col_i64(ray_data(dom_vec), du, id, dom_vec->type, dom_vec->attrs);
+            du++;
+        }
+    }
+    if (!ok || du == 0) { ray_release(dom_vec); scratch_free(pos_hdr); return NULL; }
+    dom_vec->len = du;
+
+    /* Evaluate the expression over the du distinct symbols through the
+     * same DAG compiler the row-wise key would take, against a one-column
+     * table holding the distinct vector under the referenced name. */
+    ray_t* key_dom = NULL;
+    ray_t* mini = ray_table_new(0);
+    if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
+    ray_release(dom_vec);
+    if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
+    ray_graph_t* g2 = ray_graph_new(mini);
+    if (g2) {
+        ray_op_t* kop = compile_expr_dag(g2, by_expr);
+        if (kop) kop = ray_optimize(g2, kop);
+        if (kop) key_dom = ray_execute(g2, kop);
+        ray_graph_free(g2);
+    }
+    ray_release(mini);
+    if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
+    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
+    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+
+    /* Pass 2: spread by slot. */
+    ray_t* ids = ray_vec_new(RAY_I64, nrows);
+    if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+    ids->len = nrows;
+    int64_t* idp = (int64_t*)ray_data(ids);
+    for (int64_t r = 0; r < nrows; r++)
+        idp[r] = pos[ray_read_sym(cd, r, C->type, C->attrs)];
+    scratch_free(pos_hdr);
+    ray_t* spread = ray_at_fn(key_dom, ids);
+    ray_release(ids);
+    ray_release(key_dom);
+    if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
+    if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
+    if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    agg_route_note_key_domain();
+    return spread;
+}
+
 /* Bind a single column-id to a slice of its column under `idx_list`.
  * Helper used inside the per-group hot loop (slices the table's column
  * via ray_at_fn, hands the slice to env_bind_local which retains, then
@@ -6147,6 +6345,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * a SYM vec of the ALIAS names.  parted_bydict_deferred stays false on the
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
+    bool   computed_single_key = false;   /* by: is one expression, compiled or const */
     ray_t* deferred_bydict = NULL;
     int64_t deferred_nk = 0;
     int64_t dep_key_base_sym = -1;
@@ -9017,8 +9216,19 @@ by_dict_done:
                 n_keys++;
             }
         } else {
-            /* Single key expression */
-            key_ops[0] = compile_expr_dag(g, by_expr);
+            /* Single key expression.  Over a lone SYM column evaluate it per
+             * distinct symbol and feed the spread key as a constant node,
+             * named the way the eval-level path names a computed key. */
+            ray_t* dom_key = derived_key_over_sym_domain(by_expr, tbl);
+            if (dom_key) {
+                key_ops[0] = ray_const_vec(g, dom_key);
+                ray_release(dom_key);
+            } else {
+                key_ops[0] = compile_expr_dag(g, by_expr);
+            }
+            /* Only a real expression is renamed: a bare column symbol lands
+             * here too and keeps its own name. */
+            computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
             if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
@@ -9385,7 +9595,8 @@ by_dict_done:
                     ray_t* cv = ray_table_get_col_idx(filtered_tbl, c);
                     ray_env_set_query_local(cn, cv);
                 }
-                ray_t* computed_key = ray_eval(by_expr);
+                ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl);
+                if (!computed_key) computed_key = ray_eval(by_expr);
                 ray_env_pop_scope();
                 if (!computed_key || RAY_IS_ERR(computed_key)) {
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
@@ -10226,6 +10437,20 @@ by_dict_done:
     /* Optimize and execute */
     root = ray_optimize(g, root);
     ray_t* result = ray_execute(g, root);
+    /* A computed key takes its column name from its op's ext sym, which is
+     * not a name (a const node's slot holds the literal; an expression node's
+     * ext resolves to whatever shares its id) — name it the way the
+     * eval-level path names a computed key, whichever key path ran. */
+    if (computed_single_key && result && !RAY_IS_ERR(result) && ray_is_lazy(result))
+        result = ray_lazy_materialize(result);
+    if (computed_single_key && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
+        ray_table_ncols(result) > 0) {
+        int64_t kname = derived_key_name(by_expr);
+        int64_t rc = ray_table_ncols(result);
+        for (int64_t c = 1; c < rc; c++)
+            if (ray_table_col_name(result, c) == kname) { kname = ray_sym_intern("key", 3); break; }
+        ray_table_set_col_name(result, 0, kname);
+    }
     if (self_emit_set)
         ray_group_emit_filter_set(prev_self_emit);
     if (post_group_where_expr && result && !RAY_IS_ERR(result))
@@ -10382,6 +10607,16 @@ by_dict_done:
                  * Non-agg/fallback columns are named at scatter time. */
                 for (int64_t j = 0; j < n_aggs_real && n_key_cols + j < ncols; j++)
                     ray_table_set_col_name(result, n_key_cols + j, agg_names[j]);
+                /* The computed key's derived name yields to an output alias
+                 * that spells the same. */
+                if (computed_single_key && ncols > 1) {
+                    int64_t kname = ray_table_col_name(result, 0);
+                    for (int64_t c = 1; c < ncols; c++)
+                        if (ray_table_col_name(result, c) == kname) {
+                            ray_table_set_col_name(result, 0, ray_sym_intern("key", 3));
+                            break;
+                        }
+                }
             } else {
                 /* Projection-only: columns are in dict order.  Rename each
                  * output column directly — a projection may have any number
