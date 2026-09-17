@@ -2918,8 +2918,8 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
         for (int64_t r = 0; r < probe_rows; r++) {
             int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
             if (id < 0 || id >= dn) { seen = probe_rows; break; }
-            uint64_t h = ((uint64_t)id * 0x9E3779B97F4A7C15ull) >> 47;
-            while (set[h] >= 0 && set[h] != id) h = (h + 1) & (PROBE_SLOTS - 1);
+            uint64_t h = (((uint64_t)id * 0x9E3779B97F4A7C15ull) >> 32) & (uint64_t)(PROBE_SLOTS - 1);
+            while (set[h] >= 0 && set[h] != id) h = (h + 1) & (uint64_t)(PROBE_SLOTS - 1);
             if (set[h] < 0) { set[h] = id; seen++; }
         }
         scratch_free(set_hdr);
@@ -2938,6 +2938,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); scratch_free(pos_hdr); return NULL; }
     ray_sym_vec_adopt_domain(dom_vec, C);
     int64_t du = 0, du_max = nrows / 2;
+    if (du_max > INT32_MAX) du_max = INT32_MAX;       /* slots are int32 */
     bool ok = true;
     for (int64_t r = 0; r < nrows; r++) {
         int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
