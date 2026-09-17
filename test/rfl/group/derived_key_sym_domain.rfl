@@ -1,0 +1,54 @@
+;; A group key computed from ONE symbol column (substr / str-find / if over
+;; it) must give the same groups and aggregates whether the engine evaluates
+;; the expression per row or once per distinct symbol.  Oracle: the key
+;; materialised as a column first, then a plain group-by on that column.
+;; Sizes past 4096 rows with few distinct symbols so the per-symbol path is
+;; taken; a high-cardinality control and a null-bearing column exercise the
+;; fallback.
+(set N 20000)
+(set i (til N))
+(set hosts (map (fn [k] (format "h%.example.com" k)) (til 37)))
+(set mk (fn [k] ((fn [j] (if (== 0 (% j 11)) "" (if (== 0 (% j 7)) (format "https://www.%/p/%" (at hosts (% (* 31 j) 37)) (% j 13)) (if (== 0 (% j 5)) (at hosts (% (* 31 j) 37)) (format "http://%/a/%" (at hosts (% (* 31 j) 37)) (% j 17)))))) (% k 500))))
+(set ref (as 'SYMBOL (map mk i)))
+(set v (as 'F64 (% (* i 7) 101)))
+(set T (table [ref v] (list ref v)))
+
+;; the derived key, as the engine sees it inside by:
+(set KEYQ (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v) mn: (min ref) where: (!= ref "")})))
+;; oracle: the same expression as a projected column, then group by it
+(set KEYCOL (fn [t] (select {from: t p: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) ref: ref v: v where: (!= ref "")})))
+(set ORA (fn [t] (select {from: (KEYCOL t) by: p c: (count ref) sv: (sum v) mn: (min ref)})))
+(set FP (fn [r] (ser (xasc (xasc (table [k c sv mn] (list (at (value r) 0) (at r 'c) (at r 'sv) (at r 'mn))) 'mn) 'c))))
+(set FP2 (fn [r] (ser (xasc (xasc (table [k c] (list (at (value r) 0) (at r 'c))) 'k) 'c))))
+
+(set R (KEYQ T))
+(set O (ORA T))
+(count R) -- 37
+(count O) -- 37
+(all (== (FP R) (FP O))) -- true
+;; every host appears (the "" rows are filtered, the bare-host rows keep it)
+(count (distinct (at (value R) 0))) -- 37
+
+;; a key that stays a symbol of the column (identity-like) still matches
+(set R2 (select {from: T by: (if (== (str-find ref "www.") 0) (substr ref 4 -1) ref) c: (count ref)}))
+(set O2 (select {from: (select {from: T k: (if (== (str-find ref "www.") 0) (substr ref 4 -1) ref) ref: ref}) by: k c: (count ref)}))
+(all (== (FP2 R2) (FP2 O2))) -- true
+
+;; high cardinality: every row its own symbol — the fallback path, same answer
+(set refu (as 'SYMBOL (map (fn [k] (format "http://%/u/%" (at hosts (% k 37)) k)) i)))
+(set TU (table [ref v] (list refu v)))
+(count (KEYQ TU)) -- 37
+(all (== (FP (KEYQ TU)) (FP (ORA TU)))) -- true
+
+;; nulls in the symbol column: rows with a null key group together, others unchanged
+(set refn (as 'SYMBOL (map (fn [k] (if (== 0 (% k 97)) null (mk k))) i)))
+(set TN (table [ref v] (list refn v)))
+(set RN (KEYQ TN))
+(set ON (ORA TN))
+(== (count RN) (count ON)) -- true
+(all (== (FP RN) (FP ON))) -- true
+
+;; a second column referenced in the key expression must not take the shortcut
+(set R3 (select {from: T by: (if (> v 50) (substr ref 0 4) ref) c: (count ref)}))
+(set O3 (select {from: (select {from: T k: (if (> v 50) (substr ref 0 4) ref) ref: ref}) by: k c: (count ref)}))
+(all (== (FP2 R3) (FP2 O3))) -- true

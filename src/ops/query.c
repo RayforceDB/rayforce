@@ -2793,6 +2793,104 @@ static int collect_col_refs(ray_t* expr, ray_t* tbl,
     return n;
 }
 
+/* A group-key expression that reads exactly ONE flat SYM column is a
+ * function of the symbol alone.  Evaluate it once per symbol actually
+ * present in the column (du distinct ids, first-seen order, as a SYM
+ * vector adopting the column's domain) and spread the du results over the
+ * rows — instead of running every string op over every row, where each
+ * substr/str-find over SYM interns its output per row.  Returns a fresh
+ * nrows-long key vector, or NULL when the shape does not apply (caller
+ * falls back to the plain evaluation).  Only when the distinct count is
+ * well below the row count: the expression costs O(du) here, the spread
+ * O(nrows) plain reads. */
+/* Name for a computed group key: the last bare (unquoted) symbol of the
+ * form, else `key` — the rule the eval-level group path applies. */
+static int64_t derived_key_name(ray_t* by_expr) {
+    if (by_expr && by_expr->type == RAY_LIST && by_expr->len >= 2) {
+        ray_t** be = (ray_t**)ray_data(by_expr);
+        for (int64_t i = by_expr->len - 1; i >= 1; i--)
+            if (be[i]->type == -RAY_SYM && !(be[i]->attrs & ATTR_QUOTED)) return be[i]->i64;
+    }
+    return ray_sym_intern("key", 3);
+}
+#define DERIVED_KEY_MAX_DOMAIN (64LL * 1024 * 1024)
+static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
+    if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
+    int64_t ref_syms[2];
+    int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
+    if (nref != 1) return NULL;
+    ray_t* C = ray_table_get_col(tbl, ref_syms[0]);
+    int64_t nrows = ray_table_nrows(tbl);
+    if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 4096)
+        return NULL;
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
+    int64_t dn = dom ? ray_sym_domain_count(dom) : 0;
+    /* The slot table is dn ints: refuse a domain far wider than the table
+     * (a process-wide symbol domain behind a small in-memory column). */
+    if (dn <= 0 || dn > DERIVED_KEY_MAX_DOMAIN || dn > 16 * nrows) return NULL;
+
+    /* Pass 1: first-seen slot per symbol id; bail on any id outside the
+     * domain (nulls or a foreign domain) or once du crosses the gate. */
+    ray_t* pos_hdr = NULL;
+    int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
+    if (!pos) return NULL;
+    memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
+    ray_t* dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), dn);
+    if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); scratch_free(pos_hdr); return NULL; }
+    ray_sym_vec_adopt_domain(dom_vec, C);
+    const void* cd = ray_data(C);
+    int64_t du = 0, du_max = nrows / 2;
+    bool ok = true;
+    for (int64_t r = 0; r < nrows; r++) {
+        int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
+        if (id < 0 || id >= dn) { ok = false; break; }
+        if (pos[id] < 0) {
+            if (du >= du_max) { ok = false; break; }
+            pos[id] = (int32_t)du;
+            write_col_i64(ray_data(dom_vec), du, id, dom_vec->type, dom_vec->attrs);
+            du++;
+        }
+    }
+    if (!ok || du == 0) { ray_release(dom_vec); scratch_free(pos_hdr); return NULL; }
+    dom_vec->len = du;
+
+    /* Evaluate the expression over the du distinct symbols through the
+     * same DAG compiler the row-wise key would take, against a one-column
+     * table holding the distinct vector under the referenced name. */
+    ray_t* key_dom = NULL;
+    ray_t* mini = ray_table_new(0);
+    if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
+    ray_release(dom_vec);
+    if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
+    ray_graph_t* g2 = ray_graph_new(mini);
+    if (g2) {
+        ray_op_t* kop = compile_expr_dag(g2, by_expr);
+        if (kop) kop = ray_optimize(g2, kop);
+        if (kop) key_dom = ray_execute(g2, kop);
+        ray_graph_free(g2);
+    }
+    ray_release(mini);
+    if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
+    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
+    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+
+    /* Pass 2: spread by slot. */
+    ray_t* ids = ray_vec_new(RAY_I64, nrows);
+    if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+    ids->len = nrows;
+    int64_t* idp = (int64_t*)ray_data(ids);
+    for (int64_t r = 0; r < nrows; r++)
+        idp[r] = pos[ray_read_sym(cd, r, C->type, C->attrs)];
+    scratch_free(pos_hdr);
+    ray_t* spread = ray_at_fn(key_dom, ids);
+    ray_release(ids);
+    ray_release(key_dom);
+    if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
+    if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
+    if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    return spread;
+}
+
 /* Bind a single column-id to a slice of its column under `idx_list`.
  * Helper used inside the per-group hot loop (slices the table's column
  * via ray_at_fn, hands the slice to env_bind_local which retains, then
@@ -6147,6 +6245,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * a SYM vec of the ALIAS names.  parted_bydict_deferred stays false on the
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
+    bool   dom_key_used = false;   /* single computed key fed as a const node */
     ray_t* deferred_bydict = NULL;
     int64_t deferred_nk = 0;
     int64_t dep_key_base_sym = -1;
@@ -9017,8 +9116,18 @@ by_dict_done:
                 n_keys++;
             }
         } else {
-            /* Single key expression */
-            key_ops[0] = compile_expr_dag(g, by_expr);
+            /* Single key expression.  Over a lone SYM column evaluate it per
+             * distinct symbol and feed the spread key as a constant node,
+             * named the way the eval-level path names a computed key. */
+            ray_t* dom_key = derived_key_over_sym_domain(by_expr, tbl);
+            if (dom_key) {
+                ray_op_t* ck = ray_const_vec(g, dom_key);
+                ray_release(dom_key);
+                key_ops[0] = ck;
+                dom_key_used = (ck != NULL);
+            } else {
+                key_ops[0] = compile_expr_dag(g, by_expr);
+            }
             if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
@@ -9385,7 +9494,8 @@ by_dict_done:
                     ray_t* cv = ray_table_get_col_idx(filtered_tbl, c);
                     ray_env_set_query_local(cn, cv);
                 }
-                ray_t* computed_key = ray_eval(by_expr);
+                ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl);
+                if (!computed_key) computed_key = ray_eval(by_expr);
                 ray_env_pop_scope();
                 if (!computed_key || RAY_IS_ERR(computed_key)) {
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
@@ -10226,6 +10336,11 @@ by_dict_done:
     /* Optimize and execute */
     root = ray_optimize(g, root);
     ray_t* result = ray_execute(g, root);
+    /* A const key node carries no column name (its ext slot holds the
+     * literal) — name the key column the way a computed key is named. */
+    if (dom_key_used && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
+        ray_table_ncols(result) > 0)
+        ray_table_set_col_name(result, 0, derived_key_name(by_expr));
     if (self_emit_set)
         ray_group_emit_filter_set(prev_self_emit);
     if (post_group_where_expr && result && !RAY_IS_ERR(result))
