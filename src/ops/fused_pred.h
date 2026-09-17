@@ -1,3 +1,4 @@
+#include "table/domain.h"
 /*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
@@ -77,6 +78,11 @@ typedef struct {
     uint8_t*      like_lut;
     uint32_t     like_lut_count;
     ray_t**      like_sym_strings;
+    /* FILE-domain column, pinned at compile: entries of the file prefix
+     * read straight from the mapping (see ray_sym_domain_raw_pin). */
+    ray_sym_domain_raw_t like_raw;
+    uint8_t      like_raw_ok;
+    struct ray_sym_domain_s* like_dom;
 } fp_cmp_t;
 
 typedef struct {

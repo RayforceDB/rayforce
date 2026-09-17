@@ -450,12 +450,17 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
                 }
                 uint8_t state = lut[sid];
                 if (!state) {
-                    ray_t* s = sym_strings ? sym_strings[sid]
-                                           : ray_sym_domain_str(like_dom, (int64_t)sid);
+                    const char* sp = NULL;
+                    size_t sl = 0;
+                    if (p->like_raw_ok && (int64_t)sid < p->like_raw.count) {
+                        sp = ray_sym_domain_raw_str(&p->like_raw, (int64_t)sid, &sl);
+                    } else {
+                        ray_t* s = sym_strings ? sym_strings[sid]
+                                               : ray_sym_domain_str(like_dom, (int64_t)sid);
+                        if (s) { sp = ray_str_ptr(s); sl = ray_str_len(s); }
+                    }
                     uint8_t match = 0;
-                    if (s) {
-                        const char* sp = ray_str_ptr(s);
-                        size_t sl = ray_str_len(s);
+                    if (sp) {
                         match = use_simple
                             ? (uint8_t)ray_glob_match_compiled(&p->pat_compiled, sp, sl)
                             : (uint8_t)ray_glob_match(sp, sl, p->pat_str, p->pat_len);
@@ -607,13 +612,18 @@ static inline uint8_t fp_eval_cmp_one(const fp_cmp_t* p, int64_t row) {
             uint8_t state = p->like_lut[sid];
             if (!state) {
                 /* NULL sym_strings ⇒ FILE-domain column (see fp_eval_cmp) */
-                ray_t* s = p->like_sym_strings
-                    ? p->like_sym_strings[sid]
-                    : ray_sym_domain_str(ray_sym_vec_domain(p->col_obj), (int64_t)sid);
+                const char* sp = NULL;
+                size_t sl = 0;
+                if (p->like_raw_ok && (int64_t)sid < p->like_raw.count) {
+                    sp = ray_sym_domain_raw_str(&p->like_raw, (int64_t)sid, &sl);
+                } else {
+                    ray_t* s = p->like_sym_strings
+                        ? p->like_sym_strings[sid]
+                        : ray_sym_domain_str(ray_sym_vec_domain(p->col_obj), (int64_t)sid);
+                    if (s) { sp = ray_str_ptr(s); sl = ray_str_len(s); }
+                }
                 uint8_t match = 0;
-                if (s) {
-                    const char* sp = ray_str_ptr(s);
-                    size_t sl = ray_str_len(s);
+                if (sp) {
                     match = (p->pat_compiled.shape != RAY_GLOB_SHAPE_NONE)
                           ? (uint8_t)ray_glob_match_compiled(&p->pat_compiled, sp, sl)
                           : (uint8_t)ray_glob_match(sp, sl, p->pat_str, p->pat_len);
@@ -825,6 +835,8 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
                 out->like_lut = lut;
                 out->like_lut_count = (uint32_t)dn;
                 out->like_sym_strings = NULL;  /* resolve via col_obj's domain */
+                out->like_dom = ray_sym_vec_domain(col);
+                out->like_raw_ok = ray_sym_domain_raw_pin(out->like_dom, &out->like_raw) ? 1 : 0;
             }
         }
         out->cval_in_dict = 1;
@@ -1042,6 +1054,10 @@ int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
 void fp_pred_cleanup(fp_pred_t* p) {
     if (!p) return;
     for (uint8_t i = 0; i < p->n_children; i++) {
+        if (p->children[i].like_raw_ok) {
+            ray_sym_domain_raw_unpin(p->children[i].like_dom);
+            p->children[i].like_raw_ok = 0;
+        }
         if (p->children[i].aux_hdr) {
             scratch_free(p->children[i].aux_hdr);
             p->children[i].aux_hdr = NULL;

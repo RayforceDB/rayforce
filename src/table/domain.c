@@ -146,6 +146,10 @@ struct ray_sym_domain_s {
      * used to materialize atoms[pos] on demand from the mmap bytes.
      * malloc'd; NULL when base_count == 0. */
     size_t*   offsets;
+    /* Raw readers pinned on (map, offsets) — see ray_sym_domain_raw_pin.
+     * An extend raises raw_swapping, drains raw_readers, then swaps. */
+    _Atomic(int32_t) raw_readers;
+    _Atomic(int32_t) raw_swapping;
 
     /* FILE, lazy: position → runtime intern id.  Built under g_dom_lock
      * (the build INTERNS the vocabulary into the global table —
@@ -414,7 +418,11 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             ray_sys_free(fresh);  /* fresh slot array unused — narr carries the prefix */
 
             /* Swap in the new offsets + map; the old map's bytes are no
-             * longer referenced (prefix atoms are arena-copied). */
+             * longer referenced (prefix atoms are arena-copied) — once
+             * every raw reader pinned on them has left. */
+            atomic_store_explicit(&d->raw_swapping, 1, memory_order_seq_cst);
+            while (atomic_load_explicit(&d->raw_readers, memory_order_seq_cst) != 0)
+                RAY_CPU_RELAX();
             ray_sys_free(d->offsets);
             d->offsets = fresh_offsets;
             void* old_map = d->map;
@@ -430,6 +438,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             d->disk_size = st_size;
 
             if (old_map) ray_vm_unmap_file(old_map, old_map_size);
+            atomic_store_explicit(&d->raw_swapping, 0, memory_order_release);
 
             /* Reverse index + LUT now cover a stale prefix: drop both.
              * A retire-OOM here would keep the stale LUT published over
@@ -496,6 +505,8 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!d) { ray_sys_free(rpath); return NULL; }
     d->kind = DOM_FILE;
     d->rc = 1;
+    atomic_store_explicit(&d->raw_readers, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->raw_swapping, 0, memory_order_relaxed);
     d->path = rpath;
     /* String atoms (lazy file slots + runtime-appended interns) live here,
      * off the per-thread buddy heap.  64 KB chunks. */
@@ -611,6 +622,28 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
     return a;
 }
 
+bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
+    if (!dom || !out || dom->kind == DOM_RUNTIME) return false;
+    /* Dekker pair with the extend: our increment must be visible to an
+     * extend that has raised raw_swapping, or we must see the flag. */
+    atomic_fetch_add_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&dom->raw_swapping, memory_order_seq_cst)) {
+        atomic_fetch_sub_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
+        return false;
+    }
+    out->map     = (const unsigned char*)dom->map;
+    out->offsets = dom->offsets;
+    out->count   = dom->base_count;
+    if (!out->map || !out->offsets || out->count <= 0) {
+        atomic_fetch_sub_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
+        return false;
+    }
+    return true;
+}
+void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
+    if (!dom || dom->kind == DOM_RUNTIME) return;
+    atomic_fetch_sub_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
+}
 /* Empty-vocabulary FILE domains get a distinct non-NULL LUT so callers
  * can branch on NULL == "runtime domain, ids pass through".  Never
  * indexed: every position is out of range when count == 0. */
