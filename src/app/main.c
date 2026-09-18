@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -65,6 +66,17 @@ static int64_t parse_size_arg(const char* s) {
         if (end[1] != '\0') return -1;   /* trailing junk after the suffix */
     }
     return (int64_t)(v * (double)mult);
+}
+
+static int parse_nonnegative_int_arg(const char* s, int* out) {
+    if (!s || !*s || *s == '-') return 0;
+    char* end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' || v < 0 || v > INT_MAX)
+        return 0;
+    *out = (int)v;
+    return 1;
 }
 
 /* --------------------------------------------------------------------------
@@ -184,10 +196,13 @@ int main(int argc, char** argv) {
             port = (uint16_t)pv;
         }
         else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
-            if (!v) { ray_runtime_destroy(rt); return 2; }
-            n_cores = atoi(v);
-            if (n_cores < 0) n_cores = 0;
+            const char* cv = flag_value(argc, argv, &i, argv[i]);
+            if (!cv) { ray_runtime_destroy(rt); return 2; }
+            if (!parse_nonnegative_int_arg(cv, &n_cores)) {
+                fprintf(stderr, "error: -c/--cores expects a non-negative integer\n");
+                ray_runtime_destroy(rt);
+                return 2;
+            }
         }
         else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) {
             const char* v = flag_value(argc, argv, &i, argv[i]);
