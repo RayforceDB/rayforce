@@ -2043,6 +2043,15 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     if (!path || ray_str_len(path_obj) == 0)
         return ray_error("domain", "%s: empty path", op);
 
+    /* Reject a directory up front, as `load` does (see the S_ISDIR check in
+     * ray_load_file_fn).  Platforms disagree on what fopen/fread do with
+     * one — Linux fails the read with EISDIR, others can succeed and
+     * return nothing — and "" for a directory would be exactly the silent
+     * wrong answer this change exists to remove. */
+    struct stat dst;
+    if (stat(path, &dst) == 0 && S_ISDIR(dst.st_mode))
+        return ray_error("io", "%s \"%s\": is a directory", op, path);
+
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
 

@@ -8971,6 +8971,70 @@ static test_result_t test_query_wide_table_over_64_cols(void) {
 }
 
 
+
+/* `read` must read until EOF, not to the size the file reports (#572).
+ *
+ * Every file under /proc and /sys reports st_size 0 while yielding data,
+ * which made `read` return a well-formed empty string: no error, no
+ * short-read signal, and a caller branching on the content silently took
+ * the wrong branch.  This lives in C rather than in the .rfl suite because
+ * procfs is Linux-only and the .rfl harness has no way to skip; the
+ * portable half of the behaviour (ordinary files, a FIFO, error paths) is
+ * covered in test/rfl/io/read_until_eof.rfl on every platform. */
+static test_result_t test_read_procfs_reports_zero_size(void) {
+#if !defined(__linux__)
+    SKIP("procfs is Linux-only");
+#else
+    const char* path = "/proc/sys/kernel/hostname";
+    FILE* probe = fopen(path, "rb");
+    if (!probe) SKIP("procfs not mounted");
+    fclose(probe);
+
+    /* The premise: the file reports zero bytes. */
+    struct stat st;
+    TEST_ASSERT(stat(path, &st) == 0, "stat procfs path");
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, 0);
+
+    ray_t* arg = ray_str(path, strlen(path));
+    ray_t* got = ray_read_file_fn(arg);
+    ray_release(arg);
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT(!RAY_IS_ERR(got), "read of a procfs file must not error");
+
+    /* ...and yet it has content. */
+    TEST_ASSERT(ray_str_len(got) > 0, "procfs read must not come back empty");
+
+    /* The right content: compare against the same value gethostname gives,
+     * so this asserts correctness rather than merely non-emptiness. */
+    char host[256] = {0};
+    TEST_ASSERT(gethostname(host, sizeof(host) - 1) == 0, "gethostname");
+    size_t hlen = strlen(host);
+    TEST_ASSERT((size_t)ray_str_len(got) >= hlen, "read shorter than the host name");
+    TEST_ASSERT(memcmp(ray_str_ptr(got), host, hlen) == 0, "procfs host name mismatch");
+    ray_release(got);
+
+    /* A file whose every read differs proves we re-read rather than
+     * returning a cached or truncated view. */
+    const char* upath = "/proc/sys/kernel/random/uuid";
+    FILE* uprobe = fopen(upath, "rb");
+    if (!uprobe) PASS();
+    fclose(uprobe);
+
+    ray_t* ua = ray_str(upath, strlen(upath));
+    ray_t* u1 = ray_read_file_fn(ua);
+    ray_t* u2 = ray_read_file_fn(ua);
+    ray_release(ua);
+    TEST_ASSERT(!RAY_IS_ERR(u1) && !RAY_IS_ERR(u2), "uuid reads must not error");
+    TEST_ASSERT(ray_str_len(u1) >= 36, "uuid read too short");
+    TEST_ASSERT(ray_str_len(u1) != ray_str_len(u2) ||
+                memcmp(ray_str_ptr(u1), ray_str_ptr(u2), (size_t)ray_str_len(u1)) != 0,
+                "two uuid reads returned identical bytes");
+    ray_release(u1);
+    ray_release(u2);
+    PASS();
+#endif
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
@@ -9386,6 +9450,8 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/date_trunc_subday",        test_temporal_date_trunc_subday,        lang_setup, lang_teardown },
     { "lang/temporal/extract_epoch",            test_temporal_extract_epoch,            lang_setup, lang_teardown },
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
+
+    { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

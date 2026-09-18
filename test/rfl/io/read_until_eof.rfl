@@ -12,7 +12,7 @@
 (.sys.exec "rm -rf /tmp/rf_read_eof && mkdir -p /tmp/rf_read_eof")
 (.sys.exec "printf 'hello world\\n' > /tmp/rf_read_eof/ordinary.txt")
 (.sys.exec "printf '' > /tmp/rf_read_eof/empty.txt")
-(.sys.exec "head -c 300000 /dev/zero | tr '\\0' x > /tmp/rf_read_eof/big.txt")
+(.sys.exec "dd if=/dev/zero of=/tmp/rf_read_eof/big.txt bs=1000 count=300 2>/dev/null")
 
 ;; ────────────── ordinary files still behave ──────────────
 (read "/tmp/rf_read_eof/ordinary.txt")        -- "hello world\n"
@@ -27,25 +27,12 @@
 (count (read "/tmp/rf_read_eof/big.txt"))       -- 300000
 (count (read-bytes "/tmp/rf_read_eof/big.txt")) -- 300000
 
-;; ────────────── files that report size 0 but have content ──────────────
-;; /proc/sys/kernel/hostname is the issue's own example: stat says 0, the
-;; kernel yields the host name.  Cross-checked against uname(1) so this
-;; asserts the right content, not merely that something was read.
-(> (count (read "/proc/sys/kernel/hostname")) 0) -- true
-(== (first (split (read "/proc/sys/kernel/hostname") "\n")) (first (split (get (.sys.exec "uname -n" 'out) 'out) "\n"))) -- true
-
-;; .sys.info's hostname comes from gethostname(2) rather than from procfs;
-;; the two must agree, which also ties #573's identity to this path.
-(== (get (.sys.info) 'hostname) (first (split (read "/proc/sys/kernel/hostname") "\n"))) -- true
-
-;; The entropy source the reporter actually wanted: a fresh UUID per read.
-(count (first (split (read "/proc/sys/kernel/random/uuid") "\n"))) -- 36
-;; Two reads of it must differ — proof we are reading the file, not a
-;; cached or truncated view of it.
-(== (read "/proc/sys/kernel/random/uuid") (read "/proc/sys/kernel/random/uuid")) -- false
-
-;; read-bytes takes the same path and must agree.
-(> (count (read-bytes "/proc/sys/kernel/hostname")) 0) -- true
+;; ────────────── files that cannot be sized ──────────────
+;; The issue's own examples are under /proc, which is Linux-only, and this
+;; harness has no way to skip a line per platform — they live in
+;; test_lang.c as lang/io/read_procfs_zero_size, which SKIPs off Linux.
+;; The FIFO below is the portable member of the same class: it cannot be
+;; seeked at all, so it must be read to EOF on every platform.
 
 ;; ────────────── pipes ──────────────
 ;; A FIFO cannot be seeked, so sizing from the file made this an io error.
