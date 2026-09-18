@@ -677,7 +677,28 @@ ray_err_t ray_sym_load(const char* path);
 ray_t*    ray_env_get(int64_t sym_id);
 ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
 
-/* ===== Table API ===== */
+/* ===== Table API =====
+ *
+ * Every function here that takes a `ray_t* tbl` is total over ray_t: handed a
+ * value whose type is not RAY_TABLE — an atom, a vector, a dict, an error,
+ * NULL — none of them reads the argument's payload as table storage.  An
+ * embedder holding one opaque ray_t* can call any of them without first
+ * establishing the type.  What a wrong tag yields differs by return contract:
+ *
+ *   ray_table_ncols / ray_table_nrows          -> 0
+ *   ray_table_col_name                         -> -1
+ *   ray_table_schema / ray_table_get_col*      -> NULL
+ *   ray_table_set_col_name / ray_table_set_col_idx -> no-op
+ *   ray_table_add_col                          -> typed "type" error
+ *   ray_table_validate_rectangular             -> typed "type" error
+ *
+ * ray_table_add_col consumes its `tbl` ref on every path, the error path
+ * included, so a wrong tag releases the argument exactly as a bad column does.
+ *
+ * The two that return a typed error are the ones to reach for when the
+ * distinction matters: the accessors answer 0/NULL indistinguishably from a
+ * genuinely empty table, so they cannot tell you *why* the answer was empty.
+ */
 
 ray_t*       ray_table_new(int64_t ncols);
 ray_t*       ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec);

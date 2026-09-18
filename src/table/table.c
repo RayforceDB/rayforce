@@ -50,6 +50,18 @@ static inline ray_t** tbl_slots(ray_t* tbl) {
     return (ray_t**)ray_data(tbl);
 }
 
+/* The public accessors below decode `tbl`'s payload as the two-slot
+ * {schema, cols} layout, so they are only meaningful for a RAY_TABLE.  An
+ * embedder sees one opaque ray_t* and has nothing to check against, so each
+ * accessor is total over ray_t: a wrong tag gets the empty answer, never a
+ * read through a decoded payload (#567).  Matches ray_dict_keys and
+ * ray_parted_nrows, which already check their own tags.  Internal callers
+ * establish the type during dispatch and pay one predicted compare against a
+ * field already in the same cache line as `type`. */
+static inline bool tbl_is_table(ray_t* tbl) {
+    return tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE;
+}
+
 static inline ray_t* tbl_schema(ray_t* tbl) {
     return tbl_slots(tbl)[0];
 }
@@ -118,6 +130,17 @@ ray_t* ray_table_new(int64_t ncols) {
 
 ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    /* Unlike the accessors, this consumes `tbl` and owns its result, so the
+     * wrong-tag answer has to be a typed error rather than an empty one —
+     * same consume-and-error contract as the bad-column path below.  Without
+     * it a non-table gets ray_cow'd and then has slot pointers written into
+     * its payload (#567). */
+    if (tbl->type != RAY_TABLE) {
+        ray_t* err = ray_error("type", "table add_col: expected table, got %s",
+                               ray_type_name(tbl->type));
+        ray_release(tbl);
+        return err;
+    }
     if (!table_col_is_valid(col_vec)) {
         ray_release(tbl);
         return ray_error("domain", "table add_col: column must be list/vector-like, got %s",
@@ -189,7 +212,7 @@ ray_t* ray_table_validate_rectangular(ray_t* tbl, const char* context) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
-    if (!tbl || RAY_IS_ERR(tbl)) return NULL;
+    if (!tbl_is_table(tbl)) return NULL;
     ray_t* schema = tbl_schema(tbl);
     ray_t* cols   = tbl_cols(tbl);
     if (!schema || !cols) return NULL;
@@ -206,7 +229,7 @@ ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
-    if (!tbl || RAY_IS_ERR(tbl)) return NULL;
+    if (!tbl_is_table(tbl)) return NULL;
     ray_t* cols = tbl_cols(tbl);
     if (!cols) return NULL;
     if (idx < 0 || idx >= cols->len) return NULL;
@@ -221,7 +244,7 @@ ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
  * -------------------------------------------------------------------------- */
 
 void ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec) {
-    if (!tbl || RAY_IS_ERR(tbl) || !col_vec) return;
+    if (!tbl_is_table(tbl) || !col_vec) return;
     ray_t** slots = tbl_slots(tbl);
     ray_t* cols = slots[1];
     if (!cols || RAY_IS_ERR(cols)) return;
@@ -240,7 +263,7 @@ void ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec) {
  * -------------------------------------------------------------------------- */
 
 int64_t ray_table_col_name(ray_t* tbl, int64_t idx) {
-    if (!tbl || RAY_IS_ERR(tbl)) return -1;
+    if (!tbl_is_table(tbl)) return -1;
     ray_t* schema = tbl_schema(tbl);
     if (!schema) return -1;
     if (idx < 0 || idx >= schema->len) return -1;
@@ -253,7 +276,7 @@ int64_t ray_table_col_name(ray_t* tbl, int64_t idx) {
  * -------------------------------------------------------------------------- */
 
 void ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id) {
-    if (!tbl || RAY_IS_ERR(tbl)) return;
+    if (!tbl_is_table(tbl)) return;
     ray_t** slots = tbl_slots(tbl);
     ray_t* schema = slots[0];
     if (!schema || RAY_IS_ERR(schema)) return;
@@ -269,13 +292,13 @@ void ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id) {
  * -------------------------------------------------------------------------- */
 
 int64_t ray_table_ncols(ray_t* tbl) {
-    if (!tbl || RAY_IS_ERR(tbl)) return 0;
+    if (!tbl_is_table(tbl)) return 0;
     ray_t* schema = tbl_schema(tbl);
     return schema ? schema->len : 0;
 }
 
 int64_t ray_table_nrows(ray_t* tbl) {
-    if (!tbl || RAY_IS_ERR(tbl)) return 0;
+    if (!tbl_is_table(tbl)) return 0;
     ray_t* cols = tbl_cols(tbl);
     if (!cols || cols->len <= 0) return 0;
     ray_t* first_col = ((ray_t**)ray_data(cols))[0];
@@ -313,6 +336,6 @@ int64_t ray_parted_nrows(ray_t* v) {
 }
 
 ray_t* ray_table_schema(ray_t* tbl) {
-    if (!tbl || RAY_IS_ERR(tbl)) return NULL;
+    if (!tbl_is_table(tbl)) return NULL;
     return tbl_schema(tbl);
 }
