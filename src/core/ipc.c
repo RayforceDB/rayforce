@@ -314,6 +314,51 @@ static ray_t* hook_lookup(int idx) {
     return fn;
 }
 
+/* ── Temporary VM for a hook on a VM-less thread (#569) ──────────────
+ *
+ * `__VM` is bound only by ray_runtime_create, so any thread an embedder
+ * drives IPC from — the FFI teardown path in particular — has none.  #565
+ * made the *no hook installed* case safe by letting ray_env_get fall
+ * through to globals, which left this question open: with a hook actually
+ * bound, call_fn1 would run user code with __VM == NULL.
+ *
+ * A hook is user code and should behave the same wherever the event came
+ * from, so bind a VM for the duration rather than skipping the hook
+ * (silent, and invisible at the call site) or failing the close (which
+ * would break the FFI teardown that runtime.c:50-54 explicitly supports).
+ *
+ * Binding also restores `.ipc.handle` inside the hook: ipc_ctx_set stores
+ * through __VM and returns early without one, so on a VM-less thread the
+ * hook would otherwise see a handle of -1.
+ *
+ * ray_vm_t is ~68 KB, too large for a teardown-path stack, so it comes
+ * from the buddy heap (process-wide and already live — the heap belongs to
+ * the runtime, not the thread).  Teardown mirrors ray_runtime_destroy:
+ * release raise_val and trace, then free.  Grown scope frames are not
+ * walked, matching that same teardown — a hook that returns normally has
+ * already popped its scopes. */
+typedef struct { ray_vm_t* owned; } hook_vm_t;
+
+static bool hook_vm_bind(hook_vm_t* hv) {
+    hv->owned = NULL;
+    if (__VM) return true;                      /* already on a VM thread */
+    ray_vm_t* vm = (ray_vm_t*)ray_alloc_raw(sizeof(ray_vm_t));
+    if (!vm) return false;                      /* caller skips the hook */
+    ray_vm_init(vm, -1);                        /* id -1: not a pool VM */
+    __VM = vm;
+    hv->owned = vm;
+    return true;
+}
+
+static void hook_vm_unbind(hook_vm_t* hv) {
+    if (!hv->owned) return;
+    if (hv->owned->raise_val) ray_release(hv->owned->raise_val);
+    if (hv->owned->trace) ray_release(hv->owned->trace);
+    __VM = NULL;
+    ray_free_raw(hv->owned);
+    hv->owned = NULL;
+}
+
 /* Call a single-arg hook for lifecycle events (on.open / on.close).
  * Errors are logged and swallowed — a buggy logging hook must never
  * wedge connection teardown.  `poll` is the poll the connection lives
@@ -322,8 +367,14 @@ static ray_t* hook_lookup(int idx) {
 static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
     ray_t* fn = hook_lookup(idx);
     if (!fn) return;
+    hook_vm_t hv;
+    if (!hook_vm_bind(&hv)) return;
     ray_t* arg = make_i64(handle);
-    if (!arg || RAY_IS_ERR(arg)) { if (arg) ray_release(arg); return; }
+    if (!arg || RAY_IS_ERR(arg)) {
+        if (arg) ray_release(arg);
+        hook_vm_unbind(&hv);
+        return;
+    }
     int64_t prev = ipc_ctx_handle();
     ray_poll_t* prev_poll = ipc_ctx_poll();
     ipc_ctx_set(handle, poll ? poll : prev_poll);
@@ -336,6 +387,7 @@ static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
     }
     ray_release(arg);
     if (r && r != RAY_NULL_OBJ) ray_release(r);
+    hook_vm_unbind(&hv);
 }
 
 /* Call the on.auth hook with (user, pass) string atoms.  Returns:
