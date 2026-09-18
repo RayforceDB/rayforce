@@ -63,6 +63,13 @@
 (all (== (at (xasc A 'g) 'l) (at (xasc O 'g) 'l))) -- true
 (all (== (at (xasc A 'g) 's) (at (xasc O 'g) 's))) -- true
 (all (== (at (xasc A 'g) 'c) (at (xasc O 'g) 'c))) -- true
+;; a null cell (the empty symbol) counts as length 0 in the group aggregate,
+;; as the per-row path always did — the empty symbols of sp are NOT filtered
+(set AN (select {from: F by: g l: (avg (strlen sp)) s: (sum (strlen sp)) c: (count sp)}))
+(set ON (select {from: (table [g ls] (list (at F 'g) (strlen SPS))) by: g l: (avg ls) s: (sum ls) c: (count ls)}))
+(all (== (at (xasc AN 'g) 'l) (at (xasc ON 'g) 'l))) -- true
+(all (== (at (xasc AN 'g) 's) (at (xasc ON 'g) 's))) -- true
+(nil? (at (at (select {from: F s: (sum (strlen sp)) where: (== sp "")}) 's) 0)) -- false
 ;; the where predicate over the file-domain column still filters
 (== (count (select {from: F where: (and (like u "*google*") (!= sp ""))})) (sum (as 'I64 (and (like US "*google*") (!= SPS ""))))) -- true
 (.sys.exec "rm -rf /tmp/rfl_fdom_like/") -- 0

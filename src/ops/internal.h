@@ -1606,7 +1606,7 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op);
-void ray_sym_strlen_into(ray_t* input, ray_t* result);   /* string.c */
+void ray_sym_strlen_into(ray_t* input, ray_t* result, bool null_as_zero);   /* string.c */
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_replace(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_concat(ray_graph_t* g, ray_op_t* op);

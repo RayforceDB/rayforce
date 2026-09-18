@@ -11700,13 +11700,15 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             /* A SYM column on a FILE domain: the per-row string resolve
              * would materialise an atom per distinct symbol under the
              * domain lock.  Read the lengths off the mapping once
-             * (parallel, no atoms) and aggregate the plain I64 vector. */
+             * (parallel, no atoms) and aggregate the plain I64 vector.  A
+             * null cell (the empty symbol) is a null length, which the
+             * accumulate skips exactly as the per-row path skips the row. */
             ray_t* sc = agg_vecs[a];
             if (sc->type == RAY_SYM && ray_sym_vec_domain(sc) != ray_sym_runtime_domain()) {
                 ray_t* lens = ray_vec_new(RAY_I64, sc->len);
                 if (lens && !RAY_IS_ERR(lens)) {
                     lens->len = sc->len;
-                    ray_sym_strlen_into(sc, lens);
+                    ray_sym_strlen_into(sc, lens, false);
                     agg_vecs[a] = lens;
                     agg_owned[a] = 1;
                     continue;

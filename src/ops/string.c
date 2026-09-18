@@ -1007,6 +1007,7 @@ typedef struct {
     struct ray_sym_domain_s* dom;
     ray_sym_domain_raw_t     raw;
     bool                     raw_ok;
+    bool                     null_as_zero;   /* group aggregates count a null cell as length 0 */
     _Atomic(int)             any_null;
 } strlen_sym_ctx_t;
 static void strlen_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_t hi) {
@@ -1016,7 +1017,10 @@ static void strlen_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_t 
     const void* base = ray_data(input);
     bool any_null = false;
     for (int64_t i = lo; i < hi; i++) {
-        if (ray_vec_is_null(input, i)) { c->dst[i] = NULL_I64; any_null = true; continue; }
+        if (ray_vec_is_null(input, i)) {
+            if (c->null_as_zero) { c->dst[i] = 0; continue; }
+            c->dst[i] = NULL_I64; any_null = true; continue;
+        }
         int64_t sid = ray_read_sym(base, i, input->type, input->attrs);
         if (c->raw_ok && sid >= 0 && sid < c->raw.count) {
             size_t sl;
@@ -1033,10 +1037,14 @@ static void strlen_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_t 
 /* Lengths of a SYM vector into a pre-sized I64 vector.  A FILE domain's
  * entries carry their length as a u32 prefix in the mapping — read that by
  * position, no atom, no lock, in parallel; anything else (runtime domain,
- * appended positions) resolves the way it always did. */
-void ray_sym_strlen_into(ray_t* input, ray_t* result) {
+ * appended positions) resolves the way it always did.  null_as_zero: a
+ * null cell (the empty symbol) becomes 0 with no HAS_NULLS, the contract of
+ * the group path's strlen-on-SYM aggregate; otherwise NULL_I64 as the
+ * vector op returns. */
+void ray_sym_strlen_into(ray_t* input, ray_t* result, bool null_as_zero) {
     int64_t len = input->len;
-    strlen_sym_ctx_t c = { .input = input, .dst = (int64_t*)ray_data(result), .raw_ok = false };
+    strlen_sym_ctx_t c = { .input = input, .dst = (int64_t*)ray_data(result), .raw_ok = false,
+                           .null_as_zero = null_as_zero };
     c.dom = ray_sym_vec_domain(input);
     c.raw_ok = c.dom ? ray_sym_domain_raw_pin(c.dom, &c.raw) : false;
     atomic_store_explicit(&c.any_null, 0, memory_order_relaxed);
@@ -1071,7 +1079,7 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
             }
         }
     } else {
-        ray_sym_strlen_into(input, result);
+        ray_sym_strlen_into(input, result, false);
     }
     ray_release(input);
     return result;

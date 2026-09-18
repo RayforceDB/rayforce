@@ -1720,6 +1720,40 @@ static test_result_t test_domain_raw_pin(void) {
     TEST_ASSERT_EQ_I(raw.count, (int64_t)count_at_save);
     ray_sym_domain_raw_unpin(dom);
     ray_sym_domain_release(dom);
+    /* The file grows under another writer while a reader holds a snapshot:
+     * the reopen extends the domain (new mapping, new offsets), and the
+     * old snapshot must still read every old position from its retired
+     * mapping, while a fresh pin sees the grown prefix. */
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    ray_sym_domain_t* d1 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(d1);
+    ray_sym_domain_raw_t held;
+    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &held), "pin before growth");
+    int64_t before = held.count;
+    for (int i = 0; i < 64; i++) {
+        char buf[32]; int n = snprintf(buf, sizeof buf, "raw_grow_%d", i);
+        (void)ray_sym_intern(buf, (size_t)n);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);   /* grown image, same prefix */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* cache hit → extend */
+    TEST_ASSERT_EQ_PTR(d2, d1);
+    TEST_ASSERT(ray_sym_domain_count(d1) > before, "reopen extended the domain");
+    for (int64_t p = 0; p < before; p++) {
+        size_t rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&held, p, &rl);
+        ray_t* g = ray_sym_str(p);
+        TEST_ASSERT_EQ_U(rl, ray_str_len(g));
+        TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
+    }
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &fresh), "pin after growth");
+    TEST_ASSERT(fresh.count > before, "fresh snapshot covers the grown prefix");
+    ray_sym_domain_raw_unpin(d1);
+    ray_sym_domain_raw_unpin(d1);
+    ray_sym_domain_release(d2);
+    ray_sym_domain_release(d1);
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
     PASS();

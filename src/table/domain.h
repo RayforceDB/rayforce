@@ -110,13 +110,17 @@ void ray_sym_domain_release(ray_sym_domain_t* dom);
 ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
 
 /* Raw vocabulary access for a FILE domain: the bytes of the entries the
- * file holds, read straight from the mapping — no atom, no lock.  Pin the
- * mapping first; while any reader is pinned a concurrent extend (the file
- * grew under another opener) waits before swapping the map.  Returns
- * false for the runtime domain, an empty file, or a swap in progress —
- * the caller then resolves through ray_sym_domain_str as before.  Only
- * positions below `count` (the file prefix) are readable this way;
- * runtime-appended positions keep going through ray_sym_domain_str. */
+ * file holds, read straight from the mapping — no atom, no lock.  Pin
+ * takes an atomically published snapshot of (map, offsets, count); a
+ * later extend (the symfile grew under another opener) publishes a new
+ * snapshot and RETIRES the old mapping and offsets until the domain is
+ * destroyed, so a snapshot stays readable for as long as its holder keeps
+ * the domain alive — no waiting on either side, no lock order to respect.
+ * Returns false for the runtime domain or an empty file; the caller then
+ * resolves through ray_sym_domain_str as before.  Only positions below
+ * `count` (the file prefix) are readable this way; runtime-appended
+ * positions keep going through ray_sym_domain_str.  Unpin is a no-op kept
+ * for symmetry. */
 typedef struct {
     const unsigned char* map;
     const size_t*        offsets;

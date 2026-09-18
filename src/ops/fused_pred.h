@@ -1,4 +1,3 @@
-#include "table/domain.h"
 /*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
@@ -28,6 +27,7 @@
 #include "rayforce.h"
 #include "ops/internal.h"
 #include "ops/glob.h"
+#include "table/domain.h"
 
 #define FP_PRED_MAX_CHILDREN 8
 

@@ -104,6 +104,16 @@ typedef struct dom_retired_s {
     void* ptr;
     struct dom_retired_s* next;
 } dom_retired_t;
+typedef struct dom_retired_map_s {
+    void*  map;
+    size_t size;
+    struct dom_retired_map_s* next;
+} dom_retired_map_t;
+typedef struct dom_raw_snap_s {
+    const unsigned char* map;
+    const size_t*        offsets;
+    int64_t              count;
+} dom_raw_snap_t;
 
 struct ray_sym_domain_s {
     uint8_t   kind;        /* dom_kind_t */
@@ -146,10 +156,13 @@ struct ray_sym_domain_s {
      * used to materialize atoms[pos] on demand from the mmap bytes.
      * malloc'd; NULL when base_count == 0. */
     size_t*   offsets;
-    /* Raw readers pinned on (map, offsets) — see ray_sym_domain_raw_pin.
-     * An extend raises raw_swapping, drains raw_readers, then swaps. */
-    _Atomic(int32_t) raw_readers;
-    _Atomic(int32_t) raw_swapping;
+    /* Published raw snapshot (see ray_sym_domain_raw_pin): map, offsets and
+     * the file-prefix count as one immutable record.  Replaced whole on
+     * extend; the previous record, its offsets and its mapping are retired
+     * (retired / retired_maps) rather than freed, so a reader holding the
+     * old snapshot stays valid until the domain is destroyed. */
+    _Atomic(struct dom_raw_snap_s*) raw_snap;
+    struct dom_retired_map_s* retired_maps;
 
     /* FILE, lazy: position → runtime intern id.  Built under g_dom_lock
      * (the build INTERNS the vocabulary into the global table —
@@ -245,6 +258,21 @@ static bool dom_retire(ray_sym_domain_t* d, void* p) {
     d->retired = r;
     return true;
 }
+/* Publish (map, offsets, count) as the domain's raw snapshot; the previous
+ * record is retired.  Called with the file's current image in place. */
+static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
+    dom_raw_snap_t* snap = NULL;
+    if (d->map && d->offsets && d->base_count > 0) {
+        snap = (dom_raw_snap_t*)ray_sys_alloc(sizeof(*snap));
+        if (!snap) return false;
+        snap->map = (const unsigned char*)d->map;
+        snap->offsets = d->offsets;
+        snap->count = d->base_count;
+    }
+    dom_raw_snap_t* old = atomic_exchange_explicit(&d->raw_snap, snap, memory_order_acq_rel);
+    if (old) (void)dom_retire(d, old);
+    return true;
+}
 
 /* Free a FILE domain after the last reference dropped.  Caller has
  * already unlinked it from the cache. */
@@ -263,6 +291,13 @@ static void dom_destroy(ray_sym_domain_t* d) {
         r = nxt;
     }
     ray_sys_free(d->buckets);
+    ray_sys_free(atomic_load_explicit(&d->raw_snap, memory_order_relaxed));
+    for (dom_retired_map_t* rm = d->retired_maps; rm;) {
+        dom_retired_map_t* nxt = rm->next;
+        ray_vm_unmap_file(rm->map, rm->size);
+        ray_sys_free(rm);
+        rm = nxt;
+    }
     if (d->map) ray_vm_unmap_file(d->map, d->map_size);
     ray_sys_free(d->path);
     ray_sys_free(d);
@@ -417,13 +452,10 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             for (int64_t i = count; i < fresh_count; i++) narr[i] = NULL;
             ray_sys_free(fresh);  /* fresh slot array unused — narr carries the prefix */
 
-            /* Swap in the new offsets + map; the old map's bytes are no
-             * longer referenced (prefix atoms are arena-copied) — once
-             * every raw reader pinned on them has left. */
-            atomic_store_explicit(&d->raw_swapping, 1, memory_order_seq_cst);
-            while (atomic_load_explicit(&d->raw_readers, memory_order_seq_cst) != 0)
-                RAY_CPU_RELAX();
-            ray_sys_free(d->offsets);
+            /* Swap in the new offsets + map.  Prefix atoms are arena
+             * copies, but a raw snapshot may still point at the old
+             * offsets and mapping: retire both instead of freeing. */
+            (void)dom_retire(d, d->offsets);
             d->offsets = fresh_offsets;
             void* old_map = d->map;
             size_t old_map_size = d->map_size;
@@ -437,8 +469,13 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             d->disk_count = fresh_count;
             d->disk_size = st_size;
 
-            if (old_map) ray_vm_unmap_file(old_map, old_map_size);
-            atomic_store_explicit(&d->raw_swapping, 0, memory_order_release);
+            if (old_map) {
+                dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
+                if (rm) { rm->map = old_map; rm->size = old_map_size; rm->next = d->retired_maps; d->retired_maps = rm; }
+                /* no rm: the old mapping stays mapped for the process
+                 * lifetime — never unmapped under a live snapshot */
+            }
+            (void)dom_publish_raw_snap(d);
 
             /* Reverse index + LUT now cover a stale prefix: drop both.
              * A retire-OOM here would keep the stale LUT published over
@@ -505,8 +542,8 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!d) { ray_sys_free(rpath); return NULL; }
     d->kind = DOM_FILE;
     d->rc = 1;
-    atomic_store_explicit(&d->raw_readers, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->raw_swapping, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->raw_snap, NULL, memory_order_relaxed);
+    d->retired_maps = NULL;
     d->path = rpath;
     /* String atoms (lazy file slots + runtime-appended interns) live here,
      * off the per-thread buddy heap.  64 KB chunks. */
@@ -528,6 +565,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         d->offsets = offsets;
         d->atoms_cap = count;
         d->base_count = count;
+        (void)dom_publish_raw_snap(d);
         d->disk_count = count;
         d->disk_size = d->map_size;
         /* Position-0 reservation: every non-empty symfile must carry the
@@ -624,25 +662,15 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
 
 bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     if (!dom || !out || dom->kind == DOM_RUNTIME) return false;
-    /* Dekker pair with the extend: our increment must be visible to an
-     * extend that has raised raw_swapping, or we must see the flag. */
-    atomic_fetch_add_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
-    if (atomic_load_explicit(&dom->raw_swapping, memory_order_seq_cst)) {
-        atomic_fetch_sub_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
-        return false;
-    }
-    out->map     = (const unsigned char*)dom->map;
-    out->offsets = dom->offsets;
-    out->count   = dom->base_count;
-    if (!out->map || !out->offsets || out->count <= 0) {
-        atomic_fetch_sub_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
-        return false;
-    }
+    dom_raw_snap_t* snap = atomic_load_explicit(&dom->raw_snap, memory_order_acquire);
+    if (!snap) return false;
+    out->map = snap->map;
+    out->offsets = snap->offsets;
+    out->count = snap->count;
     return true;
 }
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
-    if (!dom || dom->kind == DOM_RUNTIME) return;
-    atomic_fetch_sub_explicit(&dom->raw_readers, 1, memory_order_seq_cst);
+    (void)dom;   /* the snapshot outlives its readers by construction */
 }
 /* Empty-vocabulary FILE domains get a distinct non-NULL LUT so callers
  * can branch on NULL == "runtime domain, ids pass through".  Never
