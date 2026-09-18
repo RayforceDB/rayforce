@@ -1,0 +1,89 @@
+;; like / strlen over a SYM column whose ids live in a FILE domain (a
+;; splayed table read back from disk).  The engine reads the entries' bytes
+;; and lengths straight off the mapped vocabulary instead of materialising
+;; an atom per symbol; every answer must equal the same computation over
+;; the strings themselves.  Sizes past the parallel thresholds (like 100000
+;; rows, strlen 65536) so the pooled paths run.
+(.sys.exec "rm -rf /tmp/rfl_fdom_like/") -- 0
+(set N 120000)
+(set i (til N))
+(set hosts (map (fn [k] (format "h%.example.com" k)) (til 300)))
+(set u (as 'SYMBOL (map (fn [k] (if (== 0 (% k 41)) (format "http://%/google/%" (at hosts (% k 300)) k) (format "http://%/p/%/%" (at hosts (% (* 31 k) 300)) (% k 977) k))) i)))
+(set sp (as 'SYMBOL (map (fn [k] (if (== 0 (% k 3)) "" (format "phrase % %" (% (* k 7) 5000) (% k 13)))) i)))
+(set g (as 'I64 (% (* i 7919) 500)))
+(set T (table [u sp g] (list u sp g)))
+(.db.splayed.set "/tmp/rfl_fdom_like/" T)
+(set F (.db.splayed.get "/tmp/rfl_fdom_like/"))
+(count F) -- 120000
+(== (type (at F 'u)) 'SYM) -- true
+;; string oracle: the same values as plain strings
+(set US (as 'STR (at F 'u)))
+(set SPS (as 'STR (at F 'sp)))
+;; pattern *google*
+(== (count (select {from: F where: (like u "*google*")})) (sum (as 'I64 (like US "*google*")))) -- true
+(all (== (like (at F 'u) "*google*") (like US "*google*"))) -- true
+(== (count (select {from: F u: u where: (like u "*google*") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "*google*"))))) -- true
+;; pattern http://h1*
+(== (count (select {from: F where: (like u "http://h1*")})) (sum (as 'I64 (like US "http://h1*")))) -- true
+(all (== (like (at F 'u) "http://h1*") (like US "http://h1*"))) -- true
+(== (count (select {from: F u: u where: (like u "http://h1*") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "http://h1*"))))) -- true
+;; pattern */p/5/*
+(== (count (select {from: F where: (like u "*/p/5/*")})) (sum (as 'I64 (like US "*/p/5/*")))) -- true
+(all (== (like (at F 'u) "*/p/5/*") (like US "*/p/5/*"))) -- true
+(== (count (select {from: F u: u where: (like u "*/p/5/*") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "*/p/5/*"))))) -- true
+;; pattern http://h12.example.com/google/492
+(== (count (select {from: F where: (like u "http://h12.example.com/google/492")})) (sum (as 'I64 (like US "http://h12.example.com/google/492")))) -- true
+(all (== (like (at F 'u) "http://h12.example.com/google/492") (like US "http://h12.example.com/google/492"))) -- true
+(== (count (select {from: F u: u where: (like u "http://h12.example.com/google/492") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "http://h12.example.com/google/492"))))) -- true
+;; pattern *
+(== (count (select {from: F where: (like u "*")})) (sum (as 'I64 (like US "*")))) -- true
+(all (== (like (at F 'u) "*") (like US "*"))) -- true
+(== (count (select {from: F u: u where: (like u "*") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "*"))))) -- true
+;; pattern nomatch*
+(== (count (select {from: F where: (like u "nomatch*")})) (sum (as 'I64 (like US "nomatch*")))) -- true
+(all (== (like (at F 'u) "nomatch*") (like US "nomatch*"))) -- true
+(== (count (select {from: F u: u where: (like u "nomatch*") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "nomatch*"))))) -- true
+
+;; suffix and exact patterns: sensitive to the last byte of every entry
+(== (count (select {from: F where: (like u "*/google/492")})) 1) -- true
+(== (count (select {from: F where: (like u "http://h192.example.com/google/492")})) 1) -- true
+(== (count (select {from: F where: (like u "*9")})) (sum (as 'I64 (like US "*9")))) -- true
+(all (== (like (at F 'u) "*9") (like US "*9"))) -- true
+(all (== (like (at F 'u) "*/google/492") (like US "*/google/492"))) -- true
+(== (count (select {from: F u: u where: (like u "*9") asc: g take: 25})) (min 25 (sum (as 'I64 (like US "*9"))))) -- true
+;; like on the low-cardinality column with empties
+(all (== (like (at F 'sp) "phrase 4*") (like SPS "phrase 4*"))) -- true
+(== (count (select {from: F where: (like sp "phrase 4*")})) (sum (as 'I64 (like SPS "phrase 4*")))) -- true
+;; strlen: plain and inside an aggregate
+(all (== (strlen (at F 'u)) (strlen US))) -- true
+(all (== (strlen (at F 'sp)) (strlen SPS))) -- true
+(set A (select {from: F by: g l: (avg (strlen u)) s: (sum (strlen sp)) c: (count u) where: (!= u "")}))
+(set O (select {from: (table [g lu ls] (list (at F 'g) (strlen US) (strlen SPS))) by: g l: (avg lu) s: (sum ls) c: (count lu)}))
+(count A) -- 500
+(all (== (at (xasc A 'g) 'l) (at (xasc O 'g) 'l))) -- true
+(all (== (at (xasc A 'g) 's) (at (xasc O 'g) 's))) -- true
+(all (== (at (xasc A 'g) 'c) (at (xasc O 'g) 'c))) -- true
+;; strlen inside a group aggregate must give the SAME answer for the on-disk
+;; column as for the identical in-memory column, on every path the engine
+;; takes: the empty symbol is a null cell, and the two accumulates (with and
+;; without a row selection) treat it differently — that asymmetry is the
+;; engine's, and it must not depend on where the column lives
+(set AF (xasc (select {from: F by: g l: (avg (strlen sp)) s: (sum (strlen sp)) c: (count sp)}) 'g))
+(set AT (xasc (select {from: T by: g l: (avg (strlen sp)) s: (sum (strlen sp)) c: (count sp)}) 'g))
+(all (== (at AF 'l) (at AT 'l))) -- true
+(all (== (at AF 's) (at AT 's))) -- true
+(set WF (xasc (select {from: F by: g l: (avg (strlen sp)) s: (sum (strlen sp)) where: (< g 200)}) 'g))
+(set WT (xasc (select {from: T by: g l: (avg (strlen sp)) s: (sum (strlen sp)) where: (< g 200)}) 'g))
+(all (== (at WF 'l) (at WT 'l))) -- true
+(all (== (at WF 's) (at WT 's))) -- true
+;; the smallest case: one group of two empties, one mixed, on disk and in memory
+(.sys.exec "rm -rf /tmp/rfl_fdom_like2/") -- 0
+(set T2 (table [g2 s2] (list [1 1 2 2 3] (as 'SYMBOL ["" "abcd" "" "" "xy"]))))
+(.db.splayed.set "/tmp/rfl_fdom_like2/" T2)
+(set F2 (.db.splayed.get "/tmp/rfl_fdom_like2/"))
+(== (at (xasc (select {from: F2 by: g2 l: (avg (strlen s2))}) 'g2) 'l) (at (xasc (select {from: T2 by: g2 l: (avg (strlen s2))}) 'g2) 'l)) -- [true true true]
+(== (at (xasc (select {from: F2 by: g2 s: (sum (strlen s2))}) 'g2) 's) (at (xasc (select {from: T2 by: g2 s: (sum (strlen s2))}) 'g2) 's)) -- [true true true]
+(.sys.exec "rm -rf /tmp/rfl_fdom_like2/") -- 0
+;; the where predicate over the file-domain column still filters
+(== (count (select {from: F where: (and (like u "*google*") (!= sp ""))})) (sum (as 'I64 (and (like US "*google*") (!= SPS ""))))) -- true
+(.sys.exec "rm -rf /tmp/rfl_fdom_like/") -- 0

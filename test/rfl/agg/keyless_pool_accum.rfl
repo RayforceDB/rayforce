@@ -1,0 +1,49 @@
+;; Keyless aggregates (no by:) over enough rows for the pooled scalar
+;; path: each worker keeps one accumulator block, merged at the end.  The
+;; combined multi-aggregate form must agree with the single-aggregate
+;; forms and with the plain vector reductions, for integer, float and
+;; nullable inputs, with and without a where filter.
+(set N 200000)
+(set i (til N))
+(set a (as 'I64 (% (* i 7919) 1000)))
+(set f (as 'F64 (% (* i 31) 977)))
+(set n (as 'I64 (map (fn [k] (if (== 0 (% k 13)) 0N (% k 500))) i)))
+(set g (as 'F64 (map (fn [k] (if (== 0 (% k 17)) 0N (* 0.5 (% k 300)))) i)))
+(set T (table [a f n g] (list a f n g)))
+(set R (select {from: T s: (sum a) c: (count a) av: (avg f) mn: (min f) mx: (max a) sd: (stddev f) v: (var a) sn: (sum n) avn: (avg n) mnn: (min n) mxn: (max n) sg: (sum g) avg: (avg g) vg: (var g)}))
+(count R) -- 1
+(== (at (at R 's) 0) (sum a)) -- true
+(== (at (at R 'c) 0) (count a)) -- true
+(== (at (at R 'av) 0) (avg f)) -- true
+(== (at (at R 'mn) 0) (min f)) -- true
+(== (at (at R 'mx) 0) (max a)) -- true
+(< (abs (- (at (at R 'sd) 0) (stddev f))) 1e-9) -- true
+(< (abs (- (at (at R 'v) 0) (var a))) 1e-6) -- true
+(== (at (at R 'sn) 0) (sum n)) -- true
+(== (at (at R 'avn) 0) (avg n)) -- true
+(== (at (at R 'mnn) 0) (min n)) -- true
+(== (at (at R 'mxn) 0) (max n)) -- true
+(== (at (at R 'sg) 0) (sum g)) -- true
+(< (abs (- (at (at R 'avg) 0) (avg g))) 1e-9) -- true
+(< (abs (- (at (at R 'vg) 0) (var g))) 1e-6) -- true
+;; the single-aggregate forms take the specialised tight loops; they must
+;; match the combined form
+(== (at (at (select {from: T s: (sum a)}) 's) 0) (at (at R 's) 0)) -- true
+(== (at (at (select {from: T av: (avg f)}) 'av) 0) (at (at R 'av) 0)) -- true
+(== (at (at (select {from: T c: (count n)}) 'c) 0) (count n)) -- true
+;; with a where filter (row selection through the same accumulators)
+(set W (select {from: T s: (sum a) c: (count a) av: (avg f) mn: (min n) mx: (max g) sn: (sum n) where: (> a 500)}))
+(set ORA (select {from: T a: a f: f n: n g: g where: (> a 500)}))
+(== (at (at W 's) 0) (sum (at ORA 'a))) -- true
+(== (at (at W 'c) 0) (count (at ORA 'a))) -- true
+(== (at (at W 'av) 0) (avg (at ORA 'f))) -- true
+(== (at (at W 'mn) 0) (min (at ORA 'n))) -- true
+(== (at (at W 'mx) 0) (max (at ORA 'g))) -- true
+(== (at (at W 'sn) 0) (sum (at ORA 'n))) -- true
+;; many aggregates at once (the per-worker block scales with the count)
+(set B (select {from: T a1: (sum a) a2: (sum f) a3: (sum n) a4: (sum g) a5: (min a) a6: (min f) a7: (max n) a8: (max g) a9: (avg a) a10: (avg f) a11: (count a) a12: (var f) a13: (stddev a)}))
+(== (at (at B 'a1) 0) (sum a)) -- true
+(== (at (at B 'a4) 0) (sum g)) -- true
+(== (at (at B 'a7) 0) (max n)) -- true
+(== (at (at B 'a10) 0) (avg f)) -- true
+(< (abs (- (at (at B 'a13) 0) (stddev a))) 1e-9) -- true

@@ -8971,6 +8971,140 @@ static test_result_t test_query_wide_table_over_64_cols(void) {
 }
 
 
+
+/* `read` must read until EOF, not to the size the file reports (#572).
+ *
+ * Every file under /proc and /sys reports st_size 0 while yielding data,
+ * which made `read` return a well-formed empty string: no error, no
+ * short-read signal, and a caller branching on the content silently took
+ * the wrong branch.  This lives in C rather than in the .rfl suite because
+ * procfs is Linux-only and the .rfl harness has no way to skip; the
+ * portable half of the behaviour (ordinary files, a FIFO, error paths) is
+ * covered in test/rfl/io/read_until_eof.rfl on every platform. */
+static test_result_t test_read_procfs_reports_zero_size(void) {
+#if !defined(__linux__)
+    SKIP("procfs is Linux-only");
+#else
+    const char* path = "/proc/sys/kernel/hostname";
+    FILE* probe = fopen(path, "rb");
+    if (!probe) SKIP("procfs not mounted");
+    fclose(probe);
+
+    /* The premise: the file reports zero bytes. */
+    struct stat st;
+    TEST_ASSERT(stat(path, &st) == 0, "stat procfs path");
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, 0);
+
+    ray_t* arg = ray_str(path, strlen(path));
+    ray_t* got = ray_read_file_fn(arg);
+    ray_release(arg);
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT(!RAY_IS_ERR(got), "read of a procfs file must not error");
+
+    /* ...and yet it has content. */
+    TEST_ASSERT(ray_str_len(got) > 0, "procfs read must not come back empty");
+
+    /* The right content: compare against the same value gethostname gives,
+     * so this asserts correctness rather than merely non-emptiness. */
+    char host[256] = {0};
+    TEST_ASSERT(gethostname(host, sizeof(host) - 1) == 0, "gethostname");
+    size_t hlen = strlen(host);
+    TEST_ASSERT((size_t)ray_str_len(got) >= hlen, "read shorter than the host name");
+    TEST_ASSERT(memcmp(ray_str_ptr(got), host, hlen) == 0, "procfs host name mismatch");
+    ray_release(got);
+
+    /* A file whose every read differs proves we re-read rather than
+     * returning a cached or truncated view. */
+    const char* upath = "/proc/sys/kernel/random/uuid";
+    FILE* uprobe = fopen(upath, "rb");
+    if (!uprobe) PASS();
+    fclose(uprobe);
+
+    ray_t* ua = ray_str(upath, strlen(upath));
+    ray_t* u1 = ray_read_file_fn(ua);
+    ray_t* u2 = ray_read_file_fn(ua);
+    ray_release(ua);
+    TEST_ASSERT(!RAY_IS_ERR(u1) && !RAY_IS_ERR(u2), "uuid reads must not error");
+    TEST_ASSERT(ray_str_len(u1) >= 36, "uuid read too short");
+    TEST_ASSERT(ray_str_len(u1) != ray_str_len(u2) ||
+                memcmp(ray_str_ptr(u1), ray_str_ptr(u2), (size_t)ray_str_len(u1)) != 0,
+                "two uuid reads returned identical bytes");
+    ray_release(u1);
+    ray_release(u2);
+    PASS();
+#endif
+}
+
+/* An unsized stream has no natural end, so the read-to-EOF loop is bounded
+ * by a quarter of the heap's remaining anon headroom (#572 follow-up).  The
+ * watermark is a spill threshold rather than a ceiling — crossing it picks
+ * disk over RAM instead of failing — so an unbounded loop would fill the
+ * spill file rather than merely exhausting RAM.
+ *
+ * Drives the bound by moving the watermark to just above what is already
+ * committed, which makes the budget small and the error immediate. */
+static test_result_t test_read_unsized_stream_is_bounded(void) {
+#if defined(RAY_OS_WINDOWS)
+    SKIP("no /dev/zero");
+#else
+    FILE* probe = fopen("/dev/zero", "rb");
+    if (!probe) SKIP("/dev/zero unavailable");
+    fclose(probe);
+
+    /* ray_heap_anon_watermark() resolves the 0 sentinel to physical RAM, so
+     * restoring what it returns would pin the watermark to a number where
+     * the suite found "use physical RAM".  Detect that case and put the
+     * sentinel back instead, which keeps this test order-independent. */
+    int64_t saved = ray_heap_anon_watermark();
+    bool was_default = (saved == ray_sys_total_ram());
+    /* budget = (watermark - committed) / 4, so this leaves ~1 MB. */
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
+
+    ray_t* arg = ray_str("/dev/zero", 9);
+    ray_t* got = ray_read_file_fn(arg);
+    ray_release(arg);
+
+    ray_heap_set_anon_watermark(was_default ? 0 : saved);
+
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT(RAY_IS_ERR(got), "an endless stream must error, not grow without end");
+    TEST_ASSERT_STR_EQ(ray_err_code(got), "io");
+    ray_error_free(got);
+
+    /* A *sized* file larger than the same budget must still read: the
+     * ceiling exists to terminate an endless stream, and a reported size is
+     * a finite claim the filesystem backs.  Bounding this path would turn a
+     * large-file read that previously allocated and spilled into a hard
+     * error, and would make success depend on live process state. */
+    const char* big = "/tmp/rf_read_big_sized.bin";
+    FILE* bf = fopen(big, "wb");
+    TEST_ASSERT_NOT_NULL(bf);
+    static char chunk[65536];
+    for (int i = 0; i < 32; i++)   /* 2 MB, well over the ~1 MB budget */
+        TEST_ASSERT(fwrite(chunk, 1, sizeof(chunk), bf) == sizeof(chunk), "write big file");
+    fclose(bf);
+
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
+    ray_t* bp = ray_str(big, strlen(big));
+    ray_t* bread = ray_read_file_fn(bp);
+    ray_release(bp);
+    ray_heap_set_anon_watermark(was_default ? 0 : saved);
+    remove(big);
+    TEST_ASSERT(!RAY_IS_ERR(bread), "a sized file must not be refused by the unsized budget");
+    TEST_ASSERT_EQ_I(ray_str_len(bread), 2 * 1024 * 1024);
+    ray_release(bread);
+
+    /* The bound must not have disturbed ordinary reads once restored. */
+    ray_t* p2 = ray_str("/dev/null", 9);
+    ray_t* empty = ray_read_file_fn(p2);
+    ray_release(p2);
+    TEST_ASSERT(!RAY_IS_ERR(empty), "/dev/null must still read as empty");
+    TEST_ASSERT_EQ_I(ray_str_len(empty), 0);
+    ray_release(empty);
+    PASS();
+#endif
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
@@ -9386,6 +9520,9 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/date_trunc_subday",        test_temporal_date_trunc_subday,        lang_setup, lang_teardown },
     { "lang/temporal/extract_epoch",            test_temporal_extract_epoch,            lang_setup, lang_teardown },
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
+
+    { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
+    { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

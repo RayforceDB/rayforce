@@ -59,6 +59,7 @@ static inline double clear_neg_zero(double v) {
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include "mem/heap.h"   /* ray_heap_anon_watermark/committed — read budget */
 #if !defined(RAY_OS_WINDOWS)
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -2036,6 +2037,29 @@ ray_t* ray_type_fn(ray_t* val) {
     return ray_sym(id);
 }
 
+/* Ceiling for the growth of an *unsized* read — a stream with no size to
+ * go on.  The hinted path is deliberately not subject to it.
+ *
+ * The heap's anon watermark is NOT a ceiling: crossing it routes the
+ * mapping to a spill file rather than failing ("this never rejects work,
+ * it just picks disk over RAM" — mem/heap.c).  Bounding by the watermark
+ * itself would therefore trade an OOM kill for filling the spill file,
+ * which is why this bounds against the *remaining* headroom instead, and
+ * takes a quarter of it so an endless stream errors well before the first
+ * spill.  A quarter, and the "unknown RAM stays permissive" convention,
+ * match the admission gate in ops/cdfuse.c, which rides the same
+ * watermark — so ray_heap_set_anon_watermark still steers this and no new
+ * knob is introduced.
+ *
+ * Returns 0 for "no bound known", which callers treat as permissive. */
+static int64_t read_size_budget(void) {
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return 0;                       /* RAM unknown → permissive */
+    int64_t avail = wm - ray_heap_anon_committed();
+    if (avail <= 0) return 0;
+    return avail / 4;
+}
+
 static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     if (path_obj->type != -RAY_STR)
         return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
@@ -2043,26 +2067,104 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     if (!path || ray_str_len(path_obj) == 0)
         return ray_error("domain", "%s: empty path", op);
 
+    /* Reject a directory up front, as `load` does (see the S_ISDIR check in
+     * ray_load_file_fn).  Platforms disagree on what fopen/fread do with
+     * one — Linux fails the read with EISDIR, others can succeed and
+     * return nothing — and "" for a directory would be exactly the silent
+     * wrong answer this change exists to remove.  POSIX-only: <sys/stat.h>
+     * is guarded out on Windows and MSVC has no S_ISDIR, and unlike
+     * ray_load_file_fn this function is compiled on both paths. */
+#if !defined(RAY_OS_WINDOWS)
+    struct stat dst;
+    if (stat(path, &dst) == 0 && S_ISDIR(dst.st_mode))
+        return ray_error("io", "%s \"%s\": is a directory", op, path);
+#endif
+
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
-    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return ray_error("io", NULL); }
-    long sz = ftell(fp);
-    if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
-    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return ray_error("io", NULL); }
 
-    ray_t* result = ray_vec_new(RAY_U8, (int64_t)sz);
+    /* Read until EOF rather than to the size the file reports (#572).
+     * Everything under /proc and /sys reports 0 while yielding data, so
+     * sizing the read made those files come back as a well-formed empty
+     * value — no error, no short-read signal, and a caller branching on
+     * the content silently took the wrong branch.  Seeking also fails
+     * outright on a FIFO, and an ordinary file that changed size between
+     * the measure and the read became a spurious io error.
+     *
+     * The reported size is still worth having: where it is positive it is
+     * an exact capacity hint, so the common case does one allocation and
+     * one read with no growth. */
+    long hint = 0;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        hint = ftell(fp);
+        /* An implausible hint is treated as no hint rather than trusted
+         * into an overflow — a directory, for instance, seeks fine and
+         * reports LONG_MAX.  (Directories are already rejected by the
+         * S_ISDIR check above; this guard is for anything else that
+         * reports a size it cannot back.) */
+        if (hint < 0 || (int64_t)hint > INT64_MAX / 2 || fseek(fp, 0, SEEK_SET) != 0)
+            hint = 0;
+    }
+    /* Unseekable (pipe, character device) or size-0-but-readable: start at
+     * a page and grow.  The extra byte on a hinted read is what lets a
+     * single fread distinguish "exactly the hinted size" from "more than
+     * the hint", so a file that grew is read whole instead of truncated. */
+    int64_t cap = hint > 0 ? (int64_t)hint + 1 : 4096;
+
+    /* No ceiling on the hinted path.  A reported size is a finite claim the
+     * filesystem backs, and a large file allocating through the heap and
+     * spilling to disk is the behaviour that was already correct — the
+     * budget below exists to terminate an *endless* stream, which is not a
+     * situation a hint can describe. */
+    const int64_t budget = read_size_budget();
+
+    ray_t* result = ray_vec_new(RAY_U8, cap);
     if (!result || RAY_IS_ERR(result)) {
         fclose(fp);
         return result ? result : ray_error("oom", NULL);
     }
-    result->len = (int64_t)sz;
 
-    size_t rd = sz > 0 ? fread(ray_data(result), 1, (size_t)sz, fp) : 0;
-    int close_rc = fclose(fp);
-    if (rd != (size_t)sz || close_rc != 0) {
-        ray_release(result);
-        return ray_error("io", NULL);
+    int64_t len = 0;
+    for (;;) {
+        if (len == cap) {
+            /* An unsized stream — /dev/zero, a live FIFO — has no natural
+             * end.  Sizing from the file used to return "" for one
+             * instantly; growing without a bound instead walks the process
+             * into OOM or into the spill file.  Check before doubling, so
+             * the multiply itself cannot overflow. */
+            /* Peak during the grow is the old buffer plus the new one — 3*cap,
+             * since the old stays alive across the memcpy — so bound the
+             * peak rather than the result.  Checked before the multiply, so
+             * the multiply itself cannot overflow. */
+            if (cap > INT64_MAX / 3) {
+                ray_release(result); fclose(fp);
+                return ray_error("io", "%s \"%s\": input too large to read", op, path);
+            }
+            if (budget > 0 && cap * 3 > budget) {
+                ray_release(result); fclose(fp);
+                return ray_error("io", "%s \"%s\": unsized input exceeds the readable budget of %lld bytes",
+                                 op, path, (long long)budget);
+            }
+            int64_t ncap = cap * 2;
+            ray_t* grown = ray_vec_new(RAY_U8, ncap);
+            if (!grown || RAY_IS_ERR(grown)) {
+                ray_release(result); fclose(fp);
+                return grown ? grown : ray_error("oom", NULL);
+            }
+            memcpy(ray_data(grown), ray_data(result), (size_t)len);
+            ray_release(result);
+            result = grown; cap = ncap;
+        }
+        size_t got = fread((uint8_t*)ray_data(result) + len, 1, (size_t)(cap - len), fp);
+        len += (int64_t)got;
+        if (got == 0) {
+            if (ferror(fp)) { ray_release(result); fclose(fp); return ray_error("io", NULL); }
+            break;  /* EOF */
+        }
     }
+
+    if (fclose(fp) != 0) { ray_release(result); return ray_error("io", NULL); }
+    result->len = len;
     return result;
 }
 

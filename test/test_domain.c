@@ -1683,6 +1683,81 @@ static test_result_t test_domain_str_eager_lockfree(void) {
     PASS();
 }
 
+/* Raw vocabulary access: a pinned FILE domain hands out each file entry's
+ * bytes and length straight from the mapping, equal to the materialised
+ * atom; the runtime singleton refuses; pins nest and release. */
+static test_result_t test_domain_raw_pin(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    int64_t id_a = ray_sym_intern("raw_alpha", 9);
+    int64_t id_b = ray_sym_intern("raw_beta_longer_entry", 21);
+    (void)id_a; (void)id_b;
+    uint32_t count_at_save = ray_sym_count();
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    ray_sym_domain_raw_t raw;
+    TEST_ASSERT_FALSE(ray_sym_domain_raw_pin(ray_sym_runtime_domain(), &raw));
+    TEST_ASSERT(ray_sym_domain_raw_pin(dom, &raw), "pin a file domain");
+    TEST_ASSERT_EQ_I(raw.count, (int64_t)count_at_save);
+    /* Nested pin from another reader is fine. */
+    ray_sym_domain_raw_t raw2;
+    TEST_ASSERT(ray_sym_domain_raw_pin(dom, &raw2), "second pin");
+    for (int64_t p = 0; p < raw.count; p++) {
+        size_t rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&raw, p, &rl);
+        ray_t* s = ray_sym_domain_str(dom, p);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_U(rl, ray_str_len(s));
+        TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(s));
+    }
+    ray_sym_domain_raw_unpin(dom);
+    ray_sym_domain_raw_unpin(dom);
+    /* An entry appended after open is past the file prefix: not raw. */
+    int64_t pos_new = ray_sym_domain_intern(dom, "raw_appended", 12);
+    TEST_ASSERT(pos_new >= raw.count, "appended entry sits past the mapped prefix");
+    TEST_ASSERT(ray_sym_domain_raw_pin(dom, &raw), "pin again");
+    TEST_ASSERT_EQ_I(raw.count, (int64_t)count_at_save);
+    ray_sym_domain_raw_unpin(dom);
+    ray_sym_domain_release(dom);
+    /* The file grows under another writer while a reader holds a snapshot:
+     * the reopen extends the domain (new mapping, new offsets), and the
+     * old snapshot must still read every old position from its retired
+     * mapping, while a fresh pin sees the grown prefix. */
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    ray_sym_domain_t* d1 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(d1);
+    ray_sym_domain_raw_t held;
+    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &held), "pin before growth");
+    int64_t before = held.count;
+    for (int i = 0; i < 64; i++) {
+        char buf[32]; int n = snprintf(buf, sizeof buf, "raw_grow_%d", i);
+        (void)ray_sym_intern(buf, (size_t)n);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);   /* grown image, same prefix */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* cache hit → extend */
+    TEST_ASSERT_EQ_PTR(d2, d1);
+    TEST_ASSERT(ray_sym_domain_count(d1) > before, "reopen extended the domain");
+    for (int64_t p = 0; p < before; p++) {
+        size_t rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&held, p, &rl);
+        ray_t* g = ray_sym_str(p);
+        TEST_ASSERT_EQ_U(rl, ray_str_len(g));
+        TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
+    }
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &fresh), "pin after growth");
+    TEST_ASSERT(fresh.count > before, "fresh snapshot covers the grown prefix");
+    ray_sym_domain_raw_unpin(d1);
+    ray_sym_domain_raw_unpin(d1);
+    ray_sym_domain_release(d2);
+    ray_sym_domain_release(d1);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
 /* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
  * position-indexed array of runtime intern ids (round-trips strings),
  * built once (idempotent: same pointer).  Divergent fixture proves the
@@ -1910,6 +1985,7 @@ const test_entry_t domain_entries[] = {
     { "domain/asof_join_across_domains", test_domain_asof_join_across_domains, domain_rt_setup, domain_rt_teardown },
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
+    { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
     { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
