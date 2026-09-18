@@ -69,7 +69,7 @@ static int64_t parse_size_arg(const char* s) {
 }
 
 static int parse_nonnegative_int_arg(const char* s, int* out) {
-    if (!s || !*s || *s == '-') return 0;
+    if (!s || !*s || *s < '0' || *s > '9') return 0;
     char* end = NULL;
     errno = 0;
     long v = strtol(s, &end, 10);
