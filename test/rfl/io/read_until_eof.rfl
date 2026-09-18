@@ -7,45 +7,57 @@
 ;; caller branching on the content would act on.  Sizing from the file also
 ;; made an ordinary file that changed between the measure and the read an
 ;; io error rather than a successful read.
+;;
+;; The procfs cases from the issue are Linux-only and this harness has no
+;; per-platform skip, so they live in test_lang.c as
+;; lang/io/read_procfs_zero_size.  The FIFO cases below are the portable
+;; members of the same class: a pipe cannot be seeked, so it must be read
+;; to EOF on every platform.
+;;
+;; Paths carry the pid: this suite may run concurrently with another copy
+;; of itself on a shared runner, and a shared FIFO is worse than a shared
+;; file — `read` blocks in fopen until a writer appears, so a collision
+;; would hang rather than fail.
 
 ;; ────────────── pre-flight ──────────────
-(.sys.exec "rm -rf /tmp/rf_read_eof && mkdir -p /tmp/rf_read_eof")
-(.sys.exec "printf 'hello world\\n' > /tmp/rf_read_eof/ordinary.txt")
-(.sys.exec "printf '' > /tmp/rf_read_eof/empty.txt")
-(.sys.exec "dd if=/dev/zero of=/tmp/rf_read_eof/big.txt bs=1000 count=300 2>/dev/null")
+(set d (format "/tmp/rf_read_eof_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %" d d))
+(.sys.exec (format "printf 'hello world\\n' > %/ordinary.txt" d))
+(.sys.exec (format "printf '' > %/empty.txt" d))
+(.sys.exec (format "dd if=/dev/zero of=%/big.txt bs=1000 count=300 2>/dev/null" d))
 
 ;; ────────────── ordinary files still behave ──────────────
-(read "/tmp/rf_read_eof/ordinary.txt")        -- "hello world\n"
-(count (read-bytes "/tmp/rf_read_eof/ordinary.txt")) -- 12
+(read (format "%/ordinary.txt" d))                 -- "hello world\n"
+(count (read-bytes (format "%/ordinary.txt" d)))   -- 12
 
 ;; A genuinely empty file is still "" — the fix must not turn absence of
 ;; content into an error.
-(read "/tmp/rf_read_eof/empty.txt")           -- ""
-(count (read-bytes "/tmp/rf_read_eof/empty.txt")) -- 0
+(read (format "%/empty.txt" d))                    -- ""
+(count (read-bytes (format "%/empty.txt" d)))      -- 0
 
-;; Larger than any single growth step, to exercise the loop.
-(count (read "/tmp/rf_read_eof/big.txt"))       -- 300000
-(count (read-bytes "/tmp/rf_read_eof/big.txt")) -- 300000
+;; Sized file, larger than the unhinted starting buffer.  This takes the
+;; single-allocation hinted path.
+(count (read (format "%/big.txt" d)))              -- 300000
+(count (read-bytes (format "%/big.txt" d)))        -- 300000
 
-;; ────────────── files that cannot be sized ──────────────
-;; The issue's own examples are under /proc, which is Linux-only, and this
-;; harness has no way to skip a line per platform — they live in
-;; test_lang.c as lang/io/read_procfs_zero_size, which SKIPs off Linux.
-;; The FIFO below is the portable member of the same class: it cannot be
-;; seeked at all, so it must be read to EOF on every platform.
+;; ────────────── unsized streams: the growth loop ──────────────
+;; A FIFO has no size, so it starts at 4096 and doubles.  120000 bytes
+;; forces five doublings, exercising the grow/memcpy/release path that the
+;; sized cases above never touch.
+(.sys.exec (format "rm -f %/fifo_big && mkfifo %/fifo_big" d d))
+(.sys.exec (format "(dd if=/dev/zero bs=1000 count=120 2>/dev/null > %/fifo_big &) ; sleep 0" d))
+(count (read-bytes (format "%/fifo_big" d)))       -- 120000
 
-;; ────────────── pipes ──────────────
-;; A FIFO cannot be seeked, so sizing from the file made this an io error.
-;; Reading until EOF makes it work like any other stream.
-(.sys.exec "rm -f /tmp/rf_read_eof/fifo && mkfifo /tmp/rf_read_eof/fifo")
-(.sys.exec "(printf 'from-a-fifo\\n' > /tmp/rf_read_eof/fifo &) ; sleep 0")
-(read "/tmp/rf_read_eof/fifo") -- "from-a-fifo\n"
+;; And the small case, asserting content rather than just length.
+(.sys.exec (format "rm -f %/fifo && mkfifo %/fifo" d d))
+(.sys.exec (format "(printf 'from-a-fifo\\n' > %/fifo &) ; sleep 0" d))
+(read (format "%/fifo" d))                         -- "from-a-fifo\n"
 
 ;; ────────────── errors stay loud ──────────────
-(try (read "/tmp/rf_read_eof/does-not-exist") (fn [e] 'io-rejected)) -- 'io-rejected
-(try (read-bytes "/tmp/rf_read_eof/does-not-exist") (fn [e] 'io-rejected)) -- 'io-rejected
+(try (read (format "%/does-not-exist" d)) (fn [e] 'io-rejected))        -- 'io-rejected
+(try (read-bytes (format "%/does-not-exist" d)) (fn [e] 'io-rejected))  -- 'io-rejected
 ;; A directory is not readable as a file.
-(try (read "/tmp/rf_read_eof") (fn [e] 'io-rejected)) -- 'io-rejected
+(try (read d) (fn [e] 'io-rejected))                                    -- 'io-rejected
 
 ;; ────────────── cleanup ──────────────
-(.sys.exec "rm -rf /tmp/rf_read_eof")
+(.sys.exec (format "rm -rf %" d))

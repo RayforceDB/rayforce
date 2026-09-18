@@ -59,9 +59,9 @@ static inline double clear_neg_zero(double v) {
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include "mem/heap.h"   /* ray_heap_anon_watermark/committed — read budget */
 #if !defined(RAY_OS_WINDOWS)
 #include <sys/mman.h>
-#include "mem/heap.h"   /* ray_heap_anon_watermark — bound for an unsized read */
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -2037,6 +2037,28 @@ ray_t* ray_type_fn(ray_t* val) {
     return ray_sym(id);
 }
 
+/* Ceiling for one `read` / `read-bytes` result.
+ *
+ * The heap's anon watermark is NOT a ceiling: crossing it routes the
+ * mapping to a spill file rather than failing ("this never rejects work,
+ * it just picks disk over RAM" — mem/heap.c).  Bounding by the watermark
+ * itself would therefore trade an OOM kill for filling the spill file,
+ * which is why this bounds against the *remaining* headroom instead, and
+ * takes a quarter of it so an endless stream errors well before the first
+ * spill.  A quarter, and the "unknown RAM stays permissive" convention,
+ * match the admission gate in ops/cdfuse.c, which rides the same
+ * watermark — so ray_heap_set_anon_watermark still steers this and no new
+ * knob is introduced.
+ *
+ * Returns 0 for "no bound known", which callers treat as permissive. */
+static int64_t read_size_budget(void) {
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return 0;                       /* RAM unknown → permissive */
+    int64_t avail = wm - ray_heap_anon_committed();
+    if (avail <= 0) return 0;
+    return avail / 4;
+}
+
 static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     if (path_obj->type != -RAY_STR)
         return ray_error("type", "%s: path must be str, got %s", op, ray_type_name(path_obj->type));
@@ -2048,10 +2070,14 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
      * ray_load_file_fn).  Platforms disagree on what fopen/fread do with
      * one — Linux fails the read with EISDIR, others can succeed and
      * return nothing — and "" for a directory would be exactly the silent
-     * wrong answer this change exists to remove. */
+     * wrong answer this change exists to remove.  POSIX-only: <sys/stat.h>
+     * is guarded out on Windows and MSVC has no S_ISDIR, and unlike
+     * ray_load_file_fn this function is compiled on both paths. */
+#if !defined(RAY_OS_WINDOWS)
     struct stat dst;
     if (stat(path, &dst) == 0 && S_ISDIR(dst.st_mode))
         return ray_error("io", "%s \"%s\": is a directory", op, path);
+#endif
 
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
@@ -2084,6 +2110,13 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
      * the hint", so a file that grew is read whole instead of truncated. */
     int64_t cap = hint > 0 ? (int64_t)hint + 1 : 4096;
 
+    /* Same ceiling on both paths: a file claiming more than the budget is
+     * refused here rather than left to fail inside the allocator. */
+    const int64_t budget = read_size_budget();
+    if (budget > 0 && cap > budget)
+        return ray_error("io", "%s \"%s\": %lld bytes exceeds the readable budget of %lld bytes",
+                         op, path, (long long)cap, (long long)budget);
+
     ray_t* result = ray_vec_new(RAY_U8, cap);
     if (!result || RAY_IS_ERR(result)) {
         fclose(fp);
@@ -2093,20 +2126,17 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     int64_t len = 0;
     for (;;) {
         if (len == cap) {
-            int64_t ncap = cap * 2;
             /* An unsized stream — /dev/zero, a live FIFO — has no natural
              * end.  Sizing from the file used to return "" for one
              * instantly; growing without a bound instead walks the process
-             * into OOM, which is a worse answer than either.  Bound it by
-             * the heap's own anon watermark (the existing spill threshold,
-             * which resolves to physical RAM) rather than by a new
-             * constant, and say so rather than dying. */
-            int64_t budget = ray_heap_anon_watermark();
-            if (ncap <= 0 || (budget > 0 && ncap > budget)) {
+             * into OOM or into the spill file.  Check before doubling, so
+             * the multiply itself cannot overflow. */
+            if (cap > INT64_MAX / 2 || (budget > 0 && cap * 2 > budget)) {
                 ray_release(result); fclose(fp);
                 return ray_error("io", "%s \"%s\": input exceeds the readable budget of %lld bytes",
                                  op, path, (long long)budget);
             }
+            int64_t ncap = cap * 2;
             ray_t* grown = ray_vec_new(RAY_U8, ncap);
             if (!grown || RAY_IS_ERR(grown)) {
                 ray_release(result); fclose(fp);

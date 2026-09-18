@@ -9035,6 +9035,48 @@ static test_result_t test_read_procfs_reports_zero_size(void) {
 #endif
 }
 
+/* An unsized stream has no natural end, so the read-to-EOF loop is bounded
+ * by a quarter of the heap's remaining anon headroom (#572 follow-up).  The
+ * watermark is a spill threshold rather than a ceiling — crossing it picks
+ * disk over RAM instead of failing — so an unbounded loop would fill the
+ * spill file rather than merely exhausting RAM.
+ *
+ * Drives the bound by moving the watermark to just above what is already
+ * committed, which makes the budget small and the error immediate. */
+static test_result_t test_read_unsized_stream_is_bounded(void) {
+#if defined(RAY_OS_WINDOWS)
+    SKIP("no /dev/zero");
+#else
+    FILE* probe = fopen("/dev/zero", "rb");
+    if (!probe) SKIP("/dev/zero unavailable");
+    fclose(probe);
+
+    int64_t saved = ray_heap_anon_watermark();
+    /* budget = (watermark - committed) / 4, so this leaves ~1 MB. */
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
+
+    ray_t* arg = ray_str("/dev/zero", 9);
+    ray_t* got = ray_read_file_fn(arg);
+    ray_release(arg);
+
+    ray_heap_set_anon_watermark(saved);
+
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT(RAY_IS_ERR(got), "an endless stream must error, not grow without end");
+    TEST_ASSERT_STR_EQ(ray_err_code(got), "io");
+    ray_error_free(got);
+
+    /* The bound must not have disturbed ordinary reads once restored. */
+    ray_t* p2 = ray_str("/dev/null", 9);
+    ray_t* empty = ray_read_file_fn(p2);
+    ray_release(p2);
+    TEST_ASSERT(!RAY_IS_ERR(empty), "/dev/null must still read as empty");
+    TEST_ASSERT_EQ_I(ray_str_len(empty), 0);
+    ray_release(empty);
+    PASS();
+#endif
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
@@ -9452,6 +9494,7 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
 
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
+    { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
 
     { NULL, NULL, NULL, NULL },
 };
