@@ -8136,7 +8136,20 @@ static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
     }
     /* SYM cell: resolve through the COLUMN's domain (sym-domain Phase 2)
      * — sym_elem resolves via the global table, wrong for FILE-domain
-     * columns. */
+     * columns.  A FILE domain's entries carry their length as a u32
+     * prefix in the mapping: read it off the published snapshot (one
+     * acquire load) instead of materialising an atom per symbol under
+     * the domain lock; positions past the mapped prefix and other domains
+     * resolve as before. */
+    {
+        int64_t sid = ray_read_sym(ray_data((ray_t*)col), row, col->type, col->attrs);
+        ray_sym_domain_raw_t raw;
+        if (ray_sym_domain_raw_pin(ray_sym_vec_domain((ray_t*)col), &raw) && sid >= 0 && sid < raw.count) {
+            size_t sl;
+            (void)ray_sym_domain_raw_str(&raw, sid, &sl);
+            return (int64_t)sl;
+        }
+    }
     ray_t* s = ray_sym_vec_cell((ray_t*)col, row);
     return s ? (int64_t)ray_str_len(s) : 0;
 }
@@ -11697,24 +11710,6 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
             try_strlen_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a])) {
-            /* A SYM column on a FILE domain: the per-row string resolve
-             * would materialise an atom per distinct symbol under the
-             * domain lock.  Read the lengths off the mapping once
-             * (parallel, no atoms) and aggregate the plain I64 vector.  A
-             * null cell (the empty symbol) is a null length, which the
-             * accumulate skips exactly as the per-row path skips the row. */
-            ray_t* sc = agg_vecs[a];
-            if (sc->type == RAY_SYM && ray_sym_vec_domain(sc) != ray_sym_runtime_domain()) {
-                ray_t* lens = ray_vec_new(RAY_I64, sc->len);
-                if (lens && !RAY_IS_ERR(lens)) {
-                    lens->len = sc->len;
-                    ray_sym_strlen_into(sc, lens, false);
-                    agg_vecs[a] = lens;
-                    agg_owned[a] = 1;
-                    continue;
-                }
-                if (lens) ray_error_free(lens);
-            }
             agg_strlen[a] = 1;
             continue;
         }
