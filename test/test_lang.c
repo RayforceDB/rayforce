@@ -9051,7 +9051,12 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     if (!probe) SKIP("/dev/zero unavailable");
     fclose(probe);
 
+    /* ray_heap_anon_watermark() resolves the 0 sentinel to physical RAM, so
+     * restoring what it returns would pin the watermark to a number where
+     * the suite found "use physical RAM".  Detect that case and put the
+     * sentinel back instead, which keeps this test order-independent. */
     int64_t saved = ray_heap_anon_watermark();
+    bool was_default = (saved == ray_sys_total_ram());
     /* budget = (watermark - committed) / 4, so this leaves ~1 MB. */
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
 
@@ -9059,12 +9064,35 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     ray_t* got = ray_read_file_fn(arg);
     ray_release(arg);
 
-    ray_heap_set_anon_watermark(saved);
+    ray_heap_set_anon_watermark(was_default ? 0 : saved);
 
     TEST_ASSERT_NOT_NULL(got);
     TEST_ASSERT(RAY_IS_ERR(got), "an endless stream must error, not grow without end");
     TEST_ASSERT_STR_EQ(ray_err_code(got), "io");
     ray_error_free(got);
+
+    /* A *sized* file larger than the same budget must still read: the
+     * ceiling exists to terminate an endless stream, and a reported size is
+     * a finite claim the filesystem backs.  Bounding this path would turn a
+     * large-file read that previously allocated and spilled into a hard
+     * error, and would make success depend on live process state. */
+    const char* big = "/tmp/rf_read_big_sized.bin";
+    FILE* bf = fopen(big, "wb");
+    TEST_ASSERT_NOT_NULL(bf);
+    static char chunk[65536];
+    for (int i = 0; i < 32; i++)   /* 2 MB, well over the ~1 MB budget */
+        TEST_ASSERT(fwrite(chunk, 1, sizeof(chunk), bf) == sizeof(chunk), "write big file");
+    fclose(bf);
+
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
+    ray_t* bp = ray_str(big, strlen(big));
+    ray_t* bread = ray_read_file_fn(bp);
+    ray_release(bp);
+    ray_heap_set_anon_watermark(was_default ? 0 : saved);
+    remove(big);
+    TEST_ASSERT(!RAY_IS_ERR(bread), "a sized file must not be refused by the unsized budget");
+    TEST_ASSERT_EQ_I(ray_str_len(bread), 2 * 1024 * 1024);
+    ray_release(bread);
 
     /* The bound must not have disturbed ordinary reads once restored. */
     ray_t* p2 = ray_str("/dev/null", 9);

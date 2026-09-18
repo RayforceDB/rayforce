@@ -2037,7 +2037,8 @@ ray_t* ray_type_fn(ray_t* val) {
     return ray_sym(id);
 }
 
-/* Ceiling for one `read` / `read-bytes` result.
+/* Ceiling for the growth of an *unsized* read — a stream with no size to
+ * go on.  The hinted path is deliberately not subject to it.
  *
  * The heap's anon watermark is NOT a ceiling: crossing it routes the
  * mapping to a spill file rather than failing ("this never rejects work,
@@ -2101,7 +2102,7 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
          * reports LONG_MAX.  (Directories are already rejected by the
          * S_ISDIR check above; this guard is for anything else that
          * reports a size it cannot back.) */
-        if (hint < 0 || hint > (long)(INT64_MAX / 2) || fseek(fp, 0, SEEK_SET) != 0)
+        if (hint < 0 || (int64_t)hint > INT64_MAX / 2 || fseek(fp, 0, SEEK_SET) != 0)
             hint = 0;
     }
     /* Unseekable (pipe, character device) or size-0-but-readable: start at
@@ -2110,12 +2111,12 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
      * the hint", so a file that grew is read whole instead of truncated. */
     int64_t cap = hint > 0 ? (int64_t)hint + 1 : 4096;
 
-    /* Same ceiling on both paths: a file claiming more than the budget is
-     * refused here rather than left to fail inside the allocator. */
+    /* No ceiling on the hinted path.  A reported size is a finite claim the
+     * filesystem backs, and a large file allocating through the heap and
+     * spilling to disk is the behaviour that was already correct — the
+     * budget below exists to terminate an *endless* stream, which is not a
+     * situation a hint can describe. */
     const int64_t budget = read_size_budget();
-    if (budget > 0 && cap > budget)
-        return ray_error("io", "%s \"%s\": %lld bytes exceeds the readable budget of %lld bytes",
-                         op, path, (long long)cap, (long long)budget);
 
     ray_t* result = ray_vec_new(RAY_U8, cap);
     if (!result || RAY_IS_ERR(result)) {
@@ -2131,9 +2132,17 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
              * instantly; growing without a bound instead walks the process
              * into OOM or into the spill file.  Check before doubling, so
              * the multiply itself cannot overflow. */
-            if (cap > INT64_MAX / 2 || (budget > 0 && cap * 2 > budget)) {
+            /* Peak during the grow is the old buffer plus the new one — 3*cap,
+             * since the old stays alive across the memcpy — so bound the
+             * peak rather than the result.  Checked before the multiply, so
+             * the multiply itself cannot overflow. */
+            if (cap > INT64_MAX / 3) {
                 ray_release(result); fclose(fp);
-                return ray_error("io", "%s \"%s\": input exceeds the readable budget of %lld bytes",
+                return ray_error("io", "%s \"%s\": input too large to read", op, path);
+            }
+            if (budget > 0 && cap * 3 > budget) {
+                ray_release(result); fclose(fp);
+                return ray_error("io", "%s \"%s\": unsized input exceeds the readable budget of %lld bytes",
                                  op, path, (long long)budget);
             }
             int64_t ncap = cap * 2;

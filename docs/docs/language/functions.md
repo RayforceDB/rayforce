@@ -459,6 +459,13 @@ change between the measure and the read.
 `.fs.size` still reports what the OS reports — the two disagreeing on a
 special file is expected, not a bug.
 
+A stream with no size to go on — `/dev/zero`, or a FIFO nobody closes — has no
+EOF to reach. Reading one grows a buffer until it crosses a ceiling derived
+from the heap's remaining headroom, then fails with `io` rather than consuming
+the machine. Reads of a file whose size *is* known are not subject to that
+ceiling: a reported size is a finite claim, and a large file allocates and
+spills exactly as it did before.
+
 ## Control Flow
 
 | Function | Type | Description | Example |
