@@ -5,8 +5,9 @@ The feature is ready for PR review into `dev`; required CI checks gate merging.
 This extends the type-coverage plan.
 
 Acceptance compares immutable release binaries with identical generated inputs.
-The rebased ASan/UBSan suite passes 3,828/3,828 tests. Current measurements
-and reproducible commands are in [the results report](grouping-engine-scaling-results.md).
+The rebased ASan/UBSan suite passes 3,828/3,828 tests. Measurements and the
+commands that reproduce them are kept with the benchmark harness in
+`bench/groupby_shapes/`, not in the published docs.
 
 ## Objective
 
@@ -33,7 +34,7 @@ additional data structures. Each family needs its own baseline and scaling proof
 | Count-distinct | Pair-hash partitioning and parallel stable output ordering | Native/wide value and ordering oracles; repeated worker sweep |
 | Mixed streaming/indexed aggregates and expressions | Shared groups and stable row slices | Independent mixed contracts and repeated worker sweep |
 
-The [results report](grouping-engine-scaling-results.md) links the complete
+The benchmark harness in `bench/groupby_shapes/` holds the complete
 900-configuration summary, all 2,700 process records, phase investigations and
 regression repeats. Baseline failures receive no speedup claim. Measured cold
 setup and bounded-memory tradeoffs remain explicit.
