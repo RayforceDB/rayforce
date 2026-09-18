@@ -2052,7 +2052,7 @@ ray_t* ray_type_fn(ray_t* val) {
  * knob is introduced.
  *
  * Returns 0 for "no bound known", which callers treat as permissive. */
-static int64_t read_size_budget(void) {
+int64_t ray_unsized_read_budget(void) {
     int64_t wm = ray_heap_anon_watermark();
     if (wm <= 0) return 0;                       /* RAM unknown → permissive */
     int64_t avail = wm - ray_heap_anon_committed();
@@ -2116,7 +2116,7 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
      * spilling to disk is the behaviour that was already correct — the
      * budget below exists to terminate an *endless* stream, which is not a
      * situation a hint can describe. */
-    const int64_t budget = read_size_budget();
+    const int64_t budget = ray_unsized_read_budget();
 
     ray_t* result = ray_vec_new(RAY_U8, cap);
     if (!result || RAY_IS_ERR(result)) {

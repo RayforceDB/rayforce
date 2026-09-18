@@ -887,12 +887,22 @@ static ray_t* exec_capture(const char* cmd, int64_t* code_out) {
     FILE* fp = RAY_POPEN(cmd, "r");
     if (!fp) return ray_error("io", ".sys.exec: failed to start command: %s", strerror(errno));
 
+    /* A command that never stops writing has no end to capture, exactly as an
+     * endless file has no EOF to read (#572).  Same ceiling, same reason. */
+    const int64_t budget = ray_unsized_read_budget();
+
     size_t cap = 4096, len = 0;
     char*  buf = (char*)ray_alloc_raw(cap);
     if (!buf) { RAY_PCLOSE(fp); return ray_error("oom", ".sys.exec: capture buffer"); }
 
     for (;;) {
         if (len == cap) {
+            /* Peak during the grow is the old buffer plus the new one. */
+            if (budget > 0 && (int64_t)cap * 3 > budget) {
+                ray_free_raw(buf); RAY_PCLOSE(fp);
+                return ray_error("io", ".sys.exec: output exceeds the readable budget of %lld bytes",
+                                 (long long)budget);
+            }
             char* nbuf = (char*)ray_realloc_raw(buf, cap * 2);
             if (!nbuf) { ray_free_raw(buf); RAY_PCLOSE(fp); return ray_error("oom", ".sys.exec: capture buffer"); }
             buf = nbuf; cap *= 2;
@@ -918,6 +928,11 @@ static ray_t* exec_capture(const char* cmd, int64_t* code_out) {
 
 /* (.sys.exec cmd)      -> exit code
  * (.sys.exec cmd 'out) -> {code: <exit code> out: <stdout>}
+ *
+ * The capture reads to EOF on the child's stdout, and a backgrounded
+ * grandchild inherits that pipe — so 'out waits for it too, not just for the
+ * shell (#579).  Inherent to popen(3); the one-argument form does not have
+ * it, and is the way to launch something that outlives the call.
  *
  * stderr is deliberately left on the process's own stderr: a shelled-out
  * command's diagnostics belong in the log, and merging them into the
