@@ -426,7 +426,24 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
-| `guid` | unary | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
+| `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
+
+`guid` and `rand` draw from **different** sources on purpose:
+
+- `guid` is seeded from the OS at first use, per thread, so values are unique
+  across processes and machines. That is the property the type exists to
+  provide, so it is not something to trade for reproducibility.
+- `rand` is deterministic — the same process-wide sequence every run. That is
+  what makes tests and simulations reproducible, and changing `guid`'s seeding
+  deliberately left it alone.
+
+```lisp
+(first (guid 1))   ;; a different value in every process
+(rand 3 1000)      ;; [383 886 777] in every process
+```
+
+If you need a reproducible stream, use `rand`. If you need identifiers that do
+not collide between two processes writing into the same table, use `guid`.
 
 ## I/O & File Operations
 
