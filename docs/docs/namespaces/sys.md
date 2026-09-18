@@ -11,14 +11,14 @@ Process-level introspection (build, memory, host info) and command-style operati
 |---|---|---|---|
 | [`.sys.args`](#sys-args) | variadic | — | Command-line arguments as a typed dict. |
 | [`.sys.build`](#sys-build) | variadic | — | Version + build date as a dict. |
-| [`.sys.info`](#sys-info) | variadic | — | Host facts: cores, page size, total memory. |
+| [`.sys.info`](#sys-info) | variadic | — | Host and process facts: cores, page size, total memory, pid, hostname. |
 | [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
 | [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
 | [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
 | [`.sys.env`](#sys-env) | variadic | — | Count or list of globally bound names. |
-| [`.sys.exec`](#sys-exec) | unary | restricted | Run a shell command; return its exit code. |
+| [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
 | [`.sys.listen`](#sys-listen) | unary | restricted | Bind an IPC listener on a TCP port. |
 | [`.sys.timeit`](#sys-timeit) | variadic | — | Toggle / set the per-expression profiler. |
@@ -75,12 +75,32 @@ Signature: `(.sys.build)`. Returns a dict with `version` (string) and `build-dat
 
 ## `.sys.info` { #sys-info }
 
-Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64}` on POSIX. On Windows the response is `{cores: 1}` (a fallback — the sysconf-backed values aren't wired).
+Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64, pid: i64, hostname: str}` on POSIX. On Windows the machine facts fall back to `{cores: 1}` (the sysconf-backed values aren't wired), but `pid` and `hostname` are answered on both platforms.
 
 ```lisp
 (.sys.info)
-;; => {cores: 10, page-size: 16384, total-mem: 68719476736}
+;; => {cores: 10, page-size: 16384, total-mem: 68719476736,
+;;     pid: 48213, hostname: "tp-prod-01"}
 ```
+
+`pid` and `hostname` describe *this process*, not the machine, and exist so an
+embedded process can name itself. The common use is a per-start epoch that a
+peer can check a stale cursor against:
+
+```lisp
+(format "%-%-%" (get (.sys.info) 'hostname)
+                (get (.sys.info) 'pid)
+                (timestamp 'global))
+;; => "tp-prod-01-48213-2026.09.18D10:05:59.000000000"
+```
+
+That identity is worth preferring over a random token because it is
+diagnosable: reading it back tells you which host and which process produced
+it. Note `(timestamp 'global)` is second-resolution, so pid is what separates
+two starts within the same second.
+
+If `hostname` cannot be obtained, it reports `""` rather than failing the whole
+call — one unavailable field should not cost the caller the others.
 
 ## `.sys.mem` { #sys-mem }
 
@@ -233,14 +253,36 @@ Signature: `(.sys.env)`. From a script / IPC context returns the **count** of gl
 
 ## `.sys.exec` { #sys-exec }
 
-Signature: `(.sys.exec "command")`. Runs `command` through `system(3)` and returns its exit status as an `i64`. Used pervasively in tests to set up / tear down `/tmp` fixtures.
+Signature: `(.sys.exec "command")` or `(.sys.exec "command" 'out)`.
 
-Errors: `type` (arg not a string), `domain` (null pointer).
+Runs `command` through the shell. The one-argument form returns the **exit
+code** as an `i64` — the code the shell itself would report, not the
+`waitpid`-encoded status. A command killed by a signal reports `128 + signum`,
+following the same shell convention.
+
+The `'out` form returns `{code: i64, out: str}`, capturing the command's
+standard output. Output is read until EOF and is not sized from `stat`, so
+pipes and procfs reads come back whole. **stderr is not captured** — it stays
+on the process's own stderr, so a command's diagnostics land in the log rather
+than corrupting a value you are about to parse.
+
+Errors: `type` (command not a string, or mode not a symbol), `domain` (null
+pointer, or a mode other than `'out`), `io` (the command could not be started
+or did not complete), `oom`.
 
 ```lisp
-(.sys.exec "rm -rf /tmp/scratch")   ;; => 0
-(.sys.exec "false")                  ;; => 256  (waitpid-encoded)
+(.sys.exec "rm -rf /tmp/scratch")        ;; => 0
+(.sys.exec "false")                      ;; => 1
+(.sys.exec "exit 3")                     ;; => 3
+(.sys.exec "echo hi" 'out)               ;; => {code: 0, out: "hi\n"}
+(.sys.exec "echo partial; exit 4" 'out)  ;; => {code: 4, out: "partial\n"}
 ```
+
+!!! warning "Behaviour change"
+    Before this, the one-argument form returned the raw `waitpid`-encoded
+    status, so `(.sys.exec "false")` was `256` and `(.sys.exec "exit 3")` was
+    `768`. Success was `0` either way, so code that only checks for zero is
+    unaffected; code comparing against an encoded value needs updating.
 
 ## `.sys.cmd` { #sys-cmd }
 

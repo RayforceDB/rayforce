@@ -3372,7 +3372,7 @@ static void ray_register_builtins(void) {
      * user code can't shadow them and a glance at the name identifies
      * the category. */
     register_vary (".sys.gc",   RAY_FN_NONE,        ray_gc_fn);
-    register_unary(".sys.exec", RAY_FN_RESTRICTED,  ray_system_fn);
+    register_vary (".sys.exec", RAY_FN_RESTRICTED,  ray_system_fn);
     register_unary(".mem.objsize", RAY_FN_NONE,      ray_mem_objsize_fn);
     register_vary (".mem.ts",      RAY_FN_SPECIAL_FORM, ray_mem_ts_fn);
     /* Registry-dispatched system commands.  `.sys.cmd "name args"` is
