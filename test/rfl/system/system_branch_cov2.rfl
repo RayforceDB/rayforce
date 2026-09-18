@@ -113,10 +113,10 @@
 ;; ray_sysinfo_fn (.sys.info)  (lines 730-762)
 ;; ══════════════════════════════════════════════════════════════════════
 (type (.sys.info)) -- 'DICT
-(count (.sys.info)) -- 3
+(count (.sys.info)) -- 5
 (> (at (.sys.info) 'cores) 0) -- true
 (> (at (.sys.info) 'total-mem) 0) -- true
-(count (value (.sys.info))) -- 3
+(count (value (.sys.info))) -- 5
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_hopen_fn  (lines 769-825)

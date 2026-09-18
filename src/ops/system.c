@@ -21,6 +21,10 @@
  *   SOFTWARE.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE   /* popen()/pclose() and gethostname() — .sys.exec, .sys.info */
+#endif
+
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "lang/eval.h"  /* LAMBDA_PARAMS */
@@ -55,6 +59,12 @@ void* ray_runtime_get_sys_args(void);
 #include <string.h>
 #if !defined(RAY_OS_WINDOWS)
 #include <unistd.h>
+#include <sys/wait.h>   /* WIFEXITED/WEXITSTATUS — .sys.exec exit codes */
+#define RAY_POPEN(c, m)  popen((c), (m))
+#define RAY_PCLOSE(f)    pclose(f)
+#else
+#define RAY_POPEN(c, m)  _popen((c), (m))
+#define RAY_PCLOSE(f)    _pclose(f)
 #endif
 
 /* ══════════════════════════════════════════
@@ -798,18 +808,146 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
 }
 
 /* (system cmd) -- run shell command, return exit code */
-ray_t* ray_system_fn(ray_t* x) {
+/* Both helpers exist only for the live .sys.exec path, which RAY_FUZZING
+ * compiles out — guard them so the fuzz build does not trip
+ * -Werror,-Wunused-function. */
+#ifndef RAY_FUZZING
+/* Turn a wait(2)-style status into the exit code a shell would report.
+ * system() and pclose() hand back an encoded status, not a code: "exit 3"
+ * arrives as 768 (3 << 8).  Signals follow the shell's 128+N convention, so
+ * a command killed by SIGTERM reads as 143 rather than as a bare 15 that
+ * could be confused with a real exit status. */
+static int64_t exec_exit_code(int status) {
+#if defined(RAY_OS_WINDOWS)
+    /* The CRT's system()/_pclose() already return the child's exit code. */
+    return (int64_t)status;
+#else
+    if (WIFEXITED(status))   return (int64_t)WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return (int64_t)(128 + WTERMSIG(status));
+    return (int64_t)status;
+#endif
+}
+
+/* Read everything the child writes to stdout.  Grows geometrically rather
+ * than sizing from any stat(), so output from a pipe — which has no size to
+ * ask for — comes back whole (cf. #572). */
+static ray_t* exec_capture(const char* cmd, int64_t* code_out) {
+    FILE* fp = RAY_POPEN(cmd, "r");
+    if (!fp) return ray_error("io", ".sys.exec: failed to start command: %s", strerror(errno));
+
+    size_t cap = 4096, len = 0;
+    char*  buf = (char*)ray_alloc_raw(cap);
+    if (!buf) { RAY_PCLOSE(fp); return ray_error("oom", ".sys.exec: capture buffer"); }
+
+    for (;;) {
+        if (len == cap) {
+            char* nbuf = (char*)ray_realloc_raw(buf, cap * 2);
+            if (!nbuf) { ray_free_raw(buf); RAY_PCLOSE(fp); return ray_error("oom", ".sys.exec: capture buffer"); }
+            buf = nbuf; cap *= 2;
+        }
+        size_t got = fread(buf + len, 1, cap - len, fp);
+        len += got;
+        if (got == 0) {
+            if (ferror(fp)) { ray_free_raw(buf); RAY_PCLOSE(fp); return ray_error("io", ".sys.exec: read failed"); }
+            break;  /* EOF */
+        }
+    }
+
+    int status = RAY_PCLOSE(fp);
+    if (status == -1) { ray_free_raw(buf); return ray_error("io", ".sys.exec: command did not complete: %s", strerror(errno)); }
+    *code_out = exec_exit_code(status);
+
+    ray_t* out = ray_str(buf, len);
+    ray_free_raw(buf);
+    return out;
+}
+
+#endif /* !RAY_FUZZING */
+
+/* (.sys.exec cmd)      -> exit code
+ * (.sys.exec cmd 'out) -> {code: <exit code> out: <stdout>}
+ *
+ * stderr is deliberately left on the process's own stderr: a shelled-out
+ * command's diagnostics belong in the log, and merging them into the
+ * captured value would corrupt anything parsing that value (#573). */
+ray_t* ray_system_fn(ray_t** args, int64_t n) {
 #ifdef RAY_FUZZING
     /* Shell escape — disabled under fuzzing so untrusted input can't run
      * arbitrary commands in the fuzzer process. */
-    (void)x;
+    (void)args; (void)n;
     return ray_error("restricted", "shell disabled under fuzzing");
 #else
+    if (n != 1 && n != 2) return ray_error("domain", ".sys.exec expects 1 or 2 arguments");
+    ray_t* x = args[0];
     if (x->type != -RAY_STR) return ray_error("type", "system expects a string");
-    const char* cmd = ray_str_ptr(x);
-    if (!cmd) return ray_error("domain", ".sys.exec: empty or invalid command string");
-    int rc = system(cmd);
-    return make_i64(rc);
+
+    bool capture = false;
+    if (n == 2) {
+        ray_t* mode = args[1];
+        if (mode->type != -RAY_SYM)
+            return ray_error("type", ".sys.exec: second argument must be the symbol 'out");
+        if (mode->i64 != ray_sym_intern("out", 3))
+            return ray_error("domain", ".sys.exec: unknown mode, expected 'out");
+        capture = true;
+    }
+
+    /* libc needs a NUL-terminated command; ray strings are not NUL-terminated
+     * once pooled (len > RAY_STR_INLINE_MAX). */
+    char  stackbuf[1024];
+    char* heapbuf = NULL;
+    int64_t clen  = ray_str_len(x);
+    const char* raw = ray_str_ptr(x);
+    if (!raw) return ray_error("domain", ".sys.exec: empty or invalid command string");
+    char* cmd;
+    if (clen < (int64_t)sizeof(stackbuf)) {
+        cmd = stackbuf;
+    } else {
+        heapbuf = (char*)ray_alloc_raw((size_t)clen + 1);
+        if (!heapbuf) return ray_error("oom", ".sys.exec: command buffer");
+        cmd = heapbuf;
+    }
+    memcpy(cmd, raw, (size_t)clen);
+    cmd[clen] = '\0';
+
+    ray_t* result;
+    if (!capture) {
+        int rc = system(cmd);
+        /* -1 means the shell could not be started at all.  Decoding it would
+         * yield 128+127 = 255 — indistinguishable from a command that really
+         * exited 255 — so report it the way the capture path reports its
+         * equivalent pclose failure. */
+        if (rc == -1) {
+            if (heapbuf) ray_free_raw(heapbuf);
+            return ray_error("io", ".sys.exec: failed to run command: %s", strerror(errno));
+        }
+        result = make_i64(exec_exit_code(rc));
+    } else {
+        int64_t code = 0;
+        ray_t* out = exec_capture(cmd, &code);
+        if (RAY_IS_ERR(out)) {
+            result = out;
+        } else {
+            ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
+            ray_t* vals = RAY_IS_ERR(keys) ? keys : ray_list_new(2);
+            if (RAY_IS_ERR(keys) || RAY_IS_ERR(vals)) {
+                if (!RAY_IS_ERR(keys)) ray_release(keys);
+                ray_release(out);
+                if (heapbuf) ray_free_raw(heapbuf);
+                return RAY_IS_ERR(keys) ? keys : vals;
+            }
+            int64_t k1 = ray_sym_intern("code", 4);
+            keys = ray_vec_append(keys, &k1);
+            ray_t* v1 = make_i64(code);
+            vals = ray_list_append(vals, v1); ray_release(v1);
+            int64_t k2 = ray_sym_intern("out", 3);
+            keys = ray_vec_append(keys, &k2);
+            vals = ray_list_append(vals, out); ray_release(out);
+            result = ray_dict_new(keys, vals);
+        }
+    }
+
+    if (heapbuf) ray_free_raw(heapbuf);
+    return result;
 #endif
 }
 
@@ -1256,11 +1394,38 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     return make_i64(on ? 1 : 0);
 }
 
+/* Process id of this process.  getpid() is already used internally for heap
+ * swap-file names; this is the same value, made reachable from Rayfall. */
+static int64_t ray_os_pid(void) {
+#if defined(RAY_OS_WINDOWS)
+    return (int64_t)GetCurrentProcessId();
+#else
+    return (int64_t)getpid();
+#endif
+}
+
+/* Host name into `buf`, NUL-terminated.  False when the platform cannot
+ * answer, in which case .sys.info reports "" rather than failing the whole
+ * call — one unavailable field should not cost the caller the others. */
+static bool ray_os_hostname(char* buf, size_t cap) {
+    if (cap == 0) return false;
+    buf[0] = '\0';
+#if defined(RAY_OS_WINDOWS)
+    DWORD n = (DWORD)cap;
+    if (!GetComputerNameA(buf, &n)) return false;
+#else
+    if (gethostname(buf, cap) != 0) return false;
+    /* POSIX leaves truncation unterminated. */
+    buf[cap - 1] = '\0';
+#endif
+    return buf[0] != '\0';
+}
+
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 3);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(3);
+    ray_t* vals = ray_list_new(5);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
 #if !defined(RAY_OS_WINDOWS)
@@ -1284,6 +1449,22 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     ray_t* v1 = make_i64(1);
     vals = ray_list_append(vals, v1); ray_release(v1);
 #endif
+
+    /* Process and host identity (#573).  An embedded process previously had
+     * no way to name itself: pid plus hostname plus a start timestamp is a
+     * diagnosable epoch, where a random token only tells you that two runs
+     * differ, not which machine or process either one was. */
+    int64_t sp = ray_sym_intern("pid", 3);
+    keys = ray_vec_append(keys, &sp);
+    ray_t* vp = make_i64(ray_os_pid());
+    vals = ray_list_append(vals, vp); ray_release(vp);
+
+    char host[256];
+    int64_t sh = ray_sym_intern("hostname", 8);
+    keys = ray_vec_append(keys, &sh);
+    ray_t* vh = ray_os_hostname(host, sizeof(host)) ? ray_str(host, strlen(host))
+                                                    : ray_str("", 0);
+    vals = ray_list_append(vals, vh); ray_release(vh);
 
     return ray_dict_new(keys, vals);
 }

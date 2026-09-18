@@ -644,7 +644,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.gc` | variadic | — | Trigger GC / heap flush, returns `0` | `(.sys.gc)` |
 | `.mem.objsize` | unary | — | Logical bytes retained by an object graph; shared children count once | `(.mem.objsize value)` |
 | `.mem.ts` | special form | — | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict | `(.mem.ts (select {from: trades}))` |
-| `.sys.exec` | unary | restricted | Execute a shell command, return exit code | `(.sys.exec "ls -la")` |
+| `.sys.exec` | variadic | restricted | Execute a shell command; exit code, or `{code, out}` with `'out` | `(.sys.exec "ls -la" 'out)` |
 | `.os.getenv` | unary | restricted | Get environment variable value | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |
 | `.sys.args` | nullary | — | Application arguments as a typed dict; `user` subdict holds post-`--` args | `(.sys.args)` |
@@ -657,7 +657,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.prof` | variadic | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
 | `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`) | `(.sys.querylog)` |
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
-| `.sys.info` | variadic | — | System information (cores, page size, total memory) | `(.sys.info)` |
+| `.sys.info` | variadic | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
 
 ```lisp
 ; Metaprogramming: parse and eval
