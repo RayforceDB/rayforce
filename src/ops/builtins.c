@@ -61,6 +61,7 @@ static inline double clear_neg_zero(double v) {
 #include <time.h>
 #if !defined(RAY_OS_WINDOWS)
 #include <sys/mman.h>
+#include "mem/heap.h"   /* ray_heap_anon_watermark — bound for an unsized read */
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -2069,10 +2070,11 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     long hint = 0;
     if (fseek(fp, 0, SEEK_END) == 0) {
         hint = ftell(fp);
-        /* A directory seeks fine and reports LONG_MAX here, so an
-         * implausible hint is treated as no hint rather than trusted into
-         * an overflow.  The read itself is what rejects a directory: fread
-         * sets the error flag (EISDIR) and we return io. */
+        /* An implausible hint is treated as no hint rather than trusted
+         * into an overflow — a directory, for instance, seeks fine and
+         * reports LONG_MAX.  (Directories are already rejected by the
+         * S_ISDIR check above; this guard is for anything else that
+         * reports a size it cannot back.) */
         if (hint < 0 || hint > (long)(INT64_MAX / 2) || fseek(fp, 0, SEEK_SET) != 0)
             hint = 0;
     }
@@ -2092,6 +2094,19 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     for (;;) {
         if (len == cap) {
             int64_t ncap = cap * 2;
+            /* An unsized stream — /dev/zero, a live FIFO — has no natural
+             * end.  Sizing from the file used to return "" for one
+             * instantly; growing without a bound instead walks the process
+             * into OOM, which is a worse answer than either.  Bound it by
+             * the heap's own anon watermark (the existing spill threshold,
+             * which resolves to physical RAM) rather than by a new
+             * constant, and say so rather than dying. */
+            int64_t budget = ray_heap_anon_watermark();
+            if (ncap <= 0 || (budget > 0 && ncap > budget)) {
+                ray_release(result); fclose(fp);
+                return ray_error("io", "%s \"%s\": input exceeds the readable budget of %lld bytes",
+                                 op, path, (long long)budget);
+            }
             ray_t* grown = ray_vec_new(RAY_U8, ncap);
             if (!grown || RAY_IS_ERR(grown)) {
                 ray_release(result); fclose(fp);
