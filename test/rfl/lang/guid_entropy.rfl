@@ -1,0 +1,40 @@
+;; `guid` must be unique across processes — issue #571.
+;;
+;; The generator seeded its per-thread xorshift state from rand(), and
+;; nothing in the tree ever called srand(), so rand() ran from libc's
+;; default seed of 1. Every process therefore produced the same GUID
+;; sequence: the reporter's first value on their machine and build was
+;; byte-identical to ours, which is what a total absence of entropy looks
+;; like rather than a per-machine seed.
+;;
+;; Uniqueness is the one property the type exists to provide, and the
+;; failure is silent — the values are well-formed and carry the correct
+;; version-4 nibble.
+
+;; ────────────── within one process ──────────────
+;; Already held before the fix, asserted so a future seeding change cannot
+;; regress it into a constant.
+(== (first (guid 1)) (first (guid 1))) -- false
+(count (distinct (guid 1000)))         -- 1000
+
+;; Shape is unchanged — still a guid atom, not some other type.
+(type (first (guid 1))) -- 'guid
+
+;; ────────────── across processes ──────────────
+;; The actual regression. Two fresh processes must not agree on their
+;; first GUID. Run through .sys.exec's capture form so the comparison is
+;; on the values themselves, not on an exit code.
+(.sys.exec "rm -rf /tmp/rf_guid && mkdir -p /tmp/rf_guid")
+(.sys.exec "printf '(println (first (guid 1)))\\n' > /tmp/rf_guid/g.rfl")
+(.sys.exec "./rayforce -c 1 /tmp/rf_guid/g.rfl > /tmp/rf_guid/a.txt 2>/dev/null")
+(.sys.exec "./rayforce -c 1 /tmp/rf_guid/g.rfl > /tmp/rf_guid/b.txt 2>/dev/null")
+
+;; Both runs produced a GUID at all (36 chars + newline), so a comparison
+;; of two empty strings cannot masquerade as a pass.
+(count (first (split (read "/tmp/rf_guid/a.txt") "\n"))) -- 36
+(count (first (split (read "/tmp/rf_guid/b.txt") "\n"))) -- 36
+
+;; And they differ.
+(== (read "/tmp/rf_guid/a.txt") (read "/tmp/rf_guid/b.txt")) -- false
+
+(.sys.exec "rm -rf /tmp/rf_guid")

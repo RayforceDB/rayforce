@@ -382,26 +382,78 @@ ray_t* ray_fs_list_fn(ray_t* x) {
     return result;
 }
 
+static int64_t ray_os_pid(void);   /* defined with the .sys.info helpers */
+
+/* Eight bytes of OS entropy.  False when no source answered, which the
+ * caller treats as "fold in less", never as "seed with a constant". */
+static bool guid_os_entropy(uint64_t* out) {
+#if defined(RAY_OS_WINDOWS)
+    (void)out;
+    return false;   /* covered by the process/time material below */
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (!f) return false;
+    size_t got = fread(out, 1, sizeof(*out), f);
+    fclose(f);
+    return got == sizeof(*out);
+#endif
+}
+
+/* Seed for one thread's GUID stream.
+ *
+ * This used to come from rand(), on the stated assumption that "rand() is
+ * itself seeded by the runtime".  Nothing in the tree has ever called
+ * srand(), so rand() ran from libc's default seed of 1 and every process
+ * produced the same GUID sequence — the reporter's first value on their
+ * machine and build was byte-identical to ours (#571).  Uniqueness is the
+ * one property the type exists to provide, and the failure was silent:
+ * the values are well-formed and carry the correct version-4 nibble.
+ *
+ * Seeded from the OS independently of rand(), so rand()'s determinism —
+ * which is defensible, and which reproducible tests rely on — is left
+ * exactly as it was.  Process id, a high-resolution clock and a stack
+ * address are always folded in, so even a platform or a chroot where the
+ * entropy source cannot be reached still cannot hand two processes, or
+ * two threads, the same stream. */
+static uint64_t guid_seed(void) {
+    uint64_t s = 0;
+    if (!guid_os_entropy(&s)) s = 0;
+
+    s ^= (uint64_t)ray_os_pid() * 0x9E3779B97F4A7C15ULL;
+    s ^= (uint64_t)(uintptr_t)&s;
+#if defined(RAY_OS_WINDOWS)
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    s ^= (uint64_t)cnt.QuadPart * 0xBF58476D1CE4E5B9ULL;
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    s ^= ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        s ^= ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec) * 0xBF58476D1CE4E5B9ULL;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        s ^= (uint64_t)ts.tv_sec * 0x94D049BB133111EBULL ^ (uint64_t)ts.tv_nsec;
+#endif
+
+    /* splitmix64 finaliser: the folded material is structured (a small pid,
+     * a slow-moving clock), and xorshift64* needs its state well mixed or
+     * the first few outputs stay correlated with it. */
+    s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ULL;
+    s ^= s >> 27; s *= 0x94D049BB133111EBULL;
+    s ^= s >> 31;
+    return s ? s : 0x9E3779B97F4A7C15ULL;
+}
+
 /* xorshift64* — ~1ns per 64-bit word, vs rand()'s ~10ns for 1 byte.
- * Per-thread state seeded once with the result of rand() to keep the
- * (guid n) sequence varying across program runs (rand() is itself
- * seeded by the runtime).  v4 UUID quality only requires the version
- * and variant nibbles to be correct; the remaining 122 bits are
- * pseudo-random and xorshift64* is more than sufficient. */
+ * Per-thread state seeded once from guid_seed().  v4 UUID quality only
+ * requires the version and variant nibbles to be correct; the remaining
+ * 122 bits are pseudo-random and xorshift64* is more than sufficient. */
 static __thread uint64_t guid_rng_state = 0;
 
 static inline uint64_t guid_rng_next(void) {
     uint64_t x = guid_rng_state;
-    if (RAY_UNLIKELY(x == 0)) {
-        /* Mix rand() into a non-zero seed.  rand() returns ≤ 31 bits, so
-         * combine three calls plus an address-derived constant for
-         * thread-distinct initialisation. */
-        uint64_t a = (uint64_t)rand();
-        uint64_t b = (uint64_t)rand();
-        uint64_t c = (uint64_t)rand();
-        x = (a << 33) ^ (b << 17) ^ c ^ 0x9E3779B97F4A7C15ULL;
-        if (x == 0) x = 0x9E3779B97F4A7C15ULL;
-    }
+    if (RAY_UNLIKELY(x == 0)) x = guid_seed();
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
