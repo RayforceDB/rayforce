@@ -76,6 +76,7 @@
 
 #include <rayforce.h>
 #include <stdbool.h>
+#include <string.h>
 
 typedef struct ray_sym_domain_s ray_sym_domain_t;
 
@@ -107,6 +108,33 @@ void ray_sym_domain_release(ray_sym_domain_t* dom);
  * owned by the domain (arena-backed, RAY_ATTR_ARENA) — valid for the
  * domain's lifetime, do not release. */
 ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
+
+/* Raw vocabulary access for a FILE domain: the bytes of the entries the
+ * file holds, read straight from the mapping — no atom, no lock.  Pin
+ * takes an atomically published snapshot of (map, offsets, count); a
+ * later extend (the symfile grew under another opener) publishes a new
+ * snapshot and RETIRES the old mapping and offsets until the domain is
+ * destroyed, so a snapshot stays readable for as long as its holder keeps
+ * the domain alive — no waiting on either side, no lock order to respect.
+ * Returns false for the runtime domain or an empty file; the caller then
+ * resolves through ray_sym_domain_str as before.  Only positions below
+ * `count` (the file prefix) are readable this way; runtime-appended
+ * positions keep going through ray_sym_domain_str.  Unpin is a no-op kept
+ * for symmetry. */
+typedef struct {
+    const unsigned char* map;
+    const size_t*        offsets;
+    int64_t              count;
+} ray_sym_domain_raw_t;
+bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out);
+void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom);
+static inline const char* ray_sym_domain_raw_str(const ray_sym_domain_raw_t* r,
+                                                 int64_t pos, size_t* len) {
+    const unsigned char* rec = r->map + r->offsets[pos];
+    uint32_t l; memcpy(&l, rec, 4);
+    *len = l;
+    return (const char*)rec + 4;
+}
 
 /* Position of `str` in the domain, or -1 if absent.
  * FILE: builds the reverse index on first call (O(|vocabulary|)). */

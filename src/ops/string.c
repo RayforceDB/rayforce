@@ -54,6 +54,11 @@ typedef struct {
      * resolve each sid through `dom` instead.  The LUT is sized by
      * that domain's count at setup (fused_group.c precedent). */
     struct ray_sym_domain_s*   dom;
+    /* FILE domain, pinned: the file prefix read straight from the mapping
+     * (no atom materialisation, no lock); positions past raw.count still
+     * resolve through the domain. */
+    ray_sym_domain_raw_t       raw;
+    bool                       raw_ok;
     uint8_t*                   seen;
     uint8_t*                   lut;
     const ray_glob_compiled_t* pc;
@@ -354,11 +359,17 @@ static void like_resolve_fn(void* ctx, uint32_t worker_id,
     like_resolve_ctx_t* x = (like_resolve_ctx_t*)ctx;
     for (int64_t sid = start; sid < end; sid++) {
         if (!x->seen[sid]) continue;
-        ray_t* str = x->sym_strings ? x->sym_strings[sid]
-                                    : ray_sym_domain_str(x->dom, sid);
-        if (!str) { x->lut[sid] = 0; continue; }
-        const char* sp = ray_str_ptr(str);
-        size_t sl = ray_str_len(str);
+        const char* sp;
+        size_t sl;
+        if (x->raw_ok && sid < x->raw.count) {
+            sp = ray_sym_domain_raw_str(&x->raw, sid, &sl);
+        } else {
+            ray_t* str = x->sym_strings ? x->sym_strings[sid]
+                                        : ray_sym_domain_str(x->dom, sid);
+            if (!str) { x->lut[sid] = 0; continue; }
+            sp = ray_str_ptr(str);
+            sl = ray_str_len(str);
+        }
         x->lut[sid] = (x->use_simple
                        ? ray_glob_match_compiled(x->pc, sp, sl)
                        : ray_glob_match(sp, sl, x->pat_str, x->pat_len))
@@ -468,11 +479,13 @@ static void exec_like_parted_sym(ray_t* input, uint8_t* dst,
             .pc = pc, .use_simple = use_simple,
             .pat_str = pat_str, .pat_len = pat_len,
         };
+        rctx.raw_ok = dom ? ray_sym_domain_raw_pin(dom, &rctx.raw) : false;
         if (pool && (int64_t)dict_n >= 16384) {
             ray_pool_dispatch(pool, like_resolve_fn, &rctx, (int64_t)dict_n);
         } else {
             like_resolve_fn(&rctx, 0, 0, (int64_t)dict_n);
         }
+        if (rctx.raw_ok) ray_sym_domain_raw_unpin(dom);
 
         int64_t out_off = 0;
         for (int64_t s = 0; s < input->len; s++) {
@@ -708,11 +721,13 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
                 .pc = &pc, .use_simple = use_simple,
                 .pat_str = pat_str, .pat_len = pat_len,
             };
+            rctx.raw_ok = dom ? ray_sym_domain_raw_pin(dom, &rctx.raw) : false;
             if (pool && (int64_t)dict_n >= 16384) {
                 ray_pool_dispatch(pool, like_resolve_fn, &rctx, (int64_t)dict_n);
             } else {
                 like_resolve_fn(&rctx, 0, 0, (int64_t)dict_n);
             }
+            if (rctx.raw_ok) ray_sym_domain_raw_unpin(dom);
 
             /* Pass 3: row projection — gather lut[sid] into the per-row
              * bool dst.  Parallelised because it's a 5 M-row pass (~5 ms
@@ -868,20 +883,26 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
             seen = (uint8_t*)scratch_calloc(&seen_hdr, (size_t)dict_n);
         }
         if (lut && seen) {
+            ray_sym_domain_raw_t raw;
+            bool raw_ok = ray_sym_domain_raw_pin(dom, &raw);
             for (int64_t i = 0; i < len; i++) {
                 int64_t sid = ray_read_sym(base, i, in_type, input->attrs);
                 if ((uint64_t)sid >= (uint64_t)dict_n) { dst[i] = 0; continue; }
                 if (!seen[sid]) {
-                    ray_t* s = ray_sym_domain_str(dom, sid);
-                    if (!s) { lut[sid] = 0; }
-                    else {
-                        lut[sid] = ray_glob_match_ci(ray_str_ptr(s), ray_str_len(s),
-                                                     pat_str, pat_len) ? 1 : 0;
+                    const char* sp = NULL;
+                    size_t sl = 0;
+                    if (raw_ok && sid < raw.count) {
+                        sp = ray_sym_domain_raw_str(&raw, sid, &sl);
+                    } else {
+                        ray_t* s = ray_sym_domain_str(dom, sid);
+                        if (s) { sp = ray_str_ptr(s); sl = ray_str_len(s); }
                     }
+                    lut[sid] = sp ? (ray_glob_match_ci(sp, sl, pat_str, pat_len) ? 1 : 0) : 0;
                     seen[sid] = 1;
                 }
                 dst[i] = lut[sid];
             }
+            if (raw_ok) ray_sym_domain_raw_unpin(dom);
             scratch_free(lut_hdr);
             scratch_free(seen_hdr);
         } else {
@@ -980,6 +1001,55 @@ ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op) {
 }
 
 /* LENGTH — SYM → I64 */
+typedef struct {
+    ray_t*                   input;
+    int64_t*                 dst;
+    struct ray_sym_domain_s* dom;
+    ray_sym_domain_raw_t     raw;
+    bool                     raw_ok;
+    _Atomic(int)             any_null;
+} strlen_sym_ctx_t;
+static void strlen_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_t hi) {
+    (void)worker_id;
+    strlen_sym_ctx_t* c = (strlen_sym_ctx_t*)vctx;
+    ray_t* input = c->input;
+    const void* base = ray_data(input);
+    bool any_null = false;
+    for (int64_t i = lo; i < hi; i++) {
+        if (ray_vec_is_null(input, i)) { c->dst[i] = NULL_I64; any_null = true; continue; }
+        int64_t sid = ray_read_sym(base, i, input->type, input->attrs);
+        if (c->raw_ok && sid >= 0 && sid < c->raw.count) {
+            size_t sl;
+            (void)ray_sym_domain_raw_str(&c->raw, sid, &sl);
+            c->dst[i] = (int64_t)sl;
+        } else {
+            const char* sp; size_t sl;
+            sym_elem(input, i, &sp, &sl);
+            c->dst[i] = (int64_t)sl;
+        }
+    }
+    if (any_null) atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+}
+/* Lengths of a SYM vector into a pre-sized I64 vector.  A FILE domain's
+ * entries carry their length as a u32 prefix in the mapping — read that by
+ * position, no atom, no lock, in parallel; anything else (runtime domain,
+ * appended positions) resolves the way it always did.  A null cell (the
+ * empty symbol) is a null length, as the vector op returns. */
+void ray_sym_strlen_into(ray_t* input, ray_t* result) {
+    int64_t len = input->len;
+    strlen_sym_ctx_t c = { .input = input, .dst = (int64_t*)ray_data(result), .raw_ok = false };
+    c.dom = ray_sym_vec_domain(input);
+    c.raw_ok = c.dom ? ray_sym_domain_raw_pin(c.dom, &c.raw) : false;
+    atomic_store_explicit(&c.any_null, 0, memory_order_relaxed);
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && len >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, strlen_sym_task, &c, len);
+    else
+        strlen_sym_task(&c, 0, 0, len);
+    if (c.raw_ok) ray_sym_domain_raw_unpin(c.dom);
+    if (atomic_load_explicit(&c.any_null, memory_order_relaxed))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
+}
 ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
     if (!input || RAY_IS_ERR(input)) return input;
@@ -1002,16 +1072,7 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
             }
         }
     } else {
-        for (int64_t i = 0; i < len; i++) {
-            if (ray_vec_is_null(input, i)) {
-                dst[i] = NULL_I64;
-                result->attrs |= RAY_ATTR_HAS_NULLS;
-            } else {
-                const char* sp; size_t sl;
-                sym_elem(input, i, &sp, &sl);
-                dst[i] = (int64_t)sl;
-            }
-        }
+        ray_sym_strlen_into(input, result);
     }
     ray_release(input);
     return result;
