@@ -12136,33 +12136,35 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (sc_any_nullable)            sc_words += n_aggs;    /* nn_count */
         size_t sc_bytes = ((sc_words * sizeof(int64_t)) + sc_line - 1) / sc_line * sc_line;
         for (uint32_t w = 0; w < sc_n; w++) {
-            uint8_t* raw = (uint8_t*)scratch_calloc(&sc_acc[w]._h_sum, sc_bytes + sc_line);
+            void* raw = scratch_calloc(&sc_acc[w]._h_sum, sc_bytes + sc_line);
             if (!raw) { alloc_ok = false; break; }
-            uint8_t* blk = (uint8_t*)(((uintptr_t)raw + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
-            size_t off = 0;
-            sc_acc[w].count = (int64_t*)(blk + off); off += sizeof(int64_t);
+            /* 8-byte words from the first line boundary inside the block:
+             * every array below is a whole number of words. */
+            int64_t* blk = (int64_t*)(void*)(((uintptr_t)raw + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
+            size_t off = 0;   /* in words */
+            sc_acc[w].count = blk + off; off += 1;
             if (need_flags & DA_NEED_SUM) {
-                sc_acc[w].sum = (da_val_t*)(blk + off); off += n_aggs * sizeof(da_val_t);
+                sc_acc[w].sum = (da_val_t*)(void*)(blk + off); off += n_aggs;
             }
             if (need_flags & DA_NEED_MIN) {
-                sc_acc[w].min_val = (da_val_t*)(blk + off); off += n_aggs * sizeof(da_val_t);
+                sc_acc[w].min_val = (da_val_t*)(void*)(blk + off); off += n_aggs;
                 for (uint32_t a = 0; a < n_aggs; a++) {
                     if (group_fp_type(agg_types[a])) sc_acc[w].min_val[a].f = DBL_MAX;
                     else sc_acc[w].min_val[a].i = INT64_MAX;
                 }
             }
             if (need_flags & DA_NEED_MAX) {
-                sc_acc[w].max_val = (da_val_t*)(blk + off); off += n_aggs * sizeof(da_val_t);
+                sc_acc[w].max_val = (da_val_t*)(void*)(blk + off); off += n_aggs;
                 for (uint32_t a = 0; a < n_aggs; a++) {
                     if (group_fp_type(agg_types[a])) sc_acc[w].max_val[a].f = -DBL_MAX;
                     else sc_acc[w].max_val[a].i = INT64_MIN;
                 }
             }
             if (need_flags & DA_NEED_SUMSQ) {
-                sc_acc[w].sumsq_f64 = (double*)(blk + off); off += n_aggs * sizeof(double);
+                sc_acc[w].sumsq_f64 = (double*)(void*)(blk + off); off += n_aggs;
             }
             if (sc_any_nullable) {
-                sc_acc[w].nn_count = (int64_t*)(blk + off); off += n_aggs * sizeof(int64_t);
+                sc_acc[w].nn_count = blk + off; off += n_aggs;
             }
         }
         if (!alloc_ok) {
