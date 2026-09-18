@@ -8136,7 +8136,20 @@ static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
     }
     /* SYM cell: resolve through the COLUMN's domain (sym-domain Phase 2)
      * — sym_elem resolves via the global table, wrong for FILE-domain
-     * columns. */
+     * columns.  A FILE domain's entries carry their length as a u32
+     * prefix in the mapping: read it off the published snapshot (one
+     * acquire load) instead of materialising an atom per symbol under
+     * the domain lock; positions past the mapped prefix and other domains
+     * resolve as before. */
+    {
+        int64_t sid = ray_read_sym(ray_data((ray_t*)col), row, col->type, col->attrs);
+        ray_sym_domain_raw_t raw;
+        if (ray_sym_domain_raw_pin(ray_sym_vec_domain((ray_t*)col), &raw) && sid >= 0 && sid < raw.count) {
+            size_t sl;
+            (void)ray_sym_domain_raw_str(&raw, sid, &sl);
+            return (int64_t)sl;
+        }
+    }
     ray_t* s = ray_sym_vec_cell((ray_t*)col, row);
     return s ? (int64_t)ray_str_len(s) : 0;
 }
