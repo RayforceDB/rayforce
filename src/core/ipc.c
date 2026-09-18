@@ -343,7 +343,12 @@ static bool hook_vm_bind(hook_vm_t* hv) {
     hv->owned = NULL;
     if (__VM) return true;                      /* already on a VM thread */
     ray_vm_t* vm = (ray_vm_t*)ray_alloc_raw(sizeof(ray_vm_t));
-    if (!vm) return false;                      /* caller skips the hook */
+    if (!vm) {
+        /* Skipping a hook the operator installed is worth a line, matching
+         * how this file reports every other hook failure. */
+        fprintf(stderr, "ipc: cannot bind a VM for hook dispatch (out of memory); hook skipped\n");
+        return false;
+    }
     ray_vm_init(vm, -1);                        /* id -1: not a pool VM */
     __VM = vm;
     hv->owned = vm;
@@ -396,6 +401,10 @@ static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
  *  - -1 → no hook installed; caller uses the existing pass-through.
  * The constant-time secret compare in validate_creds always runs first,
  * so this hook can only narrow access — never widen it. */
+/* Not VM-bound, unlike hook_call_lifecycle: this runs only from inside
+ * ray_poll_run, on a thread that necessarily has a VM.  If a future path
+ * ever drives the handshake from an embedder's own thread, it needs the
+ * same hook_vm_bind treatment (#569). */
 static int hook_call_auth(ray_poll_t* poll, int64_t handle,
                           const uint8_t* cred_buf, uint8_t cred_len) {
     ray_t* fn = hook_lookup(IPC_HOOK_AUTH);
@@ -648,6 +657,8 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
          * as `{[m] eval m}` reproduces the default behaviour. */
         int hook_idx = (hdr->msgtype == RAY_IPC_MSG_SYNC) ? IPC_HOOK_SYNC
                                                            : IPC_HOOK_ASYNC;
+        /* Also not VM-bound — eval_payload runs under ray_poll_run, which
+         * owns a VM.  See hook_call_lifecycle for the case that does not. */
         ray_t* hook = hook_lookup(hook_idx);
         if (hook) {
             result = call_fn1(hook, msg);
