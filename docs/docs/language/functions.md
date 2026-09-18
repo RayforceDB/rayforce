@@ -426,7 +426,24 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
-| `guid` | unary | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
+| `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
+
+`guid` and `rand` draw from **different** sources on purpose:
+
+- `guid` is seeded from the OS at first use, per thread, so values are unique
+  across processes and machines. That is the property the type exists to
+  provide, so it is not something to trade for reproducibility.
+- `rand` is deterministic — the same process-wide sequence every run. That is
+  what makes tests and simulations reproducible, and changing `guid`'s seeding
+  deliberately left it alone.
+
+```lisp
+(first (guid 1))   ;; a different value in every process
+(rand 3 1000)      ;; [383 886 777] in every process
+```
+
+If you need a reproducible stream, use `rand`. If you need identifiers that do
+not collide between two processes writing into the same table, use `guid`.
 
 ## I/O & File Operations
 
@@ -438,11 +455,33 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `format` | variadic | Format value to string (% is placeholder) | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | Load CSV file into table | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
-| `read` | unary | Read file contents as string | `(read "file.txt")` |
-| `read-bytes` | unary | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
+| `read` | unary | Read file contents as string, to EOF | `(read "file.txt")` |
+| `read-bytes` | unary | Read file contents as a `U8` byte vector, to EOF | `(read-bytes "file.bin")` |
 | `write` | binary | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
 | `load` | unary | Load and evaluate a Rayfall script; a relative path is tried against the working directory, then below `RAYFORCE_HOME` | `(load "lib.rfl")` |
+
+`read` and `read-bytes` read until EOF rather than to the size the file
+reports. That matters for anything whose reported size is not its content
+length: every file under `/proc` and `/sys` reports `0` while yielding data,
+FIFOs and character devices cannot be seeked at all, and an ordinary file may
+change between the measure and the read.
+
+```lisp
+(read "/proc/sys/kernel/hostname")        ;; => "sita\n"
+(read "/proc/sys/kernel/random/uuid")     ;; => a fresh UUID per call
+(.fs.size "/proc/sys/kernel/hostname")    ;; => 0  (what the kernel reports)
+```
+
+`.fs.size` still reports what the OS reports — the two disagreeing on a
+special file is expected, not a bug.
+
+A stream with no size to go on — `/dev/zero`, or a FIFO nobody closes — has no
+EOF to reach. Reading one grows a buffer until it crosses a ceiling derived
+from the heap's remaining headroom, then fails with `io` rather than consuming
+the machine. Reads of a file whose size *is* known are not subject to that
+ceiling: a reported size is a finite claim, and a large file allocates and
+spills exactly as it did before.
 
 ## Control Flow
 

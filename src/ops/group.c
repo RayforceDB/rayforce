@@ -8136,7 +8136,20 @@ static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
     }
     /* SYM cell: resolve through the COLUMN's domain (sym-domain Phase 2)
      * — sym_elem resolves via the global table, wrong for FILE-domain
-     * columns. */
+     * columns.  A FILE domain's entries carry their length as a u32
+     * prefix in the mapping: read it off the published snapshot (one
+     * acquire load) instead of materialising an atom per symbol under
+     * the domain lock; positions past the mapped prefix and other domains
+     * resolve as before. */
+    {
+        int64_t sid = ray_read_sym(ray_data((ray_t*)col), row, col->type, col->attrs);
+        ray_sym_domain_raw_t raw;
+        if (ray_sym_domain_raw_pin(ray_sym_vec_domain((ray_t*)col), &raw) && sid >= 0 && sid < raw.count) {
+            size_t sl;
+            (void)ray_sym_domain_raw_str(&raw, sid, &sl);
+            return (int64_t)sl;
+        }
+    }
     ray_t* s = ray_sym_vec_cell((ray_t*)col, row);
     return s ? (int64_t)ray_str_len(s) : 0;
 }
@@ -12117,44 +12130,54 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             sc_n * sizeof(da_accum_t));
         if (!sc_acc) { scratch_free(sc_vla_hdr); goto da_path; }
 
-        /* Allocate 1-slot accumulators per worker (n_aggs entries) */
+        /* One cache-line-aligned block per worker holding every 1-slot
+         * accumulator array (n_aggs entries each).  Separate small
+         * allocations land next to each other on the heap, so adjacent
+         * workers' counters share cache lines and every row bounces the
+         * line across cores: on a two-socket 48-thread box the keyless
+         * SUM/COUNT/AVG over 100M rows took 8.8 s against 0.27 s on one
+         * socket.  The block is padded to a whole number of lines and
+         * carried by _h_sum; the other headers stay NULL for
+         * da_accum_free. */
         bool alloc_ok = true;
+        const size_t sc_line = 64;
+        size_t sc_words = 1;                                   /* count[1] */
+        if (need_flags & DA_NEED_SUM)   sc_words += n_aggs;    /* sum */
+        if (need_flags & DA_NEED_MIN)   sc_words += n_aggs;    /* min_val */
+        if (need_flags & DA_NEED_MAX)   sc_words += n_aggs;    /* max_val */
+        if (need_flags & DA_NEED_SUMSQ) sc_words += n_aggs;    /* sumsq_f64 */
+        if (sc_any_nullable)            sc_words += n_aggs;    /* nn_count */
+        size_t sc_bytes = ((sc_words * sizeof(int64_t)) + sc_line - 1) / sc_line * sc_line;
         for (uint32_t w = 0; w < sc_n; w++) {
+            void* raw = scratch_calloc(&sc_acc[w]._h_sum, sc_bytes + sc_line);
+            if (!raw) { alloc_ok = false; break; }
+            /* 8-byte words from the first line boundary inside the block:
+             * every array below is a whole number of words. */
+            int64_t* blk = (int64_t*)(void*)(((uintptr_t)raw + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
+            size_t off = 0;   /* in words */
+            sc_acc[w].count = blk + off; off += 1;
             if (need_flags & DA_NEED_SUM) {
-                sc_acc[w].sum = (da_val_t*)scratch_calloc(&sc_acc[w]._h_sum,
-                    n_aggs * sizeof(da_val_t));
-                if (!sc_acc[w].sum) { alloc_ok = false; break; }
+                sc_acc[w].sum = (da_val_t*)(void*)(blk + off); off += n_aggs;
             }
             if (need_flags & DA_NEED_MIN) {
-                sc_acc[w].min_val = (da_val_t*)scratch_alloc(&sc_acc[w]._h_min,
-                    n_aggs * sizeof(da_val_t));
-                if (!sc_acc[w].min_val) { alloc_ok = false; break; }
+                sc_acc[w].min_val = (da_val_t*)(void*)(blk + off); off += n_aggs;
                 for (uint32_t a = 0; a < n_aggs; a++) {
                     if (group_fp_type(agg_types[a])) sc_acc[w].min_val[a].f = DBL_MAX;
                     else sc_acc[w].min_val[a].i = INT64_MAX;
                 }
             }
             if (need_flags & DA_NEED_MAX) {
-                sc_acc[w].max_val = (da_val_t*)scratch_alloc(&sc_acc[w]._h_max,
-                    n_aggs * sizeof(da_val_t));
-                if (!sc_acc[w].max_val) { alloc_ok = false; break; }
+                sc_acc[w].max_val = (da_val_t*)(void*)(blk + off); off += n_aggs;
                 for (uint32_t a = 0; a < n_aggs; a++) {
                     if (group_fp_type(agg_types[a])) sc_acc[w].max_val[a].f = -DBL_MAX;
                     else sc_acc[w].max_val[a].i = INT64_MIN;
                 }
             }
             if (need_flags & DA_NEED_SUMSQ) {
-                sc_acc[w].sumsq_f64 = (double*)scratch_calloc(&sc_acc[w]._h_sumsq,
-                    n_aggs * sizeof(double));
-                if (!sc_acc[w].sumsq_f64) { alloc_ok = false; break; }
+                sc_acc[w].sumsq_f64 = (double*)(void*)(blk + off); off += n_aggs;
             }
-            sc_acc[w].count = (int64_t*)scratch_calloc(&sc_acc[w]._h_count,
-                1 * sizeof(int64_t));
-            if (!sc_acc[w].count) { alloc_ok = false; break; }
             if (sc_any_nullable) {
-                sc_acc[w].nn_count = (int64_t*)scratch_calloc(
-                    &sc_acc[w]._h_nn_count, n_aggs * sizeof(int64_t));
-                if (!sc_acc[w].nn_count) { alloc_ok = false; break; }
+                sc_acc[w].nn_count = blk + off; off += n_aggs;
             }
         }
         if (!alloc_ok) {

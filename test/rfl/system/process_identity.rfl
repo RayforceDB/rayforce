@@ -1,0 +1,73 @@
+;; Process and host identity, plus .sys.exec output capture — issue #573.
+;;
+;; An embedded process could not learn anything about itself: no PID, no
+;; hostname, and .sys.exec discarded stdout.  The reported consequence was
+;; an owner process unable to mint an epoch distinguishing one of its own
+;; restarts from the next, so a subscriber's stale cursor stayed plausible
+;; across a restart.
+;;
+;; Values here are machine- and run-specific, so the assertions are on
+;; shape and invariants rather than on literals.
+
+;; ────────────── .sys.info carries process identity ──────────────
+;; Machine facts were already there; pid and hostname join them so one
+;; call answers "what am I running on, and which process am I".
+(type (get (.sys.info) 'pid))             -- 'i64
+(> (get (.sys.info) 'pid) 0)              -- true
+
+(type (get (.sys.info) 'hostname))        -- 'str
+;; Cross-check the value rather than merely asserting it is non-empty: the
+;; implementation deliberately degrades to "" when the platform cannot
+;; answer, so a non-empty assertion would be testing something it does not
+;; promise.  Comparing against uname(1) tests what actually matters — that
+;; when we do report a hostname, it is the right one.
+(== (get (.sys.info) 'hostname) (first (split (get (.sys.exec "uname -n" 'out) 'out) "\n"))) -- true
+
+;; Stable within a process — it is our pid, not a fresh child's.
+(== (get (.sys.info) 'pid) (get (.sys.info) 'pid)) -- true
+
+;; The machine keys are untouched.
+(> (get (.sys.info) 'cores) 0)     -- true
+(> (get (.sys.info) 'page-size) 0) -- true
+
+;; ────────────── .sys.exec returns an exit code ──────────────
+;; It used to return the raw wait(2) status, so "exit 3" came back as 768.
+(.sys.exec "exit 0")   -- 0
+(.sys.exec "exit 3")   -- 3
+(.sys.exec "exit 42")  -- 42
+;; 127 is the shell's "command not found"; it must survive as itself
+;; rather than as 32512.
+(.sys.exec "exit 127") -- 127
+
+;; ────────────── .sys.exec 'out captures stdout ──────────────
+(get (.sys.exec "echo hi" 'out) 'code) -- 0
+(get (.sys.exec "echo hi" 'out) 'out)  -- "hi\n"
+
+;; Exit code and output are reported together, not either/or.
+(get (.sys.exec "echo partial; exit 4" 'out) 'code) -- 4
+(get (.sys.exec "echo partial; exit 4" 'out) 'out)  -- "partial\n"
+
+;; No output is an empty string, not a null or a missing key.
+(get (.sys.exec "true" 'out) 'out) -- ""
+
+;; Output larger than one read buffer (4096) comes back whole.  Produced by a
+;; pipe rather than by expanding 100k argv words, which would lean on `seq`
+;; and on ARG_MAX rather than on the growth behaviour under test.
+(count (get (.sys.exec "head -c 100000 /dev/zero | tr '\\0' x" 'out) 'out)) -- 100000
+
+;; stderr is not captured — it stays on the process's own stderr, so a
+;; command that only writes there yields an empty capture.
+(get (.sys.exec "{ echo oops 1>&2; } 2>/dev/null" 'out) 'out) -- ""
+
+;; 'out is the only accepted second argument.
+(try (.sys.exec "true" 'nope) (fn [e] 'rejected)) -- 'rejected
+(try (.sys.exec "true" 5)     (fn [e] 'rejected)) -- 'rejected
+
+;; ────────────── the reported use case, in one expression ──────────────
+;; host + pid + wall clock is a diagnosable epoch: no temp file, no umask
+;; dance, no cleanup, and reading it tells you which process it names.
+(> (count (format "%-%-%" (get (.sys.info) 'hostname) (get (.sys.info) 'pid) (timestamp 'global))) 0) -- true
+
+;; A command the shell cannot run at all is an io error, not a decoded 255 —
+;; otherwise it is indistinguishable from a command that genuinely exited 255.
+(.sys.exec "exit 255") -- 255

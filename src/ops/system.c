@@ -21,6 +21,10 @@
  *   SOFTWARE.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE   /* popen()/pclose() and gethostname() — .sys.exec, .sys.info */
+#endif
+
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "lang/eval.h"  /* LAMBDA_PARAMS */
@@ -55,6 +59,12 @@ void* ray_runtime_get_sys_args(void);
 #include <string.h>
 #if !defined(RAY_OS_WINDOWS)
 #include <unistd.h>
+#include <sys/wait.h>   /* WIFEXITED/WEXITSTATUS — .sys.exec exit codes */
+#define RAY_POPEN(c, m)  popen((c), (m))
+#define RAY_PCLOSE(f)    pclose(f)
+#else
+#define RAY_POPEN(c, m)  _popen((c), (m))
+#define RAY_PCLOSE(f)    _pclose(f)
 #endif
 
 /* ══════════════════════════════════════════
@@ -372,26 +382,78 @@ ray_t* ray_fs_list_fn(ray_t* x) {
     return result;
 }
 
+static int64_t ray_os_pid(void);   /* defined with the .sys.info helpers */
+
+/* Eight bytes of OS entropy.  False when no source answered, which the
+ * caller treats as "fold in less", never as "seed with a constant". */
+static bool guid_os_entropy(uint64_t* out) {
+#if defined(RAY_OS_WINDOWS)
+    (void)out;
+    return false;   /* covered by the process/time material below */
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (!f) return false;
+    size_t got = fread(out, 1, sizeof(*out), f);
+    fclose(f);
+    return got == sizeof(*out);
+#endif
+}
+
+/* Seed for one thread's GUID stream.
+ *
+ * This used to come from rand(), on the stated assumption that "rand() is
+ * itself seeded by the runtime".  Nothing in the tree has ever called
+ * srand(), so rand() ran from libc's default seed of 1 and every process
+ * produced the same GUID sequence — the reporter's first value on their
+ * machine and build was byte-identical to ours (#571).  Uniqueness is the
+ * one property the type exists to provide, and the failure was silent:
+ * the values are well-formed and carry the correct version-4 nibble.
+ *
+ * Seeded from the OS independently of rand(), so rand()'s determinism —
+ * which is defensible, and which reproducible tests rely on — is left
+ * exactly as it was.  Process id, a high-resolution clock and a stack
+ * address are always folded in, so even a platform or a chroot where the
+ * entropy source cannot be reached still cannot hand two processes, or
+ * two threads, the same stream. */
+static uint64_t guid_seed(void) {
+    uint64_t s = 0;
+    if (!guid_os_entropy(&s)) s = 0;
+
+    s ^= (uint64_t)ray_os_pid() * 0x9E3779B97F4A7C15ULL;
+    s ^= (uint64_t)(uintptr_t)&s;
+#if defined(RAY_OS_WINDOWS)
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    s ^= (uint64_t)cnt.QuadPart * 0xBF58476D1CE4E5B9ULL;
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    s ^= ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        s ^= ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec) * 0xBF58476D1CE4E5B9ULL;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        s ^= (uint64_t)ts.tv_sec * 0x94D049BB133111EBULL ^ (uint64_t)ts.tv_nsec;
+#endif
+
+    /* splitmix64 finaliser: the folded material is structured (a small pid,
+     * a slow-moving clock), and xorshift64* needs its state well mixed or
+     * the first few outputs stay correlated with it. */
+    s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ULL;
+    s ^= s >> 27; s *= 0x94D049BB133111EBULL;
+    s ^= s >> 31;
+    return s ? s : 0x9E3779B97F4A7C15ULL;
+}
+
 /* xorshift64* — ~1ns per 64-bit word, vs rand()'s ~10ns for 1 byte.
- * Per-thread state seeded once with the result of rand() to keep the
- * (guid n) sequence varying across program runs (rand() is itself
- * seeded by the runtime).  v4 UUID quality only requires the version
- * and variant nibbles to be correct; the remaining 122 bits are
- * pseudo-random and xorshift64* is more than sufficient. */
+ * Per-thread state seeded once from guid_seed().  v4 UUID quality only
+ * requires the version and variant nibbles to be correct; the remaining
+ * 122 bits are pseudo-random and xorshift64* is more than sufficient. */
 static __thread uint64_t guid_rng_state = 0;
 
 static inline uint64_t guid_rng_next(void) {
     uint64_t x = guid_rng_state;
-    if (RAY_UNLIKELY(x == 0)) {
-        /* Mix rand() into a non-zero seed.  rand() returns ≤ 31 bits, so
-         * combine three calls plus an address-derived constant for
-         * thread-distinct initialisation. */
-        uint64_t a = (uint64_t)rand();
-        uint64_t b = (uint64_t)rand();
-        uint64_t c = (uint64_t)rand();
-        x = (a << 33) ^ (b << 17) ^ c ^ 0x9E3779B97F4A7C15ULL;
-        if (x == 0) x = 0x9E3779B97F4A7C15ULL;
-    }
+    if (RAY_UNLIKELY(x == 0)) x = guid_seed();
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
@@ -798,18 +860,161 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
 }
 
 /* (system cmd) -- run shell command, return exit code */
-ray_t* ray_system_fn(ray_t* x) {
+/* Both helpers exist only for the live .sys.exec path, which RAY_FUZZING
+ * compiles out — guard them so the fuzz build does not trip
+ * -Werror,-Wunused-function. */
+#ifndef RAY_FUZZING
+/* Turn a wait(2)-style status into the exit code a shell would report.
+ * system() and pclose() hand back an encoded status, not a code: "exit 3"
+ * arrives as 768 (3 << 8).  Signals follow the shell's 128+N convention, so
+ * a command killed by SIGTERM reads as 143 rather than as a bare 15 that
+ * could be confused with a real exit status. */
+static int64_t exec_exit_code(int status) {
+#if defined(RAY_OS_WINDOWS)
+    /* The CRT's system()/_pclose() already return the child's exit code. */
+    return (int64_t)status;
+#else
+    if (WIFEXITED(status))   return (int64_t)WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return (int64_t)(128 + WTERMSIG(status));
+    return (int64_t)status;
+#endif
+}
+
+/* Read everything the child writes to stdout.  Grows geometrically rather
+ * than sizing from any stat(), so output from a pipe — which has no size to
+ * ask for — comes back whole (cf. #572). */
+static ray_t* exec_capture(const char* cmd, int64_t* code_out) {
+    FILE* fp = RAY_POPEN(cmd, "r");
+    if (!fp) return ray_error("io", ".sys.exec: failed to start command: %s", strerror(errno));
+
+    /* A command that never stops writing has no end to capture, exactly as an
+     * endless file has no EOF to read (#572).  Same ceiling, same reason. */
+    const int64_t budget = ray_unsized_read_budget();
+
+    size_t cap = 4096, len = 0;
+    char*  buf = (char*)ray_alloc_raw(cap);
+    if (!buf) { RAY_PCLOSE(fp); return ray_error("oom", ".sys.exec: capture buffer"); }
+
+    for (;;) {
+        if (len == cap) {
+            /* Peak during the grow is the old buffer plus the new one. */
+            if (budget > 0 && (int64_t)cap * 3 > budget) {
+                ray_free_raw(buf); RAY_PCLOSE(fp);
+                return ray_error("io", ".sys.exec: output exceeds the readable budget of %lld bytes",
+                                 (long long)budget);
+            }
+            char* nbuf = (char*)ray_realloc_raw(buf, cap * 2);
+            if (!nbuf) { ray_free_raw(buf); RAY_PCLOSE(fp); return ray_error("oom", ".sys.exec: capture buffer"); }
+            buf = nbuf; cap *= 2;
+        }
+        size_t got = fread(buf + len, 1, cap - len, fp);
+        len += got;
+        if (got == 0) {
+            if (ferror(fp)) { ray_free_raw(buf); RAY_PCLOSE(fp); return ray_error("io", ".sys.exec: read failed"); }
+            break;  /* EOF */
+        }
+    }
+
+    int status = RAY_PCLOSE(fp);
+    if (status == -1) { ray_free_raw(buf); return ray_error("io", ".sys.exec: command did not complete: %s", strerror(errno)); }
+    *code_out = exec_exit_code(status);
+
+    ray_t* out = ray_str(buf, len);
+    ray_free_raw(buf);
+    return out;
+}
+
+#endif /* !RAY_FUZZING */
+
+/* (.sys.exec cmd)      -> exit code
+ * (.sys.exec cmd 'out) -> {code: <exit code> out: <stdout>}
+ *
+ * The capture reads to EOF on the child's stdout, and a backgrounded
+ * grandchild inherits that pipe — so 'out waits for it too, not just for the
+ * shell (#579).  Inherent to popen(3); the one-argument form does not have
+ * it, and is the way to launch something that outlives the call.
+ *
+ * stderr is deliberately left on the process's own stderr: a shelled-out
+ * command's diagnostics belong in the log, and merging them into the
+ * captured value would corrupt anything parsing that value (#573). */
+ray_t* ray_system_fn(ray_t** args, int64_t n) {
 #ifdef RAY_FUZZING
     /* Shell escape — disabled under fuzzing so untrusted input can't run
      * arbitrary commands in the fuzzer process. */
-    (void)x;
+    (void)args; (void)n;
     return ray_error("restricted", "shell disabled under fuzzing");
 #else
+    if (n != 1 && n != 2) return ray_error("domain", ".sys.exec expects 1 or 2 arguments");
+    ray_t* x = args[0];
     if (x->type != -RAY_STR) return ray_error("type", "system expects a string");
-    const char* cmd = ray_str_ptr(x);
-    if (!cmd) return ray_error("domain", ".sys.exec: empty or invalid command string");
-    int rc = system(cmd);
-    return make_i64(rc);
+
+    bool capture = false;
+    if (n == 2) {
+        ray_t* mode = args[1];
+        if (mode->type != -RAY_SYM)
+            return ray_error("type", ".sys.exec: second argument must be the symbol 'out");
+        if (mode->i64 != ray_sym_intern("out", 3))
+            return ray_error("domain", ".sys.exec: unknown mode, expected 'out");
+        capture = true;
+    }
+
+    /* libc needs a NUL-terminated command; ray strings are not NUL-terminated
+     * once pooled (len > RAY_STR_INLINE_MAX). */
+    char  stackbuf[1024];
+    char* heapbuf = NULL;
+    int64_t clen  = ray_str_len(x);
+    const char* raw = ray_str_ptr(x);
+    if (!raw) return ray_error("domain", ".sys.exec: empty or invalid command string");
+    char* cmd;
+    if (clen < (int64_t)sizeof(stackbuf)) {
+        cmd = stackbuf;
+    } else {
+        heapbuf = (char*)ray_alloc_raw((size_t)clen + 1);
+        if (!heapbuf) return ray_error("oom", ".sys.exec: command buffer");
+        cmd = heapbuf;
+    }
+    memcpy(cmd, raw, (size_t)clen);
+    cmd[clen] = '\0';
+
+    ray_t* result;
+    if (!capture) {
+        int rc = system(cmd);
+        /* -1 means the shell could not be started at all.  Decoding it would
+         * yield 128+127 = 255 — indistinguishable from a command that really
+         * exited 255 — so report it the way the capture path reports its
+         * equivalent pclose failure. */
+        if (rc == -1) {
+            if (heapbuf) ray_free_raw(heapbuf);
+            return ray_error("io", ".sys.exec: failed to run command: %s", strerror(errno));
+        }
+        result = make_i64(exec_exit_code(rc));
+    } else {
+        int64_t code = 0;
+        ray_t* out = exec_capture(cmd, &code);
+        if (RAY_IS_ERR(out)) {
+            result = out;
+        } else {
+            ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
+            ray_t* vals = RAY_IS_ERR(keys) ? keys : ray_list_new(2);
+            if (RAY_IS_ERR(keys) || RAY_IS_ERR(vals)) {
+                if (!RAY_IS_ERR(keys)) ray_release(keys);
+                ray_release(out);
+                if (heapbuf) ray_free_raw(heapbuf);
+                return RAY_IS_ERR(keys) ? keys : vals;
+            }
+            int64_t k1 = ray_sym_intern("code", 4);
+            keys = ray_vec_append(keys, &k1);
+            ray_t* v1 = make_i64(code);
+            vals = ray_list_append(vals, v1); ray_release(v1);
+            int64_t k2 = ray_sym_intern("out", 3);
+            keys = ray_vec_append(keys, &k2);
+            vals = ray_list_append(vals, out); ray_release(out);
+            result = ray_dict_new(keys, vals);
+        }
+    }
+
+    if (heapbuf) ray_free_raw(heapbuf);
+    return result;
 #endif
 }
 
@@ -1256,11 +1461,38 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     return make_i64(on ? 1 : 0);
 }
 
+/* Process id of this process.  getpid() is already used internally for heap
+ * swap-file names; this is the same value, made reachable from Rayfall. */
+static int64_t ray_os_pid(void) {
+#if defined(RAY_OS_WINDOWS)
+    return (int64_t)GetCurrentProcessId();
+#else
+    return (int64_t)getpid();
+#endif
+}
+
+/* Host name into `buf`, NUL-terminated.  False when the platform cannot
+ * answer, in which case .sys.info reports "" rather than failing the whole
+ * call — one unavailable field should not cost the caller the others. */
+static bool ray_os_hostname(char* buf, size_t cap) {
+    if (cap == 0) return false;
+    buf[0] = '\0';
+#if defined(RAY_OS_WINDOWS)
+    DWORD n = (DWORD)cap;
+    if (!GetComputerNameA(buf, &n)) return false;
+#else
+    if (gethostname(buf, cap) != 0) return false;
+    /* POSIX leaves truncation unterminated. */
+    buf[cap - 1] = '\0';
+#endif
+    return buf[0] != '\0';
+}
+
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 3);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(3);
+    ray_t* vals = ray_list_new(5);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
 #if !defined(RAY_OS_WINDOWS)
@@ -1284,6 +1516,22 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     ray_t* v1 = make_i64(1);
     vals = ray_list_append(vals, v1); ray_release(v1);
 #endif
+
+    /* Process and host identity (#573).  An embedded process previously had
+     * no way to name itself: pid plus hostname plus a start timestamp is a
+     * diagnosable epoch, where a random token only tells you that two runs
+     * differ, not which machine or process either one was. */
+    int64_t sp = ray_sym_intern("pid", 3);
+    keys = ray_vec_append(keys, &sp);
+    ray_t* vp = make_i64(ray_os_pid());
+    vals = ray_list_append(vals, vp); ray_release(vp);
+
+    char host[256];
+    int64_t sh = ray_sym_intern("hostname", 8);
+    keys = ray_vec_append(keys, &sh);
+    ray_t* vh = ray_os_hostname(host, sizeof(host)) ? ray_str(host, strlen(host))
+                                                    : ray_str("", 0);
+    vals = ray_list_append(vals, vh); ray_release(vh);
 
     return ray_dict_new(keys, vals);
 }

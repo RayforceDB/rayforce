@@ -294,10 +294,15 @@ void ray_env_destroy(void) {
  * Returns NULL if not bound.  Always used as the head-segment resolver
  * for dotted paths, and as the fast path for plain names. */
 static ray_t* env_lookup_flat(int64_t sym_id) {
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
-        ray_scope_frame_t* f = &__VM->scope_stack[d];
-        for (int32_t i = 0; i < f->count; i++) {
-            if (f->keys[i] == sym_id) return f->vals[i];
+    /* FFI/embedding callers reach this on threads that never bound a VM
+     * (cf. ray_env_get_local, already guarded). Such a thread has no
+     * local scopes; global bindings must still resolve. */
+    if (__VM) {
+        for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+            ray_scope_frame_t* f = &__VM->scope_stack[d];
+            for (int32_t i = 0; i < f->count; i++) {
+                if (f->keys[i] == sym_id) return f->vals[i];
+            }
         }
     }
     for (int32_t i = 0; i < g_env.count; i++) {
