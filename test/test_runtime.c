@@ -635,6 +635,21 @@ static test_result_t test_build_sys_args_edges(void) {
     PASS();
 }
 
+static test_result_t test_build_sys_args_rejects_malformed_numbers(void) {
+    char* cases[][3] = {
+        { "rayforce", "-c", "2abc" },
+        { "rayforce", "-c", "999999999999999999999999" },
+        { "rayforce", "-t", "1abc" },
+        { "rayforce", "-Q", "0abc" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ray_t* d = ray_build_sys_args(3, cases[i]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(d));
+        ray_error_free(d);
+    }
+    PASS();
+}
+
 /* .sys.args builtin: only `source` when unset; reflects stored dict when set */
 static test_result_t test_sys_args_builtin(void) {
     /* unset → a dict holding just `source` (empty here: ray_eval_str is
@@ -1288,6 +1303,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_defaults",     test_build_sys_args_defaults,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
     { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
+    { "runtime/build_sys_args_rejects_malformed_numbers", test_build_sys_args_rejects_malformed_numbers, sys_setup, sys_teardown },
     { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
@@ -1315,4 +1331,3 @@ const test_entry_t runtime_entries[] = {
 
     { NULL, NULL, NULL, NULL },
 };
-
