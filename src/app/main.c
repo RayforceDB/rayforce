@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -65,6 +66,17 @@ static int64_t parse_size_arg(const char* s) {
         if (end[1] != '\0') return -1;   /* trailing junk after the suffix */
     }
     return (int64_t)(v * (double)mult);
+}
+
+static int parse_int_arg(const char* s, int* out) {
+    if (!s || !*s) return 0;
+    char* end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX)
+        return 0;
+    *out = (int)v;
+    return 1;
 }
 
 /* --------------------------------------------------------------------------
@@ -190,14 +202,24 @@ int main(int argc, char** argv) {
             if (n_cores < 0) n_cores = 0;
         }
         else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
-            if (!v) { ray_runtime_destroy(rt); return 2; }
-            timeit_init = (atoi(v) != 0);
+            const char* tv = flag_value(argc, argv, &i, argv[i]);
+            int v;
+            if (!tv || !parse_int_arg(tv, &v)) {
+                fprintf(stderr, "error: -t/--timeit expects an integer\n");
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            timeit_init = (v != 0);
         }
         else if (strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
-            if (!v) { ray_runtime_destroy(rt); return 2; }
-            qlog_init = (atoi(v) != 0);
+            int v;
+            const char* qv = flag_value(argc, argv, &i, argv[i]);
+            if (!qv || !parse_int_arg(qv, &v)) {
+                fprintf(stderr, "error: -Q/--querylog expects an integer\n");
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            qlog_init = (v != 0);
         }
         else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
             file = flag_value(argc, argv, &i, argv[i]);

@@ -2972,6 +2972,40 @@ static test_result_t test_repl_cli_cores_are_total(void) {
     TEST_ASSERT_FMT(count == 3, "-c 3 created %ld total threads", count);
     PASS();
 }
+
+static test_result_t test_repl_cli_flags_reject_malformed(void) {
+    const struct {
+        const char* flag;
+        const char* value;
+        const char* message;
+    } cases[] = {
+        { "-t", "1abc", "-t/--timeit expects an integer" },
+        { "-Q", "1abc", "-Q/--querylog expects an integer" },
+        { "-Q", "0abc", "-Q/--querylog expects an integer" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char command[256];
+        snprintf(command, sizeof command,
+                 "./rayforce %s %s </dev/null 2>&1", cases[i].flag,
+                 cases[i].value);
+        FILE* pipe = popen(command, "r");
+        TEST_ASSERT_FMT(pipe != NULL, "popen failed for %s %s", cases[i].flag,
+                        cases[i].value);
+
+        char output[256] = {0};
+        size_t used = fread(output, 1, sizeof output - 1, pipe);
+        output[used] = '\0';
+        int status = pclose(pipe);
+        TEST_ASSERT_FMT(status != -1 && WIFEXITED(status) &&
+                            WEXITSTATUS(status) == 2,
+                        "%s %s exited with status %d and output %s",
+                        cases[i].flag, cases[i].value, status, output);
+        TEST_ASSERT_FMT(strstr(output, cases[i].message) != NULL,
+                        "%s %s was not rejected as malformed: %s",
+                        cases[i].flag, cases[i].value, output);
+    }
+    PASS();
+}
 #endif
 
 /* ─── Suite definition ───────────────────────────────────────────── */
@@ -2979,6 +3013,7 @@ static test_result_t test_repl_cli_cores_are_total(void) {
 const test_entry_t repl_entries[] = {
 #if defined(__linux__)
     { "repl/cli/cores_are_total",       test_repl_cli_cores_are_total,       NULL,       NULL          },
+    { "repl/cli/flags_reject_malformed", test_repl_cli_flags_reject_malformed, NULL,       NULL          },
 #endif
     /* file-batch entrypoint — ray_repl_run_file */
     { "repl/run_file/happy",            test_repl_run_file_happy,            repl_setup, repl_teardown },
