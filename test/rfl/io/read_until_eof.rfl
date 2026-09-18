@@ -1,0 +1,64 @@
+;; `read` / `read-bytes` must read until EOF, not to the size the file
+;; reports — issue #572.
+;;
+;; The size came from fseek/ftell, and everything under /proc and /sys
+;; reports 0 while yielding data when actually read.  The failure was
+;; silent: no error, no short-read signal, just a well-formed "" that any
+;; caller branching on the content would act on.  Sizing from the file also
+;; made an ordinary file that changed between the measure and the read an
+;; io error rather than a successful read.
+
+;; ────────────── pre-flight ──────────────
+(.sys.exec "rm -rf /tmp/rf_read_eof && mkdir -p /tmp/rf_read_eof")
+(.sys.exec "printf 'hello world\\n' > /tmp/rf_read_eof/ordinary.txt")
+(.sys.exec "printf '' > /tmp/rf_read_eof/empty.txt")
+(.sys.exec "head -c 300000 /dev/zero | tr '\\0' x > /tmp/rf_read_eof/big.txt")
+
+;; ────────────── ordinary files still behave ──────────────
+(read "/tmp/rf_read_eof/ordinary.txt")        -- "hello world\n"
+(count (read-bytes "/tmp/rf_read_eof/ordinary.txt")) -- 12
+
+;; A genuinely empty file is still "" — the fix must not turn absence of
+;; content into an error.
+(read "/tmp/rf_read_eof/empty.txt")           -- ""
+(count (read-bytes "/tmp/rf_read_eof/empty.txt")) -- 0
+
+;; Larger than any single growth step, to exercise the loop.
+(count (read "/tmp/rf_read_eof/big.txt"))       -- 300000
+(count (read-bytes "/tmp/rf_read_eof/big.txt")) -- 300000
+
+;; ────────────── files that report size 0 but have content ──────────────
+;; /proc/sys/kernel/hostname is the issue's own example: stat says 0, the
+;; kernel yields the host name.  Cross-checked against uname(1) so this
+;; asserts the right content, not merely that something was read.
+(> (count (read "/proc/sys/kernel/hostname")) 0) -- true
+(== (first (split (read "/proc/sys/kernel/hostname") "\n")) (first (split (get (.sys.exec "uname -n" 'out) 'out) "\n"))) -- true
+
+;; .sys.info's hostname comes from gethostname(2) rather than from procfs;
+;; the two must agree, which also ties #573's identity to this path.
+(== (get (.sys.info) 'hostname) (first (split (read "/proc/sys/kernel/hostname") "\n"))) -- true
+
+;; The entropy source the reporter actually wanted: a fresh UUID per read.
+(count (first (split (read "/proc/sys/kernel/random/uuid") "\n"))) -- 36
+;; Two reads of it must differ — proof we are reading the file, not a
+;; cached or truncated view of it.
+(== (read "/proc/sys/kernel/random/uuid") (read "/proc/sys/kernel/random/uuid")) -- false
+
+;; read-bytes takes the same path and must agree.
+(> (count (read-bytes "/proc/sys/kernel/hostname")) 0) -- true
+
+;; ────────────── pipes ──────────────
+;; A FIFO cannot be seeked, so sizing from the file made this an io error.
+;; Reading until EOF makes it work like any other stream.
+(.sys.exec "rm -f /tmp/rf_read_eof/fifo && mkfifo /tmp/rf_read_eof/fifo")
+(.sys.exec "(printf 'from-a-fifo\\n' > /tmp/rf_read_eof/fifo &) ; sleep 0")
+(read "/tmp/rf_read_eof/fifo") -- "from-a-fifo\n"
+
+;; ────────────── errors stay loud ──────────────
+(try (read "/tmp/rf_read_eof/does-not-exist") (fn [e] 'io-rejected)) -- 'io-rejected
+(try (read-bytes "/tmp/rf_read_eof/does-not-exist") (fn [e] 'io-rejected)) -- 'io-rejected
+;; A directory is not readable as a file.
+(try (read "/tmp/rf_read_eof") (fn [e] 'io-rejected)) -- 'io-rejected
+
+;; ────────────── cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rf_read_eof")

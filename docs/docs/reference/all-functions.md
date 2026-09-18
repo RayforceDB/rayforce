@@ -612,8 +612,8 @@ Printing, file I/O, CSV loading, and script execution.
 | `format` | variadic | — | Format value to string (% as placeholder) | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
-| `read` | unary | restricted | Read file contents as string | `(read "file.txt")` |
-| `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
+| `read` | unary | restricted | Read file contents as string, to EOF | `(read "/proc/self/cmdline")` |
+| `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector, to EOF | `(read-bytes "file.bin")` |
 | `write` | binary | restricted | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | restricted | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
 | `load` | unary | restricted | Load and evaluate a Rayfall script file. A relative path is tried against the working directory, then below `RAYFORCE_HOME` when set; absolute paths are used as given; a failure names every path tried | `(load "lib.rfl")` |

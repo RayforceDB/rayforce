@@ -2045,24 +2045,63 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
 
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
-    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return ray_error("io", NULL); }
-    long sz = ftell(fp);
-    if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
-    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return ray_error("io", NULL); }
 
-    ray_t* result = ray_vec_new(RAY_U8, (int64_t)sz);
+    /* Read until EOF rather than to the size the file reports (#572).
+     * Everything under /proc and /sys reports 0 while yielding data, so
+     * sizing the read made those files come back as a well-formed empty
+     * value — no error, no short-read signal, and a caller branching on
+     * the content silently took the wrong branch.  Seeking also fails
+     * outright on a FIFO, and an ordinary file that changed size between
+     * the measure and the read became a spurious io error.
+     *
+     * The reported size is still worth having: where it is positive it is
+     * an exact capacity hint, so the common case does one allocation and
+     * one read with no growth. */
+    long hint = 0;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        hint = ftell(fp);
+        /* A directory seeks fine and reports LONG_MAX here, so an
+         * implausible hint is treated as no hint rather than trusted into
+         * an overflow.  The read itself is what rejects a directory: fread
+         * sets the error flag (EISDIR) and we return io. */
+        if (hint < 0 || hint > (long)(INT64_MAX / 2) || fseek(fp, 0, SEEK_SET) != 0)
+            hint = 0;
+    }
+    /* Unseekable (pipe, character device) or size-0-but-readable: start at
+     * a page and grow.  The extra byte on a hinted read is what lets a
+     * single fread distinguish "exactly the hinted size" from "more than
+     * the hint", so a file that grew is read whole instead of truncated. */
+    int64_t cap = hint > 0 ? (int64_t)hint + 1 : 4096;
+
+    ray_t* result = ray_vec_new(RAY_U8, cap);
     if (!result || RAY_IS_ERR(result)) {
         fclose(fp);
         return result ? result : ray_error("oom", NULL);
     }
-    result->len = (int64_t)sz;
 
-    size_t rd = sz > 0 ? fread(ray_data(result), 1, (size_t)sz, fp) : 0;
-    int close_rc = fclose(fp);
-    if (rd != (size_t)sz || close_rc != 0) {
-        ray_release(result);
-        return ray_error("io", NULL);
+    int64_t len = 0;
+    for (;;) {
+        if (len == cap) {
+            int64_t ncap = cap * 2;
+            ray_t* grown = ray_vec_new(RAY_U8, ncap);
+            if (!grown || RAY_IS_ERR(grown)) {
+                ray_release(result); fclose(fp);
+                return grown ? grown : ray_error("oom", NULL);
+            }
+            memcpy(ray_data(grown), ray_data(result), (size_t)len);
+            ray_release(result);
+            result = grown; cap = ncap;
+        }
+        size_t got = fread((uint8_t*)ray_data(result) + len, 1, (size_t)(cap - len), fp);
+        len += (int64_t)got;
+        if (got == 0) {
+            if (ferror(fp)) { ray_release(result); fclose(fp); return ray_error("io", NULL); }
+            break;  /* EOF */
+        }
     }
+
+    if (fclose(fp) != 0) { ray_release(result); return ray_error("io", NULL); }
+    result->len = len;
     return result;
 }
 
