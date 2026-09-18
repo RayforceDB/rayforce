@@ -808,6 +808,10 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
 }
 
 /* (system cmd) -- run shell command, return exit code */
+/* Both helpers exist only for the live .sys.exec path, which RAY_FUZZING
+ * compiles out — guard them so the fuzz build does not trip
+ * -Werror,-Wunused-function. */
+#ifndef RAY_FUZZING
 /* Turn a wait(2)-style status into the exit code a shell would report.
  * system() and pclose() hand back an encoded status, not a code: "exit 3"
  * arrives as 768 (3 << 8).  Signals follow the shell's 128+N convention, so
@@ -858,6 +862,8 @@ static ray_t* exec_capture(const char* cmd, int64_t* code_out) {
     return out;
 }
 
+#endif /* !RAY_FUZZING */
+
 /* (.sys.exec cmd)      -> exit code
  * (.sys.exec cmd 'out) -> {code: <exit code> out: <stdout>}
  *
@@ -905,7 +911,16 @@ ray_t* ray_system_fn(ray_t** args, int64_t n) {
 
     ray_t* result;
     if (!capture) {
-        result = make_i64(exec_exit_code(system(cmd)));
+        int rc = system(cmd);
+        /* -1 means the shell could not be started at all.  Decoding it would
+         * yield 128+127 = 255 — indistinguishable from a command that really
+         * exited 255 — so report it the way the capture path reports its
+         * equivalent pclose failure. */
+        if (rc == -1) {
+            if (heapbuf) ray_free_raw(heapbuf);
+            return ray_error("io", ".sys.exec: failed to run command: %s", strerror(errno));
+        }
+        result = make_i64(exec_exit_code(rc));
     } else {
         int64_t code = 0;
         ray_t* out = exec_capture(cmd, &code);
@@ -913,7 +928,13 @@ ray_t* ray_system_fn(ray_t** args, int64_t n) {
             result = out;
         } else {
             ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
-            ray_t* vals = ray_list_new(2);
+            ray_t* vals = RAY_IS_ERR(keys) ? keys : ray_list_new(2);
+            if (RAY_IS_ERR(keys) || RAY_IS_ERR(vals)) {
+                if (!RAY_IS_ERR(keys)) ray_release(keys);
+                ray_release(out);
+                if (heapbuf) ray_free_raw(heapbuf);
+                return RAY_IS_ERR(keys) ? keys : vals;
+            }
             int64_t k1 = ray_sym_intern("code", 4);
             keys = ray_vec_append(keys, &k1);
             ray_t* v1 = make_i64(code);

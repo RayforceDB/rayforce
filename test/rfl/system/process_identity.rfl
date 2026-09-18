@@ -16,7 +16,12 @@
 (> (get (.sys.info) 'pid) 0)              -- true
 
 (type (get (.sys.info) 'hostname))        -- 'str
-(> (count (get (.sys.info) 'hostname)) 0) -- true
+;; Cross-check the value rather than merely asserting it is non-empty: the
+;; implementation deliberately degrades to "" when the platform cannot
+;; answer, so a non-empty assertion would be testing something it does not
+;; promise.  Comparing against uname(1) tests what actually matters — that
+;; when we do report a hostname, it is the right one.
+(== (get (.sys.info) 'hostname) (first (split (get (.sys.exec "uname -n" 'out) 'out) "\n"))) -- true
 
 ;; Stable within a process — it is our pid, not a fresh child's.
 (== (get (.sys.info) 'pid) (get (.sys.info) 'pid)) -- true
@@ -45,8 +50,10 @@
 ;; No output is an empty string, not a null or a missing key.
 (get (.sys.exec "true" 'out) 'out) -- ""
 
-;; Output larger than one read buffer comes back whole.
-(count (get (.sys.exec "printf 'x%.0s' $(seq 1 100000)" 'out) 'out)) -- 100000
+;; Output larger than one read buffer (4096) comes back whole.  Produced by a
+;; pipe rather than by expanding 100k argv words, which would lean on `seq`
+;; and on ARG_MAX rather than on the growth behaviour under test.
+(count (get (.sys.exec "head -c 100000 /dev/zero | tr '\\0' x" 'out) 'out)) -- 100000
 
 ;; stderr is not captured — it stays on the process's own stderr, so a
 ;; command that only writes there yields an empty capture.
@@ -60,3 +67,7 @@
 ;; host + pid + wall clock is a diagnosable epoch: no temp file, no umask
 ;; dance, no cleanup, and reading it tells you which process it names.
 (> (count (format "%-%-%" (get (.sys.info) 'hostname) (get (.sys.info) 'pid) (timestamp 'global))) 0) -- true
+
+;; A command the shell cannot run at all is an io error, not a decoded 255 —
+;; otherwise it is indistinguishable from a command that genuinely exited 255.
+(.sys.exec "exit 255") -- 255
