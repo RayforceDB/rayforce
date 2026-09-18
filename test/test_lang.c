@@ -9105,6 +9105,34 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
 #endif
 }
 
+/* .sys.exec's capture faces the same endless-stream problem as `read`: a
+ * command that never stops writing has no EOF to reach.  Same ceiling, so
+ * assert it is actually wired up rather than only present in `read` (#579). */
+static test_result_t test_exec_capture_is_bounded(void) {
+#if defined(RAY_OS_WINDOWS) || defined(RAY_FUZZING)
+    SKIP("shell capture unavailable");
+#else
+    int64_t saved = ray_heap_anon_watermark();
+    bool was_default = (saved == ray_sys_total_ram());
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
+
+    ray_t* args[2];
+    args[0] = ray_str("cat /dev/zero", 13);
+    args[1] = ray_sym(ray_sym_intern("out", 3));
+    ray_t* got = ray_system_fn(args, 2);
+    ray_release(args[0]);
+    ray_release(args[1]);
+
+    ray_heap_set_anon_watermark(was_default ? 0 : saved);
+
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT(RAY_IS_ERR(got), "an endless command must not be captured without end");
+    TEST_ASSERT_STR_EQ(ray_err_code(got), "io");
+    ray_error_free(got);
+    PASS();
+#endif
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
@@ -9523,6 +9551,7 @@ const test_entry_t lang_entries[] = {
 
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
+    { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

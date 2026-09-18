@@ -278,6 +278,27 @@ or did not complete), `oom`.
 (.sys.exec "echo partial; exit 4" 'out)  ;; => {code: 4, out: "partial\n"}
 ```
 
+!!! warning "`'out` waits for every process holding the pipe"
+    The capture reads until end-of-file on the command's stdout, and a
+    backgrounded child inherits that pipe. So `'out` waits for the background
+    process too, not just for the shell:
+
+    ```lisp
+    (.sys.exec "(sleep 3 &) ; true" 'out)           ;; returns after 3s
+    (.sys.exec "./server &" 'out)                   ;; waits for the server
+    ```
+
+    Detach the child's stdout and the call returns at once:
+
+    ```lisp
+    (.sys.exec "(sleep 3 &) >/dev/null 2>&1" 'out)  ;; returns immediately
+    ```
+
+    This is inherent to capturing output — `popen(3)` behaves the same way, as
+    do the equivalents in other languages. The one-argument form does **not**
+    have it, since it only waits for the shell itself, so prefer plain
+    `(.sys.exec "./server &")` to launch something that outlives the call.
+
 !!! warning "Behaviour change"
     Before this, the one-argument form returned the raw `waitpid`-encoded
     status, so `(.sys.exec "false")` was `256` and `(.sys.exec "exit 3")` was
