@@ -592,6 +592,40 @@ static test_result_t test_table_accessors_wrong_type(void) {
     PASS();
 }
 
+/* ray_table_add_col is the one mutator that cannot answer "empty": it consumes
+ * its table ref and returns an owned result, so the wrong-tag answer has to be
+ * a typed error, matching the bad-column path right beside it.  Handed a
+ * non-table it previously ran ray_cow then wrote new slot pointers straight
+ * into the argument's payload — the same #567 hazard, but corrupting rather
+ * than only crashing. */
+static test_result_t test_table_add_col_wrong_type(void) {
+    int64_t poison[] = {0x4141414141414141LL, 0x4141414141414141LL,
+                        0x4141414141414141LL, 0x4141414141414141LL};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, poison, 4);
+    TEST_ASSERT_NOT_NULL(vec);
+
+    int64_t col_raw[] = {1, 2, 3};
+    ray_t* col = ray_vec_from_raw(RAY_I64, col_raw, 3);
+    TEST_ASSERT_NOT_NULL(col);
+
+    /* add_col consumes one ref of its first argument, so hand it one of ours
+     * and keep the reference we assert through afterwards. */
+    ray_retain(vec);
+    ray_t* res = ray_table_add_col(vec, ray_sym_intern("c", 1), col);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(res));
+    TEST_ASSERT_STR_EQ(ray_err_code(res), "type");
+
+    /* And the payload it would have decoded is untouched. */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(vec))[0], 0x4141414141414141LL);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(vec))[1], 0x4141414141414141LL);
+
+    ray_error_free(res);
+    ray_release(col);
+    ray_release(vec);
+    PASS();
+}
+
 /* A dict shares the table's two-slot layout, so the accessors would happily
  * read real pointers out of it and answer with a dict's shape.  The tag is the
  * only thing separating the two; assert it is honoured. */
@@ -608,6 +642,25 @@ static test_result_t test_table_accessors_reject_dict(void) {
     TEST_ASSERT_EQ_I(ray_table_ncols(d), 0);
     TEST_ASSERT_EQ_I(ray_table_nrows(d), 0);
     TEST_ASSERT_NULL(ray_table_schema(d));
+    TEST_ASSERT_NULL(ray_table_get_col(d, ray_sym_intern("c", 1)));
+    TEST_ASSERT_NULL(ray_table_get_col_idx(d, 0));
+    TEST_ASSERT_EQ_I(ray_table_col_name(d, 0), -1);
+
+    /* Mutators would otherwise write through the dict's real slot pointers. */
+    ray_table_set_col_name(d, 0, ray_sym_intern("c", 1));
+    ray_table_set_col_idx(d, 0, d);
+    TEST_ASSERT_EQ_I(ray_dict_len(d), 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_dict_keys(d)))[0], 1);
+
+    int64_t col_raw[] = {1, 2, 3};
+    ray_t* col = ray_vec_from_raw(RAY_I64, col_raw, 3);
+    ray_retain(d);
+    ray_t* res = ray_table_add_col(d, ray_sym_intern("c", 1), col);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(res));
+    TEST_ASSERT_STR_EQ(ray_err_code(res), "type");
+    TEST_ASSERT_EQ_I(ray_dict_len(d), 3);
+    ray_error_free(res);
+    ray_release(col);
 
     ray_release(d);
     PASS();
@@ -665,6 +718,7 @@ const test_entry_t table_entries[] = {
     { "table/set_col_name_shared", test_table_set_col_name_shared, table_setup, table_teardown },
     { "table/accessors_null_and_err", test_table_accessors_null_and_err, table_setup, table_teardown },
     { "table/accessors_wrong_type", test_table_accessors_wrong_type, table_setup, table_teardown },
+    { "table/add_col_wrong_type", test_table_add_col_wrong_type, table_setup, table_teardown },
     { "table/accessors_reject_dict", test_table_accessors_reject_dict, table_setup, table_teardown },
     { "table/parted_nrows_plain_vec", test_parted_nrows_plain_vec, table_setup, table_teardown },
     { "table/nrows_empty_col", test_table_nrows_empty_col, table_setup, table_teardown },

@@ -130,6 +130,17 @@ ray_t* ray_table_new(int64_t ncols) {
 
 ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    /* Unlike the accessors, this consumes `tbl` and owns its result, so the
+     * wrong-tag answer has to be a typed error rather than an empty one —
+     * same consume-and-error contract as the bad-column path below.  Without
+     * it a non-table gets ray_cow'd and then has slot pointers written into
+     * its payload (#567). */
+    if (tbl->type != RAY_TABLE) {
+        ray_t* err = ray_error("type", "table add_col: expected table, got %s",
+                               ray_type_name(tbl->type));
+        ray_release(tbl);
+        return err;
+    }
     if (!table_col_is_valid(col_vec)) {
         ray_release(tbl);
         return ray_error("domain", "table add_col: column must be list/vector-like, got %s",

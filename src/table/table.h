@@ -27,7 +27,7 @@
 /*
  * table.h -- Table operations.
  *
- * A table has type = RAY_TABLE (13), len = current column count.
+ * A table has type = RAY_TABLE (98), len = current column count.
  * Data region: first sizeof(ray_t*) bytes = pointer to schema (I64 vector
  * of column name symbol IDs), then ncols * sizeof(ray_t*) = column vector
  * pointers.
