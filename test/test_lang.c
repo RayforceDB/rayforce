@@ -8698,6 +8698,67 @@ static test_result_t test_builtin_group_guid_rfl(void) {
 
 /* ── builtins.c coverage: ray_group_indices_fn empty and list ───────────────
  * Covers empty vector and RAY_LIST paths in ray_group_indices_fn. */
+/* ---- Test: derived symbol key over a FILE domain, several chunks ----
+ * The per-distinct-symbol key evaluation over a file-backed column runs
+ * the expression over the vocabulary bytes a chunk at a time.  With the
+ * chunk shrunk to 100 values, a 200-value vocabulary crosses chunk
+ * boundaries; the groups and aggregates must equal the in-memory answer. */
+static test_result_t test_select_derived_key_file_chunks(void) {
+    ray_t* r = ray_eval_str(
+        "(do (set __dk_i (til 20000)) "
+        "    (set __dk_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
+        "    (set __dk_mk (fn [k] ((fn [j] (if (== 0 (% j 11)) \"\" (if (== 0 (% j 7)) "
+        "        (format \"https://www.%/p/%\" (at __dk_hosts (% (* 31 j) 37)) (% j 13)) "
+        "        (if (== 0 (% j 5)) (at __dk_hosts (% (* 31 j) 37)) "
+        "        (format \"http://%/a/%\" (at __dk_hosts (% (* 31 j) 37)) (% j 17)))))) (% k 500)))) "
+        "    (set __dk_T (table [ref v] (list (as 'SYMBOL (map __dk_mk __dk_i)) (as 'F64 (% (* __dk_i 7) 101))))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_dk_chunks/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_dk_chunks/\" __dk_T) "
+        "    (set __dk_F (.db.splayed.get \"/tmp/rf_test_dk_chunks/\")) "
+        "    (set __dk_keyq (fn [t] (select {from: t by: (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "        (let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
+        "        c: (count ref) sv: (sum v) mn: (min ref) where: (!= ref \"\")}))) "
+        "    (set __dk_ora (fn [t] (select {from: (select {from: t p: (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "        (let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
+        "        ref: ref v: v where: (!= ref \"\")}) by: p c: (count ref) sv: (sum v) mn: (min ref)}))) "
+        "    (set __dk_fp (fn [r] (ser (xasc (xasc (table [k c sv mn] (list (at (value r) 0) (at r 'c) (at r 'sv) (at r 'mn))) 'mn) 'c)))) "
+        "    (count (distinct (at __dk_F 'ref))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 414);              /* vocabulary of 414 values */
+    ray_release(r);
+
+    ray_derived_key_chunk_set_for_test(100);    /* five chunks over the vocabulary */
+    ray_t* same = ray_eval_str("(all (== (__dk_fp (__dk_keyq __dk_F)) (__dk_fp (__dk_ora __dk_T))))");
+    ray_t* cols = ray_eval_str("(at (cols (__dk_keyq __dk_F)) 0)");
+    ray_derived_key_chunk_set_for_test(0);
+
+    ray_t* seven = ray_eval_str("(do (set __dk_r7 (__dk_keyq __dk_F)) 0)");
+    ray_release(seven);
+    ray_derived_key_chunk_set_for_test(7);      /* 60 chunks, the last one short */
+    ray_t* same7 = ray_eval_str("(all (== (__dk_fp (__dk_keyq __dk_F)) (__dk_fp __dk_r7)))");
+    ray_derived_key_chunk_set_for_test(0);
+    ray_t* cleanup = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_test_dk_chunks/\")");
+    ray_release(cleanup);
+
+    TEST_ASSERT_NOT_NULL(same);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(same));
+    TEST_ASSERT_EQ_I(same->type, -RAY_BOOL);
+    TEST_ASSERT_TRUE(same->b8);
+    TEST_ASSERT_NOT_NULL(cols);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cols));
+    TEST_ASSERT_EQ_I(cols->i64, ray_sym_intern("p", 1));
+    TEST_ASSERT_NOT_NULL(same7);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(same7));
+    TEST_ASSERT_TRUE(same7->b8);
+    ray_release(same);
+    ray_release(cols);
+    ray_release(same7);
+    PASS();
+}
+
 static test_result_t test_builtin_group_empty_and_list(void) {
     /* Empty group */
     ASSERT_EQ("(count (key (group [])))", "0");
@@ -9538,6 +9599,7 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/idiv_rfl",            test_builtin_idiv_rfl,            lang_setup, lang_teardown },
     { "lang/builtin/group_guid_rfl",      test_builtin_group_guid_rfl,      lang_setup, lang_teardown },
     { "lang/builtin/group_empty_list",    test_builtin_group_empty_and_list, lang_setup, lang_teardown },
+    { "lang/select/derived_key_file_chunks", test_select_derived_key_file_chunks, lang_setup, lang_teardown },
     { "lang/temporal/extract_builtins_fn",      test_temporal_extract_builtins_fn,      lang_setup, lang_teardown },
     { "lang/temporal/extract_time_atom",        test_temporal_extract_time_atom,        lang_setup, lang_teardown },
     { "lang/temporal/extract_time_vector",      test_temporal_extract_time_vector,      lang_setup, lang_teardown },

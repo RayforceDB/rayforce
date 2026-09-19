@@ -1504,8 +1504,18 @@ typedef struct {
      * more — consumers take .desc at face value, and the desc-only
      * keep-min trims are gated off entirely when it is 0. */
     uint8_t  desc;
+    /* Evaluation depth (__VM->eval_depth) of the select whose group node
+     * this filter targets.  The filter is thread-local and stays armed while
+     * an arming select evaluates its `from:` (the "having" shape arms it for
+     * the DIRECT child select), so grouped selects nested deeper would see
+     * it too; consumers read it through ray_group_emit_filter_active(),
+     * which returns it only at this depth. */
+    int32_t  target_depth;
 } ray_group_emit_filter_t;
 ray_group_emit_filter_t ray_group_emit_filter_get(void);
+/* The armed filter when the calling thread's eval depth is its target
+ * depth (or no VM is bound); a disabled filter otherwise. */
+ray_group_emit_filter_t ray_group_emit_filter_active(void);
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter);
 /* Hash-aggregate rows [start, end) into ht.
  *

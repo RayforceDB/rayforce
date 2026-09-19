@@ -2009,15 +2009,33 @@ static int sg_agg_expr_ok(ray_t* expr) {
     return 0;
 }
 
+/* Aggregate shapes the hidden-slot compiler accepts: unary aggregates,
+ * binary aggregates over two bare columns (pearson, covariance, wsum, ...),
+ * and quantile with its literal probability.  List-valued top/bottom K and
+ * anything wider keep the per-group scatter path, whose element-wise
+ * semantics differ from a post-group column expression. */
+static int hidden_agg_shape_ok(ray_t* expr) {
+    int64_t n = ray_len(expr);
+    if (n == 2) return 1;
+    if (n != 3) return 0;
+    ray_t** e = (ray_t**)ray_data(expr);
+    uint16_t op = resolve_agg_opcode(e[0]->i64);
+    if (agg_is_binary_agg(op))
+        return e[1] && e[1]->type == -RAY_SYM && !(e[1]->attrs & ATTR_QUOTED) &&
+               e[2] && e[2]->type == -RAY_SYM && !(e[2]->attrs & ATTR_QUOTED);
+    return op == OP_QUANTILE;
+}
+
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
     if (!*ok || !expr) { *ok = 0; return NULL; }
     if (expr->type == RAY_LIST && is_group_dag_agg_expr(expr) &&
-        ray_len(expr) == 2) {
+        hidden_agg_shape_ok(expr)) {
         ray_t** el = (ray_t**)ray_data(expr);
         /* nested agg inside the agg argument: not a DAG shape — bail */
         if (expr_contains_agg(el[1])) { *ok = 0; return NULL; }
+        if (ray_len(expr) > 2 && expr_contains_agg(el[2])) { *ok = 0; return NULL; }
         if (*n_hidden >= cap) { *ok = 0; return NULL; }
         char buf[24];
         int bn = snprintf(buf, sizeof buf, "__ha%d", *n_hidden);
@@ -2083,6 +2101,23 @@ static ray_t* try_decompose_agg_arith(ray_t* val_expr, ray_t* tbl,
         return NULL;
     }
     return rw;
+}
+
+/* Dry run of the arith-of-aggs decomposition: true when `expr` is an
+ * arithmetic combination of DAG-shaped aggregates that the hidden-slot path
+ * evaluates after grouping.  Routing consults this before deciding that a
+ * non-aggregate output needs the per-group scatter or eval-level grouping;
+ * the real rewrite runs later in the classification pass. */
+static int is_decomposable_agg_compound(ray_t* expr, ray_t* tbl) {
+    enum { PROBE_CAP = 64 };
+    ray_t* hexprs[PROBE_CAP];
+    int64_t hnames[PROBE_CAP];
+    int n_hidden = 0;
+    ray_t* rw = try_decompose_agg_arith(expr, tbl, hexprs, hnames,
+                                        &n_hidden, PROBE_CAP);
+    if (!rw) return 0;
+    ray_release(rw);
+    return 1;
 }
 
 static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len) {
@@ -2884,6 +2919,134 @@ static int64_t derived_key_name(ray_t* by_expr) {
     return ray_sym_intern("key", 3);
 }
 #define DERIVED_KEY_MAX_DOMAIN (64LL * 1024 * 1024)
+/* The distinct-symbol evaluation, in chunks and over STR.
+ *
+ * Feeding the DAG a SYM column whose ids live in a FILE domain makes every
+ * string step of the expression a permanent cost: substr/str-find intern
+ * each distinct result into the global runtime table (with the dotted
+ * split, about 1 KB per URL) and an `if` that keeps the column itself
+ * translates its cells into runtime ids too.  Over a 20M-entry vocabulary
+ * that is tens of GB that never come back.
+ *
+ * Here the referenced column is presented to the same DAG as a STR column
+ * built from the raw vocabulary bytes, CHUNK rows at a time: every
+ * intermediate is then a chunk-sized STR vector that dies with the chunk,
+ * and only the FINAL key strings are interned — once per distinct value,
+ * exactly the ids the SYM evaluation would have produced for them.
+ * Applies only when the expression's result over the SYM column is SYM
+ * (so the interned result has the type the caller expects) and the
+ * column's vocabulary is readable through the raw snapshot.  Any other
+ * shape returns NULL and the caller takes the one-shot SYM evaluation. */
+/* Chunk length in distinct values: 256 dispatch rounds of morsels (2M
+ * rows).  Enough rows for the pooled string ops to spread over the
+ * workers, while every chunk-scoped STR intermediate stays in the
+ * low hundreds of MB at URL-sized strings. */
+#define DERIVED_KEY_CHUNK ((int64_t)RAY_MORSEL_ELEMS * RAY_DISPATCH_MORSELS * 256)
+#ifdef DEBUG
+static int64_t g_derived_key_chunk_test = 0;
+/* Test seam: a positive value replaces the chunk length until reset to 0,
+ * so a test can drive several chunks through a small vocabulary. */
+void ray_derived_key_chunk_set_for_test(int64_t rows) {
+    g_derived_key_chunk_test = rows > 0 ? rows : 0;
+}
+#endif
+static int64_t derived_key_chunk_rows(void) {
+#ifdef DEBUG
+    if (g_derived_key_chunk_test > 0) return g_derived_key_chunk_test;
+#endif
+    return DERIVED_KEY_CHUNK;
+}
+static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
+                                     struct ray_sym_domain_s* dom, int64_t du) {
+    if (!dom || dom == ray_sym_runtime_domain() || du <= 0) return NULL;
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(dom, &raw)) return NULL;
+
+    /* The result type the SYM evaluation would give: compile (only) the
+     * expression against the SYM column. */
+    int8_t sym_out = 0;
+    {
+        ray_t* probe = ray_table_new(0);
+        /* add_col retains the column itself; the caller keeps its own ref. */
+        if (probe && !RAY_IS_ERR(probe)) probe = ray_table_add_col(probe, col_sym, dom_vec);
+        if (!probe || RAY_IS_ERR(probe)) { if (probe) ray_error_free(probe); goto unpin_null; }
+        ray_graph_t* gp = ray_graph_new(probe);
+        if (gp) {
+            ray_op_t* kop = compile_expr_dag(gp, by_expr);
+            if (kop) sym_out = kop->out_type;
+            ray_graph_free(gp);
+        }
+        ray_release(probe);
+    }
+    if (sym_out != RAY_SYM) goto unpin_null;
+
+    ray_t* key_dom = ray_vec_new(RAY_SYM, du);
+    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); goto unpin_null; }
+    key_dom->len = du;
+    int64_t* kd = (int64_t*)ray_data(key_dom);
+    const void* dv = ray_data(dom_vec);
+
+    const int64_t chunk = derived_key_chunk_rows();
+    for (int64_t lo = 0; lo < du; lo += chunk) {
+        int64_t n = du - lo < chunk ? du - lo : chunk;
+        ray_t* sv = ray_vec_new(RAY_STR, n);
+        if (!sv || RAY_IS_ERR(sv)) { if (sv) ray_error_free(sv); goto fail; }
+        for (int64_t i = 0; i < n; i++) {
+            int64_t pos = ray_read_sym(dv, lo + i, dom_vec->type, dom_vec->attrs);
+            const char* sp = NULL;
+            size_t sl = 0;
+            if (pos >= 0 && pos < raw.count) {
+                sp = ray_sym_domain_raw_str(&raw, pos, &sl);
+            } else {
+                ray_t* a = ray_sym_domain_str(dom, pos);
+                if (a) { sp = ray_str_ptr(a); sl = ray_str_len(a); }
+            }
+            sv = ray_str_vec_append(sv, sp ? sp : "", sp ? sl : 0);
+            if (!sv || RAY_IS_ERR(sv)) { if (sv) ray_error_free(sv); goto fail; }
+        }
+        ray_t* mini = ray_table_new(0);
+        if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, col_sym, sv);
+        ray_release(sv);
+        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); goto fail; }
+        ray_t* kc = NULL;
+        ray_graph_t* g2 = ray_graph_new(mini);
+        if (g2) {
+            ray_op_t* kop = compile_expr_dag(g2, by_expr);
+            if (kop) kop = ray_optimize(g2, kop);
+            if (kop) kc = ray_execute(g2, kop);
+            ray_graph_free(g2);
+        }
+        ray_release(mini);
+        if (kc && !RAY_IS_ERR(kc) && ray_is_lazy(kc)) kc = ray_lazy_materialize(kc);
+        if (!kc || RAY_IS_ERR(kc)) { if (kc) ray_error_free(kc); goto fail; }
+        if (!ray_is_vec(kc) || kc->len != n) { ray_release(kc); goto fail; }
+        if (kc->type == RAY_STR) {
+            for (int64_t i = 0; i < n; i++) {
+                size_t sl = 0;
+                const char* sp = ray_str_vec_get(kc, i, &sl);
+                int64_t id = ray_sym_intern(sp ? sp : "", sp ? sl : 0);
+                if (id < 0) { ray_release(kc); goto fail; }
+                kd[lo + i] = id;
+            }
+        } else if (RAY_IS_SYM(kc->type)) {
+            /* The STR evaluation still produced symbols (e.g. a literal
+             * symbol branch): take them cell by cell as runtime ids. */
+            for (int64_t i = 0; i < n; i++)
+                kd[lo + i] = sym_cell_runtime_id(kc, i);
+        } else {
+            ray_release(kc);
+            goto fail;
+        }
+        ray_release(kc);
+    }
+    ray_sym_domain_raw_unpin(dom);
+    return key_dom;
+fail:
+    ray_release(key_dom);
+unpin_null:
+    ray_sym_domain_raw_unpin(dom);
+    return NULL;
+}
 static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
     int64_t ref_syms[2];
@@ -2956,22 +3119,27 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     /* Evaluate the expression over the du distinct symbols through the
      * same DAG compiler the row-wise key would take, against a one-column
      * table holding the distinct vector under the referenced name. */
-    ray_t* key_dom = NULL;
-    ray_t* mini = ray_table_new(0);
-    if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
-    ray_release(dom_vec);
-    if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
-    ray_graph_t* g2 = ray_graph_new(mini);
-    if (g2) {
-        ray_op_t* kop = compile_expr_dag(g2, by_expr);
-        if (kop) kop = ray_optimize(g2, kop);
-        if (kop) key_dom = ray_execute(g2, kop);
-        ray_graph_free(g2);
+    ray_t* key_dom = derived_key_str_chunks(by_expr, ref_syms[0], dom_vec, dom, du);
+    if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
+    if (key_dom) {
+        ray_release(dom_vec);
+    } else {
+        ray_t* mini = ray_table_new(0);
+        if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
+        ray_release(dom_vec);
+        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
+        ray_graph_t* g2 = ray_graph_new(mini);
+        if (g2) {
+            ray_op_t* kop = compile_expr_dag(g2, by_expr);
+            if (kop) kop = ray_optimize(g2, kop);
+            if (kop) key_dom = ray_execute(g2, kop);
+            ray_graph_free(g2);
+        }
+        ray_release(mini);
+        if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
+        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
+        if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
     }
-    ray_release(mini);
-    if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
-    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
-    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
 
     /* Pass 2: spread by slot. */
     ray_t* ids = ray_vec_new(RAY_I64, nrows);
@@ -4184,6 +4352,7 @@ static ray_t* try_count_distinct_v2_rewrite(
          * so set it explicitly instead of leaning on a zero default that
          * used to be coerced to desc inside group.c. */
         emit_f.desc = 1;
+        emit_f.target_depth = __VM ? __VM->eval_depth : 0;   /* executed right here */
         ray_group_emit_filter_set(emit_f);
         emit_set = 1;
     }
@@ -6052,8 +6221,11 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     ray_group_emit_filter_t emit_filter = {0};
     bool emit_filter_set = match_group_count_emit_filter(
         from_expr, where_expr, &emit_filter);
-    if (emit_filter_set)
+    if (emit_filter_set) {
+        /* armed for the DIRECT child select evaluated by the from: below */
+        emit_filter.target_depth = (__VM ? __VM->eval_depth : 0) + 1;
         ray_group_emit_filter_set(emit_filter);
+    }
     /* Projection pushdown: publish the columns this select references so an
      * IMMEDIATE nested `select {by:}` distinct in `from:` (eval_depth+1) carries
      * only those.  Stack buffer stays live across the from: eval; save/restore
@@ -7465,6 +7637,10 @@ by_dict_done:
                 if (is_single_group_key_projection(by_expr, dict_elems[i + 1]))
                     continue;
                 if (is_group_dag_agg_expr(dict_elems[i + 1])) continue;
+                /* Arithmetic over aggregates is served by hidden agg slots
+                 * plus one post-group evaluation on any key shape; it must
+                 * not push multi-key queries onto eval-level grouping. */
+                if (is_decomposable_agg_compound(dict_elems[i + 1], tbl)) continue;
                 any_nonagg = 1;
                 if (can_atom_broadcast(dict_elems[i + 1])) continue;
                 if (!match_count_distinct(dict_elems[i + 1])) { any_true_nonagg = 1; break; }
@@ -9368,7 +9544,25 @@ by_dict_done:
             }
             agg_ins2[n_aggs] = NULL;
             agg_k[n_aggs] = 0;
-            if (hop == OP_TOP_N || hop == OP_BOT_N) {
+            if (agg_is_binary_agg(hop)) {
+                /* hidden_agg_shape_ok admitted two bare column arguments */
+                agg_ins2[n_aggs] = compile_expr_dag(g, he[2]);
+                if (!agg_ins2[n_aggs]) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument");
+                }
+                if (agg_ins2[n_aggs]->out_type > 0 &&
+                    !agg_type_admitted(hop, agg_ins2[n_aggs]->out_type)) {
+                    int8_t in_t = agg_ins2[n_aggs]->out_type;
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select by: binary aggregation does not admit second input type %s", ray_type_name(in_t));
+                }
+                has_binary_agg = 1;
+            } else if (hop == OP_TOP_N || hop == OP_BOT_N) {
                 has_list_agg = 1;
                 if (ray_len(hidden_agg_exprs[hi]) < 3) {
                     for (int ci = 0; ci < n_compound; ci++)
@@ -10439,6 +10633,7 @@ by_dict_done:
     bool self_emit_set = false;
     if (pre_top_emit_matched) {
         prev_self_emit = ray_group_emit_filter_get();
+        pre_top_emit.target_depth = __VM ? __VM->eval_depth : 0;   /* our own group node */
         ray_group_emit_filter_set(pre_top_emit);
         self_emit_set = true;
     }
