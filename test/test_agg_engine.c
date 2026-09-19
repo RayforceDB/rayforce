@@ -2078,14 +2078,14 @@ static test_result_t test_group_values_f64(void) {
     ray_valid_t valid = { vals, RAY_I64, false };
     vt->update_batch(states, STRIDE, gids, vals, &valid, 6, NULL);
     double out[4];
-    TEST_ASSERT_TRUE(agg_group_values_f64(vt, states, STRIDE, 0, NULL, 3, 0, 1, out));
+    TEST_ASSERT_TRUE(agg_group_values_f64(vt, states, STRIDE, 0, NULL, 3, 0, out));
     TEST_ASSERT_TRUE(out[0] == 10 && out[1] == 3 && out[2] == 15);
     /* slot list picks groups 2 and 0 */
     int64_t slots[] = {2, 0};
-    TEST_ASSERT_TRUE(agg_group_values_f64(vt, states, STRIDE, 0, slots, 2, 0, 1, out));
+    TEST_ASSERT_TRUE(agg_group_values_f64(vt, states, STRIDE, 0, slots, 2, 0, out));
     TEST_ASSERT_TRUE(out[0] == 15 && out[1] == 10);
-    /* a group whose only input is null finalizes to a null minimum: it sinks
-     * below every value for desc and above every value for asc */
+    /* a group whose only input is null finalizes to a null minimum: it maps
+     * below every value, where the sort ranks nulls (first asc, last desc) */
     const agg_vtable_t* mn = agg_resolve(OP_MIN, RAY_I64);
     TEST_ASSERT_NOT_NULL(mn);
     for (int i = 0; i < 4; i++) mn->init(states + i * STRIDE);
@@ -2093,13 +2093,11 @@ static test_result_t test_group_values_f64(void) {
     int64_t mvals[] = {7, 2, NULL_I64};
     ray_valid_t mvalid = { mvals, RAY_I64, true };
     mn->update_batch(states, STRIDE, mgids, mvals, &mvalid, 3, NULL);
-    TEST_ASSERT_TRUE(agg_group_values_f64(mn, states, STRIDE, 0, NULL, 4, 0, 1, out));
+    TEST_ASSERT_TRUE(agg_group_values_f64(mn, states, STRIDE, 0, NULL, 4, 0, out));
     TEST_ASSERT_TRUE(out[0] == 7 && out[1] == 2 && out[3] < out[1]);
-    TEST_ASSERT_TRUE(agg_group_values_f64(mn, states, STRIDE, 0, NULL, 4, 0, 0, out));
-    TEST_ASSERT_TRUE(out[3] > out[0]);
     /* a list-valued aggregate has no scalar view */
     const agg_vtable_t* top = agg_resolve(OP_TOP_N, RAY_I64);
-    if (top) TEST_ASSERT_FALSE(agg_group_values_f64(top, states, STRIDE, 0, NULL, 1, 3, 1, out));
+    if (top) TEST_ASSERT_FALSE(agg_group_values_f64(top, states, STRIDE, 0, NULL, 1, 3, out));
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();

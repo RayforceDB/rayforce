@@ -73,3 +73,24 @@
 (count a9) -- 4
 (all (== (at a9 'c) (at b9 'c))) -- true
 (all (== (at a9 'm) (at b9 'm))) -- true
+
+;; null-valued groups: the sort ranks nulls first ascending and last
+;; descending, so an all-null group is rank 1 of an asc take and absent from
+;; a desc take -- on the native selections and on the trimmed routes alike
+(set tn (update {from: (table [k v] (list (% i 6) (% (* i 7) 50))) v: 0N where: (== k 2)}))
+(set a10 (select {from: tn by: k m: (min v) asc: m take: 2}))
+(count a10) -- 2
+(at (at a10 'k) 0) -- 2
+(nil? (at (at a10 'm) 0)) -- true
+(set a11 (select {from: tn by: k m: (min v) desc: m take: 2}))
+(count a11) -- 2
+(all (!= (at a11 'k) 2)) -- true
+(set tf (update {from: (table [k v] (list (% i 6) (as 'F64 (% (* i 7) 50)))) v: 0Nf where: (== k 3)}))
+(set a12 (select {from: tf by: k m: (max v) asc: m take: 2}))
+(at (at a12 'k) 0) -- 3
+(set a13 (select {from: tf by: k m: (max v) desc: m take: 2}))
+(all (!= (at a13 'k) 3)) -- true
+;; the same shape with a string key runs the trimmed route
+(set tsn (table [s v] (list (at ["a" "b" "c" "d" "e" "f"] (% i 6)) (at tn 'v))))
+(set a14 (select {from: tsn by: s m: (min v) asc: m take: 2}))
+(at (at a14 's) 0) -- "c"

@@ -76,10 +76,6 @@ void agg_route_reason(agg_v2_reason_t reason);
  * Conservative: any uncertainty → false → caller uses the existing engine. */
 bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
-/* True when v2 would group this node through a bounded dense plan (see the
- * definition for the strategy-prediction contract). */
-bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
-
 /* Top-N keep decision shared by every strategy: keep[i] = 1 when group i
  * passes min_count_exclusive and (when top_count_take > 0) lies within the
  * top-N by value in the filter's direction, ties included (a superset of N;
@@ -96,12 +92,12 @@ int64_t agg_topn_mark(const double* vals, int64_t n, const ray_group_emit_filter
                       bool have_thr, double thr, uint8_t* keep);
 
 /* Double view of aggregate `vt` for n groups: group i's state is at
- * states + (slots ? slots[i] : i) * stride + off.  Nulls (and NaN) sink to
- * the far end of the keep direction (`desc`) so they never enter a top-N.
+ * states + (slots ? slots[i] : i) * stride + off.  Nulls (and NaN) map to
+ * -INFINITY, where the sort places them (first ascending, last descending).
  * Returns false for an out_type without a scalar order (LIST, STR, ...). */
 bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
                           size_t stride, size_t off, const int64_t* slots,
-                          int64_t n, int64_t param, uint8_t desc, double* out);
+                          int64_t n, int64_t param, double* out);
 
 /* Trim a finished group result to the emit filter's kept superset (row order
  * preserved; consumes `result`).  Used by routes that emit every group. */

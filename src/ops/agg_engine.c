@@ -198,50 +198,6 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
  * the unbounded radix route still pays a large serial ordering/emission
  * tail on many-million-group inputs.  Costs one parallel min/max prescan
  * of the non-SYM keys; SYM keys resolve from their domain bounds. */
-/* The probe's plan is kept for the run that follows on this thread so the
- * key prescan is not paid twice (4 ms serial on a 10M-row I64 key).  The
- * run consumes it only when the same key columns and row count are seen. */
-typedef struct {
-    bool valid;
-    uint32_t n_keys;
-    int64_t nrows;
-    ray_t* key_cols[16];
-    dense_plan_t dp;
-} agg_dense_plan_cache_t;
-static _Thread_local agg_dense_plan_cache_t g_dense_plan_cache;
-
-static bool agg_dense_plan_cached(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
-                                  dense_plan_t* out) {
-    agg_dense_plan_cache_t* c = &g_dense_plan_cache;
-    bool hit = c->valid && c->n_keys == n_keys && c->nrows == nrows;
-    for (uint32_t k = 0; hit && k < n_keys; k++) hit = c->key_cols[k] == key_cols[k];
-    if (c->valid && !hit) agg_dense_plan_free(&c->dp);
-    c->valid = false;   /* one run per probe */
-    if (!hit) return false;
-    *out = c->dp;       /* compaction tables transfer to the run */
-    return true;
-}
-
-bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
-    if (!g || !op || !tbl) return false;
-    ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext || ext->n_keys < 1 || ext->n_keys > 16) return false;
-    agg_dense_plan_cache_t* c = &g_dense_plan_cache;
-    if (c->valid) agg_dense_plan_free(&c->dp);
-    c->valid = false;
-    for (uint32_t k = 0; k < ext->n_keys; k++) {
-        ray_op_t* key = op_node(g, ext->keys[k]);
-        ray_op_ext_t* kext = key ? find_ext(g, key->id) : NULL;
-        c->key_cols[k] = kext ? ray_table_get_col(tbl, kext->sym) : NULL;
-        if (!c->key_cols[k]) return false;
-    }
-    c->n_keys = ext->n_keys;
-    c->nrows = ray_table_nrows(tbl);
-    bool ok = agg_dense_plan(c->key_cols, c->n_keys, NULL, 0, c->nrows, &c->dp);
-    c->valid = ok;
-    return ok;
-}
-
 /* ── Dense grouping eligibility selector (mirrors group.c DA path) ────────
  * Decides whether the key tuple packs into a bounded direct-index slot space
  * (gid = sum_k (key_k - min_k)*strides[k]) so grouping can skip hashing.
@@ -480,10 +436,15 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
         if (fits) total *= rng;
     }
     if (!fits) { ray_free_raw(bits); ray_free_raw(task_bits); return false; }
-    /* Build remap/inverse for every candidate key that actually shrank. */
+    /* Build remap/inverse for every candidate key that actually shrank.  The
+     * raw ranges are restored on any allocation failure so a plan that is
+     * still accepted (the non-overflow entry) never pairs a shrunken range
+     * with the raw slot computation. */
+    int64_t raw_ranges[16];
+    memcpy(raw_ranges, out->ranges, sizeof(raw_ranges));
     for (uint32_t k = 0; k < n_keys; k++) {
         if (!candidate[k]) continue;
-        int64_t raw = out->ranges[k] - out->nullable[k];
+        int64_t raw = raw_ranges[k] - out->nullable[k];
         if (used[k] >= raw) continue;    /* every code used: raw range is already dense */
         int32_t* remap = ray_alloc_raw((size_t)raw * sizeof(int32_t));
         int64_t* inverse = ray_alloc_raw((size_t)(used[k] > 0 ? used[k] : 1) * sizeof(int64_t));
@@ -491,6 +452,7 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
             ray_free_raw(remap); ray_free_raw(inverse);
             ray_free_raw(bits); ray_free_raw(task_bits);
             agg_dense_plan_free(out);
+            memcpy(out->ranges, raw_ranges, sizeof(raw_ranges));
             return false;
         }
         const uint64_t* acc = task_bits[k];
@@ -1479,7 +1441,7 @@ static void agg_topn_candidates(const double* vals, int64_t n, int64_t cap, uint
 
 bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
                           size_t stride, size_t off, const int64_t* slots,
-                          int64_t n, int64_t param, uint8_t desc, double* out) {
+                          int64_t n, int64_t param, double* out) {
     int8_t t = vt->out_type;
     switch (t) {
         case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
@@ -1487,7 +1449,11 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
         case RAY_U8: case RAY_BOOL: break;
         default: return false;
     }
-    double null_sink = desc ? -INFINITY : INFINITY;
+    /* The sort downstream ranks nulls FIRST ascending and LAST descending
+     * (sort_nulls_first is !desc), i.e. below every value either way: an
+     * asc take keeps an all-null group at rank 1, a desc take drops it.
+     * -INFINITY reproduces exactly that in agg_topn_mark for both directions. */
+    const double null_sink = -INFINITY;
     ray_t* cell = ray_vec_new(t, 1);
     if (!cell || RAY_IS_ERR(cell)) { if (cell) ray_error_free(cell); return false; }
     cell->len = 1;
@@ -1782,7 +1748,7 @@ static void agg_slots_vals_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         int64_t b, e;
         agg_slots_topn_range(c, task, &b, &e);
         if (!agg_group_values_f64(c->vt, c->states, c->block, c->off, c->slots + b,
-                                  e - b, c->param, c->ef->desc, c->vals + b)) {
+                                  e - b, c->param, c->vals + b)) {
             atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
             continue;
         }
@@ -3662,7 +3628,7 @@ static void agg_radix_vals_fn(void* raw, uint32_t wid, int64_t start, int64_t en
     for (int64_t p = start; p < end; p++) {
         double* v = c->vals + c->base[p];
         if (!agg_group_values_f64(c->vt, c->parts[p].states, c->block, c->off, NULL,
-                                  c->parts[p].ng, c->param, c->ef->desc, v)) {
+                                  c->parts[p].ng, c->param, v)) {
             atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
             continue;
         }
@@ -4849,12 +4815,13 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
         if (idx && RAY_IS_ERR(idx)) ray_error_free(idx); else ray_release(idx);
         return result;
     }
+    /* Same null placement as agg_group_values_f64: below every value. */
     if (vcol->type == RAY_F64) {
         const double* vf = (const double*)ray_data(vcol);
-        for (int64_t r = 0; r < nrows; r++) vals[r] = vf[r];
+        for (int64_t r = 0; r < nrows; r++) vals[r] = vf[r] != vf[r] ? -INFINITY : vf[r];
     } else {
         const int64_t* vi = (const int64_t*)ray_data(vcol);
-        for (int64_t r = 0; r < nrows; r++) vals[r] = (double)vi[r];
+        for (int64_t r = 0; r < nrows; r++) vals[r] = vi[r] == NULL_I64 ? -INFINITY : (double)vi[r];
     }
     int64_t kept = agg_topn_keep(vals, nrows, ef, keep);
     int64_t* ix = (int64_t*)ray_data(idx);
@@ -4957,16 +4924,8 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * not O(nrows)) — both correct (grouped keys ARE the selected rows) and cheap
      * for high-selectivity filters, and it can pull a sparse-but-low-card selected
      * key set into the dense path that the full-table range would have rejected. */
-    /* Every run consumes the probe's cached plan (agg_dense_plan_cached
-     * invalidates it), so a plan can never outlive the query it was probed
-     * for and match a recycled column pointer later.  Selected runs plan
-     * over the selected rows instead and discard the cached full-table plan. */
     dense_plan_t dp;
-    dense_plan_t probed;
-    bool probed_hit = agg_dense_plan_cached(key_cols, ext->n_keys, nrows, &probed);
-    if (probed_hit && sel) { agg_dense_plan_free(&probed); probed_hit = false; }
     bool dense = sel ? agg_dense_plan_sel(key_cols, ext->n_keys, n_sel, sel, sel_prefix, &dp)
-                     : probed_hit ? (dp = probed, true)
                      : agg_dense_plan(key_cols, ext->n_keys, vts, ext->n_aggs, nrows, &dp);
     route_stats.dense_plan_available = dense;
 
