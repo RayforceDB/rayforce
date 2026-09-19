@@ -1815,9 +1815,11 @@ static test_result_t test_radix_native_topn(void) {
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 1);
     TEST_ASSERT_TRUE(stats.topn_native);
-    /* counts are 1 or 2: the top-10 superset is every count-2 group (500,000
-     * of 1,500,000), not the full group set */
-    TEST_ASSERT_EQ_I(stats.topn_kept, 500000);
+    /* counts are 1 or 2, so the threshold is 2 and every count-2 group
+     * (500,000 of 1,500,000) ties it: the selection keeps the ten of them
+     * with the smallest first row — the ones the emitted first-seen order
+     * would take — not the whole tie set */
+    TEST_ASSERT_EQ_I(stats.topn_kept, 10);
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
     ray_t* check = ray_eval_str(
         "(== (at (at (select {from:rt_t by:[k j] c:(count v) desc:c take:10}) 'c) 0) "
