@@ -1392,6 +1392,49 @@ static inline bool agg_finalize_value(const agg_vtable_t* vt, const void* state,
     return is_null;
 }
 
+/* Threshold = N-th value in the keep direction, found by quickselect on a
+ * copy: O(n) and exact, so ties at the threshold are kept.  Callers
+ * parallelize the value fill; the selection itself runs on the caller. */
+int64_t agg_topn_keep(const double* vals, int64_t n,
+                      const ray_group_emit_filter_t* ef, uint8_t* keep) {
+    if (n <= 0) return 0;
+    double thr = 0.0;
+    bool have_thr = false;
+    if (ef->top_count_take > 0 && n > ef->top_count_take) {
+        ray_t* hdr = NULL;
+        double* sv = (double*)scratch_alloc(&hdr, (size_t)n * sizeof(double));
+        if (sv) {
+            memcpy(sv, vals, (size_t)n * sizeof(double));
+            int64_t k = ef->desc ? (n - ef->top_count_take) : (ef->top_count_take - 1);
+            int64_t lo = 0, hi = n - 1;
+            while (lo < hi) {
+                double pivot = sv[k];
+                int64_t i = lo, j = hi;
+                while (i <= j) {
+                    while (sv[i] < pivot) i++;
+                    while (sv[j] > pivot) j--;
+                    if (i <= j) { double t = sv[i]; sv[i] = sv[j]; sv[j] = t; i++; j--; }
+                }
+                if (k <= j) hi = j;
+                else if (k >= i) lo = i;
+                else break;
+            }
+            thr = sv[k];
+            have_thr = true;
+            scratch_free(hdr);
+        }
+    }
+    int64_t kept = 0;
+    for (int64_t i = 0; i < n; i++) {
+        double v = vals[i];
+        bool ok = !(ef->min_count_exclusive > 0 && !(v > (double)ef->min_count_exclusive));
+        if (ok && have_thr && (ef->desc ? (v < thr) : (v > thr))) ok = false;
+        keep[i] = (uint8_t)ok;
+        kept += ok;
+    }
+    return kept;
+}
+
 typedef struct {
     const agg_vtable_t* vt;
     ray_t* out;

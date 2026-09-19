@@ -79,6 +79,14 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
  * definition for the strategy-prediction contract). */
 bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
+/* Top-N keep decision shared by every strategy: keep[i] = 1 when group i
+ * passes min_count_exclusive and (when top_count_take > 0) lies within the
+ * top-N by value in the filter's direction, ties included (a superset of N;
+ * the DAG's sort+take downstream finalizes order and limit).  Returns the
+ * number kept.  vals may be NULL when n == 0. */
+int64_t agg_topn_keep(const double* vals, int64_t n,
+                      const ray_group_emit_filter_t* ef, uint8_t* keep);
+
 /* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
  * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when
  * positive, an engine strategy may emit only the first `group_limit` groups in

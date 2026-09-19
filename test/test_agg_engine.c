@@ -2029,6 +2029,40 @@ DIFF_SHAPE(test_diff_group_pearson_2k, diff_make_pearson_2k, gb_pearson_2k, 2)
 /* Shape 3: heterogeneous sum(x)+pearson(x,y)+count over single I64 key. */
 DIFF_SHAPE(test_diff_group_pearson_mixed, diff_make_pearson_1k, gb_sum_pearson_count, 1)
 
+/* Shared top-N keep decision for the emit filter: ties included, direction
+ * from .desc, min_count_exclusive as a pre-filter, take beyond n keeps all. */
+static test_result_t test_topn_keep(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    double vals[] = { 5, 1, 4, 4, 2, 9, 4 };
+    uint8_t keep[7];
+    ray_group_emit_filter_t ef = {0};
+    ef.enabled = 1; ef.top_count_take = 3; ef.desc = 1;
+    int64_t n = agg_topn_keep(vals, 7, &ef, keep);
+    /* top-3 largest are 9,5,4 — every 4 ties in: {9,5,4,4,4} */
+    TEST_ASSERT_EQ_I(n, 5);
+    TEST_ASSERT_TRUE(keep[0] && !keep[1] && keep[2] && keep[3] && !keep[4] && keep[5] && keep[6]);
+    ef.desc = 0;
+    n = agg_topn_keep(vals, 7, &ef, keep);   /* smallest 3: 1,2,4 (+ ties) */
+    TEST_ASSERT_EQ_I(n, 5);
+    TEST_ASSERT_TRUE(keep[1] && keep[4] && keep[2] && keep[3] && keep[6] && !keep[0] && !keep[5]);
+    ef.desc = 1; ef.top_count_take = 0; ef.min_count_exclusive = 4;
+    n = agg_topn_keep(vals, 7, &ef, keep);   /* > 4: {5, 9} */
+    TEST_ASSERT_EQ_I(n, 2);
+    TEST_ASSERT_TRUE(keep[0] && keep[5] && !keep[2]);
+    ef.top_count_take = 100;
+    n = agg_topn_keep(vals, 7, &ef, keep);   /* take beyond n keeps all passing */
+    TEST_ASSERT_EQ_I(n, 2);
+    ef.min_count_exclusive = 0; ef.top_count_take = 2;
+    n = agg_topn_keep(vals, 7, &ef, keep);   /* top-2: 9 and 5, no ties */
+    TEST_ASSERT_EQ_I(n, 2);
+    TEST_ASSERT_TRUE(keep[0] && keep[5]);
+    TEST_ASSERT_EQ_I(agg_topn_keep(NULL, 0, &ef, keep), 0);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2096,6 +2130,7 @@ const test_entry_t agg_engine_entries[] = {
     { "dense_plan_single_i64",       test_dense_plan_single_i64,       NULL, NULL },
     { "dense_plan_two_keys",         test_dense_plan_two_keys,         NULL, NULL },
     { "dense_plan_huge_range",       test_dense_plan_huge_range,       NULL, NULL },
+    { "topn_keep",                   test_topn_keep,                   NULL, NULL },
     { "dense_plan_f64_key",          test_dense_plan_f64_key,          NULL, NULL },
     { "dense_plan_buffered_agg",     test_dense_plan_buffered_agg,     NULL, NULL },
     { "dense_plan_nullable_key",     test_dense_plan_nullable_key,     NULL, NULL },
