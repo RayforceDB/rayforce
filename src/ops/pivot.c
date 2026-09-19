@@ -25,6 +25,7 @@
 #include "ops/hash.h"
 #include "ops/idxop.h"
 #include "ops/rowsel.h"
+#include "table/domain.h"   /* raw vocabulary snapshot for if_sym_side_t */
 #include "core/pool.h"
 
 /* Resolved string atom (borrowed) of a SYM-scalar broadcast input
@@ -499,7 +500,103 @@ static ray_t* if_scatter_str(ray_t* result, ray_t* value, int64_t* ids,
     return result;
 }
 
-static int64_t if_sym_cell_value(ray_t* value, int64_t src) {
+/* Runtime-id translation for one SYM branch of an `if`.
+ *
+ * A branch that scans a FILE-domain column used to go through the
+ * domain's whole-vocabulary LUT (ray_sym_domain_runtime_lut): the first
+ * request interns EVERY entry of the vocabulary into the global table —
+ * tens of GB, permanently, for a 20M-entry column — even when the branch
+ * touches a few of them.  This translator interns only the positions the
+ * branch actually reads: `lut` starts at -1 and a slot is resolved (raw
+ * file bytes when available, the domain atom otherwise) the first time
+ * that position is met.  Resolution interns, so it runs on the calling
+ * thread only: the serial scatter path resolves on the fly; the parallel
+ * fill first walks the mask serially and resolves exactly the positions
+ * the fill will read — a row's then-cell where the mask is set, its
+ * else-cell where it is clear (if_sym_side_prepare) — and the fill then
+ * reads only that side of each row through if_sym_side_lookup, which
+ * never interns.  Runtime-domain, STR and scalar branches need no table. */
+typedef struct {
+    ray_t*                   v;
+    struct ray_sym_domain_s* dom;      /* non-runtime domain, else NULL */
+    int64_t                  dn;
+    int32_t*                 lut;      /* dn slots, -1 = unresolved (ids fit: the table counts them in 32 bits) */
+    ray_t*                   lut_hdr;
+    ray_sym_domain_raw_t     raw;
+    bool                     raw_ok;
+} if_sym_side_t;
+
+static bool if_sym_side_init(if_sym_side_t* side, ray_t* v) {
+    memset(side, 0, sizeof(*side));
+    side->v = v;
+    if (!v || ray_is_atom(v) || !RAY_IS_SYM(v->type)) return true;
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(v);
+    if (!dom || dom == ray_sym_runtime_domain()) return true;
+    int64_t dn = ray_sym_domain_count(dom);
+    if (dn <= 0) return true;
+    side->lut = (int32_t*)scratch_alloc(&side->lut_hdr, (size_t)dn * sizeof(int32_t));
+    if (!side->lut) return false;
+    memset(side->lut, 0xff, (size_t)dn * sizeof(int32_t));
+    side->dom = dom;
+    side->dn = dn;
+    side->raw_ok = ray_sym_domain_raw_pin(dom, &side->raw);
+    return true;
+}
+
+static void if_sym_side_free(if_sym_side_t* side) {
+    if (side->raw_ok) ray_sym_domain_raw_unpin(side->dom);
+    scratch_free(side->lut_hdr);
+    side->lut = NULL;
+    side->lut_hdr = NULL;
+}
+
+/* Runtime id of the vocabulary position `pos`; interns on first use.
+ * Calling thread only. */
+static int64_t if_sym_side_resolve(if_sym_side_t* side, int64_t pos) {
+    if (pos < 0 || pos >= side->dn) return -1;
+    int64_t id = side->lut[pos];
+    if (id >= 0) return id;
+    const char* sp = NULL;
+    size_t sl = 0;
+    if (side->raw_ok && pos < side->raw.count) {
+        sp = ray_sym_domain_raw_str(&side->raw, pos, &sl);
+    } else {
+        ray_t* s = ray_sym_domain_str(side->dom, pos);
+        if (s) { sp = ray_str_ptr(s); sl = ray_str_len(s); }
+    }
+    id = ray_sym_intern(sp ? sp : "", sp ? sl : 0);
+    if (id >= 0 && id <= INT32_MAX) side->lut[pos] = (int32_t)id;
+    return id;
+}
+
+/* Read-only lookup for pool workers: the position must have been
+ * prepared; nothing is interned here.  An unprepared position (a bug in
+ * the caller's prepare pass) maps to the empty symbol rather than
+ * touching the table from a worker. */
+static inline int64_t if_sym_side_lookup(const if_sym_side_t* side, int64_t pos) {
+    if (pos < 0 || pos >= side->dn) return 0;
+    int32_t id = side->lut[pos];
+    return id >= 0 ? (int64_t)id : 0;
+}
+
+/* Pre-resolve the positions rows [0, len) read on this side under the
+ * mask (`want` selects which mask value picks this side).  Serial. */
+static void if_sym_side_prepare(if_sym_side_t* side, const uint8_t* cond,
+                                int64_t len, uint8_t want) {
+    if (!side->dom) return;
+    const void* base = ray_data(side->v);
+    for (int64_t i = 0; i < len; i++) {
+        if ((cond[i] != 0) != (want != 0)) continue;
+        int64_t pos = ray_read_sym(base, i, side->v->type, side->v->attrs);
+        if (pos >= 0 && pos < side->dn && side->lut[pos] < 0)
+            (void)if_sym_side_resolve(side, pos);
+    }
+}
+
+/* Cell value as a runtime id.  A FILE-domain cell reads the side's table
+ * (resolving on the calling thread when not prepared). */
+static int64_t if_sym_cell_value(if_sym_side_t* side, int64_t src) {
+    ray_t* value = side->v;
     if (value->type == -RAY_STR) return ray_sym_intern(ray_str_ptr(value), ray_str_len(value));
     if (value->type == RAY_STR) {
         size_t sl = 0;
@@ -507,19 +604,26 @@ static int64_t if_sym_cell_value(ray_t* value, int64_t src) {
         return ray_sym_intern(sp ? sp : "", sp ? sl : 0);
     }
     if (ray_is_atom(value)) return sym_scalar_runtime_id(value);
-    return sym_cell_runtime_id(value, src);
+    if (!side->dom) return sym_cell_runtime_id(value, src);
+    int64_t pos = ray_read_sym(ray_data(value), src, value->type, value->attrs);
+    if (pos >= 0 && pos < side->dn && side->lut[pos] >= 0) return side->lut[pos];
+    return if_sym_side_resolve(side, pos);
 }
 
 static bool if_scatter_sym(ray_t* result, ray_t* value, int64_t* ids,
                            int64_t count, int64_t nrows) {
     if (!value) return true;
+    if_sym_side_t side;
+    if (!if_sym_side_init(&side, value)) return false;
     int64_t* dst = (int64_t*)ray_data(result);
-    for (int64_t j = 0; j < count; j++) {
+    bool ok = true;
+    for (int64_t j = 0; j < count && ok; j++) {
         int64_t src = if_value_index(value, ids, j, count, nrows);
-        if (src < 0) return false;
-        dst[ids[j]] = if_sym_cell_value(value, src);
+        if (src < 0) { ok = false; break; }
+        dst[ids[j]] = if_sym_cell_value(&side, src);
     }
-    return true;
+    if_sym_side_free(&side);
+    return ok;
 }
 
 static bool if_lazy_supported_type(int8_t out_type) {
@@ -709,7 +813,21 @@ typedef struct {
     int64_t t_i64, e_i64;
     void*   dst;
     int8_t  out_type;
+    if_sym_side_t* t_side;    /* SYM output: per-side id translation */
+    if_sym_side_t* e_side;
+    bool    sides_prepared;   /* positions resolved up front: read-only fill (workers) */
 } if_fill_ctx_t;
+
+/* One SYM cell of a fill side as a runtime id: the selected side only. */
+static inline int64_t if_fill_sym_cell(const if_fill_ctx_t* c, if_sym_side_t* side,
+                                       int64_t i) {
+    ray_t* v = side->v;
+    if (c->sides_prepared && side->dom) {
+        int64_t pos = ray_read_sym(ray_data(v), i, v->type, v->attrs);
+        return if_sym_side_lookup(side, pos);
+    }
+    return if_sym_cell_value(side, i);
+}
 
 static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
     const uint8_t* cond_p = c->cond;
@@ -732,10 +850,13 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         break; }
     case RAY_SYM: {
         int64_t* dst = (int64_t*)c->dst;
+        /* Only the chosen side is read: the prepare pass resolved exactly
+         * these cells, and the other side's cell may be unresolved. */
         for (int64_t i = i0; i < i1; i++) {
-            int64_t tv = c->then_scalar ? c->t_i64 : if_sym_cell_value(c->then_v, i);
-            int64_t ev = c->else_scalar ? c->e_i64 : if_sym_cell_value(c->else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
+            if (cond_p[i])
+                dst[i] = c->then_scalar ? c->t_i64 : if_fill_sym_cell(c, c->t_side, i);
+            else
+                dst[i] = c->else_scalar ? c->e_i64 : if_fill_sym_cell(c, c->e_side, i);
         }
         break; }
     case RAY_I32: case RAY_TIME: case RAY_DATE: {
@@ -946,27 +1067,46 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
 
         ray_pool_t* pool = ray_pool_get();
         bool par = ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD);
+        if_sym_side_t t_side, e_side;
+        bool sides_ok = true;
+        if (out_type == RAY_SYM) {
+            /* Both inits run (each zeroes its side) so both frees are safe. */
+            bool t_ok = if_sym_side_init(&t_side, then_scalar ? NULL : then_v);
+            bool e_ok = if_sym_side_init(&e_side, else_scalar ? NULL : else_v);
+            sides_ok = t_ok && e_ok;
+            fc.t_side = &t_side;
+            fc.e_side = &e_side;
+        }
+        if (!sides_ok) {
+            if (out_type == RAY_SYM) { if_sym_side_free(&t_side); if_sym_side_free(&e_side); }
+            ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+            ray_release(result);
+            return ray_error("oom", NULL);
+        }
         if (par && out_type == RAY_SYM) {
-            /* Vector STR sides intern per element — serial only.  Non-STR
-             * vector sides must be SYM columns; warm each non-runtime
-             * domain's runtime-id LUT HERE (sym.c frozen-table rule —
-             * the first LUT request interns the vocabulary, never allowed
-             * inside a worker; mirrors window.c's sequential warm-up). */
+            /* Vector STR sides intern per element — serial only.  A SYM
+             * column side is dispatch-safe once every position the fill
+             * will read has a runtime id (sym.c frozen-table rule: no
+             * interning inside a worker) — resolve those here, serially,
+             * and only those; the column's whole vocabulary is never
+             * interned. */
             ray_t* sides[2] = { then_scalar ? NULL : then_v,
                                 else_scalar ? NULL : else_v };
             for (int s = 0; s < 2 && par; s++) {
                 if (!sides[s]) continue;
                 if (sides[s]->type != RAY_SYM) { par = false; break; }
-                struct ray_sym_domain_s* dom = ray_sym_vec_domain(sides[s]);
-                if (dom != ray_sym_runtime_domain() &&
-                    !ray_sym_domain_runtime_lut(dom))
-                    par = false;   /* LUT OOM → safe serial fallback */
+            }
+            if (par) {
+                if_sym_side_prepare(&t_side, cond_p, len, 1);
+                if_sym_side_prepare(&e_side, cond_p, len, 0);
+                fc.sides_prepared = true;
             }
         }
         if (par)
             ray_pool_dispatch(pool, if_fill_par_fn, &fc, len);
         else
             if_fill_range(&fc, 0, len);
+        if (out_type == RAY_SYM) { if_sym_side_free(&t_side); if_sym_side_free(&e_side); }
     }
 
     ray_release(cond_v); ray_release(then_v); ray_release(else_v);
