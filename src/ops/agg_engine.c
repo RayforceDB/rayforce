@@ -346,6 +346,7 @@ static void agg_key_bounds_parallel(ray_t* key, int64_t rows, bool nullable,
  * bounded (AGG_COMPACT_MAX_RANGE codes) are compacted. */
 enum { AGG_COMPACT_MAX_RANGE = 1 << 22,   /* largest per-key remap table (codes) */
        AGG_COMPACT_TRY_SLOTS = 1 << 16 };  /* raw products above this try compaction */
+#define AGG_COMPACT_BITMAP_BUDGET ((size_t)32 << 20)   /* transient per-task bitmaps */
 
 typedef struct {
     ray_t** key_cols;
@@ -397,6 +398,9 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
     size_t words_total = 0;
     for (uint32_t k = 0; k < n_keys; k++)
         if (candidate[k]) words_total += (size_t)((out->ranges[k] - out->nullable[k] + 63) / 64);
+    /* Private bitmaps are words_total * tasks; keep the transient footprint
+     * within AGG_COMPACT_BITMAP_BUDGET by using fewer, longer tasks. */
+    while (tasks > 1 && words_total * tasks * sizeof(uint64_t) > AGG_COMPACT_BITMAP_BUDGET) tasks /= 2;
     uint64_t* bits = ray_calloc_raw(words_total * tasks * sizeof(uint64_t));
     uint64_t** task_bits = ray_calloc_raw((size_t)tasks * n_keys * sizeof(uint64_t*));
     if (!bits || !task_bits) { ray_free_raw(bits); ray_free_raw(task_bits); return false; }
@@ -1861,11 +1865,20 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
      * row ARE the first N groups in first-seen order.  Select them with an
      * N-sized max-heap over the occupied slots and emit them ascending by
      * first row, byte-identical to trimming a first-seen-ordered result. */
-    if (group_limit > 0 && first_row_ordered && ng > group_limit) {
-        int64_t n_keep = group_limit;
+    if (group_limit > 0 && first_row_ordered && ng > 0) {
+        int64_t n_keep = ng < group_limit ? ng : group_limit;
         int64_t* hkey = ray_alloc_raw((size_t)n_keep * sizeof(int64_t));
         int64_t* hslot = ray_alloc_raw((size_t)n_keep * sizeof(int64_t));
-        if (hkey && hslot) {
+        if (!hkey || !hslot) {
+            /* Emitting slot order here would hand the caller's head the wrong
+             * prefix; fail the query instead of answering it differently. */
+            ray_free_raw(hkey); ray_free_raw(hslot);
+            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
+            agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+            ray_free_raw(gstates); ray_free_raw(gfirst);
+            return ray_error("oom", NULL);
+        }
+        {
             int64_t hn = 0;
             for (int64_t i = 0; i < ng; i++) {
                 int64_t first = first_row_ordered[i], slot = occupied_slot[i];
@@ -4885,10 +4898,15 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.dense_worker_budget = false;
     route_stats.dense_tasks = 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
-    /* The top-N emit filter names an aggregate slot; an out-of-range slot or a
-     * filter armed for a different node means "no filter" here (the caller's
-     * sort+take still produces the final answer from the full result). */
-    if (efp && (!efp->enabled || efp->agg_index >= ext->n_aggs)) efp = NULL;
+    /* The emit filter is thread-local and stays armed while the whole
+     * `from:` expression of the select that matched it evaluates, so any
+     * grouped select nested inside sees it too.  Honor it only when it was
+     * armed for THIS node: the slot exists and holds the operation the
+     * filter names (an unset op means count, per the filter's contract).
+     * Anything else is "no filter": the outer sort+take still finalizes. */
+    if (efp && (!efp->enabled || efp->agg_index >= ext->n_aggs ||
+                (efp->agg_op ? efp->agg_op : OP_COUNT) != ext->agg_ops[efp->agg_index]))
+        efp = NULL;
 
     /* Exact-size carve for the per-key column pointers + syms (one block, both
      * 8-byte): unbounded key count, freed at every exit of this function

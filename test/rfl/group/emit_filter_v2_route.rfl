@@ -94,3 +94,16 @@
 (set tsn (table [s v] (list (at ["a" "b" "c" "d" "e" "f"] (% i 6)) (at tn 'v))))
 (set a14 (select {from: tsn by: s m: (min v) asc: m take: 2}))
 (at (at a14 's) 0) -- "c"
+
+;; the emit filter is armed while the matched select's from: evaluates; a
+;; grouped select nested inside must not be trimmed by it (its aggregate slot
+;; holds a different operation than the filter names)
+(set inner (select {from: t by: k s: (sum v)}))
+(set nested (select {from: (select {from: (select {from: t by: k s: (sum v)}) by: s c: (count s)}) where: (> c 5)}))
+(set ref (select {from: (select {from: inner by: s c: (count s)}) where: (> c 5)}))
+(== (count nested) (count ref)) -- true
+(== (sum (at nested 'c)) (sum (at ref 'c))) -- true
+;; the same nesting with the inner select ordered by the filtered op keeps its full group set
+(set nested2 (select {from: (select {from: (select {from: t by: k c: (count v)}) by: c n: (count c)}) where: (> n 2)}))
+(set ref2 (select {from: (select {from: (select {from: t by: k c: (count v)}) by: c n: (count c)})}))
+(== (count nested2) (count (select {from: ref2 where: (> n 2)}))) -- true
