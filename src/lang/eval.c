@@ -1926,6 +1926,47 @@ ray_t* ray_do_fn(ray_t** args, int64_t n) {
     return result;
 }
 
+/* (while cond body...) — iterate while cond is truthy.  Receives
+ * unevaluated args.  Always returns null: it is a statement form run for
+ * effect, and a never-taken loop has no last value to report.
+ *
+ * Zero body expressions is legal — a condition with side effects is then
+ * the whole loop, which is the shape a "repeat until done" drain wants
+ * (issue 588): there is no sequence to iterate, so folding over a range
+ * was only ever scaffolding.
+ *
+ * Unlike ray_do_fn this pushes NO scope around the body.  `let` binds in
+ * the top frame only (env_bind_local), so a per-iteration frame would
+ * discard loop-carried `let` state here while the compiled path — whose
+ * `let` writes a function-level bytecode slot — kept it, and the two
+ * evaluators would disagree on the same source.  A caller wanting a fresh
+ * frame per pass writes (while cond (do ...)), which composes.
+ *
+ * No interrupt check is needed: the condition goes through ray_eval on
+ * every pass, whose entry guard raises `cancel` when a Ctrl-C has landed.
+ * The compiled form is emitted by the bytecode compiler — see compile.c. */
+ray_t* ray_while_fn(ray_t** args, int64_t n) {
+    if (n < 1) return ray_error("domain", "while: expected at least 1 arg (cond), got %lld", (long long)n);
+    for (;;) {
+        ray_t* cond = ray_eval(args[0]);
+        if (RAY_IS_ERR(cond)) return cond;
+        /* Materialize lazy handles before testing truthiness — the
+         * truthiness belongs to the value, not to the non-NULL handle
+         * that happens to contain it (same rule as ray_cond_fn). */
+        if (ray_is_lazy(cond))
+            cond = ray_lazy_materialize(cond);
+        if (RAY_IS_ERR(cond)) return cond;
+        int truthy = is_truthy(cond);
+        ray_release(cond);
+        if (!truthy) return RAY_NULL_OBJ;
+        for (int64_t i = 1; i < n; i++) {
+            ray_t* val = ray_eval(args[i]);
+            if (RAY_IS_ERR(val)) return val;
+            ray_release(val);
+        }
+    }
+}
+
 /* ══════════════════════════════════════════
  * Lambda functions
  * ══════════════════════════════════════════ */
@@ -3149,6 +3190,7 @@ static void ray_register_builtins(void) {
     register_binary("let", RAY_FN_SPECIAL_FORM, ray_let_fn);
     register_vary("if",    RAY_FN_SPECIAL_FORM, ray_cond_fn);
     register_vary("do",    RAY_FN_SPECIAL_FORM, ray_do_fn);
+    register_vary("while", RAY_FN_SPECIAL_FORM, ray_while_fn);
     register_vary("fn",    RAY_FN_SPECIAL_FORM, ray_fn);
 
     /* Aggregation builtins */

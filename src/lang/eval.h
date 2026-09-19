@@ -363,6 +363,7 @@ ray_t* ray_set_fn(ray_t* name_obj, ray_t* val_expr);
 ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr);
 ray_t* ray_cond_fn(ray_t** args, int64_t n);
 ray_t* ray_do_fn(ray_t** args, int64_t n);
+ray_t* ray_while_fn(ray_t** args, int64_t n);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);

@@ -30,6 +30,57 @@ Without an else branch, `if` returns `0`:
 30
 ```
 
+## Iteration: while
+
+`while` evaluates `cond`, and while it is truthy evaluates each body expression
+in order, then tests again. It always returns null — it is a statement form,
+run for effect.
+
+```text
+‣ (set n 5)
+‣ (set total 0)
+‣ (while (> n 0) (set total (+ total n)) (set n (- n 1)))
+‣ total
+15
+```
+
+It is the only iteration form that can stop early. `map`, `fold`, `scan` and
+`prior` all consume their whole input, so a "repeat until done" loop written as
+a fold over a fixed range pays that range's full length on every call, however
+early the work finishes. `while` stops when the condition says stop, allocates
+no range, and does not recurse — so it is not bounded by the stack depth a
+recursive loop would hit.
+
+The body may be omitted, in which case a condition with side effects is the
+whole loop. That is the natural shape when there is no sequence to iterate over
+in the first place:
+
+```text
+‣ (while (drain-one-batch))
+```
+
+Unlike `do`, `while` pushes no scope of its own. A `let` in the body binds in
+the enclosing frame and therefore survives the iteration, which is what makes a
+`let` usable as a loop variable inside a lambda:
+
+```lisp
+((fn [n]
+   (let i 0)
+   (let acc 0)
+   (while (< i n) (let acc (+ acc i)) (let i (+ i 1)))
+   acc) 4)                       ; => 6
+```
+
+When a fresh binding per pass is wanted instead, wrap the body in `do`, which
+does push a scope:
+
+```lisp
+(while (< i 3) (do (let tmp (* i i)) (use tmp)) (set i (+ i 1)))
+```
+
+A loop whose condition never goes false runs until interrupted; Ctrl-C breaks
+out of one at the REPL.
+
 ## Variable Binding: set and let
 
 `set` creates a global binding. `let` creates a local binding scoped to the enclosing `do`:

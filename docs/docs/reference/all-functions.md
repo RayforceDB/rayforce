@@ -12,7 +12,7 @@
 |---|---|---|
 | [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
-| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (20) |
+| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (12) | [Table Operations](#table-ops) (20) |
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (11) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
@@ -359,6 +359,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
 | `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
+| `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
 | `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
