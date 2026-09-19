@@ -2903,6 +2903,16 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * column's vocabulary is readable through the raw snapshot.  Any other
  * shape returns NULL and the caller takes the one-shot SYM evaluation. */
 #define DERIVED_KEY_CHUNK (1LL << 21)
+/* Chunk length; RAY_DERIVED_KEY_CHUNK overrides it so a test can drive
+ * several chunks through a small vocabulary. */
+static int64_t derived_key_chunk_rows(void) {
+    const char* env = getenv("RAY_DERIVED_KEY_CHUNK");
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+        if (v > 0) return (int64_t)v;
+    }
+    return DERIVED_KEY_CHUNK;
+}
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
                                      struct ray_sym_domain_s* dom, int64_t du) {
     if (!dom || dom == ray_sym_runtime_domain() || du <= 0) return NULL;
@@ -2935,8 +2945,9 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
     int64_t* kd = (int64_t*)ray_data(key_dom);
     const void* dv = ray_data(dom_vec);
 
-    for (int64_t lo = 0; lo < du; lo += DERIVED_KEY_CHUNK) {
-        int64_t n = du - lo < DERIVED_KEY_CHUNK ? du - lo : DERIVED_KEY_CHUNK;
+    const int64_t chunk = derived_key_chunk_rows();
+    for (int64_t lo = 0; lo < du; lo += chunk) {
+        int64_t n = du - lo < chunk ? du - lo : chunk;
         ray_t* sv = ray_vec_new(RAY_STR, n);
         if (!sv || RAY_IS_ERR(sv)) { if (sv) ray_error_free(sv); goto fail; }
         for (int64_t i = 0; i < n; i++) {
