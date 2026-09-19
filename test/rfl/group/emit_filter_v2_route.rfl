@@ -60,3 +60,16 @@
 (count a7) -- 20
 (all (>= (at a7 'c) (at (at full7 'c) 19))) -- true
 (== (sum (at a7 'c)) (sum (take (at full7 'c) 20))) -- true
+
+;; routes that emit every group and trim afterwards: a string key (shared
+;; directory) and a buffered aggregate beside the ordering count
+(set ts (table [s v] (list (at ["alpha" "beta" "gamma" "delta" "eps"] (% i 5)) (% (* i 13) 97))))
+(set a8 (select {from: ts by: s c: (count v) desc: c take: 2}))
+(set b8 (take (xdesc (select {from: ts by: s c: (count v)}) 'c) 2))
+(count a8) -- 2
+(all (== (at a8 'c) (at b8 'c))) -- true
+(set a9 (select {from: t by: k m: (med v) c: (count v) desc: c take: 4}))
+(set b9 (take (xdesc (select {from: t by: k m: (med v) c: (count v)}) 'c) 4))
+(count a9) -- 4
+(all (== (at a9 'c) (at b9 'c))) -- true
+(all (== (at a9 'm) (at b9 'm))) -- true

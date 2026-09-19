@@ -4752,7 +4752,71 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
  * compact table of the selected rows once and recurse with sel=NULL — the
  * unmodified strategy then runs over the compact table.  This is the documented
  * compact fallback the design permits for the non-chunked shapes. */
+static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                int64_t nrows, ray_t* sel,
+                                const int64_t* sel_prefix, int64_t n_sel,
+                                int64_t group_limit,
+                                const ray_group_emit_filter_t* efp);
+
+/* Trim a full group result to the emit filter's keep set (the same decision
+ * the native selections make, over the finished aggregate column).  Row
+ * order is preserved.  Consumes `result`; a failure keeps the full result,
+ * which is still a valid answer for the sort+take downstream. */
+ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
+                            const ray_group_emit_filter_t* ef) {
+    if (!result || RAY_IS_ERR(result) || result->type != RAY_TABLE) return result;
+    if (ef->agg_index >= n_aggs) return result;
+    int64_t nrows = ray_table_nrows(result);
+    if (nrows <= 0) return result;
+    ray_t* vcol = ray_table_get_col_idx(result, (int64_t)n_keys + ef->agg_index);
+    if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64)) return result;
+    double* vals = ray_alloc_raw((size_t)nrows * sizeof(double));
+    uint8_t* keep = ray_alloc_raw((size_t)nrows);
+    ray_t* idx = ray_vec_new(RAY_I64, nrows);
+    if (!vals || !keep || !idx || RAY_IS_ERR(idx)) {
+        ray_free_raw(vals); ray_free_raw(keep);
+        if (idx && RAY_IS_ERR(idx)) ray_error_free(idx); else ray_release(idx);
+        return result;
+    }
+    if (vcol->type == RAY_F64) {
+        const double* vf = (const double*)ray_data(vcol);
+        for (int64_t r = 0; r < nrows; r++) vals[r] = vf[r];
+    } else {
+        const int64_t* vi = (const int64_t*)ray_data(vcol);
+        for (int64_t r = 0; r < nrows; r++) vals[r] = (double)vi[r];
+    }
+    int64_t kept = agg_topn_keep(vals, nrows, ef, keep);
+    int64_t* ix = (int64_t*)ray_data(idx);
+    int64_t w = 0;
+    for (int64_t r = 0; r < nrows; r++) if (keep[r]) ix[w++] = r;
+    idx->len = w;
+    ray_free_raw(vals); ray_free_raw(keep);
+    if (kept == nrows) { ray_release(idx); return result; }
+    ray_t* out = ray_at_fn(result, idx);
+    ray_release(idx);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return result; }
+    ray_release(result);
+    return out;
+}
+
+/* Every v2 strategy returns through here: a route that could not select
+ * the emit filter's top-N itself hands back its full result and is trimmed
+ * to the kept superset, so callers see one contract regardless of route. */
 static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                int64_t nrows, ray_t* sel,
+                                const int64_t* sel_prefix, int64_t n_sel,
+                                int64_t group_limit,
+                                const ray_group_emit_filter_t* efp) {
+    ray_t* r = exec_group_v2_run_inner(g, op, tbl, nrows, sel, sel_prefix, n_sel,
+                                       group_limit, efp);
+    if (efp && r && !RAY_IS_ERR(r) && !route_stats.topn_native) {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (ext) r = agg_emit_filter_trim(r, ext->n_keys, ext->n_aggs, efp);
+    }
+    return r;
+}
+
+static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t nrows, ray_t* sel,
                                 const int64_t* sel_prefix, int64_t n_sel,
                                 int64_t group_limit,

@@ -9829,96 +9829,6 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                              int64_t group_limit);
 
-/* Trim a full group result to the emit filter's keep set: rows whose
- * filtered-agg value passes min_count_exclusive and, when top_count_take
- * is set, lies within the top-N by that value (ties INCLUDED — the result
- * is a superset of N rows; the DAG's sort+take downstream finalizes the
- * exact order/limit, exactly as it would on an untrimmed result).
- * Row order is preserved.  Consumes `result`, returns an owned table. */
-static ray_t* group_emit_filter_trim(ray_t* result, uint32_t n_keys,
-                                     uint32_t n_aggs,
-                                     ray_group_emit_filter_t ef) {
-    if (!result || RAY_IS_ERR(result) || result->type != RAY_TABLE)
-        return result;
-    if (ef.agg_index >= n_aggs) return result;
-    int64_t nrows = ray_table_nrows(result);
-    if (nrows <= 0) return result;
-    ray_t* vcol = ray_table_get_col_idx(result,
-                                        (int64_t)n_keys + ef.agg_index);
-    if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64))
-        return result;
-    bool is_f64 = (vcol->type == RAY_F64);
-    /* Direction comes straight from .desc (mirrors the v2_emit topn path):
-     * every arming site sets it, COUNT included.  Coercing COUNT to
-     * largest-first here made `asc: <count> take: N` keep the largest N
-     * (issue #408). */
-    const int64_t* vi = (const int64_t*)ray_data(vcol);
-    const double*  vf = (const double*)ray_data(vcol);
-    #define EF_VAL_D(r) (is_f64 ? vf[(r)] : (double)vi[(r)])
-
-    double thr = 0.0;
-    bool have_thr = false;
-    if (ef.top_count_take > 0 && nrows > ef.top_count_take) {
-        /* Quickselect (on a copy) for the N-th value in the keep
-         * direction: desc keeps the N largest -> threshold is the
-         * (nrows-N)-th ascending element; asc keeps the N smallest. */
-        ray_t* sel_hdr = NULL;
-        double* sv = (double*)scratch_alloc(&sel_hdr,
-                                            (size_t)nrows * sizeof(double));
-        if (sv) {
-            for (int64_t r = 0; r < nrows; r++) sv[r] = EF_VAL_D(r);
-            int64_t k = ef.desc ? (nrows - ef.top_count_take)
-                                : (ef.top_count_take - 1);
-            int64_t lo = 0, hi = nrows - 1;
-            while (lo < hi) {
-                double pivot = sv[k];
-                int64_t i = lo, j = hi;
-                while (i <= j) {
-                    while (sv[i] < pivot) i++;
-                    while (sv[j] > pivot) j--;
-                    if (i <= j) {
-                        double t = sv[i]; sv[i] = sv[j]; sv[j] = t;
-                        i++; j--;
-                    }
-                }
-                if (k <= j) hi = j;
-                else if (k >= i) lo = i;
-                else break;
-            }
-            thr = sv[k];
-            have_thr = true;
-            scratch_free(sel_hdr);
-        }
-    }
-
-    ray_t* idx = ray_vec_new(RAY_I64, nrows);
-    if (!idx || RAY_IS_ERR(idx)) {
-        if (idx) ray_error_free(idx);
-        return result;   /* trim is an optimization — full result is valid */
-    }
-    int64_t* ix = (int64_t*)ray_data(idx);
-    int64_t kept = 0;
-    for (int64_t r = 0; r < nrows; r++) {
-        double v = EF_VAL_D(r);
-        if (ef.min_count_exclusive > 0 && !(v > (double)ef.min_count_exclusive))
-            continue;
-        if (have_thr && (ef.desc ? (v < thr) : (v > thr)))
-            continue;
-        ix[kept++] = r;
-    }
-    #undef EF_VAL_D
-    idx->len = kept;
-    if (kept == nrows) { ray_release(idx); return result; }
-    ray_t* out = ray_at_fn(result, idx);
-    ray_release(idx);
-    if (!out || RAY_IS_ERR(out)) {
-        if (out) ray_error_free(out);
-        return result;
-    }
-    ray_release(result);
-    return out;
-}
-
 /* Map an I32 dictionary-code result column back to strings via the source
  * column: code -> first_occ[code] -> the string at that row. */
 static ray_t* dict_codes_to_str(const ray_t* codes_col, ray_t* src_col,
@@ -11395,44 +11305,20 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
-    /* v2 doesn't implement the top-count emit filter (old-engine feature);
-     * when one is active, stay on the legacy path that honors it. */
     /* group_limit is a HINT (HEAD(GROUP) fusion), not a semantic: v2 threads
      * it down to the radix strategy's bounded emit and the caller trims the
      * result either way, so a positive limit stays on v2 rather than falling
-     * back to the (slower, full-materialization) legacy ladder. */
+     * back to the (slower, full-materialization) legacy ladder.  The top-N
+     * emit filter (`desc: AGG take: N`) is likewise owned by v2: radix and
+     * the dense finishes select the kept groups natively and every other
+     * route trims its full result (exec_group_v2), so an armed filter never
+     * routes a shape v2 admits onto the ladder. */
     agg_v2_reason_t admission = !ray_agg_engine_v2 ? AGG_V2_DISABLED
         : group_limit < 0 ? AGG_V2_SHAPE
-        : ray_group_emit_filter_get().enabled ? AGG_V2_EMIT_FILTER
         : agg_v2_admission(g, op, tbl);
     agg_route_reason(admission);
     if (admission == AGG_V2_ADMITTED)
         return exec_group_v2(g, op, tbl, group_limit);
-
-    /* Emit-filter shapes (`desc: c take: N`, `where (> c N)` on the group
-     * result) used to run on the legacy ladder because v2 did not implement
-     * the top-count emit filter.  That ladder is single-threaded in its
-     * scatter and its dense array scales with the store's SHARED sym domain,
-     * so every top-N group query lost the parallel engine: a three-aggregate
-     * 100k-group query measured 800 ms on one core and 777 ms on a 28-thread
-     * pool (0.1x parallel), while the same grouping without the filter ran
-     * in 47 ms.  v2 now reads the filter itself: radix and the dense finishes
-     * select the kept groups natively, the remaining routes return the full
-     * result and are trimmed here to the filter's top-N superset.  The DAG's
-     * sort+take downstream produces the final order/limit either way.  The
-     * legacy ladder remains only for shapes v2 declines. */
-    {
-        ray_group_emit_filter_t ef = ray_group_emit_filter_get();
-        if (ray_agg_engine_v2 && group_limit == 0 && ef.enabled
-            && agg_v2_can_handle(g, op, tbl)) {
-            ray_t* r = exec_group_v2(g, op, tbl, 0);
-            if (r && !RAY_IS_ERR(r))
-                return agg_route_stats().topn_native
-                    ? r : group_emit_filter_trim(r, ext->n_keys, ext->n_aggs, ef);
-            if (r) return r;
-            /* v2 declined at runtime — continue on the legacy ladder. */
-        }
-    }
 
     /* v2 with EXPRESSION agg inputs: v2 admission requires plain-column
      * scans, so a group like {sum(a*b), stddev(c), cor(x,y)} — where ONE

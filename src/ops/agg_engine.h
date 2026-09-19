@@ -21,7 +21,7 @@ typedef enum {
     AGG_V2_BUFFERED,
     AGG_V2_PARAMETER,
     AGG_V2_DISABLED,
-    AGG_V2_EMIT_FILTER,
+    AGG_V2_EMIT_FILTER,     /* no longer produced: v2 owns the emit filter */
     AGG_V2_PARALLEL_WIDE,
 } agg_v2_reason_t;
 
@@ -102,6 +102,11 @@ int64_t agg_topn_mark(const double* vals, int64_t n, const ray_group_emit_filter
 bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
                           size_t stride, size_t off, const int64_t* slots,
                           int64_t n, int64_t param, uint8_t desc, double* out);
+
+/* Trim a finished group result to the emit filter's kept superset (row order
+ * preserved; consumes `result`).  Used by routes that emit every group. */
+ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
+                            const ray_group_emit_filter_t* ef);
 
 /* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
  * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when
