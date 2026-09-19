@@ -2009,15 +2009,33 @@ static int sg_agg_expr_ok(ray_t* expr) {
     return 0;
 }
 
+/* Aggregate shapes the hidden-slot compiler accepts: unary aggregates,
+ * binary aggregates over two bare columns (pearson, covariance, wsum, ...),
+ * and quantile with its literal probability.  List-valued top/bottom K and
+ * anything wider keep the per-group scatter path, whose element-wise
+ * semantics differ from a post-group column expression. */
+static int hidden_agg_shape_ok(ray_t* expr) {
+    int64_t n = ray_len(expr);
+    if (n == 2) return 1;
+    if (n != 3) return 0;
+    ray_t** e = (ray_t**)ray_data(expr);
+    uint16_t op = resolve_agg_opcode(e[0]->i64);
+    if (agg_is_binary_agg(op))
+        return e[1] && e[1]->type == -RAY_SYM && !(e[1]->attrs & ATTR_QUOTED) &&
+               e[2] && e[2]->type == -RAY_SYM && !(e[2]->attrs & ATTR_QUOTED);
+    return op == OP_QUANTILE;
+}
+
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
     if (!*ok || !expr) { *ok = 0; return NULL; }
     if (expr->type == RAY_LIST && is_group_dag_agg_expr(expr) &&
-        ray_len(expr) == 2) {
+        hidden_agg_shape_ok(expr)) {
         ray_t** el = (ray_t**)ray_data(expr);
         /* nested agg inside the agg argument: not a DAG shape — bail */
         if (expr_contains_agg(el[1])) { *ok = 0; return NULL; }
+        if (ray_len(expr) > 2 && expr_contains_agg(el[2])) { *ok = 0; return NULL; }
         if (*n_hidden >= cap) { *ok = 0; return NULL; }
         char buf[24];
         int bn = snprintf(buf, sizeof buf, "__ha%d", *n_hidden);
@@ -2083,6 +2101,23 @@ static ray_t* try_decompose_agg_arith(ray_t* val_expr, ray_t* tbl,
         return NULL;
     }
     return rw;
+}
+
+/* Dry run of the arith-of-aggs decomposition: true when `expr` is an
+ * arithmetic combination of DAG-shaped aggregates that the hidden-slot path
+ * evaluates after grouping.  Routing consults this before deciding that a
+ * non-aggregate output needs the per-group scatter or eval-level grouping;
+ * the real rewrite runs later in the classification pass. */
+static int is_decomposable_agg_compound(ray_t* expr, ray_t* tbl) {
+    enum { PROBE_CAP = 64 };
+    ray_t* hexprs[PROBE_CAP];
+    int64_t hnames[PROBE_CAP];
+    int n_hidden = 0;
+    ray_t* rw = try_decompose_agg_arith(expr, tbl, hexprs, hnames,
+                                        &n_hidden, PROBE_CAP);
+    if (!rw) return 0;
+    ray_release(rw);
+    return 1;
 }
 
 static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len) {
@@ -4317,6 +4352,7 @@ static ray_t* try_count_distinct_v2_rewrite(
          * so set it explicitly instead of leaning on a zero default that
          * used to be coerced to desc inside group.c. */
         emit_f.desc = 1;
+        emit_f.target_depth = __VM ? __VM->eval_depth : 0;   /* executed right here */
         ray_group_emit_filter_set(emit_f);
         emit_set = 1;
     }
@@ -6185,8 +6221,11 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     ray_group_emit_filter_t emit_filter = {0};
     bool emit_filter_set = match_group_count_emit_filter(
         from_expr, where_expr, &emit_filter);
-    if (emit_filter_set)
+    if (emit_filter_set) {
+        /* armed for the DIRECT child select evaluated by the from: below */
+        emit_filter.target_depth = (__VM ? __VM->eval_depth : 0) + 1;
         ray_group_emit_filter_set(emit_filter);
+    }
     /* Projection pushdown: publish the columns this select references so an
      * IMMEDIATE nested `select {by:}` distinct in `from:` (eval_depth+1) carries
      * only those.  Stack buffer stays live across the from: eval; save/restore
@@ -7598,6 +7637,10 @@ by_dict_done:
                 if (is_single_group_key_projection(by_expr, dict_elems[i + 1]))
                     continue;
                 if (is_group_dag_agg_expr(dict_elems[i + 1])) continue;
+                /* Arithmetic over aggregates is served by hidden agg slots
+                 * plus one post-group evaluation on any key shape; it must
+                 * not push multi-key queries onto eval-level grouping. */
+                if (is_decomposable_agg_compound(dict_elems[i + 1], tbl)) continue;
                 any_nonagg = 1;
                 if (can_atom_broadcast(dict_elems[i + 1])) continue;
                 if (!match_count_distinct(dict_elems[i + 1])) { any_true_nonagg = 1; break; }
@@ -9501,7 +9544,25 @@ by_dict_done:
             }
             agg_ins2[n_aggs] = NULL;
             agg_k[n_aggs] = 0;
-            if (hop == OP_TOP_N || hop == OP_BOT_N) {
+            if (agg_is_binary_agg(hop)) {
+                /* hidden_agg_shape_ok admitted two bare column arguments */
+                agg_ins2[n_aggs] = compile_expr_dag(g, he[2]);
+                if (!agg_ins2[n_aggs]) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument");
+                }
+                if (agg_ins2[n_aggs]->out_type > 0 &&
+                    !agg_type_admitted(hop, agg_ins2[n_aggs]->out_type)) {
+                    int8_t in_t = agg_ins2[n_aggs]->out_type;
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select by: binary aggregation does not admit second input type %s", ray_type_name(in_t));
+                }
+                has_binary_agg = 1;
+            } else if (hop == OP_TOP_N || hop == OP_BOT_N) {
                 has_list_agg = 1;
                 if (ray_len(hidden_agg_exprs[hi]) < 3) {
                     for (int ci = 0; ci < n_compound; ci++)
@@ -10572,6 +10633,7 @@ by_dict_done:
     bool self_emit_set = false;
     if (pre_top_emit_matched) {
         prev_self_emit = ray_group_emit_filter_get();
+        pre_top_emit.target_depth = __VM ? __VM->eval_depth : 0;   /* our own group node */
         ray_group_emit_filter_set(pre_top_emit);
         self_emit_set = true;
     }

@@ -1,0 +1,111 @@
+;; `by: ... desc:|asc: AGG take: N` arms the top-N emit filter.  These shapes
+;; used to bypass the parallel grouping engine entirely and run on the legacy
+;; ladder (single-threaded scatter, state sized by the shared sym domain):
+;; a three-aggregate top-N over 100k groups took 800 ms on one core and did
+;; not speed up on a 28-thread pool.  Now every shape the parallel engine
+;; admits with a bounded dense plan runs there and its full result is
+;; trimmed to the filter's top-N superset; the DAG's sort+take finalizes the
+;; exact order and limit exactly as before.
+;;
+;; Each case compares the filtered query with the same query grouped
+;; without take:, then sorted and cut down the same way.
+
+(set n 30000)
+(set i (til n))
+(set t (table [k j s v w] (list (% (* i 7) 1000) (% i 5) (at ['a 'b 'c 'd 'e 'f 'g] (% (* i 3) 7)) (% (* i 13) 97) (as 'F64 (% (* i 31) 89)))))
+
+;; single int key, count desc
+(set a1 (select {from: t by: k c: (count v) desc: c take: 7}))
+(set b1 (take (xdesc (select {from: t by: k c: (count v)}) 'c) 7))
+(count a1) -- 7
+(all (== (at a1 'c) (at b1 'c))) -- true
+(all (== (at a1 'k) (at b1 'k))) -- true
+
+;; three aggregates, ordered by sum desc (the multi-aggregate shape that was 60x slower)
+(set a2 (select {from: t by: k s: (sum v) c: (count v) a: (avg w) desc: s take: 10}))
+(set b2 (take (xdesc (select {from: t by: k s: (sum v) c: (count v) a: (avg w)}) 's) 10))
+(count a2) -- 10
+(all (== (at a2 's) (at b2 's))) -- true
+(all (== (at a2 'k) (at b2 'k))) -- true
+(all (< (abs (- (at a2 'a) (at b2 'a))) 1e-9)) -- true
+
+;; asc on min, multi-key by
+(set a3 (select {from: t by: [k j] m: (min v) asc: m take: 5}))
+(set b3 (take (xasc (select {from: t by: [k j] m: (min v)}) 'm) 5))
+(count a3) -- 5
+(all (== (at a3 'm) (at b3 'm))) -- true
+
+;; max desc with a where filter (filtered dense plan, parallel prescan)
+(set a4 (select {from: t by: k m: (max v) where: (> w 40) desc: m take: 8}))
+(set b4 (take (xdesc (select {from: t by: k m: (max v) where: (> w 40)}) 'm) 8))
+(count a4) -- 8
+(all (== (at a4 'm) (at b4 'm))) -- true
+
+;; symbol key, count desc: the top-N SET is fully determined here because
+;; every symbol's count is distinct
+(set a5 (select {from: t by: s c: (count v) desc: c take: 3}))
+(set b5 (take (xdesc (select {from: t by: s c: (count v)}) 'c) 3))
+(count a5) -- 3
+(all (== (at a5 'c) (at b5 'c))) -- true
+
+;; take larger than the group count returns every group
+(set a6 (select {from: t by: j c: (count v) desc: c take: 100}))
+(count a6) -- 5
+(sum (at a6 'c)) -- 30000
+
+;; ties: the emitted rows are a valid top-N (every emitted count is >= the
+;; N-th largest count of the full grouping)
+(set a7 (select {from: t by: k c: (count v) desc: c take: 20}))
+(set full7 (xdesc (select {from: t by: k c: (count v)}) 'c))
+(count a7) -- 20
+(all (>= (at a7 'c) (at (at full7 'c) 19))) -- true
+(== (sum (at a7 'c)) (sum (take (at full7 'c) 20))) -- true
+
+;; routes that emit every group and trim afterwards: a string key (shared
+;; directory) and a buffered aggregate beside the ordering count
+(set ts (table [s v] (list (at ["alpha" "beta" "gamma" "delta" "eps"] (% i 5)) (% (* i 13) 97))))
+(set a8 (select {from: ts by: s c: (count v) desc: c take: 2}))
+(set b8 (take (xdesc (select {from: ts by: s c: (count v)}) 'c) 2))
+(count a8) -- 2
+(all (== (at a8 'c) (at b8 'c))) -- true
+(set a9 (select {from: t by: k m: (med v) c: (count v) desc: c take: 4}))
+(set b9 (take (xdesc (select {from: t by: k m: (med v) c: (count v)}) 'c) 4))
+(count a9) -- 4
+(all (== (at a9 'c) (at b9 'c))) -- true
+(all (== (at a9 'm) (at b9 'm))) -- true
+
+;; null-valued groups: the sort ranks nulls first ascending and last
+;; descending, so an all-null group is rank 1 of an asc take and absent from
+;; a desc take -- on the native selections and on the trimmed routes alike
+(set tn (update {from: (table [k v] (list (% i 6) (% (* i 7) 50))) v: 0N where: (== k 2)}))
+(set a10 (select {from: tn by: k m: (min v) asc: m take: 2}))
+(count a10) -- 2
+(at (at a10 'k) 0) -- 2
+(nil? (at (at a10 'm) 0)) -- true
+(set a11 (select {from: tn by: k m: (min v) desc: m take: 2}))
+(count a11) -- 2
+(all (!= (at a11 'k) 2)) -- true
+(set tf (update {from: (table [k v] (list (% i 6) (as 'F64 (% (* i 7) 50)))) v: 0Nf where: (== k 3)}))
+(set a12 (select {from: tf by: k m: (max v) asc: m take: 2}))
+(at (at a12 'k) 0) -- 3
+(set a13 (select {from: tf by: k m: (max v) desc: m take: 2}))
+(all (!= (at a13 'k) 3)) -- true
+;; the same shape with a string key runs the trimmed route
+(set tsn (table [s v] (list (at ["a" "b" "c" "d" "e" "f"] (% i 6)) (at tn 'v))))
+(set a14 (select {from: tsn by: s m: (min v) asc: m take: 2}))
+(at (at a14 's) 0) -- "c"
+
+;; the emit filter is armed while the matched select's from: evaluates; a
+;; grouped select nested inside must not be trimmed by it.  Every inner sum
+;; is 0 here, so an erroneous trim (sum > 5) would empty the inner result and
+;; the outer count would drop from 1 to 0.
+(set tz (table [k v] (list (% i 1000) (* 0 i))))
+(set nested (select {from: (select {from: (select {from: tz by: k s: (sum v)}) by: s c: (count s)}) where: (> c 5)}))
+(count nested) -- 1
+(at (at nested 'c) 0) -- 1000
+;; inner node whose slot 0 IS a count, but a different node than the matched
+;; one: its counts (30 each) all fail the outer threshold (> 100), so a leaked
+;; trim would empty it; the outer result must still see all 1000 inner groups
+(set nested2 (select {from: (select {from: (select {from: tz by: k c: (count v)}) by: c n: (count c)}) where: (> n 100)}))
+(count nested2) -- 1
+(at (at nested2 'n) 0) -- 1000

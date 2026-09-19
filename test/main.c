@@ -34,6 +34,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "test.h"
+#include "ops/agg_engine.h"   /* --census: agg_route_stats */
 #include "test_rfl.h"
 
 #include <stdio.h>
@@ -218,7 +219,7 @@ static const test_entry_t* const compiled_groups[] = {
  * evaluates it under a fresh runtime (via rfl_setup/rfl_teardown).
  */
 
-#define RFL_THUNK_CAPACITY 512
+#define RFL_THUNK_CAPACITY 1024
 
 static char  g_rfl_paths[RFL_THUNK_CAPACITY][512];
 static char  g_rfl_names[RFL_THUNK_CAPACITY][256];
@@ -330,6 +331,38 @@ static void rfl_rewrite_goldens(const char* path, const int* lns, char (*vals)[5
     free(s); fclose(o);
 }
 
+/* --census PATH: after every evaluated .rfl line, record grouped selects
+ * that reached the legacy grouping ladder (route counters are per thread
+ * and reset before each line).  One tab-separated line per hit:
+ * reason, file:line, source.  Diagnostic only; off unless the flag is set. */
+static FILE* g_census = NULL;
+static const char* census_reason_name(agg_v2_reason_t r) {
+    switch (r) {
+        case AGG_V2_ADMITTED:       return "admitted";
+        case AGG_V2_SHAPE:          return "shape";
+        case AGG_V2_KEY_EXPRESSION: return "key_expression";
+        case AGG_V2_KEY_TYPE:       return "key_type";
+        case AGG_V2_AGG_EXPRESSION: return "agg_expression";
+        case AGG_V2_AGG_TYPE:       return "agg_type";
+        case AGG_V2_BUFFERED:       return "buffered";
+        case AGG_V2_PARAMETER:      return "parameter";
+        case AGG_V2_DISABLED:       return "disabled";
+        case AGG_V2_EMIT_FILTER:    return "emit_filter";
+        case AGG_V2_PARALLEL_WIDE:  return "parallel_wide";
+    }
+    return "unknown";
+}
+static ray_t* rfl_eval(const char* src, const char* path, int line_no) {
+    if (g_census) agg_route_reset();
+    ray_t* v = ray_eval_str(src);
+    if (g_census) {
+        agg_route_stats_t st = agg_route_stats();
+        if (st.routes[AGG_ROUTE_LEGACY] > 0)
+            fprintf(g_census, "%s\t%s:%d\t%s\n", census_reason_name(st.last_v2_reason), path, line_no, src);
+    }
+    return v;
+}
+
 static test_result_t run_rfl_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) FAILF("cannot open %s", path);
@@ -380,7 +413,7 @@ static test_result_t run_rfl_file(const char* path) {
             *eq = '\0';
             char* lhs = start;
             char* rhs = eq + 4;
-            ray_t* le = ray_eval_str(lhs);
+            ray_t* le = rfl_eval(lhs, path, line_no);
             if (RAY_IS_ERR(le)) {
                 char buf[512]; fmt_into(le, buf, sizeof buf);
                 snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
@@ -424,7 +457,7 @@ static test_result_t run_rfl_file(const char* path) {
             *er = '\0';
             char* expr   = start;
             char* substr = er + 4;
-            ray_t* ev = ray_eval_str(expr);
+            ray_t* ev = rfl_eval(expr, path, line_no);
             if (!RAY_IS_ERR(ev)) {
                 /* ev is a value here — we expected an error but got one. */
                 char buf[512]; fmt_into(ev, buf, sizeof buf);
@@ -451,7 +484,7 @@ static test_result_t run_rfl_file(const char* path) {
             ray_error_free(ev);
         } else {
             /* Raw Rayfall code — eval; error is a test failure. */
-            ray_t* ev = ray_eval_str(start);
+            ray_t* ev = rfl_eval(start, path, line_no);
             if (ev && RAY_IS_ERR(ev)) {
                 char buf[512]; fmt_into(ev, buf, sizeof buf);
                 snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
@@ -572,7 +605,71 @@ static void rfl_teardown(void) {
     X(480) X(481) X(482) X(483) X(484) X(485) X(486) X(487) \
     X(488) X(489) X(490) X(491) X(492) X(493) X(494) X(495) \
     X(496) X(497) X(498) X(499) X(500) X(501) X(502) X(503) \
-    X(504) X(505) X(506) X(507) X(508) X(509) X(510) X(511)
+    X(504) X(505) X(506) X(507) X(508) X(509) X(510) X(511) \
+    X(512) X(513) X(514) X(515) X(516) X(517) X(518) X(519) \
+    X(520) X(521) X(522) X(523) X(524) X(525) X(526) X(527) \
+    X(528) X(529) X(530) X(531) X(532) X(533) X(534) X(535) \
+    X(536) X(537) X(538) X(539) X(540) X(541) X(542) X(543) \
+    X(544) X(545) X(546) X(547) X(548) X(549) X(550) X(551) \
+    X(552) X(553) X(554) X(555) X(556) X(557) X(558) X(559) \
+    X(560) X(561) X(562) X(563) X(564) X(565) X(566) X(567) \
+    X(568) X(569) X(570) X(571) X(572) X(573) X(574) X(575) \
+    X(576) X(577) X(578) X(579) X(580) X(581) X(582) X(583) \
+    X(584) X(585) X(586) X(587) X(588) X(589) X(590) X(591) \
+    X(592) X(593) X(594) X(595) X(596) X(597) X(598) X(599) \
+    X(600) X(601) X(602) X(603) X(604) X(605) X(606) X(607) \
+    X(608) X(609) X(610) X(611) X(612) X(613) X(614) X(615) \
+    X(616) X(617) X(618) X(619) X(620) X(621) X(622) X(623) \
+    X(624) X(625) X(626) X(627) X(628) X(629) X(630) X(631) \
+    X(632) X(633) X(634) X(635) X(636) X(637) X(638) X(639) \
+    X(640) X(641) X(642) X(643) X(644) X(645) X(646) X(647) \
+    X(648) X(649) X(650) X(651) X(652) X(653) X(654) X(655) \
+    X(656) X(657) X(658) X(659) X(660) X(661) X(662) X(663) \
+    X(664) X(665) X(666) X(667) X(668) X(669) X(670) X(671) \
+    X(672) X(673) X(674) X(675) X(676) X(677) X(678) X(679) \
+    X(680) X(681) X(682) X(683) X(684) X(685) X(686) X(687) \
+    X(688) X(689) X(690) X(691) X(692) X(693) X(694) X(695) \
+    X(696) X(697) X(698) X(699) X(700) X(701) X(702) X(703) \
+    X(704) X(705) X(706) X(707) X(708) X(709) X(710) X(711) \
+    X(712) X(713) X(714) X(715) X(716) X(717) X(718) X(719) \
+    X(720) X(721) X(722) X(723) X(724) X(725) X(726) X(727) \
+    X(728) X(729) X(730) X(731) X(732) X(733) X(734) X(735) \
+    X(736) X(737) X(738) X(739) X(740) X(741) X(742) X(743) \
+    X(744) X(745) X(746) X(747) X(748) X(749) X(750) X(751) \
+    X(752) X(753) X(754) X(755) X(756) X(757) X(758) X(759) \
+    X(760) X(761) X(762) X(763) X(764) X(765) X(766) X(767) \
+    X(768) X(769) X(770) X(771) X(772) X(773) X(774) X(775) \
+    X(776) X(777) X(778) X(779) X(780) X(781) X(782) X(783) \
+    X(784) X(785) X(786) X(787) X(788) X(789) X(790) X(791) \
+    X(792) X(793) X(794) X(795) X(796) X(797) X(798) X(799) \
+    X(800) X(801) X(802) X(803) X(804) X(805) X(806) X(807) \
+    X(808) X(809) X(810) X(811) X(812) X(813) X(814) X(815) \
+    X(816) X(817) X(818) X(819) X(820) X(821) X(822) X(823) \
+    X(824) X(825) X(826) X(827) X(828) X(829) X(830) X(831) \
+    X(832) X(833) X(834) X(835) X(836) X(837) X(838) X(839) \
+    X(840) X(841) X(842) X(843) X(844) X(845) X(846) X(847) \
+    X(848) X(849) X(850) X(851) X(852) X(853) X(854) X(855) \
+    X(856) X(857) X(858) X(859) X(860) X(861) X(862) X(863) \
+    X(864) X(865) X(866) X(867) X(868) X(869) X(870) X(871) \
+    X(872) X(873) X(874) X(875) X(876) X(877) X(878) X(879) \
+    X(880) X(881) X(882) X(883) X(884) X(885) X(886) X(887) \
+    X(888) X(889) X(890) X(891) X(892) X(893) X(894) X(895) \
+    X(896) X(897) X(898) X(899) X(900) X(901) X(902) X(903) \
+    X(904) X(905) X(906) X(907) X(908) X(909) X(910) X(911) \
+    X(912) X(913) X(914) X(915) X(916) X(917) X(918) X(919) \
+    X(920) X(921) X(922) X(923) X(924) X(925) X(926) X(927) \
+    X(928) X(929) X(930) X(931) X(932) X(933) X(934) X(935) \
+    X(936) X(937) X(938) X(939) X(940) X(941) X(942) X(943) \
+    X(944) X(945) X(946) X(947) X(948) X(949) X(950) X(951) \
+    X(952) X(953) X(954) X(955) X(956) X(957) X(958) X(959) \
+    X(960) X(961) X(962) X(963) X(964) X(965) X(966) X(967) \
+    X(968) X(969) X(970) X(971) X(972) X(973) X(974) X(975) \
+    X(976) X(977) X(978) X(979) X(980) X(981) X(982) X(983) \
+    X(984) X(985) X(986) X(987) X(988) X(989) X(990) X(991) \
+    X(992) X(993) X(994) X(995) X(996) X(997) X(998) X(999) \
+    X(1000) X(1001) X(1002) X(1003) X(1004) X(1005) X(1006) X(1007) \
+    X(1008) X(1009) X(1010) X(1011) X(1012) X(1013) X(1014) X(1015) \
+    X(1016) X(1017) X(1018) X(1019) X(1020) X(1021) X(1022) X(1023)
 
 #define X(N) static test_result_t rfl_thunk_##N(void) { return run_rfl_at(N); }
 RFL_THUNKS(X)
@@ -606,6 +703,8 @@ static int rfl_scan_at(const char* base_root, const char* cur_dir) {
         size_t nlen = strlen(ent->d_name);
         if (nlen < 4 || strcmp(ent->d_name + nlen - 4, ".rfl") != 0) continue;
 
+        _Static_assert(sizeof(rfl_thunks) / sizeof(*rfl_thunks) == RFL_THUNK_CAPACITY,
+                       "one thunk per .rfl slot: extend RFL_THUNKS with RFL_THUNK_CAPACITY");
         if (g_rfl_count >= RFL_THUNK_CAPACITY) {
             fprintf(stderr, "test driver: more than %d .rfl files — raise RFL_THUNK_CAPACITY\n",
                     RFL_THUNK_CAPACITY);
@@ -759,9 +858,13 @@ int main(int argc, char** argv) {
         if ((strcmp(argv[i], "--filter") == 0 || strcmp(argv[i], "-f") == 0)
             && i + 1 < argc) {
             filter = argv[++i];
+        } else if (strcmp(argv[i], "--census") == 0 && i + 1 < argc) {
+            g_census = fopen(argv[++i], "w");
+            if (!g_census) { fprintf(stderr, "cannot open census file\n"); return 2; }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [-f SUBSTR]\n", argv[0]);
+            printf("Usage: %s [-f SUBSTR] [--census PATH]\n", argv[0]);
             printf("  -f, --filter SUBSTR   Only run tests whose name contains SUBSTR.\n");
+            printf("  --census PATH         Record .rfl lines whose grouping ran on the legacy ladder.\n");
             return 0;
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -769,6 +872,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
     const char* rfl_root = getenv("RFL_ROOT");
     if (!rfl_root || !*rfl_root) rfl_root = "test/rfl";
     if (rfl_scan(rfl_root) < 0) return 2;

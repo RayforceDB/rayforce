@@ -1,0 +1,57 @@
+;; Composite dense plans over symbol keys with interleaved codes.
+;;
+;; Symbol columns share one domain, so their codes interleave with every
+;; other symbol column's: two 100-value keys each span a 100k-code range and
+;; their raw product (10^10) rejected the dense plan although only 10^4
+;; groups exist, sending the query to radix (505 ms vs 52 ms on one core for
+;; 10M rows).  The plan now compacts each key to the codes it uses when the
+;; raw product overflows.  The reference below groups by the integer indices
+;; the symbols were generated from; names are zero-padded so symbol order
+;; equals index order.
+
+(set n 40000)
+(set i (til n))
+(set ai (% i 100))
+(set bi (% (div i 100) 100))
+(set ci (% (* i 7) 3000))
+;; interleave: intern one c symbol between every a and b symbol
+(set names-a (map (fn [x] (format "a%" (+ 1000 x))) (til 100)))
+(set names-b (map (fn [x] (format "b%" (+ 1000 x))) (til 100)))
+(set names-c (map (fn [x] (format "c%" (+ 10000 x))) (til 3000)))
+(set mix (raze (map (fn [x] (list (at names-c (% (* x 31) 3000)) (at names-a (% x 100)) (at names-c (% (* x 17) 3000)) (at names-b (% x 100)))) (til 3000))))
+(set mixsym (as 'SYM mix))
+(set syms-a (as 'SYM names-a))
+(set syms-b (as 'SYM names-b))
+(set syms-c (as 'SYM names-c))
+(set a (at syms-a ai))
+(set b (at syms-b bi))
+(set c (at syms-c ci))
+(set v (% (* i 11) 101))
+(set t (table [a b c ai bi ci v] (list a b c ai bi ci v)))
+
+;; two symbol keys: 10,000 groups
+(set r (xasc (select {from: t s: (sum v) n: (count v) by: {a: a b: b}}) ['a 'b]))
+(set p (xasc (select {from: t s: (sum v) n: (count v) by: {ai: ai bi: bi}}) ['ai 'bi]))
+(count r) -- 10000
+(count p) -- 10000
+(all (== (at r 's) (at p 's))) -- true
+(all (== (at r 'n) (at p 'n))) -- true
+(all (== (at r 'a) (at syms-a (at p 'ai)))) -- true
+(all (== (at r 'b) (at syms-b (at p 'bi)))) -- true
+
+;; three keys, one wide: 40,000 rows, key c has 3,000 codes
+(set r3 (xasc (select {from: t s: (sum v) by: {a: a c: c}}) ['a 'c]))
+(set p3 (xasc (select {from: t s: (sum v) by: {ai: ai ci: ci}}) ['ai 'ci]))
+(== (count r3) (count p3)) -- true
+(all (== (at r3 's) (at p3 's))) -- true
+
+;; mixed symbol + integer keys, with a where filter and top-N
+(set r4 (select {from: t s: (sum v) by: {a: a bi: bi} where: (> v 50) desc: s take: 5}))
+(set p4 (take (xdesc (select {from: t s: (sum v) by: {ai: ai bi: bi} where: (> v 50)}) 's) 5))
+(all (== (at r4 's) (at p4 's))) -- true
+(all (== (at r4 'bi) (at p4 'bi))) -- true
+
+;; arithmetic over aggregates on the compacted composite key
+(set r5 (xasc (select {from: t d: (- (max v) (min v)) by: {a: a b: b}}) ['a 'b]))
+(set p5 (xasc (select {from: t mx: (max v) mn: (min v) by: {ai: ai bi: bi}}) ['ai 'bi]))
+(all (== (at r5 'd) (- (at p5 'mx) (at p5 'mn)))) -- true

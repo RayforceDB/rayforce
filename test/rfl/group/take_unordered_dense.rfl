@@ -1,0 +1,21 @@
+;; An unordered `take: N` on a grouped select returns the first N groups in
+;; first-seen order.  Bounded-domain keys used to be excluded from the dense
+;; plan for this shape and fell to the radix bounded emit (105 ms serial for
+;; 10M rows where the dense count took 17 ms).  The task-local dense path
+;; keeps a true first row per slot, so it selects the N smallest first rows.
+
+(set n 200000)
+(set t (table [k v] (list (as 'I32 (% (* (til n) 7919) 50000)) (til n))))
+(set r (select {from: t f: (first v) c: (count v) by: {k: k} take: 10}))
+(count r) -- 10
+;; the first 10 groups in first-seen order have the 10 smallest first rows,
+;; and they come out in that order
+(all (== (at r 'f) (take (asc (at (select {from: t f: (first v) by: {k: k}}) 'f)) 10))) -- true
+(all (> (at r 'c) 0)) -- true
+;; take larger than the group count returns everything, still ordered
+(set r2 (select {from: t f: (first v) by: {k: k} take: 100000}))
+(count r2) -- 50000
+;; a composite bounded key takes the same path
+(set r3 (select {from: t f: (first v) by: {k: k j: (% v 3)} take: 7}))
+(count r3) -- 7
+(all (== (at r3 'f) (asc (at r3 'f)))) -- true

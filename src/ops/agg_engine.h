@@ -21,7 +21,7 @@ typedef enum {
     AGG_V2_BUFFERED,
     AGG_V2_PARAMETER,
     AGG_V2_DISABLED,
-    AGG_V2_EMIT_FILTER,
+    AGG_V2_EMIT_FILTER,     /* no longer produced: v2 owns the emit filter */
     AGG_V2_PARALLEL_WIDE,
 } agg_v2_reason_t;
 
@@ -64,6 +64,8 @@ typedef struct {
     uint64_t dense_local_slots;     /* allocated group-state slots, including partials */
     uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
     uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
+    bool topn_native;               /* last v2 run selected the emit filter's top-N itself */
+    int64_t topn_kept;              /* groups kept by that selection (ties included) */
 } agg_route_stats_t;
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
@@ -74,6 +76,34 @@ void agg_route_reason(agg_v2_reason_t reason);
 /* True iff the v2 engine fully supports this group node over this table.
  * Conservative: any uncertainty → false → caller uses the existing engine. */
 bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+
+/* Top-N keep decision shared by every strategy: keep[i] = 1 when group i
+ * passes min_count_exclusive and (when top_count_take > 0) lies within the
+ * top-N by value in the filter's direction, ties included (a superset of N;
+ * the DAG's sort+take downstream finalizes order and limit).  Returns the
+ * number kept.  vals may be NULL when n == 0. */
+int64_t agg_topn_keep(const double* vals, int64_t n,
+                      const ray_group_emit_filter_t* ef, uint8_t* keep);
+/* The two halves of agg_topn_keep, for callers that reduce candidates in
+ * parallel: the N-th value in the keep direction (false when every value is
+ * kept), and the keep marking against a known threshold. */
+bool agg_topn_threshold(const double* vals, int64_t n,
+                        const ray_group_emit_filter_t* ef, double* thr);
+int64_t agg_topn_mark(const double* vals, int64_t n, const ray_group_emit_filter_t* ef,
+                      bool have_thr, double thr, uint8_t* keep);
+
+/* Double view of aggregate `vt` for n groups: group i's state is at
+ * states + (slots ? slots[i] : i) * stride + off.  Nulls (and NaN) map to
+ * -INFINITY, where the sort places them (first ascending, last descending).
+ * Returns false for an out_type without a scalar order (LIST, STR, ...). */
+bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
+                          size_t stride, size_t off, const int64_t* slots,
+                          int64_t n, int64_t param, double* out);
+
+/* Trim a finished group result to the emit filter's kept superset (row order
+ * preserved; consumes `result`).  Used by routes that emit every group. */
+ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
+                            const uint16_t* agg_ops, const ray_group_emit_filter_t* ef);
 
 /* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
  * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when
@@ -149,7 +179,17 @@ typedef struct {
     int64_t  ranges[16];    /* [16]: dense direct-index routing self-limits to <=16 keys (agg_dense_plan) */
     int64_t  strides[16];   /* [16]: dense self-limit <=16; composite packing: slot = sum_k (key_k - min_k)*strides[k] */
     int64_t  total_slots;   /* product of ranges */
+    /* Compacted keys (composite plans whose raw range product overflowed):
+     * remap[k][code - mins[k]] is the dense component of a code that occurs
+     * in the input, inverse[k][component] the original code.  NULL for keys
+     * that use their raw range.  Owned by the plan: agg_dense_plan_free. */
+    int32_t* remap[16];
+    int64_t* inverse[16];
+    bool     compacted;     /* any remap set: hot loops select the remap form once */
 } dense_plan_t;
+
+/* Release a plan's compaction tables (no-op for raw-range plans). */
+void agg_dense_plan_free(dense_plan_t* dp);
 
 /* Decide if dense grouping applies to (key_cols, aggs).  Eligible iff:
  *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} with a dedicated slot for nullable keys
