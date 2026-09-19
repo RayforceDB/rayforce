@@ -1815,7 +1815,9 @@ static test_result_t test_radix_native_topn(void) {
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 1);
     TEST_ASSERT_TRUE(stats.topn_native);
-    TEST_ASSERT_TRUE(stats.topn_kept >= 10 && stats.topn_kept < 100000);
+    /* counts are 1 or 2: the top-10 superset is every count-2 group (500,000
+     * of 1,500,000), not the full group set */
+    TEST_ASSERT_EQ_I(stats.topn_kept, 500000);
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
     ray_t* check = ray_eval_str(
         "(== (at (at (select {from:rt_t by:[k j] c:(count v) desc:c take:10}) 'c) 0) "
@@ -1848,8 +1850,9 @@ static test_result_t test_dense_native_topn(void) {
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
     TEST_ASSERT_TRUE(stats.topn_native);
     /* 50k groups sit below the parallel threshold (one selection task): the
-     * native selection must still cut the group set down to N plus ties. */
-    TEST_ASSERT_TRUE(stats.topn_kept >= 5 && stats.topn_kept < 1000);
+     * native selection must still cut the group set down to N plus ties —
+     * here every group whose sum equals the maximum (126), 3,846 of 50,000. */
+    TEST_ASSERT_EQ_I(stats.topn_kept, 3846);
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
     ray_t* check = ray_eval_str(
         "(all (== (at (select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5}) 's) "
