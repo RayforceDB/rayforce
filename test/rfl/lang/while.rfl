@@ -1,0 +1,129 @@
+;; (while cond body...) — the language's only early-terminating loop.
+;;
+;; Motivation (issue 588): every iteration primitive is exhaustive, so a
+;; "repeat until done" loop had to be a fold over a fixed range whose full
+;; length was paid on every call.  `while` stops when the condition says so.
+;;
+;; Two implementations must agree: the tree walker (ray_while_fn in eval.c)
+;; and the bytecode compiler (the sf_while case in compile.c, which emits a
+;; backward OP_JMP).  Every behavioural assertion below is therefore made
+;; twice where it can be — once at top level (tree walk) and once inside a
+;; lambda (compiled).  The `let`-as-loop-variable cases are the ones that
+;; would catch the two paths drifting apart: `let` binds in the top scope
+;; frame (env.c env_bind_local), so a per-iteration scope push here would
+;; make loop-carried `let` state work compiled and hang interpreted.
+
+;; ── basic iteration ──────────────────────────────────────────────────
+(set i 0)
+(set n 0)
+(while (< i 5) (set n (+ n 1)) (set i (+ i 1)))
+i -- 5
+n -- 5
+
+;; a statement form: always null, whatever the body evaluated to
+(set i 0)
+(nil? (while (< i 2) (set i (+ i 1)) 'discarded)) -- true
+
+;; zero-trip loop: body never runs, result is still null
+(set x 99)
+(nil? (while false (set x 1))) -- true
+x -- 99
+
+;; a false-from-the-start condition that is an expression, not a literal
+(set g 0)
+(while (> g 0) (set g (+ g 1)))
+g -- 0
+
+;; ── body-less form ───────────────────────────────────────────────────
+;; The condition alone drives the loop — there is no sequence to fold over,
+;; which is the shape the issue's drain loop actually wanted.
+(set k 0)
+(while (do (set k (+ k 1)) (< k 4)))
+k -- 4
+
+;; ── arity ────────────────────────────────────────────────────────────
+(while) !- domain
+
+;; ── termination is condition-driven, not bounded by a range ──────────
+;; The step runs exactly as many times as there is work.  This is precisely
+;; what the fold-left workaround could not do: it called the lambda for all
+;; DRAIN_STEPS elements however early the drain finished.
+(set work 3)
+(set calls 0)
+(set step (fn [] (set calls (+ calls 1)) (set work (- work 1)) (> work 0)))
+(set more true)
+(while more (set more (step)))
+calls -- 3
+work -- 0
+
+;; ── locals: `let` as loop-carried state ──────────────────────────────
+;; Compiled path: `let` writes a function-level slot, so it survives the
+;; iteration.  If the interpreter ever pushes a per-iteration scope, the
+;; same source hangs instead — which is why this is asserted both ways.
+((fn [n] (let i 0) (let acc 0) (while (< i n) (let acc (+ acc i)) (let i (+ i 1))) acc) 4) -- 6
+
+;; the loop condition reads a lambda PARAM (the special_form_locals hazard)
+((fn [n] (let c 0) (while (< c n) (let c (+ c 1))) c) 3) -- 3
+
+;; tree-walk path, same arithmetic, via globals
+(set i 0)
+(set acc 0)
+(while (< i 4) (set acc (+ acc i)) (set i (+ i 1)))
+acc -- 6
+
+;; a lambda-local loop must not leak its names to the global env
+((fn [] (let scratch 7) (while false (let scratch 8)) scratch)) -- 7
+scratch !- name
+
+;; ── `return` from inside a body exits the enclosing lambda ───────────
+;; The compiled `while` must route its body through the normal sf_return
+;; path.  If `while` fell back to a dynamic tree-walk eval, `return` would
+;; degrade to identity and the loop would run all ten iterations.
+(set hits 0)
+((fn [] (let i 0) (while (< i 10) (set hits (+ hits 1)) (if (> i 2) (return 42)) (let i (+ i 1))) 7)) -- 42
+hits -- 4
+
+;; without the early return the same loop runs to completion
+(set hits 0)
+((fn [] (let i 0) (while (< i 10) (set hits (+ hits 1)) (let i (+ i 1))) 7)) -- 7
+hits -- 10
+
+;; ── errors ───────────────────────────────────────────────────────────
+;; An error raised in the body propagates out and stops the loop — note the
+;; loop would otherwise never terminate, so `c` pins that it stopped on the
+;; FIRST pass.  `raise` reports as a bare `domain` error and carries its
+;; payload on __VM->raise_val (eval.c ray_raise_fn), so the payload is
+;; asserted through `try`, which is the only way to observe it.
+(set c 0)
+(== (try (while true (set c (+ c 1)) (raise 'boom)) (fn [e] e)) 'boom) -- true
+c -- 1
+
+;; an error raised in the condition propagates before the body ever runs
+(set c 0)
+(== (try (while (raise 'bad-cond) (set c (+ c 1))) (fn [e] e)) 'bad-cond) -- true
+c -- 0
+
+;; same, unwinding out of a compiled lambda
+(== (try ((fn [] (while true (raise 'inner)))) (fn [e] e)) 'inner) -- true
+
+;; a plain (non-raise) error in the body also terminates the loop
+(set c 0)
+(while true (set c (+ c 1)) (fold-right +)) !- domain
+c -- 1
+
+;; ── nesting ──────────────────────────────────────────────────────────
+(set total 0)
+(set i 0)
+(while (< i 3) (set j 0) (while (< j 2) (set total (+ total 1)) (set j (+ j 1))) (set i (+ i 1)))
+total -- 6
+
+;; nested, compiled, with let-locals on both levels
+((fn [] (let i 0) (let t 0) (while (< i 3) (let j 0) (while (< j 2) (let t (+ t 1)) (let j (+ j 1))) (let i (+ i 1))) t)) -- 6
+
+;; ── explicit per-iteration isolation still composes ──────────────────
+;; `while` does not push a scope; `do` does.  Wrapping the body in `do`
+;; gives a fresh frame per pass when that is what you want.
+(set out (list))
+(set i 0)
+(while (< i 3) (do (let sq (* i i)) (set out (concat out sq))) (set i (+ i 1)))
+out -- (list 0 1 4)
