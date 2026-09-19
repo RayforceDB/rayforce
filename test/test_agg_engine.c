@@ -2063,6 +2063,48 @@ static test_result_t test_topn_keep(void) {
     PASS();
 }
 
+/* Double view of a finalized aggregate per group, contiguous and via a slot
+ * list; nulls sink to the far end of the keep direction. */
+static test_result_t test_group_values_f64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const agg_vtable_t* vt = agg_resolve(OP_SUM, RAY_I64);
+    TEST_ASSERT_NOT_NULL(vt);
+    enum { STRIDE = 64 };
+    char states[4 * STRIDE];
+    for (int i = 0; i < 4; i++) vt->init(states + i * STRIDE);
+    uint32_t gids[] = {0, 1, 1, 2, 2, 2};
+    int64_t vals[] = {10, 1, 2, 5, 5, 5};
+    ray_valid_t valid = { vals, RAY_I64, false };
+    vt->update_batch(states, STRIDE, gids, vals, &valid, 6, NULL);
+    double out[4];
+    TEST_ASSERT_TRUE(agg_group_values_f64(vt, states, STRIDE, 0, NULL, 3, 0, 1, out));
+    TEST_ASSERT_TRUE(out[0] == 10 && out[1] == 3 && out[2] == 15);
+    /* slot list picks groups 2 and 0 */
+    int64_t slots[] = {2, 0};
+    TEST_ASSERT_TRUE(agg_group_values_f64(vt, states, STRIDE, 0, slots, 2, 0, 1, out));
+    TEST_ASSERT_TRUE(out[0] == 15 && out[1] == 10);
+    /* a group whose only input is null finalizes to a null minimum: it sinks
+     * below every value for desc and above every value for asc */
+    const agg_vtable_t* mn = agg_resolve(OP_MIN, RAY_I64);
+    TEST_ASSERT_NOT_NULL(mn);
+    for (int i = 0; i < 4; i++) mn->init(states + i * STRIDE);
+    uint32_t mgids[] = {0, 1, 3};
+    int64_t mvals[] = {7, 2, NULL_I64};
+    ray_valid_t mvalid = { mvals, RAY_I64, true };
+    mn->update_batch(states, STRIDE, mgids, mvals, &mvalid, 3, NULL);
+    TEST_ASSERT_TRUE(agg_group_values_f64(mn, states, STRIDE, 0, NULL, 4, 0, 1, out));
+    TEST_ASSERT_TRUE(out[0] == 7 && out[1] == 2 && out[3] < out[1]);
+    TEST_ASSERT_TRUE(agg_group_values_f64(mn, states, STRIDE, 0, NULL, 4, 0, 0, out));
+    TEST_ASSERT_TRUE(out[3] > out[0]);
+    /* a list-valued aggregate has no scalar view */
+    const agg_vtable_t* top = agg_resolve(OP_TOP_N, RAY_I64);
+    if (top) TEST_ASSERT_FALSE(agg_group_values_f64(top, states, STRIDE, 0, NULL, 1, 3, 1, out));
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2131,6 +2173,7 @@ const test_entry_t agg_engine_entries[] = {
     { "dense_plan_two_keys",         test_dense_plan_two_keys,         NULL, NULL },
     { "dense_plan_huge_range",       test_dense_plan_huge_range,       NULL, NULL },
     { "topn_keep",                   test_topn_keep,                   NULL, NULL },
+    { "group_values_f64",            test_group_values_f64,            NULL, NULL },
     { "dense_plan_f64_key",          test_dense_plan_f64_key,          NULL, NULL },
     { "dense_plan_buffered_agg",     test_dense_plan_buffered_agg,     NULL, NULL },
     { "dense_plan_nullable_key",     test_dense_plan_nullable_key,     NULL, NULL },

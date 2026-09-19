@@ -10,6 +10,7 @@
 #include "table/sym.h"    /* ray_read_sym */
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 /* Radix output address: high 32 bits partition, low 32 bits local group. */
@@ -1433,6 +1434,39 @@ int64_t agg_topn_keep(const double* vals, int64_t n,
         kept += ok;
     }
     return kept;
+}
+
+bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
+                          size_t stride, size_t off, const int64_t* slots,
+                          int64_t n, int64_t param, uint8_t desc, double* out) {
+    int8_t t = vt->out_type;
+    switch (t) {
+        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
+        case RAY_U8: case RAY_BOOL: break;
+        default: return false;
+    }
+    double null_sink = desc ? -INFINITY : INFINITY;
+    ray_t* cell = ray_vec_new(t, 1);
+    if (!cell || RAY_IS_ERR(cell)) { if (cell) ray_error_free(cell); return false; }
+    cell->len = 1;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t g = slots ? slots[i] : i;
+        const void* state = states + (size_t)g * stride + off;
+        bool is_null = agg_finalize_value(vt, state, cell, 0, param);
+        double v;
+        switch (t) {
+            case RAY_F64: v = ((const double*)ray_data(cell))[0]; break;
+            case RAY_F32: v = ((const float*)ray_data(cell))[0]; break;
+            case RAY_I64: case RAY_TIMESTAMP: v = (double)((const int64_t*)ray_data(cell))[0]; break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: v = (double)((const int32_t*)ray_data(cell))[0]; break;
+            case RAY_I16: v = (double)((const int16_t*)ray_data(cell))[0]; break;
+            default: v = (double)((const uint8_t*)ray_data(cell))[0]; break;
+        }
+        out[i] = is_null || v != v ? null_sink : v;
+    }
+    ray_release(cell);
+    return true;
 }
 
 typedef struct {

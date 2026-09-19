@@ -87,6 +87,14 @@ bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 int64_t agg_topn_keep(const double* vals, int64_t n,
                       const ray_group_emit_filter_t* ef, uint8_t* keep);
 
+/* Double view of aggregate `vt` for n groups: group i's state is at
+ * states + (slots ? slots[i] : i) * stride + off.  Nulls (and NaN) sink to
+ * the far end of the keep direction (`desc`) so they never enter a top-N.
+ * Returns false for an out_type without a scalar order (LIST, STR, ...). */
+bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
+                          size_t stride, size_t off, const int64_t* slots,
+                          int64_t n, int64_t param, uint8_t desc, double* out);
+
 /* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
  * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when
  * positive, an engine strategy may emit only the first `group_limit` groups in
