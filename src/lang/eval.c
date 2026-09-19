@@ -1967,6 +1967,79 @@ ray_t* ray_while_fn(ray_t** args, int64_t n) {
     }
 }
 
+/* Read a loop count from an evaluated atom.  Integers only: floats are
+ * rejected rather than truncated, because as_i64 on an F64 reads the bit
+ * pattern, and a silent (times 1.5 ...) meaning "once" hides a mistake
+ * either way.  Returns 0 on success, or fills *err. */
+static int loop_count(ray_t* x, int64_t* out, const char* who, ray_t** err) {
+    if (ray_is_atom(x)) {
+        switch (x->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: case -RAY_U8:
+            *out = as_i64(x);
+            return 0;
+        default: break;
+        }
+    }
+    *err = ray_error("type", "%s: count must be an integer, got %s", who, ray_type_name(x->type));
+    return -1;
+}
+
+/* The compiled `times` loop drives its counter through these two, held
+ * as constant-pool objects rather than bound in the env — so they carry
+ * no name a user could write, and the loop's arithmetic cannot be
+ * changed out from under it by a `(set - ...)` style override.
+ *
+ * Normalizing once on entry (type-check, and clamp a negative bound to
+ * zero) is what lets the loop test the raw counter for truthiness: 0 is
+ * falsy, every other count is truthy, so no comparison call is needed
+ * per pass and a negative bound cannot run away. */
+ray_t* ray_times_norm_fn(ray_t* x) {
+    int64_t reps = 0;
+    ray_t* err = NULL;
+    if (loop_count(x, &reps, "times", &err)) return err;
+    return make_i64(reps < 0 ? 0 : reps);
+}
+
+ray_t* ray_times_dec_fn(ray_t* x) {
+    return make_i64(as_i64(x) - 1);
+}
+
+/* (times n body...) — evaluate the body exactly n times.  Receives
+ * unevaluated args.  Always returns null, like `while`.
+ *
+ * `n` is evaluated ONCE, up front: the count is a bound fixed on entry,
+ * so a body that mutates whatever produced it cannot change how many
+ * passes remain.  A count of zero or less runs the body zero times
+ * rather than trapping — a bound computed as empty is a no-op, not an
+ * error.
+ *
+ * Pushes no scope, for the reason given on ray_while_fn: `let` binds in
+ * the top frame only, so a per-pass frame would discard loop-carried
+ * state here while the compiled path kept it.
+ *
+ * The compiled form is emitted by the bytecode compiler — see compile.c. */
+ray_t* ray_times_fn(ray_t** args, int64_t n) {
+    if (n < 1) return ray_error("domain", "times: expected at least 1 arg (count), got %lld", (long long)n);
+    ray_t* cnt = ray_eval(args[0]);
+    if (RAY_IS_ERR(cnt)) return cnt;
+    if (ray_is_lazy(cnt))
+        cnt = ray_lazy_materialize(cnt);
+    if (RAY_IS_ERR(cnt)) return cnt;
+    int64_t reps = 0;
+    ray_t* err = NULL;
+    int bad = loop_count(cnt, &reps, "times", &err);
+    ray_release(cnt);
+    if (bad) return err;
+    for (int64_t r = 0; r < reps; r++) {
+        for (int64_t i = 1; i < n; i++) {
+            ray_t* val = ray_eval(args[i]);
+            if (RAY_IS_ERR(val)) return val;
+            ray_release(val);
+        }
+    }
+    return RAY_NULL_OBJ;
+}
+
 /* ══════════════════════════════════════════
  * Lambda functions
  * ══════════════════════════════════════════ */
@@ -3191,6 +3264,7 @@ static void ray_register_builtins(void) {
     register_vary("if",    RAY_FN_SPECIAL_FORM, ray_cond_fn);
     register_vary("do",    RAY_FN_SPECIAL_FORM, ray_do_fn);
     register_vary("while", RAY_FN_SPECIAL_FORM, ray_while_fn);
+    register_vary("times", RAY_FN_SPECIAL_FORM, ray_times_fn);
     register_vary("fn",    RAY_FN_SPECIAL_FORM, ray_fn);
 
     /* Aggregation builtins */
@@ -3512,6 +3586,7 @@ static void ray_register_builtins(void) {
 
     /* Directional fold/scan variants */
     register_vary("fold-left",   RAY_FN_NONE, ray_fold_left_fn);
+    register_vary("fold-while",  RAY_FN_NONE, ray_fold_while_fn);
     register_vary("fold-right",  RAY_FN_NONE, ray_fold_right_fn);
     register_vary("scan-left",   RAY_FN_NONE, ray_scan_left_fn);
     register_vary("scan-right",  RAY_FN_NONE, ray_scan_right_fn);

@@ -1,0 +1,75 @@
+;; (fold-while pred f init xs) — a fold that stops when the running result
+;; says stop.
+;;
+;; Before each step the accumulator is offered to `pred`; a falsy answer ends
+;; the fold and yields the accumulator as it stands.  The predicate is tested
+;; BEFORE the first element too, so a predicate that is false at the start
+;; returns `init` untouched.
+;;
+;; Unlike `fold`, this does not box the whole collection up front (`fold`
+;; routes through to_boxed_list): a primitive whose purpose is to stop early
+;; must not pay for the tail it never reaches.  The counting assertions below
+;; pin that — they fail if the implementation touches more elements than the
+;; predicate allows.
+
+;; ── basic early termination ──────────────────────────────────────────
+;; sum until the running total reaches 100
+(fold-while (fn [acc] (< acc 100)) + 0 (til 1000)) -- 105
+
+;; double until past 100 — the sequence is only a step counter here
+(fold-while (fn [acc] (< acc 100)) (fn [acc _x] (* acc 2)) 1 (til 1000)) -- 128
+
+;; ── the predicate is tested before the first step ────────────────────
+(fold-while (fn [acc] false) + 7 (til 10)) -- 7
+
+;; a predicate false at the start touches no element at all
+(set seen 0)
+(fold-while (fn [acc] false) (fn [acc x] (set seen (+ seen 1)) (+ acc x)) 0 (til 1000)) -- 0
+seen -- 0
+
+;; ── it touches exactly as many elements as the predicate allows ──────
+;; The step runs while acc < 3, so it runs for acc = 0,1,2 — three times —
+;; and never looks at the remaining 997 elements.
+(set seen 0)
+(set r (fold-while (fn [acc] (< acc 3)) (fn [acc x] (set seen (+ seen 1)) (+ acc 1)) 0 (til 1000)))
+r -- 3
+seen -- 3
+
+;; ── running to completion ────────────────────────────────────────────
+;; a predicate that never fails folds the whole collection, like fold-left
+(fold-while (fn [acc] true) + 0 (til 10)) -- 45
+(fold-left + 0 (til 10)) -- 45
+
+;; ── empty and single-element collections ─────────────────────────────
+(fold-while (fn [acc] true) + 42 (til 0)) -- 42
+(fold-while (fn [acc] false) + 42 (til 0)) -- 42
+(fold-while (fn [acc] true) + 0 (til 1)) -- 0
+
+;; ── collection kinds ─────────────────────────────────────────────────
+;; a boxed list, not just a typed vector
+(fold-while (fn [acc] (< acc 6)) + 0 (list 1 2 3 4 5)) -- 6
+
+;; a typed vector of a narrower width
+(fold-while (fn [acc] (< acc 6)) + 0 [1 2 3 4 5]) -- 6
+
+;; ── arity and type ───────────────────────────────────────────────────
+(fold-while) !- domain
+(fold-while (fn [acc] true) + 0) !- domain
+(fold-while (fn [acc] true) + 0 (til 5) 9) !- domain
+(fold-while (fn [acc] true) + 0 42) !- type
+
+;; ── errors propagate from both callbacks ─────────────────────────────
+;; from the predicate, before any step runs
+(set seen 0)
+(== (try (fold-while (fn [acc] (raise 'bad-pred)) (fn [acc x] (set seen (+ seen 1)) acc) 0 (til 5)) (fn [e] e)) 'bad-pred) -- true
+seen -- 0
+
+;; from the step function, on the first element
+(== (try (fold-while (fn [acc] true) (fn [acc x] (raise 'bad-step)) 0 (til 5)) (fn [e] e)) 'bad-step) -- true
+
+;; ── compiled path ────────────────────────────────────────────────────
+;; the whole form inside a lambda, with the bound as a param
+((fn [cap] (fold-while (fn [acc] (< acc cap)) + 0 (til 1000))) 100) -- 105
+
+;; a builtin as the predicate rather than a lambda
+(fold-while nil? (fn [acc _x] 1) null (til 10)) -- 1

@@ -133,6 +133,7 @@ Functions that take other functions as arguments.
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
+| `fold-while` | variadic | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
 | `fold-right` | variadic | Right-associative fold | `(fold-right - 10 [1 2 3])` → `-8` |
 | `scan` | variadic | Running fold (returns all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-left` | variadic | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |

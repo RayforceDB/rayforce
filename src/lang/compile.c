@@ -215,7 +215,7 @@ static void emit_jump_back(compiler_t *c, int32_t target) {
 }
 
 /* Cached sym IDs for special forms */
-static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
+static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_times = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
 static _Thread_local int64_t sf_eval = -1, sf_resolve = -1;
 
 static void init_sf_syms(void) {
@@ -225,6 +225,7 @@ static void init_sf_syms(void) {
     sf_if   = ray_sym_intern("if",  2);
     sf_do   = ray_sym_intern("do",  2);
     sf_while= ray_sym_intern("while", 5);
+    sf_times= ray_sym_intern("times", 5);
     sf_fn   = ray_sym_intern("fn",  2);
     sf_self = ray_sym_intern("self", 4);
     sf_try  = ray_sym_intern("try",  3);
@@ -420,6 +421,71 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             patch_jump(c, jmpf_pos);
             int32_t idx = add_constant(c, RAY_NULL_OBJ);
             emit_const(c, idx);
+            return;
+        }
+
+        /* (times n body...) — a counted loop, desugared onto the same
+         * backward branch `while` uses.
+         *
+         * The count is evaluated ONCE into a hidden local slot, so the
+         * bound is fixed on entry however the body mutates its source.
+         * ray_times_norm_fn type-checks it and clamps a negative bound to
+         * zero, which is what lets the per-pass test be a bare truthiness
+         * check on the counter: 0 is falsy (is_truthy), everything else is
+         * truthy, so the loop needs no comparison call and a negative bound
+         * cannot run away.
+         *
+         * Both helpers are pushed as constant-pool objects rather than
+         * resolved by name, so the loop's own arithmetic is invisible to
+         * user code and immune to an override of `-` or `>`.  The counter's
+         * slot is likewise addressed by index, never by name, and its
+         * sym contains a space so no source token can collide with it —
+         * which is what keeps nested `times` counters apart.
+         *
+         * As with `while`, compiling the body inline is what keeps
+         * `return` unwinding the enclosing lambda from inside the loop. */
+        if (sym_id == sf_times && n >= 2) {
+            ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
+            ray_t *dec_fn  = ray_fn_unary("times dec",  RAY_FN_NONE, ray_times_dec_fn);
+            if (!norm_fn || RAY_IS_ERR(norm_fn) || !dec_fn || RAY_IS_ERR(dec_fn)) {
+                if (norm_fn && !RAY_IS_ERR(norm_fn)) ray_release(norm_fn);
+                if (dec_fn  && !RAY_IS_ERR(dec_fn))  ray_release(dec_fn);
+                c->error = true;
+                return;
+            }
+            int32_t norm_idx = add_constant(c, norm_fn);
+            int32_t dec_idx  = add_constant(c, dec_fn);
+            ray_release(norm_fn);
+            ray_release(dec_fn);
+            int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
+            if (cslot < 0 || c->error) { c->error = true; return; }
+
+            /* counter = normalize(<count>) */
+            emit_const(c, norm_idx);
+            compile_expr(c, elems[1]);
+            emit(c, OP_CALL1);
+            emit(c, OP_STOREENV);
+            emit(c, (uint8_t)cslot);
+
+            int32_t top = c->code_len;
+            emit(c, OP_LOADENV);
+            emit(c, (uint8_t)cslot);
+            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+            for (int64_t i = 2; i < n; i++) {
+                compile_expr(c, elems[i]);
+                emit(c, OP_POP);
+            }
+            /* counter = counter - 1 */
+            emit_const(c, dec_idx);
+            emit(c, OP_LOADENV);
+            emit(c, (uint8_t)cslot);
+            emit(c, OP_CALL1);
+            emit(c, OP_STOREENV);
+            emit(c, (uint8_t)cslot);
+            emit_jump_back(c, top);
+            patch_jump(c, jmpf_pos);
+            int32_t null_idx = add_constant(c, RAY_NULL_OBJ);
+            emit_const(c, null_idx);
             return;
         }
 
