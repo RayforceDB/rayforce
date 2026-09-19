@@ -672,6 +672,78 @@ static test_result_t test_ipc_send_async_invalid_handle(void) {
  * Covers ipc_accept, ipc_read_handshake (success path),
  * ipc_read_header, ipc_read_payload, ipc_on_close, ipc_send_fn.
  */
+/* A lifecycle hook must run on a thread that never bound a VM (#569).
+ *
+ * #565 made the *no hook installed* case safe by letting ray_env_get fall
+ * through to globals on such a thread.  With a hook actually bound,
+ * call_fn1 would then run user code with __VM == NULL — this asserts the
+ * hook runs and observes a live `.ipc.handle`.
+ *
+ * The worker deliberately never calls ray_runtime_create: that is the
+ * shape of an embedder's own thread driving teardown, which is how this
+ * was found. */
+static ray_poll_t* g_vmless_poll = NULL;
+static int64_t     g_vmless_sel  = -1;
+
+static void vmless_close_worker(void* unused) {
+    (void)unused;
+    /* No ray_runtime_create here — __VM is NULL on this thread. */
+    ray_poll_deregister(g_vmless_poll, g_vmless_sel);
+}
+
+static test_result_t test_ipc_close_hook_on_vmless_thread(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 2000);
+    TEST_ASSERT((h) >= (0), "connect");
+
+    /* Stop the server *before* installing the hook.
+     *
+     * .ipc.on.close is one process-global binding and ipc_on_close fires it
+     * for both ends of a connection, so a server thread — which has a VM —
+     * would otherwise satisfy any counter this test could assert on, and the
+     * test would stay green with the fix reverted.  Shutting the server down
+     * first, with no hook installed, means the single firing below is
+     * unambiguously the client-side teardown driven from the VM-less thread.
+     * It also removes the poll loop that would otherwise be writing these
+     * globals while the main thread reads them. */
+    ray_test_server_stop(&srv);
+
+    ray_t* r = ray_eval_str(
+        "(do (set _vmless_fired 0) (set _vmless_h -99)"
+        "    (set .ipc.on.close (fn [x] (do (set _vmless_fired (+ _vmless_fired 1))"
+        "                                   (set _vmless_h (.ipc.handle))))) null)");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "install hook");
+    ray_release(r);
+
+    g_vmless_poll = ray_ipc_active_poll();
+    TEST_ASSERT_NOT_NULL(g_vmless_poll);
+    g_vmless_sel  = h;
+
+    ray_thread_t tid;
+    ray_thread_create(&tid, vmless_close_worker, NULL);
+    ray_thread_join(tid);
+
+    /* Exactly one firing, and it came from the VM-less thread. */
+    ray_t* fired = ray_eval_str("_vmless_fired");
+    TEST_ASSERT(fired && !RAY_IS_ERR(fired), "read counter");
+    TEST_ASSERT_EQ_I(fired->i64, 1);
+    ray_release(fired);
+
+    /* It saw this connection's handle.  Without a bound VM ipc_ctx_set
+     * stores nothing and .ipc.handle reports -1, so this is the assertion
+     * that actually separates fixed from unfixed. */
+    ray_t* seen = ray_eval_str("_vmless_h");
+    TEST_ASSERT(seen && !RAY_IS_ERR(seen), "read handle");
+    TEST_ASSERT_EQ_I(seen->i64, h);
+    ray_release(seen);
+
+    ray_t* cleanup = ray_eval_str("(do (set .ipc.on.close null) null)");
+    if (cleanup) ray_release(cleanup);
+    PASS();
+}
+
 static test_result_t test_ipc_poll_based_listen(void) {
     ray_poll_t* poll = ray_poll_create();
     TEST_ASSERT_NOT_NULL(poll);
@@ -2643,6 +2715,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/close_invalid_handle",       test_ipc_close_invalid_handle,           ipc_setup, ipc_teardown },
     { "ipc/send_invalid_handle",        test_ipc_send_invalid_handle,            ipc_setup, ipc_teardown },
     { "ipc/send_async_invalid_handle",  test_ipc_send_async_invalid_handle,      ipc_setup, ipc_teardown },
+    { "ipc/close_hook_vmless_thread",   test_ipc_close_hook_on_vmless_thread,     ipc_setup, ipc_teardown },
     { "ipc/poll_based_listen",          test_ipc_poll_based_listen,              ipc_setup, ipc_teardown },
     { "ipc/poll_public_restricted",     test_ipc_poll_public_restricted,         ipc_setup, ipc_teardown },
     { "ipc/poll_auth_creds_path",        test_ipc_poll_auth_creds_path,           ipc_setup, ipc_teardown },

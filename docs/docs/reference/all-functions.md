@@ -287,7 +287,7 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 | `where` | unary | — | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | — | Group indices by value (returns dict) | `(group ['a 'b 'a])` → dict |
 | `diverse` | unary | — | Check if all elements are unique (no duplicates) | `(diverse [1 2 3])` → `true` |
-| `rand` | binary | — | Generate N random values from range or sample from vector | `(rand 3 100)` → 3 random ints 0..99 |
+| `rand` | binary | — | Generate N random values from range or sample from vector. **Deterministic**: the same sequence in every process | `(rand 3 100)` → 3 random ints 0..99 |
 | `bin` | binary | — | Binary search — left boundary (sorted input) | `(bin [10 20 30] 25)` → `1` |
 | `binr` | binary | — | Binary search — right boundary (sorted input) | `(binr [10 20 30] 25)` → `2` |
 
@@ -587,7 +587,7 @@ Type checking, casting, null testing, and object inspection.
 | `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
-| `guid` | unary | — | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
+| `guid` | unary | — | Generate a vector of N v4 GUIDs, seeded from the OS (`(guid 0)` → `[]`) | `(guid 1)` |
 
 ```lisp
 ; Type checking and casting
@@ -612,8 +612,8 @@ Printing, file I/O, CSV loading, and script execution.
 | `format` | variadic | — | Format value to string (% as placeholder) | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
-| `read` | unary | restricted | Read file contents as string | `(read "file.txt")` |
-| `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector | `(read-bytes "file.bin")` |
+| `read` | unary | restricted | Read file contents as string, to EOF | `(read "/proc/self/cmdline")` |
+| `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector, to EOF | `(read-bytes "file.bin")` |
 | `write` | binary | restricted | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | restricted | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
 | `load` | unary | restricted | Load and evaluate a Rayfall script file. A relative path is tried against the working directory, then below `RAYFORCE_HOME` when set; absolute paths are used as given; a failure names every path tried | `(load "lib.rfl")` |
