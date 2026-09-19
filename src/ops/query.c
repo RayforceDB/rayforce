@@ -2902,15 +2902,23 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * (so the interned result has the type the caller expects) and the
  * column's vocabulary is readable through the raw snapshot.  Any other
  * shape returns NULL and the caller takes the one-shot SYM evaluation. */
-#define DERIVED_KEY_CHUNK (1LL << 21)
-/* Chunk length; RAY_DERIVED_KEY_CHUNK overrides it so a test can drive
- * several chunks through a small vocabulary. */
+/* Chunk length in distinct values: 256 dispatch rounds of morsels (2M
+ * rows).  Enough rows for the pooled string ops to spread over the
+ * workers, while every chunk-scoped STR intermediate stays in the
+ * low hundreds of MB at URL-sized strings. */
+#define DERIVED_KEY_CHUNK ((int64_t)RAY_MORSEL_ELEMS * RAY_DISPATCH_MORSELS * 256)
+#ifdef DEBUG
+static int64_t g_derived_key_chunk_test = 0;
+/* Test seam: a positive value replaces the chunk length until reset to 0,
+ * so a test can drive several chunks through a small vocabulary. */
+void ray_derived_key_chunk_set_for_test(int64_t rows) {
+    g_derived_key_chunk_test = rows > 0 ? rows : 0;
+}
+#endif
 static int64_t derived_key_chunk_rows(void) {
-    const char* env = getenv("RAY_DERIVED_KEY_CHUNK");
-    if (env && *env) {
-        long v = strtol(env, NULL, 10);
-        if (v > 0) return (int64_t)v;
-    }
+#ifdef DEBUG
+    if (g_derived_key_chunk_test > 0) return g_derived_key_chunk_test;
+#endif
     return DERIVED_KEY_CHUNK;
 }
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
