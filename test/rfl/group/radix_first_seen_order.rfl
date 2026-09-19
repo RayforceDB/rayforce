@@ -1,0 +1,10 @@
+;; The radix full path emits groups in first-seen order regardless of the
+;; number of partitions used.  With v equal to the row index, "first-seen"
+;; is exactly ascending (first v).
+
+(set n 300000)
+(set t (table [k j v] (list (% (* (til n) 104729) 200003) (% (til n) 7) (til n))))
+(set r (select {from: t f: (first v) c: (count v) by: {k: k j: j}}))
+(> (count r) 200000) -- true
+(all (== (at r 'f) (asc (at r 'f)))) -- true
+(sum (at r 'c)) -- 300000

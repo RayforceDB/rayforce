@@ -1108,10 +1108,11 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
     ray_release(res);
 
     /* Same filter with desc = 0 (`asc: c take: 2`): the emit filter must NOT
-     * keep the two LARGEST groups.  Trimming here is desc-only machinery, so
-     * the asc request falls through to the full group set and the caller's
-     * sort+take picks the smallest — what must never happen is the result
-     * losing the small groups (issue #408: asc returned the desc answer). */
+     * keep the two LARGEST groups (issue #408: asc returned the desc answer).
+     * This shape now runs on the parallel engine and is trimmed to the
+     * smallest-N superset, so the result is exactly the two smallest groups;
+     * the caller's sort+take finalizes the order.  What must never happen is
+     * the result losing the small groups. */
     filter.desc = 0;
     ray_group_emit_filter_set(filter);
     res = ray_execute(g, grp);
@@ -1121,17 +1122,17 @@ static test_result_t test_i16_group_top_count_emit_filter(void) {
     out_cnt = ray_table_get_col_idx(res, 1);
     TEST_ASSERT_NOT_NULL(out_key);
     TEST_ASSERT_NOT_NULL(out_cnt);
-    /* The asc request falls through to the FULL group set (all 5 groups) —
-     * pin the row count too, so this can tell "full fall-through" apart
-     * from a hypothetical asc top-2, and cannot pass by accident. */
-    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
-    int got_smallest = 0;
+    /* Counts are 5,4,3,2,1 with no ties: the asc top-2 superset is exactly
+     * {k=4 (2), k=5 (1)}. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+    int got_smallest = 0, got_second = 0;
     for (int64_t i = 0; i < ray_table_nrows(res); i++) {
         int16_t k = ((int16_t*)ray_data(out_key))[i];
         int64_t c = ((int64_t*)ray_data(out_cnt))[i];
         if (k == 5 && c == 1) got_smallest = 1;
+        if (k == 4 && c == 2) got_second = 1;
     }
-    TEST_ASSERT_TRUE(got_smallest);
+    TEST_ASSERT_TRUE(got_smallest && got_second);
 
     ray_release(res);
     ray_graph_free(g);

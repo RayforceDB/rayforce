@@ -121,6 +121,13 @@ Group by multiple keys:
 ; GOOG Buy    125
 ```
 
+Expressions over aggregates work with any number of keys and with binary aggregates such as `pearson_corr`, `cov`, or `wsum`; the aggregates are computed in the grouping pass and the outer expression once per group:
+
+```lisp
+(select {from: trades spread: (- (max price) (min price)) by: {sym: sym venue: venue}})
+(select {from: trades r2: (pow (pearson_corr price size) 2) by: {sym: sym}})
+```
+
 ### Filter + Group-by
 
 Filter first, then group by. Chain two `select` calls for correct results:

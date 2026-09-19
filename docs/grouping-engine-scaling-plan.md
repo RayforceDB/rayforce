@@ -253,3 +253,79 @@ buffer for binary and mixed streaming reductions. The existing native-width
 readers, source selection and partition ownership remain shared. Chunk sizing
 bounds the active payload footprint; scratch consists of partition cursors,
 without another row-sized buffer.
+
+## Follow-up: core scaling on cache-bounded and legacy-routed shapes
+
+A scaling sweep over 1/8/16/28 threads on a 10M-row grouping input found five
+reasons queries stopped speeding up, or slowed down, as cores were added. None
+was in the pool; all were routing or footprint decisions.
+
+- **Replicated slab footprint.** The task-local dense strategy gave every worker a
+  full slab, and the strategy choice was deliberately independent of cache size.
+  Once the slabs together outgrew the last-level cache, every update missed to
+  memory: a 100k-group sum measured 6 ms with 8 slabs and 21 ms with 28 slabs on
+  the same pool. The runtime now reads the last-level cache size (summed over
+  every cache instance, so multi-die parts count each die) and bounds replicated
+  slabs to three quarters of it; below three slabs it prefers partition
+  ownership, whose per-partition slabs are cache-sized by construction. The
+  memory budgets stay data-derived; the cache bound only limits replication.
+  Task assignment stays static so floating-point sums remain deterministic for a
+  given pool size.
+- **Multi-key arithmetic over aggregates.** Any non-aggregate output on a
+  two-or-more-key `by:` forced eval-level grouping (no parallelism, ~850 ms),
+  because that decision ran before the arithmetic-over-aggregates decomposition.
+  Routing now probes decomposability first, and the hidden-slot decomposition
+  also admits binary aggregates and literal-probability quantiles.
+- **Top-N emit filter.** `desc: AGG take: N` armed an emit filter the parallel
+  engine does not implement, so every such query ran on the legacy ladder
+  (0.1x parallel at 28 threads for a three-aggregate query). Shapes the
+  parallel engine admits with a bounded dense plan now run there and are
+  trimmed to the top-N superset; unbounded key domains stay on the ladder
+  because the radix route's first-seen ordering and emission tail is still
+  serial-heavy there.
+- **Filtered prescan.** The selected-row dense plan walked the selection
+  serially (~13 ms per 10M rows at any core count); it is now split across the
+  pool.
+- **Composite symbol keys.** Symbol columns share one domain, so their codes
+  interleave and a two-key raw range product overflowed the dense limit,
+  sending 10k-group queries to radix (505 ms vs 52 ms on one core). Plans now
+  compact keys to the codes they use when the raw product overflows or exceeds
+  65,536 slots. The hot loops select the compacted or raw slot computation once
+  per run: a per-row check made the two-key loop 12x slower.
+
+Still open: the radix route's post-reduce stages (an input-sized order map to
+restore first-seen order, then emission) scale poorly on many-million-group
+keys; the legacy ladder remains faster for those top-N shapes. An unordered
+`take:` on a grouped select still uses radix's bounded emit rather than the
+dense plan.
+
+## Follow-up results: top-N, bounded emit and radix ordering
+
+Five more changes closed the shapes the previous follow-up left open. The
+parallel engine now owns the top-N emit filter: radix partitions and dense
+finishes finalize the ordering aggregate per group in parallel, keep bounded
+candidate heaps, take one threshold from their union and emit only the kept
+superset; every other route trims its full result with the same decision,
+and the legacy ladder's carve-outs are gone. The radix full path's first-seen
+ordering was dispatched by element grain over partitions and chunks, which
+produced a single task; it is dispatched by task count and compacts out of
+place. An unordered `take: N` on a bounded key selects the N smallest first
+rows on the dense task-local path instead of the radix bounded emit. A test
+driver flag records which `.rfl` lines still reach the legacy ladder
+(`docs/grouping-legacy-census.md`).
+
+Measured on 10M rows (min of five warm runs, ms; before = the branch point,
+after = this follow-up):
+
+| Query | 1 core | 8 cores | 28 cores |
+|---|---|---|---|
+| three-key count, desc take 10 (10M groups) | 962 → 285 | 46 → 54 | 46 → 44 |
+| three aggregates by 100k key, desc take 10 | 77 → 41 | 12.8 → 11.0 | 75 → 10.4 |
+| where + count by 15-value key, desc take 10 | 451 → 51 | 59 → 9.6 | 23.5 → 6.3 |
+| count by 100k key, unordered take 10 | 107 → 17 | 21 → 4.0 | 17.8 → 5.4 |
+| count by 100k key, desc take 10 | 28 → 17 | 4.9 → 4.0 | 4.8 → 5.5 |
+| sum + count by six keys, no take (10M groups) | 1543 → 1592 | 245 → 201 | 187 → 137 |
+| pow(pearson) by two keys | 1840 → 68 | 993 → 12 | 936 → 9.2 |
+
+The remaining legacy routes are enumerated in the census; none of them is a
+top-N, bounded-emit or compound-expression shape.

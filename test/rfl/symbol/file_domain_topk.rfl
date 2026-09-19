@@ -1,0 +1,40 @@
+;; Bounded-heap ordering (asc:/desc: with take:) keyed by a SYM column whose
+;; ids live in a FILE domain (a splayed table read back from disk).  The
+;; compare reads the entries' bytes straight off the mapped vocabulary
+;; instead of materialising an atom per symbol; every answer must equal the
+;; same ordering over the strings themselves.  Sizes past the parallel
+;; threshold (65536) so the pooled heap runs; a second key breaks ties, and
+;; the empty symbol (a null cell) takes part on both sides.
+(.sys.exec "rm -rf /tmp/rfl_fdom_topk/") -- 0
+(set N 120000)
+(set i (til N))
+(set hosts (map (fn [k] (format "h%.example.com" k)) (til 300)))
+(set u (as 'SYMBOL (map (fn [k] (if (== 0 (% k 41)) (format "http://%/google/%" (at hosts (% k 300)) (% k 977)) (format "http://%/p/%/%" (at hosts (% (* 31 k) 300)) (% k 977) (% k 7)))) i)))
+(set sp (as 'SYMBOL (map (fn [k] (if (== 0 (% k 3)) "" (format "phrase % %" (% (* k 7) 5000) (% k 13)))) i)))
+(set g (as 'I64 (% (* i 7919) 500)))
+(set T (table [u sp g] (list u sp g)))
+(.db.splayed.set "/tmp/rfl_fdom_topk/" T)
+(set F (.db.splayed.get "/tmp/rfl_fdom_topk/"))
+(count F) -- 120000
+(== (type (at F 'u)) 'SYM) -- true
+;; string oracle: the same values as plain strings, same row order
+(set TS (table [us ss g] (list (as 'STR (at F 'u)) (as 'STR (at F 'sp)) (at F 'g))))
+(set S (fn [v] (as 'STR v)))
+
+;; one key, ascending and descending, with the empty symbol filtered out
+(all (== (S (at (select {from: F sp: sp where: (!= sp "") asc: sp take: 10}) 'sp)) (at (select {from: TS ss: ss where: (!= ss "") asc: ss take: 10}) 'ss))) -- true
+(all (== (S (at (select {from: F sp: sp where: (!= sp "") desc: sp take: 10}) 'sp)) (at (select {from: TS ss: ss where: (!= ss "") desc: ss take: 10}) 'ss))) -- true
+;; ties on the symbol broken by a second key, both directions
+(all (== (S (at (select {from: F u: u g: g where: (!= sp "") asc: [u g] take: 25}) 'u)) (at (select {from: TS us: us g: g where: (!= ss "") asc: [us g] take: 25}) 'us))) -- true
+(all (== (at (select {from: F u: u g: g where: (!= sp "") asc: [u g] take: 25}) 'g) (at (select {from: TS us: us g: g where: (!= ss "") asc: [us g] take: 25}) 'g))) -- true
+(all (== (S (at (select {from: F u: u g: g where: (!= sp "") desc: [u g] take: 25}) 'u)) (at (select {from: TS us: us g: g where: (!= ss "") desc: [us g] take: 25}) 'us))) -- true
+;; the symbol as the second key behind an integer
+(all (== (S (at (select {from: F g: g sp: sp where: (!= sp "") asc: [g sp] take: 40}) 'sp)) (at (select {from: TS g: g ss: ss where: (!= ss "") asc: [g ss] take: 40}) 'ss))) -- true
+;; the empty symbol left in: it orders as the empty string on both sides
+(all (== (S (at (select {from: F sp: sp asc: sp take: 10}) 'sp)) (at (select {from: TS ss: ss asc: ss take: 10}) 'ss))) -- true
+(all (== (S (at (select {from: F sp: sp desc: sp take: 10}) 'sp)) (at (select {from: TS ss: ss desc: ss take: 10}) 'ss))) -- true
+;; a full take (no bound below the row count) keeps the same order
+(all (== (S (at (select {from: F u: u where: (== g 7) asc: u take: 1000}) 'u)) (at (select {from: TS us: us where: (== g 7) asc: us take: 1000}) 'us))) -- true
+;; in-memory SYM (runtime domain) still answers the same
+(all (== (S (at (select {from: T sp: sp where: (!= sp "") asc: sp take: 10}) 'sp)) (at (select {from: TS ss: ss where: (!= ss "") asc: ss take: 10}) 'ss))) -- true
+(.sys.exec "rm -rf /tmp/rfl_fdom_topk/") -- 0
