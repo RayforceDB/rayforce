@@ -1832,6 +1832,42 @@ static test_result_t test_radix_native_topn(void) {
     PASS();
 }
 
+/* Dense finishes select the emit filter's top-N themselves: no full emission
+ * and no post-trim for a bounded-domain key. */
+static test_result_t test_dense_native_topn(void) {
+    ray_t* setup = ray_eval_str(
+        "(set dt_i (til 1000000)) "
+        "(set dt_t (table [k v] (list (as 'I32 (% (* dt_i 7919) 50000)) (% dt_i 13))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
+    TEST_ASSERT_TRUE(stats.topn_native);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
+    ray_t* check = ray_eval_str(
+        "(all (== (at (select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5}) 's) "
+        "(take (at (xdesc (select {from:dt_t by:k s:(sum v)}) 's) 's) 5)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    /* the asc direction on the count keeps the smallest groups */
+    agg_route_reset();
+    r = ray_eval_str("(select {from:dt_t by:k c:(count v) asc:c take:3})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(agg_route_stats().topn_native);
+    check = ray_eval_str(
+        "(== (at (at (select {from:dt_t by:k c:(count v) asc:c take:3}) 'c) 0) "
+        "(min (at (select {from:dt_t by:k c:(count v)}) 'c)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    ray_release(ray_eval_str("(set dt_t 0) (set dt_i 0)"));
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
@@ -1849,6 +1885,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },
     { "agg_contract/dense_composite_compaction", test_dense_composite_compaction, contract_setup, contract_teardown },
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
+    { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },

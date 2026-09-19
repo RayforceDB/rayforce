@@ -1746,12 +1746,107 @@ static void agg_dense_key_emit(void* raw, uint32_t wid, int64_t start, int64_t e
     }
 }
 
+/* Top-N selection over a slot list: tasks finalize the filter aggregate for
+ * disjoint ranges of `slots`, keep a bounded candidate heap each, the union's
+ * N-th value is the threshold, and a second pass marks the kept groups.
+ * Returns the kept count, or -1 when the aggregate has no scalar order or
+ * memory ran out (the caller then emits every group and the query trims). */
+typedef struct {
+    const agg_vtable_t* vt;
+    const char* states;
+    size_t block, off;
+    const int64_t* slots;
+    int64_t n, param;
+    const ray_group_emit_filter_t* ef;
+    double* vals;
+    uint8_t* keep;
+    uint32_t tasks;
+    double* cand;
+    int64_t* cand_n;
+    int64_t cap;
+    bool have_thr;
+    double thr;
+    int64_t* kept;
+    _Atomic(int) fail;
+} agg_slots_topn_ctx_t;
+
+static void agg_slots_topn_range(const agg_slots_topn_ctx_t* c, int64_t task, int64_t* begin, int64_t* end) {
+    *begin = c->n / c->tasks * task;
+    *end = task + 1 == (int64_t)c->tasks ? c->n : c->n / c->tasks * (task + 1);
+}
+
+static void agg_slots_vals_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_slots_topn_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        int64_t b, e;
+        agg_slots_topn_range(c, task, &b, &e);
+        if (!agg_group_values_f64(c->vt, c->states, c->block, c->off, c->slots + b,
+                                  e - b, c->param, c->ef->desc, c->vals + b)) {
+            atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+            continue;
+        }
+        if (c->cap > 0)
+            agg_topn_candidates(c->vals + b, e - b, c->cap, c->ef->desc,
+                                c->cand + (size_t)task * c->cap, &c->cand_n[task]);
+    }
+}
+
+static void agg_slots_mark_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_slots_topn_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        int64_t b, e;
+        agg_slots_topn_range(c, task, &b, &e);
+        c->kept[task] = agg_topn_mark(c->vals + b, e - b, c->ef, c->have_thr, c->thr, c->keep + b);
+    }
+}
+
+static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
+        const char* states, size_t block, size_t off, const int64_t* slots, int64_t n,
+        int64_t param, const ray_group_emit_filter_t* ef, uint8_t* keep) {
+    if (n <= 0) return 0;
+    uint32_t tasks = pool && n >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) * 4 : 1;
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    if ((int64_t)tasks > n) tasks = (uint32_t)n;
+    int64_t cap = ef->top_count_take > 0 && n > ef->top_count_take ? ef->top_count_take : 0;
+    double* vals = ray_alloc_raw((size_t)n * sizeof(double));
+    double* cand = ray_alloc_raw((size_t)(cap > 0 ? cap * tasks : 1) * sizeof(double));
+    int64_t* cand_n = ray_calloc_raw((size_t)tasks * 2 * sizeof(int64_t));
+    int64_t kept = -1;
+    if (vals && cand && cand_n) {
+        agg_slots_topn_ctx_t c = { .vt = vt, .states = states, .block = block, .off = off,
+            .slots = slots, .n = n, .param = param, .ef = ef, .vals = vals, .keep = keep,
+            .tasks = tasks, .cand = cand, .cand_n = cand_n, .cap = cap, .kept = cand_n + tasks };
+        atomic_init(&c.fail, 0);
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_vals_fn, &c, tasks);
+        else agg_slots_vals_fn(&c, 0, 0, 1);
+        if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
+            if (cap > 0) {
+                int64_t nc = 0;
+                for (uint32_t t = 0; t < tasks; t++) {
+                    memmove(cand + nc, cand + (size_t)t * cap, (size_t)cand_n[t] * sizeof(double));
+                    nc += cand_n[t];
+                }
+                c.have_thr = agg_topn_threshold(cand, nc, ef, &c.thr);
+            }
+            if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_mark_fn, &c, tasks);
+            else agg_slots_mark_fn(&c, 0, 0, 1);
+            kept = 0;
+            for (uint32_t t = 0; t < tasks; t++) kept += c.kept[t];
+        }
+    }
+    ray_free_raw(vals); ray_free_raw(cand); ray_free_raw(cand_n);
+    return kept;
+}
+
 /* Shared output stage. Takes ownership of states/first, borrows the
  * prepared aggregate layout and descriptors. */
 static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
         ray_pool_t* pool, const agg_vo_t* vo, const agg_desc_t* d,
         int64_t total_slots, char* gstates, int64_t* gfirst,
-        const dense_plan_t* key_plan, int64_t key_part_slots, uint32_t key_bits) {
+        const dense_plan_t* key_plan, int64_t key_part_slots, uint32_t key_bits,
+        const ray_group_emit_filter_t* ef) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     const agg_vtable_t** vts = vo->vts;
     const size_t* off = vo->off;
@@ -1779,6 +1874,26 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
               occupied_slot[i] = s; i++;
           }
+    }
+    /* Top-N emit filter: keep only the groups the filter would keep, in the
+     * same slot order.  Nothing below allocates for the dropped groups. */
+    if (ef && ng > 0) {
+        uint8_t* keep = ray_alloc_raw((size_t)ng);
+        int64_t kept = keep ? agg_slots_topn_select(pool, vts[ef->agg_index], gstates, block,
+                off[ef->agg_index], occupied_slot, ng,
+                ext->agg_k ? ext->agg_k[ef->agg_index] : 0, ef, keep) : -1;
+        if (kept >= 0) {
+            int64_t w = 0;
+            for (int64_t i = 0; i < ng; i++) if (keep[i]) {
+                occupied_slot[w] = occupied_slot[i];
+                if (first_row_ordered) first_row_ordered[w] = first_row_ordered[i];
+                w++;
+            }
+            ng = kept;
+            route_stats.topn_native = true;
+        }
+        ray_free_raw(keep);
+        ray_profile_tick("dense: selected top-N groups");
     }
 
     ray_t* result = ray_table_new(n_keys + n_aggs);
@@ -2142,7 +2257,8 @@ static uint32_t agg_dense_partition_parts(uint32_t sources, int64_t slots) {
 
 static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
         ray_pool_t* pool, const dense_plan_t* plan, int64_t rows,
-        const agg_vo_t* vo, const agg_desc_t* d, ray_t* selection) {
+        const agg_vo_t* vo, const agg_desc_t* d, ray_t* selection,
+        const ray_group_emit_filter_t* ef) {
     uint32_t workers = ray_pool_total_workers(pool);
     uint32_t sources = workers;
     if (sources > RAY_POOL_INIT_TASKS / 2) sources = RAY_POOL_INIT_TASKS / 2;
@@ -2216,7 +2332,7 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     route_stats.dense_strategy = AGG_DENSE_PARTITIONED;
     route_stats.dense_tasks = c.n_tasks;
     route_stats.dense_local_slots = slots + extra_slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, part_slots, bits);
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, part_slots, bits, ef);
 failed:
     ray_free_raw(c.counts); ray_free_raw(c.gids); ray_free_raw(c.tasks);
     ray_free_raw(c.payload); ray_free_raw(c.value_offsets); ray_release(c.selection_indices); ray_free_raw(c.states); ray_free_raw(c.first);
@@ -2296,7 +2412,7 @@ static void agg_dense_shared_occupied(void* raw, uint32_t wid, int64_t start, in
 
 static ray_t* agg_dense_shared(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
         ray_pool_t* pool, const dense_plan_t* plan, int64_t rows,
-        const agg_vo_t* vo, const agg_desc_t* d) {
+        const agg_vo_t* vo, const agg_desc_t* d, const ray_group_emit_filter_t* ef) {
     int64_t slots = plan->total_slots;
     agg_dense_shared_ctx_t c = {.key = key_cols[0], .plan = plan, .layout = vo, .desc = d, .n_aggs = ext->n_aggs};
     c.states = ray_alloc_raw((size_t)slots * vo->block);
@@ -2316,7 +2432,7 @@ static ray_t* agg_dense_shared(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     route_stats.dense_strategy = AGG_DENSE_SHARED;
     route_stats.dense_tasks = ray_pool_total_workers(pool);
     route_stats.dense_local_slots = slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, slots, 0);
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, slots, 0, ef);
 failed:
     ray_free_raw(c.states); ray_free_raw(c.first); ray_free_raw(c.occupied);
     return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
@@ -2326,7 +2442,8 @@ static ray_t* exec_group_v2_parallel_dense(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext, int64_t nrows,
         ray_pool_t* pool, const dense_plan_t* dp, uint32_t nw, agg_dense_strategy_t strategy,
-        ray_t* sel, const int64_t* sel_prefix, int64_t n_sel) {
+        ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
+        const ray_group_emit_filter_t* efp) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     int64_t total_slots = dp->total_slots;
 
@@ -2344,12 +2461,12 @@ static ray_t* exec_group_v2_parallel_dense(
     const bool* val2_hasnull = d.val2_hasnull; const uint8_t* val2_esz = d.val2_esz;
 
     if (strategy == AGG_DENSE_SHARED) {
-        ray_t* result = agg_dense_shared(key_cols, key_syms, ext, pool, dp, nrows, &vo, &d);
+        ray_t* result = agg_dense_shared(key_cols, key_syms, ext, pool, dp, nrows, &vo, &d, efp);
         agg_vo_free(&vo); agg_desc_free(&d);
         return result;
     }
     if (strategy == AGG_DENSE_PARTITIONED) {
-        ray_t* result = agg_dense_partitioned(key_cols, key_syms, ext, pool, dp, sel ? n_sel : nrows, &vo, &d, sel);
+        ray_t* result = agg_dense_partitioned(key_cols, key_syms, ext, pool, dp, sel ? n_sel : nrows, &vo, &d, sel, efp);
         agg_vo_free(&vo); agg_desc_free(&d);
         return result;
     }
@@ -2458,7 +2575,7 @@ static ray_t* exec_group_v2_parallel_dense(
     ray_free_raw(locals);
 
     ray_t* result = agg_dense_finish(key_cols, key_syms, ext, pool, &vo, &d,
-                                      total_slots, gstates, gfirst, NULL, 0, 0);
+                                      total_slots, gstates, gfirst, NULL, 0, 0, efp);
     agg_vo_free(&vo); agg_desc_free(&d);
     return result;
 }
@@ -4790,7 +4907,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             route_stats.dense_worker_budget = false;
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
-                nrows, pool, &dp, dense_workers, AGG_DENSE_SHARED, sel, sel_prefix, n_sel);
+                nrows, pool, &dp, dense_workers, AGG_DENSE_SHARED, sel, sel_prefix, n_sel, efp);
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
             return result;
         }
@@ -4836,7 +4953,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 route_stats.dense_worker_budget = false;
                 agg_route_record(AGG_ROUTE_V2_DENSE);
                 ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
-                    nrows, pool, &dp, dense_workers, AGG_DENSE_PARTITIONED, sel, sel_prefix, n_sel);
+                    nrows, pool, &dp, dense_workers, AGG_DENSE_PARTITIONED, sel, sel_prefix, n_sel, efp);
                 agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
                 return result;
             }
@@ -4908,7 +5025,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 route_stats.dense_local_slots += dp.total_slots;
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp, dense_workers, AGG_DENSE_TASK_LOCAL,
-                                                    sel, sel_prefix, n_sel);
+                                                    sel, sel_prefix, n_sel, efp);
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         if (keys_intsym) {
