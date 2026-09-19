@@ -509,16 +509,18 @@ static ray_t* if_scatter_str(ray_t* result, ray_t* value, int64_t* ids,
  * touches a few of them.  This translator interns only the positions the
  * branch actually reads: `lut` starts at -1 and a slot is resolved (raw
  * file bytes when available, the domain atom otherwise) the first time
- * that position is met.  Resolution interns, so it must run on the
- * calling thread: the serial scatter path resolves on the fly, the
- * parallel fill pre-resolves every used position (if_sym_side_prepare)
- * before dispatching, after which workers only read the table.
- * Runtime-domain, STR and scalar branches need no table. */
+ * that position is met.  Resolution interns, so it runs on the calling
+ * thread only: the serial scatter path resolves on the fly; the parallel
+ * fill first walks the mask serially and resolves exactly the positions
+ * the fill will read — a row's then-cell where the mask is set, its
+ * else-cell where it is clear (if_sym_side_prepare) — and the fill then
+ * reads only that side of each row through if_sym_side_lookup, which
+ * never interns.  Runtime-domain, STR and scalar branches need no table. */
 typedef struct {
     ray_t*                   v;
     struct ray_sym_domain_s* dom;      /* non-runtime domain, else NULL */
     int64_t                  dn;
-    int64_t*                 lut;      /* dn slots, -1 = unresolved */
+    int32_t*                 lut;      /* dn slots, -1 = unresolved (ids fit: the table counts them in 32 bits) */
     ray_t*                   lut_hdr;
     ray_sym_domain_raw_t     raw;
     bool                     raw_ok;
@@ -532,9 +534,9 @@ static bool if_sym_side_init(if_sym_side_t* side, ray_t* v) {
     if (!dom || dom == ray_sym_runtime_domain()) return true;
     int64_t dn = ray_sym_domain_count(dom);
     if (dn <= 0) return true;
-    side->lut = (int64_t*)scratch_alloc(&side->lut_hdr, (size_t)dn * sizeof(int64_t));
+    side->lut = (int32_t*)scratch_alloc(&side->lut_hdr, (size_t)dn * sizeof(int32_t));
     if (!side->lut) return false;
-    memset(side->lut, 0xff, (size_t)dn * sizeof(int64_t));
+    memset(side->lut, 0xff, (size_t)dn * sizeof(int32_t));
     side->dom = dom;
     side->dn = dn;
     side->raw_ok = ray_sym_domain_raw_pin(dom, &side->raw);
@@ -563,8 +565,18 @@ static int64_t if_sym_side_resolve(if_sym_side_t* side, int64_t pos) {
         if (s) { sp = ray_str_ptr(s); sl = ray_str_len(s); }
     }
     id = ray_sym_intern(sp ? sp : "", sp ? sl : 0);
-    if (id >= 0) side->lut[pos] = id;
+    if (id >= 0 && id <= INT32_MAX) side->lut[pos] = (int32_t)id;
     return id;
+}
+
+/* Read-only lookup for pool workers: the position must have been
+ * prepared; nothing is interned here.  An unprepared position (a bug in
+ * the caller's prepare pass) maps to the empty symbol rather than
+ * touching the table from a worker. */
+static inline int64_t if_sym_side_lookup(const if_sym_side_t* side, int64_t pos) {
+    if (pos < 0 || pos >= side->dn) return 0;
+    int32_t id = side->lut[pos];
+    return id >= 0 ? (int64_t)id : 0;
 }
 
 /* Pre-resolve the positions rows [0, len) read on this side under the
@@ -803,7 +815,19 @@ typedef struct {
     int8_t  out_type;
     if_sym_side_t* t_side;    /* SYM output: per-side id translation */
     if_sym_side_t* e_side;
+    bool    sides_prepared;   /* positions resolved up front: read-only fill (workers) */
 } if_fill_ctx_t;
+
+/* One SYM cell of a fill side as a runtime id: the selected side only. */
+static inline int64_t if_fill_sym_cell(const if_fill_ctx_t* c, if_sym_side_t* side,
+                                       int64_t i) {
+    ray_t* v = side->v;
+    if (c->sides_prepared && side->dom) {
+        int64_t pos = ray_read_sym(ray_data(v), i, v->type, v->attrs);
+        return if_sym_side_lookup(side, pos);
+    }
+    return if_sym_cell_value(side, i);
+}
 
 static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
     const uint8_t* cond_p = c->cond;
@@ -826,10 +850,13 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         break; }
     case RAY_SYM: {
         int64_t* dst = (int64_t*)c->dst;
+        /* Only the chosen side is read: the prepare pass resolved exactly
+         * these cells, and the other side's cell may be unresolved. */
         for (int64_t i = i0; i < i1; i++) {
-            int64_t tv = c->then_scalar ? c->t_i64 : if_sym_cell_value(c->t_side, i);
-            int64_t ev = c->else_scalar ? c->e_i64 : if_sym_cell_value(c->e_side, i);
-            dst[i] = cond_p[i] ? tv : ev;
+            if (cond_p[i])
+                dst[i] = c->then_scalar ? c->t_i64 : if_fill_sym_cell(c, c->t_side, i);
+            else
+                dst[i] = c->else_scalar ? c->e_i64 : if_fill_sym_cell(c, c->e_side, i);
         }
         break; }
     case RAY_I32: case RAY_TIME: case RAY_DATE: {
@@ -1043,8 +1070,10 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         if_sym_side_t t_side, e_side;
         bool sides_ok = true;
         if (out_type == RAY_SYM) {
-            sides_ok = if_sym_side_init(&t_side, then_scalar ? NULL : then_v) &&
-                       if_sym_side_init(&e_side, else_scalar ? NULL : else_v);
+            /* Both inits run (each zeroes its side) so both frees are safe. */
+            bool t_ok = if_sym_side_init(&t_side, then_scalar ? NULL : then_v);
+            bool e_ok = if_sym_side_init(&e_side, else_scalar ? NULL : else_v);
+            sides_ok = t_ok && e_ok;
             fc.t_side = &t_side;
             fc.e_side = &e_side;
         }
@@ -1070,6 +1099,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
             if (par) {
                 if_sym_side_prepare(&t_side, cond_p, len, 1);
                 if_sym_side_prepare(&e_side, cond_p, len, 0);
+                fc.sides_prepared = true;
             }
         }
         if (par)

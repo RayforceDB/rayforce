@@ -11,7 +11,8 @@
 (set hosts (map (fn [k] (format "h%.example.com" k)) (til 300)))
 (set ref (as 'SYMBOL (map (fn [k] (if (== 0 (% k 11)) "" (if (== 0 (% k 7)) (format "https://www.%/p/%" (at hosts (% (* 31 k) 300)) (% k 13)) (format "http://%/a/%" (at hosts (% (* 31 k) 300)) (% k 17))))) i)))
 (set v (as 'I64 (% (* i 7) 101)))
-(set T (table [ref v] (list ref v)))
+(set ref2 (at ref (% (+ i 1) N)))
+(set T (table [ref ref2 v] (list ref ref2 v)))
 (.db.splayed.set "/tmp/rfl_fdom_if/" T)
 (set F (.db.splayed.get "/tmp/rfl_fdom_if/"))
 (count F) -- 70000
@@ -25,6 +26,14 @@
 (set A2 (select {from: F k: (if (== 0 (% v 3)) 'left ref)}))
 (set B2 (select {from: T k: (if (== 0 (% v 3)) 'left ref)}))
 (all (== (S (at A2 'k)) (S (at B2 'k)))) -- true
+;; a FILE-domain column on BOTH sides, no row selection: the pooled fill
+;; reads one side per row and must have every such cell resolved up front
+(set A7 (select {from: F k: (if (> v 50) ref ref2)}))
+(set B7 (select {from: T k: (if (> v 50) ref ref2)}))
+(all (== (S (at A7 'k)) (S (at B7 'k)))) -- true
+(set A8 (select {from: F k: (if (== 0 (% v 3)) ref2 ref)}))
+(set B8 (select {from: T k: (if (== 0 (% v 3)) ref2 ref)}))
+(all (== (S (at A8 'k)) (S (at B8 'k)))) -- true
 
 ;; computed branch against the column: the selected path
 (set A3 (select {from: F k: (if (== (str-find ref "www.") 8) (substr ref 13 -1) ref)}))
