@@ -221,7 +221,9 @@ Grouped aggregates run on the parallel aggregation engine, which picks a strateg
 - **Radix** — unbounded integer or symbol keys (many-million-group inputs) are hash-partitioned and reduced per partition.
 - **Shared directory** — float, string, GUID, and list keys use a shared parallel key directory.
 
-Arithmetic over aggregates (`(- (max v1) (min v2))`, `(pow (pearson_corr a b) 2)`) is decomposed at compile time: the aggregates run as hidden slots inside the same group pass, and the outer expression is evaluated once over the grouped result. This applies to any number of keys and to binary aggregates. Ordered top-N clauses (`desc: c take: 10`) run the full parallel grouping and trim the result to the top-N superset before the final sort; only unbounded key domains still use the older ordered-emit path.
+Arithmetic over aggregates (`(- (max v1) (min v2))`, `(pow (pearson_corr a b) 2)`) is decomposed at compile time: the aggregates run as hidden slots inside the same group pass, and the outer expression is evaluated once over the grouped result. This applies to any number of keys and to binary aggregates.
+
+Ordered top-N clauses (`desc: c take: 10`, `asc: m take: 5`) are selected inside the strategies: radix partitions and dense finishes finalize the ordering aggregate to one value per group in parallel, keep a bounded candidate set each, take the threshold from the union, and emit only the kept groups (ties included), so a 10M-group query never materializes 10M output rows. Routes that emit every group trim afterwards with the same decision. An unordered `take: N` emits the first N groups in first-seen order; on the dense task-local path that is a selection of the N smallest first rows. The radix full path restores first-seen order with a scatter, count and compaction that are all dispatched across the pool.
 
 ### Per-Thread Heaps
 

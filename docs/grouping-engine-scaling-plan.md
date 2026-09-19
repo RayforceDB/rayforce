@@ -298,3 +298,34 @@ restore first-seen order, then emission) scale poorly on many-million-group
 keys; the legacy ladder remains faster for those top-N shapes. An unordered
 `take:` on a grouped select still uses radix's bounded emit rather than the
 dense plan.
+
+## Follow-up results: top-N, bounded emit and radix ordering
+
+Five more changes closed the shapes the previous follow-up left open. The
+parallel engine now owns the top-N emit filter: radix partitions and dense
+finishes finalize the ordering aggregate per group in parallel, keep bounded
+candidate heaps, take one threshold from their union and emit only the kept
+superset; every other route trims its full result with the same decision,
+and the legacy ladder's carve-outs are gone. The radix full path's first-seen
+ordering was dispatched by element grain over partitions and chunks, which
+produced a single task; it is dispatched by task count and compacts out of
+place. An unordered `take: N` on a bounded key selects the N smallest first
+rows on the dense task-local path instead of the radix bounded emit. A test
+driver flag records which `.rfl` lines still reach the legacy ladder
+(`docs/grouping-legacy-census.md`).
+
+Measured on 10M rows (min of five warm runs, ms; before = the branch point,
+after = this follow-up):
+
+| Query | 1 core | 8 cores | 28 cores |
+|---|---|---|---|
+| three-key count, desc take 10 (10M groups) | 962 → 285 | 46 → 54 | 46 → 44 |
+| three aggregates by 100k key, desc take 10 | 77 → 41 | 12.8 → 11.0 | 75 → 10.4 |
+| where + count by 15-value key, desc take 10 | 451 → 51 | 59 → 9.6 | 23.5 → 6.3 |
+| count by 100k key, unordered take 10 | 107 → 17 | 21 → 4.0 | 17.8 → 5.4 |
+| count by 100k key, desc take 10 | 28 → 17 | 4.9 → 4.0 | 4.8 → 5.5 |
+| sum + count by six keys, no take (10M groups) | 1543 → 1592 | 245 → 201 | 187 → 137 |
+| pow(pearson) by two keys | 1840 → 68 | 993 → 12 | 936 → 9.2 |
+
+The remaining legacy routes are enumerated in the census; none of them is a
+top-N, bounded-emit or compound-expression shape.
