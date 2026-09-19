@@ -2924,10 +2924,8 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
     int8_t sym_out = 0;
     {
         ray_t* probe = ray_table_new(0);
-        if (probe && !RAY_IS_ERR(probe)) {
-            ray_retain(dom_vec);
-            probe = ray_table_add_col(probe, col_sym, dom_vec);
-        }
+        /* add_col retains the column itself; the caller keeps its own ref. */
+        if (probe && !RAY_IS_ERR(probe)) probe = ray_table_add_col(probe, col_sym, dom_vec);
         if (!probe || RAY_IS_ERR(probe)) { if (probe) ray_error_free(probe); goto unpin_null; }
         ray_graph_t* gp = ray_graph_new(probe);
         if (gp) {
@@ -3080,23 +3078,24 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
      * table holding the distinct vector under the referenced name. */
     ray_t* key_dom = derived_key_str_chunks(by_expr, ref_syms[0], dom_vec, dom, du);
     if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
-    ray_t* mini = key_dom ? NULL : ray_table_new(0);
-    if (key_dom) ray_release(dom_vec);
-    else {
-    if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
-    ray_release(dom_vec);
-    if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
-    ray_graph_t* g2 = ray_graph_new(mini);
-    if (g2) {
-        ray_op_t* kop = compile_expr_dag(g2, by_expr);
-        if (kop) kop = ray_optimize(g2, kop);
-        if (kop) key_dom = ray_execute(g2, kop);
-        ray_graph_free(g2);
-    }
-    ray_release(mini);
-    if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
-    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
-    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+    if (key_dom) {
+        ray_release(dom_vec);
+    } else {
+        ray_t* mini = ray_table_new(0);
+        if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
+        ray_release(dom_vec);
+        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
+        ray_graph_t* g2 = ray_graph_new(mini);
+        if (g2) {
+            ray_op_t* kop = compile_expr_dag(g2, by_expr);
+            if (kop) kop = ray_optimize(g2, kop);
+            if (kop) key_dom = ray_execute(g2, kop);
+            ray_graph_free(g2);
+        }
+        ray_release(mini);
+        if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
+        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
+        if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
     }
 
     /* Pass 2: spread by slot. */
