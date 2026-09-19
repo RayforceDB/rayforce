@@ -1846,7 +1846,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_pool_t* pool, const agg_vo_t* vo, const agg_desc_t* d,
         int64_t total_slots, char* gstates, int64_t* gfirst,
         const dense_plan_t* key_plan, int64_t key_part_slots, uint32_t key_bits,
-        const ray_group_emit_filter_t* ef) {
+        const ray_group_emit_filter_t* ef, int64_t group_limit) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     const agg_vtable_t** vts = vo->vts;
     const size_t* off = vo->off;
@@ -1874,6 +1874,62 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
               occupied_slot[i] = s; i++;
           }
+    }
+    /* Bounded emit (HEAD(GROUP) hint): the N groups with the smallest first
+     * row ARE the first N groups in first-seen order.  Select them with an
+     * N-sized max-heap over the occupied slots and emit them ascending by
+     * first row, byte-identical to trimming a first-seen-ordered result. */
+    if (group_limit > 0 && first_row_ordered && ng > group_limit) {
+        int64_t n_keep = group_limit;
+        int64_t* hkey = ray_alloc_raw((size_t)n_keep * sizeof(int64_t));
+        int64_t* hslot = ray_alloc_raw((size_t)n_keep * sizeof(int64_t));
+        if (hkey && hslot) {
+            int64_t hn = 0;
+            for (int64_t i = 0; i < ng; i++) {
+                int64_t first = first_row_ordered[i], slot = occupied_slot[i];
+                if (hn < n_keep) {
+                    int64_t j = hn++;
+                    hkey[j] = first; hslot[j] = slot;
+                    while (j > 0) {
+                        int64_t par = (j - 1) / 2;
+                        if (hkey[par] >= hkey[j]) break;
+                        int64_t tk = hkey[par]; hkey[par] = hkey[j]; hkey[j] = tk;
+                        int64_t ts = hslot[par]; hslot[par] = hslot[j]; hslot[j] = ts;
+                        j = par;
+                    }
+                } else if (first < hkey[0]) {
+                    hkey[0] = first; hslot[0] = slot;
+                    int64_t j = 0;
+                    for (;;) {
+                        int64_t l = 2 * j + 1, rr = l + 1, m = j;
+                        if (l < n_keep && hkey[l] > hkey[m]) m = l;
+                        if (rr < n_keep && hkey[rr] > hkey[m]) m = rr;
+                        if (m == j) break;
+                        int64_t tk = hkey[m]; hkey[m] = hkey[j]; hkey[j] = tk;
+                        int64_t ts = hslot[m]; hslot[m] = hslot[j]; hslot[j] = ts;
+                        j = m;
+                    }
+                }
+            }
+            /* heap sort ascending by first row */
+            for (int64_t end = hn - 1; end > 0; end--) {
+                int64_t tk = hkey[0]; hkey[0] = hkey[end]; hkey[end] = tk;
+                int64_t ts = hslot[0]; hslot[0] = hslot[end]; hslot[end] = ts;
+                int64_t j = 0;
+                for (;;) {
+                    int64_t l = 2 * j + 1, rr = l + 1, m = j;
+                    if (l < end && hkey[l] > hkey[m]) m = l;
+                    if (rr < end && hkey[rr] > hkey[m]) m = rr;
+                    if (m == j) break;
+                    tk = hkey[m]; hkey[m] = hkey[j]; hkey[j] = tk;
+                    ts = hslot[m]; hslot[m] = hslot[j]; hslot[j] = ts;
+                    j = m;
+                }
+            }
+            for (int64_t i = 0; i < hn; i++) { occupied_slot[i] = hslot[i]; first_row_ordered[i] = hkey[i]; }
+            ng = hn;
+        }
+        ray_free_raw(hkey); ray_free_raw(hslot);
     }
     /* Top-N emit filter: keep only the groups the filter would keep, in the
      * same slot order.  Nothing below allocates for the dropped groups. */
@@ -2332,7 +2388,7 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     route_stats.dense_strategy = AGG_DENSE_PARTITIONED;
     route_stats.dense_tasks = c.n_tasks;
     route_stats.dense_local_slots = slots + extra_slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, part_slots, bits, ef);
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, part_slots, bits, ef, 0);
 failed:
     ray_free_raw(c.counts); ray_free_raw(c.gids); ray_free_raw(c.tasks);
     ray_free_raw(c.payload); ray_free_raw(c.value_offsets); ray_release(c.selection_indices); ray_free_raw(c.states); ray_free_raw(c.first);
@@ -2432,7 +2488,7 @@ static ray_t* agg_dense_shared(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     route_stats.dense_strategy = AGG_DENSE_SHARED;
     route_stats.dense_tasks = ray_pool_total_workers(pool);
     route_stats.dense_local_slots = slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, slots, 0, ef);
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, slots, 0, ef, 0);
 failed:
     ray_free_raw(c.states); ray_free_raw(c.first); ray_free_raw(c.occupied);
     return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
@@ -2443,7 +2499,7 @@ static ray_t* exec_group_v2_parallel_dense(
         ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext, int64_t nrows,
         ray_pool_t* pool, const dense_plan_t* dp, uint32_t nw, agg_dense_strategy_t strategy,
         ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
-        const ray_group_emit_filter_t* efp) {
+        const ray_group_emit_filter_t* efp, int64_t group_limit) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     int64_t total_slots = dp->total_slots;
 
@@ -2575,7 +2631,7 @@ static ray_t* exec_group_v2_parallel_dense(
     ray_free_raw(locals);
 
     ray_t* result = agg_dense_finish(key_cols, key_syms, ext, pool, &vo, &d,
-                                      total_slots, gstates, gfirst, NULL, 0, 0, efp);
+                                      total_slots, gstates, gfirst, NULL, 0, 0, efp, group_limit);
     agg_vo_free(&vo); agg_desc_free(&d);
     return result;
 }
@@ -4986,7 +5042,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             route_stats.dense_worker_budget = false;
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
-                nrows, pool, &dp, dense_workers, AGG_DENSE_SHARED, sel, sel_prefix, n_sel, efp);
+                nrows, pool, &dp, dense_workers, AGG_DENSE_SHARED, sel, sel_prefix, n_sel, efp, 0);
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
             return result;
         }
@@ -5032,7 +5088,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 route_stats.dense_worker_budget = false;
                 agg_route_record(AGG_ROUTE_V2_DENSE);
                 ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
-                    nrows, pool, &dp, dense_workers, AGG_DENSE_PARTITIONED, sel, sel_prefix, n_sel, efp);
+                    nrows, pool, &dp, dense_workers, AGG_DENSE_PARTITIONED, sel, sel_prefix, n_sel, efp, 0);
                 agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
                 return result;
             }
@@ -5042,7 +5098,11 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (fit < dense_workers) dense_workers = fit >= 2 ? (uint32_t)fit : 0;
             if (cache_tasks < dense_workers) dense_workers = cache_tasks >= 2 ? cache_tasks : 0;
         }
-        bool dense_par_ok = dp.ok && group_limit <= 0 && dense_workers > 0;
+        /* A bounded group emit (unordered take: N) selects the first N groups
+         * in first-seen order.  Task-local slabs keep a true first row per
+         * slot, so their finish can select those groups; the shared and
+         * partition strategies above keep no first rows and stay gated. */
+        bool dense_par_ok = dp.ok && dense_workers > 0;
         /* Allocation size alone misses repeated wide-range worker updates.
          * Estimate touched slot traffic from evenly spaced key samples in each
          * worker-sized input range. Prefer radix when duplicated state traffic
@@ -5104,7 +5164,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 route_stats.dense_local_slots += dp.total_slots;
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp, dense_workers, AGG_DENSE_TASK_LOCAL,
-                                                    sel, sel_prefix, n_sel, efp);
+                                                    sel, sel_prefix, n_sel, efp, group_limit);
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         if (keys_intsym) {

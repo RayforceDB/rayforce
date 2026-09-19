@@ -1868,6 +1868,35 @@ static test_result_t test_dense_native_topn(void) {
     PASS();
 }
 
+/* Unordered take: N on a bounded key stays on the dense task-local path and
+ * emits the first N groups in first-seen order. */
+static test_result_t test_dense_unordered_take(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set ut_i (til 400000)) "
+        "(set ut_t (table [k v] (list (as 'I32 (% (* ut_i 7919) 50000)) ut_i)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:ut_t c:(count v) by:k take:10})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
+    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
+    /* rows 0..9 start groups (i*7919) % 50000, emitted in that order */
+    const int32_t* k = (const int32_t*)ray_data(ray_table_get_col_idx(r, 0));
+    const int64_t* c = (const int64_t*)ray_data(ray_table_get_col_idx(r, 1));
+    for (int64_t i = 0; i < 10; i++) {
+        TEST_ASSERT_EQ_I(k[i], (int32_t)((i * 7919) % 50000));
+        TEST_ASSERT_EQ_I(c[i], 8);
+    }
+    ray_release(r);
+    ray_release(ray_eval_str("(set ut_t 0) (set ut_i 0)"));
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
@@ -1886,6 +1915,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_composite_compaction", test_dense_composite_compaction, contract_setup, contract_teardown },
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
+    { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },
