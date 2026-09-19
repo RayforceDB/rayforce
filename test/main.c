@@ -34,6 +34,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "test.h"
+#include "ops/agg_engine.h"   /* --census: agg_route_stats */
 #include "test_rfl.h"
 
 #include <stdio.h>
@@ -330,6 +331,38 @@ static void rfl_rewrite_goldens(const char* path, const int* lns, char (*vals)[5
     free(s); fclose(o);
 }
 
+/* --census PATH: after every evaluated .rfl line, record grouped selects
+ * that reached the legacy grouping ladder (route counters are per thread
+ * and reset before each line).  One tab-separated line per hit:
+ * reason, file:line, source.  Diagnostic only; off unless the flag is set. */
+static FILE* g_census = NULL;
+static const char* census_reason_name(agg_v2_reason_t r) {
+    switch (r) {
+        case AGG_V2_ADMITTED:       return "admitted";
+        case AGG_V2_SHAPE:          return "shape";
+        case AGG_V2_KEY_EXPRESSION: return "key_expression";
+        case AGG_V2_KEY_TYPE:       return "key_type";
+        case AGG_V2_AGG_EXPRESSION: return "agg_expression";
+        case AGG_V2_AGG_TYPE:       return "agg_type";
+        case AGG_V2_BUFFERED:       return "buffered";
+        case AGG_V2_PARAMETER:      return "parameter";
+        case AGG_V2_DISABLED:       return "disabled";
+        case AGG_V2_EMIT_FILTER:    return "emit_filter";
+        case AGG_V2_PARALLEL_WIDE:  return "parallel_wide";
+    }
+    return "unknown";
+}
+static ray_t* rfl_eval(const char* src, const char* path, int line_no) {
+    if (g_census) agg_route_reset();
+    ray_t* v = ray_eval_str(src);
+    if (g_census) {
+        agg_route_stats_t st = agg_route_stats();
+        if (st.routes[AGG_ROUTE_LEGACY] > 0)
+            fprintf(g_census, "%s\t%s:%d\t%s\n", census_reason_name(st.last_v2_reason), path, line_no, src);
+    }
+    return v;
+}
+
 static test_result_t run_rfl_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) FAILF("cannot open %s", path);
@@ -380,7 +413,7 @@ static test_result_t run_rfl_file(const char* path) {
             *eq = '\0';
             char* lhs = start;
             char* rhs = eq + 4;
-            ray_t* le = ray_eval_str(lhs);
+            ray_t* le = rfl_eval(lhs, path, line_no);
             if (RAY_IS_ERR(le)) {
                 char buf[512]; fmt_into(le, buf, sizeof buf);
                 snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
@@ -424,7 +457,7 @@ static test_result_t run_rfl_file(const char* path) {
             *er = '\0';
             char* expr   = start;
             char* substr = er + 4;
-            ray_t* ev = ray_eval_str(expr);
+            ray_t* ev = rfl_eval(expr, path, line_no);
             if (!RAY_IS_ERR(ev)) {
                 /* ev is a value here — we expected an error but got one. */
                 char buf[512]; fmt_into(ev, buf, sizeof buf);
@@ -451,7 +484,7 @@ static test_result_t run_rfl_file(const char* path) {
             ray_error_free(ev);
         } else {
             /* Raw Rayfall code — eval; error is a test failure. */
-            ray_t* ev = ray_eval_str(start);
+            ray_t* ev = rfl_eval(start, path, line_no);
             if (ev && RAY_IS_ERR(ev)) {
                 char buf[512]; fmt_into(ev, buf, sizeof buf);
                 snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
@@ -825,9 +858,13 @@ int main(int argc, char** argv) {
         if ((strcmp(argv[i], "--filter") == 0 || strcmp(argv[i], "-f") == 0)
             && i + 1 < argc) {
             filter = argv[++i];
+        } else if (strcmp(argv[i], "--census") == 0 && i + 1 < argc) {
+            g_census = fopen(argv[++i], "w");
+            if (!g_census) { fprintf(stderr, "cannot open census file\n"); return 2; }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [-f SUBSTR]\n", argv[0]);
+            printf("Usage: %s [-f SUBSTR] [--census PATH]\n", argv[0]);
             printf("  -f, --filter SUBSTR   Only run tests whose name contains SUBSTR.\n");
+            printf("  --census PATH         Record .rfl lines whose grouping ran on the legacy ladder.\n");
             return 0;
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
