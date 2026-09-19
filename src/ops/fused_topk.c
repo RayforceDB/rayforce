@@ -86,10 +86,18 @@ typedef struct {
      * (ctx.sym_strings).  0 routes the compare through the column's
      * own domain (ray_sym_domain_str). */
     uint8_t     dom_runtime;
+    /* SYM keys on a FILE domain: the mapped prefix pinned for the
+     * dispatch — compares read raw bytes, no atom per symbol. */
+    uint8_t     raw_ok;
+    ray_sym_domain_raw_t raw;
     int64_t     sym;
     const void* base;
     ray_t*      col;         /* for ray_vec_is_null when has_nulls */
 } fpk_keyspec_t;
+static void fpk_unpin_keys(fpk_keyspec_t* keys, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        if (keys[i].raw_ok) { ray_sym_domain_raw_unpin(ray_sym_vec_domain(keys[i].col)); keys[i].raw_ok = 0; }
+}
 
 typedef struct {
     fp_pred_t      pred;
@@ -160,19 +168,29 @@ static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) 
             uint32_t ia = (uint32_t)read_by_esz(ks->base, row_a, ks->esz);
             uint32_t ib = (uint32_t)read_by_esz(ks->base, row_b, ks->esz);
             if (ia == ib) continue;
-            ray_t* sa;
-            ray_t* sb;
-            if (ks->dom_runtime) {
-                if (ia >= c->sym_count || ib >= c->sym_count) continue;
-                sa = c->sym_strings[ia];
-                sb = c->sym_strings[ib];
+            if (ks->raw_ok && (int64_t)ia < ks->raw.count && (int64_t)ib < ks->raw.count) {
+                /* ray_str_cmp order: bytes of the common prefix, then length. */
+                size_t la, lb;
+                const char* pa = ray_sym_domain_raw_str(&ks->raw, (int64_t)ia, &la);
+                const char* pb = ray_sym_domain_raw_str(&ks->raw, (int64_t)ib, &lb);
+                size_t ml = la < lb ? la : lb;
+                cmp = ml ? memcmp(pa, pb, ml) : 0;
+                if (cmp == 0) cmp = la < lb ? -1 : (la > lb ? 1 : 0);
             } else {
-                struct ray_sym_domain_s* dom = ray_sym_vec_domain(ks->col);
-                sa = ray_sym_domain_str(dom, (int64_t)ia);
-                sb = ray_sym_domain_str(dom, (int64_t)ib);
+                ray_t* sa;
+                ray_t* sb;
+                if (ks->dom_runtime) {
+                    if (ia >= c->sym_count || ib >= c->sym_count) continue;
+                    sa = c->sym_strings[ia];
+                    sb = c->sym_strings[ib];
+                } else {
+                    struct ray_sym_domain_s* dom = ray_sym_vec_domain(ks->col);
+                    sa = ray_sym_domain_str(dom, (int64_t)ia);
+                    sb = ray_sym_domain_str(dom, (int64_t)ib);
+                }
+                if (!sa || !sb) continue;
+                cmp = ray_str_cmp(sa, sb);
             }
-            if (!sa || !sb) continue;
-            cmp = ray_str_cmp(sa, sb);
         } else if (ks->type == RAY_STR) {
             /* Variable-length STR key: compare the actual strings (dict
              * codes, if any, are first-occurrence order — not sorted).
@@ -332,14 +350,14 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     int sym_needed = 0;
     for (uint32_t i = 0; i < n_sort_keys; i++) {
         ray_t* col = ray_table_get_col(tbl, sort_key_syms[i]);
-        if (!col) return NULL;
+        if (!col) { fpk_unpin_keys(ctx.keys, i); return NULL; }
         int8_t kt = col->type;
-        if (RAY_IS_PARTED(kt) || kt == RAY_MAPCOMMON) return NULL;
+        if (RAY_IS_PARTED(kt) || kt == RAY_MAPCOMMON) { fpk_unpin_keys(ctx.keys, i); return NULL; }
         if (kt != RAY_SYM && kt != RAY_STR && kt != RAY_BOOL && kt != RAY_U8
             && kt != RAY_I16 && kt != RAY_I32 && kt != RAY_I64
             && kt != RAY_DATE && kt != RAY_TIME && kt != RAY_TIMESTAMP
             && kt != RAY_F32 && kt != RAY_F64 && kt != RAY_GUID)
-            return NULL;
+            { fpk_unpin_keys(ctx.keys, i); return NULL; }
         ctx.keys[i].type      = kt;
         ctx.keys[i].attrs     = col->attrs;
         ctx.keys[i].esz       = ray_sym_elem_size(kt, col->attrs);
@@ -352,7 +370,10 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ctx.keys[i].sym       = sort_key_syms[i];
         ctx.keys[i].base      = ray_data(col);
         ctx.keys[i].col       = col;
+        ctx.keys[i].raw_ok    = 0;
         if (ctx.keys[i].dom_runtime) sym_needed = 1;
+        else if (kt == RAY_SYM)
+            ctx.keys[i].raw_ok = ray_sym_domain_raw_pin(ray_sym_vec_domain(col), &ctx.keys[i].raw) ? 1 : 0;
     }
     ctx.n_keys = n_sort_keys;
     ctx.k      = k;
@@ -360,18 +381,19 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
 
     /* Compile the predicate via a temp graph just for the WHERE clause. */
     ray_graph_t* g = ray_graph_new(tbl);
-    if (!g) return NULL;
+    if (!g) { fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
     ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
-    if (!pred_dag) { ray_graph_free(g); return NULL; }
+    if (!pred_dag) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
     if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
+        fpk_unpin_keys(ctx.keys, n_sort_keys);
         return NULL;
     }
 
     if (sym_needed) {
         ray_sym_strings_borrow(&ctx.sym_strings, &ctx.sym_count);
-        if (!ctx.sym_strings) { ray_graph_free(g); return NULL; }
+        if (!ctx.sym_strings) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
     }
     atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
 
@@ -389,6 +411,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         if (hn_hdr)  scratch_free(hn_hdr);
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
+        fpk_unpin_keys(ctx.keys, n_sort_keys);
         return NULL;
     }
 
@@ -399,6 +422,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         scratch_free(idx_hdr); scratch_free(hn_hdr);
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
+        fpk_unpin_keys(ctx.keys, n_sort_keys);
         return NULL;
     }
 
@@ -430,6 +454,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     scratch_free(hn_hdr);
 
     fpk_sort_final(&ctx, global_idx, global_n);
+    fpk_unpin_keys(ctx.keys, n_sort_keys);   /* no more compares past here */
 
     /* Materialize n_out output columns by gathering rows[global_idx]. */
     ray_t* result = ray_table_new(n_out);
