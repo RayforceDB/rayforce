@@ -445,7 +445,7 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
      * still accepted (the non-overflow entry) never pairs a shrunken range
      * with the raw slot computation. */
     int64_t raw_ranges[16];
-    memcpy(raw_ranges, out->ranges, sizeof(raw_ranges));
+    memcpy(raw_ranges, out->ranges, (size_t)n_keys * sizeof(int64_t));
     for (uint32_t k = 0; k < n_keys; k++) {
         if (!candidate[k]) continue;
         int64_t raw = raw_ranges[k] - out->nullable[k];
@@ -456,7 +456,7 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
             ray_free_raw(remap); ray_free_raw(inverse);
             ray_free_raw(bits); ray_free_raw(task_bits);
             agg_dense_plan_free(out);
-            memcpy(out->ranges, raw_ranges, sizeof(raw_ranges));
+            memcpy(out->ranges, raw_ranges, (size_t)n_keys * sizeof(int64_t));
             return false;
         }
         const uint64_t* acc = task_bits[k];
@@ -3936,13 +3936,6 @@ static ray_t* exec_group_v2_parallel_radix(
      * by a full key-unpack and finalize of every group.  The N groups with the
      * SMALLEST first_row ARE the first N groups in first-seen order, so the
      * emitted prefix is byte-identical to trimming the full result to N. */
-    /* Bounded emit under a HEAD(GROUP) limit hint: when only the first
-     * `group_limit` groups are wanted, selecting them directly is O(ng) with a
-     * `group_limit`-sized heap, versus the full path's O(input_count) order map
-     * (an 80MB alloc + memset + scatter + compact on a 10M-row input) followed
-     * by a full key-unpack and finalize of every group.  The N groups with the
-     * SMALLEST first_row ARE the first N groups in first-seen order, so the
-     * emitted prefix is byte-identical to trimming the full result to N. */
     int64_t n_emit = ng;
     agg_radix_order_t* pairs = NULL;
     if (efp && group_limit == 0) {
@@ -4832,9 +4825,11 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
  * order is preserved.  Consumes `result`; a failure keeps the full result,
  * which is still a valid answer for the sort+take downstream. */
 ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
-                            const ray_group_emit_filter_t* ef) {
+                            const uint16_t* agg_ops, const ray_group_emit_filter_t* ef) {
     if (!result || RAY_IS_ERR(result) || result->type != RAY_TABLE) return result;
     if (ef->agg_index >= n_aggs) return result;
+    /* second line of defence: never trim by a slot the filter did not name */
+    if (agg_ops && (ef->agg_op ? ef->agg_op : OP_COUNT) != agg_ops[ef->agg_index]) return result;
     int64_t nrows = ray_table_nrows(result);
     if (nrows <= 0) return result;
     ray_t* vcol = ray_table_get_col_idx(result, (int64_t)n_keys + ef->agg_index);
@@ -4872,17 +4867,26 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
 /* Every v2 strategy returns through here: a route that could not select
  * the emit filter's top-N itself hands back its full result and is trimmed
  * to the kept superset, so callers see one contract regardless of route. */
+/* True when the thread-local emit filter was armed for THIS node: the slot
+ * exists and holds the operation the filter names (count when unset).  The
+ * filter stays armed while the matched select's whole `from:` evaluates, so
+ * grouped selects nested inside see it too; for them this is false. */
+static bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext) {
+    return ef && ef->enabled && ext && ef->agg_index < ext->n_aggs &&
+           (ef->agg_op ? ef->agg_op : OP_COUNT) == ext->agg_ops[ef->agg_index];
+}
+
 static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t nrows, ray_t* sel,
                                 const int64_t* sel_prefix, int64_t n_sel,
                                 int64_t group_limit,
                                 const ray_group_emit_filter_t* efp) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!agg_emit_filter_targets(efp, ext)) efp = NULL;   /* one decision for routing AND trim */
     ray_t* r = exec_group_v2_run_inner(g, op, tbl, nrows, sel, sel_prefix, n_sel,
                                        group_limit, efp);
-    if (efp && r && !RAY_IS_ERR(r) && !route_stats.topn_native) {
-        ray_op_ext_t* ext = find_ext(g, op->id);
-        if (ext) r = agg_emit_filter_trim(r, ext->n_keys, ext->n_aggs, efp);
-    }
+    if (efp && r && !RAY_IS_ERR(r) && !route_stats.topn_native)
+        r = agg_emit_filter_trim(r, ext->n_keys, ext->n_aggs, ext->agg_ops, efp);
     return r;
 }
 
@@ -4898,15 +4902,8 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.dense_worker_budget = false;
     route_stats.dense_tasks = 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
-    /* The emit filter is thread-local and stays armed while the whole
-     * `from:` expression of the select that matched it evaluates, so any
-     * grouped select nested inside sees it too.  Honor it only when it was
-     * armed for THIS node: the slot exists and holds the operation the
-     * filter names (an unset op means count, per the filter's contract).
-     * Anything else is "no filter": the outer sort+take still finalizes. */
-    if (efp && (!efp->enabled || efp->agg_index >= ext->n_aggs ||
-                (efp->agg_op ? efp->agg_op : OP_COUNT) != ext->agg_ops[efp->agg_index]))
-        efp = NULL;
+    /* efp was already gated on this node by exec_group_v2_run; the compact
+     * fallback recursion re-enters through that wrapper too. */
 
     /* Exact-size carve for the per-key column pointers + syms (one block, both
      * 8-byte): unbounded key count, freed at every exit of this function
@@ -5322,7 +5319,7 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     /* The top-N emit filter (`desc: AGG take: N`) is read once here and
      * handed to every strategy: radix and the dense finishes select the kept
      * groups themselves; the other routes trim their full result. */
-    ray_group_emit_filter_t ef = ray_group_emit_filter_get();
+    ray_group_emit_filter_t ef = ray_group_emit_filter_active();
     const ray_group_emit_filter_t* efp = ef.enabled ? &ef : NULL;
     if (!g || !g->selection)
         return exec_group_v2_run(g, op, tbl, ray_table_nrows(tbl), NULL, NULL, 0,

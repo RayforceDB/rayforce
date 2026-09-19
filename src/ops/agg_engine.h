@@ -103,7 +103,7 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
 /* Trim a finished group result to the emit filter's kept superset (row order
  * preserved; consumes `result`).  Used by routes that emit every group. */
 ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
-                            const ray_group_emit_filter_t* ef);
+                            const uint16_t* agg_ops, const ray_group_emit_filter_t* ef);
 
 /* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
  * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when

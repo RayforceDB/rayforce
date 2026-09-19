@@ -96,14 +96,16 @@
 (at (at a14 's) 0) -- "c"
 
 ;; the emit filter is armed while the matched select's from: evaluates; a
-;; grouped select nested inside must not be trimmed by it (its aggregate slot
-;; holds a different operation than the filter names)
-(set inner (select {from: t by: k s: (sum v)}))
-(set nested (select {from: (select {from: (select {from: t by: k s: (sum v)}) by: s c: (count s)}) where: (> c 5)}))
-(set ref (select {from: (select {from: inner by: s c: (count s)}) where: (> c 5)}))
-(== (count nested) (count ref)) -- true
-(== (sum (at nested 'c)) (sum (at ref 'c))) -- true
-;; the same nesting with the inner select ordered by the filtered op keeps its full group set
-(set nested2 (select {from: (select {from: (select {from: t by: k c: (count v)}) by: c n: (count c)}) where: (> n 2)}))
-(set ref2 (select {from: (select {from: (select {from: t by: k c: (count v)}) by: c n: (count c)})}))
-(== (count nested2) (count (select {from: ref2 where: (> n 2)}))) -- true
+;; grouped select nested inside must not be trimmed by it.  Every inner sum
+;; is 0 here, so an erroneous trim (sum > 5) would empty the inner result and
+;; the outer count would drop from 1 to 0.
+(set tz (table [k v] (list (% i 1000) (* 0 i))))
+(set nested (select {from: (select {from: (select {from: tz by: k s: (sum v)}) by: s c: (count s)}) where: (> c 5)}))
+(count nested) -- 1
+(at (at nested 'c) 0) -- 1000
+;; inner node whose slot 0 IS a count, but a different node than the matched
+;; one: its counts (30 each) all fail the outer threshold (> 100), so a leaked
+;; trim would empty it; the outer result must still see all 1000 inner groups
+(set nested2 (select {from: (select {from: (select {from: tz by: k c: (count v)}) by: c n: (count c)}) where: (> n 100)}))
+(count nested2) -- 1
+(at (at nested2 'n) 0) -- 1000

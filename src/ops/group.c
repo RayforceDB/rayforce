@@ -7901,6 +7901,12 @@ ray_group_emit_filter_t ray_group_emit_filter_get(void) {
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter) {
     tl_group_emit_filter = filter;
 }
+ray_group_emit_filter_t ray_group_emit_filter_active(void) {
+    ray_group_emit_filter_t f = ray_group_emit_filter_get();
+    if (!f.enabled) return f;
+    if (__VM && __VM->eval_depth != f.target_depth) { ray_group_emit_filter_t off = {0}; return off; }
+    return f;
+}
 
 static int64_t da_count_emit_keep_min(const int64_t* counts, uint32_t n_slots,
                                       uint32_t group_count,
@@ -10391,7 +10397,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * is simply ignored here (staying eligible keeps where+by+take shapes on
      * the slice kernel instead of dropping them to the generic ladder). */
     if (group_limit < 0) return false;
-    if (ray_group_emit_filter_get().enabled) return false;
+    if (ray_group_emit_filter_active().enabled) return false;
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext || ext->n_keys != 1 || ext->n_aggs < 1 || ext->n_aggs > 16)
         return false;
@@ -11333,7 +11339,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * `_e{a}_{op}` output names the legacy expression emit produced.
      * Any ineligibility falls through to the legacy path unchanged. */
     if (ray_agg_engine_v2 && group_limit >= 0
-        && !ray_group_emit_filter_get().enabled) {
+        && !ray_group_emit_filter_active().enabled) {
         ray_t* r = exec_group_v2_exprs(g, op, tbl, group_limit);
         if (r) return r;
     }
@@ -11723,7 +11729,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             key_attrs[k] = 0;
         }
     }
-    ray_group_emit_filter_t emit_filter = ray_group_emit_filter_get();
+    ray_group_emit_filter_t emit_filter = ray_group_emit_filter_active();
     /* Historical: enabled only for OP_COUNT (the min_count_exclusive
      * heavy-hitter filter and the top_count_take heap).  The
      * top_count_take heap path now also accepts SUM/MIN/MAX — those

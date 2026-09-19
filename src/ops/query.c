@@ -4219,6 +4219,7 @@ static ray_t* try_count_distinct_v2_rewrite(
          * so set it explicitly instead of leaning on a zero default that
          * used to be coerced to desc inside group.c. */
         emit_f.desc = 1;
+        emit_f.target_depth = __VM ? __VM->eval_depth : 0;   /* executed right here */
         ray_group_emit_filter_set(emit_f);
         emit_set = 1;
     }
@@ -6087,8 +6088,11 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     ray_group_emit_filter_t emit_filter = {0};
     bool emit_filter_set = match_group_count_emit_filter(
         from_expr, where_expr, &emit_filter);
-    if (emit_filter_set)
+    if (emit_filter_set) {
+        /* armed for the DIRECT child select evaluated by the from: below */
+        emit_filter.target_depth = (__VM ? __VM->eval_depth : 0) + 1;
         ray_group_emit_filter_set(emit_filter);
+    }
     /* Projection pushdown: publish the columns this select references so an
      * IMMEDIATE nested `select {by:}` distinct in `from:` (eval_depth+1) carries
      * only those.  Stack buffer stays live across the from: eval; save/restore
@@ -10496,6 +10500,7 @@ by_dict_done:
     bool self_emit_set = false;
     if (pre_top_emit_matched) {
         prev_self_emit = ray_group_emit_filter_get();
+        pre_top_emit.target_depth = __VM ? __VM->eval_depth : 0;   /* our own group node */
         ray_group_emit_filter_set(pre_top_emit);
         self_emit_set = true;
     }
