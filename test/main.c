@@ -872,6 +872,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
     const char* rfl_root = getenv("RFL_ROOT");
     if (!rfl_root || !*rfl_root) rfl_root = "test/rfl";
     if (rfl_scan(rfl_root) < 0) return 2;

@@ -1405,6 +1405,22 @@ int64_t agg_topn_keep(const double* vals, int64_t n,
     return agg_topn_mark(vals, n, ef, have_thr, thr, keep);
 }
 
+/* Threshold of a top-N from the union of per-range candidate sets.  The
+ * union of every range's N best contains the global N best, so when it
+ * holds more than N values the N-th in keep direction is the threshold; when
+ * it holds exactly N (one range) the threshold is the worst candidate.  No
+ * threshold when the whole population fits in N. */
+static bool agg_topn_union_threshold(const double* cand, int64_t nc, int64_t total,
+                                     const ray_group_emit_filter_t* ef, double* thr) {
+    if (ef->top_count_take <= 0 || total <= ef->top_count_take || nc <= 0) return false;
+    if (nc > ef->top_count_take) return agg_topn_threshold(cand, nc, ef, thr);
+    double worst = cand[0];
+    for (int64_t i = 1; i < nc; i++)
+        if (ef->desc ? cand[i] < worst : cand[i] > worst) worst = cand[i];
+    *thr = worst;
+    return true;
+}
+
 /* Bounded candidate heap: the N best values of a range in the keep
  * direction.  For desc a min-heap of the N largest; for asc a max-heap of
  * the N smallest.  Every partition contributes one such set, and the
@@ -1794,7 +1810,7 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
                     memmove(cand + nc, cand + (size_t)t * cap, (size_t)cand_n[t] * sizeof(double));
                     nc += cand_n[t];
                 }
-                c.have_thr = agg_topn_threshold(cand, nc, ef, &c.thr);
+                c.have_thr = agg_topn_union_threshold(cand, nc, n, ef, &c.thr);
             }
             if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_mark_fn, &c, tasks);
             else agg_slots_mark_fn(&c, 0, 0, 1);
@@ -1913,6 +1929,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             }
             ng = kept;
             route_stats.topn_native = true;
+            route_stats.topn_kept = kept;
         }
         ray_free_raw(keep);
         ray_profile_tick("dense: selected top-N groups");
@@ -3687,7 +3704,7 @@ agg_radix_select_topn(ray_pool_t* pool, const agg_radix_part_t* parts, uint32_t 
             memmove(cand + nc, cand + (size_t)p * cap, (size_t)cand_n[p] * sizeof(double));
             nc += cand_n[p];
         }
-        c.have_thr = agg_topn_threshold(cand, nc, ef, &c.thr);
+        c.have_thr = agg_topn_union_threshold(cand, nc, ng, ef, &c.thr);
     }
     if (pool) ray_pool_dispatch_n(pool, agg_radix_mark_fn, &c, n_parts);
     else agg_radix_mark_fn(&c, 0, 0, n_parts);
@@ -3925,6 +3942,7 @@ static ray_t* exec_group_v2_parallel_radix(
             pairs = sel_pairs;
             n_emit = kept;
             route_stats.topn_native = true;
+            route_stats.topn_kept = kept;
         } else if (rc == 1) {
             agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
             for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
@@ -4635,6 +4653,7 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.dense_plan_available = dense;
     int rc = dense ? agg_group_keys_dense(keys, nrows, &dp, &groups)
                    : agg_group_keys(keys, ext->n_keys, nrows, &groups);
+    agg_dense_plan_free(&dp);   /* compaction tables serve the key build only */
     if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     if (agg_cancelled()) { agg_groups_free(&groups); return ray_error("cancel", NULL); }
     int64_t ng = groups.ngroups;
@@ -5029,8 +5048,11 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * pass. Prefer partition ownership only once replicated state
              * traffic exceeds its row traffic; large pools/ranges still use
              * bounded shared storage. */
+            /* Compare the UNCAPPED replication so the choice between the two
+             * strategies does not move with the machine's cache size; the
+             * cache bound applies inside the task-local branch below. */
             uint32_t local_tasks = cache_tasks < dense_workers ? cache_tasks : dense_workers;
-            double local_traffic = local_tasks * slab_bytes;
+            double local_traffic = dense_workers * slab_bytes;
             double partition_traffic = (double)eff_n * (sizeof(uint32_t) + record_size);
             /* Compare the complete partition allocation against radix's
              * payload plus its worst-case per-row group state. A payload-only

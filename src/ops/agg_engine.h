@@ -65,6 +65,7 @@ typedef struct {
     uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
     uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
     bool topn_native;               /* last v2 run selected the emit filter's top-N itself */
+    int64_t topn_kept;              /* groups kept by that selection (ties included) */
 } agg_route_stats_t;
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
