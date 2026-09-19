@@ -176,6 +176,10 @@ uint32_t ray_thread_count(void);
 /* Physical cores (SMT siblings collapsed); falls back to the logical
  * count when topology is unavailable. */
 uint32_t ray_physical_core_count(void);
+/* Total last-level cache capacity summed over every LLC instance (bytes);
+ * 0 when the platform cannot report it.  Bounds replicated per-task state
+ * whose random-access working set must stay cache-resident to scale. */
+uint64_t ray_cache_llc_bytes(void);
 
 void ray_parallel_begin(void);
 void ray_parallel_end(void);

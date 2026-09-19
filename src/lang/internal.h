@@ -712,6 +712,11 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range);
 
 /* Query bridge builtins (formerly in eval.c, now in ops/query.c) */
 ray_t* ray_select_fn(ray_t** args, int64_t n);
+#ifdef DEBUG
+/* Chunk length of the per-distinct-symbol key evaluation over a FILE
+ * domain (ops/query.c derived_key_str_chunks); 0 restores the default. */
+void ray_derived_key_chunk_set_for_test(int64_t rows);
+#endif
 ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);
 ray_t* ray_update_fn(ray_t** args, int64_t n);

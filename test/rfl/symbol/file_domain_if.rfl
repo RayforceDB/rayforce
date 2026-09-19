@@ -1,0 +1,58 @@
+;; `if` over a SYM column whose ids live in a FILE domain (a splayed table
+;; read back from disk).  The branch that keeps the column translates its
+;; cells into runtime ids; it must do so for the cells it reads, not by
+;; interning the column's whole vocabulary.  Every answer must equal the
+;; same expression over the in-memory table.  Sizes past the parallel
+;; threshold (65536) so the pooled fill runs for trivial branches, plus a
+;; computed branch for the selected path.
+(.sys.exec "rm -rf /tmp/rfl_fdom_if/") -- 0
+(set N 70000)
+(set i (til N))
+(set hosts (map (fn [k] (format "h%.example.com" k)) (til 300)))
+(set ref (as 'SYMBOL (map (fn [k] (if (== 0 (% k 11)) "" (if (== 0 (% k 7)) (format "https://www.%/p/%" (at hosts (% (* 31 k) 300)) (% k 13)) (format "http://%/a/%" (at hosts (% (* 31 k) 300)) (% k 17))))) i)))
+(set v (as 'I64 (% (* i 7) 101)))
+(set ref2 (at ref (% (+ i 1) N)))
+(set T (table [ref ref2 v] (list ref ref2 v)))
+(.db.splayed.set "/tmp/rfl_fdom_if/" T)
+(set F (.db.splayed.get "/tmp/rfl_fdom_if/"))
+(count F) -- 70000
+(== (type (at F 'ref)) 'SYM) -- true
+(set S (fn [r] (as 'STR r)))
+
+;; trivial branches (column vs literal, column vs column): the pooled fill
+(set A1 (select {from: F k: (if (> v 50) ref 'other)}))
+(set B1 (select {from: T k: (if (> v 50) ref 'other)}))
+(all (== (S (at A1 'k)) (S (at B1 'k)))) -- true
+(set A2 (select {from: F k: (if (== 0 (% v 3)) 'left ref)}))
+(set B2 (select {from: T k: (if (== 0 (% v 3)) 'left ref)}))
+(all (== (S (at A2 'k)) (S (at B2 'k)))) -- true
+;; a FILE-domain column on BOTH sides, no row selection: the pooled fill
+;; reads one side per row and must have every such cell resolved up front
+(set A7 (select {from: F k: (if (> v 50) ref ref2)}))
+(set B7 (select {from: T k: (if (> v 50) ref ref2)}))
+(all (== (S (at A7 'k)) (S (at B7 'k)))) -- true
+(set A8 (select {from: F k: (if (== 0 (% v 3)) ref2 ref)}))
+(set B8 (select {from: T k: (if (== 0 (% v 3)) ref2 ref)}))
+(all (== (S (at A8 'k)) (S (at B8 'k)))) -- true
+
+;; computed branch against the column: the selected path
+(set A3 (select {from: F k: (if (== (str-find ref "www.") 8) (substr ref 13 -1) ref)}))
+(set B3 (select {from: T k: (if (== (str-find ref "www.") 8) (substr ref 13 -1) ref)}))
+(all (== (S (at A3 'k)) (S (at B3 'k)))) -- true
+(count (distinct (at A3 (quote k)))) -- 9001
+
+;; the column on both sides, under a row selection
+(set A4 (select {from: F k: (if (> v 50) ref ref) where: (!= ref "")}))
+(set B4 (select {from: T k: (if (> v 50) ref ref) where: (!= ref "")}))
+(all (== (S (at A4 'k)) (S (at B4 'k)))) -- true
+
+;; as a group key: same groups and counts as in memory
+(set FP (fn [r] (ser (xasc (xasc (table [k c] (list (S (at (value r) 0)) (at r 'c))) 'k) 'c))))
+(set A5 (select {from: F by: (if (== (str-find ref "www.") 8) (substr ref 13 -1) ref) c: (count v) where: (!= ref "")}))
+(set B5 (select {from: T by: (if (== (str-find ref "www.") 8) (substr ref 13 -1) ref) c: (count v) where: (!= ref "")}))
+(all (== (FP A5) (FP B5))) -- true
+
+;; the empty symbol (a null cell) survives the translation on either side
+(set A6 (select {from: F k: (if (> v 50) ref 'x)}))
+(== (count (select {from: A6 where: (== k "")})) (count (select {from: T where: (and (> v 50) (== ref ""))}))) -- true
+(.sys.exec "rm -rf /tmp/rfl_fdom_if/") -- 0
