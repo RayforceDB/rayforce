@@ -84,3 +84,30 @@
 (count RQ) -- 1
 (== (at (value RQ) 0) (at (value OQ) 0)) -- [true]
 (== (at RQ 'c) (at OQ 'c)) -- [true]
+
+;; ── the column's ids in a FILE domain (a splayed table read back) ──────
+;; The per-symbol evaluation then runs over the vocabulary's bytes, a
+;; chunk of distinct values at a time, and interns only the final key.
+;; Same groups and aggregates as the in-memory table.  (Several chunks
+;; over a small vocabulary: lang/select/derived_key_file_chunks in
+;; test/test_lang.c, through the DEBUG-only chunk-length seam.)
+(.sys.exec "rm -rf /tmp/rfl_dkey_file/") -- 0
+(.db.splayed.set "/tmp/rfl_dkey_file/" T)
+(set F (.db.splayed.get "/tmp/rfl_dkey_file/"))
+(count F) -- 20000
+(== (type (at F 'ref)) 'SYM) -- true
+(set RF (KEYQ F))
+(count RF) -- 37
+(all (== (FP RF) (FP O))) -- true
+(== (at (cols RF) 0) 'p) -- true
+(all (== (FP2 (select {from: F by: (if (== (str-find ref "www.") 0) (substr ref 4 -1) ref) c: (count ref)})) (FP2 O2))) -- true
+;; a key whose result is not a symbol keeps the one-shot evaluation
+(set RL (select {from: F by: (strlen ref) c: (count ref)}))
+(set OL (select {from: T by: (strlen ref) c: (count ref)}))
+(all (== (FP2 RL) (FP2 OL))) -- true
+;; nulls in the file-backed column
+(.sys.exec "rm -rf /tmp/rfl_dkey_filen/") -- 0
+(.db.splayed.set "/tmp/rfl_dkey_filen/" TN)
+(set FN (.db.splayed.get "/tmp/rfl_dkey_filen/"))
+(all (== (FP (KEYQ FN)) (FP ON))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dkey_file/ /tmp/rfl_dkey_filen/") -- 0
