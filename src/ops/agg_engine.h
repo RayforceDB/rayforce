@@ -64,6 +64,7 @@ typedef struct {
     uint64_t dense_local_slots;     /* allocated group-state slots, including partials */
     uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
     uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
+    bool topn_native;               /* last v2 run selected the emit filter's top-N itself */
 } agg_route_stats_t;
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
@@ -86,6 +87,13 @@ bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
  * number kept.  vals may be NULL when n == 0. */
 int64_t agg_topn_keep(const double* vals, int64_t n,
                       const ray_group_emit_filter_t* ef, uint8_t* keep);
+/* The two halves of agg_topn_keep, for callers that reduce candidates in
+ * parallel: the N-th value in the keep direction (false when every value is
+ * kept), and the keep marking against a known threshold. */
+bool agg_topn_threshold(const double* vals, int64_t n,
+                        const ray_group_emit_filter_t* ef, double* thr);
+int64_t agg_topn_mark(const double* vals, int64_t n, const ray_group_emit_filter_t* ef,
+                      bool have_thr, double thr, uint8_t* keep);
 
 /* Double view of aggregate `vt` for n groups: group i's state is at
  * states + (slots ? slots[i] : i) * stride + off.  Nulls (and NaN) sink to

@@ -1799,6 +1799,39 @@ static test_result_t test_dense_composite_compaction(void) {
     PASS();
 }
 
+/* A many-million-group top-N must stay on the parallel engine and emit only
+ * the kept superset: radix selects by aggregate value per partition. */
+static test_result_t test_radix_native_topn(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set rt_i (til 2000000)) "
+        "(set rt_t (table [k j v] (list (% (* rt_i 7919) 1500000) (% rt_i 3) (% rt_i 5))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:rt_t by:[k j] c:(count v) desc:c take:10})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 1);
+    TEST_ASSERT_TRUE(stats.topn_native);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
+    ray_t* check = ray_eval_str(
+        "(== (at (at (select {from:rt_t by:[k j] c:(count v) desc:c take:10}) 'c) 0) "
+        "(max (at (select {from:rt_t by:[k j] c:(count v)}) 'c)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    /* asc keeps the smallest counts */
+    r = ray_eval_str("(select {from:rt_t by:[k j] c:(count v) asc:c take:3})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 2)))[0], 1);
+    ray_release(r);
+    ray_release(ray_eval_str("(set rt_t 0) (set rt_i 0)"));
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
@@ -1815,6 +1848,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_task_local", test_dense_task_local, contract_setup, contract_teardown },
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },
     { "agg_contract/dense_composite_compaction", test_dense_composite_compaction, contract_setup, contract_teardown },
+    { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },

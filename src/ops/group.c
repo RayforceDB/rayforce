@@ -11410,51 +11410,25 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         return exec_group_v2(g, op, tbl, group_limit);
 
     /* Emit-filter shapes (`desc: c take: N`, `where (> c N)` on the group
-     * result) used to run on the legacy ladder because v2 does not
-     * implement the top-count emit filter.  That ladder is single-threaded
-     * in its scatter and its dense array scales with the store's SHARED sym
-     * domain, so every top-N group query lost the parallel engine: a
-     * three-aggregate 100k-group query measured 800 ms on one core and
-     * 777 ms on a 28-thread pool (0.1x parallel), while the same grouping
-     * without the filter ran in 47 ms.  The emit filter is purely
-     * an optimization — the DAG's sort+take downstream produces the final
-     * order/limit either way — so run the PARALLEL v2 engine on every shape
-     * it admits with a bounded dense plan and trim its full result to the
-     * filter's top-N superset.  Unbounded key domains (many-million-group
-     * inputs) stay on the legacy ladder for now: v2's radix route still
-     * pays a serial first-seen ordering and emission tail there (a 10M-group
-     * three-key count measured 154 ms against the ladder's 54 ms on 28
-     * threads).  One unbounded shape still prefers v2: a single wide-domain
-     * SYM key on a bounded input, where the ladder's dense scatter scales
-     * with the store's SHARED sym domain (splayed stores keep one domain
-     * across all SYM columns — often 10M+ ids) and became the serial wall
-     * (88 ms of a 110 ms benchmark query, flat multi-core scaling). */
+     * result) used to run on the legacy ladder because v2 did not implement
+     * the top-count emit filter.  That ladder is single-threaded in its
+     * scatter and its dense array scales with the store's SHARED sym domain,
+     * so every top-N group query lost the parallel engine: a three-aggregate
+     * 100k-group query measured 800 ms on one core and 777 ms on a 28-thread
+     * pool (0.1x parallel), while the same grouping without the filter ran
+     * in 47 ms.  v2 now reads the filter itself: radix and the dense finishes
+     * select the kept groups natively, the remaining routes return the full
+     * result and are trimmed here to the filter's top-N superset.  The DAG's
+     * sort+take downstream produces the final order/limit either way.  The
+     * legacy ladder remains only for shapes v2 declines. */
     {
         ray_group_emit_filter_t ef = ray_group_emit_filter_get();
-        bool wide_sym_key = false;
-        if (ef.enabled && ext->n_keys == 1 && ray_table_nrows(tbl) <= (int64_t)(4u << 20)
-            && (ef.agg_op == 0 || ef.agg_op == OP_COUNT || ef.agg_op == OP_SUM
-                || ef.agg_op == OP_MIN || ef.agg_op == OP_MAX)) {
-            ray_op_t* k0 = op_node(g, ext->keys[0]);
-            ray_op_ext_t* k0e = k0 ? find_ext(g, k0->id) : NULL;
-            ray_t* k0c = (k0e && k0e->base.opcode == OP_SCAN)
-                       ? ray_table_get_col(tbl, k0e->sym) : NULL;
-            wide_sym_key = k0c && k0c->type == RAY_SYM &&
-                ray_sym_domain_count(ray_sym_vec_domain(k0c)) > (1 << 21);
-        }
         if (ray_agg_engine_v2 && group_limit == 0 && ef.enabled
-            && agg_v2_can_handle(g, op, tbl)
-            && (wide_sym_key || agg_v2_dense_plan_available(g, op, tbl))) {
-            /* Suppress the filter for the v2 run (v2 ignores it anyway;
-             * clearing keeps recursion/asserts honest), restore after. */
-            ray_group_emit_filter_t saved = ray_group_emit_filter_get();
-            ray_group_emit_filter_t off = {0};
-            ray_group_emit_filter_set(off);
+            && agg_v2_can_handle(g, op, tbl)) {
             ray_t* r = exec_group_v2(g, op, tbl, 0);
-            ray_group_emit_filter_set(saved);
             if (r && !RAY_IS_ERR(r))
-                return group_emit_filter_trim(r, ext->n_keys,
-                                              ext->n_aggs, ef);
+                return agg_route_stats().topn_native
+                    ? r : group_emit_filter_trim(r, ext->n_keys, ext->n_aggs, ef);
             if (r) return r;
             /* v2 declined at runtime — continue on the legacy ladder. */
         }

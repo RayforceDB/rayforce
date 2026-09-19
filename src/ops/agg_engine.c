@@ -1396,35 +1396,34 @@ static inline bool agg_finalize_value(const agg_vtable_t* vt, const void* state,
 /* Threshold = N-th value in the keep direction, found by quickselect on a
  * copy: O(n) and exact, so ties at the threshold are kept.  Callers
  * parallelize the value fill; the selection itself runs on the caller. */
-int64_t agg_topn_keep(const double* vals, int64_t n,
-                      const ray_group_emit_filter_t* ef, uint8_t* keep) {
-    if (n <= 0) return 0;
-    double thr = 0.0;
-    bool have_thr = false;
-    if (ef->top_count_take > 0 && n > ef->top_count_take) {
-        ray_t* hdr = NULL;
-        double* sv = (double*)scratch_alloc(&hdr, (size_t)n * sizeof(double));
-        if (sv) {
-            memcpy(sv, vals, (size_t)n * sizeof(double));
-            int64_t k = ef->desc ? (n - ef->top_count_take) : (ef->top_count_take - 1);
-            int64_t lo = 0, hi = n - 1;
-            while (lo < hi) {
-                double pivot = sv[k];
-                int64_t i = lo, j = hi;
-                while (i <= j) {
-                    while (sv[i] < pivot) i++;
-                    while (sv[j] > pivot) j--;
-                    if (i <= j) { double t = sv[i]; sv[i] = sv[j]; sv[j] = t; i++; j--; }
-                }
-                if (k <= j) hi = j;
-                else if (k >= i) lo = i;
-                else break;
-            }
-            thr = sv[k];
-            have_thr = true;
-            scratch_free(hdr);
+bool agg_topn_threshold(const double* vals, int64_t n,
+                        const ray_group_emit_filter_t* ef, double* thr) {
+    if (ef->top_count_take <= 0 || n <= ef->top_count_take) return false;
+    ray_t* hdr = NULL;
+    double* sv = (double*)scratch_alloc(&hdr, (size_t)n * sizeof(double));
+    if (!sv) return false;
+    memcpy(sv, vals, (size_t)n * sizeof(double));
+    int64_t k = ef->desc ? (n - ef->top_count_take) : (ef->top_count_take - 1);
+    int64_t lo = 0, hi = n - 1;
+    while (lo < hi) {
+        double pivot = sv[k];
+        int64_t i = lo, j = hi;
+        while (i <= j) {
+            while (sv[i] < pivot) i++;
+            while (sv[j] > pivot) j--;
+            if (i <= j) { double t = sv[i]; sv[i] = sv[j]; sv[j] = t; i++; j--; }
         }
+        if (k <= j) hi = j;
+        else if (k >= i) lo = i;
+        else break;
     }
+    *thr = sv[k];
+    scratch_free(hdr);
+    return true;
+}
+
+int64_t agg_topn_mark(const double* vals, int64_t n, const ray_group_emit_filter_t* ef,
+                      bool have_thr, double thr, uint8_t* keep) {
     int64_t kept = 0;
     for (int64_t i = 0; i < n; i++) {
         double v = vals[i];
@@ -1434,6 +1433,48 @@ int64_t agg_topn_keep(const double* vals, int64_t n,
         kept += ok;
     }
     return kept;
+}
+
+int64_t agg_topn_keep(const double* vals, int64_t n,
+                      const ray_group_emit_filter_t* ef, uint8_t* keep) {
+    if (n <= 0) return 0;
+    double thr = 0.0;
+    bool have_thr = agg_topn_threshold(vals, n, ef, &thr);
+    return agg_topn_mark(vals, n, ef, have_thr, thr, keep);
+}
+
+/* Bounded candidate heap: the N best values of a range in the keep
+ * direction.  For desc a min-heap of the N largest; for asc a max-heap of
+ * the N smallest.  Every partition contributes one such set, and the
+ * threshold of their union equals the threshold of the whole. */
+static void agg_topn_candidates(const double* vals, int64_t n, int64_t cap, uint8_t desc,
+                                double* heap, int64_t* hn) {
+    int64_t h = 0;
+    #define CAND_WORSE(a, b) (desc ? ((a) < (b)) : ((a) > (b)))   /* a is worse than b */
+    for (int64_t i = 0; i < n; i++) {
+        double v = vals[i];
+        if (h < cap) {
+            int64_t j = h++;
+            heap[j] = v;
+            while (j > 0) {                       /* sift up: root is the worst kept */
+                int64_t par = (j - 1) / 2;
+                if (!CAND_WORSE(heap[j], heap[par])) break;
+                double t = heap[par]; heap[par] = heap[j]; heap[j] = t; j = par;
+            }
+        } else if (CAND_WORSE(heap[0], v)) {
+            heap[0] = v;
+            int64_t j = 0;
+            for (;;) {                            /* sift down */
+                int64_t l = 2 * j + 1, r = l + 1, m = j;
+                if (l < cap && CAND_WORSE(heap[l], heap[m])) m = l;
+                if (r < cap && CAND_WORSE(heap[r], heap[m])) m = r;
+                if (m == j) break;
+                double t = heap[m]; heap[m] = heap[j]; heap[j] = t; j = m;
+            }
+        }
+    }
+    #undef CAND_WORSE
+    *hn = h;
 }
 
 bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
@@ -2514,7 +2555,7 @@ static ray_t* exec_group_v2_parallel_radix(
         ray_t** key_cols, int64_t* key_syms,
         const agg_vtable_t** vts, const size_t* off, size_t block,
         ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
-        int64_t group_limit);
+        int64_t group_limit, const ray_group_emit_filter_t* efp);
 
 typedef struct {
     ray_t**            key_cols;
@@ -3390,6 +3431,149 @@ static void agg_radix_finalize_fn(void* vctx, uint32_t wid, int64_t start, int64
     }
 }
 
+/* Heap sort of (keys, pairs) ascending by key, moving both arrays together.
+ * Used for the small selected sets of the bounded and top-N emits. */
+static void agg_sort_pairs_by_key(agg_radix_order_t* pairs, int64_t* keys, int64_t n) {
+    #define PAIRS_SIFT_DOWN(START, END) do {                                   \
+        int64_t i_ = (START);                                                  \
+        for (;;) {                                                             \
+            int64_t l = 2 * i_ + 1, r = l + 1, m = i_;                         \
+            if (l < (END) && keys[l] > keys[m]) m = l;                         \
+            if (r < (END) && keys[r] > keys[m]) m = r;                         \
+            if (m == i_) break;                                                \
+            int64_t tk = keys[m]; keys[m] = keys[i_]; keys[i_] = tk;           \
+            int64_t tp = pairs[m].idx; pairs[m].idx = pairs[i_].idx; pairs[i_].idx = tp; \
+            i_ = m;                                                            \
+        }                                                                      \
+    } while (0)
+    for (int64_t start = n / 2 - 1; start >= 0; start--) PAIRS_SIFT_DOWN(start, n);
+    for (int64_t end = n - 1; end > 0; end--) {
+        int64_t tk = keys[0]; keys[0] = keys[end]; keys[end] = tk;
+        int64_t tp = pairs[0].idx; pairs[0].idx = pairs[end].idx; pairs[end].idx = tp;
+        PAIRS_SIFT_DOWN(0, end);
+    }
+    #undef PAIRS_SIFT_DOWN
+}
+
+/* Top-N selection for the emit filter: every partition finalizes the filter
+ * aggregate into one double per group in parallel, the shared keep decision
+ * picks the kept superset, and only those groups are emitted — in ascending
+ * first-row order, so the emitted prefix is deterministic.  Replaces the
+ * full path's input-sized order map, full emission and post-trim for
+ * `desc: AGG take: N` shapes (a 10M-group three-key count spent 110 of its
+ * 154 ms there).  `*rc`: 0 ok, 1 oom, 2 the aggregate has no scalar order
+ * (caller keeps the full path and trims). */
+typedef struct {
+    const agg_radix_part_t* parts;
+    const agg_vtable_t* vt;
+    size_t off, block;
+    int64_t param;
+    const ray_group_emit_filter_t* ef;
+    double* vals;
+    uint8_t* keep;
+    const int64_t* base;
+    double* cand;          /* [n_parts * cap] per-partition candidate heaps */
+    int64_t* cand_n;       /* [n_parts] */
+    int64_t cap;
+    bool have_thr;
+    double thr;
+    int64_t* kept;         /* [n_parts] */
+    _Atomic(int) fail;
+} agg_radix_vals_ctx_t;
+
+/* Pass 1 per partition: finalize values, then the bounded candidate heap. */
+static void agg_radix_vals_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_radix_vals_ctx_t* c = raw;
+    for (int64_t p = start; p < end; p++) {
+        double* v = c->vals + c->base[p];
+        if (!agg_group_values_f64(c->vt, c->parts[p].states, c->block, c->off, NULL,
+                                  c->parts[p].ng, c->param, c->ef->desc, v)) {
+            atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+            continue;
+        }
+        if (c->cap > 0)
+            agg_topn_candidates(v, c->parts[p].ng, c->cap, c->ef->desc,
+                                c->cand + (size_t)p * c->cap, &c->cand_n[p]);
+    }
+}
+
+/* Pass 2 per partition: mark the kept groups against the global threshold. */
+static void agg_radix_mark_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_radix_vals_ctx_t* c = raw;
+    for (int64_t p = start; p < end; p++)
+        c->kept[p] = agg_topn_mark(c->vals + c->base[p], c->parts[p].ng, c->ef,
+                                   c->have_thr, c->thr, c->keep + c->base[p]);
+}
+
+static agg_radix_order_t* __attribute__((noinline))
+agg_radix_select_topn(ray_pool_t* pool, const agg_radix_part_t* parts, uint32_t n_parts,
+                      const agg_vtable_t* vt, size_t off, size_t block, int64_t param,
+                      const ray_group_emit_filter_t* ef, int64_t* n_emit, int* rc) {
+    *rc = 0;
+    int64_t ng = 0;
+    int64_t* base = ray_alloc_raw(((size_t)n_parts + 1) * sizeof(int64_t));
+    if (!base) { *rc = 1; return NULL; }
+    for (uint32_t p = 0; p < n_parts; p++) { base[p] = ng; ng += parts[p].ng; }
+    base[n_parts] = ng;
+    double* vals = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(double));
+    uint8_t* keep = ray_alloc_raw((size_t)(ng > 0 ? ng : 1));
+    if (!vals || !keep) {
+        ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep); *rc = 1; return NULL;
+    }
+    int64_t cap = ef->top_count_take > 0 && ng > ef->top_count_take ? ef->top_count_take : 0;
+    double* cand = ray_alloc_raw((size_t)(cap > 0 ? cap * n_parts : 1) * sizeof(double));
+    int64_t* cand_n = ray_calloc_raw((size_t)n_parts * 2 * sizeof(int64_t));
+    if (!cand || !cand_n) {
+        ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep);
+        ray_free_raw(cand); ray_free_raw(cand_n); *rc = 1; return NULL;
+    }
+    agg_radix_vals_ctx_t c = { .parts = parts, .vt = vt, .off = off, .block = block,
+        .param = param, .ef = ef, .vals = vals, .keep = keep, .base = base,
+        .cand = cand, .cand_n = cand_n, .cap = cap, .kept = cand_n + n_parts };
+    atomic_init(&c.fail, 0);
+    if (pool) ray_pool_dispatch_n(pool, agg_radix_vals_fn, &c, n_parts);
+    else agg_radix_vals_fn(&c, 0, 0, n_parts);
+    if (atomic_load_explicit(&c.fail, memory_order_relaxed)) {
+        ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep);
+        ray_free_raw(cand); ray_free_raw(cand_n); *rc = 2; return NULL;
+    }
+    /* The union of every partition's N best contains the global N best, so
+     * its N-th value is the global threshold: O(N * parts) serial work. */
+    if (cap > 0) {
+        int64_t nc = 0;
+        for (uint32_t p = 0; p < n_parts; p++) {
+            memmove(cand + nc, cand + (size_t)p * cap, (size_t)cand_n[p] * sizeof(double));
+            nc += cand_n[p];
+        }
+        c.have_thr = agg_topn_threshold(cand, nc, ef, &c.thr);
+    }
+    if (pool) ray_pool_dispatch_n(pool, agg_radix_mark_fn, &c, n_parts);
+    else agg_radix_mark_fn(&c, 0, 0, n_parts);
+    int64_t kept = 0;
+    for (uint32_t p = 0; p < n_parts; p++) kept += c.kept[p];
+    ray_free_raw(cand); ray_free_raw(cand_n);
+    agg_radix_order_t* sel = ray_alloc_raw((size_t)(kept > 0 ? kept : 1) * sizeof(agg_radix_order_t));
+    int64_t* fr = ray_alloc_raw((size_t)(kept > 0 ? kept : 1) * sizeof(int64_t));
+    if (!sel || !fr) {
+        ray_free_raw(sel); ray_free_raw(fr);
+        ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep); *rc = 1; return NULL;
+    }
+    int64_t k = 0;
+    for (uint32_t p = 0; p < n_parts; p++)
+        for (int64_t gg = 0; gg < parts[p].ng; gg++)
+            if (keep[base[p] + gg]) {
+                sel[k].idx = ((int64_t)p << 32) | (uint32_t)gg;
+                fr[k] = parts[p].first_row[gg];
+                k++;
+            }
+    agg_sort_pairs_by_key(sel, fr, k);
+    ray_free_raw(fr); ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep);
+    *n_emit = k;
+    return sel;
+}
+
 /* Bounded first-seen selection for the HEAD(GROUP) limit hint: pick the
  * `n_emit` groups with the SMALLEST first_row across all partitions — which
  * ARE the first `n_emit` groups in first-seen order — and return them as the
@@ -3449,24 +3633,10 @@ agg_radix_select_first_n(const agg_radix_part_t* parts, uint32_t n_parts,
             }
         }
     }
-    /* Heap-sort the selected entries into ascending first_row order. */
+    /* Sort the selected entries into ascending first_row order (the heap
+     * above is already a max-heap, so the sort's heapify is a no-op). */
     if (ok) {
-        for (int64_t end = hn - 1; end > 0; end--) {
-            int64_t tk = hkey[0]; hkey[0] = hkey[end]; hkey[end] = tk;
-            int64_t tp = sel_pairs[0].idx;
-            sel_pairs[0].idx = sel_pairs[end].idx; sel_pairs[end].idx = tp;
-            int64_t i = 0;
-            for (;;) {
-                int64_t l = 2 * i + 1, r = l + 1, m = i;
-                if (l < end && hkey[l] > hkey[m]) m = l;
-                if (r < end && hkey[r] > hkey[m]) m = r;
-                if (m == i) break;
-                tk = hkey[m]; hkey[m] = hkey[i]; hkey[i] = tk;
-                tp = sel_pairs[m].idx;
-                sel_pairs[m].idx = sel_pairs[i].idx; sel_pairs[i].idx = tp;
-                i = m;
-            }
-        }
+        agg_sort_pairs_by_key(sel_pairs, hkey, hn);
         ok = hn == n_emit;
     }
     scratch_free(hk_hdr);
@@ -3479,7 +3649,7 @@ static ray_t* exec_group_v2_parallel_radix(
         ray_t** key_cols, int64_t* key_syms,
         const agg_vtable_t** vts, const size_t* off, size_t block,
         ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
-        int64_t group_limit) {
+        int64_t group_limit, const ray_group_emit_filter_t* efp) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     ray_pool_t* pool = ray_pool_get();
@@ -3598,7 +3768,28 @@ static ray_t* exec_group_v2_parallel_radix(
      * emitted prefix is byte-identical to trimming the full result to N. */
     int64_t n_emit = ng;
     agg_radix_order_t* pairs = NULL;
-    if (group_limit > 0 && ng > group_limit) {
+    if (efp && group_limit == 0) {
+        int rc = 0;
+        int64_t kept = 0;
+        agg_radix_order_t* sel_pairs = agg_radix_select_topn(pool, parts, n_parts,
+                vts[efp->agg_index], off[efp->agg_index], block,
+                ext->agg_k ? ext->agg_k[efp->agg_index] : 0, efp, &kept, &rc);
+        if (sel_pairs) {
+            pairs = sel_pairs;
+            n_emit = kept;
+            route_stats.topn_native = true;
+        } else if (rc == 1) {
+            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+            for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
+            ray_free_raw(bufs); ray_free_raw(parts);
+            agg_desc_free(&d);
+            return ray_error("oom", NULL);
+        }
+        /* rc == 2: no scalar order for this aggregate — full path below. */
+    }
+    if (pairs) {
+        /* native top-N selected above */
+    } else if (group_limit > 0 && ng > group_limit) {
         int rc = 0;
         n_emit = group_limit;
         agg_radix_order_t* sel_pairs = agg_radix_select_first_n(
@@ -4447,13 +4638,19 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
 static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t nrows, ray_t* sel,
                                 const int64_t* sel_prefix, int64_t n_sel,
-                                int64_t group_limit) {
+                                int64_t group_limit,
+                                const ray_group_emit_filter_t* efp) {
     agg_route_reason(AGG_V2_ADMITTED);
+    route_stats.topn_native = false;
     route_stats.nullable_key = false;
     route_stats.dense_plan_available = false;
     route_stats.dense_worker_budget = false;
     route_stats.dense_tasks = 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
+    /* The top-N emit filter names an aggregate slot; an out-of-range slot or a
+     * filter armed for a different node means "no filter" here (the caller's
+     * sort+take still produces the final answer from the full result). */
+    if (efp && (!efp->enabled || efp->agg_index >= ext->n_aggs)) efp = NULL;
 
     /* Exact-size carve for the per-key column pointers + syms (one block, both
      * 8-byte): unbounded key count, freed at every exit of this function
@@ -4488,7 +4685,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (!idx || RAY_IS_ERR(idx)) { scratch_free(kc_hdr); return idx ? idx : ray_error("oom", NULL); }
             ray_t* compact = agg_build_compact(g, op, tbl, ray_data(idx), n_sel);
             ray_t* result = compact && !RAY_IS_ERR(compact)
-                ? exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0, group_limit) : compact;
+                ? exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0, group_limit, efp) : compact;
             if (compact && !RAY_IS_ERR(compact)) ray_release(compact);
             ray_release(idx); scratch_free(kc_hdr); return result;
         }
@@ -4536,7 +4733,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 return compact ? compact : ray_error("oom", NULL);             \
             }                                                                   \
             ray_t* r = exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0,   \
-                                         group_limit);                          \
+                                         group_limit, efp);                     \
             ray_release(compact); ray_release(idxb);                            \
             return r;                                                           \
         } while (0)
@@ -4719,7 +4916,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             /* Sparse ranges and excessive dense worker traffic use radix. */
             ray_t* r = exec_group_v2_parallel_radix(g, op, tbl, nrows,
                     key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
-                    group_limit);
+                    group_limit, efp);
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */
@@ -4867,9 +5064,14 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                      int64_t group_limit) {
     if (agg_cancelled()) return ray_error("cancel", NULL);
+    /* The top-N emit filter (`desc: AGG take: N`) is read once here and
+     * handed to every strategy: radix and the dense finishes select the kept
+     * groups themselves; the other routes trim their full result. */
+    ray_group_emit_filter_t ef = ray_group_emit_filter_get();
+    const ray_group_emit_filter_t* efp = ef.enabled ? &ef : NULL;
     if (!g || !g->selection)
         return exec_group_v2_run(g, op, tbl, ray_table_nrows(tbl), NULL, NULL, 0,
-                                 group_limit);
+                                 group_limit, efp);
 
     int64_t src_nrows = ray_table_nrows(tbl);
     ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
@@ -4877,7 +5079,7 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * applied here — fall back to the unfiltered run (matches the scalar-agg
      * guard in group.c, which also only honors a selection when nrows match). */
     if (sm->nrows != src_nrows)
-        return exec_group_v2_run(g, op, tbl, src_nrows, NULL, NULL, 0, group_limit);
+        return exec_group_v2_run(g, op, tbl, src_nrows, NULL, NULL, 0, group_limit, efp);
 
     int64_t n_sel = sm->total_pass;
     ray_t* prefix_block = agg_sel_build_prefix(g->selection);
@@ -4889,7 +5091,7 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_t* saved_sel = g->selection;
     g->selection = NULL;
     ray_t* result = exec_group_v2_run(g, op, tbl, src_nrows, saved_sel, sel_prefix,
-                                      n_sel, group_limit);
+                                      n_sel, group_limit, efp);
     g->selection = saved_sel;
 
     ray_release(prefix_block);
