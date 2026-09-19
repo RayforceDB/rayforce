@@ -8,6 +8,7 @@
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
 #include "table/sym.h"    /* ray_read_sym */
+#include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include <stdlib.h>
 #include <string.h>
 
@@ -190,6 +191,56 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     return agg_v2_admission(g, op, tbl) == AGG_V2_ADMITTED;
 }
 
+/* True when the v2 engine would run this group through a bounded dense
+ * (direct-index) plan over the whole table.  Callers use it to predict the
+ * strategy class before committing: dense plans scale with the pool, while
+ * the unbounded radix route still pays a large serial ordering/emission
+ * tail on many-million-group inputs.  Costs one parallel min/max prescan
+ * of the non-SYM keys; SYM keys resolve from their domain bounds. */
+/* The probe's plan is kept for the run that follows on this thread so the
+ * key prescan is not paid twice (4 ms serial on a 10M-row I64 key).  The
+ * run consumes it only when the same key columns and row count are seen. */
+typedef struct {
+    bool valid;
+    uint32_t n_keys;
+    int64_t nrows;
+    ray_t* key_cols[16];
+    dense_plan_t dp;
+} agg_dense_plan_cache_t;
+static _Thread_local agg_dense_plan_cache_t g_dense_plan_cache;
+
+static bool agg_dense_plan_cached(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
+                                  dense_plan_t* out) {
+    agg_dense_plan_cache_t* c = &g_dense_plan_cache;
+    bool hit = c->valid && c->n_keys == n_keys && c->nrows == nrows;
+    for (uint32_t k = 0; hit && k < n_keys; k++) hit = c->key_cols[k] == key_cols[k];
+    if (c->valid && !hit) agg_dense_plan_free(&c->dp);
+    c->valid = false;   /* one run per probe */
+    if (!hit) return false;
+    *out = c->dp;       /* compaction tables transfer to the run */
+    return true;
+}
+
+bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
+    if (!g || !op || !tbl) return false;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || ext->n_keys < 1 || ext->n_keys > 16) return false;
+    agg_dense_plan_cache_t* c = &g_dense_plan_cache;
+    if (c->valid) agg_dense_plan_free(&c->dp);
+    c->valid = false;
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        ray_op_t* key = op_node(g, ext->keys[k]);
+        ray_op_ext_t* kext = key ? find_ext(g, key->id) : NULL;
+        c->key_cols[k] = kext ? ray_table_get_col(tbl, kext->sym) : NULL;
+        if (!c->key_cols[k]) return false;
+    }
+    c->n_keys = ext->n_keys;
+    c->nrows = ray_table_nrows(tbl);
+    bool ok = agg_dense_plan(c->key_cols, c->n_keys, NULL, 0, c->nrows, &c->dp);
+    c->valid = ok;
+    return ok;
+}
+
 /* ── Dense grouping eligibility selector (mirrors group.c DA path) ────────
  * Decides whether the key tuple packs into a bounded direct-index slot space
  * (gid = sum_k (key_k - min_k)*strides[k]) so grouping can skip hashing.
@@ -206,9 +257,33 @@ static int64_t agg_key_null(int8_t type) {
         default: return NULL_I64;
     }
 }
-static inline int64_t agg_dense_component(const dense_plan_t* dp, uint32_t k, int64_t v) {
+/* Raw-range component: the hot loops use this whenever the plan has no
+ * compacted key.  A per-row check of the remap pointer inside the row loop
+ * defeats the compiler's pipelining of the multi-key packing (measured 12x
+ * slower on a two-integer-key sum), so callers hoist `dp->compacted` out of
+ * their loops and pick one of the two forms. */
+static inline int64_t agg_dense_component_raw(const dense_plan_t* dp, uint32_t k, int64_t v) {
     return dp->nullable[k] && v == dp->nulls[k]
         ? dp->ranges[k] - 1 : v - dp->mins[k];
+}
+static inline int64_t agg_dense_component(const dense_plan_t* dp, uint32_t k, int64_t v) {
+    if (dp->nullable[k] && v == dp->nulls[k]) return dp->ranges[k] - 1;
+    int64_t c = v - dp->mins[k];
+    return dp->remap[k] ? dp->remap[k][c] : c;
+}
+/* Original key code of a dense component (inverse of agg_dense_component). */
+static inline int64_t agg_dense_code(const dense_plan_t* dp, uint32_t k, int64_t component) {
+    if (dp->nullable[k] && component == dp->ranges[k] - 1) return dp->nulls[k];
+    return dp->inverse[k] ? dp->inverse[k][component] : dp->mins[k] + component;
+}
+
+void agg_dense_plan_free(dense_plan_t* dp) {
+    if (!dp) return;
+    for (uint32_t k = 0; k < 16; k++) {
+        ray_free_raw(dp->remap[k]); dp->remap[k] = NULL;
+        ray_free_raw(dp->inverse[k]); dp->inverse[k] = NULL;
+    }
+    dp->compacted = false;
 }
 static bool agg_dense_range(dense_plan_t* dp, uint32_t k, int64_t mn, int64_t mx) {
     if (mx < mn) { dp->mins[k] = 0; dp->ranges[k] = 1; return dp->nullable[k]; }
@@ -300,12 +375,149 @@ static void agg_key_bounds_parallel(ray_t* key, int64_t rows, bool nullable,
     agg_key_bounds(key, 0, rows, nullable, null, lo, hi);
 }
 
+/* ── Key compaction for composite plans ──────────────────────────────────
+ * A composite plan multiplies per-key ranges.  SYM columns of a shared
+ * domain (one runtime domain across every column, or a splayed store's
+ * shared symfile) interleave their codes with every other column's, so two
+ * 100-value SYM keys can each span a 100k-code range and their raw product
+ * (10^10 slots) rejects the plan although only 10^4 groups exist.  The
+ * ranges of sparse integer keys multiply out the same way.  When the raw
+ * product overflows, one parallel pass marks the codes each candidate key
+ * actually uses; if the product of the used-code counts fits, the plan maps
+ * each key through a code→component table (agg_dense_component) and emits
+ * keys through its inverse (agg_dense_code).  Only keys whose remap table is
+ * bounded (AGG_COMPACT_MAX_RANGE codes) are compacted. */
+enum { AGG_COMPACT_MAX_RANGE = 1 << 22,   /* largest per-key remap table (codes) */
+       AGG_COMPACT_TRY_SLOTS = 1 << 16 };  /* raw products above this try compaction */
+
+typedef struct {
+    ray_t** key_cols;
+    const dense_plan_t* dp;
+    const bool* candidate;
+    uint32_t n_keys;
+    int64_t rows;
+    uint32_t tasks;
+    uint64_t** task_bits;    /* [tasks][n_keys] private bitmaps, NULL when not a candidate */
+} agg_compact_ctx_t;
+
+static void agg_compact_mark_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_compact_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        int64_t begin = c->rows / c->tasks * task;
+        int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1);
+        for (uint32_t k = 0; k < c->n_keys; k++) {
+            if (!c->candidate[k]) continue;
+            uint64_t* bits = c->task_bits[(size_t)task * c->n_keys + k];
+            ray_t* kc = c->key_cols[k];
+            const void* d = ray_data(kc);
+            int64_t mn = c->dp->mins[k];
+            bool nullable = c->dp->nullable[k];
+            int64_t null = c->dp->nulls[k];
+            for (int64_t r = begin; r < limit; r++) {
+                int64_t v = agg_read_key_i64(kc, d, r);
+                if (nullable && v == null) continue;
+                uint64_t code = (uint64_t)(v - mn);
+                bits[code >> 6] |= UINT64_C(1) << (code & 63);
+            }
+        }
+    }
+}
+
+static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
+                                   int64_t dense_limit, dense_plan_t* out) {
+    bool candidate[16];
+    bool any = false;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        int64_t raw = out->ranges[k] - out->nullable[k];
+        candidate[k] = raw > 1 && raw <= AGG_COMPACT_MAX_RANGE;
+        any |= candidate[k];
+    }
+    if (!any) return false;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t tasks = pool && nrows >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) : 1;
+    if ((int64_t)tasks > nrows) tasks = (uint32_t)nrows;
+    size_t words_total = 0;
+    for (uint32_t k = 0; k < n_keys; k++)
+        if (candidate[k]) words_total += (size_t)((out->ranges[k] - out->nullable[k] + 63) / 64);
+    uint64_t* bits = ray_calloc_raw(words_total * tasks * sizeof(uint64_t));
+    uint64_t** task_bits = ray_calloc_raw((size_t)tasks * n_keys * sizeof(uint64_t*));
+    if (!bits || !task_bits) { ray_free_raw(bits); ray_free_raw(task_bits); return false; }
+    {
+        uint64_t* cursor = bits;
+        for (uint32_t t = 0; t < tasks; t++)
+            for (uint32_t k = 0; k < n_keys; k++) {
+                if (!candidate[k]) continue;
+                task_bits[(size_t)t * n_keys + k] = cursor;
+                cursor += (out->ranges[k] - out->nullable[k] + 63) / 64;
+            }
+    }
+    agg_compact_ctx_t c = { .key_cols = key_cols, .dp = out, .candidate = candidate,
+        .n_keys = n_keys, .rows = nrows, .tasks = tasks, .task_bits = task_bits };
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_compact_mark_fn, &c, tasks);
+    else agg_compact_mark_fn(&c, 0, 0, 1);
+    /* Reduce task bitmaps into task 0, count used codes, re-check the product. */
+    int64_t used[16];
+    int64_t total = 1;
+    bool fits = true;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        int64_t rng = out->ranges[k];
+        if (candidate[k]) {
+            size_t words = (size_t)((rng - out->nullable[k] + 63) / 64);
+            uint64_t* acc = task_bits[k];
+            for (uint32_t t = 1; t < tasks; t++) {
+                const uint64_t* tb = task_bits[(size_t)t * n_keys + k];
+                for (size_t w = 0; w < words; w++) acc[w] |= tb[w];
+            }
+            int64_t n = 0;
+            for (size_t w = 0; w < words; w++) n += __builtin_popcountll(acc[w]);
+            used[k] = n;
+            rng = n + out->nullable[k];
+            if (rng <= 0) rng = 1;
+        } else used[k] = rng;
+        if (fits && total > dense_limit / rng) fits = false;
+        if (fits) total *= rng;
+    }
+    if (!fits) { ray_free_raw(bits); ray_free_raw(task_bits); return false; }
+    /* Build remap/inverse for every candidate key that actually shrank. */
+    for (uint32_t k = 0; k < n_keys; k++) {
+        if (!candidate[k]) continue;
+        int64_t raw = out->ranges[k] - out->nullable[k];
+        if (used[k] >= raw) continue;    /* every code used: raw range is already dense */
+        int32_t* remap = ray_alloc_raw((size_t)raw * sizeof(int32_t));
+        int64_t* inverse = ray_alloc_raw((size_t)(used[k] > 0 ? used[k] : 1) * sizeof(int64_t));
+        if (!remap || !inverse) {
+            ray_free_raw(remap); ray_free_raw(inverse);
+            ray_free_raw(bits); ray_free_raw(task_bits);
+            agg_dense_plan_free(out);
+            return false;
+        }
+        const uint64_t* acc = task_bits[k];
+        int64_t next = 0;
+        for (int64_t code = 0; code < raw; code++) {
+            bool on = (acc[code >> 6] >> (code & 63)) & 1;
+            remap[code] = on ? (int32_t)next : -1;
+            if (on) inverse[next++] = out->mins[k] + code;
+        }
+        out->remap[k] = remap;
+        out->inverse[k] = inverse;
+        out->compacted = true;
+        out->ranges[k] = used[k] + out->nullable[k];
+        if (out->ranges[k] <= 0) out->ranges[k] = 1;
+    }
+    ray_free_raw(bits); ray_free_raw(task_bits);
+    return true;
+}
+
 bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
                     const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out) {
     (void)vts; (void)n_aggs;   /* agg kind no longer gates dense eligibility */
     out->ok = false;
     out->n_keys = n_keys;
+    out->compacted = false;
+    memset(out->remap, 0, sizeof(out->remap));
+    memset(out->inverse, 0, sizeof(out->inverse));
     /* Dense direct-index routing self-limits to <=16 keys: dense_plan_t's
      * mins/ranges/strides are fixed [16] (the direct-index packing bound).
      * n_keys is uint32_t (untruncated ext->n_keys), so a wider shape is
@@ -364,12 +576,33 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
     int64_t total = 1;
     int64_t dense_limit = nrows < (int64_t)UINT32_MAX
         ? nrows : (int64_t)UINT32_MAX;
-    for (uint32_t k = 0; k < n_keys; k++) {
+    bool overflow = false;
+    for (uint32_t k = 0; k < n_keys && !overflow; k++) {
         int64_t rng = out->ranges[k];
         if (rng <= 0) return false;
-        if (total > dense_limit / rng) return false;
+        if (total > dense_limit / rng) overflow = true;
+        else total *= rng;
+    }
+    if (overflow || (n_keys >= 2 && total > AGG_COMPACT_TRY_SLOTS)) {
+        /* Raw ranges multiply out too far — or far enough past a
+         * cache-resident slab that sparse keys would waste it (a W16 SYM key
+         * reports its whole 65,536-code width): compact the keys to the codes
+         * they use and retry the packing over the compacted ranges.  Keys
+         * whose every code is used keep their raw range. */
+        bool compacted_ok = n_keys >= 2 &&
+            agg_dense_plan_compact(key_cols, n_keys, nrows, dense_limit, out);
+        if (overflow && !compacted_ok) return false;
+        total = 1;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            int64_t rng = out->ranges[k];
+            if (rng <= 0 || total > dense_limit / rng) { agg_dense_plan_free(out); return false; }
+            total *= rng;
+        }
+    }
+    total = 1;
+    for (uint32_t k = 0; k < n_keys; k++) {
         out->strides[k] = total;
-        total *= rng;
+        total *= out->ranges[k];
     }
 
     out->total_slots = total;
@@ -859,11 +1092,57 @@ static int agg_sel_accum_chunk(const agg_valdesc_t* vd, agg_sel_scratch_t* sc,
 /* n_keys is uint32_t (untruncated ext->n_keys): the >16 shapes are rejected by
  * the same dense direct-index bound as agg_dense_plan and take v2's unbounded
  * hash/radix path; the fixed [16] mins/ranges/strides are only read at <=16. */
+typedef struct {
+    ray_t** key_cols;
+    const void** key_data;
+    const bool* nullable;
+    const int64_t* nulls;
+    uint32_t n_keys;
+    ray_t* sel;
+    const int64_t* sel_prefix;
+    int64_t n_sel;
+    uint32_t tasks;
+    int64_t* task_bounds;   /* [tasks][2][n_keys]: min row, max row per key */
+} agg_sel_bounds_ctx_t;
+
+/* One task's min/max over its slice of selected-row space. */
+static void agg_sel_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_sel_bounds_ctx_t* c = raw;
+    int64_t rows[AGG_SEL_CHUNK];
+    for (int64_t task = start; task < end; task++) {
+        int64_t* mins = c->task_bounds + (2 * (size_t)task) * c->n_keys;
+        int64_t* maxs = mins + c->n_keys;
+        for (uint32_t k = 0; k < c->n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
+        int64_t begin = c->n_sel / c->tasks * task;
+        int64_t limit = task + 1 == c->tasks ? c->n_sel : c->n_sel / c->tasks * (task + 1);
+        agg_sel_cursor_t cur;
+        agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, begin, limit);
+        int64_t cn;
+        while ((cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+            for (uint32_t k = 0; k < c->n_keys; k++) {
+                ray_t* kc = c->key_cols[k]; const void* d = c->key_data[k];
+                int64_t mn = mins[k], mx = maxs[k];
+                for (int64_t i = 0; i < cn; i++) {
+                    int64_t v = agg_read_key_i64(kc, d, rows[i]);
+                    if (c->nullable[k] && v == c->nulls[k]) continue;
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                mins[k] = mn; maxs[k] = mx;
+            }
+        }
+    }
+}
+
 static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
                                ray_t* sel, const int64_t* sel_prefix,
                                dense_plan_t* out) {
     out->ok = false;
     out->n_keys = n_keys;
+    out->compacted = false;
+    memset(out->remap, 0, sizeof(out->remap));
+    memset(out->inverse, 0, sizeof(out->inverse));
     if (n_keys < 1 || n_keys > 16) return false;
     if (n_sel <= 0) return false;
 
@@ -880,7 +1159,9 @@ static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
         out->mins[k] = INT64_MAX; out->ranges[k] = 0;   /* sentinels; filled below */
     }
 
-    /* One pass over the selected rows updating every key's min/max together. */
+    /* One pass over the selected rows updating every key's min/max together.
+     * The pass is split across the pool: a serial walk of a 10M-row selection
+     * cost ~13 ms on every filtered group-by regardless of core count. */
     ray_t* pre_hdr;
     void* pre = scratch_alloc(&pre_hdr, 3u * (size_t)n_keys * 8);   /* mins,maxs,key_data */
     if (!pre) return false;
@@ -890,23 +1171,26 @@ static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
     for (uint32_t k = 0; k < n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
     for (uint32_t k = 0; k < n_keys; k++) key_data[k] = ray_data(key_cols[k]);
 
-    int64_t rows[AGG_SEL_CHUNK];
-    agg_sel_cursor_t cur;
-    agg_sel_cursor_init(&cur, sel, sel_prefix, 0, n_sel);
-    int64_t cn;
-    while ((cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t tasks = pool && n_sel >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) * 4 : 1;
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    if ((int64_t)tasks > n_sel) tasks = (uint32_t)n_sel;
+    agg_sel_bounds_ctx_t bc = { .key_cols = key_cols, .key_data = key_data,
+        .nullable = out->nullable, .nulls = out->nulls, .n_keys = n_keys,
+        .sel = sel, .sel_prefix = sel_prefix, .n_sel = n_sel, .tasks = tasks };
+    ray_t* tb_hdr;
+    bc.task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * n_keys * sizeof(int64_t));
+    if (!bc.task_bounds) { scratch_free(pre_hdr); return false; }
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &bc, tasks);
+    else agg_sel_bounds_fn(&bc, 0, 0, 1);
+    for (uint32_t t = 0; t < tasks; t++)
         for (uint32_t k = 0; k < n_keys; k++) {
-            ray_t* kc = key_cols[k]; const void* d = key_data[k];
-            int64_t mn = mins[k], mx = maxs[k];
-            for (int64_t i = 0; i < cn; i++) {
-                int64_t v = agg_read_key_i64(kc, d, rows[i]);
-                if (out->nullable[k] && v == out->nulls[k]) continue;
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
-            }
-            mins[k] = mn; maxs[k] = mx;
+            int64_t mn = bc.task_bounds[(2 * (size_t)t) * n_keys + k];
+            int64_t mx = bc.task_bounds[(2 * (size_t)t + 1) * n_keys + k];
+            if (mn < mins[k]) mins[k] = mn;
+            if (mx > maxs[k]) maxs[k] = mx;
         }
-    }
+    scratch_free(tb_hdr);
     for (uint32_t k = 0; k < n_keys; k++) {
         if (!agg_dense_range(out, k, mins[k], maxs[k])) { scratch_free(pre_hdr); return false; }
     }
@@ -1127,11 +1411,18 @@ static void agg_dense_emit_fn(void* raw, uint32_t wid, int64_t start, int64_t en
     if (any) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
 }
 
-/* Compute the dense slot for row r via mixed-radix packing. */
-static inline int64_t agg_dense_slot(const agg_dense_ctx_t* c, int64_t r) {
+/* Compute the dense slot for row r via mixed-radix packing.  `compacted`
+ * is loop-invariant (dp->compacted); callers pass it from a local so the
+ * raw form stays branch-free. */
+static inline int64_t agg_dense_slot(const agg_dense_ctx_t* c, int64_t r, bool compacted) {
     int64_t slot = 0;
-    for (uint32_t k = 0; k < c->n_keys; k++)
-        slot += agg_dense_component(c->dp, k, agg_read_key_i64(c->key_cols[k], c->key_data[k], r)) * c->dp->strides[k];
+    if (compacted) {
+        for (uint32_t k = 0; k < c->n_keys; k++)
+            slot += agg_dense_component(c->dp, k, agg_read_key_i64(c->key_cols[k], c->key_data[k], r)) * c->dp->strides[k];
+    } else {
+        for (uint32_t k = 0; k < c->n_keys; k++)
+            slot += agg_dense_component_raw(c->dp, k, agg_read_key_i64(c->key_cols[k], c->key_data[k], r)) * c->dp->strides[k];
+    }
     return slot;
 }
 
@@ -1163,10 +1454,11 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
         agg_sel_cursor_t cur;
         agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
         int64_t cn;
+        const bool compacted = c->dp->compacted;
         while ((cn = agg_sel_cursor_next(&cur, rows)) > 0) {
             for (int64_t i = 0; i < cn; i++) {
                 int64_t r = rows[i];
-                int64_t slot = agg_dense_slot(c, r);   /* provably in [0,total_slots) */
+                int64_t slot = agg_dense_slot(c, r, compacted);   /* provably in [0,total_slots) */
                 gid[i] = (uint32_t)slot;
                 if (agg_dense_first(loc, slot)) {
                     for (uint32_t a = 0; a < c->n_aggs; a++)
@@ -1242,7 +1534,7 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
                 break;
             default:
                 for (int64_t r = start; r < end; r++) {
-                    int64_t slot = agg_dense_slot(c, r);
+                    int64_t slot = agg_dense_slot(c, r, false);   /* single key: never compacted */
                     cg[r - start] = (uint32_t)slot;
                     if (r < fr[slot]) fr[slot] = r;
                 }
@@ -1251,15 +1543,19 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
         #undef DENSE_SLOT1_LAZY
         #undef DENSE_SLOT1_EAGER
     } else {
-        for (int64_t r = start; r < end; r++) {
-            int64_t slot = agg_dense_slot(c, r);   /* provably in [0,total_slots) */
-            cgid[r - start] = (uint32_t)slot;
-            if (agg_dense_first(loc, slot)) {
-                for (uint32_t a = 0; a < c->n_aggs; a++)
-                    c->vts[a]->init(loc->states + (size_t)slot * c->block + c->off[a]);
-                loc->first_row[slot] = r;
+        #define DENSE_SLOT_MULTI(COMPACTED)                                    \
+            for (int64_t r = start; r < end; r++) {                          \
+                int64_t slot = agg_dense_slot(c, r, COMPACTED);   /* provably in [0,total_slots) */ \
+                cgid[r - start] = (uint32_t)slot;                            \
+                if (agg_dense_first(loc, slot)) {                            \
+                    for (uint32_t a = 0; a < c->n_aggs; a++)                 \
+                        c->vts[a]->init(loc->states + (size_t)slot * c->block + c->off[a]); \
+                    loc->first_row[slot] = r;                                \
+                }                                                            \
             }
-        }
+        if (c->dp->compacted) { DENSE_SLOT_MULTI(true); }
+        else { DENSE_SLOT_MULTI(false); }
+        #undef DENSE_SLOT_MULTI
     }
 
     for (uint32_t a = 0; a < c->n_aggs; a++) {
@@ -1328,9 +1624,7 @@ static void agg_dense_key_emit(void* raw, uint32_t wid, int64_t start, int64_t e
         int64_t slot = c->bits ? ((index % c->part_slots) << c->bits) + index / c->part_slots : index;
         uint32_t k = c->component;
         int64_t component = (slot / c->plan->strides[k]) % c->plan->ranges[k];
-        int64_t value = c->plan->nullable[k] && component == c->plan->ranges[k] - 1
-            ? c->plan->nulls[k] : c->plan->mins[k] + component;
-        write_col_i64(data, r, value, c->out->type, c->out->attrs);
+        write_col_i64(data, r, agg_dense_code(c->plan, k, component), c->out->type, c->out->attrs);
     }
 }
 
@@ -1474,20 +1768,24 @@ static void agg_dense_partition_count(void* raw, uint32_t wid, int64_t start, in
         int64_t limit = task + 1 == c->sources ? c->rows : c->rows / c->sources * (task + 1);
         uint64_t* count = c->counts + task * c->parts;
         if (c->plan->n_keys > 1) {
-            for (int64_t r = begin; r < limit; r++) {
-                int64_t source = c->selected_rows ? c->selected_rows[r] : r;
-                int64_t slot = 0;
-                for (uint32_t k = 0; k < c->plan->n_keys; k++)
-                    slot += agg_dense_component(c->plan, k, agg_read_key_i64(c->keys[k], c->key_data[k], source)) * c->plan->strides[k];
-                c->gids[r] = (uint32_t)slot;
-                count[slot & (c->parts - 1)]++;
-            }
+            #define PART_SLOT_MULTI(COMPONENT)                                 \
+                for (int64_t r = begin; r < limit; r++) {                    \
+                    int64_t source = c->selected_rows ? c->selected_rows[r] : r; \
+                    int64_t slot = 0;                                        \
+                    for (uint32_t k = 0; k < c->plan->n_keys; k++)           \
+                        slot += COMPONENT(c->plan, k, agg_read_key_i64(c->keys[k], c->key_data[k], source)) * c->plan->strides[k]; \
+                    c->gids[r] = (uint32_t)slot;                             \
+                    count[slot & (c->parts - 1)]++;                          \
+                }
+            if (c->plan->compacted) { PART_SLOT_MULTI(agg_dense_component); }
+            else { PART_SLOT_MULTI(agg_dense_component_raw); }
+            #undef PART_SLOT_MULTI
             continue;
         }
         #define PART_COUNT(T) do { \
             const T* p = data; \
             for (int64_t r = begin; r < limit; r++) { \
-                uint32_t slot = (uint32_t)agg_dense_component(c->plan, 0, (int64_t)p[c->selected_rows ? c->selected_rows[r] : r]); \
+                uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[c->selected_rows ? c->selected_rows[r] : r]); \
                 c->gids[r] = slot; \
                 count[slot & (c->parts - 1)]++; \
             } \
@@ -1839,7 +2137,7 @@ static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_
         #define SHARED_GIDS(T) do { \
             const T* p = data; \
             for (int64_t i = 0; i < n; i++) { \
-                uint32_t slot = (uint32_t)agg_dense_component(c->plan, 0, (int64_t)p[begin + i]); \
+                uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[begin + i]); \
                 gids[i] = slot; \
                 uint64_t bit = UINT64_C(1) << (slot % 64); \
                 _Atomic(uint64_t)* word = &c->occupied[slot / 64]; \
@@ -4133,8 +4431,16 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * not O(nrows)) — both correct (grouped keys ARE the selected rows) and cheap
      * for high-selectivity filters, and it can pull a sparse-but-low-card selected
      * key set into the dense path that the full-table range would have rejected. */
+    /* Every run consumes the probe's cached plan (agg_dense_plan_cached
+     * invalidates it), so a plan can never outlive the query it was probed
+     * for and match a recycled column pointer later.  Selected runs plan
+     * over the selected rows instead and discard the cached full-table plan. */
     dense_plan_t dp;
+    dense_plan_t probed;
+    bool probed_hit = agg_dense_plan_cached(key_cols, ext->n_keys, nrows, &probed);
+    if (probed_hit && sel) { agg_dense_plan_free(&probed); probed_hit = false; }
     bool dense = sel ? agg_dense_plan_sel(key_cols, ext->n_keys, n_sel, sel, sel_prefix, &dp)
+                     : probed_hit ? (dp = probed, true)
                      : agg_dense_plan(key_cols, ext->n_keys, vts, ext->n_aggs, nrows, &dp);
     route_stats.dense_plan_available = dense;
 
@@ -4144,7 +4450,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     #define AGG_RUN_COMPACT_FALLBACK()                                          \
         do {                                                                    \
             agg_vo_free(&vo);   /* not needed by the compact recursion */       \
-            scratch_free(kc_hdr);  /* key_cols dead: the recursion rebuilds them */ \
+            agg_dense_plan_free(&dp); scratch_free(kc_hdr);  /* key_cols dead: the recursion rebuilds them */ \
             ray_t* idxb = ray_rowsel_to_indices(sel);                           \
             if (!idxb) return ray_error("oom", NULL);                           \
             ray_t* compact = agg_build_compact(g, op, tbl, (int64_t*)ray_data(idxb), n_sel); \
@@ -4183,6 +4489,24 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (dense_budget > (double)SIZE_MAX) dense_budget = (double)SIZE_MAX;
         if (watermark > 0 && dense_budget > (double)watermark / 4) dense_budget = (double)watermark / 4;
         double slab_bytes = dp.ok ? (double)dp.total_slots * (block + sizeof(int64_t) + 1) : 0;
+        /* Replicated slabs must stay resident in the last-level cache.  Each
+         * task updates random slots of its own slab, so once the slabs
+         * together outgrow the LLC every update misses to DRAM and adding
+         * tasks makes the query slower: 100k groups over 10M rows measured
+         * 6 ms with 8 slabs (26 MB inside a 33 MB L3) and 21 ms with 28
+         * slabs (92 MB) on the same 28-thread pool.  Bound the number of
+         * replicated task slabs by three quarters of the LLC (the rest
+         * streams the input); an unreported cache assumes 32 MB.  The
+         * memory budgets below remain data-derived; this bound only limits
+         * replication, and larger domains use partition ownership, which
+         * scales with cores because every partition slab is L1-sized. */
+        uint64_t llc_bytes = ray_cache_llc_bytes();
+        double cache_budget = (llc_bytes ? (double)llc_bytes : 32.0 * 1048576.0) * 0.75;
+        uint32_t cache_tasks = dense_workers;
+        if (slab_bytes > 0 && slab_bytes * dense_workers > cache_budget) {
+            double fit = cache_budget / slab_bytes;
+            cache_tasks = fit >= 1 ? (uint32_t)fit : 0;
+        }
         /* A bounded group emit selects first-seen groups. Dense slot order
          * cannot satisfy that contract; retain radix's bounded selection. */
         bool shared_plan = dp.ok && group_limit <= 0 && !sel && ext->n_keys == 1 && dp.total_slots >= 4096;
@@ -4193,7 +4517,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
                 nrows, pool, &dp, dense_workers, AGG_DENSE_SHARED, sel, sel_prefix, n_sel);
-            agg_vo_free(&vo); scratch_free(kc_hdr);
+            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
             return result;
         }
         /* Partition ownership amortizes scatter through concurrent reducers.
@@ -4220,7 +4544,8 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * pass. Prefer partition ownership only once replicated state
              * traffic exceeds its row traffic; large pools/ranges still use
              * bounded shared storage. */
-            double local_traffic = dense_workers * slab_bytes;
+            uint32_t local_tasks = cache_tasks < dense_workers ? cache_tasks : dense_workers;
+            double local_traffic = local_tasks * slab_bytes;
             double partition_traffic = (double)eff_n * (sizeof(uint32_t) + record_size);
             /* Compare the complete partition allocation against radix's
              * payload plus its worst-case per-row group state. A payload-only
@@ -4230,18 +4555,22 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (partition_budget > (double)SIZE_MAX) partition_budget = (double)SIZE_MAX;
             if (watermark > 0 && partition_budget > (double)watermark / 4)
                 partition_budget = (double)watermark / 4;
-            if (bytes <= partition_budget && local_traffic > partition_traffic) {
+            /* Fewer than three cache-resident slabs cannot use the pool;
+             * partition ownership keeps every core busy instead. */
+            bool cache_starved = local_tasks < 3 && local_tasks < dense_workers;
+            if (bytes <= partition_budget && (local_traffic > partition_traffic || cache_starved)) {
                 route_stats.dense_worker_budget = false;
                 agg_route_record(AGG_ROUTE_V2_DENSE);
                 ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
                     nrows, pool, &dp, dense_workers, AGG_DENSE_PARTITIONED, sel, sel_prefix, n_sel);
-                agg_vo_free(&vo); scratch_free(kc_hdr);
+                agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
                 return result;
             }
         }
         if (dp.ok && slab_bytes > 0) {
             double fit = (dense_budget - (double)eff_n * sizeof(uint32_t)) / slab_bytes - 1;
             if (fit < dense_workers) dense_workers = fit >= 2 ? (uint32_t)fit : 0;
+            if (cache_tasks < dense_workers) dense_workers = cache_tasks >= 2 ? cache_tasks : 0;
         }
         bool dense_par_ok = dp.ok && group_limit <= 0 && dense_workers > 0;
         /* Allocation size alone misses repeated wide-range worker updates.
@@ -4296,6 +4625,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             uint32_t extra_tasks = dense_workers * 4;
             if (extra_tasks > RAY_POOL_INIT_TASKS) extra_tasks = RAY_POOL_INIT_TASKS;
             if (dense_workers > 1 && extra_tasks * slab_bytes <= scatter_budget / 8 &&
+                    extra_tasks * slab_bytes <= cache_budget &&
                     (extra_tasks + 1.0) * slab_bytes + (double)eff_n * sizeof(uint32_t) <= dense_budget)
                 dense_workers = extra_tasks;
             route_stats.dense_tasks = dense_workers;
@@ -4305,7 +4635,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp, dense_workers, AGG_DENSE_TASK_LOCAL,
                                                     sel, sel_prefix, n_sel);
-            agg_vo_free(&vo); scratch_free(kc_hdr); return r;
+            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         if (keys_intsym) {
             agg_route_record(AGG_ROUTE_V2_RADIX);
@@ -4313,13 +4643,13 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_t* r = exec_group_v2_parallel_radix(g, op, tbl, nrows,
                     key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
                     group_limit);
-            agg_vo_free(&vo); scratch_free(kc_hdr); return r;
+            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */
         if (sel) AGG_RUN_COMPACT_FALLBACK();
         agg_route_record(AGG_ROUTE_V2_INDEXED);
         { ray_t* r = agg_indexed_run(g, op, tbl, key_cols, key_syms, nrows);
-          agg_vo_free(&vo); scratch_free(kc_hdr); return r; }
+          agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r; }
     }
 
     /* Serial path does not consult the vts/off tables (per-agg vt is re-resolved
@@ -4334,18 +4664,18 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     agg_groups_t groups = {0};
     int grp_rc = dense ? agg_group_keys_dense(key_cols, nrows, &dp, &groups)
                        : agg_group_keys(key_cols, ext->n_keys, nrows, &groups);
-    if (grp_rc != 0) { scratch_free(kc_hdr); return ray_error("oom", NULL); }
+    if (grp_rc != 0) { agg_dense_plan_free(&dp); scratch_free(kc_hdr); return ray_error("oom", NULL); }
 
     ray_t* result = ray_table_new(ext->n_keys + ext->n_aggs);
-    if (!result || RAY_IS_ERR(result)) { scratch_free(kc_hdr); agg_groups_free(&groups); return ray_error("oom", NULL); }
+    if (!result || RAY_IS_ERR(result)) { agg_dense_plan_free(&dp); scratch_free(kc_hdr); agg_groups_free(&groups); return ray_error("oom", NULL); }
 
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_t* kc = ray_group_gather(key_cols[k], groups.first_row, groups.ngroups);
-        if (!kc || RAY_IS_ERR(kc)) { scratch_free(kc_hdr); agg_groups_free(&groups); ray_release(result); return kc ? kc : ray_error("oom", NULL); }
+        if (!kc || RAY_IS_ERR(kc)) { agg_dense_plan_free(&dp); scratch_free(kc_hdr); agg_groups_free(&groups); ray_release(result); return kc ? kc : ray_error("oom", NULL); }
         result = ray_table_add_col(result, key_syms[k], kc);
         ray_release(kc);
     }
-    scratch_free(kc_hdr);   /* key_cols/key_syms done — agg loop below reads neither */
+    agg_dense_plan_free(&dp); scratch_free(kc_hdr);   /* key_cols/key_syms done — agg loop below reads neither */
 
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
@@ -4598,10 +4928,16 @@ static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
     }
     for (int64_t s = 0; s < dp->total_slots; s++) slot2gid[s] = -1;
     int64_t ngroups = 0;
+    const bool compacted = dp->compacted;
     for (int64_t r = 0; r < nrows; r++) {
         int64_t slot = 0;
-        for (uint32_t k = 0; k < dp->n_keys; k++)
-            slot += agg_dense_component(dp, k, agg_read_key_i64(key_cols[k], data[k], r)) * dp->strides[k];
+        if (compacted) {
+            for (uint32_t k = 0; k < dp->n_keys; k++)
+                slot += agg_dense_component(dp, k, agg_read_key_i64(key_cols[k], data[k], r)) * dp->strides[k];
+        } else {
+            for (uint32_t k = 0; k < dp->n_keys; k++)
+                slot += agg_dense_component_raw(dp, k, agg_read_key_i64(key_cols[k], data[k], r)) * dp->strides[k];
+        }
         /* slot is provably in [0,total_slots): each key in [min_k,max_k] so
          * (key-min) in [0,range_k), and the composite is a mixed-radix index
          * < total_slots (dp->ok from the same prescan). */

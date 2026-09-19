@@ -6,6 +6,7 @@
 #include "ops/agg_engine.h"
 #include "ops/agg_registry.h"
 #include "core/pool.h"
+#include "core/platform.h"
 #include "mem/heap.h"
 #include "ops/fused_pred.h"
 #include "ops/cdfuse.h"
@@ -1729,6 +1730,75 @@ static test_result_t test_cancelled_group(void) {
     PASS();
 }
 
+/* Replicated task-local slabs are bounded by the last-level cache: with a
+ * 20-worker pool and a 100k-slot slab the raw replication (20 slabs) leaves
+ * most caches, and the run must use at most floor(0.75 * LLC / slab) task
+ * slabs (never fewer than the pool when everything fits).  The result is
+ * identical either way. */
+static test_result_t test_dense_cache_bound(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(20), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set cb_i (til 4000000)) "
+        "(set cb_t (table [k v] (list (as 'I32 (% (* cb_i 7919) 100000)) (% cb_i 13))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:cb_t by:k s:(sum v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
+    TEST_ASSERT_TRUE(stats.dense_tasks >= 2 && stats.dense_tasks <= 20);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 100000);
+    uint64_t llc = ray_cache_llc_bytes();
+    if (llc > 0) {
+        size_t block = agg_resolve(OP_SUM, RAY_I64)->state_size;
+        double slots = (double)stats.dense_local_slots / stats.dense_tasks;
+        double slab = slots * (block + sizeof(int64_t) + 1);
+        double budget = (double)llc * 0.75;
+        uint32_t cap = slab * 20 > budget ? (uint32_t)(budget / slab) : 20;
+        if (cap < 2) cap = 2;
+        TEST_ASSERT_EQ_I(stats.dense_tasks, cap);
+    }
+    /* The bounded run computes the same sums as the serial engine. */
+    ray_t* check = ray_eval_str(
+        "(all (== (at (xasc (select {from:cb_t by:k s:(sum v)}) 'k) 's) "
+        "(at (xasc (select {from:(select {from:cb_t k:k v:v}) by:k s:(sum v)}) 'k) 's)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    ray_release(ray_eval_str("(set cb_t 0) (set cb_i 0)"));
+    PASS();
+}
+
+/* Composite symbol keys whose codes interleave in the shared domain get a
+ * compacted dense plan: two 40-value keys over a 4,000-code domain pack into
+ * 1,600 slots instead of falling to radix. */
+static test_result_t test_dense_composite_compaction(void) {
+    ray_t* setup = ray_eval_str(
+        "(set cc_i (til 400000)) "
+        "(set cc_syms (as 'SYM (map (fn [x] (format \"s%\" (+ 10000 x))) (til 4000)))) "
+        "(set cc_a (at cc_syms (* (% cc_i 40) 100))) "
+        "(set cc_b (at cc_syms (+ 1 (* (% (div cc_i 40) 40) 100)))) "
+        "(set cc_t (table [a b v] (list cc_a cc_b (% cc_i 11))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:cc_t by:[a b] s:(sum v) n:(count v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_TRUE(stats.dense_plan_available);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 1600);
+    ray_t* check = ray_eval_str(
+        "(== (sum (at (select {from:cc_t by:[a b] s:(sum v)}) 's)) (sum (at cc_t 'v)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    ray_release(ray_eval_str("(set cc_t 0) (set cc_a 0) (set cc_b 0) (set cc_syms 0) (set cc_i 0)"));
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
@@ -1743,6 +1813,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
     { "agg_contract/dense_task_local", test_dense_task_local, contract_setup, contract_teardown },
+    { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },
+    { "agg_contract/dense_composite_compaction", test_dense_composite_compaction, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },

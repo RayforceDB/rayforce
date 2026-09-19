@@ -40,6 +40,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
 #endif
@@ -294,6 +296,125 @@ uint32_t ray_physical_core_count(void) {
 #endif
 }
 
+/* Total last-level cache capacity across every LLC instance, in bytes.
+ * Replicated per-task state (dense group slabs) stops scaling the moment
+ * its total footprint leaves the LLC: a 100k-group sum measured 6 ms with
+ * 8 slabs (26 MB, inside a 33 MB L3) and 21 ms with 28 slabs (92 MB) on the
+ * same 28-thread pool.  Callers bound such replication by this figure.
+ *
+ * Linux reads sysfs: the highest-level unified cache of cpu0 gives the
+ * per-instance size, and its shared_cpu_list gives the instance width, so
+ * multi-die parts (one LLC per die) report the sum of every die's LLC.
+ * Falls back to sysconf's L3 (then L2) size; 0 when nothing is known. */
+#if defined(RAY_OS_LINUX)
+static uint32_t cache_cpu_list_count(const char* list) {
+    /* "0-27" / "0-3,8-11" / "5" → number of CPUs named. */
+    uint32_t n = 0;
+    const char* p = list;
+    while (*p) {
+        char* end;
+        long lo = strtol(p, &end, 10);
+        if (end == p) break;
+        long hi = lo;
+        p = end;
+        if (*p == '-') { hi = strtol(p + 1, &end, 10); if (end == p + 1) break; p = end; }
+        if (hi >= lo) n += (uint32_t)(hi - lo + 1);
+        while (*p == ',' || *p == ' ' || *p == '\n') p++;
+    }
+    return n;
+}
+static uint64_t cache_sysfs_llc_bytes(void) {
+    uint64_t best = 0; long best_level = 0;
+    uint32_t logical = ray_thread_count();
+    for (int index = 0; index < 8; index++) {
+        char path[128], buf[256];
+        FILE* f;
+        long level = 0;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/level", index);
+        f = fopen(path, "r");
+        if (!f) break;
+        if (fscanf(f, "%ld", &level) != 1) level = 0;
+        fclose(f);
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/type", index);
+        f = fopen(path, "r");
+        if (!f) continue;
+        buf[0] = 0;
+        if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+        fclose(f);
+        if (strncmp(buf, "Unified", 7) != 0 || level <= best_level) continue;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/size", index);
+        f = fopen(path, "r");
+        if (!f) continue;
+        buf[0] = 0;
+        if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+        fclose(f);
+        char* unit = NULL;
+        unsigned long long size = strtoull(buf, &unit, 10);
+        if (unit && (*unit == 'K' || *unit == 'k')) size <<= 10;
+        else if (unit && (*unit == 'M' || *unit == 'm')) size <<= 20;
+        if (size == 0) continue;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/shared_cpu_list", index);
+        f = fopen(path, "r");
+        uint32_t width = 0;
+        if (f) {
+            buf[0] = 0;
+            if (fgets(buf, sizeof(buf), f)) width = cache_cpu_list_count(buf);
+            fclose(f);
+        }
+        uint32_t instances = width > 0 && logical > width ? (logical + width - 1) / width : 1;
+        best = (uint64_t)size * instances;
+        best_level = level;
+    }
+    return best;
+}
+#endif
+
+uint64_t ray_cache_llc_bytes(void) {
+    static uint64_t cached = UINT64_MAX;
+    if (cached != UINT64_MAX) return cached;
+    uint64_t bytes = 0;
+#if defined(RAY_OS_MACOS)
+    uint64_t v = 0; size_t len = sizeof(v);
+    if (sysctlbyname("hw.l3cachesize", &v, &len, NULL, 0) == 0 && v > 0) bytes = v;
+    else {
+        /* No L3 (recent ARM desktop parts): the per-cluster L2 is the last level.
+         * Sum every cluster's L2 from the perflevel topology. */
+        for (int level = 0; level < 2 && bytes < UINT64_MAX / 2; level++) {
+            char name[64];
+            uint64_t l2 = 0; int cpus = 0, per_l2 = 0;
+            size_t l2_len = sizeof(l2), cpus_len = sizeof(cpus), per_len = sizeof(per_l2);
+            snprintf(name, sizeof(name), "hw.perflevel%d.l2cachesize", level);
+            if (sysctlbyname(name, &l2, &l2_len, NULL, 0) != 0 || l2 == 0) break;
+            snprintf(name, sizeof(name), "hw.perflevel%d.physicalcpu", level);
+            if (sysctlbyname(name, &cpus, &cpus_len, NULL, 0) != 0 || cpus <= 0) cpus = 1;
+            snprintf(name, sizeof(name), "hw.perflevel%d.cpusperl2", level);
+            if (sysctlbyname(name, &per_l2, &per_len, NULL, 0) != 0 || per_l2 <= 0) per_l2 = cpus;
+            bytes += l2 * (uint64_t)((cpus + per_l2 - 1) / per_l2);
+        }
+        if (bytes == 0) {
+            len = sizeof(v);
+            if (sysctlbyname("hw.l2cachesize", &v, &len, NULL, 0) == 0) bytes = v;
+        }
+    }
+#elif defined(RAY_OS_LINUX)
+    bytes = cache_sysfs_llc_bytes();
+    if (bytes == 0) {
+#if defined(_SC_LEVEL3_CACHE_SIZE)
+        long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+        if (l3 > 0) bytes = (uint64_t)l3;
+#endif
+    }
+    if (bytes == 0) {
+#if defined(_SC_LEVEL2_CACHE_SIZE)
+        long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
+        if (l2 > 0) bytes = (uint64_t)l2 * ray_physical_core_count();
+#endif
+    }
+#endif
+    cached = bytes;
+    return bytes;
+}
+
 /* --------------------------------------------------------------------------
  * Semaphore
  * -------------------------------------------------------------------------- */
@@ -486,6 +607,36 @@ uint32_t ray_physical_core_count(void) {
     return ray_thread_count();
 }
 
+/* Sum of every level-3 cache instance reported by the processor topology
+ * (each SYSTEM_LOGICAL_PROCESSOR_INFORMATION cache record is one instance).
+ * 0 when the query fails. */
+uint64_t ray_cache_llc_bytes(void) {
+    static uint64_t cached = UINT64_MAX;
+    if (cached != UINT64_MAX) return cached;
+    uint64_t bytes = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformation(NULL, &len);
+    if (len > 0) {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION* info = ray_sys_alloc(len);
+        if (info) {
+            if (GetLogicalProcessorInformation(info, &len)) {
+                DWORD n = len / sizeof(*info);
+                BYTE best_level = 0;
+                for (DWORD i = 0; i < n; i++) {
+                    if (info[i].Relationship != RelationCache) continue;
+                    BYTE level = info[i].Cache.Level;
+                    if (info[i].Cache.Type != CacheUnified && info[i].Cache.Type != CacheData) continue;
+                    if (level > best_level) { best_level = level; bytes = 0; }
+                    if (level == best_level) bytes += info[i].Cache.Size;
+                }
+            }
+            ray_sys_free(info);
+        }
+    }
+    cached = bytes;
+    return bytes;
+}
+
 /* --------------------------------------------------------------------------
  * Semaphore
  * -------------------------------------------------------------------------- */
@@ -617,6 +768,7 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
+uint64_t ray_cache_llc_bytes(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the
  * counter must already be positive when wait fires). */

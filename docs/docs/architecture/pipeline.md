@@ -211,6 +211,18 @@ The join pipeline:
 2. **Build** — Build per-partition hash tables (each fits in L2). For inner joins, the executor selects the build side at runtime using actual materialized row counts: the smaller input becomes the build side, keeping hash tables as compact as possible. LEFT, FULL, and ANTI joins always build on the right to preserve left-row semantics. The small-input (chained) path also always builds on the right. During the per-partition open-addressing build, the executor tracks per-key duplicate counts; when a single key exceeds the duplication threshold (`RADIX_DUP_RUN_MAX = 512`), it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. No join (INNER, LEFT, or FULL) can degrade to quadratic build cost on a skewed key.
 3. **Probe** — Probe partitions in parallel across worker threads. Inner-join output order is partition- and thread-dependent; it is not guaranteed to be stable.
 
+### Group-By Aggregation
+
+Grouped aggregates run on the parallel aggregation engine, which picks a strategy from the key columns and the aggregates:
+
+- **Dense direct index** — integer, temporal, and symbol keys whose value ranges pack into a bounded slot space (a group id is the mixed-radix offset of the key tuple, no hashing). Composite keys whose raw ranges multiply out too far are first *compacted*: one parallel pass records the codes each key actually uses, and the plan maps each key through a code-to-component table. This matters for symbol keys, which share one domain and therefore interleave their codes with every other symbol column's.
+- **Task-local slabs** — each task accumulates into its own dense slab, merged once at the end. The number of replicated slabs is bounded by the last-level cache: every task updates random slots of its slab, so once the slabs together outgrow the cache each update misses to memory and more tasks make the query slower. The engine reads the cache size at startup (`ray_cache_llc_bytes`) and keeps replicated slabs within three quarters of it; when fewer than three slabs fit, it switches to partition ownership.
+- **Partition ownership** — rows are scattered by slot into partitions that each own a cache-sized slab; every group is reduced exactly once, with no merge. Used for large dense domains and for shared extrema that concurrent updates handle directly.
+- **Radix** — unbounded integer or symbol keys (many-million-group inputs) are hash-partitioned and reduced per partition.
+- **Shared directory** — float, string, GUID, and list keys use a shared parallel key directory.
+
+Arithmetic over aggregates (`(- (max v1) (min v2))`, `(pow (pearson_corr a b) 2)`) is decomposed at compile time: the aggregates run as hidden slots inside the same group pass, and the outer expression is evaluated once over the grouped result. This applies to any number of keys and to binary aggregates. Ordered top-N clauses (`desc: c take: 10`) run the full parallel grouping and trim the result to the top-N superset before the final sort; only unbounded key domains still use the older ordered-emit path.
+
 ### Per-Thread Heaps
 
 Each worker thread has its own heap (`heap_id` in the pool header). Vectors allocated during parallel execution are tagged with their owning heap via the pool they reside in. Cross-heap frees are deferred to a lock-free LIFO and reclaimed when the owning heap flushes. See [Memory Model](memory.md) for details.

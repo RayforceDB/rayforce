@@ -75,6 +75,10 @@ void agg_route_reason(agg_v2_reason_t reason);
  * Conservative: any uncertainty → false → caller uses the existing engine. */
 bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
+/* True when v2 would group this node through a bounded dense plan (see the
+ * definition for the strategy-prediction contract). */
+bool agg_v2_dense_plan_available(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+
 /* Precondition: agg_v2_can_handle(g, op, tbl) returned true.
  * `group_limit` is the HEAD(GROUP) row-limit HINT (0 = no limit): when
  * positive, an engine strategy may emit only the first `group_limit` groups in
@@ -149,7 +153,17 @@ typedef struct {
     int64_t  ranges[16];    /* [16]: dense direct-index routing self-limits to <=16 keys (agg_dense_plan) */
     int64_t  strides[16];   /* [16]: dense self-limit <=16; composite packing: slot = sum_k (key_k - min_k)*strides[k] */
     int64_t  total_slots;   /* product of ranges */
+    /* Compacted keys (composite plans whose raw range product overflowed):
+     * remap[k][code - mins[k]] is the dense component of a code that occurs
+     * in the input, inverse[k][component] the original code.  NULL for keys
+     * that use their raw range.  Owned by the plan: agg_dense_plan_free. */
+    int32_t* remap[16];
+    int64_t* inverse[16];
+    bool     compacted;     /* any remap set: hot loops select the remap form once */
 } dense_plan_t;
+
+/* Release a plan's compaction tables (no-op for raw-range plans). */
+void agg_dense_plan_free(dense_plan_t* dp);
 
 /* Decide if dense grouping applies to (key_cols, aggs).  Eligible iff:
  *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} with a dedicated slot for nullable keys

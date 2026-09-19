@@ -1,0 +1,64 @@
+;; Arithmetic over aggregates on multi-key group-bys.
+;;
+;; Before: any non-aggregate output (even one composed only of aggregates)
+;; with a two-or-more-key by: clause forced the eval-level per-group path
+;; (~850 ms for 10M rows, no parallelism).  Only single-key queries used the
+;; hidden-slot decomposition (aggregates computed by the DAG engine, the
+;; outer expression evaluated once over the grouped result).
+;; Now a decomposable compound never forces eval-level grouping, and binary
+;; aggregates (pearson_corr, cov, wsum, ...) and quantile with a literal
+;; probability are extracted into hidden slots too.
+;;
+;; Every case compares the compound result against the same arithmetic
+;; applied to separately grouped plain aggregates.
+
+(set n 20000)
+(set i (til n))
+(set t (table [a b c x y] (list (% i 7) (% i 11) (% i 3) (as 'F64 (% (* i 13) 101)) (as 'F64 (% (* i 29) 97)))))
+
+;; two keys, arithmetic over two unary aggregates
+(set r1 (xasc (select {from: t d: (- (max x) (min y)) by: {a: a b: b}}) ['a 'b]))
+(set p1 (xasc (select {from: t mx: (max x) mn: (min y) by: {a: a b: b}}) ['a 'b]))
+(count r1) -- 77
+(all (== (at r1 'd) (- (at p1 'mx) (at p1 'mn)))) -- true
+(all (== (at r1 'a) (at p1 'a))) -- true
+(all (== (at r1 'b) (at p1 'b))) -- true
+
+;; three keys, scalar function over an aggregate, plus a plain aggregate beside it
+(set r2 (xasc (select {from: t n: (count x) s: (pow (sum x) 2) by: {a: a b: b c: c}}) ['a 'b 'c]))
+(set p2 (xasc (select {from: t n: (count x) s: (sum x) by: {a: a b: b c: c}}) ['a 'b 'c]))
+(count r2) -- 231
+(all (== (at r2 'n) (at p2 'n))) -- true
+(all (< (abs (- (at r2 's) (pow (at p2 's) 2))) 1e-6)) -- true
+
+;; binary aggregate inside arithmetic: single key and two keys
+(set r3 (xasc (select {from: t r2: (pow (pearson_corr x y) 2) by: {a: a}}) ['a]))
+(set p3 (xasc (select {from: t p: (pearson_corr x y) by: {a: a}}) ['a]))
+(all (< (abs (- (at r3 'r2) (pow (at p3 'p) 2))) 1e-12)) -- true
+(set r4 (xasc (select {from: t r2: (pow (pearson_corr x y) 2) by: {a: a b: b}}) ['a 'b]))
+(set p4 (xasc (select {from: t p: (pearson_corr x y) by: {a: a b: b}}) ['a 'b]))
+(count r4) -- 77
+(all (< (abs (- (at r4 'r2) (pow (at p4 'p) 2))) 1e-12)) -- true
+
+;; covariance and weighted sum inside arithmetic
+(set r5 (xasc (select {from: t v: (* 2 (cov x y)) w: (+ 1 (wsum x y)) by: {a: a b: b}}) ['a 'b]))
+(set p5 (xasc (select {from: t v: (cov x y) w: (wsum x y) by: {a: a b: b}}) ['a 'b]))
+(all (< (abs (- (at r5 'v) (* 2 (at p5 'v)))) 1e-9)) -- true
+(all (< (abs (- (at r5 'w) (+ 1 (at p5 'w)))) 1e-9)) -- true
+
+;; quantile with a literal probability inside arithmetic
+(set r6 (xasc (select {from: t q: (+ 1 (quantile x 0.25)) by: {a: a b: b}}) ['a 'b]))
+(set p6 (xasc (select {from: t q: (quantile x 0.25) by: {a: a b: b}}) ['a 'b]))
+(all (== (at r6 'q) (+ 1 (at p6 'q)))) -- true
+
+;; a genuinely row-dependent projection still takes the per-group path and
+;; keeps its list-per-group shape, unchanged by the routing fix
+(set r7 (select {from: t d: (+ x 1) by: {a: a}}))
+(count r7) -- 7
+(type (at (at r7 'd) 0)) -- 'F64
+
+;; a where: filter composes with the compound on a multi-key by
+(set r8 (xasc (select {from: t d: (- (max x) (min y)) by: {a: a b: b} where: (> x 50)}) ['a 'b]))
+(set p8 (xasc (select {from: t mx: (max x) mn: (min y) by: {a: a b: b} where: (> x 50)}) ['a 'b]))
+(count r8) -- 77
+(all (== (at r8 'd) (- (at p8 'mx) (at p8 'mn)))) -- true
