@@ -804,6 +804,8 @@ extern bool     ray_join_force_dup_fallback;
 extern bool     ray_join_no_dup_fallback;
 extern uint64_t ray_join_dup_fallbacks;
 extern uint64_t ray_join_null_fallbacks;
+extern bool     ray_join_force_null_checks;
+extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
