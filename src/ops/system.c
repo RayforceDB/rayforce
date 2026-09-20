@@ -53,10 +53,12 @@ void* ray_runtime_get_poll(void);
 void  ray_runtime_set_sys_args(void* dict);
 void* ray_runtime_get_sys_args(void);
 #include <time.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+
 #if !defined(RAY_OS_WINDOWS)
 #include <unistd.h>
 #include <sys/wait.h>   /* WIFEXITED/WEXITSTATUS — .sys.exec exit codes */
@@ -66,6 +68,25 @@ void* ray_runtime_get_sys_args(void);
 #define RAY_POPEN(c, m)  _popen((c), (m))
 #define RAY_PCLOSE(f)    _pclose(f)
 #endif
+
+static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                             int64_t* out) {
+    if (!s || !*s) return 0;
+    const unsigned char* p = (const unsigned char*)s;
+    if (!nonnegative && (*p == '+' || *p == '-')) p++;
+    if (!isdigit(*p)) return 0;
+    for (const unsigned char* q = p; *q; q++)
+        if (!isdigit(*q)) return 0;
+
+    char* end = NULL;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' ||
+        (nonnegative && v < 0) || (core_count && v > INT_MAX))
+        return 0;
+    *out = (int64_t)v;
+    return 1;
+}
 
 /* ══════════════════════════════════════════
  * Serialization / storage
@@ -1553,13 +1574,33 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
             interactive = true;
         else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc)
             port = (int64_t)atoll(argv[++i]);
-        else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) && i + 1 < argc) {
-            long long v = atoll(argv[++i]); if (v < 0) v = 0; cores = (int64_t)v;
+        else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) {
+            if (i + 1 >= argc)
+                return ray_error("rank", ".sys.args: %s requires an argument", argv[i]);
+            int64_t v;
+            if (!parse_sys_int_arg(argv[++i], true, true, &v))
+                return ray_error("domain", ".sys.args: invalid %s value \"%s\"",
+                                  argv[i - 1], argv[i]);
+            cores = v;
         }
-        else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) && i + 1 < argc)
-            timeit = (atoll(argv[++i]) != 0);
-        else if ((strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) && i + 1 < argc)
-            querylog = (atoll(argv[++i]) != 0);
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) {
+            if (i + 1 >= argc)
+                return ray_error("rank", ".sys.args: %s requires an argument", argv[i]);
+            int64_t v;
+            if (!parse_sys_int_arg(argv[++i], false, false, &v))
+                return ray_error("domain", ".sys.args: invalid %s value \"%s\"",
+                                  argv[i - 1], argv[i]);
+            timeit = (v != 0);
+        }
+        else if (strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) {
+            if (i + 1 >= argc)
+                return ray_error("rank", ".sys.args: %s requires an argument", argv[i]);
+            int64_t v;
+            if (!parse_sys_int_arg(argv[++i], false, false, &v))
+                return ray_error("domain", ".sys.args: invalid %s value \"%s\"",
+                                  argv[i - 1], argv[i]);
+            querylog = (v != 0);
+        }
         else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc)
             file = argv[++i];
         else if (strcmp(argv[i], "-u") == 0 && i + 1 < argc) i++;   /* skip secret */

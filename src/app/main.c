@@ -214,7 +214,14 @@ int main(int argc, char** argv) {
     }
 
     /* Expose the full command line to Rayfall via (.sys.args). */
-    ray_runtime_set_sys_args(ray_build_sys_args(argc, argv));
+    ray_t* sys_args = ray_build_sys_args(argc, argv);
+    if (!sys_args || RAY_IS_ERR(sys_args)) {
+        fprintf(stderr, "error: invalid command-line arguments\n");
+        if (sys_args && RAY_IS_ERR(sys_args)) ray_error_free(sys_args);
+        ray_runtime_destroy(rt);
+        return 2;
+    }
+    ray_runtime_set_sys_args(sys_args);
 
     /* Initialise the worker pool before anything else that might use it
      * (file load, REPL eval, builtins).  If -c wasn't given, leave the

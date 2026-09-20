@@ -38,6 +38,8 @@
 void* ray_runtime_get_poll(void);
 
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,9 +81,20 @@ static int64_t arg_as_i64(ray_t* arg, int* err) {
         int sign = 1;
         if (i < len && (p[i] == '+' || p[i] == '-')) { if (p[i] == '-') sign = -1; i++; }
         if (i >= len || p[i] < '0' || p[i] > '9') { *err = 1; return 0; }
-        int64_t v = 0;
-        while (i < len && p[i] >= '0' && p[i] <= '9') { v = v * 10 + (p[i] - '0'); i++; }
-        return sign * v;
+        uint64_t v = 0;
+        uint64_t limit = sign < 0 ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
+        while (i < len && p[i] >= '0' && p[i] <= '9') {
+            uint64_t digit = (uint64_t)(p[i] - '0');
+            if (v > (limit - digit) / 10u) { *err = 1; return 0; }
+            v = v * 10u + digit;
+            i++;
+        }
+        if (i != len) { *err = 1; return 0; }
+        if (sign < 0) {
+            if (v == (uint64_t)INT64_MAX + 1u) return INT64_MIN;
+            return -(int64_t)v;
+        }
+        return (int64_t)v;
     }
     *err = 1;
     return 0;
