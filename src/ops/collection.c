@@ -1374,8 +1374,21 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
              * the WHERE kernel uses null-matches-nothing semantics — the
              * two must not be conflated.  NULL result = unsupported shape
              * (STR etc.): fall through to the hashset probe below. */
-            if (!ray_vec_may_have_nulls(val) &&
-                !ray_vec_may_have_nulls(vec)) {
+            /* Admission check, so it uses the EXACT ray_vec_has_nulls rather
+             * than the conservative row-kernel gate.  ray_vec_may_have_nulls
+             * returns true unconditionally for SYM and STR — their null is a
+             * payload value, not an attribute bit — so gating this on it made
+             * the branch unreachable for every text column, including the SYM
+             * verdict-LUT the kernel carries specifically for them.  Every
+             * `in` over a symbol column fell through to the generic per-row
+             * hashset probe: ~4.8 ms against ~40 us for the equivalent `==`
+             * on a 351k-row column (#593).  vec.h says as much where it
+             * defines the two — "paths requiring null-free data use has_nulls
+             * below".  The exact check costs one pass and is not on a per-row
+             * path; a null-bearing operand still falls through, because the
+             * kernel's null-matches-nothing semantics differ from this path's
+             * null-equals-null. */
+            if (!ray_vec_has_nulls(val) && !ray_vec_has_nulls(vec)) {
                 ray_t* fast = ray_in_vec_exec(val, vec, false);
                 if (fast) return fast;
             }
