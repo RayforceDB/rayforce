@@ -154,9 +154,29 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
             long v = strtol(env, NULL, 10);
             n_workers = (v > 0) ? (uint32_t)v : 0;
         } else {
-            /* Default to every online logical CPU. Individual operations may
-             * bound their task count to their workload or memory budget. */
-            uint32_t ncpu = ray_thread_count();
+            /* Default to every PHYSICAL core, not every logical CPU (#606).
+             * Two SMT siblings split one core's issue bandwidth, so the second
+             * thread re-runs the same instruction stream at roughly half the
+             * IPC rather than adding throughput.  Measured on the full
+             * ClickBench suite (10M rows, 43 queries x 3, three repetitions):
+             *
+             *   host                    cycles    instructions   hot times
+             *   Ryzen AI 7 350 (8/16)   -31.6%    -0.4%          -1.6%
+             *   i7-10700K      (8/16)   -34.4%    -0.3%          -0.8%
+             *
+             * Instructions flat is the point: the saving is stall cycles, not
+             * work removed, and the wall-time column is inside the run-to-run
+             * spread on both hosts.  A 4-physical/8-logical i7-6700 is the
+             * unfavourable case — it surrenders half its threads and pays
+             * ~9% on hot times for the same ~50% cycle saving — so low
+             * core-count SMT hosts that are latency-bound should set -c
+             * explicitly.
+             *
+             * ray_physical_core_count falls back to the logical count when the
+             * topology cannot be read, so exotic systems keep the old
+             * behaviour.  Individual operations may still bound their task
+             * count further to their workload or memory budget. */
+            uint32_t ncpu = ray_physical_core_count();
             n_workers = (ncpu > 1) ? ncpu - 1 : 0;
         }
     }

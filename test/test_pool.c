@@ -1379,7 +1379,15 @@ static test_result_t test_epoll_hup_no_errfn(void) {
  * -------------------------------------------------------------------------- */
 
 #if defined(__linux__) || defined(__APPLE__)
-static test_result_t test_auto_all_logical_cpus(void) {
+/* The auto-sized pool (RAYFORCE_CORES unset, ray_pool_create(.., 0)) recruits
+ * one participant per PHYSICAL core, not per logical CPU (#606).  Two SMT
+ * siblings share one core's issue bandwidth, so the second thread re-runs the
+ * same instruction stream at roughly half the IPC instead of adding
+ * throughput: measured across three microarchitectures, about a third of the
+ * cycles come back for no measurable wall-time cost.
+ * ray_physical_core_count falls back to the logical count when the topology
+ * cannot be read, so this assertion holds either way. */
+static test_result_t test_auto_physical_cores(void) {
     const char* current = getenv("RAYFORCE_CORES");
     char* saved = current ? strdup(current) : NULL;
     TEST_ASSERT_TRUE(!current || saved);
@@ -1390,14 +1398,14 @@ static test_result_t test_auto_all_logical_cpus(void) {
     if (rc == RAY_OK) ray_pool_free(&local);
     if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
     TEST_ASSERT_EQ_I(rc, RAY_OK);
-    TEST_ASSERT_EQ_I(total, ray_thread_count());
+    TEST_ASSERT_EQ_I(total, ray_physical_core_count());
     PASS();
 }
 #endif
 
 const test_entry_t pool_entries[] = {
 #if defined(__linux__) || defined(__APPLE__)
-    { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
+    { "pool/auto_physical_cores",   test_auto_physical_cores,   NULL, NULL },
 #endif
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
