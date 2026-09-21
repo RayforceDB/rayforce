@@ -462,6 +462,57 @@ static test_result_t test_dispatch_small(void) {
  * spin-wait for completion).
  * -------------------------------------------------------------------------- */
 
+/* --------------------------------------------------------------------------
+ * Test: a dispatch NARROWER than the pool still runs every task, and leaves
+ * the pool fully usable for a later wide one (#599).
+ *
+ * ray_pool_dispatch/_n now signal only min(n_tasks-1, n_workers) workers
+ * instead of the whole pool, so the under-signalled workers stay asleep.  The
+ * risks that buys are (a) a task nobody claims and (b) signal accounting that
+ * drifts across dispatches, starving a later wide window.  Alternating narrow
+ * and wide dispatches over one pool catches both: every window is verified for
+ * exact task and element counts.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dispatch_narrower_than_pool(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 4), RAY_OK);
+
+    /* n_tasks below the worker count: 1 wakes nobody, 2 wakes one, etc. */
+    for (uint32_t n = 1; n <= 4; n++) {
+        pool_count_ctx_t ctx = {0};
+        ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, n);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), n);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), n);
+    }
+
+    /* The element form, sized to a single task. */
+    {
+        pool_count_ctx_t ctx = {0};
+        ray_pool_dispatch(&pool, pool_count_fn, &ctx, 1);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 1);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), 1);
+    }
+
+    /* Alternating narrow/wide over the same pool: a wide window must still be
+     * fully served after windows that signalled fewer workers than exist. */
+    for (int rep = 0; rep < 25; rep++) {
+        pool_count_ctx_t narrow = {0};
+        ray_pool_dispatch_n(&pool, pool_count_fn, &narrow, 1);
+        TEST_ASSERT_EQ_I(atomic_load(&narrow.calls), 1);
+
+        pool_count_ctx_t wide = {0};
+        ray_pool_dispatch_n(&pool, pool_count_fn, &wide, 32);
+        TEST_ASSERT_EQ_I(atomic_load(&wide.calls), 32);
+        TEST_ASSERT_EQ_I(atomic_load(&wide.elem_sum), 32);
+    }
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_dispatch_n_small(void) {
     ray_heap_init();
 
@@ -1357,6 +1408,7 @@ const test_entry_t pool_entries[] = {
     { "pool/dispatch_zero_elems",   test_dispatch_zero_elems,   NULL, NULL },
     { "pool/dispatch_small",        test_dispatch_small,        NULL, NULL },
     { "pool/dispatch_n_small",      test_dispatch_n_small,      NULL, NULL },
+    { "pool/dispatch_narrow",       test_dispatch_narrower_than_pool, NULL, NULL },
     { "pool/dispatch_n_ring_grow",  test_dispatch_n_ring_growth, NULL, NULL },
     { "pool/dispatch_ring_grow",    test_dispatch_ring_growth,  NULL, NULL },
     { "pool/dispatch_n_cancelled",  test_dispatch_n_cancelled,  NULL, NULL },
