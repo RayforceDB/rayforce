@@ -2610,20 +2610,26 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_SORT: {
+            /* exec_node hands back an OWNED reference for every node,
+             * the constant table node included (it retains its literal).
+             * A `!= g->table` guard here treated a child that evaluates
+             * to the query table as borrowed and leaked one table per
+             * call — the ordinary shape, since a select's root is a
+             * constant node over that very table. */
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             ray_t* tbl = (input->type == RAY_TABLE) ? input : g->table;
             /* Compact lazy selection before sort (needs dense data) */
             if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
                 ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
-                if (input != g->table) ray_release(input);
+                ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
                 input = compacted;
                 tbl = compacted;
             }
             ray_t* result = exec_sort(g, op, tbl, 0);
-            if (input != g->table) ray_release(input);
+            ray_release(input);
             return result;
         }
 
@@ -2835,20 +2841,21 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_WINDOW: {
+            /* Owned input, released unconditionally: see OP_SORT. */
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             ray_t* wdf = (input->type == RAY_TABLE) ? input : g->table;
             /* Compact lazy selection before window (needs dense data) */
             if (g->selection && wdf && !RAY_IS_ERR(wdf) && wdf->type == RAY_TABLE) {
                 ray_t* compacted = sel_compact(g, wdf, g->selection, NULL, 0);
-                if (input != g->table) ray_release(input);
+                ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
                 input = compacted;
                 wdf = compacted;
             }
             ray_t* result = exec_window(g, op, wdf);
-            if (input != g->table) ray_release(input);
+            ray_release(input);
             return result;
         }
 
@@ -2865,14 +2872,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 /* Compact lazy selection before sort */
                 if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
                     ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
-                    if (sort_input != g->table) ray_release(sort_input);
+                    ray_release(sort_input);          /* owned: see OP_SORT */
                     ray_release(g->selection);
                     g->selection = NULL;
                     sort_input = compacted;
                     tbl = compacted;
                 }
                 ray_t* result = exec_sort(g, child_op, tbl, n);
-                if (sort_input != g->table) ray_release(sort_input);
+                ray_release(sort_input);
                 /* Top-level statement GC catches intermediates. */
                 return result;
             }
@@ -2935,7 +2942,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                            ? filter_input : g->table;
                 if (g->selection && ftbl && ftbl->type == RAY_TABLE) {
                     ray_t* compacted = sel_compact(g, ftbl, g->selection, NULL, 0);
-                    if (filter_input != g->table) ray_release(filter_input);
+                    ray_release(filter_input);        /* owned: see OP_SORT */
                     ray_release(g->selection);
                     g->selection = NULL;
                     filter_input = compacted;
@@ -2949,15 +2956,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 g->table = saved_table;
 
                 if (!pred || RAY_IS_ERR(pred)) {
-                    if (filter_input != saved_table)
-                        ray_release(filter_input);
+                    ray_release(filter_input);
                     return pred;
                 }
 
                 ray_t* result = exec_filter_head(ftbl, pred, n);
                 ray_release(pred);
-                if (filter_input != saved_table)
-                    ray_release(filter_input);
+                ray_release(filter_input);
                 /* Top-level statement GC catches intermediates. */
                 return result;
             } else {

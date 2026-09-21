@@ -1,0 +1,42 @@
+;; query_input_release.rfl — a query over a table built for that one call
+;; must give the table back.
+;;
+;; Every node the executor evaluates hands back an OWNED reference, the
+;; constant table node included.  The window, sort and limit cases once
+;; skipped the release when the input equalled the graph's table, taking it
+;; for a borrowed reference — and a query's root is a constant node over that
+;; very table, so one input table leaked per call.  Invisible while a global
+;; kept the table alive; a whole table per call on a fresh one.
+;;
+;; Same method as the other probes in this directory: warm up, then two equal
+;; windows of calls; the first may settle a slab or an arena, the second must
+;; not move.  `bytes-allocated` is exact, so the bound is a few KB; the table
+;; below is ~19 KB, so a single leaked call already fails it.
+(set syms (as 'SYMBOL (map (fn [i] (format "inst%" i)) (til 700))))
+(set mk (fn [p] (table [instrument rid v] (list (take syms 786) (as 'I64 (+ p (til 786))) (as 'I64 (til 786))))))
+(set heapb (fn [] (at (.sys.mem) 'bytes-allocated)))
+(set probe (fn [f warm reps] (do (map f (til warm)) (map f (til reps)) (set h0 (heapb)) (map f (til reps)) (< (- (heapb) h0) 4096))))
+
+;; partitioned + ordered, trailing frame (the shape of the report)
+(probe (fn [p] (count (window {from: (mk p) part: [instrument] order: [rid] frame: 2 funcs: {prev: (first v) n: (count v)}}))) 5 60) -- true
+;; no part/order: the whole table is one partition
+(probe (fn [p] (count (window {from: (mk p) funcs: {n: (count v)}}))) 5 60) -- true
+;; running frame
+(probe (fn [p] (count (window {from: (mk p) part: [instrument] order: [rid] frame: 'running funcs: {s: (sum v)}}))) 5 60) -- true
+;; a where: on the window input (from: is materialised before the window)
+(probe (fn [p] (count (window {from: (select {from: (mk p) where: (> rid 3)}) part: [instrument] order: [rid] funcs: {n: (count v)}}))) 5 60) -- true
+;; the same guard sat under sort and limit: a sorted or limited select over
+;; a table built for the call leaked it the same way
+(probe (fn [p] (count (select {from: (mk p) asc: rid}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) desc: v take: 5}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) where: (> rid 3) take: 5}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) where: (> rid 3) asc: v}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) by: instrument s: (sum v) asc: s}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) by: instrument s: (sum v) desc: s take: 3}))) 5 60) -- true
+;; the same table reused across calls must not be released twice: the
+;; result is still right after many calls
+(set T (mk 1))
+(map (fn [p] (window {from: T part: [instrument] order: [rid] funcs: {n: (count v)}})) (til 50))
+(count T) -- 786
+(count (window {from: T part: [instrument] order: [rid] funcs: {n: (count v)}})) -- 786
+(== (sum (at (window {from: T part: [instrument] order: [rid] frame: 'running funcs: {s: (sum v)}}) 's)) (sum (at (window {from: T part: [instrument] order: [rid] frame: 'running funcs: {s: (sum v)}}) 's))) -- true
