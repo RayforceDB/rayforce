@@ -340,8 +340,16 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
     if (prog) ray_progress_dispatch_begin((uint64_t)total_elems);
 
-    /* Wake worker threads */
-    for (uint32_t i = 0; i < pool->n_workers; i++) {
+    /* Wake worker threads — only as many as have something to claim.  Main
+     * participates as worker 0, so at most n_tasks-1 helpers can be useful;
+     * signalling the whole pool woke threads that raced to an already-drained
+     * window and went straight back to sleep, which is pure overhead on any
+     * dispatch narrower than the machine (#599).  Signalling FEWER is safe:
+     * completion is governed by the `pending` spin-wait below, never by the
+     * signal count, so an unsignalled worker simply stays asleep. */
+    uint32_t wake = n_tasks > 0 ? n_tasks - 1 : 0;
+    if (wake > pool->n_workers) wake = pool->n_workers;
+    for (uint32_t i = 0; i < wake; i++) {
         ray_sem_signal(&pool->work_ready);
     }
 
@@ -413,8 +421,16 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
     if (prog) ray_progress_dispatch_begin((uint64_t)n_tasks);
 
-    /* Wake worker threads */
-    for (uint32_t i = 0; i < pool->n_workers; i++) {
+    /* Wake worker threads — only as many as have something to claim.  Main
+     * participates as worker 0, so at most n_tasks-1 helpers can be useful;
+     * signalling the whole pool woke threads that raced to an already-drained
+     * window and went straight back to sleep, which is pure overhead on any
+     * dispatch narrower than the machine (#599).  Signalling FEWER is safe:
+     * completion is governed by the `pending` spin-wait below, never by the
+     * signal count, so an unsignalled worker simply stays asleep. */
+    uint32_t wake = n_tasks > 0 ? n_tasks - 1 : 0;
+    if (wake > pool->n_workers) wake = pool->n_workers;
+    for (uint32_t i = 0; i < wake; i++) {
         ray_sem_signal(&pool->work_ready);
     }
 
