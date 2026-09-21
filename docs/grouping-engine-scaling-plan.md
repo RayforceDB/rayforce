@@ -78,7 +78,8 @@ settings and three rounds; immutable binary hashes accompany the process records
    validate a dominant null key and a dominant non-null key.
 4. Keep strategy choice capability-driven. Add shared updates only where safe
    and measured; contended atomic sums are not an automatic replacement.
-5. Check default uses all logical CPUs; distinguish pool size from bounded tasks.
+5. Check default uses all physical cores (SMT siblings excluded, #606);
+   distinguish pool size from bounded tasks.
 
 Exit: correct unary, binary and mixed streaming results; repeated synthetic
 8/default scaling measurements for min, sum, count and statistics. Investigate

@@ -1399,6 +1399,13 @@ static test_result_t test_auto_physical_cores(void) {
     if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
     TEST_ASSERT_EQ_I(rc, RAY_OK);
     TEST_ASSERT_EQ_I(total, ray_physical_core_count());
+    /* The assertion above shares a function with the code under test, so on a
+     * non-SMT runner (physical == logical, the common CI case) it cannot tell
+     * the new policy from the old one.  Pinning the relationship as well means
+     * that on an SMT host — where the two differ — a revert to the logical
+     * count fails here rather than passing quietly. */
+    TEST_ASSERT_TRUE(ray_physical_core_count() <= ray_thread_count());
+    TEST_ASSERT_TRUE(total <= ray_thread_count());
     PASS();
 }
 #endif

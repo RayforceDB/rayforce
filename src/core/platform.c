@@ -757,7 +757,8 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 
 /* Threading — return errors / 1.  pool.c with n_workers==0 (the result of
- * thread_count==1 ⇒ ncpu-1 == 0) never invokes thread_create. */
+ * the auto-size path reading 1 core ⇒ ncpu-1 == 0) never invokes
+ * thread_create. */
 ray_err_t ray_thread_create(ray_thread_t* t, ray_thread_fn fn, void* arg) {
     (void)t; (void)fn; (void)arg;
     return RAY_ERR_NYI;
@@ -769,6 +770,12 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
+
+/* WASM: single-threaded, so physical and logical are both 1.  Defined here
+ * because pool.c's auto-size path calls it on every platform (#606) and
+ * platform.h declares it unconditionally. */
+uint32_t ray_physical_core_count(void) { return ray_thread_count(); }
+
 uint64_t ray_cache_llc_bytes(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the
