@@ -2025,7 +2025,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!input || RAY_IS_ERR(input)) return input;
             /* Compact lazy selection before reducing — filters may have
              * set g->selection without materializing a compacted table. */
-            bool own_input = (input != g->table);
+            /* Owned, like every exec_node result (see OP_SORT); no child
+             * evaluates to a borrowed query table. */
+            bool own_input = true;
             if (g->selection && input->type == RAY_TABLE) {
                 ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
                 if (own_input) ray_release(input);
