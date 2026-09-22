@@ -136,7 +136,7 @@ Each release publishes, in addition to the source:
 
 ## Platform support
 
-Linux and macOS binaries are published today. Windows is not build-ready yet
-(IOCP backend is a stub, `main.c`/`heap.c` have unguarded POSIX calls, and the
-Makefile has no Windows toolchain path); once ported, add a `windows-latest` row
-to the `build` matrix in `.github/workflows/release.yml`.
+Linux and macOS binaries are published today. Windows builds and passes the
+test suite from source with the MSYS2 CLANG64 toolchain (see CONTRIBUTING.md),
+but no Windows binary is published yet; to ship one, add a `windows-latest`
+row (MSYS2 CLANG64) to the `build` matrix in `.github/workflows/release.yml`.
