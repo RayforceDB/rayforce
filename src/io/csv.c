@@ -65,8 +65,8 @@
 #include <fcntl.h>
 #ifndef RAY_OS_WINDOWS
 #include <unistd.h>
-#endif
 #include <sys/mman.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -104,7 +104,9 @@ static inline uint64_t csv_prog_at(size_t file_size, unsigned pct) {
  * mmap flags
  * -------------------------------------------------------------------------- */
 
+#ifndef RAY_OS_WINDOWS
 #define MMAP_FLAGS MAP_PRIVATE
+#endif
 
 /* --------------------------------------------------------------------------
  * Scratch memory helpers (same pattern as exec.c).
