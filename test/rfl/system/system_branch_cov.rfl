@@ -180,8 +180,8 @@
 ;; ray_gc_fn  (line 539)
 ;; ══════════════════════════════════════════════════════════════════════
 (.sys.gc) -- 0
-(.sys.gc 0) -- 0
-(.sys.gc "x") -- 0
+(.sys.gc 0) !- domain
+(.sys.gc "x") !- domain
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_sys_bc_*")
