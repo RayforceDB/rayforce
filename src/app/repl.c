@@ -51,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #if defined(RAY_OS_WINDOWS)
 #include <io.h>
@@ -59,7 +60,6 @@
 #define STDIN_FD 0
 #else
 #include <unistd.h>
-#include <errno.h>
 #include <sys/ioctl.h>
 #define STDIN_FD STDIN_FILENO
 #endif
@@ -385,7 +385,11 @@ static void print_banner(void) {
     char cpu[256];
     get_cpu_name(cpu, sizeof(cpu));
     int64_t mem_mb = get_total_mem_mb();
+#if defined(RAY_OS_WINDOWS)
+    int ncores = (int)ray_thread_count();
+#else
     int ncores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 
     /* "Using" count reflects the actual worker-pool size, not ncores.
      * ray_pool_get() is a lazy initializer — callers might not have
