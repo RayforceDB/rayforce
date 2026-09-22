@@ -29,7 +29,7 @@
 (.sys.cmd "rm -f /tmp/rfl_syscmd_cov*") -- 0
 
 ;; ────────────── arg_as_i64: typed-int branches via .sys.timeit ──────────────
-;; Each non-string integer kind takes a distinct early-return path in
+;; Each supported non-string integer kind takes a distinct early-return path in
 ;; arg_as_i64 (lines 68-72).  Driving them through .sys.timeit is the
 ;; cleanest way to round-trip the result back into Rayfall.
 (.sys.timeit 1)        -- 1
@@ -40,8 +40,8 @@
 (.sys.timeit 0h)       -- 0
 (.sys.timeit 0x01)     -- 1
 (.sys.timeit 0x00)     -- 0
-(.sys.timeit true)     -- 1
-(.sys.timeit false)    -- 0
+(.sys.timeit true)     !- type
+(.sys.timeit false)    !- type
 
 ;; ────────────── arg_as_i64: STR branches via .sys.cmd dispatch ──────────────
 ;; The string parser handles leading whitespace, optional sign, then
@@ -69,7 +69,7 @@
 ;; arg_as_i64 has an explicit early-return for every integer kind plus
 ;; STR; any other typed arg falls past all branches into the final
 ;; `*err = 1; return 0;` pair (lines 85-86).  Reaching it requires a
-;; non-null, non-int, non-bool, non-string atom routed past the
+;; non-null, non-integer, non-string atom routed past the
 ;; string-dispatch guard — i.e. a direct `.sys.timeit` / `.sys.listen`
 ;; call with a typed atom (float, sym, etc.).  The handler then sees
 ;; err=1 and returns "type".  These probes are the only path from rfl
@@ -94,7 +94,7 @@
 (.sys.timeit 0)      -- 0
 
 ;; ────────────── arg_as_i64: type-fallthrough (lines 85-86) ──────────
-;; Float atoms hit the final *err=1; return 0 branch — neither I64/I32/I16/U8/BOOL
+;; Float atoms hit the final *err=1; return 0 branch — neither I64/I32/I16/U8
 ;; nor STR.  Only reachable via direct `.sys.timeit`/`.sys.listen` calls
 ;; (the .sys.cmd dispatcher always wraps args as strings).
 (.sys.timeit 1.5)    !- type
