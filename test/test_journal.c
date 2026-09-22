@@ -40,7 +40,44 @@
 #include <sys/stat.h>
 #include <stdint.h>
 #include <fcntl.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+/* Minimal glob(3) for the archive checks below: wildcards only in the
+ * last path component, which is all "<base>.*.log" needs. */
+typedef struct { size_t gl_pathc; char** gl_pathv; } glob_t;
+static void globfree(glob_t* g) {
+    for (size_t i = 0; i < g->gl_pathc; i++) free(g->gl_pathv[i]);
+    free(g->gl_pathv);
+    g->gl_pathc = 0; g->gl_pathv = NULL;
+}
+static int glob(const char* pat, int flags, void* errfunc, glob_t* g) {
+    (void)flags; (void)errfunc;
+    g->gl_pathc = 0; g->gl_pathv = NULL;
+    const char* slash = strrchr(pat, '/');
+    const char* bs    = strrchr(pat, '\\');
+    if (bs && (!slash || bs > slash)) slash = bs;
+    size_t dlen = slash ? (size_t)(slash - pat) + 1 : 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 3;            /* GLOB_NOMATCH */
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        size_t nlen = strlen(fd.cFileName);
+        char*  path = (char*)malloc(dlen + nlen + 1);
+        char** v    = (char**)realloc(g->gl_pathv, (g->gl_pathc + 1) * sizeof(char*));
+        if (!path || !v) { free(path); if (v) g->gl_pathv = v; FindClose(h); globfree(g); return 1; }
+        memcpy(path, pat, dlen);
+        memcpy(path + dlen, fd.cFileName, nlen + 1);
+        g->gl_pathv = v;
+        g->gl_pathv[g->gl_pathc++] = path;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return g->gl_pathc ? 0 : 3;
+}
+#else
 #include <glob.h>
+#endif
 
 /* ── Runtime fixture (same pattern as test_link.c) ─────────────────── */
 
@@ -98,8 +135,17 @@ static void cleanup_base(const char* base) {
     snprintf(path, sizeof(path), "%s.qdb",     base); unlink(path);
     snprintf(path, sizeof(path), "%s.qdb.tmp", base); unlink(path);
     /* Archived rolls have the form base.<stamp>.log — remove with glob via shell. */
+#if defined(_WIN32)
+    snprintf(path, sizeof(path), "%s.*.log", base);   /* no POSIX shell here */
+    glob_t g;
+    if (glob(path, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]);
+        globfree(&g);
+    }
+#else
     snprintf(path, sizeof(path), "rm -f '%s'.*.log 2>/dev/null", base);
     (void)system(path);
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1041,15 +1087,19 @@ static test_result_t test_journal_crash_window_no_double_apply(void) {
 
     /* Simulate the crash IN the window: put the just-archived log back
      * under its live name, exactly the on-disk state a crash between
-     * the two renames leaves behind. */
+     * the two renames leaves behind.  The journal is closed first (the
+     * "process" is gone), and the live file removed before the rename:
+     * Windows can neither replace a file that is still open nor rename
+     * onto an existing one. */
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     char pattern[300];
     snprintf(pattern, sizeof(pattern), "%s.*.log", base);
     glob_t g;
     TEST_ASSERT_EQ_I(glob(pattern, 0, NULL, &g), 0);
     TEST_ASSERT_EQ_I((int64_t)g.gl_pathc, 1);
+    (void)remove(lpath);
     TEST_ASSERT_EQ_I(rename(g.gl_pathv[0], lpath), 0);
     globfree(&g);
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
 
     /* Restart: clobber the binding, recover.  The covered log must be
      * skipped — jw_x comes back as the snapshot value, not value+1. */
@@ -2294,9 +2344,13 @@ static bool purge_write_one(int64_t x) {
 
 /* True iff at least one rolled archive (base.<stamp>.log) exists. */
 static bool archive_exists(const char* base) {
-    char cmd[1200];
-    snprintf(cmd, sizeof(cmd), "test -n \"$(ls '%s'.*.log 2>/dev/null)\"", base);
-    return system(cmd) == 0;
+    char pattern[1200];
+    snprintf(pattern, sizeof(pattern), "%s.*.log", base);
+    glob_t g;
+    if (glob(pattern, 0, NULL, &g) != 0) return false;   /* no match */
+    bool found = g.gl_pathc > 0;
+    globfree(&g);
+    return found;
 }
 
 /* P1. Full purge while the journal is OPEN: closes it, unlinks the active

@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; cov3.rfl — additional targeted coverage for collection.c remaining gaps
 ;; Focuses on: atom_eq LIST path, propagate_sym_dict, list_to_typed_vec empty SYM/STR,
 ;;             take STR range out-of-bounds, take dict with typed vals,

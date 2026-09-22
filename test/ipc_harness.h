@@ -48,8 +48,13 @@
 #include "core/runtime.h"
 #include "mem/sys.h"
 #include "lang/internal.h"
+#ifdef RAY_OS_WINDOWS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 #include <time.h>
 #include <string.h>
 

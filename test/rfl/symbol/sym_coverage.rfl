@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Coverage extension for src/table/sym.c.
 ;;
 ;; src/table/sym.c is exercised by many existing tests via CSV/splayed I/O.
