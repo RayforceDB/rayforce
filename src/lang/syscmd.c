@@ -72,7 +72,6 @@ static int64_t arg_as_i64(ray_t* arg, int* err) {
     if (arg->type == -RAY_I32) return (int64_t)arg->i32;
     if (arg->type == -RAY_I16) return (int64_t)arg->i16;
     if (arg->type == -RAY_U8)  return (int64_t)arg->u8;
-    if (arg->type == -RAY_BOOL) return (int64_t)arg->b8;
     if (arg->type == -RAY_STR) {
         const char* p = ray_str_ptr(arg);
         size_t len = ray_str_len(arg);
