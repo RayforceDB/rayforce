@@ -405,13 +405,17 @@ static void pool_count_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
  * while the freed per-task buffers waited on those lists).
  * -------------------------------------------------------------------------- */
 
-typedef struct { ray_t* blocks[64]; } pool_alloc_ctx_t;
+typedef struct {
+    ray_t*   blocks[64];
+    uint32_t owner[64];      /* worker_id that allocated blocks[i]; 0 = main */
+} pool_alloc_ctx_t;
 
 static void pool_alloc_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
-    (void)worker_id;
     pool_alloc_ctx_t* c = (pool_alloc_ctx_t*)ctx;
-    for (int64_t i = start; i < end && i < 64; i++)
-        c->blocks[i] = ray_alloc(256u << 10);    /* 256 KB from the worker's heap */
+    for (int64_t i = start; i < end && i < 64; i++) {
+        c->blocks[i] = ray_alloc(256u << 10);    /* 256 KB from the caller's heap */
+        c->owner[i]  = worker_id;
+    }
 }
 
 static test_result_t test_dispatch_reclaims_worker_blocks(void) {
@@ -421,17 +425,32 @@ static test_result_t test_dispatch_reclaims_worker_blocks(void) {
     ray_err_t err = ray_pool_create(&pool, 3);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
+    /* ray_pool_create returns before the workers have started; a worker
+     * publishes its heap once it has run ray_heap_init.  Wait for all three
+     * on that published state, so every slot below is a real heap. */
+    for (uint32_t w = 0; w < pool.n_workers; w++)
+        while (!atomic_load(&pool.worker_heaps[w])) RAY_CPU_RELAX();
+
+    /* Rounds of "workers allocate, main frees" until a round in which at
+     * least one block really came from a worker (main is worker 0 and can
+     * take every task when the others are slow to wake).  Rounds are cheap;
+     * 64 of them without a worker allocation would mean the pool is not
+     * running its workers at all. */
     pool_alloc_ctx_t ctx = {0};
-    for (int round = 0; round < 8; round++) {
+    int worker_blocks = 0;
+    for (int round = 0; round < 64 && worker_blocks == 0; round++) {
         ray_pool_dispatch_n(&pool, pool_alloc_fn, &ctx, 64);
         for (int i = 0; i < 64; i++) {
             TEST_ASSERT_NOT_NULL(ctx.blocks[i]);
+            if (ctx.owner[i] != 0) worker_blocks++;
             ray_free(ctx.blocks[i]);             /* cross-thread for worker blocks */
             ctx.blocks[i] = NULL;
         }
     }
-    /* The frees above happened after the last dispatch ended; the next one
-     * hands them back. */
+    TEST_ASSERT(worker_blocks > 0, "some blocks were allocated by workers");
+
+    /* Those frees happened after the last dispatch ended, so the blocks sit
+     * on their owners' foreign lists now; the next dispatch hands them back. */
     pool_count_ctx_t cctx = {0};
     ray_pool_dispatch_n(&pool, pool_count_fn, &cctx, 4);
     for (uint32_t w = 0; w < pool.n_workers; w++) {

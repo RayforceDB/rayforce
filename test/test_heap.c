@@ -660,6 +660,10 @@ static test_result_t test_reclaim_worker_drains_owner_list(void) {
     ray_heap_init();
     ray_heap_t* heap_b = ray_tl_heap;
     TEST_ASSERT_NOT_NULL(heap_b);
+    /* heap_b may be a heap abandoned by an earlier test's worker, with blocks
+     * freed to it since; take them back first so the books below move only
+     * for the block this test frees. */
+    ray_heap_flush_foreign();
 #if RAY_MEM_STATS
     size_t booked0 = heap_b->stats.bytes_allocated;
 #endif
