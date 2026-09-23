@@ -627,7 +627,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         if (pval->type == -RAY_SYM) {
             col_sym = pval->i64;
         } else if (pval->type == -RAY_I64) {
-            char buf[64]; int len = snprintf(buf, sizeof(buf), "%ld", (long)pval->i64);
+            char buf[64]; int len = snprintf(buf, sizeof(buf), "%" PRId64, pval->i64);
             col_sym = ray_sym_intern(buf, (size_t)len);
         } else if (pval->type == -RAY_F64) {
             double fv = clear_neg_zero(pval->f64);
@@ -636,7 +636,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         } else if (pval->type == -RAY_BOOL) {
             col_sym = ray_sym_intern(pval->b8 ? "true" : "false", pval->b8 ? 4 : 5);
         } else {
-            char buf[64]; int len = snprintf(buf, sizeof(buf), "col%ld", (long)pval->i64);
+            char buf[64]; int len = snprintf(buf, sizeof(buf), "col%" PRId64, pval->i64);
             col_sym = ray_sym_intern(buf, (size_t)len);
         }
         if (a1) ray_release(pval);

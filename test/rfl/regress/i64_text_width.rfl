@@ -1,0 +1,18 @@
+;; An i64 must survive every text path in full 64-bit width.  The
+;; interpolation, print and pivot/column-name helpers used to render it with
+;; "%ld" + (long), which is 32-bit on Windows (LLP64): 10^18 came back as
+;; -1486618624, and a pivot keyed on large integers produced wrong column
+;; names — a data defect, not just a display one.
+
+(format "%" 1000000000000000000)                 -- "1000000000000000000"
+(format "%" 9223372036854775807)                 -- "9223372036854775807"
+(format "%" -9223372036854775806)                -- "-9223372036854775806"
+(format "%" (count (til 3000000000)))            -- "3000000000"
+(format "%,%" 4294967296 4294967297)             -- "4294967296,4294967297"
+
+;; as 'STR shares none of that code — pin it as the independent oracle.
+(== (format "%" 1099511627776) (as 'STR 1099511627776))  -- true
+
+;; pivot builds column names from the key values
+(set _t64 (table [g k v] (list ['a 'a 'b] [4294967296 4294967297 4294967296] [1.0 2.0 3.0])))
+(cols (pivot _t64 'g 'k 'v sum))                 -- ['g '4294967296 '4294967297]
