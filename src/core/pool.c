@@ -214,7 +214,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
         }
-        pool->worker_heaps = (_Atomic(void*)*)ray_sys_alloc(n_workers * sizeof(_Atomic(void*)));
+        pool->worker_heaps = ray_sys_alloc(n_workers * sizeof(*pool->worker_heaps));
         if (!pool->worker_heaps) {
             ray_sys_free(pool->threads);
             ray_sem_destroy(&pool->work_ready);
