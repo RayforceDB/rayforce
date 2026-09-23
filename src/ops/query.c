@@ -6366,6 +6366,24 @@ static bool select_alias_head_is_agg(ray_t* head) {
     return s && ray_str_len(s) == 8 && memcmp(ray_str_ptr(s), "distinct", 8) == 0;
 }
 
+/* The first aggregate call in `expr` that sits inside another aggregate's
+ * argument, or NULL.  In a grouped select the inner one is already one
+ * value per group, so the outer one has no rows left to fold; evaluated
+ * anyway it collapses over the whole table and every group gets the same
+ * number.  A lambda or let body is its own scope and is not descended. */
+static ray_t* grouped_output_nested_agg(ray_t* expr, bool inside_agg) {
+    if (!expr || expr->type != RAY_LIST || expr->len < 1) return NULL;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_alias_skip_form(el[0])) return NULL;
+    bool agg = is_agg_expr(expr) != 0;
+    if (agg && inside_agg) return expr;
+    for (int64_t i = 1; i < expr->len; i++) {
+        ray_t* hit = grouped_output_nested_agg(el[i], inside_agg || agg);
+        if (hit) return hit;
+    }
+    return NULL;
+}
+
 /* Returns an OWNED expression: `expr` retained when nothing changed, a
  * fresh list otherwise.  `*changed` is set when a substitution happened. */
 static ray_t* select_alias_subst(ray_t* expr, const int64_t* names, ray_t** exprs,
@@ -9463,6 +9481,16 @@ by_dict_done:
                 ray_t* expr = dict_elems[i + 1];
                 if (is_single_group_key_projection(by_expr, expr))
                     continue;
+                if (grouped_output_nested_agg(expr, false)) {
+                    ray_t* nm = ray_sym_str(kid);
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return ray_error("domain",
+                        "select by: output `%.*s` aggregates an aggregate of the group",
+                        nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+                }
                 if (is_group_dag_agg_expr_dag_safe(expr, tbl)) {
                     /* dag-aggs claim output slots in order.  Not a flat
                      * forcer. */

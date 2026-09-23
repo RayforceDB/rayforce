@@ -86,8 +86,13 @@
 (at (select {from: g by: sym price: (sum price) mx: (max price) av: (avg price)}) 'av) -- [80.0 280.0 420.0]
 ;; an alias that shadows nothing resolves inside an aggregate too
 (at (select {from: g by: sym vals: price m: (max vals)}) 'm) -- [150 280 420]
-;; an aggregate alias has no rows left to aggregate
+;; an aggregate alias has no rows left to aggregate — nor has the same
+;; aggregate written out, which used to fold the whole table into every group
 (select {from: g by: sym s: (sum price) mx: (max s)}) !- domain
+(select {from: g by: sym mx: (max (sum price))}) !- domain
+(select {from: g by: sym mx: (max (+ (sum price) 1))}) !- domain
+;; guard: an aggregate over a whole-column verb is not a nested aggregate
+(at (select {from: g by: sym c: (count (distinct price))}) 'c) -- [2 1 1]
 ;; the alias is not visible to an outer where:, but a nested select is
 (at (select {from: (select {from: g by: sym n: (count price) nn: (+ n 1)}) where: (> nn 1)}) 'nn) -- [3 2 2]
 ;; a group-key alias is an alias like any other

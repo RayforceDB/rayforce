@@ -77,8 +77,9 @@ the per-group sum.
 Two rules follow from an alias being one value per group. Inside an
 aggregate's argument a name that is a source column is always the source
 column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
-sum. And an aggregate alias cannot be aggregated again: `s: (sum price)
-mx: (max s)` raises `domain`.
+sum. And an aggregate cannot be aggregated again, through an alias or
+written out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both
+raise `domain`.
 
 A literal symbol inside a select resolves to an earlier alias or a source
 column of that name, in that order; one naming neither stays a constant
