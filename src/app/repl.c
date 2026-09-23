@@ -353,7 +353,18 @@ static void get_cpu_name(char* buf, size_t sz) {
     if (sysctlbyname("machdep.cpu.brand_string", buf, &len, NULL, 0) != 0)
         snprintf(buf, sz, "unknown");
 #elif defined(RAY_OS_WINDOWS)
-    snprintf(buf, sz, "unknown");
+    /* The brand string the firmware reported, same text as /proc/cpuinfo's
+     * "model name"; it is padded with trailing spaces, so trim them. */
+    DWORD n = (DWORD)sz;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE,
+                     "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     "ProcessorNameString", RRF_RT_REG_SZ, NULL,
+                     buf, &n) == ERROR_SUCCESS) {
+        size_t len = strlen(buf);
+        while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
+    } else {
+        snprintf(buf, sz, "unknown");
+    }
 #else
     snprintf(buf, sz, "unknown");
 #endif
