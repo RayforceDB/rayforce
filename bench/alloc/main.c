@@ -11,7 +11,13 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <pthread.h>
-#include <sys/resource.h>
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <psapi.h>
+#else
+#  include <sys/resource.h>
+#endif
 
 static double now_s(void) {
     struct timespec ts;
@@ -66,12 +72,18 @@ static void* consumer(void* _) {
 }
 
 static long max_rss_kb(void) {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return 0;
+    return (long)(pmc.PeakWorkingSetSize / 1024);
+#else
     struct rusage ru; getrusage(RUSAGE_SELF, &ru);
     /* Linux: ru_maxrss is KB; macOS: bytes.  Normalize to KB. */
 #if defined(__APPLE__)
     return ru.ru_maxrss / 1024;
 #else
     return ru.ru_maxrss;
+#endif
 #endif
 }
 
