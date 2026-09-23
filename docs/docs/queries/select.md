@@ -62,27 +62,28 @@ every projection after it:
 ;   840 841
 ```
 
-Only projections see aliases. `where:`, `by:` and the sort keys are
-evaluated against the source table, so `where: (> notional 100000)` raises
-`schema` — filter on the expression itself, or on a nested select.
+Only projections see aliases. `where:` and `by:` are evaluated against the
+source table, so `where: (> notional 100000)` raises `schema` — filter on
+the expression itself, or on a nested select.
 
-In a grouped select the same rule applies to aggregate aliases: a later
-output may combine earlier aggregates, and is evaluated over the group
-result.
+In a grouped select a later output may build on an earlier aggregate: the
+alias stands for the aggregate's expression, so `nn` below is computed from
+the per-group sum.
 
 ```lisp
 (select {from: t by: sym notional: (sum (* price volume)) nn: (+ notional 1)})
 ```
 
-One exception keeps a common idiom meaningful: inside an aggregate's
-argument a name that is a source column is always the source column, so
-`s: (sum s) mx: (max s)` takes the maximum of the rows, not of a sum.  An
-aggregate consumes rows; an alias is one value per group.
+Two rules follow from an alias being one value per group. Inside an
+aggregate's argument a name that is a source column is always the source
+column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
+sum. And an aggregate alias cannot be aggregated again: `s: (sum price)
+mx: (max s)` raises `domain`.
 
-A literal symbol inside a select resolves to a source column or an earlier
-alias of that name; one naming neither stays a constant symbol.  Arithmetic
-on a symbol — a literal or a symbol column — is a `type` error inside a
-select, as it is outside.
+A literal symbol inside a select resolves to an earlier alias or a source
+column of that name, in that order; one naming neither stays a constant
+symbol.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
+error inside a select, as it is outside.
 
 ### Whole-column projections
 

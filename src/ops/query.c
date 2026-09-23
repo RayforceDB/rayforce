@@ -321,6 +321,19 @@ static bool dag_type_is_temporal(int8_t t) {
  * ids plus one without a word.  Declining here sends the projection to the
  * per-row eval fallback, which raises the same error as outside a query.
  * Comparisons and membership keep SYM: they are not arithmetic. */
+static const char* dag_arith_verb(const char* fname, size_t fname_len) {
+    if (fname_len == 1) {
+        switch (fname[0]) {
+            case '+': return "add";
+            case '-': return "subtract";
+            case '*': return "multiply";
+            case '/': return "divide";
+            case '%': return "mod";
+        }
+    }
+    return fname_len == 3 && memcmp(fname, "pow", 3) == 0 ? "pow" : "div";
+}
+
 static bool dag_arith_rejects_sym(const char* fname, size_t fname_len,
                                   int8_t lt, int8_t rt) {
     bool arith = (fname_len == 1 && (fname[0] == '+' || fname[0] == '-' ||
@@ -994,6 +1007,26 @@ static void cexpr_env_pop(ray_graph_t* g, int n) {
     if (g->cexpr_env_top < 0) g->cexpr_env_top = 0;  /* defensive */
 }
 
+/* The projections of the select being compiled that precede the one
+ * being compiled now (g->sel_alias_*, published by the projection loop).
+ * Latest binding wins, so an alias that shadows an earlier alias — or a
+ * source column — is the one a later projection sees. */
+static ray_op_t* sel_alias_lookup(ray_graph_t* g, int64_t sym) {
+    for (int i = g->sel_alias_n - 1; i >= 0; i--)
+        if (g->sel_alias_syms[i] == sym)
+            return &g->nodes[g->sel_alias_ids[i]];
+    return NULL;
+}
+
+/* Takes the error compile_expr_dag left on the graph (see ops.h), or
+ * NULL.  Callers that report a compile failure use it so the message
+ * names the actual problem when there is one. */
+static ray_t* graph_take_compile_err(ray_graph_t* g) {
+    ray_t* e = g->compile_err;
+    g->compile_err = NULL;
+    return e;
+}
+
 static int const_str_expr_len(ray_t* expr, size_t* out_len) {
     if (!expr || !out_len) return 0;
     if (expr->type == -RAY_STR && !(expr->attrs & ATTR_QUOTED)) {
@@ -1079,6 +1112,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         ray_op_t* bound = cexpr_env_lookup(g, expr->i64);
         if (bound) return bound;
+        ray_op_t* alias = sel_alias_lookup(g, expr->i64);
+        if (alias) return alias;
         ray_t* local = ray_env_get_lexical_local(expr->i64);
         if (local) {
             if (ray_is_atom(local)) return ray_const_atom(g, local);
@@ -1174,19 +1209,17 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
      * the rule fires only when a query table is bound.  A literal naming no
      * column stays a const atom node. */
     if (expr->type == -RAY_SYM) {
+        /* A literal naming an EARLIER PROJECTION of the same select resolves
+         * to it, exactly as the bare name does — and ahead of a source
+         * column of the same name, as the bare name does.  The alias store
+         * holds projections only, never lambda formals or let bindings, so
+         * a literal still never captures those. */
+        ray_op_t* alias = sel_alias_lookup(g, expr->i64);
+        if (alias) return alias;
         if (g->table && g->table->type == RAY_TABLE &&
             ray_table_get_col(g->table, expr->i64)) {
             ray_t* s = ray_sym_str(expr->i64);
             if (s) return ray_scan(g, ray_str_ptr(s));
-        }
-        /* A literal naming an EARLIER PROJECTION of the same select resolves
-         * to it, exactly as the bare name does.  Only projection aliases are
-         * bound in the env at this point of a select's compilation — let
-         * and lambda bindings are pushed and popped around their own body
-         * — so a literal still never captures a lambda formal or a let. */
-        if (g->table && g->table->type == RAY_TABLE) {
-            ray_op_t* alias = cexpr_env_lookup(g, expr->i64);
-            if (alias) return alias;
         }
         return ray_const_atom(g, expr);
     }
@@ -1302,7 +1335,16 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                             g->cexpr_env_top++;
                             pushed++;
                         }
+                        /* The body was written outside this select: a free
+                         * name in it is a global (or a column), never an
+                         * output alias of the select that happens to call
+                         * the lambda.  Hide the alias store while the body
+                         * compiles; the actuals above were compiled in the
+                         * projection's own scope and keep seeing aliases. */
+                        int saved_aliases = g->sel_alias_n;
+                        g->sel_alias_n = 0;
                         ray_op_t* result = compile_expr_dag(g, body);
+                        g->sel_alias_n = saved_aliases;
                         cexpr_env_pop(g, pushed);
                         return result;
                     }
@@ -1716,8 +1758,14 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                                                   right->out_type))
                     return NULL;
                 if (dag_arith_rejects_sym(fname, fname_len,
-                                          left->out_type, right->out_type))
+                                          left->out_type, right->out_type)) {
+                    if (!g->compile_err)
+                        g->compile_err = ray_error("type", "cannot %s %s and %s",
+                            dag_arith_verb(fname, fname_len),
+                            ray_type_name((int8_t)-left->out_type),
+                            ray_type_name((int8_t)-right->out_type));
                     return NULL;
+                }
                 if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
                     (!dag_pow_type_admitted(left->out_type) ||
                      !dag_pow_type_admitted(right->out_type)))
@@ -2055,6 +2103,18 @@ static int hidden_agg_shape_ok(ray_t* expr) {
     return op == OP_QUANTILE;
 }
 
+static bool agg_arith_head_is_control(int64_t sym) {
+    static const char* const forms[] = { "if", "while", "times",
+                                         "do", "let", "set", "try" };
+    ray_t* s = ray_sym_str(sym);
+    if (!s) return false;
+    const char* p = ray_str_ptr(s);
+    size_t l = ray_str_len(s);
+    for (size_t i = 0; i < sizeof forms / sizeof forms[0]; i++)
+        if (l == strlen(forms[i]) && memcmp(p, forms[i], l) == 0) return true;
+    return false;
+}
+
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
@@ -2082,6 +2142,15 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
      * Reject the whole output; it keeps the per-group scatter path. */
     if (n > 0 && el[0] && el[0]->type == -RAY_SYM &&
         el[0]->i64 == ray_sym_intern("fn", 2)) { *ok = 0; return NULL; }
+    /* `if` (and the loops) take one condition, not a vector of them:
+     * evaluated once over the n_groups-row result they would pick a
+     * single branch for every group.  The scope-making forms (do, let,
+     * set, try) evaluate their body outside the scope the hidden slots
+     * are bound in.  Reject such outputs so they keep the per-group
+     * evaluation, where the condition is a scalar and names are plain. */
+    if (n > 0 && el[0] && el[0]->type == -RAY_SYM &&
+        !(el[0]->attrs & ATTR_QUOTED) && agg_arith_head_is_control(el[0]->i64))
+        { *ok = 0; return NULL; }
     ray_t* out = ray_list_new(0);
     if (!out || RAY_IS_ERR(out)) { *ok = 0; return out && RAY_IS_ERR(out) ? NULL : NULL; }
     for (int64_t i = 0; i < n && *ok; i++) {
@@ -6262,6 +6331,23 @@ oom:
  * alone.  Nothing is rewritten inside a lambda, a quote or a let, whose own
  * bindings could shadow the alias.
  * -------------------------------------------------------------------------- */
+/* Binds output `kid` = `col` in `tbl` for the projections still to be
+ * evaluated: replaces the column of that name when there is one, appends
+ * otherwise.  Consumes one ref of `tbl`, returns an owned (possibly
+ * copied) table; `col` is retained by the table, the caller keeps its ref. */
+static ray_t* select_fallback_bind_alias(ray_t* tbl, int64_t kid, ray_t* col) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        if (ray_table_col_name(tbl, c) != kid) continue;
+        ray_t* t2 = ray_cow(tbl);   /* a failed copy leaves `tbl` untouched */
+        if (!t2 || RAY_IS_ERR(t2)) { ray_release(tbl); return t2; }
+        ray_table_set_col_idx(t2, c, col);
+        if (ray_table_get_col_idx(t2, c) != col) { ray_release(t2); return ray_error("oom", NULL); }
+        return t2;
+    }
+    return ray_table_add_col(tbl, kid, col);
+}
+
 static bool select_alias_skip_form(ray_t* head) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
     ray_t* s = ray_sym_str(head->i64);
@@ -6288,7 +6374,17 @@ static ray_t* select_alias_subst(ray_t* expr, const int64_t* names, ray_t** expr
     if (expr->type == -RAY_SYM) {
         if (!(in_agg && ray_table_get_col(tbl, expr->i64)))
             for (int i = n_alias - 1; i >= 0; i--)
-                if (names[i] == expr->i64) { *changed = true; ray_retain(exprs[i]); return exprs[i]; }
+                if (names[i] == expr->i64) {
+                    /* One value per group cannot be aggregated again:
+                     * `s: (sum price) mx: (max s)` has no rows to fold. */
+                    if (in_agg && expr_contains_agg(exprs[i])) {
+                        ray_t* s = ray_sym_str(expr->i64);
+                        return ray_error("domain",
+                            "select by: `%.*s` is an aggregate of the group and cannot be aggregated again",
+                            s ? (int)ray_str_len(s) : 1, s ? ray_str_ptr(s) : "?");
+                    }
+                    *changed = true; ray_retain(exprs[i]); return exprs[i];
+                }
         ray_retain(expr); return expr;
     }
     if (expr->type != RAY_LIST || expr->len < 1) { ray_retain(expr); return expr; }
@@ -9569,7 +9665,7 @@ by_dict_done:
             }
             for (int64_t i = 0; i < deferred_nk && n_keys < nk_max; i++) {
                 key_ops[n_keys] = compile_expr_dag(g, dfv[i * 2 + 1]);
-                if (!key_ops[n_keys]) { DICT_VIEW_CLOSE(dfv); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
+                if (!key_ops[n_keys]) { ray_t* cerr = graph_take_compile_err(g); DICT_VIEW_CLOSE(dfv); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
                 n_keys++;
             }
             DICT_VIEW_CLOSE(dfv);
@@ -9598,7 +9694,7 @@ by_dict_done:
             /* Only a real expression is renamed: a bare column symbol lands
              * here too and keeps its own name. */
             computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
-            if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
+            if (!key_ops[0]) { ray_t* cerr = graph_take_compile_err(g); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
 
@@ -9638,7 +9734,11 @@ by_dict_done:
                 agg_ops[n_aggs] = op;
                 /* Compile the aggregation input (the column reference) */
                 agg_ins[n_aggs] = compile_expr_dag(g, agg_arg);
-                if (!agg_ins[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile aggregation argument"); }
+                if (!agg_ins[n_aggs]) {
+                    ray_t* cerr = graph_take_compile_err(g);
+                    ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return cerr ? cerr : ray_error("domain", "select by: failed to compile aggregation argument");
+                }
                 agg_names[n_aggs] = kid;
                 /* Canonical aggregand type-admission (matches the scalar
                  * builtins): reject non-numeric / absolute-temporal inputs so a
@@ -9715,8 +9815,10 @@ by_dict_done:
             if (!agg_ins[n_aggs]) {
                 for (int ci = 0; ci < n_compound; ci++)
                     ray_release(compound_rw[ci]);
+                ray_t* cerr = graph_take_compile_err(g);
                 ray_graph_free(g); ray_release(tbl);
-                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile aggregation argument");
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return cerr ? cerr : ray_error("domain", "select by: failed to compile aggregation argument");
             }
             if (agg_ins[n_aggs]->out_type > 0 &&
                 !agg_type_admitted(hop, agg_ins[n_aggs]->out_type)) {
@@ -10564,7 +10666,7 @@ by_dict_done:
             if (nc_max < 1) nc_max = 1;
             ray_t* colops_hdr = NULL;
             ray_op_t** col_ops = (ray_op_t**)scratch_alloc(&colops_hdr,
-                    (size_t)nc_max * sizeof(ray_op_t*));
+                    (size_t)nc_max * (sizeof(ray_op_t*) + sizeof(int64_t) + sizeof(uint32_t)));
             if (!col_ops) {
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
@@ -10572,17 +10674,19 @@ by_dict_done:
             int64_t nc = 0;
             int use_eval_fallback = 0;
             /* Projections see the projections before them: once an output
-             * expression has compiled, its alias is bound in the compile-time
-             * env, where a later projection's name reference (or literal
-             * symbol) finds it ahead of the source table's columns.  The
-             * binding is made AFTER the expression compiles, so an alias
-             * that shadows a source column still reads the source in its
-             * own definition and the new value in every later one.  where:,
-             * by: and the sort keys compiled earlier and stay alias-blind.
-             * The env is a small fixed stack shared with let/lambda
-             * inlining; when it is full the alias is simply not bound and a
-             * later reference fails as it did before. */
-            int aliases_pushed = 0;
+             * expression has compiled, its alias is published on the graph
+             * (g->sel_alias_*), where a later projection's name reference
+             * or literal symbol finds it ahead of the source table's
+             * columns.  The binding is made AFTER the expression compiles,
+             * so an alias that shadows a source column still reads the
+             * source in its own definition and the new value in every
+             * later one.  where:, by: and the sort keys are compiled
+             * outside this window and stay alias-blind. */
+            int64_t*  alias_syms = (int64_t*)(col_ops + nc_max);
+            uint32_t* alias_ids  = (uint32_t*)(alias_syms + nc_max);
+            g->sel_alias_syms = alias_syms;
+            g->sel_alias_ids  = alias_ids;
+            g->sel_alias_n    = 0;
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
@@ -10591,11 +10695,16 @@ by_dict_done:
                     use_eval_fallback = 1;
                     break;
                 }
-                if (cexpr_env_push(g, kid, col_ops[nc])) aliases_pushed++;
+                alias_syms[nc] = kid;
+                alias_ids[nc]  = col_ops[nc]->id;
                 nc++;
+                g->sel_alias_n = (int)nc;
             }
-            cexpr_env_pop(g, aliases_pushed);
+            g->sel_alias_syms = NULL;
+            g->sel_alias_ids  = NULL;
+            g->sel_alias_n    = 0;
             if (use_eval_fallback) {
+                if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
                 /* The fallback evaluates projections directly over `tbl`,
                  * bypassing the DAG's ray_execute — so a WHERE clause (wired
                  * into `root` as ray_filter) would be silently ignored.
@@ -10669,6 +10778,24 @@ by_dict_done:
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length", "select: output column length %lld does not match %lld", (long long)col_len, (long long)out_len);
+                    }
+                    /* Later projections see this one: bind it in the table
+                     * the remaining expressions are evaluated over, in place
+                     * of a source column of the same name.  A column of
+                     * another length (`distinct`) cannot be a row of that
+                     * table and stays unbound. */
+                    if (col_len == nrows) {
+                        ray_t* bound = select_fallback_bind_alias(tbl, kid, col);
+                        if (!bound || RAY_IS_ERR(bound)) {
+                            ray_release(col);
+                            ray_release(result);
+                            if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                            if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                            ray_graph_free(g);
+                            scratch_free(colops_hdr);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return bound ? bound : ray_error("oom", NULL);
+                        }
+                        tbl = bound;
                     }
                     result = ray_table_add_col(result, kid, col);
                     ray_release(col);
@@ -11076,12 +11203,20 @@ by_dict_done:
                         ray_env_set_local(hidden_agg_names[hi],
                                           ray_table_get_col_idx(result,
                                                                 hbase + hi));
+                    int64_t n_groups = ray_table_nrows(result);
                     for (int ci = 0; ci < n_compound && !cerr; ci++) {
                         ray_t* v = ray_eval(compound_rw[ci]);
-                        if (!v || RAY_IS_ERR(v))
+                        if (!v || RAY_IS_ERR(v)) {
                             cerr = v ? v : ray_error("domain",
                                 "select by: failed to evaluate aggregate expression");
-                        else comp_cols[ci] = v;
+                        } else if (!(ray_is_vec(v) || v->type == RAY_LIST) ||
+                                   ray_len(v) != n_groups) {
+                            ray_t* nm = ray_sym_str(compound_names[ci]);
+                            cerr = ray_error("domain",
+                                "select by: output `%.*s` did not evaluate to one value per group",
+                                nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+                            ray_release(v);
+                        } else comp_cols[ci] = v;
                     }
                     ray_env_pop_scope();
                 }
@@ -11109,14 +11244,22 @@ by_dict_done:
                 if (nt && !RAY_IS_ERR(nt)) {
                     ray_release(result);
                     result = nt;
-                } else if (nt) {
-                    ray_release(nt);
+                } else {
+                    /* An output that did not evaluate to one value per
+                     * group (a scalar, say) cannot be appended: report it
+                     * rather than hand back the hidden columns. */
+                    cerr = nt ? nt : ray_error("oom", NULL);
                 }
             }
             for (int ci = 0; ci < n_compound; ci++)
                 if (comp_cols[ci]) ray_release(comp_cols[ci]);
             scratch_free(cc_hdr);
             n_compound = 0;
+            if (cerr) {
+                ray_release(result);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr;
+            }
         }
     }
 
@@ -13024,7 +13167,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 /* Evaluate expression on sub-table via DAG */
                 ray_graph_t* ug = ray_graph_new(sub_tbl);
                 ray_op_t* expr_op = compile_expr_dag(ug, agg_expr);
-                if (!expr_op) { ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("domain", "update by: failed to compile aggregate expression"); }
+                if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return cerr ? cerr : ray_error("domain", "update by: failed to compile aggregate expression"); }
                 expr_op = ray_optimize(ug, expr_op);
                 ray_t* agg_result = ray_execute(ug, expr_op);
                 ray_graph_free(ug);
@@ -13694,7 +13837,7 @@ no_where_add_col:
         ray_t* update_expr = dict_elems[d + 1];
         ray_graph_t* ug = ray_graph_new(tbl);
         ray_op_t* expr_op = compile_expr_dag(ug, update_expr);
-        if (!expr_op) { ray_release(result); ray_release(tbl); ray_graph_free(ug); DICT_VIEW_CLOSE(upda); return ray_error("domain", "update: failed to compile new column expression"); }
+        if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_release(result); ray_release(tbl); ray_graph_free(ug); DICT_VIEW_CLOSE(upda); return cerr ? cerr : ray_error("domain", "update: failed to compile new column expression"); }
         expr_op = ray_optimize(ug, expr_op);
         ray_t* expr_vec = ray_execute(ug, expr_op);
         ray_graph_free(ug);

@@ -547,6 +547,24 @@ typedef struct ray_graph {
         uint32_t   node_id;
     } cexpr_env[32];
     int             cexpr_env_top;
+
+    /* Output aliases of the select being compiled (src/ops/query.c):
+     * the projections compiled so far, in order.  A name reference or a
+     * literal symbol consults them after the lambda/let env and before
+     * the source table's columns.  Borrowed views into the projection
+     * loop's scratch arrays: set and cleared by that loop, never freed
+     * here.  Kept apart from cexpr_env so a wide select does not eat the
+     * slots lambda inlining needs. */
+    const int64_t*  sel_alias_syms;
+    const uint32_t* sel_alias_ids;
+    int             sel_alias_n;
+
+    /* Set by compile_expr_dag when it declines an expression that can
+     * only fail (arithmetic on a symbol column).  A caller with an
+     * evaluation fallback ignores it — the evaluator raises the same
+     * error; one without reports it instead of a generic compile
+     * failure.  Owned; released by ray_graph_free. */
+    ray_t*          compile_err;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */
