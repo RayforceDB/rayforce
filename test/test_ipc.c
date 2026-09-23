@@ -54,11 +54,16 @@
 
 #include "test.h"
 #include "ipc_harness.h"
+#ifdef RAY_OS_WINDOWS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#endif
 #include <rayforce.h>
 #include "core/ipc.h"
 #include "core/sock.h"
@@ -1047,12 +1052,17 @@ static test_result_t test_ipc_send_large_compressible(void) {
  * Open a journal, then connect an IPC server on top; each SYNC message
  * should flow through ray_journal_write_bytes.
  */
+/* Drop a journal's <base>.log / <base>.qdb pair (no shell). */
+static void ipc_rm_journal(const char* jbase) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s.log", jbase); (void)remove(path);
+    snprintf(path, sizeof(path), "%s.qdb", jbase); (void)remove(path);
+}
+
 static test_result_t test_ipc_journal_path(void) {
     const char* jbase = "/tmp/rayforce_test_ipc_journal";
     /* Remove stale files */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -f %s.log %s.qdb", jbase, jbase);
-    system(cmd);
+    ipc_rm_journal(jbase);
 
     /* Open journal */
     ray_err_t jerr = ray_journal_open(jbase, RAY_JOURNAL_ASYNC);
@@ -1081,7 +1091,7 @@ static test_result_t test_ipc_journal_path(void) {
     ray_test_server_stop(&srv);
 
     ray_journal_close();
-    system(cmd); /* cleanup */
+    ipc_rm_journal(jbase); /* cleanup */
     PASS();
 }
 
@@ -1453,9 +1463,7 @@ static test_result_t test_ipc_send_verbose_large_result(void) {
  */
 static test_result_t test_ipc_journal_restricted(void) {
     const char* jbase = "/tmp/rayforce_test_ipc_jrestr";
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -f %s.log %s.qdb", jbase, jbase);
-    system(cmd);
+    ipc_rm_journal(jbase);
 
     ray_err_t jerr = ray_journal_open(jbase, RAY_JOURNAL_ASYNC);
     if (jerr != RAY_OK) {
@@ -1486,7 +1494,7 @@ static test_result_t test_ipc_journal_restricted(void) {
     ray_test_server_stop(&srv);
 
     ray_journal_close();
-    system(cmd);
+    ipc_rm_journal(jbase);
     PASS();
 }
 
@@ -1979,6 +1987,7 @@ static test_result_t test_ipc_addr_local_ipv6_remote(void) {
     PASS();
 }
 
+#ifndef RAY_OS_WINDOWS   /* AF_UNIX locality is POSIX-only (see sock.c) */
 static test_result_t test_ipc_addr_local_af_unix(void) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
@@ -1986,6 +1995,7 @@ static test_result_t test_ipc_addr_local_af_unix(void) {
     TEST_ASSERT_TRUE(ray_sock_addr_is_local(&sa, sizeof(sa)));
     PASS();
 }
+#endif
 
 static test_result_t test_ipc_addr_local_rejects_garbage(void) {
     struct sockaddr_in sa;
@@ -1998,24 +2008,53 @@ static test_result_t test_ipc_addr_local_rejects_garbage(void) {
     PASS();
 }
 
-/* A real AF_UNIX pair resolves as local through getpeername. */
+/* A connected pair of sockets on this machine: an AF_UNIX socketpair on
+ * POSIX; Windows has no socketpair(2), so a loopback TCP pair there. */
+static int test_local_sock_pair(ray_sock_t sv[2]) {
+#ifdef RAY_OS_WINDOWS
+    ray_sock_t srv = ray_sock_listen_at("127.0.0.1", 0);
+    if (srv == RAY_INVALID_SOCK) return -1;
+    struct sockaddr_in addr;
+    int len = sizeof(addr);
+    if (getsockname((SOCKET)srv, (struct sockaddr*)&addr, &len) != 0) {
+        ray_sock_close(srv);
+        return -1;
+    }
+    sv[0] = ray_sock_connect("127.0.0.1", ntohs(addr.sin_port), 0);
+    sv[1] = sv[0] == RAY_INVALID_SOCK ? RAY_INVALID_SOCK : ray_sock_accept(srv);
+    ray_sock_close(srv);
+    if (sv[1] == RAY_INVALID_SOCK) {
+        if (sv[0] != RAY_INVALID_SOCK) ray_sock_close(sv[0]);
+        return -1;
+    }
+    return 0;
+#else
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return -1;
+    sv[0] = fds[0];
+    sv[1] = fds[1];
+    return 0;
+#endif
+}
+
+/* A real local pair resolves as local through getpeername. */
 static test_result_t test_ipc_peer_is_local_socketpair(void) {
-    int sv[2];
-    TEST_ASSERT_EQ_I(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-    TEST_ASSERT_TRUE(ray_sock_peer_is_local((ray_sock_t)sv[0]));
-    TEST_ASSERT_TRUE(ray_sock_peer_is_local((ray_sock_t)sv[1]));
-    close(sv[0]);
-    close(sv[1]);
+    ray_sock_t sv[2];
+    TEST_ASSERT_EQ_I(test_local_sock_pair(sv), 0);
+    TEST_ASSERT_TRUE(ray_sock_peer_is_local(sv[0]));
+    TEST_ASSERT_TRUE(ray_sock_peer_is_local(sv[1]));
+    ray_sock_close(sv[0]);
+    ray_sock_close(sv[1]);
     PASS();
 }
 
 /* An unconnected socket has no peer: getpeername fails, and an unknown
  * peer must fall back to the compressing default, not to "local". */
 static test_result_t test_ipc_peer_is_local_unconnected(void) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    TEST_ASSERT_TRUE(fd >= 0);
-    TEST_ASSERT_FALSE(ray_sock_peer_is_local((ray_sock_t)fd));
-    close(fd);
+    ray_sock_t fd = (ray_sock_t)socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT_TRUE(fd != RAY_INVALID_SOCK);
+    TEST_ASSERT_FALSE(ray_sock_peer_is_local(fd));
+    ray_sock_close(fd);
     PASS();
 }
 
@@ -2027,18 +2066,18 @@ static test_result_t test_ipc_peer_is_local_invalid_fd(void) {
 /* The policy the send paths consult: local links never compress, others
  * keep the compiled-in default. */
 static test_result_t test_ipc_link_threshold_local_vs_remote(void) {
-    int sv[2];
-    TEST_ASSERT_EQ_I(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-    TEST_ASSERT_EQ_U(ray_ipc_link_threshold((ray_sock_t)sv[0]),
+    ray_sock_t sv[2];
+    TEST_ASSERT_EQ_I(test_local_sock_pair(sv), 0);
+    TEST_ASSERT_EQ_U(ray_ipc_link_threshold(sv[0]),
                      RAY_IPC_COMPRESS_NEVER);
-    close(sv[0]);
-    close(sv[1]);
+    ray_sock_close(sv[0]);
+    ray_sock_close(sv[1]);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    TEST_ASSERT_TRUE(fd >= 0);
-    TEST_ASSERT_EQ_U(ray_ipc_link_threshold((ray_sock_t)fd),
+    ray_sock_t fd = (ray_sock_t)socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT_TRUE(fd != RAY_INVALID_SOCK);
+    TEST_ASSERT_EQ_U(ray_ipc_link_threshold(fd),
                      (size_t)RAY_IPC_COMPRESS_THRESHOLD);
-    close(fd);
+    ray_sock_close(fd);
     PASS();
 }
 
@@ -2747,7 +2786,9 @@ const test_entry_t ipc_entries[] = {
     { "ipc/addr_local/ipv6_loopback",       test_ipc_addr_local_ipv6_loopback,        ipc_setup, ipc_teardown },
     { "ipc/addr_local/ipv6_mapped_loopback",test_ipc_addr_local_ipv6_mapped_loopback, ipc_setup, ipc_teardown },
     { "ipc/addr_local/ipv6_remote",         test_ipc_addr_local_ipv6_remote,          ipc_setup, ipc_teardown },
+#ifndef RAY_OS_WINDOWS
     { "ipc/addr_local/af_unix",             test_ipc_addr_local_af_unix,              ipc_setup, ipc_teardown },
+#endif
     { "ipc/addr_local/rejects_garbage",     test_ipc_addr_local_rejects_garbage,      ipc_setup, ipc_teardown },
     { "ipc/peer_is_local/socketpair",       test_ipc_peer_is_local_socketpair,        ipc_setup, ipc_teardown },
     { "ipc/peer_is_local/unconnected",      test_ipc_peer_is_local_unconnected,       ipc_setup, ipc_teardown },

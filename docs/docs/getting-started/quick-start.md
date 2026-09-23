@@ -58,7 +58,7 @@ The Rayfall REPL provides an interactive environment with syntax highlighting, b
 ./rayforce
 ```
 
-You will see the `‣` prompt (a green triangle bullet):
+You will see the `‣` prompt (a green triangle bullet; `►` on Windows, whose console fonts have no `‣`):
 
 ```text
 ‣

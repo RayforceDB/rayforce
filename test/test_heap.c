@@ -50,7 +50,33 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+/* Anonymous mmap for the fake file-mapped (mmod==1) blocks below: a
+ * pagefile-backed view, so the library's ray_vm_unmap_file
+ * (UnmapViewOfFile) releases it just as it would a real file mapping. */
+#define PROT_READ     1
+#define PROT_WRITE    2
+#define MAP_PRIVATE   2
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED    ((void*)-1)
+static void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
+    (void)addr; (void)prot; (void)flags; (void)fd; (void)off;
+    HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                  0, (DWORD)len, NULL);
+    if (!m) return MAP_FAILED;
+    void* p = MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, len);
+    CloseHandle(m);
+    return p ? p : MAP_FAILED;
+}
+static int munmap(void* p, size_t len) {
+    (void)len;
+    return UnmapViewOfFile(p) ? 0 : -1;
+}
+#else
 #include <sys/mman.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -2565,6 +2591,11 @@ static test_result_t test_direct_cache_concurrent_replacement(void) {
 
 /* Drive the anon-to-file crossing with a low watermark, independent of RAM. */
 static test_result_t test_anon_watermark_spill(void) {
+#if defined(_WIN32)
+    /* Windows takes only the anonymous path; the file-backed spill is
+     * POSIX-only (docs/architecture/memory.md, RAY_HEAP_FILE_SPILL). */
+    SKIP("file-backed spill is POSIX-only");
+#endif
     size_t sz = 40 * 1024 * 1024 - 128;   /* order 26 → direct path */
     /* Start from an empty reuse cache: leftover cached blocks from earlier
      * tests would (a) inflate the baseline and (b) be drained by the

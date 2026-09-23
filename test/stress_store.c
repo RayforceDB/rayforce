@@ -4,6 +4,11 @@
  * Rayforce heap under test.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE          /* lstat under strict -std=c17 */
+#endif
+
+#include "test.h"          /* POSIX shims on Windows (lstat) */
 #include "stress_store.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -14,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>  /* getpid — per-process scratch paths */
+#include <dirent.h>
+#include <sys/stat.h>
+#include "store/fileio.h" /* ray_mkdir_p */
 
 const char* stress_db_path(const char* name) {
     static char buf[256];
@@ -148,10 +156,28 @@ void stress_part_dir(const stress_ctx_t* c, int i, char* buf, size_t n) {
     snprintf(buf, n, "%s/%s/hist", c->db_root, c->part_dates[i]);
 }
 
+/* Recursive delete without a shell (portable to Windows, where system()
+ * runs cmd.exe and has no `rm -rf`). */
 static void rm_rf(const char* path) {
-    char cmd[600];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)!system(cmd);
+    struct stat st;
+    if (lstat(path, &st) != 0) return;   /* never follow a symlink out */
+    if (S_ISDIR(st.st_mode)) {
+        DIR* d = opendir(path);
+        if (d) {
+            struct dirent* ent;
+            char child[1024];
+            while ((ent = readdir(d)) != NULL) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                    continue;
+                snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+                rm_rf(child);
+            }
+            closedir(d);
+        }
+        (void)rmdir(path);
+    } else {
+        (void)unlink(path);
+    }
 }
 
 /* ---- ray table <-> shadow rows ------------------------------------------ */
@@ -276,9 +302,7 @@ bool stress_init(stress_ctx_t* c, const char* db_root, uint64_t seed) {
     c->oplog = (char(*)[128])malloc((size_t)STRESS_OPLOG_CAP * 128);
     if (!c->oplog) return false;
     rm_rf(c->db_root);
-    char cmd[600];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", c->db_root);
-    if (system(cmd) != 0) {
+    if (ray_mkdir_p(c->db_root) != RAY_OK) {
         free(c->oplog);
         c->oplog = NULL;
         return false;

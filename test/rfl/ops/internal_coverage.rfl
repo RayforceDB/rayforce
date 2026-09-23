@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Coverage for src/ops/internal.h static-inline helpers that are
 ;; instantiated in production TUs (exec.c, filter.c, expr.c, etc.)
 ;; but have never been exercised through the test suite.

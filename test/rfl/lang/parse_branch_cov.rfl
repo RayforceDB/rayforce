@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Branch-coverage extension for src/lang/parse.c — the Rayfall parser
 ;; (tokenizer, atom-literal parsing, list/dict/vector syntax, comments,
 ;; escape sequences, error recovery).
