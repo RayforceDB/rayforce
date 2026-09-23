@@ -2807,28 +2807,28 @@ void ray_heap_flush_foreign(void) {
  * worker before any block is reused, and nothing short of the idle decay
  * (which needs the process to sit quiet) drains it earlier.
  *
- * So the dispatcher drains every heap's list at the end of each parallel
+ * So the dispatcher drains each worker's list at the end of each parallel
  * region.  The conditions are the ones the decay sweep relies on: the flag
  * is clear, so every worker has done its last pending-- and is claiming
  * nothing, allocating nothing and freeing nothing until the next dispatch;
  * a concurrent push onto a foreign list from some other thread is safe
  * because the drain takes the whole list in one exchange and leaves later
- * arrivals for the next round.  No pages are released here — the blocks
- * only go back to freelists, so the next round reuses them without
- * faulting.  Cost: one relaxed load per registered heap and the coalescing
- * of whatever was freed cross-thread since the last dispatch, work the
- * owner would otherwise do on its next dry allocation.
+ * arrivals for the next round.  Only pool workers qualify: the registry
+ * also holds the heaps of other live threads (a server's poll thread, an
+ * embedding's own threads), whose freelists only their owner may touch, so
+ * the pool names the heaps rather than this walking the registry.  No
+ * pages are released here — the blocks only go back to freelists, so the
+ * next round reuses them without faulting.  Cost: one load per worker and
+ * the coalescing of whatever was freed cross-thread since the last
+ * dispatch, work the owner would otherwise do on its next dry allocation.
  * -------------------------------------------------------------------------- */
 
-void ray_heap_reclaim_workers(void) {
+void ray_heap_reclaim_worker(ray_heap_t* h) {
+    if (!h) return;
     if (atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) != 0)
         return;
-    for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
-        ray_heap_t* gh = ray_heap_registry[hid];
-        if (!gh) continue;
-        if (!atomic_load_explicit(&gh->foreign, memory_order_relaxed)) continue;
-        heap_drain_foreign(gh);
-    }
+    if (!atomic_load_explicit(&h->foreign, memory_order_relaxed)) return;
+    heap_drain_foreign(h);
 }
 
 /* --------------------------------------------------------------------------

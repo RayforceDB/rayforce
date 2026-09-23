@@ -411,7 +411,7 @@ static void pool_alloc_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
     (void)worker_id;
     pool_alloc_ctx_t* c = (pool_alloc_ctx_t*)ctx;
     for (int64_t i = start; i < end && i < 64; i++)
-        c->blocks[i] = ray_alloc(1u << 20);      /* 1 MB from the worker's heap */
+        c->blocks[i] = ray_alloc(256u << 10);    /* 256 KB from the worker's heap */
 }
 
 static test_result_t test_dispatch_reclaims_worker_blocks(void) {
@@ -434,10 +434,10 @@ static test_result_t test_dispatch_reclaims_worker_blocks(void) {
      * hands them back. */
     pool_count_ctx_t cctx = {0};
     ray_pool_dispatch_n(&pool, pool_count_fn, &cctx, 4);
-    for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
-        ray_heap_t* gh = ray_heap_registry[hid];
-        if (!gh) continue;
-        TEST_ASSERT_NULL(atomic_load(&gh->foreign));
+    for (uint32_t w = 0; w < pool.n_workers; w++) {
+        ray_heap_t* wh = (ray_heap_t*)atomic_load(&pool.worker_heaps[w]);
+        TEST_ASSERT_NOT_NULL(wh);
+        TEST_ASSERT_NULL(atomic_load(&wh->foreign));
     }
 
     ray_pool_free(&pool);
