@@ -20,6 +20,7 @@
 
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -71,21 +72,20 @@ static void cw_int(int v) {
 /* Banner precomputed at install time so the handler doesn't format it. */
 static char g_banner[128];
 
+#ifndef RAYFORCE_VERSION
+#define RAYFORCE_VERSION ""
+#endif
+#ifndef RAYFORCE_GIT_COMMIT
+#define RAYFORCE_GIT_COMMIT ""
+#endif
+
 static void crash_banner_init(void) {
-    const char* v =
-#ifdef RAYFORCE_VERSION
-        "rayforce " RAYFORCE_VERSION
-#else
-        "rayforce"
-#endif
-#ifdef RAYFORCE_GIT_COMMIT
-        " (" RAYFORCE_GIT_COMMIT ")"
-#endif
-        "\n";
-    size_t vl = strlen(v);
-    if (vl >= sizeof(g_banner)) vl = sizeof(g_banner) - 1;
-    memcpy(g_banner, v, vl);
-    g_banner[vl] = '\0';
+    const char* ver = RAYFORCE_VERSION;
+    const char* rev = RAYFORCE_GIT_COMMIT;
+    int n = snprintf(g_banner, sizeof(g_banner), "rayforce%s%s%s%s%s\n",
+                     ver[0] ? " " : "", ver,
+                     rev[0] ? " (" : "", rev, rev[0] ? ")" : "");
+    if (n < 0) g_banner[0] = '\0';
 }
 
 #if defined(_WIN32)
