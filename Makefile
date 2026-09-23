@@ -81,7 +81,25 @@ COVERAGE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=$(RAY_MARCH) -DDEBUG 
   -fno-omit-frame-pointer -fprofile-instr-generate -fcoverage-mapping
 COVERAGE_LDFLAGS = -fprofile-instr-generate -fcoverage-mapping
 
-ifeq ($(UNAME_S),Linux)
+# Windows: MSYS2 CLANG64/MINGW64 toolchain (x86_64-w64-windows-gnu).  MSYS2's
+# own make hides $(OS), so also match `uname -s` (MINGW64_NT-*, CLANG64_NT-*,
+# MSYS_NT-*); a native make started from PowerShell/cmd sees OS=Windows_NT.
+RAY_WINDOWS := $(if $(filter Windows_NT,$(OS))$(findstring _NT-,$(UNAME_S)),1,)
+
+ifeq ($(RAY_WINDOWS),1)
+  # 64-bit off_t / struct stat.st_size: MinGW defaults both to 32 bits, which
+  # silently truncates sizes of files over 2 GiB (stat, lseek, ftruncate).
+  DEFS           += -D_FILE_OFFSET_BITS=64
+  # --stack: 8 MiB like a Linux main thread (the Windows default is 1 MiB,
+  # too little for deep DAG/eval recursion).  CreateThread(size 0) inherits
+  # it too, so pool workers get the same.  winpthreads (sched_yield,
+  # clock_gettime) is linked statically so the binary needs no MSYS2 DLL; the
+  # UCRT it also uses ships with Windows 10+.
+  LIBS            = -lws2_32 -lmswsock -lkernel32 -ladvapi32 \
+                    -Wl,-Bstatic -lpthread -Wl,-Bdynamic \
+                    -Wl,--stack,8388608
+  RELEASE_LDFLAGS = -Wl,--gc-sections
+else ifeq ($(UNAME_S),Linux)
   LIBS            = -lm -lpthread
   RELEASE_LDFLAGS = -Wl,--gc-sections -Wl,--as-needed
 else

@@ -44,10 +44,20 @@
 #include <unistd.h>     /* getpid, close, ftruncate, unlink */
 #include <fcntl.h>      /* open, fcntl, F_PREALLOCATE on macOS */
 #include <errno.h>
-#include <sys/mman.h>   /* mmap, munmap */
 #include <sys/stat.h>   /* O_*  modes */
 #include <sys/types.h>
 #include <stdatomic.h>
+
+/* File-backed spill (a pool or direct block mapped over a preallocated temp
+ * file when the anonymous mapping is refused) is POSIX-only.  Windows pools
+ * take only the anonymous VirtualAlloc path (docs/architecture/memory.md):
+ * the spill helpers are compiled out and swap_fd stays -1 there. */
+#if defined(RAY_OS_WINDOWS)
+#  define RAY_HEAP_FILE_SPILL 0
+#else
+#  define RAY_HEAP_FILE_SPILL 1
+#  include <sys/mman.h>   /* mmap, munmap */
+#endif
 
 #ifdef DEBUG
 /* =====================================================================
@@ -64,7 +74,9 @@
  * choice for chasing double releases (found while debugging #240).
  * RAY_DFD_NO_ABORT=1 reports without aborting.
  * ===================================================================== */
+#if !defined(RAY_OS_WINDOWS)
 #include <execinfo.h>
+#endif
 
 #define DFD_CAP_BITS 20
 #define DFD_CAP      (1u << DFD_CAP_BITS)
@@ -149,10 +161,12 @@ static void dfd_purge_range(uintptr_t lo, uintptr_t hi) {
 }
 
 static void dfd_report(const char* who, const void* p) {
+    fprintf(stderr, "\n=== DFD: %s on FREED block %p ===\n", who, p);
+#if !defined(RAY_OS_WINDOWS)
     void* frames[64];
     int n = backtrace(frames, 64);
-    fprintf(stderr, "\n=== DFD: %s on FREED block %p ===\n", who, p);
     backtrace_symbols_fd(frames, n, 2);
+#endif
     fflush(stderr);
     if (!getenv("RAY_DFD_NO_ABORT")) abort();
 }
@@ -179,6 +193,7 @@ static void dfd_validate_freelists(void);
  * contiguous first, fall back to non-contiguous, then ftruncate to
  * extend the file size if needed (F_PREALLOCATE doesn't grow the file
  * beyond its current size). */
+#if RAY_HEAP_FILE_SPILL
 static int heap_preallocate(int fd, off_t offset, off_t len) {
 #if defined(__APPLE__)
     fstore_t fs = {
@@ -202,6 +217,7 @@ static int heap_preallocate(int fd, off_t offset, off_t len) {
     return posix_fallocate(fd, offset, len);
 #endif
 }
+#endif /* RAY_HEAP_FILE_SPILL */
 
 /* --------------------------------------------------------------------------
  * Static asserts
@@ -574,6 +590,9 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     if (!heap_anon_would_exceed(pool_size))
         mem = ray_vm_alloc_aligned(pool_size, pool_size);
 
+#if !RAY_HEAP_FILE_SPILL
+    if (!mem) return false;
+#else
     if (!mem) {
         /* Anonymous mmap refused — usually means RAM+swap can't satisfy
          * pool_size right now.  Fall back to file-backed mmap: create a
@@ -668,6 +687,7 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
         ray_sys_free(swap_path);
         swap_path = NULL;
     }
+#endif /* RAY_HEAP_FILE_SPILL */
 
     /* Enable transparent huge pages on anon pools (Linux).  Self-aligned
      * 32MB pools are 2MB-aligned, hence THP-eligible.  Never on file-backed
@@ -1184,6 +1204,10 @@ static void ray_detach_owned_refs(ray_t* v) {
  * failure. */
 static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
                                   int* out_fd, char** out_path) {
+#if !RAY_HEAP_FILE_SPILL
+    (void)h; (void)map_size; (void)out_fd; (void)out_path;
+    return NULL;
+#else
     static _Atomic uint64_t direct_swap_counter = 0;
     uint64_t cnt = atomic_fetch_add_explicit(&direct_swap_counter, 1,
                                              memory_order_relaxed);
@@ -1213,6 +1237,7 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
     *out_fd   = fd;
     *out_path = path;
     return mapped;
+#endif /* RAY_HEAP_FILE_SPILL */
 }
 
 /* --------------------------------------------------------------------------
@@ -1713,6 +1738,7 @@ void ray_free(ray_t* v) {
         if (h) RAY_STAT(h->stats.free_count++);
         atomic_fetch_sub_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
         atomic_fetch_sub_explicit(&g_direct_count, 1, memory_order_relaxed);
+#if RAY_HEAP_FILE_SPILL
         if (swap_fd >= 0) {
             /* File-backed spill: mapped directly (not via ray_vm_alloc), so
              * unmap + uncount by hand, then close and unlink the spill file. */
@@ -1720,7 +1746,11 @@ void ray_free(ray_t* v) {
             ray_sys_track_sub((int64_t)map_size);
             close(swap_fd);
             if (swap_path) { unlink(swap_path); ray_sys_free(swap_path); }
-        } else if (direct_cache_put(base, map_size)) {
+        } else
+#else
+        (void)swap_fd; (void)swap_path;
+#endif
+        if (direct_cache_put(base, map_size)) {
             /* Stashed for reuse: pages stay resident, so the block keeps
              * its committed-RAM and watermark accounting; only the live
              * stats above dropped.  Eviction (direct_cache_drain) performs

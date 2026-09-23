@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; startup_script_fatal.rfl — a failing startup script under -p is fatal
 ;; non-interactively (#507).
 ;;

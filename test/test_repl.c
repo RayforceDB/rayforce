@@ -88,10 +88,8 @@ extern void*          ray_runtime_get_poll(void);
  * poll first (closes any leftover conns), runtime second. */
 static void repl_setup(void) {
     ray_runtime_create(0, NULL);
-#ifndef RAY_OS_WINDOWS
     ray_poll_t* p = ray_poll_create();
     if (p) ray_runtime_set_poll(p);
-#endif
 }
 
 static void repl_teardown(void) {
@@ -103,7 +101,6 @@ static void repl_teardown(void) {
         ray_t* args = NULL;
         ray_release(ray_repl_disconnect_fn(&args, 0));
     }
-#ifndef RAY_OS_WINDOWS
     {
         ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
         if (p) {
@@ -111,7 +108,6 @@ static void repl_teardown(void) {
             ray_poll_destroy(p);
         }
     }
-#endif
     ray_runtime_destroy(__RUNTIME);
 }
 
@@ -670,7 +666,9 @@ static test_result_t test_repl_pty_ctrl_d(void) {
  * code proves it ran while the prompt was idle, and the helper's 5 s
  * timeout (-2) is what a starved timer would produce.  Nothing after
  * the timer line is ever written to the pty. */
+#ifndef RAY_OS_WINDOWS
 static int run_pty_listen_with_poll(const char* input);
+#endif
 static test_result_t test_repl_pty_timer_fires_while_idle(void) {
 #ifndef RAY_OS_WINDOWS
     int rc = run_pty_listen_with_poll("(.time.timer.set 150 1 (fn [t] (exit 7)))\n");

@@ -65,9 +65,7 @@ static void splay_teardown(void) {
 
 /* Remove temp dir tree */
 static void rm_rf(const char* path) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", path);
-    (void)!system(cmd);
+    (void)ray_test_rm_rf(path);
 }
 
 /* =========================================================================
@@ -181,9 +179,7 @@ static test_result_t test_load_missing_schema(void) {
     /* Directory exists but contains no .d file */
     const char* dir = TMP_SPLAY_BASE "/no_schema";
     rm_rf(dir);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir);
-    (void)!system(cmd);
+    (void)ray_test_mkdir_p(dir);
 
     ray_t* r = ray_splay_load(dir, NULL);
     /* ray_col_load of missing file returns an error object */
@@ -499,9 +495,7 @@ static test_result_t test_save_sym_error(void) {
     char sym_as_dir[512];
     snprintf(sym_as_dir, sizeof(sym_as_dir), "%s/sym_dir", dir);
     /* Ensure parent dir exists first */
-    char mk[600];
-    snprintf(mk, sizeof(mk), "mkdir -p %s", sym_as_dir);
-    (void)!system(mk);
+    (void)ray_test_mkdir_p(sym_as_dir);
 
     ray_err_t err = ray_splay_save(tbl, dir, sym_as_dir);
     /* Either succeeds (some impls tolerate it) or returns an error — either
@@ -732,8 +726,8 @@ static test_result_t test_save_bulk_with_sym_path(void) {
  * 19. splay_save_impl: snprintf overflow for the column / ".d" paths.
  *     Requires strlen(dir) >= 1021 so that strlen(dir)+3 >= 1024.
  *     Build a deeply nested path using short components (≤ 50 chars each)
- *     so the filesystem NAME_MAX (255) is not exceeded, then call mkdir_p
- *     via system(), then ray_splay_save → snprintf("%s/.d") fires range.
+ *     so the filesystem NAME_MAX (255) is not exceeded, then create it
+ *     with ray_test_mkdir_p, then ray_splay_save → snprintf("%s/.d") fires range.
  *
  *     Path layout (each component 50 chars):
  *       /tmp/rft_deep_save/         (18 chars)
@@ -748,6 +742,10 @@ static test_result_t test_save_dir_path_too_long(void) {
      * fires under the same condition on Linux PATH_MAX = 4096.  Skip
      * on Darwin — the Linux runner covers the regression. */
     SKIP("PATH_MAX=1024 on macOS — deep-mkdir fixture not portable");
+#elif defined(_WIN32)
+    /* Win32 directory paths stop at MAX_PATH (~260) without long-path
+     * opt-in, far short of the 1021-char tree. */
+    SKIP("MAX_PATH=260 on Windows — deep-mkdir fixture not portable");
 #endif
     /* Construct the nested path in a buffer */
     char long_dir[2048];
@@ -771,10 +769,8 @@ static test_result_t test_save_dir_path_too_long(void) {
     TEST_ASSERT_TRUE((size_t)off >= 1021);
 
     /* Create the directory tree so ray_mkdir_p inside save succeeds.
-     * system("mkdir -p ...") handles arbitrarily deep paths. */
-    char mk[4096];
-    snprintf(mk, sizeof(mk), "mkdir -p \"%s\"", long_dir);
-    (void)!system(mk);
+     * ray_test_mkdir_p handles arbitrarily deep paths. */
+    (void)ray_test_mkdir_p(long_dir);
 
     int64_t id_v2 = ray_sym_intern("v2long", 6);
     int64_t raw[] = {1};
@@ -794,9 +790,7 @@ static test_result_t test_save_dir_path_too_long(void) {
     ray_release(col);
     ray_release(tbl);
     /* Cleanup entire nested tree from the base */
-    char rm_cmd[256];
-    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf /tmp/rft_deep_save");
-    (void)!system(rm_cmd);
+    (void)ray_test_rm_rf("/tmp/rft_deep_save");
     PASS();
 }
 
@@ -884,9 +878,7 @@ static test_result_t test_trace_missing_schema(void) {
     const char* dir = TMP_SPLAY_BASE "/trace_noschema";
     rm_rf(dir);
     /* Create dir without .d file */
-    char mk[512];
-    snprintf(mk, sizeof(mk), "mkdir -p %s", dir);
-    (void)!system(mk);
+    (void)ray_test_mkdir_p(dir);
 
     setenv("RAY_CSV_TRACE", "1", 1);
     ray_t* r = ray_splay_load(dir, NULL);
@@ -985,11 +977,14 @@ static test_result_t test_trace_fresh_load(void) {
  *     (with .d last, the column save is the first write to hit the dir).
  * ========================================================================= */
 static test_result_t test_save_schema_write_fails(void) {
+#if defined(_WIN32)
+    /* chmod cannot make a Windows directory refuse new files: the
+     * read-only attribute is ignored for directories. */
+    SKIP("read-only directories are not enforced on Windows");
+#endif
     const char* dir = TMP_SPLAY_BASE "/no_write_schema";
     rm_rf(dir);
-    char mk[512];
-    snprintf(mk, sizeof(mk), "mkdir -p %s", dir);
-    (void)!system(mk);
+    (void)ray_test_mkdir_p(dir);
 
     /* Make dir read-only so .d cannot be written */
     chmod(dir, 0555);

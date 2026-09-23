@@ -24,10 +24,13 @@
 #ifndef RAY_FILEIO_H
 #define RAY_FILEIO_H
 
-#include <rayforce.h>
+#include "core/platform.h"
 
 /* Cross-platform file I/O (locking, sync, atomic rename) */
 #ifdef RAY_OS_WINDOWS
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN   /* keep <dlgs.h>/<winsock.h> macros out */
+  #endif
   #include <windows.h>
   typedef HANDLE ray_fd_t;
   #define RAY_FD_INVALID INVALID_HANDLE_VALUE

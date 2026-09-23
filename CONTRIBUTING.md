@@ -69,6 +69,28 @@ a focused subset with:
 ./rayforce.test -f <substring>
 ```
 
+A `.rfl` file that needs a POSIX shell or filesystem (fixtures built or
+checked through `.sys.exec`, `/proc`, `/dev/tcp`, …) carries the line
+`;; @requires: posix`; on Windows the runner reports it as `SKIP` rather
+than running it. C tests use `#ifndef RAY_OS_WINDOWS` / `SKIP(...)` for the
+same purpose. Prefer the shell-free helpers `ray_test_rm_rf` /
+`ray_test_mkdir_p` (`test/test.h`) over `system("rm -rf …")` in C tests.
+
+### Windows
+
+Build with the MSYS2 CLANG64 (or MINGW64) toolchain — `pacman -S
+mingw-w64-clang-x86_64-clang make` — from an MSYS2 shell or with
+`C:\msys64\clang64\bin` and `C:\msys64\usr\bin` on `PATH`:
+
+```sh
+make            # debug build (ASan + UBSan)
+make test
+make release
+```
+
+The debug binaries load the ASan runtime DLL from `clang64\bin`, so keep it on
+`PATH` when running them.
+
 ## Stability tooling
 
 Beyond the ASan/UBSan test run, the repo carries a stability toolset. These
