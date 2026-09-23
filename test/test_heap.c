@@ -41,6 +41,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "core/platform.h"
 #include "core/pool.h"
 
 /* Restore the shipped policy after a test drives it. */
@@ -634,6 +635,56 @@ static test_result_t test_free_routes_to_owner_list(void) {
     ray_tl_heap = heap_b;
     ray_heap_flush_foreign();
     TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
+
+    ray_heap_destroy();
+    ray_tl_heap = heap_a;
+    PASS();
+}
+
+/* ---- The dispatcher hands a foreign block back to its owner --------------
+ *
+ * Issue #619: a parallel operator's workers allocate per-task buffers and the
+ * main thread frees them after the dispatch, so they land on the owning
+ * worker's foreign list, where they sit until that worker's freelists run
+ * dry — which a warm worker's rarely do.  ray_heap_reclaim_workers, run by
+ * the dispatcher at the end of every parallel region, drains every heap's
+ * list into its freelists.  Model it with two heaps: a block owned by heap_b,
+ * freed from heap_a, must leave heap_b's list when heap_a reclaims — and must
+ * not while the parallel flag is set. */
+
+static test_result_t test_reclaim_workers_drains_owner_list(void) {
+    ray_heap_t* heap_a = ray_tl_heap;
+
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    ray_heap_t* heap_b = ray_tl_heap;
+    TEST_ASSERT_NOT_NULL(heap_b);
+    ray_t* blk = ray_alloc(4096);
+    TEST_ASSERT_NOT_NULL(blk);
+    ray_mem_stats_t before; ray_mem_stats(&before);
+
+    ray_tl_heap = heap_a;
+    ray_free(blk);
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
+
+    /* Inside a parallel region the reclaim is a no-op. */
+    ray_parallel_begin();
+    ray_heap_reclaim_workers();
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
+    atomic_store(&ray_parallel_flag, 0);
+
+    /* Once it is over, another thread's heap drains heap_b's list. */
+    ray_heap_reclaim_workers();
+    TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
+
+    /* The block is on heap_b's freelist: its next allocation of that size
+     * comes back at the same address, with no new pool mapped. */
+    ray_tl_heap = heap_b;
+    ray_t* again = ray_alloc(4096);
+    TEST_ASSERT_EQ_U((uintptr_t)again, (uintptr_t)blk);
+    ray_mem_stats_t after; ray_mem_stats(&after);
+    TEST_ASSERT_EQ_U(after.sys_current, before.sys_current);
+    ray_free(again);
 
     ray_heap_destroy();
     ray_tl_heap = heap_a;
@@ -2961,6 +3012,7 @@ const test_entry_t heap_entries[] = {
     { "heap/gc_serial",                test_heap_gc_serial,              heap_setup, heap_teardown },
     { "heap/gc_parallel",              test_heap_gc_parallel,            heap_setup, heap_teardown },
     { "heap/free_routes_to_owner",     test_free_routes_to_owner_list,   heap_setup, heap_teardown },
+    { "heap/reclaim_workers_drains_owner", test_reclaim_workers_drains_owner_list, heap_setup, heap_teardown },
     { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
     { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },

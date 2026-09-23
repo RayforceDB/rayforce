@@ -398,6 +398,53 @@ static void pool_count_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
 }
 
 /* --------------------------------------------------------------------------
+ * Test: blocks a worker allocated inside a dispatch and the main thread freed
+ * after it are back with their owners by the end of the next dispatch — no
+ * registered heap carries a foreign list across a parallel region (issue
+ * #619: a stream of parallel joins grew the process by a pool per worker
+ * while the freed per-task buffers waited on those lists).
+ * -------------------------------------------------------------------------- */
+
+typedef struct { ray_t* blocks[64]; } pool_alloc_ctx_t;
+
+static void pool_alloc_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    pool_alloc_ctx_t* c = (pool_alloc_ctx_t*)ctx;
+    for (int64_t i = start; i < end && i < 64; i++)
+        c->blocks[i] = ray_alloc(1u << 20);      /* 1 MB from the worker's heap */
+}
+
+static test_result_t test_dispatch_reclaims_worker_blocks(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    ray_err_t err = ray_pool_create(&pool, 3);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    pool_alloc_ctx_t ctx = {0};
+    for (int round = 0; round < 8; round++) {
+        ray_pool_dispatch_n(&pool, pool_alloc_fn, &ctx, 64);
+        for (int i = 0; i < 64; i++) {
+            TEST_ASSERT_NOT_NULL(ctx.blocks[i]);
+            ray_free(ctx.blocks[i]);             /* cross-thread for worker blocks */
+            ctx.blocks[i] = NULL;
+        }
+    }
+    /* The frees above happened after the last dispatch ended; the next one
+     * hands them back. */
+    pool_count_ctx_t cctx = {0};
+    ray_pool_dispatch_n(&pool, pool_count_fn, &cctx, 4);
+    for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+        ray_heap_t* gh = ray_heap_registry[hid];
+        if (!gh) continue;
+        TEST_ASSERT_NULL(atomic_load(&gh->foreign));
+    }
+
+    ray_pool_free(&pool);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: dispatch with total_elems <= 0 returns immediately, no calls fire
  * -------------------------------------------------------------------------- */
 
@@ -1400,6 +1447,7 @@ const test_entry_t pool_entries[] = {
     { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
 #endif
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
+    { "pool/dispatch_reclaims_worker_blocks", test_dispatch_reclaims_worker_blocks, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
     { "pool/parallel_group_sum", test_parallel_group_sum, NULL, NULL },
     { "pool/parallel_min_max", test_parallel_min_max, NULL, NULL },

@@ -109,9 +109,10 @@ static void worker_loop(void* arg) {
                                       memory_order_acq_rel);
         }
 
-        /* No ray_heap_gc() here — removing worker GC between dispatch rounds
-         * ensures main can safely modify worker heaps in ray_parallel_end().
-         * Eager madvise in heap_coalesce already releases pages on free. */
+        /* No ray_heap_gc() here — a worker that neither allocates nor frees
+         * between its last pending-- and sem_wait is what lets the
+         * dispatcher drain worker foreign lists (ray_heap_reclaim_workers)
+         * and the idle decay walk worker heaps once the flag is clear. */
     }
 
     /* Abandon, do not destroy.  Another thread may still hold — and later
@@ -392,6 +393,10 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
      * be between pending-- and sem_wait. */
     atomic_thread_fence(memory_order_seq_cst);
     ray_rc_sync = false;
+
+    /* Hand every worker the blocks freed to it since the last dispatch, so
+     * the next round reuses them instead of cutting fresh pool space. */
+    ray_heap_reclaim_workers();
 }
 
 /* One round of ray_pool_dispatch_n: tasks [first, first+n_tasks), each handed
@@ -466,6 +471,7 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
     ray_rc_sync = false;
+    ray_heap_reclaim_workers();
 }
 
 /* --------------------------------------------------------------------------

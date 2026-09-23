@@ -2794,6 +2794,44 @@ void ray_heap_flush_foreign(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Post-dispatch reclaim (dispatcher side)
+ *
+ * A parallel operator's workers allocate their per-task buffers from their
+ * own heaps and the main thread frees them once the dispatch has completed,
+ * so every such block ends up on the owning worker's foreign list.  The
+ * owner takes that list back only when an allocation finds its freelists
+ * empty at the order it needs — and a warm worker with a partly cut pool
+ * rarely does: it keeps splitting fresh pool space instead, touching new
+ * pages every round while its own freed blocks wait on the list.  Under a
+ * steady stream of such operators the process grows by one full pool per
+ * worker before any block is reused, and nothing short of the idle decay
+ * (which needs the process to sit quiet) drains it earlier.
+ *
+ * So the dispatcher drains every heap's list at the end of each parallel
+ * region.  The conditions are the ones the decay sweep relies on: the flag
+ * is clear, so every worker has done its last pending-- and is claiming
+ * nothing, allocating nothing and freeing nothing until the next dispatch;
+ * a concurrent push onto a foreign list from some other thread is safe
+ * because the drain takes the whole list in one exchange and leaves later
+ * arrivals for the next round.  No pages are released here — the blocks
+ * only go back to freelists, so the next round reuses them without
+ * faulting.  Cost: one relaxed load per registered heap and the coalescing
+ * of whatever was freed cross-thread since the last dispatch, work the
+ * owner would otherwise do on its next dry allocation.
+ * -------------------------------------------------------------------------- */
+
+void ray_heap_reclaim_workers(void) {
+    if (atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) != 0)
+        return;
+    for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+        ray_heap_t* gh = ray_heap_registry[hid];
+        if (!gh) continue;
+        if (!atomic_load_explicit(&gh->foreign, memory_order_relaxed)) continue;
+        heap_drain_foreign(gh);
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Pending-merge queue (lock-free LIFO)
  *
  * Workers that are torn down push their heap onto this queue instead of
