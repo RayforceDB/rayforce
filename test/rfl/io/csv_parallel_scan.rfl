@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Parallel row-offset scan (csv.c build_row_offsets_par) — exactness.
 ;;
 ;; The scan splits the file into chunks and reconciles quote parity across

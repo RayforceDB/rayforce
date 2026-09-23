@@ -33,7 +33,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
-#ifndef __SANITIZE_ADDRESS__
+#if !defined(__SANITIZE_ADDRESS__) && !defined(_WIN32)   /* setrlimit: POSIX only */
 #include <sys/resource.h>
 #endif
 
@@ -3904,7 +3904,7 @@ static test_result_t test_k_shortest_found_path_dup(void) {
 /* --------------------------------------------------------------------------
  * Helper: read VmSize from /proc/self/status; returns 0 on failure.
  * -------------------------------------------------------------------------- */
-#ifndef __SANITIZE_ADDRESS__
+#if !defined(__SANITIZE_ADDRESS__) && !defined(_WIN32)
 #include <stdio.h>
 static size_t get_vmsize_bytes(void) {
     FILE* f = fopen("/proc/self/status", "r");
@@ -4241,7 +4241,7 @@ static test_result_t test_traverse_oom_paths(void) {
     ray_heap_destroy();
     PASS();
 }
-#endif /* __SANITIZE_ADDRESS__ */
+#endif /* !__SANITIZE_ADDRESS__ && !_WIN32 */
 
 /* --------------------------------------------------------------------------
  * Test: exec_expand with SIP bitmap build where rev.n_nodes > fwd.n_nodes.
@@ -5725,7 +5725,7 @@ const test_entry_t traverse_entries[] = {
     { "traverse/k_shortest_large_k",          test_k_shortest_large_k,             NULL, NULL },
     { "traverse/betweenness_with_rev_edges",  test_betweenness_with_rev_edges,     NULL, NULL },
     { "traverse/closeness_sampled_norm",      test_closeness_sampled_norm,         NULL, NULL },
-#ifndef __SANITIZE_ADDRESS__
+#if !defined(__SANITIZE_ADDRESS__) && !defined(_WIN32)
     { "traverse/traverse_oom_paths",          test_traverse_oom_paths,             NULL, NULL },
 #endif
     { "traverse/shortest_path_exceeds_254",   test_shortest_path_exceeds_254,      NULL, NULL },

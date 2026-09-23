@@ -75,7 +75,7 @@ Signature: `(.sys.build)`. Returns a dict with `version` (string) and `build-dat
 
 ## `.sys.info` { #sys-info }
 
-Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64, pid: i64, hostname: str}` on POSIX. On Windows the machine facts fall back to `{cores: 1}` (the sysconf-backed values aren't wired), but `pid` and `hostname` are answered on both platforms.
+Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64, pid: i64, hostname: str}` on every platform (on Windows from `GetSystemInfo` / `GlobalMemoryStatusEx`).
 
 ```lisp
 (.sys.info)

@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Equality comparison on NULLABLE SYM / STR columns — fused path vs unfused.
 ;;
 ;; A SYM null is sym id 0 and a STR null is a zero-length descriptor: both are

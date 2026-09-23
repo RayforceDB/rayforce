@@ -1,0 +1,48 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; cli_flag_values.rfl — a value-taking flag must not swallow the next flag,
+;; and an unknown option must not be mistaken for the script (#600).
+;;
+;; Regression: every value-taking flag consumed argv[++i] blindly, so
+;; `-Q -p 5099` ate `-p` and started a server with NO listener, no error
+;; and no warning — the worst shape for a service, since the unit looks
+;; healthy and every client gets connection refused.  `-c` and `-t` had
+;; the same hole.  A trailing `-Q` fell through to the positional-file
+;; arm and failed with the misleading `cannot open '-Q'`, and an unknown
+;; option was silently swallowed by that same arm.
+(.sys.exec "printf '(println \"script ran\")\n' > /tmp/rfl_cfv.rfl")
+
+;; ---- a flag as another flag's value is rejected, script never runs ----
+;; (.sys.exec returns the raw wait status, so each case folds to 0/1)
+(.sys.exec "./rayforce -Q -p 19961 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_cfv.out && exit 99; grep -q \"\\-Q expects a value, got flag '-p'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+
+;; the same hole in -c and -t
+(.sys.exec "./rayforce -c -p 19962 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_cfv.out && exit 99; grep -q \"\\-c expects a value, got flag '-p'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+(.sys.exec "./rayforce -t -p 19963 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_cfv.out && exit 99; grep -q \"\\-t expects a value, got flag '-p'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+
+;; long form too
+(.sys.exec "./rayforce --querylog --port 19964 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_cfv.out && exit 99; grep -q \"expects a value, got flag '--port'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+
+;; ---- a missing value says so, instead of 'cannot open' ----
+(.sys.exec "./rayforce /tmp/rfl_cfv.rfl -Q </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q \"cannot open\" /tmp/rfl_cfv.out && exit 99; grep -q \"\\-Q expects a value\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+
+;; ---- an unknown option is rejected, not taken as the script ----
+(.sys.exec "./rayforce -x /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_cfv.out && exit 99; grep -q \"unknown option '-x'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+
+;; ---- values that merely START with '-' are still accepted ----
+;; A password or a negative number is a legitimate value; only an exact
+;; match against a known flag token is refused.
+(.sys.exec "./rayforce -u -s3cret -t -1 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; grep -q 'script ran' /tmp/rfl_cfv.out") -- 0
+
+;; ---- the -Q that #600 was reached through still works, and still binds ----
+(.sys.exec "./rayforce -Q 1 -p 19965 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv2.out 2>&1 & p=$!; for i in $(seq 50); do grep -q 'script ran' /tmp/rfl_cfv2.out && break; sleep 0.1; done; bash -c '(echo > /dev/tcp/127.0.0.1/19965) 2>/dev/null'; rc=$?; kill $p 2>/dev/null; [ $rc -eq 0 ]") -- 0
+
+;; the app-args terminator is not a value either
+(.sys.exec "./rayforce -Q -- /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q \"\\-Q expects a value, got flag '--'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
+
+;; ---- tokens after `--` belong to the app and are never validated ----
+(.sys.exec "./rayforce /tmp/rfl_cfv.rfl -- -Q -p </dev/null >/tmp/rfl_cfv.out 2>&1; grep -q 'script ran' /tmp/rfl_cfv.out") -- 0
+
+;; ---- --help still lists -Q, beside its sibling -t ----
+(.sys.exec "./rayforce --help 2>&1 | grep -q -- '-Q, --querylog'") -- 0
+
+(.sys.exec "rm -f /tmp/rfl_cfv.rfl /tmp/rfl_cfv.out /tmp/rfl_cfv2.out; true")

@@ -210,6 +210,40 @@ static inline void dom_unlock(void) {
 
 /* ---- FILE domain construction / destruction ------------------------------- */
 
+/* realpath(3) contract: absolute path of an EXISTING file, else NULL.
+ * Windows has no realpath; _fullpath only normalizes (it succeeds for
+ * missing files too), so existence is checked separately. */
+static char* dom_realpath(const char* path, char resolved[PATH_MAX]) {
+#if defined(RAY_OS_WINDOWS)
+    if (!_fullpath(resolved, path, PATH_MAX)) return NULL;
+    if (GetFileAttributesA(resolved) == INVALID_FILE_ATTRIBUTES) return NULL;
+    return resolved;
+#else
+    return realpath(path, resolved);
+#endif
+}
+
+/* Do two resolved paths name the same file?  On Windows one file is
+ * reachable as C:\db\sym, C:\db/sym or C:\DB\Sym (NTFS is case-insensitive
+ * and _fullpath keeps the caller's separators and case), so compare with
+ * '\\' == '/' and ASCII case folded — a plain strcmp would key one symfile
+ * twice and open two diverging domains for it.  The paths themselves are
+ * left as given: they are also used to create the file. */
+static bool dom_path_eq(const char* a, const char* b) {
+#if defined(RAY_OS_WINDOWS)
+    for (;; a++, b++) {
+        char ca = *a == '\\' ? '/' : *a;
+        char cb = *b == '\\' ? '/' : *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+        if (!ca) return true;
+    }
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
 /* Resolved cache key for `path`.  realpath of the file when it exists;
  * for to-be-created symfiles, realpath of the parent + "/" + basename
  * (the parent must exist).  malloc'd. */
@@ -218,7 +252,7 @@ static char* dom_resolve_path(const char* path) {
      * realpath(NULL)/strdup's libc-malloc'd buffers, so the returned key is
      * uniformly buddy-allocated and the caller releases it with ray_free_raw. */
     char resolved[PATH_MAX];
-    if (realpath(path, resolved)) {
+    if (dom_realpath(path, resolved)) {
         size_t n = strlen(resolved);
         char* out = (char*)ray_sys_alloc(n + 1);
         if (out) memcpy(out, resolved, n + 1);
@@ -238,7 +272,7 @@ static char* dom_resolve_path(const char* path) {
     memcpy(tmp, path, plen + 1);
     char* dir = dirname(tmp);
     char rdir[PATH_MAX];
-    if (!realpath(dir, rdir)) return NULL;
+    if (!dom_realpath(dir, rdir)) return NULL;
     size_t dlen = strlen(rdir);
     char* out = (char*)ray_sys_alloc(dlen + 1 + blen + 1);
     if (!out) return NULL;
@@ -519,7 +553,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
 
     dom_lock();
     for (ray_sym_domain_t* d = g_domains; d; d = d->next) {
-        if (strcmp(d->path, rpath) == 0) {
+        if (dom_path_eq(d->path, rpath)) {
             /* Revalidate: external append-only growth extends in place;
              * any other divergence is loud (NULL). */
             size_t cur_size = exists ? (size_t)st.st_size : 0;
@@ -591,7 +625,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
      * the winner (pointer equality must hold for one resolved path). */
     dom_lock();
     for (ray_sym_domain_t* e = g_domains; e; e = e->next) {
-        if (strcmp(e->path, d->path) == 0) {
+        if (dom_path_eq(e->path, d->path)) {
             e->rc++;
             dom_unlock();
             dom_destroy(d);

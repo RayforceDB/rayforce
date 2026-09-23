@@ -67,7 +67,12 @@ typedef struct stat hist_stat_t;
 #define RAY_BLOCK_FROM_DATA(ptr) ((ray_t*)((char*)(ptr) - sizeof(ray_t)))
 
 /* Suppress -Wunused-result for terminal I/O writes to stdout. */
-#if !defined(RAY_OS_WINDOWS)
+#if defined(RAY_OS_WINDOWS)
+static inline void term_write(const void* buf, size_t len) {
+    int r = _write(1, buf, (unsigned)len);
+    (void)r;
+}
+#else
 static inline void term_write(const void* buf, size_t len) {
     ssize_t r = write(STDOUT_FILENO, buf, len);
     (void)r;
@@ -1512,8 +1517,18 @@ int32_t ray_term_count_unmatched(ray_term_t* term) {
 
 /* ===== Prompt ===== */
 
-/* Green ‣ (U+2023) prompt, matching Rayforce style */
+/* Green ‣ (U+2023) prompt, matching Rayforce style.
+ *
+ * No console font Windows ships has U+2023 — not Consolas, Cascadia Mono,
+ * Lucida Console or Courier New — and the classic console does no font
+ * fallback, so the prompt renders as "?" there.  Windows uses ► (U+25BA),
+ * the nearest filled triangle all four of them do have; it is also three
+ * UTF-8 bytes, so the byte and visual widths below are unchanged. */
+#if defined(RAY_OS_WINDOWS)
+#define PROMPT_STR "\033[32m\xe2\x96\xba\033[0m "
+#else
 #define PROMPT_STR "\033[32m\xe2\x80\xa3\033[0m "
+#endif
 #define PROMPT_LEN 13  /* ESC[32m (5) + ‣ (3) + ESC[0m (4) + space (1) = 13 bytes */
 #define PROMPT_VIS  2  /* visual: ‣ + space */
 #define CONT_PROMPT_STR "\033[90m\xe2\x80\xa6\033[0m "  /* gray … (U+2026) */

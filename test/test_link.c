@@ -918,9 +918,7 @@ static ray_err_t write_link_partition(const char* part_dir,
                                       int64_t custs_sym) {
     char dir[1024];
     snprintf(dir, sizeof(dir), TMP_LINK_PART_DB "/%s/" TMP_LINK_PART_TBL, part_dir);
-    char cmd[1100];
-    snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir);
-    if (system(cmd) != 0) return RAY_ERR_IO;
+    if (ray_test_mkdir_p(dir) != 0) return RAY_ERR_IO;
 
     ray_t* ridcol = ray_vec_from_raw(RAY_I64, (void*)rids, n_rid);
     if (!ridcol || RAY_IS_ERR(ridcol)) return RAY_ERR_OOM;
@@ -954,7 +952,7 @@ static ray_err_t write_link_partition(const char* part_dir,
 static test_result_t test_link_parted_load_propagates(void) {
     int64_t custs_sym = setup_custs_dim();
 
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
 
     int64_t r1[] = { 0, 1, 2 };
     int64_t q1[] = { 10, 20, 30 };
@@ -1020,7 +1018,7 @@ static test_result_t test_link_parted_load_propagates(void) {
     ray_release(ages1);
 
     ray_release(parted);
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     PASS();
 }
 
@@ -1032,7 +1030,7 @@ static test_result_t test_link_attach_rejects_parted_target(void) {
     /* Build a parted table on disk and load via ray_read_parted so we have a
      * real RAY_TABLE-with-RAY_PARTED-cols handle to point at. */
     int64_t custs_sym = setup_custs_dim();
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
 
     int64_t r1[] = { 0, 1, 2 };
     int64_t q1[] = { 10, 20, 30 };
@@ -1065,7 +1063,7 @@ static test_result_t test_link_attach_rejects_parted_target(void) {
 
     ray_release(w);
     ray_release(v);
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     PASS();
 }
 
@@ -1095,7 +1093,7 @@ static test_result_t test_link_deref_rejects_parted_after_rebind(void) {
     ray_release(good);
 
     /* Build a parted table on disk and rebind `custs` to it. */
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     int64_t r1[] = { 0, 1 };
     int64_t q1[] = { 10, 20 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.01", r1, 2, q1, 2, custs_sym), RAY_OK);
@@ -1118,7 +1116,7 @@ static test_result_t test_link_deref_rejects_parted_after_rebind(void) {
 
     ray_release(w);
     ray_release(v);
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     PASS();
 }
 
@@ -1155,7 +1153,7 @@ static test_result_t test_link_dotted_resolve_propagates_parted_error(void) {
     ray_release(good);
 
     /* Rebind custs to a parted table on disk. */
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     int64_t r1[] = { 0, 1 };
     int64_t q1[] = { 10, 20 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.01", r1, 2, q1, 2, custs_sym), RAY_OK);
@@ -1180,7 +1178,7 @@ static test_result_t test_link_dotted_resolve_propagates_parted_error(void) {
 
     ray_release(w);
     ray_release(v);
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     PASS();
 }
 
@@ -1212,7 +1210,7 @@ static test_result_t test_link_vm_eval_propagates_parted_error(void) {
     ray_release(good);
 
     /* Rebind custs to a parted table. */
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     int64_t r1[] = { 0, 1 };
     int64_t q1[] = { 10, 20 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.01", r1, 2, q1, 2, custs_sym), RAY_OK);
@@ -1233,7 +1231,7 @@ static test_result_t test_link_vm_eval_propagates_parted_error(void) {
 
     ray_release(w);
     ray_release(v);
-    (void)!system("rm -rf " TMP_LINK_PART_DB);
+    (void)ray_test_rm_rf(TMP_LINK_PART_DB);
     PASS();
 }
 
