@@ -54,3 +54,39 @@ maps one file per column, so it measures file-open cost, not the engine:
 `CreateFileA` + `CreateFileMapping` + `MapViewOfFile` per column, plus
 whatever on-access scanning is installed. The absolute cost is small and it is
 paid per table open, but a wide table opened in a loop would feel it.
+
+## The benches recent PRs shipped
+
+Same binaries, built from the release objects on each side.
+
+**`bench/join_nullfree` (#598, null-free key fast path).** The optimisation
+engages on Windows — the `nullfree` counter advances on the null-free cases
+and stays put on the nullable one, as on Linux.
+
+| case | Windows median (baseline → fast) | Linux median |
+|------|---------------------------------|--------------|
+| SYM2 | 355.3 → 336.0 ms (-5.4%) | 413.6 → 408.4 ms (-1.3%) |
+| SYM2-NULL (must not fire) | 348.2 → 349.8 ms (+0.5%) | 407.1 → 412.9 ms (+1.4%) |
+| I64 | 102.7 → 89.2 ms (-13.2%) | 100.9 → 96.3 ms (-4.6%) |
+
+**`bench/join_dup` (duplicate-key fallback).** The pathological case is fixed
+on both: CATASTROPHIC-INNER post-fix ~170 ms on Windows and ~230 ms on Linux,
+against ~2.6 s pre-fix (Windows) — the same order-of-magnitude win.
+
+**`bench/join_buildside` (build-side swap).** The swap fires on Windows and
+pays off by the same factor: MANY-TO-MANY 207 ms swapped vs 494 ms legacy
+(2.4x); Linux 188 vs 431 (2.3x). HEAVY-DUP-WIN: 1.7 s vs 6.2 s (Windows),
+1.8 s vs 8.2 s (Linux).
+
+**`bench/idx_route` Q3** (1000 lookups/rep): indexed 0.014 ms/batch on
+Windows, 0.009 on Linux; the unindexed control is 0.004 on both.
+
+Not runnable as-is:
+
+- `bench/group_pushdown` and `bench/agg_v2` no longer compile **on either
+  platform** — they use `ray_op.inputs` and `ray_group2/3`, which the engine
+  no longer has. Pre-existing, unrelated to the port.
+- `bench/groupby_shapes/*.py` needs python3, which a stock Windows lacks; the
+  `.rfl` cases in that directory run directly under `rayforce` on both.
+- `scripts/soak.sh` and `scripts/fuzz-seed-*.sh` are bash and stay POSIX-only
+  (the fuzzing runtime is Linux-only anyway, see the Makefile).
