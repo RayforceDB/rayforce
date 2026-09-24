@@ -41,6 +41,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "core/platform.h"
 #include "core/pool.h"
 
 /* Restore the shipped policy after a test drives it. */
@@ -635,6 +636,67 @@ static test_result_t test_free_routes_to_owner_list(void) {
     ray_heap_flush_foreign();
     TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
 
+    ray_heap_destroy();
+    ray_tl_heap = heap_a;
+    PASS();
+}
+
+/* ---- The dispatcher hands a foreign block back to its owner --------------
+ *
+ * Issue #619: a parallel operator's workers allocate per-task buffers and the
+ * main thread frees them after the dispatch, so they land on the owning
+ * worker's foreign list, where they sit until that worker's freelists run
+ * dry — which a warm worker's rarely do.  ray_heap_reclaim_worker, run by
+ * the dispatcher on each worker's heap at the end of every parallel region,
+ * drains that list into the worker's freelists.  Model it with two heaps: a
+ * block owned by heap_b and freed from heap_a stays parked (still on heap_b's
+ * books) until heap_a reclaims heap_b — and is left alone while the parallel
+ * flag is set. */
+
+static test_result_t test_reclaim_worker_drains_owner_list(void) {
+    ray_heap_t* heap_a = ray_tl_heap;
+
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    ray_heap_t* heap_b = ray_tl_heap;
+    TEST_ASSERT_NOT_NULL(heap_b);
+    /* heap_b may be a heap abandoned by an earlier test's worker, with blocks
+     * freed to it since; take them back first so the books below move only
+     * for the block this test frees. */
+    ray_heap_flush_foreign();
+#if RAY_MEM_STATS
+    size_t booked0 = heap_b->stats.bytes_allocated;
+#endif
+    ray_t* blk = ray_alloc(256u << 10);          /* above the slab orders */
+    TEST_ASSERT_NOT_NULL(blk);
+#if RAY_MEM_STATS
+    size_t booked1 = heap_b->stats.bytes_allocated;
+    TEST_ASSERT(booked1 > booked0, "allocation charged to heap_b");
+#endif
+
+    ray_tl_heap = heap_a;
+    ray_free(blk);
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
+#if RAY_MEM_STATS
+    /* Parked, not yet returned: heap_b still carries the bytes. */
+    TEST_ASSERT_EQ_U(heap_b->stats.bytes_allocated, booked1);
+#endif
+
+    /* Inside a parallel region the reclaim is a no-op. */
+    ray_parallel_begin();
+    ray_heap_reclaim_worker(heap_b);
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
+    atomic_store(&ray_parallel_flag, 0);
+
+    /* Once it is over, another thread reclaims heap_b: the list is empty and
+     * the block is back on heap_b's freelists, off its books. */
+    ray_heap_reclaim_worker(heap_b);
+    TEST_ASSERT_NULL(atomic_load(&heap_b->foreign));
+#if RAY_MEM_STATS
+    TEST_ASSERT_EQ_U(heap_b->stats.bytes_allocated, booked0);
+#endif
+
+    ray_tl_heap = heap_b;
     ray_heap_destroy();
     ray_tl_heap = heap_a;
     PASS();
@@ -2961,6 +3023,7 @@ const test_entry_t heap_entries[] = {
     { "heap/gc_serial",                test_heap_gc_serial,              heap_setup, heap_teardown },
     { "heap/gc_parallel",              test_heap_gc_parallel,            heap_setup, heap_teardown },
     { "heap/free_routes_to_owner",     test_free_routes_to_owner_list,   heap_setup, heap_teardown },
+    { "heap/reclaim_worker_drains_owner", test_reclaim_worker_drains_owner_list, heap_setup, heap_teardown },
     { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
     { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
