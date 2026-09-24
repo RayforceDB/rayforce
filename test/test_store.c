@@ -3061,6 +3061,25 @@ static test_result_t test_serde_de_raw_default_and_errors(void) {
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r); ray_release(w);
     }
+    /* A top-level frame must contain exactly one serialized object.  Extra
+     * payload bytes are not valid framing and must not be silently ignored. */
+    {
+        ray_t* w = ray_ser(ray_i64(42));
+        TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        int64_t total = w->len;
+        ray_t* trailing = ray_vec_new(RAY_U8, total + 1);
+        TEST_ASSERT_NOT_NULL(trailing); TEST_ASSERT_FALSE(RAY_IS_ERR(trailing));
+        trailing->len = total + 1;
+        memcpy(ray_data(trailing), ray_data(w), (size_t)total);
+        ((uint8_t*)ray_data(trailing))[total] = 0xa5;
+        ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(trailing);
+        hdr->size += 1;
+
+        ray_t* r = ray_de(trailing);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_MEM_EQ(7, r->sdata, "domain");
+        ray_release(r); ray_release(trailing); ray_release(w);
+    }
     /* SYM vector where an element has no null terminator within bounds:
      * craft a payload: type=RAY_SYM(12), attrs=0, len=1, then 4 non-null
      * bytes and nothing else → safe_strlen returns 4 = *len, domain error */
