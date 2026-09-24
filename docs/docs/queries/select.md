@@ -66,20 +66,25 @@ Only projections see aliases. `where:` and `by:` are evaluated against the
 source table, so `where: (> notional 100000)` raises `schema` — filter on
 the expression itself, or on a nested select.
 
-In a grouped select a later output may build on an earlier aggregate: the
-alias stands for the aggregate's expression, so `nn` below is computed from
-the per-group sum.
+In a grouped select a later output may build on an earlier aggregate. An
+alias that is one value per group — an aggregate, or an output built on one
+— is read from the group result, so `nn` below is computed from the
+per-group sum, and a chain of such outputs costs one column each. An alias
+of a per-row expression (`vals: price`) is substituted where it is named,
+so `m: (max vals)` is `(max price)`.
 
 ```lisp
 (select {from: t by: sym notional: (sum (* price volume)) nn: (+ notional 1)})
 ```
 
-Two rules follow from an alias being one value per group. Inside an
+Three rules follow from an alias being one value per group. Inside an
 aggregate's argument a name that is a source column is always the source
 column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
-sum. And an aggregate cannot be aggregated again, through an alias or
-written out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both
-raise `domain`.
+sum. An aggregate cannot be aggregated again, through an alias or written
+out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both raise
+`domain`. And an output may not put a source column beside a per-group
+value outside an aggregate: `f: (* price n)` with `n: (count price)` raises
+`domain`; write `(* (sum price) n)` or whichever aggregate is meant.
 
 A literal symbol inside a select resolves to an earlier alias or a source
 column of that name, in that order; one naming neither stays a constant

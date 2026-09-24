@@ -3824,11 +3824,10 @@ ray_t* ray_eval(ray_t* obj) {
          * the rule fires only while a query is active (ray_active_query_table
          * is NULL otherwise).  A literal naming no column returns itself. */
         if (obj->type == -RAY_SYM) {
-            ray_t* qt = ray_active_query_table();
-            if (qt && qt->type == RAY_TABLE) {
-                ray_t* col = ray_table_get_col(qt, obj->i64);
-                if (col) { ray_retain(col); ret = col; goto out; }
-            }
+            /* The column — or, during a per-row evaluation, its cell in the
+             * current row (ray_active_query_literal). */
+            ray_t* v = ray_active_query_literal(obj->i64);
+            if (v) { ret = v; goto out; }
         }
         ray_retain(obj);
         ret = obj; goto out;

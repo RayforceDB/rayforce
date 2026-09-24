@@ -5,10 +5,12 @@
 ;; binding is made after the expression, so an alias that shadows a source
 ;; column still reads the source in its own definition and the new value in
 ;; every later one; where:, by: and the sort keys are compiled earlier and do
-;; not see aliases.  In a grouped select the reference is resolved at the
-;; expression level (the earlier alias's expression is substituted), so an
-;; output can build on an aggregate alias.  Arithmetic on a symbol inside a
-;; select raises the type error it raises outside — it used to compute on the
+;; not see aliases.  In a grouped select an alias of a per-row expression
+;; is substituted where it is named; an alias that is one value per group
+;; (an aggregate, or built on one) is read by reference from the group
+;; result, so a chain of such outputs costs one column each, not a copy of
+;; every expression before it.  Arithmetic on a symbol inside a select
+;; raises the type error it raises outside — it used to compute on the
 ;; symbol's interned id.
 ;;
 ;; Lines marked "guard" passed before the change and pin behaviour the change
@@ -47,8 +49,10 @@
 (at (select {from: t n: (* price 2) f: ((fn [n] (+ n 100)) 1)}) 'f) -- [101 101 101]
 
 ;; a projection beside a whole-column verb (evaluated outside the compiled
-;; path) still sees the earlier aliases, shadowing included
+;; path) still sees the earlier aliases, shadowing included, as a literal too
 (at (select {from: t a: (* price 2) r: (reverse volume) b: (+ a 1)}) 'b) -- [301 561 841]
+(at (select {from: t a: (* price 2) r: (reverse volume) b: (+ 'a 1)}) 'b) -- [301 561 841]
+(at (select {from: t r: (reverse volume) b: (+ 'price 1)}) 'b) -- [151 281 421]
 (at (select {from: t price: (* price 2) r: (reverse volume) b: (+ price 1)}) 'b) -- [301 561 841]
 (at (select {from: t a: (* price 2) d: (distinct sym) b: (+ a 1)}) 'b) -- [301 561 841]
 
@@ -68,6 +72,30 @@
 ;; a condition over an aggregate alias is decided per group
 (at (select {from: g by: sym n: (count price) f: (if (> n 1) 1 0)}) 'f) -- [1 0 0]
 (cols (select {from: g by: sym n: (count price) f: (if (> n 1) 1 0)})) -- [sym n f]
+;; a chain where every output names the two before it: by reference, so the
+;; expression does not double at each step (a copy of it crashed the process)
+(at (select {from: g by: sym a0: (sum price) a1: (sum volume) a2: (+ a1 a0) a3: (+ a2 a1) a4: (+ a3 a2) a5: (+ a4 a3) a6: (+ a5 a4) a7: (+ a6 a5) a8: (+ a7 a6) a9: (+ a8 a7) a10: (+ a9 a8) a11: (+ a10 a9) a12: (+ a11 a10) a13: (+ a12 a11) a14: (+ a13 a12) a15: (+ a14 a13) a16: (+ a15 a14) a17: (+ a16 a15) a18: (+ a17 a16) a19: (+ a18 a17) a20: (+ a19 a18) a21: (+ a20 a19)}) 'a21) -- [7650000 6272600 12692700]
+;; an output may combine an aggregate with an alias; outputs keep the
+;; dict's order around a derived one; sort keys and take: may name one
+(at (select {from: g by: sym n: (count price) f: (+ (sum volume) n)}) 'f) -- [602 401 901]
+(cols (select {from: g by: sym n: (count price) f: (+ n 1) v: (sum volume)})) -- [sym n f v]
+(at (select {from: g by: sym n: (count price) f: (+ n 1) desc: f take: 2}) 'sym) -- [AAPL GOOG]
+;; a whole-column verb over an aggregate alias: one value per group still
+(at (select {from: g by: sym n: (count price) f: (deltas n)}) 'f) -- [0Nl -1 0]
+(at (select {from: g by: sym f: (deltas (sum price))}) 'f) -- [0Nl 120 140]
+;; an inline lambda sees the alias in a grouped select as in an ungrouped one
+(at (select {from: g by: sym n: (count price) f: ((fn [x] (+ x n)) 1)}) 'f) -- [3 2 2]
+;; a per-row column beside a per-group value has no single shape — named
+;; directly or carried in by an alias of a per-row expression
+(select {from: g by: sym n: (count price) f: ((fn [x] (* x n)) price)}) !- domain
+(select {from: g by: sym p2: (* price 2) n: (count price) f: (+ n p2)}) !- domain
+;; aggregates inside a derived output are computed by the engine: any
+;; number of them, of any shape, and inside a lambda body too
+(at (select {from: g by: sym n: (count price) f: (+ n (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (count (distinct price))))))))))}) 'f) -- [18 9 9]
+(at (select {from: g by: sym n: (count price) f: ((fn [x] (+ x (sum price))) n)}) 'f) -- [162 281 421]
+;; a nested select inside a per-row output keeps whole-column literals whole
+(set t2 (table [c d] (list [1 2 3 4 5] [10 20 30 40 50])))
+(first (at (select {from: t r: (reverse volume) b: (sum (at (select {from: t2 rr: (reverse 'd)}) 'rr))}) 'b)) -- 150
 ;; the same condition written out: it used to pick one branch for every
 ;; group; with constant branches the output went missing and the hidden
 ;; count appeared under a made-up name
@@ -86,6 +114,13 @@
 (at (select {from: g by: sym price: (sum price) mx: (max price) av: (avg price)}) 'av) -- [80.0 280.0 420.0]
 ;; an alias that shadows nothing resolves inside an aggregate too
 (at (select {from: g by: sym vals: price m: (max vals)}) 'm) -- [150 280 420]
+;; a count over an expression (through an alias or written out) counts rows;
+;; the written-out form used to crash the engine
+(at (select {from: g by: sym p2: (* price 2) n: (count p2)}) 'n) -- [2 1 1]
+(at (select {from: g by: sym n: (count (* price 2)) s: (sum price)}) 'n) -- [2 1 1]
+;; a group key is one value per group: it may stand beside an alias
+(at (select {from: g by: sym n: (count price) f: (if (== sym 'AAPL) n 0)}) 'f) -- [2 0 0]
+(at (select {from: g by: [sym volume] n: (count price) f: (+ n volume)}) 'f) -- [501 401 901 101]
 ;; an aggregate alias has no rows left to aggregate — nor has the same
 ;; aggregate written out, which used to fold the whole table into every group
 (select {from: g by: sym s: (sum price) mx: (max s)}) !- domain
@@ -106,6 +141,10 @@
 (select {from: t nn: (* 'sym 2)}) !- type
 (select {from: g by: sym s: (sum (+ sym 1))}) !- type
 (update {from: t x: (+ sym 1)}) !- type
+;; guard: inside a branch of `if` the arithmetic compiles as before — the
+;; branch is evaluated element-wise and only read where it is selected
+(at (select {from: t s: (if (> price 0) price (+ sym 1))}) 's) -- [150 280 420]
+(at (select {from: g by: sym s: (sum (if (> price 0) price (+ sym 1)))}) 's) -- [160 280 420]
 (select {from: t where: (< (+ sym 1) 5)}) !- type
 ;; guard
 (select {from: g by: sym s: (sum price) x: (+ sym 1)}) !- type

@@ -565,6 +565,13 @@ typedef struct ray_graph {
      * error; one without reports it instead of a generic compile
      * failure.  Owned; released by ray_graph_free. */
     ray_t*          compile_err;
+
+    /* > 0 while compile_expr_dag is inside a branch of `if`/`cond`.  The
+     * DAG evaluates both arms element-wise and the condition picks one, so
+     * an arm's value is observable only where it is selected; the checks
+     * that reject an expression outright (arithmetic on a symbol) stay
+     * quiet inside an arm and let the arm compile as it always did. */
+    int             if_arm_depth;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */
@@ -936,6 +943,7 @@ ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
  * so a literal never captures a lambda/let local and resolution fires only
  * inside a query.  Returns NULL when no query is active. */
 ray_t* ray_active_query_table(void);
+ray_t* ray_active_query_literal(int64_t sym);
 
 #ifdef __cplusplus
 }
