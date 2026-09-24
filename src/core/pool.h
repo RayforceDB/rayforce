@@ -52,6 +52,16 @@ struct ray_pool {
     uint32_t           n_workers;     /* number of background threads (nproc - 1) */
     _Atomic(uint32_t)  shutdown;
 
+    /* Heap of each worker thread [n_workers] (a ray_heap_t*), published by
+     * the worker once ray_heap_init has run and cleared before it exits.
+     * The dispatcher reads them at the end of every parallel region to hand
+     * each worker the blocks other threads freed to it (ray_heap_reclaim_
+     * worker).  Only these heaps: a worker parked on the semaphore is the
+     * one thread known to touch nothing of its own until the next dispatch,
+     * which is what makes draining its list from here sound.  NULL until
+     * the worker is up. */
+    _Atomic(void*)*     worker_heaps;
+
     /* SPMC task ring (single producer = main, multi consumer = workers + main).
      *
      * Claiming uses two MONOTONIC 64-bit cursors that are never reset, which

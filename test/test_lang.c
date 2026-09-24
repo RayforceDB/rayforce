@@ -8703,6 +8703,58 @@ static test_result_t test_builtin_group_guid_rfl(void) {
  * the expression over the vocabulary bytes a chunk at a time.  With the
  * chunk shrunk to 100 values, a 200-value vocabulary crosses chunk
  * boundaries; the groups and aggregates must equal the in-memory answer. */
+/* ---- Test: a query releases the table it was given -------------------
+ * Every node the executor evaluates returns an owned reference, the
+ * constant table node a query is rooted on included.  The window, sort
+ * and limit cases used to skip that release when the input equalled the
+ * graph's table, so each such query left one reference behind: the
+ * table's refcount climbed by one per call and, for a table built for
+ * the call, the whole table stayed allocated.  Pin the refcount: after
+ * twenty calls of each shape it must be exactly what it was before. */
+static test_result_t test_select_releases_input_table(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set __rl_i (til 786)) "
+        "    (set __rl_syms (as 'SYMBOL (map (fn [i] (format \"inst%\" i)) (til 700)))) "
+        "    (set __rl_T (table [instrument rid v] (list (take __rl_syms 786) __rl_i (% (* 7 __rl_i) 101)))) 0)");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    ray_t* T = ray_eval_str("__rl_T");           /* one more ref: ours */
+    TEST_ASSERT_NOT_NULL(T); TEST_ASSERT_FALSE(RAY_IS_ERR(T));
+    TEST_ASSERT_EQ_I(T->type, RAY_TABLE);
+    uint32_t rc0 = ray_atomic_load(&T->rc);
+    static const char* const shapes[] = {
+        "(window {from: __rl_T part: [instrument] order: [rid] frame: 2 funcs: {n: (count v)}})",
+        "(window {from: __rl_T funcs: {n: (count v)}})",
+        "(window {from: __rl_T part: [instrument] order: [rid] frame: 'running funcs: {s: (sum v)}})",
+        "(select {from: __rl_T asc: rid})",
+        "(select {from: __rl_T desc: v take: 5})",
+        "(select {from: __rl_T where: (> rid 3) take: 5})",
+        "(select {from: __rl_T where: (> rid 3) asc: v})",
+        "(select {from: __rl_T by: instrument s: (sum v) asc: s})",
+        "(select {from: __rl_T by: instrument s: (sum v) desc: s take: 3})",
+        "(select {from: __rl_T take: 5})",
+        "(select {from: __rl_T where: (> rid 3)})",
+    };
+    for (size_t k = 0; k < sizeof(shapes) / sizeof(shapes[0]); k++) {
+        for (int i = 0; i < 20; i++) {
+            ray_t* r = ray_eval_str(shapes[k]);
+            TEST_ASSERT_NOT_NULL(r);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+            ray_release(r);
+        }
+        if (ray_atomic_load(&T->rc) != rc0)
+            FAIL(shapes[k]);
+    }
+    /* the table is still whole after all of that */
+    ray_t* n = ray_eval_str("(count __rl_T)");
+    TEST_ASSERT_NOT_NULL(n); TEST_ASSERT_FALSE(RAY_IS_ERR(n));
+    TEST_ASSERT_EQ_I(n->i64, 786);
+    ray_release(n);
+    ray_release(T);
+    ray_release(ray_eval_str("(set __rl_T 0) (set __rl_i 0) (set __rl_syms 0)"));
+    PASS();
+}
+
 static test_result_t test_select_derived_key_file_chunks(void) {
     ray_t* r = ray_eval_str(
         "(do (set __dk_i (til 20000)) "
@@ -9600,6 +9652,7 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/group_guid_rfl",      test_builtin_group_guid_rfl,      lang_setup, lang_teardown },
     { "lang/builtin/group_empty_list",    test_builtin_group_empty_and_list, lang_setup, lang_teardown },
     { "lang/select/derived_key_file_chunks", test_select_derived_key_file_chunks, lang_setup, lang_teardown },
+    { "lang/select/releases_input_table",  test_select_releases_input_table,  lang_setup, lang_teardown },
     { "lang/temporal/extract_builtins_fn",      test_temporal_extract_builtins_fn,      lang_setup, lang_teardown },
     { "lang/temporal/extract_time_atom",        test_temporal_extract_time_atom,        lang_setup, lang_teardown },
     { "lang/temporal/extract_time_vector",      test_temporal_extract_time_vector,      lang_setup, lang_teardown },

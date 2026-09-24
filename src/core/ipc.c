@@ -39,6 +39,7 @@
 
 #ifdef RAY_OS_WINDOWS
   #define WIN32_LEAN_AND_MEAN
+  #include <io.h>      /* dup, dup2, close */
   #include <winsock2.h>
   #include <ws2tcpip.h>
 #else
@@ -719,13 +720,31 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
  * to fail the whole request because /tmp is full.  The captured
  * string is then empty, and the response shape is still the 2-elem
  * list — clients can rely on that invariant. */
+#ifdef RAY_OS_WINDOWS
+/* MSVCRT's tmpfile() creates its file in the drive root (admin-only on a
+ * stock system); use the user's temp directory, deleted on close ("D").
+ * With no TMP/TEMP/USERPROFILE in the environment GetTempPath falls back
+ * to the (unwritable) Windows directory, so retry in the working dir. */
+static FILE* ipc_tmpfile(void)
+{
+    char dir[MAX_PATH + 1], path[MAX_PATH + 1];
+    DWORD n = GetTempPathA(sizeof(dir), dir);
+    if (n == 0 || n > sizeof(dir) || !GetTempFileNameA(dir, "ray", 0, path)) {
+        if (!GetTempFileNameA(".", "ray", 0, path)) return NULL;
+    }
+    return fopen(path, "w+bD");
+}
+#else
+#define ipc_tmpfile() tmpfile()
+#endif
+
 static ray_t* eval_payload(uint8_t* payload, size_t payload_len,
                            ray_ipc_header_t* hdr)
 {
     if (!(hdr->flags & RAY_IPC_FLAG_VERBOSE))
         return eval_payload_core(payload, payload_len, hdr);
 
-    FILE* cap = tmpfile();
+    FILE* cap = ipc_tmpfile();
     int saved_out = -1, saved_err = -1;
     bool capturing = false;
 
@@ -831,9 +850,13 @@ static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
 #ifdef RAY_OS_WINDOWS
     int n = send((ray_sock_t)fd, (const char*)buf, (int)len, 0);
     if (n < 0) {
+        /* Always overwrite errno: callers treat EAGAIN as "queue and retry",
+         * so a stale EAGAIN left over from an earlier call would turn a dead
+         * socket into a silently parked frame. */
         int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) errno = EAGAIN;
         else if (e == WSAEINTR) errno = EINTR;
+        else errno = EIO;
     }
     return n;
 #else
@@ -855,6 +878,7 @@ static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
  * ray_request_interrupt(). */
 static volatile sig_atomic_t g_ipc_active_fd = -1;
 
+#ifndef RAY_OS_WINDOWS   /* no SIGURG on Windows: OOB cancel is POSIX-only */
 static void ipc_sigurg_handler(int sig)
 {
     (void)sig;
@@ -867,6 +891,7 @@ static void ipc_sigurg_handler(int sig)
     if (ray_sock_take_oob((ray_sock_t)fd))
         ray_request_interrupt();
 }
+#endif
 
 static void ipc_install_oob_cancel(void)
 {

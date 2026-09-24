@@ -58,7 +58,12 @@ static void aof_rm_rf(const char* dir) {
 }
 
 static void aof_setup(void) {
-    snprintf(g_aof_dir, sizeof g_aof_dir, "/tmp/ray_test_aof_%d", (int)getpid());
+    /* A fresh dir per test: the crash test deliberately leaks an open
+     * writer, and on Windows an open file cannot be deleted, so a shared
+     * dir would hand its stale segment to every later test. */
+    static int seq = 0;
+    snprintf(g_aof_dir, sizeof g_aof_dir, "/tmp/ray_test_aof_%d_%d",
+             (int)getpid(), seq++);
     aof_rm_rf(g_aof_dir);
 }
 

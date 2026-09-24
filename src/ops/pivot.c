@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include <inttypes.h>
 #include "ops/internal.h"
 #include "ops/hash.h"
 #include "ops/idxop.h"
@@ -1910,9 +1911,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 len = snprintf(buf, sizeof(buf), "%s", pval ? "true" : "false");
             } else if (pt == RAY_I64 || pt == RAY_I32 || pt == RAY_I16 ||
                        pt == RAY_DATE || pt == RAY_TIME || pt == RAY_TIMESTAMP) {
-                len = snprintf(buf, sizeof(buf), "%ld", (long)pval);
+                len = snprintf(buf, sizeof(buf), "%" PRId64, pval);
             } else {
-                len = snprintf(buf, sizeof(buf), "col%ld", (long)pval);
+                len = snprintf(buf, sizeof(buf), "col%" PRId64, pval);
             }
             col_sym = ray_sym_intern(buf, (size_t)len);
         }

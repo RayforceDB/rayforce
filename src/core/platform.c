@@ -469,6 +469,7 @@ void ray_sem_signal(ray_sem_t* s) {
   #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <io.h>      /* _get_osfhandle */
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -518,13 +519,34 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
 
 void ray_vm_unmap_file(void* ptr, size_t size) {
     if (!ptr) return;
-    UnmapViewOfFile(ptr);
+    /* munmap releases exactly [ptr, ptr+size) and is a no-op (EINVAL) for an
+     * unaligned ptr — the heap relies on that when it frees a block living
+     * inside a column's mapping (a passenger index).  UnmapViewOfFile instead
+     * drops the WHOLE view containing ptr, which would pull the column out
+     * from under its live references.  So only unmap at the view's own base;
+     * an interior block goes away with the view.  The byte accounting still
+     * follows the call, exactly as on POSIX. */
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(ptr, &mbi, sizeof(mbi)) && mbi.AllocationBase == ptr)
+        UnmapViewOfFile(ptr);
     ray_sys_track_file_sub((int64_t)size);
 }
 
-/* Windows never reaches the fd/mmap CSV path (#ifndef RAY_OS_WINDOWS), so this
- * is an unused stub kept only for API completeness. */
-void* ray_vm_map_fd_ro(int fd, size_t size) { (void)fd; (void)size; return NULL; }
+/* Read-only view of an open CRT descriptor (the CSV reader maps the file this
+ * way, then closes the fd).  The view keeps the file alive on its own, so both
+ * the mapping handle and the caller's fd may be closed afterwards. */
+void* ray_vm_map_fd_ro(int fd, size_t size) {
+    if (size == 0) return NULL;
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) return NULL;
+    void* p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, size);
+    CloseHandle(hMap);
+    if (!p) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
 
 void ray_vm_advise_seq(void* ptr, size_t size) {
     /* PrefetchVirtualMemory is Win8.1+. Best-effort; ignore failure. */
@@ -546,16 +568,25 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
 }
 
 void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
-    /* Over-allocate, find aligned offset. Can't trim on Windows, so the
-     * pool header's vm_base field stores the original base for VirtualFree. */
-    void* mem = VirtualAlloc(NULL, size + alignment,
-                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!mem) return NULL;
-    uintptr_t aligned = ((uintptr_t)mem + alignment - 1) & ~(alignment - 1);
-    /* Count the kept `size` to balance ray_vm_free(ptr, size); the alignment
-     * slack Windows cannot trim is left uncounted (parity with POSIX). */
-    ray_sys_track_add((int64_t)size);
-    return (void*)aligned;
+    /* VirtualFree(MEM_RELEASE) only accepts the exact base VirtualAlloc
+     * returned, and a reservation cannot be trimmed.  So find an aligned
+     * hole by reserving size+alignment, release it, and allocate exactly
+     * `size` at the aligned address inside it.  Another thread may take the
+     * hole in between; retry a few times.  The result is its own allocation
+     * base, so ray_vm_free(ptr, size) releases it like any other block. */
+    for (int attempt = 0; attempt < 16; attempt++) {
+        void* probe = VirtualAlloc(NULL, size + alignment, MEM_RESERVE, PAGE_NOACCESS);
+        if (!probe) return NULL;
+        uintptr_t aligned = ((uintptr_t)probe + alignment - 1) & ~(alignment - 1);
+        VirtualFree(probe, 0, MEM_RELEASE);
+        void* p = VirtualAlloc((void*)aligned, size,
+                               MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (p) {
+            ray_sys_track_add((int64_t)size);
+            return p;
+        }
+    }
+    return NULL;
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }

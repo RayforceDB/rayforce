@@ -11386,7 +11386,9 @@ by_dict_done:
                 /* Type-aware key element reader.  Normalizes any
                  * comparable scalar key into an int64_t so linear
                  * scans can use equality.  For floats we bitcast so
-                 * NaN and -0/+0 match the DAG's hash-equality. */
+                 * NaN and -0/+0 match the DAG's hash-equality.
+                 * <winreg.h> (via <windows.h>) owns the name on Windows. */
+                #undef KEY_READ
                 #define KEY_READ(dst, vec, base_type, idx) do {                \
                     const void* _d = ray_data(vec);                            \
                     switch (base_type) {                                       \

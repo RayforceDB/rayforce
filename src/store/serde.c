@@ -1250,7 +1250,13 @@ ray_t* ray_de(ray_t* bytes) {
         return ray_error("domain", "deserialize: ipc header size %lld + header != buffer length %lld", (long long)hdr->size, (long long)total);
 
     int64_t len = hdr->size;
-    return ray_de_raw(buf + sizeof(ray_ipc_header_t), &len);
+    ray_t* result = ray_de_raw(buf + sizeof(ray_ipc_header_t), &len);
+    if (!result || RAY_IS_ERR(result)) return result;
+    if (len != 0) {
+        ray_release(result);
+        return ray_error("domain", "deserialize: %lld trailing payload bytes", (long long)len);
+    }
+    return result;
 }
 
 /* --------------------------------------------------------------------------

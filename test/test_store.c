@@ -326,7 +326,7 @@ static test_result_t test_col_mmap_nofile(void) {
 
 static test_result_t test_splay_open_roundtrip(void) {
     /* Clean up any leftover splay dir */
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
 
     /* Build a 3-column table: I64, F64, I32 */
     ray_t* tbl = ray_table_new(4);
@@ -398,14 +398,14 @@ static test_result_t test_splay_open_roundtrip(void) {
     ray_release(tbl);
 
     /* Cleanup */
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     PASS();
 }
 
 /* ---- test_splay_str_column_roundtrip ----------------------------------- */
 
 static test_result_t test_splay_str_column_roundtrip(void) {
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
 
     ray_t* tbl = ray_table_new(2);
     TEST_ASSERT_NOT_NULL(tbl);
@@ -471,7 +471,7 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     ray_release(names);
     ray_release(tbl);
 
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     PASS();
 }
 
@@ -485,7 +485,7 @@ static test_result_t test_splay_str_column_roundtrip(void) {
  * ---------------------------------------------------------------------- */
 
 static test_result_t test_splay_short_strv_roundtrip(void) {
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
 
     int64_t id_short = ray_sym_intern("short", 5);
     int64_t id_empty = ray_sym_intern("empty", 5);
@@ -547,13 +547,13 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     ray_release(tbl);
     ray_release(tbl2);
 
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     PASS();
 }
 
 /* ---- test_splay_dict_column_roundtrip --------------------------------- */
 static test_result_t test_splay_dict_column_roundtrip(void) {
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
 
     int64_t ids_raw[] = {1, 2};
     ray_t* ids = ray_vec_from_raw(RAY_I64, ids_raw, 2);
@@ -608,13 +608,13 @@ static test_result_t test_splay_dict_column_roundtrip(void) {
     ray_release(tbl);
     ray_release(ids);
     ray_release(sched);
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     PASS();
 }
 
 /* ---- test_splay_empty_list_column_roundtrip --------------------------- */
 static test_result_t test_splay_empty_list_column_roundtrip(void) {
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
 
     ray_t* ids = ray_vec_new(RAY_I64, 0);
     ray_t* who = ray_vec_new(RAY_SYM, 0);
@@ -657,14 +657,14 @@ static test_result_t test_splay_empty_list_column_roundtrip(void) {
     ray_release(ids);
     ray_release(who);
     ray_release(sched);
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     PASS();
 }
 
 /* A deterministic unsupported column must be rejected before an earlier
  * column can replace the committed generation. */
 static test_result_t test_splay_save_preflight_preserves_generation(void) {
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     int64_t k_id = ray_sym_intern("k", 1);
     int64_t v_id = ray_sym_intern("v", 1);
 
@@ -705,7 +705,7 @@ static test_result_t test_splay_save_preflight_preserves_generation(void) {
     ray_release(good);
     ray_release(old_v);
     ray_release(old_k);
-    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
     PASS();
 }
 
@@ -838,9 +838,9 @@ static test_result_t test_parted_release(void) {
 
 static test_result_t test_part_open(void) {
     /* Setup: create a 2-partition db with 2 columns each */
-    (void)!system("rm -rf " TMP_PART_DB);
-    (void)!system("mkdir -p " TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME);
-    (void)!system("mkdir -p " TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME);
+    (void)ray_test_rm_rf(TMP_PART_DB);
+    (void)ray_test_mkdir_p(TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME);
+    (void)ray_test_mkdir_p(TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME);
 
     /* Partition 1: 3 rows */
     int64_t raw_a1[] = {10, 20, 30};
@@ -941,7 +941,7 @@ static test_result_t test_part_open(void) {
     /* Release — should unmap all segments */
     ray_release(parted);
 
-    (void)!system("rm -rf " TMP_PART_DB);
+    (void)ray_test_rm_rf(TMP_PART_DB);
     PASS();
 }
 
@@ -949,7 +949,7 @@ static test_result_t test_part_open(void) {
 /* ray_parted_tables lists the splayed-table subdirectories of the first
  * partition as a sorted SYM vector usable with ray_read_parted. */
 static test_result_t test_parted_tables(void) {
-    (void)!system("rm -rf " TMP_PART_DB);
+    (void)ray_test_rm_rf(TMP_PART_DB);
     /* Two tables (trades, quotes) across two partitions. */
     const char* dirs[] = {
         TMP_PART_DB "/2024.01.01/trades", TMP_PART_DB "/2024.01.01/quotes",
@@ -986,16 +986,17 @@ static test_result_t test_parted_tables(void) {
 
     /* An existing-but-empty root (no partition dirs) lists no tables —
      * an empty SYM vector, not an error. */
-    (void)!system("rm -rf " TMP_PART_DB "_np && mkdir -p " TMP_PART_DB "_np");
+    (void)ray_test_rm_rf(TMP_PART_DB "_np");
+    (void)ray_test_mkdir_p(TMP_PART_DB "_np");
     ray_t* empty = ray_parted_tables(TMP_PART_DB "_np");
     TEST_ASSERT_NOT_NULL(empty);
     TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
     TEST_ASSERT_EQ_I(empty->type, RAY_SYM);
     TEST_ASSERT_EQ_I(empty->len, 0);
     ray_release(empty);
-    (void)!system("rm -rf " TMP_PART_DB "_np");
+    (void)ray_test_rm_rf(TMP_PART_DB "_np");
 
-    (void)!system("rm -rf " TMP_PART_DB);
+    (void)ray_test_rm_rf(TMP_PART_DB);
     PASS();
 }
 
@@ -1662,7 +1663,7 @@ static test_result_t test_sym_col_valid_roundtrip(void) {
 #define TMP_SYM_PATH      "/tmp/rayforce_test_splay_sym_file"
 
 static test_result_t test_splay_load_with_sym(void) {
-    (void)!system("rm -rf " TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
     unlink(TMP_SYM_PATH);
 
     /* Intern symbols and build a table with a RAY_SYM column */
@@ -1711,7 +1712,7 @@ static test_result_t test_splay_load_with_sym(void) {
     ray_release(col_name);
     ray_release(col_age);
     ray_release(tbl);
-    (void)!system("rm -rf " TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
     unlink(TMP_SYM_PATH);
     unlink(TMP_SYM_PATH ".lk");
     PASS();
@@ -1720,7 +1721,7 @@ static test_result_t test_splay_load_with_sym(void) {
 /* ---- test_splay_load_sym_missing_corrupt ------------------------------- */
 
 static test_result_t test_splay_load_sym_missing_corrupt(void) {
-    (void)!system("rm -rf " TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
     unlink(TMP_SYM_PATH);
 
     /* Intern symbols and build a table with a RAY_SYM column */
@@ -1757,7 +1758,7 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
 
     ray_release(col);
     ray_release(tbl);
-    (void)!system("rm -rf " TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
     unlink(TMP_SYM_PATH);
     unlink(TMP_SYM_PATH ".lk");
     PASS();
@@ -1766,7 +1767,7 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
 /* ---- test_read_splayed_bad_sym_fatal ----------------------------------- */
 
 static test_result_t test_read_splayed_bad_sym_fatal(void) {
-    (void)!system("rm -rf " TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
 
     /* Build a simple table (no RAY_SYM columns needed) */
     int64_t id_x = ray_sym_intern("x", 1);
@@ -1793,7 +1794,7 @@ static test_result_t test_read_splayed_bad_sym_fatal(void) {
 
     ray_release(col_x);
     ray_release(tbl);
-    (void)!system("rm -rf " TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
     PASS();
 }
 
@@ -3059,6 +3060,25 @@ static test_result_t test_serde_de_raw_default_and_errors(void) {
         ray_t* r = ray_de(w);
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r); ray_release(w);
+    }
+    /* A top-level frame must contain exactly one serialized object.  Extra
+     * payload bytes are not valid framing and must not be silently ignored. */
+    {
+        ray_t* w = ray_ser(ray_i64(42));
+        TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        int64_t total = w->len;
+        ray_t* trailing = ray_vec_new(RAY_U8, total + 1);
+        TEST_ASSERT_NOT_NULL(trailing); TEST_ASSERT_FALSE(RAY_IS_ERR(trailing));
+        trailing->len = total + 1;
+        memcpy(ray_data(trailing), ray_data(w), (size_t)total);
+        ((uint8_t*)ray_data(trailing))[total] = 0xa5;
+        ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(trailing);
+        hdr->size += 1;
+
+        ray_t* r = ray_de(trailing);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_MEM_EQ(7, r->sdata, "domain");
+        ray_release(r); ray_release(trailing); ray_release(w);
     }
     /* SYM vector where an element has no null terminator within bounds:
      * craft a payload: type=RAY_SYM(12), attrs=0, len=1, then 4 non-null

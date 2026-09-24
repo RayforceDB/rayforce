@@ -21,7 +21,7 @@
  *   SOFTWARE.
  */
 
-#ifndef RAY_OS_WINDOWS
+#ifndef _WIN32
   #define _GNU_SOURCE
 #endif
 
@@ -48,6 +48,44 @@
 
 /* ===== Socket Implementation ===== */
 
+#ifdef RAY_OS_WINDOWS
+/* Winsock must be initialised before the process's first socket call; do it
+ * at load time so no entry point (listen, connect, a bare client) can miss
+ * it.  Never paired with WSACleanup: process exit releases it. */
+__attribute__((constructor)) static void sock_win_startup(void)
+{
+    WSADATA wsa;
+    (void)WSAStartup(MAKEWORD(2, 2), &wsa);
+}
+
+/* Winsock reports failures through WSAGetLastError(), never errno.  The
+ * callers (poll loop, IPC) branch on errno == EINTR / EAGAIN, so mirror the
+ * Winsock code into errno after every failed socket call (or a code taken
+ * from SO_ERROR). */
+static void sock_win_errno_code(int code)
+{
+    switch (code) {
+    case WSAEWOULDBLOCK:  errno = EAGAIN;       break;
+    case WSAEINTR:        errno = EINTR;        break;
+    case WSAEINPROGRESS:  errno = EINPROGRESS;  break;
+    case WSAETIMEDOUT:    errno = ETIMEDOUT;    break;
+    case WSAECONNRESET:   errno = ECONNRESET;   break;
+    case WSAECONNABORTED: errno = ECONNABORTED; break;
+    case WSAECONNREFUSED: errno = ECONNREFUSED; break;
+    case WSAENOTCONN:     errno = ENOTCONN;     break;
+    case WSAENOTSOCK:     errno = ENOTSOCK;     break;
+    case WSAEADDRINUSE:   errno = EADDRINUSE;   break;
+    case WSAEINVAL:       errno = EINVAL;       break;
+    default:              errno = EIO;          break;
+    }
+}
+
+static void sock_win_errno(void)
+{
+    sock_win_errno_code(WSAGetLastError());
+}
+#endif
+
 ray_sock_t ray_sock_listen_at(const char* host, uint16_t port)
 {
     /* NULL/empty host keeps the historical INADDR_ANY bind.  A host that
@@ -68,7 +106,15 @@ ray_sock_t ray_sock_listen_at(const char* host, uint16_t port)
     if (fd == RAY_INVALID_SOCK) return RAY_INVALID_SOCK;
 
     int yes = 1;
+#ifdef RAY_OS_WINDOWS
+    /* Windows SO_REUSEADDR lets a second socket bind a port another one is
+     * actively listening on (the bind "steals" it).  The POSIX meaning —
+     * rebind right after a restart, but fail while the port is in use — is
+     * SO_EXCLUSIVEADDRUSE here (TIME_WAIT never blocks a Windows bind). */
+    setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&yes, sizeof(yes));
+#else
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+#endif
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -77,10 +123,16 @@ ray_sock_t ray_sock_listen_at(const char* host, uint16_t port)
     addr.sin_port        = htons(port);
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+#ifdef RAY_OS_WINDOWS
+        sock_win_errno();   /* e.g. EADDRINUSE for a taken port */
+#endif
         ray_sock_close(fd);
         return RAY_INVALID_SOCK;
     }
     if (listen(fd, 128) < 0) {
+#ifdef RAY_OS_WINDOWS
+        sock_win_errno();
+#endif
         ray_sock_close(fd);
         return RAY_INVALID_SOCK;
     }
@@ -97,6 +149,9 @@ ray_sock_t ray_sock_accept(ray_sock_t srv)
     ray_sock_t fd;
     do {
         fd = (ray_sock_t)accept(srv, NULL, NULL);
+#ifdef RAY_OS_WINDOWS
+        if (fd == RAY_INVALID_SOCK) sock_win_errno();
+#endif
     } while (fd == RAY_INVALID_SOCK && errno == EINTR);
 
     if (fd == RAY_INVALID_SOCK) return RAY_INVALID_SOCK;
@@ -115,8 +170,13 @@ ray_sock_t ray_sock_accept(ray_sock_t srv)
 static int sock_connect_one(ray_sock_t fd, const struct sockaddr* addr,
                             socklen_t addrlen, int timeout_ms)
 {
-    if (timeout_ms <= 0)
-        return connect(fd, addr, addrlen) < 0 ? -1 : 0;
+    if (timeout_ms <= 0) {
+        if (connect(fd, addr, addrlen) == 0) return 0;
+#ifdef RAY_OS_WINDOWS
+        sock_win_errno();   /* callers tell refusal from other failures by errno */
+#endif
+        return -1;
+    }
 
     ray_sock_set_nonblocking(fd);
     int rc = connect(fd, addr, addrlen);
@@ -124,6 +184,7 @@ static int sock_connect_one(ray_sock_t fd, const struct sockaddr* addr,
 #ifdef RAY_OS_WINDOWS
         int werr = WSAGetLastError();
         int in_progress = (werr == WSAEWOULDBLOCK || werr == WSAEINPROGRESS);
+        if (!in_progress) sock_win_errno_code(werr);
 #else
         int in_progress = (errno == EINPROGRESS);
 #endif
@@ -136,13 +197,22 @@ static int sock_connect_one(ray_sock_t fd, const struct sockaddr* addr,
         do { pr = poll(&pfd, 1, timeout_ms); } while (pr < 0 && errno == EINTR);
 #endif
         if (pr == 0) { errno = ETIMEDOUT; return -1; }
-        if (pr < 0) return -1;
+        if (pr < 0) {
+#ifdef RAY_OS_WINDOWS
+            sock_win_errno();
+#endif
+            return -1;
+        }
         /* Writable: harvest the pending connect result via SO_ERROR. */
         int soerr = 0;
         socklen_t soerr_len = sizeof(soerr);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&soerr, &soerr_len) < 0
             || soerr != 0) {
+#ifdef RAY_OS_WINDOWS
+            if (soerr != 0) sock_win_errno_code(soerr);   /* a WSAE* code */
+#else
             if (soerr != 0) errno = soerr;
+#endif
             return -1;
         }
     }
@@ -213,6 +283,7 @@ int64_t ray_sock_send(ray_sock_t s, const void* buf, size_t len)
     while (rem > 0) {
 #ifdef RAY_OS_WINDOWS
         int n = send(s, (const char*)p, (int)rem, 0);
+        if (n < 0) sock_win_errno();
 #else
         ssize_t n = send(s, p, rem, MSG_NOSIGNAL);
 #endif
@@ -221,7 +292,11 @@ int64_t ray_sock_send(ray_sock_t s, const void* buf, size_t len)
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Wait for write-readiness before retry */
                 struct pollfd pfd = { .fd = s, .events = POLLOUT };
+#ifdef RAY_OS_WINDOWS
+                WSAPoll(&pfd, 1, -1);
+#else
                 poll(&pfd, 1, -1);
+#endif
                 continue;
             }
             return -1;
@@ -237,6 +312,7 @@ int64_t ray_sock_recv(ray_sock_t s, void* buf, size_t len)
     for (;;) {
 #ifdef RAY_OS_WINDOWS
         int n = recv(s, (char*)buf, (int)len, 0);
+        if (n < 0) sock_win_errno();
 #else
         ssize_t n = recv(s, buf, len, 0);
 #endif

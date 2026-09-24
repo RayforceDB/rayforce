@@ -50,6 +50,7 @@
 #include "lang/format.h"
 #include "ops/internal.h"
 #include "ops/idxop.h"
+#include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -375,6 +376,16 @@ static test_result_t run_rfl_file(const char* path) {
     size_t r = fread(src, 1, (size_t)n, f);
     src[r] = '\0';
     fclose(f);
+
+    /* ";; @requires: posix" anywhere in a file marks it as depending on a
+     * POSIX shell / filesystem (.sys.exec pipelines, /proc).  Where that
+     * does not exist the file is reported as SKIP, never silently dropped. */
+#if defined(_WIN32)
+    if (strstr(src, ";; @requires: posix")) {
+        free(src);
+        SKIP("requires POSIX shell/filesystem");
+    }
+#endif
 
     int   line_no       = 0;
     int   assert_count  = 0;  /* tallies LHS -- RHS and EXPR !- SUBSTR lines */
@@ -848,7 +859,58 @@ static int name_matches_filter(const char* name, const char* filter) {
     return strstr(name, filter) != NULL;
 }
 
+/* ---- Shell-free filesystem helpers (declared in test.h) ---- */
+
+int ray_test_rm_rf(const char* path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;          /* already gone */
+    if (S_ISDIR(st.st_mode)) {
+        DIR* d = opendir(path);
+        if (d) {
+            struct dirent* ent;
+            char child[4096];
+            while ((ent = readdir(d)) != NULL) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                    continue;
+                snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+                ray_test_rm_rf(child);
+            }
+            closedir(d);
+        }
+        return rmdir(path);
+    }
+    return unlink(path);
+}
+
+int ray_test_mkdir_p(const char* path) {
+    return ray_mkdir_p(path) == RAY_OK ? 0 : -1;
+}
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+long ray_test_sysconf(int name) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    switch (name) {
+    case _SC_PAGESIZE:         return (long)si.dwPageSize;
+    case _SC_NPROCESSORS_ONLN: return (long)si.dwNumberOfProcessors;
+    case _SC_PHYS_PAGES: {
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        if (!GlobalMemoryStatusEx(&ms)) return -1;
+        return (long)(ms.ullTotalPhys / si.dwPageSize);
+    }
+    default: errno = EINVAL; return -1;
+    }
+}
+#endif
+
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    (void)_mkdir("/tmp");   /* tests use "/tmp/..." paths (see test.h) */
+#endif
     ray_expr_stats_init();
     ray_idx_stats_init();
     g_color = isatty(fileno(stdout));

@@ -398,6 +398,72 @@ static void pool_count_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
 }
 
 /* --------------------------------------------------------------------------
+ * Test: blocks a worker allocated inside a dispatch and the main thread freed
+ * after it are back with their owners by the end of the next dispatch — no
+ * registered heap carries a foreign list across a parallel region (issue
+ * #619: a stream of parallel joins grew the process by a pool per worker
+ * while the freed per-task buffers waited on those lists).
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    ray_t*   blocks[64];
+    uint32_t owner[64];      /* worker_id that allocated blocks[i]; 0 = main */
+} pool_alloc_ctx_t;
+
+static void pool_alloc_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    pool_alloc_ctx_t* c = (pool_alloc_ctx_t*)ctx;
+    for (int64_t i = start; i < end && i < 64; i++) {
+        c->blocks[i] = ray_alloc(256u << 10);    /* 256 KB from the caller's heap */
+        c->owner[i]  = worker_id;
+    }
+}
+
+static test_result_t test_dispatch_reclaims_worker_blocks(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    ray_err_t err = ray_pool_create(&pool, 3);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* ray_pool_create returns before the workers have started; a worker
+     * publishes its heap once it has run ray_heap_init.  Wait for all three
+     * on that published state, so every slot below is a real heap. */
+    for (uint32_t w = 0; w < pool.n_workers; w++)
+        while (!atomic_load(&pool.worker_heaps[w])) RAY_CPU_RELAX();
+
+    /* Rounds of "workers allocate, main frees" until a round in which at
+     * least one block really came from a worker (main is worker 0 and can
+     * take every task when the others are slow to wake).  Rounds are cheap;
+     * 64 of them without a worker allocation would mean the pool is not
+     * running its workers at all. */
+    pool_alloc_ctx_t ctx = {0};
+    int worker_blocks = 0;
+    for (int round = 0; round < 64 && worker_blocks == 0; round++) {
+        ray_pool_dispatch_n(&pool, pool_alloc_fn, &ctx, 64);
+        for (int i = 0; i < 64; i++) {
+            TEST_ASSERT_NOT_NULL(ctx.blocks[i]);
+            if (ctx.owner[i] != 0) worker_blocks++;
+            ray_free(ctx.blocks[i]);             /* cross-thread for worker blocks */
+            ctx.blocks[i] = NULL;
+        }
+    }
+    TEST_ASSERT(worker_blocks > 0, "some blocks were allocated by workers");
+
+    /* Those frees happened after the last dispatch ended, so the blocks sit
+     * on their owners' foreign lists now; the next dispatch hands them back. */
+    pool_count_ctx_t cctx = {0};
+    ray_pool_dispatch_n(&pool, pool_count_fn, &cctx, 4);
+    for (uint32_t w = 0; w < pool.n_workers; w++) {
+        ray_heap_t* wh = (ray_heap_t*)atomic_load(&pool.worker_heaps[w]);
+        TEST_ASSERT_NOT_NULL(wh);
+        TEST_ASSERT_NULL(atomic_load(&wh->foreign));
+    }
+
+    ray_pool_free(&pool);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: dispatch with total_elems <= 0 returns immediately, no calls fire
  * -------------------------------------------------------------------------- */
 
@@ -461,6 +527,57 @@ static test_result_t test_dispatch_small(void) {
  * including task ring fill, semaphore signal, main-thread participation,
  * spin-wait for completion).
  * -------------------------------------------------------------------------- */
+
+/* --------------------------------------------------------------------------
+ * Test: a dispatch NARROWER than the pool still runs every task, and leaves
+ * the pool fully usable for a later wide one (#599).
+ *
+ * ray_pool_dispatch/_n now signal only min(n_tasks-1, n_workers) workers
+ * instead of the whole pool, so the under-signalled workers stay asleep.  The
+ * risks that buys are (a) a task nobody claims and (b) signal accounting that
+ * drifts across dispatches, starving a later wide window.  Alternating narrow
+ * and wide dispatches over one pool catches both: every window is verified for
+ * exact task and element counts.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dispatch_narrower_than_pool(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 4), RAY_OK);
+
+    /* n_tasks below the worker count: 1 wakes nobody, 2 wakes one, etc. */
+    for (uint32_t n = 1; n <= 4; n++) {
+        pool_count_ctx_t ctx = {0};
+        ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, n);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), n);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), n);
+    }
+
+    /* The element form, sized to a single task. */
+    {
+        pool_count_ctx_t ctx = {0};
+        ray_pool_dispatch(&pool, pool_count_fn, &ctx, 1);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 1);
+        TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), 1);
+    }
+
+    /* Alternating narrow/wide over the same pool: a wide window must still be
+     * fully served after windows that signalled fewer workers than exist. */
+    for (int rep = 0; rep < 25; rep++) {
+        pool_count_ctx_t narrow = {0};
+        ray_pool_dispatch_n(&pool, pool_count_fn, &narrow, 1);
+        TEST_ASSERT_EQ_I(atomic_load(&narrow.calls), 1);
+
+        pool_count_ctx_t wide = {0};
+        ray_pool_dispatch_n(&pool, pool_count_fn, &wide, 32);
+        TEST_ASSERT_EQ_I(atomic_load(&wide.calls), 32);
+        TEST_ASSERT_EQ_I(atomic_load(&wide.elem_sum), 32);
+    }
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
 
 static test_result_t test_dispatch_n_small(void) {
     ray_heap_init();
@@ -1349,6 +1466,7 @@ const test_entry_t pool_entries[] = {
     { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
 #endif
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
+    { "pool/dispatch_reclaims_worker_blocks", test_dispatch_reclaims_worker_blocks, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
     { "pool/parallel_group_sum", test_parallel_group_sum, NULL, NULL },
     { "pool/parallel_min_max", test_parallel_min_max, NULL, NULL },
@@ -1357,6 +1475,7 @@ const test_entry_t pool_entries[] = {
     { "pool/dispatch_zero_elems",   test_dispatch_zero_elems,   NULL, NULL },
     { "pool/dispatch_small",        test_dispatch_small,        NULL, NULL },
     { "pool/dispatch_n_small",      test_dispatch_n_small,      NULL, NULL },
+    { "pool/dispatch_narrow",       test_dispatch_narrower_than_pool, NULL, NULL },
     { "pool/dispatch_n_ring_grow",  test_dispatch_n_ring_growth, NULL, NULL },
     { "pool/dispatch_ring_grow",    test_dispatch_ring_growth,  NULL, NULL },
     { "pool/dispatch_n_cancelled",  test_dispatch_n_cancelled,  NULL, NULL },

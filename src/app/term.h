@@ -24,9 +24,12 @@
 #ifndef RAY_TERM_H
 #define RAY_TERM_H
 
-#include <rayforce.h>
+#include "core/platform.h"
 
 #if defined(RAY_OS_WINDOWS)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN   /* keep <dlgs.h>/<winsock.h> macros out */
+#endif
 #include <windows.h>
 #define KEYCODE_RETURN '\r'
 #else

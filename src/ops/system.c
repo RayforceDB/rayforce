@@ -65,6 +65,7 @@ void* ray_runtime_get_sys_args(void);
 #define RAY_POPEN(c, m)  popen((c), (m))
 #define RAY_PCLOSE(f)    pclose(f)
 #else
+#include <io.h>         /* access, F_OK */
 #define RAY_POPEN(c, m)  _popen((c), (m))
 #define RAY_PCLOSE(f)    _pclose(f)
 #endif
@@ -1532,10 +1533,23 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     ray_t* v3 = make_i64(ray_sys_total_ram());
     vals = ray_list_append(vals, v3); ray_release(v3);
 #else
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+
     int64_t s1 = ray_sym_intern("cores", 5);
     keys = ray_vec_append(keys, &s1);
-    ray_t* v1 = make_i64(1);
+    ray_t* v1 = make_i64((int64_t)si.dwNumberOfProcessors);
     vals = ray_list_append(vals, v1); ray_release(v1);
+
+    int64_t s2 = ray_sym_intern("page-size", 9);
+    keys = ray_vec_append(keys, &s2);
+    ray_t* v2 = make_i64((int64_t)si.dwPageSize);
+    vals = ray_list_append(vals, v2); ray_release(v2);
+
+    int64_t s3 = ray_sym_intern("total-mem", 9);
+    keys = ray_vec_append(keys, &s3);
+    ray_t* v3 = make_i64(ray_sys_total_ram());
+    vals = ray_list_append(vals, v3); ray_release(v3);
 #endif
 
     /* Process and host identity (#573).  An embedded process previously had

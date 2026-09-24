@@ -37,8 +37,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef RAY_OS_WINDOWS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#endif
 
 static char* make_tmpdir(void) {
     char tmpl[] = "/tmp/rayforce-rt-test-XXXXXX";
@@ -70,6 +75,11 @@ static test_result_t test_create_with_sym_absent_is_ok(void) {
  * passing a path whose parent exists but isn't a directory (ENOTDIR) —
  * portable across Linux/macOS without needing root or chmod games. */
 static test_result_t test_create_with_sym_io_error_surfaces(void) {
+#if defined(_WIN32)
+    /* Win32 reports a path through a regular file as "path not found"
+     * (ENOENT, the missing-file case), never ENOTDIR. */
+    SKIP("no ENOTDIR on Windows");
+#endif
     char* dir = make_tmpdir();
     TEST_ASSERT_NOT_NULL(dir);
 
@@ -1265,9 +1275,7 @@ static test_result_t test_syscov_splayed_set_with_sym_path(void) {
     }
 
     /* cleanup — no free(dir), it's a stack pointer */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
-    system(cmd);
+    (void)ray_test_rm_rf(dir);
     PASS();
 }
 

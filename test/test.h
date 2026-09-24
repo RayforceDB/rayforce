@@ -41,6 +41,60 @@
 #include <string.h>
 #include <setjmp.h>
 
+/* Shell-free filesystem helpers (test/main.c).  Tests must not depend on
+ * /bin/sh: on Windows system() runs cmd.exe.  Both return 0 on success. */
+int ray_test_rm_rf(const char* path);     /* rm -rf path  */
+int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
+
+#if defined(_WIN32)
+/* POSIX helpers the tests rely on, mapped onto their MSVCRT equivalents.
+ * Test paths use "/tmp/...", which Windows resolves to <drive>:\tmp; the
+ * runner creates that directory at startup (see test/main.c). */
+#include <stdlib.h>
+#include <io.h>
+#include <direct.h>
+#include <sys/stat.h>
+static inline int setenv(const char* k, const char* v, int overwrite) {
+    if (!overwrite && getenv(k)) return 0;
+    return _putenv_s(k, v) == 0 ? 0 : -1;
+}
+static inline int unsetenv(const char* k) {
+    return _putenv_s(k, "") == 0 ? 0 : -1;   /* "" removes the variable */
+}
+static inline char* mkdtemp(char* tmpl) {
+    if (!_mktemp(tmpl)) return NULL;
+    return _mkdir(tmpl) == 0 ? tmpl : NULL;
+}
+static inline unsigned geteuid(void) { return 1; }  /* never "root" */
+#define lstat stat                                  /* no symlinks to skip */
+#include <errno.h>
+#include <fcntl.h>
+static inline int symlink(const char* target, const char* path) {
+    (void)target; (void)path;
+    errno = ENOSYS;                 /* callers skip when symlink fails */
+    return -1;
+}
+#define mkdir(p, mode) _mkdir(p)
+#define pipe(fds)      _pipe((fds), 65536, _O_BINARY)
+/* sysconf subset (page size, physical pages, CPUs); see test/main.c. */
+#define _SC_PAGESIZE          1
+#define _SC_PAGE_SIZE         _SC_PAGESIZE
+#define _SC_PHYS_PAGES        2
+#define _SC_NPROCESSORS_ONLN  3
+long ray_test_sysconf(int name);
+#define sysconf ray_test_sysconf
+/* MSVCRT's tmpfile() creates its file in the drive root, which needs admin
+ * rights.  Use the temp directory instead; "D" deletes the file on close. */
+static inline FILE* ray_test_tmpfile(void) {
+    char* name = _tempnam("/tmp", "rayt");
+    if (!name) return NULL;
+    FILE* f = fopen(name, "w+bD");
+    free(name);
+    return f;
+}
+#define tmpfile ray_test_tmpfile
+#endif
+
 typedef enum { TEST_PASS = 0, TEST_FAIL, TEST_SKIP } test_status_t;
 
 typedef struct {

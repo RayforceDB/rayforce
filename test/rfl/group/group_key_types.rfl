@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Coverage for group.c — key type diversity paths
 ;;
 ;; Targets:

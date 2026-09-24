@@ -104,10 +104,6 @@ total-mem | 16777216000
 | `page-size` | OS page size in bytes |
 | `total-mem` | Total physical RAM in bytes |
 
-!!! note "Note"
-
-    On Windows, only `cores` is currently reported.
-
 ## 5. Progress Monitoring
 
 Long-running queries display a progress bar automatically in the REPL. The bar appears after approximately 2 seconds of execution and shows real-time feedback.
