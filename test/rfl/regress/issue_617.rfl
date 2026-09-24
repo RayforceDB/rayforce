@@ -93,9 +93,13 @@
 ;; number of them, of any shape, and inside a lambda body too
 (at (select {from: g by: sym n: (count price) f: (+ n (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (+ (count (distinct price)) (count (distinct price))))))))))}) 'f) -- [18 9 9]
 (at (select {from: g by: sym n: (count price) f: ((fn [x] (+ x (sum price))) n)}) 'f) -- [162 281 421]
-;; a nested select inside a per-row output keeps whole-column literals whole
+;; a nested select inside a per-row output binds whole columns, whatever its
+;; table and however few rows it has: the outer row never indexes into it
 (set t2 (table [c d] (list [1 2 3 4 5] [10 20 30 40 50])))
 (first (at (select {from: t r: (reverse volume) b: (sum (at (select {from: t2 rr: (reverse 'd)}) 'rr))}) 'b)) -- 150
+(set t3 (table [c] (list [1 1])))
+(at (select {from: t r: (reverse volume) b: (count (select {from: t3 where: (== 'c 1)}))}) 'b) -- [2 2 2]
+(at (select {from: t r: (reverse volume) b: (+ (count (select {from: t where: (> 'price 100)})) 'price)}) 'b) -- [153 283 423]
 ;; the same condition written out: it used to pick one branch for every
 ;; group; with constant branches the output went missing and the hidden
 ;; count appeared under a made-up name

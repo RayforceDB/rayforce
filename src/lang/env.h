@@ -143,6 +143,9 @@ ray_err_t ray_env_push_scope(void);
 ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);
+/* True when a query scope frame sits at index >= depth: a nested query has
+ * bound its own columns since the frame that was at depth-1 was pushed. */
+bool      ray_env_query_scope_above(int32_t depth);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_get_lexical_local(int64_t sym_id);
 bool      ray_env_has_lexical_local(int64_t sym_id);

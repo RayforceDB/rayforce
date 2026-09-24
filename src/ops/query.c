@@ -1844,9 +1844,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
  * Column-membership scoped and query-only by construction — see
  * ray_active_query_table. */
 static _Thread_local ray_t* g_active_query_table = NULL;
-/* Row of the active query table a per-row evaluation is on, -1 outside one
- * (then a literal column name stands for the whole column). */
-static _Thread_local int64_t g_active_query_row = -1;
+/* The per-row evaluation in progress, if any: the row, the table it indexes
+ * and the scope depth just above its own query frame.  A literal column
+ * name stands for the row's cell only while the active table is that table
+ * and no nested query has opened a scope since — a nested select, a
+ * per-group evaluation or a where-mask over any table (the same one
+ * included) binds whole columns and must see whole columns. */
+static _Thread_local int64_t g_active_query_row       = -1;
+static _Thread_local ray_t*  g_active_query_row_tbl   = NULL;
+static _Thread_local int32_t g_active_query_row_depth = 0;
 
 ray_t* ray_active_query_table(void) { return g_active_query_table; }
 
@@ -3566,7 +3572,11 @@ ray_t* ray_active_query_literal(int64_t sym) {
     if (!qt || qt->type != RAY_TABLE) return NULL;
     ray_t* col = ray_table_get_col(qt, sym);
     if (!col) return NULL;
-    if (g_active_query_row < 0) { ray_retain(col); return col; }
+    if (g_active_query_row < 0 || qt != g_active_query_row_tbl ||
+        g_active_query_row >= ray_len(col) ||
+        ray_env_query_scope_above(g_active_query_row_depth)) {
+        ray_retain(col); return col;
+    }
     int allocated = 0;
     ray_t* cell = collection_elem(col, g_active_query_row, &allocated);
     if (!cell || RAY_IS_ERR(cell)) return cell;
@@ -3598,7 +3608,11 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
      * (including error returns), exactly as the bind_all_columns sites do. */
     ray_t* _aqt = g_active_query_table;
     int64_t _aqr = g_active_query_row;
-    g_active_query_table = tbl;
+    ray_t*  _aqrt = g_active_query_row_tbl;
+    int32_t _aqrd = g_active_query_row_depth;
+    g_active_query_table     = tbl;
+    g_active_query_row_tbl   = tbl;
+    g_active_query_row_depth = ray_env_scope_depth();   /* just above our own frame */
 
     ray_t* result = NULL;
     int direct_typed = 0;
@@ -3609,7 +3623,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             int allocated = 0;
             ray_t* arg = collection_elem(cols[i], row, &allocated);
             if (!arg || RAY_IS_ERR(arg)) {
-                g_active_query_table = _aqt; g_active_query_row = _aqr;
+                g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                 ray_env_pop_scope();
                 if (result) ray_release(result);
                 scratch_free(refs_hdr);
@@ -3622,7 +3636,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
         g_active_query_row = row;
         ray_t* cell = ray_eval(expr);
         if (!cell || RAY_IS_ERR(cell)) {
-            g_active_query_table = _aqt; g_active_query_row = _aqr;
+            g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
             ray_env_pop_scope();
             if (result) ray_release(result);
             scratch_free(refs_hdr);
@@ -3635,7 +3649,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             if (collapsable) {
                 result = ray_vec_new((int8_t)-t, nrows);
                 if (!result || RAY_IS_ERR(result)) {
-                    g_active_query_table = _aqt; g_active_query_row = _aqr;
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
                     ray_release(cell);
                     scratch_free(refs_hdr);
@@ -3655,7 +3669,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             if (!collapsable) {
                 result = ray_alloc(nrows * sizeof(ray_t*));
                 if (!result) {
-                    g_active_query_table = _aqt; g_active_query_row = _aqr;
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
                     ray_release(cell);
                     scratch_free(refs_hdr);
@@ -3675,7 +3689,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
                 ray_t* list_col = typed_vec_to_list(result, row, nrows);
                 ray_release(result);
                 if (RAY_IS_ERR(list_col)) {
-                    g_active_query_table = _aqt; g_active_query_row = _aqr;
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
                     ray_release(cell);
                     scratch_free(refs_hdr);
@@ -3692,7 +3706,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
         }
     }
 
-    g_active_query_table = _aqt; g_active_query_row = _aqr;
+    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
     ray_env_pop_scope();
     scratch_free(refs_hdr);
     if (!result) {
@@ -6693,6 +6707,20 @@ static ray_t* select_extract_aggs(ray_t* expr, void* vctx) {
  * engine (ROW aliases substituted, derived outputs and — when there are
  * any — asc:/desc:/take: removed, hidden aggregates added, from: replaced by
  * the evaluated table) with `plan` filled in for select_apply_derived. */
+/* Does `expr` mention (bare or literal) any of the first `n` names? */
+static bool select_expr_mentions_key(ray_t* expr, ray_t* keys, int64_t n) {
+    if (!expr) return false;
+    if (expr->type == -RAY_SYM) {
+        for (int64_t i = 0; i < n; i++) if (sym_cell_runtime_id(keys, i) == expr->i64) return true;
+        return false;
+    }
+    if (expr->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(expr);
+    for (int64_t i = 0; i < expr->len; i++)
+        if (select_expr_mentions_key(el[i], keys, n)) return true;
+    return false;
+}
+
 static ray_t* select_plan_grouped_aliases(ray_t* dict, ray_t* tbl, select_alias_plan_t* plan) {
     memset(plan, 0, sizeof(*plan));
     if (!dict || dict->type != RAY_DICT || !dict_get(dict, "by")) return NULL;
@@ -6700,6 +6728,14 @@ static ray_t* select_plan_grouped_aliases(ray_t* dict, ray_t* tbl, select_alias_
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
     int64_t nd = ray_dict_len(dict);
+    /* Most grouped selects name no earlier output: leave before any
+     * allocation unless some value mentions a key that precedes it. */
+    {
+        bool any = false;
+        for (int64_t i = 1; i < nd && !any; i++)
+            any = select_expr_mentions_key(((ray_t**)ray_data(vals))[i], keys, i);
+        if (!any) return NULL;
+    }
     static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
     int64_t rid[7];
     for (int i = 0; i < 7; i++) rid[i] = ray_sym_intern(reserved[i], strlen(reserved[i]));
