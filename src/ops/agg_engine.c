@@ -928,8 +928,8 @@ static bool agg_desc_init(agg_desc_t* d, ray_graph_t* g, ray_op_ext_t* ext,
     for (uint32_t k = 0; k < nk; k++) d->key_data[k] = ray_data(key_cols[k]);
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        d->agg_syms[a] = ie->sym;
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
+        d->agg_syms[a] = ie ? ie->sym : 0;
+        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
         d->val_data[a]    = vc ? ray_data(vc) : NULL;
         d->val_types[a]   = vc ? vc->type : RAY_I64;
         d->val_hasnull[a] = vc ? ray_vec_may_have_nulls(vc) : false;
@@ -966,7 +966,7 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
     vo->block = 0;
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
+        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
         int8_t in_type = vc ? vc->type : RAY_I64;
         vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
         vo->off[a] = vo->block;
@@ -5285,13 +5285,15 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], x_col->type);
             col = agg_run_one_bin(vt, x_col, y_col, groups.gids, nrows, groups.ngroups, kparam);
         } else {
-            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
+            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
             int8_t in_type = val_col ? val_col->type : RAY_I64;
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], in_type);
             col = agg_run_one(vt, val_col, groups.gids, nrows, groups.ngroups, kparam);
         }
         if (!col || RAY_IS_ERR(col)) { agg_groups_free(&groups); ray_release(result); return col ? col : ray_error("oom", NULL); }
-        int64_t agg_name = agg_result_col_name(ie->sym, ext->agg_ops[a]);
+        /* A COUNT reads no input column, so its input node need not be a
+         * scan (`(count (* price 2))`) and has no ext to name it by. */
+        int64_t agg_name = agg_result_col_name(ie ? ie->sym : 0, ext->agg_ops[a]);
         result = ray_table_add_col(result, agg_name, col);
         ray_release(col);
     }
