@@ -1229,7 +1229,8 @@ ray_t* ray_env_fn(ray_t* x) {
 
 /* (.sys.build) -- return dict with internal build information */
 ray_t* ray_internals_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.build takes no arguments");
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(2);

@@ -101,6 +101,7 @@
 (type (.sys.build)) -- 'DICT
 (count (.sys.build)) -- 2
 (type (at (.sys.build) 'version)) -- 'str
+(.sys.build 1) !- arity
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_memstat_fn (.sys.mem)  (lines 703-728)
