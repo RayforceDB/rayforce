@@ -244,8 +244,7 @@ static void exec_like_parted_str(ray_t* input, uint8_t* dst,
             .pat_str    = pat_str,
             .pat_len    = pat_len,
         };
-        if (pool && seg_len >= LIKE_PAR_MIN_ROWS_STR &&
-            ray_pool_total_workers(pool) >= 2) {
+        if (ray_pool_par_dispatch_ok(pool, seg_len, LIKE_PAR_MIN_ROWS_STR)) {
             ray_pool_dispatch(pool, str_like_par_fn, &lctx, seg_len);
         } else {
             str_like_par_fn(&lctx, 0, 0, seg_len);
@@ -305,8 +304,7 @@ static void exec_like_parted_sym(ray_t* input, uint8_t* dst,
                 .pat_str = pat_str, .pat_len = pat_len,
                 .empty_match = empty_match,
             };
-            if (pool && seg_len >= LIKE_PAR_MIN_ROWS_SYM &&
-                ray_pool_total_workers(pool) >= 2) {
+            if (ray_pool_par_dispatch_ok(pool, seg_len, LIKE_PAR_MIN_ROWS_SYM)) {
                 ray_pool_dispatch(pool, like_rows_fn, &rctx, seg_len);
             } else {
                 like_rows_fn(&rctx, 0, 0, seg_len);
@@ -398,10 +396,7 @@ ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
 
     int64_t len = in_parted ? parted_row_count(input) : input->len;
     ray_t* result = ray_vec_new(RAY_BOOL, len);
-    if (!result || RAY_IS_ERR(result)) {
-        ray_release(input); ray_release(pat_v);
-        return result;
-    }
+    if (!result || RAY_IS_ERR(result)) return result;   /* input/pat_v are borrowed */
     result->len = len;
     uint8_t* dst = (uint8_t*)ray_data(result);
 
@@ -427,7 +422,7 @@ ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
             .pat_len    = pat_len,
         };
         ray_pool_t* str_pool = ray_pool_get();
-        if (str_pool && len >= LIKE_PAR_MIN_ROWS_STR && ray_pool_total_workers(str_pool) >= 2) {
+        if (ray_pool_par_dispatch_ok(str_pool, len, LIKE_PAR_MIN_ROWS_STR)) {
             ray_pool_dispatch(str_pool, str_like_par_fn, &lctx, len);
         } else {
             str_like_par_fn(&lctx, 0, 0, len);
@@ -470,7 +465,7 @@ ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
             }
             rctx.raw_ok = dom ? ray_sym_domain_raw_pin(dom, &rctx.raw) : false;
             ray_pool_t* pool = ray_pool_get();
-            if (pool && len >= LIKE_PAR_MIN_ROWS_SYM && ray_pool_total_workers(pool) >= 2) {
+            if (ray_pool_par_dispatch_ok(pool, len, LIKE_PAR_MIN_ROWS_SYM)) {
                 ray_pool_dispatch(pool, like_rows_fn, &rctx, len);
             } else {
                 like_rows_fn(&rctx, 0, 0, len);

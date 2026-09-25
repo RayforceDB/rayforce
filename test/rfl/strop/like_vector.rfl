@@ -34,7 +34,8 @@
 (== (sum (as 'I64 (like losv "site1*"))) (count (select {from: T where: (like losv "site1*")}))) -- true
 ;; the direct form and the select form agree with `==` on an exact pattern
 (sum (as 'I64 (like hi "http://h3.example.com/p/93/3"))) -- 1
-;; a parted column, taken from the table, runs the same kernel per segment
+;; a parted table: the select form runs the kernel per segment, the direct
+;; form gets the column materialised flat — both must agree
 (.sys.exec "rm -rf /tmp/rfl_like_vec_p") -- 0
 (set P1 (table [s] (list (as 'SYMBOL (map (fn [k] (format "a%" (% k 9))) (til 120000))))))
 (set P2 (table [s] (list (as 'SYMBOL (map (fn [k] (format "b%" (% k 9))) (til 120000))))))
