@@ -385,7 +385,7 @@ This tells you the join needed about 1 GB of temporary memory beyond what was al
 | Tool | What It Does | When to Use |
 |---|---|---|
 | `(.sys.mem 0)` | Returns heap allocation statistics | Monitor memory usage, detect leaks |
-| `(.sys.gc 0)` | Flushes caches, releases pages | Between heavy queries, before benchmarks |
+| `(.sys.gc)` | Flushes caches, releases pages | Between heavy queries, before benchmarks |
 | `(.sys.info 0)` | Shows system and runtime info | Check total RAM, CPU count, OS details |
 | `(timeit expr)` | Measures execution time of one expression | Benchmark a specific operation |
 | `:timeit` | Toggles profiling for all REPL expressions | Interactive performance exploration |
