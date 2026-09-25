@@ -10,18 +10,18 @@ Process-level introspection (build, memory, host info) and command-style operati
 | Function | Arity | Flags | Description |
 |---|---|---|---|
 | [`.sys.args`](#sys-args) | variadic | — | Command-line arguments as a typed dict. |
-| [`.sys.build`](#sys-build) | variadic | — | Version + build date as a dict. |
+| [`.sys.build`](#sys-build) | nullary | — | Version + build date as a dict. |
 | [`.sys.info`](#sys-info) | variadic | — | Host and process facts: cores, page size, total memory, pid, hostname. |
 | [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
 | [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
 | [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
-| [`.sys.env`](#sys-env) | variadic | — | Count or list of globally bound names. |
+| [`.sys.env`](#sys-env) | variadic (0–1) | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
 | [`.sys.listen`](#sys-listen) | unary | restricted | Bind an IPC listener on a TCP port. |
-| [`.sys.timeit`](#sys-timeit) | variadic | — | Toggle / set the per-expression profiler. |
+| [`.sys.timeit`](#sys-timeit) | variadic (0–1) | — | Toggle / set the per-expression profiler. |
 
 ## `.sys.args` { #sys-args }
 
@@ -244,7 +244,7 @@ GC, not a tracing object collector. Returns `0`.
 
 ## `.sys.env` { #sys-env }
 
-Signature: `(.sys.env)`. From a script / IPC context returns the **count** of globally bound names (i64). In a REPL context the same dispatcher prints one line per binding (name + type label) and returns null — the variadic registration accommodates both forms.
+Signature: `(.sys.env [compat-arg])`. From a script / IPC context returns the **count** of globally bound names (i64). In a REPL context the same dispatcher prints one line per binding (name + type label) and returns null. At most one optional compatibility argument is accepted; additional arguments return an `arity` error.
 
 ```lisp
 (.sys.env)
@@ -330,7 +330,7 @@ Errors: `type` (port not an int / not parseable from string), `domain` (port out
 
 ## `.sys.timeit` { #sys-timeit }
 
-Signature: `(.sys.timeit [flag])`. Toggles the per-expression profiler. Calling with no argument flips the current state; passing `0` disables, anything non-zero enables. Returns the new state as `i64` (0/1).
+Signature: `(.sys.timeit [flag])`. Toggles the per-expression profiler. Calling with no argument flips the current state; passing `0` disables, anything non-zero enables. Returns the new state as `i64` (0/1). More than one argument returns an `arity` error.
 
 ```lisp
 (.sys.timeit 1)   ;; enable profiling
