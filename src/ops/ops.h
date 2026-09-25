@@ -547,6 +547,31 @@ typedef struct ray_graph {
         uint32_t   node_id;
     } cexpr_env[32];
     int             cexpr_env_top;
+
+    /* Output aliases of the select being compiled (src/ops/query.c):
+     * the projections compiled so far, in order.  A name reference or a
+     * literal symbol consults them after the lambda/let env and before
+     * the source table's columns.  Borrowed views into the projection
+     * loop's scratch arrays: set and cleared by that loop, never freed
+     * here.  Kept apart from cexpr_env so a wide select does not eat the
+     * slots lambda inlining needs. */
+    const int64_t*  sel_alias_syms;
+    const uint32_t* sel_alias_ids;
+    int             sel_alias_n;
+
+    /* Set by compile_expr_dag when it declines an expression that can
+     * only fail (arithmetic on a symbol column).  A caller with an
+     * evaluation fallback ignores it — the evaluator raises the same
+     * error; one without reports it instead of a generic compile
+     * failure.  Owned; released by ray_graph_free. */
+    ray_t*          compile_err;
+
+    /* > 0 while compile_expr_dag is inside a branch of `if`/`cond`.  The
+     * DAG evaluates both arms element-wise and the condition picks one, so
+     * an arm's value is observable only where it is selected; the checks
+     * that reject an expression outright (arithmetic on a symbol) stay
+     * quiet inside an arm and let the arm compile as it always did. */
+    int             if_arm_depth;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */
@@ -918,6 +943,7 @@ ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
  * so a literal never captures a lambda/let local and resolution fires only
  * inside a query.  Returns NULL when no query is active. */
 ray_t* ray_active_query_table(void);
+ray_t* ray_active_query_literal(int64_t sym);
 
 #ifdef __cplusplus
 }

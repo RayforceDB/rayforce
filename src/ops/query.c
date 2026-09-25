@@ -314,6 +314,36 @@ static bool dag_type_is_temporal(int8_t t) {
     return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
 }
 
+/* Arithmetic on a symbol has no meaning — the eval path rejects it
+ * (`cannot add sym and i64`, arith.c).  The DAG used to admit it because
+ * `promote` folds RAY_SYM into I64 and the constant folder reads a symbol
+ * atom as its interned id, so `(+ 'name 1)` and `(+ sym_col 1)` returned
+ * ids plus one without a word.  Declining here sends the projection to the
+ * per-row eval fallback, which raises the same error as outside a query.
+ * Comparisons and membership keep SYM: they are not arithmetic. */
+static const char* dag_arith_verb(const char* fname, size_t fname_len) {
+    if (fname_len == 1) {
+        switch (fname[0]) {
+            case '+': return "add";
+            case '-': return "subtract";
+            case '*': return "multiply";
+            case '/': return "divide";
+            case '%': return "mod";
+        }
+    }
+    return fname_len == 3 && memcmp(fname, "pow", 3) == 0 ? "pow" : "div";
+}
+
+static bool dag_arith_rejects_sym(const char* fname, size_t fname_len,
+                                  int8_t lt, int8_t rt) {
+    bool arith = (fname_len == 1 && (fname[0] == '+' || fname[0] == '-' ||
+                                     fname[0] == '*' || fname[0] == '/' ||
+                                     fname[0] == '%')) ||
+                 (fname_len == 3 && (memcmp(fname, "div", 3) == 0 ||
+                                     memcmp(fname, "pow", 3) == 0));
+    return arith && (lt == RAY_SYM || rt == RAY_SYM);
+}
+
 static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
                                           int8_t left_type, int8_t right_type) {
     if (!dag_type_is_temporal(left_type) && !dag_type_is_temporal(right_type))
@@ -977,6 +1007,26 @@ static void cexpr_env_pop(ray_graph_t* g, int n) {
     if (g->cexpr_env_top < 0) g->cexpr_env_top = 0;  /* defensive */
 }
 
+/* The projections of the select being compiled that precede the one
+ * being compiled now (g->sel_alias_*, published by the projection loop).
+ * Latest binding wins, so an alias that shadows an earlier alias — or a
+ * source column — is the one a later projection sees. */
+static ray_op_t* sel_alias_lookup(ray_graph_t* g, int64_t sym) {
+    for (int i = g->sel_alias_n - 1; i >= 0; i--)
+        if (g->sel_alias_syms[i] == sym)
+            return &g->nodes[g->sel_alias_ids[i]];
+    return NULL;
+}
+
+/* Takes the error compile_expr_dag left on the graph (see ops.h), or
+ * NULL.  Callers that report a compile failure use it so the message
+ * names the actual problem when there is one. */
+static ray_t* graph_take_compile_err(ray_graph_t* g) {
+    ray_t* e = g->compile_err;
+    g->compile_err = NULL;
+    return e;
+}
+
 static int const_str_expr_len(ray_t* expr, size_t* out_len) {
     if (!expr || !out_len) return 0;
     if (expr->type == -RAY_STR && !(expr->attrs & ATTR_QUOTED)) {
@@ -1062,6 +1112,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         ray_op_t* bound = cexpr_env_lookup(g, expr->i64);
         if (bound) return bound;
+        ray_op_t* alias = sel_alias_lookup(g, expr->i64);
+        if (alias) return alias;
         ray_t* local = ray_env_get_lexical_local(expr->i64);
         if (local) {
             if (ray_is_atom(local)) return ray_const_atom(g, local);
@@ -1157,6 +1209,13 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
      * the rule fires only when a query table is bound.  A literal naming no
      * column stays a const atom node. */
     if (expr->type == -RAY_SYM) {
+        /* A literal naming an EARLIER PROJECTION of the same select resolves
+         * to it, exactly as the bare name does — and ahead of a source
+         * column of the same name, as the bare name does.  The alias store
+         * holds projections only, never lambda formals or let bindings, so
+         * a literal still never captures those. */
+        ray_op_t* alias = sel_alias_lookup(g, expr->i64);
+        if (alias) return alias;
         if (g->table && g->table->type == RAY_TABLE &&
             ray_table_get_col(g->table, expr->i64)) {
             ray_t* s = ray_sym_str(expr->i64);
@@ -1276,7 +1335,16 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                             g->cexpr_env_top++;
                             pushed++;
                         }
+                        /* The body was written outside this select: a free
+                         * name in it is a global (or a column), never an
+                         * output alias of the select that happens to call
+                         * the lambda.  Hide the alias store while the body
+                         * compiles; the actuals above were compiled in the
+                         * projection's own scope and keep seeing aliases. */
+                        int saved_aliases = g->sel_alias_n;
+                        g->sel_alias_n = 0;
                         ray_op_t* result = compile_expr_dag(g, body);
+                        g->sel_alias_n = saved_aliases;
                         cexpr_env_pop(g, pushed);
                         return result;
                     }
@@ -1342,11 +1410,12 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             ray_op_t* c = compile_expr_dag(g, elems[1]);
             if (!c) return NULL;
             uint32_t c_id = c->id;
+            g->if_arm_depth++;
             ray_op_t* t = compile_expr_dag(g, elems[2]);
-            if (!t) return NULL;
-            uint32_t t_id = t->id;
-            ray_op_t* e = compile_expr_dag(g, elems[3]);
-            if (!e) return NULL;
+            uint32_t t_id = t ? t->id : 0;
+            ray_op_t* e = t ? compile_expr_dag(g, elems[3]) : NULL;
+            g->if_arm_depth--;
+            if (!t || !e) return NULL;
             c = &g->nodes[c_id];
             t = &g->nodes[t_id];
             return ray_if(g, c, t, e);
@@ -1575,7 +1644,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 }
                 if (is_else) {
                     if (i != n - 1) return NULL;
+                    g->if_arm_depth++;
                     ray_op_t* c = compile_expr_dag(g, cpair[1]);
+                    g->if_arm_depth--;
                     if (!c) return NULL;
                     chain_id = c->id;
                 } else {
@@ -1583,7 +1654,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     ray_op_t* pred = compile_expr_dag(g, cpair[0]);
                     if (!pred) return NULL;
                     uint32_t pred_id = pred->id;
+                    g->if_arm_depth++;
                     ray_op_t* body = compile_expr_dag(g, cpair[1]);
+                    g->if_arm_depth--;
                     if (!body) return NULL;
                     pred = &g->nodes[pred_id];
                     ray_op_t* chain = &g->nodes[chain_id];
@@ -1689,6 +1762,16 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                                                   left->out_type,
                                                   right->out_type))
                     return NULL;
+                if (g->if_arm_depth == 0 &&
+                    dag_arith_rejects_sym(fname, fname_len,
+                                          left->out_type, right->out_type)) {
+                    if (!g->compile_err)
+                        g->compile_err = ray_error("type", "cannot %s %s and %s",
+                            dag_arith_verb(fname, fname_len),
+                            ray_type_name((int8_t)-left->out_type),
+                            ray_type_name((int8_t)-right->out_type));
+                    return NULL;
+                }
                 if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
                     (!dag_pow_type_admitted(left->out_type) ||
                      !dag_pow_type_admitted(right->out_type)))
@@ -1761,6 +1844,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
  * Column-membership scoped and query-only by construction — see
  * ray_active_query_table. */
 static _Thread_local ray_t* g_active_query_table = NULL;
+/* The per-row evaluation in progress, if any: the row, the table it indexes
+ * and the scope depth just above its own query frame.  A literal column
+ * name stands for the row's cell only while the active table is that table
+ * and no nested query has opened a scope since — a nested select, a
+ * per-group evaluation or a where-mask over any table (the same one
+ * included) binds whole columns and must see whole columns. */
+static _Thread_local int64_t g_active_query_row       = -1;
+static _Thread_local ray_t*  g_active_query_row_tbl   = NULL;
+static _Thread_local int32_t g_active_query_row_depth = 0;
 
 ray_t* ray_active_query_table(void) { return g_active_query_table; }
 
@@ -2026,6 +2118,18 @@ static int hidden_agg_shape_ok(ray_t* expr) {
     return op == OP_QUANTILE;
 }
 
+static bool agg_arith_head_is_control(int64_t sym) {
+    static const char* const forms[] = { "if", "while", "times",
+                                         "do", "let", "set", "try" };
+    ray_t* s = ray_sym_str(sym);
+    if (!s) return false;
+    const char* p = ray_str_ptr(s);
+    size_t l = ray_str_len(s);
+    for (size_t i = 0; i < sizeof forms / sizeof forms[0]; i++)
+        if (l == strlen(forms[i]) && memcmp(p, forms[i], l) == 0) return true;
+    return false;
+}
+
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
@@ -2053,6 +2157,15 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
      * Reject the whole output; it keeps the per-group scatter path. */
     if (n > 0 && el[0] && el[0]->type == -RAY_SYM &&
         el[0]->i64 == ray_sym_intern("fn", 2)) { *ok = 0; return NULL; }
+    /* `if` (and the loops) take one condition, not a vector of them:
+     * evaluated once over the n_groups-row result they would pick a
+     * single branch for every group.  The scope-making forms (do, let,
+     * set, try) evaluate their body outside the scope the hidden slots
+     * are bound in.  Reject such outputs so they keep the per-group
+     * evaluation, where the condition is a scalar and names are plain. */
+    if (n > 0 && el[0] && el[0]->type == -RAY_SYM &&
+        !(el[0]->attrs & ATTR_QUOTED) && agg_arith_head_is_control(el[0]->i64))
+        { *ok = 0; return NULL; }
     ray_t* out = ray_list_new(0);
     if (!out || RAY_IS_ERR(out)) { *ok = 0; return out && RAY_IS_ERR(out) ? NULL : NULL; }
     for (int64_t i = 0; i < n && *ok; i++) {
@@ -3448,6 +3561,29 @@ static ray_t* nonagg_eval_per_group_buf(ray_t* expr, ray_t* tbl,
     return res;
 }
 
+/* The value a literal column-name symbol stands for while a query is
+ * active (see the literal rule in eval.c): the whole column, or — while a
+ * per-row evaluation is running — that column's cell in the current row,
+ * so `'price` reads what `price` reads wherever the expression is
+ * evaluated.  Owned ref; NULL when no query is active or the name is not a
+ * column of it. */
+ray_t* ray_active_query_literal(int64_t sym) {
+    ray_t* qt = g_active_query_table;
+    if (!qt || qt->type != RAY_TABLE) return NULL;
+    ray_t* col = ray_table_get_col(qt, sym);
+    if (!col) return NULL;
+    if (g_active_query_row < 0 || qt != g_active_query_row_tbl ||
+        g_active_query_row >= ray_len(col) ||
+        ray_env_query_scope_above(g_active_query_row_depth)) {
+        ray_retain(col); return col;
+    }
+    int allocated = 0;
+    ray_t* cell = collection_elem(col, g_active_query_row, &allocated);
+    if (!cell || RAY_IS_ERR(cell)) return cell;
+    if (!allocated) ray_retain(cell);
+    return cell;
+}
+
 static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
     /* Exact-size carve, mirrors nonagg_eval_per_group_core: ncols(tbl) is
      * a hard upper bound for collect_col_refs's deduplicated table-column
@@ -3471,7 +3607,12 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
      * the previous value and restore it before EVERY exit from this scope
      * (including error returns), exactly as the bind_all_columns sites do. */
     ray_t* _aqt = g_active_query_table;
-    g_active_query_table = tbl;
+    int64_t _aqr = g_active_query_row;
+    ray_t*  _aqrt = g_active_query_row_tbl;
+    int32_t _aqrd = g_active_query_row_depth;
+    g_active_query_table     = tbl;
+    g_active_query_row_tbl   = tbl;
+    g_active_query_row_depth = ray_env_scope_depth();   /* just above our own frame */
 
     ray_t* result = NULL;
     int direct_typed = 0;
@@ -3482,7 +3623,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             int allocated = 0;
             ray_t* arg = collection_elem(cols[i], row, &allocated);
             if (!arg || RAY_IS_ERR(arg)) {
-                g_active_query_table = _aqt;
+                g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                 ray_env_pop_scope();
                 if (result) ray_release(result);
                 scratch_free(refs_hdr);
@@ -3492,9 +3633,10 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             if (allocated) ray_release(arg);
         }
 
+        g_active_query_row = row;
         ray_t* cell = ray_eval(expr);
         if (!cell || RAY_IS_ERR(cell)) {
-            g_active_query_table = _aqt;
+            g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
             ray_env_pop_scope();
             if (result) ray_release(result);
             scratch_free(refs_hdr);
@@ -3507,7 +3649,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             if (collapsable) {
                 result = ray_vec_new((int8_t)-t, nrows);
                 if (!result || RAY_IS_ERR(result)) {
-                    g_active_query_table = _aqt;
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
                     ray_release(cell);
                     scratch_free(refs_hdr);
@@ -3527,7 +3669,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             if (!collapsable) {
                 result = ray_alloc(nrows * sizeof(ray_t*));
                 if (!result) {
-                    g_active_query_table = _aqt;
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
                     ray_release(cell);
                     scratch_free(refs_hdr);
@@ -3547,7 +3689,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
                 ray_t* list_col = typed_vec_to_list(result, row, nrows);
                 ray_release(result);
                 if (RAY_IS_ERR(list_col)) {
-                    g_active_query_table = _aqt;
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
                     ray_release(cell);
                     scratch_free(refs_hdr);
@@ -3564,7 +3706,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
         }
     }
 
-    g_active_query_table = _aqt;
+    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
     ray_env_pop_scope();
     scratch_free(refs_hdr);
     if (!result) {
@@ -3587,6 +3729,10 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
 static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* _aqt = bind_all_columns(tbl);
+    /* Whole columns here, even when a per-row evaluation of an outer select
+     * is in progress (a nested select inside one of its outputs). */
+    int64_t _aqr = g_active_query_row;
+    g_active_query_row = -1;
     ray_t* result = ray_eval(expr);
     /* distinct/asc/desc/reverse return a lazy DAG chain (RAY_LAZY) — force it
      * to a concrete vector while the source columns it captured are still
@@ -3594,6 +3740,7 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     if (result && !RAY_IS_ERR(result))
         result = ray_lazy_materialize(result);
     g_active_query_table = _aqt;
+    g_active_query_row = _aqr;
     ray_env_pop_scope();
     if (!result)
         return ray_error("domain", "select: whole-column expression evaluation failed");
@@ -5135,6 +5282,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
 /* (select {from: t [where: pred] [by: key] [col: expr ...]})
  * Special form — receives unevaluated dict arg. */
 ray_t* ray_select(ray_t** args, int64_t n);
+static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved);
 ray_t* ray_update(ray_t** args, int64_t n);
 ray_t* ray_insert(ray_t** args, int64_t n);
 ray_t* ray_upsert(ray_t** args, int64_t n);
@@ -6196,7 +6344,7 @@ static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl) {
     rewritten = ray_dict_upsert(rewritten, from, extended);
     ray_release(from); ray_release(extended); extended = NULL;
     MAT_CHECK(rewritten);
-    ray_t* result = ray_select(&rewritten, 1);
+    ray_t* result = ray_select_impl(&rewritten, 1, true);
     ray_release(rewritten);
     return result;
 oom:
@@ -6207,7 +6355,595 @@ oom:
     #undef MAT_CHECK
 }
 
+/* --------------------------------------------------------------------------
+ * Grouped select: a projection may refer to an earlier projection.
+ *
+ * In a grouped select every output is an aggregate (or a per-group value)
+ * over the SOURCE rows, so a later output cannot read an earlier one as a
+ * column the way the ungrouped path does through the compile-time env.
+ * The reference is resolved at the expression level instead: each output
+ * value is rewritten with every earlier alias replaced by that alias's
+ * (already rewritten) expression, and the rewritten dict goes through the
+ * ordinary classification — `nn: (+ notional 1)` after
+ * `notional: (sum (* price volume))` becomes `(+ (sum (* price volume)) 1)`,
+ * which the arith-of-aggs decomposition evaluates over the group result.
+ *
+ * Two places keep the source column instead of the alias.  An alias is
+ * visible only to the outputs after it, so its own definition reads the
+ * source column of the same name.  And inside an AGGREGATE's argument a
+ * name that is a source column stays the source column — an aggregate
+ * consumes rows, an alias is one value per group, so `s: (sum s) mx: (max s)`
+ * asks for the max of the rows, not of a sum.  Outside aggregates the alias
+ * wins, as it does in an ungrouped select.  where:, by: and the sort keys
+ * are not outputs and are never rewritten.  A literal symbol naming an
+ * earlier alias resolves like the bare name; any other literal is left
+ * alone.  Nothing is rewritten inside a lambda, a quote or a let, whose own
+ * bindings could shadow the alias.
+ * -------------------------------------------------------------------------- */
+/* Binds output `kid` = `col` in `tbl` for the projections still to be
+ * evaluated: replaces the column of that name when there is one, appends
+ * otherwise.  Consumes one ref of `tbl`, returns an owned (possibly
+ * copied) table; `col` is retained by the table, the caller keeps its ref. */
+static ray_t* select_fallback_bind_alias(ray_t* tbl, int64_t kid, ray_t* col) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        if (ray_table_col_name(tbl, c) != kid) continue;
+        ray_t* t2 = ray_cow(tbl);   /* a failed copy leaves `tbl` untouched */
+        if (!t2 || RAY_IS_ERR(t2)) { ray_release(tbl); return t2; }
+        ray_table_set_col_idx(t2, c, col);
+        if (ray_table_get_col_idx(t2, c) != col) { ray_release(t2); return ray_error("oom", NULL); }
+        return t2;
+    }
+    return ray_table_add_col(tbl, kid, col);
+}
+
+static bool select_alias_skip_form(ray_t* head) {
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+    ray_t* s = ray_sym_str(head->i64);
+    if (!s) return false;
+    const char* p = ray_str_ptr(s);
+    size_t l = ray_str_len(s);
+    return (l == 2 && memcmp(p, "fn", 2) == 0) ||
+           (l == 3 && memcmp(p, "let", 3) == 0) ||
+           (l == 5 && memcmp(p, "quote", 5) == 0);
+}
+
+static bool select_alias_head_is_agg(ray_t* head) {
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+    if (resolve_agg_opcode(head->i64) != 0) return true;
+    ray_t* s = ray_sym_str(head->i64);
+    return s && ray_str_len(s) == 8 && memcmp(ray_str_ptr(s), "distinct", 8) == 0;
+}
+
+/* The first aggregate call in `expr` that sits inside another aggregate's
+ * argument, or NULL.  In a grouped select the inner one is already one
+ * value per group, so the outer one has no rows left to fold; evaluated
+ * anyway it collapses over the whole table and every group gets the same
+ * number.  A lambda or let body is its own scope and is not descended. */
+static ray_t* grouped_output_nested_agg(ray_t* expr, bool inside_agg) {
+    if (!expr || expr->type != RAY_LIST || expr->len < 1) return NULL;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_alias_skip_form(el[0])) return NULL;
+    bool agg = is_agg_expr(expr) != 0;
+    if (agg && inside_agg) return expr;
+    for (int64_t i = 1; i < expr->len; i++) {
+        ray_t* hit = grouped_output_nested_agg(el[i], inside_agg || agg);
+        if (hit) return hit;
+    }
+    return NULL;
+}
+
+/* ── Grouped alias planning ───────────────────────────────────────────────
+ * A grouped select's outputs may name earlier outputs.  Two kinds of alias:
+ *
+ *   ROW    — the expression aggregates nothing (`vals: price`, `s: sym`,
+ *            `p2: (* price 2)`): a value per source row.  Substituted by
+ *            value where referenced, so `m: (max vals)` is `(max price)`.
+ *   GROUP  — the expression contains an aggregate, or refers to a GROUP
+ *            alias: one value per group.  Never substituted.  An output
+ *            that refers to one outside an aggregate becomes a DERIVED
+ *            output: it leaves the engine's dict and is evaluated after
+ *            grouping, over the group result, where the alias is a column
+ *            (by reference — copying the expression made a chain like
+ *            `a3: (+ a2 a1)` double in size at every step).  Aggregates
+ *            inside a derived output are computed by the engine under
+ *            hidden names and read back from the result.  Inside an
+ *            aggregate's argument a GROUP alias has no rows left to fold
+ *            and is rejected.
+ *
+ * A lambda's formals shadow aliases in its body; `let` and `quote` forms
+ * are not descended. */
+
+enum { SEL_ALIAS_ROW = 0, SEL_ALIAS_GROUP = 1 };
+#define SEL_ALIAS_MAX_NODES 65536
+
+typedef struct {
+    int64_t  n_derived;
+    int64_t* derived_names;   /* [n_derived] */
+    ray_t**  derived_exprs;   /* [n_derived], owned */
+    int64_t  n_hidden;
+    int64_t* hidden_names;    /* [n_hidden]: engine outputs to drop from the result */
+    bool     sort_after;      /* asc:/desc:/take: taken out of the engine's dict */
+    ray_t*   hdr;             /* scratch block behind the arrays */
+} select_alias_plan_t;
+
+static void select_alias_plan_free(select_alias_plan_t* p) {
+    for (int64_t i = 0; i < p->n_derived; i++)
+        if (p->derived_exprs[i]) ray_release(p->derived_exprs[i]);
+    if (p->hdr) scratch_free(p->hdr);
+    memset(p, 0, sizeof(*p));
+}
+
+static bool select_sym_is(ray_t* s, const char* name, size_t len) {
+    if (!s || s->type != -RAY_SYM || (s->attrs & ATTR_QUOTED)) return false;
+    ray_t* str = ray_sym_str(s->i64);
+    return str && ray_str_len(str) == len && memcmp(ray_str_ptr(str), name, len) == 0;
+}
+
+static bool select_lambda_form(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST || expr->len < 3) return false;
+    ray_t** el = (ray_t**)ray_data(expr);
+    return select_sym_is(el[0], "fn", 2) && ray_is_vec(el[1]) && el[1]->type == RAY_SYM;
+}
+
+/* Aggregate calls anywhere in `expr` (is_agg_expr, the predicate
+ * select_extract_aggs extracts on — wider than the DAG-shaped count that
+ * sizes the engine's own hidden slots). */
+static int64_t count_agg_calls(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    int64_t c = is_agg_expr(expr) ? 1 : 0;
+    ray_t** e = (ray_t**)ray_data(expr);
+    for (int64_t i = 0; i < expr->len; i++) c += count_agg_calls(e[i]);
+    return c;
+}
+
+/* True when `expr` reads a column of `tbl` (bare or literal name; a
+ * lambda's formals shadow).  Used on a ROW alias's expression when it is
+ * substituted outside an aggregate: the source column it carries is then
+ * read per row, whatever name it came in under. */
+static bool select_expr_reads_col(ray_t* expr, ray_t* tbl, const int64_t* shadow, int n_shadow) {
+    if (!expr) return false;
+    if (expr->type == -RAY_SYM) {
+        for (int i = 0; i < n_shadow; i++) if (shadow[i] == expr->i64) return false;
+        return ray_table_get_col(tbl, expr->i64) != NULL;
+    }
+    if (expr->type != RAY_LIST || expr->len < 1) return false;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_sym_is(el[0], "quote", 5)) return false;
+    if (select_lambda_form(expr)) {
+        int64_t nf = ray_len(el[1]);
+        ray_t* hdr = NULL;
+        int64_t* merged = (int64_t*)scratch_alloc(&hdr, (size_t)(n_shadow + nf + 1) * sizeof(int64_t));
+        if (!merged) return true;   /* cannot tell: report the safe answer */
+        for (int i = 0; i < n_shadow; i++) merged[i] = shadow[i];
+        for (int64_t i = 0; i < nf; i++) merged[n_shadow + i] = sym_cell_runtime_id(el[1], i);
+        bool r = false;
+        for (int64_t i = 2; i < expr->len && !r; i++)
+            r = select_expr_reads_col(el[i], tbl, merged, n_shadow + (int)nf);
+        scratch_free(hdr);
+        return r;
+    }
+    for (int64_t i = 0; i < expr->len; i++)
+        if (select_expr_reads_col(el[i], tbl, shadow, n_shadow)) return true;
+    return false;
+}
+
+static int64_t expr_node_count(ray_t* expr, int64_t cap) {
+    if (!expr) return 0;
+    if (expr->type != RAY_LIST) return 1;
+    int64_t n = 1;
+    ray_t** el = (ray_t**)ray_data(expr);
+    for (int64_t i = 0; i < expr->len && n < cap; i++)
+        n += expr_node_count(el[i], cap - n);
+    return n;
+}
+
+/* Rebuilds `expr` with element i replaced by f(el[i]) for i >= from; the
+ * list is copied only once an element changes.  `sub` returns an owned
+ * expression.  Shared by the three walkers below. */
+typedef ray_t* (*select_alias_map_fn)(ray_t* e, void* ctx);
+
+static ray_t* select_alias_map_list(ray_t* expr, int64_t from, select_alias_map_fn fn, void* ctx) {
+    ray_t** el = (ray_t**)ray_data(expr);
+    ray_t* out = NULL;
+    for (int64_t i = from; i < expr->len; i++) {
+        ray_t* e2 = fn(el[i], ctx);
+        if (!e2 || RAY_IS_ERR(e2)) { if (out) ray_release(out); return e2 ? e2 : ray_error("oom", NULL); }
+        if (e2 != el[i] && !out) {
+            out = ray_list_new(expr->len);
+            if (!out || RAY_IS_ERR(out)) { ray_release(e2); return out ? out : ray_error("oom", NULL); }
+            for (int64_t j = 0; j < i; j++) {
+                out = ray_list_append(out, el[j]);
+                if (!out || RAY_IS_ERR(out)) { ray_release(e2); return out ? out : ray_error("oom", NULL); }
+            }
+        }
+        if (out) {
+            out = ray_list_append(out, e2);
+            ray_release(e2);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        } else {
+            ray_release(e2);
+        }
+    }
+    if (!out) { ray_retain(expr); return expr; }
+    return out;
+}
+
+typedef struct {
+    const int64_t* names;
+    ray_t**        exprs;
+    const uint8_t* kinds;
+    int            n_alias;
+    ray_t*         tbl;
+    bool           in_agg;
+    const int64_t* shadow;
+    int            n_shadow;
+    bool           changed;
+    bool           refs_group;
+    bool           refs_row;     /* a source column read outside an aggregate */
+    const int64_t* keys;         /* by: names — columns of the group result, not per-row reads */
+    int            n_keys;
+} select_alias_subst_ctx_t;
+
+static bool select_sym_in(int64_t sym, const int64_t* syms, int n) {
+    for (int i = 0; i < n; i++) if (syms[i] == sym) return true;
+    return false;
+}
+
+static ray_t* select_alias_subst(ray_t* expr, void* vctx) {
+    select_alias_subst_ctx_t* c = (select_alias_subst_ctx_t*)vctx;
+    if (!expr) return NULL;
+    if (expr->type == -RAY_SYM) {
+        for (int i = 0; i < c->n_shadow; i++)
+            if (c->shadow[i] == expr->i64) { ray_retain(expr); return expr; }
+        /* inside an aggregate's argument a source column is the source column */
+        if (c->in_agg && ray_table_get_col(c->tbl, expr->i64)) { ray_retain(expr); return expr; }
+        for (int i = c->n_alias - 1; i >= 0; i--) {
+            if (c->names[i] != expr->i64) continue;
+            if (c->kinds[i] == SEL_ALIAS_GROUP) {
+                if (c->in_agg) {
+                    ray_t* s = ray_sym_str(expr->i64);
+                    return ray_error("domain",
+                        "select by: `%.*s` is an aggregate of the group and cannot be aggregated again",
+                        s ? (int)ray_str_len(s) : 1, s ? ray_str_ptr(s) : "?");
+                }
+                c->refs_group = true;
+                ray_retain(expr); return expr;
+            }
+            c->changed = true;
+            if (!c->in_agg && select_expr_reads_col(c->exprs[i], c->tbl, c->keys, c->n_keys)) c->refs_row = true;
+            ray_retain(c->exprs[i]);
+            return c->exprs[i];
+        }
+        if (!c->in_agg && !select_sym_in(expr->i64, c->keys, c->n_keys) &&
+            ray_table_get_col(c->tbl, expr->i64)) c->refs_row = true;
+        ray_retain(expr); return expr;
+    }
+    if (expr->type != RAY_LIST || expr->len < 1) { ray_retain(expr); return expr; }
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_sym_is(el[0], "let", 3) || select_sym_is(el[0], "quote", 5)) { ray_retain(expr); return expr; }
+    if (select_lambda_form(expr)) {
+        int64_t nf = ray_len(el[1]);
+        ray_t* sh_hdr = NULL;
+        int64_t* merged = (int64_t*)scratch_alloc(&sh_hdr, (size_t)(c->n_shadow + nf + 1) * sizeof(int64_t));
+        if (!merged) return ray_error("oom", NULL);
+        for (int i = 0; i < c->n_shadow; i++) merged[i] = c->shadow[i];
+        for (int64_t i = 0; i < nf; i++) merged[c->n_shadow + i] = sym_cell_runtime_id(el[1], i);
+        select_alias_subst_ctx_t inner = *c;
+        inner.shadow = merged; inner.n_shadow = c->n_shadow + (int)nf;
+        ray_t* out = select_alias_map_list(expr, 2, select_alias_subst, &inner);
+        scratch_free(sh_hdr);
+        c->changed |= inner.changed; c->refs_group |= inner.refs_group; c->refs_row |= inner.refs_row;
+        return out;
+    }
+    select_alias_subst_ctx_t inner = *c;
+    inner.in_agg = c->in_agg || select_alias_head_is_agg(el[0]);
+    /* a call whose head is itself a form — `((fn [x] …) 1)` — is walked
+     * from the head, which is where such a lambda's body lives */
+    ray_t* out = select_alias_map_list(expr, el[0]->type == RAY_LIST ? 0 : 1,
+                                       select_alias_subst, &inner);
+    c->changed |= inner.changed; c->refs_group |= inner.refs_group; c->refs_row |= inner.refs_row;
+    return out;
+}
+
+/* Replaces every aggregate call in a derived output by a hidden engine
+ * output `__ad<k>` (added to `*engine`) and returns the rewritten
+ * expression, owned.  Lambda, let and quote forms are left alone. */
+typedef struct {
+    ray_t** engine;
+    select_alias_plan_t* plan;
+    const int64_t* shadow;   /* lambda formals in scope: an aggregate over one stays put */
+    int n_shadow;
+} select_extract_ctx_t;
+
+static bool select_expr_mentions(ray_t* expr, const int64_t* syms, int n) {
+    if (!expr) return false;
+    if (expr->type == -RAY_SYM) {
+        for (int i = 0; i < n; i++) if (syms[i] == expr->i64) return true;
+        return false;
+    }
+    if (expr->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(expr);
+    for (int64_t i = 0; i < expr->len; i++)
+        if (select_expr_mentions(el[i], syms, n)) return true;
+    return false;
+}
+
+static ray_t* select_extract_aggs(ray_t* expr, void* vctx) {
+    select_extract_ctx_t* c = (select_extract_ctx_t*)vctx;
+    if (!expr || expr->type != RAY_LIST || expr->len < 1) { ray_retain(expr); return expr; }
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_sym_is(el[0], "let", 3) || select_sym_is(el[0], "quote", 5)) { ray_retain(expr); return expr; }
+    if (select_lambda_form(expr)) {
+        int64_t nf = ray_len(el[1]);
+        ray_t* hdr = NULL;
+        int64_t* merged = (int64_t*)scratch_alloc(&hdr, (size_t)(c->n_shadow + nf + 1) * sizeof(int64_t));
+        if (!merged) return ray_error("oom", NULL);
+        for (int i = 0; i < c->n_shadow; i++) merged[i] = c->shadow[i];
+        for (int64_t i = 0; i < nf; i++) merged[c->n_shadow + i] = sym_cell_runtime_id(el[1], i);
+        select_extract_ctx_t inner = *c;
+        inner.shadow = merged; inner.n_shadow = c->n_shadow + (int)nf;
+        ray_t* out = select_alias_map_list(expr, 2, select_extract_aggs, &inner);
+        scratch_free(hdr);
+        return out;
+    }
+    if (is_agg_expr(expr) && !select_expr_mentions(expr, c->shadow, c->n_shadow)) {
+        char buf[24];
+        int bn = snprintf(buf, sizeof buf, "__ad%lld", (long long)c->plan->n_hidden);
+        int64_t hn = ray_sym_intern(buf, (size_t)bn);
+        ray_t* key = ray_sym(hn);
+        if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
+        *c->engine = ray_dict_upsert(*c->engine, key, expr);   /* retains expr */
+        ray_release(key);
+        if (!*c->engine || RAY_IS_ERR(*c->engine)) { ray_t* e = *c->engine; *c->engine = NULL; return e ? e : ray_error("oom", NULL); }
+        c->plan->hidden_names[c->plan->n_hidden++] = hn;
+        return ray_sym(hn);
+    }
+    return select_alias_map_list(expr, el[0]->type == RAY_LIST ? 0 : 1, select_extract_aggs, c);
+}
+
+/* Plans the grouped select: NULL when the dict has no by: or nothing refers
+ * to an earlier alias (nothing to do); an error; or an owned dict for the
+ * engine (ROW aliases substituted, derived outputs and — when there are
+ * any — asc:/desc:/take: removed, hidden aggregates added, from: replaced by
+ * the evaluated table) with `plan` filled in for select_apply_derived. */
+/* Does `expr` mention (bare or literal) any of the first `n` names? */
+static bool select_expr_mentions_key(ray_t* expr, ray_t* keys, int64_t n) {
+    if (!expr) return false;
+    if (expr->type == -RAY_SYM) {
+        for (int64_t i = 0; i < n; i++) if (sym_cell_runtime_id(keys, i) == expr->i64) return true;
+        return false;
+    }
+    if (expr->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(expr);
+    for (int64_t i = 0; i < expr->len; i++)
+        if (select_expr_mentions_key(el[i], keys, n)) return true;
+    return false;
+}
+
+static ray_t* select_plan_grouped_aliases(ray_t* dict, ray_t* tbl, select_alias_plan_t* plan) {
+    memset(plan, 0, sizeof(*plan));
+    if (!dict || dict->type != RAY_DICT || !dict_get(dict, "by")) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    int64_t nd = ray_dict_len(dict);
+    /* Most grouped selects name no earlier output: leave before any
+     * allocation unless some value mentions a key that precedes it. */
+    {
+        bool any = false;
+        for (int64_t i = 1; i < nd && !any; i++)
+            any = select_expr_mentions_key(((ray_t**)ray_data(vals))[i], keys, i);
+        if (!any) return NULL;
+    }
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    int64_t rid[7];
+    for (int i = 0; i < 7; i++) rid[i] = ray_sym_intern(reserved[i], strlen(reserved[i]));
+    int64_t hidden_max = 1;
+    for (int64_t i = 0; i < nd; i++)
+        hidden_max += count_agg_calls(((ray_t**)ray_data(vals))[i]);
+    ray_t* work_hdr = NULL;
+    int64_t* names = (int64_t*)scratch_alloc(&work_hdr,
+        (size_t)(nd > 0 ? nd : 1) * (sizeof(int64_t) + sizeof(ray_t*) + sizeof(uint8_t)));
+    if (!names) return ray_error("oom", NULL);
+    ray_t** exprs = (ray_t**)(names + nd);
+    uint8_t* kinds = (uint8_t*)(exprs + nd);
+    plan->derived_names = (int64_t*)scratch_alloc(&plan->hdr,
+        (size_t)(nd > 0 ? nd : 1) * (sizeof(int64_t) + sizeof(ray_t*)) + (size_t)hidden_max * sizeof(int64_t));
+    if (!plan->derived_names) { scratch_free(work_hdr); return ray_error("oom", NULL); }
+    plan->derived_exprs = (ray_t**)(plan->derived_names + nd);
+    plan->hidden_names  = (int64_t*)(plan->derived_exprs + nd);
+    /* The by: names: a group key is a column of the group result (one value
+     * per group), so reading it beside a GROUP alias is not a per-row read. */
+    ray_t* by_expr = dict_get(dict, "by");
+    ray_t* keys_hdr = NULL;
+    int64_t* key_syms = NULL;
+    int n_key_syms = 0;
+    {
+        int64_t nk = 0;
+        if (by_expr && by_expr->type == -RAY_SYM) nk = 1;
+        else if (by_expr && ray_is_vec(by_expr) && by_expr->type == RAY_SYM) nk = ray_len(by_expr);
+        else if (by_expr && by_expr->type == RAY_DICT) nk = ray_dict_len(by_expr);
+        key_syms = (int64_t*)scratch_alloc(&keys_hdr, (size_t)(nk > 0 ? nk : 1) * sizeof(int64_t));
+        if (!key_syms) { scratch_free(work_hdr); select_alias_plan_free(plan); return ray_error("oom", NULL); }
+        if (by_expr && by_expr->type == -RAY_SYM) key_syms[n_key_syms++] = by_expr->i64;
+        else if (by_expr && ray_is_vec(by_expr) && by_expr->type == RAY_SYM)
+            for (int64_t k = 0; k < nk; k++) key_syms[n_key_syms++] = sym_cell_runtime_id(by_expr, k);
+        else if (by_expr && by_expr->type == RAY_DICT) {
+            ray_t* bk = ray_dict_keys(by_expr);
+            if (bk && bk->type == RAY_SYM)
+                for (int64_t k = 0; k < nk; k++) key_syms[n_key_syms++] = sym_cell_runtime_id(bk, k);
+        }
+    }
+    int n_alias = 0;
+    ray_t* engine = NULL;            /* owned once anything changes */
+    ray_t* err = NULL;
+    for (int64_t i = 0; i < nd && !err; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        bool is_reserved = false;
+        for (int r = 0; r < 7; r++) if (rid[r] == kid) { is_reserved = true; break; }
+        if (is_reserved) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        select_alias_subst_ctx_t sc = { names, exprs, kinds, n_alias, tbl, false, NULL, 0, false, false, false, key_syms, n_key_syms };
+        ray_t* v1 = select_alias_subst(v, &sc);
+        if (!v1 || RAY_IS_ERR(v1)) { err = v1 ? v1 : ray_error("oom", NULL); break; }
+        if (sc.refs_group && sc.refs_row) {
+            /* one value per group beside a value per row: the output has
+             * no single shape; the column needs an aggregate around it */
+            ray_t* s = ray_sym_str(kid);
+            ray_release(v1);
+            err = ray_error("domain", "select by: output `%.*s` combines a source column with a per-group value; aggregate the column",
+                            s ? (int)ray_str_len(s) : 1, s ? ray_str_ptr(s) : "?");
+            break;
+        }
+        if (sc.changed && expr_node_count(v1, SEL_ALIAS_MAX_NODES) >= SEL_ALIAS_MAX_NODES) {
+            ray_t* s = ray_sym_str(kid);
+            ray_release(v1);
+            err = ray_error("limit", "select by: output `%.*s` grows too large once its aliases are expanded",
+                            s ? (int)ray_str_len(s) : 1, s ? ray_str_ptr(s) : "?");
+            break;
+        }
+        ray_t* key = ray_sym(kid);
+        if (!key || RAY_IS_ERR(key)) { ray_release(v1); err = key ? key : ray_error("oom", NULL); break; }
+        if (sc.refs_group) {
+            /* derived: out of the engine's dict, aggregates inside it in */
+            if (!engine) { engine = dict; ray_retain(engine); }
+            engine = ray_dict_remove(engine, key);
+            if (!engine || RAY_IS_ERR(engine)) { ray_release(key); ray_release(v1); err = engine ? engine : ray_error("oom", NULL); engine = NULL; break; }
+            select_extract_ctx_t xc = { &engine, plan, NULL, 0 };
+            ray_t* v2 = select_extract_aggs(v1, &xc);
+            ray_release(v1);
+            if (!v2 || RAY_IS_ERR(v2)) { ray_release(key); err = v2 ? v2 : ray_error("oom", NULL); break; }
+            plan->derived_names[plan->n_derived] = kid;
+            plan->derived_exprs[plan->n_derived] = v2;      /* owned by the plan */
+            plan->n_derived++;
+            names[n_alias] = kid; exprs[n_alias] = v2; kinds[n_alias] = SEL_ALIAS_GROUP;
+            n_alias++;
+            ray_release(key);
+            continue;
+        }
+        if (sc.changed) {
+            if (!engine) { engine = dict; ray_retain(engine); }
+            engine = ray_dict_upsert(engine, key, v1);      /* retains v1 */
+            if (!engine || RAY_IS_ERR(engine)) { ray_release(key); ray_release(v1); err = engine ? engine : ray_error("oom", NULL); engine = NULL; break; }
+        }
+        ray_release(key);
+        /* bind AFTER the value: visible to later outputs only.  exprs[]
+         * borrows v1 from the dict it now lives in. */
+        names[n_alias] = kid;
+        exprs[n_alias] = v1;
+        kinds[n_alias] = expr_contains_agg(v1) ? SEL_ALIAS_GROUP : SEL_ALIAS_ROW;
+        n_alias++;
+        ray_release(v1);
+    }
+    scratch_free(work_hdr);
+    scratch_free(keys_hdr);
+    if (err) { if (engine) ray_release(engine); select_alias_plan_free(plan); return err; }
+    if (!engine) { select_alias_plan_free(plan); return NULL; }
+    /* Sort keys and take: may name a derived output: apply them after. */
+    if (plan->n_derived > 0) {
+        for (int r = 3; r <= 5; r++) {
+            ray_t* key = ray_sym(rid[r]);
+            if (!key || RAY_IS_ERR(key)) { ray_release(engine); select_alias_plan_free(plan); return key ? key : ray_error("oom", NULL); }
+            if (dict_get(dict, reserved[r])) plan->sort_after = true;
+            engine = ray_dict_remove(engine, key);
+            ray_release(key);
+            if (!engine || RAY_IS_ERR(engine)) { select_alias_plan_free(plan); return engine ? engine : ray_error("oom", NULL); }
+        }
+    }
+    ray_t* from_key = ray_sym(rid[0]);
+    if (!from_key || RAY_IS_ERR(from_key)) { ray_release(engine); select_alias_plan_free(plan); return from_key ? from_key : ray_error("oom", NULL); }
+    engine = ray_dict_upsert(engine, from_key, tbl);
+    ray_release(from_key);
+    if (!engine || RAY_IS_ERR(engine)) { select_alias_plan_free(plan); return engine ? engine : ray_error("oom", NULL); }
+    return engine;
+}
+
+/* A derived output is evaluated once over the group result with every
+ * column bound (vector semantics) unless it holds a form that takes one
+ * condition or one value — `if` and the other control forms, a lambda
+ * body — in which case it is evaluated row by row. */
+static bool select_derived_needs_rows(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST || expr->len < 1) return false;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) return true;   /* ((fn …) …) and friends */
+    if (agg_arith_head_is_control(el[0]->i64) || select_sym_is(el[0], "cond", 4)) return true;
+    ray_t* gv = ray_env_get(el[0]->i64);
+    if (gv && gv->type == RAY_LAMBDA) return true;
+    for (int64_t i = 1; i < expr->len; i++)
+        if (select_derived_needs_rows(el[i])) return true;
+    return false;
+}
+
+/* Evaluates the derived outputs over the engine's result (in order, each
+ * one visible to the next), drops the hidden aggregate columns, restores
+ * the dict's output order and applies the sort keys and take: that were
+ * held back.  Consumes `result`. */
+static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan_t* plan) {
+    if (!result || RAY_IS_ERR(result)) return result;
+    if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
+    if (!result || RAY_IS_ERR(result)) return result;
+    if (result->type != RAY_TABLE) return result;
+    int64_t n_groups = ray_table_nrows(result);
+    for (int64_t d = 0; d < plan->n_derived; d++) {
+        ray_t* expr = plan->derived_exprs[d];
+        ray_t* col = select_derived_needs_rows(expr)
+            ? eval_expr_per_row(expr, result, n_groups)
+            : eval_expr_whole_column(expr, result);
+        if (!col || RAY_IS_ERR(col)) { ray_release(result); return col ? col : ray_error("oom", NULL); }
+        if (ray_is_lazy(col)) col = ray_lazy_materialize(col);
+        if (!col || RAY_IS_ERR(col)) { ray_release(result); return col ? col : ray_error("oom", NULL); }
+        if (!(ray_is_vec(col) || col->type == RAY_LIST) || ray_len(col) != n_groups) {
+            ray_t* nm = ray_sym_str(plan->derived_names[d]);
+            ray_release(col); ray_release(result);
+            return ray_error("domain", "select by: output `%.*s` did not evaluate to one value per group",
+                             nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+        }
+        result = select_fallback_bind_alias(result, plan->derived_names[d], col);
+        ray_release(col);
+        if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    }
+    /* Key columns first (whatever the engine emitted that is not an output),
+     * then the outputs in the dict's order, hidden aggregates dropped. */
+    DICT_VIEW_DECL(dv);
+    DICT_VIEW_OPEN(dict, dv);
+    if (DICT_VIEW_OVERFLOW(dv)) { DICT_VIEW_CLOSE(dv); ray_release(result); return ray_error("oom", NULL); }
+    int64_t from_id = ray_sym_intern("from", 4), where_id = ray_sym_intern("where", 5), by_id = ray_sym_intern("by", 2);
+    int64_t take_id = ray_sym_intern("take", 4), asc_id = ray_sym_intern("asc", 3), desc_id = ray_sym_intern("desc", 4);
+    int64_t nearest_id = ray_sym_intern("nearest", 7);
+    int64_t ncols = ray_table_ncols(result);
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) { DICT_VIEW_CLOSE(dv); ray_release(result); return out ? out : ray_error("oom", NULL); }
+    for (int64_t c = 0; c < ncols && out && !RAY_IS_ERR(out); c++) {
+        int64_t cn = ray_table_col_name(result, c);
+        bool is_output = false, is_hidden = false;
+        for (int64_t i = 0; i + 1 < dv_n; i += 2)
+            if (dv[i]->i64 == cn && cn != from_id && cn != where_id && cn != by_id && cn != take_id && cn != asc_id && cn != desc_id && cn != nearest_id) { is_output = true; break; }
+        for (int64_t h = 0; h < plan->n_hidden; h++) if (plan->hidden_names[h] == cn) { is_hidden = true; break; }
+        if (is_output || is_hidden) continue;
+        out = ray_table_add_col(out, cn, ray_table_get_col_idx(result, c));
+    }
+    for (int64_t i = 0; i + 1 < dv_n && out && !RAY_IS_ERR(out); i += 2) {
+        int64_t cn = dv[i]->i64;
+        if (cn == from_id || cn == where_id || cn == by_id || cn == take_id || cn == asc_id || cn == desc_id || cn == nearest_id) continue;
+        ray_t* col = ray_table_get_col(result, cn);
+        if (!col) continue;   /* an output the engine folded away (e.g. a key projection) */
+        out = ray_table_add_col(out, cn, col);
+    }
+    if (!out || RAY_IS_ERR(out)) { DICT_VIEW_CLOSE(dv); ray_release(result); return out ? out : ray_error("oom", NULL); }
+    ray_release(result);
+    result = out;
+    if (plan->sort_after)
+        result = apply_sort_take(result, dv, dv_n, asc_id, desc_id, take_id, NULL);
+    DICT_VIEW_CLOSE(dv);
+    return result;
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
+    return ray_select_impl(args, n, false);
+}
+
+static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
@@ -6260,6 +6996,20 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         ray_group_emit_filter_set(prev_emit_filter);
     if (RAY_IS_ERR(tbl)) return tbl;
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
+
+    if (!aliases_resolved) {
+        select_alias_plan_t plan;
+        ray_t* engine = select_plan_grouped_aliases(dict, tbl, &plan);
+        if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
+        if (engine) {
+            ray_t* r = ray_select_impl(&engine, 1, true);
+            if (plan.n_derived > 0) r = select_apply_derived(r, dict, &plan);
+            select_alias_plan_free(&plan);
+            ray_release(engine);
+            ray_release(tbl);
+            return r;
+        }
+    }
 
     ray_t* temporal_result = try_temporal_group_materialize(dict, tbl);
     if (temporal_result) { ray_release(tbl); return temporal_result; }
@@ -7128,7 +7878,8 @@ by_dict_done:
         (size_t)hidden_max * (sizeof(ray_t*) + sizeof(int64_t)) +
         (size_t)nk_max * sizeof(ray_op_t*) +
         (size_t)aggs_max * (2 * sizeof(ray_op_t*) + 2 * sizeof(int64_t) + sizeof(uint16_t)) +
-        (size_t)2 * (size_t)n_dep_keys * sizeof(int64_t));
+        (size_t)2 * (size_t)n_dep_keys * sizeof(int64_t) +
+        (size_t)(nk_max + 2 * aggs_max) * sizeof(uint32_t));
     if (!nonagg_names) {
         scratch_free(dep_src_hdr);
         if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
@@ -7147,7 +7898,14 @@ by_dict_done:
     int64_t*   agg_names      = agg_k + aggs_max;
     dep_key_names             = agg_names + aggs_max;      /* [n_dep_keys] */
     dep_key_biases            = dep_key_names + n_dep_keys; /* [n_dep_keys] */
-    uint16_t*  agg_ops        = (uint16_t*)(dep_key_biases + n_dep_keys);
+    /* Node ids of key_ops / agg_ins / agg_ins2.  g->nodes grows by realloc
+     * as expressions compile, so a pointer taken from one compile is stale
+     * after the next; the ids are captured with each compile and the
+     * pointers re-resolved from them right before the group node is built. */
+    uint32_t*  key_ids        = (uint32_t*)(dep_key_biases + n_dep_keys); /* [nk_max] */
+    uint32_t*  agg_in_ids     = key_ids + nk_max;                         /* [aggs_max] */
+    uint32_t*  agg_in2_ids    = agg_in_ids + aggs_max;                    /* [aggs_max] */
+    uint16_t*  agg_ops        = (uint16_t*)(agg_in2_ids + aggs_max);
     /* Copy the bridged dependent-key names/biases into this block, then release
      * the transient collector.  n_dep_keys == 0 (non-dep path) → no-op, and
      * dep_src_hdr stays NULL. */
@@ -9183,6 +9941,16 @@ by_dict_done:
                 ray_t* expr = dict_elems[i + 1];
                 if (is_single_group_key_projection(by_expr, expr))
                     continue;
+                if (grouped_output_nested_agg(expr, false)) {
+                    ray_t* nm = ray_sym_str(kid);
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return ray_error("domain",
+                        "select by: output `%.*s` aggregates an aggregate of the group",
+                        nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+                }
                 if (is_group_dag_agg_expr_dag_safe(expr, tbl)) {
                     /* dag-aggs claim output slots in order.  Not a flat
                      * forcer. */
@@ -9385,7 +10153,7 @@ by_dict_done:
             }
             for (int64_t i = 0; i < deferred_nk && n_keys < nk_max; i++) {
                 key_ops[n_keys] = compile_expr_dag(g, dfv[i * 2 + 1]);
-                if (!key_ops[n_keys]) { DICT_VIEW_CLOSE(dfv); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
+                if (!key_ops[n_keys]) { ray_t* cerr = graph_take_compile_err(g); DICT_VIEW_CLOSE(dfv); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
                 n_keys++;
             }
             DICT_VIEW_CLOSE(dfv);
@@ -9414,9 +10182,12 @@ by_dict_done:
             /* Only a real expression is renamed: a bare column symbol lands
              * here too and keeps its own name. */
             computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
-            if (!key_ops[0]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
+            if (!key_ops[0]) { ray_t* cerr = graph_take_compile_err(g); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
+
+        for (int64_t ki = 0; ki < n_keys; ki++)
+            key_ids[ki] = key_ops[ki]->id;
 
         /* Collect aggregation expressions from output columns.
          * Non-agg expressions are tracked separately for post-DAG scatter.
@@ -9454,7 +10225,12 @@ by_dict_done:
                 agg_ops[n_aggs] = op;
                 /* Compile the aggregation input (the column reference) */
                 agg_ins[n_aggs] = compile_expr_dag(g, agg_arg);
-                if (!agg_ins[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile aggregation argument"); }
+                agg_in_ids[n_aggs] = agg_ins[n_aggs] ? agg_ins[n_aggs]->id : RAY_OP_NONE;
+                if (!agg_ins[n_aggs]) {
+                    ray_t* cerr = graph_take_compile_err(g);
+                    ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return cerr ? cerr : ray_error("domain", "select by: failed to compile aggregation argument");
+                }
                 agg_names[n_aggs] = kid;
                 /* Canonical aggregand type-admission (matches the scalar
                  * builtins): reject non-numeric / absolute-temporal inputs so a
@@ -9465,10 +10241,12 @@ by_dict_done:
                     ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select by: aggregation does not admit input type %s", ray_type_name(in_t));
                 }
                 agg_ins2[n_aggs] = NULL;
+                agg_in2_ids[n_aggs] = RAY_OP_NONE;
                 agg_k[n_aggs] = 0;
                 if (agg_is_binary_agg(op)) {
                     if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: binary aggregation requires two column arguments"); }
                     agg_ins2[n_aggs] = compile_expr_dag(g, agg_elems[2]);
+                    agg_in2_ids[n_aggs] = agg_ins2[n_aggs] ? agg_ins2[n_aggs]->id : RAY_OP_NONE;
                     if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument"); }
                     if (agg_ins2[n_aggs]->out_type > 0 &&
                         !agg_type_admitted(op, agg_ins2[n_aggs]->out_type)) {
@@ -9528,11 +10306,14 @@ by_dict_done:
             uint16_t hop = resolve_agg_opcode(he[0]->i64);
             agg_ops[n_aggs] = hop;
             agg_ins[n_aggs] = compile_expr_dag(g, he[1]);
+            agg_in_ids[n_aggs] = agg_ins[n_aggs] ? agg_ins[n_aggs]->id : RAY_OP_NONE;
             if (!agg_ins[n_aggs]) {
                 for (int ci = 0; ci < n_compound; ci++)
                     ray_release(compound_rw[ci]);
+                ray_t* cerr = graph_take_compile_err(g);
                 ray_graph_free(g); ray_release(tbl);
-                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile aggregation argument");
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return cerr ? cerr : ray_error("domain", "select by: failed to compile aggregation argument");
             }
             if (agg_ins[n_aggs]->out_type > 0 &&
                 !agg_type_admitted(hop, agg_ins[n_aggs]->out_type)) {
@@ -9543,10 +10324,12 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select by: aggregation does not admit input type %s", ray_type_name(in_t));
             }
             agg_ins2[n_aggs] = NULL;
+            agg_in2_ids[n_aggs] = RAY_OP_NONE;
             agg_k[n_aggs] = 0;
             if (agg_is_binary_agg(hop)) {
                 /* hidden_agg_shape_ok admitted two bare column arguments */
                 agg_ins2[n_aggs] = compile_expr_dag(g, he[2]);
+                agg_in2_ids[n_aggs] = agg_ins2[n_aggs] ? agg_ins2[n_aggs]->id : RAY_OP_NONE;
                 if (!agg_ins2[n_aggs]) {
                     for (int ci = 0; ci < n_compound; ci++)
                         ray_release(compound_rw[ci]);
@@ -9608,6 +10391,15 @@ by_dict_done:
                 has_agg_k = 1;
             }
             n_aggs++;
+        }
+
+        /* Re-resolve the collected op pointers: every compile above may have
+         * moved g->nodes. */
+        for (int64_t ki = 0; ki < n_keys; ki++)
+            key_ops[ki] = &g->nodes[key_ids[ki]];
+        for (int64_t ai = 0; ai < n_aggs; ai++) {
+            agg_ins[ai]  = &g->nodes[agg_in_ids[ai]];
+            agg_ins2[ai] = agg_in2_ids[ai] != RAY_OP_NONE ? &g->nodes[agg_in2_ids[ai]] : NULL;
         }
 
         if (n_aggs > 0 || n_nonaggs > 0) {
@@ -10380,13 +11172,27 @@ by_dict_done:
             if (nc_max < 1) nc_max = 1;
             ray_t* colops_hdr = NULL;
             ray_op_t** col_ops = (ray_op_t**)scratch_alloc(&colops_hdr,
-                    (size_t)nc_max * sizeof(ray_op_t*));
+                    (size_t)nc_max * (sizeof(ray_op_t*) + sizeof(int64_t) + sizeof(uint32_t)));
             if (!col_ops) {
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
             }
             int64_t nc = 0;
             int use_eval_fallback = 0;
+            /* Projections see the projections before them: once an output
+             * expression has compiled, its alias is published on the graph
+             * (g->sel_alias_*), where a later projection's name reference
+             * or literal symbol finds it ahead of the source table's
+             * columns.  The binding is made AFTER the expression compiles,
+             * so an alias that shadows a source column still reads the
+             * source in its own definition and the new value in every
+             * later one.  where:, by: and the sort keys are compiled
+             * outside this window and stay alias-blind. */
+            int64_t*  alias_syms = (int64_t*)(col_ops + nc_max);
+            uint32_t* alias_ids  = (uint32_t*)(alias_syms + nc_max);
+            g->sel_alias_syms = alias_syms;
+            g->sel_alias_ids  = alias_ids;
+            g->sel_alias_n    = 0;
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
@@ -10395,9 +11201,16 @@ by_dict_done:
                     use_eval_fallback = 1;
                     break;
                 }
+                alias_syms[nc] = kid;
+                alias_ids[nc]  = col_ops[nc]->id;
                 nc++;
+                g->sel_alias_n = (int)nc;
             }
+            g->sel_alias_syms = NULL;
+            g->sel_alias_ids  = NULL;
+            g->sel_alias_n    = 0;
             if (use_eval_fallback) {
+                if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
                 /* The fallback evaluates projections directly over `tbl`,
                  * bypassing the DAG's ray_execute — so a WHERE clause (wired
                  * into `root` as ray_filter) would be silently ignored.
@@ -10471,6 +11284,24 @@ by_dict_done:
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length", "select: output column length %lld does not match %lld", (long long)col_len, (long long)out_len);
+                    }
+                    /* Later projections see this one: bind it in the table
+                     * the remaining expressions are evaluated over, in place
+                     * of a source column of the same name.  A column of
+                     * another length (`distinct`) cannot be a row of that
+                     * table and stays unbound. */
+                    if (col_len == nrows) {
+                        ray_t* bound = select_fallback_bind_alias(tbl, kid, col);
+                        if (!bound || RAY_IS_ERR(bound)) {
+                            ray_release(col);
+                            ray_release(result);
+                            if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                            if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                            ray_graph_free(g);
+                            scratch_free(colops_hdr);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return bound ? bound : ray_error("oom", NULL);
+                        }
+                        tbl = bound;
                     }
                     result = ray_table_add_col(result, kid, col);
                     ray_release(col);
@@ -10878,12 +11709,24 @@ by_dict_done:
                         ray_env_set_local(hidden_agg_names[hi],
                                           ray_table_get_col_idx(result,
                                                                 hbase + hi));
+                    int64_t n_groups = ray_table_nrows(result);
                     for (int ci = 0; ci < n_compound && !cerr; ci++) {
                         ray_t* v = ray_eval(compound_rw[ci]);
-                        if (!v || RAY_IS_ERR(v))
+                        if (!v || RAY_IS_ERR(v)) {
                             cerr = v ? v : ray_error("domain",
                                 "select by: failed to evaluate aggregate expression");
-                        else comp_cols[ci] = v;
+                        } else if (ray_is_lazy(v) &&
+                                   (!(v = ray_lazy_materialize(v)) || RAY_IS_ERR(v))) {
+                            cerr = v ? v : ray_error("domain",
+                                "select by: failed to evaluate aggregate expression");
+                        } else if (!(ray_is_vec(v) || v->type == RAY_LIST) ||
+                                   ray_len(v) != n_groups) {
+                            ray_t* nm = ray_sym_str(compound_names[ci]);
+                            cerr = ray_error("domain",
+                                "select by: output `%.*s` did not evaluate to one value per group",
+                                nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+                            ray_release(v);
+                        } else comp_cols[ci] = v;
                     }
                     ray_env_pop_scope();
                 }
@@ -10911,14 +11754,22 @@ by_dict_done:
                 if (nt && !RAY_IS_ERR(nt)) {
                     ray_release(result);
                     result = nt;
-                } else if (nt) {
-                    ray_release(nt);
+                } else {
+                    /* An output that did not evaluate to one value per
+                     * group (a scalar, say) cannot be appended: report it
+                     * rather than hand back the hidden columns. */
+                    cerr = nt ? nt : ray_error("oom", NULL);
                 }
             }
             for (int ci = 0; ci < n_compound; ci++)
                 if (comp_cols[ci]) ray_release(comp_cols[ci]);
             scratch_free(cc_hdr);
             n_compound = 0;
+            if (cerr) {
+                ray_release(result);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr;
+            }
         }
     }
 
@@ -12828,7 +13679,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 /* Evaluate expression on sub-table via DAG */
                 ray_graph_t* ug = ray_graph_new(sub_tbl);
                 ray_op_t* expr_op = compile_expr_dag(ug, agg_expr);
-                if (!expr_op) { ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("domain", "update by: failed to compile aggregate expression"); }
+                if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return cerr ? cerr : ray_error("domain", "update by: failed to compile aggregate expression"); }
                 expr_op = ray_optimize(ug, expr_op);
                 ray_t* agg_result = ray_execute(ug, expr_op);
                 ray_graph_free(ug);
@@ -13498,7 +14349,7 @@ no_where_add_col:
         ray_t* update_expr = dict_elems[d + 1];
         ray_graph_t* ug = ray_graph_new(tbl);
         ray_op_t* expr_op = compile_expr_dag(ug, update_expr);
-        if (!expr_op) { ray_release(result); ray_release(tbl); ray_graph_free(ug); DICT_VIEW_CLOSE(upda); return ray_error("domain", "update: failed to compile new column expression"); }
+        if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_release(result); ray_release(tbl); ray_graph_free(ug); DICT_VIEW_CLOSE(upda); return cerr ? cerr : ray_error("domain", "update: failed to compile new column expression"); }
         expr_op = ray_optimize(ug, expr_op);
         ray_t* expr_vec = ray_execute(ug, expr_op);
         ray_graph_free(ug);
@@ -18402,7 +19253,7 @@ static ray_t* asof_eval_select_segment(ray_t* dict, ray_t* parted_tbl, int32_t s
     ray_retain(keys);
     ray_t* ndict = ray_dict_new(keys, nvals);   /* consumes both */
     if (!ndict || RAY_IS_ERR(ndict)) return ndict ? ndict : ray_error("oom", NULL);
-    ray_t* r = ray_select(&ndict, 1);
+    ray_t* r = ray_select_impl(&ndict, 1, true);
     ray_release(ndict);
     return r;
 }
@@ -18942,7 +19793,7 @@ static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
 
     ray_t* dict = ray_dict_new(keys, vals);      /* consumes keys + vals */
     if (!dict || RAY_IS_ERR(dict)) return dict ? dict : ray_error("oom", NULL);
-    ray_t* raw = ray_select(&dict, 1);
+    ray_t* raw = ray_select_impl(&dict, 1, true);
     ray_release(dict);
     if (!raw || RAY_IS_ERR(raw)) return raw ? raw : ray_error("type", NULL);
 
