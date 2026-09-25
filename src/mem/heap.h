@@ -226,6 +226,13 @@ void     ray_heap_destroy(void);
 void     ray_heap_abandon(void);
 void     ray_heap_merge(ray_heap_t* src);
 void     ray_heap_flush_foreign(void);
+/* Give a parked worker's heap the blocks other threads freed to it.  For the
+ * dispatcher, once a parallel region has ended: a worker only drains its own
+ * list when its freelists run dry, so between dispatches the blocks the main
+ * thread freed sit unused while the worker keeps cutting fresh pool space.
+ * The caller vouches that the owning thread is idle (a pool worker on its
+ * semaphore); must run with ray_parallel_flag clear, does nothing otherwise. */
+void     ray_heap_reclaim_worker(ray_heap_t* h);
 void     ray_heap_push_pending(ray_heap_t* heap);
 void     ray_heap_drain_pending(void);
 uint8_t  ray_order_for_size(size_t data_size);

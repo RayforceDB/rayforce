@@ -140,6 +140,8 @@ ray_graph_t* ray_graph_new(ray_t* tbl) {
 void ray_graph_free(ray_graph_t* g) {
     if (!g) return;
 
+    if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
+
     /* Unconsumed slice-group hint (error paths / shapes that never
      * reached exec_group). */
     if (g->sg_col)        { ray_release(g->sg_col); g->sg_col = NULL; }

@@ -1615,6 +1615,8 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op);
 
 /* ── string_exec.c ── */
 ray_t* exec_like(ray_graph_t* g, ray_op_t* op);
+/* Shared LIKE kernel over a STR/SYM column (see string.c); selection may be NULL. */
+ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection);
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op);

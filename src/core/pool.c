@@ -82,6 +82,10 @@ static void worker_loop(void* arg) {
      * by an earlier worker (pools and slab caches intact). */
     ray_heap_init();
     ray_rc_sync = true;  /* workers always use atomic refcounting */
+    /* Publish the heap for the dispatcher's post-dispatch reclaim (release
+     * pairs with its acquire: the heap is fully initialised when seen). */
+    atomic_store_explicit(&pool->worker_heaps[wctx.worker_id - 1], ray_tl_heap,
+                          memory_order_release);
 
     for (;;) {
         ray_sem_wait(&pool->work_ready);
@@ -109,9 +113,10 @@ static void worker_loop(void* arg) {
                                       memory_order_acq_rel);
         }
 
-        /* No ray_heap_gc() here — removing worker GC between dispatch rounds
-         * ensures main can safely modify worker heaps in ray_parallel_end().
-         * Eager madvise in heap_coalesce already releases pages on free. */
+        /* No ray_heap_gc() here — a worker that neither allocates nor frees
+         * between its last pending-- and sem_wait is what lets the
+         * dispatcher drain worker foreign lists (ray_heap_reclaim_workers)
+         * and the idle decay walk worker heaps once the flag is clear. */
     }
 
     /* Abandon, do not destroy.  Another thread may still hold — and later
@@ -120,7 +125,24 @@ static void worker_loop(void* arg) {
      * a heap that could be unregistered and munmapped underneath that lookup
      * would be a use-after-free.  The heap stays registered with its pools
      * and is adopted by the next worker thread that starts. */
+    atomic_store_explicit(&pool->worker_heaps[wctx.worker_id - 1], NULL,
+                          memory_order_release);
     ray_heap_abandon();
+}
+
+/* End of a parallel region: hand every worker the blocks other threads
+ * freed to it since the last dispatch, so the next round reuses them
+ * instead of cutting fresh pool space (issue #619).  Workers only — they
+ * are parked on the semaphore and touch nothing of their own until the
+ * next dispatch; any other registered heap may belong to a live thread.
+ * The dispatcher's own list is drained too, on its own thread. */
+static void pool_reclaim_worker_heaps(ray_pool_t* pool) {
+    for (uint32_t i = 0; i < pool->n_workers; i++) {
+        ray_heap_t* h = (ray_heap_t*)atomic_load_explicit(&pool->worker_heaps[i],
+                                                          memory_order_acquire);
+        if (h) ray_heap_reclaim_worker(h);
+    }
+    ray_heap_flush_foreign();
 }
 
 /* --------------------------------------------------------------------------
@@ -192,6 +214,15 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
         }
+        pool->worker_heaps = ray_sys_alloc(n_workers * sizeof(*pool->worker_heaps));
+        if (!pool->worker_heaps) {
+            ray_sys_free(pool->threads);
+            ray_sem_destroy(&pool->work_ready);
+            ray_sys_free(pool->tasks);
+            return RAY_ERR_OOM;
+        }
+        for (uint32_t i = 0; i < n_workers; i++)
+            atomic_store_explicit(&pool->worker_heaps[i], NULL, memory_order_relaxed);
 
         for (uint32_t i = 0; i < n_workers; i++) {
             worker_ctx_t* wctx = (worker_ctx_t*)ray_sys_alloc(sizeof(worker_ctx_t));
@@ -204,6 +235,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 for (uint32_t j = 0; j < i; j++) {
                     ray_thread_join(pool->threads[j]);
                 }
+                ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
                 ray_sem_destroy(&pool->work_ready);
                 ray_sys_free(pool->tasks);
@@ -222,6 +254,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 for (uint32_t j = 0; j < i; j++) {
                     ray_thread_join(pool->threads[j]);
                 }
+                ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
                 ray_sem_destroy(&pool->work_ready);
                 ray_sys_free(pool->tasks);
@@ -255,6 +288,7 @@ void ray_pool_free(ray_pool_t* pool) {
         ray_thread_join(pool->threads[i]);
     }
 
+    ray_sys_free(pool->worker_heaps);
     ray_sys_free(pool->threads);
     ray_sem_destroy(&pool->work_ready);
     ray_sys_free(pool->tasks);
@@ -392,6 +426,8 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
      * be between pending-- and sem_wait. */
     atomic_thread_fence(memory_order_seq_cst);
     ray_rc_sync = false;
+
+    pool_reclaim_worker_heaps(pool);
 }
 
 /* One round of ray_pool_dispatch_n: tasks [first, first+n_tasks), each handed
@@ -466,6 +502,7 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
     ray_rc_sync = false;
+    pool_reclaim_worker_heaps(pool);
 }
 
 /* --------------------------------------------------------------------------
