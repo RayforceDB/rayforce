@@ -1,0 +1,47 @@
+;; `like` over a whole column, called directly, runs the same kernel as
+;; `select … where: (like …)`: one pattern match per distinct symbol, the row
+;; pass over the worker pool.  Sizes past the parallel thresholds (SYM
+;; 100000 rows, STR 200000) so the pooled path runs; every answer must equal
+;; the select form and the same match over the plain strings.
+(set N 240000)
+(set i (til N))
+;; low cardinality (8-bit dictionary width) and high cardinality (wider ids)
+(set lo (as 'SYMBOL (map (fn [k] (format "site%.example.com" (% k 40))) i)))
+(set hi (as 'SYMBOL (map (fn [k] (format "http://h%.example.com/p/%/%" (% k 700) (% (* 31 k) 977) k)) i)))
+(set losv (as 'STR lo))
+(set hisv (as 'STR hi))
+(set T (table [lo hi losv hisv] (list lo hi losv hisv)))
+(count T) -- 240000
+;; SYM, 8-bit ids: prefix / contains / exact / class / any / none
+(all (== (like lo "site1*") (like losv "site1*"))) -- true
+(== (sum (as 'I64 (like lo "site1*"))) (count (select {from: T where: (like lo "site1*")}))) -- true
+(all (== (like lo "*7.example*") (like losv "*7.example*"))) -- true
+(== (sum (as 'I64 (like lo "*7.example*"))) (count (select {from: T where: (like lo "*7.example*")}))) -- true
+(all (== (like lo "site12.example.com") (like losv "site12.example.com"))) -- true
+(sum (as 'I64 (like lo "site12.example.com"))) -- 6000
+(all (== (like lo "site[12]?.example.com") (like losv "site[12]?.example.com"))) -- true
+(sum (as 'I64 (like lo "*"))) -- 240000
+(sum (as 'I64 (like lo "nothing*"))) -- 0
+;; SYM, wide ids
+(all (== (like hi "http://h1*") (like hisv "http://h1*"))) -- true
+(== (sum (as 'I64 (like hi "http://h1*"))) (count (select {from: T where: (like hi "http://h1*")}))) -- true
+(all (== (like hi "*/p/5/*") (like hisv "*/p/5/*"))) -- true
+(== (sum (as 'I64 (like hi "*/p/5/*"))) (count (select {from: T where: (like hi "*/p/5/*")}))) -- true
+(all (== (like hi "*/p/5/[0-9]") (like hisv "*/p/5/[0-9]"))) -- true
+(all (== (like hi "http://h12.example.com/p/492/*") (like hisv "http://h12.example.com/p/492/*"))) -- true
+;; STR column past its own parallel threshold
+(== (sum (as 'I64 (like hisv "*/p/5/*"))) (count (select {from: T where: (like hisv "*/p/5/*")}))) -- true
+(== (sum (as 'I64 (like losv "site1*"))) (count (select {from: T where: (like losv "site1*")}))) -- true
+;; the direct form and the select form agree with `==` on an exact pattern
+(sum (as 'I64 (like hi "http://h3.example.com/p/93/3"))) -- 1
+;; a parted column, taken from the table, runs the same kernel per segment
+(.sys.exec "rm -rf /tmp/rfl_like_vec_p") -- 0
+(set P1 (table [s] (list (as 'SYMBOL (map (fn [k] (format "a%" (% k 9))) (til 120000))))))
+(set P2 (table [s] (list (as 'SYMBOL (map (fn [k] (format "b%" (% k 9))) (til 120000))))))
+(.db.splayed.set "/tmp/rfl_like_vec_p/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_like_vec_p/2/t/" P2)
+(set PT (.db.parted.get "/tmp/rfl_like_vec_p/" 't))
+(== (sum (as 'I64 (like (at PT 's) "a*"))) (count (select {from: PT where: (like s "a*")}))) -- true
+(sum (as 'I64 (like (at PT 's) "a*"))) -- 120000
+(sum (as 'I64 (like (at PT 's) "?3"))) -- 26666
+(sum (as 'I64 (like (at PT 's) "*"))) -- 240000
