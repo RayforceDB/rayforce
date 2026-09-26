@@ -1,0 +1,32 @@
+;; A DAG node with several consumers is executed once and its value shared
+;; (exec_node memo).  The answers must equal the per-consumer evaluation the
+;; engine used to do, including when one consumer's kernel would have been
+;; free to reuse the input buffer in place (rc == 1) while a sibling still
+;; read it.
+(set N 70000)
+(set i (til N))
+(set S (as 'STR (map (fn [k] (if (== 0 (% k 11)) "" (if (== 0 (% k 3)) (format "http://www.host%.example.org/path/%/page?id=%" (% k 500) k (* k 13)) (if (== 0 (% k 7)) (format "ab%" (% k 10)) (format "https://host%.example.org/p/%" (% k 500) k))))) i)))
+(set T (table [S] (list S)))
+;; a let-bound string search used twice and three times equals its explicit form
+(all (== (at (select {from: T x: (let p (str-find S "://") (+ p p))}) 'x) (at (select {from: T x: (+ (str-find S "://") (str-find S "://"))}) 'x))) -- true
+(all (== (at (select {from: T x: (let p (str-find S "://") (+ p (+ p p)))}) 'x) (at (select {from: T x: (* 3 (str-find S "://"))}) 'x))) -- true
+;; the shared node feeds both an arithmetic consumer and a comparison; the
+;; comparison must see the original values
+(set R (select {from: T s: S x1: (let p (str-find S "://") (as 'I64 (within p [4 5]))) x3: (let p (str-find S "://") (let s (substr S (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (as 'I64 (not (nil? sl))))))) x4: (let p (str-find S "://") (let s (substr S (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (as 'I64 (and (within p [4 5]) (not (nil? sl)))))))) pp: (let p (str-find S "://") (let s (substr S (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (+ p (* 0 sl)))))) p0: (str-find S "://")}))
+(count (select {from: R where: (!= x4 (* x1 x3))})) -- 0
+(count (select {from: R where: (!= pp p0)})) -- 0
+(sum (at R 'x4)) -- 57576
+;; the whole derived host expression equals its unshared spelling
+(set host (fn [] (select {from: T k: (let p (str-find S "://") (let s (substr S (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr S 1 4) "http") (not (nil? sl))) (substr r 1 sl) S)))))})))
+(count (distinct (at (host) 'k))) -- 511
+(sum (as 'I64 (strlen (at (host) 'k)))) -- 1099454
+;; a shared node used both outside an `if` and inside its branches: the
+;; branch runs over its own rows only, so the value computed there must not
+;; be handed to the consumer that runs over the whole table (and vice versa)
+(set c (< (% i 7) 3))
+(set U (table [S c] (list S c)))
+(all (== (at (select {from: U r: (let x (upper S) (if c (concat x "?") (concat x "!")))}) 'r) (at (select {from: U r: (if c (concat (upper S) "?") (concat (upper S) "!"))}) 'r))) -- true
+(all (== (at (select {from: U r: (let x (strlen S) (if c x (+ x 1000)))}) 'r) (at (select {from: U r: (if c (strlen S) (+ (strlen S) 1000))}) 'r))) -- true
+(all (== (at (select {from: U r: (let x (strlen S) (+ x (if c x (+ x 1000))))}) 'r) (at (select {from: U r: (+ (strlen S) (if c (strlen S) (+ (strlen S) 1000)))}) 'r))) -- true
+(all (== (at (select {from: U r: (let x (substr S 8 5) (if c x (concat x "-")))}) 'r) (at (select {from: U r: (if c (substr S 8 5) (concat (substr S 8 5) "-"))}) 'r))) -- true
+(sum (at (select {from: U r: (let x (strlen S) (+ x (if c x (+ x 1000))))}) 'r)) -- 41272796

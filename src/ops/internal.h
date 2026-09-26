@@ -1603,6 +1603,19 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
 
 /* ── pivot_exec.c ── */
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op);
+
+/* Shared-node memo around a sub-evaluation over a swapped g->table
+ * (exec.c): push sets the outer memo aside and arms one for the current
+ * table and sub-root; pop tears it down and restores the outer one. */
+typedef struct {
+    ray_t**   vals;
+    uint32_t* uses;
+    uint32_t  n;
+    ray_t*    hdr;
+    ray_t*    table;
+} ray_exec_memo_save_t;
+void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save);
+void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
 /* ── embedding_exec.c ── */

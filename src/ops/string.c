@@ -987,158 +987,6 @@ static bool substr_scalar_arg(ray_t* v, int64_t* out) {
     }
 }
 
-static ray_t* substr_str_scalar_view(ray_t* input, int64_t start, int64_t length) {
-    if (!input || input->type != RAY_STR)
-        return NULL;
-
-    int64_t nrows = input->len;
-    ray_t* result = ray_vec_new(RAY_STR, nrows);
-    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
-    result->len = nrows;
-
-    const ray_str_t* src = NULL;
-    const char* pool = NULL;
-    str_resolve(input, &src, &pool);
-    ray_t* owner = (input->attrs & RAY_ATTR_SLICE) ? input->slice_parent : input;
-    ray_t* pool_obj = owner ? owner->str_pool : NULL;
-    if (pool_obj && !RAY_IS_ERR(pool_obj)) {
-        ray_retain(pool_obj);
-        result->str_pool = pool_obj;
-    }
-
-    ray_str_t* dst = (ray_str_t*)ray_data(result);
-    for (int64_t i = 0; i < nrows; i++) {
-        const ray_str_t* s = &src[i];
-        ray_str_t* d = &dst[i];
-        memset(d, 0, sizeof(*d));
-
-        int64_t st = start - 1;
-        int64_t sl = (int64_t)s->len;
-        if (st < 0) st = 0;
-        if (st >= sl) continue;
-
-        int64_t ln = length;
-        if (ln < 0 || ln > sl - st) ln = sl - st;
-        if (ln <= 0) continue;
-
-        d->len = (uint32_t)ln;
-        if (!ray_str_is_inline(s) && !pool) {
-            ray_release(result);
-            return NULL;
-        }
-        const char* sp = ray_str_t_ptr(s, pool) + st;
-        if (ln <= RAY_STR_INLINE_MAX) {
-            memcpy(d->data, sp, (size_t)ln);
-        } else if (!ray_str_is_inline(s) && pool_obj) {
-            if ((uint64_t)s->pool_off + (uint64_t)st > UINT32_MAX) {
-                ray_release(result);
-                return ray_error("range", "substr: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
-            }
-            memcpy(d->prefix, sp, 4);
-            d->pool_off = s->pool_off + (uint32_t)st;
-            ray_str_t_cache_hash(d, pool);
-        } else {
-            ray_release(result);
-            return NULL;
-        }
-    }
-
-    return result;
-}
-
-static bool substr_len_at(ray_t* len_v, int64_t row, int64_t* out) {
-    if (!len_v || !out) return false;
-    if (ray_vec_may_have_nulls(len_v)) {
-        if (ray_vec_is_null(len_v, row)) return false;
-    }
-    switch (len_v->type) {
-    case RAY_I64: {
-        int64_t v = ((const int64_t*)ray_data(len_v))[row];
-        if (v == NULL_I64) return false;
-        *out = v;
-        return true;
-    }
-    case RAY_I32: {
-        int32_t v = ((const int32_t*)ray_data(len_v))[row];
-        if (v == NULL_I32) return false;
-        *out = (int64_t)v;
-        return true;
-    }
-    default:
-        return false;
-    }
-}
-
-static ray_t* substr_str_scalar_start_len_view(ray_t* input,
-                                               int64_t start,
-                                               ray_t* len_v) {
-    if (!input || input->type != RAY_STR || !len_v)
-        return NULL;
-    if (len_v->type != RAY_I64 && len_v->type != RAY_I32)
-        return NULL;
-    int64_t nrows = input->len;
-    if (len_v->len != nrows)
-        return NULL;
-
-    ray_t* result = ray_vec_new(RAY_STR, nrows);
-    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
-    result->len = nrows;
-
-    const ray_str_t* src = NULL;
-    const char* pool = NULL;
-    str_resolve(input, &src, &pool);
-    ray_t* owner = (input->attrs & RAY_ATTR_SLICE) ? input->slice_parent : input;
-    ray_t* pool_obj = owner ? owner->str_pool : NULL;
-    if (pool_obj && !RAY_IS_ERR(pool_obj)) {
-        ray_retain(pool_obj);
-        result->str_pool = pool_obj;
-    }
-
-    ray_str_t* dst = (ray_str_t*)ray_data(result);
-    int64_t st0 = start - 1;
-    if (st0 < 0) st0 = 0;
-    for (int64_t i = 0; i < nrows; i++) {
-        ray_str_t* d = &dst[i];
-        memset(d, 0, sizeof(*d));
-
-        int64_t ln = 0;
-        if (!substr_len_at(len_v, i, &ln)) {
-            ray_vec_set_null(result, i, true);
-            continue;
-        }
-
-        const ray_str_t* s = &src[i];
-        int64_t sl = (int64_t)s->len;
-        if (st0 >= sl) continue;
-
-        if (ln < 0 || ln > sl - st0) ln = sl - st0;
-        if (ln <= 0) continue;
-
-        d->len = (uint32_t)ln;
-        if (!ray_str_is_inline(s) && !pool) {
-            ray_release(result);
-            return NULL;
-        }
-        const char* sp = ray_str_t_ptr(s, pool) + st0;
-        if (ln <= RAY_STR_INLINE_MAX) {
-            memcpy(d->data, sp, (size_t)ln);
-        } else if (!ray_str_is_inline(s) && pool_obj) {
-            if ((uint64_t)s->pool_off + (uint64_t)st0 > UINT32_MAX) {
-                ray_release(result);
-                return ray_error("range", "substr: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
-            }
-            memcpy(d->prefix, sp, 4);
-            d->pool_off = s->pool_off + (uint32_t)st0;
-            ray_str_t_cache_hash(d, pool);
-        } else {
-            ray_release(result);
-            return NULL;
-        }
-    }
-
-    return result;
-}
-
 /* True when a whole-column (scalar) start/length argument is null.  Such an
  * argument applies to every row, so the entire result is null — and a null
  * integer scalar is INT64_MIN, which must never reach the `scalar - 1`
@@ -1150,6 +998,135 @@ static bool substr_scalar_is_null(ray_t* v) {
     if (ray_is_vec(v) && v->len == 1 && ray_vec_may_have_nulls(v))
         return ray_vec_is_null(v, 0);
     return false;
+}
+
+/* Per-row start / length argument of substr: an atom, a 1-element vector
+ * (scalar), or a vector with one value per row (I64 / I32 / F64).  `ok` is
+ * false for a null. */
+typedef struct {
+    int64_t        scalar;
+    const int64_t* i64;
+    const int32_t* i32;
+    const double*  f64;
+    ray_t*         v;          /* the vector, for null checks; NULL for scalars */
+    bool           all_null;
+} substr_arg_t;
+
+static bool substr_arg_init(ray_t* v, int64_t nrows, substr_arg_t* a) {
+    memset(a, 0, sizeof(*a));
+    int64_t sc;
+    if (substr_scalar_arg(v, &sc)) { a->scalar = sc; return true; }
+    if (substr_scalar_is_null(v)) { a->all_null = true; return true; }
+    if (!ray_is_vec(v) || v->len != nrows) return false;
+    a->v = v;
+    switch (v->type) {
+    case RAY_I64: a->i64 = (const int64_t*)ray_data(v); return true;
+    case RAY_I32: a->i32 = (const int32_t*)ray_data(v); return true;
+    case RAY_F64: a->f64 = (const double*)ray_data(v);  return true;
+    default: return false;
+    }
+}
+
+static inline bool substr_arg_at(const substr_arg_t* a, int64_t r, int64_t* out) {
+    if (a->all_null) return false;
+    if (!a->v) { *out = a->scalar; return true; }
+    if (a->i64) { int64_t x = a->i64[r]; if (x == NULL_I64) return false; *out = x; return true; }
+    if (a->i32) { int32_t x = a->i32[r]; if (x == NULL_I32) return false; *out = (int64_t)x; return true; }
+    double d = a->f64[r];
+    if (d != d) return false;
+    *out = (int64_t)d;
+    return true;
+}
+
+/* Substring of a STR column as descriptors over the column's own pool:
+ * an inline result copies its bytes, a longer one points into the parent
+ * pool at the shifted offset.  No bytes are copied and no pool is built,
+ * so the pass is descriptor-bound and runs on the worker pool.  A null
+ * start or length gives a null (empty) row; the empty result of a start
+ * past the end is an empty row.  Returns NULL for shapes it does not take
+ * (the caller keeps the general loop). */
+typedef struct {
+    const ray_str_t* src;
+    const char*      pool;
+    ray_str_t*       dst;
+    substr_arg_t     start;
+    substr_arg_t     len;
+    _Atomic(uint32_t) any_null;
+    _Atomic(uint32_t) range_err;
+} substr_view_ctx_t;
+
+static void substr_view_fn(void* vctx, uint32_t worker_id, int64_t lo, int64_t hi) {
+    (void)worker_id;
+    substr_view_ctx_t* c = (substr_view_ctx_t*)vctx;
+    bool null_seen = false, range_seen = false;
+    for (int64_t i = lo; i < hi; i++) {
+        ray_str_t* d = &c->dst[i];
+        memset(d, 0, sizeof(*d));
+        int64_t st, ln;
+        if (!substr_arg_at(&c->start, i, &st) || !substr_arg_at(&c->len, i, &ln)) {
+            null_seen = true;
+            continue;
+        }
+        const ray_str_t* s = &c->src[i];
+        int64_t sl = (int64_t)s->len;
+        st -= 1;                       /* 1-based → 0-based */
+        if (st < 0) st = 0;
+        if (st >= sl) continue;
+        if (ln < 0 || ln > sl - st) ln = sl - st;
+        if (ln <= 0) continue;
+        const char* sp = ray_str_t_ptr(s, c->pool) + st;
+        d->len = (uint32_t)ln;
+        if (ln <= RAY_STR_INLINE_MAX) {
+            memcpy(d->data, sp, (size_t)ln);
+        } else {
+            /* a pooled result needs a pooled source (an inline source is at
+             * most 12 bytes, so a longer result never comes from one) */
+            if ((uint64_t)s->pool_off + (uint64_t)st > UINT32_MAX) { range_seen = true; d->len = 0; continue; }
+            memcpy(d->prefix, sp, 4);
+            d->pool_off = s->pool_off + (uint32_t)st;
+            /* hash32 stays 0: a consumer that needs it computes it once
+             * (ray_str_t_hash32); hashing every substring here paid a pass
+             * over the bytes that most consumers never used. */
+        }
+    }
+    if (null_seen)  atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+    if (range_seen) atomic_store_explicit(&c->range_err, 1, memory_order_relaxed);
+}
+
+static ray_t* substr_str_view(ray_t* input, ray_t* start_v, ray_t* len_v) {
+    if (!input || input->type != RAY_STR) return NULL;
+    int64_t nrows = input->len;
+    substr_view_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (!substr_arg_init(start_v, nrows, &ctx.start)) return NULL;
+    if (!substr_arg_init(len_v, nrows, &ctx.len)) return NULL;
+
+    ray_t* result = ray_vec_new(RAY_STR, nrows);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    result->len = nrows;
+    str_resolve(input, &ctx.src, &ctx.pool);
+    ray_t* owner = (input->attrs & RAY_ATTR_SLICE) ? input->slice_parent : input;
+    ray_t* pool_obj = owner ? owner->str_pool : NULL;
+    if (pool_obj && !RAY_IS_ERR(pool_obj)) {
+        ray_retain(pool_obj);
+        result->str_pool = pool_obj;
+    }
+    ctx.dst = (ray_str_t*)ray_data(result);
+    atomic_store_explicit(&ctx.any_null, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx.range_err, 0, memory_order_relaxed);
+
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, substr_view_fn, &ctx, nrows);
+    else
+        substr_view_fn(&ctx, 0, 0, nrows);
+    if (atomic_load_explicit(&ctx.range_err, memory_order_relaxed)) {
+        ray_release(result);
+        return ray_error("range", "substr: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
+    }
+    if (atomic_load_explicit(&ctx.any_null, memory_order_relaxed))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
+    return result;
 }
 
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
@@ -1167,26 +1144,14 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
     bool is_str = (input->type == RAY_STR);
 
     if (is_str) {
-        int64_t s_const = 0, l_const = 0;
-        if (substr_scalar_arg(start_v, &s_const) &&
-            substr_scalar_arg(len_v, &l_const)) {
-            ray_t* view = substr_str_scalar_view(input, s_const, l_const);
-            if (view) {
-                ray_release(input);
-                ray_release(start_v);
-                ray_release(len_v);
-                return view;
-            }
-        }
-        if (substr_scalar_arg(start_v, &s_const) &&
-            !ray_is_atom(len_v) && len_v->len == nrows) {
-            ray_t* view = substr_str_scalar_start_len_view(input, s_const, len_v);
-            if (view) {
-                ray_release(input);
-                ray_release(start_v);
-                ray_release(len_v);
-                return view;
-            }
+        /* Descriptors over the column's own pool, for every scalar / per-row
+         * combination of start and length that reads as an integer. */
+        ray_t* view = substr_str_view(input, start_v, len_v);
+        if (view) {
+            ray_release(input);
+            ray_release(start_v);
+            ray_release(len_v);
+            return view;
         }
     }
 

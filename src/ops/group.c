@@ -162,13 +162,24 @@ static void reduce_acc_init(reduce_acc_t* acc) {
 static inline bool sym_lex_lt(struct ray_sym_domain_s* dom,
                               int64_t a, int64_t b) {
     if (a == b) return false;
-    ray_t* sa = ray_sym_domain_str(dom, a);
-    ray_t* sb = ray_sym_domain_str(dom, b);
-    if (!sa || !sb) return a < b;
-    const char* pa = ray_str_ptr(sa);
-    const char* pb = ray_str_ptr(sb);
-    size_t la = ray_str_len(sa);
-    size_t lb = ray_str_len(sb);
+    const char* pa; const char* pb;
+    size_t la, lb;
+    /* A FILE domain's entries are read off the mapped vocabulary: no atom
+     * is materialised per compare (the lazily built atoms cost more than
+     * the compare itself on a wide vocabulary).  Positions past the file
+     * prefix, and the runtime domain, resolve through the atoms as before. */
+    ray_sym_domain_raw_t raw;
+    if (ray_sym_domain_raw_pin(dom, &raw) && a >= 0 && b >= 0 &&
+        a < raw.count && b < raw.count) {
+        pa = ray_sym_domain_raw_str(&raw, a, &la);
+        pb = ray_sym_domain_raw_str(&raw, b, &lb);
+    } else {
+        ray_t* sa = ray_sym_domain_str(dom, a);
+        ray_t* sb = ray_sym_domain_str(dom, b);
+        if (!sa || !sb) return a < b;
+        pa = ray_str_ptr(sa); pb = ray_str_ptr(sb);
+        la = ray_str_len(sa); lb = ray_str_len(sb);
+    }
     size_t m = la < lb ? la : lb;
     int c = memcmp(pa, pb, m);
     if (c != 0) return c < 0;
@@ -7848,6 +7859,7 @@ typedef struct {
     ray_t*         rowsel;
     ray_t**        sym_strings;  /* borrowed sym snapshot for strlen-on-SYM aggs */
     uint32_t       sym_count;
+    int64_t        da_n_scan;    /* rows to scan (ranged tasks split it) */
 } da_ctx_t;
 
 typedef struct {
@@ -8888,6 +8900,18 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     }
     #undef DA_MULTI_KEY_LOOP
     #undef DA_PF_DIST
+}
+
+/* One task per accumulator (ray_pool_dispatch_n): task i scans the i-th
+ * of n_accums equal row ranges into accums[i], whichever worker runs it. */
+static void da_accum_task_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id; (void)end;
+    da_ctx_t* c = (da_ctx_t*)ctx;
+    int64_t k = c->n_accums, n = c->da_n_scan;
+    int64_t base = n / k, rem = n % k;
+    int64_t lo = start * base + (start < rem ? start : rem);
+    int64_t hi = lo + base + (start < rem ? 1 : 0);
+    da_accum_fn(ctx, (uint32_t)start, lo, hi);
 }
 
 /* Parallel DA merge: merge per-worker accumulators into accums[0] by
@@ -12641,8 +12665,15 @@ da_path:;
             uint64_t max_workers = cells_per_worker
                 ? (uint64_t)n_scan / cells_per_worker : 1;
             if (max_workers < 1) max_workers = 1;
-            if ((uint64_t)da_n_workers > max_workers)
-                da_n_workers = 1;
+            /* More workers than the budget allows: keep the budget's worth
+             * of accumulators and give each one a contiguous row range (one
+             * task per accumulator, whichever worker runs it) instead of
+             * collapsing to a serial scan of every row. */
+            bool da_ranged = false;
+            if ((uint64_t)da_n_workers > max_workers) {
+                da_n_workers = (uint32_t)max_workers;
+                da_ranged = da_n_workers > 1;
+            }
 
             ray_t* accums_hdr;
             da_accum_t* accums = (da_accum_t*)scratch_calloc(&accums_hdr,
@@ -12768,9 +12799,12 @@ da_path:;
                 .n_slots     = n_slots,
                 .match_idx   = match_idx,
                 .rowsel      = rowsel,
+                .da_n_scan   = n_scan,
             };
 
-            if (da_n_workers > 1)
+            if (da_ranged)
+                ray_pool_dispatch_n(da_pool, da_accum_task_fn, &da_ctx, da_n_workers);
+            else if (da_n_workers > 1)
                 ray_pool_dispatch(da_pool, da_accum_fn, &da_ctx, n_scan);
             else
                 da_accum_fn(&da_ctx, 0, 0, n_scan);

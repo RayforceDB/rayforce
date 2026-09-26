@@ -104,8 +104,8 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
 }
 
 /* Numeric, temporal, STR and GUID comparisons have an explicit typed leg
- * with null-as-minimum ordering. SYM equality uses domain codes. LIKE/IN keep
- * their stricter null-free admission because they use different evaluators. */
+ * with null-as-minimum ordering. SYM equality uses domain codes. IN keeps
+ * its stricter null-free admission because it uses a different evaluator. */
 static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
     if (!col) return 0;
     if (col->type >= RAY_BOOL && col->type <= RAY_TIMESTAMP) return 1;
@@ -114,8 +114,8 @@ static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
     return !ray_vec_has_nulls(col);
 }
 
-/* Strict form — no nullable column at all.  Used by the shapes whose
- * evaluator arm is not an equality compare (LIKE, IN). */
+/* Strict form — no nullable column at all.  Used by the shape whose
+ * evaluator arm is not an equality compare (IN). */
 static int fp_col_supported(const ray_t* col) {
     return col && !ray_vec_has_nulls(col);
 }
@@ -208,7 +208,10 @@ static int fp_check_like(ray_t* expr, ray_t* tbl) {
     if (!fp_expr_const_str(elems[2])) return 0;
     if (tbl) {
         ray_t* col = ray_table_get_col(tbl, lhs->i64);
-        if (!col || !fp_col_supported(col)) return 0;
+        /* A null text cell is the empty string on every like path (the
+         * kernel and this evaluator both match the pattern against ""),
+         * so a nullable column is admitted. */
+        if (!col) return 0;
         if (col->type != RAY_STR && col->type != RAY_SYM) return 0;
     }
     return 1;
@@ -445,10 +448,13 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
             for (int64_t r = 0; r < n; r++) {
                 uint64_t sid = (uint64_t)read_by_esz(base, start + r, esz_l);
                 if (sid >= lut_n || !lut) {
-                    bits[r] = 0;
+                    bits[r] = p->like_empty_match;
                     continue;
                 }
-                uint8_t state = lut[sid];
+                /* The LUT is shared by the workers: relaxed atomics on its
+                 * bytes (every writer stores the same answer for a cell,
+                 * so a repeated resolve is the only cost of a race). */
+                uint8_t state = __atomic_load_n(&lut[sid], __ATOMIC_RELAXED);
                 if (!state) {
                     const char* sp = NULL;
                     size_t sl = 0;
@@ -466,7 +472,7 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
                             : (uint8_t)ray_glob_match(sp, sl, p->pat_str, p->pat_len);
                     }
                     state = (uint8_t)(match ? 2 : 1);
-                    lut[sid] = state;
+                    __atomic_store_n(&lut[sid], state, __ATOMIC_RELAXED);
                 }
                 bits[r] = (uint8_t)(state == 2);
             }
@@ -608,8 +614,8 @@ static inline uint8_t fp_eval_cmp_one(const fp_cmp_t* p, int64_t row) {
         if (p->col_type == RAY_SYM) {
             uint64_t sid = (uint64_t)read_by_esz(p->col_base, row, p->col_esz);
             if (sid >= p->like_lut_count || !p->like_lut)
-                return 0;
-            uint8_t state = p->like_lut[sid];
+                return p->like_empty_match;
+            uint8_t state = __atomic_load_n(&p->like_lut[sid], __ATOMIC_RELAXED);
             if (!state) {
                 /* NULL sym_strings ⇒ FILE-domain column (see fp_eval_cmp) */
                 const char* sp = NULL;
@@ -629,7 +635,7 @@ static inline uint8_t fp_eval_cmp_one(const fp_cmp_t* p, int64_t row) {
                           : (uint8_t)ray_glob_match(sp, sl, p->pat_str, p->pat_len);
                 }
                 state = (uint8_t)(match ? 2 : 1);
-                p->like_lut[sid] = state;
+                __atomic_store_n(&p->like_lut[sid], state, __ATOMIC_RELAXED);
             }
             return (uint8_t)(state == 2);
         }
@@ -797,8 +803,10 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         return 0;
     }
     if (out->op == FP_LIKE) {
+        /* A nullable text column is admitted: a null cell is the empty
+         * string on every like path, matched against the pattern once
+         * here (like_empty_match). */
         if (col->type != RAY_STR && col->type != RAY_SYM) return -1;
-        if (!fp_col_supported(col)) return -1;
         ray_t* cv_like = rext->literal;
         if (!cv_like || cv_like->type != -RAY_STR) return -1;
         out->col_type  = col->type;
@@ -810,6 +818,9 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         out->pat_str   = ray_str_ptr(cv_like);
         out->pat_len   = ray_str_len(cv_like);
         out->pat_compiled = ray_glob_compile(out->pat_str, out->pat_len);
+        out->like_empty_match = (out->pat_compiled.shape != RAY_GLOB_SHAPE_NONE)
+            ? (uint8_t)ray_glob_match_compiled(&out->pat_compiled, "", 0)
+            : (uint8_t)ray_glob_match("", 0, out->pat_str, out->pat_len);
         if (col->type == RAY_SYM) {
             /* Cell ids are positions in the COLUMN's domain.  Runtime
              * domain: borrow the global string snapshot (lock-free per

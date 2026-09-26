@@ -82,6 +82,9 @@ typedef struct {
      * read straight from the mapping (see ray_sym_domain_raw_pin). */
     ray_sym_domain_raw_t like_raw;
     uint8_t      like_raw_ok;
+    /* pattern vs "": the answer for a null text cell and for a cell id the
+     * LUT does not cover (the same rule as the bare like kernel). */
+    uint8_t      like_empty_match;
     struct ray_sym_domain_s* like_dom;
 } fp_cmp_t;
 
