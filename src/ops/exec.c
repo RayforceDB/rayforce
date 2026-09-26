@@ -1839,8 +1839,116 @@ done:
     return result;
 }
 
+/* Nodes whose result may be shared between consumers: pure, vector-valued
+ * operators.  Structural ops (scan, filter, group, sort, join …) either
+ * carry side state (g->selection) or return their input, and stay out. */
+static inline bool op_memoizable(uint16_t o) {
+    switch (o) {
+        case OP_IF: case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
+        case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
+        case OP_CONCAT: case OP_STR_FIND: case OP_EXTRACT: case OP_DATE_TRUNC:
+        case OP_IN: case OP_NOT_IN:
+            return true;
+        default:
+            return op_is_elementwise(o);
+    }
+}
+
+/* Count each node's consumers over the in_id edges (plus one for the
+ * root's return) and arm the memo when some memoizable node has more than
+ * one.  The memo keeps its own ref on every stored value until
+ * exec_memo_end: a consumer that receives an input with rc == 1 may reuse
+ * the buffer in place, and a fused window or a sibling still holding a raw
+ * pointer into that buffer would then read the overwritten values — so no
+ * shared value is ever handed out as the sole reference.  Shared
+ * intermediates therefore live to the end of the execution; before this a
+ * shared node was recomputed per consumer instead.  Values belong to the
+ * table the memo was armed over (memo_table): while g->table is swapped
+ * for a sub-table the memo is inert.  Returns whether it armed; not
+ * re-entrant on purpose — a nested execution of the same graph leaves the
+ * outer memo alone and must not tear it down. */
+static bool exec_memo_begin(ray_graph_t* g, ray_op_t* root) {
+    if (!g || g->memo_uses || g->node_count == 0) return false;
+    uint32_t nc = g->node_count;
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_calloc(&hdr, (size_t)nc * (sizeof(ray_t*) + sizeof(uint32_t)));
+    if (!mem) return false;
+    ray_t**   vals = (ray_t**)mem;
+    uint32_t* uses = (uint32_t*)(mem + (size_t)nc * sizeof(ray_t*));
+    for (uint32_t i = 0; i < nc; i++) {
+        ray_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        for (uint8_t k = 0; k < n->arity && k < 2; k++)
+            if (n->in_id[k] != RAY_OP_NONE && n->in_id[k] < nc) uses[n->in_id[k]]++;
+        /* Operands kept in the ext node: the third input of if / substr /
+         * replace, the trailing arguments of concat. */
+        if (n->opcode == OP_IF || n->opcode == OP_SUBSTR || n->opcode == OP_REPLACE) {
+            ray_op_ext_t* e = find_ext(g, n->id);
+            if (e && e->third_in < nc) uses[e->third_in]++;
+        } else if (n->opcode == OP_CONCAT) {
+            ray_op_ext_t* e = find_ext(g, n->id);
+            if (e) {
+                int n_args = (int)e->sym;
+                const uint32_t* trail = (const uint32_t*)((const char*)(e + 1));
+                for (int a = 2; a < n_args; a++)
+                    if (trail[a - 2] < nc) uses[trail[a - 2]]++;
+            }
+        }
+    }
+    if (root && root->id < nc) uses[root->id]++;
+    bool any = false;
+    for (uint32_t i = 0; i < nc && !any; i++)
+        any = uses[i] > 1 && op_memoizable(g->nodes[i].opcode);
+    if (!any) { scratch_free(hdr); return false; }
+    g->memo_vals = vals; g->memo_uses = uses; g->memo_n = nc; g->memo_hdr = hdr;
+    g->memo_table = g->table;
+    return true;
+}
+
+static void exec_memo_end(ray_graph_t* g) {
+    if (!g || !g->memo_uses) return;
+    for (uint32_t i = 0; i < g->memo_n; i++)
+        if (g->memo_vals[i]) ray_release(g->memo_vals[i]);
+    scratch_free(g->memo_hdr);
+    g->memo_vals = NULL; g->memo_uses = NULL; g->memo_n = 0; g->memo_hdr = NULL;
+    g->memo_table = NULL;
+}
+
+/* A sub-evaluation over another table (an `if` branch over its compacted
+ * rows) gets a memo of its own: the outer memo is set aside — its values
+ * belong to the outer table — and a fresh one is armed over the current
+ * g->table with the sub-root's census.  Pop tears the inner memo down and
+ * puts the outer one back. */
+void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save) {
+    save->vals = g->memo_vals; save->uses = g->memo_uses; save->n = g->memo_n;
+    save->hdr = g->memo_hdr; save->table = g->memo_table;
+    g->memo_vals = NULL; g->memo_uses = NULL; g->memo_n = 0; g->memo_hdr = NULL;
+    g->memo_table = NULL;
+    (void)exec_memo_begin(g, root);
+}
+
+void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save) {
+    exec_memo_end(g);
+    g->memo_vals = save->vals; g->memo_uses = save->uses; g->memo_n = save->n;
+    g->memo_hdr = save->hdr; g->memo_table = save->table;
+}
+
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
+
+    /* Shared node already computed: hand out a ref (the memo's own ref goes
+     * at exec_memo_end). */
+    bool memo_on = g->memo_uses && g->table == g->memo_table &&
+                   op->id < g->memo_n && op_memoizable(op->opcode);
+    if (memo_on && g->memo_vals[op->id]) {
+        ray_t* v = g->memo_vals[op->id];
+        ray_retain(v);
+        /* The memo keeps its own ref until exec_memo_end: a consumer that
+         * reaches its input with rc == 1 may reuse the buffer in place, and
+         * another consumer may still hold a raw pointer into it. */
+        return v;
+    }
+    bool memo_shared = memo_on && g->memo_uses[op->id] > 1;
 
     /* Per-op cancellation checkpoint. Long fused pipelines iterate
      * exec_node many times; this catches Ctrl-C between operators
@@ -1878,6 +1986,15 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
 
     ray_t* _prof_result = exec_node_inner(g, op);
     tl_exec_depth--;
+
+    /* First consumer of a shared node: keep a ref for the others (a lazy
+     * value is not kept — materialising it is the consumer's business). */
+    if (memo_shared && _prof_result && !RAY_IS_ERR(_prof_result) &&
+        !ray_is_lazy(_prof_result) && g->memo_uses && g->table == g->memo_table &&
+        !g->memo_vals[op->id]) {
+        ray_retain(_prof_result);
+        g->memo_vals[op->id] = _prof_result;
+    }
 
     if (profiling) {
         ray_prof_span_t* ep = ray_profile_span_end(oname);
@@ -3926,7 +4043,11 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
     if (seg_count == 0 || !dag_can_stream(g, root)) {
         /* Non-parted table or DAG contains ops that need specialized merge:
          * use existing flat-materialization path. */
+        /* Only the call that armed the memo tears it down: a nested
+         * execution of the same graph leaves the outer memo alone. */
+        bool memo_armed = exec_memo_begin(g, root);
         ray_t* result = exec_node(g, root);
+        if (memo_armed) exec_memo_end(g);
         if (g->selection && result && !RAY_IS_ERR(result)
             && result->type == RAY_TABLE) {
             /* Projection-aware compaction: a select publishes the keys-only

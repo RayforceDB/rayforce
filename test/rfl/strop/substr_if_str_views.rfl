@@ -1,0 +1,33 @@
+;; substr over a STR column with per-row start / length is a descriptor view
+;; over the column's pool, and `if` over two STR columns is a descriptor pick
+;; whatever pools the sides come from.  Every answer is checked against the
+;; per-row evaluation of the same expression.
+(set N 120000)
+(set i (til N))
+(set S (as 'STR (map (fn [k] (if (== 0 (% k 11)) "" (if (== 0 (% k 3)) (format "http://www.host%.example.org/path/%/page?id=%" (% k 500) k (* k 13)) (if (== 0 (% k 7)) (format "ab%" (% k 10)) (format "https://host%.example.org/p/%" (% k 500) k))))) i)))
+(set st (% (* i 7) 19))
+(set ln (- (% (* i 5) 23) 3))
+(set stn (as 'I64 (map (fn [j] (if (== 0 (% j 13)) 0N (% (* j 7) 19))) i)))
+(set kk (% i 17))
+(set T (table [S st ln stn k] (list S st ln stn kk)))
+(set oracle (fn [f] (as 'STR (map f i))))
+;; vector start, whole tail
+(all (== (at (select {from: T x: (substr S st -1)}) 'x) (oracle (fn [j] (substr (at S j) (at st j) -1))))) -- true
+;; vector start and vector length (negative lengths, past-the-end starts)
+(all (== (at (select {from: T x: (substr S st ln)}) 'x) (oracle (fn [j] (substr (at S j) (at st j) (at ln j)))))) -- true
+;; a float start vector reads as its integer image
+(all (== (at (select {from: T x: (substr S (as 'F64 st) -1)}) 'x) (oracle (fn [j] (substr (at S j) (at st j) -1))))) -- true
+;; null starts give empty (null) rows
+(all (== (at (select {from: T x: (substr S stn 4)}) 'x) (oracle (fn [j] (if (nil? (at stn j)) "" (substr (at S j) (at stn j) 4)))))) -- true
+;; scalar start and length, the old view shape
+(all (== (at (select {from: T x: (substr S 5 7)}) 'x) (oracle (fn [j] (substr (at S j) 5 7))))) -- true
+;; a substring of a substring stays a view; the pool is shared, not copied
+(all (== (at (select {from: T x: (substr (substr S 9 -1) 2 5)}) 'x) (oracle (fn [j] (substr (substr (at S j) 9 -1) 2 5))))) -- true
+;; if over two STR sides from different pools, with empty strings on both
+(all (== (at (select {from: T x: (if (== 0 (% k 2)) (substr S 9 -1) S)}) 'x) (oracle (fn [j] (if (== 0 (% (at kk j) 2)) (substr (at S j) 9 -1) (at S j)))))) -- true
+;; if over two views of one pool
+(all (== (at (select {from: T x: (if (== 0 (% k 3)) (substr S 5 -1) (substr S 2 6))}) 'x) (oracle (fn [j] (if (== 0 (% (at kk j) 3)) (substr (at S j) 5 -1) (substr (at S j) 2 6)))))) -- true
+;; the picked side's empty strings are nulls of the result
+(count (select {from: (select {from: T x: (if (== 0 (% k 2)) (substr S 9 -1) S)}) where: (nil? x)})) -- 16410
+;; a scalar side keeps the per-row path
+(all (== (at (select {from: T x: (if (== 0 (% k 3)) S "zzz")}) 'x) (oracle (fn [j] (if (== 0 (% (at kk j) 3)) (at S j) "zzz"))))) -- true

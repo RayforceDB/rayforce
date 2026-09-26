@@ -252,7 +252,12 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
 
     g->table = sub;
     g->selection = NULL;
+    /* The branch's shared nodes get a memo over the branch's rows; the
+     * outer memo (values of the full table) is set aside meanwhile. */
+    ray_exec_memo_save_t memo_save;
+    ray_exec_memo_push(g, branch, &memo_save);
     ray_t* value = exec_node(g, branch);
+    ray_exec_memo_pop(g, &memo_save);
     if (g->selection) {
         ray_release(g->selection);
         g->selection = NULL;
@@ -498,6 +503,144 @@ static ray_t* if_scatter_str(ray_t* result, ray_t* value, int64_t* ids,
         }
         result = next;
     }
+    return result;
+}
+
+/* Descriptor scatter for the STR arm of the selected path.  A side is a
+ * STR vector with one row per id (or as many rows as the table, indexed by
+ * the id), or a broadcast scalar.  The result takes the side's 16-byte
+ * descriptor at ids[j] instead of appending its bytes row by row: pooled
+ * strings keep pointing into their pool, two different pools are laid end
+ * to end (the second side's offsets shift), a pooled scalar's bytes go in
+ * once.  Rows not in either id list stay the null descriptor the caller
+ * zeroed.  Returns NULL, the result untouched, for a side this cannot take
+ * (a SYM branch, a length that is neither) — the caller then falls back to
+ * the per-row scatter, which also reports the length error. */
+typedef struct {
+    ray_t*           v;
+    int64_t*         ids;
+    int64_t          n;
+    bool             scalar;
+    bool             full;     /* vector of nrows: row ids[j] */
+    const ray_str_t* desc;
+    ray_t*           pool;
+    const char*      sp;       /* scalar bytes */
+    size_t           sl;
+} if_str_side_t;
+
+static bool if_str_side_init(ray_t* v, int64_t* ids, int64_t n, int64_t nrows,
+                             if_str_side_t* s) {
+    memset(s, 0, sizeof(*s));
+    s->ids = ids; s->n = n;
+    if (!v || n <= 0) return true;
+    s->v = v;
+    if (v->type == -RAY_STR) {
+        s->scalar = true; s->sp = ray_str_ptr(v); s->sl = ray_str_len(v);
+        return true;
+    }
+    if (v->type != RAY_STR) return false;
+    if (v->len == 1) {
+        s->scalar = true;
+        s->sp = ray_str_vec_get(v, 0, &s->sl);
+        if (!s->sp) { s->sp = ""; s->sl = 0; }
+        return true;
+    }
+    if (v->len == n) s->full = false;
+    else if (v->len == nrows) s->full = true;
+    else return false;
+    const char* bytes = NULL;
+    str_resolve(v, &s->desc, &bytes);
+    s->pool = str_vec_pool_obj(v);
+    if (s->pool && RAY_IS_ERR(s->pool)) return false;
+    return true;
+}
+
+typedef struct {
+    const int64_t*   ids;
+    const ray_str_t* src;
+    bool             scalar;
+    bool             full;
+    ray_str_t        sd;       /* the scalar's descriptor */
+    uint32_t         shift;
+    ray_str_t*       dst;
+} if_str_scatter_ctx_t;
+
+static void if_str_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const if_str_scatter_ctx_t* c = (const if_str_scatter_ctx_t*)vctx;
+    if (c->scalar) {
+        for (int64_t j = start; j < end; j++) c->dst[c->ids[j]] = c->sd;
+        return;
+    }
+    for (int64_t j = start; j < end; j++) {
+        ray_str_t d = c->full ? c->src[c->ids[j]] : c->src[j];
+        if (c->shift && !ray_str_is_inline(&d)) d.pool_off += c->shift;
+        c->dst[c->ids[j]] = d;
+    }
+}
+
+static void if_str_scatter_side(const if_str_side_t* s, uint32_t shift, uint32_t scalar_off,
+                                ray_str_t* dst) {
+    if (!s->v) return;
+    if_str_scatter_ctx_t c = {
+        .ids = s->ids, .src = s->desc, .scalar = s->scalar, .full = s->full,
+        .shift = shift, .dst = dst,
+    };
+    if (s->scalar) {
+        memset(&c.sd, 0, sizeof(c.sd));
+        c.sd.len = (uint32_t)s->sl;
+        if (s->sl <= RAY_STR_INLINE_MAX) {
+            if (s->sl) memcpy(c.sd.data, s->sp, s->sl);
+        } else {
+            memcpy(c.sd.prefix, s->sp, 4);
+            c.sd.pool_off = scalar_off;
+        }
+    }
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, s->n, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, if_str_scatter_fn, &c, s->n);
+    else
+        if_str_scatter_fn(&c, 0, 0, s->n);
+}
+
+static ray_t* if_scatter_str_desc(ray_t* result,
+                                  ray_t* then_v, int64_t* t_ids, int64_t t_n,
+                                  ray_t* else_v, int64_t* e_ids, int64_t e_n,
+                                  int64_t nrows) {
+    if_str_side_t t, e;
+    if (!if_str_side_init(then_v, t_ids, t_n, nrows, &t)) return NULL;
+    if (!if_str_side_init(else_v, e_ids, e_n, nrows, &e)) return NULL;
+
+    ray_t* pt = (t.v && !t.scalar) ? t.pool : NULL;
+    ray_t* pe = (e.v && !e.scalar) ? e.pool : NULL;
+    bool t_big = t.v && t.scalar && t.sl > RAY_STR_INLINE_MAX;
+    bool e_big = e.v && e.scalar && e.sl > RAY_STR_INLINE_MAX;
+    uint32_t e_shift = 0, ts_off = 0, es_off = 0;
+    if (!t_big && !e_big && (pt == pe || !pt || !pe)) {
+        ray_t* shared = pt ? pt : pe;
+        if (shared) { ray_retain(shared); result->str_pool = shared; }
+    } else {
+        int64_t tl = pt ? pt->len : 0;
+        int64_t el = (pe && pe != pt) ? pe->len : 0;
+        if (tl < 0 || el < 0) return NULL;
+        uint64_t total = (uint64_t)tl + (uint64_t)el
+                       + (t_big ? (uint64_t)t.sl : 0) + (e_big ? (uint64_t)e.sl : 0);
+        if (total > UINT32_MAX) return NULL;
+        ray_t* np = ray_alloc(total > 0 ? (size_t)total : 1);
+        if (!np || RAY_IS_ERR(np)) return NULL;
+        np->type = RAY_U8;
+        np->len  = (int64_t)total;
+        char* dst = (char*)ray_data(np);
+        uint32_t off = 0;
+        if (tl) { memcpy(dst, ray_data(pt), (size_t)tl); off += (uint32_t)tl; }
+        if (pe && pe != pt && el) { memcpy(dst + off, ray_data(pe), (size_t)el); e_shift = off; off += (uint32_t)el; }
+        if (t_big) { memcpy(dst + off, t.sp, t.sl); ts_off = off; off += (uint32_t)t.sl; }
+        if (e_big) { memcpy(dst + off, e.sp, e.sl); es_off = off; off += (uint32_t)e.sl; }
+        result->str_pool = np;
+    }
+    ray_str_t* dst = (ray_str_t*)ray_data(result);
+    if_str_scatter_side(&t, 0, ts_off, dst);
+    if_str_scatter_side(&e, e_shift, es_off, dst);
     return result;
 }
 
@@ -772,9 +915,15 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
 
     bool ok = true;
     if (out_type == RAY_STR) {
-        result = if_scatter_str(result, then_v, true_ids, true_count, nrows);
-        if (result && !RAY_IS_ERR(result))
-            result = if_scatter_str(result, else_v, false_ids, false_count, nrows);
+        ray_t* fast = if_scatter_str_desc(result, then_v, true_ids, true_count,
+                                          else_v, false_ids, false_count, nrows);
+        if (fast) {
+            result = fast;
+        } else {
+            result = if_scatter_str(result, then_v, true_ids, true_count, nrows);
+            if (result && !RAY_IS_ERR(result))
+                result = if_scatter_str(result, else_v, false_ids, false_count, nrows);
+        }
     } else if (out_type == RAY_SYM) {
         ok = if_scatter_sym(result, then_v, true_ids, true_count, nrows) &&
              if_scatter_sym(result, else_v, false_ids, false_count, nrows);
@@ -893,6 +1042,32 @@ static void if_fill_par_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) 
     if_fill_range((const if_fill_ctx_t*)ctx, start, end);
 }
 
+/* Descriptor fill for the STR arm of exec_if_eager: dst[r] is the chosen
+ * side's descriptor; a pooled else-descriptor moves by e_shift when the two
+ * pools were laid end to end.  Rows are independent; workers write disjoint
+ * ranges. */
+typedef struct {
+    const uint8_t*   cond;
+    const ray_str_t* t;
+    const ray_str_t* e;
+    ray_str_t*       dst;
+    uint32_t         e_shift;
+} if_str_desc_ctx_t;
+
+static void if_str_desc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    const if_str_desc_ctx_t* c = (const if_str_desc_ctx_t*)vctx;
+    for (int64_t r = start; r < end; r++) {
+        if (c->cond[r]) {
+            c->dst[r] = c->t[r];
+        } else {
+            ray_str_t d = c->e[r];
+            if (c->e_shift && !ray_str_is_inline(&d)) d.pool_off += c->e_shift;
+            c->dst[r] = d;
+        }
+    }
+}
+
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
@@ -959,27 +1134,64 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     uint8_t* cond_p = (uint8_t*)ray_data(cond_v);
 
     if (out_type == RAY_STR) {
+        /* Two STR vectors: the result is descriptors only.  Each row takes
+         * its side's 16-byte descriptor; pooled strings keep pointing into
+         * their pool.  One shared pool (or one side inline-only) is reused
+         * as is; two different pools are laid end to end in a new pool and
+         * the else side's offsets shift by the then pool's length.  Nulls
+         * are empty descriptors and travel unchanged.  No per-row append,
+         * no rehash; the fill runs on the worker pool. */
         if (!then_scalar && !else_scalar &&
             then_v->type == RAY_STR && else_v->type == RAY_STR &&
-            len <= then_v->len && len <= else_v->len &&
-            !ray_vec_may_have_nulls(then_v) &&
-            !ray_vec_may_have_nulls(else_v)) {
+            len <= then_v->len && len <= else_v->len) {
             ray_t* then_pool = str_vec_pool_obj(then_v);
             ray_t* else_pool = str_vec_pool_obj(else_v);
+            const ray_str_t* t_desc = NULL;
+            const ray_str_t* e_desc = NULL;
+            const char* t_bytes = NULL;
+            const char* e_bytes = NULL;
+            str_resolve(then_v, &t_desc, &t_bytes);
+            str_resolve(else_v, &e_desc, &e_bytes);
+            bool ok = true;
+            uint32_t e_shift = 0;
             if (then_pool == else_pool || !then_pool || !else_pool) {
                 ray_t* out_pool = then_pool ? then_pool : else_pool;
                 if (out_pool && !RAY_IS_ERR(out_pool)) {
                     ray_retain(out_pool);
                     result->str_pool = out_pool;
                 }
-                const ray_str_t* t_desc = NULL;
-                const ray_str_t* e_desc = NULL;
-                const char* unused_pool = NULL;
-                str_resolve(then_v, &t_desc, &unused_pool);
-                str_resolve(else_v, &e_desc, &unused_pool);
-                ray_str_t* dst = (ray_str_t*)ray_data(result);
-                for (int64_t i = 0; i < len; i++)
-                    dst[i] = cond_p[i] ? t_desc[i] : e_desc[i];
+            } else if (RAY_IS_ERR(then_pool) || RAY_IS_ERR(else_pool)) {
+                ok = false;
+            } else {
+                int64_t tl = then_pool->len, el = else_pool->len;
+                if (tl < 0 || el < 0 || (uint64_t)tl + (uint64_t)el > UINT32_MAX) {
+                    ok = false;
+                } else {
+                    ray_t* np = ray_alloc((size_t)(tl + el) > 0 ? (size_t)(tl + el) : 1);
+                    if (!np || RAY_IS_ERR(np)) {
+                        ok = false;
+                    } else {
+                        np->type = RAY_U8;
+                        np->len  = tl + el;
+                        if (tl) memcpy(ray_data(np), t_bytes, (size_t)tl);
+                        if (el) memcpy((char*)ray_data(np) + tl, e_bytes, (size_t)el);
+                        result->str_pool = np;
+                        e_shift = (uint32_t)tl;
+                    }
+                }
+            }
+            if (ok) {
+                if_str_desc_ctx_t dctx = {
+                    .cond = cond_p, .t = t_desc, .e = e_desc,
+                    .dst = (ray_str_t*)ray_data(result), .e_shift = e_shift,
+                };
+                ray_pool_t* pool = ray_pool_get();
+                if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD))
+                    ray_pool_dispatch(pool, if_str_desc_fn, &dctx, len);
+                else
+                    if_str_desc_fn(&dctx, 0, 0, len);
+                if (ray_vec_may_have_nulls(then_v) || ray_vec_may_have_nulls(else_v))
+                    result->attrs |= RAY_ATTR_HAS_NULLS;
                 ray_release(cond_v); ray_release(then_v); ray_release(else_v);
                 return result;
             }

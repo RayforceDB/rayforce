@@ -379,16 +379,20 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ctx.k      = k;
     ctx.tbl    = tbl;
 
-    /* Compile the predicate via a temp graph just for the WHERE clause. */
+    /* Compile the predicate via a temp graph just for the WHERE clause.  No
+     * where: is a predicate with no children — every row passes — and the
+     * heap does the whole sort-and-take in one pass. */
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) { fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
-    ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
-    if (!pred_dag) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
-    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
-        fp_pred_cleanup(&ctx.pred);
-        ray_graph_free(g);
-        fpk_unpin_keys(ctx.keys, n_sort_keys);
-        return NULL;
+    if (where_expr) {
+        ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
+        if (!pred_dag) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
+        if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
+            fp_pred_cleanup(&ctx.pred);
+            ray_graph_free(g);
+            fpk_unpin_keys(ctx.keys, n_sort_keys);
+            return NULL;
+        }
     }
 
     if (sym_needed) {
