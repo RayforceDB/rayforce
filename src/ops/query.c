@@ -3069,6 +3069,225 @@ static int64_t derived_key_chunk_rows(void) {
 #endif
     return DERIVED_KEY_CHUNK;
 }
+
+/* ---- chunk STR build: the entries at positions dv[lo, lo+n) as one STR
+ * vector over one pool.  Lengths and byte pointers are read on the workers
+ * (the raw snapshot needs no lock); a position past the file prefix — a
+ * runtime-appended entry — is resolved through the domain on the calling
+ * thread.  A serial prefix sum places the pooled rows, then the workers
+ * write the descriptors and copy the pooled bytes into disjoint ranges. */
+typedef struct {
+    const void*                 dv;
+    uint8_t                     dattrs;
+    int64_t                     lo;
+    const ray_sym_domain_raw_t* raw;
+    const char**                ptr;
+    uint32_t*                   len;
+    uint32_t*                   off;
+    ray_str_t*                  dst;
+    char*                       pool;
+    atomic_int                  late;
+} dk_chunk_ctx_t;
+
+static void dk_chunk_scan_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    dk_chunk_ctx_t* c = (dk_chunk_ctx_t*)vctx;
+    int late = 0;
+    for (int64_t i = start; i < end; i++) {
+        int64_t pos = ray_read_sym(c->dv, c->lo + i, RAY_SYM, c->dattrs);
+        if (pos >= 0 && pos < c->raw->count) {
+            size_t sl = 0;
+            c->ptr[i] = ray_sym_domain_raw_str(c->raw, pos, &sl);
+            c->len[i] = (uint32_t)sl;
+        } else {
+            c->ptr[i] = NULL;
+            c->len[i] = UINT32_MAX;
+            late++;
+        }
+    }
+    if (late) atomic_fetch_add_explicit(&c->late, late, memory_order_relaxed);
+}
+
+static void dk_chunk_fill_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dk_chunk_ctx_t* c = (const dk_chunk_ctx_t*)vctx;
+    for (int64_t i = start; i < end; i++) {
+        ray_str_t* d = &c->dst[i];
+        uint32_t l = c->len[i];
+        memset(d, 0, sizeof(*d));
+        d->len = l;
+        if (l == 0) continue;
+        if (l <= RAY_STR_INLINE_MAX) {
+            memcpy(d->data, c->ptr[i], l);
+        } else {
+            memcpy(c->pool + c->off[i], c->ptr[i], l);
+            memcpy(d->prefix, c->ptr[i], 4);
+            d->pool_off = c->off[i];
+        }
+    }
+}
+
+static ray_t* derived_key_chunk_strs(const void* dv, uint8_t dattrs, int64_t lo, int64_t n,
+                                     const ray_sym_domain_raw_t* raw,
+                                     struct ray_sym_domain_s* dom) {
+    ray_t* aux_hdr = NULL;
+    size_t ptr_sz = (size_t)n * sizeof(const char*);
+    size_t u32_sz = (size_t)n * sizeof(uint32_t);
+    char* mem = (char*)scratch_alloc(&aux_hdr, ptr_sz + 2 * u32_sz);
+    if (!mem) return NULL;
+    dk_chunk_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.dv = dv; c.dattrs = dattrs; c.lo = lo; c.raw = raw;
+    c.ptr = (const char**)mem;
+    c.len = (uint32_t*)(mem + ptr_sz);
+    c.off = (uint32_t*)(mem + ptr_sz + u32_sz);
+    atomic_store_explicit(&c.late, 0, memory_order_relaxed);
+
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
+    if (par) ray_pool_dispatch(pool, dk_chunk_scan_fn, &c, n);
+    else     dk_chunk_scan_fn(&c, 0, 0, n);
+    if (atomic_load_explicit(&c.late, memory_order_relaxed)) {
+        for (int64_t i = 0; i < n; i++) {
+            if (c.len[i] != UINT32_MAX) continue;
+            int64_t pos = ray_read_sym(dv, lo + i, RAY_SYM, dattrs);
+            ray_t* a = ray_sym_domain_str(dom, pos);
+            size_t sl = a ? ray_str_len(a) : 0;
+            if (sl > UINT32_MAX) { scratch_free(aux_hdr); return NULL; }
+            c.ptr[i] = a ? ray_str_ptr(a) : "";
+            c.len[i] = (uint32_t)sl;
+        }
+    }
+    uint64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (c.len[i] <= RAY_STR_INLINE_MAX) continue;
+        c.off[i] = (uint32_t)total;
+        total += c.len[i];
+        if (total > UINT32_MAX) { scratch_free(aux_hdr); return NULL; }
+    }
+    ray_t* sv = ray_vec_new(RAY_STR, n);
+    if (!sv || RAY_IS_ERR(sv)) { if (sv) ray_error_free(sv); scratch_free(aux_hdr); return NULL; }
+    sv->len = n;
+    if (total > 0) {
+        ray_t* sp = ray_alloc((size_t)total);
+        if (!sp || RAY_IS_ERR(sp)) { ray_release(sv); scratch_free(aux_hdr); return NULL; }
+        sp->type = RAY_U8;
+        sp->len  = (int64_t)total;
+        sv->str_pool = sp;
+        c.pool = (char*)ray_data(sp);
+    }
+    c.dst = (ray_str_t*)ray_data(sv);
+    if (par) ray_pool_dispatch(pool, dk_chunk_fill_fn, &c, n);
+    else     dk_chunk_fill_fn(&c, 0, 0, n);
+    scratch_free(aux_hdr);
+    return sv;
+}
+
+/* ---- chunk result interning: each distinct string of the chunk's key
+ * vector is interned once, all of them under one lock, and its id spread
+ * over the rows that hold it.  The hashes are the intern table's own
+ * (ray_hash_bytes), computed on the workers; the dedupe is an
+ * open-addressing table over the distinct ordinals, on scratch. */
+typedef struct {
+    const ray_str_t* desc;
+    const char*      pool;
+    uint32_t*        hash;
+} dk_hash_ctx_t;
+
+static void dk_hash_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dk_hash_ctx_t* c = (const dk_hash_ctx_t*)vctx;
+    for (int64_t i = start; i < end; i++) {
+        const ray_str_t* d = &c->desc[i];
+        c->hash[i] = (uint32_t)ray_hash_bytes(ray_str_t_ptr(d, c->pool), d->len);
+    }
+}
+
+static bool derived_key_intern_chunk(ray_t* kc, int64_t n, int64_t* out) {
+    const ray_str_t* desc = NULL;
+    const char* pool = NULL;
+    str_resolve(kc, &desc, &pool);
+    int64_t slots = 1024;
+    while (slots < 2 * n) slots <<= 1;
+    ray_t* hdr = NULL;
+    size_t hash_sz = (size_t)n * sizeof(uint32_t);
+    size_t rep_sz  = (size_t)n * sizeof(int32_t);
+    size_t tab_sz  = (size_t)slots * sizeof(int32_t);
+    size_t dstr_sz = (size_t)n * sizeof(const char*);
+    size_t dlen_sz = (size_t)n * sizeof(size_t);
+    size_t dhsh_sz = (size_t)n * sizeof(uint32_t);
+    size_t did_sz  = (size_t)n * sizeof(int64_t);
+    /* One carve; the 8-byte arrays go first so every field stays aligned. */
+    char* mem = (char*)scratch_alloc(&hdr, hash_sz + rep_sz + tab_sz + dstr_sz + dlen_sz + dhsh_sz + did_sz);
+    if (!mem) return false;
+    const char**  dstr  = (const char**)mem;                    mem += dstr_sz;
+    size_t*       dlen  = (size_t*)mem;                         mem += dlen_sz;
+    int64_t*      did   = (int64_t*)mem;                        mem += did_sz;
+    uint32_t*     hash  = (uint32_t*)mem;                       mem += hash_sz;
+    int32_t*      rep   = (int32_t*)mem;                        mem += rep_sz;
+    int32_t*      tab   = (int32_t*)mem;                        mem += tab_sz;
+    uint32_t*     dhsh  = (uint32_t*)mem;
+    memset(tab, 0xff, tab_sz);
+
+    dk_hash_ctx_t hc = { .desc = desc, .pool = pool, .hash = hash };
+    ray_pool_t* rp = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(rp, n, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(rp, dk_hash_fn, &hc, n);
+    else
+        dk_hash_fn(&hc, 0, 0, n);
+
+    uint64_t mask = (uint64_t)slots - 1;
+    int64_t nd = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t h = hash[i];
+        const ray_str_t* d = &desc[i];
+        const char* sp = ray_str_t_ptr(d, pool);
+        uint64_t s = ((uint64_t)h * 0x9E3779B97F4A7C15ull >> 32) & mask;
+        for (;;) {
+            int32_t r = tab[s];
+            if (r < 0) {
+                tab[s] = (int32_t)nd;
+                rep[i] = (int32_t)nd;
+                dstr[nd] = sp; dlen[nd] = d->len; dhsh[nd] = h;
+                nd++;
+                break;
+            }
+            if (dhsh[r] == h && dlen[r] == d->len &&
+                (d->len == 0 || memcmp(dstr[r], sp, d->len) == 0)) {
+                rep[i] = r;
+                break;
+            }
+            s = (s + 1) & mask;
+        }
+    }
+    if (ray_sym_intern_batch(dhsh, dstr, dlen, nd, did) < 0) { scratch_free(hdr); return false; }
+    for (int64_t i = 0; i < n; i++) out[i] = did[rep[i]];
+    scratch_free(hdr);
+    return true;
+}
+
+/* ---- the spread pass of derived_key_over_sym_domain: each row takes the
+ * key of its symbol's slot (workers, disjoint ranges). */
+typedef struct {
+    const void*    cd;
+    uint8_t        attrs;
+    int64_t        dn;
+    const int32_t* pos;
+    const int64_t* key;      /* spread: key per slot; NULL = write the slot */
+    int64_t*       out;
+} dk_rows_ctx_t;
+
+static void dk_spread_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dk_rows_ctx_t* c = (const dk_rows_ctx_t*)vctx;
+    if (c->key) {
+        for (int64_t r = start; r < end; r++)
+            c->out[r] = c->key[c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)]];
+    } else {
+        for (int64_t r = start; r < end; r++)
+            c->out[r] = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
+    }
+}
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
                                      struct ray_sym_domain_s* dom, int64_t du) {
     if (!dom || dom == ray_sym_runtime_domain() || du <= 0) return NULL;
@@ -3102,21 +3321,8 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
     const int64_t chunk = derived_key_chunk_rows();
     for (int64_t lo = 0; lo < du; lo += chunk) {
         int64_t n = du - lo < chunk ? du - lo : chunk;
-        ray_t* sv = ray_vec_new(RAY_STR, n);
-        if (!sv || RAY_IS_ERR(sv)) { if (sv) ray_error_free(sv); goto fail; }
-        for (int64_t i = 0; i < n; i++) {
-            int64_t pos = ray_read_sym(dv, lo + i, dom_vec->type, dom_vec->attrs);
-            const char* sp = NULL;
-            size_t sl = 0;
-            if (pos >= 0 && pos < raw.count) {
-                sp = ray_sym_domain_raw_str(&raw, pos, &sl);
-            } else {
-                ray_t* a = ray_sym_domain_str(dom, pos);
-                if (a) { sp = ray_str_ptr(a); sl = ray_str_len(a); }
-            }
-            sv = ray_str_vec_append(sv, sp ? sp : "", sp ? sl : 0);
-            if (!sv || RAY_IS_ERR(sv)) { if (sv) ray_error_free(sv); goto fail; }
-        }
+        ray_t* sv = derived_key_chunk_strs(dv, dom_vec->attrs, lo, n, &raw, dom);
+        if (!sv) goto fail;
         ray_t* mini = ray_table_new(0);
         if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, col_sym, sv);
         ray_release(sv);
@@ -3134,13 +3340,7 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
         if (!kc || RAY_IS_ERR(kc)) { if (kc) ray_error_free(kc); goto fail; }
         if (!ray_is_vec(kc) || kc->len != n) { ray_release(kc); goto fail; }
         if (kc->type == RAY_STR) {
-            for (int64_t i = 0; i < n; i++) {
-                size_t sl = 0;
-                const char* sp = ray_str_vec_get(kc, i, &sl);
-                int64_t id = ray_sym_intern(sp ? sp : "", sp ? sl : 0);
-                if (id < 0) { ray_release(kc); goto fail; }
-                kd[lo + i] = id;
-            }
+            if (!derived_key_intern_chunk(kc, n, kd + lo)) { ray_release(kc); goto fail; }
         } else if (RAY_IS_SYM(kc->type)) {
             /* The STR evaluation still produced symbols (e.g. a literal
              * symbol branch): take them cell by cell as runtime ids. */
@@ -3215,6 +3415,9 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     ray_sym_vec_adopt_domain(dom_vec, C);
     int64_t du = 0, du_max = nrows / 2;
     if (du_max > INT32_MAX) du_max = INT32_MAX;       /* slots are int32 */
+    /* Slots in first-seen row order: the interned key ids follow the slot
+     * order, and with them the order the groups come out in — the same
+     * order the row-wise evaluation gives. */
     bool ok = true;
     for (int64_t r = 0; r < nrows; r++) {
         int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
@@ -3228,6 +3431,11 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     }
     if (!ok || du == 0) { ray_release(dom_vec); scratch_free(pos_hdr); return NULL; }
     dom_vec->len = du;
+    dk_rows_ctx_t rc;
+    memset(&rc, 0, sizeof(rc));
+    rc.cd = cd; rc.attrs = C->attrs; rc.dn = dn;
+    ray_pool_t* rpool = ray_pool_get();
+    bool rows_par = ray_pool_par_dispatch_ok(rpool, nrows, RAY_PARALLEL_THRESHOLD);
 
     /* Evaluate the expression over the du distinct symbols through the
      * same DAG compiler the row-wise key would take, against a one-column
@@ -3254,20 +3462,37 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
         if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
     }
 
-    /* Pass 2: spread by slot. */
-    ray_t* ids = ray_vec_new(RAY_I64, nrows);
-    if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
-    ids->len = nrows;
-    int64_t* idp = (int64_t*)ray_data(ids);
-    for (int64_t r = 0; r < nrows; r++)
-        idp[r] = pos[ray_read_sym(cd, r, C->type, C->attrs)];
-    scratch_free(pos_hdr);
-    ray_t* spread = ray_at_fn(key_dom, ids);
-    ray_release(ids);
-    ray_release(key_dom);
-    if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
-    if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
-    if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    /* Pass 2: spread by slot — each row takes the key of its symbol's slot,
+     * written straight into the result (no index vector, no gather). */
+    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+    ray_t* spread = NULL;
+    if (key_dom->type == RAY_SYM && (key_dom->attrs & RAY_SYM_W_MASK) == RAY_SYM_W64) {
+        spread = ray_sym_vec_new(RAY_SYM_W64, nrows);
+        if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+        spread->len = nrows;
+        ray_sym_vec_adopt_domain(spread, key_dom);
+        rc.pos = pos; rc.key = (const int64_t*)ray_data(key_dom); rc.out = (int64_t*)ray_data(spread);
+        if (rows_par) ray_pool_dispatch(rpool, dk_spread_fn, &rc, nrows);
+        else          dk_spread_fn(&rc, 0, 0, nrows);
+        scratch_free(pos_hdr);
+        ray_release(key_dom);
+    } else {
+        /* Any other key vector (the one-shot SYM evaluation's width, or a
+         * non-SYM result): index by slot and gather. */
+        ray_t* ids = ray_vec_new(RAY_I64, nrows);
+        if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+        ids->len = nrows;
+        rc.pos = pos; rc.key = NULL; rc.out = (int64_t*)ray_data(ids);
+        if (rows_par) ray_pool_dispatch(rpool, dk_spread_fn, &rc, nrows);
+        else          dk_spread_fn(&rc, 0, 0, nrows);
+        scratch_free(pos_hdr);
+        spread = ray_at_fn(key_dom, ids);
+        ray_release(ids);
+        ray_release(key_dom);
+        if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
+        if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
+        if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    }
     agg_route_note_key_domain();
     return spread;
 }
