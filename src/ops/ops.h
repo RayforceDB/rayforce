@@ -572,6 +572,23 @@ typedef struct ray_graph {
      * that reject an expression outright (arithmetic on a symbol) stay
      * quiet inside an arm and let the arm compile as it always did. */
     int             if_arm_depth;
+
+    /* Result memo for shared nodes (exec.c, exec_node): a node with more
+     * than one consumer in the graph is executed once and its result is
+     * handed to every consumer as a retained ref; the memo's own ref is
+     * released at exec_memo_end.  Set up around the flat exec_node(root) call in
+     * ray_execute_inner, NULL otherwise.  Without it a `let`-bound string
+     * expression used three times ran three times. */
+    ray_t**         memo_vals;
+    uint32_t*       memo_uses;
+    uint32_t        memo_n;
+    ray_t*          memo_hdr;
+    /* The table the memo was armed over.  A node evaluated while g->table
+     * is swapped for another (an `if` branch over its compacted rows, a
+     * filter's right-hand side over a sub-table, a window partition) has a
+     * value of that table's length, so the memo neither serves nor stores
+     * while g->table differs. */
+    ray_t*          memo_table;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */

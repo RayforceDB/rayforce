@@ -252,7 +252,12 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
 
     g->table = sub;
     g->selection = NULL;
+    /* The branch's shared nodes get a memo over the branch's rows; the
+     * outer memo (values of the full table) is set aside meanwhile. */
+    ray_exec_memo_save_t memo_save;
+    ray_exec_memo_push(g, branch, &memo_save);
     ray_t* value = exec_node(g, branch);
+    ray_exec_memo_pop(g, &memo_save);
     if (g->selection) {
         ray_release(g->selection);
         g->selection = NULL;
