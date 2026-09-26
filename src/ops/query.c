@@ -7135,8 +7135,8 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
      * intermediate filtered table materialised.  Closes a large
      * latency gap on ORDER BY + LIMIT shapes that were previously
      * dominated by the filtered-table materialisation step. */
-    if (where_expr && take_expr && has_sort && !by_expr && !nearest_expr) {
-        if (ray_fused_topk_supported(where_expr, tbl)) {
+    if (take_expr && has_sort && !by_expr && !nearest_expr) {
+        if (!where_expr || ray_fused_topk_supported(where_expr, tbl)) {
             /* Walk the dict and check: exactly one asc/desc clause naming
              * a single scalar column, take is an atom K, and every
              * output column is a -RAY_SYM source-column reference (no
