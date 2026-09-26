@@ -826,9 +826,11 @@ int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
 
 /* Intern n pre-hashed, already-deduplicated strings under one lock without
  * caching dotted segments: for VALUES (a derived group key's strings — hosts,
- * URLs), which are never resolved as namespace paths.  A value that later
- * appears as an identifier gets its segments cached by that intern (the
- * probe-hit path of sym_intern_nolock).  Same ids as ray_sym_intern_batch. */
+ * URLs), which are not namespace paths.  Such a symbol is not dotted until
+ * the same string is interned as a name (the probe-hit path of
+ * sym_intern_nolock caches the segments then) or ray_sym_rebuild_segments
+ * runs — the contract of ray_sym_intern_no_split.  Same ids as
+ * ray_sym_intern_batch. */
 int64_t ray_sym_intern_batch_no_split(const uint32_t* hashes, const char* const* strs,
                                       const size_t* lens, int64_t n, int64_t* out_ids) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;

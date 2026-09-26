@@ -12797,7 +12797,13 @@ da_path:;
              * collapsing to a serial scan of every row. */
             bool da_ranged = false;
             uint32_t da_part_tasks = 0;
-            if ((uint64_t)da_n_workers > max_workers) {
+            if ((uint64_t)da_n_workers > max_workers && da_has_first_last) {
+                /* Several FIRST/LAST aggregates share one first_row/last_row
+                 * per slot (see da_accum_row): the answer for a null-mixed
+                 * pair depends on the order the rows arrive in, so past the
+                 * budget those keep the serial scan in row order. */
+                da_n_workers = 1;
+            } else if ((uint64_t)da_n_workers > max_workers) {
                 if (n_slots >= 2 * da_n_workers && nrows <= INT32_MAX) {
                     /* Partition the SLOTS instead: one pass buckets the row
                      * ids by slot span, then one task per span drains its
