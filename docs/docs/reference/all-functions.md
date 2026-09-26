@@ -12,7 +12,7 @@
 |---|---|---|
 | [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
-| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (20) |
+| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (13) | [Table Operations](#table-ops) (20) |
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (11) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
@@ -71,7 +71,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
-`fold-left`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
+`fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
@@ -221,6 +221,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 | `pmap` | variadic | — | Parallel map (multi-threaded, returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
+| `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
 | `fold-right` | variadic | — | Right-associative fold | `(fold-right - 10 [1 2 3])` → `-8` |
 | `scan` | variadic | — | Running fold (all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-left` | variadic | — | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
@@ -359,6 +360,8 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
 | `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
+| `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
+| `times` | variadic | special | Run body exactly n times (count evaluated once); returns null | `(times 5 (set n (+ n 1)))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
 | `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
@@ -652,7 +655,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.now` | variadic | — | Monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
-| `.sys.build` | variadic | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
+| `.sys.build` | nullary | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | variadic | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
 | `.sys.prof` | variadic | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
 | `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`) | `(.sys.querylog)` |

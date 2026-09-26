@@ -1071,6 +1071,186 @@ static test_result_t test_jb_mixed_type_radix(void) {
     PASS();
 }
 
+
+/* ── #597: null-free key-column fast path ─────────────────────────────────
+ * A join proves once, per key column, whether the column can hold a null
+ * (payload scan for SYM/STR, the HAS_NULLS bit otherwise) and skips the
+ * per-cell null test in hash_row_keys / join_keys_eq when no key column can.
+ *
+ * ray_join_nullfree_keys counts the joins that took that path;
+ * ray_join_force_null_checks suppresses it, giving the differential tests a
+ * null-aware oracle inside one binary (same shape as the build-swap knob).
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* SYM table; a "" entry is the canonical SYM null (id 0). */
+static ray_t* jb_sym_table1(const char* name, const char* const* vals, int64_t n) {
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W64, n);
+    if (!col || RAY_IS_ERR(col)) return col;
+    col->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t id = vals[i][0] ? ray_sym_intern(vals[i], strlen(vals[i])) : 0;
+        ray_write_sym(ray_data(col), i, (uint64_t)id, RAY_SYM, col->attrs);
+    }
+    ray_t* tbl = ray_table_new(1);
+    int64_t sym = ray_sym_intern(name, strlen(name));
+    tbl = ray_table_add_col(tbl, sym, col);
+    ray_release(col);
+    return tbl;
+}
+
+/* I64 table with an optional null at `null_at` (-1 for none). */
+static ray_t* jb_table1_null(const char* name, const int64_t* vals, int64_t n,
+                             int64_t null_at) {
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, n);
+    if (!col || RAY_IS_ERR(col)) return col;
+    if (null_at >= 0) ray_vec_set_null(col, null_at, true);
+    ray_t* tbl = ray_table_new(1);
+    int64_t sym = ray_sym_intern(name, strlen(name));
+    tbl = ray_table_add_col(tbl, sym, col);
+    ray_release(col);
+    return tbl;
+}
+
+/* SYM key columns with no null cell take the null-free path. */
+static test_result_t test_jb_nf_sym_keys_prove(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    static const char* const lv[] = { "NYSE", "LSE",  "NYSE", "TSE" };
+    static const char* const rv[] = { "LSE",  "NYSE", "XETR" };
+    ray_t* lt = jb_sym_table1("venue", lv, 4);
+    ray_t* rt = jb_sym_table1("rvenue", rv, 3);
+    TEST_ASSERT(lt && !RAY_IS_ERR(lt), "left SYM table");
+    TEST_ASSERT(rt && !RAY_IS_ERR(rt), "right SYM table");
+
+    uint64_t before = ray_join_nullfree_keys;
+    ray_t* got = jb_inner_join(lt, "venue", rt, "rvenue");
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "join execution");
+    TEST_ASSERT(ray_join_nullfree_keys > before,
+                "null-free SYM key columns must take the null-free path");
+    TEST_ASSERT_EQ_I(ray_table_nrows(got), 3);
+
+    ray_release(got);
+    ray_release(lt);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* One null SYM cell on the left blocks the fast path.  SYM nulls are id 0
+ * in the payload and are NOT reflected in HAS_NULLS, so this case is the
+ * reason the proof scans the payload instead of reading the flag. */
+static test_result_t test_jb_nf_sym_null_blocks(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    static const char* const lv[] = { "NYSE", "",    "NYSE", "TSE" };
+    static const char* const rv[] = { "LSE",  "NYSE", "XETR" };
+    ray_t* lt = jb_sym_table1("venue", lv, 4);
+    ray_t* rt = jb_sym_table1("rvenue", rv, 3);
+    TEST_ASSERT(lt && !RAY_IS_ERR(lt), "left SYM table");
+    TEST_ASSERT(rt && !RAY_IS_ERR(rt), "right SYM table");
+    TEST_ASSERT_FALSE(ray_table_get_col_idx(lt, 0)->attrs & RAY_ATTR_HAS_NULLS);
+
+    uint64_t before = ray_join_nullfree_keys;
+    ray_t* got = jb_inner_join(lt, "venue", rt, "rvenue");
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "join execution");
+    TEST_ASSERT(ray_join_nullfree_keys == before,
+                "a null SYM key cell must block the null-free path");
+
+    ray_release(got);
+    ray_release(lt);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* I64 keys: the HAS_NULLS bit decides. */
+static test_result_t test_jb_nf_i64_flag_decides(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    static const int64_t lv[] = { 1, 2, 3, 4 };
+    static const int64_t rv[] = { 2, 3, 9 };
+
+    ray_t* lt_clean = jb_table1_null("lk", lv, 4, -1);
+    ray_t* rt       = jb_table1_null("rk", rv, 3, -1);
+    uint64_t before = ray_join_nullfree_keys;
+    ray_t* got = jb_inner_join(lt_clean, "lk", rt, "rk");
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "clean join execution");
+    TEST_ASSERT(ray_join_nullfree_keys > before,
+                "HAS_NULLS-clear I64 keys must take the null-free path");
+    ray_release(got);
+    ray_release(lt_clean);
+
+    ray_t* lt_null = jb_table1_null("lk", lv, 4, 1);
+    TEST_ASSERT_TRUE(ray_table_get_col_idx(lt_null, 0)->attrs & RAY_ATTR_HAS_NULLS);
+    before = ray_join_nullfree_keys;
+    got = jb_inner_join(lt_null, "lk", rt, "rk");
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "nullable join execution");
+    TEST_ASSERT(ray_join_nullfree_keys == before,
+                "a HAS_NULLS I64 key column must block the null-free path");
+
+    ray_release(got);
+    ray_release(lt_null);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* The null-free path must not change any answer: run every join type, at
+ * both the chained and the radix size, with and without null keys, against
+ * the forced null-aware oracle. */
+static test_result_t test_jb_nf_differential(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t sizes[] = { 64, RAY_PARALLEL_THRESHOLD + 5000 };
+    const uint8_t types[] = { 0, 1, 2 };
+    test_result_t result = (test_result_t){ TEST_PASS, NULL };
+
+    for (size_t s = 0; s < sizeof sizes / sizeof *sizes && result.status == TEST_PASS; s++) {
+        int64_t n = sizes[s];
+        int64_t* lv = malloc((size_t)n * sizeof(*lv));
+        int64_t* rv = malloc((size_t)n * sizeof(*rv));
+        if (!lv || !rv) { free(lv); free(rv); ray_sym_destroy(); ray_heap_destroy();
+                          return (test_result_t){ TEST_FAIL, "malloc" }; }
+        for (int64_t i = 0; i < n; i++) { lv[i] = i % (n / 4 + 1); rv[i] = i % (n / 3 + 1); }
+
+        for (int nulls = 0; nulls < 2 && result.status == TEST_PASS; nulls++) {
+            ray_t* lt = jb_table1_null("lk", lv, n, nulls ? n / 2 : -1);
+            ray_t* rt = jb_table1_null("rk", rv, n, nulls ? n / 3 : -1);
+
+            for (size_t t = 0; t < sizeof types / sizeof *types && result.status == TEST_PASS; t++) {
+                ray_join_force_null_checks = true;
+                ray_t* oracle = jb_join(lt, "lk", rt, "rk", types[t]);
+                ray_join_force_null_checks = false;
+                ray_t* fast = jb_join(lt, "lk", rt, "rk", types[t]);
+
+                if (!oracle || RAY_IS_ERR(oracle) || !fast || RAY_IS_ERR(fast)) {
+                    result = (test_result_t){ TEST_FAIL, "differential join execution" };
+                } else {
+                    result = jb_results_equal(fast, oracle);
+                }
+                ray_release(oracle);
+                ray_release(fast);
+            }
+            ray_release(lt);
+            ray_release(rt);
+        }
+        free(lv);
+        free(rv);
+    }
+
+    ray_join_force_null_checks = false;
+    ray_sym_destroy();
+    ray_heap_destroy();
+    return result;
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
@@ -1093,5 +1273,9 @@ const test_entry_t join_buildside_entries[] = {
     { "join_buildside/not_sticky", test_jb_not_sticky, NULL, NULL },
     { "join_buildside/mixed_type_radix", test_jb_mixed_type_radix, NULL, NULL },
     { "join_buildside/null_run_upfront_fallback", test_jb_null_run_upfront_fallback, NULL, NULL },
+    { "join_buildside/nf_sym_keys_prove", test_jb_nf_sym_keys_prove, NULL, NULL },
+    { "join_buildside/nf_sym_null_blocks", test_jb_nf_sym_null_blocks, NULL, NULL },
+    { "join_buildside/nf_i64_flag_decides", test_jb_nf_i64_flag_decides, NULL, NULL },
+    { "join_buildside/nf_differential", test_jb_nf_differential, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

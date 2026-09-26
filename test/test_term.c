@@ -1185,7 +1185,12 @@ static test_result_t test_term_prompt_emits_bytes(void) {
     ray_term_prompt(t);
     fflush(stdout);
     int32_t n = capture_end(saved, path, cap, sizeof cap);
-    int saw_arrow = strstr(cap, "\xe2\x80\xa3") != NULL; /* ‣ */
+    /* ‣ (U+2023), or ► (U+25BA) where no console font has ‣ — see term.c */
+#if defined(RAY_OS_WINDOWS)
+    int saw_arrow = strstr(cap, "\xe2\x96\xba") != NULL;
+#else
+    int saw_arrow = strstr(cap, "\xe2\x80\xa3") != NULL;
+#endif
     int saw_green = strstr(cap, "\033[32m") != NULL;
     TEST_ASSERT_FMT(n > 0, "no prompt output");
     TEST_ASSERT_FMT(saw_arrow, "missing ‣ arrow in prompt: bytes=%d", n);

@@ -26,6 +26,9 @@
   #include <sys/socket.h>
   #include <netinet/in.h>
   #include <unistd.h>
+#else
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
 #endif
 
 extern ray_runtime_t* __RUNTIME;
@@ -631,7 +634,6 @@ static test_result_t test_mcast_large_payload_queues_until_writable(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
     ray_release(sub);
 
-#ifndef RAY_OS_WINDOWS
     ray_t* server_h = ray_env_get(ray_sym_intern("_mc_sub_handle", 14));
     TEST_ASSERT_NOT_NULL(server_h);
     TEST_ASSERT_EQ_I(server_h->type, -RAY_I64);
@@ -639,8 +641,7 @@ static test_result_t test_mcast_large_payload_queues_until_writable(void) {
     TEST_ASSERT_NOT_NULL(server_sel);
     int sndbuf = 4096;
     setsockopt((ray_sock_t)server_sel->fd, SOL_SOCKET, SO_SNDBUF,
-               &sndbuf, sizeof(sndbuf));
-#endif
+               (const char*)&sndbuf, sizeof(sndbuf));
 
     const char* pub_src =
         "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
@@ -728,7 +729,6 @@ static test_result_t test_mcast_shared_frame_across_subscribers(void) {
     int64_t hp = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((hp) >= (0), "publisher connected");
 
-#ifndef RAY_OS_WINDOWS
     ray_t* server_hs = ray_env_get(ray_sym_intern("_mc_handles", 11));
     TEST_ASSERT_NOT_NULL(server_hs);
     TEST_ASSERT((ray_len(server_hs)) >= (3), "three server-side subscriber handles");
@@ -737,9 +737,8 @@ static test_result_t test_mcast_shared_frame_across_subscribers(void) {
         ray_selector_t* ssel = ray_poll_get(poll, sh);
         TEST_ASSERT_NOT_NULL(ssel);
         int sndbuf = 4096;
-        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
     }
-#endif
 
     const char* pub_src = "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";
     ray_t* msg = ray_str(pub_src, strlen(pub_src));
@@ -802,6 +801,13 @@ static test_result_t test_mcast_shared_frame_across_subscribers(void) {
  * frame keeps receiving.  The active limits and the high-water mark are
  * readable from .mc.stats and per handle from (.ipc.handle h). */
 static test_result_t test_mcast_txlimit_overflow_disconnects(void) {
+#if defined(_WIN32)
+    /* The backlog this test needs never forms on Windows: Winsock accepts a
+     * single non-blocking send() larger than SO_SNDBUF whole (it pins the
+     * caller's buffer), so the 800 KiB frame leaves at once and no
+     * subscriber crosses its tx limit. */
+    SKIP("Winsock accepts oversized sends whole; no tx backlog forms");
+#endif
     ray_t* r = ray_eval_str(
         "(set _mc_count 0)"
         "(set _mc_close_count 0)"
@@ -840,14 +846,12 @@ static test_result_t test_mcast_txlimit_overflow_disconnects(void) {
     TEST_ASSERT((ray_len(server_hs)) >= (2), "two server-side subscriber handles");
     int64_t s1 = ((int64_t*)ray_data(server_hs))[0];
     int64_t s2 = ((int64_t*)ray_data(server_hs))[1];
-#ifndef RAY_OS_WINDOWS
     for (int i = 0; i < 2; i++) {
         ray_selector_t* ssel = ray_poll_get(poll, i == 0 ? s1 : s2);
         TEST_ASSERT_NOT_NULL(ssel);
         int sndbuf = 4096;
-        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
     }
-#endif
 
     /* Process default: 64 KiB.  h2 alone may hold 4 MiB. */
     ray_t* msg = ray_str("(.ipc.txlimit 65536 0)", strlen("(.ipc.txlimit 65536 0)"));
@@ -1040,14 +1044,12 @@ static test_result_t test_ipc_outbound_close_hook(void) {
     TEST_ASSERT_TRUE(pump_until_env_i64_at_least("_oc_out", 7, 1, 1000));
 
     /* B: the peer resets h2 (linger zero, then close → RST) */
-#ifndef RAY_OS_WINDOWS
     {
         ray_selector_t* ssel = ray_poll_get(poll, s2);
         TEST_ASSERT_NOT_NULL(ssel);
         struct linger lg = { 1, 0 };
-        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        setsockopt((ray_sock_t)ssel->fd, SOL_SOCKET, SO_LINGER, (const char*)&lg, sizeof(lg));
     }
-#endif
     n = snprintf(src, sizeof(src), "(.ipc.close %lld)", (long long)s2);
     msg = ray_str(src, (size_t)n);
     cr = ray_ipc_send(hc, msg);
@@ -1224,7 +1226,6 @@ static test_result_t test_mcast_sync_reply_after_queued_frame(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(sub));
     ray_release(sub);
 
-#ifndef RAY_OS_WINDOWS
     /* Shrink the server->h1 send buffer so a big frame parks on sel->tx.buf
      * instead of leaving in a single write. */
     ray_t* server_h = ray_env_get(ray_sym_intern("_mc_sub_handle", 14));
@@ -1234,8 +1235,7 @@ static test_result_t test_mcast_sync_reply_after_queued_frame(void) {
     TEST_ASSERT_NOT_NULL(server_sel);
     int sndbuf = 4096;
     setsockopt((ray_sock_t)server_sel->fd, SOL_SOCKET, SO_SNDBUF,
-               &sndbuf, sizeof(sndbuf));
-#endif
+               (const char*)&sndbuf, sizeof(sndbuf));
 
     const char* pub_src =
         "(.mc.pub \"big\" (+ (* (til 100000) 1103515245) 12345))";

@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; cov5 — targeted coverage: distinct_sort_cmp default branch (lines 282-291)
 ;;
 ;; F32 (type=6) is not in hs_hash_row switch → hashes by index (all "distinct").

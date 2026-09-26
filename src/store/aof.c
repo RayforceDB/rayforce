@@ -49,6 +49,15 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+/* ray_file_sync takes the platform handle: the descriptor itself on POSIX,
+ * the underlying HANDLE on Windows. */
+#ifdef RAY_OS_WINDOWS
+#include <io.h>
+#define AOF_FP_HANDLE(fp) ((ray_fd_t)_get_osfhandle(fileno(fp)))
+#else
+#define AOF_FP_HANDLE(fp) ((ray_fd_t)fileno(fp))
+#endif
+
 #define AOF_PATH_MAX    1024
 /* Segment-path buffers are sized past the worst case (dir + '/' + 24-char
  * segment name) so gcc's -Wformat-truncation can prove snprintf fits even
@@ -390,7 +399,7 @@ static ray_err_t aof_rotate(ray_aof_t* log) {
         if (err != RAY_OK) return err;
     }
     if (fflush(log->fp) != 0) return RAY_ERR_IO;
-    if (ray_file_sync((ray_fd_t)fileno(log->fp)) != RAY_OK) return RAY_ERR_IO;
+    if (ray_file_sync(AOF_FP_HANDLE(log->fp)) != RAY_OK) return RAY_ERR_IO;
     if (fclose(log->fp) != 0) { log->fp = NULL; return RAY_ERR_IO; }
 
     char path[AOF_SEGPATH_MAX];
@@ -442,7 +451,7 @@ ray_err_t ray_aof_commit(ray_aof_t* log) {
     ray_err_t err = aof_write_frame(log);
     if (err != RAY_OK) return err;
     if (fflush(log->fp) != 0) return RAY_ERR_IO;
-    return ray_file_sync((ray_fd_t)fileno(log->fp));
+    return ray_file_sync(AOF_FP_HANDLE(log->fp));
 }
 
 int64_t ray_aof_next_lsn(const ray_aof_t* log) {

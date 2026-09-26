@@ -37,8 +37,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef RAY_OS_WINDOWS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#endif
 
 static char* make_tmpdir(void) {
     char tmpl[] = "/tmp/rayforce-rt-test-XXXXXX";
@@ -70,6 +75,11 @@ static test_result_t test_create_with_sym_absent_is_ok(void) {
  * passing a path whose parent exists but isn't a directory (ENOTDIR) —
  * portable across Linux/macOS without needing root or chmod games. */
 static test_result_t test_create_with_sym_io_error_surfaces(void) {
+#if defined(_WIN32)
+    /* Win32 reports a path through a regular file as "path not found"
+     * (ENOENT, the missing-file case), never ENOTDIR. */
+    SKIP("no ENOTDIR on Windows");
+#endif
     char* dir = make_tmpdir();
     TEST_ASSERT_NOT_NULL(dir);
 
@@ -632,6 +642,21 @@ static test_result_t test_build_sys_args_edges(void) {
 
     ray_release(user);
     ray_release(d);
+    PASS();
+}
+
+static test_result_t test_build_sys_args_rejects_malformed_numbers(void) {
+    char* cases[][3] = {
+        { "rayforce", "-c", "2abc" },
+        { "rayforce", "-c", "999999999999999999999999" },
+        { "rayforce", "-t", "1abc" },
+        { "rayforce", "-Q", "0abc" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ray_t* d = ray_build_sys_args(3, cases[i]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(d));
+        ray_error_free(d);
+    }
     PASS();
 }
 
@@ -1250,9 +1275,7 @@ static test_result_t test_syscov_splayed_set_with_sym_path(void) {
     }
 
     /* cleanup — no free(dir), it's a stack pointer */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
-    system(cmd);
+    (void)ray_test_rm_rf(dir);
     PASS();
 }
 
@@ -1288,6 +1311,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_defaults",     test_build_sys_args_defaults,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
     { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
+    { "runtime/build_sys_args_rejects_malformed_numbers", test_build_sys_args_rejects_malformed_numbers, sys_setup, sys_teardown },
     { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
@@ -1315,4 +1339,3 @@ const test_entry_t runtime_entries[] = {
 
     { NULL, NULL, NULL, NULL },
 };
-

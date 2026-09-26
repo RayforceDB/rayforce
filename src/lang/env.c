@@ -112,6 +112,13 @@ static struct {
  * threads with no bound VM, so plain __VM derefs are safe below. */
 
 int32_t ray_env_scope_depth(void) { return __VM ? __VM->scope_depth : 0; }
+
+bool ray_env_query_scope_above(int32_t depth) {
+    if (!__VM) return false;
+    for (int32_t d = depth < 0 ? 0 : depth; d < __VM->scope_depth; d++)
+        if (__VM->scope_stack[d].kind == RAY_SCOPE_QUERY) return true;
+    return false;
+}
 int32_t ray_env_global_count(void) { return g_env.count; }
 
 /* Reverse-map a builtin function object to the symbol it is bound under in the
@@ -839,7 +846,7 @@ int32_t ray_env_list_user(int64_t* sym_ids, ray_t** vals, int32_t max_entries) {
 /* ---- Prefix lookup ---- */
 
 static const char* s_keywords[] = {
-    "def", "do", "false", "fn", "if", "let", "set", "true", NULL
+    "def", "do", "false", "fn", "if", "let", "set", "times", "true", "while", NULL
 };
 
 /* Compare helper for qsort on const char* */

@@ -110,7 +110,7 @@ void ray_lang_print(FILE* fp, ray_t* val) {
         return;
     }
     switch (val->type) {
-    case -RAY_I64:  fprintf(fp, "%ld", (long)val->i64); break;
+    case -RAY_I64:  fprintf(fp, "%" PRId64, val->i64); break;
     case -RAY_F64: {
         double fv = val->f64;
         fv = clear_neg_zero(fv);
@@ -142,8 +142,8 @@ void ray_lang_print(FILE* fp, ray_t* val) {
         break;
     }
     case RAY_TABLE:
-        fprintf(fp, "<table %ldx%ld>",
-                (long)ray_table_nrows(val), (long)ray_table_ncols(val));
+        fprintf(fp, "<table %" PRId64 "x%" PRId64 ">",
+                ray_table_nrows(val), ray_table_ncols(val));
         break;
     case RAY_UNARY: case RAY_BINARY: case RAY_VARY: {
         const char* name = ray_fn_name(val);
@@ -204,7 +204,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                        RAY_ATOM_IS_NULL(a)) {
                 tlen = snprintf(tmp, sizeof(tmp), "%s", null_literal_str(a->type));
             } else if (a->type == -RAY_I64) {
-                tlen = snprintf(tmp, sizeof(tmp), "%ld", (long)a->i64);
+                tlen = snprintf(tmp, sizeof(tmp), "%" PRId64, a->i64);
             } else if (a->type == -RAY_F64) {
                 double fv = a->f64;
                 fv = clear_neg_zero(fv);

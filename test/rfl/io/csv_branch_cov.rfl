@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Branch coverage for src/io/csv.c — targets reachable functional branches
 ;; left uncovered by csv_types.rfl, csv_round2.rfl, csv_splayed.rfl,
 ;; system/{read,write}_csv.rfl, and test/test_csv.c.

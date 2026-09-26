@@ -30,6 +30,86 @@ Without an else branch, `if` returns `0`:
 30
 ```
 
+## Iteration: while
+
+`while` evaluates `cond`, and while it is truthy evaluates each body expression
+in order, then tests again. It always returns null — it is a statement form,
+run for effect.
+
+```text
+‣ (set n 5)
+‣ (set total 0)
+‣ (while (> n 0) (set total (+ total n)) (set n (- n 1)))
+‣ total
+15
+```
+
+It is the only iteration form that can stop early. `map`, `fold`, `scan` and
+`prior` all consume their whole input, so a "repeat until done" loop written as
+a fold over a fixed range pays that range's full length on every call, however
+early the work finishes. `while` stops when the condition says stop, allocates
+no range, and does not recurse — so it is not bounded by the stack depth a
+recursive loop would hit.
+
+The body may be omitted, in which case a condition with side effects is the
+whole loop. That is the natural shape when there is no sequence to iterate over
+in the first place:
+
+```text
+‣ (while (drain-one-batch))
+```
+
+Unlike `do`, `while` pushes no scope of its own. A `let` in the body binds in
+the enclosing frame and therefore survives the iteration, which is what makes a
+`let` usable as a loop variable inside a lambda:
+
+```lisp
+((fn [n]
+   (let i 0)
+   (let acc 0)
+   (while (< i n) (let acc (+ acc i)) (let i (+ i 1)))
+   acc) 4)                       ; => 6
+```
+
+When a fresh binding per pass is wanted instead, wrap the body in `do`, which
+does push a scope:
+
+```lisp
+(while (< i 3) (do (let tmp (* i i)) (use tmp)) (set i (+ i 1)))
+```
+
+A loop whose condition never goes false runs until interrupted; Ctrl-C breaks
+out of one at the REPL.
+
+## Bounded Iteration: times
+
+`times` runs the body a fixed number of times and returns null.
+
+```text
+‣ (set n 0)
+‣ (times 5 (set n (+ n 1)))
+‣ n
+5
+```
+
+The count is evaluated **once**, on entry, so the bound is fixed however the
+body mutates whatever produced it:
+
+```lisp
+(set k 3)
+(times k (set k (+ k 10)))      ; runs 3 times, not forever
+```
+
+A count of zero or less runs the body zero times rather than raising — a bound
+that computes to empty is a no-op, not an error. A non-integer count is a type
+error. Like `while`, `times` pushes no scope of its own, so a `let` in the body
+binds in the enclosing frame; wrap the body in `do` when a fresh binding per
+pass is wanted.
+
+Reach for `times` when the number of passes is known up front and for `while`
+when it is not. Neither allocates a sequence, so neither pays for a range that
+exists only to be counted.
+
 ## Variable Binding: set and let
 
 `set` creates a global binding. `let` creates a local binding scoped to the enclosing `do`:
@@ -187,7 +267,20 @@ Lambdas are auto-mapped over vectors when called directly. Use `map` for explici
 ‣ (scan + [1 2 3 4 5])
 ; => [1 3 6 10 15]
 
+;; fold-while stops as soon as the running result fails the predicate,
+;; leaving the rest of the collection untouched
+‣ (fold-while (fn [acc] (< acc 100)) + 0 (til 1000))
+; => 105
+
 ;; where returns indices matching a condition
 ‣ (where (> (til 10) 3))
 ; => [4 5 6 7 8 9]
 ```
+
+`map`, `fold`, `scan` and `prior` all consume their whole input. `fold-while`
+is the one member of the family that can stop: the accumulator is offered to
+the predicate before each step, and a falsy answer ends the fold and yields the
+accumulator as it stands. The test happens before the first element too, so a
+predicate that is false at the start returns the initial value untouched.
+Elements are pulled one at a time, so a fold that stops after three steps costs
+three elements however long the collection is.

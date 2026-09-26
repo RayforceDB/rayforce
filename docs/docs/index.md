@@ -2,7 +2,7 @@
 
 Embeddable columnar analytics and graph traversal engine in pure C.
 
-Rayforce combines morsel-driven vectorized execution, a multi-pass query optimizer, and a native CSR graph engine in a single pipeline. It is queried through the **Rayfall** language, exposes a C API for embedding, and runs on Linux and macOS (Windows is planned — the IOCP backend is still a stub).
+Rayforce combines morsel-driven vectorized execution, a multi-pass query optimizer, and a native CSR graph engine in a single pipeline. It is queried through the **Rayfall** language, exposes a C API for embedding, and runs on Linux and macOS, and builds on Windows from source (MSYS2 CLANG64).
 
 [Quick Start](getting-started/quick-start.md){ .md-button .md-button--primary }
 [Functions Reference](language/functions.md){ .md-button }

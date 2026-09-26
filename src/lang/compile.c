@@ -183,16 +183,39 @@ static int32_t emit_jump(compiler_t *c, uint8_t opcode) {
     return patch_pos;
 }
 
-static void patch_jump(compiler_t *c, int32_t pos) {
-    int32_t raw = c->code_len - pos - 2;
+/* Write a jump displacement into the 2-byte operand at `pos`, which is
+ * relative to the instruction's end (pos + 2).  Out of int16_t range sets
+ * c->error, aborting bytecode emission so the lambda falls back to the
+ * tree-walking interpreter — the same graceful degradation as the other
+ * compile-time bailouts. */
+static void write_jump_offset(compiler_t *c, int32_t pos, int32_t target) {
+    int32_t raw = target - pos - 2;
     if (raw > 32767 || raw < -32768) { c->error = true; return; }
     int16_t offset = (int16_t)raw;
     c->code[pos]     = (uint8_t)((uint16_t)offset >> 8);
     c->code[pos + 1] = (uint8_t)(offset & 0xFF);
 }
 
+/* Resolve a forward jump emitted earlier, now that its target is here. */
+static void patch_jump(compiler_t *c, int32_t pos) {
+    write_jump_offset(c, pos, c->code_len);
+}
+
+/* Emit an unconditional jump BACKWARD to an already-emitted address — the
+ * mirror of patch_jump, where the target is known up front and the
+ * displacement comes out negative.  The VM's op_jmp checks for a pending
+ * interrupt whenever the offset is negative, so a runaway loop built from
+ * this stays Ctrl-C-able. */
+static void emit_jump_back(compiler_t *c, int32_t target) {
+    emit(c, OP_JMP);
+    int32_t pos = c->code_len;
+    emit(c, 0);
+    emit(c, 0);
+    write_jump_offset(c, pos, target);
+}
+
 /* Cached sym IDs for special forms */
-static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
+static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_times = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
 static _Thread_local int64_t sf_eval = -1, sf_resolve = -1;
 
 static void init_sf_syms(void) {
@@ -201,6 +224,8 @@ static void init_sf_syms(void) {
     sf_let  = ray_sym_intern("let", 3);
     sf_if   = ray_sym_intern("if",  2);
     sf_do   = ray_sym_intern("do",  2);
+    sf_while= ray_sym_intern("while", 5);
+    sf_times= ray_sym_intern("times", 5);
     sf_fn   = ray_sym_intern("fn",  2);
     sf_self = ray_sym_intern("self", 4);
     sf_try  = ray_sym_intern("try",  3);
@@ -366,6 +391,101 @@ static void compile_list(compiler_t *c, ray_t *ast) {
                 if (i > 1) emit(c, OP_POP);
                 compile_expr(c, elems[i]);
             }
+            return;
+        }
+
+        /* (while cond body...) — the only backward branch the compiler
+         * emits.  Body values are discarded (OP_POP each), and the form
+         * yields null however many times it iterated, matching
+         * ray_while_fn.  No scope is pushed: `let` in the body writes this
+         * frame's local slot, so loop-carried state survives the pass
+         * exactly as it does on the tree-walking path.
+         *
+         * Compiling the body inline — rather than letting this fall through
+         * to the generic special-form path below — is what keeps `return`
+         * working inside a loop: it reaches the sf_return case and unwinds
+         * the lambda, instead of degrading to the tree walker's identity
+         * `return` (issue 588). */
+        if (sym_id == sf_while && n >= 2) {
+            int32_t top = c->code_len;
+            compile_expr(c, elems[1]);
+            /* Truthiness belongs to the materialized value, not to the
+             * non-NULL lazy handle containing it — same rule as sf_if. */
+            emit(c, OP_FORCE);
+            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+            for (int64_t i = 2; i < n; i++) {
+                compile_expr(c, elems[i]);
+                emit(c, OP_POP);
+            }
+            emit_jump_back(c, top);
+            patch_jump(c, jmpf_pos);
+            int32_t idx = add_constant(c, RAY_NULL_OBJ);
+            emit_const(c, idx);
+            return;
+        }
+
+        /* (times n body...) — a counted loop, desugared onto the same
+         * backward branch `while` uses.
+         *
+         * The count is evaluated ONCE into a hidden local slot, so the
+         * bound is fixed on entry however the body mutates its source.
+         * ray_times_norm_fn type-checks it and clamps a negative bound to
+         * zero, which is what lets the per-pass test be a bare truthiness
+         * check on the counter: 0 is falsy (is_truthy), everything else is
+         * truthy, so the loop needs no comparison call and a negative bound
+         * cannot run away.
+         *
+         * Both helpers are pushed as constant-pool objects rather than
+         * resolved by name, so the loop's own arithmetic is invisible to
+         * user code and immune to an override of `-` or `>`.  The counter's
+         * slot is likewise addressed by index, never by name, and its
+         * sym contains a space so no source token can collide with it —
+         * which is what keeps nested `times` counters apart.
+         *
+         * As with `while`, compiling the body inline is what keeps
+         * `return` unwinding the enclosing lambda from inside the loop. */
+        if (sym_id == sf_times && n >= 2) {
+            ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
+            ray_t *dec_fn  = ray_fn_unary("times dec",  RAY_FN_NONE, ray_times_dec_fn);
+            if (!norm_fn || RAY_IS_ERR(norm_fn) || !dec_fn || RAY_IS_ERR(dec_fn)) {
+                if (norm_fn && !RAY_IS_ERR(norm_fn)) ray_release(norm_fn);
+                if (dec_fn  && !RAY_IS_ERR(dec_fn))  ray_release(dec_fn);
+                c->error = true;
+                return;
+            }
+            int32_t norm_idx = add_constant(c, norm_fn);
+            int32_t dec_idx  = add_constant(c, dec_fn);
+            ray_release(norm_fn);
+            ray_release(dec_fn);
+            int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
+            if (cslot < 0 || c->error) { c->error = true; return; }
+
+            /* counter = normalize(<count>) */
+            emit_const(c, norm_idx);
+            compile_expr(c, elems[1]);
+            emit(c, OP_CALL1);
+            emit(c, OP_STOREENV);
+            emit(c, (uint8_t)cslot);
+
+            int32_t top = c->code_len;
+            emit(c, OP_LOADENV);
+            emit(c, (uint8_t)cslot);
+            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+            for (int64_t i = 2; i < n; i++) {
+                compile_expr(c, elems[i]);
+                emit(c, OP_POP);
+            }
+            /* counter = counter - 1 */
+            emit_const(c, dec_idx);
+            emit(c, OP_LOADENV);
+            emit(c, (uint8_t)cslot);
+            emit(c, OP_CALL1);
+            emit(c, OP_STOREENV);
+            emit(c, (uint8_t)cslot);
+            emit_jump_back(c, top);
+            patch_jump(c, jmpf_pos);
+            int32_t null_idx = add_constant(c, RAY_NULL_OBJ);
+            emit_const(c, null_idx);
             return;
         }
 

@@ -928,8 +928,8 @@ static bool agg_desc_init(agg_desc_t* d, ray_graph_t* g, ray_op_ext_t* ext,
     for (uint32_t k = 0; k < nk; k++) d->key_data[k] = ray_data(key_cols[k]);
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        d->agg_syms[a] = ie->sym;
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
+        d->agg_syms[a] = ie ? ie->sym : 0;
+        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
         d->val_data[a]    = vc ? ray_data(vc) : NULL;
         d->val_types[a]   = vc ? vc->type : RAY_I64;
         d->val_hasnull[a] = vc ? ray_vec_may_have_nulls(vc) : false;
@@ -966,7 +966,7 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
     vo->block = 0;
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
+        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
         int8_t in_type = vc ? vc->type : RAY_I64;
         vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
         vo->off[a] = vo->block;
@@ -3724,20 +3724,91 @@ agg_radix_select_topn(ray_pool_t* pool, const agg_radix_part_t* parts, uint32_t 
     int64_t kept = 0;
     for (uint32_t p = 0; p < n_parts; p++) kept += c.kept[p];
     ray_free_raw(cand); ray_free_raw(cand_n);
-    agg_radix_order_t* sel = ray_alloc_raw((size_t)(kept > 0 ? kept : 1) * sizeof(agg_radix_order_t));
-    int64_t* fr = ray_alloc_raw((size_t)(kept > 0 ? kept : 1) * sizeof(int64_t));
+    /* The kept set is every group at or beyond the threshold.  Groups
+     * strictly beyond it number fewer than N by construction, but the groups
+     * AT the threshold can be nearly all of them — a count-per-group top-10
+     * over a near-unique key has a threshold of 1 and every group ties it —
+     * and sorting that set is a comparison sort over the whole grouping.
+     * The emitted prefix is the tied groups' first-seen order, so only the
+     * N tied groups with the smallest first_row can ever be taken: keep
+     * exactly those, through a bounded max-heap, and the sort below runs
+     * over at most 2N entries.  Without a threshold every group is kept
+     * (the take exceeds the group count) and the set is small anyway. */
+    int64_t take = c.have_thr ? ef->top_count_take : 0;
+    int64_t sel_cap = c.have_thr ? 2 * take : kept;
+    if (sel_cap <= 0) sel_cap = 1;
+    agg_radix_order_t* sel = ray_alloc_raw((size_t)sel_cap * sizeof(agg_radix_order_t));
+    int64_t* fr = ray_alloc_raw((size_t)sel_cap * sizeof(int64_t));
     if (!sel || !fr) {
         ray_free_raw(sel); ray_free_raw(fr);
         ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep); *rc = 1; return NULL;
     }
     int64_t k = 0;
-    for (uint32_t p = 0; p < n_parts; p++)
-        for (int64_t gg = 0; gg < parts[p].ng; gg++)
-            if (keep[base[p] + gg]) {
-                sel[k].idx = ((int64_t)p << 32) | (uint32_t)gg;
-                fr[k] = parts[p].first_row[gg];
-                k++;
+    if (!c.have_thr) {
+        for (uint32_t p = 0; p < n_parts; p++)
+            for (int64_t gg = 0; gg < parts[p].ng; gg++)
+                if (keep[base[p] + gg]) {
+                    sel[k].idx = ((int64_t)p << 32) | (uint32_t)gg;
+                    fr[k] = parts[p].first_row[gg];
+                    k++;
+                }
+    } else {
+        /* strict groups fill sel[0..k); the tied heap lives in sel[take..) */
+        agg_radix_order_t* hp = sel + take;
+        int64_t* hk = fr + take;
+        int64_t hn = 0;
+        bool overflow = false;
+        for (uint32_t p = 0; p < n_parts && !overflow; p++) {
+            const double* pv = vals + base[p];
+            const uint8_t* pk = keep + base[p];
+            const int64_t* pfr = parts[p].first_row;
+            for (int64_t gg = 0; gg < parts[p].ng; gg++) {
+                if (!pk[gg]) continue;
+                int64_t payload = ((int64_t)p << 32) | (uint32_t)gg;
+                if (pv[gg] != c.thr) {
+                    if (k >= take) { overflow = true; break; }
+                    sel[k].idx = payload; fr[k] = pfr[gg]; k++;
+                    continue;
+                }
+                int64_t first = pfr[gg];
+                if (hn < take) {
+                    int64_t i = hn++;
+                    hk[i] = first; hp[i].idx = payload;
+                    while (i > 0) {                       /* sift up */
+                        int64_t par = (i - 1) / 2;
+                        if (hk[par] >= hk[i]) break;
+                        int64_t tk = hk[par]; hk[par] = hk[i]; hk[i] = tk;
+                        int64_t tp = hp[par].idx; hp[par].idx = hp[i].idx; hp[i].idx = tp;
+                        i = par;
+                    }
+                } else if (first < hk[0]) {
+                    hk[0] = first; hp[0].idx = payload;
+                    int64_t i = 0;
+                    for (;;) {                            /* sift down */
+                        int64_t l = 2 * i + 1, r = l + 1, m = i;
+                        if (l < take && hk[l] > hk[m]) m = l;
+                        if (r < take && hk[r] > hk[m]) m = r;
+                        if (m == i) break;
+                        int64_t tk = hk[m]; hk[m] = hk[i]; hk[i] = tk;
+                        int64_t tp = hp[m].idx; hp[m].idx = hp[i].idx; hp[i].idx = tp;
+                        i = m;
+                    }
+                }
             }
+        }
+        if (overflow) {
+            /* more than N groups beyond the threshold: not a threshold this
+             * selection understands — let the caller take the full path */
+            ray_free_raw(sel); ray_free_raw(fr);
+            ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep); *rc = 2; return NULL;
+        }
+        /* close the gap between the strict prefix and the tied heap */
+        if (k < take) {
+            memmove(sel + k, hp, (size_t)hn * sizeof(agg_radix_order_t));
+            memmove(fr + k, hk, (size_t)hn * sizeof(int64_t));
+        }
+        k += hn;
+    }
     agg_sort_pairs_by_key(sel, fr, k);
     ray_free_raw(fr); ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep);
     *n_emit = k;
@@ -5214,13 +5285,15 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], x_col->type);
             col = agg_run_one_bin(vt, x_col, y_col, groups.gids, nrows, groups.ngroups, kparam);
         } else {
-            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT) ? ray_table_get_col(tbl, ie->sym) : NULL;
+            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
             int8_t in_type = val_col ? val_col->type : RAY_I64;
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], in_type);
             col = agg_run_one(vt, val_col, groups.gids, nrows, groups.ngroups, kparam);
         }
         if (!col || RAY_IS_ERR(col)) { agg_groups_free(&groups); ray_release(result); return col ? col : ray_error("oom", NULL); }
-        int64_t agg_name = agg_result_col_name(ie->sym, ext->agg_ops[a]);
+        /* A COUNT reads no input column, so its input node need not be a
+         * scan (`(count (* price 2))`) and has no ext to name it by. */
+        int64_t agg_name = agg_result_col_name(ie ? ie->sym : 0, ext->agg_ops[a]);
         result = ray_table_add_col(result, agg_name, col);
         ray_release(col);
     }

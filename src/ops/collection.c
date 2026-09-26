@@ -1374,8 +1374,21 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
              * the WHERE kernel uses null-matches-nothing semantics — the
              * two must not be conflated.  NULL result = unsupported shape
              * (STR etc.): fall through to the hashset probe below. */
-            if (!ray_vec_may_have_nulls(val) &&
-                !ray_vec_may_have_nulls(vec)) {
+            /* Admission check, so it uses the EXACT ray_vec_has_nulls rather
+             * than the conservative row-kernel gate.  ray_vec_may_have_nulls
+             * returns true unconditionally for SYM and STR — their null is a
+             * payload value, not an attribute bit — so gating this on it made
+             * the branch unreachable for every text column, including the SYM
+             * verdict-LUT the kernel carries specifically for them.  Every
+             * `in` over a symbol column fell through to the generic per-row
+             * hashset probe: ~4.8 ms against ~40 us for the equivalent `==`
+             * on a 351k-row column (#593).  vec.h says as much where it
+             * defines the two — "paths requiring null-free data use has_nulls
+             * below".  The exact check costs one pass and is not on a per-row
+             * path; a null-bearing operand still falls through, because the
+             * kernel's null-matches-nothing semantics differ from this path's
+             * null-equals-null. */
+            if (!ray_vec_has_nulls(val) && !ray_vec_has_nulls(vec)) {
                 ray_t* fast = ray_in_vec_exec(val, vec, false);
                 if (fast) return fast;
             }
@@ -4364,6 +4377,54 @@ ray_t* ray_map_right_fn(ray_t** args, int64_t n) {
 ray_t* ray_fold_left_fn(ray_t** args, int64_t n) {
     /* Same as (fold fn init coll) — fold already goes left-to-right */
     return ray_fold_fn(args, n);
+}
+
+/* (fold-while pred f init coll) — a fold that stops when the running
+ * result says stop.
+ *
+ * Before each step the accumulator is offered to `pred`; a falsy answer
+ * ends the fold and yields the accumulator as it stands.  The test comes
+ * BEFORE the first element, so a predicate that is false at the start
+ * returns `init` untouched and touches nothing.
+ *
+ * Deliberately unlike ray_fold_fn in one respect: that routes its
+ * collection through unbox_vec_arg -> to_boxed_list, boxing every element
+ * up front.  For a primitive whose whole purpose is to stop early, paying
+ * for the tail it never reaches is exactly the cost being removed here
+ * (issue 588), so elements are pulled one at a time via collection_elem —
+ * the same way map_iterate walks its input.  Stopping at element three of
+ * a million costs three boxed atoms, not a million. */
+ray_t* ray_fold_while_fn(ray_t** args, int64_t n) {
+    if (n != 4) return ray_error("domain", "fold-while: requires exactly 4 args (pred, fn, init, coll), got %lld", (long long)n);
+    for (int64_t i = 0; i < n; i++)
+        if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
+
+    ray_t* pred = args[0];
+    ray_t* fn   = args[1];
+    ray_t* coll = args[3];
+    if (!is_collection(coll))
+        return ray_error("type", "fold-while: coll arg must be a collection, got %s", ray_type_name(coll->type));
+
+    ray_retain(args[2]);
+    ray_t* acc = args[2];
+    int64_t len = ray_len(coll);
+    for (int64_t i = 0; i < len; i++) {
+        ray_t* keep = call_fn1(pred, acc);
+        if (ray_is_lazy(keep)) keep = ray_lazy_materialize(keep);
+        if (RAY_IS_ERR(keep)) { ray_release(acc); return keep; }
+        int go = is_truthy(keep);
+        ray_release(keep);
+        if (!go) return acc;
+
+        int alloc = 0;
+        ray_t* elem = collection_elem(coll, i, &alloc);
+        ray_t* next = call_fn2(fn, acc, elem);
+        if (alloc) ray_release(elem);
+        ray_release(acc);
+        if (RAY_IS_ERR(next)) return next;
+        acc = next;
+    }
+    return acc;
 }
 
 /* (fold-right fn init coll) — right fold */

@@ -19,10 +19,14 @@
 #include "core/crash.h"
 
 #include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <execinfo.h>
 #endif
 
@@ -42,7 +46,7 @@ static void cw(const char* s) {
 /* Write an unsigned value as 0x-prefixed hex.  No libc formatting.
  * Routes through cw() so the write return value is handled (gcc's
  * warn_unused_result on write() is not silenced by a (void) cast). */
-static void cw_hex(unsigned long v) {
+static void cw_hex(uint64_t v) {
     char buf[2 + 16 + 1];
     static const char hexd[] = "0123456789abcdef";
     buf[0] = '0'; buf[1] = 'x';
@@ -52,7 +56,8 @@ static void cw_hex(unsigned long v) {
     cw(buf);
 }
 
-/* Write a small non-negative integer as decimal. */
+#if !defined(_WIN32)
+/* Write a small non-negative integer as decimal (backtrace frame count). */
 static void cw_int(int v) {
     if (v < 0) { cw("-"); v = -v; }
     char buf[16];
@@ -62,6 +67,74 @@ static void cw_int(int v) {
     while (v > 0 && i > 0) { buf[--i] = (char)('0' + v % 10); v /= 10; }
     cw(&buf[i]);
 }
+#endif
+
+/* Banner precomputed at install time so the handler doesn't format it. */
+static char g_banner[128];
+
+#ifndef RAYFORCE_VERSION
+#define RAYFORCE_VERSION ""
+#endif
+#ifndef RAYFORCE_GIT_COMMIT
+#define RAYFORCE_GIT_COMMIT ""
+#endif
+
+static void crash_banner_init(void) {
+    const char* ver = RAYFORCE_VERSION;
+    const char* rev = RAYFORCE_GIT_COMMIT;
+    int n = snprintf(g_banner, sizeof(g_banner), "rayforce%s%s%s%s%s\n",
+                     ver[0] ? " " : "", ver,
+                     rev[0] ? " (" : "", rev, rev[0] ? ")" : "");
+    if (n < 0) g_banner[0] = '\0';
+}
+
+#if defined(_WIN32)
+
+/* ── Windows: structured exceptions ───────────────────────────────── */
+
+static const char* exc_name(DWORD code) {
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:      return "EXCEPTION_ACCESS_VIOLATION";
+        case EXCEPTION_STACK_OVERFLOW:        return "EXCEPTION_STACK_OVERFLOW";
+        case EXCEPTION_ILLEGAL_INSTRUCTION:   return "EXCEPTION_ILLEGAL_INSTRUCTION";
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:    return "EXCEPTION_INT_DIVIDE_BY_ZERO";
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "EXCEPTION_ARRAY_BOUNDS_EXCEEDED";
+        case EXCEPTION_IN_PAGE_ERROR:         return "EXCEPTION_IN_PAGE_ERROR";
+        default:                              return "exception";
+    }
+}
+
+/* Top-level filter: runs only for exceptions nobody else handled.  Report
+ * and let the default handling (WER / exit with the exception code) run,
+ * which keeps the process exit status meaningful to the orchestrator. */
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep) {
+    const EXCEPTION_RECORD* er = ep ? ep->ExceptionRecord : NULL;
+    cw("\n=== rayforce fatal ");
+    cw(er ? exc_name(er->ExceptionCode) : "exception");
+    if (er) {
+        cw(" code "); cw_hex((uint64_t)er->ExceptionCode);
+        cw(" at "); cw_hex((uint64_t)(uintptr_t)er->ExceptionAddress);
+        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+            er->NumberParameters >= 2) {
+            cw(" fault addr ");
+            cw_hex((uint64_t)er->ExceptionInformation[1]);
+        }
+    }
+    cw(" ===\n");
+    cw(g_banner);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void ray_crash_install(void) {
+    crash_banner_init();
+    /* Reserve stack for the filter itself, so a stack-overflow exception
+     * can still be reported (the Windows analogue of sigaltstack). */
+    ULONG guarantee = 64 * 1024;
+    (void)SetThreadStackGuarantee(&guarantee);
+    SetUnhandledExceptionFilter(crash_filter);
+}
+
+#else /* POSIX */
 
 static const char* sig_name(int sig) {
     switch (sig) {
@@ -74,9 +147,6 @@ static const char* sig_name(int sig) {
     }
 }
 
-/* Banner precomputed at install time so the handler doesn't format it. */
-static char g_banner[128];
-
 /* ── the handler ──────────────────────────────────────────────────── */
 
 static void crash_handler(int sig, siginfo_t* info, void* ucontext) {
@@ -84,11 +154,10 @@ static void crash_handler(int sig, siginfo_t* info, void* ucontext) {
 
     cw("\n=== rayforce fatal ");
     cw(sig_name(sig));
-    if (info) { cw(" at fault addr "); cw_hex((unsigned long)info->si_addr); }
+    if (info) { cw(" at fault addr "); cw_hex((uint64_t)(uintptr_t)info->si_addr); }
     cw(" ===\n");
     cw(g_banner);
 
-#if !defined(_WIN32)
     void* frames[64];
     int n = backtrace(frames, 64);
     /* backtrace_symbols_fd writes directly to the fd without allocating. */
@@ -96,7 +165,6 @@ static void crash_handler(int sig, siginfo_t* info, void* ucontext) {
     cw("=== end backtrace (");
     cw_int(n);
     cw(" frames) ===\n");
-#endif
 
     /* Restore the default disposition and re-raise, so the process dies
      * from the original signal: this preserves the core dump and reports
@@ -116,24 +184,8 @@ static void crash_handler(int sig, siginfo_t* info, void* ucontext) {
 static char g_altstack[RAY_CRASH_ALTSTACK_SZ];
 
 void ray_crash_install(void) {
-#if !defined(_WIN32)
     /* Precompute the version banner once (async-signal-safe reuse). */
-    {
-        const char* v =
-#ifdef RAYFORCE_VERSION
-            "rayforce " RAYFORCE_VERSION
-#else
-            "rayforce"
-#endif
-#ifdef RAYFORCE_GIT_COMMIT
-            " (" RAYFORCE_GIT_COMMIT ")"
-#endif
-            "\n";
-        size_t vl = strlen(v);
-        if (vl >= sizeof(g_banner)) vl = sizeof(g_banner) - 1;
-        memcpy(g_banner, v, vl);
-        g_banner[vl] = '\0';
-    }
+    crash_banner_init();
 
     /* Warm up the unwinder: the first backtrace() may dlopen libgcc and
      * allocate, which must not happen inside the handler. */
@@ -157,5 +209,6 @@ void ray_crash_install(void) {
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
     for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
         (void)sigaction(sigs[i], &sa, NULL);
-#endif
 }
+
+#endif /* _WIN32 */

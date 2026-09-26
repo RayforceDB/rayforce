@@ -46,7 +46,13 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
-#include <sys/resource.h>
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <psapi.h>
+#else
+#  include <sys/resource.h>
+#endif
 
 /* ---------- timing ---------- */
 static double now_ms(void) {
@@ -69,11 +75,17 @@ static double vmin(const double* arr, int n) {
     return m;
 }
 static long max_rss_kb(void) {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return 0;
+    return (long)(pmc.PeakWorkingSetSize / 1024);
+#else
     struct rusage ru; getrusage(RUSAGE_SELF, &ru);
 #if defined(__APPLE__)
     return ru.ru_maxrss / 1024;
 #else
     return ru.ru_maxrss;
+#endif
 #endif
 }
 

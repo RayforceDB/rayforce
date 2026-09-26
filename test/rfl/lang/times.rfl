@@ -1,0 +1,124 @@
+;; (times n body...) — bounded loop: run the body exactly n times.
+;;
+;; The count is evaluated ONCE, up front, so a body that mutates whatever
+;; produced it cannot change how many passes remain.  Returns null, pushes
+;; no scope, and is asserted on both evaluators — the tree walker
+;; (ray_times_fn) and the bytecode compiler, whose sf_times case desugars
+;; to a counted loop over a hidden local slot.
+
+;; ── basic counting ───────────────────────────────────────────────────
+(set n 0)
+(times 5 (set n (+ n 1)))
+n -- 5
+
+;; a statement form: always null, whatever the body evaluated to
+(nil? (times 3 'discarded)) -- true
+
+;; several body expressions, run in order, every pass
+(set a 0)
+(set b 0)
+(times 4 (set a (+ a 1)) (set b (+ b a)))
+a -- 4
+b -- 10
+
+;; ── zero and negative counts ─────────────────────────────────────────
+(set z 99)
+(nil? (times 0 (set z 1))) -- true
+z -- 99
+
+;; a negative count runs zero times rather than trapping
+(set z 99)
+(nil? (times -3 (set z 1))) -- true
+z -- 99
+
+;; body-less form is legal and does nothing observable
+(nil? (times 5)) -- true
+
+;; ── the count is evaluated once, up front ────────────────────────────
+;; If the count were re-read each pass this would not terminate at 3.
+(set k 3)
+(set passes 0)
+(times k (set k (+ k 10)) (set passes (+ passes 1)))
+passes -- 3
+k -- 33
+
+;; the count is an arbitrary expression, evaluated once
+(set calls 0)
+(set howmany (fn [] (set calls (+ calls 1)) 4))
+(set p 0)
+(times (howmany) (set p (+ p 1)))
+p -- 4
+calls -- 1
+
+;; ── arity and type ───────────────────────────────────────────────────
+(times) !- domain
+(times "3" (set n 1)) !- type
+(times 1.5 (set n 1)) !- type
+
+;; ── compiled path ────────────────────────────────────────────────────
+;; count from a lambda param, accumulator in a let-local
+((fn [m] (let acc 0) (times m (let acc (+ acc 2))) acc) 5) -- 10
+
+;; the count is validated and clamped on the COMPILED path too, where it
+;; runs through ray_times_norm_fn rather than the tree walker's check
+((fn [] (times "3" 1))) !- type
+((fn [] (times 1.5 1))) !- type
+((fn [n] (let z 99) (times n (let z 1)) z) -3) -- 99
+((fn [n] (let z 99) (times n (let z 1)) z) 0) -- 99
+
+;; the hidden loop counter must not collide with a user local of any name
+((fn [] (let n 0) (let c 100) (times 3 (let n (+ n c))) n)) -- 300
+
+;; tree-walk path, same arithmetic
+(set acc 0)
+(times 5 (set acc (+ acc 2)))
+acc -- 10
+
+;; ── `return` from inside a body exits the enclosing lambda ───────────
+;; Body compiles inline, so return unwinds the lambda rather than
+;; degrading to the tree walker's identity return.
+(set hits 0)
+((fn [] (let i 0) (times 10 (set hits (+ hits 1)) (if (> i 2) (return 42)) (let i (+ i 1))) 7)) -- 42
+hits -- 4
+
+;; without the early return the same loop runs all ten passes
+(set hits 0)
+((fn [] (times 10 (set hits (+ hits 1))) 7)) -- 7
+hits -- 10
+
+;; ── errors ───────────────────────────────────────────────────────────
+;; an error in the body propagates and stops the loop on the first pass
+(set c 0)
+(== (try (times 10 (set c (+ c 1)) (raise 'boom)) (fn [e] e)) 'boom) -- true
+c -- 1
+
+;; an error in the count propagates before the body ever runs
+(set c 0)
+(== (try (times (raise 'bad-count) (set c (+ c 1))) (fn [e] e)) 'bad-count) -- true
+c -- 0
+
+;; ── nesting ──────────────────────────────────────────────────────────
+;; nested counters must not clobber one another
+(set total 0)
+(times 3 (times 2 (set total (+ total 1))))
+total -- 6
+
+;; nested, compiled, with let-locals on both levels
+((fn [] (let t 0) (times 3 (times 2 (let t (+ t 1)))) t)) -- 6
+
+;; nested three deep
+(set total 0)
+(times 2 (times 3 (times 4 (set total (+ total 1)))))
+total -- 24
+
+;; ── composes with while ──────────────────────────────────────────────
+(set out 0)
+(set i 0)
+(while (< i 3) (times 2 (set out (+ out 1))) (set i (+ i 1)))
+out -- 6
+
+;; ── per-pass isolation via do, as with while ─────────────────────────
+(set out (list))
+(set i 0)
+(times 3 (do (let sq (* i i)) (set out (concat out sq))) (set i (+ i 1)))
+out -- (list 0 1 4)

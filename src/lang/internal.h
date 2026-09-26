@@ -526,6 +526,7 @@ ray_t* ray_binr_fn(ray_t* sorted, ray_t* val);
 ray_t* ray_map_left_fn(ray_t** args, int64_t n);
 ray_t* ray_map_right_fn(ray_t** args, int64_t n);
 ray_t* ray_fold_left_fn(ray_t** args, int64_t n);
+ray_t* ray_fold_while_fn(ray_t** args, int64_t n);
 ray_t* ray_fold_right_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_left_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_right_fn(ray_t** args, int64_t n);

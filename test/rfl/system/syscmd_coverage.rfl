@@ -55,14 +55,14 @@
 (.sys.cmd "timeit 100")     -- 1
 (.sys.cmd "timeit 0")       -- 0
 
-;; Empty-after-sign / non-digit start → type error (line 80).
+;; Empty-after-sign / non-digit start / trailing garbage → type error.
 (.sys.cmd "timeit +")    !- type
 (.sys.cmd "timeit -")    !- type
 (.sys.cmd "timeit abc")  !- type
-(.sys.cmd "timeit 1.5")  -- 1
-;; ^ "1.5" parses up to the dot → 1, profile turns on; the trailing
-;; ".5" is not an error (the parser stops at first non-digit and
-;; returns what it has).  Reset state for any later toggle tests.
+(.sys.cmd "timeit 1.5")  !- type
+(.sys.timeit "1abc")      !- type
+(.sys.timeit "9223372036854775808") !- type
+;; Reset state for any later toggle tests.
 (.sys.timeit 0)          -- 0
 
 ;; ────────────── arg_as_i64: type-fallthrough (lines 85-86) ──────────────
@@ -113,17 +113,19 @@
 (.sys.timeit)     -- 1
 (.sys.timeit)     -- 0
 
-;; ────────────── ray_sys_timeit_fn: variadic with extra args ignored ──────
-;; The variadic adapter (line 353) only forwards the first arg.
+;; ────────────── ray_sys_timeit_fn: optional arg + arity guard ──────────
+;; The variadic adapter accepts zero or one arg, and rejects extras before
+;; changing profiler state.
 (.sys.timeit 1) -- 1
 (.sys.timeit 0) -- 0
+(.sys.timeit 1 0) !- arity
 
-;; ────────────── h_env: count > 0 + variadic with arg branch ──────────────
-;; ray_sys_env_fn takes optional arg via variadic adapter (line 356);
-;; arg is ignored by h_env (line 164).  Both call shapes work.
+;; ────────────── h_env: count > 0 + optional compatibility arg ──────────
+;; ray_sys_env_fn accepts zero or one arg and rejects extras before h_env runs.
 (> (.sys.env) 0)    -- true
 (> (.sys.env 1) 0)  -- true
 (> (.sys.env "x") 0) -- true
+(.sys.env 1 2) !- arity
 
 ;; ────────────── h_listen: domain / type / io branches ──────────────
 ;; The test runtime (test/main.c rfl_setup) registers a poll instance —

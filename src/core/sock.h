@@ -24,7 +24,7 @@
 #ifndef RAY_SOCK_H
 #define RAY_SOCK_H
 
-#include <rayforce.h>
+#include "core/platform.h"
 
 /* ===== Socket Abstraction ===== */
 

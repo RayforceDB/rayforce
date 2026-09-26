@@ -109,3 +109,28 @@
 (set nested2 (select {from: (select {from: (select {from: tz by: k c: (count v)}) by: c n: (count c)}) where: (> n 100)}))
 (count nested2) -- 1
 (at (at nested2 'n) 0) -- 1000
+
+;; a threshold that every group ties: a near-unique two-key grouping where
+;; almost every count is 1, so the N-th largest count is 1 and the kept set
+;; would be the whole grouping.  The result is still the first N tied groups
+;; in first-seen order, and the selection must not scale with the group count.
+(set n9 300000)
+(set i9 (til n9))
+(set a9 (as 'I64 (+ (* i9 2654435761) (% (* i9 7) 3))))
+(set b9 (as 'I64 (% (* i9 40503) 150000)))
+(set t9 (table [a b v] (list a9 b9 (% i9 5))))
+(set r9 (select {from: t9 by: [a b] c: (count v) s: (sum v) desc: c take: 10}))
+(set f9 (select {from: t9 by: [a b] c: (count v) s: (sum v)}))
+(count r9) -- 10
+(all (>= (at r9 'c) (at (at (xdesc f9 'c) 'c) 9))) -- true
+(== (sum (at r9 'c)) (sum (take (at (xdesc f9 'c) 'c) 10))) -- true
+(all (== (at r9 'a) (take (at (select {from: f9 where: (== c (max c))}) 'a) 10))) -- true
+(all (== (at r9 's) (take (at (select {from: f9 where: (== c (max c))}) 's) 10))) -- true
+;; the same shape under a row selection
+(set r9w (select {from: t9 by: [a b] c: (count v) desc: c take: 10 where: (!= v 0)}))
+(set f9w (select {from: t9 by: [a b] c: (count v) where: (!= v 0)}))
+(count r9w) -- 10
+(all (== (at r9w 'a) (take (at (select {from: f9w where: (== c (max c))}) 'a) 10))) -- true
+;; ascending: the smallest counts, again first-seen among the ties
+(set r9a (select {from: t9 by: [a b] c: (count v) asc: c take: 10}))
+(all (== (at r9a 'a) (take (at (select {from: f9 where: (== c (min c))}) 'a) 10))) -- true

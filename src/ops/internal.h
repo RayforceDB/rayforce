@@ -804,6 +804,8 @@ extern bool     ray_join_force_dup_fallback;
 extern bool     ray_join_no_dup_fallback;
 extern uint64_t ray_join_dup_fallbacks;
 extern uint64_t ray_join_null_fallbacks;
+extern bool     ray_join_force_null_checks;
+extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
@@ -1613,6 +1615,8 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op);
 
 /* ── string_exec.c ── */
 ray_t* exec_like(ray_graph_t* g, ray_op_t* op);
+/* Shared LIKE kernel over a STR/SYM column (see string.c); selection may be NULL. */
+ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection);
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op);

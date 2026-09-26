@@ -67,6 +67,56 @@ static int64_t parse_size_arg(const char* s) {
     return (int64_t)(v * (double)mult);
 }
 
+/* --------------------------------------------------------------------------
+ * Flag-value guard (#600)
+ *
+ * Every value-taking flag used to be gated on `i + 1 < argc` and then
+ * consume argv[++i] blindly, so one flag silently ate the next: `-Q -p
+ * 5099` started a server with NO listener, no error and no warning —
+ * the worst shape for a service, because the unit looks healthy while
+ * every client gets connection refused.  A trailing flag fell through to
+ * the positional-file arm and reported `cannot open '-Q'`.
+ *
+ * A value is refused when it is missing, or when it is EXACTLY one of
+ * this program's flag tokens.  A value that merely STARTS with '-' (a
+ * password, a negative number) stays legal — refusing those would break
+ * working command lines for no gain.
+ *
+ * Keep this list in step with the flags handled in main's parse loop and
+ * with --help.  (ray_build_sys_args in src/ops/system.c walks argv a
+ * second time for .sys.args; it only ever sees a command line that
+ * already passed this guard, so it cannot mis-pair.)
+ * -------------------------------------------------------------------------- */
+static const char* const k_known_flags[] = {
+    "-i", "--interactive", "-p", "--port", "-c", "--cores",
+    "-t", "--timeit", "-Q", "--querylog", "-f", "--file",
+    "-u", "-U", "-l", "-L", "-m", "--mem", "-h", "--help",
+    "--",   /* the app-args terminator is not a value either */
+    NULL
+};
+
+static bool arg_is_known_flag(const char* tok) {
+    for (int k = 0; k_known_flags[k]; k++)
+        if (strcmp(tok, k_known_flags[k]) == 0) return true;
+    return false;
+}
+
+/* The value for a value-taking flag, or NULL with the diagnostic already
+ * printed.  Advances *i past the value it returns. */
+static const char* flag_value(int argc, char** argv, int* i, const char* name) {
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "error: %s expects a value\n", name);
+        return NULL;
+    }
+    const char* v = argv[*i + 1];
+    if (arg_is_known_flag(v)) {
+        fprintf(stderr, "error: %s expects a value, got flag '%s'\n", name, v);
+        return NULL;
+    }
+    ++*i;
+    return v;
+}
+
 int main(int argc, char** argv) {
     /* Install the fatal-signal handler first: a crash during startup
      * should still produce a symbolized backtrace.  Handles the fault
@@ -104,17 +154,19 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0)
             interactive = 1;
-        else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc) {
+        else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
             /* PORT binds all interfaces; HOST:PORT confines the listener
              * to one IPv4 address (#427).  Strict digits-only port — a
              * silently truncated "65536x" listener is worse than exiting. */
-            const char* parg  = argv[++i];
+            const char* parg = flag_value(argc, argv, &i, argv[i]);
+            if (!parg) { ray_runtime_destroy(rt); return 2; }
             const char* colon = strchr(parg, ':');
             const char* pstr  = parg;
             if (colon) {
                 size_t hlen = (size_t)(colon - parg);
                 if (hlen == 0 || hlen >= sizeof(bind_host)) {
                     fprintf(stderr, "bad -p bind address: %s\n", parg);
+                    ray_runtime_destroy(rt);
                     return 2;
                 }
                 memcpy(bind_host, parg, hlen);
@@ -126,44 +178,45 @@ int main(int argc, char** argv) {
             long pv = strtol(pstr, &endp, 10);
             if (endp == pstr || *endp != '\0' || errno == ERANGE || pv <= 0 || pv > 65535) {
                 fprintf(stderr, "bad -p port (must be 1..65535): %s\n", parg);
+                ray_runtime_destroy(rt);
                 return 2;
             }
             port = (uint16_t)pv;
         }
-        else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) && i + 1 < argc) {
-            int v = atoi(argv[++i]);
-            if (v < 0) v = 0;
-            n_cores = v;
+        else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) {
+            const char* v = flag_value(argc, argv, &i, argv[i]);
+            if (!v) { ray_runtime_destroy(rt); return 2; }
+            n_cores = atoi(v);
+            if (n_cores < 0) n_cores = 0;
         }
-        else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) && i + 1 < argc) {
-            int v = atoi(argv[++i]);
-            timeit_init = (v != 0);
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) {
+            const char* v = flag_value(argc, argv, &i, argv[i]);
+            if (!v) { ray_runtime_destroy(rt); return 2; }
+            timeit_init = (atoi(v) != 0);
         }
-        else if ((strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) && i + 1 < argc) {
-            int v = atoi(argv[++i]);
-            qlog_init = (v != 0);
+        else if (strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) {
+            const char* v = flag_value(argc, argv, &i, argv[i]);
+            if (!v) { ray_runtime_destroy(rt); return 2; }
+            qlog_init = (atoi(v) != 0);
         }
-        else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
-            file = argv[++i];
+        else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
+            file = flag_value(argc, argv, &i, argv[i]);
+            if (!file) { ray_runtime_destroy(rt); return 2; }
         }
-        else if (strcmp(argv[i], "-u") == 0 && i + 1 < argc) {
-            auth_pw = argv[++i];
-            auth_restricted = false;
+        else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "-U") == 0) {
+            auth_restricted = (argv[i][1] == 'U');
+            auth_pw = flag_value(argc, argv, &i, argv[i]);
+            if (!auth_pw) { ray_runtime_destroy(rt); return 2; }
         }
-        else if (strcmp(argv[i], "-U") == 0 && i + 1 < argc) {
-            auth_pw = argv[++i];
-            auth_restricted = true;
+        else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0) {
+            log_mode = (argv[i][1] == 'L') ? RAY_JOURNAL_SYNC : RAY_JOURNAL_ASYNC;
+            log_base = flag_value(argc, argv, &i, argv[i]);
+            if (!log_base) { ray_runtime_destroy(rt); return 2; }
         }
-        else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
-            log_base = argv[++i];
-            log_mode = RAY_JOURNAL_ASYNC;
-        }
-        else if (strcmp(argv[i], "-L") == 0 && i + 1 < argc) {
-            log_base = argv[++i];
-            log_mode = RAY_JOURNAL_SYNC;
-        }
-        else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) && i + 1 < argc) {
-            int64_t wm = parse_size_arg(argv[++i]);
+        else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) {
+            const char* mv = flag_value(argc, argv, &i, argv[i]);
+            if (!mv) { ray_runtime_destroy(rt); return 2; }
+            int64_t wm = parse_size_arg(mv);
             if (wm <= 0) {
                 fprintf(stderr, "error: -m/--mem expects a size like 4G, 512M, or a byte count\n");
                 ray_runtime_destroy(rt);
@@ -173,13 +226,15 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stdout,
-                "usage: %s [-f file] [-p port] [-c cores] [-t 0|1] [-i]"
+                "usage: %s [-f file] [-p port] [-c cores] [-t 0|1] [-Q 0|1] [-i]"
                 " [-u PW | -U PW] [-l BASE | -L BASE] [-m SIZE] [file.rfl] [-- app args]\n"
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
                 "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
                 "      --port HOST:PORT  bind the listener to HOST only (e.g. 127.0.0.1:7701)\n"
                 "  -c, --cores N       total execution cores, main included (0 = auto)\n"
                 "  -t, --timeit N      enable profiler at startup (N != 0)\n"
+                "  -Q, --querylog N    enable query logging at startup (N != 0);\n"
+                "                      read the ring with (.sys.querylog)\n"
                 "  -i, --interactive   start the REPL even after running a file\n"
                 "  -u PW               set plain auth password\n"
                 "  -U PW               set restricted auth password\n"
@@ -209,12 +264,28 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--") == 0)
             break;   /* stop flag parsing; remaining tokens are app args */
+        else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            /* Not a known flag.  This used to fall into the positional arm
+             * below, so a typo'd option was silently swallowed as the script
+             * name and then overwritten by the real one — the flag simply
+             * did nothing (#600).  A lone "-" stays a positional. */
+            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            ray_runtime_destroy(rt);
+            return 2;
+        }
         else
             file = argv[i];
     }
 
     /* Expose the full command line to Rayfall via (.sys.args). */
-    ray_runtime_set_sys_args(ray_build_sys_args(argc, argv));
+    ray_t* sys_args = ray_build_sys_args(argc, argv);
+    if (!sys_args || RAY_IS_ERR(sys_args)) {
+        fprintf(stderr, "error: invalid command-line arguments\n");
+        if (sys_args && RAY_IS_ERR(sys_args)) ray_error_free(sys_args);
+        ray_runtime_destroy(rt);
+        return 2;
+    }
+    ray_runtime_set_sys_args(sys_args);
 
     /* Initialise the worker pool before anything else that might use it
      * (file load, REPL eval, builtins).  If -c wasn't given, leave the

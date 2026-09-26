@@ -51,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #if defined(RAY_OS_WINDOWS)
 #include <io.h>
@@ -59,7 +60,6 @@
 #define STDIN_FD 0
 #else
 #include <unistd.h>
-#include <errno.h>
 #include <sys/ioctl.h>
 #define STDIN_FD STDIN_FILENO
 #endif
@@ -353,7 +353,18 @@ static void get_cpu_name(char* buf, size_t sz) {
     if (sysctlbyname("machdep.cpu.brand_string", buf, &len, NULL, 0) != 0)
         snprintf(buf, sz, "unknown");
 #elif defined(RAY_OS_WINDOWS)
-    snprintf(buf, sz, "unknown");
+    /* The brand string the firmware reported, same text as /proc/cpuinfo's
+     * "model name"; it is padded with trailing spaces, so trim them. */
+    DWORD n = (DWORD)sz;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE,
+                     "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     "ProcessorNameString", RRF_RT_REG_SZ, NULL,
+                     buf, &n) == ERROR_SUCCESS) {
+        size_t len = strlen(buf);
+        while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
+    } else {
+        snprintf(buf, sz, "unknown");
+    }
 #else
     snprintf(buf, sz, "unknown");
 #endif
@@ -385,7 +396,11 @@ static void print_banner(void) {
     char cpu[256];
     get_cpu_name(cpu, sizeof(cpu));
     int64_t mem_mb = get_total_mem_mb();
+#if defined(RAY_OS_WINDOWS)
+    int ncores = (int)ray_thread_count();
+#else
     int ncores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 
     /* "Using" count reflects the actual worker-pool size, not ncores.
      * ray_pool_get() is a lazy initializer — callers might not have

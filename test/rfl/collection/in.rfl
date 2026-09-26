@@ -84,3 +84,42 @@
 (in [1h 2h 3h] [3h 2h 1h]) -- [true true true]
 ;; Test with empty arrays
 (in (list) [1h 2h]) -- (list)
+
+;; ========== TEXT (SYM/STR) NULL SEMANTICS (#593) ==========
+;; `in` admits the typed verdict-LUT kernel only when BOTH sides are exactly
+;; null-free, because that kernel uses null-matches-nothing semantics while
+;; this path is null-equals-null.  The gate used to ask
+;; ray_vec_may_have_nulls, which is unconditionally true for SYM and STR
+;; (their null is a payload value, not an attribute bit) — so the kernel was
+;; unreachable for text columns and every symbol `in` fell through to the
+;; generic per-row hashset probe.  These pin the semantics on both sides of
+;; that gate so the admission check cannot drift back.
+
+;; null in the COLUMN, null needle — null equals null
+(in (as 'SYM ["a" "" "b"]) (as 'SYM [""])) -- [false true false]
+(in ["a" "" "b"] [""]) -- [false true false]
+
+;; null in the column, non-null needle — the null matches nothing else
+(in (as 'SYM ["a" "" "b"]) (as 'SYM ["a"])) -- [true false false]
+
+;; null only in the NEEDLES: the column is null-free but the gate must still
+;; reject, since a null needle needs null-equals-null against nothing
+(in (as 'SYM ["a" "b"]) (as 'SYM ["" "a"])) -- [true false]
+
+;; nulls on both sides
+(in (as 'SYM ["a" ""]) (as 'SYM ["" "z"])) -- [false true]
+
+;; null-free text: this is the shape that now reaches the kernel
+(in (as 'SYM ["a" "b" "c"]) (as 'SYM ["b" "c"])) -- [false true true]
+(in ["a" "b" "c"] ["b" "c"]) -- [false true true]
+
+;; empty needle set over a null-free symbol column
+(in (as 'SYM ["a" "b"]) (as 'SYM [])) -- [false false]
+
+;; a single needle is the degenerate case the issue reported: same answer as
+;; the equality it should cost the same as
+(in (as 'SYM ["a" "b" "a"]) (as 'SYM ["a"])) -- [true false true]
+(== (as 'SYM ["a" "b" "a"]) 'a) -- [true false true]
+
+;; duplicate needles must not double-count or change the verdict
+(in (as 'SYM ["a" "b"]) (as 'SYM ["a" "a" "a"])) -- [true false]

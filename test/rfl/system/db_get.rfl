@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
 ;; Multi-table roots through the explicit .db trio — the surface left
 ;; after the .db.*.mount removal: every table is opened by name with
 ;; .db.splayed.get / .db.parted.get; nothing is discovered or bound

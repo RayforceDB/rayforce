@@ -213,7 +213,7 @@ static test_result_t test_csv_null_i64(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n10\n\n30\n");
     fclose(f);
 
@@ -245,7 +245,7 @@ static test_result_t test_csv_null_i64_unparseable(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n10\nN/A\n30\n");
     fclose(f);
 
@@ -274,7 +274,7 @@ static test_result_t test_csv_null_f64(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n1.5\n\n3.5\n");
     fclose(f);
 
@@ -305,7 +305,7 @@ static test_result_t test_csv_null_i16(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n10\n\n30\n");
     fclose(f);
 
@@ -336,7 +336,7 @@ static test_result_t test_csv_null_i32(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n10\n\n30\n");
     fclose(f);
 
@@ -367,7 +367,7 @@ static test_result_t test_csv_null_date(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "d\n2025-01-02\n\n2026-12-31\n");
     fclose(f);
 
@@ -396,7 +396,7 @@ static test_result_t test_csv_null_time(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "t\n12:34:56\n\n23:59:59\n");
     fclose(f);
 
@@ -425,7 +425,7 @@ static test_result_t test_csv_null_timestamp(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "ts\n2025-01-02T03:04:05\n\n2026-12-31T23:59:59\n");
     fclose(f);
 
@@ -455,7 +455,7 @@ static test_result_t test_csv_null_bool(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "flag\ntrue\n\nfalse\n");
     fclose(f);
 
@@ -484,7 +484,7 @@ static test_result_t test_csv_null_sym(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "name\nalice\n\nbob\n");
     fclose(f);
 
@@ -515,7 +515,7 @@ static test_result_t test_csv_no_nulls_no_null_bitmap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n10\n20\n30\n");
     fclose(f);
 
@@ -537,7 +537,7 @@ static test_result_t test_csv_null_mixed_columns(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "id,val,name\n1,1.5,alice\n,2.5,\n3,,bob\n");
     fclose(f);
 
@@ -579,7 +579,7 @@ static test_result_t test_csv_explicit_str_schema(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     /* Mix inline (<=12B), pooled (>12B), empty/null, and a short */
     fprintf(f, "id,note\n"
                "1,hi\n"
@@ -628,7 +628,7 @@ static test_result_t test_csv_escaped_str_roundtrip(void) {
     (void)ray_sym_init();
 
     /* Write a CSV with fields that require quoting/escaping */
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "s\n"
                "\"he,llo\"\n"
                "\"wo\"\"rld\"\n"
@@ -748,7 +748,7 @@ static test_result_t test_csv_infer_date(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "d\n2025-01-02\n2026-12-31\n2000-03-15\n");
     fclose(f);
 
@@ -769,7 +769,7 @@ static test_result_t test_csv_infer_time(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "t\n12:34:56\n00:00:00\n23:59:59.123\n");
     fclose(f);
 
@@ -792,7 +792,7 @@ static test_result_t test_csv_infer_timestamp_promotion(void) {
 
     /* Mix of full timestamps with both 'T' and ' ' separators, plus a
      * date-only sentinel that should be promoted to TIMESTAMP. */
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "ts\n2025-01-02T03:04:05\n2025-06-07 08:09:10.123456\n2024-12-31\n");
     fclose(f);
 
@@ -813,7 +813,7 @@ static test_result_t test_csv_infer_bool(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "b\ntrue\nfalse\nTRUE\nFALSE\n");
     fclose(f);
 
@@ -834,7 +834,7 @@ static test_result_t test_csv_infer_f64_specials(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "v\n1.0\n2e10\n-3.5E-2\nnan\nInf\n+inf\n-INF\n");
     fclose(f);
 
@@ -856,7 +856,7 @@ static test_result_t test_csv_infer_null_sentinels(void) {
     (void)ray_sym_init();
 
     /* Sentinel rows alternating with i64 values; column should infer I64. */
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n10\nN/A\nNA\nnull\nNULL\nNone\nnone\nn/a\nna\n.\n42\n");
     fclose(f);
 
@@ -882,7 +882,7 @@ static test_result_t test_csv_infer_promotions(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "n,b\n1,true\n2,0\n3.5,1\n");
     fclose(f);
 
@@ -905,7 +905,7 @@ static test_result_t test_csv_tab_delimiter(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "a\tb\tc\n1\t2\t3\n4\t5\t6\n");
     fclose(f);
 
@@ -926,7 +926,7 @@ static test_result_t test_csv_no_header(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "10,20\n30,40\n50,60\n");
     fclose(f);
 
@@ -988,7 +988,7 @@ static test_result_t test_csv_invalid_schema_type(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "x\n1\n2\n");
     fclose(f);
 
@@ -1002,7 +1002,7 @@ static test_result_t test_csv_invalid_schema_type(void) {
 
     /* Schema too short for ncols also errors out. */
     int8_t one_only[1] = { RAY_I64 };
-    FILE* g = fopen(TMP_CSV, "w");
+    FILE* g = fopen(TMP_CSV, "wb");
     fprintf(g, "a,b\n1,2\n");
     fclose(g);
     ray_t* loaded3 = ray_read_csv_opts(TMP_CSV, ',', true, one_only, 1);
@@ -1044,7 +1044,7 @@ static test_result_t test_csv_truncated_row(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "a,b,c\n1,2,3\n4\n7,8,9\n");
     fclose(f);
 
@@ -1277,7 +1277,7 @@ static test_result_t test_csv_parallel_parse(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "i,s\n");
     /* 9000 rows so n_rows > 8192. */
     for (int i = 0; i < 9000; i++)
@@ -1306,7 +1306,7 @@ static test_result_t test_csv_sym_narrowing(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "k\n");
     /* Only three distinct values across many rows. */
     for (int i = 0; i < 200; i++)
@@ -1342,7 +1342,7 @@ static test_result_t test_csv_explicit_u8_schema(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "v\n");
     /* 10 000 rows ⇒ parallel parse path; values 0..255 cycling so the
      * truncated bytes fully exercise the U8 range. */
@@ -1384,7 +1384,7 @@ static test_result_t test_csv_explicit_i16_schema_with_nulls(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "v\n");
     const int N = 1500;
     for (int i = 0; i < N; i++) {
@@ -1427,7 +1427,7 @@ static test_result_t test_csv_explicit_i32_schema(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "v\n");
     const int N = 500;
     for (int i = 0; i < N; i++) fprintf(f, "%d\n", -100000 + i * 137);
@@ -1460,7 +1460,7 @@ static test_result_t test_csv_explicit_u8_schema_serial(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "a,b\n");
     /* 200 rows; second column missing on every 50th row → triggers
      * past-row-boundary fill in the parser. */
@@ -1501,7 +1501,7 @@ static test_result_t test_csv_infer_high_cardinality_str(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     fprintf(f, "payload\n");
     for (int i = 0; i < 100; i++)
         fprintf(f, "unique_payload_%03d\n", i);
@@ -1570,7 +1570,7 @@ static test_result_t test_csv_interrupt_mid_parse(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     TEST_ASSERT_NOT_NULL(f);
     fputs("id,payload\n", f);
     for (int i = 0; i < 200000; i++) {
@@ -1610,7 +1610,7 @@ static test_result_t test_csv_progress_never_goes_backwards(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    FILE* f = fopen(TMP_CSV, "w");
+    FILE* f = fopen(TMP_CSV, "wb");
     TEST_ASSERT_NOT_NULL(f);
     fputs("payload,symbol\n", f);
     for (int i = 0; i < 100000; i++)
