@@ -8,7 +8,7 @@
 ;; Registered as variadic so the zero-argument call remains valid while
 ;; the implementation can reject unexpected arguments explicitly.
 (.sys.gc) -- 0
-(.sys.gc 0) !- domain
+(.sys.gc 0) !- arity
 (count (.sys.info)) -- 5
 (count (.sys.mem)) -- 16
 (count (.sys.build)) -- 2
