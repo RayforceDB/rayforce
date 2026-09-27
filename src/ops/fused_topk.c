@@ -47,6 +47,7 @@
 #include "ops/internal.h"
 #include "lang/internal.h"
 #include "core/pool.h"
+#include "ops/idxop.h"      /* chunk-zone extrema: skip chunks that cannot enter the top-K */
 
 #include <string.h>
 #include <stdatomic.h>
@@ -128,7 +129,59 @@ typedef struct {
     ray_t**        sym_strings;
     uint32_t       sym_count;
     _Atomic(uint32_t) oom;
+    /* Chunk pruning on the first sort key (integer / temporal column with a
+     * chunk-zone index): zmin/zmax per 1<<zlog2 rows, znull chunk null
+     * bits.  `bound` is the best worst-key any full worker heap holds —
+     * the final K-th key is at least as good — so a chunk whose extremum
+     * cannot beat it is skipped without evaluating the predicate. */
+    const int64_t* zmin;
+    const int64_t* zmax;
+    const uint8_t* znull;
+    uint32_t       zn;
+    uint8_t        zlog2;
+    uint8_t        zdesc;
+    uint8_t        znulls_better;   /* nulls sort ahead of values */
+    _Atomic(int64_t) bound;
+    _Atomic(uint8_t) bound_set;
 } fpk_par_ctx_t;
+
+static inline int64_t fpk_key_i64(const fpk_keyspec_t* ks, int64_t row) {
+    switch (ks->esz) {
+    case 1: return (int64_t)((const uint8_t*)ks->base)[row];
+    case 2: return (int64_t)((const int16_t*)ks->base)[row];
+    case 4: return (int64_t)((const int32_t*)ks->base)[row];
+    default: return ((const int64_t*)ks->base)[row];
+    }
+}
+
+/* A full heap's worst row publishes its first key as a pruning bound. */
+static void fpk_publish_bound(fpk_par_ctx_t* c, int64_t worst_row) {
+    if (!c->zmin) return;
+    const fpk_keyspec_t* ks = &c->keys[0];
+    if (ks->has_nulls && ray_vec_is_null(ks->col, worst_row)) return;
+    int64_t v = fpk_key_i64(ks, worst_row);
+    int64_t cur = atomic_load_explicit(&c->bound, memory_order_relaxed);
+    bool set = atomic_load_explicit(&c->bound_set, memory_order_relaxed);
+    for (;;) {
+        bool better = !set || (c->zdesc ? v > cur : v < cur);
+        if (!better) return;
+        if (atomic_compare_exchange_weak_explicit(&c->bound, &cur, v,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&c->bound_set, 1, memory_order_release);
+            return;
+        }
+        set = true;
+    }
+}
+
+/* Chunk `g` cannot hold a row that beats the bound. */
+static inline bool fpk_chunk_pruned(const fpk_par_ctx_t* c, int64_t g) {
+    if (!atomic_load_explicit(&c->bound_set, memory_order_acquire)) return false;
+    if (g < 0 || g >= (int64_t)c->zn) return false;
+    if (c->znulls_better && c->znull && (c->znull[g >> 3] & (1u << (g & 7)))) return false;
+    int64_t b = atomic_load_explicit(&c->bound, memory_order_relaxed);
+    return c->zdesc ? c->zmax[g] < b : c->zmin[g] > b;
+}
 
 /* Compare two source rows by the multi-key sort spec.  Returns
  * "a is worse than b" sense: positive means evict-a-first in the
@@ -283,6 +336,11 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
 
     int64_t row = start;
     while (row < end) {
+        if (c->zmin && fpk_chunk_pruned(c, row >> c->zlog2)) {
+            int64_t next = ((row >> c->zlog2) + 1) << c->zlog2;
+            row = next < end ? next : end;
+            continue;
+        }
         int64_t mend = row + RAY_MORSEL_ELEMS;
         if (mend > end) mend = end;
         int64_t mlen = mend - row;
@@ -294,12 +352,13 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
             int64_t src_row = row + r;
             if (hn < k) {
                 hidx[hn++] = src_row;
-                if (hn == k) fpk_heapify(c, hidx, k);
+                if (hn == k) { fpk_heapify(c, hidx, k); fpk_publish_bound(c, hidx[0]); }
             } else {
                 /* Reject fast: skip if new ≥ current worst (heap root). */
                 if (fpk_cmp(c, src_row, hidx[0]) >= 0) continue;
                 hidx[0] = src_row;
                 fpk_sift_down(c, hidx, k, 0);
+                fpk_publish_bound(c, hidx[0]);
             }
         }
         row = mend;
@@ -379,6 +438,25 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ctx.n_keys = n_sort_keys;
     ctx.k      = k;
     ctx.tbl    = tbl;
+    {
+        ray_t* kc = ctx.keys[0].col;
+        int8_t kt = ctx.keys[0].type;
+        if ((kt == RAY_I16 || kt == RAY_I32 || kt == RAY_I64 || kt == RAY_DATE ||
+             kt == RAY_TIME || kt == RAY_TIMESTAMP) &&
+            ray_index_kind(kc) == RAY_IDX_CHUNK_ZONE) {
+            ray_index_t* zx = ray_index_payload(kc->index);
+            if (zx->built_for_len == kc->len && !zx->u.chunk_zone.is_f64 &&
+                zx->u.chunk_zone.mins && zx->u.chunk_zone.maxs && zx->u.chunk_zone.null_bits) {
+                ctx.zmin  = (const int64_t*)ray_data(zx->u.chunk_zone.mins);
+                ctx.zmax  = (const int64_t*)ray_data(zx->u.chunk_zone.maxs);
+                ctx.znull = (const uint8_t*)ray_data(zx->u.chunk_zone.null_bits);
+                ctx.zn    = zx->u.chunk_zone.n_chunks;
+                ctx.zlog2 = zx->u.chunk_zone.chunk_log2;
+                ctx.zdesc = ctx.keys[0].desc;
+                ctx.znulls_better = ctx.keys[0].nulls_first;
+            }
+        }
+    }
 
     /* Compile the predicate via a temp graph just for the WHERE clause.  No
      * where: is a predicate with no children — every row passes — and the
