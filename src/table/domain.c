@@ -1060,7 +1060,6 @@ static void dom_batch_dedupe_fn(void* raw, uint32_t wid, int64_t start, int64_t 
 static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     dom_batch_ctx_t* b = (dom_batch_ctx_t*)raw;
-    _Atomic(uint64_t)* buckets = (_Atomic(uint64_t)*)b->buckets;
     for (int64_t p = start; p < end; p++) {
         int64_t lo = b->part_off[p];
         int64_t hi = lo + b->uniq_n[p];
@@ -1077,8 +1076,8 @@ static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t start, int64_t 
             uint64_t slot = h & b->mask;
             for (;;) {
                 uint64_t cur = 0;
-                if (atomic_compare_exchange_strong_explicit(&buckets[slot], &cur, e,
-                        memory_order_relaxed, memory_order_relaxed))
+                if (atomic_compare_exchange_strong_explicit((_Atomic(uint64_t)*)&b->buckets[slot],
+                        &cur, e, memory_order_relaxed, memory_order_relaxed))
                     break;
                 slot = (slot + 1) & b->mask;
             }

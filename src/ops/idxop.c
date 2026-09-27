@@ -1250,14 +1250,13 @@ static void hp_pass_e(void* raw, uint32_t wid, int64_t start, int64_t end) {
      * partition's groups are nobody else's, so the cursors are private */
     for (int64_t j = lo; j < hi; j++)
         h->rw[h->of[gmap[h->lg[j]]]++] = h->pr[j];
-    _Atomic(int64_t)* tbl = (_Atomic(int64_t)*)h->tbl;
     for (int64_t g = 0; g < ng; g++) {
         int64_t G = gmap[g];
         uint64_t slot = mix64((uint64_t)h->gk[G]) & h->tmask;
         for (;;) {
             int64_t cur = 0;
-            if (atomic_compare_exchange_strong_explicit(&tbl[slot], &cur, G + 1,
-                    memory_order_relaxed, memory_order_relaxed))
+            if (atomic_compare_exchange_strong_explicit((_Atomic(int64_t)*)&h->tbl[slot],
+                    &cur, G + 1, memory_order_relaxed, memory_order_relaxed))
                 break;
             slot = (slot + 1) & h->tmask;
         }
