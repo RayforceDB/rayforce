@@ -49,4 +49,11 @@
 (all (== (as 'STR (at R3 'ref)) (as 'STR (at O3 'ref)))) -- true
 ;; an alias that spells the source column's name renames the key to `key`
 (cols (select {from: F by: (substr ref 1 4) ref: (count ref) where: (!= ref "")})) -- [key ref]
+;; unsorted output: groups in the order their first value appears in the
+;; column's vocabulary, the same at every core count (the per-value counts
+;; come out of a grouping whose order depends on the core count, and are
+;; put back in vocabulary order first)
+(set RU (select {from: F by: (substr ref 1 4) c: (count ref)}))
+(as 'STR (at RU 'ref)) -- ["" "http" "ab5" "ab0" "ab9" "ab4" "ab3" "ab8" "ab2" "ab1" "ab6" "ab7"]
+(at RU 'c) -- [18203 164471 1733 1736 1733 1733 1734 1731 1731 1731 1732 1732]
 (.sys.exec "rm -rf /tmp/rfl_dkv/") -- 0

@@ -42,3 +42,13 @@
 (== (count R4) (count O4)) -- true
 (all (== (at (select {from: R4 asc: k}) 'sv) (at (select {from: O4 asc: k}) 'sv))) -- true
 (all (== (as 'STR (at (select {from: R4 asc: k}) 'm)) (as 'STR (at (select {from: O4 asc: k}) 'm)))) -- true
+;; float sums over the partitioned accumulate add each group's rows in
+;; table order: 1e16 + 1 - 1e16 + 1 rounds to 1.0 in that order, whatever
+;; the core count (a scheduler-dependent order gave 0.0 for some groups)
+(set NF 200000)
+(set iF (til NF))
+(set TF (table [k f s] (list (% iF 50000) (at [1e16 1.0 -1e16 1.0] (as 'I64 (floor (/ iF 50000)))) (as 'SYMBOL (map (fn [j] (format "h%" (% j 97))) iF)))))
+(set RF (select {from: TF by: k l: (sum (strlen s)) sf: (sum f) c: (count f)}))
+(distinct (at RF 'sf)) -- [1.0]
+(count RF) -- 50000
+

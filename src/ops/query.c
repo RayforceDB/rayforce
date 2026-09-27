@@ -3487,6 +3487,70 @@ static void dkv_len_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     if (late) atomic_fetch_add_explicit(&c->late, late, memory_order_relaxed);
 }
 
+/* H (distinct values of C with their counts) in C's domain-position order.
+ * The grouping that produced H emits in an order that depends on the core
+ * count; the rewrite's output order follows H, and a derived-key grouping
+ * on the row path comes out in the same order at every core count (the
+ * first-seen order of the key values, which follows the positions of the
+ * values they come from).  Positions are distinct, so the order is the
+ * rank of each position among those present: a bitmap over the domain,
+ * block popcounts, then a scatter.  Returns a new table, or NULL (H kept). */
+static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
+    ray_t* Hc = ray_table_get_col_idx(H, 0);
+    ray_t* Hn = ray_table_get_col_idx(H, 1);
+    int64_t du = ray_table_nrows(H);
+    if (dom_count <= 0 || du <= 1) return NULL;
+    int64_t nw = (dom_count + 63) / 64;
+    int64_t nb = (nw + 63) / 64;                 /* rank blocks of 64 words */
+    ray_t *bh = NULL, *rh = NULL;
+    uint64_t* bits = (uint64_t*)scratch_calloc(&bh, (size_t)nw * sizeof(uint64_t));
+    int64_t*  rank = (int64_t*)scratch_alloc(&rh, (size_t)(nb + 1) * sizeof(int64_t));
+    if (!bits || !rank) { scratch_free(bh); scratch_free(rh); return NULL; }
+    const void* cd = ray_data(Hc);
+    for (int64_t i = 0; i < du; i++) {
+        int64_t pos = ray_read_sym(cd, i, RAY_SYM, Hc->attrs);
+        if (pos < 0 || pos >= dom_count) { scratch_free(bh); scratch_free(rh); return NULL; }
+        bits[pos >> 6] |= (uint64_t)1 << (pos & 63);
+    }
+    int64_t run = 0;
+    for (int64_t b = 0; b < nb; b++) {
+        rank[b] = run;
+        int64_t w1 = (b + 1) * 64 < nw ? (b + 1) * 64 : nw;
+        for (int64_t w = b * 64; w < w1; w++) run += __builtin_popcountll(bits[w]);
+    }
+    ray_t* nc = ray_sym_vec_new(Hc->attrs & RAY_SYM_W_MASK, du);
+    ray_t* nn = ray_vec_new(RAY_I64, du);
+    if (!nc || RAY_IS_ERR(nc) || !nn || RAY_IS_ERR(nn)) {
+        if (nc && !RAY_IS_ERR(nc)) ray_release(nc);
+        if (nn && !RAY_IS_ERR(nn)) ray_release(nn);
+        scratch_free(bh); scratch_free(rh);
+        return NULL;
+    }
+    ray_sym_vec_adopt_domain(nc, Hc);
+    nc->len = du; nn->len = du;
+    void* ncd = ray_data(nc);
+    int64_t* nnd = (int64_t*)ray_data(nn);
+    const int64_t* hnd = (const int64_t*)ray_data(Hn);
+    for (int64_t i = 0; i < du; i++) {
+        int64_t pos = ray_read_sym(cd, i, RAY_SYM, Hc->attrs);
+        int64_t w = pos >> 6;
+        int64_t r = rank[w >> 6];
+        for (int64_t x = (w >> 6) * 64; x < w; x++) r += __builtin_popcountll(bits[x]);
+        r += __builtin_popcountll(bits[w] & (((uint64_t)1 << (pos & 63)) - 1));
+        ray_write_sym(ncd, r, (uint64_t)pos, RAY_SYM, nc->attrs);
+        nnd[r] = hnd[i];
+    }
+    if (Hc->attrs & RAY_ATTR_HAS_NULLS) nc->attrs |= RAY_ATTR_HAS_NULLS;
+    scratch_free(bh); scratch_free(rh);
+    ray_t* out = ray_table_new(2);
+    if (!out || RAY_IS_ERR(out)) { ray_release(nc); ray_release(nn); return NULL; }
+    out = ray_table_add_col(out, ray_table_col_name(H, 0), nc);
+    out = ray_table_add_col(out, ray_table_col_name(H, 1), nn);
+    ray_release(nc); ray_release(nn);
+    if (!out || RAY_IS_ERR(out)) return NULL;
+    return out;
+}
+
 static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_expr,
                                      ray_t** dict_elems, int64_t dict_n,
                                      int64_t from_id, int64_t by_id, int64_t where_id,
@@ -3562,6 +3626,15 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     int64_t du = ray_table_nrows(H);
     if (!Hc || !Hn || Hc->type != RAY_SYM || Hn->type != RAY_I64 || du <= 0 ||
         ray_sym_vec_domain(Hc) != dom) { ray_release(H); return NULL; }
+    {
+        ray_t* Ho = dkv_order_by_position(H, ray_sym_domain_count(dom));
+        if (Ho) {
+            ray_release(H);
+            H = Ho;
+            Hc = ray_table_get_col_idx(H, 0);
+            Hn = ray_table_get_col_idx(H, 1);
+        }
+    }
 
     /* 2. the key once per distinct value */
     ray_t* key_dom = derived_key_str_chunks(by_expr, col, Hc, dom, du);

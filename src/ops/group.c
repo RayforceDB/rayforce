@@ -8947,9 +8947,9 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
 
 /* ---- slot-partitioned accumulate --------------------------------------
  * For a pool with more workers than the per-worker slot budget allows.
- * Pass 1 (workers, disjoint row ranges): each row's group is computed once
- * and its row id appended to the bucket of (worker, task) with
- * task = gid / span — no shared writes.  Pass 2 (one task per slot span,
+ * Pass 1 (nw tasks, contiguous row ranges in order): each row's group is
+ * computed once and its row id appended to the bucket of (range, task)
+ * with task = gid / span — no shared writes.  Pass 2 (one task per slot span,
  * ray_pool_dispatch_n): task t drains every worker's bucket t into the
  * single accumulator set; no two tasks touch a slot, so nothing is merged
  * and the state is one set however many workers run.  The buckets hold
@@ -8959,6 +8959,7 @@ typedef struct {
     da_ctx_t*     c;
     da_bucket_t*  buckets;      /* [nw * k] */
     uint32_t      nw, k, span;
+    int64_t       n_scan;
     _Atomic(int)  oom;
 } da_part_ctx_t;
 
@@ -8976,10 +8977,17 @@ static bool da_bucket_push(da_bucket_t* b, int32_t v) {
     return true;
 }
 
-static void da_part_scatter_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+/* Task `t` of nw scans the t-th contiguous row range into bucket row t:
+ * draining rows 0..nw-1 in order then hands each slot its rows in table
+ * order, so the accumulation (float sums included) is the serial scan's,
+ * whatever the scheduling. */
+static void da_part_scatter_fn(void* raw, uint32_t wid, int64_t task, int64_t task_end) {
+    (void)wid; (void)task_end;
     da_part_ctx_t* p = (da_part_ctx_t*)raw;
     da_ctx_t* c = p->c;
-    da_bucket_t* mine = &p->buckets[(size_t)wid * p->k];
+    da_bucket_t* mine = &p->buckets[(size_t)task * p->k];
+    int64_t start = p->n_scan * task / p->nw;
+    int64_t end   = p->n_scan * (task + 1) / p->nw;
     const int64_t* match_idx = c->match_idx;
     for (int64_t i = start; i < end; i++) {
         int64_t r = match_idx ? match_idx[i] : i;
@@ -9017,9 +9025,10 @@ static bool da_accum_partitioned(da_ctx_t* c, ray_pool_t* pool, uint32_t k, int6
     ray_t* bh = NULL;
     da_bucket_t* buckets = (da_bucket_t*)scratch_calloc(&bh, (size_t)nw * k * sizeof(da_bucket_t));
     if (!buckets) return false;
-    da_part_ctx_t p = { .c = c, .buckets = buckets, .nw = nw, .k = k, .span = span };
+    da_part_ctx_t p = { .c = c, .buckets = buckets, .nw = nw, .k = k, .span = span,
+                        .n_scan = n_scan };
     atomic_store_explicit(&p.oom, 0, memory_order_relaxed);
-    ray_pool_dispatch(pool, da_part_scatter_fn, &p, n_scan);
+    ray_pool_dispatch_n(pool, da_part_scatter_fn, &p, nw);
     bool ok = atomic_load_explicit(&p.oom, memory_order_relaxed) == 0;
     if (ok) ray_pool_dispatch_n(pool, da_part_drain_fn, &p, k);
     for (size_t i = 0; i < (size_t)nw * k; i++)
