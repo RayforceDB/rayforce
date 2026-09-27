@@ -1018,6 +1018,38 @@ static ray_op_t* sel_alias_lookup(ray_graph_t* g, int64_t sym) {
     return NULL;
 }
 
+/* The op a sort key binds to.  When the sort runs over a projection
+ * (`root` is its SELECT), the key is the projected column that scans the
+ * source column — an output, or the hidden key appended for it — so the
+ * sort reads it by POSITION and no name lookup over the projected table
+ * (scans named by source, expressions `_e<c>`) can pick another column.
+ * Otherwise a fresh scan resolved by name, as before. */
+static ray_op_t* select_sort_key_op(ray_graph_t* g, ray_op_t* root, int64_t sym, const char* name) {
+    if (root && root->opcode == OP_SELECT) {
+        ray_op_ext_t* se = find_ext(g, root->id);
+        if (se && se->base.opcode == OP_SELECT)
+            for (uint32_t c = 0; c < se->sort.n_cols; c++) {
+                ray_op_t* col = &g->nodes[se->sort.columns[c]];
+                if (col->opcode != OP_SCAN) continue;
+                ray_op_ext_t* ce = find_ext(g, col->id);
+                if (ce && ce->base.opcode == OP_SCAN && ce->sym == sym) return col;
+            }
+    }
+    return ray_scan(g, name);
+}
+
+/* Index of the first projected column that is a bare scan of source
+ * column `sym`, or -1.  Used to bind a sort key to the projected column
+ * that already carries it. */
+static int64_t select_scan_output(ray_graph_t* g, ray_op_t** col_ops, int64_t nc, int64_t sym) {
+    for (int64_t c = 0; c < nc; c++) {
+        if (!col_ops[c] || col_ops[c]->opcode != OP_SCAN) continue;
+        ray_op_ext_t* ce = find_ext(g, col_ops[c]->id);
+        if (ce && ce->base.opcode == OP_SCAN && ce->sym == sym) return c;
+    }
+    return -1;
+}
+
 /* Takes the error compile_expr_dag left on the graph (see ops.h), or
  * NULL.  Callers that report a compile failure use it so the message
  * names the actual problem when there is one. */
@@ -7542,10 +7574,9 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
     bool   computed_single_key = false;   /* by: is one expression, compiled or const */
-    /* Sort keys that are source columns but not outputs of the projection:
-     * carried through the projection so the sort can read them, dropped
-     * from the result after it ran. */
-    int64_t hidden_sort_cols[16];
+    /* Sort keys that are source columns no output scans: carried through
+     * the projection (appended after the outputs) so the sort can read
+     * them, dropped from the result after it ran. */
     int     n_hidden_sort = 0;
     ray_t* deferred_bydict = NULL;
     int64_t deferred_nk = 0;
@@ -11438,7 +11469,16 @@ by_dict_done:
              * former fixed col_ops[16] silently routed >16 outputs to the
              * eval fallback via the width check below; now only the other
              * use_eval_fallback trigger (a failed compile) applies. */
-            int64_t nc_max = select_output_count(dict_elems, dict_n) + 16;
+            int64_t nc_max = select_output_count(dict_elems, dict_n);
+            /* plus one slot per sort key name: any of them may have to be
+             * carried through the projection as a hidden column */
+            for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                int64_t kid = dict_elems[i]->i64;
+                if (kid != asc_id && kid != desc_id) continue;
+                ray_t* val = dict_elems[i + 1];
+                if (val->type == -RAY_SYM) nc_max += 1;
+                else if (ray_is_vec(val) && val->type == RAY_SYM) nc_max += ray_len(val);
+            }
             if (nc_max < 1) nc_max = 1;
             ray_t* colops_hdr = NULL;
             ray_op_t** col_ops = (ray_op_t**)scratch_alloc(&colops_hdr,
@@ -11479,9 +11519,13 @@ by_dict_done:
             g->sel_alias_syms = NULL;
             g->sel_alias_ids  = NULL;
             g->sel_alias_n    = 0;
-            /* A sort key naming a source column that no output carries is
-             * projected too (the sort runs over the projection), and dropped
-             * from the result afterwards. */
+            /* Sort keys name SOURCE columns (like where: and by:, they are
+             * alias-blind).  A key some output scans bare is read from that
+             * output (the sort binds to the projected column by position,
+             * see exec_sort); a key no output scans is projected too, after
+             * the outputs, and dropped from the result afterwards.  Output
+             * aliases are not consulted: `{b: a ... asc: b}` sorts by the
+             * source column b, not by the output that renames a. */
             if (!use_eval_fallback && has_sort) {
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
@@ -11491,17 +11535,8 @@ by_dict_done:
                                : (ray_is_vec(val) && val->type == RAY_SYM) ? val->len : 0;
                     for (int64_t k = 0; k < nk; k++) {
                         int64_t ks = val->type == -RAY_SYM ? val->i64 : sym_cell_runtime_id(val, k);
-                        bool have = false;
-                        for (int64_t c = 0; c < nc; c++) {
-                            if (alias_syms[c] == ks) have = true;
-                            /* a bare scan of the key column under another
-                             * alias: the projection names it by its source
-                             * column, and the sort finds it there */
-                            ray_op_ext_t* ce = find_ext(g, col_ops[c]->id);
-                            if (ce && ce->base.opcode == OP_SCAN && ce->sym == ks) have = true;
-                        }
-                        for (int h = 0; h < n_hidden_sort; h++) if (hidden_sort_cols[h] == ks) have = true;
-                        if (have || !ray_table_get_col(tbl, ks) || n_hidden_sort >= 16) continue;
+                        if (select_scan_output(g, col_ops, nc, ks) >= 0) continue;
+                        if (!ray_table_get_col(tbl, ks) || nc >= nc_max) continue;
                         ray_t* nm = ray_sym_str(ks);
                         ray_op_t* sc = nm ? ray_scan(g, ray_str_ptr(nm)) : NULL;
                         if (!sc) continue;
@@ -11509,7 +11544,7 @@ by_dict_done:
                         alias_syms[nc] = ks;
                         alias_ids[nc] = sc->id;
                         nc++;
-                        hidden_sort_cols[n_hidden_sort++] = ks;
+                        n_hidden_sort++;
                     }
                 }
             }
@@ -11666,14 +11701,14 @@ by_dict_done:
             if (val->type == -RAY_SYM) {
                 /* Single column name */
                 ray_t* s = ray_sym_str(val->i64);
-                sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
+                sort_keys[n_sort] = select_sort_key_op(g, root, val->i64, ray_str_ptr(s));
                 sort_descs[n_sort] = is_desc;
                 n_sort++;
             } else if (ray_is_vec(val) && val->type == RAY_SYM) {
                 /* Multiple column names — cell-data via the vec's domain */
                 for (int64_t c = 0; c < val->len; c++) {
                     ray_t* s = ray_sym_vec_cell(val, c);
-                    sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
+                    sort_keys[n_sort] = select_sort_key_op(g, root, sym_cell_runtime_id(val, c), ray_str_ptr(s));
                     sort_descs[n_sort] = is_desc;
                     n_sort++;
                 }
