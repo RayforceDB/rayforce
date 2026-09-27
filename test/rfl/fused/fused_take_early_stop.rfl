@@ -38,3 +38,13 @@
 (at (select {x: x from: TK where: (== c 7) asc: x take: 3}) 'x) -- [7 1007 2007]
 ;; descending take on the sorted column stays on the ordered path
 (at (select {x: x from: TK where: (== c 7) desc: s take: 3}) 'x) -- [999007 998007 997007]
+;; a value written with alter set can break a `sorted` marker's order: the
+;; marker is cleared, and the ascending take orders by value again
+(set sv (.attr.set 'sorted (til 10)))
+(alter 'sv set 8 -3)
+(set TS (table [x s c] (list (til 10) sv (% (til 10) 2))))
+(at (select {x: x from: TS where: (== c 0) asc: s take: 2}) 'x) -- [8 0]
+;; a take given as an expression is evaluated once
+(set tcnt 0)
+(count (select {x: x from: TK where: (== c 7) take: (do (set tcnt (+ tcnt 1)) 9)})) -- 9
+tcnt -- 1

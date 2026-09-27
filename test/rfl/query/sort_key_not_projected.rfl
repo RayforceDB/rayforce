@@ -21,3 +21,10 @@
 ;; a key that is also an output is not duplicated
 (cols (select {a: a c: c from: T asc: c take: 2})) -- ['a 'c]
 (at (select {a: a c: c from: T asc: c take: 2}) 'c) -- [0 1]
+;; an output that renames the key column: the projection names that scan by
+;; its source column, so the key is found there and nothing extra is added
+;; or dropped (the output itself stays)
+(at (select {b: a from: T asc: a}) 'b) -- (til 100)
+(take (at (select {b: a from: T desc: a}) 'b) 3) -- [99 98 97]
+(take (at (select {b: a from: T where: (> (+ b 1) 3) desc: a}) 'b) 3) -- [97 96 95]
+(select {x: c y: a from: T desc: a take: [1 2]}) -- (table [x y] (list [1 2] [98 97]))

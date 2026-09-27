@@ -7457,6 +7457,12 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     if (!kc) bad_clause = 1;
                 }
             }
+            /* Without a sort the positional path takes only a literal K:
+             * an expression is left to the general path, which evaluates
+             * it exactly once. */
+            if (n_sort_keys == 0 && !(ray_is_atom(take_expr) &&
+                  (take_expr->type == -RAY_I64 || take_expr->type == -RAY_I32)))
+                bad_clause = 1;
             if (!bad_clause && n_out_syms > 0) {
                 ray_t* tv = ray_eval(take_expr);
                 if (tv && !RAY_IS_ERR(tv) && ray_is_atom(tv) &&
@@ -11476,7 +11482,14 @@ by_dict_done:
                     for (int64_t k = 0; k < nk; k++) {
                         int64_t ks = val->type == -RAY_SYM ? val->i64 : sym_cell_runtime_id(val, k);
                         bool have = false;
-                        for (int64_t c = 0; c < nc; c++) if (alias_syms[c] == ks) have = true;
+                        for (int64_t c = 0; c < nc; c++) {
+                            if (alias_syms[c] == ks) have = true;
+                            /* a bare scan of the key column under another
+                             * alias: the projection names it by its source
+                             * column, and the sort finds it there */
+                            ray_op_ext_t* ce = find_ext(g, col_ops[c]->id);
+                            if (ce && ce->base.opcode == OP_SCAN && ce->sym == ks) have = true;
+                        }
                         for (int h = 0; h < n_hidden_sort; h++) if (hidden_sort_cols[h] == ks) have = true;
                         if (have || !ray_table_get_col(tbl, ks) || n_hidden_sort >= 16) continue;
                         ray_t* nm = ray_sym_str(ks);
@@ -11756,14 +11769,14 @@ by_dict_done:
     if (n_hidden_sort > 0 && result && !RAY_IS_ERR(result)) {
         if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
         if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
+            /* the hidden keys were projected last: drop the trailing
+             * columns (by position — an output may carry the same name) */
             int64_t rc = ray_table_ncols(result);
-            ray_t* kept = ray_table_new(rc);
-            for (int64_t c = 0; kept && !RAY_IS_ERR(kept) && c < rc; c++) {
-                int64_t nm = ray_table_col_name(result, c);
-                bool hide = false;
-                for (int h = 0; h < n_hidden_sort; h++) if (hidden_sort_cols[h] == nm) hide = true;
-                if (!hide) kept = ray_table_add_col(kept, nm, ray_table_get_col_idx(result, c));
-            }
+            int64_t keep_n = rc - n_hidden_sort;
+            ray_t* kept = keep_n >= 0 ? ray_table_new(keep_n > 0 ? keep_n : 1) : NULL;
+            for (int64_t c = 0; kept && !RAY_IS_ERR(kept) && c < keep_n; c++)
+                kept = ray_table_add_col(kept, ray_table_col_name(result, c),
+                                         ray_table_get_col_idx(result, c));
             if (kept && !RAY_IS_ERR(kept)) { ray_release(result); result = kept; }
             else if (kept) ray_release(kept);
         }
