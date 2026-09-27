@@ -40,6 +40,10 @@
 #include "lang/internal.h"  /* ray_set/get_splayed_fn (surface resolver) */
 #include "mem/heap.h"
 #include "table/sym.h"
+#include "table/domain.h" /* symfile positions of a streamed CSV load */
+#include "io/csv.h"       /* ray_csv_save_splayed_named_opts */
+#include "mem/sys.h"
+#include "core/pool.h"
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -66,6 +70,139 @@ static void splay_teardown(void) {
 /* Remove temp dir tree */
 static void rm_rf(const char* path) {
     (void)ray_test_rm_rf(path);
+}
+
+/* Streamed CSV -> splayed load, several chunks.  The symfile positions of
+ * the SYM columns are the ones the cell-by-cell writer gives: per chunk,
+ * columns in order, each column's strings by first occurrence — whatever
+ * the worker count or how the dictionaries were split into partitions.
+ * Chunks of 20k rows with >4k new strings each take the parallel batch. */
+static test_result_t test_csv_splayed_symfile_order(void) {
+    TEST_ASSERT_NOT_NULL(ray_pool_get());
+    const char* dir = TMP_SPLAY_BASE "/csvorder";
+    const char* csv = TMP_SPLAY_BASE "/csvorder.csv";
+    rm_rf(dir);
+    mkdir(TMP_SPLAY_BASE, 0755);
+
+    enum { NROWS = 60000, CHUNK = 20000, NA = 13000, NB = 9000 };
+    FILE* f = fopen(csv, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b,v\n", f);
+    for (int r = 0; r < NROWS; r++) {
+        int ai = (int)(((int64_t)r * 7919) % NA);
+        if (r % 5 == 0) fprintf(f, "a%d,a%d,%d\n", ai, (ai + 11) % NA, r);   /* b reuses a's strings */
+        else            fprintf(f, "a%d,b%d,%d\n", ai, (int)(((int64_t)r * 104729) % NB), r);
+    }
+    fclose(f);
+
+    int8_t types[] = { RAY_SYM, RAY_SYM, RAY_I64 };
+    ray_err_t err = ray_csv_save_splayed_named_opts(csv, ',', true, types, 3, NULL, 0, dir, CHUNK);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* expected positions: walk as the writer does */
+    int64_t* pa = (int64_t*)ray_sys_alloc(NA * sizeof(int64_t));
+    int64_t* pb = (int64_t*)ray_sys_alloc(NB * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(pa); TEST_ASSERT_NOT_NULL(pb);
+    for (int i = 0; i < NA; i++) pa[i] = -1;
+    for (int i = 0; i < NB; i++) pb[i] = -1;
+    int64_t next = 1;                                /* 0 is "" */
+    for (int c0 = 0; c0 < NROWS; c0 += CHUNK) {
+        for (int r = c0; r < c0 + CHUNK; r++) {      /* column a */
+            int ai = (int)(((int64_t)r * 7919) % NA);
+            if (pa[ai] < 0) pa[ai] = next++;
+        }
+        for (int r = c0; r < c0 + CHUNK; r++) {      /* column b */
+            int ai = (int)(((int64_t)r * 7919) % NA);
+            if (r % 5 == 0) { int x = (ai + 11) % NA; if (pa[x] < 0) pa[x] = next++; }
+            else { int bi = (int)(((int64_t)r * 104729) % NB); if (pb[bi] < 0) pb[bi] = next++; }
+        }
+    }
+
+    char sym_path[256];
+    snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
+    ray_sym_domain_t* dom = ray_sym_domain_open(sym_path);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), next);
+    char buf[32];
+    for (int i = 0; i < NA; i++) {
+        if (pa[i] < 0) continue;
+        int n = snprintf(buf, sizeof(buf), "a%d", i);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, buf, (size_t)n), pa[i]);
+    }
+    for (int i = 0; i < NB; i++) {
+        if (pb[i] < 0) continue;
+        int n = snprintf(buf, sizeof(buf), "b%d", i);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, buf, (size_t)n), pb[i]);
+    }
+    ray_sym_domain_release(dom);
+
+    /* and the cells read back the strings written */
+    ray_t* t = ray_read_splayed(dir, sym_path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), NROWS);
+    ray_t* ca = ray_table_get_col_idx(t, 0);
+    for (int r = 0; r < NROWS; r += 997) {
+        ray_t* cell = ray_sym_vec_cell(ca, r);
+        TEST_ASSERT_NOT_NULL(cell);
+        int n = snprintf(buf, sizeof(buf), "a%d", (int)(((int64_t)r * 7919) % NA));
+        TEST_ASSERT_EQ_U(ray_str_len(cell), (size_t)n);
+        TEST_ASSERT_MEM_EQ((size_t)n, ray_str_ptr(cell), buf);
+    }
+    ray_release(t);
+    ray_sys_free(pa); ray_sys_free(pb);
+    rm_rf(dir);
+    unlink(csv);
+    PASS();
+}
+
+/* A chunk whose byte window holds no quote, in a file that has quotes in
+ * another chunk, is split into rows exactly as the whole file is: a lone
+ * '\r' ends a row.  (The quote-free fast path of the parallel scanner did
+ * not treat it so, and merged two rows, losing a value.) */
+static test_result_t test_csv_splayed_quote_mode_per_file(void) {
+    TEST_ASSERT_NOT_NULL(ray_pool_get());
+    const char* dir = TMP_SPLAY_BASE "/csvquote";
+    const char* csv = TMP_SPLAY_BASE "/csvquote.csv";
+    rm_rf(dir);
+    mkdir(TMP_SPLAY_BASE, 0755);
+
+    enum { NROWS = 60000, CHUNK = 20000, LONE = 45007 };
+    FILE* f = fopen(csv, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("s,v\n", f);
+    fputs("\"q,1\",0\n", f);                           /* quotes only in chunk 0 */
+    for (int r = 1; r < NROWS; r++) {
+        if (r == LONE) fprintf(f, "left\rright,%d\n", r);  /* chunk 2 */
+        else           fprintf(f, "r%d,%d\n", r, r);
+    }
+    fclose(f);
+
+    int8_t types[] = { RAY_SYM, RAY_I64 };
+    ray_t* mem = ray_read_csv_named_opts(csv, ',', true, types, 2, NULL, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mem));
+    int64_t want = ray_table_nrows(mem);
+    TEST_ASSERT_EQ_I(want, NROWS + 1);                /* the lone \r splits a row */
+
+    ray_err_t err = ray_csv_save_splayed_named_opts(csv, ',', true, types, 2, NULL, 0, dir, CHUNK);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    char sym_path[256];
+    snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
+    ray_t* t = ray_read_splayed(dir, sym_path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), want);
+    /* every row agrees with the in-memory read */
+    ray_t* vm = ray_table_get_col_idx(mem, 1);
+    ray_t* vt = ray_table_get_col_idx(t, 1);
+    for (int64_t r = 0; r < want; r++) {
+        TEST_ASSERT_EQ_I(ray_vec_is_null(vt, r), ray_vec_is_null(vm, r));
+        if (!ray_vec_is_null(vm, r))
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(vt))[r], ((int64_t*)ray_data(vm))[r]);
+    }
+    ray_release(t);
+    ray_release(mem);
+    rm_rf(dir);
+    unlink(csv);
+    PASS();
 }
 
 /* =========================================================================
@@ -2277,5 +2414,7 @@ const test_entry_t splay_entries[] = {
     { "splay/empty_sym_table_roundtrip",  test_empty_sym_table_roundtrip,       splay_setup, splay_teardown },
     { "splay/resolution_order_independence", test_resolution_order_independence, splay_setup, splay_teardown },
     { "splay/resolution_explicit_wins",   test_resolution_explicit_wins,        splay_setup, splay_teardown },
+    { "splay/csv_symfile_order",          test_csv_splayed_symfile_order,       splay_setup, splay_teardown },
+    { "splay/csv_quote_mode_per_file",    test_csv_splayed_quote_mode_per_file, splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

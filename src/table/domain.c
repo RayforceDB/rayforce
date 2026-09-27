@@ -179,6 +179,10 @@ struct ray_sym_domain_s {
      * inserts incrementally; growth rebuilds).  Guarded by g_dom_lock. */
     uint64_t* buckets;
     uint64_t  bucket_mask; /* cap - 1; 0 = not built yet */
+    /* Batch interns currently probing a snapshot of `buckets` outside the
+     * lock (guarded by g_dom_lock).  While non-zero a replaced table is
+     * retired instead of freed. */
+    int32_t   batch_inflight;
 
     dom_retired_t* retired; /* replaced atom arrays + old LUTs */
 
@@ -294,6 +298,15 @@ static bool dom_retire(ray_sym_domain_t* d, void* p) {
     d->retired = r;
     return true;
 }
+
+/* Drop a replaced reverse-index table: freed at once unless a batch intern
+ * is probing a snapshot outside the lock, then retired with the domain. */
+static bool dom_drop_buckets_locked(ray_sym_domain_t* d, uint64_t* old) {
+    if (!old) return true;
+    if (d->batch_inflight == 0) { ray_sys_free(old); return true; }
+    return dom_retire(d, old);
+}
+
 /* Publish (map, offsets, count) as the domain's raw snapshot; the previous
  * record is retired.  Called with the file's current image in place. */
 static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
@@ -519,9 +532,9 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
              * same corner dom_append_locked hits; mirror its loud abort
              * (the count is already published, there is no clean undo). */
             if (d->buckets) {
-                /* Retire, never free: a batch intern may be probing a
-                 * snapshot of this table outside the lock. */
-                if (!dom_retire(d, d->buckets)) {
+                /* A batch intern may be probing a snapshot of this
+                 * table outside the lock. */
+                if (!dom_drop_buckets_locked(d, d->buckets)) {
                     fprintf(stderr, "rayforce: sym domain '%s': OOM retiring "
                                     "reverse index after external extend\n",
                             d->path ? d->path : "?");
@@ -796,9 +809,9 @@ static bool dom_build_index_locked(ray_sym_domain_t* d, int64_t extra) {
             buckets[slot] = ((uint64_t)h << 32) | ((uint64_t)(uint32_t)i + 1);
         }
     }
-    /* Retire, never free: a batch intern probes a snapshot of the old
-     * table outside the lock (see ray_sym_domain_intern_batch). */
-    if (d->buckets && !dom_retire(d, d->buckets)) {
+    /* A batch intern may be probing a snapshot of the old table outside
+     * the lock (see ray_sym_domain_intern_batch). */
+    if (d->buckets && !dom_drop_buckets_locked(d, d->buckets)) {
         ray_sys_free(buckets);
         return false;
     }
@@ -972,7 +985,6 @@ typedef struct {
     int64_t*             part_off;   /* [n_part + 1] */
     int64_t*             uniq_n;     /* [n_part] distinct misses per partition */
     int64_t*             bytes_p;    /* [n_part] arena bytes the partition's atoms need */
-    int64_t*             pos_base;   /* [n_part] first position of the partition */
     void**               region;     /* [n_part] arena region per partition */
     ray_t**              atoms_w;    /* current atom array (fill target) */
     /* Set when a probe met an entry it could not compare (no atom, no
@@ -1066,8 +1078,8 @@ static void dom_batch_dedupe_fn(void* raw, uint32_t wid, int64_t start, int64_t 
 }
 
 /* Append the partition's distinct strings: build the atoms in the
- * partition's arena region at positions [pos_base, pos_base + uniq_n),
- * publish them in the reverse index (CAS on the empty slot keeps
+ * partition's arena region at the positions the caller assigned (batch
+ * order), publish them in the reverse index (CAS on the empty slot keeps
  * concurrent partitions from claiming one slot twice) and resolve the
  * partition's repeats.  Runs under the domain lock; the count is
  * published by the caller once every partition is done. */
@@ -1078,13 +1090,12 @@ static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t start, int64_t 
         int64_t lo = b->part_off[p];
         int64_t hi = lo + b->uniq_n[p];
         char* at = (char*)b->region[p];
-        int64_t pos = b->pos_base[p];
-        for (int64_t j = lo; j < hi; j++, pos++) {
+        for (int64_t j = lo; j < hi; j++) {
             int64_t i = b->uniq[j];
+            int64_t pos = b->out_pos[i];   /* assigned in batch order */
             ray_t* s = ray_arena_str_at(at, b->strs[i], b->lens[i]);
             at += ray_arena_str_bytes(b->lens[i]);
             b->atoms_w[pos] = s;
-            b->out_pos[i] = pos;
             uint32_t h = b->hashes[i];
             uint64_t e = ((uint64_t)h << 32) | ((uint64_t)(uint32_t)pos + 1);
             uint64_t slot = h & b->mask;
@@ -1152,6 +1163,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     b.mask    = dom->bucket_mask;
     b.atoms   = atomic_load_explicit(&dom->atoms, memory_order_acquire);
     b.count   = atomic_load_explicit(&dom->count, memory_order_acquire);
+    dom->batch_inflight++;
     dom_unlock();
 
     if (!ray_sym_domain_raw_pin(dom, &b.raw)) b.raw.count = 0;
@@ -1173,16 +1185,20 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     if (n_part == 1) n_part = 2;   /* keep the shift below the type width */
     int64_t n_miss = 0;
     for (int64_t i = 0; i < n; i++) n_miss += (out_pos[i] < 0);
-    if (n_miss == 0) return true;
+    if (n_miss == 0) {
+        dom_lock();
+        dom->batch_inflight--;
+        dom_unlock();
+        return true;
+    }
 
     b.miss     = (int64_t*)ray_sys_alloc((size_t)n_miss * sizeof(int64_t));
     b.uniq     = (int64_t*)ray_sys_alloc((size_t)n_miss * sizeof(int64_t));
     b.part_off = (int64_t*)ray_sys_alloc((size_t)(n_part + 1) * sizeof(int64_t));
     b.uniq_n   = (int64_t*)ray_sys_alloc((size_t)n_part * sizeof(int64_t));
     b.bytes_p  = (int64_t*)ray_sys_alloc((size_t)n_part * sizeof(int64_t));
-    b.pos_base = (int64_t*)ray_sys_alloc((size_t)n_part * sizeof(int64_t));
     b.region   = (void**)ray_sys_alloc((size_t)n_part * sizeof(void*));
-    bool ok = b.miss && b.uniq && b.part_off && b.uniq_n && b.bytes_p && b.pos_base && b.region;
+    bool ok = b.miss && b.uniq && b.part_off && b.uniq_n && b.bytes_p && b.region;
     if (ok) {
         memset(b.part_off, 0, (size_t)(n_part + 1) * sizeof(int64_t));
         for (int64_t i = 0; i < n; i++)
@@ -1204,6 +1220,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     }
 
     dom_lock();
+    dom->batch_inflight--;   /* no probe outside the lock past this point */
     bool unchanged = ok && dom->buckets == b.buckets &&
                      atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count &&
                      !atomic_load_explicit(&b.unsure, memory_order_relaxed);
@@ -1233,10 +1250,12 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
             /* One arena region per partition; positions in partition order.
              * Nothing is published until every partition has built its
              * atoms, so a failed reservation costs only arena space. */
+            /* New strings take positions in batch order (first occurrence),
+             * so the symfile does not depend on how the batch was split. */
             int64_t pos = base;
+            for (int64_t i = 0; i < n; i++)
+                if (out_pos[i] == -1) out_pos[i] = pos++;
             for (int p = 0; p < n_part; p++) {
-                b.pos_base[p] = pos;
-                pos += b.uniq_n[p];
                 b.region[p] = NULL;
                 if (b.bytes_p[p] > 0) {
                     b.region[p] = ray_arena_alloc_raw(dom->arena, (size_t)b.bytes_p[p]);
@@ -1260,7 +1279,10 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                     atomic_store_explicit(&dom->runtime_lut, NULL, memory_order_release);
                 }
             } else {
-                for (int64_t i = 0; i < n; i++) if (out_pos[i] < -1) out_pos[i] = -1;
+                /* Nothing published: undo the assigned positions and the
+                 * repeat marks; the serial path resolves them again. */
+                for (int64_t i = 0; i < n; i++)
+                    if (out_pos[i] < -1 || out_pos[i] >= base) out_pos[i] = -1;
             }
         }
     } else {
@@ -1275,7 +1297,6 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     ray_sys_free(b.part_off);
     ray_sys_free(b.uniq_n);
     ray_sys_free(b.bytes_p);
-    ray_sys_free(b.pos_base);
     ray_sys_free(b.region);
     return ok;
 }

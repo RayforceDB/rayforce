@@ -1099,8 +1099,9 @@ ray_t* ray_index_inline_map(uint8_t* region) {
  *      rows (block popcounts + one prefix) — exactly the order the
  *      serial walk assigns;
  *   D  per partition: keys and counts into the group's slots;
- *   E  per partition: row scatter (of[] as cursor), key table entries
- *      claimed with CAS on the empty slot.
+ *   E  per partition: row scatter (of[] as cursor); then the key table,
+ *      filled in group order on the calling thread so its bytes match the
+ *      serial build.
  *
  * Every array a pass writes at random is faulted in beforehand from all
  * workers in slices: a fresh mapping faulted at random from every worker
@@ -1244,23 +1245,11 @@ static void hp_pass_e(void* raw, uint32_t wid, int64_t start, int64_t end) {
     int64_t p = start;
     int64_t lo = h->part_off[p], hi = h->part_off[p + 1];
     const int64_t* gmap = h->gcount + lo;
-    int64_t ng = h->ng_p[p];
     /* rows of a partition are ascending -> ascending inside each group;
      * of[] doubles as the fill cursor (the caller shifts it back); the
      * partition's groups are nobody else's, so the cursors are private */
     for (int64_t j = lo; j < hi; j++)
         h->rw[h->of[gmap[h->lg[j]]]++] = h->pr[j];
-    for (int64_t g = 0; g < ng; g++) {
-        int64_t G = gmap[g];
-        uint64_t slot = mix64((uint64_t)h->gk[G]) & h->tmask;
-        for (;;) {
-            int64_t cur = 0;
-            if (atomic_compare_exchange_strong_explicit((_Atomic(int64_t)*)&h->tbl[slot],
-                    &cur, G + 1, memory_order_relaxed, memory_order_relaxed))
-                break;
-            slot = (slot + 1) & h->tmask;
-        }
-    }
 }
 
 /* Zero (and so fault in) up to 8 fresh regions in parallel slices: each
@@ -1389,6 +1378,13 @@ static bool hash_build_par(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
     ray_pool_dispatch_n(pool, hp_pass_e, &h, (uint32_t)h.n_part);
     for (int64_t g = n_groups; g > 0; g--) h.of[g] = h.of[g - 1];
     h.of[0] = 0;
+    /* Key table filled in group order, exactly as the serial build does:
+     * the persisted index is then the same bytes whatever the core count. */
+    for (int64_t g = 0; g < n_groups; g++) {
+        uint64_t slot = mix64((uint64_t)h.gk[g]) & h.tmask;
+        while (h.tbl[slot] != 0) slot = (slot + 1) & h.tmask;
+        h.tbl[slot] = g + 1;
+    }
     if (ray_interrupted()) { ok = false; goto done; }
 
     *gkeys_out = gkeys; *offs_out = offs; *rows_out = rows; *table_out = table;

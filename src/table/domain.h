@@ -167,10 +167,8 @@ int64_t ray_sym_domain_intern(ray_sym_domain_t* dom, const char* str, size_t len
 /* Batch find-or-append of n strings (hashes[i] = (uint32_t)ray_hash_bytes
  * of strs[i]); out_pos[i] receives the position.  Repeats inside the
  * batch resolve to one position.  FILE: the lookup of the existing
- * vocabulary runs in parallel on the pool and the new strings are
- * appended grouped by hash partition — the positions new strings get is
- * not a contract (it varies with the worker count), only that each
- * distinct string gets one.  RUNTIME: one ray_sym_intern per entry.
+ * vocabulary runs in parallel on the pool; new strings are appended in
+ * batch order (a string's first occurrence), whatever the worker count.  RUNTIME: one ray_sym_intern per entry.
  * Returns false on OOM (out_pos then holds -1 for the entries not
  * resolved). */
 bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
