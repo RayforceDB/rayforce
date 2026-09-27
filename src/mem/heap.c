@@ -40,6 +40,7 @@
 #include "store/hnsw.h"
 #include "store/csr.h"
 #include "store/part.h"
+#include "ops/datalog.h"
 #include "ops/idxop.h"
 #include <string.h>
 #include <stdlib.h>     /* getenv */
@@ -964,6 +965,15 @@ static void ray_release_owned_refs(ray_t* v) {
             if (rel) ray_rel_free(rel);
             v->i64 = 0;
             v->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
+            return;
+        }
+        /* I64 atom tagged as a Datalog program owns the program block.  The
+         * explicit dl-free path clears this tag first, so scope cleanup is
+         * safe and does not double-free an already released handle. */
+        if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_DLPROG)) {
+            dl_program_free((dl_program_t*)(uintptr_t)v->i64);
+            v->i64 = 0;
+            v->attrs &= (uint8_t)~RAY_ATTR_DLPROG;
             return;
         }
         if (ray_atom_owns_obj(v) && v->obj && !RAY_IS_ERR(v->obj))
