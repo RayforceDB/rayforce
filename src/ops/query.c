@@ -7526,6 +7526,11 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
     bool   computed_single_key = false;   /* by: is one expression, compiled or const */
+    /* Sort keys that are source columns but not outputs of the projection:
+     * carried through the projection so the sort can read them, dropped
+     * from the result after it ran. */
+    int64_t hidden_sort_cols[16];
+    int     n_hidden_sort = 0;
     ray_t* deferred_bydict = NULL;
     int64_t deferred_nk = 0;
     int64_t dep_key_base_sym = -1;
@@ -11417,7 +11422,7 @@ by_dict_done:
              * former fixed col_ops[16] silently routed >16 outputs to the
              * eval fallback via the width check below; now only the other
              * use_eval_fallback trigger (a failed compile) applies. */
-            int64_t nc_max = select_output_count(dict_elems, dict_n);
+            int64_t nc_max = select_output_count(dict_elems, dict_n) + 16;
             if (nc_max < 1) nc_max = 1;
             ray_t* colops_hdr = NULL;
             ray_op_t** col_ops = (ray_op_t**)scratch_alloc(&colops_hdr,
@@ -11458,6 +11463,33 @@ by_dict_done:
             g->sel_alias_syms = NULL;
             g->sel_alias_ids  = NULL;
             g->sel_alias_n    = 0;
+            /* A sort key naming a source column that no output carries is
+             * projected too (the sort runs over the projection), and dropped
+             * from the result afterwards. */
+            if (!use_eval_fallback && has_sort) {
+                for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                    int64_t kid = dict_elems[i]->i64;
+                    if (kid != asc_id && kid != desc_id) continue;
+                    ray_t* val = dict_elems[i + 1];
+                    int64_t nk = val->type == -RAY_SYM ? 1
+                               : (ray_is_vec(val) && val->type == RAY_SYM) ? val->len : 0;
+                    for (int64_t k = 0; k < nk; k++) {
+                        int64_t ks = val->type == -RAY_SYM ? val->i64 : sym_cell_runtime_id(val, k);
+                        bool have = false;
+                        for (int64_t c = 0; c < nc; c++) if (alias_syms[c] == ks) have = true;
+                        for (int h = 0; h < n_hidden_sort; h++) if (hidden_sort_cols[h] == ks) have = true;
+                        if (have || !ray_table_get_col(tbl, ks) || n_hidden_sort >= 16) continue;
+                        ray_t* nm = ray_sym_str(ks);
+                        ray_op_t* sc = nm ? ray_scan(g, ray_str_ptr(nm)) : NULL;
+                        if (!sc) continue;
+                        col_ops[nc] = sc;
+                        alias_syms[nc] = ks;
+                        alias_ids[nc] = sc->id;
+                        nc++;
+                        hidden_sort_cols[n_hidden_sort++] = ks;
+                    }
+                }
+            }
             if (use_eval_fallback) {
                 if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
                 /* The fallback evaluates projections directly over `tbl`,
@@ -11721,6 +11753,21 @@ by_dict_done:
     /* Optimize and execute */
     root = ray_optimize(g, root);
     ray_t* result = ray_execute(g, root);
+    if (n_hidden_sort > 0 && result && !RAY_IS_ERR(result)) {
+        if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
+        if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
+            int64_t rc = ray_table_ncols(result);
+            ray_t* kept = ray_table_new(rc);
+            for (int64_t c = 0; kept && !RAY_IS_ERR(kept) && c < rc; c++) {
+                int64_t nm = ray_table_col_name(result, c);
+                bool hide = false;
+                for (int h = 0; h < n_hidden_sort; h++) if (hidden_sort_cols[h] == nm) hide = true;
+                if (!hide) kept = ray_table_add_col(kept, nm, ray_table_get_col_idx(result, c));
+            }
+            if (kept && !RAY_IS_ERR(kept)) { ray_release(result); result = kept; }
+            else if (kept) ray_release(kept);
+        }
+    }
     /* A computed key takes its column name from its op's ext sym, which is
      * not a name (a const node's slot holds the literal; an expression node's
      * ext resolves to whatever shares its id) — name it the way the
