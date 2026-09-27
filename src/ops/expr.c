@@ -1863,8 +1863,9 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
 
     /* Per-worker scratch buffers (heap-allocated via arena, morsel-sized) */
     ray_t* scratch_hdr = NULL;
+    /* one morsel buffer per register the expression uses */
     char* scratch_mem = (char*)scratch_alloc(&scratch_hdr,
-                            (size_t)EXPR_MAX_REGS * EXPR_MORSEL * 8);
+                            (size_t)(expr->n_regs ? expr->n_regs : 1) * EXPR_MORSEL * 8);
     if (!scratch_mem) return;
     void* scratch[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++)

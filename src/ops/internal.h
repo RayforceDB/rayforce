@@ -809,8 +809,8 @@ extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
-#define EXPR_MAX_REGS 16
-#define EXPR_MAX_INS  48
+#define EXPR_MAX_REGS 32
+#define EXPR_MAX_INS  96
 #define EXPR_MORSEL   RAY_MORSEL_ELEMS
 
 typedef struct {
