@@ -109,26 +109,54 @@ ray_t* ray_arena_alloc(ray_arena_t* arena, size_t nbytes) {
     return v;
 }
 
-ray_t* ray_arena_str(ray_arena_t* arena, const char* s, size_t len) {
+size_t ray_arena_str_bytes(size_t len) {
+    if (len < 7) return 32;
+    /* [U8 header (32) | data (len+1) | pad to 32 | STR header (32)] */
+    return (((32 + len + 1) + 31) & ~(size_t)31) + 32;
+}
+
+void* ray_arena_alloc_raw(ray_arena_t* arena, size_t nbytes) {
+    if (!arena) return NULL;
+    if (nbytes > SIZE_MAX - (ARENA_ALIGN - 1)) return NULL;
+    size_t block_size = ARENA_ALIGN_UP(nbytes);
+    ray_arena_chunk_t* c = arena->chunks;
+    if (c->used + block_size > c->cap) {
+        size_t new_cap = arena->chunk_size;
+        if (block_size > new_cap) new_cap = ARENA_ALIGN_UP(block_size);
+        ray_arena_chunk_t* nc = arena_new_chunk(new_cap);
+        if (!nc) return NULL;
+        nc->next = arena->chunks;
+        arena->chunks = nc;
+        c = nc;
+    }
+    void* p = chunk_data(c) + c->used;
+    c->used += block_size;
+    return p;
+}
+
+ray_t* ray_arena_str_at(void* at, const char* s, size_t len) {
     if (len < 7) {
-        /* SSO: bytes inline in the header (ray_arena_alloc zeroes it and sets
-         * RAY_ATTR_ARENA + rc=1). */
-        ray_t* v = ray_arena_alloc(arena, 0);
-        if (!v) return NULL;
+        /* SSO: bytes inline in the header. */
+        ray_t* v = (ray_t*)at;
+        memset(v, 0, 32);
+        v->attrs = RAY_ATTR_ARENA;
+        ray_atomic_store(&v->rc, 1);
         v->type = -RAY_STR;
         v->slen = (uint8_t)len;
         if (len > 0) memcpy(v->sdata, s, len);
         v->sdata[len] = '\0';
         return v;
     }
-    /* Long string: fused single allocation for the U8 data vec + the STR atom.
+    /* Long string: fused single block for the U8 data vec + the STR atom.
      * Layout: [U8 ray_t header (32) | data (len+1) | pad to 32 | STR header (32)].
-     * One arena_alloc instead of two.  32-byte arena alignment keeps the atom's
-     * obj pointer low byte out of is_sso()'s 1..7 SSO range. */
+     * 32-byte arena alignment keeps the atom's obj pointer low byte out of
+     * is_sso()'s 1..7 SSO range. */
     size_t data_size = len + 1;
     size_t chars_block = ((32 + data_size) + 31) & ~(size_t)31;  /* align up to 32 */
-    ray_t* chars = ray_arena_alloc(arena, chars_block);
-    if (!chars) return NULL;
+    ray_t* chars = (ray_t*)at;
+    memset(chars, 0, 32);
+    chars->attrs = RAY_ATTR_ARENA;
+    ray_atomic_store(&chars->rc, 1);
     chars->type = RAY_U8;
     chars->len  = (int64_t)len;
     memcpy(ray_data(chars), s, len);
@@ -141,6 +169,12 @@ ray_t* ray_arena_str(ray_arena_t* arena, const char* s, size_t len) {
     v->type  = -RAY_STR;
     v->obj   = chars;
     return v;
+}
+
+ray_t* ray_arena_str(ray_arena_t* arena, const char* s, size_t len) {
+    void* at = ray_arena_alloc_raw(arena, ray_arena_str_bytes(len));
+    if (!at) return NULL;
+    return ray_arena_str_at(at, s, len);
 }
 
 bool ray_arena_reserve(ray_arena_t* arena, size_t bytes) {
