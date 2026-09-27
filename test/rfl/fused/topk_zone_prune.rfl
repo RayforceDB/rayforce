@@ -3,7 +3,7 @@
 ;; runs in two long ascending blocks (like a table sorted by (counter,
 ;; time)), so most chunks are prunable; every answer must equal the same
 ;; query over an unindexed in-memory copy, for asc/desc, two keys, K near
-;; the number of matches, and a nullable key.
+;; the number of matches, and a nullable key (below).
 (.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
 (set n 600000)
 (set i (til n))
@@ -26,4 +26,19 @@
 (eqt (q4 T) (q4 Tm)) -- true
 (eqt (q5 T) (q5 Tm)) -- true
 (at (q1 T) 't) -- [1000007 1000007 1000014 1000014 1000028 1000028 1000035 1000035 1000049 1000049]
+;; a nullable key: one chunk entirely null and every 1000th row null —
+;; nulls sort first under asc (their chunks are never skipped) and last
+;; under desc
+(.sys.exec "rm -rf rf_test_zprune_n") -- 0
+(set kn (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N (+ 5 (% j 300000)))) i)))
+(.db.splayed.set "rf_test_zprune_n/" (table [kn v] (list kn v)))
+(set TN (.db.splayed.get "rf_test_zprune_n/"))
+(set TNm (table [kn v] (list kn v)))
+(set qn1 (fn [x] (select {kn: kn v: v from: x where: (> v 100) asc: kn take: 20})))
+(set qn2 (fn [x] (select {kn: kn v: v from: x where: (> v 100) desc: kn take: 20})))
+(set qn3 (fn [x] (select {kn: kn v: v from: x where: (== v 7) asc: [kn v] take: 5})))
+(eqt (qn1 TN) (qn1 TNm)) -- true
+(eqt (qn2 TN) (qn2 TNm)) -- true
+(eqt (qn3 TN) (qn3 TNm)) -- true
+(.sys.exec "rm -rf rf_test_zprune_n") -- 0
 (.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
