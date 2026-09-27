@@ -141,7 +141,9 @@ typedef struct {
     uint8_t        zlog2;
     uint8_t        zdesc;
     uint8_t        znulls_better;   /* nulls sort ahead of values */
-    _Atomic(int64_t) bound;
+    /* written by every worker with a full heap: own cache line, away from
+     * the read-only zone pointers above */
+    _Alignas(64) _Atomic(int64_t) bound;
     _Atomic(uint8_t) bound_set;
 } fpk_par_ctx_t;
 
@@ -352,15 +354,17 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
             int64_t src_row = row + r;
             if (hn < k) {
                 hidx[hn++] = src_row;
-                if (hn == k) { fpk_heapify(c, hidx, k); fpk_publish_bound(c, hidx[0]); }
+                if (hn == k) fpk_heapify(c, hidx, k);
             } else {
                 /* Reject fast: skip if new ≥ current worst (heap root). */
                 if (fpk_cmp(c, src_row, hidx[0]) >= 0) continue;
                 hidx[0] = src_row;
                 fpk_sift_down(c, hidx, k, 0);
-                fpk_publish_bound(c, hidx[0]);
             }
         }
+        /* Once per morsel: publishing on every heap replacement contends
+         * on the bound when the rows arrive in the order being sought. */
+        if (hn == k) fpk_publish_bound(c, hidx[0]);
         row = mend;
     }
     c->heap_n[worker_id] = hn;
