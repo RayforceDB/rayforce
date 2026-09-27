@@ -14,7 +14,7 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 | [`.log.open`](#log-open) | variadic | restricted | Open a journal in async or sync mode. |
 | [`.log.write`](#log-write) | unary | — | Append a serialised expression to the open journal. |
 | [`.log.sync`](#log-sync) | variadic | — | `fsync` the journal. |
-| [`.log.snapshot`](#log-snapshot) | variadic | restricted | Write a snapshot of current state and roll to a fresh segment. |
+| [`.log.snapshot`](#log-snapshot) | nullary | restricted | Write a snapshot of current state and roll to a fresh segment. |
 | [`.log.roll`](#log-roll) | nullary | restricted | Close the active segment and start a new one. |
 | [`.log.replay`](#log-replay) | unary | restricted | Replay a journal file; return entry count. |
 | [`.log.validate`](#log-validate) | unary | — | Scan a journal file; return `(chunks valid_bytes)`. |

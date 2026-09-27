@@ -57,6 +57,7 @@
 (.log.roll)      !- domain
 (.log.roll 1)    !- arity
 (.log.snapshot)  !- domain
+(.log.snapshot 1) !- arity
 (nil? (.log.sync))  -- true
 (nil? (.log.close)) -- true
 
