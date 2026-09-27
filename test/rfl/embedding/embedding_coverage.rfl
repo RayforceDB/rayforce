@@ -96,6 +96,9 @@
 ;; Existing hnsw.rfl only exercises 'l2.  Cover the other two metric
 ;; branches in parse_metric_sym + the cosine path in ray_hnsw_search.
 (set IdxCos (hnsw-build V 'cosine))
+;; HNSW handles are process-local and must not be serialized as plain i64s.
+(ser IdxCos) !- domain
+(ser (list IdxCos)) !- domain
 (at (hnsw-info IdxCos) 'metric) -- 'cosine
 (at (hnsw-info IdxCos) 'nrows)  -- 5
 (at (hnsw-info IdxCos) 'dim)    -- 3
