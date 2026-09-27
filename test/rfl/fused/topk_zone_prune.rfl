@@ -1,0 +1,29 @@
+;; Fused top-k over a stored column with a chunk-zone index skips chunks
+;; whose extremum cannot beat the current K-th key.  The time column here
+;; runs in two long ascending blocks (like a table sorted by (counter,
+;; time)), so most chunks are prunable; every answer must equal the same
+;; query over an unindexed in-memory copy, for asc/desc, two keys, K near
+;; the number of matches, and a nullable key.
+(.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
+(set n 600000)
+(set i (til n))
+(set t (+ 1000000 (* 7 (% i 300000))))
+(set s (as 'SYMBOL (map (fn [j] (if (== 0 (% j 3)) "" (format "p%" (% j 101)))) i)))
+(set v (% (* i 13) 1000))
+(.csv.write (table [t s v] (list t s v)) "rf_test_zprune.csv") -- 0
+(set T (.csv.splayed [t s v] [I64 SYM I64] "rf_test_zprune.csv" "rf_test_zprune/"))
+(set Tm (.csv.read [t s v] [I64 SYM I64] "rf_test_zprune.csv"))
+(at (.idx.info (at T 't)) 'kind) -- 'chunk_zone
+(set eqt (fn [a b] (all (map (fn [c] (all (== (as 'STR (at a c)) (as 'STR (at b c))))) (cols a)))))
+(set q1 (fn [x] (select {s: s t: t v: v from: x where: (!= s "") asc: t take: 10})))
+(set q2 (fn [x] (select {s: s t: t from: x where: (!= s "") asc: [t s] take: 10})))
+(set q3 (fn [x] (select {v: v t: t from: x where: (> v 500) desc: t take: 7})))
+(set q4 (fn [x] (select {v: v t: t from: x where: (> v 990) asc: t take: 50})))
+(set q5 (fn [x] (select {v: v t: t from: x where: (== v 3) asc: t take: 700})))
+(eqt (q1 T) (q1 Tm)) -- true
+(eqt (q2 T) (q2 Tm)) -- true
+(eqt (q3 T) (q3 Tm)) -- true
+(eqt (q4 T) (q4 Tm)) -- true
+(eqt (q5 T) (q5 Tm)) -- true
+(at (q1 T) 't) -- [1000007 1000007 1000014 1000014 1000028 1000028 1000035 1000035 1000049 1000049]
+(.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
