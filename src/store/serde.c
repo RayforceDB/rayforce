@@ -94,6 +94,38 @@
 #define RAY_SERDE_LAMBDA_HAS_CLOSURE ((uint8_t)0x01)
 #define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK RAY_SERDE_LAMBDA_HAS_CLOSURE
 
+/* Process-local handles cannot be reconstructed from a wire frame.  Walk
+ * compound values before sizing a frame so a graph handle nested in a dict,
+ * list, table, or lambda is rejected instead of being silently demoted to a
+ * plain integer when its ownership attribute is stripped. */
+static bool serde_contains_attr(ray_t* obj, uint8_t attr) {
+    if (!obj || RAY_IS_ERR(obj) || RAY_IS_NULL(obj)) return false;
+    if (obj->type == -RAY_I64 && (obj->attrs & attr)) return true;
+    switch (obj->type) {
+    case RAY_LIST: {
+        ray_t** elems = (ray_t**)ray_data(obj);
+        for (int64_t i = 0; i < obj->len; i++)
+            if (serde_contains_attr(elems[i], attr)) return true;
+        return false;
+    }
+    case RAY_TABLE:
+    case RAY_DICT: {
+        ray_t** slots = (ray_t**)ray_data(obj);
+        return serde_contains_attr(slots[0], attr) ||
+               serde_contains_attr(slots[1], attr);
+    }
+    case RAY_LAMBDA: {
+        ray_t** slots = (ray_t**)ray_data(obj);
+        if (serde_contains_attr(slots[0], attr) ||
+            serde_contains_attr(slots[1], attr)) return true;
+        return LAMBDA_CLOSURE(obj) &&
+               serde_contains_attr(LAMBDA_CLOSURE(obj), attr);
+    }
+    default:
+        return false;
+    }
+}
+
 /* Helper: strlen with bounds */
 static size_t safe_strlen(const uint8_t* buf, int64_t max) {
     for (int64_t i = 0; i < max; i++)
@@ -1182,6 +1214,12 @@ ray_t* ray_ser(ray_t* obj) {
         obj = ray_lazy_materialize(obj); /* consumes the retain */
         if (RAY_IS_ERR(obj)) return obj;
         owned = true;
+    }
+
+    if (serde_contains_attr(obj, RAY_ATTR_GRAPH)) {
+        ray_t* e = ray_error("domain", "serialize: graph handles are process-local");
+        if (owned) ray_release(obj);
+        return e;
     }
 
     int64_t payload = ray_serde_size(obj);
