@@ -1604,6 +1604,9 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
 /* ── pivot_exec.c ── */
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op);
 
+/* Is a descriptor view worth rebuilding over its own bytes (string.c)? */
+bool ray_str_view_should_compact(uint64_t pooled_bytes, int64_t pool_len);
+
 /* Shared-node memo around a sub-evaluation over a swapped g->table
  * (exec.c): push sets the outer memo aside and arms one for the current
  * table and sub-root; pop tears it down and restores the outer one. */

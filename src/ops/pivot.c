@@ -510,9 +510,10 @@ static ray_t* if_scatter_str(ray_t* result, ray_t* value, int64_t* ids,
  * STR vector with one row per id (or as many rows as the table, indexed by
  * the id), or a broadcast scalar.  The result takes the side's 16-byte
  * descriptor at ids[j] instead of appending its bytes row by row: pooled
- * strings keep pointing into their pool, two different pools are laid end
- * to end (the second side's offsets shift), a pooled scalar's bytes go in
- * once.  Rows not in either id list stay the null descriptor the caller
+ * strings keep pointing into their pool when the rows keep most of it;
+ * otherwise (two different pools, a pooled scalar, or a small share of a
+ * big pool) the result gets a pool of exactly its own bytes.  Rows not in
+ * either id list stay the null descriptor the caller
  * zeroed.  Returns NULL, the result untouched, for a side this cannot take
  * (a SYM branch, a length that is neither) — the caller then falls back to
  * the per-row scatter, which also reports the length error. */
@@ -523,6 +524,7 @@ typedef struct {
     bool             scalar;
     bool             full;     /* vector of nrows: row ids[j] */
     const ray_str_t* desc;
+    const char*      bytes;    /* its pool's bytes (NULL when inline-only) */
     ray_t*           pool;
     const char*      sp;       /* scalar bytes */
     size_t           sl;
@@ -548,11 +550,36 @@ static bool if_str_side_init(ray_t* v, int64_t* ids, int64_t n, int64_t nrows,
     if (v->len == n) s->full = false;
     else if (v->len == nrows) s->full = true;
     else return false;
-    const char* bytes = NULL;
-    str_resolve(v, &s->desc, &bytes);
+    str_resolve(v, &s->desc, &s->bytes);
     s->pool = str_vec_pool_obj(v);
     if (s->pool && RAY_IS_ERR(s->pool)) return false;
     return true;
+}
+
+/* The side's descriptor for its j-th id. */
+static inline ray_str_t if_str_side_desc(const if_str_side_t* s, int64_t j) {
+    return s->full ? s->desc[s->ids[j]] : s->desc[j];
+}
+
+/* Bytes the side's pooled descriptors point at. */
+static uint64_t if_str_side_pooled_bytes(const if_str_side_t* s) {
+    if (!s->v || s->scalar) return 0;
+    uint64_t sum = 0;
+    for (int64_t j = 0; j < s->n; j++) {
+        ray_str_t d = if_str_side_desc(s, j);
+        if (!ray_str_is_inline(&d)) sum += d.len;
+    }
+    return sum;
+}
+
+/* Assign compact offsets to the side's pooled descriptors from *run. */
+static void if_str_side_offsets(const if_str_side_t* s, uint32_t* newoff, uint64_t* run) {
+    for (int64_t j = 0; j < s->n; j++) {
+        ray_str_t d = if_str_side_desc(s, j);
+        if (ray_str_is_inline(&d)) continue;
+        newoff[j] = (uint32_t)*run;
+        *run += d.len;
+    }
 }
 
 typedef struct {
@@ -561,8 +588,11 @@ typedef struct {
     bool             scalar;
     bool             full;
     ray_str_t        sd;       /* the scalar's descriptor */
-    uint32_t         shift;
     ray_str_t*       dst;
+    /* compaction: pooled bytes move to dst_bytes at newoff[j] */
+    const uint32_t*  newoff;
+    const char*      src_bytes;
+    char*            dst_bytes;
 } if_str_scatter_ctx_t;
 
 static void if_str_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -574,17 +604,20 @@ static void if_str_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t e
     }
     for (int64_t j = start; j < end; j++) {
         ray_str_t d = c->full ? c->src[c->ids[j]] : c->src[j];
-        if (c->shift && !ray_str_is_inline(&d)) d.pool_off += c->shift;
+        if (c->newoff && !ray_str_is_inline(&d)) {
+            memcpy(c->dst_bytes + c->newoff[j], c->src_bytes + d.pool_off, d.len);
+            d.pool_off = c->newoff[j];
+        }
         c->dst[c->ids[j]] = d;
     }
 }
 
-static void if_str_scatter_side(const if_str_side_t* s, uint32_t shift, uint32_t scalar_off,
-                                ray_str_t* dst) {
+static void if_str_scatter_side(const if_str_side_t* s, const uint32_t* newoff, char* dst_bytes,
+                                uint32_t scalar_off, ray_str_t* dst) {
     if (!s->v) return;
     if_str_scatter_ctx_t c = {
         .ids = s->ids, .src = s->desc, .scalar = s->scalar, .full = s->full,
-        .shift = shift, .dst = dst,
+        .dst = dst, .newoff = newoff, .src_bytes = s->bytes, .dst_bytes = dst_bytes,
     };
     if (s->scalar) {
         memset(&c.sd, 0, sizeof(c.sd));
@@ -615,32 +648,47 @@ static ray_t* if_scatter_str_desc(ray_t* result,
     ray_t* pe = (e.v && !e.scalar) ? e.pool : NULL;
     bool t_big = t.v && t.scalar && t.sl > RAY_STR_INLINE_MAX;
     bool e_big = e.v && e.scalar && e.sl > RAY_STR_INLINE_MAX;
-    uint32_t e_shift = 0, ts_off = 0, es_off = 0;
-    if (!t_big && !e_big && (pt == pe || !pt || !pe)) {
-        ray_t* shared = pt ? pt : pe;
-        if (shared) { ray_retain(shared); result->str_pool = shared; }
-    } else {
-        int64_t tl = pt ? pt->len : 0;
-        int64_t el = (pe && pe != pt) ? pe->len : 0;
-        if (tl < 0 || el < 0) return NULL;
-        uint64_t total = (uint64_t)tl + (uint64_t)el
-                       + (t_big ? (uint64_t)t.sl : 0) + (e_big ? (uint64_t)e.sl : 0);
-        if (total > UINT32_MAX) return NULL;
-        ray_t* np = ray_alloc(total > 0 ? (size_t)total : 1);
-        if (!np || RAY_IS_ERR(np)) return NULL;
-        np->type = RAY_U8;
-        np->len  = (int64_t)total;
-        char* dst = (char*)ray_data(np);
-        uint32_t off = 0;
-        if (tl) { memcpy(dst, ray_data(pt), (size_t)tl); off += (uint32_t)tl; }
-        if (pe && pe != pt && el) { memcpy(dst + off, ray_data(pe), (size_t)el); e_shift = off; off += (uint32_t)el; }
-        if (t_big) { memcpy(dst + off, t.sp, t.sl); ts_off = off; off += (uint32_t)t.sl; }
-        if (e_big) { memcpy(dst + off, e.sp, e.sl); es_off = off; off += (uint32_t)e.sl; }
-        result->str_pool = np;
-    }
+    uint64_t t_ref = if_str_side_pooled_bytes(&t);
+    uint64_t e_ref = if_str_side_pooled_bytes(&e);
     ray_str_t* dst = (ray_str_t*)ray_data(result);
-    if_str_scatter_side(&t, 0, ts_off, dst);
-    if_str_scatter_side(&e, e_shift, es_off, dst);
+
+    /* One pool (or none) behind both sides, and the rows keep most of it:
+     * point into it as is. */
+    bool one_pool = (pt == pe) || !pt || !pe;
+    ray_t* shared = pt ? pt : pe;
+    if (!t_big && !e_big && one_pool &&
+        (!shared || !ray_str_view_should_compact(t_ref + e_ref, shared->len))) {
+        if (shared) { ray_retain(shared); result->str_pool = shared; }
+        if_str_scatter_side(&t, NULL, NULL, 0, dst);
+        if_str_scatter_side(&e, NULL, NULL, 0, dst);
+        return result;
+    }
+
+    /* Otherwise a pool of exactly the bytes the result points at: the two
+     * sides' pooled rows one after the other, then the pooled scalars. */
+    uint64_t total = t_ref + e_ref + (t_big ? (uint64_t)t.sl : 0) + (e_big ? (uint64_t)e.sl : 0);
+    if (total > UINT32_MAX) return NULL;
+    int64_t n_off = (t.v && !t.scalar ? t.n : 0) + (e.v && !e.scalar ? e.n : 0);
+    ray_t* off_hdr = NULL;
+    uint32_t* newoff = (uint32_t*)scratch_alloc(&off_hdr, (size_t)(n_off > 0 ? n_off : 1) * sizeof(uint32_t));
+    if (!newoff) return NULL;
+    uint32_t* t_off = (t.v && !t.scalar) ? newoff : NULL;
+    uint32_t* e_off = (e.v && !e.scalar) ? newoff + (t.v && !t.scalar ? t.n : 0) : NULL;
+    uint64_t run = 0;
+    if (t_off) if_str_side_offsets(&t, t_off, &run);
+    if (e_off) if_str_side_offsets(&e, e_off, &run);
+    uint32_t ts_off = 0, es_off = 0;
+    ray_t* np = ray_alloc(total > 0 ? (size_t)total : 1);
+    if (!np || RAY_IS_ERR(np)) { scratch_free(off_hdr); return NULL; }
+    np->type = RAY_U8;
+    np->len  = (int64_t)total;
+    char* dst_bytes = (char*)ray_data(np);
+    if (t_big) { memcpy(dst_bytes + run, t.sp, t.sl); ts_off = (uint32_t)run; run += t.sl; }
+    if (e_big) { memcpy(dst_bytes + run, e.sp, e.sl); es_off = (uint32_t)run; run += e.sl; }
+    result->str_pool = np;
+    if_str_scatter_side(&t, t_off, dst_bytes, ts_off, dst);
+    if_str_scatter_side(&e, e_off, dst_bytes, es_off, dst);
+    scratch_free(off_hdr);
     return result;
 }
 
@@ -1051,20 +1099,24 @@ typedef struct {
     const ray_str_t* t;
     const ray_str_t* e;
     ray_str_t*       dst;
-    uint32_t         e_shift;
+    /* two pools: the chosen row's pooled bytes move to dst_bytes at newoff[r] */
+    const uint32_t*  newoff;
+    const char*      t_bytes;
+    const char*      e_bytes;
+    char*            dst_bytes;
 } if_str_desc_ctx_t;
 
 static void if_str_desc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
     (void)worker_id;
     const if_str_desc_ctx_t* c = (const if_str_desc_ctx_t*)vctx;
     for (int64_t r = start; r < end; r++) {
-        if (c->cond[r]) {
-            c->dst[r] = c->t[r];
-        } else {
-            ray_str_t d = c->e[r];
-            if (c->e_shift && !ray_str_is_inline(&d)) d.pool_off += c->e_shift;
-            c->dst[r] = d;
+        ray_str_t d = c->cond[r] ? c->t[r] : c->e[r];
+        if (c->newoff && !ray_str_is_inline(&d)) {
+            const char* src = c->cond[r] ? c->t_bytes : c->e_bytes;
+            memcpy(c->dst_bytes + c->newoff[r], src + d.pool_off, d.len);
+            d.pool_off = c->newoff[r];
         }
+        c->dst[r] = d;
     }
 }
 
@@ -1137,8 +1189,8 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         /* Two STR vectors: the result is descriptors only.  Each row takes
          * its side's 16-byte descriptor; pooled strings keep pointing into
          * their pool.  One shared pool (or one side inline-only) is reused
-         * as is; two different pools are laid end to end in a new pool and
-         * the else side's offsets shift by the then pool's length.  Nulls
+         * as is; two different pools give a pool of exactly the chosen
+         * rows' bytes.  Nulls
          * are empty descriptors and travel unchanged.  No per-row append,
          * no rehash; the fill runs on the worker pool. */
         if (!then_scalar && !else_scalar &&
@@ -1153,7 +1205,8 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
             str_resolve(then_v, &t_desc, &t_bytes);
             str_resolve(else_v, &e_desc, &e_bytes);
             bool ok = true;
-            uint32_t e_shift = 0;
+            ray_t* off_hdr = NULL;
+            uint32_t* newoff = NULL;
             if (then_pool == else_pool || !then_pool || !else_pool) {
                 ray_t* out_pool = then_pool ? then_pool : else_pool;
                 if (out_pool && !RAY_IS_ERR(out_pool)) {
@@ -1163,33 +1216,43 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
             } else if (RAY_IS_ERR(then_pool) || RAY_IS_ERR(else_pool)) {
                 ok = false;
             } else {
-                int64_t tl = then_pool->len, el = else_pool->len;
-                if (tl < 0 || el < 0 || (uint64_t)tl + (uint64_t)el > UINT32_MAX) {
+                /* Two pools: a pool of exactly the chosen rows' bytes (a
+                 * serial pass assigns the offsets, the fill copies). */
+                newoff = (uint32_t*)scratch_alloc(&off_hdr, (size_t)(len > 0 ? len : 1) * sizeof(uint32_t));
+                if (!newoff) {
                     ok = false;
                 } else {
-                    ray_t* np = ray_alloc((size_t)(tl + el) > 0 ? (size_t)(tl + el) : 1);
+                    uint64_t run = 0;
+                    for (int64_t r = 0; r < len; r++) {
+                        const ray_str_t* d = cond_p[r] ? &t_desc[r] : &e_desc[r];
+                        if (ray_str_is_inline(d)) continue;
+                        newoff[r] = (uint32_t)run;
+                        run += d->len;
+                    }
+                    ray_t* np = (run <= UINT32_MAX) ? ray_alloc(run > 0 ? (size_t)run : 1) : NULL;
                     if (!np || RAY_IS_ERR(np)) {
                         ok = false;
                     } else {
                         np->type = RAY_U8;
-                        np->len  = tl + el;
-                        if (tl) memcpy(ray_data(np), t_bytes, (size_t)tl);
-                        if (el) memcpy((char*)ray_data(np) + tl, e_bytes, (size_t)el);
+                        np->len  = (int64_t)run;
                         result->str_pool = np;
-                        e_shift = (uint32_t)tl;
                     }
                 }
+                if (!ok && off_hdr) { scratch_free(off_hdr); off_hdr = NULL; newoff = NULL; }
             }
             if (ok) {
                 if_str_desc_ctx_t dctx = {
                     .cond = cond_p, .t = t_desc, .e = e_desc,
-                    .dst = (ray_str_t*)ray_data(result), .e_shift = e_shift,
+                    .dst = (ray_str_t*)ray_data(result),
+                    .newoff = newoff, .t_bytes = t_bytes, .e_bytes = e_bytes,
+                    .dst_bytes = result->str_pool ? (char*)ray_data(result->str_pool) : NULL,
                 };
                 ray_pool_t* pool = ray_pool_get();
                 if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD))
                     ray_pool_dispatch(pool, if_str_desc_fn, &dctx, len);
                 else
                     if_str_desc_fn(&dctx, 0, 0, len);
+                if (off_hdr) scratch_free(off_hdr);
                 if (ray_vec_may_have_nulls(then_v) || ray_vec_may_have_nulls(else_v))
                     result->attrs |= RAY_ATTR_HAS_NULLS;
                 ray_release(cond_v); ray_release(then_v); ray_release(else_v);
