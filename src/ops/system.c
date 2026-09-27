@@ -1330,7 +1330,8 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
  */
 ray_t* ray_prof_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.prof takes no arguments");
 
     /* Read the snapshot of the last completed query — NOT the in-flight
      * buffer, which currently holds this `(.sys.prof)` call's own spans.

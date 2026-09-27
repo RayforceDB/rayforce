@@ -13,7 +13,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.build`](#sys-build) | nullary | — | Version + build date as a dict. |
 | [`.sys.info`](#sys-info) | nullary | — | Host and process facts: cores, page size, total memory, pid, hostname. |
 | [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
-| [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
+| [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
 | [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
