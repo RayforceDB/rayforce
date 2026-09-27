@@ -7409,6 +7409,16 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                  * column.  The dict key is the alias the result publishes;
                  * the value names the source column to gather from. */
                 if (n_out_syms >= 255) { bad_clause = 1; break; }
+                /* Projections resolve left to right: a name bound by an
+                 * earlier output is that output's value, not the source
+                 * column.  The fused paths gather source columns, so such
+                 * a shape is left to the planner. */
+                if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
+                    bool alias_ref = false;
+                    for (uint8_t o = 0; o < n_out_syms; o++)
+                        if (out_aliases[o] == v->i64 && out_syms[o] != v->i64) alias_ref = true;
+                    if (alias_ref) { bad_clause = 1; break; }
+                }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
                     ray_t* oc = ray_table_get_col(tbl, v->i64);
                     if (!oc) { bad_clause = 1; break; }
