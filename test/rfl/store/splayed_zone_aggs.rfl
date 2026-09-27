@@ -2,13 +2,13 @@
 ;; metadata (per-chunk min/max, per-chunk sums and non-null counts): every
 ;; answer must equal the same query over an in-memory copy of the data,
 ;; nulls and types included.  Four chunks of 64k rows.
-(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv") -- 0
+(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0
 (set n 200000)
 (set i (til n))
 (set M (table [a16 a32 a64 big d f] (list (as 'I16 (% i 3000)) (as 'I32 (- (% (* i 7) 100000) 50000)) (- i 100000) (* (- i 100000) 92233720368547) (as 'DATE (% i 900)) (/ (as 'F64 i) 7.0))))
 (.csv.write M "rf_test_zone_aggs.csv") -- 0
 ;; blank the first field of every row whose a16 value ends in 0: nulls
-(.sys.exec "sed -i 's/^\\([0-9]*\\)0,/,/' rf_test_zone_aggs.csv") -- 0
+(.sys.exec "sed -i.bak 's/^\\([0-9]*\\)0,/,/' rf_test_zone_aggs.csv") -- 0
 (set T (.csv.splayed [a16 a32 a64 big d f] [I16 I32 I64 I64 DATE F64] "rf_test_zone_aggs.csv" "rf_test_zone_aggs/"))
 (set Tm (.csv.read [a16 a32 a64 big d f] [I16 I32 I64 I64 DATE F64] "rf_test_zone_aggs.csv"))
 (at (.idx.info (at T 'a16)) 'kind) -- 'chunk_zone
@@ -46,4 +46,4 @@
 (.sys.exec "rm -rf rf_test_zone_max") -- 0
 ;; an empty table keeps the planner's answers
 (at (select {from: (select {from: T where: (< a64 -1000000)}) c: (count a16)}) 'c) -- (at (select {from: (select {from: Tm where: (< a64 -1000000)}) c: (count a16)}) 'c)
-(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv") -- 0
+(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0
