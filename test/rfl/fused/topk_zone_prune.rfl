@@ -42,3 +42,27 @@
 (eqt (qn3 TN) (qn3 TNm)) -- true
 (.sys.exec "rm -rf rf_test_zprune_n") -- 0
 (.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
+;; best-chunk-first: the chunks are visited in the order of their zone
+;; extremum, so an `asc` over a descending column (its best chunk is the
+;; last one) and a key whose best chunk sits in the middle prune the rest
+;; whatever the physical order; answers equal the in-memory copy and the
+;; planner's full sort
+(.sys.exec "rm -rf rf_test_zprune_o") -- 0
+(set kd (- n i))
+(set km (abs (- i 300000)))
+(.db.splayed.set "rf_test_zprune_o/" (table [kd km v] (list kd km v)))
+(set TO (.db.splayed.get "rf_test_zprune_o/"))
+(set TOm (table [kd km v] (list kd km v)))
+(set qo1 (fn [x] (select {kd: kd v: v from: x asc: kd take: 8000})))
+(set qo2 (fn [x] (select {kd: kd v: v from: x where: (> v 500) asc: kd take: 100})))
+(set qo3 (fn [x] (select {km: km v: v from: x where: (< v 900) asc: km take: 300})))
+(set qo4 (fn [x] (select {km: km v: v from: x desc: km take: 5})))
+(set qo5 (fn [x] (select {km: km kd: kd from: x where: (== v 7) asc: [km kd] take: 40})))
+(eqt (qo1 TO) (qo1 TOm)) -- true
+(eqt (qo2 TO) (qo2 TOm)) -- true
+(eqt (qo3 TO) (qo3 TOm)) -- true
+(eqt (qo4 TO) (qo4 TOm)) -- true
+(eqt (qo5 TO) (qo5 TOm)) -- true
+(at (qo1 TO) 'kd) -- (+ 1 (til 8000))
+(at (qo4 TO) 'km) -- [300000 299999 299999 299998 299998]
+(.sys.exec "rm -rf rf_test_zprune_o") -- 0

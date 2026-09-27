@@ -141,6 +141,15 @@ typedef struct {
     uint8_t        zlog2;
     uint8_t        zdesc;
     uint8_t        znulls_better;   /* nulls sort ahead of values */
+    /* Best-chunk-first visiting order: zorder[v] is the chunk to scan in
+     * virtual slot v (chunks sorted by the extremum that matters for the
+     * direction, null chunks first when nulls sort ahead).  Workers are
+     * dispatched over the virtual row space zn << zlog2 and map each slot
+     * back to its chunk, so the K-th key tightens on the most promising
+     * chunks first and the rest are pruned — whatever the physical order
+     * of the data.  NULL when there is no zone index. */
+    const uint32_t* zorder;
+    int64_t        nrows;
     /* written by every worker with a full heap: own cache line, away from
      * the read-only zone pointers above */
     _Alignas(64) _Atomic(int64_t) bound;
@@ -183,6 +192,53 @@ static inline bool fpk_chunk_pruned(const fpk_par_ctx_t* c, int64_t g) {
     if (c->znulls_better && c->znull && (c->znull[g >> 3] & (1u << (g & 7)))) return false;
     int64_t b = atomic_load_explicit(&c->bound, memory_order_relaxed);
     return c->zdesc ? c->zmax[g] < b : c->zmin[g] > b;
+}
+
+/* Chunk `a` is more promising than chunk `b` for the first key's
+ * direction: null chunks lead when nulls sort ahead, then the smaller
+ * minimum (asc) or the larger maximum (desc); ties keep chunk order. */
+static inline bool fpk_chunk_better(const fpk_par_ctx_t* c, uint32_t a, uint32_t b) {
+    if (c->znulls_better && c->znull) {
+        bool na = (c->znull[a >> 3] >> (a & 7)) & 1;
+        bool nb = (c->znull[b >> 3] >> (b & 7)) & 1;
+        if (na != nb) return na;
+    }
+    int64_t ka = c->zdesc ? c->zmax[a] : c->zmin[a];
+    int64_t kb = c->zdesc ? c->zmax[b] : c->zmin[b];
+    if (ka != kb) return c->zdesc ? ka > kb : ka < kb;
+    return a < b;
+}
+
+/* Heap-sort the chunk ids in `ord` (initially 0..n-1) best first. */
+static void fpk_order_chunks(const fpk_par_ctx_t* c, uint32_t* ord, uint32_t n) {
+    /* max-heap on "worse": the root is the least promising chunk, so
+     * popping it to the tail leaves the best chunk at ord[0]. */
+    for (uint32_t i = n; i-- > 0;) {
+        /* sift ord[i] down */
+        uint32_t k = i;
+        for (;;) {
+            uint32_t l = 2 * k + 1, r = l + 1, w = k;
+            if (l < n && fpk_chunk_better(c, ord[w], ord[l])) w = l;
+            if (r < n && fpk_chunk_better(c, ord[w], ord[r])) w = r;
+            if (w == k) break;
+            uint32_t t = ord[k]; ord[k] = ord[w]; ord[w] = t;
+            k = w;
+        }
+        if (i == 0) break;
+    }
+    for (uint32_t end = n; end > 1;) {
+        end--;
+        uint32_t t = ord[0]; ord[0] = ord[end]; ord[end] = t;
+        uint32_t k = 0;
+        for (;;) {
+            uint32_t l = 2 * k + 1, r = l + 1, w = k;
+            if (l < end && fpk_chunk_better(c, ord[w], ord[l])) w = l;
+            if (r < end && fpk_chunk_better(c, ord[w], ord[r])) w = r;
+            if (w == k) break;
+            uint32_t u = ord[k]; ord[k] = ord[w]; ord[w] = u;
+            k = w;
+        }
+    }
 }
 
 /* Compare two source rows by the multi-key sort spec.  Returns
@@ -327,22 +383,12 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
         fpk_sift_down(c, heap, n, i);
 }
 
-/* Worker fn: scan rows [start, end), eval predicate per morsel, do
- * heap inserts for passing rows. */
-static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
-    fpk_par_ctx_t* c = (fpk_par_ctx_t*)raw;
-    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
-    int32_t  k    = (int32_t)c->k;
-    int64_t* hidx = &c->heap_idx[(size_t)worker_id * (size_t)k];
-    int32_t  hn   = c->heap_n[worker_id];
-
-    int64_t row = start;
+/* Scan physical rows [row, end): eval predicate per morsel, heap-insert
+ * the passing rows.  `*hnp` is the worker's heap fill on entry and exit. */
+static inline void fpk_scan_rows(fpk_par_ctx_t* c, int64_t* hidx, int32_t* hnp,
+                                 int32_t k, int64_t row, int64_t end) {
+    int32_t hn = *hnp;
     while (row < end) {
-        if (c->zmin && fpk_chunk_pruned(c, row >> c->zlog2)) {
-            int64_t next = ((row >> c->zlog2) + 1) << c->zlog2;
-            row = next < end ? next : end;
-            continue;
-        }
         int64_t mend = row + RAY_MORSEL_ELEMS;
         if (mend > end) mend = end;
         int64_t mlen = mend - row;
@@ -366,6 +412,38 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
          * on the bound when the rows arrive in the order being sought. */
         if (hn == k) fpk_publish_bound(c, hidx[0]);
         row = mend;
+    }
+    *hnp = hn;
+}
+
+/* Worker fn: [start, end) is a range of physical rows, or — with a zone
+ * order — of virtual rows whose chunk slots map to physical chunks. */
+static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    fpk_par_ctx_t* c = (fpk_par_ctx_t*)raw;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+    int32_t  k    = (int32_t)c->k;
+    int64_t* hidx = &c->heap_idx[(size_t)worker_id * (size_t)k];
+    int32_t  hn   = c->heap_n[worker_id];
+
+    if (!c->zmin) {
+        fpk_scan_rows(c, hidx, &hn, k, start, end);
+    } else {
+        int64_t span = (int64_t)1 << c->zlog2;
+        int64_t v = start;
+        while (v < end) {
+            int64_t slot = v >> c->zlog2;
+            int64_t sbeg = slot << c->zlog2;
+            int64_t send = sbeg + span;
+            if (send > end) send = end;
+            int64_t g = c->zorder ? (int64_t)c->zorder[slot] : slot;
+            if (!fpk_chunk_pruned(c, g)) {
+                int64_t p0 = (g << c->zlog2) + (v - sbeg);
+                int64_t p1 = (g << c->zlog2) + (send - sbeg);
+                if (p1 > c->nrows) p1 = c->nrows;
+                if (p0 < p1) fpk_scan_rows(c, hidx, &hn, k, p0, p1);
+            }
+            v = send;
+        }
     }
     c->heap_n[worker_id] = hn;
 }
@@ -442,6 +520,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ctx.n_keys = n_sort_keys;
     ctx.k      = k;
     ctx.tbl    = tbl;
+    ctx.nrows  = nrows;
     {
         ray_t* kc = ctx.keys[0].col;
         int8_t kt = ctx.keys[0].type;
@@ -458,6 +537,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                 ctx.zlog2 = zx->u.chunk_zone.chunk_log2;
                 ctx.zdesc = ctx.keys[0].desc;
                 ctx.znulls_better = ctx.keys[0].nulls_first;
+                if (((int64_t)ctx.zn << ctx.zlog2) < nrows)
+                    ctx.zmin = NULL; /* index shorter than the column: no pruning */
             }
         }
     }
@@ -502,8 +583,24 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         return NULL;
     }
 
-    if (pool) ray_pool_dispatch(pool, fpk_par_fn, &ctx, nrows);
-    else      fpk_par_fn(&ctx, 0, 0, nrows);
+    /* With a zone index the workers walk the chunks best-first over the
+     * virtual row space (the order is optional: without it the slots map
+     * to the physical chunks and pruning still applies). */
+    int64_t span_rows = nrows;
+    ray_t*  zord_hdr  = NULL;
+    if (ctx.zmin) {
+        span_rows = (int64_t)ctx.zn << ctx.zlog2;
+        uint32_t* ord = (uint32_t*)scratch_alloc(&zord_hdr,
+                                                 (size_t)ctx.zn * sizeof(uint32_t));
+        if (ord) {
+            for (uint32_t g = 0; g < ctx.zn; g++) ord[g] = g;
+            fpk_order_chunks(&ctx, ord, ctx.zn);
+            ctx.zorder = ord;
+        }
+    }
+    if (pool) ray_pool_dispatch(pool, fpk_par_fn, &ctx, span_rows);
+    else      fpk_par_fn(&ctx, 0, 0, span_rows);
+    if (zord_hdr) { scratch_free(zord_hdr); ctx.zorder = NULL; }
 
     if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
         scratch_free(idx_hdr); scratch_free(hn_hdr);
