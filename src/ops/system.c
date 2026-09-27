@@ -1267,7 +1267,8 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n) {
 
 /* (.sys.mem) -- return dict with memory allocator statistics */
 ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.mem takes no arguments");
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
