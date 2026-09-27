@@ -525,7 +525,7 @@ spills exactly as it did before.
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | variadic | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
-| `.sys.info` | variadic | System information (cores, page size, memory) | `(.sys.info)` |
+| `.sys.info` | nullary | System information (cores, page size, memory) | `(.sys.info)` |
 
 ## Serialization & Storage
 

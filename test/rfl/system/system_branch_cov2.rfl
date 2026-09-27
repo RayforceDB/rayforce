@@ -114,6 +114,7 @@
 ;; ray_sysinfo_fn (.sys.info)  (lines 730-762)
 ;; ══════════════════════════════════════════════════════════════════════
 (type (.sys.info)) -- 'DICT
+(.sys.info 1) !- arity
 (count (.sys.info)) -- 5
 (> (at (.sys.info) 'cores) 0) -- true
 (> (at (.sys.info) 'total-mem) 0) -- true

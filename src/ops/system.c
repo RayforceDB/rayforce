@@ -1524,7 +1524,8 @@ static bool ray_os_hostname(char* buf, size_t cap) {
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.info takes no arguments");
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(5);

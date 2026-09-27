@@ -86,7 +86,7 @@ tracing collector.
 
 ## 4. The `.sys.info` Function
 
-Call `(.sys.info 0)` to see system-level information about the Rayforce runtime:
+Call `(.sys.info)` to see system-level information about the Rayforce runtime:
 
 ```lisp
 (.sys.info)
