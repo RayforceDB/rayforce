@@ -533,6 +533,7 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
 static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
                                         int64_t from_id) {
     int64_t nrows = ray_table_nrows(tbl);
+    if (nrows <= 0) return NULL;   /* empty tables keep the planner's answers */
     int64_t n_out = 0;
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         if (dict_elems[i]->i64 == from_id) continue;
@@ -554,7 +555,8 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
         case OP_MIN: case OP_MAX: {
             if (ray_index_kind(col) != RAY_IDX_CHUNK_ZONE) return NULL;
             ray_index_t* ix = ray_index_payload(col->index);
-            if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64) return NULL;
+            if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64 ||
+                !ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs) return NULL;
             break;
         }
         case OP_SUM:

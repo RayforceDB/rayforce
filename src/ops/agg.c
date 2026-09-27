@@ -645,7 +645,7 @@ ray_t* ray_min_fn(ray_t* x) {
          * (mutation paths call ray_index_drop). */
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
-            if (ix->built_for_len == x->len) {
+            if (ix->built_for_len == x->len && ix->u.chunk_zone.mins) {
                 uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
                 if (ix->u.chunk_zone.is_f64) {
                     const double* mins = (const double*)ray_data(ix->u.chunk_zone.mins);
@@ -659,7 +659,12 @@ ray_t* ray_min_fn(ray_t* x) {
                     int64_t mn = INT64_MAX;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (mins[g] < mn) mn = mins[g];
-                    if (mn == INT64_MAX) return ray_typed_null(-x->type);
+                    /* All-null is what the non-null counts say when the
+                     * zone has them; the sentinel alone cannot tell a
+                     * column of INT64_MAX values from an empty one. */
+                    int64_t zs_, zn_;
+                    bool have_nn = ray_zone_int_sum(x, &zs_, &zn_, NULL);
+                    if (have_nn ? zn_ == 0 : mn == INT64_MAX) return ray_typed_null(-x->type);
                     /* Preserve the column's storage width on the result. */
                     switch (x->type) {
                     case RAY_BOOL:      return ray_bool((bool)mn);
@@ -700,7 +705,7 @@ ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
-            if (ix->built_for_len == x->len) {
+            if (ix->built_for_len == x->len && ix->u.chunk_zone.maxs) {
                 uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
                 if (ix->u.chunk_zone.is_f64) {
                     const double* maxs = (const double*)ray_data(ix->u.chunk_zone.maxs);
@@ -714,7 +719,12 @@ ray_t* ray_max_fn(ray_t* x) {
                     int64_t mx = INT64_MIN;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (maxs[g] > mx) mx = maxs[g];
-                    if (mx == INT64_MIN) return ray_typed_null(-x->type);
+                    /* All-null is what the non-null counts say when the
+                     * zone has them; the sentinel alone cannot tell a
+                     * column of INT64_MIN values from an empty one. */
+                    int64_t zs_, zn_;
+                    bool have_nn = ray_zone_int_sum(x, &zs_, &zn_, NULL);
+                    if (have_nn ? zn_ == 0 : mx == INT64_MIN) return ray_typed_null(-x->type);
                     switch (x->type) {
                     case RAY_BOOL:      return ray_bool((bool)mx);
                     case RAY_U8:        return ray_u8((uint8_t)mx);
