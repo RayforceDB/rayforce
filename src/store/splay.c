@@ -24,6 +24,7 @@
 #include "splay.h"
 #include "core/runtime.h"
 #include "core/pool.h"
+#include "mem/sys.h"
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/serde.h"
@@ -516,7 +517,10 @@ ray_t* ray_splay_load(const char* dir, const char* sym_path) {
 /* Index one column of a just-written splayed table (see
  * ray_splay_build_indexes).  Columns are independent — each reads and
  * appends to its own file — so the caller runs one task per column. */
-static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c) {
+/* deferred: when non-NULL and the column qualifies for a hash index, the
+ * computed zone is stored there instead of persisted and nothing is written;
+ * splay_persist_hash_or_zone finishes the column. */
+static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t** deferred) {
     {
         ray_t* col = ray_table_get_col_idx(tbl, c);
         if (!col || RAY_IS_ERR(col)) return;
@@ -600,6 +604,13 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c) {
         if (col->type != RAY_STR &&
             ray_csv_hash_upgrade_check(col->type, col->len,
                                        ray_index_payload(idx))) {
+            if (deferred) {
+                /* Inside a per-column task: the hash build has its own
+                 * parallel path that needs the pool, so hand the zone
+                 * back and let the caller build the hash afterwards. */
+                *deferred = idx;
+                return;
+            }
             ray_t* hi = ray_idx_hash_fn(col);
             if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
                 ray_release(idx);          /* zone sacrificed for the hash */
@@ -633,14 +644,43 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c) {
     }
 }
 
-typedef struct { const char* dir; ray_t* tbl; } splay_index_ctx_t;
+/* Persist a deferred column: its hash index when the build succeeded
+ * (hashed[c]), else the zone it was computed with (deferred[c]). */
+typedef struct { const char* dir; ray_t* tbl; ray_t** deferred; ray_t** hashed; } splay_index_ctx_t;
+
+static void splay_persist_deferred(splay_index_ctx_t* x, int64_t c) {
+    ray_t* col = ray_table_get_col_idx(x->tbl, c);
+    ray_t* nstr = ray_sym_str(ray_table_col_name(x->tbl, c));
+    char path[1100];
+    int n = (nstr && !RAY_IS_ERR(nstr))
+        ? snprintf(path, sizeof(path), "%s/%.*s", x->dir, (int)ray_str_len(nstr), ray_str_ptr(nstr))
+        : -1;
+    bool have_path = n > 0 && n < (int)sizeof(path);
+    ray_t* hi = x->hashed[c];
+    if (hi) {
+        if (have_path)
+            (void)ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
+        ray_release(hi);
+    } else if (have_path) {
+        (void)ray_col_append_index(path, ray_index_payload(x->deferred[c]), col->len, col->type);
+    }
+    ray_release(x->deferred[c]);
+    x->hashed[c] = NULL; x->deferred[c] = NULL;
+}
+
+static void splay_persist_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    splay_index_ctx_t* x = (splay_index_ctx_t*)raw;
+    if (x->deferred[start]) splay_persist_deferred(x, start);
+}
 static void splay_build_index_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
     splay_index_ctx_t* c = (splay_index_ctx_t*)raw;
-    splay_build_index_col(c->dir, c->tbl, start);
+    splay_build_index_col(c->dir, c->tbl, start, &c->deferred[start]);
 }
 
 void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
+
     if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0) return;
@@ -648,11 +688,31 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
      * scans of each column and used to run one after another on the
      * calling thread — the longest serial stretch of a CSV → splayed load. */
     ray_pool_t* pool = ray_pool_get();
-    splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl };
-    if (ray_pool_par_dispatch_ok(pool, nc, 2))
+    if (ray_pool_par_dispatch_ok(pool, nc, 2)) {
+        /* Zones / dictionaries per column in parallel; the columns that
+         * qualify for a hash index come back deferred and are built one
+         * after another on this thread, each hash build parallel inside. */
+        ray_t** deferred = (ray_t**)ray_sys_alloc((size_t)nc * 2 * sizeof(ray_t*));
+        if (!deferred) {
+            for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, NULL);
+            return;
+        }
+        memset(deferred, 0, (size_t)nc * 2 * sizeof(ray_t*));
+        splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .deferred = deferred, .hashed = deferred + nc };
         ray_pool_dispatch_n(pool, splay_build_index_task, &ctx, (uint32_t)nc);
-    else
-        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c);
+        /* Hash builds one after another (each parallel inside), then the
+         * writes of all deferred columns together. */
+        for (int64_t c = 0; c < nc; c++) {
+            if (!deferred[c]) continue;
+            ray_t* hi = ray_idx_hash_fn(ray_table_get_col_idx(tbl, c));
+            if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) ctx.hashed[c] = hi;
+            else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
+        }
+        ray_pool_dispatch_n(pool, splay_persist_task, &ctx, (uint32_t)nc);
+        ray_sys_free(deferred);
+    } else {
+        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, NULL);
+    }
 }
 
 ray_t* ray_read_splayed(const char* dir, const char* sym_path) {
