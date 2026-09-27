@@ -43,6 +43,7 @@
 ;; left a journal open would make our .log.open fail with "already open".
 ;; Close defensively first (no-op + RAY_OK if already closed).
 (nil? (.log.close)) -- true
+(.log.close 1) !- arity
 (.sys.exec "rm -f /tmp/rfl_ops_journal_wrap.log /tmp/rfl_ops_journal_wrap.qdb /tmp/rfl_ops_journal_wrap.qdb.tmp /tmp/rfl_ops_journal_wrap.*.log")
 
 ;; ════════════════════════════════════════════════════════════════════════
