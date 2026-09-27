@@ -7360,7 +7360,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
      * intermediate filtered table materialised.  Closes a large
      * latency gap on ORDER BY + LIMIT shapes that were previously
      * dominated by the filtered-table materialisation step. */
-    if (take_expr && has_sort && !by_expr && !nearest_expr) {
+    if (take_expr && (has_sort || where_expr) && !by_expr && !nearest_expr) {
         if (!where_expr || ray_fused_topk_supported(where_expr, tbl)) {
             /* Walk the dict and check: exactly one asc/desc clause naming
              * a single scalar column, take is an atom K, and every
@@ -7457,13 +7457,37 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     if (!kc) bad_clause = 1;
                 }
             }
-            if (!bad_clause && n_sort_keys > 0 && n_out_syms > 0) {
+            if (!bad_clause && n_out_syms > 0) {
                 ray_t* tv = ray_eval(take_expr);
                 if (tv && !RAY_IS_ERR(tv) && ray_is_atom(tv) &&
                     (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
                     int64_t k = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
                     ray_release(tv);
-                    if (k > 0 && k <= FPK_MAX_K && k < ray_table_nrows(tbl)) {
+                    /* Positional take under a filter, and an ascending
+                     * take on a column known to be sorted (no nulls): the
+                     * answer is the first |k| passing rows from one end of
+                     * the table, found without scanning the rest. */
+                    bool sorted_asc = false;
+                    if (n_sort_keys == 1 && !sort_descs[0]) {
+                        ray_t* kc = ray_table_get_col(tbl, sort_key_syms[0]);
+                        sorted_asc = kc && (kc->attrs & RAY_ATTR_SORTED) &&
+                                     !(kc->attrs & RAY_ATTR_SLICE) &&
+                                     !ray_vec_may_have_nulls(kc);
+                    }
+                    if (where_expr && (n_sort_keys == 0 || (sorted_asc && k > 0)) &&
+                        k != 0 && k != INT64_MIN &&
+                        (k < 0 ? -k : k) <= FPK_MAX_K &&
+                        (k < 0 ? -k : k) < ray_table_nrows(tbl)) {
+                        ray_t* res = ray_fused_take_select(tbl, where_expr, k,
+                                                           out_syms, out_aliases,
+                                                           n_out_syms);
+                        if (res && !RAY_IS_ERR(res)) {
+                            ray_release(tbl);
+                            DICT_VIEW_CLOSE(dv); return res;
+                        }
+                        if (res && RAY_IS_ERR(res)) ray_release(res);
+                    }
+                    if (n_sort_keys > 0 && k > 0 && k <= FPK_MAX_K && k < ray_table_nrows(tbl)) {
                         ray_t* res = ray_fused_topk_select(tbl, where_expr,
                                                            sort_key_syms,
                                                            sort_descs,

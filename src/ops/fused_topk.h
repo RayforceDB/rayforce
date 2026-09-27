@@ -72,6 +72,23 @@ int ray_fused_topk_supported(ray_t* where_expr, ray_t* tbl);
  *
  * Returns NULL on shape miss (errors during predicate compile etc.) so
  * the caller can fall back to the unfused FILTER + SORT_TAKE path. */
+/* Fused filter + positional take: `(select {cols… from: T where: <pred>
+ * take: K})` with no ordering, K > 0 (the first K rows that pass, in
+ * table order) or K < 0 (the last |K|).  The scan stops as soon as the
+ * answer is known: the table is walked in chunks from the near end, each
+ * worker keeps at most |K| row ids, and a worker that has |K| publishes
+ * the row beyond which nothing can still be part of the answer.  Also
+ * serves `asc: key take: K` when the key column carries RAY_ATTR_SORTED
+ * and no nulls (the first K passing rows are then the K smallest, ties in
+ * table order — what the stable sort returns).
+ * Returns NULL on a shape the path does not take (caller falls back). */
+ray_t* ray_fused_take_select(ray_t* tbl,
+                             ray_t* where_expr,
+                             int64_t k,
+                             const int64_t* out_col_syms,
+                             const int64_t* out_alias_syms,
+                             uint32_t n_out);
+
 ray_t* ray_fused_topk_select(ray_t* tbl,
                              ray_t* where_expr,
                              const int64_t* sort_key_syms,

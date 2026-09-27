@@ -49,6 +49,7 @@
 #include "core/pool.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 /* Use the same predicate-shape detector as fused_group.  Single comparison
  * or AND of comparisons against literals on flat int/temporal/SYM columns. */
@@ -474,6 +475,212 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ray_t* src = ray_table_get_col(tbl, cs);
         if (!src) { build_ok = 0; break; }
         ray_t* col = gather_by_idx(src, global_idx, global_n);
+        if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
+        result = ray_table_add_col(result, alias, col);
+        ray_release(col);
+    }
+    ray_graph_free(g);
+    fp_pred_cleanup(&ctx.pred);
+    if (!build_ok) {
+        ray_release(result);
+        return ray_error("schema", NULL);
+    }
+    return result;
+}
+
+/* ───── Fused filter + positional take ────────────────────────────────
+ * Chunks of FTK_CHUNK_ROWS rows, numbered from the end the answer comes
+ * from (row 0 for the first K, the last row for the last |K|), one pool
+ * task per chunk in that order — the workers sweep the table from that
+ * end together.  Each worker appends passing rows to its own list until
+ * it holds |K|; those |K| bound the answer, so it publishes the |K|-th
+ * row as the cutoff: no row beyond it can be among the first |K| passing
+ * rows of the table, and every later chunk returns at once.  The lists
+ * are merged by row id at the end and the |K| nearest the scanned end
+ * are gathered.
+ * ──────────────────────────────────────────────────────────────────── */
+
+#define FTK_CHUNK_ROWS (64 * 1024)
+
+typedef struct {
+    fp_pred_t         pred;
+    int64_t           nrows;
+    int64_t           k;         /* |K| */
+    bool              from_end;
+    int64_t*          rows;      /* [nw * k] per-worker row ids, in scan order */
+    int32_t*          rows_n;    /* [nw] */
+    _Atomic(int64_t)  cutoff;    /* forward: rows >= cutoff are out; backward: rows <= cutoff */
+} ftk_ctx_t;
+
+static inline bool ftk_beyond(const ftk_ctx_t* c, int64_t row) {
+    int64_t cut = atomic_load_explicit(&c->cutoff, memory_order_relaxed);
+    return c->from_end ? row <= cut : row >= cut;
+}
+
+static void ftk_publish(ftk_ctx_t* c, int64_t row) {
+    int64_t cur = atomic_load_explicit(&c->cutoff, memory_order_relaxed);
+    for (;;) {
+        bool tighter = c->from_end ? row > cur : row < cur;
+        if (!tighter) return;
+        if (atomic_compare_exchange_weak_explicit(&c->cutoff, &cur, row,
+                memory_order_relaxed, memory_order_relaxed))
+            return;
+    }
+}
+
+static void ftk_task_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)end;
+    ftk_ctx_t* c = (ftk_ctx_t*)raw;
+    int32_t  k  = (int32_t)c->k;
+    int64_t* my = &c->rows[(size_t)worker_id * (size_t)k];
+    int32_t  n  = c->rows_n[worker_id];
+    if (n >= k) return;                       /* this worker's list is complete */
+
+    /* chunk `start` counted from the scanned end */
+    int64_t lo, hi;
+    if (!c->from_end) {
+        lo = start * FTK_CHUNK_ROWS;
+        hi = lo + FTK_CHUNK_ROWS;
+        if (hi > c->nrows) hi = c->nrows;
+    } else {
+        hi = c->nrows - start * FTK_CHUNK_ROWS;
+        lo = hi - FTK_CHUNK_ROWS;
+        if (lo < 0) lo = 0;
+    }
+    if (ftk_beyond(c, c->from_end ? hi - 1 : lo)) return;
+
+    uint8_t bits[RAY_MORSEL_ELEMS];
+    if (!c->from_end) {
+        for (int64_t row = lo; row < hi && n < k; ) {
+            if (ftk_beyond(c, row)) break;
+            int64_t mend = row + RAY_MORSEL_ELEMS;
+            if (mend > hi) mend = hi;
+            fp_eval_pred(&c->pred, row, mend, bits);
+            for (int64_t r = 0; r < mend - row && n < k; r++)
+                if (bits[r]) my[n++] = row + r;
+            row = mend;
+        }
+    } else {
+        for (int64_t mend = hi; mend > lo && n < k; ) {
+            if (ftk_beyond(c, mend - 1)) break;
+            int64_t row = mend - RAY_MORSEL_ELEMS;
+            if (row < lo) row = lo;
+            fp_eval_pred(&c->pred, row, mend, bits);
+            for (int64_t r = mend - row - 1; r >= 0 && n < k; r--)
+                if (bits[r]) my[n++] = row + r;
+            mend = row;
+        }
+    }
+    c->rows_n[worker_id] = n;
+    if (n >= k) ftk_publish(c, my[k - 1]);
+}
+
+ray_t* ray_fused_take_select(ray_t* tbl,
+                             ray_t* where_expr,
+                             int64_t k,
+                             const int64_t* out_col_syms,
+                             const int64_t* out_alias_syms,
+                             uint32_t n_out)
+{
+    if (!tbl || tbl->type != RAY_TABLE || !where_expr || k == 0 || n_out == 0) return NULL;
+    if (k == INT64_MIN) return NULL;
+    bool from_end = k < 0;
+    if (from_end) k = -k;
+    if (k > FPK_MAX_K) return NULL;
+    int64_t nrows = ray_table_nrows(tbl);
+    if (nrows <= 0 || k >= nrows) return NULL;
+
+    for (uint32_t c = 0; c < n_out; c++) {
+        ray_t* col = ray_table_get_col(tbl, out_col_syms[c]);
+        if (!col) return NULL;
+        int8_t ot = col->type;
+        if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON) return NULL;
+        if (!ray_is_vec(col)) return NULL;
+    }
+
+    ftk_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.nrows = nrows;
+    ctx.k = k;
+    ctx.from_end = from_end;
+    atomic_store_explicit(&ctx.cutoff, from_end ? -1 : INT64_MAX, memory_order_relaxed);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
+    if (!pred_dag) { ray_graph_free(g); return NULL; }
+    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return NULL;
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+    ray_t* rows_hdr = NULL;
+    ray_t* n_hdr    = NULL;
+    ctx.rows   = (int64_t*)scratch_alloc(&rows_hdr, (size_t)nw * (size_t)k * sizeof(int64_t));
+    ctx.rows_n = (int32_t*)scratch_calloc(&n_hdr, (size_t)nw * sizeof(int32_t));
+    if (!ctx.rows || !ctx.rows_n) {
+        if (rows_hdr) scratch_free(rows_hdr);
+        if (n_hdr) scratch_free(n_hdr);
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return NULL;
+    }
+
+    int64_t n_chunks = (nrows + FTK_CHUNK_ROWS - 1) / FTK_CHUNK_ROWS;
+    if (ray_pool_par_dispatch_ok(pool, n_chunks, 2))
+        ray_pool_dispatch_n(pool, ftk_task_fn, &ctx, (uint32_t)n_chunks);
+    else
+        for (int64_t t = 0; t < n_chunks; t++) ftk_task_fn(&ctx, 0, t, t + 1);
+
+    /* Merge: each list is in scan order; pick the row nearest the scanned
+     * end across lists k times, then present in table order. */
+    int64_t out[FPK_MAX_K];
+    int32_t out_n = 0;
+    ray_t* pos_hdr = NULL;
+    int32_t* pos = (int32_t*)scratch_calloc(&pos_hdr, (size_t)nw * sizeof(int32_t));
+    if (!pos) {
+        scratch_free(rows_hdr); scratch_free(n_hdr);
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return NULL;
+    }
+    while (out_n < (int32_t)k) {
+        int64_t best = -1;
+        uint32_t bw = 0;
+        for (uint32_t w = 0; w < nw; w++) {
+            if (pos[w] >= ctx.rows_n[w]) continue;
+            int64_t r = ctx.rows[(size_t)w * (size_t)k + (size_t)pos[w]];
+            if (best < 0 || (from_end ? r > best : r < best)) { best = r; bw = w; }
+        }
+        if (best < 0) break;
+        pos[bw]++;
+        out[out_n++] = best;
+    }
+    scratch_free(pos_hdr);
+    scratch_free(rows_hdr);
+    scratch_free(n_hdr);
+    if (from_end) {
+        for (int32_t i = 0, j = out_n - 1; i < j; i++, j--) {
+            int64_t t = out[i]; out[i] = out[j]; out[j] = t;
+        }
+    }
+
+    ray_t* result = ray_table_new(n_out);
+    if (!result || RAY_IS_ERR(result)) {
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return result ? result : ray_error("oom", NULL);
+    }
+    int build_ok = 1;
+    for (uint32_t c = 0; c < n_out; c++) {
+        int64_t cs    = out_col_syms[c];
+        int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
+        ray_t* src = ray_table_get_col(tbl, cs);
+        if (!src) { build_ok = 0; break; }
+        ray_t* col = gather_by_idx(src, out, out_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
         ray_release(col);
