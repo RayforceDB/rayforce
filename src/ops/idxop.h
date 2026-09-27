@@ -165,6 +165,12 @@ typedef struct {
             uint8_t  chunk_log2;  /* chunk size = 1 << chunk_log2 (default 16 → 64 K rows) */
             uint8_t  is_f64;
             uint8_t  _pad[2];
+            /* Integer / temporal zones only (NULL for float zones and for
+             * indexes written before it existed): RAY_I64 vec of
+             * 2 * n_chunks — [0, n) the chunk's non-null values summed with
+             * int64 wraparound, [n, 2n) its non-null row count.  Whole-column
+             * sum / count / avg answer from it in O(n_chunks). */
+            ray_t*   aggs;
         } chunk_zone;
         struct {                /* RAY_IDX_PART */
             ray_t*  keys;       /* distinct partition values, in ascending block order */
@@ -270,6 +276,12 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
  * RAY_INDEX object (caller releases).  Used by the splayed-store builder to
  * compute an index for persistence without COWing a shared column. */
 ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
+
+/* Whole-column sum (int64 wraparound) and non-null count of an integer
+ * column from its chunk-zone per-chunk aggregates; false when the column
+ * carries none for its current length.  exact_f64 (optional): whether the
+ * sum is exactly what a double accumulation of the rows gives. */
+bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out, bool* exact_f64);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).

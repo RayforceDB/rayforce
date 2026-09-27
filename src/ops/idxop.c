@@ -376,9 +376,12 @@ void ray_index_release_payload(ray_index_t* ix) {
             ray_release(ix->u.chunk_zone.maxs);
         if (ix->u.chunk_zone.null_bits && !RAY_IS_ERR(ix->u.chunk_zone.null_bits))
             ray_release(ix->u.chunk_zone.null_bits);
+        if (ix->u.chunk_zone.aggs && !RAY_IS_ERR(ix->u.chunk_zone.aggs))
+            ray_release(ix->u.chunk_zone.aggs);
         ix->u.chunk_zone.mins = NULL;
         ix->u.chunk_zone.maxs = NULL;
         ix->u.chunk_zone.null_bits = NULL;
+        ix->u.chunk_zone.aggs = NULL;
         break;
     case RAY_IDX_PART:
         if (ix->u.part.keys   && !RAY_IS_ERR(ix->u.part.keys))   ray_release(ix->u.part.keys);
@@ -409,7 +412,7 @@ int ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap) {
     case RAY_IDX_BLOOM:      c[0] = ix->u.bloom.bits; break;
     case RAY_IDX_CHUNK_ZONE:
         c[0] = ix->u.chunk_zone.mins; c[1] = ix->u.chunk_zone.maxs;
-        c[2] = ix->u.chunk_zone.null_bits;
+        c[2] = ix->u.chunk_zone.null_bits; c[3] = ix->u.chunk_zone.aggs;
         break;
     case RAY_IDX_PART:
         c[0] = ix->u.part.keys; c[1] = ix->u.part.starts; c[2] = ix->u.part.lens;
@@ -458,6 +461,8 @@ void ray_index_retain_payload(ray_index_t* ix) {
             ray_retain(ix->u.chunk_zone.maxs);
         if (ix->u.chunk_zone.null_bits && !RAY_IS_ERR(ix->u.chunk_zone.null_bits))
             ray_retain(ix->u.chunk_zone.null_bits);
+        if (ix->u.chunk_zone.aggs && !RAY_IS_ERR(ix->u.chunk_zone.aggs))
+            ray_retain(ix->u.chunk_zone.aggs);
         break;
     case RAY_IDX_PART:
         if (ix->u.part.keys   && !RAY_IS_ERR(ix->u.part.keys))   ray_retain(ix->u.part.keys);
@@ -598,6 +603,8 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
         int64_t s = (int64_t)g * csz;
         int64_t e = s + csz; if (e > n) e = n;
         int64_t mn = INT64_MAX, mx = INT64_MIN;
+        uint64_t sum = 0;          /* wraps like the engine's int64 sum */
+        int64_t nn = 0;
         bool any_null = false;
         for (int64_t i = s; i < e; i++) {
             if (ray_vec_is_null(v, i)) { any_null = true; continue; }
@@ -611,6 +618,13 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
             }
             if (val < mn) mn = val;
             if (val > mx) mx = val;
+            sum += (uint64_t)val;
+            nn++;
+        }
+        if (ix->u.chunk_zone.aggs) {
+            int64_t* ag = (int64_t*)ray_data(ix->u.chunk_zone.aggs);
+            ag[g] = (int64_t)sum;
+            ag[n_chunks + g] = nn;
         }
         /* Empty (all-null) chunks keep mn=INT64_MAX / mx=INT64_MIN so
          * the reduce path's min(mins[*]) / max(maxs[*]) ignores them. */
@@ -807,6 +821,12 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2) {
     ix->u.chunk_zone.mins      = mins;
     ix->u.chunk_zone.maxs      = maxs;
     ix->u.chunk_zone.null_bits = nbits;
+    if (!ix->u.chunk_zone.is_f64) {
+        ray_t* aggs = ray_vec_new(RAY_I64, 2 * (int64_t)n_chunks);
+        if (!aggs || RAY_IS_ERR(aggs)) { ray_release(idx); return ray_error("oom", "chunk_zone: aggs alloc"); }
+        aggs->len = 2 * (int64_t)n_chunks;
+        ix->u.chunk_zone.aggs = aggs;
+    }
 
     ray_err_t err = chunk_zone_scan(v, ix);
     if (err != RAY_OK) {
@@ -857,6 +877,12 @@ ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2) {
     ix->u.chunk_zone.mins      = mins;
     ix->u.chunk_zone.maxs      = maxs;
     ix->u.chunk_zone.null_bits = nbits;
+    if (!ix->u.chunk_zone.is_f64) {
+        ray_t* aggs = ray_vec_new(RAY_I64, 2 * (int64_t)n_chunks);
+        if (!aggs || RAY_IS_ERR(aggs)) { ray_release(idx); return ray_error("oom", "chunk_zone: aggs alloc"); }
+        aggs->len = 2 * (int64_t)n_chunks;
+        ix->u.chunk_zone.aggs = aggs;
+    }
 
     ray_err_t err = chunk_zone_scan(v, ix);
     if (err != RAY_OK) {
@@ -980,7 +1006,11 @@ static int idx_child_slots(ray_index_t* ix, ray_t** slots[4]) {
     case RAY_IDX_CHUNK_ZONE:
         slots[n++] = &ix->u.chunk_zone.mins;
         slots[n++] = &ix->u.chunk_zone.maxs;
-        slots[n++] = &ix->u.chunk_zone.null_bits; break;
+        slots[n++] = &ix->u.chunk_zone.null_bits;
+        /* 4th slot added after the first on-disk generation: older regions
+         * hold zero there (the payload is zeroed at alloc), which maps to
+         * NULL — no aggregates, nothing else changes. */
+        slots[n++] = &ix->u.chunk_zone.aggs; break;
     case RAY_IDX_PART:
         slots[n++] = &ix->u.part.keys; slots[n++] = &ix->u.part.starts;
         slots[n++] = &ix->u.part.lens; break;
