@@ -27,6 +27,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/pool.h"
 #include "mem/cow.h"
 #include "vec/vec.h"
 #include "table/sym.h"
@@ -334,6 +335,10 @@ static test_result_t test_index_hash_with_nulls_preserved(void) {
  * computed the obvious way. */
 static test_result_t test_index_hash_large_parallel(void) {
     ray_heap_init();
+    /* The parallel build needs the pool; create it before the attach so
+     * the test does not silently take the serial fallback. */
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
     const int64_t n = 300000, kmax = 5003;
     ray_t* v = ray_vec_new(RAY_I64, n);
     TEST_ASSERT_NOT_NULL(v);

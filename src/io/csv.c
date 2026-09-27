@@ -3955,7 +3955,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
                                               .ncols = ncols, .err = RAY_OK };
             ray_pool_t* wpool = ray_pool_get();
-            if (wpool && wpool->n_workers > 0 && ncols > 1)
+            if (ray_pool_par_dispatch_ok(wpool, ncols, 2))
                 ray_pool_dispatch_n(wpool, csv_splayed_append_task, &actx, (uint32_t)ncols);
             else
                 for (int c = 0; c < ncols; c++) csv_splayed_append_task(&actx, 0, c, c + 1);

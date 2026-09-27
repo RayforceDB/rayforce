@@ -518,7 +518,17 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
              * the grown count (OOB reads for lock-free consumers) — the
              * same corner dom_append_locked hits; mirror its loud abort
              * (the count is already published, there is no clean undo). */
-            if (d->buckets) { ray_sys_free(d->buckets); d->buckets = NULL; d->bucket_mask = 0; }
+            if (d->buckets) {
+                /* Retire, never free: a batch intern may be probing a
+                 * snapshot of this table outside the lock. */
+                if (!dom_retire(d, d->buckets)) {
+                    fprintf(stderr, "rayforce: sym domain '%s': OOM retiring "
+                                    "reverse index after external extend\n",
+                            d->path ? d->path : "?");
+                    abort();
+                }
+                d->buckets = NULL; d->bucket_mask = 0;
+            }
             int64_t* lut = atomic_load_explicit(&d->runtime_lut, memory_order_relaxed);
             if (lut) {
                 if (!dom_retire(d, lut)) {
@@ -965,6 +975,9 @@ typedef struct {
     int64_t*             pos_base;   /* [n_part] first position of the partition */
     void**               region;     /* [n_part] arena region per partition */
     ray_t**              atoms_w;    /* current atom array (fill target) */
+    /* Set when a probe met an entry it could not compare (no atom, no
+     * raw bytes): the misses are then resolved under the lock instead. */
+    _Atomic(bool)        unsure;
     int                  part_shift;
     _Atomic(bool)        oom;
 } dom_batch_ctx_t;
@@ -991,6 +1004,7 @@ static void dom_batch_probe_fn(void* raw, uint32_t wid, int64_t start, int64_t e
                                                     memory_order_acquire);
                     if (a) { p = ray_str_ptr(a); l = ray_str_len(a); }
                     else if (pos < b->raw.count) p = ray_sym_domain_raw_str(&b->raw, pos, &l);
+                    else atomic_store_explicit((_Atomic(bool)*)&b->unsure, true, memory_order_relaxed);
                     if (p && l == len && (len == 0 || memcmp(p, s, len) == 0)) {
                         found = pos;
                         break;
@@ -1191,7 +1205,8 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
 
     dom_lock();
     bool unchanged = ok && dom->buckets == b.buckets &&
-                     atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count;
+                     atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count &&
+                     !atomic_load_explicit(&b.unsure, memory_order_relaxed);
     if (unchanged) {
         int64_t total = 0;
         for (int p = 0; p < n_part; p++) total += b.uniq_n[p];
