@@ -59,6 +59,7 @@
 (.log.snapshot)  !- domain
 (.log.snapshot 1) !- arity
 (nil? (.log.sync))  -- true
+(.log.sync 1) !- arity
 (nil? (.log.close)) -- true
 
 ;; ════════════════════════════════════════════════════════════════════════

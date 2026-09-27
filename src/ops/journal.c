@@ -214,7 +214,8 @@ ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".log.sync takes no arguments");
     return err_to_ray(ray_journal_sync(), "io");
 }
 
