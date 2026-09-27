@@ -1083,7 +1083,9 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
  * points at the start of the index region within the column's file mapping.
  * Returns NULL for a stale layout generation or a payload-size mismatch —
  * the caller loads the column unindexed (the index is rebuildable). */
-ray_t* ray_index_inline_map(uint8_t* region) {
+ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
+    int64_t head = IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t));
+    if (region_size < head) return NULL;
     ray_t* idx = (ray_t*)region;
     if (idx->order != RAY_IDX_FORMAT_MAJOR) return NULL;
     if (idx->len != (int64_t)sizeof(ray_index_t)) return NULL;
@@ -1092,8 +1094,32 @@ ray_t* ray_index_inline_map(uint8_t* region) {
     int nch = idx_child_slots(ix, slots);
     for (int i = 0; i < nch; i++) {
         int64_t o = (int64_t)(intptr_t)(*slots[i]);
-        *slots[i] = o ? (ray_t*)(region + o) : NULL;
+        ray_t* c = NULL;
+        /* A child must lie inside the region: a region re-saved by a
+         * binary that knows fewer child slots keeps a stale offset in a
+         * slot it did not write. */
+        if (o >= head && o <= region_size - 32) {
+            ray_t* cand = (ray_t*)(region + o);
+            int64_t esz = ray_elem_size(cand->type);
+            if (cand->len >= 0 && esz > 0 &&
+                cand->len <= (region_size - o - 32) / esz)
+                c = cand;
+        }
+        if (o && !c) {
+            /* The chunk-zone aggregates are optional; any other child out
+             * of bounds means the region cannot be trusted. */
+            if (ix->kind == RAY_IDX_CHUNK_ZONE && slots[i] == &ix->u.chunk_zone.aggs) {
+                *slots[i] = NULL;
+                continue;
+            }
+            return NULL;
+        }
+        *slots[i] = c;
     }
+    if (ix->kind == RAY_IDX_CHUNK_ZONE && ix->u.chunk_zone.aggs &&
+        (ix->u.chunk_zone.aggs->type != RAY_I64 || ix->u.chunk_zone.is_f64 ||
+         ix->u.chunk_zone.aggs->len != 2 * (int64_t)ix->u.chunk_zone.n_chunks))
+        ix->u.chunk_zone.aggs = NULL;
     ix->markers |= RAY_MARK_MMAP;
     idx->mmod = 1;
     return idx;
@@ -2612,7 +2638,12 @@ ray_t* ray_index_drop(ray_t** vp) {
      * ray_alloc_copy (rc>1).  Don't clobber the snapshot in that case —
      * the other holder still reads it.  See vec_drop_index_inplace for
      * the same pattern. */
-    bool shared = ray_atomic_load(&idx->rc) > 1;
+    /* A mapped index (mmod 1) rides the column file's mapping: copies of
+     * the column borrow it without a reference, and the mapping's owner
+     * unmaps it.  Dropping it from a vector only detaches it — the
+     * snapshot stays for the other holders and nothing is released. */
+    bool mapped = idx->mmod == 1;
+    bool shared = mapped || ray_atomic_load(&idx->rc) > 1;
     if (shared) {
         ray_index_retain_saved(ix);
     }
@@ -2628,7 +2659,7 @@ ray_t* ray_index_drop(ray_t** vp) {
 
     /* Release the index.  Per-kind children are released by the RAY_INDEX
      * branch of ray_release_owned_refs (added in heap.c). */
-    ray_release(idx);
+    if (!mapped) ray_release(idx);
     return v;
 }
 

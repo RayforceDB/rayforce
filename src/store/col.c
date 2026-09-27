@@ -1748,7 +1748,8 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
      * column's single mapping.  ray_free reads the full mapping size from the
      * reserved _idx_pad slot to munmap the whole region (payload + index). */
     if (cm.has_index) {
-        ray_t* idx = ray_index_inline_map((uint8_t*)cm.mapped + cm.index_offset);
+        ray_t* idx = ray_index_inline_map((uint8_t*)cm.mapped + cm.index_offset,
+                                          (int64_t)cm.mapped_size - (int64_t)cm.index_offset);
         if (idx) {   /* NULL = stale index layout generation: load unindexed */
             ray_t* r = ray_index_attach_built(&vec, idx);
             if (r && !RAY_IS_ERR(r)) vec = r;

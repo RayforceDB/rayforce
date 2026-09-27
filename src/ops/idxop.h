@@ -300,7 +300,7 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
  *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
 int64_t ray_index_inline_size(const ray_index_t* ix);
 void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
-ray_t*  ray_index_inline_map(uint8_t* region);
+ray_t*  ray_index_inline_map(uint8_t* region, int64_t region_size);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach aux state byte-for-byte.  Returns *vp. */
