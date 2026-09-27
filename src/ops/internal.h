@@ -837,6 +837,8 @@ typedef struct {
         uint8_t     col_attrs;  /* column attrs — RAY_SYM width (REG_SCAN only) */
         bool        is_parted;  /* true if this SCAN refs a parted column */
         bool        nullable;   /* lanes may contain NULL_I64 / NaN */
+        bool        null_src;   /* that nullability traces to a nullable column
+                                 * (else: only op-generated sentinels) */
         const void* data;       /* column data pointer (REG_SCAN only) */
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */

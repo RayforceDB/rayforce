@@ -133,3 +133,37 @@
 ;; Arithmetic: null DOES propagate
 (count (+ [0Nl 1 2] 1)) -- 3
 (sum (map nil? (+ [0Nl 1 2] 1))) -- 1
+
+;; ===================================================================
+;; Fused select: a null produced in the middle of the program (x/0,
+;; overflow, |INT64_MIN|) survives every downstream op — abs/neg/floor,
+;; cast to i64, further i64 arithmetic — and the output column carries
+;; HAS_NULLS, so aggregates skip those lanes instead of being poisoned.
+;; ===================================================================
+(set i (til 200000))
+(set NT (table [h b a c] (list (- (% i 300) 150) (% i 13) (% i 97) (% i 11))))
+(set H (at NT 'h)) (set B (at NT 'b)) (set A (at NT 'a)) (set C (at NT 'c))
+;; every 13th b is zero
+(count (where (== B 0))) -- 15385
+(count (where (nil? (at (select {from: NT x: (abs (/ h b))}) 'x)))) -- 15385
+(count (where (nil? (at (select {from: NT x: (neg (/ h b))}) 'x)))) -- 15385
+(count (where (nil? (at (select {from: NT x: (floor (/ h b))}) 'x)))) -- 15385
+(count (where (nil? (at (select {from: NT x: (as 'I64 (/ h b))}) 'x)))) -- 15385
+(count (where (nil? (at (select {from: NT x: (+ (as 'I64 (/ h b)) 1)}) 'x)))) -- 15385
+(count (where (nil? (at (select {from: NT x: (+ (div h b) 1)}) 'x)))) -- 15385
+;; sums equal the column-at-a-time answers (nulls skipped, not summed)
+(sum (at (select {from: NT x: (abs (/ h b))}) 'x)) -- (sum (abs (/ H B)))
+(sum (at (select {from: NT x: (as 'I64 (/ h b))}) 'x)) -- (sum (as 'I64 (/ H B)))
+(sum (at (select {from: NT x: (+ (div h b) 1)}) 'x)) -- (sum (+ (div H B) 1))
+;; the same through a program wider than 16 registers
+(set WX (at (select {from: NT x: (abs (+ (/ h b) (+ a (+ c (+ a (+ c (+ a (+ c (+ a (+ c (+ a c)))))))))))}) 'x))
+(count (where (nil? WX))) -- 15385
+(sum WX) -- (sum (abs (+ (/ H B) (+ A (+ C (+ A (+ C (+ A (+ C (+ A (+ C (+ A C))))))))))))
+;; grouped aggregates over the fused column match a pre-materialized one
+(set G1 (select {from: NT by: {k: c} s: (sum (abs (/ h b))) m: (avg (abs (/ h b)))}))
+(set NX (table [c x] (list C (abs (/ H B)))))
+(set G2 (select {from: NX by: {k: c} s: (sum x) m: (avg x)}))
+(at G1 's) -- (at G2 's)
+(at G1 'm) -- (at G2 'm)
+;; a null-free program keeps HAS_NULLS off (no spurious null-aware path)
+(count (where (nil? (at (select {from: NT x: (abs (+ h 1.5))}) 'x)))) -- 0

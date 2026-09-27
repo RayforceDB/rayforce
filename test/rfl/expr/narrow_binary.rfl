@@ -237,3 +237,20 @@
 ;; null is the least value in narrow-int comparison: -1 is NOT < null
 (< [-1h] [0Nh]) -- [false]
 (type (< [-1h] [0Nh])) -- 'B8
+
+;; ===================================================================
+;; Fused select: an I32/I16 narrowing cast or a comparison result used
+;; as an operand of an i64 op (or of another comparison) is widened to
+;; i64 lanes before the kernel reads it — the 4-, 2- or 1-byte scratch
+;; buffer must never be read as 8-byte lanes.
+;; ===================================================================
+(set NB (table [a b c] (list [14 20 30] [1 2 3] [0Nl 2 3])))
+(at (select {from: NB z: (- a (as 'I32 -1))}) 'z) -- [15 21 31]
+(at (select {from: NB z: (+ a (as 'I32 -1))}) 'z) -- [13 19 29]
+(at (select {from: NB z: (neg (as 'I32 b))}) 'z) -- [-1 -2 -3]
+(at (select {from: NB z: (abs (as 'I16 (neg b)))}) 'z) -- [1 2 3]
+(at (select {from: NB z: (+ (> a 15) 1)}) 'z) -- [1 2 2]
+(at (select {from: NB z: (< (as 'I32 b) (as 'I32 a))}) 'z) -- [true true true]
+(count (select {from: NB where: (< (as 'I32 a) (as 'I16 25))})) -- 2
+;; the narrow null sentinel widens to the i64 null
+(at (select {from: NB z: (+ a (as 'I32 c))}) 'z) -- [0Nl 22 33]
