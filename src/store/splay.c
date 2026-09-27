@@ -23,6 +23,7 @@
 
 #include "splay.h"
 #include "core/runtime.h"
+#include "core/pool.h"
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/serde.h"
@@ -512,12 +513,13 @@ ray_t* ray_splay_load(const char* dir, const char* sym_path) {
  * rewrite), so a later mmap load gets the same block-skip an in-memory build
  * has.  Best-effort and idempotent-ish: ray_col_append_index refuses a file
  * that is not exactly payload-sized (already indexed), so re-runs are no-ops. */
-void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
-    if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
-    int64_t nc = ray_table_ncols(tbl);
-    for (int64_t c = 0; c < nc; c++) {
+/* Index one column of a just-written splayed table (see
+ * ray_splay_build_indexes).  Columns are independent — each reads and
+ * appends to its own file — so the caller runs one task per column. */
+static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c) {
+    {
         ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!col || RAY_IS_ERR(col)) continue;
+        if (!col || RAY_IS_ERR(col)) return;
 
         /* Explicit SYM index: a SYM column carrying a grouped (hash) index in
          * memory gets a hash index persisted inline — regardless of length (the
@@ -557,7 +559,7 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
                     }
                 }
             }
-            continue;
+            return;
         }
 
         /* Explicit STR index: a grouped / unique hash on a STR column is keyed
@@ -575,10 +577,10 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
                     (void)ray_col_append_index(path, ray_index_payload(col->index),
                                                col->len, RAY_STR);
             }
-            continue;
+            return;
         }
 
-        if (col->len < (1 << 16)) continue;
+        if (col->len < (1 << 16)) return;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal
          * get the per-chunk min/max for block-skip.
@@ -593,7 +595,7 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
         ray_t* idx = (col->type == RAY_STR)
                      ? ray_index_dict_compute(col)
                      : ray_index_chunk_zone_compute(col, 16);
-        if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); continue; }
+        if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); return; }
 
         if (col->type != RAY_STR &&
             ray_csv_hash_upgrade_check(col->type, col->len,
@@ -612,7 +614,7 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
                             ray_index_payload(hi->index), hi->len, hi->type);
                 }
                 ray_release(hi);
-                continue;
+                return;
             }
             if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
             /* Hash build failed — fall through and persist the zone. */
@@ -629,6 +631,28 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
         }
         ray_release(idx);
     }
+}
+
+typedef struct { const char* dir; ray_t* tbl; } splay_index_ctx_t;
+static void splay_build_index_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    splay_index_ctx_t* c = (splay_index_ctx_t*)raw;
+    splay_build_index_col(c->dir, c->tbl, start);
+}
+
+void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
+    if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
+    int64_t nc = ray_table_ncols(tbl);
+    if (nc <= 0) return;
+    /* One task per column: the zone / dictionary / hash builds are per-row
+     * scans of each column and used to run one after another on the
+     * calling thread — the longest serial stretch of a CSV → splayed load. */
+    ray_pool_t* pool = ray_pool_get();
+    splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl };
+    if (ray_pool_par_dispatch_ok(pool, nc, 2))
+        ray_pool_dispatch_n(pool, splay_build_index_task, &ctx, (uint32_t)nc);
+    else
+        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c);
 }
 
 ray_t* ray_read_splayed(const char* dir, const char* sym_path) {

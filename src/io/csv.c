@@ -1211,6 +1211,50 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
                                     offsets_out, hdr_out);
 }
 
+/* Row starts of the next `max_rows` rows from `data_offset`, found by the
+ * parallel scanner over a byte window instead of the serial walk: the
+ * window is sized from `avg_row` (bytes per row seen so far) with slack, and
+ * doubled when it holds fewer than max_rows + 1 row starts before the end
+ * of the file (the extra start proves the max_rows-th row is complete).
+ * Returns the row count, -1 if interrupted, or -2 when the parallel path
+ * does not apply (small window, no pool) — the caller then runs the serial
+ * limited scan. */
+static int64_t build_row_offsets_window(const char* buf, size_t buf_size,
+                                        size_t data_offset, int64_t max_rows,
+                                        size_t avg_row,
+                                        int64_t** offsets_out, ray_t** hdr_out,
+                                        size_t* next_offset_out) {
+    *offsets_out = NULL; *hdr_out = NULL;
+    if (next_offset_out) *next_offset_out = data_offset;
+    if (max_rows <= 0 || data_offset >= buf_size) return 0;
+    if (avg_row < 8) avg_row = 8;
+    size_t window = (size_t)max_rows * avg_row + (size_t)max_rows * avg_row / 4 + (64u << 10);
+    for (;;) {
+        size_t end = data_offset + window;
+        if (end > buf_size || end < data_offset) end = buf_size;
+        int64_t* offs = NULL; ray_t* hdr = NULL;
+        int64_t n = build_row_offsets_par(buf, end, data_offset, 0, 0, &offs, &hdr);
+        if (n < 0) return n;                 /* -1 interrupted, -2 not applicable */
+        if (n == 0) { scratch_free(hdr); return -2; }
+        if (n > max_rows) {
+            /* row max_rows - 1 ends before start max_rows: complete */
+            if (next_offset_out) *next_offset_out = (size_t)offs[max_rows];
+            *offsets_out = offs; *hdr_out = hdr;
+            return max_rows;
+        }
+        if (end == buf_size) {
+            /* every remaining row, the last one ended by the file */
+            if (next_offset_out) *next_offset_out = buf_size;
+            *offsets_out = offs; *hdr_out = hdr;
+            return n;
+        }
+        /* the window held at most max_rows starts: widen and rescan */
+        scratch_free(hdr);
+        if (window > SIZE_MAX / 2) return -2;
+        window *= 2;
+    }
+}
+
 static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
                                          size_t data_offset, int64_t max_rows,
                                          bool data_has_quotes,
@@ -3283,7 +3327,15 @@ typedef struct {
      * fixed at W32: a streaming writer can't know the final vocabulary
      * before the last chunk, and W32 covers any STRL count. */
     struct ray_sym_domain_s* dom;
+    /* runtime id -> domain position, direct-mapped: the chunk vecs are
+     * runtime-domain and a column's values repeat across rows and chunks,
+     * so a value is interned into the symfile's domain (a locked probe) the
+     * first time it is met and looked up here after. */
+    int64_t*  lut_id;    /* [CSV_SPLAYED_LUT] runtime id per slot, -1 empty */
+    uint32_t* lut_pos;   /* [CSV_SPLAYED_LUT] position per slot */
 } csv_splayed_col_writer_t;
+#define CSV_SPLAYED_LUT_BITS 19
+#define CSV_SPLAYED_LUT (1u << CSV_SPLAYED_LUT_BITS)
 
 static ray_err_t csv_splayed_writer_open(csv_splayed_col_writer_t* w,
                                          const char* dir, int64_t name_id,
@@ -3314,7 +3366,23 @@ static ray_err_t csv_splayed_writer_open(csv_splayed_col_writer_t* w,
     if (!w->fp) return RAY_ERR_IO;
     ray_t zero = {0};
     if (fwrite(&zero, 1, 32, w->fp) != 32) return RAY_ERR_IO;
+    if (type == RAY_SYM) {
+        /* best effort: without the cache every cell probes the domain */
+        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)CSV_SPLAYED_LUT * sizeof(int64_t));
+        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)CSV_SPLAYED_LUT * sizeof(uint32_t));
+        if (!w->lut_id || !w->lut_pos) {
+            ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
+            w->lut_id = NULL; w->lut_pos = NULL;
+        } else {
+            memset(w->lut_id, 0xff, (size_t)CSV_SPLAYED_LUT * sizeof(int64_t));
+        }
+    }
     return RAY_OK;
+}
+
+static void csv_splayed_writer_drop_lut(csv_splayed_col_writer_t* w) {
+    ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
+    w->lut_id = NULL; w->lut_pos = NULL;
 }
 
 static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
@@ -3328,18 +3396,36 @@ static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
          * resolve each cell through the chunk vec's own domain and
          * find-or-append into the target (distinct work rides the
          * write).  The domain is flushed before the column files are
-         * committed (close), preserving the sym-first crash ordering. */
+         * committed (close), preserving the sym-first crash ordering.
+         * A runtime-domain chunk vec goes through the id -> position
+         * cache: only a value's first encounter pays the domain probe. */
+        bool cached = ray_sym_vec_domain(col) == ray_sym_runtime_domain() && w->lut_id;
+        const void* cd = ray_data(col);
         uint32_t buf[8192];
         for (int64_t off = 0; off < n; ) {
             int64_t cnt = n - off;
             if (cnt > (int64_t)(sizeof(buf) / sizeof(buf[0])))
                 cnt = (int64_t)(sizeof(buf) / sizeof(buf[0]));
             for (int64_t i = 0; i < cnt; i++) {
-                ray_t* s = ray_sym_vec_cell(col, off + i);
-                if (!s) return RAY_ERR_CORRUPT;
-                int64_t pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s),
-                                                    ray_str_len(s));
-                if (pos < 0) return RAY_ERR_OOM;
+                int64_t pos;
+                if (cached) {
+                    int64_t id = ray_read_sym(cd, off + i, RAY_SYM, col->attrs);
+                    uint32_t slot = (uint32_t)(((uint64_t)id * 0x9E3779B97F4A7C15ull) >> (64 - CSV_SPLAYED_LUT_BITS));
+                    if (w->lut_id[slot] == id) {
+                        pos = w->lut_pos[slot];
+                    } else {
+                        ray_t* s = ray_sym_str(id);
+                        if (!s) return RAY_ERR_CORRUPT;
+                        pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
+                        if (pos < 0) return RAY_ERR_OOM;
+                        w->lut_id[slot] = id; w->lut_pos[slot] = (uint32_t)pos;
+                    }
+                } else {
+                    ray_t* s = ray_sym_vec_cell(col, off + i);
+                    if (!s) return RAY_ERR_CORRUPT;
+                    pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
+                    if (pos < 0) return RAY_ERR_OOM;
+                }
                 buf[i] = (uint32_t)pos;
                 /* Position 0 of any symfile is the empty string (domain.c
                  * enforces that reservation on open), so a re-encoded cell is
@@ -3365,7 +3451,29 @@ static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
     return RAY_OK;
 }
 
+/* Append task: column `start` of the chunk table into its writer.  The
+ * first failure is kept (a later task cannot clear it). */
+typedef struct {
+    csv_splayed_col_writer_t* writers;
+    ray_t*   tbl;
+    int      ncols;
+    _Atomic(ray_err_t) err;
+} csv_splayed_append_ctx_t;
+
+static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
+    if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
+    ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
+    ray_err_t e = csv_splayed_writer_append(&a->writers[start], col);
+    if (e != RAY_OK) {
+        ray_err_t ok = RAY_OK;
+        atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
+    }
+}
+
 static ray_err_t csv_splayed_writer_close(csv_splayed_col_writer_t* w) {
+    csv_splayed_writer_drop_lut(w);
     if (!w->fp) return RAY_OK;
     ray_err_t err = RAY_OK;
 
@@ -3397,6 +3505,7 @@ static ray_err_t csv_splayed_writer_close(csv_splayed_col_writer_t* w) {
 }
 
 static void csv_splayed_writer_abort(csv_splayed_col_writer_t* w) {
+    csv_splayed_writer_drop_lut(w);
     if (w->fp) fclose(w->fp);
     w->fp = NULL;
     remove(w->tmp_path);
@@ -3630,16 +3739,26 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
 
     size_t chunk_offset = data_offset;
     bool wrote_any = false;
+    size_t avg_row_bytes = 64;   /* refined from every chunk scanned */
     while (chunk_offset < file_size || !wrote_any) {
         ray_t* row_offsets_hdr = NULL;
         int64_t* row_offsets = NULL;
         size_t next_offset = chunk_offset;
         int64_t cnt = 0;
         if (chunk_offset < file_size) {
-            cnt = build_row_offsets_limited(buf, file_size, chunk_offset,
-                                            rows_per_chunk, data_has_quotes,
-                                            &row_offsets,
-                                            &row_offsets_hdr, &next_offset);
+            /* Parallel scan over a byte window sized from the rows seen so
+             * far; the serial walk remains the fallback and the semantics. */
+            cnt = build_row_offsets_window(buf, file_size, chunk_offset,
+                                           rows_per_chunk, avg_row_bytes,
+                                           &row_offsets, &row_offsets_hdr,
+                                           &next_offset);
+            if (cnt == -2)
+                cnt = build_row_offsets_limited(buf, file_size, chunk_offset,
+                                                rows_per_chunk, data_has_quotes,
+                                                &row_offsets,
+                                                &row_offsets_hdr, &next_offset);
+            if (cnt > 0 && next_offset > chunk_offset)
+                avg_row_bytes = (next_offset - chunk_offset) / (size_t)cnt;
             if (cnt <= 0) {
                 scratch_free(row_offsets_hdr);
                 err = (cnt < 0) ? RAY_ERR_CANCEL : RAY_ERR_IO;
@@ -3658,10 +3777,19 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             break;
         }
 
-        for (int c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            err = csv_splayed_writer_append(&writers[c], col);
-            if (err != RAY_OK) break;
+        /* One task per column: each writer owns its file, its cache and
+         * its symfile domain (the domain probe takes the domain lock, the
+         * symbol table read its own), so the columns of a chunk are
+         * encoded and written side by side. */
+        {
+            csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
+                                              .ncols = ncols, .err = RAY_OK };
+            ray_pool_t* wpool = ray_pool_get();
+            if (wpool && wpool->n_workers > 0 && ncols > 1)
+                ray_pool_dispatch_n(wpool, csv_splayed_append_task, &actx, (uint32_t)ncols);
+            else
+                for (int c = 0; c < ncols; c++) csv_splayed_append_task(&actx, 0, c, c + 1);
+            err = actx.err;
         }
         ray_release(tbl);
         if (err != RAY_OK) break;
