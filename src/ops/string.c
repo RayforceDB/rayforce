@@ -1053,12 +1053,14 @@ typedef struct {
     substr_arg_t     len;
     _Atomic(uint32_t) any_null;
     _Atomic(uint32_t) range_err;
+    _Atomic(uint64_t) pooled_bytes;   /* bytes the pooled results point at */
 } substr_view_ctx_t;
 
 static void substr_view_fn(void* vctx, uint32_t worker_id, int64_t lo, int64_t hi) {
     (void)worker_id;
     substr_view_ctx_t* c = (substr_view_ctx_t*)vctx;
     bool null_seen = false, range_seen = false;
+    uint64_t pooled = 0;
     for (int64_t i = lo; i < hi; i++) {
         ray_str_t* d = &c->dst[i];
         memset(d, 0, sizeof(*d));
@@ -1084,6 +1086,7 @@ static void substr_view_fn(void* vctx, uint32_t worker_id, int64_t lo, int64_t h
             if ((uint64_t)s->pool_off + (uint64_t)st > UINT32_MAX) { range_seen = true; d->len = 0; continue; }
             memcpy(d->prefix, sp, 4);
             d->pool_off = s->pool_off + (uint32_t)st;
+            pooled += (uint64_t)ln;
             /* hash32 stays 0: a consumer that needs it computes it once
              * (ray_str_t_hash32); hashing every substring here paid a pass
              * over the bytes that most consumers never used. */
@@ -1091,6 +1094,17 @@ static void substr_view_fn(void* vctx, uint32_t worker_id, int64_t lo, int64_t h
     }
     if (null_seen)  atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
     if (range_seen) atomic_store_explicit(&c->range_err, 1, memory_order_relaxed);
+    if (pooled) atomic_fetch_add_explicit(&c->pooled_bytes, pooled, memory_order_relaxed);
+}
+
+/* A view whose bytes are a small share (under an eighth) of the pool it
+ * points into is worth rebuilding over its own bytes: the copy costs the
+ * few bytes it keeps, the pool it would otherwise pin costs the rest.  A
+ * larger share stays a view — the parent pool is usually alive anyway (a
+ * column, a sibling intermediate), and copying most of it would only add
+ * a second copy for the view's lifetime. */
+bool ray_str_view_should_compact(uint64_t pooled_bytes, int64_t pool_len) {
+    return pool_len > 0 && pooled_bytes * 8 < (uint64_t)pool_len;
 }
 
 static ray_t* substr_str_view(ray_t* input, ray_t* start_v, ray_t* len_v) {
@@ -1114,6 +1128,7 @@ static ray_t* substr_str_view(ray_t* input, ray_t* start_v, ray_t* len_v) {
     ctx.dst = (ray_str_t*)ray_data(result);
     atomic_store_explicit(&ctx.any_null, 0, memory_order_relaxed);
     atomic_store_explicit(&ctx.range_err, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx.pooled_bytes, 0, memory_order_relaxed);
 
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD))
@@ -1126,6 +1141,16 @@ static ray_t* substr_str_view(ray_t* input, ray_t* start_v, ray_t* len_v) {
     }
     if (atomic_load_explicit(&ctx.any_null, memory_order_relaxed))
         result->attrs |= RAY_ATTR_HAS_NULLS;
+    /* A result with no pooled descriptor (every substring fits inline)
+     * has nothing in the parent pool to keep alive.  A view that does
+     * point into it stays a view: the column is alive anyway, and a
+     * sibling `if` over two such views can pick either side without
+     * copying (a compacted view would give it two different pools). */
+    if (result->str_pool &&
+        atomic_load_explicit(&ctx.pooled_bytes, memory_order_relaxed) == 0) {
+        ray_release(result->str_pool);
+        result->str_pool = NULL;
+    }
     return result;
 }
 
