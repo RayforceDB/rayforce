@@ -64,6 +64,20 @@ The symbol table is a dotfile (`.sym`, lock `.sym.lk`), so it never collides
 with a user column — a table may have an ordinary column named `sym` (the
 canonical ticker column), as shown above.
 
+### Atomic table replacement
+
+When an existing splayed table is replaced, Rayforce writes the new schema and
+all columns into a fresh directory below `.generations/`. After the files are
+complete, it atomically replaces the small `.current` manifest. Readers follow
+that manifest, so they see either the previous complete generation or the new
+complete generation — never a mixture of columns from both. A failed write
+before publication leaves the previous generation selected. Tables written by
+older Rayforce versions remain readable; the first replacement upgrades the
+directory to the generation layout.
+
+This protects publication of one splayed table. Coordinating a consistent
+snapshot across multiple tables or date partitions still belongs to the caller.
+
 ### C API
 
 | Function | Description |

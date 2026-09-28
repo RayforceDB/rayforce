@@ -2372,7 +2372,84 @@ static test_result_t test_splayed_has_nulls_roundtrip(void) {
     PASS();
 }
 
+/* A replacement must be published as one generation.  The failed replacement
+ * is deterministic (unsupported nested data), so it also proves that a
+ * preflight/write error cannot advance the table-level manifest. */
+static test_result_t test_splay_atomic_generation_publish(void) {
+    const char* dir = TMP_SPLAY_BASE "/atomic_generation";
+    char manifest[512];
+    int n = snprintf(manifest, sizeof(manifest), "%s/.current", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(manifest));
+    (void)ray_test_rm_rf(dir);
+
+    int64_t x_id = ray_sym_intern("x", 1);
+    int64_t y_id = ray_sym_intern("y", 1);
+    int64_t old_x_raw[] = {1, 2};
+    int64_t old_y_raw[] = {10, 20};
+    ray_t* old_x = ray_vec_from_raw(RAY_I64, old_x_raw, 2);
+    ray_t* old_y = ray_vec_from_raw(RAY_I64, old_y_raw, 2);
+    ray_t* old = ray_table_new(2);
+    old = ray_table_add_col(old, x_id, old_x);
+    old = ray_table_add_col(old, y_id, old_y);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(old));
+    TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(manifest, F_OK), -1);
+
+    int64_t new_x_raw[] = {3, 4};
+    int64_t new_y_raw[] = {30, 40};
+    ray_t* new_x = ray_vec_from_raw(RAY_I64, new_x_raw, 2);
+    ray_t* new_y = ray_vec_from_raw(RAY_I64, new_y_raw, 2);
+    ray_t* replacement = ray_table_new(2);
+    replacement = ray_table_add_col(replacement, x_id, new_x);
+    replacement = ray_table_add_col(replacement, y_id, new_y);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(replacement));
+    TEST_ASSERT_EQ_I(ray_splay_save(replacement, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(manifest, F_OK), 0);
+
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* loaded_x = ray_table_get_col(loaded, x_id);
+    ray_t* loaded_y = ray_table_get_col(loaded, y_id);
+    TEST_ASSERT_NOT_NULL(loaded_x);
+    TEST_ASSERT_NOT_NULL(loaded_y);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_x))[0], 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_y))[0], 30);
+    ray_release(loaded);
+
+    ray_t* bad_col = ray_dict_new(ray_vec_from_raw(RAY_I64, old_x_raw, 2),
+                                  ray_vec_from_raw(RAY_I64, old_y_raw, 2));
+    ray_t* bad = ray_table_new(2);
+    bad = ray_table_add_col(bad, x_id, old_x);
+    bad = ray_table_add_col(bad, y_id, bad_col);
+    ray_err_t bad_err = ray_splay_save(bad, dir, NULL);
+    TEST_ASSERT_TRUE(bad_err != RAY_OK);
+
+    loaded = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    loaded_x = ray_table_get_col(loaded, x_id);
+    loaded_y = ray_table_get_col(loaded, y_id);
+    TEST_ASSERT_NOT_NULL(loaded_x);
+    TEST_ASSERT_NOT_NULL(loaded_y);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_x))[0], 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_y))[0], 30);
+    ray_release(loaded);
+
+    ray_release(bad);
+    ray_release(bad_col);
+    ray_release(replacement);
+    ray_release(new_x);
+    ray_release(new_y);
+    ray_release(old);
+    ray_release(old_x);
+    ray_release(old_y);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
+    { "splay/atomic_generation_publish", test_splay_atomic_generation_publish, splay_setup, splay_teardown },
     { "splay/has_nulls_roundtrip",        test_splayed_has_nulls_roundtrip,      splay_setup, splay_teardown },
     { "splay/save_null_dir",              test_save_null_dir,                   splay_setup, splay_teardown },
     { "splay/save_null_tbl",              test_save_null_tbl,                   splay_setup, splay_teardown },
