@@ -3637,12 +3637,13 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     }
 }
 
-ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
+static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool header,
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
-                                          const char* dir, int64_t rows_per_chunk) {
+                                          const char* dir, int64_t rows_per_chunk,
+                                          const char* sym_path) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
-    if (!path || !dir) return RAY_ERR_DOMAIN;
+    if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
 
     int fd = open(path, O_RDONLY);
@@ -3795,12 +3796,6 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
         for (int c = 0; c < ncols; c++)
             if (resolved_types[c] == RAY_SYM) any_sym = true;
         if (any_sym) {
-            char sym_path[1024];
-            int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
-            if (n < 0 || (size_t)n >= sizeof(sym_path)) {
-                ray_vm_unmap_file(buf, file_size);
-                return RAY_ERR_RANGE;
-            }
             sym_dom = ray_sym_domain_open_or_create(sym_path);
             if (!sym_dom) {
                 ray_vm_unmap_file(buf, file_size);
@@ -3949,6 +3944,33 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     if (sym_dom) ray_sym_domain_release(sym_dom);
     ray_vm_unmap_file(buf, file_size);
     return err;
+}
+
+ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
+                                          const int8_t* col_types_in, int32_t n_types,
+                                          const int64_t* col_names_in, int32_t n_names,
+                                          const char* dir, int64_t rows_per_chunk) {
+    if (ray_interrupted()) return RAY_ERR_CANCEL;
+    if (!path || !dir) return RAY_ERR_DOMAIN;
+    char sym_path[1024];
+    int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
+    if (n < 0 || (size_t)n >= sizeof(sym_path)) return RAY_ERR_RANGE;
+    ray_splay_write_t write;
+    ray_err_t err = ray_splay_write_begin(dir, &write);
+    if (err != RAY_OK) return err;
+    err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
+                                  col_names_in, n_names, write.dir,
+                                  rows_per_chunk, sym_path);
+    if (err == RAY_OK) {
+        ray_t* tbl = ray_read_splayed(write.dir, sym_path);
+        if (!tbl || RAY_IS_ERR(tbl)) {
+            err = tbl ? ray_err_from_obj(tbl) : RAY_ERR_OOM;
+        } else {
+            ray_splay_build_indexes(write.dir, tbl);
+        }
+        if (tbl) ray_release(tbl);
+    }
+    return ray_splay_write_finish(&write, err, false);
 }
 
 static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool header,

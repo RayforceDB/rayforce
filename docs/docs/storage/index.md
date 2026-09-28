@@ -75,6 +75,26 @@ before publication leaves the previous generation selected. Tables written by
 older Rayforce versions remain readable; the first replacement upgrades the
 directory to the generation layout.
 
+The table, partition and CSV entry points follow the same publication protocol.
+Indexes are built in the new generation before it is published. Writers to the
+same table serialize on `.write.lock`; readers resolve the manifest once and
+continue using that generation. The symbol vocabulary stays at its original
+location and grows append-only.
+
+Previous generations, the legacy files and incomplete staging directories are
+retained. Disk usage therefore grows with replacements. There is no automatic
+garbage collection yet: reclaim old files only during offline maintenance with
+all readers and writers stopped, and preserve the generation named by `.current`.
+Older binaries that do not understand `.current` must not access an upgraded
+table; reading its legacy files directly returns obsolete data.
+
+`ray_splay_save` (including `.db.splayed.set`) syncs data, indexes and directory
+entries before acknowledging publication. The bulk C API and CSV import retain
+their no-fsync contract: publication is atomic for readers, but is not a
+power-loss durability guarantee. An I/O error after the manifest rename (during
+the final directory sync) has an uncertain commit outcome; reopen the table to
+inspect the selected generation.
+
 This protects publication of one splayed table. Coordinating a consistent
 snapshot across multiple tables or date partitions still belongs to the caller.
 

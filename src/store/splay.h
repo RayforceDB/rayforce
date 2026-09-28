@@ -25,8 +25,29 @@
 #define RAY_SPLAY_H
 
 #include <rayforce.h>
+#include "store/fileio.h"
 
 struct ray_sym_domain_s;
+
+/* Internal publication protocol shared by the table and streaming CSV writers.
+ * begin serializes writers; finish publishes only on success and always unlocks.
+ * Old generations must remain available to readers that already resolved them. */
+typedef struct {
+    ray_fd_t lock;
+    bool staged;
+    char root[1024];
+    char dir[1024];
+    char generation[256];
+} ray_splay_write_t;
+
+ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write);
+ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
+                                  bool durable);
+/* Write only to a fresh/unpublished directory owned by the caller. */
+ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
+                                 const char* sym_path, bool durable);
+/* Resolve once and retain the returned path for the entire read. */
+ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz);
 
 /* Splayed table I/O.
  *
@@ -47,8 +68,8 @@ ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
  * files so later mmap loads get block-skip.  Best-effort, per numeric column. */
 void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
 
-/* Partition loader entry: the parted reader opens root/sym ONCE and
- * passes the shared domain to every partition's columns. */
+/* Loader accepting a shared FILE domain. It resolves the generation first,
+ * then refreshes the cached domain to include any externally appended symbols. */
 ray_t*    ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom);
 
 #endif /* RAY_SPLAY_H */

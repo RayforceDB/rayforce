@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdatomic.h>
 
 /* --------------------------------------------------------------------------
  * Splayed table: directory of column files + .d schema file
@@ -152,7 +153,7 @@ static void splay_sweep_stale(ray_t* tbl, const char* dir) {
  * are written below .generations/<name> first, then .current is replaced with
  * one filesystem rename.  Readers that predate this format continue to use
  * the legacy directory when .current is absent. */
-static unsigned long splay_generation_seq;
+static _Atomic unsigned long splay_generation_seq;
 
 static ray_err_t splay_current_dir(const char* dir, char* out, size_t out_sz,
                                    bool* active) {
@@ -162,25 +163,27 @@ static ray_err_t splay_current_dir(const char* dir, char* out, size_t out_sz,
         return RAY_ERR_RANGE;
     *active = false;
 
-    struct stat st;
-    if (stat(manifest, &st) != 0) {
+    FILE* f = fopen(manifest, "rb");
+    if (!f) {
         if (errno == ENOENT) return RAY_OK; /* legacy splayed directory */
         return RAY_ERR_IO;
     }
 
-    FILE* f = fopen(manifest, "rb");
-    if (!f) return RAY_ERR_IO;
-
     char rel[512];
-    int scanned = fscanf(f, "%511s", rel);
+    size_t len = fread(rel, 1, sizeof(rel), f);
+    bool failed = ferror(f) != 0;
     int closed = fclose(f);
-    if (scanned != 1 || closed != 0) {
+    if (failed || closed != 0 || len == 0 || len >= sizeof(rel)) {
         return RAY_ERR_CORRUPT;
     }
+    if (rel[len - 1] == '\n') len--;
+    rel[len] = '\0';
     if (strncmp(rel, ".generations/", 13) != 0 ||
-        strstr(rel, "..") || strstr(rel, "\\") ||
-        strcmp(rel, ".generations/") == 0)
+        len <= 13 || memchr(rel, '\0', len))
         return RAY_ERR_CORRUPT;
+    for (size_t i = 13; i < len; i++)
+        if (!((rel[i] >= '0' && rel[i] <= '9') || rel[i] == 'g' || rel[i] == '-'))
+            return RAY_ERR_CORRUPT;
 
     n = snprintf(out, out_sz, "%s/%s", dir, rel);
     if (n < 0 || (size_t)n >= out_sz) return RAY_ERR_RANGE;
@@ -188,13 +191,22 @@ static ray_err_t splay_current_dir(const char* dir, char* out, size_t out_sz,
     return RAY_OK;
 }
 
-static ray_err_t splay_publish_generation(const char* dir, const char* gen) {
+ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz) {
+    if (!dir || !out || !out_sz) return RAY_ERR_IO;
+    bool active;
+    ray_err_t err = splay_current_dir(dir, out, out_sz, &active);
+    if (err != RAY_OK || active) return err;
+    int n = snprintf(out, out_sz, "%s", dir);
+    return n < 0 || (size_t)n >= out_sz ? RAY_ERR_RANGE : RAY_OK;
+}
+
+static ray_err_t splay_publish_generation(const char* dir, const char* gen,
+                                          bool durable) {
     char manifest[1024], tmp[1024];
     int n = snprintf(manifest, sizeof(manifest), "%s/.current", dir);
     if (n < 0 || (size_t)n >= sizeof(manifest)) return RAY_ERR_RANGE;
-    n = snprintf(tmp, sizeof(tmp), "%s/.current.tmp.%lu.%lu.%lu", dir,
-                 (unsigned long)time(NULL), (unsigned long)getpid(),
-                 ++splay_generation_seq);
+    /* The exclusively created generation owns this temporary file. */
+    n = snprintf(tmp, sizeof(tmp), "%s/%s/.current.tmp", dir, gen);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return RAY_ERR_RANGE;
 
     FILE* f = fopen(tmp, "wb");
@@ -213,26 +225,27 @@ static ray_err_t splay_publish_generation(const char* dir, const char* gen) {
         (void)remove(tmp);
         return RAY_ERR_IO;
     }
-    ray_err_t err = ray_file_sync(fd);
+    ray_err_t err = durable ? ray_file_sync(fd) : RAY_OK;
     ray_file_close(fd);
     if (err != RAY_OK || ray_file_rename(tmp, manifest) != RAY_OK) {
         (void)remove(tmp);
         return RAY_ERR_IO;
     }
-    return ray_file_sync_dir(manifest);
+    return durable ? ray_file_sync_dir(manifest) : RAY_OK;
 }
 
-static bool splay_has_file(const char* dir, const char* name) {
+static ray_err_t splay_has_file(const char* dir, const char* name, bool* exists) {
     char path[1024];
     int n = snprintf(path, sizeof(path), "%s/%s", dir, name);
-    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
     struct stat st;
-    return stat(path, &st) == 0;
+    *exists = stat(path, &st) == 0;
+    return *exists || errno == ENOENT ? RAY_OK : RAY_ERR_IO;
 }
 
-static ray_err_t splay_save_to_dir_impl(ray_t* tbl, const char* dir,
-                                        const char* sym_path, bool durable) {
-    if (!tbl || RAY_IS_ERR(tbl)) return RAY_ERR_TYPE;
+static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
+                                     const char* sym_path) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return RAY_ERR_TYPE;
     if (!dir) return RAY_ERR_IO;
 
     ray_err_t name_err = splay_validate_persisted_names(tbl);
@@ -286,6 +299,37 @@ static ray_err_t splay_save_to_dir_impl(ray_t* tbl, const char* dir,
         }
     }
 
+    return RAY_OK;
+}
+
+static ray_err_t splay_sync_files(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) return RAY_ERR_IO;
+    ray_err_t err = RAY_OK;
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char path[1024];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) { err = RAY_ERR_RANGE; break; }
+        struct stat st;
+        if (stat(path, &st) != 0) { err = RAY_ERR_IO; break; }
+        if (!S_ISREG(st.st_mode)) continue;
+        ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (fd == RAY_FD_INVALID) { err = RAY_ERR_IO; break; }
+        err = ray_file_sync(fd);
+        ray_file_close(fd);
+        if (err != RAY_OK) break;
+    }
+    closedir(d);
+    return err;
+}
+
+ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
+                                 const char* sym_path, bool durable) {
+    ray_err_t validation = splay_validate_save(tbl, dir, sym_path);
+    if (validation != RAY_OK) return validation;
     /* Create directory and any missing parents (mkdir -p semantics).
      * Required for partitioned layouts like "/db/2024.01.01/t/" where the
      * caller hasn't pre-created the date partition. */
@@ -348,13 +392,7 @@ static ray_err_t splay_save_to_dir_impl(ray_t* tbl, const char* dir,
 
     int64_t ncols = ray_table_ncols(tbl);
 
-    /* 2. Column files (and the schema names they correspond to).
-     * NOTE: overwriting an existing dir rewrites columns in place; a crash
-     * mid-loop leaves old .d + a mix of old/new column files.  Ragged
-     * lengths are caught at load (column-length check); equal-length
-     * mixed-generation rows are inherent to in-place overwrite and would
-     * need staged writes — out of scope (fresh-dir crashes degrade to a
-     * visibly missing table via the .d-last commit marker). */
+    /* 2. Write the column files in the caller's unpublished directory. */
     ray_t* schema = ray_vec_new(RAY_STR, ncols > 0 ? ncols : 1);
     if (!schema || RAY_IS_ERR(schema)) {
         if (schema) ray_release(schema);
@@ -385,9 +423,7 @@ static ray_err_t splay_save_to_dir_impl(ray_t* tbl, const char* dir,
             : (durable ? ray_col_save(col, path)
                        : ray_col_save_bulk(col, path));
         if (err != RAY_OK) {
-            /* No new .d is written.  Preflight prevents deterministic format
-             * failures here; an I/O error or crash can still leave an
-             * existing directory with mixed-generation column files. */
+            /* No new .d or .current is published on failure. */
             ray_release(schema);
             if (dom) ray_sym_domain_release(dom);
             return err;
@@ -400,6 +436,13 @@ static ray_err_t splay_save_to_dir_impl(ray_t* tbl, const char* dir,
         }
     }
     if (dom) ray_sym_domain_release(dom);
+
+    /* Indexes belong to this generation and must precede publication. */
+    ray_splay_build_indexes(dir, tbl);
+    if (durable) {
+        ray_err_t err = splay_sync_files(dir);
+        if (err != RAY_OK) { ray_release(schema); return err; }
+    }
 
     /* 3. .d LAST — the commit marker. */
     {
@@ -421,52 +464,91 @@ static ray_err_t splay_save_to_dir_impl(ray_t* tbl, const char* dir,
     return RAY_OK;
 }
 
+ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
+                                  bool durable) {
+    if (result == RAY_OK && write->staged) {
+        /* ray_file_sync_dir syncs the PARENT of its argument. */
+        char schema[1100];
+        snprintf(schema, sizeof(schema), "%s/.d", write->dir);
+        if (durable && (ray_file_sync_dir(schema) != RAY_OK ||
+                        ray_file_sync_dir(write->dir) != RAY_OK))
+            result = RAY_ERR_IO;
+        if (result == RAY_OK)
+            result = splay_publish_generation(write->root, write->generation, durable);
+    }
+    if (write->lock != RAY_FD_INVALID) {
+        (void)ray_file_unlock(write->lock);
+        ray_file_close(write->lock);
+        write->lock = RAY_FD_INVALID;
+    }
+    /* A reader may have resolved the old path without opening every column.
+     * Keep both legacy files and old generations immutable after publication. */
+    return result;
+}
+
+ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
+    memset(write, 0, sizeof(*write));
+    write->lock = RAY_FD_INVALID;
+    if (!dir || !*dir) return RAY_ERR_IO;
+    int n = snprintf(write->root, sizeof(write->root), "%s", dir);
+    if (n < 0 || (size_t)n >= sizeof(write->root)) return RAY_ERR_RANGE;
+    size_t len = strlen(write->root);
+    while (len > 1 && write->root[len - 1] == '/') write->root[--len] = '\0';
+    ray_err_t err = ray_mkdir_p(write->root);
+    if (err != RAY_OK) return err;
+
+    char path[1024];
+    n = snprintf(path, sizeof(path), "%s/.write.lock", write->root);
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    write->lock = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    if (write->lock == RAY_FD_INVALID) return RAY_ERR_IO;
+    err = ray_file_lock_ex(write->lock);
+    if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
+
+    bool schema, current;
+    err = splay_has_file(write->root, ".d", &schema);
+    if (err == RAY_OK) err = splay_has_file(write->root, ".current", &current);
+    if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
+    write->staged = schema || current;
+    if (!write->staged) {
+        memcpy(write->dir, write->root, len + 1);
+        return RAY_OK;
+    }
+    n = snprintf(path, sizeof(path), "%s/.generations", write->root);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return ray_splay_write_finish(write, RAY_ERR_RANGE, false);
+    err = ray_mkdir_p(path);
+    if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
+
+    for (;;) {
+        unsigned long seq = atomic_fetch_add(&splay_generation_seq, 1);
+        snprintf(write->generation, sizeof(write->generation), ".generations/g-%lu-%lu-%lu",
+                 (unsigned long)time(NULL), (unsigned long)getpid(), seq);
+        n = snprintf(write->dir, sizeof(write->dir), "%s/%s", write->root, write->generation);
+        if (n < 0 || (size_t)n >= sizeof(write->dir))
+            return ray_splay_write_finish(write, RAY_ERR_RANGE, false);
+#ifdef RAY_OS_WINDOWS
+        if (CreateDirectoryA(write->dir, NULL)) break;
+        if (GetLastError() != ERROR_ALREADY_EXISTS)
+#else
+        if (mkdir(write->dir, 0755) == 0) break;
+        if (errno != EEXIST)
+#endif
+            return ray_splay_write_finish(write, RAY_ERR_IO, false);
+        /* Never reuse an existing generation, including after PID reuse. */
+    }
+    return RAY_OK;
+}
+
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable) {
-    if (!tbl || RAY_IS_ERR(tbl)) return RAY_ERR_TYPE;
-    if (!dir) return RAY_ERR_IO;
-
-    /* Keep the first write backward-compatible.  Once a table has a
-     * committed schema (or already uses generations), every replacement is
-     * staged out-of-place and published through .current. */
-    bool atomic = splay_has_file(dir, ".d") || splay_has_file(dir, ".current");
-    if (!atomic)
-        return splay_save_to_dir_impl(tbl, dir, sym_path, durable);
-
-    ray_err_t err = ray_mkdir_p(dir);
+    ray_err_t err = splay_validate_save(tbl, dir, sym_path);
     if (err != RAY_OK) return err;
-
-    char generations[1024], gen_name[256], gen_dir[1024];
-    int n = snprintf(generations, sizeof(generations), "%s/.generations", dir);
-    if (n < 0 || (size_t)n >= sizeof(generations)) return RAY_ERR_RANGE;
-    err = ray_mkdir_p(generations);
+    ray_splay_write_t write;
+    err = ray_splay_write_begin(dir, &write);
     if (err != RAY_OK) return err;
-
-    n = snprintf(gen_name, sizeof(gen_name), ".generations/g-%lu-%lu-%lu",
-                 (unsigned long)time(NULL), (unsigned long)getpid(),
-                 ++splay_generation_seq);
-    if (n < 0 || (size_t)n >= sizeof(gen_name)) return RAY_ERR_RANGE;
-    n = snprintf(gen_dir, sizeof(gen_dir), "%s/%s", dir, gen_name);
-    if (n < 0 || (size_t)n >= sizeof(gen_dir)) return RAY_ERR_RANGE;
-
-    err = splay_save_to_dir_impl(tbl, gen_dir, sym_path, durable);
-    if (err != RAY_OK) return err;
-    if (durable && ray_file_sync_dir(gen_dir) != RAY_OK)
-        return RAY_ERR_IO;
-    if (ray_file_sync_dir(generations) != RAY_OK)
-        return RAY_ERR_IO;
-
-    /* This is the table-level commit point.  A failure before this rename
-     * leaves the old .current (and therefore the old complete generation)
-     * untouched. */
-    err = splay_publish_generation(dir, gen_name);
-    if (err != RAY_OK) return err;
-
-    /* Legacy files are no longer read once .current exists.  Remove stale
-     * columns opportunistically for existing callers that inspect the old
-     * directory layout; failure here cannot invalidate the committed table. */
-    splay_sweep_stale(tbl, dir);
-    return RAY_OK;
+    err = ray_splay_write_table(tbl, write.dir, sym_path, durable);
+    return ray_splay_write_finish(&write, err, durable);
 }
 
 ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
@@ -622,13 +704,12 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
 static ray_t* splay_load_impl(const char* dir, const char* sym_path,
                               bool use_mmap) {
     char resolved[1024];
-    bool active = false;
-    ray_err_t current_err = splay_current_dir(dir, resolved, sizeof(resolved),
-                                              &active);
-    if (current_err != RAY_OK)
-        return ray_error("corrupt", "splayed %s: invalid .current manifest", dir);
-
-    const char* load_dir = active ? resolved : dir;
+    ray_err_t err = ray_splay_resolve_dir(dir, resolved, sizeof(resolved));
+    if (err != RAY_OK)
+        return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
+    /* Resolve first: a newly published generation can reference symbols
+     * appended since a previous domain open. Opening afterwards refreshes
+     * the cached domain before any of those column codes are validated. */
     ray_sym_domain_t* dom = NULL;
     if (sym_path) {
         struct stat st;
@@ -640,7 +721,7 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path,
                     "record, or missing \"\" at position 0)", sym_path);
         }
     }
-    ray_t* tbl = splay_load_dom_impl(load_dir, dom, use_mmap);
+    ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap);
     if (dom) ray_sym_domain_release(dom); /* columns hold their own refs */
     return tbl;
 }
@@ -861,5 +942,18 @@ ray_t* ray_read_splayed(const char* dir, const char* sym_path) {
 }
 
 ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
-    return splay_load_dom_impl(dir, dom, true);
+    char resolved[1024];
+    ray_err_t err = ray_splay_resolve_dir(dir, resolved, sizeof(resolved));
+    if (err != RAY_OK)
+        return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
+    ray_sym_domain_t* fresh = NULL;
+    const char* path = dom ? ray_sym_domain_path(dom) : NULL;
+    if (path) {
+        fresh = ray_sym_domain_open(path);
+        if (!fresh) return ray_error("corrupt", "cannot refresh splayed symfile");
+        dom = fresh;
+    }
+    ray_t* tbl = splay_load_dom_impl(resolved, dom, true);
+    if (fresh) ray_sym_domain_release(fresh);
+    return tbl;
 }
