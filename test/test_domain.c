@@ -1804,6 +1804,47 @@ static test_result_t test_domain_runtime_lut(void) {
     PASS();
 }
 
+static test_result_t test_domain_concat_text_nulls(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    /* Fixture includes the builtin vocabulary, so its positions need W16. */
+    const uint8_t widths[] = {RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64};
+    for (int w = 0; w < 3; w++) {
+        ray_t* file = ray_sym_vec_new(widths[w], 4);
+        ray_sym_domain_release(file->sym_domain);
+        ray_sym_domain_retain(dom);
+        file->sym_domain = dom;
+        file->len = 4;
+        const int64_t vals[] = {pos_b, pos_a, 0, pos_b};
+        for (int i = 0; i < 4; i++) ray_write_sym(ray_data(file), i, vals[i], RAY_SYM, file->attrs);
+        int64_t ids[] = {0, ray_sym_intern("dq_b", 4)};
+        ray_t* runtime = ray_vec_from_raw(RAY_SYM, ids, 2);
+        ray_t* slice = ray_vec_slice(file, 1, 2);
+        for (int side = 0; side < 2; side++) {
+            ray_t* out = ray_vec_concat(side ? runtime : slice, side ? slice : runtime);
+            TEST_ASSERT_NOT_NULL(out);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+            TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out), ray_sym_runtime_domain());
+            TEST_ASSERT_EQ_I(out->attrs & RAY_SYM_W_MASK, RAY_SYM_W64);
+            TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
+            TEST_ASSERT_FALSE(out->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX));
+            int64_t expected[] = {ray_sym_intern("dq_a", 4), 0, 0, ids[1]};
+            for (int i = 0; i < 4; i++) {
+                int64_t value = expected[(i + (side ? 2 : 0)) % 4];
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[i], value);
+                TEST_ASSERT_EQ_I(ray_vec_is_null(out, i), value == 0);
+            }
+            ray_release(out);
+        }
+        ray_release(slice); ray_release(file); ray_release(runtime);
+    }
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 #define TMP_DOM_BADSYM_PATH "/tmp/rayforce_test_domain_badsym"
 
 /* Position-0 reservation: ray_sym_save-produced files carry "" at
@@ -1986,6 +2027,7 @@ const test_entry_t domain_entries[] = {
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
+    { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
     { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
