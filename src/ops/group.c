@@ -10955,7 +10955,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (prod[a].ta != RAY_F64)      { ip = prod[a].pa; it = prod[a].ta; }
             else if (prod[a].tb != RAY_F64) { ip = prod[a].pb; it = prod[a].tb; }
             else continue;                   /* F64×F64 — no int side */
-            if (it != RAY_I64 && it != RAY_TIME && it != RAY_I32) continue;
+            if (it != RAY_I64 && it != RAY_I32) continue;
             for (uint32_t b = 0; b < n_aggs; b++) {
                 if (b == a || !agg_vecs[b] || ctx.fused_by[b] >= 0) continue;
                 if (ext->agg_ops[b] != OP_SUM && ext->agg_ops[b] != OP_AVG) continue;
