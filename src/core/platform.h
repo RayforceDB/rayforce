@@ -180,6 +180,10 @@ uint32_t ray_physical_core_count(void);
  * 0 when the platform cannot report it.  Bounds replicated per-task state
  * whose random-access working set must stay cache-resident to scale. */
 uint64_t ray_cache_llc_bytes(void);
+#ifdef DEBUG
+/* Pin ray_cache_llc_bytes to `bytes` (0 = probe again). */
+void ray_cache_llc_set_for_test(uint64_t bytes);
+#endif
 
 void ray_parallel_begin(void);
 void ray_parallel_end(void);
