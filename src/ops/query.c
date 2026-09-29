@@ -528,6 +528,79 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
     return 0;
 }
 
+/* See the call site in ray_select_impl.  NULL: some output is not answerable
+ * from metadata (the caller plans the query as usual). */
+static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
+                                        int64_t from_id) {
+    int64_t nrows = ray_table_nrows(tbl);
+    if (nrows <= 0) return NULL;   /* empty tables keep the planner's answers */
+    int64_t n_out = 0;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        if (dict_elems[i]->i64 == from_id) continue;
+        ray_t* e = dict_elems[i + 1];
+        if (!e || e->type != RAY_LIST || ray_len(e) != 2) return NULL;
+        ray_t** el = (ray_t**)ray_data(e);
+        if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) return NULL;
+        if (el[1]->type != -RAY_SYM || (el[1]->attrs & ATTR_QUOTED)) return NULL;
+        ray_t* col = ray_table_get_col(tbl, el[1]->i64);
+        if (!col || !ray_is_vec(col) || RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+            (col->attrs & RAY_ATTR_SLICE) || col->len != nrows)
+            return NULL;
+        uint16_t op = resolve_agg_opcode(el[0]->i64);
+        bool int_col = col->type == RAY_I64 || col->type == RAY_I32 ||
+                       col->type == RAY_I16 || col->type == RAY_U8;
+        int64_t zs, zn; bool exact = false;
+        switch (op) {
+        case OP_COUNT: break;
+        case OP_MIN: case OP_MAX: {
+            if (ray_index_kind(col) != RAY_IDX_CHUNK_ZONE) return NULL;
+            ray_index_t* ix = ray_index_payload(col->index);
+            if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64 ||
+                !ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs) return NULL;
+            break;
+        }
+        case OP_SUM:
+            if (!int_col || !ray_zone_int_sum(col, &zs, &zn, NULL)) return NULL;
+            break;
+        case OP_AVG:
+            if (!int_col || !ray_zone_int_sum(col, &zs, &zn, &exact) || !exact) return NULL;
+            break;
+        default: return NULL;
+        }
+        n_out++;
+    }
+    if (n_out == 0) return NULL;
+
+    ray_t* res = ray_table_new(n_out);
+    if (!res || RAY_IS_ERR(res)) return NULL;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id) continue;
+        ray_t** el = (ray_t**)ray_data(dict_elems[i + 1]);
+        ray_t* col = ray_table_get_col(tbl, el[1]->i64);
+        uint16_t op = resolve_agg_opcode(el[0]->i64);
+        ray_t* atom = op == OP_COUNT ? ray_i64(nrows)
+                    : op == OP_MIN   ? ray_min_fn(col)
+                    : op == OP_MAX   ? ray_max_fn(col)
+                    : op == OP_SUM   ? ray_sum_fn(col)
+                    :                  ray_avg_fn(col);
+        if (!atom || RAY_IS_ERR(atom) || !ray_is_atom(atom)) {
+            if (atom && RAY_IS_ERR(atom)) ray_error_free(atom); else if (atom) ray_release(atom);
+            ray_release(res);
+            return NULL;
+        }
+        ray_t* v = ray_vec_new(-atom->type, 1);
+        if (v && !RAY_IS_ERR(v)) v = ray_vec_append(v, &atom->i64);
+        if (v && !RAY_IS_ERR(v) && RAY_ATOM_IS_NULL(atom)) ray_vec_set_null(v, 0, true);
+        ray_release(atom);
+        if (!v || RAY_IS_ERR(v)) { ray_release(res); return NULL; }
+        res = ray_table_add_col(res, kid, v);
+        ray_release(v);
+        if (!res || RAY_IS_ERR(res)) return NULL;
+    }
+    return res;
+}
+
 static bool agg_name_is_percentile(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
     return s && ray_str_len(s) == 10 &&
@@ -7741,6 +7814,24 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     /* Simple case: no clauses at all → return table as-is */
     if (n_out == 0 && !where_expr && !by_expr && !take_expr && !has_sort && !nearest_expr)
         { DICT_VIEW_CLOSE(dv); return tbl; }
+
+    /* Whole-table aggregates answered from column metadata:
+     * `(select {from: T a: (sum c) b: (min d) …})` with no other clause, each
+     * output one of count / min / max / sum / avg over a plain column that
+     * the metadata answers exactly — count is the row count; min/max read
+     * the chunk-zone extrema of an integer or temporal column; sum and avg
+     * read its per-chunk sums (avg only when no partial sum can leave
+     * double's integer range, so the value is the row-wise one).  Any
+     * output the metadata cannot answer leaves the query to the planner. */
+    if (!where_expr && !by_expr && !take_expr && !has_sort && !nearest_expr && n_out > 0 &&
+        tbl->type == RAY_TABLE) {
+        ray_t* meta_res = select_aggs_from_metadata(tbl, dict_elems, dict_n, from_id);
+        if (meta_res) {
+            ray_release(tbl);
+            DICT_VIEW_CLOSE(dv);
+            return meta_res;
+        }
+    }
 
     /* Streaming parted ORDER BY: `(select {…} from: PARTED asc/desc: KEY)`
      * with no by:/take:/nearest: over a table whose partitions are already

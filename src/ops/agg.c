@@ -404,6 +404,39 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
     return ray_f64(ray_f64_fin(num / sqrt(dx * dy)));
 }
 
+/* Whole-column sum / non-null count of an integer column from its
+ * chunk-zone index (per-chunk int64 sums with wraparound and non-null
+ * counts), in O(n_chunks).  `exact_f64` reports whether every partial sum
+ * an accumulation in double could meet stays below 2^53 in magnitude, i.e.
+ * the sum converted to double equals any double accumulation of the rows.
+ * Returns false when the column has no such index for its current length. */
+bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out, bool* exact_f64) {
+    if (!x || !ray_is_vec(x) || ray_index_kind(x) != RAY_IDX_CHUNK_ZONE) return false;
+    ray_index_t* ix = ray_index_payload(x->index);
+    if (ix->built_for_len != x->len || ix->u.chunk_zone.is_f64 || !ix->u.chunk_zone.aggs)
+        return false;
+    uint32_t n = ix->u.chunk_zone.n_chunks;
+    if (ix->u.chunk_zone.aggs->len != 2 * (int64_t)n) return false;
+    const int64_t* ag = (const int64_t*)ray_data(ix->u.chunk_zone.aggs);
+    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+    uint64_t sum = 0;
+    int64_t nn = 0;
+    double bound = 0.0;
+    for (uint32_t g = 0; g < n; g++) {
+        sum += (uint64_t)ag[g];
+        nn  += ag[n + g];
+        if (ag[n + g] > 0) {
+            double a = fabs((double)mins[g]), b = fabs((double)maxs[g]);
+            bound += (a > b ? a : b) * (double)ag[n + g];
+        }
+    }
+    *sum_out = (int64_t)sum;
+    *nn_out = nn;
+    if (exact_f64) *exact_f64 = bound < 9007199254740992.0;   /* 2^53 */
+    return true;
+}
+
 ray_t* ray_sum_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_SUM);
     if (RAY_IS_PARTED(x->type)) return agg_parted_sum(x);
@@ -417,6 +450,11 @@ ray_t* ray_sum_fn(ray_t* x) {
         /* Canonical admission: numeric + TIME (duration); DATE/TIMESTAMP are
          * absolute points and SYM/STR/GUID are non-numeric → type error. */
         if (!agg_type_admitted(OP_SUM, x->type)) return ray_error("type", "sum expects a numeric or time-duration vector, got %s", ray_type_name(x->type));
+        /* Integer columns with per-chunk sums in their zone index. */
+        if (x->type == RAY_I64 || x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8) {
+            int64_t zs, zn;
+            if (ray_zone_int_sum(x, &zs, &zn, NULL)) return make_i64(zs);
+        }
         /* Narrow/temporal types need specific return constructors that the
          * DAG executor doesn't provide — use scalar path for these.  TIMESTAMP
          * is rejected by agg_type_admitted() above, so only the duration-like
@@ -570,6 +608,16 @@ ray_t* ray_avg_fn(ray_t* x) {
         /* Canonical admission: numeric + temporal (→ F64); SYM/STR/GUID are
          * non-numeric → type error (the DAG path otherwise averaged raw ids). */
         if (!agg_type_admitted(OP_AVG, x->type)) return ray_error("type", "avg expects a numeric or temporal vector, got %s", ray_type_name(x->type));
+        /* Integer columns with per-chunk sums: exact when no partial sum can
+         * leave double's integer range (then every accumulation order in
+         * double gives the same value). */
+        if (x->type == RAY_I64 || x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8) {
+            int64_t zs, zn; bool exact = false;
+            if (ray_zone_int_sum(x, &zs, &zn, &exact) && exact) {
+                if (zn == 0) return ray_typed_null(-RAY_F64);
+                return make_f64((double)zs / (double)zn);
+            }
+        }
         AGG_VEC_VIA_DAG(x, ray_avg);
     }
     if (!is_list(x)) return ray_error("type", "avg expects a numeric vector, atom, or list, got %s", ray_type_name(x->type));
@@ -597,7 +645,7 @@ ray_t* ray_min_fn(ray_t* x) {
          * (mutation paths call ray_index_drop). */
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
-            if (ix->built_for_len == x->len) {
+            if (ix->built_for_len == x->len && ix->u.chunk_zone.mins) {
                 uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
                 if (ix->u.chunk_zone.is_f64) {
                     const double* mins = (const double*)ray_data(ix->u.chunk_zone.mins);
@@ -611,7 +659,12 @@ ray_t* ray_min_fn(ray_t* x) {
                     int64_t mn = INT64_MAX;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (mins[g] < mn) mn = mins[g];
-                    if (mn == INT64_MAX) return ray_typed_null(-x->type);
+                    /* All-null is what the non-null counts say when the
+                     * zone has them; the sentinel alone cannot tell a
+                     * column of INT64_MAX values from an empty one. */
+                    int64_t zs_, zn_;
+                    bool have_nn = ray_zone_int_sum(x, &zs_, &zn_, NULL);
+                    if (have_nn ? zn_ == 0 : mn == INT64_MAX) return ray_typed_null(-x->type);
                     /* Preserve the column's storage width on the result. */
                     switch (x->type) {
                     case RAY_BOOL:      return ray_bool((bool)mn);
@@ -652,7 +705,7 @@ ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
-            if (ix->built_for_len == x->len) {
+            if (ix->built_for_len == x->len && ix->u.chunk_zone.maxs) {
                 uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
                 if (ix->u.chunk_zone.is_f64) {
                     const double* maxs = (const double*)ray_data(ix->u.chunk_zone.maxs);
@@ -666,7 +719,12 @@ ray_t* ray_max_fn(ray_t* x) {
                     int64_t mx = INT64_MIN;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (maxs[g] > mx) mx = maxs[g];
-                    if (mx == INT64_MIN) return ray_typed_null(-x->type);
+                    /* All-null is what the non-null counts say when the
+                     * zone has them; the sentinel alone cannot tell a
+                     * column of INT64_MIN values from an empty one. */
+                    int64_t zs_, zn_;
+                    bool have_nn = ray_zone_int_sum(x, &zs_, &zn_, NULL);
+                    if (have_nn ? zn_ == 0 : mx == INT64_MIN) return ray_typed_null(-x->type);
                     switch (x->type) {
                     case RAY_BOOL:      return ray_bool((bool)mx);
                     case RAY_U8:        return ray_u8((uint8_t)mx);
