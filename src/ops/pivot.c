@@ -1498,7 +1498,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (agg_op == OP_MAX) need_flags |= GHT_NEED_MAX;
     /* Integer avg divides the exact 128-bit sum (high words in off_sum_hi),
      * like every group engine — never a wrapped int64. */
-    if (agg_op == OP_AVG && vcol->type != RAY_F64 && vcol->type != RAY_F32)
+    if (agg_op == OP_AVG && (vcol->type == RAY_I64 || vcol->type == RAY_TIMESTAMP ||
+                             (vcol->type != RAY_F64 && vcol->type != RAY_F32 &&
+                              nrows >= ((int64_t)1 << 31))))
         need_flags |= GHT_NEED_SUM128;
 
     /* n_keys/n_aggs are no longer capped: ght_compute_layout spills to an

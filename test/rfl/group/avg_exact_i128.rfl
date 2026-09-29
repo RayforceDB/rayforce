@@ -110,6 +110,17 @@
 (set TS (update {from: (table [s v c] (list (as 'SYM (% p 5)) hv hc)) s: (.idx.hash s)}))
 (at (select {from: TS where: (in s ['0 '1 '2]) by: s a: (avg v)}) 'a) -- [-0.5 -0.5 -0.5]
 (allE (at (select {from: TS where: (in s ['0 '1 '2]) by: s a: (avg c) s2: (sum c)}) 'a)) -- true
+;; single-key sparse scatter path (wide I32 key, avg over strlen of a STR
+;; column, a count, a where): the mean of the lengths, bit for bit
+(set cid (as 'I32 (* 35000 (% (* d 2654435761) 6000))))
+(set url (concat "http://example.com/some/path/" (as 'STR (* d (% d 977)))))
+(set H (table [cid url c] (list cid url hc)))
+(set R (select {from: H by: cid asc: cid l: (avg (strlen url)) n: (count url) where: (!= url "")}))
+(count R) -- 6000
+(== (first (at R 'l)) (avg (strlen (at (select {from: H where: (== cid 0)}) 'url)))) -- true
+(== (at R 'l) (at (select {from: H by: cid asc: cid l: (avg (strlen url)) where: (!= url "")}) 'l)) -- (take [true] 6000)
+(allE (at (select {from: H by: cid l: (avg c) n: (count url)}) 'l)) -- true
+(allE (at (select {from: H by: cid l: (avg c) s: (sum c) where: (!= url "")}) 'l)) -- true
 ;; a splayed copy answers exactly what the in-memory table answers
 (.sys.exec "rm -rf rf_test_avg_i128") -- 0
 (set Tm (table [c v d k3 f3 k350] (list hc hv d k3 f3 k350)))
