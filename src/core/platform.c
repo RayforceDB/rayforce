@@ -369,7 +369,7 @@ static uint64_t cache_sysfs_llc_bytes(void) {
 }
 #endif
 
-uint64_t ray_cache_llc_bytes(void) {
+static uint64_t cache_llc_probe(void) {
     static uint64_t cached = UINT64_MAX;
     if (cached != UINT64_MAX) return cached;
     uint64_t bytes = 0;
@@ -642,7 +642,7 @@ uint32_t ray_physical_core_count(void) {
 /* Sum of every level-3 cache instance reported by the processor topology
  * (each SYSTEM_LOGICAL_PROCESSOR_INFORMATION cache record is one instance).
  * 0 when the query fails. */
-uint64_t ray_cache_llc_bytes(void) {
+static uint64_t cache_llc_probe(void) {
     static uint64_t cached = UINT64_MAX;
     if (cached != UINT64_MAX) return cached;
     uint64_t bytes = 0;
@@ -800,7 +800,7 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
-uint64_t ray_cache_llc_bytes(void) { return 0; }
+static uint64_t cache_llc_probe(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the
  * counter must already be positive when wait fires). */
@@ -818,3 +818,21 @@ void ray_sem_wait(ray_sem_t* s) {
 void ray_sem_signal(ray_sem_t* s) { (*s)++; }
 
 #endif /* RAY_OS_WASM */
+
+#ifdef DEBUG
+/* Test pin for the probed LLC size: routing that bounds replicated state by
+ * the cache (group dense slabs) otherwise picks a different strategy on
+ * every CI runner.  0 restores the platform probe. */
+static uint64_t g_llc_for_test = 0;
+
+void ray_cache_llc_set_for_test(uint64_t bytes) {
+    g_llc_for_test = bytes;
+}
+#endif
+
+uint64_t ray_cache_llc_bytes(void) {
+#ifdef DEBUG
+    if (g_llc_for_test) return g_llc_for_test;
+#endif
+    return cache_llc_probe();
+}

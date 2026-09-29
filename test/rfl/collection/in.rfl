@@ -86,9 +86,10 @@
 (in (list) [1h 2h]) -- (list)
 
 ;; ========== TEXT (SYM/STR) NULL SEMANTICS (#593) ==========
-;; `in` admits the typed verdict-LUT kernel only when BOTH sides are exactly
-;; null-free, because that kernel uses null-matches-nothing semantics while
-;; this path is null-equals-null.  The gate used to ask
+;; `in` admits the typed verdict-LUT kernel unless BOTH sides carry a null:
+;; the kernel uses null-matches-nothing semantics while the hashset path is
+;; null-equals-null, and the two disagree only on a null row against a null
+;; set element.  The gate used to ask
 ;; ray_vec_may_have_nulls, which is unconditionally true for SYM and STR
 ;; (their null is a payload value, not an attribute bit) — so the kernel was
 ;; unreachable for text columns and every symbol `in` fell through to the
@@ -102,8 +103,8 @@
 ;; null in the column, non-null needle — the null matches nothing else
 (in (as 'SYM ["a" "" "b"]) (as 'SYM ["a"])) -- [true false false]
 
-;; null only in the NEEDLES: the column is null-free but the gate must still
-;; reject, since a null needle needs null-equals-null against nothing
+;; null only in the NEEDLES: a null-free column has no row for the null
+;; needle to equal, so both semantics agree and the kernel is admitted
 (in (as 'SYM ["a" "b"]) (as 'SYM ["" "a"])) -- [true false]
 
 ;; nulls on both sides
@@ -112,6 +113,38 @@
 ;; null-free text: this is the shape that now reaches the kernel
 (in (as 'SYM ["a" "b" "c"]) (as 'SYM ["b" "c"])) -- [false true true]
 (in ["a" "b" "c"] ["b" "c"]) -- [false true true]
+
+;; ========== ONE-SIDED NULLS REACH THE KERNEL (#593) ==========
+;; A nullable column against null-free needles (or the reverse) is admitted:
+;; a null row can only match a null needle.  Before, one null row sent the
+;; whole column to the hashset, whose i64/f64 hashes disagree across numeric
+;; types — so the mixed-type rows below also answered wrongly.
+
+;; nullable column, null-free needles, every null-bearing width
+(in [1 0Nl 3] [1 3]) -- [true false true]
+(in [1i 0Ni 3i] [1 3]) -- [true false true]
+(in [1h 0Nh 3h] [1h]) -- [true false false]
+(in [1.0 0Nf 3.0] [1.0 3.0]) -- [true false true]
+(in [2024.01.01 0Nd] [2024.01.01]) -- [true false]
+(in ["a" "" "b"] ["a"]) -- [true false false]
+
+;; the i32 null sentinel is INT32_MIN: a non-null needle of that value must
+;; not match the null row
+(in [1i 0Ni 3i] [-2147483648 3]) -- [false false true]
+
+;; null-free column, null needles: the null needle matches nothing
+(in [1 2 3] [0Nl 3]) -- [false false true]
+(in [1.0 2.0 3.0] [0Nf 3.0]) -- [false false true]
+(in [2024.01.01 2024.01.02] [0Nd 2024.01.02]) -- [false true]
+(in ["a" "b"] ["" "a"]) -- [true false]
+
+;; mixed int/float with a null on one side — was [true false false] and
+;; [false false false] on the hashset path
+(in [1.0 0Nf 3.0] [1 3]) -- [true false true]
+(in [1 0Nl 3] [1.0 3.0]) -- [true false true]
+
+;; nulls on both sides still take the null-equals-null path
+(in [1 0Nl 3] [0Nl 3]) -- [false true true]
 
 ;; empty needle set over a null-free symbol column
 (in (as 'SYM ["a" "b"]) (as 'SYM [])) -- [false false]
@@ -123,3 +156,64 @@
 
 ;; duplicate needles must not double-count or change the verdict
 (in (as 'SYM ["a" "b"]) (as 'SYM ["a" "a" "a"])) -- [true false]
+
+;; ========== TEMPORAL EQUALS ONLY ITS OWN TYPE (#593 review) ==========
+;; atom_eq never matches a DATE to an int or to a TIMESTAMP, and neither do
+;; find / except or the hashset `in`.  The typed kernel compared raw
+;; payloads — day 0 matched 0i, a DATE's day count matched a TIMESTAMP's
+;; nanoseconds — so widening its gate made the answer depend on where the
+;; nulls were.  Every shape below answers the same with nulls on either
+;; side, none, or (for the hashset) both.
+
+;; temporal column, int needles: nothing matches
+(in [2000.01.01 2000.01.03] [0i 2i]) -- [false false]
+(in [2000.01.01 0Nd 2000.01.03] [0i 2i]) -- [false false false]
+(in [2000.01.01 2000.01.03] [0Ni 2i]) -- [false false]
+(in [2000.01.01 0Nd] [0]) -- [false false]
+(in [00:00:01.000 0Nt] [1000i]) -- [false false]
+(in [2000.01.01D00:00:00.000000000 0Np] [0]) -- [false false]
+
+;; int column, temporal needles: nothing matches
+(in [0i 2i] [2000.01.01 2000.01.03]) -- [false false]
+(in [0 0Nl] [2000.01.01]) -- [false false]
+(in [0 1] [2000.01.01 0Nd]) -- [false false]
+
+;; distinct temporal types never match — not even by raw payload
+(in [2000.01.02] [2000.01.01D00:00:00.000000001]) -- [false]
+(in [2000.01.02 0Nd] [2000.01.02D00:00:00.000000000]) -- [false false]
+(in [2000.01.01D00:00:00.000000000 0Np] [2000.01.01]) -- [false false]
+(in [00:00:00.001] [2000.01.01D00:00:00.000000001]) -- [false]
+
+;; same with nulls on both sides: only null equals null
+(in [2000.01.01 0Nd] [0Ni 0i]) -- [false true]
+
+;; same-type temporal still matches, with or without nulls
+(in [2000.01.01 0Nd 2000.01.03] [2000.01.03]) -- [false false true]
+(in [2000.01.01 2000.01.03] [2000.01.01 0Nd]) -- [true false]
+
+;; the fused where: and find agree with the bare in
+(count (select {from: (table [d] (list [2000.01.01 2000.01.03 0Nd])) where: (in d [0i 2i])})) -- 0
+(find [2000.01.01 2000.01.03] [0i]) -- [0Nl]
+
+;; ========== LARGE NEEDLE SETS HASH INSIDE THE KERNEL ==========
+;; Past the SIMD small-set size (8) the kernel hashes the needles instead of
+;; scanning them per row, so a nullable column against thousands of needles
+;; stays O(rows + needles).  Pins the boundary and the table's edge values.
+
+;; 8 needles (SIMD path) and 9 (hash path) answer alike
+(in [1 2 3 0Nl 20] [1 3 5 7 9 11 13 15]) -- [true false true false false]
+(in [1 2 3 0Nl 20] [1 3 5 7 9 11 13 15 20]) -- [true false true false true]
+(in [1.0 2.0 0Nf 20.0] [1.0 3.0 5.0 7.0 9.0 11.0 13.0 15.0 20.0]) -- [true false false true]
+
+;; -0.0 and +0.0 share a slot; NaN / null never match
+(in [-0.0 0.0 1.5] (as 'F64 (til 20))) -- [true true false]
+(in [0Nf 2.5] (concat (as 'F64 (til 20)) [2.5])) -- [false true]
+
+;; duplicates in a large set, and a large set against a nullable column
+(sum (in (concat (til 1000) [0Nl]) (take (til 100) 5000))) -- 100
+(sum (in (concat (til 1000) [0Nl]) (* 2 (til 1000)))) -- 500
+(sum (in (concat (as 'F64 (til 1000)) [0Nf]) (as 'F64 (* 2 (til 1000))))) -- 500
+
+;; a large set of narrow ints against a narrow column
+(sum (in (as 'I32 (til 1000)) (as 'I32 (* 3 (til 100))))) -- 100
+(sum (in (as 'I16 (til 1000)) (as 'I16 (* 3 (til 100))))) -- 100
