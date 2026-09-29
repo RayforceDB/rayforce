@@ -151,6 +151,7 @@ static inline void scratch_free(ray_t* hdr) {
 typedef struct {
     const char* ptr;
     uint32_t    len;
+    uint32_t    hash;   /* ray_hash_bytes of the field; filled for SYM columns */
 } csv_strref_t;
 
 RAY_INLINE const char* scan_field(const char* p, const char* buf_end,
@@ -952,9 +953,15 @@ static size_t csv_scan_split_at(const char* buf, size_t file_size, size_t s,
 
 /* Returns the row count (>=0), -1 if interrupted, or -2 when the parallel
  * path does not apply and the caller should run the serial scan. */
+/* force_quotes: the caller scans a byte window of a file and knows quotes
+ * occur somewhere in the file's data.  The quote-aware state machine is
+ * then used even when this window holds none, so a window is split into
+ * rows exactly as the whole file would be (the quote-free fast path treats
+ * a lone '\r' and "\n\r" differently). */
 static int64_t build_row_offsets_par(const char* buf, size_t buf_size,
                                      size_t data_offset,
                                      uint64_t prog_base, uint64_t prog_len,
+                                     bool force_quotes,
                                      int64_t** offsets_out, ray_t** hdr_out) {
     *offsets_out = NULL;
     *hdr_out = NULL;
@@ -1023,7 +1030,7 @@ static int64_t build_row_offsets_par(const char* buf, size_t buf_size,
         total_q    += quote_cnt[i];
         total_term += term_cnt[i];
     }
-    ctx.has_quotes = total_q != 0;
+    ctx.has_quotes = total_q != 0 || force_quotes;
 
     /* Now nudge the boundaries for the state machine pass 1 just chose.  The
      * byte skipped is always '\n' or '\r', never '"', so the parities
@@ -1201,7 +1208,7 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
      * -2 means "not applicable" (small file, no pool, allocation refused) and
      * falls back to the serial scan, which defines the semantics. */
     int64_t par = build_row_offsets_par(buf, buf_size, data_offset,
-                                        prog_base, prog_len,
+                                        prog_base, prog_len, false,
                                         offsets_out, hdr_out);
     if (par != -2) return par;
 
@@ -1209,6 +1216,59 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
     return build_row_offsets_serial(buf, buf_size, data_offset,
                                     prog_base, prog_len,
                                     offsets_out, hdr_out);
+}
+
+/* Row starts of the next `max_rows` rows from `data_offset`, found by the
+ * parallel scanner over a byte window instead of the serial walk: the
+ * window is sized from `avg_row` (bytes per row seen so far) with slack, and
+ * doubled when it holds fewer than max_rows + 1 row starts before the end
+ * of the file (the extra start proves the max_rows-th row is complete).
+ * Returns the row count, -1 if interrupted, or -2 when the parallel path
+ * does not apply (small window, no pool) — the caller then runs the serial
+ * limited scan. */
+static int64_t build_row_offsets_window(const char* buf, size_t buf_size,
+                                        size_t data_offset, int64_t max_rows,
+                                        size_t avg_row, bool data_has_quotes,
+                                        int64_t** offsets_out, ray_t** hdr_out,
+                                        size_t* next_offset_out) {
+    *offsets_out = NULL; *hdr_out = NULL;
+    if (next_offset_out) *next_offset_out = data_offset;
+    if (max_rows <= 0 || data_offset >= buf_size) return 0;
+    if (avg_row < 8) avg_row = 8;
+    size_t window = (size_t)max_rows * avg_row + (size_t)max_rows * avg_row / 4 + (64u << 10);
+    for (;;) {
+        size_t end = data_offset + window;
+        if (end > buf_size || end < data_offset) end = buf_size;
+        /* Readahead hint for the window about to be scanned: the scanner's
+         * tasks fault the pages in parallel, which a cold file serves best
+         * when the kernel already streams the range. */
+        {
+            size_t ps = (size_t)sysconf(_SC_PAGESIZE);
+            size_t a = data_offset & ~(ps - 1);
+            madvise((void*)(buf + a), end - a, MADV_WILLNEED);
+        }
+        int64_t* offs = NULL; ray_t* hdr = NULL;
+        int64_t n = build_row_offsets_par(buf, end, data_offset, 0, 0,
+                                          data_has_quotes, &offs, &hdr);
+        if (n < 0) return n;                 /* -1 interrupted, -2 not applicable */
+        if (n == 0) { scratch_free(hdr); return -2; }
+        if (n > max_rows) {
+            /* row max_rows - 1 ends before start max_rows: complete */
+            if (next_offset_out) *next_offset_out = (size_t)offs[max_rows];
+            *offsets_out = offs; *hdr_out = hdr;
+            return max_rows;
+        }
+        if (end == buf_size) {
+            /* every remaining row, the last one ended by the file */
+            if (next_offset_out) *next_offset_out = buf_size;
+            *offsets_out = offs; *hdr_out = hdr;
+            return n;
+        }
+        /* the window held at most max_rows starts: widen and rescan */
+        scratch_free(hdr);
+        if (window > SIZE_MAX / 2) return -2;
+        window *= 2;
+    }
 }
 
 static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
@@ -1381,6 +1441,7 @@ typedef struct {
     uint32_t    len;
     const char* ptr;
     int64_t     gid;      /* global sym id, filled in step B */
+    int64_t     row;      /* first row the string occurs on (domain batch order) */
 } csv_dedup_ent_t;
 
 typedef struct {
@@ -1438,7 +1499,31 @@ typedef struct {
     /* [n_cols] "this column wrote a canonical null", recorded where the value
      * is written.  See csv_note_empty. */
     bool*          empties;
+    /* Target FILE domain (splayed save): the distinct strings are
+     * interned straight into the table's symfile domain, batched over
+     * every SYM column of the chunk, and the codes are positions in it.
+     * NULL: runtime symbol table, id-order-preserving serial walk. */
+    struct ray_sym_domain_s* dom;
+    /* Hash partitions per SYM column (domain target only; 1 otherwise):
+     * dicts[i * n_part + p] holds the distinct strings of column cols[i]
+     * whose hash >> part_shift == p.  Partitions of one column are
+     * deduplicated by independent tasks. */
+    int            n_part;
+    int            part_shift;
 } csv_dedup_ctx_t;
+
+static inline int csv_dedup_part(const csv_dedup_ctx_t* dd, uint32_t hash) {
+    return dd->n_part > 1 ? (int)(hash >> dd->part_shift) : 0;
+}
+
+/* Every partition of column i deduplicated without overflow. */
+static inline bool csv_col_dict_ok(const csv_dedup_ctx_t* dd, int i) {
+    for (int p = 0; p < dd->n_part; p++) {
+        const csv_dedup_t* d = &dd->dicts[i * dd->n_part + p];
+        if (!d->done || d->overflow) return false;
+    }
+    return true;
+}
 
 /* HAS_NULLS accounting for SYM/STR columns (step 9c).
  *
@@ -1460,10 +1545,14 @@ static void csv_dedup_task(void* arg, uint32_t worker_id,
     (void)worker_id; (void)end_i;
     csv_dedup_ctx_t* ctx = (csv_dedup_ctx_t*)arg;
     csv_dedup_t* d = &ctx->dicts[start];
-    const csv_strref_t* refs = ctx->str_refs[ctx->cols[start]];
+    int col_i = (int)(start / ctx->n_part);
+    int part  = (int)(start % ctx->n_part);
+    const csv_strref_t* refs = ctx->str_refs[ctx->cols[col_i]];
     /* Local codes land in the destination id array and are replaced in place
-     * by step C, so the dedupe needs no per-row scratch of its own. */
-    uint32_t* codes = (uint32_t*)ctx->col_data[ctx->cols[start]];
+     * by step C, so the dedupe needs no per-row scratch of its own.  With
+     * partitions each task owns the rows whose hash falls in its partition;
+     * partition 0 also writes the null codes. */
+    uint32_t* codes = (uint32_t*)ctx->col_data[ctx->cols[col_i]];
     int64_t n_rows = ctx->n_rows;
 
     if (!csv_dedup_grow(d) || !csv_dedup_grow_ents(d)) {
@@ -1475,8 +1564,9 @@ static void csv_dedup_task(void* arg, uint32_t worker_id,
 
     for (int64_t r = 0; r < n_rows; r++) {
         if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
-        if (refs[r].ptr == NULL) { codes[r] = 0; continue; }
-        uint32_t h = (uint32_t)ray_hash_bytes(refs[r].ptr, refs[r].len);
+        if (refs[r].ptr == NULL) { if (part == 0) codes[r] = 0; continue; }
+        uint32_t h = refs[r].hash;   /* computed by the parse */
+        if (csv_dedup_part(ctx, h) != part) continue;
         uint32_t mask = d->n_slots - 1;
         uint32_t j = h & mask;
         uint32_t found = 0;
@@ -1507,6 +1597,7 @@ static void csv_dedup_task(void* arg, uint32_t worker_id,
         e->len  = refs[r].len;
         e->ptr  = refs[r].ptr;
         e->gid  = 0;
+        e->row  = r;
         d->n_ents++;
         codes[r] = d->n_ents;                 /* code = entry index + 1 */
         d->slots[j] = d->n_ents;
@@ -1523,8 +1614,9 @@ static void csv_dedup_map_task(void* arg, uint32_t worker_id,
                                int64_t start, int64_t end_i) {
     (void)worker_id; (void)end_i;
     csv_dedup_ctx_t* ctx = (csv_dedup_ctx_t*)arg;
-    const csv_dedup_t* d = &ctx->dicts[start];
-    if (d->overflow) return;              /* step B already wrote real ids */
+    if (!csv_col_dict_ok(ctx, (int)start)) return;   /* step B already wrote real ids */
+    const csv_dedup_t* dcol = &ctx->dicts[start * ctx->n_part];
+    const csv_strref_t* refs = ctx->str_refs[ctx->cols[start]];
     uint32_t* ids = (uint32_t*)ctx->col_data[ctx->cols[start]];
     int64_t n_rows = ctx->n_rows;
     uint32_t empty = (uint32_t)ctx->empty_gid;
@@ -1532,7 +1624,8 @@ static void csv_dedup_map_task(void* arg, uint32_t worker_id,
     for (int64_t r = 0; r < n_rows; r++) {
         if (RAY_UNLIKELY((r & 1023) == 0 && ray_interrupted())) return;
         uint32_t code = ids[r];
-        uint32_t id = code ? (uint32_t)d->ents[code - 1].gid : empty;
+        uint32_t id = code ? (uint32_t)dcol[csv_dedup_part(ctx, refs[r].hash)].ents[code - 1].gid
+                           : empty;
         ids[r] = id;
         saw_null |= (id == 0);
     }
@@ -1551,9 +1644,135 @@ static void csv_dedup_map_task(void* arg, uint32_t worker_id,
  * empty string anyway, so collapsing them is the only deterministic answer the
  * parser can give.  Empty fields are local code 0 out of the dedupe and are
  * mapped to that id by step C. */
+/* Step B for a FILE domain target: one batch for the whole chunk, laid out
+ * the way the cell-by-cell writer met the strings — columns in order, each
+ * column's strings by first occurrence — so the symfile gets the same
+ * positions whatever the worker count and however a column's dictionary
+ * was split into hash partitions.  The domain probes the existing
+ * vocabulary in parallel and appends the new strings in batch order.  A
+ * column whose dictionary overflowed contributes its rows directly (the
+ * batch dedupes them) and gets its ids written here. */
+/* Append column i's dictionary entries to out[] by first row.  Each hash
+ * partition lists its strings in row order already, so this is a merge of
+ * n_part sorted runs (n_part is small). */
+static int64_t csv_col_ents_by_row(csv_dedup_ctx_t* dd, int i, csv_dedup_ent_t** out) {
+    int np = dd->n_part;
+    csv_dedup_t* d0 = &dd->dicts[i * np];
+    if (np == 1) {
+        for (uint32_t e = 0; e < d0->n_ents; e++) out[e] = &d0->ents[e];
+        return d0->n_ents;
+    }
+    uint32_t cur[64];
+    for (int p = 0; p < np; p++) cur[p] = 0;
+    int64_t n = 0;
+    for (;;) {
+        int best = -1;
+        int64_t br = 0;
+        for (int p = 0; p < np; p++) {
+            if (cur[p] >= d0[p].n_ents) continue;
+            int64_t r = d0[p].ents[cur[p]].row;
+            if (best < 0 || r < br) { best = p; br = r; }
+        }
+        if (best < 0) break;
+        out[n++] = &d0[best].ents[cur[best]++];
+    }
+    return n;
+}
+
+static bool csv_intern_dicts_domain(csv_dedup_ctx_t* dd, int n_sym,
+                                    int64_t* col_max_ids,
+                                    uint64_t prog_base, uint64_t prog_len) {
+    struct ray_sym_domain_s* dom = dd->dom;
+    /* Position 0 of a symfile domain is "" (reserved on creation). */
+    if (ray_sym_domain_intern(dom, "", 0) != 0) return false;
+    dd->empty_gid = 0;
+
+    int64_t total = 0;
+    for (int i = 0; i < n_sym; i++) {
+        if (csv_col_dict_ok(dd, i)) {
+            for (int p = 0; p < dd->n_part; p++) total += dd->dicts[i * dd->n_part + p].n_ents;
+        } else {
+            total += dd->n_rows;
+        }
+    }
+    if (total == 0) {
+        if (prog_len) ray_progress_span_set(prog_base + prog_len);
+        return true;
+    }
+
+    ray_t *hs = NULL, *hl = NULL, *hh = NULL, *hp = NULL, *ho = NULL;
+    const char** strs   = (const char**)scratch_alloc(&hs, (size_t)total * sizeof(char*));
+    size_t*      lens   = (size_t*)scratch_alloc(&hl, (size_t)total * sizeof(size_t));
+    uint32_t*    hashes = (uint32_t*)scratch_alloc(&hh, (size_t)total * sizeof(uint32_t));
+    int64_t*     pos    = (int64_t*)scratch_alloc(&hp, (size_t)total * sizeof(int64_t));
+    /* order[k]: the dictionary entry behind batch slot k (dict columns) */
+    csv_dedup_ent_t** order = (csv_dedup_ent_t**)scratch_alloc(&ho,
+                                  (size_t)total * sizeof(csv_dedup_ent_t*));
+    bool ok = strs && lens && hashes && pos && order;
+
+    int64_t k = 0;
+    for (int i = 0; ok && i < n_sym; i++) {
+        if (csv_col_dict_ok(dd, i)) {
+            int64_t ne = csv_col_ents_by_row(dd, i, order + k);
+            for (int64_t e = 0; e < ne; e++, k++) {
+                strs[k]   = order[k]->ptr;
+                lens[k]   = order[k]->len;
+                hashes[k] = order[k]->hash;
+            }
+        } else {
+            const csv_strref_t* refs = dd->str_refs[dd->cols[i]];
+            for (int64_t r = 0; r < dd->n_rows; r++) {
+                if (refs[r].ptr == NULL) continue;
+                strs[k]   = refs[r].ptr;
+                lens[k]   = refs[r].len;
+                hashes[k] = refs[r].hash;
+                k++;
+            }
+        }
+    }
+    if (ok) ok = ray_sym_domain_intern_batch(dom, k, strs, lens, hashes, pos);
+
+    /* Hand the positions back in the same walk. */
+    k = 0;
+    for (int i = 0; ok && i < n_sym; i++) {
+        int c = dd->cols[i];
+        int64_t max_id = 0;
+        if (csv_col_dict_ok(dd, i)) {
+            int64_t ne = 0;
+            for (int p = 0; p < dd->n_part; p++) ne += dd->dicts[i * dd->n_part + p].n_ents;
+            for (int64_t e = 0; e < ne; e++, k++) {
+                int64_t id = pos[k];
+                if (id < 0) { ok = false; id = 0; }
+                order[k]->gid = id;
+                if (id > max_id) max_id = id;
+            }
+        } else {
+            const csv_strref_t* refs = dd->str_refs[c];
+            uint32_t* ids = (uint32_t*)dd->col_data[c];
+            bool saw_null = false;
+            for (int64_t r = 0; r < dd->n_rows; r++) {
+                if (refs[r].ptr == NULL) { ids[r] = 0; saw_null = true; continue; }
+                int64_t id = pos[k++];
+                if (id < 0) { ok = false; id = 0; }
+                ids[r] = (uint32_t)id;
+                saw_null |= (id == 0);
+                if (id > max_id) max_id = id;
+            }
+            csv_note_empty(dd->empties, c, saw_null);
+        }
+        if (col_max_ids) col_max_ids[c] = max_id;
+    }
+
+    scratch_free(hs); scratch_free(hl); scratch_free(hh); scratch_free(hp); scratch_free(ho);
+    if (prog_len) ray_progress_span_set(prog_base + prog_len);
+    return ok;
+}
+
 static bool csv_intern_dicts(csv_dedup_ctx_t* dd, int n_sym,
                              int64_t* col_max_ids,
                              uint64_t prog_base, uint64_t prog_len) {
+    if (dd->dom)
+        return csv_intern_dicts_domain(dd, n_sym, col_max_ids, prog_base, prog_len);
     bool ok = true;
 
     /* Same first call, same reason, as the serial walk: sym 0 is reserved by
@@ -1739,6 +1958,7 @@ typedef struct {
     int               n_sym;
     bool*             empties;     /* [n_cols] SYM/STR column wrote a null */
     bool              intern_ok;
+    struct ray_sym_domain_s* dom;  /* SYM target domain, NULL = runtime */
 } csv_finalize_ctx_t;
 
 /* dispatch 1: [0, n_fill) fill a RAY_STR column, [n_fill, n_fill+n_sym) dedupe
@@ -1768,7 +1988,7 @@ static void csv_finalize_task(void* arg, uint32_t worker_id,
  * prog_base/prog_len describe this phase's slice of the load's byte axis; pass
  * len 0 when no progress span is active (the streaming conversion path). */
 static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
-                             bool* fill_ok, int* sym_cols, csv_dedup_t* dicts,
+                             bool* fill_ok, int* sym_cols,
                              bool* empties,
                              uint64_t prog_base, uint64_t prog_len) {
     int n_fill = 0, n_sym = 0;
@@ -1778,7 +1998,31 @@ static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
         else                                   sym_cols[n_sym++] = c;
     }
     for (int i = 0; i < n_fill; i++) fill_ok[i] = true;
-    memset(dicts, 0, (size_t)n_sym * sizeof(csv_dedup_t));
+
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && ray_pool_total_workers(pool) >= 2;
+
+    /* Partitions per SYM column.  The runtime path keeps one dictionary per
+     * column (its id order is the serial walk's); a domain target has no
+     * order to keep, so the heavy columns are split by hash until the
+     * dedupe tasks cover the pool about twice over. */
+    int n_part = 1;
+    if (ctx->dom && par && n_sym > 0) {
+        int64_t want = (int64_t)ray_pool_total_workers(pool) * 2 / n_sym;
+        while (n_part * 2 <= want && n_part < 16) n_part *= 2;
+        while (n_part > 1 && (int64_t)n_fill + (int64_t)n_sym * n_part > (int64_t)RAY_POOL_INIT_TASKS)
+            n_part /= 2;
+    }
+    int part_shift = 32;
+    for (int q = n_part; q > 1; q >>= 1) part_shift--;
+
+    ray_t* dicts_hdr = NULL;
+    csv_dedup_t* dicts = NULL;
+    if (n_sym > 0) {
+        dicts = (csv_dedup_t*)scratch_calloc(&dicts_hdr,
+                    (size_t)n_sym * (size_t)n_part * sizeof(csv_dedup_t));
+        if (!dicts) return false;
+    }
 
     ctx->fill_cols = fill_cols;
     ctx->n_fill    = n_fill;
@@ -1793,6 +2037,9 @@ static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
     ctx->dd.n_rows    = ctx->n_rows;
     ctx->dd.empty_gid = 0;
     ctx->dd.empties   = ctx->empties;
+    ctx->dd.dom       = ctx->dom;
+    ctx->dd.n_part    = n_part;
+    ctx->dd.part_shift = part_shift;
 
     /* Slice the phase: dedupe+fill is the bulk, the serial intern touches only
      * distinct strings, the remap is one linear pass per SYM column.  Measured
@@ -1800,10 +2047,8 @@ static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
     uint64_t w1 = prog_len * 6 / 10;
     uint64_t w2 = prog_len / 10;
 
-    int64_t n_tasks = (int64_t)n_fill + (int64_t)n_sym;
-    ray_pool_t* pool = ray_pool_get();
-    bool par = pool && ray_pool_total_workers(pool) >= 2 &&
-               n_tasks > 0 && n_tasks <= (int64_t)RAY_POOL_INIT_TASKS;
+    int64_t n_tasks = (int64_t)n_fill + (int64_t)n_sym * n_part;
+    par = par && n_tasks > 0 && n_tasks <= (int64_t)RAY_POOL_INIT_TASKS;
 
     if (prog_len) ray_progress_span_phase("finalize", prog_base, w1);
     if (par) ray_pool_dispatch_n(pool, csv_finalize_task, ctx, (uint32_t)n_tasks);
@@ -1830,12 +2075,14 @@ static bool csv_finalize_run(csv_finalize_ctx_t* ctx, int* fill_cols,
         if (ray_interrupted()) goto fail;
     }
 
-    for (int i = 0; i < n_sym; i++) csv_dedup_release(&dicts[i]);
+    for (int i = 0; i < n_sym * n_part; i++) csv_dedup_release(&dicts[i]);
+    scratch_free(dicts_hdr);
     for (int i = 0; i < n_fill; i++) if (!fill_ok[i]) return false;
     return true;
 
 fail:
-    for (int i = 0; i < n_sym; i++) csv_dedup_release(&dicts[i]);
+    for (int i = 0; i < n_sym * n_part; i++) csv_dedup_release(&dicts[i]);
+    scratch_free(dicts_hdr);
     return false;
 }
 
@@ -2021,6 +2268,10 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                         }
                         ctx->str_refs[c][row].ptr = fld;
                         ctx->str_refs[c][row].len = (uint32_t)flen;
+                        /* SYM columns are deduplicated by hash right after
+                         * the parse; hash here while the bytes are hot. */
+                        if (ctx->resolved_types[c] == RAY_SYM)
+                            ctx->str_refs[c][row].hash = (uint32_t)ray_hash_bytes(fld, flen);
                     }
                     break;
                 }
@@ -2202,6 +2453,8 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
                         }
                         str_refs[c][row].ptr = fld;
                         str_refs[c][row].len = (uint32_t)flen;
+                        if (resolved_types[c] == RAY_SYM)
+                            str_refs[c][row].hash = (uint32_t)ray_hash_bytes(fld, flen);
                     }
                     break;
                 }
@@ -2479,7 +2732,8 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
                                    const int64_t* row_offsets, int64_t n_rows,
                                    int ncols, char delimiter,
                                    const int64_t* col_name_ids,
-                                   const int8_t* resolved_types) {
+                                   const int8_t* resolved_types,
+                                   struct ray_sym_domain_s* sym_dom) {
     /* Defensive guard: RAY_CSV_AUTO_TAG must be resolved to a concrete width
      * before reaching this point (by csv_resolve_auto_in_place or
      * csv_resolve_auto_streamed).  If a marker slips through, the resolution
@@ -2504,6 +2758,11 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         if (!col_vecs[c] || RAY_IS_ERR(col_vecs[c])) {
             for (int j = 0; j < c; j++) ray_release(col_vecs[j]);
             return NULL;
+        }
+        if (type == RAY_SYM && sym_dom) {
+            /* Cells are positions in the target symfile domain. */
+            ray_sym_domain_retain(sym_dom);
+            col_vecs[c]->sym_domain = sym_dom;
         }
         col_vecs[c]->len = n_rows;
         col_data[c] = ray_data(col_vecs[c]);
@@ -2645,14 +2904,14 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             .col_vecs       = col_vecs,
             .n_rows         = n_rows,
             .sym_max_ids    = sym_max_ids,
+            .dom            = sym_dom,
         };
         int  fill_cols[CSV_MAX_COLS];
         int  sym_cols[CSV_MAX_COLS];
         bool fill_ok[CSV_MAX_COLS];
-        csv_dedup_t dicts[CSV_MAX_COLS];
         /* No progress span on the conversion path — pass a zero-length slice. */
         bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
-                                       sym_cols, dicts, col_wrote_null, 0, 0);
+                                       sym_cols, col_wrote_null, 0, 0);
         if (!fin_ok || ray_interrupted()) {
             csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                                      buf, file_size, row_done, col_had_escaped);
@@ -2693,6 +2952,7 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         if (new_w >= RAY_SYM_W32) continue;
         ray_t* narrow = ray_sym_vec_new(new_w, n_rows);
         if (!narrow || RAY_IS_ERR(narrow)) continue;
+        ray_sym_vec_adopt_domain(narrow, col_vecs[c]);
         narrow->len = n_rows;
         const uint32_t* src = (const uint32_t*)col_data[c];
         void* dst = ray_data(narrow);
@@ -3123,9 +3383,8 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
         int  fill_cols[CSV_MAX_COLS];
         int  sym_cols[CSV_MAX_COLS];
         bool fill_ok[CSV_MAX_COLS];
-        csv_dedup_t dicts[CSV_MAX_COLS];
         bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
-                                       sym_cols, dicts, col_wrote_null,
+                                       sym_cols, col_wrote_null,
                                        prog_parse_end,
                                        (uint64_t)file_size - prog_parse_end);
         if (!fin_ok || ray_interrupted()) {
@@ -3283,7 +3542,15 @@ typedef struct {
      * fixed at W32: a streaming writer can't know the final vocabulary
      * before the last chunk, and W32 covers any STRL count. */
     struct ray_sym_domain_s* dom;
+    /* runtime id -> domain position, direct-mapped: the chunk vecs are
+     * runtime-domain and a column's values repeat across rows and chunks,
+     * so a value is interned into the symfile's domain (a locked probe) the
+     * first time it is met and looked up here after. */
+    int64_t*  lut_id;    /* [CSV_SPLAYED_LUT] runtime id per slot, -1 empty */
+    uint32_t* lut_pos;   /* [CSV_SPLAYED_LUT] position per slot */
 } csv_splayed_col_writer_t;
+#define CSV_SPLAYED_LUT_BITS 19
+#define CSV_SPLAYED_LUT (1u << CSV_SPLAYED_LUT_BITS)
 
 static ray_err_t csv_splayed_writer_open(csv_splayed_col_writer_t* w,
                                          const char* dir, int64_t name_id,
@@ -3314,7 +3581,23 @@ static ray_err_t csv_splayed_writer_open(csv_splayed_col_writer_t* w,
     if (!w->fp) return RAY_ERR_IO;
     ray_t zero = {0};
     if (fwrite(&zero, 1, 32, w->fp) != 32) return RAY_ERR_IO;
+    if (type == RAY_SYM) {
+        /* best effort: without the cache every cell probes the domain */
+        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)CSV_SPLAYED_LUT * sizeof(int64_t));
+        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)CSV_SPLAYED_LUT * sizeof(uint32_t));
+        if (!w->lut_id || !w->lut_pos) {
+            ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
+            w->lut_id = NULL; w->lut_pos = NULL;
+        } else {
+            memset(w->lut_id, 0xff, (size_t)CSV_SPLAYED_LUT * sizeof(int64_t));
+        }
+    }
     return RAY_OK;
+}
+
+static void csv_splayed_writer_drop_lut(csv_splayed_col_writer_t* w) {
+    ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
+    w->lut_id = NULL; w->lut_pos = NULL;
 }
 
 static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
@@ -3328,18 +3611,40 @@ static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
          * resolve each cell through the chunk vec's own domain and
          * find-or-append into the target (distinct work rides the
          * write).  The domain is flushed before the column files are
-         * committed (close), preserving the sym-first crash ordering. */
+         * committed (close), preserving the sym-first crash ordering.
+         * A runtime-domain chunk vec goes through the id -> position
+         * cache: only a value's first encounter pays the domain probe. */
+        bool direct = ray_sym_vec_domain(col) == w->dom;
+        bool cached = ray_sym_vec_domain(col) == ray_sym_runtime_domain() && w->lut_id;
+        const void* cd = ray_data(col);
         uint32_t buf[8192];
         for (int64_t off = 0; off < n; ) {
             int64_t cnt = n - off;
             if (cnt > (int64_t)(sizeof(buf) / sizeof(buf[0])))
                 cnt = (int64_t)(sizeof(buf) / sizeof(buf[0]));
             for (int64_t i = 0; i < cnt; i++) {
-                ray_t* s = ray_sym_vec_cell(col, off + i);
-                if (!s) return RAY_ERR_CORRUPT;
-                int64_t pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s),
-                                                    ray_str_len(s));
-                if (pos < 0) return RAY_ERR_OOM;
+                int64_t pos;
+                if (direct) {
+                    /* Already encoded over the target domain. */
+                    pos = ray_read_sym(cd, off + i, RAY_SYM, col->attrs);
+                } else if (cached) {
+                    int64_t id = ray_read_sym(cd, off + i, RAY_SYM, col->attrs);
+                    uint32_t slot = (uint32_t)(((uint64_t)id * 0x9E3779B97F4A7C15ull) >> (64 - CSV_SPLAYED_LUT_BITS));
+                    if (w->lut_id[slot] == id) {
+                        pos = w->lut_pos[slot];
+                    } else {
+                        ray_t* s = ray_sym_str(id);
+                        if (!s) return RAY_ERR_CORRUPT;
+                        pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
+                        if (pos < 0) return RAY_ERR_OOM;
+                        w->lut_id[slot] = id; w->lut_pos[slot] = (uint32_t)pos;
+                    }
+                } else {
+                    ray_t* s = ray_sym_vec_cell(col, off + i);
+                    if (!s) return RAY_ERR_CORRUPT;
+                    pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
+                    if (pos < 0) return RAY_ERR_OOM;
+                }
                 buf[i] = (uint32_t)pos;
                 /* Position 0 of any symfile is the empty string (domain.c
                  * enforces that reservation on open), so a re-encoded cell is
@@ -3365,7 +3670,29 @@ static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
     return RAY_OK;
 }
 
+/* Append task: column `start` of the chunk table into its writer.  The
+ * first failure is kept (a later task cannot clear it). */
+typedef struct {
+    csv_splayed_col_writer_t* writers;
+    ray_t*   tbl;
+    int      ncols;
+    _Atomic(ray_err_t) err;
+} csv_splayed_append_ctx_t;
+
+static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
+    if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
+    ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
+    ray_err_t e = csv_splayed_writer_append(&a->writers[start], col);
+    if (e != RAY_OK) {
+        ray_err_t ok = RAY_OK;
+        atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
+    }
+}
+
 static ray_err_t csv_splayed_writer_close(csv_splayed_col_writer_t* w) {
+    csv_splayed_writer_drop_lut(w);
     if (!w->fp) return RAY_OK;
     ray_err_t err = RAY_OK;
 
@@ -3397,6 +3724,7 @@ static ray_err_t csv_splayed_writer_close(csv_splayed_col_writer_t* w) {
 }
 
 static void csv_splayed_writer_abort(csv_splayed_col_writer_t* w) {
+    csv_splayed_writer_drop_lut(w);
     if (w->fp) fclose(w->fp);
     w->fp = NULL;
     remove(w->tmp_path);
@@ -3630,16 +3958,27 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
 
     size_t chunk_offset = data_offset;
     bool wrote_any = false;
+    size_t avg_row_bytes = 64;   /* refined from every chunk scanned */
     while (chunk_offset < file_size || !wrote_any) {
         ray_t* row_offsets_hdr = NULL;
         int64_t* row_offsets = NULL;
         size_t next_offset = chunk_offset;
         int64_t cnt = 0;
         if (chunk_offset < file_size) {
-            cnt = build_row_offsets_limited(buf, file_size, chunk_offset,
-                                            rows_per_chunk, data_has_quotes,
-                                            &row_offsets,
-                                            &row_offsets_hdr, &next_offset);
+            /* Parallel scan over a byte window sized from the rows seen so
+             * far; the serial walk remains the fallback and the semantics. */
+            cnt = build_row_offsets_window(buf, file_size, chunk_offset,
+                                           rows_per_chunk, avg_row_bytes,
+                                           data_has_quotes,
+                                           &row_offsets, &row_offsets_hdr,
+                                           &next_offset);
+            if (cnt == -2)
+                cnt = build_row_offsets_limited(buf, file_size, chunk_offset,
+                                                rows_per_chunk, data_has_quotes,
+                                                &row_offsets,
+                                                &row_offsets_hdr, &next_offset);
+            if (cnt > 0 && next_offset > chunk_offset)
+                avg_row_bytes = (next_offset - chunk_offset) / (size_t)cnt;
             if (cnt <= 0) {
                 scratch_free(row_offsets_hdr);
                 err = (cnt < 0) ? RAY_ERR_CANCEL : RAY_ERR_IO;
@@ -3649,7 +3988,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
 
         ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
                                           cnt, ncols, delimiter, col_name_ids,
-                                          resolved_types);
+                                          resolved_types, sym_dom);
         scratch_free(row_offsets_hdr);
         if (!tbl || RAY_IS_ERR(tbl)) {
             err = (tbl && RAY_IS_ERR(tbl)) ? ray_err_from_obj(tbl)
@@ -3658,14 +3997,31 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             break;
         }
 
-        for (int c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            err = csv_splayed_writer_append(&writers[c], col);
-            if (err != RAY_OK) break;
+        /* One task per column: each writer owns its file, its cache and
+         * its symfile domain (the domain probe takes the domain lock, the
+         * symbol table read its own), so the columns of a chunk are
+         * encoded and written side by side. */
+        {
+            csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
+                                              .ncols = ncols, .err = RAY_OK };
+            ray_pool_t* wpool = ray_pool_get();
+            if (ray_pool_par_dispatch_ok(wpool, ncols, 2))
+                ray_pool_dispatch_n(wpool, csv_splayed_append_task, &actx, (uint32_t)ncols);
+            else
+                for (int c = 0; c < ncols; c++) csv_splayed_append_task(&actx, 0, c, c + 1);
+            err = actx.err;
         }
         ray_release(tbl);
         if (err != RAY_OK) break;
         wrote_any = true;
+        /* The chunk's bytes are done with: drop them from the mapping so a
+         * long file does not pin its whole length in resident memory. */
+        if (next_offset > chunk_offset) {
+            size_t ps = (size_t)sysconf(_SC_PAGESIZE);
+            size_t a = (chunk_offset + ps - 1) & ~(ps - 1);
+            size_t b = next_offset & ~(ps - 1);
+            if (b > a) madvise((void*)(buf + a), b - a, MADV_DONTNEED);
+        }
         if (cnt == 0) break;
         chunk_offset = next_offset;
     }
@@ -3673,8 +4029,9 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     /* Flush the symfile BEFORE committing column files (writer_close
      * renames tmp → final): columns must never reference positions the
      * symfile doesn't persist (sym-first crash ordering). */
-    if (err == RAY_OK && sym_dom)
+    if (err == RAY_OK && sym_dom) {
         err = ray_sym_domain_flush(sym_dom, false);
+    }
 
     for (int c = 0; c < ncols; c++) {
         ray_err_t cerr = (err == RAY_OK) ? csv_splayed_writer_close(&writers[c])
@@ -3886,7 +4243,8 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
         }
 
         ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
-                                          cnt, ncols, delimiter, col_name_ids, resolved_types);
+                                          cnt, ncols, delimiter, col_name_ids, resolved_types,
+                                          NULL);
         if (!tbl || RAY_IS_ERR(tbl)) {
             err = (tbl && RAY_IS_ERR(tbl)) ? ray_err_from_obj(tbl)
                                            : RAY_ERR_OOM;
