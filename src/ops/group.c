@@ -7860,6 +7860,11 @@ typedef struct {
     ray_t**        sym_strings;  /* borrowed sym snapshot for strlen-on-SYM aggs */
     uint32_t       sym_count;
     int64_t        da_n_scan;    /* rows to scan (ranged tasks split it) */
+    /* Per-agg raw vocabulary snapshot of a FILE-domain SYM column, pinned
+     * once for the whole accumulate: strlen and lexical min/max read the
+     * entry off the mapping instead of pinning (and checking null) per row. */
+    ray_sym_domain_raw_t* agg_raw;
+    uint8_t*       agg_raw_ok;
 } da_ctx_t;
 
 typedef struct {
@@ -8571,6 +8576,47 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * Fast path for SUM/AVG-only queries: eliminates op-code dispatch and da_read_val
  * dual-write overhead.  The branch on c->all_sum is perfectly predicted (invariant
  * across all rows). */
+/* strlen of agg column a at row r.  STR: the descriptor's length (a null
+ * is the empty string, length 0).  SYM: null is id 0; a FILE-domain entry's
+ * length is the u32 prefix in the pinned mapping; anything else resolves
+ * as group_strlen_at_cached does. */
+static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r) {
+    const ray_t* col = c->agg_cols[a];
+    if (col->type == RAY_STR) {
+        const ray_str_t* elems; const char* pool; (void)pool;
+        str_resolve(col, &elems, &pool);
+        return (int64_t)elems[r].len;
+    }
+    if (col->type == RAY_SYM) {
+        int64_t sid = ray_read_sym(ray_data((ray_t*)col), r, RAY_SYM, col->attrs);
+        if (sid == 0) return 0;
+        if (c->agg_raw_ok && c->agg_raw_ok[a] && sid > 0 && sid < c->agg_raw[a].count) {
+            size_t sl;
+            (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+            return (int64_t)sl;
+        }
+    }
+    return group_strlen_at_cached(col, r, c->sym_strings, c->sym_count);
+}
+
+/* Lexical x < y for two cells of agg column a_idx (a SYM column): the
+ * pinned mapping when both positions are in the file prefix, sym_lex_lt
+ * otherwise. */
+static inline bool da_sym_lex_lt(const da_ctx_t* c, uint32_t a_idx, int64_t x, int64_t y) {
+    if (x == y) return false;
+    if (c->agg_raw_ok && c->agg_raw_ok[a_idx] && x >= 0 && y >= 0 &&
+        x < c->agg_raw[a_idx].count && y < c->agg_raw[a_idx].count) {
+        size_t lx, ly;
+        const char* px = ray_sym_domain_raw_str(&c->agg_raw[a_idx], x, &lx);
+        const char* py = ray_sym_domain_raw_str(&c->agg_raw[a_idx], y, &ly);
+        size_t m = lx < ly ? lx : ly;
+        int r = m ? memcmp(px, py, m) : 0;
+        if (r != 0) return r < 0;
+        return lx < ly;
+    }
+    return sym_lex_lt(ray_sym_vec_domain(c->agg_cols[a_idx]), x, y);
+}
+
 static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r) {
     uint8_t n_aggs = c->n_aggs;
     acc->count[gid]++;
@@ -8593,9 +8639,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i = wrap_add_i64(
-                    acc->sum[idx].i,
-                    group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count));
+                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r));
                 if (nn) nn[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
@@ -8646,8 +8690,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             fv = prod_val_f64(&c->agg_prod[a], r);
             iv = (int64_t)fv;
         } else if (c->agg_strlen && c->agg_strlen[a]) {
-            iv = group_strlen_at_cached(c->agg_cols[a], r,
-                                        c->sym_strings, c->sym_count);
+            iv = da_strlen_at(c, a, r);
             fv = (double)iv;
         } else {
             uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
@@ -8739,7 +8782,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             } else if (c->agg_types[a] == RAY_SYM && !int_null) {
                 /* Lex compare for SYM; INT64_MAX = "not seen yet". */
                 if (acc->min_val[idx].i == INT64_MAX ||
-                    sym_lex_lt(ray_sym_vec_domain(c->agg_cols[a]), iv, acc->min_val[idx].i))
+                    da_sym_lex_lt(c, a, iv, acc->min_val[idx].i))
                     acc->min_val[idx].i = iv;
             } else if (!int_null) {
                 if (iv < acc->min_val[idx].i) acc->min_val[idx].i = iv;
@@ -8750,7 +8793,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                 if (fv == fv && fv > acc->max_val[idx].f) acc->max_val[idx].f = fv;
             } else if (c->agg_types[a] == RAY_SYM && !int_null) {
                 if (acc->max_val[idx].i == INT64_MIN ||
-                    sym_lex_gt(ray_sym_vec_domain(c->agg_cols[a]), iv, acc->max_val[idx].i))
+                    da_sym_lex_lt(c, a, acc->max_val[idx].i, iv))
                     acc->max_val[idx].i = iv;
             } else if (!int_null) {
                 if (iv > acc->max_val[idx].i) acc->max_val[idx].i = iv;
@@ -8900,6 +8943,98 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     }
     #undef DA_MULTI_KEY_LOOP
     #undef DA_PF_DIST
+}
+
+/* ---- slot-partitioned accumulate --------------------------------------
+ * For a pool with more workers than the per-worker slot budget allows.
+ * Pass 1 (nw tasks, contiguous row ranges in order): each row's group is
+ * computed once and its row id appended to the bucket of (range, task)
+ * with task = gid / span — no shared writes.  Pass 2 (one task per slot span,
+ * ray_pool_dispatch_n): task t drains every worker's bucket t into the
+ * single accumulator set; no two tasks touch a slot, so nothing is merged
+ * and the state is one set however many workers run.  The buckets hold
+ * int32 row ids (the caller admits tables below INT32_MAX rows). */
+typedef struct { int32_t* data; int64_t len, cap; ray_t* hdr; } da_bucket_t;
+typedef struct {
+    da_ctx_t*     c;
+    da_bucket_t*  buckets;      /* [nw * k] */
+    uint32_t      nw, k, span;
+    int64_t       n_scan;
+    _Atomic(int)  oom;
+} da_part_ctx_t;
+
+static bool da_bucket_push(da_bucket_t* b, int32_t v) {
+    if (b->len == b->cap) {
+        int64_t ncap = b->cap ? b->cap * 2 : 1024;
+        ray_t* nh = NULL;
+        int32_t* nd = (int32_t*)scratch_alloc(&nh, (size_t)ncap * sizeof(int32_t));
+        if (!nd) return false;
+        if (b->len) memcpy(nd, b->data, (size_t)b->len * sizeof(int32_t));
+        if (b->hdr) scratch_free(b->hdr);
+        b->data = nd; b->hdr = nh; b->cap = ncap;
+    }
+    b->data[b->len++] = v;
+    return true;
+}
+
+/* Task `t` of nw scans the t-th contiguous row range into bucket row t:
+ * draining rows 0..nw-1 in order then hands each slot its rows in table
+ * order, so the accumulation (float sums included) is the serial scan's,
+ * whatever the scheduling. */
+static void da_part_scatter_fn(void* raw, uint32_t wid, int64_t task, int64_t task_end) {
+    (void)wid; (void)task_end;
+    da_part_ctx_t* p = (da_part_ctx_t*)raw;
+    da_ctx_t* c = p->c;
+    da_bucket_t* mine = &p->buckets[(size_t)task * p->k];
+    int64_t start = p->n_scan * task / p->nw;
+    int64_t end   = p->n_scan * (task + 1) / p->nw;
+    const int64_t* match_idx = c->match_idx;
+    for (int64_t i = start; i < end; i++) {
+        int64_t r = match_idx ? match_idx[i] : i;
+        if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue;
+        uint32_t t = (uint32_t)da_composite_gid(c, r) / p->span;
+        if (!da_bucket_push(&mine[t], (int32_t)r)) {
+            atomic_store_explicit(&p->oom, 1, memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+static void da_part_drain_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    da_part_ctx_t* p = (da_part_ctx_t*)raw;
+    da_ctx_t* c = p->c;
+    da_accum_t* acc = &c->accums[0];
+    uint32_t t = (uint32_t)start;
+    for (uint32_t w = 0; w < p->nw; w++) {
+        const da_bucket_t* b = &p->buckets[(size_t)w * p->k + t];
+        for (int64_t j = 0; j < b->len; j++) {
+            int64_t r = b->data[j];
+            da_accum_row(c, acc, da_composite_gid(c, r), r);
+        }
+    }
+}
+
+/* Returns false (accumulators untouched) when the buckets could not be
+ * allocated; the caller then falls back to the plain scan. */
+static bool da_accum_partitioned(da_ctx_t* c, ray_pool_t* pool, uint32_t k, int64_t n_scan) {
+    uint32_t nw = ray_pool_total_workers(pool);
+    uint32_t span = (c->n_slots + k - 1) / k;
+    if (span == 0) span = 1;
+    k = (c->n_slots + span - 1) / span;
+    ray_t* bh = NULL;
+    da_bucket_t* buckets = (da_bucket_t*)scratch_calloc(&bh, (size_t)nw * k * sizeof(da_bucket_t));
+    if (!buckets) return false;
+    da_part_ctx_t p = { .c = c, .buckets = buckets, .nw = nw, .k = k, .span = span,
+                        .n_scan = n_scan };
+    atomic_store_explicit(&p.oom, 0, memory_order_relaxed);
+    ray_pool_dispatch_n(pool, da_part_scatter_fn, &p, nw);
+    bool ok = atomic_load_explicit(&p.oom, memory_order_relaxed) == 0;
+    if (ok) ray_pool_dispatch_n(pool, da_part_drain_fn, &p, k);
+    for (size_t i = 0; i < (size_t)nw * k; i++)
+        if (buckets[i].hdr) scratch_free(buckets[i].hdr);
+    scratch_free(bh);
+    return ok;
 }
 
 /* One task per accumulator (ray_pool_dispatch_n): task i scans the i-th
@@ -12670,9 +12805,26 @@ da_path:;
              * task per accumulator, whichever worker runs it) instead of
              * collapsing to a serial scan of every row. */
             bool da_ranged = false;
-            if ((uint64_t)da_n_workers > max_workers) {
-                da_n_workers = (uint32_t)max_workers;
-                da_ranged = da_n_workers > 1;
+            uint32_t da_part_tasks = 0;
+            if ((uint64_t)da_n_workers > max_workers && da_has_first_last) {
+                /* Several FIRST/LAST aggregates share one first_row/last_row
+                 * per slot (see da_accum_row): the answer for a null-mixed
+                 * pair depends on the order the rows arrive in, so past the
+                 * budget those keep the serial scan in row order. */
+                da_n_workers = 1;
+            } else if ((uint64_t)da_n_workers > max_workers) {
+                if (n_slots >= 2 * da_n_workers && nrows <= INT32_MAX) {
+                    /* Partition the SLOTS instead: one pass buckets the row
+                     * ids by slot span, then one task per span drains its
+                     * buckets into the single accumulator set.  Twice as
+                     * many spans as workers evens out skewed groups. */
+                    da_part_tasks = 2 * da_n_workers;
+                    if (da_part_tasks > n_slots) da_part_tasks = n_slots;
+                    da_n_workers = 1;
+                } else {
+                    da_n_workers = (uint32_t)max_workers;
+                    da_ranged = da_n_workers > 1;
+                }
             }
 
             ray_t* accums_hdr;
@@ -12801,13 +12953,31 @@ da_path:;
                 .rowsel      = rowsel,
                 .da_n_scan   = n_scan,
             };
+            /* Pin each SYM agg column's vocabulary once for the accumulate. */
+            ray_t* agg_raw_hdr = NULL;
+            if (n_aggs > 0) {
+                char* rm = (char*)scratch_calloc(&agg_raw_hdr,
+                    (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1));
+                if (rm) {
+                    da_ctx.agg_raw = (ray_sym_domain_raw_t*)rm;
+                    da_ctx.agg_raw_ok = (uint8_t*)(rm + (size_t)n_aggs * sizeof(ray_sym_domain_raw_t));
+                    for (uint32_t a = 0; a < n_aggs; a++)
+                        if (agg_vecs[a] && agg_vecs[a]->type == RAY_SYM)
+                            da_ctx.agg_raw_ok[a] = ray_sym_domain_raw_pin(
+                                ray_sym_vec_domain(agg_vecs[a]), &da_ctx.agg_raw[a]) ? 1 : 0;
+                }
+            }
 
-            if (da_ranged)
+            if (da_part_tasks > 0) {
+                if (!da_accum_partitioned(&da_ctx, da_pool, da_part_tasks, n_scan))
+                    da_accum_fn(&da_ctx, 0, 0, n_scan);
+            } else if (da_ranged)
                 ray_pool_dispatch_n(da_pool, da_accum_task_fn, &da_ctx, da_n_workers);
             else if (da_n_workers > 1)
                 ray_pool_dispatch(da_pool, da_accum_fn, &da_ctx, n_scan);
             else
                 da_accum_fn(&da_ctx, 0, 0, n_scan);
+            if (agg_raw_hdr) scratch_free(agg_raw_hdr);
 
             /* Merge target is always accums[0] */
             da_accum_t* merged = &accums[0];

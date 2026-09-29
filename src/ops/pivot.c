@@ -845,6 +845,42 @@ static bool if_branch_trivial(ray_graph_t* g, ray_op_t* op) {
     return false;
 }
 
+/* A branch that is cheap to evaluate over ALL rows and total (no row can
+ * fail): scans, constants, substrings, string case/trim/length, add/sub/mul,
+ * comparisons, and/or/not, and `if` over such — a descriptor-only STR
+ * result then costs less than the selected path's compaction of the rows
+ * for each branch (a serial gather of the branch's columns) plus its
+ * scatter.  Searches (str-find, like, replace, concat) and everything else
+ * are worth restricting to the rows that need them. */
+static bool if_branch_cheap(ray_graph_t* g, ray_op_t* op, int depth) {
+    if (!op || depth > 32) return false;
+    switch (op->opcode) {
+    case OP_ALIAS: case OP_MATERIALIZE:
+        return if_branch_cheap(g, op_child(g, op, 0), depth + 1);
+    case OP_SCAN: return true;
+    case OP_CONST: {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        return ext && ext->literal && ray_is_atom(ext->literal);
+    }
+    case OP_SUBSTR: case OP_IF: {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || ext->third_in >= g->node_count) return false;
+        for (int k = 0; k < op->arity && k < 2; k++)
+            if (!if_branch_cheap(g, op_child(g, op, k), depth + 1)) return false;
+        return if_branch_cheap(g, op_node(g, ext->third_in), depth + 1);
+    }
+    case OP_STRLEN: case OP_UPPER: case OP_LOWER: case OP_TRIM:
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_NEG: case OP_ABS:
+    case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+    case OP_AND: case OP_OR: case OP_NOT: case OP_ISNULL:
+        for (int k = 0; k < op->arity && k < 2; k++)
+            if (!if_branch_cheap(g, op_child(g, op, k), depth + 1)) return false;
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* Is a trivial branch of static type `bt` filled CORRECTLY by the eager
  * elementwise path for result type `out`?  Mixed numeric/string branch
  * combinations (e.g. `(if c n1 s2)` with I64 + STR) rely on the selected
@@ -889,11 +925,16 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
      * answer exactly as it would, or the same expression gets two types
      * depending on the worker count.  Where it is not, this arm is the only
      * one there is and may report the type the rows actually have. */
-    bool eager_possible = op->out_type != RAY_STR &&
-                          if_branch_trivial(g, then_op) &&
-                          if_branch_trivial(g, else_op) &&
-                          if_type_eager_ok(then_op->out_type, op->out_type) &&
-                          if_type_eager_ok(else_op->out_type, op->out_type);
+    bool eager_possible = (op->out_type != RAY_STR &&
+                           if_branch_trivial(g, then_op) &&
+                           if_branch_trivial(g, else_op) &&
+                           if_type_eager_ok(then_op->out_type, op->out_type) &&
+                           if_type_eager_ok(else_op->out_type, op->out_type)) ||
+                          /* two STR vector branches that are cheap and total:
+                           * the eager arm picks descriptors over one pass */
+                          (op->out_type == RAY_STR &&
+                           then_op->out_type == RAY_STR && else_op->out_type == RAY_STR &&
+                           if_branch_cheap(g, then_op, 0) && if_branch_cheap(g, else_op, 0));
     {
         ray_pool_t* rp = ray_pool_get();
         if (rp && rp->n_workers > 0 && eager_possible)
