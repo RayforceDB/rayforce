@@ -277,11 +277,19 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
  * compute an index for persistence without COWing a shared column. */
 ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
 
+/* The integer mean is (double)(int64 sum) / count whenever the column's
+ * true total fits int64 (modular accumulation is then exact whatever the
+ * order), and the double-accumulated sum / count beyond that.  Both the
+ * row-wise reduction and the chunk-zone metadata decide with this margin
+ * below 2^63, so they agree bit for bit. */
+#define RAY_AVG_I64_EXACT_BOUND 9.2e18
+
 /* Whole-column sum (int64 wraparound) and non-null count of an integer
  * column from its chunk-zone per-chunk aggregates; false when the column
- * carries none for its current length.  exact_f64 (optional): whether the
- * sum is exactly what a double accumulation of the rows gives. */
-bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out, bool* exact_f64);
+ * carries none for its current length.  exact (optional): whether the
+ * column's total is provably within RAY_AVG_I64_EXACT_BOUND, i.e. the
+ * wrapped sum is the exact one and the mean can be taken from it. */
+bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out, bool* exact);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).

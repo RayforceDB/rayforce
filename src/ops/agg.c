@@ -169,12 +169,14 @@ static ray_t* agg_parted_avg(ray_t* x) {
     if (!agg_parted_numeric_base(base)) return ray_error("type", "avg expects a numeric or temporal parted column, got %s", ray_type_name(base));
     ray_t** segs = (ray_t**)ray_data(x);
     double sum = 0.0;
+    uint64_t sum_i = 0;   /* integer segments: exact while the total fits int64 */
     int64_t cnt = 0;
+    bool fp = base == RAY_F64 || base == RAY_F32;
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
         if (!seg) continue;
         int has_nulls = ray_vec_may_have_nulls(seg);
-        if (base == RAY_F64 || base == RAY_F32) {
+        if (fp) {
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
                 if (base == RAY_F64) sum += ((double*)ray_data(seg))[i];
@@ -184,11 +186,13 @@ static ray_t* agg_parted_avg(ray_t* x) {
         } else {
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
-                sum += (double)agg_read_i64(seg, i); cnt++;
+                int64_t v = agg_read_i64(seg, i);
+                sum += (double)v; sum_i += (uint64_t)v; cnt++;
             }
         }
     }
     if (cnt == 0) return ray_typed_null(-RAY_F64);
+    if (!fp && fabs(sum) < RAY_AVG_I64_EXACT_BOUND) sum = (double)(int64_t)sum_i;
     return make_f64(sum / (double)cnt);
 }
 
@@ -406,7 +410,7 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
 
 /* Whole-column sum / non-null count of an integer column from its
  * chunk-zone index (per-chunk int64 sums with wraparound and non-null
- * counts), in O(n_chunks).  `exact_f64` reports whether every partial sum
+ * counts), in O(n_chunks).  `exact_f64` reports whether the column's total
  * an accumulation in double could meet stays below 2^53 in magnitude, i.e.
  * the sum converted to double equals any double accumulation of the rows.
  * Returns false when the column has no such index for its current length. */
@@ -433,7 +437,7 @@ bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out, bool* exact_f
     }
     *sum_out = (int64_t)sum;
     *nn_out = nn;
-    if (exact_f64) *exact_f64 = bound < 9007199254740992.0;   /* 2^53 */
+    if (exact_f64) *exact_f64 = bound < RAY_AVG_I64_EXACT_BOUND;
     return true;
 }
 
@@ -608,9 +612,9 @@ ray_t* ray_avg_fn(ray_t* x) {
         /* Canonical admission: numeric + temporal (→ F64); SYM/STR/GUID are
          * non-numeric → type error (the DAG path otherwise averaged raw ids). */
         if (!agg_type_admitted(OP_AVG, x->type)) return ray_error("type", "avg expects a numeric or temporal vector, got %s", ray_type_name(x->type));
-        /* Integer columns with per-chunk sums: exact when no partial sum can
-         * leave double's integer range (then every accumulation order in
-         * double gives the same value). */
+        /* Integer columns with per-chunk sums: exact when the total provably
+         * fits int64 — then the wrapped sum is the exact one, and the
+         * row-wise reduction divides the same integer. */
         if (x->type == RAY_I64 || x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8) {
             int64_t zs, zn; bool exact = false;
             if (ray_zone_int_sum(x, &zs, &zn, &exact) && exact) {

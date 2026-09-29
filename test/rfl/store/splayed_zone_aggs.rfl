@@ -22,9 +22,22 @@
 (at (at R 's16) 0) -- (sum (at Tm 'a16))
 (at (at R 'mn) 0) -- 2000.01.01
 (at (at R 'c) 0) -- 200000
-;; sums past double's integer range: avg is left to the row-wise path and
-;; still agrees; a float column and a filter take the usual path too
+;; a total past double's integer range but within int64 is answered from the
+;; metadata: the wrapped per-chunk sums are exact, and the row-wise reduction
+;; divides the same integer (2^40 x 200000 = 2^57.6 > 2^53)
+(.sys.exec "rm -rf rf_test_zone_p40") -- 0
+(.db.splayed.set "rf_test_zone_p40/" (table [p] (list (take [1099511627776] 200000))))
+(set TP (.db.splayed.get "rf_test_zone_p40/"))
+(at (select {from: TP a: (avg p)}) 'a) -- [1099511627776.0]
+(avg (at TP 'p)) -- 1099511627776.0
+(avg (take [1099511627776] 200000)) -- 1099511627776.0
+(.sys.exec "rm -rf rf_test_zone_p40") -- 0
+;; a total that can leave int64 (|value| up to 2^63 x 200000 rows) is left
+;; to the row-wise path, which then divides the double sum and still agrees
+;; with the in-memory copy; a float column and a filter take the usual path
 (at (select {from: T a: (avg big)}) 'a) -- (at (select {from: Tm a: (avg big)}) 'a)
+(avg (at T 'big)) -- (avg (at Tm 'big))
+(< (abs (- (avg (take [4611686018427387904] 70000)) 4611686018427387904.0)) 1.0) -- true
 (at (select {from: T a: (sum a16) b: (sum f)}) 'b) -- (at (select {from: Tm a: (sum a16) b: (sum f)}) 'b)
 (at (select {from: T a: (sum a16) where: (> a32 0)}) 'a) -- (at (select {from: Tm a: (sum a16) where: (> a32 0)}) 'a)
 ;; scalar forms read the same metadata
