@@ -1683,8 +1683,11 @@ void ray_free(ray_t* v) {
          * pool before appending — has to ask the registry, and only a
          * string column was ever registered.  So the lock stays off the
          * ordinary free entirely, and a mutated column pays it once. */
+        /* A column loaded with an inline index registered its region too
+         * (col.c): the index may have been detached since, and only the
+         * descriptor still knows the mapped length. */
         ray_file_map_t* m = col_map;
-        if (!m && v->type == RAY_STR) m = ray_file_map_lookup(v);
+        if (!m) m = ray_file_map_lookup(v);
         if (m) {
             ray_file_map_release(m);
             if (h) RAY_STAT(h->stats.free_count++);
