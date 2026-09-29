@@ -184,6 +184,13 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], ic->type);
         if (!vt) return AGG_V2_AGG_TYPE;
         if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
+        /* The streaming integer avg packs its 128-bit high word with the
+         * group count in one word (agg_stream.c): exact while every group
+         * has fewer than 2^32 rows.  A table that large keeps the legacy
+         * engines, whose accumulators carry a full high word. */
+        if (ext->agg_ops[a] == OP_AVG && ic->type != RAY_F64 && ic->type != RAY_F32 &&
+            ray_table_nrows(tbl) >= ((int64_t)1 << 32))
+            return AGG_V2_AGG_TYPE;
     }
     return AGG_V2_ADMITTED;
 }

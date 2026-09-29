@@ -2103,6 +2103,101 @@ static test_result_t test_group_values_f64(void) {
     PASS();
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Exact integer AVG on the legacy engines (v2 OFF) and on v2 (ON).
+ * A column of 2^62 averages to exactly 2^62 and alternating
+ * +(2^63-1-i) / -(2^63-1-i) pairs to exactly -0.5 whenever a group holds
+ * whole pairs — only the 128-bit sum gives those bits (the wrapped int64
+ * total is garbage, a double running sum loses the low bits).  The key
+ * type and the row count steer the legacy ladder: an I64 key over 70000
+ * rows takes the direct-array path, the same key over 60 rows the serial
+ * finish, an F64 key the hash/radix row layout, and a sparse I64 key
+ * (range far above the row count) the single-key sparse paths, which now
+ * hand an integer AVG to the row layout. */
+static ray_t* avg128_make(int64_t n, bool f64_key, bool sparse_key) {
+    ray_t* kvec = ray_vec_new(f64_key ? RAY_F64 : RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    ray_t* cvec = ray_vec_new(RAY_I64, n); cvec->len = n;
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    int64_t* cd = (int64_t*)ray_data(cvec);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = (i / 2) % 3;
+        if (sparse_key) k *= 1000000007LL;
+        if (f64_key) ((double*)ray_data(kvec))[i] = (double)k;
+        else         ((int64_t*)ray_data(kvec))[i] = k;
+        int64_t mag = INT64_MAX - i;
+        vd[i] = (i & 1) ? mag : -mag;
+        cd[i] = (int64_t)1 << 62;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("c", 1), cvec); ray_release(cvec);
+    return tbl;
+}
+static ray_op_t* gb_avg128(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v"); ray_op_t* c = ray_scan(g, "c");
+    uint16_t ops[] = { OP_AVG, OP_AVG, OP_SUM, OP_COUNT };
+    ray_op_t* ins[] = { v, c, c, c }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 4);
+}
+/* Run gb_avg128 with the v2 flag as given; the 2nd and 3rd result columns
+ * are the two means.  Fails unless every group is exactly -0.5 / 2^62. */
+static test_result_t avg128_check(ray_t* tbl, bool v2, const char* what) {
+    ray_agg_engine_v2 = v2;
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* r = ray_execute(g, gb_avg128(g));
+    if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    ray_agg_engine_v2 = true;             /* restore default */
+    test_result_t res = (test_result_t){ TEST_PASS, NULL };
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE || ray_table_ncols(r) != 5) {
+        res = (test_result_t){ TEST_FAIL, "avg128: bad result shape" };
+    } else {
+        ray_t* mv = ray_table_get_col_idx(r, 1);
+        ray_t* mc = ray_table_get_col_idx(r, 2);
+        int64_t ng = ray_table_nrows(r);
+        if (ng != 3 || !mv || !mc || mv->type != RAY_F64 || mc->type != RAY_F64) {
+            res = (test_result_t){ TEST_FAIL, "avg128: expected 3 groups of F64 means" };
+        } else {
+            for (int64_t i = 0; i < ng; i++) {
+                double a = ((const double*)ray_data(mv))[i];
+                double b = ((const double*)ray_data(mc))[i];
+                if (a != -0.5 || b != 4611686018427387904.0) {
+                    snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
+                             "%s: group %lld mean(v)=%.17g mean(c)=%.17g (want -0.5, 2^62)",
+                             what, (long long)i, a, b);
+                    res = (test_result_t){ TEST_FAIL, ray_test_fail_buf };
+                    break;
+                }
+            }
+        }
+    }
+    if (r && !RAY_IS_ERR(r)) ray_release(r);
+    ray_graph_free(g);
+    return res;
+}
+static test_result_t test_avg_exact_i128_engines(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    struct { int64_t n; bool f64; bool sparse; const char* name; } shapes[] = {
+        { HC_N, false, false, "i64 key, 70000 rows" },
+        { 60,   false, false, "i64 key, 60 rows" },
+        { HC_N, true,  false, "f64 key, 70000 rows" },
+        { 60,   true,  false, "f64 key, 60 rows" },
+        { HC_N, false, true,  "sparse i64 key, 70000 rows" },
+        { 60,   false, true,  "sparse i64 key, 60 rows" },
+    };
+    test_result_t res = (test_result_t){ TEST_PASS, NULL };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]) && res.status == TEST_PASS; i++) {
+        ray_t* tbl = avg128_make(shapes[i].n, shapes[i].f64, shapes[i].sparse);
+        res = avg128_check(tbl, false, shapes[i].name);
+        if (res.status == TEST_PASS) res = avg128_check(tbl, true, shapes[i].name);
+        ray_release(tbl);
+    }
+    ray_sym_destroy(); ray_heap_destroy();
+    return res;
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2179,5 +2274,6 @@ const test_entry_t agg_engine_entries[] = {
     { "group_keys_i_i32",            test_group_keys_i_i32,            NULL, NULL },
     { "group_keys_multi",            test_group_keys_multi,            NULL, NULL },
     { "agg_run_one_i64",             test_agg_run_one_i64,             NULL, NULL },
+    { "avg_exact_i128_engines",      test_avg_exact_i128_engines,      NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

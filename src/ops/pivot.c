@@ -1496,6 +1496,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint8_t need_flags = GHT_NEED_SUM; /* always need sum (used for FIRST/LAST too) */
     if (agg_op == OP_MIN) need_flags |= GHT_NEED_MIN;
     if (agg_op == OP_MAX) need_flags |= GHT_NEED_MAX;
+    /* Integer avg divides the exact 128-bit sum (high words in off_sum_hi),
+     * like every group engine — never a wrapped int64. */
+    if (agg_op == OP_AVG && vcol->type != RAY_F64 && vcol->type != RAY_F32)
+        need_flags |= GHT_NEED_SUM128;
 
     /* n_keys/n_aggs are no longer capped: ght_compute_layout spills to an
      * owned heap block (ly.spill_hdr) whenever n_keys exceeds GHT_INLINE
@@ -2032,7 +2036,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     case OP_AVG:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, (int64_t)r, true); break; }
                         v = val_is_f64 ? ROW_RD_F64(row, ly.off_sum, s) / nn
-                                       : (double)ROW_RD_I64(row, ly.off_sum, s) / nn;
+                          : (ly.need_flags & GHT_NEED_SUM128)
+                            ? ray_i128_to_f64(ROW_RD_I64(row, ly.off_sum_hi, s),
+                                              (uint64_t)ROW_RD_I64(row, ly.off_sum, s)) / nn
+                            : (double)ROW_RD_I64(row, ly.off_sum, s) / nn;
                         break;
                     case OP_MIN:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, (int64_t)r, true); break; }

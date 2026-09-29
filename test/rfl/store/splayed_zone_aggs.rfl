@@ -58,6 +58,8 @@
 (.db.splayed.set "rf_test_zone_huge/" (table [hv hc] (list hv hc)))
 (set TH (.db.splayed.get "rf_test_zone_huge/"))
 (set THm (table [hv hc] (list hv hc)))
+(at (select {from: THm a: (avg hv) b: (avg hc)}) 'a) -- [-0.5]
+(at (select {from: THm a: (avg hv) b: (avg hc)}) 'b) -- [4611686018427387904.0]
 (at (select {from: TH a: (avg hv) b: (avg hc)}) 'a) -- [-0.5]
 (at (select {from: TH a: (avg hv) b: (avg hc)}) 'b) -- [4611686018427387904.0]
 (avg hv) -- -0.5
