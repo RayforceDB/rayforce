@@ -1734,7 +1734,13 @@ static test_result_t test_cancelled_group(void) {
  * 20-worker pool and a 100k-slot slab the raw replication (20 slabs) leaves
  * most caches, and the run must use at most floor(0.75 * LLC / slab) task
  * slabs (never fewer than the pool when everything fits).  The result is
- * identical either way. */
+ * identical either way.
+ *
+ * The LLC is pinned to 32 MB (the size the route assumes when none is
+ * reported) for the routed query: ~10 slabs fit, so the bound bites but the
+ * run is not cache-starved.  Unpinned, a small-cache runner (a macOS CI VM
+ * reports a few MB of L2) fits fewer than three slabs and the route rightly
+ * switches to partition ownership, failing the strategy assertion. */
 static test_result_t test_dense_cache_bound(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(20), RAY_OK);
@@ -1743,21 +1749,24 @@ static test_result_t test_dense_cache_bound(void) {
         "(set cb_t (table [k v] (list (as 'I32 (% (* cb_i 7919) 100000)) (% cb_i 13))))");
     TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
     agg_route_reset();
+    ray_cache_llc_set_for_test(32ull << 20);
     ray_t* r = ray_eval_str("(select {from:cb_t by:k s:(sum v)})");
-    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     agg_route_stats_t stats = agg_route_stats();
+    uint64_t llc = ray_cache_llc_bytes();
+    ray_cache_llc_set_for_test(0);  /* before any assert can return */
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
     TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
     TEST_ASSERT_TRUE(stats.dense_tasks >= 2 && stats.dense_tasks <= 20);
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 100000);
-    uint64_t llc = ray_cache_llc_bytes();
-    if (llc > 0) {
+    {
         size_t block = agg_resolve(OP_SUM, RAY_I64)->state_size;
         double slots = (double)stats.dense_local_slots / stats.dense_tasks;
         double slab = slots * (block + sizeof(int64_t) + 1);
         double budget = (double)llc * 0.75;
         uint32_t cap = slab * 20 > budget ? (uint32_t)(budget / slab) : 20;
         if (cap < 2) cap = 2;
+        TEST_ASSERT_TRUE(cap >= 3 && cap < 20);  /* the pin makes the bound bite */
         TEST_ASSERT_EQ_I(stats.dense_tasks, cap);
     }
     /* The bounded run computes the same sums as the serial engine. */
