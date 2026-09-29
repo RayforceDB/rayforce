@@ -1436,7 +1436,7 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
         if (idxmg == COL_IDX_AUX_MAGIC) {
             size_t region_off = (out->tail_offset + 31) & ~(size_t)31;
             /* Need at least one RAY_INDEX block (32 hdr + sizeof payload). */
-            if (region_off + 32 + sizeof(ray_index_t) <= mapped_size) {
+            if (region_off + 32 + RAY_IDX_PAYLOAD_LEN_GEN1 <= mapped_size) {
                 out->has_index = true;
                 out->index_offset = region_off;
             }

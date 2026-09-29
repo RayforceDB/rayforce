@@ -1091,12 +1091,21 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
  * Returns NULL for a stale layout generation or a payload-size mismatch —
  * the caller loads the column unindexed (the index is rebuildable). */
 ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
-    int64_t head = IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t));
-    if (region_size < head) return NULL;
+    if (region_size < 32) return NULL;
     ray_t* idx = (ray_t*)region;
     if (idx->order != RAY_IDX_FORMAT_MAJOR) return NULL;
-    if (idx->len != (int64_t)sizeof(ray_index_t)) return NULL;
+    /* The payload is the ray_index_t as it was when the region was written.
+     * A region of the first generation is RAY_IDX_PAYLOAD_LEN_GEN1 bytes: the
+     * fields appended since (hash statistics) are absent — the struct read
+     * through the mapping overlaps the first child there, so they are never
+     * consulted: the marker that guards them is cleared below.  The child
+     * blocks start after the payload the writer had, whichever it was. */
+    int64_t plen = idx->len;
+    if (plen != (int64_t)sizeof(ray_index_t) && plen != RAY_IDX_PAYLOAD_LEN_GEN1) return NULL;
+    int64_t head = IDX_ALIGN32(32 + plen);
+    if (region_size < head) return NULL;
     ray_index_t* ix = ray_index_payload(idx);
+    if (plen < (int64_t)sizeof(ray_index_t)) ix->markers &= (uint8_t)~RAY_MARK_STATS;
     ray_t** slots[4];
     int nch = idx_child_slots(ix, slots);
     for (int i = 0; i < nch; i++) {
@@ -1467,6 +1476,88 @@ done:
     return ok;
 }
 
+/* Whole-column statistics of an integer / temporal column for its hash
+ * index: one pass, split over the pool, per-worker partials combined. */
+typedef struct {
+    ray_t*           v;
+    bool             nulls;
+    ray_int_stats_t* parts;   /* [n_workers] */
+} int_stats_ctx_t;
+
+static inline int64_t int_stats_read(const uint8_t* base, int8_t t, int64_t i) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: return (int64_t)base[i];
+    case RAY_I16: { int16_t x; memcpy(&x, base + i * 2, 2); return x; }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: { int32_t x; memcpy(&x, base + i * 4, 4); return x; }
+    default: { int64_t x; memcpy(&x, base + i * 8, 8); return x; }
+    }
+}
+
+static void int_stats_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    int_stats_ctx_t* c = (int_stats_ctx_t*)raw;
+    ray_int_stats_t* st = &c->parts[worker_id];
+    const uint8_t* base = (const uint8_t*)ray_data(c->v);
+    int8_t t = c->v->type;
+    for (int64_t i = start; i < end; i++) {
+        if (c->nulls && ray_vec_is_null(c->v, i)) continue;
+        int64_t x = int_stats_read(base, t, i);
+        ray_i128_add(&st->sum_hi, &st->sum_lo, x);
+        if (x < st->min) st->min = x;
+        if (x > st->max) st->max = x;
+        st->nn++;
+    }
+}
+
+static bool int_stats_type(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 ||
+           t == RAY_I64 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+/* Fill the hash index's whole-column statistics for an integer / temporal
+ * key and set RAY_MARK_STATS.  Any other key type leaves the marker clear. */
+static void hash_compute_stats(ray_t* v, ray_index_t* ix) {
+    if (!int_stats_type(v->type)) return;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+    if (nw == 0) nw = 1;
+    ray_t* hdr = NULL;
+    ray_int_stats_t* parts = (ray_int_stats_t*)scratch_calloc(&hdr, (size_t)nw * sizeof(ray_int_stats_t));
+    if (!parts) return;   /* no statistics: the column keeps scanning */
+    for (uint32_t w = 0; w < nw; w++) { parts[w].min = INT64_MAX; parts[w].max = INT64_MIN; }
+    int_stats_ctx_t ctx = { .v = v, .nulls = ray_vec_may_have_nulls(v), .parts = parts };
+    if (pool && v->len >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, int_stats_fn, &ctx, v->len);
+    else
+        int_stats_fn(&ctx, 0, 0, v->len);
+    ray_int_stats_t st = { 0, 0, 0, INT64_MAX, INT64_MIN };
+    for (uint32_t w = 0; w < nw; w++) {
+        st.nn += parts[w].nn;
+        ray_i128_add128(&st.sum_hi, &st.sum_lo, parts[w].sum_hi, parts[w].sum_lo);
+        if (parts[w].min < st.min) st.min = parts[w].min;
+        if (parts[w].max > st.max) st.max = parts[w].max;
+    }
+    scratch_free(hdr);
+    ix->u.hash.st_nn = st.nn;
+    ix->u.hash.st_sum_lo = st.sum_lo;
+    ix->u.hash.st_sum_hi = st.sum_hi;
+    ix->u.hash.st_min = st.min;
+    ix->u.hash.st_max = st.max;
+    ix->markers |= RAY_MARK_STATS;
+}
+
+bool ray_index_hash_stats(ray_t* x, ray_int_stats_t* out) {
+    if (!x || !ray_is_vec(x) || ray_index_kind(x) != RAY_IDX_HASH) return false;
+    ray_index_t* ix = ray_index_payload(x->index);
+    if (!(ix->markers & RAY_MARK_STATS) || ix->built_for_len != x->len) return false;
+    if (!int_stats_type(x->type)) return false;
+    out->nn = ix->u.hash.st_nn;
+    out->sum_lo = ix->u.hash.st_sum_lo;
+    out->sum_hi = ix->u.hash.st_sum_hi;
+    out->min = ix->u.hash.st_min;
+    out->max = ix->u.hash.st_max;
+    return true;
+}
+
 ray_t* ray_index_attach_hash(ray_t** vp) {
     /* allow_str: keyed on a byte hash with payload-verified compares;
      * allow_sym: RAY_SYM uses domain ids. */
@@ -1500,6 +1591,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
             ix->u.hash.n_keys   = pk;
             ix->u.hash.n_groups = pn;
             ix->u.hash.order_sym = -1;
+            hash_compute_stats(v, ix);
             return attach_finalize(v, idx);
         }
     }
@@ -1641,6 +1733,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     ix->u.hash.n_keys   = n_keys;
     ix->u.hash.n_groups = n_groups;
     ix->u.hash.order_sym = -1;
+    hash_compute_stats(v, ix);
 
     return attach_finalize(v, idx);
 

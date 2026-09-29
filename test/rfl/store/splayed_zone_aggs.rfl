@@ -2,7 +2,7 @@
 ;; metadata (per-chunk min/max, per-chunk sums and non-null counts): every
 ;; answer must equal the same query over an in-memory copy of the data,
 ;; nulls and types included.  Four chunks of 64k rows.
-(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0
+(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak rf_test_zone_hash") -- 0
 (set n 200000)
 (set i (til n))
 (set M (table [a16 a32 a64 big d f] (list (as 'I16 (% i 3000)) (as 'I32 (- (% (* i 7) 100000) 50000)) (- i 100000) (* (- i 100000) 92233720368547) (as 'DATE (% i 900)) (/ (as 'F64 i) 7.0))))
@@ -67,6 +67,42 @@
 (avg (at TH 'hc)) -- 4611686018427387904.0
 (at (select {from: TH a: (avg hv) where: (>= hi 0)}) 'a) -- (at (select {from: THm a: (avg hv) where: (>= hi 0)}) 'a)
 (.sys.exec "rm -rf rf_test_zone_huge") -- 0
+;; a column the loader upgrades to a HASH index has no zones; its index
+;; carries the whole-column statistics instead (non-null count, exact
+;; 128-bit sum, extrema), so the same whole-table aggregates come from the
+;; metadata: values and types equal the in-memory copy, nulls skipped,
+;; temporal means included
+(.sys.exec "rm -rf rf_test_zone_hash") -- 0
+(set hn 300000)
+(set hi (til hn))
+(set hk (* (+ 1000 (% (* hi 2654435761) 100000)) 92233720368547))
+(set hkn (as 'I64 (map (fn [j] (if (== 0 (% j 977)) 0Nl (+ 1000 (% (* j 2654435761) 100000)))) hi)))
+(set ht (as 'TIMESTAMP (* 1000000000 (+ 1700000000 (% (* hi 2654435761) 200000)))))
+(.db.splayed.set "rf_test_zone_hash/" (table [hk hkn ht] (list hk hkn ht)))
+(set TH (.db.splayed.get "rf_test_zone_hash/"))
+(set THm (table [hk hkn ht] (list hk hkn ht)))
+(at (.idx.info (at TH 'hk)) 'kind) -- 'hash
+(at (.idx.info (at TH 'hkn)) 'kind) -- 'hash
+(set qh (fn [t] (select {from: t a: (avg hk) s: (sum hk) mn: (min hk) mx: (max hk) c: (count hk) an: (avg hkn) sn: (sum hkn) mnn: (min hkn) mxn: (max hkn) ta: (avg ht) tmn: (min ht) tmx: (max ht)})))
+(set RH (qh TH))
+(set OH (qh THm))
+(all (map (fn [c] (== (at (at RH c) 0) (at (at OH c) 0))) (cols RH))) -- true
+(all (map (fn [c] (== (type (at RH c)) (type (at OH c)))) (cols RH))) -- true
+(at (at RH 'mnn) 0) -- 1000
+(at (at RH 'c) 0) -- 300000
+(avg (at TH 'hk)) -- (avg hk)
+(sum (at TH 'hk)) -- (sum hk)
+(min (at TH 'hkn)) -- (min hkn)
+(max (at TH 'ht)) -- (max ht)
+;; the answer comes from the metadata: a whole-table mean of the 300k-row
+;; column is not a scan (bounded far below it)
+(< (timeit (select {from: TH a: (avg hk) b: (min hkn)})) (/ (timeit (select {from: THm a: (avg hk) b: (min hkn)})) 4)) -- true
+;; a runtime hash index carries the statistics too
+(set hv (.idx.hash (* (+ (til 200000) 1) 7)))
+(avg hv) -- (avg (* (+ (til 200000) 1) 7))
+(min hv) -- 7
+(max hv) -- 1400000
+(.sys.exec "rm -rf rf_test_zone_hash") -- 0
 ;; an empty table keeps the planner's answers
 (at (select {from: (select {from: T where: (< a64 -1000000)}) c: (count a16)}) 'c) -- (at (select {from: (select {from: Tm where: (< a64 -1000000)}) c: (count a16)}) 'c)
 (.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0

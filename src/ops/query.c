@@ -549,10 +549,16 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
         uint16_t op = resolve_agg_opcode(el[0]->i64);
         bool int_col = col->type == RAY_I64 || col->type == RAY_I32 ||
                        col->type == RAY_I16 || col->type == RAY_U8;
+        /* a mean is admitted over temporal and BOOL columns too, and their
+         * statistics are integers like the rest */
+        bool avg_col = int_col || col->type == RAY_BOOL || col->type == RAY_DATE ||
+                       col->type == RAY_TIME || col->type == RAY_TIMESTAMP;
         int64_t zs, zn, zh; uint64_t zl;
         switch (op) {
         case OP_COUNT: break;
         case OP_MIN: case OP_MAX: {
+            ray_int_stats_t hs;
+            if (ray_index_hash_stats(col, &hs)) break;   /* hash index: whole-column extrema */
             if (ray_index_kind(col) != RAY_IDX_CHUNK_ZONE) return NULL;
             ray_index_t* ix = ray_index_payload(col->index);
             if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64 ||
@@ -563,7 +569,7 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
             if (!int_col || !ray_zone_int_sum(col, &zs, &zn)) return NULL;
             break;
         case OP_AVG:
-            if (!int_col || !ray_zone_int_sum128(col, &zh, &zl, &zn)) return NULL;
+            if (!avg_col || !ray_zone_int_sum128(col, &zh, &zl, &zn)) return NULL;
             break;
         default: return NULL;
         }

@@ -423,6 +423,8 @@ static const int64_t* zone_aggs(ray_t* x, uint32_t* n_out, bool* have_hi) {
 }
 
 bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out) {
+    ray_int_stats_t hs;
+    if (ray_index_hash_stats(x, &hs)) { *sum_out = (int64_t)hs.sum_lo; *nn_out = hs.nn; return true; }
     uint32_t n; bool have_hi;
     const int64_t* ag = zone_aggs(x, &n, &have_hi);
     if (!ag) return false;
@@ -438,6 +440,8 @@ bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out) {
 }
 
 bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* nn_out) {
+    ray_int_stats_t hs;
+    if (ray_index_hash_stats(x, &hs)) { *hi_out = hs.sum_hi; *lo_out = hs.sum_lo; *nn_out = hs.nn; return true; }
     uint32_t n; bool have_hi;
     const int64_t* ag = zone_aggs(x, &n, &have_hi);
     if (!ag) return false;
@@ -640,7 +644,8 @@ ray_t* ray_avg_fn(ray_t* x) {
         /* Integer columns with per-chunk sums: the exact 128-bit total is
          * what the row-wise reduction computes too, so the answers agree
          * bit for bit. */
-        if (x->type == RAY_I64 || x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8) {
+        if (x->type == RAY_I64 || x->type == RAY_I32 || x->type == RAY_I16 || x->type == RAY_U8 ||
+            x->type == RAY_BOOL || x->type == RAY_DATE || x->type == RAY_TIME || x->type == RAY_TIMESTAMP) {
             int64_t zh, zn; uint64_t zl;
             if (ray_zone_int_sum128(x, &zh, &zl, &zn)) {
                 if (zn == 0) return ray_typed_null(-RAY_F64);
@@ -664,11 +669,30 @@ ray_t* ray_avg_fn(ray_t* x) {
     return make_f64(sum / (double)cnt);
 }
 
+/* An integer / temporal extremum as an atom of the column's type. */
+static ray_t* int_extreme_atom(int8_t t, int64_t v) {
+    switch (t) {
+    case RAY_BOOL:      return ray_bool((bool)v);
+    case RAY_U8:        return ray_u8((uint8_t)v);
+    case RAY_I16:       return ray_i16((int16_t)v);
+    case RAY_I32:       return ray_i32((int32_t)v);
+    case RAY_DATE:      return ray_date((int32_t)v);
+    case RAY_TIME:      return ray_time(v);
+    case RAY_TIMESTAMP: return ray_timestamp(v);
+    default:            return ray_i64(v);
+    }
+}
+
 ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MIN);
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 0);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
+        /* A hash-indexed integer / temporal column carries its whole-column
+         * extrema (no zones to scan): same answer, same typing. */
+        ray_int_stats_t hs;
+        if (ray_index_hash_stats(x, &hs))
+            return hs.nn == 0 ? ray_typed_null(-x->type) : int_extreme_atom(x->type, hs.min);
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
          * Only valid when the index was built for the column's current len
          * (mutation paths call ray_index_drop). */
@@ -732,6 +756,9 @@ ray_t* ray_max_fn(ray_t* x) {
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 1);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
+        ray_int_stats_t hs;
+        if (ray_index_hash_stats(x, &hs))
+            return hs.nn == 0 ? ray_typed_null(-x->type) : int_extreme_atom(x->type, hs.max);
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
             if (ix->built_for_len == x->len && ix->u.chunk_zone.maxs) {

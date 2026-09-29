@@ -645,6 +645,100 @@ static test_result_t test_index_mapped_drop_unmaps_tail(void) {
     PASS();
 }
 
+/* ─── Hash index: whole-column statistics, and first-generation regions ──
+ *
+ * An integer hash index carries the column's non-null count, exact 128-bit
+ * sum and extrema (RAY_MARK_STATS).  A region persisted before those fields
+ * existed has a 96-byte payload; it must still map, with the marker clear,
+ * and its lookups must still work — the children start right after the
+ * payload the writer had. */
+static test_result_t test_index_hash_stats_and_gen1_region(void) {
+    ray_heap_init();
+    int64_t n = 5000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) { int64_t x = (i % 700) * 4611686018427387LL - 9; v = ray_vec_append(v, &x); }
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 11, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 4321, true), RAY_OK);
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
+    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
+
+    /* statistics against a plain walk */
+    ray_int_stats_t st;
+    TEST_ASSERT_TRUE(ray_index_hash_stats(w, &st));
+    int64_t nn = 0, mn = INT64_MAX, mx = INT64_MIN, hi = 0; uint64_t lo = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(w, i)) continue;
+        int64_t x = ((int64_t*)ray_data(w))[i];
+        ray_i128_add(&hi, &lo, x);
+        if (x < mn) mn = x;
+        if (x > mx) mx = x;
+        nn++;
+    }
+    TEST_ASSERT_EQ_I(st.nn, nn);
+    TEST_ASSERT_EQ_I(st.nn, n - 2);
+    TEST_ASSERT_EQ_I(st.sum_hi, hi);
+    TEST_ASSERT_TRUE(st.sum_lo == lo);
+    TEST_ASSERT_TRUE(st.sum_hi > 0);            /* the total leaves int64 */
+    TEST_ASSERT_EQ_I(st.min, mn);
+    TEST_ASSERT_EQ_I(st.max, mx);
+
+    /* persist the region as written today, then as the first generation */
+    ray_index_t* ix = ray_index_payload(w->index);
+    int64_t rsize = ray_index_inline_size(ix);
+    ray_t* rh = ray_alloc((size_t)rsize);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rh));
+    uint8_t* region = (uint8_t*)ray_data(rh);
+    memset(region, 0, (size_t)rsize);
+    ray_index_inline_write(region, ix);
+
+    /* today's layout maps with the statistics */
+    ray_t* mh = ray_alloc((size_t)rsize);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mh));
+    uint8_t* m1 = (uint8_t*)ray_data(mh);
+    memcpy(m1, region, (size_t)rsize);
+    ray_t* mapped = ray_index_inline_map(m1, rsize);
+    TEST_ASSERT_NOT_NULL(mapped);
+    ray_index_t* mx1 = ray_index_payload(mapped);
+    TEST_ASSERT_TRUE(mx1->markers & RAY_MARK_STATS);
+    TEST_ASSERT_EQ_I(mx1->u.hash.st_nn, nn);
+    TEST_ASSERT_EQ_I(mx1->u.hash.st_max, mx);
+
+    /* the first generation: a 96-byte payload, children right after it */
+    int64_t head_new = (32 + (int64_t)sizeof(ray_index_t) + 31) & ~(int64_t)31;
+    int64_t head_old = (32 + RAY_IDX_PAYLOAD_LEN_GEN1 + 31) & ~(int64_t)31;
+    int64_t osize = rsize - (head_new - head_old);
+    ray_t* oh = ray_alloc((size_t)rsize);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(oh));
+    uint8_t* old = (uint8_t*)ray_data(oh);
+    memset(old, 0, (size_t)rsize);
+    memcpy(old, region, 32 + RAY_IDX_PAYLOAD_LEN_GEN1);
+    ((ray_t*)old)->len = RAY_IDX_PAYLOAD_LEN_GEN1;
+    memcpy(old + head_old, region + head_new, (size_t)(rsize - head_new));
+    ray_index_t* ox = (ray_index_t*)(old + 32);
+    ox->markers = (uint8_t)(ox->markers & ~RAY_MARK_STATS);
+    ray_t** ch[4] = { &ox->u.hash.table, &ox->u.hash.gkeys, &ox->u.hash.offs, &ox->u.hash.rows };
+    for (int c = 0; c < 4; c++) {
+        int64_t off = (int64_t)(intptr_t)*ch[c];
+        if (off) *ch[c] = (ray_t*)(intptr_t)(off - (head_new - head_old));
+    }
+    ray_t* omapped = ray_index_inline_map(old, osize);
+    TEST_ASSERT_NOT_NULL(omapped);
+    ray_index_t* oix = ray_index_payload(omapped);
+    TEST_ASSERT_EQ_I((int)oix->kind, RAY_IDX_HASH);
+    TEST_ASSERT_FALSE(oix->markers & RAY_MARK_STATS);
+    TEST_ASSERT_EQ_I(oix->u.hash.n_groups, ix->u.hash.n_groups);
+    TEST_ASSERT_EQ_I(oix->u.hash.gkeys->len, ix->u.hash.gkeys->len);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(oix->u.hash.rows))[0], ((int64_t*)ray_data(ix->u.hash.rows))[0]);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(oix->u.hash.offs))[ix->u.hash.n_groups],
+                     ((int64_t*)ray_data(ix->u.hash.offs))[ix->u.hash.n_groups]);
+
+    ray_release(oh); ray_release(mh); ray_release(rh);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Slice null detection on indexed/parent vec ───────────────────── */
 
 static test_result_t test_index_aux_helper_slice(void) {
@@ -3848,6 +3942,7 @@ const test_entry_t index_entries[] = {
     { "index/null_readers_through_helper",   test_index_null_readers_through_helper,   NULL, NULL },
     { "index/aux_helper_slice",          test_index_aux_helper_slice,          NULL, NULL },
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
+    { "index/hash_stats_and_gen1_region", test_index_hash_stats_and_gen1_region, NULL, NULL },
     { "index/mapped_drop_unmaps_tail", test_index_mapped_drop_unmaps_tail, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },

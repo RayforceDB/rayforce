@@ -96,6 +96,10 @@ typedef enum {
  * passenger index by pointer.  Clear = heap-resident index (freed normally),
  * including a runtime-built index attached to an mmap'd column. */
 #define RAY_MARK_MMAP    0x02
+/* RAY_IDX_HASH over an integer / temporal column: the whole-column
+ * statistics (st_* below) were computed and are valid.  Clear on regions
+ * written before they existed and on SYM / STR / float keys. */
+#define RAY_MARK_STATS   0x04
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
 typedef struct {
@@ -135,6 +139,20 @@ typedef struct {
             int64_t  n_keys;    /* number of non-null rows indexed */
             int64_t  n_groups;  /* number of distinct keys */
             int64_t  order_sym; /* optional column symbol ordered within each group */
+            /* Whole-column statistics of an integer / temporal key, valid
+             * when RAY_MARK_STATS is set: a hash-indexed column carries no
+             * chunk zones, and these let count / sum / avg / min / max be
+             * answered without a scan, exactly as the zones do.  The sum is
+             * the exact 128-bit total (lo, hi); min / max ignore nulls.
+             * Appended after the first persisted generation: a region whose
+             * payload is RAY_IDX_PAYLOAD_LEN_GEN1 bytes long has no room for
+             * them and loads with the marker clear. */
+            int64_t  st_nn;
+            uint64_t st_sum_lo;
+            int64_t  st_sum_hi;
+            int64_t  st_min;
+            int64_t  st_max;
+            int64_t  _st_pad[3];
         } hash;
         struct {                /* RAY_IDX_SORT */
             ray_t* perm;        /* RAY_I64 vec, perm[i] = row id at sorted pos i */
@@ -236,6 +254,11 @@ _Static_assert(sizeof(((ray_index_t*)0)->u.ukey) <= sizeof(((ray_index_t*)0)->u.
  * contiguous 32-byte-aligned ray_t blocks mmap'd in place (no serialization).
  * For the trailing child blocks to stay 32-aligned, the index payload must be a
  * 32-byte multiple — enforce it so the layout invariant can't silently break. */
+/* Payload length of the RAY_INDEX block as written before the hash
+ * statistics were appended; such regions still load (ray_index_inline_map)
+ * with the statistics marker clear. */
+#define RAY_IDX_PAYLOAD_LEN_GEN1 96
+_Static_assert(sizeof(ray_index_t) == 160, "index payload grew: add a generation length");
 _Static_assert(sizeof(ray_index_t) % 32 == 0,
                "ray_index_t must be a 32-byte multiple for in-place mmap layout");
 
@@ -311,6 +334,13 @@ bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out);
  * metadata: true when the per-chunk high words are stored, or when no
  * partial sum can wrap int64 (then the wrapped sum is the exact one). */
 bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* nn_out);
+
+/* Whole-column statistics of an integer / temporal column from its hash
+ * index (RAY_MARK_STATS, built for the column's current length): non-null
+ * count, exact 128-bit sum (hi, lo) and the extrema over non-null values.
+ * False when the column has no such index. */
+typedef struct { int64_t nn; uint64_t sum_lo; int64_t sum_hi; int64_t min; int64_t max; } ray_int_stats_t;
+bool ray_index_hash_stats(ray_t* x, ray_int_stats_t* out);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).
