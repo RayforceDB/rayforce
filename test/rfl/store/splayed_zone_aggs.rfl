@@ -22,9 +22,11 @@
 (at (at R 's16) 0) -- (sum (at Tm 'a16))
 (at (at R 'mn) 0) -- 2000.01.01
 (at (at R 'c) 0) -- 200000
-;; sums past double's integer range: avg is left to the row-wise path and
-;; still agrees; a float column and a filter take the usual path too
+;; sums past double's integer range: the metadata keeps the exact 128-bit
+;; per-chunk sums and the row-wise reduction accumulates the same way, so
+;; avg agrees bit for bit; a float column and a filter take the usual path
 (at (select {from: T a: (avg big)}) 'a) -- (at (select {from: Tm a: (avg big)}) 'a)
+(avg (at T 'big)) -- (avg (at Tm 'big))
 (at (select {from: T a: (sum a16) b: (sum f)}) 'b) -- (at (select {from: Tm a: (sum a16) b: (sum f)}) 'b)
 (at (select {from: T a: (sum a16) where: (> a32 0)}) 'a) -- (at (select {from: Tm a: (sum a16) where: (> a32 0)}) 'a)
 ;; scalar forms read the same metadata
@@ -44,6 +46,25 @@
 (at (select {from: TX a: (min m) b: (max m)}) 'a) -- [9223372036854775807]
 (min (at TX 'm)) -- 9223372036854775807
 (.sys.exec "rm -rf rf_test_zone_max") -- 0
+;; the exact mean of values that overflow int64 within every chunk:
+;; alternating +(2^63-1-i) / -(2^63-1-i) pairs sum to exactly one per pair,
+;; and a column of 2^62 averages to exactly 2^62 — from the metadata, from
+;; the row-wise reduction, and from a parted copy
+(.sys.exec "rm -rf rf_test_zone_huge") -- 0
+(set hn 150000)
+(set hi (til hn))
+(set hv (* (- (* 2 (% hi 2)) 1) (- 9223372036854775807 hi)))
+(set hc (take [4611686018427387904] hn))
+(.db.splayed.set "rf_test_zone_huge/" (table [hv hc] (list hv hc)))
+(set TH (.db.splayed.get "rf_test_zone_huge/"))
+(set THm (table [hv hc] (list hv hc)))
+(at (select {from: TH a: (avg hv) b: (avg hc)}) 'a) -- [-0.5]
+(at (select {from: TH a: (avg hv) b: (avg hc)}) 'b) -- [4611686018427387904.0]
+(avg hv) -- -0.5
+(avg (at TH 'hv)) -- -0.5
+(avg (at TH 'hc)) -- 4611686018427387904.0
+(at (select {from: TH a: (avg hv) where: (>= hi 0)}) 'a) -- (at (select {from: THm a: (avg hv) where: (>= hi 0)}) 'a)
+(.sys.exec "rm -rf rf_test_zone_huge") -- 0
 ;; an empty table keeps the planner's answers
 (at (select {from: (select {from: T where: (< a64 -1000000)}) c: (count a16)}) 'c) -- (at (select {from: (select {from: Tm where: (< a64 -1000000)}) c: (count a16)}) 'c)
 (.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0

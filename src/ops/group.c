@@ -131,10 +131,13 @@ int64_t ray_group_perpart_runs(void) {
 typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
     int64_t sum_i, min_i, max_i, prod_i, first_i, last_i, sum_sq_i;
-    /* Parallel f64 sum of the integer stream — used by AVG so the
-     * mean of an i64 column whose sum exceeds 2^63 stays accurate
-     * instead of being whatever (uint64) wrap left in sum_i. */
+    /* f64 sum of the integer stream (variance / stddev of integers). */
     double sum_d;
+    /* High word of the exact 128-bit sum of the integer stream; sum_i is
+     * its low word.  AVG of an integer column divides this exact total,
+     * so the mean is the same bits whatever the morsel split and equals
+     * the value the chunk-zone metadata computes from its per-chunk sums. */
+    int64_t sum_hi;
     int64_t cnt;
     int64_t zero_count;
     bool has_first;
@@ -145,7 +148,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->prod_f = 1.0; acc->first_f = 0; acc->last_f = 0; acc->sum_sq_f = 0;
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
-    acc->sum_d = 0;
+    acc->sum_d = 0; acc->sum_hi = 0;
     acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
 }
 
@@ -329,13 +332,14 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define RED_NEED_MAX       (1u << 7)
 #define RED_NEED_FIRST     (1u << 8)
 #define RED_NEED_LAST      (1u << 9)
+#define RED_NEED_SUM_128   (1u << 10) /* integer stream: exact 128-bit sum in (sum_hi, sum_i) */
 
 #define RED_MASK_ANY       (RED_NEED_COUNT | RED_NEED_ZERO)
 #define RED_MASK_MIN       (RED_NEED_COUNT | RED_NEED_MIN)
 #define RED_MASK_MAX       (RED_NEED_COUNT | RED_NEED_MAX)
 #define RED_MASK_FIRST     (RED_NEED_COUNT | RED_NEED_FIRST)
 #define RED_MASK_LAST      (RED_NEED_COUNT | RED_NEED_LAST)
-#define RED_MASK_AVG_I     (RED_NEED_SUM_D | RED_NEED_COUNT)
+#define RED_MASK_AVG_I     (RED_NEED_SUM_128 | RED_NEED_COUNT)
 #define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
 #define RED_MASK_STATS_I   (RED_NEED_SUM_D | RED_NEED_SUM_SQ | RED_NEED_COUNT)
 #define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
@@ -368,6 +372,11 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if ((NEEDS) & RED_NEED_SUM_128) { \
+                uint64_t lo_ = (uint64_t)(acc)->sum_i + (uint64_t)v; \
+                (acc)->sum_hi += (v < 0 ? -1 : 0) + (lo_ < (uint64_t)v ? 1 : 0); \
+                (acc)->sum_i = (int64_t)lo_; \
+            } \
             if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
             if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
             if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
@@ -396,6 +405,11 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if ((NEEDS) & RED_NEED_SUM_128) { \
+                uint64_t lo_ = (uint64_t)(acc)->sum_i + (uint64_t)v; \
+                (acc)->sum_hi += (v < 0 ? -1 : 0) + (lo_ < (uint64_t)v ? 1 : 0); \
+                (acc)->sum_i = (int64_t)lo_; \
+            } \
             if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
             if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
             if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
@@ -662,7 +676,11 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
         break;
     case OP_AVG:
         if (fp) dst->sum_f += src->sum_f;
-        else dst->sum_d += src->sum_d;
+        else {
+            uint64_t lo = (uint64_t)dst->sum_i + (uint64_t)src->sum_i;
+            dst->sum_hi += src->sum_hi + (lo < (uint64_t)src->sum_i ? 1 : 0);
+            dst->sum_i = (int64_t)lo;
+        }
         dst->cnt += src->cnt;
         break;
     case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
@@ -4268,7 +4286,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             /* COUNT returns total length including nulls — matches ray_count_fn's
              * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
             case OP_COUNT: result = ray_i64(scan_n); break;
-            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : merged.sum_d / merged.cnt)) : ray_typed_null(-RAY_F64); break;
+            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : ray_i128_to_f64(merged.sum_hi, (uint64_t)merged.sum_i) / merged.cnt)) : ray_typed_null(-RAY_F64); break;
             case OP_FIRST: result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.first_f) : reduction_i64_result(merged.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
             case OP_LAST:  result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.last_f) : reduction_i64_result(merged.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
             case OP_VAR: case OP_VAR_POP:
@@ -4309,7 +4327,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         /* COUNT returns total length including nulls — matches ray_count_fn's
          * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
         case OP_COUNT: return ray_i64(scan_n);
-        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : acc.sum_d / acc.cnt)) : ray_typed_null(-RAY_F64);
+        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : ray_i128_to_f64(acc.sum_hi, (uint64_t)acc.sum_i) / acc.cnt)) : ray_typed_null(-RAY_F64);
         case OP_FIRST: return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.first_f) : reduction_i64_result(acc.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
         case OP_LAST:  return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.last_f) : reduction_i64_result(acc.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
         case OP_VAR: case OP_VAR_POP:

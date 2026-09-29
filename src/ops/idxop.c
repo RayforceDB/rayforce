@@ -603,7 +603,8 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
         int64_t s = (int64_t)g * csz;
         int64_t e = s + csz; if (e > n) e = n;
         int64_t mn = INT64_MAX, mx = INT64_MIN;
-        uint64_t sum = 0;          /* wraps like the engine's int64 sum */
+        uint64_t sum = 0;          /* low word: wraps like the engine's int64 sum */
+        int64_t  hi  = 0;          /* high word of the exact 128-bit sum */
         int64_t nn = 0;
         bool any_null = false;
         for (int64_t i = s; i < e; i++) {
@@ -618,13 +619,15 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
             }
             if (val < mn) mn = val;
             if (val > mx) mx = val;
-            sum += (uint64_t)val;
+            ray_i128_add(&hi, &sum, val);
             nn++;
         }
         if (ix->u.chunk_zone.aggs) {
             int64_t* ag = (int64_t*)ray_data(ix->u.chunk_zone.aggs);
             ag[g] = (int64_t)sum;
             ag[n_chunks + g] = nn;
+            if (ix->u.chunk_zone.aggs->len >= 3 * (int64_t)n_chunks)
+                ag[2 * (int64_t)n_chunks + g] = hi;
         }
         /* Empty (all-null) chunks keep mn=INT64_MAX / mx=INT64_MIN so
          * the reduce path's min(mins[*]) / max(maxs[*]) ignores them. */
@@ -822,9 +825,10 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2) {
     ix->u.chunk_zone.maxs      = maxs;
     ix->u.chunk_zone.null_bits = nbits;
     if (!ix->u.chunk_zone.is_f64) {
-        ray_t* aggs = ray_vec_new(RAY_I64, 2 * (int64_t)n_chunks);
+        /* [sum low words | non-null counts | sum high words], one per chunk */
+        ray_t* aggs = ray_vec_new(RAY_I64, 3 * (int64_t)n_chunks);
         if (!aggs || RAY_IS_ERR(aggs)) { ray_release(idx); return ray_error("oom", "chunk_zone: aggs alloc"); }
-        aggs->len = 2 * (int64_t)n_chunks;
+        aggs->len = 3 * (int64_t)n_chunks;
         ix->u.chunk_zone.aggs = aggs;
     }
 
@@ -878,9 +882,10 @@ ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2) {
     ix->u.chunk_zone.maxs      = maxs;
     ix->u.chunk_zone.null_bits = nbits;
     if (!ix->u.chunk_zone.is_f64) {
-        ray_t* aggs = ray_vec_new(RAY_I64, 2 * (int64_t)n_chunks);
+        /* [sum low words | non-null counts | sum high words], one per chunk */
+        ray_t* aggs = ray_vec_new(RAY_I64, 3 * (int64_t)n_chunks);
         if (!aggs || RAY_IS_ERR(aggs)) { ray_release(idx); return ray_error("oom", "chunk_zone: aggs alloc"); }
-        aggs->len = 2 * (int64_t)n_chunks;
+        aggs->len = 3 * (int64_t)n_chunks;
         ix->u.chunk_zone.aggs = aggs;
     }
 
@@ -1116,9 +1121,11 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
         }
         *slots[i] = c;
     }
+    /* two layouts: [lo | nn] (2 per chunk) and [lo | nn | hi] (3 per chunk) */
     if (ix->kind == RAY_IDX_CHUNK_ZONE && ix->u.chunk_zone.aggs &&
         (ix->u.chunk_zone.aggs->type != RAY_I64 || ix->u.chunk_zone.is_f64 ||
-         ix->u.chunk_zone.aggs->len != 2 * (int64_t)ix->u.chunk_zone.n_chunks))
+         (ix->u.chunk_zone.aggs->len != 2 * (int64_t)ix->u.chunk_zone.n_chunks &&
+          ix->u.chunk_zone.aggs->len != 3 * (int64_t)ix->u.chunk_zone.n_chunks)))
         ix->u.chunk_zone.aggs = NULL;
     ix->markers |= RAY_MARK_MMAP;
     idx->mmod = 1;
