@@ -43,6 +43,19 @@ static inline bool group_fp_type(int8_t t) {
     return t == RAY_F32 || t == RAY_F64;
 }
 
+/* Does an integer AVG over this input need the 128-bit high word next to
+ * its int64 sum?  Only a 64-bit input can push a group's total past int64
+ * in fewer than 2^31 rows; a narrower input (and a strlen fusion, whose
+ * lengths are smaller still) stays exact in the wrapped int64 sum, so it
+ * skips the carry and the per-slot high word entirely — the dense
+ * direct-array path in particular carves that word per worker.  An
+ * unknown type (0: a linear plan without a source vector) is treated as
+ * 64-bit. */
+static inline bool group_avg_needs_hi(int8_t t, int64_t nrows) {
+    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_SYM || t == 0 ||
+           nrows >= ((int64_t)1 << 31);
+}
+
 /*
  * group_key_f64_bits -- read an F64 GROUP BY key's bits, canonicalised.
  *
@@ -131,10 +144,13 @@ int64_t ray_group_perpart_runs(void) {
 typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
     int64_t sum_i, min_i, max_i, prod_i, first_i, last_i, sum_sq_i;
-    /* Parallel f64 sum of the integer stream — used by AVG so the
-     * mean of an i64 column whose sum exceeds 2^63 stays accurate
-     * instead of being whatever (uint64) wrap left in sum_i. */
+    /* f64 sum of the integer stream (variance / stddev of integers). */
     double sum_d;
+    /* High word of the exact 128-bit sum of the integer stream; sum_i is
+     * its low word.  AVG of an integer column divides this exact total,
+     * so the mean is the same bits whatever the morsel split and equals
+     * the value the chunk-zone metadata computes from its per-chunk sums. */
+    int64_t sum_hi;
     int64_t cnt;
     int64_t zero_count;
     bool has_first;
@@ -145,7 +161,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->prod_f = 1.0; acc->first_f = 0; acc->last_f = 0; acc->sum_sq_f = 0;
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
-    acc->sum_d = 0;
+    acc->sum_d = 0; acc->sum_hi = 0;
     acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
 }
 
@@ -329,13 +345,14 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define RED_NEED_MAX       (1u << 7)
 #define RED_NEED_FIRST     (1u << 8)
 #define RED_NEED_LAST      (1u << 9)
+#define RED_NEED_SUM_128   (1u << 10) /* integer stream: exact 128-bit sum in (sum_hi, sum_i) */
 
 #define RED_MASK_ANY       (RED_NEED_COUNT | RED_NEED_ZERO)
 #define RED_MASK_MIN       (RED_NEED_COUNT | RED_NEED_MIN)
 #define RED_MASK_MAX       (RED_NEED_COUNT | RED_NEED_MAX)
 #define RED_MASK_FIRST     (RED_NEED_COUNT | RED_NEED_FIRST)
 #define RED_MASK_LAST      (RED_NEED_COUNT | RED_NEED_LAST)
-#define RED_MASK_AVG_I     (RED_NEED_SUM_D | RED_NEED_COUNT)
+#define RED_MASK_AVG_I     (RED_NEED_SUM_128 | RED_NEED_COUNT)
 #define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
 #define RED_MASK_STATS_I   (RED_NEED_SUM_D | RED_NEED_SUM_SQ | RED_NEED_COUNT)
 #define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
@@ -368,6 +385,11 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if ((NEEDS) & RED_NEED_SUM_128) { \
+                uint64_t lo_ = (uint64_t)(acc)->sum_i + (uint64_t)v; \
+                (acc)->sum_hi += (v < 0 ? -1 : 0) + (lo_ < (uint64_t)v ? 1 : 0); \
+                (acc)->sum_i = (int64_t)lo_; \
+            } \
             if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
             if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
             if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
@@ -396,6 +418,11 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
+            if ((NEEDS) & RED_NEED_SUM_128) { \
+                uint64_t lo_ = (uint64_t)(acc)->sum_i + (uint64_t)v; \
+                (acc)->sum_hi += (v < 0 ? -1 : 0) + (lo_ < (uint64_t)v ? 1 : 0); \
+                (acc)->sum_i = (int64_t)lo_; \
+            } \
             if (((NEEDS) & RED_NEED_ZERO) && v == 0) (acc)->zero_count++; \
             if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_i) (acc)->min_i = v; \
             if (((NEEDS) & RED_NEED_MAX) && v > (acc)->max_i) (acc)->max_i = v; \
@@ -662,7 +689,11 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
         break;
     case OP_AVG:
         if (fp) dst->sum_f += src->sum_f;
-        else dst->sum_d += src->sum_d;
+        else {
+            uint64_t lo = (uint64_t)dst->sum_i + (uint64_t)src->sum_i;
+            dst->sum_hi += src->sum_hi + (lo < (uint64_t)src->sum_i ? 1 : 0);
+            dst->sum_i = (int64_t)lo;
+        }
         dst->cnt += src->cnt;
         break;
     case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
@@ -4268,7 +4299,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             /* COUNT returns total length including nulls — matches ray_count_fn's
              * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
             case OP_COUNT: result = ray_i64(scan_n); break;
-            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : merged.sum_d / merged.cnt)) : ray_typed_null(-RAY_F64); break;
+            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : ray_i128_to_f64(merged.sum_hi, (uint64_t)merged.sum_i) / merged.cnt)) : ray_typed_null(-RAY_F64); break;
             case OP_FIRST: result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.first_f) : reduction_i64_result(merged.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
             case OP_LAST:  result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.last_f) : reduction_i64_result(merged.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
             case OP_VAR: case OP_VAR_POP:
@@ -4309,7 +4340,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         /* COUNT returns total length including nulls — matches ray_count_fn's
          * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
         case OP_COUNT: return ray_i64(scan_n);
-        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : acc.sum_d / acc.cnt)) : ray_typed_null(-RAY_F64);
+        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : ray_i128_to_f64(acc.sum_hi, (uint64_t)acc.sum_i) / acc.cnt)) : ray_typed_null(-RAY_F64);
         case OP_FIRST: return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.first_f) : reduction_i64_result(acc.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
         case OP_LAST:  return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.last_f) : reduction_i64_result(acc.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
         case OP_VAR: case OP_VAR_POP:
@@ -4683,6 +4714,8 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
     if (need_flags & GHT_NEED_MIN)   { out->off_min   = (uint16_t)off; off += block; }
     if (need_flags & GHT_NEED_MAX)   { out->off_max   = (uint16_t)off; off += block; }
     if (need_flags & GHT_NEED_SUMSQ) { out->off_sumsq = (uint16_t)off; off += block; }
+    /* High words of the exact 128-bit integer sums (integer AVG). */
+    if (need_flags & GHT_NEED_SUM128) { out->off_sum_hi = (uint16_t)off; off += block; }
     /* Per-slot row-index bounds for FIRST/LAST.  Two int64 blocks of
      * n_agg_vals slots each, allocated only when needed. */
     if (has_first_last) {
@@ -5310,6 +5343,14 @@ static inline void init_accum_from_entry(char* row, const char* entry,
             } else {
                 memcpy(row + ly->off_sum + s * 8, agg_data + s * 8, 8);
             }
+            /* 128-bit sum: the high word sign-extends the first integer
+             * value (the row was zeroed above, so 0 is right for F64,
+             * truthy and non-negative slots). */
+            if ((nf & GHT_NEED_SUM128) && !(af & GHT_AF_F64) &&
+                !(aflags2[a] & GHT_AF2_TRUTHY)) {
+                int64_t v; memcpy(&v, agg_data + s * 8, 8);
+                if (v < 0) { int64_t hi = -1; memcpy(row + ly->off_sum_hi + s * 8, &hi, 8); }
+            }
         }
         if (nf & GHT_NEED_MIN) memcpy(row + ly->off_min + s * 8, agg_data + s * 8, 8);
         if (nf & GHT_NEED_MAX) memcpy(row + ly->off_max + s * 8, agg_data + s * 8, 8);
@@ -5432,6 +5473,7 @@ static inline void accum_from_entry(char* row, const char* entry,
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
+                else if (nf & GHT_NEED_SUM128) { ray_i128_add(&ROW_WR_I64(row, ly->off_sum_hi, s), (uint64_t*)&ROW_WR_I64(row, ly->off_sum, s), v); }
                 else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
             }
             if (nf & GHT_NEED_MIN) {
@@ -5560,6 +5602,7 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                     }
                 } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
+                else if (nf & GHT_NEED_SUM128) { ray_i128_add(&ROW_WR_I64(row, ly->off_sum_hi, s), (uint64_t*)&ROW_WR_I64(row, ly->off_sum, s), v); }
                 else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
             }
             if (nf & GHT_NEED_MIN) {
@@ -6713,7 +6756,10 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case OP_AVG:
                             if (nn == 0) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
                             v = sf ? ROW_RD_F64(row, ly->off_sum, s) / nn
-                                   : (double)ROW_RD_I64(row, ly->off_sum, s) / nn;
+                              : (ly->need_flags & GHT_NEED_SUM128)
+                                ? ray_i128_to_f64(ROW_RD_I64(row, ly->off_sum_hi, s),
+                                                  (uint64_t)ROW_RD_I64(row, ly->off_sum, s)) / nn
+                                : (double)ROW_RD_I64(row, ly->off_sum, s) / nn;
                             if (ao->affine) v += ao->bias_f64;
                             break;
                         case OP_MIN:
@@ -6926,7 +6972,9 @@ static inline uint32_t group_merge_row(group_ht_t* ht,
     const uint8_t* const aflags = ly->agg_flags;
     const int8_t*  const vslot = ly->agg_val_slot;
     uint16_t off_sum = ly->off_sum;
+    uint16_t off_sum_hi = ly->off_sum_hi;
     bool need_sum = (ly->need_flags & GHT_NEED_SUM) != 0;
+    bool need_sum128 = (ly->need_flags & GHT_NEED_SUM128) != 0;
     for (;;) {
         uint32_t sv = ht->slots[slot];
         if (sv == HT_EMPTY) {
@@ -6965,10 +7013,16 @@ static inline uint32_t group_merge_row(group_ht_t* ht,
                             memcpy(&sv_f, src_row + off, 8);
                             // cppcheck-suppress invalidPointerCast // GHT rows are 8-byte aligned and off_sum/s*8 are multiples of 8
                             *(double*)(row + off) += sv_f;
+                        } else if (need_sum128) {
+                            int64_t sv_i, sv_hi;
+                            memcpy(&sv_i, src_row + off, 8);
+                            memcpy(&sv_hi, src_row + off_sum_hi + (size_t)s * 8, 8);
+                            ray_i128_add128((int64_t*)(row + off_sum_hi + (size_t)s * 8),
+                                            (uint64_t*)(row + off), sv_hi, (uint64_t)sv_i);
                         } else {
                             int64_t sv_i;
                             memcpy(&sv_i, src_row + off, 8);
-                            *(int64_t*)(row + off) += sv_i;
+                            *(int64_t*)(row + off) = wrap_add_i64(*(int64_t*)(row + off), sv_i);
                         }
                     }
                 }
@@ -7107,7 +7161,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
      * NOTE: "hashing is identical" is load-bearing and is enforced by the
      * v2_packed branch in the staging loop — see the comment there. */
     if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
-        (ly->need_flags & ~(uint32_t)GHT_NEED_SUM) == 0 &&
+        (ly->need_flags & ~(uint32_t)(GHT_NEED_SUM | GHT_NEED_SUM128)) == 0 &&
         !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
                                GHT_AF_HOLISTIC)) &&
         nk >= 1 && nk <= 2 && ly->entry_stride <= 64) {
@@ -7515,6 +7569,11 @@ typedef union { double f; int64_t i; } da_val_t;
 
 typedef struct {
     da_val_t* sum;       /* SUM/AVG/FIRST/LAST [n_slots * n_aggs] */
+    int64_t*  sum_hi;    /* high words of the exact 128-bit integer sums
+                          * [n_slots * n_aggs]; allocated only when an
+                          * integer AVG is present (sum[].i is then the low
+                          * word — still the wrapped int64 SUM), NULL
+                          * otherwise so SUM-only queries pay nothing. */
     da_val_t* min_val;   /* MIN [n_slots * n_aggs] */
     da_val_t* max_val;   /* MAX [n_slots * n_aggs] */
     double*   sumsq_f64; /* sum-of-squares for STDDEV/VAR */
@@ -7535,6 +7594,7 @@ typedef struct {
     double*   sumxy;     /* Σxy  */
     /* Arena headers */
     ray_t* _h_sum;
+    ray_t* _h_sum_hi;
     ray_t* _h_min;
     ray_t* _h_max;
     ray_t* _h_sumsq;
@@ -7549,6 +7609,7 @@ typedef struct {
 
 static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_sum);
+    scratch_free(a->_h_sum_hi);
     scratch_free(a->_h_min);
     scratch_free(a->_h_max);
     scratch_free(a->_h_sumsq);
@@ -7566,11 +7627,18 @@ static inline void da_accum_free(da_accum_t* a) {
  * non-NULL) carries the per-(group, agg) non-null row count: AVG/VAR/
  * STDDEV use it as the divisor and MIN/MAX/PROD/FIRST/LAST emit a typed
  * null when it is zero.  Pass NULL to keep the legacy count[gid]-divisor
- * behaviour (callers without HAS_NULLS aggs need not allocate it). */
+ * behaviour (callers without HAS_NULLS aggs need not allocate it).
+ * sum_hi64 (if non-NULL) carries the high words of the exact 128-bit
+ * integer sums: an integer AVG then divides ray_i128_to_f64(hi, lo), the
+ * same bits as the keyless reduction and the chunk-zone metadata.  A
+ * caller passing NULL must not emit an integer AVG.  The strlen fusion
+ * keeps the plain wrapped add (a sum of lengths never leaves int64), so a
+ * high word of 0 is exact there. */
 static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t* ext,
                               ray_t* const* agg_vecs, uint32_t grp_count,
                               uint32_t n_aggs,
                               const double*  sum_f64,  const int64_t* sum_i64,
+                              const int64_t* sum_hi64,
                               const double*  min_f64,  const double*  max_f64,
                               const int64_t* min_i64,  const int64_t* max_i64,
                               const int64_t* counts,
@@ -7657,7 +7725,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         break;
                     case OP_AVG:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
-                        v = is_f64 ? sum_f64[idx] / nn : (double)sum_i64[idx] / nn;
+                        v = is_f64 ? sum_f64[idx] / nn
+                          : sum_hi64 ? ray_i128_to_f64(sum_hi64[idx], (uint64_t)sum_i64[idx]) / nn
+                          : (double)sum_i64[idx] / nn;
                         if (affine && affine[a].enabled)
                             v += affine[a].bias_f64;
                         break;
@@ -7872,12 +7942,14 @@ typedef struct {
     int64_t*   keys;
     int64_t*   counts;
     da_val_t*  sums;
+    int64_t*   sums_hi;   /* high words of the 128-bit integer sums (integer AVG) */
     uint32_t   cap;
     uint32_t   size;
     ray_t*     _h_used;
     ray_t*     _h_keys;
     ray_t*     _h_counts;
     ray_t*     _h_sums;
+    ray_t*     _h_sums_hi;
 } sparse_i64_ht_t;
 
 static inline uint64_t sparse_i64_mix(uint64_t x) {
@@ -7906,6 +7978,7 @@ static void sparse_i64_free(sparse_i64_ht_t* ht) {
     scratch_free(ht->_h_keys);
     scratch_free(ht->_h_counts);
     scratch_free(ht->_h_sums);
+    scratch_free(ht->_h_sums_hi);
     memset(ht, 0, sizeof(*ht));
 }
 
@@ -8025,7 +8098,7 @@ static int64_t da_count_emit_keep_min_u32(const uint32_t* counts,
 }
 
 static bool sparse_i64_init(sparse_i64_ht_t* ht, uint32_t cap, uint8_t n_aggs,
-                            bool need_sum) {
+                            bool need_sum, bool need_sum128) {
     memset(ht, 0, sizeof(*ht));
     if (cap < 1024) cap = 1024;
     cap = sparse_i64_pow2(cap);
@@ -8037,7 +8110,12 @@ static bool sparse_i64_init(sparse_i64_ht_t* ht, uint32_t cap, uint8_t n_aggs,
         ht->sums = (da_val_t*)scratch_calloc(&ht->_h_sums,
             (size_t)cap * n_aggs * sizeof(da_val_t));
     }
-    if (!ht->used || !ht->keys || !ht->counts || (need_sum && !ht->sums)) {
+    if (need_sum && need_sum128) {
+        ht->sums_hi = (int64_t*)scratch_calloc(&ht->_h_sums_hi,
+            (size_t)cap * n_aggs * sizeof(int64_t));
+    }
+    if (!ht->used || !ht->keys || !ht->counts || (need_sum && !ht->sums) ||
+        (need_sum && need_sum128 && !ht->sums_hi)) {
         sparse_i64_free(ht);
         return false;
     }
@@ -8057,7 +8135,7 @@ static bool sparse_i64_rehash(sparse_i64_ht_t* ht, uint8_t n_aggs,
                               bool need_sum) {
     sparse_i64_ht_t old = *ht;
     sparse_i64_ht_t nw;
-    if (!sparse_i64_init(&nw, old.cap * 2u, n_aggs, need_sum))
+    if (!sparse_i64_init(&nw, old.cap * 2u, n_aggs, need_sum, old.sums_hi != NULL))
         return false;
     for (uint32_t i = 0; i < old.cap; i++) {
         if (!old.used[i]) continue;
@@ -8068,6 +8146,9 @@ static bool sparse_i64_rehash(sparse_i64_ht_t* ht, uint8_t n_aggs,
         if (need_sum)
             memcpy(&nw.sums[(size_t)s * n_aggs], &old.sums[(size_t)i * n_aggs],
                    (size_t)n_aggs * sizeof(da_val_t));
+        if (nw.sums_hi)
+            memcpy(&nw.sums_hi[(size_t)s * n_aggs], &old.sums_hi[(size_t)i * n_aggs],
+                   (size_t)n_aggs * sizeof(int64_t));
         nw.size++;
     }
     sparse_i64_free(&old);
@@ -8089,6 +8170,9 @@ static bool sparse_i64_touch(sparse_i64_ht_t* ht, int64_t key, uint8_t n_aggs,
         if (need_sum)
             memset(&ht->sums[(size_t)s * n_aggs], 0,
                    (size_t)n_aggs * sizeof(da_val_t));
+        if (ht->sums_hi)
+            memset(&ht->sums_hi[(size_t)s * n_aggs], 0,
+                   (size_t)n_aggs * sizeof(int64_t));
         ht->size++;
     }
     *out_slot = s;
@@ -8392,16 +8476,67 @@ static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
     return read_col_i64(ptr, r, type, 0);  /* attrs=0: agg columns are numeric, never SYM */
 }
 
+/* Exact 128-bit sum of a contiguous int64 run, kept vectorizable.
+ * Blocks of 1024 rows, three forms, escalating once for the rest of the
+ * run when a block fails a check (a column's values are alike):
+ *   0. non-negative values below 2^53 (ids, counts, timestamps): one OR of
+ *      the raw values next to the wrapped sum proves every value is in
+ *      [0, 2^53), so the block sum cannot have overflowed int64;
+ *   1. values in [-2^53, 2^53): the same with the values biased by 2^53
+ *      (one extra add);
+ *   2. anything: two plain running sums, the wrapped total and the sum of
+ *      the (arithmetically shifted) high 32-bit halves; with n < 2^32 the
+ *      low halves' sum is below 2^64, so it is recovered exactly from the
+ *      wrapped total, and the block's value is sh * 2^32 + low.
+ * A failed check re-reads only that block (8 KiB, L1-hot).  Same bits as
+ * ray_i128_add per element (idxop.h) at a fraction of its cost. */
+static inline void group_i128_sum_i64_range(const int64_t* restrict x, int64_t n,
+                                            int64_t* hi, uint64_t* lo) {
+    const int64_t blk = 1024;
+    const uint64_t bias = (uint64_t)1 << 53;
+    int mode = 0;
+    for (int64_t b = 0; b < n; b += blk) {
+        int64_t e = (n - b > blk) ? b + blk : n;
+        if (mode == 0) {
+            uint64_t s = 0, o = 0;
+            for (int64_t r = b; r < e; r++) { uint64_t u = (uint64_t)x[r]; s += u; o |= u; }
+            if ((o >> 53) == 0) { ray_i128_add(hi, lo, (int64_t)s); continue; }
+            mode = 1;
+        }
+        if (mode == 1) {
+            uint64_t s = 0, o = 0;
+            for (int64_t r = b; r < e; r++) { uint64_t u = (uint64_t)x[r]; s += u; o |= u + bias; }
+            if ((o >> 54) == 0) { ray_i128_add(hi, lo, (int64_t)s); continue; }
+            mode = 2;
+        }
+        uint64_t sl = 0; int64_t sh = 0;
+        for (int64_t r = b; r < e; r++) {
+            int64_t v = x[r];
+            sl += (uint64_t)v;
+            sh += v >> 32;
+        }
+        uint64_t low = sl - ((uint64_t)sh << 32);   /* sum of the low halves */
+        ray_i128_add128(hi, lo, sh >> 32, (uint64_t)sh << 32);
+        ray_i128_add128(hi, lo, 0, low);
+    }
+}
+
 /* Tight SIMD-friendly loop for single SUM/AVG on i64 (no mask).
- * Note: int64 sum can overflow; caller responsibility to use appropriate types. */
+ * Note: the int64 sum wraps (SUM's contract); an integer AVG also carries
+ * the high word (acc->sum_hi) so it divides the exact 128-bit total. */
 static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
     const int64_t* restrict data = (const int64_t*)c->agg_ptrs[0];
-    int64_t sum = 0;
-    for (int64_t r = start; r < end; r++)
-        sum = wrap_add_i64(sum, data[r]);
-    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
+    if (acc->sum_hi) {
+        group_i128_sum_i64_range(data + start, end - start,
+                                 &acc->sum_hi[0], (uint64_t*)&acc->sum[0].i);
+    } else {
+        int64_t sum = 0;
+        for (int64_t r = start; r < end; r++)
+            sum = wrap_add_i64(sum, data[r]);
+        acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
+    }
     acc->count[0] += end - start;
 }
 
@@ -8424,6 +8559,41 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
     const agg_linear_t* lin = &c->agg_linear[0];
     int64_t n = end - start;
 
+    if (acc->sum_hi) {
+        /* Integer AVG needs the exact 128-bit total.  A bare column (one
+         * term, coefficient 1, no bias — the common keyless avg) streams
+         * the vectorized block sum; a narrow column's block total cannot
+         * leave int64 at all.  Any other linear shape walks the rows: the
+         * per-row value wraps like the materialized expression would and
+         * the 128-bit total of those rows is exact. */
+        bool bare = lin->n_terms == 1 && lin->coeff_i64[0] == 1 &&
+                    lin->bias_i64 == 0 && lin->term_ptrs[0];
+        int8_t t0 = lin->term_types[0];
+        if (bare && (t0 == RAY_I64 || t0 == RAY_TIMESTAMP)) {
+            group_i128_sum_i64_range((const int64_t*)lin->term_ptrs[0] + start, n,
+                                     &acc->sum_hi[0], (uint64_t*)&acc->sum[0].i);
+        } else if (bare && t0 != RAY_SYM) {
+            /* <= 32-bit values: 2^30 of them stay far inside int64 */
+            const int64_t blk = (int64_t)1 << 30;
+            for (int64_t b = start; b < end; b += blk) {
+                int64_t e = (end - b > blk) ? b + blk : end;
+                int64_t sum = 0;
+                for (int64_t r = b; r < e; r++)
+                    sum += scalar_i64_at(lin->term_ptrs[0], t0, r);
+                ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, sum);
+            }
+        } else {
+            for (int64_t r = start; r < end; r++) {
+                int64_t iv = lin->bias_i64;
+                for (uint8_t t = 0; t < lin->n_terms; t++)
+                    iv = wrap_add_i64(iv, wrap_mul_i64(lin->coeff_i64[t],
+                            scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r)));
+                ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, iv);
+            }
+        }
+        acc->count[0] += n;
+        return;
+    }
     int64_t sum = wrap_mul_i64(lin->bias_i64, n);
     /* n_terms is bounded by AGG_LINEAR_MAX_TERMS (8, internal.h) — an
      * unrelated fixed cap on linear-expression arity, not a GROUP n_keys/
@@ -8500,7 +8670,8 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
                     if (nn) nn[a]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
-                acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
+                if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, iv);
+                else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
                 if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
                 if (nn) nn[a]++;
             }
@@ -8654,7 +8825,8 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                 uint8_t v_attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
                 int64_t v = read_col_i64(c->agg_ptrs[a], r, c->agg_types[a], v_attrs);
                 if (RAY_LIKELY(!((inm >> a) & 1) || v != c->agg_int_null_sentinel[a])) {
-                    acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, v);
+                    if (acc->sum_hi) ray_i128_add(&acc->sum_hi[idx], (uint64_t*)&acc->sum[idx].i, v);
+                    else acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, v);
                     if (nn) nn[idx]++;
                 }
             }
@@ -8718,7 +8890,8 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                     if (nn) nn[idx]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
-                acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
+                if (acc->sum_hi) ray_i128_add(&acc->sum_hi[idx], (uint64_t*)&acc->sum[idx].i, iv);
+                else acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
                 if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
                 if (nn) nn[idx]++;
             }
@@ -9109,6 +9282,9 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                         }
                     } else if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop))
                         merged->sum[idx].f += wa->sum[idx].f;
+                    else if (merged->sum_hi)
+                        ray_i128_add128(&merged->sum_hi[idx], (uint64_t*)&merged->sum[idx].i,
+                                        wa->sum_hi[idx], (uint64_t)wa->sum[idx].i);
                     else
                         merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                 }
@@ -10252,6 +10428,8 @@ typedef struct {
     const uint16_t*   agg_ops;
     uint8_t           n_aggs;
     da_val_t*         partials; /* [n_tasks * n_aggs], zeroed */
+    int64_t*          partials_hi; /* high words of the integer partials
+                                    * (NULL unless an integer AVG) */
     double*           partial_sumsq;
     double*           partial_sum_y;
     double*           partial_sumsq_y;
@@ -10458,16 +10636,24 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                 int8_t t = av->type;
                 uint8_t at = av->attrs;
                 uint64_t acc = 0;
+                int64_t hi = 0;     /* 128-bit high word (integer AVG) */
                 double ssq = 0.0;
                 bool need_sq = c->partial_sumsq &&
                     (op == OP_STDDEV || op == OP_STDDEV_POP ||
                      op == OP_VAR || op == OP_VAR_POP);
                 if (contig && (t == RAY_I64 || t == RAY_TIME)) {
                     const int64_t* restrict x = (const int64_t*)p + r0;
-                    for (int64_t j = 0; j < n; j++) {
-                        int64_t v = x[j];
-                        acc += (uint64_t)v;
-                        if (need_sq) { double d = (double)v; ssq += d * d; }
+                    if (c->partials_hi) {
+                        /* exact 128-bit total, still a vectorized stream */
+                        group_i128_sum_i64_range(x, n, &hi, &acc);
+                        if (need_sq)
+                            for (int64_t j = 0; j < n; j++) { double d = (double)x[j]; ssq += d * d; }
+                    } else {
+                        for (int64_t j = 0; j < n; j++) {
+                            int64_t v = x[j];
+                            acc += (uint64_t)v;
+                            if (need_sq) { double d = (double)v; ssq += d * d; }
+                        }
                     }
                 } else if (contig && t == RAY_I32) {
                     const int32_t* restrict x = (const int32_t*)p + r0;
@@ -10476,14 +10662,18 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                         acc += (uint64_t)v;
                         if (need_sq) { double d = (double)v; ssq += d * d; }
                     }
+                    /* n <= SG_CHUNK_ROWS 32-bit values: the int64 sum is
+                     * exact, its high word is the sign. */
+                    hi = (int64_t)acc < 0 ? -1 : 0;
                 } else {
                     for (int64_t j = 0; j < n; j++) {
                         int64_t v = read_col_i64(p, rows[j], t, at);
-                        acc += (uint64_t)v;
+                        ray_i128_add(&hi, &acc, v);
                         if (need_sq) { double d = (double)v; ssq += d * d; }
                     }
                 }
                 c->partials[idx].i = (int64_t)acc;
+                if (c->partials_hi) c->partials_hi[idx] = hi;
                 if (need_sq) c->partial_sumsq[idx] = ssq;
             }
         }
@@ -10652,7 +10842,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     const ray_idx_slice_t* slices = (K > 0)
         ? (const ray_idx_slice_t*)ray_data(g->sg_slices_hdr) : NULL;
 
-    bool need_sumsq = false, need_pair = false;
+    bool need_sumsq = false, need_pair = false, need_sum128 = false;
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
         if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
@@ -10661,12 +10851,19 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             need_sumsq = true;
         if (agg_is_binary_agg(aop))
             need_pair = true;
+        /* Integer AVG divides the exact 128-bit sum: carry high words. */
+        if (aop == OP_AVG && !prod[a].enabled && agg_vecs[a] &&
+            !group_fp_type(agg_vecs[a]->type) &&
+            group_avg_needs_hi(agg_vecs[a]->type, ray_table_nrows(tbl)))
+            need_sum128 = true;
     }
 
     ray_t *sum_hdr = NULL, *cnt_hdr = NULL, *task_hdr = NULL, *part_hdr = NULL;
     ray_t *sumsq_hdr = NULL, *sum_y_hdr = NULL, *sumsq_y_hdr = NULL, *sumxy_hdr = NULL;
     ray_t *part_sumsq_hdr = NULL, *part_sum_y_hdr = NULL, *part_sumsq_y_hdr = NULL, *part_sumxy_hdr = NULL;
+    ray_t *sum_hi_hdr = NULL, *part_hi_hdr = NULL;
     da_val_t* sums = NULL;
+    int64_t* sums_hi = NULL;
     double *sumsq = NULL, *sum_y = NULL, *sumsq_y = NULL, *sumxy = NULL;
     int64_t* counts = NULL;
     if (K > 0) {
@@ -10674,6 +10871,9 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                    (size_t)K * n_aggs * sizeof(da_val_t));
         counts = (int64_t*)scratch_calloc(&cnt_hdr,
                    (size_t)K * sizeof(int64_t));
+        if (need_sum128)
+            sums_hi = (int64_t*)scratch_calloc(&sum_hi_hdr,
+                       (size_t)K * n_aggs * sizeof(int64_t));
         if (need_sumsq)
             sumsq = (double*)scratch_calloc(&sumsq_hdr,
                        (size_t)K * n_aggs * sizeof(double));
@@ -10692,12 +10892,16 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             n_tasks += (slices[i].n + SG_CHUNK_ROWS - 1) / SG_CHUNK_ROWS;
         sg_task_t* tasks = NULL;
         da_val_t* partials = NULL;
+        int64_t* part_hi = NULL;
         double *part_sumsq = NULL, *part_sum_y = NULL, *part_sumsq_y = NULL, *part_sumxy = NULL;
         if (sums && counts) {
             task_hdr = ray_alloc((size_t)n_tasks * (int64_t)sizeof(sg_task_t));
             tasks = task_hdr ? (sg_task_t*)ray_data(task_hdr) : NULL;
             partials = (da_val_t*)scratch_calloc(&part_hdr,
                            (size_t)n_tasks * n_aggs * sizeof(da_val_t));
+            if (need_sum128)
+                part_hi = (int64_t*)scratch_calloc(&part_hi_hdr,
+                              (size_t)n_tasks * n_aggs * sizeof(int64_t));
             if (need_sumsq)
                 part_sumsq = (double*)scratch_calloc(&part_sumsq_hdr,
                                (size_t)n_tasks * n_aggs * sizeof(double));
@@ -10711,12 +10915,14 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         if (!sums || !counts || !tasks || !partials ||
+            (need_sum128 && (!sums_hi || !part_hi)) ||
             (need_sumsq && (!sumsq || !part_sumsq)) ||
             (need_pair && (!sum_y || !sumsq_y || !sumxy ||
                            !part_sum_y || !part_sumsq_y || !part_sumxy))) {
             scratch_free(sum_hdr); scratch_free(cnt_hdr);
             scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
             scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+            scratch_free(sum_hi_hdr); scratch_free(part_hi_hdr);
             if (task_hdr) ray_free(task_hdr);
             scratch_free(part_hdr);
             scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
@@ -10733,7 +10939,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         sg_ctx_t ctx = { slices, tasks, agg_vecs, agg_vecs2, prod, ext->agg_ops,
-                         n_aggs, partials, part_sumsq, part_sum_y,
+                         n_aggs, partials, part_hi, part_sumsq, part_sum_y,
                          part_sumsq_y, part_sumxy, {0}, {0} };
         /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
          * a product's int side already streams rides the product loop —
@@ -10752,6 +10958,10 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             for (uint32_t b = 0; b < n_aggs; b++) {
                 if (b == a || !agg_vecs[b] || ctx.fused_by[b] >= 0) continue;
                 if (ext->agg_ops[b] != OP_SUM && ext->agg_ops[b] != OP_AVG) continue;
+                /* The product loop yields only the wrapped int64 side sum;
+                 * an integer AVG needs the 128-bit total, so it streams
+                 * its own column. */
+                if (ext->agg_ops[b] == OP_AVG && part_hi) continue;
                 if (ray_data(agg_vecs[b]) != ip || agg_vecs[b]->type != it) continue;
                 ctx.pair_sum[a] = (int8_t)b;
                 ctx.fused_by[b] = (int8_t)a;
@@ -10778,6 +10988,9 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (pair || prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
                     (agg_vecs[a] && group_fp_type(agg_vecs[a]->type)))
                     sums[di].f += partials[si].f;
+                else if (sums_hi)
+                    ray_i128_add128(&sums_hi[di], (uint64_t*)&sums[di].i,
+                                    part_hi[si], (uint64_t)partials[si].i);
                 else
                     sums[di].i = (int64_t)((uint64_t)sums[di].i +
                                            (uint64_t)partials[si].i);
@@ -10790,7 +11003,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         ray_free(task_hdr);
-        scratch_free(part_hdr);
+        scratch_free(part_hdr); scratch_free(part_hi_hdr);
         scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
         scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
     }
@@ -10803,6 +11016,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
         scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
         scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+        scratch_free(sum_hi_hdr);
         return NULL;
     }
     ray_t* kc = col_vec_new(key_col, K > 0 ? K : 1);
@@ -10812,6 +11026,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
         scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
         scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+        scratch_free(sum_hi_hdr);
         return NULL;
     }
     if (kc->type == RAY_SYM)
@@ -10826,17 +11041,19 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
         scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
         scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+        scratch_free(sum_hi_hdr);
         return result;
     }
 
     emit_agg_columns(&result, g, ext, agg_vecs, (uint32_t)K, n_aggs,
-                     (double*)sums, (int64_t*)sums,
+                     (double*)sums, (int64_t*)sums, sums_hi,
                      NULL, NULL, NULL, NULL,
                      counts, NULL, prod, sumsq, NULL, sum_y, sumsq_y, sumxy);
 
     scratch_free(sum_hdr); scratch_free(cnt_hdr);
     scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
     scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+    scratch_free(sum_hi_hdr);
     return result;
 }
 
@@ -10996,6 +11213,7 @@ typedef struct {
     int64_t        n_scan;
     uint8_t        key_esz;
     bool           sp_need_sum;
+    bool           sp_need_sum128;   /* an integer AVG: carry high words */
     const int64_t* match_idx;
     ray_t*         rowsel;
     ray_t*         match_idx_block;
@@ -11066,6 +11284,7 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
     int64_t        n_scan     = c->n_scan;
     uint8_t        key_esz    = c->key_esz;
     bool           sp_need_sum = c->sp_need_sum;
+    bool           sp_need_sum128 = c->sp_need_sum128;
     const int64_t* match_idx  = c->match_idx;
     ray_t*         rowsel     = c->rowsel;
     ray_t*         match_idx_block = c->match_idx_block;
@@ -11077,16 +11296,23 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                              : (1u << 20);
                 const uint64_t max_dense_cap = 1u << 24;
                 bool count_only_first = (key_types[0] == RAY_SYM);
-                ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL;
+                ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL, *range_hi_hdr = NULL;
                 uint32_t* range_count = (uint32_t*)scratch_calloc(
                     &cnt_hdr, (size_t)cap * sizeof(uint32_t));
                 da_val_t* range_sum = NULL;
+                int64_t* range_sum_hi = NULL;   /* high words (integer AVG) */
                 bool dyn_ok = range_count != NULL;
                 if (dyn_ok && sp_need_sum && !count_only_first) {
                     range_sum = (da_val_t*)scratch_calloc(
                         &range_sum_hdr,
                         (size_t)cap * n_aggs * sizeof(da_val_t));
                     dyn_ok = range_sum != NULL;
+                    if (dyn_ok && sp_need_sum128) {
+                        range_sum_hi = (int64_t*)scratch_calloc(
+                            &range_hi_hdr,
+                            (size_t)cap * n_aggs * sizeof(int64_t));
+                        dyn_ok = range_sum_hi != NULL;
+                    }
                 }
 
 	                uint64_t max_seen = 0;
@@ -11203,6 +11429,19 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                 memset(range_sum + (size_t)old_cap * n_aggs, 0,                 \
                        (size_t)(cap - old_cap) * n_aggs * sizeof(da_val_t));     \
             }                                                                    \
+            if (range_sum_hi) {                                                  \
+                int64_t* new_hi = (int64_t*)scratch_realloc(                     \
+                    &range_hi_hdr,                                               \
+                    (size_t)old_cap * n_aggs * sizeof(int64_t),                  \
+                    (size_t)cap * n_aggs * sizeof(int64_t));                     \
+                if (!new_hi) {                                                   \
+                    dyn_ok = false;                                              \
+                    goto dyn_dense_done;                                         \
+                }                                                                \
+                range_sum_hi = new_hi;                                           \
+                memset(range_sum_hi + (size_t)old_cap * n_aggs, 0,              \
+                       (size_t)(cap - old_cap) * n_aggs * sizeof(int64_t));      \
+            }                                                                    \
         }                                                                        \
         have_dyn_key = true;                                                     \
         if (off > max_seen) max_seen = off;                                      \
@@ -11218,6 +11457,10 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                             agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
                 else if (agg_f64_mask & ((uint64_t)1 << a))                      \
                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row); \
+                else if (range_sum_hi)                                           \
+                    ray_i128_add(&range_sum_hi[(size_t)off * n_aggs + a],         \
+                                 (uint64_t*)&sums[a].i,                          \
+                                 read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0)); \
                 else                                                             \
                     sums[a].i = wrap_add_i64(                                    \
                         sums[a].i,                                               \
@@ -11272,7 +11515,7 @@ dyn_dense_done:
 
                     ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
                     if (!result || RAY_IS_ERR(result)) {
-                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
                         for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
@@ -11287,7 +11530,7 @@ dyn_dense_done:
                         /* raw cell ids from key_vecs[0] — adopt its domain */
                         ray_sym_vec_adopt_domain(key_col, sym_domain_rep(key_vecs[0]));
                     if (!key_col || RAY_IS_ERR(key_col)) {
-                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
                         ray_release(result);
                         for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
@@ -11298,16 +11541,21 @@ dyn_dense_done:
                     }
                     key_col->len = (int64_t)grp_count;
 
-                    ray_t *_h_sum = NULL, *_h_cnt = NULL;
+                    ray_t *_h_sum = NULL, *_h_cnt = NULL, *_h_sum_hi = NULL;
                     da_val_t* dense_sum = sp_need_sum
                         ? (da_val_t*)scratch_alloc(&_h_sum,
                             (size_t)grp_count * n_aggs * sizeof(da_val_t))
                         : NULL;
+                    int64_t* dense_sum_hi = (sp_need_sum && sp_need_sum128)
+                        ? (int64_t*)scratch_alloc(&_h_sum_hi,
+                            (size_t)grp_count * n_aggs * sizeof(int64_t))
+                        : NULL;
                     int64_t* dense_count = (int64_t*)scratch_alloc(
                         &_h_cnt, (size_t)grp_count * sizeof(int64_t));
-                    if ((sp_need_sum && !dense_sum) || !dense_count) {
-                        scratch_free(_h_sum); scratch_free(_h_cnt);
-                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                    if ((sp_need_sum && !dense_sum) || !dense_count ||
+                        (sp_need_sum && sp_need_sum128 && !dense_sum_hi)) {
+                        scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
+                        scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
                         ray_release(key_col); ray_release(result);
                         for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
@@ -11316,9 +11564,13 @@ dyn_dense_done:
                         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return ray_error("oom", NULL);
                     }
-                    if (sp_need_sum && !range_sum)
+                    if (sp_need_sum && !range_sum) {
                         memset(dense_sum, 0,
                                (size_t)grp_count * n_aggs * sizeof(da_val_t));
+                        if (dense_sum_hi)
+                            memset(dense_sum_hi, 0,
+                                   (size_t)grp_count * n_aggs * sizeof(int64_t));
+                    }
 
                     uint32_t gi = 0;
                     for (uint64_t off = 0; off <= max_seen; off++) {
@@ -11334,6 +11586,10 @@ dyn_dense_done:
                             memcpy(&dense_sum[(size_t)gi * n_aggs],
                                    &range_sum[(size_t)off * n_aggs],
                                    (size_t)n_aggs * sizeof(da_val_t));
+                            if (dense_sum_hi)
+                                memcpy(&dense_sum_hi[(size_t)gi * n_aggs],
+                                       &range_sum_hi[(size_t)off * n_aggs],
+                                       (size_t)n_aggs * sizeof(int64_t));
                         }
                         if (!range_sum) range_count[off] = gi + 1u;
                         gi++;
@@ -11357,6 +11613,10 @@ dyn_dense_done:
                         agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
             else if (agg_f64_mask & ((uint64_t)1 << a))                          \
                 sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row);    \
+            else if (dense_sum_hi)                                               \
+                ray_i128_add(&dense_sum_hi[(size_t)(marker - 1u) * n_aggs + a],  \
+                             (uint64_t*)&sums[a].i,                              \
+                             read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0)); \
             else                                                                 \
                 sums[a].i = wrap_add_i64(                                        \
                     sums[a].i,                                                   \
@@ -11402,13 +11662,13 @@ dyn_dense_done:
                      * row is non-null and the legacy count-based divisor is
                      * correct. */
                     emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
-                                     (double*)dense_sum, (int64_t*)dense_sum,
+                                     (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                                      NULL, NULL, NULL, NULL,
                                      dense_count, agg_affine, agg_prod, NULL, NULL,
                                      NULL, NULL, NULL);
 
-                    scratch_free(_h_sum); scratch_free(_h_cnt);
-                    scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                    scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
+                    scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
                     for (uint32_t a = 0; a < n_aggs; a++)
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                     for (uint32_t k = 0; k < n_keys; k++)
@@ -11417,7 +11677,7 @@ dyn_dense_done:
                     return result;
                 }
 
-                scratch_free(range_sum_hdr);
+                scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
                 scratch_free(cnt_hdr);
 
     /* Dynamic-dense probe bailed (unbounded key or no surviving row): shared
@@ -11966,6 +12226,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * once n_aggs exceeded its bit width. */
         bool     *sc_int_null_has      = (bool*)(agg_types + vla_aggs);
         bool sc_any_nullable = false;
+        /* Integer AVG divides the exact 128-bit sum: carry high words. */
+        bool sc_need_sum128 = false;
         for (uint32_t a = 0; a < n_aggs; a++) {
             if (agg_prod[a].enabled) {
                 /* Fused product: F64 accumulate, no source vec. */
@@ -11996,6 +12258,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_int_null_sentinel[a] = 0;
                 sc_int_null_has[a] = false;
             }
+            if (ext->agg_ops[a] == OP_AVG && !group_fp_type(agg_types[a]) &&
+                !agg_strlen[a] && group_avg_needs_hi(agg_types[a], nrows))
+                sc_need_sum128 = true;
         }
 
         if (!match_idx && !rowsel && !sc_any_nullable && n_aggs > 1) {
@@ -12051,8 +12316,21 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 }
             }
 
+            /* An integer AVG needs the exact 128-bit total: take it from
+             * the chunk-zone metadata when the column carries it (the
+             * same (hi, lo) ray_avg_fn reads), otherwise skip the shortcut
+             * and let the parallel scan below carry the high word. */
+            int64_t zone_hi = 0, zone_nn = 0; uint64_t zone_lo = 0;
+            bool zone_128 = false;
+            if (one_base_input && base_col && sc_need_sum128 &&
+                !group_fp_type(base_type)) {
+                zone_128 = ray_zone_int_sum128(base_col, &zone_hi, &zone_lo, &zone_nn)
+                           && zone_nn == nrows;
+                if (!zone_128) one_base_input = false;
+            }
             if (one_base_input && base_col) {
-                ray_t* base_sum_obj = ray_sum_fn(base_col);
+                ray_t* base_sum_obj = zone_128 ? ray_i64((int64_t)zone_lo)
+                                               : ray_sum_fn(base_col);
                 if (!base_sum_obj || RAY_IS_ERR(base_sum_obj)) {
                     scratch_free(sc_vla_hdr);
                     for (uint32_t a = 0; a < n_aggs; a++)
@@ -12084,12 +12362,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_t *sum_hdr = NULL, *cnt_hdr = NULL;
                     double* sums_f64 = NULL;
                     int64_t* sums_i64 = NULL;
+                    int64_t* sums_hi = NULL;
                     if (base_is_f64)
                         sums_f64 = (double*)scratch_alloc(&sum_hdr,
                             (size_t)n_aggs * sizeof(double));
                     else
+                        /* [sums | high words] in one carve */
                         sums_i64 = (int64_t*)scratch_alloc(&sum_hdr,
-                            (size_t)n_aggs * sizeof(int64_t));
+                            (size_t)2 * n_aggs * sizeof(int64_t));
                     int64_t* counts = (int64_t*)scratch_alloc(&cnt_hdr,
                         sizeof(int64_t));
                     if ((base_is_f64 ? (sums_f64 != NULL) : (sums_i64 != NULL)) &&
@@ -12100,6 +12380,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         } else {
                             for (uint32_t a = 0; a < n_aggs; a++)
                                 sums_i64[a] = base_sum_i64;
+                            if (zone_128) {
+                                sums_hi = sums_i64 + n_aggs;
+                                for (uint32_t a = 0; a < n_aggs; a++)
+                                    sums_hi[a] = zone_hi;
+                            }
                         }
                         counts[0] = nrows;
 
@@ -12119,7 +12404,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         }
 
                         emit_agg_columns(&result, g, ext, agg_vecs, 1, n_aggs,
-                                         sums_f64, sums_i64,
+                                         sums_f64, sums_i64, sums_hi,
                                          NULL, NULL, NULL, NULL,
                                          counts, agg_affine, agg_prod,
                                          NULL, NULL, NULL, NULL, NULL);
@@ -12172,6 +12457,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         const size_t sc_line = 64;
         size_t sc_words = 1;                                   /* count[1] */
         if (need_flags & DA_NEED_SUM)   sc_words += n_aggs;    /* sum */
+        if (sc_need_sum128)             sc_words += n_aggs;    /* sum_hi */
         if (need_flags & DA_NEED_MIN)   sc_words += n_aggs;    /* min_val */
         if (need_flags & DA_NEED_MAX)   sc_words += n_aggs;    /* max_val */
         if (need_flags & DA_NEED_SUMSQ) sc_words += n_aggs;    /* sumsq_f64 */
@@ -12187,6 +12473,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             sc_acc[w].count = blk + off; off += 1;
             if (need_flags & DA_NEED_SUM) {
                 sc_acc[w].sum = (da_val_t*)(void*)(blk + off); off += n_aggs;
+            }
+            if (sc_need_sum128) {
+                sc_acc[w].sum_hi = blk + off; off += n_aggs;
             }
             if (need_flags & DA_NEED_MIN) {
                 sc_acc[w].min_val = (da_val_t*)(void*)(blk + off); off += n_aggs;
@@ -12298,6 +12587,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     } else {
                         if (group_fp_type(agg_types[a]))
                             m->sum[a].f += wa->sum[a].f;
+                        else if (m->sum_hi)
+                            ray_i128_add128(&m->sum_hi[a], (uint64_t*)&m->sum[a].i,
+                                            wa->sum_hi[a], (uint64_t)wa->sum[a].i);
                         else
                             m->sum[a].i = wrap_add_i64(m->sum[a].i, wa->sum[a].i);
                     }
@@ -12363,7 +12655,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
 
         emit_agg_columns(&result, g, ext, agg_vecs, 1, n_aggs,
-                         (double*)m->sum, (int64_t*)m->sum,
+                         (double*)m->sum, (int64_t*)m->sum, m->sum_hi,
                          (double*)m->min_val, (double*)m->max_val,
                          (int64_t*)m->min_val, (int64_t*)m->max_val,
                          m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count,
@@ -12727,6 +13019,8 @@ da_path:;
             int64_t da_int_null_sentinel[vla_aggs];
             uint64_t agg_f64_mask = 0;
             uint64_t da_int_null_mask = 0;
+            /* Integer AVG divides the exact 128-bit sum: carry high words. */
+            bool da_need_sum128 = false;
             /* Track whether any agg column can produce a null so we can
              * allocate per-(group, agg) non-null counts only when required.
              * F64 with HAS_NULLS uses NaN-skip; sentinel-typed integers
@@ -12778,6 +13072,9 @@ da_path:;
                     agg_types[a] = 0;
                     da_int_null_sentinel[a] = 0;
                 }
+                if (ext->agg_ops[a] == OP_AVG && !(agg_f64_mask & ((uint64_t)1 << a)) &&
+                    !agg_strlen[a] && group_avg_needs_hi(agg_types[a], nrows))
+                    da_need_sum128 = true;
             }
 
             ray_pool_t* da_pool = ray_pool_get();
@@ -12788,6 +13085,7 @@ da_path:;
              * cells must remain O(contributing rows). */
             uint32_t arrays_per_agg = 0;
             if (need_flags & DA_NEED_SUM) arrays_per_agg += 1;
+            if (da_need_sum128) arrays_per_agg += 1;             /* sum_hi */
             if (need_flags & DA_NEED_MIN) arrays_per_agg += 1;
             if (need_flags & DA_NEED_MAX) arrays_per_agg += 1;
             if (need_flags & DA_NEED_SUMSQ) arrays_per_agg += 1;
@@ -12838,6 +13136,11 @@ da_path:;
                     accums[w].sum = (da_val_t*)scratch_calloc(&accums[w]._h_sum,
                         total * sizeof(da_val_t));
                     if (!accums[w].sum) { alloc_ok = false; break; }
+                }
+                if (da_need_sum128) {
+                    accums[w].sum_hi = (int64_t*)scratch_calloc(&accums[w]._h_sum_hi,
+                        total * sizeof(int64_t));
+                    if (!accums[w].sum_hi) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_SUMSQ) {
                     accums[w].sumsq_f64 = (double*)scratch_calloc(&accums[w]._h_sumsq,
@@ -13020,6 +13323,7 @@ da_path:;
                                 uint16_t aop = ext->agg_ops[a];
                                 if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP || agg_is_binary_agg(aop)) {
                                     if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop)) merged->sum[idx].f += wa->sum[idx].f;
+                                    else if (merged->sum_hi) ray_i128_add128(&merged->sum_hi[idx], (uint64_t*)&merged->sum[idx].i, wa->sum_hi[idx], (uint64_t)wa->sum[idx].i);
                                     else merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                                 } else if (aop == OP_PROD) {
                                     /* Use per-(group, agg) non-null counts when
@@ -13146,6 +13450,9 @@ da_path:;
                                     /* binary aggs accumulate Σx as double even
                                      * for integer x-columns — merge as float. */
                                     merged->sum[idx].f += wa->sum[idx].f;
+                                else if (merged->sum_hi)
+                                    ray_i128_add128(&merged->sum_hi[idx], (uint64_t*)&merged->sum[idx].i,
+                                                    wa->sum_hi[idx], (uint64_t)wa->sum[idx].i);
                                 else
                                     merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
                             }
@@ -13206,6 +13513,7 @@ da_path:;
                 da_accum_free(&accums[w]);
 
             da_val_t* da_sum      = merged->sum;      /* may be NULL if !DA_NEED_SUM */
+            int64_t*  da_sum_hi   = merged->sum_hi;   /* NULL unless an integer AVG */
             da_val_t* da_min_val  = merged->min_val;  /* may be NULL if !DA_NEED_MIN */
             da_val_t* da_max_val  = merged->max_val;  /* may be NULL if !DA_NEED_MAX */
             double*   da_sumsq   = merged->sumsq_f64; /* may be NULL if !DA_NEED_SUMSQ */
@@ -13271,8 +13579,9 @@ da_path:;
             size_t dense_total = (size_t)grp_count * n_aggs;
             ray_t *_h_dsum = NULL, *_h_dmin = NULL, *_h_dmax = NULL;
             ray_t *_h_dsq = NULL, *_h_dcnt = NULL, *_h_dnn = NULL;
-            ray_t *_h_dsy = NULL, *_h_dsqy = NULL, *_h_dxy = NULL;
+            ray_t *_h_dsy = NULL, *_h_dsqy = NULL, *_h_dxy = NULL, *_h_dshi = NULL;
             da_val_t* dense_sum     = da_sum     ? (da_val_t*)scratch_alloc(&_h_dsum, dense_total * sizeof(da_val_t)) : NULL;
+            int64_t*  dense_sum_hi  = da_sum_hi  ? (int64_t*)scratch_alloc(&_h_dshi, dense_total * sizeof(int64_t)) : NULL;
             da_val_t* dense_min_val = da_min_val ? (da_val_t*)scratch_alloc(&_h_dmin, dense_total * sizeof(da_val_t)) : NULL;
             da_val_t* dense_max_val = da_max_val ? (da_val_t*)scratch_alloc(&_h_dmax, dense_total * sizeof(da_val_t)) : NULL;
             double*   dense_sumsq   = da_sumsq   ? (double*)scratch_alloc(&_h_dsq, dense_total * sizeof(double)) : NULL;
@@ -13294,6 +13603,7 @@ da_path:;
                     size_t si = (size_t)s * n_aggs + a;
                     size_t di = (size_t)gi * n_aggs + a;
                     if (dense_sum)     dense_sum[di]     = da_sum[si];
+                    if (dense_sum_hi)  dense_sum_hi[di]  = da_sum_hi[si];
                     if (dense_min_val) dense_min_val[di] = da_min_val[si];
                     if (dense_max_val) dense_max_val[di] = da_max_val[si];
                     if (dense_sumsq)   dense_sumsq[di]   = da_sumsq[si];
@@ -13306,7 +13616,7 @@ da_path:;
             }
 
             emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
-                             (double*)dense_sum, (int64_t*)dense_sum,
+                             (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                              (double*)dense_min_val, (double*)dense_max_val,
                              (int64_t*)dense_min_val, (int64_t*)dense_max_val,
                              dense_counts, agg_affine, agg_prod, dense_sumsq,
@@ -13317,6 +13627,7 @@ da_path:;
             scratch_free(_h_dsq); scratch_free(_h_dcnt);
             scratch_free(_h_dnn);
             scratch_free(_h_dsy); scratch_free(_h_dsqy); scratch_free(_h_dxy);
+            scratch_free(_h_dshi);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
             for (uint32_t a = 0; a < n_aggs; a++)
@@ -13346,6 +13657,9 @@ da_path:;
                 sp_eligible = false;
         }
         bool sp_need_sum = false;
+        /* An integer AVG divides the exact 128-bit sum: the scatter arrays
+         * and the sparse table then carry a high word per slot. */
+        bool sp_need_sum128 = false;
         for (uint32_t a = 0; a < n_aggs && sp_eligible; a++) {
             uint16_t op = ext->agg_ops[a];
             if (op == OP_COUNT) continue;
@@ -13360,8 +13674,13 @@ da_path:;
                  * accum_from_entry inherits the same nullable-agg gap.) */
                 if (agg_vecs[a] && ray_vec_may_have_nulls(agg_vecs[a]))
                     sp_eligible = false;
-                else
+                else {
                     sp_need_sum = true;
+                    if (op == OP_AVG && !(agg_vecs[a] && group_fp_type(agg_vecs[a]->type)) &&
+                        !agg_strlen[a] &&
+                        group_avg_needs_hi(agg_vecs[a] ? agg_vecs[a]->type : 0, nrows))
+                        sp_need_sum128 = true;
+                }
             }
         }
 
@@ -13441,7 +13760,8 @@ da_path:;
                     .strlen_sym_count = strlen_sym_count,
                     .agg_f64_mask = agg_f64_mask, .n_aggs = n_aggs,
                     .n_keys = n_keys, .n_scan = n_scan, .key_esz = key_esz,
-                    .sp_need_sum = sp_need_sum, .match_idx = match_idx,
+                    .sp_need_sum = sp_need_sum, .sp_need_sum128 = sp_need_sum128,
+                    .match_idx = match_idx,
                     .rowsel = rowsel, .match_idx_block = match_idx_block,
                     .vla_hdr = vla_hdr, .emit_filter = emit_filter,
                 };
@@ -13473,13 +13793,14 @@ da_path:;
                     ? (uint64_t)((uint64_t)max_key - (uint64_t)min_key + 1u)
                     : 0u;
                 if (have_key && key_range > 0 && key_range <= (1u << 26)) {
-                    ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL;
-                    ray_t *_h_sum = NULL, *_h_cnt = NULL;
+                    ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL, *range_hi_hdr = NULL;
+                    ray_t *_h_sum = NULL, *_h_cnt = NULL, *_h_sum_hi = NULL;
                     uint32_t* range_count = (uint32_t*)scratch_calloc(
                         &cnt_hdr, (size_t)key_range * sizeof(uint32_t));
                     if (!range_count)
                         goto ht_path;
                     da_val_t* range_sum = NULL;
+                    int64_t* range_sum_hi = NULL;   /* high words (integer AVG) */
                     if (sp_need_sum && key_range <= (1u << 24)) {
                         range_sum = (da_val_t*)scratch_calloc(
                             &range_sum_hdr,
@@ -13487,6 +13808,16 @@ da_path:;
                         if (!range_sum) {
                             scratch_free(cnt_hdr);
                             goto ht_path;
+                        }
+                        if (sp_need_sum128) {
+                            range_sum_hi = (int64_t*)scratch_calloc(
+                                &range_hi_hdr,
+                                (size_t)key_range * n_aggs * sizeof(int64_t));
+                            if (!range_sum_hi) {
+                                scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
+                                scratch_free(cnt_hdr);
+                                goto ht_path;
+                            }
                         }
                     }
 
@@ -13511,6 +13842,10 @@ da_path:;
                                                                strlen_sym_count));
                                 else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
+                                else if (range_sum_hi)
+                                    ray_i128_add(&range_sum_hi[(size_t)off * n_aggs + a],
+                                                 (uint64_t*)&sums[a].i,
+                                                 read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                                 else
                                     sums[a].i = wrap_add_i64(
                                         sums[a].i,
@@ -13534,7 +13869,7 @@ da_path:;
 
                     ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
                     if (!result || RAY_IS_ERR(result)) {
-                        scratch_free(range_sum_hdr);
+                        scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
                         scratch_free(cnt_hdr);
                         for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
@@ -13550,7 +13885,7 @@ da_path:;
                         /* raw cell ids from key_vecs[0] — adopt its domain */
                         ray_sym_vec_adopt_domain(key_col, sym_domain_rep(key_vecs[0]));
                     if (!key_col || RAY_IS_ERR(key_col)) {
-                        scratch_free(range_sum_hdr);
+                        scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
                         scratch_free(cnt_hdr);
                         ray_release(result);
                         for (uint32_t a = 0; a < n_aggs; a++)
@@ -13566,11 +13901,16 @@ da_path:;
                         ? (da_val_t*)scratch_calloc(&_h_sum,
                             (size_t)grp_count * n_aggs * sizeof(da_val_t))
                         : NULL;
+                    int64_t* dense_sum_hi = (sp_need_sum && sp_need_sum128)
+                        ? (int64_t*)scratch_calloc(&_h_sum_hi,
+                            (size_t)grp_count * n_aggs * sizeof(int64_t))
+                        : NULL;
                     int64_t* dense_count = (int64_t*)scratch_alloc(
                         &_h_cnt, (size_t)grp_count * sizeof(int64_t));
-                    if ((sp_need_sum && !dense_sum) || !dense_count) {
-                        scratch_free(_h_sum); scratch_free(_h_cnt);
-                        scratch_free(range_sum_hdr);
+                    if ((sp_need_sum && !dense_sum) || !dense_count ||
+                        (sp_need_sum && sp_need_sum128 && !dense_sum_hi)) {
+                        scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
+                        scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
                         scratch_free(cnt_hdr);
                         ray_release(key_col); ray_release(result);
                         for (uint32_t a = 0; a < n_aggs; a++)
@@ -13596,6 +13936,10 @@ da_path:;
                             memcpy(&dense_sum[(size_t)gi * n_aggs],
                                    &range_sum[(size_t)off * n_aggs],
                                    (size_t)n_aggs * sizeof(da_val_t));
+                            if (dense_sum_hi)
+                                memcpy(&dense_sum_hi[(size_t)gi * n_aggs],
+                                       &range_sum_hi[(size_t)off * n_aggs],
+                                       (size_t)n_aggs * sizeof(int64_t));
                         }
                         range_count[off] = gi + 1u;
                         gi++;
@@ -13622,6 +13966,10 @@ da_path:;
                                                                strlen_sym_count));
                                 else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
+                                else if (dense_sum_hi)
+                                    ray_i128_add(&dense_sum_hi[(size_t)(marker - 1u) * n_aggs + a],
+                                                 (uint64_t*)&sums[a].i,
+                                                 read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                                 else
                                     sums[a].i = wrap_add_i64(
                                         sums[a].i,
@@ -13630,7 +13978,7 @@ da_path:;
                         }
                     }
 
-                    scratch_free(range_sum_hdr);
+                    scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
                     scratch_free(cnt_hdr);
                     ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]);
                     int64_t name_id = key_ext ? key_ext->sym : 0;
@@ -13641,12 +13989,12 @@ da_path:;
                      * emit-filter range path only runs when sp_eligible was
                      * true. */
                     emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
-                                     (double*)dense_sum, (int64_t*)dense_sum,
+                                     (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                                      NULL, NULL, NULL, NULL,
                                      dense_count, agg_affine, agg_prod, NULL, NULL,
                                      NULL, NULL, NULL);
 
-                    scratch_free(_h_sum);
+                    scratch_free(_h_sum); scratch_free(_h_sum_hi);
                     scratch_free(_h_cnt);
                     for (uint32_t a = 0; a < n_aggs; a++)
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
@@ -13668,7 +14016,7 @@ da_path:;
                 uint64_t expected = (uint64_t)nrows / 64u;
                 if (expected < 4096) expected = 4096;
                 if (expected > (1u << 20)) expected = (1u << 20);
-                if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, false))
+                if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, false, false))
                     goto ht_path;
 
                 for (int64_t i = 0; i < n_scan; i++) {
@@ -13687,7 +14035,8 @@ da_path:;
                 uint64_t expected = (uint64_t)nrows / 64u;
                 if (expected < 4096) expected = 4096;
                 if (expected > (1u << 20)) expected = (1u << 20);
-                if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, sp_need_sum))
+                if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, sp_need_sum,
+                                     sp_need_sum128))
                     goto ht_path;
 
                 for (int64_t i = 0; i < n_scan; i++) {
@@ -13714,6 +14063,10 @@ da_path:;
                                                        strlen_sym_count));
                         else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
+                        else if (sp_ht.sums_hi)
+                            ray_i128_add(&sp_ht.sums_hi[(size_t)slot * n_aggs + a],
+                                         (uint64_t*)&sums[a].i,
+                                         read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                         else
                             sums[a].i = wrap_add_i64(
                                 sums[a].i,
@@ -13769,15 +14122,20 @@ da_path:;
             }
             key_col->len = (int64_t)grp_count;
 
-            ray_t *_h_sum = NULL, *_h_cnt = NULL;
+            ray_t *_h_sum = NULL, *_h_cnt = NULL, *_h_sum_hi = NULL;
             da_val_t* dense_sum = sp_need_sum
                 ? (da_val_t*)scratch_alloc(&_h_sum,
                     (size_t)grp_count * n_aggs * sizeof(da_val_t))
                 : NULL;
+            int64_t* dense_sum_hi = (sp_need_sum && sp_need_sum128)
+                ? (int64_t*)scratch_alloc(&_h_sum_hi,
+                    (size_t)grp_count * n_aggs * sizeof(int64_t))
+                : NULL;
             int64_t* dense_count = (int64_t*)scratch_alloc(&_h_cnt,
                 (size_t)grp_count * sizeof(int64_t));
-            if ((sp_need_sum && !dense_sum) || !dense_count) {
-                scratch_free(_h_sum); scratch_free(_h_cnt);
+            if ((sp_need_sum && !dense_sum) || !dense_count ||
+                (sp_need_sum && sp_need_sum128 && !dense_sum_hi)) {
+                scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
                 ray_release(key_col); ray_release(result);
                 sparse_i64_free(&sp_ht);
                 for (uint32_t a = 0; a < n_aggs; a++)
@@ -13787,14 +14145,17 @@ da_path:;
                 if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return ray_error("oom", NULL);
             }
-            if (use_emit_filter && sp_need_sum)
+            if (use_emit_filter && sp_need_sum) {
                 memset(dense_sum, 0, (size_t)grp_count * n_aggs * sizeof(da_val_t));
+                if (dense_sum_hi)
+                    memset(dense_sum_hi, 0, (size_t)grp_count * n_aggs * sizeof(int64_t));
+            }
 
             sparse_i64_ht_t heavy_ht;
             memset(&heavy_ht, 0, sizeof(heavy_ht));
             if (use_emit_filter && grp_count > 0) {
-                if (!sparse_i64_init(&heavy_ht, grp_count * 2u, n_aggs, false)) {
-                    scratch_free(_h_sum); scratch_free(_h_cnt);
+                if (!sparse_i64_init(&heavy_ht, grp_count * 2u, n_aggs, false, false)) {
+                    scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
                     ray_release(key_col); ray_release(result);
                     sparse_i64_free(&sp_ht);
                     for (uint32_t a = 0; a < n_aggs; a++)
@@ -13816,7 +14177,7 @@ da_path:;
                 if (use_emit_filter) {
                     int32_t hslot;
                     if (!sparse_i64_touch(&heavy_ht, sp_ht.keys[s], n_aggs, false, &hslot)) {
-                        scratch_free(_h_sum); scratch_free(_h_cnt);
+                        scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
                         ray_release(key_col); ray_release(result);
                         sparse_i64_free(&heavy_ht);
                         sparse_i64_free(&sp_ht);
@@ -13832,6 +14193,10 @@ da_path:;
                     memcpy(&dense_sum[(size_t)gi * n_aggs],
                            &sp_ht.sums[(size_t)s * n_aggs],
                            (size_t)n_aggs * sizeof(da_val_t));
+                    if (dense_sum_hi)
+                        memcpy(&dense_sum_hi[(size_t)gi * n_aggs],
+                               &sp_ht.sums_hi[(size_t)s * n_aggs],
+                               (size_t)n_aggs * sizeof(int64_t));
                 }
                 gi++;
             }
@@ -13859,6 +14224,10 @@ da_path:;
                                                        strlen_sym_count));
                         else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], r);
+                        else if (dense_sum_hi)
+                            ray_i128_add(&dense_sum_hi[(size_t)out_gi * n_aggs + a],
+                                         (uint64_t*)&sums[a].i,
+                                         read_col_i64(agg_ptrs[a], r, agg_types[a], 0));
                         else
                             sums[a].i = wrap_add_i64(
                                 sums[a].i,
@@ -13876,12 +14245,12 @@ da_path:;
              * and is gated to null-free agg columns (sp_eligible guard at
              * ~line 5737), so counts[gi] is the correct divisor. */
             emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
-                             (double*)dense_sum, (int64_t*)dense_sum,
+                             (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                              NULL, NULL, NULL, NULL,
                              dense_count, agg_affine, agg_prod, NULL, NULL,
                              NULL, NULL, NULL);
 
-            scratch_free(_h_sum);
+            scratch_free(_h_sum); scratch_free(_h_sum_hi);
             scratch_free(_h_cnt);
             for (uint32_t a = 0; a < n_aggs; a++)
                 if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
@@ -13919,6 +14288,10 @@ ht_path:;
         uint16_t aop = ext->agg_ops[a];
         if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST)
             ght_need |= GHT_NEED_SUM;
+        /* Integer avg divides the exact 128-bit sum: carry its high words. */
+        if (aop == OP_AVG && agg_vecs[a] && !group_fp_type(agg_vecs[a]->type) &&
+            !agg_strlen[a] && group_avg_needs_hi(agg_vecs[a]->type, nrows))
+            ght_need |= GHT_NEED_SUM128;
         if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
             { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ; }
         if (agg_is_binary_agg(aop))
@@ -15581,7 +15954,10 @@ sequential_fallback:;
                     case OP_AVG:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? ROW_RD_F64(row, ly->off_sum, s) / nn
-                                   : (double)ROW_RD_I64(row, ly->off_sum, s) / nn;
+                          : (ly->need_flags & GHT_NEED_SUM128)
+                            ? ray_i128_to_f64(ROW_RD_I64(row, ly->off_sum_hi, s),
+                                              (uint64_t)ROW_RD_I64(row, ly->off_sum, s)) / nn
+                            : (double)ROW_RD_I64(row, ly->off_sum, s) / nn;
                         if (agg_affine[a].enabled) v += agg_affine[a].bias_f64;
                         break;
                     case OP_MIN:

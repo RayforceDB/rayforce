@@ -549,7 +549,7 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
         uint16_t op = resolve_agg_opcode(el[0]->i64);
         bool int_col = col->type == RAY_I64 || col->type == RAY_I32 ||
                        col->type == RAY_I16 || col->type == RAY_U8;
-        int64_t zs, zn; bool exact = false;
+        int64_t zs, zn, zh; uint64_t zl;
         switch (op) {
         case OP_COUNT: break;
         case OP_MIN: case OP_MAX: {
@@ -560,10 +560,10 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
             break;
         }
         case OP_SUM:
-            if (!int_col || !ray_zone_int_sum(col, &zs, &zn, NULL)) return NULL;
+            if (!int_col || !ray_zone_int_sum(col, &zs, &zn)) return NULL;
             break;
         case OP_AVG:
-            if (!int_col || !ray_zone_int_sum(col, &zs, &zn, &exact) || !exact) return NULL;
+            if (!int_col || !ray_zone_int_sum128(col, &zh, &zl, &zn)) return NULL;
             break;
         default: return NULL;
         }
