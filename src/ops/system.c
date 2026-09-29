@@ -680,6 +680,7 @@ static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) 
         OBJSIZE_PUSH(ix->u.chunk_zone.mins);
         OBJSIZE_PUSH(ix->u.chunk_zone.maxs);
         OBJSIZE_PUSH(ix->u.chunk_zone.null_bits);
+        OBJSIZE_PUSH(ix->u.chunk_zone.aggs);
         break;
     case RAY_IDX_PART:
         OBJSIZE_PUSH(ix->u.part.keys); OBJSIZE_PUSH(ix->u.part.starts);
@@ -873,7 +874,8 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
  * pages/pools.  Rayforce values are reference-counted, so this is allocator
  * GC rather than a tracing collector.  Variadic to allow `(.sys.gc)`. */
 ray_t* ray_gc_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
     ray_heap_gc();
     /* Same statement-boundary rule as the REPL: an explicit maintenance
      * call is also a chance to notice the process has gone quiet. */

@@ -26,6 +26,8 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "mem/sys.h"
+#include "core/pool.h"
 #include "mem/cow.h"
 #include "vec/vec.h"
 #include "table/sym.h"
@@ -322,6 +324,83 @@ static test_result_t test_index_hash_with_nulls_preserved(void) {
     aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
 
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Large column: the build runs partition-parallel above 64k rows and must
+ * produce the serial walk's layout — groups in first-occurrence order, rows
+ * ascending inside a group, nulls excluded — checked against a reference
+ * computed the obvious way. */
+static test_result_t test_index_hash_large_parallel(void) {
+    ray_heap_init();
+    /* The parallel build needs the pool; create it before the attach so
+     * the test does not silently take the serial fallback. */
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    const int64_t n = 300000, kmax = 5003;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* xs = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        xs[i] = (int64_t)(((uint64_t)i * 2654435761ull) % (uint64_t)kmax) - 17;
+    v->len = n;
+    /* every 977th row null */
+    for (int64_t i = 0; i < n; i += 977)
+        TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, i, true), RAY_OK);
+
+    /* reference: first-occurrence group ids and counts */
+    int64_t* gid_of_key = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
+    int64_t* ref_key    = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
+    int64_t* ref_cnt    = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(gid_of_key); TEST_ASSERT_NOT_NULL(ref_key); TEST_ASSERT_NOT_NULL(ref_cnt);
+    for (int64_t k = 0; k < kmax; k++) { gid_of_key[k] = -1; ref_cnt[k] = 0; }
+    int64_t ref_groups = 0, ref_keys = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(v, i)) continue;
+        int64_t k = xs[i] + 17;
+        if (gid_of_key[k] < 0) { gid_of_key[k] = ref_groups; ref_key[ref_groups++] = xs[i]; }
+        ref_cnt[gid_of_key[k]]++;
+        ref_keys++;
+    }
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I((int)ix->kind, RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(ix->u.hash.n_keys, ref_keys);
+    TEST_ASSERT_EQ_I(ix->u.hash.n_groups, ref_groups);
+    const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
+    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
+    TEST_ASSERT_EQ_I(of[0], 0);
+    TEST_ASSERT_EQ_I(of[ref_groups], ref_keys);
+    /* Serial layout: groups in first-occurrence order, each with its count,
+     * rows ascending and all storing the group's key. */
+    for (int64_t g = 0; g < ref_groups; g++) {
+        TEST_ASSERT_EQ_I(gk[g], ref_key[g]);
+        TEST_ASSERT_EQ_I(of[g + 1] - of[g], ref_cnt[g]);
+        for (int64_t j = of[g]; j < of[g + 1]; j++) {
+            TEST_ASSERT_EQ_I(xs[rw[j]], ref_key[g]);
+            if (j > of[g]) TEST_ASSERT_TRUE(rw[j] > rw[j - 1]);
+        }
+    }
+    /* table probes: every key resolves to its group, an absent key misses */
+    for (int64_t k = 0; k < kmax; k += 61) {
+        const int64_t* grows = NULL;
+        int64_t gn = 0;
+        TEST_ASSERT_EQ_I(ray_index_hash_group(w, k - 17, &grows, &gn), 1);
+        TEST_ASSERT_EQ_I(gn, ref_cnt[gid_of_key[k]]);
+    }
+    {
+        const int64_t* grows = NULL;
+        int64_t gn = 0;
+        TEST_ASSERT_EQ_I(ray_index_hash_group(w, kmax + 1000, &grows, &gn), 0);
+    }
+
+    ray_sys_free(gid_of_key); ray_sys_free(ref_key); ray_sys_free(ref_cnt);
     ray_release(w);
     ray_heap_destroy();
     PASS();
@@ -3697,6 +3776,7 @@ const test_entry_t index_entries[] = {
     { "index/unsupported_type",              test_index_unsupported_type,              NULL, NULL },
     { "index/hash_attach_drop",              test_index_hash_attach_drop,              NULL, NULL },
     { "index/hash_with_nulls_preserved",     test_index_hash_with_nulls_preserved,     NULL, NULL },
+    { "index/hash_large_parallel",           test_index_hash_large_parallel,           NULL, NULL },
     { "index/sort_attach_drop",              test_index_sort_attach_drop,              NULL, NULL },
     { "index/bloom_attach_drop",             test_index_bloom_attach_drop,             NULL, NULL },
     { "index/replace_cross_kind",            test_index_replace_cross_kind,            NULL, NULL },

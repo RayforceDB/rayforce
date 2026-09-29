@@ -824,6 +824,27 @@ int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
     return 0;
 }
 
+/* Intern n pre-hashed, already-deduplicated strings under one lock without
+ * caching dotted segments: for VALUES (a derived group key's strings — hosts,
+ * URLs), which are not namespace paths.  Such a symbol is not dotted until
+ * the same string is interned as a name (the probe-hit path of
+ * sym_intern_nolock caches the segments then) or ray_sym_rebuild_segments
+ * runs — the contract of ray_sym_intern_no_split.  Same ids as
+ * ray_sym_intern_batch. */
+int64_t ray_sym_intern_batch_no_split(const uint32_t* hashes, const char* const* strs,
+                                      const size_t* lens, int64_t n, int64_t* out_ids) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
+    if (n <= 0) return 0;
+    sym_lock();
+    for (int64_t i = 0; i < n; i++) {
+        int64_t id = sym_intern_nolock_noseg(hashes[i], strs[i], lens[i]);
+        if (id < 0) { sym_unlock(); return -1; }
+        out_ids[i] = id;
+    }
+    sym_unlock();
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
  * ray_sym_intern_no_split — persistence-only bulk intern
  * -------------------------------------------------------------------------- */

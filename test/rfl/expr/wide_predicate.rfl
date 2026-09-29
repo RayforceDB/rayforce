@@ -1,0 +1,33 @@
+;; Filters and computed columns wider than 16 expression registers compile
+;; to one fused expression (EXPR_MAX_REGS) instead of falling back to
+;; column-at-a-time evaluation.  Every answer is checked against the same
+;; conditions combined step by step.
+(set n 200000)
+(set i (til n))
+(set T (table [a b c d e f] (list (% i 97) (% i 13) (% (* i 7) 1000) (as 'DATE (% i 60)) (% i 2) (% i 3))))
+;; four conditions, one a `within` (the shape that used to exceed the limit)
+(set W4 (select {from: T where: (and (== a 5) (within d [2000.01.10 2000.01.20]) (== e 0) (== f 1))}))
+(set S1 (select {from: T where: (== a 5)}))
+(set S2 (select {from: S1 where: (within d [2000.01.10 2000.01.20])}))
+(set S3 (select {from: S2 where: (== e 0)}))
+(set S4 (select {from: S3 where: (== f 1)}))
+(count W4) -- (count S4)
+(at W4 'c) -- (at S4 'c)
+;; six conditions with arithmetic on both sides
+(set W6 (select {from: T where: (and (> (+ a b) 20) (< (* c 2) 1500) (within d [2000.01.05 2000.02.19]) (!= e 1) (>= (- f 1) 0) (<= (+ a (* 2 b)) 100))}))
+(set R6 (select {from: T where: (> (+ a b) 20)}))
+(set R6 (select {from: R6 where: (< (* c 2) 1500)}))
+(set R6 (select {from: R6 where: (within d [2000.01.05 2000.02.19])}))
+(set R6 (select {from: R6 where: (!= e 1)}))
+(set R6 (select {from: R6 where: (>= (- f 1) 0)}))
+(set R6 (select {from: R6 where: (<= (+ a (* 2 b)) 100)}))
+(count W6) -- (count R6)
+(sum (at W6 'c)) -- (sum (at R6 'c))
+;; a grouping under a four-condition filter (grouped by a computed key)
+(set G4 (select {from: T by: {k: (xbar c 100)} n: (count a) where: (and (== a 5) (within d [2000.01.10 2000.01.20]) (== e 0) (== f 1))}))
+(set GS (select {from: S4 by: {k: (xbar c 100)} n: (count a)}))
+(at (select {from: G4 asc: k}) 'n) -- (at (select {from: GS asc: k}) 'n)
+(at (select {from: G4 asc: k}) 'k) -- (at (select {from: GS asc: k}) 'k)
+;; a wide computed column
+(set X (select {from: T x: (+ (+ (+ (* a 3) (* b 5)) (+ (* c 7) (- a b))) (+ (+ (- c a) (+ b c)) (* (+ a 1) (+ b 2))))}))
+(at (at X 'x) 12345) -- (+ (+ (+ (* 26 3) (* 8 5)) (+ (* 415 7) (- 26 8))) (+ (+ (- 415 26) (+ 8 415)) (* (+ 26 1) (+ 8 2))))
