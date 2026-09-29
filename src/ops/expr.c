@@ -584,6 +584,7 @@ static uint8_t expr_ensure_type(ray_expr_t* out, uint8_t src, int8_t target) {
     out->regs[r].kind = REG_SCRATCH;
     out->regs[r].type = target;
     out->regs[r].nullable = out->regs[src].nullable;
+    out->regs[r].null_src = out->regs[src].null_src;
     out->n_regs++;
     out->n_scratch++;
     out->ins[out->n_ins++] = (expr_ins_t){
@@ -591,6 +592,34 @@ static uint8_t expr_ensure_type(ray_expr_t* out, uint8_t src, int8_t target) {
         .null_aware = out->regs[src].nullable ? 1 : 0,
     };
     return r;
+}
+
+/* Can this instruction write a null sentinel into its destination even
+ * when every source lane is a real value?  F64: any op that ray_f64_fin /
+ * a zero-divisor test canonicalizes to NULL_F64 (overflow, x/0, sqrt(<0),
+ * log(<=0), ...).  I64: zero-divisor IDIV/MOD and the INT64_MIN overflow of
+ * NEG/ABS.  Such a destination is nullable for every downstream instruction
+ * (so CAST F64->I64, I64 arithmetic and MIN2/MAX2 pick their null-aware
+ * kernels) and, when nothing upstream is a nullable column, the output flag
+ * comes from a precise sentinel scan rather than the conservative attr. */
+static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binary) {
+    if (ot == RAY_F64) {
+        switch (op) {
+            case OP_ADD: case OP_SUB: case OP_MUL:
+            case OP_DIV: case OP_IDIV: case OP_MOD: case OP_POW:
+            case OP_SQRT: case OP_LOG: case OP_EXP:
+            case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
+            case OP_TAN: case OP_ATAN: case OP_RECIPROCAL:
+                return true;
+            default:
+                return false; /* NEG/ABS/CEIL/FLOOR/ROUND/CAST/MIN2/MAX2: finite -> finite */
+        }
+    }
+    if (ot == RAY_I64) {
+        if (binary) return op == OP_DIV || op == OP_IDIV || op == OP_MOD;
+        return (op == OP_NEG || op == OP_ABS) && t1 == RAY_I64;
+    }
+    return false;
 }
 
 /* Which (opcode, dst-type, src1-type) shapes have null-aware kernel
@@ -804,6 +833,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     out->regs[r].type = (base == RAY_F64 || base == RAY_F32)
                                       ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
+                    out->regs[r].null_src = col_nulls;
                     out->has_parted = true;
                 } else {
                     out->regs[r].col_type = col->type;
@@ -815,6 +845,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     out->regs[r].type = (col->type == RAY_F64 || col->type == RAY_F32)
                                       ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
+                    out->regs[r].null_src = col_nulls;
                 }
             } else if (node->opcode == OP_CONST) {
                 ray_op_ext_t* ext = find_ext(g, node->id);
@@ -878,37 +909,57 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 else
                     ot = RAY_I64;
 
-                /* Type promotion: ensure both sources match for the operation.
-                 * Skip for OP_CAST — the instruction itself IS the conversion. */
+                /* Type promotion: every source of a non-CAST instruction
+                 * must sit in the lane type its kernel reads.  Scratch
+                 * registers may hold I32/I16 (narrowing CAST results) or
+                 * BOOL (comparison results): an I64 or comparison kernel
+                 * reading such a buffer as 8-byte lanes returns garbage, so
+                 * widen them here (the CAST kernels map the narrow null
+                 * sentinels).  A promotion that cannot be placed (register
+                 * or instruction budget) bails instead of running the
+                 * mismatched kernel.  Skip for OP_CAST — the instruction
+                 * itself IS the conversion. */
+#define EXPR_PROMOTE(sreg, T) do {                                   \
+                    (sreg) = expr_ensure_type(out, (sreg), (T));      \
+                    if (out->regs[(sreg)].type != (T))                \
+                        EXPR_BAIL(EXPR_BAIL_REGS);                    \
+                } while (0)
                 if (op == OP_CAST) {
                     /* No promotion needed; CAST handles the conversion */
-                    r = out->n_regs;
-                    if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
-                } else if (ot == RAY_F64 && s2 != 0xFF) {
-                    /* Arithmetic with f64 output — promote i64 inputs to f64 */
-                    s1 = expr_ensure_type(out, s1, RAY_F64);
-                    s2 = expr_ensure_type(out, s2, RAY_F64);
-                    r = out->n_regs; /* re-read after possible CAST inserts */
-                    if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
-                } else if (ot == RAY_F64 && s2 == 0xFF) {
-                    /* Unary f64 — promote input */
-                    s1 = expr_ensure_type(out, s1, RAY_F64);
-                    r = out->n_regs;
-                    if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
-                } else if (ot == RAY_BOOL && s2 != 0xFF && t1 != t2) {
-                    /* Comparison with mixed types — promote both to f64 */
-                    int8_t pt = (t1 == RAY_F64 || t2 == RAY_F64) ? RAY_F64 : RAY_I64;
-                    s1 = expr_ensure_type(out, s1, pt);
-                    s2 = expr_ensure_type(out, s2, pt);
-                    r = out->n_regs;
-                    if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
+                } else if (ot == RAY_F64) {
+                    /* f64 arithmetic / unary math — promote i64 inputs to f64 */
+                    EXPR_PROMOTE(s1, RAY_F64);
+                    if (s2 != 0xFF) EXPR_PROMOTE(s2, RAY_F64);
+                } else if (ot == RAY_I64) {
+                    /* i64 arithmetic / NEG / ABS / SIGNUM — widen narrow and
+                     * BOOL sources.  An F64 source stays F64: only SIGNUM
+                     * reaches here with one, and its kernel reads doubles. */
+                    if (out->regs[s1].type != RAY_F64) EXPR_PROMOTE(s1, RAY_I64);
+                    if (s2 != 0xFF && out->regs[s2].type != RAY_F64) EXPR_PROMOTE(s2, RAY_I64);
+                } else if (ot == RAY_BOOL && s2 != 0xFF &&
+                           ((op >= OP_EQ && op <= OP_GE) || op == OP_AND || op == OP_OR)) {
+                    /* Comparison / AND / OR — both sides in one lane type:
+                     * BOOL stays BOOL only when both sides are BOOL. */
+                    int8_t pt = (t1 == RAY_F64 || t2 == RAY_F64) ? RAY_F64
+                              : (t1 == RAY_BOOL && t2 == RAY_BOOL) ? RAY_BOOL : RAY_I64;
+                    if (pt != RAY_BOOL) {
+                        EXPR_PROMOTE(s1, pt);
+                        EXPR_PROMOTE(s2, pt);
+                    }
                 }
+#undef EXPR_PROMOTE
+                r = out->n_regs; /* re-read after possible CAST inserts */
+                if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
 
                 /* Compute nullability from the FINAL (post-promotion) s1/s2.
                  * Inserted CASTs inherit nullable from their source (Step 3),
                  * so the promoted regs already carry the right flag. */
                 bool in_null = out->regs[s1].nullable ||
                                (s2 != 0xFF && out->regs[s2].nullable);
+                bool in_src  = out->regs[s1].null_src ||
+                               (s2 != 0xFF && out->regs[s2].null_src);
+                bool gen_null = expr_op_generates_null(op, ot, out->regs[s1].type,
+                                                       s2 != 0xFF);
                 bool ins_null_aware = false;
                 bool dst_nullable   = false;
                 if (in_null) {
@@ -959,7 +1010,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
 
                 out->regs[r].kind = REG_SCRATCH;
                 out->regs[r].type = ot;
-                out->regs[r].nullable = dst_nullable;
+                /* nullable: lanes may hold a sentinel, propagated from a
+                 * source or produced by this op.  null_src: that possibility
+                 * traces to a nullable column (conservative output attr);
+                 * without it the output flag comes from a precise scan. */
+                out->regs[r].nullable = dst_nullable || gen_null;
+                out->regs[r].null_src = dst_nullable && in_src;
                 out->n_scratch++;
 
                 if (out->n_ins >= EXPR_MAX_INS) EXPR_BAIL(EXPR_BAIL_INS);
@@ -1863,8 +1919,9 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
 
     /* Per-worker scratch buffers (heap-allocated via arena, morsel-sized) */
     ray_t* scratch_hdr = NULL;
+    /* one morsel buffer per register the expression uses */
     char* scratch_mem = (char*)scratch_alloc(&scratch_hdr,
-                            (size_t)EXPR_MAX_REGS * EXPR_MORSEL * 8);
+                            (size_t)(expr->n_regs ? expr->n_regs : 1) * EXPR_MORSEL * 8);
     if (!scratch_mem) return;
     void* scratch[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++)
@@ -1941,57 +1998,27 @@ static void mark_i64_overflow_as_null(ray_t* result, int64_t off, int64_t len) {
     }
 }
 
-/* The fused unary path may produce INT64_MIN via signed-overflow only for
- * OP_NEG and OP_ABS over an i64 source (output type i64).  Detect those
- * shapes from the last instruction in the compiled expression. */
-static bool expr_last_op_overflows_i64(const ray_expr_t* expr) {
-    if (expr->out_type != RAY_I64 || expr->n_ins == 0) return false;
-    const expr_ins_t* last = &expr->ins[expr->n_ins - 1];
-    if (last->opcode != OP_NEG && last->opcode != OP_ABS) return false;
-    if (last->src2 != 0xFF) return false; /* unary only */
-    if (expr->regs[last->src1].type != RAY_I64) return false;
-    if (expr->regs[last->dst].type != RAY_I64) return false;
-    return true;
-}
-
-/* The fused binary path writes NULL_I64 for an i64 DIV/IDIV/MOD whose
- * divisor is zero (or the INT64_MIN/-1 overflow case) — null-model
- * null handling requires HAS_NULLS set when that sentinel lands.  When the
- * output register is already marked `nullable` the conservative flag below
- * covers it; this detector handles the case where it is not, reusing the
- * mark_i64_overflow_as_null scan (which flips HAS_NULLS for any NULL_I64
- * lane).  Detect the shape from the last instruction. */
-static bool expr_last_op_divmod_i64(const ray_expr_t* expr) {
-    if (expr->out_type != RAY_I64 || expr->n_ins == 0) return false;
-    const expr_ins_t* last = &expr->ins[expr->n_ins - 1];
-    if (last->opcode != OP_DIV && last->opcode != OP_IDIV &&
-        last->opcode != OP_MOD) return false;
-    if (last->src2 == 0xFF) return false; /* binary only */
-    if (expr->regs[last->dst].type != RAY_I64) return false;
-    return true;
-}
-
-/* Single-null float model: the fused F64 kernels canonicalize any non-finite
- * result (overflow → ±Inf, div/mod-by-zero, sqrt(<0), log(≤0), exp(overflow))
- * to NULL_F64 in-buffer.  Detect when the last instruction is such an F64
- * producer so the caller runs the cheap post-scan that flips HAS_NULLS for any
- * 0Nf lane.  Used to set HAS_NULLS conservatively from the op shape (no
- * per-element scan — the scan is a full extra memory pass that regressed the
- * hot float kernels ~50%); see the call site.  Matches the fallback path's
- * shape-based flagging so VM ≡ fallback. */
-static bool expr_last_op_produces_f64_null(const ray_expr_t* expr) {
-    if (expr->out_type != RAY_F64 || expr->n_ins == 0) return false;
-    const expr_ins_t* last = &expr->ins[expr->n_ins - 1];
-    switch (last->opcode) {
-        case OP_ADD: case OP_SUB: case OP_MUL:
-        case OP_DIV: case OP_IDIV: case OP_MOD: case OP_POW:
-        case OP_SQRT: case OP_LOG: case OP_EXP:
-        case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
-        case OP_TAN: case OP_ATAN: case OP_RECIPROCAL:
-            return true;
-        default:
-            return false;  /* NEG/ABS/CEIL/FLOOR/ROUND/CAST/MIN2/MAX2: finite→finite */
-    }
+/* HAS_NULLS on a fused output.  A register whose nullability traces to a
+ * nullable column gets the conservative attr — REQUIRED, not cosmetic:
+ * group.c feeds this vec to aggregates whose check-free fast path is gated
+ * on the attr; a missing attr with sentinel lanes = wrong aggregates.  A
+ * register that is nullable only because some instruction in the program
+ * can produce a sentinel (x/0, overflow -> Inf, sqrt(<0), |INT64_MIN|, ...)
+ * is scanned instead, so a pure-finite result keeps HAS_NULLS unset —
+ * critical because this output is often an input to the NEXT op /
+ * aggregate, and a spurious HAS_NULLS would force that consumer onto the
+ * slow null-aware path (measured: conservative flagging regressed chained
+ * float kernels catastrophically by poisoning inputs).  The scan looks at
+ * the whole program's generators, not just the last instruction: the
+ * sentinel survives every downstream null-aware kernel (abs, +, cast, ...).
+ * Produced once (post-join of all morsels), so the pass is not the per-op
+ * hot loop.  Mirrors the fallback's shape-based flagging (VM == fallback). */
+static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t nrows) {
+    uint8_t o = expr->out_reg;
+    if (!expr->regs[o].nullable) return;
+    if (expr->regs[o].null_src) { out->attrs |= RAY_ATTR_HAS_NULLS; return; }
+    if (expr->out_type == RAY_I64)      mark_i64_overflow_as_null(out, 0, nrows);
+    else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
 }
 
 /* Evaluate compiled expression over parted (segmented) columns.
@@ -2063,24 +2090,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
 
         global_off += seg_len;
     }
-    if (expr_last_op_overflows_i64(expr) || expr_last_op_divmod_i64(expr))
-        mark_i64_overflow_as_null(out, 0, nrows);
-    /* Single-null float model: flip HAS_NULLS PRECISELY if an F64 producer
-     * canonicalized a non-finite result to NULL_F64 in-buffer.  Scan-based (not
-     * conservative-by-shape) so a pure-finite result keeps HAS_NULLS unset —
-     * critical because this fused output is often an input to the NEXT op /
-     * aggregate, and a spurious HAS_NULLS would force that consumer onto the
-     * slow null-aware path (measured: conservative flagging regressed chained
-     * float kernels catastrophically by poisoning inputs).  This output is
-     * produced once (post-join of all morsels) so the single pass here is not
-     * the per-op hot loop; mirrors the i64-overflow mark above. */
-    if (expr_last_op_produces_f64_null(expr))
-        mark_f64_nonfinite_as_null(out, 0, nrows);
-    /* Conservative "may contain nulls" — REQUIRED, not cosmetic: group.c
-     * feeds this vec to aggregates whose check-free fast path is gated on
-     * the attr; a missing attr with sentinel lanes = wrong aggregates. */
-    if (expr->regs[expr->out_reg].nullable)
-        out->attrs |= RAY_ATTR_HAS_NULLS;
+    expr_flag_output_nulls(expr, out, nrows);
     return out;
 }
 
@@ -2104,24 +2114,7 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
     else
         expr_full_fn(&ctx, 0, 0, nrows);
 
-    if (expr_last_op_overflows_i64(expr) || expr_last_op_divmod_i64(expr))
-        mark_i64_overflow_as_null(out, 0, nrows);
-    /* Single-null float model: flip HAS_NULLS PRECISELY if an F64 producer
-     * canonicalized a non-finite result to NULL_F64 in-buffer.  Scan-based (not
-     * conservative-by-shape) so a pure-finite result keeps HAS_NULLS unset —
-     * critical because this fused output is often an input to the NEXT op /
-     * aggregate, and a spurious HAS_NULLS would force that consumer onto the
-     * slow null-aware path (measured: conservative flagging regressed chained
-     * float kernels catastrophically by poisoning inputs).  This output is
-     * produced once (post-join of all morsels) so the single pass here is not
-     * the per-op hot loop; mirrors the i64-overflow mark above. */
-    if (expr_last_op_produces_f64_null(expr))
-        mark_f64_nonfinite_as_null(out, 0, nrows);
-    /* Conservative "may contain nulls" — REQUIRED, not cosmetic: group.c
-     * feeds this vec to aggregates whose check-free fast path is gated on
-     * the attr; a missing attr with sentinel lanes = wrong aggregates. */
-    if (expr->regs[expr->out_reg].nullable)
-        out->attrs |= RAY_ATTR_HAS_NULLS;
+    expr_flag_output_nulls(expr, out, nrows);
     return out;
 }
 
