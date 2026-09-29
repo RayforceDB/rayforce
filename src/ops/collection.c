@@ -65,13 +65,60 @@ typedef struct hashset_t {
     int8_t   src_type;     /* ray_t.type */
     bool     src_has_nulls;
     void*    src_data;     /* pointer to typed data (or RAY_LIST elements) */
+    /* Int-family cells hash through f64 (hs_hash_row).  Off until a probe
+     * crosses numeric classes — see hs_needs_num_f64. */
+    bool     num_f64;
+    int8_t   probe_type;   /* last probe type vetted by hashset_adopt_probe */
 } hashset_t;
+
+/* Numeric class of a typed-vec type, matching is_numeric/atom_eq: every
+ * int width compares to every float width through f64.  Temporal types are
+ * not numeric there (a DATE never equals an I32), so they stay class 0. */
+enum { HS_NUM_NONE = 0, HS_NUM_INT = 1, HS_NUM_FLT = 2 };
+static inline int hs_num_class(int8_t t) {
+    switch (t) {
+        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+            return HS_NUM_INT;
+        case RAY_F32: case RAY_F64:
+            return HS_NUM_FLT;
+        default:
+            return HS_NUM_NONE;
+    }
+}
+
+/* Cell i of a numeric typed vec as f64 — as_f64 on the boxed atom. */
+static inline double hs_cell_f64(int8_t t, const void* data, int64_t i) {
+    switch (t) {
+        case RAY_BOOL: return (double)((const bool*)data)[i];
+        case RAY_U8:   return (double)((const uint8_t*)data)[i];
+        case RAY_I16:  return (double)((const int16_t*)data)[i];
+        case RAY_I32:  return (double)((const int32_t*)data)[i];
+        case RAY_I64:  return (double)((const int64_t*)data)[i];
+        case RAY_F32:  return (double)((const float*)data)[i];
+        default:       return ((const double*)data)[i];
+    }
+}
+
+/* Int cells hash with ray_hash_i64 and float cells (typed, or numeric atoms
+ * in a RAY_LIST) with ray_hash_f64, so 3 and 3.0 land in different buckets
+ * and hs_eq_rows never sees them (#645).  An int side meeting a float or
+ * list side must hash its ints through f64 as well. */
+static inline bool hs_needs_num_f64(int8_t a, int8_t b) {
+    int ca = hs_num_class(a), cb = hs_num_class(b);
+    if (ca == HS_NUM_INT) return cb == HS_NUM_FLT || b == RAY_LIST;
+    if (cb == HS_NUM_INT) return ca == HS_NUM_FLT || a == RAY_LIST;
+    return false;
+}
 
 /* Hash a single row at index i in src.  Mirrors atom_eq's coercion
  * rules: numeric types normalize through f64 so an I64 atom and an
- * F64 atom holding the same value collide (boxed-list path only — a
- * typed vec is homogeneous, so the dispatch picks one branch). */
-static uint64_t hs_hash_row(ray_t* src, int64_t i, int8_t t, void* data) {
+ * F64 atom holding the same value collide.  A typed int vec hashes
+ * through i64 unless num_f64 is set — the set is being probed from the
+ * other numeric class (hs_needs_num_f64). */
+static uint64_t hs_hash_row(ray_t* src, int64_t i, int8_t t, void* data,
+                            bool num_f64) {
+    if (num_f64 && hs_num_class(t) == HS_NUM_INT)
+        return ray_hash_f64(hs_cell_f64(t, data, i));
     switch (t) {
         case RAY_I64:       return ray_hash_i64(((const int64_t*)data)[i]);
         case RAY_I32:       return ray_hash_i64((int64_t)((const int32_t*)data)[i]);
@@ -169,6 +216,10 @@ static int hs_eq_rows(ray_t* a_src, int64_t ai, int8_t at, void* a_data,
             }
         }
     }
+    /* Mixed numeric typed vecs: atom_eq compares any two numerics
+     * through f64 — do the same without boxing a pair per probe. */
+    if (hs_num_class(at) != HS_NUM_NONE && hs_num_class(bt) != HS_NUM_NONE)
+        return hs_cell_f64(at, a_data, ai) == hs_cell_f64(bt, b_data, bi);
     /* Fall back to atom_eq via boxed values.  Used for cross-type
      * comparisons (e.g. except over typed I64 vs F64 vec) and the
      * RAY_LIST path.  collection_elem allocates a temporary atom for
@@ -208,6 +259,8 @@ static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     hs->src_type = src ? src->type : 0;
     hs->src_has_nulls = src ? ray_vec_may_have_nulls(src) : false;
     hs->src_data = src ? ray_data(src) : NULL;
+    hs->num_f64 = false;
+    hs->probe_type = hs->src_type;
     return true;
 }
 
@@ -216,11 +269,11 @@ static void hashset_destroy(hashset_t* hs) {
     hs->slots = NULL;
 }
 
-static bool hashset_grow(hashset_t* hs) {
+/* Re-slot every stored row into a fresh table of new_cap, hashing with
+ * the set's current num_f64 mode. */
+static bool hashset_rehash(hashset_t* hs, int64_t new_cap) {
     int64_t old_cap = hs->cap;
     int64_t* old_slots = hs->slots;
-    int64_t new_cap = old_cap * 2;
-    if (new_cap < old_cap) return false;
     ray_t* nb = ray_alloc((size_t)new_cap * sizeof(int64_t));
     if (!nb || RAY_IS_ERR(nb)) return false;
     int64_t* ns = (int64_t*)ray_data(nb);
@@ -229,7 +282,8 @@ static bool hashset_grow(hashset_t* hs) {
     for (int64_t i = 0; i < old_cap; i++) {
         int64_t ridx = old_slots[i];
         if (ridx == HS_EMPTY) continue;
-        uint64_t h = hs_hash_row(hs->src, ridx, hs->src_type, hs->src_data);
+        uint64_t h = hs_hash_row(hs->src, ridx, hs->src_type, hs->src_data,
+                                 hs->num_f64);
         int64_t s = (int64_t)(h & (uint64_t)mask);
         while (ns[s] != HS_EMPTY) s = (s + 1) & mask;
         ns[s] = ridx;
@@ -242,8 +296,47 @@ static bool hashset_grow(hashset_t* hs) {
     return true;
 }
 
+static bool hashset_grow(hashset_t* hs) {
+    int64_t new_cap = hs->cap * 2;
+    if (new_cap < hs->cap) return false;
+    return hashset_rehash(hs, new_cap);
+}
+
 /* Probe the set for the row (probe_src, probe_i).  Returns the stored
  * row index from the build-side vec on hit, HS_EMPTY on miss. */
+/* A probe of a type the set has not seen yet.  From the other numeric
+ * class, rehash once so int cells hash through f64 — later probes and
+ * inserts keep the mode, and same-type callers never get here.  Returns
+ * false on OOM: the slots keep their old layout, the type stays unvetted
+ * so the next probe retries, and the caller answers by hashset_scan. */
+static __attribute__((noinline, cold)) bool
+hashset_adopt_probe(hashset_t* hs, int8_t probe_type) {
+    if (!hs->num_f64 && hs_needs_num_f64(hs->src_type, probe_type)) {
+        hs->num_f64 = true;
+        if (!hashset_rehash(hs, hs->cap)) {
+            hs->num_f64 = false;
+            return false;
+        }
+    }
+    hs->probe_type = probe_type;
+    return true;
+}
+
+/* Hash-free probe for when the table could not be rehashed: compare the
+ * row against every stored one. */
+static __attribute__((noinline, cold)) int64_t
+hashset_scan(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
+             int8_t probe_type, void* probe_data) {
+    for (int64_t k = 0; k < hs->cap; k++) {
+        int64_t stored = hs->slots[k];
+        if (stored != HS_EMPTY &&
+            hs_eq_rows(probe_src, probe_i, probe_type, probe_data,
+                       hs->src, stored, hs->src_type, hs->src_data))
+            return stored;
+    }
+    return HS_EMPTY;
+}
+
 static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
                                   int8_t probe_type, void* probe_data) {
     if (hs_row_is_null(probe_src, probe_i, probe_data))
@@ -277,7 +370,11 @@ static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_
             return HS_EMPTY;
         }
     }
-    uint64_t h = hs_hash_row(probe_src, probe_i, probe_type, probe_data);
+    if (probe_type != hs->probe_type &&
+        !hashset_adopt_probe(hs, probe_type))
+        return hashset_scan(hs, probe_src, probe_i, probe_type, probe_data);
+    uint64_t h = hs_hash_row(probe_src, probe_i, probe_type, probe_data,
+                             hs->num_f64);
     int64_t s = (int64_t)(h & (uint64_t)hs->mask);
     while (hs->slots[s] != HS_EMPTY) {
         int64_t stored = hs->slots[s];
@@ -366,7 +463,8 @@ static bool hashset_insert(hashset_t* hs, int64_t i) {
     if (hs->count * 2 >= hs->cap) {
         if (!hashset_grow(hs)) { /* fall through, may degrade */ }
     }
-    uint64_t h = hs_hash_row(hs->src, i, hs->src_type, hs->src_data);
+    uint64_t h = hs_hash_row(hs->src, i, hs->src_type, hs->src_data,
+                             hs->num_f64);
     int64_t s = (int64_t)(h & (uint64_t)hs->mask);
     while (hs->slots[s] != HS_EMPTY) {
         int64_t stored = hs->slots[s];
