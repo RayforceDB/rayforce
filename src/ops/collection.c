@@ -1385,10 +1385,18 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
              * on a 351k-row column (#593).  vec.h says as much where it
              * defines the two — "paths requiring null-free data use has_nulls
              * below".  The exact check costs one pass and is not on a per-row
-             * path; a null-bearing operand still falls through, because the
-             * kernel's null-matches-nothing semantics differ from this path's
-             * null-equals-null. */
-            if (!ray_vec_has_nulls(val) && !ray_vec_has_nulls(vec)) {
+             * path.
+             *
+             * Only BOTH sides null-bearing must fall through.  The kernel's
+             * null-matches-nothing and this path's null-equals-null disagree
+             * on exactly one question — does a null row match a null set
+             * element — and that needs a null on each side.  A null row
+             * against a null-free set, or a null set element against a
+             * null-free column, is false under both.  Requiring both sides
+             * null-free sent any nullable column to the hashset: one null
+             * row cost ~25x.  The set is tested first: it is usually the
+             * small side, and a null-free set skips the column scan. */
+            if (!(ray_vec_has_nulls(vec) && ray_vec_has_nulls(val))) {
                 ray_t* fast = ray_in_vec_exec(val, vec, false);
                 if (fast) return fast;
             }
