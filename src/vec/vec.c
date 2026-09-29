@@ -102,7 +102,12 @@ static inline void vec_drop_index_inplace(ray_t* v) {
     if (!(v->attrs & RAY_ATTR_HAS_INDEX)) return;
     ray_t* idx = v->index;
     ray_index_t* ix = ray_index_payload(idx);
-    bool shared = ray_atomic_load(&idx->rc) > 1;
+    /* A mapped index (mmod 1) rides the column file's mapping: copies of
+     * the column borrow it without a reference, and the mapping's owner
+     * unmaps it.  Dropping it from a vector only detaches it — the
+     * snapshot stays for the other holders and nothing is released. */
+    bool mapped = idx->mmod == 1;
+    bool shared = mapped || ray_atomic_load(&idx->rc) > 1;
 
     if (shared) {
         /* Take our own retained references to the saved-pointer slots
@@ -120,7 +125,7 @@ static inline void vec_drop_index_inplace(ray_t* v) {
         ix->saved_attrs = 0;
     }
     v->attrs &= (uint8_t)~RAY_ATTR_HAS_INDEX;
-    ray_release(idx);
+    if (!mapped) ray_release(idx);
 }
 
 /* --------------------------------------------------------------------------

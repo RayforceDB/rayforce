@@ -131,14 +131,22 @@ int64_t ray_group_perpart_runs(void) {
 typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
     int64_t sum_i, min_i, max_i, prod_i, first_i, last_i, sum_sq_i;
-    /* Parallel f64 sum of the integer stream — used by AVG so the
-     * mean of an i64 column whose sum exceeds 2^63 stays accurate
-     * instead of being whatever (uint64) wrap left in sum_i. */
+    /* f64 sum of the integer stream.  AVG keeps it beside the wrapped
+     * sum_i: while the total fits int64 the mean divides the exact integer
+     * (the same bits whatever the morsel split, and what the chunk-zone
+     * metadata computes); beyond that it divides this approximation. */
     double sum_d;
     int64_t cnt;
     int64_t zero_count;
     bool has_first;
 } reduce_acc_t;
+
+/* Mean of an integer stream: the exact wrapped integer sum while the total
+ * fits int64 (see RAY_AVG_I64_EXACT_BOUND), the double sum beyond. */
+static inline double reduce_int_mean(const reduce_acc_t* a) {
+    double s = fabs(a->sum_d) < RAY_AVG_I64_EXACT_BOUND ? (double)a->sum_i : a->sum_d;
+    return s / (double)a->cnt;
+}
 
 static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_f = 0; acc->min_f = DBL_MAX; acc->max_f = -DBL_MAX;
@@ -335,7 +343,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define RED_MASK_MAX       (RED_NEED_COUNT | RED_NEED_MAX)
 #define RED_MASK_FIRST     (RED_NEED_COUNT | RED_NEED_FIRST)
 #define RED_MASK_LAST      (RED_NEED_COUNT | RED_NEED_LAST)
-#define RED_MASK_AVG_I     (RED_NEED_SUM_D | RED_NEED_COUNT)
+#define RED_MASK_AVG_I     (RED_NEED_SUM | RED_NEED_SUM_D | RED_NEED_COUNT)
 #define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
 #define RED_MASK_STATS_I   (RED_NEED_SUM_D | RED_NEED_SUM_SQ | RED_NEED_COUNT)
 #define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
@@ -662,7 +670,10 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
         break;
     case OP_AVG:
         if (fp) dst->sum_f += src->sum_f;
-        else dst->sum_d += src->sum_d;
+        else {
+            dst->sum_d += src->sum_d;
+            dst->sum_i = (int64_t)((uint64_t)dst->sum_i + (uint64_t)src->sum_i);
+        }
         dst->cnt += src->cnt;
         break;
     case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
@@ -4268,7 +4279,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             /* COUNT returns total length including nulls — matches ray_count_fn's
              * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
             case OP_COUNT: result = ray_i64(scan_n); break;
-            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : merged.sum_d / merged.cnt)) : ray_typed_null(-RAY_F64); break;
+            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : reduce_int_mean(&merged))) : ray_typed_null(-RAY_F64); break;
             case OP_FIRST: result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.first_f) : reduction_i64_result(merged.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
             case OP_LAST:  result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.last_f) : reduction_i64_result(merged.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
             case OP_VAR: case OP_VAR_POP:
@@ -4309,7 +4320,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         /* COUNT returns total length including nulls — matches ray_count_fn's
          * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
         case OP_COUNT: return ray_i64(scan_n);
-        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : acc.sum_d / acc.cnt)) : ray_typed_null(-RAY_F64);
+        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : reduce_int_mean(&acc))) : ray_typed_null(-RAY_F64);
         case OP_FIRST: return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.first_f) : reduction_i64_result(acc.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
         case OP_LAST:  return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.last_f) : reduction_i64_result(acc.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
         case OP_VAR: case OP_VAR_POP:
