@@ -27,6 +27,7 @@
 #include "ops/rowsel.h"
 #include "ops/fused_group.h"
 #include "ops/idxop.h"
+#include "ops/hash.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/qstats.h"   /* per-worker parallelism stats for profile spans */
@@ -611,12 +612,67 @@ typedef struct {
      * per-row linear set scan into one byte load — any set size, width-
      * specialized, vectorizable.  NULL when not applicable. */
     const uint8_t* symlut;
+    /* Needle hash, built when the set outgrows the SIMD small-set path
+     * (IN_SIMD_SET): open addressing over the live probe values, so a
+     * row costs one probe instead of a scan of the whole set.  hti holds
+     * int64 values (empty = INT64_MIN; a real INT64_MIN needle sets
+     * ht_has_min), htf holds f64 bit patterns (empty = IN_HTF_EMPTY, a
+     * NaN, which is never inserted).  Both NULL = linear scan. */
+    const int64_t*  hti;
+    const uint64_t* htf;
+    int64_t        ht_mask;
+    bool           ht_has_min;
     bool           col_has_nulls;
     bool           col_atom_null;
     bool           col_is_atom;
     bool           use_double;
     bool           negate;
 } in_worker_ctx_t;
+
+/* Sets up to this many live elements take the unrolled SIMD compare in
+ * exec_in_worker; larger ones get the needle hash (in_build_worker_ctx). */
+#define IN_SIMD_SET 8
+#define IN_HTF_EMPTY UINT64_C(0x7ff8000000000000)
+
+/* -0.0 and +0.0 compare equal, so they must share a slot. */
+static inline uint64_t in_f64_key(double v) {
+    uint64_t b;
+    memcpy(&b, &v, sizeof(b));
+    return b == UINT64_C(0x8000000000000000) ? 0 : b;
+}
+
+static inline int in_set_has_i(const in_worker_ctx_t* c, int64_t v) {
+    if (c->hti) {
+        if (v == INT64_MIN) return c->ht_has_min;
+        int64_t s = (int64_t)(ray_hash_i64(v) & (uint64_t)c->ht_mask);
+        for (;;) {
+            int64_t k = c->hti[s];
+            if (k == v) return 1;
+            if (k == INT64_MIN) return 0;
+            s = (s + 1) & c->ht_mask;
+        }
+    }
+    for (int64_t j = 0; j < c->sv_len; j++)
+        if (v == c->svi[j]) return 1;
+    return 0;
+}
+
+static inline int in_set_has_f(const in_worker_ctx_t* c, double v) {
+    if (c->htf) {
+        if (v != v) return 0;  /* NaN equals nothing, as in the scan */
+        uint64_t b = in_f64_key(v);
+        int64_t s = (int64_t)(ray_hash_i64((int64_t)b) & (uint64_t)c->ht_mask);
+        for (;;) {
+            uint64_t k = c->htf[s];
+            if (k == b) return 1;
+            if (k == IN_HTF_EMPTY) return 0;
+            s = (s + 1) & c->ht_mask;
+        }
+    }
+    for (int64_t j = 0; j < c->sv_len; j++)
+        if (v == c->svf[j]) return 1;
+    return 0;
+}
 
 static void exec_in_worker(void* vctx, uint32_t worker_id,
                            int64_t start, int64_t end) {
@@ -705,7 +761,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
         return;
     }
 
-    if (!c->col_is_atom && !c->use_double && sv_len >= 1 && sv_len <= 8) {
+    if (!c->col_is_atom && !c->use_double && sv_len >= 1 && sv_len <= IN_SIMD_SET) {
         const int64_t* svi = c->svi;
         uint8_t neg = (uint8_t)negate;
         #define IN_FAST(CTYPE, FITS, SENT, HASNULL) do {                     \
@@ -765,7 +821,6 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
     }
 
     if (c->use_double) {
-        const double* svf = c->svf;
         if (c->col_atom_null) {
             /* All elements are null — fill zeros */
             for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
@@ -775,24 +830,17 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
                 double cv;
                 if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
                 else IN_READ_F64(cv, i);
-                int found = 0;
-                for (int64_t j = 0; j < sv_len; j++)
-                    if (cv == svf[j]) { found = 1; break; }
-                ob[i - ob_base] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(in_set_has_f(c, cv) ^ negate);
             }
         } else {
             for (int64_t i = start; i < end; i++) {
                 double cv;
                 if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
                 else IN_READ_F64(cv, i);
-                int found = 0;
-                for (int64_t j = 0; j < sv_len; j++)
-                    if (cv == svf[j]) { found = 1; break; }
-                ob[i - ob_base] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(in_set_has_f(c, cv) ^ negate);
             }
         }
     } else {
-        const int64_t* svi = c->svi;
         if (c->col_atom_null) {
             for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
         } else if (vec_has_nulls) {
@@ -801,20 +849,14 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
                 int64_t cv;
                 if (c->col_is_atom) cv = col->i64;
                 else IN_READ_I64(cv, i);
-                int found = 0;
-                for (int64_t j = 0; j < sv_len; j++)
-                    if (cv == svi[j]) { found = 1; break; }
-                ob[i - ob_base] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(in_set_has_i(c, cv) ^ negate);
             }
         } else {
             for (int64_t i = start; i < end; i++) {
                 int64_t cv;
                 if (c->col_is_atom) cv = col->i64;
                 else IN_READ_I64(cv, i);
-                int found = 0;
-                for (int64_t j = 0; j < sv_len; j++)
-                    if (cv == svi[j]) { found = 1; break; }
-                ob[i - ob_base] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(in_set_has_i(c, cv) ^ negate);
             }
         }
     }
@@ -884,6 +926,17 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
 
     int col_class = CLASSIFY(ct);
     int set_class = CLASSIFY(st);
+
+    /* A temporal value equals only its own type: atom_eq — and so the
+     * hashset behind find/except and the null-bearing `in` — never matches
+     * a DATE to an int or to a TIMESTAMP.  Comparing raw payloads here
+     * matched day 0 to 0i, and a DATE's day count to a TIMESTAMP's
+     * nanoseconds.  Empty probe, exactly like SYM vs non-SYM below. */
+    #define IS_TEMPORAL(t) \
+        ((t) == RAY_DATE || (t) == RAY_TIME || (t) == RAY_TIMESTAMP)
+    if ((IS_TEMPORAL(ct) || IS_TEMPORAL(st)) && ct != st)
+        set_len = 0;
+    #undef IS_TEMPORAL
 
     /* Mixed SYM vs non-SYM → treat as an empty probe.  A SYM set
      * containing resolved sym IDs has no meaning when compared to a
@@ -1043,10 +1096,52 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
         }
     }
 
+    /* Large set on a non-LUT column: hash the live needles once so each row
+     * costs one probe.  The linear scan was O(rows × needles) — a nullable
+     * I64 column against 100k needles took over a second.  An allocation
+     * failure keeps the scan: slower, same answer. */
+    const int64_t* hti = NULL;
+    const uint64_t* htf = NULL;
+    int64_t ht_mask = 0;
+    bool ht_has_min = false;
+    if (!ray_is_atom(col) && !symlut && sv_len > IN_SIMD_SET) {
+        int64_t cap = 16;
+        while (cap < sv_len * 2) cap <<= 1;
+        ray_t* hh = ray_alloc((size_t)cap * sizeof(int64_t));
+        if (hh) {
+            ht_mask = cap - 1;
+            if (use_double) {
+                uint64_t* t = (uint64_t*)ray_data(hh);
+                for (int64_t k = 0; k < cap; k++) t[k] = IN_HTF_EMPTY;
+                for (int64_t j = 0; j < sv_len; j++) {
+                    if (svf[j] != svf[j]) continue;  /* NaN matches nothing */
+                    uint64_t b = in_f64_key(svf[j]);
+                    int64_t sl = (int64_t)(ray_hash_i64((int64_t)b) & (uint64_t)ht_mask);
+                    while (t[sl] != IN_HTF_EMPTY && t[sl] != b) sl = (sl + 1) & ht_mask;
+                    t[sl] = b;
+                }
+                htf = t;
+            } else {
+                int64_t* t = (int64_t*)ray_data(hh);
+                for (int64_t k = 0; k < cap; k++) t[k] = INT64_MIN;
+                for (int64_t j = 0; j < sv_len; j++) {
+                    int64_t v = svi[j];
+                    if (v == INT64_MIN) { ht_has_min = true; continue; }
+                    int64_t sl = (int64_t)(ray_hash_i64(v) & (uint64_t)ht_mask);
+                    while (t[sl] != INT64_MIN && t[sl] != v) sl = (sl + 1) & ht_mask;
+                    t[sl] = v;
+                }
+                hti = t;
+            }
+            *lut_hdr_out = hh;  /* freed by every caller with the LUT */
+        }
+    }
+
     *out_ctx = (in_worker_ctx_t){
         .col = col,
         .svf = svf, .svi = svi, .sv_len = sv_len,
         .symlut = symlut,
+        .hti = hti, .htf = htf, .ht_mask = ht_mask, .ht_has_min = ht_has_min,
         .ob = NULL, .ob_base = 0, .ct = ct,
         .col_has_nulls = col_has_nulls,
         .col_atom_null = col_atom_null,
