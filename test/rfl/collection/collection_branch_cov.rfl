@@ -218,12 +218,11 @@
 ;; STR equality (lines 145-151)
 (count (union ["aa" "bb"] ["bb" "cc"])) -- 3
 
-;; Cross-type comparison via atom_eq fallback (lines 159-165)
-;; except where vec1 is I64 and vec2 is F64 → cross-type hs_eq_rows
-;; NOTE: hash values differ across types (I64 vs F64), so the hashset
-;; probe may miss. The typed-vec path uses type-specific hashing, so
-;; cross-type except returns all of vec1 (no matches found).
-(count (except [1 2 3 4] (as 'F64 [2 3]))) -- 4
+;; Cross-type comparison: except where vec1 is I64 and vec2 is F64 →
+;; cross-type hs_eq_rows.  The first I64 probe switches the F64-built set
+;; into num_f64 mode so 2 and 2.0 share a bucket; this used to return all
+;; of vec1 because the two sides hashed through different functions (#645).
+(count (except [1 2 3 4] (as 'F64 [2 3]))) -- 2
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; Section 10: hashset_grow — trigger by exceeding load factor (lines 202-226)
