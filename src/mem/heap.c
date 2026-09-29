@@ -2945,9 +2945,14 @@ void ray_parallel_end(void) {
  * else is the page-rounded payload plus an inline passenger index. */
 static size_t mapped_block_bytes(const ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT || v->type == RAY_LIST) return 0;
-    if (v->type == RAY_STR) {
+    {
+        /* Same route as ray_free: the pool's descriptor for a string
+         * column, else the registry — which also holds every indexed
+         * mapped column (col.c), whether or not its index is still
+         * attached. */
         ray_file_map_t* m = NULL;
-        if (v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->mmod == 3)
+        if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool) &&
+            v->str_pool->mmod == 3)
             m = v->str_pool->file_map;
         if (!m) m = ray_file_map_lookup(v);
         if (m) return m->len;

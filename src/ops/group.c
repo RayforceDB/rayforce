@@ -10469,7 +10469,7 @@ static inline double sg_prod_range(const agg_prod_t* p, int64_t r0, int64_t n,
             a2 += x[j + 2] * y[j + 2]; a3 += x[j + 3] * y[j + 3];
         }
         for (; j < n; j++) a0 += x[j] * y[j];
-    } else if (ta == RAY_F64 && (tb == RAY_I64 || tb == RAY_TIME)) {
+    } else if (ta == RAY_F64 && (tb == RAY_I64 || tb == RAY_TIMESTAMP)) {
         const double*  restrict x = (const double*)pa + r0;
         const int64_t* restrict y = (const int64_t*)pb + r0;
         uint64_t s0 = 0;
@@ -10641,7 +10641,7 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                 bool need_sq = c->partial_sumsq &&
                     (op == OP_STDDEV || op == OP_STDDEV_POP ||
                      op == OP_VAR || op == OP_VAR_POP);
-                if (contig && (t == RAY_I64 || t == RAY_TIME)) {
+                if (contig && (t == RAY_I64 || t == RAY_TIMESTAMP)) {
                     const int64_t* restrict x = (const int64_t*)p + r0;
                     if (c->partials_hi) {
                         /* exact 128-bit total, still a vectorized stream */
@@ -10655,7 +10655,8 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                             if (need_sq) { double d = (double)v; ssq += d * d; }
                         }
                     }
-                } else if (contig && t == RAY_I32) {
+                } else if (contig && (t == RAY_I32 || t == RAY_DATE || t == RAY_TIME)) {
+                    /* the 4-byte family: I32 and the day / millisecond temporals */
                     const int32_t* restrict x = (const int32_t*)p + r0;
                     for (int64_t j = 0; j < n; j++) {
                         int64_t v = (int64_t)x[j];
