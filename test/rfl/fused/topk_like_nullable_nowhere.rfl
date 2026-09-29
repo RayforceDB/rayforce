@@ -1,0 +1,37 @@
+;; The fused filter + top-k takes a `like` over a text column that holds
+;; empty strings (a null text cell is the empty string on every like path),
+;; and a sort + take with no where: at all — both used to fall back to a full
+;; filter / sort of the table.  Results are checked against the unfused
+;; spelling.
+(set N 120000)
+(set i (til N))
+(set url (as 'SYMBOL (map (fn [k] (if (== 0 (% k 97)) (format "http://google.com/q/%" k) (if (== 0 (% k 41)) "" (format "http://site%.example.com/p/%" (% k 500) k)))) i)))
+(set us (as 'STR url))
+(set ts (% (* i 7919) 100003))
+(set T (table [url us ts k] (list url us ts (% i 17))))
+(count (select {from: T where: (nil? url)})) -- 2896
+;; like on the nullable SYM column: fused select equals the direct like
+(count (select {from: T where: (like url "*google*")})) -- 1238
+(== (count (select {from: T where: (like url "*google*")})) (sum (as 'I64 (like url "*google*")))) -- true
+(== (count (select {from: T where: (like us "*google*")})) (sum (as 'I64 (like us "*google*")))) -- true
+;; top-k over the like: same rows as sorting the filtered table
+(set A (select {from: T where: (like url "*google*") asc: ts take: 10}))
+(set B (select {from: (select {from: T where: (like url "*google*")}) asc: ts take: 10}))
+(all (== (at A 'ts) (at B 'ts))) -- true
+(all (== (at A 'url) (at B 'url))) -- true
+(count (cols A)) -- 4
+;; the sort key need not be in the projection
+(all (== (at (select {from: T u: url where: (like url "*google*") asc: ts take: 10}) 'u) (at B 'url))) -- true
+(all (== (at (select {from: T u: us where: (like us "*google*") desc: ts take: 10}) 'u) (at (select {from: (select {from: T where: (like url "*google*")}) desc: ts take: 10}) 'us))) -- true
+;; a pattern the empty string matches admits the null rows on both paths
+(== (count (select {from: T where: (like url "*") asc: ts take: 200000})) (sum (as 'I64 (like url "*")))) -- true
+(== (count (select {from: T where: (like url "*") asc: ts take: 200000})) 120000) -- true
+;; and with a projection list
+(all (== (at (select {from: T u: url t: ts where: (like us "*google*") asc: ts take: 10}) 't) (at B 'ts))) -- true
+;; no where: at all — the whole table's top-k, ascending and descending
+(all (== (at (select {from: T asc: ts take: 10}) 'ts) (at (select {from: (select {from: T asc: ts}) take: 10}) 'ts))) -- true
+(all (== (at (select {from: T desc: ts take: 10}) 'ts) (at (select {from: (select {from: T desc: ts}) take: 10}) 'ts))) -- true
+(first (at (select {from: T asc: ts take: 1}) 'ts)) -- 0
+(count (select {from: T desc: ts take: 25})) -- 25
+;; empty strings sort first as null text
+(first (at (select {from: T asc: us take: 1}) 'us)) -- ""

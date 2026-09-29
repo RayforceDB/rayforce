@@ -45,6 +45,14 @@ ray_t* ray_arena_alloc(ray_arena_t* arena, size_t nbytes);
  * heap (used by the global sym table and FILE sym domains).  NULL on OOM. */
 ray_t* ray_arena_str(ray_arena_t* arena, const char* s, size_t len);
 
+/* Bulk string construction: reserve one raw region for many atoms, then
+ * build each atom in place (ray_arena_str == alloc_raw + str_at).  The
+ * region is arena memory: 32-byte aligned, released with the arena.  Lets
+ * a caller carve one region per worker and build atoms in parallel. */
+size_t ray_arena_str_bytes(size_t len);                          /* bytes one atom needs */
+void*  ray_arena_alloc_raw(ray_arena_t* arena, size_t nbytes);   /* NULL on OOM */
+ray_t* ray_arena_str_at(void* at, const char* s, size_t len);    /* at: ray_arena_str_bytes(len) */
+
 /* Ensure the arena can serve subsequent allocations totalling at least
  * `bytes` without the head chunk needing to grow.  If the head chunk has
  * enough free space already, this is a no-op; otherwise a new chunk with

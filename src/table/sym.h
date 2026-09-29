@@ -129,6 +129,9 @@ int64_t ray_sym_intern_prehashed(uint32_t hash, const char* str, size_t len);
  * any intern failed, in which case out_ids is only partially filled. */
 int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
                              const size_t* lens, int64_t n, int64_t* out_ids);
+/* The same for VALUES: no dotted-segment caching (see sym.c). */
+int64_t ray_sym_intern_batch_no_split(const uint32_t* hashes, const char* const* strs,
+                                      const size_t* lens, int64_t n, int64_t* out_ids);
 
 /* Monotonic counter bumped by ray_sym_init and ray_sym_destroy.  A cache
  * keyed on sym ids is valid only while this is unchanged: ids are stable

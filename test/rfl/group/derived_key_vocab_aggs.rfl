@@ -1,0 +1,59 @@
+;; A grouping keyed by an expression over one FILE-domain SYM column whose
+;; every aggregate reads that column — count, min, max, sum/avg of strlen —
+;; is decided over the column's distinct values: the rows are grouped by the
+;; column once (a count per value), the key runs once per value, and the
+;; aggregates are rewritten over that.  Every answer is checked against the
+;; row-wise evaluation, which one aggregate over another column forces.
+(.sys.exec "rm -rf /tmp/rfl_dkv/") -- 0
+(set N 200000)
+(set i (til N))
+(set D 3000)
+(set refs (map (fn [k] (if (== 0 (% k 11)) "" (if (== 0 (% k 3)) (format "http://www.host%.example.org/path/%/page?id=%" (% k 70) k (* k 13)) (if (== 0 (% k 7)) (format "ab%" (% k 10)) (format "https://host%.example.org/p/%" (% k 70) k))))) (til D)))
+(set ref (as 'SYMBOL (map (fn [k] (at refs (% (* k 7919) D))) i)))
+(set v (% (* i 31) 1000))
+(set T (table [ref v] (list ref v)))
+(.db.splayed.set "/tmp/rfl_dkv/" T)
+(set F (.db.splayed.get "/tmp/rfl_dkv/"))
+(set key (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) l: (avg (strlen ref)) c: (count ref) mn: (min ref) mx: (max ref) sl: (sum (strlen ref)) where: (!= ref "")})))
+(set oracle (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) l: (avg (strlen ref)) c: (count ref) mn: (min ref) mx: (max ref) sl: (sum (strlen ref)) sv: (sum v) where: (!= ref "")})))
+(set same (fn [R O col] (all (== (at (select {from: R asc: c}) col) (at (select {from: O asc: c}) col)))))
+(set R (key F))
+(set O (oracle F))
+(count R) -- 80
+(== (count R) (count O)) -- true
+(cols R) -- [p l c mn mx sl]
+(type (at R 'l)) -- 'F64
+(type (at R 'mn)) -- 'SYM
+(same R O 'c) -- true
+(same R O 'l) -- true
+(same R O 'sl) -- true
+(all (== (as 'STR (at (select {from: R asc: c}) 'mn)) (as 'STR (at (select {from: O asc: c}) 'mn)))) -- true
+(all (== (as 'STR (at (select {from: R asc: c}) 'mx)) (as 'STR (at (select {from: O asc: c}) 'mx)))) -- true
+(all (== (as 'STR (at (select {from: R asc: c}) 'p)) (as 'STR (at (select {from: O asc: c}) 'p)))) -- true
+;; the same table in memory (runtime domain) takes the row path and agrees
+(set RM (key T))
+(== (count RM) (count R)) -- true
+(same RM R 'c) -- true
+(same RM R 'l) -- true
+;; no where: the null group is there, its avg is the null float, its min the empty symbol
+(set R2 (select {from: F by: (substr ref 1 4) c: (count ref) l: (avg (strlen ref)) mn: (min ref)}))
+(set O2 (select {from: F by: (substr ref 1 4) c: (count ref) l: (avg (strlen ref)) mn: (min ref) sv: (sum v)}))
+(count R2) -- 12
+(same R2 O2 'c) -- true
+(all (== (nil? (at (select {from: R2 asc: c}) 'l)) (nil? (at (select {from: O2 asc: c}) 'l)))) -- true
+(sum (at R2 'c)) -- 200000
+;; sort and take on an output alias
+(set R3 (select {from: F by: (substr ref 1 4) c: (count ref) where: (!= ref "") desc: c take: 3}))
+(set O3 (select {from: F by: (substr ref 1 4) c: (count ref) sv: (sum v) where: (!= ref "") desc: c take: 3}))
+(all (== (at R3 'c) (at O3 'c))) -- true
+(all (== (as 'STR (at R3 'ref)) (as 'STR (at O3 'ref)))) -- true
+;; an alias that spells the source column's name renames the key to `key`
+(cols (select {from: F by: (substr ref 1 4) ref: (count ref) where: (!= ref "")})) -- [key ref]
+;; unsorted output: groups in the order their first value appears in the
+;; column's vocabulary, the same at every core count (the per-value counts
+;; come out of a grouping whose order depends on the core count, and are
+;; put back in vocabulary order first)
+(set RU (select {from: F by: (substr ref 1 4) c: (count ref)}))
+(as 'STR (at RU 'ref)) -- ["" "http" "ab5" "ab0" "ab9" "ab4" "ab3" "ab8" "ab2" "ab1" "ab6" "ab7"]
+(at RU 'c) -- [18203 164471 1733 1736 1733 1733 1734 1731 1731 1731 1732 1732]
+(.sys.exec "rm -rf /tmp/rfl_dkv/") -- 0

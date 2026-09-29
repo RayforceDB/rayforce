@@ -324,18 +324,24 @@ static test_result_t test_nullfree_promotion_invariance(void) {
     ray_expr_t ex;
     TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex),
                 "null-free promotion compiles");
-    /* No INPUT is nullable, so the compiler marks no instruction null_aware and
-     * no reg nullable.  Single-null float model: an F64 producer that may yield
-     * 0Nf from finite inputs (overflow) gets HAS_NULLS via a PRECISE post-scan
-     * in expr_eval_full (expr_last_op_produces_f64_null +
-     * mark_f64_nonfinite_as_null) — NOT the compile-time nullable flag — so
-     * this null-free-promotion compile invariant is preserved unchanged. */
+    /* No INPUT is nullable, so the compiler marks no instruction null_aware
+     * and no reg null_src (column-derived nullability).  Single-null float
+     * model: the F64 ADD may yield 0Nf from finite inputs (overflow), so its
+     * destination IS nullable — downstream kernels would have to honour the
+     * sentinel — but HAS_NULLS on the output comes from a PRECISE post-scan
+     * in expr_eval_full (expr_flag_output_nulls + mark_f64_nonfinite_as_null),
+     * NOT from a conservative flag, so a finite result stays null-free. */
     for (uint8_t i = 0; i < ex.n_ins; i++)
         TEST_ASSERT(ex.ins[i].null_aware == 0,
                     "no null_aware on null-free promotion");
     for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
-        TEST_ASSERT(!ex.regs[r2].nullable,
-                    "no nullable regs on null-free promotion");
+        TEST_ASSERT(!ex.regs[r2].null_src,
+                    "no column-derived nullable regs on null-free promotion");
+    for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
+        if (ex.regs[r2].kind != REG_SCRATCH || r2 == ex.out_reg) continue;
+        else TEST_ASSERT(!ex.regs[r2].nullable, "promotion cast is not nullable");
+    TEST_ASSERT(ex.regs[ex.out_reg].nullable,
+                "F64 ADD destination is nullable (overflow -> 0Nf generator)");
 
     ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();

@@ -1341,6 +1341,9 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
             return ray_alter_set_cow_fail(original_var, cow_result, idx, val, name_sym);
         }
         var = cow_result;
+        /* A value written in place can break the order a `sorted` marker
+         * promises (consumers trust it without re-checking). */
+        var->attrs &= (uint8_t)~RAY_ATTR_SORTED;
 
         /* Validate idx shape + (for the atom case) bounds BEFORE we
          * touch any state.  The accelerator-index drop below would

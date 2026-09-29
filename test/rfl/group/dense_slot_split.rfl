@@ -1,0 +1,54 @@
+;; The direct-array group path with more workers than its slot budget allows:
+;; the slots are split across tasks (each scans every row for its own range
+;; of groups, one accumulator set).  200k rows over ~250k key slots with a
+;; nullable min/sum/count keep cells * workers above the row count at any
+;; worker count from two up.  The oracle is the same grouping forced onto
+;; the hash path by one far-away key (the range then exceeds the slot
+;; budget); every group but that one must agree.
+(set N 200000)
+(set i (til N))
+(set k (% (* i 7919) 130003))
+(set s (as 'SYMBOL (map (fn [j] (if (== 0 (% j 13)) "" (format "host%.example.org" (% (* j 31) 9973)))) i)))
+(set v (as 'I64 (map (fn [j] (if (== 0 (% j 7)) 0N (% (* j 17) 1000))) i)))
+(set f (% (* i 3) 100))
+(set T (table [k s v f] (list k s v f)))
+(set T2 (table [k s v f] (list (concat k [1000000000]) (concat s (as 'SYMBOL ["zz"])) (concat v [5]) (concat f [7]))))
+(set R (select {from: T by: k c: (count s) m: (min s) x: (max s) sv: (sum v) av: (avg v) fi: (first f) la: (last f)}))
+(set O (select {from: T2 by: k c: (count s) m: (min s) x: (max s) sv: (sum v) av: (avg v) fi: (first f) la: (last f) where: (< k 1000000000)}))
+(count R) -- 130003
+(== (count R) (count O)) -- true
+(set RS (select {from: R asc: k}))
+(set OS (select {from: O asc: k}))
+(all (== (at RS 'k) (at OS 'k))) -- true
+(all (== (at RS 'c) (at OS 'c))) -- true
+(all (== (as 'STR (at RS 'm)) (as 'STR (at OS 'm)))) -- true
+(all (== (as 'STR (at RS 'x)) (as 'STR (at OS 'x)))) -- true
+(all (== (at RS 'sv) (at OS 'sv))) -- true
+(all (== (at RS 'av) (at OS 'av))) -- true
+(all (== (at RS 'fi) (at OS 'fi))) -- true
+(all (== (at RS 'la) (at OS 'la))) -- true
+;; strlen over the SYM column with empty cells, and a two-key composite
+(set R2 (select {from: T by: k l: (avg (strlen s)) c: (count k)}))
+(set O2 (select {from: T2 by: k l: (avg (strlen s)) c: (count k) where: (< k 1000000000)}))
+(all (== (at (select {from: R2 asc: k}) 'l) (at (select {from: O2 asc: k}) 'l))) -- true
+(set R3 (select {from: T by: [k f] c: (count s) m: (min s) sv: (sum v)}))
+(set O3 (select {from: T2 by: [k f] c: (count s) m: (min s) sv: (sum v) where: (< k 1000000000)}))
+(== (count R3) (count O3)) -- true
+(== (sum (at R3 'sv)) (sum (at O3 'sv))) -- true
+(== (sum (as 'I64 (strlen (as 'STR (at R3 'm))))) (sum (as 'I64 (strlen (as 'STR (at O3 'm)))))) -- true
+;; the same under a where: selection (the tasks walk the selection too)
+(set R4 (select {from: T by: k c: (count s) m: (min s) sv: (sum v) where: (> f 9)}))
+(set O4 (select {from: T2 by: k c: (count s) m: (min s) sv: (sum v) where: (and (> f 9) (< k 1000000000))}))
+(== (count R4) (count O4)) -- true
+(all (== (at (select {from: R4 asc: k}) 'sv) (at (select {from: O4 asc: k}) 'sv))) -- true
+(all (== (as 'STR (at (select {from: R4 asc: k}) 'm)) (as 'STR (at (select {from: O4 asc: k}) 'm)))) -- true
+;; float sums over the partitioned accumulate add each group's rows in
+;; table order: 1e16 + 1 - 1e16 + 1 rounds to 1.0 in that order, whatever
+;; the core count (a scheduler-dependent order gave 0.0 for some groups)
+(set NF 200000)
+(set iF (til NF))
+(set TF (table [k f s] (list (% iF 50000) (at [1e16 1.0 -1e16 1.0] (as 'I64 (floor (/ iF 50000)))) (as 'SYMBOL (map (fn [j] (format "h%" (% j 97))) iF)))))
+(set RF (select {from: TF by: k l: (sum (strlen s)) sf: (sum f) c: (count f)}))
+(distinct (at RF 'sf)) -- [1.0]
+(count RF) -- 50000
+

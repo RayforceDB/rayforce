@@ -26,6 +26,8 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "mem/sys.h"
+#include "core/pool.h"
 #include "mem/cow.h"
 #include "vec/vec.h"
 #include "table/sym.h"
@@ -33,6 +35,9 @@
 #include "ops/rowsel.h"
 #include "store/col.h"
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
@@ -327,6 +332,83 @@ static test_result_t test_index_hash_with_nulls_preserved(void) {
     PASS();
 }
 
+/* Large column: the build runs partition-parallel above 64k rows and must
+ * produce the serial walk's layout — groups in first-occurrence order, rows
+ * ascending inside a group, nulls excluded — checked against a reference
+ * computed the obvious way. */
+static test_result_t test_index_hash_large_parallel(void) {
+    ray_heap_init();
+    /* The parallel build needs the pool; create it before the attach so
+     * the test does not silently take the serial fallback. */
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    const int64_t n = 300000, kmax = 5003;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* xs = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        xs[i] = (int64_t)(((uint64_t)i * 2654435761ull) % (uint64_t)kmax) - 17;
+    v->len = n;
+    /* every 977th row null */
+    for (int64_t i = 0; i < n; i += 977)
+        TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, i, true), RAY_OK);
+
+    /* reference: first-occurrence group ids and counts */
+    int64_t* gid_of_key = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
+    int64_t* ref_key    = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
+    int64_t* ref_cnt    = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(gid_of_key); TEST_ASSERT_NOT_NULL(ref_key); TEST_ASSERT_NOT_NULL(ref_cnt);
+    for (int64_t k = 0; k < kmax; k++) { gid_of_key[k] = -1; ref_cnt[k] = 0; }
+    int64_t ref_groups = 0, ref_keys = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(v, i)) continue;
+        int64_t k = xs[i] + 17;
+        if (gid_of_key[k] < 0) { gid_of_key[k] = ref_groups; ref_key[ref_groups++] = xs[i]; }
+        ref_cnt[gid_of_key[k]]++;
+        ref_keys++;
+    }
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I((int)ix->kind, RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(ix->u.hash.n_keys, ref_keys);
+    TEST_ASSERT_EQ_I(ix->u.hash.n_groups, ref_groups);
+    const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
+    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
+    TEST_ASSERT_EQ_I(of[0], 0);
+    TEST_ASSERT_EQ_I(of[ref_groups], ref_keys);
+    /* Serial layout: groups in first-occurrence order, each with its count,
+     * rows ascending and all storing the group's key. */
+    for (int64_t g = 0; g < ref_groups; g++) {
+        TEST_ASSERT_EQ_I(gk[g], ref_key[g]);
+        TEST_ASSERT_EQ_I(of[g + 1] - of[g], ref_cnt[g]);
+        for (int64_t j = of[g]; j < of[g + 1]; j++) {
+            TEST_ASSERT_EQ_I(xs[rw[j]], ref_key[g]);
+            if (j > of[g]) TEST_ASSERT_TRUE(rw[j] > rw[j - 1]);
+        }
+    }
+    /* table probes: every key resolves to its group, an absent key misses */
+    for (int64_t k = 0; k < kmax; k += 61) {
+        const int64_t* grows = NULL;
+        int64_t gn = 0;
+        TEST_ASSERT_EQ_I(ray_index_hash_group(w, k - 17, &grows, &gn), 1);
+        TEST_ASSERT_EQ_I(gn, ref_cnt[gid_of_key[k]]);
+    }
+    {
+        const int64_t* grows = NULL;
+        int64_t gn = 0;
+        TEST_ASSERT_EQ_I(ray_index_hash_group(w, kmax + 1000, &grows, &gn), 0);
+    }
+
+    ray_sys_free(gid_of_key); ray_sys_free(ref_key); ray_sys_free(ref_cnt);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Sort index ──────────────────────────────────────────────────── */
 
 static test_result_t test_index_sort_attach_drop(void) {
@@ -498,6 +580,67 @@ static test_result_t test_index_persistence_roundtrip(void) {
 
     ray_release(loaded);
     ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Mapped column drops its own index: the whole mapping is unmapped ──
+ *
+ * A column loaded by mmap with an inline index region is longer than its
+ * payload.  Dropping the index from the loaded column itself (the sole
+ * reference: an in-place edit does exactly this) used to leave the index
+ * tail mapped for the life of the process, because ray_free sized the
+ * unmap from the index it no longer had.  The file is laid out so the
+ * region crosses into a page of its own; after the free that page must
+ * be gone (msync reports ENOMEM on an unmapped range). */
+static test_result_t test_index_mapped_drop_unmaps_tail(void) {
+    ray_heap_init();
+    /* Lay the file out so the inline index region crosses into a page of
+     * its own whatever the page size (4 KiB on Linux, 16 KiB on Apple
+     * silicon): the payload ends 64 bytes short of the second page. */
+    long pg = sysconf(_SC_PAGESIZE);
+    TEST_ASSERT_TRUE(pg >= 4096);
+    int64_t n = (2 * (int64_t)pg - 96) / 8;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) { int64_t x = i * 3; v = ray_vec_append(v, &x); }
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_chunk_zone(&w, 8)));
+
+    char path[] = "/tmp/idx_drop_unmap_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_TRUE(fd >= 0);
+    close(fd);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);   /* writes the inline index region too */
+    ray_release(w);
+
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_TRUE(st.st_size > 2 * pg);            /* the region reaches a further page */
+    size_t mapped = ((size_t)st.st_size + (size_t)pg - 1) & ~((size_t)pg - 1);
+
+    ray_t* m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_U(m->mmod, 1);
+    TEST_ASSERT_TRUE(m->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I((int)ray_index_payload(m->index)->kind, RAY_IDX_CHUNK_ZONE);
+    char* last_page = (char*)m + mapped - (size_t)pg;
+    TEST_ASSERT_EQ_I(msync(last_page, (size_t)pg, MS_ASYNC), 0);   /* mapped while loaded */
+
+    /* Sole reference: the drop detaches the mapped index in place. */
+    ray_t* d = m;
+    ray_t* r = ray_index_drop(&d);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(d == m);
+    TEST_ASSERT_FALSE(d->attrs & RAY_ATTR_HAS_INDEX);
+    int64_t* data = (int64_t*)ray_data(d);
+    TEST_ASSERT_EQ_I(data[n - 1], (n - 1) * 3);
+
+    ray_release(d);
+    errno = 0;
+    int rc = msync(last_page, (size_t)pg, MS_ASYNC);
+    TEST_ASSERT_TRUE(rc == -1 && errno == ENOMEM);       /* the tail page is unmapped */
+    unlink(path);
     ray_heap_destroy();
     PASS();
 }
@@ -3697,6 +3840,7 @@ const test_entry_t index_entries[] = {
     { "index/unsupported_type",              test_index_unsupported_type,              NULL, NULL },
     { "index/hash_attach_drop",              test_index_hash_attach_drop,              NULL, NULL },
     { "index/hash_with_nulls_preserved",     test_index_hash_with_nulls_preserved,     NULL, NULL },
+    { "index/hash_large_parallel",           test_index_hash_large_parallel,           NULL, NULL },
     { "index/sort_attach_drop",              test_index_sort_attach_drop,              NULL, NULL },
     { "index/bloom_attach_drop",             test_index_bloom_attach_drop,             NULL, NULL },
     { "index/replace_cross_kind",            test_index_replace_cross_kind,            NULL, NULL },
@@ -3704,6 +3848,7 @@ const test_entry_t index_entries[] = {
     { "index/null_readers_through_helper",   test_index_null_readers_through_helper,   NULL, NULL },
     { "index/aux_helper_slice",          test_index_aux_helper_slice,          NULL, NULL },
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
+    { "index/mapped_drop_unmaps_tail", test_index_mapped_drop_unmaps_tail, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },
     { "index/i16_zone_and_hash",             test_index_i16_zone_and_hash,             NULL, NULL },

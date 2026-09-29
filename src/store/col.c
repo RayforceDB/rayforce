@@ -1748,14 +1748,35 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
      * column's single mapping.  ray_free reads the full mapping size from the
      * reserved _idx_pad slot to munmap the whole region (payload + index). */
     if (cm.has_index) {
-        ray_t* idx = ray_index_inline_map((uint8_t*)cm.mapped + cm.index_offset);
+        ray_t* idx = ray_index_inline_map((uint8_t*)cm.mapped + cm.index_offset,
+                                          (int64_t)cm.mapped_size - (int64_t)cm.index_offset);
         if (idx) {   /* NULL = stale index layout generation: load unindexed */
             ray_t* r = ray_index_attach_built(&vec, idx);
             if (r && !RAY_IS_ERR(r)) vec = r;
         }
-        /* The munmap size is derived from the column + index at free time
-         * (ray_free), so no aux slot is needed — leaving str_pool intact on STR. */
         /* Attach failure → column loads unindexed; correctness unaffected. */
+        /* The mapping is longer than the payload by the index region, and
+         * ray_free can only size it from the attached index.  Once the
+         * column drops that index — an in-place edit of the loaded column's
+         * only reference detaches a mapped index without releasing it — or
+         * when ray_index_inline_map discarded a child that is still in the
+         * file, the tail would stay mapped for the life of the process.  So
+         * a mapped column that carries an index registers its region under
+         * its own address with the true length, exactly as str_pool_cow does
+         * for a string column whose pool pointer stops leading to it; a
+         * string column already reaches the region through its pool. */
+        if (vec->type != RAY_STR && (vec->attrs & RAY_ATTR_HAS_INDEX)) {
+            ray_file_map_t* m = (ray_file_map_t*)ray_sys_alloc(sizeof(*m));
+            if (m) {
+                m->base = cm.mapped;
+                m->len  = cm.mapped_size;
+                m->rc   = 1;
+                m->next = NULL;
+                ray_file_map_register(vec, m);
+            }
+            /* No descriptor (oom): the free falls back to sizing from the
+             * index, the behaviour before this registration existed. */
+        }
     }
 
     return vec;

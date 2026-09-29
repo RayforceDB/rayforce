@@ -184,6 +184,14 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], ic->type);
         if (!vt) return AGG_V2_AGG_TYPE;
         if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
+        /* The streaming 64-bit integer avg packs its 128-bit high word with
+         * the group count in one word (agg_stream.c): exact while every
+         * group has fewer than 2^32 rows; the narrower kernels keep a plain
+         * int64 sum, exact below 2^31 rows.  A table that large keeps the
+         * legacy engines, whose accumulators carry a full high word. */
+        if (ext->agg_ops[a] == OP_AVG && ic->type != RAY_F64 && ic->type != RAY_F32 &&
+            ray_table_nrows(tbl) >= ((int64_t)1 << ((ic->type == RAY_I64 || ic->type == RAY_TIMESTAMP) ? 32 : 31)))
+            return AGG_V2_AGG_TYPE;
     }
     return AGG_V2_ADMITTED;
 }
@@ -4645,15 +4653,34 @@ static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
 #undef INDEX_FIRST_VALID
     }
     int64_t best = -1;
+    /* A FILE domain's entries are compared off the mapped vocabulary: no
+     * atom per row — the lazily built atoms of a wide vocabulary cost far
+     * more than the compare and stay for the domain's lifetime.  Positions
+     * past the file prefix, and the runtime domain, go through the atoms. */
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(c->src);
+    ray_sym_domain_raw_t vocab;
+    bool vocab_ok = ray_sym_domain_raw_pin(dom, &vocab);
     for (int64_t j = 0; j < count; j++) {
         if ((j & 65535) == 0 && ray_interrupted()) return -1;
         int64_t r = rows[c->kind == OP_LAST ? count - 1 - j : j];
         if (ray_vec_is_null(c->src, r)) continue;
         if (best < 0) best = r;
         if (c->kind == OP_FIRST || c->kind == OP_LAST) break;
-        ray_t* x = ray_group_sym_read(&c->symbols, ray_sym_vec_domain(c->src), ray_read_sym(data, r, c->src->type, c->src->attrs));
-        ray_t* y = ray_group_sym_read(&c->symbols, ray_sym_vec_domain(c->src), ray_read_sym(data, best, c->src->type, c->src->attrs));
-        int cmp = ray_str_cmp(x, y);
+        int64_t ir = ray_read_sym(data, r, c->src->type, c->src->attrs);
+        int64_t ib = ray_read_sym(data, best, c->src->type, c->src->attrs);
+        int cmp;
+        if (vocab_ok && ir >= 0 && ib >= 0 && ir < vocab.count && ib < vocab.count) {
+            size_t lr, lb;
+            const char* pr = ray_sym_domain_raw_str(&vocab, ir, &lr);
+            const char* pb = ray_sym_domain_raw_str(&vocab, ib, &lb);
+            size_t m = lr < lb ? lr : lb;
+            cmp = m ? memcmp(pr, pb, m) : 0;
+            if (cmp == 0) cmp = (lr > lb) - (lr < lb);
+        } else {
+            ray_t* x = ray_group_sym_read(&c->symbols, dom, ir);
+            ray_t* y = ray_group_sym_read(&c->symbols, dom, ib);
+            cmp = ray_str_cmp(x, y);
+        }
         if (c->kind == OP_MIN ? cmp < 0 : cmp > 0) best = r;
     }
     return best;

@@ -809,8 +809,8 @@ extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
-#define EXPR_MAX_REGS 16
-#define EXPR_MAX_INS  48
+#define EXPR_MAX_REGS 32
+#define EXPR_MAX_INS  96
 #define EXPR_MORSEL   RAY_MORSEL_ELEMS
 
 typedef struct {
@@ -837,6 +837,8 @@ typedef struct {
         uint8_t     col_attrs;  /* column attrs — RAY_SYM width (REG_SCAN only) */
         bool        is_parted;  /* true if this SCAN refs a parted column */
         bool        nullable;   /* lanes may contain NULL_I64 / NaN */
+        bool        null_src;   /* that nullability traces to a nullable column
+                                 * (else: only op-generated sentinels) */
         const void* data;       /* column data pointer (REG_SCAN only) */
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
@@ -1226,6 +1228,12 @@ ray_t* desc_vec_eager(ray_t* x);
 /* OP_PEARSON_CORR per-group accumulators: x-side piggybacks on SUM and
  * SUMSQ blocks; this flag enables the y-side blocks (Σy, Σy², Σxy). */
 #define GHT_NEED_PEARSON 0x10
+/* Exact integer AVG: an extra int64 block (off_sum_hi) carries the high
+ * word of a 128-bit two's-complement sum next to each off_sum slot, so an
+ * integer mean never divides a wrapped int64 (ray_i128_add / ray_i128_to_f64
+ * in idxop.h).  Set whenever an OP_AVG agg has a non-float input; SUM keeps
+ * reading off_sum alone (int64 wraparound is its contract). */
+#define GHT_NEED_SUM128  0x20
 
 /* ── ght_layout_t — inline-or-spill, fixed-size, by-value embeddable ──
  *
@@ -1298,6 +1306,9 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
+    /* High words of the 128-bit integer sums (GHT_NEED_SUM128); 0 when the
+     * layout carries none. */
+    uint16_t off_sum_hi;
     /* Earliest contributing source row for this group.  Every packed entry
      * carries its source row in the tail slot; partition merges retain the
      * minimum so output order is independent of radix partition count. */
@@ -1603,6 +1614,22 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
 
 /* ── pivot_exec.c ── */
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op);
+
+/* Is a descriptor view worth rebuilding over its own bytes (string.c)? */
+bool ray_str_view_should_compact(uint64_t pooled_bytes, int64_t pool_len);
+
+/* Shared-node memo around a sub-evaluation over a swapped g->table
+ * (exec.c): push sets the outer memo aside and arms one for the current
+ * table and sub-root; pop tears it down and restores the outer one. */
+typedef struct {
+    ray_t**   vals;
+    uint32_t* uses;
+    uint32_t  n;
+    ray_t*    hdr;
+    ray_t*    table;
+} ray_exec_memo_save_t;
+void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save);
+void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
 /* ── embedding_exec.c ── */

@@ -1,0 +1,27 @@
+;; Splayed CSV load of a SYM column whose per-partition dictionary
+;; overflows (src/io/csv.c: csv_dedup_task caps a partition at
+;; CSV_DEDUP_MAX_ENTS distinct strings — 8192 in debug builds — and the
+;; column then interns row by row into the symfile domain,
+;; csv_intern_dicts_domain's fallback).  140k distinct strings exceed the
+;; cap in at least one partition however the column is split (at most 16
+;; partitions).  Release builds keep the cap at 1M and take the batched
+;; path; the answers are the same either way.
+
+(.sys.exec "rm -rf rf_test_splayed_ovf rf_test_splayed_ovf.csv") -- 0
+(.sys.exec "seq 0 139999 | awk '{print $1\",k\"$1}' > rf_test_splayed_ovf.csv") -- 0
+(set Tovf (.csv.splayed [id s] [I64 SYM] "rf_test_splayed_ovf.csv" "rf_test_splayed_ovf/"))
+(count Tovf) -- 140000
+(sum (at Tovf 'id)) -- 9799930000
+(count (distinct (at Tovf 's))) -- 140000
+(at (at Tovf 's) 0) -- 'k0
+(at (at Tovf 's) 8192) -- 'k8192
+(at (at Tovf 's) 139999) -- 'k139999
+;; every row's symbol is the one written for its id
+(count (select {from: Tovf where: (== s (as 'SYM "k77777"))})) -- 1
+(at (at (select {id: id from: Tovf where: (== s (as 'SYM "k77777"))}) 'id) 0) -- 77777
+;; reload from disk agrees
+(set Rovf (.db.splayed.get "rf_test_splayed_ovf/"))
+(count Rovf) -- 140000
+(count (distinct (at Rovf 's))) -- 140000
+(at (at Rovf 's) 139999) -- 'k139999
+(.sys.exec "rm -rf rf_test_splayed_ovf rf_test_splayed_ovf.csv") -- 0
