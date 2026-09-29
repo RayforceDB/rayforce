@@ -35,6 +35,9 @@
 #include "ops/rowsel.h"
 #include "store/col.h"
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
@@ -577,6 +580,67 @@ static test_result_t test_index_persistence_roundtrip(void) {
 
     ray_release(loaded);
     ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Mapped column drops its own index: the whole mapping is unmapped ──
+ *
+ * A column loaded by mmap with an inline index region is longer than its
+ * payload.  Dropping the index from the loaded column itself (the sole
+ * reference: an in-place edit does exactly this) used to leave the index
+ * tail mapped for the life of the process, because ray_free sized the
+ * unmap from the index it no longer had.  The file is laid out so the
+ * region crosses into a page of its own; after the free that page must
+ * be gone (msync reports ENOMEM on an unmapped range). */
+static test_result_t test_index_mapped_drop_unmaps_tail(void) {
+    ray_heap_init();
+    /* Lay the file out so the inline index region crosses into a page of
+     * its own whatever the page size (4 KiB on Linux, 16 KiB on Apple
+     * silicon): the payload ends 64 bytes short of the second page. */
+    long pg = sysconf(_SC_PAGESIZE);
+    TEST_ASSERT_TRUE(pg >= 4096);
+    int64_t n = (2 * (int64_t)pg - 96) / 8;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) { int64_t x = i * 3; v = ray_vec_append(v, &x); }
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_chunk_zone(&w, 8)));
+
+    char path[] = "/tmp/idx_drop_unmap_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_TRUE(fd >= 0);
+    close(fd);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);   /* writes the inline index region too */
+    ray_release(w);
+
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_TRUE(st.st_size > 2 * pg);            /* the region reaches a further page */
+    size_t mapped = ((size_t)st.st_size + (size_t)pg - 1) & ~((size_t)pg - 1);
+
+    ray_t* m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_U(m->mmod, 1);
+    TEST_ASSERT_TRUE(m->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I((int)ray_index_payload(m->index)->kind, RAY_IDX_CHUNK_ZONE);
+    char* last_page = (char*)m + mapped - (size_t)pg;
+    TEST_ASSERT_EQ_I(msync(last_page, (size_t)pg, MS_ASYNC), 0);   /* mapped while loaded */
+
+    /* Sole reference: the drop detaches the mapped index in place. */
+    ray_t* d = m;
+    ray_t* r = ray_index_drop(&d);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(d == m);
+    TEST_ASSERT_FALSE(d->attrs & RAY_ATTR_HAS_INDEX);
+    int64_t* data = (int64_t*)ray_data(d);
+    TEST_ASSERT_EQ_I(data[n - 1], (n - 1) * 3);
+
+    ray_release(d);
+    errno = 0;
+    int rc = msync(last_page, (size_t)pg, MS_ASYNC);
+    TEST_ASSERT_TRUE(rc == -1 && errno == ENOMEM);       /* the tail page is unmapped */
+    unlink(path);
     ray_heap_destroy();
     PASS();
 }
@@ -3784,6 +3848,7 @@ const test_entry_t index_entries[] = {
     { "index/null_readers_through_helper",   test_index_null_readers_through_helper,   NULL, NULL },
     { "index/aux_helper_slice",          test_index_aux_helper_slice,          NULL, NULL },
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
+    { "index/mapped_drop_unmaps_tail", test_index_mapped_drop_unmaps_tail, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },
     { "index/i16_zone_and_hash",             test_index_i16_zone_and_hash,             NULL, NULL },
