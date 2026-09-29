@@ -925,6 +925,22 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
      * answer exactly as it would, or the same expression gets two types
      * depending on the worker count.  Where it is not, this arm is the only
      * one there is and may report the type the rows actually have. */
+    ray_t* outer_sel = g->selection;
+    if (outer_sel) {
+        ray_rowsel_t* sm = ray_rowsel_meta(outer_sel);
+        if (!sm || sm->nrows != nrows) return NULL;
+    }
+
+    int64_t selected = outer_sel ? ray_rowsel_meta(outer_sel)->total_pass : nrows;
+    if (selected < 0 || selected > nrows) return NULL;
+    /* Under a sparse outer selection (a `where:` keeping a quarter of the
+     * rows or fewer) the STR eager arm is a bad trade: it builds a
+     * descriptor for every row of the table, and the filtered result then
+     * keeps that whole intermediate — both parents' bytes — alive for its
+     * few rows.  Touching only the selected rows costs less and holds only
+     * their bytes.  Same threshold as the projection's pre-compaction. */
+    bool sparse_sel = outer_sel && selected * 4 <= nrows;
+
     bool eager_possible = (op->out_type != RAY_STR &&
                            if_branch_trivial(g, then_op) &&
                            if_branch_trivial(g, else_op) &&
@@ -932,7 +948,7 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
                            if_type_eager_ok(else_op->out_type, op->out_type)) ||
                           /* two STR vector branches that are cheap and total:
                            * the eager arm picks descriptors over one pass */
-                          (op->out_type == RAY_STR &&
+                          (op->out_type == RAY_STR && !sparse_sel &&
                            then_op->out_type == RAY_STR && else_op->out_type == RAY_STR &&
                            if_branch_cheap(g, then_op, 0) && if_branch_cheap(g, else_op, 0));
     {
@@ -945,15 +961,6 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     if (!if_make_branch_plan(g, then_op, &then_plan) ||
         !if_make_branch_plan(g, else_op, &else_plan))
         return NULL;
-
-    ray_t* outer_sel = g->selection;
-    if (outer_sel) {
-        ray_rowsel_t* sm = ray_rowsel_meta(outer_sel);
-        if (!sm || sm->nrows != nrows) return NULL;
-    }
-
-    int64_t selected = outer_sel ? ray_rowsel_meta(outer_sel)->total_pass : nrows;
-    if (selected < 0 || selected > nrows) return NULL;
 
     uint8_t* cond = (uint8_t*)ray_data(cond_v);
     int64_t true_count = if_selected_true_count(cond, nrows, outer_sel);
