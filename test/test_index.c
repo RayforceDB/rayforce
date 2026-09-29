@@ -595,7 +595,12 @@ static test_result_t test_index_persistence_roundtrip(void) {
  * be gone (msync reports ENOMEM on an unmapped range). */
 static test_result_t test_index_mapped_drop_unmaps_tail(void) {
     ray_heap_init();
-    int64_t n = 1000;                 /* 8032 payload bytes: the region starts at 8064 and crosses 8192 */
+    /* Lay the file out so the inline index region crosses into a page of
+     * its own whatever the page size (4 KiB on Linux, 16 KiB on Apple
+     * silicon): the payload ends 64 bytes short of the second page. */
+    long pg = sysconf(_SC_PAGESIZE);
+    TEST_ASSERT_TRUE(pg >= 4096);
+    int64_t n = (2 * (int64_t)pg - 96) / 8;
     ray_t* v = ray_vec_new(RAY_I64, n);
     for (int64_t i = 0; i < n; i++) { int64_t x = i * 3; v = ray_vec_append(v, &x); }
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
@@ -611,16 +616,16 @@ static test_result_t test_index_mapped_drop_unmaps_tail(void) {
 
     struct stat st;
     TEST_ASSERT_EQ_I(stat(path, &st), 0);
-    TEST_ASSERT_TRUE(st.st_size > 8192);           /* the region reaches a second page */
-    size_t mapped = ((size_t)st.st_size + 4095) & ~(size_t)4095;
+    TEST_ASSERT_TRUE(st.st_size > 2 * pg);            /* the region reaches a further page */
+    size_t mapped = ((size_t)st.st_size + (size_t)pg - 1) & ~((size_t)pg - 1);
 
     ray_t* m = ray_col_mmap(path);
     TEST_ASSERT_FALSE(RAY_IS_ERR(m));
     TEST_ASSERT_EQ_U(m->mmod, 1);
     TEST_ASSERT_TRUE(m->attrs & RAY_ATTR_HAS_INDEX);
     TEST_ASSERT_EQ_I((int)ray_index_payload(m->index)->kind, RAY_IDX_CHUNK_ZONE);
-    char* last_page = (char*)m + mapped - 4096;
-    TEST_ASSERT_EQ_I(msync(last_page, 4096, MS_ASYNC), 0);   /* mapped while loaded */
+    char* last_page = (char*)m + mapped - (size_t)pg;
+    TEST_ASSERT_EQ_I(msync(last_page, (size_t)pg, MS_ASYNC), 0);   /* mapped while loaded */
 
     /* Sole reference: the drop detaches the mapped index in place. */
     ray_t* d = m;
@@ -629,11 +634,11 @@ static test_result_t test_index_mapped_drop_unmaps_tail(void) {
     TEST_ASSERT_TRUE(d == m);
     TEST_ASSERT_FALSE(d->attrs & RAY_ATTR_HAS_INDEX);
     int64_t* data = (int64_t*)ray_data(d);
-    TEST_ASSERT_EQ_I(data[999], 2997);
+    TEST_ASSERT_EQ_I(data[n - 1], (n - 1) * 3);
 
     ray_release(d);
     errno = 0;
-    int rc = msync(last_page, 4096, MS_ASYNC);
+    int rc = msync(last_page, (size_t)pg, MS_ASYNC);
     TEST_ASSERT_TRUE(rc == -1 && errno == ENOMEM);       /* the tail page is unmapped */
     unlink(path);
     ray_heap_destroy();
