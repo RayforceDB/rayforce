@@ -19,6 +19,12 @@
 (count R) -- 10000
 (< (- (direct) base) 1000000) -- true
 (all (== (at R 'x) (at (select {from: T x: (if c S S2) where: (== st 1)}) 'x))) -- true
+(all (map (fn [j] (== (at (at R 'x) j) (if (at c (* j 50)) (at S (* j 50)) (at S2 (* j 50))))) (til 200))) -- true
+(set R 0)
+;; a filter that keeps most rows: the same values whichever arm ran
+(set R (select {from: T x: (if c S S2) where: (> st 10)}))
+(count R) -- 400000
+(all (== (at R 'x) (at (at (select {from: T x: (if c S S2)}) 'x) (where (> st 10))))) -- true
 (set R 0)
 ;; the same over two substring views
 (set R (select {from: T x: (if c (substr S 2 30) (substr S2 2 30)) where: (== st 1)}))
@@ -29,9 +35,9 @@
 (set R (select {from: T x: (if c S "a-rather-long-literal-string") where: (== st 1)}))
 (< (- (direct) base) 1000000) -- true
 (set R 0)
-;; a per-row condition over two whole columns (the selected path — STR is
-;; never routed to the eager arm when the condition is a column) copies only
-;; the chosen rows' bytes: less than the two parent pools together
+;; a per-row condition over two whole columns with no filter (two cheap STR
+;; branches take the eager arm, which picks descriptors over one pass): the
+;; result holds less than the two parent pools together
 (set R (select {from: T x: (if c S S2)}))
 (set grow (- (direct) base))
 (< grow 40000000) -- true
