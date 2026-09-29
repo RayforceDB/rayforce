@@ -313,7 +313,10 @@ static __attribute__((noinline, cold)) bool
 hashset_adopt_probe(hashset_t* hs, int8_t probe_type) {
     if (!hs->num_f64 && hs_needs_num_f64(hs->src_type, probe_type)) {
         hs->num_f64 = true;
-        if (!hashset_rehash(hs, hs->cap)) {
+        /* Only int cells change hash in this mode: a float- or list-built
+         * set already sits in the f64 layout, so it needs no rehash. */
+        if (hs_num_class(hs->src_type) == HS_NUM_INT &&
+            !hashset_rehash(hs, hs->cap)) {
             hs->num_f64 = false;
             return false;
         }

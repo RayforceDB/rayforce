@@ -42,6 +42,18 @@
 (except [1 2 3] [1 3]) -- [2]
 (find [1.0 2.0] [2.0]) -- [1]
 
+;; a float-built set probed by ints (no rehash needed), then by floats
+(set _fs (as 'F64 (til 1000)))
+(count (except (til 2000) _fs)) -- 1000
+(count (except (as 'F64 (til 2000)) _fs)) -- 1000
+
+;; beyond 2^53 an int and a double compare through f64, so an int matches
+;; the double its neighbour rounds to — (== 9007199254740993
+;; 9007199254740992.0) is true too.  Same-type ints that share a double
+;; image are still told apart.
+(find [9007199254740993 9007199254740992 9007199254740994] [9007199254740992.0 9007199254740994.0]) -- [0 2]
+(except [9007199254740993 9007199254740992 9007199254740994] [9007199254740992]) -- [9007199254740993 9007199254740994]
+
 ;; enough rows to force hashset growth before and after the switch
 (count (except (til 1000) (as 'F64 (til 500)))) -- 500
 (sum (find (as 'F64 (til 1000)) (til 1000))) -- 499500
