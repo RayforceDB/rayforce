@@ -97,11 +97,29 @@
 ;; the answer comes from the metadata: a whole-table mean of the 300k-row
 ;; column is not a scan (bounded far below it)
 (< (timeit (select {from: TH a: (avg hk) b: (min hkn)})) (/ (timeit (select {from: THm a: (avg hk) b: (min hkn)})) 4)) -- true
+;; the statistics are visible in the index description
+(at (.idx.info (at TH 'hk)) 'stats) -- 1
 ;; a runtime hash index carries the statistics too
 (set hv (.idx.hash (* (+ (til 200000) 1) 7)))
+(at (.idx.info hv) 'stats) -- 1
 (avg hv) -- (avg (* (+ (til 200000) 1) 7))
 (min hv) -- 7
 (max hv) -- 1400000
+;; concat of a unique-keyed indexed column carries the index over: the
+;; statistics extend over the appended rows (a plain copy gives the answers)
+(set hc (concat hv [-5 1400007]))
+(at (.idx.info hc) 'kind) -- 'hash
+(min hc) -- -5
+(max hc) -- 1400007
+(sum hc) -- (sum (concat (* (+ (til 200000) 1) 7) [-5 1400007]))
+(avg hc) -- (avg (concat (* (+ (til 200000) 1) 7) [-5 1400007]))
+(set TC (concat (table [hk] (list (at TH 'hk))) (table [hk] (list [9223372036854775807]))))
+(set TCm (concat (table [hk] (list hk)) (table [hk] (list [9223372036854775807]))))
+(at (.idx.info (at TC 'hk)) 'kind) -- 'hash
+(at (select {from: TC mx: (max hk)}) 'mx) -- [9223372036854775807]
+(at (select {from: TC mn: (min hk) s: (sum hk) a: (avg hk)}) 'mn) -- (at (select {from: TCm mn: (min hk)}) 'mn)
+(at (select {from: TC mn: (min hk) s: (sum hk) a: (avg hk)}) 's) -- (at (select {from: TCm s: (sum hk)}) 's)
+(at (select {from: TC mn: (min hk) s: (sum hk) a: (avg hk)}) 'a) -- (at (select {from: TCm a: (avg hk)}) 'a)
 (.sys.exec "rm -rf rf_test_zone_hash") -- 0
 ;; an empty table keeps the planner's answers
 (at (select {from: (select {from: T where: (< a64 -1000000)}) c: (count a16)}) 'c) -- (at (select {from: (select {from: Tm where: (< a64 -1000000)}) c: (count a16)}) 'c)

@@ -3205,6 +3205,9 @@ ray_t* ray_index_info(ray_t* v) {
         if (RAY_IS_ERR(r)) goto fail;
         r = dict_append_sym_i64(&keys, &vals, "n_groups", ix->u.hash.n_groups);
         if (RAY_IS_ERR(r)) goto fail;
+        /* whole-column statistics present (integer / temporal key) */
+        r = dict_append_sym_i64(&keys, &vals, "stats", (ix->markers & RAY_MARK_STATS) ? 1 : 0);
+        if (RAY_IS_ERR(r)) goto fail;
         break;
     case RAY_IDX_SORT:
         r = dict_append_sym_i64(&keys, &vals, "perm_len",
@@ -3812,6 +3815,23 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
     /* Every appended key is new, so `unique` stays true and a single-row
      * group is trivially ordered by any column: the markers carry over. */
     ix->u.hash.order_sym = sx->u.hash.order_sym;
-    ix->markers = sx->markers;
+    ix->markers = (uint8_t)(sx->markers & ~RAY_MARK_STATS);
+    /* The statistics of the source column extend over the appended rows —
+     * all non-null, dst carries no HAS_NULLS — or they do not exist. */
+    if ((sx->markers & RAY_MARK_STATS) && int_stats_type(t)) {
+        int64_t hi = sx->u.hash.st_sum_hi; uint64_t lo = sx->u.hash.st_sum_lo;
+        int64_t mn = sx->u.hash.st_min, mx = sx->u.hash.st_max;
+        const uint8_t* db = (const uint8_t*)ray_data(dst);
+        for (int64_t r = n0; r < n1; r++) {
+            int64_t x = int_stats_read(db, t, r);
+            ray_i128_add(&hi, &lo, x);
+            if (x < mn) mn = x;
+            if (x > mx) mx = x;
+        }
+        ix->u.hash.st_nn = sx->u.hash.st_nn + add;
+        ix->u.hash.st_sum_lo = lo; ix->u.hash.st_sum_hi = hi;
+        ix->u.hash.st_min = mn;    ix->u.hash.st_max = mx;
+        ix->markers |= RAY_MARK_STATS;
+    }
     attach_finalize(dst, idx);
 }
