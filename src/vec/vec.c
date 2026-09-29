@@ -515,22 +515,11 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
             }
         }
 
-        /* Propagate null bitmaps from a and b.
-         * Slices don't carry RAY_ATTR_HAS_NULLS — check RAY_ATTR_SLICE too. */
-        if (ray_vec_may_have_nulls(a) ||
-            ray_vec_may_have_nulls(b)) {
-            for (int64_t i = 0; i < a->len; i++) {
-                if (ray_vec_is_null((ray_t*)a, i)) {
-                    ray_err_t err = ray_vec_set_null_checked(result, i, true);
-                    if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), NULL); }
-                }
-            }
-            for (int64_t i = 0; i < b->len; i++) {
-                if (ray_vec_is_null((ray_t*)b, i)) {
-                    ray_err_t err = ray_vec_set_null_checked(result, a->len + i, true);
-                    if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), NULL); }
-                }
-            }
+        /* Canonical empty payloads were copied above; only the null hint
+         * remains. Scan payloads (including slices), not input hint bits. */
+        if (ray_vec_text_has_nulls(a) || ray_vec_text_has_nulls(b)) {
+            vec_drop_index_inplace(result);
+            result->attrs |= RAY_ATTR_HAS_NULLS;
         }
 
         return result;
@@ -650,10 +639,15 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
                (size_t)b->len * esz);
     }
 
-    /* Propagate null bitmaps from a and b.
-     * Slices don't carry RAY_ATTR_HAS_NULLS — check RAY_ATTR_SLICE too. */
-    if (ray_vec_may_have_nulls(a) ||
-        ray_vec_may_have_nulls(b)) {
+    /* SYM's zero id survives copying, widening and domain translation.
+     * Numeric sentinels retain their existing propagation path below. */
+    if (result->type == RAY_SYM) {
+        if (ray_vec_text_has_nulls(a) || ray_vec_text_has_nulls(b)) {
+            vec_drop_index_inplace(result);
+            result->attrs |= RAY_ATTR_HAS_NULLS;
+        }
+    } else if (ray_vec_may_have_nulls(a) ||
+               ray_vec_may_have_nulls(b)) {
         for (int64_t i = 0; i < a->len; i++) {
             if (ray_vec_is_null((ray_t*)a, i)) {
                 ray_err_t err = ray_vec_set_null_checked(result, i, true);

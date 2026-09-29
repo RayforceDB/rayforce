@@ -25,6 +25,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "vec/vec.h"
+#include "vec/str.h"
 #include "vec/embedding.h"
 #include "table/sym.h"
 #include "core/platform.h"
@@ -1782,6 +1783,94 @@ static test_result_t test_vec_concat_str_null(void) {
     PASS();
 }
 
+/* Canonical text payloads must propagate even without HAS_NULLS.  Exercise
+ * both operands, chunk/tail boundaries, all SYM width pairs and slices whose
+ * parent has nulls outside the selected range. */
+static test_result_t test_vec_concat_text_null_scan(void) {
+    const uint8_t widths[] = {RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64};
+    const int64_t positions[] = {-1, 0, 255, 256, 258};
+    for (int kind = 0; kind < 2; kind++) {
+        for (int wa = 0; wa < (kind ? 4 : 1); wa++) {
+            for (int wb = 0; wb < (kind ? 4 : 1); wb++) {
+                for (int side = 0; side < 2; side++) {
+                    for (int p = 0; p < 5; p++) {
+                        ray_t* v[2];
+                        for (int s = 0; s < 2; s++) {
+                            v[s] = kind ? ray_sym_vec_new(widths[s ? wb : wa], 261)
+                                        : ray_vec_new(RAY_STR, 261);
+                            TEST_ASSERT_NOT_NULL(v[s]);
+                            TEST_ASSERT_FALSE(RAY_IS_ERR(v[s]));
+                            if (kind) {
+                                v[s]->len = 261;
+                                for (int64_t i = 0; i < 261; i++)
+                                    ray_write_sym(ray_data(v[s]), i, 1, RAY_SYM, v[s]->attrs);
+                            } else {
+                                for (int64_t i = 0; i < 261; i++)
+                                    v[s] = ray_str_vec_append(v[s], "a pooled string longer than inline", 33);
+                            }
+                            ray_vec_set_null(v[s], 0, true);
+                            ray_vec_set_null(v[s], 260, true);
+                            if (s == side && positions[p] >= 0)
+                                ray_vec_set_null(v[s], positions[p] + 1, true);
+                            v[s]->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+                        }
+                        ray_t* a = ray_vec_slice(v[0], 1, 259);
+                        ray_t* b = ray_vec_slice(v[1], 1, 259);
+                        ray_t* c = ray_vec_concat(a, b);
+                        TEST_ASSERT_NOT_NULL(c);
+                        TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+                        TEST_ASSERT_EQ_I(c->len, 518);
+                        TEST_ASSERT_EQ_I(!!(c->attrs & RAY_ATTR_HAS_NULLS), positions[p] >= 0);
+                        TEST_ASSERT_FALSE(c->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX | RAY_ATTR_SORTED));
+                        /* Result owns its pool/domain independently of inputs. */
+                        ray_release(a); ray_release(b);
+                        ray_release(v[0]); ray_release(v[1]);
+                        for (int64_t i = 0; i < c->len; i++) {
+                            bool is_null = positions[p] >= 0 && i == side * 259 + positions[p];
+                            TEST_ASSERT_EQ_I(ray_vec_is_null(c, i), is_null);
+                            if (kind) {
+                                TEST_ASSERT_EQ_I(ray_read_sym(ray_data(c), i, RAY_SYM, c->attrs), !is_null);
+                            } else if (!is_null) {
+                                size_t len;
+                                const char* str = ray_str_vec_get(c, i, &len);
+                                TEST_ASSERT_EQ_U(len, 33);
+                                TEST_ASSERT_MEM_EQ(33, str, "a pooled string longer than inline");
+                            } else {
+                                ray_str_t zero = {0};
+                                TEST_ASSERT_MEM_EQ(sizeof(zero), &((ray_str_t*)ray_data(c))[i], &zero);
+                            }
+                        }
+                        ray_release(c);
+                    }
+                }
+            }
+        }
+    }
+    PASS();
+}
+
+static test_result_t test_vec_concat_text_empty(void) {
+    for (int kind = 0; kind < 2; kind++) {
+        ray_t* empty = ray_vec_new(kind ? RAY_SYM : RAY_STR, 0);
+        ray_t* nulls = ray_vec_new(kind ? RAY_SYM : RAY_STR, 2);
+        nulls->len = 2;
+        ray_vec_set_null(nulls, 0, true);
+        ray_vec_set_null(nulls, 1, true);
+        nulls->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+        for (int side = 0; side < 3; side++) {
+            ray_t* c = ray_vec_concat(side == 0 ? nulls : empty, side == 1 ? nulls : empty);
+            TEST_ASSERT_NOT_NULL(c);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+            TEST_ASSERT_EQ_I(c->len, side == 2 ? 0 : 2);
+            TEST_ASSERT_EQ_I(!!(c->attrs & RAY_ATTR_HAS_NULLS), side != 2);
+            for (int64_t i = 0; i < c->len; i++) TEST_ASSERT_TRUE(ray_vec_is_null(c, i));
+            ray_release(c);
+        }
+        ray_release(nulls); ray_release(empty);
+    }
+    PASS();
+}
+
 /* ---- str_vec_append: pool growth across many large strings ------------- */
 
 static test_result_t test_str_vec_append_pool_grow(void) {
@@ -2372,6 +2461,8 @@ const test_entry_t vec_entries[] = {
     { "vec/concat_empty", test_vec_concat_empty, vec_setup, vec_teardown },
     { "vec/concat_str", test_vec_concat_str, vec_setup, vec_teardown },
     { "vec/concat_str_null", test_vec_concat_str_null, vec_setup, vec_teardown },
+    { "vec/concat_text_null_scan", test_vec_concat_text_null_scan, vec_setup, vec_teardown },
+    { "vec/concat_text_empty", test_vec_concat_text_empty, vec_setup, vec_teardown },
     { "vec/str_append_pool_grow", test_str_vec_append_pool_grow, vec_setup, vec_teardown },
     { "vec/str_set_paths", test_str_vec_set_paths, vec_setup, vec_teardown },
     { "vec/str_guards", test_str_vec_guards, vec_setup, vec_teardown },

@@ -227,6 +227,7 @@ ray_t* ray_log_close_fn(ray_t** args, int64_t n) {
  * argument; acts on the journal .log.open/.write/.close target.  Errors
  * with `domain` when no journal base is known (none ever opened). */
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".log.purge takes no arguments");
     return err_to_ray(ray_journal_purge(), "io");
 }

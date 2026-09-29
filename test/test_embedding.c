@@ -36,6 +36,7 @@
 #include "lang/internal.h"
 #include "lang/format.h"
 #include "store/hnsw.h"
+#include "store/fileio.h"
 #include <math.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -1002,6 +1003,32 @@ static test_result_t test_hnsw_vec_size_valid_guard(void) {
     int64_t max_elems = (int64_t)(SIZE_MAX / sizeof(float));
     TEST_ASSERT_TRUE(ray_hnsw_vec_size_valid(max_elems, 1));
     TEST_ASSERT_FALSE(ray_hnsw_vec_size_valid(max_elems, 2));
+    PASS();
+}
+
+/* A persisted neighbor id is an array index during greedy descent.  A
+ * malformed file must be rejected by both load entry points before a query
+ * can turn it into an out-of-bounds read / process crash. */
+static test_result_t test_hnsw_load_rejects_bad_neighbor(void) {
+    const char* dir = "/tmp/ray_hnsw_bad_neighbor";
+    float vecs[2 * 2] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 2, 2, RAY_HNSW_L2, 4, 50);
+    TEST_ASSERT_NOT_NULL(idx);
+    TEST_ASSERT_EQ_I(ray_hnsw_save(idx, dir), RAY_OK);
+    ray_hnsw_free(idx);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hnsw_layer_0.bin", dir);
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    /* Layer metadata is two int64 values; overwrite the first neighbor. */
+    TEST_ASSERT_EQ_I(fseek(f, (long)(2 * sizeof(int64_t)), SEEK_SET), 0);
+    int64_t bad_id = 1000000000;
+    TEST_ASSERT_EQ_U(fwrite(&bad_id, sizeof(bad_id), 1, f), 1);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+
+    TEST_ASSERT_NULL(ray_hnsw_load(dir));
+    TEST_ASSERT_NULL(ray_hnsw_mmap(dir));
     PASS();
 }
 
@@ -2002,6 +2029,7 @@ const test_entry_t embedding_entries[] = {
     { "embedding/hnsw_mmap_load", test_hnsw_mmap_load, emb_setup, emb_teardown },
     { "embedding/hnsw_build_overflow_rejected", test_hnsw_build_overflow_rejected, emb_setup, emb_teardown },
     { "embedding/hnsw_vec_size_valid_guard", test_hnsw_vec_size_valid_guard, emb_setup, emb_teardown },
+    { "embedding/hnsw_load_rejects_bad_neighbor", test_hnsw_load_rejects_bad_neighbor, emb_setup, emb_teardown },
     { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
 
     /* rerank coverage (S7) */
@@ -2050,5 +2078,4 @@ const test_entry_t embedding_entries[] = {
 
     { NULL, NULL, NULL, NULL },
 };
-
 

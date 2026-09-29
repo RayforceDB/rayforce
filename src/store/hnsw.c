@@ -908,6 +908,57 @@ bool ray_hnsw_vec_size_valid(int64_t n_nodes, int32_t dim) {
     return (uint64_t)n_nodes <= SIZE_MAX / sizeof(float) / (uint64_t)dim;
 }
 
+/* Validate the graph topology before making the loaded index available to
+ * search.  All ids in these files are untrusted: a bad neighbor used to
+ * reach hnsw_greedy_closest() or hnsw_search_layer() becomes an unchecked
+ * offset into idx->vectors.  The node_ids mapping is equally important — a
+ * duplicate, missing, or wrong-level entry can make a valid-looking layer
+ * resolve the wrong neighbor block.
+ */
+static bool hnsw_persisted_layers_valid(const ray_hnsw_t* idx) {
+    if (!idx || !idx->node_level || idx->n_nodes <= 0 || idx->n_layers <= 0)
+        return false;
+
+    for (int64_t id = 0; id < idx->n_nodes; id++) {
+        if (idx->node_level[id] < 0 || idx->node_level[id] >= idx->n_layers)
+            return false;
+    }
+
+    uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)idx->n_nodes);
+    if (!seen) return false;
+
+    bool valid = true;
+    for (int32_t l = 0; l < idx->n_layers && valid; l++) {
+        const ray_hnsw_layer_t* layer = &idx->layers[l];
+        int64_t expected = 0;
+        for (int64_t id = 0; id < idx->n_nodes; id++)
+            if (idx->node_level[id] >= l) expected++;
+        if (layer->n_nodes != expected || !layer->node_ids || !layer->neighbors) {
+            valid = false;
+            break;
+        }
+
+        memset(seen, 0, (size_t)idx->n_nodes);
+        for (int64_t i = 0; i < layer->n_nodes && valid; i++) {
+            int64_t id = layer->node_ids[i];
+            if (id < 0 || id >= idx->n_nodes || idx->node_level[id] < l || seen[id]) {
+                valid = false;
+                break;
+            }
+            seen[id] = 1;
+        }
+
+        size_t nb_count = (size_t)layer->n_nodes * (size_t)layer->M_max;
+        for (size_t i = 0; i < nb_count && valid; i++) {
+            int64_t id = layer->neighbors[i];
+            if (id != -1 && (id < 0 || id >= idx->n_nodes)) valid = false;
+        }
+    }
+
+    ray_sys_free(seen);
+    return valid;
+}
+
 static ray_hnsw_t* hnsw_load_impl(const char* dir, bool use_mmap) {
     if (!dir) return NULL;
     (void)use_mmap; /* mmap optimization deferred — both paths read into memory */
@@ -999,6 +1050,11 @@ static ray_hnsw_t* hnsw_load_impl(const char* dir, bool use_mmap) {
         }
 
         fclose(f);
+    }
+
+    if (!hnsw_persisted_layers_valid(idx)) {
+        ray_hnsw_free(idx);
+        return NULL;
     }
 
     /* Read vectors */
