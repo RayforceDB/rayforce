@@ -156,3 +156,64 @@
 
 ;; duplicate needles must not double-count or change the verdict
 (in (as 'SYM ["a" "b"]) (as 'SYM ["a" "a" "a"])) -- [true false]
+
+;; ========== TEMPORAL EQUALS ONLY ITS OWN TYPE (#593 review) ==========
+;; atom_eq never matches a DATE to an int or to a TIMESTAMP, and neither do
+;; find / except or the hashset `in`.  The typed kernel compared raw
+;; payloads — day 0 matched 0i, a DATE's day count matched a TIMESTAMP's
+;; nanoseconds — so widening its gate made the answer depend on where the
+;; nulls were.  Every shape below answers the same with nulls on either
+;; side, none, or (for the hashset) both.
+
+;; temporal column, int needles: nothing matches
+(in [2000.01.01 2000.01.03] [0i 2i]) -- [false false]
+(in [2000.01.01 0Nd 2000.01.03] [0i 2i]) -- [false false false]
+(in [2000.01.01 2000.01.03] [0Ni 2i]) -- [false false]
+(in [2000.01.01 0Nd] [0]) -- [false false]
+(in [00:00:01.000 0Nt] [1000i]) -- [false false]
+(in [2000.01.01D00:00:00.000000000 0Np] [0]) -- [false false]
+
+;; int column, temporal needles: nothing matches
+(in [0i 2i] [2000.01.01 2000.01.03]) -- [false false]
+(in [0 0Nl] [2000.01.01]) -- [false false]
+(in [0 1] [2000.01.01 0Nd]) -- [false false]
+
+;; distinct temporal types never match — not even by raw payload
+(in [2000.01.02] [2000.01.01D00:00:00.000000001]) -- [false]
+(in [2000.01.02 0Nd] [2000.01.02D00:00:00.000000000]) -- [false false]
+(in [2000.01.01D00:00:00.000000000 0Np] [2000.01.01]) -- [false false]
+(in [00:00:00.001] [2000.01.01D00:00:00.000000001]) -- [false]
+
+;; same with nulls on both sides: only null equals null
+(in [2000.01.01 0Nd] [0Ni 0i]) -- [false true]
+
+;; same-type temporal still matches, with or without nulls
+(in [2000.01.01 0Nd 2000.01.03] [2000.01.03]) -- [false false true]
+(in [2000.01.01 2000.01.03] [2000.01.01 0Nd]) -- [true false]
+
+;; the fused where: and find agree with the bare in
+(count (select {from: (table [d] (list [2000.01.01 2000.01.03 0Nd])) where: (in d [0i 2i])})) -- 0
+(find [2000.01.01 2000.01.03] [0i]) -- [0Nl]
+
+;; ========== LARGE NEEDLE SETS HASH INSIDE THE KERNEL ==========
+;; Past the SIMD small-set size (8) the kernel hashes the needles instead of
+;; scanning them per row, so a nullable column against thousands of needles
+;; stays O(rows + needles).  Pins the boundary and the table's edge values.
+
+;; 8 needles (SIMD path) and 9 (hash path) answer alike
+(in [1 2 3 0Nl 20] [1 3 5 7 9 11 13 15]) -- [true false true false false]
+(in [1 2 3 0Nl 20] [1 3 5 7 9 11 13 15 20]) -- [true false true false true]
+(in [1.0 2.0 0Nf 20.0] [1.0 3.0 5.0 7.0 9.0 11.0 13.0 15.0 20.0]) -- [true false false true]
+
+;; -0.0 and +0.0 share a slot; NaN / null never match
+(in [-0.0 0.0 1.5] (as 'F64 (til 20))) -- [true true false]
+(in [0Nf 2.5] (concat (as 'F64 (til 20)) [2.5])) -- [false true]
+
+;; duplicates in a large set, and a large set against a nullable column
+(sum (in (concat (til 1000) [0Nl]) (take (til 100) 5000))) -- 100
+(sum (in (concat (til 1000) [0Nl]) (* 2 (til 1000)))) -- 500
+(sum (in (concat (as 'F64 (til 1000)) [0Nf]) (as 'F64 (* 2 (til 1000))))) -- 500
+
+;; a large set of narrow ints against a narrow column
+(sum (in (as 'I32 (til 1000)) (as 'I32 (* 3 (til 100))))) -- 100
+(sum (in (as 'I16 (til 1000)) (as 'I16 (* 3 (til 100))))) -- 100
