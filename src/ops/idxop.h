@@ -165,6 +165,12 @@ typedef struct {
             uint8_t  chunk_log2;  /* chunk size = 1 << chunk_log2 (default 16 → 64 K rows) */
             uint8_t  is_f64;
             uint8_t  _pad[2];
+            /* Integer / temporal zones only (NULL for float zones and for
+             * indexes written before it existed): RAY_I64 vec of
+             * 2 * n_chunks — [0, n) the chunk's non-null values summed with
+             * int64 wraparound, [n, 2n) its non-null row count.  Whole-column
+             * sum / count / avg answer from it in O(n_chunks). */
+            ray_t*   aggs;
         } chunk_zone;
         struct {                /* RAY_IDX_PART */
             ray_t*  keys;       /* distinct partition values, in ascending block order */
@@ -271,6 +277,41 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
  * compute an index for persistence without COWing a shared column. */
 ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
 
+/* 128-bit two's-complement accumulation of int64 values: (hi, lo) += v.
+ * The engine's integer avg sums this way — exact for any column, and the
+ * same bits whatever the morsel split — and the chunk-zone metadata keeps
+ * the per-chunk (hi, lo) so it can answer the same value. */
+static inline void ray_i128_add(int64_t* hi, uint64_t* lo, int64_t v) {
+    uint64_t l = *lo + (uint64_t)v;
+    *hi += (v < 0 ? -1 : 0) + (l < (uint64_t)v ? 1 : 0);
+    *lo = l;
+}
+static inline void ray_i128_add128(int64_t* hi, uint64_t* lo, int64_t vhi, uint64_t vlo) {
+    uint64_t l = *lo + vlo;
+    *hi += vhi + (l < vlo ? 1 : 0);
+    *lo = l;
+}
+/* Double nearest the 128-bit value (hi, lo): the magnitude is converted
+ * (high word scaled by 2^64 plus the low word) and the sign reapplied, so
+ * a small negative total is not lost in 2^64 - |s|.  One formula
+ * everywhere so every path agrees bit for bit. */
+static inline double ray_i128_to_f64(int64_t hi, uint64_t lo) {
+    bool neg = hi < 0;
+    uint64_t h = (uint64_t)hi, l = lo;
+    if (neg) { l = ~l + 1u; h = ~h + (l == 0 ? 1u : 0u); }
+    double d = (double)h * 18446744073709551616.0 + (double)l;
+    return neg ? -d : d;
+}
+
+/* Whole-column sum (int64 wraparound) and non-null count of an integer
+ * column from its chunk-zone per-chunk aggregates; false when the column
+ * carries none for its current length. */
+bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out);
+/* The exact 128-bit sum (hi, lo) and non-null count from the same
+ * metadata: true when the per-chunk high words are stored, or when no
+ * partial sum can wrap int64 (then the wrapped sum is the exact one). */
+bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* nn_out);
+
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).
  * Returns RAY_ERR_NYI for non-STR.  Used at splayed save to persist the dict
@@ -288,7 +329,7 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
  *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
 int64_t ray_index_inline_size(const ray_index_t* ix);
 void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
-ray_t*  ray_index_inline_map(uint8_t* region);
+ray_t*  ray_index_inline_map(uint8_t* region, int64_t region_size);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach aux state byte-for-byte.  Returns *vp. */

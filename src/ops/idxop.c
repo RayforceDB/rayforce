@@ -378,9 +378,12 @@ void ray_index_release_payload(ray_index_t* ix) {
             ray_release(ix->u.chunk_zone.maxs);
         if (ix->u.chunk_zone.null_bits && !RAY_IS_ERR(ix->u.chunk_zone.null_bits))
             ray_release(ix->u.chunk_zone.null_bits);
+        if (ix->u.chunk_zone.aggs && !RAY_IS_ERR(ix->u.chunk_zone.aggs))
+            ray_release(ix->u.chunk_zone.aggs);
         ix->u.chunk_zone.mins = NULL;
         ix->u.chunk_zone.maxs = NULL;
         ix->u.chunk_zone.null_bits = NULL;
+        ix->u.chunk_zone.aggs = NULL;
         break;
     case RAY_IDX_PART:
         if (ix->u.part.keys   && !RAY_IS_ERR(ix->u.part.keys))   ray_release(ix->u.part.keys);
@@ -411,7 +414,7 @@ int ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap) {
     case RAY_IDX_BLOOM:      c[0] = ix->u.bloom.bits; break;
     case RAY_IDX_CHUNK_ZONE:
         c[0] = ix->u.chunk_zone.mins; c[1] = ix->u.chunk_zone.maxs;
-        c[2] = ix->u.chunk_zone.null_bits;
+        c[2] = ix->u.chunk_zone.null_bits; c[3] = ix->u.chunk_zone.aggs;
         break;
     case RAY_IDX_PART:
         c[0] = ix->u.part.keys; c[1] = ix->u.part.starts; c[2] = ix->u.part.lens;
@@ -460,6 +463,8 @@ void ray_index_retain_payload(ray_index_t* ix) {
             ray_retain(ix->u.chunk_zone.maxs);
         if (ix->u.chunk_zone.null_bits && !RAY_IS_ERR(ix->u.chunk_zone.null_bits))
             ray_retain(ix->u.chunk_zone.null_bits);
+        if (ix->u.chunk_zone.aggs && !RAY_IS_ERR(ix->u.chunk_zone.aggs))
+            ray_retain(ix->u.chunk_zone.aggs);
         break;
     case RAY_IDX_PART:
         if (ix->u.part.keys   && !RAY_IS_ERR(ix->u.part.keys))   ray_retain(ix->u.part.keys);
@@ -600,6 +605,9 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
         int64_t s = (int64_t)g * csz;
         int64_t e = s + csz; if (e > n) e = n;
         int64_t mn = INT64_MAX, mx = INT64_MIN;
+        uint64_t sum = 0;          /* low word: wraps like the engine's int64 sum */
+        int64_t  hi  = 0;          /* high word of the exact 128-bit sum */
+        int64_t nn = 0;
         bool any_null = false;
         for (int64_t i = s; i < e; i++) {
             if (ray_vec_is_null(v, i)) { any_null = true; continue; }
@@ -613,6 +621,15 @@ static ray_err_t chunk_zone_scan_int(ray_t* v, ray_index_t* ix,
             }
             if (val < mn) mn = val;
             if (val > mx) mx = val;
+            ray_i128_add(&hi, &sum, val);
+            nn++;
+        }
+        if (ix->u.chunk_zone.aggs) {
+            int64_t* ag = (int64_t*)ray_data(ix->u.chunk_zone.aggs);
+            ag[g] = (int64_t)sum;
+            ag[n_chunks + g] = nn;
+            if (ix->u.chunk_zone.aggs->len >= 3 * (int64_t)n_chunks)
+                ag[2 * (int64_t)n_chunks + g] = hi;
         }
         /* Empty (all-null) chunks keep mn=INT64_MAX / mx=INT64_MIN so
          * the reduce path's min(mins[*]) / max(maxs[*]) ignores them. */
@@ -809,6 +826,13 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2) {
     ix->u.chunk_zone.mins      = mins;
     ix->u.chunk_zone.maxs      = maxs;
     ix->u.chunk_zone.null_bits = nbits;
+    if (!ix->u.chunk_zone.is_f64) {
+        /* [sum low words | non-null counts | sum high words], one per chunk */
+        ray_t* aggs = ray_vec_new(RAY_I64, 3 * (int64_t)n_chunks);
+        if (!aggs || RAY_IS_ERR(aggs)) { ray_release(idx); return ray_error("oom", "chunk_zone: aggs alloc"); }
+        aggs->len = 3 * (int64_t)n_chunks;
+        ix->u.chunk_zone.aggs = aggs;
+    }
 
     ray_err_t err = chunk_zone_scan(v, ix);
     if (err != RAY_OK) {
@@ -859,6 +883,13 @@ ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2) {
     ix->u.chunk_zone.mins      = mins;
     ix->u.chunk_zone.maxs      = maxs;
     ix->u.chunk_zone.null_bits = nbits;
+    if (!ix->u.chunk_zone.is_f64) {
+        /* [sum low words | non-null counts | sum high words], one per chunk */
+        ray_t* aggs = ray_vec_new(RAY_I64, 3 * (int64_t)n_chunks);
+        if (!aggs || RAY_IS_ERR(aggs)) { ray_release(idx); return ray_error("oom", "chunk_zone: aggs alloc"); }
+        aggs->len = 3 * (int64_t)n_chunks;
+        ix->u.chunk_zone.aggs = aggs;
+    }
 
     ray_err_t err = chunk_zone_scan(v, ix);
     if (err != RAY_OK) {
@@ -982,7 +1013,11 @@ static int idx_child_slots(ray_index_t* ix, ray_t** slots[4]) {
     case RAY_IDX_CHUNK_ZONE:
         slots[n++] = &ix->u.chunk_zone.mins;
         slots[n++] = &ix->u.chunk_zone.maxs;
-        slots[n++] = &ix->u.chunk_zone.null_bits; break;
+        slots[n++] = &ix->u.chunk_zone.null_bits;
+        /* 4th slot added after the first on-disk generation: older regions
+         * hold zero there (the payload is zeroed at alloc), which maps to
+         * NULL — no aggregates, nothing else changes. */
+        slots[n++] = &ix->u.chunk_zone.aggs; break;
     case RAY_IDX_PART:
         slots[n++] = &ix->u.part.keys; slots[n++] = &ix->u.part.starts;
         slots[n++] = &ix->u.part.lens; break;
@@ -1055,7 +1090,9 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
  * points at the start of the index region within the column's file mapping.
  * Returns NULL for a stale layout generation or a payload-size mismatch —
  * the caller loads the column unindexed (the index is rebuildable). */
-ray_t* ray_index_inline_map(uint8_t* region) {
+ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
+    int64_t head = IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t));
+    if (region_size < head) return NULL;
     ray_t* idx = (ray_t*)region;
     if (idx->order != RAY_IDX_FORMAT_MAJOR) return NULL;
     if (idx->len != (int64_t)sizeof(ray_index_t)) return NULL;
@@ -1064,8 +1101,34 @@ ray_t* ray_index_inline_map(uint8_t* region) {
     int nch = idx_child_slots(ix, slots);
     for (int i = 0; i < nch; i++) {
         int64_t o = (int64_t)(intptr_t)(*slots[i]);
-        *slots[i] = o ? (ray_t*)(region + o) : NULL;
+        ray_t* c = NULL;
+        /* A child must lie inside the region: a region re-saved by a
+         * binary that knows fewer child slots keeps a stale offset in a
+         * slot it did not write. */
+        if (o >= head && o <= region_size - 32) {
+            ray_t* cand = (ray_t*)(region + o);
+            int64_t esz = ray_elem_size(cand->type);
+            if (cand->len >= 0 && esz > 0 &&
+                cand->len <= (region_size - o - 32) / esz)
+                c = cand;
+        }
+        if (o && !c) {
+            /* The chunk-zone aggregates are optional; any other child out
+             * of bounds means the region cannot be trusted. */
+            if (ix->kind == RAY_IDX_CHUNK_ZONE && slots[i] == &ix->u.chunk_zone.aggs) {
+                *slots[i] = NULL;
+                continue;
+            }
+            return NULL;
+        }
+        *slots[i] = c;
     }
+    /* two layouts: [lo | nn] (2 per chunk) and [lo | nn | hi] (3 per chunk) */
+    if (ix->kind == RAY_IDX_CHUNK_ZONE && ix->u.chunk_zone.aggs &&
+        (ix->u.chunk_zone.aggs->type != RAY_I64 || ix->u.chunk_zone.is_f64 ||
+         (ix->u.chunk_zone.aggs->len != 2 * (int64_t)ix->u.chunk_zone.n_chunks &&
+          ix->u.chunk_zone.aggs->len != 3 * (int64_t)ix->u.chunk_zone.n_chunks)))
+        ix->u.chunk_zone.aggs = NULL;
     ix->markers |= RAY_MARK_MMAP;
     idx->mmod = 1;
     return idx;
@@ -2930,7 +2993,12 @@ ray_t* ray_index_drop(ray_t** vp) {
      * ray_alloc_copy (rc>1).  Don't clobber the snapshot in that case —
      * the other holder still reads it.  See vec_drop_index_inplace for
      * the same pattern. */
-    bool shared = ray_atomic_load(&idx->rc) > 1;
+    /* A mapped index (mmod 1) rides the column file's mapping: copies of
+     * the column borrow it without a reference, and the mapping's owner
+     * unmaps it.  Dropping it from a vector only detaches it — the
+     * snapshot stays for the other holders and nothing is released. */
+    bool mapped = idx->mmod == 1;
+    bool shared = mapped || ray_atomic_load(&idx->rc) > 1;
     if (shared) {
         ray_index_retain_saved(ix);
     }
@@ -2946,7 +3014,7 @@ ray_t* ray_index_drop(ray_t** vp) {
 
     /* Release the index.  Per-kind children are released by the RAY_INDEX
      * branch of ray_release_owned_refs (added in heap.c). */
-    ray_release(idx);
+    if (!mapped) ray_release(idx);
     return v;
 }
 

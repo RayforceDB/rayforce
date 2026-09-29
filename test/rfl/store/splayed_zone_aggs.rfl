@@ -1,0 +1,70 @@
+;; Whole-table aggregates over a splayed table answered from the chunk-zone
+;; metadata (per-chunk min/max, per-chunk sums and non-null counts): every
+;; answer must equal the same query over an in-memory copy of the data,
+;; nulls and types included.  Four chunks of 64k rows.
+(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0
+(set n 200000)
+(set i (til n))
+(set M (table [a16 a32 a64 big d f] (list (as 'I16 (% i 3000)) (as 'I32 (- (% (* i 7) 100000) 50000)) (- i 100000) (* (- i 100000) 92233720368547) (as 'DATE (% i 900)) (/ (as 'F64 i) 7.0))))
+(.csv.write M "rf_test_zone_aggs.csv") -- 0
+;; blank the first field of every row whose a16 value ends in 0: nulls
+(.sys.exec "sed -i.bak 's/^\\([0-9]*\\)0,/,/' rf_test_zone_aggs.csv") -- 0
+(set T (.csv.splayed [a16 a32 a64 big d f] [I16 I32 I64 I64 DATE F64] "rf_test_zone_aggs.csv" "rf_test_zone_aggs/"))
+(set Tm (.csv.read [a16 a32 a64 big d f] [I16 I32 I64 I64 DATE F64] "rf_test_zone_aggs.csv"))
+(at (.idx.info (at T 'a16)) 'kind) -- 'chunk_zone
+(set q (fn [t] (select {from: t s16: (sum a16) c: (count a16) av: (avg a16) s32: (sum a32) av32: (avg a32) s64: (sum a64) av64: (avg a64) mn: (min d) mx: (max d) m16: (min a16) x32: (max a32)})))
+(set R (q T))
+(set O (q Tm))
+(cols R) -- (cols O)
+(all (map (fn [c] (== (at (at R c) 0) (at (at O c) 0))) (cols R))) -- true
+(all (map (fn [c] (== (type (at R c)) (type (at O c)))) (cols R))) -- true
+;; the pinned values
+(at (at R 's16) 0) -- (sum (at Tm 'a16))
+(at (at R 'mn) 0) -- 2000.01.01
+(at (at R 'c) 0) -- 200000
+;; sums past double's integer range: the metadata keeps the exact 128-bit
+;; per-chunk sums and the row-wise reduction accumulates the same way, so
+;; avg agrees bit for bit; a float column and a filter take the usual path
+(at (select {from: T a: (avg big)}) 'a) -- (at (select {from: Tm a: (avg big)}) 'a)
+(avg (at T 'big)) -- (avg (at Tm 'big))
+(at (select {from: T a: (sum a16) b: (sum f)}) 'b) -- (at (select {from: Tm a: (sum a16) b: (sum f)}) 'b)
+(at (select {from: T a: (sum a16) where: (> a32 0)}) 'a) -- (at (select {from: Tm a: (sum a16) where: (> a32 0)}) 'a)
+;; scalar forms read the same metadata
+(sum (at T 'a32)) -- (sum (at Tm 'a32))
+(avg (at T 'a16)) -- (avg (at Tm 'a16))
+;; editing a copy of a loaded column drops the copy's index; the loaded
+;; column's own metadata stays intact and still answers
+(set U (delete {from: T where: (== a64 5)}))
+(set w (at T 'a32))
+(alter 'w set 0 7)
+(at (select {from: T m: (min a32) x: (max a32) s: (sum a32)}) 's) -- (at (select {from: Tm m: (min a32) x: (max a32) s: (sum a32)}) 's)
+(at (select {from: T m: (min a32)}) 'm) -- (at (select {from: Tm m: (min a32)}) 'm)
+;; a column whose every value is the int64 maximum is not "all null"
+(.sys.exec "rm -rf rf_test_zone_max") -- 0
+(.db.splayed.set "rf_test_zone_max/" (table [m] (list (take [9223372036854775807] 70000))))
+(set TX (.db.splayed.get "rf_test_zone_max/"))
+(at (select {from: TX a: (min m) b: (max m)}) 'a) -- [9223372036854775807]
+(min (at TX 'm)) -- 9223372036854775807
+(.sys.exec "rm -rf rf_test_zone_max") -- 0
+;; the exact mean of values that overflow int64 within every chunk:
+;; alternating +(2^63-1-i) / -(2^63-1-i) pairs sum to exactly one per pair,
+;; and a column of 2^62 averages to exactly 2^62 — from the metadata, from
+;; the row-wise reduction, and from a parted copy
+(.sys.exec "rm -rf rf_test_zone_huge") -- 0
+(set hn 150000)
+(set hi (til hn))
+(set hv (* (- (* 2 (% hi 2)) 1) (- 9223372036854775807 hi)))
+(set hc (take [4611686018427387904] hn))
+(.db.splayed.set "rf_test_zone_huge/" (table [hv hc] (list hv hc)))
+(set TH (.db.splayed.get "rf_test_zone_huge/"))
+(set THm (table [hv hc] (list hv hc)))
+(at (select {from: TH a: (avg hv) b: (avg hc)}) 'a) -- [-0.5]
+(at (select {from: TH a: (avg hv) b: (avg hc)}) 'b) -- [4611686018427387904.0]
+(avg hv) -- -0.5
+(avg (at TH 'hv)) -- -0.5
+(avg (at TH 'hc)) -- 4611686018427387904.0
+(at (select {from: TH a: (avg hv) where: (>= hi 0)}) 'a) -- (at (select {from: THm a: (avg hv) where: (>= hi 0)}) 'a)
+(.sys.exec "rm -rf rf_test_zone_huge") -- 0
+;; an empty table keeps the planner's answers
+(at (select {from: (select {from: T where: (< a64 -1000000)}) c: (count a16)}) 'c) -- (at (select {from: (select {from: Tm where: (< a64 -1000000)}) c: (count a16)}) 'c)
+(.sys.exec "rm -rf rf_test_zone_aggs rf_test_zone_aggs.csv rf_test_zone_aggs.csv.bak") -- 0

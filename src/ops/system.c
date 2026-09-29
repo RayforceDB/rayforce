@@ -680,6 +680,7 @@ static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) 
         OBJSIZE_PUSH(ix->u.chunk_zone.mins);
         OBJSIZE_PUSH(ix->u.chunk_zone.maxs);
         OBJSIZE_PUSH(ix->u.chunk_zone.null_bits);
+        OBJSIZE_PUSH(ix->u.chunk_zone.aggs);
         break;
     case RAY_IDX_PART:
         OBJSIZE_PUSH(ix->u.part.keys); OBJSIZE_PUSH(ix->u.part.starts);
