@@ -1,0 +1,59 @@
+;; Fused filter + positional take (src/ops/fused_topk.c, ray_fused_take_select).
+;;
+;; `(select {cols from: T where: pred take: K})` with no ordering answers
+;; with the first K passing rows (K > 0) or the last |K| (K < 0) in table
+;; order, and stops scanning once they are known.  `asc: key take: K` on a
+;; column marked sorted (no nulls) goes the same way.  The table spans
+;; many scan chunks so the per-worker lists and the cutoff are exercised;
+;; every answer is known by construction (x = row, c = x mod 1000).
+
+(set N 1000000)
+(set X (til N))
+(set TK (table [x c s] (list X (% X 1000) (.attr.set 'sorted (til N)))))
+
+;; first K passing rows
+(at (select {x: x from: TK where: (== c 7) take: 10}) 'x) -- [7 1007 2007 3007 4007 5007 6007 7007 8007 9007]
+;; last |K| passing rows, in table order
+(at (select {x: x from: TK where: (== c 7) take: -10}) 'x) -- [990007 991007 992007 993007 994007 995007 996007 997007 998007 999007]
+;; AND predicate
+(at (select {x: x from: TK where: (and (== c 7) (> x 500000)) take: 3}) 'x) -- [500007 501007 502007]
+(at (select {x: x from: TK where: (and (== c 7) (< x 500000)) take: -2}) 'x) -- [498007 499007]
+;; fewer passing rows than K, and none
+(at (select {x: x from: TK where: (and (== c 7) (< x 3000)) take: 10}) 'x) -- [7 1007 2007]
+(count (select {x: x from: TK where: (> x 5000000) take: 10})) -- 0
+;; all columns, aliased column
+(count (select {from: TK where: (== c 7) take: 4})) -- 4
+(at (select {y: x from: TK where: (== c 7) take: 2}) 'y) -- [7 1007]
+;; K beyond one worker's chunk of matches: identical to filter-then-take
+(set FA (at (select {x: x from: TK where: (== c 7) take: 700}) 'x))
+(set FB (take (at (select {x: x from: TK where: (== c 7)}) 'x) 700))
+(count FA) -- 700
+(sum (as 'I64 (== FA FB))) -- 700
+(set LA (at (select {x: x from: TK where: (== c 7) take: -700}) 'x))
+(set LB (take (at (select {x: x from: TK where: (== c 7)}) 'x) -700))
+(sum (as 'I64 (== LA LB))) -- 700
+;; ascending take on a sorted key column = first K passing rows
+(at (select {x: x from: TK where: (== c 7) asc: s take: 5}) 'x) -- [7 1007 2007 3007 4007]
+;; the same key without the sorted marker still orders correctly
+(at (select {x: x from: TK where: (== c 7) asc: x take: 3}) 'x) -- [7 1007 2007]
+;; descending take on the sorted column stays on the ordered path
+(at (select {x: x from: TK where: (== c 7) desc: s take: 3}) 'x) -- [999007 998007 997007]
+;; a value written with alter set can break a `sorted` marker's order: the
+;; marker is cleared, and the ascending take orders by value again
+(set sv (.attr.set 'sorted (til 10)))
+(alter 'sv set 8 -3)
+(set TS (table [x s c] (list (til 10) sv (% (til 10) 2))))
+(at (select {x: x from: TS where: (== c 0) asc: s take: 2}) 'x) -- [8 0]
+;; a take given as an expression is evaluated once
+(set tcnt 0)
+(count (select {x: x from: TK where: (== c 7) take: (do (set tcnt (+ tcnt 1)) 9)})) -- 9
+tcnt -- 1
+;; projections resolve left to right: an output that names an earlier
+;; output's alias reads that output's value, not the source column — the
+;; fused paths gather source columns and leave such a shape to the planner
+(set TA (table [a b c] (list [3 1 2 4] [30 10 20 40] [0 0 0 0])))
+(at (select {b: a z: b from: TA where: (== c 0) take: 2}) 'z) -- [3 1]
+(at (select {b: a z: b from: TA where: (== c 0) take: -2}) 'z) -- [2 4]
+(at (select {b: a z: b from: TA where: (== c 0) asc: a take: 2}) 'z) -- [1 2]
+(at (select {b: a z: b from: TA asc: a take: 2}) 'z) -- [1 2]
+(at (select {b: b z: b from: TA where: (== c 0) take: 2}) 'z) -- [30 10]

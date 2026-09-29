@@ -1,0 +1,60 @@
+;; A select that sorts by a source column it does not output.  The key is
+;; carried through the projection for the sort and dropped from the result;
+;; before, the sort looked the key up in the projected table and failed with
+;; `nyi` (only the fused top-k shapes, which read the source table, worked).
+(set T (table [a b c s] (list (til 100) (% (til 100) 7) (reverse (til 100)) (as 'SYMBOL (map (fn [i] (format "x%" (% i 13))) (til 100))))))
+
+;; plain sort, no filter, no take
+(take (at (select {a: a from: T asc: c}) 'a) 5) -- [99 98 97 96 95]
+(cols (select {a: a from: T asc: c})) -- ['a]
+(count (select {a: a from: T asc: c})) -- 100
+;; a filter the fused path does not take, with and without take
+(at (select {a: a from: T where: (> (+ b 1) 3) asc: c take: 3}) 'a) -- [97 96 95]
+(cols (select {a: a from: T where: (> (+ b 1) 3) asc: c take: 3})) -- ['a]
+(take (at (select {a: a from: T where: (> (+ b 1) 3) desc: c}) 'a) 4) -- [3 4 5 6]
+(at (select {a: a from: T where: (in s ['x1 'x2]) desc: c take: 3}) 'a) -- [1 2 14]
+;; two keys, neither projected
+(at (select {a: a from: T where: (> (+ b 1) 3) asc: [b c] take: 4}) 'a) -- [94 87 80 73]
+;; a computed output alongside
+(at (select {a: a d: (+ a 1) from: T where: (> b 2) desc: c take: 2}) 'd) -- [4 5]
+(cols (select {a: a d: (+ a 1) from: T where: (> b 2) desc: c take: 2})) -- ['a 'd]
+;; a key that is also an output is not duplicated
+(cols (select {a: a c: c from: T asc: c take: 2})) -- ['a 'c]
+(at (select {a: a c: c from: T asc: c take: 2}) 'c) -- [0 1]
+;; an output that renames the key column: the sort reads that output (the
+;; key binds to the projected column that scans it), nothing extra is
+;; added or dropped
+(at (select {b: a from: T asc: a}) 'b) -- (til 100)
+(take (at (select {b: a from: T desc: a}) 'b) 3) -- [99 98 97]
+(take (at (select {b: a from: T where: (> (+ b 1) 3) desc: a}) 'b) 3) -- [97 96 95]
+(select {x: c y: a from: T desc: a take: [1 2]}) -- (table [x y] (list [1 2] [98 97]))
+
+;; Sort keys name SOURCE columns, never output aliases: `b: a asc: b` sorts
+;; by the source b (hidden, since no output scans it) and returns a under
+;; the name b; a computed output under the key's name changes nothing
+(set HB (table [a b] (list [3 1 2] [0 2 1])))
+(at (select {b: a from: HB asc: b}) 'b) -- [3 2 1]
+(cols (select {b: a from: HB asc: b})) -- ['b]
+(at (select {b: a from: HB desc: b take: 2}) 'b) -- [1 2]
+(at (select {b: (+ a 1) from: HB asc: b}) 'b) -- [4 3 2]
+(at (select {c: b from: HB asc: b}) 'c) -- [0 1 2]
+;; the key binds to the projected column by position, so a hidden key whose
+;; name collides with the projection's internal name for a computed output
+;; (`_e<i>`) still sorts by the source column — with and without take, one
+;; and two keys, either direction
+(set HC (table [a _e0 _e1] (list [3 1 2 5 4] [0 2 1 4 3] [1 1 0 0 1])))
+(at (select {z: (+ a 10) from: HC asc: _e0}) 'z) -- [13 12 11 14 15]
+(cols (select {z: (+ a 10) from: HC asc: _e0})) -- ['z]
+(at (select {z: (+ a 10) from: HC asc: _e0 take: 3}) 'z) -- [13 12 11]
+(at (select {z: (+ a 10) from: HC asc: [_e1 _e0]}) 'z) -- [12 15 13 11 14]
+(at (select {z: (+ a 10) from: HC asc: [_e1 _e0] take: 3}) 'z) -- [12 15 13]
+(at (select {z: (+ a 10) w: (* a 2) from: HC desc: _e1 asc: _e0}) 'z) -- [13 11 14 12 15]
+(at (select {z: (+ a 10) w: (* a 2) from: HC desc: _e1 asc: _e0 take: 2}) 'w) -- [6 2]
+;; more hidden keys than the former fixed capacity of 16
+(set i (til 1000))
+(set T17 (table [a k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12 k13 k14 k15 k16] (list i (- 0 (% (* i 3) 5)) (- 0 (% (* i 4) 5)) (- 0 (% (* i 5) 5)) (- 0 (% (* i 6) 5)) (- 0 (% (* i 7) 5)) (- 0 (% (* i 8) 5)) (- 0 (% (* i 9) 5)) (- 0 (% (* i 10) 5)) (- 0 (% (* i 11) 5)) (- 0 (% (* i 12) 5)) (- 0 (% (* i 13) 5)) (- 0 (% (* i 14) 5)) (- 0 (% (* i 15) 5)) (- 0 (% (* i 16) 5)) (- 0 (% (* i 17) 5)) (- 0 (% (* i 18) 5)) (- 0 (% (* i 19) 5)))))
+(set R17 (select {z: (+ a 10) from: T17 asc: [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12 k13 k14 k15 k16]}))
+(set M17 (select {z: (+ a 10) k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8 k9: k9 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16 from: T17 asc: [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12 k13 k14 k15 k16]}))
+(cols R17) -- ['z]
+(at R17 'z) -- (at M17 'z)
+(at (select {z: (+ a 10) from: T17 asc: [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12 k13 k14 k15 k16] take: 5}) 'z) -- (take (at M17 'z) 5)
