@@ -384,11 +384,16 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
 }
 
 /* Scan physical rows [row, end): eval predicate per morsel, heap-insert
- * the passing rows.  `*hnp` is the worker's heap fill on entry and exit. */
+ * the passing rows.  `*hnp` is the worker's heap fill on entry and exit.
+ * `chunk` >= 0 is the zone chunk the rows belong to: the bound may tighten
+ * while the chunk is being scanned (another worker's heap filled, or this
+ * one's), so it is re-tested before every morsel — one relaxed load and a
+ * compare — and the rest of the chunk is abandoned once it cannot beat it. */
 static inline void fpk_scan_rows(fpk_par_ctx_t* c, int64_t* hidx, int32_t* hnp,
-                                 int32_t k, int64_t row, int64_t end) {
+                                 int32_t k, int64_t row, int64_t end, int64_t chunk) {
     int32_t hn = *hnp;
     while (row < end) {
+        if (chunk >= 0 && fpk_chunk_pruned(c, chunk)) break;
         int64_t mend = row + RAY_MORSEL_ELEMS;
         if (mend > end) mend = end;
         int64_t mlen = mend - row;
@@ -426,7 +431,7 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
     int32_t  hn   = c->heap_n[worker_id];
 
     if (!c->zmin) {
-        fpk_scan_rows(c, hidx, &hn, k, start, end);
+        fpk_scan_rows(c, hidx, &hn, k, start, end, -1);
     } else {
         int64_t span = (int64_t)1 << c->zlog2;
         int64_t v = start;
@@ -440,7 +445,7 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
                 int64_t p0 = (g << c->zlog2) + (v - sbeg);
                 int64_t p1 = (g << c->zlog2) + (send - sbeg);
                 if (p1 > c->nrows) p1 = c->nrows;
-                if (p0 < p1) fpk_scan_rows(c, hidx, &hn, k, p0, p1);
+                if (p0 < p1) fpk_scan_rows(c, hidx, &hn, k, p0, p1, g);
             }
             v = send;
         }
