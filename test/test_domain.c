@@ -39,6 +39,9 @@
 #include "table/domain.h"
 #include "store/col.h"
 #include "store/serde.h"
+#include "core/pool.h"   /* the batch intern probes on the pool */
+#include "ops/hash.h"    /* ray_hash_bytes: batch intern takes prehashed entries */
+#include "mem/sys.h"
 #include "ops/ops.h"   /* RAY_PARTED_BASE (parted-flatten adoption test) */
 #include <string.h>
 #include <stdio.h>
@@ -396,6 +399,108 @@ static test_result_t test_domain_open_basic(void) {
     TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "file_new", 8), new_pos);
     ray_sym_domain_release(re);
 
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* ray_sym_domain_intern_batch: one batch with repeats spread over the hash
+ * partitions, half the vocabulary already interned one by one.  Every
+ * entry resolves to the position find() reports, repeats agree, the
+ * pre-interned half keeps its positions, the count grows by exactly the
+ * new distinct strings, a second identical batch changes nothing and ""
+ * is position 0. */
+static test_result_t test_domain_intern_batch(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    TEST_ASSERT_NOT_NULL(ray_pool_get());   /* parallel probe path */
+
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+
+    enum { NV = 20000, NB = 60000, SL = 16 };
+    char*        vocab  = (char*)ray_sys_alloc((size_t)NV * SL);
+    int64_t*     pre    = (int64_t*)ray_sys_alloc((size_t)NV * sizeof(int64_t));
+    int64_t*     seen   = (int64_t*)ray_sys_alloc((size_t)NV * sizeof(int64_t));
+    const char** strs   = (const char**)ray_sys_alloc((size_t)NB * sizeof(char*));
+    size_t*      lens   = (size_t*)ray_sys_alloc((size_t)NB * sizeof(size_t));
+    uint32_t*    hashes = (uint32_t*)ray_sys_alloc((size_t)NB * sizeof(uint32_t));
+    int64_t*     pos    = (int64_t*)ray_sys_alloc((size_t)NB * sizeof(int64_t));
+    int64_t*     pos2   = (int64_t*)ray_sys_alloc((size_t)NB * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(vocab); TEST_ASSERT_NOT_NULL(pre); TEST_ASSERT_NOT_NULL(seen);
+    TEST_ASSERT_NOT_NULL(strs); TEST_ASSERT_NOT_NULL(lens); TEST_ASSERT_NOT_NULL(hashes);
+    TEST_ASSERT_NOT_NULL(pos); TEST_ASSERT_NOT_NULL(pos2);
+
+    for (int v = 0; v < NV; v++) {
+        snprintf(vocab + (size_t)v * SL, SL, "v%05d_%c", v, 'a' + v % 26);
+        seen[v] = -1;
+        pre[v] = -1;
+    }
+    for (int v = 0; v < NV / 2; v++) {
+        const char* sv = vocab + (size_t)v * SL;
+        pre[v] = ray_sym_domain_intern(dom, sv, strlen(sv));
+        TEST_ASSERT(pre[v] > 0, "pre-intern gets a position");
+    }
+    int64_t count_before = ray_sym_domain_count(dom);
+    TEST_ASSERT_EQ_I(count_before, NV / 2 + 1);   /* + reserved "" */
+
+    for (int j = 0; j < NB; j++) {
+        int v = (int)(((int64_t)j * 7919) % NV);   /* every string ~3 times */
+        const char* sv = vocab + (size_t)v * SL;
+        strs[j] = sv;
+        lens[j] = strlen(sv);
+        hashes[j] = (uint32_t)ray_hash_bytes(sv, lens[j]);
+        pos[j] = -7;
+    }
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, NB, strs, lens, hashes, pos));
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), NV + 1);
+
+    for (int j = 0; j < NB; j++) {
+        int v = (int)(((int64_t)j * 7919) % NV);
+        TEST_ASSERT(pos[j] > 0 && pos[j] <= NV, "position in range, never 0");
+        if (seen[v] < 0) seen[v] = pos[j];
+        TEST_ASSERT_EQ_I(pos[j], seen[v]);                        /* repeats agree */
+        if (pre[v] >= 0) TEST_ASSERT_EQ_I(pos[j], pre[v]);        /* hits keep their position */
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[j], lens[j]), pos[j]);
+        ray_t* a = ray_sym_domain_str(dom, pos[j]);
+        TEST_ASSERT_NOT_NULL(a);
+        TEST_ASSERT_EQ_U(ray_str_len(a), lens[j]);
+        TEST_ASSERT_MEM_EQ(lens[j], ray_str_ptr(a), strs[j]);
+    }
+    /* distinct positions: every vocabulary entry got exactly one */
+    for (int v = 0; v < NV; v++) TEST_ASSERT(seen[v] > 0, "every string appeared");
+
+    /* the same batch again: all hits, nothing appended */
+    for (int j = 0; j < NB; j++) pos2[j] = -7;
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, NB, strs, lens, hashes, pos2));
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), NV + 1);
+    for (int j = 0; j < NB; j++) TEST_ASSERT_EQ_I(pos2[j], pos[j]);
+
+    /* "" resolves to the reserved position 0; a fresh string still appends */
+    {
+        const char* two[2] = { "", "brand_new_entry" };
+        size_t tl[2] = { 0, strlen("brand_new_entry") };
+        uint32_t th[2] = { (uint32_t)ray_hash_bytes("", 0), (uint32_t)ray_hash_bytes(two[1], tl[1]) };
+        int64_t tp[2] = { -7, -7 };
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, 2, two, tl, th, tp));
+        TEST_ASSERT_EQ_I(tp[0], 0);
+        TEST_ASSERT_EQ_I(tp[1], NV + 1);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), NV + 2);
+    }
+
+    /* the flushed file reopens with the same vocabulary */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    ray_sym_domain_release(dom);
+    ray_sym_domain_t* re = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(re), NV + 2);
+    for (int j = 0; j < NB; j += 997)
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(re, strs[j], lens[j]), pos[j]);
+    ray_sym_domain_release(re);
+
+    ray_sys_free(vocab); ray_sys_free(pre); ray_sys_free(seen);
+    ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hashes);
+    ray_sys_free(pos); ray_sys_free(pos2);
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
     PASS();
@@ -1804,6 +1909,47 @@ static test_result_t test_domain_runtime_lut(void) {
     PASS();
 }
 
+static test_result_t test_domain_concat_text_nulls(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    /* Fixture includes the builtin vocabulary, so its positions need W16. */
+    const uint8_t widths[] = {RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64};
+    for (int w = 0; w < 3; w++) {
+        ray_t* file = ray_sym_vec_new(widths[w], 4);
+        ray_sym_domain_release(file->sym_domain);
+        ray_sym_domain_retain(dom);
+        file->sym_domain = dom;
+        file->len = 4;
+        const int64_t vals[] = {pos_b, pos_a, 0, pos_b};
+        for (int i = 0; i < 4; i++) ray_write_sym(ray_data(file), i, vals[i], RAY_SYM, file->attrs);
+        int64_t ids[] = {0, ray_sym_intern("dq_b", 4)};
+        ray_t* runtime = ray_vec_from_raw(RAY_SYM, ids, 2);
+        ray_t* slice = ray_vec_slice(file, 1, 2);
+        for (int side = 0; side < 2; side++) {
+            ray_t* out = ray_vec_concat(side ? runtime : slice, side ? slice : runtime);
+            TEST_ASSERT_NOT_NULL(out);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+            TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out), ray_sym_runtime_domain());
+            TEST_ASSERT_EQ_I(out->attrs & RAY_SYM_W_MASK, RAY_SYM_W64);
+            TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
+            TEST_ASSERT_FALSE(out->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX));
+            int64_t expected[] = {ray_sym_intern("dq_a", 4), 0, 0, ids[1]};
+            for (int i = 0; i < 4; i++) {
+                int64_t value = expected[(i + (side ? 2 : 0)) % 4];
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[i], value);
+                TEST_ASSERT_EQ_I(ray_vec_is_null(out, i), value == 0);
+            }
+            ray_release(out);
+        }
+        ray_release(slice); ray_release(file); ray_release(runtime);
+    }
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 #define TMP_DOM_BADSYM_PATH "/tmp/rayforce_test_domain_badsym"
 
 /* Position-0 reservation: ray_sym_save-produced files carry "" at
@@ -1986,8 +2132,10 @@ const test_entry_t domain_entries[] = {
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
+    { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
+    { "domain/intern_batch",            test_domain_intern_batch,            domain_setup, domain_teardown },
     { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

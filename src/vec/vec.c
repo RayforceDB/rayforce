@@ -102,7 +102,12 @@ static inline void vec_drop_index_inplace(ray_t* v) {
     if (!(v->attrs & RAY_ATTR_HAS_INDEX)) return;
     ray_t* idx = v->index;
     ray_index_t* ix = ray_index_payload(idx);
-    bool shared = ray_atomic_load(&idx->rc) > 1;
+    /* A mapped index (mmod 1) rides the column file's mapping: copies of
+     * the column borrow it without a reference, and the mapping's owner
+     * unmaps it.  Dropping it from a vector only detaches it — the
+     * snapshot stays for the other holders and nothing is released. */
+    bool mapped = idx->mmod == 1;
+    bool shared = mapped || ray_atomic_load(&idx->rc) > 1;
 
     if (shared) {
         /* Take our own retained references to the saved-pointer slots
@@ -120,7 +125,7 @@ static inline void vec_drop_index_inplace(ray_t* v) {
         ix->saved_attrs = 0;
     }
     v->attrs &= (uint8_t)~RAY_ATTR_HAS_INDEX;
-    ray_release(idx);
+    if (!mapped) ray_release(idx);
 }
 
 /* --------------------------------------------------------------------------
@@ -515,22 +520,11 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
             }
         }
 
-        /* Propagate null bitmaps from a and b.
-         * Slices don't carry RAY_ATTR_HAS_NULLS — check RAY_ATTR_SLICE too. */
-        if (ray_vec_may_have_nulls(a) ||
-            ray_vec_may_have_nulls(b)) {
-            for (int64_t i = 0; i < a->len; i++) {
-                if (ray_vec_is_null((ray_t*)a, i)) {
-                    ray_err_t err = ray_vec_set_null_checked(result, i, true);
-                    if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), NULL); }
-                }
-            }
-            for (int64_t i = 0; i < b->len; i++) {
-                if (ray_vec_is_null((ray_t*)b, i)) {
-                    ray_err_t err = ray_vec_set_null_checked(result, a->len + i, true);
-                    if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), NULL); }
-                }
-            }
+        /* Canonical empty payloads were copied above; only the null hint
+         * remains. Scan payloads (including slices), not input hint bits. */
+        if (ray_vec_text_has_nulls(a) || ray_vec_text_has_nulls(b)) {
+            vec_drop_index_inplace(result);
+            result->attrs |= RAY_ATTR_HAS_NULLS;
         }
 
         return result;
@@ -650,10 +644,15 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
                (size_t)b->len * esz);
     }
 
-    /* Propagate null bitmaps from a and b.
-     * Slices don't carry RAY_ATTR_HAS_NULLS — check RAY_ATTR_SLICE too. */
-    if (ray_vec_may_have_nulls(a) ||
-        ray_vec_may_have_nulls(b)) {
+    /* SYM's zero id survives copying, widening and domain translation.
+     * Numeric sentinels retain their existing propagation path below. */
+    if (result->type == RAY_SYM) {
+        if (ray_vec_text_has_nulls(a) || ray_vec_text_has_nulls(b)) {
+            vec_drop_index_inplace(result);
+            result->attrs |= RAY_ATTR_HAS_NULLS;
+        }
+    } else if (ray_vec_may_have_nulls(a) ||
+               ray_vec_may_have_nulls(b)) {
         for (int64_t i = 0; i < a->len; i++) {
             if (ray_vec_is_null((ray_t*)a, i)) {
                 ray_err_t err = ray_vec_set_null_checked(result, i, true);

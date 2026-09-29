@@ -198,7 +198,8 @@ ray_t* ray_log_validate_fn(ray_t* path) {
 }
 
 ray_t* ray_log_roll_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".log.roll takes no arguments");
     if (!ray_journal_is_open())
         return ray_error("domain", ".log.roll: no journal open");
     return err_to_ray(ray_journal_roll(), "io");
@@ -227,6 +228,7 @@ ray_t* ray_log_close_fn(ray_t** args, int64_t n) {
  * argument; acts on the journal .log.open/.write/.close target.  Errors
  * with `domain` when no journal base is known (none ever opened). */
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".log.purge takes no arguments");
     return err_to_ray(ray_journal_purge(), "io");
 }

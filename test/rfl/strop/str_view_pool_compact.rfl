@@ -1,0 +1,78 @@
+;; A STR result that is a view into another vector's pool keeps only the
+;; bytes it points at: an `if` that kept a few rows of two big columns, or a
+;; substring of a few bytes, must not hold (or copy) the whole parent pools.
+;; direct-bytes counts the big (32 MB and up) pool allocations, so a result
+;; that pins or copies a whole parent pool shows up there and one that keeps
+;; its few bytes does not.
+(set N 500000)
+(set i (til N))
+(set S (as 'STR (map (fn [k] (format "https://host%.example.org/path/%/page?id=%" (% k 500) k (* k 13))) i)))
+(set S2 (as 'STR (map (fn [k] (format "second-pool-string-%-%" k (* k 7))) i)))
+(set st (+ 1 (% i 50)))
+(set c (< (% i 7) 3))
+(set T (table [S S2 st c] (list S S2 st c)))
+(set direct (fn [] (do (.sys.gc) (at (.sys.mem) 'direct-bytes))))
+(set base (direct))
+(>= base 33554432) -- true
+;; if over two pools under a where: keeping one row in fifty
+(set R (select {from: T x: (if c S S2) where: (== st 1)}))
+(count R) -- 10000
+(< (- (direct) base) 1000000) -- true
+(all (== (at R 'x) (at (select {from: T x: (if c S S2) where: (== st 1)}) 'x))) -- true
+(all (map (fn [j] (== (at (at R 'x) j) (if (at c (* j 50)) (at S (* j 50)) (at S2 (* j 50))))) (til 200))) -- true
+(set R 0)
+;; a filter that keeps most rows: the same values whichever arm ran
+(set R (select {from: T x: (if c S S2) where: (> st 10)}))
+(count R) -- 400000
+(all (== (at R 'x) (at (at (select {from: T x: (if c S S2)}) 'x) (where (> st 10))))) -- true
+(set R 0)
+;; the same over two substring views
+(set R (select {from: T x: (if c (substr S 2 30) (substr S2 2 30)) where: (== st 1)}))
+(< (- (direct) base) 1000000) -- true
+(at (at R 'x) 0) -- "ttps://host0.example.org/path/"
+(set R 0)
+;; a pooled scalar side under a where
+(set R (select {from: T x: (if c S "a-rather-long-literal-string") where: (== st 1)}))
+(< (- (direct) base) 1000000) -- true
+(set R 0)
+;; a per-row condition over two whole columns with no filter (two cheap STR
+;; branches take the eager arm, which picks descriptors over one pass): the
+;; result holds less than the two parent pools together
+(set R (select {from: T x: (if c S S2)}))
+(set grow (- (direct) base))
+(< grow 40000000) -- true
+(all (map (fn [j] (== (at (at R 'x) j) (if (at c j) (at S j) (at S2 j)))) (til 20000))) -- true
+(set R 0)
+;; the eager arm: a scalar condition (a variable, not a column) is not a
+;; row mask, so the selected path declines and the eager fill runs over two
+;; different pools.  It builds a pool of the chosen side's bytes only, and
+;; the result keeps its values after every source is released — at 500k rows
+;; (the fill runs on the worker pool) and at 1000 rows (below the parallel
+;; threshold, serial fill)
+(set pick true)
+(set RE (select {from: T x: (if pick S S2)}))
+(set grow (- (direct) base))
+(< grow 40000000) -- true
+(set pick false)
+(set RF (select {from: T x: (if pick S S2)}))
+(set Ts (take T 1000))
+(set pick true)
+(set RS (select {from: Ts x: (if pick S S2)}))
+(set pick false)
+(set RS2 (select {from: Ts x: (if pick S S2)}))
+;; a substring of three bytes is inline everywhere: no pool at all, so the
+;; result outlives the table without holding its bytes
+(set R (select {from: T x: (substr S st 3)}))
+(set T 0) (set S 0) (set S2 0) (set i 0) (set st 0) (set c 0) (set Ts 0)
+;; the eager results still read their strings, every row checked
+(set ix (til 500000))
+(all (== (at RE 'x) (as 'STR (map (fn [k] (format "https://host%.example.org/path/%/page?id=%" (% k 500) k (* k 13))) ix)))) -- true
+(all (== (at RF 'x) (as 'STR (map (fn [k] (format "second-pool-string-%-%" k (* k 7))) ix)))) -- true
+(all (== (at RS 'x) (as 'STR (map (fn [k] (format "https://host%.example.org/path/%/page?id=%" (% k 500) k (* k 13))) (til 1000))))) -- true
+(all (== (at RS2 'x) (as 'STR (map (fn [k] (format "second-pool-string-%-%" k (* k 7))) (til 1000))))) -- true
+;; each eager result holds one side's bytes, not both parents' pools
+(set RE 0) (set RS 0) (set RS2 0)
+(< (direct) 40000000) -- true
+(set RF 0)
+(< (direct) 1000000) -- true
+(count R) -- 500000

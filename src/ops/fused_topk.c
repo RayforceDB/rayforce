@@ -47,8 +47,10 @@
 #include "ops/internal.h"
 #include "lang/internal.h"
 #include "core/pool.h"
+#include "ops/idxop.h"      /* chunk-zone extrema: skip chunks that cannot enter the top-K */
 
 #include <string.h>
+#include <stdatomic.h>
 
 /* Use the same predicate-shape detector as fused_group.  Single comparison
  * or AND of comparisons against literals on flat int/temporal/SYM columns. */
@@ -127,7 +129,117 @@ typedef struct {
     ray_t**        sym_strings;
     uint32_t       sym_count;
     _Atomic(uint32_t) oom;
+    /* Chunk pruning on the first sort key (integer / temporal column with a
+     * chunk-zone index): zmin/zmax per 1<<zlog2 rows, znull chunk null
+     * bits.  `bound` is the best worst-key any full worker heap holds —
+     * the final K-th key is at least as good — so a chunk whose extremum
+     * cannot beat it is skipped without evaluating the predicate. */
+    const int64_t* zmin;
+    const int64_t* zmax;
+    const uint8_t* znull;
+    uint32_t       zn;
+    uint8_t        zlog2;
+    uint8_t        zdesc;
+    uint8_t        znulls_better;   /* nulls sort ahead of values */
+    /* Best-chunk-first visiting order: zorder[v] is the chunk to scan in
+     * virtual slot v (chunks sorted by the extremum that matters for the
+     * direction, null chunks first when nulls sort ahead).  Workers are
+     * dispatched over the virtual row space zn << zlog2 and map each slot
+     * back to its chunk, so the K-th key tightens on the most promising
+     * chunks first and the rest are pruned — whatever the physical order
+     * of the data.  NULL when there is no zone index. */
+    const uint32_t* zorder;
+    int64_t        nrows;
+    /* written by every worker with a full heap: own cache line, away from
+     * the read-only zone pointers above */
+    _Alignas(64) _Atomic(int64_t) bound;
+    _Atomic(uint8_t) bound_set;
 } fpk_par_ctx_t;
+
+static inline int64_t fpk_key_i64(const fpk_keyspec_t* ks, int64_t row) {
+    switch (ks->esz) {
+    case 1: return (int64_t)((const uint8_t*)ks->base)[row];
+    case 2: return (int64_t)((const int16_t*)ks->base)[row];
+    case 4: return (int64_t)((const int32_t*)ks->base)[row];
+    default: return ((const int64_t*)ks->base)[row];
+    }
+}
+
+/* A full heap's worst row publishes its first key as a pruning bound. */
+static void fpk_publish_bound(fpk_par_ctx_t* c, int64_t worst_row) {
+    if (!c->zmin) return;
+    const fpk_keyspec_t* ks = &c->keys[0];
+    if (ks->has_nulls && ray_vec_is_null(ks->col, worst_row)) return;
+    int64_t v = fpk_key_i64(ks, worst_row);
+    int64_t cur = atomic_load_explicit(&c->bound, memory_order_relaxed);
+    bool set = atomic_load_explicit(&c->bound_set, memory_order_relaxed);
+    for (;;) {
+        bool better = !set || (c->zdesc ? v > cur : v < cur);
+        if (!better) return;
+        if (atomic_compare_exchange_weak_explicit(&c->bound, &cur, v,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&c->bound_set, 1, memory_order_release);
+            return;
+        }
+        set = true;
+    }
+}
+
+/* Chunk `g` cannot hold a row that beats the bound. */
+static inline bool fpk_chunk_pruned(const fpk_par_ctx_t* c, int64_t g) {
+    if (!atomic_load_explicit(&c->bound_set, memory_order_acquire)) return false;
+    if (g < 0 || g >= (int64_t)c->zn) return false;
+    if (c->znulls_better && c->znull && (c->znull[g >> 3] & (1u << (g & 7)))) return false;
+    int64_t b = atomic_load_explicit(&c->bound, memory_order_relaxed);
+    return c->zdesc ? c->zmax[g] < b : c->zmin[g] > b;
+}
+
+/* Chunk `a` is more promising than chunk `b` for the first key's
+ * direction: null chunks lead when nulls sort ahead, then the smaller
+ * minimum (asc) or the larger maximum (desc); ties keep chunk order. */
+static inline bool fpk_chunk_better(const fpk_par_ctx_t* c, uint32_t a, uint32_t b) {
+    if (c->znulls_better && c->znull) {
+        bool na = (c->znull[a >> 3] >> (a & 7)) & 1;
+        bool nb = (c->znull[b >> 3] >> (b & 7)) & 1;
+        if (na != nb) return na;
+    }
+    int64_t ka = c->zdesc ? c->zmax[a] : c->zmin[a];
+    int64_t kb = c->zdesc ? c->zmax[b] : c->zmin[b];
+    if (ka != kb) return c->zdesc ? ka > kb : ka < kb;
+    return a < b;
+}
+
+/* Heap-sort the chunk ids in `ord` (initially 0..n-1) best first. */
+static void fpk_order_chunks(const fpk_par_ctx_t* c, uint32_t* ord, uint32_t n) {
+    /* max-heap on "worse": the root is the least promising chunk, so
+     * popping it to the tail leaves the best chunk at ord[0]. */
+    for (uint32_t i = n; i-- > 0;) {
+        /* sift ord[i] down */
+        uint32_t k = i;
+        for (;;) {
+            uint32_t l = 2 * k + 1, r = l + 1, w = k;
+            if (l < n && fpk_chunk_better(c, ord[w], ord[l])) w = l;
+            if (r < n && fpk_chunk_better(c, ord[w], ord[r])) w = r;
+            if (w == k) break;
+            uint32_t t = ord[k]; ord[k] = ord[w]; ord[w] = t;
+            k = w;
+        }
+        if (i == 0) break;
+    }
+    for (uint32_t end = n; end > 1;) {
+        end--;
+        uint32_t t = ord[0]; ord[0] = ord[end]; ord[end] = t;
+        uint32_t k = 0;
+        for (;;) {
+            uint32_t l = 2 * k + 1, r = l + 1, w = k;
+            if (l < end && fpk_chunk_better(c, ord[w], ord[l])) w = l;
+            if (r < end && fpk_chunk_better(c, ord[w], ord[r])) w = r;
+            if (w == k) break;
+            uint32_t u = ord[k]; ord[k] = ord[w]; ord[w] = u;
+            k = w;
+        }
+    }
+}
 
 /* Compare two source rows by the multi-key sort spec.  Returns
  * "a is worse than b" sense: positive means evict-a-first in the
@@ -271,17 +383,17 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
         fpk_sift_down(c, heap, n, i);
 }
 
-/* Worker fn: scan rows [start, end), eval predicate per morsel, do
- * heap inserts for passing rows. */
-static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
-    fpk_par_ctx_t* c = (fpk_par_ctx_t*)raw;
-    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
-    int32_t  k    = (int32_t)c->k;
-    int64_t* hidx = &c->heap_idx[(size_t)worker_id * (size_t)k];
-    int32_t  hn   = c->heap_n[worker_id];
-
-    int64_t row = start;
+/* Scan physical rows [row, end): eval predicate per morsel, heap-insert
+ * the passing rows.  `*hnp` is the worker's heap fill on entry and exit.
+ * `chunk` >= 0 is the zone chunk the rows belong to: the bound may tighten
+ * while the chunk is being scanned (another worker's heap filled, or this
+ * one's), so it is re-tested before every morsel — one relaxed load and a
+ * compare — and the rest of the chunk is abandoned once it cannot beat it. */
+static inline void fpk_scan_rows(fpk_par_ctx_t* c, int64_t* hidx, int32_t* hnp,
+                                 int32_t k, int64_t row, int64_t end, int64_t chunk) {
+    int32_t hn = *hnp;
     while (row < end) {
+        if (chunk >= 0 && fpk_chunk_pruned(c, chunk)) break;
         int64_t mend = row + RAY_MORSEL_ELEMS;
         if (mend > end) mend = end;
         int64_t mlen = mend - row;
@@ -301,7 +413,42 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
                 fpk_sift_down(c, hidx, k, 0);
             }
         }
+        /* Once per morsel: publishing on every heap replacement contends
+         * on the bound when the rows arrive in the order being sought. */
+        if (hn == k) fpk_publish_bound(c, hidx[0]);
         row = mend;
+    }
+    *hnp = hn;
+}
+
+/* Worker fn: [start, end) is a range of physical rows, or — with a zone
+ * order — of virtual rows whose chunk slots map to physical chunks. */
+static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    fpk_par_ctx_t* c = (fpk_par_ctx_t*)raw;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+    int32_t  k    = (int32_t)c->k;
+    int64_t* hidx = &c->heap_idx[(size_t)worker_id * (size_t)k];
+    int32_t  hn   = c->heap_n[worker_id];
+
+    if (!c->zmin) {
+        fpk_scan_rows(c, hidx, &hn, k, start, end, -1);
+    } else {
+        int64_t span = (int64_t)1 << c->zlog2;
+        int64_t v = start;
+        while (v < end) {
+            int64_t slot = v >> c->zlog2;
+            int64_t sbeg = slot << c->zlog2;
+            int64_t send = sbeg + span;
+            if (send > end) send = end;
+            int64_t g = c->zorder ? (int64_t)c->zorder[slot] : slot;
+            if (!fpk_chunk_pruned(c, g)) {
+                int64_t p0 = (g << c->zlog2) + (v - sbeg);
+                int64_t p1 = (g << c->zlog2) + (send - sbeg);
+                if (p1 > c->nrows) p1 = c->nrows;
+                if (p0 < p1) fpk_scan_rows(c, hidx, &hn, k, p0, p1, g);
+            }
+            v = send;
+        }
     }
     c->heap_n[worker_id] = hn;
 }
@@ -378,6 +525,28 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ctx.n_keys = n_sort_keys;
     ctx.k      = k;
     ctx.tbl    = tbl;
+    ctx.nrows  = nrows;
+    {
+        ray_t* kc = ctx.keys[0].col;
+        int8_t kt = ctx.keys[0].type;
+        if ((kt == RAY_I16 || kt == RAY_I32 || kt == RAY_I64 || kt == RAY_DATE ||
+             kt == RAY_TIME || kt == RAY_TIMESTAMP) &&
+            ray_index_kind(kc) == RAY_IDX_CHUNK_ZONE) {
+            ray_index_t* zx = ray_index_payload(kc->index);
+            if (zx->built_for_len == kc->len && !zx->u.chunk_zone.is_f64 &&
+                zx->u.chunk_zone.mins && zx->u.chunk_zone.maxs && zx->u.chunk_zone.null_bits) {
+                ctx.zmin  = (const int64_t*)ray_data(zx->u.chunk_zone.mins);
+                ctx.zmax  = (const int64_t*)ray_data(zx->u.chunk_zone.maxs);
+                ctx.znull = (const uint8_t*)ray_data(zx->u.chunk_zone.null_bits);
+                ctx.zn    = zx->u.chunk_zone.n_chunks;
+                ctx.zlog2 = zx->u.chunk_zone.chunk_log2;
+                ctx.zdesc = ctx.keys[0].desc;
+                ctx.znulls_better = ctx.keys[0].nulls_first;
+                if (((int64_t)ctx.zn << ctx.zlog2) < nrows)
+                    ctx.zmin = NULL; /* index shorter than the column: no pruning */
+            }
+        }
+    }
 
     /* Compile the predicate via a temp graph just for the WHERE clause.  No
      * where: is a predicate with no children — every row passes — and the
@@ -419,8 +588,24 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         return NULL;
     }
 
-    if (pool) ray_pool_dispatch(pool, fpk_par_fn, &ctx, nrows);
-    else      fpk_par_fn(&ctx, 0, 0, nrows);
+    /* With a zone index the workers walk the chunks best-first over the
+     * virtual row space (the order is optional: without it the slots map
+     * to the physical chunks and pruning still applies). */
+    int64_t span_rows = nrows;
+    ray_t*  zord_hdr  = NULL;
+    if (ctx.zmin) {
+        span_rows = (int64_t)ctx.zn << ctx.zlog2;
+        uint32_t* ord = (uint32_t*)scratch_alloc(&zord_hdr,
+                                                 (size_t)ctx.zn * sizeof(uint32_t));
+        if (ord) {
+            for (uint32_t g = 0; g < ctx.zn; g++) ord[g] = g;
+            fpk_order_chunks(&ctx, ord, ctx.zn);
+            ctx.zorder = ord;
+        }
+    }
+    if (pool) ray_pool_dispatch(pool, fpk_par_fn, &ctx, span_rows);
+    else      fpk_par_fn(&ctx, 0, 0, span_rows);
+    if (zord_hdr) { scratch_free(zord_hdr); ctx.zorder = NULL; }
 
     if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
         scratch_free(idx_hdr); scratch_free(hn_hdr);
@@ -474,6 +659,212 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ray_t* src = ray_table_get_col(tbl, cs);
         if (!src) { build_ok = 0; break; }
         ray_t* col = gather_by_idx(src, global_idx, global_n);
+        if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
+        result = ray_table_add_col(result, alias, col);
+        ray_release(col);
+    }
+    ray_graph_free(g);
+    fp_pred_cleanup(&ctx.pred);
+    if (!build_ok) {
+        ray_release(result);
+        return ray_error("schema", NULL);
+    }
+    return result;
+}
+
+/* ───── Fused filter + positional take ────────────────────────────────
+ * Chunks of FTK_CHUNK_ROWS rows, numbered from the end the answer comes
+ * from (row 0 for the first K, the last row for the last |K|), one pool
+ * task per chunk in that order — the workers sweep the table from that
+ * end together.  Each worker appends passing rows to its own list until
+ * it holds |K|; those |K| bound the answer, so it publishes the |K|-th
+ * row as the cutoff: no row beyond it can be among the first |K| passing
+ * rows of the table, and every later chunk returns at once.  The lists
+ * are merged by row id at the end and the |K| nearest the scanned end
+ * are gathered.
+ * ──────────────────────────────────────────────────────────────────── */
+
+#define FTK_CHUNK_ROWS (64 * 1024)
+
+typedef struct {
+    fp_pred_t         pred;
+    int64_t           nrows;
+    int64_t           k;         /* |K| */
+    bool              from_end;
+    int64_t*          rows;      /* [nw * k] per-worker row ids, in scan order */
+    int32_t*          rows_n;    /* [nw] */
+    _Atomic(int64_t)  cutoff;    /* forward: rows >= cutoff are out; backward: rows <= cutoff */
+} ftk_ctx_t;
+
+static inline bool ftk_beyond(const ftk_ctx_t* c, int64_t row) {
+    int64_t cut = atomic_load_explicit(&c->cutoff, memory_order_relaxed);
+    return c->from_end ? row <= cut : row >= cut;
+}
+
+static void ftk_publish(ftk_ctx_t* c, int64_t row) {
+    int64_t cur = atomic_load_explicit(&c->cutoff, memory_order_relaxed);
+    for (;;) {
+        bool tighter = c->from_end ? row > cur : row < cur;
+        if (!tighter) return;
+        if (atomic_compare_exchange_weak_explicit(&c->cutoff, &cur, row,
+                memory_order_relaxed, memory_order_relaxed))
+            return;
+    }
+}
+
+static void ftk_task_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)end;
+    ftk_ctx_t* c = (ftk_ctx_t*)raw;
+    int32_t  k  = (int32_t)c->k;
+    int64_t* my = &c->rows[(size_t)worker_id * (size_t)k];
+    int32_t  n  = c->rows_n[worker_id];
+    if (n >= k) return;                       /* this worker's list is complete */
+
+    /* chunk `start` counted from the scanned end */
+    int64_t lo, hi;
+    if (!c->from_end) {
+        lo = start * FTK_CHUNK_ROWS;
+        hi = lo + FTK_CHUNK_ROWS;
+        if (hi > c->nrows) hi = c->nrows;
+    } else {
+        hi = c->nrows - start * FTK_CHUNK_ROWS;
+        lo = hi - FTK_CHUNK_ROWS;
+        if (lo < 0) lo = 0;
+    }
+    if (ftk_beyond(c, c->from_end ? hi - 1 : lo)) return;
+
+    uint8_t bits[RAY_MORSEL_ELEMS];
+    if (!c->from_end) {
+        for (int64_t row = lo; row < hi && n < k; ) {
+            if (ftk_beyond(c, row)) break;
+            int64_t mend = row + RAY_MORSEL_ELEMS;
+            if (mend > hi) mend = hi;
+            fp_eval_pred(&c->pred, row, mend, bits);
+            for (int64_t r = 0; r < mend - row && n < k; r++)
+                if (bits[r]) my[n++] = row + r;
+            row = mend;
+        }
+    } else {
+        for (int64_t mend = hi; mend > lo && n < k; ) {
+            if (ftk_beyond(c, mend - 1)) break;
+            int64_t row = mend - RAY_MORSEL_ELEMS;
+            if (row < lo) row = lo;
+            fp_eval_pred(&c->pred, row, mend, bits);
+            for (int64_t r = mend - row - 1; r >= 0 && n < k; r--)
+                if (bits[r]) my[n++] = row + r;
+            mend = row;
+        }
+    }
+    c->rows_n[worker_id] = n;
+    if (n >= k) ftk_publish(c, my[k - 1]);
+}
+
+ray_t* ray_fused_take_select(ray_t* tbl,
+                             ray_t* where_expr,
+                             int64_t k,
+                             const int64_t* out_col_syms,
+                             const int64_t* out_alias_syms,
+                             uint32_t n_out)
+{
+    if (!tbl || tbl->type != RAY_TABLE || !where_expr || k == 0 || n_out == 0) return NULL;
+    if (k == INT64_MIN) return NULL;
+    bool from_end = k < 0;
+    if (from_end) k = -k;
+    if (k > FPK_MAX_K) return NULL;
+    int64_t nrows = ray_table_nrows(tbl);
+    if (nrows <= 0 || k >= nrows) return NULL;
+
+    for (uint32_t c = 0; c < n_out; c++) {
+        ray_t* col = ray_table_get_col(tbl, out_col_syms[c]);
+        if (!col) return NULL;
+        int8_t ot = col->type;
+        if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON) return NULL;
+        if (!ray_is_vec(col)) return NULL;
+    }
+
+    ftk_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.nrows = nrows;
+    ctx.k = k;
+    ctx.from_end = from_end;
+    atomic_store_explicit(&ctx.cutoff, from_end ? -1 : INT64_MAX, memory_order_relaxed);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
+    if (!pred_dag) { ray_graph_free(g); return NULL; }
+    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return NULL;
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+    ray_t* rows_hdr = NULL;
+    ray_t* n_hdr    = NULL;
+    ctx.rows   = (int64_t*)scratch_alloc(&rows_hdr, (size_t)nw * (size_t)k * sizeof(int64_t));
+    ctx.rows_n = (int32_t*)scratch_calloc(&n_hdr, (size_t)nw * sizeof(int32_t));
+    if (!ctx.rows || !ctx.rows_n) {
+        if (rows_hdr) scratch_free(rows_hdr);
+        if (n_hdr) scratch_free(n_hdr);
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return NULL;
+    }
+
+    int64_t n_chunks = (nrows + FTK_CHUNK_ROWS - 1) / FTK_CHUNK_ROWS;
+    if (ray_pool_par_dispatch_ok(pool, n_chunks, 2))
+        ray_pool_dispatch_n(pool, ftk_task_fn, &ctx, (uint32_t)n_chunks);
+    else
+        for (int64_t t = 0; t < n_chunks; t++) ftk_task_fn(&ctx, 0, t, t + 1);
+
+    /* Merge: each list is in scan order; pick the row nearest the scanned
+     * end across lists k times, then present in table order. */
+    int64_t out[FPK_MAX_K];
+    int32_t out_n = 0;
+    ray_t* pos_hdr = NULL;
+    int32_t* pos = (int32_t*)scratch_calloc(&pos_hdr, (size_t)nw * sizeof(int32_t));
+    if (!pos) {
+        scratch_free(rows_hdr); scratch_free(n_hdr);
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return NULL;
+    }
+    while (out_n < (int32_t)k) {
+        int64_t best = -1;
+        uint32_t bw = 0;
+        for (uint32_t w = 0; w < nw; w++) {
+            if (pos[w] >= ctx.rows_n[w]) continue;
+            int64_t r = ctx.rows[(size_t)w * (size_t)k + (size_t)pos[w]];
+            if (best < 0 || (from_end ? r > best : r < best)) { best = r; bw = w; }
+        }
+        if (best < 0) break;
+        pos[bw]++;
+        out[out_n++] = best;
+    }
+    scratch_free(pos_hdr);
+    scratch_free(rows_hdr);
+    scratch_free(n_hdr);
+    if (from_end) {
+        for (int32_t i = 0, j = out_n - 1; i < j; i++, j--) {
+            int64_t t = out[i]; out[i] = out[j]; out[j] = t;
+        }
+    }
+
+    ray_t* result = ray_table_new(n_out);
+    if (!result || RAY_IS_ERR(result)) {
+        fp_pred_cleanup(&ctx.pred);
+        ray_graph_free(g);
+        return result ? result : ray_error("oom", NULL);
+    }
+    int build_ok = 1;
+    for (uint32_t c = 0; c < n_out; c++) {
+        int64_t cs    = out_col_syms[c];
+        int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
+        ray_t* src = ray_table_get_col(tbl, cs);
+        if (!src) { build_ok = 0; break; }
+        ray_t* col = gather_by_idx(src, out, out_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
         ray_release(col);

@@ -3572,6 +3572,26 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
     return result;
 }
 
+/* The column of `tbl` a scan sort key reads.  When the sort runs directly
+ * over a SELECT and the key is one of that SELECT's columns, bind by
+ * POSITION: the projection names scans by their source column and
+ * expressions `_e<c>`, so a hidden key or a renamed output can share a
+ * name with another projected column and a name lookup would read the
+ * wrong one.  Any other key resolves by name.  Borrowed. */
+static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                uint32_t key_id, int64_t key_sym) {
+    ray_op_t* child = g ? op_child(g, op, 0) : NULL;
+    if (child && child->opcode == OP_SELECT) {
+        ray_op_ext_t* se = find_ext(g, child->id);
+        if (se && se->base.opcode == OP_SELECT &&
+            (int64_t)se->sort.n_cols == ray_table_ncols(tbl))
+            for (uint32_t c = 0; c < se->sort.n_cols; c++)
+                if (se->sort.columns[c] == key_id)
+                    return ray_table_get_col_idx(tbl, c);
+    }
+    return ray_table_get_col(tbl, key_sym);
+}
+
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
@@ -3603,7 +3623,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
             ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
             ray_op_ext_t* key_ext = find_ext(g, key_op->id);
             if (key_ext && key_ext->base.opcode == OP_SCAN) {
-                key_cols[k] = ray_table_get_col(tbl, key_ext->sym);
+                key_cols[k] = sort_key_scan_col(g, op, tbl, key_op->id, key_ext->sym);
                 if (!key_cols[k]) { all_scan = 0; break; }
             } else {
                 all_scan = 0;
@@ -3655,7 +3675,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
         ray_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
-            sort_vecs[k] = ray_table_get_col(tbl, key_ext->sym);
+            sort_vecs[k] = sort_key_scan_col(g, op, tbl, key_op->id, key_ext->sym);
         } else {
             ray_t* saved = g->table;
             g->table = tbl;

@@ -809,8 +809,8 @@ extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
-#define EXPR_MAX_REGS 16
-#define EXPR_MAX_INS  48
+#define EXPR_MAX_REGS 32
+#define EXPR_MAX_INS  96
 #define EXPR_MORSEL   RAY_MORSEL_ELEMS
 
 typedef struct {
@@ -837,6 +837,8 @@ typedef struct {
         uint8_t     col_attrs;  /* column attrs — RAY_SYM width (REG_SCAN only) */
         bool        is_parted;  /* true if this SCAN refs a parted column */
         bool        nullable;   /* lanes may contain NULL_I64 / NaN */
+        bool        null_src;   /* that nullability traces to a nullable column
+                                 * (else: only op-generated sentinels) */
         const void* data;       /* column data pointer (REG_SCAN only) */
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
@@ -1603,6 +1605,9 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
 
 /* ── pivot_exec.c ── */
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op);
+
+/* Is a descriptor view worth rebuilding over its own bytes (string.c)? */
+bool ray_str_view_should_compact(uint64_t pooled_bytes, int64_t pool_len);
 
 /* Shared-node memo around a sub-evaluation over a swapped g->table
  * (exec.c): push sets the outer memo aside and arms one for the current

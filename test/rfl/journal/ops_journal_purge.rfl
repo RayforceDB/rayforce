@@ -41,6 +41,7 @@
 
 ;; State was reset: a second purge has no base to act on -> domain error.
 (.log.purge) !- domain
+(.log.purge 1) !- arity
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 2. The issue #279 workflow: open, write, close, then purge WITHOUT

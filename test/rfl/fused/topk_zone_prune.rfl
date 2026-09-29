@@ -1,0 +1,68 @@
+;; Fused top-k over a stored column with a chunk-zone index skips chunks
+;; whose extremum cannot beat the current K-th key.  The time column here
+;; runs in two long ascending blocks (like a table sorted by (counter,
+;; time)), so most chunks are prunable; every answer must equal the same
+;; query over an unindexed in-memory copy, for asc/desc, two keys, K near
+;; the number of matches, and a nullable key (below).
+(.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
+(set n 600000)
+(set i (til n))
+(set t (+ 1000000 (* 7 (% i 300000))))
+(set s (as 'SYMBOL (map (fn [j] (if (== 0 (% j 3)) "" (format "p%" (% j 101)))) i)))
+(set v (% (* i 13) 1000))
+(.csv.write (table [t s v] (list t s v)) "rf_test_zprune.csv") -- 0
+(set T (.csv.splayed [t s v] [I64 SYM I64] "rf_test_zprune.csv" "rf_test_zprune/"))
+(set Tm (.csv.read [t s v] [I64 SYM I64] "rf_test_zprune.csv"))
+(at (.idx.info (at T 't)) 'kind) -- 'chunk_zone
+(set eqt (fn [a b] (all (map (fn [c] (all (== (as 'STR (at a c)) (as 'STR (at b c))))) (cols a)))))
+(set q1 (fn [x] (select {s: s t: t v: v from: x where: (!= s "") asc: t take: 10})))
+(set q2 (fn [x] (select {s: s t: t from: x where: (!= s "") asc: [t s] take: 10})))
+(set q3 (fn [x] (select {v: v t: t from: x where: (> v 500) desc: t take: 7})))
+(set q4 (fn [x] (select {v: v t: t from: x where: (> v 990) asc: t take: 50})))
+(set q5 (fn [x] (select {v: v t: t from: x where: (== v 3) asc: t take: 700})))
+(eqt (q1 T) (q1 Tm)) -- true
+(eqt (q2 T) (q2 Tm)) -- true
+(eqt (q3 T) (q3 Tm)) -- true
+(eqt (q4 T) (q4 Tm)) -- true
+(eqt (q5 T) (q5 Tm)) -- true
+(at (q1 T) 't) -- [1000007 1000007 1000014 1000014 1000028 1000028 1000035 1000035 1000049 1000049]
+;; a nullable key: one chunk entirely null and every 1000th row null —
+;; nulls sort first under asc (their chunks are never skipped) and last
+;; under desc
+(.sys.exec "rm -rf rf_test_zprune_n") -- 0
+(set kn (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N (+ 5 (% j 300000)))) i)))
+(.db.splayed.set "rf_test_zprune_n/" (table [kn v] (list kn v)))
+(set TN (.db.splayed.get "rf_test_zprune_n/"))
+(set TNm (table [kn v] (list kn v)))
+(set qn1 (fn [x] (select {kn: kn v: v from: x where: (> v 100) asc: kn take: 20})))
+(set qn2 (fn [x] (select {kn: kn v: v from: x where: (> v 100) desc: kn take: 20})))
+(set qn3 (fn [x] (select {kn: kn v: v from: x where: (== v 7) asc: [kn v] take: 5})))
+(eqt (qn1 TN) (qn1 TNm)) -- true
+(eqt (qn2 TN) (qn2 TNm)) -- true
+(eqt (qn3 TN) (qn3 TNm)) -- true
+(.sys.exec "rm -rf rf_test_zprune_n") -- 0
+(.sys.exec "rm -rf rf_test_zprune rf_test_zprune.csv") -- 0
+;; best-chunk-first: the chunks are visited in the order of their zone
+;; extremum, so an `asc` over a descending column (its best chunk is the
+;; last one) and a key whose best chunk sits in the middle prune the rest
+;; whatever the physical order; answers equal the in-memory copy and the
+;; planner's full sort
+(.sys.exec "rm -rf rf_test_zprune_o") -- 0
+(set kd (- n i))
+(set km (abs (- i 300000)))
+(.db.splayed.set "rf_test_zprune_o/" (table [kd km v] (list kd km v)))
+(set TO (.db.splayed.get "rf_test_zprune_o/"))
+(set TOm (table [kd km v] (list kd km v)))
+(set qo1 (fn [x] (select {kd: kd v: v from: x asc: kd take: 8000})))
+(set qo2 (fn [x] (select {kd: kd v: v from: x where: (> v 500) asc: kd take: 100})))
+(set qo3 (fn [x] (select {km: km v: v from: x where: (< v 900) asc: km take: 300})))
+(set qo4 (fn [x] (select {km: km v: v from: x desc: km take: 5})))
+(set qo5 (fn [x] (select {km: km kd: kd from: x where: (== v 7) asc: [km kd] take: 40})))
+(eqt (qo1 TO) (qo1 TOm)) -- true
+(eqt (qo2 TO) (qo2 TOm)) -- true
+(eqt (qo3 TO) (qo3 TOm)) -- true
+(eqt (qo4 TO) (qo4 TOm)) -- true
+(eqt (qo5 TO) (qo5 TOm)) -- true
+(at (qo1 TO) 'kd) -- (+ 1 (til 8000))
+(at (qo4 TO) 'km) -- [300000 299999 299999 299998 299998]
+(.sys.exec "rm -rf rf_test_zprune_o") -- 0
