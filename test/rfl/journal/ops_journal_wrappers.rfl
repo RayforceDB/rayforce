@@ -54,6 +54,7 @@
 ;;    closed → err_to_ray RAY_OK arm → null.
 ;; ════════════════════════════════════════════════════════════════════════
 (.log.roll)      !- domain
+(.log.roll 1)    !- arity
 (.log.snapshot)  !- domain
 (nil? (.log.sync))  -- true
 (nil? (.log.close)) -- true
