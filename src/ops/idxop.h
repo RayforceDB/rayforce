@@ -277,11 +277,40 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
  * compute an index for persistence without COWing a shared column. */
 ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
 
+/* 128-bit two's-complement accumulation of int64 values: (hi, lo) += v.
+ * The engine's integer avg sums this way — exact for any column, and the
+ * same bits whatever the morsel split — and the chunk-zone metadata keeps
+ * the per-chunk (hi, lo) so it can answer the same value. */
+static inline void ray_i128_add(int64_t* hi, uint64_t* lo, int64_t v) {
+    uint64_t l = *lo + (uint64_t)v;
+    *hi += (v < 0 ? -1 : 0) + (l < (uint64_t)v ? 1 : 0);
+    *lo = l;
+}
+static inline void ray_i128_add128(int64_t* hi, uint64_t* lo, int64_t vhi, uint64_t vlo) {
+    uint64_t l = *lo + vlo;
+    *hi += vhi + (l < vlo ? 1 : 0);
+    *lo = l;
+}
+/* Double nearest the 128-bit value (hi, lo): the magnitude is converted
+ * (high word scaled by 2^64 plus the low word) and the sign reapplied, so
+ * a small negative total is not lost in 2^64 - |s|.  One formula
+ * everywhere so every path agrees bit for bit. */
+static inline double ray_i128_to_f64(int64_t hi, uint64_t lo) {
+    bool neg = hi < 0;
+    uint64_t h = (uint64_t)hi, l = lo;
+    if (neg) { l = ~l + 1u; h = ~h + (l == 0 ? 1u : 0u); }
+    double d = (double)h * 18446744073709551616.0 + (double)l;
+    return neg ? -d : d;
+}
+
 /* Whole-column sum (int64 wraparound) and non-null count of an integer
  * column from its chunk-zone per-chunk aggregates; false when the column
- * carries none for its current length.  exact_f64 (optional): whether the
- * sum is exactly what a double accumulation of the rows gives. */
-bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out, bool* exact_f64);
+ * carries none for its current length. */
+bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out);
+/* The exact 128-bit sum (hi, lo) and non-null count from the same
+ * metadata: true when the per-chunk high words are stored, or when no
+ * partial sum can wrap int64 (then the wrapped sum is the exact one). */
+bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* nn_out);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).

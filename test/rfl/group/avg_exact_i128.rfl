@@ -1,0 +1,139 @@
+;; avg of an integer column divides the EXACT 128-bit sum in every group
+;; engine: keyless, dense/hash/radix keyed (v2), the float-key legacy hash
+;; path, the small-table serial finishes, the slice-indexed path, pivot,
+;; nullable inputs and a splayed copy — all the same bits as (avg vec).
+;; SUM keeps its int64 wraparound contract next to the exact mean.
+;; A column of 2^62 averages to exactly 2^62; alternating +(2^63-1-i) /
+;; -(2^63-1-i) pairs sum to exactly -1 per pair, so their mean is -0.5
+;; whenever a group holds whole pairs (keys derive from (div d 2)).
+(set n 70000)
+(set d (til n))
+(set hc (take [4611686018427387904] n))
+(set hv (* (- (* 2 (% d 2)) 1) (- 9223372036854775807 d)))
+(set p (div d 2))
+(set k3 (% p 3))
+(set f3 (as 'F64 k3))
+(set k350 (% p 350))
+(set ksp (* (% p 350) 1000003))
+(set k35k (% p 35000))
+(set T (table [c v d k3 f3 k350 ksp k35k] (list hc hv d k3 f3 k350 ksp k35k)))
+(set E 4611686018427387904.0)
+(set allE (fn [x] (== (count x) (sum (== x E)))))
+(set allH (fn [x] (== (count x) (sum (== x -0.5)))))
+;; the bare column
+(avg hc) -- 4611686018427387904.0
+(avg hv) -- -0.5
+;; keyless select: one agg, a where, two aggs over one column (sum stays wrapped)
+(at (select {from: T b: (avg c)}) 'b) -- [4611686018427387904.0]
+(at (select {from: T b: (avg v)}) 'b) -- [-0.5]
+(== (first (at (select {from: T b: (avg v)}) 'b)) (avg hv)) -- true
+(== (first (at (select {from: T b: (avg c)}) 'b)) (avg hc)) -- true
+(at (select {from: T where: (>= d 2) b: (avg v)}) 'b) -- [-0.5]
+(at (select {from: T where: (>= d 2) b: (avg c)}) 'b) -- [4611686018427387904.0]
+(at (select {from: T b: (avg c) s: (sum c)}) 'b) -- [4611686018427387904.0]
+(at (select {from: T b: (avg v) s: (sum v)}) 'b) -- [-0.5]
+(at (select {from: T b: (avg v) s: (sum v)}) 's) -- [-35000]
+(at (select {from: T b: (avg c) m: (max c)}) 'b) -- [4611686018427387904.0]
+;; few groups (dense), 350 groups, 35000 groups of two rows (each group's
+;; own total overflows int64), sparse keys, a where, two keys
+(allE (at (select {from: T by: k3 b: (avg c)}) 'b)) -- true
+(allH (at (select {from: T by: k3 b: (avg v)}) 'b)) -- true
+(allH (at (select {from: T by: k350 b: (avg v)}) 'b)) -- true
+(count (select {from: T by: k35k b: (avg c)})) -- 35000
+(allE (at (select {from: T by: k35k b: (avg c)}) 'b)) -- true
+(allH (at (select {from: T by: k35k b: (avg v)}) 'b)) -- true
+(allH (at (select {from: T by: ksp b: (avg v)}) 'b)) -- true
+(allE (at (select {from: T by: ksp b: (avg c) s: (sum c)}) 'b)) -- true
+(allH (at (select {from: T where: (>= d 2) by: k3 b: (avg v)}) 'b)) -- true
+(allH (at (select {from: T by: {a: k3 b: k350} m: (avg v)}) 'm)) -- true
+;; avg exact while sum of the same column wraps (23334, 23334, 23332 rows of 2^62)
+(at (select {from: T by: k3 asc: k3 b: (avg c) s: (sum c)}) 's) -- [0Nl 0Nl 0]
+(allE (at (select {from: T by: k3 asc: k3 b: (avg c) s: (sum c)}) 'b)) -- true
+;; float keys take the legacy hash engine (radix merge + row emit)
+(allE (at (select {from: T by: f3 b: (avg c)}) 'b)) -- true
+(allH (at (select {from: T by: f3 b: (avg v)}) 'b)) -- true
+(allH (at (select {from: T by: f3 b: (avg v) s: (sum v)}) 'b)) -- true
+(allH (at (select {from: T where: (>= d 2) by: f3 b: (avg v)}) 'b)) -- true
+(allH (at (select {from: T by: {a: f3 b: (as 'F64 k350)} m: (avg v)}) 'm)) -- true
+;; small tables: the serial finishes
+(allH (at (select {from: T where: (< d 60) by: k3 b: (avg v)}) 'b)) -- true
+(allH (at (select {from: T where: (< d 60) by: f3 b: (avg v)}) 'b)) -- true
+(at (select {from: T where: (< d 60) b: (avg v)}) 'b) -- [-0.5]
+;; narrow and temporal inputs agree with the bare vector avg
+(set i32 (as 'I32 (* (- (* 2 (% d 2)) 1) (- 2147483647 (% d 1000)))))
+(set i16 (as 'I16 (* (- (* 2 (% d 2)) 1) (- 32767 (% d 100)))))
+(set u8 (as 'U8 (% d 256)))
+(set bo (== (% d 3) 0))
+(set dt (as 'DATE (- 2147483647 (% d 1000))))
+(set tm (as 'TIME (- 2147483647 (% d 1000))))
+(set ts (as 'TIMESTAMP hv))
+(set TN (table [k3 f3 i32 i16 u8 bo dt tm ts] (list k3 f3 i32 i16 u8 bo dt tm ts)))
+(at (select {from: TN a: (avg i32)}) 'a) -- [-0.5]
+(at (select {from: TN a: (avg i16)}) 'a) -- [-0.5]
+(at (select {from: TN a: (avg ts)}) 'a) -- [-0.5]
+(== (first (at (select {from: TN a: (avg u8)}) 'a)) (avg u8)) -- true
+(== (first (at (select {from: TN a: (avg bo)}) 'a)) (avg bo)) -- true
+(== (first (at (select {from: TN a: (avg dt)}) 'a)) (avg dt)) -- true
+(== (first (at (select {from: TN a: (avg tm)}) 'a)) (avg tm)) -- true
+(at (select {from: TN by: k3 a: (avg i32)}) 'a) -- [-0.5 -0.5 -0.5]
+(at (select {from: TN by: f3 a: (avg i32)}) 'a) -- [-0.5 -0.5 -0.5]
+(at (select {from: TN by: k3 a: (avg i16)}) 'a) -- [-0.5 -0.5 -0.5]
+(at (select {from: TN by: f3 a: (avg i16)}) 'a) -- [-0.5 -0.5 -0.5]
+(at (select {from: TN by: k3 a: (avg ts)}) 'a) -- [-0.5 -0.5 -0.5]
+(at (select {from: TN by: f3 a: (avg ts)}) 'a) -- [-0.5 -0.5 -0.5]
+(== (at (select {from: TN by: k3 asc: k3 a: (avg u8)}) 'a) (at (select {from: TN by: f3 asc: f3 a: (avg u8)}) 'a)) -- [true true true]
+(== (at (select {from: TN by: k3 asc: k3 a: (avg bo)}) 'a) (at (select {from: TN by: f3 asc: f3 a: (avg bo)}) 'a)) -- [true true true]
+(== (at (select {from: TN by: k3 asc: k3 a: (avg dt)}) 'a) (at (select {from: TN by: f3 asc: f3 a: (avg dt)}) 'a)) -- [true true true]
+(== (at (select {from: TN by: k3 asc: k3 a: (avg tm)}) 'a) (at (select {from: TN by: f3 asc: f3 a: (avg tm)}) 'a)) -- [true true true]
+;; nulls are skipped; an all-null group is null
+(set hcn (* hc (at [1 0N] (as 'I64 (== (% d 7) 0)))))
+(set TNu (table [c d k3 f3] (list hcn d k3 f3)))
+(at (select {from: TNu a: (avg c)}) 'a) -- [4611686018427387904.0]
+(== (first (at (select {from: TNu a: (avg c)}) 'a)) (avg hcn)) -- true
+(at (select {from: TNu a: (avg c) s: (sum c)}) 'a) -- [4611686018427387904.0]
+(at (select {from: TNu where: (>= d 2) a: (avg c)}) 'a) -- [4611686018427387904.0]
+(allE (at (select {from: TNu by: k3 a: (avg c)}) 'a)) -- true
+(allE (at (select {from: TNu by: f3 a: (avg c)}) 'a)) -- true
+(set TA (table [c k3 f3] (list (* hc (at [1 0N] (as 'I64 (== k3 2)))) k3 f3)))
+(at (select {from: TA by: k3 asc: k3 a: (avg c)}) 'a) -- [4611686018427387904.0 4611686018427387904.0 0Nf]
+(at (select {from: TA by: f3 asc: f3 a: (avg c)}) 'a) -- [4611686018427387904.0 4611686018427387904.0 0Nf]
+(at (select {from: (select {from: TA where: (== k3 2)}) a: (avg c)}) 'a) -- [0Nf]
+;; pivot
+(set TP (table [r pc c v] (list (% p 3) (% (div d 6) 2) hc hv)))
+(set P (pivot TP 'r 'pc 'v avg))
+(at P (at (cols P) 1)) -- [-0.5 -0.5 -0.5]
+(at P (at (cols P) 2)) -- [-0.5 -0.5 -0.5]
+(set Q (pivot TP 'r 'pc 'c avg))
+(allE (at Q (at (cols Q) 1))) -- true
+(allE (at Q (at (cols Q) 2))) -- true
+;; slice-indexed group (hash index on the SYM key + in-filter)
+(set TS (update {from: (table [s v c] (list (as 'SYM (% p 5)) hv hc)) s: (.idx.hash s)}))
+(at (select {from: TS where: (in s ['0 '1 '2]) by: s a: (avg v)}) 'a) -- [-0.5 -0.5 -0.5]
+(allE (at (select {from: TS where: (in s ['0 '1 '2]) by: s a: (avg c) s2: (sum c)}) 'a)) -- true
+;; single-key sparse scatter path (wide I32 key, avg over strlen of a STR
+;; column, a count, a where): the mean of the lengths, bit for bit
+(set cid (as 'I32 (* 35000 (% (* d 2654435761) 6000))))
+(set url (concat "http://example.com/some/path/" (as 'STR (* d (% d 977)))))
+(set H (table [cid url c] (list cid url hc)))
+(set R (select {from: H by: cid asc: cid l: (avg (strlen url)) n: (count url) where: (!= url "")}))
+(count R) -- 6000
+(== (first (at R 'l)) (avg (strlen (at (select {from: H where: (== cid 0)}) 'url)))) -- true
+(== (at R 'l) (at (select {from: H by: cid asc: cid l: (avg (strlen url)) where: (!= url "")}) 'l)) -- (take [true] 6000)
+(allE (at (select {from: H by: cid l: (avg c) n: (count url)}) 'l)) -- true
+(allE (at (select {from: H by: cid l: (avg c) s: (sum c) where: (!= url "")}) 'l)) -- true
+;; a splayed copy answers exactly what the in-memory table answers
+(.sys.exec "rm -rf rf_test_avg_i128") -- 0
+(set Tm (table [c v d k3 f3 k350] (list hc hv d k3 f3 k350)))
+(.db.splayed.set "rf_test_avg_i128/" Tm)
+(set Ts (.db.splayed.get "rf_test_avg_i128/"))
+(at (select {from: Ts a: (avg v) b: (avg c)}) 'a) -- [-0.5]
+(at (select {from: Ts a: (avg v) b: (avg c)}) 'b) -- [4611686018427387904.0]
+(== (at (select {from: Ts a: (avg v) b: (avg c)}) 'b) (at (select {from: Tm a: (avg v) b: (avg c)}) 'b)) -- [true]
+(== (at (select {from: Ts a: (avg v)}) 'a) (at (select {from: Tm a: (avg v)}) 'a)) -- [true]
+(== (at (select {from: Ts where: (>= d 2) a: (avg v)}) 'a) (at (select {from: Tm where: (>= d 2) a: (avg v)}) 'a)) -- [true]
+(== (at (select {from: Ts by: k3 asc: k3 a: (avg v) b: (avg c)}) 'a) (at (select {from: Tm by: k3 asc: k3 a: (avg v) b: (avg c)}) 'a)) -- [true true true]
+(== (at (select {from: Ts by: k3 asc: k3 a: (avg v) b: (avg c)}) 'b) (at (select {from: Tm by: k3 asc: k3 a: (avg v) b: (avg c)}) 'b)) -- [true true true]
+(allH (at (select {from: Ts by: k350 a: (avg v)}) 'a)) -- true
+(== (at (select {from: Ts by: f3 asc: f3 a: (avg v) b: (avg c)}) 'b) (at (select {from: Tm by: f3 asc: f3 a: (avg v) b: (avg c)}) 'b)) -- [true true true]
+(== (avg (at Ts 'c)) (first (at (select {from: Ts a: (avg c)}) 'a))) -- true
+(.sys.exec "rm -rf rf_test_avg_i128") -- 0

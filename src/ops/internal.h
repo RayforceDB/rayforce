@@ -1228,6 +1228,12 @@ ray_t* desc_vec_eager(ray_t* x);
 /* OP_PEARSON_CORR per-group accumulators: x-side piggybacks on SUM and
  * SUMSQ blocks; this flag enables the y-side blocks (Σy, Σy², Σxy). */
 #define GHT_NEED_PEARSON 0x10
+/* Exact integer AVG: an extra int64 block (off_sum_hi) carries the high
+ * word of a 128-bit two's-complement sum next to each off_sum slot, so an
+ * integer mean never divides a wrapped int64 (ray_i128_add / ray_i128_to_f64
+ * in idxop.h).  Set whenever an OP_AVG agg has a non-float input; SUM keeps
+ * reading off_sum alone (int64 wraparound is its contract). */
+#define GHT_NEED_SUM128  0x20
 
 /* ── ght_layout_t — inline-or-spill, fixed-size, by-value embeddable ──
  *
@@ -1300,6 +1306,9 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
+    /* High words of the 128-bit integer sums (GHT_NEED_SUM128); 0 when the
+     * layout carries none. */
+    uint16_t off_sum_hi;
     /* Earliest contributing source row for this group.  Every packed entry
      * carries its source row in the tail slot; partition merges retain the
      * minimum so output order is independent of radix partition count. */
