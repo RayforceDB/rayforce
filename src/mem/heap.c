@@ -2775,10 +2775,12 @@ void ray_heap_merge(ray_heap_t* src) {
             dst->pools[dst->pool_count++] = src->pools[i];
         } else {
             /* Pool overflow: only triggers at RAY_MAX_POOLS (512 pools = 16GB+).
-             * Fix ownership so blocks free to the correct heap. */
-            ray_pool_hdr_t* hdr = (ray_pool_hdr_t*)src->pools[i].base;
-            hdr->heap_id = dst->id;
-            assert(0 && "ray_heap_merge: pool overflow at RAY_MAX_POOLS");
+             * dst cannot track the pool, so it could never be released —
+             * fatal in every build.  Explicit rather than assert(0): under
+             * -DNDEBUG that compiled away and the pool leaked silently (#652). */
+            fprintf(stderr, "rayforce: ray_heap_merge: pool overflow at "
+                            "RAY_MAX_POOLS (%d)\n", (int)RAY_MAX_POOLS);
+            abort();
         }
     }
     src->pool_count = 0;

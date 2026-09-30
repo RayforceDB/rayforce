@@ -44,6 +44,17 @@ jobs:
         if: matrix.target == 'debug'
         run: make test
 
+  # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
+  # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;
+  # work placed inside an assert then silently vanishes (#652: an NDEBUG build
+  # registered no builtins).  This leg keeps the code correct either way.
+  ndebug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test with NDEBUG
+        run: make test-ndebug
+
   # Coverage-guided fuzz smoke pass over the untrusted-input decoders
   # (parser, numeric scanners, wire-frame decoder).  A healthy corpus finds
   # nothing new in a minute, so any crash here is a genuine regression.
@@ -127,14 +138,15 @@ jobs:
   # skipped required check can be treated as passed, silently opening the gate.
   # static-analysis is intentionally NOT in `needs` — it is advisory only.
   ci-success:
-    needs: [build-and-test, fuzz-smoke, tsan]
+    needs: [build-and-test, ndebug, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs passed
         run: |
           bt='${{ needs.build-and-test.result }}'
+          nd='${{ needs.ndebug.result }}'
           fz='${{ needs.fuzz-smoke.result }}'
           ts='${{ needs.tsan.result }}'
-          echo "build-and-test: $bt   fuzz-smoke: $fz   tsan: $ts"
-          [ "$bt" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
+          echo "build-and-test: $bt   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
+          [ "$bt" = "success" ] && [ "$nd" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
