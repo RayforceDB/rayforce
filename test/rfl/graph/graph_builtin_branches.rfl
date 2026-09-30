@@ -42,7 +42,7 @@
 (ser Wg) !- domain
 (ser (list Wg)) !- domain
 (ser (dict ['g] (list Wg))) !- domain
-(ser (table [g] (list (list Wg)))) !- domain
+(ser (table [g] (list (list (list Wg))))) !- domain
 (ser ((fn [] (let captured Wg) (fn [] captured)))) !- domain
 (nil? (.log.open 'async "/tmp/rfl_graph_serde_handle")) -- true
 (.log.write Wg) !- domain
