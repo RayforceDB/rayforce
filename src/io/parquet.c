@@ -248,6 +248,12 @@ typedef struct {
 } pq_schema;
 typedef struct { const uint8_t* p; uint32_t n; } pq_string;
 typedef struct {
+    const char* strings[8192];
+    size_t lengths[8192];
+    uint32_t hashes[8192];
+    int64_t ids[8192], positions[8192];
+} pq_symbol_scratch;
+typedef struct {
     pq_span metadata;
     pq_cur chunk, values;
     pq_rle defs, ids;
@@ -255,11 +261,18 @@ typedef struct {
     size_t page_cap, dict_cap;
     pq_string* strings;
     int64_t* symbol_ids;
+    pq_symbol_scratch* symbols;
     int64_t dict_count, page_left, chunk_left, page_nulls, expected_nulls, pages_skipped;
     uint64_t bool_bit;
     int codec, encoding;
     bool have_dict, optional;
 } pq_column;
+/* A cursor is used by one decoder at a time. Flush each PLAIN batch before
+ * advancing pages, so dictionary decoding may reuse the same heap scratch. */
+static pq_symbol_scratch* pq_symbols(pq_column* c) {
+    if (!c->symbols) c->symbols = ray_alloc_raw(sizeof(*c->symbols));
+    return c->symbols;
+}
 typedef struct { int64_t lo, hi; } pq_interval;
 struct ray_parquet {
     uint8_t* map;
@@ -360,6 +373,7 @@ void ray_parquet_close(ray_parquet_t* r) {
     if (r->cursors) for (int64_t i = 0; i < r->nselected; i++) {
         ray_free_raw(r->cursors[i].page); ray_free_raw(r->cursors[i].dict);
         ray_free_raw(r->cursors[i].strings); ray_free_raw(r->cursors[i].symbol_ids);
+        ray_free_raw(r->cursors[i].symbols);
     }
     ray_free_raw(r->cursors); ray_free_raw(r->selected); ray_free_raw(r->excluded);
     if (!r->borrowed) {
@@ -673,7 +687,10 @@ static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* data, size_
         if (s->import_domain) {
             c->symbol_ids = ray_alloc_raw((size_t)(count ? count : 1)*sizeof(*c->symbol_ids));
             if (!c->symbol_ids) return false;
-            const char* strings[8192]; size_t lengths[8192]; uint32_t hashes[8192];
+            pq_symbol_scratch* scratch = pq_symbols(c);
+            if (!scratch) return false;
+            const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
+            uint32_t* hashes = scratch->hashes;
             for (int64_t off = 0; off < count; off += 8192) {
                 int64_t n = count-off < 8192 ? count-off : 8192;
                 for (int64_t i = 0; i < n; i++) {
@@ -838,12 +855,15 @@ static void pq_plain_int(ray_t* v, int64_t row, const uint8_t* p, int64_t n) {
 /* Native dictionary ids go directly to file-domain symbol positions. PLAIN
  * pages intern bounded batches before their decompression buffer is reused. */
 static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, int64_t rows) {
+    pq_symbol_scratch* scratch = pq_symbols(c);
+    if (!scratch) return "symbol scratch allocation failed";
     ray_t* v = ray_sym_vec_new(RAY_SYM_W32,rows);
     if (!v || RAY_IS_ERR(v)) { if (v) ray_release(v); return "symbol vector allocation failed"; }
     v->sym_domain = s->import_domain; ray_sym_domain_retain(v->sym_domain);
     v->len = rows; *out = v; uint32_t* dst = ray_data(v);
-    const char* strings[8192]; size_t lengths[8192]; uint32_t hashes[8192];
-    int64_t ids[8192], positions[8192];
+    const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
+    uint32_t* hashes = scratch->hashes;
+    int64_t* ids = scratch->ids; int64_t* positions = scratch->positions;
     for (int64_t at = 0; at < rows;) {
         if (ray_interrupted()) return "scan interrupted";
         if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
@@ -1017,12 +1037,15 @@ static const char* pq_decode_column(ray_parquet_t* r, int64_t i, ray_t** out, in
     if (r->filter_pos >= 0 || r->text_pattern) schema.import_domain = NULL;
     return pq_decode(&r->cursors[i],&schema,out,rows);
 }
-static const char* pq_intern_selected(ray_t** vector, ray_sym_domain_t* domain) {
+static const char* pq_intern_selected(pq_column* c, ray_t** vector, ray_sym_domain_t* domain) {
+    pq_symbol_scratch* scratch = pq_symbols(c);
+    if (!scratch) return "symbol scratch allocation failed";
     ray_t* src = *vector;
     ray_t* dst = ray_sym_vec_new(RAY_SYM_W32,src->len);
     if (!dst || RAY_IS_ERR(dst)) { if (dst) ray_release(dst); return "symbol allocation failed"; }
     dst->sym_domain = domain; ray_sym_domain_retain(domain); dst->len = src->len;
-    const char* strings[8192]; size_t lengths[8192]; uint32_t hashes[8192]; int64_t ids[8192];
+    const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
+    uint32_t* hashes = scratch->hashes; int64_t* ids = scratch->ids;
     for (int64_t at = 0; at < src->len; at += 8192) {
         int64_t n = src->len-at < 8192 ? src->len-at : 8192;
         for (int64_t i = 0; i < n; i++) {
@@ -1139,7 +1162,7 @@ ray_t* ray_parquet_next(ray_parquet_t* r) {
             v->len = kept;
         }
         if (v->type == RAY_STR && r->schema[r->selected[c]].import_domain) {
-            err = pq_intern_selected(&cols[c],r->schema[r->selected[c]].import_domain);
+            err = pq_intern_selected(&r->cursors[c],&cols[c],r->schema[r->selected[c]].import_domain);
             if (err) goto fail;
             v = cols[c];
         }

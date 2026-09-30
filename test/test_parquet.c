@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+#include <pthread.h>
+#endif
 
 static void pq_setup(void) { ray_heap_init(); (void)ray_sym_init(); }
 static void pq_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); }
@@ -425,7 +428,57 @@ static test_result_t test_pq_parted_symbols(void) {
     }
     pq_remove_native(root,NULL,0); ray_pool_destroy(); PASS();
 }
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+static void* pq_small_stack_worker(void* result) {
+    pq_setup();
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
+    int64_t key = ray_sym_intern("types",5);
+    ray_t* values = ray_list_new(1);
+    ((ray_t**)ray_data(values))[0] = ray_vec_from_raw(RAY_SYM,ids,3); values->len = 1;
+    ray_t* options = ray_dict_new(ray_vec_from_raw(RAY_SYM,&key,1),values);
+    const char* files[] = {FIX "unix.parquet",FIX "rle-runs.parquet",FIX "row-groups.parquet"};
+    const int64_t counts[] = {2,24597,44009};
+    bool ok = true;
+    /* No pool: every dictionary/PLAIN page and batch is decoded on this
+     * deliberately small thread stack, including the nested dictionary path. */
+    for (int f = 0; f < 3 && ok; f++) {
+        ray_t* t = ray_parquet_read(files[f],options);
+        ok = t && !RAY_IS_ERR(t) && ray_table_nrows(t) == counts[f];
+        if (ok) {
+            ray_t* col = ray_table_get_col_idx(t,2);
+            for (int64_t i = 0; i < counts[f] && ok; i++) {
+                char expected[64];
+                if (f == 0) snprintf(expected,sizeof(expected),"pooled string number %s",i ? "two" : "one");
+                else if (f == 1) snprintf(expected,sizeof(expected),"%s",i%8199 < 4099 ? "a repeated pooled string" : "");
+                else snprintf(expected,sizeof(expected),"long pooled string row %lld",(long long)i);
+                ray_t* text = ray_sym_vec_cell(col,i);
+                ok = text && !strcmp(ray_str_ptr(text),expected);
+            }
+        }
+        if (t) ray_release(t);
+    }
+    ray_release(options); pq_teardown(); *(bool*)result = ok;
+    return NULL;
+}
+#endif
+static test_result_t test_pq_small_stack(void) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    ray_pool_destroy();
+    pthread_attr_t attr; pthread_t worker; bool ok = false;
+    TEST_ASSERT_EQ_I(pthread_attr_init(&attr),0);
+    int rc = pthread_attr_setstacksize(&attr,256*1024);
+    if (!rc) rc = pthread_create(&worker,&attr,pq_small_stack_worker,&ok);
+    pthread_attr_destroy(&attr);
+    TEST_ASSERT_EQ_I(rc,0);
+    TEST_ASSERT_EQ_I(pthread_join(worker,NULL),0);
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+#else
+    SKIP("requires POSIX thread stack attributes");
+#endif
+}
 const test_entry_t parquet_entries[] = {
+    {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
     {"parquet/snappy",test_pq_snappy,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
