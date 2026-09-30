@@ -18,7 +18,7 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 | [`.log.roll`](#log-roll) | nullary | restricted | Close the active segment and start a new one. |
 | [`.log.replay`](#log-replay) | unary | restricted | Replay a journal file; return entry count. |
 | [`.log.validate`](#log-validate) | unary | — | Scan a journal file; return `(chunks valid_bytes)`. |
-| [`.log.close`](#log-close) | variadic | restricted | Flush and close the active journal. |
+| [`.log.close`](#log-close) | nullary | restricted | Flush and close the active journal. |
 | [`.log.purge`](#log-purge) | nullary | restricted | Close the active journal and delete all its files. |
 
 ## `.log.open` { #log-open }
