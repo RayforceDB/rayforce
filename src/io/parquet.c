@@ -1658,7 +1658,7 @@ typedef struct {
     ray_parquet_t* parent;
     ray_col_stream_t* writers;
     int64_t* offsets;
-    _Atomic(uint32_t)* nulls;
+    _Atomic uint32_t* nulls;
     ray_t** errors;
 } pq_direct_work;
 static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
@@ -1702,7 +1702,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t tasks = r->ngroups*r->ncols;
     if (tasks > UINT32_MAX) return pq_error("too many column chunk tasks");
     int64_t* offsets = ray_calloc_raw((size_t)(r->ngroups+1)*sizeof(*offsets));
-    _Atomic(uint32_t)* nulls = ray_calloc_raw((size_t)r->ncols*sizeof(*nulls));
+    _Atomic uint32_t* nulls = ray_calloc_raw((size_t)r->ncols*sizeof(*nulls));
     ray_t** errors = ray_calloc_raw((size_t)(tasks+1)*sizeof(*errors));
     ray_t* err = NULL;
     if (!offsets || !nulls || !errors) { err = ray_error("oom",NULL); goto done; }
