@@ -420,6 +420,16 @@ tidy:
 	clang-tidy --quiet $(FILES) -- $(TIDY_FLAGS)
 
 # cppcheck is a second-opinion linter — advisory only, never a gate.
+#
+# CPPCHECK_DEFS pins ONE preprocessor configuration: the gcc / x86-64 / Linux
+# debug build CI compiles.  Given no -D, cppcheck enumerates the #ifdef
+# combinations it finds (platform, DEBUG, endianness, fuzzing) and analyses
+# each file up to 12 times — most files hit that cap, which is what made
+# the whole-tree pass take ~50 minutes.  Undefined macros stay undefined, so
+# the Windows/macOS/WASM branches are not analysed here; every Linux file is.
+CPPCHECK_DEFS = -D__linux__ -D__GNUC__ -D__x86_64__ -D__SIZEOF_INT128__=16 \
+  -D__ORDER_LITTLE_ENDIAN__=1234 -D__BYTE_ORDER__=1234 -D__GLIBC__ -DDEBUG
+
 cppcheck:
 	@command -v cppcheck >/dev/null || { echo "cppcheck: not found"; exit 1; }
 	cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 \
@@ -427,7 +437,7 @@ cppcheck:
 	  --suppress=missingIncludeSystem \
 	  --suppress=assignBoolToPointer \
 	  --suppress=nullPointerRedundantCheck \
-	  --std=c17 -q $(INCLUDES) src/
+	  --std=c17 -q $(CPPCHECK_DEFS) $(INCLUDES) src/
 # assignBoolToPointer: cppcheck misparses the GNU computed-goto label
 #   address `&&label` (a void*) as a logical-AND yielding a bool.
 # nullPointerRedundantCheck: a heuristic that fires on the codebase's
