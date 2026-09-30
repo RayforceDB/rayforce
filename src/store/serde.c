@@ -94,38 +94,6 @@
 #define RAY_SERDE_LAMBDA_HAS_CLOSURE ((uint8_t)0x01)
 #define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK RAY_SERDE_LAMBDA_HAS_CLOSURE
 
-/* Process-local handles cannot be reconstructed from a wire frame.  Walk
- * compound values before sizing a frame so a graph handle nested in a dict,
- * list, table, or lambda is rejected instead of being silently demoted to a
- * plain integer when its ownership attribute is stripped. */
-static bool serde_contains_attr(ray_t* obj, uint8_t attr) {
-    if (!obj || RAY_IS_ERR(obj) || RAY_IS_NULL(obj)) return false;
-    if (obj->type == -RAY_I64 && (obj->attrs & attr)) return true;
-    switch (obj->type) {
-    case RAY_LIST: {
-        ray_t** elems = (ray_t**)ray_data(obj);
-        for (int64_t i = 0; i < obj->len; i++)
-            if (serde_contains_attr(elems[i], attr)) return true;
-        return false;
-    }
-    case RAY_TABLE:
-    case RAY_DICT: {
-        ray_t** slots = (ray_t**)ray_data(obj);
-        return serde_contains_attr(slots[0], attr) ||
-               serde_contains_attr(slots[1], attr);
-    }
-    case RAY_LAMBDA: {
-        ray_t** slots = (ray_t**)ray_data(obj);
-        if (serde_contains_attr(slots[0], attr) ||
-            serde_contains_attr(slots[1], attr)) return true;
-        return LAMBDA_CLOSURE(obj) &&
-               serde_contains_attr(LAMBDA_CLOSURE(obj), attr);
-    }
-    default:
-        return false;
-    }
-}
-
 /* Helper: strlen with bounds */
 static size_t safe_strlen(const uint8_t* buf, int64_t max) {
     for (int64_t i = 0; i < max; i++)
@@ -269,6 +237,8 @@ int64_t ray_serde_size(ray_t* obj) {
         case RAY_TIME:
         case RAY_F32:       return 1 + 1 + 4;
         case RAY_I64:
+            if (obj->attrs & RAY_ATTR_GRAPH) return 0;
+            return 1 + 1 + 8;
         case RAY_TIMESTAMP:
         case RAY_F64:       return 1 + 1 + 8;
         case RAY_GUID:      return 1 + 1 + 16;
@@ -349,24 +319,43 @@ int64_t ray_serde_size(ray_t* obj) {
     case RAY_LIST: {
         int64_t size = 1 + 1 + 8;
         ray_t** elems = (ray_t**)ray_data(obj);
-        for (int64_t i = 0; i < obj->len; i++)
-            size += ray_serde_size(elems[i]);
+        for (int64_t i = 0; i < obj->len; i++) {
+            int64_t child = ray_serde_size(elems[i]);
+            if (child <= 0) return child;
+            size += child;
+        }
         return size;
     }
     case RAY_TABLE: {
         /* type + attrs + schema(recursive) + cols(recursive RAY_LIST) */
         ray_t** slots = (ray_t**)ray_data(obj);
-        return 1 + 1 + schema_names_serde_size(slots[0]) + ray_serde_size(slots[1]);
+        int64_t schema = schema_names_serde_size(slots[0]);
+        if (schema <= 0) return schema;
+        int64_t cols = ray_serde_size(slots[1]);
+        if (cols <= 0) return cols;
+        return 1 + 1 + schema + cols;
     }
     case RAY_DICT: {
         /* type + attrs + keys(recursive) + vals(recursive) */
         ray_t** slots = (ray_t**)ray_data(obj);
-        return 1 + 1 + ray_serde_size(slots[0]) + ray_serde_size(slots[1]);
+        int64_t keys = ray_serde_size(slots[0]);
+        if (keys <= 0) return keys;
+        int64_t vals = ray_serde_size(slots[1]);
+        if (vals <= 0) return vals;
+        return 1 + 1 + keys + vals;
     }
     case RAY_LAMBDA: {
         ray_t** slots = (ray_t**)ray_data(obj);
-        int64_t size = 1 + 1 + ray_serde_size(slots[0]) + ray_serde_size(slots[1]);
-        if (LAMBDA_CLOSURE(obj)) size += ray_serde_size(LAMBDA_CLOSURE(obj));
+        int64_t params = ray_serde_size(slots[0]);
+        if (params <= 0) return params;
+        int64_t body = ray_serde_size(slots[1]);
+        if (body <= 0) return body;
+        int64_t size = 1 + 1 + params + body;
+        if (LAMBDA_CLOSURE(obj)) {
+            int64_t closure = ray_serde_size(LAMBDA_CLOSURE(obj));
+            if (closure <= 0) return closure;
+            size += closure;
+        }
         return size;
     }
     case RAY_UNARY:
@@ -414,13 +403,14 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     int8_t type = obj->type;
-    buf[0] = (uint8_t)type;
-    buf++;
 
     /* Atoms — format: type(1) + flags(1) + value-bytes.  `flags` bit 0
      * carries the typed-null marker (aux[0] & 1 on the source atom)
      * so (de (ser 0Nl)) roundtrips instead of decoding as plain 0. */
     if (type < 0) {
+        if (type == -RAY_I64 && (obj->attrs & RAY_ATTR_GRAPH)) return 0;
+        buf[0] = (uint8_t)type;
+        buf++;
         uint8_t aflags = (uint8_t)(obj->aux[0] & 1);
         if (type == -RAY_SYM && (obj->attrs & ATTR_QUOTED))
             aflags |= ATTR_QUOTED;
@@ -491,6 +481,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
 
     /* Vectors and compound types */
     int64_t c;
+    buf[0] = (uint8_t)type;
+    buf++;
 
     /* Attrs byte: preserve HAS_NULLS; clear SLICE / ARENA (internal flags). */
     uint8_t wire_attrs = obj->attrs & (RAY_ATTR_HAS_NULLS);
@@ -607,8 +599,11 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         buf += 8;
         ray_t** elems = (ray_t**)ray_data(obj);
         c = 0;
-        for (int64_t i = 0; i < obj->len; i++)
-            c += ray_ser_raw(buf + c, elems[i]);
+        for (int64_t i = 0; i < obj->len; i++) {
+            int64_t child = ray_ser_raw(buf + c, elems[i]);
+            if (child <= 0) return child;
+            c += child;
+        }
         return 1 + 1 + 8 + c;
     }
 
@@ -618,7 +613,10 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ser_schema_names(buf, slots[0]);     /* schema names as RAY_SYM vector */
-        c += ray_ser_raw(buf + c, slots[1]);     /* cols (RAY_LIST) */
+        if (c <= 0) return c;
+        int64_t cols = ray_ser_raw(buf + c, slots[1]);     /* cols (RAY_LIST) */
+        if (cols <= 0) return cols;
+        c += cols;
         return 1 + 1 + c;
     }
 
@@ -627,7 +625,10 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);
-        c += ray_ser_raw(buf + c, slots[1]);
+        if (c <= 0) return c;
+        int64_t vals = ray_ser_raw(buf + c, slots[1]);
+        if (vals <= 0) return vals;
+        c += vals;
         return 1 + 1 + c;
     }
 
@@ -636,9 +637,15 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
-        c += ray_ser_raw(buf + c, slots[1]); /* body */
-        if (LAMBDA_CLOSURE(obj))
-            c += ray_ser_raw(buf + c, LAMBDA_CLOSURE(obj));
+        if (c <= 0) return c;
+        int64_t body = ray_ser_raw(buf + c, slots[1]); /* body */
+        if (body <= 0) return body;
+        c += body;
+        if (LAMBDA_CLOSURE(obj)) {
+            int64_t closure = ray_ser_raw(buf + c, LAMBDA_CLOSURE(obj));
+            if (closure <= 0) return closure;
+            c += closure;
+        }
         return 1 + 1 + c;
     }
 
@@ -1214,12 +1221,6 @@ ray_t* ray_ser(ray_t* obj) {
         obj = ray_lazy_materialize(obj); /* consumes the retain */
         if (RAY_IS_ERR(obj)) return obj;
         owned = true;
-    }
-
-    if (serde_contains_attr(obj, RAY_ATTR_GRAPH)) {
-        ray_t* e = ray_error("domain", "serialize: graph handles are process-local");
-        if (owned) ray_release(obj);
-        return e;
     }
 
     int64_t payload = ray_serde_size(obj);

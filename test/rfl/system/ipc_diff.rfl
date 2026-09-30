@@ -72,6 +72,13 @@
 ;; ── string ops ─────────────────────────────────────────────────────
 (like "hello" "h*")  -- (.ipc.send h "(like \"hello\" \"h*\")")
 
+;; ── process-local handles ──────────────────────────────────────────
+;; Graph handles carry heap pointers in i64 atoms plus RAY_ATTR_GRAPH.
+;; They must be rejected by the shared serde path before IPC can leak
+;; the address or silently demote a nested handle to a bare integer.
+(.ipc.send h "(do (set E (table [src dst] (list [0 1] [1 0]))) (set G (.graph.build E 'src 'dst)) G)") !- domain
+(.ipc.send h "(do (set E2 (table [src dst] (list [0 1] [1 0]))) (set G2 (.graph.build E2 'src 'dst)) (list G2 1))") !- domain
+
 ;; ── large payloads ─────────────────────────────────────────────────
 ;; Multi-KB results over the framing path.  These no longer exercise
 ;; ray_ipc_compress: since #541 a loopback link never compresses, so
