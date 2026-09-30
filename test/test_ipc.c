@@ -2123,7 +2123,8 @@ static test_result_t test_ipc_open_opts_int_timeout(void) {
     ray_t* a = ray_i64(250);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(a, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(a, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_I(timeout, 250);
     TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_AUTO);
@@ -2137,7 +2138,8 @@ static test_result_t test_ipc_open_opts_dict_timeout(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_I(timeout, 400);
     TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_AUTO);
@@ -2153,7 +2155,8 @@ static test_result_t test_ipc_open_opts_compress_null_never(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_NEVER);
     TEST_ASSERT_EQ_I(timeout, 0);      /* unset -> default budget */
@@ -2168,7 +2171,8 @@ static test_result_t test_ipc_open_opts_compress_threshold(void) {
     ray_t* d = mk_opts(keys, vals, 2);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_U(thr, 5000);
     TEST_ASSERT_EQ_I(timeout, 75);
@@ -2184,7 +2188,8 @@ static test_result_t test_ipc_open_opts_compress_zero_always(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 99;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_U(thr, 0);
     ray_release(vals[0]);
@@ -2199,7 +2204,8 @@ static test_result_t test_ipc_open_opts_unknown_key(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(vals[0]);
@@ -2213,7 +2219,8 @@ static test_result_t test_ipc_open_opts_bad_value_type(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(vals[0]);
@@ -2227,7 +2234,8 @@ static test_result_t test_ipc_open_opts_negative_rejected(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(vals[0]);
@@ -2236,7 +2244,7 @@ static test_result_t test_ipc_open_opts_negative_rejected(void) {
     const char* k2[] = { "timeout" };
     ray_t* v2[] = { ray_i64(-1) };
     ray_t* d2 = mk_opts(k2, v2, 1);
-    err = ray_ipc_parse_open_opts(d2, &timeout, &thr);
+    err = ray_ipc_parse_open_opts(d2, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(v2[0]);
@@ -2251,7 +2259,8 @@ static test_result_t test_ipc_open_opts_timeout_null_is_default(void) {
     ray_t* d = mk_opts(keys, vals, 1);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_I(timeout, 0);
     ray_release(vals[0]);
@@ -2266,7 +2275,8 @@ static test_result_t test_ipc_open_opts_empty_dict(void) {
     ray_t* d = ray_dict_new(k, v);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_I(timeout, 0);
     TEST_ASSERT_EQ_U(thr, RAY_IPC_COMPRESS_AUTO);
@@ -2292,7 +2302,8 @@ static test_result_t test_ipc_open_opts_string_keys_rejected(void) {
 
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(d);
@@ -2313,7 +2324,8 @@ static test_result_t test_ipc_open_opts_list_sym_keys(void) {
 
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_EQ_U(thr, 4096);
     ray_release(d);
@@ -2334,7 +2346,8 @@ static test_result_t test_ipc_open_opts_list_sym_keys_unknown(void) {
 
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(d);
@@ -2345,12 +2358,117 @@ static test_result_t test_ipc_open_opts_wrong_arg_type(void) {
     ray_t* a = ray_str("nope", 4);
     int    timeout = -1;
     size_t thr     = 0;
-    ray_t* err = ray_ipc_parse_open_opts(a, &timeout, &thr);
+    int    ka      = 0;
+    ray_t* err = ray_ipc_parse_open_opts(a, &timeout, &thr, &ka);
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     ray_error_free(err);
     ray_release(a);
     PASS();
 }
+
+/* ---- .ipc.open keepalive (#589) ----------------------------------------
+ * `keepalive` is a dead-peer budget in ms: absent = on at the default
+ * budget, 0N = off, n > 0 = on at n (plus the unacknowledged-data bound).
+ * 0 is ambiguous ("off"? "immediately"?) and refused. */
+
+static test_result_t test_ipc_open_opts_keepalive_parse(void) {
+    int    timeout = -1;
+    size_t thr     = 0;
+    int    ka      = 12345;
+
+    /* absent -> auto */
+    ray_t* e = ray_i64(100);
+    TEST_ASSERT_NULL(ray_ipc_parse_open_opts(e, &timeout, &thr, &ka));
+    TEST_ASSERT_EQ_I(ka, RAY_IPC_KEEPALIVE_AUTO);
+    ray_release(e);
+
+    const char* keys[] = { "keepalive" };
+    ray_t* vals[] = { ray_i64(NULL_I64) };
+    ray_t* d = mk_opts(keys, vals, 1);
+    TEST_ASSERT_NULL(ray_ipc_parse_open_opts(d, &timeout, &thr, &ka));
+    TEST_ASSERT_EQ_I(ka, RAY_IPC_KEEPALIVE_OFF);
+    ray_release(vals[0]); ray_release(d);
+
+    vals[0] = ray_i64(30000);
+    d = mk_opts(keys, vals, 1);
+    TEST_ASSERT_NULL(ray_ipc_parse_open_opts(d, &timeout, &thr, &ka));
+    TEST_ASSERT_EQ_I(ka, 30000);
+    ray_release(vals[0]); ray_release(d);
+
+    int64_t bad[] = { 0, -5 };
+    for (int i = 0; i < 2; i++) {
+        vals[0] = ray_i64(bad[i]);
+        d = mk_opts(keys, vals, 1);
+        ray_t* err = ray_ipc_parse_open_opts(d, &timeout, &thr, &ka);
+        TEST_ASSERT_TRUE(err && RAY_IS_ERR(err));
+        TEST_ASSERT_EQ_I(ray_err_from_obj(err), RAY_ERR_DOMAIN);
+        ray_error_free(err);
+        ray_release(vals[0]); ray_release(d);
+    }
+    PASS();
+}
+
+#if defined(__linux__)
+#include <netinet/tcp.h>
+static int sockopt_int(int fd, int level, int name) {
+    int v = -1;
+    socklen_t l = sizeof(v);
+    if (getsockopt(fd, level, name, &v, &l) < 0) return -1;
+    return v;
+}
+
+/* The options must actually land on the outbound socket, and survive the
+ * post-handshake reset of the connect-budget timeouts. */
+static test_result_t test_ipc_keepalive_sockopts(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    ray_poll_t* poll = ray_ipc_active_poll();
+
+    /* default: keepalive at 60s (probe at 30s idle, then every 10s x3),
+     * and no unacknowledged-data bound. */
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "default connect");
+    int fd = (int)ray_poll_get(poll, h)->fd;
+    TEST_ASSERT_EQ_I(sockopt_int(fd, SOL_SOCKET, SO_KEEPALIVE), 1);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_KEEPIDLE), 30);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_KEEPINTVL), 10);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_KEEPCNT), 3);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_USER_TIMEOUT), 0);
+    ray_ipc_close(h);
+
+    /* explicit budget: keepalive at that budget plus TCP_USER_TIMEOUT.
+     * Sub-second components round up to the kernel's 1s floor. */
+    h = ray_ipc_connect_opts("127.0.0.1", srv.port, NULL, NULL, 0,
+                             RAY_IPC_COMPRESS_AUTO, 4000);
+    TEST_ASSERT((h) >= (0), "budget connect");
+    fd = (int)ray_poll_get(poll, h)->fd;
+    TEST_ASSERT_EQ_I(sockopt_int(fd, SOL_SOCKET, SO_KEEPALIVE), 1);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_KEEPIDLE), 2);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_KEEPINTVL), 1);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_USER_TIMEOUT), 4000);
+
+    /* the link still works with them set */
+    ray_t* msg = ray_str("(+ 1 2)", 7);
+    ray_t* r = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 3);
+    ray_release(r);
+    ray_ipc_close(h);
+
+    /* off */
+    h = ray_ipc_connect_opts("127.0.0.1", srv.port, NULL, NULL, 0,
+                             RAY_IPC_COMPRESS_AUTO, RAY_IPC_KEEPALIVE_OFF);
+    TEST_ASSERT((h) >= (0), "off connect");
+    fd = (int)ray_poll_get(poll, h)->fd;
+    TEST_ASSERT_EQ_I(sockopt_int(fd, SOL_SOCKET, SO_KEEPALIVE), 0);
+    TEST_ASSERT_EQ_I(sockopt_int(fd, IPPROTO_TCP, TCP_USER_TIMEOUT), 0);
+    ray_ipc_close(h);
+
+    ray_test_server_stop(&srv);
+    PASS();
+}
+#endif
 
 /* A compressed frame must survive a real socket round trip.
  *
@@ -2366,7 +2484,8 @@ static test_result_t test_ipc_compressed_roundtrip(void) {
     RAY_TEST_SERVER_START(srv);
 
     /* threshold 0 = compress everything, overriding the loopback default */
-    int64_t h = ray_ipc_connect_opts("127.0.0.1", srv.port, NULL, NULL, 0, 0);
+    int64_t h = ray_ipc_connect_opts("127.0.0.1", srv.port, NULL, NULL, 0, 0,
+                                     RAY_IPC_KEEPALIVE_AUTO);
     TEST_ASSERT((h) >= (0), "connected with compression forced");
     TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h), 0);
 
@@ -2815,6 +2934,10 @@ const test_entry_t ipc_entries[] = {
     { "ipc/mcast_local_not_compressed",    test_ipc_mcast_local_not_compressed,     ipc_setup, ipc_teardown },
     { "ipc/frame_async_at_threshold",       test_ipc_frame_async_at_threshold,       ipc_setup, ipc_teardown },
     { "ipc/compressed_roundtrip",          test_ipc_compressed_roundtrip,           ipc_setup, ipc_teardown },
+    { "ipc/open_opts/keepalive_parse",     test_ipc_open_opts_keepalive_parse,      ipc_setup, ipc_teardown },
+#if defined(__linux__)
+    { "ipc/keepalive_sockopts",            test_ipc_keepalive_sockopts,             ipc_setup, ipc_teardown },
+#endif
 
     /* wire-level characterization (refactor guard) */
     { "ipc/wire/resp_header_fields",       test_ipc_wire_resp_header_fields,        ipc_setup, ipc_teardown },

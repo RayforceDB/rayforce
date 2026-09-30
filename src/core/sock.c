@@ -161,6 +161,45 @@ ray_sock_t ray_sock_accept(ray_sock_t srv)
     return fd;
 }
 
+int ray_sock_set_keepalive(ray_sock_t s, int budget_ms, bool user_timeout)
+{
+    int on = budget_ms > 0 ? 1 : 0;
+    if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&on, sizeof(on)) < 0)
+        return -1;
+    if (!on) return 0;
+
+    int idle  = budget_ms / 2000;       /* seconds */
+    int intvl = budget_ms / 6000;
+    int cnt   = 3;
+    if (idle  < 1) idle  = 1;
+    if (intvl < 1) intvl = 1;
+#if defined(TCP_KEEPIDLE)
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&idle, sizeof(idle));
+#elif defined(TCP_KEEPALIVE)            /* macOS spelling */
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, (const char*)&idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&cnt, sizeof(cnt));
+#endif
+
+    if (user_timeout) {
+#if defined(TCP_USER_TIMEOUT)
+        unsigned int ut = (unsigned int)budget_ms;
+        setsockopt(s, IPPROTO_TCP, TCP_USER_TIMEOUT, (const char*)&ut, sizeof(ut));
+#elif defined(TCP_RXT_CONNDROPTIME)     /* macOS */
+        int ut = budget_ms < 1000 ? 1 : budget_ms / 1000;
+        setsockopt(s, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, (const char*)&ut, sizeof(ut));
+#elif defined(TCP_MAXRT)                /* Windows */
+        int ut = budget_ms < 1000 ? 1 : budget_ms / 1000;
+        setsockopt(s, IPPROTO_TCP, TCP_MAXRT, (const char*)&ut, sizeof(ut));
+#endif
+    }
+    return 0;
+}
+
 /* Connect an already-created socket `fd` to one resolved address.  With
  * timeout_ms > 0 the connect is driven non-blocking + poll (a blocking
  * connect() ignores SO_*TIMEO) and the same budget is then applied as the

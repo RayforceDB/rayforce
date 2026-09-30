@@ -1446,12 +1446,13 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
                          int timeout_ms)
 {
     return ray_ipc_connect_opts(host, port, user, password, timeout_ms,
-                                RAY_IPC_COMPRESS_AUTO);
+                                RAY_IPC_COMPRESS_AUTO, RAY_IPC_KEEPALIVE_AUTO);
 }
 
 int64_t ray_ipc_connect_opts(const char* host, uint16_t port,
                          const char* user, const char* password,
-                         int timeout_ms, size_t compress_threshold)
+                         int timeout_ms, size_t compress_threshold,
+                         int keepalive_ms)
 {
     /* The connection lives in the active poll's selector table — its
      * selector id IS the handle.  No poll, no handle namespace: refuse
@@ -1530,6 +1531,14 @@ int64_t ray_ipc_connect_opts(const char* host, uint16_t port,
       setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &z, sizeof(z));
       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &z, sizeof(z)); }
 #endif
+
+    /* The handshake timeouts are gone, so from here on only keepalive
+     * notices a peer that vanished without closing (#589).  Best-effort:
+     * failing to arm it leaves the link no worse than before. */
+    if (keepalive_ms == RAY_IPC_KEEPALIVE_AUTO)
+        ray_sock_set_keepalive(fd, RAY_IPC_KEEPALIVE_DEFAULT_MS, false);
+    else if (keepalive_ms > 0)
+        ray_sock_set_keepalive(fd, keepalive_ms, true);
 
     /* Handshake + auth done (blocking socket).  Hand the fd over to the
      * poll: nonblocking, parked on a header read, same read pump as an
@@ -1924,10 +1933,12 @@ static int opts_i64(ray_t* d, const char* name, int64_t* out, ray_t** err)
 }
 
 ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
-                               size_t* compress_threshold)
+                               size_t* compress_threshold,
+                               int* keepalive_ms)
 {
     *timeout_ms         = 0;
     *compress_threshold = RAY_IPC_COMPRESS_AUTO;
+    *keepalive_ms       = RAY_IPC_KEEPALIVE_AUTO;
     if (!arg) return NULL;
 
     /* Backwards-compatible form: a bare integer is the connect timeout. */
@@ -1973,10 +1984,11 @@ ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
                 return ray_error("type", ".ipc.open: option keys must be symbols, got %s",
                                  ray_type_name(keys->type));
             }
-            bool known = (n == 7 && memcmp(p, "timeout",  7) == 0)
-                      || (n == 8 && memcmp(p, "compress", 8) == 0);
+            bool known = (n == 7 && memcmp(p, "timeout",   7) == 0)
+                      || (n == 8 && memcmp(p, "compress",  8) == 0)
+                      || (n == 9 && memcmp(p, "keepalive", 9) == 0);
             if (!known)
-                return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout` or `compress`)",
+                return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout`, `compress` or `keepalive`)",
                                  (int)n, p ? p : "");
         }
     }
@@ -2000,6 +2012,17 @@ ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
         if (cv == NULL_I64)      *compress_threshold = RAY_IPC_COMPRESS_NEVER;
         else if (cv < 0)         return ray_error("domain", ".ipc.open compress threshold must be >= 0 or 0N (never), got %lld", (long long)cv);
         else                     *compress_threshold = (size_t)cv;
+    }
+
+    int64_t kv = 0;
+    got = opts_i64(arg, "keepalive", &kv, &err);
+    if (got < 0) return err;
+    if (got == 1) {
+        /* 0N = off.  n > 0 = dead-peer budget in ms.  0 is refused rather
+         * than guessed at: it could mean "off" or "immediately". */
+        if (kv == NULL_I64)      *keepalive_ms = RAY_IPC_KEEPALIVE_OFF;
+        else if (kv <= 0)        return ray_error("domain", ".ipc.open keepalive must be > 0 or 0N (off), got %lld", (long long)kv);
+        else                     *keepalive_ms = (kv > INT_MAX) ? INT_MAX : (int)kv;
     }
     return NULL;
 }

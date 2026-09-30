@@ -20,17 +20,29 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 
 ## `.ipc.open` { #ipc-open }
 
-Signature: `(.ipc.open "host:port")` or `(.ipc.open "host:port:user:password")`, with an optional trailing connect timeout in milliseconds: `(.ipc.open "host:port" 2000)`.
+Signature: `(.ipc.open "host:port")` or `(.ipc.open "host:port:user:password")`, with an optional second argument: a connect timeout in milliseconds, `(.ipc.open "host:port" 2000)`, or an options dict, `(.ipc.open "host:port" (dict [timeout keepalive] [2000 30000]))`.
 
 Returns: an `i64` handle. Negative handles never escape — errors are surfaced as Rayfall error objects:
 
 - `type` — address argument is not a string, or the timeout argument is not an integer.
 - `rank` — called with fewer than 1 or more than 2 arguments.
-- `domain` — malformed address (missing port, port out of `(0, 65535]`, oversized host/user/password), or a negative timeout.
+- `domain` — malformed address (missing port, port out of `(0, 65535]`, oversized host/user/password), a negative timeout, an unknown option key, or an out-of-range option value.
 - `access` — server requires auth and you didn't supply credentials, **or** the password is wrong.
 - `io` — connection refused / network error, or `connection timed out` when the connect did not complete within the timeout.
 
 The optional timeout bounds **both** the TCP connect and the handshake I/O. A blocking `connect()` ignores socket send/receive timeouts, so without an explicit bound a dead or packet-filtered peer would otherwise hang for the operating-system default (often minutes). When omitted, a default budget of 5 seconds applies.
+
+Options dict keys (all optional; keys must be symbols):
+
+| Key | Value | Absent means |
+|---|---|---|
+| `timeout` | Connect + handshake budget in ms, as the bare-integer form. | 5 seconds. |
+| `compress` | Threshold in bytes: `0N` never compresses, `0` always does, `n` compresses payloads larger than `n`. | Loopback links never compress; others use 2,000. |
+| `keepalive` | Dead-peer budget in ms, or `0N` to turn detection off. `0` is rejected. | Detection on, 60-second budget. |
+
+**Dead-peer detection.** A peer can become unreachable without closing the socket: a suspended host, a NAT or firewall that silently drops the flow, or a machine that loses power. No reset ever arrives. Without detection the handle stays open forever, and `.ipc.on.close` never fires. To prevent that, outbound connections enable TCP keepalive: after half the budget of silence the kernel starts probing, and it declares the peer dead about one budget after the peer last sent anything. The connection is then torn down like any other failure: a pending `.ipc.send` returns `io` and `.ipc.on.close` fires. A peer that is alive answers the probes from its kernel, even while it is busy evaluating, so a long query is never cut off.
+
+Keepalive only probes while none of our data is waiting for acknowledgement. Passing an explicit `keepalive` budget also bounds how long sent data may stay unacknowledged (`TCP_USER_TIMEOUT` on Linux), which catches a peer that vanishes mid-request. The cost is that a live peer which stops **reading** for that long also counts as dead: a large request to a server busy with something else, for example. The default does not set this bound. In that case a peer that vanishes with our data in flight is dropped by the operating system's retransmission limit, which is about 15 minutes on Linux. The budget is applied in whole seconds for the probe schedule. Platforms without these socket options skip them.
 
 The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged.
 
@@ -43,6 +55,9 @@ The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-ve
 
 ;; Fail fast if the peer doesn't answer within 2 seconds
 (set h (.ipc.open "127.0.0.1:5000" 2000))
+
+;; Declare the peer dead after ~10s of silence or unacknowledged data
+(set h (.ipc.open "127.0.0.1:5000" (dict [keepalive] [10000])))
 ```
 
 ## `.ipc.send` { #ipc-send }
