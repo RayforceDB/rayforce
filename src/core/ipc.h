@@ -168,6 +168,10 @@ ray_t*    ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
 size_t    ray_ipc_handle_threshold(int64_t handle);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
+/* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
+ * On expiry the connection is closed (on.close fires) and an `io` error
+ * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */
+ray_t*    ray_ipc_send_timeout(int64_t handle, ray_t* msg, int64_t timeout_ms);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg);
 

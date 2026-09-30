@@ -70,6 +70,7 @@
 #include "core/platform.h"
 #include "core/runtime.h"
 #include "core/poll.h"
+#include "core/timer.h"
 #include "store/serde.h"
 #include "mem/sys.h"
 #include "store/journal.h"
@@ -88,6 +89,7 @@ extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -2470,6 +2472,163 @@ static test_result_t test_ipc_keepalive_sockopts(void) {
 }
 #endif
 
+/* ---- .ipc.send deadline (#589) -----------------------------------------
+ * A peer that completes the handshake and then never answers: the shape
+ * of a half-open link, or of a server stuck in a long evaluation.  It
+ * optionally drains what it is sent, and records whether the client
+ * closed its end.  SO_RCVTIMEO bounds it, so a client that never closes
+ * fails the test instead of hanging it.  POSIX socket calls: not on
+ * Windows. */
+#ifndef RAY_OS_WINDOWS
+typedef struct {
+    ray_sock_t   lfd;
+    uint16_t     port;
+    bool         drain;     /* false: never read past the handshake */
+    volatile int saw_eof;
+    ray_thread_t tid;
+} silent_peer_t;
+
+static void silent_peer_thread(void* arg) {
+    silent_peer_t* p = (silent_peer_t*)arg;
+    ray_sock_t c = ray_sock_accept(p->lfd);
+    if (c == RAY_INVALID_SOCK) return;
+    ray_sock_set_blocking(c);
+    struct timeval tv = { 5, 0 };
+    setsockopt((int)c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint8_t hs[2];
+    if (recv((int)c, hs, 2, MSG_WAITALL) == 2) {
+        uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+        send((int)c, resp, 2, 0);
+        if (!p->drain) ray_test_sleep_ms(1500);  /* window fills meanwhile */
+        uint8_t buf[65536];
+        for (;;) {
+            ssize_t n = recv((int)c, buf, sizeof(buf), 0);
+            if (n == 0) { p->saw_eof = 1; break; }
+            if (n < 0) {
+                if (errno == ECONNRESET) p->saw_eof = 1;
+                break;
+            }
+        }
+    }
+    ray_sock_close(c);
+}
+
+static int silent_peer_start(silent_peer_t* p, bool drain) {
+    memset(p, 0, sizeof(*p));
+    p->drain = drain;
+    p->lfd = ray_sock_listen(0);
+    if (p->lfd == RAY_INVALID_SOCK) return -1;
+    p->port = ray_test_listen_port(p->lfd);
+    ray_thread_create(&p->tid, silent_peer_thread, p);
+    return 0;
+}
+
+static void silent_peer_stop(silent_peer_t* p) {
+    ray_thread_join(p->tid);
+    ray_sock_close(p->lfd);
+}
+
+/* No reply within the deadline: io error, the connection is closed (so a
+ * late reply can never answer a later send), and on.close fires. */
+static test_result_t test_ipc_send_deadline_expires(void) {
+    silent_peer_t peer;
+    TEST_ASSERT_EQ_I(silent_peer_start(&peer, true), 0);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", peer.port, NULL, NULL, 2000);
+    TEST_ASSERT((h) >= (0), "connect");
+
+    ray_t* r = ray_eval_str(
+        "(do (set _dl_fired 0)"
+        "    (set .ipc.on.close (fn [x] (set _dl_fired (+ _dl_fired 1)))) null)");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "install hook");
+    ray_release(r);
+
+    ray_t* msg = ray_i64(42);
+    int64_t t0 = ray_time_now_ms();
+    r = ray_ipc_send_timeout(h, msg, 200);
+    int64_t took = ray_time_now_ms() - t0;
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(r), RAY_ERR_IO);
+    ray_error_free(r);
+    TEST_ASSERT(took >= 200 && took < 2000, "expired on its deadline");
+
+    /* The handle is gone: a later send cannot pick up a stale reply. */
+    r = ray_ipc_send(h, msg);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    ray_error_free(r);
+    ray_release(msg);
+
+    r = ray_eval_str("_dl_fired");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "read counter");
+    TEST_ASSERT_EQ_I(r->i64, 1);
+    ray_release(r);
+    r = ray_eval_str("(set .ipc.on.close null)");
+    if (r) ray_release(r);
+
+    silent_peer_stop(&peer);
+    TEST_ASSERT_EQ_I(peer.saw_eof, 1);           /* our end really closed */
+    PASS();
+}
+
+/* The deadline covers the write too: a peer that never reads fills the
+ * socket buffers, and the send must not block past its deadline there. */
+static test_result_t test_ipc_send_deadline_covers_write(void) {
+    silent_peer_t peer;
+    TEST_ASSERT_EQ_I(silent_peer_start(&peer, false), 0);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", peer.port, NULL, NULL, 2000);
+    TEST_ASSERT((h) >= (0), "connect");
+
+    /* 64 MB: far past loopback socket buffering. */
+    int64_t n = 8 * 1024 * 1024;
+    ray_t* big = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(big);
+    big->len = n;
+    memset(ray_data(big), 0x5a, (size_t)n * sizeof(int64_t));
+
+    int64_t t0 = ray_time_now_ms();
+    ray_t* r = ray_ipc_send_timeout(h, big, 300);
+    int64_t took = ray_time_now_ms() - t0;
+    ray_release(big);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(r), RAY_ERR_IO);
+    ray_error_free(r);
+    TEST_ASSERT(took >= 300 && took < 1400, "write gave up on its deadline");
+
+    ray_t* msg = ray_i64(1);
+    r = ray_ipc_send(h, msg);                    /* handle closed */
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    ray_error_free(r);
+    ray_release(msg);
+
+    silent_peer_stop(&peer);
+    TEST_ASSERT_EQ_I(peer.saw_eof, 1);
+    PASS();
+}
+#endif
+
+/* A reply inside the deadline is returned as usual, and the handle stays
+ * open for the next send. */
+static test_result_t test_ipc_send_deadline_met(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "connect");
+
+    for (int i = 0; i < 2; i++) {
+        ray_t* msg = ray_str("(+ 1 2)", 7);
+        ray_t* r = ray_ipc_send_timeout(h, msg, 5000);
+        ray_release(msg);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 3);
+        ray_release(r);
+    }
+
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    PASS();
+}
+
 /* A compressed frame must survive a real socket round trip.
  *
  * Since #541 a loopback link never compresses, so every existing
@@ -2938,6 +3097,11 @@ const test_entry_t ipc_entries[] = {
 #if defined(__linux__)
     { "ipc/keepalive_sockopts",            test_ipc_keepalive_sockopts,             ipc_setup, ipc_teardown },
 #endif
+#ifndef RAY_OS_WINDOWS
+    { "ipc/send_deadline/expires",         test_ipc_send_deadline_expires,          ipc_setup, ipc_teardown },
+    { "ipc/send_deadline/covers_write",    test_ipc_send_deadline_covers_write,     ipc_setup, ipc_teardown },
+#endif
+    { "ipc/send_deadline/met",             test_ipc_send_deadline_met,              ipc_setup, ipc_teardown },
 
     /* wire-level characterization (refactor guard) */
     { "ipc/wire/resp_header_fields",       test_ipc_wire_resp_header_fields,        ipc_setup, ipc_teardown },
