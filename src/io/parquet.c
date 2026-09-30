@@ -275,7 +275,7 @@ struct ray_parquet {
     int64_t filter_pos, filter_lo, filter_hi, skipped;
     pq_interval* excluded;
     int64_t nexcluded, exclude_pos, group_rows, bloom_skipped, parallel_batches;
-    bool failed, emitted, borrowed;
+    bool failed, emitted, borrowed, filter_nulls;
 };
 static bool pq_reserve(uint8_t** buf, size_t* cap, size_t n) {
     if (n > PQ_MAX_PAGE) return false;
@@ -614,10 +614,13 @@ static const char* pq_start_group(ray_parquet_t* r) {
     pq_span filter_chunk = {0};
     ray_free_raw(r->excluded); r->excluded = NULL; r->nexcluded = r->exclude_pos = 0;
     if (!pq_group_columns(r,r->group,cols,&r->group_left,r->filter_pos >= 0 ? &filter_chunk : NULL)) { ray_free_raw(cols); return "invalid column chunk metadata"; }
-    if (r->filter_pos >= 0 && pq_disjoint(r,cols[r->selected[r->filter_pos]])) {
+    /* Bounds and Bloom filters describe non-null values. A WHERE accepting
+     * nulls must decode these groups/pages, including native null sentinels
+     * in required columns. Explicit read ranges still exclude nulls. */
+    if (r->filter_pos >= 0 && !r->filter_nulls && pq_disjoint(r,cols[r->selected[r->filter_pos]])) {
         r->group_left = 0; r->skipped++; ray_free_raw(cols); return NULL;
     }
-    if (r->filter_pos >= 0 && pq_bloom_absent(r,cols[r->selected[r->filter_pos]])) {
+    if (r->filter_pos >= 0 && !r->filter_nulls && pq_bloom_absent(r,cols[r->selected[r->filter_pos]])) {
         r->group_left = 0; r->skipped++; r->bloom_skipped++; ray_free_raw(cols); return NULL;
     }
     r->group_rows = r->group_left;
@@ -639,7 +642,7 @@ static const char* pq_start_group(ray_parquet_t* r) {
         ray_free_raw(c->strings); c->strings = NULL;
         ray_free_raw(c->symbol_ids); c->symbol_ids = NULL;
     }
-    if (!err && r->filter_pos >= 0) pq_page_intervals(r,filter_chunk);
+    if (!err && r->filter_pos >= 0 && !r->filter_nulls) pq_page_intervals(r,filter_chunk);
     ray_free_raw(cols); return err;
 }
 static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, bool compressed, const uint8_t** out) {
@@ -1108,7 +1111,7 @@ ray_t* ray_parquet_next(ray_parquet_t* r) {
         for (int64_t i = 0; i < rows; i++) {
             int64_t value = f->type == RAY_I16 ? ((int16_t*)ray_data(f))[i] :
                             f->type == RAY_I32 ? ((int32_t*)ray_data(f))[i] : ((int64_t*)ray_data(f))[i];
-            keep[i] = !ray_vec_is_null(f,i) && value >= r->filter_lo && value <= r->filter_hi;
+            keep[i] = ray_vec_is_null(f,i) ? r->filter_nulls : value >= r->filter_lo && value <= r->filter_hi;
             kept += keep[i];
         }
     }
@@ -1226,6 +1229,7 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->ngroups = group+1; r->group = group-1; r->batch_rows = parent->batch_rows;
     r->nselected = parent->nselected; r->noutput = parent->noutput;
     r->filter_pos = parent->filter_pos; r->filter_lo = parent->filter_lo; r->filter_hi = parent->filter_hi;
+    r->filter_nulls = parent->filter_nulls;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
@@ -2048,7 +2052,8 @@ static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int
             ray_t* v = ray_table_get_col_idx(batch,predicates[p].pos);
             int64_t x = v->type == RAY_I16 ? ((int16_t*)ray_data(v))[i] :
                 v->type == RAY_I32 ? ((int32_t*)ray_data(v))[i] : ((int64_t*)ray_data(v))[i];
-            keep = !ray_vec_is_null(v,i) && x >= predicates[p].lo && x <= predicates[p].hi;
+            keep = ray_vec_is_null(v,i) ? predicates[p].lo == INT64_MIN :
+                x >= predicates[p].lo && x <= predicates[p].hi;
         }
         if (!keep) continue;
         if (dst != i) for (int64_t c = 0; c < nc; c++) {
@@ -2127,10 +2132,11 @@ done:
     ray_free_raw(states); ray_free_raw(errors); return err;
 }
 static ray_t* pq_stream_aggregates(ray_parquet_t* r, ray_t* query, ray_t* where) {
-    /* range() was configured only after the entire WHERE was proven to be
-     * row-local integer comparisons. Other columns remain residual filters. */
-    if (where && r->filter_pos < 0) return NULL;
-    bool residual = !pq_exact_range(r,where);
+    /* A configured standalone LIKE is already fully applied by the reader.
+     * Otherwise range() proves row-local integer comparisons; other columns
+     * remain residual filters. Keep the aggregate row even for zero matches. */
+    if (where && r->filter_pos < 0 && !r->text_pattern) return NULL;
+    bool residual = !r->text_pattern && !pq_exact_range(r,where);
     pq_predicate predicates[PQ_MAX_COLS]; int64_t np = 0;
     if (residual && !pq_predicates(r,where,predicates,&np)) return NULL;
     ray_t* keys = ray_dict_keys(query); ray_t* vals = ray_dict_vals(query);
@@ -2243,8 +2249,12 @@ ray_t* ray_parquet_select_source(ray_t* source, ray_t* query, bool* complete) {
     ray_free_raw(keep);
     ray_t* where = pq_option(query,"where");
     int64_t col = -1, lo = INT64_MIN, hi = INT64_MAX;
-    if (pq_query_range(r,where,&col,&lo,&hi,0) && col >= 0 && lo <= hi)
+    if (pq_query_range(r,where,&col,&lo,&hi,0) && col >= 0 && lo <= hi) {
         err = ray_parquet_range(r,r->schema[col].name,lo,hi);
+        /* Query bounds use INT64_MIN only for an absent lower bound: literal
+         * nulls are rejected by pq_query_range. Rayforce nulls sort first. */
+        if (!err) r->filter_nulls = lo == INT64_MIN;
+    }
     /* A standalone LIKE is row-local. Retain the ordinary WHERE as well so
      * all later query stages use the same language semantics. */
     if (!err && where && where->type == RAY_LIST && where->len == 3) {
