@@ -118,12 +118,15 @@ jobs:
   # check sets currently surface only false positives (GNU computed-goto
   # label addresses, caller-guaranteed non-null params, defensive
   # redundant-null-check heuristics), so this reports without gating.
-  # cppcheck runs whole-tree here (fast); the heavier clang-tidy pass
+  # cppcheck runs whole-tree here over one pinned configuration (see
+  # CPPCHECK_DEFS in the Makefile); the heavier clang-tidy pass
   # (`make tidy`) runs locally and in the nightly workflow.  Flip to a
-  # blocking gate once the baseline is annotated clean.
+  # blocking gate once the baseline is annotated clean.  The timeout keeps a
+  # regression in analysis time from holding a runner for hours.
   static-analysis:
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install cppcheck
