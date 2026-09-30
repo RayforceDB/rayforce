@@ -4060,7 +4060,13 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * would reset the elapsed clock and fire premature "final" ticks. */
     ray_t* scan_err = validate_scan_columns(g);
     if (scan_err) return scan_err;
-    return ray_execute_inner(g, root);
+    /* Never NULL: callers test RAY_IS_ERR, which is false for NULL, and then
+     * dereference.  The inner paths hand NULL back unchanged when a node,
+     * a compaction or a merge fails to allocate (the flat path's
+     * `return result`, the streaming path's seg_tbl / partial / merged
+     * returns); `(times <lazy> ...)` would then crash in loop_count. */
+    ray_t* result = ray_execute_inner(g, root);
+    return result ? result : ray_error("oom", NULL);
 }
 
 /* Flatten one parted/mapcommon column into a dense vector (mirrors the

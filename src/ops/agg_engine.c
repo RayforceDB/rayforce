@@ -5421,7 +5421,10 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * groups themselves; the other routes trim their full result. */
     ray_group_emit_filter_t ef = ray_group_emit_filter_active();
     const ray_group_emit_filter_t* efp = ef.enabled ? &ef : NULL;
-    if (!g || !g->selection)
+    /* exec_group_v2_run reads g's op extensions unconditionally; a NULL
+     * graph is an error here, not a request for an unfiltered run. */
+    if (!g) return ray_error("nyi", NULL);
+    if (!g->selection)
         return exec_group_v2_run(g, op, tbl, ray_table_nrows(tbl), NULL, NULL, 0,
                                  group_limit, efp);
 
