@@ -1,10 +1,12 @@
 ;; ipc_open_opts.rfl — `.ipc.open`'s second argument (#541).
 ;;
 ;; It stays an integer connect timeout, or becomes an options dict with
-;; optional `timeout` and `compress`.  `compress` is a threshold in bytes,
-;; not a flag: 0N never compresses, 0 always does, n compresses payloads
-;; larger than n.  Absent means auto — loopback and UNIX-domain links
-;; default to never compressing, everything else to the built-in 2000.
+;; optional `timeout`, `compress` and `keepalive`.  `compress` is a
+;; threshold in bytes, not a flag: 0N never compresses, 0 always does, n
+;; compresses payloads larger than n.  Absent means auto — loopback and
+;; UNIX-domain links default to never compressing, everything else to the
+;; built-in 2000.  `keepalive` is a dead-peer budget in ms (#589): 0N
+;; turns detection off, absent keeps it on at the 60s default.
 ;;
 ;; Nothing is bound on 19974, so a well-formed call reaches connect and
 ;; fails with `io`; a malformed one is rejected before that, with `type`
@@ -20,6 +22,10 @@
 (.ipc.open "127.0.0.1:19974" (dict [compress] [0])) !- io
 (.ipc.open "127.0.0.1:19974" (dict [compress] [5000])) !- io
 (.ipc.open "127.0.0.1:19974" (dict [timeout compress] [200 0N])) !- io
+;; keepalive (#589): a dead-peer budget in ms, 0N = off
+(.ipc.open "127.0.0.1:19974" (dict [keepalive] [30000])) !- io
+(.ipc.open "127.0.0.1:19974" (dict [keepalive] [0N])) !- io
+(.ipc.open "127.0.0.1:19974" (dict [timeout keepalive] [200 5000])) !- io
 
 ;; an empty dict is valid — everything defaults
 (.ipc.open "127.0.0.1:19974" (dict [] [])) !- io
@@ -32,6 +38,11 @@
 (.ipc.open "127.0.0.1:19974" (dict [compress] ["lots"])) !- type
 (.ipc.open "127.0.0.1:19974" (dict [compress] [-5])) !- domain
 (.ipc.open "127.0.0.1:19974" (dict [timeout] [-1])) !- domain
+;; 0 could mean "off" or "immediately"; neither is guessed
+(.ipc.open "127.0.0.1:19974" (dict [keepalive] [0])) !- domain
+(.ipc.open "127.0.0.1:19974" (dict [keepalive] [-1])) !- domain
+(.ipc.open "127.0.0.1:19974" (dict [keepalive] ["1m"])) !- type
+(.ipc.open "127.0.0.1:19974" (dict [keepalve] [1000])) !- domain
 
 ;; a second argument that is neither an integer nor a dict
 (.ipc.open "127.0.0.1:19974" "soon") !- type

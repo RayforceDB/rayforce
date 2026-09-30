@@ -1740,11 +1740,13 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
 
     /* Optional second argument: an integer connect timeout in
      * milliseconds (0 = use default), or an options dict carrying
-     * `timeout` and/or `compress` (#541). */
+     * `timeout`, `compress` (#541) and/or `keepalive` (#589). */
     int    timeout_ms = 0;
     size_t compress   = RAY_IPC_COMPRESS_AUTO;
+    int    keepalive  = RAY_IPC_KEEPALIVE_AUTO;
     if (n == 2) {
-        ray_t* err = ray_ipc_parse_open_opts(args[1], &timeout_ms, &compress);
+        ray_t* err = ray_ipc_parse_open_opts(args[1], &timeout_ms, &compress,
+                                             &keepalive);
         if (err) return err;
     }
 
@@ -1802,7 +1804,8 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     const char* pw_ptr = (n_parts >= 4) ? password : NULL;
     const char* us_ptr = (n_parts >= 4) ? user : NULL;
 
-    int64_t h = ray_ipc_connect_opts(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms, compress);
+    int64_t h = ray_ipc_connect_opts(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms,
+                                     compress, keepalive);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
     if (h == -4) return ray_error("io", "wire version mismatch: %s:%d", host, port);

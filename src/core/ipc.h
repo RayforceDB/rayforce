@@ -44,6 +44,25 @@
  * concrete threshold when the connection is established. */
 #define RAY_IPC_COMPRESS_AUTO  ((size_t)-2)
 
+/* ===== Dead-peer detection (#589) =====
+ *
+ * Outbound connections get kernel keepalive by default, so a peer that
+ * vanishes without closing (suspended host, NAT/firewall that silently
+ * drops the flow) is torn down and `.ipc.on.close` fires, instead of the
+ * connection hanging forever.  See ray_sock_set_keepalive for how the
+ * budget maps onto the socket options.
+ *
+ *   RAY_IPC_KEEPALIVE_AUTO  keepalive at RAY_IPC_KEEPALIVE_DEFAULT_MS, no
+ *                           unacknowledged-data bound
+ *   RAY_IPC_KEEPALIVE_OFF   no keepalive
+ *   n > 0                   keepalive at budget n ms, plus the
+ *                           unacknowledged-data bound (TCP_USER_TIMEOUT) —
+ *                           the caller asked for n, so a peer that stops
+ *                           reading for n ms counts as dead too. */
+#define RAY_IPC_KEEPALIVE_DEFAULT_MS 60000
+#define RAY_IPC_KEEPALIVE_AUTO       0
+#define RAY_IPC_KEEPALIVE_OFF        (-1)
+
 /* Compression policy for one link: loopback and UNIX-domain peers never
  * compress (no bandwidth to buy with the CPU), everything else keeps the
  * compiled-in default.  An unknown peer keeps the default. */
@@ -123,20 +142,26 @@ int64_t ray_ipc_listen_at(ray_poll_t* poll, const char* host, uint16_t port);
 int64_t   ray_ipc_connect(const char* host, uint16_t port,
                            const char* user, const char* password,
                            int timeout_ms);
-/* As ray_ipc_connect, with an explicit compression threshold for the new
- * link.  RAY_IPC_COMPRESS_AUTO keeps the locality-derived default. */
+/* As ray_ipc_connect, with an explicit compression threshold and
+ * keepalive budget for the new link.  RAY_IPC_COMPRESS_AUTO keeps the
+ * locality-derived default; keepalive_ms is RAY_IPC_KEEPALIVE_AUTO,
+ * RAY_IPC_KEEPALIVE_OFF, or a budget in ms (see above). */
 int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
                            const char* user, const char* password,
-                           int timeout_ms, size_t compress_threshold);
+                           int timeout_ms, size_t compress_threshold,
+                           int keepalive_ms);
 
 /* Parse .ipc.open's optional second argument: an integer timeout in
- * milliseconds, or a dict with optional `timeout` and `compress`.
- * `compress` is a threshold in bytes — 0N never compresses, 0 always
- * does, n compresses payloads larger than n; absent leaves
- * RAY_IPC_COMPRESS_AUTO.  Returns NULL on success, or an error object
+ * milliseconds, or a dict with optional `timeout`, `compress` and
+ * `keepalive`.  `compress` is a threshold in bytes — 0N never
+ * compresses, 0 always does, n compresses payloads larger than n; absent
+ * leaves RAY_IPC_COMPRESS_AUTO.  `keepalive` is a dead-peer budget in
+ * ms — 0N turns it off, n > 0 sets it; absent leaves
+ * RAY_IPC_KEEPALIVE_AUTO.  Returns NULL on success, or an error object
  * the caller returns as-is. */
 ray_t*    ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
-                                  size_t* compress_threshold);
+                                  size_t* compress_threshold,
+                                  int* keepalive_ms);
 
 /* The compression threshold in force on an open handle, or
  * RAY_IPC_COMPRESS_AUTO if the handle does not resolve. */

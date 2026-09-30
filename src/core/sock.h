@@ -64,6 +64,24 @@ void       ray_sock_set_oob_owner(ray_sock_t s);
 int        ray_sock_take_oob(ray_sock_t s);
 void       ray_sock_close(ray_sock_t s);
 ray_err_t  ray_sock_set_nonblocking(ray_sock_t s);
+/* Dead-peer detection for an established TCP connection (#589).
+ * budget_ms > 0 turns on kernel keepalive tuned so that a silent peer is
+ * declared dead about budget_ms after the last thing it sent: the first
+ * probe goes out at budget_ms/2 of idle, then three more at budget_ms/6
+ * (whole seconds, at least 1 each — the kernel's granularity).  Keepalive
+ * only probes while nothing is in flight, so a live peer that is merely
+ * slow to read or to answer is never affected.
+ *
+ * user_timeout additionally bounds how long sent data may stay
+ * unacknowledged (TCP_USER_TIMEOUT on Linux, the nearest equivalent
+ * elsewhere).  That also catches a peer that vanishes with our data in
+ * flight, but it fires on a live peer that stops reading for budget_ms
+ * too (a zero receive window), so it is opt-in only.
+ *
+ * budget_ms <= 0 turns keepalive off.  Best-effort: an option the
+ * platform lacks is skipped.  Returns 0, or -1 if keepalive itself could
+ * not be enabled. */
+int        ray_sock_set_keepalive(ray_sock_t s, int budget_ms, bool user_timeout);
 ray_err_t  ray_sock_set_blocking(ray_sock_t s);
 
 /* ===== Link locality =====

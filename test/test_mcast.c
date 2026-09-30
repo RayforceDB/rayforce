@@ -959,14 +959,16 @@ static test_result_t test_ipc_connect_compress_override(void) {
     TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h_auto), RAY_IPC_COMPRESS_NEVER);
 
     /* Explicit threshold wins over the locality default... */
-    int64_t h_on = ray_ipc_connect_opts("127.0.0.1", port, NULL, NULL, 0, 2000);
+    int64_t h_on = ray_ipc_connect_opts("127.0.0.1", port, NULL, NULL, 0, 2000,
+                                        RAY_IPC_KEEPALIVE_AUTO);
     TEST_ASSERT((h_on) >= (0), "override connected");
     TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h_on), 2000);
 
     /* ...in both directions: NEVER stays NEVER on a link that would
      * otherwise have compressed. */
     int64_t h_off = ray_ipc_connect_opts("127.0.0.1", port, NULL, NULL, 0,
-                                         RAY_IPC_COMPRESS_NEVER);
+                                         RAY_IPC_COMPRESS_NEVER,
+                                         RAY_IPC_KEEPALIVE_AUTO);
     TEST_ASSERT((h_off) >= (0), "never connected");
     TEST_ASSERT_EQ_U(ray_ipc_handle_threshold(h_off), RAY_IPC_COMPRESS_NEVER);
 
