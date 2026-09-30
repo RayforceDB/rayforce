@@ -140,6 +140,13 @@ HARDENED_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) -g \
   -funroll-loops -fno-math-errno -fassociative-math -ffp-contract=fast \
   -fno-signed-zeros -fno-trapping-math -falign-functions=64
 
+# ndebug: the debug/test flavour with -DNDEBUG, so every assert() compiles
+# away.  Our own builds keep asserts on, but packagers, CMake Release and
+# `zig cc` define NDEBUG; code with work inside an assert then silently
+# skips it (#652: no builtins were registered).  `make test-ndebug` runs
+# the whole suite that way.
+NDEBUG_CFLAGS = $(DEBUG_CFLAGS) -DNDEBUG
+
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)
 
@@ -161,6 +168,9 @@ TSAN_MAIN_OBJ = $(MAIN_SRC:.c=.tsan.o)
 TSAN_TEST_OBJ = $(TEST_SRC:.c=.tsan.o)
 HARD_LIB_OBJ  = $(LIB_SRC:.c=.hard.o)
 HARD_MAIN_OBJ = $(MAIN_SRC:.c=.hard.o)
+NDEBUG_LIB_OBJ  = $(LIB_SRC:.c=.ndebug.o)
+NDEBUG_MAIN_OBJ = $(MAIN_SRC:.c=.ndebug.o)
+NDEBUG_TEST_OBJ = $(TEST_SRC:.c=.ndebug.o)
 
 # Auto-generated header dependencies (one .d per .o, see DEPFLAGS).
 # The fragments are -included at the very END of this file — including
@@ -170,7 +180,8 @@ DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
        $(REL_LIB_OBJ:.o=.d) $(REL_MAIN_OBJ:.o=.d) \
        $(FUZZ_LIB_OBJ:.o=.d) \
        $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
-       $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d)
+       $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d) \
+       $(NDEBUG_LIB_OBJ:.o=.d) $(NDEBUG_MAIN_OBJ:.o=.d) $(NDEBUG_TEST_OBJ:.o=.d)
 
 # Default target (pinned so an -included .d fragment can't steal it).
 .DEFAULT_GOAL := default
@@ -192,6 +203,9 @@ default: debug
 
 %.hard.o: %.c
 	$(CC) -c $(HARDENED_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.ndebug.o: %.c
+	$(CC) -c $(NDEBUG_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
 $(TARGET): $(LIB_OBJ) $(MAIN_OBJ)
@@ -244,6 +258,13 @@ test: LDFLAGS = $(DEBUG_LDFLAGS)
 test: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
+	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
+
+# The suite with every assert() compiled out (see NDEBUG_CFLAGS).  Relinks
+# ./$(TARGET) in the same flavour, as `test` does, for the IPC-diff tests.
+test-ndebug: $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)
+	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET) $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(LIBS) $(DEBUG_LDFLAGS)
+	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET).test $(NDEBUG_LIB_OBJ) $(NDEBUG_TEST_OBJ) $(LIBS) $(DEBUG_LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
 
 # ─── ThreadSanitizer ────────────────────────────────────────────────
@@ -417,7 +438,8 @@ cppcheck:
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
-	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ)
+	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) \
+	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)
 	-rm -f $(DEPS)
 	-rm -f $(TARGET) $(TARGET).test lib$(TARGET).a
 	-rm -f $(TARGET).tsan $(TARGET).test.tsan
@@ -428,7 +450,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist test coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: default debug release lib dist test test-ndebug coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

@@ -3071,6 +3071,17 @@ vm_error_cleanup: {
  * to any `.`-prefixed name are refused by ray_env_set, so user code
  * can't drift them apart.  Only 2-level namespaces are in use; the
  * assert below guards against silent breakage if that changes. */
+/* Builtin registration runs once at startup with no caller to report to, so
+ * a failure is fatal.  It is checked explicitly and never inside assert():
+ * an -DNDEBUG build compiles an assert away, work and all — the binds below
+ * once lived inside one, and such a build started with no builtins (#652). */
+static void reg_check(bool ok, const char* name, const char* what) {
+    if (ok) return;
+    fprintf(stderr, "rayforce: cannot register builtin %s: %s\n",
+            name ? name : "(namespace)", what);
+    abort();
+}
+
 /* Get-or-create a child dict by key on `parent`.  ray_dict_get
  * returns an owned ref (or NULL if missing), so we either reuse it
  * (after type-checking) or build a fresh subdict and upsert it.
@@ -3086,9 +3097,10 @@ static ray_t* dict_get_or_create_subdict(ray_t* parent, ray_t* key,
     if (existing) ray_release(existing);
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 4);
     ray_t* vals = ray_list_new(4);
-    assert(keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals));
+    reg_check(keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals),
+              NULL, "out of memory");
     ray_t* child = ray_dict_new(keys, vals);
-    assert(child && !RAY_IS_ERR(child));
+    reg_check(child && !RAY_IS_ERR(child), NULL, "out of memory");
     ray_retain(child);  /* caller retains; dict_upsert below also retains */
     parent = ray_dict_upsert(parent, key, child);
     *out_child = child;
@@ -3112,9 +3124,10 @@ static void reg_bind(const char* name, ray_t* obj) {
         } else {
             ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 4);
             ray_t* vals = ray_list_new(4);
-            assert(keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals));
+            reg_check(keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals),
+                      name, "out of memory");
             root = ray_dict_new(keys, vals);
-            assert(root && !RAY_IS_ERR(root));
+            reg_check(root && !RAY_IS_ERR(root), name, "out of memory");
         }
 
         /* 2. For each intermediate segment, descend into (or create)
@@ -3159,12 +3172,13 @@ static void reg_bind(const char* name, ray_t* obj) {
          *    highlighting) enumerates every reserved builtin by name.
          *    ray_env_bind_flat skips the dotted-walk so this doesn't
          *    re-upsert into the same dict we just built. */
-        assert(ray_env_bind(root_sym, chain[0]) == RAY_OK);
+        reg_check(ray_env_bind(root_sym, chain[0]) == RAY_OK, name,
+                  "binding its namespace root failed");
         ray_release(chain[0]);
-        assert(ray_env_bind_flat(sym, obj) == RAY_OK);
+        reg_check(ray_env_bind_flat(sym, obj) == RAY_OK, name, "binding failed");
         return;
     }
-    assert(ray_env_bind(sym, obj) == RAY_OK);
+    reg_check(ray_env_bind(sym, obj) == RAY_OK, name, "binding failed");
 }
 
 static void register_binary(const char* name, uint8_t attrs, ray_binary_fn fn) {
