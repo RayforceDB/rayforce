@@ -49,6 +49,7 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
