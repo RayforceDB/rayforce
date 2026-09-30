@@ -1,0 +1,192 @@
+{
+  "parquet": "/tmp/rayforce-clickbench-full.parquet",
+  "csv": "/tmp/rayforce-clickbench-full.csv",
+  "schema": "/home/hetoku/data/work/ClickBench/rayforce/create.rfl",
+  "cpu": "x86_64",
+  "logical_cpus": 28,
+  "input_bytes": {
+    "csv": 78462321894,
+    "parquet": 14779976446
+  },
+  "page_cache": "OS-managed; no cache eviction",
+  "timing": "process + native indexes + reopen + output fsync",
+  "results": [
+    {
+      "kind": "csv",
+      "cores": 28,
+      "repeat": 0,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 112.20130286399217,
+      "process_seconds": 112.12,
+      "peak_rss_kib": 57853476,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 28,
+      "repeat": 0,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 111.79427186300745,
+      "process_seconds": 111.64,
+      "peak_rss_kib": 54960308,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 28,
+      "repeat": 1,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 108.55062488399562,
+      "process_seconds": 108.47,
+      "peak_rss_kib": 55387880,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 28,
+      "repeat": 1,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 125.60159180300252,
+      "process_seconds": 125.52,
+      "peak_rss_kib": 59516320,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 28,
+      "repeat": 2,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 123.01205844699871,
+      "process_seconds": 122.83,
+      "peak_rss_kib": 58392464,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 28,
+      "repeat": 2,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 100.22642820300825,
+      "process_seconds": 100.14,
+      "peak_rss_kib": 55450524,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 8,
+      "repeat": 0,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 145.03412295099406,
+      "process_seconds": 144.94,
+      "peak_rss_kib": 56970088,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 8,
+      "repeat": 0,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 104.45399783599714,
+      "process_seconds": 104.37,
+      "peak_rss_kib": 52489196,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 8,
+      "repeat": 1,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 99.68813424799009,
+      "process_seconds": 99.58,
+      "peak_rss_kib": 48723944,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 8,
+      "repeat": 1,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 125.43565527698956,
+      "process_seconds": 125.28,
+      "peak_rss_kib": 56344680,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 8,
+      "repeat": 2,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 135.2072667439934,
+      "process_seconds": 135.09,
+      "peak_rss_kib": 59701964,
+      "native_bytes": 59042332197,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 8,
+      "repeat": 2,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 73.56849755599978,
+      "process_seconds": 73.47,
+      "peak_rss_kib": 55747412,
+      "native_bytes": 59042332197,
+      "verified": true
+    }
+  ],
+  "medians": [
+    {
+      "cores": 28,
+      "csv": 123.01205844699871,
+      "parquet": 108.55062488399562,
+      "csv_over_parquet": 1.1332229416316812
+    },
+    {
+      "cores": 8,
+      "csv": 135.2072667439934,
+      "parquet": 99.68813424799009,
+      "csv_over_parquet": 1.3563025104637207
+    }
+  ],
+  "dataset": "ClickBench complete Athena hits.parquet",
+  "full_100m_dataset": true,
+  "dataset_url": "https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet",
+  "row_groups": 226,
+  "cells_per_import": 10499737185,
+  "binary_sha256": "6d2b4d2e65d94b0627b1441227e21d6cb9e37a46640d6cc04faacec45c2a6d1d",
+  "phase": "before dictionary contention and lifetime fixes",
+  "verification": "Every column name, type and row value; numeric payload bytes and symbol string bytes. Index presence/size reflected in identical output sizes.",
+  "cpu_model": "Intel Core i7-14700",
+  "physical_cores": 20,
+  "ram_gib": 62,
+  "storage": "Samsung SSD 990 PRO 2TB, /dev/nvme0n1p3",
+  "swap": "16 GiB zram plus approximately 4 GiB disk swap; swapping observed, predominantly zram",
+  "input_preparation": "DuckDB 1.1.3 export of the same Parquet, UTC, headerless CSV; preparation excluded from load timing",
+  "base_commit": "95b0b91c2be60954e11ad106f0bf24c8f340b948",
+  "dirty_worktree": true,
+  "parquet_sha256": "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f",
+  "schema_sha256": "2e62ea68186f0afd6dfd5b98c372371c56e8d7b8510eeda21404a46d219b6625",
+  "kernel": "6.17.9-76061709-generic"
+}

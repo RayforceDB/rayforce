@@ -1,0 +1,109 @@
+{
+  "date": "2026-09-30",
+  "scope": "Native flat Parquet adapter and full ClickBench evidence; broader P2\u2013P6 roadmap remains partial",
+  "platform": "Linux x86_64, Intel Core i7-14700",
+  "sanitizers": {
+    "passed": 3978,
+    "failed": 0,
+    "skipped": 0,
+    "command": "make test -j8",
+    "log": "build/parquet-recovery/test-final-full.log"
+  },
+  "scalar_decoder": {
+    "passed": 14,
+    "failed": 0,
+    "method": "Recompile src/io/parquet.c with -U__SSE2__ and ASan/UBSan; link against sanitized library/test objects; run -f parquet",
+    "log": "build/parquet-recovery/test-parquet-scalar.log"
+  },
+  "fuzz": {
+    "returncode": 0,
+    "executed_inputs": 9600493,
+    "seconds": 601,
+    "peak_rss_mib": 1053,
+    "sanitizer_findings": 0,
+    "command": "setarch x86_64 -R env ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 build_fuzz/fuzz_parquet fuzz/corpus/parquet fuzz/seeds/parquet -rss_limit_mb=4096 -timeout=10 -max_len=16384 -print_final_stats=1 -artifact_prefix=build/parquet-recovery/fuzz/ -max_total_time=600",
+    "build": "make build_fuzz/fuzz_parquet -j8 FUZZ_LDEXTRA=-L/usr/lib/gcc/x86_64-linux-gnu/11",
+    "log": "build/parquet-recovery/fuzz-parquet-final.log",
+    "setup_notes": [
+      "Initial Clang link needed the installed GCC 11 C++ library search path.",
+      "Initial startup segfaulted before processing input; an empty-input replay passed, and the sustained run used the existing reduced-ASLR workaround.",
+      "No ASan, UBSan or LSan diagnostics appeared in the successful full-run log."
+    ],
+    "limits": "Serial decoder/pruning harness, at most 256 batches of 257 rows per input; does not cover parallel scheduling or native publication."
+  },
+  "full_dataset": {
+    "rows": 99997497,
+    "columns": 105,
+    "cells_per_load": 10499737185,
+    "direct_queries_verified": 43,
+    "partitioned_cases_verified": 12,
+    "query_report": "2026-09-30-full-queries.json",
+    "load_report": "2026-09-30-parted-full.json",
+    "measured_binary_sha256": "3efe1db444730918af49610cb26a313729f54bc3ccc3f15fb61173f84ae0b86b"
+  },
+  "failure_injection": {
+    "old_binary": {
+      "returncode": 0,
+      "published": true,
+      "stdout": "",
+      "stderr": "",
+      "file_size_limit": 64
+    },
+    "fixed_sanitized_binary": {
+      "returncode": 1,
+      "published": false,
+      "staging_retained": true,
+      "stdout": "",
+      "stderr": "error: io: parquet: native partition write failed\n",
+      "file_size_limit": 64
+    },
+    "fixed_release_binary": {
+      "returncode": 1,
+      "published": false,
+      "staging_retained": true,
+      "stdout": "",
+      "stderr": "error: io: parquet: native partition write failed\n",
+      "file_size_limit": 64
+    }
+  },
+  "harness_regressions": {
+    "passed": true,
+    "checks": [
+      "load/query completed cases retained",
+      "partial output archived",
+      "changed source/settings rejected",
+      "native numeric corruption rejected",
+      "native dictionary-text corruption rejected"
+    ],
+    "command": "python3 scripts/parquet-harness-selftest.py build/parquet-recovery/data/hits-1m.parquet --rayforce ./rayforce --native-verifier build/parquet-recovery/verify-native --work-dir build/parquet-recovery/harness-resume-tests",
+    "log": "build/parquet-recovery/test-harness-resume.log"
+  },
+  "release": {
+    "command": "make -B release -j8 TARGET=build/parquet-recovery/rayforce-final",
+    "path": "build/parquet-recovery/rayforce-final",
+    "bytes": 5371656,
+    "sha256": "c279da830779bb186dff5d700f389cc216762dd9758dcb5aa73da1ba2f096d61",
+    "needed_libraries": [
+      "libm.so.6",
+      "libc.so.6",
+      "ld-linux-x86-64.so.2"
+    ],
+    "native_smoke": {
+      "rows": 1000,
+      "columns": 105,
+      "splayed_verified": true,
+      "parted_verified": true
+    },
+    "changes_since_measured_build": [
+      "Propagate buffered column fclose failures before rename.",
+      "Publish new CSV/Parquet destinations with exclusive rename.",
+      "Disable Parquet import writes in fuzz builds only."
+    ]
+  },
+  "docs": {
+    "passed": true,
+    "command": "mkdocs build --strict --site-dir build/parquet-recovery/site",
+    "log": "build/parquet-recovery/docs-build.log"
+  },
+  "remaining_plan": "docs/parquet-completion-plan.md"
+}
