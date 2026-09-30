@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check lazy Parquet queries on a ClickBench sample against external DuckDB.
+"""Check lazy Parquet queries on a ClickBench sample against external reference SQL engine.
 
 Python standard library only. Queries cover representative shapes from
 ../ClickBench/rayforce/queries.sql, with deterministic group ordering and raw
@@ -42,7 +42,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('parquet', type=Path)
     ap.add_argument('--rayforce', type=Path, default=Path('./rayforce'))
-    ap.add_argument('--duckdb', default='duckdb')
+    ap.add_argument('--oracle', required=True, help='reference SQL CLI executable')
     ap.add_argument('--cores', type=int, default=4)
     args = ap.parse_args()
     path = args.parquet.resolve()
@@ -59,7 +59,7 @@ def main():
         report = []
         for name, _, body in QUERIES:
             command = f'CREATE VIEW hits AS SELECT * FROM read_parquet({sql(path)}); SELECT {body};'
-            oracle = subprocess.run([args.duckdb,'-csv','-c',command],check=True,capture_output=True,text=True).stdout
+            oracle = subprocess.run([args.oracle,'-csv','-c',command],check=True,capture_output=True,text=True).stdout
             right = list(csv.reader(io.StringIO(oracle)))
             with (tmp/(name+'.csv')).open(newline='') as f: left = list(csv.reader(f))
             if not left or not right or set(left[0]) != set(right[0]) or len(left) != len(right):

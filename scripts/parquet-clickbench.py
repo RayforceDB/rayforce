@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full ClickBench direct-Parquet census, with an external DuckDB oracle.
+"""Full ClickBench direct-Parquet census, with an external reference SQL oracle.
 
 Standard library only. One fresh process per query; retain scripts, CSVs,
 logs, query time and process RSS. This is a diagnostic census, not the official
@@ -166,7 +166,7 @@ def verify_ties(a, stem, ray, sql, setup, headers, actual, expected):
              f'(SELECT count(*) FROM r WHERE {" AND ".join(comparisons)}) >= a.copies;')
     stem.with_suffix('.ties.sql').write_text(query+'\n')
     output = stem.with_suffix('.ties.json')
-    status = run([a.duckdb, '-json', '-c', query], output, a.timeout)
+    status = run([a.oracle, '-json', '-c', query], output, a.timeout)
     if status['status'] != 'executed':
         return False
     return json.loads(output.read_text())[0]['matches'] == len(actual)
@@ -177,7 +177,8 @@ def main():
     p.add_argument('parquet', type=Path)
     p.add_argument('--rayforce', type=Path, default=Path('./rayforce'))
     p.add_argument('--clickbench', type=Path, default=Path('../ClickBench'))
-    p.add_argument('--duckdb', default='duckdb')
+    p.add_argument('--oracle', required=True, help='reference SQL CLI executable')
+    p.add_argument('--oracle-queries', type=Path, required=True, help='reference SQL file: 43 ClickBench queries, one per line')
     p.add_argument('--cores', type=int, default=os.cpu_count())
     p.add_argument('--timeout', type=int, default=180)
     p.add_argument('--address-space-gib', type=int, default=0,
@@ -196,7 +197,7 @@ def main():
         if not root.is_dir(): p.error('--resume requires an existing work directory')
     else: root.mkdir(exist_ok=False)
     ray_queries = (a.clickbench/'rayforce/queries.sql').read_text().splitlines()
-    sql_queries = (a.clickbench/'duckdb/queries.sql').read_text().splitlines()
+    sql_queries = a.oracle_queries.read_text().splitlines()
     if len(ray_queries) != 43 or len(sql_queries) != 43:
         raise RuntimeError('expected 43 one-line queries per ClickBench adapter')
     options = ''
@@ -219,9 +220,9 @@ def main():
               'results': []}
     identity = {k:v for k,v in report.items() if k != 'results'}
     identity.update(queries=a.queries,ray_queries_sha256=digest(a.clickbench/'rayforce/queries.sql'),
-                    sql_queries_sha256=digest(a.clickbench/'duckdb/queries.sql'),
+                    sql_queries_sha256=digest(a.oracle_queries),
                     checkpoint_sha256=digest(Path(__file__).with_name('parquet_checkpoint.py')),
-                    duckdb_sha256=digest(shutil.which(a.duckdb) or a.duckdb))
+                    oracle_sha256=digest(shutil.which(a.oracle) or a.oracle))
     previous = open_run(root,a.resume,identity)
     if previous: report = previous
     completed = {x['query'] for x in report['results']}
@@ -255,13 +256,13 @@ def main():
                 result.update(process_seconds=float(tokens[0]), peak_rss_kib=int(tokens[1]),
                               user_seconds=float(tokens[2]), system_seconds=float(tokens[3]))
         if result['status'] == 'executed' and output.exists():
-            print(f'Q{number:02d} DuckDB', flush=True)
+            print(f'Q{number:02d} reference SQL engine', flush=True)
             source = "'" + str(a.parquet.resolve()).replace("'", "''") + "'"
             setup = f"SET threads={a.cores}; SET memory_limit='32GB'; CREATE VIEW hits AS SELECT * FROM read_parquet({source}); "
             oracle_sql = setup + sql
             stem.with_suffix('.sql').write_text(oracle_sql+'\n')
             oracle_path = stem.with_suffix('.oracle.json')
-            oracle = run([a.duckdb, '-json', '-c', oracle_sql], oracle_path, a.timeout)
+            oracle = run([a.oracle, '-json', '-c', oracle_sql], oracle_path, a.timeout)
             result['oracle'] = oracle
             if oracle['status'] == 'executed':
                 rows = json.loads(oracle_path.read_text().strip() or '[]')

@@ -254,7 +254,7 @@
   "full_100m_dataset": false,
   "repeats_per_case": 3,
   "alternating_order": true,
-  "csv_preparation": "DuckDB 1.1.3 export of the same original Parquet rows; headerless CSV; SET TimeZone='UTC'; format raw Unix seconds/days as ISO timestamps/dates",
+  "csv_preparation": "Reference SQL CLI 1.1.3 export of the same original Parquet rows; headerless CSV; SET TimeZone='UTC'; format raw Unix seconds/days as ISO timestamps/dates",
   "build": "release, -O3 -march=native; no third-party libraries",
   "binary_sha256": "e7ccf08863a33b17dfdf1cb01202160dcddc6fccb3f306f1c08a2d5ae7eed201",
   "baseline_commit": "95b0b91c2be60954e11ad106f0bf24c8f340b948",
@@ -269,7 +269,7 @@
       "passed": 3970,
       "failed": 0
     },
-    "multigroup_duckdb_queries": {
+    "multigroup_oracle_queries": {
       "passed": 12,
       "cores": 28,
       "rows": 3266382

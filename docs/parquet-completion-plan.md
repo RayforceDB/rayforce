@@ -1,7 +1,7 @@
 # Parquet completion plan
 
 Status: in progress, 2026-09-30. No third-party implementation or runtime
-libraries. External DuckDB is a development oracle only. Existing local work
+libraries. An external reference SQL engine is a development oracle only. Existing local work
 and the measured full ClickBench splayed baseline are preserved.
 
 Current checkpoint: **P1's full-size evidence gates are complete**: all 43
@@ -21,7 +21,7 @@ partial; see the explicit open list at the end.
 - Run all 43 ClickBench query shapes against direct Parquet. Record individual
   failures rather than stopping at the first unsupported query. Record any
   necessary translations explicitly, including raw Unix temporal units.
-- Check results against DuckDB, accounting for SQL's unspecified tie ordering
+- Check results against the reference SQL engine, accounting for SQL's unspecified tie ordering
   and unordered LIMIT. Do not mark execution-only results as verified.
 - Fix correctness failures before treating timings as performance evidence.
 
@@ -146,7 +146,7 @@ documented rejection, and no added third-party library dependencies.
   The latter also fixes ordinary in-memory queries. Regressions cover nested
   conditions, prefiltering and references to earlier computed aliases.
 - Final recovery validation: ASan/UBSan **3,975/3,975 passed**; the one-million-row
-  ClickBench sample has **43/43 queries verified** against DuckDB, including
+  ClickBench sample has **43/43 queries verified** against the reference SQL engine, including
   exact full-row membership and multiplicity for tied alternatives. Report:
   `bench/parquet_load/results/2026-09-30-sample-queries.json`. Separate verifier
   self-checks reject invented rows, wrong ranks and excess duplicate rows.

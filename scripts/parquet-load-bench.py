@@ -47,8 +47,8 @@ def main():
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--reference', type=Path, help='existing verified native CSV reference; retained')
     p.add_argument('--kinds', choices=['csv','parquet'], nargs='+', default=['csv','parquet'])
-    p.add_argument('--prepare-csv', action='store_true', help='export identical rows with external DuckDB before timing; CSV must not exist')
-    p.add_argument('--duckdb', default='duckdb')
+    p.add_argument('--prepare-csv', action='store_true', help='export identical rows with external reference SQL engine before timing; CSV must not exist')
+    p.add_argument('--oracle', help='reference SQL CLI executable')
     p.add_argument('--native-verifier', type=Path, help='bounded-memory verifier built from bench/parquet_load/verify-native.c')
     p.add_argument('--layout', choices=['splayed','parted'], default='splayed')
     p.add_argument('--partition-rows', type=int, default=65536,
@@ -56,6 +56,7 @@ def main():
     p.add_argument('--work-dir', type=Path, required=True)
     p.add_argument('--resume', action='store_true', help='continue an unchanged checkpointed run; retain completed verified cases')
     a = p.parse_args()
+    if a.prepare_csv and not a.resume and not a.oracle: p.error('--prepare-csv requires --oracle')
     if a.repeats < 1 or any(c < 1 for c in a.cores): p.error('positive repeats/cores required')
     if len(set(a.cores)) != len(a.cores) or len(set(a.kinds)) != len(a.kinds): p.error('cores and kinds must not contain duplicates')
     if not 1 <= a.partition_rows <= 1048576: p.error('partition rows must be 1..1048576')
@@ -86,7 +87,7 @@ def main():
         sql = ("SET TimeZone='UTC'; SET threads=8; COPY (SELECT * REPLACE ("+', '.join(replacements)+
                f") FROM read_parquet({sqlstr(a.parquet.resolve())})) TO {sqlstr(a.csv.resolve())} (HEADER false, DELIMITER ',');")
         (root/'prepare.sql').write_text(sql+'\n')
-        subprocess.run([a.duckdb,'-c',sql],check=True)
+        subprocess.run([a.oracle,'-c',sql],check=True)
     reference = a.reference.resolve() if a.reference else None
     identity = {'parquet':file_identity(a.parquet),'csv':file_identity(a.csv),
                 'schema_sha256':digest(create),'binary_sha256':digest(binary),

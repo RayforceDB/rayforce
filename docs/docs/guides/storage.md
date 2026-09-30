@@ -294,6 +294,10 @@ Alternatively, use `.parquet.scan` as a `select` source: it reopens the file for
 each query, infers projections for statically understood expressions, and
 extracts signed-integer comparisons (`==`, `<`, `<=`, `>`, `>=`, including
 conjunctions, reversed operands, and literal inclusive `within` bounds).
+Upper-bound comparisons retain nulls, which Rayforce orders before numbers.
+When a pushed predicate accepts nulls, the reader decodes all candidate pages
+instead of pruning with nonnull statistics or Bloom filters. Explicit
+`.parquet.read` ranges continue to exclude nulls.
 A standalone `like` predicate filters each decoded batch before materializing
 the result. Filtered text enters a private symbol dictionary only after it
 survives the reader predicate. Dynamic expressions fall back to carrying
@@ -303,8 +307,9 @@ are evaluated by the ordinary query engine without early filtering.
 Simple global `count`, integer `sum`/`avg`, and supported numeric/temporal
 `min`/`max` expressions use the native streaming accumulators. An unfiltered
 count uses footer row counts without decoding pages. Filtered streaming
-aggregates currently require row-local signed-integer comparisons; one column
-uses reader pruning and residual comparisons run on each batch. Other queries,
+aggregates support row-local signed-integer comparisons or a standalone `like`.
+For integer comparisons, one column uses reader pruning and residual comparisons
+run on each batch. Other queries,
 including grouping, distinct and ordering, materialize the inferred columns
 and candidate rows before ordinary query execution, preserving global query
 semantics. These queries are not bounded-memory scans. The lazy descriptor is
@@ -443,7 +448,13 @@ temporal types. Those benchmark-specific conversions do not belong in the
 format reader.
 
 The following developer tools use Python's standard library; remote range
-fetches use the `curl` executable. DuckDB is an external test oracle only.
+fetches use the `curl` executable. The reference SQL engine is an external test
+oracle only. Pass its executable
+with `--oracle`; it must accept `-c`, `-csv`, and `-json` and support
+`read_parquet`, `COPY`, and the SQL expressions in the scripts. The full
+query census also requires `--oracle-queries`, a file containing the 43
+corresponding SQL queries, one per line. These tools are development-only
+and are not runtime dependencies.
 
 ```bash
 # Inventory the original footer and copy original pages for a bounded sample.
@@ -451,11 +462,12 @@ python3 scripts/parquet-inspect.py \
   https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet \
   --sample /tmp/hits-sample.parquet --groups 1
 
-# Compare every sample cell to DuckDB and every native batch to the source.
-python3 scripts/parquet-verify.py /tmp/hits-sample.parquet
+# Compare every sample cell to the reference SQL engine and every native batch to the source.
+python3 scripts/parquet-verify.py /tmp/hits-sample.parquet --oracle /path/to/reference-sql
 
 # Compare representative lazy query shapes with the external oracle.
-python3 scripts/parquet-query-verify.py /tmp/hits-sample.parquet --cores 4
+python3 scripts/parquet-query-verify.py /tmp/hits-sample.parquet --cores 4 \
+  --oracle /path/to/reference-sql
 
 # Warm scan timings: all columns, projection, footer count, streaming aggregates.
 make release
@@ -466,13 +478,13 @@ make test TEST_FILTER=parquet
 ```
 
 The first original row group (450,560 rows) was checked across all 105 columns:
-47,308,800 cells matched DuckDB, and all seven converted native partitions
+47,308,800 cells matched the reference SQL engine, and all seven converted native partitions
 matched the decoded source. Twelve representative lazy query shapes also
 matched the oracle, including grouping, distinct counts, top-k and empty
 filtered aggregates.
 
 The full 99,997,497-row input subsequently passed all **43 ClickBench query
-shapes** against DuckDB on 2026-09-30, using explicit SYM text types, 28 workers,
+shapes** against the reference SQL engine on 2026-09-30, using explicit SYM text types, 28 workers,
 and a recorded 48 GiB process address-space ceiling. The per-query scripts,
 translations, timings, peak RSS and oracle outcomes are recorded in
 `bench/parquet_load/results/2026-09-30-full-queries.json`. Tied LIMIT alternatives
@@ -520,14 +532,14 @@ does not in this measurement. These are sample scan timings, not a published
 `../ClickBench/rayforce/create.rfl` and runs its `.csv.splayed` load against
 `.parquet.splayed` with the same native schema. It maps the Athena file's raw
 integer dates/timestamps using explicit Unix units and stores all text as SYM,
-matching ClickBench. An optional external DuckDB export prepares a headerless
+matching ClickBench. An optional external reference SQL export prepares a headerless
 CSV containing the identical rows, with UTC timestamps. Export and download are
 outside the measured load stage; no external library is linked to Rayforce.
 
 ```bash
 make release
 python3 scripts/parquet-load-bench.py /tmp/hits-sample.parquet /tmp/hits-sample.csv \
-  --prepare-csv --duckdb duckdb --cores 1 8 28 --repeats 3 \
+  --prepare-csv --oracle /path/to/reference-sql --cores 1 8 28 --repeats 3 \
   --work-dir /tmp/rayforce-load-comparison
 ```
 
@@ -550,7 +562,7 @@ cc -O3 -Iinclude bench/parquet_load/verify-native.c -o /tmp/verify-native
 curl --fail --location --output /tmp/hits.parquet \
   https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet
 python3 scripts/parquet-load-bench.py /tmp/hits.parquet /tmp/hits.csv \
-  --prepare-csv --duckdb duckdb --cores 28 8 --repeats 3 \
+  --prepare-csv --oracle /path/to/reference-sql --cores 28 8 --repeats 3 \
   --native-verifier /tmp/verify-native --work-dir /tmp/rayforce-full-load
 ```
 

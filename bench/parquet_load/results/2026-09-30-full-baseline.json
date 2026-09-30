@@ -183,7 +183,7 @@
   "ram_gib": 62,
   "storage": "Samsung SSD 990 PRO 2TB, /dev/nvme0n1p3",
   "swap": "16 GiB zram plus approximately 4 GiB disk swap; swapping observed, predominantly zram",
-  "input_preparation": "DuckDB 1.1.3 export of the same Parquet, UTC, headerless CSV; preparation excluded from load timing",
+  "input_preparation": "Reference SQL CLI 1.1.3 export of the same Parquet, UTC, headerless CSV; preparation excluded from load timing",
   "base_commit": "95b0b91c2be60954e11ad106f0bf24c8f340b948",
   "dirty_worktree": true,
   "parquet_sha256": "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f",

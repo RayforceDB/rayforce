@@ -41,16 +41,17 @@ def main():
     p.add_argument('source',type=Path,help='ClickBench Parquet input')
     p.add_argument('--rayforce',type=Path,required=True)
     p.add_argument('--native-verifier',type=Path,required=True)
-    p.add_argument('--duckdb',default='duckdb')
+    p.add_argument('--oracle',required=True,help='reference SQL CLI executable')
+    p.add_argument('--oracle-queries', type=Path, required=True, help='reference SQL file: 43 ClickBench queries, one per line')
     p.add_argument('--work-dir',type=Path,required=True)
     a=p.parse_args(); root=a.work_dir.resolve(); root.mkdir(exist_ok=False)
     pq=root/'small.parquet'; csv=root/'small.csv'
     quote=lambda s: "'"+str(s).replace("'","''")+"'"
-    subprocess.run([a.duckdb,'-c',f'COPY (SELECT * FROM read_parquet({quote(a.source.resolve())}) LIMIT 1000) TO {quote(pq)} (FORMAT PARQUET, COMPRESSION SNAPPY)'],check=True)
+    subprocess.run([a.oracle,'-c',f'COPY (SELECT * FROM read_parquet({quote(a.source.resolve())}) LIMIT 1000) TO {quote(pq)} (FORMAT PARQUET, COMPRESSION SNAPPY)'],check=True)
     load=root/'loads'
     command=[sys.executable,'scripts/parquet-load-bench.py',str(pq),str(csv),'--prepare-csv',
              '--rayforce',str(a.rayforce.resolve()),'--native-verifier',str(a.native_verifier.resolve()),
-             '--duckdb',a.duckdb,'--cores','1','2','--repeats','1','--work-dir',str(load)]
+             '--oracle',a.oracle,'--cores','1','2','--repeats','1','--work-dir',str(load)]
     run(command,load)
     before=json.loads((load/'results.json').read_text()); assert len(before['results'])==1
     (load/'stop').unlink()
@@ -90,7 +91,7 @@ def main():
 
     query=root/'queries'
     command=[sys.executable,'scripts/parquet-clickbench.py',str(pq),'--rayforce',str(a.rayforce.resolve()),
-             '--duckdb',a.duckdb,'--queries','1','3','--cores','1','--work-dir',str(query)]
+             '--oracle',a.oracle,'--oracle-queries',str(a.oracle_queries.resolve()),'--queries','1','3','--cores','1','--work-dir',str(query)]
     run(command,query)
     before=json.loads((query/'results.json').read_text()); assert len(before['results'])==1 and before['results'][0]['verified']
     old_csv=fingerprint(query/'q01.csv')

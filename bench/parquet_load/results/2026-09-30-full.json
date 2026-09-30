@@ -260,7 +260,7 @@
   "kernel": "6.17.9-76061709-generic",
   "swap": "16 GiB zram plus approximately 4 GiB disk swap; swapping observed, predominantly zram",
   "compiler": "GCC 11.4.0, release Makefile flags including -O3 -march=native",
-  "input_preparation": "DuckDB 1.1.3 CLI, UTC, headerless CSV exported from the same full Parquet; download/export excluded",
+  "input_preparation": "Reference SQL CLI 1.1.3 CLI, UTC, headerless CSV exported from the same full Parquet; download/export excluded",
   "export_sql": "SET TimeZone='UTC'; SET threads=8; COPY (SELECT * REPLACE (strftime(to_timestamp(\"EventTime\"), '%Y-%m-%d %H:%M:%S') AS \"EventTime\", strftime(DATE '1970-01-01' + \"EventDate\", '%Y-%m-%d') AS \"EventDate\", strftime(to_timestamp(\"ClientEventTime\"), '%Y-%m-%d %H:%M:%S') AS \"ClientEventTime\", strftime(to_timestamp(\"LocalEventTime\"), '%Y-%m-%d %H:%M:%S') AS \"LocalEventTime\") FROM read_parquet('/tmp/rayforce-clickbench-full.parquet')) TO '/tmp/rayforce-clickbench-full.csv' (HEADER false, DELIMITER ',');\n",
   "verification": "Every native column name/order, type and value compared with the baseline CSV table. Numeric payload bytes and actual symbol string bytes; independent native-file verifier, outside load timing.",
   "verifier_sha256": "32b5543e7331e5986963593c459b3862b4f5c8c52757ccb0f944b5957884e458",
