@@ -2405,6 +2405,10 @@ static test_result_t test_splay_atomic_generation_publish(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(replacement));
     TEST_ASSERT_EQ_I(ray_splay_save(replacement, dir, NULL), RAY_OK);
     TEST_ASSERT_EQ_I(access(manifest, F_OK), 0);
+    char legacy_schema[512];
+    n = snprintf(legacy_schema, sizeof(legacy_schema), "%s/.d", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(legacy_schema));
+    TEST_ASSERT_EQ_I(access(legacy_schema, F_OK), -1);
 
     ray_t* loaded = ray_splay_load(dir, NULL);
     TEST_ASSERT_NOT_NULL(loaded);
@@ -2480,6 +2484,27 @@ static bool generation_matches(const char* dir, bool mmap, int64_t value) {
     return ok;
 }
 
+static int generation_dir_count(const char* dir) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/.generations", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    DIR* d = opendir(path);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child[1024];
+        n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) continue;
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) count++;
+    }
+    closedir(d);
+    return count;
+}
+
 /* Force actual filesystem failures after the first column and after all
  * columns respectively. No invalid object or preflight shortcut is involved. */
 static test_result_t test_generation_io_failures(void) {
@@ -2502,11 +2527,7 @@ static test_result_t test_generation_io_failures(void) {
         err = ray_splay_write_finish(&write, err, true);
         TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
         snprintf(first_col, sizeof(first_col), "%s/x", write.dir);
-        ray_t* written = ray_col_load(first_col);
-        TEST_ASSERT_NOT_NULL(written);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(written));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(written))[0], 9);
-        ray_release(written);
+        TEST_ASSERT_EQ_I(access(first_col, F_OK), -1);
         TEST_ASSERT_TRUE(generation_matches(dir, false, 1));
         TEST_ASSERT_TRUE(generation_matches(dir, true, 1));
 
@@ -2542,6 +2563,7 @@ static test_result_t test_generation_io_failures(void) {
     /* Failure must also release the writer lock so a retry can commit. */
     TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
     TEST_ASSERT_TRUE(generation_matches(dir, true, 9));
+    TEST_ASSERT_TRUE(generation_dir_count(dir) <= 2);
     ray_release(next);
     ray_release(old);
     rm_rf(dir);
@@ -2575,6 +2597,7 @@ static test_result_t test_generation_retains_readers(void) {
         TEST_ASSERT_TRUE(generation_matches(dir, false, 9));
         TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
     }
+    TEST_ASSERT_TRUE(generation_dir_count(dir) <= 2);
     ray_release(next);
     ray_release(old);
     rm_rf(dir);

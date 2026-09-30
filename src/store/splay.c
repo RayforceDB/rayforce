@@ -243,6 +243,67 @@ static ray_err_t splay_has_file(const char* dir, const char* name, bool* exists)
     return *exists || errno == ENOENT ? RAY_OK : RAY_ERR_IO;
 }
 
+static void splay_remove_tree_best_effort(const char* path) {
+    DIR* d = opendir(path);
+    if (!d) {
+        (void)unlink(path);
+        return;
+    }
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child[1024];
+        int n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) continue;
+        struct stat st;
+        if (stat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) splay_remove_tree_best_effort(child);
+        else (void)unlink(child);
+    }
+    closedir(d);
+    (void)rmdir(path);
+}
+
+static void splay_retire_legacy_schema(const char* root) {
+    char schema[1024], retired[1024];
+    int n = snprintf(schema, sizeof(schema), "%s/.d", root);
+    int m = snprintf(retired, sizeof(retired), "%s/.legacy.d", root);
+    if (n < 0 || (size_t)n >= sizeof(schema) ||
+        m < 0 || (size_t)m >= sizeof(retired))
+        return;
+    if (access(schema, F_OK) != 0) return;
+    (void)unlink(retired);
+    if (rename(schema, retired) != 0)
+        (void)unlink(schema);
+}
+
+static void splay_prune_generations(const char* root, const char* current,
+                                    const char* previous) {
+    char generations[1024];
+    int n = snprintf(generations, sizeof(generations), "%s/.generations", root);
+    if (n < 0 || (size_t)n >= sizeof(generations)) return;
+    DIR* d = opendir(generations);
+    if (!d) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char rel[256], full[1024];
+        int rn = snprintf(rel, sizeof(rel), ".generations/%s", entry->d_name);
+        int fn = snprintf(full, sizeof(full), "%s/%s", root, rel);
+        if (rn < 0 || (size_t)rn >= sizeof(rel) ||
+            fn < 0 || (size_t)fn >= sizeof(full))
+            continue;
+        if ((current && strcmp(rel, current) == 0) ||
+            (previous && strcmp(full, previous) == 0))
+            continue;
+        splay_remove_tree_best_effort(full);
+    }
+    closedir(d);
+}
+
 static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
                                      const char* sym_path) {
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return RAY_ERR_TYPE;
@@ -300,30 +361,6 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
     }
 
     return RAY_OK;
-}
-
-static ray_err_t splay_sync_files(const char* dir) {
-    DIR* d = opendir(dir);
-    if (!d) return RAY_ERR_IO;
-    ray_err_t err = RAY_OK;
-    struct dirent* entry;
-    while ((entry = readdir(d))) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-            continue;
-        char path[1024];
-        int n = snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
-        if (n < 0 || (size_t)n >= sizeof(path)) { err = RAY_ERR_RANGE; break; }
-        struct stat st;
-        if (stat(path, &st) != 0) { err = RAY_ERR_IO; break; }
-        if (!S_ISREG(st.st_mode)) continue;
-        ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE);
-        if (fd == RAY_FD_INVALID) { err = RAY_ERR_IO; break; }
-        err = ray_file_sync(fd);
-        ray_file_close(fd);
-        if (err != RAY_OK) break;
-    }
-    closedir(d);
-    return err;
 }
 
 ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
@@ -437,12 +474,10 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
     }
     if (dom) ray_sym_domain_release(dom);
 
-    /* Indexes belong to this generation and must precede publication. */
+    /* Indexes belong to this generation and must precede publication. They are
+     * rebuildable accelerators; ray_col_append_index writes the marker last and
+     * intentionally does not fsync them again after ray_col_save fsyncs data. */
     ray_splay_build_indexes(dir, tbl);
-    if (durable) {
-        ray_err_t err = splay_sync_files(dir);
-        if (err != RAY_OK) { ray_release(schema); return err; }
-    }
 
     /* 3. .d LAST — the commit marker. */
     {
@@ -466,7 +501,12 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
+    char previous[1024];
+    bool had_previous = false;
     if (result == RAY_OK && write->staged) {
+        if (splay_current_dir(write->root, previous, sizeof(previous),
+                              &had_previous) != RAY_OK)
+            had_previous = false;
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];
         snprintf(schema, sizeof(schema), "%s/.d", write->dir);
@@ -475,14 +515,20 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
             result = RAY_ERR_IO;
         if (result == RAY_OK)
             result = splay_publish_generation(write->root, write->generation, durable);
+        if (result == RAY_OK) {
+            splay_retire_legacy_schema(write->root);
+            splay_prune_generations(write->root, write->generation,
+                                    had_previous ? previous : NULL);
+        }
+    }
+    if (result != RAY_OK && write->staged && write->dir[0]) {
+        splay_remove_tree_best_effort(write->dir);
     }
     if (write->lock != RAY_FD_INVALID) {
         (void)ray_file_unlock(write->lock);
         ray_file_close(write->lock);
         write->lock = RAY_FD_INVALID;
     }
-    /* A reader may have resolved the old path without opening every column.
-     * Keep both legacy files and old generations immutable after publication. */
     return result;
 }
 

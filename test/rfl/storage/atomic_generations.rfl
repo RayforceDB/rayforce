@@ -8,8 +8,10 @@
 (.db.splayed.set agLeaf agNew)
 (sum (at (.db.splayed.get agLeaf) 'x)) -- 7
 (sum (at (.db.parted.get agRoot 't) 'x)) -- 7
-;; Discovery must use the active schema even after offline legacy cleanup.
-(.sys.exec "rm /tmp/rf_test_atomic_generations/2026.09.28/t/.d") -- 0
+;; The first generation publish retires the legacy schema so old binaries
+;; cannot silently read the stale root files.
+(.sys.exec "test ! -f /tmp/rf_test_atomic_generations/2026.09.28/t/.d") -- 0
+;; Discovery must use the active schema without the legacy root .d.
 (.db.parted.tables agRoot) -- ['t]
 
 ;; Schema narrowing must not make the partition reader use the old .d.
@@ -44,4 +46,9 @@
 (.db.splayed.set (format "%/indexed_str" agRoot) agStrings)
 (.db.splayed.set (format "%/indexed_str" agRoot) agStrings)
 (.idx.has? (at (.db.splayed.get (format "%/indexed_str" agRoot)) 'k)) -- true
+;; Retention is bounded to current + previous generation.
+(.db.splayed.set agLeaf (table ['x] (list [11 12])))
+(.db.splayed.set agLeaf (table ['x] (list [13 14])))
+(.db.splayed.set agLeaf (table ['x] (list [15 16])))
+(.sys.exec "test $(find /tmp/rf_test_atomic_generations/2026.09.28/t/.generations -mindepth 1 -maxdepth 1 -type d | wc -l) -le 2") -- 0
 (.sys.exec "rm -rf /tmp/rf_test_atomic_generations") -- 0

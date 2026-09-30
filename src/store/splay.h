@@ -31,7 +31,8 @@ struct ray_sym_domain_s;
 
 /* Internal publication protocol shared by the table and streaming CSV writers.
  * begin serializes writers; finish publishes only on success and always unlocks.
- * Old generations must remain available to readers that already resolved them. */
+ * Publication keeps the current generation and one previous generation; older
+ * staged directories are removed best-effort after each successful publish. */
 typedef struct {
     ray_fd_t lock;
     bool staged;

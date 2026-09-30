@@ -81,16 +81,20 @@ same table serialize on `.write.lock`; readers resolve the manifest once and
 continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
 
-Previous generations, the legacy files and incomplete staging directories are
-retained. Disk usage therefore grows with replacements. There is no automatic
-garbage collection yet: reclaim old files only during offline maintenance with
-all readers and writers stopped, and preserve the generation named by `.current`.
-Older binaries that do not understand `.current` must not access an upgraded
-table; reading its legacy files directly returns obsolete data.
+Publication keeps the selected generation and one previous generation, then
+removes older staged directories best-effort. A failed unpublished generation is
+removed immediately where the platform allows it; on Windows an open mapped file
+can defer that cleanup until a later publish. At the first manifest publish,
+the legacy root `.d` is retired so older binaries fail loudly instead of reading
+obsolete root files.
 
-`ray_splay_save` (including `.db.splayed.set`) syncs data, indexes and directory
-entries before acknowledging publication. The bulk C API and CSV import retain
-their no-fsync contract: publication is atomic for readers, but is not a
+The `.write.lock` writer lock is local-filesystem coordination. Do not rely on
+it for NFS-backed shared writers.
+
+`ray_splay_save` (including `.db.splayed.set`) syncs primary data and directory
+entries before acknowledging publication. Inline indexes are rebuildable
+accelerators written with a marker-last protocol. The bulk C API and CSV import
+retain their no-fsync contract: publication is atomic for readers, but is not a
 power-loss durability guarantee. An I/O error after the manifest rename (during
 the final directory sync) has an uncertain commit outcome; reopen the table to
 inspect the selected generation.
