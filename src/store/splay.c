@@ -146,7 +146,7 @@ static void splay_sweep_stale(ray_t* tbl, const char* dir) {
 }
 
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_path,
-                                 bool durable) {
+                                 bool durable, bool staged) {
     if (!tbl || RAY_IS_ERR(tbl)) return RAY_ERR_TYPE;
     if (!dir) return RAY_ERR_IO;
 
@@ -254,7 +254,9 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
             }
         }
 
-        ray_err_t sym_err = ray_sym_domain_flush(dom, durable);
+        /* Private import roots publish only after their final domain flush.
+         * Live-table saves still require the vocabulary before every column. */
+        ray_err_t sym_err = staged ? RAY_OK : ray_sym_domain_flush(dom, durable);
         if (sym_err != RAY_OK) {
             ray_sym_domain_release(dom);
             return sym_err;
@@ -337,11 +339,15 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_pa
 }
 
 ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, true);
+    return splay_save_impl(tbl, dir, sym_path, true, false);
 }
 
 ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, false);
+    return splay_save_impl(tbl, dir, sym_path, false, false);
+}
+
+ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
+    return splay_save_impl(tbl, dir, sym_path, false, true);
 }
 
 /* --------------------------------------------------------------------------

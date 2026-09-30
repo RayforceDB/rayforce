@@ -51,6 +51,10 @@ ray_err_t ray_file_unlock(ray_fd_t fd);
 ray_err_t ray_file_sync(ray_fd_t fd);
 ray_err_t ray_file_sync_dir(const char* path);
 ray_err_t ray_file_rename(const char* old_path, const char* new_path);
+/* Publish a new path without replacing any existing destination, including
+ * an empty directory. Unsupported host/filesystem primitives return an error;
+ * there is deliberately no racy check-then-rename fallback. */
+ray_err_t ray_file_rename_new(const char* old_path, const char* new_path);
 ray_err_t ray_mkdir(const char* path);
 ray_err_t ray_mkdir_p(const char* path);  /* like `mkdir -p` */
 

@@ -785,7 +785,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_str_list(vec, f);
-        fclose(f);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
     }
@@ -795,7 +795,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_list(vec, f);
-        fclose(f);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
     }
@@ -805,7 +805,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_table(vec, f);
-        fclose(f);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
     }
@@ -1029,7 +1029,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             if (rw != (size_t)rsize) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
         }
 
-        fclose(f);
+        if (fclose(f) != 0) { remove(tmp_path); return RAY_ERR_IO; }
     }
 
 fsync_and_rename:;
@@ -1112,8 +1112,10 @@ ray_err_t ray_col_save_bulk(ray_t* vec, const char* path) {
  * process dictionary.  Header rc = domain count at save time (the O(1)
  * fast-reject the loader checks against the FILE domain's count).
  * Caller contract: every distinct symbol of the column was interned into
- * `target` and the domain was FLUSHED before this call (crash ordering:
- * sym → columns → .d) — an absent symbol here is RAY_ERR_CORRUPT.
+ * `target`. Live-table writes must FLUSH the domain before this call (crash
+ * ordering: sym → columns → .d). An import into a private staging directory
+ * may defer that flush until all workers join, but must persist the complete
+ * domain before publishing the root. An absent symbol is RAY_ERR_CORRUPT.
  * -------------------------------------------------------------------------- */
 
 ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
