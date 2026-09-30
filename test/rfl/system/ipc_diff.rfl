@@ -76,8 +76,8 @@
 ;; Graph handles carry heap pointers in i64 atoms plus RAY_ATTR_GRAPH.
 ;; They must be rejected by the shared serde path before IPC can leak
 ;; the address or silently demote a nested handle to a bare integer.
-(.ipc.send h "(do (set E (table [src dst] (list [0 1] [1 0]))) (set G (.graph.build E 'src 'dst)) G)") !- domain
-(.ipc.send h "(do (set E2 (table [src dst] (list [0 1] [1 0]))) (set G2 (.graph.build E2 'src 'dst)) (list G2 1))") !- domain
+(.ipc.send h "(do (set E (table [src dst] (list [0 1] [1 0]))) (set G (.graph.build E 'src 'dst)) G)") !- type
+(.ipc.send h "(do (set E2 (table [src dst] (list [0 1] [1 0]))) (set G2 (.graph.build E2 'src 'dst)) (list G2 1))") !- type
 
 ;; ── large payloads ─────────────────────────────────────────────────
 ;; Multi-KB results over the framing path.  These no longer exercise
