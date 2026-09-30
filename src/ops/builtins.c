@@ -327,7 +327,7 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
     /* args are pre-materialized by eval — see ray_println_fn. */
     for (int64_t i = 0; i < n; i++) {
         if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(stdout, "error"); continue; }
-        ray_t* formatted = ray_fmt(args[i], 1);
+        ray_t* formatted = ray_fmt(args[i], 2);
         if (formatted && !RAY_IS_ERR(formatted)) {
             const char* sp = ray_str_ptr(formatted);
             size_t sl = ray_str_len(formatted);

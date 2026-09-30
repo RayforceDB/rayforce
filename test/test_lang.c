@@ -7778,6 +7778,44 @@ static test_result_t test_builtin_show_fn(void) {
     PASS();
 }
 
+/* (show T) prints every column and row of a table: only the REPL display
+ * truncates to FMT_TABLE_MAX_WIDTH x FMT_TABLE_MAX_HEIGHT. */
+static test_result_t test_builtin_show_table_unlimited(void) {
+    ray_t* t = ray_eval_str(
+        "(table [a b c d e f g h i j k l m] (list (til 25) (til 25) (til 25)"
+        " (til 25) (til 25) (til 25) (til 25) (til 25) (til 25) (til 25)"
+        " (til 25) (til 25) (til 25)))");
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    char path[] = "/tmp/rfl_show_unlimited_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_TRUE(fd >= 0);
+    fflush(stdout);
+    int saved = dup(fileno(stdout));
+    dup2(fd, fileno(stdout));
+    ray_t* args[1] = { t };
+    ray_t* r = ray_show_fn(args, 1);
+    fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    char buf[16384];
+    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    close(fd);
+    unlink(path);
+    buf[n > 0 ? n : 0] = '\0';
+
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "25 rows (25 shown) 13 columns (13 shown)"));
+    int64_t typed = 0;   /* one "I64" type cell per printed column */
+    for (const char* q = buf; (q = strstr(q, "I64")) != NULL; q += 3) typed++;
+    TEST_ASSERT_EQ_I(typed, 13);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "│ 24 "));
+    ray_release(t);
+    PASS();
+}
+
 /* (timeit expr) — returns elapsed ms as F64. */
 static test_result_t test_builtin_timeit_fn(void) {
     /* timeit calls ray_eval(args[0]) — pass a parsed expression. */
@@ -9627,6 +9665,7 @@ const test_entry_t lang_entries[] = {
     /* S1/S2 builtins + temporal */
     { "lang/builtin/print",       test_builtin_print_fn,       lang_setup, lang_teardown },
     { "lang/builtin/show",        test_builtin_show_fn,        lang_setup, lang_teardown },
+    { "lang/builtin/show_table_unlimited", test_builtin_show_table_unlimited, lang_setup, lang_teardown },
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
     { "lang/builtin/read_bytes",  test_builtin_read_bytes_fn,  lang_setup, lang_teardown },
