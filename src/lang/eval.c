@@ -3528,7 +3528,7 @@ static void ray_register_builtins(void) {
     /* IPC client primitives under `.ipc.*` */
     register_vary(  ".ipc.open",  RAY_FN_RESTRICTED,  ray_hopen_fn);
     register_unary( ".ipc.close", RAY_FN_RESTRICTED,  ray_hclose_fn);
-    register_binary(".ipc.send",  RAY_FN_RESTRICTED,  ray_hsend_fn);
+    register_vary(  ".ipc.send",  RAY_FN_RESTRICTED,  ray_hsend_fn);
     register_binary(".ipc.post",  RAY_FN_RESTRICTED,  ray_hpost_fn);
     /* Current connection handle inside any `.ipc.on.*` hook, -1 otherwise.
      * Variadic for the `(.ipc.handle)` / `(.ipc.handle 0)` convention. */

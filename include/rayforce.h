@@ -841,6 +841,10 @@ int64_t   ray_ipc_connect(const char* host, uint16_t port,
                           int timeout_ms);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
+/* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
+ * On expiry the connection is closed (on.close fires) and an `io` error
+ * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */
+ray_t*    ray_ipc_send_timeout(int64_t handle, ray_t* msg, int64_t timeout_ms);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
 

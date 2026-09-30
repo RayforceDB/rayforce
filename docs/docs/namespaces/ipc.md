@@ -13,7 +13,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 | Function | Arity | Flags | Description |
 |---|---|---|---|
 | [`.ipc.open`](#ipc-open) | variadic | restricted | Open a TCP connection (optional connect timeout); return an i64 handle. |
-| [`.ipc.send`](#ipc-send) | binary | restricted | Send a message synchronously; return the server's result. |
+| [`.ipc.send`](#ipc-send) | variadic | restricted | Send a message synchronously (optional deadline); return the server's result. |
 | [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
 | [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. |
@@ -62,7 +62,7 @@ The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-ve
 
 ## `.ipc.send` { #ipc-send }
 
-Signature: `(.ipc.send h msg)`. Sends `msg` synchronously — blocks until the peer replies.
+Signature: `(.ipc.send h msg)` or `(.ipc.send h msg timeout-ms)`. Sends `msg` synchronously — blocks until the peer replies, or until the optional deadline expires.
 
 The receiving side's behaviour depends on `msg`'s type:
 
@@ -71,7 +71,9 @@ The receiving side's behaviour depends on `msg`'s type:
 | `STR` | Parsed as Rayfall, evaluated, result returned. |
 | anything else | Passed straight into `ray_eval` — identity for plain data, execution for an expression list. |
 
-Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle does not name an open connection). Server-side errors are returned as error objects too — `.ipc.send` does not raise them, the caller decides what to do.
+Errors: `type` (`h` not an `i64`/`i32`, `msg` not serialisable, or the timeout not an integer), `domain` (timeout `0` or negative), `rank` (not 2 or 3 arguments), `io` (handle does not name an open connection, or the deadline expired). Server-side errors are returned as error objects too — `.ipc.send` does not raise them, the caller decides what to do.
+
+**Deadline.** With a timeout, the whole round trip (writing the request and waiting for the reply) must finish within `timeout-ms`, or `.ipc.send` returns `io` (`ipc send timed out after N ms; connection closed`). `0N` means no deadline, the same as leaving the argument out. On expiry the connection is **closed** and `.ipc.on.close` fires. A reply carries no request id, so a reply that arrived later would otherwise be taken as the answer to the next `.ipc.send` on the handle. Reconnect with `.ipc.open`. Before closing, the peer is sent the same best-effort cancel as Ctrl-C, so a server still evaluating the request stops. Use a deadline where you know the call's latency budget: a cheap poll can have a tight one, while a long query should have a loose one or none. For a peer that disappears without closing the connection, see dead-peer detection under [`.ipc.open`](#ipc-open).
 
 While waiting for its response, `.ipc.send` keeps servicing the connection: an async message pushed by the peer in the meantime is dispatched (evaluated, or routed through `.ipc.on.async`) before the round-trip returns, and a sync request arriving from the peer is answered. Frames are never silently swallowed by the wait.
 
@@ -81,6 +83,9 @@ While waiting for its response, `.ipc.send` keeps servicing the connection: an a
 
 ;; Expression form — dict stays unevaluated until the server processes it
 (.ipc.send h (list select {from: trades by: sym total: (sum qty)}))
+
+;; Give up (and drop the connection) if no answer within 5 seconds
+(.ipc.send h "(count trades)" 5000)
 
 ;; Plain data round-trips
 (.ipc.send h 42)         ;; => 42

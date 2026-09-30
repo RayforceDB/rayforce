@@ -50,6 +50,12 @@ ray_sock_t ray_sock_accept(ray_sock_t srv);
  * RAY_INVALID_SOCK is returned. */
 ray_sock_t ray_sock_connect(const char* host, uint16_t port, int timeout_ms);
 int64_t    ray_sock_send(ray_sock_t s, const void* buf, size_t len);
+/* As ray_sock_send, but gives up once the monotonic clock
+ * (ray_time_now_ms) reaches deadline_ms, returning -1 with errno
+ * ETIMEDOUT.  The frame may then be partly written, so the caller must
+ * treat the stream as unusable.  deadline_ms < 0 = no deadline. */
+int64_t    ray_sock_send_until(ray_sock_t s, const void* buf, size_t len,
+                               int64_t deadline_ms);
 int64_t    ray_sock_recv(ray_sock_t s, void* buf, size_t len);
 /* Block until s is readable (or hung up).  timeout_ms < 0 = no timeout.
  * Returns 1 readable, 0 timed out, -1 error. */
