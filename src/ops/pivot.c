@@ -1196,11 +1196,18 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
      * reading past it, so `(if false f 1.0)` returned a mixture of both
      * branches.  Expand it once so every consumer sees a full-length mask;
      * the selected arm declines a scalar condition outright, which is why
-     * this only ever mattered here. */
-    if (ray_is_atom(cond_v)) {
-        int64_t n = ray_is_atom(then_v) ? (ray_is_atom(else_v) ? 1 : else_v->len)
-                                        : then_v->len;
-        uint8_t on = cond_v->b8 ? 1 : 0;
+     * this only ever mattered here.  A reduction in the condition, such as
+     * `(> (count x) 3)`, reaches here as a one-element BOOL vector rather
+     * than an atom; against vector branches it is the same scalar. */
+    int64_t branch_len = 1;
+    if (!ray_is_atom(then_v) && then_v->len > branch_len) branch_len = then_v->len;
+    if (!ray_is_atom(else_v) && else_v->len > branch_len) branch_len = else_v->len;
+    bool cond_one = !ray_is_atom(cond_v) && cond_v->type == RAY_BOOL &&
+                    cond_v->len == 1 && branch_len > 1;
+    if (ray_is_atom(cond_v) || cond_one) {
+        int64_t n = branch_len;
+        uint8_t on = cond_one ? ((const uint8_t*)ray_data(cond_v))[0] != 0
+                              : (cond_v->b8 ? 1 : 0);
         ray_t* mask = ray_vec_new(RAY_BOOL, n);
         if (!mask || RAY_IS_ERR(mask)) {
             ray_release(cond_v); ray_release(then_v); ray_release(else_v);

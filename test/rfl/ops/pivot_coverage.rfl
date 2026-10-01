@@ -781,6 +781,17 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (at (select {r: (if false f 1.0) from: TZ}) 'r) -- [1.0 1.0 1.0]
 (at (select {r: (if true f 1.0) from: TZ}) 'r) -- [1.5 2.5 3.5]
 
+;; A reduction in the condition reaches the eager fill as a one-element BOOL
+;; vector, not an atom.  It was indexed per row too, so only the first row
+;; followed the condition and the rest read past the cell.
+(set TR (table [x s] (list (til 6) (as 'SYM ["a" "b" "c" "d" "e" "f"]))))
+(at (select {k: (if (> (count x) 3) s "") from: TR}) 'k) -- ["a" "b" "c" "d" "e" "f"]
+(at (select {k: (if (< (count x) 3) s "") from: TR}) 'k) -- ["" "" "" "" "" ""]
+(at (select {k: (if (> (sum x) 3) x 0) from: TR}) 'k) -- [0 1 2 3 4 5]
+(at (select {k: (if (< (sum x) 3) x 7) from: TR}) 'k) -- [7 7 7 7 7 7]
+(at (select {k: (if (> (max x) 3) 1.5 x) from: TR}) 'k) -- [1.5 1.5 1.5 1.5 1.5 1.5]
+(at (select {k: (if (< (max x) 3) 1.5 x) from: TR}) 'k) -- [0.0 1.0 2.0 3.0 4.0 5.0]
+
 
 ;; ── the null symbol needs no width handling ───────────────────────────
 ;; SYM has no typed null and no `0Ns` literal (parse.c): the empty symbol `'`
