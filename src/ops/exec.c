@@ -2798,11 +2798,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * NULL refine meant "all pass": a false scalar kept every row.
              * Spread it over the table's rows instead. */
             if (input->type == RAY_TABLE &&
-                (pred->type == -RAY_BOOL || (pred->type == RAY_BOOL && pred->len == 1))) {
+                (ray_is_atom(pred) || (pred->type == RAY_BOOL && pred->len == 1))) {
                 int64_t tn = ray_table_nrows(input);
-                if (tn != 1) {
-                    uint8_t on = pred->type == -RAY_BOOL ? pred->b8
-                                                         : ((const uint8_t*)ray_data(pred))[0];
+                /* an atom of any type (`where: 0`) by the scalar truth rule;
+                 * a one-element BOOL is already a row mask on a 1-row table */
+                if (ray_is_atom(pred) || tn != 1) {
+                    uint8_t on = ray_is_atom(pred) ? (is_truthy(pred) ? 1 : 0)
+                                                   : ((const uint8_t*)ray_data(pred))[0];
                     ray_release(pred);
                     if (on) return input;   /* every row passes: selection unchanged */
                     pred = ray_vec_new(RAY_BOOL, tn);
