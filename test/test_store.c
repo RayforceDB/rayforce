@@ -1619,6 +1619,41 @@ static test_result_t test_file_rename_new(void) {
 #endif
 }
 
+/* The portable fallback used where the host or filesystem has no
+ * no-replace rename: same contract as ray_file_rename_new. */
+static test_result_t test_file_rename_new_emulated(void) {
+#if defined(RAY_OS_WASM) || defined(RAY_OS_WINDOWS)
+    SKIP("POSIX fallback");
+#else
+    char from[160], to[160], marker[180];
+    snprintf(from,sizeof(from),"/tmp/rayforce-emu-from-%d",(int)getpid());
+    snprintf(to,sizeof(to),"/tmp/rayforce-emu-to-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(ray_mkdir(from),RAY_OK); TEST_ASSERT_EQ_I(ray_mkdir(to),RAY_OK);
+    snprintf(marker,sizeof(marker),"%s/marker",from);
+    FILE* f = fopen(marker,"wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fwrite("retained",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+    /* an existing (empty) directory is not replaced */
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(from,to),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    TEST_ASSERT_EQ_I(rmdir(to),0);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(from,to),RAY_OK);
+    TEST_ASSERT_TRUE(access(from,F_OK) != 0);
+    snprintf(marker,sizeof(marker),"%s/marker",to);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    /* files: an existing destination is kept, a new one is published */
+    char other[180];
+    snprintf(other,sizeof(other),"%s/other",to);
+    f = fopen(other,"wb"); TEST_ASSERT_NOT_NULL(f); fputs("x",f); fclose(f);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(other,marker),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(other,F_OK) == 0);
+    unlink(marker);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(other,marker),RAY_OK);
+    TEST_ASSERT_TRUE(access(other,F_OK) != 0 && access(marker,F_OK) == 0);
+    unlink(marker); rmdir(to);
+    PASS();
+#endif
+}
+
 /* ---- test_file_shared_lock_concurrent ---------------------------------- */
 
 static test_result_t test_file_shared_lock_concurrent(void) {
@@ -5591,6 +5626,7 @@ const test_entry_t store_entries[] = {
     { "store/col_close_failure", test_col_close_failure, store_setup, store_teardown },
     { "store/col_append_index_rollback", test_col_append_index_rollback, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
+    { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },
     { "store/sym_col_bounds_reject", test_sym_col_bounds_reject, store_setup, store_teardown },
     { "store/sym_col_count_mismatch", test_sym_col_count_mismatch, store_setup, store_teardown },

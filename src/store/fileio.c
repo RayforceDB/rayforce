@@ -253,15 +253,36 @@ ray_err_t ray_file_rename(const char* old_path, const char* new_path) {
     return RAY_OK;
 }
 
+ray_err_t ray_file_rename_new_emulated(const char* old_path, const char* new_path) {
+    if (!old_path || !new_path) return RAY_ERR_IO;
+    struct stat st;
+    if (lstat(old_path, &st) != 0) return RAY_ERR_IO;
+    if (S_ISDIR(st.st_mode)) {
+        /* mkdir claims the name or fails if anything holds it; rename then
+         * replaces only that empty placeholder, and fails (ENOTEMPTY /
+         * EEXIST) if anything was put into it meanwhile. */
+        if (mkdir(new_path, 0700) != 0) return RAY_ERR_IO;
+        if (rename(old_path, new_path) != 0) { rmdir(new_path); return RAY_ERR_IO; }
+        return RAY_OK;
+    }
+    /* link fails if the name exists; then drop the old name. */
+    if (link(old_path, new_path) != 0) return RAY_ERR_IO;
+    if (unlink(old_path) != 0) { unlink(new_path); return RAY_ERR_IO; }
+    return RAY_OK;
+}
+
 ray_err_t ray_file_rename_new(const char* old_path, const char* new_path) {
     if (!old_path || !new_path) return RAY_ERR_IO;
 #if defined(RAY_OS_LINUX)
-    return renameat2(AT_FDCWD,old_path,AT_FDCWD,new_path,RENAME_NOREPLACE) == 0 ? RAY_OK : RAY_ERR_IO;
+    if (renameat2(AT_FDCWD,old_path,AT_FDCWD,new_path,RENAME_NOREPLACE) == 0) return RAY_OK;
+    /* EINVAL: this filesystem does not implement RENAME_NOREPLACE (some
+     * network and FUSE filesystems); ENOSYS: kernel older than 3.15. */
+    if (errno != EINVAL && errno != ENOSYS) return RAY_ERR_IO;
 #elif defined(RAY_OS_MACOS)
-    return renamex_np(old_path,new_path,RENAME_EXCL) == 0 ? RAY_OK : RAY_ERR_IO;
-#else
-    return RAY_ERR_NYI;
+    if (renamex_np(old_path,new_path,RENAME_EXCL) == 0) return RAY_OK;
+    if (errno != ENOTSUP) return RAY_ERR_IO;
 #endif
+    return ray_file_rename_new_emulated(old_path, new_path);
 }
 
 ray_err_t ray_mkdir(const char* path) {
