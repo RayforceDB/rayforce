@@ -812,6 +812,21 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (at (select {k: (if f 1 0) from: TN}) 'k) -- (concat 0 (take 1 11))
 (at (select {k: (if (count x) x 0) from: (table [x] (list (til 256)))}) 'k) -- (til 256)
 
+;; Per condition type: null and zero are false, anything else true, the
+;; rule of the scalar `if`.  A wider column was read one byte per row, so an
+;; all-ones I64 condition was true on rows 0 and 8 only, I32 on every fourth
+;; row, I16 on every other one.  Text has no truth value and is refused.
+(at (select {r: (if c 10 20) from: (table [c] (list (take 1 9)))}) 'r) -- (take 10 9)
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'i32 [1 0 1 0 1 0 1 0 1])))}) 'r) -- [10 20 10 20 10 20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'i16 [1 0 1 0 1 0 1 0 1])))}) 'r) -- [10 20 10 20 10 20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'u8 [1 0 1 0 1 0 1 0 1])))}) 'r) -- [10 20 10 20 10 20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list [0 1 256 0N]))}) 'r) -- [20 10 10 20]
+(at (select {r: (if c 10 20) from: (table [c] (list (concat (as 'i32 [0 7]) 0Ni)))}) 'r) -- [20 10 20]
+(at (select {r: (if c 10 20) from: (table [c] (list [0.0 1.5 0Nf -2.0]))}) 'r) -- [20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'date [0 1 2])))}) 'r) -- [20 10 10]
+(select {r: (if c 10 20) from: (table [c] (list ['a 'b 'c]))}) !- type
+(select {r: (if c 10 20) from: (table [c] (list (list "a" "b" "c")))}) !- type
+
 ;; The same on enough rows for the fill to run on the worker pool.
 (set TP (table [x s] (list (til 200000) (as 'SYM (% (til 200000) 7)))))
 (sum (at (select {k: (if (> (count x) 3) x 0) from: TP}) 'k)) -- 19999900000

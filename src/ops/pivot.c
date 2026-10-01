@@ -1169,22 +1169,56 @@ static void if_str_desc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_
     }
 }
 
-/* Truthiness of an `if` condition, matching ray_cond_fn: null, false and a
- * zero I64 or F64 are false, any other value is true.  idx < 0 reads the
- * atom itself, otherwise cell idx of the vector. */
-static uint8_t if_cond_truthy(ray_t* c, int64_t idx) {
-    if (idx < 0) {
-        if (RAY_ATOM_IS_NULL(c)) return 0;
-        if (c->type == -RAY_BOOL) return c->b8 ? 1 : 0;
-        if (c->type == -RAY_I64)  return c->i64 != 0;
-        if (c->type == -RAY_F64)  return c->f64 != 0.0;
+/* Truthiness of one cell of an `if` condition vector, the rule is_truthy
+ * applies to an atom: null and zero are false, anything else is true. */
+static uint8_t if_cond_cell(ray_t* c, int64_t i) {
+    const void* d = ray_data(c);
+    switch (c->type) {
+    case RAY_BOOL: case RAY_U8:
+        return ((const uint8_t*)d)[i] != 0;
+    default: break;
+    }
+    if (ray_vec_is_null(c, i)) return 0;
+    switch (c->type) {
+    case RAY_I16:   return ((const int16_t*)d)[i] != 0;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+                    return ((const int32_t*)d)[i] != 0;
+    case RAY_I64: case RAY_TIMESTAMP:
+                    return ((const int64_t*)d)[i] != 0;
+    case RAY_F32: { float f = ((const float*)d)[i]; return f != 0.0f && f == f; }
+    case RAY_F64: { double f = ((const double*)d)[i]; return f != 0.0 && f == f; }
+    default:        return 0;   /* refused by if_cond_type_ok first */
+    }
+}
+
+/* Truthiness of an atom condition: is_truthy's rule (lang/internal.h, which
+ * this file cannot include), kept in step with it. */
+static uint8_t if_cond_atom(ray_t* x) {
+    if (RAY_ATOM_IS_NULL(x)) return 0;
+    switch (x->type) {
+    case -RAY_BOOL: return x->b8 != 0;
+    case -RAY_U8:   return x->u8 != 0;
+    case -RAY_I16:  return x->i16 != 0;
+    case -RAY_I32:  return x->i32 != 0;
+    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return x->i64 != 0;
+    case -RAY_F32: case -RAY_F64:
+        return x->f64 != 0.0 && x->f64 == x->f64;
+    default:
         return 1;
     }
-    if (c->type == RAY_BOOL) return ((const uint8_t*)ray_data(c))[idx] ? 1 : 0;
-    if (ray_vec_is_null(c, idx)) return 0;
-    if (c->type == RAY_I64) return ((const int64_t*)ray_data(c))[idx] != 0;
-    if (c->type == RAY_F64) return ((const double*)ray_data(c))[idx] != 0.0;
-    return 1;
+}
+
+/* A condition vector needs a truth value per cell: booleans, numbers and
+ * temporals have one.  Text, GUID and boxed lists do not. */
+static bool if_cond_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
@@ -1218,14 +1252,20 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
      * one-element vector rather than an atom and is the same scalar against
      * vector branches.  A condition of another type, such as `(count x)` or
      * an I64 column, was read byte by byte.  Every such condition becomes a
-     * full-length BOOL mask, with the interpreter's truthiness per cell; the
+     * full-length BOOL mask, with is_truthy's rule per cell; the
      * selected arm declines all of them, which is why only this arm
      * mattered. */
     int64_t branch_len = 1;
     if (!ray_is_atom(then_v) && then_v->len > branch_len) branch_len = then_v->len;
     if (!ray_is_atom(else_v) && else_v->len > branch_len) branch_len = else_v->len;
+    if (!ray_is_atom(cond_v) && !if_cond_type_ok(cond_v->type)) {
+        int8_t ct = cond_v->type;
+        ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+        return ray_error("type", "if: condition must be boolean, numeric or temporal, got %s",
+                         ray_type_name(ct));
+    }
     bool cond_bcast = ray_is_atom(cond_v) || (cond_v->len == 1 && branch_len > 1);
-    if (cond_bcast || (cond_v->type != RAY_BOOL && ray_is_vec(cond_v))) {
+    if (cond_bcast || cond_v->type != RAY_BOOL) {
         int64_t n = cond_bcast ? branch_len : cond_v->len;
         ray_t* mask = ray_vec_new(RAY_BOOL, n);
         if (!mask || RAY_IS_ERR(mask)) {
@@ -1234,9 +1274,10 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         }
         uint8_t* m = (uint8_t*)ray_data(mask);
         if (cond_bcast)
-            memset(m, if_cond_truthy(cond_v, ray_is_atom(cond_v) ? -1 : 0), (size_t)n);
+            memset(m, ray_is_atom(cond_v) ? if_cond_atom(cond_v)
+                                          : if_cond_cell(cond_v, 0), (size_t)n);
         else
-            for (int64_t i = 0; i < n; i++) m[i] = if_cond_truthy(cond_v, i);
+            for (int64_t i = 0; i < n; i++) m[i] = if_cond_cell(cond_v, i);
         mask->len = n;
         ray_release(cond_v);
         cond_v = mask;
