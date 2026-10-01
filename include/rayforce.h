@@ -64,6 +64,10 @@ int  ray_version_major(void);
 int  ray_version_minor(void);
 int  ray_version_patch(void);
 const char* ray_version_string(void);
+/* The commit this library was built from, as its build saw it ("unknown"
+ * outside a git checkout).  A compile-time constant: safe to call before
+ * any runtime exists. */
+const char* ray_git_commit(void);
 
 /* ===== Type Constants ===== */
 

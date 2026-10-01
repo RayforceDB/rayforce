@@ -25,6 +25,11 @@ VERSION_MAJOR := $(word 1,$(subst ., ,$(RAY_VERSION)))
 VERSION_MINOR := $(word 2,$(subst ., ,$(RAY_VERSION)))
 VERSION_PATCH := $(word 3,$(subst ., ,$(RAY_VERSION)))
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# The objects that embed GIT_HASH depend on a stamp rewritten only when the
+# hash changes, so an incremental build after a new commit rebuilds them
+# instead of keeping the previous hash (see GIT_HASH_OBJS below).
+GIT_HASH_STAMP := build/.git-hash
+$(shell mkdir -p build && { [ "$$(cat $(GIT_HASH_STAMP) 2>/dev/null)" = "$(GIT_HASH)" ] || echo "$(GIT_HASH)" > $(GIT_HASH_STAMP); })
 BUILD_DATE := $(shell date -u +%Y-%m-%d)
 
 WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
@@ -206,6 +211,13 @@ default: debug
 
 %.ndebug.o: %.c
 	$(CC) -c $(NDEBUG_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+# Sources that embed GIT_HASH (ray_git_commit, the REPL and crash banners,
+# and the test that compares ray_git_commit against it), in every object
+# flavour.
+GIT_HASH_SRCS := src/core/types src/app/repl src/core/crash test/test_types
+GIT_HASH_OBJS := $(foreach v,.o .rel.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
+$(GIT_HASH_OBJS): $(GIT_HASH_STAMP)
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
 $(TARGET): $(LIB_OBJ) $(MAIN_OBJ)
