@@ -21,6 +21,12 @@
  *   SOFTWARE.
  */
 
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#elif !defined(_WIN32)
+#  define _GNU_SOURCE       /* ftruncate, fileno */
+#endif
+
 #include "col.h"
 #include "core/platform.h"
 #include "mem/heap.h"
@@ -37,6 +43,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#ifdef RAY_OS_WINDOWS
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * validate_sym_bounds -- check all indices in a RAY_SYM column are < sym_count
@@ -686,6 +697,16 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
  * pad the payload to 32, write the region, then stamp the aux[0..3] marker.
  * Used by the streaming .csv.splayed builder, which writes raw columns first.
  * `col_len`/`col_type` describe the on-disk column (payload = 32 + len*esz). */
+/* Cut a column file back to `len` bytes: undoes a partial index append. */
+static bool col_truncate(FILE* f, int64_t len) {
+    if (fflush(f) != 0) return false;
+#ifdef RAY_OS_WINDOWS
+    return _chsize_s(_fileno(f), len) == 0;
+#else
+    return ftruncate(fileno(f), (off_t)len) == 0;
+#endif
+}
+
 ray_err_t ray_col_append_index(const char* path, const void* ix_v,
                                int64_t col_len, int8_t col_type) {
     const ray_index_t* ix = (const ray_index_t*)ix_v;
@@ -708,28 +729,42 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     if (fsz < 32) { fclose(f); return RAY_ERR_CORRUPT; }
     int64_t payload_end = fsz;
 
+    /* From here on a failure must leave the file as it was: without the
+     * marker the loader requires the exact payload length, so stray
+     * region bytes would make the column unloadable, and callers treat
+     * the index as a best-effort accelerator. */
+    ray_err_t err = RAY_OK;
     int64_t region_off = (payload_end + 31) & ~(int64_t)31;
     int64_t pad = region_off - payload_end;
     static const uint8_t zeros[32] = {0};
-    if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) { fclose(f); return RAY_ERR_IO; }
+    if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) { err = RAY_ERR_IO; goto rollback; }
 
     int64_t rsize = ray_index_inline_size(ix);
     uint8_t* rbuf = (uint8_t*)ray_calloc_raw((size_t)(1) * ((size_t)rsize));
-    if (!rbuf) { fclose(f); return RAY_ERR_OOM; }
+    if (!rbuf) { err = RAY_ERR_OOM; goto rollback; }
     ray_index_inline_write(rbuf, ix);
     size_t rw = fwrite(rbuf, 1, (size_t)rsize, f);
     ray_free_raw(rbuf);
-    if (rw != (size_t)rsize) { fclose(f); return RAY_ERR_IO; }
+    if (rw != (size_t)rsize) { err = RAY_ERR_IO; goto rollback; }
+    /* The region must be on the file before the marker claims it. */
+    if (fflush(f) != 0) { err = RAY_ERR_IO; goto rollback; }
 
     /* Stamp the marker into aux[0..3] (file offset 0). */
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return RAY_ERR_IO; }
+    if (fseek(f, 0, SEEK_SET) != 0) { err = RAY_ERR_IO; goto rollback; }
     uint32_t mg = COL_IDX_AUX_MAGIC;
-    if (fwrite(&mg, 1, 4, f) != 4) { fclose(f); return RAY_ERR_IO; }
+    if (fwrite(&mg, 1, 4, f) != 4) { err = RAY_ERR_IO; goto rollback; }
     /* The index is a derived accelerator (rebuildable); flush is enough — no
      * fsync needed, and the marker is written LAST so a torn append never
      * leaves a half-region that looks indexed. */
     if (fclose(f) != 0) return RAY_ERR_IO;
     return RAY_OK;
+
+rollback:
+    /* Best effort: the marker was never written, so restoring the length
+     * is all it takes; if even that fails the caller sees the error. */
+    (void)col_truncate(f, payload_end);
+    fclose(f);
+    return err;
 }
 
 /* Does the payload hold the type's null sentinel anywhere?  Sequential

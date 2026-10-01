@@ -33,6 +33,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/col.h"
+#include "ops/idxop.h"
 #include "store/fileio.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -62,6 +63,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #endif
 
 #define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
@@ -1523,6 +1525,67 @@ static test_result_t test_col_close_failure(void) {
     }
     unlink(path);
     for (int i = 4; i >= 0; i--) ray_release(values[i]);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* A failed index append must leave the column loadable: without the index
+ * marker the loader requires the exact payload length, so a partial region
+ * would turn a best-effort accelerator into an unreadable column. */
+static test_result_t test_col_append_index_rollback(void) {
+#ifdef RAY_OS_LINUX
+    int64_t n = 100000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i * 3;
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-append-rollback-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_col_save(v, path), RAY_OK);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    off_t payload = st.st_size;
+
+    ray_t* w = v; ray_retain(w);
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    const ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_NOT_NULL(ix);
+
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)payload + 40;     /* pad fits, region doesn't */
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(ray_col_append_index(path, ix, n, RAY_I64) != RAY_OK ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, (int64_t)payload);
+    ray_t* back = ray_col_load(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(back))[n - 1], (n - 1) * 3);
+    ray_release(back);
+
+    /* and the append still works once there is room */
+    TEST_ASSERT_EQ_I(ray_col_append_index(path, ix, n, RAY_I64), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_TRUE(st.st_size > payload);
+    back = ray_col_load(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    ray_release(back);
+
+    ray_release(w);
+    ray_release(v);
+    unlink(path);
     PASS();
 #else
     SKIP("requires Linux RLIMIT_FSIZE fault injection");
@@ -5526,6 +5589,7 @@ const test_entry_t store_entries[] = {
     { "store/file_sync", test_file_sync_op, store_setup, store_teardown },
     { "store/file_rename", test_file_rename_op, store_setup, store_teardown },
     { "store/col_close_failure", test_col_close_failure, store_setup, store_teardown },
+    { "store/col_append_index_rollback", test_col_append_index_rollback, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },
     { "store/sym_col_bounds_reject", test_sym_col_bounds_reject, store_setup, store_teardown },
