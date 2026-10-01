@@ -860,6 +860,35 @@ static test_result_t test_save_bulk_with_sym_path(void) {
     PASS();
 }
 
+static test_result_t test_save_staged_bulk_defers_sym_flush(void) {
+    const char* dir      = TMP_SPLAY_BASE "/staged_bulk_sym";
+    const char* sym_path = TMP_SPLAY_BASE "/staged_bulk_sym.sym";
+    rm_rf(dir);
+    unlink(sym_path);
+
+    int64_t id_s = ray_sym_intern("wsym", 4);
+    int64_t sval = ray_sym_intern("wv1", 3);
+    ray_t* scol = ray_sym_vec_new(RAY_SYM_W8, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(scol));
+    scol->len = 2;
+    ((uint8_t*)ray_data(scol))[0] = (uint8_t)sval;
+    ((uint8_t*)ray_data(scol))[1] = (uint8_t)sval;
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, id_s, scol);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_err_t err = ray_splay_save_staged_bulk(tbl, dir, sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_I(access(sym_path, F_OK), -1);
+
+    ray_release(scol);
+    ray_release(tbl);
+    rm_rf(dir);
+    unlink(sym_path);
+    PASS();
+}
+
 /* =========================================================================
  * 19. splay_save_impl: snprintf overflow for the column / ".d" paths.
  *     Requires strlen(dir) >= 1021 so that strlen(dir)+3 >= 1024.
@@ -2506,6 +2535,74 @@ static int generation_dir_count(const char* dir) {
     return count;
 }
 
+#ifndef _WIN32
+static test_result_t test_generation_prune_unlinks_symlink(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_symlink";
+    const char* victim = TMP_SPLAY_BASE "/generation_symlink_victim";
+    const char* victim_file = TMP_SPLAY_BASE "/generation_symlink_victim/keep";
+    rm_rf(dir);
+    rm_rf(victim);
+
+    ray_t* one = generation_pair(1);
+    ray_t* two = generation_pair(2);
+    ray_t* three = generation_pair(3);
+    ray_t* four = generation_pair(4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(one));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(two));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(three));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(four));
+
+    TEST_ASSERT_EQ_I(ray_splay_save(one, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(three, dir, NULL), RAY_OK);
+
+    char current[1024], generations[1024], prune_dir[1024];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, current, sizeof(current)), RAY_OK);
+    int n = snprintf(generations, sizeof(generations), "%s/.generations", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(generations));
+    DIR* d = opendir(generations);
+    TEST_ASSERT_NOT_NULL(d);
+    prune_dir[0] = '\0';
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char full[1024];
+        n = snprintf(full, sizeof(full), "%s/%s", generations, entry->d_name);
+        TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(full));
+        if (strcmp(full, current) != 0) {
+            snprintf(prune_dir, sizeof(prune_dir), "%s", full);
+            break;
+        }
+    }
+    closedir(d);
+    TEST_ASSERT_TRUE(prune_dir[0] != '\0');
+
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(victim), 0);
+    FILE* f = fopen(victim_file, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("keep", f);
+    fclose(f);
+
+    char link_path[1024];
+    n = snprintf(link_path, sizeof(link_path), "%s/outside", prune_dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(link_path));
+    TEST_ASSERT_EQ_I(symlink(victim, link_path), 0);
+
+    TEST_ASSERT_EQ_I(ray_splay_save(four, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(victim_file, F_OK), 0);
+    TEST_ASSERT_EQ_I(access(prune_dir, F_OK), -1);
+
+    ray_release(four);
+    ray_release(three);
+    ray_release(two);
+    ray_release(one);
+    rm_rf(dir);
+    rm_rf(victim);
+    PASS();
+}
+#endif
+
 /* Force actual filesystem failures after the first column and after all
  * columns respectively. No invalid object or preflight shortcut is involved. */
 static test_result_t test_generation_io_failures(void) {
@@ -2669,6 +2766,9 @@ static test_result_t test_generation_writer_exit(void) {
 }
 
 const test_entry_t splay_entries[] = {
+#ifndef _WIN32
+    { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
+#endif
     { "splay/generation_io_failures", test_generation_io_failures, splay_setup, splay_teardown },
     { "splay/generation_retains_readers", test_generation_retains_readers, splay_setup, splay_teardown },
     { "splay/generation_invalid_manifest", test_generation_invalid_manifest, splay_setup, splay_teardown },
@@ -2694,6 +2794,7 @@ const test_entry_t splay_entries[] = {
     { "splay/load_dir_path_too_long",     test_load_dir_path_too_long,          splay_setup, splay_teardown },
     { "splay/load_col_path_too_long",     test_load_col_path_too_long,          splay_setup, splay_teardown },
     { "splay/save_bulk_with_sym_path",    test_save_bulk_with_sym_path,         splay_setup, splay_teardown },
+    { "splay/save_staged_bulk_defers_sym_flush", test_save_staged_bulk_defers_sym_flush, splay_setup, splay_teardown },
     { "splay/save_dir_path_too_long",     test_save_dir_path_too_long,          splay_setup, splay_teardown },
     { "splay/save_col_path_too_long",     test_save_col_path_too_long,          splay_setup, splay_teardown },
     { "splay/trace_valid_dir",            test_trace_valid_dir,                 splay_setup, splay_teardown },

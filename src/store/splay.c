@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 /*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
@@ -257,12 +260,24 @@ static void splay_remove_tree_best_effort(const char* path) {
         int n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
         if (n < 0 || (size_t)n >= sizeof(child)) continue;
         struct stat st;
+#ifdef RAY_OS_WINDOWS
         if (stat(child, &st) != 0) continue;
+#else
+        if (lstat(child, &st) != 0) continue;
+#endif
         if (S_ISDIR(st.st_mode)) splay_remove_tree_best_effort(child);
         else (void)unlink(child);
     }
     closedir(d);
     (void)rmdir(path);
+}
+
+static bool splay_generation_is_current(const ray_splay_write_t* write) {
+    char current[1024];
+    bool active = false;
+    return write && write->staged && write->dir[0] &&
+           splay_current_dir(write->root, current, sizeof(current), &active) == RAY_OK &&
+           active && strcmp(current, write->dir) == 0;
 }
 
 static void splay_retire_legacy_schema(const char* root) {
@@ -363,8 +378,9 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
     return RAY_OK;
 }
 
-ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
-                                 const char* sym_path, bool durable) {
+static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
+                                        const char* sym_path, bool durable,
+                                        bool flush_sym, bool build_indexes) {
     ray_err_t validation = splay_validate_save(tbl, dir, sym_path);
     if (validation != RAY_OK) return validation;
     /* Create directory and any missing parents (mkdir -p semantics).
@@ -420,7 +436,7 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
             }
         }
 
-        ray_err_t sym_err = ray_sym_domain_flush(dom, durable);
+        ray_err_t sym_err = flush_sym ? ray_sym_domain_flush(dom, durable) : RAY_OK;
         if (sym_err != RAY_OK) {
             ray_sym_domain_release(dom);
             return sym_err;
@@ -477,7 +493,8 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
     /* Indexes belong to this generation and must precede publication. They are
      * rebuildable accelerators; ray_col_append_index writes the marker last and
      * intentionally does not fsync them again after ray_col_save fsyncs data. */
-    ray_splay_build_indexes(dir, tbl);
+    if (build_indexes)
+        ray_splay_build_indexes(dir, tbl);
 
     /* 3. .d LAST — the commit marker. */
     {
@@ -497,6 +514,11 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
     splay_sweep_stale(tbl, dir);
 
     return RAY_OK;
+}
+
+ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
+                                 const char* sym_path, bool durable) {
+    return splay_write_table_impl(tbl, dir, sym_path, durable, true, true);
 }
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
@@ -521,7 +543,8 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                     had_previous ? previous : NULL);
         }
     }
-    if (result != RAY_OK && write->staged && write->dir[0]) {
+    if (result != RAY_OK && write->staged && write->dir[0] &&
+        !splay_generation_is_current(write)) {
         splay_remove_tree_best_effort(write->dir);
     }
     if (write->lock != RAY_FD_INVALID) {
@@ -603,6 +626,10 @@ ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
 
 ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
     return splay_save_impl(tbl, dir, sym_path, false);
+}
+
+ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
+    return splay_write_table_impl(tbl, dir, sym_path, false, false, false);
 }
 
 /* --------------------------------------------------------------------------
