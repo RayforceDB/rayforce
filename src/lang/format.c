@@ -70,6 +70,7 @@ static void fmt_init(fmt_buf_t* b) {
     b->err_msg = NULL;
     b->sink    = NULL;
     b->io_err  = false;
+    b->flushed = false;
     b->block   = ray_alloc(256);
     if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
         b->err = true; b->err_msg = "cannot allocate the initial output buffer";
