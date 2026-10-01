@@ -49,6 +49,7 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
@@ -859,6 +860,35 @@ static test_result_t test_save_bulk_with_sym_path(void) {
     PASS();
 }
 
+static test_result_t test_save_staged_bulk_defers_sym_flush(void) {
+    const char* dir      = TMP_SPLAY_BASE "/staged_bulk_sym";
+    const char* sym_path = TMP_SPLAY_BASE "/staged_bulk_sym.sym";
+    rm_rf(dir);
+    unlink(sym_path);
+
+    int64_t id_s = ray_sym_intern("wsym", 4);
+    int64_t sval = ray_sym_intern("wv1", 3);
+    ray_t* scol = ray_sym_vec_new(RAY_SYM_W8, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(scol));
+    scol->len = 2;
+    ((uint8_t*)ray_data(scol))[0] = (uint8_t)sval;
+    ((uint8_t*)ray_data(scol))[1] = (uint8_t)sval;
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, id_s, scol);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_err_t err = ray_splay_save_staged_bulk(tbl, dir, sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_I(access(sym_path, F_OK), -1);
+
+    ray_release(scol);
+    ray_release(tbl);
+    rm_rf(dir);
+    unlink(sym_path);
+    PASS();
+}
+
 /* =========================================================================
  * 19. splay_save_impl: snprintf overflow for the column / ".d" paths.
  *     Requires strlen(dir) >= 1021 so that strlen(dir)+3 >= 1024.
@@ -1309,8 +1339,8 @@ static test_result_t test_selfdescribing_schema_fresh_process(void) {
 }
 
 /* =========================================================================
- * 29. Crash-safe save: (a) re-set with a NARROWER schema removes stale
- *     column files; (b) symbol-free tables write no symfile even when a
+ * 29. Crash-safe save: (a) re-set with a NARROWER schema retains old
+ *     column files for readers; (b) symbol-free tables write no symfile even when a
  *     sym_path is supplied; (c) .d is the commit marker — written last.
  * ========================================================================= */
 static test_result_t test_save_sweeps_stale_and_skips_sym(void) {
@@ -1343,10 +1373,10 @@ static test_result_t test_save_sweeps_stale_and_skips_sym(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(narrow));
     TEST_ASSERT_EQ_I(ray_splay_save(narrow, dir, NULL), RAY_OK);
 
-    /* (a) stale column file "b" must be gone; load sees 1 column */
+    /* Old readers can still open b; the new generation has only a. */
     char bpath[512];
     snprintf(bpath, sizeof(bpath), "%s/b", dir);
-    TEST_ASSERT_EQ_I(access(bpath, F_OK), -1);
+    TEST_ASSERT_EQ_I(access(bpath, F_OK), 0);
     ray_t* loaded = ray_splay_load(dir, NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
@@ -2372,7 +2402,378 @@ static test_result_t test_splayed_has_nulls_roundtrip(void) {
     PASS();
 }
 
+/* A replacement must be published as one generation.  The failed replacement
+ * is deterministic (unsupported nested data), so it also proves that a
+ * preflight/write error cannot advance the table-level manifest. */
+static test_result_t test_splay_atomic_generation_publish(void) {
+    const char* dir = TMP_SPLAY_BASE "/atomic_generation";
+    char manifest[512];
+    int n = snprintf(manifest, sizeof(manifest), "%s/.current", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(manifest));
+    (void)ray_test_rm_rf(dir);
+
+    int64_t x_id = ray_sym_intern("x", 1);
+    int64_t y_id = ray_sym_intern("y", 1);
+    int64_t old_x_raw[] = {1, 2};
+    int64_t old_y_raw[] = {10, 20};
+    ray_t* old_x = ray_vec_from_raw(RAY_I64, old_x_raw, 2);
+    ray_t* old_y = ray_vec_from_raw(RAY_I64, old_y_raw, 2);
+    ray_t* old = ray_table_new(2);
+    old = ray_table_add_col(old, x_id, old_x);
+    old = ray_table_add_col(old, y_id, old_y);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(old));
+    TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(manifest, F_OK), -1);
+
+    int64_t new_x_raw[] = {3, 4};
+    int64_t new_y_raw[] = {30, 40};
+    ray_t* new_x = ray_vec_from_raw(RAY_I64, new_x_raw, 2);
+    ray_t* new_y = ray_vec_from_raw(RAY_I64, new_y_raw, 2);
+    ray_t* replacement = ray_table_new(2);
+    replacement = ray_table_add_col(replacement, x_id, new_x);
+    replacement = ray_table_add_col(replacement, y_id, new_y);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(replacement));
+    TEST_ASSERT_EQ_I(ray_splay_save(replacement, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(manifest, F_OK), 0);
+    char legacy_schema[512];
+    n = snprintf(legacy_schema, sizeof(legacy_schema), "%s/.d", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(legacy_schema));
+    TEST_ASSERT_EQ_I(access(legacy_schema, F_OK), -1);
+
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* loaded_x = ray_table_get_col(loaded, x_id);
+    ray_t* loaded_y = ray_table_get_col(loaded, y_id);
+    TEST_ASSERT_NOT_NULL(loaded_x);
+    TEST_ASSERT_NOT_NULL(loaded_y);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_x))[0], 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_y))[0], 30);
+    ray_release(loaded);
+
+    ray_t* bad_col = ray_dict_new(ray_vec_from_raw(RAY_I64, old_x_raw, 2),
+                                  ray_vec_from_raw(RAY_I64, old_y_raw, 2));
+    ray_t* bad = ray_table_new(2);
+    bad = ray_table_add_col(bad, x_id, old_x);
+    bad = ray_table_add_col(bad, y_id, old_y);
+    ray_table_set_col_idx(bad, 1, bad_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    ray_err_t bad_err = ray_splay_save(bad, dir, NULL);
+    TEST_ASSERT_EQ_I(bad_err, RAY_ERR_NYI);
+
+    loaded = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    loaded_x = ray_table_get_col(loaded, x_id);
+    loaded_y = ray_table_get_col(loaded, y_id);
+    TEST_ASSERT_NOT_NULL(loaded_x);
+    TEST_ASSERT_NOT_NULL(loaded_y);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_x))[0], 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(loaded_y))[0], 30);
+    ray_release(loaded);
+
+    ray_release(bad);
+    ray_release(bad_col);
+    ray_release(replacement);
+    ray_release(new_x);
+    ray_release(new_y);
+    ray_release(old);
+    ray_release(old_x);
+    ray_release(old_y);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+static ray_t* generation_pair(int64_t value) {
+    int64_t x[] = {value, value + 1};
+    int64_t y[] = {value * 10, (value + 1) * 10};
+    ray_t* xc = ray_vec_from_raw(RAY_I64, x, 2);
+    ray_t* yc = ray_vec_from_raw(RAY_I64, y, 2);
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), xc);
+    t = ray_table_add_col(t, ray_sym_intern("y", 1), yc);
+    ray_release(xc);
+    ray_release(yc);
+    return t;
+}
+
+static bool generation_matches(const char* dir, bool mmap, int64_t value) {
+    ray_t* t = mmap ? ray_read_splayed(dir, NULL) : ray_splay_load(dir, NULL);
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_release(t); return false; }
+    ray_t* x = ray_table_get_col(t, ray_sym_intern("x", 1));
+    ray_t* y = ray_table_get_col(t, ray_sym_intern("y", 1));
+    bool ok = x && y && x->len == 2 && y->len == 2 &&
+              x->type == RAY_I64 && y->type == RAY_I64;
+    if (ok) {
+        const int64_t* xd = ray_data(x);
+        const int64_t* yd = ray_data(y);
+        ok = xd[0] == value && xd[1] == value + 1 &&
+             yd[0] == value * 10 && yd[1] == (value + 1) * 10;
+    }
+    ray_release(t);
+    return ok;
+}
+
+static int generation_dir_count(const char* dir) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/.generations", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    DIR* d = opendir(path);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child[1024];
+        n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) continue;
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) count++;
+    }
+    closedir(d);
+    return count;
+}
+
+#ifndef _WIN32
+static test_result_t test_generation_prune_unlinks_symlink(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_symlink";
+    const char* victim = TMP_SPLAY_BASE "/generation_symlink_victim";
+    const char* victim_file = TMP_SPLAY_BASE "/generation_symlink_victim/keep";
+    rm_rf(dir);
+    rm_rf(victim);
+
+    ray_t* one = generation_pair(1);
+    ray_t* two = generation_pair(2);
+    ray_t* three = generation_pair(3);
+    ray_t* four = generation_pair(4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(one));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(two));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(three));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(four));
+
+    TEST_ASSERT_EQ_I(ray_splay_save(one, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(three, dir, NULL), RAY_OK);
+
+    char current[1024], generations[1024], prune_dir[1024];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, current, sizeof(current)), RAY_OK);
+    int n = snprintf(generations, sizeof(generations), "%s/.generations", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(generations));
+    DIR* d = opendir(generations);
+    TEST_ASSERT_NOT_NULL(d);
+    prune_dir[0] = '\0';
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char full[1024];
+        n = snprintf(full, sizeof(full), "%s/%s", generations, entry->d_name);
+        TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(full));
+        if (strcmp(full, current) != 0) {
+            snprintf(prune_dir, sizeof(prune_dir), "%s", full);
+            break;
+        }
+    }
+    closedir(d);
+    TEST_ASSERT_TRUE(prune_dir[0] != '\0');
+
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(victim), 0);
+    FILE* f = fopen(victim_file, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("keep", f);
+    fclose(f);
+
+    char link_path[1024];
+    n = snprintf(link_path, sizeof(link_path), "%s/outside", prune_dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(link_path));
+    TEST_ASSERT_EQ_I(symlink(victim, link_path), 0);
+
+    TEST_ASSERT_EQ_I(ray_splay_save(four, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(victim_file, F_OK), 0);
+    TEST_ASSERT_EQ_I(access(prune_dir, F_OK), -1);
+
+    ray_release(four);
+    ray_release(three);
+    ray_release(two);
+    ray_release(one);
+    rm_rf(dir);
+    rm_rf(victim);
+    PASS();
+}
+#endif
+
+/* Force actual filesystem failures after the first column and after all
+ * columns respectively. No invalid object or preflight shortcut is involved. */
+static test_result_t test_generation_io_failures(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_io";
+    rm_rf(dir);
+    ray_t* old = generation_pair(1);
+    ray_t* next = generation_pair(9);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(old));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(next));
+    for (int era = 0; era < 2; era++) {
+        /* Exercise both legacy -> generation and generation -> generation. */
+        TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+        char before[1024], after[1024], obstruction[1100], first_col[1100];
+        TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, before, sizeof(before)), RAY_OK);
+        ray_splay_write_t write;
+        TEST_ASSERT_EQ_I(ray_splay_write_begin(dir, &write), RAY_OK);
+        snprintf(obstruction, sizeof(obstruction), "%s/y", write.dir);
+        TEST_ASSERT_EQ_I(ray_test_mkdir_p(obstruction), 0);
+        ray_err_t err = ray_splay_write_table(next, write.dir, NULL, true);
+        err = ray_splay_write_finish(&write, err, true);
+        TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+        snprintf(first_col, sizeof(first_col), "%s/x", write.dir);
+        TEST_ASSERT_EQ_I(access(first_col, F_OK), -1);
+        TEST_ASSERT_TRUE(generation_matches(dir, false, 1));
+        TEST_ASSERT_TRUE(generation_matches(dir, true, 1));
+
+        TEST_ASSERT_EQ_I(ray_splay_write_begin(dir, &write), RAY_OK);
+        err = ray_splay_write_table(next, write.dir, NULL, true);
+        if (err != RAY_OK) (void)ray_splay_write_finish(&write, err, true);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+        /* A directory cannot be opened as the manifest's temporary file. */
+        snprintf(obstruction, sizeof(obstruction), "%s/.current.tmp", write.dir);
+        TEST_ASSERT_EQ_I(ray_test_mkdir_p(obstruction), 0);
+        TEST_ASSERT_EQ_I(ray_splay_write_finish(&write, RAY_OK, true), RAY_ERR_IO);
+        TEST_ASSERT_TRUE(generation_matches(dir, false, 1));
+        TEST_ASSERT_TRUE(generation_matches(dir, true, 1));
+        TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, after, sizeof(after)), RAY_OK);
+        TEST_ASSERT_TRUE(strcmp(before, after) == 0);
+#ifndef _WIN32
+        if (geteuid() != 0) {
+            /* Temp creation succeeds inside the stage; publication itself
+             * fails when rename cannot modify the table root. */
+            TEST_ASSERT_EQ_I(ray_splay_write_begin(dir, &write), RAY_OK);
+            err = ray_splay_write_table(next, write.dir, NULL, true);
+            if (err != RAY_OK) (void)ray_splay_write_finish(&write, err, true);
+            TEST_ASSERT_EQ_I(err, RAY_OK);
+            TEST_ASSERT_EQ_I(chmod(dir, 0555), 0);
+            err = ray_splay_write_finish(&write, RAY_OK, true);
+            int restored = chmod(dir, 0755);
+            TEST_ASSERT_EQ_I(restored, 0);
+            TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+            TEST_ASSERT_TRUE(generation_matches(dir, true, 1));
+        }
+#endif
+    }
+    /* Failure must also release the writer lock so a retry can commit. */
+    TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
+    TEST_ASSERT_TRUE(generation_matches(dir, true, 9));
+    TEST_ASSERT_TRUE(generation_dir_count(dir) <= 2);
+    ray_release(next);
+    ray_release(old);
+    rm_rf(dir);
+    PASS();
+}
+
+static test_result_t test_generation_retains_readers(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_readers";
+    rm_rf(dir);
+    ray_t* old = generation_pair(1);
+    ray_t* next = generation_pair(9);
+    TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    for (int era = 0; era < 2; era++) {
+        char resolved[1024], path[1100];
+        TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
+        ray_t* pinned = ray_read_splayed(dir, NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(pinned));
+        TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
+        /* Reader resolved the old path before publication but opens a column
+         * afterwards. Both the on-disk file and an existing mmap must survive. */
+        snprintf(path, sizeof(path), "%s/y", resolved);
+        ray_t* late = ray_col_load(path);
+        TEST_ASSERT_NOT_NULL(late);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(late));
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(late))[0], 10);
+        ray_release(late);
+        ray_t* py = ray_table_get_col(pinned, ray_sym_intern("y", 1));
+        TEST_ASSERT_NOT_NULL(py);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(py))[0], 10);
+        ray_release(pinned);
+        TEST_ASSERT_TRUE(generation_matches(dir, false, 9));
+        TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    }
+    TEST_ASSERT_TRUE(generation_dir_count(dir) <= 2);
+    ray_release(next);
+    ray_release(old);
+    rm_rf(dir);
+    PASS();
+}
+
+static test_result_t test_generation_invalid_manifest(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_manifest";
+    rm_rf(dir);
+    ray_t* t = generation_pair(1);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    const char* invalid[] = {"", ".generations/../x\n", ".generations/g-1/..\n",
+                             ".generations/g-1\njunk\n", ".generations/\n"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        FILE* f = fopen(TMP_SPLAY_BASE "/generation_manifest/.current", "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        TEST_ASSERT_TRUE(fputs(invalid[i], f) >= 0);
+        TEST_ASSERT_EQ_I(fclose(f), 0);
+        ray_t* loaded = ray_splay_load(dir, NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_STR_EQ(ray_err_code(loaded), "corrupt");
+        ray_release(loaded);
+        loaded = ray_read_splayed_dom(dir, NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_STR_EQ(ray_err_code(loaded), "corrupt");
+        ray_release(loaded);
+    }
+    ray_release(t);
+    rm_rf(dir);
+    PASS();
+}
+
+static test_result_t test_generation_writer_exit(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_exit";
+    rm_rf(dir);
+    ray_t* old = generation_pair(1);
+    ray_t* next = generation_pair(9);
+    TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    for (int complete = 0; complete < 2; complete++) {
+        ray_splay_write_t wr;
+        TEST_ASSERT_EQ_I(ray_splay_write_begin(dir, &wr), RAY_OK);
+        ray_err_t err;
+        if (complete) {
+            err = ray_splay_write_table(next, wr.dir, NULL, true);
+        } else {
+            char path[1100];
+            snprintf(path, sizeof(path), "%s/x", wr.dir);
+            err = ray_col_save(ray_table_get_col_idx(next, 0), path);
+        }
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+        /* Simulate an abrupt writer exit after staging but before finish():
+         * the OS releases the writer lock, but no .current publication happens.
+         * Avoid fork() here; macOS sanitizer runtimes may terminate forked
+         * children before normal test-side status reporting runs. */
+        TEST_ASSERT_EQ_I(ray_file_unlock(wr.lock), RAY_OK);
+        ray_file_close(wr.lock);
+        wr.lock = RAY_FD_INVALID;
+        TEST_ASSERT_TRUE(generation_matches(dir, false, 1));
+        TEST_ASSERT_TRUE(generation_matches(dir, true, 1));
+        TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
+    TEST_ASSERT_TRUE(generation_matches(dir, true, 9));
+    ray_release(next);
+    ray_release(old);
+    rm_rf(dir);
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
+#ifndef _WIN32
+    { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
+#endif
+    { "splay/generation_io_failures", test_generation_io_failures, splay_setup, splay_teardown },
+    { "splay/generation_retains_readers", test_generation_retains_readers, splay_setup, splay_teardown },
+    { "splay/generation_invalid_manifest", test_generation_invalid_manifest, splay_setup, splay_teardown },
+    { "splay/generation_writer_exit", test_generation_writer_exit, splay_setup, splay_teardown },
+    { "splay/atomic_generation_publish", test_splay_atomic_generation_publish, splay_setup, splay_teardown },
     { "splay/has_nulls_roundtrip",        test_splayed_has_nulls_roundtrip,      splay_setup, splay_teardown },
     { "splay/save_null_dir",              test_save_null_dir,                   splay_setup, splay_teardown },
     { "splay/save_null_tbl",              test_save_null_tbl,                   splay_setup, splay_teardown },
@@ -2393,6 +2794,7 @@ const test_entry_t splay_entries[] = {
     { "splay/load_dir_path_too_long",     test_load_dir_path_too_long,          splay_setup, splay_teardown },
     { "splay/load_col_path_too_long",     test_load_col_path_too_long,          splay_setup, splay_teardown },
     { "splay/save_bulk_with_sym_path",    test_save_bulk_with_sym_path,         splay_setup, splay_teardown },
+    { "splay/save_staged_bulk_defers_sym_flush", test_save_staged_bulk_defers_sym_flush, splay_setup, splay_teardown },
     { "splay/save_dir_path_too_long",     test_save_dir_path_too_long,          splay_setup, splay_teardown },
     { "splay/save_col_path_too_long",     test_save_col_path_too_long,          splay_setup, splay_teardown },
     { "splay/trace_valid_dir",            test_trace_valid_dir,                 splay_setup, splay_teardown },
