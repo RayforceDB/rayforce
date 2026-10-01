@@ -55,3 +55,8 @@ int  ray_version_major(void)         { return RAY_VERSION_MAJOR; }
 int  ray_version_minor(void)         { return RAY_VERSION_MINOR; }
 int  ray_version_patch(void)         { return RAY_VERSION_PATCH; }
 const char* ray_version_string(void) { return RAY_VERSION_STRING_; }
+
+#ifndef RAYFORCE_GIT_COMMIT
+#define RAYFORCE_GIT_COMMIT "unknown"
+#endif
+const char* ray_git_commit(void)     { return RAYFORCE_GIT_COMMIT; }
