@@ -321,7 +321,9 @@ table operations.
 - One local, unencrypted file with a flat schema.
 - Uncompressed and raw Snappy column chunks.
 - Data pages v1 and v2; PLAIN and dictionary encoding, including the legacy
-  dictionary tag and dictionary-to-plain fallback within a chunk.
+  dictionary tag and dictionary-to-plain fallback within a chunk; RLE-encoded
+  BOOLEAN values (the v2 default of common writers). Zero-row row groups are
+  skipped.
 - RLE/bit-packed definition levels and dictionary IDs; page CRC32 validation
   when a checksum is present on a decoded page. Pruned pages are not read for
   checksum validation.
@@ -340,9 +342,12 @@ table operations.
   integer null sentinels are represented as nulls. Their original distinction
   from Parquet nulls is not preserved. This is not a lossless interchange path
   for those values. Enable `strict: true` to reject these collisions instead.
-- At most 4,096 columns, a 64 MiB footer, 64 MiB per compressed or decompressed
-  page, and a 64 MiB string pool per decoded column batch. Oversized values
-  return errors. Total scratch memory depends on the selected column count
+- At most 4,096 columns, a 64 MiB footer, and 64 MiB per compressed or
+  decompressed page. Batches of long strings are made smaller: each row
+  group's batch size is lowered so a STR column's decoded string pool stays
+  near 64 MiB, estimated from the column chunk's uncompressed size. A pool
+  past its 4 GiB capacity (a dictionary repeating very long values, for
+  example) returns an error. Oversized values return errors. Total scratch memory depends on the selected column count
   and page/dictionary sizes; there is no query-wide memory budget yet.
 
 Projection avoids decoding other columns, except an unprojected range-filter
@@ -408,8 +413,9 @@ partition IDs in source order, with at most 65,536 rows per partition by default
 An import options dictionary can replace the positional type vector:
 `{types: [I64 SYM] rows: 262144 strict: true}`. `types` and `strict` are optional;
 `rows` accepts 1 through 1,048,576. Row-group boundaries also end partitions.
-Larger batches require more memory; decoded STR pools retain their 64 MiB batch
-limit. Splayed imports accept the same options to control their decode batches.
+Larger batches require more memory. Partitions holding long strings are
+smaller than `rows`, since a partition is one decode batch and batches keep
+STR pools near 64 MiB. Splayed imports accept the same options to control their decode batches.
 The importer writes
 exact native numeric zone indexes while each decoded batch is resident (F32
 currently excluded). STR pools stay local to each partition. Typed SYM imports
