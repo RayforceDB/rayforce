@@ -365,7 +365,7 @@ compdb:
 # these targets are Linux-only by design; CI gates them to ubuntu.
 FUZZ_RUNTIME ?= 60
 FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
-FUZZ_TARGETS  = parse numparse de eval csv journal
+FUZZ_TARGETS  = parse numparse de eval csv journal parquet
 # Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
 # lacks libstdc++ (e.g. a partially-installed newer gcc shadowing the real
 # one).  Normally empty; set on such a box, e.g.
@@ -389,6 +389,10 @@ build_fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_LIB_OBJ)
 	$(CLANGXX) -fsanitize=fuzzer,address,undefined $(FUZZ_LDEXTRA) \
 	  -o $@ build_fuzz/$*.o $(FUZZ_LIB_OBJ) $(LIBS)
 
+# Reuse instrumented objects across fuzz targets and linker retries.
+.SECONDARY: $(FUZZ_LIB_OBJ)
+.PRECIOUS: build_fuzz/fuzz_%
+
 fuzz-%: build_fuzz/fuzz_%
 	@mkdir -p fuzz/corpus/$*
 	@dict=$(DICT_$*); \
@@ -396,6 +400,7 @@ fuzz-%: build_fuzz/fuzz_%
 	 seeds=$$( [ -d fuzz/seeds/$* ] && echo fuzz/seeds/$* ); \
 	 set -x; \
 	 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	   ./build_fuzz/fuzz_$* fuzz/corpus/$* $$seeds \
 	   $$dictopt $(FUZZ_OPTS) -max_total_time=$(FUZZ_RUNTIME)
 

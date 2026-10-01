@@ -37,6 +37,9 @@ struct ray_sym_domain_s;
  * with no resolvable symfile is a loud "sym" error. */
 ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path);
 ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path);
+/* Private import directory only: caller holds the shared symbol domain alive
+ * and flushes it before publishing the root. Bulk writes are not durable. */
+ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path);
 ray_t*    ray_splay_load(const char* dir, const char* sym_path);
 ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
 

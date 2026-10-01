@@ -6516,6 +6516,16 @@ static bool restricted_expr_returns_access(const char* expr) {
     return access;
 }
 
+static test_result_t test_eval_restricted_parquet(void) {
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(.parquet.splayed \"missing\" \"unused\")"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(.parquet.scan \"test/data/parquet/flat-1-v2.parquet\")"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(select {from: {.parquet.source: \"test/data/parquet/flat-1-v2.parquet\"} x: x})"));
+    PASS();
+}
+
 /* Restricted builtins must be rejected at the actual invocation boundary,
  * including compiled lambda bytecode.  Invalid filesystem arguments are
  * deliberate: before the fix they return os/type instead of access without
@@ -8808,6 +8818,34 @@ static test_result_t test_select_derived_key_file_chunks(void) {
     ray_release(same);
     ray_release(cols);
     ray_release(same7);
+
+    /* Scan-owned dictionaries have no mmap prefix. Their stable atoms must
+     * use the same bounded chunk evaluator as a file domain's appended tail. */
+    ray_t* original = ray_eval_str("__dk_T");
+    TEST_ASSERT_NOT_NULL(original); TEST_ASSERT_FALSE(RAY_IS_ERR(original));
+    ray_t* refs = ray_table_get_col_idx(original,0);
+    ray_sym_domain_t* domain = ray_sym_domain_new(); TEST_ASSERT_NOT_NULL(domain);
+    ray_t* private = ray_sym_vec_new(RAY_SYM_W32,refs->len);
+    TEST_ASSERT_NOT_NULL(private); TEST_ASSERT_FALSE(RAY_IS_ERR(private));
+    private->sym_domain = domain; private->len = refs->len;
+    for (int64_t i = 0; i < refs->len; i++) {
+        ray_t* s = ray_sym_vec_cell(refs,i);
+        int64_t id = ray_sym_domain_intern(domain,ray_str_ptr(s),ray_str_len(s));
+        TEST_ASSERT_TRUE(id >= 0);
+        ((uint32_t*)ray_data(private))[i] = (uint32_t)id;
+        if (!id) private->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    ray_t* table = ray_table_new(0);
+    table = ray_table_add_col(table,ray_sym_intern("ref",3),private);
+    table = ray_table_add_col(table,ray_sym_intern("v",1),ray_table_get_col_idx(original,1));
+    TEST_ASSERT_NOT_NULL(table); TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+    ray_env_set(ray_sym_intern("__dk_private",12),table);
+    ray_release(private); ray_release(table); ray_release(original);
+    ray_derived_key_chunk_set_for_test(7);
+    same = ray_eval_str("(all (== (__dk_fp (__dk_keyq __dk_private)) (__dk_fp __dk_r7)))");
+    ray_derived_key_chunk_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(same); TEST_ASSERT_FALSE(RAY_IS_ERR(same)); TEST_ASSERT_TRUE(same->b8);
+    ray_release(same);
     PASS();
 }
 
@@ -9530,6 +9568,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_time", test_eval_table_list_col_time, lang_setup, lang_teardown },
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
+    { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },

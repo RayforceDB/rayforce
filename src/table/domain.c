@@ -35,10 +35,10 @@
  * Append-only; positions are permanent; ray_sym_domain_flush persists
  * base+tail atomically under the symfile's flock.
  *
- * Concurrency: one global spinlock guards the cache list, FILE-domain
+ * Concurrency: one global mutex guards the cache list, FILE-domain
  * refcounts, appends, the lazily built reverse index and the runtime-id
- * LUT build.  Domain opens, interns (save merges / live inserts — all
- * inside sequential eval) and first-find index builds are rare.  The
+ * LUT build. Bulk imports can hold it while growing a large dictionary;
+ * contending workers sleep instead of spending CPU time spinning. The
  * two hot read paths are LOCK-FREE: ray_sym_domain_str reads the
  * atomically published (count, atoms) pair — appends publish a slot
  * write with a release store of the count, growth REPLACES the array
@@ -73,6 +73,11 @@
 #include <libgen.h>
 #include <sys/stat.h>
 #include <limits.h>
+#if defined(RAY_OS_WINDOWS)
+#include <windows.h>
+#elif !defined(RAY_OS_WASM)
+#include <pthread.h>
+#endif
 #ifndef PATH_MAX
 #  define PATH_MAX 4096
 #endif
@@ -204,15 +209,23 @@ ray_sym_domain_t* ray_sym_runtime_domain(void) {
 
 static ray_sym_domain_t* g_domains = NULL;
 
-static _Atomic(int) g_dom_lock = 0;
+#if defined(RAY_OS_WINDOWS)
+static SRWLOCK g_dom_lock = SRWLOCK_INIT;
 static inline void dom_lock(void) {
-    while (atomic_exchange_explicit(&g_dom_lock, 1, memory_order_acquire)) {
-        RAY_CPU_RELAX();
-    }
+    AcquireSRWLockExclusive(&g_dom_lock);
 }
 static inline void dom_unlock(void) {
-    atomic_store_explicit(&g_dom_lock, 0, memory_order_release);
+    ReleaseSRWLockExclusive(&g_dom_lock);
 }
+#elif defined(RAY_OS_WASM)
+/* The WASM runtime is single-threaded. */
+static inline void dom_lock(void) {}
+static inline void dom_unlock(void) {}
+#else
+static pthread_mutex_t g_dom_lock = PTHREAD_MUTEX_INITIALIZER;
+static inline void dom_lock(void) { pthread_mutex_lock(&g_dom_lock); }
+static inline void dom_unlock(void) { pthread_mutex_unlock(&g_dom_lock); }
+#endif
 
 /* ---- FILE domain construction / destruction ------------------------------- */
 
@@ -669,6 +682,17 @@ ray_sym_domain_t* ray_sym_domain_open(const char* path) {
 
 ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path) {
     return dom_open_impl(path, true);
+}
+
+ray_sym_domain_t* ray_sym_domain_new(void) {
+    ray_sym_domain_t* d = ray_sys_alloc(sizeof(*d));
+    if (!d) return NULL;
+    d->kind = DOM_FILE;
+    d->rc = 1;
+    atomic_store_explicit(&d->raw_snap, NULL, memory_order_relaxed);
+    d->arena = ray_arena_new(64 * 1024);
+    if (!d->arena) { ray_sys_free(d); return NULL; }
+    return d;
 }
 
 void ray_sym_domain_retain(ray_sym_domain_t* dom) {
@@ -1224,6 +1248,33 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     bool unchanged = ok && dom->buckets == b.buckets &&
                      atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count &&
                      !atomic_load_explicit(&b.unsure, memory_order_relaxed);
+    if (ok && !unchanged) {
+        /* Concurrent column chunks commonly append between the probe and
+         * commit. Keep the deduplication and arena batching: recheck only
+         * distinct misses against the current index, then commit the new
+         * subset in bulk. Falling back to one allocation/insertion per
+         * cell here makes additional import workers spend their time
+         * waiting for this lock. */
+        int64_t total = 0;
+        for (int p = 0; p < n_part; p++) {
+            int64_t lo = b.part_off[p], keep = 0, bytes = 0;
+            for (int64_t j = 0; j < b.uniq_n[p]; j++) {
+                int64_t i = b.uniq[lo+j];
+                int64_t pos = dom_probe_locked(dom, hashes[i], strs[i], lens[i]);
+                if (pos >= 0) out_pos[i] = pos;
+                else {
+                    b.uniq[lo+keep++] = i;
+                    bytes += (int64_t)ray_arena_str_bytes(lens[i]);
+                }
+            }
+            b.uniq_n[p] = keep; b.bytes_p[p] = bytes; total += keep;
+        }
+        b.count = atomic_load_explicit(&dom->count, memory_order_relaxed);
+        if ((double)(b.count + total) > 0.7 * (double)(dom->bucket_mask + 1))
+            ok = dom_build_index_locked(dom, total);
+        b.buckets = dom->buckets; b.mask = dom->bucket_mask;
+        unchanged = ok;
+    }
     if (unchanged) {
         int64_t total = 0;
         for (int p = 0; p < n_part; p++) total += b.uniq_n[p];
@@ -1317,6 +1368,7 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom) {
 ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     if (!dom) return RAY_ERR_TYPE;
     if (dom->kind == DOM_RUNTIME) return RAY_OK; /* sym.c owns its own files */
+    if (!dom->path) return RAY_ERR_DOMAIN;
 
     dom_lock();
     int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
