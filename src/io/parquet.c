@@ -1610,6 +1610,15 @@ static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* ta
 done:
     ray_free_raw(offsets); ray_free_raw(errors); return err;
 }
+/* The destination without trailing separators, as .csv.parted takes it:
+ * "out/" must stage in "out.parquet-partial", not "out/.parquet-partial". */
+static bool pq_dest(const char* in, char* out, size_t size) {
+    size_t len = in ? strlen(in) : 0;
+    while (len > 1 && (in[len-1] == '/' || in[len-1] == '\\')) len--;
+    if (!len || len >= size) return false;
+    memcpy(out,in,len); out[len] = 0;
+    return true;
+}
 static ray_t* pq_stage(ray_parquet_t* r, const char* root, char* staging, size_t size, bool parted) {
     struct stat st;
     int n = snprintf(staging,size,"%s.parquet-partial",root);
@@ -1625,7 +1634,7 @@ static ray_t* pq_stage(ray_parquet_t* r, const char* root, char* staging, size_t
 #else
     bool created = mkdir(staging,0755) == 0;
 #endif
-    return created ? NULL : pq_error("cannot create staging directory (parent must exist; stale staging directories are not overwritten)");
+    return created ? NULL : ray_error("parquet","cannot create staging directory %s (the parent must exist; one left by an earlier failed import is not overwritten, remove it to retry)",staging);
 }
 static ray_t* pq_publish(const char* staging, const char* root, int64_t rows) {
     struct stat st;
@@ -1666,9 +1675,12 @@ ray_t* ray_parquet_parted_typed(const char* path, const char* root, const char* 
     return ray_error("restricted","Parquet imports disabled under fuzzing");
 #endif
     if (!pq_safe_name(table)) return pq_error("invalid destination table name");
+    char dest[1024];
+    if (!pq_dest(root,dest,sizeof(dest))) return pq_error("invalid or too long destination path");
+    root = dest;
     ray_parquet_t* r = NULL; ray_t* err = ray_parquet_open(path,NULL,PQ_BATCH,&r);
     if (err) return err;
-    char staging[1024], sym[1100]; int64_t parts;
+    char staging[1100], sym[1200]; int64_t parts;
     ray_sym_domain_t* domain = NULL;
     err = pq_import_types(r,types);
     if (!err) err = pq_stage(r,root,staging,sizeof(staging),true);
@@ -1792,9 +1804,12 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
 #ifdef RAY_FUZZING
     return ray_error("restricted","Parquet imports disabled under fuzzing");
 #endif
+    char dest[1024];
+    if (!pq_dest(dir,dest,sizeof(dest))) return pq_error("invalid or too long destination path");
+    dir = dest;
     ray_parquet_t* r = NULL; ray_t* err = ray_parquet_open(path,NULL,PQ_BATCH,&r);
     if (err) return err;
-    char staging[1024], spool[1100], leaf[1400], file[1600];
+    char staging[1100], spool[1200], leaf[1500], file[1700];
     ray_col_stream_t* writers = NULL; int64_t opened = 0, parts = 0;
     ray_err_t e = RAY_OK; ray_sym_domain_t* domain = NULL;
     err = pq_import_types(r,types);

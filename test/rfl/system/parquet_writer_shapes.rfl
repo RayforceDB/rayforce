@@ -35,3 +35,14 @@
 (.parquet.each "rf_test_pq_long.parquet" (fn [batch] (set nb (+ nb 1)))) -- 8000
 (> nb 1) -- true
 (.sys.exec "rm -f rf_test_pq_long.parquet") -- 0
+
+;; a destination with a trailing separator stages beside it, as
+;; .csv.parted does, not inside it as "<dest>/.parquet-partial"
+(.sys.exec "rm -rf rf_test_pq_slash rf_test_pq_slash.parquet-partial") -- 0
+(.parquet.splayed "test/data/parquet/empty-group.parquet" "rf_test_pq_slash/") -- 5
+(count (.db.splayed.get "rf_test_pq_slash")) -- 5
+(.sys.exec "test -e rf_test_pq_slash/.parquet-partial") -- 1
+;; a leftover staging directory blocks the destination (the error names it)
+(.sys.exec "rm -rf rf_test_pq_slash && mkdir rf_test_pq_slash.parquet-partial") -- 0
+(.parquet.splayed "test/data/parquet/empty-group.parquet" "rf_test_pq_slash") !- parquet
+(.sys.exec "rm -rf rf_test_pq_slash rf_test_pq_slash.parquet-partial") -- 0
