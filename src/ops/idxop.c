@@ -745,11 +745,15 @@ static ray_t* prepare_attach_ex(ray_t** vp, const char* what,
         return ray_error("type", "%s: cannot index a slice; materialize first", what);
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
         ray_index_drop(&v);
+        if (!v) return ray_error("oom", NULL);  /* keep *vp intact */
         if (RAY_IS_ERR(v)) return v;
         *vp = v;
     }
     v = ray_cow(v);
-    if (!v || RAY_IS_ERR(v)) return v;
+    /* Never hand back NULL: every caller tests only RAY_IS_ERR and then
+     * dereferences, so a failed copy must surface as an error. */
+    if (!v) return ray_error("oom", NULL);
+    if (RAY_IS_ERR(v)) return v;
     *vp = v;
     /* Numeric vectors carry any index kind; STR carries only RAY_IDX_DICT
      * (codes live alongside the descriptors — the column representation is

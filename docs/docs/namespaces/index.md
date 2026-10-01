@@ -17,6 +17,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.log.*`](log.md) | Write-ahead log: open, write, sync, snapshot, roll, replay, validate. |
 | [`.mem.*`](mem.md) | Value sizing and scoped time/allocation measurement. |
 | [`.os.*`](os.md) | Process environment: `getenv`, `setenv`. |
+| [`.parquet.*`](parquet.md) | Parquet metadata, reads, lazy queries, callbacks, and native imports. |
 | [`.repl.*`](repl.md) | Interactive REPL control — attach the local REPL to a remote server. |
 | [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, querylog, gc, exec, listen, timeit, env, cmd. |
 | [`.time.*`](time.md) | Monotonic clock and timer scheduler. |
@@ -30,6 +31,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post`
 - `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
 - `.os.getenv`, `.os.setenv`
+- `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
 - `.repl.connect`, `.repl.disconnect`
 - `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`
 - `.time.timer.set`, `.time.timer.del`

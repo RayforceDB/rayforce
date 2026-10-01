@@ -21,10 +21,12 @@ static void contract_setup(void) {
     contract_runtime = ray_runtime_create(0, NULL);
     contract_cores = ray_pool_total_workers(ray_pool_get());
     ray_agg_engine_v2 = true;
+    ray_agg_first_n = true;
     agg_route_reset();
 }
 static void contract_teardown(void) {
     ray_agg_engine_v2 = true;
+    ray_agg_first_n = true;
     ray_runtime_destroy(contract_runtime);
     if (ray_pool_total_workers(ray_pool_get()) != contract_cores) {
         ray_pool_destroy();
@@ -1887,7 +1889,9 @@ static test_result_t test_dense_native_topn(void) {
 }
 
 /* Unordered take: N on a bounded key stays on the dense task-local path and
- * emits the first N groups in first-seen order. */
+ * emits the first N groups in first-seen order.  The first-N pre-pass would
+ * answer this shape before the dense route runs, so it is switched off for
+ * the route assertions and switched back on for the same answer. */
 static test_result_t test_dense_unordered_take(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
@@ -1895,23 +1899,122 @@ static test_result_t test_dense_unordered_take(void) {
         "(set ut_i (til 400000)) "
         "(set ut_t (table [k v] (list (as 'I32 (% (* ut_i 7919) 50000)) ut_i)))");
     TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
-    agg_route_reset();
-    ray_t* r = ray_eval_str("(select {from:ut_t c:(count v) by:k take:10})");
-    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    agg_route_stats_t stats = agg_route_stats();
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
-    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
-    TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
-    /* rows 0..9 start groups (i*7919) % 50000, emitted in that order */
-    const int32_t* k = (const int32_t*)ray_data(ray_table_get_col_idx(r, 0));
-    const int64_t* c = (const int64_t*)ray_data(ray_table_get_col_idx(r, 1));
-    for (int64_t i = 0; i < 10; i++) {
-        TEST_ASSERT_EQ_I(k[i], (int32_t)((i * 7919) % 50000));
-        TEST_ASSERT_EQ_I(c[i], 8);
+    for (int pass = 0; pass < 2; pass++) {
+        ray_agg_first_n = pass == 1;
+        agg_route_reset();
+        ray_t* r = ray_eval_str("(select {from:ut_t c:(count v) by:k take:10})");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        agg_route_stats_t stats = agg_route_stats();
+        if (pass == 0) {
+            TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+            TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
+            TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
+            TEST_ASSERT_EQ_I(stats.first_n, 0);
+        } else {
+            TEST_ASSERT_EQ_I(stats.first_n, 1);
+        }
+        TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
+        /* rows 0..9 start groups (i*7919) % 50000, emitted in that order */
+        const int32_t* k = (const int32_t*)ray_data(ray_table_get_col_idx(r, 0));
+        const int64_t* c = (const int64_t*)ray_data(ray_table_get_col_idx(r, 1));
+        for (int64_t i = 0; i < 10; i++) {
+            TEST_ASSERT_EQ_I(k[i], (int32_t)((i * 7919) % 50000));
+            TEST_ASSERT_EQ_I(c[i], 8);
+        }
+        ray_release(r);
     }
-    ray_release(r);
     ray_release(ray_eval_str("(set ut_t 0) (set ut_i 0)"));
+    PASS();
+}
+
+/* Same names, types, row order and cells (SYM cells by their text). */
+static bool first_n_same_table(ray_t* a, ray_t* b) {
+    if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b)) return false;
+    if (a->type != RAY_TABLE || b->type != RAY_TABLE) return false;
+    int64_t nc = ray_table_ncols(a), nr = ray_table_nrows(a);
+    if (nc != ray_table_ncols(b) || nr != ray_table_nrows(b)) return false;
+    for (int64_t c = 0; c < nc; c++) {
+        if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return false;
+        ray_t* x = ray_table_get_col_idx(a, c);
+        ray_t* y = ray_table_get_col_idx(b, c);
+        if (!x || !y || x->type != y->type || x->len != y->len) return false;
+        if (x->type == RAY_SYM) {
+            for (int64_t r = 0; r < nr; r++) {
+                ray_t* sx = ray_sym_vec_cell(x, r);
+                ray_t* sy = ray_sym_vec_cell(y, r);
+                if (!sx || !sy || ray_str_len(sx) != ray_str_len(sy) ||
+                    memcmp(ray_str_ptr(sx), ray_str_ptr(sy), ray_str_len(sx)) != 0)
+                    return false;
+            }
+        } else if (memcmp(ray_data(x), ray_data(y), (size_t)nr * col_esz(x)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Unordered take: N over a large input: the first-N pre-pass answers every
+ * admitted shape with exactly the table the full aggregation returns (same
+ * groups in the same first-seen order, every aggregate over all rows of its
+ * group), and leaves every other shape to the full aggregation. */
+static test_result_t test_first_n_take(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set fn_i (til 300000)) "
+        "(set fn_t (table [i u s w y d ts nu v g fl h] (list fn_i (% (* fn_i 7919) 50000) "
+        "(as 'SYM (as 'STR (% fn_i 5))) (as 'I32 (% fn_i 10)) "
+        "(as 'SYM (as 'STR (% (* fn_i 7919) 50000))) (as 'DATE (% (* fn_i 31) 20000)) "
+        "(as 'TIMESTAMP (* 1000 (% (* fn_i 13) 60000))) "
+        "(at (concat [0N] (til 4999)) (% (* fn_i 7919) 5000)) "
+        "(at (concat [0N] (til 1000)) (% fn_i 1001)) "
+        "(as 'SYM (as 'STR (% fn_i 97))) (* 0.5 (as 'F64 fn_i)) (div fn_i 2)))) "
+        "(set fn_small (take fn_t 1000))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    static const struct { const char* q; uint64_t fast; } shapes[] = {
+        { "(select {from:fn_t by:[u s] c:(count u) take:10})", 1 },
+        { "(select {from:fn_t by:u c:(count u) sv:(sum v) av:(avg v) mn:(min v) mx:(max v) take:10})", 1 },
+        { "(select {from:fn_t by:y c:(count v) sv:(sum v) take:10})", 1 },
+        { "(select {from:fn_t by:[u s w] c:(count u) sv:(sum v) take:10})", 1 },
+        { "(select {from:fn_t where:(> v 500) by:[u s] c:(count u) sv:(sum v) take:10})", 1 },
+        { "(select {from:fn_t by:[u s] c:(count u) mx:(max v) take:600})", 1 },
+        { "(select {from:fn_t by:[i s] c:(count u) mx:(max v) take:1000})", 1 },
+        /* 2000 matching rows in the first task: the matches spill to a second pass */
+        { "(select {from:fn_t by:h c:(count v) sv:(sum v) take:1000})", 1 },
+        { "(select {from:fn_t by:d c:(count v) mn:(min ts) mx:(max d) take:5})", 1 },
+        { "(select {from:fn_t by:ts c:(count v) av:(avg w) take:7})", 1 },
+        { "(select {from:fn_t by:nu c:(count v) sv:(sum v) take:10})", 1 },
+        { "(select {from:fn_t by:[nu w] c:(count v) take:10})", 1 },
+        { "(select {from:fn_t by:[u s] c:(count u) take:[3 5]})", 1 },
+        { "(select {from:fn_t by:u c:(count fl) take:4})", 1 },
+        /* left to the full aggregation */
+        { "(select {from:fn_t by:u sf:(sum fl) take:10})", 0 },
+        { "(select {from:fn_t by:u fv:(first v) take:10})", 0 },
+        { "(select {from:fn_t by:u c:(count u) take:2000})", 0 },
+        { "(select {from:fn_t by:g c:(count u) take:10})", 0 },
+        { "(select {from:fn_t by:u c:(count u) desc:c take:10})", 0 },
+        { "(select {from:fn_t by:u c:(count u) take:-5})", 0 },
+        { "(select {from:fn_t by:u c:(count u) take:0})", 0 },
+        { "(select {from:fn_t by:u c:(count u) take:[-5 3]})", 0 },
+        { "(select {from:fn_small by:u c:(count u) take:10})", 0 },
+        { "(select {from:fn_t by:w c:(count u) take:100})", 0 },
+        { "(select {from:fn_t where:(> v 100000) by:u c:(count u) take:10})", 0 },
+    };
+    for (size_t q = 0; q < sizeof(shapes) / sizeof(shapes[0]); q++) {
+        ray_agg_first_n = false;
+        ray_t* old = ray_eval_str(shapes[q].q);
+        ray_agg_first_n = true;
+        agg_route_reset();
+        ray_t* got = ray_eval_str(shapes[q].q);
+        uint64_t ran = agg_route_stats().first_n;
+        TEST_ASSERT_FMT(old && !RAY_IS_ERR(old) && got && !RAY_IS_ERR(got), "%s: error", shapes[q].q);
+        TEST_ASSERT_FMT(ran == shapes[q].fast, "%s: first-N ran %d times, expected %d",
+                        shapes[q].q, (int)ran, (int)shapes[q].fast);
+        TEST_ASSERT_FMT(first_n_same_table(old, got), "%s: result differs from the full aggregation",
+                        shapes[q].q);
+        ray_release(old); ray_release(got);
+    }
+    ray_release(ray_eval_str("(set fn_t 0) (set fn_small 0) (set fn_i 0)"));
     PASS();
 }
 
@@ -1934,6 +2037,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
+    { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },

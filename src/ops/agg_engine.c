@@ -4988,6 +4988,419 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     return r;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * First-N groups for an unordered `take: N`.
+ *
+ * With a HEAD(GROUP) limit hint and an input large enough for the parallel
+ * strategies, every route exec_group_v2_run_inner can take for an int/SYM-
+ * keyed streaming group emits the groups in first-seen order and keeps the N
+ * with the smallest first row (task-local dense selects them in
+ * agg_dense_finish, radix in agg_radix_select_first_n or its first-seen
+ * restore; the shared and partitioned dense strategies are gated off by the
+ * limit).  Those N groups are the first N distinct key tuples in (selected)
+ * row order, so they can be found before aggregating anything:
+ *
+ *   1. a serial scan from the first selected row collects the first N
+ *      distinct key tuples into a small hash set;
+ *   2. a parallel pass collects, in row order, every selected row whose key
+ *      is in the set, and the unchanged strategy dispatch aggregates just
+ *      those rows (a compact table of the keys and aggregate inputs), so each
+ *      aggregate covers ALL rows of its group;
+ *   3. the re-run gets the same limit (all N groups), so its routes keep
+ *      first-seen order too; the order is still checked against the set's
+ *      ranks and put right if a route ever disagrees.
+ *
+ * Admitted aggregates are the ones whose value does not depend on the order
+ * rows are folded in: count of any input, and sum/avg/min/max over integer
+ * and temporal inputs (a float sum regroups the additions).  The pre-pass
+ * gives up — the caller runs the full aggregation and only the probe is
+ * spent — when the N keys are not found within a bounded prefix, or when the
+ * N groups hold a large share of the rows (sampled before the parallel pass,
+ * counted exactly in it), where aggregating everything costs about the same. */
+#define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
+#define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
+#define AGG_FIRSTN_SAMPLES    4096     /* evenly spaced rows for the share estimate */
+#define AGG_FIRSTN_SHARE      64       /* full run once the N groups hold 1/64 of the rows */
+
+bool ray_agg_first_n = true;
+static _Thread_local bool firstn_nested;   /* inside the pre-pass's own group run */
+
+typedef struct {
+    int64_t*  keys;     /* cap * n_keys */
+    int32_t*  rank;     /* cap; -1 marks an empty slot */
+    uint64_t* bloom;    /* 1 << bbits bits over the members' hashes */
+    uint32_t  n_keys;
+    uint32_t  bits;     /* cap = 1 << bits */
+    uint32_t  bbits;
+    int64_t   n;        /* tuples inserted; rank = insertion order */
+} agg_firstn_set_t;
+
+/* Tuple hash, folded one key at a time so a morsel can be hashed one key
+ * COLUMN at a time (agg_firstn_hash_block) with the same result. */
+#define AGG_FIRSTN_SEED 0x9E3779B97F4A7C15ULL
+#define AGG_FIRSTN_MIX(h, v) \
+    do { (h) = ((h) ^ (uint64_t)(v)) * 0x9E3779B97F4A7C15ULL; (h) ^= (h) >> 32; } while (0)
+#define AGG_FIRSTN_FINAL(h) ((h) * 0xD6E8FEB86659FD93ULL)
+
+static inline uint64_t agg_firstn_hash(const int64_t* kv, uint32_t n_keys) {
+    uint64_t h = AGG_FIRSTN_SEED;
+    for (uint32_t k = 0; k < n_keys; k++) AGG_FIRSTN_MIX(h, kv[k]);
+    return AGG_FIRSTN_FINAL(h);
+}
+
+/* Rank of the tuple (hash `hv`), or -1 when absent.  With `insert`, an absent
+ * tuple is added with the next rank (the caller keeps the set a quarter full). */
+static inline int64_t agg_firstn_probe(agg_firstn_set_t* s, const int64_t* kv,
+                                       uint64_t hv, bool insert) {
+    uint64_t mask = ((uint64_t)1 << s->bits) - 1;
+    for (uint64_t i = hv >> (64 - s->bits);; i = (i + 1) & mask) {
+        int32_t r = s->rank[i];
+        int64_t* sk = s->keys + i * s->n_keys;
+        if (r < 0) {
+            if (!insert) return -1;
+            for (uint32_t k = 0; k < s->n_keys; k++) sk[k] = kv[k];
+            s->rank[i] = (int32_t)s->n;
+            s->n++;
+            return -1;
+        }
+        uint32_t k = 0;
+        while (k < s->n_keys && sk[k] == kv[k]) k++;
+        if (k == s->n_keys) return r;
+    }
+}
+
+/* Fold key column `col` rows [b, b+n) into the running hashes h[0..n). The
+ * widening matches agg_read_key_i64 (signed types sign-extend, SYM and U8/BOOL
+ * zero-extend), so the folded hash equals agg_firstn_hash of the read tuple. */
+static void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
+                                  int64_t b, int64_t n) {
+    switch (col->type) {
+        case RAY_I64: case RAY_TIMESTAMP: {
+            const int64_t* d = (const int64_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
+            break;
+        }
+        case RAY_I32: case RAY_DATE: case RAY_TIME: {
+            const int32_t* d = (const int32_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+            break;
+        }
+        case RAY_I16: {
+            const int16_t* d = (const int16_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+            break;
+        }
+        case RAY_U8: case RAY_BOOL: {
+            const uint8_t* d = (const uint8_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+            break;
+        }
+        case RAY_SYM:
+            switch (col->attrs & RAY_SYM_W_MASK) {
+                case RAY_SYM_W8: {
+                    const uint8_t* d = (const uint8_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+                    break;
+                }
+                case RAY_SYM_W16: {
+                    const uint16_t* d = (const uint16_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+                    break;
+                }
+                case RAY_SYM_W32: {
+                    const uint32_t* d = (const uint32_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+                    break;
+                }
+                default: {
+                    const int64_t* d = (const int64_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
+                    break;
+                }
+            }
+            break;
+        default:   /* admission keeps every other type out */
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], agg_read_key_i64(col, data, b + i));
+            break;
+    }
+}
+
+#define AGG_FIRSTN_LOCAL 1024          /* matches a task keeps before spilling */
+
+typedef struct {
+    agg_firstn_set_t* set;
+    ray_t**      key_cols;
+    const void** key_data;
+    uint32_t     n_keys;
+    int64_t      nrows;
+    ray_t*       sel;          /* rowsel or NULL */
+    uint32_t     n_segs, tasks;
+    int64_t*     counts;       /* per task: matches; then the write offset */
+    int64_t*     local;        /* tasks * AGG_FIRSTN_LOCAL: the first matches */
+    int64_t*     out;          /* write pass: the final row list */
+    int64_t*     kvs;          /* tasks * n_keys: each task's probe tuple */
+} agg_firstn_ctx_t;
+
+/* One task: the selected rows of its morsel segments whose key tuple is in
+ * the set, in row order.  Each morsel is hashed one key column at a time; the
+ * bloom bit rejects almost every row before any per-row key read. */
+static void agg_firstn_task(agg_firstn_ctx_t* c, uint32_t t) {
+    int64_t s0 = (int64_t)c->n_segs * t / c->tasks;
+    int64_t s1 = (int64_t)c->n_segs * (t + 1) / c->tasks;
+    agg_firstn_set_t* set = c->set;
+    uint32_t n_keys = c->n_keys;
+    uint64_t hb[RAY_MORSEL_ELEMS];
+    int64_t* kv = c->kvs + (int64_t)t * n_keys;
+    const uint8_t*  fl = c->sel ? ray_rowsel_flags(c->sel) : NULL;
+    const uint32_t* of = c->sel ? ray_rowsel_offsets(c->sel) : NULL;
+    const uint16_t* ix = c->sel ? ray_rowsel_idx(c->sel) : NULL;
+    int64_t* out = c->out ? c->out + c->counts[t] : c->local + (int64_t)t * AGG_FIRSTN_LOCAL;
+    int64_t out_cap = c->out ? INT64_MAX : AGG_FIRSTN_LOCAL;
+    uint32_t bshift = 64 - set->bbits;
+    int64_t n = 0;
+    for (int64_t seg = s0; seg < s1; seg++) {
+        if (fl && fl[seg] == RAY_SEL_NONE) continue;
+        int64_t b = seg * RAY_MORSEL_ELEMS;
+        int64_t len = c->nrows - b < RAY_MORSEL_ELEMS ? c->nrows - b : RAY_MORSEL_ELEMS;
+        for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
+        for (uint32_t k = 0; k < n_keys; k++)
+            agg_firstn_hash_block(hb, c->key_cols[k], c->key_data[k], b, len);
+        bool mix = fl && fl[seg] == RAY_SEL_MIX;
+        int64_t j_end = mix ? (int64_t)of[seg + 1] : len;
+        for (int64_t j = mix ? (int64_t)of[seg] : 0; j < j_end; j++) {
+            int64_t i = mix ? (int64_t)ix[j] : j;
+            uint64_t hv = AGG_FIRSTN_FINAL(hb[i]);
+            uint64_t bit = hv >> bshift;
+            if (!((set->bloom[bit >> 6] >> (bit & 63)) & 1)) continue;
+            for (uint32_t k = 0; k < n_keys; k++)
+                kv[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], b + i);
+            if (agg_firstn_probe(set, kv, hv, false) < 0) continue;
+            if (n < out_cap) out[n] = b + i;
+            n++;
+        }
+    }
+    if (!c->out) c->counts[t] = n;
+}
+
+static void agg_firstn_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    for (int64_t t = start; t < end; t++) agg_firstn_task((agg_firstn_ctx_t*)raw, (uint32_t)t);
+}
+
+static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
+                                ray_t** key_cols) {
+    for (uint32_t k = 0; k < ext->n_keys; k++)
+        switch (key_cols[k]->type) {
+            case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
+            case RAY_BOOL: case RAY_DATE: case RAY_TIME:
+            case RAY_TIMESTAMP: case RAY_SYM: break;
+            default: return false;
+        }
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        uint16_t aop = ext->agg_ops[a];
+        if (aop != OP_COUNT && aop != OP_SUM && aop != OP_AVG && aop != OP_MIN && aop != OP_MAX)
+            return false;
+        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) return false;
+        bool has_in = ext->agg_ins && ext->agg_ins[a] != RAY_OP_NONE;
+        if (!has_in) { if (aop == OP_COUNT) continue; return false; }
+        ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
+        if (!ie || ie->base.opcode != OP_SCAN) return false;
+        ray_t* col = ray_table_get_col(tbl, ie->sym);
+        if (!col) return false;
+        if (aop == OP_COUNT) continue;
+        switch (col->type) {
+            case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
+            case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
+            default: return false;   /* floats: the fold order shows in the value */
+        }
+    }
+    return true;
+}
+
+/* The first `group_limit` groups in first-seen order, an error, or NULL when
+ * the shape or the data is not one the pre-pass serves (the caller then runs
+ * the full aggregation). */
+static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
+                              ray_t** key_cols, ray_t* sel, int64_t n_sel,
+                              int64_t group_limit) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    ray_pool_t* pool = ray_pool_get();
+    int64_t eff_n = sel ? n_sel : nrows;
+    /* Only where the full run would take the parallel first-seen routes. */
+    if (!ray_agg_first_n || firstn_nested || !pool || eff_n < RAY_PARALLEL_THRESHOLD ||
+        group_limit <= 0 || group_limit > AGG_FIRSTN_MAX || !ext)
+        return NULL;
+    if (sel && ray_rowsel_meta(sel)->nrows != nrows) return NULL;
+    if (!agg_firstn_admitted(g, ext, tbl, key_cols)) return NULL;
+
+    uint32_t n_keys = ext->n_keys;
+    uint32_t bits = 4;
+    while (((int64_t)1 << bits) < group_limit * 4) bits++;
+    uint32_t bbits = bits + 6 > 16 ? bits + 6 : 16;
+    int64_t cap = (int64_t)1 << bits;
+    ray_t* res = NULL;
+    ray_t* kv_hdr = NULL;
+    /* one carve: the probe tuple, then the key data pointers */
+    int64_t* kv = (int64_t*)scratch_alloc(&kv_hdr, (size_t)n_keys * 2 * sizeof(int64_t));
+    agg_firstn_set_t set = { .n_keys = n_keys, .bits = bits, .bbits = bbits, .n = 0 };
+    set.keys = ray_alloc_raw((size_t)cap * n_keys * sizeof(int64_t));
+    set.rank = ray_alloc_raw((size_t)cap * sizeof(int32_t));
+    set.bloom = ray_calloc_raw(((size_t)1 << bbits) / 8);
+    int64_t* counts = NULL;
+    int64_t* local = NULL;
+    int64_t* kvs = NULL;
+    int64_t* idx = NULL;
+    int64_t* perm = NULL;
+    ray_t* compact = NULL;
+    ray_t* sub = NULL;
+    if (!kv || !set.keys || !set.rank || !set.bloom) { res = ray_error("oom", NULL); goto done; }
+    memset(set.rank, 0xFF, (size_t)cap * sizeof(int32_t));
+    const void** key_data = (const void**)(kv + n_keys);
+    for (uint32_t k = 0; k < n_keys; k++) key_data[k] = ray_data(key_cols[k]);
+    uint32_t n_segs = (uint32_t)((nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS);
+
+    /* 1. the first N distinct tuples, serially from the first selected row */
+    {
+        const uint8_t*  fl = sel ? ray_rowsel_flags(sel) : NULL;
+        const uint32_t* of = sel ? ray_rowsel_offsets(sel) : NULL;
+        const uint16_t* ix = sel ? ray_rowsel_idx(sel) : NULL;
+        int64_t budget = group_limit * 64 > AGG_FIRSTN_PROBE_ROWS
+                       ? group_limit * 64 : AGG_FIRSTN_PROBE_ROWS;
+        int64_t scanned = 0;
+        for (int64_t seg = 0; seg < n_segs && set.n < group_limit && scanned < budget; seg++) {
+            if (fl && fl[seg] == RAY_SEL_NONE) continue;
+            int64_t b = seg * RAY_MORSEL_ELEMS;
+            int64_t len = nrows - b < RAY_MORSEL_ELEMS ? nrows - b : RAY_MORSEL_ELEMS;
+            bool mix = fl && fl[seg] == RAY_SEL_MIX;
+            int64_t j_end = mix ? (int64_t)of[seg + 1] : len;
+            for (int64_t j = mix ? (int64_t)of[seg] : 0;
+                 j < j_end && set.n < group_limit && scanned < budget; j++, scanned++) {
+                int64_t row = b + (mix ? (int64_t)ix[j] : j);
+                for (uint32_t k = 0; k < n_keys; k++)
+                    kv[k] = agg_read_key_i64(key_cols[k], key_data[k], row);
+                agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), true);
+            }
+        }
+        if (set.n < group_limit) goto done;   /* few groups or long runs: full run */
+    }
+    for (int64_t i = 0; i < cap; i++) {
+        if (set.rank[i] < 0) continue;
+        uint64_t bit = agg_firstn_hash(set.keys + i * n_keys, n_keys) >> (64 - bbits);
+        set.bloom[bit >> 6] |= (uint64_t)1 << (bit & 63);
+    }
+
+    /* the share of rows the N groups hold, from evenly spaced source rows */
+    {
+        int64_t samples = nrows < AGG_FIRSTN_SAMPLES ? nrows : AGG_FIRSTN_SAMPLES;
+        int64_t step = nrows / samples, hits = 0;
+        for (int64_t i = 0; i < samples; i++) {
+            for (uint32_t k = 0; k < n_keys; k++)
+                kv[k] = agg_read_key_i64(key_cols[k], key_data[k], i * step);
+            if (agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), false) >= 0) hits++;
+        }
+        if (hits * AGG_FIRSTN_SHARE > samples) goto done;
+    }
+
+    /* 2. the selected rows of those groups, in row order: each task keeps its
+     * first AGG_FIRSTN_LOCAL matches; a second pass writes them all only when
+     * some task had more. */
+    uint32_t tasks = 1;
+    if (ray_pool_par_dispatch_ok(pool, eff_n, RAY_PARALLEL_THRESHOLD)) {
+        uint32_t want = ray_pool_total_workers(pool) * 4;
+        if (want > RAY_POOL_INIT_TASKS) want = RAY_POOL_INIT_TASKS;
+        tasks = want < n_segs ? want : n_segs;
+        if (tasks < 1) tasks = 1;
+    }
+    counts = ray_alloc_raw((size_t)tasks * sizeof(int64_t));
+    local = ray_alloc_raw((size_t)tasks * AGG_FIRSTN_LOCAL * sizeof(int64_t));
+    kvs = ray_alloc_raw((size_t)tasks * n_keys * sizeof(int64_t));
+    if (!counts || !local || !kvs) { res = ray_error("oom", NULL); goto done; }
+    agg_firstn_ctx_t c = { .set = &set, .key_cols = key_cols, .key_data = key_data,
+        .n_keys = n_keys, .nrows = nrows, .sel = sel, .n_segs = n_segs,
+        .tasks = tasks, .counts = counts, .local = local, .out = NULL, .kvs = kvs };
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_firstn_fn, &c, tasks);
+    else agg_firstn_fn(&c, 0, 0, 1);
+    if (agg_cancelled()) { res = ray_error("cancel", NULL); goto done; }
+    int64_t m = 0;
+    bool spilled = false;
+    for (uint32_t t = 0; t < tasks; t++) {
+        if (counts[t] > AGG_FIRSTN_LOCAL) spilled = true;
+        m += counts[t];
+    }
+    if (m * (AGG_FIRSTN_SHARE / 2) > eff_n) goto done;   /* the sample missed a heavy group */
+    idx = ray_alloc_raw((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
+    if (!idx) { res = ray_error("oom", NULL); goto done; }
+    if (spilled) {
+        int64_t off = 0;
+        for (uint32_t t = 0; t < tasks; t++) { int64_t ct = counts[t]; counts[t] = off; off += ct; }
+        c.out = idx;
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_firstn_fn, &c, tasks);
+        else agg_firstn_fn(&c, 0, 0, 1);
+        if (agg_cancelled()) { res = ray_error("cancel", NULL); goto done; }
+    } else {
+        int64_t off = 0;
+        for (uint32_t t = 0; t < tasks; t++) {
+            memcpy(idx + off, local + (int64_t)t * AGG_FIRSTN_LOCAL, (size_t)counts[t] * sizeof(int64_t));
+            off += counts[t];
+        }
+    }
+
+    compact = agg_build_compact(g, op, tbl, idx, m);
+    if (!compact || RAY_IS_ERR(compact)) {
+        res = compact ? compact : ray_error("oom", NULL); compact = NULL; goto done;
+    }
+    /* The same bounded emit as the full run: every route keeps first-seen
+     * order under a limit, and the limit is the whole group count here.  The
+     * nested run must not re-enter the pre-pass. */
+    firstn_nested = true;
+    sub = exec_group_v2_run(g, op, compact, m, NULL, NULL, 0, set.n, NULL);
+    firstn_nested = false;
+    if (!sub || RAY_IS_ERR(sub)) { res = sub ? sub : ray_error("oom", NULL); sub = NULL; goto done; }
+
+    /* 3. first-seen order: the rank of every emitted group in the set.  The
+     * bounded emit already yields it; any other order is put right here. */
+    if (sub->type != RAY_TABLE || ray_table_nrows(sub) != set.n ||
+        ray_table_ncols(sub) < (int64_t)n_keys)
+        goto done;                             /* unexpected shape: full run */
+    perm = ray_alloc_raw((size_t)set.n * sizeof(int64_t));
+    if (!perm) { res = ray_error("oom", NULL); goto done; }
+    for (int64_t r = 0; r < set.n; r++) perm[r] = -1;
+    bool identity = true;
+    for (int64_t r = 0; r < set.n; r++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
+            ray_t* oc = ray_table_get_col_idx(sub, k);
+            if (!oc || oc->type != key_cols[k]->type) goto done;
+            kv[k] = agg_read_key_i64(oc, ray_data(oc), r);
+        }
+        int64_t rk = agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), false);
+        if (rk < 0 || perm[rk] >= 0) goto done;
+        perm[rk] = r;
+        if (rk != r) identity = false;
+    }
+    if (identity) { res = sub; sub = NULL; }
+    else {
+        ray_t* pv = ray_vec_new(RAY_I64, set.n);
+        if (!pv || RAY_IS_ERR(pv)) { res = pv ? pv : ray_error("oom", NULL); goto done; }
+        memcpy(ray_data(pv), perm, (size_t)set.n * sizeof(int64_t));
+        pv->len = set.n;
+        res = ray_at_fn(sub, pv);
+        ray_release(pv);
+        if (!res) res = ray_error("oom", NULL);
+    }
+    if (!RAY_IS_ERR(res)) {
+        route_stats.first_n++;
+        ray_profile_tick("group: first-N keys");
+    }
+
+done:
+    if (sub) ray_release(sub);
+    if (compact) ray_release(compact);
+    ray_free_raw(perm); ray_free_raw(idx); ray_free_raw(local); ray_free_raw(kvs); ray_free_raw(counts);
+    ray_free_raw(set.keys); ray_free_raw(set.rank); ray_free_raw(set.bloom);
+    if (kv_hdr) scratch_free(kv_hdr);
+    return res;
+}
+
 static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t nrows, ray_t* sel,
                                 const int64_t* sel_prefix, int64_t n_sel,
@@ -5043,6 +5456,12 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         agg_route_record(AGG_ROUTE_V2_INDEXED);
         ray_t* result = agg_indexed_run(g, op, tbl, key_cols, key_syms, nrows);
         scratch_free(kc_hdr); return result;
+    }
+
+    /* Unordered take: N — find the N groups first, aggregate only them. */
+    if (group_limit > 0 && !efp) {
+        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, n_sel, group_limit);
+        if (fr) { scratch_free(kc_hdr); return fr; }
     }
 
     /* Precompute AoS state layout for the admitted aggregates. */
@@ -5421,7 +5840,10 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * groups themselves; the other routes trim their full result. */
     ray_group_emit_filter_t ef = ray_group_emit_filter_active();
     const ray_group_emit_filter_t* efp = ef.enabled ? &ef : NULL;
-    if (!g || !g->selection)
+    /* exec_group_v2_run reads g's op extensions unconditionally; a NULL
+     * graph is an error here, not a request for an unfiltered run. */
+    if (!g) return ray_error("nyi", NULL);
+    if (!g->selection)
         return exec_group_v2_run(g, op, tbl, ray_table_nrows(tbl), NULL, NULL, 0,
                                  group_limit, efp);
 

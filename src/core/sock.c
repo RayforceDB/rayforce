@@ -26,6 +26,8 @@
 #endif
 
 #include "core/sock.h"
+#include "core/timer.h"
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -161,6 +163,45 @@ ray_sock_t ray_sock_accept(ray_sock_t srv)
     return fd;
 }
 
+int ray_sock_set_keepalive(ray_sock_t s, int budget_ms, bool user_timeout)
+{
+    int on = budget_ms > 0 ? 1 : 0;
+    if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&on, sizeof(on)) < 0)
+        return -1;
+    if (!on) return 0;
+
+    int idle  = budget_ms / 2000;       /* seconds */
+    int intvl = budget_ms / 6000;
+    int cnt   = 3;
+    if (idle  < 1) idle  = 1;
+    if (intvl < 1) intvl = 1;
+#if defined(TCP_KEEPIDLE)
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&idle, sizeof(idle));
+#elif defined(TCP_KEEPALIVE)            /* macOS spelling */
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, (const char*)&idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&cnt, sizeof(cnt));
+#endif
+
+    if (user_timeout) {
+#if defined(TCP_USER_TIMEOUT)
+        unsigned int ut = (unsigned int)budget_ms;
+        setsockopt(s, IPPROTO_TCP, TCP_USER_TIMEOUT, (const char*)&ut, sizeof(ut));
+#elif defined(TCP_RXT_CONNDROPTIME)     /* macOS */
+        int ut = budget_ms < 1000 ? 1 : budget_ms / 1000;
+        setsockopt(s, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, (const char*)&ut, sizeof(ut));
+#elif defined(TCP_MAXRT)                /* Windows */
+        int ut = budget_ms < 1000 ? 1 : budget_ms / 1000;
+        setsockopt(s, IPPROTO_TCP, TCP_MAXRT, (const char*)&ut, sizeof(ut));
+#endif
+    }
+    return 0;
+}
+
 /* Connect an already-created socket `fd` to one resolved address.  With
  * timeout_ms > 0 the connect is driven non-blocking + poll (a blocking
  * connect() ignores SO_*TIMEO) and the same budget is then applied as the
@@ -278,6 +319,12 @@ ray_sock_t ray_sock_connect(const char* host, uint16_t port, int timeout_ms)
 
 int64_t ray_sock_send(ray_sock_t s, const void* buf, size_t len)
 {
+    return ray_sock_send_until(s, buf, len, -1);
+}
+
+int64_t ray_sock_send_until(ray_sock_t s, const void* buf, size_t len,
+                            int64_t deadline_ms)
+{
     const uint8_t* p   = (const uint8_t*)buf;
     size_t         rem = len;
     while (rem > 0) {
@@ -291,11 +338,17 @@ int64_t ray_sock_send(ray_sock_t s, const void* buf, size_t len)
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Wait for write-readiness before retry */
+                int wait_ms = -1;
+                if (deadline_ms >= 0) {
+                    int64_t left = deadline_ms - ray_time_now_ms();
+                    if (left <= 0) { errno = ETIMEDOUT; return -1; }
+                    wait_ms = left > INT_MAX ? INT_MAX : (int)left;
+                }
                 struct pollfd pfd = { .fd = s, .events = POLLOUT };
 #ifdef RAY_OS_WINDOWS
-                WSAPoll(&pfd, 1, -1);
+                WSAPoll(&pfd, 1, wait_ms);
 #else
-                poll(&pfd, 1, -1);
+                poll(&pfd, 1, wait_ms);
 #endif
                 continue;
             }

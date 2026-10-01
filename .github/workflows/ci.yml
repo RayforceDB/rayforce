@@ -44,6 +44,17 @@ jobs:
         if: matrix.target == 'debug'
         run: make test
 
+  # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
+  # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;
+  # work placed inside an assert then silently vanishes (#652: an NDEBUG build
+  # registered no builtins).  This leg keeps the code correct either way.
+  ndebug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test with NDEBUG
+        run: make test-ndebug
+
   # Coverage-guided fuzz smoke pass over the untrusted-input decoders
   # (parser, numeric scanners, wire-frame decoder).  A healthy corpus finds
   # nothing new in a minute, so any crash here is a genuine regression.
@@ -107,12 +118,15 @@ jobs:
   # check sets currently surface only false positives (GNU computed-goto
   # label addresses, caller-guaranteed non-null params, defensive
   # redundant-null-check heuristics), so this reports without gating.
-  # cppcheck runs whole-tree here (fast); the heavier clang-tidy pass
+  # cppcheck runs whole-tree here over one pinned configuration (see
+  # CPPCHECK_DEFS in the Makefile); the heavier clang-tidy pass
   # (`make tidy`) runs locally and in the nightly workflow.  Flip to a
-  # blocking gate once the baseline is annotated clean.
+  # blocking gate once the baseline is annotated clean.  The timeout keeps a
+  # regression in analysis time from holding a runner for hours.
   static-analysis:
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install cppcheck
@@ -127,14 +141,15 @@ jobs:
   # skipped required check can be treated as passed, silently opening the gate.
   # static-analysis is intentionally NOT in `needs` — it is advisory only.
   ci-success:
-    needs: [build-and-test, fuzz-smoke, tsan]
+    needs: [build-and-test, ndebug, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs passed
         run: |
           bt='${{ needs.build-and-test.result }}'
+          nd='${{ needs.ndebug.result }}'
           fz='${{ needs.fuzz-smoke.result }}'
           ts='${{ needs.tsan.result }}'
-          echo "build-and-test: $bt   fuzz-smoke: $fz   tsan: $ts"
-          [ "$bt" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
+          echo "build-and-test: $bt   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
+          [ "$bt" = "success" ] && [ "$nd" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1

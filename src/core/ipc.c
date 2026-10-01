@@ -27,6 +27,7 @@
 
 #include "core/ipc.h"
 #include "core/mcast.h"
+#include "core/timer.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
@@ -457,14 +458,16 @@ static int hook_call_auth(ray_poll_t* poll, int64_t handle,
  * on write-readiness the way ray_sock_send already does, so the direct write
  * that follows starts on a frame boundary.  Fast-path returns 0 when nothing
  * is queued (the common, non-subscriber case).  Returns -1 on socket error. */
-static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel)
+static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel,
+                                  int64_t deadline_ms)
 {
     if (!sel || !sel->tx.buf) return 0;
     while (sel->tx.buf) {
         ray_poll_buf_t* buf = sel->tx.buf;
         int64_t rem = buf->size - buf->offset;
         if (rem > 0 &&
-            ray_sock_send(sel->fd, buf->data + buf->offset, (size_t)rem) < 0)
+            ray_sock_send_until(sel->fd, buf->data + buf->offset, (size_t)rem,
+                                deadline_ms) < 0)
             return -1;
         sel->tx.buf = buf->next;
         buf->next = NULL;
@@ -1154,7 +1157,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * half-sent push.  A drain error means the peer is gone — skip the
          * write and let the poll/pump layer deregister it. */
         if (cur && cur->data == (void*)cd &&
-            conn_tx_drain_blocking(poll, cur) == 0)
+            conn_tx_drain_blocking(poll, cur, -1) == 0)
             {
                 ray_ipc_conn_data_t* rcd = (ray_ipc_conn_data_t*)cur->data;
                 send_response((ray_sock_t)cur->fd, result,
@@ -1409,13 +1412,15 @@ static size_t conn_threshold(ray_selector_t* sel)
 }
 
 static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
-                              uint8_t extra_flags, size_t threshold)
+                              uint8_t extra_flags, size_t threshold,
+                              int64_t deadline_ms)
 {
     ray_err_t err = RAY_OK;
     ray_poll_frame_t* frame = conn_frame_msg(msg, msgtype, extra_flags,
                                              threshold, &err);
     if (!frame) return -1;
-    int64_t rc = ray_sock_send(fd, frame->data, (size_t)frame->size);
+    int64_t rc = ray_sock_send_until(fd, frame->data, (size_t)frame->size,
+                                     deadline_ms);
     ray_poll_frame_release(frame);
     return rc < 0 ? -1 : 0;
 }
@@ -1446,12 +1451,13 @@ int64_t ray_ipc_connect(const char* host, uint16_t port,
                          int timeout_ms)
 {
     return ray_ipc_connect_opts(host, port, user, password, timeout_ms,
-                                RAY_IPC_COMPRESS_AUTO);
+                                RAY_IPC_COMPRESS_AUTO, RAY_IPC_KEEPALIVE_AUTO);
 }
 
 int64_t ray_ipc_connect_opts(const char* host, uint16_t port,
                          const char* user, const char* password,
-                         int timeout_ms, size_t compress_threshold)
+                         int timeout_ms, size_t compress_threshold,
+                         int keepalive_ms)
 {
     /* The connection lives in the active poll's selector table — its
      * selector id IS the handle.  No poll, no handle namespace: refuse
@@ -1531,6 +1537,14 @@ int64_t ray_ipc_connect_opts(const char* host, uint16_t port,
       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &z, sizeof(z)); }
 #endif
 
+    /* The handshake timeouts are gone, so from here on only keepalive
+     * notices a peer that vanished without closing (#589).  Best-effort:
+     * failing to arm it leaves the link no worse than before. */
+    if (keepalive_ms == RAY_IPC_KEEPALIVE_AUTO)
+        ray_sock_set_keepalive(fd, RAY_IPC_KEEPALIVE_DEFAULT_MS, false);
+    else if (keepalive_ms > 0)
+        ray_sock_set_keepalive(fd, keepalive_ms, true);
+
     /* Handshake + auth done (blocking socket).  Hand the fd over to the
      * poll: nonblocking, parked on a header read, same read pump as an
      * inbound connection — which is exactly what makes pushed frames
@@ -1585,9 +1599,31 @@ void ray_ipc_close(int64_t handle)
  * deposited — dispatching (not swallowing) any frames that arrive in
  * between: a pushed ASYNC gets evaluated, a nested SYNC request from
  * the peer gets evaluated and answered.  Full-duplex, either side of
- * the wire. */
-static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
+ * the wire.
+ *
+ * timeout_ms > 0 bounds the whole round trip, write included (#589).
+ * On expiry the connection is closed — on.close fires — because a RESP
+ * carries no request id: a reply that arrived later would be taken as
+ * the answer to the NEXT send on the handle.  A write cut off by the
+ * deadline has left a partial frame on the stream, which is unusable for
+ * the same reason.  Before closing, the peer is sent the same urgent-data
+ * cancel as Ctrl-C, so it stops evaluating a query nobody will read. */
+static ray_t* sync_expire(ray_poll_t* poll, int64_t id, int64_t timeout_ms)
 {
+    ray_selector_t* sel = ray_poll_get(poll, id);
+    if (sel) {
+        ray_sock_send_oob((ray_sock_t)sel->fd, '!');
+        ray_poll_deregister(poll, id);
+    }
+    return ray_error("io", "ipc send timed out after %lld ms; connection closed",
+                     (long long)timeout_ms);
+}
+
+static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
+                        int64_t timeout_ms)
+{
+    int64_t deadline = timeout_ms > 0 ? ray_time_now_ms() + timeout_ms : -1;
+
     bool owned = false;
     if (ray_is_lazy(msg)) {
         ray_retain(msg);
@@ -1613,10 +1649,14 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
 
     /* Drain any half-sent multicast frame queued to this fd before writing the
      * sync request, so its bytes can't interleave into the pending frame. */
-    if (conn_tx_drain_blocking(poll, sel) < 0 ||
+    errno = 0;
+    if (conn_tx_drain_blocking(poll, sel, deadline) < 0 ||
         conn_write_msg((ray_sock_t)sel->fd, msg, RAY_IPC_MSG_SYNC,
-                       extra_flags, conn_threshold(sel)) < 0) {
+                       extra_flags, conn_threshold(sel), deadline) < 0) {
+        int e = errno;
         if (owned) ray_release(msg);
+        if (deadline >= 0 && e == ETIMEDOUT)
+            return sync_expire(poll, sel->id, timeout_ms);
         return ray_error("io", "ipc send failed");
     }
     if (owned) ray_release(msg);
@@ -1651,7 +1691,15 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
              * defensive: treat as closed. */
             return ray_error("io", "connection closed");
         }
-        int w = ray_sock_wait_readable_intr((ray_sock_t)sel->fd, -1);
+        /* The deadline is checked after the pump, so a reply that is
+         * already here when it expires is still delivered. */
+        int wait_ms = -1;
+        if (deadline >= 0) {
+            int64_t left = deadline - ray_time_now_ms();
+            if (left <= 0) return sync_expire(poll, id, timeout_ms);
+            wait_ms = left > INT_MAX ? INT_MAX : (int)left;
+        }
+        int w = ray_sock_wait_readable_intr((ray_sock_t)sel->fd, wait_ms);
         if (w == -2) {
             /* Interrupted by a signal.  If it was a cancel request (Ctrl-C),
              * forward it to the server as TCP urgent data — the server is busy
@@ -1674,7 +1722,12 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
 
 ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
 {
-    return sync_send(handle, msg, 0);
+    return sync_send(handle, msg, 0, 0);
+}
+
+ray_t* ray_ipc_send_timeout(int64_t handle, ray_t* msg, int64_t timeout_ms)
+{
+    return sync_send(handle, msg, 0, timeout_ms);
 }
 
 size_t ray_ipc_handle_threshold(int64_t handle)
@@ -1700,10 +1753,10 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
     }
     ray_poll_t* poll;
     ray_selector_t* sel = conn_resolve(&poll, handle);
-    ray_err_t rc = (!sel || conn_tx_drain_blocking(poll, sel) < 0 ||
+    ray_err_t rc = (!sel || conn_tx_drain_blocking(poll, sel, -1) < 0 ||
                     conn_write_msg((ray_sock_t)sel->fd, msg,
                                    RAY_IPC_MSG_ASYNC, 0,
-                                   conn_threshold(sel)) < 0)
+                                   conn_threshold(sel), -1) < 0)
                    ? RAY_ERR_IO : RAY_OK;
     if (owned) ray_release(msg);
     return rc;
@@ -1898,7 +1951,7 @@ ray_err_t ray_ipc_try_send_async(int64_t handle, ray_t* msg)
  * instead of bare result.  Same wire path as ray_ipc_send otherwise. */
 ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
 {
-    return sync_send(handle, msg, RAY_IPC_FLAG_VERBOSE);
+    return sync_send(handle, msg, RAY_IPC_FLAG_VERBOSE, 0);
 }
 
 /* ===== .ipc.open options ===== */
@@ -1924,10 +1977,12 @@ static int opts_i64(ray_t* d, const char* name, int64_t* out, ray_t** err)
 }
 
 ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
-                               size_t* compress_threshold)
+                               size_t* compress_threshold,
+                               int* keepalive_ms)
 {
     *timeout_ms         = 0;
     *compress_threshold = RAY_IPC_COMPRESS_AUTO;
+    *keepalive_ms       = RAY_IPC_KEEPALIVE_AUTO;
     if (!arg) return NULL;
 
     /* Backwards-compatible form: a bare integer is the connect timeout. */
@@ -1973,10 +2028,11 @@ ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
                 return ray_error("type", ".ipc.open: option keys must be symbols, got %s",
                                  ray_type_name(keys->type));
             }
-            bool known = (n == 7 && memcmp(p, "timeout",  7) == 0)
-                      || (n == 8 && memcmp(p, "compress", 8) == 0);
+            bool known = (n == 7 && memcmp(p, "timeout",   7) == 0)
+                      || (n == 8 && memcmp(p, "compress",  8) == 0)
+                      || (n == 9 && memcmp(p, "keepalive", 9) == 0);
             if (!known)
-                return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout` or `compress`)",
+                return ray_error("domain", ".ipc.open: unknown option `%.*s` (expected `timeout`, `compress` or `keepalive`)",
                                  (int)n, p ? p : "");
         }
     }
@@ -2000,6 +2056,17 @@ ray_t* ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
         if (cv == NULL_I64)      *compress_threshold = RAY_IPC_COMPRESS_NEVER;
         else if (cv < 0)         return ray_error("domain", ".ipc.open compress threshold must be >= 0 or 0N (never), got %lld", (long long)cv);
         else                     *compress_threshold = (size_t)cv;
+    }
+
+    int64_t kv = 0;
+    got = opts_i64(arg, "keepalive", &kv, &err);
+    if (got < 0) return err;
+    if (got == 1) {
+        /* 0N = off.  n > 0 = dead-peer budget in ms.  0 is refused rather
+         * than guessed at: it could mean "off" or "immediately". */
+        if (kv == NULL_I64)      *keepalive_ms = RAY_IPC_KEEPALIVE_OFF;
+        else if (kv <= 0)        return ray_error("domain", ".ipc.open keepalive must be > 0 or 0N (off), got %lld", (long long)kv);
+        else                     *keepalive_ms = (kv > INT_MAX) ? INT_MAX : (int)kv;
     }
     return NULL;
 }

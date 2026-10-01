@@ -506,6 +506,75 @@ static test_result_t test_domain_intern_batch(void) {
     PASS();
 }
 
+enum { DOM_CONCURRENT_TASKS = 32, DOM_CONCURRENT_BATCH = 8192,
+       DOM_CONCURRENT_VOCAB = 32768, DOM_CONCURRENT_STRING = 32 };
+typedef struct {
+    ray_sym_domain_t* domain;
+    char* vocabulary;
+    int64_t* positions;
+    bool ok[DOM_CONCURRENT_TASKS];
+} domain_concurrent_batch_t;
+
+static void domain_concurrent_batch_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    domain_concurrent_batch_t* ctx = raw;
+    const char* strings[DOM_CONCURRENT_BATCH];
+    size_t lengths[DOM_CONCURRENT_BATCH];
+    uint32_t hashes[DOM_CONCURRENT_BATCH];
+    for (int64_t task = start; task < end; task++) {
+        for (int i = 0; i < DOM_CONCURRENT_BATCH; i++) {
+            int v = (task*1024 + i%4096)%DOM_CONCURRENT_VOCAB;
+            strings[i] = ctx->vocabulary + v*DOM_CONCURRENT_STRING;
+            lengths[i] = strlen(strings[i]);
+            hashes[i] = (uint32_t)ray_hash_bytes(strings[i], lengths[i]);
+        }
+        ctx->ok[task] = ray_sym_domain_intern_batch(ctx->domain, DOM_CONCURRENT_BATCH,
+            strings, lengths, hashes, ctx->positions + task*DOM_CONCURRENT_BATCH);
+    }
+}
+
+/* Overlapping batches grow the shared index while other workers probe it.
+ * Every task has repeats, and adjacent tasks share most of their vocabulary.
+ * Check all returned positions and the persisted domain, including a second
+ * all-hit pass after the concurrent growth. */
+static test_result_t test_domain_intern_batch_concurrent(void) {
+    unlink(TMP_DOM_SYM_PATH); unlink(TMP_DOM_SYM_PATH ".lk");
+    domain_concurrent_batch_t ctx = {0};
+    ctx.domain = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    ctx.vocabulary = ray_sys_alloc(DOM_CONCURRENT_VOCAB*DOM_CONCURRENT_STRING);
+    ctx.positions = ray_sys_alloc(DOM_CONCURRENT_TASKS*DOM_CONCURRENT_BATCH*sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(ctx.domain); TEST_ASSERT_NOT_NULL(ctx.vocabulary); TEST_ASSERT_NOT_NULL(ctx.positions);
+    for (int v = 0; v < DOM_CONCURRENT_VOCAB; v++)
+        snprintf(ctx.vocabulary + v*DOM_CONCURRENT_STRING, DOM_CONCURRENT_STRING,
+                 "parallel-%05d-%08x", v, (unsigned)v*7919u);
+    for (int pass = 0; pass < 2; pass++) {
+        ray_pool_dispatch_n(ray_pool_get(), domain_concurrent_batch_task, &ctx, DOM_CONCURRENT_TASKS);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(ctx.domain), DOM_CONCURRENT_VOCAB+1);
+        for (int task = 0; task < DOM_CONCURRENT_TASKS; task++) {
+            TEST_ASSERT_TRUE(ctx.ok[task]);
+            for (int i = 0; i < DOM_CONCURRENT_BATCH; i++) {
+                int v = (task*1024 + i%4096)%DOM_CONCURRENT_VOCAB;
+                const char* expected = ctx.vocabulary + v*DOM_CONCURRENT_STRING;
+                int64_t pos = ctx.positions[task*DOM_CONCURRENT_BATCH+i];
+                TEST_ASSERT(pos > 0 && pos <= DOM_CONCURRENT_VOCAB, "concurrent position in range");
+                ray_t* actual = ray_sym_domain_str(ctx.domain, pos);
+                TEST_ASSERT_NOT_NULL(actual);
+                TEST_ASSERT_EQ_U(ray_str_len(actual), strlen(expected));
+                TEST_ASSERT_MEM_EQ(strlen(expected), ray_str_ptr(actual), expected);
+                TEST_ASSERT_EQ_I(ray_sym_domain_find(ctx.domain, expected, strlen(expected)), pos);
+            }
+        }
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush(ctx.domain, false), RAY_OK);
+        ray_sym_domain_release(ctx.domain);
+        ctx.domain = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(ctx.domain);
+    }
+    ray_sym_domain_release(ctx.domain);
+    ray_sys_free(ctx.vocabulary); ray_sys_free(ctx.positions);
+    unlink(TMP_DOM_SYM_PATH); unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* Task 7b: open_or_create on a missing file yields an empty writable
  * domain; "" is seeded at position 0 by the first intern; flush creates
  * the file; verify-base-unchanged makes a racing writer LOUD. */
@@ -2103,7 +2172,27 @@ static test_result_t test_domain_dict_upsert_file_keys(void) {
 
 /* ---- registration -------------------------------------------------------- */
 
+static test_result_t test_domain_private(void) {
+    ray_sym_domain_t* a = ray_sym_domain_new();
+    ray_sym_domain_t* b = ray_sym_domain_new();
+    TEST_ASSERT_NOT_NULL(a); TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_TRUE(a != b);
+    TEST_ASSERT_NULL(ray_sym_domain_path(a));
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(a,"private-a",9),1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(b,"private-b",9),1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(b,"private-a",9),-1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(a,true),RAY_ERR_DOMAIN);
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W32,1);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = 1; v->sym_domain = a; ray_sym_domain_retain(a);
+    ((uint32_t*)ray_data(v))[0] = 1;
+    ray_sym_domain_release(a); ray_sym_domain_release(b);
+    TEST_ASSERT_TRUE(!strcmp(ray_str_ptr(ray_sym_vec_cell(v,0)),"private-a"));
+    ray_release(v);
+    PASS();
+}
 const test_entry_t domain_entries[] = {
+    { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },
@@ -2136,6 +2225,7 @@ const test_entry_t domain_entries[] = {
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
     { "domain/intern_batch",            test_domain_intern_batch,            domain_setup, domain_teardown },
+    { "domain/intern_batch_concurrent", test_domain_intern_batch_concurrent, domain_setup, domain_teardown },
     { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

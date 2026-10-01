@@ -95,8 +95,9 @@ ray_t*    ray_col_mmap(const char* path);
 /* Write a RAY_SYM column re-encoded as positions in `target` (width =
  * ray_sym_dict_width(domain count); header rc = domain count at save).
  * Caller must have interned the column's distinct symbols into `target`
- * and FLUSHED the domain first (crash ordering: sym before columns) —
- * a cell whose symbol is absent from `target` is RAY_ERR_CORRUPT. */
+ * and FLUSHED the domain first for live-table writes. Private import staging
+ * may defer the flush until workers join, before publishing the root.
+ * A cell whose symbol is absent from `target` is RAY_ERR_CORRUPT. */
 ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
                                    struct ray_sym_domain_s* target,
                                    bool durable);

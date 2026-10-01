@@ -1,0 +1,918 @@
+{
+  "input": "/home/hetoku/data/work/rayforce/build/parquet-recovery/data/hits.parquet",
+  "input_bytes": 14779976446,
+  "input_sha256": "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f",
+  "binary_sha256": "c937de4742ccc4c1b9a7718fde7e461908fe6cc303664efcdfe7b8c7b7cda1de",
+  "harness_sha256": "43321ce378dcba977b0d84ff401618292f8735bfb8c08e599200a146b8cec264",
+  "cores": 28,
+  "timeout_seconds": 180,
+  "address_space_gib": 48,
+  "cache": "OS-managed",
+  "method": "fresh process per query; query timing excludes result CSV; not official ClickBench score",
+  "results": [
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.03328534199954447,
+      "query": 1,
+      "translations": [
+        "express scalar count/column access through lazy select"
+      ],
+      "rayfall": "(select {from: hits n: (count WatchID)})",
+      "sql": "SELECT COUNT(*) FROM hits;",
+      "verified": true,
+      "query_ms": 7.08045,
+      "process_seconds": 0.02,
+      "peak_rss_kib": 17896,
+      "user_seconds": 0.0,
+      "system_seconds": 0.0,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16678115500053536
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.4704088350008533,
+      "query": 2,
+      "translations": [
+        "express scalar count/column access through lazy select"
+      ],
+      "rayfall": "(select {from: hits n: (count AdvEngineID) where: (!= AdvEngineID 0)})",
+      "sql": "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0;",
+      "verified": true,
+      "query_ms": 350.567,
+      "process_seconds": 0.42,
+      "peak_rss_kib": 1399960,
+      "user_seconds": 0.9,
+      "system_seconds": 0.53,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.11827315600021393
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.1680108559994551,
+      "query": 3,
+      "translations": [],
+      "rayfall": "(select {from: hits sum_adv: (sum AdvEngineID) c: (count AdvEngineID) avg_res: (avg ResolutionWidth)})",
+      "sql": "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits;",
+      "verified": true,
+      "query_ms": 135.633,
+      "process_seconds": 0.15,
+      "peak_rss_kib": 361572,
+      "user_seconds": 1.54,
+      "system_seconds": 0.06,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16566995799985307
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.1691691460000584,
+      "query": 4,
+      "translations": [],
+      "rayfall": "(select {from: hits avg_user: (avg UserID)})",
+      "sql": "SELECT AVG(UserID) FROM hits;",
+      "verified": true,
+      "query_ms": 106.343,
+      "process_seconds": 0.12,
+      "peak_rss_kib": 679988,
+      "user_seconds": 1.3,
+      "system_seconds": 0.09,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16909983599998668
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 3.1388994049993926,
+      "query": 5,
+      "translations": [
+        "express scalar count/column access through lazy select"
+      ],
+      "rayfall": "(select {from: hits n: (count (distinct UserID))})",
+      "sql": "SELECT COUNT(DISTINCT UserID) FROM hits;",
+      "verified": true,
+      "query_ms": 2970.81,
+      "process_seconds": 3.12,
+      "peak_rss_kib": 6111684,
+      "user_seconds": 7.15,
+      "system_seconds": 3.24,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.31696160399951623
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 5.40217867299998,
+      "query": 6,
+      "translations": [
+        "express scalar count/column access through lazy select"
+      ],
+      "rayfall": "(select {from: hits n: (count (distinct SearchPhrase))})",
+      "sql": "SELECT COUNT(DISTINCT SearchPhrase) FROM hits;",
+      "verified": true,
+      "query_ms": 5210.42,
+      "process_seconds": 5.35,
+      "peak_rss_kib": 9404532,
+      "user_seconds": 9.99,
+      "system_seconds": 2.79,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.4235815100000764
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.11805872399963846,
+      "query": 7,
+      "translations": [],
+      "rayfall": "(select {from: hits min_date: (min EventDate) max_date: (max EventDate)})",
+      "sql": "SELECT MIN(EventDate), MAX(EventDate) FROM hits;",
+      "verified": true,
+      "query_ms": 49.5342,
+      "process_seconds": 0.07,
+      "peak_rss_kib": 309164,
+      "user_seconds": 0.3,
+      "system_seconds": 0.05,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16845499399914843
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.42058218700003636,
+      "query": 8,
+      "translations": [],
+      "rayfall": "(select {from: hits by: AdvEngineID c: (count AdvEngineID) where: (!= AdvEngineID 0) desc: c})",
+      "sql": "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC;",
+      "verified": true,
+      "query_ms": 305.648,
+      "process_seconds": 0.37,
+      "peak_rss_kib": 1404784,
+      "user_seconds": 0.66,
+      "system_seconds": 0.34,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16914371900020342
+      },
+      "rows": 18,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 1.5286647499997343,
+      "query": 9,
+      "translations": [],
+      "rayfall": "(select {from: hits by: RegionID u: (count (distinct UserID)) desc: u take: 10})",
+      "sql": "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 1426.13,
+      "process_seconds": 1.49,
+      "peak_rss_kib": 6979620,
+      "user_seconds": 9.35,
+      "system_seconds": 2.59,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.37034994999976334
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 2.0326254190003965,
+      "query": 10,
+      "translations": [],
+      "rayfall": "(select {from: hits by: RegionID sum_adv: (sum AdvEngineID) c: (count AdvEngineID) avg_res: (avg ResolutionWidth) u: (count (distinct UserID)) desc: c take: 10})",
+      "sql": "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 1828.47,
+      "process_seconds": 1.97,
+      "peak_rss_kib": 6935396,
+      "user_seconds": 6.46,
+      "system_seconds": 2.09,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.4216643670006306
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 3.0884199019992593,
+      "query": 11,
+      "translations": [],
+      "rayfall": "(select {from: hits by: MobilePhoneModel u: (count (distinct UserID)) where: (!= MobilePhoneModel \"\") desc: u take: 10})",
+      "sql": "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 2843.16,
+      "process_seconds": 3.07,
+      "peak_rss_kib": 7600456,
+      "user_seconds": 8.02,
+      "system_seconds": 2.05,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.1658214079998288
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 3.1894680499999595,
+      "query": 12,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [MobilePhone MobilePhoneModel] u: (count (distinct UserID)) where: (!= MobilePhoneModel \"\") desc: u take: 10})",
+      "sql": "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 2932.43,
+      "process_seconds": 3.17,
+      "peak_rss_kib": 7923620,
+      "user_seconds": 8.88,
+      "system_seconds": 2.14,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16605956599960336
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 4.446989922999819,
+      "query": 13,
+      "translations": [],
+      "rayfall": "(select {from: hits by: SearchPhrase c: (count SearchPhrase) where: (!= SearchPhrase \"\") desc: c take: 10})",
+      "sql": "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 4326.05,
+      "process_seconds": 4.43,
+      "peak_rss_kib": 9354896,
+      "user_seconds": 12.24,
+      "system_seconds": 2.21,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.41845333099990967
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 5.807053839999753,
+      "query": 14,
+      "translations": [],
+      "rayfall": "(select {from: hits by: SearchPhrase u: (count (distinct UserID)) where: (!= SearchPhrase \"\") desc: u take: 10})",
+      "sql": "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 5505.14,
+      "process_seconds": 5.75,
+      "peak_rss_kib": 11829104,
+      "user_seconds": 17.6,
+      "system_seconds": 3.19,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.6245498130001579
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 4.648584576999383,
+      "query": 15,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [SearchEngineID SearchPhrase] c: (count SearchPhrase) where: (!= SearchPhrase \"\") desc: c take: 10})",
+      "sql": "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 4483.3,
+      "process_seconds": 4.62,
+      "peak_rss_kib": 9666596,
+      "user_seconds": 13.86,
+      "system_seconds": 2.25,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.41877485500026523
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 1.2262750830004734,
+      "query": 16,
+      "translations": [],
+      "rayfall": "(select {from: hits by: UserID c: (count UserID) desc: c take: 10})",
+      "sql": "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 1075.49,
+      "process_seconds": 1.2,
+      "peak_rss_kib": 8809624,
+      "user_seconds": 6.94,
+      "system_seconds": 6.01,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.369186150999667
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 5.201602898000601,
+      "query": 17,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [UserID SearchPhrase] c: (count UserID) desc: c take: 10})",
+      "sql": "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 5064.16,
+      "process_seconds": 5.17,
+      "peak_rss_kib": 12785300,
+      "user_seconds": 22.61,
+      "system_seconds": 3.69,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.7213904640002511
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 5.0552245729995775,
+      "query": 18,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [UserID SearchPhrase] c: (count UserID) take: 10})",
+      "sql": "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10;",
+      "verified": true,
+      "query_ms": 4914.32,
+      "process_seconds": 5.03,
+      "peak_rss_kib": 12688620,
+      "user_seconds": 22.7,
+      "system_seconds": 3.67,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.670424785999785
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 0, column 0: '-2461439046089301801' != 1428604792192303429",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 3.5502483379996193,
+      "query": 19,
+      "translations": [
+        "minute from explicit Unix seconds"
+      ],
+      "rayfall": "(select {from: hits by: {UserID: UserID m: (% (div EventTime 60) 60) SearchPhrase: SearchPhrase} c: (count UserID) desc: c take: 10})",
+      "sql": "SELECT UserID, (EventTime // 60) % 60 AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: oom\n",
+      "process_seconds": 3.53,
+      "peak_rss_kib": 31482616,
+      "user_seconds": 35.21,
+      "system_seconds": 35.12
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.16613202200005617,
+      "query": 20,
+      "translations": [],
+      "rayfall": "(select {from: hits UserID: UserID where: (== UserID 435090932899640449)})",
+      "sql": "SELECT UserID FROM hits WHERE UserID = 435090932899640449;",
+      "verified": true,
+      "query_ms": 133.086,
+      "process_seconds": 0.15,
+      "peak_rss_kib": 636560,
+      "user_seconds": 1.57,
+      "system_seconds": 0.08,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.16707965499972488
+      },
+      "rows": 4,
+      "mismatch": null
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.301032219000263,
+      "query": 21,
+      "translations": [
+        "express scalar count/column access through lazy select"
+      ],
+      "rayfall": "(select {from: hits n: (count URL) where: (like URL \"*google*\")})",
+      "sql": "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%';",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.25,
+      "peak_rss_kib": 12749212,
+      "user_seconds": 19.13,
+      "system_seconds": 4.31
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 6.3130491820002135,
+      "query": 22,
+      "translations": [],
+      "rayfall": "(select {from: hits by: SearchPhrase min_url: (min URL) c: (count URL) where: (and (like URL \"*google*\") (!= SearchPhrase \"\")) desc: c take: 10})",
+      "sql": "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 6.28,
+      "peak_rss_kib": 15378372,
+      "user_seconds": 23.79,
+      "system_seconds": 4.52
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 9.684250721999888,
+      "query": 23,
+      "translations": [],
+      "rayfall": "(select {from: hits by: SearchPhrase min_url: (min URL) min_title: (min Title) c: (count URL) u: (count (distinct UserID)) where: (and (like Title \"*Google*\") (not (like URL \"*.google.*\")) (!= SearchPhrase \"\")) desc: c take: 10})",
+      "sql": "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 9.67,
+      "peak_rss_kib": 20752816,
+      "user_seconds": 34.1,
+      "system_seconds": 8.1
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 2.741317023999727,
+      "query": 24,
+      "translations": [],
+      "rayfall": "(select {from: hits where: (like URL \"*google*\") asc: EventTime take: 10})",
+      "sql": "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: oom\n",
+      "process_seconds": 2.71,
+      "peak_rss_kib": 31776108,
+      "user_seconds": 43.31,
+      "system_seconds": 10.74
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 3.6426952319998236,
+      "query": 25,
+      "translations": [
+        "retain EventTime projected by the ClickBench Rayforce query"
+      ],
+      "rayfall": "(select {from: hits SearchPhrase: SearchPhrase EventTime: EventTime where: (!= SearchPhrase \"\") asc: EventTime take: 10})",
+      "sql": "SELECT SearchPhrase, EventTime FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10;",
+      "verified": true,
+      "query_ms": 3531.95,
+      "process_seconds": 3.6,
+      "peak_rss_kib": 10439984,
+      "user_seconds": 11.9,
+      "system_seconds": 2.13,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.2699823359998845
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 2, column 0: 'galaxy s4 zoom \u0444\u0438\u043b\u044c\u043c' != '\u0444\u0438\u043b\u044c\u043c \u043d\u0435\u0431\u043e\u043b\u044c\u0448\u043e\u0439 \u0431\u0438\u0437\u043d\u0435\u0441\u0430 \u0441\u0435\u0432\u0435\u0440\u043e\u044f\u0442\u043d\u043e'",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 2.987415011999474,
+      "query": 26,
+      "translations": [],
+      "rayfall": "(select {from: hits SearchPhrase: SearchPhrase where: (!= SearchPhrase \"\") asc: SearchPhrase take: 10})",
+      "sql": "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10;",
+      "verified": true,
+      "query_ms": 2849.13,
+      "process_seconds": 2.96,
+      "peak_rss_kib": 7627040,
+      "user_seconds": 9.25,
+      "system_seconds": 1.62,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.2197323750006035
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 3.640393693000078,
+      "query": 27,
+      "translations": [
+        "retain EventTime projected by the ClickBench Rayforce query"
+      ],
+      "rayfall": "(select {from: hits SearchPhrase: SearchPhrase EventTime: EventTime where: (!= SearchPhrase \"\") asc: [EventTime SearchPhrase] take: 10})",
+      "sql": "SELECT SearchPhrase, EventTime FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10;",
+      "verified": true,
+      "query_ms": 3516.9,
+      "process_seconds": 3.58,
+      "peak_rss_kib": 10493404,
+      "user_seconds": 12.35,
+      "system_seconds": 2.04,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.26986020599997573
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.353923423999731,
+      "query": 28,
+      "translations": [],
+      "rayfall": "(select {from: (select {from: hits by: CounterID l: (avg (strlen URL)) c: (count URL) where: (!= URL \"\")}) where: (> c 100000) desc: l take: 25})",
+      "sql": "SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.31,
+      "peak_rss_kib": 12477232,
+      "user_seconds": 20.14,
+      "system_seconds": 4.31
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 2.5928762149997056,
+      "query": 29,
+      "translations": [
+        "match SQL URL regexp protocol, nonempty host and newline semantics"
+      ],
+      "rayfall": "(xcol (select {from: (select {from: hits by: (let p (str-find Referer \"://\") (let s (substr Referer (+ p 4) -1) (let sl (str-find s \"/\") (if (and (or (== (substr Referer 1 7) \"http://\") (== (substr Referer 1 8) \"https://\")) (> sl 0) (nil? (str-find (substr s (+ sl 2) -1) \"\\n\"))) (if (and (== (str-find s \"www.\") 0) (> sl 4)) (substr s 5 (- sl 4)) (substr s 1 sl)) Referer)))) l: (avg (strlen Referer)) c: (count Referer) min_ref: (min Referer) where: (!= Referer \"\")}) where: (> c 100000) desc: l take: 25}) [k l c min_ref])",
+      "sql": "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;",
+      "verified": false,
+      "diagnostic": "error: oom\n",
+      "process_seconds": 2.54,
+      "peak_rss_kib": 31991564,
+      "user_seconds": 42.2,
+      "system_seconds": 8.91
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.5219473319993995,
+      "query": 30,
+      "translations": [],
+      "rayfall": "(select {from: hits s0: (sum ResolutionWidth) s1: (sum (+ ResolutionWidth 1)) s2: (sum (+ ResolutionWidth 2)) s3: (sum (+ ResolutionWidth 3)) s4: (sum (+ ResolutionWidth 4)) s5: (sum (+ ResolutionWidth 5)) s6: (sum (+ ResolutionWidth 6)) s7: (sum (+ ResolutionWidth 7)) s8: (sum (+ ResolutionWidth 8)) s9: (sum (+ ResolutionWidth 9)) s10: (sum (+ ResolutionWidth 10)) s11: (sum (+ ResolutionWidth 11)) s12: (sum (+ ResolutionWidth 12)) s13: (sum (+ ResolutionWidth 13)) s14: (sum (+ ResolutionWidth 14)) s15: (sum (+ ResolutionWidth 15)) s16: (sum (+ ResolutionWidth 16)) s17: (sum (+ ResolutionWidth 17)) s18: (sum (+ ResolutionWidth 18)) s19: (sum (+ ResolutionWidth 19)) s20: (sum (+ ResolutionWidth 20)) s21: (sum (+ ResolutionWidth 21)) s22: (sum (+ ResolutionWidth 22)) s23: (sum (+ ResolutionWidth 23)) s24: (sum (+ ResolutionWidth 24)) s25: (sum (+ ResolutionWidth 25)) s26: (sum (+ ResolutionWidth 26)) s27: (sum (+ ResolutionWidth 27)) s28: (sum (+ ResolutionWidth 28)) s29: (sum (+ ResolutionWidth 29)) s30: (sum (+ ResolutionWidth 30)) s31: (sum (+ ResolutionWidth 31)) s32: (sum (+ ResolutionWidth 32)) s33: (sum (+ ResolutionWidth 33)) s34: (sum (+ ResolutionWidth 34)) s35: (sum (+ ResolutionWidth 35)) s36: (sum (+ ResolutionWidth 36)) s37: (sum (+ ResolutionWidth 37)) s38: (sum (+ ResolutionWidth 38)) s39: (sum (+ ResolutionWidth 39)) s40: (sum (+ ResolutionWidth 40)) s41: (sum (+ ResolutionWidth 41)) s42: (sum (+ ResolutionWidth 42)) s43: (sum (+ ResolutionWidth 43)) s44: (sum (+ ResolutionWidth 44)) s45: (sum (+ ResolutionWidth 45)) s46: (sum (+ ResolutionWidth 46)) s47: (sum (+ ResolutionWidth 47)) s48: (sum (+ ResolutionWidth 48)) s49: (sum (+ ResolutionWidth 49)) s50: (sum (+ ResolutionWidth 50)) s51: (sum (+ ResolutionWidth 51)) s52: (sum (+ ResolutionWidth 52)) s53: (sum (+ ResolutionWidth 53)) s54: (sum (+ ResolutionWidth 54)) s55: (sum (+ ResolutionWidth 55)) s56: (sum (+ ResolutionWidth 56)) s57: (sum (+ ResolutionWidth 57)) s58: (sum (+ ResolutionWidth 58)) s59: (sum (+ ResolutionWidth 59)) s60: (sum (+ ResolutionWidth 60)) s61: (sum (+ ResolutionWidth 61)) s62: (sum (+ ResolutionWidth 62)) s63: (sum (+ ResolutionWidth 63)) s64: (sum (+ ResolutionWidth 64)) s65: (sum (+ ResolutionWidth 65)) s66: (sum (+ ResolutionWidth 66)) s67: (sum (+ ResolutionWidth 67)) s68: (sum (+ ResolutionWidth 68)) s69: (sum (+ ResolutionWidth 69)) s70: (sum (+ ResolutionWidth 70)) s71: (sum (+ ResolutionWidth 71)) s72: (sum (+ ResolutionWidth 72)) s73: (sum (+ ResolutionWidth 73)) s74: (sum (+ ResolutionWidth 74)) s75: (sum (+ ResolutionWidth 75)) s76: (sum (+ ResolutionWidth 76)) s77: (sum (+ ResolutionWidth 77)) s78: (sum (+ ResolutionWidth 78)) s79: (sum (+ ResolutionWidth 79)) s80: (sum (+ ResolutionWidth 80)) s81: (sum (+ ResolutionWidth 81)) s82: (sum (+ ResolutionWidth 82)) s83: (sum (+ ResolutionWidth 83)) s84: (sum (+ ResolutionWidth 84)) s85: (sum (+ ResolutionWidth 85)) s86: (sum (+ ResolutionWidth 86)) s87: (sum (+ ResolutionWidth 87)) s88: (sum (+ ResolutionWidth 88)) s89: (sum (+ ResolutionWidth 89))})",
+      "sql": "SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4), SUM(ResolutionWidth + 5), SUM(ResolutionWidth + 6), SUM(ResolutionWidth + 7), SUM(ResolutionWidth + 8), SUM(ResolutionWidth + 9), SUM(ResolutionWidth + 10), SUM(ResolutionWidth + 11), SUM(ResolutionWidth + 12), SUM(ResolutionWidth + 13), SUM(ResolutionWidth + 14), SUM(ResolutionWidth + 15), SUM(ResolutionWidth + 16), SUM(ResolutionWidth + 17), SUM(ResolutionWidth + 18), SUM(ResolutionWidth + 19), SUM(ResolutionWidth + 20), SUM(ResolutionWidth + 21), SUM(ResolutionWidth + 22), SUM(ResolutionWidth + 23), SUM(ResolutionWidth + 24), SUM(ResolutionWidth + 25), SUM(ResolutionWidth + 26), SUM(ResolutionWidth + 27), SUM(ResolutionWidth + 28), SUM(ResolutionWidth + 29), SUM(ResolutionWidth + 30), SUM(ResolutionWidth + 31), SUM(ResolutionWidth + 32), SUM(ResolutionWidth + 33), SUM(ResolutionWidth + 34), SUM(ResolutionWidth + 35), SUM(ResolutionWidth + 36), SUM(ResolutionWidth + 37), SUM(ResolutionWidth + 38), SUM(ResolutionWidth + 39), SUM(ResolutionWidth + 40), SUM(ResolutionWidth + 41), SUM(ResolutionWidth + 42), SUM(ResolutionWidth + 43), SUM(ResolutionWidth + 44), SUM(ResolutionWidth + 45), SUM(ResolutionWidth + 46), SUM(ResolutionWidth + 47), SUM(ResolutionWidth + 48), SUM(ResolutionWidth + 49), SUM(ResolutionWidth + 50), SUM(ResolutionWidth + 51), SUM(ResolutionWidth + 52), SUM(ResolutionWidth + 53), SUM(ResolutionWidth + 54), SUM(ResolutionWidth + 55), SUM(ResolutionWidth + 56), SUM(ResolutionWidth + 57), SUM(ResolutionWidth + 58), SUM(ResolutionWidth + 59), SUM(ResolutionWidth + 60), SUM(ResolutionWidth + 61), SUM(ResolutionWidth + 62), SUM(ResolutionWidth + 63), SUM(ResolutionWidth + 64), SUM(ResolutionWidth + 65), SUM(ResolutionWidth + 66), SUM(ResolutionWidth + 67), SUM(ResolutionWidth + 68), SUM(ResolutionWidth + 69), SUM(ResolutionWidth + 70), SUM(ResolutionWidth + 71), SUM(ResolutionWidth + 72), SUM(ResolutionWidth + 73), SUM(ResolutionWidth + 74), SUM(ResolutionWidth + 75), SUM(ResolutionWidth + 76), SUM(ResolutionWidth + 77), SUM(ResolutionWidth + 78), SUM(ResolutionWidth + 79), SUM(ResolutionWidth + 80), SUM(ResolutionWidth + 81), SUM(ResolutionWidth + 82), SUM(ResolutionWidth + 83), SUM(ResolutionWidth + 84), SUM(ResolutionWidth + 85), SUM(ResolutionWidth + 86), SUM(ResolutionWidth + 87), SUM(ResolutionWidth + 88), SUM(ResolutionWidth + 89) FROM hits;",
+      "verified": true,
+      "query_ms": 402.159,
+      "process_seconds": 0.46,
+      "peak_rss_kib": 1456428,
+      "user_seconds": 1.45,
+      "system_seconds": 0.35,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.270388840999658
+      },
+      "rows": 1,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 4.398490037000556,
+      "query": 31,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [SearchEngineID ClientIP] c: (count ClientIP) sum_ref: (sum IsRefresh) avg_res: (avg ResolutionWidth) where: (!= SearchPhrase \"\") desc: c take: 10})",
+      "sql": "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 4270.13,
+      "process_seconds": 4.35,
+      "peak_rss_kib": 11402116,
+      "user_seconds": 14.71,
+      "system_seconds": 2.46,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.4223289579995253
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 9, column 1: '-265917476' != -1125673878",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 4.548407165999379,
+      "query": 32,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [WatchID ClientIP] c: (count ClientIP) sum_ref: (sum IsRefresh) avg_res: (avg ResolutionWidth) where: (!= SearchPhrase \"\") desc: c take: 10})",
+      "sql": "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 4447.28,
+      "process_seconds": 4.52,
+      "peak_rss_kib": 12565532,
+      "user_seconds": 16.46,
+      "system_seconds": 2.77,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.470218436000323
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 0, column 0: '5581899925183342605' != 7430821073251343496",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 2.6888607160008178,
+      "query": 33,
+      "translations": [],
+      "rayfall": "(select {from: hits by: [WatchID ClientIP] c: (count ClientIP) sum_ref: (sum IsRefresh) avg_res: (avg ResolutionWidth) desc: c take: 10})",
+      "sql": "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 2525.59,
+      "process_seconds": 2.68,
+      "peak_rss_kib": 26849556,
+      "user_seconds": 23.06,
+      "system_seconds": 9.77,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 1.4810918140001377
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 0, column 0: '7224410078130478461' != 8566928176839891583",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.255612147000647,
+      "query": 34,
+      "translations": [],
+      "rayfall": "(select {from: hits by: URL c: (count URL) desc: c take: 10})",
+      "sql": "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.2,
+      "peak_rss_kib": 12776952,
+      "user_seconds": 19.04,
+      "system_seconds": 3.96
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.253833794999991,
+      "query": 35,
+      "translations": [],
+      "rayfall": "(select {from: (select {from: hits by: URL c: (count URL) desc: c take: 10}) one: 1 URL: URL c: c})",
+      "sql": "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.21,
+      "peak_rss_kib": 12901544,
+      "user_seconds": 18.78,
+      "system_seconds": 3.91
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 0.7736502080006176,
+      "query": 36,
+      "translations": [
+        "align computed-group-key output column order"
+      ],
+      "rayfall": "(select {from: hits by: {ClientIP: ClientIP ip1: (- ClientIP 1) ip2: (- ClientIP 2) ip3: (- ClientIP 3)} c: (count ClientIP) desc: c take: 10})",
+      "sql": "SELECT ClientIP, COUNT(*) AS c, ClientIP - 1, ClientIP - 2, ClientIP - 3 FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10;",
+      "verified": true,
+      "query_ms": 662.876,
+      "process_seconds": 0.73,
+      "peak_rss_kib": 7094612,
+      "user_seconds": 6.79,
+      "system_seconds": 2.45,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.3703878790001909
+      },
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.656682338999417,
+      "query": 37,
+      "translations": [
+        "date predicates in explicit Unix days"
+      ],
+      "rayfall": "(select {from: hits by: URL views: (count URL) where: (and (== CounterID 62) (within EventDate [15887 15917]) (== DontCountHits 0) (== IsRefresh 0) (!= URL \"\")) desc: views take: 10})",
+      "sql": "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.63,
+      "peak_rss_kib": 13928648,
+      "user_seconds": 20.51,
+      "system_seconds": 4.28
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.150060204000511,
+      "query": 38,
+      "translations": [
+        "date predicates in explicit Unix days"
+      ],
+      "rayfall": "(select {from: hits by: Title views: (count Title) where: (and (== CounterID 62) (within EventDate [15887 15917]) (== DontCountHits 0) (== IsRefresh 0) (!= Title \"\")) desc: views take: 10})",
+      "sql": "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.14,
+      "peak_rss_kib": 13538876,
+      "user_seconds": 18.59,
+      "system_seconds": 5.04
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 5.804852301999745,
+      "query": 39,
+      "translations": [
+        "date predicates in explicit Unix days"
+      ],
+      "rayfall": "(select {from: hits by: URL views: (count URL) where: (and (== CounterID 62) (within EventDate [15887 15917]) (== IsRefresh 0) (!= IsLink 0) (== IsDownload 0)) desc: views take: [1000 10]})",
+      "sql": "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;",
+      "verified": false,
+      "diagnostic": "error: range: str_vec_append: pool offset exceeds 4294967295 bytes\n",
+      "process_seconds": 5.76,
+      "peak_rss_kib": 14276344,
+      "user_seconds": 21.06,
+      "system_seconds": 4.45
+    },
+    {
+      "status": "execution_failed",
+      "returncode": 1,
+      "wall_seconds": 2.844032495999272,
+      "query": 40,
+      "translations": [
+        "date predicates in explicit Unix days"
+      ],
+      "rayfall": "(select {from: hits by: {TraficSourceID: TraficSourceID SearchEngineID: SearchEngineID AdvEngineID: AdvEngineID Src: (if (and (== SearchEngineID 0) (== AdvEngineID 0)) Referer \"\") Dst: URL} views: (count URL) where: (and (== CounterID 62) (within EventDate [15887 15917]) (== IsRefresh 0)) desc: views take: [1000 10]})",
+      "sql": "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;",
+      "verified": false,
+      "diagnostic": "error: oom\n",
+      "process_seconds": 2.83,
+      "peak_rss_kib": 31829532,
+      "user_seconds": 42.42,
+      "system_seconds": 10.34
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 2.6837512299998707,
+      "query": 41,
+      "translations": [
+        "date predicates in explicit Unix days"
+      ],
+      "rayfall": "(select {from: hits by: [URLHash EventDate] views: (count URLHash) where: (and (== CounterID 62) (within EventDate [15887 15917]) (== IsRefresh 0) (in TraficSourceID [-1 6]) (== RefererHash 3594120000172545465)) desc: views take: [100 10]})",
+      "sql": "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100;",
+      "verified": true,
+      "query_ms": 2589.9,
+      "process_seconds": 2.66,
+      "peak_rss_kib": 10474972,
+      "user_seconds": 7.73,
+      "system_seconds": 2.47,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.11676255700058391
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 0, column 0: '5520570504648279068' != 2054727273000865689",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 2.9943100970003798,
+      "query": 42,
+      "translations": [
+        "date predicates in explicit Unix days"
+      ],
+      "rayfall": "(select {from: hits by: [WindowClientWidth WindowClientHeight] views: (count WatchID) where: (and (== CounterID 62) (within EventDate [15887 15917]) (== IsRefresh 0) (== DontCountHits 0) (== URLHash 2868770270353813622)) desc: views take: [10000 10]})",
+      "sql": "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000;",
+      "verified": true,
+      "query_ms": 2891.42,
+      "process_seconds": 2.96,
+      "peak_rss_kib": 12236048,
+      "user_seconds": 9.85,
+      "system_seconds": 2.64,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.11599820500032365
+      },
+      "tie_validation": "rank sequence, full-row oracle membership and multiplicity",
+      "initial_order_difference": "row 0, column 0: '1667' != 1239",
+      "rows": 10,
+      "mismatch": null
+    },
+    {
+      "status": "verified",
+      "returncode": 0,
+      "wall_seconds": 2.234604500000387,
+      "query": 43,
+      "translations": [
+        "date predicates in explicit Unix days",
+        "minute buckets in explicit Unix seconds"
+      ],
+      "rayfall": "(select {from: hits by: {M: (xbar EventTime 60)} views: (count WatchID) where: (and (== CounterID 62) (within EventDate [15900 15901]) (== IsRefresh 0) (== DontCountHits 0)) asc: M take: [1000 10]})",
+      "sql": "SELECT (EventTime // 60) * 60 AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15900 AND EventDate <= 15901 AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY (EventTime // 60) * 60 ORDER BY (EventTime // 60) * 60 LIMIT 10 OFFSET 1000;",
+      "verified": true,
+      "query_ms": 2119.17,
+      "process_seconds": 2.22,
+      "peak_rss_kib": 8630272,
+      "user_seconds": 8.65,
+      "system_seconds": 1.82,
+      "oracle": {
+        "status": "executed",
+        "returncode": 0,
+        "wall_seconds": 0.1154094809999151
+      },
+      "rows": 10,
+      "mismatch": null
+    }
+  ]
+}
