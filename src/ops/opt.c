@@ -676,6 +676,14 @@ static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
         return true;
     }
 
+    /* Over a table the filter's job is the selection it installs: the
+     * aggregate paths run it for that alone, then group the table under
+     * g->selection.  A take-0 in its place installed none, so a false
+     * `where:` grouped every row.  Leave the filter; it turns the false
+     * constant into an empty selection. */
+    ray_op_t* src = op_child(g, node, 0);
+    if (src && src->out_type == RAY_TABLE) return false;
+
     ray_op_ext_t* ext = ensure_ext_node(g, node->id);
     if (!ext) return false;
     ext->base = *node;

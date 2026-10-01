@@ -179,3 +179,21 @@
 ;; return 0 → expr_affine_of_sym returns 0 → dep_candidate=false
 (set TGt2 (table [k u] (list [1 2 3 4] [10 20 30 40])))
 (count (select {c: (count u) from: TGt2 by: {k: k m: (+ k 1.0)}})) -- 4
+
+;; A where: predicate that reduces to one value holds for every row or none.
+;; A false scalar conjunct of an `and` kept every row (the one-element
+;; predicate failed the row-count check and the refine read "all pass"), a
+;; false scalar alone failed with a selection mismatch, and a constant false
+;; under a grouping or an aggregate grouped every row.
+(set TSc (table [x s] (list (til 6) ['a 'b 'c 'a 'b 'c])))
+(at (select {from: TSc where: (and (> x 1) (== (strlen "abc") 4))}) 'x) -- (til 0)
+(at (select {from: TSc where: (and (> x 1) (== (count x) 5))}) 'x) -- (til 0)
+(at (select {from: TSc where: (and (> x 1) (== (count x) 6))}) 'x) -- [2 3 4 5]
+(count (select {from: TSc where: (== (count x) 5)})) -- 0
+(count (select {from: TSc where: (== (count x) 6)})) -- 6
+(count (select {c: (count x) from: TSc by: s where: (and (> x 1) (== (strlen "abc") 4))})) -- 0
+(count (select {c: (count x) from: TSc by: s where: (== 1 2)})) -- 0
+(count (select {c: (count x) from: TSc by: s where: false})) -- 0
+(at (select {c: (count x) from: TSc where: (and (> x 1) false)}) 'c) -- [0]
+(at (select {c: (count x) from: TSc by: s where: true}) 'c) -- [2 2 2]
+(at (select {from: TSc where: (or (> x 3) true)}) 'x) -- (til 6)

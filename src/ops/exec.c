@@ -2792,6 +2792,29 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* pred = exec_node(g, op_child(g, op, 1));
             if (!pred || RAY_IS_ERR(pred)) { ray_release(input); return pred; }
 
+            /* A predicate that reduces to one value (`(== (count x) 5)`, a
+             * scalar conjunct of an `and`) holds for every row or none.
+             * Read as a column it failed the length checks below, and the
+             * NULL refine meant "all pass": a false scalar kept every row.
+             * Spread it over the table's rows instead. */
+            if (input->type == RAY_TABLE &&
+                (pred->type == -RAY_BOOL || (pred->type == RAY_BOOL && pred->len == 1))) {
+                int64_t tn = ray_table_nrows(input);
+                if (tn != 1) {
+                    uint8_t on = pred->type == -RAY_BOOL ? pred->b8
+                                                         : ((const uint8_t*)ray_data(pred))[0];
+                    ray_release(pred);
+                    if (on) return input;   /* every row passes: selection unchanged */
+                    pred = ray_vec_new(RAY_BOOL, tn);
+                    if (!pred || RAY_IS_ERR(pred)) {
+                        ray_release(input);
+                        return pred ? pred : ray_error("oom", NULL);
+                    }
+                    pred->len = tn;
+                    if (tn > 0) memset(ray_data(pred), 0, (size_t)tn);
+                }
+            }
+
             /* Lazy filter: convert predicate to a rowsel (morsel-local
              * index list) and install on g->selection instead of
              * materializing a compacted table.  Only for TABLE inputs —
