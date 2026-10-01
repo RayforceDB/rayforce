@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 static char tmp_csv_path[64];
 static const char* tmp_csv(void) {
@@ -2004,9 +2005,12 @@ static test_result_t test_csv_parted_staging(void) {
     int8_t invalid[] = {RAY_TABLE}, types[] = {RAY_SYM};
     TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,1,NULL,0,root,"../escape",2),RAY_ERR_DOMAIN);
     TEST_ASSERT_TRUE(access(partial,F_OK) != 0);
+    /* A failure before the first partition leaves no staging behind. */
     TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,invalid,1,NULL,0,root,"hits",2),RAY_ERR_TYPE);
     TEST_ASSERT_TRUE(access(root,F_OK) != 0);
-    TEST_ASSERT_TRUE(access(partial,F_OK) == 0);
+    TEST_ASSERT_TRUE(access(partial,F_OK) != 0);
+    /* Retained staging (an import that failed mid-write) blocks the root. */
+    TEST_ASSERT_EQ_I(mkdir(partial,0755),0);
     TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,1,NULL,0,root,"hits",2),RAY_ERR_IO);
     TEST_ASSERT_EQ_I(rmdir(partial),0);
     /* A trailing slash still stages beside the requested destination. */

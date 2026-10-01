@@ -10,6 +10,16 @@
 ;; unreadable source: fails, and claims nothing
 (.csv.parted "rf_test_pstage_missing.csv" "rf_test_pstage" 'tbl) !- io
 (.sys.exec "test -e rf_test_pstage.csv-partial") -- 1
+;; a failure before the first partition (wrong type vector, empty source,
+;; a directory as source) also leaves nothing behind
+(.csv.parted [I64] "rf_test_pstage.csv" "rf_test_pstage" 'tbl) !- length
+(.sys.exec "test -e rf_test_pstage.csv-partial") -- 1
+(.sys.exec ": > rf_test_pstage_empty.csv") -- 0
+(.csv.parted "rf_test_pstage_empty.csv" "rf_test_pstage" 'tbl) !- io
+(.sys.exec "test -e rf_test_pstage.csv-partial") -- 1
+(.sys.exec "mkdir -p rf_test_pstage_dir") -- 0
+(.csv.parted "rf_test_pstage_dir" "rf_test_pstage" 'tbl) !- io
+(.sys.exec "test -e rf_test_pstage.csv-partial") -- 1
 ;; ...so the next import into the same root succeeds
 (count (.csv.parted "rf_test_pstage.csv" "rf_test_pstage" 'tbl)) -- 2
 
@@ -20,4 +30,4 @@
 (.sys.exec "rm -rf rf_test_pstage2.csv-partial") -- 0
 (count (.csv.parted "rf_test_pstage.csv" "rf_test_pstage2/" 'tbl)) -- 2
 
-(.sys.exec "rm -rf rf_test_pstage rf_test_pstage2 rf_test_pstage*.csv") -- 0
+(.sys.exec "rm -rf rf_test_pstage rf_test_pstage2 rf_test_pstage_dir rf_test_pstage*.csv") -- 0

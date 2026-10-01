@@ -4260,7 +4260,24 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
 #endif
     ray_err_t err = csv_save_parted_impl(path,delimiter,header,col_types,n_types,
                                        col_names,n_names,staging,table_name,rows_per_part,true);
-    if (err != RAY_OK) return err;
+    if (err != RAY_OK) {
+        /* Failed staging is kept for diagnosis only when it holds a
+         * partition.  A failure before the first one (a type vector that
+         * does not match, an empty or unreadable source) leaves at most
+         * the symfile, and keeping that would only block the root. */
+        char probe[1200];
+        snprintf(probe,sizeof(probe),"%s/0",staging);
+        if (stat(probe,&st) != 0) {
+            snprintf(probe,sizeof(probe),"%s/.sym",staging);
+            remove(probe);
+#ifdef RAY_OS_WINDOWS
+            RemoveDirectoryA(staging);
+#else
+            rmdir(staging);
+#endif
+        }
+        return err;
+    }
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (stat(dest,&st) == 0) return RAY_ERR_IO;
     return ray_file_rename_new(staging,dest);
