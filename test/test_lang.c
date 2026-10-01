@@ -7929,6 +7929,58 @@ static test_result_t test_builtin_show_table_long_cells(void) {
     PASS();
 }
 
+/* One long cell does not pad every other row of its column: a column is
+ * padded to at most FMT_SHOW_PAD_MAX display columns, and a longer cell is
+ * written whole past its border.  Padding every row to the longest cell
+ * made the output rows x longest cell. */
+static test_result_t test_builtin_show_table_long_cell_unpadded(void) {
+    enum { N = 3000, LONG = 10000 };
+    ray_t* k = ray_vec_new(RAY_I64, N);
+    ray_t* s = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(s);
+    k->len = N;
+    ray_t* lblk = ray_alloc(LONG + 1);
+    TEST_ASSERT_NOT_NULL(lblk);
+    char* lng = (char*)ray_data(lblk);
+    memset(lng, 'x', LONG);
+    lng[LONG] = '\0';
+    for (int64_t i = 0; i < N; i++) {
+        ((int64_t*)ray_data(k))[i] = i;
+        char cell[32];
+        int cl = snprintf(cell, sizeof(cell), "v%lld", (long long)i);
+        s = i == 0 ? ray_str_vec_append(s, lng, LONG) : ray_str_vec_append(s, cell, (size_t)cl);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    }
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(k);
+    ray_release(s);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    size_t n = strlen(buf);
+    /* the long value is there whole */
+    TEST_ASSERT_NOT_NULL(strstr(buf, lng));
+    /* every other row is padded to the cap, not to the long cell: well
+     * under rows x (cap + border) + the long cell itself */
+    TEST_ASSERT_FMT(n < (size_t)N * (256 * 3 + 64) + LONG * 2,
+                    "show wrote %zu bytes for %d rows", n, N);
+    TEST_ASSERT_FMT(n < (size_t)N * 400, "show wrote %zu bytes for %d short rows", n, N);
+    TEST_ASSERT_EQ_I(count_substr(buf, "\n│"), N + 3);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "│ \"v2999\" "));
+    ray_free(text);
+    ray_free(lblk);
+    ray_release(t);
+    PASS();
+}
+
 /* show prints any value in full: a vector far past the REPL width limit
  * comes out whole, streamed through the output buffer. */
 static test_result_t test_builtin_show_vector_full(void) {
@@ -9833,6 +9885,7 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/show_table_unlimited", test_builtin_show_table_unlimited, lang_setup, lang_teardown },
     { "lang/builtin/show_table_streamed", test_builtin_show_table_streamed, lang_setup, lang_teardown },
     { "lang/builtin/show_table_long_cells", test_builtin_show_table_long_cells, lang_setup, lang_teardown },
+    { "lang/builtin/show_table_long_cell_unpadded", test_builtin_show_table_long_cell_unpadded, lang_setup, lang_teardown },
     { "lang/builtin/show_vector_full", test_builtin_show_vector_full, lang_setup, lang_teardown },
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },

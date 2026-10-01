@@ -833,6 +833,12 @@ static void fmt_stream_rule(fmt_buf_t* b, const int32_t* w, int64_t n,
     }
 }
 
+/* Widest a streamed column is padded to, in display columns.  A longer cell
+ * is written whole, unpadded, past the border of its own row: padding every
+ * row to the longest cell made the output rows x longest cell (one 10 KB
+ * value in 10k rows wrote 100 MB of spaces). */
+#define FMT_SHOW_PAD_MAX 256
+
 static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
@@ -857,13 +863,16 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
         const char* tname = ray_type_name(col ? col->type : 0);
         int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
         if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
-        for (int64_t ri = 0; ri < nrows; ri++) {
+        int32_t cell_w = 0;
+        for (int64_t ri = 0; ri < nrows && cell_w < FMT_SHOW_PAD_MAX; ri++) {
             const char* cs; int32_t cl;
             fmt_stream_cell(&tmp, col, ri, &cs, &cl);
             if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
             int32_t dw = fmt_utf8_width(cs, cl);
-            if (dw > w) w = dw;
+            if (dw > cell_w) cell_w = dw;
         }
+        if (cell_w > FMT_SHOW_PAD_MAX) cell_w = FMT_SHOW_PAD_MAX;
+        if (cell_w > w) w = cell_w;
         widths[ci] = w + 2;   /* one space of padding on each side */
     }
 
@@ -902,6 +911,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
             if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
             fmt_putc(b, ' ');
             fmt_putn(b, cs, cl);
+            /* a cell past FMT_SHOW_PAD_MAX gets no padding (p <= 0) */
             for (int32_t p = widths[ci] - fmt_utf8_width(cs, cl) - 1; p > 0; p--) fmt_putc(b, ' ');
             fmt_puts(b, G_V);
         }
