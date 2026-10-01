@@ -14354,7 +14354,18 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
             break;
         }
     }
-    if (!rowwise) {
+    /* A dict entry naming no column adds one; that is the general path's
+     * job (this one writes existing columns in place and dropped it). */
+    bool adds_col = false;
+    for (int64_t d = 0; d + 1 < updf_n && !adds_col; d += 2) {
+        int64_t kid = updf[d]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id) continue;
+        bool found = false;
+        for (int64_t i = 0; i < nu; i++)
+            if (ray_table_col_name(tbl, ucol[i]) == kid) { found = true; break; }
+        if (!found) adds_col = true;
+    }
+    if (!rowwise || adds_col) {
         scratch_free(ucol_hdr); scratch_free(uexpr_hdr); scratch_free(uval_hdr);
         DICT_VIEW_CLOSE(updf);
         return NULL;
@@ -15105,6 +15116,55 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_release(new_col);
                 ray_release(expr_vec);
             }
+            if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
+        }
+
+        /* New columns (in the dict, not in the table): the expression's
+         * value on the matched rows and null on the rest.  The loop above
+         * walks the table's columns only, so these used to be dropped
+         * without a word. */
+        for (int64_t d = 0; d + 1 < dict_n; d += 2) {
+            int64_t kid = dict_elems[d]->i64;
+            if (kid == from_id || kid == where_id) continue;
+            bool exists = false;
+            for (int64_t c = 0; c < ncols; c++)
+                if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
+            if (exists) continue;
+            ray_t* v = update_eval_on(tbl, dict_elems[d + 1]);
+            if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
+                ray_t* wide;
+                if (v->type == -RAY_STR) {
+                    wide = broadcast_scalar(v, nrows);
+                } else {
+                    ray_t* n_obj = make_i64(nrows);
+                    wide = n_obj ? ray_take_fn(v, n_obj) : ray_error("oom", NULL);
+                    if (n_obj) ray_release(n_obj);
+                }
+                ray_release(v);
+                v = wide;
+            }
+            if (v && !RAY_IS_ERR(v) && !ray_is_vec(v)) {
+                int8_t vt = v->type;
+                ray_release(v);
+                v = ray_error("type", "update: a new column under where: must be a typed vector, got %s",
+                              ray_type_name(vt));
+            } else if (v && !RAY_IS_ERR(v) && v->len != nrows) {
+                int64_t got = v->len;
+                ray_release(v);
+                v = ray_error("length", "update: new column has %lld values for %lld rows",
+                              (long long)got, (long long)nrows);
+            }
+            if (v && !RAY_IS_ERR(v)) v = ray_cow(v);
+            if (!v || RAY_IS_ERR(v)) {
+                ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw);
+                return v ? v : ray_error("oom", NULL);
+            }
+            ray_t* nul = ray_typed_null((int8_t)-v->type);
+            for (int64_t r = 0; r < nrows && nul && !RAY_IS_ERR(nul); r++)
+                if (!mask[r]) store_typed_elem(v, r, nul);
+            if (nul && !RAY_IS_ERR(nul)) ray_release(nul);
+            result = ray_table_add_col(result, kid, v);
+            ray_release(v);
             if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
         }
 
