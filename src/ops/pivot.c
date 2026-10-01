@@ -1168,6 +1168,24 @@ static void if_str_desc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_
     }
 }
 
+/* Truthiness of an `if` condition, matching ray_cond_fn: null, false and a
+ * zero I64 or F64 are false, any other value is true.  idx < 0 reads the
+ * atom itself, otherwise cell idx of the vector. */
+static uint8_t if_cond_truthy(ray_t* c, int64_t idx) {
+    if (idx < 0) {
+        if (RAY_ATOM_IS_NULL(c)) return 0;
+        if (c->type == -RAY_BOOL) return c->b8 ? 1 : 0;
+        if (c->type == -RAY_I64)  return c->i64 != 0;
+        if (c->type == -RAY_F64)  return c->f64 != 0.0;
+        return 1;
+    }
+    if (c->type == RAY_BOOL) return ((const uint8_t*)ray_data(c))[idx] ? 1 : 0;
+    if (ray_vec_is_null(c, idx)) return 0;
+    if (c->type == RAY_I64) return ((const int64_t*)ray_data(c))[idx] != 0;
+    if (c->type == RAY_F64) return ((const double*)ray_data(c))[idx] != 0.0;
+    return 1;
+}
+
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
@@ -1192,28 +1210,32 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         return else_v;
     }
 
-    /* A scalar condition has one cell, and the fills below index it per row —
-     * reading past it, so `(if false f 1.0)` returned a mixture of both
-     * branches.  Expand it once so every consumer sees a full-length mask;
-     * the selected arm declines a scalar condition outright, which is why
-     * this only ever mattered here.  A reduction in the condition, such as
-     * `(> (count x) 3)`, reaches here as a one-element BOOL vector rather
-     * than an atom; against vector branches it is the same scalar. */
+    /* The fills below read the condition as one BOOL byte per row.  A scalar
+     * condition has one cell, and indexing it per row read past it, so
+     * `(if false f 1.0)` returned a mixture of both branches.  A reduction
+     * in the condition, such as `(> (count x) 3)`, reaches here as a
+     * one-element vector rather than an atom and is the same scalar against
+     * vector branches.  A condition of another type, such as `(count x)` or
+     * an I64 column, was read byte by byte.  Every such condition becomes a
+     * full-length BOOL mask, with the interpreter's truthiness per cell; the
+     * selected arm declines all of them, which is why only this arm
+     * mattered. */
     int64_t branch_len = 1;
     if (!ray_is_atom(then_v) && then_v->len > branch_len) branch_len = then_v->len;
     if (!ray_is_atom(else_v) && else_v->len > branch_len) branch_len = else_v->len;
-    bool cond_one = !ray_is_atom(cond_v) && cond_v->type == RAY_BOOL &&
-                    cond_v->len == 1 && branch_len > 1;
-    if (ray_is_atom(cond_v) || cond_one) {
-        int64_t n = branch_len;
-        uint8_t on = cond_one ? ((const uint8_t*)ray_data(cond_v))[0] != 0
-                              : (cond_v->b8 ? 1 : 0);
+    bool cond_bcast = ray_is_atom(cond_v) || (cond_v->len == 1 && branch_len > 1);
+    if (cond_bcast || (cond_v->type != RAY_BOOL && ray_is_vec(cond_v))) {
+        int64_t n = cond_bcast ? branch_len : cond_v->len;
         ray_t* mask = ray_vec_new(RAY_BOOL, n);
         if (!mask || RAY_IS_ERR(mask)) {
             ray_release(cond_v); ray_release(then_v); ray_release(else_v);
             return mask ? mask : ray_error("oom", NULL);
         }
-        memset(ray_data(mask), on, (size_t)n);
+        uint8_t* m = (uint8_t*)ray_data(mask);
+        if (cond_bcast)
+            memset(m, if_cond_truthy(cond_v, ray_is_atom(cond_v) ? -1 : 0), (size_t)n);
+        else
+            for (int64_t i = 0; i < n; i++) m[i] = if_cond_truthy(cond_v, i);
         mask->len = n;
         ray_release(cond_v);
         cond_v = mask;

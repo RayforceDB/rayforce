@@ -792,6 +792,28 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (at (select {k: (if (> (max x) 3) 1.5 x) from: TR}) 'k) -- [1.5 1.5 1.5 1.5 1.5 1.5]
 (at (select {k: (if (< (max x) 3) 1.5 x) from: TR}) 'k) -- [0.0 1.0 2.0 3.0 4.0 5.0]
 
+;; A condition of another type follows the interpreter's truthiness (zero
+;; I64 or F64 and null are false) per cell.  It was read as raw bytes, so
+;; `(if (+ (count x) 250) ...)` took the else-branch on row 0 and read past
+;; the cell on later rows, and an I64 column picked only rows 0 and 8.
+(set TN (table [x f] (list (til 12) (+ 0.0 (til 12)))))
+(at (select {k: (if (+ (count x) 244) x 0) from: TN}) 'k) -- (til 12)
+(at (select {k: (if (- (count x) 12) x 7) from: TN}) 'k) -- (take 7 12)
+(at (select {k: (if (count x) x 0) from: TN}) 'k) -- (til 12)
+(at (select {k: (if (max f) x 0) from: TN}) 'k) -- (til 12)
+(at (select {k: (if x x 100) from: TN}) 'k) -- (concat 100 (+ 1 (til 11)))
+(at (select {k: (if f 1 0) from: TN}) 'k) -- (concat 0 (take 1 11))
+(at (select {k: (if (count x) x 0) from: (table [x] (list (til 256)))}) 'k) -- (til 256)
+
+;; The same on enough rows for the fill to run on the worker pool.
+(set TP (table [x s] (list (til 200000) (as 'SYM (% (til 200000) 7)))))
+(sum (at (select {k: (if (> (count x) 3) x 0) from: TP}) 'k)) -- 19999900000
+(sum (at (select {k: (if (< (count x) 3) x 0) from: TP}) 'k)) -- 0
+(sum (at (select {k: (if (+ (count x) 0) x 0) from: TP}) 'k)) -- 19999900000
+(sum (at (select {k: (if (% x 2) x 0) from: TP}) 'k)) -- 10000000000
+(at (select {k: (if (> (count x) 3) s "") from: TP}) 'k) -- (as 'STR (at TP 's))
+(count (distinct (at (select {k: (if (< (count x) 3) s "") from: TP}) 'k))) -- 1
+
 
 ;; ── the null symbol needs no width handling ───────────────────────────
 ;; SYM has no typed null and no `0Ns` literal (parse.c): the empty symbol `'`
