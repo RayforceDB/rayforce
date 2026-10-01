@@ -349,9 +349,8 @@ table operations.
 - At most 4,096 columns, a 64 MiB footer, and 64 MiB per compressed or
   decompressed page. Batches of long strings are made smaller: each row
   group's batch size is lowered so a STR column's decoded string pool stays
-  near 64 MiB, estimated from the column chunk's uncompressed size. A pool
-  past its 4 GiB capacity (a dictionary repeating very long values, for
-  example) returns an error. Oversized values return errors. Total scratch memory depends on the selected column count
+  near 64 MiB, estimated from the column chunk's uncompressed size and its
+  longest dictionary entry. A pool past its 4 GiB capacity returns an error. Oversized values return errors. Total scratch memory depends on the selected column count
   and page/dictionary sizes; there is no query-wide memory budget yet.
 
 Projection avoids decoding other columns, except an unprojected range-filter

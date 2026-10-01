@@ -631,13 +631,48 @@ static bool pq_group_columns(ray_parquet_t* r, int64_t g, pq_span* cols, int64_t
     }
     return c.p == c.end;
 }
+/* Longest entry in a BYTE_ARRAY column chunk's dictionary page, 0 when it
+ * has none (or it cannot be read here; the decoder reports that later).
+ * Every dictionary-encoded row copies one entry into the batch pool, and
+ * the chunk's uncompressed size (dictionary + indices) says nothing about
+ * how many times a long entry repeats. */
+static int64_t pq_dict_max_len(ray_parquet_t* r, pq_span meta) {
+    pq_span mf[17];
+    if (!pq_fields(meta,mf,17)) return 0;
+    int64_t dict = pq_get(mf[11],-1), codec = pq_get(mf[4],-1);
+    if (dict < 4 || (uint64_t)dict >= r->data_end) return 0;
+    pq_cur c = {r->map+dict,r->map+r->data_end,false};
+    const uint8_t* start = c.p;
+    if (!pq_skip(&c,12,0,false)) return 0;
+    pq_span f[10];
+    if (!pq_fields((pq_span){start,c.p,12},f,10) || pq_get(f[1],-1) != 2) return 0;
+    int64_t raw = pq_get(f[2],-1), size = pq_get(f[3],-1);
+    if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE ||
+        (uint64_t)size > (uint64_t)(c.end-c.p)) return 0;
+    const uint8_t* p = c.p; uint8_t* buf = NULL;
+    if (codec == 1) {
+        buf = ray_alloc_raw((size_t)(raw ? raw : 1));
+        if (!buf || !ray_parquet_snappy(c.p,(size_t)size,buf,(size_t)raw)) { ray_free_raw(buf); return 0; }
+        p = buf;
+    } else if (raw != size) return 0;
+    int64_t max = 0;
+    for (const uint8_t* q = p, *end = p+raw; end-q >= 4; ) {
+        uint32_t len = pq_u32(q); q += 4;
+        if (len > (uint64_t)(end-q)) break;
+        if ((int64_t)len > max) max = len;
+        q += len;
+    }
+    ray_free_raw(buf);
+    return max;
+}
+
 /* Rows per batch for row group g: batch_rows, lowered so each selected STR
- * column's pool stays near PQ_POOL_TARGET.  Bytes per row are estimated
- * from the chunk's uncompressed size, which bounds PLAIN strings (each
- * value's bytes are in it) — a 4 MB file of 11 KB documents decodes 86 MB
- * of strings, and one fixed 65,536-row batch would hold all of it.  A
- * dictionary chunk can expand beyond its size (repeated long entries);
- * PQ_POOL_MAX still bounds that.  Deterministic from metadata, so the
+ * column's pool stays near PQ_POOL_TARGET.  Bytes per row are bounded by
+ * the larger of the chunk's uncompressed bytes per value (PLAIN pages hold
+ * every value's bytes; a 4 MB file of 11 KB documents decodes 86 MB of
+ * strings, and one fixed 65,536-row batch would hold all of it) and the
+ * longest dictionary entry (dictionary pages; each row may repeat it).
+ * PQ_POOL_MAX remains the hard limit.  Deterministic from the file, so the
  * partitioned writer can count partitions with it before decoding. */
 static int64_t pq_group_batch(ray_parquet_t* r, int64_t g) {
     int64_t batch = r->batch_rows, rows;
@@ -652,6 +687,8 @@ static int64_t pq_group_batch(ray_parquet_t* r, int64_t g) {
             int64_t values = pq_get(mf[5],-1), bytes = pq_get(mf[6],-1);
             if (values <= 0 || bytes <= 0) continue;
             int64_t per_row = bytes/values + 1;
+            int64_t longest = pq_dict_max_len(r,cols[r->selected[i]]) + 1;
+            if (longest > per_row) per_row = longest;
             int64_t cap = (int64_t)PQ_POOL_TARGET/per_row;
             if (cap < 1) cap = 1;
             if (cap < batch) batch = cap;

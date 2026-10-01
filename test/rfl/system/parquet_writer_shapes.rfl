@@ -57,3 +57,14 @@
 (count (select {from: tr where: (> ts 2100.01.01D00:00:00.000000000)})) -- 1
 (count (select {from: tr where: (< ts 1900.01.01D00:00:00.000000000)})) -- 1
 (.parquet.read {strict: true} "test/data/parquet/timestamp-range.parquet") !- parquet
+
+;; the same pool bound for dictionary pages: 10,000 rows repeating 20
+;; distinct 10 KB entries (~100 MB decoded).  The chunk is small, but every
+;; row copies an entry into the pool, so batches must be sized by the
+;; longest entry (~6,700 rows), not left at the default 65,536.
+(.sys.exec "python3 test/data/parquet/generate.py --dict-strings rf_test_pq_dict.parquet") -- 0
+(set nd 0)
+(.parquet.each "rf_test_pq_dict.parquet" (fn [batch] (set nd (+ nd 1)))) -- 10000
+nd -- 2
+(count (distinct (at (.parquet.read "rf_test_pq_dict.parquet") 's))) -- 20
+(.sys.exec "rm -f rf_test_pq_dict.parquet") -- 0

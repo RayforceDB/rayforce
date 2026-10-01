@@ -96,7 +96,7 @@ def page(kind, header, body, codec=1, prefix=b'', compressed=True, crc=False):
     header_bytes = fields(f)
     return Page(header_bytes+payload,len(header_bytes)+len(prefix)+len(body))
 
-def write(path, specs, groups, codec=1, v2=False, dictionary=True, crc=False, legacy=False, statistics=True, compress_v2=True, indexes=False, bloom=False, bad_index=False, bad_bloom=False, mismatched=False, corrupt_column=None, rle_ids=False, rle_bools=False):
+def write(path, specs, groups, codec=1, v2=False, dictionary=True, crc=False, legacy=False, statistics=True, compress_v2=True, indexes=False, bloom=False, bad_index=False, bad_bloom=False, mismatched=False, corrupt_column=None, rle_ids=False, rle_bools=False, all_dict=False):
     data = bytearray(b'PAR1')
     schema = [[(3,I32,0),(4,BINARY,'schema'),(5,I32,len(specs))]]
     for name,pt,optional,converted in specs:
@@ -129,7 +129,7 @@ def write(path, specs, groups, codec=1, v2=False, dictionary=True, crc=False, le
             data_off=start+sum(map(len,pages))
             for k,(lo,hi) in enumerate(zip(cuts,cuts[1:])):
                 vals=values[lo:hi]; valid=[x for x in vals if x is not None]
-                enc=(2 if legacy else 8) if use_dict and k<len(cuts)-2 else 0
+                enc=(2 if legacy else 8) if use_dict and (all_dict or k<len(cuts)-2) else 0
                 width=max(0,(len(vocab)-1).bit_length())
                 if enc and rle_ids:
                     from itertools import groupby
@@ -198,10 +198,19 @@ def long_strings(path, rows=8000, size=9000):
           [[list(range(rows)),[str(i).encode()+b' '+b'x'*(size-len(str(i))-1) for i in range(rows)]]],
           codec=0,dictionary=False)
 
+def dict_strings(path, rows=10000, distinct=20, size=10000):
+    """A few long strings repeated through the dictionary on every page: the
+    chunk is small, but every row copies an entry into the batch pool."""
+    vocab=['%02d '%k+'y'*(size-3) for k in range(distinct)]
+    write(Path(path),[('s',6,False,0)],[[[vocab[i%distinct] for i in range(rows)]]],
+          codec=0,all_dict=True)
+
 if __name__ == '__main__':
     import sys
     if sys.argv[1:2] == ['--long-strings']:
         long_strings(sys.argv[2]); sys.exit(0)
+    if sys.argv[1:2] == ['--dict-strings']:
+        dict_strings(sys.argv[2]); sys.exit(0)
     root=Path(__file__).parent
     specs=[('x',1,True,None),('name',6,True,0),('flag',0,True,None),('wide',2,False,None),('day',1,False,6),('ts',2,False,10),('f',5,True,None)]
     rows=[[1,None,3,4,5,None,7,8,9],['alpha','a long string over twelve bytes',None,'','alpha','beta','gamma','delta','z'],[True,None,False,True,False,True,None,False,True],list(range(100,109)),list(range(10957,10966)),[946684800000000+i for i in range(9)],[1.25,None,-2.,3.,4.,5.,6.,7.,8.]]
