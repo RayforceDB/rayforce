@@ -9,6 +9,7 @@
 #include "parquet.h"
 #include "core/platform.h"
 #include "core/pool.h"
+#include "core/crc32.h"
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
@@ -40,6 +41,12 @@
 #define PQ_MAX_PART_ROWS 1048576
 #define PQ_MAX_COLS 4096
 #define PQ_MAX_PAGE (64u * 1024u * 1024u)
+/* Decoded STR batches: the reader sizes each row group's batches to keep a
+ * column's string pool near PQ_POOL_TARGET (pq_group_batch); PQ_POOL_MAX is
+ * the pool's real capacity (32-bit offsets), the backstop when a group's
+ * metadata underestimates its strings. */
+#define PQ_POOL_TARGET (64u * 1024u * 1024u)
+#define PQ_POOL_MAX    ((uint64_t)UINT32_MAX)
 #define PQ_MAX_FOOTER (64u * 1024u * 1024u)
 #define PQ_EPOCH_DAYS 10957
 #define PQ_EPOCH_NS INT64_C(946684800000000000)
@@ -266,6 +273,7 @@ typedef struct {
     uint64_t bool_bit;
     int codec, encoding;
     bool have_dict, optional;
+    bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
 } pq_column;
 /* A cursor is used by one decoder at a time. Flush each PLAIN batch before
  * advancing pages, so dictionary decoding may reuse the same heap scratch. */
@@ -285,6 +293,7 @@ struct ray_parquet {
     ray_t* text_pattern;
     int64_t text_pos;
     int64_t ncols, ngroups, nselected, noutput, rows, group, group_left, batch_rows;
+    int64_t group_batch;  /* batch_rows, capped for this group's STR columns */
     int64_t filter_pos, filter_lo, filter_hi, skipped;
     pq_interval* excluded;
     int64_t nexcluded, exclude_pos, group_rows, bloom_skipped, parallel_batches;
@@ -622,12 +631,46 @@ static bool pq_group_columns(ray_parquet_t* r, int64_t g, pq_span* cols, int64_t
     }
     return c.p == c.end;
 }
+/* Rows per batch for row group g: batch_rows, lowered so each selected STR
+ * column's pool stays near PQ_POOL_TARGET.  Bytes per row are estimated
+ * from the chunk's uncompressed size, which bounds PLAIN strings (each
+ * value's bytes are in it) — a 4 MB file of 11 KB documents decodes 86 MB
+ * of strings, and one fixed 65,536-row batch would hold all of it.  A
+ * dictionary chunk can expand beyond its size (repeated long entries);
+ * PQ_POOL_MAX still bounds that.  Deterministic from metadata, so the
+ * partitioned writer can count partitions with it before decoding. */
+static int64_t pq_group_batch(ray_parquet_t* r, int64_t g) {
+    int64_t batch = r->batch_rows, rows;
+    pq_span* cols = ray_alloc_raw((size_t)r->ncols*sizeof(*cols));
+    if (!cols) return batch;
+    if (pq_group_columns(r,g,cols,&rows,NULL)) {
+        for (int64_t i = 0; i < r->nselected; i++) {
+            const pq_schema* sc = &r->schema[r->selected[i]];
+            if (sc->physical != 6 || sc->type != RAY_STR || sc->import_domain) continue;
+            pq_span mf[17];
+            if (!pq_fields(cols[r->selected[i]],mf,17)) continue;
+            int64_t values = pq_get(mf[5],-1), bytes = pq_get(mf[6],-1);
+            if (values <= 0 || bytes <= 0) continue;
+            int64_t per_row = bytes/values + 1;
+            int64_t cap = (int64_t)PQ_POOL_TARGET/per_row;
+            if (cap < 1) cap = 1;
+            if (cap < batch) batch = cap;
+        }
+    }
+    ray_free_raw(cols);
+    return batch;
+}
 static const char* pq_start_group(ray_parquet_t* r) {
     pq_span* cols = ray_alloc_raw((size_t)r->ncols*sizeof(*cols));
     if (!cols) return "row group allocation failed";
     pq_span filter_chunk = {0};
     ray_free_raw(r->excluded); r->excluded = NULL; r->nexcluded = r->exclude_pos = 0;
     if (!pq_group_columns(r,r->group,cols,&r->group_left,r->filter_pos >= 0 ? &filter_chunk : NULL)) { ray_free_raw(cols); return "invalid column chunk metadata"; }
+    /* A zero-row group has nothing to decode.  Writers still emit its
+     * chunks, with a dictionary page and data_page_offset 0, which the
+     * chunk checks below would reject. */
+    if (r->group_left == 0) { ray_free_raw(cols); return NULL; }
+    r->group_batch = pq_group_batch(r,r->group);
     /* Bounds and Bloom filters describe non-null values. A WHERE accepting
      * nulls must decode these groups/pages, including native null sentinels
      * in required columns. Explicit read ranges still exclude nulls. */
@@ -727,19 +770,14 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
             }
         }
         if (f[4].type) {
-            /* Parquet uses ordinary CRC32, over the compressed page body. */
             int64_t expected;
             if (!pq_num(f[4],&expected)) return "invalid page checksum";
-            uint32_t crc = UINT32_MAX;
-            for (int64_t i = 0; i < size; i++) {
-                crc ^= payload[i];
-                for (int bit = 0; bit < 8; bit++) crc = (crc>>1) ^ (UINT32_C(0xedb88320) & (uint32_t)-(int32_t)(crc&1));
-            }
-            if (~crc != (uint32_t)expected) return "page checksum mismatch";
+            /* Ordinary CRC-32 over the compressed page body. */
+            if (ray_crc32(0,payload,(size_t)size) != (uint32_t)expected) return "page checksum mismatch";
         }
         if (kind == 1) continue; /* legacy index page */
         const uint8_t* data = NULL; pq_span h[9]; int64_t count, encoding;
-        c->bool_bit = 0; c->page_nulls = 0; c->expected_nulls = -1;
+        c->bool_bit = 0; c->bool_rle = false; c->page_nulls = 0; c->expected_nulls = -1;
         if (kind == 2) {
             if (!pq_fields(f[7],h,9) || !pq_num(h[1],&count) ||
                 (pq_get(h[2],-1) != 0 && pq_get(h[2],-1) != 2) ||
@@ -770,7 +808,17 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
             c->expected_nulls = nulls;
         } else return "unsupported page type";
         if (count <= 0 || count > c->chunk_left) return "invalid page row count";
-        if (encoding != 0 && encoding != 2 && encoding != 8) return "unsupported value encoding (supported: plain, dictionary)";
+        if (encoding == 3 && s->physical == 0) {
+            /* RLE booleans (the v2 default of common writers): a 4-byte
+             * little-endian length, then a bit-width-1 hybrid stream. */
+            const uint8_t* lp; const uint8_t* body;
+            if (!pq_take(&c->values,4,&lp) || !pq_take(&c->values,pq_u32(lp),&body) ||
+                c->values.p != c->values.end) return "invalid RLE boolean data";
+            c->ids = (pq_rle){.c={body,c->values.end,false},.width=1};
+            c->bool_rle = true; c->encoding = 0; c->page_left = count;
+            return NULL;
+        }
+        if (encoding != 0 && encoding != 2 && encoding != 8) return "unsupported value encoding (supported: plain, dictionary, RLE booleans)";
         c->encoding = (int)encoding; c->page_left = count;
         if (encoding) {
             if (!c->have_dict || s->physical == 0) return "missing or invalid dictionary";
@@ -939,7 +987,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             const uint8_t* p = s->physical == 6 ? c->strings[id].p :
                 c->dict+(size_t)id*((s->physical == 1 || s->physical == 4) ? 4 : 8);
             uint32_t len = s->physical == 6 ? c->strings[id].n : 0;
-            if (len > PQ_MAX_PAGE || (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_MAX_PAGE) ||
+            if (len > PQ_MAX_PAGE || (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) ||
                 !pq_put_value(&v,i,s,p,len)) return "value conversion or allocation failed";
             *out = v;
             /* Convert once, fill native values. STR descriptors may safely
@@ -981,6 +1029,10 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                     if (!pq_rle_next(&c->ids,&id) || id >= c->dict_count) return "dictionary index out of range";
                     if (s->physical == 6) { p = c->strings[id].p; len = c->strings[id].n; }
                     else p = c->dict+(size_t)id*((s->physical == 1 || s->physical == 4) ? 4 : 8);
+                } else if (c->bool_rle) {
+                    uint32_t bit;
+                    if (!pq_rle_next(&c->ids,&bit)) return "truncated RLE boolean data";
+                    b = (uint8_t)bit; p = &b;
                 } else if (s->physical == 0) {
                     if (c->bool_bit/8 >= (uint64_t)(c->values.end-c->values.p)) return "truncated boolean data";
                     b = (c->values.p[c->bool_bit/8]>>(c->bool_bit&7))&1; c->bool_bit++; p = &b;
@@ -990,7 +1042,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                     len = pq_u32(lp);
                     if (!pq_take(&c->values,len,&p)) return "truncated string data";
                 } else if (!pq_take(&c->values,(s->physical == 1 || s->physical == 4) ? 4 : 8,&p)) return "truncated numeric data";
-                if (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_MAX_PAGE) return "batch string pool exceeds 64 MiB";
+                if (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
                 if (len > PQ_MAX_PAGE || !pq_put_value(&v,i,s,p,len)) return "value conversion or allocation failed";
                 *out = v;
             }
@@ -1000,6 +1052,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            else if (c->bool_rle) { if (!pq_rle_done(&c->ids)) return "excess RLE boolean data"; }
             else if (s->physical == 0) { if ((c->bool_bit+7)/8 != (uint64_t)(c->values.end-c->values.p)) return "excess boolean data"; }
             else if (c->values.p != c->values.end) return "excess plain data";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
@@ -1089,7 +1142,8 @@ ray_t* ray_parquet_next(ray_parquet_t* r) {
             if (err) { r->failed = true; return pq_error(err); }
         }
         if (!r->group_left && r->emitted) return NULL;
-        rows = r->group_left < r->batch_rows ? r->group_left : r->batch_rows;
+        int64_t cap = r->group_batch > 0 ? r->group_batch : r->batch_rows;
+        rows = r->group_left < cap ? r->group_left : cap;
         if (r->group_left && r->exclude_pos < r->nexcluded) {
             pq_interval range = r->excluded[r->exclude_pos];
             int64_t at = r->group_rows-r->group_left;
@@ -1538,7 +1592,7 @@ static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* ta
         int64_t rows = pq_get(fields[3],-1);
         if (rows < 0) { err = pq_error("invalid row group row count"); goto done; }
         offsets[g] = *parts;
-        int64_t n = rows ? 1+(rows-1)/r->batch_rows : 1;
+        int64_t n = rows ? 1+(rows-1)/pq_group_batch(r,g) : 1;
         if (*parts > INT64_MAX-n) { err = pq_error("too many partitions"); goto done; }
         *parts += n;
     }
