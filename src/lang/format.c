@@ -51,6 +51,7 @@ typedef struct {
                          * only for modes that never read back what they
                          * appended (mode 2) */
     bool    io_err;     /* err was a failed write to sink */
+    bool    flushed;    /* some output already reached sink */
 } fmt_buf_t;
 
 #define FMT_SINK_FLUSH ((int64_t)1 << 20)
@@ -105,6 +106,7 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
             return;
         }
         b->len = 0;
+        b->flushed = true;
     }
     int64_t need = (int64_t)b->len + extra;
     if (need <= (int64_t)b->cap) return;
@@ -818,7 +820,7 @@ static void fmt_stream_cell(fmt_buf_t* tmp, ray_t* col, int64_t ri,
     tmp->len = 0;
     fmt_raw_elem(tmp, col, ri);
     *s = tmp->buf;
-    *len = tmp->len < FMT_CELL_BUF_SIZE - 1 ? tmp->len : FMT_CELL_BUF_SIZE - 1;
+    *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
 }
 
 static void fmt_stream_rule(fmt_buf_t* b, const int32_t* w, int64_t n,
@@ -1461,6 +1463,13 @@ ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
     if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
         b.io_err = b.err = true;
     ray_err_t e = !b.err ? RAY_OK : b.io_err ? RAY_ERR_IO : RAY_ERR_OOM;
+    /* Out of memory after part of the output was written: end that part
+     * with a marker, and report it as written so the caller does not print
+     * the value a second time. */
+    if (e == RAY_ERR_OOM && b.flushed) {
+        fputs("\nerror: out of memory\n", fp);
+        e = RAY_ERR_IO;
+    }
     fmt_destroy(&b);
     return e;
 }

@@ -7879,6 +7879,46 @@ static test_result_t test_builtin_show_table_streamed(void) {
     PASS();
 }
 
+/* Table cells are written whole.  The REPL's fixed 64-byte cell grid cut
+ * them at byte 63, losing the tail and the closing quote, and a cut inside
+ * a multi-byte character left invalid UTF-8 and a misaligned border. */
+static test_result_t test_builtin_show_table_long_cells(void) {
+    ray_t* t = ray_eval_str(
+        "(table [s u] (list"
+        " (list \"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-tail-end-marker\" \"x\")"
+        " (list \"a\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9z\" \"y\")))");
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "XYZ-tail-end-marker\" "));
+    /* 36 two-byte characters: the cut at byte 63 fell inside one */
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\xc3\xa9\xc3\xa9z\" "));
+    /* every line of the table has the same display width */
+    int32_t width = -1;
+    for (const char* line = buf; *line; ) {
+        const char* end = strchr(line, '\n');
+        if (!end) end = line + strlen(line);
+        int32_t w = 0;
+        for (const char* c = line; c < end; c++) w += ((unsigned char)*c & 0xC0) != 0x80;
+        if (end > line) {
+            if (width < 0) width = w;
+            TEST_ASSERT_EQ_I(w, width);
+        }
+        line = *end ? end + 1 : end;
+    }
+    ray_free(text);
+    ray_release(t);
+    PASS();
+}
+
 /* show prints any value in full: a vector far past the REPL width limit
  * comes out whole, streamed through the output buffer. */
 static test_result_t test_builtin_show_vector_full(void) {
@@ -9753,6 +9793,7 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/show",        test_builtin_show_fn,        lang_setup, lang_teardown },
     { "lang/builtin/show_table_unlimited", test_builtin_show_table_unlimited, lang_setup, lang_teardown },
     { "lang/builtin/show_table_streamed", test_builtin_show_table_streamed, lang_setup, lang_teardown },
+    { "lang/builtin/show_table_long_cells", test_builtin_show_table_long_cells, lang_setup, lang_teardown },
     { "lang/builtin/show_vector_full", test_builtin_show_vector_full, lang_setup, lang_teardown },
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
