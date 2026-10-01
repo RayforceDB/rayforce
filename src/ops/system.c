@@ -197,11 +197,6 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     ray_err_t err = ray_splay_save(tbl, dir, sym_path);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
-    /* Build + persist accelerator indexes (STR dictionaries, numeric chunk-zone
-     * min/max) inline at each column file's tail so mmap loads get the fast
-     * paths — same pass .csv.splayed runs. */
-    ray_splay_build_indexes(dir, tbl);
-
     ray_retain(tbl);
     return tbl;
 }

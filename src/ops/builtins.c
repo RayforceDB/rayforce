@@ -686,19 +686,8 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
     if (!sym) return ray_error("io", NULL);
 
-    /* The streaming writer emits raw columns; append chunk-zone indexes to the
-     * just-written files, then reload so the returned table carries them
-     * (mmap'd in place).  Conversion is the ONLY place a CSV load decides an
-     * index: `.csv.read` returns an index-free in-memory table, and callers
-     * that want one on it ask explicitly (.idx.hash / the attrs verbs).
-     * Without this pass, a converted store would have no block-skip at all. */
-    ray_t* tbl = ray_read_splayed(dir, sym);
-    if (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
-        ray_splay_build_indexes(dir, tbl);
-        ray_release(tbl);
-        tbl = ray_read_splayed(dir, sym);
-    }
-    return tbl;
+    /* The writer builds indexes before publishing its generation. */
+    return ray_read_splayed(dir, sym);
 }
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
