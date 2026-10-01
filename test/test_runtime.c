@@ -1239,6 +1239,30 @@ static test_result_t test_syscov_hclose_type_error(void) {
     PASS();
 }
 
+/* .csv.parted into a new root whose <root>.csv-partial is left from an
+ * earlier failed import: the error names the directory to remove. */
+static test_result_t test_syscov_csv_parted_stale_staging(void) {
+    char root[128], staging[160], csv[160], src[512];
+    snprintf(root, sizeof(root), "/tmp/rfcov-pstage-%d", (int)getpid());
+    snprintf(staging, sizeof(staging), "%s.csv-partial", root);
+    snprintf(csv, sizeof(csv), "%s.csv", root);
+    FILE* f = fopen(csv, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b\n1,x\n", f);
+    fclose(f);
+    TEST_ASSERT_EQ_I(mkdir(staging, 0755), 0);
+    snprintf(src, sizeof(src), "(.csv.parted \"%s\" \"%s\" 'tbl)", csv, root);
+    ray_t* e = ray_eval_str(src);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "io");
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_TRUE(msg && strstr(msg, staging) && strstr(msg, "remove it to retry"));
+    ray_error_free(e);
+    rmdir(staging);
+    unlink(csv);
+    PASS();
+}
+
 /* hsend type errors (ray_hsend_fn) */
 static test_result_t test_syscov_hsend_type_errors(void) {
     /* handle not integer */
@@ -1334,6 +1358,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_hopen_with_credentials", test_syscov_hopen_with_credentials, sys_setup, sys_teardown },
     { "runtime/syscov_hclose_type_error",    test_syscov_hclose_type_error,    sys_setup, sys_teardown },
     { "runtime/syscov_hsend_type_errors",    test_syscov_hsend_type_errors,    sys_setup, sys_teardown },
+    { "runtime/syscov_csv_parted_stale_staging", test_syscov_csv_parted_stale_staging, sys_setup, sys_teardown },
     { "runtime/syscov_splayed_set_sym_path", test_syscov_splayed_set_with_sym_path, sys_setup, sys_teardown },
     { "runtime/syscov_splayed_get_sym_path", test_syscov_splayed_get_with_sym_path, sys_setup, sys_teardown },
 

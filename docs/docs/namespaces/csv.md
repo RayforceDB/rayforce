@@ -85,7 +85,7 @@ Signatures (with optional rows-per-part):
 - `(.csv.parted [names] [types] "src.csv" "db_root" 'tbl_name)`
 - `(.csv.parted [...]types "src.csv" rows_per_part "db_root" 'tbl_name)` — pass a positive integer just before the db-root to override the default partition size.
 
-Streams the CSV into `db_root/<partition-number>/tbl_name/`. Returns the parted table loaded back from disk. A new root is staged at `<db_root>.csv-partial` and published after the shared dictionary flush; failed staging is retained and rejected on retry. Existing roots retain per-partition update behavior. Bulk writes require an external file and directory sync for durability.
+Streams the CSV into `db_root/<partition-number>/tbl_name/`. Returns the parted table loaded back from disk. A new root is staged at `<db_root>.csv-partial` and published after the shared dictionary flush; failed staging is retained for diagnosis, and a retry into the same root fails with an `io` error naming the directory to remove. An unreadable source fails before anything is staged. Existing roots retain per-partition update behavior. Bulk writes require an external file and directory sync for durability.
 
 Constraints on `tbl_name`: must not start with `.`, must not contain `/` or `\\` or `..`.
 

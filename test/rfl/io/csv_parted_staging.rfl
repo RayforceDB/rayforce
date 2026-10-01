@@ -1,0 +1,23 @@
+;; csv_parted_staging.rfl — `.csv.parted` into a NEW root stages in
+;; `<root>.csv-partial` and keeps it after a failure, for diagnosis.
+;; A mistyped source path must not leave that directory behind (it would
+;; block every later import into the root), and a staging directory that
+;; is left behind must be named in the error, not reported as a bare `io`.
+
+(.sys.exec "rm -rf rf_test_pstage rf_test_pstage.csv-partial rf_test_pstage2 rf_test_pstage2.csv-partial") -- 0
+(.sys.exec "printf 'a,b\\n1,x\\n2,y\\n' > rf_test_pstage.csv") -- 0
+
+;; unreadable source: fails, and claims nothing
+(.csv.parted "rf_test_pstage_missing.csv" "rf_test_pstage" 'tbl) !- io
+(.sys.exec "test -e rf_test_pstage.csv-partial") -- 1
+;; ...so the next import into the same root succeeds
+(count (.csv.parted "rf_test_pstage.csv" "rf_test_pstage" 'tbl)) -- 2
+
+;; a leftover staging directory still blocks the root (the C test
+;; runtime/syscov_csv_parted_stale_staging checks that the error names it)
+(.sys.exec "mkdir rf_test_pstage2.csv-partial") -- 0
+(.csv.parted "rf_test_pstage.csv" "rf_test_pstage2" 'tbl) !- io
+(.sys.exec "rm -rf rf_test_pstage2.csv-partial") -- 0
+(count (.csv.parted "rf_test_pstage.csv" "rf_test_pstage2/" 'tbl)) -- 2
+
+(.sys.exec "rm -rf rf_test_pstage rf_test_pstage2 rf_test_pstage*.csv") -- 0

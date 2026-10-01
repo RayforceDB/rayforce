@@ -74,6 +74,10 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
 ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
                                const int8_t* col_types, int32_t n_types,
                                const int64_t* col_names, int32_t n_names);
+/* `root` without trailing separators, and the `<root>.csv-partial` staging
+ * directory a new parted root is imported into. */
+ray_err_t ray_csv_parted_paths(const char* root, char* dest, size_t dest_size,
+                               char* staging, size_t staging_size);
 ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool header,
                                          const int8_t* col_types, int32_t n_types,
                                          const int64_t* col_names, int32_t n_names,

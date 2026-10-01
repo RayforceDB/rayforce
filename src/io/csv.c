@@ -4208,6 +4208,20 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     return err;
 }
 
+/* `root` without trailing separators, and the staging directory a new
+ * root is imported into.  Shared with the builtin so its errors can name
+ * the directory.  Returns RAY_OK or RAY_ERR_RANGE (path too long). */
+ray_err_t ray_csv_parted_paths(const char* root, char* dest, size_t dest_size,
+                               char* staging, size_t staging_size) {
+    size_t len = strlen(root);
+    while (len > 1 && (root[len-1] == '/' || root[len-1] == '\\')) len--;
+    if (len >= dest_size) return RAY_ERR_RANGE;
+    memcpy(dest,root,len); dest[len] = 0;
+    int n = snprintf(staging,staging_size,"%s.csv-partial",dest);
+    if (n < 0 || (size_t)n >= staging_size) return RAY_ERR_RANGE;
+    return RAY_OK;
+}
+
 ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool header,
                                          const int8_t* col_types, int32_t n_types,
                                          const int64_t* col_names, int32_t n_names,
@@ -4218,15 +4232,18 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
         return RAY_ERR_DOMAIN;
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     char dest[1024], staging[1100];
-    size_t len = strlen(root);
-    while (len > 1 && (root[len-1] == '/' || root[len-1] == '\\')) len--;
-    if (len >= sizeof(dest)) return RAY_ERR_RANGE;
-    memcpy(dest,root,len); dest[len] = 0;
+    ray_err_t perr = ray_csv_parted_paths(root,dest,sizeof(dest),staging,sizeof(staging));
+    if (perr != RAY_OK) return perr;
     struct stat st;
     if (stat(dest,&st) == 0)
         return csv_save_parted_impl(path,delimiter,header,col_types,n_types,
                                    col_names,n_names,dest,table_name,rows_per_part,false);
-    snprintf(staging,sizeof(staging),"%s.csv-partial",dest);
+    /* Fail on an unreadable input before claiming the staging directory:
+     * failed staging is retained and blocks the root, which a mistyped
+     * source path must not do. */
+    FILE* in = fopen(path,"rb");
+    if (!in) return RAY_ERR_IO;
+    fclose(in);
     /* Keep mkdir-p's parent creation, but claim the staging root exclusively.
      * A failed import remains available for diagnosis and is never reused. */
     char* slash = strrchr(dest,'/');
