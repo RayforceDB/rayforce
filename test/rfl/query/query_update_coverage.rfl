@@ -628,3 +628,10 @@
 (at (update {k: (if (> (count x) 1) (first t) (last t)) from: TGS by: g}) 'k) -- ["a" "a" "a" "dd" "e"]
 (at (update {t: "zz" from: TGS by: g}) 't) -- ["zz" "zz" "zz" "zz" "zz"]
 (at (update {k: (first t) from: TGS by: g}) 'k) -- ["a" "a" "a" "dd" "e"]
+;; The per-group sub-table shares the STR column's string pool: without it
+;; every string past the inline size read as "" inside the group, and a
+;; string op on it aborted on the missing pool.
+(set TLS (table [x g t] (list (til 5) [0 0 1 1 2] (list "first-long-pooled-string-aaaa" "second-long-pooled-string-bbb" "short" "x" "third-long-pooled-string-ccc"))))
+(at (update {t: (first t) from: TLS by: g}) 't) -- ["first-long-pooled-string-aaaa" "first-long-pooled-string-aaaa" "short" "short" "third-long-pooled-string-ccc"]
+(at (update {t: t from: TLS by: g}) 't) -- (at TLS 't)
+(at (update {k: (upper t) from: TLS by: g}) 'k) -- (upper (at TLS 't))

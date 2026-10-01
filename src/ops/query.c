@@ -14608,6 +14608,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                      * so preserve it when any gathered row is null. */
                     if (copied_null)
                         sub_col->attrs |= RAY_ATTR_HAS_NULLS;
+                    /* STR descriptors of pooled strings point into the
+                     * source's pool: share it, or every string past the
+                     * inline size reads as "" inside the group. */
+                    if (ct == RAY_STR)
+                        col_propagate_str_pool(sub_col, full_col);
                     sub_tbl = ray_table_add_col(sub_tbl, cn, sub_col);
                     ray_release(sub_col);
                     if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
