@@ -1491,6 +1491,12 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
                 total += sl;
             } else if (t == -RAY_STR) {
                 total += ray_str_len(args[a]);
+            } else if (t == -RAY_SYM) {
+                /* A symbol literal or a scalar such as (first s): RAY_IS_SYM
+                 * matches SYM vectors only, so its text was left out and
+                 * (concat 'ab 'cd) came back null. */
+                ray_t* st = ray_sym_str(args[a]->i64);
+                if (st) total += ray_str_len(st);
             }
         }
         char sbuf[8192];
@@ -1525,6 +1531,11 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
             } else if (t == -RAY_STR) {
                 const char* sp = ray_str_ptr(args[a]);
                 size_t sl = ray_str_len(args[a]);
+                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
+            } else if (t == -RAY_SYM) {
+                ray_t* st = ray_sym_str(args[a]->i64);
+                const char* sp = st ? ray_str_ptr(st) : NULL;
+                size_t sl = st ? ray_str_len(st) : 0;
                 if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
             }
         }
