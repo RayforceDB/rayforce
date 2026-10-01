@@ -847,7 +847,13 @@ static bool pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p
             (s->converted == 16 && (x < INT16_MIN || x > INT16_MAX))) return false;
         if (s->type == RAY_DATE && __builtin_sub_overflow(x,PQ_EPOCH_DAYS,&x)) return false;
         if (s->type == RAY_TIMESTAMP &&
-            (__builtin_sub_overflow(x,PQ_EPOCH_NS/s->scale,&x) || __builtin_mul_overflow(x,s->scale,&x))) return false;
+            (__builtin_sub_overflow(x,PQ_EPOCH_NS/s->scale,&x) || __builtin_mul_overflow(x,s->scale,&x))) {
+            /* Outside the native nanosecond range (~1677-2262), e.g. a
+             * 9999-12-31 "end of time" sentinel at ms precision.  Native
+             * null semantics apply unless strict mode rejects it. */
+            if (s->strict) return false;
+            x = NULL_I64;
+        }
         if (s->type == RAY_I16) {
             if (x < INT16_MIN || x > INT16_MAX) return false;
             ((int16_t*)ray_data(v))[row] = (int16_t)x;

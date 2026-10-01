@@ -46,3 +46,10 @@
 (.sys.exec "rm -rf rf_test_pq_slash && mkdir rf_test_pq_slash.parquet-partial") -- 0
 (.parquet.splayed "test/data/parquet/empty-group.parquet" "rf_test_pq_slash") !- parquet
 (.sys.exec "rm -rf rf_test_pq_slash rf_test_pq_slash.parquet-partial") -- 0
+
+;; ms timestamps past the nanosecond range (a 9999-12-31 sentinel) read
+;; as null under native null semantics; strict mode rejects them
+(set tr (.parquet.read "test/data/parquet/timestamp-range.parquet"))
+(count tr) -- 3
+(count (select {from: tr where: (nil? ts)})) -- 1
+(.parquet.read {strict: true} "test/data/parquet/timestamp-range.parquet") !- parquet

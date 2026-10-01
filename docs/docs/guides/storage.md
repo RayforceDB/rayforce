@@ -341,7 +341,9 @@ table operations.
 - Existing Rayforce null semantics apply: empty strings, NaNs, and native
   integer null sentinels are represented as nulls. Their original distinction
   from Parquet nulls is not preserved. This is not a lossless interchange path
-  for those values. Enable `strict: true` to reject these collisions instead.
+  for those values. Timestamps outside the native nanosecond range (about
+  1677 to 2262, e.g. a 9999-12-31 sentinel) also read as null. Enable
+  `strict: true` to reject these collisions and out-of-range values instead.
 - At most 4,096 columns, a 64 MiB footer, and 64 MiB per compressed or
   decompressed page. Batches of long strings are made smaller: each row
   group's batch size is lowered so a STR column's decoded string pool stays

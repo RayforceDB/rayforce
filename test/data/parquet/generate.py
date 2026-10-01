@@ -217,6 +217,9 @@ if __name__ == '__main__':
     bools=[True,True,True,None,False,True,False,False,True,None,True,False,True,True,False,False,True,False,True,True]
     for v2 in (False,True):
         write(root/f'bool-rle-v{2 if v2 else 1}.parquet',[('b',0,True,None)],[[bools],[bools[::-1]]],v2=v2,rle_bools=True)
+    # TIMESTAMP_MILLIS (converted 9) past the nanosecond range: 9999-12-31.
+    write(root/'timestamp-range.parquet',[('ts',2,False,9)],
+          [[[946684800000,253402214400000,946684801000]]],dictionary=False)
     write(root/'empty-group.parquet',[('x',2,True,None),('s',6,False,0)],
           [[[1,None,3],['one','two','three']],[[],[]],[[4,5],['four','five']]])
     write(root/'sentinels.parquet',[('i',1,False,None),('l',2,False,None),('f',5,False,None),('s',6,False,0)],[[[-2**31,2],[-2**63,3],[float('nan'),1.],['','x']]],dictionary=False)
