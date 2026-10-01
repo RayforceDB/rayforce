@@ -327,7 +327,12 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
     /* args are pre-materialized by eval — see ray_println_fn. */
     for (int64_t i = 0; i < n; i++) {
         if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(stdout, "error"); continue; }
-        ray_t* formatted = ray_fmt(args[i], 2);
+        /* show prints the whole value, streamed; the display limits belong
+         * to the REPL and to print. */
+        ray_err_t e = ray_fmt_write(stdout, args[i]);
+        if (e == RAY_OK || e == RAY_ERR_IO) continue;   /* written, or stdout failed */
+        /* out of memory: fall back to the bounded REPL display below */
+        ray_t* formatted = ray_fmt(args[i], 1);
         if (formatted && !RAY_IS_ERR(formatted)) {
             const char* sp = ray_str_ptr(formatted);
             size_t sl = ray_str_len(formatted);

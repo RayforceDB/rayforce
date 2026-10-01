@@ -7778,6 +7778,46 @@ static test_result_t test_builtin_show_fn(void) {
     PASS();
 }
 
+/* Run (show x) with stdout redirected to a temporary file.  Returns show's
+ * result; *text_out receives the printed bytes in a ray_alloc'd block the
+ * caller frees (NULL on failure). */
+static ray_t* show_capture(ray_t* x, ray_t** text_out) {
+    *text_out = NULL;
+    FILE* tmp = tmpfile();
+    if (!tmp) return NULL;
+    fflush(stdout);
+    int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+    ray_t* args[1] = { x };
+    ray_t* r = ray_show_fn(args, 1);
+    fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+    long size = ftell(tmp);
+    if (size < 0) { fclose(tmp); return r; }
+    ray_t* blk = ray_alloc((size_t)size + 1);
+    if (blk) {
+        char* buf = (char*)ray_data(blk);
+        rewind(tmp);
+        size_t n = fread(buf, 1, (size_t)size, tmp);
+        buf[n] = '\0';
+        *text_out = blk;
+    }
+    fclose(tmp);
+    return r;
+}
+
+/* A plain scan: under ASan each strstr call re-measures the whole haystack,
+ * which makes a strstr loop quadratic on megabytes of output. */
+static int64_t count_substr(const char* s, const char* needle) {
+    int64_t n = 0;
+    size_t nl = strlen(needle), sl = strlen(s);
+    for (size_t i = 0; i + nl <= sl; ) {
+        if (memcmp(s + i, needle, nl) == 0) { n++; i += nl; } else i++;
+    }
+    return n;
+}
+
 /* (show T) prints every column and row of a table: only the REPL display
  * truncates to FMT_TABLE_MAX_WIDTH x FMT_TABLE_MAX_HEIGHT. */
 static test_result_t test_builtin_show_table_unlimited(void) {
@@ -7788,31 +7828,77 @@ static test_result_t test_builtin_show_table_unlimited(void) {
     TEST_ASSERT_NOT_NULL(t);
     TEST_ASSERT_FALSE(RAY_IS_ERR(t));
 
-    char path[] = "/tmp/rfl_show_unlimited_XXXXXX";
-    int fd = mkstemp(path);
-    TEST_ASSERT_TRUE(fd >= 0);
-    fflush(stdout);
-    int saved = dup(fileno(stdout));
-    dup2(fd, fileno(stdout));
-    ray_t* args[1] = { t };
-    ray_t* r = ray_show_fn(args, 1);
-    fflush(stdout);
-    dup2(saved, fileno(stdout));
-    close(saved);
-
-    char buf[16384];
-    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
-    close(fd);
-    unlink(path);
-    buf[n > 0 ? n : 0] = '\0';
-
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
     TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
     TEST_ASSERT_NOT_NULL(strstr(buf, "25 rows (25 shown) 13 columns (13 shown)"));
-    int64_t typed = 0;   /* one "I64" type cell per printed column */
-    for (const char* q = buf; (q = strstr(q, "I64")) != NULL; q += 3) typed++;
-    TEST_ASSERT_EQ_I(typed, 13);
+    TEST_ASSERT_EQ_I(count_substr(buf, "I64"), 13);   /* one type cell per column */
     TEST_ASSERT_NOT_NULL(strstr(buf, "│ 24 "));
+    ray_free(text);
     ray_release(t);
+    PASS();
+}
+
+/* A table far beyond the REPL limits is written in full, row by row, and its
+ * rows line up with the header (widths come from every cell, not a sample). */
+static test_result_t test_builtin_show_table_streamed(void) {
+    enum { N = 50000 };
+    ray_t* k = ray_vec_new(RAY_I64, N);
+    ray_t* v = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    k->len = N; v->len = N;
+    for (int64_t i = 0; i < N; i++) {
+        ((int64_t*)ray_data(k))[i] = i;
+        ((int64_t*)ray_data(v))[i] = i * 1000000;
+    }
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_release(k);
+    ray_release(v);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "50000 rows (50000 shown) 2 columns (2 shown)"));
+    /* the last column is widened to fit the footer, so match row prefixes */
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\n│ 0     │ 0 "));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\n│ 25000 │ 25000000000 "));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\n│ 49999 │ 49999000000 "));
+    /* 50000 data rows + name row + type row + footer row */
+    TEST_ASSERT_EQ_I(count_substr(buf, "\n│"), 50003);
+    ray_free(text);
+    ray_release(t);
+    PASS();
+}
+
+/* show prints any value in full: a vector far past the REPL width limit
+ * comes out whole, streamed through the output buffer. */
+static test_result_t test_builtin_show_vector_full(void) {
+    enum { N = 200000 };
+    ray_t* v = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = N;
+    for (int64_t i = 0; i < N; i++) ((int64_t*)ray_data(v))[i] = i;
+    ray_t* text = NULL;
+    ray_t* r = show_capture(v, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    size_t n = strlen(buf);
+    TEST_ASSERT_TRUE(strncmp(buf, "[0 1 2 3 ", 9) == 0);
+    TEST_ASSERT_TRUE(n > 9 && strcmp(buf + n - 9, " 199999]\n") == 0);
+    TEST_ASSERT_EQ_I(count_substr(buf, " "), 199999);
+    TEST_ASSERT_NULL(strstr(buf, ".."));
+    ray_free(text);
+    ray_release(v);
     PASS();
 }
 
@@ -9666,6 +9752,8 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/print",       test_builtin_print_fn,       lang_setup, lang_teardown },
     { "lang/builtin/show",        test_builtin_show_fn,        lang_setup, lang_teardown },
     { "lang/builtin/show_table_unlimited", test_builtin_show_table_unlimited, lang_setup, lang_teardown },
+    { "lang/builtin/show_table_streamed", test_builtin_show_table_streamed, lang_setup, lang_teardown },
+    { "lang/builtin/show_vector_full", test_builtin_show_vector_full, lang_setup, lang_teardown },
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
     { "lang/builtin/read_bytes",  test_builtin_read_bytes_fn,  lang_setup, lang_teardown },
