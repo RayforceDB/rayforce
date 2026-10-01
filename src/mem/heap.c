@@ -1200,8 +1200,8 @@ static void ray_detach_owned_refs(ray_t* v) {
  * anonymous mmap was refused.  Mirrors heap_add_pool's swap fallback but at the
  * exact size — a direct block needs no pool alignment (it is located by its
  * stored map_size, not by pool-base masking), so a plain mmap suffices.
- * Returns the mapped base and the fd/path to close+unlink at free; NULL on
- * failure. */
+ * Returns the mapped base and the fd to close at free (*out_path is NULL: the
+ * file is already unlinked); NULL on failure. */
 static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
                                   int* out_fd, char** out_path) {
 #if !RAY_HEAP_FILE_SPILL
@@ -1234,8 +1234,14 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
     /* Count as committed working set — a RAM substitute with preallocated
      * blocks (matches heap_add_pool's swap-pool accounting). */
     ray_sys_track_add((int64_t)map_size);
+    /* Unlink now that the mapping holds the inode, as heap_add_pool does:
+     * the kernel reclaims the blocks on munmap or at process exit.  Left
+     * until ray_free, a process that exited or was killed holding the block
+     * left the whole file on disk. */
+    unlink(path);
+    ray_sys_free(path);
     *out_fd   = fd;
-    *out_path = path;
+    *out_path = NULL;
     return mapped;
 #endif /* RAY_HEAP_FILE_SPILL */
 }
