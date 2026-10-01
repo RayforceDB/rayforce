@@ -28,6 +28,7 @@
 #include "ops/rowsel.h"
 #include "table/domain.h"   /* raw vocabulary snapshot for if_sym_side_t */
 #include "core/pool.h"
+#include "lang/format.h"    /* ray_type_name (error context) */
 
 /* Resolved string atom (borrowed) of a SYM-scalar broadcast input
  * (atom -RAY_SYM, or a 1-elem RAY_SYM_W{8,16,32,64} vec used as
@@ -1466,7 +1467,24 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
+static bool if_type_is_text(int8_t t) { return t == RAY_STR || t == RAY_SYM; }
+
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
+    /* A text result with a non-text branch has no column type: the fills
+     * read the numbers as string descriptors or symbol ids and returned
+     * garbage, e.g. `(if (< x 3) s x)` with s SYM and x I64. */
+    if (if_type_is_text(op->out_type)) {
+        ray_op_t* then_op = op_child(g, op, 1);
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        ray_op_t* else_op = ext ? op_node(g, ext->third_in) : NULL;
+        int8_t tt = then_op ? then_op->out_type : 0;
+        int8_t et = else_op ? else_op->out_type : 0;
+        bool t_bad = tt > 0 && tt != RAY_LIST && !if_type_is_text(tt);
+        bool e_bad = et > 0 && et != RAY_LIST && !if_type_is_text(et);
+        if (t_bad || e_bad)
+            return ray_error("type", "if: branches mix %s and %s",
+                             ray_type_name(tt), ray_type_name(et));
+    }
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
     if (!cond_v || RAY_IS_ERR(cond_v)) return cond_v;
 
