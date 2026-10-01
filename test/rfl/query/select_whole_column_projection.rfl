@@ -35,3 +35,18 @@
 
 ;; ── ragged result rejected: a length-changing column beside a full column ────
 (select {a: (distinct v) b: v from: T}) !- length
+
+;; A scalar that reaches the projection as a one-element vector rather than
+;; an atom (arithmetic over a reduction, or an `if` whose parts are all
+;; scalar) broadcasts like an atom next to a full column.  The table used to
+;; take its row count from the first column, so these came back with 1 row
+;; and columns of different lengths.
+(set TB (table [x] (list (til 6))))
+(count (select {k: (+ (sum x) 0) y: x from: TB})) -- 6
+(at (select {k: (+ (sum x) 0) y: x from: TB}) 'k) -- [15 15 15 15 15 15]
+(at (select {k: (if true 7 0) y: x from: TB}) 'k) -- [7 7 7 7 7 7]
+(at (select {y: x k: (if (> (count x) 3) 1 0) from: TB}) 'k) -- [1 1 1 1 1 1]
+(at (select {k: (if true 7 0) y: x from: TB where: (> x 2)}) 'k) -- [7 7 7]
+;; every column a scalar: the one-row result stays
+(count (select {k: (+ (sum x) 0) from: TB})) -- 1
+(count (select {k: (+ (sum x) 0) y: x from: (table [x] (list (til 0)))})) -- 0

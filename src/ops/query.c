@@ -14065,6 +14065,22 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
     return mask_vec;
 }
 
+/* A scalar computed as a one-element vector rather than an atom, such as
+ * `(+ (sum x) 0)` or an `if` whose parts are all scalar, becomes that atom
+ * when the column has another length, so the atom broadcast below applies
+ * to it.  Left as a vector it replaced the column with one row. */
+static ray_t* update_scalar_vec(ray_t* v, int64_t nrows) {
+    if (!v || RAY_IS_ERR(v) || v->type <= 0 || v->type == RAY_LIST ||
+        !ray_is_vec(v) || v->len != 1 || nrows == 1)
+        return v;
+    int alloc = 0;
+    ray_t* a = collection_elem(v, 0, &alloc);
+    if (!a || RAY_IS_ERR(a)) return v;
+    if (!alloc) ray_retain(a);
+    ray_release(v);
+    return a;
+}
+
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
     ray_t* out = NULL;
     ray_graph_t* g = ray_graph_new(sub);
@@ -14088,7 +14104,7 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
     if (!out) return ray_error("type", "update: failed to evaluate column update expression");
     if (RAY_IS_ERR(out)) return out;
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
-    return out;
+    return update_scalar_vec(out, ray_table_nrows(sub));
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
@@ -14768,6 +14784,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     ray_env_pop_scope();
                 }
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
+                expr_vec = update_scalar_vec(expr_vec, nrows);
 
                 /* WHERE update: expression result replaces ONLY masked rows.
                  * When type differs (e.g., I64 col, F64 expr from (* col 1.1)),
@@ -15073,6 +15090,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_env_pop_scope();
             }
             if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
+            expr_vec = update_scalar_vec(expr_vec, ray_table_nrows(tbl));
 
             /* Broadcast scalar atom to full column vector if needed */
             if (expr_vec->type < 0) {
@@ -15235,6 +15253,7 @@ no_where_add_col:
         ray_t* expr_vec = ray_execute(ug, expr_op);
         ray_graph_free(ug);
         if (RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec; }
+        expr_vec = update_scalar_vec(expr_vec, ray_table_nrows(tbl));
 
         /* Broadcast scalar to column */
         if (expr_vec->type < 0) {

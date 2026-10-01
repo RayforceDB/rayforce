@@ -3600,6 +3600,37 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
             }
 
+            /* A scalar computed as a one-element vector rather than an atom,
+             * such as `(+ (sum x) 0)` or an `if` whose parts are all scalar,
+             * is broadcast like an atom when another column has the input's
+             * rows.  Left alone, the table took its row count from whichever
+             * column came first and its columns disagreed in length.  When
+             * every column is a scalar the one-row result stays. */
+            int64_t nr_in = ray_table_nrows(input);
+            if (nr_in != 1 && result && !RAY_IS_ERR(result)) {
+                int64_t rc = ray_table_ncols(result);
+                bool has_full = false;
+                for (int64_t c = 0; c < rc; c++) {
+                    ray_t* cv = ray_table_get_col_idx(result, c);
+                    if (cv && cv->type > 0 && cv->len == nr_in) { has_full = true; break; }
+                }
+                for (int64_t c = 0; has_full && c < rc; c++) {
+                    ray_t* cv = ray_table_get_col_idx(result, c);
+                    if (!cv || cv->type <= 0 || cv->len != 1) continue;
+                    ray_t* n_obj = make_i64(nr_in);
+                    ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
+                    if (n_obj) ray_release(n_obj);
+                    if (!wide || RAY_IS_ERR(wide)) {
+                        ray_release(result);
+                        g->table = saved_table;
+                        ray_release(input);
+                        return wide ? wide : ray_error("oom", NULL);
+                    }
+                    ray_table_set_col_idx(result, c, wide);
+                    ray_release(wide);
+                }
+            }
+
             g->table = saved_table;
             ray_release(input);
             return result;

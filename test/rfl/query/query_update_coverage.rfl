@@ -576,3 +576,16 @@
 (at (at (update {v: 0Nl from: (table [k v] (list [1 2 3] [10 20 30])) where: (== k 1)}) 'v) 1) -- 20
 (at (at (update {v: 0Nf from: (table [k v] (list [1 2 3] [10.0 20.0 30.0])) where: (== k 1)}) 'v) 1) -- 20.0
 (nil? (at (at (update {v: 0Nl from: (table [k v] (list [1 2 3] [10 20 30])) where: (== k 1)}) 'v) 0)) -- true
+
+;; A scalar computed as a one-element vector (arithmetic over a reduction,
+;; or an `if` whose parts are all scalar) broadcasts like an atom.  It used
+;; to replace the column with one row, so the table shrank to one row, or
+;; under `where:` wrote zeros into the matched rows.
+(set TU (table [x s] (list (til 6) ['a 'b 'c 'd 'e 'f])))
+(at (update {x: (if true 7 0) from: TU}) 'x) -- [7 7 7 7 7 7]
+(at (update {x: (+ (sum x) 0) from: TU}) 'x) -- [15 15 15 15 15 15]
+(at (update {z: (+ (max x) 1) from: TU}) 'z) -- [6 6 6 6 6 6]
+(at (update {x: (+ (sum x) 0) from: TU where: (> x 2)}) 'x) -- (at (update {x: (sum x) from: TU where: (> x 2)}) 'x)
+(at (update {x: (if true 7 0) from: TU where: (> x 2)}) 'x) -- [0 1 2 7 7 7]
+(at (update {s: (if true 'q 'r) from: TU}) 's) -- ['q 'q 'q 'q 'q 'q]
+(at (update {x: (+ (sum x) 1) from: (table [x] (list [5]))}) 'x) -- [6]
