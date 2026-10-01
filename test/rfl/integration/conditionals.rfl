@@ -18,3 +18,20 @@
 (set x 5) (if (< x 0) 'neg (if (== x 0) 'zero 'pos)) -- 'pos
 (set x -3) (if (< x 0) 'neg (if (== x 0) 'zero 'pos)) -- 'neg
 (set x 0) (if (< x 0) 'neg (if (== x 0) 'zero 'pos)) -- 'zero
+;; ========== TRUTHINESS PER TYPE ==========
+;; A zero of any numeric or temporal type is false, as is null.  Only I64
+;; and F64 zeros used to be: an I32, I16 or U8 zero took the
+;; then-branch, and `not` / `and` / `or` read it the same way.
+(if (as 'i32 0) 1 2) -- 2
+(if (as 'i32 3) 1 2) -- 1
+(if (as 'i16 0) 1 2) -- 2
+(if (as 'u8 0) 1 2) -- 2
+(if (as 'u8 9) 1 2) -- 1
+(if (as 'date 0) 1 2) -- 2
+(if 0Ni 1 2) -- 2
+(if 0Nf 1 2) -- 2
+(if 256 1 2) -- 1
+(if 'a 1 2) -- 1
+(not (as 'i32 0)) -- true
+(not (as 'i16 5)) -- false
+(or (as 'u8 0) false) -- false

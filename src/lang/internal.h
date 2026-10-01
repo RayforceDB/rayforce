@@ -215,13 +215,23 @@ static inline ray_t* make_typed_int(int8_t atom_type, int64_t val) {
  * ══════════════════════════════════════════ */
 
 /* Logical -- coerce to truthiness (0/nil/false = falsy, else truthy).
- * Null forms (RAY_NULL singleton and typed null atoms) are falsy. */
+ * Null forms (RAY_NULL singleton and typed null atoms) are falsy, and so is
+ * a zero of any numeric or temporal type: only I64 and F64 zeros used to
+ * be, so `(if (as 'i32 0) 1 2)` took the then-branch. */
 static inline int is_truthy(ray_t* x) {
     if (RAY_IS_NULL(x) || RAY_ATOM_IS_NULL(x)) return 0;
-    if (x->type == -RAY_BOOL) return x->b8;
-    if (x->type == -RAY_I64)  return x->i64 != 0;
-    if (x->type == -RAY_F64)  return x->f64 != 0.0;
-    return 1; /* non-null objects are truthy */
+    switch (x->type) {
+    case -RAY_BOOL: return x->b8 != 0;
+    case -RAY_U8:   return x->u8 != 0;
+    case -RAY_I16:  return x->i16 != 0;
+    case -RAY_I32:  return x->i32 != 0;
+    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return x->i64 != 0;
+    case -RAY_F32: case -RAY_F64:   /* F32 atoms are stored widened */
+        return x->f64 != 0.0 && x->f64 == x->f64;
+    default:
+        return 1; /* non-null objects are truthy */
+    }
 }
 
 /* ══════════════════════════════════════════
