@@ -1,0 +1,291 @@
+{
+  "parquet": "/tmp/rayforce-clickbench-8rg.parquet",
+  "csv": "/tmp/rayforce-clickbench-8rg.csv",
+  "schema": "/home/hetoku/data/work/ClickBench/rayforce/create.rfl",
+  "page_cache": "OS-managed; no cache eviction",
+  "timing": "process + native indexes + reopen + output fsync",
+  "results": [
+    {
+      "kind": "csv",
+      "cores": 1,
+      "repeat": 0,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 8.619528122988413,
+      "process_seconds": 8.53,
+      "peak_rss_kib": 3532424,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 1,
+      "repeat": 0,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 4.6923914270009845,
+      "process_seconds": 4.63,
+      "peak_rss_kib": 3326132,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 1,
+      "repeat": 1,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 4.789084106989321,
+      "process_seconds": 4.73,
+      "peak_rss_kib": 3325860,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 1,
+      "repeat": 1,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 8.65201945300214,
+      "process_seconds": 8.56,
+      "peak_rss_kib": 3532692,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 1,
+      "repeat": 2,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 8.74717317300383,
+      "process_seconds": 8.52,
+      "peak_rss_kib": 3532348,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 1,
+      "repeat": 2,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 4.6113874959992245,
+      "process_seconds": 4.55,
+      "peak_rss_kib": 3327384,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 8,
+      "repeat": 0,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.7667662469903007,
+      "process_seconds": 2.69,
+      "peak_rss_kib": 3849720,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 8,
+      "repeat": 0,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 1.638353346992517,
+      "process_seconds": 1.57,
+      "peak_rss_kib": 3723756,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 8,
+      "repeat": 1,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 1.661491525999736,
+      "process_seconds": 1.6,
+      "peak_rss_kib": 3694116,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 8,
+      "repeat": 1,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.575383318006061,
+      "process_seconds": 2.49,
+      "peak_rss_kib": 3851152,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 8,
+      "repeat": 2,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.6272437120060204,
+      "process_seconds": 2.52,
+      "peak_rss_kib": 3850644,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 8,
+      "repeat": 2,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 1.728464215004351,
+      "process_seconds": 1.66,
+      "peak_rss_kib": 3723888,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 28,
+      "repeat": 0,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.309884261994739,
+      "process_seconds": 2.21,
+      "peak_rss_kib": 4058276,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 28,
+      "repeat": 0,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.0614602970017586,
+      "process_seconds": 2.0,
+      "peak_rss_kib": 4032552,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 28,
+      "repeat": 1,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.1139418789971387,
+      "process_seconds": 2.05,
+      "peak_rss_kib": 4041272,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 28,
+      "repeat": 1,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.218596715989406,
+      "process_seconds": 2.15,
+      "peak_rss_kib": 4058092,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "csv",
+      "cores": 28,
+      "repeat": 2,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.361339034003322,
+      "process_seconds": 2.26,
+      "peak_rss_kib": 4057912,
+      "native_bytes": 2195585704,
+      "verified": true
+    },
+    {
+      "kind": "parquet",
+      "cores": 28,
+      "repeat": 2,
+      "rows": 3266382,
+      "columns": 105,
+      "durable_load_seconds": 2.0892868819937576,
+      "process_seconds": 2.03,
+      "peak_rss_kib": 4038620,
+      "native_bytes": 2195585704,
+      "verified": true
+    }
+  ],
+  "medians": [
+    {
+      "cores": 1,
+      "csv": 8.65201945300214,
+      "parquet": 4.6923914270009845,
+      "csv_over_parquet": 1.8438400946725464
+    },
+    {
+      "cores": 8,
+      "csv": 2.6272437120060204,
+      "parquet": 1.661491525999736,
+      "csv_over_parquet": 1.5812561610419178
+    },
+    {
+      "cores": 28,
+      "csv": 2.309884261994739,
+      "parquet": 2.0892868819937576,
+      "csv_over_parquet": 1.1055850117579213
+    }
+  ],
+  "date": "2026-09-30",
+  "cpu": "Intel Core i7-14700",
+  "logical_cpus": 28,
+  "ram_gib": 62,
+  "source_url": "https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet",
+  "original_row_groups": 8,
+  "rows": 3266382,
+  "columns": 105,
+  "compared_cells_per_import": 342970110,
+  "full_100m_dataset": false,
+  "repeats_per_case": 3,
+  "alternating_order": true,
+  "csv_preparation": "Reference SQL CLI 1.1.3 export of the same original Parquet rows; headerless CSV; SET TimeZone='UTC'; format raw Unix seconds/days as ISO timestamps/dates",
+  "build": "release, -O3 -march=native; no third-party libraries",
+  "binary_sha256": "e7ccf08863a33b17dfdf1cb01202160dcddc6fccb3f306f1c08a2d5ae7eed201",
+  "baseline_commit": "95b0b91c2be60954e11ad106f0bf24c8f340b948",
+  "worktree_changes": true,
+  "input_bytes": {
+    "parquet": 594562209,
+    "csv": 2722297967
+  },
+  "source_parquet_sha256": "8806e5d33f823ec8ce0195836111cdc55277d6b22133dfd7261d055a3004095c",
+  "validation": {
+    "asan_ubsan_suite": {
+      "passed": 3970,
+      "failed": 0
+    },
+    "multigroup_oracle_queries": {
+      "passed": 12,
+      "cores": 28,
+      "rows": 3266382
+    },
+    "typed_parted_growing_dictionary": {
+      "cores": [
+        1,
+        8,
+        28
+      ],
+      "rows": 44009,
+      "row_groups": 7,
+      "all_cells_match": true
+    },
+    "csv_prepare_option_verified": true,
+    "final_release_sha256": "6d2b4d2e65d94b0627b1441227e21d6cb9e37a46640d6cc04faacec45c2a6d1d"
+  },
+  "timed_binary_note": "The recorded binary measured CSV and splayed Parquet imports. Subsequent fixes affect only typed partitioned conversion; its final build is recorded under validation."
+}

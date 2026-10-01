@@ -1,0 +1,40 @@
+{
+  "parquet": "/home/hetoku/data/work/rayforce/build/parquet-recovery/data/hits.parquet",
+  "csv": "/home/hetoku/data/work/rayforce/build/parquet-recovery/data/hits.csv",
+  "schema": "/home/hetoku/data/work/ClickBench/rayforce/create.rfl",
+  "cpu": "x86_64",
+  "logical_cpus": 28,
+  "layout": "parted",
+  "binary_sha256": "3efe1db444730918af49610cb26a313729f54bc3ccc3f15fb61173f84ae0b86b",
+  "partitioning": "source order, at most 65536 rows; Parquet also breaks at row-group boundaries",
+  "input_bytes": {
+    "csv": 78462321894,
+    "parquet": 14779976446
+  },
+  "page_cache": "OS-managed; no cache eviction",
+  "timing": "process + native indexes + reopen + output fsync",
+  "results": [
+    {
+      "kind": "parquet",
+      "layout": "parted",
+      "cores": 8,
+      "repeat": 0,
+      "rows": 99997497,
+      "columns": 105,
+      "durable_load_seconds": 231.19439260599938,
+      "process_seconds": 146.54,
+      "peak_rss_kib": 34636300,
+      "native_bytes": 47357381941,
+      "verified": true,
+      "process_user_seconds": 101.15,
+      "process_system_seconds": 27.74,
+      "major_faults": 342772,
+      "minor_faults": 7424529,
+      "input_blocks": 57467768,
+      "output_blocks": 93743936
+    }
+  ],
+  "medians": [],
+  "harness_sha256": "68da5354ce7276664fbc7c0f8d61a7eeab0a1e86a0f9a7de60cb9eefbe0555e6",
+  "comparison_note": "Single matched-cap diagnostic, not a repeated median; baseline is 2026-09-30-parted-baseline-pair.json."
+}

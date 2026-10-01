@@ -1,0 +1,22 @@
+;; Computed dictionary group keys use row-wise query conditionals.
+;; Evaluating `if` as a general special form treats its vector as truthy.
+(set BC (table [engine adv ref url] (list [0 2 0 2] [0 0 1 1] ["first" "second" "third" "fourth"] ["u" "u" "u" "u"])))
+(set BCG (select {from: BC by: {src: (if (and (== engine 0) (== adv 0)) ref "")} n: (count url) asc: src}))
+(count BCG) -- 2
+(at (at BCG 'src) 0) -- ""
+(at (at BCG 'src) 1) -- "first"
+(all (== (at BCG 'n) [3 1])) -- true
+
+;; Prefiltered and nested conditions preserve the selected row positions.
+(set BCF (select {from: BC by: {src: (if (== engine 0) (if (== adv 0) ref "paid") "search")} n: (count url) where: (> adv 0) asc: src}))
+(count BCF) -- 2
+(at (at BCF 'src) 0) -- "paid"
+(at (at BCF 'src) 1) -- "search"
+(all (== (at BCF 'n) [1 1])) -- true
+
+;; Later aliases can reference an earlier computed key.
+(set BCA (select {from: BC by: {src: (if (== engine 0) ref "") size: (strlen src)} n: (count url) asc: size}))
+(nil? (at (at BCA 'size) 0)) -- true
+(at (at BCA 'size) 1) -- 5
+(at (at BCA 'size) 2) -- 5
+(sum (at BCA 'n)) -- 4

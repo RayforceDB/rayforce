@@ -1,0 +1,70 @@
+;; @requires: posix
+;; Parquet shapes common writers emit by default that the reader once
+;; rejected (PR 657 review): RLE-encoded booleans (the v2 default), a
+;; zero-row row group, and long strings past one 64 MiB batch pool.
+
+;; RLE booleans, v1 and v2 pages, with nulls: 40 rows, 4 null, 22 true
+(set b1 (.parquet.read "test/data/parquet/bool-rle-v1.parquet"))
+(set b2 (.parquet.read "test/data/parquet/bool-rle-v2.parquet"))
+(count b1) -- 40
+(count (select {from: b1 where: (== b true)})) -- 22
+(count (select {from: b2 where: (== b true)})) -- 22
+(count (select {from: b2 where: (nil? b)})) -- 4
+;; nullable booleans decode to I16 (BOOL has no null)
+(at (at b2 'b) 4) -- 0
+(at (at b2 'b) 39) -- 1
+
+;; a zero-row group between two populated ones
+(set eg (.parquet.read "test/data/parquet/empty-group.parquet"))
+(count eg) -- 5
+(sum (at eg 'x)) -- 13
+(at (at eg 's) 3) -- "four"
+(.sys.exec "rm -rf rf_test_pq_eg_parted") -- 0
+(.parquet.parted "test/data/parquet/empty-group.parquet" "rf_test_pq_eg_parted" 'e) -- 5
+(count (select {from: (.db.parted.get "rf_test_pq_eg_parted" 'e)})) -- 5
+(.sys.exec "rm -rf rf_test_pq_eg_parted") -- 0
+
+;; 8000 rows x 9000-byte strings (~72 MB decoded): the reader splits the
+;; row group into batches whose string pools stay near 64 MiB.
+(.sys.exec "python3 test/data/parquet/generate.py --long-strings rf_test_pq_long.parquet") -- 0
+(set lg (.parquet.read "rf_test_pq_long.parquet"))
+(count lg) -- 8000
+(sum (at lg 'id)) -- 31996000
+(sum (map count (at lg 'doc))) -- 72000000
+(set nb 0)
+(.parquet.each "rf_test_pq_long.parquet" (fn [batch] (set nb (+ nb 1)))) -- 8000
+(> nb 1) -- true
+(.sys.exec "rm -f rf_test_pq_long.parquet") -- 0
+
+;; a destination with a trailing separator stages beside it, as
+;; .csv.parted does, not inside it as "<dest>/.parquet-partial"
+(.sys.exec "rm -rf rf_test_pq_slash rf_test_pq_slash.parquet-partial") -- 0
+(.parquet.splayed "test/data/parquet/empty-group.parquet" "rf_test_pq_slash/") -- 5
+(count (.db.splayed.get "rf_test_pq_slash")) -- 5
+(.sys.exec "test -e rf_test_pq_slash/.parquet-partial") -- 1
+;; a leftover staging directory blocks the destination (the error names it)
+(.sys.exec "rm -rf rf_test_pq_slash && mkdir rf_test_pq_slash.parquet-partial") -- 0
+(.parquet.splayed "test/data/parquet/empty-group.parquet" "rf_test_pq_slash") !- parquet
+(.sys.exec "rm -rf rf_test_pq_slash rf_test_pq_slash.parquet-partial") -- 0
+
+;; ms timestamps outside the nanosecond range (a 9999-12-31 "end of time"
+;; sentinel, a 1000-01-01 date) clamp to the nearest representable instant,
+;; so comparisons keep their meaning: a 9999 validity end is not "expired".
+;; Strict mode rejects them.
+(set tr (.parquet.read "test/data/parquet/timestamp-range.parquet"))
+(count tr) -- 4
+(count (select {from: tr where: (nil? ts)})) -- 0
+(count (select {from: tr where: (> ts 2100.01.01D00:00:00.000000000)})) -- 1
+(count (select {from: tr where: (< ts 1900.01.01D00:00:00.000000000)})) -- 1
+(.parquet.read {strict: true} "test/data/parquet/timestamp-range.parquet") !- parquet
+
+;; the same pool bound for dictionary pages: 10,000 rows repeating 20
+;; distinct 10 KB entries (~100 MB decoded).  The chunk is small, but every
+;; row copies an entry into the pool, so batches must be sized by the
+;; longest entry (~6,700 rows), not left at the default 65,536.
+(.sys.exec "python3 test/data/parquet/generate.py --dict-strings rf_test_pq_dict.parquet") -- 0
+(set nd 0)
+(.parquet.each "rf_test_pq_dict.parquet" (fn [batch] (set nd (+ nd 1)))) -- 10000
+nd -- 2
+(count (distinct (at (.parquet.read "rf_test_pq_dict.parquet") 's))) -- 20
+(.sys.exec "rm -f rf_test_pq_dict.parquet") -- 0

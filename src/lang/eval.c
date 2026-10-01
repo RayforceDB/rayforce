@@ -3411,6 +3411,12 @@ static void ray_register_builtins(void) {
     register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
     register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
     register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
+    register_vary(".parquet.scan",     RAY_FN_RESTRICTED, ray_parquet_scan_fn);
+    register_unary(".parquet.meta",    RAY_FN_RESTRICTED, ray_parquet_metadata_fn);
+    register_vary(".parquet.read",     RAY_FN_RESTRICTED, ray_parquet_read_fn);
+    register_vary(".parquet.each",     RAY_FN_RESTRICTED, ray_parquet_each_fn);
+    register_vary(".parquet.splayed",  RAY_FN_RESTRICTED, ray_parquet_splayed_fn);
+    register_vary(".parquet.parted",   RAY_FN_RESTRICTED, ray_parquet_parted_fn);
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);

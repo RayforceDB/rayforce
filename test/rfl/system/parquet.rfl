@@ -1,0 +1,211 @@
+;; @requires: posix
+;; Native Parquet frontend, query execution, projected streaming, and ranges.
+(set pq (.parquet.read "test/data/parquet/flat-1-v2.parquet"))
+(count pq) -- 18
+(sum (at pq 'x)) -- 74
+(sum (at pq 'wide)) -- 1872
+(min (at pq 'day)) -- 2000.01.01
+(count (select {from: pq where: (> x 4)})) -- 8
+(count (.parquet.read [name] "test/data/parquet/flat-0-v1.parquet")) -- 18
+(count (.parquet.meta "test/data/parquet/flat-1-v1.parquet")) -- 14
+(.parquet.each [x] "test/data/parquet/flat-1-v2.parquet" (fn [batch] (sum (at batch 'x)))) -- 18
+(set pq-r (.parquet.read {columns: [name] range: {column: x min: 4 max: 7}} "test/data/parquet/flat-1-v2.parquet"))
+(count pq-r) -- 6
+(count (cols pq-r)) -- 1
+(count (.parquet.read {range: {column: x min: 40 max: 70}} "test/data/parquet/flat-1-v2.parquet")) -- 0
+(.parquet.each {columns: [name] range: {column: x min: 4 max: 7}} "test/data/parquet/flat-1-v2.parquet" (fn [batch] (count batch))) -- 6
+(.parquet.read [missing] "test/data/parquet/flat-1-v1.parquet") !- parquet
+(.parquet.read [x x] "test/data/parquet/flat-1-v1.parquet") !- parquet
+(.parquet.read {range: {column: name min: 1 max: 2}} "test/data/parquet/flat-1-v1.parquet") !- parquet
+(.parquet.read "missing-rayforce.parquet") !- io
+(.parquet.read 1) !- type
+(.parquet.read) !- arity
+(.parquet.each "test/data/parquet/flat-1-v1.parquet" (fn [batch] (at batch 'missing))) !- domain
+;; Reopenable source: whole-query grouping, sorting, repeated scans and pushdown.
+(set pqs (.parquet.scan "test/data/parquet/flat-1-v2.parquet"))
+(count (select {from: pqs})) -- 18
+(sum (at (select {from: pqs x: x}) 'x)) -- 74
+(count (cols (select {from: pqs name: name where: (and (>= x 4) (<= x 7))}))) -- 1
+(count (select {from: pqs name: name where: (and (>= x 4) (<= x 7))})) -- 6
+(sum (at (select {from: pqs s: (sum wide)}) 's)) -- 1872
+(sum (at (select {from: pqs by: x n: (count wide)}) 'n)) -- 18
+(sum (at (select {from: pqs x: x desc: x take: 3}) 'x)) -- 26
+(count (select {from: pqs x: x where: (< x 4)})) -- 8
+(count (select {from: pqs x: x where: (> 4 x)})) -- 8
+(count (select {from: pqs x: x where: (or (== x 1) (== x 9))})) -- 4
+(== (count (select {from: pqs x: x where: (> x (avg x))})) (count (select {from: pq x: x where: (> x (avg x))}))) -- true
+(count (select {from: pqs x: x where: (and (> x 7) (< x 3))})) -- 0
+(count (select {from: pqs x: x where: (== x 4)})) -- 2
+(count (select {from: (.parquet.scan "test/data/parquet/empty.parquet") x: x})) -- 0
+(select {from: (.parquet.scan "missing-rayforce.parquet") x: x}) !- io
+
+;; Unknown functions may capture columns; disable projection for those calls.
+(set pq-capture (fn [unused] wide))
+(sum (at (select {from: pqs value: (pq-capture x)}) 'value)) -- 1872
+;; Literal-only output still preserves source cardinality.
+(count (select {from: pqs value: 1})) -- 18
+(count (select {from: pqs by: [x wide] n: (count wide)})) -- 9
+
+;; Corrupt unreferenced string payload proves inferred projection avoids decoding it.
+(sum (at (select {from: (.parquet.scan "test/data/parquet/projection.parquet") x: x}) 'x)) -- 37
+(.parquet.read "test/data/parquet/projection.parquet") !- parquet
+;; Stream global integer aggregates across batches using native accumulators.
+(set pq-big (.parquet.scan "test/data/parquet/parallel.parquet"))
+(sum (at (select {from: pq-big n: (count x)}) 'n)) -- 70003
+(sum (at (select {from: pq-big s: (sum x)}) 's)) -- 2450175003
+(sum (at (select {from: pq-big a: (avg x)}) 'a)) -- 35001.0
+(sum (at (select {from: pq-big lo: (min y)}) 'lo)) -- 0
+(sum (at (select {from: pq-big n: (count x) where: (and (>= x 65530) (<= x 65540))}) 'n)) -- 11
+(sum (at (select {from: pq-big s: (sum x) where: (and (>= x 65530) (<= x 65540))}) 's)) -- 720885
+(sum (at (select {from: pq-big a: (avg x) where: (and (>= x 65530) (<= x 65540))}) 'a)) -- 65535.0
+;; Multiple predicate columns must retain the residual predicate.
+(sum (at (select {from: pqs n: (count wide) where: (and (>= x 4) (< wide 105))}) 'n)) -- 4
+(sum (at (select {from: pqs n: (count x) where: (> x 100)}) 'n)) -- 0
+(sum (at (select {from: (.parquet.scan "test/data/parquet/empty.parquet") n: (count x)}) 'n)) -- 0
+(sum (at (select {from: (.parquet.scan "test/data/parquet/all-null.parquet") s: (sum x)}) 's)) -- 0
+(all (== (as 'STR (at (select {from: pqs a: (avg x)}) 'a)) (as 'STR (at (select {from: pq a: (avg x)}) 'a)))) -- true
+;; A footer-only count never touches the deliberately corrupted payload.
+(sum (at (select {from: (.parquet.scan "test/data/parquet/projection.parquet") n: (count name)}) 'n)) -- 9
+;; Streaming residual comparisons preserve the empty global aggregate row.
+(sum (at (select {from: pqs n: (count wide) where: (and (>= x 4) (> wide 1000))}) 'n)) -- 0
+
+;; Independent row groups preserve order, nulls, pruning and partial-state merges.
+(set pq-groups (.parquet.scan "test/data/parquet/row-groups.parquet"))
+(sum (at (select {from: pq-groups s: (sum x)}) 's)) -- 968374036
+(sum (at (select {from: pq-groups a: (avg x)}) 'a)) -- 22004.0
+(sum (at (select {from: pq-groups s: (sum x) where: (and (>= x 4999) (<= x 39012) (< y 100000))}) 's)) -- 558839820
+(sum (at (select {from: pq-groups n: (count y) where: (and (>= x 4999) (<= x 39012) (< y 100000))}) 'n)) -- 28771
+(sum (at (select {from: pq-groups s: (sum x) where: (and (>= x 4999) (< y 0))}) 's)) -- 73539505
+(set pq-groups-eager (.parquet.read "test/data/parquet/row-groups.parquet"))
+;; Worker readers must inherit null acceptance for their primary predicate.
+(== (count (select {from: pq-groups where: (< y 0)})) (count (select {from: pq-groups-eager where: (< y 0)}))) -- true
+(== (sum (at (select {from: pq-groups s: (sum x) where: (< y 0)}) 's)) (sum (at (select {from: pq-groups-eager s: (sum x) where: (< y 0)}) 's))) -- true
+(count (.parquet.read {columns: [s] range: {column: x min: 4999 max: 39012}} "test/data/parquet/row-groups.parquet")) -- 34014
+;; Upper-bound predicates retain nulls through page/group pruning and aggregates.
+(set pq-null (.parquet.read "test/data/parquet/indexed-null.parquet"))
+(set pqs-null (.parquet.scan "test/data/parquet/indexed-null.parquet"))
+(== (count (select {from: pqs-null where: (< x 5)})) (count (select {from: pq-null where: (< x 5)}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (< x 5)}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (< x 5)}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (< x 5)}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (< x 5)}) 's))) -- true
+(== (count (select {from: pqs-null where: (<= x 5)})) (count (select {from: pq-null where: (<= x 5)}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (<= x 5)}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (<= x 5)}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (<= x 5)}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (<= x 5)}) 's))) -- true
+(== (count (select {from: pqs-null where: (> 5 x)})) (count (select {from: pq-null where: (> 5 x)}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (> 5 x)}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (> 5 x)}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (> 5 x)}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (> 5 x)}) 's))) -- true
+(== (count (select {from: pqs-null where: (>= 5 x)})) (count (select {from: pq-null where: (>= 5 x)}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (>= 5 x)}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (>= 5 x)}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (>= 5 x)}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (>= 5 x)}) 's))) -- true
+(== (count (select {from: pqs-null where: (< x 0)})) (count (select {from: pq-null where: (< x 0)}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (< x 0)}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (< x 0)}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (< x 0)}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (< x 0)}) 's))) -- true
+(== (count (select {from: pqs-null where: (<= x -9223372036854775807)})) (count (select {from: pq-null where: (<= x -9223372036854775807)}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (<= x -9223372036854775807)}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (<= x -9223372036854775807)}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (<= x -9223372036854775807)}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (<= x -9223372036854775807)}) 's))) -- true
+(== (count (select {from: pqs-null where: (and (< x 5) (<= x 4))})) (count (select {from: pq-null where: (and (< x 5) (<= x 4))}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (and (< x 5) (<= x 4))}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (and (< x 5) (<= x 4))}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (and (< x 5) (<= x 4))}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (and (< x 5) (<= x 4))}) 's))) -- true
+(== (count (select {from: pqs-null where: (and (>= x 4) (< x 5))})) (count (select {from: pq-null where: (and (>= x 4) (< x 5))}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (and (>= x 4) (< x 5))}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (and (>= x 4) (< x 5))}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (and (>= x 4) (< x 5))}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (and (>= x 4) (< x 5))}) 's))) -- true
+(== (count (select {from: pqs-null where: (and (>= row 0) (< x 5))})) (count (select {from: pq-null where: (and (>= row 0) (< x 5))}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (and (>= row 0) (< x 5))}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (and (>= row 0) (< x 5))}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (and (>= row 0) (< x 5))}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (and (>= row 0) (< x 5))}) 's))) -- true
+(== (count (select {from: pqs-null where: (and (< x 5) (>= row 0))})) (count (select {from: pq-null where: (and (< x 5) (>= row 0))}))) -- true
+(== (sum (at (select {from: pqs-null n: (count row) where: (and (< x 5) (>= row 0))}) 'n)) (sum (at (select {from: pq-null n: (count row) where: (and (< x 5) (>= row 0))}) 'n))) -- true
+(== (sum (at (select {from: pqs-null s: (sum row) where: (and (< x 5) (>= row 0))}) 's)) (sum (at (select {from: pq-null s: (sum row) where: (and (< x 5) (>= row 0))}) 's))) -- true
+(count (select {from: pqs-null where: (< x 5)})) -- 7
+(sum (at (select {from: pqs-null s: (sum row) where: (< x 0)}) 's)) -- 24
+(count (select {from: (.parquet.scan "test/data/parquet/all-null.parquet") where: (< x 0)})) -- 9
+(sum (at (select {from: (.parquet.scan "test/data/parquet/all-null.parquet") n: (count x) where: (<= x 0)}) 'n)) -- 9
+;; Required source values can map to native null sentinels, too.
+(count (select {from: (.parquet.scan "test/data/parquet/sentinels.parquet") where: (< i -2147483648)})) -- 1
+(sum (at (select {from: (.parquet.scan "test/data/parquet/sentinels.parquet") n: (count i) where: (< l -9223372036854775807)}) 'n)) -- 1
+
+;; Native conversion entry points validate schemas and argument shapes.
+(.parquet.splayed) !- arity
+(.parquet.splayed 1 "unused") !- type
+(.parquet.splayed [I32] "test/data/parquet/unix.parquet" "unused") !- parquet
+(.parquet.splayed [DATE TIMESTAMP SYM] "test/data/parquet/unix.parquet" "unused") !- parquet
+(.parquet.parted [DATE TIMESTAMP SYM] "test/data/parquet/unix.parquet" "unused" 'hits) !- parquet
+
+;; Explicit types use private dictionaries that survive reader closure.
+(set pq-typed (.parquet.read {types: [UNIX_DATE UNIX_SECONDS SYM]} "test/data/parquet/unix.parquet"))
+(type (at pq-typed 's)) -- 'SYM
+(min (at pq-typed 'day)) -- 2000.01.01
+(min (at pq-typed 'ts)) -- 2000.01.01D00:00:00.000000000
+(all (== (as 'STR (at pq-typed 's)) (at (.parquet.read "test/data/parquet/unix.parquet") 's))) -- true
+(set pq-typed-source (.parquet.scan {types: [I32 I64 SYM]} "test/data/parquet/row-groups.parquet"))
+(set pq-typed-result (select {from: pq-typed-source s: s where: (and (>= x 4999) (<= x 39012))}))
+(count pq-typed-result) -- 34014
+(type (at pq-typed-result 's)) -- 'SYM
+(all (== (as 'STR (at pq-typed-result 's)) (at (.parquet.read {columns: [s] range: {column: x min: 4999 max: 39012}} "test/data/parquet/row-groups.parquet") 's))) -- true
+(sum (at (select {from: pq-typed-source n: (count s) where: (and (>= x 4999) (< y 100000))}) 'n)) -- 29156
+(count (select {from: pq-typed-source by: s n: (count x)})) -- 44009
+(type (at (.parquet.read {types: [I32 I64 SYM] columns: [s] range: {column: x min: 10 max: 19}} "test/data/parquet/row-groups.parquet") 's)) -- 'SYM
+(.parquet.read {types: [I32]} "test/data/parquet/unix.parquet") !- parquet
+(.parquet.scan {columns: [s]} "test/data/parquet/unix.parquet") !- parquet
+(.parquet.scan) !- arity
+(.parquet.scan 1) !- type
+(select {from: (.parquet.scan {types: [DATE TIMESTAMP SYM]} "test/data/parquet/unix.parquet")}) !- parquet
+
+;; Transparent expressions retain projection, and inclusive ranges retain null rules.
+(sum (at (select {from: (.parquet.scan "test/data/parquet/projection.parquet") x: (let tmp (div x 1) (% tmp 100))}) 'x)) -- 37
+(sum (at (select {from: (.parquet.scan "test/data/parquet/projection.parquet") x: (if (> x 3) x 0)}) 'x)) -- 33
+(count (select {from: pqs where: (within x [4 7])})) -- 6
+(sum (at (select {from: pqs n: (count wide) where: (and (within x [4 7]) (< wide 105))}) 'n)) -- 4
+(count (select {from: pqs where: (within x [7 4])})) -- 0
+;; LIKE is applied before materialization, including empty/null and complex patterns.
+(count (select {from: pqs where: (like name "*a*")})) -- 12
+(count (select {from: pqs where: (like name "[ab]*")})) -- 8
+(count (select {from: pqs where: (like name "")})) -- 4
+(count (select {from: pqs where: (like name "*")})) -- 18
+(count (select {from: pqs where: (like name "no match")})) -- 0
+(count (select {from: pqs n: (count name) where: (like name "no match")})) -- 1
+(sum (at (select {from: pqs n: (count name) where: (like name "no match")}) 'n)) -- 0
+(sum (at (select {from: pqs s: (sum wide) where: (like name "no match")}) 's)) -- 0
+(sum (at (select {from: pqs n: (count name) where: (like name "*a*")}) 'n)) -- 12
+(sum (at (select {from: pq-typed-source n: (count s) where: (like s "no match")}) 'n)) -- 0
+(count (select {from: pq-typed-source where: (like s "*row 10*")})) -- 1111
+(all (== (as 'STR (at (select {from: pq-typed-source s: s where: (like s "*row 10*")}) 's)) (at (select {from: (.parquet.read "test/data/parquet/row-groups.parquet") s: s where: (like s "*row 10*")}) 's))) -- true
+;; A user lambda replacing a familiar builtin can capture other columns.
+(set pq-original-lower lower)
+(set lower (fn [unused] wide))
+(sum (at (select {from: pqs result: (lower x)}) 'result)) -- 1872
+(set lower pq-original-lower)
+
+;; Strict mode rejects actual values that would become native nulls; true nulls survive.
+(count (.parquet.read {strict: true} "test/data/parquet/strict-good.parquet")) -- 3
+(count (.parquet.read {types: [I32 SYM] strict: true} "test/data/parquet/strict-good.parquet")) -- 3
+(.parquet.read {strict: 1} "test/data/parquet/strict-good.parquet") !- parquet
+(.parquet.read {columns: [i] strict: true} "test/data/parquet/strict-collisions-0.parquet") !- parquet
+(.parquet.read {columns: [j] strict: true} "test/data/parquet/strict-collisions-0.parquet") !- parquet
+(.parquet.read {columns: [f] strict: true} "test/data/parquet/strict-collisions-0.parquet") !- parquet
+(.parquet.read {columns: [s] strict: true} "test/data/parquet/strict-collisions-0.parquet") !- parquet
+(.parquet.read {columns: [i] strict: true} "test/data/parquet/strict-collisions-1.parquet") !- parquet
+(.parquet.read {columns: [j] strict: true} "test/data/parquet/strict-collisions-1.parquet") !- parquet
+(.parquet.read {columns: [f] strict: true} "test/data/parquet/strict-collisions-1.parquet") !- parquet
+(.parquet.read {columns: [s] strict: true types: [I32 I64 F64 SYM]} "test/data/parquet/strict-collisions-1.parquet") !- parquet
+(min (at (.parquet.read {columns: [i] strict: true types: [I64 I64 F64 STR]} "test/data/parquet/strict-collisions-0.parquet") 'i)) -- -2147483648
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-0.parquet") !- parquet
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-1.parquet") !- parquet
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-2.parquet") !- parquet
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-3.parquet") !- parquet
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-4.parquet") !- parquet
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-5.parquet") !- parquet
+(.parquet.read {strict: true} "test/data/parquet/strict-utf8-6.parquet") !- parquet
+(.parquet.read {strict: true types: [SYM]} "test/data/parquet/strict-utf8-7.parquet") !- parquet
+(select {from: (.parquet.scan {strict: true} "test/data/parquet/strict-collisions-0.parquet") i: i}) !- parquet
+(.parquet.parted {rows: 0} "test/data/parquet/flat-1-v2.parquet" "unused" 'hits) !- parquet
+(.parquet.parted {rows: 1048577} "test/data/parquet/flat-1-v2.parquet" "unused" 'hits) !- parquet
+(.sys.exec "rm -rf /tmp/rfl_parquet_rows /tmp/rfl_parquet_strict /tmp/rfl_parquet_strict.parquet-partial")
+(.parquet.parted {rows: 3} "test/data/parquet/flat-1-v2.parquet" "/tmp/rfl_parquet_rows" 'hits) -- 18
+(count (.db.parted.get "/tmp/rfl_parquet_rows" 'hits)) -- 18
+(count (.db.splayed.get "/tmp/rfl_parquet_rows/5/hits")) -- 3
+(.parquet.parted {strict: true} "test/data/parquet/strict-collisions-0.parquet" "/tmp/rfl_parquet_strict" 'hits) !- parquet
+(.db.parted.get "/tmp/rfl_parquet_strict" 'hits) !- io
+(.sys.exec "rm -rf /tmp/rfl_parquet_rows /tmp/rfl_parquet_strict.parquet-partial")
+(.parquet.parted {rows: 100000 strict: true} "test/data/parquet/parallel.parquet" "/tmp/rfl_parquet_rows" 'hits) -- 70003
+(count (.db.splayed.get "/tmp/rfl_parquet_rows/0/hits")) -- 70003
+(sum (at (.db.splayed.get "/tmp/rfl_parquet_rows/0/hits") 'x)) -- 2450175003
+(.sys.exec "rm -rf /tmp/rfl_parquet_rows")
