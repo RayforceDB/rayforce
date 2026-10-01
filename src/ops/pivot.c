@@ -28,6 +28,7 @@
 #include "ops/rowsel.h"
 #include "table/domain.h"   /* raw vocabulary snapshot for if_sym_side_t */
 #include "core/pool.h"
+#include "lang/format.h"    /* ray_type_name (error context) */
 
 /* Resolved string atom (borrowed) of a SYM-scalar broadcast input
  * (atom -RAY_SYM, or a 1-elem RAY_SYM_W{8,16,32,64} vec used as
@@ -1168,6 +1169,58 @@ static void if_str_desc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_
     }
 }
 
+/* Truthiness of one cell of an `if` condition vector, the rule is_truthy
+ * applies to an atom: null and zero are false, anything else is true. */
+static uint8_t if_cond_cell(ray_t* c, int64_t i) {
+    const void* d = ray_data(c);
+    switch (c->type) {
+    case RAY_BOOL: case RAY_U8:
+        return ((const uint8_t*)d)[i] != 0;
+    default: break;
+    }
+    if (ray_vec_is_null(c, i)) return 0;
+    switch (c->type) {
+    case RAY_I16:   return ((const int16_t*)d)[i] != 0;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+                    return ((const int32_t*)d)[i] != 0;
+    case RAY_I64: case RAY_TIMESTAMP:
+                    return ((const int64_t*)d)[i] != 0;
+    case RAY_F32: { float f = ((const float*)d)[i]; return f != 0.0f && f == f; }
+    case RAY_F64: { double f = ((const double*)d)[i]; return f != 0.0 && f == f; }
+    default:        return 0;   /* refused by if_cond_type_ok first */
+    }
+}
+
+/* Truthiness of an atom condition: is_truthy's rule (lang/internal.h, which
+ * this file cannot include), kept in step with it. */
+static uint8_t if_cond_atom(ray_t* x) {
+    if (RAY_ATOM_IS_NULL(x)) return 0;
+    switch (x->type) {
+    case -RAY_BOOL: return x->b8 != 0;
+    case -RAY_U8:   return x->u8 != 0;
+    case -RAY_I16:  return x->i16 != 0;
+    case -RAY_I32:  return x->i32 != 0;
+    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return x->i64 != 0;
+    case -RAY_F32: case -RAY_F64:
+        return x->f64 != 0.0 && x->f64 == x->f64;
+    default:
+        return 1;
+    }
+}
+
+/* A condition vector needs a truth value per cell: booleans, numbers and
+ * temporals have one.  Text, GUID and boxed lists do not. */
+static bool if_cond_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
@@ -1192,21 +1245,40 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         return else_v;
     }
 
-    /* A scalar condition has one cell, and the fills below index it per row —
-     * reading past it, so `(if false f 1.0)` returned a mixture of both
-     * branches.  Expand it once so every consumer sees a full-length mask;
-     * the selected arm declines a scalar condition outright, which is why
-     * this only ever mattered here. */
-    if (ray_is_atom(cond_v)) {
-        int64_t n = ray_is_atom(then_v) ? (ray_is_atom(else_v) ? 1 : else_v->len)
-                                        : then_v->len;
-        uint8_t on = cond_v->b8 ? 1 : 0;
+    /* The fills below read the condition as one BOOL byte per row.  A scalar
+     * condition has one cell, and indexing it per row read past it, so
+     * `(if false f 1.0)` returned a mixture of both branches.  A reduction
+     * in the condition, such as `(> (count x) 3)`, reaches here as a
+     * one-element vector rather than an atom and is the same scalar against
+     * vector branches.  A condition of another type, such as `(count x)` or
+     * an I64 column, was read byte by byte.  Every such condition becomes a
+     * full-length BOOL mask, with is_truthy's rule per cell; the
+     * selected arm declines all of them, which is why only this arm
+     * mattered. */
+    int64_t branch_len = 1;
+    if (!ray_is_atom(then_v) && then_v->len > branch_len) branch_len = then_v->len;
+    if (!ray_is_atom(else_v) && else_v->len > branch_len) branch_len = else_v->len;
+    if (!ray_is_atom(cond_v) && !if_cond_type_ok(cond_v->type)) {
+        int8_t ct = cond_v->type;
+        g->if_refused = true;
+        ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+        return ray_error("type", "if: condition must be boolean, numeric or temporal, got %s",
+                         ray_type_name(ct));
+    }
+    bool cond_bcast = ray_is_atom(cond_v) || (cond_v->len == 1 && branch_len > 1);
+    if (cond_bcast || cond_v->type != RAY_BOOL) {
+        int64_t n = cond_bcast ? branch_len : cond_v->len;
         ray_t* mask = ray_vec_new(RAY_BOOL, n);
         if (!mask || RAY_IS_ERR(mask)) {
             ray_release(cond_v); ray_release(then_v); ray_release(else_v);
             return mask ? mask : ray_error("oom", NULL);
         }
-        memset(ray_data(mask), on, (size_t)n);
+        uint8_t* m = (uint8_t*)ray_data(mask);
+        if (cond_bcast)
+            memset(m, ray_is_atom(cond_v) ? if_cond_atom(cond_v)
+                                          : if_cond_cell(cond_v, 0), (size_t)n);
+        else
+            for (int64_t i = 0; i < n; i++) m[i] = if_cond_cell(cond_v, i);
         mask->len = n;
         ray_release(cond_v);
         cond_v = mask;
@@ -1437,7 +1509,40 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
+static bool if_type_is_text(int8_t t) { return t == RAY_STR || t == RAY_SYM; }
+
+/* A branch that can stand in a text result: a text column or literal, a
+ * boxed list, an untyped node, or a null literal such as `0N`, which the
+ * fills write as the text null. */
+static bool if_branch_text_ok(ray_graph_t* g, ray_op_t* b) {
+    if (!b) return true;
+    int8_t t = b->out_type;
+    if (t <= 0 || t == RAY_LIST || if_type_is_text(t)) return true;
+    if (b->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, b->id);
+        if (ext && ext->literal && ray_is_atom(ext->literal) &&
+            RAY_ATOM_IS_NULL(ext->literal))
+            return true;
+    }
+    return false;
+}
+
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
+    /* A text result with a non-text branch has no column type: the fills
+     * read the numbers as string descriptors or symbol ids and returned
+     * garbage, e.g. `(if (< x 3) s x)` with s SYM and x I64. */
+    if (if_type_is_text(op->out_type)) {
+        ray_op_t* then_op = op_child(g, op, 1);
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        ray_op_t* else_op = ext ? op_node(g, ext->third_in) : NULL;
+        int8_t tt = then_op ? then_op->out_type : 0;
+        int8_t et = else_op ? else_op->out_type : 0;
+        if (!if_branch_text_ok(g, then_op) || !if_branch_text_ok(g, else_op)) {
+            g->if_refused = true;
+            return ray_error("type", "if: branches mix %s and %s",
+                             ray_type_name(tt), ray_type_name(et));
+        }
+    }
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
     if (!cond_v || RAY_IS_ERR(cond_v)) return cond_v;
 

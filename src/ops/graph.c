@@ -522,6 +522,29 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
         out_type = RAY_SYM;
     uint32_t est = cond->est_rows;
 
+    /* A null literal such as `0N` or `0Nf` beside a text branch is the text
+     * null.  Left as a number, the fills wrote its payload as a symbol id
+     * (NaN bits for 0Nf, INT64_MIN for 0N): a crash, or a symbol that is
+     * not null.  Swap it for the text null of the result type. */
+    if (out_type == RAY_STR || out_type == RAY_SYM) {
+        for (int side = 0; side < 2; side++) {
+            uint32_t bid = side ? else_id : then_id;
+            ray_op_t* b = &g->nodes[bid];
+            if (b->opcode != OP_CONST || b->out_type == RAY_STR || b->out_type == RAY_SYM)
+                continue;
+            ray_op_ext_t* bx = find_ext(g, bid);
+            if (!bx || !bx->literal || !ray_is_atom(bx->literal) ||
+                !RAY_ATOM_IS_NULL(bx->literal))
+                continue;
+            ray_t* tn = ray_typed_null((int8_t)-out_type);
+            if (!tn || RAY_IS_ERR(tn)) return NULL;
+            ray_op_t* nc = ray_const_atom(g, tn);
+            ray_release(tn);
+            if (!nc) return NULL;
+            if (side) else_id = nc->id; else then_id = nc->id;
+        }
+    }
+
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
 

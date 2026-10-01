@@ -478,19 +478,44 @@ RTTime -- [09:30:00.000 10:00:00.000 11:00:00.000]
 (at (at (select {s: (if cond s1 s2) from: T1StrB}) 's) 0) -- "worldv"
 
 ;; ====================================================================
-;; Section 22: exec_if — 1-row I64+STR table; fallback else path
-;;             Covers pivot.c line 116 (else { sp = ""; sl = 0; })
-;;             and line 139: triggered when then/else scalar is a
-;;             non-STR, non-SYM type (e.g. I64) in a STR-output if.
+;; Section 22: exec_if — a text branch with a numeric branch
+;;             A STR or SYM result has no cell for an I64: the fills read
+;;             the numbers as descriptors or symbol ids.  One row happened
+;;             to come back as the I64 branch; two rows gave ["" "b"] for
+;;             cond [true false], n1 [7 8], s2 ["a" "b"].  It is a type
+;;             error now, whatever the row count.
 ;; ====================================================================
 
 (set T1I64StrA (table [cond n1 s2] (list [true] [0] (list "worldv"))))
-(count (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's)) -- 1
-(at (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's) 0) -- 0
+(select {s: (if cond n1 s2) from: T1I64StrA}) !- type
 
 (set T1I64StrB (table [cond s1 n2] (list [false] (list "hellov") [0])))
-(count (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's)) -- 1
-(at (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's) 0) -- 0
+(select {s: (if cond s1 n2) from: T1I64StrB}) !- type
+
+(set T2I64Str (table [cond n1 s2] (list [true false] [7 8] (list "a" "b"))))
+(select {s: (if cond n1 s2) from: T2I64Str}) !- type
+(set T2I64Sym (table [x s] (list (til 6) (as 'SYM ["a" "b" "c" "d" "e" "f"]))))
+(select {k: (if (< x 3) s x) from: T2I64Sym}) !- type
+(select {k: (if (< x 3) s 5) from: T2I64Sym}) !- type
+(select {k: (if (< (count x) 3) s x) from: T2I64Sym}) !- type
+;; A null literal is not a number here: it stands for the text null and
+;; must keep working beside a text branch, in every place an `if` compiles.
+(as 'STR (at (select {k: (if (< x 2) s 0N) from: T2I64Sym}) 'k)) -- ["a" "b" "" "" "" ""]
+(as 'STR (at (select {k: (if (> x 3) 'q 0N) from: T2I64Sym}) 'k)) -- ["" "" "" "" "q" "q"]
+(as 'STR (at (select {k: (cond ((> x 4) s) (else 0N)) from: T2I64Sym}) 'k)) -- ["" "" "" "" "" "f"]
+(count (select {c: (count x) from: T2I64Sym by: {g: (if (> x 3) s 0N)}})) -- 3
+(count (select {from: T2I64Sym where: (== (if (> x 3) s 0N) 'e)})) -- 1
+(as 'STR (at (update {s: (if (> x 3) s 0N) from: T2I64Sym}) 's)) -- ["" "" "" "" "e" "f"]
+;; ...and it is a real null, whatever the literal's type: the fills wrote
+;; the literal's payload as a symbol id, so 0N gave a symbol that is not
+;; null, 0Nf (NaN bits) crashed the symbol lookup, and 0Nh named whichever
+;; symbol had that id.
+(nil? (at (select {k: (if (< x 2) s 0N) from: T2I64Sym}) 'k)) -- [false false true true true true]
+(nil? (at (select {k: (if (< x 2) s 0Nf) from: T2I64Sym}) 'k)) -- [false false true true true true]
+(set many (as 'SYM (as 'STR (+ 500000 (til 40000)))))
+(nil? (at (select {k: (if (< x 2) s 0Nh) from: T2I64Sym}) 'k)) -- [false false true true true true]
+(nil? (at (select {k: (if (> x 3) 'q 0Nf) from: T2I64Sym}) 'k)) -- [true true true true false false]
+(at (select {k: (if (> x 3) n 0Nf) from: (table [x n] (list (til 6) (list "a" "b" "c" "d" "e" "f")))}) 'k) -- ["" "" "" "" "e" "f"]
 
 ;; ====================================================================
 ;; Section 23: exec_if — STR output, SYM *atom* then-branch
@@ -780,6 +805,54 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 ;; condition outright, which is why only the eager one was affected.
 (at (select {r: (if false f 1.0) from: TZ}) 'r) -- [1.0 1.0 1.0]
 (at (select {r: (if true f 1.0) from: TZ}) 'r) -- [1.5 2.5 3.5]
+
+;; A reduction in the condition reaches the eager fill as a one-element BOOL
+;; vector, not an atom.  It was indexed per row too, so only the first row
+;; followed the condition and the rest read past the cell.
+(set TR (table [x s] (list (til 6) (as 'SYM ["a" "b" "c" "d" "e" "f"]))))
+(at (select {k: (if (> (count x) 3) s "") from: TR}) 'k) -- ["a" "b" "c" "d" "e" "f"]
+(at (select {k: (if (< (count x) 3) s "") from: TR}) 'k) -- ["" "" "" "" "" ""]
+(at (select {k: (if (> (sum x) 3) x 0) from: TR}) 'k) -- [0 1 2 3 4 5]
+(at (select {k: (if (< (sum x) 3) x 7) from: TR}) 'k) -- [7 7 7 7 7 7]
+(at (select {k: (if (> (max x) 3) 1.5 x) from: TR}) 'k) -- [1.5 1.5 1.5 1.5 1.5 1.5]
+(at (select {k: (if (< (max x) 3) 1.5 x) from: TR}) 'k) -- [0.0 1.0 2.0 3.0 4.0 5.0]
+
+;; A condition of another type follows the interpreter's truthiness (zero
+;; I64 or F64 and null are false) per cell.  It was read as raw bytes, so
+;; `(if (+ (count x) 250) ...)` took the else-branch on row 0 and read past
+;; the cell on later rows, and an I64 column picked only rows 0 and 8.
+(set TN (table [x f] (list (til 12) (+ 0.0 (til 12)))))
+(at (select {k: (if (+ (count x) 244) x 0) from: TN}) 'k) -- (til 12)
+(at (select {k: (if (- (count x) 12) x 7) from: TN}) 'k) -- (take 7 12)
+(at (select {k: (if (count x) x 0) from: TN}) 'k) -- (til 12)
+(at (select {k: (if (max f) x 0) from: TN}) 'k) -- (til 12)
+(at (select {k: (if x x 100) from: TN}) 'k) -- (concat 100 (+ 1 (til 11)))
+(at (select {k: (if f 1 0) from: TN}) 'k) -- (concat 0 (take 1 11))
+(at (select {k: (if (count x) x 0) from: (table [x] (list (til 256)))}) 'k) -- (til 256)
+
+;; Per condition type: null and zero are false, anything else true, the
+;; rule of the scalar `if`.  A wider column was read one byte per row, so an
+;; all-ones I64 condition was true on rows 0 and 8 only, I32 on every fourth
+;; row, I16 on every other one.  Text has no truth value and is refused.
+(at (select {r: (if c 10 20) from: (table [c] (list (take 1 9)))}) 'r) -- (take 10 9)
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'i32 [1 0 1 0 1 0 1 0 1])))}) 'r) -- [10 20 10 20 10 20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'i16 [1 0 1 0 1 0 1 0 1])))}) 'r) -- [10 20 10 20 10 20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'u8 [1 0 1 0 1 0 1 0 1])))}) 'r) -- [10 20 10 20 10 20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list [0 1 256 0N]))}) 'r) -- [20 10 10 20]
+(at (select {r: (if c 10 20) from: (table [c] (list (concat (as 'i32 [0 7]) 0Ni)))}) 'r) -- [20 10 20]
+(at (select {r: (if c 10 20) from: (table [c] (list [0.0 1.5 0Nf -2.0]))}) 'r) -- [20 10 20 10]
+(at (select {r: (if c 10 20) from: (table [c] (list (as 'date [0 1 2])))}) 'r) -- [20 10 10]
+(select {r: (if c 10 20) from: (table [c] (list ['a 'b 'c]))}) !- type
+(select {r: (if c 10 20) from: (table [c] (list (list "a" "b" "c")))}) !- type
+
+;; The same on enough rows for the fill to run on the worker pool.
+(set TP (table [x s] (list (til 200000) (as 'SYM (% (til 200000) 7)))))
+(sum (at (select {k: (if (> (count x) 3) x 0) from: TP}) 'k)) -- 19999900000
+(sum (at (select {k: (if (< (count x) 3) x 0) from: TP}) 'k)) -- 0
+(sum (at (select {k: (if (+ (count x) 0) x 0) from: TP}) 'k)) -- 19999900000
+(sum (at (select {k: (if (% x 2) x 0) from: TP}) 'k)) -- 10000000000
+(at (select {k: (if (> (count x) 3) s "") from: TP}) 'k) -- (as 'STR (at TP 's))
+(count (distinct (at (select {k: (if (< (count x) 3) s "") from: TP}) 'k))) -- 1
 
 
 ;; ── the null symbol needs no width handling ───────────────────────────
