@@ -1500,12 +1500,42 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             uint32_t col_id = col->id;
             ray_op_t* bucket = compile_expr_dag(g, elems[2]);
             if (!bucket) return NULL;
+            uint32_t bucket_id = bucket->id;
             col = &g->nodes[col_id];
-            /* xbar(x, b) = x - (x % b)  (stays in integer domain) */
+            /* xbar(x, b) = x - (x % b)  (stays in integer domain).
+             *
+             * A temporal column keeps its type (ray_xbar_fn returns the
+             * column's type, #669): `promote` folds TIMESTAMP into I64 and
+             * DATE / TIME into I32, so the bucketed result is cast back to
+             * the column's type — same width, so the cast is a retag (or a
+             * narrowing from an I64 bucket for DATE / TIME).  The eval path
+             * rejects a float bucket on a temporal column; declining here
+             * sends the projection to it for the same error.  A TIME bucket
+             * on a TIMESTAMP column is in milliseconds (ray_xbar_fn scales
+             * it to nanoseconds). */
+            int8_t col_t = col->out_type;
+            if (RAY_IS_PARTED(col_t)) col_t = (int8_t)RAY_PARTED_BASETYPE(col_t);
+            int8_t temporal = dag_type_is_temporal(col_t) ? col_t : 0;
+            if (temporal) {
+                int8_t bt = bucket->out_type;
+                if (RAY_IS_PARTED(bt)) bt = (int8_t)RAY_PARTED_BASETYPE(bt);
+                if (bt == RAY_F64 || bt == RAY_F32) return NULL;
+                if (temporal == RAY_TIMESTAMP && bt == RAY_TIME) {
+                    ray_op_t* scale = ray_const_i64(g, 1000000LL);
+                    if (!scale) return NULL;
+                    bucket = &g->nodes[bucket_id];
+                    bucket = ray_mul(g, bucket, scale);
+                    if (!bucket) return NULL;
+                    bucket_id = bucket->id;
+                    col = &g->nodes[col_id];
+                }
+            }
             ray_op_t* m = ray_mod(g, col, bucket);
             if (!m) return NULL;
             col = &g->nodes[col_id];
-            return ray_sub(g, col, m);
+            ray_op_t* r = ray_sub(g, col, m);
+            if (!r || !temporal) return r;
+            return ray_cast(g, r, temporal);
         }
 
         /* (if cond then else) — 4 elements (fn + 3 args).  Compiles
@@ -13629,7 +13659,9 @@ static void xbar_par_fn(void* vctx, uint32_t worker_id,
                 int64_t a = in[i];
                 int64_t q = a / b;
                 if ((a ^ b) < 0 && q * b != a) q--;
-                o[i] = q * b;
+                /* Unsigned wrap: only the null sentinel (INT64_MIN) rounds
+                 * below INT64_MIN, and the caller rewrites it as null. */
+                o[i] = (int64_t)((uint64_t)q * (uint64_t)b);
             }
         }
     } else if (c->out_type == RAY_I32 || c->out_type == RAY_DATE ||
