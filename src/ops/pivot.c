@@ -1510,6 +1510,22 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
 
 static bool if_type_is_text(int8_t t) { return t == RAY_STR || t == RAY_SYM; }
 
+/* A branch that can stand in a text result: a text column or literal, a
+ * boxed list, an untyped node, or a null literal such as `0N`, which the
+ * fills write as the text null. */
+static bool if_branch_text_ok(ray_graph_t* g, ray_op_t* b) {
+    if (!b) return true;
+    int8_t t = b->out_type;
+    if (t <= 0 || t == RAY_LIST || if_type_is_text(t)) return true;
+    if (b->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, b->id);
+        if (ext && ext->literal && ray_is_atom(ext->literal) &&
+            RAY_ATOM_IS_NULL(ext->literal))
+            return true;
+    }
+    return false;
+}
+
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
     /* A text result with a non-text branch has no column type: the fills
      * read the numbers as string descriptors or symbol ids and returned
@@ -1520,9 +1536,7 @@ ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
         ray_op_t* else_op = ext ? op_node(g, ext->third_in) : NULL;
         int8_t tt = then_op ? then_op->out_type : 0;
         int8_t et = else_op ? else_op->out_type : 0;
-        bool t_bad = tt > 0 && tt != RAY_LIST && !if_type_is_text(tt);
-        bool e_bad = et > 0 && et != RAY_LIST && !if_type_is_text(et);
-        if (t_bad || e_bad)
+        if (!if_branch_text_ok(g, then_op) || !if_branch_text_ok(g, else_op))
             return ray_error("type", "if: branches mix %s and %s",
                              ray_type_name(tt), ray_type_name(et));
     }

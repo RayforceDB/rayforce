@@ -50,3 +50,13 @@
 ;; every column a scalar: the one-row result stays
 (count (select {k: (+ (sum x) 0) from: TB})) -- 1
 (count (select {k: (+ (sum x) 0) y: x from: (table [x] (list (til 0)))})) -- 0
+
+;; The same over a parted table, whose columns count rows across partitions.
+(.sys.exec "rm -rf /tmp/rfl_scalar_bcast_parted")
+(.db.splayed.set "/tmp/rfl_scalar_bcast_parted/1/t/" (table [x] (list (til 4))))
+(.db.splayed.set "/tmp/rfl_scalar_bcast_parted/2/t/" (table [x] (list (+ 10 (til 3)))))
+(set TPB (.db.parted.get "/tmp/rfl_scalar_bcast_parted/" 't))
+(at (select {k: (+ (sum x) 0) y: x from: TPB}) 'k) -- (take 39 7)
+(at (select {y: x k: (if true 7 0) from: TPB}) 'k) -- (take 7 7)
+(count (select {k: (+ (sum x) 0) from: TPB})) -- 1
+(.sys.exec "rm -rf /tmp/rfl_scalar_bcast_parted") -- 0

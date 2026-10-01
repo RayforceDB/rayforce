@@ -14081,6 +14081,35 @@ static ray_t* update_scalar_vec(ray_t* v, int64_t nrows) {
     return a;
 }
 
+/* The cell an atom writes into a column of type ct (esz bytes wide).  GUID
+ * keeps its 16 bytes in ->obj, an I64 atom into F64 is converted, and an
+ * F32 atom holds its value widened in ->f64, so copying ->i64 wrote the
+ * low half of a double: zeros for most values. */
+static void update_atom_cell(const ray_t* a, int8_t ct, size_t esz, uint8_t elem[16]) {
+    memset(elem, 0, 16);
+    if (ct == RAY_GUID) {
+        if (a->obj) memcpy(elem, ray_data(a->obj), 16);
+    } else if (ct == RAY_F64 && a->type == -RAY_I64) {
+        double p = (double)a->i64; memcpy(elem, &p, sizeof p);
+    } else if (ct == RAY_F32 && (a->type == -RAY_F32 || a->type == -RAY_F64)) {
+        float f = (float)a->f64; memcpy(elem, &f, sizeof f);
+    } else {
+        memcpy(elem, &a->i64, esz);
+    }
+}
+
+/* Whether a DAG error must stand rather than hand the expression to the
+ * interpreter.  The interpreter's `if` and `cond` test one truth value, so
+ * for an expression holding either it is no equivalent: a DAG type error
+ * (mixed branch types, a condition with no truth value) became the
+ * then-branch written to every matched row.  Other expressions keep the
+ * fallback, which also covers operations the DAG does not take. */
+static bool update_dag_err_final(ray_t* out, ray_t* expr) {
+    if (!out || !RAY_IS_ERR(out) || ray_err_from_obj(out) == RAY_ERR_NYI) return false;
+    return expr_contains_call_named(expr, "if", 2) ||
+           expr_contains_call_named(expr, "cond", 4);
+}
+
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
     ray_t* out = NULL;
     ray_graph_t* g = ray_graph_new(sub);
@@ -14092,6 +14121,7 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
         }
         ray_graph_free(g);
     }
+    if (update_dag_err_final(out, expr)) return out;
     if (!out || RAY_IS_ERR(out)) {
         if (out) ray_error_free(out);
         int64_t ncols = ray_table_ncols(sub);
@@ -14180,15 +14210,9 @@ static ray_t* update_scatter(ray_t** slots, int64_t c, const int64_t* rows, int6
     uint8_t* d = (uint8_t*)ray_data(col);
     if (val->type < 0) {
         /* Atom broadcast: one encoded cell, written k times. */
-        uint8_t elem[16] = {0};
+        uint8_t elem[16];
         bool is_null = RAY_ATOM_IS_NULL(val);
-        if (ct == RAY_GUID) {
-            if (val->obj) memcpy(elem, ray_data(val->obj), 16);
-        } else if (ct == RAY_F64 && val->type == -RAY_I64) {
-            double p = (double)val->i64; memcpy(elem, &p, sizeof p);
-        } else {
-            memcpy(elem, &val->i64, esz);
-        }
+        update_atom_cell(val, ct, esz, elem);
         for (int64_t i = 0; i < k; i++) {
             if (is_null) ray_vec_set_null(col, rows[i], true);
             else {
@@ -14583,6 +14607,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_release(sub_tbl);
 
                 if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
+                /* A one-element result is the group's scalar, broadcast like
+                 * an atom; it failed the length check on groups of 2+ rows. */
+                agg_result = update_scalar_vec(agg_result, gsize);
 
                 /* Determine output type from first group */
                 if (first_group) {
@@ -14771,8 +14798,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                         ray_graph_free(ug);
                     }
                 }
-                if (!expr_vec || RAY_IS_ERR(expr_vec)) {
+                if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, update_expr))) {
                     /* Fallback: eval with column bindings */
+                    if (expr_vec) ray_error_free(expr_vec);
                     int64_t ncols_e = ray_table_ncols(tbl);
                     ray_env_push_query_scope();
                     for (int64_t c2 = 0; c2 < ncols_e; c2++) {
@@ -14885,15 +14913,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                          * GUID (16 B), whose payload lives in ->obj — copying
                          * ray_elem_size(ct) bytes from ->i64 would over-read an
                          * 8-byte buffer and write the wrong source for GUID. */
-                        uint8_t elem[16] = {0};
-                        if (ct == RAY_GUID) {
-                            if (expr_vec->obj) memcpy(elem, ray_data(expr_vec->obj), 16);
-                        } else if (ct == RAY_F64 && expr_vec->type == -RAY_I64) {
-                            double promoted = (double)expr_vec->i64;
-                            memcpy(elem, &promoted, sizeof promoted);
-                        } else {
-                            memcpy(elem, &expr_vec->i64, ray_elem_size(ct));
-                        }
+                        uint8_t elem[16];
+                        update_atom_cell(expr_vec, ct, ray_elem_size(ct), elem);
                         for (int64_t r = 0; r < nrows; r++) {
                             bcast = ray_vec_append(bcast, elem);
                             if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return bcast; }
@@ -15077,8 +15098,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     ray_graph_free(ug);
                 }
             }
-            if (!expr_vec || RAY_IS_ERR(expr_vec)) {
+            if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, update_expr))) {
                 /* Fallback: eval with column bindings */
+                if (expr_vec) ray_error_free(expr_vec);
                 int64_t ncols_f = ray_table_ncols(tbl);
                 ray_env_push_query_scope();
                 for (int64_t cf = 0; cf < ncols_f; cf++) {
@@ -15133,15 +15155,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     /* Wide enough for every fixed-width type incl. GUID (16 B,
                      * payload in ->obj); ray_elem_size(ct) bytes from ->i64
                      * would over-read an 8-byte buffer for GUID. */
-                    uint8_t elem[16] = {0};
-                    if (ct == RAY_GUID) {
-                        if (expr_vec->obj) memcpy(elem, ray_data(expr_vec->obj), 16);
-                    } else if (ct == RAY_F64 && expr_vec->type == -RAY_I64) {
-                        double promoted = (double)expr_vec->i64;
-                        memcpy(elem, &promoted, sizeof promoted);
-                    } else {
-                        memcpy(elem, &expr_vec->i64, ray_elem_size(ct));
-                    }
+                    uint8_t elem[16];
+                    update_atom_cell(expr_vec, ct, ray_elem_size(ct), elem);
                     for (int64_t r = 0; r < nrows; r++) {
                         bcast = ray_vec_append(bcast, elem);
                         if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
@@ -15271,12 +15286,8 @@ no_where_add_col:
             } else {
                 /* elem holds any fixed-width payload incl. GUID's 16 B (in
                  * ->obj); copying from ->i64 would be wrong/over-read for GUID. */
-                uint8_t elem[16] = {0};
-                if (ct == RAY_GUID) {
-                    if (expr_vec->obj) memcpy(elem, ray_data(expr_vec->obj), 16);
-                } else {
-                    memcpy(elem, &expr_vec->i64, ray_elem_size(ct));
-                }
+                uint8_t elem[16];
+                update_atom_cell(expr_vec, ct, ray_elem_size(ct), elem);
                 for (int64_t r = 0; r < nrows; r++) {
                     bcast = ray_vec_append(bcast, elem);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }

@@ -589,3 +589,25 @@
 (at (update {x: (if true 7 0) from: TU where: (> x 2)}) 'x) -- [0 1 2 7 7 7]
 (at (update {s: (if true 'q 'r) from: TU}) 's) -- ['q 'q 'q 'q 'q 'q]
 (at (update {x: (+ (sum x) 1) from: (table [x] (list [5]))}) 'x) -- [6]
+;; Under `where:` the update keeps the compiled expression's own error.  It
+;; used to fall back to the interpreter, whose `if` tests one truth value:
+;; the then-branch went to every matched row with no error.
+(set TW (table [x s] (list (til 4) ['ab 'cd 'ef 'gh])))
+(as 'STR (at (update {s: (if (> x 2) s 0N) from: TW where: (> x 0)}) 's)) -- ["ab" "" "" "gh"]
+(update {s: (if (> x 1) 'q x) from: TW where: (> x 0)}) !- type
+(update {s: (if s 1 2) from: TW where: (> x 0)}) !- type
+(set TWI (table [x s] (list (til 6) ['a 'b 'c 'd 'e 'f])))
+(update {s: (if (> x 3) s 0N) from: 'TWI where: (> x 2)})
+(as 'STR (at TWI 's)) -- ["a" "b" "c" "" "e" "f"]
+
+;; An F32 atom keeps its value widened; the broadcast copied the low half of
+;; the double and wrote zeros.
+(set F32V (fn [x] (at (select {from: (table [v] (list x)) v: (as 'F32 v)}) 'v)))
+(set TF (table [x f] (list (til 3) (F32V [1.5 2.5 3.5]))))
+(at (update {f: (as 'F32 (+ (sum f) 0)) from: TF}) 'f) -- (F32V [7.5 7.5 7.5])
+(at (update {f: (as 'F32 (+ (sum f) 0)) from: TF where: (> x 0)}) 'f) -- (F32V [1.5 7.5 7.5])
+(at (update {g: (as 'F32 (+ (sum f) 0)) from: TF}) 'g) -- (F32V [7.5 7.5 7.5])
+
+;; By group, a one-element result is the group's scalar.
+(at (update {k: (+ (sum x) 0) from: (table [x g] (list (til 5) [0 0 0 1 2])) by: g}) 'k) -- [3 3 3 3 4]
+(at (update {k: (if (> (count x) 1) 'many 'one) from: (table [x g] (list (til 5) [0 0 0 1 2])) by: g}) 'k) -- ['many 'many 'many 'one 'one]

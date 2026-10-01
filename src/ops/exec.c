@@ -3612,11 +3612,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 bool has_full = false;
                 for (int64_t c = 0; c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
-                    if (cv && cv->type > 0 && cv->len == nr_in) { has_full = true; break; }
+                    /* a parted column counts its rows across segments */
+                    if (cv && cv->type > 0 && ray_parted_nrows(cv) == nr_in) { has_full = true; break; }
                 }
                 for (int64_t c = 0; has_full && c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
-                    if (!cv || cv->type <= 0 || cv->len != 1) continue;
+                    if (!cv || cv->type <= 0 || RAY_IS_PARTED(cv->type) ||
+                        cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
                     ray_t* n_obj = make_i64(nr_in);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
                     if (n_obj) ray_release(n_obj);

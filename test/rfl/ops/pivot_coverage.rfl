@@ -498,6 +498,14 @@ RTTime -- [09:30:00.000 10:00:00.000 11:00:00.000]
 (select {k: (if (< x 3) s x) from: T2I64Sym}) !- type
 (select {k: (if (< x 3) s 5) from: T2I64Sym}) !- type
 (select {k: (if (< (count x) 3) s x) from: T2I64Sym}) !- type
+;; A null literal is not a number here: it stands for the text null and
+;; must keep working beside a text branch, in every place an `if` compiles.
+(as 'STR (at (select {k: (if (< x 2) s 0N) from: T2I64Sym}) 'k)) -- ["a" "b" "" "" "" ""]
+(as 'STR (at (select {k: (if (> x 3) 'q 0N) from: T2I64Sym}) 'k)) -- ["" "" "" "" "q" "q"]
+(as 'STR (at (select {k: (cond ((> x 4) s) (else 0N)) from: T2I64Sym}) 'k)) -- ["" "" "" "" "" "f"]
+(count (select {c: (count x) from: T2I64Sym by: {g: (if (> x 3) s 0N)}})) -- 3
+(count (select {from: T2I64Sym where: (== (if (> x 3) s 0N) 'e)})) -- 1
+(as 'STR (at (update {s: (if (> x 3) s 0N) from: T2I64Sym}) 's)) -- ["" "" "" "" "e" "f"]
 
 ;; ====================================================================
 ;; Section 23: exec_if — STR output, SYM *atom* then-branch
