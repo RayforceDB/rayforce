@@ -8304,6 +8304,9 @@ static bool try_strlen_sumavg_input(ray_graph_t* g, ray_t* tbl,
  * group-aggregation loops can read row-wise without out-of-bounds access. */
 static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
     if (!src || RAY_IS_ERR(src) || nrows < 0) return NULL;
+    /* A STR atom has no fixed-width payload to copy: the switch below has no
+     * case for it, and the NULL surfaced as "oom". */
+    if (src->type == -RAY_STR) return broadcast_scalar(src, nrows);
 
     int8_t out_type = ray_is_atom(src) ? (int8_t)-src->type : src->type;
     if (out_type <= 0 || out_type >= RAY_TYPE_COUNT) return NULL;
@@ -8319,6 +8322,8 @@ static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
         char* d = (char*)ray_data(out);
         for (int64_t i = 0; i < nrows; i++)
             memcpy(d + (size_t)i * esz, s, esz);
+        /* copied STR descriptors still point into the source's pool */
+        if (out_type == RAY_STR) col_propagate_str_pool(out, src);
         return out;
     }
 

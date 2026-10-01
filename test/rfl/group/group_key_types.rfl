@@ -217,3 +217,10 @@
 (at (select {from: Tconst by: (let a ref 7) c: (count ref) where: (> v 69990)}) 'c) -- [9]
 (at (select {from: (table [ref v] (list (as 'SYM (% (til 70) 3)) (til 70))) by: (let a ref "const") c: (count ref)}) 'c) -- [70]
 (at (select {from: (table [ref v] (list ['a] [1])) by: "const" c: (count ref)}) 'c) -- [1]
+
+;; A STR atom as an aggregate input is that value in every group; it had no
+;; broadcast case and the query failed with "oom" (or worse).
+(set TSa (table [x s] (list (til 6) ['a 'b 'c 'a 'b 'c])))
+(at (select {c: (first (upper "a")) from: TSa by: s}) 'c) -- ["A" "A" "A"]
+(at (select {c: (last (trim " a")) from: TSa by: s}) 'c) -- ["a" "a" "a"]
+(at (select {c: (first "zz") from: TSa}) 'c) -- ["zz"]
