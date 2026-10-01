@@ -12257,9 +12257,11 @@ by_dict_done:
      * HINT, which the v2 radix engine uses to emit only N groups instead of
      * materializing all of them.  The hint is advisory: HEAD still trims and
      * apply_sort_take still runs at the end, so correctness never depends on
-     * it.  NOT pushed with a group-by: negative (tail) and range takes, which
-     * both need the full group set; and any asc:/desc: shape, which reorders
-     * the groups first (that shape also owns the desc+take emit-filter
+     * it.  A range take [start amount] with start >= 0 pushes start+amount the
+     * same way (apply_sort_take then slices the range out of those groups).
+     * NOT pushed with a group-by: negative (tail) takes and ranges counted
+     * from the end, which need the full group set; and any asc:/desc: shape,
+     * which reorders the groups first (that shape also owns the desc+take emit-filter
      * machinery — has_sort keeps the two disjoint).  Also NOT pushed when a
      * deferred key WHERE runs AFTER the group (post_group_where_expr): that
      * filter drops result rows, so taking the first N groups before it would
@@ -12307,6 +12309,10 @@ by_dict_done:
                 else { const int32_t* r32 = (const int32_t*)rv;
                        take_pre.a = r32[0]; take_pre.b = r32[1]; }
                 ray_release(tv);
+                /* [start amount] from the front reads only the first
+                 * start+amount groups: push that bound like an atom take. */
+                if (take_pre.a >= 0 && take_pre.b > 0 && take_pre.a <= INT64_MAX - take_pre.b)
+                    root = ray_head(g, root, take_pre.a + take_pre.b);
             } else take_range = tv;  /* apply after DAG execution */
         } else {
             int8_t tv_t = tv->type;            /* capture BEFORE free */

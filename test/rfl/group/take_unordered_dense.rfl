@@ -19,3 +19,61 @@
 (set r3 (select {from: t f: (first v) by: {k: k j: (% v 3)} take: 7}))
 (count r3) -- 7
 (all (== (at r3 'f) (asc (at r3 'f)))) -- true
+
+;; ─── first N groups found before aggregating ────────────────────────────────
+;; Over a large input an unordered take: N finds its N groups first (the first
+;; N distinct key tuples in row order) and aggregates only their rows.  Every
+;; answer must be the first N groups of the full grouped result in first-seen
+;; order (ascending first row f), each aggregate over ALL rows of its group.
+(set eqt (fn [x y] (and (all (== (cols x) (cols y))) (== (count x) (count y)) (all (map (fn [c] (and (== (type (at x c)) (type (at y c))) (all (== (at x c) (at y c))))) (cols x))))))
+(set n2 300000)
+(set i2 (til n2))
+;; u: 50000 groups of 6 rows (rows j, j+50000, ...); s/w repeat with u, so
+;; [u s] and [u s w] are 50000 groups of 6 too; nu has a null key at row 0
+(set F (table [i u s w y d ts nu v g fl h] (list i2 (% (* i2 7919) 50000) (as 'SYM (as 'STR (% i2 5))) (as 'I32 (% i2 10)) (as 'SYM (as 'STR (% (* i2 7919) 50000))) (as 'DATE (% (* i2 31) 20000)) (as 'TIMESTAMP (* 1000 (% (* i2 13) 60000))) (at (concat [0N] (til 4999)) (% (* i2 7919) 5000)) (at (concat [0N] (til 1000)) (% i2 1001)) (as 'SYM (as 'STR (% i2 97))) (* 0.5 (as 'F64 i2)) (div i2 2))))
+(eqt (select {from: F by: [u s] c: (count u) f: (min i) take: 10}) (take (xasc (select {from: F by: [u s] c: (count u) f: (min i)}) 'f) 10)) -- true
+(at (select {from: F by: [u s] c: (count u) take: 10}) 'c) -- [6 6 6 6 6 6 6 6 6 6]
+(eqt (select {from: F by: u c: (count u) sv: (sum v) av: (avg v) mn: (min v) mx: (max v) f: (min i) take: 10}) (take (xasc (select {from: F by: u c: (count u) sv: (sum v) av: (avg v) mn: (min v) mx: (max v) f: (min i)}) 'f) 10)) -- true
+(eqt (select {from: F by: y c: (count v) sv: (sum v) f: (min i) take: 10}) (take (xasc (select {from: F by: y c: (count v) sv: (sum v) f: (min i)}) 'f) 10)) -- true
+(eqt (select {from: F by: [u s w] c: (count u) sv: (sum v) f: (min i) take: 10}) (take (xasc (select {from: F by: [u s w] c: (count u) sv: (sum v) f: (min i)}) 'f) 10)) -- true
+(eqt (select {from: F where: (> v 500) by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (take (xasc (select {from: F where: (> v 500) by: [u s] c: (count u) sv: (sum v) f: (min i)}) 'f) 10)) -- true
+(at (select {from: F where: (> v 500) by: [u s] f: (min i) take: 3}) 'f) -- [502 503 504]
+(eqt (select {from: F by: [u s] c: (count u) mx: (max v) f: (min i) take: 600}) (take (xasc (select {from: F by: [u s] c: (count u) mx: (max v) f: (min i)}) 'f) 600)) -- true
+;; groups of two consecutive rows: 2000 matches in the first task spill to a
+;; second collecting pass
+(eqt (select {from: F by: h c: (count v) sv: (sum v) f: (min i) take: 1000}) (take (xasc (select {from: F by: h c: (count v) sv: (sum v) f: (min i)}) 'f) 1000)) -- true
+(eqt (select {from: F by: [i s] c: (count u) mx: (max v) f: (min i) take: 1000}) (take (xasc (select {from: F by: [i s] c: (count u) mx: (max v) f: (min i)}) 'f) 1000)) -- true
+(eqt (select {from: F by: d c: (count v) mn: (min ts) f: (min i) take: 5}) (take (xasc (select {from: F by: d c: (count v) mn: (min ts) f: (min i)}) 'f) 5)) -- true
+(eqt (select {from: F by: ts c: (count v) av: (avg w) f: (min i) take: 7}) (take (xasc (select {from: F by: ts c: (count v) av: (avg w) f: (min i)}) 'f) 7)) -- true
+(eqt (select {from: F by: nu c: (count v) sv: (sum v) f: (min i) take: 10}) (take (xasc (select {from: F by: nu c: (count v) sv: (sum v) f: (min i)}) 'f) 10)) -- true
+(at (at (select {from: F by: nu c: (count v) take: 10}) 'nu) 0) -- 0Nl
+(eqt (select {from: F by: [nu w] c: (count v) sv: (sum v) f: (min i) take: 10}) (take (xasc (select {from: F by: [nu w] c: (count v) sv: (sum v) f: (min i)}) 'f) 10)) -- true
+;; the range form [start amount] reads the first start+amount groups
+(eqt (select {from: F by: [u s] c: (count u) f: (min i) take: [3 5]}) (take (xasc (select {from: F by: [u s] c: (count u) f: (min i)}) 'f) [3 5])) -- true
+(eqt (select {from: F by: [u s] c: (count u) f: (min i) take: [49998 5]}) (take (xasc (select {from: F by: [u s] c: (count u) f: (min i)}) 'f) [49998 5])) -- true
+(count (select {from: F by: [u s] c: (count u) take: [60000 5]})) -- 0
+(count (select {from: F by: [u s] c: (count u) take: 0})) -- 0
+;; more wanted than there are groups: all of them, in first-seen order
+(eqt (select {from: F by: w c: (count u) f: (min i) take: 100}) (xasc (select {from: F by: w c: (count u) f: (min i)}) 'f)) -- true
+(count (select {from: (take F 0) by: u c: (count u) take: 10})) -- 0
+(count (select {from: F where: (> v 100000) by: u c: (count u) take: 10})) -- 0
+;; shapes the pre-pass leaves to the full aggregation answer the same way
+(eqt (select {from: F by: g c: (count u) f: (min i) take: 10}) (take (xasc (select {from: F by: g c: (count u) f: (min i)}) 'f) 10)) -- true
+(eqt (select {from: F by: u c: (count u) fv: (first v) f: (min i) take: 10}) (take (xasc (select {from: F by: u c: (count u) fv: (first v) f: (min i)}) 'f) 10)) -- true
+(at (select {from: F by: u sf: (sum fl) take: 3}) 'u) -- [0 7919 15838]
+;; a splayed (mapped) copy answers exactly like the in-memory table
+(.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0
+(.db.splayed.set "rf_test_firstn_take/" F)
+(set Fs (.db.splayed.get "rf_test_firstn_take/"))
+(eqt (select {from: Fs by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (select {from: F by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10})) -- true
+(eqt (select {from: Fs by: y c: (count u) mx: (max v) f: (min i) take: 10}) (select {from: F by: y c: (count u) mx: (max v) f: (min i) take: 10})) -- true
+;; a parted table keeps the post-execution take over its own group order:
+;; the take is the head of its full result, and the groups are exact
+(.db.splayed.set "rf_test_firstn_parted/1/t/" (take F [0 100000]))
+(.db.splayed.set "rf_test_firstn_parted/2/t/" (take F [100000 100000]))
+(.db.splayed.set "rf_test_firstn_parted/3/t/" (take F [200000 100000]))
+(set Fp (.db.parted.get "rf_test_firstn_parted/" 't))
+(set Pfull (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i)}))
+(eqt (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (take Pfull 10)) -- true
+(eqt (xasc Pfull 'f) (xasc (select {from: F by: [u s] c: (count u) sv: (sum v) f: (min i)}) 'f)) -- true
+(.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0
