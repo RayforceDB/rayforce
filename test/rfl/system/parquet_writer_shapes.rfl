@@ -47,9 +47,13 @@
 (.parquet.splayed "test/data/parquet/empty-group.parquet" "rf_test_pq_slash") !- parquet
 (.sys.exec "rm -rf rf_test_pq_slash rf_test_pq_slash.parquet-partial") -- 0
 
-;; ms timestamps past the nanosecond range (a 9999-12-31 sentinel) read
-;; as null under native null semantics; strict mode rejects them
+;; ms timestamps outside the nanosecond range (a 9999-12-31 "end of time"
+;; sentinel, a 1000-01-01 date) clamp to the nearest representable instant,
+;; so comparisons keep their meaning: a 9999 validity end is not "expired".
+;; Strict mode rejects them.
 (set tr (.parquet.read "test/data/parquet/timestamp-range.parquet"))
-(count tr) -- 3
-(count (select {from: tr where: (nil? ts)})) -- 1
+(count tr) -- 4
+(count (select {from: tr where: (nil? ts)})) -- 0
+(count (select {from: tr where: (> ts 2100.01.01D00:00:00.000000000)})) -- 1
+(count (select {from: tr where: (< ts 1900.01.01D00:00:00.000000000)})) -- 1
 (.parquet.read {strict: true} "test/data/parquet/timestamp-range.parquet") !- parquet

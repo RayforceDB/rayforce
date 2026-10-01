@@ -831,7 +831,9 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
     return "missing data page";
 }
 
-static bool pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p, uint32_t len) {
+#define PQ_PUT_FAIL "value conversion or allocation failed"
+/* Convert one value into row `row`; NULL, or the reason it failed. */
+static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p, uint32_t len) {
     ray_t* v = *vp;
     switch (s->physical) {
     case 0:
@@ -844,22 +846,25 @@ static bool pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p
         if ((s->converted == 11 && x > UINT8_MAX) ||
             (s->converted == 12 && x > UINT16_MAX) ||
             (s->converted == 15 && (x < INT8_MIN || x > INT8_MAX)) ||
-            (s->converted == 16 && (x < INT16_MIN || x > INT16_MAX))) return false;
-        if (s->type == RAY_DATE && __builtin_sub_overflow(x,PQ_EPOCH_DAYS,&x)) return false;
+            (s->converted == 16 && (x < INT16_MIN || x > INT16_MAX))) return PQ_PUT_FAIL;
+        if (s->type == RAY_DATE && __builtin_sub_overflow(x,PQ_EPOCH_DAYS,&x)) return PQ_PUT_FAIL;
+        int64_t raw = x;
         if (s->type == RAY_TIMESTAMP &&
             (__builtin_sub_overflow(x,PQ_EPOCH_NS/s->scale,&x) || __builtin_mul_overflow(x,s->scale,&x))) {
-            /* Outside the native nanosecond range (~1677-2262), e.g. a
-             * 9999-12-31 "end of time" sentinel at ms precision.  Native
-             * null semantics apply unless strict mode rejects it. */
-            if (s->strict) return false;
-            x = NULL_I64;
+            /* Outside the native nanosecond range, e.g. a 9999-12-31 "end
+             * of time" sentinel at ms precision.  Clamp to the nearest
+             * representable instant so comparisons keep their meaning (a
+             * null would sort below every timestamp and read as expired);
+             * strict mode rejects the value instead. */
+            if (s->strict) return "timestamp outside the native nanosecond range (strict mode)";
+            x = raw >= PQ_EPOCH_NS/s->scale ? INT64_MAX : INT64_MIN+1;
         }
         if (s->type == RAY_I16) {
-            if (x < INT16_MIN || x > INT16_MAX) return false;
+            if (x < INT16_MIN || x > INT16_MAX) return PQ_PUT_FAIL;
             ((int16_t*)ray_data(v))[row] = (int16_t)x;
         } else if (s->type == RAY_I64 || s->type == RAY_TIMESTAMP) ((int64_t*)ray_data(v))[row] = x;
         else {
-            if (x < INT32_MIN || x > INT32_MAX) return false;
+            if (x < INT32_MIN || x > INT32_MAX) return PQ_PUT_FAIL;
             ((int32_t*)ray_data(v))[row] = (int32_t)x;
         }
         break;
@@ -867,18 +872,18 @@ static bool pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p
     case 4: { uint32_t u = pq_u32(p); memcpy((float*)ray_data(v)+row,&u,4); break; }
     case 5: { uint64_t u = pq_u64(p); memcpy((double*)ray_data(v)+row,&u,8); break; }
     case 6: {
-        if (s->strict && s->converted == 0 && !pq_utf8(p,len)) return false;
+        if (s->strict && s->converted == 0 && !pq_utf8(p,len)) return PQ_PUT_FAIL;
         ray_t* next = ray_str_vec_set(v,row,(const char*)p,len);
-        if (!next || RAY_IS_ERR(next)) { if (next) ray_release(next); return false; }
+        if (!next || RAY_IS_ERR(next)) { if (next) ray_release(next); return PQ_PUT_FAIL; }
         *vp = v = next; break;
     }
-    default: return false;
+    default: return PQ_PUT_FAIL;
     }
     uint8_t attrs = v->attrs;
     v->attrs |= RAY_ATTR_HAS_NULLS;
     if (!ray_vec_is_null(v,row)) v->attrs = attrs;
-    else if (s->strict) return false;
-    return true;
+    else if (s->strict) return PQ_PUT_FAIL;
+    return NULL;
 }
 /* PLAIN signed integers can go straight into native blocks. SSE2 handles
  * copy and sentinel detection together; scalar code also handles big endian. */
@@ -993,8 +998,9 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             const uint8_t* p = s->physical == 6 ? c->strings[id].p :
                 c->dict+(size_t)id*((s->physical == 1 || s->physical == 4) ? 4 : 8);
             uint32_t len = s->physical == 6 ? c->strings[id].n : 0;
-            if (len > PQ_MAX_PAGE || (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) ||
-                !pq_put_value(&v,i,s,p,len)) return "value conversion or allocation failed";
+            if (len > PQ_MAX_PAGE || (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX)) return PQ_PUT_FAIL;
+            const char* perr = pq_put_value(&v,i,s,p,len);
+            if (perr) return perr;
             *out = v;
             /* Convert once, fill native values. STR descriptors may safely
              * share the same immutable bytes within this batch's pool. */
@@ -1049,7 +1055,9 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                     if (!pq_take(&c->values,len,&p)) return "truncated string data";
                 } else if (!pq_take(&c->values,(s->physical == 1 || s->physical == 4) ? 4 : 8,&p)) return "truncated numeric data";
                 if (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
-                if (len > PQ_MAX_PAGE || !pq_put_value(&v,i,s,p,len)) return "value conversion or allocation failed";
+                if (len > PQ_MAX_PAGE) return PQ_PUT_FAIL;
+                const char* perr = pq_put_value(&v,i,s,p,len);
+                if (perr) return perr;
                 *out = v;
             }
         }
@@ -1171,6 +1179,7 @@ ray_t* ray_parquet_next(ray_parquet_t* r) {
     ray_t** cols = ray_calloc_raw((size_t)r->nselected*sizeof(*cols));
     uint8_t* keep = NULL;
     const char** errors = NULL;
+    int64_t bad_col = -1;
     if (!cols) { ray_release(tbl); r->failed = true; return ray_error("oom",NULL); }
     ray_pool_t* pool = rows >= 4096 && r->nselected > 1 ? ray_pool_get() : NULL;
     if (ray_pool_par_dispatch_ok(pool,rows,4096)) {
@@ -1180,11 +1189,11 @@ ray_t* ray_parquet_next(ray_parquet_t* r) {
         ray_pool_dispatch_n(pool,pq_decode_task,&work,(uint32_t)r->nselected);
         r->parallel_batches++;
         for (int64_t i = 0; i < r->nselected; i++) {
-            if (errors[i] || !cols[i]) { err = errors[i] ? errors[i] : "scan interrupted"; goto fail; }
+            if (errors[i] || !cols[i]) { err = errors[i] ? errors[i] : "scan interrupted"; bad_col = i; goto fail; }
         }
     } else for (int64_t i = 0; i < r->nselected; i++) {
         err = pq_decode_column(r,i,&cols[i],rows);
-        if (err) goto fail;
+        if (err) { bad_col = i; goto fail; }
     }
     int64_t kept = rows;
     if (r->filter_pos >= 0 && rows) {
@@ -1238,7 +1247,12 @@ fail:
     ray_free_raw(cols); ray_free_raw(keep); ray_free_raw(errors);
     if (tbl) ray_release(tbl);
     r->failed = true;
-    return ray_interrupted() ? ray_error("cancel","parquet scan interrupted") : pq_error(err);
+    if (ray_interrupted()) return ray_error("cancel","parquet scan interrupted");
+    if (bad_col >= 0) {
+        ray_t* name = ray_sym_str(r->schema[r->selected[bad_col]].name);
+        return ray_error("parquet","%s (column %s)",err,name ? ray_str_ptr(name) : "?");
+    }
+    return pq_error(err);
 }
 
 /* Optional Rayfall scan settings: {columns: [x y] range: {column: k min: 1 max: 9}}.
