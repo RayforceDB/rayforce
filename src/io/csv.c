@@ -1371,6 +1371,97 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
     return n;
 }
 
+/* Row starts of the next `max_rows` rows from `off`: the parallel window
+ * scan when it applies, else the serial limited scan — the pairing the
+ * streaming import loop uses, so both see identical row boundaries.
+ * *avg_row is refined from each chunk. */
+static int64_t csv_scan_rows_chunk(const char* buf, size_t file_size,
+                                   size_t off, int64_t max_rows,
+                                   size_t* avg_row, bool data_has_quotes,
+                                   int64_t** offs, ray_t** hdr, size_t* next) {
+    int64_t cnt = build_row_offsets_window(buf, file_size, off, max_rows,
+                                           *avg_row, data_has_quotes,
+                                           offs, hdr, next);
+    if (cnt == -2)
+        cnt = build_row_offsets_limited(buf, file_size, off, max_rows,
+                                        data_has_quotes, offs, hdr, next);
+    if (cnt > 0 && *next > off) *avg_row = (*next - off) / (size_t)cnt;
+    return cnt;
+}
+
+#define CSV_SAMPLE_SCAN_ROWS (1 << 20)
+
+/* Type-inference sample for the streaming importers, chosen exactly as
+ * .csv.read chooses it: CSV_SAMPLE_ROWS rows at indices
+ * si * (n - 1) / (CSV_SAMPLE_ROWS - 1) over all n data rows, or every row
+ * when n is no larger.  The streaming paths never hold all row offsets, so
+ * this costs a counting pass and a picking pass over the row boundaries —
+ * but it is what keeps .csv.splayed / .csv.parted inferring the same column
+ * types as .csv.read for the same file (SYM vs STR is a sample-cardinality
+ * decision, so any other sample can disagree).  Fed to
+ * csv_infer_types_from_offsets with n_rows == the sample size, every row
+ * given is used.  Same contract as build_row_offsets_limited: the row
+ * count, 0 on allocation failure, -1 if interrupted. */
+static int64_t csv_streaming_sample(const char* buf, size_t file_size,
+                                    size_t data_offset, bool data_has_quotes,
+                                    int64_t** offsets_out, ray_t** hdr_out) {
+    *offsets_out = NULL;
+    *hdr_out = NULL;
+    if (data_offset >= file_size) return 0;
+
+    /* Pass 1: count rows. */
+    int64_t total = 0;
+    size_t avg_row = 64;
+    for (size_t off = data_offset; off < file_size; ) {
+        int64_t* o = NULL; ray_t* h = NULL; size_t next = off;
+        int64_t cnt = csv_scan_rows_chunk(buf, file_size, off,
+                                          CSV_SAMPLE_SCAN_ROWS, &avg_row,
+                                          data_has_quotes, &o, &h, &next);
+        scratch_free(h);
+        if (cnt < 0) return -1;
+        if (cnt == 0 || next <= off) break;
+        total += cnt;
+        off = next;
+    }
+
+    if (total <= CSV_SAMPLE_ROWS)
+        return build_row_offsets_limited(buf, file_size, data_offset,
+                                         CSV_SAMPLE_ROWS, data_has_quotes,
+                                         offsets_out, hdr_out, NULL);
+
+    ray_t* hdr = NULL;
+    int64_t* picked = (int64_t*)scratch_alloc(&hdr,
+        (size_t)CSV_SAMPLE_ROWS * sizeof(int64_t));
+    if (!picked) return 0;
+
+    /* Pass 2: pick the sample rows' offsets. */
+    int64_t si = 0, base = 0;
+    int64_t target = 0;                 /* index of sample row si */
+    for (size_t off = data_offset; off < file_size && si < CSV_SAMPLE_ROWS; ) {
+        int64_t* o = NULL; ray_t* h = NULL; size_t next = off;
+        int64_t cnt = csv_scan_rows_chunk(buf, file_size, off,
+                                          CSV_SAMPLE_SCAN_ROWS, &avg_row,
+                                          data_has_quotes, &o, &h, &next);
+        if (cnt < 0) { scratch_free(h); scratch_free(hdr); return -1; }
+        if (cnt == 0 || next <= off) { scratch_free(h); break; }
+        while (si < CSV_SAMPLE_ROWS && target < base + cnt) {
+            picked[si++] = o[target - base];
+            if (si < CSV_SAMPLE_ROWS)
+                target = si * (total - 1) / (CSV_SAMPLE_ROWS - 1);
+        }
+        scratch_free(h);
+        base += cnt;
+        off = next;
+    }
+    if (si != CSV_SAMPLE_ROWS) {        /* file changed under the map? */
+        scratch_free(hdr);
+        return 0;
+    }
+    *offsets_out = picked;
+    *hdr_out = hdr;
+    return si;
+}
+
 /* --------------------------------------------------------------------------
  * Per-column local dedupe — the parallel front half of the sym intern.
  *
@@ -3650,12 +3741,10 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     } else if (!col_types_in) {
         ray_t* sample_offsets_hdr = NULL;
         int64_t* sample_offsets = NULL;
-        int64_t sample_n = build_row_offsets_limited(buf, file_size, data_offset,
-                                                     CSV_SAMPLE_ROWS,
-                                                     data_has_quotes,
-                                                     &sample_offsets,
-                                                     &sample_offsets_hdr,
-                                                     NULL);
+        int64_t sample_n = csv_streaming_sample(buf, file_size, data_offset,
+                                                data_has_quotes,
+                                                &sample_offsets,
+                                                &sample_offsets_hdr);
         if (sample_n < 0) {
             ray_vm_unmap_file(buf, file_size);
             return RAY_ERR_CANCEL;
@@ -3974,12 +4063,10 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     } else if (!col_types_in) {
         ray_t* sample_offsets_hdr = NULL;
         int64_t* sample_offsets = NULL;
-        int64_t sample_n = build_row_offsets_limited(buf, file_size, data_offset,
-                                                     CSV_SAMPLE_ROWS,
-                                                     data_has_quotes,
-                                                     &sample_offsets,
-                                                     &sample_offsets_hdr,
-                                                     NULL);
+        int64_t sample_n = csv_streaming_sample(buf, file_size, data_offset,
+                                                data_has_quotes,
+                                                &sample_offsets,
+                                                &sample_offsets_hdr);
         if (sample_n < 0) {
             ray_vm_unmap_file(buf, file_size);
             return RAY_ERR_CANCEL;

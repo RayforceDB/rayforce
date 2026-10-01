@@ -32,6 +32,7 @@
 #include "ops/idxop.h"
 #include <stdio.h>
 #include <unistd.h>
+#include <dirent.h>
 
 static char tmp_csv_path[64];
 static const char* tmp_csv(void) {
@@ -1883,6 +1884,72 @@ static test_result_t test_csv_native_pooled_batches(void) {
     PASS();
 }
 
+/* Recursive remove for the import tests' output trees. */
+static void csv_test_rm_rf(const char* path) {
+    DIR* d = opendir(path);
+    if (d) {
+        struct dirent* ent;
+        char sub[1024];
+        while ((ent = readdir(d)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+            snprintf(sub, sizeof(sub), "%s/%s", path, ent->d_name);
+            csv_test_rm_rf(sub);
+        }
+        closedir(d);
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+/* The streaming importers must infer the same column types as .csv.read.
+ * SYM vs STR is decided from a sample's cardinality, so it depends on
+ * which rows are sampled: here the first 4096 notes are all distinct
+ * (a leading-rows sample says STR) while the file as a whole has ~4100
+ * distinct notes over 200k rows (.csv.read's file-wide sample says SYM). */
+static test_result_t test_csv_streaming_infers_like_read(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    FILE* f = fopen(TMP_CSV, "wb"); TEST_ASSERT_NOT_NULL(f);
+    fputs("id,note\n", f);
+    for (int i = 0; i < 200000; i++) {
+        if (i < 4096) fprintf(f, "%d,unique note %d\n", i, i);
+        else          fprintf(f, "%d,repeat %d\n", i, i % 10);
+    }
+    fclose(f);
+
+    ray_t* mem = ray_read_csv_named_opts(TMP_CSV, ',', true, NULL, 0, NULL, 0);
+    TEST_ASSERT_TRUE(mem && !RAY_IS_ERR(mem));
+    int8_t want = ray_table_get_col_idx(mem, 1)->type;
+    ray_release(mem);
+    TEST_ASSERT_EQ_I(want, RAY_SYM);
+
+    char dir[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-csv-infer-%d", (int)getpid());
+    csv_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV, ',', true, NULL, 0,
+                                                     NULL, 0, dir, 0), RAY_OK);
+    char sym[160];
+    snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    ray_t* t = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, 1)->type, want);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+
+    char leaf[192];
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV, ',', true, NULL, 0,
+                                                    NULL, 0, dir, "t", 150000), RAY_OK);
+    snprintf(leaf, sizeof(leaf), "%s/1/t", dir);
+    t = ray_read_splayed(leaf, sym);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, 1)->type, want);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_csv_parted_zones(void) {
     ray_heap_init(); (void)ray_sym_init();
     char root[128],leaf[160],path[200];
@@ -2024,5 +2091,6 @@ const test_entry_t csv_entries[] = {
     { "csv/progress_monotonic",   test_csv_progress_never_goes_backwards,   NULL, NULL },
     { "csv/scan_boundary_matrix", test_csv_scan_boundary_matrix,            NULL, NULL },
     { "csv/sym_id_order",         test_csv_sym_id_order,                    NULL, NULL },
+    { "csv/streaming_infers_like_read", test_csv_streaming_infers_like_read, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
