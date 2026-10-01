@@ -14098,20 +14098,35 @@ static void update_atom_cell(const ray_t* a, int8_t ct, size_t esz, uint8_t elem
     }
 }
 
+/* One cell of an update-by result.  A STR cell goes through the string
+ * pool: store_typed_elem has no STR arm and left the cell empty, so a
+ * string per group came out as "".  Returns the column, or an error. */
+static ray_t* update_by_store(ray_t* col, int64_t row, ray_t* cell) {
+    if (col->type == RAY_STR) {
+        const char* sp = "";
+        size_t sl = 0;
+        if (cell->type == -RAY_STR && !RAY_ATOM_IS_NULL(cell)) {
+            sp = ray_str_ptr(cell);
+            sl = ray_str_len(cell);
+        }
+        return ray_str_vec_set(col, row, sp, sl);
+    }
+    store_typed_elem(col, row, cell);
+    return col;
+}
+
 /* Whether a DAG error must stand rather than hand the expression to the
- * interpreter.  The interpreter's `if` and `cond` test one truth value, so
- * for an expression holding either it is no equivalent: a DAG type error
- * (mixed branch types, a condition with no truth value) became the
- * then-branch written to every matched row.  Other expressions keep the
- * fallback, which also covers operations the DAG does not take. */
-static bool update_dag_err_final(ray_t* out, ray_t* expr) {
-    if (!out || !RAY_IS_ERR(out) || ray_err_from_obj(out) == RAY_ERR_NYI) return false;
-    return expr_contains_call_named(expr, "if", 2) ||
-           expr_contains_call_named(expr, "cond", 4);
+ * interpreter: only when an `if` refused its operands (g->if_refused).  The
+ * interpreter's `if` tests one truth value, so retrying there wrote the
+ * then-branch to every matched row.  Other DAG failures, such as an
+ * operation the DAG does not take, keep the fallback. */
+static bool update_dag_err_final(ray_t* out, bool if_refused) {
+    return if_refused && out && RAY_IS_ERR(out);
 }
 
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
     ray_t* out = NULL;
+    bool if_refused = false;
     ray_graph_t* g = ray_graph_new(sub);
     if (g) {
         ray_op_t* op = compile_expr_dag(g, expr);
@@ -14119,9 +14134,10 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
             op = ray_optimize(g, op);
             out = ray_execute(g, op);
         }
+        if_refused = g->if_refused;
         ray_graph_free(g);
     }
-    if (update_dag_err_final(out, expr)) return out;
+    if (update_dag_err_final(out, if_refused)) return out;
     if (!out || RAY_IS_ERR(out)) {
         if (out) ray_error_free(out);
         int64_t ncols = ray_table_ncols(sub);
@@ -14632,14 +14648,18 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                  * size — has no row-aligned meaning, so decline loudly rather
                  * than leave the memset zeros in place (silent data loss). */
                 int64_t* idxs = (int64_t*)ray_data(idx_vec);
+                ray_t* store_err = NULL;
                 if (ray_is_atom(agg_result)) {
-                    for (int64_t r = 0; r < gsize; r++)
-                        store_typed_elem(out_col, idxs[r], agg_result);
+                    for (int64_t r = 0; r < gsize && !store_err; r++) {
+                        ray_t* nc = update_by_store(out_col, idxs[r], agg_result);
+                        if (RAY_IS_ERR(nc)) store_err = nc; else out_col = nc;
+                    }
                 } else if (ray_is_vec(agg_result) && ray_len(agg_result) == gsize) {
-                    for (int64_t r = 0; r < gsize; r++) {
+                    for (int64_t r = 0; r < gsize && !store_err; r++) {
                         int alloc = 0;
                         ray_t* cell = collection_elem(agg_result, r, &alloc);
-                        store_typed_elem(out_col, idxs[r], cell);
+                        ray_t* nc = update_by_store(out_col, idxs[r], cell);
+                        if (RAY_IS_ERR(nc)) store_err = nc; else out_col = nc;
                         if (alloc) ray_release(cell);
                     }
                 } else {
@@ -14649,6 +14669,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     return ray_error("length", "update by: expression result length %lld does not match group size %lld", (long long)got, (long long)gsize);
                 }
                 ray_release(agg_result);
+                if (store_err) {
+                    ray_release(out_col);
+                    UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                    return store_err;
+                }
             }
 
             upd_names[upd_i] = kid;
@@ -14787,6 +14812,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
 
                 /* Evaluate expression via DAG, fallback to eval-level */
                 ray_t* expr_vec = NULL;
+                bool if_refused = false;
                 {
                     ray_graph_t* ug = ray_graph_new(tbl);
                     if (ug) {
@@ -14795,10 +14821,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                             expr_op = ray_optimize(ug, expr_op);
                             expr_vec = ray_execute(ug, expr_op);
                         }
+                        if_refused = ug->if_refused;
                         ray_graph_free(ug);
                     }
                 }
-                if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, update_expr))) {
+                if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, if_refused))) {
                     /* Fallback: eval with column bindings */
                     if (expr_vec) ray_error_free(expr_vec);
                     int64_t ncols_e = ray_table_ncols(tbl);
@@ -15087,6 +15114,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             ray_release(orig_col);
         } else {
             ray_t* expr_vec = NULL;
+            bool if_refused = false;
             {
                 ray_graph_t* ug = ray_graph_new(tbl);
                 if (ug) {
@@ -15095,10 +15123,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                         expr_op = ray_optimize(ug, expr_op);
                         expr_vec = ray_execute(ug, expr_op);
                     }
+                    if_refused = ug->if_refused;
                     ray_graph_free(ug);
                 }
             }
-            if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, update_expr))) {
+            if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, if_refused))) {
                 /* Fallback: eval with column bindings */
                 if (expr_vec) ray_error_free(expr_vec);
                 int64_t ncols_f = ray_table_ncols(tbl);

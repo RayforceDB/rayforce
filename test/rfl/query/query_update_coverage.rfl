@@ -611,3 +611,20 @@
 ;; By group, a one-element result is the group's scalar.
 (at (update {k: (+ (sum x) 0) from: (table [x g] (list (til 5) [0 0 0 1 2])) by: g}) 'k) -- [3 3 3 3 4]
 (at (update {k: (if (> (count x) 1) 'many 'one) from: (table [x g] (list (til 5) [0 0 0 1 2])) by: g}) 'k) -- ['many 'many 'many 'one 'one]
+;; ...but only an `if` refusing its operands is final.  Other DAG failures
+;; inside an `if`, such as a global list or a cast of a null literal, still
+;; fall back to the interpreter, which handles them.
+(set GL (list 1 2 3))
+(set TQ (table [x a] (list (til 4) (as 'I32 [1 2 3 4]))))
+(at (update {x: (if true (count GL) x) from: TQ where: (> x 1)}) 'x) -- [0 1 3 3]
+(at (update {x: (if (> (count GL) 2) 9 x) from: TQ where: (> x 1)}) 'x) -- [0 1 9 9]
+(at (update {x: (if true (count GL) x) from: TQ}) 'x) -- [3 3 3 3]
+(at (update {a: (if true (as 'I32 0N) a) from: TQ where: (> x 1)}) 'a) -- (concat (as 'I32 [1 2]) (take 0Ni 2))
+(at (update {x: (if (> (count x) 2) 1 (neg 0N)) from: TQ where: (> x 1)}) 'x) -- [0 1 1 1]
+(as 'STR (at (update {s: (if (> x 1) s 0Nf) from: TW where: (> x 0)}) 's)) -- ["ab" "" "ef" "gh"]
+
+;; By group, a STR cell is written through the string pool; it came out "".
+(set TGS (table [x g t] (list (til 5) [0 0 0 1 2] (list "a" "bb" "c" "dd" "e"))))
+(at (update {k: (if (> (count x) 1) (first t) (last t)) from: TGS by: g}) 'k) -- ["a" "a" "a" "dd" "e"]
+(at (update {t: "zz" from: TGS by: g}) 't) -- ["zz" "zz" "zz" "zz" "zz"]
+(at (update {k: (first t) from: TGS by: g}) 'k) -- ["a" "a" "a" "dd" "e"]

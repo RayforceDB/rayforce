@@ -506,6 +506,16 @@ RTTime -- [09:30:00.000 10:00:00.000 11:00:00.000]
 (count (select {c: (count x) from: T2I64Sym by: {g: (if (> x 3) s 0N)}})) -- 3
 (count (select {from: T2I64Sym where: (== (if (> x 3) s 0N) 'e)})) -- 1
 (as 'STR (at (update {s: (if (> x 3) s 0N) from: T2I64Sym}) 's)) -- ["" "" "" "" "e" "f"]
+;; ...and it is a real null, whatever the literal's type: the fills wrote
+;; the literal's payload as a symbol id, so 0N gave a symbol that is not
+;; null, 0Nf (NaN bits) crashed the symbol lookup, and 0Nh named whichever
+;; symbol had that id.
+(nil? (at (select {k: (if (< x 2) s 0N) from: T2I64Sym}) 'k)) -- [false false true true true true]
+(nil? (at (select {k: (if (< x 2) s 0Nf) from: T2I64Sym}) 'k)) -- [false false true true true true]
+(set many (as 'SYM (as 'STR (+ 500000 (til 40000)))))
+(nil? (at (select {k: (if (< x 2) s 0Nh) from: T2I64Sym}) 'k)) -- [false false true true true true]
+(nil? (at (select {k: (if (> x 3) 'q 0Nf) from: T2I64Sym}) 'k)) -- [true true true true false false]
+(at (select {k: (if (> x 3) n 0Nf) from: (table [x n] (list (til 6) (list "a" "b" "c" "d" "e" "f")))}) 'k) -- ["" "" "" "" "e" "f"]
 
 ;; ====================================================================
 ;; Section 23: exec_if — STR output, SYM *atom* then-branch

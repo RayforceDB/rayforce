@@ -1260,6 +1260,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     if (!ray_is_atom(else_v) && else_v->len > branch_len) branch_len = else_v->len;
     if (!ray_is_atom(cond_v) && !if_cond_type_ok(cond_v->type)) {
         int8_t ct = cond_v->type;
+        g->if_refused = true;
         ray_release(cond_v); ray_release(then_v); ray_release(else_v);
         return ray_error("type", "if: condition must be boolean, numeric or temporal, got %s",
                          ray_type_name(ct));
@@ -1536,9 +1537,11 @@ ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
         ray_op_t* else_op = ext ? op_node(g, ext->third_in) : NULL;
         int8_t tt = then_op ? then_op->out_type : 0;
         int8_t et = else_op ? else_op->out_type : 0;
-        if (!if_branch_text_ok(g, then_op) || !if_branch_text_ok(g, else_op))
+        if (!if_branch_text_ok(g, then_op) || !if_branch_text_ok(g, else_op)) {
+            g->if_refused = true;
             return ray_error("type", "if: branches mix %s and %s",
                              ray_type_name(tt), ray_type_name(et));
+        }
     }
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
     if (!cond_v || RAY_IS_ERR(cond_v)) return cond_v;
