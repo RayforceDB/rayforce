@@ -114,6 +114,8 @@ The format is `"host:port"` for unauthenticated connections, or `"host:port:user
 | String | Parsed as Rayfall code and evaluated; result returned |
 | Any other value | Evaluated directly (identity for data, execution for expressions); result returned |
 
+An optional third argument sets a deadline in milliseconds: `(.ipc.send h "(+ 1 2)" 5000)`. If the reply has not arrived by then, the connection is closed and an `io` error is returned. See [`.ipc.send`](../namespaces/ipc.md#ipc-send).
+
 #### String queries
 
 ```text

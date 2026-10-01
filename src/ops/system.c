@@ -1825,15 +1825,41 @@ ray_t* ray_hclose_fn(ray_t* x) {
     return RAY_NULL_OBJ;
 }
 
-/* (hsend handle msg) → result */
-ray_t* ray_hsend_fn(ray_t* handle, ray_t* msg) {
+/* (.ipc.send handle msg [timeout-ms]) → result
+ *
+ * The optional timeout bounds the whole round trip (#589).  On expiry the
+ * connection is closed — a late reply would otherwise answer the next
+ * send — and an `io` error is returned.  0N means no deadline, as if the
+ * argument were absent. */
+ray_t* ray_hsend_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 3)
+        return ray_error("rank", ".ipc.send expects 2 or 3 arguments: handle msg [timeout-ms]");
+    ray_t* handle = args[0];
+    ray_t* msg    = args[1];
     if (!ray_is_atom(handle) || (handle->type != -RAY_I64 && handle->type != -RAY_I32))
         return ray_error("type", ".ipc.send expects an i64 or i32 handle, got %s", ray_type_name(handle->type));
     int64_t h = (handle->type == -RAY_I64) ? handle->i64 : handle->i32;
+
+    int64_t timeout_ms = 0;
+    if (n == 3) {
+        ray_t* t = args[2];
+        if (!ray_is_atom(t) || (t->type != -RAY_I64 && t->type != -RAY_I32))
+            return ray_error("type", ".ipc.send timeout must be an integer (ms), got %s", ray_type_name(t->type));
+        int64_t tv = (t->type == -RAY_I64) ? t->i64
+                   : (t->i32 == NULL_I32 ? NULL_I64 : (int64_t)t->i32);
+        if (tv != NULL_I64) {
+            /* 0 is refused rather than guessed at: "no deadline" or
+             * "already expired"? */
+            if (tv <= 0)
+                return ray_error("domain", ".ipc.send timeout must be > 0 or 0N (none), got %lld", (long long)tv);
+            timeout_ms = tv;
+        }
+    }
+
     /* Validate message is serializable (reject builtins, etc.) */
     if (ray_serde_size(msg) <= 0)
         return ray_error("type", "message not serializable");
-    return ray_ipc_send(h, msg);
+    return ray_ipc_send_timeout(h, msg, timeout_ms);
 }
 
 /* (.ipc.post handle msg) → null on local send, error on failure.
