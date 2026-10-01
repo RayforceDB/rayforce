@@ -1577,7 +1577,13 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
                                    const char* sym, bool durable) {
     ray_sym_domain_t* domain = NULL;
     for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].import_domain) domain = r->schema[c].import_domain;
-    if (!domain) return durable ? ray_splay_save(batch,leaf,sym) : ray_splay_save_bulk(batch,leaf,sym);
+    /* No import domain means no SYM column, so the vocabulary is untouched.
+     * The non-durable callers (the splayed spool and parted partitions) write
+     * private leaves under the import's staging root, published by renaming
+     * the whole tree: write them as a bare staged save, without the writer
+     * lock, generation handling or index pass that publishing a live table
+     * needs.  The spool then deletes exactly the files it wrote. */
+    if (!domain) return durable ? ray_splay_save(batch,leaf,sym) : ray_splay_save_staged_bulk(batch,leaf,sym);
     ray_err_t e = ray_mkdir_p(leaf); if (e != RAY_OK) return e;
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { if (schema) ray_release(schema); return RAY_ERR_OOM; }
