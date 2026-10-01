@@ -49,6 +49,12 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj);
 /* Format and write to FILE* */
 void ray_fmt_print(FILE* fp, ray_t* obj, int mode);
 
+/* Write obj to fp in full, without display limits, streaming so memory
+ * stays bounded (show).  RAY_ERR_IO if fp fails or if memory ran out after
+ * part of the output was written (the part ends with an error marker);
+ * RAY_ERR_OOM if memory ran out before anything was written. */
+ray_err_t ray_fmt_write(FILE* fp, ray_t* obj);
+
 /* Display settings */
 void ray_fmt_set_precision(int digits);
 void ray_fmt_set_width(int cols);

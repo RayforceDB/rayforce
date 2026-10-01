@@ -46,7 +46,15 @@ typedef struct {
                          * Once set, every append is a no-op and fmt_to_str
                          * returns an error instead of a string. */
     const char* err_msg;/* why err was set, surfaced by fmt_to_str */
+    FILE*   sink;       /* when set, full content is written here and the
+                         * buffer emptied as it passes FMT_SINK_FLUSH bytes;
+                         * only for modes that never read back what they
+                         * appended (mode 2) */
+    bool    io_err;     /* err was a failed write to sink */
+    bool    flushed;    /* some output already reached sink */
 } fmt_buf_t;
+
+#define FMT_SINK_FLUSH ((int64_t)1 << 20)
 
 /* The fmt_* append helpers are all void and have no caller to return an error
  * to, so a growth failure (the 2GiB int32 buffer ceiling, or a ray_alloc that
@@ -60,6 +68,9 @@ typedef struct {
 static void fmt_init(fmt_buf_t* b) {
     b->err     = false;
     b->err_msg = NULL;
+    b->sink    = NULL;
+    b->io_err  = false;
+    b->flushed = false;
     b->block   = ray_alloc(256);
     if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
         b->err = true; b->err_msg = "cannot allocate the initial output buffer";
@@ -90,6 +101,14 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
      * negative extra, need = len + extra < len <= cap, so the fast path would
      * otherwise return first and leave the bad length to a wild memcpy. */
     if (extra < 0) { b->err = true; b->err_msg = "invalid negative format length"; return; }
+    if (b->sink && b->len > 0 && (int64_t)b->len + extra > FMT_SINK_FLUSH) {
+        if (fwrite(b->buf, 1, (size_t)b->len, b->sink) != (size_t)b->len) {
+            b->err = true; b->io_err = true; b->err_msg = "cannot write formatted output";
+            return;
+        }
+        b->len = 0;
+        b->flushed = true;
+    }
     int64_t need = (int64_t)b->len + extra;
     if (need <= (int64_t)b->cap) return;
     if (need > (int64_t)INT32_MAX) {
@@ -782,13 +801,142 @@ static void fmt_centered(fmt_buf_t* b, const char* s, int32_t slen, int32_t widt
     for (int32_t i = 0; i < right; i++) fmt_putc(b, ' ');
 }
 
-/* Maximum pre-formatted cells: FMT_TABLE_MAX_WIDTH * FMT_TABLE_MAX_HEIGHT = 200 */
+/* The REPL display (mode 1) pre-formats at most FMT_TABLE_MAX_WIDTH x
+ * FMT_TABLE_MAX_HEIGHT cells on the stack; mode 2 without a sink pre-formats
+ * the whole table on the heap, and show streams it (fmt_table_stream). */
 #define FMT_CELL_BUF_SIZE 64
 
 typedef struct {
     char    str[FMT_CELL_BUF_SIZE];
     int32_t len;
 } fmt_cell_t;
+
+/* Table in full into a sink-backed buffer (show).  A first pass measures
+ * each column's display width over every cell; the second writes the rows,
+ * which the sink flushes as the buffer fills.  Memory is O(columns), unlike
+ * the pre-formatted cell grid of the REPL display. */
+static void fmt_stream_cell(fmt_buf_t* tmp, ray_t* col, int64_t ri,
+                            const char** s, int32_t* len) {
+    if (!col || ri >= ray_len(col)) { *s = "NA"; *len = 2; return; }
+    tmp->len = 0;
+    fmt_raw_elem(tmp, col, ri);
+    *s = tmp->buf;
+    *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
+}
+
+static void fmt_stream_rule(fmt_buf_t* b, const int32_t* w, int64_t n,
+                            const char* left, const char* mid, const char* right) {
+    fmt_puts(b, left);
+    for (int64_t ci = 0; ci < n; ci++) {
+        for (int32_t j = 0; j < w[ci]; j++) fmt_puts(b, G_H);
+        fmt_puts(b, ci < n - 1 ? mid : right);
+    }
+}
+
+/* Widest a streamed column is padded to, in display columns.  A longer cell
+ * is written whole, unpadded, past the border of its own row: padding every
+ * row to the longest cell made the output rows x longest cell (one 10 KB
+ * value in 10k rows wrote 100 MB of spaces). */
+#define FMT_SHOW_PAD_MAX 256
+
+static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t nrows = ray_table_nrows(tbl);
+    if (ncols <= 0) { fmt_puts(b, "<table>"); return; }
+
+    ray_t* wblk = ray_alloc((size_t)ncols * sizeof(int32_t));
+    ray_t* nblk = ray_alloc((size_t)ncols * sizeof(ray_t*));
+    if (nblk) memset(ray_data(nblk), 0, (size_t)ncols * sizeof(ray_t*));
+    fmt_buf_t tmp;
+    fmt_init(&tmp);
+    if (!wblk || !nblk || tmp.err) {
+        b->err = true; b->err_msg = "out of memory formatting a table";
+        goto done;
+    }
+    int32_t* widths = (int32_t*)ray_data(wblk);
+    ray_t**  names  = (ray_t**)ray_data(nblk);
+
+    for (int64_t ci = 0; ci < ncols; ci++) {
+        ray_t* nm = ray_sym_str(ray_table_col_name(tbl, ci));
+        names[ci] = (nm && !RAY_IS_ERR(nm)) ? nm : NULL;
+        ray_t* col = ray_table_get_col_idx(tbl, ci);
+        const char* tname = ray_type_name(col ? col->type : 0);
+        int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
+        if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
+        int32_t cell_w = 0;
+        for (int64_t ri = 0; ri < nrows && cell_w < FMT_SHOW_PAD_MAX; ri++) {
+            const char* cs; int32_t cl;
+            fmt_stream_cell(&tmp, col, ri, &cs, &cl);
+            if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
+            int32_t dw = fmt_utf8_width(cs, cl);
+            if (dw > cell_w) cell_w = dw;
+        }
+        if (cell_w > FMT_SHOW_PAD_MAX) cell_w = FMT_SHOW_PAD_MAX;
+        if (cell_w > w) w = cell_w;
+        widths[ci] = w + 2;   /* one space of padding on each side */
+    }
+
+    int32_t total = (int32_t)(ncols - 1);
+    for (int64_t ci = 0; ci < ncols; ci++) total += widths[ci];
+    char footer[128];
+    int footer_len = snprintf(footer, sizeof(footer),
+        " %" PRId64 " rows (%" PRId64 " shown) %" PRId64 " columns (%" PRId64 " shown)",
+        nrows, nrows, ncols, ncols);
+    if (total < footer_len) { widths[ncols - 1] += footer_len - total; total = footer_len; }
+
+    fmt_stream_rule(b, widths, ncols, G_TL, G_TT, G_TR);
+    fmt_putc(b, '\n');
+    fmt_puts(b, G_V);
+    for (int64_t ci = 0; ci < ncols; ci++) {
+        if (names[ci]) fmt_centered(b, ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci]), widths[ci]);
+        else           fmt_centered(b, "?", 1, widths[ci]);
+        fmt_puts(b, G_V);
+    }
+    fmt_putc(b, '\n');
+    fmt_puts(b, G_V);
+    for (int64_t ci = 0; ci < ncols; ci++) {
+        ray_t* col = ray_table_get_col_idx(tbl, ci);
+        const char* tname = ray_type_name(col ? col->type : 0);
+        fmt_centered(b, tname, (int32_t)strlen(tname), widths[ci]);
+        fmt_puts(b, G_V);
+    }
+    fmt_putc(b, '\n');
+    fmt_stream_rule(b, widths, ncols, G_LT, G_X, G_RT);
+    for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+        fmt_putc(b, '\n');
+        fmt_puts(b, G_V);
+        for (int64_t ci = 0; ci < ncols; ci++) {
+            const char* cs; int32_t cl;
+            fmt_stream_cell(&tmp, ray_table_get_col_idx(tbl, ci), ri, &cs, &cl);
+            if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
+            fmt_putc(b, ' ');
+            fmt_putn(b, cs, cl);
+            /* a cell past FMT_SHOW_PAD_MAX gets no padding (p <= 0) */
+            for (int32_t p = widths[ci] - fmt_utf8_width(cs, cl) - 1; p > 0; p--) fmt_putc(b, ' ');
+            fmt_puts(b, G_V);
+        }
+    }
+    fmt_putc(b, '\n');
+    fmt_stream_rule(b, widths, ncols, G_LT, G_BT, G_RT);
+    fmt_putc(b, '\n');
+    fmt_puts(b, G_V);
+    fmt_putn(b, footer, footer_len);
+    for (int32_t i = footer_len; i < total; i++) fmt_putc(b, ' ');
+    fmt_puts(b, G_V);
+    fmt_putc(b, '\n');
+    fmt_puts(b, G_BL);
+    for (int32_t i = 0; i < total; i++) fmt_puts(b, G_H);
+    fmt_puts(b, G_BR);
+
+done:
+    if (nblk) {
+        ray_t** nm = (ray_t**)ray_data(nblk);
+        for (int64_t ci = 0; ci < ncols; ci++) if (nm[ci]) ray_release(nm[ci]);
+        ray_free(nblk);
+    }
+    if (wblk) ray_free(wblk);
+    fmt_destroy(&tmp);
+}
 
 static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
     int64_t ncols = ray_table_ncols(tbl);
@@ -819,6 +967,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
     }
 
     /* Full mode (1) and show mode (2) */
+    if (mode == 2 && b->sink) { fmt_table_stream(b, tbl); return; }
     int64_t table_width  = ncols;
     int64_t table_height = nrows;
 
@@ -883,6 +1032,14 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         heap_tlen_blk   = ray_alloc((size_t)(table_width * (int64_t)sizeof(int32_t)));
         heap_refs_blk   = ray_alloc((size_t)(table_width * (int64_t)sizeof(ray_t*)));
         heap_cells_blk  = ray_alloc((size_t)(table_width * table_height * (int64_t)sizeof(fmt_cell_t)));
+        if (!heap_widths_blk || !heap_names_blk || !heap_nlen_blk || !heap_types_blk ||
+            !heap_tlen_blk || !heap_refs_blk || !heap_cells_blk) {
+            ray_t* blks[7] = { heap_widths_blk, heap_names_blk, heap_nlen_blk, heap_types_blk,
+                               heap_tlen_blk, heap_refs_blk, heap_cells_blk };
+            for (int k = 0; k < 7; k++) if (blks[k]) ray_free(blks[k]);
+            b->err = true; b->err_msg = "out of memory formatting a table";
+            return;
+        }
 
         col_widths    = (int32_t*)ray_data(heap_widths_blk);
         col_names     = (const char**)ray_data(heap_names_blk);
@@ -1303,4 +1460,27 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
         fwrite(ray_str_ptr(s), 1, ray_str_len(s), fp);
         ray_release(s);
     }
+}
+
+/* Write obj to fp in full (show): no row, column or width limits, and
+ * streamed, so memory stays bounded whatever the size of obj.  RAY_ERR_IO if
+ * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated. */
+ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    if (b.err) return RAY_ERR_OOM;
+    b.sink = fp;
+    fmt_obj(&b, obj, 2);
+    if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
+        b.io_err = b.err = true;
+    ray_err_t e = !b.err ? RAY_OK : b.io_err ? RAY_ERR_IO : RAY_ERR_OOM;
+    /* Out of memory after part of the output was written: end that part
+     * with a marker, and report it as written so the caller does not print
+     * the value a second time. */
+    if (e == RAY_ERR_OOM && b.flushed) {
+        fputs("\nerror: out of memory\n", fp);
+        e = RAY_ERR_IO;
+    }
+    fmt_destroy(&b);
+    return e;
 }
