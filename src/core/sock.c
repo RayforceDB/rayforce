@@ -26,6 +26,8 @@
 #endif
 
 #include "core/sock.h"
+#include "core/timer.h"
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -317,6 +319,12 @@ ray_sock_t ray_sock_connect(const char* host, uint16_t port, int timeout_ms)
 
 int64_t ray_sock_send(ray_sock_t s, const void* buf, size_t len)
 {
+    return ray_sock_send_until(s, buf, len, -1);
+}
+
+int64_t ray_sock_send_until(ray_sock_t s, const void* buf, size_t len,
+                            int64_t deadline_ms)
+{
     const uint8_t* p   = (const uint8_t*)buf;
     size_t         rem = len;
     while (rem > 0) {
@@ -330,11 +338,17 @@ int64_t ray_sock_send(ray_sock_t s, const void* buf, size_t len)
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Wait for write-readiness before retry */
+                int wait_ms = -1;
+                if (deadline_ms >= 0) {
+                    int64_t left = deadline_ms - ray_time_now_ms();
+                    if (left <= 0) { errno = ETIMEDOUT; return -1; }
+                    wait_ms = left > INT_MAX ? INT_MAX : (int)left;
+                }
                 struct pollfd pfd = { .fd = s, .events = POLLOUT };
 #ifdef RAY_OS_WINDOWS
-                WSAPoll(&pfd, 1, -1);
+                WSAPoll(&pfd, 1, wait_ms);
 #else
-                poll(&pfd, 1, -1);
+                poll(&pfd, 1, wait_ms);
 #endif
                 continue;
             }

@@ -1,3 +1,4 @@
+;; @requires: posix
 ;; Coverage for src/io/csv.c splayed-writer paths, src/store/col.c str-pool
 ;; copy on load, and the GUID column writer.
 ;;
@@ -136,9 +137,8 @@
 (at (at Rnull 'b) 11) -- 12.5
 
 ;; ════════════════════════════════════════════════════════════════
-;; 3. STR column via explicit schema — exercises ray_splay_save_bulk
-;; fallback inside ray_csv_save_splayed_named_opts (col.c writes the
-;; STR + adjacent str_pool inline), and col_copy_str_pool on load.
+;; 3. Explicit STR schema streams descriptors and rebases pooled offsets.
+;; The shared column writer appends the adjacent pool at commit.
 ;;
 ;; The schema-overridden form takes (.csv.splayed [names] [types] csv dir),
 ;; same dispatcher as ray_read_csv_splayed_fn.

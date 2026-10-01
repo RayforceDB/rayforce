@@ -348,7 +348,16 @@ static test_result_t test_matrix_shared_domain_layout(void) {
  * (bytes 0-15 aux, then mmod/order/type/attrs — store/col.c "Column file
  * format").  Returns RAY_SYM_W8/W16/W32/W64 or -1 on I/O failure. */
 static int disk_sym_width(const char* col_path) {
-    FILE* f = fopen(col_path, "rb");
+    /* Keep inspecting the raw header, but in the selected generation. */
+    char dir[1024], resolved[1024], path[1200];
+    const char* slash = strrchr(col_path, '/');
+    if (!slash || (size_t)(slash - col_path) >= sizeof(dir)) return -1;
+    memcpy(dir, col_path, (size_t)(slash - col_path));
+    dir[slash - col_path] = '\0';
+    if (ray_splay_resolve_dir(dir, resolved, sizeof(resolved)) != RAY_OK) return -1;
+    int n = snprintf(path, sizeof(path), "%s/%s", resolved, slash + 1);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    FILE* f = fopen(path, "rb");
     if (!f) return -1;
     if (fseek(f, (long)offsetof(ray_t, attrs), SEEK_SET) != 0) {
         fclose(f);

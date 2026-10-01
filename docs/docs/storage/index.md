@@ -64,6 +64,44 @@ The symbol table is a dotfile (`.sym`, lock `.sym.lk`), so it never collides
 with a user column — a table may have an ordinary column named `sym` (the
 canonical ticker column), as shown above.
 
+### Atomic table replacement
+
+When an existing splayed table is replaced, Rayforce writes the new schema and
+all columns into a fresh directory below `.generations/`. After the files are
+complete, it atomically replaces the small `.current` manifest. Readers follow
+that manifest, so they see either the previous complete generation or the new
+complete generation — never a mixture of columns from both. A failed write
+before publication leaves the previous generation selected. Tables written by
+older Rayforce versions remain readable; the first replacement upgrades the
+directory to the generation layout.
+
+The table, partition and CSV entry points follow the same publication protocol.
+Indexes are built in the new generation before it is published. Writers to the
+same table serialize on `.write.lock`; readers resolve the manifest once and
+continue using that generation. The symbol vocabulary stays at its original
+location and grows append-only.
+
+Publication keeps the selected generation and one previous generation, then
+removes older staged directories best-effort. A failed unpublished generation is
+removed immediately where the platform allows it; on Windows an open mapped file
+can defer that cleanup until a later publish. At the first manifest publish,
+the legacy root `.d` is retired so older binaries fail loudly instead of reading
+obsolete root files.
+
+The `.write.lock` writer lock is local-filesystem coordination. Do not rely on
+it for NFS-backed shared writers.
+
+`ray_splay_save` (including `.db.splayed.set`) syncs primary data and directory
+entries before acknowledging publication. Inline indexes are rebuildable
+accelerators written with a marker-last protocol. The bulk C API and CSV import
+retain their no-fsync contract: publication is atomic for readers, but is not a
+power-loss durability guarantee. An I/O error after the manifest rename (during
+the final directory sync) has an uncertain commit outcome; reopen the table to
+inspect the selected generation.
+
+This protects publication of one splayed table. Coordinating a consistent
+snapshot across multiple tables or date partitions still belongs to the caller.
+
 ### C API
 
 | Function | Description |

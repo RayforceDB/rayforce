@@ -1,0 +1,22 @@
+;; ipc_send_timeout.rfl — `.ipc.send`'s optional third argument (#589).
+;;
+;; `(.ipc.send h msg ms)` bounds the round trip; on expiry the connection
+;; is closed and `io` is returned.  0N means no deadline.  0 is refused:
+;; it could mean "none" or "already expired".
+;;
+;; 999999 names no connection, so a well-formed call reaches handle
+;; resolution and fails with `io`; a malformed one is rejected before
+;; that, with `type`, `domain` or `rank`.  The C suite (ipc/send_deadline)
+;; covers expiry against a live socket.
+
+(.ipc.send 999999 42) !- io
+(.ipc.send 999999 42 100) !- io
+(.ipc.send 999999 42 0N) !- io
+
+(.ipc.send 999999 42 0) !- domain
+(.ipc.send 999999 42 -5) !- domain
+(.ipc.send 999999 42 "soon") !- type
+(.ipc.send 999999 42 1.5) !- type
+
+(.ipc.send 999999) !- rank
+(.ipc.send 999999 42 100 1) !- rank

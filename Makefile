@@ -25,6 +25,11 @@ VERSION_MAJOR := $(word 1,$(subst ., ,$(RAY_VERSION)))
 VERSION_MINOR := $(word 2,$(subst ., ,$(RAY_VERSION)))
 VERSION_PATCH := $(word 3,$(subst ., ,$(RAY_VERSION)))
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# The objects that embed GIT_HASH depend on a stamp rewritten only when the
+# hash changes, so an incremental build after a new commit rebuilds them
+# instead of keeping the previous hash (see GIT_HASH_OBJS below).
+GIT_HASH_STAMP := build/.git-hash
+$(shell mkdir -p build && { [ "$$(cat $(GIT_HASH_STAMP) 2>/dev/null)" = "$(GIT_HASH)" ] || echo "$(GIT_HASH)" > $(GIT_HASH_STAMP); })
 BUILD_DATE := $(shell date -u +%Y-%m-%d)
 
 WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
@@ -207,6 +212,13 @@ default: debug
 %.ndebug.o: %.c
 	$(CC) -c $(NDEBUG_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
+# Sources that embed GIT_HASH (ray_git_commit, the REPL and crash banners,
+# and the test that compares ray_git_commit against it), in every object
+# flavour.
+GIT_HASH_SRCS := src/core/types src/app/repl src/core/crash test/test_types
+GIT_HASH_OBJS := $(foreach v,.o .rel.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
+$(GIT_HASH_OBJS): $(GIT_HASH_STAMP)
+
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
 $(TARGET): $(LIB_OBJ) $(MAIN_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
@@ -365,7 +377,7 @@ compdb:
 # these targets are Linux-only by design; CI gates them to ubuntu.
 FUZZ_RUNTIME ?= 60
 FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
-FUZZ_TARGETS  = parse numparse de eval csv journal
+FUZZ_TARGETS  = parse numparse de eval csv journal parquet
 # Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
 # lacks libstdc++ (e.g. a partially-installed newer gcc shadowing the real
 # one).  Normally empty; set on such a box, e.g.
@@ -389,6 +401,10 @@ build_fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_LIB_OBJ)
 	$(CLANGXX) -fsanitize=fuzzer,address,undefined $(FUZZ_LDEXTRA) \
 	  -o $@ build_fuzz/$*.o $(FUZZ_LIB_OBJ) $(LIBS)
 
+# Reuse instrumented objects across fuzz targets and linker retries.
+.SECONDARY: $(FUZZ_LIB_OBJ)
+.PRECIOUS: build_fuzz/fuzz_%
+
 fuzz-%: build_fuzz/fuzz_%
 	@mkdir -p fuzz/corpus/$*
 	@dict=$(DICT_$*); \
@@ -396,6 +412,7 @@ fuzz-%: build_fuzz/fuzz_%
 	 seeds=$$( [ -d fuzz/seeds/$* ] && echo fuzz/seeds/$* ); \
 	 set -x; \
 	 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	   ./build_fuzz/fuzz_$* fuzz/corpus/$* $$seeds \
 	   $$dictopt $(FUZZ_OPTS) -max_total_time=$(FUZZ_RUNTIME)
 

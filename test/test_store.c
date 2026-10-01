@@ -33,6 +33,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/col.h"
+#include "ops/idxop.h"
 #include "store/fileio.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -58,6 +59,12 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#ifdef RAY_OS_LINUX
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#endif
 
 #define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
 #define TMP_SPLAY_DIR "/tmp/rayforce_test_splay"
@@ -1476,6 +1483,175 @@ static test_result_t test_file_rename_op(void) {
 
     unlink(TMP_FILEIO_PATH2);
     PASS();
+}
+
+static test_result_t test_col_close_failure(void) {
+#ifdef RAY_OS_LINUX
+    int64_t data[] = {1,2,3,4};
+    ray_t* values[5];
+    values[0] = ray_vec_from_raw(RAY_I64,data,4);
+    values[1] = ray_vec_new(RAY_STR,0);
+    values[1] = ray_str_vec_append(values[1],"a buffered string payload",25);
+    values[2] = ray_list_new(0);
+    ray_t* text = ray_str("a buffered string payload",25);
+    values[2] = ray_list_append(values[2],text); ray_release(text);
+    values[3] = ray_list_new(0);
+    values[3] = ray_list_append(values[3],values[0]);
+    values[4] = ray_table_new(0);
+    values[4] = ray_table_add_col(values[4],ray_sym_intern("v",1),values[0]);
+    char path[160], temp[180];
+    snprintf(path,sizeof(path),"/tmp/rayforce-close-failure-%d",(int)getpid());
+    snprintf(temp,sizeof(temp),"%s.tmp",path);
+    for (int type = 0; type < 5; type++) for (int durable = 0; durable < 2; durable++) {
+        TEST_ASSERT_NOT_NULL(values[type]); TEST_ASSERT_FALSE(RAY_IS_ERR(values[type]));
+        FILE* f = fopen(path,"wb"); TEST_ASSERT_NOT_NULL(f);
+        TEST_ASSERT_EQ_I(fwrite("original",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+        pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+        if (!pid) {
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_FSIZE,&limit)) _exit(2);
+            limit.rlim_cur = 33;
+            if (signal(SIGXFSZ,SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE,&limit)) _exit(2);
+            ray_err_t err = durable ? ray_col_save(values[type],path) : ray_col_save_bulk(values[type],path);
+            _exit(err == RAY_ERR_IO ? 0 : 1);
+        }
+        int status;
+        TEST_ASSERT_EQ_I(waitpid(pid,&status,0),pid);
+        TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status),0);
+        f = fopen(path,"rb"); TEST_ASSERT_NOT_NULL(f);
+        char bytes[16]; size_t n = fread(bytes,1,sizeof(bytes),f); fclose(f);
+        TEST_ASSERT_EQ_I(n,8); TEST_ASSERT_TRUE(!memcmp(bytes,"original",8));
+        TEST_ASSERT_TRUE(access(temp,F_OK) != 0);
+    }
+    unlink(path);
+    for (int i = 4; i >= 0; i--) ray_release(values[i]);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* A failed index append must leave the column loadable: without the index
+ * marker the loader requires the exact payload length, so a partial region
+ * would turn a best-effort accelerator into an unreadable column. */
+static test_result_t test_col_append_index_rollback(void) {
+#ifdef RAY_OS_LINUX
+    int64_t n = 100000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i * 3;
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-append-rollback-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_col_save(v, path), RAY_OK);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    off_t payload = st.st_size;
+
+    ray_t* w = v; ray_retain(w);
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    const ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_NOT_NULL(ix);
+
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)payload + 40;     /* pad fits, region doesn't */
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(ray_col_append_index(path, ix, n, RAY_I64) != RAY_OK ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, (int64_t)payload);
+    ray_t* back = ray_col_load(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(back))[n - 1], (n - 1) * 3);
+    ray_release(back);
+
+    /* and the append still works once there is room */
+    TEST_ASSERT_EQ_I(ray_col_append_index(path, ix, n, RAY_I64), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_TRUE(st.st_size > payload);
+    back = ray_col_load(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    ray_release(back);
+
+    ray_release(w);
+    ray_release(v);
+    unlink(path);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+static test_result_t test_file_rename_new(void) {
+#ifdef RAY_OS_WASM
+    SKIP("exclusive rename is unavailable on this host");
+#else
+    char from[160], to[160], marker[180];
+    snprintf(from,sizeof(from),"/tmp/rayforce-publish-from-%d",(int)getpid());
+    snprintf(to,sizeof(to),"/tmp/rayforce-publish-to-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(ray_mkdir(from),RAY_OK); TEST_ASSERT_EQ_I(ray_mkdir(to),RAY_OK);
+    snprintf(marker,sizeof(marker),"%s/marker",from);
+    FILE* f = fopen(marker,"wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fwrite("retained",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+    /* Ordinary POSIX rename would replace this empty directory. */
+    TEST_ASSERT_EQ_I(ray_file_rename_new(from,to),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    TEST_ASSERT_EQ_I(rmdir(to),0);
+    TEST_ASSERT_EQ_I(ray_file_rename_new(from,to),RAY_OK);
+    TEST_ASSERT_TRUE(access(from,F_OK) != 0);
+    snprintf(marker,sizeof(marker),"%s/marker",to);
+    f = fopen(marker,"rb"); TEST_ASSERT_NOT_NULL(f);
+    char bytes[8]; TEST_ASSERT_EQ_I(fread(bytes,1,8,f),8); fclose(f);
+    TEST_ASSERT_TRUE(!memcmp(bytes,"retained",8));
+    TEST_ASSERT_EQ_I(ray_file_rename_new(NULL,to),RAY_ERR_IO);
+    unlink(marker); rmdir(to);
+    PASS();
+#endif
+}
+
+/* The portable fallback used where the host or filesystem has no
+ * no-replace rename: same contract as ray_file_rename_new. */
+static test_result_t test_file_rename_new_emulated(void) {
+#if defined(RAY_OS_WASM) || defined(RAY_OS_WINDOWS)
+    SKIP("POSIX fallback");
+#else
+    char from[160], to[160], marker[180];
+    snprintf(from,sizeof(from),"/tmp/rayforce-emu-from-%d",(int)getpid());
+    snprintf(to,sizeof(to),"/tmp/rayforce-emu-to-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(ray_mkdir(from),RAY_OK); TEST_ASSERT_EQ_I(ray_mkdir(to),RAY_OK);
+    snprintf(marker,sizeof(marker),"%s/marker",from);
+    FILE* f = fopen(marker,"wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fwrite("retained",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+    /* an existing (empty) directory is not replaced */
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(from,to),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    TEST_ASSERT_EQ_I(rmdir(to),0);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(from,to),RAY_OK);
+    TEST_ASSERT_TRUE(access(from,F_OK) != 0);
+    snprintf(marker,sizeof(marker),"%s/marker",to);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    /* files: an existing destination is kept, a new one is published */
+    char other[180];
+    snprintf(other,sizeof(other),"%s/other",to);
+    f = fopen(other,"wb"); TEST_ASSERT_NOT_NULL(f); fputs("x",f); fclose(f);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(other,marker),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(other,F_OK) == 0);
+    unlink(marker);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(other,marker),RAY_OK);
+    TEST_ASSERT_TRUE(access(other,F_OK) != 0 && access(marker,F_OK) == 0);
+    unlink(marker); rmdir(to);
+    PASS();
+#endif
 }
 
 /* ---- test_file_shared_lock_concurrent ---------------------------------- */
@@ -5447,6 +5623,10 @@ const test_entry_t store_entries[] = {
     { "store/file_lock_unlock", test_file_lock_unlock, store_setup, store_teardown },
     { "store/file_sync", test_file_sync_op, store_setup, store_teardown },
     { "store/file_rename", test_file_rename_op, store_setup, store_teardown },
+    { "store/col_close_failure", test_col_close_failure, store_setup, store_teardown },
+    { "store/col_append_index_rollback", test_col_append_index_rollback, store_setup, store_teardown },
+    { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
+    { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },
     { "store/sym_col_bounds_reject", test_sym_col_bounds_reject, store_setup, store_teardown },
     { "store/sym_col_count_mismatch", test_sym_col_count_mismatch, store_setup, store_teardown },

@@ -26,6 +26,7 @@
  */
 
 #include "lang/internal.h"
+#include "io/parquet.h"
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "ops/ops.h"
@@ -3153,7 +3154,9 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * exactly the ids the SYM evaluation would have produced for them.
  * Applies only when the expression's result over the SYM column is SYM
  * (so the interned result has the type the caller expects) and the
- * column's vocabulary is readable through the raw snapshot.  Any other
+ * column has a private domain. File prefixes use the raw snapshot;
+ * in-memory domains resolve their stable atoms through the same tail path.
+ * Any other
  * shape returns NULL and the caller takes the one-shot SYM evaluation. */
 /* Chunk length in distinct values: 256 dispatch rounds of morsels (2M
  * rows).  Enough rows for the pooled string ops to spread over the
@@ -3399,8 +3402,8 @@ static void dk_spread_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
                                      struct ray_sym_domain_s* dom, int64_t du) {
     if (!dom || dom == ray_sym_runtime_domain() || du <= 0) return NULL;
-    ray_sym_domain_raw_t raw;
-    if (!ray_sym_domain_raw_pin(dom, &raw)) return NULL;
+    ray_sym_domain_raw_t raw = {0};
+    (void)ray_sym_domain_raw_pin(dom, &raw);
 
     /* The result type the SYM evaluation would give: compile (only) the
      * expression against the SYM column. */
@@ -7719,6 +7722,13 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     if (emit_filter_set)
         ray_group_emit_filter_set(prev_emit_filter);
     if (RAY_IS_ERR(tbl)) return tbl;
+    if (tbl->type == RAY_DICT) {
+        bool complete;
+        ray_t* scan = ray_parquet_select_source(tbl,dict,&complete);
+        if (scan) { ray_release(tbl); tbl = scan; }
+        if (complete) return tbl;
+        if (RAY_IS_ERR(tbl)) return tbl;
+    }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
 
     if (!aliases_resolved) {
@@ -8569,7 +8579,22 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                 scratch_free(refs_hdr);
                 break;
             }
-            ray_t* col_vec = ray_eval(v);
+            /* Group-key expressions have the same row-wise semantics as
+             * projections. In particular, eval-level `if` tests whole-vector
+             * truthiness and would choose one branch for every input row. */
+            ray_t* col_vec = NULL;
+            ray_graph_t* key_graph = ray_graph_new(tbl);
+            if (!key_graph) col_vec = ray_error("oom", NULL);
+            else {
+                ray_op_t* key_op = compile_expr_dag(key_graph, v);
+                if (key_op) {
+                    key_op = ray_optimize(key_graph, key_op);
+                    col_vec = ray_execute(key_graph, key_op);
+                    if (!col_vec) col_vec = ray_error("domain", "by-dict key execution failed");
+                }
+                ray_graph_free(key_graph);
+            }
+            if (!col_vec) col_vec = ray_eval(v);
             if (ray_is_lazy(col_vec))
                 col_vec = ray_lazy_materialize(col_vec);
             for (int ri = 0; ri < n_refs; ri++) {
@@ -12232,9 +12257,11 @@ by_dict_done:
      * HINT, which the v2 radix engine uses to emit only N groups instead of
      * materializing all of them.  The hint is advisory: HEAD still trims and
      * apply_sort_take still runs at the end, so correctness never depends on
-     * it.  NOT pushed with a group-by: negative (tail) and range takes, which
-     * both need the full group set; and any asc:/desc: shape, which reorders
-     * the groups first (that shape also owns the desc+take emit-filter
+     * it.  A range take [start amount] with start >= 0 pushes start+amount the
+     * same way (apply_sort_take then slices the range out of those groups).
+     * NOT pushed with a group-by: negative (tail) takes and ranges counted
+     * from the end, which need the full group set; and any asc:/desc: shape,
+     * which reorders the groups first (that shape also owns the desc+take emit-filter
      * machinery — has_sort keeps the two disjoint).  Also NOT pushed when a
      * deferred key WHERE runs AFTER the group (post_group_where_expr): that
      * filter drops result rows, so taking the first N groups before it would
@@ -12282,6 +12309,10 @@ by_dict_done:
                 else { const int32_t* r32 = (const int32_t*)rv;
                        take_pre.a = r32[0]; take_pre.b = r32[1]; }
                 ray_release(tv);
+                /* [start amount] from the front reads only the first
+                 * start+amount groups: push that bound like an atom take. */
+                if (take_pre.a >= 0 && take_pre.b > 0 && take_pre.a <= INT64_MAX - take_pre.b)
+                    root = ray_head(g, root, take_pre.a + take_pre.b);
             } else take_range = tv;  /* apply after DAG execution */
         } else {
             int8_t tv_t = tv->type;            /* capture BEFORE free */

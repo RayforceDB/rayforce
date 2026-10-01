@@ -14,6 +14,7 @@ runtime).
 | `fuzz_eval`     | `ray_eval_str`         | full parse → eval pipeline (sandboxed) |
 | `fuzz_csv`      | `ray_read_csv*`        | CSV reader (input via memfd) |
 | `fuzz_journal`  | `ray_journal_validate` / `ray_journal_replay` | journal framing walk + replay |
+| `fuzz_parquet`  | `ray_parquet_open` / `ray_parquet_next` | footer, page, encoding and optional index parsers |
 
 The journal log is a sequence of IPC frames verbatim, so the `de` corpus also
 hardens journal replay's decode step.
@@ -87,3 +88,11 @@ crash-XXXX appears (CI artifact or local run)
 Error assertions in `.rfl` regression tests match the 7-byte error **code**
 (e.g. `!- parse`, `!- domain`), not the detailed message — the message is not
 part of the value rendered for comparison.
+
+`make fuzz-parquet FUZZ_RUNTIME=600` exercises the native Parquet footer,
+page, dictionary, definition-level and optional index parsers under ASan/UBSan.
+Its seeds are ordinary small Parquet files, including both page versions,
+Snappy, checksums, malformed optional indexes and fidelity edge cases. The
+driver consumes at most 256 batches of 257 rows per input to bound work from
+forged row counts. It covers decoded/pruned reader paths; it does not certify
+import publication, parallel scheduling or every supported producer.

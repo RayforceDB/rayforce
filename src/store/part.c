@@ -344,6 +344,9 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
                                  db_root, part_dirs[p], table_name);
             goto fail_tables;
         }
+        /* Resolve the generation before refreshing the shared symbol domain.
+         * ray_read_splayed_dom reopens the cached domain by path, so symbols
+         * appended by a concurrent publisher are visible before columns load. */
         part_tables[p] = ray_read_splayed_dom(path, dom);
         if (!part_tables[p] || RAY_IS_ERR(part_tables[p])) {
             if (trace)
@@ -566,8 +569,11 @@ static ray_err_t collect_table_dirs(const char* pdir, char*** out_names,
     struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;   /* ".", "..", and the ".sym" dotfile */
-        char dpath[1024];
-        int dn = snprintf(dpath, sizeof(dpath), "%s/%s/.d", pdir, ent->d_name);
+        char tdir[1024], resolved[1024], dpath[1100];
+        int dn = snprintf(tdir, sizeof(tdir), "%s/%s", pdir, ent->d_name);
+        if (dn < 0 || (size_t)dn >= sizeof(tdir)) continue;
+        if (ray_splay_resolve_dir(tdir, resolved, sizeof(resolved)) != RAY_OK) continue;
+        dn = snprintf(dpath, sizeof(dpath), "%s/.d", resolved);
         if (dn < 0 || (size_t)dn >= sizeof(dpath)) continue;
         struct stat st;
         if (stat(dpath, &st) != 0 || !S_ISREG(st.st_mode)) continue; /* not a table */
@@ -606,8 +612,11 @@ static ray_err_t collect_table_dirs(const char* pdir, char*** out_names,
 /* Does partition `part` contain splayed table `tname` (i.e. a `.d` schema)? */
 static bool partition_has_table(const char* db_root, const char* part,
                                 const char* tname) {
-    char dpath[1024];
-    int n = snprintf(dpath, sizeof(dpath), "%s/%s/%s/.d", db_root, part, tname);
+    char tdir[1024], resolved[1024], dpath[1100];
+    int n = snprintf(tdir, sizeof(tdir), "%s/%s/%s", db_root, part, tname);
+    if (n < 0 || (size_t)n >= sizeof(tdir)) return false;
+    if (ray_splay_resolve_dir(tdir, resolved, sizeof(resolved)) != RAY_OK) return false;
+    n = snprintf(dpath, sizeof(dpath), "%s/.d", resolved);
     if (n < 0 || (size_t)n >= sizeof(dpath)) return false;
     struct stat st;
     return stat(dpath, &st) == 0 && S_ISREG(st.st_mode);

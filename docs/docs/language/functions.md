@@ -456,6 +456,8 @@ not collide between two processes writing into the same table, use `guid`.
 | `format` | variadic | Format value to string (% is placeholder) | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | Load CSV file into table | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
+| [`.parquet.read`](../namespaces/parquet.md#parquet-read) | variadic | Read a Parquet file into a table | `(.parquet.read [id price] "trades.parquet")` |
+| [`.parquet.scan`](../namespaces/parquet.md#parquet-scan) | variadic | Create a lazy Parquet source for `select` | `(.parquet.scan "trades.parquet")` |
 | `read` | unary | Read file contents as string, to EOF | `(read "file.txt")` |
 | `read-bytes` | unary | Read file contents as a `U8` byte vector, to EOF | `(read-bytes "file.bin")` |
 | `write` | binary | Write a string to a file | `(write "file.txt" "content")` |

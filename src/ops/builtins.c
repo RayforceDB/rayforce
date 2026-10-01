@@ -59,6 +59,7 @@ static inline double clear_neg_zero(double v) {
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>
 #include "mem/heap.h"   /* ray_heap_anon_watermark/committed — read budget */
 #if !defined(RAY_OS_WINDOWS)
 #include <sys/mman.h>
@@ -690,19 +691,8 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
     if (!sym) return ray_error("io", NULL);
 
-    /* The streaming writer emits raw columns; append chunk-zone indexes to the
-     * just-written files, then reload so the returned table carries them
-     * (mmap'd in place).  Conversion is the ONLY place a CSV load decides an
-     * index: `.csv.read` returns an index-free in-memory table, and callers
-     * that want one on it ask explicitly (.idx.hash / the attrs verbs).
-     * Without this pass, a converted store would have no block-skip at all. */
-    ray_t* tbl = ray_read_splayed(dir, sym);
-    if (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
-        ray_splay_build_indexes(dir, tbl);
-        ray_release(tbl);
-        tbl = ray_read_splayed(dir, sym);
-    }
-    return tbl;
+    /* The writer builds indexes before publishing its generation. */
+    return ray_read_splayed(dir, sym);
 }
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
@@ -771,11 +761,30 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         }
     }
 
+    /* A new root is staged in <root>.csv-partial, which a failed import
+     * leaves behind for diagnosis and which then blocks the root.  Name it
+     * in the error rather than returning a bare `io`. */
+    char dest[1024], staging[1100];
+    bool stale = false;
+    if (ray_csv_parted_paths(root, dest, sizeof(dest), staging, sizeof(staging)) == RAY_OK) {
+        struct stat st;
+        stale = stat(dest, &st) != 0 && stat(staging, &st) == 0;
+    }
+    if (stale)
+        return ray_error("io", "csv.parted: %s is left from an earlier failed import; remove it to retry",
+                         staging);
+
     ray_err_t err = ray_csv_save_parted_named_opts(path, 0, header,
                                                    types_arg, ncols,
                                                    names_arg, ncols,
                                                    root, table_name, rows_per_part);
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    if (err != RAY_OK) {
+        struct stat st;
+        if (stat(dest, &st) != 0 && stat(staging, &st) == 0)
+            return ray_error(ray_err_code_str(err), "csv.parted: import failed; partial output retained in %s",
+                             staging);
+        return ray_error(ray_err_code_str(err), NULL);
+    }
 
     ray_t* out = ray_read_parted(root, table_name);
     if (getenv("RAY_CSV_TRACE") && out && RAY_IS_ERR(out)) {
