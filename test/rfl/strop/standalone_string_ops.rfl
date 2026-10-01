@@ -46,3 +46,19 @@
 
 (substr [1 2 3] 1 1) !- type
 (replace ["a"] 1 "x") !- type
+
+;; A string literal reaches the compiled string ops as an atom, whose len
+;; field aliases its payload: the ops read that many rows past it.  An update
+;; with (strlen "abc") or (trim " ab") crashed, (upper (first s)) beside a
+;; column returned hundreds of garbage rows, and substr / replace asked for
+;; petabytes.
+(set TsL (table [x s t] (list (til 4) ['ab 'cd 'ef 'gh] (list "ab" "cd" "ef" "gh"))))
+(at (update {y: (strlen "abc") from: TsL}) 'y) -- [3 3 3 3]
+(at (update {x: (strlen "abc") from: TsL}) 'x) -- [3 3 3 3]
+(at (update {y: (trim " ab") from: TsL}) 'y) -- ["ab" "ab" "ab" "ab"]
+(at (update {y: (upper "ab") from: TsL}) 'y) -- ["AB" "AB" "AB" "AB"]
+(at (update {y: (lower 'AB) from: TsL}) 'y) -- ['ab 'ab 'ab 'ab]
+(at (select {a: (upper (first s)) b: x from: TsL}) 'a) -- ['AB 'AB 'AB 'AB]
+(at (select {a: (upper (first t)) b: x from: TsL}) 'a) -- ["AB" "AB" "AB" "AB"]
+(at (update {y: (substr "abcdef" 1 3) from: TsL}) 'y) -- ["abc" "abc" "abc" "abc"]
+(at (update {y: (replace "abcabc" "b" "x") from: TsL}) 'y) -- ["axcaxc" "axcaxc" "axcaxc" "axcaxc"]
