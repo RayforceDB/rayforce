@@ -1,0 +1,40 @@
+;; eval_fallback_sym_passthrough.rfl — a SYM column projected beside a
+;; projection the DAG declines (temporal + - *) keeps its SYM type.
+;;
+;; Temporal arithmetic makes compile_expr_dag return NULL, so the whole select
+;; lands in the eval-level projection fallback.  That path used to evaluate a
+;; bare column name per row and collect the cells, and its cell collector never
+;; collapses SYM / STR / GUID atoms into a typed vector — so `name: name` came
+;; back as a LIST of boxed sym atoms and an inner-join on it matched nothing
+;; (rayforce-py#24).  A bare column name now takes the column itself.
+
+(set t (table [name s ts d tm i] (list [Alice Bob Carol] (list "a" "b" "c") [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000] [2001.01.01 2002.02.02 2003.03.03] [01:01:01.000 02:02:02.000 03:03:03.000] [1 2 3])))
+
+;; ─── control: an I64 computed column compiles, SYM survives ─────────────────
+(type (at (select {from: t name: name x: (+ i 1)}) 'name)) -- 'SYM
+
+;; ─── temporal arithmetic beside a SYM passthrough ───────────────────────────
+(type (at (select {from: t name: name x: (+ ts 1)}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (+ d 1)}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (+ tm 1)}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (- ts ts)}) 'name)) -- 'SYM
+(at (select {from: t name: name x: (+ ts 1)}) 'name) -- [Alice Bob Carol]
+
+;; the computed column itself is unaffected
+(at (select {from: t name: name x: (- ts ts)}) 'x) -- (- (at t 'ts) (at t 'ts))
+
+;; aliasing, projection order and a where: clause make no difference
+(type (at (select {from: t n: name x: (+ ts 1)}) 'n)) -- 'SYM
+(type (at (select {from: t x: (+ ts 1) name: name}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (+ ts 1) where: (> i 1)}) 'name)) -- 'SYM
+(at (select {from: t name: name x: (+ ts 1) where: (> i 1)}) 'name) -- [Bob Carol]
+
+;; other passthrough column kinds keep their type too
+(type (at (select {from: t s: s x: (+ ts 1)}) 's)) -- 'STR
+(at (select {from: t s: s x: (+ ts 1)}) 's) -- (list "a" "b" "c")
+(type (at (select {from: t i: i x: (+ ts 1)}) 'i)) -- 'I64
+(type (at (select {from: t ts: ts x: (+ ts 1)}) 'ts)) -- 'TIMESTAMP
+
+;; ─── the downstream symptom: a join on the projected column ─────────────────
+(set t2 (table [name last] (list [Alice Bob Carol] [Cooper Belcher Bells])))
+(at (inner-join [name] (select {from: t name: name x: (+ ts 1)}) t2) 'last) -- [Cooper Belcher Bells]

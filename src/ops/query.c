@@ -2405,6 +2405,27 @@ static bool table_has_parted_columns(ray_t* tbl);
  * (see eval_expr_whole_column).  Matched on the top-level head only —
  * a whole-column verb nested under an element-wise op has ambiguous length
  * semantics and is left to the per-row path. */
+/* A projection that is a bare, unquoted column name of `tbl` IS that column.
+ * The eval fallback otherwise evaluates it per row and collects the cells,
+ * and eval_expr_per_row never collapses SYM / STR / GUID atoms into a typed
+ * vector — so `name: name` beside a projection the DAG declines (temporal
+ * arithmetic, say) came back as a LIST of boxed sym atoms, and a join on it
+ * matched nothing (rayforce-py#24).  Taking the column directly is what the
+ * DAG path does for the same expression and is type-preserving for every
+ * column kind.  Owned ref, or NULL when the expression is not such a name or
+ * the column is not a plain full-length vector (parted / mapcommon / slice
+ * columns keep the per-row read, which handles them cell by cell). */
+static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t nrows) {
+    if (!expr || expr->type != -RAY_SYM || (expr->attrs & ATTR_QUOTED)) return NULL;
+    ray_t* col = ray_table_get_col(tbl, expr->i64);
+    if (!col || col->type <= 0) return NULL;
+    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+        (col->attrs & RAY_ATTR_SLICE) || ray_len(col) != nrows)
+        return NULL;
+    ray_retain(col);
+    return col;
+}
+
 static int is_whole_column_projection(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -12815,9 +12836,11 @@ by_dict_done:
                     /* Whole-column verbs (distinct/asc/desc/reverse) consume the
                      * entire column and must be evaluated once, not scattered
                      * per-row; everything else keeps the row-by-row semantics. */
-                    ray_t* col = is_whole_column_projection(dict_elems[i + 1])
-                        ? eval_expr_whole_column(dict_elems[i + 1], tbl)
-                        : eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
+                    ray_t* col = select_fallback_passthrough_col(dict_elems[i + 1], tbl, nrows);
+                    if (!col)
+                        col = is_whole_column_projection(dict_elems[i + 1])
+                            ? eval_expr_whole_column(dict_elems[i + 1], tbl)
+                            : eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
