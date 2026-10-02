@@ -1,0 +1,14 @@
+;; #674: (as 'STR ...) in a select projection returned a LIST of boxed string
+;; atoms (the eval fallback did not collapse STR cells).  Fixed by the STR
+;; collapse in the fallback collector (#690); pinned here.
+(set T674 (table [x s] (list (til 4) [a b a b])))
+(type (at (select {k: (as 'STR (% x 5)) from: T674}) 'k)) -- 'STR
+(at (select {k: (as 'STR (% x 5)) from: T674}) 'k) -- (as 'STR (% (til 4) 5))
+(type (at (select {k: (as 'STR x) from: T674}) 'k)) -- 'STR
+(type (at (select {k: (as 'STR s) from: T674}) 'k)) -- 'STR
+(type (at (select {k: (as 'STR (% x 5)) from: T674 where: (> x 0)}) 'k)) -- 'STR
+(type (at (update {k: (as 'STR (% x 5)) from: T674}) 'k)) -- 'STR
+;; grouped: one STR vector per group, the shape a plain column takes under by:
+(type (at (select {k: (as 'STR (% x 5)) by: s from: T674}) 'k)) -- 'LIST
+(at (select {k: (as 'STR (% x 5)) by: s from: T674}) 'k) -- (list (as 'STR (list "0" "2")) (as 'STR (list "1" "3")))
+(type (at (select {k: (as 'STR (first x)) by: s from: T674}) 'k)) -- 'STR

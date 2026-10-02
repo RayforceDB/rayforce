@@ -523,12 +523,35 @@ static bool if_branch_is_list_scan(ray_graph_t* g, ray_op_t* b) {
     return col && col->type == RAY_LIST;
 }
 
+/* Is node `id` a bare null atom literal (`0N`, `0Nf`, `0Ni`, ...)? */
+static bool if_const_null_atom(ray_graph_t* g, uint32_t id) {
+    ray_op_t* b = &g->nodes[id];
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* bx = find_ext(g, id);
+    return bx && bx->literal && ray_is_atom(bx->literal) &&
+           RAY_ATOM_IS_NULL(bx->literal);
+}
+
 ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* else_val) {
     /* 3-input node: cond, then, else — needs ext node */
     uint32_t cond_id = cond->id;
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
-    int8_t out_type = promote_if_type(then_val->out_type, else_val->out_type);
+    int8_t tt = then_val->out_type;
+    int8_t et = else_val->out_type;
+    int8_t out_type = promote_if_type(tt, et);
+    /* A temporal branch beside a null literal keeps the temporal type
+     * (#673): `(if c d 0N)` is a DATE column with nulls, not the I64 that
+     * promote() makes of DATE + I64, and `(if c ts 0Nd)` a TIMESTAMP one,
+     * not the I64 the two widths fold to.  Same rule as the text null
+     * below: the literal is then swapped for the typed null.  A non-null
+     * value beside a temporal still promotes, as before. */
+    if (type_is_temporal(tt) && et != tt && et != RAY_STR && et != RAY_SYM &&
+        et != RAY_GUID && if_const_null_atom(g, else_id))
+        out_type = tt;
+    else if (type_is_temporal(et) && tt != et && tt != RAY_STR && tt != RAY_SYM &&
+             tt != RAY_GUID && if_const_null_atom(g, then_id))
+        out_type = et;
     if (out_type < 0) return NULL;
     /* A LIST column scans as the untyped node (out_type 0), which promote()
      * also folds to BOOL and the fill then reads the cell pointers as bytes.
@@ -545,17 +568,19 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     /* A null literal such as `0N` or `0Nf` beside a text branch is the text
      * null.  Left as a number, the fills wrote its payload as a symbol id
      * (NaN bits for 0Nf, INT64_MIN for 0N): a crash, or a symbol that is
-     * not null.  Swap it for the text null of the result type. */
-    if (out_type == RAY_STR || out_type == RAY_SYM) {
+     * not null.  Swap it for the text null of the result type.  Beside a
+     * temporal branch it is the temporal null the same way: the fills read
+     * a DATE/TIME null from i32 and a TIMESTAMP null from i64, so the
+     * literal must carry the result's own sentinel. */
+    bool text_out = out_type == RAY_STR || out_type == RAY_SYM;
+    if (text_out || type_is_temporal(out_type)) {
         for (int side = 0; side < 2; side++) {
             uint32_t bid = side ? else_id : then_id;
             ray_op_t* b = &g->nodes[bid];
-            if (b->opcode != OP_CONST || b->out_type == RAY_STR || b->out_type == RAY_SYM)
+            if (b->out_type == out_type ||
+                (text_out && (b->out_type == RAY_STR || b->out_type == RAY_SYM)))
                 continue;
-            ray_op_ext_t* bx = find_ext(g, bid);
-            if (!bx || !bx->literal || !ray_is_atom(bx->literal) ||
-                !RAY_ATOM_IS_NULL(bx->literal))
-                continue;
+            if (!if_const_null_atom(g, bid)) continue;
             ray_t* tn = ray_typed_null((int8_t)-out_type);
             if (!tn || RAY_IS_ERR(tn)) return NULL;
             ray_op_t* nc = ray_const_atom(g, tn);

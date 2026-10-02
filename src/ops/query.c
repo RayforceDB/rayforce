@@ -373,6 +373,19 @@ static bool dag_cmp_rejects_temporal_float(const char* fname, size_t fname_len,
     return (dag_type_is_temporal(lt) && rf) || (lf && dag_type_is_temporal(rt));
 }
 
+/* A column operand of `and` / `or` must be boolean: the kernel read an I64
+ * column by its bytes, so `(and x (> y 2))` kept rows a where: on `x`
+ * alone rejects (#678).  A literal keeps its scalar truth value, as a
+ * where: scalar does.  Sets compile_err and returns false on a bad operand. */
+static bool dag_bool_operand_ok(ray_graph_t* g, ray_op_t* a, bool is_and) {
+    if (a->opcode == OP_CONST || a->out_type <= 0 || a->out_type == RAY_BOOL)
+        return true;
+    if (!g->compile_err)
+        g->compile_err = ray_error("type", "%s: operand must be boolean, got %s",
+                                   is_and ? "and" : "or", ray_type_name(a->out_type));
+    return false;
+}
+
 static bool dag_unary_numeric_name(const char* name, size_t len) {
     if (len == 3)
         return memcmp(name, "sin", 3) == 0 ||
@@ -1859,6 +1872,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 for (int64_t i = 0; i < k; i++) {
                     ray_op_t* a = compile_expr_dag(g, elems[i + 1]);
                     if (!a) return NULL;
+                    if (!dag_bool_operand_ok(g, a, is_and)) return NULL;
                     arg_ids[i] = a->id;
                 }
                 dag_binary_ctor ctor = is_and ? ray_and : ray_or;
@@ -1915,6 +1929,10 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 ray_op_t* right = compile_expr_dag(g, elems[2]);
                 if (!right) return NULL;
                 left = &g->nodes[left_id];
+                if ((ctor == ray_and || ctor == ray_or) &&
+                    (!dag_bool_operand_ok(g, left, ctor == ray_and) ||
+                     !dag_bool_operand_ok(g, right, ctor == ray_and)))
+                    return NULL;
                 if (dag_temporal_arith_needs_eval(fname, fname_len,
                                                   left->out_type,
                                                   right->out_type))
@@ -2037,37 +2055,6 @@ static ray_t* bind_all_columns(ray_t* tbl) {
     return prev;
 }
 
-static bool query_atom_truthy(ray_t* v, bool* out) {
-    if (!v || !ray_is_atom(v) || RAY_ATOM_IS_NULL(v)) return false;
-    switch (v->type) {
-    case -RAY_BOOL:
-        *out = v->b8 != 0;
-        return true;
-    case -RAY_U8:
-        *out = v->u8 != 0;
-        return true;
-    case -RAY_I16:
-        *out = v->i16 != 0;
-        return true;
-    case -RAY_I32:
-    case -RAY_DATE:
-    case -RAY_TIME:
-        *out = v->i32 != 0;
-        return true;
-    case -RAY_I64:
-    case -RAY_SYM:
-    case -RAY_TIMESTAMP:
-        *out = v->i64 != 0;
-        return true;
-    case -RAY_F32:
-    case -RAY_F64:
-        *out = v->f64 != 0.0;
-        return true;
-    default:
-        return false;
-    }
-}
-
 static ray_t* eval_where_mask(ray_t* where_expr, ray_t* tbl, const char* label) {
     if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* _aqt = bind_all_columns(tbl);
@@ -2082,33 +2069,8 @@ static ray_t* eval_where_mask(ray_t* where_expr, ray_t* tbl, const char* label) 
     if (RAY_IS_ERR(mask))
         return mask;
 
-    int64_t nrows = ray_table_nrows(tbl);
-    if (mask->type == RAY_BOOL) {
-        if (mask->len != nrows) {
-            int64_t got = mask->len;
-            ray_release(mask);
-            return ray_error("length",
-                "%s: WHERE mask length %lld does not match row count %lld",
-                label, (long long)got, (long long)nrows);
-        }
-        return mask;
-    }
-
-    bool keep = false;
-    if (query_atom_truthy(mask, &keep)) {
-        ray_release(mask);
-        ray_t* out = ray_vec_new(RAY_BOOL, nrows);
-        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-        out->len = nrows;
-        memset(ray_data(out), keep ? 1 : 0, (size_t)nrows);
-        return out;
-    }
-
-    int8_t got_type = mask->type;
-    ray_release(mask);
-    return ray_error("type",
-        "%s: WHERE must produce a bool mask or truthy scalar, got %s",
-        label, ray_type_name(got_type));
+    /* the one where: rule — same as the compiled OP_FILTER path */
+    return ray_where_mask_coerce(mask, ray_table_nrows(tbl), label);
 }
 
 static ray_op_t* compile_where_predicate(ray_graph_t* g, ray_t* tbl,
@@ -2118,6 +2080,14 @@ static ray_op_t* compile_where_predicate(ray_graph_t* g, ray_t* tbl,
     if (out_err) *out_err = NULL;
     ray_op_t* pred = compile_expr_dag(g, where_expr);
     if (pred) return pred;
+    /* A predicate the compiler rejected outright (`(and x ...)` over an
+     * I64 column) is an error, not a fallback: the interpreter's `and` is
+     * a scalar truth test, which would have kept every row. */
+    if (g->compile_err) {
+        if (out_err) *out_err = graph_take_compile_err(g);
+        else { ray_release(g->compile_err); g->compile_err = NULL; }
+        return NULL;
+    }
 
     ray_t* mask = eval_where_mask(where_expr, tbl, label);
     if (!mask || RAY_IS_ERR(mask)) {
@@ -7330,22 +7300,15 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     return 1;
 }
 
-/* A where: predicate with one value (`false`, `(== (count x) 5)`) holds for
- * every row or none: spread it into a full mask of `tn` rows, as the table
- * filter does.  Consumes `m`; returns it unchanged when it is no scalar, or
- * when it is a symbol or string atom (no truth value; the caller's type
- * check reports it). */
-static ray_t* where_mask_spread(ray_t* m, int64_t tn) {
+/* A where: value that is not already a BOOL mask of `tn` rows goes through
+ * the one where: rule (ray_where_mask_coerce): a scalar (`false`,
+ * `(== (count x) 5)`) is spread over the rows, any other vector (a numeric
+ * or symbol column) is a type error.  Consumes
+ * `m`. */
+static ray_t* where_mask_spread(ray_t* m, int64_t tn, const char* label) {
     if (!m || RAY_IS_ERR(m)) return m;
-    bool atom = ray_is_atom(m) && ray_pred_atom_type_ok(m->type);
-    if (!atom && !(m->type == RAY_BOOL && m->len == 1 && tn != 1)) return m;
-    uint8_t on = atom ? (is_truthy(m) ? 1 : 0) : ((const uint8_t*)ray_data(m))[0];
-    ray_release(m);
-    ray_t* v = ray_vec_new(RAY_BOOL, tn);
-    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
-    v->len = tn;
-    if (tn > 0) memset(ray_data(v), on, (size_t)tn);
-    return v;
+    if (m->type == RAY_BOOL && m->len == tn) return m;
+    return ray_where_mask_coerce(m, tn, label);
 }
 
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
@@ -7423,6 +7386,12 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
         return ray_error("oom", NULL);
     }
     ray_op_t* pred = compile_expr_dag(g, where_expr);
+    if (!pred && g->compile_err) {
+        ray_t* cerr = graph_take_compile_err(g);
+        ray_graph_free(g);
+        ray_release(tbl);
+        return cerr;
+    }
     if (!pred) {
         ray_t* pred_vec = eval_where_mask(where_expr, tbl, "select count");
         if (!pred_vec || RAY_IS_ERR(pred_vec)) {
@@ -7492,7 +7461,7 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
         return pred_vec ? pred_vec : ray_error("type", "select count: WHERE predicate evaluation failed");
     }
     int64_t tbl_nrows = ray_table_nrows(tbl);
-    pred_vec = where_mask_spread(pred_vec, tbl_nrows);
+    pred_vec = where_mask_spread(pred_vec, tbl_nrows, "select count");
     if (!pred_vec || RAY_IS_ERR(pred_vec)) {
         ray_graph_free(g);
         ray_release(tbl);
@@ -15054,16 +15023,21 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
 /* Legacy-shaped mask evaluation (DAG, then eval with column bindings). */
 static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
     ray_t* mask_vec = NULL;
+    bool rejected = false;
     ray_graph_t* g = ray_graph_new(tbl);
     if (g) {
         ray_op_t* pred = compile_expr_dag(g, where_expr);
         if (pred) {
             pred = ray_optimize(g, pred);
             mask_vec = ray_execute(g, pred);
+        } else if (g->compile_err) {
+            /* rejected outright, not declined: no interpreter retry */
+            mask_vec = graph_take_compile_err(g);
+            rejected = true;
         }
         ray_graph_free(g);
     }
-    if (!mask_vec || RAY_IS_ERR(mask_vec)) {
+    if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
         int64_t ncols = ray_table_ncols(tbl);
         ray_env_push_query_scope();
         for (int64_t c = 0; c < ncols; c++)
@@ -15073,7 +15047,7 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
     }
     if (!mask_vec) return ray_error("type", "update: `where:` predicate evaluation failed");
     if (RAY_IS_ERR(mask_vec)) return mask_vec;
-    mask_vec = where_mask_spread(mask_vec, ray_table_nrows(tbl));
+    mask_vec = where_mask_spread(mask_vec, ray_table_nrows(tbl), "update");
     if (!mask_vec || RAY_IS_ERR(mask_vec)) return mask_vec ? mask_vec : ray_error("oom", NULL);
     if (mask_vec->type != RAY_BOOL || mask_vec->len != ray_table_nrows(tbl)) {
         int8_t mask_t = mask_vec->type;
@@ -15905,17 +15879,22 @@ ray_t* ray_update(ray_t** args, int64_t n) {
     if (where_expr) {
         /* Try DAG compilation first, fall back to eval-level */
         ray_t* mask_vec = NULL;
+        bool rejected = false;
         ray_graph_t* g = ray_graph_new(tbl);
         if (g) {
             ray_op_t* pred = compile_expr_dag(g, where_expr);
             if (pred) {
                 pred = ray_optimize(g, pred);
                 mask_vec = ray_execute(g, pred);
+            } else if (g->compile_err) {
+                /* rejected outright, not declined: no interpreter retry */
+                mask_vec = graph_take_compile_err(g);
+                rejected = true;
             }
             ray_graph_free(g);
         }
         /* Fallback: eval-level predicate evaluation */
-        if (!mask_vec || RAY_IS_ERR(mask_vec)) {
+        if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
             /* Bind column names to column vectors in env, then eval */
             int64_t ncols2 = ray_table_ncols(tbl);
             ray_env_push_query_scope();
@@ -15928,7 +15907,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             ray_env_pop_scope();
         }
         if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("type", "update: `where:` predicate evaluation failed"); }
-        mask_vec = where_mask_spread(mask_vec, nrows);
+        mask_vec = where_mask_spread(mask_vec, nrows, "update");
         if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("oom", NULL); }
         if (mask_vec->type != RAY_BOOL || mask_vec->len != nrows) {
             int8_t mask_t = mask_vec->type;            /* capture BEFORE free */

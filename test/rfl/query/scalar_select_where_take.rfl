@@ -1,0 +1,100 @@
+;; scalar_select_where_take.rfl — issues #675 and #679.
+;;
+;; #675: a select whose outputs are all scalar expressions wrapping
+;; aggregates (`(+ (sum x) 0)`) is one row.  Under where: the reductions
+;; inside the projection already walk the selection (exec_reduction), so
+;; OP_SELECT must drop it instead of leaving it for ray_execute_inner's
+;; final gather, which met the one-row result with a selection built for
+;; the input's rows ("sel_compact: selection nrows mismatch").
+;;
+;; #679: an all-aggregate select (keyless GROUP) with a no-match where: and
+;; a positive take: came back empty.  HEAD(GROUP) compacted the selection
+;; into a 0-row table before exec_group, which has no scalar path for an
+;; empty input; the keyless group now keeps the selection lazy, as the
+;; plain OP_GROUP path does, and take: applies to the (one) output row.
+
+;; ─── #675: scalar outputs under where: ───────────────────────────────
+(set T675 (table [x] (list (til 4))))
+
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x 1)}) 'k) -- [5]
+(count (select {k: (+ (sum x) 0) from: T675 where: (> x 1)})) -- 1
+;; no where: unchanged
+(at (select {k: (+ (sum x) 0) from: T675}) 'k) -- [6]
+;; a row column beside the scalar: the scalar is broadcast to the survivors
+(at (select {k: (+ (sum x) 0) y: x from: T675 where: (> x 1)}) 'k) -- [5 5]
+(at (select {k: (+ (sum x) 0) y: x from: T675 where: (> x 1)}) 'y) -- [2 3]
+;; two scalar outputs
+(at (select {k: (+ (sum x) 0) m: (* (max x) 10) from: T675 where: (> x 1)}) 'm) -- [30]
+;; scalar `if` over an aggregate
+(at (select {k: (if (> (sum x) 4) 1 0) from: T675 where: (> x 1)}) 'k) -- [1]
+;; where: matching nothing / everything
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x 10)}) 'k) -- [0]
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x -1)}) 'k) -- [6]
+;; take: applies to the output rows: one row stays one row
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x 1) take: 3}) 'k) -- [5]
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x 1) take: 1}) 'k) -- [5]
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x 1) take: -1}) 'k) -- [5]
+;; with by: the same form is per group (order unspecified: check the set)
+(count (select {k: (+ (sum x) 0) from: T675 where: (> x 0) by: (% x 2)})) -- 2
+(sum (at (select {k: (+ (sum x) 0) from: T675 where: (> x 0) by: (% x 2)}) 'k)) -- 6
+(at (select {k: (+ (sum x) 0) from: T675 where: (> x 1) by: x}) 'k) -- [2 3]
+
+;; ─── #675 on a parted table ──────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_q675_parted")
+(set T675a (table [x d] (list [1 2 3] [2024.01.01 2024.01.01 2024.01.01])))
+(set T675b (table [x d] (list [10 20] [2024.01.02 2024.01.02])))
+(.db.splayed.set "/tmp/rfl_q675_parted/2024.01.01/t/" T675a)
+(.db.splayed.set "/tmp/rfl_q675_parted/2024.01.02/t/" T675b)
+(set P675 (.db.parted.get "/tmp/rfl_q675_parted/" 't))
+(count P675) -- 5
+(at (select {k: (+ (sum x) 0) from: P675 where: (== date 2024.01.02)}) 'k) -- [30]
+(at (select {k: (+ (sum x) 0) from: P675 where: (== d 2024.01.02)}) 'k) -- [30]
+(count (select {k: (+ (sum x) 0) from: P675 where: (== d 2024.01.02)})) -- 1
+(at (select {k: (+ (sum x) 0) from: P675 where: (> x 1)}) 'k) -- [35]
+(at (select {k: (+ (sum x) 0) from: P675}) 'k) -- [36]
+(at (select {c: (count x) from: P675 where: (> x 100) take: 3}) 'c) -- [0]
+(at (select {c: (count x) from: P675 where: (> x 5) take: 1}) 'c) -- [2]
+(.sys.exec "rm -rf /tmp/rfl_q675_parted")
+
+;; ─── #679: scalar aggregate, no-match where:, take: ──────────────────
+(set T679 (table [x y] (list [0 256 0 1 0 0] (til 6))))
+
+(at (select {c: (count y) from: T679 where: (> y 100)}) 'c) -- [0]
+(at (select {c: (count y) from: T679 where: (> y 100) take: 3}) 'c) -- [0]
+(at (select {c: (count y) from: T679 where: (> y 100) take: 1}) 'c) -- [0]
+(at (select {c: (count y) from: T679 where: (> y 100) take: -3}) 'c) -- [0]
+(at (select {c: (count y) from: T679 where: (> y 100) take: [0 3]}) 'c) -- [0]
+;; take: 0 is zero output rows
+(at (select {c: (count y) from: T679 where: (> y 100) take: 0}) 'c) -- []
+;; take: on a non-empty match counts every survivor, not take: rows
+(at (select {c: (count y) from: T679 where: (> y 2) take: 1}) 'c) -- [3]
+(at (select {c: (count y) from: T679 where: (> y 2) take: 3}) 'c) -- [3]
+(at (select {c: (count y) from: T679 take: 3}) 'c) -- [6]
+;; several aggregates
+(at (select {c: (count y) s: (sum y) m: (max y) from: T679 where: (> y 100) take: 3}) 's) -- [0]
+(at (select {c: (count y) s: (sum y) m: (max y) from: T679 where: (> y 100) take: 3}) 'm) -- [0Nl]
+(at (select {c: (count y) s: (sum y) m: (max y) from: T679 where: (> y 2) take: 2}) 's) -- [12]
+;; other no-match predicates
+(at (select {c: (count y) from: T679 where: (== x 256) take: 3}) 'c) -- [1]
+(at (select {c: (count y) from: T679 where: (in x [7 8]) take: 3}) 'c) -- [0]
+(at (select {c: (count y) from: T679 where: (and (> y 100) (< y 1000)) take: 3}) 'c) -- [0]
+;; the #675 form with a no-match where: and take:
+(at (select {c: (+ (count y) 0) from: T679 where: (> y 100) take: 3}) 'c) -- [0]
+;; by: with no match is still no groups
+(count (select {c: (count y) from: T679 where: (> y 100) by: x take: 3})) -- 0
+(count (select {c: (count y) from: T679 where: (> y 2) by: x take: 1})) -- 1
+
+;; ─── review follow-ups ───────────────────────────────────────────────
+;; #675 on a one-row table: a scalar and a row column have the same length,
+;; so the ops decide; a failing where: still leaves one row
+(at (select {k: (+ (sum x) 0) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- [0]
+(at (select {k: (+ (sum x) 0) from: (table [x] (list [5])) where: (> x 1)}) 'k) -- [5]
+(at (select {k: (if (> (sum x) 1) 1 0) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- [0]
+(at (select {k: x from: (table [x] (list [5])) where: (> x 10)}) 'k) -- []
+(at (select {k: (+ x 1) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- []
+;; #679 for an aggregate of an expression: the keyless group keeps its
+;; selection lazy on the plain path too
+(at (select {c: (sum (* y 2)) from: T679 where: (> y 100)}) 'c) -- [0]
+(at (select {c: (sum (* y 2)) from: T679 where: (> y 100) take: 1}) 'c) -- [0]
+(at (select {c: (sum (* y 2)) from: T679 where: (> y 2)}) 'c) -- [24]
+(at (select {c: (max (+ y 1)) from: T679 where: (> y 100)}) 'c) -- [0Nl]
