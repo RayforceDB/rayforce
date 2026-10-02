@@ -69,7 +69,7 @@ All comparison operators are **atomic** and return boolean results.
 |---|---|---|---|
 | `and` | binary | Logical AND | `(and true false)` → `false` |
 | `or` | binary | Logical OR | `(or true false)` → `true` |
-| `not` | unary | Logical NOT | `(not true)` → `false` |
+| `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation
 
