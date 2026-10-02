@@ -92,9 +92,13 @@ static ray_err_t journal_lock(const char* base, bool* missing) {
         journal_unlock();
     }
     for (int attempt = 0; attempt < 8; attempt++) {
-        /* flock needs no write access: a lock file another user created
-         * still serialises with that user's process. */
-        ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_CREATE);
+        /* Open for writing: flock emulated over byte-range locks (NFS, SMB)
+         * takes an exclusive lock only on a writable fd.  A lock file that
+         * is not ours to write (another user's) is still locked through a
+         * read-only fd, so it serialises with that user's process. */
+        ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+        if (fd == RAY_FD_INVALID && (errno == EACCES || errno == EROFS))
+            fd = ray_file_open(path, RAY_OPEN_READ);
         if (fd == RAY_FD_INVALID) {
             if (missing) *missing = errno == ENOENT;
             return RAY_ERR_IO;
