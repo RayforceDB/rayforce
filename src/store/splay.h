@@ -37,6 +37,7 @@ typedef struct {
     ray_fd_t lock;
     bool staged;
     char root[1024];
+    char created[1024];     /* shallowest directory of root begin created */
     char dir[1024];
     char generation[256];
 } ray_splay_write_t;

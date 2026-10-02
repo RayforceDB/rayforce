@@ -521,6 +521,44 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
     return splay_write_table_impl(tbl, dir, sym_path, durable, true, true);
 }
 
+/* Record the shallowest component of `root` that does not exist yet, so a
+ * failed first write can remove the directories it created. */
+static void splay_find_missing(const char* root, char* out, size_t out_sz) {
+    out[0] = '\0';
+    size_t len = strlen(root);
+    if (len >= out_sz) return;
+    char buf[1024];
+    memcpy(buf, root, len + 1);
+    struct stat st;
+    for (size_t i = 1; i <= len; i++) {
+        if (i < len && buf[i] != '/') continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        bool missing = stat(buf, &st) != 0 && errno == ENOENT;
+        if (missing) {
+            memcpy(out, buf, i + 1);
+            return;
+        }
+        buf[i] = saved;
+    }
+}
+
+/* A failed first write removes the table directory and every directory begin
+ * created above it, so no partition without a schema is left behind. Parents
+ * are only removed while empty. */
+static void splay_remove_created(const ray_splay_write_t* write) {
+    splay_remove_tree_best_effort(write->root);
+    size_t stop = strlen(write->created);
+    char path[1024];
+    memcpy(path, write->root, strlen(write->root) + 1);
+    for (;;) {
+        char* slash = strrchr(path, '/');
+        if (!slash || (size_t)(slash - path) < stop) break;
+        *slash = '\0';
+        if (rmdir(path) != 0) break;
+    }
+}
+
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
     char previous[1024];
@@ -547,11 +585,21 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
         !splay_generation_is_current(write)) {
         splay_remove_tree_best_effort(write->dir);
     }
+    bool drop_created = result != RAY_OK && !write->staged && write->created[0];
+#ifndef RAY_OS_WINDOWS
+    /* Removed under the lock: a writer waiting on it then finds no directory
+     * and fails instead of writing into one that is being removed. */
+    if (drop_created) splay_remove_created(write);
+#endif
     if (write->lock != RAY_FD_INVALID) {
         (void)ray_file_unlock(write->lock);
         ray_file_close(write->lock);
         write->lock = RAY_FD_INVALID;
     }
+#ifdef RAY_OS_WINDOWS
+    /* Windows cannot delete the open lock file. */
+    if (drop_created) splay_remove_created(write);
+#endif
     return result;
 }
 
@@ -563,8 +611,9 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     if (n < 0 || (size_t)n >= sizeof(write->root)) return RAY_ERR_RANGE;
     size_t len = strlen(write->root);
     while (len > 1 && write->root[len - 1] == '/') write->root[--len] = '\0';
+    splay_find_missing(write->root, write->created, sizeof(write->created));
     ray_err_t err = ray_mkdir_p(write->root);
-    if (err != RAY_OK) return err;
+    if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
 
     char path[1024];
     n = snprintf(path, sizeof(path), "%s/.write.lock", write->root);

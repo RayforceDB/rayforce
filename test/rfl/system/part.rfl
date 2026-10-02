@@ -481,5 +481,25 @@
 (.db.parted.get "/tmp/rfl_part_intovf/" 't) !- corrupt
 (.sys.exec "rm -rf /tmp/rfl_part_intord /tmp/rfl_part_intovf")
 
+;; ────────────── failed first write of a partition ──────────────
+;; A first write writes in place; when it fails (here the symbol file sits
+;; under a regular file) it removes the directories it created, so the
+;; partition scan does not trip over a directory without a schema.
+(.sys.exec "rm -rf /tmp/rfl_part_fail && mkdir -p /tmp/rfl_part_fail && touch /tmp/rfl_part_fail/file")
+(set FW (table [a s] (list [1 2] ['x 'y])))
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/t/" FW "/tmp/rfl_part_fail/db/.sym")
+(.db.splayed.set "/tmp/rfl_part_fail/db/2/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/2") -- 1
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; every directory the write created goes, the ones that were there stay
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/u/x/y/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/1/u") -- 1
+(.sys.exec "test -d /tmp/rfl_part_fail/db/1/t") -- 0
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; a failed rewrite of a published table keeps the table
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+(.sys.exec "rm -rf /tmp/rfl_part_fail")
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like /tmp/rfl_part_mc /tmp/rfl_part_mb")
