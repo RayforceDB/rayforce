@@ -15353,13 +15353,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
                 }
 
-                /* Evaluate expression on sub-table via DAG */
-                ray_graph_t* ug = ray_graph_new(sub_tbl);
-                ray_op_t* expr_op = compile_expr_dag(ug, agg_expr);
-                if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return cerr ? cerr : ray_error("domain", "update by: failed to compile aggregate expression"); }
-                expr_op = ray_optimize(ug, expr_op);
-                ray_t* agg_result = ray_execute(ug, expr_op);
-                ray_graph_free(ug);
+                /* Evaluate expression on the sub-table: DAG first, then the
+                 * eval-level fallback with the group's columns bound (an
+                 * aggregate the DAG declines, e.g. over temporal + - *,
+                 * used to fail here with "failed to compile"). */
+                ray_t* agg_result = update_eval_on(sub_tbl, agg_expr);
                 ray_release(sub_tbl);
 
                 if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
@@ -16079,16 +16077,15 @@ no_where_add_col:
         }
         if (exists) continue;
 
-        /* New column: evaluate expression and add */
+        /* New column: evaluate expression and add.  DAG first, then the
+         * eval-level fallback with column bindings — the same sequence an
+         * update of an EXISTING column takes (update_eval_on).  This site
+         * used to fail outright when the DAG declined the expression
+         * (temporal + - *), so `x: (+ ts 1)` worked as a select and as an
+         * existing-column update but not as a new column. */
         ray_t* update_expr = dict_elems[d + 1];
-        ray_graph_t* ug = ray_graph_new(tbl);
-        ray_op_t* expr_op = compile_expr_dag(ug, update_expr);
-        if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_release(result); ray_release(tbl); ray_graph_free(ug); DICT_VIEW_CLOSE(upda); return cerr ? cerr : ray_error("domain", "update: failed to compile new column expression"); }
-        expr_op = ray_optimize(ug, expr_op);
-        ray_t* expr_vec = ray_execute(ug, expr_op);
-        ray_graph_free(ug);
-        if (RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec; }
-        expr_vec = update_scalar_vec(expr_vec, ray_table_nrows(tbl));
+        ray_t* expr_vec = update_eval_on(tbl, update_expr);
+        if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate new column expression"); }
 
         /* Broadcast scalar to column */
         if (expr_vec->type < 0) {
