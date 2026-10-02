@@ -353,6 +353,26 @@ static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
     return len == 1 && (name[0] == '+' || name[0] == '-' || name[0] == '*');
 }
 
+/* A comparison between a temporal and a float has no meaning — the eval
+ * path rejects it (`cannot compare timestamp and f64`, cmp.c).  The DAG
+ * kernel promoted both sides to double, where a TIMESTAMP near 2024 has a
+ * 128 ns ULP: against the F64 mean of the column, (> ts (avg ts)) read
+ * every row as equal to the mean (#694).  Integer scalars stay on the
+ * exact int64 kernel, as they always did. */
+static bool dag_cmp_rejects_temporal_float(const char* fname, size_t fname_len,
+                                           int8_t lt, int8_t rt) {
+    bool cmp = (fname_len == 1 && (fname[0] == '>' || fname[0] == '<')) ||
+               (fname_len == 2 && fname[1] == '=' &&
+                (fname[0] == '>' || fname[0] == '<' ||
+                 fname[0] == '=' || fname[0] == '!'));
+    if (!cmp) return false;
+    if (RAY_IS_PARTED(lt)) lt = (int8_t)RAY_PARTED_BASETYPE(lt);
+    if (RAY_IS_PARTED(rt)) rt = (int8_t)RAY_PARTED_BASETYPE(rt);
+    bool lf = lt == RAY_F64 || lt == RAY_F32;
+    bool rf = rt == RAY_F64 || rt == RAY_F32;
+    return (dag_type_is_temporal(lt) && rf) || (lf && dag_type_is_temporal(rt));
+}
+
 static bool dag_unary_numeric_name(const char* name, size_t len) {
     if (len == 3)
         return memcmp(name, "sin", 3) == 0 ||
@@ -1905,6 +1925,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     if (!g->compile_err)
                         g->compile_err = ray_error("type", "cannot %s %s and %s",
                             dag_arith_verb(fname, fname_len),
+                            ray_type_name((int8_t)-left->out_type),
+                            ray_type_name((int8_t)-right->out_type));
+                    return NULL;
+                }
+                if (g->if_arm_depth == 0 &&
+                    dag_cmp_rejects_temporal_float(fname, fname_len,
+                                                   left->out_type, right->out_type)) {
+                    if (!g->compile_err)
+                        g->compile_err = ray_error("type", "cannot compare %s and %s",
                             ray_type_name((int8_t)-left->out_type),
                             ray_type_name((int8_t)-right->out_type));
                     return NULL;
@@ -4800,7 +4829,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                 if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
                 if (cell && !RAY_IS_ERR(cell)) {
                     int8_t t = cell->type;
-                    if (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) vt = (int8_t)(-t);
+                    if (t < 0 && t != -RAY_SYM && t != -RAY_STR) vt = (int8_t)(-t);
                     ray_release(cell);
                 } else if (cell) ray_error_free(cell);
             }
@@ -5255,7 +5284,7 @@ static ray_t* empty_agg_column(ray_t* fn_name, ray_t* src) {
             if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
             if (v && !RAY_IS_ERR(v)) {
                 int8_t t = v->type;
-                if (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) out = ray_vec_new((int8_t)(-t), 0);
+                if (t < 0 && t != -RAY_SYM && t != -RAY_STR) out = ray_vec_new((int8_t)(-t), 0);
                 ray_release(v);
             } else if (v) ray_error_free(v);
             ray_release(empty);
@@ -7949,6 +7978,23 @@ static bool select_alias_skip_form(ray_t* head) {
            (l == 5 && memcmp(p, "quote", 5) == 0);
 }
 
+/* expr_contains_agg for the eval fallback's one-value rule: an aggregate
+ * inside a lambda, let or quote form does not count.  A lambda call is a
+ * per-row projection on the fallback (`((fn [c] (sum c)) 'ts)` sums one
+ * cell per row, parted_f64_agg.rfl) and its body folds its own formal,
+ * not a column, so it is neither evaluated once nor pre-reduced. */
+static int select_fallback_has_agg(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    int64_t n = ray_len(expr);
+    if (n == 0) return 0;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_alias_skip_form(el[0])) return 0;
+    if (is_agg_expr(expr)) return 1;
+    for (int64_t i = 0; i < n; i++)
+        if (select_fallback_has_agg(el[i])) return 1;
+    return 0;
+}
+
 static bool select_alias_head_is_agg(ray_t* head) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
     if (resolve_agg_opcode(head->i64) != 0) return true;
@@ -8108,6 +8154,64 @@ static ray_t* select_alias_map_list(ray_t* expr, int64_t from, select_alias_map_
     }
     if (!out) { ray_retain(expr); return expr; }
     return out;
+}
+
+/* ── Eval-fallback pre-reduction of aggregates ────────────────────────────
+ * A projection that mixes a row column with an aggregate in one expression
+ * (`(+ i (max i))`, `(if (> i (avg i)) 1 0)`) is scattered per row by the
+ * eval fallback, where every column is bound to one cell: the aggregate
+ * then folds that cell alone and `(max i)` reads as `i`.  Before the
+ * scatter, every maximal aggregate call in the expression is evaluated once
+ * over the whole table (eval_expr_whole_column, earlier outputs already
+ * bound as columns) and its value spliced into a rewritten copy of the
+ * expression, so the per-row pass combines each row with the value the DAG
+ * path would have broadcast.  A value the evaluator would not take as
+ * itself — a symbol (a name, or a literal the active-query rule maps to a
+ * column) or a list (a call) — is wrapped in `(quote …)`; a one-element
+ * vector is the scalar it stands for, as select_fallback_broadcast reads
+ * it.  Lambda, let and quote forms are left alone: a lambda's body folds
+ * its own formal per row, not a column.  The user's AST is never mutated
+ * (select_alias_map_list copies a list only once a child changes).
+ * Returns an owned expression, or an error. */
+typedef struct { ray_t* tbl; } select_fallback_prereduce_ctx_t;
+
+static ray_t* select_fallback_prereduce(ray_t* expr, void* vctx) {
+    select_fallback_prereduce_ctx_t* c = (select_fallback_prereduce_ctx_t*)vctx;
+    if (!expr || expr->type != RAY_LIST || expr->len < 1) { ray_retain(expr); return expr; }
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_alias_skip_form(el[0])) { ray_retain(expr); return expr; }
+    if (!is_agg_expr(expr))
+        return select_alias_map_list(expr, el[0]->type == RAY_LIST ? 0 : 1,
+                                     select_fallback_prereduce, c);
+    ray_t* v = eval_expr_whole_column(expr, c->tbl);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    if (v->type > 0 && v->type != RAY_LIST && ray_is_vec(v) && v->len == 1) {
+        int allocated = 0;
+        ray_t* a = collection_elem(v, 0, &allocated);
+        if (a && !RAY_IS_ERR(a) && !allocated) ray_retain(a);
+        ray_release(v);
+        if (!a || RAY_IS_ERR(a)) return a ? a : ray_error("oom", NULL);
+        v = a;
+    }
+    if (v->type == -RAY_SYM) {
+        /* a literal copy (ray_quote_fn's shape): no name resolution, and
+         * collect_col_refs does not take it for a column of the same name */
+        ray_t* q = ray_sym(v->i64);
+        ray_release(v);
+        if (!q || RAY_IS_ERR(q)) return q ? q : ray_error("oom", NULL);
+        q->attrs |= ATTR_QUOTED;
+        v = q;
+    } else if (v->type != RAY_LIST) {
+        return v;
+    }
+    ray_t* head = ray_sym(ray_sym_intern("quote", 5));
+    ray_t* wrap = head && !RAY_IS_ERR(head) ? ray_list_new(2) : NULL;
+    if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, head);
+    if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, v);
+    if (head && !RAY_IS_ERR(head)) ray_release(head);
+    ray_release(v);
+    if (!wrap || RAY_IS_ERR(wrap)) return wrap ? wrap : ray_error("oom", NULL);
+    return wrap;
 }
 
 typedef struct {
@@ -12889,7 +12993,17 @@ by_dict_done:
                 }
             }
             if (use_eval_fallback) {
-                if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
+                /* A projection the compiler rejected outright is an error,
+                 * not a fallback: scattered per row, (> ts (avg ts)) would
+                 * average one cell and compare it with itself. */
+                if (g->compile_err) {
+                    ray_t* cerr = graph_take_compile_err(g);
+                    if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                    if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(colops_hdr);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr;
+                }
                 /* The fallback evaluates projections directly over `tbl`,
                  * bypassing the DAG's ray_execute — so a WHERE clause (wired
                  * into `root` as ray_filter) would be silently ignored.
@@ -12971,7 +13085,7 @@ by_dict_done:
                         kid == take_id || kid == asc_id || kid == desc_id ||
                         kid == nearest_id) continue;
                     ray_t* e = dict_elems[i + 1];
-                    any_row_proj = expr_refs_row_column(e, tbl) || !expr_contains_agg(e);
+                    any_row_proj = expr_refs_row_column(e, tbl) || !select_fallback_has_agg(e);
                 }
                 int64_t bcast_len = any_row_proj ? nrows : 1;
                 int64_t out_len = -1;   /* length of the first materialized column */
@@ -12994,13 +13108,30 @@ by_dict_done:
                     int whole_verb = is_whole_column_projection(expr);
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
-                                     (expr_contains_agg(expr) && !expr_refs_row_column(expr, tbl)));
-                    ray_t* col = select_fallback_passthrough_col(expr, tbl, nrows);
-                    if (!col) {
-                        col = (whole_verb || one_value)
-                            ? eval_expr_whole_column(expr, tbl)
-                            : eval_expr_per_row(expr, tbl, nrows);
-                        if (one_value) col = select_fallback_broadcast(col, bcast_len);
+                                     (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)));
+                    /* A row column mixed with an aggregate in one
+                     * expression: its aggregates are reduced once over
+                     * the whole table before the scatter, which would
+                     * otherwise fold a single cell (`(+ i (max i))` came
+                     * back as `(* 2 i)`; select_fallback_prereduce). */
+                    ray_t* reduced = NULL;
+                    if (!whole_verb && !one_value && select_fallback_has_agg(expr)) {
+                        select_fallback_prereduce_ctx_t pc = { tbl };
+                        reduced = select_fallback_prereduce(expr, &pc);
+                        if (reduced && !RAY_IS_ERR(reduced)) expr = reduced;
+                    }
+                    ray_t* col;
+                    if (reduced && RAY_IS_ERR(reduced)) {
+                        col = reduced;
+                    } else {
+                        col = select_fallback_passthrough_col(expr, tbl, nrows);
+                        if (!col) {
+                            col = (whole_verb || one_value)
+                                ? eval_expr_whole_column(expr, tbl)
+                                : eval_expr_per_row(expr, tbl, nrows);
+                            if (one_value) col = select_fallback_broadcast(col, bcast_len);
+                        }
+                        if (reduced) ray_release(reduced);
                     }
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
