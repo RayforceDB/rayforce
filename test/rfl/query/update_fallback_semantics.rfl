@@ -35,6 +35,17 @@
 (at (update {m: (max (- ts ts)) by: k from: t}) 'm) -- [0 0 0 0 0]
 (at (update {m: (max (+ i 1)) by: k from: t}) 'm) -- [3 3 6 6 6]
 
+;; an `if` whose condition mixes a row column with an aggregate cannot be
+;; evaluated per row (the aggregate would see one cell); it stays an error
+;; until the fallback can reduce aggregates first (#692)
+(update {x: (if (> i (avg i)) (+ ts 1) ts) from: t}) !- nyi
+(update {i: (if (> i (avg i)) 1 (- ts ts)) from: t where: (> i 1)}) !- nyi
+(update {x: (if (> i (avg i)) (+ ts 1) ts) by: k from: t}) !- nyi
+;; an aggregate over a literal or a global is the same on every row: fine
+(at (update {x: (if (> i 2) (count [1 2 3]) (- ts ts)) from: t}) 'x) -- [0 0 3 3 3]
+(set GL [1 2 3 4])
+(at (update {x: (if (> i 2) (count GL) (- ts ts)) from: t}) 'x) -- [0 0 4 4 4]
+
 ;; ─── 3. update by: with group results of differing types ────────────────────
 (set g (table [k ts tm i] (list [a a b c c c] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 6))) (as 'TIME (* 1000 (til 6))) [1 2 3 4 5 6])))
 (at (update {m: (if (> (count i) 1) (max (- i i)) 2.5) by: k from: g}) 'm) -- [0.0 0.0 2.5 0.0 0.0 0.0]

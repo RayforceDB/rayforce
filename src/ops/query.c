@@ -14972,6 +14972,43 @@ static ray_t* update_by_store(ray_t* col, int64_t row, ray_t* cell) {
     return col;
 }
 
+/* True iff `expr` reads a column of `tbl` anywhere in its subtree — unlike
+ * expr_refs_row_column it looks inside aggregates too. */
+static int expr_refs_any_column(ray_t* expr, ray_t* tbl) {
+    if (!expr) return 0;
+    if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
+        if (ray_env_has_lexical_local(expr->i64)) return 0;
+        if (ray_table_get_col(tbl, expr->i64)) return 1;
+        if (ray_sym_is_dotted(expr->i64)) {
+            const int64_t* segs;
+            int nsegs = ray_sym_segs(expr->i64, &segs);
+            if (nsegs >= 1 && ray_table_get_col(tbl, segs[0])) return 1;
+        }
+        return 0;
+    }
+    if (expr->type == RAY_LIST) {
+        ray_t** elems = (ray_t**)ray_data(expr);
+        int64_t n = ray_len(expr);
+        for (int64_t i = 1; i < n; i++)
+            if (expr_refs_any_column(elems[i], tbl)) return 1;
+    }
+    return 0;
+}
+
+/* True iff `expr` contains an aggregate over a column of `tbl`: the one
+ * shape a per-row pass cannot evaluate, since the aggregate would see one
+ * cell.  An aggregate over a global or a literal is the same value on
+ * every row and is fine per row. */
+static int expr_contains_agg_over_column(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    if (is_agg_expr(expr)) return expr_refs_any_column(expr, tbl);
+    ray_t** elems = (ray_t**)ray_data(expr);
+    int64_t n = ray_len(expr);
+    for (int64_t i = 0; i < n; i++)
+        if (expr_contains_agg_over_column(elems[i], tbl)) return 1;
+    return 0;
+}
+
 /* Whether a DAG error must stand rather than hand the expression to the
  * interpreter: only when an `if` refused its operands (g->if_refused).  The
  * interpreter's `if` tests one truth value, so retrying there wrote the
@@ -14987,7 +15024,8 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * verbs need the whole column — except for an `if` that reads a column in
  * row position (expr_refs_row_column): the interpreter's `if` tests ONE
  * truth value, so a whole-column pass wrote the then-branch to every row;
- * that goes per row.  When both paths fail, the planner's error (a misspelt
+ * that goes per row — unless it also aggregates, which per row would see
+ * one cell: that is an error (#692).  When both paths fail, the planner's error (a misspelt
  * column: `schema: column 'x' not found`) wins over the interpreter's less
  * specific one.  Owned; a one-element vector is its atom. */
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
@@ -15020,7 +15058,17 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
          * columns, and whole-column verbs (.idx.hash, distinct, ...) and
          * aggregates need the whole column; only `if` is not — it tests one
          * truth value — so an `if` over a column goes per row. */
-        if (!(expr_contains_call_named(expr, "if", 2) && expr_refs_row_column(expr, sub))) {
+        int per_row = expr_contains_call_named(expr, "if", 2) && expr_refs_row_column(expr, sub);
+        if (per_row && expr_contains_agg_over_column(expr, sub)) {
+            /* Per row, an aggregate over a column sees one cell:
+             * `(if (> i (avg i)) ..)` would compare each row with itself.
+             * Keep this an error until the fallback can reduce aggregates
+             * first (#692).  (An aggregate over a global or a literal is the
+             * same value on every row and goes through.) */
+            if (cerr) ray_release(cerr);
+            return ray_error("nyi", "update: an if over a column that also aggregates is not supported without the planner");
+        }
+        if (!per_row) {
             int64_t ncols = ray_table_ncols(sub);
             ray_env_push_query_scope();
             for (int64_t c = 0; c < ncols; c++)
