@@ -1,0 +1,17 @@
+;; @requires: posix  (fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; A date-partitioned table's `date` key against a TIMESTAMP literal.  The key
+;; holds days; the literal is rewritten in days, rounded as the operator needs,
+;; so partition pruning and the row filter agree with the same data in memory.
+(.sys.exec "rm -rf /tmp/rfl_tcmp_parted/") -- 0
+(.db.splayed.set "/tmp/rfl_tcmp_parted/2024.01.01/t/" (table [v] (list (til 4))) "/tmp/rfl_tcmp_parted/.sym")
+(.db.splayed.set "/tmp/rfl_tcmp_parted/2024.01.02/t/" (table [v] (list (til 4))) "/tmp/rfl_tcmp_parted/.sym")
+(.db.splayed.set "/tmp/rfl_tcmp_parted/2024.01.03/t/" (table [v] (list (til 4))) "/tmp/rfl_tcmp_parted/.sym")
+(set P (.db.parted.get "/tmp/rfl_tcmp_parted/" 't))
+(count (select {v: v from: P where: (>= date 2024.01.02D00:00:00.000000000)})) -- 8
+(count (select {v: v from: P where: (> date 2024.01.01D12:00:00.000000000)})) -- 8
+(count (select {v: v from: P where: (< date 2024.01.03D00:00:00.000000001)})) -- 12
+(count (select {v: v from: P where: (<= date 2024.01.02D23:59:59.999999999)})) -- 8
+(count (select {v: v from: P where: (== date 2024.01.02D00:00:00.000000000)})) -- 4
+(count (select {v: v from: P where: (== date 2024.01.02D06:00:00.000000000)})) -- 0
+(count (select {from: P where: (>= date 2024.01.02D00:00:00.000000000)})) -- 8
+(.sys.exec "rm -rf /tmp/rfl_tcmp_parted/") -- 0
