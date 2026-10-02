@@ -847,39 +847,6 @@ static bool if_branch_trivial(ray_graph_t* g, ray_op_t* op) {
     return false;
 }
 
-/* Whether the text build can read every SYM cell of a trivial branch from
- * its snapshot.  A FILE-domain column whose domain gained positions past the
- * mapped file (new symbols of a live insert) may not be; that `if` goes to
- * the selected arm from the start instead of materialising both branches
- * for a build that would then decline. */
-static bool if_sym_col_snapshot_ok(ray_t* col) {
-    if (RAY_IS_PARTED(col->type)) {
-        ray_t** segs = (ray_t**)ray_data(col);
-        for (int64_t s = 0; s < col->len; s++)
-            if (segs[s] && !RAY_IS_PARTED(segs[s]->type) && !if_sym_col_snapshot_ok(segs[s]))
-                return false;
-        return true;
-    }
-    if (!RAY_IS_SYM(col->type)) return true;
-    struct ray_sym_domain_s* dom = ray_sym_vec_domain(col);
-    if (!dom || dom == ray_sym_runtime_domain()) return true;
-    ray_sym_domain_raw_t raw;
-    if (!ray_sym_domain_raw_pin(dom, &raw)) return false;
-    bool ok = ray_sym_domain_count(dom) <= raw.count;
-    ray_sym_domain_raw_unpin(dom);
-    return ok;
-}
-
-static bool if_branch_snapshot_ok(ray_graph_t* g, ray_op_t* op) {
-    if (!op) return false;
-    if (op->opcode == OP_ALIAS || op->opcode == OP_MATERIALIZE)
-        return if_branch_snapshot_ok(g, op_child(g, op, 0));
-    if (op->opcode != OP_SCAN || !g->table) return true;
-    ray_op_ext_t* ext = find_ext(g, op->id);
-    ray_t* col = ext ? ray_table_get_col(g->table, ext->sym) : NULL;
-    return !col || if_sym_col_snapshot_ok(col);
-}
-
 /* A branch that is cheap to evaluate over ALL rows and total (no row can
  * fail): scans, constants, substrings, string case/trim/length, add/sub/mul,
  * comparisons, and/or/not, and `if` over such — a descriptor-only STR
@@ -937,10 +904,7 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
     }
 }
 
-/* `force`: run this arm even where the eager arm is a candidate (the
- * eager text build declined); the result type is still the one both arms
- * agree on. */
-static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v, bool force) {
+static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     if (!g || !g->table || !cond_v || cond_v->type != RAY_BOOL)
         return NULL;
     int64_t nrows = ray_table_nrows(g->table);
@@ -1002,11 +966,10 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v, bool
                            (then_op->out_type == RAY_SYM || else_op->out_type == RAY_SYM) &&
                            (then_op->out_type == RAY_SYM || then_op->out_type == RAY_STR) &&
                            (else_op->out_type == RAY_SYM || else_op->out_type == RAY_STR) &&
-                           if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op) &&
-                           if_branch_snapshot_ok(g, then_op) && if_branch_snapshot_ok(g, else_op));
+                           if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op));
     {
         ray_pool_t* rp = ray_pool_get();
-        if (rp && rp->n_workers > 0 && eager_possible && !force)
+        if (rp && rp->n_workers > 0 && eager_possible)
             return NULL;
     }
 
@@ -1575,17 +1538,8 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
             return result;
         }
         /* A SYM side the text build could not read (a symbol appended to
-         * its domain after the snapshot): take the selected arm, as before
-         * this build existed, rather than the per-row append below. */
-        if (then_v->type == -RAY_SYM || RAY_IS_SYM(then_v->type) ||
-            else_v->type == -RAY_SYM || RAY_IS_SYM(else_v->type)) {
-            ray_t* sel = exec_if_selected(g, op, cond_v, true);
-            if (sel) {
-                ray_release(result);
-                ray_release(cond_v); ray_release(then_v); ray_release(else_v);
-                return sel;
-            }
-        }
+         * its domain after the snapshot) is resolved row by row below, from
+         * the branches already materialised. */
         /* Two STR vectors: the result is descriptors only.  Each row takes
          * its side's 16-byte descriptor; pooled strings keep pointing into
          * their pool.  One shared pool (or one side inline-only) is reused
@@ -1826,7 +1780,7 @@ ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
     if (!cond_v || RAY_IS_ERR(cond_v)) return cond_v;
 
-    ray_t* selected = exec_if_selected(g, op, cond_v, false);
+    ray_t* selected = exec_if_selected(g, op, cond_v);
     if (selected) {
         ray_release(cond_v);
         return selected;
