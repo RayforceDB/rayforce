@@ -556,13 +556,35 @@ static void splay_find_missing(const char* root, char* out, size_t out_sz) {
 }
 
 /* A failed first write removes the table directory and every directory begin
- * created above it, so no partition without a schema is left behind.  Only
- * the lock holder removes the table directory's contents; without the lock
- * (begin failed before taking it) and above it, directories are removed only
- * while empty. */
+ * created above it, so no partition without a schema is left behind.  The
+ * lock holder first empties the table directory, all but its lock file. */
+static void splay_clear_created(const ray_splay_write_t* write) {
+    DIR* d = opendir(write->root);
+    if (!d) return;
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+            strcmp(entry->d_name, ".write.lock") == 0)
+            continue;
+        char child[1100];
+        int n = snprintf(child, sizeof(child), "%s/%s", write->root, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) continue;
+        splay_remove_tree_best_effort(child);
+    }
+    closedir(d);
+}
+
+/* Then the lock file goes, last: a waiter on it finds it unlinked and starts
+ * over, and a writer that creates a new one keeps the directory, which is
+ * then removed only while empty, like every directory above it.  Without the
+ * lock (begin failed before taking it) nothing but empty directories goes. */
 static void splay_remove_created(const ray_splay_write_t* write, bool locked) {
-    if (locked) splay_remove_tree_best_effort(write->root);
-    else (void)rmdir(write->root);
+    if (locked) {
+        char lock[1100];
+        int n = snprintf(lock, sizeof(lock), "%s/.write.lock", write->root);
+        if (n > 0 && (size_t)n < sizeof(lock)) (void)unlink(lock);
+    }
+    if (rmdir(write->root) != 0) return;
     size_t stop = strlen(write->created);
     char path[1024];
     memcpy(path, write->root, strlen(write->root) + 1);
@@ -603,9 +625,10 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
     }
     bool drop_created = result != RAY_OK && !write->staged && write->created[0];
     bool locked = write->locked;
+    if (drop_created && locked) splay_clear_created(write);
 #ifndef RAY_OS_WINDOWS
-    /* Removed under the lock; a writer waiting on it then finds its lock
-     * file unlinked and starts over (see ray_splay_write_begin). */
+    /* Under the lock; a writer waiting on it then finds its lock file
+     * unlinked and starts over (see ray_splay_write_begin). */
     if (drop_created) splay_remove_created(write, locked);
 #endif
     if (write->lock != RAY_FD_INVALID) {
@@ -638,9 +661,11 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
         splay_find_missing(write->root, write->created, sizeof(write->created));
         err = ray_mkdir_p(write->root);
         if (err != RAY_OK) {
+#ifndef RAY_OS_WINDOWS
             /* A failed first write of a sibling removed a new parent
              * between our mkdirs: create it again. */
             if (errno == ENOENT) continue;
+#endif
             return ray_splay_write_finish(write, err, false);
         }
         write->lock = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);

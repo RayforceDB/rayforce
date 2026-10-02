@@ -2555,6 +2555,32 @@ static test_result_t test_journal_lock_not_inherited(void) {
 #endif
 }
 
+/* A lock file this process cannot write (another user's) still guards the
+ * journal: purge is refused while its holder has it locked. */
+static test_result_t test_journal_purge_refused_readonly_lock(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_ro");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(7));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    char path[300]; snprintf(path, sizeof(path), "%s.lk", base);
+    TEST_ASSERT_EQ_I(chmod(path, 0444), 0);
+    int other = open(path, O_RDONLY);
+    TEST_ASSERT_TRUE(other >= 0);
+    TEST_ASSERT_EQ_I(flock(other, LOCK_EX | LOCK_NB), 0);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), 0);
+    close(other);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), -1);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
 /* Purge stays best-effort when the journal's directory is gone. */
 static test_result_t test_journal_purge_without_dir(void) {
 #if defined(_WIN32)
@@ -2707,6 +2733,7 @@ const test_entry_t journal_entries[] = {
     { "journal/lock_follows_base",          test_journal_lock_follows_base,          jrn_setup, jrn_teardown },
     { "journal/lock_not_inherited",         test_journal_lock_not_inherited,         jrn_setup, jrn_teardown },
     { "journal/purge_without_dir",          test_journal_purge_without_dir,          jrn_setup, jrn_teardown },
+    { "journal/purge_refused_readonly_lock", test_journal_purge_refused_readonly_lock, jrn_setup, jrn_teardown },
     /* #420: snapshot/roll crash window must not double-apply */
     { "journal/crash_window_no_double_apply", test_journal_crash_window_no_double_apply, jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
