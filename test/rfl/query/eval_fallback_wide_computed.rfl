@@ -1,0 +1,34 @@
+;; eval_fallback_wide_computed.rfl — a STR- or GUID-valued projection in the
+;; eval-level fallback is collected as a STR / GUID vector, as it is when the
+;; same projection compiles (review of #690).
+;;
+;; The fallback's per-row cell collector collapsed scalars into a typed vector
+;; except STR and GUID, so `(if (> i 2) str "zz")` alone was STR but became a
+;; LIST of boxed atoms as soon as a projection the DAG declines (temporal
+;; + - *) sat beside it: a column's type depended on its neighbour.
+
+(set T (table [i str d g] (list [1 2 3 4] (list "a" "" "ccc" "dd") [2001.01.01 2002.01.01 2003.01.01 2004.01.01] (guid 4))))
+
+;; ─── control: the compiled path ─────────────────────────────────────────────
+(type (at (select {w: (if (> i 2) str "zz") from: T}) 'w)) -- 'STR
+(type (at (select {w: g from: T}) 'w)) -- 'GUID
+
+;; ─── STR beside a temporal projection ───────────────────────────────────────
+(type (at (select {w: (if (> i 2) str "zz") x: (+ d 1) from: T}) 'w)) -- 'STR
+(at (select {w: (if (> i 2) str "zz") x: (+ d 1) from: T}) 'w) -- (list "zz" "zz" "ccc" "dd")
+;; a string past the 12-byte inline size goes through the pool
+(at (select {w: (if (> i 2) str "a-string-longer-than-twelve") x: (+ d 1) from: T}) 'w) -- (list "a-string-longer-than-twelve" "a-string-longer-than-twelve" "ccc" "dd")
+;; a quoted STR column name
+(type (at (select {w: 'str x: (+ d 1) from: T}) 'w)) -- 'STR
+
+;; ─── GUID beside a temporal projection ──────────────────────────────────────
+(type (at (select {w: (if (> i 2) g g) x: (+ d 1) from: T}) 'w)) -- 'GUID
+(at (select {w: (if (> i 2) g g) x: (+ d 1) from: T}) 'w) -- (at T 'g)
+
+;; ─── mixed types still demote to LIST ───────────────────────────────────────
+(type (at (select {w: (if (> i 2) str 0) x: (+ d 1) from: T}) 'w)) -- 'LIST
+
+;; ─── per-group fallback ─────────────────────────────────────────────────────
+(set G (table [k str d] (list [a a b b] (list "a" "" "ccc" "dd") [2001.01.01 2002.01.01 2003.01.01 2004.01.01])))
+(type (at (select {from: G by: k w: (first str) x: (first (+ d 1))}) 'w)) -- 'STR
+(at (select {from: G by: k w: (first str) x: (first (+ d 1))}) 'w) -- (list "a" "ccc")

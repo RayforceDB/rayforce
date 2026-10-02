@@ -2391,6 +2391,29 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
 
 static ray_t* query_materialize_parted_col(ray_t* col);
 static bool table_has_parted_columns(ray_t* tbl);
+static ray_t* query_materialize_parted_table(ray_t* tbl);
+
+/* A projection that is a bare, unquoted column name of `tbl` IS that column.
+ * The eval fallback otherwise evaluates it per row and collects the cells;
+ * before the collector collapsed SYM atoms, `name: name` beside a projection
+ * the DAG declines (temporal arithmetic, say) came back as a LIST of boxed
+ * sym atoms, and a join on it matched nothing (rayforce-py#24).  Taking the
+ * column directly is what the DAG path does for the same expression, keeps
+ * every column kind (a LIST column included) as it is, and skips the per-row
+ * walk.  Owned ref, or NULL when the expression is not such a name or
+ * the column is not a plain full-length vector (parted / mapcommon / slice
+ * columns keep the per-row read, which handles them cell by cell). */
+static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t nrows) {
+    if (!expr || expr->type != -RAY_SYM || (expr->attrs & ATTR_QUOTED)) return NULL;
+    if (ray_env_has_lexical_local(expr->i64)) return NULL;   /* a formal shadows the column, as on the DAG */
+    ray_t* col = ray_table_get_col(tbl, expr->i64);
+    if (!col || col->type < 0) return NULL;
+    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+        (col->attrs & RAY_ATTR_SLICE) || ray_len(col) != nrows)
+        return NULL;
+    ray_retain(col);
+    return col;
+}
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * length-changing / reordering builtin (distinct, asc, desc, reverse) that
@@ -4838,8 +4861,28 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
 
         if (gi == 0) {
             int8_t t = cell->type;
-            int collapsable = (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID);
-            if (collapsable) {
+            int collapsable = (t < 0);
+            if (collapsable && t == -RAY_STR) {
+                /* STR has no typed-store arm: collect through the string
+                 * pool, appending one cell per row (len == rows so far). */
+                result = ray_vec_new(RAY_STR, n_groups);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt;
+                    ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                const char* sp = ray_str_ptr(cell);
+                result = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt;
+                    ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                direct_typed = 1; typed_t = t;
+                ray_release(cell);
+            } else if (collapsable) {
                 int8_t vt = (int8_t)(-t);
                 result = ray_vec_new(vt, n_groups);
                 if (!result || RAY_IS_ERR(result)) {
@@ -4875,7 +4918,23 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
         }
 
         if (direct_typed) {
-            if (cell->type == typed_t && store_typed_elem(result, gi, cell) == 0) {
+            int stored = 0;
+            if (cell->type == typed_t) {
+                if (typed_t == -RAY_STR) {
+                    const char* sp = ray_str_ptr(cell);
+                    ray_t* nv = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                    if (!nv || RAY_IS_ERR(nv)) {
+                        g_active_query_table = _aqt;
+                        ray_env_pop_scope(); ray_release(cell);
+                        scratch_free(refs_hdr);
+                        return nv ? nv : ray_error("oom", NULL);
+                    }
+                    result = nv; stored = 1;
+                } else {
+                    stored = (store_typed_elem(result, gi, cell) == 0);
+                }
+            }
+            if (stored) {
                 ray_release(cell);
             } else {
                 /* Demote: convert typed vec [0..gi-1] to list, append cell, continue as list. */
@@ -5040,8 +5099,30 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
         if (row == 0) {
             int8_t t = cell->type;
-            int collapsable = (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID);
-            if (collapsable) {
+            int collapsable = (t < 0);
+            if (collapsable && t == -RAY_STR) {
+                /* STR has no typed-store arm: collect through the string
+                 * pool, appending one cell per row (len == rows so far). */
+                result = ray_vec_new(RAY_STR, nrows);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                    ray_env_pop_scope();
+                    ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                const char* sp = ray_str_ptr(cell);
+                result = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                    ray_env_pop_scope();
+                    ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                direct_typed = 1; typed_t = t;
+                ray_release(cell);
+            } else if (collapsable) {
                 result = ray_vec_new((int8_t)-t, nrows);
                 if (!result || RAY_IS_ERR(result)) {
                     g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
@@ -5078,7 +5159,24 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
         }
 
         if (direct_typed) {
-            if (cell->type == typed_t && store_typed_elem(result, row, cell) == 0) {
+            int stored = 0;
+            if (cell->type == typed_t) {
+                if (typed_t == -RAY_STR) {
+                    const char* sp = ray_str_ptr(cell);
+                    ray_t* nv = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                    if (!nv || RAY_IS_ERR(nv)) {
+                        g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                        ray_env_pop_scope();
+                        ray_release(cell);
+                        scratch_free(refs_hdr);
+                        return nv ? nv : ray_error("oom", NULL);
+                    }
+                    result = nv; stored = 1;
+                } else {
+                    stored = (store_typed_elem(result, row, cell) == 0);
+                }
+            }
+            if (stored) {
                 ray_release(cell);
             } else {
                 ray_t* list_col = typed_vec_to_list(result, row, nrows);
@@ -12797,6 +12895,31 @@ by_dict_done:
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                     }
                 }
+                /* The per-row reader has no arm for segmented columns, so a
+                 * projection over a .db.parted.get table raised `type` here.
+                 * Flatten a parted / mapcommon table once, as update does, so
+                 * every projection below sees plain vectors. */
+                if (table_has_parted_columns(tbl)) {
+                    ray_t* flat = query_materialize_parted_table(tbl);
+                    if (!flat || RAY_IS_ERR(flat)) {
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                        ray_graph_free(g); ray_release(tbl);
+                        scratch_free(colops_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
+                    }
+                    ray_release(tbl);
+                    tbl = flat;
+                    ray_graph_free(g);
+                    g = ray_graph_new(tbl);
+                    if (!g) {
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                        ray_release(tbl);
+                        scratch_free(colops_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                    }
+                }
                 ray_t* result = ray_table_new(0);
                 if (!result || RAY_IS_ERR(result)) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
@@ -12815,9 +12938,11 @@ by_dict_done:
                     /* Whole-column verbs (distinct/asc/desc/reverse) consume the
                      * entire column and must be evaluated once, not scattered
                      * per-row; everything else keeps the row-by-row semantics. */
-                    ray_t* col = is_whole_column_projection(dict_elems[i + 1])
-                        ? eval_expr_whole_column(dict_elems[i + 1], tbl)
-                        : eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
+                    ray_t* col = select_fallback_passthrough_col(dict_elems[i + 1], tbl, nrows);
+                    if (!col)
+                        col = is_whole_column_projection(dict_elems[i + 1])
+                            ? eval_expr_whole_column(dict_elems[i + 1], tbl)
+                            : eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
@@ -14802,6 +14927,38 @@ static void update_atom_cell(const ray_t* a, int8_t ct, size_t esz, uint8_t elem
 /* One cell of an update-by result.  A STR cell goes through the string
  * pool: store_typed_elem has no STR arm and left the cell empty, so a
  * string per group came out as "".  Returns the column, or an error. */
+/* Rank of a numeric column type for update by:'s promotion of a group
+ * result of another type; 0 for a non-numeric type. */
+static int update_by_num_rank(int8_t t) {
+    switch (t) {
+        case RAY_BOOL: return 1;
+        case RAY_U8:   return 2;
+        case RAY_I16:  return 3;
+        case RAY_I32:  return 4;
+        case RAY_I64:  return 5;
+        case RAY_F32:  return 6;
+        case RAY_F64:  return 7;
+        default:       return 0;
+    }
+}
+
+/* A copy of the numeric column `col` as type `to` (every row converted
+ * through store_typed_elem, nulls carried).  Owned. */
+static ray_t* update_by_promote(ray_t* col, int8_t to) {
+    int64_t n = ray_len(col);
+    ray_t* nc = ray_vec_new(to, n);
+    if (!nc || RAY_IS_ERR(nc)) return nc ? nc : ray_error("oom", NULL);
+    nc->len = n;
+    for (int64_t r = 0; r < n; r++) {
+        int alloc = 0;
+        ray_t* cell = collection_elem(col, r, &alloc);
+        if (!cell || RAY_IS_ERR(cell)) { ray_release(nc); return cell ? cell : ray_error("oom", NULL); }
+        store_typed_elem(nc, r, cell);
+        if (alloc) ray_release(cell);
+    }
+    return nc;
+}
+
 static ray_t* update_by_store(ray_t* col, int64_t row, ray_t* cell) {
     if (col->type == RAY_STR) {
         const char* sp = "";
@@ -14816,6 +14973,43 @@ static ray_t* update_by_store(ray_t* col, int64_t row, ray_t* cell) {
     return col;
 }
 
+/* True iff `expr` reads a column of `tbl` anywhere in its subtree — unlike
+ * expr_refs_row_column it looks inside aggregates too. */
+static int expr_refs_any_column(ray_t* expr, ray_t* tbl) {
+    if (!expr) return 0;
+    if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
+        if (ray_env_has_lexical_local(expr->i64)) return 0;
+        if (ray_table_get_col(tbl, expr->i64)) return 1;
+        if (ray_sym_is_dotted(expr->i64)) {
+            const int64_t* segs;
+            int nsegs = ray_sym_segs(expr->i64, &segs);
+            if (nsegs >= 1 && ray_table_get_col(tbl, segs[0])) return 1;
+        }
+        return 0;
+    }
+    if (expr->type == RAY_LIST) {
+        ray_t** elems = (ray_t**)ray_data(expr);
+        int64_t n = ray_len(expr);
+        for (int64_t i = 1; i < n; i++)
+            if (expr_refs_any_column(elems[i], tbl)) return 1;
+    }
+    return 0;
+}
+
+/* True iff `expr` contains an aggregate over a column of `tbl`: the one
+ * shape a per-row pass cannot evaluate, since the aggregate would see one
+ * cell.  An aggregate over a global or a literal is the same value on
+ * every row and is fine per row. */
+static int expr_contains_agg_over_column(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    if (is_agg_expr(expr)) return expr_refs_any_column(expr, tbl);
+    ray_t** elems = (ray_t**)ray_data(expr);
+    int64_t n = ray_len(expr);
+    for (int64_t i = 0; i < n; i++)
+        if (expr_contains_agg_over_column(elems[i], tbl)) return 1;
+    return 0;
+}
+
 /* Whether a DAG error must stand rather than hand the expression to the
  * interpreter: only when an `if` refused its operands (g->if_refused).  The
  * interpreter's `if` tests one truth value, so retrying there wrote the
@@ -14825,8 +15019,19 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
     return if_refused && out && RAY_IS_ERR(out);
 }
 
+/* Evaluate an update expression over `sub`: the DAG first, then the
+ * interpreter.  The interpreter pass binds whole columns and evaluates once
+ * — its vector builtins are elementwise, and aggregates and whole-column
+ * verbs need the whole column — except for an `if` that reads a column in
+ * row position (expr_refs_row_column): the interpreter's `if` tests ONE
+ * truth value, so a whole-column pass wrote the then-branch to every row;
+ * that goes per row — unless it also aggregates, which per row would see
+ * one cell: that is an error (#692).  When both paths fail, the planner's error (a misspelt
+ * column: `schema: column 'x' not found`) wins over the interpreter's less
+ * specific one.  Owned; a one-element vector is its atom. */
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
     ray_t* out = NULL;
+    ray_t* cerr = NULL;
     bool if_refused = false;
     ray_graph_t* g = ray_graph_new(sub);
     if (g) {
@@ -14834,20 +15039,52 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
         if (op) {
             op = ray_optimize(g, op);
             out = ray_execute(g, op);
+        } else {
+            cerr = graph_take_compile_err(g);
         }
         if_refused = g->if_refused;
         ray_graph_free(g);
     }
-    if (update_dag_err_final(out, if_refused)) return out;
-    if (!out || RAY_IS_ERR(out)) {
-        if (out) ray_error_free(out);
-        int64_t ncols = ray_table_ncols(sub);
-        ray_env_push_query_scope();
-        for (int64_t c = 0; c < ncols; c++)
-            ray_env_set_query_local(ray_table_col_name(sub, c), ray_table_get_col_idx(sub, c));
-        out = ray_eval(expr);
-        ray_env_pop_scope();
+    if (update_dag_err_final(out, if_refused)) {
+        if (cerr) ray_error_free(cerr);
+        return out;
     }
+    if (!out || RAY_IS_ERR(out)) {
+        /* Keep the planner's error — from compile, or from executing what
+         * it compiled (a scan of a misspelt column: `schema: column 'x'
+         * not found`) — to report if the interpreter fails as well. */
+        if (out) { if (cerr) ray_error_free(cerr); cerr = out; out = NULL; }
+        int64_t nrows = ray_table_nrows(sub);
+        /* The interpreter's vector builtins are elementwise over whole
+         * columns, and whole-column verbs (.idx.hash, distinct, ...) and
+         * aggregates need the whole column; only `if` is not — it tests one
+         * truth value — so an `if` over a column goes per row. */
+        int per_row = expr_contains_call_named(expr, "if", 2) && expr_refs_row_column(expr, sub);
+        if (per_row && expr_contains_agg_over_column(expr, sub)) {
+            /* Per row, an aggregate over a column sees one cell:
+             * `(if (> i (avg i)) ..)` would compare each row with itself.
+             * Keep this an error until the fallback can reduce aggregates
+             * first (#692).  (An aggregate over a global or a literal is the
+             * same value on every row and goes through.) */
+            if (cerr) ray_error_free(cerr);
+            return ray_error("nyi", "update: an if over a column that also aggregates is not supported without the planner");
+        }
+        if (!per_row) {
+            int64_t ncols = ray_table_ncols(sub);
+            ray_env_push_query_scope();
+            for (int64_t c = 0; c < ncols; c++)
+                ray_env_set_query_local(ray_table_col_name(sub, c), ray_table_get_col_idx(sub, c));
+            out = ray_eval(expr);
+            ray_env_pop_scope();
+        } else {
+            out = eval_expr_per_row(expr, sub, nrows);
+        }
+        if ((!out || RAY_IS_ERR(out)) && cerr) {
+            if (out) ray_error_free(out);
+            return cerr;
+        }
+    }
+    if (cerr) ray_error_free(cerr);   /* error objects bypass the refcount */
     if (!out) return ray_error("type", "update: failed to evaluate column update expression");
     if (RAY_IS_ERR(out)) return out;
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
@@ -15330,13 +15567,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
                 }
 
-                /* Evaluate expression on sub-table via DAG */
-                ray_graph_t* ug = ray_graph_new(sub_tbl);
-                ray_op_t* expr_op = compile_expr_dag(ug, agg_expr);
-                if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_graph_free(ug); ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return cerr ? cerr : ray_error("domain", "update by: failed to compile aggregate expression"); }
-                expr_op = ray_optimize(ug, expr_op);
-                ray_t* agg_result = ray_execute(ug, expr_op);
-                ray_graph_free(ug);
+                /* Evaluate expression on the sub-table: DAG first, then the
+                 * eval-level fallback with the group's columns bound (an
+                 * aggregate the DAG declines, e.g. over temporal + - *,
+                 * used to fail here with "failed to compile"). */
+                ray_t* agg_result = update_eval_on(sub_tbl, agg_expr);
                 ray_release(sub_tbl);
 
                 if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
@@ -15364,6 +15599,28 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                  * shape — a vector whose length is neither 1 nor the group
                  * size — has no row-aligned meaning, so decline loudly rather
                  * than leave the memset zeros in place (silent data loss). */
+                /* A group result of another type than the column was cast
+                 * into it silently (2.5 stored as 2, a TIMESTAMP as a TIME).
+                 * Promote the column to the wider numeric type; reject any
+                 * other mismatch loudly. */
+                {
+                    int8_t rt = ray_is_atom(agg_result) ? (int8_t)-agg_result->type : agg_result->type;
+                    if (rt != out_type && rt > 0) {
+                        int rr = update_by_num_rank(rt), orr = update_by_num_rank(out_type);
+                        if (!rr || !orr) {
+                            ray_release(agg_result); ray_release(out_col);
+                            UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                            return ray_error("type", "update by: group result type %s does not match %s", ray_type_name(rt), ray_type_name(out_type));
+                        }
+                        if (rr > orr) {
+                            ray_t* promoted = update_by_promote(out_col, rt);
+                            if (RAY_IS_ERR(promoted)) { ray_release(agg_result); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return promoted; }
+                            ray_release(out_col);
+                            out_col = promoted;
+                            out_type = rt;
+                        }
+                    }
+                }
                 int64_t* idxs = (int64_t*)ray_data(idx_vec);
                 ray_t* store_err = NULL;
                 if (ray_is_atom(agg_result)) {
@@ -15529,36 +15786,14 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_t* new_col = ray_vec_new(ct, nrows);
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
-                /* Evaluate expression via DAG, fallback to eval-level */
-                ray_t* expr_vec = NULL;
-                bool if_refused = false;
-                {
-                    ray_graph_t* ug = ray_graph_new(tbl);
-                    if (ug) {
-                        ray_op_t* expr_op = compile_expr_dag(ug, update_expr);
-                        if (expr_op) {
-                            expr_op = ray_optimize(ug, expr_op);
-                            expr_vec = ray_execute(ug, expr_op);
-                        }
-                        if_refused = ug->if_refused;
-                        ray_graph_free(ug);
-                    }
-                }
-                if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, if_refused))) {
-                    /* Fallback: eval with column bindings */
-                    if (expr_vec) ray_error_free(expr_vec);
-                    int64_t ncols_e = ray_table_ncols(tbl);
-                    ray_env_push_query_scope();
-                    for (int64_t c2 = 0; c2 < ncols_e; c2++) {
-                        int64_t cn = ray_table_col_name(tbl, c2);
-                        ray_t* col2 = ray_table_get_col_idx(tbl, c2);
-                        ray_env_set_query_local(cn, col2);
-                    }
-                    expr_vec = ray_eval(update_expr);
-                    ray_env_pop_scope();
-                }
+                /* DAG first, then the interpreter (update_eval_on). */
+                ray_t* expr_vec = update_eval_on(tbl, update_expr);
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
-                expr_vec = update_scalar_vec(expr_vec, nrows);
+                if (expr_vec->type >= 0 && ray_len(expr_vec) != nrows) {
+                    int64_t got = ray_len(expr_vec);
+                    ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl);
+                    DICT_VIEW_CLOSE(updw); return ray_error("length", "update: column has %lld values for %lld rows", (long long)got, (long long)nrows);
+                }
 
                 /* WHERE update: expression result replaces ONLY masked rows.
                  * When type differs (e.g., I64 col, F64 expr from (* col 1.1)),
@@ -15881,35 +16116,16 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             result = ray_table_add_col(result, col_name, orig_col);
             ray_release(orig_col);
         } else {
-            ray_t* expr_vec = NULL;
-            bool if_refused = false;
-            {
-                ray_graph_t* ug = ray_graph_new(tbl);
-                if (ug) {
-                    ray_op_t* expr_op = compile_expr_dag(ug, update_expr);
-                    if (expr_op) {
-                        expr_op = ray_optimize(ug, expr_op);
-                        expr_vec = ray_execute(ug, expr_op);
-                    }
-                    if_refused = ug->if_refused;
-                    ray_graph_free(ug);
-                }
-            }
-            if (!expr_vec || (RAY_IS_ERR(expr_vec) && !update_dag_err_final(expr_vec, if_refused))) {
-                /* Fallback: eval with column bindings */
-                if (expr_vec) ray_error_free(expr_vec);
-                int64_t ncols_f = ray_table_ncols(tbl);
-                ray_env_push_query_scope();
-                for (int64_t cf = 0; cf < ncols_f; cf++) {
-                    int64_t cn = ray_table_col_name(tbl, cf);
-                    ray_t* colf = ray_table_get_col_idx(tbl, cf);
-                    ray_env_set_query_local(cn, colf);
-                }
-                expr_vec = ray_eval(update_expr);
-                ray_env_pop_scope();
-            }
+            /* DAG first, then the interpreter (update_eval_on). */
+            ray_t* expr_vec = update_eval_on(tbl, update_expr);
             if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
-            expr_vec = update_scalar_vec(expr_vec, ray_table_nrows(tbl));
+            if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
+                /* A column of another length has no row-aligned meaning; it
+                 * used to be added as-is and left the table ragged. */
+                int64_t got = ray_len(expr_vec);
+                ray_release(expr_vec); ray_release(result); ray_release(tbl);
+                DICT_VIEW_CLOSE(upda); return ray_error("length", "update: column has %lld values for %lld rows", (long long)got, (long long)ray_table_nrows(tbl));
+            }
 
             /* Broadcast scalar atom to full column vector if needed */
             if (expr_vec->type < 0) {
@@ -16056,16 +16272,23 @@ no_where_add_col:
         }
         if (exists) continue;
 
-        /* New column: evaluate expression and add */
+        /* New column: evaluate expression and add.  DAG first, then the
+         * eval-level fallback with column bindings — the same sequence an
+         * update of an EXISTING column takes (update_eval_on).  This site
+         * used to fail outright when the DAG declined the expression
+         * (temporal + - *), so `x: (+ ts 1)` worked as a select and as an
+         * existing-column update but not as a new column. */
         ray_t* update_expr = dict_elems[d + 1];
-        ray_graph_t* ug = ray_graph_new(tbl);
-        ray_op_t* expr_op = compile_expr_dag(ug, update_expr);
-        if (!expr_op) { ray_t* cerr = graph_take_compile_err(ug); ray_release(result); ray_release(tbl); ray_graph_free(ug); DICT_VIEW_CLOSE(upda); return cerr ? cerr : ray_error("domain", "update: failed to compile new column expression"); }
-        expr_op = ray_optimize(ug, expr_op);
-        ray_t* expr_vec = ray_execute(ug, expr_op);
-        ray_graph_free(ug);
-        if (RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec; }
-        expr_vec = update_scalar_vec(expr_vec, ray_table_nrows(tbl));
+        ray_t* expr_vec = update_eval_on(tbl, update_expr);
+        if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate new column expression"); }
+        if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
+            /* A column of another length has no row-aligned meaning; it
+             * used to be added as-is and left the table ragged (the where:
+             * arm checks the same). */
+            int64_t got = ray_len(expr_vec);
+            ray_release(expr_vec); ray_release(result); ray_release(tbl);
+            DICT_VIEW_CLOSE(upda); return ray_error("length", "update: new column has %lld values for %lld rows", (long long)got, (long long)ray_table_nrows(tbl));
+        }
 
         /* Broadcast scalar to column */
         if (expr_vec->type < 0) {
@@ -16156,6 +16379,25 @@ static bool table_has_parted_columns(ray_t* tbl) {
             return true;
     }
     return false;
+}
+
+/* A fresh table with every parted / mapcommon column of `tbl` flattened
+ * (query_materialize_parted_col); plain columns are shared.  Owned. */
+static ray_t* query_materialize_parted_table(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* flat_tbl = ray_table_new(nc);
+    if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* flat_col = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        if (!flat_col || RAY_IS_ERR(flat_col)) {
+            ray_release(flat_tbl);
+            return flat_col ? flat_col : ray_error("oom", NULL);
+        }
+        flat_tbl = ray_table_add_col(flat_tbl, ray_table_col_name(tbl, c), flat_col);
+        ray_release(flat_col);
+        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
+    }
+    return flat_tbl;
 }
 
 typedef struct {
