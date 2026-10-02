@@ -2490,6 +2490,87 @@ static test_result_t test_journal_purge_refused_while_locked(void) {
 #endif
 }
 
+#if !defined(_WIN32)
+/* A base inside a fresh directory, so a test can remove the directory. */
+static void make_dir_base(char* dir, size_t dsz, char* base, size_t bsz, const char* prefix) {
+    snprintf(dir, dsz, "/tmp/jrn_test_%s_XXXXXX", prefix);
+    if (!mkdtemp(dir)) dir[0] = '\0';
+    snprintf(base, bsz, "%s/base", dir);
+}
+
+static void remove_dir_base(const char* dir, const char* base) {
+    cleanup_base(base);
+    rmdir(dir);
+}
+#endif
+
+/* A roll that cannot reopen its log keeps the lock of its base; opening
+ * another base then takes that base's lock instead of reusing the old one. */
+static test_result_t test_journal_lock_follows_base(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char dir[256], base1[300];
+    make_dir_base(dir, sizeof(dir), base1, sizeof(base1), "lock_base");
+    TEST_ASSERT_TRUE(dir[0] != '\0');
+    TEST_ASSERT_EQ_I(ray_journal_open(base1, RAY_JOURNAL_ASYNC), RAY_OK);
+    remove_dir_base(dir, base1);
+    TEST_ASSERT_TRUE(ray_journal_roll() != RAY_OK);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    char base2[256]; make_base(base2, sizeof(base2), "lock_base2");
+    TEST_ASSERT_EQ_I(ray_journal_open(base2, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base2), 0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base2), 1);
+    cleanup_base(base2);
+    PASS();
+#endif
+}
+
+/* The lock fd is close-on-exec: a program started with .sys.exec must not
+ * keep the journal locked after this process exits. */
+static test_result_t test_journal_lock_not_inherited(void) {
+#if !defined(__linux__)
+    SKIP("reads /proc/self/fd");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_exec");
+    char lk[300]; snprintf(lk, sizeof(lk), "%s.lk", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    int found = 0, cloexec = 0;
+    for (int fd = 3; fd < 1024; fd++) {
+        char link[64], target[400];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = '\0';
+        if (strcmp(target, lk) != 0) continue;
+        found = 1;
+        cloexec = (fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0;
+    }
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    TEST_ASSERT_EQ_I(found, 1);
+    TEST_ASSERT_EQ_I(cloexec, 1);
+    PASS();
+#endif
+}
+
+/* Purge stays best-effort when the journal's directory is gone. */
+static test_result_t test_journal_purge_without_dir(void) {
+#if defined(_WIN32)
+    SKIP("POSIX directory fixture");
+#else
+    char dir[256], base[300];
+    make_dir_base(dir, sizeof(dir), base, sizeof(base), "purge_nodir");
+    TEST_ASSERT_TRUE(dir[0] != '\0');
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    remove_dir_base(dir, base);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    PASS();
+#endif
+}
+
 /* P3. ops wrapper: (.log.purge) returns null on success and a `domain`
  * error when no journal base is known. */
 static test_result_t test_journal_purge_ops_wrapper(void) {
@@ -2623,6 +2704,9 @@ const test_entry_t journal_entries[] = {
     { "journal/lock_held_while_open",      test_journal_lock_held_while_open,      jrn_setup, jrn_teardown },
     { "journal/lock_refuses_second_opener", test_journal_lock_refuses_second_opener, jrn_setup, jrn_teardown },
     { "journal/purge_refused_while_locked", test_journal_purge_refused_while_locked, jrn_setup, jrn_teardown },
+    { "journal/lock_follows_base",          test_journal_lock_follows_base,          jrn_setup, jrn_teardown },
+    { "journal/lock_not_inherited",         test_journal_lock_not_inherited,         jrn_setup, jrn_teardown },
+    { "journal/purge_without_dir",          test_journal_purge_without_dir,          jrn_setup, jrn_teardown },
     /* #420: snapshot/roll crash window must not double-apply */
     { "journal/crash_window_no_double_apply", test_journal_crash_window_no_double_apply, jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },

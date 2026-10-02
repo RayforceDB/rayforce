@@ -44,6 +44,7 @@
 #ifndef RAY_OS_WINDOWS
 #  include <unistd.h>
 #  include <sys/stat.h>
+#  include <fcntl.h>
 #endif
 
 #define RAY_JOURNAL_PATH_MAX 1024
@@ -59,6 +60,7 @@ static struct {
     bool               in_replay;
     int64_t            log_gen;    /* live log's generation id, 0 = legacy/unknown */
     ray_fd_t           lock_fd;    /* <base>.lk, held while the journal is open */
+    char               lock_path[RAY_JOURNAL_PATH_MAX];   /* the held <base>.lk */
 } g_journal = {
     .mode      = RAY_JOURNAL_OFF,
     .fp        = NULL,
@@ -75,18 +77,42 @@ static struct {
  * the journal open, and a second opener fails instead of interleaving.
  * .log.purge removes the lock file while holding it; a lock taken on a file
  * that was removed meanwhile is dropped and taken again on the new one, so
- * two openers can never hold locks on different files. */
-static ray_err_t journal_lock(const char* base) {
-    if (g_journal.lock_fd != RAY_FD_INVALID) return RAY_OK;
+ * two openers can never hold locks on different files.  A lock still held
+ * for another base (a roll that failed to reopen its log) is dropped first.
+ * *busy, when given, tells whether another process holds the lock. */
+static void journal_unlock(void);
+static ray_err_t journal_lock(const char* base, bool* busy) {
+    if (busy) *busy = false;
     char path[RAY_JOURNAL_PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s.lk", base);
     if (n <= 0 || (size_t)n >= sizeof(path)) return RAY_ERR_DOMAIN;
+    if (g_journal.lock_fd != RAY_FD_INVALID) {
+        if (strcmp(g_journal.lock_path, path) == 0) return RAY_OK;
+        journal_unlock();
+    }
     for (int attempt = 0; attempt < 8; attempt++) {
         ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
         if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+#ifndef RAY_OS_WINDOWS
+        /* A program started with .sys.exec must not keep the lock alive
+         * after this process exits. */
+        (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
         if (ray_file_trylock_ex(fd) != RAY_OK) {
+#ifdef RAY_OS_WINDOWS
+            bool held = true;
+#else
+            int e = errno;
+            bool held = e == EWOULDBLOCK || e == EAGAIN;
+#endif
             ray_file_close(fd);
-            fprintf(stderr, "log: ERROR  journal %s is open in another process\n", base);
+            if (busy) *busy = held;
+            if (held)
+                fprintf(stderr, "log: ERROR  journal %s is open in another process\n", base);
+#ifndef RAY_OS_WINDOWS
+            else
+                fprintf(stderr, "log: ERROR  cannot lock %s: %s\n", path, strerror(e));
+#endif
             return RAY_ERR_IO;
         }
 #ifndef RAY_OS_WINDOWS
@@ -98,6 +124,7 @@ static ray_err_t journal_lock(const char* base) {
         }
 #endif
         g_journal.lock_fd = fd;
+        memcpy(g_journal.lock_path, path, (size_t)n + 1);
         return RAY_OK;
     }
     return RAY_ERR_IO;
@@ -684,7 +711,7 @@ ray_err_t ray_journal_open_append(const char* base, ray_journal_mode_t mode) {
     size_t blen = strlen(base);
     if (blen + 5 >= sizeof(g_journal.base)) return RAY_ERR_DOMAIN;
 
-    ray_err_t le = journal_lock(base);
+    ray_err_t le = journal_lock(base, NULL);
     if (le != RAY_OK) return le;
     memcpy(g_journal.base, base, blen + 1);
     g_journal.mode = mode;
@@ -704,7 +731,7 @@ ray_err_t ray_journal_open(const char* base, ray_journal_mode_t mode) {
 
     /* Lock before replaying, so a second process fails before it applies
      * a log another process is still writing. */
-    ray_err_t le = journal_lock(base);
+    ray_err_t le = journal_lock(base, NULL);
     if (le != RAY_OK) return le;
     ray_err_t re = ray_journal_recover(base);
     if (re != RAY_OK) { journal_unlock(); return re; }
@@ -748,9 +775,11 @@ ray_err_t ray_journal_purge(void) {
     if (!g_journal.base[0]) return RAY_ERR_DOMAIN;
 
     /* Hold the journal's lock while its files are removed: another process
-     * that has it open is still writing them. */
-    ray_err_t lock_result = journal_lock(g_journal.base);
-    if (lock_result != RAY_OK) return lock_result;
+     * that has it open is still writing them.  A lock that cannot be taken
+     * for another reason (the directory is gone) leaves purge best-effort. */
+    bool busy = false;
+    ray_err_t lock_result = journal_lock(g_journal.base, &busy);
+    if (lock_result != RAY_OK && busy) return lock_result;
 
     /* Close the active log FIRST: never unlink a path out from under
      * buffered writes (and Windows refuses to unlink an open file). */
@@ -814,7 +843,8 @@ ray_err_t ray_journal_purge(void) {
     /* 3. The lock file last, while it is still held (see journal_lock).
      *    Windows cannot remove a file that is open, so it stays there. */
 #ifndef RAY_OS_WINDOWS
-    if (path_join_ext(path, sizeof(path), g_journal.base, ".lk"))
+    if (g_journal.lock_fd != RAY_FD_INVALID &&
+        path_join_ext(path, sizeof(path), g_journal.base, ".lk"))
         purge_one(path, &result);
 #endif
 
