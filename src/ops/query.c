@@ -4859,8 +4859,28 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
 
         if (gi == 0) {
             int8_t t = cell->type;
-            int collapsable = (t < 0 && t != -RAY_STR && t != -RAY_GUID);
-            if (collapsable) {
+            int collapsable = (t < 0);
+            if (collapsable && t == -RAY_STR) {
+                /* STR has no typed-store arm: collect through the string
+                 * pool, appending one cell per row (len == rows so far). */
+                result = ray_vec_new(RAY_STR, n_groups);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt;
+                    ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                const char* sp = ray_str_ptr(cell);
+                result = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt;
+                    ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                direct_typed = 1; typed_t = t;
+                ray_release(cell);
+            } else if (collapsable) {
                 int8_t vt = (int8_t)(-t);
                 result = ray_vec_new(vt, n_groups);
                 if (!result || RAY_IS_ERR(result)) {
@@ -4896,7 +4916,23 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
         }
 
         if (direct_typed) {
-            if (cell->type == typed_t && store_typed_elem(result, gi, cell) == 0) {
+            int stored = 0;
+            if (cell->type == typed_t) {
+                if (typed_t == -RAY_STR) {
+                    const char* sp = ray_str_ptr(cell);
+                    ray_t* nv = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                    if (!nv || RAY_IS_ERR(nv)) {
+                        g_active_query_table = _aqt;
+                        ray_env_pop_scope(); ray_release(cell);
+                        scratch_free(refs_hdr);
+                        return nv ? nv : ray_error("oom", NULL);
+                    }
+                    result = nv; stored = 1;
+                } else {
+                    stored = (store_typed_elem(result, gi, cell) == 0);
+                }
+            }
+            if (stored) {
                 ray_release(cell);
             } else {
                 /* Demote: convert typed vec [0..gi-1] to list, append cell, continue as list. */
@@ -5061,8 +5097,30 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
         if (row == 0) {
             int8_t t = cell->type;
-            int collapsable = (t < 0 && t != -RAY_STR && t != -RAY_GUID);
-            if (collapsable) {
+            int collapsable = (t < 0);
+            if (collapsable && t == -RAY_STR) {
+                /* STR has no typed-store arm: collect through the string
+                 * pool, appending one cell per row (len == rows so far). */
+                result = ray_vec_new(RAY_STR, nrows);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                    ray_env_pop_scope();
+                    ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                const char* sp = ray_str_ptr(cell);
+                result = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                if (!result || RAY_IS_ERR(result)) {
+                    g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                    ray_env_pop_scope();
+                    ray_release(cell);
+                    scratch_free(refs_hdr);
+                    return result ? result : ray_error("oom", NULL);
+                }
+                direct_typed = 1; typed_t = t;
+                ray_release(cell);
+            } else if (collapsable) {
                 result = ray_vec_new((int8_t)-t, nrows);
                 if (!result || RAY_IS_ERR(result)) {
                     g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
@@ -5099,7 +5157,24 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
         }
 
         if (direct_typed) {
-            if (cell->type == typed_t && store_typed_elem(result, row, cell) == 0) {
+            int stored = 0;
+            if (cell->type == typed_t) {
+                if (typed_t == -RAY_STR) {
+                    const char* sp = ray_str_ptr(cell);
+                    ray_t* nv = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                    if (!nv || RAY_IS_ERR(nv)) {
+                        g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                        ray_env_pop_scope();
+                        ray_release(cell);
+                        scratch_free(refs_hdr);
+                        return nv ? nv : ray_error("oom", NULL);
+                    }
+                    result = nv; stored = 1;
+                } else {
+                    stored = (store_typed_elem(result, row, cell) == 0);
+                }
+            }
+            if (stored) {
                 ray_release(cell);
             } else {
                 ray_t* list_col = typed_vec_to_list(result, row, nrows);
