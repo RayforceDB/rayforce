@@ -35,6 +35,7 @@ struct ray_sym_domain_s;
  * staged directories are removed best-effort after each successful publish. */
 typedef struct {
     ray_fd_t lock;
+    bool locked;
     bool staged;
     char root[1024];
     char created[1024];     /* shallowest directory of root begin created */

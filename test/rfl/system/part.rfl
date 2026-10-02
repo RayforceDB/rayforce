@@ -519,6 +519,11 @@
 (.sys.exec "test -e /tmp/rfl_part_fail/db/1/u") -- 1
 (.sys.exec "test -d /tmp/rfl_part_fail/db/1/t") -- 0
 (count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; a path that climbs out of the new directory with .. names one that was
+;; there: nothing of it is removed
+(.db.splayed.set "/tmp/rfl_part_fail/new/../db/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+(.sys.exec "test -e /tmp/rfl_part_fail/db/.sym") -- 0
 ;; a failed rewrite of a published table keeps the table
 (.db.splayed.set "/tmp/rfl_part_fail/db/1/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
 (count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
