@@ -15148,9 +15148,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         }
 
         /* New columns (in the dict, not in the table): the expression's
-         * value on the matched rows and null on the rest.  The loop above
-         * walks the table's columns only, so these used to be dropped
-         * without a word. */
+         * value on the matched rows and null on the rest — false / 0x00 for
+         * BOOL and U8, which have no null.  The loop above walks the table's
+         * columns only, so these used to be dropped without a word. */
         for (int64_t d = 0; d + 1 < dict_n; d += 2) {
             int64_t kid = dict_elems[d]->i64;
             if (kid == from_id || kid == where_id) continue;
