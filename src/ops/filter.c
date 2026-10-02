@@ -281,6 +281,68 @@ static void fidx_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
+static ray_t* where_mask_fill(int64_t tn, uint8_t on) {
+    ray_t* v = ray_vec_new(RAY_BOOL, tn);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = tn;
+    if (tn > 0) memset(ray_data(v), on, (size_t)tn);
+    return v;
+}
+
+/* The one rule for a `where:` value, applied wherever a predicate meets a
+ * table of `tn` rows (OP_FILTER, the take: head filter, the eval fallback,
+ * the count-select and the update/delete mask paths):
+ *
+ *   - a BOOL vector of tn rows is the mask;
+ *   - a scalar with a truth value (bool, numeric, temporal — is_truthy, so
+ *     zero and null are false) holds for every row or none; a one-element
+ *     BOOL over tn != 1 rows likewise;
+ *   - any other vector — a numeric, temporal, symbol or string column — is
+ *     a type error, and a BOOL vector of another length a length error.
+ *     Before this a bare I64 column reached the filter kernels, which read
+ *     a mask as one byte per row (#678).
+ *
+ * Consumes `pred`; returns an owned BOOL vector of tn rows or an error. */
+ray_t* ray_where_mask_coerce(ray_t* pred, int64_t tn, const char* label) {
+    if (!pred || RAY_IS_ERR(pred)) return pred;
+    if (ray_is_atom(pred)) {
+        if (!ray_pred_atom_type_ok(pred->type)) {
+            int8_t pt = pred->type;
+            ray_release(pred);
+            return ray_error("type", "%s: a scalar predicate must be boolean or numeric, got %s",
+                             label, ray_type_name(pt));
+        }
+        uint8_t on = is_truthy(pred) ? 1 : 0;
+        ray_release(pred);
+        return where_mask_fill(tn, on);
+    }
+    if (ray_is_lazy(pred)) {
+        pred = ray_lazy_materialize(pred);
+        if (!pred || RAY_IS_ERR(pred)) return pred ? pred : ray_error("oom", NULL);
+    }
+    if (pred->type == RAY_BOOL) {
+        if (pred->len == tn) return pred;
+        if (pred->len == 1 && tn != 1) {
+            uint8_t on = ((const uint8_t*)ray_data(pred))[0];
+            ray_release(pred);
+            return where_mask_fill(tn, on);
+        }
+        int64_t got = pred->len;
+        ray_release(pred);
+        return ray_error("length", "%s: WHERE mask length %lld does not match row count %lld",
+                         label, (long long)got, (long long)tn);
+    }
+    /* Any other vector — a numeric, temporal, symbol or string column — is
+     * no mask (query_coverage.rfl, where_eval_fallback.rfl pin this); the
+     * filter kernels read a mask as one byte per row, so an I64 column let
+     * through here kept the rows whose low byte of every eighth value was
+     * set (#678). */
+    int8_t pt = pred->type;
+    ray_release(pred);
+    return ray_error("type", "%s: WHERE must produce a bool mask or truthy scalar, got %s",
+                     label, ray_type_name(pt));
+}
+
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     (void)g;
     (void)op;
@@ -293,6 +355,13 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
      * ray_type_sizes out of bounds. */
     if (pred->type < 0)
         return ray_error("length", "filter: predicate must be a BOOL vector matching the input length, got an atom");
+    /* The morsel sweeps below read the mask as one byte per row; any other
+     * vector type must be coerced by ray_where_mask_coerce before it gets
+     * here (an I64 column read this way kept the rows whose low byte of
+     * every eighth value was set, #678). */
+    if (pred->type != RAY_BOOL)
+        return ray_error("type", "filter: predicate must be a BOOL vector, got %s",
+                         ray_type_name(pred->type));
 
     /* A plain contiguous BOOL predicate over a large input takes the
      * parallel chunked count/fill; anything else (lazy / morsel-backed
@@ -581,27 +650,20 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     if (!input || RAY_IS_ERR(input)) return input;
     if (!pred || RAY_IS_ERR(pred)) return pred;
-    /* A predicate with one value (`where: false`, `(== (count x) 10)`) holds
-     * for every row or none, as in the plain filter.  The checks below
-     * passed an atom through as "keep the whole table" and read a
-     * one-element BOOL as a one-row mask.  Spread it over the rows. */
-    if (input->type == RAY_TABLE) {
-        int64_t tn = ray_table_nrows(input);
-        bool atom = ray_is_atom(pred);
-        if (atom && !ray_pred_atom_type_ok(pred->type))
-            return ray_error("type", "where: a scalar predicate must be boolean or numeric, got %s",
-                             ray_type_name(pred->type));
-        if (atom || (pred->type == RAY_BOOL && pred->len == 1 && tn != 1)) {
-            uint8_t on = atom ? (is_truthy(pred) ? 1 : 0)
-                              : ((const uint8_t*)ray_data(pred))[0];
-            ray_t* m = ray_vec_new(RAY_BOOL, tn);
-            if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
-            m->len = tn;
-            if (tn > 0) memset(ray_data(m), on, (size_t)tn);
-            ray_t* r = exec_filter_head(input, m, limit);
-            ray_release(m);
-            return r;
-        }
+    /* Over a table the predicate goes through the one where: rule
+     * (ray_where_mask_coerce): a scalar or one-element BOOL is spread over
+     * the rows, a numeric column becomes its nonzero-and-non-null mask, a
+     * symbol is a type error.  The checks below used to pass an atom and
+     * any non-BOOL vector through as "keep the whole table" — so
+     * `where: x take: 2` over an I64 column returned every row. */
+    if (input->type == RAY_TABLE &&
+        !(pred->type == RAY_BOOL && pred->len == ray_table_nrows(input))) {
+        ray_retain(pred);
+        ray_t* m = ray_where_mask_coerce(pred, ray_table_nrows(input), "where");
+        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+        ray_t* r = exec_filter_head(input, m, limit);
+        ray_release(m);
+        return r;
     }
     /* Pass-through must hand back an OWNED ref: the exec.c caller
      * releases its own input ref and returns this value as the node

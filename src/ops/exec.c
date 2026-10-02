@@ -1595,6 +1595,12 @@ static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op,
     return 1;
 }
 
+/* True when a GROUP node groups by at least one key. */
+static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
+    ray_op_ext_t* gx = find_ext(g, group_op->id);
+    return gx && gx->n_keys > 0;
+}
+
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
  * (GROUP predicate pushdown, opt.c Task-3).
  *
@@ -2381,6 +2387,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(group_result);
                     return pred;
                 }
+                if (group_result->type == RAY_TABLE) {
+                    pred = ray_where_mask_coerce(pred, ray_table_nrows(group_result), "where");
+                    if (!pred || RAY_IS_ERR(pred)) {
+                        ray_release(group_result);
+                        return pred ? pred : ray_error("oom", NULL);
+                    }
+                }
 
                 ray_t* result = exec_filter(g, op, group_result, pred);
                 ray_release(pred);
@@ -2792,34 +2805,26 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* pred = exec_node(g, op_child(g, op, 1));
             if (!pred || RAY_IS_ERR(pred)) { ray_release(input); return pred; }
 
-            /* A predicate that reduces to one value (`(== (count x) 5)`, a
-             * scalar conjunct of an `and`) holds for every row or none.
-             * Read as a column it failed the length checks below, and the
-             * NULL refine meant "all pass": a false scalar kept every row.
-             * Spread it over the table's rows instead. */
+            /* Over a table every predicate value goes through the one
+             * where: rule (ray_where_mask_coerce): a scalar (`(== (count x)
+             * 5)`, a scalar conjunct of an `and`) or a one-element BOOL is
+             * spread over the rows; a numeric column becomes its
+             * nonzero-and-non-null mask; a symbol or string is a type error.
+             * Before this, an I64 column fell through to the eager
+             * exec_filter, which read it as one byte per row (#678). */
             if (input->type == RAY_TABLE &&
-                (ray_is_atom(pred) || (pred->type == RAY_BOOL && pred->len == 1))) {
+                !(pred->type == RAY_BOOL && pred->len == ray_table_nrows(input))) {
                 int64_t tn = ray_table_nrows(input);
-                /* an atom of any type (`where: 0`) by the scalar truth rule;
-                 * a one-element BOOL is already a row mask on a 1-row table */
-                if (ray_is_atom(pred) && !ray_pred_atom_type_ok(pred->type)) {
-                    int8_t pt = pred->type;
-                    ray_release(pred); ray_release(input);
-                    return ray_error("type", "where: a scalar predicate must be boolean or numeric, got %s",
-                                     ray_type_name(pt));
+                bool all_on = ray_is_atom(pred) && ray_pred_atom_type_ok(pred->type) &&
+                              is_truthy(pred);
+                pred = ray_where_mask_coerce(pred, tn, "where");
+                if (!pred || RAY_IS_ERR(pred)) {
+                    ray_release(input);
+                    return pred ? pred : ray_error("oom", NULL);
                 }
-                if (ray_is_atom(pred) || tn != 1) {
-                    uint8_t on = ray_is_atom(pred) ? (is_truthy(pred) ? 1 : 0)
-                                                   : ((const uint8_t*)ray_data(pred))[0];
+                if (all_on) {       /* every row passes: selection unchanged */
                     ray_release(pred);
-                    if (on) return input;   /* every row passes: selection unchanged */
-                    pred = ray_vec_new(RAY_BOOL, tn);
-                    if (!pred || RAY_IS_ERR(pred)) {
-                        ray_release(input);
-                        return pred ? pred : ray_error("oom", NULL);
-                    }
-                    pred->len = tn;
-                    if (tn > 0) memset(ray_data(pred), 0, (size_t)tn);
+                    return input;
                 }
             }
 
@@ -3150,7 +3155,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (res && RAY_IS_ERR(res)) return res;
                     if (res) { owned_tbl = res; tbl = res; }
                     /* NULL → lazy path; g->selection installed, tbl unchanged */
-                } else if (g->selection && tbl->type == RAY_TABLE) {
+                } else if (g->selection && tbl->type == RAY_TABLE &&
+                           group_has_keys(g, child_op)) {
+                    /* A keyless group (an all-aggregate select) is one row
+                     * whatever the limit, and its aggregates read the
+                     * selection themselves: compacting a no-match where:
+                     * handed exec_group an empty table, which has no rows to
+                     * reduce and came back with no row at all (#679). */
                     int needs = 0;
                     int64_t nc = ray_table_ncols(tbl);
                     for (int64_t c = 0; c < nc; c++) {
@@ -3645,6 +3656,15 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
                     /* a parted column counts its rows across segments */
                     if (cv && cv->type > 0 && ray_parted_nrows(cv) == nr_in) { has_full = true; break; }
+                }
+                /* Every column a scalar: the reductions inside them already
+                 * walked the where: selection (exec_reduction), so the
+                 * one-row result is final.  Left installed, the selection
+                 * (built for the input's rows) met the one-row result in
+                 * ray_execute_inner's final gather (#675). */
+                if (!has_full && g->selection) {
+                    ray_release(g->selection);
+                    g->selection = NULL;
                 }
                 for (int64_t c = 0; has_full && c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
