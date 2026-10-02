@@ -7914,6 +7914,30 @@ static ray_t* select_fallback_bind_alias(ray_t* tbl, int64_t kid, ray_t* col) {
     return ray_table_add_col(tbl, kid, col);
 }
 
+/* The one value an aggregate-only projection produced, as a column of n
+ * rows.  An atom is broadcast; a one-element vector (the interpreter's
+ * shape for some scalar results, like exec.c's for `(+ (sum x) 0)`) is
+ * widened the way OP_SELECT widens it.  Any other vector is the
+ * projection's own column and passes through unchanged, so a row-long
+ * global or a lambda call that returns a row-aligned result keeps its
+ * length.  Consumes `v`. */
+static ray_t* select_fallback_broadcast(ray_t* v, int64_t n) {
+    if (!v || RAY_IS_ERR(v)) return v;
+    if (ray_is_atom(v)) {
+        ray_t* out = atom_broadcast_vec(v, n);
+        if (!out) out = ray_error("type", "select: cannot broadcast a %s value to a column",
+                                  ray_type_name(v->type));
+        ray_release(v);
+        return out;
+    }
+    if (v->type <= 0 || !ray_is_vec(v) || v->len != 1 || n == 1) return v;
+    ray_t* n_obj = make_i64(n);
+    ray_t* wide = n_obj ? ray_take_fn(v, n_obj) : ray_error("oom", NULL);
+    if (n_obj) ray_release(n_obj);
+    ray_release(v);
+    return wide;
+}
+
 static bool select_alias_skip_form(ray_t* head) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
     ray_t* s = ray_sym_str(head->i64);
@@ -12929,6 +12953,27 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result ? result : ray_error("oom", NULL);
                 }
                 int64_t nrows = ray_table_nrows(tbl);
+                /* A projection with an aggregate in it and no column ref
+                 * outside the aggregate's argument (expr_contains_agg &&
+                 * !expr_refs_row_column) is one value for the whole select.
+                 * Scattered per row it saw a one-cell slice
+                 * of every column, so `(max i)` beside a projection the DAG
+                 * declines came back as `i` itself (#692).  Such a
+                 * projection is evaluated once over the whole table and the
+                 * value broadcast as the DAG path broadcasts it (exec.c
+                 * OP_SELECT): to nrows beside a projection that flows a row
+                 * column through, and to one row when no projection does
+                 * (case (a) above: an all-aggregate select is one row). */
+                int any_row_proj = 0;
+                for (int64_t i = 0; i + 1 < dict_n && !any_row_proj; i += 2) {
+                    int64_t kid = dict_elems[i]->i64;
+                    if (kid == from_id || kid == where_id || kid == by_id ||
+                        kid == take_id || kid == asc_id || kid == desc_id ||
+                        kid == nearest_id) continue;
+                    ray_t* e = dict_elems[i + 1];
+                    any_row_proj = expr_refs_row_column(e, tbl) || !expr_contains_agg(e);
+                }
+                int64_t bcast_len = any_row_proj ? nrows : 1;
                 int64_t out_len = -1;   /* length of the first materialized column */
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
@@ -12937,12 +12982,26 @@ by_dict_done:
                         kid == nearest_id) continue;
                     /* Whole-column verbs (distinct/asc/desc/reverse) consume the
                      * entire column and must be evaluated once, not scattered
-                     * per-row; everything else keeps the row-by-row semantics. */
-                    ray_t* col = select_fallback_passthrough_col(dict_elems[i + 1], tbl, nrows);
-                    if (!col)
-                        col = is_whole_column_projection(dict_elems[i + 1])
-                            ? eval_expr_whole_column(dict_elems[i + 1], tbl)
-                            : eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
+                     * per-row; so must a one-value projection (an aggregate,
+                     * alone or under scalar arithmetic / a scalar `if`), whose
+                     * value is then broadcast.  Everything else — literals,
+                     * lambda calls, and a row column mixed with an aggregate
+                     * in one expression — keeps the row-by-row semantics.
+                     * With no row projection at all nothing is scattered: an
+                     * alias bound below as a one-row column must not be read
+                     * per row.  A bare column name is the column itself. */
+                    ray_t* expr = dict_elems[i + 1];
+                    int whole_verb = is_whole_column_projection(expr);
+                    int one_value = !whole_verb &&
+                                    (!any_row_proj ||
+                                     (expr_contains_agg(expr) && !expr_refs_row_column(expr, tbl)));
+                    ray_t* col = select_fallback_passthrough_col(expr, tbl, nrows);
+                    if (!col) {
+                        col = (whole_verb || one_value)
+                            ? eval_expr_whole_column(expr, tbl)
+                            : eval_expr_per_row(expr, tbl, nrows);
+                        if (one_value) col = select_fallback_broadcast(col, bcast_len);
+                    }
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
@@ -12971,8 +13030,10 @@ by_dict_done:
                      * the remaining expressions are evaluated over, in place
                      * of a source column of the same name.  A column of
                      * another length (`distinct`) cannot be a row of that
-                     * table and stays unbound. */
-                    if (col_len == nrows) {
+                     * table and stays unbound.  In an all-aggregate select
+                     * the one-row value is what a later projection reads
+                     * (`{m: (max ts) y: (+ m 1)}`), and nothing scatters it. */
+                    if (col_len == bcast_len) {
                         ray_t* bound = select_fallback_bind_alias(tbl, kid, col);
                         if (!bound || RAY_IS_ERR(bound)) {
                             ray_release(col);

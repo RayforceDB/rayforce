@@ -898,7 +898,7 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
          * it to an unwritten result buffer). */
         case RAY_F64: case RAY_I64: case RAY_I32: case RAY_I16:
         case RAY_U8: case RAY_BOOL:
-        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE:
+        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE: case RAY_GUID:
             return true;
         default: return false;
     }
@@ -1143,6 +1143,21 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             uint8_t tv = c->then_scalar ? (uint8_t)c->t_i64 : (uint8_t)if_vec_i64(c->then_v, i);
             uint8_t ev = c->else_scalar ? (uint8_t)c->e_i64 : (uint8_t)if_vec_i64(c->else_v, i);
             dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_GUID: {
+        /* 16-byte cells: copy the chosen side's cell.  A GUID atom keeps
+         * its bytes in obj; a one-element vector is row 0. */
+        uint8_t* dst = (uint8_t*)c->dst;
+        const uint8_t* tb = ray_is_atom(c->then_v) ? (const uint8_t*)ray_data(c->then_v->obj)
+                                                   : (const uint8_t*)ray_data(c->then_v);
+        const uint8_t* eb = ray_is_atom(c->else_v) ? (const uint8_t*)ray_data(c->else_v->obj)
+                                                   : (const uint8_t*)ray_data(c->else_v);
+        for (int64_t i = i0; i < i1; i++) {
+            const uint8_t* src = cond_p[i]
+                ? tb + (c->then_scalar ? 0 : i) * 16
+                : eb + (c->else_scalar ? 0 : i) * 16;
+            memcpy(dst + i * 16, src, 16);
         }
         break; }
     default: break;
