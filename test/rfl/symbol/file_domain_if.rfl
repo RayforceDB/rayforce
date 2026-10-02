@@ -82,4 +82,17 @@
 (all (== (at (select {from: F k: (if (> v 50) ref "") where: (> v 10)}) 'k) (OW (fn [x] (> x 10))))) -- true
 (all (== (at (select {from: F k: (if (> v 50) ref "") where: (== v 77)}) 'k) (OW (fn [x] (== x 77))))) -- true
 (count (select {from: F k: (if (> v 50) ref "") where: (> v 1000)})) -- 0
-(.sys.exec "rm -rf /tmp/rfl_fdom_if/ /tmp/rfl_fdom_if_x/") -- 0
+;; a partitioned table after a live insert of a new symbol: the domain
+;; holds positions past its mapped file, so the `if` takes the selected arm
+;; up front.  Oracle: the scalar `if` row by row.
+(.sys.exec "rm -rf /tmp/rfl_fdom_if_p/") -- 0
+(.db.splayed.set "/tmp/rfl_fdom_if_p/1/t/" TX "/tmp/rfl_fdom_if_p/.sym")
+(set PT (.db.parted.get "/tmp/rfl_fdom_if_p/" 't))
+(insert 'PT 2 (list (as 'SYMBOL ["fdom_if_novel" "fdom_if_novel"]) ["s1" "s2"] [99 7]))
+(set PR (as 'STR (at PT 'ref)))
+(set PV (at PT 'v))
+(set OP1 (as 'STR (map (fn [k] (if (> (at PV k) 50) (at PR k) "")) (til (count PT)))))
+(all (== (at (select {from: PT k: (if (> v 50) ref "")}) 'k) OP1)) -- true
+(last (at (select {from: PT k: (if (> v 50) ref "")}) 'k)) -- ""
+(at (at (select {from: PT k: (if (> v 50) ref "")}) 'k) (- (count PT) 2)) -- "fdom_if_novel"
+(.sys.exec "rm -rf /tmp/rfl_fdom_if/ /tmp/rfl_fdom_if_x/ /tmp/rfl_fdom_if_p/") -- 0
