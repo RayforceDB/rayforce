@@ -2802,6 +2802,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t tn = ray_table_nrows(input);
                 /* an atom of any type (`where: 0`) by the scalar truth rule;
                  * a one-element BOOL is already a row mask on a 1-row table */
+                if (ray_is_atom(pred) && !ray_pred_atom_type_ok(pred->type)) {
+                    int8_t pt = pred->type;
+                    ray_release(pred); ray_release(input);
+                    return ray_error("type", "where: a scalar predicate must be boolean or numeric, got %s",
+                                     ray_type_name(pt));
+                }
                 if (ray_is_atom(pred) || tn != 1) {
                     uint8_t on = ray_is_atom(pred) ? (is_truthy(pred) ? 1 : 0)
                                                    : ((const uint8_t*)ray_data(pred))[0];

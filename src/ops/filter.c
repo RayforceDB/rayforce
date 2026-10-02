@@ -581,6 +581,28 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     if (!input || RAY_IS_ERR(input)) return input;
     if (!pred || RAY_IS_ERR(pred)) return pred;
+    /* A predicate with one value (`where: false`, `(== (count x) 10)`) holds
+     * for every row or none, as in the plain filter.  The checks below
+     * passed an atom through as "keep the whole table" and read a
+     * one-element BOOL as a one-row mask.  Spread it over the rows. */
+    if (input->type == RAY_TABLE) {
+        int64_t tn = ray_table_nrows(input);
+        bool atom = ray_is_atom(pred);
+        if (atom && !ray_pred_atom_type_ok(pred->type))
+            return ray_error("type", "where: a scalar predicate must be boolean or numeric, got %s",
+                             ray_type_name(pred->type));
+        if (atom || (pred->type == RAY_BOOL && pred->len == 1 && tn != 1)) {
+            uint8_t on = atom ? (is_truthy(pred) ? 1 : 0)
+                              : ((const uint8_t*)ray_data(pred))[0];
+            ray_t* m = ray_vec_new(RAY_BOOL, tn);
+            if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+            m->len = tn;
+            if (tn > 0) memset(ray_data(m), on, (size_t)tn);
+            ray_t* r = exec_filter_head(input, m, limit);
+            ray_release(m);
+            return r;
+        }
+    }
     /* Pass-through must hand back an OWNED ref: the exec.c caller
      * releases its own input ref and returns this value as the node
      * result, so a bare `input` would leave the result dangling once
@@ -593,7 +615,17 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
 
     int64_t ncols = ray_table_ncols(input);
     int64_t nrows = ray_table_nrows(input);
-    if (limit <= 0 || ncols <= 0) return ray_table_new(0);
+    if (ncols <= 0) return ray_table_new(0);
+    if (limit <= 0) {
+        /* No rows, but the table's columns: an empty table without them
+         * made `(at r 'x)` fail on `take: 0`. */
+        ray_t* zero = make_i64(0);
+        ray_t* r = zero ? ray_take_fn(input, zero) : NULL;
+        if (zero) ray_release(zero);
+        if (r && !RAY_IS_ERR(r)) return r;
+        if (r) ray_error_free(r);
+        return ray_table_new(0);   /* a parted table takes no `take` */
+    }
     if (limit > nrows) limit = nrows;
 
     /* VLA guard */

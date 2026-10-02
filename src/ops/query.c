@@ -6565,6 +6565,24 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     return 1;
 }
 
+/* A where: predicate with one value (`false`, `(== (count x) 5)`) holds for
+ * every row or none: spread it into a full mask of `tn` rows, as the table
+ * filter does.  Consumes `m`; returns it unchanged when it is no scalar, or
+ * when it is a symbol or string atom (no truth value; the caller's type
+ * check reports it). */
+static ray_t* where_mask_spread(ray_t* m, int64_t tn) {
+    if (!m || RAY_IS_ERR(m)) return m;
+    bool atom = ray_is_atom(m) && ray_pred_atom_type_ok(m->type);
+    if (!atom && !(m->type == RAY_BOOL && m->len == 1 && tn != 1)) return m;
+    uint8_t on = atom ? (is_truthy(m) ? 1 : 0) : ((const uint8_t*)ray_data(m))[0];
+    ray_release(m);
+    ray_t* v = ray_vec_new(RAY_BOOL, tn);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = tn;
+    if (tn > 0) memset(ray_data(v), on, (size_t)tn);
+    return v;
+}
+
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (handled) *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2) return NULL;
@@ -6709,6 +6727,12 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
         return pred_vec ? pred_vec : ray_error("type", "select count: WHERE predicate evaluation failed");
     }
     int64_t tbl_nrows = ray_table_nrows(tbl);
+    pred_vec = where_mask_spread(pred_vec, tbl_nrows);
+    if (!pred_vec || RAY_IS_ERR(pred_vec)) {
+        ray_graph_free(g);
+        ray_release(tbl);
+        return pred_vec ? pred_vec : ray_error("oom", NULL);
+    }
     if (pred_vec->type != RAY_BOOL || pred_vec->len != tbl_nrows) {
         int8_t pred_t = pred_vec->type;            /* capture BEFORE free */
         ray_release(pred_vec);
@@ -14089,6 +14113,8 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
     }
     if (!mask_vec) return ray_error("type", "update: `where:` predicate evaluation failed");
     if (RAY_IS_ERR(mask_vec)) return mask_vec;
+    mask_vec = where_mask_spread(mask_vec, ray_table_nrows(tbl));
+    if (!mask_vec || RAY_IS_ERR(mask_vec)) return mask_vec ? mask_vec : ray_error("oom", NULL);
     if (mask_vec->type != RAY_BOOL || mask_vec->len != ray_table_nrows(tbl)) {
         int8_t mask_t = mask_vec->type;
         ray_release(mask_vec);
@@ -14810,6 +14836,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             ray_env_pop_scope();
         }
         if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("type", "update: `where:` predicate evaluation failed"); }
+        mask_vec = where_mask_spread(mask_vec, nrows);
+        if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("oom", NULL); }
         if (mask_vec->type != RAY_BOOL || mask_vec->len != nrows) {
             int8_t mask_t = mask_vec->type;            /* capture BEFORE free */
             ray_release(mask_vec);

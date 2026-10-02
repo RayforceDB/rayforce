@@ -197,3 +197,20 @@
 (at (select {c: (count x) from: TSc where: (and (> x 1) false)}) 'c) -- [0]
 (at (select {c: (count x) from: TSc by: s where: true}) 'c) -- [2 2 2]
 (at (select {from: TSc where: (or (> x 3) true)}) 'x) -- (til 6)
+;; ...with take: too, where the filter gathers only the first rows: an atom
+;; predicate passed the whole table through (a false `where:` with `take: 3`
+;; returned every row) and a one-element BOOL read as a one-row mask.
+(set TSt (table [x s] (list (til 10) (as 'SYM (% (til 10) 3)))))
+(at (select {from: TSt where: false take: 3}) 'x) -- (til 0)
+(at (select {from: TSt where: (and (> x 1) false) take: 3}) 'x) -- (til 0)
+(at (select {from: TSt where: 0N take: 3}) 'x) -- (til 0)
+(at (select {from: TSt where: (== (count x) 10) take: 5}) 'x) -- [0 1 2 3 4]
+(at (select {from: TSt where: true take: 3}) 'x) -- [0 1 2]
+;; take 0 keeps the table's columns
+(key (select {from: TSt where: (> x 1) take: 0})) -- ['x 's]
+;; a symbol or string has no truth value
+(select {from: TSt where: "abc"}) !- type
+;; update where: takes a scalar predicate the same way
+(at (update {x: 100 from: TSt where: false}) 'x) -- (til 10)
+(at (update {x: 100 from: TSt where: (== (count x) 10)}) 'x) -- (take 100 10)
+(count (select {from: TSt where: (== (count x) 9)})) -- 0
