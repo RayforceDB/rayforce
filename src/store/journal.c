@@ -58,6 +58,7 @@ static struct {
     char               log_path[RAY_JOURNAL_PATH_MAX];
     bool               in_replay;
     int64_t            log_gen;    /* live log's generation id, 0 = legacy/unknown */
+    ray_fd_t           lock_fd;    /* <base>.lk, held while the journal is open */
 } g_journal = {
     .mode      = RAY_JOURNAL_OFF,
     .fp        = NULL,
@@ -65,7 +66,49 @@ static struct {
     .log_path  = {0},
     .in_replay = false,
     .log_gen   = 0,
+    .lock_fd   = RAY_FD_INVALID,
 };
+
+/* One writer per journal base.  The journal is single-writer (an entry is
+ * two writes, a roll renames the live log, a snapshot writes a fixed temp
+ * name), so this process holds an exclusive lock on <base>.lk while it has
+ * the journal open, and a second opener fails instead of interleaving.
+ * .log.purge removes the lock file while holding it; a lock taken on a file
+ * that was removed meanwhile is dropped and taken again on the new one, so
+ * two openers can never hold locks on different files. */
+static ray_err_t journal_lock(const char* base) {
+    if (g_journal.lock_fd != RAY_FD_INVALID) return RAY_OK;
+    char path[RAY_JOURNAL_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s.lk", base);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return RAY_ERR_DOMAIN;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+        if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+        if (ray_file_trylock_ex(fd) != RAY_OK) {
+            ray_file_close(fd);
+            fprintf(stderr, "log: ERROR  journal %s is open in another process\n", base);
+            return RAY_ERR_IO;
+        }
+#ifndef RAY_OS_WINDOWS
+        struct stat held, named;
+        if (fstat(fd, &held) != 0 || stat(path, &named) != 0 ||
+            held.st_ino != named.st_ino || held.st_dev != named.st_dev) {
+            ray_file_close(fd);                  /* purged under us: retry */
+            continue;
+        }
+#endif
+        g_journal.lock_fd = fd;
+        return RAY_OK;
+    }
+    return RAY_ERR_IO;
+}
+
+static void journal_unlock(void) {
+    if (g_journal.lock_fd == RAY_FD_INVALID) return;
+    (void)ray_file_unlock(g_journal.lock_fd);
+    ray_file_close(g_journal.lock_fd);
+    g_journal.lock_fd = RAY_FD_INVALID;
+}
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
@@ -641,24 +684,42 @@ ray_err_t ray_journal_open_append(const char* base, ray_journal_mode_t mode) {
     size_t blen = strlen(base);
     if (blen + 5 >= sizeof(g_journal.base)) return RAY_ERR_DOMAIN;
 
+    ray_err_t le = journal_lock(base);
+    if (le != RAY_OK) return le;
     memcpy(g_journal.base, base, blen + 1);
     g_journal.mode = mode;
-    if (!path_join_ext(g_journal.log_path, sizeof(g_journal.log_path), base, ".log"))
+    if (!path_join_ext(g_journal.log_path, sizeof(g_journal.log_path), base, ".log")) {
+        journal_unlock();
         return RAY_ERR_DOMAIN;
+    }
 
-    return open_log_for_append();
+    ray_err_t oe = open_log_for_append();
+    if (oe != RAY_OK) journal_unlock();
+    return oe;
 }
 
 ray_err_t ray_journal_open(const char* base, ray_journal_mode_t mode) {
     if (!base || !*base) return RAY_ERR_DOMAIN;
     if (g_journal.fp) return RAY_ERR_DOMAIN;   /* already open */
 
+    /* Lock before replaying, so a second process fails before it applies
+     * a log another process is still writing. */
+    ray_err_t le = journal_lock(base);
+    if (le != RAY_OK) return le;
     ray_err_t re = ray_journal_recover(base);
-    if (re != RAY_OK) return re;
+    if (re != RAY_OK) { journal_unlock(); return re; }
     return ray_journal_open_append(base, mode);
 }
 
+static ray_err_t journal_close_fp(void);
+
 ray_err_t ray_journal_close(void) {
+    ray_err_t r = journal_close_fp();
+    journal_unlock();
+    return r;
+}
+
+static ray_err_t journal_close_fp(void) {
     if (!g_journal.fp) return RAY_OK;
     /* Check both fflush and fclose return — buffered ENOSPC slips
      * through silently otherwise and the "best-effort durability at
@@ -686,11 +747,16 @@ ray_err_t ray_journal_purge(void) {
      * nothing to act on, and (unlike .log.close) we cannot derive a path. */
     if (!g_journal.base[0]) return RAY_ERR_DOMAIN;
 
+    /* Hold the journal's lock while its files are removed: another process
+     * that has it open is still writing them. */
+    ray_err_t lock_result = journal_lock(g_journal.base);
+    if (lock_result != RAY_OK) return lock_result;
+
     /* Close the active log FIRST: never unlink a path out from under
      * buffered writes (and Windows refuses to unlink an open file). */
     if (g_journal.fp) {
-        ray_err_t close_result = ray_journal_close();
-        if (close_result != RAY_OK) return close_result;
+        ray_err_t close_result = journal_close_fp();
+        if (close_result != RAY_OK) { journal_unlock(); return close_result; }
     }
 
     ray_err_t result = RAY_OK;
@@ -745,7 +811,15 @@ ray_err_t ray_journal_purge(void) {
         closedir(d);
     }
 
-    /* 3. Reset: the journal is gone, so a later .log.open starts clean. */
+    /* 3. The lock file last, while it is still held (see journal_lock).
+     *    Windows cannot remove a file that is open, so it stays there. */
+#ifndef RAY_OS_WINDOWS
+    if (path_join_ext(path, sizeof(path), g_journal.base, ".lk"))
+        purge_one(path, &result);
+#endif
+
+    /* 4. Reset: the journal is gone, so a later .log.open starts clean. */
+    journal_unlock();
     g_journal.mode        = RAY_JOURNAL_OFF;
     g_journal.base[0]     = '\0';
     g_journal.log_path[0] = '\0';

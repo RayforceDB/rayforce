@@ -134,6 +134,7 @@ static void cleanup_base(const char* base) {
     snprintf(path, sizeof(path), "%s.log",     base); unlink(path);
     snprintf(path, sizeof(path), "%s.qdb",     base); unlink(path);
     snprintf(path, sizeof(path), "%s.qdb.tmp", base); unlink(path);
+    snprintf(path, sizeof(path), "%s.lk",      base); unlink(path);
     /* Archived rolls have the form base.<stamp>.log — remove with glob via shell. */
 #if defined(_WIN32)
     snprintf(path, sizeof(path), "%s.*.log", base);   /* no POSIX shell here */
@@ -2407,6 +2408,88 @@ static test_result_t test_journal_purge_after_close(void) {
     PASS();
 }
 
+/* L1-L3 (#687): one writer per journal base.  The lock is an exclusive
+ * flock on <base>.lk; a second open file description (as another process
+ * would have) cannot take it while the journal is open, through a roll,
+ * and is refused by open and purge while someone else holds it. */
+#if !defined(_WIN32)
+#include <sys/file.h>
+/* Whether another holder could take the lock on <base>.lk right now. */
+static int jrn_lock_free(const char* base) {
+    char path[300];
+    snprintf(path, sizeof(path), "%s.lk", base);
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+    int ok = flock(fd, LOCK_EX | LOCK_NB) == 0;
+    close(fd);
+    return ok;
+}
+#endif
+
+static test_result_t test_journal_lock_held_while_open(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_held");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 0);
+    TEST_ASSERT_EQ_I(ray_journal_roll(), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 0);          /* a roll keeps it */
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 1);
+    TEST_ASSERT_EQ_I(ray_journal_open_append(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
+static test_result_t test_journal_lock_refuses_second_opener(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_refuse");
+    char path[300]; snprintf(path, sizeof(path), "%s.lk", base);
+    int other = open(path, O_RDWR | O_CREAT, 0644);
+    TEST_ASSERT_TRUE(other >= 0);
+    TEST_ASSERT_EQ_I(flock(other, LOCK_EX | LOCK_NB), 0);   /* "another process" */
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_IO);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    TEST_ASSERT_EQ_I(ray_journal_open_append(base, RAY_JOURNAL_ASYNC), RAY_ERR_IO);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    close(other);                                            /* releases it */
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
+static test_result_t test_journal_purge_refused_while_locked(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_purge");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(7));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    char path[300]; snprintf(path, sizeof(path), "%s.lk", base);
+    int other = open(path, O_RDWR | O_CREAT, 0644);
+    TEST_ASSERT_TRUE(other >= 0);
+    TEST_ASSERT_EQ_I(flock(other, LOCK_EX | LOCK_NB), 0);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_ERR_IO);       /* someone writes it */
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), 0);
+    close(other);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), -1);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 1);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
 /* P3. ops wrapper: (.log.purge) returns null on success and a `domain`
  * error when no journal base is known. */
 static test_result_t test_journal_purge_ops_wrapper(void) {
@@ -2536,6 +2619,10 @@ const test_entry_t journal_entries[] = {
     { "journal/purge_full",                test_journal_purge_full,                jrn_setup, jrn_teardown },
     { "journal/purge_after_close",         test_journal_purge_after_close,         jrn_setup, jrn_teardown },
     { "journal/purge_ops_wrapper",         test_journal_purge_ops_wrapper,         jrn_setup, jrn_teardown },
+    /* #687: one writer per journal base */
+    { "journal/lock_held_while_open",      test_journal_lock_held_while_open,      jrn_setup, jrn_teardown },
+    { "journal/lock_refuses_second_opener", test_journal_lock_refuses_second_opener, jrn_setup, jrn_teardown },
+    { "journal/purge_refused_while_locked", test_journal_purge_refused_while_locked, jrn_setup, jrn_teardown },
     /* #420: snapshot/roll crash window must not double-apply */
     { "journal/crash_window_no_double_apply", test_journal_crash_window_no_double_apply, jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },

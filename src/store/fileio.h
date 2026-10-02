@@ -47,6 +47,8 @@ ray_fd_t  ray_file_open(const char* path, int flags);
 void     ray_file_close(ray_fd_t fd);
 ray_err_t ray_file_lock_ex(ray_fd_t fd);
 ray_err_t ray_file_lock_sh(ray_fd_t fd);
+/* Exclusive lock without waiting: RAY_ERR_IO when another holder has it. */
+ray_err_t ray_file_trylock_ex(ray_fd_t fd);
 ray_err_t ray_file_unlock(ray_fd_t fd);
 ray_err_t ray_file_sync(ray_fd_t fd);
 ray_err_t ray_file_sync_dir(const char* path);
