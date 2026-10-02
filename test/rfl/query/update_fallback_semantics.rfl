@@ -17,6 +17,11 @@
 ;; ─── 1. a new or replaced column of the wrong length is rejected ────────────
 (update {n: (til 3) from: t}) !- length
 (update {i: (til 3) from: t}) !- length
+;; a LIST result too (LIST is type 0, not an atom)
+(update {n: (list 1 2) from: t}) !- length
+(update {n: (list 1 2) from: t where: (> i 1)}) !- type
+(update {i: (list 1 2) from: t}) !- length
+(update {i: (list 1 2) from: t where: (> i 1)}) !- length
 ;; a constant / reduced expression still broadcasts
 (at (update {n: 7 from: t}) 'n) -- [7 7 7 7 7]
 (at (update {n: (max (- ts ts)) from: t}) 'n) -- [0 0 0 0 0]

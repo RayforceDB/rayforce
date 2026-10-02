@@ -2405,8 +2405,9 @@ static ray_t* query_materialize_parted_table(ray_t* tbl);
  * columns keep the per-row read, which handles them cell by cell). */
 static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t nrows) {
     if (!expr || expr->type != -RAY_SYM || (expr->attrs & ATTR_QUOTED)) return NULL;
+    if (ray_env_has_lexical_local(expr->i64)) return NULL;   /* a formal shadows the column, as on the DAG */
     ray_t* col = ray_table_get_col(tbl, expr->i64);
-    if (!col || col->type <= 0) return NULL;
+    if (!col || col->type < 0) return NULL;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
         (col->attrs & RAY_ATTR_SLICE) || ray_len(col) != nrows)
         return NULL;
@@ -15045,14 +15046,14 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
         ray_graph_free(g);
     }
     if (update_dag_err_final(out, if_refused)) {
-        if (cerr) ray_release(cerr);
+        if (cerr) ray_error_free(cerr);
         return out;
     }
     if (!out || RAY_IS_ERR(out)) {
         /* Keep the planner's error — from compile, or from executing what
          * it compiled (a scan of a misspelt column: `schema: column 'x'
          * not found`) — to report if the interpreter fails as well. */
-        if (out) { if (cerr) ray_release(cerr); cerr = out; out = NULL; }
+        if (out) { if (cerr) ray_error_free(cerr); cerr = out; out = NULL; }
         int64_t nrows = ray_table_nrows(sub);
         /* The interpreter's vector builtins are elementwise over whole
          * columns, and whole-column verbs (.idx.hash, distinct, ...) and
@@ -15065,7 +15066,7 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
              * Keep this an error until the fallback can reduce aggregates
              * first (#692).  (An aggregate over a global or a literal is the
              * same value on every row and goes through.) */
-            if (cerr) ray_release(cerr);
+            if (cerr) ray_error_free(cerr);
             return ray_error("nyi", "update: an if over a column that also aggregates is not supported without the planner");
         }
         if (!per_row) {
@@ -15083,7 +15084,7 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
             return cerr;
         }
     }
-    if (cerr) ray_release(cerr);
+    if (cerr) ray_error_free(cerr);   /* error objects bypass the refcount */
     if (!out) return ray_error("type", "update: failed to evaluate column update expression");
     if (RAY_IS_ERR(out)) return out;
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
@@ -15788,7 +15789,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 /* DAG first, then the interpreter (update_eval_on). */
                 ray_t* expr_vec = update_eval_on(tbl, update_expr);
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
-                if (expr_vec->type > 0 && ray_len(expr_vec) != nrows) {
+                if (expr_vec->type >= 0 && ray_len(expr_vec) != nrows) {
                     int64_t got = ray_len(expr_vec);
                     ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl);
                     DICT_VIEW_CLOSE(updw); return ray_error("length", "update: column has %lld values for %lld rows", (long long)got, (long long)nrows);
@@ -16118,7 +16119,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             /* DAG first, then the interpreter (update_eval_on). */
             ray_t* expr_vec = update_eval_on(tbl, update_expr);
             if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
-            if (expr_vec->type > 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
+            if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
                 /* A column of another length has no row-aligned meaning; it
                  * used to be added as-is and left the table ragged. */
                 int64_t got = ray_len(expr_vec);
@@ -16280,7 +16281,7 @@ no_where_add_col:
         ray_t* update_expr = dict_elems[d + 1];
         ray_t* expr_vec = update_eval_on(tbl, update_expr);
         if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate new column expression"); }
-        if (expr_vec->type > 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
+        if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
             /* A column of another length has no row-aligned meaning; it
              * used to be added as-is and left the table ragged (the where:
              * arm checks the same). */

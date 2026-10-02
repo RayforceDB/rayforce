@@ -38,3 +38,7 @@
 ;; ─── the downstream symptom: a join on the projected column ─────────────────
 (set t2 (table [name last] (list [Alice Bob Carol] [Cooper Belcher Bells])))
 (at (inner-join [name] (select {from: t name: name x: (+ ts 1)}) t2) 'last) -- [Cooper Belcher Bells]
+
+;; ─── a lexical local shadows a column of the same name, as on the DAG ───────
+((fn [name] (at (select {from: t w: name x: (+ ts 1)}) 'w)) 'shadow) -- [shadow shadow shadow]
+((fn [name] (at (select {from: t w: name}) 'w)) 'shadow) -- [shadow shadow shadow]
