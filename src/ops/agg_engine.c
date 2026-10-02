@@ -3040,6 +3040,9 @@ static uint32_t agg_radix_part_count(uint32_t nworkers, int64_t nrows) {
  * (chunk, partition), so chunks are few (a handful per worker) but never so
  * small that the per-chunk partition row dwarfs the rows it counts. */
 #define AGG_RADIX_CHUNK_MIN_ROWS  16384
+/* ...but an input of at least this many rows per worker still gives every
+ * worker a chunk, so mid-size inputs count and scatter on the whole pool. */
+#define AGG_RADIX_CHUNK_FLOOR_ROWS 4096
 #define AGG_RADIX_CHUNKS_PER_WORKER 4
 /* Count-matrix budget: chunks are reduced (never below one per worker) so
  * n_chunks × n_parts × 4 bytes stays under this. */
@@ -4000,6 +4003,8 @@ static ray_t* exec_group_v2_parallel_radix(
     if (want > by_budget) want = by_budget;
     if (want < nw) want = nw;
     uint64_t by_rows = ((uint64_t)n_in + AGG_RADIX_CHUNK_MIN_ROWS - 1) / AGG_RADIX_CHUNK_MIN_ROWS;
+    if (by_rows < nw && (uint64_t)n_in >= (uint64_t)nw * AGG_RADIX_CHUNK_FLOOR_ROWS)
+        by_rows = nw;
     if (want > by_rows) want = by_rows;
     uint64_t by_width = (uint64_t)n_in / ((uint64_t)1 << 30) + 1;
     if (want < by_width) want = by_width;
