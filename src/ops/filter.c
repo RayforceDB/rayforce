@@ -686,7 +686,7 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         if (zero) ray_release(zero);
         if (r && !RAY_IS_ERR(r)) return r;
         if (r) ray_error_free(r);
-        return ray_table_new(0);   /* a parted table takes no `take` */
+        limit = 0;   /* a parted table takes no `take`: gather no rows */
     }
     if (limit > nrows) limit = nrows;
 
@@ -696,7 +696,7 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     /* Collect up to `limit` matching row indices, stopping early */
     ray_t* idx_hdr = NULL;
     int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
-                                    (size_t)limit * sizeof(int64_t));
+                                    (size_t)(limit > 0 ? limit : 1) * sizeof(int64_t));
     if (!match_idx) return ray_error("oom", NULL);
 
     int64_t found = 0;

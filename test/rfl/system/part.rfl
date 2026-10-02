@@ -496,6 +496,8 @@
 (at (select {from: PK where: (> ts 2) take: 3}) 'date) -- [2024.01.01 2024.01.01 2024.01.03]
 (at (select {from: PK where: (> ts 3) take: 5}) 'date) -- [2024.01.01 2024.01.03]
 (at (select {d: date from: PK where: (== v 13) take: 1}) 'd) -- [2024.01.03]
+(key (select {from: PK where: (> ts 2) take: 0})) -- [date ts v]
+(count (select {from: PK where: (> ts 2) take: 0})) -- 0
 (.sys.exec "rm -rf /tmp/rfl_part_keep")
 (.db.splayed.set "/tmp/rfl_part_keep/1/t/" (table [ts v] (list (til 5) (til 5))))
 (.db.splayed.set "/tmp/rfl_part_keep/7/t/" (table [ts v] (list (til 5) (til 5))))
