@@ -652,8 +652,8 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     if (!pred || RAY_IS_ERR(pred)) return pred;
     /* Over a table the predicate goes through the one where: rule
      * (ray_where_mask_coerce): a scalar or one-element BOOL is spread over
-     * the rows, a numeric column becomes its nonzero-and-non-null mask, a
-     * symbol is a type error.  The checks below used to pass an atom and
+     * the rows, any other vector (a numeric or symbol column) is a type
+     * error.  The checks below used to pass an atom and
      * any non-BOOL vector through as "keep the whole table" — so
      * `where: x take: 2` over an I64 column returned every row. */
     if (input->type == RAY_TABLE &&

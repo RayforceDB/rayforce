@@ -56,6 +56,13 @@
 ;; ── unchanged: a non-null number beside a temporal still promotes ───────────
 (type (at (select {k: (if (> x 1) d 5) from: TD}) 'k)) -- 'I64
 (at (select {k: (if (> x 1) d 5) from: TD}) 'k) -- [5 5 3 4]
-;; two different temporal types still fold to their storage width
-(type (at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k)) -- 'I32
-(type (at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k)) -- 'I64
+;; a null literal of another temporal type is a null of the branch's type
+(type (at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]
+(type (at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k)) -- 'TIMESTAMP
+(at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k) -- [0Np 0Np 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000004]
+(nil? (at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k)) -- [true true false false]
+(type (at (select {k: (if (> x 1) 0Np t) from: TD}) 'k)) -- 'TIME
+(nil? (at (select {k: (if (> x 1) 0Np t) from: TD}) 'k)) -- [false false true true]
+;; two typed temporal nulls: the then side wins
+(type (at (select {k: (if (> x 1) 0Nd 0Np) from: TD}) 'k)) -- 'DATE

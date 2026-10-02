@@ -540,18 +540,18 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     int8_t tt = then_val->out_type;
     int8_t et = else_val->out_type;
     int8_t out_type = promote_if_type(tt, et);
-    /* A temporal branch beside a bare null literal keeps the temporal type
+    /* A temporal branch beside a null literal keeps the temporal type
      * (#673): `(if c d 0N)` is a DATE column with nulls, not the I64 that
-     * promote() makes of DATE + I64.  Same rule as the text null below: the
-     * literal is then swapped for the typed null.  A non-null number beside
-     * a temporal still promotes, as before. */
-    if (type_is_temporal(tt) != type_is_temporal(et)) {
-        bool then_temporal = type_is_temporal(tt);
-        int8_t other = then_temporal ? et : tt;
-        if (other != RAY_STR && other != RAY_SYM && other != RAY_GUID &&
-            if_const_null_atom(g, then_temporal ? else_id : then_id))
-            out_type = then_temporal ? tt : et;
-    }
+     * promote() makes of DATE + I64, and `(if c ts 0Nd)` a TIMESTAMP one,
+     * not the I64 the two widths fold to.  Same rule as the text null
+     * below: the literal is then swapped for the typed null.  A non-null
+     * value beside a temporal still promotes, as before. */
+    if (type_is_temporal(tt) && et != tt && et != RAY_STR && et != RAY_SYM &&
+        et != RAY_GUID && if_const_null_atom(g, else_id))
+        out_type = tt;
+    else if (type_is_temporal(et) && tt != et && tt != RAY_STR && tt != RAY_SYM &&
+             tt != RAY_GUID && if_const_null_atom(g, then_id))
+        out_type = et;
     if (out_type < 0) return NULL;
     /* A LIST column scans as the untyped node (out_type 0), which promote()
      * also folds to BOOL and the fill then reads the cell pointers as bytes.

@@ -83,3 +83,18 @@
 ;; by: with no match is still no groups
 (count (select {c: (count y) from: T679 where: (> y 100) by: x take: 3})) -- 0
 (count (select {c: (count y) from: T679 where: (> y 2) by: x take: 1})) -- 1
+
+;; ─── review follow-ups ───────────────────────────────────────────────
+;; #675 on a one-row table: a scalar and a row column have the same length,
+;; so the ops decide; a failing where: still leaves one row
+(at (select {k: (+ (sum x) 0) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- [0]
+(at (select {k: (+ (sum x) 0) from: (table [x] (list [5])) where: (> x 1)}) 'k) -- [5]
+(at (select {k: (if (> (sum x) 1) 1 0) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- [0]
+(at (select {k: x from: (table [x] (list [5])) where: (> x 10)}) 'k) -- []
+(at (select {k: (+ x 1) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- []
+;; #679 for an aggregate of an expression: the keyless group keeps its
+;; selection lazy on the plain path too
+(at (select {c: (sum (* y 2)) from: T679 where: (> y 100)}) 'c) -- [0]
+(at (select {c: (sum (* y 2)) from: T679 where: (> y 100) take: 1}) 'c) -- [0]
+(at (select {c: (sum (* y 2)) from: T679 where: (> y 2)}) 'c) -- [24]
+(at (select {c: (max (+ y 1)) from: T679 where: (> y 100)}) 'c) -- [0Nl]

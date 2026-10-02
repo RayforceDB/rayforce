@@ -93,3 +93,28 @@
 (select {from: B where: x take: 10}) !- type
 (count (select {from: B where: (!= x 0)})) -- 133333
 (at (select {c: (count y) from: B where: (!= x 0)}) 'c) -- [133333]
+
+;; ─── review follow-ups ───────────────────────────────────────────────
+;; `and` / `or` over a non-boolean column is the same type error on every
+;; shape: select splits an `and` into one filter per conjunct, update and
+;; `or` compile the whole expression, and the compiled kernel used to read
+;; an I64 operand by its bytes
+(update {y: 99 from: T where: (and x (> y 2))}) !- type
+(delete {from: T where: (and x (> y 2))}) !- type
+(select {from: T where: (or x (> y 4))}) !- type
+(update {y: 99 from: T where: (or x (> y 4))}) !- type
+(select {c: (count y) from: T where: (or x (> y 4))}) !- type
+(select {w: (and x (> y 2)) from: T}) !- type
+(at (select {from: T where: (and b (> y 1))}) 'y) -- [2 4]
+(at (update {y: 99 from: T where: (and b (> y 1))}) 'y) -- [0 1 99 3 99 5]
+(at (select {from: T where: (or b (> y 4))}) 'y) -- [0 2 4 5]
+;; the eval fallback (a projection the DAG declines) takes the same rule
+(set TF (table [x y ts] (list [0 256 0N 1 0 0] (til 6) (+ 2024.01.01D00:00:00.000000000 (* 10 (til 6))))))
+(select {k: (+ ts 1) from: TF where: x}) !- type
+(select {k: (+ ts 1) from: TF where: 'abc}) !- type
+(at (select {k: (+ ts 1) y: y from: TF where: (first [0 2])}) 'y) -- []
+(at (select {k: (+ ts 1) y: y from: TF where: (first [1 2])}) 'y) -- [0 1 2 3 4 5]
+(at (select {k: (+ ts 1) y: y from: TF where: (> y 3)}) 'y) -- [4 5]
+;; the count-only path
+(count (select {from: TF where: (first [0 2])})) -- 0
+(count (select {from: TF where: x})) !- type

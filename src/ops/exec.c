@@ -1601,6 +1601,33 @@ static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
     return gx && gx->n_keys > 0;
 }
 
+/* True when the op tree under `id` carries none of the input's rows: every
+ * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
+ * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
+ * cannot on a one-row table (#675). */
+static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id, int depth) {
+    if (id >= g->node_count || depth > 64) return false;
+    ray_op_t* n = &g->nodes[id];
+    switch (n->opcode) {
+    case OP_CONST: return true;
+    case OP_SCAN:  return false;
+    case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
+    case OP_MIN: case OP_MAX:
+    case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
+    case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP:
+        return true;
+    default: break;
+    }
+    if (n->arity == 0) return false;
+    for (uint32_t i = 0; i < n->arity && i < 2; i++)
+        if (!op_tree_is_scalar(g, n->in_id[i], depth + 1)) return false;
+    if (n->opcode == OP_IF) {           /* the else branch rides in the ext */
+        ray_op_ext_t* x = find_ext(g, id);
+        if (!x || !op_tree_is_scalar(g, x->third_in, depth + 1)) return false;
+    }
+    return true;
+}
+
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
  * (GROUP predicate pushdown, opt.c Task-3).
  *
@@ -2808,23 +2835,21 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             /* Over a table every predicate value goes through the one
              * where: rule (ray_where_mask_coerce): a scalar (`(== (count x)
              * 5)`, a scalar conjunct of an `and`) or a one-element BOOL is
-             * spread over the rows; a numeric column becomes its
-             * nonzero-and-non-null mask; a symbol or string is a type error.
+             * spread over the rows; any other vector is a type error.
              * Before this, an I64 column fell through to the eager
              * exec_filter, which read it as one byte per row (#678). */
             if (input->type == RAY_TABLE &&
                 !(pred->type == RAY_BOOL && pred->len == ray_table_nrows(input))) {
                 int64_t tn = ray_table_nrows(input);
-                bool all_on = ray_is_atom(pred) && ray_pred_atom_type_ok(pred->type) &&
-                              is_truthy(pred);
+                if (ray_is_atom(pred) && ray_pred_atom_type_ok(pred->type) &&
+                    is_truthy(pred)) {
+                    ray_release(pred);  /* every row passes: selection unchanged */
+                    return input;
+                }
                 pred = ray_where_mask_coerce(pred, tn, "where");
                 if (!pred || RAY_IS_ERR(pred)) {
                     ray_release(input);
                     return pred ? pred : ray_error("oom", NULL);
-                }
-                if (all_on) {       /* every row passes: selection unchanged */
-                    ray_release(pred);
-                    return input;
                 }
             }
 
@@ -2980,7 +3005,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                  * materializing that expression over ALL rows — so the
                  * scattered gate matches the projection-side compaction
                  * factor (4x), not the plain-gather tradeoff (16x). */
-                if (gx && meta && nrows > 0 &&
+                /* A keyless group (an all-aggregate select) is one row and
+                 * its aggregates read the selection themselves; compacted,
+                 * a no-match where: handed exec_group an empty table and it
+                 * came back with no row (#679, the HEAD arm likewise). */
+                if (gx && gx->n_keys > 0 && meta && nrows > 0 &&
                     meta->total_pass * (contig ? 2 : 4) <= nrows) {
                     int64_t keep[32];
                     bool has_expr = false;
@@ -3649,13 +3678,21 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * column came first and its columns disagreed in length.  When
              * every column is a scalar the one-row result stays. */
             int64_t nr_in = ray_table_nrows(input);
-            if (nr_in != 1 && result && !RAY_IS_ERR(result)) {
+            if (result && !RAY_IS_ERR(result)) {
                 int64_t rc = ray_table_ncols(result);
                 bool has_full = false;
-                for (int64_t c = 0; c < rc; c++) {
-                    ray_t* cv = ray_table_get_col_idx(result, c);
-                    /* a parted column counts its rows across segments */
-                    if (cv && cv->type > 0 && ray_parted_nrows(cv) == nr_in) { has_full = true; break; }
+                if (nr_in != 1) {
+                    for (int64_t c = 0; c < rc; c++) {
+                        ray_t* cv = ray_table_get_col_idx(result, c);
+                        /* a parted column counts its rows across segments */
+                        if (cv && cv->type > 0 && ray_parted_nrows(cv) == nr_in) { has_full = true; break; }
+                    }
+                } else {
+                    /* On a one-row input a scalar and a row column have the
+                     * same length: read the ops instead, so a scalar-only
+                     * select under a failing where: is still one row. */
+                    for (uint32_t c = 0; c < n_cols && !has_full; c++)
+                        if (!op_tree_is_scalar(g, columns[c], 0)) has_full = true;
                 }
                 /* Every column a scalar: the reductions inside them already
                  * walked the where: selection (exec_reduction), so the
@@ -3666,7 +3703,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(g->selection);
                     g->selection = NULL;
                 }
-                for (int64_t c = 0; has_full && c < rc; c++) {
+                for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
                     if (!cv || cv->type <= 0 || RAY_IS_PARTED(cv->type) ||
                         cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
