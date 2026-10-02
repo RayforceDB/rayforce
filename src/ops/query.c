@@ -7264,7 +7264,26 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
         return 0;
     }
 
+    /* The raw compare below is right only for a literal in the column's own
+     * units.  A float literal decoded to 0 here, and a different temporal
+     * type compared days, milliseconds and nanoseconds as one unit.  A
+     * TIMESTAMP column takes a DATE or TIME literal on its nanosecond scale,
+     * as the eval path does; every other mix goes the general way. */
+    if (rhs_expr->type == -RAY_F64 || rhs_expr->type == -RAY_F32) return 0;
+    bool rhs_ns = false;
+    if (is_temporal(rhs_expr) && rhs_expr->type != -col->type) {
+        if (col->type != RAY_TIMESTAMP) return 0;
+        rhs_ns = true;
+    }
+
     int64_t rhs = count_atom_i64(rhs_expr);
+    if (rhs_ns) {
+        /* Days or milliseconds to nanoseconds, saturating: a date beyond
+         * the TIMESTAMP range still compares past every cell. */
+        int64_t unit = rhs_expr->type == -RAY_DATE ? 86400000000000LL : 1000000LL;
+        if (__builtin_mul_overflow((int64_t)rhs_expr->i32, unit, &rhs))
+            rhs = rhs_expr->i32 < 0 ? INT64_MIN + 1 : INT64_MAX;
+    }
     /* SYM cells are positions in the COLUMN's domain; the literal atom
      * carries a runtime id — re-express it (sym-domain Phase 2; no-op
      * for runtime-domain columns).  Absent ⇒ -1: never equals any cell

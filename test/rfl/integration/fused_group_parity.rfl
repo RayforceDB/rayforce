@@ -224,31 +224,14 @@
 (at (at (select {name: name n: n from: Tld where: (>= n 0) asc: name take: 3}) 'name) 2) -- 'zebra
 (.sys.exec "rm -f rf_test_local_dict_sym.csv") -- 0
 
-;; ────────────── Mixed-temporal compare must NOT fire fused ───────
+;; ────────────── Mixed-temporal compare ────────────────────────────
 ;; DATE storage is int32 days-from-epoch; TIMESTAMP is int64 ns-
-;; from-epoch.  A raw-unit fused comparator would compare the two
-;; integer fields directly — meaningless when the units differ.
-;; The fused predicate gate refuses cross-temporal compares so the
-;; unfused engine handles them.
-;;
-;; Caveat for this test (carried over from the round-5 review): the
-;; unfused engine in rayforce *also* compares temporals by their
-;; raw stored ints today, so the result is the same in both paths
-;; for any single concrete (op, lhs-class, rhs-class, value) tuple
-;; we can pick.  In other words, this test pins down "the gate
-;; routes the cross-temporal shape to the unfused path and the
-;; result is whatever the unfused path produces" — it does NOT
-;; distinguish raw-fused-result from a hypothetical normalised
-;; result, because no such normalised result exists in the engine
-;; today.  A stronger regression here would require an engine-side
-;; fix that adds proper temporal normalisation in cmp.c, which is
-;; out of scope for this branch and tracked separately.
+;; from-epoch.  The compiler rewrites the DATE literal as a TIMESTAMP
+;; constant before the predicate is built, so the fused and unfused
+;; paths see a same-typed compare and keep the rows on or after
+;; 2013.07.15.  This line used to pin the raw-int answer (3).
 (set Tts (table [t v] (list (as 'TIMESTAMP [2013.07.01D00:00:00.000000 2013.07.15D00:00:00.000000 2013.07.31D00:00:00.000000]) [1 2 3])))
-;; The shape compiles and runs — that's what we're verifying here.
-;; The exact count (3) reflects current engine semantics for a
-;; cross-temporal compare; the value isn't the regression target,
-;; the "doesn't crash / doesn't get a corrupted fused answer" is.
-(count (select {c: (count v) from: Tts where: (>= t 2013.07.15) by: t})) -- 3
+(count (select {c: (count v) from: Tts where: (>= t 2013.07.15) by: t})) -- 2
 
 ;; Same-typed DATE compare still works — verifies the gate allows
 ;; the supported same-class shape and didn't over-reject.

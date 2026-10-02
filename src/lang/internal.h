@@ -105,9 +105,15 @@ static inline int is_temporal(ray_t* x) {
  * DATE = days since epoch -> ns, TIME = ms since midnight -> ns, TIMESTAMP = ns */
 static inline int64_t temporal_as_ns(ray_t* x) {
     if (x->type == -RAY_TIMESTAMP) return x->i64;
-    if (x->type == -RAY_DATE)      return (int64_t)x->i32 * 86400000000000LL;
-    if (x->type == -RAY_TIME)      return (int64_t)x->i32 * 1000000LL;
-    return 0;
+    int64_t unit = x->type == -RAY_DATE ? 86400000000000LL
+                 : x->type == -RAY_TIME ? 1000000LL : 0;
+    if (!unit) return 0;
+    /* Saturating: a date outside the TIMESTAMP range still orders past
+     * every timestamp, instead of overflowing. */
+    int64_t ns;
+    if (__builtin_mul_overflow((int64_t)x->i32, unit, &ns))
+        return x->i32 < 0 ? INT64_MIN + 1 : INT64_MAX;
+    return ns;
 }
 
 /* Extract integer value from any integer atom as int64_t */
