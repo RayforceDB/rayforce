@@ -1974,6 +1974,189 @@ static test_result_t test_diff_group_determinism_workers(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * RADIX vs a SEQUENTIAL REFERENCE: values, keys and emit order, bit for bit.
+ *
+ * The radix route partitions every input chunk's rows into one payload array
+ * at exact offsets, so each partition holds its rows in ascending input
+ * order whatever the worker count.  Group emit order is first-seen order and
+ * every aggregate — the F64 SUM included, whose bits depend on the order its
+ * terms are added — must equal a plain left-to-right pass over the rows.
+ *
+ * The reference below is that pass, computed here with no engine code:
+ * groups numbered in first-seen order, I64 sum/count/min and an F64 sum
+ * accumulated in row order.  Each shape runs at several pool sizes, with and
+ * without a selection, and must take the radix route every time.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* Columns: a = sparse I64 (wide range → radix), b = sparse I32 with nulls,
+ * c = I16, s = SYM (W16), v = I64, f = F64. */
+static ray_t* rx_make_table(int64_t n) {
+    ray_t* a = ray_vec_new(RAY_I64, n); a->len = n;
+    ray_t* b = ray_vec_new(RAY_I32, n); b->len = n;
+    ray_t* c = ray_vec_new(RAY_I16, n); c->len = n;
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W16, n); s->len = n;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
+    int64_t syms[97];
+    for (int j = 0; j < 97; j++) {
+        char buf[16]; int m = snprintf(buf, sizeof(buf), "rx%d", j);
+        syms[j] = ray_sym_intern(buf, (size_t)m);
+    }
+    int64_t groups = n / 3 > 1 ? n / 3 : 1;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t g = (i * 7919) % groups;            /* scrambled first sight */
+        ((int64_t*)ray_data(a))[i] = g * 1000003 - 500000000;
+        ((int32_t*)ray_data(b))[i] = (int32_t)(((i * 31) % 40000) * 40009 - 800000000);
+        ((int16_t*)ray_data(c))[i] = (int16_t)(i % 7 - 3);
+        ray_write_sym(ray_data(s), i, (uint64_t)syms[(i * 13) % 97], RAY_SYM, s->attrs);
+        ((int64_t*)ray_data(v))[i] = (i * 7) % 1001 - 500;
+        ((double*)ray_data(f))[i] = (double)((i * 13) % 997) * 0.1 + 0.001;
+    }
+    for (int64_t i = 0; i < n; i += 9) ray_vec_set_null(b, i, true);
+    ray_t* tbl = ray_table_new(6);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("a", 1), a); ray_release(a);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("b", 1), b); ray_release(b);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("c", 1), c); ray_release(c);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), s); ray_release(s);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), v); ray_release(v);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), f); ray_release(f);
+    return tbl;
+}
+
+static ray_op_t* rx_group(ray_graph_t* g, const char* k0, const char* k1) {
+    ray_op_t* v = ray_scan(g, "v"); ray_op_t* f = ray_scan(g, "f");
+    uint16_t ops[] = { OP_SUM, OP_COUNT, OP_MIN, OP_SUM };
+    ray_op_t* ins[] = { v, v, v, f };
+    ray_op_t* keys[2] = { ray_scan(g, k0), k1 ? ray_scan(g, k1) : NULL };
+    return ray_group(g, keys, k1 ? 2 : 1, ops, ins, 4);
+}
+static ray_op_t* gb_rx_a(ray_graph_t* g)  { return rx_group(g, "a", NULL); }
+static ray_op_t* gb_rx_b(ray_graph_t* g)  { return rx_group(g, "b", NULL); }
+static ray_op_t* gb_rx_ca(ray_graph_t* g) { return rx_group(g, "c", "a"); }
+static ray_op_t* gb_rx_sa(ray_graph_t* g) { return rx_group(g, "s", "a"); }
+
+typedef struct { int64_t k[2]; int64_t sum, cnt, min; double fsum; } rx_ref_t;
+
+/* Sequential reference over the rows passing `mask` (NULL = all), in row
+ * order.  Returns the group count; *out receives groups in first-seen order. */
+static int64_t rx_reference(ray_t* tbl, const char* k0, const char* k1,
+                            const uint8_t* mask, rx_ref_t** out) {
+    int64_t n = ray_table_nrows(tbl);
+    ray_t* c0 = ray_table_get_col(tbl, ray_sym_intern(k0, strlen(k0)));
+    ray_t* c1 = k1 ? ray_table_get_col(tbl, ray_sym_intern(k1, strlen(k1))) : NULL;
+    const int64_t* v = ray_data(ray_table_get_col(tbl, ray_sym_intern("v", 1)));
+    const double* f = ray_data(ray_table_get_col(tbl, ray_sym_intern("f", 1)));
+    int64_t cap = 1;
+    while (cap < 2 * n) cap <<= 1;
+    int64_t* slot = malloc((size_t)cap * sizeof(int64_t));
+    rx_ref_t* g = malloc((size_t)(n > 0 ? n : 1) * sizeof(rx_ref_t));
+    for (int64_t i = 0; i < cap; i++) slot[i] = -1;
+    int64_t ng = 0;
+    for (int64_t r = 0; r < n; r++) {
+        if (mask && !mask[r]) continue;
+        int64_t k[2] = { col_read_i64(c0, r), c1 ? col_read_i64(c1, r) : 0 };
+        uint64_t h = (uint64_t)k[0] * 0x9E3779B97F4A7C15ULL ^ (uint64_t)k[1] * 0xC2B2AE3D27D4EB4FULL;
+        int64_t at = (int64_t)((h ^ (h >> 29)) & (uint64_t)(cap - 1));
+        while (slot[at] >= 0 && (g[slot[at]].k[0] != k[0] || g[slot[at]].k[1] != k[1]))
+            at = (at + 1) & (cap - 1);
+        if (slot[at] < 0) {
+            slot[at] = ng;
+            g[ng] = (rx_ref_t){ { k[0], k[1] }, 0, 0, INT64_MAX, 0.0 };
+            ng++;
+        }
+        rx_ref_t* e = &g[slot[at]];
+        e->sum += v[r]; e->cnt++;
+        if (v[r] < e->min) e->min = v[r];
+        e->fsum += f[r];
+    }
+    free(slot);
+    *out = g;
+    return ng;
+}
+
+static test_result_t rx_expect_reference(ray_t* out, const rx_ref_t* ref,
+                                         int64_t ng, int n_keys) {
+    TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "radix group failed");
+    TEST_ASSERT_FMT(ray_table_nrows(out) == ng, "groups %lld != reference %lld",
+                    (long long)ray_table_nrows(out), (long long)ng);
+    TEST_ASSERT_EQ_I(ray_table_ncols(out), n_keys + 4);
+    ray_t* sum = ray_table_get_col_idx(out, n_keys);
+    ray_t* cnt = ray_table_get_col_idx(out, n_keys + 1);
+    ray_t* mn  = ray_table_get_col_idx(out, n_keys + 2);
+    ray_t* fs  = ray_table_get_col_idx(out, n_keys + 3);
+    TEST_ASSERT_EQ_I(fs->type, RAY_F64);
+    for (int64_t r = 0; r < ng; r++) {
+        for (int k = 0; k < n_keys; k++)
+            TEST_ASSERT_FMT(col_read_i64(ray_table_get_col_idx(out, k), r) == ref[r].k[k],
+                            "row %lld key %d out of first-seen order", (long long)r, k);
+        TEST_ASSERT_FMT(((int64_t*)ray_data(sum))[r] == ref[r].sum, "row %lld sum", (long long)r);
+        TEST_ASSERT_FMT(((int64_t*)ray_data(cnt))[r] == ref[r].cnt, "row %lld count", (long long)r);
+        TEST_ASSERT_FMT(((int64_t*)ray_data(mn))[r] == ref[r].min, "row %lld min", (long long)r);
+        double got = ((double*)ray_data(fs))[r];
+        TEST_ASSERT_FMT(memcmp(&got, &ref[r].fsum, sizeof(double)) == 0,
+                        "row %lld f64 sum %.17g != sequential %.17g",
+                        (long long)r, got, ref[r].fsum);
+    }
+    PASS();
+}
+
+static test_result_t test_radix_matches_sequential_reference(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_agg_engine_v2 = true;
+    static const struct {
+        const char* k0; const char* k1; group_builder_t build;
+    } shapes[] = {
+        { "a", NULL, gb_rx_a  },   /* sparse I64 */
+        { "b", NULL, gb_rx_b  },   /* nullable I32 */
+        { "c", "a",  gb_rx_ca },   /* multi-key I16 + I64 */
+        { "s", "a",  gb_rx_sa },   /* SYM + I64 */
+    };
+    /* {pool size, rows}: the 16-way run has enough chunks × partitions to
+     * take the parallel prefix sum. */
+    static const struct { uint32_t workers; int64_t rows; int shapes; } runs[] = {
+        { 2, 100000, 4 }, { 3, 100000, 4 }, { 8, 100000, 4 }, { 16, 1100000, 1 },
+    };
+    test_result_t res = (test_result_t){ TEST_PASS, NULL };
+    for (size_t w = 0; w < sizeof(runs) / sizeof(runs[0]) && res.status == TEST_PASS; w++) {
+        ray_pool_destroy();
+        ray_pool_init_total(runs[w].workers);
+        int64_t n = runs[w].rows;
+        ray_t* tbl = rx_make_table(n);
+        uint8_t* mask = malloc((size_t)n);
+        for (int64_t i = 0; i < n; i++) mask[i] = (i % 5) != 2 && (i / 4096) % 7 != 3;
+        for (int s = 0; s < runs[w].shapes && res.status == TEST_PASS; s++) {
+            for (int selected = 0; selected < 2 && res.status == TEST_PASS; selected++) {
+                rx_ref_t* ref = NULL;
+                int64_t ng = rx_reference(tbl, shapes[s].k0, shapes[s].k1,
+                                          selected ? mask : NULL, &ref);
+                agg_route_reset();
+                ray_t* out;
+                if (selected) {
+                    out = run_group_with_sel(tbl, shapes[s].build, mask, n, true);
+                } else {
+                    ray_graph_t* g = ray_graph_new(tbl);
+                    out = ray_execute(g, shapes[s].build(g));
+                    if (out && ray_is_lazy(out)) out = ray_lazy_materialize(out);
+                    ray_graph_free(g);
+                }
+                if (agg_route_stats().routes[AGG_ROUTE_V2_RADIX] != 1)
+                    res = (test_result_t){ TEST_FAIL, "shape did not take the radix route" };
+                else
+                    res = rx_expect_reference(out, ref, ng, shapes[s].k1 ? 2 : 1);
+                if (out) ray_release(out);
+                free(ref);
+            }
+        }
+        free(mask);
+        ray_release(tbl);
+    }
+    ray_pool_destroy();
+    ray_pool_init(0);
+    ray_sym_destroy(); ray_heap_destroy();
+    return res;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * PEARSON r-vs-r² DISCOVERY + v2/old differential.
  *
  * DISCOVERY: build a single perfectly anti-correlated group — key all same,
@@ -2248,6 +2431,7 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_radix_median",     test_diff_group_radix_median,     NULL, NULL },
     { "diff_group_radix_top2",       test_diff_group_radix_top2,       NULL, NULL },
     { "diff_group_determinism_workers", test_diff_group_determinism_workers, NULL, NULL },
+    { "radix_matches_sequential_reference", test_radix_matches_sequential_reference, NULL, NULL },
     { "sel_i64_sum",                 test_sel_i64_sum,                 NULL, NULL },
     { "sel_i64_count",               test_sel_i64_count,               NULL, NULL },
     { "sel_i64_four",                test_sel_i64_four,                NULL, NULL },

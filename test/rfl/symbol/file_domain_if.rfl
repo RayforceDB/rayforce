@@ -55,4 +55,31 @@
 ;; the empty symbol (a null cell) survives the translation on either side
 (set A6 (select {from: F k: (if (> v 50) ref 'x)}))
 (== (count (select {from: A6 where: (== k "")})) (count (select {from: T where: (and (> v 50) (== ref ""))}))) -- true
-(.sys.exec "rm -rf /tmp/rfl_fdom_if/") -- 0
+
+;; a symbol column against a string literal or a string column answers
+;; STR, each row's text taken from its side — on the pool past the
+;; parallel threshold, the FILE domain's vocabulary read in place and the
+;; in-memory column's text read from the symbol table, nothing interned.
+;; Nulls ("" cells) on the symbol side.  Oracle: the scalar `if` row by row.
+(.sys.exec "rm -rf /tmp/rfl_fdom_if_x/") -- 0
+(set rs (as 'STR ref2))
+(set TX (table [ref s v] (list ref rs v)))
+(.db.splayed.set "/tmp/rfl_fdom_if_x/" TX)
+(set FX (.db.splayed.get "/tmp/rfl_fdom_if_x/"))
+(set O1 (as 'STR (map (fn [k] (if (> (at v k) 50) (as 'STR (at ref k)) "")) i)))
+(set C1 (select {from: F k: (if (> v 50) ref "")}))
+(type (at C1 'k)) -- 'STR
+(all (== (at C1 'k) O1)) -- true
+(all (== (at (select {from: T k: (if (> v 50) ref "")}) 'k) O1)) -- true
+(set O2 (as 'STR (map (fn [k] (if (== 0 (% (at v k) 3)) (at rs k) (as 'STR (at ref k)))) i)))
+(all (== (at (select {from: FX k: (if (== 0 (% v 3)) s ref)}) 'k) O2)) -- true
+(all (== (at (select {from: TX k: (if (== 0 (% v 3)) s ref)}) 'k) O2)) -- true
+(set O3 (as 'STR (map (fn [k] (if (> (at v k) 20) "abc" (at rs k))) i)))
+(all (== (at (select {from: FX k: (if (> v 20) 'abc s)}) 'k) O3)) -- true
+;; under a dense where: (pooled over the table, then filtered), a sparse
+;; one (row by row over the passing rows) and an empty one
+(set OW (fn [p] (at (select {from: (table [k v] (list O1 v)) where: (p v)}) 'k)))
+(all (== (at (select {from: F k: (if (> v 50) ref "") where: (> v 10)}) 'k) (OW (fn [x] (> x 10))))) -- true
+(all (== (at (select {from: F k: (if (> v 50) ref "") where: (== v 77)}) 'k) (OW (fn [x] (== x 77))))) -- true
+(count (select {from: F k: (if (> v 50) ref "") where: (> v 1000)})) -- 0
+(.sys.exec "rm -rf /tmp/rfl_fdom_if/ /tmp/rfl_fdom_if_x/") -- 0
