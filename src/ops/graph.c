@@ -437,7 +437,13 @@ static bool type_is_temporal(int8_t t) {
     return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
 }
 
+/* GUID has no numeric promotion: two GUID branches keep the type, and a
+ * GUID beside anything else has no column type.  promote() used to fall
+ * through to BOOL for it, and the fill then read the 16-byte cells as
+ * bytes (#691).  -1 for the mixed case so ray_if declines the node and
+ * the projection falls back to the interpreter. */
 static int8_t promote_if_type(int8_t a, int8_t b) {
+    if (a == RAY_GUID || b == RAY_GUID) return a == b ? RAY_GUID : -1;
     if (a == b && type_is_temporal(a)) return a;
     return promote(a, b);
 }
@@ -509,12 +515,26 @@ ray_op_t* ray_max2(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return make_binary
 ray_op_t* ray_in(ray_graph_t* g, ray_op_t* col, ray_op_t* set){ return make_binary(g, OP_IN, col, set, RAY_BOOL); }
 ray_op_t* ray_not_in(ray_graph_t* g, ray_op_t* col, ray_op_t* set){ return make_binary(g, OP_NOT_IN, col, set, RAY_BOOL); }
 
+static bool if_branch_is_list_scan(ray_graph_t* g, ray_op_t* b) {
+    if (!b || b->opcode != OP_SCAN || !g->table) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    if (!ext) return false;
+    ray_t* col = ray_table_get_col(g->table, ext->sym);
+    return col && col->type == RAY_LIST;
+}
+
 ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* else_val) {
     /* 3-input node: cond, then, else — needs ext node */
     uint32_t cond_id = cond->id;
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
     int8_t out_type = promote_if_type(then_val->out_type, else_val->out_type);
+    if (out_type < 0) return NULL;
+    /* A LIST column scans as the untyped node (out_type 0), which promote()
+     * also folds to BOOL and the fill then reads the cell pointers as bytes.
+     * No fill exists for ragged cells: decline so the projection falls back. */
+    if (if_branch_is_list_scan(g, then_val) || if_branch_is_list_scan(g, else_val))
+        return NULL;
     /* IF preserves string types: promote() handles RAY_STR (wins over SYM);
      * SYM override only applies when neither side is RAY_STR */
     if (out_type != RAY_STR &&

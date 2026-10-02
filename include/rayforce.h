@@ -362,6 +362,8 @@ void     ray_free_raw(void* p);
 /* ===== System memory ===== */
 
 int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informational) */
+int64_t  ray_sys_ram_limit(void);   /* RAM this process may use: min(physical RAM,
+                                     * container/cgroup limit); the default anon watermark */
 
 /* ===== Interrupt API =====
  * Long-running queries poll ray_interrupted() at morsel granularity

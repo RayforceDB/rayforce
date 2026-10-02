@@ -2987,10 +2987,16 @@ static ray_t* exec_group_v2_parallel_smallhash(
  * so each can be grouped+accumulated fully in parallel with NO cross-partition
  * merge — eliminating the serial Phase-B bottleneck of the hash path.
  *
- *   Phase 1 (parallel over rows): scatter each row's INDEX into a per-(worker,
- *            partition) growable int64 buffer keyed by the hash partition.
- *   Phase 2 (parallel over partitions): gather all workers' index buffers for
- *            partition p; build a small open-addressing hash over those rows
+ *   Phase 1 (parallel over fixed input chunks): two-pass radix partitioning
+ *            with exact offsets.  Pass 1 counts, per (chunk, partition), the
+ *            rows hashing to each partition; a prefix sum turns the counts into
+ *            each (chunk, partition)'s exact slot range inside ONE payload
+ *            array allocated once; pass 2 reads back each row's partition id
+ *            (stored by pass 1) and writes its packed record at its slot.
+ *            Partition p's records are contiguous and in ascending input
+ *            order (chunk order, then row order).
+ *   Phase 2 (parallel over partitions): walk partition p's contiguous
+ *            records; build a small open-addressing hash over those rows
  *            (keys disjoint from other partitions); assign partition-local gids
  *            (first_row = MIN row), init each agg state on first key sight,
  *            batch-update each agg from a gathered value column.
@@ -3012,31 +3018,38 @@ static uint32_t agg_radix_part_count(uint32_t nworkers, int64_t nrows) {
     return n;
 }
 
-/* Growable contiguous PAYLOAD buffer (per worker, per partition).  Phase 1
- * scatters one fixed-size record per row instead of a bare row index: the
- * record packs [n_keys×int64 widened keys][agg input value(s) at native esz]
- * [row_idx int64].  Phase 2 then groups+accumulates each partition by walking
- * its records SEQUENTIALLY — hash/equality compare the contiguous packed keys
- * and accumulation reads values from the contiguous record — trading a one-time
- * scatter cost for cache-friendly Phase-2 reads (the memory-bound hot spot was
- * agg_tuple_eq re-reading scattered key columns on every distinct insert). */
-typedef struct { char* buf; uint32_t n, cap; } agg_pay_buf_t;  /* n = #records */
+/* PAYLOAD layout.  Phase 1 scatters one fixed-size record per row instead of a
+ * bare row index: the record packs [n_keys×int64 widened keys][agg input
+ * value(s) at native esz][row_idx int64].  Phase 2 then groups+accumulates each
+ * partition by walking its records SEQUENTIALLY — hash/equality compare the
+ * contiguous packed keys and accumulation reads values from the contiguous
+ * record — trading a one-time scatter cost for cache-friendly Phase-2 reads
+ * (the memory-bound hot spot was agg_tuple_eq re-reading scattered key columns
+ * on every distinct insert).
+ *
+ * All records live in ONE array of input_count records, partition-major:
+ * partition p owns records [part_start[p], part_start[p+1]).  Inside p, the
+ * slots are carved per input chunk in chunk order, so a partition's records
+ * appear in ascending input order no matter which worker ran which chunk.
+ * The allocation count is O(1) in the worker count: no per-(worker,
+ * partition) buffers to grow, and nothing for the dispatcher to free one by
+ * one. */
 
-/* Reserve room for one more record of `rec` bytes; returns dest ptr or NULL. */
-static char* agg_pay_reserve(agg_pay_buf_t* b, size_t rec, uint32_t cap0) {
-    if (b->n == b->cap) {
-        if (b->cap > UINT32_MAX / 2) return NULL;
-        /* First allocation jumps straight to the caller's expected row count
-         * (uniform-hash estimate).  Growing 1->2->4->... instead re-copies the
-         * whole payload ~2x across tens of thousands of per-(worker,partition)
-         * buffers — the memmove was 23% of ClickBench q17. */
-        uint32_t nc = b->cap ? b->cap * 2 : (cap0 ? cap0 : 1);
-        char* nb = ray_realloc_raw(b->buf, (size_t)nc * rec);
-        if (!nb) return NULL;
-        b->buf = nb; b->cap = nc;
-    }
-    return b->buf + (size_t)b->n++ * rec;
-}
+/* Input rows per phase-1 chunk, at least.  Chunks are the unit of both the
+ * counting and the scatter pass, and the count matrix holds one uint32 per
+ * (chunk, partition), so chunks are few (a handful per worker) but never so
+ * small that the per-chunk partition row dwarfs the rows it counts. */
+#define AGG_RADIX_CHUNK_MIN_ROWS  16384
+/* ...but an input of at least this many rows per worker still gives every
+ * worker a chunk, so mid-size inputs count and scatter on the whole pool. */
+#define AGG_RADIX_CHUNK_FLOOR_ROWS 4096
+#define AGG_RADIX_CHUNKS_PER_WORKER 4
+/* Count-matrix budget: chunks are reduced (never below one per worker) so
+ * n_chunks × n_parts × 4 bytes stays under this. */
+#define AGG_RADIX_COUNT_BUDGET  ((size_t)64 << 20)
+/* Partitions per prefix-sum task (one cache-line-friendly band of each
+ * chunk's count row). */
+#define AGG_RADIX_PREFIX_BAND   64
 
 /* Per-partition result slot (filled by Phase 2). */
 typedef struct {
@@ -3154,11 +3167,21 @@ typedef struct {
     uint32_t            part_bits;  /* log2(n_parts): hash bits consumed by
                                      * partition selection; phase 2 shifts
                                      * them out before slot indexing */
-    uint32_t            pay_prime;  /* expected rows per (worker,partition)
-                                     * buffer — first-allocation capacity */
-    agg_pay_buf_t*      bufs;       /* [nw * n_parts] payload records */
+    /* Phase-1 chunking of the input space [0, n_in) (selected-row space in
+     * sel mode): chunk c covers [c*chunk_rows, min((c+1)*chunk_rows, n_in)). */
+    int64_t             n_in;
+    int64_t             chunk_rows;
+    uint32_t            n_chunks;
+    /* [n_chunks * n_parts]: pass 1 stores per-(chunk, partition) row counts;
+     * the prefix pass turns them into each chunk's offset inside partition
+     * p's slot range; pass 2 uses its chunk's row as write cursors. */
+    uint32_t*           cnt;
+    int64_t*            part_start; /* [n_parts + 1] record index of p's slots */
+    char*               pay;        /* [n_in * rec] payload records */
+    uint16_t*           pid;        /* [n_in] partition of each input position
+                                     * (pass 1 writes, pass 2 reads) */
     agg_radix_part_t*   parts;      /* [n_parts] */
-    int                 phase1_oom; /* set by any Phase-1 worker on push failure */
+    _Atomic(int)        part_overflow; /* a partition exceeds UINT32_MAX rows */
     /* Per-row payload record layout (bytes), computed once by the caller:
      *   [0 .. n_keys*8)         packed keys (each widened via agg_read_key_i64)
      *   [val_off[a] ..]         agg a's input value at native esz (if val_data[a])
@@ -3176,12 +3199,6 @@ typedef struct {
      * the decoded original row. */
     ray_t*              sel;
     const int64_t*      sel_prefix;
-    /* Per-WORKER key-staging row: [nw * n_keys] int64.  The scatter reads all
-     * keys into its worker's slice to compute the partition hash, THEN copies
-     * them into the reserved record (the record's partition is not known until
-     * the hash is computed, so the keys can't be written straight to it).  One
-     * carve for the whole dispatch (caller-owned) — never a per-row alloc. */
-    int64_t*            kv_scratch;
 } agg_radix_ctx_t;
 
 /* Avalanche finalizer shared by the radix scatter (partition selection) and
@@ -3197,26 +3214,39 @@ static inline uint64_t agg_radix_fmix64(uint64_t h) {
     return h;
 }
 
-/* Scatter one ORIGINAL row r's packed payload record into the worker's per-
- * partition buffer.  Returns 0 or -1 on push OOM (sets phase1_oom). */
-static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
-                                        int64_t* kv, int64_t r,
-                                        int64_t input_order) {
+/* Visit one ORIGINAL row r at input position `pos`.
+ *
+ * Pass 1 (scatter == false) hashes the key tuple, records the partition in
+ * pid[pos] and counts the row in its partition's cell of this chunk's count
+ * row.  Pass 2 (scatter == true) reads the partition back from pid[pos] and
+ * writes the packed record at the chunk's next slot of that partition.
+ *
+ * Storing the partition id (2 bytes per row, freed after pass 2) instead of
+ * re-hashing in pass 2 measured 15-25% faster for phase 1: the destination
+ * address no longer waits on the key load -> FNV -> fmix chain, so the
+ * scattered stores issue back to back, and the keys go straight from the
+ * column into the record with no staging row. */
+RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
+                                int64_t r, int64_t pos, bool scatter) {
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
-    /* kv: this worker's key-staging slice (c->kv_scratch + wid*n_keys), sized
-     * for any key count — no fixed [16] cap. */
-    uint64_t h = 1469598103934665603ULL;
-    for (uint32_t k = 0; k < n_keys; k++) {
-        int64_t v = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
-        kv[k] = v;
-        h ^= (uint64_t)v; h *= 1099511628211ULL;
+    if (!scatter) {
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            int64_t v = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+            h ^= (uint64_t)v; h *= 1099511628211ULL;
+        }
+        h = agg_radix_fmix64(h);
+        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
+        c->pid[pos] = (uint16_t)p;
+        cur[p]++;
+        return;
     }
-    h = agg_radix_fmix64(h);
-    uint32_t p = (uint32_t)(h & (c->n_parts - 1));
-    char* rec = agg_pay_reserve(&my[p], c->rec, c->pay_prime);
-    if (!rec) { c->phase1_oom = 1; return -1; }
+    uint32_t p = c->pid[pos];
+    char* rec = c->pay + (size_t)(c->part_start[p] + cur[p]++) * c->rec;
     int64_t* kdst = (int64_t*)rec;
-    for (uint32_t k = 0; k < n_keys; k++) kdst[k] = kv[k];
+    for (uint32_t k = 0; k < n_keys; k++)
+        kdst[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+    int64_t input_order = pos;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (c->val_data[a]) {
             uint8_t ez = c->val_esz[a];
@@ -3229,55 +3259,76 @@ static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
     }
     if (c->needs_row)
         memcpy(rec + c->row_off, &input_order, sizeof(input_order));
-    return 0;
 }
 
-/* Scatter this worker's [start,end) rows, staging each row's keys through kv.
- * static inline so each caller below inlines its own copy: when the stack
- * array is passed, kv's alloca provenance reaches the per-row kv[k]=v stage
- * unmerged and the compiler scalarizes/register-promotes it (parent codegen);
- * a heap slice stays compiler-opaque (may alias key_data/rec/bufs).
- * RAY_INLINE (always_inline) so both call sites below get their own copy —
- * an out-of-line body would merge the two provenances into one pointer param
- * and re-pessimize the stack path. */
-RAY_INLINE void agg_radix_scatter_range(agg_radix_ctx_t* c, agg_pay_buf_t* my,
-                                        int64_t* kv, int64_t start, int64_t end) {
+/* Run one pass over chunk `ch`: input positions [start,end) in chunk order
+ * (selected-row ordinals in sel mode, decoded to original rows).  RAY_INLINE
+ * and `scatter` constant at both call sites, so the count and the scatter
+ * loops specialize.  A chunk's count row doubles as its pass-2 write cursors
+ * and is touched only by the task running that chunk. */
+RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatter) {
+    int64_t start = ch * c->chunk_rows;
+    int64_t end = start + c->chunk_rows;
+    if (end > c->n_in) end = c->n_in;
+    uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+    if (!scatter) memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
     if (c->sel) {
-        /* Chunk-decode this worker's slice of selected rows; scatter each. */
         int64_t rows[AGG_SEL_CHUNK];
-        agg_sel_cursor_t cur;
-        agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
-        int64_t input_order = start;
+        agg_sel_cursor_t sc;
+        agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, start, end);
+        int64_t pos = start;
         int64_t cn;
-        while ((cn = agg_sel_cursor_next(&cur, rows)) > 0)
+        while ((cn = agg_sel_cursor_next(&sc, rows)) > 0)
             for (int64_t i = 0; i < cn; i++)
-                if (agg_radix_scatter_one(c, my, kv, rows[i],
-                                          input_order++) != 0) return;
+                agg_radix_visit(c, cur, rows[i], pos++, scatter);
         return;
     }
     for (int64_t r = start; r < end; r++)
-        if (agg_radix_scatter_one(c, my, kv, r, r) != 0) return;
+        agg_radix_visit(c, cur, r, r, scatter);
 }
 
-/* Phase 1: scatter one packed payload record per row into per-(worker,
- * partition) contiguous buffers, keyed by the tuple-hash partition. */
-static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+/* Phase 1, pass 1: count each chunk's rows per partition. */
+static void agg_radix_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    for (int64_t ch = start; ch < end; ch++)
+        agg_radix_chunk_pass((agg_radix_ctx_t*)vctx, ch, false);
+}
+
+/* Phase 1, prefix: for a band of partitions, turn every chunk's count into
+ * its offset inside the partition (exclusive scan down the chunks, so chunk
+ * order — ascending input order — is the slot order) and store the
+ * partition's total in part_start[p + 1] for the caller's scan. */
+static void agg_radix_prefix_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
     agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
-    agg_pay_buf_t* my = &c->bufs[(size_t)wid * c->n_parts];
-    /* Key-staging row for this worker.  The common bounded case (n_keys <= 16)
-     * stages through a STACK array: a compiler-opaque heap slice defeated the
-     * scalarization/register-promotion of the per-row kv[k]=v stage (flat
-     * retired instructions, IPC 0.71->0.58, scatter self-time tripled — see
-     * task-9-rca.md).  Branch ONCE here (not per row) so each inlined copy of
-     * agg_radix_scatter_range gets its argument's provenance unmerged: the
-     * stack call restores parent codegen (and drops the secondary false-sharing
-     * term); wide keys (>16) fall back to the per-worker heap slice. */
-    if (c->n_keys <= 16) {
-        int64_t kv_stk[16];
-        agg_radix_scatter_range(c, my, kv_stk, start, end);
-    } else {
-        agg_radix_scatter_range(c, my, &c->kv_scratch[(size_t)wid * c->n_keys], start, end);
+    for (int64_t band = start; band < end; band++) {
+        uint32_t p0 = (uint32_t)band * AGG_RADIX_PREFIX_BAND;
+        uint32_t np = c->n_parts - p0;
+        if (np > AGG_RADIX_PREFIX_BAND) np = AGG_RADIX_PREFIX_BAND;
+        uint64_t run[AGG_RADIX_PREFIX_BAND] = {0};
+        for (uint32_t ch = 0; ch < c->n_chunks; ch++) {
+            uint32_t* row = c->cnt + (size_t)ch * c->n_parts + p0;
+            for (uint32_t j = 0; j < np; j++) {
+                uint32_t n = row[j];
+                row[j] = (uint32_t)run[j];
+                run[j] += n;
+            }
+        }
+        for (uint32_t j = 0; j < np; j++) {
+            /* Offsets are uint32 and phase 2 indexes a partition's rows with
+             * 32-bit gids: a partition past that bound takes the fallback. */
+            if (run[j] > UINT32_MAX)
+                atomic_store_explicit(&c->part_overflow, 1, memory_order_relaxed);
+            c->part_start[p0 + j + 1] = (int64_t)run[j];
+        }
     }
+}
+
+/* Phase 1, pass 2: write each chunk's packed records at their exact slots. */
+static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    for (int64_t ch = start; ch < end; ch++)
+        agg_radix_chunk_pass((agg_radix_ctx_t*)vctx, ch, true);
 }
 
 /* Phase 2: group + accumulate one partition by walking its packed payload
@@ -3296,10 +3347,8 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
         uint32_t p = (uint32_t)pi;
         agg_radix_part_t* pr = &c->parts[p];
 
-        /* Total rows hashing to p across all workers. */
-        int64_t total = 0;
-        for (uint32_t w = 0; w < c->nw; w++)
-            total += c->bufs[(size_t)w * c->n_parts + p].n;
+        /* Rows hashing to p: its contiguous slot range, in input order. */
+        int64_t total = c->part_start[p + 1] - c->part_start[p];
         if (total == 0) continue;
 
         /* Open-addressing hash sized to next_pow2(2*total). */
@@ -3350,10 +3399,9 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
         }
 
         int64_t ng = 0, ri = 0;
-        for (uint32_t w = 0; w < c->nw; w++) {
-            agg_pay_buf_t* b = &c->bufs[(size_t)w * c->n_parts + p];
-            const char* rec = b->buf;
-            for (uint32_t i = 0; i < b->n; i++, rec += c->rec) {
+        {
+            const char* rec = c->pay + (size_t)c->part_start[p] * c->rec;
+            for (int64_t i = 0; i < total; i++, rec += c->rec) {
                 const int64_t* keys = (const int64_t*)rec;
                 int64_t r = 0;
                 if (c->needs_row) memcpy(&r, rec + c->row_off, sizeof(r));
@@ -3925,16 +3973,13 @@ static ray_t* exec_group_v2_parallel_radix(
     bool needs_row = true;
 
     /* Per-row payload record layout: [packed keys][agg values][row_idx?].
-     * val_off/val2_off are per-dispatch (filled once here, read by workers).
-     * The same carve tails a per-worker key-staging block (nw*n_keys int64,
-     * both 8-byte) so kv_scratch shares off_hdr's lifetime — one free, no extra
-     * exit sites.  Only phases 1-2 read either; both freed once phase 2 joins. */
+     * val_off/val2_off are per-dispatch (filled once here, read by workers);
+     * only phases 1-2 read them, freed once phase 2 joins. */
     ray_t* off_hdr;
     size_t* val_off = (size_t*)scratch_calloc(&off_hdr,
-        2u * (size_t)n_aggs * sizeof(size_t) + (size_t)nw * (size_t)n_keys * sizeof(int64_t));
+        2u * (size_t)(n_aggs ? n_aggs : 1) * sizeof(size_t));
     if (!val_off) { agg_desc_free(&d); return ray_error("oom", NULL); }
     size_t* val2_off = val_off + n_aggs;
-    int64_t* kv_scratch = (int64_t*)(val2_off + n_aggs);   /* [nw * n_keys] */
     size_t rec_cur = (size_t)n_keys * 8;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (val_data[a])  { val_off[a]  = rec_cur; rec_cur += val_esz[a]; }
@@ -3943,16 +3988,46 @@ static ray_t* exec_group_v2_parallel_radix(
     size_t row_off = rec_cur; if (needs_row) rec_cur += 8;
     size_t rec = (rec_cur + 7u) & ~(size_t)7u;   /* 8-align records */
 
-    uint32_t n_parts = agg_radix_part_count(nw, sel ? n_sel : nrows);
-    size_t nbuf = (size_t)nw * n_parts;
-    agg_pay_buf_t*    bufs  = ray_calloc_raw((size_t)(nbuf) * (sizeof(agg_pay_buf_t)));
+    int64_t n_in = sel ? n_sel : nrows;
+    if (n_in < 0) n_in = 0;
+    uint32_t n_parts = agg_radix_part_count(nw, n_in);
+    /* Partition ids are stored as uint16 between the passes.  Only inputs
+     * past 2^32 rows ask for more partitions; they get larger ones. */
+    if (n_parts > 65536) n_parts = 65536;
+
+    /* Phase-1 chunks: a few per worker so claiming balances uneven rows,
+     * bounded by the count-matrix budget and by a minimum chunk size, and
+     * small enough that a chunk's per-partition count fits uint32. */
+    uint64_t want = (uint64_t)nw * AGG_RADIX_CHUNKS_PER_WORKER;
+    uint64_t by_budget = AGG_RADIX_COUNT_BUDGET / ((uint64_t)n_parts * sizeof(uint32_t));
+    if (want > by_budget) want = by_budget;
+    if (want < nw) want = nw;
+    uint64_t by_rows = ((uint64_t)n_in + AGG_RADIX_CHUNK_MIN_ROWS - 1) / AGG_RADIX_CHUNK_MIN_ROWS;
+    if (by_rows < nw && (uint64_t)n_in >= (uint64_t)nw * AGG_RADIX_CHUNK_FLOOR_ROWS)
+        by_rows = nw;
+    if (want > by_rows) want = by_rows;
+    uint64_t by_width = (uint64_t)n_in / ((uint64_t)1 << 30) + 1;
+    if (want < by_width) want = by_width;
+    if (want < 1) want = 1;
+    int64_t chunk_rows = (int64_t)(((uint64_t)n_in + want - 1) / want);
+    if (chunk_rows < 1) chunk_rows = 1;
+    uint32_t n_chunks = (uint32_t)((n_in + chunk_rows - 1) / chunk_rows);
+
+    /* O(1) allocations whatever the worker count: the count matrix and the
+     * partition ids live until pass 2 ends, the payload until phase 2 ends. */
     agg_radix_part_t* parts = ray_calloc_raw((size_t)n_parts * sizeof(agg_radix_part_t));
-    if (!bufs || !parts) {
-        ray_free_raw(bufs); ray_free_raw(parts);
+    uint32_t* cnt = ray_alloc_raw((size_t)(n_chunks ? n_chunks : 1) * n_parts * sizeof(uint32_t));
+    int64_t* part_start = ray_alloc_raw(((size_t)n_parts + 1) * sizeof(int64_t));
+    uint16_t* pid = ray_alloc_raw((size_t)(n_in ? n_in : 1) * sizeof(uint16_t));
+    char* pay = ray_alloc_raw((size_t)(n_in ? n_in : 1) * rec);
+    if (!parts || !cnt || !part_start || !pid || !pay) {
+        ray_free_raw(parts); ray_free_raw(cnt); ray_free_raw(part_start);
+        ray_free_raw(pid); ray_free_raw(pay);
         scratch_free(off_hdr); agg_desc_free(&d);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
     }
+    part_start[0] = 0;
 
     agg_radix_ctx_t ctx = {
         .key_cols = key_cols, .key_data = key_data, .n_keys = n_keys,
@@ -3961,40 +4036,62 @@ static ray_t* exec_group_v2_parallel_radix(
         .val2_data = val2_data, .val2_types = val2_types, .val2_hasnull = val2_hasnull, .val2_esz = val2_esz,
         .nw = nw, .n_parts = n_parts,
         .part_bits = (uint32_t)__builtin_ctz(n_parts),
-        /* Uniform-hash expectation with 25% slack; ≥8 so tiny buffers don't
-         * immediately re-double. */
-        .pay_prime = (uint32_t)((uint64_t)(sel ? n_sel : nrows)
-                                / ((uint64_t)nw * n_parts) * 5 / 4 + 8),
-        .bufs = bufs, .parts = parts, .phase1_oom = 0,
+        .n_in = n_in, .chunk_rows = chunk_rows, .n_chunks = n_chunks,
+        .cnt = cnt, .part_start = part_start, .pay = pay, .pid = pid,
+        .parts = parts,
         .rec = rec, .row_off = row_off, .needs_row = needs_row,
         .sel = sel, .sel_prefix = sel_prefix,
         .val_off = val_off, .val2_off = val2_off,
-        .kv_scratch = kv_scratch,
     };
+    atomic_init(&ctx.part_overflow, 0);
 
-    /* Phase 1: scatter.  Sel mode dispatches over selected-row space [0,n_sel);
-     * each worker decodes its slice of selected rows to ORIGINAL indices. */
-    ray_pool_dispatch(pool, agg_radix_scatter_fn, &ctx, sel ? n_sel : nrows);
+    /* Phase 1, pass 1: per-(chunk, partition) counts.  Sel mode chunks the
+     * selected-row space [0,n_sel); each chunk decodes its selected rows to
+     * ORIGINAL indices.  A cancelled dispatch skips chunks and leaves their
+     * count rows and ids unset, so nothing past it may run. */
+    ray_pool_dispatch_n(pool, agg_radix_count_fn, &ctx, n_chunks);
+    bool cancelled = pool_cancelled(pool);
+    if (!cancelled) {
+        uint32_t n_bands = (n_parts + AGG_RADIX_PREFIX_BAND - 1) / AGG_RADIX_PREFIX_BAND;
+        if (n_bands > 1 && (uint64_t)n_chunks * n_parts >= ((uint64_t)1 << 16))
+            ray_pool_dispatch_n(pool, agg_radix_prefix_fn, &ctx, n_bands);
+        else
+            agg_radix_prefix_fn(&ctx, 0, 0, n_bands);
+        cancelled = pool_cancelled(pool);
+    }
+    int oom = atomic_load_explicit(&ctx.part_overflow, memory_order_relaxed);
+    if (!cancelled && !oom) {
+        for (uint32_t p = 0; p < n_parts; p++) part_start[p + 1] += part_start[p];
+        /* Pass 2: every record to its exact slot. */
+        ray_pool_dispatch_n(pool, agg_radix_scatter_fn, &ctx, n_chunks);
+        cancelled = pool_cancelled(pool);
+    }
+    ray_free_raw(cnt); ctx.cnt = NULL;
+    ray_free_raw(pid); ctx.pid = NULL;
     ray_profile_tick("radix: scattered rows");
 
     /* Phase 2: per-partition group+accumulate. */
-    int oom = ctx.phase1_oom;
-    if (!oom)
+    if (!cancelled && !oom)
         ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, n_parts);
-    if (!oom)
+    if (!cancelled && !oom) {
+        cancelled = pool_cancelled(pool);
         for (uint32_t p = 0; p < n_parts; p++)
             if (parts[p].oom) { oom = 1; break; }
+    }
 
     ray_profile_tick("radix: reduced partitions");
 
-    /* Phases 1+2 done (both dispatches joined); val_off/val2_off no longer read. */
+    /* Phases 1+2 done (every dispatch joined); val_off/val2_off and the
+     * payload records are no longer read — groups keep copies of their keys. */
     scratch_free(off_hdr);
+    ray_free_raw(pay); ctx.pay = NULL;
+    ray_free_raw(part_start); ctx.part_start = NULL;
 
-    if (oom) {
+    if (cancelled || oom) {
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-        ray_free_raw(bufs); ray_free_raw(parts);
+        ray_free_raw(parts);
         agg_desc_free(&d);
+        if (cancelled) return ray_error("cancel", NULL);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
     }
@@ -4030,8 +4127,7 @@ static ray_t* exec_group_v2_parallel_radix(
             route_stats.topn_kept = kept;
         } else if (rc == 1) {
             agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-            ray_free_raw(bufs); ray_free_raw(parts);
+            ray_free_raw(parts);
             agg_desc_free(&d);
             return ray_error("oom", NULL);
         }
@@ -4046,8 +4142,7 @@ static ray_t* exec_group_v2_parallel_radix(
                 parts, n_parts, input_count, n_emit, &rc);
         if (!sel_pairs) {
             agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-            ray_free_raw(bufs); ray_free_raw(parts);
+            ray_free_raw(parts);
             agg_desc_free(&d);
             return rc == 1 ? ray_error("oom", NULL)
                            : ray_error("group", "failed to order radix groups");
@@ -4058,8 +4153,7 @@ static ray_t* exec_group_v2_parallel_radix(
         (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
     if (!pairs) {
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-        ray_free_raw(bufs); ray_free_raw(parts);
+        ray_free_raw(parts);
         agg_desc_free(&d);
         return ray_error("oom", NULL);
     }
@@ -4147,8 +4241,7 @@ static ray_t* exec_group_v2_parallel_radix(
     if (!order_ok) {
         ray_free_raw(pairs);
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-        ray_free_raw(bufs); ray_free_raw(parts);
+        ray_free_raw(parts);
         agg_desc_free(&d);
         return ray_error("group", "failed to order radix groups");
     }
@@ -4159,8 +4252,7 @@ static ray_t* exec_group_v2_parallel_radix(
     if (!result || RAY_IS_ERR(result)) {
         ray_free_raw(pairs);
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-        ray_free_raw(bufs); ray_free_raw(parts);
+        ray_free_raw(parts);
         agg_desc_free(&d);
         return result ? result : ray_error("oom", NULL);
     }
@@ -4210,8 +4302,7 @@ static ray_t* exec_group_v2_parallel_radix(
         scratch_free(kouts_hdr);
         ray_free_raw(pairs);
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-        ray_free_raw(bufs); ray_free_raw(parts);
+        ray_free_raw(parts);
         agg_desc_free(&d);
         ray_release(result); return kerr;
     }
@@ -4230,8 +4321,7 @@ static ray_t* exec_group_v2_parallel_radix(
     if (!outs) {
         ray_free_raw(pairs);
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-        ray_free_raw(bufs); ray_free_raw(parts);
+        ray_free_raw(parts);
         agg_desc_free(&d);
         ray_release(result); return ray_error("oom", NULL);
     }
@@ -4246,8 +4336,7 @@ static ray_t* exec_group_v2_parallel_radix(
             for (uint32_t b = 0; b < a; b++) ray_release(outs[b]);
             ray_free_raw(pairs);
             agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-            ray_free_raw(bufs); ray_free_raw(parts);
+            ray_free_raw(parts);
             scratch_free(outs_hdr); agg_desc_free(&d);
             ray_release(result); return out ? out : ray_error("oom", NULL);
         }
@@ -4318,8 +4407,7 @@ static ray_t* exec_group_v2_parallel_radix(
     /* Finalize is done reading every partition's buffered group state → destroy
      * exactly once before freeing the partition slabs. */
     agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-    for (size_t i = 0; i < nbuf; i++) ray_free_raw(bufs[i].buf);
-    ray_free_raw(bufs); ray_free_raw(parts);
+    ray_free_raw(parts);
     scratch_free(outs_hdr); agg_desc_free(&d);
     return result;
 }

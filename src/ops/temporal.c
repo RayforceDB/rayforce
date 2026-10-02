@@ -600,6 +600,14 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
     if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
 
     int64_t field = ext->sym;
+    /* A literal (`(year 2020.01.01)`) arrives as an atom, whose len field
+     * aliases its value: the date became a vector of 7305 rows.  The atom
+     * path of the builtin answers it as one value. */
+    if (input->type < 0) {
+        ray_t* r = ray_temporal_extract(input, (int)field);
+        ray_release(input);
+        return r;
+    }
     int64_t len = input->len;
     int8_t in_type = input->type;
 
@@ -816,6 +824,12 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
     if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
 
     int64_t field = ext->sym;
+    /* An atom's len aliases its value; see exec_extract. */
+    if (input->type < 0) {
+        ray_t* r = ray_temporal_truncate(input, (int)field);
+        ray_release(input);
+        return r;
+    }
     int64_t len = input->len;
     int8_t in_type = input->type;
 

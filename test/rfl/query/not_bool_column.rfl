@@ -1,0 +1,35 @@
+;; #693: compiled `not` over a BOOL column in a select projection.
+;;
+;; A REG_SCAN of a BOOL column is widened to an I64 lane (register-widening
+;; invariant in expr.c), but the BOOL-output unary kernel read the NOT
+;; source as bytes: lane 0 saw the low byte of the first int64, lanes 1..7
+;; saw its zero padding, so [true false true false] came back as
+;; [false true true true].  The fix reads the source at its own lane width.
+
+(set T (table [b] (list [true false true false])))
+(at (select {n: (not b) from: T}) 'n) -- [false true false true]
+(at (select {n: (not (not b)) from: T}) 'n) -- [true false true false]
+(at (select {n: (and b (not b)) from: T}) 'n) -- [false false false false]
+(at (select {n: b from: T where: (not b)}) 'n) -- [false false]
+(count (select {n: b from: T where: (not b)})) -- 2
+
+;; all-true input: every lane must flip
+(set T4 (table [b] (list [true true true true])))
+(at (select {n: (not b) from: T4}) 'n) -- [false false false false]
+
+;; lengths around the 8-byte lane boundary
+(set T8 (table [b] (list [true false true false true false true false])))
+(at (select {n: (not b) from: T8}) 'n) -- [false true false true false true false true]
+(set T9 (table [b] (list [true false true false true false true false true])))
+(at (select {n: (not b) from: T9}) 'n) -- [false true false true false true false true false]
+(set T17 (table [b] (list [true false true false true false true false true false true false true false true false true])))
+(at (select {n: (not b) from: T17}) 'n) -- [false true false true false true false true false true false true false true false true false]
+
+;; computed-bool source (1-byte scratch) was already correct; keep it covered
+(set TI (table [i] (list (til 6))))
+(at (select {n: (not (> i 2)) from: TI}) 'n) -- [true true true false false false]
+
+;; same kernel: (as 'BOOL ...) over a comparison result / narrow cast
+(at (select {n: (as 'BOOL (> i 2)) from: TI}) 'n) -- [false false false true true true]
+(at (select {n: (as 'BOOL (as 'I32 i)) from: TI}) 'n) -- [false true true true true true]
+(at (select {n: (as 'BOOL (as 'I16 i)) from: TI}) 'n) -- [false true true true true true]

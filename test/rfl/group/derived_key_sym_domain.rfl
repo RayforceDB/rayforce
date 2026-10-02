@@ -111,3 +111,172 @@
 (set FN (.db.splayed.get "/tmp/rfl_dkey_filen/"))
 (all (== (FP (KEYQ FN)) (FP ON))) -- true
 (.sys.exec "rm -rf /tmp/rfl_dkey_file/ /tmp/rfl_dkey_filen/") -- 0
+
+;; ── the key as a per-value program ─────────────────────────────────────
+;; Over a FILE-domain column a key made of let / if / cond / and / or / not
+;; / comparisons / + - * / str-find / substr / strlen / within / nil? runs
+;; as a straight-line program once per distinct value, on the workers;
+;; any other operator keeps the chunk DAG.  Reference for every key: the
+;; same expression computed row by row with `map` over the column's
+;; strings, then a plain grouping by that column.  70000 rows so both the
+;; vocabulary rewrite (aggregates over the key column only) and the
+;; per-row spread (an aggregate over another column) run.
+(set U ["http://www.abc.com/x" "" "abc" "android-app://q/z" "http://www./" "https://www.x" "http:/a/b" "http://a" "://x/y" "ftp://h/x" "https://www.h.org/a/b" "http://h.org/" "www.x/y" "http" "https:///z" "HTTP://UP.ORG/a" "http://h.org/www./x" "https://ww.h.org/q" "http://www.www.h/" "http://s?te.org/o#o"])
+(set mkv (fn [j] (if (< j (count U)) (at U j) (if (== 0 (% j 7)) (format "http://www.site%.org/p/%" (% j 41) j) (if (== 1 (% j 7)) (format "https://site%.org/q?x=%" (% j 41) j) (if (== 2 (% j 7)) (format "http://site%.org" (% j 41)) (if (== 3 (% j 7)) (format "android-app://com.app%/x" (% j 13)) (if (== 4 (% j 7)) (format "https://www.site%.org/" (% j 41)) (if (== 5 (% j 7)) (format "site%.org/path" (% j 41)) (format "http://Site%.org/a/b#%" (% j 41) j))))))))))
+(set NP 70000)
+(set ip (til NP))
+(set refp (as 'SYMBOL (map (fn [k] (if (== 0 (% k 97)) null (mkv (% (* k 7919) 640)))) ip)))
+(set vp (% (* ip 31) 1000))
+(set TP (table [ref v] (list refp vp)))
+(.sys.exec "rm -rf /tmp/rfl_dkey_prog/") -- 0
+(.db.splayed.set "/tmp/rfl_dkey_prog/" TP)
+(set FT (.db.splayed.get "/tmp/rfl_dkey_prog/"))
+(count (distinct (at FT 'ref))) -- 423
+(set SP (as 'STR (at TP 'ref)))
+;; a key of the value alone, per row through the distinct values (the Q29
+;; key and the two-column key below are mapped over every row)
+(set DSP (distinct SP))
+(set ISP (find DSP SP))
+(set rowk (fn [f] (at (map f DSP) ISP)))
+;; reference grouping over a materialised key column; fingerprint by key text
+(set refg (fn [K] (select {from: (table [k ref v] (list (as 'SYMBOL K) refp vp)) by: k c: (count ref) sv: (sum v)})))
+(set fpk (fn [r] (ser (xasc (table [k c] (list (as 'STR (at (value r) 0)) (at r 'c))) 'k))))
+(set fpks (fn [r] (ser (xasc (table [k c sv] (list (as 'STR (at (value r) 0)) (at r 'c) (at r 'sv))) 'k))))
+
+;; the URL-host key: http / https / www / no slash / empty / non-http / nulls
+(set kq29 (fn [x] (do (let p (str-find x "://")) (let s (substr x (+ p 4) -1)) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s)) (let sl (str-find r "/")) (if (and (and (>= p 4) (<= p 5)) (== (substr x 1 4) "http") (not (nil? sl))) (substr r 1 sl) x))))
+(set K29 (map kq29 SP))
+(set O29 (refg K29))
+(set R29 (select {from: FT by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")}))
+(set O29w (select {from: (table [k ref] (list (as 'SYMBOL K29) refp)) by: k c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")}))
+(== (count R29) (count O29w)) -- true
+(all (== (fpk R29) (fpk O29w))) -- true
+(set FPL (fn [r] (ser (xasc (table [k l mn] (list (as 'STR (at (value r) 0)) (at r 'l) (as 'STR (at r 'mn)))) 'k))))
+(all (== (FPL R29) (FPL O29w))) -- true
+(at (cols R29) 0) -- 'p
+;; the same key with an aggregate over another column: per-row spread
+(set R29s (select {from: FT by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v)}))
+(== (count R29s) (count O29)) -- true
+(all (== (fpks R29s) (fpks O29))) -- true
+;; an operator outside the program (abs) leaves the key to the chunk DAG: same groups
+(set R29d (select {from: FT by: (let p (str-find ref "://") (let s (substr ref (+ p (abs 4)) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v)}))
+(all (== (fpks R29d) (fpks O29))) -- true
+
+;; cond, string literals in the arms, offsets past the end
+(set R2 (select {from: FT by: (cond ((== (substr ref 1 5) "https") "secure") ((== (substr ref 1 4) "http") (substr ref 8 4)) (else (substr ref 1 3))) c: (count ref) sv: (sum v)}))
+(set O2 (refg (rowk (fn [x] (if (== (substr x 1 5) "https") "secure" (if (== (substr x 1 4) "http") (substr x 8 4) (substr x 1 3)))))))
+(all (== (fpks R2) (fpks O2))) -- true
+;; null arithmetic: strlen of the empty value is null, so is the length below
+(set R3 (select {from: FT by: (if (or (nil? (str-find ref "/")) (> (strlen ref) 24)) (substr ref 1 (- (strlen ref) 2)) ref) c: (count ref)}))
+(set O3 (refg (rowk (fn [x] (if (or (nil? (str-find x "/")) (> (strlen x) 24)) (substr x 1 (- (strlen x) 2)) x)))))
+(all (== (fpk R3) (fpk O3))) -- true
+;; comparisons of nullable offsets, a product as the start
+(set R4 (select {from: FT by: (if (!= (str-find ref "?") (str-find ref "#")) (substr ref (* 2 (str-find ref "o")) 3) "none") c: (count ref)}))
+(set O4 (refg (rowk (fn [x] (if (!= (str-find x "?") (str-find x "#")) (substr x (* 2 (str-find x "o")) 3) "none")))))
+(all (== (fpk R4) (fpk O4))) -- true
+;; a search pattern with a wildcard
+(set R5 (select {from: FT by: (substr ref (+ 1 (str-find ref "s?te")) 6) c: (count ref)}))
+(set O5 (refg (rowk (fn [x] (substr x (+ 1 (str-find x "s?te")) 6)))))
+(all (== (fpk R5) (fpk O5))) -- true
+;; the key is an earlier binding, not the last operator
+(set R6 (select {from: FT by: (let a (substr ref 1 3) (let b (str-find ref "x") a)) c: (count ref)}))
+(all (== (fpk R6) (fpk (refg (rowk (fn [x] (substr x 1 3))))))) -- true
+;; n-ary and, not, nil? over the value itself
+(set R7 (select {from: FT by: (if (and (not (nil? ref)) (<= (strlen ref) 12) (>= (strlen ref) 3)) "short" (substr ref (- (strlen ref) 3) 4)) c: (count ref)}))
+(set O7 (refg (rowk (fn [x] (if (and (not (nil? x)) (<= (strlen x) 12) (>= (strlen x) 3)) "short" (substr x (- (strlen x) 3) 4))))))
+(all (== (fpk R7) (fpk O7))) -- true
+;; another column in the key: never per value
+(set R8 (select {from: FT by: (if (> v 500) (substr ref 1 4) ref) c: (count ref)}))
+(set O8 (refg (map (fn [k] (if (> (at vp k) 500) (substr (at SP k) 1 4) (at SP k))) ip)))
+(all (== (fpk R8) (fpk O8))) -- true
+;; an operator outside the program (upper): the chunk DAG, same groups
+(set R9 (select {from: FT by: (upper (substr ref 1 4)) c: (count ref)}))
+(set O9 (refg (rowk (fn [x] (upper (substr x 1 4))))))
+(all (== (fpk R9) (fpk O9))) -- true
+;; a vocabulary past the parallel threshold (73k distinct values): the
+;; program, the partitioned dedupe and the position ordering run on the
+;; workers; the chunk DAG's interning (abs again) too
+(set NB 80000)
+(set mkb (fn [k] (if (== 0 (% k 13)) "" (if (== 0 (% k 11)) (format "android-app://app%/x%" (% k 7) k) (if (== 0 (% k 5)) (format "https://www.h%.org/p/%" (% k 97) k) (if (== 0 (% k 3)) (format "http://h%.org" k) (format "http://h%.org/q/%" (% k 97) k)))))))
+(set refb (as 'SYMBOL (map mkb (til NB))))
+(.sys.exec "rm -rf /tmp/rfl_dkey_progb/") -- 0
+(.db.splayed.set "/tmp/rfl_dkey_progb/" (table [ref] (list refb)))
+(set FB (.db.splayed.get "/tmp/rfl_dkey_progb/"))
+(> (count (distinct (at FB 'ref))) 65536) -- true
+(set KB (as 'SYMBOL (map kq29 (as 'STR refb))))
+(set OB (select {from: (table [k ref] (list KB refb)) by: k c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")}))
+(set RB (select {from: FB by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")}))
+(== (count RB) (count OB)) -- true
+(all (== (FPL RB) (FPL OB))) -- true
+(all (== (fpk RB) (fpk OB))) -- true
+(set RBd (select {from: FB by: (let p (str-find ref "://") (let s (substr ref (+ p (abs 4)) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")}))
+(all (== (fpk RBd) (fpk OB))) -- true
+;; unsorted, both evaluations give the groups in the same order
+(all (== (as 'STR (at RB 'p)) (as 'STR (at RBd 'p)))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dkey_progb/") -- 0
+(.sys.exec "rm -rf /tmp/rfl_dkey_prog/") -- 0
+
+;; ── an `if` inside a by-DICT key ───────────────────────────────────────
+;; It selects per row, exactly as in a projection or a bare by:.  The
+;; by-dict used to evaluate its keys with the tree-walking `if`, which
+;; tests ONE truth value — a vector condition is truthy, so every row got
+;; the then-branch and the else-branch never reached a group.  Oracle: the
+;; key built row by row (map over row indices, the scalar `if`), then a
+;; plain group-by on the materialised column.  80000 rows so the
+;; column-wise `if` runs pooled (past 65536) with and without a dense
+;; where:; nulls in both condition columns and in the symbol branch.
+(set M 80000)
+(set j (til M))
+(set se (as 'I16 (% (* j 7) 5)))
+(set ae (as 'I16 (% (* j 11) 3)))
+(set rf (as 'SYMBOL (map (fn [k] (if (== 0 (% k 19)) "" (format "https://ref%.example.com/path/%" (% k 211) (% k 7)))) j)))
+(set ur (as 'SYMBOL (map (fn [k] (format "u%" (% k 7))) j)))
+(set w (% j 10))
+(set TD0 (table [se ae rf ur w] (list se ae rf ur w)))
+(set TD (update {ae: 0Nh where: (== 0 (% (til M) 17)) from: (update {se: 0Nh where: (== 0 (% (til M) 13)) from: TD0})}))
+(count TD) -- 80000
+(set KOR (fn [t] (as 'STR (map (fn [k] (if (and (== (at (at t 'se) k) 0) (== (at (at t 'ae) k) 0)) (as 'STR (at (at t 'rf) k)) "")) (til (count t))))))
+(set KO2 (fn [t] (as 'STR (map (fn [k] (if (> (at (at t 'w) k) 4) (as 'STR (at (at t 'rf) k)) (as 'STR (at (at t 'ur) k)))) (til (count t))))))
+(set OT (fn [t ks] (table [se ae src dst w] (list (at t 'se) (at t 'ae) ks (at t 'ur) (at t 'w)))))
+(set OTD (OT TD (KOR TD)))
+(set OTD2 (OT TD (KO2 TD)))
+(set ORD (fn [o] (select {from: o by: [se ae src dst] c: (count dst) sw: (sum w)})))
+(set FPD (fn [r] (ser (xasc (table [se ae src dst c sw] (list (at r 'se) (at r 'ae) (as 'STR (at r 'src)) (as 'STR (at r 'dst)) (at r 'c) (at r 'sw))) [se ae src dst]))))
+;; SYM column against a string literal
+(set QD (fn [t] (select {from: t by: {se: se ae: ae src: (if (and (== se 0) (== ae 0)) rf "") dst: ur} c: (count ur) sw: (sum w)})))
+(set RD (QD TD))
+(set OD (ORD OTD))
+(== (count RD) (count OD)) -- true
+(all (== (FPD RD) (FPD OD))) -- true
+;; the else-branch reaches the groups
+(> (count (select {from: RD where: (== src "")})) 0) -- true
+(> (count (select {from: RD where: (!= src "")})) 0) -- true
+;; two symbol columns as the branches
+(set QD2 (fn [t] (select {from: t by: {se: se ae: ae src: (if (> w 4) rf ur) dst: ur} c: (count ur) sw: (sum w)})))
+(all (== (FPD (QD2 TD)) (FPD (ORD OTD2)))) -- true
+;; where: dense (90%, still pooled), sparse (10%), empty
+(set QW (fn [t p] (select {from: t by: {se: se ae: ae src: (if (and (== se 0) (== ae 0)) rf "") dst: ur} c: (count ur) sw: (sum w) where: (p w)})))
+(set OW (fn [p] (ORD (select {from: OTD where: (p w)}))))
+(set PD (fn [x] (!= x 3)))
+(set PS (fn [x] (== x 3)))
+(all (== (FPD (QW TD PD)) (FPD (OW PD)))) -- true
+(all (== (FPD (QW TD PS)) (FPD (OW PS)))) -- true
+(count (QW TD (fn [x] (> x 100)))) -- 0
+;; the same table read back from disk: the symbol columns' ids live in FILE domains
+(.sys.exec "rm -rf /tmp/rfl_dkey_bydict/") -- 0
+(.db.splayed.set "/tmp/rfl_dkey_bydict/" TD)
+(set FD (.db.splayed.get "/tmp/rfl_dkey_bydict/"))
+(all (== (FPD (QD FD)) (FPD OD))) -- true
+(all (== (FPD (QD2 FD)) (FPD (ORD OTD2)))) -- true
+(all (== (FPD (QW FD PD)) (FPD (OW PD)))) -- true
+(all (== (FPD (QW FD PS)) (FPD (OW PS)))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dkey_bydict/") -- 0
+;; below the pool threshold the column-wise `if` takes its per-row arm: same groups
+(set TS (take TD 3000))
+(all (== (FPD (QD TS)) (FPD (ORD (OT TS (KOR TS)))))) -- true
+;; a condition that reduces to one value is a scalar test, not a per-row
+;; one: every row takes the then-branch, as before
+(set RSC (select {from: TS by: {src: (if (> (count w) 3) rf "")} c: (count w)}))
+(set OSC (select {from: TS by: rf c: (count w)}))
+(== (count RSC) (count OSC)) -- true
+(all (== (asc (at RSC 'c)) (asc (at OSC 'c)))) -- true

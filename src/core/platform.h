@@ -180,6 +180,11 @@ uint32_t ray_physical_core_count(void);
  * 0 when the platform cannot report it.  Bounds replicated per-task state
  * whose random-access working set must stay cache-resident to scale. */
 uint64_t ray_cache_llc_bytes(void);
+/* Memory limit imposed on this process by its container / cgroup (bytes):
+ * the smallest cgroup v2 memory.max or v1 memory.limit_in_bytes found on
+ * the process's cgroup and its ancestors.  0 when none is set, or on
+ * platforms without cgroups. */
+int64_t ray_os_cgroup_mem_limit(void);
 #ifdef DEBUG
 /* Pin ray_cache_llc_bytes to `bytes` (0 = probe again). */
 void ray_cache_llc_set_for_test(uint64_t bytes);

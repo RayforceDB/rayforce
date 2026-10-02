@@ -680,6 +680,16 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
     if (!input || RAY_IS_ERR(input)) return input;
+    /* A literal (`(trim " ab")`) arrives as an atom, whose len field
+     * aliases its payload: the loop below read that many rows past it.
+     * The builtin answers an atom as one value. */
+    if (input->type < 0) {
+        ray_t* r = op->opcode == OP_UPPER ? ray_upper_fn(input)
+                 : op->opcode == OP_LOWER ? ray_lower_fn(input)
+                 :                          ray_trim_fn(input);
+        ray_release(input);
+        return r;
+    }
 
     int64_t len = input->len;
     bool is_str = (input->type == RAY_STR);
@@ -800,6 +810,12 @@ void ray_sym_strlen_into(ray_t* input, ray_t* result) {
 ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
     if (!input || RAY_IS_ERR(input)) return input;
+    /* An atom's len aliases its payload; see exec_string_unary. */
+    if (input->type < 0) {
+        ray_t* r = ray_strlen_fn(input);
+        ray_release(input);
+        return r;
+    }
 
     int64_t len = input->len;
     ray_t* result = ray_vec_new(RAY_I64, len);
@@ -1165,6 +1181,14 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
     ray_t* len_v = exec_node(g, op_node(g, ext->third_in));
     if (!len_v || RAY_IS_ERR(len_v)) { ray_release(input); ray_release(start_v); return len_v; }
 
+    /* An atom's len aliases its payload; see exec_string_unary. */
+    if (input->type < 0) {
+        ray_t* args[3] = { input, start_v, len_v };
+        ray_t* r = ray_substr_fn(args, 3);
+        ray_release(input); ray_release(start_v); ray_release(len_v);
+        return r;
+    }
+
     int64_t nrows = input->len;
     bool is_str = (input->type == RAY_STR);
 
@@ -1289,6 +1313,14 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_t* to_v = exec_node(g, op_node(g, ext->third_in));
     if (!to_v || RAY_IS_ERR(to_v)) { ray_release(input); ray_release(from_v); return to_v; }
+
+    /* An atom's len aliases its payload; see exec_string_unary. */
+    if (input->type < 0) {
+        ray_t* args[3] = { input, from_v, to_v };
+        ray_t* r = ray_replace_fn(args, 3);
+        ray_release(input); ray_release(from_v); ray_release(to_v);
+        return r;
+    }
 
     /* from_v and to_v should be string constants (SYM atoms) */
     const char* from_str = ray_str_ptr(from_v);
@@ -1459,6 +1491,12 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
                 total += sl;
             } else if (t == -RAY_STR) {
                 total += ray_str_len(args[a]);
+            } else if (t == -RAY_SYM) {
+                /* A symbol literal or a scalar such as (first s): RAY_IS_SYM
+                 * matches SYM vectors only, so its text was left out and
+                 * (concat 'ab 'cd) came back null. */
+                ray_t* st = ray_sym_str(args[a]->i64);
+                if (st) total += ray_str_len(st);
             }
         }
         char sbuf[8192];
@@ -1493,6 +1531,11 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
             } else if (t == -RAY_STR) {
                 const char* sp = ray_str_ptr(args[a]);
                 size_t sl = ray_str_len(args[a]);
+                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
+            } else if (t == -RAY_SYM) {
+                ray_t* st = ray_sym_str(args[a]->i64);
+                const char* sp = st ? ray_str_ptr(st) : NULL;
+                size_t sl = st ? ray_str_len(st) : 0;
                 if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
             }
         }

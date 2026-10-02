@@ -1806,4 +1806,18 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
 
+
+/* A scalar `where:` predicate holds for every row or none.  It needs a truth
+ * value: booleans, numbers and temporals have one (zero and null are false);
+ * a symbol or a string does not. */
+static inline bool ray_pred_atom_type_ok(int8_t t) {
+    switch (t) {
+    case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
 #endif /* RAY_EXEC_INTERNAL_H */

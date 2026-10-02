@@ -8304,6 +8304,9 @@ static bool try_strlen_sumavg_input(ray_graph_t* g, ray_t* tbl,
  * group-aggregation loops can read row-wise without out-of-bounds access. */
 static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
     if (!src || RAY_IS_ERR(src) || nrows < 0) return NULL;
+    /* A STR atom has no fixed-width payload to copy: the switch below has no
+     * case for it, and the NULL surfaced as "oom". */
+    if (src->type == -RAY_STR) return broadcast_scalar(src, nrows);
 
     int8_t out_type = ray_is_atom(src) ? (int8_t)-src->type : src->type;
     if (out_type <= 0 || out_type >= RAY_TYPE_COUNT) return NULL;
@@ -8319,6 +8322,8 @@ static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
         char* d = (char*)ray_data(out);
         for (int64_t i = 0; i < nrows; i++)
             memcpy(d + (size_t)i * esz, s, esz);
+        /* copied STR descriptors still point into the source's pool */
+        if (out_type == RAY_STR) col_propagate_str_pool(out, src);
         return out;
     }
 
@@ -11939,6 +11944,36 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_t* vec = exec_node(g, key_op);
             g->table = saved_table;
             if (vec && !RAY_IS_ERR(vec)) {
+                /* A key that evaluates to one value (a constant, or a `let`
+                 * whose body is one) is that value on every row: one group.
+                 * It came back as an atom or a one-element vector and was
+                 * read as a full column, past its end — random groups, or a
+                 * crash on the workers.  Another length is no row-aligned
+                 * key at all. */
+                int64_t tn = ray_table_nrows(tbl);
+                bool scalar = ray_is_atom(vec) || (ray_is_vec(vec) && vec->len == 1 && tn != 1);
+                if (scalar) {
+                    ray_t* wide;
+                    if (vec->type == -RAY_STR) {
+                        wide = broadcast_scalar(vec, tn);
+                    } else {
+                        ray_t* n_obj = make_i64(tn);
+                        wide = n_obj ? ray_take_fn(vec, n_obj) : ray_error("oom", NULL);
+                        if (n_obj) ray_release(n_obj);
+                    }
+                    ray_release(vec);
+                    vec = wide;
+                } else if (ray_is_vec(vec) && vec->len != tn) {
+                    int64_t got = vec->len;
+                    ray_release(vec);
+                    vec = ray_error("length", "by: key has %lld values for %lld rows",
+                                    (long long)got, (long long)tn);
+                }
+                if (!vec || RAY_IS_ERR(vec)) {
+                    for (uint32_t j = 0; j < k; j++)
+                        if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
+                    return vec ? vec : ray_error("oom", NULL);
+                }
                 key_vecs[k] = vec;
                 key_owned[k] = 1;
             }

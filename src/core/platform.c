@@ -369,6 +369,97 @@ static uint64_t cache_sysfs_llc_bytes(void) {
 }
 #endif
 
+/* --------------------------------------------------------------------------
+ * Container memory limit (Linux cgroups)
+ *
+ * A process limited below host RAM (`docker run --memory`, `systemd-run -p
+ * MemoryMax=`) is OOM-killed by its cgroup long before sysconf's physical
+ * RAM figure is reached, so the heap's spill threshold must see that limit
+ * (issue #688).  cgroup v2 publishes it as memory.max ("max" = unlimited)
+ * under the cgroup named by /proc/self/cgroup; v1 as memory.limit_in_bytes
+ * under the memory controller mount, where "unlimited" is LLONG_MAX rounded
+ * down to a page.  A limit may sit on an ancestor (a slice above the scope),
+ * so every directory up to the mount root is read and the smallest wins.
+ * Inside a cgroup namespace the reported path is "/" and the root files are
+ * the container's own, which the same walk covers.
+ * -------------------------------------------------------------------------- */
+#if defined(RAY_OS_LINUX)
+/* One cgroup limit file → bytes, or 0 when missing, unreadable or unlimited. */
+static int64_t cgroup_read_limit(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[64];
+    buf[0] = 0;
+    if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+    fclose(f);
+    if (strncmp(buf, "max", 3) == 0) return 0;
+    char* end = NULL;
+    unsigned long long v = strtoull(buf, &end, 10);
+    if (end == buf || v == 0 || v >= (1ULL << 62)) return 0;   /* v1 "unlimited" ~ 2^63 */
+    return (int64_t)v;
+}
+
+/* Smallest limit found in `root`/`cgpath`/`file` and every ancestor. */
+static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const char* file) {
+    char dir[512];
+    if (snprintf(dir, sizeof(dir), "%s%s", root, cgpath) >= (int)sizeof(dir)) return 0;
+    size_t rootlen = strlen(root);
+    int64_t limit = 0;
+    for (;;) {
+        char path[640];
+        snprintf(path, sizeof(path), "%s/%s", dir, file);
+        int64_t v = cgroup_read_limit(path);
+        if (v > 0 && (limit == 0 || v < limit)) limit = v;
+        if (strlen(dir) <= rootlen) break;              /* mount root checked */
+        char* slash = strrchr(dir, '/');
+        if (!slash || (size_t)(slash - dir) < rootlen) break;
+        *slash = 0;                                      /* parent directory */
+    }
+    return limit;
+}
+
+/* True when the comma-separated controller list names "memory". */
+static bool cgroup_has_memory(const char* ctrls) {
+    while (*ctrls) {
+        size_t n = strcspn(ctrls, ",");
+        if (n == 6 && strncmp(ctrls, "memory", 6) == 0) return true;
+        ctrls += n;
+        if (*ctrls == ',') ctrls++;
+    }
+    return false;
+}
+
+int64_t ray_os_cgroup_mem_limit(void) {
+    FILE* f = fopen("/proc/self/cgroup", "r");
+    if (!f) return 0;
+    int64_t limit = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        /* "<hierarchy>:<controllers>:<path>" — v2 is "0::/path". */
+        char* c1 = strchr(line, ':');
+        char* c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c2) continue;
+        *c2 = 0;
+        const char* ctrls = c1 + 1;
+        char* cgpath = c2 + 1;
+        cgpath[strcspn(cgpath, "\n")] = 0;
+        if (strcmp(cgpath, "/") == 0) cgpath[0] = 0;
+        int64_t v;
+        if (*ctrls == 0)
+            v = cgroup_walk_limit("/sys/fs/cgroup", cgpath, "memory.max");
+        else if (cgroup_has_memory(ctrls))
+            v = cgroup_walk_limit("/sys/fs/cgroup/memory", cgpath, "memory.limit_in_bytes");
+        else
+            continue;
+        if (v > 0 && (limit == 0 || v < limit)) limit = v;
+    }
+    fclose(f);
+    return limit;
+}
+#else
+int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+#endif
+
 static uint64_t cache_llc_probe(void) {
     static uint64_t cached = UINT64_MAX;
     if (cached != UINT64_MAX) return cached;
@@ -639,6 +730,8 @@ uint32_t ray_physical_core_count(void) {
     return ray_thread_count();
 }
 
+int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+
 /* Sum of every level-3 cache instance reported by the processor topology
  * (each SYSTEM_LOGICAL_PROCESSOR_INFORMATION cache record is one instance).
  * 0 when the query fails. */
@@ -800,6 +893,7 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
+int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 static uint64_t cache_llc_probe(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the

@@ -340,7 +340,7 @@ void ray_mem_trace_end(ray_mem_trace_t* out) {
  * When a new anon mapping would push this past the watermark, it is routed to a
  * spill file instead — this never rejects work, it just picks disk over RAM. */
 static _Atomic(int64_t) g_anon_committed = 0;
-static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to physical RAM */
+static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to ray_sys_ram_limit() */
 static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
 
 /* Commit `bytes` of anonymous (RAM-resident) footprint and advance the peak
@@ -359,10 +359,12 @@ static void heap_anon_commit(int64_t bytes) {
 }
 
 /* Threshold above which anon allocations spill to disk.  Default keeps our
- * anon footprint within physical RAM (swap + page cache stay as headroom). */
+ * anon footprint within the RAM the process may actually use — physical RAM,
+ * or the container's cgroup limit when that is smaller (#688); swap + page
+ * cache stay as headroom. */
 static int64_t heap_anon_watermark(void) {
     int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
-    return wm > 0 ? wm : ray_sys_total_ram();
+    return wm > 0 ? wm : ray_sys_ram_limit();
 }
 /* True if committing `bytes` more anonymous RAM would cross the watermark. */
 static bool heap_anon_would_exceed(size_t bytes) {

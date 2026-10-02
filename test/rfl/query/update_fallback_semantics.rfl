@@ -1,0 +1,66 @@
+;; update_fallback_semantics.rfl — an `update` expression the DAG declines
+;; (temporal + - *) is evaluated with the same row semantics as the compiled
+;; path (review of #690, second pass).
+;;
+;; The eval fallback evaluated the expression once with whole columns bound.
+;; The interpreter's `if` tests one truth value, so `(if (> i 2) 1 (- ts ts))`
+;; wrote the then-branch to every row; a column of the wrong length was added
+;; unchecked (ragged table); `update by:` took the column type from the first
+;; group and cast the rest; and a misspelt column reported `name` instead of
+;; the planner's `schema` error.  The fallback now evaluates per row when the
+;; expression reads a column in row position and once otherwise (aggregates,
+;; constants), checks the length, promotes numeric group results and rejects
+;; the rest loudly, and prefers the planner's compile error when both fail.
+
+(set t (table [k ts tm i name] (list [a a b b b] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 5))) (as 'TIME (* 1000 (til 5))) [1 2 3 4 5] [Al Bo Ca Da Ed])))
+
+;; ─── 1. a new or replaced column of the wrong length is rejected ────────────
+(update {n: (til 3) from: t}) !- length
+(update {i: (til 3) from: t}) !- length
+;; a LIST result too (LIST is type 0, not an atom)
+(update {n: (list 1 2) from: t}) !- length
+(update {n: (list 1 2) from: t where: (> i 1)}) !- type
+(update {i: (list 1 2) from: t}) !- length
+(update {i: (list 1 2) from: t where: (> i 1)}) !- length
+;; a constant / reduced expression still broadcasts
+(at (update {n: 7 from: t}) 'n) -- [7 7 7 7 7]
+(at (update {n: (max (- ts ts)) from: t}) 'n) -- [0 0 0 0 0]
+(at (update {n: (max (+ i 1)) from: t}) 'n) -- [6 6 6 6 6]
+
+;; ─── 2. `if` over a temporal expression is per row, as in select ────────────
+(at (select {x: (if (> i 2) 1 (- ts ts)) from: t}) 'x) -- [0 0 1 1 1]
+(at (update {x: (if (> i 2) 1 (- ts ts)) from: t}) 'x) -- [0 0 1 1 1]
+(at (update {i: (if (> i 2) 1 (- ts ts)) from: t}) 'i) -- [0 0 1 1 1]
+(at (update {x: (if (> i 2) 1 (- ts ts)) from: t where: (> i 1)}) 'x) -- [0Nl 0 1 1 1]
+(at (update {i: (if (> i 2) 1 (- ts ts)) from: t where: (> i 1)}) 'i) -- [1 0 1 1 1]
+;; under by: the compiled path is per row within the group; the fallback too
+(at (update {x: (if (> i 2) 1 (- i i)) by: k from: t}) 'x) -- [0 0 1 1 1]
+(at (update {x: (if (> i 2) 1 (- ts ts)) by: k from: t}) 'x) -- [0 0 1 1 1]
+;; a reduced expression under by: is still one value per group
+(at (update {m: (max (- ts ts)) by: k from: t}) 'm) -- [0 0 0 0 0]
+(at (update {m: (max (+ i 1)) by: k from: t}) 'm) -- [3 3 6 6 6]
+
+;; an `if` whose condition mixes a row column with an aggregate cannot be
+;; evaluated per row (the aggregate would see one cell); it stays an error
+;; until the fallback can reduce aggregates first (#692)
+(update {x: (if (> i (avg i)) (+ ts 1) ts) from: t}) !- nyi
+(update {i: (if (> i (avg i)) 1 (- ts ts)) from: t where: (> i 1)}) !- nyi
+(update {x: (if (> i (avg i)) (+ ts 1) ts) by: k from: t}) !- nyi
+;; an aggregate over a literal or a global is the same on every row: fine
+(at (update {x: (if (> i 2) (count [1 2 3]) (- ts ts)) from: t}) 'x) -- [0 0 3 3 3]
+(set GL [1 2 3 4])
+(at (update {x: (if (> i 2) (count GL) (- ts ts)) from: t}) 'x) -- [0 0 4 4 4]
+
+;; ─── 3. update by: with group results of differing types ────────────────────
+(set g (table [k ts tm i] (list [a a b c c c] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 6))) (as 'TIME (* 1000 (til 6))) [1 2 3 4 5 6])))
+(at (update {m: (if (> (count i) 1) (max (- i i)) 2.5) by: k from: g}) 'm) -- [0.0 0.0 2.5 0.0 0.0 0.0]
+(at (update {m: (if (> (count i) 1) (max (- ts ts)) 2.5) by: k from: g}) 'm) -- [0.0 0.0 2.5 0.0 0.0 0.0]
+(type (at (update {m: (if (> (count i) 1) (max (- ts ts)) 2.5) by: k from: g}) 'm)) -- 'F64
+;; a TIMESTAMP cannot be written into a TIME column: reject, do not cast
+(update {m: (if (> (count i) 1) (max (+ tm 0)) (max (+ ts 0))) by: k from: g}) !- type
+
+;; ─── 5. a misspelt column reports the planner's schema error ────────────────
+(update {x: (+ nosuch 1) from: t}) !- schema
+;; (when the planner declines silently — a temporal operand — there is no
+;; planner error and the interpreter's `name` error stands, as in select)
+(update {x: (+ nosuch ts) from: t}) !- name
