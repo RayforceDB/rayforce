@@ -1064,14 +1064,29 @@ static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
         ray_hnsw_free(idx);
         TEST_ASSERT_TRUE(false);
     }
-    int64_t valid_neighbor = idx->layers[1].neighbors[0];
+    int64_t injected_layers = 0;
+    for (int32_t l = 1; l < idx->n_layers; l++) {
+        ray_hnsw_layer_t* layer = &idx->layers[l];
+        int64_t slot = -1;
+        for (int64_t i = 0; i < layer->n_nodes && slot < 0; i++) {
+            for (int64_t j = 0; j < layer->M_max; j++) {
+                if (layer->neighbors[i * layer->M_max + j] != -1) {
+                    slot = i * layer->M_max + j;
+                    break;
+                }
+            }
+        }
+        if (slot >= 0) {
+            layer->neighbors[slot] = low_level_id;
+            injected_layers++;
+        }
+    }
+    TEST_ASSERT_TRUE(injected_layers > 0);
     int64_t valid_entry = idx->entry_point;
     int32_t valid_M_max0 = idx->M_max0;
 
-    idx->layers[1].neighbors[0] = low_level_id;
     ray_err_t neighbor_err = ray_hnsw_save(idx, neighbor_dir);
 
-    idx->layers[1].neighbors[0] = valid_neighbor;
     idx->entry_point = low_level_id;
     ray_err_t entry_err = ray_hnsw_save(idx, entry_dir);
 
@@ -1084,11 +1099,13 @@ static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
     TEST_ASSERT_EQ_I(width_err, RAY_OK);
     ray_hnsw_t* loaded = ray_hnsw_load(neighbor_dir);
     TEST_ASSERT_NOT_NULL(loaded);
-    ray_hnsw_layer_t* layer = &loaded->layers[1];
-    for (int64_t i = 0; i < layer->n_nodes; i++) {
-        for (int64_t j = 0; j < layer->M_max; j++) {
-            int64_t id = layer->neighbors[i * layer->M_max + j];
-            TEST_ASSERT_TRUE(id == -1 || loaded->node_level[id] >= 1);
+    for (int32_t l = 1; l < loaded->n_layers; l++) {
+        ray_hnsw_layer_t* layer = &loaded->layers[l];
+        for (int64_t i = 0; i < layer->n_nodes; i++) {
+            for (int64_t j = 0; j < layer->M_max; j++) {
+                int64_t id = layer->neighbors[i * layer->M_max + j];
+                TEST_ASSERT_TRUE(id == -1 || loaded->node_level[id] >= l);
+            }
         }
     }
     float query[2] = {0.0f, 0.0f};
