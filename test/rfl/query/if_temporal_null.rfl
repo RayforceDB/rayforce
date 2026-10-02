@@ -1,0 +1,68 @@
+;; `if` with a temporal branch and a bare null literal keeps the temporal
+;; type (issue #673).
+;;
+;; `0N` is an I64 literal and promote() folds DATE + I64 to I64 (TIME to I64,
+;; TIMESTAMP to I64), so `(if c d 0N)` came back as an I64 column of day
+;; numbers with I64 nulls.  ray_if (src/ops/graph.c) now gives a temporal
+;; branch beside a null literal the temporal type and swaps the literal for
+;; the typed null, the same way it already does for a null literal beside a
+;; text branch (#668).  A non-null number beside a temporal still promotes.
+
+(set TD (table [x d t ts] (list (til 4) (as 'DATE [1 2 3 4]) (as 'TIME [1 2 3 4]) (as 'TIMESTAMP [1 2 3 4]))))
+
+;; ── the explicit typed null is the oracle ───────────────────────────────────
+(type (at (select {k: (if (> x 1) d 0Nd) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) d 0Nd) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]
+
+;; ── DATE / TIME / TIMESTAMP beside 0N, both orders ──────────────────────────
+(type (at (select {k: (if (> x 1) d 0N) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) d 0N) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]
+(type (at (select {k: (if (> x 1) 0N d) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) 0N d) from: TD}) 'k) -- [2000.01.02 2000.01.03 0Nd 0Nd]
+(type (at (select {k: (if (> x 1) t 0N) from: TD}) 'k)) -- 'TIME
+(at (select {k: (if (> x 1) t 0N) from: TD}) 'k) -- [0Nt 0Nt 00:00:00.003 00:00:00.004]
+(type (at (select {k: (if (> x 1) 0N t) from: TD}) 'k)) -- 'TIME
+(type (at (select {k: (if (> x 1) ts 0N) from: TD}) 'k)) -- 'TIMESTAMP
+(at (select {k: (if (> x 1) ts 0N) from: TD}) 'k) -- [0Np 0Np 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000004]
+(type (at (select {k: (if (> x 1) 0N ts) from: TD}) 'k)) -- 'TIMESTAMP
+
+;; ── other null literal widths: 0Nf (F64) and 0Ni (I32) ──────────────────────
+(type (at (select {k: (if (> x 1) d 0Nf) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) d 0Nf) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]
+(type (at (select {k: (if (> x 1) 0Nf ts) from: TD}) 'k)) -- 'TIMESTAMP
+(type (at (select {k: (if (> x 1) d 0Ni) from: TD}) 'k)) -- 'DATE
+(type (at (select {k: (if (> x 1) t 0Ni) from: TD}) 'k)) -- 'TIME
+
+;; ── the nulls are nulls, not day numbers ────────────────────────────────────
+(nil? (at (select {k: (if (> x 1) d 0N) from: TD}) 'k)) -- [true true false false]
+(nil? (at (select {k: (if (> x 1) ts 0N) from: TD}) 'k)) -- [true true false false]
+(nil? (at (select {k: (if (> x 1) 0Nf t) from: TD}) 'k)) -- [false false true true]
+
+;; ── cond, update, where:, by: go through the same node ──────────────────────
+(type (at (select {k: (cond ((> x 1) d) (else 0N)) from: TD}) 'k)) -- 'DATE
+(at (select {k: (cond ((> x 1) d) (else 0N)) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]
+(type (at (update {k: (if (> x 1) d 0N) from: TD}) 'k)) -- 'DATE
+(at (update {k: (if (> x 1) ts 0N) from: TD}) 'k) -- [0Np 0Np 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000004]
+(at (select {x: x from: TD where: (nil? (if (> x 1) d 0N))}) 'x) -- [0 1]
+(type (at (select {n: (count x) from: TD by: {k: (if (> x 1) d 0N)}}) 'k)) -- 'DATE
+
+;; ── literal-only and nested branches ────────────────────────────────────────
+(type (at (select {k: (if (> x 1) 2024.01.01 0N) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) 2024.01.01 0N) from: TD}) 'k) -- [0Nd 0Nd 2024.01.01 2024.01.01]
+(type (at (select {k: (if (> x 1) 0Nd 0N) from: TD}) 'k)) -- 'DATE
+(type (at (select {k: (if (> x 1) (if (> x 2) d 0N) 0Nf) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) (if (> x 2) d 0N) 0Nf) from: TD}) 'k) -- [0Nd 0Nd 0Nd 2000.01.05]
+
+;; ── unchanged: a non-null number beside a temporal still promotes ───────────
+(type (at (select {k: (if (> x 1) d 5) from: TD}) 'k)) -- 'I64
+(at (select {k: (if (> x 1) d 5) from: TD}) 'k) -- [5 5 3 4]
+;; a null literal of another temporal type is a null of the branch's type
+(type (at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k)) -- 'DATE
+(at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]
+(type (at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k)) -- 'TIMESTAMP
+(at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k) -- [0Np 0Np 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000004]
+(nil? (at (select {k: (if (> x 1) ts 0Nd) from: TD}) 'k)) -- [true true false false]
+(type (at (select {k: (if (> x 1) 0Np t) from: TD}) 'k)) -- 'TIME
+(nil? (at (select {k: (if (> x 1) 0Np t) from: TD}) 'k)) -- [false false true true]
+;; two typed temporal nulls: the then side wins
+(type (at (select {k: (if (> x 1) 0Nd 0Np) from: TD}) 'k)) -- 'DATE

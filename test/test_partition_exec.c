@@ -1440,7 +1440,8 @@ static test_result_t test_filter_head_zero_limit(void) {
 /* --------------------------------------------------------------------------
  * Test 22: exec_filter_head — non-table / non-BOOL inputs (early returns)
  *
- * Targets filter.c L397 (input->type != RAY_TABLE || pred->type != RAY_BOOL).
+ * Targets the exec_filter_head early returns: a non-table input is passed
+ * through; a non-BOOL predicate over a table is a type error.
  * -------------------------------------------------------------------------- */
 static test_result_t test_filter_head_non_table(void) {
     ray_heap_init();
@@ -1457,7 +1458,9 @@ static test_result_t test_filter_head_non_table(void) {
     TEST_ASSERT_NOT_NULL(r1);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
 
-    /* Non-BOOL pred with a real table */
+    /* Non-BOOL pred with a real table: no mask, a type error (#678).  It
+     * used to pass the whole table through, so `where: x take: k` over an
+     * I64 column returned every row. */
     ray_t* col = ray_vec_new(RAY_I64, 5);
     col->len = 5;
     int64_t sym_d = ray_sym_intern("d", 1);
@@ -1468,10 +1471,10 @@ static test_result_t test_filter_head_non_table(void) {
     non_bool_pred->len = 5;
     ray_t* r2 = exec_filter_head(tbl, non_bool_pred, 3);
     TEST_ASSERT_NOT_NULL(r2);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
 
     ray_release(r1);
-    ray_release(r2);
+    ray_error_free(r2);
     ray_release(pred);
     ray_release(non_bool_pred);
     ray_release(tbl);
