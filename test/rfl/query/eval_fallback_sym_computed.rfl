@@ -1,0 +1,28 @@
+;; eval_fallback_sym_computed.rfl — a projection that evaluates to sym atoms
+;; in the eval-level fallback is collected as a SYM vector, as the DAG path
+;; returns for the same expression (follow-up to eval_fallback_sym_passthrough).
+;;
+;; The fallback's per-row cell collector collapsed every scalar kind but SYM /
+;; STR / GUID into a typed vector; a sym-valued expression — `(if ...)` over
+;; quoted symbols, or a quoted column name `'name` — came back as a LIST of
+;; boxed sym atoms.  SYM atoms now collapse like the other scalars.
+
+(set t (table [name ts i] (list [Alice Bob Carol] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000] [1 2 3])))
+
+;; ─── control: the DAG path ──────────────────────────────────────────────────
+(type (at (select {from: t n: (if (> i 1) 'hi 'lo) x: (+ i 1)}) 'n)) -- 'SYM
+(type (at (select {from: t n: 'name x: (+ i 1)}) 'n)) -- 'SYM
+
+;; ─── the fallback (temporal arithmetic beside it) ───────────────────────────
+(type (at (select {from: t n: (if (> i 1) 'hi 'lo) x: (+ ts 1)}) 'n)) -- 'SYM
+(at (select {from: t n: (if (> i 1) 'hi 'lo) x: (+ ts 1)}) 'n) -- [lo hi hi]
+(type (at (select {from: t n: 'name x: (+ ts 1)}) 'n)) -- 'SYM
+(at (select {from: t n: 'name x: (+ ts 1)}) 'n) -- [Alice Bob Carol]
+
+;; a mixed-type projection still demotes to LIST rather than mis-typing
+(type (at (select {from: t n: (if (> i 1) 'hi 0) x: (+ ts 1)}) 'n)) -- 'LIST
+
+;; ─── per-group fallback: a sym-valued non-aggregate output ──────────────────
+(set g (table [k name ts] (list [a a b] [Alice Bob Carol] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000])))
+(type (at (select {from: g by: k n: (first name) x: (first (+ ts 1))}) 'n)) -- 'SYM
+(at (select {from: g by: k n: (first name) x: (first (+ ts 1))}) 'n) -- [Alice Carol]

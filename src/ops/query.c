@@ -4859,7 +4859,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
 
         if (gi == 0) {
             int8_t t = cell->type;
-            int collapsable = (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID);
+            int collapsable = (t < 0 && t != -RAY_STR && t != -RAY_GUID);
             if (collapsable) {
                 int8_t vt = (int8_t)(-t);
                 result = ray_vec_new(vt, n_groups);
@@ -5061,7 +5061,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
         if (row == 0) {
             int8_t t = cell->type;
-            int collapsable = (t < 0 && t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID);
+            int collapsable = (t < 0 && t != -RAY_STR && t != -RAY_GUID);
             if (collapsable) {
                 result = ray_vec_new((int8_t)-t, nrows);
                 if (!result || RAY_IS_ERR(result)) {
