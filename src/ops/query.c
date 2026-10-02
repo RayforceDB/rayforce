@@ -2391,6 +2391,28 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
 
 static ray_t* query_materialize_parted_col(ray_t* col);
 static bool table_has_parted_columns(ray_t* tbl);
+static ray_t* query_materialize_parted_table(ray_t* tbl);
+
+/* A projection that is a bare, unquoted column name of `tbl` IS that column.
+ * The eval fallback otherwise evaluates it per row and collects the cells;
+ * before the collector collapsed SYM atoms, `name: name` beside a projection
+ * the DAG declines (temporal arithmetic, say) came back as a LIST of boxed
+ * sym atoms, and a join on it matched nothing (rayforce-py#24).  Taking the
+ * column directly is what the DAG path does for the same expression, keeps
+ * every column kind (a LIST column included) as it is, and skips the per-row
+ * walk.  Owned ref, or NULL when the expression is not such a name or
+ * the column is not a plain full-length vector (parted / mapcommon / slice
+ * columns keep the per-row read, which handles them cell by cell). */
+static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t nrows) {
+    if (!expr || expr->type != -RAY_SYM || (expr->attrs & ATTR_QUOTED)) return NULL;
+    ray_t* col = ray_table_get_col(tbl, expr->i64);
+    if (!col || col->type <= 0) return NULL;
+    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+        (col->attrs & RAY_ATTR_SLICE) || ray_len(col) != nrows)
+        return NULL;
+    ray_retain(col);
+    return col;
+}
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * length-changing / reordering builtin (distinct, asc, desc, reverse) that
@@ -2405,27 +2427,6 @@ static bool table_has_parted_columns(ray_t* tbl);
  * (see eval_expr_whole_column).  Matched on the top-level head only —
  * a whole-column verb nested under an element-wise op has ambiguous length
  * semantics and is left to the per-row path. */
-/* A projection that is a bare, unquoted column name of `tbl` IS that column.
- * The eval fallback otherwise evaluates it per row and collects the cells,
- * and eval_expr_per_row never collapses SYM / STR / GUID atoms into a typed
- * vector — so `name: name` beside a projection the DAG declines (temporal
- * arithmetic, say) came back as a LIST of boxed sym atoms, and a join on it
- * matched nothing (rayforce-py#24).  Taking the column directly is what the
- * DAG path does for the same expression and is type-preserving for every
- * column kind.  Owned ref, or NULL when the expression is not such a name or
- * the column is not a plain full-length vector (parted / mapcommon / slice
- * columns keep the per-row read, which handles them cell by cell). */
-static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t nrows) {
-    if (!expr || expr->type != -RAY_SYM || (expr->attrs & ATTR_QUOTED)) return NULL;
-    ray_t* col = ray_table_get_col(tbl, expr->i64);
-    if (!col || col->type <= 0) return NULL;
-    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
-        (col->attrs & RAY_ATTR_SLICE) || ray_len(col) != nrows)
-        return NULL;
-    ray_retain(col);
-    return col;
-}
-
 static int is_whole_column_projection(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -12893,6 +12894,31 @@ by_dict_done:
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                     }
                 }
+                /* The per-row reader has no arm for segmented columns, so a
+                 * projection over a .db.parted.get table raised `type` here.
+                 * Flatten a parted / mapcommon table once, as update does, so
+                 * every projection below sees plain vectors. */
+                if (table_has_parted_columns(tbl)) {
+                    ray_t* flat = query_materialize_parted_table(tbl);
+                    if (!flat || RAY_IS_ERR(flat)) {
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                        ray_graph_free(g); ray_release(tbl);
+                        scratch_free(colops_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
+                    }
+                    ray_release(tbl);
+                    tbl = flat;
+                    ray_graph_free(g);
+                    g = ray_graph_new(tbl);
+                    if (!g) {
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                        ray_release(tbl);
+                        scratch_free(colops_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                    }
+                }
                 ray_t* result = ray_table_new(0);
                 if (!result || RAY_IS_ERR(result)) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
@@ -16251,6 +16277,25 @@ static bool table_has_parted_columns(ray_t* tbl) {
             return true;
     }
     return false;
+}
+
+/* A fresh table with every parted / mapcommon column of `tbl` flattened
+ * (query_materialize_parted_col); plain columns are shared.  Owned. */
+static ray_t* query_materialize_parted_table(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* flat_tbl = ray_table_new(nc);
+    if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* flat_col = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        if (!flat_col || RAY_IS_ERR(flat_col)) {
+            ray_release(flat_tbl);
+            return flat_col ? flat_col : ray_error("oom", NULL);
+        }
+        flat_tbl = ray_table_add_col(flat_tbl, ray_table_col_name(tbl, c), flat_col);
+        ray_release(flat_col);
+        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
+    }
+    return flat_tbl;
 }
 
 typedef struct {

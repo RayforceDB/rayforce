@@ -1,0 +1,30 @@
+;; eval_fallback_parted.rfl — a projection the DAG declines (temporal + - *)
+;; over a partitioned table is answered by the eval-level fallback (review of
+;; #690).
+;;
+;; The fallback evaluated projections straight over the parted table; its
+;; per-row reader has no arm for segmented columns, so `x: (+ d 1)` over a
+;; .db.parted.get table raised `type` while the same query over a flat table
+;; worked.  Parted columns are now flattened before the fallback runs, as
+;; `update` already does.
+;; @requires: posix
+
+(.sys.exec "rm -rf /tmp/rfl_evalfb_parted")
+(set T (table [i str d name] (list [1 2 3 4] (list "a" "" "ccc" "dd") [2001.01.01 2002.01.01 2003.01.01 2004.01.01] [Alice Bob Carol Dan])))
+(.db.splayed.set "/tmp/rfl_evalfb_parted/2024.01.01/t/" T "/tmp/rfl_evalfb_parted/.sym")
+(.db.splayed.set "/tmp/rfl_evalfb_parted/2024.01.02/t/" T "/tmp/rfl_evalfb_parted/.sym")
+(set P (.db.parted.get "/tmp/rfl_evalfb_parted/" 't))
+
+;; ─── control: a compiled projection over the parted table ───────────────────
+(count (select {i: i from: P})) -- 8
+
+;; ─── temporal arithmetic alone, and beside passthroughs of every kind ────────
+(at (select {x: (+ d 1) from: P}) 'x) -- (+ (at P 'd) 1)
+(at (select {i: i x: (+ d 1) from: P}) 'i) -- [1 2 3 4 1 2 3 4]
+(type (at (select {name: name x: (+ d 1) from: P}) 'name)) -- 'SYM
+(at (select {name: name x: (+ d 1) from: P}) 'name) -- [Alice Bob Carol Dan Alice Bob Carol Dan]
+(type (at (select {str: str x: (+ d 1) from: P}) 'str)) -- 'STR
+(at (select {str: str x: (+ d 1) from: P}) 'str) -- (list "a" "" "ccc" "dd" "a" "" "ccc" "dd")
+;; with a where: clause
+(at (select {i: i x: (+ d 1) from: P where: (> i 2)}) 'i) -- [3 4 3 4]
+(.sys.exec "rm -rf /tmp/rfl_evalfb_parted")
