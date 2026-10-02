@@ -44,6 +44,7 @@
 #include <stdio.h>
 
 extern ray_runtime_t* __RUNTIME;
+extern const char* ray_error_msg(void);
 
 /* Small epsilon for F64 comparisons. */
 #define EPS 1e-6
@@ -1032,10 +1033,10 @@ static test_result_t test_hnsw_load_rejects_bad_neighbor(void) {
     PASS();
 }
 
-/* Every persisted edge must point to a node present on the edge's layer.
- * An in-range node ID from a lower layer otherwise makes the index silently
- * lose that path during greedy descent. */
-static test_result_t test_hnsw_load_rejects_invalid_layer_topology(void) {
+/* Older builders could persist a one-way edge to a lower-level node in an
+ * upper layer. Loading should discard that unusable edge, while still
+ * rejecting malformed entry-point and layer-width metadata. */
+static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
     const char* neighbor_dir = "/tmp/ray_hnsw_wrong_layer_neighbor";
     const char* entry_dir = "/tmp/ray_hnsw_wrong_layer_entry";
     const char* width_dir = "/tmp/ray_hnsw_wrong_layer_width";
@@ -1081,8 +1082,26 @@ static test_result_t test_hnsw_load_rejects_invalid_layer_topology(void) {
     TEST_ASSERT_EQ_I(neighbor_err, RAY_OK);
     TEST_ASSERT_EQ_I(entry_err, RAY_OK);
     TEST_ASSERT_EQ_I(width_err, RAY_OK);
-    TEST_ASSERT_NULL(ray_hnsw_load(neighbor_dir));
-    TEST_ASSERT_NULL(ray_hnsw_mmap(neighbor_dir));
+    ray_hnsw_t* loaded = ray_hnsw_load(neighbor_dir);
+    TEST_ASSERT_NOT_NULL(loaded);
+    ray_hnsw_layer_t* layer = &loaded->layers[1];
+    for (int64_t i = 0; i < layer->n_nodes; i++) {
+        for (int64_t j = 0; j < layer->M_max; j++) {
+            int64_t id = layer->neighbors[i * layer->M_max + j];
+            TEST_ASSERT_TRUE(id == -1 || loaded->node_level[id] >= 1);
+        }
+    }
+    float query[2] = {0.0f, 0.0f};
+    int64_t result_id;
+    double result_dist;
+    TEST_ASSERT_EQ_I(ray_hnsw_search(loaded, query, 2, 1, 50, &result_id,
+                                     &result_dist),
+                     1);
+    ray_hnsw_free(loaded);
+
+    loaded = ray_hnsw_mmap(neighbor_dir);
+    TEST_ASSERT_NOT_NULL(loaded);
+    ray_hnsw_free(loaded);
     TEST_ASSERT_NULL(ray_hnsw_load(entry_dir));
     TEST_ASSERT_NULL(ray_hnsw_mmap(entry_dir));
     TEST_ASSERT_NULL(ray_hnsw_load(width_dir));
@@ -1726,6 +1745,16 @@ static test_result_t test_hnsw_load_type_errors(void) {
     r = ray_hnsw_load_fn(scalar);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     ray_release(scalar);
+
+    ray_t* missing = ray_str("/tmp/ray_hnsw_missing_index_error_detail", 40);
+    TEST_ASSERT_NOT_NULL(missing);
+    r = ray_hnsw_load_fn(missing);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_TRUE(strstr(msg, "rebuild it") != NULL);
+    ray_error_free(r);
+    ray_release(missing);
     PASS();
 }
 
@@ -2088,7 +2117,7 @@ const test_entry_t embedding_entries[] = {
     { "embedding/hnsw_build_overflow_rejected", test_hnsw_build_overflow_rejected, emb_setup, emb_teardown },
     { "embedding/hnsw_vec_size_valid_guard", test_hnsw_vec_size_valid_guard, emb_setup, emb_teardown },
     { "embedding/hnsw_load_rejects_bad_neighbor", test_hnsw_load_rejects_bad_neighbor, emb_setup, emb_teardown },
-    { "embedding/hnsw_load_rejects_invalid_layer_topology", test_hnsw_load_rejects_invalid_layer_topology, emb_setup, emb_teardown },
+    { "embedding/hnsw_load_repairs_legacy_layer_edge", test_hnsw_load_repairs_legacy_layer_edge, emb_setup, emb_teardown },
     { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
 
     /* rerank coverage (S7) */

@@ -569,7 +569,10 @@ ray_t* ray_hnsw_load_fn(ray_t* path) {
     memcpy(buf, p, len);
     buf[len] = '\0';
     ray_hnsw_t* idx = ray_hnsw_load(buf);
-    if (!idx) return ray_error("io", NULL);
+    if (!idx)
+        return ray_error("io", "hnsw-load: index '%s' is invalid or incomplete; "
+                               "restore a compatible copy or rebuild it",
+                         buf);
     ray_t* h = hnsw_wrap(idx);
     if (!h || RAY_IS_ERR(h)) { ray_hnsw_free(idx); return h; }
     return h;

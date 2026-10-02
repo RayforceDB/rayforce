@@ -960,20 +960,28 @@ static bool hnsw_persisted_layers_valid(const ray_hnsw_t* idx) {
 
         for (int64_t i = 0; i < layer->n_nodes && valid; i++) {
             bool empty_seen = false;
-            const int64_t* neighbors =
+            int64_t* neighbors =
                 &layer->neighbors[(size_t)i * (size_t)layer->M_max];
+            int64_t kept = 0;
             for (int64_t j = 0; j < layer->M_max; j++) {
                 int64_t id = neighbors[j];
                 if (id == -1) {
                     empty_seen = true;
                     continue;
                 }
-                if (empty_seen || id < 0 || id >= idx->n_nodes ||
-                    idx->node_level[id] < l) {
+                if (empty_seen || id < 0 || id >= idx->n_nodes) {
                     valid = false;
                     break;
                 }
+                /* Older builders could persist the entry point as a one-way
+                 * edge even when it was absent from this upper layer. Such an
+                 * edge was unusable; drop it while preserving valid neighbors. */
+                if (idx->node_level[id] < l)
+                    continue;
+                neighbors[kept++] = id;
             }
+            while (valid && kept < layer->M_max)
+                neighbors[kept++] = -1;
         }
     }
 
