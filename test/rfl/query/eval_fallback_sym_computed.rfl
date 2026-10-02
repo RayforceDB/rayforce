@@ -26,3 +26,9 @@
 (set g (table [k name ts] (list [a a b] [Alice Bob Carol] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000])))
 (type (at (select {from: g by: k n: (first name) x: (first (+ ts 1))}) 'n)) -- 'SYM
 (at (select {from: g by: k n: (first name) x: (first (+ ts 1))}) 'n) -- [Alice Carol]
+
+;; ─── a plain grouped select whose output is a sym cell ──────────────────────
+;; `(at name 0)` is no aggregate, so it takes the per-group collector too; it
+;; used to come back LIST and is SYM now, like the DAG's `(first name)`.
+(type (at (select {from: g by: k n: (at name 0)}) 'n)) -- 'SYM
+(at (select {from: g by: k n: (at name 0)}) 'n) -- [Alice Carol]
