@@ -8,7 +8,7 @@ Rayforce uses a custom memory subsystem — no calls to `malloc` or `free` ever 
 - **Slab cache** — Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.
 - **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated. Note that `ray_retain`/`ray_release`/`ray_cow` are no-ops on `RAY_ERROR` objects, so an error block must be reclaimed with `ray_error_free()` rather than `ray_release()`.
 - **Arena allocator** — For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an `RAY_ATTR_ARENA` flag that makes retain/release no-ops. The entire arena is freed at once when work completes.
-- **Out-of-core spill** — There is no enforced memory ceiling. The heap tracks how much anonymous (RAM) memory it has committed; once an allocation would push that past the **anon watermark** (total physical RAM by default), it is backed by a preallocated disk file instead of anonymous RAM. File-backed pages are always reclaimable to disk, so they can't trigger the OOM killer — the working set spills and the query completes (slowly) rather than being killed. This never rejects work. Total physical RAM is detected at startup for this threshold and for reporting (see `.sys.info` → `total-mem`).
+- **Out-of-core spill** — There is no enforced memory ceiling. The heap tracks how much anonymous (RAM) memory it has committed; once an allocation would push that past the **anon watermark** (by default total physical RAM, or the container's cgroup memory limit when that is smaller — `docker run --memory`, systemd `MemoryMax=`; `-m SIZE` overrides it), it is backed by a preallocated disk file instead of anonymous RAM. File-backed pages are always reclaimable to disk, so they can't trigger the OOM killer — the working set spills and the query completes (slowly) rather than being killed. This never rejects work. Total physical RAM is detected at startup for this threshold and for reporting (see `.sys.info` → `total-mem`).
 
 For a deep dive into the allocator internals, see [Memory Model](../architecture/memory.md).
 
@@ -232,8 +232,10 @@ disk-full error.
 
 **The anon watermark.** So the heap tracks the anonymous (RAM-resident) bytes it
 has committed, and when a new pool or large allocation would push that past the
-watermark — total physical RAM by default — it backs that allocation with a disk
-spill file **instead of** anonymous RAM. This never rejects work; it just routes
+watermark — by default the smaller of total physical RAM and the container's
+cgroup memory limit (cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`,
+including limits set on a parent slice), or the `-m SIZE` flag when given — it
+backs that allocation with a disk spill file **instead of** anonymous RAM. This never rejects work; it just routes
 the overflow to disk so it spills rather than getting OOM-killed. A query like
 `(til 10000000000)` (a 74 GiB vector) on a smaller machine now spills to disk and
 completes (slowly) instead of being terminated. The progress bar's `used / total`

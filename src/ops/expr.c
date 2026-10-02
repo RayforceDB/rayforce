@@ -1602,16 +1602,44 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                 const double* a = (const double*)ap;
                 for (int64_t j = 0; j < n; j++)
                     d[j] = (a[j] != 0.0 && a[j] == a[j]) ? 1 : 0;
+            } else if (t1 == RAY_I32) {
+                const int32_t* a = (const int32_t*)ap;
+                for (int64_t j = 0; j < n; j++)
+                    d[j] = (a[j] != 0 && a[j] != NULL_I32) ? 1 : 0;
+            } else if (t1 == RAY_I16) {
+                const int16_t* a = (const int16_t*)ap;
+                for (int64_t j = 0; j < n; j++)
+                    d[j] = (a[j] != 0 && a[j] != NULL_I16) ? 1 : 0;
+            } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+                const uint8_t* a = (const uint8_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = a[j] ? 1 : 0;
             } else {
                 const int64_t* a = (const int64_t*)ap;
                 for (int64_t j = 0; j < n; j++)
                     d[j] = (a[j] != 0 && a[j] != NULL_I64) ? 1 : 0;
             }
-        } else {
-            const uint8_t* a = (const uint8_t*)ap;
-            switch (opcode) {
-                case OP_NOT: for (int64_t j = 0; j < n; j++) d[j] = !a[j]; break;
-                default: break;
+        } else if (opcode == OP_NOT) {
+            /* The source lane keeps its producer's width: a REG_SCAN of a
+             * BOOL column is widened to I64 (register-widening invariant),
+             * a comparison result is a 1-byte BOOL scratch, a narrowing
+             * CAST leaves I32/I16, a float lane is F64.  Read it at that
+             * width (#693: the I64-widened BOOL column read as bytes gave
+             * `!0` = true for every lane but the first). */
+            if (t1 == RAY_F64) {
+                const double* a = (const double*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0.0) ? 1 : 0;
+            } else if (t1 == RAY_I64) {
+                const int64_t* a = (const int64_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0) ? 1 : 0;
+            } else if (t1 == RAY_I32) {
+                const int32_t* a = (const int32_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0) ? 1 : 0;
+            } else if (t1 == RAY_I16) {
+                const int16_t* a = (const int16_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0) ? 1 : 0;
+            } else {
+                const uint8_t* a = (const uint8_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = !a[j];
             }
         }
     } else if (dt == RAY_I32) {
@@ -3057,7 +3085,14 @@ static void binary_range(ray_op_t* op, int8_t out_type,
      * (!= MobilePhoneModel "") = 15 ms vs ~1 ms on the typed-pointer
      * path).  Specialise on column width here so the inner loop reduces
      * to a typed pointer dereference + compare + store. */
-    if (out_type == RAY_BOOL && !l_scalar && r_scalar &&
+    /* The scalar must be integer-family too: a float scalar (an aggregate
+     * such as (avg col), or any computed F64 atom / 1-elem vec) was decoded
+     * into r_f64 by the caller and r_i64 is still 0, so this kernel would
+     * compare every row against 0 (#694).  Float scalars take the generic
+     * BOOL path below, which promotes both sides to double. */
+    bool r_scalar_float = rhs->type == -RAY_F64 || rhs->type == -RAY_F32 ||
+                          rhs->type ==  RAY_F64 || rhs->type ==  RAY_F32;
+    if (out_type == RAY_BOOL && !l_scalar && r_scalar && !r_scalar_float &&
         (op->opcode == OP_EQ || op->opcode == OP_NE ||
          op->opcode == OP_LT || op->opcode == OP_LE ||
          op->opcode == OP_GT || op->opcode == OP_GE) &&

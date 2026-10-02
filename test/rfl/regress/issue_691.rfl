@@ -1,0 +1,25 @@
+;; #691: a compiled `if` whose branches are GUID columns kept promote()'s
+;; fallthrough type (B8) and the fill read the 16-byte cells as bytes.
+(set T691 (table [i g] (list [1 2 3 4] (guid 4))))
+(set G691 (at T691 'g))
+(set G1 (first (guid 1)))
+(type (at (select {w: (if (> i 2) g g) from: T691}) 'w)) -- 'GUID
+(all (== (at (select {w: (if (> i 2) g g) from: T691}) 'w) G691)) -- true
+(type (at (select {w: (if true g g) from: T691}) 'w)) -- 'GUID
+(type (at (select {w: (if (> i 2) g g) from: T691 where: (> i 1)}) 'w)) -- 'GUID
+(type (at (update {w: (if (> i 2) g g) from: T691}) 'w)) -- 'GUID
+(type (at (select {w: (cond ((> i 2) g) (else g)) from: T691}) 'w)) -- 'GUID
+;; scalar GUID branch (an env-bound atom compiles as a const)
+(set W691 (at (select {w: (if (> i 2) g G1) from: T691}) 'w))
+(type W691) -- 'GUID
+(== (at W691 0) G1) -- true
+(== (at W691 1) G1) -- true
+(== (at W691 2) (at G691 2)) -- true
+(== (at W691 3) (at G691 3)) -- true
+;; mixed GUID / numeric branches have no column type: the DAG declines
+;; instead of reading GUID bytes as integers
+(type (at (select {w: (if (> i 2) g i) from: T691}) 'w)) -- 'LIST
+;; a LIST column scans as the untyped node and fell into the same B8 fill
+(set TL (table [i l] (list [1 2 3 4] (list [1 2] [3] [4 5 6] [7]))))
+(type (at (select {w: (if (> i 2) l l) from: TL}) 'w)) -- 'LIST
+(at (select {w: (if (> i 2) l l) from: TL}) 'w) -- (list [1 2] [3] [4 5 6] [7])

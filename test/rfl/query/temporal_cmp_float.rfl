@@ -1,0 +1,49 @@
+;; temporal_cmp_float.rfl — comparing a temporal column with a float inside
+;; a query is the same type error as outside one (#694).
+;;
+;; avg of a temporal column is F64 (canonical admission).  Outside a query
+;; (> ts (avg ts)) is "cannot compare timestamp and f64" (cmp.c); inside a
+;; select the generic DAG kernel promoted both sides to double, where a
+;; TIMESTAMP near 2024 has a 128 ns ULP: every row compared equal to the
+;; mean, so (> ts (avg ts)) was all false and (== ts (avg ts)) all true.
+;; The compiler now rejects a temporal-vs-float compare with the builtin
+;; error (the per-row fallback would average one cell and compare it with
+;; itself).  Same-typed temporal compares stay on the exact int64 kernel.
+(set T (table [i ts] (list [1 2 3 4] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 4))))))
+
+;; the aggregate is F64 in and out of a query
+(type (avg (at T 'ts))) -- 'f64
+(type (at (select {m: (avg ts) from: T}) 'm)) -- 'F64
+
+;; temporal vs the F64 aggregate: both paths raise the type error
+(> (at T 'ts) (avg (at T 'ts))) !- type
+(select {c: (> ts (avg ts)) from: T}) !- type
+(select {c: (< ts (avg ts)) from: T}) !- type
+(select {c: (>= ts (avg ts)) from: T}) !- type
+(select {c: (<= ts (avg ts)) from: T}) !- type
+(select {c: (== ts (avg ts)) from: T}) !- type
+(select {c: (!= ts (avg ts)) from: T}) !- type
+(select {c: (> (avg ts) ts) from: T}) !- type
+(select {from: T where: (> ts (avg ts))}) !- type
+(select {c: (if (> ts (avg ts)) 1 0) from: T}) !- type
+(update {c: (> ts (avg ts)) from: T}) !- type
+(select {c: (> ts (med ts)) from: T}) !- type
+
+;; temporal vs a float literal, DATE and TIME too
+(> (at T 'ts) 1.5) !- type
+(select {c: (> ts 1.5) from: T}) !- type
+(select {from: T where: (< ts 1.5)}) !- type
+(set Ttm (table [d t] (list (as 'DATE [10 20]) (as 'TIME [1000 2000]))))
+(select {c: (> d 1.5) from: Ttm}) !- type
+(select {c: (> t 1.5) from: Ttm}) !- type
+(select {c: (> d (avg d)) from: Ttm}) !- type
+
+;; same temporal type on both sides stays exact (rows 10 ns apart near 2024)
+(at (select {c: (> ts 2024.01.01D00:00:00.000000015) from: T}) 'c) -- [false false true true]
+(at (select {c: (>= ts (max ts)) from: T}) 'c) -- [false false false true]
+(at (select {c: (== ts (first ts)) from: T}) 'c) -- [true false false false]
+(at (select {c: (!= ts 2024.01.01D00:00:00.000000010) from: T}) 'c) -- [true false true true]
+(count (select {from: T where: (> ts 2024.01.01D00:00:00.000000015)})) -- 2
+;; integer scalars keep the exact int64 kernel
+(at (select {c: (> ts 757382400000000015) from: T}) 'c) -- [false false true true]
+(at (select {c: (> i (avg i)) from: T}) 'c) -- [false false true true]

@@ -94,6 +94,25 @@ static test_result_t test_thread_create_join(void) {
     PASS();
 }
 
+/* ---- test_cgroup_mem_limit --------------------------------------------- */
+
+/* The probe must be defensive: never negative, and never larger than the
+ * host's physical RAM when a container limit is in force.  Whether a limit
+ * IS in force depends on how the suite is launched (docker --memory,
+ * systemd MemoryMax), so only the invariants are asserted here; the
+ * limited case is verified by hand with `systemd-run --scope -p MemoryMax`
+ * (issue #688). */
+static test_result_t test_cgroup_mem_limit(void) {
+    int64_t cg = ray_os_cgroup_mem_limit();
+    TEST_ASSERT(cg >= 0, "cgroup limit is never negative");
+    /* A second probe reads the same files and must agree. */
+    TEST_ASSERT_EQ_I(ray_os_cgroup_mem_limit(), cg);
+#ifndef RAY_OS_LINUX
+    TEST_ASSERT_EQ_I(cg, 0);
+#endif
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t platform_entries[] = {
@@ -101,6 +120,7 @@ const test_entry_t platform_entries[] = {
     { "platform/vm_alloc_aligned", test_vm_alloc_aligned, NULL, NULL },
     { "platform/thread_count", test_thread_count, NULL, NULL },
     { "platform/thread_create_join", test_thread_create_join, NULL, NULL },
+    { "platform/cgroup_mem_limit", test_cgroup_mem_limit, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

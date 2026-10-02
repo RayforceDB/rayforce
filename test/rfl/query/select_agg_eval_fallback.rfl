@@ -1,0 +1,62 @@
+;; An aggregate projected beside a projection the DAG declines (issue #692).
+;;
+;; A temporal `+ - *` makes compile_expr_dag decline the projection, so the
+;; whole select lands in the eval fallback (src/ops/query.c, the loop over
+;; eval_expr_whole_column / eval_expr_per_row).  There every non-whole-column
+;; projection was scattered per row, and an aggregate saw a one-cell slice of
+;; each column: `(max i)` came back as `i` itself.  A projection with no
+;; column ref outside an aggregate (expr_refs_row_column == 0) is now
+;; evaluated once over the whole table and broadcast the way the DAG path
+;; broadcasts it: to the row count beside a row projection, one row when
+;; every projection is such a value.
+;;
+;; Oracle: the DAG path with a plain (non-temporal) row projection beside it.
+
+(set T (table [i ts] (list [1 2 3 4] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 4))))))
+
+;; ── the DAG rule this must match: an aggregate beside a row column broadcasts ─
+(at (select {m: (max i) x: i from: T}) 'm) -- [4 4 4 4]
+(at (select {m: (+ (max i) 1) x: i from: T}) 'm) -- [5 5 5 5]
+
+;; ── aggregate beside a declined (temporal) projection ───────────────────────
+(at (select {m: (max i) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
+(at (select {x: (+ ts 1) m: (max i) from: T}) 'm) -- [4 4 4 4]
+(at (select {m: (sum i) x: (+ ts 1) from: T}) 'm) -- [10 10 10 10]
+(at (select {m: (count i) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
+(at (select {m: (max i) x: (+ ts 1) from: T}) 'x) -- (+ (at T 'ts) 1)
+(count (select {m: (max i) x: (+ ts 1) from: T})) -- 4
+
+;; ── the aggregate nested under arithmetic, or under a scalar `if` ───────────
+(at (select {m: (+ (max i) 1) x: (+ ts 1) from: T}) 'm) -- [5 5 5 5]
+(at (select {k: (if (> (count i) 3) 1 0) x: (+ ts 1) from: T}) 'k) -- [1 1 1 1]
+(at (select {m: (count (distinct i)) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
+
+;; ── the declined projection is itself the aggregate ──────────────────────────
+(at (select {s: (+ (max ts) 1) x: i from: T}) 's) -- (take (+ (max (at T 'ts)) 1) 4)
+
+
+;; ── where: filters before the aggregate sees the column ──────────────────────
+(at (select {m: (max i) x: (+ ts 1) from: T where: (> i 1)}) 'm) -- [4 4 4]
+(at (select {m: (min i) x: (+ ts 1) from: T where: (> i 1)}) 'm) -- [2 2 2]
+(count (select {m: (max i) x: (+ ts 1) from: T where: (> i 10)})) -- 0
+
+;; ── a later projection reads the broadcast value ─────────────────────────────
+(at (select {m: (max i) y: (+ m 1) x: (+ ts 1) from: T}) 'y) -- [5 5 5 5]
+
+;; ── every projection an aggregate: one row, as the DAG path returns ─────────
+(count (select {m: (max i) s: (+ (max ts) 1) from: T})) -- 1
+(at (select {m: (max i) s: (+ (max ts) 1) from: T}) 'm) -- [4]
+(at (select {m: (max i) s: (+ (max ts) 1) from: T}) 's) -- (list (+ (max (at T 'ts)) 1))
+(count (select {s: (+ (max ts) 1) from: T})) -- 1
+
+;; ── a later projection without an aggregate is a row projection, as on the DAG path ─
+(count (select {m: (max i) y: (+ m 1) from: T})) -- 4
+(count (select {m: (max ts) y: (+ m 1) from: T})) -- 4
+
+;; ── projections without an aggregate keep the row-by-row path ────────────────
+(at (select {l: 7 x: (+ ts 1) from: T}) 'l) -- [7 7 7 7]
+(at (select {k: ((fn [a] (if (> a 2) 1 0)) i) x: (+ ts 1) from: T}) 'k) -- [0 0 1 1]
+(count (select {l: 7 s: (+ (max ts) 1) from: T})) -- 4
+
+;; ── a length-changing verb beside an aggregate is still ragged ───────────────
+(select {a: (distinct i) m: (max i) from: (table [i] (list [1 2 2 3]))}) !- length

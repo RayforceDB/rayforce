@@ -1,0 +1,43 @@
+;; Select eval fallback: a per-row / per-group projection that produces GUID
+;; atoms is collapsed into a GUID column, not left as a LIST of GUID atoms.
+;; `(+ ts 1)` beside the projection keeps the whole select on the eval
+;; fallback (the DAG declines the temporal arithmetic), so every shape below
+;; reaches eval_expr_per_row / nonagg_eval_per_group_core in query.c.
+(set GV (as 'GUID (list "11111111-1111-4111-8111-111111111111" "22222222-2222-4222-8222-222222222222" "33333333-3333-4333-8333-333333333333" "44444444-4444-4444-8444-444444444444")))
+(set G0 (as 'GUID "00000000-0000-0000-0000-000000000000"))
+(set G1 (at GV 0))
+(set T (table [i g ts s] (list [1 2 3 4] GV (+ 2024.01.01D00:00:00.000000000 (* 10 (til 4))) [a a b b])))
+
+;; ─── ungrouped per-row scatter ─────────────────────────────────────
+(type (at (select {w: (if (> i 2) g g) x: (+ ts 1) from: T}) 'w)) -- 'GUID
+(at (select {w: (if (> i 2) g g) x: (+ ts 1) from: T}) 'w) -- GV
+(at (select {w: (if (> i 2) g (at GV (- 3 i))) x: (+ ts 1) from: T}) 'w) -- (as 'GUID (list "33333333-3333-4333-8333-333333333333" "22222222-2222-4222-8222-222222222222" "33333333-3333-4333-8333-333333333333" "44444444-4444-4444-8444-444444444444"))
+;; a GUID atom global in one branch
+(type (at (select {w: (if (> i 2) g G1) x: (+ ts 1) from: T}) 'w)) -- 'GUID
+(at (select {w: (if (> i 2) g G1) x: (+ ts 1) from: T}) 'w) -- (as 'GUID (list "11111111-1111-4111-8111-111111111111" "11111111-1111-4111-8111-111111111111" "33333333-3333-4333-8333-333333333333" "44444444-4444-4444-8444-444444444444"))
+;; GUID null atoms collapse too and stay null in the column
+(type (at (select {w: (if (> i 2) g G0) x: (+ ts 1) from: T}) 'w)) -- 'GUID
+(nil? (at (select {w: (if (> i 2) g G0) x: (+ ts 1) from: T}) 'w)) -- [true true false false]
+(nil? (at (select {w: (if (> i 2) G0 G0) x: (+ ts 1) from: T}) 'w)) -- [true true true true]
+(type (at (select {w: (if (> i 2) G0 G0) x: (+ ts 1) from: T}) 'w)) -- 'GUID
+;; a lambda projection
+(type (at (select {w: ((fn [x y] (if (> y 2) x G1)) g i) x: (+ ts 1) from: T}) 'w)) -- 'GUID
+;; mixed GUID / numeric rows have no common column type: still a LIST
+(type (at (select {w: (if (> i 2) g i) x: (+ ts 1) from: T}) 'w)) -- 'LIST
+(at (select {w: (if (> i 2) g i) x: (+ ts 1) from: T}) 'w) -- (list 1 2 (at GV 2) (at GV 3))
+
+;; ─── grouped: derived output evaluated once per group ──────────────
+(type (at (select {w: (if (> (sum i) 3) (first g) G1) x: (+ (first ts) 1) by: s from: T}) 'w)) -- 'GUID
+(at (select {w: (if (> (sum i) 3) (first g) G1) x: (+ (first ts) 1) by: s from: T}) 'w) -- (as 'GUID (list "11111111-1111-4111-8111-111111111111" "33333333-3333-4333-8333-333333333333"))
+(type (at (select {w: (if (> (sum i) 3) (first g) (sum i)) x: (+ (first ts) 1) by: s from: T}) 'w)) -- 'LIST
+;; grouped: non-aggregate lambda evaluated per group slice
+(type (at (select {w: ((fn [x] (last x)) g) by: s from: T}) 'w)) -- 'GUID
+(at (select {w: ((fn [x] (last x)) g) by: s from: T}) 'w) -- (as 'GUID (list "22222222-2222-4222-8222-222222222222" "44444444-4444-4444-8444-444444444444"))
+(nil? (at (select {w: ((fn [x] (if (> (count x) 1) G0 (first x))) g) by: s from: T}) 'w)) -- [true true]
+(type (at (select {w: ((fn [x] (if (> (count x) 1) G0 (first x))) g) by: s from: T}) 'w)) -- 'GUID
+
+;; ─── the collapsed column is a real GUID column downstream ─────────
+(count (distinct (at (select {w: (if (> i 2) g G1) x: (+ ts 1) from: T}) 'w))) -- 3
+(type (at (select {w: (if (> i 2) g g) x: (+ ts 1) from: T asc: w}) 'w)) -- 'GUID
+(count (select {w: (if (> i 2) g G1) x: (+ ts 1) from: T where: (== i 3)})) -- 1
+(type (at (update {w: ((fn [x y] (if (> y 2) x G1)) g i) from: T}) 'w)) -- 'GUID

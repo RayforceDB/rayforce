@@ -30,6 +30,8 @@
 #include "core/sock.h"      /* ray_sock_* */
 #include "core/poll.h"      /* ray_poll_t, ray_poll_create/destroy */
 #include "core/timer.h"     /* ray_timers_t, ray_timers_pump_for */
+#include "core/platform.h"  /* ray_os_cgroup_mem_limit */
+#include "mem/heap.h"       /* ray_heap_anon_watermark */
 #include "lang/format.h"    /* ray_fmt for eval_err */
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,6 +313,29 @@ static test_result_t test_oom_sentinel_is_well_formed(void) {
     /* Re-check: still well-formed after a "free" attempt. */
     TEST_ASSERT_TRUE(RAY_IS_ERR(RAY_OOM_OBJ));
     TEST_ASSERT_EQ_I(strcmp(ray_err_code(RAY_OOM_OBJ), "oom"), 0);
+    PASS();
+}
+
+/* The default anon watermark is the RAM this process may actually use:
+ * physical RAM, capped by a container / cgroup limit when one is set
+ * (#688).  It must be positive and never above physical RAM, and the heap's
+ * default watermark must resolve to it. */
+static test_result_t test_ram_limit_caps_total_ram(void) {
+    ray_err_t err = RAY_OK;
+    ray_runtime_t* rt = ray_runtime_create_with_sym_err(NULL, &err);
+    TEST_ASSERT_NOT_NULL(rt);
+    int64_t phys  = ray_sys_total_ram();
+    int64_t limit = ray_sys_ram_limit();
+    TEST_ASSERT(phys > 0, "physical RAM detected");
+    TEST_ASSERT(limit > 0, "ram limit detected");
+    TEST_ASSERT(limit <= phys, "ram limit never exceeds physical RAM");
+    int64_t cg = ray_os_cgroup_mem_limit();
+    TEST_ASSERT_EQ_I(limit, (cg > 0 && cg < phys) ? cg : phys);
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(0);                /* 0 = default */
+    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), limit);
+    ray_heap_set_anon_watermark(previous == limit ? 0 : previous);
+    ray_runtime_destroy(rt);
     PASS();
 }
 
@@ -1322,6 +1347,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/lambda_self_sym_per_runtime", test_lambda_self_sym_per_runtime, NULL, NULL },
     { "runtime/create_with_sym_oversized_file", test_create_with_sym_oversized_file, NULL, NULL },
     { "runtime/oom_sentinel_is_well_formed", test_oom_sentinel_is_well_formed, NULL, NULL },
+    { "runtime/ram_limit_caps_total_ram", test_ram_limit_caps_total_ram, NULL, NULL },
     { "runtime/sock_close_invalid",                  test_sock_close_invalid,                  NULL, NULL },
     { "runtime/sock_listen_bind_fails_eaddrinuse",   test_sock_listen_bind_fails_eaddrinuse,   NULL, NULL },
     { "runtime/sock_connect_bad_host",               test_sock_connect_bad_host,               NULL, NULL },

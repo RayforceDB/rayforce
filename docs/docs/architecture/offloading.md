@@ -146,4 +146,4 @@ When adding new element-wise operations to Rayforce, they must be added to the `
 - **Pruning requires literal constants** — the partition pruning pass only handles comparisons against literal values (e.g., `date > 2024.01.01`), not computed expressions (e.g., `date > (today - 30)`).
 - **Single partition column** — pruning works on the single partition key inferred from directory names. Multi-column partition keys are not supported.
 - **Thread-local memory pressure** — `ray_mem_pressure()` only reads the calling thread's heap statistics, not the global total across all worker threads. It is not currently used in the streaming hot path.
-- **Container memory detection** — on Linux, `sysconf(_SC_PHYS_PAGES)` reports host physical RAM, not the container's cgroup memory limit. A future release will read `/sys/fs/cgroup/memory.max` when available.
+- **Container memory detection** — on Linux the anon watermark (spill threshold) is capped by the cgroup memory limit (`memory.max` / `memory.limit_in_bytes`, nearest ancestor included), but `.sys.info` → `total-mem` still reports host physical RAM.

@@ -260,10 +260,11 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
     ray_vm_init(rt->vms[0], 0);
     __VM = rt->vms[0];
 
-    /* Detect total physical RAM (informational — surfaced via .sys.mem and
+    /* Detect total physical RAM (informational — surfaced via .sys.info and
      * used as a sanity bound for the sym-file pre-load check below). There is
      * NO enforced memory ceiling: the heap is out-of-core and spills to a
-     * file-backed mapping when anonymous mmap is refused (see heap_add_pool). */
+     * file-backed mapping once its anon footprint reaches the watermark (see
+     * heap_add_pool), whose default is ram_limit below. */
 #ifdef RAY_OS_WINDOWS
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
@@ -279,6 +280,14 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
     else
         rt->total_ram = (int64_t)(4ULL << 30);
 #endif
+    /* A container / cgroup limit below host RAM is where the OOM killer
+     * actually fires, so the spill threshold defaults to the smaller of the
+     * two (#688).  An explicit -m / ray_heap_set_anon_watermark still wins. */
+    rt->ram_limit = rt->total_ram;
+    {
+        int64_t cg = ray_os_cgroup_mem_limit();
+        if (cg > 0 && cg < rt->ram_limit) rt->ram_limit = cg;
+    }
 
     /* __RUNTIME must be visible before ray_sym_load so the sym-load size
      * check and ray_error() both operate against the live runtime. */
@@ -372,6 +381,10 @@ void* ray_runtime_get_sys_args(void) {
 
 int64_t ray_sys_total_ram(void) {
     return __RUNTIME ? __RUNTIME->total_ram : 0;
+}
+
+int64_t ray_sys_ram_limit(void) {
+    return __RUNTIME ? __RUNTIME->ram_limit : 0;
 }
 
 int8_t ray_obj_type(ray_t* v) {
