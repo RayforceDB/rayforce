@@ -222,7 +222,7 @@ The global symbol intern table maps strings to integer IDs. When saving data to 
 
 ### Append-Only .sym Files
 
-Symbol files use an append-only format. New symbols are appended to the end of the file without rewriting existing entries. This makes concurrent writes safe and enables incremental updates.
+Symbol files use an append-only format. New symbols are appended to the end of the file without rewriting existing entries, so a symbol's position never changes and updates are incremental. One process writes a database at a time: a writer whose view of the file is out of date fails with `RAY_ERR_CORRUPT` instead of overwriting another writer's symbols (see [Running Several Instances](../guides/instances.md)).
 
 | Function | Description |
 |---|---|
@@ -243,7 +243,7 @@ ray_sym_load("db/.sym");
 ### Concurrency and Integrity
 
 - **File locking** — `flock()` on POSIX, `LockFileEx()` on Windows. Multiple processes can safely read the symbol file; writes acquire an exclusive lock.
-- **Corruption detection** — symbol files include checksums. If a file is truncated or corrupted, `ray_sym_load()` returns `RAY_ERR_CORRUPT` and leaves the in-memory table unchanged.
+- **Corruption detection** — symbol files carry no checksum. The loader checks the magic, the entry count and every entry's length; a truncated or malformed file makes `ray_sym_load()` return `RAY_ERR_CORRUPT`.
 - **Arena backing** — interned strings are allocated from a dedicated arena (`ray_arena_t`), making bulk allocation fast and ensuring all strings are freed together when the symbol table is destroyed.
 
 ## CSV Import and Export
@@ -412,7 +412,7 @@ For every table present in **any** partition, ensures **every** partition has it
 
 Symbol tables are persisted automatically when you use `.db.splayed.set`. A `.sym` file is written into the table directory containing all interned symbol strings. When loading with `.db.splayed.get` or `.db.parted.get`, the symbol table is loaded first so that symbol columns decode correctly.
 
-At the C API level, `ray_sym_save(path)` and `ray_sym_load(path)` handle persistence directly. The format is append-only — new symbols are appended without rewriting existing entries, making concurrent access safe.
+At the C API level, `ray_sym_save(path)` and `ray_sym_load(path)` handle persistence directly. `ray_sym_save` writes the whole runtime table to a temporary file and renames it over `path`; one process writes a given file.
 
 ## Working Example: Round-Trip
 
