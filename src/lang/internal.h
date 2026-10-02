@@ -364,7 +364,11 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
             case RAY_I16:
                 ((int16_t*)ray_data(vec))[i] = NULL_I16; break;
             default: {
-                int esz = ray_elem_size(vec->type);
+                /* A SYM cell is 1, 2, 4 or 8 bytes by the vector's width;
+                 * ray_elem_size(SYM) is the 8 of the widest, which cleared
+                 * the next cells of a narrow column and wrote past its end. */
+                int esz = vec->type == RAY_SYM ? ray_sym_elem_size(vec->type, vec->attrs)
+                                               : ray_elem_size(vec->type);
                 memset((char*)ray_data(vec) + i * esz, 0, esz);
                 break;
             }

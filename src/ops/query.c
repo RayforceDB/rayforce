@@ -6565,6 +6565,24 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     return 1;
 }
 
+/* A where: predicate with one value (`false`, `(== (count x) 5)`) holds for
+ * every row or none: spread it into a full mask of `tn` rows, as the table
+ * filter does.  Consumes `m`; returns it unchanged when it is no scalar, or
+ * when it is a symbol or string atom (no truth value; the caller's type
+ * check reports it). */
+static ray_t* where_mask_spread(ray_t* m, int64_t tn) {
+    if (!m || RAY_IS_ERR(m)) return m;
+    bool atom = ray_is_atom(m) && ray_pred_atom_type_ok(m->type);
+    if (!atom && !(m->type == RAY_BOOL && m->len == 1 && tn != 1)) return m;
+    uint8_t on = atom ? (is_truthy(m) ? 1 : 0) : ((const uint8_t*)ray_data(m))[0];
+    ray_release(m);
+    ray_t* v = ray_vec_new(RAY_BOOL, tn);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = tn;
+    if (tn > 0) memset(ray_data(v), on, (size_t)tn);
+    return v;
+}
+
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (handled) *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2) return NULL;
@@ -6709,6 +6727,12 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
         return pred_vec ? pred_vec : ray_error("type", "select count: WHERE predicate evaluation failed");
     }
     int64_t tbl_nrows = ray_table_nrows(tbl);
+    pred_vec = where_mask_spread(pred_vec, tbl_nrows);
+    if (!pred_vec || RAY_IS_ERR(pred_vec)) {
+        ray_graph_free(g);
+        ray_release(tbl);
+        return pred_vec ? pred_vec : ray_error("oom", NULL);
+    }
     if (pred_vec->type != RAY_BOOL || pred_vec->len != tbl_nrows) {
         int8_t pred_t = pred_vec->type;            /* capture BEFORE free */
         ray_release(pred_vec);
@@ -14089,6 +14113,8 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
     }
     if (!mask_vec) return ray_error("type", "update: `where:` predicate evaluation failed");
     if (RAY_IS_ERR(mask_vec)) return mask_vec;
+    mask_vec = where_mask_spread(mask_vec, ray_table_nrows(tbl));
+    if (!mask_vec || RAY_IS_ERR(mask_vec)) return mask_vec ? mask_vec : ray_error("oom", NULL);
     if (mask_vec->type != RAY_BOOL || mask_vec->len != ray_table_nrows(tbl)) {
         int8_t mask_t = mask_vec->type;
         ray_release(mask_vec);
@@ -14354,7 +14380,18 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
             break;
         }
     }
-    if (!rowwise) {
+    /* A dict entry naming no column adds one; that is the general path's
+     * job (this one writes existing columns in place and dropped it). */
+    bool adds_col = false;
+    for (int64_t d = 0; d + 1 < updf_n && !adds_col; d += 2) {
+        int64_t kid = updf[d]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id) continue;
+        bool found = false;
+        for (int64_t i = 0; i < nu; i++)
+            if (ray_table_col_name(tbl, ucol[i]) == kid) { found = true; break; }
+        if (!found) adds_col = true;
+    }
+    if (!rowwise || adds_col) {
         scratch_free(ucol_hdr); scratch_free(uexpr_hdr); scratch_free(uval_hdr);
         DICT_VIEW_CLOSE(updf);
         return NULL;
@@ -14799,6 +14836,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             ray_env_pop_scope();
         }
         if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("type", "update: `where:` predicate evaluation failed"); }
+        mask_vec = where_mask_spread(mask_vec, nrows);
+        if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("oom", NULL); }
         if (mask_vec->type != RAY_BOOL || mask_vec->len != nrows) {
             int8_t mask_t = mask_vec->type;            /* capture BEFORE free */
             ray_release(mask_vec);
@@ -15105,6 +15144,55 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_release(new_col);
                 ray_release(expr_vec);
             }
+            if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
+        }
+
+        /* New columns (in the dict, not in the table): the expression's
+         * value on the matched rows and null on the rest — false / 0x00 for
+         * BOOL and U8, which have no null.  The loop above walks the table's
+         * columns only, so these used to be dropped without a word. */
+        for (int64_t d = 0; d + 1 < dict_n; d += 2) {
+            int64_t kid = dict_elems[d]->i64;
+            if (kid == from_id || kid == where_id) continue;
+            bool exists = false;
+            for (int64_t c = 0; c < ncols; c++)
+                if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
+            if (exists) continue;
+            ray_t* v = update_eval_on(tbl, dict_elems[d + 1]);
+            if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
+                ray_t* wide;
+                if (v->type == -RAY_STR) {
+                    wide = broadcast_scalar(v, nrows);
+                } else {
+                    ray_t* n_obj = make_i64(nrows);
+                    wide = n_obj ? ray_take_fn(v, n_obj) : ray_error("oom", NULL);
+                    if (n_obj) ray_release(n_obj);
+                }
+                ray_release(v);
+                v = wide;
+            }
+            if (v && !RAY_IS_ERR(v) && !ray_is_vec(v)) {
+                int8_t vt = v->type;
+                ray_release(v);
+                v = ray_error("type", "update: a new column under where: must be a typed vector, got %s",
+                              ray_type_name(vt));
+            } else if (v && !RAY_IS_ERR(v) && v->len != nrows) {
+                int64_t got = v->len;
+                ray_release(v);
+                v = ray_error("length", "update: new column has %lld values for %lld rows",
+                              (long long)got, (long long)nrows);
+            }
+            if (v && !RAY_IS_ERR(v)) v = ray_cow(v);
+            if (!v || RAY_IS_ERR(v)) {
+                ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw);
+                return v ? v : ray_error("oom", NULL);
+            }
+            ray_t* nul = ray_typed_null((int8_t)-v->type);
+            for (int64_t r = 0; r < nrows && nul && !RAY_IS_ERR(nul); r++)
+                if (!mask[r]) store_typed_elem(v, r, nul);
+            if (nul && !RAY_IS_ERR(nul)) ray_release(nul);
+            result = ray_table_add_col(result, kid, v);
+            ray_release(v);
             if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
         }
 

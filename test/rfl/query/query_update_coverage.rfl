@@ -635,3 +635,36 @@
 (at (update {t: (first t) from: TLS by: g}) 't) -- ["first-long-pooled-string-aaaa" "first-long-pooled-string-aaaa" "short" "short" "third-long-pooled-string-ccc"]
 (at (update {t: t from: TLS by: g}) 't) -- (at TLS 't)
 (at (update {k: (upper t) from: TLS by: g}) 'k) -- (upper (at TLS 't))
+
+;; Under where: a new column takes the expression on the matched rows and null
+;; on the rest (false / 0x00 for BOOL and U8, which have no null).  Both the
+;; copy path and the in-place path walked the table's columns only and dropped
+;; it without an error.
+(set TWn (table [x s] (list (til 4) ['ab 'cd 'ef 'gh])))
+(key (update {k: (+ x 1) from: TWn where: (> x 1)})) -- ['x 's 'k]
+(at (update {k: (+ x 1) from: TWn where: (> x 1)}) 'k) -- [0N 0N 3 4]
+(as 'STR (at (update {k: s from: TWn where: (> x 1)}) 'k)) -- ["" "" "ef" "gh"]
+(nil? (at (update {k: s from: TWn where: (> x 1)}) 'k)) -- [true true false false]
+(at TWn 's) -- ['ab 'cd 'ef 'gh]
+(at (update {k: 7 from: TWn where: (> x 1)}) 'k) -- [0N 0N 7 7]
+(at (update {k: "zz" from: TWn where: (> x 1)}) 'k) -- ["" "" "zz" "zz"]
+(at (update {k: (> x 1) from: TWn where: (> x 1)}) 'k) -- [false false true true]
+(at (update {k: (as 'U8 x) from: TWn where: (> x 1)}) 'k) -- (as 'U8 [0 0 2 3])
+(update {k: (+ x 1) from: 'TWn where: (> x 1)})
+(at TWn 'k) -- [0N 0N 3 4]
+(update {b: (> x 2) from: 'TWn where: (> x 1)})
+(at TWn 'b) -- [false false false true]
+;; ...on a FILE-domain SYM column too, whose cells are 1, 2 or 4 bytes: the
+;; null write cleared 8 bytes per unmatched row, wiping the next cells and
+;; writing past the end of the column.
+(.sys.exec "rm -rf /tmp/rfl_upd_newcol_sym")
+(.db.splayed.set "/tmp/rfl_upd_newcol_sym/t/" (table [x s] (list (til 6) ['ab 'cd 'ef 'gh 'ab 'ij])))
+(set SWn (.db.splayed.get "/tmp/rfl_upd_newcol_sym/t/"))
+(as 'STR (at (update {k: s from: SWn where: (> x 1)}) 'k)) -- ["" "" "ef" "gh" "ab" "ij"]
+(as 'STR (at (update {k: s from: SWn where: (in x [1 2])}) 'k)) -- ["" "cd" "ef" "" "" ""]
+(.db.splayed.set "/tmp/rfl_upd_newcol_sym/w8/" (table [x s] (list (til 200000) (as 'SYM (as 'STR (% (til 200000) 200))))))
+(set SW8 (.db.splayed.get "/tmp/rfl_upd_newcol_sym/w8/"))
+(sum (nil? (at (update {k: s from: SW8 where: (< x 10)}) 'k))) -- 199990
+(at (at (update {k: s from: SW8 where: (< x 10)}) 'k) 7) -- (at (at SW8 's) 7)
+(update {k: (list 1 2 3 4 5 6) from: SWn where: (> x 1)}) !- type
+(.sys.exec "rm -rf /tmp/rfl_upd_newcol_sym") -- 0

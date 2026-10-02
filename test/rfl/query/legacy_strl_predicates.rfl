@@ -24,8 +24,10 @@
 ;; == over the list column raises instead of silently matching nothing
 (select {from: TS where: (== s "keep me")}) !- type
 
-;; scalar subject in where: loud length error, not an aliased-length oom
-(select {from: TS where: (like "keep me" "*keep*")}) !- length
+;; scalar subject in where: one value for every row, not an aliased-length
+;; oom — true keeps every row, false none
+(get (select {from: TS where: (like "keep me" "*keep*")}) 'v) -- [1 2 3]
+(count (select {from: TS where: (like "drop" "*keep*")})) -- 0
 
 ;; ilike over a numeric column raises instead of matching nothing
 (select {from: TS where: (ilike v "*1*")}) !- type
