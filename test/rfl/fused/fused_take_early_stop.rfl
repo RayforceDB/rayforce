@@ -57,3 +57,20 @@ tcnt -- 1
 (at (select {b: a z: b from: TA where: (== c 0) asc: a take: 2}) 'z) -- [1 2]
 (at (select {b: a z: b from: TA asc: a take: 2}) 'z) -- [1 2]
 (at (select {b: b z: b from: TA where: (== c 0) take: 2}) 'z) -- [30 10]
+
+;; Chunks may run in any order (pool.h, ORDER CONTRACT): a worker whose list
+;; filled from a late chunk must still scan an earlier one it is handed.
+;; Matches that start late in the table / deep in a chunk, and K beyond a
+;; chunk's worth of matches, in both directions.
+(at (select {x: x from: TK where: (> x 999990) take: 3}) 'x) -- [999991 999992 999993]
+(at (select {x: x from: TK where: (and (== c 7) (> x 900000)) take: 3}) 'x) -- [900007 901007 902007]
+(at (select {x: x from: TK where: (and (== c 7) (< x 100000)) take: -3}) 'x) -- [97007 98007 99007]
+(at (select {x: x from: TK where: (< x 9) take: -3}) 'x) -- [6 7 8]
+(set FC (at (select {x: x from: TK where: (and (== c 7) (> x 500000)) take: 300}) 'x))
+(count FC) -- 300
+(sum FC) -- 194852100
+(last FC) -- 799007
+(set FD (at (select {x: x from: TK where: (and (== c 7) (< x 500000)) take: -300}) 'x))
+(sum FD) -- 104852100
+(first FD) -- 200007
+(at (select {x: x from: TK where: (and (== c 7) (> x 900000)) asc: s take: 3}) 'x) -- [900007 901007 902007]

@@ -675,13 +675,16 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
 /* ───── Fused filter + positional take ────────────────────────────────
  * Chunks of FTK_CHUNK_ROWS rows, numbered from the end the answer comes
  * from (row 0 for the first K, the last row for the last |K|), one pool
- * task per chunk in that order — the workers sweep the table from that
- * end together.  Each worker appends passing rows to its own list until
- * it holds |K|; those |K| bound the answer, so it publishes the |K|-th
- * row as the cutoff: no row beyond it can be among the first |K| passing
- * rows of the table, and every later chunk returns at once.  The lists
- * are merged by row id at the end and the |K| nearest the scanned end
- * are gathered.
+ * task per chunk.  Each worker keeps the |K| passing rows nearest that
+ * end it has seen, in scan order; once it holds |K| they bound the
+ * answer, so it publishes its |K|-th row as the cutoff: no row beyond it
+ * can be among the first |K| passing rows of the table, and every chunk
+ * past it returns at once.  The pool makes no promise about the order
+ * tasks run in (see pool.h), so a worker whose list is full may still be
+ * handed a chunk that lies BEFORE the rows it holds — it scans it and
+ * lets nearer rows displace the farthest; only the cutoff, which is
+ * sound whatever the order, skips work.  The lists are merged by row id
+ * at the end and the |K| nearest the scanned end are gathered.
  * ──────────────────────────────────────────────────────────────────── */
 
 #define FTK_CHUNK_ROWS (64 * 1024)
@@ -712,13 +715,34 @@ static void ftk_publish(ftk_ctx_t* c, int64_t row) {
     }
 }
 
+/* Admit `row` to the worker's list of the |K| nearest passing rows, kept in
+ * scan order.  Rows arrive in scan order within a chunk, but a later chunk
+ * may lie before an earlier one, so a full list still takes a nearer row:
+ * it is inserted in place and the farthest drops off.  False when the list
+ * is full and `row` is not nearer than its last entry — then nothing after
+ * it in this chunk is either. */
+static inline bool ftk_push(const ftk_ctx_t* c, int64_t* my, int32_t* pn, int64_t row) {
+    int32_t n = *pn, k = (int32_t)c->k;
+    if (n == k) {
+        if (c->from_end ? row <= my[k - 1] : row >= my[k - 1]) return false;
+        n--;                                  /* the farthest drops off */
+    }
+    int32_t i = n;
+    while (i > 0 && (c->from_end ? my[i - 1] < row : my[i - 1] > row)) {
+        my[i] = my[i - 1];
+        i--;
+    }
+    my[i] = row;
+    *pn = n + 1;
+    return true;
+}
+
 static void ftk_task_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
     (void)end;
     ftk_ctx_t* c = (ftk_ctx_t*)raw;
     int32_t  k  = (int32_t)c->k;
     int64_t* my = &c->rows[(size_t)worker_id * (size_t)k];
     int32_t  n  = c->rows_n[worker_id];
-    if (n >= k) return;                       /* this worker's list is complete */
 
     /* chunk `start` counted from the scanned end */
     int64_t lo, hi;
@@ -734,24 +758,25 @@ static void ftk_task_fn(void* raw, uint32_t worker_id, int64_t start, int64_t en
     if (ftk_beyond(c, c->from_end ? hi - 1 : lo)) return;
 
     uint8_t bits[RAY_MORSEL_ELEMS];
+    bool more = true;                         /* false: list full, rest of chunk is farther */
     if (!c->from_end) {
-        for (int64_t row = lo; row < hi && n < k; ) {
+        for (int64_t row = lo; row < hi && more; ) {
             if (ftk_beyond(c, row)) break;
             int64_t mend = row + RAY_MORSEL_ELEMS;
             if (mend > hi) mend = hi;
             fp_eval_pred(&c->pred, row, mend, bits);
-            for (int64_t r = 0; r < mend - row && n < k; r++)
-                if (bits[r]) my[n++] = row + r;
+            for (int64_t r = 0; r < mend - row && more; r++)
+                if (bits[r]) more = ftk_push(c, my, &n, row + r);
             row = mend;
         }
     } else {
-        for (int64_t mend = hi; mend > lo && n < k; ) {
+        for (int64_t mend = hi; mend > lo && more; ) {
             if (ftk_beyond(c, mend - 1)) break;
             int64_t row = mend - RAY_MORSEL_ELEMS;
             if (row < lo) row = lo;
             fp_eval_pred(&c->pred, row, mend, bits);
-            for (int64_t r = mend - row - 1; r >= 0 && n < k; r--)
-                if (bits[r]) my[n++] = row + r;
+            for (int64_t r = mend - row - 1; r >= 0 && more; r--)
+                if (bits[r]) more = ftk_push(c, my, &n, row + r);
             mend = row;
         }
     }
