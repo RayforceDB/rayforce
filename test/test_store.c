@@ -60,11 +60,11 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #ifdef RAY_OS_LINUX
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
-#include <sys/stat.h>
 #endif
 
 #define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
