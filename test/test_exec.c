@@ -7835,11 +7835,11 @@ static test_result_t test_exec_profiling_span_end(void) {
     PASS();
 }
 
-/* ---- broadcast_scalar nrows<=0 unknown type error (exec.c L501) ----
- * ray_typed_null(-RAY_DATE) creates an atom with type=-RAY_DATE, which
- * is not handled by broadcast_scalar nrows<=0 → returns ray_error.
- * SELECT propagates the error; ray_execute returns an error result.    */
-static test_result_t test_exec_broadcast_scalar_empty_unknown_type(void) {
+/* ---- OP_SELECT: a DATE constant over an empty table (#698) ----
+ * A select of literals alone keeps the input's rows: zero, typed DATE.
+ * The atom was broadcast by a routine that knew only str/i64/f64/bool/sym
+ * and failed with a type error.                                        */
+static test_result_t test_exec_select_date_const_empty(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -7850,8 +7850,6 @@ static test_result_t test_exec_broadcast_scalar_empty_unknown_type(void) {
     tbl = ray_table_add_col(tbl, name_x, empty_vec);
     ray_release(empty_vec);
 
-    /* -RAY_DATE atom → hits else return ray_error("type", NULL) in
-     * broadcast_scalar's nrows<=0 branch                               */
     ray_t* date_atom = ray_typed_null(-RAY_DATE);
     TEST_ASSERT_NOT_NULL(date_atom);
     TEST_ASSERT_FALSE(RAY_IS_ERR(date_atom));
@@ -7862,11 +7860,12 @@ static test_result_t test_exec_broadcast_scalar_empty_unknown_type(void) {
     ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 1);
 
     ray_t* result = ray_execute(g, sel);
-    /* Should be an error: broadcast_scalar returns error for unknown type */
     TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 0);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_DATE);
 
-    if (result && !RAY_IS_ERR(result)) ray_release(result);
+    ray_release(result);
     ray_release(date_atom);
     ray_graph_free(g);
     ray_release(tbl);
@@ -7875,10 +7874,10 @@ static test_result_t test_exec_broadcast_scalar_empty_unknown_type(void) {
     PASS();
 }
 
-/* ---- broadcast_scalar nrows>0 unknown type error (exec.c L525) ----
- * Same as above but with a non-empty table (nrows>0).  broadcast_scalar
- * skips nrows<=0 path and reaches the later else return ray_error.     */
-static test_result_t test_exec_broadcast_scalar_nonzero_unknown_type(void) {
+/* ---- OP_SELECT: a DATE constant beside a row column (#698) ----
+ * Same as above on the 10-row table with a scanned column beside it: the
+ * constant widens to every row and stays null.                          */
+static test_result_t test_exec_select_date_const_beside_col(void) {
     ray_heap_init();
     ray_t* tbl = make_exec_table(); /* 10-row table */
 
@@ -7893,12 +7892,49 @@ static test_result_t test_exec_broadcast_scalar_nonzero_unknown_type(void) {
     ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 2);
 
     ray_t* result = ray_execute(g, sel);
-    /* broadcast_scalar returns error for unknown atom type → error propagates */
     TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 10);
+    ray_t* dcol = ray_table_get_col_idx(result, 1);
+    TEST_ASSERT_EQ_I(dcol->type, RAY_DATE);
+    TEST_ASSERT_EQ_I(dcol->len, 10);
+    TEST_ASSERT_TRUE(ray_vec_is_null(dcol, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(dcol, 9));
 
-    if (result && !RAY_IS_ERR(result)) ray_release(result);
+    ray_release(result);
     ray_release(date_atom);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- OP_SELECT: an F32 constant beside a row column (#698) ----
+ * enlist has no F32 vector and boxes the atom in a one-element LIST; the
+ * widening must still give it the input's rows, not a ragged table.    */
+static test_result_t test_exec_select_f32_const_beside_col(void) {
+    ray_heap_init();
+    ray_t* tbl = make_exec_table(); /* 10-row table */
+
+    ray_t* f_atom = ray_f32(1.5f);
+    TEST_ASSERT_NOT_NULL(f_atom);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(f_atom));
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* cst = ray_const_atom(g, f_atom);
+    ray_op_t* v1  = ray_scan(g, "v1");
+    ray_op_t* cols[] = { v1, cst };
+    ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 2);
+
+    ray_t* result = ray_execute(g, sel);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 10);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 1)->len, 10);
+
+    ray_release(result);
+    ray_release(f_atom);
     ray_graph_free(g);
     ray_release(tbl);
     ray_sym_destroy();
@@ -17650,8 +17686,9 @@ const test_entry_t exec_entries[] = {
     { "exec/broadcast_scalar_empty_bool",     test_exec_broadcast_scalar_empty_bool,     NULL, NULL },
     { "exec/broadcast_scalar_empty_sym",      test_exec_broadcast_scalar_empty_sym,      NULL, NULL },
     { "exec/profiling_span_end",              test_exec_profiling_span_end,              NULL, NULL },
-    { "exec/broadcast_scalar_empty_unknown",  test_exec_broadcast_scalar_empty_unknown_type,  NULL, NULL },
-    { "exec/broadcast_scalar_nzero_unknown",  test_exec_broadcast_scalar_nonzero_unknown_type, NULL, NULL },
+    { "exec/select_date_const_empty",         test_exec_select_date_const_empty,         NULL, NULL },
+    { "exec/select_date_const_beside_col",    test_exec_select_date_const_beside_col,    NULL, NULL },
+    { "exec/select_f32_const_beside_col",     test_exec_select_f32_const_beside_col,     NULL, NULL },
     { "exec/select_10_expr_cols",             test_exec_select_10_expr_cols,             NULL, NULL },
     { "exec/streaming_concat_scan",           test_exec_streaming_concat_scan,           NULL, NULL },
     { "exec/streaming_all_segments_pruned",   test_exec_streaming_all_segments_pruned,   NULL, NULL },
