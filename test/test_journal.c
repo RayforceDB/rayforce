@@ -2416,7 +2416,7 @@ static test_result_t test_journal_purge_after_close(void) {
 #include <sys/file.h>
 /* Whether another holder could take the lock on <base>.lk right now. */
 static int jrn_lock_free(const char* base) {
-    char path[300];
+    char path[1100];
     snprintf(path, sizeof(path), "%s.lk", base);
     int fd = open(path, O_RDWR | O_CREAT, 0644);
     if (fd < 0) return -1;
@@ -2581,6 +2581,38 @@ static test_result_t test_journal_purge_refused_readonly_lock(void) {
 #endif
 }
 
+/* A base too long for open_append, reached through open after it took the
+ * lock: the failed open releases the lock. */
+static test_result_t test_journal_open_releases_lock_on_long_base(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char dir[256], base[1100];
+    make_dir_base(dir, sizeof(dir), base, sizeof(base), "lock_long");
+    TEST_ASSERT_TRUE(dir[0] != '\0');
+    char path[1100];
+    snprintf(path, sizeof(path), "%s", dir);
+    while (strlen(path) + 201 < 1010) {
+        size_t n = strlen(path);
+        path[n] = '/';
+        memset(path + n + 1, 'a', 200);
+        path[n + 201] = '\0';
+        TEST_ASSERT_EQ_I(mkdir(path, 0755), 0);
+    }
+    size_t n = strlen(path);
+    path[n] = '/';
+    memset(path + n + 1, 'b', 1019 - n - 1);
+    path[1019] = '\0';
+    TEST_ASSERT_EQ_I(ray_journal_open(path, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    TEST_ASSERT_EQ_I(jrn_lock_free(path), 1);
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    TEST_ASSERT_EQ_I(system(cmd), 0);
+    PASS();
+#endif
+}
+
 /* Purge stays best-effort when the journal's directory is gone. */
 static test_result_t test_journal_purge_without_dir(void) {
 #if defined(_WIN32)
@@ -2733,6 +2765,7 @@ const test_entry_t journal_entries[] = {
     { "journal/lock_follows_base",          test_journal_lock_follows_base,          jrn_setup, jrn_teardown },
     { "journal/lock_not_inherited",         test_journal_lock_not_inherited,         jrn_setup, jrn_teardown },
     { "journal/purge_without_dir",          test_journal_purge_without_dir,          jrn_setup, jrn_teardown },
+    { "journal/open_releases_lock_on_long_base", test_journal_open_releases_lock_on_long_base, jrn_setup, jrn_teardown },
     { "journal/purge_refused_readonly_lock", test_journal_purge_refused_readonly_lock, jrn_setup, jrn_teardown },
     /* #420: snapshot/roll crash window must not double-apply */
     { "journal/crash_window_no_double_apply", test_journal_crash_window_no_double_apply, jrn_setup, jrn_teardown },

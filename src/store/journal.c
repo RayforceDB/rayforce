@@ -755,7 +755,9 @@ ray_err_t ray_journal_open(const char* base, ray_journal_mode_t mode) {
     if (le != RAY_OK) return le;
     ray_err_t re = ray_journal_recover(base);
     if (re != RAY_OK) { journal_unlock(); return re; }
-    return ray_journal_open_append(base, mode);
+    ray_err_t ae = ray_journal_open_append(base, mode);
+    if (ae != RAY_OK) journal_unlock();
+    return ae;
 }
 
 static ray_err_t journal_close_fp(void);
