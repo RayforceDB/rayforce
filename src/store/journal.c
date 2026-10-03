@@ -91,17 +91,26 @@ static ray_err_t journal_lock(const char* base, bool* missing) {
         if (strcmp(g_journal.lock_path, path) == 0) return RAY_OK;
         journal_unlock();
     }
+    int open_err = 0;
     for (int attempt = 0; attempt < 8; attempt++) {
         /* Open for writing: flock emulated over byte-range locks (NFS, SMB)
          * takes an exclusive lock only on a writable fd.  A lock file that
          * is not ours to write (another user's) is still locked through a
          * read-only fd, so it serialises with that user's process. */
         ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
-        if (fd == RAY_FD_INVALID && (errno == EACCES || errno == EROFS))
-            fd = ray_file_open(path, RAY_OPEN_READ);
         if (fd == RAY_FD_INVALID) {
-            if (missing) *missing = errno == ENOENT;
-            return RAY_ERR_IO;
+            int e = errno;
+            if (e == EACCES || e == EROFS) {
+                fd = ray_file_open(path, RAY_OPEN_READ);
+                /* Removed between the two opens: try again. */
+                if (fd == RAY_FD_INVALID && errno == ENOENT) { open_err = e; continue; }
+            }
+            if (fd == RAY_FD_INVALID) {
+                /* Only a missing directory means nobody can hold it. */
+                if (missing) *missing = e == ENOENT;
+                fprintf(stderr, "log: ERROR  cannot open %s: %s\n", path, strerror(e));
+                return RAY_ERR_IO;
+            }
         }
 #ifndef RAY_OS_WINDOWS
         /* A program started with .sys.exec must not keep the lock alive
@@ -136,6 +145,8 @@ static ray_err_t journal_lock(const char* base, bool* missing) {
         memcpy(g_journal.lock_path, path, (size_t)n + 1);
         return RAY_OK;
     }
+    if (open_err)
+        fprintf(stderr, "log: ERROR  cannot open %s: %s\n", path, strerror(open_err));
     return RAY_ERR_IO;
 }
 
