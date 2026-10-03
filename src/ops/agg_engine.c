@@ -17,6 +17,7 @@
 typedef struct { int64_t idx; } agg_radix_order_t;
 
 bool ray_agg_engine_v2 = true;   /* knob; default on */
+bool ray_agg_tablestack = true;  /* knob; default on */
 
 static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
@@ -26,7 +27,8 @@ void agg_route_record(agg_route_t route) {
     static const char* const names[AGG_ROUTE_COUNT] = {
         "group: none", "group: legacy", "group: slices", "group: parted",
         "group: v2 serial dense", "group: v2 serial hash", "group: v2 dense",
-        "group: v2 radix", "group: v2 hash", "group: v2 smallhash", "group: v2 indexed"
+        "group: v2 radix", "group: v2 hash", "group: v2 smallhash", "group: v2 indexed",
+        "group: v2 tablestack"
     };
     route_stats.routes[route]++;
     ray_profile_tick(names[route]);
@@ -3948,6 +3950,363 @@ static void agg_ord_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     memset(c->pairs + start, 0xFF, (size_t)(end - start) * sizeof(agg_radix_order_t));
 }
 
+/* Largest group count whose first-seen order is restored by sorting the
+ * groups rather than by the input-sized order map (see agg_parts_emit). */
+#define AGG_ORDER_SORT_MAX_GROUPS 16384
+
+/* Phase 3 of every partition-producing strategy (radix, table stack): order
+ * the per-partition groups by first logical input position (or select the
+ * bounded / top-N subset), emit the key columns from the packed per-group
+ * keys and finalize the aggregates.  Consumes `parts` (destroyed + freed on
+ * every path) and `d` (freed on every path). */
+static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
+        agg_radix_part_t* parts, uint32_t n_parts, ray_pool_t* pool, uint32_t nw,
+        ray_t** key_cols, int64_t* key_syms,
+        const agg_vtable_t** vts, const size_t* off, size_t block,
+        int64_t input_count, int64_t group_limit, const ray_group_emit_filter_t* efp) {
+    uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
+    const int64_t* agg_syms = d->agg_syms;
+    /* Phase 3: restore stable first-seen order across partitions. */
+    int64_t ng = 0;
+    for (uint32_t p = 0; p < n_parts; p++) ng += parts[p].ng;
+
+    /* Place each group directly at its first logical input position, then
+     * compact those occupied positions in one linear pass.  This restores
+     * first-seen order without a comparison sort or a routing threshold. */
+
+    /* Bounded emit under a HEAD(GROUP) limit hint: when only the first
+     * `group_limit` groups are wanted, selecting them directly is O(ng) with a
+     * `group_limit`-sized heap, versus the full path's O(input_count) order map
+     * (an 80MB alloc + memset + scatter + compact on a 10M-row input) followed
+     * by a full key-unpack and finalize of every group.  The N groups with the
+     * SMALLEST first_row ARE the first N groups in first-seen order, so the
+     * emitted prefix is byte-identical to trimming the full result to N. */
+    int64_t n_emit = ng;
+    agg_radix_order_t* pairs = NULL;
+    if (efp && group_limit == 0) {
+        int rc = 0;
+        int64_t kept = 0;
+        agg_radix_order_t* sel_pairs = agg_radix_select_topn(pool, parts, n_parts,
+                vts[efp->agg_index], off[efp->agg_index], block,
+                ext->agg_k ? ext->agg_k[efp->agg_index] : 0, efp, &kept, &rc);
+        if (sel_pairs) {
+            pairs = sel_pairs;
+            n_emit = kept;
+            route_stats.topn_native = true;
+            route_stats.topn_kept = kept;
+        } else if (rc == 1) {
+            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+            ray_free_raw(parts);
+            agg_desc_free(d);
+            return ray_error("oom", NULL);
+        }
+        /* rc == 2: no scalar order for this aggregate — full path below. */
+    }
+    if (pairs) {
+        /* native top-N selected above */
+    } else if (group_limit > 0 && ng > group_limit) {
+        int rc = 0;
+        n_emit = group_limit;
+        agg_radix_order_t* sel_pairs = agg_radix_select_first_n(
+                parts, n_parts, input_count, n_emit, &rc);
+        if (!sel_pairs) {
+            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+            ray_free_raw(parts);
+            agg_desc_free(d);
+            return rc == 1 ? ray_error("oom", NULL)
+                           : ray_error("group", "failed to order radix groups");
+        }
+        pairs = sel_pairs;
+    } else if (ng <= AGG_ORDER_SORT_MAX_GROUPS && ng * 32 <= input_count) {
+        /* Few groups over many rows (every low-cardinality group-by): sort
+         * the (first_row, group) pairs — first rows are distinct across
+         * groups, so the order is total and identical to the map below —
+         * instead of filling, scattering into and compacting an order map
+         * of one word per INPUT row (32 MB and three passes for ten groups
+         * over 4M rows). */
+        pairs = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(agg_radix_order_t));
+        ray_t* sk_hdr = NULL;
+        int64_t* skeys = pairs ? (int64_t*)scratch_alloc(&sk_hdr,
+            (size_t)(ng > 0 ? ng : 1) * sizeof(int64_t)) : NULL;
+        if (!pairs || !skeys) {
+            ray_free_raw(pairs); scratch_free(sk_hdr);
+            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+            ray_free_raw(parts);
+            agg_desc_free(d);
+            return ray_error("oom", NULL);
+        }
+        int64_t m = 0;
+        for (uint32_t p = 0; p < n_parts; p++)
+            for (int64_t gg = 0; gg < parts[p].ng; gg++, m++) {
+                skeys[m] = parts[p].first_row[gg];
+                pairs[m].idx = ((int64_t)p << 32) | (uint32_t)gg;
+            }
+        agg_sort_pairs_by_key(pairs, skeys, ng);
+        scratch_free(sk_hdr);
+    } else {
+    pairs = ray_alloc_raw(
+        (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
+    if (!pairs) {
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        ray_free_raw(parts);
+        agg_desc_free(d);
+        return ray_error("oom", NULL);
+    }
+    /* -1 fill: on a 10M-row input this is an 80MB first touch of fresh
+     * pages, so it runs across the pool (each task faults and fills its own
+     * range); the serial memset it replaces cost ~20 ms of a 63 ms phase. */
+    {
+        agg_ord_fill_ctx_t fctx = { .pairs = pairs };
+        if (pool && input_count >= RAY_PARALLEL_THRESHOLD)
+            ray_pool_dispatch(pool, agg_ord_fill_fn, &fctx, input_count);
+        else
+            memset(pairs, 0xFF, (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
+    }
+    bool order_ok = true;
+    int64_t ordered = 0;
+    bool ord_parallel_done = false;
+    /* Every stage below is dispatched by TASK COUNT (ray_pool_dispatch_n):
+     * the element-grain dispatch used before produced a single task for a
+     * 128-partition scatter and a 77-chunk compaction, so this "parallel"
+     * ordering ran serially (63 ms of a 10M-group query on 28 threads).  The
+     * compaction writes out of place into an ng-sized buffer, so chunks are
+     * independent and the input-sized map is released right after. */
+    const int64_t ORD_CHUNK = 1 << 17;
+    const int64_t ORD_MAX_CHUNKS = RAY_POOL_MAX_TASKS / 4;
+    if (pool && nw > 1 && input_count >= (1 << 20) &&
+        (input_count + ORD_CHUNK - 1) / ORD_CHUNK <= ORD_MAX_CHUNKS) {
+        int64_t n_chunks = (input_count + ORD_CHUNK - 1) / ORD_CHUNK;
+        ray_t* ordcnt_hdr = NULL;
+        int64_t* ord_counts = (int64_t*)scratch_alloc(&ordcnt_hdr,
+            (size_t)n_chunks * sizeof(int64_t));
+        agg_radix_order_t* compacted = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(agg_radix_order_t));
+        if (ord_counts && compacted) {
+            agg_ord_scatter_ctx_t sctx = {
+                .parts = parts, .pairs = pairs,
+                .input_count = input_count, .fail = 0,
+            };
+            ray_pool_dispatch_n(pool, agg_ord_scatter_fn, &sctx, (uint32_t)n_parts);
+            if (!atomic_load_explicit(&sctx.fail, memory_order_relaxed)) {
+                agg_ord_compact_ctx_t cctx = {
+                    .pairs = pairs, .dst = compacted, .input_count = input_count,
+                    .chunk = ORD_CHUNK, .counts = ord_counts,
+                };
+                ray_pool_dispatch_n(pool, agg_ord_count_fn, &cctx, (uint32_t)n_chunks);
+                /* Exclusive prefix (serial over a few hundred chunks). */
+                int64_t run = 0;
+                for (int64_t ch = 0; ch < n_chunks; ch++) {
+                    int64_t n = ord_counts[ch];
+                    ord_counts[ch] = run;
+                    run += n;
+                }
+                ordered = run;
+                order_ok = ordered == ng;
+                if (order_ok) {
+                    ray_pool_dispatch_n(pool, agg_ord_compact_fn, &cctx, (uint32_t)n_chunks);
+                    ray_free_raw(pairs);
+                    pairs = compacted;
+                    compacted = NULL;
+                }
+                ord_parallel_done = true;
+            } else {
+                order_ok = false;
+                ord_parallel_done = true;   /* bounds violation → error path */
+            }
+        }
+        ray_free_raw(compacted);
+        scratch_free(ordcnt_hdr);
+    }
+    if (!ord_parallel_done) {
+        for (uint32_t p = 0; p < n_parts && order_ok; p++) {
+            for (int64_t gg = 0; gg < parts[p].ng; gg++) {
+                int64_t first = parts[p].first_row[gg];
+                if (first < 0 || first >= input_count || pairs[first].idx != -1) {
+                    order_ok = false;
+                    break;
+                }
+                pairs[first].idx = ((int64_t)p << 32) | (uint32_t)gg;
+            }
+        }
+        if (order_ok) {
+            for (int64_t i = 0; i < input_count; i++)
+                if (pairs[i].idx != -1) pairs[ordered++].idx = pairs[i].idx;
+            order_ok = ordered == ng;
+        }
+    }
+    if (!order_ok) {
+        ray_free_raw(pairs);
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        ray_free_raw(parts);
+        agg_desc_free(d);
+        return ray_error("group", "failed to order radix groups");
+    }
+    }   /* end full-order path */
+    ray_profile_tick("radix: ordered groups");
+
+    ray_t* result = ray_table_new(n_keys + n_aggs);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_free_raw(pairs);
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        ray_free_raw(parts);
+        agg_desc_free(d);
+        return result ? result : ray_error("oom", NULL);
+    }
+
+    /* Emit key columns by sequential un-pack from the contiguous per-partition
+     * packed-key buffers (cache-friendly), NOT a scattered gather of the
+     * original columns at first_row[].  Byte-identical to ray_group_gather
+     * (see agg_unpack_key_col_new), incl. SYM payload + domain.
+     *
+     * All n_keys destinations are built BEFORE the fill so one dispatch covers
+     * the whole key side; they enter the table only once every row is written.
+     * n_keys is NOT bounded to 16 on this path (only dense direct-index routing
+     * caps it, in agg_dense_plan), so the handle array is a scratch carve, not
+     * a stack array — ASan caught the stack version overflowing on a 17-key
+     * group-by (test/rfl/group/radix_key_emit_parallel.rfl). */
+    ray_t*   kouts_hdr = NULL;
+    ray_t**  kouts   = (ray_t**)scratch_calloc(&kouts_hdr, (size_t)n_keys * sizeof(ray_t*));
+    ray_t*   kerr    = kouts ? NULL : ray_error("oom", NULL);
+    uint32_t k_built = 0;
+    for (; !kerr && k_built < n_keys; k_built++) {
+        ray_t* kc = agg_unpack_key_col_new(key_cols[k_built], n_emit);
+        if (!kc || RAY_IS_ERR(kc)) { kerr = kc ? kc : ray_error("oom", NULL); break; }
+        kouts[k_built] = kc;
+    }
+    if (!kerr) {
+        agg_key_emit_ctx_t kctx = {
+            .key_cols = key_cols, .outs = kouts, .parts = parts,
+            .pairs = pairs, .n_keys = n_keys,
+        };
+        /* Parallelize the un-pack over the OUTPUT rows on the same terms as the
+         * phase-3 finalize below: worthwhile only when ngroups is large.  Every
+         * bounded-emit shape (the HEAD(GROUP) limit hint — q17 emits 10 rows)
+         * and every low-cardinality group-by stays on the identical serial
+         * range call, so there is no dispatch overhead where there is no win. */
+        if (ray_pool_par_dispatch_ok(pool, n_emit, RAY_PARALLEL_THRESHOLD)) {
+            ray_pool_dispatch(pool, agg_key_emit_fn, &kctx, n_emit);
+            /* A cancelled dispatch drains its tickets WITHOUT running fn, so the
+             * key columns can be left partly uninitialized (for SYM that would
+             * be an out-of-domain id).  Never hand that back — bail. */
+            if (pool_cancelled(pool)) kerr = ray_error("cancel", NULL);
+        } else {
+            agg_key_emit_range(&kctx, 0, n_emit);
+        }
+    }
+    if (kerr) {
+        for (uint32_t k = 0; k < k_built; k++) ray_release(kouts[k]);
+        scratch_free(kouts_hdr);
+        ray_free_raw(pairs);
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        ray_free_raw(parts);
+        agg_desc_free(d);
+        ray_release(result); return kerr;
+    }
+    for (uint32_t k = 0; k < n_keys; k++) {
+        result = ray_table_add_col(result, key_syms[k], kouts[k]);
+        ray_release(kouts[k]);
+    }
+    scratch_free(kouts_hdr);
+
+    /* Pre-allocate every agg's output column up front so the parallel finalize
+     * pass can write disjoint slices into all scalar columns at once.  LIST
+     * (top/bot) columns are finalized serially below — outs[a] stays NULL for
+     * them so the parallel worker skips them. */
+    ray_t* outs_hdr;
+    ray_t** outs = (ray_t**)scratch_calloc(&outs_hdr, (size_t)n_aggs * (sizeof(ray_t*) + sizeof(int64_t)));
+    if (!outs) {
+        ray_free_raw(pairs);
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        ray_free_raw(parts);
+        agg_desc_free(d);
+        ray_release(result); return ray_error("oom", NULL);
+    }
+    int64_t* kparams = (int64_t*)(outs + n_aggs);
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        /* Buffered top_n/bot_n produce a LIST cell per group (a native vector);
+         * median and all streaming aggs produce a scalar out_type cell. */
+        bool is_list = (vts[a]->out_type == RAY_LIST);
+        ray_t* out = is_list ? ray_list_new(n_emit)
+                             : ray_vec_new(vts[a]->out_type, n_emit);
+        if (!out || RAY_IS_ERR(out)) {
+            for (uint32_t b = 0; b < a; b++) ray_release(outs[b]);
+            ray_free_raw(pairs);
+            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+            ray_free_raw(parts);
+            scratch_free(outs_hdr); agg_desc_free(d);
+            ray_release(result); return out ? out : ray_error("oom", NULL);
+        }
+        out->len = n_emit;
+        outs[a] = out;
+        kparams[a] = (ext->agg_k ? ext->agg_k[a] : 0);
+    }
+
+    /* Parallelize the scalar finalize over the output rows when ngroups is large
+     * (the q10/high-card win).  Small ng (incl. every low-card shape) keeps the
+     * trivial serial loop → zero dispatch overhead, no regression. */
+    bool par_fin = (pool && n_emit >= RAY_PARALLEL_THRESHOLD);
+    if (par_fin) {
+        uint8_t* saw_null = ray_calloc_raw((size_t)((size_t)nw * (n_aggs ? n_aggs : 1)) * (1));
+        ray_t* scalar_hdr = NULL;
+        ray_t** scalar_outs = saw_null
+            ? (ray_t**)scratch_alloc(&scalar_hdr, (size_t)n_aggs * sizeof(ray_t*)) : NULL;
+        if (!saw_null || !scalar_outs) { par_fin = false; ray_free_raw(saw_null); scratch_free(scalar_hdr); }
+        else {
+            for (uint32_t a = 0; a < n_aggs; a++)
+                scalar_outs[a] = (vts[a]->out_type == RAY_LIST) ? NULL : outs[a];
+            agg_radix_fin_ctx_t fc = {
+                .parts = parts, .pairs = pairs, .vts = vts, .off = off,
+                .block = block, .n_aggs = n_aggs, .agg_k = kparams,
+                .outs = scalar_outs, .saw_null = saw_null,
+            };
+            ray_pool_dispatch(pool, agg_radix_finalize_fn, &fc, n_emit);
+            /* OR the deferred HAS_NULLS flag once, serially. */
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                if (vts[a]->out_type == RAY_LIST) continue;
+                for (uint32_t w = 0; w < nw; w++)
+                    if (saw_null[(size_t)w * n_aggs + a]) {
+                        outs[a]->attrs |= RAY_ATTR_HAS_NULLS;
+                        break;
+                    }
+            }
+            ray_free_raw(saw_null);
+            scratch_free(scalar_hdr);
+        }
+    }
+
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        bool is_list = (vts[a]->out_type == RAY_LIST);
+        ray_t* out = outs[a];
+        /* Serial finalize: LIST aggs always (ray_list_set COW/retain not
+         * confirmed race-safe), and all aggs when the parallel pass was skipped. */
+        if (is_list || !par_fin) {
+            for (int64_t i = 0; i < n_emit; i++) {
+                uint32_t p  = (uint32_t)(pairs[i].idx >> 32);
+                uint32_t gg = (uint32_t)(pairs[i].idx & 0xffffffffu);
+                const void* state = parts[p].states + (size_t)gg * block + off[a];
+                if (is_list) {
+                    ray_t* cell = vts[a]->finalize(state, NULL, kparams[a]);
+                    out = ray_list_set(out, i, cell);   /* retains cell */
+                    ray_release(cell);
+                } else if (agg_finalize_value(vts[a], state, out, i, kparams[a])) {
+                    out->attrs |= RAY_ATTR_HAS_NULLS;
+                }
+            }
+            outs[a] = out;   /* ray_list_set may COW-realloc */
+        }
+        int64_t agg_name = agg_result_col_name(agg_syms[a], ext->agg_ops[a]);
+        result = ray_table_add_col(result, agg_name, out);
+        ray_release(out);
+    }
+
+    ray_free_raw(pairs);
+    /* Finalize is done reading every partition's buffered group state → destroy
+     * exactly once before freeing the partition slabs. */
+    agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+    ray_free_raw(parts);
+    scratch_free(outs_hdr); agg_desc_free(d);
+    return result;
+}
+
 static ray_t* exec_group_v2_parallel_radix(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
         ray_t** key_cols, int64_t* key_syms,
@@ -3966,7 +4325,6 @@ static ray_t* exec_group_v2_parallel_radix(
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
     const void** val2_data = d.val2_data; const int8_t* val2_types = d.val2_types;
     const bool* val2_hasnull = d.val2_hasnull; const uint8_t* val2_esz = d.val2_esz;
-    const int64_t* agg_syms = d.agg_syms;
 
     /* Every group records its earliest source row so emitted order does not
      * depend on the number of radix partitions used by this execution. */
@@ -4096,320 +4454,1055 @@ static ray_t* exec_group_v2_parallel_radix(
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
     }
 
-    /* Phase 3: restore stable first-seen order across partitions. */
-    int64_t ng = 0;
-    for (uint32_t p = 0; p < n_parts; p++) ng += parts[p].ng;
+    return agg_parts_emit(ext, &d, parts, n_parts, pool, nw, key_cols, key_syms,
+                          vts, off, block, sel ? n_sel : nrows, group_limit, efp);
+}
 
-    /* Place each group directly at its first logical input position, then
-     * compact those occupied positions in one linear pass.  This restores
-     * first-seen order without a comparison sort or a routing threshold. */
-    int64_t input_count = sel ? n_sel : nrows;
+/* ══════════════════════════════════════════════════════════════════════
+ * Table-stack group-by (int/SYM keys, ACC_STREAMING aggs only).
+ *
+ * The radix strategy above scatters EVERY input row into a payload record
+ * before any aggregation happens, so a 4M-row group-by over ten sparse keys
+ * pays the full scatter (~100 MB of records) to produce ten groups.  This
+ * strategy pre-aggregates first and scatters only when pre-aggregation
+ * provably stops paying:
+ *
+ *   Gate:    a sample of the grouped rows (the SELECTED rows under a
+ *            pushed filter) gives a Chao1 distinct estimate and the share
+ *            of rows whose key the sample saw once.  The strategy takes
+ *            the query only when the estimated groups fit one table of at
+ *            most AGG_TS_MAX_BITS slots, that singleton share is bounded
+ *            (Chao1 under-counts a long tail behind a hot head), the
+ *            tables of all workers fit the last-level cache together, AND
+ *            every phase-1 task is expected to fold several rows per
+ *            group; otherwise it
+ *            declines (returns NULL) and the caller runs the radix scatter,
+ *            whose L1-local per-partition probes beat cache-missing table
+ *            probes once rows per group per task drop below a handful
+ *            (measured: 50k+ groups over 4M rows on 24 threads ran 0.55-
+ *            0.85x of radix on the table stack, <= 15k groups 1.2-6x).
+ *   Phase 1 (one logical task per contiguous input range; tasks are claimed
+ *            by whichever worker is free, but the task -> range map is fixed
+ *            so the merge order, and with it every floating-point result, is
+ *            independent of scheduling): each task owns a stack of
+ *            open-addressing tables.  Slot = hash >> (64 - log2 cap)
+ *            (TOP-BIT placement), so for any power-of-two table the entries
+ *            of merge partition p (the top log2(n_parts) hash bits) live in
+ *            one contiguous slot range — the merge below range-scans the
+ *            task tables directly, no scatter copy of their entries.  The
+ *            hash lives inline in the entry; a one-byte tag array answers
+ *            "empty?" and most "not this key" from L1.
+ *            A table grows by doubling up to AGG_TS_MAX_BITS; a full table
+ *            at that size is PUSHED onto the task's stack and a fresh one
+ *            started (no rehash past cache size, no scatter).  Every time
+ *            a table fills, the task compares the distinct entries it took
+ *            against the rows it absorbed: at >= AGG_TS_SWITCH_PCT percent
+ *            distinct the input is nearly all-distinct in this range (the
+ *            sample estimate was wrong), so the task switches to RAW
+ *            SCATTER — the remaining rows go as packed records into
+ *            per-partition buckets (chunked bump allocation, lazily
+ *            created) and are aggregated by the merge.
+ *   Phase 2 (one task per merge partition): fold, in task order, every
+ *            table's slot range for p and every task's bucket p into one
+ *            partition-local hash; the result is the same agg_radix_part_t
+ *            the radix strategy produces, so the shared agg_parts_emit
+ *            handles ordering (first-seen), bounded emit, native top-N and
+ *            the parallel key/aggregate emit unchanged.
+ * ══════════════════════════════════════════════════════════════════════ */
 
-    /* Bounded emit under a HEAD(GROUP) limit hint: when only the first
-     * `group_limit` groups are wanted, selecting them directly is O(ng) with a
-     * `group_limit`-sized heap, versus the full path's O(input_count) order map
-     * (an 80MB alloc + memset + scatter + compact on a 10M-row input) followed
-     * by a full key-unpack and finalize of every group.  The N groups with the
-     * SMALLEST first_row ARE the first N groups in first-seen order, so the
-     * emitted prefix is byte-identical to trimming the full result to N. */
-    int64_t n_emit = ng;
-    agg_radix_order_t* pairs = NULL;
-    if (efp && group_limit == 0) {
-        int rc = 0;
-        int64_t kept = 0;
-        agg_radix_order_t* sel_pairs = agg_radix_select_topn(pool, parts, n_parts,
-                vts[efp->agg_index], off[efp->agg_index], block,
-                ext->agg_k ? ext->agg_k[efp->agg_index] : 0, efp, &kept, &rc);
-        if (sel_pairs) {
-            pairs = sel_pairs;
-            n_emit = kept;
-            route_stats.topn_native = true;
-            route_stats.topn_kept = kept;
-        } else if (rc == 1) {
-            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            ray_free_raw(parts);
-            agg_desc_free(&d);
-            return ray_error("oom", NULL);
-        }
-        /* rc == 2: no scalar order for this aggregate — full path below. */
-    }
-    if (pairs) {
-        /* native top-N selected above */
-    } else if (group_limit > 0 && ng > group_limit) {
-        int rc = 0;
-        n_emit = group_limit;
-        agg_radix_order_t* sel_pairs = agg_radix_select_first_n(
-                parts, n_parts, input_count, n_emit, &rc);
-        if (!sel_pairs) {
-            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            ray_free_raw(parts);
-            agg_desc_free(&d);
-            return rc == 1 ? ray_error("oom", NULL)
-                           : ray_error("group", "failed to order radix groups");
-        }
-        pairs = sel_pairs;
-    } else {
-    pairs = ray_alloc_raw(
-        (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
-    if (!pairs) {
-        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        ray_free_raw(parts);
-        agg_desc_free(&d);
-        return ray_error("oom", NULL);
-    }
-    /* -1 fill: on a 10M-row input this is an 80MB first touch of fresh
-     * pages, so it runs across the pool (each task faults and fills its own
-     * range); the serial memset it replaces cost ~20 ms of a 63 ms phase. */
-    {
-        agg_ord_fill_ctx_t fctx = { .pairs = pairs };
-        if (pool && input_count >= RAY_PARALLEL_THRESHOLD)
-            ray_pool_dispatch(pool, agg_ord_fill_fn, &fctx, input_count);
-        else
-            memset(pairs, 0xFF, (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
-    }
-    bool order_ok = true;
-    int64_t ordered = 0;
-    bool ord_parallel_done = false;
-    /* Every stage below is dispatched by TASK COUNT (ray_pool_dispatch_n):
-     * the element-grain dispatch used before produced a single task for a
-     * 128-partition scatter and a 77-chunk compaction, so this "parallel"
-     * ordering ran serially (63 ms of a 10M-group query on 28 threads).  The
-     * compaction writes out of place into an ng-sized buffer, so chunks are
-     * independent and the input-sized map is released right after. */
-    const int64_t ORD_CHUNK = 1 << 17;
-    const int64_t ORD_MAX_CHUNKS = RAY_POOL_MAX_TASKS / 4;
-    if (pool && nw > 1 && input_count >= (1 << 20) &&
-        (input_count + ORD_CHUNK - 1) / ORD_CHUNK <= ORD_MAX_CHUNKS) {
-        int64_t n_chunks = (input_count + ORD_CHUNK - 1) / ORD_CHUNK;
-        ray_t* ordcnt_hdr = NULL;
-        int64_t* ord_counts = (int64_t*)scratch_alloc(&ordcnt_hdr,
-            (size_t)n_chunks * sizeof(int64_t));
-        agg_radix_order_t* compacted = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(agg_radix_order_t));
-        if (ord_counts && compacted) {
-            agg_ord_scatter_ctx_t sctx = {
-                .parts = parts, .pairs = pairs,
-                .input_count = input_count, .fail = 0,
-            };
-            ray_pool_dispatch_n(pool, agg_ord_scatter_fn, &sctx, (uint32_t)n_parts);
-            if (!atomic_load_explicit(&sctx.fail, memory_order_relaxed)) {
-                agg_ord_compact_ctx_t cctx = {
-                    .pairs = pairs, .dst = compacted, .input_count = input_count,
-                    .chunk = ORD_CHUNK, .counts = ord_counts,
-                };
-                ray_pool_dispatch_n(pool, agg_ord_count_fn, &cctx, (uint32_t)n_chunks);
-                /* Exclusive prefix (serial over a few hundred chunks). */
-                int64_t run = 0;
-                for (int64_t ch = 0; ch < n_chunks; ch++) {
-                    int64_t n = ord_counts[ch];
-                    ord_counts[ch] = run;
-                    run += n;
-                }
-                ordered = run;
-                order_ok = ordered == ng;
-                if (order_ok) {
-                    ray_pool_dispatch_n(pool, agg_ord_compact_fn, &cctx, (uint32_t)n_chunks);
-                    ray_free_raw(pairs);
-                    pairs = compacted;
-                    compacted = NULL;
-                }
-                ord_parallel_done = true;
-            } else {
-                order_ok = false;
-                ord_parallel_done = true;   /* bounds violation → error path */
-            }
-        }
-        ray_free_raw(compacted);
-        scratch_free(ordcnt_hdr);
-    }
-    if (!ord_parallel_done) {
-        for (uint32_t p = 0; p < n_parts && order_ok; p++) {
-            for (int64_t gg = 0; gg < parts[p].ng; gg++) {
-                int64_t first = parts[p].first_row[gg];
-                if (first < 0 || first >= input_count || pairs[first].idx != -1) {
-                    order_ok = false;
-                    break;
-                }
-                pairs[first].idx = ((int64_t)p << 32) | (uint32_t)gg;
-            }
-        }
-        if (order_ok) {
-            for (int64_t i = 0; i < input_count; i++)
-                if (pairs[i].idx != -1) pairs[ordered++].idx = pairs[i].idx;
-            order_ok = ordered == ng;
-        }
-    }
-    if (!order_ok) {
-        ray_free_raw(pairs);
-        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        ray_free_raw(parts);
-        agg_desc_free(&d);
-        return ray_error("group", "failed to order radix groups");
-    }
-    }   /* end full-order path */
-    ray_profile_tick("radix: ordered groups");
+#define AGG_TS_CHUNK          4096      /* rows per probe + accumulate batch */
+#define AGG_TS_MIN_BITS       13        /* smallest table: 8192 slots */
+#define AGG_TS_MAX_BITS       15        /* largest table: 32768 slots, then stack */
+#define AGG_TS_LOAD_NUM       3         /* fill tables to 3/4 */
+#define AGG_TS_SWITCH_ROWS    16384     /* rows a table must absorb before its
+                                         * distinct ratio decides anything */
+#define AGG_TS_SWITCH_PCT     50        /* distinct/rows (%) at which a filled
+                                         * table switches its task to raw scatter */
+#define AGG_TS_TASK_ROWS      16384     /* minimum rows per phase-1 task */
+#define AGG_TS_TASKS_PER_WORKER 2
+#define AGG_TS_BUCKET_FIRST   ((size_t)8 << 10)    /* first bucket chunk (bytes) */
+#define AGG_TS_BUCKET_NEXT    ((size_t)64 << 10)   /* largest bucket chunk (bytes) */
+#define AGG_TS_SAMPLE         8192      /* single rows sampled for the gate + sizing */
+#define AGG_TS_GATE_UNSEEN_PCT 66       /* reject when more than this share of the
+                                         * sampled rows carry a key seen once */
+#define AGG_TS_GATE_GROUPS    24576     /* estimated groups must fit one full
+                                         * AGG_TS_MAX_BITS table */
+#define AGG_TS_GATE_REPEAT    4         /* ...and each task must expect this
+                                         * many rows per group */
 
-    ray_t* result = ray_table_new(n_keys + n_aggs);
-    if (!result || RAY_IS_ERR(result)) {
-        ray_free_raw(pairs);
-        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        ray_free_raw(parts);
-        agg_desc_free(&d);
-        return result ? result : ray_error("oom", NULL);
-    }
+/* Entry layout at ent + slot * estride:
+ *   [0, 8)                 uint64 key hash (| 1, never 0 when occupied)
+ *   [8, 16)                int64 first logical input position
+ *   [16, 16 + 8*n_keys)    packed keys (agg_read_key_i64 widened)
+ *   [state_off, ...)       AoS aggregate states (off[a] inside) */
+#define AGG_TS_KEY_OFF        16
+typedef struct agg_ts_table {
+    uint8_t*             tag;     /* [cap] 0 = empty, else hash bits 48..55 | 1 */
+    char*                ent;     /* [cap * estride] */
+    uint32_t             bits;
+    int64_t              cap;
+    int64_t              ng;      /* occupied slots */
+    int64_t              rows;    /* rows aggregated into this table */
+    struct agg_ts_table* prev;    /* older, full table of the same task */
+} agg_ts_table_t;
 
-    /* Emit key columns by sequential un-pack from the contiguous per-partition
-     * packed-key buffers (cache-friendly), NOT a scattered gather of the
-     * original columns at first_row[].  Byte-identical to ray_group_gather
-     * (see agg_unpack_key_col_new), incl. SYM payload + domain.
-     *
-     * All n_keys destinations are built BEFORE the fill so one dispatch covers
-     * the whole key side; they enter the table only once every row is written.
-     * n_keys is NOT bounded to 16 on this path (only dense direct-index routing
-     * caps it, in agg_dense_plan), so the handle array is a scratch carve, not
-     * a stack array — ASan caught the stack version overflowing on a 17-key
-     * group-by (test/rfl/group/radix_key_emit_parallel.rfl). */
-    ray_t*   kouts_hdr = NULL;
-    ray_t**  kouts   = (ray_t**)scratch_calloc(&kouts_hdr, (size_t)n_keys * sizeof(ray_t*));
-    ray_t*   kerr    = kouts ? NULL : ray_error("oom", NULL);
-    uint32_t k_built = 0;
-    for (; !kerr && k_built < n_keys; k_built++) {
-        ray_t* kc = agg_unpack_key_col_new(key_cols[k_built], n_emit);
-        if (!kc || RAY_IS_ERR(kc)) { kerr = kc ? kc : ray_error("oom", NULL); break; }
-        kouts[k_built] = kc;
+/* Scatter bucket chunk: records follow the header (24 bytes → 8-aligned). */
+typedef struct agg_ts_chunk {
+    struct agg_ts_chunk* next;
+    int64_t              n;       /* records used */
+    int64_t              cap;     /* records that fit */
+} agg_ts_chunk_t;
+
+typedef struct {
+    agg_ts_chunk_t* head;
+    agg_ts_chunk_t* tail;
+    int64_t         n;            /* records in the bucket */
+    size_t          bytes;        /* size of the last chunk (doubles per chunk) */
+} agg_ts_bucket_t;
+
+typedef struct {
+    agg_ts_table_t*  top;         /* current table; prev links the stack */
+    agg_ts_bucket_t* buckets;     /* [n_parts], allocated on the switch */
+    int64_t          rows;        /* rows consumed by this task */
+    int64_t          entries;     /* entries across the task's tables */
+    int64_t          scattered;   /* rows that went to buckets */
+    uint32_t         n_tables;
+    bool             scatter;     /* raw scatter mode */
+    int              oom;
+} agg_ts_task_t;
+
+typedef struct {
+    ray_t**              key_cols;
+    const void**         key_data;
+    uint32_t             n_keys;
+    const agg_vtable_t** vts;
+    const size_t*        off;
+    size_t               block;
+    uint32_t             n_aggs;
+    const void**         val_data;  const int8_t* val_types;  const bool* val_hasnull;  const uint8_t* val_esz;
+    const void**         val2_data; const int8_t* val2_types; const bool* val2_hasnull; const uint8_t* val2_esz;
+    /* Table-stride view of the aggregates: states live inside the entries. */
+    agg_valdesc_t        vd;
+    const size_t*        ent_off;   /* [n_aggs] state_off + off[a] */
+    size_t               estride;
+    size_t               state_off;
+    /* Scatter record layout (same as the radix payload): [keys][vals][pos]. */
+    size_t               rec;
+    size_t               row_off;
+    const size_t*        val_off;
+    const size_t*        val2_off;
+    uint32_t             n_parts;
+    uint32_t             part_bits;
+    uint32_t             init_bits;
+    int64_t              n_in;
+    int64_t              task_rows;
+    uint32_t             n_tasks;
+    agg_ts_task_t*       tasks;     /* [n_tasks] */
+    agg_radix_part_t*    parts;     /* [n_parts] */
+    int64_t              merge_cand; /* total entries + scattered rows (phase 2 sizing) */
+    ray_t*               sel;
+    const int64_t*       sel_prefix;
+} agg_ts_ctx_t;
+
+/* Same FNV-1a + fmix64 as the radix scatter; bit 0 forced on so 0 can mark
+ * an empty slot (top-bit placement and partition bits are unaffected). */
+static inline uint64_t agg_ts_hash(const int64_t* keys, uint32_t n_keys) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t k = 0; k < n_keys; k++) { h ^= (uint64_t)keys[k]; h *= 1099511628211ULL; }
+    return agg_radix_fmix64(h) | 1u;
+}
+
+/* Tag byte: hash bits 48..55 (below the slot/partition bits), never 0. */
+static inline uint8_t agg_ts_tag(uint64_t h) { return (uint8_t)((h >> 48) | 1u); }
+
+static inline uint64_t agg_ts_ent_hash(const agg_ts_table_t* t, size_t estride, int64_t slot) {
+    uint64_t h; memcpy(&h, t->ent + (size_t)slot * estride, sizeof(h)); return h;
+}
+
+static agg_ts_table_t* agg_ts_table_new(uint32_t bits, size_t estride) {
+    agg_ts_table_t* t = ray_alloc_raw(sizeof(agg_ts_table_t));
+    if (!t) return NULL;
+    int64_t cap = (int64_t)1 << bits;
+    t->tag = ray_calloc_raw((size_t)cap);
+    t->ent = ray_alloc_raw((size_t)cap * estride);
+    if (!t->tag || !t->ent) {
+        ray_free_raw(t->tag); ray_free_raw(t->ent); ray_free_raw(t);
+        return NULL;
     }
-    if (!kerr) {
-        agg_key_emit_ctx_t kctx = {
-            .key_cols = key_cols, .outs = kouts, .parts = parts,
-            .pairs = pairs, .n_keys = n_keys,
-        };
-        /* Parallelize the un-pack over the OUTPUT rows on the same terms as the
-         * phase-3 finalize below: worthwhile only when ngroups is large.  Every
-         * bounded-emit shape (the HEAD(GROUP) limit hint — q17 emits 10 rows)
-         * and every low-cardinality group-by stays on the identical serial
-         * range call, so there is no dispatch overhead where there is no win. */
-        if (ray_pool_par_dispatch_ok(pool, n_emit, RAY_PARALLEL_THRESHOLD)) {
-            ray_pool_dispatch(pool, agg_key_emit_fn, &kctx, n_emit);
-            /* A cancelled dispatch drains its tickets WITHOUT running fn, so the
-             * key columns can be left partly uninitialized (for SYM that would
-             * be an out-of-domain id).  Never hand that back — bail. */
-            if (pool_cancelled(pool)) kerr = ray_error("cancel", NULL);
+    t->bits = bits; t->cap = cap; t->ng = 0; t->rows = 0; t->prev = NULL;
+    return t;
+}
+
+static void agg_ts_table_free(agg_ts_table_t* t) {
+    while (t) {
+        agg_ts_table_t* prev = t->prev;
+        ray_free_raw(t->tag); ray_free_raw(t->ent); ray_free_raw(t);
+        t = prev;
+    }
+}
+
+/* Double a table in place of itself (same stack position).  Top-bit
+ * placement keeps the relative order of the entries; the states are plain
+ * bytes (streaming accumulators own no memory) so a memcpy moves them. */
+static agg_ts_table_t* agg_ts_table_grow(agg_ts_table_t* t, size_t estride) {
+    agg_ts_table_t* n = agg_ts_table_new(t->bits + 1, estride);
+    if (!n) return NULL;
+    uint64_t nmask = (uint64_t)n->cap - 1;
+    uint32_t shift = 64 - n->bits;
+    for (int64_t s = 0; s < t->cap; s++) {
+        if (!t->tag[s]) continue;
+        uint64_t h = agg_ts_ent_hash(t, estride, s);
+        uint64_t d = h >> shift;
+        while (n->tag[d]) d = (d + 1) & nmask;
+        n->tag[d] = t->tag[s];
+        memcpy(n->ent + (size_t)d * estride, t->ent + (size_t)s * estride, estride);
+    }
+    n->ng = t->ng; n->rows = t->rows; n->prev = t->prev;
+    ray_free_raw(t->tag); ray_free_raw(t->ent); ray_free_raw(t);
+    return n;
+}
+
+static void agg_ts_bucket_free(agg_ts_bucket_t* b) {
+    agg_ts_chunk_t* ch = b->head;
+    while (ch) { agg_ts_chunk_t* nx = ch->next; ray_free_raw(ch); ch = nx; }
+    b->head = b->tail = NULL; b->n = 0; b->bytes = 0;
+}
+
+static void agg_ts_task_free(agg_ts_task_t* ts, uint32_t n_parts) {
+    agg_ts_table_free(ts->top); ts->top = NULL;
+    if (ts->buckets) {
+        for (uint32_t p = 0; p < n_parts; p++) agg_ts_bucket_free(&ts->buckets[p]);
+        ray_free_raw(ts->buckets); ts->buckets = NULL;
+    }
+}
+
+/* Reserve one record slot in bucket b (lazy, chunked bump allocation). */
+static inline char* agg_ts_bucket_push(agg_ts_bucket_t* b, size_t rec) {
+    agg_ts_chunk_t* ch = b->tail;
+    if (!ch || ch->n == ch->cap) {
+        /* Chunks double from AGG_TS_BUCKET_FIRST to AGG_TS_BUCKET_NEXT, so a
+         * sparse stream (tasks x partitions of them) wastes at most about
+         * what it holds while a dense one soon bumps 64 KB at a time. */
+        size_t bytes = ch ? b->bytes * 2 : AGG_TS_BUCKET_FIRST;
+        if (bytes > AGG_TS_BUCKET_NEXT) bytes = AGG_TS_BUCKET_NEXT;
+        b->bytes = bytes;
+        int64_t cap = (int64_t)((bytes - sizeof(agg_ts_chunk_t)) / rec);
+        if (cap < 1) cap = 1;
+        agg_ts_chunk_t* nc = ray_alloc_raw(sizeof(agg_ts_chunk_t) + (size_t)cap * rec);
+        if (!nc) return NULL;
+        nc->next = NULL; nc->n = 0; nc->cap = cap;
+        if (ch) ch->next = nc; else b->head = nc;
+        b->tail = nc; ch = nc;
+    }
+    b->n++;
+    return (char*)(ch + 1) + (size_t)ch->n++ * rec;
+}
+
+/* Make room in the task's current table for up to `n` new entries at the
+ * configured load: grow below the size cap, push at the cap, or switch the
+ * task to raw scatter when the filled table shows the input is too distinct
+ * for pre-aggregation to pay.  Returns false on OOM. */
+static bool agg_ts_reserve(agg_ts_ctx_t* c, agg_ts_task_t* ts, int64_t n) {
+    agg_ts_table_t* t = ts->top;
+    while (!t || t->ng + n > (t->cap >> 2) * AGG_TS_LOAD_NUM) {
+        if (t && t->rows >= AGG_TS_SWITCH_ROWS &&
+                t->ng * 100 >= t->rows * AGG_TS_SWITCH_PCT) {
+            ts->scatter = true;
+            return true;
+        }
+        if (!t) {
+            t = agg_ts_table_new(c->init_bits, c->estride);
+            if (!t) return false;
+            ts->n_tables++;
+        } else if (t->bits < AGG_TS_MAX_BITS) {
+            agg_ts_table_t* grown = agg_ts_table_grow(t, c->estride);
+            if (!grown) return false;   /* t is intact; the task free releases it */
+            t = grown;
         } else {
-            agg_key_emit_range(&kctx, 0, n_emit);
+            agg_ts_table_t* nt = agg_ts_table_new(AGG_TS_MAX_BITS, c->estride);
+            if (!nt) return false;
+            nt->prev = t; t = nt;
+            ts->n_tables++;
         }
+        ts->top = t;
     }
-    if (kerr) {
-        for (uint32_t k = 0; k < k_built; k++) ray_release(kouts[k]);
-        scratch_free(kouts_hdr);
-        ray_free_raw(pairs);
-        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        ray_free_raw(parts);
-        agg_desc_free(&d);
-        ray_release(result); return kerr;
-    }
-    for (uint32_t k = 0; k < n_keys; k++) {
-        result = ray_table_add_col(result, key_syms[k], kouts[k]);
-        ray_release(kouts[k]);
-    }
-    scratch_free(kouts_hdr);
+    return true;
+}
 
-    /* Pre-allocate every agg's output column up front so the parallel finalize
-     * pass can write disjoint slices into all scalar columns at once.  LIST
-     * (top/bot) columns are finalized serially below — outs[a] stays NULL for
-     * them so the parallel worker skips them. */
-    ray_t* outs_hdr;
-    ray_t** outs = (ray_t**)scratch_calloc(&outs_hdr, (size_t)n_aggs * (sizeof(ray_t*) + sizeof(int64_t)));
-    if (!outs) {
-        ray_free_raw(pairs);
-        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-        ray_free_raw(parts);
-        agg_desc_free(&d);
-        ray_release(result); return ray_error("oom", NULL);
-    }
-    int64_t* kparams = (int64_t*)(outs + n_aggs);
-    for (uint32_t a = 0; a < n_aggs; a++) {
-        /* Buffered top_n/bot_n produce a LIST cell per group (a native vector);
-         * median and all streaming aggs produce a scalar out_type cell. */
-        bool is_list = (vts[a]->out_type == RAY_LIST);
-        ray_t* out = is_list ? ray_list_new(n_emit)
-                             : ray_vec_new(vts[a]->out_type, n_emit);
-        if (!out || RAY_IS_ERR(out)) {
-            for (uint32_t b = 0; b < a; b++) ray_release(outs[b]);
-            ray_free_raw(pairs);
-            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-            ray_free_raw(parts);
-            scratch_free(outs_hdr); agg_desc_free(&d);
-            ray_release(result); return out ? out : ray_error("oom", NULL);
+/* Visit one chunk of rows of a task: original rows `rows[i]` (or pos0 + i
+ * when rows == NULL) at logical input positions pos0 + i. */
+static void agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
+                         const int64_t* rows, int64_t pos0, int64_t n,
+                         agg_sel_scratch_t* sc, uint32_t* gid, int64_t* keys) {
+    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
+    if (!ts->scatter && !agg_ts_reserve(c, ts, n)) { ts->oom = 1; return; }
+
+    if (ts->scatter) {
+        if (!ts->buckets) {
+            ts->buckets = ray_calloc_raw((size_t)c->n_parts * sizeof(agg_ts_bucket_t));
+            if (!ts->buckets) { ts->oom = 1; return; }
         }
-        out->len = n_emit;
-        outs[a] = out;
-        kparams[a] = (ext->agg_k ? ext->agg_k[a] : 0);
-    }
-
-    /* Parallelize the scalar finalize over the output rows when ngroups is large
-     * (the q10/high-card win).  Small ng (incl. every low-card shape) keeps the
-     * trivial serial loop → zero dispatch overhead, no regression. */
-    bool par_fin = (pool && n_emit >= RAY_PARALLEL_THRESHOLD);
-    if (par_fin) {
-        uint8_t* saw_null = ray_calloc_raw((size_t)((size_t)nw * (n_aggs ? n_aggs : 1)) * (1));
-        ray_t* scalar_hdr = NULL;
-        ray_t** scalar_outs = saw_null
-            ? (ray_t**)scratch_alloc(&scalar_hdr, (size_t)n_aggs * sizeof(ray_t*)) : NULL;
-        if (!saw_null || !scalar_outs) { par_fin = false; ray_free_raw(saw_null); scratch_free(scalar_hdr); }
-        else {
-            for (uint32_t a = 0; a < n_aggs; a++)
-                scalar_outs[a] = (vts[a]->out_type == RAY_LIST) ? NULL : outs[a];
-            agg_radix_fin_ctx_t fc = {
-                .parts = parts, .pairs = pairs, .vts = vts, .off = off,
-                .block = block, .n_aggs = n_aggs, .agg_k = kparams,
-                .outs = scalar_outs, .saw_null = saw_null,
-            };
-            ray_pool_dispatch(pool, agg_radix_finalize_fn, &fc, n_emit);
-            /* OR the deferred HAS_NULLS flag once, serially. */
+        uint32_t pshift = 64 - c->part_bits;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t r = rows ? rows[i] : pos0 + i;
+            for (uint32_t k = 0; k < n_keys; k++)
+                keys[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+            uint64_t h = agg_ts_hash(keys, n_keys);
+            char* rec = agg_ts_bucket_push(&ts->buckets[h >> pshift], c->rec);
+            if (!rec) { ts->oom = 1; return; }
+            memcpy(rec, keys, (size_t)n_keys * sizeof(int64_t));
             for (uint32_t a = 0; a < n_aggs; a++) {
-                if (vts[a]->out_type == RAY_LIST) continue;
-                for (uint32_t w = 0; w < nw; w++)
-                    if (saw_null[(size_t)w * n_aggs + a]) {
-                        outs[a]->attrs |= RAY_ATTR_HAS_NULLS;
-                        break;
-                    }
-            }
-            ray_free_raw(saw_null);
-            scratch_free(scalar_hdr);
-        }
-    }
-
-    for (uint32_t a = 0; a < n_aggs; a++) {
-        bool is_list = (vts[a]->out_type == RAY_LIST);
-        ray_t* out = outs[a];
-        /* Serial finalize: LIST aggs always (ray_list_set COW/retain not
-         * confirmed race-safe), and all aggs when the parallel pass was skipped. */
-        if (is_list || !par_fin) {
-            for (int64_t i = 0; i < n_emit; i++) {
-                uint32_t p  = (uint32_t)(pairs[i].idx >> 32);
-                uint32_t gg = (uint32_t)(pairs[i].idx & 0xffffffffu);
-                const void* state = parts[p].states + (size_t)gg * block + off[a];
-                if (is_list) {
-                    ray_t* cell = vts[a]->finalize(state, NULL, kparams[a]);
-                    out = ray_list_set(out, i, cell);   /* retains cell */
-                    ray_release(cell);
-                } else if (agg_finalize_value(vts[a], state, out, i, kparams[a])) {
-                    out->attrs |= RAY_ATTR_HAS_NULLS;
+                if (c->val_data[a]) {
+                    uint8_t ez = c->val_esz[a];
+                    memcpy(rec + c->val_off[a], (const char*)c->val_data[a] + (size_t)r * ez, ez);
+                }
+                if (c->val2_data[a]) {
+                    uint8_t ez2 = c->val2_esz[a];
+                    memcpy(rec + c->val2_off[a], (const char*)c->val2_data[a] + (size_t)r * ez2, ez2);
                 }
             }
-            outs[a] = out;   /* ray_list_set may COW-realloc */
+            int64_t pos = pos0 + i;
+            memcpy(rec + c->row_off, &pos, sizeof(pos));
         }
-        int64_t agg_name = agg_result_col_name(agg_syms[a], ext->agg_ops[a]);
-        result = ray_table_add_col(result, agg_name, out);
-        ray_release(out);
+        ts->rows += n; ts->scattered += n;
+        return;
     }
 
-    ray_free_raw(pairs);
-    /* Finalize is done reading every partition's buffered group state → destroy
-     * exactly once before freeing the partition slabs. */
-    agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
-    ray_free_raw(parts);
-    scratch_free(outs_hdr); agg_desc_free(&d);
-    return result;
+    agg_ts_table_t* t = ts->top;
+    uint64_t mask = (uint64_t)t->cap - 1;
+    uint32_t shift = 64 - t->bits;
+    size_t estride = c->estride, key_bytes = (size_t)n_keys * sizeof(int64_t);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t r = rows ? rows[i] : pos0 + i;
+        for (uint32_t k = 0; k < n_keys; k++)
+            keys[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+        uint64_t h = agg_ts_hash(keys, n_keys);
+        uint8_t tag = agg_ts_tag(h);
+        uint64_t slot = h >> shift;
+        for (;;) {
+            uint8_t st = t->tag[slot];
+            if (!st) {
+                char* e = t->ent + (size_t)slot * estride;
+                t->tag[slot] = tag;
+                int64_t pos = pos0 + i;      /* positions ascend within a task:
+                                              * the first sight IS the minimum */
+                memcpy(e, &h, sizeof(h));
+                memcpy(e + sizeof(uint64_t), &pos, sizeof(pos));
+                memcpy(e + AGG_TS_KEY_OFF, keys, key_bytes);
+                for (uint32_t a = 0; a < n_aggs; a++)
+                    c->vts[a]->init(e + c->ent_off[a]);
+                t->ng++;
+                break;
+            }
+            if (st == tag) {
+                const char* e = t->ent + (size_t)slot * estride;
+                uint64_t eh; memcpy(&eh, e, sizeof(eh));
+                if (eh == h && memcmp(e + AGG_TS_KEY_OFF, keys, key_bytes) == 0) break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        gid[i] = (uint32_t)slot;
+    }
+    if (rows) {
+        if (agg_sel_accum_chunk(&c->vd, sc, t->ent, gid, rows, n) != 0) { ts->oom = 1; return; }
+    } else {
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            char* states = t->ent + c->ent_off[a];
+            if (c->vts[a]->update_batch2) {
+                const void* vx = (const char*)c->val_data[a]  + (size_t)pos0 * c->val_esz[a];
+                const void* vy = (const char*)c->val2_data[a] + (size_t)pos0 * c->val2_esz[a];
+                ray_valid_t valid_x = { vx, c->val_types[a],  c->val_hasnull[a] };
+                ray_valid_t valid_y = { vy, c->val2_types[a], c->val2_hasnull[a] };
+                c->vts[a]->update_batch2(states, estride, gid, vx, vy, &valid_x, &valid_y, n, NULL);
+            } else if (c->val_data[a]) {
+                const void* vals = (const char*)c->val_data[a] + (size_t)pos0 * c->val_esz[a];
+                ray_valid_t valid = { vals, c->val_types[a], c->val_hasnull[a] };
+                c->vts[a]->update_batch(states, estride, gid, vals, &valid, n, NULL);
+            } else {
+                ray_valid_t valid = { NULL, c->val_types[a], false };
+                c->vts[a]->update_batch(states, estride, gid, NULL, &valid, n, NULL);
+            }
+        }
+    }
+    t->rows += n; ts->rows += n;
+}
+
+/* Phase 1: one task = one contiguous range of logical input positions. */
+static void agg_ts_phase1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_ts_ctx_t* c = (agg_ts_ctx_t*)vctx;
+    ray_t* kb_hdr = NULL;
+    int64_t* keys = (int64_t*)scratch_alloc(&kb_hdr,
+        (size_t)(c->n_keys ? c->n_keys : 1) * sizeof(int64_t));
+    uint32_t* gid = keys ? ray_alloc_raw(AGG_TS_CHUNK * sizeof(uint32_t)) : NULL;
+    if (!keys || !gid) {
+        for (int64_t ti = start; ti < end; ti++) c->tasks[ti].oom = 1;
+        ray_free_raw(gid); scratch_free(kb_hdr);
+        return;
+    }
+    for (int64_t ti = start; ti < end; ti++) {
+        agg_ts_task_t* ts = &c->tasks[ti];
+        int64_t lo = ti * c->task_rows;
+        int64_t hi = lo + c->task_rows;
+        if (hi > c->n_in) hi = c->n_in;
+        if (c->sel) {
+            int64_t rows[AGG_SEL_CHUNK];
+            agg_sel_scratch_t sc;
+            if (!agg_sel_scratch_init(&sc, c->n_aggs)) { ts->oom = 1; continue; }
+            agg_sel_cursor_t cur;
+            agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, lo, hi);
+            int64_t pos = lo, cn;
+            while (!ts->oom && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+                agg_ts_chunk(c, ts, rows, pos, cn, &sc, gid, keys);
+                pos += cn;
+            }
+            agg_sel_scratch_free(&sc);
+        } else {
+            for (int64_t cs = lo; cs < hi && !ts->oom; cs += AGG_TS_CHUNK) {
+                int64_t ce = cs + AGG_TS_CHUNK; if (ce > hi) ce = hi;
+                agg_ts_chunk(c, ts, NULL, cs, ce - cs, NULL, gid, keys);
+            }
+        }
+        for (agg_ts_table_t* tab = ts->top; tab; tab = tab->prev) ts->entries += tab->ng;
+    }
+    ray_free_raw(gid); scratch_free(kb_hdr);
+}
+
+/* Partition-local merge table (phase 2): hash-indexed gid, grow-on-demand
+ * group arrays in the agg_radix_part_t layout. */
+typedef struct {
+    uint64_t* mh;        /* [htcap] key hash | 1, 0 = empty */
+    int32_t*  mg;        /* [htcap] slot -> gid */
+    int64_t   htcap;
+    char*     states;    /* [gcap * block] */
+    int64_t*  first_row; /* [gcap] */
+    int64_t*  keys;      /* [gcap * n_keys] */
+    int64_t   gcap, ng;
+} agg_ts_merge_t;
+
+static bool agg_ts_merge_init(agg_ts_merge_t* m, int64_t expect, size_t block, uint32_t n_keys) {
+    int64_t htcap = 64;
+    while (htcap < expect * 4) htcap <<= 1;
+    int64_t gcap = expect < 256 ? expect : 256;
+    if (gcap < 16) gcap = 16;
+    m->mh = ray_calloc_raw((size_t)htcap * sizeof(uint64_t));
+    m->mg = ray_alloc_raw((size_t)htcap * sizeof(int32_t));
+    m->states = ray_alloc_raw((size_t)gcap * block);
+    m->first_row = ray_alloc_raw((size_t)gcap * sizeof(int64_t));
+    m->keys = ray_alloc_raw((size_t)gcap * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
+    m->htcap = htcap; m->gcap = gcap; m->ng = 0;
+    return m->mh && m->mg && m->states && m->first_row && m->keys;
+}
+
+static void agg_ts_merge_free(agg_ts_merge_t* m, bool keep_groups) {
+    ray_free_raw(m->mh); ray_free_raw(m->mg); m->mh = NULL; m->mg = NULL;
+    if (!keep_groups) {
+        ray_free_raw(m->states); ray_free_raw(m->first_row); ray_free_raw(m->keys);
+        m->states = NULL; m->first_row = NULL; m->keys = NULL;
+    }
+}
+
+/* Slot index inside the merge table: bits above the forced bit 0 (the top
+ * bits are the partition, constant inside one table). */
+#define AGG_TS_MSLOT(h, mask) (((h) >> 1) & (mask))
+
+static bool agg_ts_merge_rehash(agg_ts_merge_t* m) {
+    int64_t ncap = m->htcap * 2;
+    uint64_t* nh = ray_calloc_raw((size_t)ncap * sizeof(uint64_t));
+    int32_t* ng = ray_alloc_raw((size_t)ncap * sizeof(int32_t));
+    if (!nh || !ng) { ray_free_raw(nh); ray_free_raw(ng); return false; }
+    uint64_t nmask = (uint64_t)ncap - 1;
+    for (int64_t s = 0; s < m->htcap; s++) {
+        uint64_t h = m->mh[s];
+        if (!h) continue;
+        uint64_t d = AGG_TS_MSLOT(h, nmask);
+        while (nh[d]) d = (d + 1) & nmask;
+        nh[d] = h; ng[d] = m->mg[s];
+    }
+    ray_free_raw(m->mh); ray_free_raw(m->mg);
+    m->mh = nh; m->mg = ng; m->htcap = ncap;
+    return true;
+}
+
+/* Find or create the group of (h, keys) in the merge table; `pos` is the
+ * candidate's first logical position (kept as the MIN).  Returns the gid,
+ * -1 on OOM. */
+static inline int64_t agg_ts_merge_gid(agg_ts_merge_t* m, agg_ts_ctx_t* c,
+                                       uint64_t h, const int64_t* keys, int64_t pos) {
+    uint32_t n_keys = c->n_keys;
+    size_t key_bytes = (size_t)n_keys * sizeof(int64_t);
+    uint64_t mask = (uint64_t)m->htcap - 1;
+    uint64_t slot = AGG_TS_MSLOT(h, mask);
+    for (;;) {
+        uint64_t sh = m->mh[slot];
+        if (!sh) break;
+        int32_t gg = m->mg[slot];
+        if (sh == h && memcmp(m->keys + (size_t)gg * n_keys, keys, key_bytes) == 0) {
+            if (pos < m->first_row[gg]) m->first_row[gg] = pos;
+            return gg;
+        }
+        slot = (slot + 1) & mask;
+    }
+    if ((m->ng + 1) * 2 > m->htcap) {          /* keep the load under 1/2 */
+        if (!agg_ts_merge_rehash(m)) return -1;
+        mask = (uint64_t)m->htcap - 1;
+        slot = AGG_TS_MSLOT(h, mask);
+        while (m->mh[slot]) slot = (slot + 1) & mask;
+    }
+    if (m->ng == m->gcap) {
+        int64_t ncap = m->gcap * 2;
+        void* ns = ray_realloc_raw(m->states, (size_t)ncap * c->block);
+        if (!ns) return -1;
+        m->states = ns;
+        void* nf = ray_realloc_raw(m->first_row, (size_t)ncap * sizeof(int64_t));
+        if (!nf) return -1;
+        m->first_row = nf;
+        void* nk = ray_realloc_raw(m->keys, (size_t)ncap * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
+        if (!nk) return -1;
+        m->keys = nk;
+        m->gcap = ncap;
+    }
+    int64_t gg = m->ng++;
+    m->mh[slot] = h; m->mg[slot] = (int32_t)gg;
+    m->first_row[gg] = pos;
+    memcpy(m->keys + (size_t)gg * n_keys, keys, key_bytes);
+    for (uint32_t a = 0; a < c->n_aggs; a++)
+        c->vts[a]->init(m->states + (size_t)gg * c->block + c->off[a]);
+    return gg;
+}
+
+/* Slot range of partition p in a table: [lo, lo + n) plus the run of
+ * occupied slots that linear probing pushed past it (wrapping).  Visits
+ * every occupied slot of the range and of that run; the body filters by
+ * partition (entries displaced INTO the range from the previous partition
+ * and the run's own tail belong elsewhere). */
+#define AGG_TS_RANGE_FOREACH(tab, p, part_bits, SLOT, BODY) do {               \
+        agg_ts_table_t* tab_ = (tab);                                          \
+        uint64_t mask_ = (uint64_t)tab_->cap - 1;                              \
+        uint32_t span_ = tab_->bits - (part_bits);                             \
+        int64_t lo_ = (int64_t)(p) << span_, n_ = (int64_t)1 << span_;         \
+        int64_t s_ = lo_, end_ = lo_ + n_;                                     \
+        for (; s_ < end_; s_++) {                                              \
+            if (!tab_->tag[s_]) continue;                                      \
+            int64_t SLOT = s_; BODY                                            \
+        }                                                                      \
+        for (int64_t k_ = 0; k_ < tab_->cap && tab_->tag[(uint64_t)s_ & mask_]; \
+             k_++, s_++) { int64_t SLOT = (int64_t)((uint64_t)s_ & mask_); BODY } \
+    } while (0)
+
+/* Phase 2: merge partition p from every task, in task order (tables oldest
+ * first, then the task's scattered records in input order).  Frees each
+ * bucket it consumed; tables are shared by all partitions and outlive the
+ * dispatch. */
+static void agg_ts_merge_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_ts_ctx_t* c = (agg_ts_ctx_t*)vctx;
+    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
+    uint32_t pshift = 64 - c->part_bits;
+    ray_t* ptr_hdr = NULL;
+    /* Per-call scratch: gid batch, one gather buffer per aggregate side, and
+     * a small array to walk a stack oldest-first. */
+    char** gv = (char**)scratch_calloc(&ptr_hdr,
+        (size_t)(2u * (n_aggs ? n_aggs : 1)) * sizeof(char*));
+    uint32_t* gid = gv ? ray_alloc_raw(AGG_TS_CHUNK * sizeof(uint32_t)) : NULL;
+    bool ok = gv && gid;
+    char** gy = gv ? gv + (n_aggs ? n_aggs : 1) : NULL;
+    for (uint32_t a = 0; ok && a < n_aggs; a++) {
+        if (c->val_data[a])  { gv[a] = ray_alloc_raw((size_t)AGG_TS_CHUNK * (c->val_esz[a] ? c->val_esz[a] : 1));  ok = gv[a] != NULL; }
+        if (ok && c->val2_data[a]) { gy[a] = ray_alloc_raw((size_t)AGG_TS_CHUNK * (c->val2_esz[a] ? c->val2_esz[a] : 1)); ok = gy[a] != NULL; }
+    }
+    uint32_t depth_cap = 16;
+    agg_ts_table_t** stack = ok ? ray_alloc_raw(depth_cap * sizeof(agg_ts_table_t*)) : NULL;
+    ok = ok && stack;
+    int64_t expect = c->merge_cand / c->n_parts + 1;
+
+    for (int64_t pi = start; pi < end; pi++) {
+        uint32_t p = (uint32_t)pi;
+        agg_radix_part_t* pr = &c->parts[p];
+        if (!ok) { pr->oom = 1; continue; }
+
+        agg_ts_merge_t m;
+        if (!agg_ts_merge_init(&m, expect, c->block, n_keys)) {
+            agg_ts_merge_free(&m, false); pr->oom = 1; continue;
+        }
+        bool poom = false;
+        for (uint32_t ti = 0; ti < c->n_tasks && !poom; ti++) {
+            agg_ts_task_t* ts = &c->tasks[ti];
+            /* Tables oldest first. */
+            uint32_t depth = 0;
+            for (agg_ts_table_t* tab = ts->top; tab; tab = tab->prev) {
+                if (depth == depth_cap) {
+                    void* ns = ray_realloc_raw((void*)stack, (size_t)depth_cap * 2 * sizeof(agg_ts_table_t*));
+                    if (!ns) { poom = true; break; }
+                    stack = ns; depth_cap *= 2;
+                }
+                stack[depth++] = tab;
+            }
+            if (poom) break;
+            for (uint32_t di = depth; di-- > 0 && !poom; ) {
+                agg_ts_table_t* tab = stack[di];
+                AGG_TS_RANGE_FOREACH(tab, p, c->part_bits, s, {
+                    if (poom) break;
+                    const char* e = tab_->ent + (size_t)s * c->estride;
+                    uint64_t h; memcpy(&h, e, sizeof(h));
+                    if ((uint32_t)(h >> pshift) == p) {
+                        int64_t pos; memcpy(&pos, e + sizeof(uint64_t), sizeof(pos));
+                        int64_t gg = agg_ts_merge_gid(&m, c, h,
+                            (const int64_t*)(e + AGG_TS_KEY_OFF), pos);
+                        if (gg < 0) { poom = true; break; }
+                        for (uint32_t a = 0; a < n_aggs; a++)
+                            c->vts[a]->merge(m.states + (size_t)gg * c->block + c->off[a],
+                                             e + c->ent_off[a], NULL);
+                    }
+                });
+            }
+            if (poom || !ts->buckets) continue;
+            /* Scattered records of this task, in input order, in batches. */
+            agg_ts_bucket_t* b = &ts->buckets[p];
+            for (agg_ts_chunk_t* ch = b->head; ch && !poom; ch = ch->next) {
+                const char* rec = (const char*)(ch + 1);
+                for (int64_t base = 0; base < ch->n && !poom; base += AGG_TS_CHUNK) {
+                    int64_t bn = ch->n - base; if (bn > AGG_TS_CHUNK) bn = AGG_TS_CHUNK;
+                    for (int64_t i = 0; i < bn; i++, rec += c->rec) {
+                        const int64_t* keys = (const int64_t*)rec;
+                        int64_t pos; memcpy(&pos, rec + c->row_off, sizeof(pos));
+                        for (uint32_t a = 0; a < n_aggs; a++) {
+                            if (gv[a]) memcpy(gv[a] + (size_t)i * c->val_esz[a],  rec + c->val_off[a],  c->val_esz[a]);
+                            if (gy[a]) memcpy(gy[a] + (size_t)i * c->val2_esz[a], rec + c->val2_off[a], c->val2_esz[a]);
+                        }
+                        int64_t gg = agg_ts_merge_gid(&m, c, agg_ts_hash(keys, n_keys), keys, pos);
+                        if (gg < 0) { poom = true; break; }
+                        gid[i] = (uint32_t)gg;
+                    }
+                    if (poom) break;
+                    for (uint32_t a = 0; a < n_aggs; a++) {
+                        char* states = m.states + c->off[a];
+                        if (c->vts[a]->update_batch2) {
+                            ray_valid_t vx = { gv[a], c->val_types[a],  c->val_hasnull[a] };
+                            ray_valid_t vy = { gy[a], c->val2_types[a], c->val2_hasnull[a] };
+                            c->vts[a]->update_batch2(states, c->block, gid, gv[a], gy[a], &vx, &vy, bn, NULL);
+                        } else if (c->val_data[a]) {
+                            ray_valid_t valid = { gv[a], c->val_types[a], c->val_hasnull[a] };
+                            c->vts[a]->update_batch(states, c->block, gid, gv[a], &valid, bn, NULL);
+                        } else {
+                            ray_valid_t valid = { NULL, c->val_types[a], false };
+                            c->vts[a]->update_batch(states, c->block, gid, NULL, &valid, bn, NULL);
+                        }
+                    }
+                }
+            }
+            agg_ts_bucket_free(b);   /* consumed by this partition only */
+        }
+        if (poom) { agg_ts_merge_free(&m, false); pr->oom = 1; continue; }
+        agg_ts_merge_free(&m, true);
+        pr->states = m.states; pr->first_row = m.first_row; pr->keys = m.keys; pr->ng = m.ng;
+    }
+    ray_free_raw(stack);
+    for (uint32_t a = 0; a < n_aggs && gv; a++) { ray_free_raw(gv[a]); ray_free_raw(gy[a]); }
+    ray_free_raw(gid); scratch_free(ptr_hdr);
+}
+
+/* Gate sample: AGG_TS_SAMPLE_TASKS slices of AGG_TS_SAMPLE_PER single rows,
+ * each slice hashed into its own small open-addressing set by one pool
+ * task (the reads are cache misses at scattered positions, and with a
+ * selection each position costs a cursor placement; serial they were
+ * 1-2 ms, more than a short radix query can afford).  The slices are
+ * merged into one count set afterwards. */
+#define AGG_TS_SAMPLE_TASKS   16
+#define AGG_TS_SAMPLE_PER     (AGG_TS_SAMPLE / AGG_TS_SAMPLE_TASKS)
+#define AGG_TS_SAMPLE_SETCAP  (AGG_TS_SAMPLE_PER * 4)
+/* Serial pre-check on the calling thread before the parallel sample, in
+ * two stages over scattered single rows.  Stage 1: AGG_TS_PRE_SAMPLE rows;
+ * at most AGG_TS_PRE_REPEATS repeated keys among them declines outright
+ * (the birthday estimate n^2 / (2 repeats) is then >= 128k groups, five
+ * times the admission cap), so a near-unique key costs a few hundred
+ * reads and no dispatch.  Stage 2 runs only when stage 1 is ambiguous
+ * (AGG_TS_PRE_REPEATS < repeats < AGG_TS_PRE_CLEAR, a birthday estimate
+ * between ~4k and ~65k groups): AGG_TS_PRE_SAMPLE2 rows in all, and a
+ * birthday estimate of at least AGG_TS_PRE_DECLINE_X times the cap
+ * declines — a 50k-group key repeats ~10 times among 1024 rows (declined
+ * at <= 14, ~88% of the time), a key at the cap ~21 times (declined ~5%),
+ * one at 15k ~35 times (never), so the 2x-5x-the-cap band rarely pays for
+ * the parallel sample while low cardinalities pay only stage 1. */
+#define AGG_TS_PRE_SAMPLE     512
+#define AGG_TS_PRE_REPEATS    1
+#define AGG_TS_PRE_CLEAR      32
+#define AGG_TS_PRE_SAMPLE2    1024
+#define AGG_TS_PRE_DECLINE_X  1.5
+typedef struct {
+    ray_t**        key_cols;
+    const void**   key_data;
+    uint32_t       n_keys;
+    int64_t        n_in;
+    int64_t        step;
+    ray_t*         sel;
+    const int64_t* sel_prefix;
+    uint64_t*      hs;     /* [tasks * SETCAP] key hash | 1, 0 = empty */
+    uint16_t*      cnt;    /* [tasks * SETCAP] */
+    int64_t*       keys;   /* [tasks * n_keys] packed-key scratch */
+    int64_t*       n;      /* [tasks] rows sampled */
+} agg_ts_sample_ctx_t;
+
+static void agg_ts_sample_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_ts_sample_ctx_t* c = (agg_ts_sample_ctx_t*)vctx;
+    uint32_t n_keys = c->n_keys;
+    for (int64_t t = start; t < end; t++) {
+        uint64_t* hs = c->hs + (size_t)t * AGG_TS_SAMPLE_SETCAP;
+        uint16_t* cnt = c->cnt + (size_t)t * AGG_TS_SAMPLE_SETCAP;
+        int64_t* keys = c->keys + (size_t)t * (n_keys ? n_keys : 1);
+        int64_t rows[AGG_SEL_CHUNK];
+        int64_t n = 0;
+        for (int64_t j = 0; j < AGG_TS_SAMPLE_PER; j++) {
+            int64_t i = t * AGG_TS_SAMPLE_PER + j;
+            int64_t pos = i * c->step + (int64_t)(ray_hash_i64(i) % (uint64_t)c->step);
+            int64_t r = pos;
+            if (c->sel) {
+                agg_sel_cursor_t cur;
+                agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, pos, pos + 1);
+                if (agg_sel_cursor_next(&cur, rows) != 1) continue;
+                r = rows[0];
+            }
+            for (uint32_t k = 0; k < n_keys; k++)
+                keys[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+            uint64_t h = agg_ts_hash(keys, n_keys);
+            uint64_t at = h & (AGG_TS_SAMPLE_SETCAP - 1);
+            while (hs[at] && hs[at] != h) at = (at + 1) & (AGG_TS_SAMPLE_SETCAP - 1);
+            if (!hs[at]) hs[at] = h;
+            cnt[at]++;
+            n++;
+        }
+        c->n[t] = n;
+    }
+}
+
+/* Serial pre-check on the calling thread, before any allocation or
+ * dispatch: AGG_TS_PRE_SAMPLE scattered single rows (selected rows under a
+ * filter); true when at most AGG_TS_PRE_REPEATS keys repeat among them,
+ * i.e. the key is near-unique and the strategy must decline. */
+/* A selected row of the segment holding ORIGINAL position `pos`, read
+ * straight from the selection: the row itself in an ALL segment, a
+ * pseudo-random entry (by `salt`) of a MIX segment's index slice — one
+ * cache line for the slice and one for the key, where a cursor placement
+ * by selected ordinal costs a prefix search plus a decode.  False for a
+ * NONE segment. */
+static inline bool agg_ts_sel_row_at(const uint8_t* flags, const uint32_t* offsets,
+                                     const uint16_t* idx, int64_t pos, uint64_t salt,
+                                     int64_t* row) {
+    uint32_t seg = (uint32_t)(pos / RAY_MORSEL_ELEMS);
+    uint8_t f = flags[seg];
+    if (f == RAY_SEL_NONE) return false;
+    if (f == RAY_SEL_ALL) { *row = pos; return true; }
+    uint32_t len = offsets[seg + 1] - offsets[seg];
+    if (len == 0) return false;
+    const uint16_t* slice = idx + offsets[seg];
+    *row = (int64_t)seg * RAY_MORSEL_ELEMS + slice[salt % len];
+    return true;
+}
+
+static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
+                                     ray_t* sel, const int64_t* sel_prefix, int64_t n_sel) {
+    (void)sel_prefix;
+    enum { PRECAP = AGG_TS_PRE_SAMPLE2 * 4 };
+    int64_t n_in = sel ? n_sel : nrows;
+    if (n_in < AGG_TS_SAMPLE) return false;
+    const uint8_t* sflags = sel ? ray_rowsel_flags(sel) : NULL;
+    const uint32_t* soffsets = sel ? ray_rowsel_offsets(sel) : NULL;
+    const uint16_t* sidx = sel ? ray_rowsel_idx(sel) : NULL;
+    size_t nk = n_keys ? n_keys : 1;
+    uint64_t phs[PRECAP];
+    int64_t pkeys[16];
+    const void* pdata[16];
+    ray_t* pk_hdr = NULL;
+    int64_t* keys = pkeys;
+    const void** key_data = pdata;
+    if (nk > 16) {
+        keys = (int64_t*)scratch_alloc(&pk_hdr, nk * (sizeof(int64_t) + sizeof(void*)));
+        if (!keys) return false;
+        key_data = (const void**)(keys + nk);
+    }
+    for (uint32_t k = 0; k < n_keys; k++) key_data[k] = ray_data(key_cols[k]);
+    memset(phs, 0, sizeof(phs));
+    /* Stride AGG_TS_PRE_SAMPLE2 positions over the ORIGINAL rows (a selected
+     * row is taken at or after each position); stage 1 visits every other
+     * one (spread over the whole input), stage 2 fills in the rest.  A
+     * position whose segment has no selected row is skipped, so a decision
+     * needs at least half the intended rows; otherwise the full gate, which
+     * samples by selected ordinal, decides. */
+    const int64_t ratio = AGG_TS_PRE_SAMPLE2 / AGG_TS_PRE_SAMPLE;
+    int64_t pstep = nrows / AGG_TS_PRE_SAMPLE2;
+    if (pstep < 1) pstep = 1;
+    int64_t d = 0, n = 0;
+    bool declined = false;
+    for (int64_t phase = 0; phase < ratio && !declined; phase++) {
+        for (int64_t j = 0; j < AGG_TS_PRE_SAMPLE; j++) {
+            int64_t i = j * ratio + phase;
+            uint64_t jit = ray_hash_i64(i + 7919);
+            int64_t pos = i * pstep + (int64_t)(jit % (uint64_t)pstep);
+            if (pos >= nrows) break;
+            int64_t r = pos;
+            if (sel && !agg_ts_sel_row_at(sflags, soffsets, sidx, pos, jit >> 32, &r)) continue;
+            for (uint32_t k = 0; k < n_keys; k++)
+                keys[k] = agg_read_key_i64(key_cols[k], key_data[k], r);
+            uint64_t h = agg_ts_hash(keys, n_keys);
+            uint64_t at = h & (PRECAP - 1);
+            while (phs[at] && phs[at] != h) at = (at + 1) & (PRECAP - 1);
+            if (!phs[at]) { phs[at] = h; d++; }
+            n++;
+        }
+        if (n < AGG_TS_PRE_SAMPLE / 2) break;   /* too few selected: full gate decides */
+        int64_t repeats = n - d;
+        if (phase == 0) {
+            if (repeats <= AGG_TS_PRE_REPEATS) declined = true;
+            else if (repeats >= AGG_TS_PRE_CLEAR) break;   /* clearly low: no stage 2 */
+        }
+    }
+    if (!declined && n >= AGG_TS_PRE_SAMPLE2 / 2) {
+        int64_t repeats = n - d;
+        double birthday = repeats > 0 ? (double)n * (double)n / (2.0 * (double)repeats) : 9.2e18;
+        declined = birthday >= AGG_TS_PRE_DECLINE_X * (double)AGG_TS_GATE_GROUPS;
+    }
+    scratch_free(pk_hdr);
+    return declined;
+}
+
+/* Chao1 estimate of the distinct key count from AGG_TS_SAMPLE SINGLE rows
+ * at evenly spaced positions (hashed jitter inside each stride).  One row
+ * per position, never a run of neighbours: real tables are often sorted
+ * or sessionised, so a key with millions of distinct values still repeats
+ * in short runs of consecutive rows, and a sample that reads neighbours
+ * counts those runs as repeats — the estimate collapses and a group-by
+ * with millions of groups is admitted (measured 1.3-1.9x slower than the
+ * radix scatter).  Rows far apart only repeat when the key really is
+ * frequent.  With a selection the sample is drawn from the SELECTED rows
+ * (ordinals decoded through the selection cursor): the grouped keys are
+ * those rows, and a sample of the whole table can look low-cardinality
+ * while the surviving rows are near-unique (a `where: (!= phrase "")`
+ * over a column that is mostly empty).  Chao1 is a lower bound for skewed
+ * abundances, so *unseen_pct also reports the Good-Turing share of rows
+ * whose key was seen once — the mass of keys the sample never saw — for
+ * the caller's gate.  Returns a value past INT64_MAX/2 when the sample is
+ * all-distinct. */
+static double agg_ts_estimate(ray_pool_t* pool, ray_t** key_cols, const void** key_data,
+                              uint32_t n_keys, int64_t nrows,
+                              ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
+                              int* unseen_pct) {
+    enum { CAP = 16384, PRECAP = AGG_TS_PRE_SAMPLE * 4 };
+    int64_t n_in = sel ? n_sel : nrows;
+    *unseen_pct = 0;
+    if (n_in < AGG_TS_SAMPLE) return (double)n_in;
+    size_t nk = n_keys ? n_keys : 1;
+    size_t set_bytes = (size_t)AGG_TS_SAMPLE_TASKS * AGG_TS_SAMPLE_SETCAP;
+    ray_t* hdr = NULL;
+    uint64_t* hs = (uint64_t*)scratch_calloc(&hdr,
+        set_bytes * sizeof(uint64_t) + set_bytes * sizeof(uint16_t)
+        + (size_t)AGG_TS_SAMPLE_TASKS * nk * sizeof(int64_t)
+        + (size_t)AGG_TS_SAMPLE_TASKS * sizeof(int64_t)
+        + CAP * sizeof(uint64_t) + CAP * sizeof(uint16_t));
+    if (!hs) return (double)n_in;
+    uint16_t* cnt = (uint16_t*)(hs + set_bytes);
+    int64_t* keys = (int64_t*)(cnt + set_bytes);
+    int64_t* ns = keys + (size_t)AGG_TS_SAMPLE_TASKS * nk;
+    uint64_t* ghs = (uint64_t*)(ns + AGG_TS_SAMPLE_TASKS);
+    uint16_t* gcnt = (uint16_t*)(ghs + CAP);
+    agg_ts_sample_ctx_t ctx = {
+        .key_cols = key_cols, .key_data = key_data, .n_keys = n_keys,
+        .n_in = n_in, .step = n_in / AGG_TS_SAMPLE,
+        .sel = sel, .sel_prefix = sel_prefix,
+        .hs = hs, .cnt = cnt, .keys = keys, .n = ns,
+    };
+    if (ray_pool_par_dispatch_ok(pool, AGG_TS_SAMPLE, 1))
+        ray_pool_dispatch_n(pool, agg_ts_sample_fn, &ctx, AGG_TS_SAMPLE_TASKS);
+    else
+        agg_ts_sample_fn(&ctx, 0, 0, AGG_TS_SAMPLE_TASKS);
+    /* Merge the slices' counts into one set. */
+    int64_t d = 0, n = 0;
+    for (int t = 0; t < AGG_TS_SAMPLE_TASKS; t++) {
+        n += ns[t];
+        const uint64_t* th = hs + (size_t)t * AGG_TS_SAMPLE_SETCAP;
+        const uint16_t* tc = cnt + (size_t)t * AGG_TS_SAMPLE_SETCAP;
+        for (int i = 0; i < AGG_TS_SAMPLE_SETCAP; i++) {
+            uint64_t h = th[i];
+            if (!h) continue;
+            uint64_t at = h & (CAP - 1);
+            while (ghs[at] && ghs[at] != h) at = (at + 1) & (CAP - 1);
+            if (!ghs[at]) { ghs[at] = h; d++; }
+            gcnt[at] = (uint16_t)(gcnt[at] + tc[i]);
+        }
+    }
+    int64_t f1 = 0, f2 = 0;
+    for (int64_t i = 0; i < CAP; i++) {
+        if (gcnt[i] == 1) f1++; else if (gcnt[i] == 2) f2++;
+    }
+    scratch_free(hdr);
+    if (n <= 0) return (double)n_in;
+    *unseen_pct = (int)(f1 * 100 / n);
+    if (d == n) return 9.2e18;
+    return (double)d + (f2 > 0 ? (double)f1 * (double)f1 / (2.0 * (double)f2)
+                                : (double)f1 * (double)(f1 - 1) / 2.0);
+}
+
+/* Declines (returns NULL, nothing recorded or allocated) when the sample
+ * estimate says the radix scatter is the better fit; see the header. */
+static ray_t* exec_group_v2_parallel_tablestack(
+        ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
+        ray_t** key_cols, int64_t* key_syms,
+        const agg_vtable_t** vts, const size_t* off, size_t block,
+        ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
+        int64_t group_limit, const ray_group_emit_filter_t* efp) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nw = ray_pool_total_workers(pool);
+
+    /* Near-unique keys (the common radix shape) decline here, before any
+     * allocation: the radix path then runs exactly as it always has. */
+    if (agg_ts_precheck_declines(key_cols, n_keys, nrows, sel, sel_prefix, n_sel)) {
+        ray_profile_tick("tablestack: gate declined");
+        return NULL;
+    }
+
+    agg_desc_t d;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+
+    int64_t n_in = sel ? n_sel : nrows;
+    if (n_in < 0) n_in = 0;
+    /* Logical tasks: a few per worker, never fewer rows than a table is
+     * worth; the task -> range map depends on (rows, workers) only. */
+    uint64_t want = (uint64_t)n_in / AGG_TS_TASK_ROWS;
+    uint64_t max_tasks = nw > 1 ? (uint64_t)nw * AGG_TS_TASKS_PER_WORKER : 1;
+    if (want > max_tasks) want = max_tasks;
+    if (want < 1) want = 1;
+    uint32_t n_tasks = (uint32_t)want;
+    int64_t task_rows = (n_in + n_tasks - 1) / n_tasks;
+    if (task_rows < 1) task_rows = 1;
+
+    /* Gate + initial table size from one sample of the grouped rows (the
+     * selected rows under a pushed filter). */
+    size_t state_off = AGG_TS_KEY_OFF + (size_t)n_keys * sizeof(int64_t);
+    size_t estride = (state_off + block + 7u) & ~(size_t)7u;
+    int unseen_pct = 0;
+    double est = agg_ts_estimate(pool, key_cols, d.key_data, n_keys, nrows,
+                                 sel, sel_prefix, n_sel, &unseen_pct);
+    uint32_t init_bits = AGG_TS_MIN_BITS;
+    while (init_bits < AGG_TS_MAX_BITS &&
+           (double)((int64_t)1 << init_bits) * 0.75 < est * 1.25) init_bits++;
+    /* Every worker probes its own table at random: the entries the tables
+     * in flight touch (plus their tag arrays) must stay in the last-level
+     * cache together or each probe misses to DRAM (the same bound the dense
+     * task-local slabs use; an unreported cache assumes 32 MB).  Wide
+     * aggregate states shrink the admitted group count accordingly. */
+    uint64_t llc_bytes = ray_cache_llc_bytes();
+    double cache_budget = (llc_bytes ? (double)llc_bytes : 32.0 * 1048576.0) * 0.75;
+    double table_bytes = est * (double)estride + (double)((int64_t)1 << init_bits);
+    /* Chao1 under-estimates a long tail behind a repeated head (a few hot
+     * keys supply the pairs its formula divides by while the tail stays
+     * unseen): when more than AGG_TS_GATE_UNSEEN_PCT of the sampled rows
+     * carry a key the sample saw once, most rows would open a new entry in
+     * their task's table whatever the estimate says — decline. */
+    if (est > (double)AGG_TS_GATE_GROUPS || est * AGG_TS_GATE_REPEAT > (double)task_rows ||
+            unseen_pct > AGG_TS_GATE_UNSEEN_PCT ||
+            table_bytes * (double)nw > cache_budget) {
+        agg_desc_free(&d);
+        ray_profile_tick("tablestack: gate declined");
+        return NULL;
+    }
+    agg_route_record(AGG_ROUTE_V2_TABLESTACK);
+
+    /* Record layout (scatter) + entry layout (tables), one carve. */
+    ray_t* off_hdr;
+    size_t* val_off = (size_t*)scratch_calloc(&off_hdr,
+        3u * (size_t)(n_aggs ? n_aggs : 1) * sizeof(size_t));
+    if (!val_off) { agg_desc_free(&d); return ray_error("oom", NULL); }
+    size_t* val2_off = val_off + (n_aggs ? n_aggs : 1);
+    size_t* ent_off  = val2_off + (n_aggs ? n_aggs : 1);
+    size_t rec_cur = (size_t)n_keys * 8;
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        if (d.val_data[a])  { val_off[a]  = rec_cur; rec_cur += d.val_esz[a]; }
+        if (d.val2_data[a]) { val2_off[a] = rec_cur; rec_cur += d.val2_esz[a]; }
+    }
+    size_t row_off = rec_cur; rec_cur += 8;
+    size_t rec = (rec_cur + 7u) & ~(size_t)7u;
+    for (uint32_t a = 0; a < n_aggs; a++) ent_off[a] = state_off + off[a];
+
+    /* Merge partitions: enough for the pool, a power of two no larger than
+     * the smallest table (its slot range per partition must be >= 1). */
+    uint32_t n_parts = 64;
+    while (n_parts < 8u * nw && n_parts < 1024u) n_parts <<= 1;
+
+    agg_ts_task_t* tasks = ray_calloc_raw((size_t)n_tasks * sizeof(agg_ts_task_t));
+    agg_radix_part_t* parts = ray_calloc_raw((size_t)n_parts * sizeof(agg_radix_part_t));
+    bool alloc_ok = tasks && parts;
+    /* Each task's first table is carved HERE, on the calling thread that
+     * also frees it after the merge: an allocation made by a worker and
+     * freed by another thread is parked on the owner's foreign list, and
+     * tens of such tables per query would shift the heap the next query
+     * runs on.  Growth and pushed tables (rarer) still come from workers. */
+    for (uint32_t t = 0; alloc_ok && t < n_tasks; t++) {
+        tasks[t].top = agg_ts_table_new(init_bits, estride);
+        if (!tasks[t].top) alloc_ok = false; else tasks[t].n_tables = 1;
+    }
+    if (!alloc_ok) {
+        if (tasks) for (uint32_t t = 0; t < n_tasks; t++) agg_ts_table_free(tasks[t].top);
+        ray_free_raw(tasks); ray_free_raw(parts);
+        scratch_free(off_hdr); agg_desc_free(&d);
+        return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
+                key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+    }
+
+    agg_ts_ctx_t ctx = {
+        .key_cols = key_cols, .key_data = d.key_data, .n_keys = n_keys,
+        .vts = vts, .off = off, .block = block, .n_aggs = n_aggs,
+        .val_data = d.val_data, .val_types = d.val_types, .val_hasnull = d.val_hasnull, .val_esz = d.val_esz,
+        .val2_data = d.val2_data, .val2_types = d.val2_types, .val2_hasnull = d.val2_hasnull, .val2_esz = d.val2_esz,
+        .vd = { .n_aggs = n_aggs, .vts = vts, .off = ent_off, .block = estride,
+                .val_data = d.val_data, .val_types = d.val_types, .val_hasnull = d.val_hasnull, .val_esz = d.val_esz,
+                .val2_data = d.val2_data, .val2_types = d.val2_types, .val2_hasnull = d.val2_hasnull, .val2_esz = d.val2_esz },
+        .ent_off = ent_off, .estride = estride, .state_off = state_off,
+        .rec = rec, .row_off = row_off, .val_off = val_off, .val2_off = val2_off,
+        .n_parts = n_parts, .part_bits = (uint32_t)__builtin_ctz(n_parts),
+        .init_bits = init_bits,
+        .n_in = n_in, .task_rows = task_rows, .n_tasks = n_tasks,
+        .tasks = tasks, .parts = parts,
+        .sel = sel, .sel_prefix = sel_prefix,
+    };
+
+    ray_pool_dispatch_n(pool, agg_ts_phase1_fn, &ctx, n_tasks);
+    bool cancelled = pool_cancelled(pool);
+    int oom = 0;
+    uint32_t scatter_tasks = 0; uint64_t tables = 0; int64_t cand = 0;
+    for (uint32_t t = 0; t < n_tasks; t++) {
+        if (tasks[t].oom) oom = 1;
+        if (tasks[t].scatter) scatter_tasks++;
+        tables += tasks[t].n_tables;
+        cand += tasks[t].entries + tasks[t].scattered;
+    }
+    ctx.merge_cand = cand;
+    route_stats.ts_tasks = n_tasks;
+    route_stats.ts_scatter_tasks = scatter_tasks;
+    route_stats.ts_tables = tables;
+    ray_profile_tick("tablestack: aggregated tasks");
+
+    if (!cancelled && !oom) {
+        ray_pool_dispatch_n(pool, agg_ts_merge_fn, &ctx, n_parts);
+        cancelled = pool_cancelled(pool);
+        for (uint32_t p = 0; p < n_parts; p++) if (parts[p].oom) { oom = 1; break; }
+    }
+    for (uint32_t t = 0; t < n_tasks; t++) agg_ts_task_free(&tasks[t], n_parts);
+    ray_free_raw(tasks);
+    scratch_free(off_hdr);
+    ray_profile_tick("tablestack: merged partitions");
+
+    if (cancelled || oom) {
+        agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+        ray_free_raw(parts);
+        agg_desc_free(&d);
+        if (cancelled) return ray_error("cancel", NULL);
+        return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
+                key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+    }
+    return agg_parts_emit(ext, &d, parts, n_parts, pool, nw, key_cols, key_syms,
+                          vts, off, block, n_in, group_limit, efp);
 }
 
 static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
@@ -5769,11 +6862,20 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         if (keys_intsym) {
-            agg_route_record(AGG_ROUTE_V2_RADIX);
-            /* Sparse ranges and excessive dense worker traffic use radix. */
-            ray_t* r = exec_group_v2_parallel_radix(g, op, tbl, nrows,
-                    key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
-                    group_limit, efp);
+            /* Sparse ranges and excessive dense worker traffic: pre-aggregate
+             * per task and scatter only the all-distinct tails (table stack);
+             * the radix scatter remains available behind the knob. */
+            ray_t* r = ray_agg_tablestack
+                ? exec_group_v2_parallel_tablestack(g, op, tbl, nrows,
+                        key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
+                        group_limit, efp)
+                : NULL;
+            if (!r) {   /* declined by its sample gate (or disabled) */
+                agg_route_record(AGG_ROUTE_V2_RADIX);
+                r = exec_group_v2_parallel_radix(g, op, tbl, nrows,
+                        key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
+                        group_limit, efp);
+            }
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */

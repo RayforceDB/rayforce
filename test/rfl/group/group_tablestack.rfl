@@ -1,0 +1,123 @@
+;; group_tablestack.rfl — the table-stack strategy (src/ops/agg_engine.c,
+;; exec_group_v2_parallel_tablestack): parallel int/SYM-key groups whose keys
+;; are too sparse for the dense direct-index plan and whose sampled
+;; cardinality is low pre-aggregate into per-task top-bit tables and merge by
+;; partition; a task whose table fills with mostly-distinct keys switches to
+;; raw scatter, and an input whose sample (of the selected rows under a
+;; where:) shows high cardinality declines to the radix scatter.  Keys are
+;; spread with `* 1000003` so the dense plan bails (same trick as
+;; group_radix_rightsize).
+;; Every expected value below is closed-form: row r carries key index
+;; (9 r) mod 10 (7919 mod 10 = 9), so group g' (first seen at row g') holds
+;; the rows r = g' + 10 m, m in [0, 20000).
+
+(set N 200000)
+(set i (til N))
+(set T10 (table [k j v] (list (* (% (* i 7919) 10) 1000003) (% i 7) i)))
+
+;; ── ten sparse keys: no task ever scatters; exact sums, first-seen order ──
+(set R10 (select {from: T10 s: (sum v) c: (count v) mn: (min v) mx: (max v) by: k}))
+(count R10) -- 10
+(at R10 'k) -- [0 9000027 8000024 7000021 6000018 5000015 4000012 3000009 2000006 1000003]
+(at R10 'c) -- [20000 20000 20000 20000 20000 20000 20000 20000 20000 20000]
+(at R10 'mn) -- [0 1 2 3 4 5 6 7 8 9]
+(at R10 'mx) -- [199990 199991 199992 199993 199994 199995 199996 199997 199998 199999]
+(at R10 's) -- [1999900000 1999920000 1999940000 1999960000 1999980000 2000000000 2000020000 2000040000 2000060000 2000080000]
+(sum (at R10 's)) -- 19999900000
+
+;; ── pushed WHERE: the selected-row space is chunked per task ─────────────
+(set W10 (select {from: T10 s: (sum v) c: (count v) by: k where: (< v 100000)}))
+(at W10 'k) -- [0 9000027 8000024 7000021 6000018 5000015 4000012 3000009 2000006 1000003]
+(at W10 'c) -- [10000 10000 10000 10000 10000 10000 10000 10000 10000 10000]
+(at W10 's) -- [499950000 499960000 499970000 499980000 499990000 500000000 500010000 500020000 500030000 500040000]
+
+;; ── composite key (sparse int + small int): 70 groups ────────────────────
+(set M10 (select {from: T10 c: (count v) by: [k j]}))
+(count M10) -- 70
+(sum (at M10 'c)) -- 200000
+(at (select {from: M10 n: (count c) by: k}) 'n) -- [7 7 7 7 7 7 7 7 7 7]
+
+;; ── SYM + sparse int composite ───────────────────────────────────────────
+(set vocab (as 'SYM (map (fn [x] (format "ts%" x)) (til 3))))
+(set Ts (table [s k v] (list (at vocab (% i 3)) (* (% (* i 7919) 10) 1000003) i)))
+(set Rs (select {from: Ts c: (count v) sv: (sum v) by: [s k]}))
+(count Rs) -- 30
+(sum (at Rs 'c)) -- 200000
+(sum (at Rs 'sv)) -- 19999900000
+
+;; ── native top-N over the merged partitions ──────────────────────────────
+(at (select {from: T10 s: (sum v) by: k desc: s take: 3}) 'k) -- [1000003 2000006 3000009]
+(at (select {from: T10 s: (sum v) by: k desc: s take: 3}) 's) -- [2000080000 2000060000 2000040000]
+
+;; ── medium cardinality: 5000 keys, forty rows each, one table per task ───
+(set T50 (table [k v] (list (* (% (* i 7919) 5000) 1000003) i)))
+(set R50 (select {from: T50 c: (count v) s: (sum v) by: k}))
+(count R50) -- 5000
+(min (at R50 'c)) -- 40
+(max (at R50 'c)) -- 40
+(sum (at R50 's)) -- 19999900000
+;; first-seen order: the first row of each group ascends with the output row.
+(set F50 (select {from: T50 f: (first v) by: k}))
+(all (== (at F50 'f) (asc (at F50 'f)))) -- true
+
+;; ── skewed input: 950000 rows over ten hot keys (75%) and 2000 middle keys
+;;    (25%, ~120 rows each), then 50000 all-distinct rows.  The sample
+;;    estimates a few thousand groups (the middle layer supplies the pairs
+;;    Chao1 divides by) and only ~5% of rows are singletons, so the table
+;;    stack is taken; the last task fills a 32768-slot table at a low
+;;    distinct ratio (push), then fills the next one with distinct keys only
+;;    (switch to raw scatter) ────────────────────────────────────────────────
+(set N2 1000000)
+(set j (til 950000))
+(set flag (div (% j 8) 6))
+(set hot (* (% (* j 7919) 10) 1000003))
+(set mid (* (+ 10 (% (div j 8) 2000)) 1000003))
+(set head (+ (* (- 1 flag) hot) (* flag mid)))
+(set Tk (table [k v] (list (raze (list head (* (+ (til 50000) 2010) 1000003))) (til N2))))
+(set Rk (select {from: Tk c: (count v) s: (sum v) by: k}))
+(count Rk) -- 52010
+(sum (at Rk 'c)) -- 1000000
+(asc (distinct (at Rk 'c))) -- [1 118 120 71250]
+(at (at Rk 'k) (til 12)) -- [0 9000027 8000024 7000021 6000018 5000015 10000030 2000006 1000003 11000033 4000012 3000009]
+(at (select {from: Tk s: (sum v) c: (count v) by: k where: (== k 0)}) 's) -- [33843037500]
+(at (select {from: Tk s: (sum v) c: (count v) by: k where: (== k 0)}) 'c) -- [71250]
+(at (select {from: Tk s: (sum v) c: (count v) by: k where: (== k 10000030)}) 's) -- [56640780]
+(at (select {from: Tk s: (sum v) c: (count v) by: k where: (== k 10000030)}) 'c) -- [120]
+(at (select {from: Tk s: (sum v) by: k where: (== k 2010006030)}) 's) -- [950000]
+(set Fk (select {from: Tk f: (first v) by: k}))
+(all (== (at Fk 'f) (asc (at Fk 'f)))) -- true
+(all (== (at (select {from: Tk c: (count v) by: k where: (>= v 950000)}) 'k) (* (+ (til 50000) 2010) 1000003))) -- true
+;; selected rows: even v reaches five hot keys, the middle layer and half the tail
+(count (select {from: Tk c: (count v) by: k where: (== (% v 2) 0)})) -- 27005
+(set Tk 0) (set Rk 0) (set Fk 0) (set j 0) (set flag 0) (set hot 0) (set mid 0) (set head 0)
+
+;; ── sorted key repeating in runs of five rows (one group per five rows):
+;;    the gate samples single scattered rows, sees no repeats and declines
+;;    to radix — the merged result is exact either way ──────────────────────
+(set Tr (table [k v] (list (* (div i 5) 1000003) i)))
+(set Rr (select {from: Tr c: (count v) s: (sum v) by: k}))
+(count Rr) -- 40000
+(asc (distinct (at Rr 'c))) -- [5]
+(all (== (at Rr 'k) (* (til 40000) 1000003))) -- true
+(all (== (at Rr 's) (+ (* 25 (til 40000)) 10))) -- true
+(count (select {from: Tr c: (count v) by: k where: (< (% v 10) 3)})) -- 20000
+(set Tr 0) (set Rr 0)
+
+;; ── all-distinct keys: the sample gate declines to the radix scatter; one
+;;    group per row, emitted in input order ─────────────────────────────────
+(set Th (table [k v] (list (* i 1000003) i)))
+(set Rh (select {from: Th c: (count v) s: (sum v) by: k}))
+(count Rh) -- 200000
+(max (at Rh 'c)) -- 1
+(all (== (at Rh 'k) (* (til N) 1000003))) -- true
+(all (== (at Rh 's) (til N))) -- true
+;; the same with a filter that keeps every third row
+(set Wh (select {from: Th c: (count v) by: k where: (== (% v 3) 0)}))
+(count Wh) -- 66667
+(all (== (at Wh 'k) (* (* 3 (til 66667)) 1000003))) -- true
+
+;; ── negative keys and a narrow key type ──────────────────────────────────
+(set Tn (table [k v] (list (- (* (% (* i 7919) 10) 1000003) 5000000) (as 'I32 (% (* i 7919) 3000)) )))
+(set Rn (select {from: Tn c: (count k) by: v}))
+(count Rn) -- 3000
+(at (select {from: Tn mn: (min k) mx: (max k) by: k}) 'k) -- [-5000000 4000027 3000024 2000021 1000018 15 -999988 -1999991 -2999994 -3999997]

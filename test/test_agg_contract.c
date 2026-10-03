@@ -339,10 +339,10 @@ static test_result_t test_group_routes_and_bool_outputs(void) {
         { 32, 0, AGG_ROUTE_V2_SERIAL_DENSE },
         { 32, 1, AGG_ROUTE_V2_SERIAL_HASH },
         { RAY_PARALLEL_THRESHOLD, 0, AGG_ROUTE_V2_DENSE },
-        { RAY_PARALLEL_THRESHOLD, 1, AGG_ROUTE_V2_RADIX },
+        { RAY_PARALLEL_THRESHOLD, 1, AGG_ROUTE_V2_TABLESTACK },   /* 4 sparse keys */
         { RAY_PARALLEL_THRESHOLD, 2, AGG_ROUTE_V2_DENSE },
         { RAY_PARALLEL_THRESHOLD, 3, AGG_ROUTE_V2_DENSE },
-        { RAY_PARALLEL_THRESHOLD, 4, AGG_ROUTE_V2_RADIX },
+        { RAY_PARALLEL_THRESHOLD, 4, AGG_ROUTE_V2_RADIX },        /* all-distinct sparse keys */
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         int64_t n = cases[c].n;
@@ -1900,6 +1900,132 @@ static test_result_t test_dense_native_topn(void) {
     PASS();
 }
 
+/* Sparse int keys below the dense plan: the table-stack strategy takes a
+ * low-cardinality input (one table per task, no scatter) and declines an
+ * all-distinct one to radix at its sample gate.  A skewed input whose
+ * sample looks low-cardinality but whose last task is all-distinct exercises
+ * the stack push and the adaptive switch to raw scatter inside that task.
+ * Every shape agrees with the radix scatter (knob off) and the serial fold
+ * on every integer aggregate, in the same first-seen order. */
+static test_result_t test_tablestack_routes(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set tsk_i (til 262144)) "
+        "(set tsk_low (table [k v] (list (* (% (* tsk_i 7919) 10) 1000003) tsk_i))) "
+        "(set tsk_mid (table [k v] (list (* (% (* tsk_i 7919) 5000) 1000003) tsk_i))) "
+        "(set tsk_j (til 1048576)) "
+        "(set tsk_hi (table [k v] (list (* tsk_j 1000003) tsk_j))) "
+        /* rows [0, 983040): ten hot keys (75%) + 2000 middle keys (25%, rows
+         * 8m+6 and 8m+7 share key m mod 2000); rows [983040, 1048576): all
+         * distinct.  The middle layer gives the gate's Chao1 the pairs it
+         * divides by, so the estimate stays in the thousands and the
+         * distinct tail (6% of the rows) is left to the tasks. */
+        "(set tsk_h (til 983040)) "
+        "(set tsk_f (div (% tsk_h 8) 6)) "
+        "(set tsk_sk (table [k v] (list (raze (list "
+        "(+ (* (- 1 tsk_f) (* (% (* tsk_h 7919) 10) 1000003)) (* tsk_f (* (+ 10 (% (div tsk_h 8) 2000)) 1000003))) "
+        "(* (+ (til 65536) 2010) 1000003))) tsk_j)))"
+        /* phrases: q0 on 87% of the rows; the rest draw from 200000 phrases,
+         * 30% of them from a hot head of 1000 */
+        "(set tsk_pv (as 'SYM (map (fn [x] (format \"q%\" x)) (til 200000)))) "
+        "(set tsk_pp (% (* tsk_j 7919) 200000)) "
+        "(set tsk_ph1 (div (% tsk_j 10) 7)) "
+        "(set tsk_pp (+ (* tsk_ph1 (% tsk_pp 1000)) (* (- 1 tsk_ph1) tsk_pp))) "
+        "(set tsk_ph (table [g p v] (list (% tsk_j 7) (at tsk_pv (* (div (% tsk_j 100) 87) (+ 1 (% tsk_pp 199999)))) tsk_j))) "
+        /* sorted key repeating in runs of five: 209716 groups */
+        "(set tsk_run (table [k v] (list (* (div tsk_j 5) 1000003) tsk_j)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    const struct { const char* q; int64_t groups; agg_route_t route; int scatter; int extra_tables; const char* cols[3]; } cases[] = {
+        { "(select {from:tsk_low by:k s:(sum v) c:(count v) mn:(min v) mx:(max v)})", 10, AGG_ROUTE_V2_TABLESTACK, 0, 0, { "k", "s", "mx" } },
+        { "(select {from:tsk_low by:k s:(sum v) c:(count v) where:(< v 200000)})", 10, AGG_ROUTE_V2_TABLESTACK, 0, 0, { "k", "s", "c" } },
+        { "(select {from:tsk_mid by:k s:(sum v) c:(count v)})", 5000, AGG_ROUTE_V2_TABLESTACK, 0, 0, { "k", "s", "c" } },
+        { "(select {from:tsk_hi by:k s:(sum v) c:(count v)})", 1048576, AGG_ROUTE_V2_RADIX, 0, 0, { "k", "s", "c" } },
+        /* Mostly-empty SYM phrase column: a sample of the whole table looks
+         * low-cardinality (87% one key), but the rows surviving the filter
+         * are near-unique — the gate samples the SELECTED rows and declines. */
+        { "(select {from:tsk_ph by:[g p] c:(count v) where:(!= p 'q0)})", 73815, AGG_ROUTE_V2_RADIX, 0, 0, { "g", "p", "c" } },
+        /* A key that repeats only in RUNS of consecutive rows (sorted
+         * input): a sample of neighbouring rows would see repeats and
+         * admit 200k groups; single scattered rows see none and decline. */
+        { "(select {from:tsk_run by:k s:(sum v) c:(count v)})", 209716, AGG_ROUTE_V2_RADIX, 0, 0, { "k", "s", "c" } },
+        { "(select {from:tsk_run by:k s:(sum v) c:(count v) where:(< (% v 10) 3)})", 104858, AGG_ROUTE_V2_RADIX, 0, 0, { "k", "s", "c" } },
+        /* 8 tasks of 131072 rows; the last one holds ~2010 keys in its
+         * first half, grows to 32768 slots over the distinct second half,
+         * fills it at 28% distinct (push) and fills the pushed table with
+         * distinct keys only (switch). */
+        { "(select {from:tsk_sk by:k s:(sum v) c:(count v)})", 67546, AGG_ROUTE_V2_TABLESTACK, 1, 1, { "k", "s", "c" } },
+        /* selected (even rows reach five hot keys, every middle key and
+         * half the tail): the last task fills the 32768-slot table at 44%
+         * (push) and the remaining ~9200 keys fit the pushed table. */
+        { "(select {from:tsk_sk by:k s:(sum v) c:(count v) where:(== (% v 2) 0)})", 34773, AGG_ROUTE_V2_TABLESTACK, 0, 1, { "k", "s", "c" } },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_agg_tablestack = true;
+        agg_route_reset();
+        ray_t* r = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        agg_route_stats_t stats = agg_route_stats();
+        TEST_ASSERT_FMT(stats.routes[cases[c].route] == 1, "case %zu route", c);
+        TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
+        TEST_ASSERT_EQ_I(ray_table_nrows(r), cases[c].groups);
+        if (cases[c].route == AGG_ROUTE_V2_TABLESTACK) {
+            TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
+            TEST_ASSERT_EQ_I(stats.ts_tasks, 8);
+            TEST_ASSERT_FMT(stats.ts_scatter_tasks == (uint32_t)cases[c].scatter,
+                            "case %zu scatter tasks %u", c, stats.ts_scatter_tasks);
+            TEST_ASSERT_FMT(stats.ts_tables == stats.ts_tasks + (uint64_t)cases[c].extra_tables,
+                            "case %zu tables %llu", c, (unsigned long long)stats.ts_tables);
+        } else {
+            TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_TABLESTACK], 0);
+        }
+        ray_env_set(ray_sym_intern("tsk_a", 5), r); ray_release(r);
+        ray_agg_tablestack = false;
+        agg_route_reset();
+        r = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_RADIX], 1);
+        ray_env_set(ray_sym_intern("tsk_b", 5), r); ray_release(r);
+        ray_agg_tablestack = true;
+        /* Same groups in the same (first-seen) order with the same values. */
+        for (int k = 0; k < 3; k++) {
+            char expr[128];
+            snprintf(expr, sizeof(expr), "(all (== (at tsk_a '%s) (at tsk_b '%s)))",
+                     cases[c].cols[k], cases[c].cols[k]);
+            ray_t* same = ray_eval_str(expr);
+            TEST_ASSERT_NOT_NULL(same); TEST_ASSERT_FALSE(RAY_IS_ERR(same));
+            TEST_ASSERT_FMT(same->u8, "case %zu column %d differs from radix", c, k);
+            ray_release(same);
+        }
+    }
+    /* Serial oracle: one core folds every row in order (serial hash path). */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+    ray_t* ser = ray_eval_str("(select {from:tsk_sk by:k s:(sum v) c:(count v)})");
+    TEST_ASSERT_NOT_NULL(ser); TEST_ASSERT_FALSE(RAY_IS_ERR(ser));
+    ray_env_set(ray_sym_intern("tsk_s", 5), ser); ray_release(ser);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* par = ray_eval_str("(select {from:tsk_sk by:k s:(sum v) c:(count v)})");
+    TEST_ASSERT_NOT_NULL(par); TEST_ASSERT_FALSE(RAY_IS_ERR(par));
+    ray_env_set(ray_sym_intern("tsk_p", 5), par); ray_release(par);
+    const char* sorted[] = {
+        "(all (== (at (xasc tsk_s 'k) 'k) (at (xasc tsk_p 'k) 'k)))",
+        "(all (== (at (xasc tsk_s 'k) 's) (at (xasc tsk_p 'k) 's)))",
+        "(all (== (at (xasc tsk_s 'k) 'c) (at (xasc tsk_p 'k) 'c)))",
+    };
+    for (int k = 0; k < 3; k++) {
+        ray_t* same = ray_eval_str(sorted[k]);
+        TEST_ASSERT_NOT_NULL(same); TEST_ASSERT_FALSE(RAY_IS_ERR(same));
+        TEST_ASSERT_FMT(same->u8, "serial oracle column %d differs", k);
+        ray_release(same);
+    }
+    ray_release(ray_eval_str("(set tsk_i 0) (set tsk_j 0) (set tsk_h 0) (set tsk_f 0) (set tsk_low 0) (set tsk_mid 0) "
+                             "(set tsk_hi 0) (set tsk_sk 0) (set tsk_a 0) (set tsk_b 0) (set tsk_s 0) (set tsk_p 0) "
+                             "(set tsk_pv 0) (set tsk_pp 0) (set tsk_ph1 0) (set tsk_ph 0) (set tsk_run 0)"));
+    PASS();
+}
+
 /* Unordered take: N on a bounded key stays on the dense task-local path and
  * emits the first N groups in first-seen order.  The first-N pre-pass would
  * answer this shape before the dense route runs, so it is switched off for
@@ -2047,6 +2173,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },
     { "agg_contract/dense_composite_compaction", test_dense_composite_compaction, contract_setup, contract_teardown },
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
+    { "agg_contract/tablestack_routes", test_tablestack_routes, contract_setup, contract_teardown },
     { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
