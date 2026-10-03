@@ -461,6 +461,39 @@ static void* pq_small_stack_worker(void* result) {
     return NULL;
 }
 #endif
+/* Direct path: 7 uneven row groups merge into the whole-column zone; the
+ * unclustered column with nulls gets a hash. */
+static test_result_t test_pq_splayed_inline_indexes(void) {
+    const char* names[] = {"x","y"};
+    for (int cores = 1; cores <= 4; cores *= 4) {
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
+        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-zones-%d-%d",(int)getpid(),cores);
+        ray_t* result = ray_parquet_splayed_typed(FIX "zones.parquet",dir,NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,200000); ray_release(result);
+        ray_t* table = ray_read_splayed(dir,NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+        ray_t* x = ray_table_get_col_idx(table,0);
+        TEST_ASSERT_EQ_I(ray_index_kind(x),RAY_IDX_CHUNK_ZONE);
+        ray_t* plain = ray_vec_from_raw(RAY_I32,ray_data(x),x->len);
+        ray_t* want = ray_index_chunk_zone_compute(plain,16);
+        TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+        const ray_index_t* g = ray_index_payload(x->index);
+        const ray_index_t* w = ray_index_payload(want);
+        TEST_ASSERT_EQ_I(g->u.chunk_zone.n_chunks,4);
+        TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.mins),ray_data(w->u.chunk_zone.mins),4*8),0);
+        TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.maxs),ray_data(w->u.chunk_zone.maxs),4*8),0);
+        TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.aggs),ray_data(w->u.chunk_zone.aggs),12*8),0);
+        TEST_ASSERT_TRUE((g->u.chunk_zone.null_bits != NULL) == (w->u.chunk_zone.null_bits != NULL));
+        if (w->u.chunk_zone.null_bits)
+            TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.null_bits),ray_data(w->u.chunk_zone.null_bits),(size_t)((g->u.chunk_zone.n_chunks+7)/8)),0);
+        ray_release(want); ray_release(plain);
+        TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(table,1)),RAY_IDX_HASH);
+        ray_release(table); pq_remove_native(dir,names,2);
+        ray_pool_destroy();
+    }
+    PASS();
+}
+
 static test_result_t test_pq_small_stack(void) {
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
     ray_pool_destroy();
@@ -489,6 +522,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/bloom",test_pq_bloom,pq_setup,pq_teardown},
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
+    {"parquet/splayed_inline_indexes",test_pq_splayed_inline_indexes,pq_setup,pq_teardown},
     {"parquet/parallel",test_pq_parallel,pq_setup,pq_teardown},
     {"parquet/range",test_pq_range,pq_setup,pq_teardown},
     {NULL,NULL,NULL,NULL}
