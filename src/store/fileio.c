@@ -92,6 +92,15 @@ ray_err_t ray_file_lock_ex(ray_fd_t fd) {
     return RAY_OK;
 }
 
+ray_err_t ray_file_trylock_ex(ray_fd_t fd) {
+    if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    OVERLAPPED ov = {0};
+    if (!LockFileEx(fd, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0, MAXDWORD, MAXDWORD, &ov))
+        return RAY_ERR_IO;
+    return RAY_OK;
+}
+
 ray_err_t ray_file_lock_sh(ray_fd_t fd) {
     if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
     OVERLAPPED ov = {0};
@@ -178,6 +187,10 @@ ray_err_t ray_mkdir_p(const char* path) {
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#if defined(RAY_OS_LINUX)
+#include <sys/syscall.h>
+#define RAY_RENAME_NOREPLACE 1u   /* RENAME_NOREPLACE, linux/fs.h */
+#endif
 
 ray_fd_t ray_file_open(const char* path, int flags) {
     if (!path) return RAY_FD_INVALID;
@@ -202,6 +215,12 @@ void ray_file_close(ray_fd_t fd) {
 ray_err_t ray_file_lock_ex(ray_fd_t fd) {
     if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
     if (flock(fd, LOCK_EX) != 0) return RAY_ERR_IO;
+    return RAY_OK;
+}
+
+ray_err_t ray_file_trylock_ex(ray_fd_t fd) {
+    if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) return RAY_ERR_IO;
     return RAY_OK;
 }
 
@@ -273,8 +292,11 @@ ray_err_t ray_file_rename_new_emulated(const char* old_path, const char* new_pat
 
 ray_err_t ray_file_rename_new(const char* old_path, const char* new_path) {
     if (!old_path || !new_path) return RAY_ERR_IO;
-#if defined(RAY_OS_LINUX)
-    if (renameat2(AT_FDCWD,old_path,AT_FDCWD,new_path,RENAME_NOREPLACE) == 0) return RAY_OK;
+#if defined(RAY_OS_LINUX) && defined(SYS_renameat2)
+    /* Through syscall(): the renameat2 wrapper and RENAME_NOREPLACE came in
+     * glibc 2.28, and the engine links against older glibc (2.17). */
+    if (syscall(SYS_renameat2, AT_FDCWD, old_path, AT_FDCWD, new_path,
+                RAY_RENAME_NOREPLACE) == 0) return RAY_OK;
     /* EINVAL: this filesystem does not implement RENAME_NOREPLACE (some
      * network and FUSE filesystems); ENOSYS: kernel older than 3.15. */
     if (errno != EINVAL && errno != ENOSYS) return RAY_ERR_IO;

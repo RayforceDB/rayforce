@@ -686,7 +686,7 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         if (zero) ray_release(zero);
         if (r && !RAY_IS_ERR(r)) return r;
         if (r) ray_error_free(r);
-        return ray_table_new(0);   /* a parted table takes no `take` */
+        limit = 0;   /* a parted table takes no `take`: gather no rows */
     }
     if (limit > nrows) limit = nrows;
 
@@ -696,7 +696,7 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     /* Collect up to `limit` matching row indices, stopping early */
     ray_t* idx_hdr = NULL;
     int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
-                                    (size_t)limit * sizeof(int64_t));
+                                    (size_t)(limit > 0 ? limit : 1) * sizeof(int64_t));
     if (!match_idx) return ray_error("oom", NULL);
 
     int64_t found = 0;
@@ -720,9 +720,19 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         ray_t* col = ray_table_get_col_idx(input, c);
         int64_t name_id = ray_table_col_name(input, c);
         if (!col) continue;
+        if (col->type == RAY_MAPCOMMON) {
+            ray_t* mc = materialize_mapcommon_gather(col, match_idx, found);
+            if (!mc || RAY_IS_ERR(mc)) {
+                scratch_free(idx_hdr);
+                ray_release(tbl);
+                return mc;
+            }
+            tbl = ray_table_add_col(tbl, name_id, mc);
+            ray_release(mc);
+            continue;
+        }
         int8_t out_type = RAY_IS_PARTED(col->type)
                         ? (int8_t)RAY_PARTED_BASETYPE(col->type) : col->type;
-        if (out_type == RAY_MAPCOMMON) continue;
         uint8_t out_attrs = 0;
         if (out_type == RAY_SYM) {
             if (RAY_IS_PARTED(col->type)) {
@@ -905,6 +915,13 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                 continue;
             ray_t* col = ray_table_get_col_idx(tbl, c);
             if (!col) continue;
+            if (col->type == RAY_MAPCOMMON) {
+                ray_t* mc = materialize_mapcommon_head(col, 0);
+                if (!mc || RAY_IS_ERR(mc)) { ray_release(empty); return mc; }
+                empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), mc);
+                ray_release(mc);
+                continue;
+            }
             int8_t ct = RAY_IS_PARTED(col->type)
                       ? (int8_t)RAY_PARTED_BASETYPE(col->type) : col->type;
             /* RAY_LIST == 0; ray_vec_new rejects type <= 0, so a LIST

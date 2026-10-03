@@ -40,3 +40,18 @@
 (at (select {r: (as 'I16 (as 'U8 v)) from: TV}) 'r) -- (as 'I16 (as 'U8 nv))
 (at (select {r: (as 'I32 (as 'U8 v)) from: TV}) 'r) -- (as 'I32 (as 'U8 nv))
 (count (til 100000)) -- 100000
+
+;; `nil?` over a narrow lane read it as int64 and found no null
+(set vn [1 0N 3 0N 5])
+(set TI (table [v] (list vn)))
+(at (select {n: (nil? (as 'I32 v)) from: TI}) 'n) -- (nil? (as 'I32 vn))
+(at (select {n: (nil? (as 'I16 v)) from: TI}) 'n) -- (nil? (as 'I16 vn))
+(at (select {n: (nil? (as 'U8 v)) from: TI}) 'n) -- (nil? (as 'U8 vn))
+(at (select {n: (nil? (as 'DATE v)) from: TI}) 'n) -- (nil? (as 'DATE vn))
+(count (select {v: v from: TI where: (nil? (as 'I32 v))})) -- 2
+;; a null-free value that truncates onto the narrow sentinel is not null
+(set vb [-32768 32768 -2147483648 2147483648 65535])
+(set TB (table [v] (list vb)))
+(at (select {n: (nil? (as 'I16 v)) from: TB}) 'n) -- (nil? (as 'I16 vb))
+(at (select {n: (nil? (as 'I32 v)) from: TB}) 'n) -- (nil? (as 'I32 vb))
+(count (select {v: v from: TB where: (nil? (as 'I32 v))})) -- 0

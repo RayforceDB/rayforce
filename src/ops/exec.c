@@ -129,6 +129,36 @@ ray_t* materialize_mapcommon_head(ray_t* mc, int64_t n) {
     return flat;
 }
 
+/* Materialize the rows `idx[0..n)` (ascending) of a MAPCOMMON column. */
+ray_t* materialize_mapcommon_gather(ray_t* mc, const int64_t* idx, int64_t n) {
+    ray_t** mc_ptrs = (ray_t**)ray_data(mc);
+    ray_t* kv = mc_ptrs[0];
+    ray_t* rc = mc_ptrs[1];
+    int64_t n_parts = kv->len;
+    int8_t kv_type = kv->type;
+    size_t esz = (size_t)ray_sym_elem_size(kv_type, kv->attrs);
+    const char* kdata = (const char*)ray_data(kv);
+    const int64_t* counts = (const int64_t*)ray_data(rc);
+
+    ray_t* flat = ray_vec_new(kv_type, n);
+    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    flat->len = n;
+    /* raw SYM cell ids — adopt the keys carrier's domain (see above) */
+    if (kv_type == RAY_SYM) ray_sym_vec_adopt_domain(flat, kv);
+
+    char* out = (char*)ray_data(flat);
+    int64_t part_idx = 0;
+    int64_t part_end = n_parts > 0 ? counts[0] : 0;
+    for (int64_t i = 0; i < n; i++) {
+        while (part_idx < n_parts - 1 && idx[i] >= part_end) {
+            part_idx++;
+            part_end += counts[part_idx];
+        }
+        memcpy(out + (size_t)i * esz, kdata + (size_t)part_idx * esz, esz);
+    }
+    return flat;
+}
+
 /* Materialize MAPCOMMON through a boolean filter predicate. */
 ray_t* materialize_mapcommon_filter(ray_t* mc, ray_t* pred, int64_t pass_count) {
     ray_t** mc_ptrs = (ray_t**)ray_data(mc);

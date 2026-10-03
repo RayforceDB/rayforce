@@ -481,5 +481,55 @@
 (.db.parted.get "/tmp/rfl_part_intovf/" 't) !- corrupt
 (.sys.exec "rm -rf /tmp/rfl_part_intord /tmp/rfl_part_intovf")
 
+;; ────────────── partition column on no-match where: and under take: ──────────────
+;; The result keeps the partition column whether or not a row matched, and
+;; take: gathers it for the rows it keeps (an empty partition in between).
+(.sys.exec "rm -rf /tmp/rfl_part_keep")
+(.db.splayed.set "/tmp/rfl_part_keep/2024.01.01/t/" (table [ts v] (list (til 5) (til 5))))
+(.db.splayed.set "/tmp/rfl_part_keep/2024.01.02/t/" (table [ts v] (list (til 0) (til 0))))
+(.db.splayed.set "/tmp/rfl_part_keep/2024.01.03/t/" (table [ts v] (list (til 5) (+ 10 (til 5)))))
+(set PK (.db.parted.get "/tmp/rfl_part_keep/" 't))
+(key (select {from: PK where: (> ts 100)})) -- [date ts v]
+(type (at (select {from: PK where: (> ts 100)}) 'date)) -- 'DATE
+(key (select {from: PK where: false})) -- [date ts v]
+(key (select {v: v date: date from: PK where: (> ts 100)})) -- [v date]
+(at (select {from: PK where: (> ts 2) take: 3}) 'date) -- [2024.01.01 2024.01.01 2024.01.03]
+(at (select {from: PK where: (> ts 3) take: 5}) 'date) -- [2024.01.01 2024.01.03]
+(at (select {d: date from: PK where: (== v 13) take: 1}) 'd) -- [2024.01.03]
+(key (select {from: PK where: (> ts 2) take: 0})) -- [date ts v]
+(count (select {from: PK where: (> ts 2) take: 0})) -- 0
+(.sys.exec "rm -rf /tmp/rfl_part_keep")
+(.db.splayed.set "/tmp/rfl_part_keep/1/t/" (table [ts v] (list (til 5) (til 5))))
+(.db.splayed.set "/tmp/rfl_part_keep/7/t/" (table [ts v] (list (til 5) (til 5))))
+(set PKI (.db.parted.get "/tmp/rfl_part_keep/" 't))
+(at (select {from: PKI where: (> ts 3) take: 2}) 'part) -- [1 7]
+(key (select {from: PKI where: (> ts 30)})) -- [part ts v]
+(.sys.exec "rm -rf /tmp/rfl_part_keep")
+
+;; ────────────── failed first write of a partition ──────────────
+;; A first write writes in place; when it fails (here the symbol file sits
+;; under a regular file) it removes the directories it created, so the
+;; partition scan does not trip over a directory without a schema.
+(.sys.exec "rm -rf /tmp/rfl_part_fail && mkdir -p /tmp/rfl_part_fail && touch /tmp/rfl_part_fail/file")
+(set FW (table [a s] (list [1 2] ['x 'y])))
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/t/" FW "/tmp/rfl_part_fail/db/.sym")
+(.db.splayed.set "/tmp/rfl_part_fail/db/2/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/2") -- 1
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; every directory the write created goes, the ones that were there stay
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/u/x/y/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/1/u") -- 1
+(.sys.exec "test -d /tmp/rfl_part_fail/db/1/t") -- 0
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; a path that climbs out of the new directory with .. names one that was
+;; there: nothing of it is removed
+(.db.splayed.set "/tmp/rfl_part_fail/new/../db/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+(.sys.exec "test -e /tmp/rfl_part_fail/db/.sym") -- 0
+;; a failed rewrite of a published table keeps the table
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+(.sys.exec "rm -rf /tmp/rfl_part_fail")
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like /tmp/rfl_part_mc /tmp/rfl_part_mb")

@@ -1599,6 +1599,20 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
             if (t1 == RAY_F64) {
                 const double* a = (const double*)ap;
                 for (int64_t j = 0; j < n; j++) d[j] = (a[j] != a[j]) ? 1 : 0;
+            } else if ((t1 == RAY_I32 || t1 == RAY_I16) && !null_aware) {
+                /* A narrowing CAST of a null-free source truncates: a value
+                 * that lands on the sentinel is still a value. */
+                memset(d, 0, (size_t)n);
+            } else if (t1 == RAY_I32) {
+                /* A narrowing CAST leaves an I32 / I16 / 1-byte lane: read it
+                 * at its own width, with its own null sentinel. */
+                const int32_t* a = (const int32_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I32) ? 1 : 0;
+            } else if (t1 == RAY_I16) {
+                const int16_t* a = (const int16_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I16) ? 1 : 0;
+            } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+                memset(d, 0, (size_t)n);   /* no null in a byte lane */
             } else {
                 const int64_t* a = (const int64_t*)ap;
                 for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I64) ? 1 : 0;
