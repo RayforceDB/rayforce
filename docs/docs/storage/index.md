@@ -91,6 +91,16 @@ obsolete root files.
 The `.write.lock` writer lock is local-filesystem coordination. Do not rely on
 it for NFS-backed shared writers.
 
+The first write of a table directory, one without `.d` or `.current`, writes in
+place. When it fails, the writer removes what it produced there and, once the
+directory holds nothing else, the directory itself and every directory it
+created above it, so no schema-less partition is left behind. A directory that
+existed before the write is handled the same way, whether an operator pre-made
+it or an earlier first write was killed: files that were there before the lock
+was taken and that the write did not rewrite stay, since a directory without a
+schema is not always a dead table. A partition directory left empty this way
+is still a partition; `.db.parted.fill` gives it the missing tables.
+
 `ray_splay_save` (including `.db.splayed.set`) syncs primary data and directory
 entries before acknowledging publication. Inline indexes are rebuildable
 accelerators written with a marker-last protocol. The bulk C API and CSV import

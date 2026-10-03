@@ -36,7 +36,11 @@ struct ray_sym_domain_s;
 typedef struct {
     ray_fd_t lock;
     bool locked;
+    bool unlink_lock;       /* lock failed with nobody holding it: remove the file */
     bool staged;
+    uint64_t* before;       /* in-place: inodes in root when the lock was taken */
+    size_t nbefore;
+    bool before_known;
     char root[1024];
     char created[1024];     /* shallowest directory of root begin created */
     char dir[1024];
