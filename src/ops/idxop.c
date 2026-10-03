@@ -904,6 +904,183 @@ ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2) {
     return idx;   /* standalone RAY_INDEX object — caller releases */
 }
 
+/* ── Incremental chunk zone ─────────────────────────────────────────────────
+ * The stream writers see a column in slices; per chunk the zone needs only
+ * running min / max, a null flag and (integers) the exact 128-bit sum and
+ * non-null count, so any slice size and any starting row work, and two
+ * accumulators over disjoint row ranges merge chunk by chunk.  Arrays are
+ * indexed by GLOBAL chunk (row >> 16) so a Parquet task that starts at row
+ * 5 M carries a few empty leading chunks and merges by index. */
+#define ZONE_ACC_LOG2 16
+
+bool ray_zone_acc_supported(int8_t type) { return numeric_elem_size(type) != 0; }
+
+static ray_err_t zone_acc_grow(ray_zone_acc_t* a, uint32_t want) {
+    if (want <= a->n_chunks) return RAY_OK;
+    if (want <= a->cap) { a->n_chunks = want; return RAY_OK; }
+    uint32_t cap = a->cap ? a->cap : 16;
+    while (cap < want) cap *= 2;
+    size_t old = a->cap;
+#define ZONE_GROW(field, T, init) do {                                        \
+        T* p = (T*)ray_realloc_raw(a->field, (size_t)cap * sizeof(T));        \
+        if (!p) return RAY_ERR_OOM;                                           \
+        for (size_t i = old; i < cap; i++) p[i] = (init);                     \
+        a->field = p; } while (0)
+    if (a->is_f64) { ZONE_GROW(fmins, double, INFINITY); ZONE_GROW(fmaxs, double, -INFINITY); }
+    else {
+        ZONE_GROW(mins, int64_t, INT64_MAX); ZONE_GROW(maxs, int64_t, INT64_MIN);
+        ZONE_GROW(sum_lo, uint64_t, 0); ZONE_GROW(sum_hi, int64_t, 0); ZONE_GROW(nn, int64_t, 0);
+    }
+    ZONE_GROW(nulls, uint8_t, 0);
+#undef ZONE_GROW
+    a->cap = cap;
+    a->n_chunks = want;
+    return RAY_OK;
+}
+
+ray_err_t ray_zone_acc_init(ray_zone_acc_t* a, int8_t type, int64_t start_row) {
+    memset(a, 0, sizeof(*a));
+    a->esz = numeric_elem_size(type);
+    if (a->esz == 0 || start_row < 0) return RAY_ERR_TYPE;
+    a->type = type;
+    a->is_f64 = (type == RAY_F64 || type == RAY_F32);
+    a->next_row = start_row;
+    return RAY_OK;
+}
+
+void ray_zone_acc_free(ray_zone_acc_t* a) {
+    ray_free_raw(a->mins); ray_free_raw(a->maxs); ray_free_raw(a->fmins); ray_free_raw(a->fmaxs);
+    ray_free_raw(a->nulls); ray_free_raw(a->sum_lo); ray_free_raw(a->sum_hi); ray_free_raw(a->nn);
+    memset(a, 0, sizeof(*a));
+}
+
+ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v) {
+    if (!a->type || !v || RAY_IS_ERR(v) || v->type != a->type) return RAY_ERR_TYPE;
+    int64_t n = v->len;
+    if (n <= 0) return RAY_OK;
+    int64_t csz = 1LL << ZONE_ACC_LOG2;
+    int64_t last = a->next_row + n - 1;
+    ray_err_t err = zone_acc_grow(a, (uint32_t)(last >> ZONE_ACC_LOG2) + 1);
+    if (err != RAY_OK) return err;
+    const uint8_t* base = (const uint8_t*)ray_data(v);
+    int64_t i = 0;
+    while (i < n) {
+        if (RAY_UNLIKELY(ray_interrupted())) return RAY_ERR_CANCEL;
+        int64_t row = a->next_row + i;
+        uint32_t g = (uint32_t)(row >> ZONE_ACC_LOG2);
+        int64_t e = ((int64_t)g + 1) * csz - a->next_row; if (e > n) e = n;
+        bool any_null = false;
+        if (a->is_f64) {
+            double mn = a->fmins[g], mx = a->fmaxs[g];
+            for (; i < e; i++) {
+                double val;
+                if (a->esz == 4) { float t; memcpy(&t, base + i * 4, 4); val = (double)t; }
+                else memcpy(&val, base + i * 8, 8);
+                if (isnan(val)) { any_null = true; continue; }
+                if (val < mn) mn = val;
+                if (val > mx) mx = val;
+            }
+            a->fmins[g] = mn; a->fmaxs[g] = mx;
+        } else {
+            int64_t mn = a->mins[g], mx = a->maxs[g], nn = a->nn[g], hi = a->sum_hi[g];
+            uint64_t lo = a->sum_lo[g];
+            for (; i < e; i++) {
+                /* Null = the type's sentinel VALUE, whatever the slice header
+                 * says (col.c #495: the persisted bit derives from the payload). */
+                int64_t val = 0;
+                bool is_null = false;
+                switch (a->esz) {
+                case 1: val = (int64_t)base[i]; break;
+                case 2: { int16_t t; memcpy(&t, base + i * 2, 2); val = t; is_null = (t == NULL_I16); break; }
+                case 4: { int32_t t; memcpy(&t, base + i * 4, 4); val = t; is_null = (t == NULL_I32); break; }
+                default: { int64_t t; memcpy(&t, base + i * 8, 8); val = t; is_null = (t == NULL_I64); break; }
+                }
+                if (is_null) { any_null = true; continue; }
+                if (val < mn) mn = val;
+                if (val > mx) mx = val;
+                ray_i128_add(&hi, &lo, val);
+                nn++;
+            }
+            a->mins[g] = mn; a->maxs[g] = mx; a->nn[g] = nn; a->sum_hi[g] = hi; a->sum_lo[g] = lo;
+        }
+        if (any_null) { a->nulls[g] = 1; a->saw_null = true; }
+    }
+    a->next_row += n;
+    return RAY_OK;
+}
+
+ray_err_t ray_zone_acc_merge(ray_zone_acc_t* dst, const ray_zone_acc_t* src) {
+    if (!dst->type || dst->type != src->type) return RAY_ERR_TYPE;
+    ray_err_t err = zone_acc_grow(dst, src->n_chunks);
+    if (err != RAY_OK) return err;
+    for (uint32_t g = 0; g < src->n_chunks; g++) {
+        if (dst->is_f64) {
+            if (src->fmins[g] < dst->fmins[g]) dst->fmins[g] = src->fmins[g];
+            if (src->fmaxs[g] > dst->fmaxs[g]) dst->fmaxs[g] = src->fmaxs[g];
+        } else {
+            if (src->mins[g] < dst->mins[g]) dst->mins[g] = src->mins[g];
+            if (src->maxs[g] > dst->maxs[g]) dst->maxs[g] = src->maxs[g];
+            dst->nn[g] += src->nn[g];
+            ray_i128_add128(&dst->sum_hi[g], &dst->sum_lo[g], src->sum_hi[g], src->sum_lo[g]);
+        }
+        dst->nulls[g] |= src->nulls[g];
+    }
+    if (src->saw_null) dst->saw_null = true;
+    if (src->next_row > dst->next_row) dst->next_row = src->next_row;
+    return RAY_OK;
+}
+
+ray_t* ray_zone_acc_finish(ray_zone_acc_t* a, int64_t len) {
+    int64_t csz = 1LL << ZONE_ACC_LOG2;
+    if (!a->type || len < csz) { ray_zone_acc_free(a); return NULL; }
+    uint32_t n_chunks = (uint32_t)((len + csz - 1) / csz);
+    ray_err_t err = zone_acc_grow(a, n_chunks);   /* chunks never touched stay empty */
+    if (err != RAY_OK) { ray_zone_acc_free(a); return ray_error("oom", "chunk_zone: arrays alloc"); }
+    ray_t* idx = ray_index_alloc(RAY_IDX_CHUNK_ZONE, a->type, len);
+    if (!idx || RAY_IS_ERR(idx)) { ray_zone_acc_free(a); return idx; }
+    ray_index_t* ix = ray_index_payload(idx);
+    ix->u.chunk_zone.n_chunks = n_chunks;
+    ix->u.chunk_zone.chunk_log2 = ZONE_ACC_LOG2;
+    ix->u.chunk_zone.is_f64 = a->is_f64;
+    int8_t arr_type = a->is_f64 ? RAY_F64 : RAY_I64;
+    ray_t* mins = ray_vec_new(arr_type, n_chunks);
+    ray_t* maxs = ray_vec_new(arr_type, n_chunks);
+    int64_t nb_len = (n_chunks + 7) / 8;
+    ray_t* nbits = ray_vec_new(RAY_U8, nb_len);
+    ray_t* aggs = a->is_f64 ? NULL : ray_vec_new(RAY_I64, 3 * (int64_t)n_chunks);
+    if (!mins || RAY_IS_ERR(mins) || !maxs || RAY_IS_ERR(maxs) || !nbits || RAY_IS_ERR(nbits) ||
+        (!a->is_f64 && (!aggs || RAY_IS_ERR(aggs)))) {
+        if (mins && !RAY_IS_ERR(mins)) ray_release(mins);
+        if (maxs && !RAY_IS_ERR(maxs)) ray_release(maxs);
+        if (nbits && !RAY_IS_ERR(nbits)) ray_release(nbits);
+        if (aggs && !RAY_IS_ERR(aggs)) ray_release(aggs);
+        ray_release(idx); ray_zone_acc_free(a);
+        return ray_error("oom", "chunk_zone: arrays alloc");
+    }
+    mins->len = n_chunks; maxs->len = n_chunks; nbits->len = nb_len;
+    memset(ray_data(nbits), 0, (size_t)nb_len);
+    if (a->is_f64) {
+        memcpy(ray_data(mins), a->fmins, (size_t)n_chunks * 8);
+        memcpy(ray_data(maxs), a->fmaxs, (size_t)n_chunks * 8);
+    } else {
+        memcpy(ray_data(mins), a->mins, (size_t)n_chunks * 8);
+        memcpy(ray_data(maxs), a->maxs, (size_t)n_chunks * 8);
+        aggs->len = 3 * (int64_t)n_chunks;
+        int64_t* ag = (int64_t*)ray_data(aggs);
+        for (uint32_t g = 0; g < n_chunks; g++) {
+            ag[g] = (int64_t)a->sum_lo[g];
+            ag[n_chunks + g] = a->nn[g];
+            ag[2 * (int64_t)n_chunks + g] = a->sum_hi[g];
+        }
+    }
+    uint8_t* nb = (uint8_t*)ray_data(nbits);
+    for (uint32_t g = 0; g < n_chunks; g++) if (a->nulls[g]) nb[g >> 3] |= (uint8_t)(1u << (g & 7));
+    ix->u.chunk_zone.mins = mins; ix->u.chunk_zone.maxs = maxs;
+    ix->u.chunk_zone.null_bits = nbits; ix->u.chunk_zone.aggs = aggs;
+    ray_zone_acc_free(a);
+    return idx;
+}
+
 /* ── RAY_IDX_DICT: per-column string dictionary (codes + first-occ rows) ──
  * Deduplicates `v`'s strings into dense int32 codes; first_occ[c] is the row of
  * code c's first occurrence (so code -> string resolves through `v` itself).
@@ -985,6 +1162,126 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
     ray_t* idx = ray_index_dict_compute(v);
     if (!idx || RAY_IS_ERR(idx)) return idx ? idx : ray_error("oom", NULL);
     return attach_finalize(v, idx);
+}
+
+/* ── Incremental STR dictionary ─────────────────────────────────────────────
+ * Codes are assigned in first-occurrence order, exactly as
+ * ray_index_dict_compute assigns them over the whole column, so the result
+ * is the same index.  Distinct strings are copied once into a private pool;
+ * the column itself is on disk by then.  There is no cardinality cap: the
+ * accumulator holds 4 B/row of codes plus one copy of each distinct string,
+ * less than the whole-column ray_index_dict_compute (codes + slots +
+ * first_occ), and a high-cardinality dictionary still serves distinct. */
+ray_err_t ray_dict_acc_init(ray_dict_acc_t* a) {
+    memset(a, 0, sizeof(*a));
+    a->mask = 1023;
+    a->slot = (uint32_t*)ray_calloc_raw((size_t)(a->mask + 1) * sizeof(uint32_t));
+    return a->slot ? RAY_OK : RAY_ERR_OOM;
+}
+
+void ray_dict_acc_free(ray_dict_acc_t* a) {
+    ray_free_raw(a->codes); ray_free_raw(a->first_occ); ray_free_raw(a->offs);
+    ray_free_raw(a->lens); ray_free_raw(a->pool); ray_free_raw(a->slot);
+    bool dead = a->dead;
+    memset(a, 0, sizeof(*a));
+    a->dead = dead;
+}
+
+static ray_err_t dict_acc_rehash(ray_dict_acc_t* a) {
+    uint64_t ncap = (a->mask + 1) * 2;
+    uint32_t* ns = (uint32_t*)ray_calloc_raw((size_t)ncap * sizeof(uint32_t));
+    if (!ns) return RAY_ERR_OOM;
+    for (int64_t c = 0; c < a->n_distinct; c++) {
+        uint64_t s = ray_hash_bytes(a->lens[c] ? a->pool + a->offs[c] : "", a->lens[c]) & (ncap - 1);
+        while (ns[s]) s = (s + 1) & (ncap - 1);
+        ns[s] = (uint32_t)c + 1;
+    }
+    ray_free_raw(a->slot); a->slot = ns; a->mask = ncap - 1;
+    return RAY_OK;
+}
+
+ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
+    if (a->dead) return RAY_OK;
+    if (!v || RAY_IS_ERR(v) || v->type != RAY_STR) return RAY_ERR_TYPE;
+    int64_t n = v->len;
+    if (n <= 0) return RAY_OK;
+    if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
+    if (a->n_rows + n > a->cap_rows) {
+        int64_t cap = a->cap_rows ? a->cap_rows : 65536;
+        while (cap < a->n_rows + n) cap *= 2;
+        int32_t* p = (int32_t*)ray_realloc_raw(a->codes, (size_t)cap * sizeof(int32_t));
+        if (!p) return RAY_ERR_OOM;
+        a->codes = p; a->cap_rows = cap;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
+        size_t len; const char* p = ray_str_vec_get(v, i, &len);
+        uint64_t h = ray_hash_bytes(p, len);
+        uint64_t s = h & a->mask;
+        int32_t code = -1;
+        for (;;) {
+            uint32_t cp1 = a->slot[s];
+            if (cp1 == 0) break;
+            int32_t c = (int32_t)cp1 - 1;
+            if (a->lens[c] == len && (len == 0 || memcmp(a->pool + a->offs[c], p, len) == 0)) { code = c; break; }
+            s = (s + 1) & a->mask;
+        }
+        if (code < 0) {
+            if (a->n_distinct == a->cap_distinct) {
+                int64_t cap = a->cap_distinct ? a->cap_distinct * 2 : 1024;
+                int32_t* f = (int32_t*)ray_realloc_raw(a->first_occ, (size_t)cap * sizeof(int32_t));
+                uint64_t* o = f ? (uint64_t*)ray_realloc_raw(a->offs, (size_t)cap * sizeof(uint64_t)) : NULL;
+                uint32_t* l = o ? (uint32_t*)ray_realloc_raw(a->lens, (size_t)cap * sizeof(uint32_t)) : NULL;
+                if (f) a->first_occ = f;
+                if (o) a->offs = o;
+                if (l) a->lens = l;
+                if (!f || !o || !l) return RAY_ERR_OOM;   /* grown parts stay owned by a */
+                a->cap_distinct = cap;
+            }
+            if (len > 0) {
+                if (a->pool_len + len > a->pool_cap) {
+                    uint64_t cap = a->pool_cap ? a->pool_cap * 2 : 65536;
+                    while (cap < a->pool_len + len) cap *= 2;
+                    char* np = (char*)ray_realloc_raw(a->pool, (size_t)cap);
+                    if (!np) return RAY_ERR_OOM;
+                    a->pool = np; a->pool_cap = cap;
+                }
+                memcpy(a->pool + a->pool_len, p, len);
+            }
+            code = (int32_t)a->n_distinct++;
+            a->offs[code] = a->pool_len; a->lens[code] = (uint32_t)len;
+            a->pool_len += len;
+            a->first_occ[code] = (int32_t)(a->n_rows + i);
+            a->slot[s] = (uint32_t)code + 1;
+            if ((uint64_t)a->n_distinct * 2 > a->mask + 1) {
+                ray_err_t err = dict_acc_rehash(a);
+                if (err != RAY_OK) return err;
+            }
+        }
+        a->codes[a->n_rows + i] = code;
+    }
+    a->n_rows += n;
+    return RAY_OK;
+}
+
+ray_t* ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len) {
+    if (a->dead || len < 65536 || a->n_rows != len) { ray_dict_acc_free(a); return NULL; }
+    ray_t* codes = ray_vec_new(RAY_I32, len);
+    ray_t* first_occ = ray_vec_new(RAY_I32, a->n_distinct > 0 ? a->n_distinct : 1);
+    ray_t* idx = ray_index_alloc(RAY_IDX_DICT, RAY_STR, len);
+    if (!codes || RAY_IS_ERR(codes) || !first_occ || RAY_IS_ERR(first_occ) || !idx || RAY_IS_ERR(idx)) {
+        if (codes && !RAY_IS_ERR(codes)) ray_release(codes);
+        if (first_occ && !RAY_IS_ERR(first_occ)) ray_release(first_occ);
+        if (idx && !RAY_IS_ERR(idx)) ray_release(idx);
+        ray_dict_acc_free(a);
+        return ray_error("oom", NULL);
+    }
+    codes->len = len; memcpy(ray_data(codes), a->codes, (size_t)len * 4);
+    first_occ->len = a->n_distinct; memcpy(ray_data(first_occ), a->first_occ, (size_t)a->n_distinct * 4);
+    ray_index_t* ix = ray_index_payload(idx);
+    ix->u.dict.codes = codes; ix->u.dict.first_occ = first_occ; ix->u.dict.n_distinct = a->n_distinct;
+    ray_dict_acc_free(a);
+    return idx;
 }
 
 /* ── Inline on-disk index region (zero-copy mmap) ───────────────────────────
@@ -1087,6 +1384,47 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
         *on_slots[i] = (ray_t*)(intptr_t)off;   /* region-relative offset */
         off += idx_blk_bytes(c);
     }
+}
+
+bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
+    static const uint8_t zeros[32] = {0};
+    _Alignas(32) uint8_t head[IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t))];
+    memset(head, 0, sizeof(head));
+    ray_t blkhdr;
+    memset(&blkhdr, 0, 32);
+    blkhdr.type = RAY_INDEX; blkhdr.len = (int64_t)sizeof(ray_index_t);
+    blkhdr.mmod = 1; blkhdr.rc = 1;
+    blkhdr.order = RAY_IDX_FORMAT_MAJOR;
+    memcpy(head, &blkhdr, 32);
+    ray_index_t* on = (ray_index_t*)(head + 32);
+    memcpy(on, ix, sizeof(ray_index_t));
+    on->markers |= RAY_MARK_MMAP;
+
+    ray_t** src_slots[4];
+    ray_t** on_slots[4];
+    int nch = idx_child_slots((ray_index_t*)ix, src_slots);
+    idx_child_slots(on, on_slots);
+    int64_t off = (int64_t)sizeof(head);
+    for (int i = 0; i < nch; i++) {
+        ray_t* c = *src_slots[i];
+        if (!c || RAY_IS_ERR(c)) { *on_slots[i] = NULL; continue; }
+        *on_slots[i] = (ray_t*)(intptr_t)off;   /* region-relative offset */
+        off += idx_blk_bytes(c);
+    }
+    if (fwrite(head, 1, sizeof(head), f) != sizeof(head)) return false;
+    for (int i = 0; i < nch; i++) {
+        ray_t* c = *src_slots[i];
+        if (!c || RAY_IS_ERR(c)) continue;
+        ray_t chdr;
+        memcpy(&chdr, c, 32);
+        chdr.mmod = 1; chdr.rc = 1;
+        if (fwrite(&chdr, 1, 32, f) != 32) return false;
+        size_t dbytes = (size_t)c->len * ray_elem_size(c->type);
+        if (dbytes && fwrite(ray_data(c), 1, dbytes, f) != dbytes) return false;
+        size_t pad = (size_t)idx_blk_bytes(c) - 32 - dbytes;
+        if (pad && fwrite(zeros, 1, pad, f) != pad) return false;
+    }
+    return true;
 }
 
 /* Map an mmap'd inline region in place: patch child offsets to absolute

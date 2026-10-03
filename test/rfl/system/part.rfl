@@ -529,6 +529,37 @@
 ;; a failed rewrite of a published table keeps the table
 (.db.splayed.set "/tmp/rfl_part_fail/db/1/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
 (count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; a table directory that was there before the write is removed too when
+;; a failed first write leaves nothing but what it produced behind: one an
+;; operator pre-made, or one a killed first write left with its lock file
+(.sys.exec "mkdir -p /tmp/rfl_part_fail/db/1/u")
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/u/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/1/u") -- 1
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+(.sys.exec "mkdir -p /tmp/rfl_part_fail/db/1/u && touch /tmp/rfl_part_fail/db/1/u/.write.lock")
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/u/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/1/u") -- 1
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
+;; a file that was there before the write and that the write did not reach
+;; is not the writer's to remove: a directory without a schema is not
+;; always a dead table (the database root has none either)
+(.sys.exec "mkdir -p /tmp/rfl_part_fail/db/1/u && touch /tmp/rfl_part_fail/db/1/u/.write.lock /tmp/rfl_part_fail/db/1/u/a")
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/u/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/1/u/a") -- 0
+(.sys.exec "rm -rf /tmp/rfl_part_fail/db/1/u")
+;; a retry after a kill that succeeds publishes over the leftovers
+(.sys.exec "mkdir -p /tmp/rfl_part_fail/db/1/u && touch /tmp/rfl_part_fail/db/1/u/.write.lock /tmp/rfl_part_fail/db/1/u/zz")
+(.db.splayed.set "/tmp/rfl_part_fail/db/1/u/" FW "/tmp/rfl_part_fail/db/.sym")
+(.sys.exec "test -e /tmp/rfl_part_fail/db/1/u/zz") -- 1
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 'u)) -- 2
+;; only the table directory goes: a partition directory that was there
+;; before the write stays, and stays an empty partition
+(.sys.exec "mkdir -p /tmp/rfl_part_fail/db/2/t")
+(.db.splayed.set "/tmp/rfl_part_fail/db/2/t/" FW "/tmp/rfl_part_fail/file/.sym") !- io
+(.sys.exec "test -e /tmp/rfl_part_fail/db/2/t") -- 1
+(.sys.exec "test -d /tmp/rfl_part_fail/db/2") -- 0
+(.sys.exec "rmdir /tmp/rfl_part_fail/db/2")
+(count (.db.parted.get "/tmp/rfl_part_fail/db/" 't)) -- 2
 (.sys.exec "rm -rf /tmp/rfl_part_fail")
 
 ;; ────────────── teardown ──────────────

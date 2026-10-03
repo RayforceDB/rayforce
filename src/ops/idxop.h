@@ -45,6 +45,7 @@
  * vector get this for free (fresh vectors start at attrs==0, no index).
  */
 
+#include <stdio.h>   /* FILE: ray_index_inline_write_file */
 #include <rayforce.h>
 #include "mem/heap.h"  /* RAY_ATTR_HAS_INDEX */
 
@@ -277,6 +278,38 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
  * compute an index for persistence without COWing a shared column. */
 ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
 
+/* ===== Incremental chunk-zone accumulator ===== */
+
+typedef struct {
+    int8_t    type;       /* column type; 0 = inactive */
+    uint8_t   is_f64;     /* F32 / F64 column: fmins/fmaxs used, no sums */
+    int       esz;        /* element size in bytes */
+    int64_t   next_row;   /* global row the next ray_zone_acc_add starts at */
+    uint32_t  n_chunks;   /* chunks in use so far, indexed by global chunk */
+    uint32_t  cap;        /* chunks allocated */
+    int64_t*  mins;  int64_t* maxs;    /* integer zones */
+    double*   fmins; double*  fmaxs;   /* float zones */
+    bool      saw_null;   /* the column holds a sentinel/NaN; the writer must
+                           * publish HAS_NULLS (col.c #495 rule) */
+    uint8_t*  nulls;      /* one byte per chunk: 1 = any null in chunk */
+    uint64_t* sum_lo; int64_t* sum_hi; int64_t* nn;   /* integer zones only */
+} ray_zone_acc_t;
+
+/* true when `type` gets a chunk zone (the ten numeric/temporal types). */
+bool      ray_zone_acc_supported(int8_t type);
+/* Start accumulating rows of `type` from global row `start_row`. */
+ray_err_t ray_zone_acc_init(ray_zone_acc_t* a, int8_t type, int64_t start_row);
+/* Rows [next_row, next_row + v->len) are v; v->type must equal a->type. */
+/* A non-OK return (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
+ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v);
+/* dst += src, chunk by chunk; both must have the same type. src is untouched. */
+ray_err_t ray_zone_acc_merge(ray_zone_acc_t* dst, const ray_zone_acc_t* src);
+/* The standalone RAY_IDX_CHUNK_ZONE index for a column of `len` rows
+ * (chunk_log2 16), identical to ray_index_chunk_zone_compute(col, 16);
+ * NULL when len < 65536. Frees the accumulator either way. */
+ray_t*    ray_zone_acc_finish(ray_zone_acc_t* a, int64_t len);
+void      ray_zone_acc_free(ray_zone_acc_t* a);
+
 /* 128-bit two's-complement accumulation of int64 values: (hi, lo) += v.
  * The engine's integer avg sums this way — exact for any column, and the
  * same bits whatever the morsel split — and the chunk-zone metadata keeps
@@ -319,6 +352,29 @@ bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* n
 ray_t* ray_index_dict_compute(ray_t* v);
 ray_t* ray_index_attach_dict(ray_t** vp);
 
+/* ===== Incremental STR dictionary ===== */
+
+typedef struct {
+    int32_t*  codes;     int64_t n_rows;     int64_t cap_rows;
+    int32_t*  first_occ; int64_t n_distinct; int64_t cap_distinct;
+    uint64_t* offs;      /* per distinct: byte offset into pool */
+    uint32_t* lens;      /* per distinct: byte length */
+    char*     pool;      uint64_t pool_len;  uint64_t pool_cap;
+    uint32_t* slot;      uint64_t mask;      /* code + 1, 0 = empty */
+    bool      dead;      /* row count overflowed int32 codes: nothing is kept */
+} ray_dict_acc_t;
+ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
+/* Appends every row of STR vector v. There is no cardinality cap: the
+ * result matches ray_index_dict_compute for any number of distinct strings.
+ * Only a row count past INT32_MAX (codes are int32) frees the accumulator,
+ * sets dead and returns RAY_OK; further adds are no-ops. A non-OK return
+ * (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
+ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);
+/* The standalone RAY_IDX_DICT for a column of `len` rows, identical to
+ * ray_index_dict_compute; NULL when dead or len < 65536. Frees `a`. */
+ray_t*    ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len);
+void      ray_dict_acc_free(ray_dict_acc_t* a);
+
 /* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
 
@@ -329,6 +385,10 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
  *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
 int64_t ray_index_inline_size(const ray_index_t* ix);
 void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
+/* The same bytes as ray_index_inline_write, streamed to `f` block by block
+ * straight from the child vecs: no region-sized staging buffer (a 100 M-row
+ * hash region is ~4.5 GB) and one copy fewer.  false on a short write. */
+bool    ray_index_inline_write_file(FILE* f, const ray_index_t* ix);
 ray_t*  ray_index_inline_map(uint8_t* region, int64_t region_size);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the

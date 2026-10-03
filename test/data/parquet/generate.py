@@ -256,6 +256,15 @@ if __name__ == '__main__':
         groups.append([list(range(lo,hi)),[None if i%13==0 else i*3 for i in range(lo,hi)],
                        ['long pooled string row '+str(i) for i in range(lo,hi)]])
     write(root/'row-groups.parquet',[('x',1,False,None),('y',2,True,None),('s',6,False,0)],groups,dictionary=False,indexes=True)
+    # Numeric-only (direct path), 7 uneven row groups over 200000 rows, so
+    # row-group boundaries fall inside 65536-row zone chunks. x is clustered,
+    # y is unclustered with nulls every 13th row.
+    starts=[0,30001,70002,100003,131075,170006,190007]
+    groups=[]
+    for g,lo in enumerate(starts):
+        hi=starts[g+1] if g+1<len(starts) else 200000
+        groups.append([list(range(lo,hi)),[None if i%13==0 else (i*7919)%1000003 for i in range(lo,hi)]])
+    write(root/'zones.parquet',[('x',1,False,None),('y',2,True,None)],groups,dictionary=False)
     write(root/'unix.parquet',[('day',1,False,None),('ts',2,False,None),('s',6,False,0)],
           [[[10957,10958],[946684800,946684801],['pooled string number one','pooled string number two']]],dictionary=False)
     write(root/'rle-runs.parquet',[('x',1,False,None),('y',2,False,None),('s',6,False,0)],

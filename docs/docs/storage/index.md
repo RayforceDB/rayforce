@@ -76,7 +76,13 @@ older Rayforce versions remain readable; the first replacement upgrades the
 directory to the generation layout.
 
 The table, partition and CSV entry points follow the same publication protocol.
-Indexes are built in the new generation before it is published. Writers to the
+Indexes are built in the new generation before it is published. The CSV and
+Parquet converters build each column's chunk zone or string dictionary from
+the rows as they are streamed and write it with the column, so a conversion
+does not read its own output back; only integer columns whose zone qualifies
+for a hash index are re-read, one column at a time, to build it. An index
+that cannot be written (for example, the disk fills) is dropped and the column
+is published without it. Writers to the
 same table serialize on `.write.lock`; readers resolve the manifest once and
 continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
@@ -90,6 +96,16 @@ obsolete root files.
 
 The `.write.lock` writer lock is local-filesystem coordination. Do not rely on
 it for NFS-backed shared writers.
+
+The first write of a table directory, one without `.d` or `.current`, writes in
+place. When it fails, the writer removes what it produced there and, once the
+directory holds nothing else, the directory itself and every directory it
+created above it, so no schema-less partition is left behind. A directory that
+existed before the write is handled the same way, whether an operator pre-made
+it or an earlier first write was killed: files that were there before the lock
+was taken and that the write did not rewrite stay, since a directory without a
+schema is not always a dead table. A partition directory left empty this way
+is still a partition; `.db.parted.fill` gives it the missing tables.
 
 `ray_splay_save` (including `.db.splayed.set`) syncs primary data and directory
 entries before acknowledging publication. Inline indexes are rebuildable

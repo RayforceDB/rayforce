@@ -26,6 +26,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "store/journal.h"
+#include "store/fileio.h"
 #include "store/serde.h"
 #include "lang/eval.h"
 #include "lang/env.h"
@@ -694,6 +695,41 @@ static test_result_t test_journal_open_double_open(void) {
 
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     cleanup_base(base);
+    PASS();
+}
+
+/* 3c2. A base that fits the lock path but not <base>.log (1019-1020 bytes)
+ *      fails in the append step after ray_journal_open took the lock; the
+ *      lock must not stay held by the failed open. */
+static test_result_t test_journal_open_long_base_releases_lock(void) {
+#if defined(__APPLE__) || defined(_WIN32)
+    SKIP("deep-mkdir fixture not portable (PATH_MAX / MAX_PATH)");
+#endif
+    char dir[2048];
+    const char* root = "/tmp/jrn_test_longbase";  /* 22 chars */
+    const char* comp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; /* 50 chars */
+    int off = snprintf(dir, sizeof(dir), "%s", root);
+    /* 22 + 19 * 51 = 991; a 27-char leaf makes the base 1019 bytes. */
+    for (int i = 0; i < 19; i++) off += snprintf(dir + off, sizeof(dir) - (size_t)off, "/%s", comp);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char base[2048];
+    int blen = snprintf(base, sizeof(base), "%s/bbbbbbbbbbbbbbbbbbbbbbbbbbb", dir);
+    TEST_ASSERT_EQ_I(blen, 1019);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+
+    /* flock is per open file description: a second fd in this process
+     * gets EWOULDBLOCK while the failed open still holds the lock. */
+    char lk[2064];
+    snprintf(lk, sizeof(lk), "%s.lk", base);
+    ray_fd_t fd = ray_file_open(lk, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    TEST_ASSERT_TRUE(fd != RAY_FD_INVALID);
+    ray_err_t le = ray_file_trylock_ex(fd);
+    (void)ray_file_unlock(fd);
+    ray_file_close(fd);
+    (void)ray_test_rm_rf(root);
+    TEST_ASSERT_EQ_I(le, RAY_OK);
     PASS();
 }
 
@@ -2687,6 +2723,7 @@ const test_entry_t journal_entries[] = {
     { "journal/open_close_basic",          test_journal_open_close_basic,          jrn_setup, jrn_teardown },
     { "journal/open_bad_base",             test_journal_open_bad_base,             jrn_setup, jrn_teardown },
     { "journal/open_double_open",          test_journal_open_double_open,          jrn_setup, jrn_teardown },
+    { "journal/open_long_base_releases_lock", test_journal_open_long_base_releases_lock, jrn_setup, jrn_teardown },
     { "journal/open_replays_existing_log", test_journal_open_replays_existing_log, jrn_setup, jrn_teardown },
     { "journal/open_badtail_log",          test_journal_open_badtail_log,          jrn_setup, jrn_teardown },
     /* Write bytes */
