@@ -30,6 +30,7 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include <time.h>
+#include <dirent.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/col.h"
@@ -2068,6 +2069,131 @@ static test_result_t test_stream_hash_wave(void) {
     TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 1LL << 40, 5), 1);
     TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 40, 1000, 3), 3);
     TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(4LL * 58 * 1000 * 2, 1000, 5), 2);
+    PASS();
+}
+
+/* The index region streamed to a file (block by block) is byte-identical to
+ * the one the buffered writer lays out in memory, for every public index kind. */
+static bool region_file_matches_buffer(ray_t* w) {
+    if (!w || RAY_IS_ERR(w) || !w->index) return false;
+    const ray_index_t* ix = ray_index_payload(w->index);
+    int64_t size = ray_index_inline_size(ix);
+    uint8_t* buf = (uint8_t*)ray_calloc_raw((size_t)size);
+    uint8_t* back = (uint8_t*)ray_calloc_raw((size_t)size + 1);
+    FILE* f = tmpfile();
+    bool ok = buf && back && f;
+    if (ok) {
+        ray_index_inline_write(buf, ix);
+        ok = ray_index_inline_write_file(f, ix) && fflush(f) == 0 &&
+             ftell(f) == (long)size && fseek(f, 0, SEEK_SET) == 0 &&
+             fread(back, 1, (size_t)size + 1, f) == (size_t)size &&   /* nothing beyond size */
+             memcmp(buf, back, (size_t)size) == 0;
+    }
+    if (f) fclose(f);
+    ray_free_raw(buf); ray_free_raw(back);
+    return ok;
+}
+
+static test_result_t test_stream_region_bytes_match(void) {
+    int64_t n = 70001;      /* child lengths are not multiples of 32: the pad path runs */
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_chunk_zone(&w, 16)));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NOT_NULL(ray_index_payload(w->index)->u.chunk_zone.aggs);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    ray_t* f64 = ray_vec_new(RAY_F64, n); f64->len = n;
+    for (int64_t i = 0; i < n; i++) ((double*)ray_data(f64))[i] = (double)(i % 1013) * 0.5;
+    w = f64;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_chunk_zone(&w, 16)));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NULL(ray_index_payload(w->index)->u.chunk_zone.aggs);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    w = dict_test_col(n, 3000, false);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_dict(&w)));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    ray_t* h = ray_vec_new(RAY_I64, n); h->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(h))[i] = (i * 7919) % 1009;
+    w = ray_idx_hash_fn(h);
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_HASH);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    int kinds = 3;
+    for (int k = 0; k < kinds; k++) {
+        ray_t* z = ray_vec_new(RAY_I64, n); z->len = n;
+        for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(z))[i] = (i * 7919) % 100003;
+        w = z;
+        ray_t* r = k == 0 ? ray_index_attach_zone(&w)
+                 : k == 1 ? ray_index_attach_sort(&w) : ray_index_attach_bloom(&w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(ray_index_kind(w), k == 0 ? RAY_IDX_ZONE : k == 1 ? RAY_IDX_SORT : RAY_IDX_BLOOM);
+        TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+        ray_release(w);
+    }
+    PASS();
+}
+
+static bool stream_dir_has_tmp(const char* dir) {
+    DIR* d = opendir(dir);
+    bool found = false;
+    struct dirent* e;
+    while (d && (e = readdir(d)))
+        if (!strncmp(e->d_name, ".stream-", 8)) found = true;
+    if (d) closedir(d);
+    return found;
+}
+
+/* One writer's finish fails; close_all returns the error and nothing is
+ * published: no column file, no tmp or pool file, no retained index.
+ * Injection: the failing writer's FILE* is replaced by a read-only stream on
+ * its own tmp file, so every write the finish attempts (index region, header)
+ * fails with EBADF and the run needs neither timing nor an interrupt (which
+ * would also cancel the healthy columns nondeterministically). */
+static test_result_t test_stream_finish_failure_publishes_nothing(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-fail-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 300000;
+    ray_t* a = ray_vec_new(RAY_I64, n); a->len = n;
+    ray_t* b = ray_vec_new(RAY_I64, n); b->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(a))[i] = i;
+        ((int64_t*)ray_data(b))[i] = (i * 7919) % 1000003;   /* a hash candidate */
+    }
+    ray_t* s = dict_test_col(100000, 3000, false);
+    ray_t* cols[3] = { a, b, s };
+    int8_t types[3] = { RAY_I64, RAY_I64, RAY_STR };
+    const char* names[3] = { "fa", "fb", "fs" };
+    ray_col_stream_t w[3];
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), types[c], NULL), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w[c], 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], cols[c]), RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(fclose(w[0].fp), 0);
+    w[0].fp = fopen(w[0].tmp_path, "rb");
+    TEST_ASSERT_NOT_NULL(w[0].fp);
+    ray_err_t e = ray_col_stream_close_all(w, 3, false, NULL);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_IO);
+    for (int c = 0; c < 3; c++) {
+        char path[200]; snprintf(path, sizeof(path), "%s/%s", dir, names[c]);
+        TEST_ASSERT_TRUE(access(path, F_OK) != 0);
+        TEST_ASSERT_NULL(w[c].index);
+        ray_col_stream_abort(&w[c]);   /* converters abort after a failed close */
+    }
+    TEST_ASSERT_FALSE(stream_dir_has_tmp(dir));
+    ray_release(a); ray_release(b); ray_release(s);
+    (void)ray_test_rm_rf(dir);
     PASS();
 }
 
@@ -6141,6 +6267,8 @@ const test_entry_t store_entries[] = {
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
+    { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
+    { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },
