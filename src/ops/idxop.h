@@ -348,6 +348,27 @@ bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* n
 ray_t* ray_index_dict_compute(ray_t* v);
 ray_t* ray_index_attach_dict(ray_t** vp);
 
+/* ===== Incremental STR dictionary ===== */
+
+#define RAY_DICT_ACC_MAX_DISTINCT (1 << 20)
+typedef struct {
+    int32_t*  codes;     int64_t n_rows;     int64_t cap_rows;
+    int32_t*  first_occ; int64_t n_distinct; int64_t cap_distinct;
+    uint64_t* offs;      /* per distinct: byte offset into pool */
+    uint32_t* lens;      /* per distinct: byte length */
+    char*     pool;      uint64_t pool_len;  uint64_t pool_cap;
+    uint32_t* slot;      uint64_t mask;      /* code + 1, 0 = empty */
+    bool      dead;      /* cap exceeded: nothing is kept any more */
+} ray_dict_acc_t;
+ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
+/* Appends every row of STR vector v. Past the cap it frees itself,
+ * sets dead and returns RAY_OK; further adds are no-ops. */
+ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);
+/* The standalone RAY_IDX_DICT for a column of `len` rows, identical to
+ * ray_index_dict_compute; NULL when dead or len < 65536. Frees `a`. */
+ray_t*    ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len);
+void      ray_dict_acc_free(ray_dict_acc_t* a);
+
 /* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
 

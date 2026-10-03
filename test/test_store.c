@@ -1724,6 +1724,73 @@ static test_result_t test_zone_acc_float(void) {
     PASS();
 }
 
+static ray_t* dict_test_col(int64_t n, int64_t distinct, bool unique) {
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    for (int64_t i = 0; i < n; i++) {
+        char buf[64];
+        int len = unique ? snprintf(buf, sizeof(buf), "a long pooled unique string %lld", (long long)i)
+                         : (i % 1009 == 0 ? 0 : snprintf(buf, sizeof(buf), "v%lld", (long long)(i % distinct)));
+        v = ray_str_vec_append(v, buf, (size_t)len);
+        if (!v || RAY_IS_ERR(v)) return NULL;
+    }
+    return v;
+}
+
+/* Slices of 30000 rows, empty strings included, equals ray_index_dict_compute. */
+static test_result_t test_dict_acc_slices_equal_compute(void) {
+    int64_t n = 100000;
+    ray_t* v = dict_test_col(n, 3000, false);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    for (int64_t off = 0; off < n; off += 30000) {
+        int64_t cnt = n - off < 30000 ? n - off : 30000;
+        ray_t* s = ray_vec_new(RAY_STR, cnt);
+        for (int64_t i = 0; i < cnt; i++) {
+            size_t len; const char* p = ray_str_vec_get(v, off + i, &len);
+            s = ray_str_vec_append(s, p, len);
+        }
+        TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    ray_t* got = ray_dict_acc_finish(&acc, n);
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    const ray_index_t* x = ray_index_payload(got);
+    const ray_index_t* y = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, y->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, 3001);   /* 3000 values plus "" */
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.codes), ray_data(y->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.first_occ), ray_data(y->u.dict.first_occ),
+                            (size_t)x->u.dict.n_distinct * 4), 0);
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* Unique strings: past 65536 rows more than half are distinct, so it dies. */
+static test_result_t test_dict_acc_cap_abandons(void) {
+    int64_t n = 70000;
+    ray_t* v = dict_test_col(n, 0, true);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, v), RAY_OK);
+    TEST_ASSERT_TRUE(acc.dead);
+    TEST_ASSERT_NULL(acc.codes);
+    TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, v), RAY_OK);   /* no-op */
+    TEST_ASSERT_NULL(ray_dict_acc_finish(&acc, 2 * n));
+    /* below the gate: nothing either */
+    ray_dict_acc_t small;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&small), RAY_OK);
+    v->len = 1000;
+    TEST_ASSERT_EQ_I(ray_dict_acc_add(&small, v), RAY_OK);
+    TEST_ASSERT_NULL(ray_dict_acc_finish(&small, 1000));
+    v->len = n;
+    ray_release(v);
+    PASS();
+}
+
 static test_result_t test_file_rename_new(void) {
 #ifdef RAY_OS_WASM
     SKIP("exclusive rename is unavailable on this host");
@@ -5761,6 +5828,8 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_one_chunk",            test_zone_acc_one_chunk,            store_setup, store_teardown },
     { "store/zone_acc_merge_mid_chunk",      test_zone_acc_merge_mid_chunk,      store_setup, store_teardown },
     { "store/zone_acc_float",                test_zone_acc_float,                store_setup, store_teardown },
+    { "store/dict_acc_slices_equal_compute", test_dict_acc_slices_equal_compute, store_setup, store_teardown },
+    { "store/dict_acc_cap_abandons",         test_dict_acc_cap_abandons,         store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },

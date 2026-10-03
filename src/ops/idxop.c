@@ -1163,6 +1163,131 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
     return attach_finalize(v, idx);
 }
 
+/* ── Incremental STR dictionary ─────────────────────────────────────────────
+ * Codes are assigned in first-occurrence order, exactly as
+ * ray_index_dict_compute assigns them over the whole column, so the result
+ * is the same index.  Distinct strings are copied once into a private pool;
+ * the column itself is on disk by then.  A column whose distinct count
+ * passes the cap gets no dictionary: such a dictionary accelerates nothing
+ * and would hold most of the column in memory. */
+ray_err_t ray_dict_acc_init(ray_dict_acc_t* a) {
+    memset(a, 0, sizeof(*a));
+    a->mask = 1023;
+    a->slot = (uint32_t*)ray_calloc_raw((size_t)(a->mask + 1) * sizeof(uint32_t));
+    return a->slot ? RAY_OK : RAY_ERR_OOM;
+}
+
+void ray_dict_acc_free(ray_dict_acc_t* a) {
+    ray_free_raw(a->codes); ray_free_raw(a->first_occ); ray_free_raw(a->offs);
+    ray_free_raw(a->lens); ray_free_raw(a->pool); ray_free_raw(a->slot);
+    bool dead = a->dead;
+    memset(a, 0, sizeof(*a));
+    a->dead = dead;
+}
+
+static ray_err_t dict_acc_rehash(ray_dict_acc_t* a) {
+    uint64_t ncap = (a->mask + 1) * 2;
+    uint32_t* ns = (uint32_t*)ray_calloc_raw((size_t)ncap * sizeof(uint32_t));
+    if (!ns) return RAY_ERR_OOM;
+    for (int64_t c = 0; c < a->n_distinct; c++) {
+        uint64_t s = ray_hash_bytes(a->pool + a->offs[c], a->lens[c]) & (ncap - 1);
+        while (ns[s]) s = (s + 1) & (ncap - 1);
+        ns[s] = (uint32_t)c + 1;
+    }
+    ray_free_raw(a->slot); a->slot = ns; a->mask = ncap - 1;
+    return RAY_OK;
+}
+
+static bool dict_acc_over_cap(const ray_dict_acc_t* a) {
+    if (a->n_distinct > RAY_DICT_ACC_MAX_DISTINCT) return true;
+    return a->n_rows >= 65536 && a->n_distinct * 2 > a->n_rows;
+}
+
+ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
+    if (a->dead) return RAY_OK;
+    if (!v || RAY_IS_ERR(v) || v->type != RAY_STR) return RAY_ERR_TYPE;
+    int64_t n = v->len;
+    if (n <= 0) return RAY_OK;
+    if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
+    if (a->n_rows + n > a->cap_rows) {
+        int64_t cap = a->cap_rows ? a->cap_rows : 65536;
+        while (cap < a->n_rows + n) cap *= 2;
+        int32_t* p = (int32_t*)ray_realloc_raw(a->codes, (size_t)cap * sizeof(int32_t));
+        if (!p) return RAY_ERR_OOM;
+        a->codes = p; a->cap_rows = cap;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
+        size_t len; const char* p = ray_str_vec_get(v, i, &len);
+        uint64_t h = ray_hash_bytes(p, len);
+        uint64_t s = h & a->mask;
+        int32_t code = -1;
+        for (;;) {
+            uint32_t cp1 = a->slot[s];
+            if (cp1 == 0) break;
+            int32_t c = (int32_t)cp1 - 1;
+            if (a->lens[c] == len && memcmp(a->pool + a->offs[c], p, len) == 0) { code = c; break; }
+            s = (s + 1) & a->mask;
+        }
+        if (code < 0) {
+            if (a->n_distinct == a->cap_distinct) {
+                int64_t cap = a->cap_distinct ? a->cap_distinct * 2 : 1024;
+                int32_t* f = (int32_t*)ray_realloc_raw(a->first_occ, (size_t)cap * sizeof(int32_t));
+                uint64_t* o = f ? (uint64_t*)ray_realloc_raw(a->offs, (size_t)cap * sizeof(uint64_t)) : NULL;
+                uint32_t* l = o ? (uint32_t*)ray_realloc_raw(a->lens, (size_t)cap * sizeof(uint32_t)) : NULL;
+                if (f) a->first_occ = f;
+                if (o) a->offs = o;
+                if (l) a->lens = l;
+                if (!f || !o || !l) return RAY_ERR_OOM;   /* grown parts stay owned by a */
+                a->cap_distinct = cap;
+            }
+            if (len > 0) {
+                if (a->pool_len + len > a->pool_cap) {
+                    uint64_t cap = a->pool_cap ? a->pool_cap * 2 : 65536;
+                    while (cap < a->pool_len + len) cap *= 2;
+                    char* np = (char*)ray_realloc_raw(a->pool, (size_t)cap);
+                    if (!np) return RAY_ERR_OOM;
+                    a->pool = np; a->pool_cap = cap;
+                }
+                memcpy(a->pool + a->pool_len, p, len);
+            }
+            code = (int32_t)a->n_distinct++;
+            a->offs[code] = a->pool_len; a->lens[code] = (uint32_t)len;
+            a->pool_len += len;
+            a->first_occ[code] = (int32_t)(a->n_rows + i);
+            a->slot[s] = (uint32_t)code + 1;
+            if ((uint64_t)a->n_distinct * 2 > a->mask + 1) {
+                ray_err_t err = dict_acc_rehash(a);
+                if (err != RAY_OK) return err;
+            }
+        }
+        a->codes[a->n_rows + i] = code;
+    }
+    a->n_rows += n;
+    if (dict_acc_over_cap(a)) { a->dead = true; ray_dict_acc_free(a); }
+    return RAY_OK;
+}
+
+ray_t* ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len) {
+    if (a->dead || len < 65536 || a->n_rows != len) { ray_dict_acc_free(a); return NULL; }
+    ray_t* codes = ray_vec_new(RAY_I32, len);
+    ray_t* first_occ = ray_vec_new(RAY_I32, a->n_distinct > 0 ? a->n_distinct : 1);
+    ray_t* idx = ray_index_alloc(RAY_IDX_DICT, RAY_STR, len);
+    if (!codes || RAY_IS_ERR(codes) || !first_occ || RAY_IS_ERR(first_occ) || !idx || RAY_IS_ERR(idx)) {
+        if (codes && !RAY_IS_ERR(codes)) ray_release(codes);
+        if (first_occ && !RAY_IS_ERR(first_occ)) ray_release(first_occ);
+        if (idx && !RAY_IS_ERR(idx)) ray_release(idx);
+        ray_dict_acc_free(a);
+        return ray_error("oom", NULL);
+    }
+    codes->len = len; memcpy(ray_data(codes), a->codes, (size_t)len * 4);
+    first_occ->len = a->n_distinct; memcpy(ray_data(first_occ), a->first_occ, (size_t)a->n_distinct * 4);
+    ray_index_t* ix = ray_index_payload(idx);
+    ix->u.dict.codes = codes; ix->u.dict.first_occ = first_occ; ix->u.dict.n_distinct = a->n_distinct;
+    ray_dict_acc_free(a);
+    return idx;
+}
+
 /* ── Inline on-disk index region (zero-copy mmap) ───────────────────────────
  * An attached index is persisted at the (32-aligned) tail of its column file as
  * a run of contiguous 32-byte-aligned ray_t blocks:
