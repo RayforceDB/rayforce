@@ -1788,6 +1788,7 @@ typedef struct {
     ray_col_stream_t* writers;
     int64_t* offsets;
     _Atomic uint32_t* nulls;
+    _Atomic uint32_t* locks;
     ray_t** errors;
 } pq_direct_work;
 static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
@@ -1812,6 +1813,10 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         bool seek = fseeko(local.fp,(off_t)offset,SEEK_SET) == 0;
 #endif
         if (!seek) w->errors[task] = pq_error("cannot seek native output range");
+        if (!w->errors[task]) {
+            ray_err_t ie = ray_col_stream_index_begin(&local,row);
+            if (ie != RAY_OK) w->errors[task] = ray_error(ray_err_code_str(ie),"parquet: zone accumulator");
+        }
         while (!w->errors[task]) {
             ray_t* batch = ray_parquet_next(r);
             if (!batch) break;
@@ -1820,6 +1825,16 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
             row += ray_table_nrows(batch); ray_release(batch);
             if (err != RAY_OK) { w->errors[task] = ray_error(ray_err_code_str(err),"parquet: direct column write failed"); break; }
         }
+        /* Fold this row group's chunk partials into the column's zone. */
+        if (local.zone && !w->errors[task]) {
+            while (atomic_exchange_explicit(&w->locks[c],1,memory_order_acquire)) RAY_CPU_RELAX();
+            ray_err_t me = ray_col_stream_index_merge(&w->writers[c],&local);
+            atomic_store_explicit(&w->locks[c],0,memory_order_release);
+            if (me != RAY_OK && !w->errors[task]) w->errors[task] = ray_error(ray_err_code_str(me),"parquet: zone merge");
+        }
+        /* Unmerged accumulator (task error): ray_col_stream_abort would
+         * fclose local.fp a second time, so free the zone directly. */
+        if (local.zone) { ray_zone_acc_free(local.zone); ray_free_raw(local.zone); local.zone = NULL; }
         if (fclose(local.fp) && !w->errors[task]) w->errors[task] = pq_error("native column close failed");
         if (local.had_nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
         if (!w->errors[task] && row != w->offsets[g+1]) w->errors[task] = pq_error("row group ended before its assigned output range");
@@ -1832,14 +1847,15 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     if (tasks > UINT32_MAX) return pq_error("too many column chunk tasks");
     int64_t* offsets = ray_calloc_raw((size_t)(r->ngroups+1)*sizeof(*offsets));
     _Atomic uint32_t* nulls = ray_calloc_raw((size_t)r->ncols*sizeof(*nulls));
+    _Atomic uint32_t* locks = ray_calloc_raw((size_t)r->ncols*sizeof(*locks));
     ray_t** errors = ray_calloc_raw((size_t)(tasks+1)*sizeof(*errors));
     ray_t* err = NULL;
-    if (!offsets || !nulls || !errors) { err = ray_error("oom",NULL); goto done; }
+    if (!offsets || !nulls || !locks || !errors) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
         if (r->rows > (INT64_MAX-32)/(int64_t)size) { err = pq_error("native column exceeds file offset range"); goto done; }
         if (fflush(writers[c].fp)) { err = pq_error("cannot flush column header"); goto done; }
-        atomic_init(&nulls[c],0);
+        atomic_init(&nulls[c],0); atomic_init(&locks[c],0);
         if (r->schema[c].native_symbol) r->schema[c].import_domain = writers[c].dom;
     }
     for (int64_t g = 0; g < r->ngroups; g++) {
@@ -1847,7 +1863,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
         offsets[g+1] = offsets[g]+pq_get(fields[3],0);
     }
-    pq_direct_work work = {r,writers,offsets,nulls,errors};
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors};
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
     else pq_write_direct_group(&work,0,0,tasks);
@@ -1861,7 +1877,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     }
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
-    ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(errors); return err;
+    ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors); return err;
 }
 ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types) {
 #ifdef RAY_FUZZING
@@ -1890,6 +1906,10 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     for (int64_t c = 0; c < r->ncols; c++) {
         opened++;
         e = ray_col_stream_open(&writers[c],staging,r->schema[c].name,r->schema[c].native_symbol ? RAY_SYM : (int8_t)r->schema[c].type,domain);
+        if (e != RAY_OK) goto io_fail;
+    }
+    for (int64_t c = 0; c < r->ncols; c++) {
+        e = ray_col_stream_index_begin(&writers[c],0);
         if (e != RAY_OK) goto io_fail;
     }
     bool direct = true;
@@ -1935,6 +1955,10 @@ finish_columns:
         e = ray_col_stream_close(&writers[c],false);
         if (e != RAY_OK) goto io_fail;
     }
+    for (int64_t c = 0; c < r->ncols; c++) {
+        if (writers[c].wants_hash) (void)ray_splay_hash_column(writers[c].path,writers[c].index);
+        if (writers[c].index) { ray_release(writers[c].index); writers[c].index = NULL; }
+    }
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { err = schema ? schema : ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
@@ -1950,17 +1974,12 @@ finish_columns:
      * its ingestion hash tables and string arena before building indexes;
      * reopening needs only the file-backed vocabulary. Keeping both live
      * makes large imports compete with index builders for tens of GiB. */
-    bool have_symbols = domain != NULL;
     if (domain) {
         ray_sym_domain_release(domain); domain = NULL;
         for (int64_t c = 0; c < opened; c++) writers[c].dom = NULL;
     }
-    snprintf(file,sizeof(file),"%s/.sym",staging);
-    ray_t* tbl = ray_read_splayed(staging,have_symbols ? file : NULL);
-    if (!tbl || RAY_IS_ERR(tbl)) { err = tbl ? tbl : ray_error("oom",NULL); goto done; }
-    ray_splay_build_indexes(staging,tbl); ray_release(tbl);
-    /* Index builders append derived regions. Flush those final file images
-     * before the directory becomes visible under its published name. */
+    /* The column files already carry their index regions. Flush the final
+     * file images before the directory becomes visible under its published name. */
     for (int64_t c = 0; c <= r->ncols; c++) {
         snprintf(file,sizeof(file),"%s/.d",staging);
         const char* path = c == r->ncols ? file : writers[c].path;
