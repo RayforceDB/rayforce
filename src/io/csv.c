@@ -3075,9 +3075,10 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         col_data[c] = dst;
     }
 
-    /* Index policy belongs to each destination writer: splayed builds full
-     * column indexes after streaming; parted attaches persisted zones to each
-     * final partition while it is resident. Intermediate chunks need none. */
+    /* Index policy belongs to each destination writer: splayed stream writers
+     * build theirs inline while the column is written; parted attaches
+     * persisted zones to each final partition while it is resident.
+     * Intermediate chunks need none. */
 
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) {
@@ -3821,6 +3822,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     for (int c = 0; c < ncols; c++) {
         err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
                                       resolved_types[c], sym_dom);
+        if (err == RAY_OK) err = ray_col_stream_index_begin(&writers[c], 0);
         if (err != RAY_OK) {
             for (int j = 0; j <= c; j++) ray_col_stream_abort(&writers[j]);
             if (sym_dom) ray_sym_domain_release(sym_dom);
@@ -3913,6 +3915,15 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         if (err != RAY_OK) ray_col_stream_abort(&writers[c]);
     }
 
+    /* Columns whose zone asked for a hash: the only files read back. The
+     * hash builds run one after another, each parallel inside, before .d
+     * so an in-place first write never publishes a half-appended region. */
+    for (int c = 0; c < ncols; c++) {
+        if (err == RAY_OK && writers[c].wants_hash)
+            (void)ray_splay_hash_column(writers[c].path, writers[c].index);   /* best effort */
+        if (writers[c].index) { ray_release(writers[c].index); writers[c].index = NULL; }
+    }
+
     /* .d LAST — the commit marker.  All column files are renamed into
      * place by now and the symfile is flushed; a crash or error before
      * this point leaves a dir without .d, which loads as a *missing*
@@ -3961,15 +3972,6 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
                                   col_names_in, n_names, write.dir,
                                   rows_per_chunk, sym_path);
-    if (err == RAY_OK) {
-        ray_t* tbl = ray_read_splayed(write.dir, sym_path);
-        if (!tbl || RAY_IS_ERR(tbl)) {
-            err = tbl ? ray_err_from_obj(tbl) : RAY_ERR_OOM;
-        } else {
-            ray_splay_build_indexes(write.dir, tbl);
-        }
-        if (tbl) ray_release(tbl);
-    }
     return ray_splay_write_finish(&write, err, false);
 }
 

@@ -2036,9 +2036,64 @@ static test_result_t test_csv_parted_staging(void) {
     unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy(); PASS();
 }
 
+/* 300000 rows streamed in chunks of 100000 (not a multiple of 65536): the
+ * clustered column carries a 5-chunk zone, the unclustered one a hash (the
+ * upgrade needs at least four chunks), the STR column a dict, and the
+ * nullable column a zone whose null bits come from the parse chunks. */
+static bool csv_vec_bytes_eq(ray_t* a, ray_t* b, size_t esz) {
+    return a && b && a->len == b->len && !memcmp(ray_data(a), ray_data(b), (size_t)a->len * esz);
+}
+static test_result_t test_csv_splayed_inline_indexes(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-inline-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("a,b,s,n\n",f);
+    for(long long i=0;i<300000;i++) {
+        if (i%13==0) fprintf(f,"%lld,%lld,v%lld,\n",i,(i*7919)%1000003,i%500);
+        else fprintf(f,"%lld,%lld,v%lld,%lld\n",i,(i*7919)%1000003,i%500,i);
+    }
+    fclose(f);
+    int8_t types[]={RAY_I64,RAY_I64,RAY_STR,RAY_I64};
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,4,NULL,0,dir,100000),RAY_OK);
+    ray_t* t=ray_read_splayed(dir,NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t),300000);
+    ray_t* a=ray_table_get_col_idx(t,0);
+    TEST_ASSERT_EQ_I(ray_index_kind(a),RAY_IDX_CHUNK_ZONE);
+    const ray_index_t* ix=ray_index_payload(a->index);
+    TEST_ASSERT_EQ_I(ix->u.chunk_zone.n_chunks,5);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[1],65536);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.maxs))[4],299999);
+    TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,1)),RAY_IDX_HASH);
+    ray_t* s=ray_table_get_col_idx(t,2);
+    TEST_ASSERT_EQ_I(ray_index_kind(s),RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(ray_index_payload(s->index)->u.dict.n_distinct,500);
+    /* nullable column: zone equals a from-scratch compute over the loaded data */
+    ray_t* nc=ray_table_get_col_idx(t,3);
+    TEST_ASSERT_EQ_I(ray_index_kind(nc),RAY_IDX_CHUNK_ZONE);
+    const ray_index_t* nz=ray_index_payload(nc->index);
+    TEST_ASSERT_TRUE(((uint8_t*)ray_data(nz->u.chunk_zone.null_bits))[0] & 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(nz->u.chunk_zone.mins))[0],1);
+    ray_t* plain=ray_vec_from_raw(RAY_I64,ray_data(nc),nc->len);
+    TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+    ray_t* ref=ray_index_chunk_zone_compute(plain,16);
+    TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+    const ray_index_t* rz=ray_index_payload(ref);
+    TEST_ASSERT_EQ_I(nz->u.chunk_zone.n_chunks,rz->u.chunk_zone.n_chunks);
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.mins,rz->u.chunk_zone.mins,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.maxs,rz->u.chunk_zone.maxs,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.null_bits,rz->u.chunk_zone.null_bits,1));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.aggs,rz->u.chunk_zone.aggs,8));
+    ray_release(ref); ray_release(plain);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
+    { "csv/splayed_inline_indexes", test_csv_splayed_inline_indexes, NULL, NULL },
     { "csv/native_pooled_batches", test_csv_native_pooled_batches, NULL, NULL },
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
