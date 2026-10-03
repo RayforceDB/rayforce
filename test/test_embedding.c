@@ -35,6 +35,7 @@
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/format.h"
+#include "core/platform.h"
 #include "store/hnsw.h"
 #include "store/fileio.h"
 #include <math.h>
@@ -42,8 +43,13 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#ifndef RAY_OS_WINDOWS
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 extern ray_runtime_t* __RUNTIME;
+extern const char* ray_error_msg(void);
 
 /* Small epsilon for F64 comparisons. */
 #define EPS 1e-6
@@ -1032,6 +1038,130 @@ static test_result_t test_hnsw_load_rejects_bad_neighbor(void) {
     PASS();
 }
 
+/* Older builders could persist a one-way edge to a lower-level node in an
+ * upper layer. Loading should discard that unusable edge, while still
+ * rejecting malformed entry-point and layer-width metadata. */
+static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
+    const char* neighbor_dir = "/tmp/ray_hnsw_wrong_layer_neighbor";
+    const char* entry_dir = "/tmp/ray_hnsw_wrong_layer_entry";
+    const char* width_dir = "/tmp/ray_hnsw_wrong_layer_width";
+    float vecs[128 * 2];
+    for (int i = 0; i < 128; i++) {
+        vecs[i * 2] = (float)i;
+        vecs[i * 2 + 1] = (float)(i % 7);
+    }
+
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 128, 2, RAY_HNSW_L2, 4, 50);
+    TEST_ASSERT_NOT_NULL(idx);
+    if (idx->n_layers <= 1) {
+        ray_hnsw_free(idx);
+        TEST_ASSERT_TRUE(false);
+    }
+
+    int64_t low_level_id = -1;
+    for (int64_t i = 0; i < idx->n_nodes; i++) {
+        if (idx->node_level[i] == 0) {
+            low_level_id = i;
+            break;
+        }
+    }
+    if (low_level_id < 0) {
+        ray_hnsw_free(idx);
+        TEST_ASSERT_TRUE(false);
+    }
+    int64_t injected_layers = 0;
+    for (int32_t l = 1; l < idx->n_layers; l++) {
+        ray_hnsw_layer_t* layer = &idx->layers[l];
+        int64_t slot = -1;
+        for (int64_t i = 0; i < layer->n_nodes && slot < 0; i++) {
+            for (int64_t j = 0; j < layer->M_max; j++) {
+                if (layer->neighbors[i * layer->M_max + j] != -1) {
+                    slot = i * layer->M_max + j;
+                    break;
+                }
+            }
+        }
+        if (slot >= 0) {
+            layer->neighbors[slot] = low_level_id;
+            injected_layers++;
+        }
+    }
+    TEST_ASSERT_TRUE(injected_layers > 0);
+    int64_t valid_entry = idx->entry_point;
+    int32_t valid_M_max0 = idx->M_max0;
+
+    ray_err_t neighbor_err = ray_hnsw_save(idx, neighbor_dir);
+
+    idx->entry_point = low_level_id;
+    ray_err_t entry_err = ray_hnsw_save(idx, entry_dir);
+
+    idx->entry_point = valid_entry;
+    idx->M_max0 = valid_M_max0 - 1;
+    ray_err_t width_err = ray_hnsw_save(idx, width_dir);
+    ray_hnsw_free(idx);
+    TEST_ASSERT_EQ_I(neighbor_err, RAY_OK);
+    TEST_ASSERT_EQ_I(entry_err, RAY_OK);
+    TEST_ASSERT_EQ_I(width_err, RAY_OK);
+#ifndef RAY_OS_WINDOWS
+    char warning_path[96];
+    snprintf(warning_path, sizeof(warning_path), "/tmp/ray_hnsw_warning_%ld.log",
+             (long)getpid());
+    int warning_fd = open(warning_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT_TRUE(warning_fd >= 0);
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    TEST_ASSERT_TRUE(saved_stderr >= 0);
+    TEST_ASSERT_EQ_I(dup2(warning_fd, STDERR_FILENO), STDERR_FILENO);
+    ray_hnsw_t* loaded = ray_hnsw_load(neighbor_dir);
+    ray_hnsw_t* mapped = ray_hnsw_mmap(neighbor_dir);
+    fflush(stderr);
+    TEST_ASSERT_EQ_I(dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    close(saved_stderr);
+
+    char warning[512];
+    TEST_ASSERT_EQ_I(lseek(warning_fd, 0, SEEK_SET), 0);
+    ssize_t warning_len = read(warning_fd, warning, sizeof(warning) - 1);
+    TEST_ASSERT_TRUE(warning_len >= 0);
+    warning[warning_len] = '\0';
+    close(warning_fd);
+    unlink(warning_path);
+    char expected_count[64];
+    snprintf(expected_count, sizeof(expected_count), "repaired %lld legacy",
+             (long long)injected_layers);
+    TEST_ASSERT_TRUE(strstr(warning, expected_count) != NULL);
+    TEST_ASSERT_TRUE(strstr(warning, "rebuild the index") != NULL);
+#else
+    ray_hnsw_t* loaded = ray_hnsw_load(neighbor_dir);
+    ray_hnsw_t* mapped = ray_hnsw_mmap(neighbor_dir);
+#endif
+
+    TEST_ASSERT_NOT_NULL(loaded);
+    for (int32_t l = 1; l < loaded->n_layers; l++) {
+        ray_hnsw_layer_t* layer = &loaded->layers[l];
+        for (int64_t i = 0; i < layer->n_nodes; i++) {
+            for (int64_t j = 0; j < layer->M_max; j++) {
+                int64_t id = layer->neighbors[i * layer->M_max + j];
+                TEST_ASSERT_TRUE(id == -1 || loaded->node_level[id] >= l);
+            }
+        }
+    }
+    float query[2] = {0.0f, 0.0f};
+    int64_t result_id;
+    double result_dist;
+    TEST_ASSERT_EQ_I(ray_hnsw_search(loaded, query, 2, 1, 50, &result_id,
+                                     &result_dist),
+                     1);
+    ray_hnsw_free(loaded);
+
+    TEST_ASSERT_NOT_NULL(mapped);
+    ray_hnsw_free(mapped);
+    TEST_ASSERT_NULL(ray_hnsw_load(entry_dir));
+    TEST_ASSERT_NULL(ray_hnsw_mmap(entry_dir));
+    TEST_ASSERT_NULL(ray_hnsw_load(width_dir));
+    TEST_ASSERT_NULL(ray_hnsw_mmap(width_dir));
+    PASS();
+}
+
 /* Trigger the maxheap_sift_down / results-replacement path in hnsw_search_layer.
  *
  * The replacement branch (lines 342-344) fires when:
@@ -1668,6 +1798,16 @@ static test_result_t test_hnsw_load_type_errors(void) {
     r = ray_hnsw_load_fn(scalar);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     ray_release(scalar);
+
+    ray_t* missing = ray_str("/tmp/ray_hnsw_missing_index_error_detail", 40);
+    TEST_ASSERT_NOT_NULL(missing);
+    r = ray_hnsw_load_fn(missing);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_TRUE(strstr(msg, "rebuild it") != NULL);
+    ray_error_free(r);
+    ray_release(missing);
     PASS();
 }
 
@@ -2030,6 +2170,7 @@ const test_entry_t embedding_entries[] = {
     { "embedding/hnsw_build_overflow_rejected", test_hnsw_build_overflow_rejected, emb_setup, emb_teardown },
     { "embedding/hnsw_vec_size_valid_guard", test_hnsw_vec_size_valid_guard, emb_setup, emb_teardown },
     { "embedding/hnsw_load_rejects_bad_neighbor", test_hnsw_load_rejects_bad_neighbor, emb_setup, emb_teardown },
+    { "embedding/hnsw_load_repairs_legacy_layer_edge", test_hnsw_load_repairs_legacy_layer_edge, emb_setup, emb_teardown },
     { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
 
     /* rerank coverage (S7) */
@@ -2078,4 +2219,3 @@ const test_entry_t embedding_entries[] = {
 
     { NULL, NULL, NULL, NULL },
 };
-
