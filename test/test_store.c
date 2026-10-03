@@ -36,6 +36,7 @@
 #include "ops/idxop.h"
 #include "store/fileio.h"
 #include "store/splay.h"
+#include "store/stream.h"
 #include "store/part.h"
 #include "store/serde.h"
 #include "core/ipc.h"
@@ -1788,6 +1789,120 @@ static test_result_t test_dict_acc_cap_abandons(void) {
     TEST_ASSERT_NULL(ray_dict_acc_finish(&small, 1000));
     v->len = n;
     ray_release(v);
+    PASS();
+}
+
+/* Stream a 200000-row I64 column in 70000-row slices; the file carries the
+ * zone and loads with it. Values are clustered so no hash is wanted. */
+static test_result_t test_stream_inline_zone(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-zone-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 200000;
+    ray_t* v = zone_test_col(n, 0, 0);
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("z", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    for (int64_t off = 0; off < n; off += 70000) {
+        int64_t cnt = n - off < 70000 ? n - off : 70000;
+        ray_t* s = ray_vec_from_raw(RAY_I64, (int64_t*)ray_data(v) + off, cnt);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s), RAY_OK);
+        ray_release(s);
+    }
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_FALSE(w.wants_hash);
+    TEST_ASSERT_NULL(w.index);
+    char path[200]; snprintf(path, sizeof(path), "%s/z", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_CHUNK_ZONE);
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(zone_equal(back->index, want));
+    /* the region is what ray_col_append_index would have written */
+    ray_t* plain = zone_test_col(n, 0, 0);
+    char ref[200]; snprintf(ref, sizeof(ref), "%s/ref", dir);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(plain, ref), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_append_index(ref, ray_index_payload(want), n, RAY_I64), RAY_OK);
+    struct stat a, b;
+    TEST_ASSERT_EQ_I(stat(path, &a), 0); TEST_ASSERT_EQ_I(stat(ref, &b), 0);
+    TEST_ASSERT_EQ_I((int64_t)a.st_size, (int64_t)b.st_size);
+    ray_release(want); ray_release(back); ray_release(plain); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Exactly 65536 rows: one chunk, a zone, never a hash candidate. */
+static test_result_t test_stream_inline_zone_one_chunk(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-one-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 65536;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;  /* unclustered */
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("o", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_FALSE(w.wants_hash);
+    char path[200]; snprintf(path, sizeof(path), "%s/o", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_CHUNK_ZONE);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Unclustered I64 over four chunks: no inline index, the zone is kept and
+ * wants_hash set; ray_splay_hash_column then appends a hash. */
+static test_result_t test_stream_hash_candidate(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-hash-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("h", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_TRUE(w.wants_hash);
+    TEST_ASSERT_NOT_NULL(w.index);
+    char path[200]; snprintf(path, sizeof(path), "%s/h", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    ray_release(back);
+    TEST_ASSERT_EQ_I(ray_splay_hash_column(path, w.index), RAY_OK);
+    ray_release(w.index); w.index = NULL;
+    back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* STR column of 100000 rows with empty strings: inline dict, HAS_NULLS set. */
+static test_result_t test_stream_inline_dict(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-dict-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 100000;
+    ray_t* v = dict_test_col(n, 3000, false);
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    char path[200]; snprintf(path, sizeof(path), "%s/s", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(ray_index_payload(back->index)->u.dict.n_distinct, 3001);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
     PASS();
 }
 
@@ -5830,6 +5945,10 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_float",                test_zone_acc_float,                store_setup, store_teardown },
     { "store/dict_acc_slices_equal_compute", test_dict_acc_slices_equal_compute, store_setup, store_teardown },
     { "store/dict_acc_cap_abandons",         test_dict_acc_cap_abandons,         store_setup, store_teardown },
+    { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
+    { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
+    { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
+    { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },

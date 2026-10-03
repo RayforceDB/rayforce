@@ -3,6 +3,7 @@
 #define RAY_STORE_STREAM_H
 #include <rayforce.h>
 #include <stdio.h>
+#include "ops/idxop.h"
 /* One column, appended in bounded batches. SYM target domain is borrowed.
  * Close commits the column; caller flushes its symbol domain first and writes
  * the table schema last. STR pools spool to disk, with native 32-bit offsets. */
@@ -30,10 +31,19 @@ typedef struct {
      * first time it is met and looked up here after. */
     int64_t*  lut_id;    /* [COL_STREAM_LUT] runtime id per slot, -1 empty */
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
+    ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
+    ray_dict_acc_t* dict;   /* STR: the running dictionary */
+    ray_t*  index;          /* after close: the zone kept for a hash candidate */
+    bool    wants_hash;     /* after close: build a hash by re-reading the file */
 } ray_col_stream_t;
 
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
                               int8_t type, struct ray_sym_domain_s* domain);
+/* Start building the column's index from global row start_row. Call after
+ * open and before the first append; no-op for types without an index. */
+ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row);
+/* Fold src's zone into dst's (parallel Parquet tasks). Frees src's zone. */
+ray_err_t ray_col_stream_index_merge(ray_col_stream_t* dst, ray_col_stream_t* src);
 ray_err_t ray_col_stream_append(ray_col_stream_t* w, ray_t* column);
 ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable);
 void ray_col_stream_abort(ray_col_stream_t* w);

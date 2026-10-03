@@ -1272,3 +1272,8 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
     if (fresh) ray_sym_domain_release(fresh);
     return tbl;
 }
+
+ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
+    (void)path; (void)zone;
+    return RAY_ERR_NYI;   /* Task 5 replaces this */
+}

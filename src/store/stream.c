@@ -8,6 +8,7 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
+#include "io/csv.h"      /* ray_csv_hash_upgrade_check: the shared upgrade policy */
 #include <limits.h>
 #include <string.h>
 
@@ -62,6 +63,37 @@ ray_err_t ray_col_stream_open(ray_col_stream_t* w,
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
     w->lut_id = NULL; w->lut_pos = NULL;
+}
+
+ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row) {
+    if (w->zone || w->dict) return RAY_ERR_DOMAIN;
+    if (w->type == RAY_STR) {
+        w->dict = (ray_dict_acc_t*)ray_alloc_raw(sizeof(*w->dict));
+        if (!w->dict) return RAY_ERR_OOM;
+        ray_err_t err = ray_dict_acc_init(w->dict);
+        if (err != RAY_OK) { ray_free_raw(w->dict); w->dict = NULL; }
+        return err;
+    }
+    if (!ray_zone_acc_supported(w->type)) return RAY_OK;
+    w->zone = (ray_zone_acc_t*)ray_alloc_raw(sizeof(*w->zone));
+    if (!w->zone) return RAY_ERR_OOM;
+    ray_err_t err = ray_zone_acc_init(w->zone, w->type, start_row);
+    if (err != RAY_OK) { ray_free_raw(w->zone); w->zone = NULL; }
+    return err;
+}
+
+ray_err_t ray_col_stream_index_merge(ray_col_stream_t* dst, ray_col_stream_t* src) {
+    if (!src->zone) return RAY_OK;
+    ray_err_t err = dst->zone ? ray_zone_acc_merge(dst->zone, src->zone) : RAY_ERR_DOMAIN;
+    ray_zone_acc_free(src->zone); ray_free_raw(src->zone); src->zone = NULL;
+    return err;
+}
+
+static void stream_drop_index(ray_col_stream_t* w) {
+    if (w->zone) { ray_zone_acc_free(w->zone); ray_free_raw(w->zone); w->zone = NULL; }
+    if (w->dict) { ray_dict_acc_free(w->dict); ray_free_raw(w->dict); w->dict = NULL; }
+    if (w->index) { ray_release(w->index); w->index = NULL; }
+    w->wants_hash = false;
 }
 
 ray_err_t ray_col_stream_append(ray_col_stream_t* w,
@@ -174,6 +206,14 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
             return RAY_ERR_IO;
         if (col->attrs & RAY_ATTR_HAS_NULLS) w->had_nulls = true;
     }
+    if (w->zone && col->type == w->type) {
+        ray_err_t err = ray_zone_acc_add(w->zone, col);
+        if (err != RAY_OK) return err;
+    }
+    if (w->dict && col->type == RAY_STR) {
+        ray_err_t err = ray_dict_acc_add(w->dict, col);
+        if (err != RAY_OK) return err;
+    }
     w->rows += n;
     return RAY_OK;
 }
@@ -205,6 +245,29 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
     if (w->pool_fp) { if (fclose(w->pool_fp) && err == RAY_OK) err = RAY_ERR_IO; w->pool_fp = NULL; }
     if (w->pool_path[0]) remove(w->pool_path);
 
+    /* The index region goes after the payload and the marker into the same
+     * header write, so the rename publishes data and index together.  A
+     * zone the hash policy wants upgraded is handed back instead: the
+     * converter re-reads only that column to build the hash. */
+    bool inline_index = false;
+    if (err == RAY_OK && (w->zone || w->dict)) {
+        ray_t* idx = w->zone ? ray_zone_acc_finish(w->zone, w->rows)
+                             : ray_dict_acc_finish(w->dict, w->rows);
+        ray_free_raw(w->zone); ray_free_raw(w->dict); w->zone = NULL; w->dict = NULL;
+        if (idx && RAY_IS_ERR(idx)) { ray_error_free(idx); idx = NULL; }   /* best effort */
+        if (idx) {
+            const ray_index_t* ix = ray_index_payload(idx);
+            if (ix->kind == RAY_IDX_CHUNK_ZONE &&
+                ray_csv_hash_upgrade_check(w->type, w->rows, ix)) {
+                w->index = idx; w->wants_hash = true;
+            } else {
+                err = ray_col_write_index_region(w->fp, ix, NULL);
+                inline_index = err == RAY_OK;
+                ray_release(idx);
+            }
+        }
+    }
+
     if (err == RAY_OK) {
         ray_t hdr = {0};
         hdr.type = w->type;
@@ -217,9 +280,10 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
         if (w->had_nulls) hdr.attrs |= RAY_ATTR_HAS_NULLS;
         /* Stamp the on-disk format major version into `order` so the
          * streamed column file shares the exact identity ray_col_save
-         * writes — the loaders validate it.  aux stays zero (it was
-         * zero-initialized above) — reserved for postponed index data. */
+         * writes — the loaders validate it.  aux stays zero unless an
+         * index region was written above, in which case the stamp sets it. */
         ray_col_stamp_format(&hdr);
+        if (inline_index) ray_col_stamp_index(&hdr);
         if (fseek(w->fp, 0, SEEK_SET) != 0 ||
             fwrite(&hdr, 1, 32, w->fp) != 32)
             err = RAY_ERR_IO;
@@ -234,12 +298,13 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
     }
     if (err == RAY_OK) err = ray_file_rename(w->tmp_path, w->path);
     if (err == RAY_OK && durable) err = ray_file_sync_dir(w->path);
-    if (err != RAY_OK) remove(w->tmp_path);
+    if (err != RAY_OK) { remove(w->tmp_path); stream_drop_index(w); }
     return err;
 }
 
 void ray_col_stream_abort(ray_col_stream_t* w) {
     ray_col_stream_drop_lut(w);
+    stream_drop_index(w);
     if (w->fp) fclose(w->fp);
     w->fp = NULL;
     if (w->pool_fp) fclose(w->pool_fp);

@@ -74,6 +74,9 @@ ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
 /* Append chunk-zone index regions to a freshly-streamed splayed store's column
  * files so later mmap loads get block-skip.  Best-effort, per numeric column. */
 void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
+/* Append a hash index to the column file at path, using its kept chunk zone
+ * (Task 5 deliverable). */
+ray_err_t ray_splay_hash_column(const char* path, ray_t* zone);
 
 /* Loader accepting a shared FILE domain. It resolves the generation first,
  * then refreshes the cached domain to include any externally appended symbols. */
