@@ -755,7 +755,11 @@ ray_err_t ray_journal_open(const char* base, ray_journal_mode_t mode) {
     if (le != RAY_OK) return le;
     ray_err_t re = ray_journal_recover(base);
     if (re != RAY_OK) { journal_unlock(); return re; }
-    return ray_journal_open_append(base, mode);
+    /* The append step fails before it reaches the lock it already holds
+     * (base too long for <base>.log): release ours. */
+    ray_err_t oe = ray_journal_open_append(base, mode);
+    if (oe != RAY_OK) journal_unlock();
+    return oe;
 }
 
 static ray_err_t journal_close_fp(void);
