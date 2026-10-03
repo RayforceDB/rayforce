@@ -727,13 +727,9 @@ ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload
     int64_t pad = region_off - payload_end;
     static const uint8_t zeros[32] = {0};
     if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) return RAY_ERR_IO;
-    int64_t rsize = ray_index_inline_size(ix);
-    uint8_t* rbuf = (uint8_t*)ray_calloc_raw((size_t)rsize);
-    if (!rbuf) return RAY_ERR_OOM;
-    ray_index_inline_write(rbuf, ix);
-    size_t rw = fwrite(rbuf, 1, (size_t)rsize, f);
-    ray_free_raw(rbuf);
-    if (rw != (size_t)rsize) return RAY_ERR_IO;
+    /* Streamed block by block from the index itself: no region-sized
+     * staging buffer to fault in and copy (4.5 GB for a 100 M-row hash). */
+    if (!ray_index_inline_write_file(f, ix)) return RAY_ERR_IO;
     /* The region must be on the file before any marker claims it. */
     return fflush(f) == 0 ? RAY_OK : RAY_ERR_IO;
 }

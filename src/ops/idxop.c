@@ -1386,6 +1386,47 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
     }
 }
 
+bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
+    static const uint8_t zeros[32] = {0};
+    uint8_t head[IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t))];
+    memset(head, 0, sizeof(head));
+    ray_t blkhdr;
+    memset(&blkhdr, 0, 32);
+    blkhdr.type = RAY_INDEX; blkhdr.len = (int64_t)sizeof(ray_index_t);
+    blkhdr.mmod = 1; blkhdr.rc = 1;
+    blkhdr.order = RAY_IDX_FORMAT_MAJOR;
+    memcpy(head, &blkhdr, 32);
+    ray_index_t* on = (ray_index_t*)(head + 32);
+    memcpy(on, ix, sizeof(ray_index_t));
+    on->markers |= RAY_MARK_MMAP;
+
+    ray_t** src_slots[4];
+    ray_t** on_slots[4];
+    int nch = idx_child_slots((ray_index_t*)ix, src_slots);
+    idx_child_slots(on, on_slots);
+    int64_t off = (int64_t)sizeof(head);
+    for (int i = 0; i < nch; i++) {
+        ray_t* c = *src_slots[i];
+        if (!c || RAY_IS_ERR(c)) { *on_slots[i] = NULL; continue; }
+        *on_slots[i] = (ray_t*)(intptr_t)off;   /* region-relative offset */
+        off += idx_blk_bytes(c);
+    }
+    if (fwrite(head, 1, sizeof(head), f) != sizeof(head)) return false;
+    for (int i = 0; i < nch; i++) {
+        ray_t* c = *src_slots[i];
+        if (!c || RAY_IS_ERR(c)) continue;
+        ray_t chdr;
+        memcpy(&chdr, c, 32);
+        chdr.mmod = 1; chdr.rc = 1;
+        if (fwrite(&chdr, 1, 32, f) != 32) return false;
+        size_t dbytes = (size_t)c->len * ray_elem_size(c->type);
+        if (dbytes && fwrite(ray_data(c), 1, dbytes, f) != dbytes) return false;
+        size_t pad = (size_t)idx_blk_bytes(c) - 32 - dbytes;
+        if (pad && fwrite(zeros, 1, pad, f) != pad) return false;
+    }
+    return true;
+}
+
 /* Map an mmap'd inline region in place: patch child offsets to absolute
  * pointers and return the RAY_INDEX object (already RAY_MARK_MMAP).  `region`
  * points at the start of the index region within the column's file mapping.

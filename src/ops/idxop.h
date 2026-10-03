@@ -45,6 +45,7 @@
  * vector get this for free (fresh vectors start at attrs==0, no index).
  */
 
+#include <stdio.h>   /* FILE: ray_index_inline_write_file */
 #include <rayforce.h>
 #include "mem/heap.h"  /* RAY_ATTR_HAS_INDEX */
 
@@ -384,6 +385,10 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
  *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
 int64_t ray_index_inline_size(const ray_index_t* ix);
 void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
+/* The same bytes as ray_index_inline_write, streamed to `f` block by block
+ * straight from the child vecs: no region-sized staging buffer (a 100 M-row
+ * hash region is ~4.5 GB) and one copy fewer.  false on a short write. */
+bool    ray_index_inline_write_file(FILE* f, const ray_index_t* ix);
 ray_t*  ray_index_inline_map(uint8_t* region, int64_t region_size);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the
