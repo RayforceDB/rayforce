@@ -973,7 +973,6 @@ ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v) {
         if (a->is_f64) {
             double mn = a->fmins[g], mx = a->fmaxs[g];
             for (; i < e; i++) {
-                if (ray_vec_is_null(v, i)) { any_null = true; continue; }
                 double val;
                 if (a->esz == 4) { float t; memcpy(&t, base + i * 4, 4); val = (double)t; }
                 else memcpy(&val, base + i * 8, 8);
@@ -986,14 +985,17 @@ ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v) {
             int64_t mn = a->mins[g], mx = a->maxs[g], nn = a->nn[g], hi = a->sum_hi[g];
             uint64_t lo = a->sum_lo[g];
             for (; i < e; i++) {
-                if (ray_vec_is_null(v, i)) { any_null = true; continue; }
+                /* Null = the type's sentinel VALUE, whatever the slice header
+                 * says (col.c #495: the persisted bit derives from the payload). */
                 int64_t val = 0;
+                bool is_null = false;
                 switch (a->esz) {
                 case 1: val = (int64_t)base[i]; break;
-                case 2: { int16_t t; memcpy(&t, base + i * 2, 2); val = t; break; }
-                case 4: { int32_t t; memcpy(&t, base + i * 4, 4); val = t; break; }
-                default: { int64_t t; memcpy(&t, base + i * 8, 8); val = t; break; }
+                case 2: { int16_t t; memcpy(&t, base + i * 2, 2); val = t; is_null = (t == NULL_I16); break; }
+                case 4: { int32_t t; memcpy(&t, base + i * 4, 4); val = t; is_null = (t == NULL_I32); break; }
+                default: { int64_t t; memcpy(&t, base + i * 8, 8); val = t; is_null = (t == NULL_I64); break; }
                 }
+                if (is_null) { any_null = true; continue; }
                 if (val < mn) mn = val;
                 if (val > mx) mx = val;
                 ray_i128_add(&hi, &lo, val);
@@ -1001,7 +1003,7 @@ ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v) {
             }
             a->mins[g] = mn; a->maxs[g] = mx; a->nn[g] = nn; a->sum_hi[g] = hi; a->sum_lo[g] = lo;
         }
-        if (any_null) a->nulls[g] = 1;
+        if (any_null) { a->nulls[g] = 1; a->saw_null = true; }
     }
     a->next_row += n;
     return RAY_OK;
@@ -1023,6 +1025,7 @@ ray_err_t ray_zone_acc_merge(ray_zone_acc_t* dst, const ray_zone_acc_t* src) {
         }
         dst->nulls[g] |= src->nulls[g];
     }
+    if (src->saw_null) dst->saw_null = true;
     if (src->next_row > dst->next_row) dst->next_row = src->next_row;
     return RAY_OK;
 }

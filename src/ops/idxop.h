@@ -288,6 +288,8 @@ typedef struct {
     uint32_t  cap;        /* chunks allocated */
     int64_t*  mins;  int64_t* maxs;    /* integer zones */
     double*   fmins; double*  fmaxs;   /* float zones */
+    bool      saw_null;   /* the column holds a sentinel/NaN; the writer must
+                           * publish HAS_NULLS (col.c #495 rule) */
     uint8_t*  nulls;      /* one byte per chunk: 1 = any null in chunk */
     uint64_t* sum_lo; int64_t* sum_hi; int64_t* nn;   /* integer zones only */
 } ray_zone_acc_t;

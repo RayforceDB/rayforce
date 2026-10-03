@@ -2090,7 +2090,55 @@ static test_result_t test_csv_splayed_inline_indexes(void) {
     PASS();
 }
 
+/* A literal INT64_MIN in a parse chunk without empty cells is a number to the
+ * parser (no HAS_NULLS on that slice) but a null once the column header ORs
+ * the slice flags; the streamed zone must follow the loaded column (#495). */
+static test_result_t test_csv_splayed_sentinel_literal(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-sent-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("lit2\n",f);
+    for(long long i=0;i<300000;i++) {
+        if (i==7) fputs("-9223372036854775808\n",f);
+        else if (i>=200000 && i%50==0) fputs("\n",f);
+        else fprintf(f,"%lld\n",i/1000);
+    }
+    fclose(f);
+    int8_t types[]={RAY_I64};
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000),RAY_OK);
+    ray_t* t=ray_read_splayed(dir,NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* c=ray_table_get_col_idx(t,0);
+    TEST_ASSERT_EQ_I(c->len,300000);
+    TEST_ASSERT_TRUE(c->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(ray_index_kind(c),RAY_IDX_CHUNK_ZONE);
+    ray_t* plain=ray_vec_from_raw(RAY_I64,ray_data(c),c->len);
+    TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+    plain->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* ref=ray_index_chunk_zone_compute(plain,16);
+    TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+    const ray_index_t* nz=ray_index_payload(c->index);
+    const ray_index_t* rz=ray_index_payload(ref);
+    TEST_ASSERT_EQ_I(nz->u.chunk_zone.n_chunks,rz->u.chunk_zone.n_chunks);
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.mins,rz->u.chunk_zone.mins,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.maxs,rz->u.chunk_zone.maxs,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.null_bits,rz->u.chunk_zone.null_bits,1));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.aggs,rz->u.chunk_zone.aggs,8));
+    int64_t zs=0, znn=0, ws=0, wnn=0;
+    TEST_ASSERT_TRUE(ray_zone_int_sum(c,&zs,&znn));
+    const int64_t* d=(const int64_t*)ray_data(c);
+    for (int64_t i=0;i<c->len;i++) { if (ray_vec_is_null(c,i)) continue; ws+=d[i]; wnn++; }
+    TEST_ASSERT_EQ_I(zs,ws);
+    TEST_ASSERT_EQ_I(znn,wnn);
+    TEST_ASSERT_EQ_I(wnn,300000-1-(100000/50));
+    ray_release(ref); ray_release(plain);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
+    { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
     { "csv/splayed_inline_indexes", test_csv_splayed_inline_indexes, NULL, NULL },

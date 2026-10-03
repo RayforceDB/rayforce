@@ -250,6 +250,10 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
      * zone the hash policy wants upgraded is handed back instead: the
      * converter re-reads only that column to build the hash. */
     bool inline_index = false;
+    /* The persisted HAS_NULLS bit derives from the payload (col.c #495): a
+     * sentinel in any slice, flagged or not, publishes the bit, so the
+     * loaded column and the zone agree on every cell. */
+    if (w->zone && w->zone->saw_null) w->had_nulls = true;
     if (err == RAY_OK && (w->zone || w->dict)) {
         ray_t* idx = w->zone ? ray_zone_acc_finish(w->zone, w->rows)
                              : ray_dict_acc_finish(w->dict, w->rows);

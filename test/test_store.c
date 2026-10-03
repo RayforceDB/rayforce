@@ -1884,6 +1884,76 @@ static test_result_t test_stream_inline_zone(void) {
     PASS();
 }
 
+/* A sentinel typed as a value in a slice WITHOUT HAS_NULLS is still a null:
+ * the accumulator decides by the sentinel value (col.c #495). */
+static test_result_t test_zone_acc_sentinel_without_flag(void) {
+    int64_t n = 70000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = i * 3 + 5;
+    d[7] = INT64_MIN;
+    TEST_ASSERT_FALSE(v->attrs & RAY_ATTR_HAS_NULLS);
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_I64, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, v), RAY_OK);
+    TEST_ASSERT_TRUE(acc.saw_null);
+    TEST_ASSERT_EQ_I(acc.nn[0], 65535);
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    const ray_index_t* ix = ray_index_payload(got);
+    TEST_ASSERT_TRUE(((uint8_t*)ray_data(ix->u.chunk_zone.null_bits))[0] & 1u);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[0], 5);   /* row 0 */
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* Writer level: slice 1 carries a sentinel without the flag, slice 2 the
+ * flag; the file header must publish HAS_NULLS and the zone must agree with
+ * the loaded column. */
+static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-sent-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 70000;
+    ray_t* s1 = ray_vec_new(RAY_I64, n); s1->len = n;
+    ray_t* s2 = ray_vec_new(RAY_I64, n); s2->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(s1))[i] = i * 3;
+        ((int64_t*)ray_data(s2))[i] = (i % 50 == 0) ? NULL_I64 : (n + i) * 3;
+    }
+    ((int64_t*)ray_data(s1))[7] = INT64_MIN;
+    s2->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("n", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s1), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    if (w.index) { ray_release(w.index); w.index = NULL; }
+    char path[200]; snprintf(path, sizeof(path), "%s/n", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, 2 * n);
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_INDEX);
+    ray_t* copy = ray_vec_from_raw(RAY_I64, ray_data(back), back->len);
+    TEST_ASSERT_TRUE(copy && !RAY_IS_ERR(copy));
+    copy->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* want = ray_index_chunk_zone_compute(copy, 16);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(back->index, want));
+    TEST_ASSERT_TRUE(((int64_t*)ray_data(ray_index_payload(back->index)->u.chunk_zone.mins))[0] != INT64_MIN);
+    ray_release(want); ray_release(copy); ray_release(back);
+    ray_release(s1); ray_release(s2);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* Exactly 65536 rows: one chunk, a zone, never a hash candidate. */
 static test_result_t test_stream_inline_zone_one_chunk(void) {
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-one-%d", (int)getpid());
@@ -5999,6 +6069,8 @@ const test_entry_t store_entries[] = {
     { "store/dict_acc_leading_empty", test_dict_acc_leading_empty, store_setup, store_teardown },
     { "store/dict_acc_cap_abandons",         test_dict_acc_cap_abandons,         store_setup, store_teardown },
     { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
+    { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
+    { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
