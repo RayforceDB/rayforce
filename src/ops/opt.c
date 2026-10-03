@@ -664,6 +664,10 @@ static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
 
     ray_op_ext_t* pred_ext = find_ext(g, pred->id);
     if (!pred_ext || !pred_ext->literal || !ray_is_atom(pred_ext->literal)) return false;
+    /* Only a constant with a truth value folds.  atom_to_numeric reads a
+     * symbol's id, so `where: 'abc` folded to "keep every row"; left in
+     * place, the filter raises the scalar-predicate type error (#678). */
+    if (pred_ext->literal->type == -RAY_SYM) return false;
 
     bool keep_rows = false;
     if (!atom_to_bool(pred_ext->literal, &keep_rows)) return false;

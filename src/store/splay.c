@@ -521,6 +521,168 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
     return splay_write_table_impl(tbl, dir, sym_path, durable, true, true);
 }
 
+#ifdef RAY_OS_WINDOWS
+#define SPLAY_IS_SEP(c) ((c) == '/' || (c) == '\\')
+#else
+#define SPLAY_IS_SEP(c) ((c) == '/')
+#endif
+
+/* Record the shallowest component of `root` that does not exist yet, so a
+ * failed first write can remove the directories it created.  Nothing is
+ * recorded when a ".." follows it: root would then lie outside it. */
+static void splay_find_missing(const char* root, char* out, size_t out_sz) {
+    out[0] = '\0';
+    size_t len = strlen(root);
+    if (len >= out_sz) return;
+    char buf[1024];
+    memcpy(buf, root, len + 1);
+    struct stat st;
+    size_t i = 1;
+    for (; i <= len; i++) {
+        if (i < len && !SPLAY_IS_SEP(buf[i])) continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        bool missing = stat(buf, &st) != 0 && errno == ENOENT;
+        buf[i] = saved;
+        if (missing) break;
+    }
+    if (i > len) return;
+    for (size_t j = i; j < len; j++)
+        if (SPLAY_IS_SEP(root[j]) && root[j + 1] == '.' && root[j + 2] == '.' &&
+            (root[j + 3] == '\0' || SPLAY_IS_SEP(root[j + 3])))
+            return;
+    memcpy(out, root, i);
+    out[i] = '\0';
+}
+
+/* An in-place write goes to a directory that may have been there before this
+ * writer: an operator pre-made it, or an earlier first write was killed and
+ * left its lock file and partial columns.  Nothing says what else it holds
+ * (a database root has no .d either), so a failed write removes only what
+ * this writer produced: every entry whose inode was not in the directory
+ * when the lock was taken.  Column files are renamed into place, so a
+ * leftover this writer rewrote has a new inode and goes with the rest.
+ * Taken under the lock, right after it. */
+static int splay_ino_cmp(const void* a, const void* b) {
+    uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+static void splay_snapshot_root(ray_splay_write_t* write) {
+    write->before = NULL;
+    write->nbefore = 0;
+    write->before_known = false;
+    DIR* d = opendir(write->root);
+    if (!d) return;
+    size_t cap = 0;
+    bool ok = true;
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child[1100];
+        int n = snprintf(child, sizeof(child), "%s/%s", write->root, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) { ok = false; break; }
+        struct stat st;
+        if (stat(child, &st) != 0) {
+            if (errno == ENOENT) continue;      /* removed while listing */
+            ok = false;
+            break;
+        }
+        if (write->nbefore == cap) {
+            cap = cap ? cap * 2 : 16;
+            uint64_t* grown = ray_realloc_raw(write->before, cap * sizeof(uint64_t));
+            if (!grown) { ok = false; break; }
+            write->before = grown;
+        }
+        write->before[write->nbefore++] = (uint64_t)st.st_ino;
+    }
+    closedir(d);
+    if (ok && write->nbefore > 1)
+        qsort(write->before, write->nbefore, sizeof(uint64_t), splay_ino_cmp);
+    write->before_known = ok;
+}
+
+static bool splay_was_there(const ray_splay_write_t* write, uint64_t ino) {
+    size_t lo = 0, hi = write->nbefore;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (write->before[mid] < ino) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < write->nbefore && write->before[lo] == ino;
+}
+
+/* A failed first write removes the table directory and every directory begin
+ * created above it, so no partition without a schema is left behind.  The
+ * lock holder first empties the table directory of what it produced, all
+ * but its lock file: everything, when begin created the directory; else
+ * what the snapshot does not know.  Without a snapshot nothing goes. */
+static void splay_clear_created(const ray_splay_write_t* write) {
+    bool all = write->created[0];
+    if (!all && !write->before_known) return;
+    DIR* d = opendir(write->root);
+    if (!d) return;
+    struct dirent* entry;
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+            strcmp(entry->d_name, ".write.lock") == 0)
+            continue;
+        char child[1100];
+        int n = snprintf(child, sizeof(child), "%s/%s", write->root, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) continue;
+        if (!all) {
+            struct stat st;
+            if (stat(child, &st) != 0 || splay_was_there(write, (uint64_t)st.st_ino))
+                continue;
+        }
+        splay_remove_tree_best_effort(child);
+    }
+    closedir(d);
+}
+
+/* Nothing but the lock file left? */
+static bool splay_root_is_bare(const ray_splay_write_t* write) {
+    DIR* d = opendir(write->root);
+    if (!d) return false;
+    bool bare = true;
+    struct dirent* entry;
+    while (bare && (entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 &&
+            strcmp(entry->d_name, ".write.lock") != 0)
+            bare = false;
+    }
+    closedir(d);
+    return bare;
+}
+
+/* Then the lock file goes, last: a waiter on it finds it unlinked and starts
+ * over, and a writer that creates a new one keeps the directory, which is
+ * then removed only while empty, like every directory above it.  A directory
+ * that still holds anything else keeps its lock file too.  Without the lock
+ * (begin failed before taking it) nothing but empty directories goes, and
+ * the lock file only when nobody can hold it.  Directories above a table
+ * directory that was there before the write are not this writer's. */
+static void splay_remove_created(const ray_splay_write_t* write, bool unlink_lock) {
+    if (!splay_root_is_bare(write)) return;
+    if (unlink_lock) {
+        char lock[1100];
+        int n = snprintf(lock, sizeof(lock), "%s/.write.lock", write->root);
+        if (n > 0 && (size_t)n < sizeof(lock)) (void)unlink(lock);
+    }
+    if (rmdir(write->root) != 0 || !write->created[0]) return;
+    size_t stop = strlen(write->created);
+    char path[1024];
+    memcpy(path, write->root, strlen(write->root) + 1);
+    for (;;) {
+        size_t k = strlen(path);
+        while (k > 0 && !SPLAY_IS_SEP(path[k - 1])) k--;
+        if (k == 0 || k - 1 < stop) break;
+        path[k - 1] = '\0';
+        if (rmdir(path) != 0) break;
+    }
+}
+
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
     char previous[1024];
@@ -547,11 +709,44 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
         !splay_generation_is_current(write)) {
         splay_remove_tree_best_effort(write->dir);
     }
+    /* The lock holder clears what it produced in the table directory;
+     * without the lock only the empty directories begin created go.  The
+     * schema check is repeated here, under the lock: `created` was recorded
+     * before the lock was taken, and a stat error in begin must not clear a
+     * table another writer published meanwhile. */
+    bool locked = write->locked;
+    bool drop_created = result != RAY_OK && !write->staged &&
+                        (locked || write->created[0]);
+    if (drop_created && locked) {
+        bool schema = false, current = false;
+        if (splay_has_file(write->root, ".d", &schema) != RAY_OK ||
+            splay_has_file(write->root, ".current", &current) != RAY_OK ||
+            schema || current)
+            drop_created = false;
+        else
+            splay_clear_created(write);
+    }
+    if (write->before) {
+        ray_free_raw(write->before);
+        write->before = NULL;
+        write->nbefore = 0;
+    }
+    bool unlink_lock = locked || write->unlink_lock;
+#ifndef RAY_OS_WINDOWS
+    /* Under the lock; a writer waiting on it then finds its lock file
+     * unlinked and starts over (see ray_splay_write_begin). */
+    if (drop_created) splay_remove_created(write, unlink_lock);
+#endif
     if (write->lock != RAY_FD_INVALID) {
-        (void)ray_file_unlock(write->lock);
+        if (write->locked) (void)ray_file_unlock(write->lock);
         ray_file_close(write->lock);
         write->lock = RAY_FD_INVALID;
+        write->locked = false;
     }
+#ifdef RAY_OS_WINDOWS
+    /* Windows cannot delete the open lock file. */
+    if (drop_created) splay_remove_created(write, unlink_lock);
+#endif
     return result;
 }
 
@@ -563,16 +758,62 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     if (n < 0 || (size_t)n >= sizeof(write->root)) return RAY_ERR_RANGE;
     size_t len = strlen(write->root);
     while (len > 1 && write->root[len - 1] == '/') write->root[--len] = '\0';
-    ray_err_t err = ray_mkdir_p(write->root);
-    if (err != RAY_OK) return err;
 
     char path[1024];
     n = snprintf(path, sizeof(path), "%s/.write.lock", write->root);
     if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
-    write->lock = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
-    if (write->lock == RAY_FD_INVALID) return RAY_ERR_IO;
-    err = ray_file_lock_ex(write->lock);
-    if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
+    ray_err_t err = RAY_ERR_IO;
+    for (int attempt = 0; attempt < 8 && !write->locked; attempt++) {
+        splay_find_missing(write->root, write->created, sizeof(write->created));
+        err = ray_mkdir_p(write->root);
+        if (err != RAY_OK) {
+#ifndef RAY_OS_WINDOWS
+            /* A failed first write of a sibling removed a new parent
+             * between our mkdirs: create it again. */
+            if (errno == ENOENT) continue;
+#endif
+            return ray_splay_write_finish(write, err, false);
+        }
+        write->lock = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+        if (write->lock == RAY_FD_INVALID) {
+            err = RAY_ERR_IO;
+            if (errno == ENOENT) continue;
+            return ray_splay_write_finish(write, err, false);
+        }
+        err = ray_file_lock_ex(write->lock);
+        if (err != RAY_OK) {
+            /* A wait cut short (EINTR) is retried without waiting.  When
+             * that fails for any reason but another holder, locking itself
+             * is broken, so nobody holds this lock file either and a
+             * directory created for it can go with it (see finish);
+             * otherwise it stays, as it would admit a second writer. */
+            if (ray_file_trylock_ex(write->lock) == RAY_OK) {
+                err = RAY_OK;
+            } else {
+#ifndef RAY_OS_WINDOWS
+                write->unlink_lock = errno != EWOULDBLOCK && errno != EAGAIN &&
+                                     write->created[0];
+#endif
+                return ray_splay_write_finish(write, err, false);
+            }
+        }
+        write->locked = true;
+#ifndef RAY_OS_WINDOWS
+        /* A failed first write removes the directory with its lock file
+         * while holding the lock; a waiter then holds a lock on a file
+         * nobody else can find.  Drop it and start over. */
+        struct stat held, named;
+        if (fstat(write->lock, &held) != 0 || stat(path, &named) != 0 ||
+            held.st_ino != named.st_ino || held.st_dev != named.st_dev) {
+            (void)ray_file_unlock(write->lock);
+            ray_file_close(write->lock);
+            write->lock = RAY_FD_INVALID;
+            write->locked = false;
+            err = RAY_ERR_IO;
+        }
+#endif
+    }
+    if (!write->locked) return ray_splay_write_finish(write, err, false);
 
     bool schema, current;
     err = splay_has_file(write->root, ".d", &schema);
@@ -580,6 +821,7 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
     write->staged = schema || current;
     if (!write->staged) {
+        splay_snapshot_root(write);
         memcpy(write->dir, write->root, len + 1);
         return RAY_OK;
     }

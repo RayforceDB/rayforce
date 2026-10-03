@@ -371,5 +371,35 @@ ray_t* ray_not_fn(ray_t* x) {
         r->len = n;
         return r;
     }
+    /* Element-wise for numeric and temporal vectors too, as the compiled
+     * `not` is: true where the cell is zero or null.  It used to answer one
+     * truth value for the whole vector, so a query evaluated through the
+     * interpreter disagreed with the same query compiled. */
+    if (ray_is_vec(x) && (x->type == RAY_U8 || x->type == RAY_I16 ||
+                          x->type == RAY_I32 || x->type == RAY_I64 ||
+                          x->type == RAY_F32 || x->type == RAY_F64 ||
+                          x->type == RAY_DATE || x->type == RAY_TIME ||
+                          x->type == RAY_TIMESTAMP)) {
+        int64_t n = x->len;
+        ray_t* r = ray_vec_new(RAY_BOOL, n);
+        if (RAY_IS_ERR(r)) return r;
+        uint8_t* dr = (uint8_t*)ray_data(r);
+        const void* src = ray_data(x);
+        for (int64_t i = 0; i < n; i++) {
+            bool z;
+            switch (x->type) {
+                case RAY_U8:  z = ((const uint8_t*)src)[i] == 0; break;
+                case RAY_I16: z = ((const int16_t*)src)[i] == 0; break;
+                case RAY_I32: case RAY_DATE: case RAY_TIME:
+                              z = ((const int32_t*)src)[i] == 0; break;
+                case RAY_F32: z = ((const float*)src)[i] == 0.0f; break;
+                case RAY_F64: z = ((const double*)src)[i] == 0.0; break;
+                default:      z = ((const int64_t*)src)[i] == 0; break;
+            }
+            dr[i] = z || ray_vec_is_null(x, i);
+        }
+        r->len = n;
+        return r;
+    }
     return make_bool(is_truthy(x) ? 0 : 1);
 }

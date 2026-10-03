@@ -31,3 +31,16 @@
 (at (select {c: (> i thr) from: t}) 'c) -- [false false false true true]
 (at (select {c: (> (avg i) i) from: t}) 'c) -- [true true false false false]
 (at (select {c: (+ i (avg i)) from: t}) 'c) -- [4.0 5.0 6.0 7.0 8.0]
+
+;; `(count (select {from: t where: (op col lit)}))` takes a counting fast path
+;; that compared the column with the literal's raw integer value: a float
+;; literal decoded to 0, and a DATE or TIME literal against a TIMESTAMP
+;; column compared days or milliseconds with nanoseconds.
+(set TC4 (table [i d ts] (list [1 2 3 4] [2024.01.01 2024.01.02 2024.01.03 2024.01.04] (+ 2024.01.01D00:00:00.000000000 (* (til 4) 43200000000000)))))
+(count (select {from: TC4 where: (> i 2.5)})) -- 2
+(count (select {from: TC4 where: (< i 2.5)})) -- 2
+(count (select {from: TC4 where: (== i 2.0)})) -- 1
+(count (select {from: TC4 where: (> ts 2024.01.02)})) -- 1
+(count (select {from: TC4 where: (>= ts 2024.01.02)})) -- 2
+(count (select {from: TC4 where: (> d 2024.01.02D12:00:00.000000000)})) -- 2
+(count (select {from: TC4 where: (> d 2024.01.02)})) -- 2

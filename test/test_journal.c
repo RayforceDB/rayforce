@@ -26,6 +26,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "store/journal.h"
+#include "store/fileio.h"
 #include "store/serde.h"
 #include "lang/eval.h"
 #include "lang/env.h"
@@ -134,6 +135,7 @@ static void cleanup_base(const char* base) {
     snprintf(path, sizeof(path), "%s.log",     base); unlink(path);
     snprintf(path, sizeof(path), "%s.qdb",     base); unlink(path);
     snprintf(path, sizeof(path), "%s.qdb.tmp", base); unlink(path);
+    snprintf(path, sizeof(path), "%s.lk",      base); unlink(path);
     /* Archived rolls have the form base.<stamp>.log — remove with glob via shell. */
 #if defined(_WIN32)
     snprintf(path, sizeof(path), "%s.*.log", base);   /* no POSIX shell here */
@@ -693,6 +695,41 @@ static test_result_t test_journal_open_double_open(void) {
 
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     cleanup_base(base);
+    PASS();
+}
+
+/* 3c2. A base that fits the lock path but not <base>.log (1019-1020 bytes)
+ *      fails in the append step after ray_journal_open took the lock; the
+ *      lock must not stay held by the failed open. */
+static test_result_t test_journal_open_long_base_releases_lock(void) {
+#if defined(__APPLE__) || defined(_WIN32)
+    SKIP("deep-mkdir fixture not portable (PATH_MAX / MAX_PATH)");
+#endif
+    char dir[2048];
+    const char* root = "/tmp/jrn_test_longbase";  /* 22 chars */
+    const char* comp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; /* 50 chars */
+    int off = snprintf(dir, sizeof(dir), "%s", root);
+    /* 22 + 19 * 51 = 991; a 27-char leaf makes the base 1019 bytes. */
+    for (int i = 0; i < 19; i++) off += snprintf(dir + off, sizeof(dir) - (size_t)off, "/%s", comp);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char base[2048];
+    int blen = snprintf(base, sizeof(base), "%s/bbbbbbbbbbbbbbbbbbbbbbbbbbb", dir);
+    TEST_ASSERT_EQ_I(blen, 1019);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+
+    /* flock is per open file description: a second fd in this process
+     * gets EWOULDBLOCK while the failed open still holds the lock. */
+    char lk[2064];
+    snprintf(lk, sizeof(lk), "%s.lk", base);
+    ray_fd_t fd = ray_file_open(lk, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    TEST_ASSERT_TRUE(fd != RAY_FD_INVALID);
+    ray_err_t le = ray_file_trylock_ex(fd);
+    (void)ray_file_unlock(fd);
+    ray_file_close(fd);
+    (void)ray_test_rm_rf(root);
+    TEST_ASSERT_EQ_I(le, RAY_OK);
     PASS();
 }
 
@@ -2407,6 +2444,195 @@ static test_result_t test_journal_purge_after_close(void) {
     PASS();
 }
 
+/* L1-L3 (#687): one writer per journal base.  The lock is an exclusive
+ * flock on <base>.lk; a second open file description (as another process
+ * would have) cannot take it while the journal is open, through a roll,
+ * and is refused by open and purge while someone else holds it. */
+#if !defined(_WIN32)
+#include <sys/file.h>
+/* Whether another holder could take the lock on <base>.lk right now. */
+static int jrn_lock_free(const char* base) {
+    char path[300];
+    snprintf(path, sizeof(path), "%s.lk", base);
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+    int ok = flock(fd, LOCK_EX | LOCK_NB) == 0;
+    close(fd);
+    return ok;
+}
+#endif
+
+static test_result_t test_journal_lock_held_while_open(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_held");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 0);
+    TEST_ASSERT_EQ_I(ray_journal_roll(), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 0);          /* a roll keeps it */
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 1);
+    TEST_ASSERT_EQ_I(ray_journal_open_append(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
+static test_result_t test_journal_lock_refuses_second_opener(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_refuse");
+    char path[300]; snprintf(path, sizeof(path), "%s.lk", base);
+    int other = open(path, O_RDWR | O_CREAT, 0644);
+    TEST_ASSERT_TRUE(other >= 0);
+    TEST_ASSERT_EQ_I(flock(other, LOCK_EX | LOCK_NB), 0);   /* "another process" */
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_IO);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    TEST_ASSERT_EQ_I(ray_journal_open_append(base, RAY_JOURNAL_ASYNC), RAY_ERR_IO);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    close(other);                                            /* releases it */
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
+static test_result_t test_journal_purge_refused_while_locked(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_purge");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(7));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    char path[300]; snprintf(path, sizeof(path), "%s.lk", base);
+    int other = open(path, O_RDWR | O_CREAT, 0644);
+    TEST_ASSERT_TRUE(other >= 0);
+    TEST_ASSERT_EQ_I(flock(other, LOCK_EX | LOCK_NB), 0);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_ERR_IO);       /* someone writes it */
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), 0);
+    close(other);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), -1);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base), 1);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
+#if !defined(_WIN32)
+/* A base inside a fresh directory, so a test can remove the directory. */
+static void make_dir_base(char* dir, size_t dsz, char* base, size_t bsz, const char* prefix) {
+    snprintf(dir, dsz, "/tmp/jrn_test_%s_XXXXXX", prefix);
+    if (!mkdtemp(dir)) dir[0] = '\0';
+    snprintf(base, bsz, "%s/base", dir);
+}
+
+static void remove_dir_base(const char* dir, const char* base) {
+    cleanup_base(base);
+    rmdir(dir);
+}
+#endif
+
+/* A roll that cannot reopen its log keeps the lock of its base; opening
+ * another base then takes that base's lock instead of reusing the old one. */
+static test_result_t test_journal_lock_follows_base(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char dir[256], base1[300];
+    make_dir_base(dir, sizeof(dir), base1, sizeof(base1), "lock_base");
+    TEST_ASSERT_TRUE(dir[0] != '\0');
+    TEST_ASSERT_EQ_I(ray_journal_open(base1, RAY_JOURNAL_ASYNC), RAY_OK);
+    remove_dir_base(dir, base1);
+    TEST_ASSERT_TRUE(ray_journal_roll() != RAY_OK);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    char base2[256]; make_base(base2, sizeof(base2), "lock_base2");
+    TEST_ASSERT_EQ_I(ray_journal_open(base2, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base2), 0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_EQ_I(jrn_lock_free(base2), 1);
+    cleanup_base(base2);
+    PASS();
+#endif
+}
+
+/* The lock fd is close-on-exec: a program started with .sys.exec must not
+ * keep the journal locked after this process exits. */
+static test_result_t test_journal_lock_not_inherited(void) {
+#if !defined(__linux__)
+    SKIP("reads /proc/self/fd");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_exec");
+    char lk[300]; snprintf(lk, sizeof(lk), "%s.lk", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    int found = 0, cloexec = 0;
+    for (int fd = 3; fd < 1024; fd++) {
+        char link[64], target[400];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = '\0';
+        if (strcmp(target, lk) != 0) continue;
+        found = 1;
+        cloexec = (fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0;
+    }
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    TEST_ASSERT_EQ_I(found, 1);
+    TEST_ASSERT_EQ_I(cloexec, 1);
+    PASS();
+#endif
+}
+
+/* A lock file this process cannot write (another user's) still guards the
+ * journal: purge is refused while its holder has it locked. */
+static test_result_t test_journal_purge_refused_readonly_lock(void) {
+#if defined(_WIN32)
+    SKIP("flock probe is POSIX-only");
+#else
+    char base[256]; make_base(base, sizeof(base), "lock_ro");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(7));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    char path[300]; snprintf(path, sizeof(path), "%s.lk", base);
+    TEST_ASSERT_EQ_I(chmod(path, 0444), 0);
+    int other = open(path, O_RDONLY);
+    TEST_ASSERT_TRUE(other >= 0);
+    TEST_ASSERT_EQ_I(flock(other, LOCK_EX | LOCK_NB), 0);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), 0);
+    close(other);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), -1);
+    cleanup_base(base);
+    PASS();
+#endif
+}
+
+/* Purge stays best-effort when the journal's directory is gone. */
+static test_result_t test_journal_purge_without_dir(void) {
+#if defined(_WIN32)
+    SKIP("POSIX directory fixture");
+#else
+    char dir[256], base[300];
+    make_dir_base(dir, sizeof(dir), base, sizeof(base), "purge_nodir");
+    TEST_ASSERT_TRUE(dir[0] != '\0');
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    remove_dir_base(dir, base);
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    PASS();
+#endif
+}
+
 /* P3. ops wrapper: (.log.purge) returns null on success and a `domain`
  * error when no journal base is known. */
 static test_result_t test_journal_purge_ops_wrapper(void) {
@@ -2462,6 +2688,7 @@ const test_entry_t journal_entries[] = {
     { "journal/open_close_basic",          test_journal_open_close_basic,          jrn_setup, jrn_teardown },
     { "journal/open_bad_base",             test_journal_open_bad_base,             jrn_setup, jrn_teardown },
     { "journal/open_double_open",          test_journal_open_double_open,          jrn_setup, jrn_teardown },
+    { "journal/open_long_base_releases_lock", test_journal_open_long_base_releases_lock, jrn_setup, jrn_teardown },
     { "journal/open_replays_existing_log", test_journal_open_replays_existing_log, jrn_setup, jrn_teardown },
     { "journal/open_badtail_log",          test_journal_open_badtail_log,          jrn_setup, jrn_teardown },
     /* Write bytes */
@@ -2536,6 +2763,14 @@ const test_entry_t journal_entries[] = {
     { "journal/purge_full",                test_journal_purge_full,                jrn_setup, jrn_teardown },
     { "journal/purge_after_close",         test_journal_purge_after_close,         jrn_setup, jrn_teardown },
     { "journal/purge_ops_wrapper",         test_journal_purge_ops_wrapper,         jrn_setup, jrn_teardown },
+    /* #687: one writer per journal base */
+    { "journal/lock_held_while_open",      test_journal_lock_held_while_open,      jrn_setup, jrn_teardown },
+    { "journal/lock_refuses_second_opener", test_journal_lock_refuses_second_opener, jrn_setup, jrn_teardown },
+    { "journal/purge_refused_while_locked", test_journal_purge_refused_while_locked, jrn_setup, jrn_teardown },
+    { "journal/lock_follows_base",          test_journal_lock_follows_base,          jrn_setup, jrn_teardown },
+    { "journal/lock_not_inherited",         test_journal_lock_not_inherited,         jrn_setup, jrn_teardown },
+    { "journal/purge_without_dir",          test_journal_purge_without_dir,          jrn_setup, jrn_teardown },
+    { "journal/purge_refused_readonly_lock", test_journal_purge_refused_readonly_lock, jrn_setup, jrn_teardown },
     /* #420: snapshot/roll crash window must not double-apply */
     { "journal/crash_window_no_double_apply", test_journal_crash_window_no_double_apply, jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },

@@ -479,12 +479,112 @@ ray_op_t* ray_cast(ray_graph_t* g, ray_op_t* a, int8_t target_type) {
  * Binary element-wise ops
  * -------------------------------------------------------------------------- */
 
-/* Generic binary op constructor — opcode-driven, no switch/case needed by caller */
+/* DATE, TIME and TIMESTAMP compare on one nanosecond scale, as the eval path
+ * does (temporal_as_ns): a DATE lane holds days, a TIME milliseconds, a
+ * TIMESTAMP nanoseconds, and the comparison kernels compare raw lane values.
+ * When the two sides are different temporal types and one is a literal, the
+ * literal is rewritten in the other side's units: exactly for a TIMESTAMP
+ * side, rounded as the operator needs for a DATE or TIME side
+ * (x*u > L <=> x > floor(L/u), x*u >= L <=> x >= ceil(L/u), ...), clamped to
+ * the lane.  The column keeps its own units, so its fast paths, index routing
+ * and partition pruning still apply, and no cell is scaled (a DATE far from
+ * 2000 overflows nanoseconds).  An equality the column's units cannot express
+ * holds for no row (`!=` for every row), and is written as a comparison with
+ * the lane's maximum that has that answer.  Two non-literal sides are
+ * declined, and the caller falls back to the eval path. */
+static int8_t cmp_temporal_type(ray_graph_t* g, ray_op_t* x) {
+    int8_t t = x->out_type;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    if (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP) return t;
+    /* A date-partitioned table's key scans as MAPCOMMON over DATE values. */
+    if (t == RAY_MAPCOMMON && x->opcode == OP_SCAN && g->table) {
+        ray_op_ext_t* ext = find_ext(g, x->id);
+        ray_t* col = ext ? ray_table_get_col(g->table, ext->sym) : NULL;
+        if (col && col->type == RAY_MAPCOMMON && col->attrs == RAY_MC_DATE)
+            return RAY_DATE;
+    }
+    return 0;
+}
+
+static int64_t cmp_temporal_unit(int8_t t) {
+    return t == RAY_DATE ? 86400000000000LL : t == RAY_TIME ? 1000000LL : 1;
+}
+
+/* The temporal atom of a literal node, or NULL. */
+static ray_t* cmp_temporal_literal_of(ray_graph_t* g, ray_op_t* x) {
+    if (x->opcode != OP_CONST) return NULL;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    ray_t* lit = ext ? ext->literal : NULL;
+    if (!lit || !ray_is_atom(lit)) return NULL;
+    return (lit->type == -RAY_DATE || lit->type == -RAY_TIME ||
+            lit->type == -RAY_TIMESTAMP) ? lit : NULL;
+}
+
+/* `lit` as a literal of type `ct` for `col *op lit`.  A null literal becomes
+ * ct's null.  An `==` / `!=` that ct's units cannot express turns *op into
+ * `>` / `<=` against ct's largest value: false, resp. true, for every row. */
+static ray_t* cmp_temporal_rewrite(ray_t* lit, int8_t ct, uint16_t* op) {
+    uint16_t opcode = *op;
+    if (RAY_ATOM_IS_NULL(lit)) return ray_typed_null((int8_t)-ct);
+    int8_t lt = (int8_t)-lit->type;
+    int64_t v = lt == RAY_TIMESTAMP ? lit->i64 : (int64_t)lit->i32;
+    int64_t ns;
+    if (__builtin_mul_overflow(v, cmp_temporal_unit(lt), &ns))
+        ns = v < 0 ? INT64_MIN + 1 : INT64_MAX;          /* saturate */
+    if (ns == INT64_MIN) ns = INT64_MIN + 1;               /* not the null sentinel */
+    int64_t u = cmp_temporal_unit(ct);
+    int64_t q = ns / u, r = ns % u;
+    if (r != 0) {
+        switch (opcode) {
+        case OP_GT: case OP_LE: if (r < 0) q--; break;       /* floor */
+        case OP_GE: case OP_LT: if (r > 0) q++; break;       /* ceiling */
+        default:                                           /* ==, != between units */
+            *op = opcode == OP_EQ ? OP_GT : OP_LE;
+            return ct == RAY_DATE ? ray_date(INT32_MAX) : ray_time(INT32_MAX);
+        }
+    }
+    if (ct == RAY_TIMESTAMP) return ray_timestamp(q);
+    if (q > INT32_MAX) q = INT32_MAX;
+    if (q < (int64_t)INT32_MIN + 1) q = (int64_t)INT32_MIN + 1;
+    return ct == RAY_DATE ? ray_date(q) : ray_time(q);
+}
+
+static uint16_t cmp_flip(uint16_t opcode) {
+    switch (opcode) {
+    case OP_LT: return OP_GT;
+    case OP_LE: return OP_GE;
+    case OP_GT: return OP_LT;
+    case OP_GE: return OP_LE;
+    default:    return opcode;
+    }
+}
+
+static ray_op_t* make_cmp(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
+    int8_t ta = cmp_temporal_type(g, a);
+    int8_t tb = cmp_temporal_type(g, b);
+    if (!ta || !tb || ta == tb) return make_binary(g, opcode, a, b, RAY_BOOL);
+    uint32_t a_id = a->id, b_id = b->id;
+    ray_t* bl = cmp_temporal_literal_of(g, b);
+    ray_t* al = bl ? NULL : cmp_temporal_literal_of(g, a);
+    if (!bl && !al) return NULL;
+    /* Rewrite in `col OP lit` orientation; a literal on the left flips. */
+    uint16_t op = bl ? opcode : cmp_flip(opcode);
+    ray_t* nl = cmp_temporal_rewrite(bl ? bl : al, bl ? ta : tb, &op);
+    if (!nl || RAY_IS_ERR(nl)) return NULL;
+    ray_op_t* c = ray_const_atom(g, nl);
+    ray_release(nl);
+    if (!c) return NULL;
+    return bl ? make_binary(g, op, &g->nodes[a_id], c, RAY_BOOL)
+              : make_binary(g, cmp_flip(op), c, &g->nodes[b_id], RAY_BOOL);
+}
+
 ray_op_t* ray_binop(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
     int8_t out;
     switch (opcode) {
     case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
-    case OP_GT: case OP_GE: case OP_AND: case OP_OR:
+    case OP_GT: case OP_GE:
+        return make_cmp(g, opcode, a, b);
+    case OP_AND: case OP_OR:
         out = RAY_BOOL; break;
     case OP_DIV: case OP_POW:
         out = RAY_F64; break;
@@ -502,12 +602,12 @@ ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binar
 ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MOD, a, b, promote(a->out_type, b->out_type)); }
 ray_op_t* ray_pow_op(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_POW, a, b, RAY_F64); }
 
-ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_EQ, a, b, RAY_BOOL); }
-ray_op_t* ray_ne(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_NE, a, b, RAY_BOOL); }
-ray_op_t* ray_lt(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_LT, a, b, RAY_BOOL); }
-ray_op_t* ray_le(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_LE, a, b, RAY_BOOL); }
-ray_op_t* ray_gt(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_GT, a, b, RAY_BOOL); }
-ray_op_t* ray_ge(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_GE, a, b, RAY_BOOL); }
+ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_EQ, a, b); }
+ray_op_t* ray_ne(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_NE, a, b); }
+ray_op_t* ray_lt(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_LT, a, b); }
+ray_op_t* ray_le(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_LE, a, b); }
+ray_op_t* ray_gt(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_GT, a, b); }
+ray_op_t* ray_ge(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_GE, a, b); }
 ray_op_t* ray_and(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return make_binary(g, OP_AND, a, b, RAY_BOOL); }
 ray_op_t* ray_or(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_OR, a, b, RAY_BOOL); }
 ray_op_t* ray_min2(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return make_binary(g, OP_MIN2, a, b, promote(a->out_type, b->out_type)); }
@@ -523,12 +623,35 @@ static bool if_branch_is_list_scan(ray_graph_t* g, ray_op_t* b) {
     return col && col->type == RAY_LIST;
 }
 
+/* Is node `id` a bare null atom literal (`0N`, `0Nf`, `0Ni`, ...)? */
+static bool if_const_null_atom(ray_graph_t* g, uint32_t id) {
+    ray_op_t* b = &g->nodes[id];
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* bx = find_ext(g, id);
+    return bx && bx->literal && ray_is_atom(bx->literal) &&
+           RAY_ATOM_IS_NULL(bx->literal);
+}
+
 ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* else_val) {
     /* 3-input node: cond, then, else — needs ext node */
     uint32_t cond_id = cond->id;
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
-    int8_t out_type = promote_if_type(then_val->out_type, else_val->out_type);
+    int8_t tt = then_val->out_type;
+    int8_t et = else_val->out_type;
+    int8_t out_type = promote_if_type(tt, et);
+    /* A temporal branch beside a null literal keeps the temporal type
+     * (#673): `(if c d 0N)` is a DATE column with nulls, not the I64 that
+     * promote() makes of DATE + I64, and `(if c ts 0Nd)` a TIMESTAMP one,
+     * not the I64 the two widths fold to.  Same rule as the text null
+     * below: the literal is then swapped for the typed null.  A non-null
+     * value beside a temporal still promotes, as before. */
+    if (type_is_temporal(tt) && et != tt && et != RAY_STR && et != RAY_SYM &&
+        et != RAY_GUID && if_const_null_atom(g, else_id))
+        out_type = tt;
+    else if (type_is_temporal(et) && tt != et && tt != RAY_STR && tt != RAY_SYM &&
+             tt != RAY_GUID && if_const_null_atom(g, then_id))
+        out_type = et;
     if (out_type < 0) return NULL;
     /* A LIST column scans as the untyped node (out_type 0), which promote()
      * also folds to BOOL and the fill then reads the cell pointers as bytes.
@@ -545,17 +668,19 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     /* A null literal such as `0N` or `0Nf` beside a text branch is the text
      * null.  Left as a number, the fills wrote its payload as a symbol id
      * (NaN bits for 0Nf, INT64_MIN for 0N): a crash, or a symbol that is
-     * not null.  Swap it for the text null of the result type. */
-    if (out_type == RAY_STR || out_type == RAY_SYM) {
+     * not null.  Swap it for the text null of the result type.  Beside a
+     * temporal branch it is the temporal null the same way: the fills read
+     * a DATE/TIME null from i32 and a TIMESTAMP null from i64, so the
+     * literal must carry the result's own sentinel. */
+    bool text_out = out_type == RAY_STR || out_type == RAY_SYM;
+    if (text_out || type_is_temporal(out_type)) {
         for (int side = 0; side < 2; side++) {
             uint32_t bid = side ? else_id : then_id;
             ray_op_t* b = &g->nodes[bid];
-            if (b->opcode != OP_CONST || b->out_type == RAY_STR || b->out_type == RAY_SYM)
+            if (b->out_type == out_type ||
+                (text_out && (b->out_type == RAY_STR || b->out_type == RAY_SYM)))
                 continue;
-            ray_op_ext_t* bx = find_ext(g, bid);
-            if (!bx || !bx->literal || !ray_is_atom(bx->literal) ||
-                !RAY_ATOM_IS_NULL(bx->literal))
-                continue;
+            if (!if_const_null_atom(g, bid)) continue;
             ray_t* tn = ray_typed_null((int8_t)-out_type);
             if (!tn || RAY_IS_ERR(tn)) return NULL;
             ray_op_t* nc = ray_const_atom(g, tn);
