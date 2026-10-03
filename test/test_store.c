@@ -1954,6 +1954,52 @@ static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
     PASS();
 }
 
+/* An index region that cannot be written (ENOSPC/EFBIG) is dropped: close
+ * cuts the file back to the payload and publishes the column without the
+ * index.  Everything runs in the forked child so no FILE* state is shared
+ * with the parent; the child exits 0 only if close returned RAY_OK. */
+static test_result_t test_stream_index_write_failure_drops_index(void) {
+#ifdef RAY_OS_LINUX
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-enospc-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 70000;
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = i * 3;     /* clustered, no nulls */
+    v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    char path[200]; snprintf(path, sizeof(path), "%s/c", dir);
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        ray_col_stream_t w;
+        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL) != RAY_OK) _exit(2);
+        if (ray_col_stream_index_begin(&w, 0) != RAY_OK) _exit(2);
+        if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)(32 + n * 8 + 40);
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(ray_col_stream_close(&w, false) == RAY_OK ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, 32 + n * 8);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(back))[n - 1], (n - 1) * 3);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
 /* Exactly 65536 rows: one chunk, a zone, never a hash candidate. */
 static test_result_t test_stream_inline_zone_one_chunk(void) {
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-one-%d", (int)getpid());
@@ -6071,6 +6117,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
+    { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },

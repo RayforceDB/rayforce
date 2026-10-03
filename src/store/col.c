@@ -702,7 +702,7 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
  * Used by the streaming .csv.splayed builder, which writes raw columns first.
  * `col_len`/`col_type` describe the on-disk column (payload = 32 + len*esz). */
 /* Cut a column file back to `len` bytes: undoes a partial index append. */
-static bool col_truncate(FILE* f, int64_t len) {
+bool ray_col_truncate(FILE* f, int64_t len) {
     if (fflush(f) != 0) return false;
 #ifdef RAY_OS_WINDOWS
     return _chsize_s(_fileno(f), len) == 0;
@@ -765,7 +765,7 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     /* Without the marker the loader requires the exact payload length, hence
      * the rollback. Best effort: the marker was never written, so restoring the length is
      * all it takes; a payload_end of 0 means the region never started. */
-    if (payload_end) (void)col_truncate(f, payload_end);
+    if (payload_end) (void)ray_col_truncate(f, payload_end);
     fclose(f);
     return err;
 }

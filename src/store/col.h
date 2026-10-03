@@ -123,6 +123,9 @@ ray_err_t ray_col_append_index(const char* path, const void* ix,
  * ray_col_stamp_index or rolls the file back on error. */
 ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload_end_out);
 
+/* Flush f and cut it to `len` bytes: undoes a partial index region. */
+bool ray_col_truncate(FILE* f, int64_t len);
+
 /* Put the "index present" marker into a 32-byte header image. */
 void      ray_col_stamp_index(ray_t* hdr);
 

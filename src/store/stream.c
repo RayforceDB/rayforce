@@ -265,8 +265,16 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
                 ray_csv_hash_upgrade_check(w->type, w->rows, ix)) {
                 w->index = idx; w->wants_hash = true;
             } else {
-                err = ray_col_write_index_region(w->fp, ix, NULL);
-                inline_index = err == RAY_OK;
+                int64_t payload_end = 0;
+                ray_err_t ierr = ray_col_write_index_region(w->fp, ix, &payload_end);
+                inline_index = ierr == RAY_OK;
+                /* The index is a best-effort accelerator: when its region
+                 * cannot be written, cut the file back to the payload and
+                 * publish the column without it.  Only a failed cut is an
+                 * error, since the file would then be unloadable. */
+                if (ierr != RAY_OK && payload_end > 0 &&
+                    !ray_col_truncate(w->fp, payload_end))
+                    err = RAY_ERR_IO;
                 ray_release(idx);
             }
         }
