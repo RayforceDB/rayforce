@@ -77,7 +77,8 @@ ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
  * inline in the stream writer.  Best-effort, per numeric column. */
 void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
 /* Append a hash index to the column file at path, using its kept chunk zone
- * (Task 5 deliverable). */
+ * Re-reads the column file, appends a hash, and falls back to appending
+ * `zone` when no hash results. The caller keeps ownership of zone. Best effort. */
 ray_err_t ray_splay_hash_column(const char* path, ray_t* zone);
 
 /* Loader accepting a shared FILE domain. It resolves the generation first,

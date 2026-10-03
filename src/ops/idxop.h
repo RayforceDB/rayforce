@@ -297,6 +297,7 @@ bool      ray_zone_acc_supported(int8_t type);
 /* Start accumulating rows of `type` from global row `start_row`. */
 ray_err_t ray_zone_acc_init(ray_zone_acc_t* a, int8_t type, int64_t start_row);
 /* Rows [next_row, next_row + v->len) are v; v->type must equal a->type. */
+/* A non-OK return (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
 ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v);
 /* dst += src, chunk by chunk; both must have the same type. src is untouched. */
 ray_err_t ray_zone_acc_merge(ray_zone_acc_t* dst, const ray_zone_acc_t* src);
@@ -362,7 +363,8 @@ typedef struct {
 } ray_dict_acc_t;
 ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
 /* Appends every row of STR vector v. Past the cap it frees itself,
- * sets dead and returns RAY_OK; further adds are no-ops. */
+ * sets dead and returns RAY_OK; further adds are no-ops. A non-OK return
+ * (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
 ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);
 /* The standalone RAY_IDX_DICT for a column of `len` rows, identical to
  * ray_index_dict_compute; NULL when dead or len < 65536. Frees `a`. */

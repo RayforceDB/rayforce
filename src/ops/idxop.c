@@ -28,8 +28,6 @@
 #include "vec/vec.h"
 #include "table/table.h"
 #include "table/sym.h"
-#include <math.h>
-#include <stdint.h>
 #include "lang/eval.h"
 #include "ops/ops.h"
 #include "ops/rowsel.h"

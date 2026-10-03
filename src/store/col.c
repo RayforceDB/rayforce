@@ -693,7 +693,11 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
  * ray_col_save -- write a vector to a column file
  * -------------------------------------------------------------------------- */
 
-/* Append an inline index region to an EXISTING column file (no data rewrite):
+/* Rationale: the region goes at the real payload end (STR includes its pool,
+ * so never recompute from len*esz); the marker is stamped LAST so a torn
+ * append never looks indexed; the flush is not an fsync because the index is
+ * a rebuildable accelerator.
+ * Append an inline index region to an EXISTING column file (no data rewrite):
  * pad the payload to 32, write the region, then stamp the aux[0..3] marker.
  * Used by the streaming .csv.splayed builder, which writes raw columns first.
  * `col_len`/`col_type` describe the on-disk column (payload = 32 + len*esz). */
@@ -758,7 +762,8 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
         }
     }
     if (err == RAY_OK) return fclose(f) == 0 ? RAY_OK : RAY_ERR_IO;
-    /* Best effort: the marker was never written, so restoring the length is
+    /* Without the marker the loader requires the exact payload length, hence
+     * the rollback. Best effort: the marker was never written, so restoring the length is
      * all it takes; a payload_end of 0 means the region never started. */
     if (payload_end) (void)col_truncate(f, payload_end);
     fclose(f);

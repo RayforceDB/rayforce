@@ -33,7 +33,9 @@ typedef struct {
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
-    ray_t*  index;          /* after close: the zone kept for a hash candidate */
+    ray_t*  index;          /* after close: the zone kept for a hash candidate;
+                             * the caller releases it AND sets it to NULL, or
+                             * must not call abort afterwards */
     bool    wants_hash;     /* after close: build a hash by re-reading the file */
 } ray_col_stream_t;
 
@@ -44,6 +46,8 @@ ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row);
 /* Fold src's zone into dst's (parallel Parquet tasks). Frees src's zone. */
 ray_err_t ray_col_stream_index_merge(ray_col_stream_t* dst, ray_col_stream_t* src);
+/* On error only ray_col_stream_abort is valid (payload bytes were written
+ * before the index feed). */
 ray_err_t ray_col_stream_append(ray_col_stream_t* w, ray_t* column);
 ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable);
 void ray_col_stream_abort(ray_col_stream_t* w);

@@ -81,8 +81,10 @@ Parquet converters build each column's chunk zone or string dictionary from
 the rows as they are streamed and write it with the column, so a conversion
 does not read its own output back; only integer columns whose zone qualifies
 for a hash index are re-read, one column at a time, to build it. A string
-column whose distinct values exceed 1<<20, or exceed half its rows, gets no
-dictionary. Writers to the
+column gets no dictionary when it has more than 1<<20 distinct values, or,
+once 65536 rows have been written, more distinct values than half the rows
+written so far (checked after each streamed chunk). `.db.splayed.set` of a
+resident table keeps building the uncapped dictionary. Writers to the
 same table serialize on `.write.lock`; readers resolve the manifest once and
 continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
