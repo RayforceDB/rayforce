@@ -35,6 +35,7 @@
 #include "table/table.h"
 #include "table/domain.h"
 #include "ops/idxop.h"
+#include "core/profile.h"
 #include "io/csv.h"      /* ray_csv_hash_upgrade_check — shared index policy */
 #include "vec/str.h"
 #include "lang/format.h"
@@ -1275,12 +1276,23 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
 
 ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
     if (!path) return RAY_ERR_DOMAIN;
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
+    int64_t t0 = trace ? ray_profile_now_ns() : 0;
     ray_t* col = ray_col_mmap(path);
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
     ray_err_t err = RAY_ERR_IO;
+    int64_t t1 = trace ? ray_profile_now_ns() : 0;
     ray_t* hi = ray_idx_hash_fn(col);
+    int64_t t2 = trace ? ray_profile_now_ns() : 0;
     if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
         err = ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
+        if (trace) {
+            const ray_index_t* hx = ray_index_payload(hi->index);
+            fprintf(stderr, "csv.splayed: hash file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
+                            " mmap=%.1fms build=%.1fms write=%.1fms\n",
+                    path, hi->len, hx->u.hash.n_keys, hx->u.hash.n_groups,
+                    (double)(t1 - t0) / 1e6, (double)(t2 - t1) / 1e6, (double)(ray_profile_now_ns() - t2) / 1e6);
+        }
         ray_release(hi);
     } else if (hi) {
         if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi);

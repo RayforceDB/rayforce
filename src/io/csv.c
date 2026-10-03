@@ -42,6 +42,7 @@
 #include "mem/sys.h"
 #include "core/numparse.h"
 #include "core/pool.h"
+#include "core/profile.h"   /* ray_profile_now_ns: RAY_CSV_TRACE phase stamps */
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "lang/format.h"
 #include "ops/hash.h"
@@ -3626,6 +3627,7 @@ typedef struct {
     ray_t*   tbl;
     int      ncols;
     _Atomic(ray_err_t) err;
+    int64_t* col_ns;    /* RAY_CSV_TRACE: per-column append time, or NULL */
 } csv_splayed_append_ctx_t;
 
 static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -3633,7 +3635,9 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
     if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
     ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
+    int64_t tt0 = a->col_ns ? ray_profile_now_ns() : 0;
     ray_err_t e = ray_col_stream_append(&a->writers[start], col);
+    if (a->col_ns) a->col_ns[start] += ray_profile_now_ns() - tt0;
     if (e != RAY_OK) {
         ray_err_t ok = RAY_OK;
         atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
@@ -3648,6 +3652,13 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
+    /* RAY_CSV_TRACE: phase timings to stderr, as csv.parted prints them. */
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    int64_t tr_t0 = ray_profile_now_ns();
+    int64_t tr_scan = 0, tr_parse = 0, tr_append = 0, tr_chunks = 0;
+    int64_t tr_col_ns[CSV_MAX_COLS];
+    memset(tr_col_ns, 0, sizeof(tr_col_ns));
+#define TR_MS(ns) ((double)(ns) / 1e6)
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return RAY_ERR_IO;
@@ -3836,11 +3847,13 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     size_t chunk_offset = data_offset;
     bool wrote_any = false;
     size_t avg_row_bytes = 64;   /* refined from every chunk scanned */
+    int64_t tr_setup = ray_profile_now_ns() - tr_t0;
     while (chunk_offset < file_size || !wrote_any) {
         ray_t* row_offsets_hdr = NULL;
         int64_t* row_offsets = NULL;
         size_t next_offset = chunk_offset;
         int64_t cnt = 0;
+        int64_t tr_c0 = ray_profile_now_ns();
         if (chunk_offset < file_size) {
             /* Parallel scan over a byte window sized from the rows seen so
              * far; the serial walk remains the fallback and the semantics. */
@@ -3863,6 +3876,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             }
         }
 
+        int64_t tr_c1 = ray_profile_now_ns();
         ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
                                           cnt, ncols, delimiter, col_name_ids,
                                           resolved_types, sym_dom);
@@ -3873,6 +3887,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             if (tbl) ray_release(tbl);
             break;
         }
+        int64_t tr_c2 = ray_profile_now_ns();
 
         /* One task per column: each writer owns its file, its cache and
          * its symfile domain (the domain probe takes the domain lock, the
@@ -3880,7 +3895,8 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
          * encoded and written side by side. */
         {
             csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
-                                              .ncols = ncols, .err = RAY_OK };
+                                              .ncols = ncols, .err = RAY_OK,
+                                              .col_ns = trace ? tr_col_ns : NULL };
             ray_pool_t* wpool = ray_pool_get();
             if (ray_pool_par_dispatch_ok(wpool, ncols, 2))
                 ray_pool_dispatch_n(wpool, csv_splayed_append_task, &actx, (uint32_t)ncols);
@@ -3889,6 +3905,11 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             err = actx.err;
         }
         ray_release(tbl);
+        int64_t tr_c3 = ray_profile_now_ns();
+        tr_scan += tr_c1 - tr_c0; tr_parse += tr_c2 - tr_c1; tr_append += tr_c3 - tr_c2; tr_chunks++;
+        if (trace)
+            fprintf(stderr, "csv.splayed: chunk=%" PRId64 " rows=%" PRId64 " scan=%.1fms parse=%.1fms append=%.1fms\n",
+                    tr_chunks, cnt, TR_MS(tr_c1 - tr_c0), TR_MS(tr_c2 - tr_c1), TR_MS(tr_c3 - tr_c2));
         if (err != RAY_OK) break;
         wrote_any = true;
         /* The chunk's bytes are done with: drop them from the mapping so a
@@ -3906,28 +3927,67 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     /* Flush the symfile BEFORE committing column files (writer_close
      * renames tmp → final): columns must never reference positions the
      * symfile doesn't persist (sym-first crash ordering). */
+    int64_t tr_loop_end = ray_profile_now_ns();
+    if (trace) {
+        fprintf(stderr, "csv.splayed: file=%s ncols=%d chunks=%" PRId64 " setup=%.1fms scan=%.1fms parse=%.1fms append=%.1fms loop=%.1fms\n",
+                path, ncols, tr_chunks, TR_MS(tr_setup), TR_MS(tr_scan), TR_MS(tr_parse), TR_MS(tr_append),
+                TR_MS(tr_loop_end - tr_t0 - tr_setup));
+        /* the three columns whose append tasks took the longest in total:
+         * the critical path of every chunk's column dispatch */
+        for (int k = 0; k < 3 && k < ncols; k++) {
+            int best = -1;
+            for (int c = 0; c < ncols; c++)
+                if (tr_col_ns[c] > 0 && (best < 0 || tr_col_ns[c] > tr_col_ns[best])) best = c;
+            if (best < 0) break;
+            ray_t* na = ray_sym_str(col_name_ids[best]);
+            fprintf(stderr, "csv.splayed: append_top%d col=%s type=%d total=%.1fms\n", k + 1,
+                    na ? ray_str_ptr(na) : "?", (int)resolved_types[best], TR_MS(tr_col_ns[best]));
+            tr_col_ns[best] = -tr_col_ns[best];
+        }
+    }
     if (err == RAY_OK && sym_dom) {
         err = ray_sym_domain_flush(sym_dom, false);
     }
+    int64_t tr_flush_end = ray_profile_now_ns();
+    if (trace) fprintf(stderr, "csv.splayed: symfile_flush=%.1fms\n", TR_MS(tr_flush_end - tr_loop_end));
 
-    for (int c = 0; c < ncols; c++) {
-        ray_err_t cerr = (err == RAY_OK) ? ray_col_stream_close(&writers[c],false)
-                                         : RAY_ERR_IO;
-        if (err == RAY_OK && cerr != RAY_OK) err = cerr;
-        if (err != RAY_OK) ray_col_stream_abort(&writers[c]);
+    /* Every column finishes as a pool task (STR pool merge, dictionary /
+     * zone finish, index region, header, fclose), then the renames run
+     * serially in column order; a failed finish publishes nothing. */
+    memset(tr_col_ns, 0, sizeof(tr_col_ns));
+    if (err == RAY_OK) err = ray_col_stream_close_all(writers, ncols, false, trace ? tr_col_ns : NULL);
+    else for (int c = 0; c < ncols; c++) ray_col_stream_abort(&writers[c]);
+    int64_t tr_close_end = ray_profile_now_ns();
+    if (trace) {
+        int64_t mx = 0; int mxc = -1;
+        for (int c = 0; c < ncols; c++) if (tr_col_ns[c] > mx) { mx = tr_col_ns[c]; mxc = c; }
+        ray_t* na = mxc >= 0 ? ray_sym_str(col_name_ids[mxc]) : NULL;
+        fprintf(stderr, "csv.splayed: finish+publish=%.1fms longest_finish=%s %.1fms\n",
+                TR_MS(tr_close_end - tr_flush_end),
+                na ? ray_str_ptr(na) : "-", TR_MS(mx));
     }
 
     /* The domain was flushed before the closes and .d names columns through
      * the global symbol table, so drop its tables before the hash re-read. */
     if (sym_dom) { ray_sym_domain_release(sym_dom); sym_dom = NULL; }
+    int64_t tr_rel_end = ray_profile_now_ns();
+    if (trace) fprintf(stderr, "csv.splayed: domain_release=%.1fms\n", TR_MS(tr_rel_end - tr_close_end));
 
-    /* Columns whose zone asked for a hash: the only files read back. The
-     * hash builds run one after another, each parallel inside, before .d
-     * so an in-place first write never publishes a half-appended region. */
-    for (int c = 0; c < ncols; c++) {
-        if (err == RAY_OK && writers[c].wants_hash)
-            (void)ray_splay_hash_column(writers[c].path, writers[c].index);   /* best effort */
+    /* Columns whose zone asked for a hash: the only files read back, before
+     * .d so an in-place first write never publishes a half-appended region. */
+    memset(tr_col_ns, 0, sizeof(tr_col_ns));
+    if (err == RAY_OK) ray_col_stream_hash_all(writers, ncols, trace ? tr_col_ns : NULL);
+    for (int c = 0; c < ncols; c++)
         if (writers[c].index) { ray_release(writers[c].index); writers[c].index = NULL; }
+    int64_t tr_hash_end = ray_profile_now_ns();
+    if (trace) {
+        for (int c = 0; c < ncols; c++) {
+            if (!tr_col_ns[c]) continue;
+            ray_t* na = ray_sym_str(col_name_ids[c]);
+            fprintf(stderr, "csv.splayed: hash col=%s type=%d task=%.1fms\n",
+                    na ? ray_str_ptr(na) : "?", (int)resolved_types[c], TR_MS(tr_col_ns[c]));
+        }
+        fprintf(stderr, "csv.splayed: hash_phase=%.1fms\n", TR_MS(tr_hash_end - tr_rel_end));
     }
 
     /* .d LAST — the commit marker.  All column files are renamed into
@@ -3957,6 +4017,9 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             ray_release(schema);
         }
     }
+    if (trace) fprintf(stderr, "csv.splayed: schema=%.1fms total=%.1fms\n",
+                       TR_MS(ray_profile_now_ns() - tr_hash_end), TR_MS(ray_profile_now_ns() - tr_t0));
+#undef TR_MS
 
     if (sym_dom) ray_sym_domain_release(sym_dom);
     ray_vm_unmap_file(buf, file_size);

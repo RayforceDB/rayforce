@@ -9,6 +9,10 @@
 #include "table/domain.h"
 #include "vec/str.h"
 #include "io/csv.h"      /* ray_csv_hash_upgrade_check: the shared upgrade policy */
+#include "store/splay.h" /* ray_splay_hash_column */
+#include "core/pool.h"
+#include "core/profile.h"
+#include "core/runtime.h"
 #include <limits.h>
 #include <string.h>
 
@@ -218,7 +222,7 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
     return RAY_OK;
 }
 
-ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
+ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
     ray_col_stream_drop_lut(w);
     if (!w->fp) return RAY_OK;
     ray_err_t err = RAY_OK;
@@ -308,15 +312,138 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
         if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
         else { err = ray_file_sync(fd); ray_file_close(fd); }
     }
-    if (err == RAY_OK) err = ray_file_rename(w->tmp_path, w->path);
+    if (err != RAY_OK) { remove(w->tmp_path); stream_drop_index(w); }
+    else w->finished = true;
+    return err;
+}
+
+ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable) {
+    if (!w->finished) return RAY_OK;
+    w->finished = false;
+    ray_err_t err = ray_file_rename(w->tmp_path, w->path);
     if (err == RAY_OK && durable) err = ray_file_sync_dir(w->path);
     if (err != RAY_OK) { remove(w->tmp_path); stream_drop_index(w); }
     return err;
 }
 
+ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable) {
+    ray_err_t err = ray_col_stream_finish(w, durable);
+    if (err == RAY_OK) err = ray_col_stream_publish(w, durable);
+    return err;
+}
+
+typedef struct {
+    ray_col_stream_t* w;
+    int64_t* col_ns;
+    bool durable;
+    _Atomic(ray_err_t) err;
+} stream_finish_ctx_t;
+
+static void stream_finish_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    stream_finish_ctx_t* a = (stream_finish_ctx_t*)raw;
+    int64_t t0 = a->col_ns ? ray_profile_now_ns() : 0;
+    ray_err_t e = ray_col_stream_finish(&a->w[start], a->durable);
+    if (a->col_ns) a->col_ns[start] = ray_profile_now_ns() - t0;
+    if (e != RAY_OK) {
+        ray_err_t ok = RAY_OK;
+        atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
+    }
+}
+
+ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
+                                   int64_t* col_ns) {
+    if (n <= 0) return RAY_OK;
+    /* finish touches only the writer's own files and never dispatches, so
+     * every column finishes side by side: STR pool merges and dictionary
+     * regions, which used to run one after another on the caller. */
+    stream_finish_ctx_t ctx = { .w = w, .col_ns = col_ns, .durable = durable, .err = RAY_OK };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, n, 2))
+        ray_pool_dispatch_n(pool, stream_finish_task, &ctx, (uint32_t)n);
+    else
+        for (int64_t c = 0; c < n; c++) stream_finish_task(&ctx, 0, c, c + 1);
+    ray_err_t err = ctx.err;
+    /* The renames stay serial and in column order (microseconds each). */
+    for (int64_t c = 0; c < n; c++) {
+        ray_err_t cerr = (err == RAY_OK) ? ray_col_stream_publish(&w[c], durable) : RAY_ERR_IO;
+        if (err == RAY_OK && cerr != RAY_OK) err = cerr;
+        if (err != RAY_OK) ray_col_stream_abort(&w[c]);
+    }
+    return err;
+}
+
+typedef struct {
+    ray_col_stream_t* w;
+    const int64_t* cand;
+    int64_t base;
+    int64_t* col_ns;
+} stream_hash_ctx_t;
+
+static void stream_hash_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    stream_hash_ctx_t* a = (stream_hash_ctx_t*)raw;
+    int64_t c = a->cand[a->base + start];
+    int64_t t0 = a->col_ns ? ray_profile_now_ns() : 0;
+    (void)ray_splay_hash_column(a->w[c].path, a->w[c].index);   /* best effort */
+    if (a->col_ns) a->col_ns[c] = ray_profile_now_ns() - t0;
+}
+
+/* Peak private memory of one in-flight hash build, per row of the column.
+ * Inside a pool task the build takes the serial path of
+ * ray_index_attach_hash: the probe table (next_pow2(2n) x 8 B: 16-32 B/row,
+ * 21.5 at 100 M rows) lives only during the key pass and is freed before
+ * the CSR table of the same size is built, so the two never coexist; rgid,
+ * gkeys, offs and rows are 8 B/row each (worst case: every key distinct)
+ * and the index stays allocated until its region is written.  That is
+ * ~54 B/row on paper; measured as a 58 B/row RSS delta per column in
+ * flight (2 M-row I64 columns), which is the figure used here.  The mmap of
+ * the column file itself is page cache and not counted. */
+#define STREAM_HASH_BYTES_PER_ROW 58
+/* Share of the RAM budget the in-flight builds may take together. */
+#define STREAM_HASH_RAM_SHARE 4
+
+void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns) {
+    int64_t* cand = (int64_t*)ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t ncand = 0, rows = 0;
+    if (cand)
+        for (int64_t c = 0; c < n; c++)
+            if (w[c].wants_hash) { cand[ncand++] = c; if (w[c].rows > rows) rows = w[c].rows; }
+    ray_pool_t* pool = ray_pool_get();
+    if (ncand >= 2 && ray_pool_par_dispatch_ok(pool, ncand, 2)) {
+        /* Columns in flight at once, from the RAM budget (-m, else physical
+         * RAM / cgroup): W = ram_limit / SHARE / (58 B * rows), clamped to
+         * [1, ncand].  Each task builds serially, so K columns finish in
+         * ceil(K / W) serial build times instead of K parallel-inside builds
+         * that scale to ~2x on 24 threads. */
+        int64_t budget = ray_sys_ram_limit() / STREAM_HASH_RAM_SHARE;
+        int64_t per_col = (rows > 0 ? rows : 1) * STREAM_HASH_BYTES_PER_ROW;
+        int64_t wave = budget / per_col;
+        if (wave < 1) wave = 1;
+        if (wave > ncand) wave = ncand;
+        for (int64_t base = 0; base < ncand; base += wave) {
+            int64_t k = ncand - base < wave ? ncand - base : wave;
+            stream_hash_ctx_t ctx = { .w = w, .cand = cand, .base = base, .col_ns = col_ns };
+            ray_pool_dispatch_n(pool, stream_hash_task, &ctx, (uint32_t)k);
+        }
+    } else {
+        /* one candidate (or no pool): the build is parallel inside */
+        for (int64_t i = 0; i < ncand; i++) {
+            stream_hash_ctx_t ctx = { .w = w, .cand = cand, .base = i, .col_ns = col_ns };
+            stream_hash_task(&ctx, 0, 0, 1);
+        }
+    }
+    if (!cand)   /* OOM on the candidate list: the columns keep their zones */
+        for (int64_t c = 0; c < n; c++) w[c].wants_hash = false;
+    ray_free_raw(cand);
+    for (int64_t c = 0; c < n; c++)
+        if (w[c].index) { ray_release(w[c].index); w[c].index = NULL; }
+}
+
 void ray_col_stream_abort(ray_col_stream_t* w) {
     ray_col_stream_drop_lut(w);
     stream_drop_index(w);
+    w->finished = false;
     if (w->fp) fclose(w->fp);
     w->fp = NULL;
     if (w->pool_fp) fclose(w->pool_fp);

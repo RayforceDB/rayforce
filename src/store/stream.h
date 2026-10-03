@@ -37,6 +37,7 @@ typedef struct {
                              * the caller releases it AND sets it to NULL, or
                              * must not call abort afterwards */
     bool    wants_hash;     /* after close: build a hash by re-reading the file */
+    bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
 } ray_col_stream_t;
 
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
@@ -50,5 +51,25 @@ ray_err_t ray_col_stream_index_merge(ray_col_stream_t* dst, ray_col_stream_t* sr
  * before the index feed). */
 ray_err_t ray_col_stream_append(ray_col_stream_t* w, ray_t* column);
 ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable);
+/* close in two halves, so a converter can finish all its columns as pool
+ * tasks (pool merge, index region, header, fclose, fsync) and publish them
+ * serially.  finish touches only the writer's own files and never dispatches,
+ * so it is safe inside a pool task; publish is the rename (+ dir sync).  On a
+ * finish error the tmp file is already removed; the caller still calls abort
+ * on every writer. */
+ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable);
+ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable);
+/* finish every writer as one pool task per column (serially without a
+ * pool), then publish them in order.  The first finish error is returned;
+ * on any error every writer is aborted and nothing is published.
+ * `col_ns` (optional, n entries) receives each column's finish time. */
+ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
+                                   int64_t* col_ns);
+/* Build the hash index of every closed writer whose zone asked for one
+ * (wants_hash) by re-reading its published file, and release the zones.
+ * Several candidates build as pool tasks (one column per task, in waves
+ * sized from the RAM budget); a single one builds with the parallel
+ * builder.  Best effort: a failed build leaves the column with its zone. */
+void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns);
 void ray_col_stream_abort(ray_col_stream_t* w);
 #endif
