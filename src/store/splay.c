@@ -1288,7 +1288,7 @@ ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
         err = ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
         if (trace) {
             const ray_index_t* hx = ray_index_payload(hi->index);
-            fprintf(stderr, "csv.splayed: hash file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
+            fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
                             " mmap=%.1fms build=%.1fms write=%.1fms\n",
                     path, hi->len, hx->u.hash.n_keys, hx->u.hash.n_groups,
                     (double)(t1 - t0) / 1e6, (double)(t2 - t1) / 1e6, (double)(ray_profile_now_ns() - t2) / 1e6);

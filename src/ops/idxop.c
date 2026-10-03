@@ -1388,7 +1388,7 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
 
 bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
     static const uint8_t zeros[32] = {0};
-    uint8_t head[IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t))];
+    _Alignas(32) uint8_t head[IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t))];
     memset(head, 0, sizeof(head));
     ray_t blkhdr;
     memset(&blkhdr, 0, 32);
