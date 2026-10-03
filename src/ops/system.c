@@ -871,7 +871,6 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
 ray_t* ray_gc_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
-    ray_derived_key_cache_clear();
     ray_heap_gc();
     /* Same statement-boundary rule as the REPL: an explicit maintenance
      * call is also a chance to notice the process has gone quiet. */

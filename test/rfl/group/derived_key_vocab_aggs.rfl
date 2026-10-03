@@ -58,17 +58,6 @@
 (set KEEP (at (at NGM 1) 'p))
 (set NGM 0)
 (count (distinct (as 'STR KEEP))) -- 80
-;; the key domain of an expression is kept for its next execution (every
-;; key a hit, nothing built); (.sys.gc) drops it and the next execution
-;; builds afresh — same groups either way, the global table still untouched
-(set NG2 (nogrow (fn [] (key F))))
-(at NG2 0) -- 0
-(all (== (as 'STR (at (select {from: (at NG2 1) asc: c}) 'p)) (as 'STR (at (select {from: O asc: c}) 'p)))) -- true
-(.sys.gc) -- 0
-(set NG3 (nogrow (fn [] (key F))))
-(at NG3 0) -- 0
-(same (at NG3 1) O 'c) -- true
-(all (== (as 'STR (at (select {from: (at NG3 1) asc: c}) 'p)) (as 'STR (at (select {from: O asc: c}) 'p)))) -- true
 ;; no where: the null group is there, its avg is the null float, its min the empty symbol
 (set R2 (select {from: F by: (substr ref 1 4) c: (count ref) l: (avg (strlen ref)) mn: (min ref)}))
 (set O2 (select {from: F by: (substr ref 1 4) c: (count ref) l: (avg (strlen ref)) mn: (min ref) sv: (sum v)}))

@@ -3726,7 +3726,6 @@ void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
-    ray_derived_key_cache_clear();
     ray_env_destroy();
     ray_compile_reset();
     g_call_self_sym = -1;

@@ -3205,7 +3205,8 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * intermediate is then a chunk-sized STR vector that dies with the chunk,
  * and only the FINAL key strings are interned — once per distinct value,
  * into a domain of the key vector's own (released with the result; the
- * global table never grows by a derived value).  Applies only when the
+ * global table never grows by a derived value; positions = first-seen
+ * order of the keys, the order unsorted groups come out in).  Applies only when the
  * expression's result over the SYM column is SYM (so the result has the
  * type the caller expects).  File prefixes use the raw snapshot, the
  * runtime domain its borrowed atom array, and a private in-memory domain
@@ -3523,7 +3524,10 @@ static void dk_assign_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
  * domain kdom; out[i] gets the position of string i.  n stays below
  * INT32_MAX (a chunk).  The partitioned rows and their tables live only
  * through the dedupe; the arrays the batch intern reads are sized by the
- * distinct count. */
+ * distinct count.  The domain is this execution's own and the
+ * representatives are handed over in first-row order, so a key's position
+ * is its first-seen rank — the order unsorted groups come out in, the same
+ * at every thread count. */
 static bool dk_intern_views(const char* const* sp, const uint32_t* sl, const uint32_t* hash,
                             int64_t n, struct ray_sym_domain_s* kdom, int64_t* out) {
     if (n <= 0) return true;
@@ -4185,59 +4189,6 @@ static bool dkp_chunk_keys(const dkp_prog_t* P, const void* dv, uint8_t dattrs, 
     return ok;
 }
 
-/* ---- the key domains of recent key expressions ---------------------------
- * A key domain is a dictionary of strings: the positions a query's keys get
- * in it are correct for any later query of the same expression (the keys
- * are looked up by their bytes; the domain only grows).  So the domain is
- * kept, by the text of the expression, for the next execution: a repeated
- * query then interns nothing — every key is a hit — instead of building a
- * dictionary of millions of hosts from scratch each time.  A few entries,
- * least recently used out; cleared by (.sys.gc) and at teardown. */
-#define DK_CACHE_N 8
-typedef struct {
-    ray_t*                   text;   /* the expression, formatted */
-    struct ray_sym_domain_s* kdom;   /* one ref held by the cache */
-    uint64_t                 used;
-} dk_cache_ent_t;
-static dk_cache_ent_t g_dk_cache[DK_CACHE_N];
-static uint64_t       g_dk_cache_clock;
-
-/* The cached domain for `text` (retained for the caller), or NULL. */
-static struct ray_sym_domain_s* dk_cache_get(ray_t* text) {
-    size_t n = ray_str_len(text);
-    const char* p = ray_str_ptr(text);
-    for (int i = 0; i < DK_CACHE_N; i++) {
-        dk_cache_ent_t* e = &g_dk_cache[i];
-        if (!e->kdom || ray_str_len(e->text) != n || memcmp(ray_str_ptr(e->text), p, n) != 0) continue;
-        e->used = ++g_dk_cache_clock;
-        ray_sym_domain_retain(e->kdom);
-        return e->kdom;
-    }
-    return NULL;
-}
-
-static void dk_cache_put(ray_t* text, struct ray_sym_domain_s* kdom) {
-    dk_cache_ent_t* v = &g_dk_cache[0];
-    for (int i = 0; i < DK_CACHE_N; i++) {
-        dk_cache_ent_t* e = &g_dk_cache[i];
-        if (!e->kdom) { v = e; break; }
-        if (e->used < v->used) v = e;
-    }
-    if (v->kdom) { ray_sym_domain_release(v->kdom); ray_release(v->text); }
-    ray_retain(text);
-    ray_sym_domain_retain(kdom);
-    v->text = text; v->kdom = kdom; v->used = ++g_dk_cache_clock;
-}
-
-void ray_derived_key_cache_clear(void) {
-    for (int i = 0; i < DK_CACHE_N; i++) {
-        dk_cache_ent_t* e = &g_dk_cache[i];
-        if (e->kdom) ray_sym_domain_release(e->kdom);
-        if (e->text) ray_release(e->text);
-        e->kdom = NULL; e->text = NULL; e->used = 0;
-    }
-}
-
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
                                      struct ray_sym_domain_s* dom, int64_t du) {
     if (!dom || du <= 0) return NULL;
@@ -4275,15 +4226,11 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
     /* The key strings live in a domain of their own, owned by the key
      * vector (and by every vector that adopts it): the query's derived
      * values never enter the global table, and the whole dictionary goes
-     * when the last result column holding it — and the cache above — does.
-     * The cached domain of this expression when there is one. */
-    ray_t* ktext = ray_fmt(by_expr, 0);
-    if (ktext && RAY_IS_ERR(ktext)) { ray_error_free(ktext); ktext = NULL; }
-    bool kdom_fresh = false;
+     * when the last result column holding it does.  Its positions are
+     * this execution's first-seen ranks of the keys (dk_intern_views). */
     {
-        struct ray_sym_domain_s* kdom = ktext ? dk_cache_get(ktext) : NULL;
-        if (!kdom) { kdom = ray_sym_domain_new(); kdom_fresh = true; }
-        if (!kdom) { ray_release(key_dom); if (ktext) ray_release(ktext); goto unpin_null; }
+        struct ray_sym_domain_s* kdom = ray_sym_domain_new();
+        if (!kdom) { ray_release(key_dom); goto unpin_null; }
         key_dom->sym_domain = kdom;               /* the vector takes the ref */
     }
     struct ray_sym_domain_s* kdom = key_dom->sym_domain;
@@ -4331,14 +4278,9 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
         }
         ray_release(kc);
     }
-    if (ktext) {
-        if (kdom_fresh) dk_cache_put(ktext, kdom);
-        ray_release(ktext);
-    }
     ray_sym_domain_raw_unpin(dom);
     return key_dom;
 fail:
-    if (ktext) ray_release(ktext);
     ray_release(key_dom);
 unpin_null:
     ray_sym_domain_raw_unpin(dom);
@@ -4780,10 +4722,10 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
         if (ray_table_col_name(O, c) == kname) { kname = ray_sym_intern("key", 3); break; }
     ray_table_set_col_name(O, 0, kname);
     /* Unsorted output comes out in the order of the key domain's positions
-     * — the first occurrence of each key over S, i.e. the vocabulary order
+     * — this execution's first-seen ranks over S, i.e. the vocabulary order
      * of the values — whatever order the grouping over S emitted in (its
-     * strategy, and with it the order, depends on the core count).  A
-     * sort or take clause fixes the order itself. */
+     * strategy, and with it the order, depends on the core count).  A sort
+     * or take clause fixes the order itself. */
     bool plain = true;
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
