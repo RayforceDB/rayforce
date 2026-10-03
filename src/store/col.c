@@ -711,7 +711,11 @@ ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload
     const ray_index_t* ix = (const ray_index_t*)ix_v;
     if (!f || !ix) return RAY_ERR_DOMAIN;
     if (fseek(f, 0, SEEK_END) != 0) return RAY_ERR_IO;
-    long fsz = ftell(f);
+#ifdef RAY_OS_WINDOWS
+    int64_t fsz = (int64_t)_ftelli64(f);
+#else
+    int64_t fsz = (int64_t)ftello(f);
+#endif
     if (fsz < 32) return RAY_ERR_CORRUPT;
     int64_t payload_end = fsz;
     if (payload_end_out) *payload_end_out = payload_end;

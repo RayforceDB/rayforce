@@ -1190,7 +1190,7 @@ static ray_err_t dict_acc_rehash(ray_dict_acc_t* a) {
     uint32_t* ns = (uint32_t*)ray_calloc_raw((size_t)ncap * sizeof(uint32_t));
     if (!ns) return RAY_ERR_OOM;
     for (int64_t c = 0; c < a->n_distinct; c++) {
-        uint64_t s = ray_hash_bytes(a->pool + a->offs[c], a->lens[c]) & (ncap - 1);
+        uint64_t s = ray_hash_bytes(a->lens[c] ? a->pool + a->offs[c] : "", a->lens[c]) & (ncap - 1);
         while (ns[s]) s = (s + 1) & (ncap - 1);
         ns[s] = (uint32_t)c + 1;
     }
@@ -1226,7 +1226,7 @@ ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
             uint32_t cp1 = a->slot[s];
             if (cp1 == 0) break;
             int32_t c = (int32_t)cp1 - 1;
-            if (a->lens[c] == len && memcmp(a->pool + a->offs[c], p, len) == 0) { code = c; break; }
+            if (a->lens[c] == len && (len == 0 || memcmp(a->pool + a->offs[c], p, len) == 0)) { code = c; break; }
             s = (s + 1) & a->mask;
         }
         if (code < 0) {

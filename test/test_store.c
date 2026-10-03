@@ -1769,6 +1769,46 @@ static test_result_t test_dict_acc_slices_equal_compute(void) {
     PASS();
 }
 
+/* Leading empty strings (NULL pool at the first distinct value), then
+ * 70000 rows over 100 values, in two slices: equals ray_index_dict_compute. */
+static test_result_t test_dict_acc_leading_empty(void) {
+    int64_t n = 70003;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v = ray_str_vec_append(v, "", 0);
+    v = ray_str_vec_append(v, "", 0);
+    v = ray_str_vec_append(v, "a", 1);
+    for (int64_t i = 0; i < 70000; i++) {
+        char buf[32]; int len = snprintf(buf, sizeof(buf), "v%lld", (long long)(i % 100));
+        v = ray_str_vec_append(v, buf, (size_t)len);
+    }
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    int64_t cuts[3] = {0, 35000, n};
+    for (int k = 0; k < 2; k++) {
+        ray_t* s = ray_vec_new(RAY_STR, cuts[k + 1] - cuts[k]);
+        for (int64_t i = cuts[k]; i < cuts[k + 1]; i++) {
+            size_t len; const char* p = ray_str_vec_get(v, i, &len);
+            s = ray_str_vec_append(s, p, len);
+        }
+        TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    ray_t* got = ray_dict_acc_finish(&acc, n);
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    const ray_index_t* x = ray_index_payload(got);
+    const ray_index_t* y = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, y->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, 102);   /* "", "a", v0..v99 */
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.codes), ray_data(y->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.first_occ), ray_data(y->u.dict.first_occ),
+                            (size_t)x->u.dict.n_distinct * 4), 0);
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
 /* Unique strings: past 65536 rows more than half are distinct, so it dies. */
 static test_result_t test_dict_acc_cap_abandons(void) {
     int64_t n = 70000;
@@ -1827,6 +1867,18 @@ static test_result_t test_stream_inline_zone(void) {
     struct stat a, b;
     TEST_ASSERT_EQ_I(stat(path, &a), 0); TEST_ASSERT_EQ_I(stat(ref, &b), 0);
     TEST_ASSERT_EQ_I((int64_t)a.st_size, (int64_t)b.st_size);
+    {
+        size_t sz = (size_t)a.st_size;
+        uint8_t* ba = (uint8_t*)malloc(sz); uint8_t* bb = (uint8_t*)malloc(sz);
+        TEST_ASSERT_TRUE(ba && bb);
+        FILE* fa = fopen(path, "rb"); FILE* fb = fopen(ref, "rb");
+        TEST_ASSERT_TRUE(fa && fb);
+        TEST_ASSERT_EQ_I((int64_t)fread(ba, 1, sz, fa), (int64_t)sz);
+        TEST_ASSERT_EQ_I((int64_t)fread(bb, 1, sz, fb), (int64_t)sz);
+        fclose(fa); fclose(fb);
+        TEST_ASSERT_EQ_I(memcmp(ba, bb, sz), 0);
+        free(ba); free(bb);
+    }
     ray_release(want); ray_release(back); ray_release(plain); ray_release(v);
     (void)ray_test_rm_rf(dir);
     PASS();
@@ -5944,6 +5996,7 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_merge_mid_chunk",      test_zone_acc_merge_mid_chunk,      store_setup, store_teardown },
     { "store/zone_acc_float",                test_zone_acc_float,                store_setup, store_teardown },
     { "store/dict_acc_slices_equal_compute", test_dict_acc_slices_equal_compute, store_setup, store_teardown },
+    { "store/dict_acc_leading_empty", test_dict_acc_leading_empty, store_setup, store_teardown },
     { "store/dict_acc_cap_abandons",         test_dict_acc_cap_abandons,         store_setup, store_teardown },
     { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },

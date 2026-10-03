@@ -3917,6 +3917,10 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         if (err != RAY_OK) ray_col_stream_abort(&writers[c]);
     }
 
+    /* The domain was flushed before the closes and .d names columns through
+     * the global symbol table, so drop its tables before the hash re-read. */
+    if (sym_dom) { ray_sym_domain_release(sym_dom); sym_dom = NULL; }
+
     /* Columns whose zone asked for a hash: the only files read back. The
      * hash builds run one after another, each parallel inside, before .d
      * so an in-place first write never publishes a half-appended region. */

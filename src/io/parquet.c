@@ -1951,9 +1951,17 @@ finish_columns:
     if (domain) { e = ray_sym_domain_flush(domain,true); if (e != RAY_OK) goto io_fail; }
     for (int64_t c = 0; c < r->ncols; c++) {
         /* All columns are still under a private staging directory. Commit
-         * their final images together below, after appending indexes. */
+         * their final images together below, after the hash re-read. */
         e = ray_col_stream_close(&writers[c],false);
         if (e != RAY_OK) goto io_fail;
+    }
+    /* The persisted domain is flushed and every writer is closed (the zone
+     * and dictionary indexes were built inline while streaming). Drop the
+     * ingestion hash tables and string arena before the hash re-read of the
+     * integer columns; reopening needs only the file-backed vocabulary. */
+    if (domain) {
+        ray_sym_domain_release(domain); domain = NULL;
+        for (int64_t c = 0; c < opened; c++) writers[c].dom = NULL;
     }
     for (int64_t c = 0; c < r->ncols; c++) {
         if (writers[c].wants_hash) (void)ray_splay_hash_column(writers[c].path,writers[c].index);
@@ -1970,14 +1978,6 @@ finish_columns:
     snprintf(file,sizeof(file),"%s/.d",staging);
     e = ray_col_save_bulk(schema,file); ray_release(schema);
     if (e != RAY_OK) goto io_fail;
-    /* The persisted domain is complete and all writers are closed. Drop
-     * its ingestion hash tables and string arena before building indexes;
-     * reopening needs only the file-backed vocabulary. Keeping both live
-     * makes large imports compete with index builders for tens of GiB. */
-    if (domain) {
-        ray_sym_domain_release(domain); domain = NULL;
-        for (int64_t c = 0; c < opened; c++) writers[c].dom = NULL;
-    }
     /* The column files already carry their index regions. Flush the final
      * file images before the directory becomes visible under its published name. */
     for (int64_t c = 0; c <= r->ncols; c++) {

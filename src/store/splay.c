@@ -1275,7 +1275,7 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
 
 ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
     if (!path) return RAY_ERR_DOMAIN;
-    ray_t* col = ray_col_load(path);
+    ray_t* col = ray_col_mmap(path);
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
     ray_err_t err = RAY_ERR_IO;
     ray_t* hi = ray_idx_hash_fn(col);

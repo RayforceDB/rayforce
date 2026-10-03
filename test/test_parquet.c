@@ -483,6 +483,9 @@ static test_result_t test_pq_splayed_inline_indexes(void) {
         TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.mins),ray_data(w->u.chunk_zone.mins),4*8),0);
         TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.maxs),ray_data(w->u.chunk_zone.maxs),4*8),0);
         TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.aggs),ray_data(w->u.chunk_zone.aggs),12*8),0);
+        TEST_ASSERT_TRUE((g->u.chunk_zone.null_bits != NULL) == (w->u.chunk_zone.null_bits != NULL));
+        if (w->u.chunk_zone.null_bits)
+            TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.null_bits),ray_data(w->u.chunk_zone.null_bits),(size_t)((g->u.chunk_zone.n_chunks+7)/8)),0);
         ray_release(want); ray_release(plain);
         TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(table,1)),RAY_IDX_HASH);
         ray_release(table); pq_remove_native(dir,names,2);
