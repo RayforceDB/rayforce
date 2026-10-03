@@ -35,6 +35,7 @@
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/format.h"
+#include "core/platform.h"
 #include "store/hnsw.h"
 #include "store/fileio.h"
 #include <math.h>
@@ -42,6 +43,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#ifndef RAY_OS_WINDOWS
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 extern ray_runtime_t* __RUNTIME;
 extern const char* ray_error_msg(void);
@@ -1097,7 +1102,39 @@ static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
     TEST_ASSERT_EQ_I(neighbor_err, RAY_OK);
     TEST_ASSERT_EQ_I(entry_err, RAY_OK);
     TEST_ASSERT_EQ_I(width_err, RAY_OK);
+#ifndef RAY_OS_WINDOWS
+    char warning_path[96];
+    snprintf(warning_path, sizeof(warning_path), "/tmp/ray_hnsw_warning_%ld.log",
+             (long)getpid());
+    int warning_fd = open(warning_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT_TRUE(warning_fd >= 0);
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    TEST_ASSERT_TRUE(saved_stderr >= 0);
+    TEST_ASSERT_EQ_I(dup2(warning_fd, STDERR_FILENO), STDERR_FILENO);
     ray_hnsw_t* loaded = ray_hnsw_load(neighbor_dir);
+    ray_hnsw_t* mapped = ray_hnsw_mmap(neighbor_dir);
+    fflush(stderr);
+    TEST_ASSERT_EQ_I(dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    close(saved_stderr);
+
+    char warning[512];
+    TEST_ASSERT_EQ_I(lseek(warning_fd, 0, SEEK_SET), 0);
+    ssize_t warning_len = read(warning_fd, warning, sizeof(warning) - 1);
+    TEST_ASSERT_TRUE(warning_len >= 0);
+    warning[warning_len] = '\0';
+    close(warning_fd);
+    unlink(warning_path);
+    char expected_count[64];
+    snprintf(expected_count, sizeof(expected_count), "repaired %lld legacy",
+             (long long)injected_layers);
+    TEST_ASSERT_TRUE(strstr(warning, expected_count) != NULL);
+    TEST_ASSERT_TRUE(strstr(warning, "rebuild the index") != NULL);
+#else
+    ray_hnsw_t* loaded = ray_hnsw_load(neighbor_dir);
+    ray_hnsw_t* mapped = ray_hnsw_mmap(neighbor_dir);
+#endif
+
     TEST_ASSERT_NOT_NULL(loaded);
     for (int32_t l = 1; l < loaded->n_layers; l++) {
         ray_hnsw_layer_t* layer = &loaded->layers[l];
@@ -1116,9 +1153,8 @@ static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
                      1);
     ray_hnsw_free(loaded);
 
-    loaded = ray_hnsw_mmap(neighbor_dir);
-    TEST_ASSERT_NOT_NULL(loaded);
-    ray_hnsw_free(loaded);
+    TEST_ASSERT_NOT_NULL(mapped);
+    ray_hnsw_free(mapped);
     TEST_ASSERT_NULL(ray_hnsw_load(entry_dir));
     TEST_ASSERT_NULL(ray_hnsw_mmap(entry_dir));
     TEST_ASSERT_NULL(ray_hnsw_load(width_dir));

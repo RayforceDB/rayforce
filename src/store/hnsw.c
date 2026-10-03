@@ -558,12 +558,12 @@ ray_hnsw_t* ray_hnsw_build(const float* vectors, int64_t n_nodes, int32_t dim,
             return NULL;
         }
         const float* vec = vectors + i * dim;
-        int32_t node_level = idx->node_level[i];
+        int32_t node_level = (uint8_t)idx->node_level[i];
 
         /* Only levels up to the current entry point have already been
          * populated; higher levels belong to nodes inserted later. */
         int64_t ep = idx->entry_point;
-        int32_t ep_level = idx->node_level[ep];
+        int32_t ep_level = (uint8_t)idx->node_level[ep];
         for (int32_t l = ep_level; l > node_level; l--) {
             ep = hnsw_greedy_closest(idx, vec, ep, l);
         }
@@ -913,24 +913,34 @@ bool ray_hnsw_vec_size_valid(int64_t n_nodes, int32_t dim) {
     return (uint64_t)n_nodes <= SIZE_MAX / sizeof(float) / (uint64_t)dim;
 }
 
-/* Validate the graph topology before making the loaded index available to
- * search.  All ids in these files are untrusted: a bad neighbor used to
- * reach hnsw_greedy_closest() or hnsw_search_layer() becomes an unchecked
- * offset into idx->vectors.  The node_ids mapping is equally important — a
- * duplicate, missing, or wrong-level entry can make a valid-looking layer
- * resolve the wrong neighbor block.
+/* Validate and repair the graph topology before making the loaded index
+ * available to search.  All ids in these files are untrusted: a bad neighbor
+ * used to reach hnsw_greedy_closest() or hnsw_search_layer() becomes an
+ * unchecked offset into idx->vectors.  The node_ids mapping is equally
+ * important — a duplicate, missing, or wrong-level entry can make a
+ * valid-looking layer resolve the wrong neighbor block.  Legacy lower-layer
+ * links are removed in place and reported through repaired_links; every other
+ * inconsistency fails.
  */
-static bool hnsw_persisted_layers_valid(const ray_hnsw_t* idx) {
-    if (!idx || !idx->node_level || idx->n_nodes <= 0 || idx->n_layers <= 0)
+static bool hnsw_validate_and_repair_persisted_layers(ray_hnsw_t* idx,
+                                                       int64_t* repaired_links) {
+    if (repaired_links) *repaired_links = 0;
+    if (!idx || !idx->node_level || idx->n_nodes <= 0 || idx->n_layers <= 0 ||
+        idx->n_layers > HNSW_MAX_LAYERS)
         return false;
 
-    for (int64_t id = 0; id < idx->n_nodes; id++) {
-        if (idx->node_level[id] < 0 || idx->node_level[id] >= idx->n_layers)
-            return false;
-    }
-    if (idx->entry_point < 0 || idx->entry_point >= idx->n_nodes ||
-        idx->node_level[idx->entry_point] != idx->n_layers - 1)
+    if (idx->entry_point < 0 || (uint64_t)idx->entry_point >= (uint64_t)idx->n_nodes)
         return false;
+
+    bool entry_on_top_layer = false;
+    for (int64_t id = 0; id < idx->n_nodes; id++) {
+        int8_t level = idx->node_level[id];
+        if (level < 0 || level >= idx->n_layers)
+            return false;
+        if (id == idx->entry_point)
+            entry_on_top_layer = level == idx->n_layers - 1;
+    }
+    if (!entry_on_top_layer) return false;
 
     uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)idx->n_nodes);
     if (!seen) return false;
@@ -976,8 +986,10 @@ static bool hnsw_persisted_layers_valid(const ray_hnsw_t* idx) {
                 /* Older builders could persist the entry point as a one-way
                  * edge even when it was absent from this upper layer. Such an
                  * edge was unusable; drop it while preserving valid neighbors. */
-                if (idx->node_level[id] < l)
+                if (idx->node_level[id] < l) {
+                    if (repaired_links) (*repaired_links)++;
                     continue;
+                }
                 neighbors[kept++] = id;
             }
             while (valid && kept < layer->M_max)
@@ -1082,11 +1094,11 @@ static ray_hnsw_t* hnsw_load_impl(const char* dir, bool use_mmap) {
         fclose(f);
     }
 
-    if (!hnsw_persisted_layers_valid(idx)) {
+    int64_t repaired_links = 0;
+    if (!hnsw_validate_and_repair_persisted_layers(idx, &repaired_links)) {
         ray_hnsw_free(idx);
         return NULL;
     }
-
     /* Read vectors */
     snprintf(path, sizeof(path), "%s/hnsw_vectors.bin", dir);
     f = fopen(path, "rb");
@@ -1101,6 +1113,13 @@ static ray_hnsw_t* hnsw_load_impl(const char* dir, bool use_mmap) {
         idx->vectors = vecs;
     }
     fclose(f);
+
+    if (repaired_links > 0) {
+        fprintf(stderr,
+                "hnsw: WARN  repaired %lld legacy cross-layer neighbor link%s "
+                "while loading %s; rebuild the index to restore search recall\n",
+                (long long)repaired_links, repaired_links == 1 ? "" : "s", dir);
+    }
 
     return idx;
 }
