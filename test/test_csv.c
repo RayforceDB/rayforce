@@ -30,6 +30,7 @@
 #include "store/splay.h"
 #include "table/sym.h"
 #include "ops/idxop.h"
+#include "core/runtime.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -2090,6 +2091,61 @@ static test_result_t test_csv_splayed_inline_indexes(void) {
     PASS();
 }
 
+/* Four unclustered I64 columns (hash candidates) and one clustered column,
+ * converted twice: with the runtime RAM limit as is, and with it lowered so
+ * every hash wave holds one column (built on the calling thread, outside any
+ * dispatch).  Both conversions must publish identical column files. */
+static bool csv_files_equal(const char* a, const char* b) {
+    FILE* fa = fopen(a, "rb"); FILE* fb = fopen(b, "rb");
+    bool ok = fa && fb;
+    while (ok) {
+        char x[65536], y[65536];
+        size_t nx = fread(x, 1, sizeof(x), fa), ny = fread(y, 1, sizeof(y), fb);
+        if (nx != ny || memcmp(x, y, nx)) ok = false;
+        if (nx == 0) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return ok;
+}
+static test_result_t test_csv_splayed_hash_waves(void) {
+    /* a runtime supplies the RAM limit the wave width is derived from */
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    char dirs[2][128];
+    snprintf(dirs[0],sizeof(dirs[0]),"/tmp/rayforce-csv-wave0-%d",(int)getpid());
+    snprintf(dirs[1],sizeof(dirs[1]),"/tmp/rayforce-csv-wave1-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("a,b,c,d,k\n",f);
+    for(long long i=0;i<300000;i++)
+        fprintf(f,"%lld,%lld,%lld,%lld,%lld\n",(i*7919)%1000003,(i*7919+104729)%1000003,
+                (i*7919+2*104729)%1000003,(i*7919+3*104729)%1000003,i);
+    fclose(f);
+    int8_t types[]={RAY_I64,RAY_I64,RAY_I64,RAY_I64,RAY_I64};
+    int64_t saved = __RUNTIME->ram_limit;
+    for (int run=0; run<2; run++) {
+        /* 4 * 58 B * 300000 rows: one column per wave */
+        if (run) __RUNTIME->ram_limit = 4LL*58*300000;
+        ray_err_t e=ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,5,NULL,0,dirs[run],100000);
+        __RUNTIME->ram_limit = saved;
+        TEST_ASSERT_EQ_I(e,RAY_OK);
+        ray_t* t=ray_read_splayed(dirs[run],NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        for (int c=0;c<4;c++) TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,c)),RAY_IDX_HASH);
+        TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,4)),RAY_IDX_CHUNK_ZONE);
+        ray_release(t);
+    }
+    const char* names[]={"a","b","c","d","k"};
+    for (int c=0;c<5;c++) {
+        char p0[200], p1[200];
+        snprintf(p0,sizeof(p0),"%s/%s",dirs[0],names[c]);
+        snprintf(p1,sizeof(p1),"%s/%s",dirs[1],names[c]);
+        TEST_ASSERT_TRUE(csv_files_equal(p0,p1));
+    }
+    csv_test_rm_rf(dirs[0]); csv_test_rm_rf(dirs[1]);
+    unlink(TMP_CSV); ray_runtime_destroy(rt);
+    PASS();
+}
+
 /* A literal INT64_MIN in a parse chunk without empty cells is a number to the
  * parser (no HAS_NULLS on that slice) but a null once the column header ORs
  * the slice flags; the streamed zone must follow the loaded column (#495). */
@@ -2142,6 +2198,7 @@ const test_entry_t csv_entries[] = {
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
     { "csv/splayed_inline_indexes", test_csv_splayed_inline_indexes, NULL, NULL },
+    { "csv/splayed_hash_waves", test_csv_splayed_hash_waves, NULL, NULL },
     { "csv/native_pooled_batches", test_csv_native_pooled_batches, NULL, NULL },
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },

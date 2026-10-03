@@ -71,5 +71,8 @@ ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
  * sized from the RAM budget); a single one builds with the parallel
  * builder.  Best effort: a failed build leaves the column with its zone. */
 void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns);
+/* Hash builds in flight at once: clamp(ram_limit / 4 / (58 B * max(rows, 1)),
+ * 1, candidates).  Pure; `candidates` >= 1 expected. */
+int64_t ray_col_stream_hash_wave(int64_t ram_limit, int64_t rows, int64_t candidates);
 void ray_col_stream_abort(ray_col_stream_t* w);
 #endif

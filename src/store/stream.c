@@ -403,6 +403,15 @@ static void stream_hash_task(void* raw, uint32_t wid, int64_t start, int64_t end
 /* Share of the RAM budget the in-flight builds may take together. */
 #define STREAM_HASH_RAM_SHARE 4
 
+int64_t ray_col_stream_hash_wave(int64_t ram_limit, int64_t rows, int64_t candidates) {
+    int64_t budget = ram_limit / STREAM_HASH_RAM_SHARE;
+    int64_t per_col = (rows > 0 ? rows : 1) * STREAM_HASH_BYTES_PER_ROW;
+    int64_t wave = budget / per_col;
+    if (wave < 1) wave = 1;
+    if (wave > candidates) wave = candidates;
+    return wave;
+}
+
 void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns) {
     int64_t* cand = (int64_t*)ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
     int64_t ncand = 0, rows = 0;
@@ -416,15 +425,16 @@ void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns) {
          * [1, ncand].  Each task builds serially, so K columns finish in
          * ceil(K / W) serial build times instead of K parallel-inside builds
          * that scale to ~2x on 24 threads. */
-        int64_t budget = ray_sys_ram_limit() / STREAM_HASH_RAM_SHARE;
-        int64_t per_col = (rows > 0 ? rows : 1) * STREAM_HASH_BYTES_PER_ROW;
-        int64_t wave = budget / per_col;
-        if (wave < 1) wave = 1;
-        if (wave > ncand) wave = ncand;
+        int64_t wave = ray_col_stream_hash_wave(ray_sys_ram_limit(), rows, ncand);
         for (int64_t base = 0; base < ncand; base += wave) {
             int64_t k = ncand - base < wave ? ncand - base : wave;
             stream_hash_ctx_t ctx = { .w = w, .cand = cand, .base = base, .col_ns = col_ns };
-            ray_pool_dispatch_n(pool, stream_hash_task, &ctx, (uint32_t)k);
+            if (k == 1)
+                /* A lone build runs here, outside any dispatch, so
+                 * ray_parallel_flag stays down and its builder is parallel. */
+                stream_hash_task(&ctx, 0, 0, 1);
+            else
+                ray_pool_dispatch_n(pool, stream_hash_task, &ctx, (uint32_t)k);
         }
     } else {
         /* one candidate (or no pool): the build is parallel inside */

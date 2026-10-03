@@ -2061,6 +2061,16 @@ static test_result_t test_stream_hash_candidate(void) {
     PASS();
 }
 
+/* Wave width of the hash phase: a pure function of RAM budget and shape. */
+static test_result_t test_stream_hash_wave(void) {
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(0, 100, 5), 1);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 0, 5), 5);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 1LL << 40, 5), 1);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 40, 1000, 3), 3);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(4LL * 58 * 1000 * 2, 1000, 5), 2);
+    PASS();
+}
+
 /* STR column of 100000 rows with empty strings: inline dict, HAS_NULLS set. */
 static test_result_t test_stream_inline_dict(void) {
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-dict-%d", (int)getpid());
@@ -6130,6 +6140,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
+    { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },
