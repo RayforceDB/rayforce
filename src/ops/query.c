@@ -3201,16 +3201,16 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * that is tens of GB that never come back.
  *
  * Here the referenced column is presented to the same DAG as a STR column
- * built from the raw vocabulary bytes, CHUNK rows at a time: every
+ * built from the vocabulary bytes, CHUNK rows at a time: every
  * intermediate is then a chunk-sized STR vector that dies with the chunk,
  * and only the FINAL key strings are interned — once per distinct value,
- * exactly the ids the SYM evaluation would have produced for them.
- * Applies only when the expression's result over the SYM column is SYM
- * (so the interned result has the type the caller expects) and the
- * column has a private domain. File prefixes use the raw snapshot;
- * in-memory domains resolve their stable atoms through the same tail path.
- * Any other
- * shape returns NULL and the caller takes the one-shot SYM evaluation. */
+ * into a domain of the key vector's own (released with the result; the
+ * global table never grows by a derived value).  Applies only when the
+ * expression's result over the SYM column is SYM (so the result has the
+ * type the caller expects).  File prefixes use the raw snapshot, the
+ * runtime domain its borrowed atom array, and a private in-memory domain
+ * resolves its stable atoms through the tail path.  Any other shape
+ * returns NULL and the caller takes the one-shot SYM evaluation. */
 /* Chunk length in distinct values: 256 dispatch rounds of morsels (2M
  * rows).  Enough rows for the pooled string ops to spread over the
  * workers, while every chunk-scoped STR intermediate stays in the
@@ -3247,6 +3247,8 @@ typedef struct {
     uint32_t*                   off;
     ray_str_t*                  dst;
     char*                       pool;
+    ray_t* const*               rstr;   /* runtime domain: the borrowed atom array */
+    uint32_t                    rcnt;
     atomic_int                  late;
 } dk_chunk_ctx_t;
 
@@ -3256,7 +3258,20 @@ static void dk_chunk_scan_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
     int late = 0;
     for (int64_t i = start; i < end; i++) {
         int64_t pos = ray_read_sym(c->dv, c->lo + i, RAY_SYM, c->dattrs);
-        if (pos >= 0 && pos < c->raw->count) {
+        if (c->rstr) {
+            /* runtime domain: the atom array borrowed once per chunk (no
+             * lock — nothing interns into the global table while the chunk
+             * is read) */
+            ray_t* a = (pos >= 0 && pos < (int64_t)c->rcnt) ? c->rstr[pos] : NULL;
+            if (a && ray_str_len(a) <= UINT32_MAX) {
+                c->ptr[i] = ray_str_ptr(a);
+                c->len[i] = (uint32_t)ray_str_len(a);
+            } else {
+                c->ptr[i] = NULL;
+                c->len[i] = UINT32_MAX;
+                late++;
+            }
+        } else if (pos >= 0 && pos < c->raw->count) {
             size_t sl = 0;
             c->ptr[i] = ray_sym_domain_raw_str(c->raw, pos, &sl);
             c->len[i] = (uint32_t)sl;
@@ -3289,9 +3304,9 @@ static void dk_chunk_fill_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
 }
 
 /* The bytes of entries dv[lo, lo+n) as (ptr, len) views: read on the
- * workers off the raw snapshot, a runtime-appended position resolved
- * through the domain on the calling thread.  False on a length past
- * UINT32_MAX. */
+ * workers off the raw snapshot (FILE) or the borrowed atom array (the
+ * runtime domain), a position past either resolved through the domain on
+ * the calling thread.  False on a length past UINT32_MAX. */
 static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n,
                            const ray_sym_domain_raw_t* raw, struct ray_sym_domain_s* dom,
                            const char** ptr, uint32_t* len) {
@@ -3300,6 +3315,11 @@ static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n
     c.dv = dv; c.dattrs = dattrs; c.lo = lo; c.raw = raw;
     c.ptr = ptr;
     c.len = len;
+    if (dom == ray_sym_runtime_domain()) {
+        ray_t** rs = NULL; uint32_t rc = 0;
+        ray_sym_strings_borrow(&rs, &rc);
+        c.rstr = rs; c.rcnt = rc;
+    }
     atomic_store_explicit(&c.late, 0, memory_order_relaxed);
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
@@ -3395,9 +3415,13 @@ typedef struct {
     const int64_t*     tbase;   /* [DK_NPART + 1]: partition tables in tab */
     uint64_t*          tab;     /* hash << 32 | index in the partition; all ones = empty */
     int32_t*           rep;     /* first row holding the same string */
-    const int32_t*     ord;     /* at a representative row: its ordinal */
+    int32_t*           ord;     /* at a representative row: its ordinal */
     const int64_t*     did;     /* id per ordinal */
     int64_t*           out;
+    int64_t*           rcnt;    /* [nt]: representatives per row range, then their base */
+    const char**       dstr;    /* the representatives' strings, lengths, hashes */
+    size_t*            dlen;
+    uint32_t*          dhsh;
 } dk_dedupe_ctx_t;
 
 static inline uint32_t dk_part_of(uint32_t h) { return h >> (32 - DK_PART_BITS); }
@@ -3465,18 +3489,43 @@ static void dk_dedupe_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
     }
 }
 
+static void dk_reps_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    const dk_dedupe_ctx_t* c = (const dk_dedupe_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt, k = 0;
+        for (int64_t i = lo; i < hi; i++) k += c->rep[i] == (int32_t)i;
+        c->rcnt[t] = k;
+    }
+}
+
+static void dk_reps_list_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    const dk_dedupe_ctx_t* c = (const dk_dedupe_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt, d = c->rcnt[t];
+        for (int64_t i = lo; i < hi; i++) {
+            if (c->rep[i] != (int32_t)i) continue;
+            c->ord[i] = (int32_t)d;
+            c->dstr[d] = c->sp[i]; c->dlen[d] = c->sl[i]; c->dhsh[d] = c->hash[i];
+            d++;
+        }
+    }
+}
+
 static void dk_assign_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
     const dk_dedupe_ctx_t* c = (const dk_dedupe_ctx_t*)vctx;
     for (int64_t i = lo; i < hi; i++) c->out[i] = c->did[c->ord[c->rep[i]]];
 }
 
-/* Intern the n strings (sp[i], sl[i]) with hashes hash[i]; out[i] gets the
- * id of string i.  n stays below INT32_MAX (a chunk).  The partitioned
- * rows and their tables live only through the dedupe; the arrays the
- * batch intern reads are sized by the distinct count. */
+/* Intern the n strings (sp[i], sl[i]) with hashes hash[i] into the key
+ * domain kdom; out[i] gets the position of string i.  n stays below
+ * INT32_MAX (a chunk).  The partitioned rows and their tables live only
+ * through the dedupe; the arrays the batch intern reads are sized by the
+ * distinct count. */
 static bool dk_intern_views(const char* const* sp, const uint32_t* sl, const uint32_t* hash,
-                            int64_t n, int64_t* out) {
+                            int64_t n, struct ray_sym_domain_s* kdom, int64_t* out) {
     if (n <= 0) return true;
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
@@ -3534,10 +3583,14 @@ static bool dk_intern_views(const char* const* sp, const uint32_t* sl, const uin
     scratch_free(thdr);
     scratch_free(ihdr);
 
-    /* the representatives in row order: ordinals, then their strings */
+    /* the representatives in row order: ordinals, then their strings —
+     * counted per row range on the workers, a prefix over the ranges, then
+     * numbered and listed per range (the count array is free by now) */
+    c.rcnt = cnt;
+    if (par) ray_pool_dispatch_n(pool, dk_reps_count_fn, &c, (uint32_t)nt);
+    else     dk_reps_count_fn(&c, 0, 0, nt);
     int64_t nd = 0;
-    for (int64_t i = 0; i < n; i++)
-        if (rep[i] == (int32_t)i) ord[i] = (int32_t)nd++;
+    for (int64_t t = 0; t < nt; t++) { int64_t k = cnt[t]; cnt[t] = nd; nd += k; }
     size_t dstr_sz = (size_t)nd * sizeof(const char*);
     size_t dlen_sz = (size_t)nd * sizeof(size_t);
     size_t did_sz  = (size_t)nd * sizeof(int64_t);
@@ -3547,15 +3600,16 @@ static bool dk_intern_views(const char* const* sp, const uint32_t* sl, const uin
     size_t*      dlen = (size_t*)dm;       dm += dlen_sz;
     int64_t*     did  = (int64_t*)dm;      dm += did_sz;
     uint32_t*    dhsh = (uint32_t*)dm;
-    for (int64_t i = 0, d = 0; i < n; i++) {
-        if (rep[i] != (int32_t)i) continue;
-        dstr[d] = sp[i]; dlen[d] = sl[i]; dhsh[d] = hash[i];
-        d++;
-    }
-    /* Key strings are values, not names: interned without the dotted-
-     * segment caching that a name with '.' in it gets (a host or URL would
-     * otherwise intern every one of its segments too). */
-    bool ok = ray_sym_intern_batch_no_split(dhsh, dstr, dlen, nd, did) >= 0;
+    c.dstr = dstr; c.dlen = dlen; c.dhsh = dhsh;
+    if (par) ray_pool_dispatch_n(pool, dk_reps_list_fn, &c, (uint32_t)nt);
+    else     dk_reps_list_fn(&c, 0, 0, nt);
+    /* Key strings are values of this query, not names: they go into the
+     * key vector's own domain (released with it), never into the global
+     * table — a host extracted from millions of URLs costs one entry
+     * there for as long as the result lives, and nothing afterwards. */
+    ray_profile_tick("derived key: representatives listed");
+    bool ok = ray_sym_domain_intern_batch(kdom, nd, dstr, dlen, dhsh, did);
+    ray_profile_tick("derived key: key domain interned");
     if (ok) {
         c.did = did;
         if (par) ray_pool_dispatch(pool, dk_assign_fn, &c, n);
@@ -3589,7 +3643,8 @@ static void dk_hash_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
-static bool derived_key_intern_chunk(ray_t* kc, int64_t n, int64_t* out) {
+static bool derived_key_intern_chunk(ray_t* kc, int64_t n, struct ray_sym_domain_s* kdom,
+                                     int64_t* out) {
     dk_hash_ctx_t hc;
     memset(&hc, 0, sizeof(hc));
     str_resolve(kc, &hc.desc, &hc.pool);
@@ -3604,7 +3659,31 @@ static bool derived_key_intern_chunk(ray_t* kc, int64_t n, int64_t* out) {
         ray_pool_dispatch(rp, dk_hash_fn, &hc, n);
     else
         dk_hash_fn(&hc, 0, 0, n);
-    bool ok = dk_intern_views(hc.sp, hc.sl, hc.hash, n, out);
+    bool ok = dk_intern_views(hc.sp, hc.sl, hc.hash, n, kdom, out);
+    scratch_free(hdr);
+    return ok;
+}
+
+/* A chunk result that is already SYM (a symbol-literal arm, say): its
+ * cells as strings through their own domain, interned into the key
+ * domain like any other key string. */
+static bool derived_key_intern_sym_cells(ray_t* kc, int64_t n, struct ray_sym_domain_s* kdom,
+                                         int64_t* out) {
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)n * (sizeof(const char*) + 2 * sizeof(uint32_t)));
+    if (!mem) return false;
+    const char** sp = (const char**)mem;
+    uint32_t* sl = (uint32_t*)(mem + (size_t)n * sizeof(const char*));
+    uint32_t* hash = sl + n;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* a = ray_sym_vec_cell(kc, i);
+        size_t l = a ? ray_str_len(a) : 0;
+        if (l > UINT32_MAX) { scratch_free(hdr); return false; }
+        sp[i] = a ? ray_str_ptr(a) : "";
+        sl[i] = (uint32_t)l;
+        hash[i] = (uint32_t)ray_hash_bytes(sp[i], l);
+    }
+    bool ok = dk_intern_views(sp, sl, hash, n, kdom, out);
     scratch_free(hdr);
     return ok;
 }
@@ -3618,17 +3697,80 @@ typedef struct {
     const int32_t* pos;
     const int64_t* key;      /* spread: key per slot; NULL = write the slot */
     int64_t*       out;
+    bool           sparse;   /* a selection: an unslotted id (-1) takes slot 0 */
 } dk_rows_ctx_t;
 
 static void dk_spread_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     const dk_rows_ctx_t* c = (const dk_rows_ctx_t*)vctx;
+    if (c->sparse) {
+        /* rows outside the selection have no slot: they take slot 0 (the
+         * grouping never reads them — it honours the same selection) */
+        if (c->key) {
+            for (int64_t r = start; r < end; r++) {
+                int32_t s = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
+                c->out[r] = c->key[s >= 0 ? s : 0];
+            }
+        } else {
+            for (int64_t r = start; r < end; r++) {
+                int32_t s = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
+                c->out[r] = s >= 0 ? s : 0;
+            }
+        }
+        return;
+    }
     if (c->key) {
         for (int64_t r = start; r < end; r++)
             c->out[r] = c->key[c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)]];
     } else {
         for (int64_t r = start; r < end; r++)
             c->out[r] = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
+    }
+}
+
+/* ---- the rows of a selection, in row order (every row when sel is NULL):
+ * a cursor over the rowsel's morsel flags — a NONE morsel is skipped, an
+ * ALL morsel is a row range, a MIX morsel its index list. */
+typedef struct {
+    ray_t*          sel;
+    int64_t         nrows;
+    int64_t         seg, n_segs;
+    const uint8_t*  flags;
+    const uint32_t* offs;
+    const uint16_t* idx;
+    int64_t         base;
+    int64_t         r, end;      /* a range: the next row and its end */
+    int64_t         k, kend;     /* an index list: the next entry and its end */
+    int             mode;        /* 0 = between morsels, 1 = range, 2 = indices */
+} dk_sel_it_t;
+
+static void dk_sel_it_init(dk_sel_it_t* it, ray_t* sel, int64_t nrows) {
+    memset(it, 0, sizeof(*it));
+    it->sel = sel; it->nrows = nrows; it->seg = -1;
+    if (!sel) { it->mode = 1; it->r = 0; it->end = nrows; return; }
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    it->n_segs = m->n_segs;
+    it->flags = ray_rowsel_flags(sel);
+    it->offs  = ray_rowsel_offsets(sel);
+    it->idx   = ray_rowsel_idx(sel);
+}
+
+/* The next selected row, or -1 past the last. */
+static inline int64_t dk_sel_it_next(dk_sel_it_t* it) {
+    for (;;) {
+        if (it->mode == 1) { if (it->r < it->end) return it->r++; }
+        else if (it->mode == 2) { if (it->k < it->kend) return it->base + it->idx[it->k++]; }
+        if (!it->sel || ++it->seg >= it->n_segs) { it->mode = 0; return -1; }
+        uint8_t f = it->flags[it->seg];
+        it->base = it->seg * RAY_MORSEL_ELEMS;
+        if (f == RAY_SEL_NONE) { it->mode = 0; continue; }
+        if (f == RAY_SEL_ALL) {
+            it->mode = 1; it->r = it->base;
+            it->end = it->base + RAY_MORSEL_ELEMS;
+            if (it->end > it->nrows) it->end = it->nrows;
+        } else {
+            it->mode = 2; it->k = it->offs[it->seg]; it->kend = it->offs[it->seg + 1];
+        }
     }
 }
 
@@ -4013,10 +4155,12 @@ static void dkp_run_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
-/* The keys of dv[lo, lo+n) through the program, interned into kd[0, n). */
+/* The keys of dv[lo, lo+n) through the program, interned into the key
+ * domain kdom as kd[0, n). */
 static bool dkp_chunk_keys(const dkp_prog_t* P, const void* dv, uint8_t dattrs, int64_t lo,
                            int64_t n, const ray_sym_domain_raw_t* raw,
-                           struct ray_sym_domain_s* dom, int64_t* kd) {
+                           struct ray_sym_domain_s* dom, struct ray_sym_domain_s* kdom,
+                           int64_t* kd) {
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
     uint32_t nwork = par ? ray_pool_total_workers(pool) : 1;
@@ -4034,16 +4178,69 @@ static bool dkp_chunk_keys(const dkp_prog_t* P, const void* dv, uint8_t dattrs, 
         if (par) ray_pool_dispatch(pool, dkp_run_fn, &c, n);
         else     dkp_run_fn(&c, 0, 0, n);
         ray_profile_tick("derived key: program over values");
-        ok = dk_intern_views(c.sp, c.sl, c.hash, n, kd);
+        ok = dk_intern_views(c.sp, c.sl, c.hash, n, kdom, kd);
     }
     scratch_free(rhdr);
     scratch_free(hdr);
     return ok;
 }
 
+/* ---- the key domains of recent key expressions ---------------------------
+ * A key domain is a dictionary of strings: the positions a query's keys get
+ * in it are correct for any later query of the same expression (the keys
+ * are looked up by their bytes; the domain only grows).  So the domain is
+ * kept, by the text of the expression, for the next execution: a repeated
+ * query then interns nothing — every key is a hit — instead of building a
+ * dictionary of millions of hosts from scratch each time.  A few entries,
+ * least recently used out; cleared by (.sys.gc) and at teardown. */
+#define DK_CACHE_N 8
+typedef struct {
+    ray_t*                   text;   /* the expression, formatted */
+    struct ray_sym_domain_s* kdom;   /* one ref held by the cache */
+    uint64_t                 used;
+} dk_cache_ent_t;
+static dk_cache_ent_t g_dk_cache[DK_CACHE_N];
+static uint64_t       g_dk_cache_clock;
+
+/* The cached domain for `text` (retained for the caller), or NULL. */
+static struct ray_sym_domain_s* dk_cache_get(ray_t* text) {
+    size_t n = ray_str_len(text);
+    const char* p = ray_str_ptr(text);
+    for (int i = 0; i < DK_CACHE_N; i++) {
+        dk_cache_ent_t* e = &g_dk_cache[i];
+        if (!e->kdom || ray_str_len(e->text) != n || memcmp(ray_str_ptr(e->text), p, n) != 0) continue;
+        e->used = ++g_dk_cache_clock;
+        ray_sym_domain_retain(e->kdom);
+        return e->kdom;
+    }
+    return NULL;
+}
+
+static void dk_cache_put(ray_t* text, struct ray_sym_domain_s* kdom) {
+    dk_cache_ent_t* v = &g_dk_cache[0];
+    for (int i = 0; i < DK_CACHE_N; i++) {
+        dk_cache_ent_t* e = &g_dk_cache[i];
+        if (!e->kdom) { v = e; break; }
+        if (e->used < v->used) v = e;
+    }
+    if (v->kdom) { ray_sym_domain_release(v->kdom); ray_release(v->text); }
+    ray_retain(text);
+    ray_sym_domain_retain(kdom);
+    v->text = text; v->kdom = kdom; v->used = ++g_dk_cache_clock;
+}
+
+void ray_derived_key_cache_clear(void) {
+    for (int i = 0; i < DK_CACHE_N; i++) {
+        dk_cache_ent_t* e = &g_dk_cache[i];
+        if (e->kdom) ray_sym_domain_release(e->kdom);
+        if (e->text) ray_release(e->text);
+        e->kdom = NULL; e->text = NULL; e->used = 0;
+    }
+}
+
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
                                      struct ray_sym_domain_s* dom, int64_t du) {
-    if (!dom || dom == ray_sym_runtime_domain() || du <= 0) return NULL;
+    if (!dom || du <= 0) return NULL;
     ray_sym_domain_raw_t raw = {0};
     (void)ray_sym_domain_raw_pin(dom, &raw);
 
@@ -4058,7 +4255,12 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
         ray_graph_t* gp = ray_graph_new(probe);
         if (gp) {
             ray_op_t* kop = compile_expr_dag(gp, by_expr);
-            if (kop) sym_out = kop->out_type;
+            /* A key that compiles to a constant — a literal, or a let whose
+             * body is one — evaluates to that literal: a string literal is
+             * typed SYM by the compiler but executes as the STR it is.  The
+             * one-shot evaluation (and the row path behind it) keeps that
+             * type; this path would intern it into a symbol. */
+            if (kop && kop->opcode != OP_CONST) sym_out = kop->out_type;
             ray_graph_free(gp);
         }
         ray_release(probe);
@@ -4070,6 +4272,21 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
     key_dom->len = du;
     int64_t* kd = (int64_t*)ray_data(key_dom);
     const void* dv = ray_data(dom_vec);
+    /* The key strings live in a domain of their own, owned by the key
+     * vector (and by every vector that adopts it): the query's derived
+     * values never enter the global table, and the whole dictionary goes
+     * when the last result column holding it — and the cache above — does.
+     * The cached domain of this expression when there is one. */
+    ray_t* ktext = ray_fmt(by_expr, 0);
+    if (ktext && RAY_IS_ERR(ktext)) { ray_error_free(ktext); ktext = NULL; }
+    bool kdom_fresh = false;
+    {
+        struct ray_sym_domain_s* kdom = ktext ? dk_cache_get(ktext) : NULL;
+        if (!kdom) { kdom = ray_sym_domain_new(); kdom_fresh = true; }
+        if (!kdom) { ray_release(key_dom); if (ktext) ray_release(ktext); goto unpin_null; }
+        key_dom->sym_domain = kdom;               /* the vector takes the ref */
+    }
+    struct ray_sym_domain_s* kdom = key_dom->sym_domain;
 
     /* The per-value program when the key compiles to one, the chunk DAG
      * otherwise. */
@@ -4080,7 +4297,7 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
     for (int64_t lo = 0; lo < du; lo += chunk) {
         int64_t n = du - lo < chunk ? du - lo : chunk;
         if (use_prog) {
-            if (!dkp_chunk_keys(&prog, dv, dom_vec->attrs, lo, n, &raw, dom, kd + lo)) goto fail;
+            if (!dkp_chunk_keys(&prog, dv, dom_vec->attrs, lo, n, &raw, dom, kdom, kd + lo)) goto fail;
             continue;
         }
         ray_t* sv = derived_key_chunk_strs(dv, dom_vec->attrs, lo, n, &raw, dom);
@@ -4103,21 +4320,25 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
         if (!ray_is_vec(kc) || kc->len != n) { ray_release(kc); goto fail; }
         ray_profile_tick("derived key: chunk DAG");
         if (kc->type == RAY_STR) {
-            if (!derived_key_intern_chunk(kc, n, kd + lo)) { ray_release(kc); goto fail; }
+            if (!derived_key_intern_chunk(kc, n, kdom, kd + lo)) { ray_release(kc); goto fail; }
         } else if (RAY_IS_SYM(kc->type)) {
             /* The STR evaluation still produced symbols (e.g. a literal
-             * symbol branch): take them cell by cell as runtime ids. */
-            for (int64_t i = 0; i < n; i++)
-                kd[lo + i] = sym_cell_runtime_id(kc, i);
+             * symbol branch): their strings, into the key domain. */
+            if (!derived_key_intern_sym_cells(kc, n, kdom, kd + lo)) { ray_release(kc); goto fail; }
         } else {
             ray_release(kc);
             goto fail;
         }
         ray_release(kc);
     }
+    if (ktext) {
+        if (kdom_fresh) dk_cache_put(ktext, kdom);
+        ray_release(ktext);
+    }
     ray_sym_domain_raw_unpin(dom);
     return key_dom;
 fail:
+    if (ktext) ray_release(ktext);
     ray_release(key_dom);
 unpin_null:
     ray_sym_domain_raw_unpin(dom);
@@ -4225,6 +4446,8 @@ typedef struct {
     struct ray_sym_domain_s* dom;
     ray_sym_domain_raw_t raw;
     bool           raw_ok;
+    ray_t* const*  rstr;      /* runtime domain: the borrowed atom array */
+    uint32_t       rcnt;
     atomic_int     late;
 } dkv_len_ctx_t;
 
@@ -4236,7 +4459,11 @@ static void dkv_len_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         int64_t pos = ray_read_sym(c->hc, i, RAY_SYM, c->attrs);
         c->nn[i] = pos > 0 ? c->cnt[i] : 0;
         if (pos <= 0) { c->lenw[i] = 0; continue; }
-        if (c->raw_ok && pos < c->raw.count) {
+        if (c->rstr) {
+            ray_t* a = pos < (int64_t)c->rcnt ? c->rstr[pos] : NULL;
+            if (a) c->lenw[i] = c->cnt[i] * (int64_t)ray_str_len(a);
+            else { c->lenw[i] = INT64_MIN; late++; }
+        } else if (c->raw_ok && pos < c->raw.count) {
             size_t l; (void)ray_sym_domain_raw_str(&c->raw, pos, &l);
             c->lenw[i] = c->cnt[i] * (int64_t)l;
         } else {
@@ -4249,10 +4476,9 @@ static void dkv_len_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
 
 /* H (distinct values of C with their counts) in C's domain-position order.
  * The grouping that produced H emits in an order that depends on the core
- * count; the rewrite's output order follows H, and a derived-key grouping
- * on the row path comes out in the same order at every core count (the
- * first-seen order of the key values, which follows the positions of the
- * values they come from).  Positions are distinct, so the order is the
+ * count; the key domain is filled in H's order, and the rewrite's output
+ * is put in key-position order, so it comes out the same at every core
+ * count (the first-seen order of the key values over the vocabulary).  Positions are distinct, so the order is the
  * rank of each position among those present: a bitmap over the domain
  * (set on the workers), a running popcount per word, then a scatter on the
  * workers.  Returns a new table, or NULL (H kept). */
@@ -4362,7 +4588,7 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     int64_t nrows = ray_table_nrows(tbl);
     if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 65536) return NULL;
     struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
-    if (!dom || dom == ray_sym_runtime_domain()) return NULL;
+    if (!dom) return NULL;
 
     /* Every output is one of the decomposable aggregates over C; sort/take
      * clauses may only name output aliases. */
@@ -4454,6 +4680,11 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
             .nn = (int64_t*)ray_data(nn), .lenw = (int64_t*)ray_data(lenw), .dom = dom,
         };
         lc.raw_ok = ray_sym_domain_raw_pin(dom, &lc.raw);
+        if (dom == ray_sym_runtime_domain()) {
+            ray_t** rs = NULL; uint32_t rcnt = 0;
+            ray_sym_strings_borrow(&rs, &rcnt);
+            lc.rstr = rs; lc.rcnt = rcnt;
+        }
         atomic_store_explicit(&lc.late, 0, memory_order_relaxed);
         ray_pool_t* pool = ray_pool_get();
         if (ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD))
@@ -4548,11 +4779,62 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     for (int64_t c = 1; c < rc; c++)
         if (ray_table_col_name(O, c) == kname) { kname = ray_sym_intern("key", 3); break; }
     ray_table_set_col_name(O, 0, kname);
+    /* Unsorted output comes out in the order of the key domain's positions
+     * — the first occurrence of each key over S, i.e. the vocabulary order
+     * of the values — whatever order the grouping over S emitted in (its
+     * strategy, and with it the order, depends on the core count).  A
+     * sort or take clause fixes the order itself. */
+    bool plain = true;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == take_id || kid == asc_id || kid == desc_id) plain = false;
+    }
+    int64_t orows = ray_table_nrows(O);
+    ray_t* okey = ray_table_get_col_idx(O, 0);
+    if (plain && orows > 1 && okey && okey->type == RAY_SYM) {
+        struct ray_sym_domain_s* kdom = ray_sym_vec_domain(okey);
+        int64_t kn = ray_sym_domain_count(kdom);
+        ray_t *shdr = NULL, *ihdr = NULL;
+        int64_t* slot = (int64_t*)scratch_alloc(&shdr, (size_t)(kn > 0 ? kn : 1) * sizeof(int64_t));
+        int64_t* idx  = (int64_t*)scratch_alloc(&ihdr, (size_t)orows * sizeof(int64_t));
+        bool ok = slot && idx;
+        if (ok) {
+            memset(slot, 0xff, (size_t)kn * sizeof(int64_t));
+            const void* kd = ray_data(okey);
+            for (int64_t i = 0; i < orows && ok; i++) {
+                int64_t pos = ray_read_sym(kd, i, RAY_SYM, okey->attrs);
+                if (pos < 0 || pos >= kn || slot[pos] >= 0) ok = false;   /* not a grouping by this key */
+                else slot[pos] = i;
+            }
+        }
+        if (ok) {
+            int64_t m = 0;
+            for (int64_t pos = 0; pos < kn; pos++) if (slot[pos] >= 0) idx[m++] = slot[pos];
+            ok = m == orows;
+        }
+        if (ok) {
+            ray_t* P = ray_table_new(rc);
+            for (int64_t c = 0; c < rc && P && !RAY_IS_ERR(P); c++) {
+                ray_t* src = ray_table_get_col_idx(O, c);
+                ray_t* g = src ? gather_by_idx(src, idx, orows) : NULL;
+                if (!g || RAY_IS_ERR(g)) { if (g) ray_error_free(g); ray_release(P); P = NULL; break; }
+                P = ray_table_add_col(P, ray_table_col_name(O, c), g);
+                ray_release(g);
+            }
+            if (P && !RAY_IS_ERR(P)) { ray_release(O); O = P; }
+            else if (P) ray_error_free(P);
+        }
+        scratch_free(shdr); scratch_free(ihdr);
+    }
     agg_route_note_key_domain();
     return O;
 }
 
-static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
+/* `sel` (a rowsel over tbl, or NULL): only the rows it selects decide
+ * which distinct symbols are evaluated — the grouping that consumes the key
+ * honours the same selection, so a symbol that occurs in no selected row
+ * is never evaluated (nor its key interned). */
+static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel) {
     if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
     int64_t ref_syms[2];
     int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
@@ -4563,6 +4845,14 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     int64_t nrows = ray_table_nrows(tbl);
     if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 4096)
         return NULL;
+    int64_t sel_rows = nrows;
+    if (sel) {
+        /* a rowsel block (ray_rowsel_new: an untyped block, its meta first) */
+        ray_rowsel_t* sm = ray_rowsel_meta(sel);
+        if (!sm || sm->nrows != nrows) return NULL;
+        sel_rows = sm->total_pass;
+        if (sel_rows < 4096) return NULL;
+    }
     struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
     int64_t dn = dom ? ray_sym_domain_count(dom) : 0;
     /* The slot table is dn ints: refuse a domain far wider than the table
@@ -4575,7 +4865,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
      * A 128k-slot open-addressing set on scratch — no dn-sized memory. */
     const void* cd = ray_data(C);
     {
-        const int64_t probe_rows = nrows < 65536 ? nrows : 65536;
+        const int64_t probe_rows = sel_rows < 65536 ? sel_rows : 65536;
         int64_t PROBE_SLOTS = 1024;               /* power of two, load <= 1/2 */
         while (PROBE_SLOTS < 2 * probe_rows) PROBE_SLOTS <<= 1;
         ray_t* set_hdr = NULL;
@@ -4583,8 +4873,12 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
         if (!set) return NULL;
         memset(set, 0xff, (size_t)PROBE_SLOTS * sizeof(int64_t));
         int64_t seen = 0;
+        dk_sel_it_t pit;
+        dk_sel_it_init(&pit, sel, nrows);
         for (int64_t r = 0; r < probe_rows; r++) {
-            int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
+            int64_t row = dk_sel_it_next(&pit);
+            if (row < 0) break;
+            int64_t id = ray_read_sym(cd, row, C->type, C->attrs);
             if (id < 0 || id >= dn) { seen = probe_rows; break; }
             uint64_t h = (((uint64_t)id * 0x9E3779B97F4A7C15ull) >> 32) & (uint64_t)(PROBE_SLOTS - 1);
             while (set[h] >= 0 && set[h] != id) h = (h + 1) & (uint64_t)(PROBE_SLOTS - 1);
@@ -4605,13 +4899,17 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     ray_t* dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), dn);
     if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); scratch_free(pos_hdr); return NULL; }
     ray_sym_vec_adopt_domain(dom_vec, C);
-    int64_t du = 0, du_max = nrows / 2;
+    int64_t du = 0, du_max = sel_rows / 2;
     if (du_max > INT32_MAX) du_max = INT32_MAX;       /* slots are int32 */
-    /* Slots in first-seen row order: the interned key ids follow the slot
-     * order, and with them the order the groups come out in — the same
-     * order the row-wise evaluation gives. */
+    /* Slots in first-seen row order (over the selected rows): the interned
+     * key ids follow the slot order, and with them the order the groups
+     * come out in — the same order the row-wise evaluation gives. */
     bool ok = true;
-    for (int64_t r = 0; r < nrows; r++) {
+    dk_sel_it_t it;
+    dk_sel_it_init(&it, sel, nrows);
+    for (;;) {
+        int64_t r = dk_sel_it_next(&it);
+        if (r < 0) break;
         int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
         if (id < 0 || id >= dn) { ok = false; break; }
         if (pos[id] < 0) {
@@ -4626,6 +4924,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl) {
     dk_rows_ctx_t rc;
     memset(&rc, 0, sizeof(rc));
     rc.cd = cd; rc.attrs = C->attrs; rc.dn = dn;
+    rc.sparse = sel != NULL;
     ray_pool_t* rpool = ray_pool_get();
     bool rows_par = ray_pool_par_dispatch_ok(rpool, nrows, RAY_PARALLEL_THRESHOLD);
 
@@ -11905,7 +12204,7 @@ by_dict_done:
              * named the way the eval-level path names a computed key.  (The
              * grouping decided over the distinct values, derived_key_vocab_aggs,
              * was tried ahead of the WHERE.) */
-            ray_t* dom_key = derived_key_over_sym_domain(by_expr, tbl);
+            ray_t* dom_key = derived_key_over_sym_domain(by_expr, tbl, g->selection);
             if (dom_key) {
                 key_ops[0] = ray_const_vec(g, dom_key);
                 ray_release(dom_key);
@@ -12323,7 +12622,7 @@ by_dict_done:
                     ray_t* cv = ray_table_get_col_idx(filtered_tbl, c);
                     ray_env_set_query_local(cn, cv);
                 }
-                ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl);
+                ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
                 if (!computed_key) computed_key = ray_eval(by_expr);
                 ray_env_pop_scope();
                 if (!computed_key || RAY_IS_ERR(computed_key)) {

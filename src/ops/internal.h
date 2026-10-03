@@ -642,6 +642,9 @@ ray_op_t* graph_alloc_node(ray_graph_t* g);
  * query.c.  Used by fused_* operators that need to evaluate a small
  * predicate without going through the full select planner. */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
+/* Drop the key domains kept for recent derived group keys (query.c):
+ * (.sys.gc) and language teardown. */
+void ray_derived_key_cache_clear(void);
 
 /* Pointer to trailing bytes after an ext node. */
 #define EXT_TRAIL(ext) ((char*)((ext) + 1))

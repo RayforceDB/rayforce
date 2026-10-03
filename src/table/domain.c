@@ -57,6 +57,7 @@
 #endif
 
 #include "domain.h"
+#include "core/profile.h"   /* phase ticks of the batch intern */
 #include "core/platform.h"  /* ray_vm_map_file / ray_vm_unmap_file */
 #include "mem/heap.h"
 #include "mem/sys.h"   /* domain buffers are process-global → mmap-backed, not buddy */
@@ -1008,14 +1009,18 @@ typedef struct {
     int64_t*             uniq;       /* [n_miss] first occurrences, per partition segment */
     int64_t*             part_off;   /* [n_part + 1] */
     int64_t*             uniq_n;     /* [n_part] distinct misses per partition */
-    int64_t*             bytes_p;    /* [n_part] arena bytes the partition's atoms need */
-    void**               region;     /* [n_part] arena region per partition */
+    int64_t*             tab;        /* one block: every partition's dedupe table */
+    int64_t*             tab_off;    /* [n_part + 1] partition table extents in tab */
+    /* the append: new strings k = 0..total-1 in batch order */
+    int64_t*             ui;         /* [total] batch index of new string k */
+    int64_t*             uoff;       /* [total] its byte offset in region */
+    char*                region;     /* one arena region for the whole batch */
+    int64_t              base;       /* position of new string 0 */
     ray_t**              atoms_w;    /* current atom array (fill target) */
     /* Set when a probe met an entry it could not compare (no atom, no
      * raw bytes): the misses are then resolved under the lock instead. */
     _Atomic(bool)        unsure;
     int                  part_shift;
-    _Atomic(bool)        oom;
 } dom_batch_ctx_t;
 
 static void dom_batch_probe_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -1065,14 +1070,13 @@ static void dom_batch_dedupe_fn(void* raw, uint32_t wid, int64_t start, int64_t 
         int64_t lo = b->part_off[p], hi = b->part_off[p + 1];
         int64_t cnt = hi - lo;
         if (cnt == 0) { b->uniq_n[p] = 0; continue; }
-        uint64_t cap = 16;
-        while ((uint64_t)cnt * 2 > cap) cap <<= 1;
-        int64_t* tab = (int64_t*)ray_sys_alloc((size_t)cap * sizeof(int64_t));
-        if (!tab) { atomic_store_explicit(&b->oom, true, memory_order_relaxed); b->uniq_n[p] = 0; continue; }
+        /* the partition's slice of the shared table block (sized by the
+         * caller: a power of two at least twice the partition's misses) */
+        uint64_t cap = (uint64_t)(b->tab_off[p + 1] - b->tab_off[p]);
+        int64_t* tab = b->tab + b->tab_off[p];
         memset(tab, 0xff, (size_t)cap * sizeof(int64_t));   /* -1 = empty */
         uint64_t mask = cap - 1;
         int64_t k = 0;
-        int64_t bytes = 0;
         for (int64_t j = lo; j < hi; j++) {
             int64_t i = b->miss[j];
             uint32_t h = b->hashes[i];
@@ -1092,55 +1096,50 @@ static void dom_batch_dedupe_fn(void* raw, uint32_t wid, int64_t start, int64_t 
             } else {
                 tab[slot] = i;
                 b->uniq[lo + k++] = i;
-                bytes += (int64_t)ray_arena_str_bytes(b->lens[i]);
             }
         }
         b->uniq_n[p] = k;
-        b->bytes_p[p] = bytes;
-        ray_sys_free(tab);
     }
 }
 
-/* Append the partition's distinct strings: build the atoms in the
- * partition's arena region at the positions the caller assigned (batch
- * order), publish them in the reverse index (CAS on the empty slot keeps
- * concurrent partitions from claiming one slot twice) and resolve the
- * partition's repeats.  Runs under the domain lock; the count is
- * published by the caller once every partition is done. */
-static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+/* Append the batch's new strings k0..k1 (positions base + k, assigned in
+ * batch order by the caller): build each atom at its offset in the one
+ * arena region, store it at its position (a contiguous run per task — no
+ * two tasks write the same cache line of the atom array) and publish it in
+ * the reverse index (CAS on the empty slot keeps the probes of the other
+ * tasks correct). */
+static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t k0, int64_t k1) {
     (void)wid;
     dom_batch_ctx_t* b = (dom_batch_ctx_t*)raw;
-    for (int64_t p = start; p < end; p++) {
-        int64_t lo = b->part_off[p];
-        int64_t hi = lo + b->uniq_n[p];
-        char* at = (char*)b->region[p];
-        for (int64_t j = lo; j < hi; j++) {
-            int64_t i = b->uniq[j];
-            int64_t pos = b->out_pos[i];   /* assigned in batch order */
-            ray_t* s = ray_arena_str_at(at, b->strs[i], b->lens[i]);
-            at += ray_arena_str_bytes(b->lens[i]);
-            b->atoms_w[pos] = s;
-            uint32_t h = b->hashes[i];
-            uint64_t e = ((uint64_t)h << 32) | ((uint64_t)(uint32_t)pos + 1);
-            uint64_t slot = h & b->mask;
-            for (;;) {
-                uint64_t cur = 0;
-                if (atomic_compare_exchange_strong_explicit((_Atomic(uint64_t)*)&b->buckets[slot],
-                        &cur, e, memory_order_relaxed, memory_order_relaxed))
-                    break;
-                slot = (slot + 1) & b->mask;
-            }
-        }
-        for (int64_t j = lo; j < b->part_off[p + 1]; j++) {
-            int64_t i = b->miss[j];
-            int64_t v = b->out_pos[i];
-            if (v < -1) b->out_pos[i] = b->out_pos[-(v + 2)];
+    for (int64_t k = k0; k < k1; k++) {
+        int64_t i = b->ui[k];
+        int64_t pos = b->base + k;
+        ray_t* s = ray_arena_str_at(b->region + b->uoff[k], b->strs[i], b->lens[i]);
+        b->atoms_w[pos] = s;
+        uint32_t h = b->hashes[i];
+        uint64_t e = ((uint64_t)h << 32) | ((uint64_t)(uint32_t)pos + 1);
+        uint64_t slot = h & b->mask;
+        for (;;) {
+            uint64_t cur = 0;
+            if (atomic_compare_exchange_strong_explicit((_Atomic(uint64_t)*)&b->buckets[slot],
+                    &cur, e, memory_order_relaxed, memory_order_relaxed))
+                break;
+            slot = (slot + 1) & b->mask;
         }
     }
 }
 
-/* Serial fallback for the misses: find-or-append one by one under the lock
- * (the domain changed under us, or the parallel path ran out of memory). */
+/* A repeated miss takes the position its first occurrence received. */
+static void dom_batch_repeat_fn(void* raw, uint32_t wid, int64_t j0, int64_t j1) {
+    (void)wid;
+    dom_batch_ctx_t* b = (dom_batch_ctx_t*)raw;
+    for (int64_t j = j0; j < j1; j++) {
+        int64_t i = b->miss[j];
+        int64_t v = b->out_pos[i];
+        if (v < -1) b->out_pos[i] = b->out_pos[-(v + 2)];
+    }
+}
+
 static bool dom_batch_append_serial_locked(ray_sym_domain_t* dom, int64_t n,
                                            const char* const* strs, const size_t* lens,
                                            const uint32_t* hashes, int64_t* out_pos) {
@@ -1189,6 +1188,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     b.count   = atomic_load_explicit(&dom->count, memory_order_acquire);
     dom->batch_inflight++;
     dom_unlock();
+    ray_profile_tick("dom batch: index ready");
 
     if (!ray_sym_domain_raw_pin(dom, &b.raw)) b.raw.count = 0;
     b.strs = strs; b.lens = lens; b.hashes = hashes; b.out_pos = out_pos;
@@ -1198,10 +1198,15 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     if (par) ray_pool_dispatch(pool, dom_batch_probe_fn, &b, n);
     else dom_batch_probe_fn(&b, 0, 0, n);
 
-    /* Misses, grouped by hash partition. */
+    /* Misses, grouped by hash partition: no more partitions than workers*4
+     * or than the batch fills with a few thousand misses each.  Every
+     * partition dedupes its misses in its slice of ONE table block — a
+     * batch costs one page-granular allocation for the tables, not one per
+     * partition (and no mapping churn on the workers). */
     int n_part = 1;
     if (par) {
         int64_t want = (int64_t)ray_pool_total_workers(pool) * 4;
+        if (want > n / 4096) want = n / 4096;
         while (n_part < want && n_part < 1024) n_part <<= 1;
     }
     b.part_shift = 31;
@@ -1220,9 +1225,8 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     b.uniq     = (int64_t*)ray_sys_alloc((size_t)n_miss * sizeof(int64_t));
     b.part_off = (int64_t*)ray_sys_alloc((size_t)(n_part + 1) * sizeof(int64_t));
     b.uniq_n   = (int64_t*)ray_sys_alloc((size_t)n_part * sizeof(int64_t));
-    b.bytes_p  = (int64_t*)ray_sys_alloc((size_t)n_part * sizeof(int64_t));
-    b.region   = (void**)ray_sys_alloc((size_t)n_part * sizeof(void*));
-    bool ok = b.miss && b.uniq && b.part_off && b.uniq_n && b.bytes_p && b.region;
+    b.tab_off  = (int64_t*)ray_sys_alloc((size_t)(n_part + 1) * sizeof(int64_t));
+    bool ok = b.miss && b.uniq && b.part_off && b.uniq_n && b.tab_off;
     if (ok) {
         memset(b.part_off, 0, (size_t)(n_part + 1) * sizeof(int64_t));
         for (int64_t i = 0; i < n; i++)
@@ -1234,13 +1238,21 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
             for (int64_t i = 0; i < n; i++)
                 if (out_pos[i] < 0) b.miss[fill[hashes[i] >> b.part_shift]++] = i;
         }
-        if (par) ray_pool_dispatch_n(pool, dom_batch_dedupe_fn, &b, (uint32_t)n_part);
-        else dom_batch_dedupe_fn(&b, 0, 0, n_part);
-        if (atomic_load_explicit(&b.oom, memory_order_relaxed)) {
-            /* Undo the repeat marks; the serial path resolves everything. */
-            for (int64_t i = 0; i < n; i++) if (out_pos[i] < -1) out_pos[i] = -1;
-            ok = false;
+        /* table extents: a power of two at least twice the partition's misses */
+        int64_t tcap = 0;
+        for (int p = 0; p < n_part; p++) {
+            int64_t cnt = b.part_off[p + 1] - b.part_off[p];
+            int64_t cap = 0;
+            if (cnt > 0) { cap = 16; while (cnt * 2 > cap) cap <<= 1; }
+            b.tab_off[p] = tcap;
+            tcap += cap;
         }
+        b.tab_off[n_part] = tcap;
+        b.tab = (int64_t*)ray_sys_alloc((size_t)(tcap > 0 ? tcap : 1) * sizeof(int64_t));
+        if (!b.tab) ok = false;
+        else if (par) ray_pool_dispatch_n(pool, dom_batch_dedupe_fn, &b, (uint32_t)n_part);
+        else dom_batch_dedupe_fn(&b, 0, 0, n_part);
+        ray_profile_tick("dom batch: misses deduped");
     }
 
     dom_lock();
@@ -1257,17 +1269,14 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
          * waiting for this lock. */
         int64_t total = 0;
         for (int p = 0; p < n_part; p++) {
-            int64_t lo = b.part_off[p], keep = 0, bytes = 0;
+            int64_t lo = b.part_off[p], keep = 0;
             for (int64_t j = 0; j < b.uniq_n[p]; j++) {
                 int64_t i = b.uniq[lo+j];
                 int64_t pos = dom_probe_locked(dom, hashes[i], strs[i], lens[i]);
                 if (pos >= 0) out_pos[i] = pos;
-                else {
-                    b.uniq[lo+keep++] = i;
-                    bytes += (int64_t)ray_arena_str_bytes(lens[i]);
-                }
+                else b.uniq[lo+keep++] = i;
             }
-            b.uniq_n[p] = keep; b.bytes_p[p] = bytes; total += keep;
+            b.uniq_n[p] = keep; total += keep;
         }
         b.count = atomic_load_explicit(&dom->count, memory_order_relaxed);
         if ((double)(b.count + total) > 0.7 * (double)(dom->bucket_mask + 1))
@@ -1297,26 +1306,44 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                 }
             }
         }
+        if (ok && total > 0) {
+            b.ui = (int64_t*)ray_sys_alloc((size_t)total * 2 * sizeof(int64_t));
+            if (!b.ui) ok = false;
+            else b.uoff = b.ui + total;
+        }
         if (ok) {
-            /* One arena region per partition; positions in partition order.
-             * Nothing is published until every partition has built its
-             * atoms, so a failed reservation costs only arena space. */
             /* New strings take positions in batch order (first occurrence),
-             * so the symfile does not depend on how the batch was split. */
+             * so the symfile does not depend on how the batch was split;
+             * their atoms go into ONE arena region, each at the offset the
+             * strings before it leave.  Nothing is published until every
+             * atom is built, so a failed reservation costs only arena
+             * space. */
             int64_t pos = base;
-            for (int64_t i = 0; i < n; i++)
-                if (out_pos[i] == -1) out_pos[i] = pos++;
-            for (int p = 0; p < n_part; p++) {
-                b.region[p] = NULL;
-                if (b.bytes_p[p] > 0) {
-                    b.region[p] = ray_arena_alloc_raw(dom->arena, (size_t)b.bytes_p[p]);
-                    if (!b.region[p]) { ok = false; break; }
-                }
+            size_t bytes = 0;
+            for (int64_t i = 0; i < n; i++) {
+                if (out_pos[i] != -1) continue;
+                int64_t k = pos - base;
+                if (k < total) { b.ui[k] = i; b.uoff[k] = (int64_t)bytes; }
+                bytes += ray_arena_str_bytes(lens[i]);
+                out_pos[i] = pos++;
+            }
+            if (pos - base != total) ok = false;
+            if (ok && bytes > 0) {
+                b.region = (char*)ray_arena_alloc_raw(dom->arena, bytes);
+                if (!b.region) ok = false;
             }
             if (ok) {
+                b.base = base;
                 b.atoms_w = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
-                if (par) ray_pool_dispatch_n(pool, dom_batch_insert_fn, &b, (uint32_t)n_part);
-                else dom_batch_insert_fn(&b, 0, 0, n_part);
+                if (total > 0) {
+                    if (par && ray_pool_par_dispatch_ok(pool, total, 4096))
+                        ray_pool_dispatch(pool, dom_batch_insert_fn, &b, total);
+                    else dom_batch_insert_fn(&b, 0, 0, total);
+                }
+                if (par && ray_pool_par_dispatch_ok(pool, n_miss, 4096))
+                    ray_pool_dispatch(pool, dom_batch_repeat_fn, &b, n_miss);
+                else dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                ray_profile_tick("dom batch: inserted");
                 atomic_store_explicit(&dom->count, pos, memory_order_release);
                 /* Same invalidation as dom_append_locked: the runtime LUT
                  * no longer covers the vocabulary. */
@@ -1342,13 +1369,15 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     if (!unchanged || !ok)
         ok = dom_batch_append_serial_locked(dom, n, strs, lens, hashes, out_pos);
     dom_unlock();
+    ray_profile_tick("dom batch: done");
 
     ray_sys_free(b.miss);
     ray_sys_free(b.uniq);
     ray_sys_free(b.part_off);
     ray_sys_free(b.uniq_n);
-    ray_sys_free(b.bytes_p);
-    ray_sys_free(b.region);
+    ray_sys_free(b.tab_off);
+    ray_sys_free(b.tab);
+    ray_sys_free(b.ui);
     return ok;
 }
 

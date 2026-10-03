@@ -290,7 +290,13 @@ static test_result_t test_derived_key_per_symbol_route(void) {
         "(set s (as 'SYMBOL (map (fn [k] (format \"h%.x\" (% k 16))) i))) "
         "(set v (as 'F64 (% i 7))) "
         "(set T (table [s v] (list s v))) "
-        "(set T3 (take T 3000))";
+        "(set T3 (take T 3000)) "
+        /* u: one row in four repeats 16 values, the rest are unique — a
+         * near-unique column as a whole (3/4 + distinct in the probe), a
+         * 16-value one over the rows `(== w 0)` selects */
+        "(set j (til 16384)) "
+        "(set u (as 'SYMBOL (map (fn [k] (if (== 0 (% k 4)) (format \"h%.x\" (% k 16)) (format \"u%.y\" k))) j))) "
+        "(set TU (table [u w v] (list u (% j 4) (as 'F64 (% j 7)))))";
     ray_t* r = ray_eval_str(setup);
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     const struct { const char* q; uint64_t evals; } cases[] = {
@@ -299,6 +305,12 @@ static test_result_t test_derived_key_per_symbol_route(void) {
         { "(select {from: T by: (differ s) c: (count v)})", 0 },
         { "(select {from: T by: (if (> v 3) (substr s 0 2) s) c: (count v)})", 0 },
         { "(select {from: T3 by: (substr s 0 2) c: (count v)})", 0 },
+        /* the selection decides: near-unique over every row, repetitive
+         * over the selected rows */
+        { "(select {from: TU by: (substr u 0 2) c: (count v)})", 0 },
+        { "(select {from: TU by: (substr u 0 2) c: (count v) where: (== w 0)})", 1 },
+        /* a selection below the row floor keeps the row path */
+        { "(select {from: TU by: (substr u 0 2) c: (count v) where: (and (== w 0) (< v 2))})", 0 },
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         agg_route_reset();

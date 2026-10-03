@@ -30,11 +30,45 @@
 (all (== (as 'STR (at (select {from: R asc: c}) 'mn)) (as 'STR (at (select {from: O asc: c}) 'mn)))) -- true
 (all (== (as 'STR (at (select {from: R asc: c}) 'mx)) (as 'STR (at (select {from: O asc: c}) 'mx)))) -- true
 (all (== (as 'STR (at (select {from: R asc: c}) 'p)) (as 'STR (at (select {from: O asc: c}) 'p)))) -- true
-;; the same table in memory (runtime domain) takes the row path and agrees
+;; the same table in memory (the column's ids are runtime ids, read from
+;; the table's own atoms) takes the same route and agrees
 (set RM (key T))
 (== (count RM) (count R)) -- true
 (same RM R 'c) -- true
 (same RM R 'l) -- true
+;; ── the key values never enter the global symbol table ─────────────────
+;; The key strings go into a domain of the key column's own, released with
+;; the result: the runtime table ((.sys.mem) 'sym-count) is exactly as
+;; large after the query as before it, over the file-backed table and over
+;; the in-memory one.  The snapshot is taken inside one expression (a line
+;; of this file interns its own names when it is parsed), and (.sys.mem) is
+;; called once beforehand (its first call interns its own key names).
+(count (.sys.mem)) -- 18
+(set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
+(set NG (nogrow (fn [] (key F))))
+(at NG 0) -- 0
+(same (at NG 1) O 'c) -- true
+(set NGM (nogrow (fn [] (key T))))
+(at NGM 0) -- 0
+(same (at NGM 1) O 'l) -- true
+;; the key column stays a symbol column, resolvable through its own domain
+(type (at (at NG 1) 'p)) -- 'SYM
+(count (distinct (as 'STR (at (at NGM 1) 'p)))) -- 80
+;; and the result survives its source: the domain lives with the column
+(set KEEP (at (at NGM 1) 'p))
+(set NGM 0)
+(count (distinct (as 'STR KEEP))) -- 80
+;; the key domain of an expression is kept for its next execution (every
+;; key a hit, nothing built); (.sys.gc) drops it and the next execution
+;; builds afresh — same groups either way, the global table still untouched
+(set NG2 (nogrow (fn [] (key F))))
+(at NG2 0) -- 0
+(all (== (as 'STR (at (select {from: (at NG2 1) asc: c}) 'p)) (as 'STR (at (select {from: O asc: c}) 'p)))) -- true
+(.sys.gc) -- 0
+(set NG3 (nogrow (fn [] (key F))))
+(at NG3 0) -- 0
+(same (at NG3 1) O 'c) -- true
+(all (== (as 'STR (at (select {from: (at NG3 1) asc: c}) 'p)) (as 'STR (at (select {from: O asc: c}) 'p)))) -- true
 ;; no where: the null group is there, its avg is the null float, its min the empty symbol
 (set R2 (select {from: F by: (substr ref 1 4) c: (count ref) l: (avg (strlen ref)) mn: (min ref)}))
 (set O2 (select {from: F by: (substr ref 1 4) c: (count ref) l: (avg (strlen ref)) mn: (min ref) sv: (sum v)}))
