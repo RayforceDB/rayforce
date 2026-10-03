@@ -1809,19 +1809,28 @@ static test_result_t test_dict_acc_leading_empty(void) {
     PASS();
 }
 
-/* Unique strings: past 65536 rows more than half are distinct, so it dies. */
-static test_result_t test_dict_acc_cap_abandons(void) {
+/* 70000 unique strings: no cap, the dictionary equals the whole-column one. */
+static test_result_t test_dict_acc_high_cardinality(void) {
     int64_t n = 70000;
     ray_t* v = dict_test_col(n, 0, true);
     TEST_ASSERT_NOT_NULL(v);
     ray_dict_acc_t acc;
     TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
     TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, v), RAY_OK);
-    TEST_ASSERT_TRUE(acc.dead);
-    TEST_ASSERT_NULL(acc.codes);
-    TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, v), RAY_OK);   /* no-op */
-    TEST_ASSERT_NULL(ray_dict_acc_finish(&acc, 2 * n));
-    /* below the gate: nothing either */
+    TEST_ASSERT_FALSE(acc.dead);
+    ray_t* got = ray_dict_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    const ray_index_t* g = ray_index_payload(got);
+    const ray_index_t* w = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(g->u.dict.n_distinct, 70000);
+    TEST_ASSERT_EQ_I(g->u.dict.n_distinct, w->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.dict.codes), ray_data(w->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.dict.first_occ), ray_data(w->u.dict.first_occ),
+                            (size_t)w->u.dict.n_distinct * 4), 0);
+    ray_release(got); ray_release(want);
+    /* below the gate: nothing */
     ray_dict_acc_t small;
     TEST_ASSERT_EQ_I(ray_dict_acc_init(&small), RAY_OK);
     v->len = 1000;
@@ -6113,7 +6122,7 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_float",                test_zone_acc_float,                store_setup, store_teardown },
     { "store/dict_acc_slices_equal_compute", test_dict_acc_slices_equal_compute, store_setup, store_teardown },
     { "store/dict_acc_leading_empty", test_dict_acc_leading_empty, store_setup, store_teardown },
-    { "store/dict_acc_cap_abandons",         test_dict_acc_cap_abandons,         store_setup, store_teardown },
+    { "store/dict_acc_high_cardinality",     test_dict_acc_high_cardinality,     store_setup, store_teardown },
     { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },

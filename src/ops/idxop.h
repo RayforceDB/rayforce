@@ -353,7 +353,6 @@ ray_t* ray_index_attach_dict(ray_t** vp);
 
 /* ===== Incremental STR dictionary ===== */
 
-#define RAY_DICT_ACC_MAX_DISTINCT (1 << 20)
 typedef struct {
     int32_t*  codes;     int64_t n_rows;     int64_t cap_rows;
     int32_t*  first_occ; int64_t n_distinct; int64_t cap_distinct;
@@ -361,10 +360,12 @@ typedef struct {
     uint32_t* lens;      /* per distinct: byte length */
     char*     pool;      uint64_t pool_len;  uint64_t pool_cap;
     uint32_t* slot;      uint64_t mask;      /* code + 1, 0 = empty */
-    bool      dead;      /* cap exceeded: nothing is kept any more */
+    bool      dead;      /* row count overflowed int32 codes: nothing is kept */
 } ray_dict_acc_t;
 ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
-/* Appends every row of STR vector v. Past the cap it frees itself,
+/* Appends every row of STR vector v. There is no cardinality cap: the
+ * result matches ray_index_dict_compute for any number of distinct strings.
+ * Only a row count past INT32_MAX (codes are int32) frees the accumulator,
  * sets dead and returns RAY_OK; further adds are no-ops. A non-OK return
  * (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
 ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);

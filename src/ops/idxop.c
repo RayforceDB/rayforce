@@ -1168,9 +1168,10 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
  * Codes are assigned in first-occurrence order, exactly as
  * ray_index_dict_compute assigns them over the whole column, so the result
  * is the same index.  Distinct strings are copied once into a private pool;
- * the column itself is on disk by then.  A column whose distinct count
- * passes the cap gets no dictionary: such a dictionary accelerates nothing
- * and would hold most of the column in memory. */
+ * the column itself is on disk by then.  There is no cardinality cap: the
+ * accumulator holds 4 B/row of codes plus one copy of each distinct string,
+ * less than the whole-column ray_index_dict_compute (codes + slots +
+ * first_occ), and a high-cardinality dictionary still serves distinct. */
 ray_err_t ray_dict_acc_init(ray_dict_acc_t* a) {
     memset(a, 0, sizeof(*a));
     a->mask = 1023;
@@ -1197,11 +1198,6 @@ static ray_err_t dict_acc_rehash(ray_dict_acc_t* a) {
     }
     ray_free_raw(a->slot); a->slot = ns; a->mask = ncap - 1;
     return RAY_OK;
-}
-
-static bool dict_acc_over_cap(const ray_dict_acc_t* a) {
-    if (a->n_distinct > RAY_DICT_ACC_MAX_DISTINCT) return true;
-    return a->n_rows >= 65536 && a->n_distinct * 2 > a->n_rows;
 }
 
 ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
@@ -1265,7 +1261,6 @@ ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
         a->codes[a->n_rows + i] = code;
     }
     a->n_rows += n;
-    if (dict_acc_over_cap(a)) { a->dead = true; ray_dict_acc_free(a); }
     return RAY_OK;
 }
 
