@@ -28,6 +28,8 @@
 #include "vec/vec.h"
 #include "table/table.h"
 #include "table/sym.h"
+#include <math.h>
+#include <stdint.h>
 #include "lang/eval.h"
 #include "ops/ops.h"
 #include "ops/rowsel.h"
@@ -902,6 +904,180 @@ ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2) {
                          "chunk_zone scan failed for type %d", (int)v->type);
     }
     return idx;   /* standalone RAY_INDEX object — caller releases */
+}
+
+/* ── Incremental chunk zone ─────────────────────────────────────────────────
+ * The stream writers see a column in slices; per chunk the zone needs only
+ * running min / max, a null flag and (integers) the exact 128-bit sum and
+ * non-null count, so any slice size and any starting row work, and two
+ * accumulators over disjoint row ranges merge chunk by chunk.  Arrays are
+ * indexed by GLOBAL chunk (row >> 16) so a Parquet task that starts at row
+ * 5 M carries a few empty leading chunks and merges by index. */
+#define ZONE_ACC_LOG2 16
+
+bool ray_zone_acc_supported(int8_t type) { return numeric_elem_size(type) != 0; }
+
+static ray_err_t zone_acc_grow(ray_zone_acc_t* a, uint32_t want) {
+    if (want <= a->n_chunks) return RAY_OK;
+    if (want <= a->cap) { a->n_chunks = want; return RAY_OK; }
+    uint32_t cap = a->cap ? a->cap : 16;
+    while (cap < want) cap *= 2;
+    size_t old = a->cap;
+#define ZONE_GROW(field, T, init) do {                                        \
+        T* p = (T*)ray_realloc_raw(a->field, (size_t)cap * sizeof(T));        \
+        if (!p) return RAY_ERR_OOM;                                           \
+        for (size_t i = old; i < cap; i++) p[i] = (init);                     \
+        a->field = p; } while (0)
+    if (a->is_f64) { ZONE_GROW(fmins, double, INFINITY); ZONE_GROW(fmaxs, double, -INFINITY); }
+    else {
+        ZONE_GROW(mins, int64_t, INT64_MAX); ZONE_GROW(maxs, int64_t, INT64_MIN);
+        ZONE_GROW(sum_lo, uint64_t, 0); ZONE_GROW(sum_hi, int64_t, 0); ZONE_GROW(nn, int64_t, 0);
+    }
+    ZONE_GROW(nulls, uint8_t, 0);
+#undef ZONE_GROW
+    a->cap = cap;
+    a->n_chunks = want;
+    return RAY_OK;
+}
+
+ray_err_t ray_zone_acc_init(ray_zone_acc_t* a, int8_t type, int64_t start_row) {
+    memset(a, 0, sizeof(*a));
+    a->esz = numeric_elem_size(type);
+    if (a->esz == 0 || start_row < 0) return RAY_ERR_TYPE;
+    a->type = type;
+    a->is_f64 = (type == RAY_F64 || type == RAY_F32);
+    a->next_row = start_row;
+    return RAY_OK;
+}
+
+void ray_zone_acc_free(ray_zone_acc_t* a) {
+    ray_free_raw(a->mins); ray_free_raw(a->maxs); ray_free_raw(a->fmins); ray_free_raw(a->fmaxs);
+    ray_free_raw(a->nulls); ray_free_raw(a->sum_lo); ray_free_raw(a->sum_hi); ray_free_raw(a->nn);
+    memset(a, 0, sizeof(*a));
+}
+
+ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v) {
+    if (!a->type || !v || RAY_IS_ERR(v) || v->type != a->type) return RAY_ERR_TYPE;
+    int64_t n = v->len;
+    if (n <= 0) return RAY_OK;
+    int64_t csz = 1LL << ZONE_ACC_LOG2;
+    int64_t last = a->next_row + n - 1;
+    ray_err_t err = zone_acc_grow(a, (uint32_t)(last >> ZONE_ACC_LOG2) + 1);
+    if (err != RAY_OK) return err;
+    const uint8_t* base = (const uint8_t*)ray_data(v);
+    int64_t i = 0;
+    while (i < n) {
+        if (RAY_UNLIKELY(ray_interrupted())) return RAY_ERR_CANCEL;
+        int64_t row = a->next_row + i;
+        uint32_t g = (uint32_t)(row >> ZONE_ACC_LOG2);
+        int64_t e = ((int64_t)g + 1) * csz - a->next_row; if (e > n) e = n;
+        bool any_null = false;
+        if (a->is_f64) {
+            double mn = a->fmins[g], mx = a->fmaxs[g];
+            for (; i < e; i++) {
+                if (ray_vec_is_null(v, i)) { any_null = true; continue; }
+                double val;
+                if (a->esz == 4) { float t; memcpy(&t, base + i * 4, 4); val = (double)t; }
+                else memcpy(&val, base + i * 8, 8);
+                if (isnan(val)) { any_null = true; continue; }
+                if (val < mn) mn = val;
+                if (val > mx) mx = val;
+            }
+            a->fmins[g] = mn; a->fmaxs[g] = mx;
+        } else {
+            int64_t mn = a->mins[g], mx = a->maxs[g], nn = a->nn[g], hi = a->sum_hi[g];
+            uint64_t lo = a->sum_lo[g];
+            for (; i < e; i++) {
+                if (ray_vec_is_null(v, i)) { any_null = true; continue; }
+                int64_t val = 0;
+                switch (a->esz) {
+                case 1: val = (int64_t)base[i]; break;
+                case 2: { int16_t t; memcpy(&t, base + i * 2, 2); val = t; break; }
+                case 4: { int32_t t; memcpy(&t, base + i * 4, 4); val = t; break; }
+                default: { int64_t t; memcpy(&t, base + i * 8, 8); val = t; break; }
+                }
+                if (val < mn) mn = val;
+                if (val > mx) mx = val;
+                ray_i128_add(&hi, &lo, val);
+                nn++;
+            }
+            a->mins[g] = mn; a->maxs[g] = mx; a->nn[g] = nn; a->sum_hi[g] = hi; a->sum_lo[g] = lo;
+        }
+        if (any_null) a->nulls[g] = 1;
+    }
+    a->next_row += n;
+    return RAY_OK;
+}
+
+ray_err_t ray_zone_acc_merge(ray_zone_acc_t* dst, const ray_zone_acc_t* src) {
+    if (!dst->type || dst->type != src->type) return RAY_ERR_TYPE;
+    ray_err_t err = zone_acc_grow(dst, src->n_chunks);
+    if (err != RAY_OK) return err;
+    for (uint32_t g = 0; g < src->n_chunks; g++) {
+        if (dst->is_f64) {
+            if (src->fmins[g] < dst->fmins[g]) dst->fmins[g] = src->fmins[g];
+            if (src->fmaxs[g] > dst->fmaxs[g]) dst->fmaxs[g] = src->fmaxs[g];
+        } else {
+            if (src->mins[g] < dst->mins[g]) dst->mins[g] = src->mins[g];
+            if (src->maxs[g] > dst->maxs[g]) dst->maxs[g] = src->maxs[g];
+            dst->nn[g] += src->nn[g];
+            ray_i128_add128(&dst->sum_hi[g], &dst->sum_lo[g], src->sum_hi[g], src->sum_lo[g]);
+        }
+        dst->nulls[g] |= src->nulls[g];
+    }
+    if (src->next_row > dst->next_row) dst->next_row = src->next_row;
+    return RAY_OK;
+}
+
+ray_t* ray_zone_acc_finish(ray_zone_acc_t* a, int64_t len) {
+    int64_t csz = 1LL << ZONE_ACC_LOG2;
+    if (!a->type || len < csz) { ray_zone_acc_free(a); return NULL; }
+    uint32_t n_chunks = (uint32_t)((len + csz - 1) / csz);
+    ray_err_t err = zone_acc_grow(a, n_chunks);   /* chunks never touched stay empty */
+    if (err != RAY_OK) { ray_zone_acc_free(a); return ray_error("oom", "chunk_zone: arrays alloc"); }
+    ray_t* idx = ray_index_alloc(RAY_IDX_CHUNK_ZONE, a->type, len);
+    if (!idx || RAY_IS_ERR(idx)) { ray_zone_acc_free(a); return idx; }
+    ray_index_t* ix = ray_index_payload(idx);
+    ix->u.chunk_zone.n_chunks = n_chunks;
+    ix->u.chunk_zone.chunk_log2 = ZONE_ACC_LOG2;
+    ix->u.chunk_zone.is_f64 = a->is_f64;
+    int8_t arr_type = a->is_f64 ? RAY_F64 : RAY_I64;
+    ray_t* mins = ray_vec_new(arr_type, n_chunks);
+    ray_t* maxs = ray_vec_new(arr_type, n_chunks);
+    int64_t nb_len = (n_chunks + 7) / 8;
+    ray_t* nbits = ray_vec_new(RAY_U8, nb_len);
+    ray_t* aggs = a->is_f64 ? NULL : ray_vec_new(RAY_I64, 3 * (int64_t)n_chunks);
+    if (!mins || RAY_IS_ERR(mins) || !maxs || RAY_IS_ERR(maxs) || !nbits || RAY_IS_ERR(nbits) ||
+        (!a->is_f64 && (!aggs || RAY_IS_ERR(aggs)))) {
+        if (mins && !RAY_IS_ERR(mins)) ray_release(mins);
+        if (maxs && !RAY_IS_ERR(maxs)) ray_release(maxs);
+        if (nbits && !RAY_IS_ERR(nbits)) ray_release(nbits);
+        if (aggs && !RAY_IS_ERR(aggs)) ray_release(aggs);
+        ray_release(idx); ray_zone_acc_free(a);
+        return ray_error("oom", "chunk_zone: arrays alloc");
+    }
+    mins->len = n_chunks; maxs->len = n_chunks; nbits->len = nb_len;
+    memset(ray_data(nbits), 0, (size_t)nb_len);
+    if (a->is_f64) {
+        memcpy(ray_data(mins), a->fmins, (size_t)n_chunks * 8);
+        memcpy(ray_data(maxs), a->fmaxs, (size_t)n_chunks * 8);
+    } else {
+        memcpy(ray_data(mins), a->mins, (size_t)n_chunks * 8);
+        memcpy(ray_data(maxs), a->maxs, (size_t)n_chunks * 8);
+        aggs->len = 3 * (int64_t)n_chunks;
+        int64_t* ag = (int64_t*)ray_data(aggs);
+        for (uint32_t g = 0; g < n_chunks; g++) {
+            ag[g] = (int64_t)a->sum_lo[g];
+            ag[n_chunks + g] = a->nn[g];
+            ag[2 * (int64_t)n_chunks + g] = a->sum_hi[g];
+        }
+    }
+    uint8_t* nb = (uint8_t*)ray_data(nbits);
+    for (uint32_t g = 0; g < n_chunks; g++) if (a->nulls[g]) nb[g >> 3] |= (uint8_t)(1u << (g & 7));
+    ix->u.chunk_zone.mins = mins; ix->u.chunk_zone.maxs = maxs;
+    ix->u.chunk_zone.null_bits = nbits; ix->u.chunk_zone.aggs = aggs;
+    ray_zone_acc_free(a);
+    return idx;
 }
 
 /* ── RAY_IDX_DICT: per-column string dictionary (codes + first-occ rows) ──

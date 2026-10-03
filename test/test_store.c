@@ -1592,6 +1592,138 @@ static test_result_t test_col_append_index_rollback(void) {
 #endif
 }
 
+/* Fill v with i*3, every 97th row null, rows [a, b) all null. */
+static ray_t* zone_test_col(int64_t n, int64_t null_from, int64_t null_to) {
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        d[i] = (i % 97 == 0 || (i >= null_from && i < null_to)) ? NULL_I64 : i * 3;
+    v->attrs |= 0x40;  /* RAY_ATTR_HAS_NULLS */
+    return v;
+}
+
+static bool zone_equal(ray_t* a, ray_t* b) {
+    const ray_index_t* x = ray_index_payload(a);
+    const ray_index_t* y = ray_index_payload(b);
+    if (x->u.chunk_zone.n_chunks != y->u.chunk_zone.n_chunks) return false;
+    if (x->u.chunk_zone.is_f64 != y->u.chunk_zone.is_f64) return false;
+    size_t n = x->u.chunk_zone.n_chunks;
+    if (memcmp(ray_data(x->u.chunk_zone.mins), ray_data(y->u.chunk_zone.mins), n * 8)) return false;
+    if (memcmp(ray_data(x->u.chunk_zone.maxs), ray_data(y->u.chunk_zone.maxs), n * 8)) return false;
+    if (memcmp(ray_data(x->u.chunk_zone.null_bits), ray_data(y->u.chunk_zone.null_bits), (n + 7) / 8)) return false;
+    if ((x->u.chunk_zone.aggs == NULL) != (y->u.chunk_zone.aggs == NULL)) return false;
+    if (x->u.chunk_zone.aggs &&
+        memcmp(ray_data(x->u.chunk_zone.aggs), ray_data(y->u.chunk_zone.aggs), n * 3 * 8)) return false;
+    return true;
+}
+
+/* Uneven slices (70000 rows), an all-null chunk 2, equals the whole-column zone. */
+static test_result_t test_zone_acc_slices_equal_compute(void) {
+    int64_t n = 300000;
+    ray_t* v = zone_test_col(n, 131072, 196608);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_I64, 0), RAY_OK);
+    for (int64_t off = 0; off < n; off += 70000) {
+        int64_t cnt = n - off < 70000 ? n - off : 70000;
+        ray_t* s = ray_vec_from_raw(RAY_I64, (int64_t*)ray_data(v) + off, cnt);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    /* a zero-row append opens nothing */
+    ray_t* empty = ray_vec_new(RAY_I64, 0);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, empty), RAY_OK);
+    ray_release(empty);
+    TEST_ASSERT_EQ_I(acc.n_chunks, 5);
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    const ray_index_t* ix = ray_index_payload(got);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[2], INT64_MAX);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.maxs))[2], INT64_MIN);
+    TEST_ASSERT_TRUE(((uint8_t*)ray_data(ix->u.chunk_zone.null_bits))[0] & (1u << 2));
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* Exactly one chunk; an append ending on the boundary opens no second chunk. */
+static test_result_t test_zone_acc_one_chunk(void) {
+    int64_t n = 65536;
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_I64, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, v), RAY_OK);
+    TEST_ASSERT_EQ_I(acc.n_chunks, 1);
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    TEST_ASSERT_EQ_I(ray_index_payload(got)->u.chunk_zone.n_chunks, 1);
+    ray_release(got);
+    /* below the gate: nothing */
+    ray_zone_acc_t small;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&small, RAY_I64, 0), RAY_OK);
+    v->len = 65535;
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&small, v), RAY_OK);
+    TEST_ASSERT_NULL(ray_zone_acc_finish(&small, 65535));
+    v->len = n;
+    ray_release(v);
+    PASS();
+}
+
+/* Two accumulators split mid-chunk (at row 100000) merge into the whole. */
+static test_result_t test_zone_acc_merge_mid_chunk(void) {
+    int64_t n = 200000, split = 100000;
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_t* lo = ray_vec_from_raw(RAY_I64, ray_data(v), split);
+    ray_t* hi = ray_vec_from_raw(RAY_I64, (int64_t*)ray_data(v) + split, n - split);
+    TEST_ASSERT_TRUE(lo && hi);
+    ray_zone_acc_t a, b;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&a, RAY_I64, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&b, RAY_I64, split), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&b, hi), RAY_OK);   /* later range first */
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&a, lo), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_merge(&a, &b), RAY_OK);
+    ray_zone_acc_free(&b);
+    ray_t* got = ray_zone_acc_finish(&a, n);
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    ray_release(got); ray_release(want); ray_release(lo); ray_release(hi); ray_release(v);
+    PASS();
+}
+
+/* F64 with NaN nulls: float arrays, no aggs. */
+static test_result_t test_zone_acc_float(void) {
+    int64_t n = 150000;
+    ray_t* v = ray_vec_new(RAY_F64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    double* d = (double*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = (i % 1000 == 7) ? NAN : (double)i * 0.5;
+    v->attrs |= 0x40;  /* RAY_ATTR_HAS_NULLS */
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_F64, 0), RAY_OK);
+    for (int64_t off = 0; off < n; off += 40000) {
+        int64_t cnt = n - off < 40000 ? n - off : 40000;
+        ray_t* s = ray_vec_from_raw(RAY_F64, d + off, cnt);
+        TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    TEST_ASSERT_NULL(ray_index_payload(got)->u.chunk_zone.aggs);
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
 static test_result_t test_file_rename_new(void) {
 #ifdef RAY_OS_WASM
     SKIP("exclusive rename is unavailable on this host");
@@ -5625,6 +5757,10 @@ const test_entry_t store_entries[] = {
     { "store/file_rename", test_file_rename_op, store_setup, store_teardown },
     { "store/col_close_failure", test_col_close_failure, store_setup, store_teardown },
     { "store/col_append_index_rollback", test_col_append_index_rollback, store_setup, store_teardown },
+    { "store/zone_acc_slices_equal_compute", test_zone_acc_slices_equal_compute, store_setup, store_teardown },
+    { "store/zone_acc_one_chunk",            test_zone_acc_one_chunk,            store_setup, store_teardown },
+    { "store/zone_acc_merge_mid_chunk",      test_zone_acc_merge_mid_chunk,      store_setup, store_teardown },
+    { "store/zone_acc_float",                test_zone_acc_float,                store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },

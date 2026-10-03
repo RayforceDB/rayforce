@@ -277,6 +277,35 @@ ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
  * compute an index for persistence without COWing a shared column. */
 ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
 
+/* ===== Incremental chunk-zone accumulator ===== */
+
+typedef struct {
+    int8_t    type;       /* column type; 0 = inactive */
+    uint8_t   is_f64;     /* F32 / F64 column: fmins/fmaxs used, no sums */
+    int       esz;        /* element size in bytes */
+    int64_t   next_row;   /* global row the next ray_zone_acc_add starts at */
+    uint32_t  n_chunks;   /* chunks in use so far, indexed by global chunk */
+    uint32_t  cap;        /* chunks allocated */
+    int64_t*  mins;  int64_t* maxs;    /* integer zones */
+    double*   fmins; double*  fmaxs;   /* float zones */
+    uint8_t*  nulls;      /* one byte per chunk: 1 = any null in chunk */
+    uint64_t* sum_lo; int64_t* sum_hi; int64_t* nn;   /* integer zones only */
+} ray_zone_acc_t;
+
+/* true when `type` gets a chunk zone (the ten numeric/temporal types). */
+bool      ray_zone_acc_supported(int8_t type);
+/* Start accumulating rows of `type` from global row `start_row`. */
+ray_err_t ray_zone_acc_init(ray_zone_acc_t* a, int8_t type, int64_t start_row);
+/* Rows [next_row, next_row + v->len) are v; v->type must equal a->type. */
+ray_err_t ray_zone_acc_add(ray_zone_acc_t* a, ray_t* v);
+/* dst += src, chunk by chunk; both must have the same type. src is untouched. */
+ray_err_t ray_zone_acc_merge(ray_zone_acc_t* dst, const ray_zone_acc_t* src);
+/* The standalone RAY_IDX_CHUNK_ZONE index for a column of `len` rows
+ * (chunk_log2 16), identical to ray_index_chunk_zone_compute(col, 16);
+ * NULL when len < 65536. Frees the accumulator either way. */
+ray_t*    ray_zone_acc_finish(ray_zone_acc_t* a, int64_t len);
+void      ray_zone_acc_free(ray_zone_acc_t* a);
+
 /* 128-bit two's-complement accumulation of int64 values: (hi, lo) += v.
  * The engine's integer avg sums this way — exact for any column, and the
  * same bits whatever the morsel split — and the chunk-zone metadata keeps
