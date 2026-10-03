@@ -1274,6 +1274,19 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
 }
 
 ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
-    (void)path; (void)zone;
-    return RAY_ERR_NYI;   /* Task 5 replaces this */
+    if (!path) return RAY_ERR_DOMAIN;
+    ray_t* col = ray_col_load(path);
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    ray_err_t err = RAY_ERR_IO;
+    ray_t* hi = ray_idx_hash_fn(col);
+    if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
+        err = ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
+        ray_release(hi);
+    } else if (hi) {
+        if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi);
+    }
+    if (err != RAY_OK && zone)
+        err = ray_col_append_index(path, ray_index_payload(zone), col->len, col->type);
+    ray_release(col);
+    return err;
 }
