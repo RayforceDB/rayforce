@@ -26,6 +26,7 @@
 
 #include <rayforce.h>
 #include <string.h>
+#include <stdio.h>
 
 struct ray_sym_domain_s;
 
@@ -116,6 +117,14 @@ ray_t*    ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* do
  * store/ header). */
 ray_err_t ray_col_append_index(const char* path, const void* ix,
                                int64_t col_len, int8_t col_type);
+
+/* Seek f to its end, pad to 32 bytes and write ix's inline region there;
+ * flushes. Does not touch the header. The caller stamps the marker with
+ * ray_col_stamp_index or rolls the file back on error. */
+ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload_end_out);
+
+/* Put the "index present" marker into a 32-byte header image. */
+void      ray_col_stamp_index(ray_t* hdr);
 
 
 #endif /* RAY_COL_H */
