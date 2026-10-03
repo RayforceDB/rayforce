@@ -71,8 +71,10 @@ ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sy
 ray_t*    ray_splay_load(const char* dir, const char* sym_path);
 ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
 
-/* Append chunk-zone index regions to a freshly-streamed splayed store's column
- * files so later mmap loads get block-skip.  Best-effort, per numeric column. */
+/* Append chunk-zone index regions to the column files of a splayed store
+ * written from a resident table, so later mmap loads get block-skip.  Used by
+ * `.db.splayed.set` only; the CSV and Parquet converters build their indexes
+ * inline in the stream writer.  Best-effort, per numeric column. */
 void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
 /* Append a hash index to the column file at path, using its kept chunk zone
  * (Task 5 deliverable). */

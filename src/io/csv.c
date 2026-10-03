@@ -2590,7 +2590,9 @@ static int csv_hash_elem_size(int8_t t) {
  *
  * Returns 1 to attach, 0 to skip. */
 /* Payload-level core of the hash-upgrade decision.  Its only caller is the
- * .csv.splayed index builder (ray_splay_build_indexes): indexing is a
+ * .csv.splayed / Parquet conversion path: the stream writer builds each
+ * column's chunk zone inline and, for integer columns whose zone passes this
+ * check, the column is re-read once to build the hash.  Indexing is a
  * CONVERSION-time decision, made once and persisted with the column files.
  * A `.csv.read` into memory attaches nothing (it used to run this same
  * heuristic over every column and throw the result away — 19.7 s of a 46 s
