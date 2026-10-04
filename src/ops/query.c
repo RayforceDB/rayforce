@@ -3190,6 +3190,66 @@ static int64_t derived_key_name(ray_t* by_expr) {
     }
     return ray_sym_intern("key", 3);
 }
+/* The column of a computed group key `v` over `tbl`, caller owns it.  The
+ * caller has pushed a query scope binding `tbl`'s columns; a partitioned
+ * column the key reads is bound flattened for the evaluation and restored
+ * after.  Compiled as a projection where it can be: group-key expressions
+ * have the same row-wise semantics as projections, and eval-level `if`
+ * tests whole-vector truthiness and would choose one branch for every
+ * input row. */
+static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
+    /* Exact-size carve: collect_col_refs dedups against real table
+     * columns, so ray_table_ncols(tbl) is a hard upper bound. */
+    int64_t ncols_max = ray_table_ncols(tbl);
+    if (ncols_max < 1) ncols_max = 1;
+    ray_t* refs_hdr = NULL;
+    int64_t* ref_syms = (int64_t*)scratch_alloc(&refs_hdr,
+            (size_t)ncols_max * (sizeof(int64_t) + sizeof(ray_t*)));
+    if (!ref_syms) return ray_error("oom", NULL);
+    ray_t** materialized_refs = (ray_t**)(ref_syms + ncols_max);
+    int n_refs = collect_col_refs(v, tbl, ref_syms, (int)ncols_max, 0);
+    for (int ri = 0; ri < n_refs; ri++) materialized_refs[ri] = NULL;
+    ray_t* col_vec = NULL;
+    for (int ri = 0; ri < n_refs && !col_vec; ri++) {
+        ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
+        if (ref_col && (RAY_IS_PARTED(ref_col->type) ||
+                        ref_col->type == RAY_MAPCOMMON)) {
+            ray_t* flat = query_materialize_parted_col(ref_col);
+            if (!flat || RAY_IS_ERR(flat)) {
+                col_vec = flat ? flat : ray_error("oom", NULL);
+                break;
+            }
+            materialized_refs[ri] = flat;
+            ray_env_set_query_local(ref_syms[ri], flat);
+        }
+    }
+    if (!col_vec) {
+        ray_graph_t* key_graph = ray_graph_new(tbl);
+        if (!key_graph) col_vec = ray_error("oom", NULL);
+        else {
+            ray_op_t* key_op = compile_expr_dag(key_graph, v);
+            if (key_op) {
+                key_op = ray_optimize(key_graph, key_op);
+                col_vec = ray_execute(key_graph, key_op);
+                if (!col_vec) col_vec = ray_error("domain", "by-dict key execution failed");
+            }
+            ray_graph_free(key_graph);
+        }
+        if (!col_vec) col_vec = ray_eval(v);
+        if (ray_is_lazy(col_vec))
+            col_vec = ray_lazy_materialize(col_vec);
+    }
+    for (int ri = 0; ri < n_refs; ri++) {
+        if (materialized_refs[ri]) {
+            ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
+            if (ref_col) ray_env_set_query_local(ref_syms[ri], ref_col);
+            ray_release(materialized_refs[ri]);
+        }
+    }
+    scratch_free(refs_hdr);
+    return col_vec;
+}
+
 #define DERIVED_KEY_MAX_DOMAIN (64LL * 1024 * 1024)
 /* The distinct-symbol evaluation, in chunks and over STR.
  *
@@ -8851,6 +8911,110 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     return ray_select_impl(args, n, false);
 }
 
+/* The hidden name a bare computed by: key is grouped under (#707). */
+#define SELECT_COMPUTED_KEY "__by_key"
+
+/* A bare computed by: key (`by: (% v 3)`) groups on the DAG path only beside
+ * plain aggregates.  Any other output (a `distinct` aggregate, a row
+ * expression) would send it to the eval-level grouping, which is slower
+ * (10-20% at 10M rows); the by-dict form `{k: (% v 3)}` materializes the key
+ * once and keeps the DAG path's speed for every output shape.  So
+ * that is the query this plans: the same dict with by: as a one-key by-dict
+ * under a hidden name, from: the table already evaluated, and a sort key
+ * naming the derived key column redirected to the hidden one.  The caller
+ * renames the hidden column to `*key_name`, the name the DAG path gives a
+ * computed key.  NULL when the shape needs no rewrite. */
+static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_name) {
+    ray_t* by_expr = dict_get(dict, "by");
+    if (!by_expr || by_expr->type != RAY_LIST || ray_len(by_expr) < 1) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    int64_t rid[7];
+    for (int i = 0; i < 7; i++) rid[i] = ray_sym_intern(reserved[i], strlen(reserved[i]));
+    int64_t nd = ray_dict_len(dict);
+    int64_t hidden = ray_sym_intern(SELECT_COMPUTED_KEY, strlen(SELECT_COMPUTED_KEY));
+    int64_t kname = derived_key_name(by_expr);
+    bool needs_eval = false;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        bool clause = false;
+        for (int r = 0; r < 7; r++) if (kid == rid[r]) clause = true;
+        if (clause) continue;
+        if (kid == kname) kname = ray_sym_intern("key", 3);
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        /* the routing's own test for an output the DAG group cannot serve */
+        if (is_single_group_key_projection(by_expr, v)) continue;
+        if (is_group_dag_agg_expr(v)) continue;
+        if (is_decomposable_agg_compound(v, tbl)) continue;
+        needs_eval = true;
+    }
+    if (!needs_eval || ray_table_get_col(tbl, hidden)) return NULL;
+
+    ray_t* bk = ray_vec_new(RAY_SYM, 1);
+    ray_t* bv = ray_list_new(1);
+    if (bk && !RAY_IS_ERR(bk)) { ((int64_t*)ray_data(bk))[0] = hidden; bk->len = 1; }
+    if (bv && !RAY_IS_ERR(bv)) bv = ray_list_append(bv, by_expr);
+    ray_t* by_dict = ray_dict_new(bk, bv);
+    if (!by_dict || RAY_IS_ERR(by_dict)) return by_dict ? by_dict : ray_error("oom", NULL);
+
+    ray_t* engine = dict;
+    ray_retain(engine);
+    ray_t* k_by = ray_sym(rid[2]);
+    engine = k_by && !RAY_IS_ERR(k_by) ? ray_dict_upsert(engine, k_by, by_dict) : engine;
+    if (k_by) ray_release(k_by);
+    ray_release(by_dict);
+    ray_t* k_from = ray_sym(rid[0]);
+    if (engine && !RAY_IS_ERR(engine) && k_from && !RAY_IS_ERR(k_from))
+        engine = ray_dict_upsert(engine, k_from, tbl);
+    if (k_from) ray_release(k_from);
+    /* asc:/desc: name result columns: the derived key is the hidden one */
+    for (int r = 4; r <= 5 && engine && !RAY_IS_ERR(engine); r++) {
+        ray_t* sv = dict_get(engine, reserved[r]);
+        ray_t* nv = NULL;
+        if (sv && sv->type == -RAY_SYM && sv->i64 == kname) {
+            nv = ray_sym(hidden);
+            if (nv && !RAY_IS_ERR(nv)) nv->attrs = sv->attrs;
+        } else if (sv && sv->type == RAY_SYM) {
+            int64_t n = ray_len(sv);
+            bool hit = false;
+            for (int64_t j = 0; j < n; j++) if (sym_cell_runtime_id(sv, j) == kname) hit = true;
+            if (hit) {
+                nv = ray_vec_new(RAY_SYM, n);
+                if (nv && !RAY_IS_ERR(nv)) {
+                    for (int64_t j = 0; j < n; j++) {
+                        int64_t id = sym_cell_runtime_id(sv, j);
+                        ((int64_t*)ray_data(nv))[j] = id == kname ? hidden : id;
+                    }
+                    nv->len = n;
+                }
+            }
+        }
+        if (!nv) continue;
+        if (RAY_IS_ERR(nv)) { ray_release(engine); return nv; }
+        ray_t* k_s = ray_sym(rid[r]);
+        if (!k_s || RAY_IS_ERR(k_s)) { ray_release(nv); ray_release(engine); return k_s ? k_s : ray_error("oom", NULL); }
+        engine = ray_dict_upsert(engine, k_s, nv);
+        ray_release(k_s);
+        ray_release(nv);
+    }
+    if (!engine || RAY_IS_ERR(engine)) return engine ? engine : ray_error("oom", NULL);
+    *key_name = kname;
+    return engine;
+}
+
+/* Names the hidden key column of a select_plan_computed_key result. */
+static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
+    if (r && !RAY_IS_ERR(r) && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE) return r;
+    int64_t hidden = ray_sym_intern(SELECT_COMPUTED_KEY, strlen(SELECT_COMPUTED_KEY));
+    int64_t nc = ray_table_ncols(r);
+    for (int64_t c = 0; c < nc; c++)
+        if (ray_table_col_name(r, c) == hidden) { ray_table_set_col_name(r, c, key_name); break; }
+    return r;
+}
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
@@ -8923,6 +9087,18 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
             ray_release(engine);
             ray_release(tbl);
             return r;
+        }
+    }
+
+    {
+        int64_t key_name = -1;
+        ray_t* engine = select_plan_computed_key(dict, tbl, &key_name);
+        if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
+        if (engine) {
+            ray_t* r = ray_select_impl(&engine, 1, true);
+            ray_release(engine);
+            ray_release(tbl);
+            return select_name_computed_key(r, key_name);
         }
     }
 
@@ -9719,73 +9895,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                 sv_data[i] = k->i64;
                 continue;
             }
-            /* Exact-size carve: collect_col_refs dedups against real table
-             * columns, so ray_table_ncols(tbl) is a hard upper bound — no
-             * silent truncation past the former [16] cap.  Scoped to this
-             * loop iteration only (tbl may gain a column each pass via
-             * ray_table_add_col below), freed before every exit. */
-            int64_t ncols_max = ray_table_ncols(tbl);
-            if (ncols_max < 1) ncols_max = 1;
-            ray_t* refs_hdr = NULL;
-            int64_t* ref_syms = (int64_t*)scratch_alloc(&refs_hdr,
-                    (size_t)ncols_max * (sizeof(int64_t) + sizeof(ray_t*)));
-            if (!ref_syms) {
-                fail_err = ray_error("oom", NULL);
-                failed = true; break;
-            }
-            ray_t** materialized_refs = (ray_t**)(ref_syms + ncols_max);
-            int n_refs = collect_col_refs(v, tbl, ref_syms, (int)ncols_max, 0);
-            for (int ri = 0; ri < n_refs; ri++) materialized_refs[ri] = NULL;
-            for (int ri = 0; ri < n_refs; ri++) {
-                ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
-                if (ref_col && (RAY_IS_PARTED(ref_col->type) ||
-                                ref_col->type == RAY_MAPCOMMON)) {
-                    ray_t* flat = query_materialize_parted_col(ref_col);
-                    if (!flat || RAY_IS_ERR(flat)) {
-                        fail_err = flat ? flat : ray_error("oom", NULL);
-                        failed = true; break;
-                    }
-                    materialized_refs[ri] = flat;
-                    ray_env_set_query_local(ref_syms[ri], flat);
-                }
-            }
-            if (failed) {
-                for (int ri = 0; ri < n_refs; ri++) {
-                    if (materialized_refs[ri]) {
-                        ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
-                        if (ref_col) ray_env_set_query_local(ref_syms[ri], ref_col);
-                        ray_release(materialized_refs[ri]);
-                    }
-                }
-                scratch_free(refs_hdr);
-                break;
-            }
-            /* Group-key expressions have the same row-wise semantics as
-             * projections. In particular, eval-level `if` tests whole-vector
-             * truthiness and would choose one branch for every input row. */
-            ray_t* col_vec = NULL;
-            ray_graph_t* key_graph = ray_graph_new(tbl);
-            if (!key_graph) col_vec = ray_error("oom", NULL);
-            else {
-                ray_op_t* key_op = compile_expr_dag(key_graph, v);
-                if (key_op) {
-                    key_op = ray_optimize(key_graph, key_op);
-                    col_vec = ray_execute(key_graph, key_op);
-                    if (!col_vec) col_vec = ray_error("domain", "by-dict key execution failed");
-                }
-                ray_graph_free(key_graph);
-            }
-            if (!col_vec) col_vec = ray_eval(v);
-            if (ray_is_lazy(col_vec))
-                col_vec = ray_lazy_materialize(col_vec);
-            for (int ri = 0; ri < n_refs; ri++) {
-                if (materialized_refs[ri]) {
-                    ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
-                    if (ref_col) ray_env_set_query_local(ref_syms[ri], ref_col);
-                    ray_release(materialized_refs[ri]);
-                }
-            }
-            scratch_free(refs_hdr);
+            ray_t* col_vec = group_key_eval(v, tbl);
             if (!col_vec || RAY_IS_ERR(col_vec)) {
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");
                 failed = true; break;
@@ -11232,8 +11342,70 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             }
 
-	            /* eval_group path supports only simple scalar / [col] by-forms;
-	             * computed keys shouldn't land here. */
+            /* A computed key (`by: (% v 3)`) or a literal one lands here when
+             * an output is not a plain aggregate (a `distinct` aggregate, a
+             * row expression).  Evaluate it over the selected rows, as a
+             * by-dict value is evaluated, into a hidden column and
+             * group on that; the source columns stay as they are for the
+             * outputs, and the result's key column is named as the DAG path
+             * names a computed key (#707). */
+            int64_t key_out_name = by_key_sym;
+            if (by_key_sym < 0 && by_expr->type != RAY_SYM) {
+                int64_t kn = ray_table_nrows(eval_tbl);
+                ray_t* kv = NULL;
+                if (ray_env_push_query_scope() != RAY_OK) kv = ray_error("oom", NULL);
+                else {
+                    int64_t enc = ray_table_ncols(eval_tbl);
+                    for (int64_t c = 0; c < enc; c++) {
+                        ray_t* cv = ray_table_get_col_idx(eval_tbl, c);
+                        if (cv) ray_env_set_query_local(ray_table_col_name(eval_tbl, c), cv);
+                    }
+                    kv = group_key_eval(by_expr, eval_tbl);
+                    ray_env_pop_scope();
+                }
+                if (kv && !RAY_IS_ERR(kv) && ray_is_atom(kv)) {
+                    ray_t* wide = atom_broadcast_vec(kv, kn);
+                    ray_release(kv);
+                    kv = wide ? wide : ray_error("type", "by: cannot broadcast the key");
+                }
+                if (kv && !RAY_IS_ERR(kv) && (!ray_is_vec(kv) || ray_len(kv) != kn)) {
+                    int64_t got = ray_len(kv);
+                    ray_release(kv);
+                    kv = ray_error("length", "by: key has %lld rows, the table %lld",
+                                   (long long)got, (long long)kn);
+                }
+                if (!kv || RAY_IS_ERR(kv)) {
+                    if (eval_tbl != tbl) ray_release(eval_tbl);
+                    ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return kv ? kv : ray_error("domain", "by: key produced no result");
+                }
+                by_key_sym = ray_sym_intern("__by_key", 8);
+                if (ray_table_get_col(eval_tbl, by_key_sym)) {
+                    ray_release(kv);
+                    if (eval_tbl != tbl) ray_release(eval_tbl);
+                    ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return ray_error("domain", "by: the input has a column named __by_key");
+                }
+                ray_retain(eval_tbl);   /* add_col consumes it: copy, never edit the input */
+                ray_t* keyed = ray_table_add_col(eval_tbl, by_key_sym, kv);
+                ray_release(kv);
+                if (eval_tbl != tbl) ray_release(eval_tbl);
+                if (!keyed || RAY_IS_ERR(keyed)) {
+                    ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return keyed ? keyed : ray_error("oom", NULL);
+                }
+                eval_tbl = keyed;
+                key_out_name = derived_key_name(by_expr);
+                for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                    int64_t kid = dict_elems[i]->i64;
+                    if (kid == from_id || kid == where_id || kid == by_id ||
+                        kid == take_id || kid == asc_id || kid == desc_id) continue;
+                    if (kid == key_out_name) { key_out_name = ray_sym_intern("key", 3); break; }
+                }
+            }
+	            /* eval_group path supports only scalar / [col] by-forms and the
+	             * computed key materialized above. */
 	            if (by_key_sym < 0) {
 	                if (eval_tbl != tbl) ray_release(eval_tbl);
 	                ray_release(tbl);
@@ -11783,7 +11955,7 @@ by_dict_done:
                     ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec ? key_vec : ray_error("oom", NULL);
                 }
-                result = ray_table_add_col(result, by_key_sym, key_vec);
+                result = ray_table_add_col(result, key_out_name, key_vec);
                 ray_release(key_vec);
             }
 
