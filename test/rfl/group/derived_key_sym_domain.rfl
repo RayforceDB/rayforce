@@ -214,6 +214,97 @@
 ;; unsorted, both evaluations give the groups in the same order
 (all (== (as 'STR (at RB 'p)) (as 'STR (at RBd 'p)))) -- true
 (.sys.exec "rm -rf /tmp/rfl_dkey_progb/") -- 0
+
+;; ── only the selected rows' values are evaluated ───────────────────────
+;; Under a where: the per-value evaluation visits the distinct values of
+;; the SELECTED rows alone (the grouping honours the same selection); a
+;; value that occurs in no selected row is never evaluated.  Same groups
+;; as the key materialised row by row and filtered, over the file-backed
+;; table and in memory; a sparse selection (one row in ten) and a dense one.
+(set KW (fn [t w] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v) where: (> v w)})))
+(set OW (fn [w] (select {from: (table [k ref v] (list (as 'SYMBOL K29) refp vp)) by: k c: (count ref) sv: (sum v) where: (> v w)})))
+(all (== (fpks (KW FT 900)) (fpks (OW 900)))) -- true
+(all (== (fpks (KW TP 900)) (fpks (OW 900)))) -- true
+(all (== (fpks (KW FT 100)) (fpks (OW 100)))) -- true
+(all (== (fpks (KW TP 100)) (fpks (OW 100)))) -- true
+(== (count (KW FT 900)) (count (OW 900))) -- true
+(<= (count (KW FT 900)) (count (KW FT 100))) -- true
+
+;; ── derived keys leave the global symbol table alone ───────────────────
+;; Whether the column's ids are FILE positions (FT) or runtime ids (TP),
+;; the values are read in place and the final key strings are interned
+;; into a domain owned by the key column: a query grows the runtime table
+;; ((.sys.mem) 'sym-count) by nothing — per-row spread with a selection,
+;; vocabulary rewrite, and the chunk DAG alike.  The snapshot is taken
+;; inside one expression (a line of this file interns its own names when
+;; it is parsed), after a first call of each shape (hidden names) and of
+;; (.sys.mem) itself (its first call interns its own key names).
+(count (.sys.mem)) -- 18
+(set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
+(set KV (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")})))
+(set KD (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p (abs 4)) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v)})))
+(set WARM (list (KW FT 900) (KW TP 900) (KV FT) (KV TP) (KD FT) (KD TP)))
+(set NG1 (nogrow (fn [] (KW FT 900))))
+(at NG1 0) -- 0
+(set NG2 (nogrow (fn [] (KW TP 900))))
+(at NG2 0) -- 0
+(all (== (fpks (at NG2 1)) (fpks (OW 900)))) -- true
+(set NG3 (nogrow (fn [] (KV TP))))
+(at NG3 0) -- 0
+(all (== (fpk (at NG3 1)) (fpk O29w))) -- true
+(all (== (FPL (at NG3 1)) (FPL O29w))) -- true
+(set NG4 (nogrow (fn [] (KV FT))))
+(at NG4 0) -- 0
+(set NG5 (nogrow (fn [] (KD TP))))
+(at NG5 0) -- 0
+(all (== (fpks (at NG5 1)) (fpks O29))) -- true
+(set NG6 (nogrow (fn [] (KD FT))))
+(at NG6 0) -- 0
+;; the key column is a symbol column over its own domain; it outlives the
+;; query and compares by text against runtime symbols
+(type (at (at NG3 1) 'p)) -- 'SYM
+(set KP (at (at NG2 1) 'p))
+(set NG2 0)
+(== (count (distinct (as 'STR KP))) (count KP)) -- true
+(> (sum (as 'I64 (== KP 'abc))) 0) -- true
+
+;; ── unsorted output is a function of the query and its rows alone ──────
+;; The keys of an execution are numbered in the order they are first met
+;; over the selected rows — never by anything that ran earlier in the
+;; session: a query that follows another selection of the same expression
+;; comes out exactly as it does on its own, on the per-row spread (an
+;; aggregate over another column) and on the vocabulary rewrite, over the
+;; file-backed table and in memory.  The first selection (https referers)
+;; meets a strict subset of the second's keys, in another order.
+(set KEYS (fn [r] (as 'STR (at (value r) 0))))
+(set SA (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v) where: (like ref "https://*")})))
+(set SB (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v) where: (!= ref "")})))
+(set VA (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) where: (like ref "https://*")})))
+(set VB (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) where: (!= ref "")})))
+(< (count (SA FT)) (count (SB FT))) -- true
+;; the order of each, alone
+(set CB (KEYS (SB FT)))
+(set CA (KEYS (SA FT)))
+;; the same, after the other selection
+(set W (SA FT))
+(all (== CB (KEYS (SB FT)))) -- true
+(all (== CA (KEYS (SA FT)))) -- true
+(set W (SB FT))
+(all (== CA (KEYS (SA FT)))) -- true
+(all (== CB (KEYS (SB FT)))) -- true
+;; the vocabulary rewrite
+(set VCB (KEYS (VB FT)))
+(set W (VA FT))
+(all (== VCB (KEYS (VB FT)))) -- true
+;; in memory
+(set MB (KEYS (SB TP)))
+(set W (SA TP))
+(all (== MB (KEYS (SB TP)))) -- true
+(set MVB (KEYS (VB TP)))
+(set W (VA TP))
+(all (== MVB (KEYS (VB TP)))) -- true
+;; the subset's keys do not lead the full selection's order
+(all (== (take CB (count CA)) CA)) -- false
 (.sys.exec "rm -rf /tmp/rfl_dkey_prog/") -- 0
 
 ;; ── an `if` inside a by-DICT key ───────────────────────────────────────

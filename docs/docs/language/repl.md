@@ -19,6 +19,16 @@ echo '(+ 1 2)' | ./rayforce
 
 Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool includes every online logical CPU, including SMT threads. Use `-c N` to choose a total worker count explicitly. Individual operations may use fewer tasks when their workload or memory budget requires it.
 
+### Environment Variables
+
+The thread pool reads these once, when it is created (process start, or the first parallel operation):
+
+| Variable | Default | Description |
+|---|---|---|
+| `RAYFORCE_CORES` | unset | Number of background worker threads when no `-c` is given (the main thread is one more). Unset keeps the default of every online logical CPU; the test harness sets it to keep spawned processes small. An explicit `-c N` overrides it. |
+| `RAY_POOL_STEAL` | `1` | How workers claim tasks. `1`: each worker owns a contiguous slice of the table and steals halves of other workers' remaining slices once its own is done — sequential access and a stable row-to-worker mapping. `0`: every worker claims the next task from one shared cursor. Results are identical; set `0` only to A/B the two schedulers. |
+| `RAY_POOL_TRACE` | unset | `1` prints a per-worker histogram to stderr when the pool is destroyed (at exit): tasks each worker ran from its own slice versus stolen ones, and the number of steals. Use it to see how evenly work splits across workers on a given machine. |
+
 ## REPL Commands
 
 All commands start with `:` and are handled before expression evaluation.

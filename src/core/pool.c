@@ -29,6 +29,7 @@
 #include "mem/sys.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <sched.h>
 
 /* Per-worker query-statistics slab (see core/qstats.h).  Zero-initialised;
@@ -72,6 +73,217 @@ static inline bool pool_claim(ray_pool_t* pool, uint64_t* out_idx) {
     }
 }
 
+/* --------------------------------------------------------------------------
+ * Range + steal claiming (pool->steal, RAY_POOL_STEAL=1 — the default)
+ *
+ * The dispatcher splits every window [base, base+n) into W contiguous ticket
+ * ranges, one per worker (main is worker 0), and stores each as a head:tail
+ * word in slots[w].range (see ray_pool_slot_t for the encoding and why the
+ * halves are absolute tickets).  Owner and thieves agree through that one
+ * word only:
+ *
+ *   owner  CAS (h, t) -> (h+1, t)        claims ticket h, keeps running in order
+ *   thief  CAS (h, t) -> (h, t-k)        takes [t-k, t), k = ceil((t-h)/2) >= 1
+ *
+ * Both compare the whole pair, so when owner and thief race on the last
+ * ticket exactly one CAS lands and the other sees an empty range.  Half-
+ * at-least-one guarantees a range nobody runs — a worker that was not woken
+ * (only n-1 helpers are signalled), is still starting, or is simply slow —
+ * is drained entirely by thieves.
+ *
+ * The word is stored without a CAS in two places only, both when it is
+ * provably empty and uncontended: by the dispatcher at window open (pending
+ * == 0 means every range is head == tail, and a thief never CASes an empty
+ * word), and by a thief installing the chunk it has just cut into its own
+ * slot (nobody but the owner adds to an owner's word).  Those two can race
+ * with each other: a worker still scanning for victims when the next window
+ * opens may cut a chunk before the dispatcher has reached ITS slot, and the
+ * dispatcher's share store would then overwrite the installed chunk — or
+ * the install would overwrite the share.  win_state closes it: it is odd
+ * from before the first range store until after the last one; a thief that
+ * reads it odd after its cut runs the chunk privately (no install), and a
+ * thief that reads it even has, by that acquire, seen its own share land.
+ * A chunk pins its window (pending > 0), so the parity it reads can only be
+ * that of the window the chunk came from.
+ *
+ * Publish order: ring fill, pending, range words (release each), then the
+ * even win_state.  A claim CAS acquires the word, so whoever runs a ticket
+ * — however late it woke — sees the ring slots and pending of that window.
+ * Nothing is ever reset, so the cross-dispatch reset race of pool_claim's
+ * predecessor cannot reappear here either.
+ * -------------------------------------------------------------------------- */
+
+#define RANGE_PACK(h, t)  (((uint64_t)(uint32_t)(t) << 32) | (uint32_t)(h))
+#define RANGE_HEAD(w)     ((uint32_t)(w))
+#define RANGE_TAIL(w)     ((uint32_t)((w) >> 32))
+
+/* Run one claimed ticket (or skip it when cancelled) and retire it. */
+static inline void pool_exec(ray_pool_t* pool, uint32_t worker_id, uint32_t ticket) {
+    if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled, memory_order_relaxed))) {
+        atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+        return;
+    }
+    ray_pool_task_t* t = &pool->tasks[ticket & (pool->task_cap - 1)];
+    int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
+    t->fn(t->ctx, worker_id, t->start, t->end);
+    ray_qstats_task_end(_qs_m, worker_id, t->end - t->start, _qs_t0);
+    atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+}
+
+/* Owner claim: the head of own range, in order.  False when it is empty. */
+static inline bool pool_range_take(ray_pool_slot_t* s, uint32_t* out) {
+    uint64_t cur = atomic_load_explicit(&s->range, memory_order_acquire);
+    for (;;) {
+        uint32_t h = RANGE_HEAD(cur), t = RANGE_TAIL(cur);
+        if (h == t) return false;
+        if (atomic_compare_exchange_weak_explicit(&s->range, &cur, RANGE_PACK(h + 1, t),
+                memory_order_acq_rel, memory_order_acquire)) {
+            *out = h;
+            return true;
+        }
+        /* CAS failed: a thief cut the tail — `cur` is current, retry. */
+    }
+}
+
+/* Victim order hook: the k-th victim (k in [1, W)) of worker w.  Plain
+ * round-robin from w+1 for now; a NUMA-aware order (same-node workers
+ * first, then the rest) plugs in here without touching the protocol. */
+static inline uint32_t pool_victim(const ray_pool_t* pool, uint32_t w, uint32_t k) {
+    uint32_t W = ray_pool_total_workers(pool);
+    uint32_t v = w + k;
+    return v >= W ? v - W : v;
+}
+
+/* Cut the upper half (at least one ticket) off the first non-empty victim
+ * range in victim order.  Two passes: a chunk that is between its cut and
+ * its install is invisible for a moment, and a worker that goes to sleep on
+ * that moment would leave the thief alone with it. */
+static bool pool_steal(ray_pool_t* pool, uint32_t w, uint32_t* c0, uint32_t* c1) {
+    uint32_t W = ray_pool_total_workers(pool);
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t k = 1; k < W; k++) {
+            ray_pool_slot_t* v = &pool->slots[pool_victim(pool, w, k)];
+            uint64_t cur = atomic_load_explicit(&v->range, memory_order_relaxed);
+            for (;;) {
+                uint32_t h = RANGE_HEAD(cur), t = RANGE_TAIL(cur);
+                uint32_t rem = t - h;
+                if (rem == 0) break;
+                uint32_t take = (rem + 1) >> 1;
+                if (atomic_compare_exchange_weak_explicit(&v->range, &cur,
+                        RANGE_PACK(h, t - take), memory_order_acq_rel,
+                        memory_order_relaxed)) {
+                    *c0 = t - take;
+                    *c1 = t;
+                    return true;
+                }
+            }
+        }
+        RAY_CPU_RELAX();
+    }
+    return false;
+}
+
+/* Drain own range, then steal until a full victim scan finds nothing.
+ * `prog` is the main thread's progress pump (false on workers).  Tickets
+ * are attributed when they run: those inside the chunk last installed here
+ * (or run privately) count as stolen, the rest came with the share — so
+ * own + stolen over all slots is exactly the tickets executed. */
+static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
+    ray_pool_slot_t* s = &pool->slots[w];
+    uint32_t ch0 = 0, ch1 = 0;    /* installed chunk [ch0, ch1), empty at entry */
+    for (;;) {
+        uint32_t tk;
+        while (pool_range_take(s, &tk)) {
+            if ((uint32_t)(tk - ch0) < (uint32_t)(ch1 - ch0)) s->stolen++; else s->own++;
+            pool_exec(pool, w, tk);
+            if (prog) ray_progress_pump();
+        }
+
+        uint32_t c0, c1;
+        if (!pool_steal(pool, w, &c0, &c1)) return;
+        s->steals++;
+
+        /* Install the chunk as own range so others can halve it in turn —
+         * unless the window is still being published (odd win_state: the
+         * dispatcher may be about to store this worker's share here) or
+         * own range is not empty (that share already landed after the scan
+         * started).  win_state is read FIRST: its acquire is what makes a
+         * share the dispatcher stored visible to the own-range load, so an
+         * even value and an empty word together mean no share is coming.
+         * Either way the chunk is run privately, in order, and the loop
+         * comes back to own range afterwards. */
+        if (!(atomic_load_explicit(&pool->win_state, memory_order_acquire) & 1)) {
+            uint64_t mine = atomic_load_explicit(&s->range, memory_order_acquire);
+            if (RANGE_HEAD(mine) == RANGE_TAIL(mine)) {
+                ch0 = c0; ch1 = c1;
+                atomic_store_explicit(&s->range, RANGE_PACK(c0, c1), memory_order_release);
+                continue;
+            }
+        }
+        s->stolen += c1 - c0;
+        for (; c0 != c1; c0++) {
+            pool_exec(pool, w, c0);
+            if (prog) ray_progress_pump();
+        }
+    }
+}
+
+/* Split tickets [base, base+n) into W contiguous ranges — the first n % W
+ * workers take one ticket more — and publish them.  Caller has filled the
+ * ring and stored `pending`; see the ordering note above. */
+static void pool_publish_ranges(ray_pool_t* pool, uint64_t base, uint32_t n) {
+    uint32_t W = ray_pool_total_workers(pool);
+    uint32_t q = n / W, r = n % W;
+    atomic_fetch_add_explicit(&pool->win_state, 1, memory_order_release);   /* odd */
+    uint64_t at = base;
+    for (uint32_t w = 0; w < W; w++) {
+        uint64_t len = q + (w < r ? 1u : 0u);
+        atomic_store_explicit(&pool->slots[w].range,
+                              RANGE_PACK((uint32_t)at, (uint32_t)(at + len)),
+                              memory_order_release);
+        at += len;
+    }
+    atomic_fetch_add_explicit(&pool->win_state, 1, memory_order_release);   /* even */
+}
+
+/* Main thread in steal mode: own range, steal, and keep stealing while it
+ * waits — a worker that was not woken has its range drained from here, so
+ * completion never depends on a signal count.  Progress is pumped as in the
+ * cursor path: per ticket, and once per 1024 spins. */
+static void pool_main_run_steal(ray_pool_t* pool, bool prog) {
+    unsigned spin_count = 0;
+    for (;;) {
+        pool_run_steal(pool, 0, prog);
+        if (atomic_load_explicit(&pool->pending, memory_order_acquire) == 0) break;
+        for (int i = 0; i < 16; i++) {
+            RAY_CPU_RELAX();
+            if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
+        }
+    }
+}
+
+/* RAY_POOL_TRACE: how the tickets split between own ranges and steals. */
+static void pool_trace_dump(const ray_pool_t* pool) {
+    uint32_t W = ray_pool_total_workers(pool);
+    uint64_t own = 0, stolen = 0, steals = 0;
+    for (uint32_t w = 0; w < W; w++) {
+        own += pool->slots[w].own;
+        stolen += pool->slots[w].stolen;
+        steals += pool->slots[w].steals;
+    }
+    fprintf(stderr, "pool: steal=%u workers=%u windows=%llu tickets=%llu own=%llu stolen=%llu steals=%llu\n",
+            pool->steal, W,
+            (unsigned long long)(atomic_load_explicit(&pool->win_state, memory_order_relaxed) / 2),
+            (unsigned long long)(own + stolen), (unsigned long long)own,
+            (unsigned long long)stolen, (unsigned long long)steals);
+    for (uint32_t w = 0; w < W; w++) {
+        const ray_pool_slot_t* s = &pool->slots[w];
+        fprintf(stderr, "pool:  w%-3u own %12llu  stolen %12llu  steals %8llu\n", w,
+                (unsigned long long)s->own, (unsigned long long)s->stolen,
+                (unsigned long long)s->steals);
+    }
+}
+
 static void worker_loop(void* arg) {
     worker_ctx_t wctx = *(worker_ctx_t*)arg;
     ray_sys_free(arg);
@@ -92,6 +304,11 @@ static void worker_loop(void* arg) {
 
         if (atomic_load_explicit(&pool->shutdown, memory_order_acquire))
             break;
+
+        if (pool->steal) {
+            pool_run_steal(pool, wctx.worker_id, false);
+            continue;
+        }
 
         /* Claim and execute tasks until the window is drained */
         uint64_t idx;
@@ -162,6 +379,17 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
     atomic_init(&pool->task_limit, 0);
     atomic_init(&pool->pending, 0);
     atomic_init(&pool->cancelled, 0);
+    atomic_init(&pool->win_state, 0);
+
+    /* Claiming mode and tracing, read once here so one binary can be A/B'd:
+     * RAY_POOL_STEAL=0 keeps the shared cursor, anything else (or unset)
+     * selects per-worker ranges with stealing. */
+    {
+        const char* e = getenv("RAY_POOL_STEAL");
+        pool->steal = (e && *e) ? (strtol(e, NULL, 10) != 0) : 1;
+        e = getenv("RAY_POOL_TRACE");
+        pool->trace = (e && *e && strtol(e, NULL, 10) != 0);
+    }
 
     if (auto_size) {
         /* Auto-size to ncpu-1. The RAYFORCE_CORES env var overrides this
@@ -196,12 +424,31 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
     pool->tasks = (ray_pool_task_t*)ray_sys_alloc(pool->task_cap * sizeof(ray_pool_task_t));
     if (!pool->tasks) return RAY_ERR_OOM;
 
+    /* One claim slot per worker, main included, each on its own cache line
+     * (ray_sys_alloc only guarantees its header alignment, hence the manual
+     * round-up).  Allocated in both modes so the trace and tests can read
+     * the counters regardless of the switch. */
+    {
+        size_t W = (size_t)n_workers + 1;
+        pool->slots_raw = ray_sys_alloc(W * sizeof(ray_pool_slot_t) + 64);
+        if (!pool->slots_raw) {
+            ray_sys_free(pool->tasks);
+            return RAY_ERR_OOM;
+        }
+        pool->slots = (ray_pool_slot_t*)(((uintptr_t)pool->slots_raw + 63) & ~(uintptr_t)63);
+        for (size_t w = 0; w < W; w++) {
+            atomic_init(&pool->slots[w].range, 0);
+            pool->slots[w].own = pool->slots[w].stolen = pool->slots[w].steals = 0;
+        }
+    }
+
     atomic_store_explicit(&pool->task_claim, 0, memory_order_relaxed);
     atomic_store_explicit(&pool->task_limit, 0, memory_order_relaxed);
     atomic_store_explicit(&pool->pending, 0, memory_order_relaxed);
 
     ray_err_t err = ray_sem_init(&pool->work_ready, 0);
     if (err != RAY_OK) {
+        ray_sys_free(pool->slots_raw);
         ray_sys_free(pool->tasks);
         return err;
     }
@@ -211,6 +458,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         pool->threads = (ray_thread_t*)ray_sys_alloc(n_workers * sizeof(ray_thread_t));
         if (!pool->threads) {
             ray_sem_destroy(&pool->work_ready);
+            ray_sys_free(pool->slots_raw);
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
         }
@@ -218,6 +466,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         if (!pool->worker_heaps) {
             ray_sys_free(pool->threads);
             ray_sem_destroy(&pool->work_ready);
+            ray_sys_free(pool->slots_raw);
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
         }
@@ -238,6 +487,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
                 ray_sem_destroy(&pool->work_ready);
+                ray_sys_free(pool->slots_raw);
                 ray_sys_free(pool->tasks);
                 return RAY_ERR_OOM;
             }
@@ -257,6 +507,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
                 ray_sem_destroy(&pool->work_ready);
+                ray_sys_free(pool->slots_raw);
                 ray_sys_free(pool->tasks);
                 return err;
             }
@@ -288,9 +539,12 @@ void ray_pool_free(ray_pool_t* pool) {
         ray_thread_join(pool->threads[i]);
     }
 
+    if (pool->trace && pool->slots) pool_trace_dump(pool);
+
     ray_sys_free(pool->worker_heaps);
     ray_sys_free(pool->threads);
     ray_sem_destroy(&pool->work_ready);
+    ray_sys_free(pool->slots_raw);
     ray_sys_free(pool->tasks);
     memset(pool, 0, sizeof(*pool));
 }
@@ -340,7 +594,9 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
 
     /* Carve a fresh window [base, base+n_tasks) off the monotonic high-water
      * mark.  The prior dispatch is fully claimed, so task_claim == task_limit
-     * == base here; the window's slots never alias a still-live slot. */
+     * == base here (in steal mode: every slots[].range is head == tail and
+     * the cursors were advanced to base at publish); the window's slots
+     * never alias a still-live slot. */
     uint64_t base = atomic_load_explicit(&pool->task_limit, memory_order_relaxed);
 
     /* Fill task ring for tickets [base, base+n_tasks) */
@@ -357,9 +613,17 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     /* pending must be visible before the window opens; the task_limit
-     * store-release publishes the ring fill AND pending to claimers. */
+     * store-release publishes the ring fill AND pending to claimers.  In
+     * steal mode the range words are the publication (release each) and
+     * the cursors only record the high-water mark. */
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
-    atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_release);
+    if (pool->steal) {
+        atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
+        atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
+        pool_publish_ranges(pool, base, n_tasks);
+    } else {
+        atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_release);
+    }
 
     /* Mark parallel region: workers are about to run, cross-heap
      * freelist modification is unsafe until spin-wait completes. */
@@ -388,7 +652,9 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     /* Main thread participates as worker 0 */
-    {
+    if (pool->steal) {
+        pool_main_run_steal(pool, prog);
+    } else {
         uint64_t idx;
         while (pool_claim(pool, &idx)) {
             if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled,
@@ -405,11 +671,9 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
             if (prog) ray_progress_pump();
         }
-    }
 
-    /* Spin-wait for workers to finish remaining tasks.
-     * No semaphore — avoids surplus-signal bug between consecutive dispatches. */
-    {
+        /* Spin-wait for workers to finish remaining tasks.
+         * No semaphore — avoids surplus-signal bug between consecutive dispatches. */
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
             RAY_CPU_RELAX();
@@ -448,7 +712,13 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
-    atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_release);
+    if (pool->steal) {
+        atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
+        atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
+        pool_publish_ranges(pool, base, n_tasks);
+    } else {
+        atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_release);
+    }
 
     atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
     ray_rc_sync = true;
@@ -471,7 +741,9 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     /* Main thread participates as worker 0 */
-    {
+    if (pool->steal) {
+        pool_main_run_steal(pool, prog);
+    } else {
         uint64_t idx;
         while (pool_claim(pool, &idx)) {
             if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled,
@@ -488,10 +760,8 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
             if (prog) ray_progress_pump();
         }
-    }
 
-    /* Spin-wait for workers to finish remaining tasks */
-    {
+        /* Spin-wait for workers to finish remaining tasks */
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
             RAY_CPU_RELAX();
@@ -549,6 +819,20 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
 static ray_pool_t  g_pool;
 static _Atomic(uint32_t) g_pool_init_state = 0;  /* 0=uninit, 1=initializing, 2=ready */
 
+/* RAY_POOL_TRACE on the singleton: the CLI never destroys it, so the
+ * histogram is printed from an atexit hook if the pool is still live then
+ * (ray_pool_free prints it itself otherwise).  Workers may still be parked
+ * at that point; they are idle, so the counters are quiescent. */
+static void pool_trace_atexit(void) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        pool_trace_dump(&g_pool);
+}
+
+static void pool_trace_arm(void) {
+    static bool armed = false;
+    if (!armed && g_pool.trace) { armed = true; atexit(pool_trace_atexit); }
+}
+
 ray_pool_t* ray_pool_get(void) {
     uint32_t state = atomic_load_explicit(&g_pool_init_state, memory_order_acquire);
     if (state == 2) return &g_pool;
@@ -559,6 +843,7 @@ ray_pool_t* ray_pool_get(void) {
                                                     memory_order_acquire)) {
             ray_err_t err = ray_pool_create(&g_pool, 0);
             if (err == RAY_OK) {
+                pool_trace_arm();
                 atomic_store_explicit(&g_pool_init_state, 2, memory_order_release);
                 return &g_pool;
             }
@@ -611,6 +896,7 @@ static ray_err_t ray_pool_init_impl(uint32_t n_workers, bool auto_size) {
     }
     ray_err_t err = ray_pool_create_impl(&g_pool, n_workers, auto_size);
     if (err == RAY_OK) {
+        pool_trace_arm();
         atomic_store_explicit(&g_pool_init_state, 2, memory_order_release);
     } else {
         atomic_store_explicit(&g_pool_init_state, 0, memory_order_release);

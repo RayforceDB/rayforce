@@ -999,6 +999,15 @@ uint32_t ray_sym_count(void) {
     return count;
 }
 
+/* Bytes the table's string arena holds (every interned name's atom). */
+size_t ray_sym_bytes(void) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return 0;
+    sym_lock();
+    size_t bytes = g_sym.arena ? ray_arena_total_used(g_sym.arena) : 0;
+    sym_unlock();
+    return bytes;
+}
+
 /* --------------------------------------------------------------------------
  * ray_sym_strings_borrow
  *
