@@ -225,3 +225,29 @@
 ;; integration test (see system/part.rfl for the DAG-side count-distinct
 ;; parted coverage).  Calling out the gap here so the next coverage
 ;; sweep knows where to look.
+
+;; ────────── per-group slices of a sparse where: ──────────
+;; A where: that keeps at most an eighth of the rows builds the per-group
+;; row slices count(distinct) reads from the selection instead of from the
+;; whole row→gid map.  Oracle: the same select over the pre-filtered table
+;; (no selection).  The second where: keeps two whole morsels (ALL
+;; segments), the first scattered rows (MIX segments).
+(set Nsp 300000)
+(set isp (til Nsp))
+(set vsp (as 'SYMBOL (map (fn [k] (if (== 0 (% k 97)) (format "a Google %" (% k 11)) (format "v%" k))) (til 2000))))
+(set Tsp (table [k s u r] (list (% (* isp 7) 701) (at vsp (% isp 2000)) (% (* isp 13) 977) isp)))
+(set Fsp (select {from: Tsp where: (and (like s "*Google*") (> u 100))}))
+(< (* 8 (count Fsp)) Nsp) -- true
+(set SA (select {from: (select {from: Tsp by: k c: (count u) d: (count (distinct u)) mn: (min s) where: (and (like s "*Google*") (> u 100))}) asc: k}))
+(set SB (select {from: (select {from: Fsp by: k c: (count u) d: (count (distinct u)) mn: (min s)}) asc: k}))
+(== (count SA) (count SB)) -- true
+(all (== (at SA 'c) (at SB 'c))) -- true
+(all (== (at SA 'd) (at SB 'd))) -- true
+(all (== (at SA 'mn) (at SB 'mn))) -- true
+(set Gsp (select {from: Tsp where: (< r 16384)}))
+(set GA (select {from: (select {from: Tsp by: k c: (count u) d: (count (distinct u)) where: (< r 16384)}) asc: k}))
+(set GB (select {from: (select {from: Gsp by: k c: (count u) d: (count (distinct u))}) asc: k}))
+(all (== (at GA 'd) (at GB 'd))) -- true
+(sum (at GA 'd)) -- 16384
+;; a where: keeping no row at all
+(count (select {from: Tsp by: k d: (count (distinct u)) where: (> u 5000)})) -- 0

@@ -5887,6 +5887,45 @@ static void idxbuf_scat_fn(void* vctx, uint32_t worker_id,
     }
 }
 
+/* Up to this many rows kept by a where: the per-group slices are built
+ * serially from the selection (idxbuf_sel_pass) instead of from row_gid. */
+#define SLICE_IDX_SEL_MAX_ROWS (1 << 20)
+
+/* One pass over the rows a rowsel keeps, in ascending order: with
+ * idx_buf NULL count each row's group into cnt[], otherwise scatter the
+ * row into idx_buf at pos[gid]++.  A row whose gid is negative belongs
+ * to no group. */
+static void idxbuf_sel_pass(const int64_t* row_gid, ray_t* sel, int64_t nrows,
+                            int64_t* cnt_or_pos, int64_t* idx_buf) {
+    ray_rowsel_t*   sm   = ray_rowsel_meta(sel);
+    const uint8_t*  flg  = ray_rowsel_flags(sel);
+    const uint32_t* offs = ray_rowsel_offsets(sel);
+    const uint16_t* lidx = ray_rowsel_idx(sel);
+    for (uint32_t seg = 0; seg < sm->n_segs; seg++) {
+        uint8_t f = flg[seg];
+        if (f == RAY_SEL_NONE) continue;
+        int64_t s_lo = (int64_t)seg * RAY_MORSEL_ELEMS;
+        if (f == RAY_SEL_ALL) {
+            int64_t s_hi = s_lo + RAY_MORSEL_ELEMS;
+            if (s_hi > nrows) s_hi = nrows;
+            for (int64_t r = s_lo; r < s_hi; r++) {
+                int64_t gi = row_gid[r];
+                if (gi < 0) continue;
+                if (idx_buf) idx_buf[cnt_or_pos[gi]++] = r;
+                else cnt_or_pos[gi]++;
+            }
+            continue;
+        }
+        for (uint32_t i = offs[seg]; i < offs[seg + 1]; i++) {
+            int64_t r = s_lo + lidx[i];
+            int64_t gi = row_gid[r];
+            if (gi < 0) continue;
+            if (idx_buf) idx_buf[cnt_or_pos[gi]++] = r;
+            else cnt_or_pos[gi]++;
+        }
+    }
+}
+
 static ray_t* query_materialize_parted_col(ray_t* col) {
     if (!col) return NULL;
     if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
@@ -14498,7 +14537,38 @@ by_dict_done:
                     ray_pool_t* idx_pool = ray_pool_get();
                     int64_t total = 0;
                     int parallel_idx_done = 0;
-                    if (idx_pool && nrows >= 200000 &&
+                    /* A where: that kept few rows: row_gid spans the whole
+                     * table (-1 for a filtered row), so the passes below
+                     * would read all of it twice and size a histogram per
+                     * task of the table for a handful of survivors.  The
+                     * selection lists the survivors; two serial passes over
+                     * them build the same slices, rows ascending within a
+                     * group as the scatter below leaves them. */
+                    if (saved_selection && n_groups > 0) {
+                        int64_t kept = ray_rowsel_meta(saved_selection)->total_pass;
+                        if (kept <= SLICE_IDX_SEL_MAX_ROWS && kept * 8 <= nrows) {
+                            memset(grp_cnt, 0, (size_t)n_groups * sizeof(int64_t));
+                            idxbuf_sel_pass(row_gid, saved_selection, nrows, grp_cnt, NULL);
+                            for (int64_t gi = 0; gi < n_groups; gi++) {
+                                offsets[gi] = total;
+                                total += grp_cnt[gi];
+                            }
+                            idx_hdr = ray_alloc((size_t)(total > 0 ? total : 1) * sizeof(int64_t));
+                            if (!idx_hdr) {
+                                ray_free(gk_hdr); ray_free(rg_hdr);
+                                ray_free(cnt_hdr); ray_free(off_hdr);
+                                ray_free(pos_hdr);
+                                RELEASE_SCAN_KEY();
+                                ray_release(result); ray_release(tbl);
+                                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                            }
+                            idx_buf = (int64_t*)ray_data(idx_hdr);
+                            memcpy(pos, offsets, (size_t)n_groups * sizeof(int64_t));
+                            idxbuf_sel_pass(row_gid, saved_selection, nrows, pos, idx_buf);
+                            parallel_idx_done = 1;
+                        }
+                    }
+                    if (!parallel_idx_done && idx_pool && nrows >= 200000 &&
                         ray_pool_total_workers(idx_pool) >= 2 &&
                         n_groups > 0 && n_groups <= 65536)
                     {
