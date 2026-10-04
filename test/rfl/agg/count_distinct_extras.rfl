@@ -227,9 +227,8 @@
 ;; sweep knows where to look.
 
 ;; ────────── per-group slices of a sparse where: ──────────
-;; A where: that keeps at most an eighth of the rows builds the per-group
-;; row slices count(distinct) reads from the selection instead of from the
-;; whole row→gid map.  Oracle: the same select over the pre-filtered table
+;; Under a where: the per-group row slices count(distinct) reads are built
+;; from the rows the selection keeps, not from the whole row→gid map.  Oracle: the same select over the pre-filtered table
 ;; (no selection).  The second where: keeps two whole morsels (ALL
 ;; segments), the first scattered rows (MIX segments).
 (set Nsp 300000)
@@ -251,3 +250,21 @@
 (sum (at GA 'd)) -- 16384
 ;; a where: keeping no row at all
 (count (select {from: Tsp by: k d: (count (distinct u)) where: (> u 5000)})) -- 0
+;; With no where: and under a where: keeping many rows the slices are built
+;; in parallel, one histogram row per task, the tasks cut by the rows they
+;; visit.  Oracle independent of the slices: distinct (k, u) pairs counted
+;; per k by the grouping itself.
+(set CDO (fn [t] (select {from: (select {from: (select {from: t by: [k u]}) by: k d: (count u)}) asc: k})))
+(set CDS (fn [t] (select {from: (select {from: t by: k c: (count u) d: (count (distinct u))}) asc: k})))
+(set PA (CDS Tsp))
+(set PB (CDO Tsp))
+(all (== (at PA 'd) (at PB 'd))) -- true
+(sum (at PA 'c)) -- 300000
+(set PW (select {from: (select {from: Tsp by: k c: (count u) d: (count (distinct u)) where: (< r 200000)}) asc: k}))
+(set PV (CDO (select {from: Tsp where: (< r 200000)})))
+(all (== (at PW 'd) (at PV 'd))) -- true
+(sum (at PW 'c)) -- 200000
+(set QW (select {from: (select {from: Tsp by: k c: (count u) d: (count (distinct u)) where: (> u 100)}) asc: k}))
+(set QV (CDO (select {from: Tsp where: (> u 100)})))
+(all (== (at QW 'd) (at QV 'd))) -- true
+(sum (at QW 'c)) -- (count (select {from: Tsp where: (> u 100)}))

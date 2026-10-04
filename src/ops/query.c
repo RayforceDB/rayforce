@@ -5837,93 +5837,157 @@ static void cdpg_buf_par_fn(void* vctx, uint32_t worker_id,
 }
 #undef CDPG_BUF_INSERT
 
-/* Parallel idx_buf construction from row_gid.  Builds the
- * groupwise inverted index used by per-group-slice consumers
- * (count_distinct_per_group_buf, nonagg_eval_per_group_buf, etc.)
+/* Per-group row slices (grp_cnt / offsets / idx_buf) from row_gid, for
+ * the per-group-slice consumers (count_distinct_per_group_buf,
+ * nonagg_eval_per_group_buf, ...).  A row whose gid is negative belongs to
+ * no group; with a selection only the rows it keeps are visited.
  *
- * Two passes:
- *   Pass 1 (cnt_fn): per-task histograms of row_gid → grp_cnt buckets
- *                    (kept in task-local rows so no atomics needed).
- *   Pass 2 (scat_fn): per-task scatter into idx_buf using the cumulative
- *                     per-(task,group) cursor pre-computed by the caller.
- *
- * On 5 M-row Q11 with 84 groups the serial loop was 8-10 ms; this
- * parallel form takes ~0.5 ms at 28 workers and drops Q11/Q14-class
- * queries by an order of magnitude when the per-group dedup is also
- * parallelised. */
+ * Tasks are contiguous runs of morsels, one per worker (fewer when the
+ * histograms would outgrow SLICE_HIST_CELLS), cut so each holds about the
+ * same number of visited rows.  Pass 1 counts each task's rows per group
+ * into its own histogram row; a row-wise prefix turns the rows into
+ * cursors; pass 2 scatters.  Tasks run in row order within a group, so the
+ * rows of a group come out ascending.  The histograms are sized by the
+ * worker count, not the table: one row per 8192-row task had made them
+ * (and the prefix over them) grow with the table (#710). */
+#define SLICE_SERIAL_ROWS (1 << 17)   /* fewer visited rows: one task */
+#define SLICE_HIST_CELLS  (1 << 23)   /* bound on n_tasks * n_groups */
+
 typedef struct {
     const int64_t*  row_gid;
-    int64_t*        hist;        /* [n_tasks * n_groups] */
-    int64_t*        cursor;      /* [n_tasks * n_groups] */
-    int64_t*        idx_buf;
+    int64_t         nrows;
     int64_t         n_groups;
-    int64_t         grain;       /* rows per task (for task_id derivation) */
-} idxbuf_par_ctx_t;
+    int64_t*        hist;        /* [n_tasks * n_groups]: counts, then cursors */
+    int64_t*        idx_buf;     /* pass 2 only */
+    const int64_t*  seg_lo;      /* [n_tasks + 1]: each task's morsels */
+    const uint8_t*  sel_flg;     /* NULL: every row */
+    const uint32_t* sel_offs;
+    const uint16_t* sel_idx;
+} slice_build_ctx_t;
 
-static void idxbuf_hist_fn(void* vctx, uint32_t worker_id,
-                           int64_t start, int64_t end) {
-    (void)worker_id;
-    idxbuf_par_ctx_t* ctx = (idxbuf_par_ctx_t*)vctx;
-    int64_t task_id = start / ctx->grain;
-    int64_t* hist = ctx->hist + task_id * ctx->n_groups;
-    const int64_t* row_gid = ctx->row_gid;
-    for (int64_t r = start; r < end; r++) {
-        int64_t gi = row_gid[r];
-        if (gi >= 0) hist[gi]++;
-    }
-}
-
-static void idxbuf_scat_fn(void* vctx, uint32_t worker_id,
-                           int64_t start, int64_t end) {
-    (void)worker_id;
-    idxbuf_par_ctx_t* ctx = (idxbuf_par_ctx_t*)vctx;
-    int64_t task_id = start / ctx->grain;
-    int64_t* cur = ctx->cursor + task_id * ctx->n_groups;
-    const int64_t* row_gid = ctx->row_gid;
-    int64_t* idx_buf = ctx->idx_buf;
-    for (int64_t r = start; r < end; r++) {
-        int64_t gi = row_gid[r];
-        if (gi >= 0) idx_buf[cur[gi]++] = r;
-    }
-}
-
-/* Up to this many rows kept by a where: the per-group slices are built
- * serially from the selection (idxbuf_sel_pass) instead of from row_gid. */
-#define SLICE_IDX_SEL_MAX_ROWS (1 << 20)
-
-/* One pass over the rows a rowsel keeps, in ascending order: with
- * idx_buf NULL count each row's group into cnt[], otherwise scatter the
- * row into idx_buf at pos[gid]++.  A row whose gid is negative belongs
- * to no group. */
-static void idxbuf_sel_pass(const int64_t* row_gid, ray_t* sel, int64_t nrows,
-                            int64_t* cnt_or_pos, int64_t* idx_buf) {
-    ray_rowsel_t*   sm   = ray_rowsel_meta(sel);
-    const uint8_t*  flg  = ray_rowsel_flags(sel);
-    const uint32_t* offs = ray_rowsel_offsets(sel);
-    const uint16_t* lidx = ray_rowsel_idx(sel);
-    for (uint32_t seg = 0; seg < sm->n_segs; seg++) {
-        uint8_t f = flg[seg];
+static inline void slice_build_task(const slice_build_ctx_t* c, int64_t t, bool scatter) {
+    int64_t* h = c->hist + t * c->n_groups;
+    const int64_t* row_gid = c->row_gid;
+    int64_t* out = c->idx_buf;
+    for (int64_t seg = c->seg_lo[t]; seg < c->seg_lo[t + 1]; seg++) {
+        int64_t s_lo = seg * RAY_MORSEL_ELEMS;
+        uint8_t f = c->sel_flg ? c->sel_flg[seg] : RAY_SEL_ALL;
         if (f == RAY_SEL_NONE) continue;
-        int64_t s_lo = (int64_t)seg * RAY_MORSEL_ELEMS;
         if (f == RAY_SEL_ALL) {
             int64_t s_hi = s_lo + RAY_MORSEL_ELEMS;
-            if (s_hi > nrows) s_hi = nrows;
+            if (s_hi > c->nrows) s_hi = c->nrows;
             for (int64_t r = s_lo; r < s_hi; r++) {
                 int64_t gi = row_gid[r];
                 if (gi < 0) continue;
-                if (idx_buf) idx_buf[cnt_or_pos[gi]++] = r;
-                else cnt_or_pos[gi]++;
+                if (scatter) out[h[gi]++] = r;
+                else h[gi]++;
             }
             continue;
         }
-        for (uint32_t i = offs[seg]; i < offs[seg + 1]; i++) {
-            int64_t r = s_lo + lidx[i];
+        for (uint32_t i = c->sel_offs[seg]; i < c->sel_offs[seg + 1]; i++) {
+            int64_t r = s_lo + c->sel_idx[i];
             int64_t gi = row_gid[r];
             if (gi < 0) continue;
-            if (idx_buf) idx_buf[cnt_or_pos[gi]++] = r;
-            else cnt_or_pos[gi]++;
+            if (scatter) out[h[gi]++] = r;
+            else h[gi]++;
         }
     }
+}
+
+static void slice_count_fn(void* vctx, uint32_t worker_id, int64_t t0, int64_t t1) {
+    (void)worker_id;
+    for (int64_t t = t0; t < t1; t++) slice_build_task((const slice_build_ctx_t*)vctx, t, false);
+}
+
+static void slice_scatter_fn(void* vctx, uint32_t worker_id, int64_t t0, int64_t t1) {
+    (void)worker_id;
+    for (int64_t t = t0; t < t1; t++) slice_build_task((const slice_build_ctx_t*)vctx, t, true);
+}
+
+/* Build the slices into grp_cnt / offsets (caller's [n_groups] arrays) and
+ * *idx_hdr, using pos[n_groups] as scratch.  sel may be NULL.  Returns
+ * false on allocation failure. */
+static bool slice_build(const int64_t* row_gid, int64_t nrows, ray_t* sel,
+                        int64_t n_groups, int64_t* grp_cnt, int64_t* offsets,
+                        int64_t* pos, ray_t** idx_hdr) {
+    *idx_hdr = NULL;
+    int64_t n_segs = (nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    slice_build_ctx_t c = { .row_gid = row_gid, .nrows = nrows, .n_groups = n_groups };
+    int64_t visited = nrows;
+    if (sel) {
+        ray_rowsel_t* sm = ray_rowsel_meta(sel);
+        if ((int64_t)sm->n_segs < n_segs) n_segs = sm->n_segs;
+        c.sel_flg  = ray_rowsel_flags(sel);
+        c.sel_offs = ray_rowsel_offsets(sel);
+        c.sel_idx  = ray_rowsel_idx(sel);
+        visited = sm->total_pass;
+    }
+    ray_pool_t* pool = ray_pool_get();
+    int64_t n_tasks = 1;
+    if (pool && visited >= SLICE_SERIAL_ROWS && n_groups > 0 &&
+        ray_pool_par_dispatch_ok(pool, visited, SLICE_SERIAL_ROWS)) {
+        n_tasks = ray_pool_total_workers(pool);
+        if (n_tasks * n_groups > SLICE_HIST_CELLS) n_tasks = SLICE_HIST_CELLS / n_groups;
+        if (n_tasks > n_segs) n_tasks = n_segs;
+        if (n_tasks < 2) n_tasks = 1;
+    }
+    ray_t* hist_hdr = NULL;
+    ray_t* seg_hdr = NULL;
+    int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
+        (size_t)n_tasks * (size_t)(n_groups > 0 ? n_groups : 1) * sizeof(int64_t));
+    int64_t* seg_lo = (int64_t*)scratch_alloc(&seg_hdr, (size_t)(n_tasks + 1) * sizeof(int64_t));
+    if (!hist || !seg_lo) {
+        if (hist_hdr) scratch_free(hist_hdr);
+        if (seg_hdr) scratch_free(seg_hdr);
+        return false;
+    }
+    /* cut the morsels into n_tasks runs of about visited / n_tasks rows */
+    seg_lo[0] = 0;
+    if (n_tasks > 1 && c.sel_flg) {
+        int64_t t = 1, acc = 0;
+        for (int64_t seg = 0; seg < n_segs && t < n_tasks; seg++) {
+            uint8_t f = c.sel_flg[seg];
+            if (f == RAY_SEL_ALL) {
+                int64_t s_hi = (seg + 1) * RAY_MORSEL_ELEMS;
+                acc += (s_hi > nrows ? nrows : s_hi) - seg * RAY_MORSEL_ELEMS;
+            } else if (f != RAY_SEL_NONE) {
+                acc += c.sel_offs[seg + 1] - c.sel_offs[seg];
+            }
+            while (t < n_tasks && acc * n_tasks >= visited * t) seg_lo[t++] = seg + 1;
+        }
+        while (t < n_tasks) seg_lo[t++] = n_segs;
+    } else {
+        for (int64_t t = 1; t < n_tasks; t++) seg_lo[t] = n_segs * t / n_tasks;
+    }
+    seg_lo[n_tasks] = n_segs;
+    c.hist = hist;
+    c.seg_lo = seg_lo;
+
+    if (n_tasks > 1) ray_pool_dispatch_n(pool, slice_count_fn, &c, (uint32_t)n_tasks);
+    else             slice_count_fn(&c, 0, 0, 1);
+
+    /* row-wise prefix: totals per group, offsets, then each task's cursor */
+    memset(grp_cnt, 0, (size_t)n_groups * sizeof(int64_t));
+    for (int64_t t = 0; t < n_tasks; t++) {
+        const int64_t* h = hist + t * n_groups;
+        for (int64_t gi = 0; gi < n_groups; gi++) grp_cnt[gi] += h[gi];
+    }
+    int64_t total = 0;
+    for (int64_t gi = 0; gi < n_groups; gi++) { offsets[gi] = total; total += grp_cnt[gi]; }
+    if (n_groups > 0) memcpy(pos, offsets, (size_t)n_groups * sizeof(int64_t));
+    for (int64_t t = 0; t < n_tasks; t++) {
+        int64_t* h = hist + t * n_groups;
+        for (int64_t gi = 0; gi < n_groups; gi++) { int64_t k = h[gi]; h[gi] = pos[gi]; pos[gi] += k; }
+    }
+
+    *idx_hdr = ray_alloc((size_t)(total > 0 ? total : 1) * sizeof(int64_t));
+    if (!*idx_hdr) { scratch_free(hist_hdr); scratch_free(seg_hdr); return false; }
+    c.idx_buf = (int64_t*)ray_data(*idx_hdr);
+    if (n_tasks > 1) ray_pool_dispatch_n(pool, slice_scatter_fn, &c, (uint32_t)n_tasks);
+    else             slice_scatter_fn(&c, 0, 0, 1);
+    scratch_free(hist_hdr);
+    scratch_free(seg_hdr);
+    return true;
 }
 
 static ray_t* query_materialize_parted_col(ray_t* col) {
@@ -14530,138 +14594,16 @@ by_dict_done:
                 int64_t* idx_buf = NULL;
                 ray_t*   idx_hdr = NULL;
                 if (needs_slice_idx) {
-                    /* Parallel histogram + scatter when the row count is
-                     * large enough to amortise dispatch overhead.  For
-                     * 5 M-row Q11 the serial loop was 8-10 ms; the
-                     * parallel path drops it to ~0.5 ms at 28 workers. */
-                    ray_pool_t* idx_pool = ray_pool_get();
-                    int64_t total = 0;
-                    int parallel_idx_done = 0;
-                    /* A where: that kept few rows: row_gid spans the whole
-                     * table (-1 for a filtered row), so the passes below
-                     * would read all of it twice and size a histogram per
-                     * task of the table for a handful of survivors.  The
-                     * selection lists the survivors; two serial passes over
-                     * them build the same slices, rows ascending within a
-                     * group as the scatter below leaves them. */
-                    if (saved_selection && n_groups > 0) {
-                        int64_t kept = ray_rowsel_meta(saved_selection)->total_pass;
-                        if (kept <= SLICE_IDX_SEL_MAX_ROWS && kept * 8 <= nrows) {
-                            memset(grp_cnt, 0, (size_t)n_groups * sizeof(int64_t));
-                            idxbuf_sel_pass(row_gid, saved_selection, nrows, grp_cnt, NULL);
-                            for (int64_t gi = 0; gi < n_groups; gi++) {
-                                offsets[gi] = total;
-                                total += grp_cnt[gi];
-                            }
-                            idx_hdr = ray_alloc((size_t)(total > 0 ? total : 1) * sizeof(int64_t));
-                            if (!idx_hdr) {
-                                ray_free(gk_hdr); ray_free(rg_hdr);
-                                ray_free(cnt_hdr); ray_free(off_hdr);
-                                ray_free(pos_hdr);
-                                RELEASE_SCAN_KEY();
-                                ray_release(result); ray_release(tbl);
-                                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
-                            }
-                            idx_buf = (int64_t*)ray_data(idx_hdr);
-                            memcpy(pos, offsets, (size_t)n_groups * sizeof(int64_t));
-                            idxbuf_sel_pass(row_gid, saved_selection, nrows, pos, idx_buf);
-                            parallel_idx_done = 1;
-                        }
+                    if (!slice_build(row_gid, nrows, saved_selection, n_groups,
+                                     grp_cnt, offsets, pos, &idx_hdr)) {
+                        ray_free(gk_hdr); ray_free(rg_hdr);
+                        ray_free(cnt_hdr); ray_free(off_hdr);
+                        ray_free(pos_hdr);
+                        RELEASE_SCAN_KEY();
+                        ray_release(result); ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                     }
-                    if (!parallel_idx_done && idx_pool && nrows >= 200000 &&
-                        ray_pool_total_workers(idx_pool) >= 2 &&
-                        n_groups > 0 && n_groups <= 65536)
-                    {
-                        int64_t grain = (int64_t)RAY_DISPATCH_MORSELS *
-                                        RAY_MORSEL_ELEMS;
-                        int64_t n_tasks = (nrows + grain - 1) / grain;
-                        if (n_tasks > 65536) {
-                            n_tasks = 65536;
-                            grain = (nrows + n_tasks - 1) / n_tasks;
-                        }
-                        ray_t* hist_hdr = NULL;
-                        ray_t* cur_hdr  = NULL;
-                        int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
-                            (size_t)n_tasks * (size_t)n_groups *
-                            sizeof(int64_t));
-                        int64_t* cur  = (int64_t*)scratch_alloc(&cur_hdr,
-                            (size_t)n_tasks * (size_t)n_groups *
-                            sizeof(int64_t));
-                        if (hist && cur) {
-                            idxbuf_par_ctx_t pctx = {
-                                .row_gid  = row_gid,
-                                .hist     = hist,
-                                .cursor   = cur,
-                                .idx_buf  = NULL,
-                                .n_groups = n_groups,
-                                .grain    = grain,
-                            };
-                            ray_pool_dispatch(idx_pool, idxbuf_hist_fn,
-                                              &pctx, nrows);
-
-                            /* Prefix: per-group total + per-task cursor. */
-                            for (int64_t gi = 0; gi < n_groups; gi++) {
-                                int64_t cum = total;
-                                for (int64_t t = 0; t < n_tasks; t++) {
-                                    int64_t c = hist[t * n_groups + gi];
-                                    cur[t * n_groups + gi] = cum;
-                                    cum += c;
-                                }
-                                grp_cnt[gi] = cum - total;
-                                offsets[gi] = total;
-                                total = cum;
-                            }
-
-                            idx_hdr = ray_alloc((size_t)total *
-                                                sizeof(int64_t));
-                            if (!idx_hdr) {
-                                scratch_free(hist_hdr); scratch_free(cur_hdr);
-                                ray_free(gk_hdr); ray_free(rg_hdr);
-                                ray_free(cnt_hdr); ray_free(off_hdr);
-                                ray_free(pos_hdr);
-                                RELEASE_SCAN_KEY();
-                                ray_release(result); ray_release(tbl);
-                                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
-                            }
-                            idx_buf = (int64_t*)ray_data(idx_hdr);
-                            pctx.idx_buf = idx_buf;
-                            ray_pool_dispatch(idx_pool, idxbuf_scat_fn,
-                                              &pctx, nrows);
-                            parallel_idx_done = 1;
-                        }
-                        if (hist_hdr) scratch_free(hist_hdr);
-                        if (cur_hdr)  scratch_free(cur_hdr);
-                    }
-
-                    if (!parallel_idx_done) {
-                        memset(grp_cnt, 0, (size_t)n_groups * sizeof(int64_t));
-                        for (int64_t r = 0; r < nrows; r++)
-                            if (row_gid[r] >= 0) grp_cnt[row_gid[r]]++;
-
-                        total = 0;
-                        for (int64_t gi = 0; gi < n_groups; gi++)
-                            total += grp_cnt[gi];
-                        idx_hdr = ray_alloc((size_t)total * sizeof(int64_t));
-                        if (!idx_hdr) {
-                            ray_free(gk_hdr); ray_free(rg_hdr); ray_free(cnt_hdr);
-                            ray_free(off_hdr); ray_free(pos_hdr);
-                            RELEASE_SCAN_KEY();
-                            ray_release(result); ray_release(tbl);
-                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
-                        }
-                        idx_buf = (int64_t*)ray_data(idx_hdr);
-
-                        offsets[0] = 0;
-                        for (int64_t gi = 1; gi < n_groups; gi++)
-                            offsets[gi] = offsets[gi - 1] + grp_cnt[gi - 1];
-
-                        memcpy(pos, offsets,
-                               (size_t)n_groups * sizeof(int64_t));
-                        for (int64_t r = 0; r < nrows; r++) {
-                            int64_t gi = row_gid[r];
-                            if (gi >= 0) idx_buf[pos[gi]++] = r;
-                        }
-                    }
+                    idx_buf = (int64_t*)ray_data(idx_hdr);
                 }
 
                 ray_t* scatter_err = NULL;
