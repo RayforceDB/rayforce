@@ -201,3 +201,26 @@
 (set Rsw8b (select {c: (count v) from: Tsw8b by: [k1 k2]}))
 (>= (count Rsw8b) 3) -- true
 (.sys.exec "rm -f /tmp/rfl_grp_sw8.csv") -- 0
+
+;; A key that evaluates to one value — a literal, or a `let` whose body is
+;; one — is that value on every row: one group.  It came back as an atom or
+;; a one-element vector and was read as a full column past its end, giving
+;; random groups on one core and a crash on the workers.
+(set Tconst (table [ref v] (list (as 'SYM (% (til 70000) 300)) (til 70000))))
+(set Rconst (select {from: Tconst by: (let a ref "const") c: (count ref) s: (sum v)}))
+(at Rconst 'ref) -- ["const"]
+(at Rconst 'c) -- [70000]
+(at Rconst 's) -- [2449965000]
+(at (select {from: Tconst by: "const" c: (count ref)}) 'c) -- [70000]
+(at (select {from: Tconst by: (let a ref 7) c: (count ref)}) 'c) -- [70000]
+(at (select {from: Tconst by: (let a ref 2020.01.01) c: (count ref)}) 'ref) -- [2020.01.01]
+(at (select {from: Tconst by: (let a ref 7) c: (count ref) where: (> v 69990)}) 'c) -- [9]
+(at (select {from: (table [ref v] (list (as 'SYM (% (til 70) 3)) (til 70))) by: (let a ref "const") c: (count ref)}) 'c) -- [70]
+(at (select {from: (table [ref v] (list ['a] [1])) by: "const" c: (count ref)}) 'c) -- [1]
+
+;; A STR atom as an aggregate input is that value in every group; it had no
+;; broadcast case and the query failed with "oom" (or worse).
+(set TSa (table [x s] (list (til 6) ['a 'b 'c 'a 'b 'c])))
+(at (select {c: (first (upper "a")) from: TSa by: s}) 'c) -- ["A" "A" "A"]
+(at (select {c: (last (trim " a")) from: TSa by: s}) 'c) -- ["a" "a" "a"]
+(at (select {c: (first "zz") from: TSa}) 'c) -- ["zz"]

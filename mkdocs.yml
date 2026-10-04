@@ -135,6 +135,7 @@ nav:
           - .mc — Multicast: multicast-usage.md
           - .mem — Measurement: docs/namespaces/mem.md
           - .os — Process env: docs/namespaces/os.md
+          - .parquet — Parquet input: docs/namespaces/parquet.md
           - .repl — REPL control: docs/namespaces/repl.md
           - .sys — System info: docs/namespaces/sys.md
           - .time — Clock & timers: docs/namespaces/time.md

@@ -64,6 +64,10 @@ int  ray_version_major(void);
 int  ray_version_minor(void);
 int  ray_version_patch(void);
 const char* ray_version_string(void);
+/* The commit this library was built from, as its build saw it ("unknown"
+ * outside a git checkout).  A compile-time constant: safe to call before
+ * any runtime exists. */
+const char* ray_git_commit(void);
 
 /* ===== Type Constants ===== */
 
@@ -358,6 +362,8 @@ void     ray_free_raw(void* p);
 /* ===== System memory ===== */
 
 int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informational) */
+int64_t  ray_sys_ram_limit(void);   /* RAM this process may use: min(physical RAM,
+                                     * container/cgroup limit); the default anon watermark */
 
 /* ===== Interrupt API =====
  * Long-running queries poll ray_interrupted() at morsel granularity
@@ -648,6 +654,8 @@ int64_t  ray_sym_intern_runtime(const char* str, size_t len);
 int64_t  ray_sym_find(const char* str, size_t len);
 ray_t*    ray_sym_str(int64_t id);
 uint32_t ray_sym_count(void);
+/* Bytes of string storage the global symbol table holds (its arena). */
+size_t   ray_sym_bytes(void);
 
 /* Borrow a snapshot of the sym → string array.  Returns a pointer to
  * the underlying ray_t** strings table along with its length; valid
@@ -841,6 +849,10 @@ int64_t   ray_ipc_connect(const char* host, uint16_t port,
                           int timeout_ms);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
+/* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
+ * On expiry the connection is closed (on.close fires) and an `io` error
+ * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */
+ray_t*    ray_ipc_send_timeout(int64_t handle, ray_t* msg, int64_t timeout_ms);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
 

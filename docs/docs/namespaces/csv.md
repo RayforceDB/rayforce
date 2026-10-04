@@ -44,7 +44,7 @@ Examples:
 (set t (.csv.read [sym price qty date] [SYMBOL F64 I64 DATE] "/tmp/rayforce-trades-headerless.csv"))
 ```
 
-The reader memory-maps the input, splits it into chunks, parses chunks in parallel, then merges column types and symbol-intern tables. Speedup is near-linear with core count on files of 100 MB+.
+The reader memory-maps the input, splits it into chunks, parses chunks in parallel, then merges column types and symbol-intern tables. Scaling depends on parsing, dictionary work, memory pressure, and output I/O; see the [measured load comparisons](../guides/storage.md#full-clickbench-load-proof).
 
 ## `.csv.write` { #csv-write }
 
@@ -64,7 +64,7 @@ Signatures:
 - `(.csv.splayed [types] "src.csv" "out_dir")`
 - `(.csv.splayed [names] [types] "src.csv" "out_dir")`
 
-Streams `src.csv` chunk-by-chunk through the parser into a splayed directory at `out_dir` (one column file per field, plus a `sym` symbol-table file). Returns the resulting splayed table loaded with `ray_read_splayed` — zero-copy mmap, so the bytes stay on disk.
+Streams `src.csv` chunk-by-chunk through the parser into a splayed directory at `out_dir` (one column file per field, `.d` schema, and `.sym` symbol dictionary when needed). Returns the resulting splayed table loaded with `ray_read_splayed` — zero-copy mmap, so the bytes stay on disk.
 
 Use this when the CSV is too large to fit in memory but you want to query it like an in-memory table.
 
@@ -85,7 +85,7 @@ Signatures (with optional rows-per-part):
 - `(.csv.parted [names] [types] "src.csv" "db_root" 'tbl_name)`
 - `(.csv.parted [...]types "src.csv" rows_per_part "db_root" 'tbl_name)` — pass a positive integer just before the db-root to override the default partition size.
 
-Streams the CSV into a partitioned table under `db_root/tbl_name/`, creating subdirectories per partition. Returns the parted table loaded back from disk.
+Streams the CSV into `db_root/<partition-number>/tbl_name/`. Returns the parted table loaded back from disk. A new root is staged at `<db_root>.csv-partial` and published after the shared dictionary flush; staging from an import that failed after writing a partition is retained for diagnosis, and a retry into the same root fails with an `io` error naming the directory to remove. A failure before the first partition (an unreadable or empty source, a type vector that does not match) leaves nothing behind. Existing roots retain per-partition update behavior. Bulk writes require an external file and directory sync for durability.
 
 Constraints on `tbl_name`: must not start with `.`, must not contain `/` or `\\` or `..`.
 

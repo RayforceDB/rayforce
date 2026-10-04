@@ -1,0 +1,66 @@
+;; A row column mixed with an aggregate in ONE projection, on the eval fallback.
+;;
+;; A temporal `+ - *` makes compile_expr_dag decline a projection, so the whole
+;; select lands in the eval fallback (src/ops/query.c, the loop over
+;; eval_expr_whole_column / eval_expr_per_row).  A projection with a column
+;; ref outside its aggregate (`(+ i (max i))`, `(if (> i (avg i)) 1 0)`) is
+;; scattered per row there, and every column is bound to one cell: the
+;; aggregate folded that cell alone, so `(max i)` read as `i` and
+;; `(+ i (max i))` came back as `(* 2 i)`.  Every maximal aggregate call in
+;; such a projection is now reduced once over the whole table before the
+;; scatter and spliced into a rewritten copy of the expression
+;; (select_fallback_prereduce), so each row combines with the value the DAG
+;; path broadcasts.
+;;
+;; Oracle: the DAG path with a plain (non-temporal) row projection beside it.
+
+(set T (table [i ts s n] (list [1 2 3 4] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 4))) (quote [a b c d]) (list "p" "q" "r" "s"))))
+
+;; ── the DAG rule this must match ─────────────────────────────────────────────
+(at (select {m: (+ i (max i)) x: i from: T}) 'm) -- [5 6 7 8]
+(at (select {m: (if (> i (avg i)) 1 0) x: i from: T}) 'm) -- [0 0 1 1]
+
+;; ── arithmetic over a row column and an aggregate ────────────────────────────
+(at (select {m: (+ i (max i)) x: (+ ts 1) from: T}) 'm) -- [5 6 7 8]
+(at (select {x: (+ ts 1) m: (+ i (max i)) from: T}) 'm) -- [5 6 7 8]
+(at (select {m: (* i (avg i)) x: (+ ts 1) from: T}) 'm) -- [2.5 5.0 7.5 10.0]
+(at (select {m: (- i (/ (sum i) (count i))) x: (+ ts 1) from: T}) 'm) -- [-1.5 -0.5 0.5 1.5]
+(at (select {m: (+ i (count (distinct i))) x: (+ ts 1) from: T}) 'm) -- [5 6 7 8]
+(at (select {m: (+ i (max i)) x: (+ ts 1) from: T}) 'x) -- (+ (at T 'ts) 1)
+(count (select {m: (+ i (max i)) x: (+ ts 1) from: T})) -- 4
+
+;; ── a scalar `if` whose condition reads the row and an aggregate ─────────────
+(at (select {m: (if (> i (avg i)) 1 0) x: (+ ts 1) from: T}) 'm) -- [0 0 1 1]
+(at (select {m: (if (> i (avg i)) (max i) (min i)) x: (+ ts 1) from: T}) 'm) -- [1 1 4 4]
+
+;; ── a nested aggregate is reduced as a whole ─────────────────────────────────
+(at (select {m: (+ i (max (- i (min i)))) x: (+ ts 1) from: T}) 'm) -- [4 5 6 7]
+
+;; ── a symbol- or string-valued aggregate is spliced as a literal ─────────────
+(at (select {m: (== s (first s)) x: (+ ts 1) from: T}) 'm) -- [true false false false]
+(at (select {m: (== n (last n)) x: (+ ts 1) from: T}) 'm) -- [false false false true]
+
+;; ── the temporal column mixed with its own aggregate ─────────────────────────
+(at (select {m: (- ts (min ts)) x: i from: T}) 'm) -- [0 10 20 30]
+(at (select {m: (- ts.yyyy (max i)) x: (+ ts 1) from: T}) 'm) -- [2020 2020 2020 2020]
+
+;; ── where: filters before the aggregate is reduced ───────────────────────────
+(at (select {m: (- i (min i)) x: (+ ts 1) from: T where: (> i 1)}) 'm) -- [0 1 2]
+(at (select {m: (+ i (max i)) x: (+ ts 1) from: T where: (> i (avg i))}) 'm) -- [7 8]
+(count (select {m: (+ i (max i)) x: (+ ts 1) from: T where: (> i 10)})) -- 0
+
+;; ── the aggregate reads an earlier output; a later output reads the mix ──────
+(at (select {d: (* i 2) m: (+ i (max d)) x: (+ ts 1) from: T}) 'm) -- [9 10 11 12]
+(at (select {d: (* i 2) m: (+ i (max d)) y: (- m 1) x: (+ ts 1) from: T}) 'y) -- [8 9 10 11]
+
+;; ── a lambda call's argument is reduced; a lambda body is left alone ─────────
+;; (a lambda call is a per-row projection on the fallback, #690: its body
+;;  folds the formal it was given, one cell, so (max a) there is a itself)
+(at (select {m: (+ i ((fn [a] (* a 2)) (max i))) x: (+ ts 1) from: T}) 'm) -- [9 10 11 12]
+(at (select {m: ((fn [a] (- a (max a))) i) x: (+ ts 1) from: T}) 'm) -- [0 0 0 0]
+(at (select {k: ((fn [a] (if (> a 2) 1 0)) i) x: (+ ts 1) from: T}) 'k) -- [0 0 1 1]
+
+;; ── what already held: an aggregate alone broadcasts, all-aggregate is one row ─
+(at (select {m: (max i) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
+(at (select {m: (count (distinct i)) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
+(count (select {m: (max i) s: (+ (max ts) 1) from: T})) -- 1

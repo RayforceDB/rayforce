@@ -197,11 +197,6 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     ray_err_t err = ray_splay_save(tbl, dir, sym_path);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
-    /* Build + persist accelerator indexes (STR dictionaries, numeric chunk-zone
-     * min/max) inline at each column file's tail so mmap loads get the fast
-     * paths — same pass .csv.splayed runs. */
-    ray_splay_build_indexes(dir, tbl);
-
     ray_retain(tbl);
     return tbl;
 }
@@ -1287,6 +1282,10 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "sort-perpart-runs",  17, ray_sort_perpart_runs()    },
         { "window-perpart-runs", 19, ray_window_perpart_runs() },
         { "join-perpart-runs",   17, ray_join_perpart_runs()   },
+        /* the global symbol table: entries and the bytes of their strings,
+         * so a test can assert that a query leaves it where it found it */
+        { "sym-count",        9, (int64_t)ray_sym_count()       },
+        { "sym-bytes",        9, (int64_t)ray_sym_bytes()       },
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         int64_t s = ray_sym_intern(rows[i].name, rows[i].nlen);
@@ -1740,11 +1739,13 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
 
     /* Optional second argument: an integer connect timeout in
      * milliseconds (0 = use default), or an options dict carrying
-     * `timeout` and/or `compress` (#541). */
+     * `timeout`, `compress` (#541) and/or `keepalive` (#589). */
     int    timeout_ms = 0;
     size_t compress   = RAY_IPC_COMPRESS_AUTO;
+    int    keepalive  = RAY_IPC_KEEPALIVE_AUTO;
     if (n == 2) {
-        ray_t* err = ray_ipc_parse_open_opts(args[1], &timeout_ms, &compress);
+        ray_t* err = ray_ipc_parse_open_opts(args[1], &timeout_ms, &compress,
+                                             &keepalive);
         if (err) return err;
     }
 
@@ -1802,7 +1803,8 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     const char* pw_ptr = (n_parts >= 4) ? password : NULL;
     const char* us_ptr = (n_parts >= 4) ? user : NULL;
 
-    int64_t h = ray_ipc_connect_opts(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms, compress);
+    int64_t h = ray_ipc_connect_opts(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms,
+                                     compress, keepalive);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
     if (h == -4) return ray_error("io", "wire version mismatch: %s:%d", host, port);
@@ -1822,15 +1824,41 @@ ray_t* ray_hclose_fn(ray_t* x) {
     return RAY_NULL_OBJ;
 }
 
-/* (hsend handle msg) → result */
-ray_t* ray_hsend_fn(ray_t* handle, ray_t* msg) {
+/* (.ipc.send handle msg [timeout-ms]) → result
+ *
+ * The optional timeout bounds the whole round trip (#589).  On expiry the
+ * connection is closed — a late reply would otherwise answer the next
+ * send — and an `io` error is returned.  0N means no deadline, as if the
+ * argument were absent. */
+ray_t* ray_hsend_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 3)
+        return ray_error("rank", ".ipc.send expects 2 or 3 arguments: handle msg [timeout-ms]");
+    ray_t* handle = args[0];
+    ray_t* msg    = args[1];
     if (!ray_is_atom(handle) || (handle->type != -RAY_I64 && handle->type != -RAY_I32))
         return ray_error("type", ".ipc.send expects an i64 or i32 handle, got %s", ray_type_name(handle->type));
     int64_t h = (handle->type == -RAY_I64) ? handle->i64 : handle->i32;
+
+    int64_t timeout_ms = 0;
+    if (n == 3) {
+        ray_t* t = args[2];
+        if (!ray_is_atom(t) || (t->type != -RAY_I64 && t->type != -RAY_I32))
+            return ray_error("type", ".ipc.send timeout must be an integer (ms), got %s", ray_type_name(t->type));
+        int64_t tv = (t->type == -RAY_I64) ? t->i64
+                   : (t->i32 == NULL_I32 ? NULL_I64 : (int64_t)t->i32);
+        if (tv != NULL_I64) {
+            /* 0 is refused rather than guessed at: "no deadline" or
+             * "already expired"? */
+            if (tv <= 0)
+                return ray_error("domain", ".ipc.send timeout must be > 0 or 0N (none), got %lld", (long long)tv);
+            timeout_ms = tv;
+        }
+    }
+
     /* Validate message is serializable (reject builtins, etc.) */
     if (ray_serde_size(msg) <= 0)
         return ray_error("type", "message not serializable");
-    return ray_ipc_send(h, msg);
+    return ray_ipc_send_timeout(h, msg, timeout_ms);
 }
 
 /* (.ipc.post handle msg) → null on local send, error on failure.

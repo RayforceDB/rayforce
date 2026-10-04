@@ -42,6 +42,7 @@
 #include "mem/sys.h"
 #include "core/numparse.h"
 #include "core/pool.h"
+#include "core/profile.h"   /* ray_profile_now_ns: RAY_CSV_TRACE phase stamps */
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "lang/format.h"
 #include "ops/hash.h"
@@ -49,6 +50,7 @@
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"
+#include "store/stream.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
@@ -1370,6 +1372,97 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
     return n;
 }
 
+/* Row starts of the next `max_rows` rows from `off`: the parallel window
+ * scan when it applies, else the serial limited scan — the pairing the
+ * streaming import loop uses, so both see identical row boundaries.
+ * *avg_row is refined from each chunk. */
+static int64_t csv_scan_rows_chunk(const char* buf, size_t file_size,
+                                   size_t off, int64_t max_rows,
+                                   size_t* avg_row, bool data_has_quotes,
+                                   int64_t** offs, ray_t** hdr, size_t* next) {
+    int64_t cnt = build_row_offsets_window(buf, file_size, off, max_rows,
+                                           *avg_row, data_has_quotes,
+                                           offs, hdr, next);
+    if (cnt == -2)
+        cnt = build_row_offsets_limited(buf, file_size, off, max_rows,
+                                        data_has_quotes, offs, hdr, next);
+    if (cnt > 0 && *next > off) *avg_row = (*next - off) / (size_t)cnt;
+    return cnt;
+}
+
+#define CSV_SAMPLE_SCAN_ROWS (1 << 20)
+
+/* Type-inference sample for the streaming importers, chosen exactly as
+ * .csv.read chooses it: CSV_SAMPLE_ROWS rows at indices
+ * si * (n - 1) / (CSV_SAMPLE_ROWS - 1) over all n data rows, or every row
+ * when n is no larger.  The streaming paths never hold all row offsets, so
+ * this costs a counting pass and a picking pass over the row boundaries —
+ * but it is what keeps .csv.splayed / .csv.parted inferring the same column
+ * types as .csv.read for the same file (SYM vs STR is a sample-cardinality
+ * decision, so any other sample can disagree).  Fed to
+ * csv_infer_types_from_offsets with n_rows == the sample size, every row
+ * given is used.  Same contract as build_row_offsets_limited: the row
+ * count, 0 on allocation failure, -1 if interrupted. */
+static int64_t csv_streaming_sample(const char* buf, size_t file_size,
+                                    size_t data_offset, bool data_has_quotes,
+                                    int64_t** offsets_out, ray_t** hdr_out) {
+    *offsets_out = NULL;
+    *hdr_out = NULL;
+    if (data_offset >= file_size) return 0;
+
+    /* Pass 1: count rows. */
+    int64_t total = 0;
+    size_t avg_row = 64;
+    for (size_t off = data_offset; off < file_size; ) {
+        int64_t* o = NULL; ray_t* h = NULL; size_t next = off;
+        int64_t cnt = csv_scan_rows_chunk(buf, file_size, off,
+                                          CSV_SAMPLE_SCAN_ROWS, &avg_row,
+                                          data_has_quotes, &o, &h, &next);
+        scratch_free(h);
+        if (cnt < 0) return -1;
+        if (cnt == 0 || next <= off) break;
+        total += cnt;
+        off = next;
+    }
+
+    if (total <= CSV_SAMPLE_ROWS)
+        return build_row_offsets_limited(buf, file_size, data_offset,
+                                         CSV_SAMPLE_ROWS, data_has_quotes,
+                                         offsets_out, hdr_out, NULL);
+
+    ray_t* hdr = NULL;
+    int64_t* picked = (int64_t*)scratch_alloc(&hdr,
+        (size_t)CSV_SAMPLE_ROWS * sizeof(int64_t));
+    if (!picked) return 0;
+
+    /* Pass 2: pick the sample rows' offsets. */
+    int64_t si = 0, base = 0;
+    int64_t target = 0;                 /* index of sample row si */
+    for (size_t off = data_offset; off < file_size && si < CSV_SAMPLE_ROWS; ) {
+        int64_t* o = NULL; ray_t* h = NULL; size_t next = off;
+        int64_t cnt = csv_scan_rows_chunk(buf, file_size, off,
+                                          CSV_SAMPLE_SCAN_ROWS, &avg_row,
+                                          data_has_quotes, &o, &h, &next);
+        if (cnt < 0) { scratch_free(h); scratch_free(hdr); return -1; }
+        if (cnt == 0 || next <= off) { scratch_free(h); break; }
+        while (si < CSV_SAMPLE_ROWS && target < base + cnt) {
+            picked[si++] = o[target - base];
+            if (si < CSV_SAMPLE_ROWS)
+                target = si * (total - 1) / (CSV_SAMPLE_ROWS - 1);
+        }
+        scratch_free(h);
+        base += cnt;
+        off = next;
+    }
+    if (si != CSV_SAMPLE_ROWS) {        /* file changed under the map? */
+        scratch_free(hdr);
+        return 0;
+    }
+    *offsets_out = picked;
+    *hdr_out = hdr;
+    return si;
+}
+
 /* --------------------------------------------------------------------------
  * Per-column local dedupe — the parallel front half of the sym intern.
  *
@@ -2498,7 +2591,9 @@ static int csv_hash_elem_size(int8_t t) {
  *
  * Returns 1 to attach, 0 to skip. */
 /* Payload-level core of the hash-upgrade decision.  Its only caller is the
- * .csv.splayed index builder (ray_splay_build_indexes): indexing is a
+ * .csv.splayed / Parquet conversion path: the stream writer builds each
+ * column's chunk zone inline and, for integer columns whose zone passes this
+ * check, the column is re-read once to build the hash.  Indexing is a
  * CONVERSION-time decision, made once and persisted with the column files.
  * A `.csv.read` into memory attaches nothing (it used to run this same
  * heuristic over every column and throw the result away — 19.7 s of a 46 s
@@ -2983,12 +3078,10 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         col_data[c] = dst;
     }
 
-    /* No index attach here.  This function feeds the streaming csv→splayed /
-     * →parted writers: every column it produces is immediately serialised to
-     * disk and thrown away, and store/splay.c decides and persists the real
-     * index (chunk-zone / dict, upgraded to hash by
-     * ray_csv_hash_upgrade_check) at conversion time.  Building an in-memory
-     * index per 1M-row chunk here was pure waste. */
+    /* Index policy belongs to each destination writer: splayed stream writers
+     * build theirs inline while the column is written; parted attaches
+     * persisted zones to each final partition while it is resident.
+     * Intermediate chunks need none. */
 
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) {
@@ -3527,156 +3620,14 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
                                   col_types_in, n_types, NULL, 0);
 }
 
-typedef struct {
-    FILE* fp;
-    char path[1024];
-    char tmp_path[1024];
-    int8_t type;
-    uint8_t attrs;
-    int64_t rows;
-    bool had_nulls;
-    /* SYM columns: the target symfile's domain (shared, borrowed from
-     * the caller).  Cells are encoded as positions in it — the freshly
-     * parsed chunk vecs are runtime-domain, so each cell's string is
-     * find-or-appended into the domain (the flip, Task 7b).  Width is
-     * fixed at W32: a streaming writer can't know the final vocabulary
-     * before the last chunk, and W32 covers any STRL count. */
-    struct ray_sym_domain_s* dom;
-    /* runtime id -> domain position, direct-mapped: the chunk vecs are
-     * runtime-domain and a column's values repeat across rows and chunks,
-     * so a value is interned into the symfile's domain (a locked probe) the
-     * first time it is met and looked up here after. */
-    int64_t*  lut_id;    /* [CSV_SPLAYED_LUT] runtime id per slot, -1 empty */
-    uint32_t* lut_pos;   /* [CSV_SPLAYED_LUT] position per slot */
-} csv_splayed_col_writer_t;
-#define CSV_SPLAYED_LUT_BITS 19
-#define CSV_SPLAYED_LUT (1u << CSV_SPLAYED_LUT_BITS)
-
-static ray_err_t csv_splayed_writer_open(csv_splayed_col_writer_t* w,
-                                         const char* dir, int64_t name_id,
-                                         int8_t type,
-                                         struct ray_sym_domain_s* dom) {
-    memset(w, 0, sizeof(*w));
-    w->type = type;
-    w->attrs = (type == RAY_SYM) ? RAY_SYM_W32 : 0;
-    w->dom = dom;
-    if (type == RAY_SYM && !dom) return RAY_ERR_IO;
-
-    ray_t* name_atom = ray_sym_str(name_id);
-    if (!name_atom) return RAY_ERR_CORRUPT;
-    const char* name = ray_str_ptr(name_atom);
-    size_t name_len = ray_str_len(name_atom);
-    if (name_len == 0 || name[0] == '.' ||
-        memchr(name, '/', name_len) || memchr(name, '\\', name_len) ||
-        memchr(name, '\0', name_len))
-        return RAY_ERR_DOMAIN;
-
-    int n = snprintf(w->path, sizeof(w->path), "%s/%.*s",
-                     dir, (int)name_len, name);
-    if (n < 0 || (size_t)n >= sizeof(w->path)) return RAY_ERR_RANGE;
-    n = snprintf(w->tmp_path, sizeof(w->tmp_path), "%s.tmp", w->path);
-    if (n < 0 || (size_t)n >= sizeof(w->tmp_path)) return RAY_ERR_RANGE;
-
-    w->fp = fopen(w->tmp_path, "wb+");
-    if (!w->fp) return RAY_ERR_IO;
-    ray_t zero = {0};
-    if (fwrite(&zero, 1, 32, w->fp) != 32) return RAY_ERR_IO;
-    if (type == RAY_SYM) {
-        /* best effort: without the cache every cell probes the domain */
-        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)CSV_SPLAYED_LUT * sizeof(int64_t));
-        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)CSV_SPLAYED_LUT * sizeof(uint32_t));
-        if (!w->lut_id || !w->lut_pos) {
-            ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
-            w->lut_id = NULL; w->lut_pos = NULL;
-        } else {
-            memset(w->lut_id, 0xff, (size_t)CSV_SPLAYED_LUT * sizeof(int64_t));
-        }
-    }
-    return RAY_OK;
-}
-
-static void csv_splayed_writer_drop_lut(csv_splayed_col_writer_t* w) {
-    ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
-    w->lut_id = NULL; w->lut_pos = NULL;
-}
-
-static ray_err_t csv_splayed_writer_append(csv_splayed_col_writer_t* w,
-                                           ray_t* col) {
-    if (!w->fp || !col || RAY_IS_ERR(col)) return RAY_ERR_TYPE;
-    int64_t n = col->len;
-    if (n < 0) return RAY_ERR_CORRUPT;
-
-    if (w->type == RAY_SYM) {
-        /* Encode cells as positions in the target symfile's domain:
-         * resolve each cell through the chunk vec's own domain and
-         * find-or-append into the target (distinct work rides the
-         * write).  The domain is flushed before the column files are
-         * committed (close), preserving the sym-first crash ordering.
-         * A runtime-domain chunk vec goes through the id -> position
-         * cache: only a value's first encounter pays the domain probe. */
-        bool direct = ray_sym_vec_domain(col) == w->dom;
-        bool cached = ray_sym_vec_domain(col) == ray_sym_runtime_domain() && w->lut_id;
-        const void* cd = ray_data(col);
-        uint32_t buf[8192];
-        for (int64_t off = 0; off < n; ) {
-            int64_t cnt = n - off;
-            if (cnt > (int64_t)(sizeof(buf) / sizeof(buf[0])))
-                cnt = (int64_t)(sizeof(buf) / sizeof(buf[0]));
-            for (int64_t i = 0; i < cnt; i++) {
-                int64_t pos;
-                if (direct) {
-                    /* Already encoded over the target domain. */
-                    pos = ray_read_sym(cd, off + i, RAY_SYM, col->attrs);
-                } else if (cached) {
-                    int64_t id = ray_read_sym(cd, off + i, RAY_SYM, col->attrs);
-                    uint32_t slot = (uint32_t)(((uint64_t)id * 0x9E3779B97F4A7C15ull) >> (64 - CSV_SPLAYED_LUT_BITS));
-                    if (w->lut_id[slot] == id) {
-                        pos = w->lut_pos[slot];
-                    } else {
-                        ray_t* s = ray_sym_str(id);
-                        if (!s) return RAY_ERR_CORRUPT;
-                        pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
-                        if (pos < 0) return RAY_ERR_OOM;
-                        w->lut_id[slot] = id; w->lut_pos[slot] = (uint32_t)pos;
-                    }
-                } else {
-                    ray_t* s = ray_sym_vec_cell(col, off + i);
-                    if (!s) return RAY_ERR_CORRUPT;
-                    pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
-                    if (pos < 0) return RAY_ERR_OOM;
-                }
-                buf[i] = (uint32_t)pos;
-                /* Position 0 of any symfile is the empty string (domain.c
-                 * enforces that reservation on open), so a re-encoded cell is
-                 * the canonical SYM null exactly when its position is 0.
-                 * Testing the value WRITTEN keeps the on-disk HAS_NULLS honest
-                 * without trusting the chunk vec's attrs — and this arm is why
-                 * streamed SYM columns used to lose the bit entirely: only the
-                 * non-SYM arm below propagated it (issue #416). */
-                if (pos == 0) w->had_nulls = true;
-            }
-            if (fwrite(buf, sizeof(uint32_t), (size_t)cnt, w->fp) != (size_t)cnt)
-                return RAY_ERR_IO;
-            off += cnt;
-        }
-    } else {
-        uint8_t esz = ray_sym_elem_size(w->type, 0);
-        size_t bytes = (size_t)n * (size_t)esz;
-        if (bytes && fwrite(ray_data(col), 1, bytes, w->fp) != bytes)
-            return RAY_ERR_IO;
-        if (col->attrs & RAY_ATTR_HAS_NULLS) w->had_nulls = true;
-    }
-    w->rows += n;
-    return RAY_OK;
-}
-
 /* Append task: column `start` of the chunk table into its writer.  The
  * first failure is kept (a later task cannot clear it). */
 typedef struct {
-    csv_splayed_col_writer_t* writers;
+    ray_col_stream_t* writers;
     ray_t*   tbl;
     int      ncols;
     _Atomic(ray_err_t) err;
+    int64_t* col_ns;    /* RAY_CSV_TRACE: per-column append time, or NULL */
 } csv_splayed_append_ctx_t;
 
 static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -3684,59 +3635,30 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
     if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
     ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
-    ray_err_t e = csv_splayed_writer_append(&a->writers[start], col);
+    int64_t tt0 = a->col_ns ? ray_profile_now_ns() : 0;
+    ray_err_t e = ray_col_stream_append(&a->writers[start], col);
+    if (a->col_ns) a->col_ns[start] += ray_profile_now_ns() - tt0;
     if (e != RAY_OK) {
         ray_err_t ok = RAY_OK;
         atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
     }
 }
 
-static ray_err_t csv_splayed_writer_close(csv_splayed_col_writer_t* w) {
-    csv_splayed_writer_drop_lut(w);
-    if (!w->fp) return RAY_OK;
-    ray_err_t err = RAY_OK;
-
-    if (err == RAY_OK) {
-        ray_t hdr = {0};
-        hdr.type = w->type;
-        hdr.attrs = w->attrs;
-        hdr.len = w->rows;
-        /* SYM: header rc = the symfile's count (the loader's O(1)
-         * fast-reject against the FILE domain). */
-        hdr.rc = (w->type == RAY_SYM)
-            ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
-        if (w->had_nulls) hdr.attrs |= RAY_ATTR_HAS_NULLS;
-        /* Stamp the on-disk format major version into `order` so the
-         * streamed column file shares the exact identity ray_col_save
-         * writes — the loaders validate it.  aux stays zero (it was
-         * zero-initialized above) — reserved for postponed index data. */
-        ray_col_stamp_format(&hdr);
-        if (fseek(w->fp, 0, SEEK_SET) != 0 ||
-            fwrite(&hdr, 1, 32, w->fp) != 32)
-            err = RAY_ERR_IO;
-    }
-
-    if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
-    w->fp = NULL;
-    if (err == RAY_OK) err = ray_file_rename(w->tmp_path, w->path);
-    if (err != RAY_OK) remove(w->tmp_path);
-    return err;
-}
-
-static void csv_splayed_writer_abort(csv_splayed_col_writer_t* w) {
-    csv_splayed_writer_drop_lut(w);
-    if (w->fp) fclose(w->fp);
-    w->fp = NULL;
-    remove(w->tmp_path);
-}
-
-ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
+static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool header,
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
-                                          const char* dir, int64_t rows_per_chunk) {
+                                          const char* dir, int64_t rows_per_chunk,
+                                          const char* sym_path) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
-    if (!path || !dir) return RAY_ERR_DOMAIN;
+    if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
+    /* RAY_CSV_TRACE: phase timings to stderr, as csv.parted prints them. */
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    int64_t tr_t0 = ray_profile_now_ns();
+    int64_t tr_scan = 0, tr_parse = 0, tr_append = 0, tr_chunks = 0;
+    int64_t tr_col_ns[CSV_MAX_COLS];
+    memset(tr_col_ns, 0, sizeof(tr_col_ns));
+#define TR_MS(ns) ((double)(ns) / 1e6)
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return RAY_ERR_IO;
@@ -3834,12 +3756,10 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     } else if (!col_types_in) {
         ray_t* sample_offsets_hdr = NULL;
         int64_t* sample_offsets = NULL;
-        int64_t sample_n = build_row_offsets_limited(buf, file_size, data_offset,
-                                                     CSV_SAMPLE_ROWS,
-                                                     data_has_quotes,
-                                                     &sample_offsets,
-                                                     &sample_offsets_hdr,
-                                                     NULL);
+        int64_t sample_n = csv_streaming_sample(buf, file_size, data_offset,
+                                                data_has_quotes,
+                                                &sample_offsets,
+                                                &sample_offsets_hdr);
         if (sample_n < 0) {
             ray_vm_unmap_file(buf, file_size);
             return RAY_ERR_CANCEL;
@@ -3851,33 +3771,6 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
         if (!infer_ok) {
             ray_vm_unmap_file(buf, file_size);
             return RAY_ERR_OOM;
-        }
-    }
-
-    for (int c = 0; c < ncols; c++) {
-        if (resolved_types[c] == RAY_STR) {
-            ray_t* tbl = ray_read_csv_named_opts(path, delimiter, header,
-                                                 col_types_in, n_types,
-                                                 col_names_in, n_names);
-            if (!tbl || RAY_IS_ERR(tbl)) {
-                ray_vm_unmap_file(buf, file_size);
-                return tbl ? ray_err_from_obj(tbl) : RAY_ERR_IO;
-            }
-            /* Splay save owns the symfile now: dir/.sym is the table's
-             * domain (distinct-merge + position encoding); symbol-free
-             * tables write none.  The dotfile name leaves "sym" free as a
-             * user column. */
-            char sym_path[1024];
-            int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
-            if (n < 0 || (size_t)n >= sizeof(sym_path)) {
-                ray_release(tbl);
-                ray_vm_unmap_file(buf, file_size);
-                return RAY_ERR_RANGE;
-            }
-            err = ray_splay_save_bulk(tbl, dir, sym_path);
-            ray_release(tbl);
-            ray_vm_unmap_file(buf, file_size);
-            return err;
         }
     }
 
@@ -3917,12 +3810,6 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
         for (int c = 0; c < ncols; c++)
             if (resolved_types[c] == RAY_SYM) any_sym = true;
         if (any_sym) {
-            char sym_path[1024];
-            int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
-            if (n < 0 || (size_t)n >= sizeof(sym_path)) {
-                ray_vm_unmap_file(buf, file_size);
-                return RAY_ERR_RANGE;
-            }
             sym_dom = ray_sym_domain_open_or_create(sym_path);
             if (!sym_dom) {
                 ray_vm_unmap_file(buf, file_size);
@@ -3943,13 +3830,14 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
         }
     }
 
-    csv_splayed_col_writer_t writers[CSV_MAX_COLS];
+    ray_col_stream_t writers[CSV_MAX_COLS];
     memset(writers, 0, sizeof(writers));
     for (int c = 0; c < ncols; c++) {
-        err = csv_splayed_writer_open(&writers[c], dir, col_name_ids[c],
+        err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
                                       resolved_types[c], sym_dom);
+        if (err == RAY_OK) err = ray_col_stream_index_begin(&writers[c], 0);
         if (err != RAY_OK) {
-            for (int j = 0; j < c; j++) csv_splayed_writer_abort(&writers[j]);
+            for (int j = 0; j <= c; j++) ray_col_stream_abort(&writers[j]);
             if (sym_dom) ray_sym_domain_release(sym_dom);
             ray_vm_unmap_file(buf, file_size);
             return err;
@@ -3959,11 +3847,13 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     size_t chunk_offset = data_offset;
     bool wrote_any = false;
     size_t avg_row_bytes = 64;   /* refined from every chunk scanned */
+    int64_t tr_setup = ray_profile_now_ns() - tr_t0;
     while (chunk_offset < file_size || !wrote_any) {
         ray_t* row_offsets_hdr = NULL;
         int64_t* row_offsets = NULL;
         size_t next_offset = chunk_offset;
         int64_t cnt = 0;
+        int64_t tr_c0 = ray_profile_now_ns();
         if (chunk_offset < file_size) {
             /* Parallel scan over a byte window sized from the rows seen so
              * far; the serial walk remains the fallback and the semantics. */
@@ -3986,6 +3876,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             }
         }
 
+        int64_t tr_c1 = ray_profile_now_ns();
         ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
                                           cnt, ncols, delimiter, col_name_ids,
                                           resolved_types, sym_dom);
@@ -3996,6 +3887,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             if (tbl) ray_release(tbl);
             break;
         }
+        int64_t tr_c2 = ray_profile_now_ns();
 
         /* One task per column: each writer owns its file, its cache and
          * its symfile domain (the domain probe takes the domain lock, the
@@ -4003,7 +3895,8 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
          * encoded and written side by side. */
         {
             csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
-                                              .ncols = ncols, .err = RAY_OK };
+                                              .ncols = ncols, .err = RAY_OK,
+                                              .col_ns = trace ? tr_col_ns : NULL };
             ray_pool_t* wpool = ray_pool_get();
             if (ray_pool_par_dispatch_ok(wpool, ncols, 2))
                 ray_pool_dispatch_n(wpool, csv_splayed_append_task, &actx, (uint32_t)ncols);
@@ -4012,6 +3905,11 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             err = actx.err;
         }
         ray_release(tbl);
+        int64_t tr_c3 = ray_profile_now_ns();
+        tr_scan += tr_c1 - tr_c0; tr_parse += tr_c2 - tr_c1; tr_append += tr_c3 - tr_c2; tr_chunks++;
+        if (trace)
+            fprintf(stderr, "csv.splayed: chunk=%" PRId64 " rows=%" PRId64 " scan=%.1fms parse=%.1fms append=%.1fms\n",
+                    tr_chunks, cnt, TR_MS(tr_c1 - tr_c0), TR_MS(tr_c2 - tr_c1), TR_MS(tr_c3 - tr_c2));
         if (err != RAY_OK) break;
         wrote_any = true;
         /* The chunk's bytes are done with: drop them from the mapping so a
@@ -4029,15 +3927,67 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     /* Flush the symfile BEFORE committing column files (writer_close
      * renames tmp → final): columns must never reference positions the
      * symfile doesn't persist (sym-first crash ordering). */
+    int64_t tr_loop_end = ray_profile_now_ns();
+    if (trace) {
+        fprintf(stderr, "csv.splayed: file=%s ncols=%d chunks=%" PRId64 " setup=%.1fms scan=%.1fms parse=%.1fms append=%.1fms loop=%.1fms\n",
+                path, ncols, tr_chunks, TR_MS(tr_setup), TR_MS(tr_scan), TR_MS(tr_parse), TR_MS(tr_append),
+                TR_MS(tr_loop_end - tr_t0 - tr_setup));
+        /* the three columns whose append tasks took the longest in total:
+         * the critical path of every chunk's column dispatch */
+        for (int k = 0; k < 3 && k < ncols; k++) {
+            int best = -1;
+            for (int c = 0; c < ncols; c++)
+                if (tr_col_ns[c] > 0 && (best < 0 || tr_col_ns[c] > tr_col_ns[best])) best = c;
+            if (best < 0) break;
+            ray_t* na = ray_sym_str(col_name_ids[best]);
+            fprintf(stderr, "csv.splayed: append_top%d col=%s type=%d total=%.1fms\n", k + 1,
+                    na ? ray_str_ptr(na) : "?", (int)resolved_types[best], TR_MS(tr_col_ns[best]));
+            tr_col_ns[best] = -tr_col_ns[best];
+        }
+    }
     if (err == RAY_OK && sym_dom) {
         err = ray_sym_domain_flush(sym_dom, false);
     }
+    int64_t tr_flush_end = ray_profile_now_ns();
+    if (trace) fprintf(stderr, "csv.splayed: symfile_flush=%.1fms\n", TR_MS(tr_flush_end - tr_loop_end));
 
-    for (int c = 0; c < ncols; c++) {
-        ray_err_t cerr = (err == RAY_OK) ? csv_splayed_writer_close(&writers[c])
-                                         : RAY_ERR_IO;
-        if (err == RAY_OK && cerr != RAY_OK) err = cerr;
-        if (err != RAY_OK) csv_splayed_writer_abort(&writers[c]);
+    /* Every column finishes as a pool task (STR pool merge, dictionary /
+     * zone finish, index region, header, fclose), then the renames run
+     * serially in column order; a failed finish publishes nothing. */
+    memset(tr_col_ns, 0, sizeof(tr_col_ns));
+    if (err == RAY_OK) err = ray_col_stream_close_all(writers, ncols, false, trace ? tr_col_ns : NULL);
+    else for (int c = 0; c < ncols; c++) ray_col_stream_abort(&writers[c]);
+    int64_t tr_close_end = ray_profile_now_ns();
+    if (trace) {
+        int64_t mx = 0; int mxc = -1;
+        for (int c = 0; c < ncols; c++) if (tr_col_ns[c] > mx) { mx = tr_col_ns[c]; mxc = c; }
+        ray_t* na = mxc >= 0 ? ray_sym_str(col_name_ids[mxc]) : NULL;
+        fprintf(stderr, "csv.splayed: finish+publish=%.1fms longest_finish=%s %.1fms\n",
+                TR_MS(tr_close_end - tr_flush_end),
+                na ? ray_str_ptr(na) : "-", TR_MS(mx));
+    }
+
+    /* The domain was flushed before the closes and .d names columns through
+     * the global symbol table, so drop its tables before the hash re-read. */
+    if (sym_dom) { ray_sym_domain_release(sym_dom); sym_dom = NULL; }
+    int64_t tr_rel_end = ray_profile_now_ns();
+    if (trace) fprintf(stderr, "csv.splayed: domain_release=%.1fms\n", TR_MS(tr_rel_end - tr_close_end));
+
+    /* Columns whose zone asked for a hash: the only files read back, before
+     * .d so an in-place first write never publishes a half-appended region. */
+    memset(tr_col_ns, 0, sizeof(tr_col_ns));
+    if (err == RAY_OK) ray_col_stream_hash_all(writers, ncols, trace ? tr_col_ns : NULL);
+    for (int c = 0; c < ncols; c++)
+        if (writers[c].index) { ray_release(writers[c].index); writers[c].index = NULL; }
+    int64_t tr_hash_end = ray_profile_now_ns();
+    if (trace) {
+        for (int c = 0; c < ncols; c++) {
+            if (!tr_col_ns[c]) continue;
+            ray_t* na = ray_sym_str(col_name_ids[c]);
+            fprintf(stderr, "csv.splayed: hash col=%s type=%d task=%.1fms\n",
+                    na ? ray_str_ptr(na) : "?", (int)resolved_types[c], TR_MS(tr_col_ns[c]));
+        }
+        fprintf(stderr, "csv.splayed: hash_phase=%.1fms\n", TR_MS(tr_hash_end - tr_rel_end));
     }
 
     /* .d LAST — the commit marker.  All column files are renamed into
@@ -4067,17 +4017,38 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             ray_release(schema);
         }
     }
+    if (trace) fprintf(stderr, "csv.splayed: schema=%.1fms total=%.1fms\n",
+                       TR_MS(ray_profile_now_ns() - tr_hash_end), TR_MS(ray_profile_now_ns() - tr_t0));
+#undef TR_MS
 
     if (sym_dom) ray_sym_domain_release(sym_dom);
     ray_vm_unmap_file(buf, file_size);
     return err;
 }
 
-ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool header,
+ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
+                                          const int8_t* col_types_in, int32_t n_types,
+                                          const int64_t* col_names_in, int32_t n_names,
+                                          const char* dir, int64_t rows_per_chunk) {
+    if (ray_interrupted()) return RAY_ERR_CANCEL;
+    if (!path || !dir) return RAY_ERR_DOMAIN;
+    char sym_path[1024];
+    int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
+    if (n < 0 || (size_t)n >= sizeof(sym_path)) return RAY_ERR_RANGE;
+    ray_splay_write_t write;
+    ray_err_t err = ray_splay_write_begin(dir, &write);
+    if (err != RAY_OK) return err;
+    err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
+                                  col_names_in, n_names, write.dir,
+                                  rows_per_chunk, sym_path);
+    return ray_splay_write_finish(&write, err, false);
+}
+
+static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool header,
                                          const int8_t* col_types_in, int32_t n_types,
                                          const int64_t* col_names_in, int32_t n_names,
                                          const char* root, const char* table_name,
-                                         int64_t rows_per_part) {
+                                         int64_t rows_per_part, bool staged) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !root || !table_name) return RAY_ERR_DOMAIN;
     if (rows_per_part <= 0) rows_per_part = CSV_PART_ROWS_DEFAULT;
@@ -4185,12 +4156,10 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     } else if (!col_types_in) {
         ray_t* sample_offsets_hdr = NULL;
         int64_t* sample_offsets = NULL;
-        int64_t sample_n = build_row_offsets_limited(buf, file_size, data_offset,
-                                                     CSV_SAMPLE_ROWS,
-                                                     data_has_quotes,
-                                                     &sample_offsets,
-                                                     &sample_offsets_hdr,
-                                                     NULL);
+        int64_t sample_n = csv_streaming_sample(buf, file_size, data_offset,
+                                                data_has_quotes,
+                                                &sample_offsets,
+                                                &sample_offsets_hdr);
         if (sample_n < 0) {
             ray_vm_unmap_file(buf, file_size);
             return RAY_ERR_CANCEL;
@@ -4222,6 +4191,18 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     int64_t part = 0;
     size_t chunk_offset = data_offset;
     bool wrote_any = false;
+    /* Hold the append domain across partitions. Without this reference each
+     * save destroys its lookup table and reparses/reindexes the entire growing
+     * vocabulary on the next partition. */
+    ray_sym_domain_t* import_domain = NULL;
+    for (int c = 0; c < ncols; c++) if (resolved_types[c] == RAY_SYM) {
+        char sym_path[1024];
+        int n = snprintf(sym_path,sizeof(sym_path),"%s/.sym",root);
+        if (n < 0 || (size_t)n >= sizeof(sym_path)) err = RAY_ERR_RANGE;
+        else if (!(import_domain = ray_sym_domain_open_or_create(sym_path))) err = RAY_ERR_IO;
+        break;
+    }
+    if (err != RAY_OK) { ray_vm_unmap_file(buf,file_size); return err; }
     while (chunk_offset < file_size || !wrote_any) {
         ray_t* row_offsets_hdr = NULL;
         int64_t* row_offsets = NULL;
@@ -4244,7 +4225,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
 
         ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
                                           cnt, ncols, delimiter, col_name_ids, resolved_types,
-                                          NULL);
+                                          import_domain);
         if (!tbl || RAY_IS_ERR(tbl)) {
             err = (tbl && RAY_IS_ERR(tbl)) ? ray_err_from_obj(tbl)
                                            : RAY_ERR_OOM;
@@ -4255,6 +4236,21 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                         part, cnt);
             break;
         }
+
+        /* Match Parquet parted output: build numeric zones while the bounded
+         * decoded partition is resident, before serialization. */
+        for (int64_t c = 0; c < ray_table_ncols(tbl); c++) {
+            ray_t* col = ray_table_get_col_idx(tbl,c);
+            if (col->type == RAY_STR || col->type == RAY_SYM || col->type == RAY_F32 || col->type == RAY_GUID) continue;
+            ray_retain(col);
+            ray_t* indexed = col->len >= 65536 ? ray_index_attach_chunk_zone(&col,16) : ray_index_attach_zone(&col);
+            if (indexed && RAY_IS_ERR(indexed)) {
+                err = ray_err_from_obj(indexed); ray_release(indexed); ray_release(col);
+                break;
+            }
+            ray_table_set_col_idx(tbl,c,col); ray_release(col);
+        }
+        if (err != RAY_OK) { ray_release(tbl); scratch_free(row_offsets_hdr); break; }
 
         char leaf[1024];
         int n = snprintf(leaf, sizeof(leaf), "%s/%" PRId64 "/%s", root, part, table_name);
@@ -4278,7 +4274,8 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
             err = RAY_ERR_RANGE;
             break;
         }
-        err = ray_splay_save_bulk(tbl, leaf, root_sym);
+        err = staged ? ray_splay_save_staged_bulk(tbl, leaf, root_sym)
+                     : ray_splay_save_bulk(tbl, leaf, root_sym);
         ray_release(tbl);
         scratch_free(row_offsets_hdr);
         if (err != RAY_OK) {
@@ -4293,13 +4290,90 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
         part++;
     }
 
-    /* root/.sym is maintained per-partition by ray_splay_save_bulk
-     * (distinct-merge + flush before each partition's columns) — no
-     * whole-dictionary dump at the end anymore. */
+    /* Staged imports write the growing vocabulary once, after all partitions.
+     * Existing roots retain the flush-before-column live-write protocol. */
+    if (err == RAY_OK && staged && import_domain)
+        err = ray_sym_domain_flush(import_domain, false);
+    if (import_domain) ray_sym_domain_release(import_domain);
     ray_vm_unmap_file(buf, file_size);
     if (trace)
         fprintf(stderr, "csv.parted: done err=%s\n", ray_err_code_str(err));
     return err;
+}
+
+/* `root` without trailing separators, and the staging directory a new
+ * root is imported into.  Shared with the builtin so its errors can name
+ * the directory.  Returns RAY_OK or RAY_ERR_RANGE (path too long). */
+ray_err_t ray_csv_parted_paths(const char* root, char* dest, size_t dest_size,
+                               char* staging, size_t staging_size) {
+    size_t len = strlen(root);
+    while (len > 1 && (root[len-1] == '/' || root[len-1] == '\\')) len--;
+    if (len >= dest_size) return RAY_ERR_RANGE;
+    memcpy(dest,root,len); dest[len] = 0;
+    int n = snprintf(staging,staging_size,"%s.csv-partial",dest);
+    if (n < 0 || (size_t)n >= staging_size) return RAY_ERR_RANGE;
+    return RAY_OK;
+}
+
+ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool header,
+                                         const int8_t* col_types, int32_t n_types,
+                                         const int64_t* col_names, int32_t n_names,
+                                         const char* root, const char* table_name,
+                                         int64_t rows_per_part) {
+    if (!path || !root || !*root || !table_name || !*table_name ||
+        table_name[0] == '.' || strchr(table_name,'/') || strchr(table_name,'\\'))
+        return RAY_ERR_DOMAIN;
+    if (ray_interrupted()) return RAY_ERR_CANCEL;
+    char dest[1024], staging[1100];
+    ray_err_t perr = ray_csv_parted_paths(root,dest,sizeof(dest),staging,sizeof(staging));
+    if (perr != RAY_OK) return perr;
+    struct stat st;
+    if (stat(dest,&st) == 0)
+        return csv_save_parted_impl(path,delimiter,header,col_types,n_types,
+                                   col_names,n_names,dest,table_name,rows_per_part,false);
+    /* Fail on an unreadable input before claiming the staging directory:
+     * failed staging is retained and blocks the root, which a mistyped
+     * source path must not do. */
+    FILE* in = fopen(path,"rb");
+    if (!in) return RAY_ERR_IO;
+    fclose(in);
+    /* Keep mkdir-p's parent creation, but claim the staging root exclusively.
+     * A failed import remains available for diagnosis and is never reused. */
+    char* slash = strrchr(dest,'/');
+    if (slash && slash != dest) {
+        *slash = 0;
+        ray_err_t e = ray_mkdir_p(dest);
+        *slash = '/';
+        if (e != RAY_OK) return e;
+    }
+#ifdef RAY_OS_WINDOWS
+    if (!CreateDirectoryA(staging,NULL)) return RAY_ERR_IO;
+#else
+    if (mkdir(staging,0755) != 0) return RAY_ERR_IO;
+#endif
+    ray_err_t err = csv_save_parted_impl(path,delimiter,header,col_types,n_types,
+                                       col_names,n_names,staging,table_name,rows_per_part,true);
+    if (err != RAY_OK) {
+        /* Failed staging is kept for diagnosis only when it holds a
+         * partition.  A failure before the first one (a type vector that
+         * does not match, an empty or unreadable source) leaves at most
+         * the symfile, and keeping that would only block the root. */
+        char probe[1200];
+        snprintf(probe,sizeof(probe),"%s/0",staging);
+        if (stat(probe,&st) != 0) {
+            snprintf(probe,sizeof(probe),"%s/.sym",staging);
+            remove(probe);
+#ifdef RAY_OS_WINDOWS
+            RemoveDirectoryA(staging);
+#else
+            rmdir(staging);
+#endif
+        }
+        return err;
+    }
+    if (ray_interrupted()) return RAY_ERR_CANCEL;
+    if (stat(dest,&st) == 0) return RAY_ERR_IO;
+    return ray_file_rename_new(staging,dest);
 }
 
 /* --------------------------------------------------------------------------

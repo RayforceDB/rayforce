@@ -340,7 +340,7 @@ void ray_mem_trace_end(ray_mem_trace_t* out) {
  * When a new anon mapping would push this past the watermark, it is routed to a
  * spill file instead — this never rejects work, it just picks disk over RAM. */
 static _Atomic(int64_t) g_anon_committed = 0;
-static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to physical RAM */
+static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to ray_sys_ram_limit() */
 static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
 
 /* Commit `bytes` of anonymous (RAM-resident) footprint and advance the peak
@@ -359,10 +359,12 @@ static void heap_anon_commit(int64_t bytes) {
 }
 
 /* Threshold above which anon allocations spill to disk.  Default keeps our
- * anon footprint within physical RAM (swap + page cache stay as headroom). */
+ * anon footprint within the RAM the process may actually use — physical RAM,
+ * or the container's cgroup limit when that is smaller (#688); swap + page
+ * cache stay as headroom. */
 static int64_t heap_anon_watermark(void) {
     int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
-    return wm > 0 ? wm : ray_sys_total_ram();
+    return wm > 0 ? wm : ray_sys_ram_limit();
 }
 /* True if committing `bytes` more anonymous RAM would cross the watermark. */
 static bool heap_anon_would_exceed(size_t bytes) {
@@ -1200,8 +1202,8 @@ static void ray_detach_owned_refs(ray_t* v) {
  * anonymous mmap was refused.  Mirrors heap_add_pool's swap fallback but at the
  * exact size — a direct block needs no pool alignment (it is located by its
  * stored map_size, not by pool-base masking), so a plain mmap suffices.
- * Returns the mapped base and the fd/path to close+unlink at free; NULL on
- * failure. */
+ * Returns the mapped base and the fd to close at free (*out_path is NULL: the
+ * file is already unlinked); NULL on failure. */
 static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
                                   int* out_fd, char** out_path) {
 #if !RAY_HEAP_FILE_SPILL
@@ -1234,8 +1236,14 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
     /* Count as committed working set — a RAM substitute with preallocated
      * blocks (matches heap_add_pool's swap-pool accounting). */
     ray_sys_track_add((int64_t)map_size);
+    /* Unlink now that the mapping holds the inode, as heap_add_pool does:
+     * the kernel reclaims the blocks on munmap or at process exit.  Left
+     * until ray_free, a process that exited or was killed holding the block
+     * left the whole file on disk. */
+    unlink(path);
+    ray_sys_free(path);
     *out_fd   = fd;
-    *out_path = path;
+    *out_path = NULL;
     return mapped;
 #endif /* RAY_HEAP_FILE_SPILL */
 }
@@ -2775,10 +2783,12 @@ void ray_heap_merge(ray_heap_t* src) {
             dst->pools[dst->pool_count++] = src->pools[i];
         } else {
             /* Pool overflow: only triggers at RAY_MAX_POOLS (512 pools = 16GB+).
-             * Fix ownership so blocks free to the correct heap. */
-            ray_pool_hdr_t* hdr = (ray_pool_hdr_t*)src->pools[i].base;
-            hdr->heap_id = dst->id;
-            assert(0 && "ray_heap_merge: pool overflow at RAY_MAX_POOLS");
+             * dst cannot track the pool, so it could never be released —
+             * fatal in every build.  Explicit rather than assert(0): under
+             * -DNDEBUG that compiled away and the pool leaked silently (#652). */
+            fprintf(stderr, "rayforce: ray_heap_merge: pool overflow at "
+                            "RAY_MAX_POOLS (%d)\n", (int)RAY_MAX_POOLS);
+            abort();
         }
     }
     src->pool_count = 0;

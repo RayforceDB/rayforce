@@ -1,0 +1,78 @@
+;; xbar_temporal_key_type.rfl — `(xbar <temporal col> <bucket>)` compiled by the
+;; DAG keeps the column's type (issue #669).
+;;
+;; The DAG lowers xbar to `col - (col % bucket)`; its arithmetic promotion turns
+;; a TIMESTAMP operand into I64 and DATE / TIME into I32, so every DAG path
+;; (projection, bare `by:`, by-dict key, parted by-dict key) used to return raw
+;; integers where the interpreter's xbar returns the column's type.  The DAG
+;; now casts the bucketed result back to the column's type.  Every golden here
+;; is the interpreter's own xbar over the same column, so the DAG and the
+;; interpreter are held to the same values AND the same type.
+
+(set t (table [ts d tm x] (list (as 'TIMESTAMP (* 1000000000 (til 300))) (as 'DATE (til 300)) (as 'TIME (* 1000 (til 300))) (til 300))))
+
+;; ─── by-dict key ─────────────────────────────────────────────────────────────
+(type (at (select {from: t by: {M: (xbar ts 60000000000)} c: (count x)}) 'M)) -- 'TIMESTAMP
+(type (at (select {from: t by: {M: (xbar d 7)} c: (count x)}) 'M)) -- 'DATE
+(type (at (select {from: t by: {M: (xbar tm 7000)} c: (count x)}) 'M)) -- 'TIME
+(at (select {from: t by: {M: (xbar ts 60000000000)} c: (count x)}) 'M) -- (distinct (xbar (at t 'ts) 60000000000))
+(at (select {from: t by: {M: (xbar d 7)} c: (count x)}) 'M) -- (distinct (xbar (at t 'd) 7))
+(at (select {from: t by: {M: (xbar tm 7000)} c: (count x)}) 'M) -- (distinct (xbar (at t 'tm) 7000))
+;; the aggregate beside the key is unaffected
+(at (select {from: t by: {M: (xbar ts 60000000000)} c: (count x)}) 'c) -- [60 60 60 60 60]
+
+;; ─── projection ──────────────────────────────────────────────────────────────
+(type (at (select {k: (xbar ts 60000000000) from: t}) 'k)) -- 'TIMESTAMP
+(type (at (select {k: (xbar d 7) from: t}) 'k)) -- 'DATE
+(type (at (select {k: (xbar tm 7000) from: t}) 'k)) -- 'TIME
+(at (select {k: (xbar ts 60000000000) from: t}) 'k) -- (xbar (at t 'ts) 60000000000)
+(at (select {k: (xbar d 7) from: t}) 'k) -- (xbar (at t 'd) 7)
+(at (select {k: (xbar tm 7000) from: t}) 'k) -- (xbar (at t 'tm) 7000)
+
+;; ─── bare `by:` (no interpreter fallback: the key MUST compile) ─────────────
+;; (group order is unspecified for a computed bare key: compare sorted)
+(type (at (select {from: t by: (xbar ts 60000000000) c: (count x)}) 'ts)) -- 'TIMESTAMP
+(type (at (select {from: t by: (xbar d 7) c: (count x)}) 'd)) -- 'DATE
+(type (at (select {from: t by: (xbar tm 7000) c: (count x)}) 'tm)) -- 'TIME
+(asc (at (select {from: t by: (xbar ts 60000000000) c: (count x)}) 'ts)) -- (asc (distinct (xbar (at t 'ts) 60000000000)))
+(asc (at (select {from: t by: (xbar d 7) c: (count x)}) 'd)) -- (asc (distinct (xbar (at t 'd) 7)))
+
+;; ─── WHERE predicate over a bucketed temporal column ─────────────────────────
+(at (select {x: x from: t where: (== (xbar ts 60000000000) 2000.01.01D00:02:00.000000000)}) 'x) -- (+ 120 (til 60))
+
+;; ─── bucket forms the interpreter accepts ────────────────────────────────────
+;; narrow integer bucket
+(type (at (select {k: (xbar ts (as 'I32 60000000)) from: t}) 'k)) -- 'TIMESTAMP
+(at (select {k: (xbar ts (as 'I32 60000000)) from: t}) 'k) -- (xbar (at t 'ts) (as 'I32 60000000))
+;; TIME bucket on a TIMESTAMP column is a millisecond bucket (scaled to ns)
+(at (select {k: (xbar ts 00:01:00.000) from: t}) 'k) -- (xbar (at t 'ts) 00:01:00.000)
+(at (select {from: t by: {M: (xbar ts 00:01:00.000)} c: (count x)}) 'M) -- (distinct (xbar (at t 'ts) 00:01:00.000))
+;; same-type temporal bucket
+(at (select {k: (xbar d 2000.01.08) from: t}) 'k) -- (xbar (at t 'd) 2000.01.08)
+;; a float bucket is a type error on a temporal column, in a query as outside one
+(select {k: (xbar ts 2.5) from: t}) !- type
+(select {from: t by: {M: (xbar ts 2.5)} c: (count x)}) !- type
+
+;; ─── nulls stay null, in the column's type ───────────────────────────────────
+(set tn (table [ts d x] (list [2000.01.01D00:00:00.000000000 0Np 2000.01.01D00:01:30.000000000] [2000.01.01 0Nd 2000.01.09] [1 2 3])))
+(at (select {k: (xbar ts 60000000000) from: tn}) 'k) -- [2000.01.01D00:00:00.000000000 0Np 2000.01.01D00:01:00.000000000]
+(at (select {k: (xbar d 7) from: tn}) 'k) -- [2000.01.01 0Nd 2000.01.08]
+(asc (at (select {from: tn by: {M: (xbar ts 60000000000)} c: (count x)}) 'M)) -- (asc (distinct (xbar (at tn 'ts) 60000000000)))
+(asc (at (select {from: tn by: {M: (xbar d 7)} c: (count x)}) 'M)) -- (asc (distinct (xbar (at tn 'd) 7)))
+
+;; ─── parted by-dict key (per-partition streaming kernel) ─────────────────────
+(set N 400)
+(set PTS (as 'TIMESTAMP (* 1000000000 (til N))))
+(set PD (as 'DATE (til N)))
+(set PV (as 'F64 (til N)))
+(set P1 (table [ts d v] (list PTS PD PV)))
+(.sys.exec "rm -rf /tmp/rfl_xbar_tkt")
+(.db.splayed.set "/tmp/rfl_xbar_tkt/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_xbar_tkt/2/t/" P1)
+(set Pw (.db.parted.get "/tmp/rfl_xbar_tkt/" 't))
+(type (at (select {sv: (sum v) by: {tb: (xbar ts 200000000000)} from: Pw asc: tb}) 'tb)) -- 'TIMESTAMP
+(at (select {sv: (sum v) by: {tb: (xbar ts 200000000000)} from: Pw asc: tb}) 'tb) -- (distinct (xbar PTS 200000000000))
+(type (at (select {sv: (sum v) by: {tb: (xbar d 200)} from: Pw asc: tb}) 'tb)) -- 'DATE
+(at (select {sv: (sum v) by: {tb: (xbar d 200)} from: Pw asc: tb}) 'tb) -- (distinct (xbar PD 200))
+(at (select {sv: (sum v) by: {tb: (xbar d 200)} from: Pw asc: tb}) 'sv) -- [39800.0 119800.0]
+(.sys.exec "rm -rf /tmp/rfl_xbar_tkt")

@@ -24,7 +24,8 @@
 (.sys.exec "cd /tmp/rfl_lh/proj && RAYFORCE_HOME=/tmp/rfl_lh/home/ $OLDPWD/rayforce main.rfl </dev/null 2>&1 | grep -q '^/tmp/rfl_lh/home/lib/a.rfl|'") -- 0
 
 ;; without a home the same script fails, naming only the working-directory path
-(.sys.exec "cd /tmp/rfl_lh/proj && $OLDPWD/rayforce main.rfl </dev/null 2>&1 | grep -q 'error: io: load \"lib/a.rfl\": No such file or directory$'") -- 0
+;; explicitly unset the home so this case cannot inherit the runner's setting
+(.sys.exec "unset RAYFORCE_HOME; cd /tmp/rfl_lh/proj && $OLDPWD/rayforce main.rfl </dev/null 2>&1 | grep -q 'error: io: load \"lib/a.rfl\": No such file or directory$'") -- 0
 
 ;; missing in both places: both attempts are named
 (.sys.exec "printf '(load \"lib/zz.rfl\")\n' > /tmp/rfl_lh/proj/miss.rfl; cd /tmp/rfl_lh/proj && RAYFORCE_HOME=/tmp/rfl_lh/home $OLDPWD/rayforce miss.rfl </dev/null 2>&1 | grep -q 'error: io: load \"lib/zz.rfl\": No such file or directory (also tried \"/tmp/rfl_lh/home/lib/zz.rfl\")'") -- 0

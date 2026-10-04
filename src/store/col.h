@@ -26,6 +26,7 @@
 
 #include <rayforce.h>
 #include <string.h>
+#include <stdio.h>
 
 struct ray_sym_domain_s;
 
@@ -95,8 +96,9 @@ ray_t*    ray_col_mmap(const char* path);
 /* Write a RAY_SYM column re-encoded as positions in `target` (width =
  * ray_sym_dict_width(domain count); header rc = domain count at save).
  * Caller must have interned the column's distinct symbols into `target`
- * and FLUSHED the domain first (crash ordering: sym before columns) —
- * a cell whose symbol is absent from `target` is RAY_ERR_CORRUPT. */
+ * and FLUSHED the domain first for live-table writes. Private import staging
+ * may defer the flush until workers join, before publishing the root.
+ * A cell whose symbol is absent from `target` is RAY_ERR_CORRUPT. */
 ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
                                    struct ray_sym_domain_s* target,
                                    bool durable);
@@ -115,6 +117,17 @@ ray_t*    ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* do
  * store/ header). */
 ray_err_t ray_col_append_index(const char* path, const void* ix,
                                int64_t col_len, int8_t col_type);
+
+/* Seek f to its end, pad to 32 bytes and write ix's inline region there;
+ * flushes. Does not touch the header. The caller stamps the marker with
+ * ray_col_stamp_index or rolls the file back on error. */
+ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload_end_out);
+
+/* Flush f and cut it to `len` bytes: undoes a partial index region. */
+bool ray_col_truncate(FILE* f, int64_t len);
+
+/* Put the "index present" marker into a 32-byte header image. */
+void      ray_col_stamp_index(ray_t* hdr);
 
 
 #endif /* RAY_COL_H */

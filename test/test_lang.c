@@ -6516,6 +6516,16 @@ static bool restricted_expr_returns_access(const char* expr) {
     return access;
 }
 
+static test_result_t test_eval_restricted_parquet(void) {
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(.parquet.splayed \"missing\" \"unused\")"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(.parquet.scan \"test/data/parquet/flat-1-v2.parquet\")"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(select {from: {.parquet.source: \"test/data/parquet/flat-1-v2.parquet\"} x: x})"));
+    PASS();
+}
+
 /* Restricted builtins must be rejected at the actual invocation boundary,
  * including compiled lambda bytecode.  Invalid filesystem arguments are
  * deliberate: before the fix they return os/type instead of access without
@@ -7778,6 +7788,222 @@ static test_result_t test_builtin_show_fn(void) {
     PASS();
 }
 
+/* Run (show x) with stdout redirected to a temporary file.  Returns show's
+ * result; *text_out receives the printed bytes in a ray_alloc'd block the
+ * caller frees (NULL on failure). */
+static ray_t* show_capture(ray_t* x, ray_t** text_out) {
+    *text_out = NULL;
+    FILE* tmp = tmpfile();
+    if (!tmp) return NULL;
+    fflush(stdout);
+    int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+    ray_t* args[1] = { x };
+    ray_t* r = ray_show_fn(args, 1);
+    fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+    long size = ftell(tmp);
+    if (size < 0) { fclose(tmp); return r; }
+    ray_t* blk = ray_alloc((size_t)size + 1);
+    if (blk) {
+        char* buf = (char*)ray_data(blk);
+        rewind(tmp);
+        size_t n = fread(buf, 1, (size_t)size, tmp);
+        buf[n] = '\0';
+        *text_out = blk;
+    }
+    fclose(tmp);
+    return r;
+}
+
+/* A plain scan: under ASan each strstr call re-measures the whole haystack,
+ * which makes a strstr loop quadratic on megabytes of output. */
+static int64_t count_substr(const char* s, const char* needle) {
+    int64_t n = 0;
+    size_t nl = strlen(needle), sl = strlen(s);
+    for (size_t i = 0; i + nl <= sl; ) {
+        if (memcmp(s + i, needle, nl) == 0) { n++; i += nl; } else i++;
+    }
+    return n;
+}
+
+/* (show T) prints every column and row of a table: only the REPL display
+ * truncates to FMT_TABLE_MAX_WIDTH x FMT_TABLE_MAX_HEIGHT. */
+static test_result_t test_builtin_show_table_unlimited(void) {
+    ray_t* t = ray_eval_str(
+        "(table [a b c d e f g h i j k l m] (list (til 25) (til 25) (til 25)"
+        " (til 25) (til 25) (til 25) (til 25) (til 25) (til 25) (til 25)"
+        " (til 25) (til 25) (til 25)))");
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "25 rows (25 shown) 13 columns (13 shown)"));
+    TEST_ASSERT_EQ_I(count_substr(buf, "I64"), 13);   /* one type cell per column */
+    TEST_ASSERT_NOT_NULL(strstr(buf, "│ 24 "));
+    ray_free(text);
+    ray_release(t);
+    PASS();
+}
+
+/* A table far beyond the REPL limits is written in full, row by row, and its
+ * rows line up with the header (widths come from every cell, not a sample). */
+static test_result_t test_builtin_show_table_streamed(void) {
+    enum { N = 50000 };
+    ray_t* k = ray_vec_new(RAY_I64, N);
+    ray_t* v = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(v);
+    k->len = N; v->len = N;
+    for (int64_t i = 0; i < N; i++) {
+        ((int64_t*)ray_data(k))[i] = i;
+        ((int64_t*)ray_data(v))[i] = i * 1000000;
+    }
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_release(k);
+    ray_release(v);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "50000 rows (50000 shown) 2 columns (2 shown)"));
+    /* the last column is widened to fit the footer, so match row prefixes */
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\n│ 0     │ 0 "));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\n│ 25000 │ 25000000000 "));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\n│ 49999 │ 49999000000 "));
+    /* 50000 data rows + name row + type row + footer row */
+    TEST_ASSERT_EQ_I(count_substr(buf, "\n│"), 50003);
+    ray_free(text);
+    ray_release(t);
+    PASS();
+}
+
+/* Table cells are written whole.  The REPL's fixed 64-byte cell grid cut
+ * them at byte 63, losing the tail and the closing quote, and a cut inside
+ * a multi-byte character left invalid UTF-8 and a misaligned border. */
+static test_result_t test_builtin_show_table_long_cells(void) {
+    ray_t* t = ray_eval_str(
+        "(table [s u] (list"
+        " (list \"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-tail-end-marker\" \"x\")"
+        " (list \"a\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9z\" \"y\")))");
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "XYZ-tail-end-marker\" "));
+    /* 36 two-byte characters: the cut at byte 63 fell inside one */
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\xc3\xa9\xc3\xa9z\" "));
+    /* every line of the table has the same display width */
+    int32_t width = -1;
+    for (const char* line = buf; *line; ) {
+        const char* end = strchr(line, '\n');
+        if (!end) end = line + strlen(line);
+        int32_t w = 0;
+        for (const char* c = line; c < end; c++) w += ((unsigned char)*c & 0xC0) != 0x80;
+        if (end > line) {
+            if (width < 0) width = w;
+            TEST_ASSERT_EQ_I(w, width);
+        }
+        line = *end ? end + 1 : end;
+    }
+    ray_free(text);
+    ray_release(t);
+    PASS();
+}
+
+/* One long cell does not pad every other row of its column: a column is
+ * padded to at most FMT_SHOW_PAD_MAX display columns, and a longer cell is
+ * written whole past its border.  Padding every row to the longest cell
+ * made the output rows x longest cell. */
+static test_result_t test_builtin_show_table_long_cell_unpadded(void) {
+    enum { N = 3000, LONG = 10000 };
+    ray_t* k = ray_vec_new(RAY_I64, N);
+    ray_t* s = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_NOT_NULL(k);
+    TEST_ASSERT_NOT_NULL(s);
+    k->len = N;
+    ray_t* lblk = ray_alloc(LONG + 1);
+    TEST_ASSERT_NOT_NULL(lblk);
+    char* lng = (char*)ray_data(lblk);
+    memset(lng, 'x', LONG);
+    lng[LONG] = '\0';
+    for (int64_t i = 0; i < N; i++) {
+        ((int64_t*)ray_data(k))[i] = i;
+        char cell[32];
+        int cl = snprintf(cell, sizeof(cell), "v%lld", (long long)i);
+        s = i == 0 ? ray_str_vec_append(s, lng, LONG) : ray_str_vec_append(s, cell, (size_t)cl);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    }
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(k);
+    ray_release(s);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    ray_t* text = NULL;
+    ray_t* r = show_capture(t, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    size_t n = strlen(buf);
+    /* the long value is there whole */
+    TEST_ASSERT_NOT_NULL(strstr(buf, lng));
+    /* every other row is padded to the cap, not to the long cell: well
+     * under rows x (cap + border) + the long cell itself */
+    TEST_ASSERT_FMT(n < (size_t)N * (256 * 3 + 64) + LONG * 2,
+                    "show wrote %zu bytes for %d rows", n, N);
+    TEST_ASSERT_FMT(n < (size_t)N * 400, "show wrote %zu bytes for %d short rows", n, N);
+    TEST_ASSERT_EQ_I(count_substr(buf, "\n│"), N + 3);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "│ \"v2999\" "));
+    ray_free(text);
+    ray_free(lblk);
+    ray_release(t);
+    PASS();
+}
+
+/* show prints any value in full: a vector far past the REPL width limit
+ * comes out whole, streamed through the output buffer. */
+static test_result_t test_builtin_show_vector_full(void) {
+    enum { N = 200000 };
+    ray_t* v = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = N;
+    for (int64_t i = 0; i < N; i++) ((int64_t*)ray_data(v))[i] = i;
+    ray_t* text = NULL;
+    ray_t* r = show_capture(v, &text);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(text);
+    const char* buf = (const char*)ray_data(text);
+    size_t n = strlen(buf);
+    TEST_ASSERT_TRUE(strncmp(buf, "[0 1 2 3 ", 9) == 0);
+    TEST_ASSERT_TRUE(n > 9 && strcmp(buf + n - 9, " 199999]\n") == 0);
+    TEST_ASSERT_EQ_I(count_substr(buf, " "), 199999);
+    TEST_ASSERT_NULL(strstr(buf, ".."));
+    ray_free(text);
+    ray_release(v);
+    PASS();
+}
+
 /* (timeit expr) — returns elapsed ms as F64. */
 static test_result_t test_builtin_timeit_fn(void) {
     /* timeit calls ray_eval(args[0]) — pass a parsed expression. */
@@ -8808,6 +9034,34 @@ static test_result_t test_select_derived_key_file_chunks(void) {
     ray_release(same);
     ray_release(cols);
     ray_release(same7);
+
+    /* Scan-owned dictionaries have no mmap prefix. Their stable atoms must
+     * use the same bounded chunk evaluator as a file domain's appended tail. */
+    ray_t* original = ray_eval_str("__dk_T");
+    TEST_ASSERT_NOT_NULL(original); TEST_ASSERT_FALSE(RAY_IS_ERR(original));
+    ray_t* refs = ray_table_get_col_idx(original,0);
+    ray_sym_domain_t* domain = ray_sym_domain_new(); TEST_ASSERT_NOT_NULL(domain);
+    ray_t* private = ray_sym_vec_new(RAY_SYM_W32,refs->len);
+    TEST_ASSERT_NOT_NULL(private); TEST_ASSERT_FALSE(RAY_IS_ERR(private));
+    private->sym_domain = domain; private->len = refs->len;
+    for (int64_t i = 0; i < refs->len; i++) {
+        ray_t* s = ray_sym_vec_cell(refs,i);
+        int64_t id = ray_sym_domain_intern(domain,ray_str_ptr(s),ray_str_len(s));
+        TEST_ASSERT_TRUE(id >= 0);
+        ((uint32_t*)ray_data(private))[i] = (uint32_t)id;
+        if (!id) private->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    ray_t* table = ray_table_new(0);
+    table = ray_table_add_col(table,ray_sym_intern("ref",3),private);
+    table = ray_table_add_col(table,ray_sym_intern("v",1),ray_table_get_col_idx(original,1));
+    TEST_ASSERT_NOT_NULL(table); TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+    ray_env_set(ray_sym_intern("__dk_private",12),table);
+    ray_release(private); ray_release(table); ray_release(original);
+    ray_derived_key_chunk_set_for_test(7);
+    same = ray_eval_str("(all (== (__dk_fp (__dk_keyq __dk_private)) (__dk_fp __dk_r7)))");
+    ray_derived_key_chunk_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(same); TEST_ASSERT_FALSE(RAY_IS_ERR(same)); TEST_ASSERT_TRUE(same->b8);
+    ray_release(same);
     PASS();
 }
 
@@ -9530,6 +9784,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_time", test_eval_table_list_col_time, lang_setup, lang_teardown },
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
+    { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
@@ -9627,6 +9882,11 @@ const test_entry_t lang_entries[] = {
     /* S1/S2 builtins + temporal */
     { "lang/builtin/print",       test_builtin_print_fn,       lang_setup, lang_teardown },
     { "lang/builtin/show",        test_builtin_show_fn,        lang_setup, lang_teardown },
+    { "lang/builtin/show_table_unlimited", test_builtin_show_table_unlimited, lang_setup, lang_teardown },
+    { "lang/builtin/show_table_streamed", test_builtin_show_table_streamed, lang_setup, lang_teardown },
+    { "lang/builtin/show_table_long_cells", test_builtin_show_table_long_cells, lang_setup, lang_teardown },
+    { "lang/builtin/show_table_long_cell_unpadded", test_builtin_show_table_long_cell_unpadded, lang_setup, lang_teardown },
+    { "lang/builtin/show_vector_full", test_builtin_show_vector_full, lang_setup, lang_teardown },
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
     { "lang/builtin/read_bytes",  test_builtin_read_bytes_fn,  lang_setup, lang_teardown },

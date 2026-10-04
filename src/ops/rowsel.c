@@ -33,6 +33,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ──────────────────────────────────────────────────────────────────
  * Allocation helpers
@@ -262,10 +264,14 @@ void rowsel_builder_init(rowsel_builder_t* b, uint32_t n_segs) {
     b->idx_len    = 0;
     b->total_pass = 0;
     /* All three allocs must succeed — raw allocator is fatal-by-contract
-     * (no recovery path in Rayforce; same as ray_alloc failure callers). */
-    assert(b->seg_flags && "rowsel_builder_init: OOM on seg_flags");
-    assert(b->seg_off   && "rowsel_builder_init: OOM on seg_off");
-    assert(b->idx       && "rowsel_builder_init: OOM on idx");
+     * (no recovery path in Rayforce; same as ray_alloc failure callers).
+     * Checked explicitly: an assert would compile away under -DNDEBUG and
+     * leave the NULL for the next line to dereference (#652). */
+    if (!b->seg_flags || !b->seg_off || !b->idx) {
+        fprintf(stderr, "rayforce: rowsel_builder_init: out of memory "
+                        "(%u segments)\n", (unsigned)n_segs);
+        abort();
+    }
     /* seg_off[0] is already 0 from ray_calloc_raw; kept explicit for clarity. */
     b->seg_off[0] = 0;
 }

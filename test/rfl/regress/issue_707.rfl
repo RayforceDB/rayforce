@@ -1,0 +1,62 @@
+;; #707 — a select grouped by a computed key (`by: (% v 3)`) failed with
+;; "nyi: eval-level groupby requires scalar key" whenever an output was not a
+;; plain aggregate: a `distinct` aggregate or a row expression sends the
+;; select to the eval-level grouping, which only read a key from a named
+;; column.  The key is now evaluated over the selected rows into a hidden
+;; column; the result names it as the DAG path names a computed key.
+(set T (table [s v] (list (take ['abc1 'abd2 'xyz3 'xya4] 40) (til 40))))
+;; the oracle: the same key materialized as a column first
+(set U (update {k: (substr s 0 2) m: (% v 3) p: (% v 2) from: T}))
+
+(count (select {c: (count (distinct v)) from: T by: (substr s 0 2)})) -- 2
+(at (select {c: (count (distinct v)) from: T by: (substr s 0 2) asc: s}) 'c) -- (at (select {c: (count (distinct v)) from: U by: k asc: k}) 'c)
+(at (select {c: (count (distinct v)) from: T by: (substr s 0 2) asc: s}) 's) -- ['ab 'xy]
+(at (select {c: (count (distinct v)) from: T by: (% v 3) asc: v}) 'c) -- [14 13 13]
+(at (select {c: (count (distinct v)) from: T by: (% v 3) asc: v}) 'v) -- [0 1 2]
+(at (select {c: (sum (distinct v)) from: T by: (% v 3) asc: v}) 'c) -- (at (select {c: (sum (distinct v)) from: U by: m asc: m}) 'c)
+(at (select {c: (count (distinct v)) n: (count v) from: T by: (% v 3) asc: v}) 'n) -- [14 13 13]
+;; a row expression beside the key
+(at (select {c: (+ v 1) from: T by: (% v 3) asc: v}) 'c) -- (at (select {c: (+ v 1) from: U by: m asc: m}) 'c)
+(at (select {d: (distinct v) from: T by: (% v 2) asc: v}) 'd) -- (at (select {d: (distinct v) from: U by: p asc: p}) 'd)
+
+;; where: filters the rows the key is computed over
+(at (select {c: (count (distinct v)) from: T where: (> v 5) by: (substr s 0 2) asc: s}) 'c) -- (at (select {c: (count (distinct v)) from: U where: (> v 5) by: k asc: k}) 'c)
+(at (select {c: (count (distinct v)) from: T where: (> v 30) by: (% v 3) asc: v}) 'c) -- [3 3 3]
+(count (select {c: (count (distinct v)) from: T where: (> v 100) by: (% v 3)})) -- 0
+
+;; the key column's name: the expression's column, or `key` when an output
+;; spells the same or the expression names no column
+(key (select {c: (count (distinct v)) from: T by: (% v 3)})) -- ['v 'c]
+(key (select {v: (count (distinct v)) from: T by: (% v 3)})) -- ['key 'v]
+(key (select {c: (count (distinct v)) from: T by: (+ (% v 3) 1)})) -- ['key 'c]
+;; the source column the key is derived from is left intact for the outputs
+(at (select {mx: (max (distinct v)) from: T by: (% v 3) asc: v}) 'mx) -- [39 37 38]
+;; the input table is not modified
+(key T) -- ['s 'v]
+
+;; a sort key naming the derived key column sorts by the key, not the source
+(at (select {c: (count (distinct v)) from: T by: (% v 3) desc: v}) 'v) -- [2 1 0]
+(at (select {c: (count (distinct v)) from: T by: (% v 3) asc: [c v]}) 'v) -- [1 2 0]
+(at (select {c: (count (distinct v)) from: T by: (% v 3) desc: v take: 1}) 'c) -- [13]
+
+;; plain aggregates keep the DAG path and its naming
+(key (select {c: (count v) from: T by: (% v 3)})) -- ['v 'c]
+(at (select {c: (count v) from: T by: (% v 3) asc: v}) 'c) -- [14 13 13]
+
+;; a literal key is one group
+(at (select {c: (count (distinct v)) from: T by: 1}) 'c) -- [40]
+;; the key is computed row-wise, as a by-dict value is: `if` per row
+(at (select {c: (count (distinct v)) from: T by: (if (> v 4) 1 0) asc: key}) 'c) -- [5 35]
+
+;; ─── on a parted table ───────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_q707_parted")
+(.db.splayed.set "/tmp/rfl_q707_parted/2024.01.01/t/" (table [v] (list [1 2 3 4])))
+(.db.splayed.set "/tmp/rfl_q707_parted/2024.01.02/t/" (table [v] (list [5 6 7 7])))
+(set P (.db.parted.get "/tmp/rfl_q707_parted/" 't))
+(at (select {c: (count (distinct v)) from: P by: (% v 2) asc: v}) 'c) -- (at (select {c: (count (distinct v)) from: P by: {m: (% v 2)} asc: m}) 'c)
+(at (select {c: (count (distinct v)) from: P by: (% v 2) asc: v}) 'c) -- [3 4]
+(at (select {c: (count (distinct v)) from: P where: (> v 2) by: (% v 2) asc: v}) 'c) -- [2 3]
+(.sys.exec "rm -rf /tmp/rfl_q707_parted")
+
+;; the hidden key column's name is refused rather than shadowed
+(select {c: (count (distinct v)) from: (table [__by_key v] (list [1 2] [3 4])) by: (% v 2)}) !- domain

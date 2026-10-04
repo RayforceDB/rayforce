@@ -105,9 +105,15 @@ static inline int is_temporal(ray_t* x) {
  * DATE = days since epoch -> ns, TIME = ms since midnight -> ns, TIMESTAMP = ns */
 static inline int64_t temporal_as_ns(ray_t* x) {
     if (x->type == -RAY_TIMESTAMP) return x->i64;
-    if (x->type == -RAY_DATE)      return (int64_t)x->i32 * 86400000000000LL;
-    if (x->type == -RAY_TIME)      return (int64_t)x->i32 * 1000000LL;
-    return 0;
+    int64_t unit = x->type == -RAY_DATE ? 86400000000000LL
+                 : x->type == -RAY_TIME ? 1000000LL : 0;
+    if (!unit) return 0;
+    /* Saturating: a date outside the TIMESTAMP range still orders past
+     * every timestamp, instead of overflowing. */
+    int64_t ns;
+    if (__builtin_mul_overflow((int64_t)x->i32, unit, &ns))
+        return x->i32 < 0 ? INT64_MIN + 1 : INT64_MAX;
+    return ns;
 }
 
 /* Extract integer value from any integer atom as int64_t */
@@ -215,13 +221,23 @@ static inline ray_t* make_typed_int(int8_t atom_type, int64_t val) {
  * ══════════════════════════════════════════ */
 
 /* Logical -- coerce to truthiness (0/nil/false = falsy, else truthy).
- * Null forms (RAY_NULL singleton and typed null atoms) are falsy. */
+ * Null forms (RAY_NULL singleton and typed null atoms) are falsy, and so is
+ * a zero of any numeric or temporal type: only I64 and F64 zeros used to
+ * be, so `(if (as 'i32 0) 1 2)` took the then-branch. */
 static inline int is_truthy(ray_t* x) {
     if (RAY_IS_NULL(x) || RAY_ATOM_IS_NULL(x)) return 0;
-    if (x->type == -RAY_BOOL) return x->b8;
-    if (x->type == -RAY_I64)  return x->i64 != 0;
-    if (x->type == -RAY_F64)  return x->f64 != 0.0;
-    return 1; /* non-null objects are truthy */
+    switch (x->type) {
+    case -RAY_BOOL: return x->b8 != 0;
+    case -RAY_U8:   return x->u8 != 0;
+    case -RAY_I16:  return x->i16 != 0;
+    case -RAY_I32:  return x->i32 != 0;
+    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return x->i64 != 0;
+    case -RAY_F32: case -RAY_F64:   /* F32 atoms are stored widened */
+        return x->f64 != 0.0 && x->f64 == x->f64;
+    default:
+        return 1; /* non-null objects are truthy */
+    }
 }
 
 /* ══════════════════════════════════════════
@@ -354,7 +370,11 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
             case RAY_I16:
                 ((int16_t*)ray_data(vec))[i] = NULL_I16; break;
             default: {
-                int esz = ray_elem_size(vec->type);
+                /* A SYM cell is 1, 2, 4 or 8 bytes by the vector's width;
+                 * ray_elem_size(SYM) is the 8 of the widest, which cleared
+                 * the next cells of a narrow column and wrote past its end. */
+                int esz = vec->type == RAY_SYM ? ray_sym_elem_size(vec->type, vec->attrs)
+                                               : ray_elem_size(vec->type);
                 memset((char*)ray_data(vec) + i * esz, 0, esz);
                 break;
             }
@@ -651,7 +671,7 @@ ray_t* ray_ser_fn(ray_t* val);
 ray_t* ray_de_fn(ray_t* val);
 ray_t* ray_hopen_fn(ray_t** args, int64_t n);
 ray_t* ray_hclose_fn(ray_t* x);
-ray_t* ray_hsend_fn(ray_t* handle, ray_t* msg);
+ray_t* ray_hsend_fn(ray_t** args, int64_t n);
 ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n);
@@ -692,6 +712,12 @@ ray_t* ray_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_exit_fn(ray_t* arg);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n);
+ray_t* ray_parquet_read_fn(ray_t** args, int64_t n);
+ray_t* ray_parquet_scan_fn(ray_t** args, int64_t n);
+ray_t* ray_parquet_metadata_fn(ray_t* path);
+ray_t* ray_parquet_each_fn(ray_t** args, int64_t n);
+ray_t* ray_parquet_splayed_fn(ray_t** args, int64_t n);
+ray_t* ray_parquet_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);

@@ -77,6 +77,7 @@ static int munmap(void* p, size_t len) {
 }
 #else
 #include <sys/mman.h>
+#include <sys/stat.h>   /* fstat: spill-file link count */
 #endif
 #include <fcntl.h>
 #include <unistd.h>
@@ -2672,6 +2673,16 @@ static test_result_t test_anon_watermark_spill(void) {
     bool a_file = a ? ray_direct_file_backed(a) : true;   /* expect anon (RAM) */
     ray_t* b = ray_alloc(sz);
     bool b_file = b ? ray_direct_file_backed(b) : false;  /* expect spill file */
+    /* The spill file is unlinked as soon as it is mapped: a process that
+     * exits or is killed while holding the block leaves nothing on disk. */
+    bool b_unlinked = true;
+#if !defined(_WIN32)
+    if (b && b_file) {
+        struct stat st;
+        int fd = ((const ray_direct_hdr_t*)((const char*)b - RAY_DIRECT_HDR))->swap_fd;
+        b_unlinked = fstat(fd, &st) == 0 && st.st_nlink == 0;
+    }
+#endif
 
     /* A spilled block must be as usable as an anon one: write a pattern near
      * the start and end of each and read it back (MAP_SHARED round-trip). */
@@ -2700,6 +2711,7 @@ static test_result_t test_anon_watermark_spill(void) {
     TEST_ASSERT_NOT_NULL(b);
     TEST_ASSERT(!a_file, "first alloc under watermark stays in anonymous RAM");
     TEST_ASSERT(b_file, "second alloc over watermark spills to a disk file");
+    TEST_ASSERT(b_unlinked, "the spill file has no name left while the block is live");
     TEST_ASSERT(rw_ok, "both anon and spilled blocks round-trip written data");
 
     /* Counter returns to baseline once both are freed. */

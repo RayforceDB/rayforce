@@ -1,0 +1,54 @@
+;; Replacements must be visible through every public storage entry point.
+(.sys.exec "rm -rf /tmp/rf_test_atomic_generations") -- 0
+(set agRoot "/tmp/rf_test_atomic_generations")
+(set agLeaf (format "%/2026.09.28/t" agRoot))
+(set agOld (table ['x 'y] (list [1 2] [10 20])))
+(set agNew (table ['x 'y] (list [3 4] [30 40])))
+(.db.splayed.set agLeaf agOld)
+(.db.splayed.set agLeaf agNew)
+(sum (at (.db.splayed.get agLeaf) 'x)) -- 7
+(sum (at (.db.parted.get agRoot 't) 'x)) -- 7
+;; The first generation publish retires the legacy schema so old binaries
+;; cannot silently read the stale root files.
+(.sys.exec "test ! -f /tmp/rf_test_atomic_generations/2026.09.28/t/.d") -- 0
+;; Discovery must use the active schema without the legacy root .d.
+(.db.parted.tables agRoot) -- ['t]
+
+;; Schema narrowing must not make the partition reader use the old .d.
+(.db.splayed.set agLeaf (table ['x] (list [5 6])))
+(count (key (.db.parted.get agRoot 't))) -- 2
+(sum (at (.db.parted.get agRoot 't) 'x)) -- 11
+
+;; The streaming (numeric) CSV writer must publish a new generation too.
+(.csv.write agNew (format "%/new.csv" agRoot))
+(set agCSV (.csv.splayed (format "%/new.csv" agRoot) agLeaf))
+(sum (at agCSV 'x)) -- 7
+(sum (at (.db.splayed.get agLeaf) 'y)) -- 70
+(sum (at (.db.parted.get agRoot 't) 'y)) -- 70
+
+;; Its materializing STR fallback uses the same protocol and root symfile.
+(set agText (table ['x 'text 'sym] (list [7 8] ["alpha" "beta"] ['A 'B])))
+(.csv.write agText (format "%/text.csv" agRoot))
+(set agCSV (.csv.splayed [I64 STR SYMBOL] (format "%/text.csv" agRoot) (format "%/text" agRoot)))
+(set agText (table ['x 'text 'sym] (list [9 10] ["gamma" "delta"] ['C 'D])))
+(.csv.write agText (format "%/text.csv" agRoot))
+(set agCSV (.csv.splayed [I64 STR SYMBOL] (format "%/text.csv" agRoot) (format "%/text" agRoot)))
+(at agCSV 'x) -- [9 10]
+(at agCSV 'text) -- ["gamma" "delta"]
+(at agCSV 'sym) -- ['C 'D]
+
+;; Persist indexes in the generation being published, not in legacy files.
+(set agIndexed (table ['k 'v] (list (.attr.set 'grouped ['a 'b]) [1 2])))
+(.db.splayed.set (format "%/indexed" agRoot) agIndexed)
+(.db.splayed.set (format "%/indexed" agRoot) agIndexed)
+(.idx.has? (at (.db.splayed.get (format "%/indexed" agRoot)) 'k)) -- true
+(set agStrings (table ['k] (list (.attr.set 'grouped ["aa" "bb"]))))
+(.db.splayed.set (format "%/indexed_str" agRoot) agStrings)
+(.db.splayed.set (format "%/indexed_str" agRoot) agStrings)
+(.idx.has? (at (.db.splayed.get (format "%/indexed_str" agRoot)) 'k)) -- true
+;; Retention is bounded to current + previous generation.
+(.db.splayed.set agLeaf (table ['x] (list [11 12])))
+(.db.splayed.set agLeaf (table ['x] (list [13 14])))
+(.db.splayed.set agLeaf (table ['x] (list [15 16])))
+(.sys.exec "test $(find /tmp/rf_test_atomic_generations/2026.09.28/t/.generations -mindepth 1 -maxdepth 1 -type d | wc -l) -le 2") -- 0
+(.sys.exec "rm -rf /tmp/rf_test_atomic_generations") -- 0

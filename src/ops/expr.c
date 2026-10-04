@@ -622,6 +622,16 @@ static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binar
     return false;
 }
 
+/* A CAST may target a temporal type (the DAG retags a bucketed temporal
+ * column, see the xbar branch of compile_expr_dag).  TIMESTAMP is an I64
+ * lane and DATE / TIME are I32 lanes: the kernels, and the capability table,
+ * dispatch on the lane type. */
+static inline int8_t expr_cast_lane_type(int8_t t) {
+    if (t == RAY_TIMESTAMP) return RAY_I64;
+    if (t == RAY_DATE || t == RAY_TIME) return RAY_I32;
+    return t;
+}
+
 /* Which (opcode, dst-type, src1-type) shapes have null-aware kernel
  * variants?  Landing per-family:
  *   Task 5: CAST shapes + F64 arithmetic (IEEE-propagating, no variant needed)
@@ -630,6 +640,8 @@ static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binar
  *            F64 MIN2/MAX2 (non-IEEE-propagating, variant added) */
 static bool expr_null_capable(uint8_t op, int8_t dt, int8_t t1) {
     if (op == OP_CAST) {
+        dt = expr_cast_lane_type(dt);
+        t1 = expr_cast_lane_type(t1);
         if (dt == RAY_F64 && t1 != RAY_F64) return true;  /* i64→f64: NaN map */
         if (dt == RAY_I64 && t1 == RAY_F64) return true;  /* f64→i64: NaN→NULL_I64 */
         if (dt == RAY_I64 && t1 != RAY_F64) return true;  /* narrow widen: sentinel map */
@@ -1446,6 +1458,10 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
  * the mark_i64_overflow_as_null post-pass (INT64_MIN result → null). */
 static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void* dp,
                              int8_t t1, const void* ap, int64_t n) {
+    if (opcode == OP_CAST) {
+        dt = expr_cast_lane_type(dt);
+        t1 = expr_cast_lane_type(t1);
+    }
     if (dt == RAY_F64) {
         double* d = (double*)dp;
         if (t1 == RAY_F64) {
@@ -1478,6 +1494,19 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                 case OP_CAST:  memcpy(d, a, (size_t)n * sizeof(double)); break;
                 default: break;
             }
+        } else if (t1 == RAY_I32) {
+            /* A narrowing CAST leaves an I32 / I16 / 1-byte lane behind;
+             * read it at its own width, not as int64. */
+            const int32_t* a = (const int32_t*)ap;
+            for (int64_t j = 0; j < n; j++)
+                d[j] = (null_aware && a[j] == NULL_I32) ? NULL_F64 : (double)a[j];
+        } else if (t1 == RAY_I16) {
+            const int16_t* a = (const int16_t*)ap;
+            for (int64_t j = 0; j < n; j++)
+                d[j] = (null_aware && a[j] == NULL_I16) ? NULL_F64 : (double)a[j];
+        } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+            const uint8_t* a = (const uint8_t*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = (double)a[j];
         } else { /* CAST i64→f64: with null_aware map NULL_I64 → NULL_F64 */
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1518,8 +1547,8 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                 case OP_CAST: memcpy(d, a, (size_t)n * sizeof(int64_t)); break;
                 default: break;
             }
-        } else if (t1 == RAY_BOOL) {
-            /* CAST bool→i64 — BOOL scratch is 1 byte per elem (0/1). */
+        } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+            /* CAST bool/u8→i64 — a 1-byte lane. */
             const uint8_t* a = (const uint8_t*)ap;
             for (int64_t j = 0; j < n; j++) d[j] = a[j];
         } else if (t1 == RAY_I32 || t1 == RAY_DATE || t1 == RAY_TIME) {
@@ -1570,6 +1599,20 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
             if (t1 == RAY_F64) {
                 const double* a = (const double*)ap;
                 for (int64_t j = 0; j < n; j++) d[j] = (a[j] != a[j]) ? 1 : 0;
+            } else if ((t1 == RAY_I32 || t1 == RAY_I16) && !null_aware) {
+                /* A narrowing CAST of a null-free source truncates: a value
+                 * that lands on the sentinel is still a value. */
+                memset(d, 0, (size_t)n);
+            } else if (t1 == RAY_I32) {
+                /* A narrowing CAST leaves an I32 / I16 / 1-byte lane: read it
+                 * at its own width, with its own null sentinel. */
+                const int32_t* a = (const int32_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I32) ? 1 : 0;
+            } else if (t1 == RAY_I16) {
+                const int16_t* a = (const int16_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I16) ? 1 : 0;
+            } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+                memset(d, 0, (size_t)n);   /* no null in a byte lane */
             } else {
                 const int64_t* a = (const int64_t*)ap;
                 for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I64) ? 1 : 0;
@@ -1586,16 +1629,44 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                 const double* a = (const double*)ap;
                 for (int64_t j = 0; j < n; j++)
                     d[j] = (a[j] != 0.0 && a[j] == a[j]) ? 1 : 0;
+            } else if (t1 == RAY_I32) {
+                const int32_t* a = (const int32_t*)ap;
+                for (int64_t j = 0; j < n; j++)
+                    d[j] = (a[j] != 0 && a[j] != NULL_I32) ? 1 : 0;
+            } else if (t1 == RAY_I16) {
+                const int16_t* a = (const int16_t*)ap;
+                for (int64_t j = 0; j < n; j++)
+                    d[j] = (a[j] != 0 && a[j] != NULL_I16) ? 1 : 0;
+            } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+                const uint8_t* a = (const uint8_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = a[j] ? 1 : 0;
             } else {
                 const int64_t* a = (const int64_t*)ap;
                 for (int64_t j = 0; j < n; j++)
                     d[j] = (a[j] != 0 && a[j] != NULL_I64) ? 1 : 0;
             }
-        } else {
-            const uint8_t* a = (const uint8_t*)ap;
-            switch (opcode) {
-                case OP_NOT: for (int64_t j = 0; j < n; j++) d[j] = !a[j]; break;
-                default: break;
+        } else if (opcode == OP_NOT) {
+            /* The source lane keeps its producer's width: a REG_SCAN of a
+             * BOOL column is widened to I64 (register-widening invariant),
+             * a comparison result is a 1-byte BOOL scratch, a narrowing
+             * CAST leaves I32/I16, a float lane is F64.  Read it at that
+             * width (#693: the I64-widened BOOL column read as bytes gave
+             * `!0` = true for every lane but the first). */
+            if (t1 == RAY_F64) {
+                const double* a = (const double*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0.0) ? 1 : 0;
+            } else if (t1 == RAY_I64) {
+                const int64_t* a = (const int64_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0) ? 1 : 0;
+            } else if (t1 == RAY_I32) {
+                const int32_t* a = (const int32_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0) ? 1 : 0;
+            } else if (t1 == RAY_I16) {
+                const int16_t* a = (const int16_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = (a[j] == 0) ? 1 : 0;
+            } else {
+                const uint8_t* a = (const uint8_t*)ap;
+                for (int64_t j = 0; j < n; j++) d[j] = !a[j];
             }
         }
     } else if (dt == RAY_I32) {
@@ -1627,6 +1698,15 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                     d[j] = ray_cast_f64_to_i32_null(a[j]);
             else
                 for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_i32_null(a[j]);
+        } else if (t1 == RAY_I32) {
+            memcpy(d, ap, (size_t)n * sizeof(int32_t));
+        } else if (t1 == RAY_I16) {
+            const int16_t* a = (const int16_t*)ap;
+            for (int64_t j = 0; j < n; j++)
+                d[j] = (null_aware && a[j] == NULL_I16) ? NULL_I32 : (int32_t)a[j];
+        } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+            const uint8_t* a = (const uint8_t*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = a[j];
         } else {
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1653,6 +1733,15 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                     d[j] = ray_cast_f64_to_i16_null(a[j]);
             else
                 for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_i16_null(a[j]);
+        } else if (t1 == RAY_I32) {
+            const int32_t* a = (const int32_t*)ap;
+            for (int64_t j = 0; j < n; j++)
+                d[j] = (null_aware && a[j] == NULL_I32) ? NULL_I16 : (int16_t)a[j];
+        } else if (t1 == RAY_I16) {
+            memcpy(d, ap, (size_t)n * sizeof(int16_t));
+        } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+            const uint8_t* a = (const uint8_t*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = a[j];
         } else {
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1666,6 +1755,14 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
         if (t1 == RAY_F64) {
             const double* a = (const double*)ap;
             for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_u8_null(a[j]);
+        } else if (t1 == RAY_I32) {
+            const int32_t* a = (const int32_t*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
+        } else if (t1 == RAY_I16) {
+            const int16_t* a = (const int16_t*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
+        } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
+            memcpy(d, ap, (size_t)n);
         } else {
             const int64_t* a = (const int64_t*)ap;
             for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
@@ -2742,8 +2839,8 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             }
             out_off += n;
         }
-    } else if (in_type == RAY_I64 && out_type == RAY_BOOL) {
-        if (opc == OP_CAST) {
+    } else if (in_type == RAY_I64 && out_type == RAY_BOOL && opc == OP_CAST) {
+        {
             /* (as 'BOOL i64_col) — truthy semantics; NULL_I64 = INT64_MIN
              * sentinel is non-zero but logically missing, so skip it. */
             while (ray_morsel_next(&m)) {
@@ -2755,19 +2852,85 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 out_off += n;
             }
         }
-    } else if (in_type == RAY_BOOL && opc == OP_NOT) {
+    } else if (opc == OP_NOT) {
+        /* `not` is true for zero, and for a null as in the eval path (a null
+         * is not true).  Every numeric source width: BOOL / U8 bytes, I16,
+         * I32 and the DATE / TIME lanes, I64 and TIMESTAMP, F32, F64. */
+        int8_t it = expr_cast_lane_type(in_type);
+        if (it != RAY_F64 && it != RAY_F32 && it != RAY_I64 && it != RAY_I32 &&
+            it != RAY_I16 && it != RAY_U8 && it != RAY_BOOL) {
+            ray_release(result);
+            return ray_error("type", "not: expects a numeric argument, got %s",
+                             ray_type_name(in_type));
+        }
         while (ray_morsel_next(&m)) {
             int64_t n = m.morsel_len;
-            uint8_t* src = (uint8_t*)m.morsel_ptr;
             uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
-            for (int64_t i = 0; i < n; i++) dst[i] = !src[i];
+            if (it == RAY_F64) {
+                const double* src = (const double*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = !(src[i] != 0.0 && src[i] == src[i]);
+            } else if (it == RAY_F32) {
+                const float* src = (const float*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = !(src[i] != 0.0f && src[i] == src[i]);
+            } else if (it == RAY_I64) {
+                const int64_t* src = (const int64_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = src[i] == 0 || src[i] == NULL_I64;
+            } else if (it == RAY_I32) {
+                const int32_t* src = (const int32_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = src[i] == 0 || src[i] == NULL_I32;
+            } else if (it == RAY_I16) {
+                const int16_t* src = (const int16_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = src[i] == 0 || src[i] == NULL_I16;
+            } else {
+                const uint8_t* src = (const uint8_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = !src[i];
+            }
+            out_off += n;
+        }
+    } else if (opc == OP_CAST && (out_type == RAY_I32 || out_type == RAY_I16 ||
+                                  out_type == RAY_U8 || out_type == RAY_BOOL) &&
+               (expr_cast_lane_type(in_type) == RAY_I32 || in_type == RAY_I16 ||
+                in_type == RAY_U8 || in_type == RAY_BOOL) &&
+               expr_cast_lane_type(in_type) != expr_cast_lane_type(out_type)) {
+        /* Narrow to narrow: the arms below widen a narrow source to I64 or
+         * F64 only, and wrote 8-byte doubles into these narrower targets. */
+        int8_t it = expr_cast_lane_type(in_type);
+        size_t osz = ray_elem_size(out_type);
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            char* dst = (char*)ray_data(result) + (size_t)out_off * osz;
+            for (int64_t i = 0; i < n; i++) {
+                int64_t v = it == RAY_I32 ? (int64_t)((const int32_t*)m.morsel_ptr)[i]
+                          : it == RAY_I16 ? (int64_t)((const int16_t*)m.morsel_ptr)[i]
+                          :                 (int64_t)((const uint8_t*)m.morsel_ptr)[i];
+                if (out_type == RAY_I32)      ((int32_t*)dst)[i] = (int32_t)v;
+                else if (out_type == RAY_I16) ((int16_t*)dst)[i] = (int16_t)v;
+                else if (out_type == RAY_U8)  ((uint8_t*)dst)[i] = (uint8_t)v;
+                else /* BOOL: a null is not true, as in the I64 and F64 arms */
+                    ((uint8_t*)dst)[i] = v != 0 && !(it == RAY_I32 && v == NULL_I32) &&
+                                         !(it == RAY_I16 && v == NULL_I16);
+            }
             out_off += n;
         }
     } else if (opc == OP_CAST) {
+        /* A temporal target or source is its lane type (TIMESTAMP ≡ I64,
+         * DATE / TIME ≡ I32); an equal-lane cast is a retag copy. */
+        int8_t it = expr_cast_lane_type(in_type);
+        int8_t ot = expr_cast_lane_type(out_type);
+        if (it == ot) {
+            size_t esz = ray_elem_size(ot);
+            while (ray_morsel_next(&m)) {
+                int64_t n = m.morsel_len;
+                memcpy((char*)ray_data(result) + (size_t)out_off * esz,
+                       m.morsel_ptr, (size_t)n * esz);
+                out_off += n;
+            }
+        } else
         /* CAST from narrow integer types (I32/I16/U8/BOOL) to I64/F64.
-         * in_type is loop-invariant; select the typed read outside the loop. */
-        if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME) {
-            if (out_type == RAY_I64) {
+         * The lane types are loop-invariant; select the typed read outside
+         * the loop. */
+        if (it == RAY_I32) {
+            if (ot == RAY_I64) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int32_t* src = (int32_t*)m.morsel_ptr;
@@ -2784,8 +2947,8 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     out_off += n;
                 }
             }
-        } else if (in_type == RAY_I16) {
-            if (out_type == RAY_I64) {
+        } else if (it == RAY_I16) {
+            if (ot == RAY_I64) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int16_t* src = (int16_t*)m.morsel_ptr;
@@ -2802,8 +2965,8 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     out_off += n;
                 }
             }
-        } else if (in_type == RAY_U8 || in_type == RAY_BOOL) {
-            if (out_type == RAY_I64) {
+        } else if (it == RAY_U8 || it == RAY_BOOL) {
+            if (ot == RAY_I64) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     uint8_t* src = (uint8_t*)m.morsel_ptr;
@@ -2820,9 +2983,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     out_off += n;
                 }
             }
-        } else if (in_type == RAY_I64) {
+        } else if (it == RAY_I64) {
             /* Narrowing I64 → I32/I16/U8/BOOL: truncate. */
-            if (out_type == RAY_I32) {
+            if (ot == RAY_I32) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int64_t* src = (int64_t*)m.morsel_ptr;
@@ -2830,7 +2993,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     for (int64_t i = 0; i < n; i++) dst[i] = (int32_t)src[i];
                     out_off += n;
                 }
-            } else if (out_type == RAY_I16) {
+            } else if (ot == RAY_I16) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int64_t* src = (int64_t*)m.morsel_ptr;
@@ -2838,22 +3001,22 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     for (int64_t i = 0; i < n; i++) dst[i] = (int16_t)src[i];
                     out_off += n;
                 }
-            } else if (out_type == RAY_U8 || out_type == RAY_BOOL) {
+            } else if (ot == RAY_U8 || ot == RAY_BOOL) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int64_t* src = (int64_t*)m.morsel_ptr;
                     uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
                     /* BOOL: collapse non-zero to 1; U8: low byte. */
-                    if (out_type == RAY_BOOL)
+                    if (ot == RAY_BOOL)
                         for (int64_t i = 0; i < n; i++) dst[i] = src[i] ? 1 : 0;
                     else
                         for (int64_t i = 0; i < n; i++) dst[i] = (uint8_t)src[i];
                     out_off += n;
                 }
             }
-        } else if (in_type == RAY_F64) {
+        } else if (it == RAY_F64) {
             /* Narrowing F64 → I32/I16/U8/BOOL: float truncation. */
-            if (out_type == RAY_I32) {
+            if (ot == RAY_I32) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
@@ -2861,7 +3024,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_i32_null(src[i]);
                     out_off += n;
                 }
-            } else if (out_type == RAY_I16) {
+            } else if (ot == RAY_I16) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
@@ -2869,12 +3032,12 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_i16_null(src[i]);
                     out_off += n;
                 }
-            } else if (out_type == RAY_U8 || out_type == RAY_BOOL) {
+            } else if (ot == RAY_U8 || ot == RAY_BOOL) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
                     uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
-                    if (out_type == RAY_BOOL)
+                    if (ot == RAY_BOOL)
                         /* NaN (NULL_F64 sentinel) is "missing"; IEEE
                          * `NaN != 0.0` is true so add an explicit
                          * `src[i] == src[i]` to filter NaN to false. */
@@ -3027,7 +3190,14 @@ static void binary_range(ray_op_t* op, int8_t out_type,
      * (!= MobilePhoneModel "") = 15 ms vs ~1 ms on the typed-pointer
      * path).  Specialise on column width here so the inner loop reduces
      * to a typed pointer dereference + compare + store. */
-    if (out_type == RAY_BOOL && !l_scalar && r_scalar &&
+    /* The scalar must be integer-family too: a float scalar (an aggregate
+     * such as (avg col), or any computed F64 atom / 1-elem vec) was decoded
+     * into r_f64 by the caller and r_i64 is still 0, so this kernel would
+     * compare every row against 0 (#694).  Float scalars take the generic
+     * BOOL path below, which promotes both sides to double. */
+    bool r_scalar_float = rhs->type == -RAY_F64 || rhs->type == -RAY_F32 ||
+                          rhs->type ==  RAY_F64 || rhs->type ==  RAY_F32;
+    if (out_type == RAY_BOOL && !l_scalar && r_scalar && !r_scalar_float &&
         (op->opcode == OP_EQ || op->opcode == OP_NE ||
          op->opcode == OP_LT || op->opcode == OP_LE ||
          op->opcode == OP_GT || op->opcode == OP_GE) &&

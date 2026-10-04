@@ -1132,6 +1132,198 @@ static test_result_t test_dispatch_n_exact_cap(void) {
 }
 
 /* ==========================================================================
+ * Claim-protocol tests: every ticket exactly once, under both claiming modes
+ *
+ * RAY_POOL_STEAL selects, at pool creation, the shared bounded-CAS cursor (0)
+ * or per-worker contiguous ranges with tail stealing (1).  The pool has had
+ * cross-dispatch claim races before, so each mode is driven through thousands
+ * of back-to-back windows of every awkward shape — tiny n, n below / at /
+ * above the worker count, n far above it through both entry points, and a
+ * dispatch_n wider than the ring (several rounds) — with uneven per-ticket
+ * work so that owners and thieves really meet on the words.  A ticket hit
+ * twice or never is the failure; a lost ticket would also hang the dispatch,
+ * which the harness watchdog reports as a hung test.
+ * ========================================================================== */
+
+#if defined(__linux__) || defined(__APPLE__)
+
+/* Create a pool under a given RAY_POOL_STEAL value, restoring the variable
+ * afterwards (the switch is read once, at creation). */
+static ray_err_t pool_create_mode(ray_pool_t* pool, uint32_t n_workers, bool steal) {
+    const char* cur = getenv("RAY_POOL_STEAL");
+    char* saved = cur ? strdup(cur) : NULL;
+    setenv("RAY_POOL_STEAL", steal ? "1" : "0", 1);
+    ray_err_t rc = ray_pool_create(pool, n_workers);
+    if (saved) { setenv("RAY_POOL_STEAL", saved, 1); free(saved); }
+    else unsetenv("RAY_POOL_STEAL");
+    return rc;
+}
+
+#define POOL_ONCE_MAX   70000u
+#define POOL_ONCE_GRAIN ((int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)   /* = TASK_GRAIN */
+
+static _Atomic(uint32_t) pool_once_hits[POOL_ONCE_MAX];   /* per-ticket hit count */
+
+typedef struct {
+    int64_t  grain;              /* elements per ticket: 1 (dispatch_n) or TASK_GRAIN */
+    uint32_t n;                  /* tickets in the window */
+    uint32_t block;              /* ticket that waits for every other one; UINT32_MAX = none */
+    _Atomic(uint32_t) done;      /* tickets finished */
+} pool_once_ctx_t;
+
+static void pool_once_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    pool_once_ctx_t* c = (pool_once_ctx_t*)ctx;
+    uint32_t t = (uint32_t)(start / c->grain);
+    /* Uneven, deterministic per-ticket work (0..16k iterations) so claims
+     * and steals interleave instead of every ticket finishing at once. */
+    volatile uint32_t sink = 0;
+    uint32_t spin = ((t * 2654435761u) >> 24) << 6;
+    for (uint32_t i = 0; i < spin; i++) sink += i;
+    (void)sink;
+    /* The blocking ticket finishes last: it waits on observable state (every
+     * other ticket done), never on a timer. */
+    if (t == c->block)
+        while (atomic_load_explicit(&c->done, memory_order_acquire) + 1 < c->n) RAY_CPU_RELAX();
+    if (t < POOL_ONCE_MAX && end - start <= c->grain)
+        atomic_fetch_add_explicit(&pool_once_hits[t], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&c->done, 1, memory_order_release);
+}
+
+static void pool_once_reset(pool_once_ctx_t* c, uint32_t n, int64_t grain) {
+    for (uint32_t t = 0; t < n; t++)
+        atomic_store_explicit(&pool_once_hits[t], 0, memory_order_relaxed);
+    c->grain = grain;
+    c->n = n;
+    atomic_store_explicit(&c->done, 0, memory_order_relaxed);
+}
+
+/* First ticket in [0, n) whose hit count is not exactly one, or -1. */
+static int64_t pool_once_bad(uint32_t n) {
+    for (uint32_t t = 0; t < n; t++)
+        if (atomic_load_explicit(&pool_once_hits[t], memory_order_relaxed) != 1) return t;
+    return -1;
+}
+
+/* One window through the chosen entry point, then the exactly-once check
+ * and the cross-dispatch invariant (window fully claimed: cursors equal). */
+static test_result_t pool_once_window(ray_pool_t* pool, pool_once_ctx_t* c, uint32_t n,
+                                      bool elem_form, uint64_t* tickets) {
+    pool_once_reset(c, n, elem_form ? POOL_ONCE_GRAIN : 1);
+    if (elem_form) ray_pool_dispatch(pool, pool_once_fn, c, (int64_t)n * POOL_ONCE_GRAIN);
+    else           ray_pool_dispatch_n(pool, pool_once_fn, c, n);
+    *tickets += n;
+    TEST_ASSERT_EQ_U(atomic_load(&c->done), n);
+    int64_t bad = pool_once_bad(n);
+    TEST_ASSERT_FMT(bad < 0, "ticket %lld of %u hit %u times (steal=%u, workers=%u, %s)",
+                    (long long)bad, n, bad < 0 ? 0u : atomic_load(&pool_once_hits[bad]),
+                    pool->steal, pool->n_workers, elem_form ? "dispatch" : "dispatch_n");
+    TEST_ASSERT_EQ_U(atomic_load(&pool->task_claim), atomic_load(&pool->task_limit));
+    PASS();
+}
+
+#define POOL_ONCE_RUN(pool, c, n, elem, tk) do {                              \
+        test_result_t _r = pool_once_window((pool), (c), (n), (elem), (tk)); \
+        if (_r.status != TEST_PASS) return _r;                                \
+    } while (0)
+
+/* The window battery over one pool: every awkward shape, many times over. */
+static test_result_t pool_once_battery(ray_pool_t* pool) {
+    uint32_t W = ray_pool_total_workers(pool);
+    pool_once_ctx_t c = { .block = UINT32_MAX };
+    uint64_t tickets = 0;
+
+    /* thousands of back-to-back tiny windows: the cross-dispatch race bed */
+    for (uint32_t i = 0; i < 3000; i++)
+        POOL_ONCE_RUN(pool, &c, 1 + i % 3, false, &tickets);
+
+    /* n below, at and just above the worker count, and a few multiples */
+    for (uint32_t i = 0; i < 300; i++) {
+        if (W > 1) POOL_ONCE_RUN(pool, &c, W - 1, false, &tickets);
+        POOL_ONCE_RUN(pool, &c, W, false, &tickets);
+        POOL_ONCE_RUN(pool, &c, W + 1, false, &tickets);
+        POOL_ONCE_RUN(pool, &c, 2 * W + 1, i & 1, &tickets);
+    }
+
+    /* n far above the worker count, both entry points */
+    for (uint32_t i = 0; i < 60; i++) {
+        POOL_ONCE_RUN(pool, &c, 1000, false, &tickets);
+        POOL_ONCE_RUN(pool, &c, 1000, true, &tickets);
+    }
+
+    /* more tasks than the ring can ever hold: several dispatch_n rounds */
+    POOL_ONCE_RUN(pool, &c, POOL_ONCE_MAX, false, &tickets);
+
+    /* Accounting: in steal mode every ticket was claimed from an own range
+     * or stolen, nothing else; the cursor path never touches the counters. */
+    uint64_t own = 0, stolen = 0;
+    for (uint32_t w = 0; w < W; w++) { own += pool->slots[w].own; stolen += pool->slots[w].stolen; }
+    if (pool->steal) TEST_ASSERT_EQ_U(own + stolen, tickets);
+    else             TEST_ASSERT_EQ_U(own + stolen, 0u);
+    PASS();
+}
+
+static test_result_t pool_once_mode(bool steal) {
+    ray_heap_init();
+    static const uint32_t workers[] = { 3, 0, 6 };   /* W = 4, 1 (main only), 7 */
+    for (size_t i = 0; i < sizeof(workers) / sizeof(workers[0]); i++) {
+        ray_pool_t pool;
+        TEST_ASSERT_EQ_I(pool_create_mode(&pool, workers[i], steal), RAY_OK);
+        TEST_ASSERT_EQ_U(pool.steal, steal ? 1u : 0u);
+        test_result_t r = pool_once_battery(&pool);
+        ray_pool_free(&pool);
+        if (r.status != TEST_PASS) return r;
+    }
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_claim_once_cursor(void) { return pool_once_mode(false); }
+static test_result_t test_claim_once_steal(void)  { return pool_once_mode(true); }
+
+/* --------------------------------------------------------------------------
+ * Test: stealing is forced, not left to scheduling luck.
+ *
+ * Ticket 0 heads main's own range and waits until every other ticket is
+ * done.  Main is stuck in it, so the rest of main's share can only run if
+ * the workers cut it from the tail — with ranges the window cannot complete
+ * otherwise (a hang the watchdog would report).  Should a worker beat main
+ * to ticket 0 instead, it did so by stealing it, so `stolen` is positive
+ * either way.  The cursor mode runs the same window as a control: there the
+ * remaining tickets are simply claimed from the shared cursor.
+ * -------------------------------------------------------------------------- */
+static test_result_t pool_steal_forced_mode(bool steal) {
+    ray_heap_init();
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(pool_create_mode(&pool, 3, steal), RAY_OK);
+
+    pool_once_ctx_t c = { .block = 0 };
+    uint64_t tickets = 0;
+    for (int rep = 0; rep < 8; rep++)
+        POOL_ONCE_RUN(&pool, &c, 4000, rep & 1, &tickets);
+
+    uint64_t own = 0, stolen = 0, steals = 0;
+    for (uint32_t w = 0; w < ray_pool_total_workers(&pool); w++) {
+        own += pool.slots[w].own; stolen += pool.slots[w].stolen; steals += pool.slots[w].steals;
+    }
+    if (steal) {
+        TEST_ASSERT_EQ_U(own + stolen, tickets);
+        TEST_ASSERT_FMT(stolen > 0 && steals > 0, "no steal in %llu windows", (unsigned long long)8);
+    } else {
+        TEST_ASSERT_EQ_U(own + stolen + steals, 0u);
+    }
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_steal_forced(void)        { return pool_steal_forced_mode(true); }
+static test_result_t test_steal_forced_cursor(void) { return pool_steal_forced_mode(false); }
+
+#endif /* __linux__ || __APPLE__ */
+
+/* ==========================================================================
  * Bounded poll-step tests
  * ========================================================================== */
 
@@ -1494,6 +1686,10 @@ const test_entry_t pool_entries[] = {
     { "pool/dispatch_n_multi_grow", test_dispatch_n_multi_grow, NULL, NULL },
     { "pool/dispatch_n_exact_cap",  test_dispatch_n_exact_cap,  NULL, NULL },
 #if defined(__linux__) || defined(__APPLE__)
+    { "pool/claim_once_cursor",     test_claim_once_cursor,     NULL, NULL },
+    { "pool/claim_once_steal",      test_claim_once_steal,      NULL, NULL },
+    { "pool/steal_forced",          test_steal_forced,          NULL, NULL },
+    { "pool/steal_forced_cursor",   test_steal_forced_cursor,   NULL, NULL },
     { "pool/poll_run_for_zero_drains_ready_event", test_poll_run_for_zero_drains_ready_event, NULL, NULL },
     { "pool/poll_run_for_positive_timeout", test_poll_run_for_positive_timeout, NULL, NULL },
 #endif

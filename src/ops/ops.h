@@ -589,6 +589,13 @@ typedef struct ray_graph {
      * value of that table's length, so the memo neither serves nor stores
      * while g->table differs. */
     ray_t*          memo_table;
+
+    /* Set when an `if` refuses its operands (a text result with a numeric
+     * branch, a condition with no truth value).  Such an error is the
+     * expression's answer: a caller with an interpreter fallback must not
+     * retry, since the interpreter's `if` tests one truth value and would
+     * write the then-branch to every row. */
+    bool            if_refused;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */

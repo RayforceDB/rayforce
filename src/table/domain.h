@@ -45,6 +45,8 @@
  *              open / append and owned by the domain (borrowed by
  *              callers, exactly like ray_sym_str), making
  *              ray_sym_domain_str a lock-free array read.
+ *              ray_sym_domain_new creates a private in-memory instance of
+ *              this dictionary, with no backing path or cache entry.
  *
  * Position-0 reservation: position 0 of every non-empty FILE domain is
  * the canonical empty/null symbol "" (mirrors global id 0).  Group kernels
@@ -98,6 +100,11 @@ ray_sym_domain_t* ray_sym_domain_open(const char* path);
  * domain (vocabulary written on first flush).  The save path's
  * open-or-create entry point. */
 ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path);
+
+/* New private, refcounted in-memory dictionary. Supports the same concurrent
+ * append and resolution operations as FILE domains, without a cache entry or
+ * backing file. Attached vectors keep it alive. flush returns RAY_ERR_DOMAIN. */
+ray_sym_domain_t* ray_sym_domain_new(void);
 
 /* No-ops on the runtime singleton. */
 void ray_sym_domain_retain(ray_sym_domain_t* dom);

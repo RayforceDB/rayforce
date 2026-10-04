@@ -1,0 +1,62 @@
+;; #693: compiled `not` over a BOOL column in a select projection.
+;;
+;; A REG_SCAN of a BOOL column is widened to an I64 lane (register-widening
+;; invariant in expr.c), but the BOOL-output unary kernel read the NOT
+;; source as bytes: lane 0 saw the low byte of the first int64, lanes 1..7
+;; saw its zero padding, so [true false true false] came back as
+;; [false true true true].  The fix reads the source at its own lane width.
+
+(set T (table [b] (list [true false true false])))
+(at (select {n: (not b) from: T}) 'n) -- [false true false true]
+(at (select {n: (not (not b)) from: T}) 'n) -- [true false true false]
+(at (select {n: (and b (not b)) from: T}) 'n) -- [false false false false]
+(at (select {n: b from: T where: (not b)}) 'n) -- [false false]
+(count (select {n: b from: T where: (not b)})) -- 2
+
+;; all-true input: every lane must flip
+(set T4 (table [b] (list [true true true true])))
+(at (select {n: (not b) from: T4}) 'n) -- [false false false false]
+
+;; lengths around the 8-byte lane boundary
+(set T8 (table [b] (list [true false true false true false true false])))
+(at (select {n: (not b) from: T8}) 'n) -- [false true false true false true false true]
+(set T9 (table [b] (list [true false true false true false true false true])))
+(at (select {n: (not b) from: T9}) 'n) -- [false true false true false true false true false]
+(set T17 (table [b] (list [true false true false true false true false true false true false true false true false true])))
+(at (select {n: (not b) from: T17}) 'n) -- [false true false true false true false true false true false true false true false true false]
+
+;; computed-bool source (1-byte scratch) was already correct; keep it covered
+(set TI (table [i] (list (til 6))))
+(at (select {n: (not (> i 2)) from: TI}) 'n) -- [true true true false false false]
+
+;; same kernel: (as 'BOOL ...) over a comparison result / narrow cast
+(at (select {n: (as 'BOOL (> i 2)) from: TI}) 'n) -- [false false false true true true]
+(at (select {n: (as 'BOOL (as 'I32 i)) from: TI}) 'n) -- [false true true true true true]
+(at (select {n: (as 'BOOL (as 'I16 i)) from: TI}) 'n) -- [false true true true true true]
+
+;; `not` over a nullable non-BOOL column runs in the element-wise fallback
+;; (the compiled kernel declines a null-aware NOT).  That fallback had a NOT
+;; for BOOL input only and left the result unwritten for any other width.
+;; A null is not true, so `not` of it is true, as in the eval path.
+(set iN [1 0N 0 3 0 5 6 0 0N 9])
+(set fN [1.0 0Nf 0.0 3.0 0.0 5.0 6.0 0.0 0Nf 9.0])
+(set TNN (table [k iN fN] (list (til 10) iN fN)))
+(at (select {n: (not iN) from: TNN}) 'n) -- [false true true false true false false true true false]
+(at (select {n: (not fN) from: TNN}) 'n) -- [false true true false true false false true true false]
+(at (select {k: k from: TNN where: (not iN)}) 'k) -- [1 2 4 7 8]
+(at (select {n: (not (as 'I32 iN)) from: TNN}) 'n) -- [false true true false true false false true true false]
+(set TN16 (table [h] (list (as 'I16 iN))))
+(at (select {n: (not h) from: TN16}) 'n) -- [false true true false true false false true true false]
+(set TN32 (table [w] (list (as 'I32 iN))))
+(at (select {n: (not w) from: TN32}) 'n) -- [false true true false true false false true true false]
+;; `not` has no meaning for symbols
+(select {n: (not s) from: (table [s] (list (as 'SYMBOL ["a" "" "b"])))}) !- type
+;; the eval path's `not` is element-wise over numeric vectors too
+(not iN) -- [false true true false true false false true true false]
+(not fN) -- [false true true false true false false true true false]
+(not [true false]) -- [false true]
+(not 0) -- true
+;; a vector result, so an `if` on `(not vec)` tests a vector, which is truthy
+;; whatever its cells: the same as for a BOOL vector before this change
+(if (not [1 2]) 'a 'b) -- 'a
+(if (not [true true]) 'a 'b) -- 'a

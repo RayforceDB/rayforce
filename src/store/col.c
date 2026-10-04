@@ -21,6 +21,12 @@
  *   SOFTWARE.
  */
 
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#elif !defined(_WIN32)
+#  define _GNU_SOURCE       /* ftruncate, fileno */
+#endif
+
 #include "col.h"
 #include "core/platform.h"
 #include "mem/heap.h"
@@ -37,6 +43,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#ifdef RAY_OS_WINDOWS
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * validate_sym_bounds -- check all indices in a RAY_SYM column are < sym_count
@@ -682,54 +693,77 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
  * ray_col_save -- write a vector to a column file
  * -------------------------------------------------------------------------- */
 
-/* Append an inline index region to an EXISTING column file (no data rewrite):
+/* Rationale: the region goes at the real payload end (STR includes its pool,
+ * so never recompute from len*esz); the marker is stamped LAST so a torn
+ * append never looks indexed; the flush is not an fsync because the index is
+ * a rebuildable accelerator.
+ * Append an inline index region to an EXISTING column file (no data rewrite):
  * pad the payload to 32, write the region, then stamp the aux[0..3] marker.
  * Used by the streaming .csv.splayed builder, which writes raw columns first.
  * `col_len`/`col_type` describe the on-disk column (payload = 32 + len*esz). */
-ray_err_t ray_col_append_index(const char* path, const void* ix_v,
-                               int64_t col_len, int8_t col_type) {
+/* Cut a column file back to `len` bytes: undoes a partial index append. */
+bool ray_col_truncate(FILE* f, int64_t len) {
+    if (fflush(f) != 0) return false;
+#ifdef RAY_OS_WINDOWS
+    return _chsize_s(_fileno(f), len) == 0;
+#else
+    return ftruncate(fileno(f), (off_t)len) == 0;
+#endif
+}
+
+ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload_end_out) {
     const ray_index_t* ix = (const ray_index_t*)ix_v;
-    if (!path || !ix) return RAY_ERR_DOMAIN;
-    (void)col_len; (void)col_type;
-
-    FILE* f = fopen(path, "r+b");
-    if (!f) return RAY_ERR_IO;
-    /* Already-indexed guard: the marker is stamped into aux[0..3] LAST, so its
-     * presence means a complete prior append. */
-    uint32_t cur_mg = 0;
-    if (fread(&cur_mg, 1, 4, f) == 4 && cur_mg == COL_IDX_AUX_MAGIC) {
-        fclose(f); return RAY_ERR_CORRUPT;
-    }
-    /* Append at the actual payload end — generic across formats: numeric is
-     * [header][data]; STR is [header][descriptors][pool].  Don't recompute it
-     * from col_len*esz (that ignores the str_pool). */
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return RAY_ERR_IO; }
-    long fsz = ftell(f);
-    if (fsz < 32) { fclose(f); return RAY_ERR_CORRUPT; }
+    if (!f || !ix) return RAY_ERR_DOMAIN;
+    if (fseek(f, 0, SEEK_END) != 0) return RAY_ERR_IO;
+#ifdef RAY_OS_WINDOWS
+    int64_t fsz = (int64_t)_ftelli64(f);
+#else
+    int64_t fsz = (int64_t)ftello(f);
+#endif
+    if (fsz < 32) return RAY_ERR_CORRUPT;
     int64_t payload_end = fsz;
-
+    if (payload_end_out) *payload_end_out = payload_end;
     int64_t region_off = (payload_end + 31) & ~(int64_t)31;
     int64_t pad = region_off - payload_end;
     static const uint8_t zeros[32] = {0};
-    if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) { fclose(f); return RAY_ERR_IO; }
+    if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) return RAY_ERR_IO;
+    /* Streamed block by block from the index itself: no region-sized
+     * staging buffer to fault in and copy (4.5 GB for a 100 M-row hash). */
+    if (!ray_index_inline_write_file(f, ix)) return RAY_ERR_IO;
+    /* The region must be on the file before any marker claims it. */
+    return fflush(f) == 0 ? RAY_OK : RAY_ERR_IO;
+}
 
-    int64_t rsize = ray_index_inline_size(ix);
-    uint8_t* rbuf = (uint8_t*)ray_calloc_raw((size_t)(1) * ((size_t)rsize));
-    if (!rbuf) { fclose(f); return RAY_ERR_OOM; }
-    ray_index_inline_write(rbuf, ix);
-    size_t rw = fwrite(rbuf, 1, (size_t)rsize, f);
-    ray_free_raw(rbuf);
-    if (rw != (size_t)rsize) { fclose(f); return RAY_ERR_IO; }
-
-    /* Stamp the marker into aux[0..3] (file offset 0). */
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return RAY_ERR_IO; }
+void ray_col_stamp_index(ray_t* hdr) {
+    memset(hdr->aux, 0, 16);
     uint32_t mg = COL_IDX_AUX_MAGIC;
-    if (fwrite(&mg, 1, 4, f) != 4) { fclose(f); return RAY_ERR_IO; }
-    /* The index is a derived accelerator (rebuildable); flush is enough — no
-     * fsync needed, and the marker is written LAST so a torn append never
-     * leaves a half-region that looks indexed. */
-    if (fclose(f) != 0) return RAY_ERR_IO;
-    return RAY_OK;
+    memcpy(hdr->aux, &mg, 4);
+}
+
+ray_err_t ray_col_append_index(const char* path, const void* ix_v,
+                               int64_t col_len, int8_t col_type) {
+    if (!path || !ix_v) return RAY_ERR_DOMAIN;
+    (void)col_len; (void)col_type;
+    FILE* f = fopen(path, "r+b");
+    if (!f) return RAY_ERR_IO;
+    uint32_t cur_mg = 0;
+    if (fread(&cur_mg, 1, 4, f) == 4 && cur_mg == COL_IDX_AUX_MAGIC) { fclose(f); return RAY_ERR_CORRUPT; }
+    int64_t payload_end = 0;
+    ray_err_t err = ray_col_write_index_region(f, ix_v, &payload_end);
+    if (err == RAY_OK) {
+        if (fseek(f, 0, SEEK_SET) != 0) err = RAY_ERR_IO;
+        else {
+            uint32_t mg = COL_IDX_AUX_MAGIC;
+            if (fwrite(&mg, 1, 4, f) != 4) err = RAY_ERR_IO;
+        }
+    }
+    if (err == RAY_OK) return fclose(f) == 0 ? RAY_OK : RAY_ERR_IO;
+    /* Without the marker the loader requires the exact payload length, hence
+     * the rollback. Best effort: the marker was never written, so restoring the length is
+     * all it takes; a payload_end of 0 means the region never started. */
+    if (payload_end) (void)ray_col_truncate(f, payload_end);
+    fclose(f);
+    return err;
 }
 
 /* Does the payload hold the type's null sentinel anywhere?  Sequential
@@ -785,7 +819,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_str_list(vec, f);
-        fclose(f);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
     }
@@ -795,7 +829,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_list(vec, f);
-        fclose(f);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
     }
@@ -805,7 +839,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_table(vec, f);
-        fclose(f);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
     }
@@ -926,9 +960,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         /* Stamp the "index present" marker into the reserved aux (after all
          * other aux manipulation, which zeroes it for the common cases). */
         if (persist_index) {
-            memset(header.aux, 0, 16);
-            uint32_t mg = COL_IDX_AUX_MAGIC;
-            memcpy(header.aux, &mg, 4);
+            ray_col_stamp_index(&header);
         }
 
         size_t written = fwrite(&header, 1, 32, f);
@@ -1029,7 +1061,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             if (rw != (size_t)rsize) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
         }
 
-        fclose(f);
+        if (fclose(f) != 0) { remove(tmp_path); return RAY_ERR_IO; }
     }
 
 fsync_and_rename:;
@@ -1112,8 +1144,10 @@ ray_err_t ray_col_save_bulk(ray_t* vec, const char* path) {
  * process dictionary.  Header rc = domain count at save time (the O(1)
  * fast-reject the loader checks against the FILE domain's count).
  * Caller contract: every distinct symbol of the column was interned into
- * `target` and the domain was FLUSHED before this call (crash ordering:
- * sym → columns → .d) — an absent symbol here is RAY_ERR_CORRUPT.
+ * `target`. Live-table writes must FLUSH the domain before this call (crash
+ * ordering: sym → columns → .d). An import into a private staging directory
+ * may defer that flush until all workers join, but must persist the complete
+ * domain before publishing the root. An absent symbol is RAY_ERR_CORRUPT.
  * -------------------------------------------------------------------------- */
 
 ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,

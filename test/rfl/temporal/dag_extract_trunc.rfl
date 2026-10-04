@@ -243,3 +243,14 @@
 (at (at (select {y: ts.year from: TyMHn}) 'y) 1)  -- 0Np
 (at (at (select {m: ts.month from: TyMHn}) 'm) 1) -- 0Np
 (at (at (select {h: ts.hour from: TyMHn}) 'h) 1)  -- 0Np
+
+;; A date or timestamp literal reaches the compiled extract/truncate as an
+;; atom, whose len field aliases its value: (year 2020.01.01) became a vector
+;; of 7305 rows (the days since 2000.01.01), and an update with it turned a
+;; 4-row table into a 7305-row one.
+(set TyL (table [x] (list (til 4))))
+(at (update {y: (year 2020.01.01) from: TyL}) 'y) -- [2020 2020 2020 2020]
+(count (update {x: (if true (year 2020.01.01) x) from: TyL})) -- 4
+(at (update {x: (if true (year 2020.01.01) x) from: TyL}) 'x) -- [2020 2020 2020 2020]
+(at (select {m: (month 2020.03.15) y: x from: TyL}) 'm) -- [3 3 3 3]
+(at (select {d: (day 2020.03.15) y: x from: TyL}) 'd) -- [15 15 15 15]

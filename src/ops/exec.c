@@ -129,6 +129,36 @@ ray_t* materialize_mapcommon_head(ray_t* mc, int64_t n) {
     return flat;
 }
 
+/* Materialize the rows `idx[0..n)` (ascending) of a MAPCOMMON column. */
+ray_t* materialize_mapcommon_gather(ray_t* mc, const int64_t* idx, int64_t n) {
+    ray_t** mc_ptrs = (ray_t**)ray_data(mc);
+    ray_t* kv = mc_ptrs[0];
+    ray_t* rc = mc_ptrs[1];
+    int64_t n_parts = kv->len;
+    int8_t kv_type = kv->type;
+    size_t esz = (size_t)ray_sym_elem_size(kv_type, kv->attrs);
+    const char* kdata = (const char*)ray_data(kv);
+    const int64_t* counts = (const int64_t*)ray_data(rc);
+
+    ray_t* flat = ray_vec_new(kv_type, n);
+    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    flat->len = n;
+    /* raw SYM cell ids — adopt the keys carrier's domain (see above) */
+    if (kv_type == RAY_SYM) ray_sym_vec_adopt_domain(flat, kv);
+
+    char* out = (char*)ray_data(flat);
+    int64_t part_idx = 0;
+    int64_t part_end = n_parts > 0 ? counts[0] : 0;
+    for (int64_t i = 0; i < n; i++) {
+        while (part_idx < n_parts - 1 && idx[i] >= part_end) {
+            part_idx++;
+            part_end += counts[part_idx];
+        }
+        memcpy(out + (size_t)i * esz, kdata + (size_t)part_idx * esz, esz);
+    }
+    return flat;
+}
+
 /* Materialize MAPCOMMON through a boolean filter predicate. */
 ray_t* materialize_mapcommon_filter(ray_t* mc, ray_t* pred, int64_t pass_count) {
     ray_t** mc_ptrs = (ray_t**)ray_data(mc);
@@ -1595,6 +1625,52 @@ static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op,
     return 1;
 }
 
+/* True when a GROUP node groups by at least one key. */
+static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
+    ray_op_ext_t* gx = find_ext(g, group_op->id);
+    return gx && gx->n_keys > 0;
+}
+
+/* True when every leaf of the op tree under `id` is a constant or, with
+ * `reduced`, sits under a reduction. */
+static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth) {
+    if (id >= g->node_count || depth > 64) return false;
+    ray_op_t* n = &g->nodes[id];
+    switch (n->opcode) {
+    case OP_CONST: return true;
+    case OP_SCAN:  return false;
+    case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
+    case OP_MIN: case OP_MAX:
+    case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
+    case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP:
+        if (reduced) return true;
+        break;
+    default: break;
+    }
+    if (n->arity == 0) return false;
+    for (uint32_t i = 0; i < n->arity && i < 2; i++)
+        if (!op_tree_leaves(g, n->in_id[i], reduced, depth + 1)) return false;
+    if (n->opcode == OP_IF) {           /* the else branch rides in the ext */
+        ray_op_ext_t* x = find_ext(g, id);
+        if (!x || !op_tree_leaves(g, x->third_in, reduced, depth + 1)) return false;
+    }
+    return true;
+}
+
+/* True when the op tree under `id` carries none of the input's rows: every
+ * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
+ * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
+ * cannot on a one-row table (#675). */
+static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, 0);
+}
+
+/* True when the op tree under `id` reads no column at all, not even under a
+ * reduction: a literal, or an expression over literals. */
+static bool op_tree_is_const(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, false, 0);
+}
+
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
  * (GROUP predicate pushdown, opt.c Task-3).
  *
@@ -2381,6 +2457,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(group_result);
                     return pred;
                 }
+                if (group_result->type == RAY_TABLE) {
+                    pred = ray_where_mask_coerce(pred, ray_table_nrows(group_result), "where");
+                    if (!pred || RAY_IS_ERR(pred)) {
+                        ray_release(group_result);
+                        return pred ? pred : ray_error("oom", NULL);
+                    }
+                }
 
                 ray_t* result = exec_filter(g, op, group_result, pred);
                 ray_release(pred);
@@ -2792,6 +2875,27 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* pred = exec_node(g, op_child(g, op, 1));
             if (!pred || RAY_IS_ERR(pred)) { ray_release(input); return pred; }
 
+            /* Over a table every predicate value goes through the one
+             * where: rule (ray_where_mask_coerce): a scalar (`(== (count x)
+             * 5)`, a scalar conjunct of an `and`) or a one-element BOOL is
+             * spread over the rows; any other vector is a type error.
+             * Before this, an I64 column fell through to the eager
+             * exec_filter, which read it as one byte per row (#678). */
+            if (input->type == RAY_TABLE &&
+                !(pred->type == RAY_BOOL && pred->len == ray_table_nrows(input))) {
+                int64_t tn = ray_table_nrows(input);
+                if (ray_is_atom(pred) && ray_pred_atom_type_ok(pred->type) &&
+                    is_truthy(pred)) {
+                    ray_release(pred);  /* every row passes: selection unchanged */
+                    return input;
+                }
+                pred = ray_where_mask_coerce(pred, tn, "where");
+                if (!pred || RAY_IS_ERR(pred)) {
+                    ray_release(input);
+                    return pred ? pred : ray_error("oom", NULL);
+                }
+            }
+
             /* Lazy filter: convert predicate to a rowsel (morsel-local
              * index list) and install on g->selection instead of
              * materializing a compacted table.  Only for TABLE inputs —
@@ -2944,7 +3048,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                  * materializing that expression over ALL rows — so the
                  * scattered gate matches the projection-side compaction
                  * factor (4x), not the plain-gather tradeoff (16x). */
-                if (gx && meta && nrows > 0 &&
+                /* A keyless group (an all-aggregate select) is one row and
+                 * its aggregates read the selection themselves; compacted,
+                 * a no-match where: handed exec_group an empty table and it
+                 * came back with no row (#679, the HEAD arm likewise). */
+                if (gx && gx->n_keys > 0 && meta && nrows > 0 &&
                     meta->total_pass * (contig ? 2 : 4) <= nrows) {
                     int64_t keep[32];
                     bool has_expr = false;
@@ -3119,7 +3227,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (res && RAY_IS_ERR(res)) return res;
                     if (res) { owned_tbl = res; tbl = res; }
                     /* NULL → lazy path; g->selection installed, tbl unchanged */
-                } else if (g->selection && tbl->type == RAY_TABLE) {
+                } else if (g->selection && tbl->type == RAY_TABLE &&
+                           group_has_keys(g, child_op)) {
+                    /* A keyless group (an all-aggregate select) is one row
+                     * whatever the limit, and its aggregates read the
+                     * selection themselves: compacting a no-match where:
+                     * handed exec_group an empty table, which has no rows to
+                     * reduce and came back with no row at all (#679). */
                     int needs = 0;
                     int64_t nc = ray_table_ncols(tbl);
                     for (int64_t c = 0; c < nc; c++) {
@@ -3574,10 +3688,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_release(input);
                         return vec ? vec : ray_error("nyi", NULL);
                     }
-                    /* Broadcast scalar atoms to full column vectors */
+                    /* A scalar atom becomes a one-element column, widened
+                     * below only if another column carries the input's
+                     * rows.  Broadcast here, it posed as such a column and
+                     * widened the scalars beside it (#698). */
                     if (vec->type < 0) {
-                        int64_t nr = ray_table_nrows(input);
-                        ray_t* col = broadcast_scalar(vec, nr);
+                        ray_t* col = ray_enlist_fn(&vec, 1);
                         ray_release(vec);
                         vec = col;
                         if (!vec || RAY_IS_ERR(vec)) {
@@ -3597,6 +3713,66 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     int64_t name_id = ray_sym_intern(name_buf, (size_t)n);
                     result = ray_table_add_col(result, name_id, vec);
                     ray_release(vec);
+                }
+            }
+
+            /* A scalar column, an atom enlisted above or one computed as a
+             * one-element vector (`(+ (sum x) 0)`, an `if` whose parts are
+             * all scalar), is broadcast when another column has the input's
+             * rows.  Left alone, the table took its row count from whichever
+             * column came first and its columns disagreed in length.  When
+             * every column is a scalar the one-row result stays. */
+            int64_t nr_in = ray_table_nrows(input);
+            if (result && !RAY_IS_ERR(result)) {
+                int64_t rc = ray_table_ncols(result);
+                bool has_full = false;
+                if (nr_in != 1) {
+                    for (int64_t c = 0; c < rc; c++) {
+                        ray_t* cv = ray_table_get_col_idx(result, c);
+                        /* a parted column counts its rows across segments */
+                        if (cv && cv->type > 0 && ray_parted_nrows(cv) == nr_in) { has_full = true; break; }
+                    }
+                } else {
+                    /* On a one-row input a scalar and a row column have the
+                     * same length: read the ops instead, so a scalar-only
+                     * select under a failing where: is still one row. */
+                    for (uint32_t c = 0; c < n_cols && !has_full; c++)
+                        if (!op_tree_is_scalar(g, columns[c])) has_full = true;
+                }
+                /* A select of literals alone (`{s: 1}`) reduces nothing and
+                 * keeps the input's rows.  Beside an aggregate a literal is
+                 * one more scalar, as in a keyless group. */
+                if (!has_full) {
+                    bool all_const = true;
+                    for (uint32_t c = 0; c < n_cols && all_const; c++)
+                        if (!op_tree_is_const(g, columns[c])) all_const = false;
+                    has_full = all_const;
+                }
+                /* Every column a scalar: the reductions inside them already
+                 * walked the where: selection (exec_reduction), so the
+                 * one-row result is final.  Left installed, the selection
+                 * (built for the input's rows) met the one-row result in
+                 * ray_execute_inner's final gather (#675). */
+                if (!has_full && g->selection) {
+                    ray_release(g->selection);
+                    g->selection = NULL;
+                }
+                /* A LIST here is an atom enlist has no vector for (F32). */
+                for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
+                    ray_t* cv = ray_table_get_col_idx(result, c);
+                    if (!cv || cv->type < 0 || RAY_IS_PARTED(cv->type) ||
+                        cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
+                    ray_t* n_obj = make_i64(nr_in);
+                    ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
+                    if (n_obj) ray_release(n_obj);
+                    if (!wide || RAY_IS_ERR(wide)) {
+                        ray_release(result);
+                        g->table = saved_table;
+                        ray_release(input);
+                        return wide ? wide : ray_error("oom", NULL);
+                    }
+                    ray_table_set_col_idx(result, c, wide);
+                    ray_release(wide);
                 }
             }
 
@@ -4060,7 +4236,13 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * would reset the elapsed clock and fire premature "final" ticks. */
     ray_t* scan_err = validate_scan_columns(g);
     if (scan_err) return scan_err;
-    return ray_execute_inner(g, root);
+    /* Never NULL: callers test RAY_IS_ERR, which is false for NULL, and then
+     * dereference.  The inner paths hand NULL back unchanged when a node,
+     * a compaction or a merge fails to allocate (the flat path's
+     * `return result`, the streaming path's seg_tbl / partial / merged
+     * returns); `(times <lazy> ...)` would then crash in loop_count. */
+    ray_t* result = ray_execute_inner(g, root);
+    return result ? result : ray_error("oom", NULL);
 }
 
 /* Flatten one parted/mapcommon column into a dense vector (mirrors the

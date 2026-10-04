@@ -27,9 +27,14 @@
 #include "mem/heap.h"
 #include "core/qstats.h"
 #include "io/csv.h"
+#include "store/splay.h"
 #include "table/sym.h"
+#include "ops/idxop.h"
+#include "core/runtime.h"
 #include <stdio.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 static char tmp_csv_path[64];
 static const char* tmp_csv(void) {
@@ -1859,7 +1864,342 @@ static test_result_t test_csv_sym_id_order(void) {
     PASS();
 }
 
+static test_result_t test_csv_native_pooled_batches(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    FILE* fp = fopen(TMP_CSV,"wb"); TEST_ASSERT_NOT_NULL(fp);
+    fprintf(fp,"id,text\n1,first long pooled string\n2,second long pooled string\n3,\n4,fourth long pooled string\n5,last long pooled string\n"); fclose(fp);
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-stream-%d",(int)getpid());
+    const int8_t types[] = {RAY_I32,RAY_STR};
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,2),RAY_OK);
+    ray_t* table = ray_read_splayed(dir,NULL); TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+    TEST_ASSERT_EQ_I(ray_table_nrows(table),5);
+    const char* expected[] = {"first long pooled string","second long pooled string","","fourth long pooled string","last long pooled string"};
+    for (int i = 0; i < 5; i++) {
+        size_t len; const char* text = ray_str_vec_get(ray_table_get_col_idx(table,1),i,&len);
+        TEST_ASSERT_EQ_I(len,strlen(expected[i])); TEST_ASSERT_TRUE(!memcmp(text,expected[i],len));
+        TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(table,0)))[i],i+1);
+    }
+    ray_release(table);
+    const char* files[] = {"id","text",".d"}; char path[160];
+    for (int i = 0; i < 3; i++) { snprintf(path,sizeof(path),"%s/%s",dir,files[i]); unlink(path); }
+    rmdir(dir); unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Recursive remove for the import tests' output trees. */
+static void csv_test_rm_rf(const char* path) {
+    DIR* d = opendir(path);
+    if (d) {
+        struct dirent* ent;
+        char sub[1024];
+        while ((ent = readdir(d)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+            snprintf(sub, sizeof(sub), "%s/%s", path, ent->d_name);
+            csv_test_rm_rf(sub);
+        }
+        closedir(d);
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+/* The streaming importers must infer the same column types as .csv.read.
+ * SYM vs STR is decided from a sample's cardinality, so it depends on
+ * which rows are sampled: here the first 4096 notes are all distinct
+ * (a leading-rows sample says STR) while the file as a whole has ~4100
+ * distinct notes over 200k rows (.csv.read's file-wide sample says SYM). */
+static test_result_t test_csv_streaming_infers_like_read(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    FILE* f = fopen(TMP_CSV, "wb"); TEST_ASSERT_NOT_NULL(f);
+    fputs("id,note\n", f);
+    for (int i = 0; i < 200000; i++) {
+        if (i < 4096) fprintf(f, "%d,unique note %d\n", i, i);
+        else          fprintf(f, "%d,repeat %d\n", i, i % 10);
+    }
+    fclose(f);
+
+    ray_t* mem = ray_read_csv_named_opts(TMP_CSV, ',', true, NULL, 0, NULL, 0);
+    TEST_ASSERT_TRUE(mem && !RAY_IS_ERR(mem));
+    int8_t want = ray_table_get_col_idx(mem, 1)->type;
+    ray_release(mem);
+    TEST_ASSERT_EQ_I(want, RAY_SYM);
+
+    char dir[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-csv-infer-%d", (int)getpid());
+    csv_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV, ',', true, NULL, 0,
+                                                     NULL, 0, dir, 0), RAY_OK);
+    char sym[160];
+    snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    ray_t* t = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, 1)->type, want);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+
+    char leaf[192];
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV, ',', true, NULL, 0,
+                                                    NULL, 0, dir, "t", 150000), RAY_OK);
+    snprintf(leaf, sizeof(leaf), "%s/1/t", dir);
+    t = ray_read_splayed(leaf, sym);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, 1)->type, want);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_csv_parted_zones(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char root[128],leaf[160],path[200];
+    snprintf(root,sizeof(root),"/tmp/rayforce-csv-zones-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("x,y,s\n",f);
+    for(int i=0;i<65539;i++) fprintf(f,"%d,%d,value-%d\n",i,65538-i,i%257);
+    fclose(f);
+    int8_t types[]={RAY_I32,RAY_I64,RAY_SYM};
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,3,NULL,0,root,"hits",65536),RAY_OK);
+    for(int p=0;p<2;p++) {
+        snprintf(leaf,sizeof(leaf),"%s/%d/hits",root,p);
+        snprintf(path,sizeof(path),"%s/.sym",root);
+        ray_t* t=ray_read_splayed(leaf,path); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_nrows(t),p ? 3 : 65536);
+        for(int c=0;c<2;c++) {
+            ray_t* v=ray_table_get_col_idx(t,c);
+            TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_INDEX);
+            const ray_index_t* ix=ray_index_payload(v->index); TEST_ASSERT_TRUE(ix != NULL);
+            TEST_ASSERT_EQ_I(ix->kind,p ? RAY_IDX_ZONE : RAY_IDX_CHUNK_ZONE);
+            int64_t lo=c ? (p ? 0 : 3) : (p ? 65536 : 0);
+            int64_t hi=c ? (p ? 2 : 65538) : (p ? 65538 : 65535);
+            TEST_ASSERT_EQ_I(p ? ix->u.zone.min_i : ((int64_t*)ray_data(ix->u.chunk_zone.mins))[0],lo);
+            TEST_ASSERT_EQ_I(p ? ix->u.zone.max_i : ((int64_t*)ray_data(ix->u.chunk_zone.maxs))[0],hi);
+        }
+        ray_t* x=ray_table_get_col_idx(t,0);
+        TEST_ASSERT_EQ_I(((int32_t*)ray_data(x))[0],p ? 65536 : 0);
+        TEST_ASSERT_EQ_I(((int32_t*)ray_data(x))[x->len-1],p ? 65538 : 65535);
+        ray_t* s=ray_table_get_col_idx(t,2);
+        for(int64_t i=0;i<s->len;i++) {
+            char expected[32]; snprintf(expected,sizeof(expected),"value-%lld",(long long)((i+p*65536)%257));
+            ray_t* cell=ray_sym_vec_cell(s,i);
+            TEST_ASSERT_TRUE(cell != NULL);
+            TEST_ASSERT_TRUE(!strcmp(ray_str_ptr(cell),expected));
+        }
+        ray_release(t);
+        const char* names[]={"x","y","s",".d"};
+        for(int c=0;c<4;c++) { snprintf(path,sizeof(path),"%s/%s",leaf,names[c]); unlink(path); }
+        rmdir(leaf); snprintf(path,sizeof(path),"%s/%d",root,p); rmdir(path);
+    }
+    snprintf(path,sizeof(path),"%s/.sym",root); unlink(path); rmdir(root); unlink(TMP_CSV);
+    ray_sym_destroy(); ray_heap_destroy(); PASS();
+}
+
+static test_result_t test_csv_parted_staging(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char root[160],partial[200],path[240];
+    snprintf(root,sizeof(root),"/tmp/rayforce-csv-staging-%d",(int)getpid());
+    snprintf(partial,sizeof(partial),"%s.csv-partial",root);
+    FILE* f = fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("s\nfirst\nsecond\nthird\n",f); fclose(f);
+    int8_t invalid[] = {RAY_TABLE}, types[] = {RAY_SYM};
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,1,NULL,0,root,"../escape",2),RAY_ERR_DOMAIN);
+    TEST_ASSERT_TRUE(access(partial,F_OK) != 0);
+    /* A failure before the first partition leaves no staging behind. */
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,invalid,1,NULL,0,root,"hits",2),RAY_ERR_TYPE);
+    TEST_ASSERT_TRUE(access(root,F_OK) != 0);
+    TEST_ASSERT_TRUE(access(partial,F_OK) != 0);
+    /* Retained staging (an import that failed mid-write) blocks the root. */
+    TEST_ASSERT_EQ_I(mkdir(partial,0755),0);
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,1,NULL,0,root,"hits",2),RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(rmdir(partial),0);
+    /* A trailing slash still stages beside the requested destination. */
+    snprintf(path,sizeof(path),"%s/",root);
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,1,NULL,0,path,"hits",2),RAY_OK);
+    TEST_ASSERT_TRUE(access(partial,F_OK) != 0);
+    /* Existing-root saves must persist new symbols before replacing columns. */
+    f = fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("s\nlater-a\nlater-b\nlater-c\n",f); fclose(f);
+    TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV,',',true,types,1,NULL,0,root,"hits",2),RAY_OK);
+    for (int p = 0; p < 2; p++) {
+        char sym[200],leaf[200];
+        snprintf(sym,sizeof(sym),"%s/.sym",root); snprintf(leaf,sizeof(leaf),"%s/%d/hits",root,p);
+        ray_t* t = ray_read_splayed(leaf,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        ray_t* col = ray_table_get_col_idx(t,0);
+        for (int64_t i = 0; i < col->len; i++) {
+            char expected[] = "later-a"; expected[6] += (char)(p*2+i);
+            TEST_ASSERT_TRUE(!strcmp(ray_str_ptr(ray_sym_vec_cell(col,i)),expected));
+        }
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(ray_test_rm_rf(root),0);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy(); PASS();
+}
+
+/* 300000 rows streamed in chunks of 100000 (not a multiple of 65536): the
+ * clustered column carries a 5-chunk zone, the unclustered one a hash (the
+ * upgrade needs at least four chunks), the STR column a dict, and the
+ * nullable column a zone whose null bits come from the parse chunks. */
+static bool csv_vec_bytes_eq(ray_t* a, ray_t* b, size_t esz) {
+    return a && b && a->len == b->len && !memcmp(ray_data(a), ray_data(b), (size_t)a->len * esz);
+}
+static test_result_t test_csv_splayed_inline_indexes(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-inline-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("a,b,s,n\n",f);
+    for(long long i=0;i<300000;i++) {
+        if (i%13==0) fprintf(f,"%lld,%lld,v%lld,\n",i,(i*7919)%1000003,i%500);
+        else fprintf(f,"%lld,%lld,v%lld,%lld\n",i,(i*7919)%1000003,i%500,i);
+    }
+    fclose(f);
+    int8_t types[]={RAY_I64,RAY_I64,RAY_STR,RAY_I64};
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,4,NULL,0,dir,100000),RAY_OK);
+    ray_t* t=ray_read_splayed(dir,NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t),300000);
+    ray_t* a=ray_table_get_col_idx(t,0);
+    TEST_ASSERT_EQ_I(ray_index_kind(a),RAY_IDX_CHUNK_ZONE);
+    const ray_index_t* ix=ray_index_payload(a->index);
+    TEST_ASSERT_EQ_I(ix->u.chunk_zone.n_chunks,5);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[1],65536);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.maxs))[4],299999);
+    TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,1)),RAY_IDX_HASH);
+    ray_t* s=ray_table_get_col_idx(t,2);
+    TEST_ASSERT_EQ_I(ray_index_kind(s),RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(ray_index_payload(s->index)->u.dict.n_distinct,500);
+    /* nullable column: zone equals a from-scratch compute over the loaded data */
+    ray_t* nc=ray_table_get_col_idx(t,3);
+    TEST_ASSERT_EQ_I(ray_index_kind(nc),RAY_IDX_CHUNK_ZONE);
+    const ray_index_t* nz=ray_index_payload(nc->index);
+    TEST_ASSERT_TRUE(((uint8_t*)ray_data(nz->u.chunk_zone.null_bits))[0] & 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(nz->u.chunk_zone.mins))[0],1);
+    ray_t* plain=ray_vec_from_raw(RAY_I64,ray_data(nc),nc->len);
+    TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+    ray_t* ref=ray_index_chunk_zone_compute(plain,16);
+    TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+    const ray_index_t* rz=ray_index_payload(ref);
+    TEST_ASSERT_EQ_I(nz->u.chunk_zone.n_chunks,rz->u.chunk_zone.n_chunks);
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.mins,rz->u.chunk_zone.mins,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.maxs,rz->u.chunk_zone.maxs,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.null_bits,rz->u.chunk_zone.null_bits,1));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.aggs,rz->u.chunk_zone.aggs,8));
+    ray_release(ref); ray_release(plain);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Four unclustered I64 columns (hash candidates) and one clustered column,
+ * converted twice: with the runtime RAM limit as is, and with it lowered so
+ * every hash wave holds one column (built on the calling thread, outside any
+ * dispatch).  Both conversions must publish identical column files. */
+static bool csv_files_equal(const char* a, const char* b) {
+    FILE* fa = fopen(a, "rb"); FILE* fb = fopen(b, "rb");
+    bool ok = fa && fb;
+    while (ok) {
+        char x[65536], y[65536];
+        size_t nx = fread(x, 1, sizeof(x), fa), ny = fread(y, 1, sizeof(y), fb);
+        if (nx != ny || memcmp(x, y, nx)) ok = false;
+        if (nx == 0) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return ok;
+}
+static test_result_t test_csv_splayed_hash_waves(void) {
+    /* a runtime supplies the RAM limit the wave width is derived from */
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    char dirs[2][128];
+    snprintf(dirs[0],sizeof(dirs[0]),"/tmp/rayforce-csv-wave0-%d",(int)getpid());
+    snprintf(dirs[1],sizeof(dirs[1]),"/tmp/rayforce-csv-wave1-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("a,b,c,d,k\n",f);
+    for(long long i=0;i<300000;i++)
+        fprintf(f,"%lld,%lld,%lld,%lld,%lld\n",(i*7919)%1000003,(i*7919+104729)%1000003,
+                (i*7919+2*104729)%1000003,(i*7919+3*104729)%1000003,i);
+    fclose(f);
+    int8_t types[]={RAY_I64,RAY_I64,RAY_I64,RAY_I64,RAY_I64};
+    int64_t saved = __RUNTIME->ram_limit;
+    for (int run=0; run<2; run++) {
+        /* 4 * 58 B * 300000 rows: one column per wave */
+        if (run) __RUNTIME->ram_limit = 4LL*58*300000;
+        ray_err_t e=ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,5,NULL,0,dirs[run],100000);
+        __RUNTIME->ram_limit = saved;
+        TEST_ASSERT_EQ_I(e,RAY_OK);
+        ray_t* t=ray_read_splayed(dirs[run],NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        for (int c=0;c<4;c++) TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,c)),RAY_IDX_HASH);
+        TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,4)),RAY_IDX_CHUNK_ZONE);
+        ray_release(t);
+    }
+    const char* names[]={"a","b","c","d","k"};
+    for (int c=0;c<5;c++) {
+        char p0[200], p1[200];
+        snprintf(p0,sizeof(p0),"%s/%s",dirs[0],names[c]);
+        snprintf(p1,sizeof(p1),"%s/%s",dirs[1],names[c]);
+        TEST_ASSERT_TRUE(csv_files_equal(p0,p1));
+    }
+    csv_test_rm_rf(dirs[0]); csv_test_rm_rf(dirs[1]);
+    unlink(TMP_CSV); ray_runtime_destroy(rt);
+    PASS();
+}
+
+/* A literal INT64_MIN in a parse chunk without empty cells is a number to the
+ * parser (no HAS_NULLS on that slice) but a null once the column header ORs
+ * the slice flags; the streamed zone must follow the loaded column (#495). */
+static test_result_t test_csv_splayed_sentinel_literal(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-sent-%d",(int)getpid());
+    FILE* f=fopen(TMP_CSV,"w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("lit2\n",f);
+    for(long long i=0;i<300000;i++) {
+        if (i==7) fputs("-9223372036854775808\n",f);
+        else if (i>=200000 && i%50==0) fputs("\n",f);
+        else fprintf(f,"%lld\n",i/1000);
+    }
+    fclose(f);
+    int8_t types[]={RAY_I64};
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000),RAY_OK);
+    ray_t* t=ray_read_splayed(dir,NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* c=ray_table_get_col_idx(t,0);
+    TEST_ASSERT_EQ_I(c->len,300000);
+    TEST_ASSERT_TRUE(c->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(ray_index_kind(c),RAY_IDX_CHUNK_ZONE);
+    ray_t* plain=ray_vec_from_raw(RAY_I64,ray_data(c),c->len);
+    TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+    plain->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* ref=ray_index_chunk_zone_compute(plain,16);
+    TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+    const ray_index_t* nz=ray_index_payload(c->index);
+    const ray_index_t* rz=ray_index_payload(ref);
+    TEST_ASSERT_EQ_I(nz->u.chunk_zone.n_chunks,rz->u.chunk_zone.n_chunks);
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.mins,rz->u.chunk_zone.mins,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.maxs,rz->u.chunk_zone.maxs,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.null_bits,rz->u.chunk_zone.null_bits,1));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(nz->u.chunk_zone.aggs,rz->u.chunk_zone.aggs,8));
+    int64_t zs=0, znn=0, ws=0, wnn=0;
+    TEST_ASSERT_TRUE(ray_zone_int_sum(c,&zs,&znn));
+    const int64_t* d=(const int64_t*)ray_data(c);
+    for (int64_t i=0;i<c->len;i++) { if (ray_vec_is_null(c,i)) continue; ws+=d[i]; wnn++; }
+    TEST_ASSERT_EQ_I(zs,ws);
+    TEST_ASSERT_EQ_I(znn,wnn);
+    TEST_ASSERT_EQ_I(wnn,300000-1-(100000/50));
+    ray_release(ref); ray_release(plain);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
+    { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
+    { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
+    { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
+    { "csv/splayed_inline_indexes", test_csv_splayed_inline_indexes, NULL, NULL },
+    { "csv/splayed_hash_waves", test_csv_splayed_hash_waves, NULL, NULL },
+    { "csv/native_pooled_batches", test_csv_native_pooled_batches, NULL, NULL },
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
     { "csv/roundtrip_f64", test_csv_roundtrip_f64, NULL, NULL },
@@ -1915,5 +2255,6 @@ const test_entry_t csv_entries[] = {
     { "csv/progress_monotonic",   test_csv_progress_never_goes_backwards,   NULL, NULL },
     { "csv/scan_boundary_matrix", test_csv_scan_boundary_matrix,            NULL, NULL },
     { "csv/sym_id_order",         test_csv_sym_id_order,                    NULL, NULL },
+    { "csv/streaming_infers_like_read", test_csv_streaming_infers_like_read, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

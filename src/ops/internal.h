@@ -992,6 +992,9 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
 /* ── filter.c ── */
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred);
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit);
+/* The one `where:` rule (see filter.c): consumes `pred`, returns an owned
+ * BOOL mask of `tn` rows or an error.  `label` prefixes the error. */
+ray_t* ray_where_mask_coerce(ray_t* pred, int64_t tn, const char* label);
 /* Typed membership kernel (verdict-LUT / SIMD / pool-parallel); NULL when
  * the col/set shape is unsupported — caller falls back to its own path. */
 ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate);
@@ -1657,6 +1660,7 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op);
 ray_t* materialize_mapcommon(ray_t* mc);
 ray_t* materialize_mapcommon_head(ray_t* mc, int64_t n);
 ray_t* materialize_mapcommon_filter(ray_t* mc, ray_t* pred, int64_t pass_count);
+ray_t* materialize_mapcommon_gather(ray_t* mc, const int64_t* idx, int64_t n);
 ray_t* broadcast_scalar(ray_t* atom, int64_t nrows);
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op);
 
@@ -1805,5 +1809,19 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
 
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
+
+
+/* A scalar `where:` predicate holds for every row or none.  It needs a truth
+ * value: booleans, numbers and temporals have one (zero and null are false);
+ * a symbol or a string does not. */
+static inline bool ray_pred_atom_type_ok(int8_t t) {
+    switch (t) {
+    case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
 
 #endif /* RAY_EXEC_INTERNAL_H */

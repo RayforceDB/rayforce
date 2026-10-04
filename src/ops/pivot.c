@@ -22,12 +22,14 @@
  */
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include "ops/internal.h"
 #include "ops/hash.h"
 #include "ops/idxop.h"
 #include "ops/rowsel.h"
 #include "table/domain.h"   /* raw vocabulary snapshot for if_sym_side_t */
 #include "core/pool.h"
+#include "lang/format.h"    /* ray_type_name (error context) */
 
 /* Resolved string atom (borrowed) of a SYM-scalar broadcast input
  * (atom -RAY_SYM, or a 1-elem RAY_SYM_W{8,16,32,64} vec used as
@@ -896,7 +898,7 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
          * it to an unwritten result buffer). */
         case RAY_F64: case RAY_I64: case RAY_I32: case RAY_I16:
         case RAY_U8: case RAY_BOOL:
-        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE:
+        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE: case RAY_GUID:
             return true;
         default: return false;
     }
@@ -940,6 +942,10 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
      * few rows.  Touching only the selected rows costs less and holds only
      * their bytes.  Same threshold as the projection's pre-compaction. */
     bool sparse_sel = outer_sel && selected * 4 <= nrows;
+    /* The SYM text build below writes a fresh pool for every row of the
+     * table, which the filtered result then keeps: only worth it when the
+     * selection keeps nearly every row. */
+    bool near_full_sel = !outer_sel || selected * 10 >= nrows * 9;
 
     bool eager_possible = (op->out_type != RAY_STR &&
                            if_branch_trivial(g, then_op) &&
@@ -950,7 +956,17 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
                            * the eager arm picks descriptors over one pass */
                           (op->out_type == RAY_STR && !sparse_sel &&
                            then_op->out_type == RAY_STR && else_op->out_type == RAY_STR &&
-                           if_branch_cheap(g, then_op, 0) && if_branch_cheap(g, else_op, 0));
+                           if_branch_cheap(g, then_op, 0) && if_branch_cheap(g, else_op, 0)) ||
+                          /* a SYM column or literal against a SYM or STR
+                           * one, over enough rows to split: the eager arm
+                           * resolves each row's text on the pool
+                           * (if_str_text_build).  Below that the selected
+                           * arm's per-row scatter costs less. */
+                          (op->out_type == RAY_STR && near_full_sel && nrows >= RAY_PARALLEL_THRESHOLD &&
+                           (then_op->out_type == RAY_SYM || else_op->out_type == RAY_SYM) &&
+                           (then_op->out_type == RAY_SYM || then_op->out_type == RAY_STR) &&
+                           (else_op->out_type == RAY_SYM || else_op->out_type == RAY_STR) &&
+                           if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op));
     {
         ray_pool_t* rp = ray_pool_get();
         if (rp && rp->n_workers > 0 && eager_possible)
@@ -1129,6 +1145,21 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
+    case RAY_GUID: {
+        /* 16-byte cells: copy the chosen side's cell.  A GUID atom keeps
+         * its bytes in obj; a one-element vector is row 0. */
+        uint8_t* dst = (uint8_t*)c->dst;
+        const uint8_t* tb = ray_is_atom(c->then_v) ? (const uint8_t*)ray_data(c->then_v->obj)
+                                                   : (const uint8_t*)ray_data(c->then_v);
+        const uint8_t* eb = ray_is_atom(c->else_v) ? (const uint8_t*)ray_data(c->else_v->obj)
+                                                   : (const uint8_t*)ray_data(c->else_v);
+        for (int64_t i = i0; i < i1; i++) {
+            const uint8_t* src = cond_p[i]
+                ? tb + (c->then_scalar ? 0 : i) * 16
+                : eb + (c->else_scalar ? 0 : i) * 16;
+            memcpy(dst + i * 16, src, 16);
+        }
+        break; }
     default: break;
     }
 }
@@ -1168,9 +1199,272 @@ static void if_str_desc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_
     }
 }
 
-static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
+/* Truthiness of one cell of an `if` condition vector, the rule is_truthy
+ * applies to an atom: null and zero are false, anything else is true. */
+static uint8_t if_cond_cell(ray_t* c, int64_t i) {
+    const void* d = ray_data(c);
+    switch (c->type) {
+    case RAY_BOOL: case RAY_U8:
+        return ((const uint8_t*)d)[i] != 0;
+    default: break;
+    }
+    if (ray_vec_is_null(c, i)) return 0;
+    switch (c->type) {
+    case RAY_I16:   return ((const int16_t*)d)[i] != 0;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+                    return ((const int32_t*)d)[i] != 0;
+    case RAY_I64: case RAY_TIMESTAMP:
+                    return ((const int64_t*)d)[i] != 0;
+    case RAY_F32: { float f = ((const float*)d)[i]; return f != 0.0f && f == f; }
+    case RAY_F64: { double f = ((const double*)d)[i]; return f != 0.0 && f == f; }
+    default:        return 0;   /* refused by if_cond_type_ok first */
+    }
+}
+
+/* Truthiness of an atom condition: is_truthy's rule (lang/internal.h, which
+ * this file cannot include), kept in step with it. */
+static uint8_t if_cond_atom(ray_t* x) {
+    if (RAY_ATOM_IS_NULL(x)) return 0;
+    switch (x->type) {
+    case -RAY_BOOL: return x->b8 != 0;
+    case -RAY_U8:   return x->u8 != 0;
+    case -RAY_I16:  return x->i16 != 0;
+    case -RAY_I32:  return x->i32 != 0;
+    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        return x->i64 != 0;
+    case -RAY_F32: case -RAY_F64:
+        return x->f64 != 0.0 && x->f64 == x->f64;
+    default:
+        return 1;
+    }
+}
+
+/* A condition vector needs a truth value per cell: booleans, numbers and
+ * temporals have one.  Text, GUID and boxed lists do not. */
+static bool if_cond_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* STR output with a SYM side (the other a SYM or STR vector, or a
+ * broadcast scalar): each row takes its chosen side's text into a fresh
+ * descriptor; texts past the inline width go to one pool laid out in row
+ * order.  A SYM cell is read through a snapshot taken here, serially,
+ * before any worker runs — the runtime table's string array
+ * (ray_sym_strings_borrow) or a FILE domain's raw vocabulary
+ * (ray_sym_domain_raw_pin) — so nothing is interned or materialised and
+ * both passes run on the pool.  A cell neither snapshot can read (a
+ * FILE-domain position appended after the file was mapped, an id past the
+ * table) makes the build decline; the caller then appends serially. */
+enum { IF_TXT_SCALAR = 1, IF_TXT_STR, IF_TXT_SYM_RT, IF_TXT_SYM_FILE };
+
+typedef struct {
+    uint8_t                  kind;
+    const char*              sp;          /* scalar text */
+    uint32_t                 sl;
+    const ray_str_t*         desc;        /* STR vector */
+    const char*              bytes;
+    const void*              sym;         /* SYM vector cells */
+    int8_t                   sym_type;
+    uint8_t                  sym_attrs;
+    ray_t**                  rt_strings;  /* runtime-domain snapshot */
+    uint32_t                 rt_count;
+    struct ray_sym_domain_s* dom;         /* FILE domain, pinned */
+    ray_sym_domain_raw_t     raw;
+} if_txt_side_t;
+
+static bool if_txt_side_init(if_txt_side_t* s, ray_t* v, bool scalar, int64_t len) {
+    memset(s, 0, sizeof(*s));
+    if (scalar) {
+        const char* sp = "";
+        size_t sl = 0;
+        if (v->type == -RAY_STR) {
+            sp = ray_str_ptr(v); sl = ray_str_len(v);
+        } else if (v->type == RAY_STR) {
+            sp = ray_str_vec_get(v, 0, &sl);
+            if (!sp) { sp = ""; sl = 0; }
+        } else if (v->type == -RAY_SYM || RAY_IS_SYM(v->type)) {
+            ray_t* a = sym_scalar_str(v);
+            sp = a ? ray_str_ptr(a) : "";
+            sl = a ? ray_str_len(a) : 0;
+        } else {
+            return false;
+        }
+        if (sl > UINT32_MAX) return false;
+        s->kind = IF_TXT_SCALAR; s->sp = sp; s->sl = (uint32_t)sl;
+        return true;
+    }
+    if (v->len < len) return false;
+    if (v->type == RAY_STR) {
+        s->kind = IF_TXT_STR;
+        str_resolve(v, &s->desc, &s->bytes);
+        return true;
+    }
+    if (!RAY_IS_SYM(v->type)) return false;
+    s->sym = ray_data(v);
+    s->sym_type = v->type;
+    s->sym_attrs = v->attrs;
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(v);
+    if (dom == ray_sym_runtime_domain()) {
+        ray_sym_strings_borrow(&s->rt_strings, &s->rt_count);
+        if (!s->rt_strings) return false;
+        s->kind = IF_TXT_SYM_RT;
+        return true;
+    }
+    if (!ray_sym_domain_raw_pin(dom, &s->raw)) return false;
+    s->dom = dom;
+    s->kind = IF_TXT_SYM_FILE;
+    return true;
+}
+
+static void if_txt_side_free(if_txt_side_t* s) {
+    if (s->kind == IF_TXT_SYM_FILE) ray_sym_domain_raw_unpin(s->dom);
+    s->kind = 0;
+}
+
+/* Text of row r on this side; false for a cell the snapshot cannot read. */
+static inline bool if_txt_get(const if_txt_side_t* s, int64_t r,
+                              const char** sp, uint32_t* sl) {
+    switch (s->kind) {
+    case IF_TXT_SCALAR:
+        *sp = s->sp; *sl = s->sl;
+        return true;
+    case IF_TXT_STR: {
+        const ray_str_t* d = &s->desc[r];
+        *sl = d->len;
+        *sp = d->len == 0 ? "" : ray_str_is_inline(d) ? d->data : s->bytes + d->pool_off;
+        return true;
+    }
+    case IF_TXT_SYM_RT: {
+        int64_t id = ray_read_sym(s->sym, r, s->sym_type, s->sym_attrs);
+        if (id < 0 || id >= (int64_t)s->rt_count || !s->rt_strings[id]) return false;
+        ray_t* a = s->rt_strings[id];
+        *sp = ray_str_ptr(a); *sl = (uint32_t)ray_str_len(a);
+        return true;
+    }
+    case IF_TXT_SYM_FILE: {
+        int64_t pos = ray_read_sym(s->sym, r, s->sym_type, s->sym_attrs);
+        if (pos < 0 || pos >= s->raw.count) return false;
+        size_t l = 0;
+        *sp = ray_sym_domain_raw_str(&s->raw, pos, &l);
+        *sl = (uint32_t)l;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+typedef struct {
+    const uint8_t*       cond;
+    const if_txt_side_t* t;
+    const if_txt_side_t* e;
+    uint32_t*            off;    /* pooled length per row, then its pool offset */
+    ray_str_t*           dst;
+    char*                pool;
+    _Atomic(int)         miss;
+} if_txt_ctx_t;
+
+static void if_txt_len_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    if_txt_ctx_t* c = (if_txt_ctx_t*)vctx;
+    for (int64_t r = start; r < end; r++) {
+        const char* sp; uint32_t sl;
+        if (!if_txt_get(c->cond[r] ? c->t : c->e, r, &sp, &sl)) {
+            atomic_store_explicit(&c->miss, 1, memory_order_relaxed);
+            return;
+        }
+        c->off[r] = sl > RAY_STR_INLINE_MAX ? sl : 0;
+    }
+}
+
+static void if_txt_fill_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    if_txt_ctx_t* c = (if_txt_ctx_t*)vctx;
+    for (int64_t r = start; r < end; r++) {
+        const char* sp = ""; uint32_t sl = 0;
+        if (!if_txt_get(c->cond[r] ? c->t : c->e, r, &sp, &sl)) { sp = ""; sl = 0; }
+        ray_str_t* d = &c->dst[r];
+        memset(d, 0, sizeof(*d));
+        d->len = sl;
+        if (sl <= RAY_STR_INLINE_MAX) {
+            if (sl) memcpy(d->data, sp, sl);
+        } else {
+            memcpy(d->prefix, sp, 4);
+            d->pool_off = c->off[r];
+            memcpy(c->pool + c->off[r], sp, sl);
+        }
+    }
+}
+
+/* Fills `result` (STR, len rows) and returns it, or NULL with `result`
+ * untouched when the build does not apply. */
+static ray_t* if_str_text_build(ray_t* result, const uint8_t* cond, int64_t len,
+                                ray_t* then_v, bool then_scalar,
+                                ray_t* else_v, bool else_scalar) {
+    bool t_sym = then_v->type == -RAY_SYM || RAY_IS_SYM(then_v->type);
+    bool e_sym = else_v->type == -RAY_SYM || RAY_IS_SYM(else_v->type);
+    if (!t_sym && !e_sym) return NULL;
+    if (len <= 0) return NULL;
+
+    if_txt_side_t t, e;
+    if (!if_txt_side_init(&t, then_v, then_scalar, len)) {
+        if_txt_side_free(&t);
+        return NULL;
+    }
+    if (!if_txt_side_init(&e, else_v, else_scalar, len)) {
+        if_txt_side_free(&t); if_txt_side_free(&e);
+        return NULL;
+    }
+    ray_t* off_hdr = NULL;
+    uint32_t* off = (uint32_t*)scratch_alloc(&off_hdr, (size_t)len * sizeof(uint32_t));
+    if (!off) { if_txt_side_free(&t); if_txt_side_free(&e); return NULL; }
+
+    if_txt_ctx_t c = { .cond = cond, .t = &t, .e = &e, .off = off,
+                       .dst = (ray_str_t*)ray_data(result), .pool = NULL };
+    atomic_init(&c.miss, 0);
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD);
+    if (par) ray_pool_dispatch(pool, if_txt_len_fn, &c, len);
+    else     if_txt_len_fn(&c, 0, 0, len);
+
+    uint64_t run = 0;
+    bool ok = atomic_load_explicit(&c.miss, memory_order_relaxed) == 0;
+    if (ok) {
+        for (int64_t r = 0; r < len; r++) {
+            uint32_t l = off[r];
+            off[r] = (uint32_t)run;
+            run += l;
+            if (run > UINT32_MAX) { ok = false; break; }
+        }
+    }
+    ray_t* np = NULL;
+    if (ok && run > 0) {
+        np = ray_alloc((size_t)run);
+        if (!np || RAY_IS_ERR(np)) { np = NULL; ok = false; }
+        else { np->type = RAY_U8; np->len = (int64_t)run; c.pool = (char*)ray_data(np); }
+    }
+    if (ok) {
+        if (par) ray_pool_dispatch(pool, if_txt_fill_fn, &c, len);
+        else     if_txt_fill_fn(&c, 0, 0, len);
+        result->str_pool = np;
+    }
+    scratch_free(off_hdr);
+    if_txt_side_free(&t);
+    if_txt_side_free(&e);
+    return ok ? result : NULL;
+}
+
+/* `cond_in`: the condition exec_if already evaluated (ownership passes
+ * here), or NULL to evaluate it. */
+static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
-    ray_t* cond_v = exec_node(g, op_child(g, op, 0));
+    ray_t* cond_v = cond_in ? cond_in : exec_node(g, op_child(g, op, 0));
     ray_t* then_v = exec_node(g, op_child(g, op, 1));
 
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -1192,21 +1486,40 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         return else_v;
     }
 
-    /* A scalar condition has one cell, and the fills below index it per row —
-     * reading past it, so `(if false f 1.0)` returned a mixture of both
-     * branches.  Expand it once so every consumer sees a full-length mask;
-     * the selected arm declines a scalar condition outright, which is why
-     * this only ever mattered here. */
-    if (ray_is_atom(cond_v)) {
-        int64_t n = ray_is_atom(then_v) ? (ray_is_atom(else_v) ? 1 : else_v->len)
-                                        : then_v->len;
-        uint8_t on = cond_v->b8 ? 1 : 0;
+    /* The fills below read the condition as one BOOL byte per row.  A scalar
+     * condition has one cell, and indexing it per row read past it, so
+     * `(if false f 1.0)` returned a mixture of both branches.  A reduction
+     * in the condition, such as `(> (count x) 3)`, reaches here as a
+     * one-element vector rather than an atom and is the same scalar against
+     * vector branches.  A condition of another type, such as `(count x)` or
+     * an I64 column, was read byte by byte.  Every such condition becomes a
+     * full-length BOOL mask, with is_truthy's rule per cell; the
+     * selected arm declines all of them, which is why only this arm
+     * mattered. */
+    int64_t branch_len = 1;
+    if (!ray_is_atom(then_v) && then_v->len > branch_len) branch_len = then_v->len;
+    if (!ray_is_atom(else_v) && else_v->len > branch_len) branch_len = else_v->len;
+    if (!ray_is_atom(cond_v) && !if_cond_type_ok(cond_v->type)) {
+        int8_t ct = cond_v->type;
+        g->if_refused = true;
+        ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+        return ray_error("type", "if: condition must be boolean, numeric or temporal, got %s",
+                         ray_type_name(ct));
+    }
+    bool cond_bcast = ray_is_atom(cond_v) || (cond_v->len == 1 && branch_len > 1);
+    if (cond_bcast || cond_v->type != RAY_BOOL) {
+        int64_t n = cond_bcast ? branch_len : cond_v->len;
         ray_t* mask = ray_vec_new(RAY_BOOL, n);
         if (!mask || RAY_IS_ERR(mask)) {
             ray_release(cond_v); ray_release(then_v); ray_release(else_v);
             return mask ? mask : ray_error("oom", NULL);
         }
-        memset(ray_data(mask), on, (size_t)n);
+        uint8_t* m = (uint8_t*)ray_data(mask);
+        if (cond_bcast)
+            memset(m, ray_is_atom(cond_v) ? if_cond_atom(cond_v)
+                                          : if_cond_cell(cond_v, 0), (size_t)n);
+        else
+            for (int64_t i = 0; i < n; i++) m[i] = if_cond_cell(cond_v, i);
         mask->len = n;
         ray_release(cond_v);
         cond_v = mask;
@@ -1234,6 +1547,14 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     uint8_t* cond_p = (uint8_t*)ray_data(cond_v);
 
     if (out_type == RAY_STR) {
+        if (if_str_text_build(result, cond_p, len, then_v, then_scalar,
+                              else_v, else_scalar)) {
+            ray_release(cond_v); ray_release(then_v); ray_release(else_v);
+            return result;
+        }
+        /* A SYM side the text build could not read (a symbol appended to
+         * its domain after the snapshot) is resolved row by row below, from
+         * the branches already materialised. */
         /* Two STR vectors: the result is descriptors only.  Each row takes
          * its side's 16-byte descriptor; pooled strings keep pointing into
          * their pool.  One shared pool (or one side inline-only) is reused
@@ -1437,7 +1758,40 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
+static bool if_type_is_text(int8_t t) { return t == RAY_STR || t == RAY_SYM; }
+
+/* A branch that can stand in a text result: a text column or literal, a
+ * boxed list, an untyped node, or a null literal such as `0N`, which the
+ * fills write as the text null. */
+static bool if_branch_text_ok(ray_graph_t* g, ray_op_t* b) {
+    if (!b) return true;
+    int8_t t = b->out_type;
+    if (t <= 0 || t == RAY_LIST || if_type_is_text(t)) return true;
+    if (b->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, b->id);
+        if (ext && ext->literal && ray_is_atom(ext->literal) &&
+            RAY_ATOM_IS_NULL(ext->literal))
+            return true;
+    }
+    return false;
+}
+
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
+    /* A text result with a non-text branch has no column type: the fills
+     * read the numbers as string descriptors or symbol ids and returned
+     * garbage, e.g. `(if (< x 3) s x)` with s SYM and x I64. */
+    if (if_type_is_text(op->out_type)) {
+        ray_op_t* then_op = op_child(g, op, 1);
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        ray_op_t* else_op = ext ? op_node(g, ext->third_in) : NULL;
+        int8_t tt = then_op ? then_op->out_type : 0;
+        int8_t et = else_op ? else_op->out_type : 0;
+        if (!if_branch_text_ok(g, then_op) || !if_branch_text_ok(g, else_op)) {
+            g->if_refused = true;
+            return ray_error("type", "if: branches mix %s and %s",
+                             ray_type_name(tt), ray_type_name(et));
+        }
+    }
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
     if (!cond_v || RAY_IS_ERR(cond_v)) return cond_v;
 
@@ -1447,8 +1801,8 @@ ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
         return selected;
     }
 
-    ray_release(cond_v);
-    return exec_if_eager(g, op);
+    /* the condition is handed on, not evaluated twice */
+    return exec_if_eager(g, op, cond_v);
 }
 
 /* Fold the null-mask words [nullw, nullw+null_words) into a running hash.

@@ -30,11 +30,14 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include <time.h>
+#include <dirent.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/col.h"
+#include "ops/idxop.h"
 #include "store/fileio.h"
 #include "store/splay.h"
+#include "store/stream.h"
 #include "store/part.h"
 #include "store/serde.h"
 #include "core/ipc.h"
@@ -58,6 +61,12 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#ifdef RAY_OS_LINUX
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#endif
 
 #define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
 #define TMP_SPLAY_DIR "/tmp/rayforce_test_splay"
@@ -1476,6 +1485,800 @@ static test_result_t test_file_rename_op(void) {
 
     unlink(TMP_FILEIO_PATH2);
     PASS();
+}
+
+static test_result_t test_col_close_failure(void) {
+#ifdef RAY_OS_LINUX
+    int64_t data[] = {1,2,3,4};
+    ray_t* values[5];
+    values[0] = ray_vec_from_raw(RAY_I64,data,4);
+    values[1] = ray_vec_new(RAY_STR,0);
+    values[1] = ray_str_vec_append(values[1],"a buffered string payload",25);
+    values[2] = ray_list_new(0);
+    ray_t* text = ray_str("a buffered string payload",25);
+    values[2] = ray_list_append(values[2],text); ray_release(text);
+    values[3] = ray_list_new(0);
+    values[3] = ray_list_append(values[3],values[0]);
+    values[4] = ray_table_new(0);
+    values[4] = ray_table_add_col(values[4],ray_sym_intern("v",1),values[0]);
+    char path[160], temp[180];
+    snprintf(path,sizeof(path),"/tmp/rayforce-close-failure-%d",(int)getpid());
+    snprintf(temp,sizeof(temp),"%s.tmp",path);
+    for (int type = 0; type < 5; type++) for (int durable = 0; durable < 2; durable++) {
+        TEST_ASSERT_NOT_NULL(values[type]); TEST_ASSERT_FALSE(RAY_IS_ERR(values[type]));
+        FILE* f = fopen(path,"wb"); TEST_ASSERT_NOT_NULL(f);
+        TEST_ASSERT_EQ_I(fwrite("original",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+        pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+        if (!pid) {
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_FSIZE,&limit)) _exit(2);
+            limit.rlim_cur = 33;
+            if (signal(SIGXFSZ,SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE,&limit)) _exit(2);
+            ray_err_t err = durable ? ray_col_save(values[type],path) : ray_col_save_bulk(values[type],path);
+            _exit(err == RAY_ERR_IO ? 0 : 1);
+        }
+        int status;
+        TEST_ASSERT_EQ_I(waitpid(pid,&status,0),pid);
+        TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status),0);
+        f = fopen(path,"rb"); TEST_ASSERT_NOT_NULL(f);
+        char bytes[16]; size_t n = fread(bytes,1,sizeof(bytes),f); fclose(f);
+        TEST_ASSERT_EQ_I(n,8); TEST_ASSERT_TRUE(!memcmp(bytes,"original",8));
+        TEST_ASSERT_TRUE(access(temp,F_OK) != 0);
+    }
+    unlink(path);
+    for (int i = 4; i >= 0; i--) ray_release(values[i]);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* A failed index append must leave the column loadable: without the index
+ * marker the loader requires the exact payload length, so a partial region
+ * would turn a best-effort accelerator into an unreadable column. */
+static test_result_t test_col_append_index_rollback(void) {
+#ifdef RAY_OS_LINUX
+    int64_t n = 100000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i * 3;
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-append-rollback-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_col_save(v, path), RAY_OK);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    off_t payload = st.st_size;
+
+    ray_t* w = v; ray_retain(w);
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    const ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_NOT_NULL(ix);
+
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)payload + 40;     /* pad fits, region doesn't */
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(ray_col_append_index(path, ix, n, RAY_I64) != RAY_OK ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, (int64_t)payload);
+    ray_t* back = ray_col_load(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(back))[n - 1], (n - 1) * 3);
+    ray_release(back);
+
+    /* and the append still works once there is room */
+    TEST_ASSERT_EQ_I(ray_col_append_index(path, ix, n, RAY_I64), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_TRUE(st.st_size > payload);
+    back = ray_col_load(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    ray_release(back);
+
+    ray_release(w);
+    ray_release(v);
+    unlink(path);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* Fill v with i*3, every 97th row null, rows [a, b) all null. */
+static ray_t* zone_test_col(int64_t n, int64_t null_from, int64_t null_to) {
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        d[i] = (i % 97 == 0 || (i >= null_from && i < null_to)) ? NULL_I64 : i * 3;
+    v->attrs |= 0x40;  /* RAY_ATTR_HAS_NULLS */
+    return v;
+}
+
+static bool zone_equal(ray_t* a, ray_t* b) {
+    const ray_index_t* x = ray_index_payload(a);
+    const ray_index_t* y = ray_index_payload(b);
+    if (x->u.chunk_zone.n_chunks != y->u.chunk_zone.n_chunks) return false;
+    if (x->u.chunk_zone.is_f64 != y->u.chunk_zone.is_f64) return false;
+    size_t n = x->u.chunk_zone.n_chunks;
+    if (memcmp(ray_data(x->u.chunk_zone.mins), ray_data(y->u.chunk_zone.mins), n * 8)) return false;
+    if (memcmp(ray_data(x->u.chunk_zone.maxs), ray_data(y->u.chunk_zone.maxs), n * 8)) return false;
+    if (memcmp(ray_data(x->u.chunk_zone.null_bits), ray_data(y->u.chunk_zone.null_bits), (n + 7) / 8)) return false;
+    if ((x->u.chunk_zone.aggs == NULL) != (y->u.chunk_zone.aggs == NULL)) return false;
+    if (x->u.chunk_zone.aggs &&
+        memcmp(ray_data(x->u.chunk_zone.aggs), ray_data(y->u.chunk_zone.aggs), n * 3 * 8)) return false;
+    return true;
+}
+
+/* Uneven slices (70000 rows), an all-null chunk 2, equals the whole-column zone. */
+static test_result_t test_zone_acc_slices_equal_compute(void) {
+    int64_t n = 300000;
+    ray_t* v = zone_test_col(n, 131072, 196608);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_I64, 0), RAY_OK);
+    for (int64_t off = 0; off < n; off += 70000) {
+        int64_t cnt = n - off < 70000 ? n - off : 70000;
+        ray_t* s = ray_vec_from_raw(RAY_I64, (int64_t*)ray_data(v) + off, cnt);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    /* a zero-row append opens nothing */
+    ray_t* empty = ray_vec_new(RAY_I64, 0);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, empty), RAY_OK);
+    ray_release(empty);
+    TEST_ASSERT_EQ_I(acc.n_chunks, 5);
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    const ray_index_t* ix = ray_index_payload(got);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[2], INT64_MAX);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.maxs))[2], INT64_MIN);
+    TEST_ASSERT_TRUE(((uint8_t*)ray_data(ix->u.chunk_zone.null_bits))[0] & (1u << 2));
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* Exactly one chunk; an append ending on the boundary opens no second chunk. */
+static test_result_t test_zone_acc_one_chunk(void) {
+    int64_t n = 65536;
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_I64, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, v), RAY_OK);
+    TEST_ASSERT_EQ_I(acc.n_chunks, 1);
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    TEST_ASSERT_EQ_I(ray_index_payload(got)->u.chunk_zone.n_chunks, 1);
+    ray_release(got);
+    /* below the gate: nothing */
+    ray_zone_acc_t small;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&small, RAY_I64, 0), RAY_OK);
+    v->len = 65535;
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&small, v), RAY_OK);
+    TEST_ASSERT_NULL(ray_zone_acc_finish(&small, 65535));
+    v->len = n;
+    ray_release(v);
+    PASS();
+}
+
+/* Two accumulators split mid-chunk (at row 100000) merge into the whole. */
+static test_result_t test_zone_acc_merge_mid_chunk(void) {
+    int64_t n = 200000, split = 100000;
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_t* lo = ray_vec_from_raw(RAY_I64, ray_data(v), split);
+    ray_t* hi = ray_vec_from_raw(RAY_I64, (int64_t*)ray_data(v) + split, n - split);
+    TEST_ASSERT_TRUE(lo && hi);
+    ray_zone_acc_t a, b;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&a, RAY_I64, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&b, RAY_I64, split), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&b, hi), RAY_OK);   /* later range first */
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&a, lo), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_merge(&a, &b), RAY_OK);
+    ray_zone_acc_free(&b);
+    ray_t* got = ray_zone_acc_finish(&a, n);
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    ray_release(got); ray_release(want); ray_release(lo); ray_release(hi); ray_release(v);
+    PASS();
+}
+
+/* F64 with NaN nulls: float arrays, no aggs. */
+static test_result_t test_zone_acc_float(void) {
+    int64_t n = 150000;
+    ray_t* v = ray_vec_new(RAY_F64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    double* d = (double*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = (i % 1000 == 7) ? NAN : (double)i * 0.5;
+    v->attrs |= 0x40;  /* RAY_ATTR_HAS_NULLS */
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_F64, 0), RAY_OK);
+    for (int64_t off = 0; off < n; off += 40000) {
+        int64_t cnt = n - off < 40000 ? n - off : 40000;
+        ray_t* s = ray_vec_from_raw(RAY_F64, d + off, cnt);
+        TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    TEST_ASSERT_NULL(ray_index_payload(got)->u.chunk_zone.aggs);
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+static ray_t* dict_test_col(int64_t n, int64_t distinct, bool unique) {
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    for (int64_t i = 0; i < n; i++) {
+        char buf[64];
+        int len = unique ? snprintf(buf, sizeof(buf), "a long pooled unique string %lld", (long long)i)
+                         : (i % 1009 == 0 ? 0 : snprintf(buf, sizeof(buf), "v%lld", (long long)(i % distinct)));
+        v = ray_str_vec_append(v, buf, (size_t)len);
+        if (!v || RAY_IS_ERR(v)) return NULL;
+    }
+    return v;
+}
+
+/* Slices of 30000 rows, empty strings included, equals ray_index_dict_compute. */
+static test_result_t test_dict_acc_slices_equal_compute(void) {
+    int64_t n = 100000;
+    ray_t* v = dict_test_col(n, 3000, false);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    for (int64_t off = 0; off < n; off += 30000) {
+        int64_t cnt = n - off < 30000 ? n - off : 30000;
+        ray_t* s = ray_vec_new(RAY_STR, cnt);
+        for (int64_t i = 0; i < cnt; i++) {
+            size_t len; const char* p = ray_str_vec_get(v, off + i, &len);
+            s = ray_str_vec_append(s, p, len);
+        }
+        TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    ray_t* got = ray_dict_acc_finish(&acc, n);
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    const ray_index_t* x = ray_index_payload(got);
+    const ray_index_t* y = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, y->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, 3001);   /* 3000 values plus "" */
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.codes), ray_data(y->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.first_occ), ray_data(y->u.dict.first_occ),
+                            (size_t)x->u.dict.n_distinct * 4), 0);
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* Leading empty strings (NULL pool at the first distinct value), then
+ * 70000 rows over 100 values, in two slices: equals ray_index_dict_compute. */
+static test_result_t test_dict_acc_leading_empty(void) {
+    int64_t n = 70003;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v = ray_str_vec_append(v, "", 0);
+    v = ray_str_vec_append(v, "", 0);
+    v = ray_str_vec_append(v, "a", 1);
+    for (int64_t i = 0; i < 70000; i++) {
+        char buf[32]; int len = snprintf(buf, sizeof(buf), "v%lld", (long long)(i % 100));
+        v = ray_str_vec_append(v, buf, (size_t)len);
+    }
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    int64_t cuts[3] = {0, 35000, n};
+    for (int k = 0; k < 2; k++) {
+        ray_t* s = ray_vec_new(RAY_STR, cuts[k + 1] - cuts[k]);
+        for (int64_t i = cuts[k]; i < cuts[k + 1]; i++) {
+            size_t len; const char* p = ray_str_vec_get(v, i, &len);
+            s = ray_str_vec_append(s, p, len);
+        }
+        TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+    }
+    ray_t* got = ray_dict_acc_finish(&acc, n);
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want));
+    const ray_index_t* x = ray_index_payload(got);
+    const ray_index_t* y = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, y->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, 102);   /* "", "a", v0..v99 */
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.codes), ray_data(y->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.first_occ), ray_data(y->u.dict.first_occ),
+                            (size_t)x->u.dict.n_distinct * 4), 0);
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* 70000 unique strings: no cap, the dictionary equals the whole-column one. */
+static test_result_t test_dict_acc_high_cardinality(void) {
+    int64_t n = 70000;
+    ray_t* v = dict_test_col(n, 0, true);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, v), RAY_OK);
+    TEST_ASSERT_FALSE(acc.dead);
+    ray_t* got = ray_dict_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    const ray_index_t* g = ray_index_payload(got);
+    const ray_index_t* w = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(g->u.dict.n_distinct, 70000);
+    TEST_ASSERT_EQ_I(g->u.dict.n_distinct, w->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.dict.codes), ray_data(w->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.dict.first_occ), ray_data(w->u.dict.first_occ),
+                            (size_t)w->u.dict.n_distinct * 4), 0);
+    ray_release(got); ray_release(want);
+    /* below the gate: nothing */
+    ray_dict_acc_t small;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&small), RAY_OK);
+    v->len = 1000;
+    TEST_ASSERT_EQ_I(ray_dict_acc_add(&small, v), RAY_OK);
+    TEST_ASSERT_NULL(ray_dict_acc_finish(&small, 1000));
+    v->len = n;
+    ray_release(v);
+    PASS();
+}
+
+/* Stream a 200000-row I64 column in 70000-row slices; the file carries the
+ * zone and loads with it. Values are clustered so no hash is wanted. */
+static test_result_t test_stream_inline_zone(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-zone-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 200000;
+    ray_t* v = zone_test_col(n, 0, 0);
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("z", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    for (int64_t off = 0; off < n; off += 70000) {
+        int64_t cnt = n - off < 70000 ? n - off : 70000;
+        ray_t* s = ray_vec_from_raw(RAY_I64, (int64_t*)ray_data(v) + off, cnt);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s), RAY_OK);
+        ray_release(s);
+    }
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_FALSE(w.wants_hash);
+    TEST_ASSERT_NULL(w.index);
+    char path[200]; snprintf(path, sizeof(path), "%s/z", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_CHUNK_ZONE);
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(zone_equal(back->index, want));
+    /* the region is what ray_col_append_index would have written */
+    ray_t* plain = zone_test_col(n, 0, 0);
+    char ref[200]; snprintf(ref, sizeof(ref), "%s/ref", dir);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(plain, ref), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_append_index(ref, ray_index_payload(want), n, RAY_I64), RAY_OK);
+    struct stat a, b;
+    TEST_ASSERT_EQ_I(stat(path, &a), 0); TEST_ASSERT_EQ_I(stat(ref, &b), 0);
+    TEST_ASSERT_EQ_I((int64_t)a.st_size, (int64_t)b.st_size);
+    {
+        size_t sz = (size_t)a.st_size;
+        uint8_t* ba = (uint8_t*)malloc(sz); uint8_t* bb = (uint8_t*)malloc(sz);
+        TEST_ASSERT_TRUE(ba && bb);
+        FILE* fa = fopen(path, "rb"); FILE* fb = fopen(ref, "rb");
+        TEST_ASSERT_TRUE(fa && fb);
+        TEST_ASSERT_EQ_I((int64_t)fread(ba, 1, sz, fa), (int64_t)sz);
+        TEST_ASSERT_EQ_I((int64_t)fread(bb, 1, sz, fb), (int64_t)sz);
+        fclose(fa); fclose(fb);
+        TEST_ASSERT_EQ_I(memcmp(ba, bb, sz), 0);
+        free(ba); free(bb);
+    }
+    ray_release(want); ray_release(back); ray_release(plain); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* A sentinel typed as a value in a slice WITHOUT HAS_NULLS is still a null:
+ * the accumulator decides by the sentinel value (col.c #495). */
+static test_result_t test_zone_acc_sentinel_without_flag(void) {
+    int64_t n = 70000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = i * 3 + 5;
+    d[7] = INT64_MIN;
+    TEST_ASSERT_FALSE(v->attrs & RAY_ATTR_HAS_NULLS);
+    ray_zone_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_zone_acc_init(&acc, RAY_I64, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_zone_acc_add(&acc, v), RAY_OK);
+    TEST_ASSERT_TRUE(acc.saw_null);
+    TEST_ASSERT_EQ_I(acc.nn[0], 65535);
+    ray_t* got = ray_zone_acc_finish(&acc, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    const ray_index_t* ix = ray_index_payload(got);
+    TEST_ASSERT_TRUE(((uint8_t*)ray_data(ix->u.chunk_zone.null_bits))[0] & 1u);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[0], 5);   /* row 0 */
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* want = ray_index_chunk_zone_compute(v, 16);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(got, want));
+    ray_release(got); ray_release(want); ray_release(v);
+    PASS();
+}
+
+/* Writer level: slice 1 carries a sentinel without the flag, slice 2 the
+ * flag; the file header must publish HAS_NULLS and the zone must agree with
+ * the loaded column. */
+static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-sent-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 70000;
+    ray_t* s1 = ray_vec_new(RAY_I64, n); s1->len = n;
+    ray_t* s2 = ray_vec_new(RAY_I64, n); s2->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(s1))[i] = i * 3;
+        ((int64_t*)ray_data(s2))[i] = (i % 50 == 0) ? NULL_I64 : (n + i) * 3;
+    }
+    ((int64_t*)ray_data(s1))[7] = INT64_MIN;
+    s2->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("n", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s1), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    if (w.index) { ray_release(w.index); w.index = NULL; }
+    char path[200]; snprintf(path, sizeof(path), "%s/n", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, 2 * n);
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_INDEX);
+    ray_t* copy = ray_vec_from_raw(RAY_I64, ray_data(back), back->len);
+    TEST_ASSERT_TRUE(copy && !RAY_IS_ERR(copy));
+    copy->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* want = ray_index_chunk_zone_compute(copy, 16);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_TRUE(zone_equal(back->index, want));
+    TEST_ASSERT_TRUE(((int64_t*)ray_data(ray_index_payload(back->index)->u.chunk_zone.mins))[0] != INT64_MIN);
+    ray_release(want); ray_release(copy); ray_release(back);
+    ray_release(s1); ray_release(s2);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* An index region that cannot be written (ENOSPC/EFBIG) is dropped: close
+ * cuts the file back to the payload and publishes the column without the
+ * index.  Everything runs in the forked child so no FILE* state is shared
+ * with the parent; the child exits 0 only if close returned RAY_OK. */
+static test_result_t test_stream_index_write_failure_drops_index(void) {
+#ifdef RAY_OS_LINUX
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-enospc-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 70000;
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = i * 3;     /* clustered, no nulls */
+    v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    char path[200]; snprintf(path, sizeof(path), "%s/c", dir);
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        ray_col_stream_t w;
+        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL) != RAY_OK) _exit(2);
+        if (ray_col_stream_index_begin(&w, 0) != RAY_OK) _exit(2);
+        if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)(32 + n * 8 + 40);
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(ray_col_stream_close(&w, false) == RAY_OK ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, 32 + n * 8);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, n);
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(back))[n - 1], (n - 1) * 3);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* Exactly 65536 rows: one chunk, a zone, never a hash candidate. */
+static test_result_t test_stream_inline_zone_one_chunk(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-one-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 65536;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;  /* unclustered */
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("o", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_FALSE(w.wants_hash);
+    char path[200]; snprintf(path, sizeof(path), "%s/o", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_CHUNK_ZONE);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Unclustered I64 over four chunks: no inline index, the zone is kept and
+ * wants_hash set; ray_splay_hash_column then appends a hash. */
+static test_result_t test_stream_hash_candidate(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-hash-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("h", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_TRUE(w.wants_hash);
+    TEST_ASSERT_NOT_NULL(w.index);
+    char path[200]; snprintf(path, sizeof(path), "%s/h", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    ray_release(back);
+    TEST_ASSERT_EQ_I(ray_splay_hash_column(path, w.index), RAY_OK);
+    ray_release(w.index); w.index = NULL;
+    back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Wave width of the hash phase: a pure function of RAM budget and shape. */
+static test_result_t test_stream_hash_wave(void) {
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(0, 100, 5), 1);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 0, 5), 5);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 1LL << 40, 5), 1);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 40, 1000, 3), 3);
+    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(4LL * 58 * 1000 * 2, 1000, 5), 2);
+    PASS();
+}
+
+/* The index region streamed to a file (block by block) is byte-identical to
+ * the one the buffered writer lays out in memory, for every public index kind. */
+static bool region_file_matches_buffer(ray_t* w) {
+    if (!w || RAY_IS_ERR(w) || !w->index) return false;
+    const ray_index_t* ix = ray_index_payload(w->index);
+    int64_t size = ray_index_inline_size(ix);
+    uint8_t* buf = (uint8_t*)ray_calloc_raw((size_t)size);
+    uint8_t* back = (uint8_t*)ray_calloc_raw((size_t)size + 1);
+    FILE* f = tmpfile();
+    bool ok = buf && back && f;
+    if (ok) {
+        ray_index_inline_write(buf, ix);
+        ok = ray_index_inline_write_file(f, ix) && fflush(f) == 0 &&
+             ftell(f) == (long)size && fseek(f, 0, SEEK_SET) == 0 &&
+             fread(back, 1, (size_t)size + 1, f) == (size_t)size &&   /* nothing beyond size */
+             memcmp(buf, back, (size_t)size) == 0;
+    }
+    if (f) fclose(f);
+    ray_free_raw(buf); ray_free_raw(back);
+    return ok;
+}
+
+static test_result_t test_stream_region_bytes_match(void) {
+    int64_t n = 70001;      /* child lengths are not multiples of 32: the pad path runs */
+    ray_t* v = zone_test_col(n, 0, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_chunk_zone(&w, 16)));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NOT_NULL(ray_index_payload(w->index)->u.chunk_zone.aggs);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    ray_t* f64 = ray_vec_new(RAY_F64, n); f64->len = n;
+    for (int64_t i = 0; i < n; i++) ((double*)ray_data(f64))[i] = (double)(i % 1013) * 0.5;
+    w = f64;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_chunk_zone(&w, 16)));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NULL(ray_index_payload(w->index)->u.chunk_zone.aggs);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    w = dict_test_col(n, 3000, false);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_dict(&w)));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    ray_t* h = ray_vec_new(RAY_I64, n); h->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(h))[i] = (i * 7919) % 1009;
+    w = ray_idx_hash_fn(h);
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_HASH);
+    TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+    ray_release(w);
+
+    int kinds = 3;
+    for (int k = 0; k < kinds; k++) {
+        ray_t* z = ray_vec_new(RAY_I64, n); z->len = n;
+        for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(z))[i] = (i * 7919) % 100003;
+        w = z;
+        ray_t* r = k == 0 ? ray_index_attach_zone(&w)
+                 : k == 1 ? ray_index_attach_sort(&w) : ray_index_attach_bloom(&w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(ray_index_kind(w), k == 0 ? RAY_IDX_ZONE : k == 1 ? RAY_IDX_SORT : RAY_IDX_BLOOM);
+        TEST_ASSERT_TRUE(region_file_matches_buffer(w));
+        ray_release(w);
+    }
+    PASS();
+}
+
+static bool stream_dir_has_tmp(const char* dir) {
+    DIR* d = opendir(dir);
+    bool found = false;
+    struct dirent* e;
+    while (d && (e = readdir(d)))
+        if (!strncmp(e->d_name, ".stream-", 8)) found = true;
+    if (d) closedir(d);
+    return found;
+}
+
+/* One writer's finish fails; close_all returns the error and nothing is
+ * published: no column file, no tmp or pool file, no retained index.
+ * Injection: the failing writer's FILE* is replaced by a read-only stream on
+ * its own tmp file, so every write the finish attempts (index region, header)
+ * fails with EBADF and the run needs neither timing nor an interrupt (which
+ * would also cancel the healthy columns nondeterministically). */
+static test_result_t test_stream_finish_failure_publishes_nothing(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-fail-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 300000;
+    ray_t* a = ray_vec_new(RAY_I64, n); a->len = n;
+    ray_t* b = ray_vec_new(RAY_I64, n); b->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(a))[i] = i;
+        ((int64_t*)ray_data(b))[i] = (i * 7919) % 1000003;   /* a hash candidate */
+    }
+    ray_t* s = dict_test_col(100000, 3000, false);
+    ray_t* cols[3] = { a, b, s };
+    int8_t types[3] = { RAY_I64, RAY_I64, RAY_STR };
+    const char* names[3] = { "fa", "fb", "fs" };
+    ray_col_stream_t w[3];
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), types[c], NULL), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w[c], 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], cols[c]), RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(fclose(w[0].fp), 0);
+    w[0].fp = fopen(w[0].tmp_path, "rb");
+    TEST_ASSERT_NOT_NULL(w[0].fp);
+    ray_err_t e = ray_col_stream_close_all(w, 3, false, NULL);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_IO);
+    for (int c = 0; c < 3; c++) {
+        char path[200]; snprintf(path, sizeof(path), "%s/%s", dir, names[c]);
+        TEST_ASSERT_TRUE(access(path, F_OK) != 0);
+        TEST_ASSERT_NULL(w[c].index);
+        ray_col_stream_abort(&w[c]);   /* converters abort after a failed close */
+    }
+    TEST_ASSERT_FALSE(stream_dir_has_tmp(dir));
+    ray_release(a); ray_release(b); ray_release(s);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* STR column of 100000 rows with empty strings: inline dict, HAS_NULLS set. */
+static test_result_t test_stream_inline_dict(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-dict-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 100000;
+    ray_t* v = dict_test_col(n, 3000, false);
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    char path[200]; snprintf(path, sizeof(path), "%s/s", dir);
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(ray_index_payload(back->index)->u.dict.n_distinct, 3001);
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+static test_result_t test_file_rename_new(void) {
+#ifdef RAY_OS_WASM
+    SKIP("exclusive rename is unavailable on this host");
+#else
+    char from[160], to[160], marker[180];
+    snprintf(from,sizeof(from),"/tmp/rayforce-publish-from-%d",(int)getpid());
+    snprintf(to,sizeof(to),"/tmp/rayforce-publish-to-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(ray_mkdir(from),RAY_OK); TEST_ASSERT_EQ_I(ray_mkdir(to),RAY_OK);
+    snprintf(marker,sizeof(marker),"%s/marker",from);
+    FILE* f = fopen(marker,"wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fwrite("retained",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+    /* Ordinary POSIX rename would replace this empty directory. */
+    TEST_ASSERT_EQ_I(ray_file_rename_new(from,to),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    TEST_ASSERT_EQ_I(rmdir(to),0);
+    TEST_ASSERT_EQ_I(ray_file_rename_new(from,to),RAY_OK);
+    TEST_ASSERT_TRUE(access(from,F_OK) != 0);
+    snprintf(marker,sizeof(marker),"%s/marker",to);
+    f = fopen(marker,"rb"); TEST_ASSERT_NOT_NULL(f);
+    char bytes[8]; TEST_ASSERT_EQ_I(fread(bytes,1,8,f),8); fclose(f);
+    TEST_ASSERT_TRUE(!memcmp(bytes,"retained",8));
+    TEST_ASSERT_EQ_I(ray_file_rename_new(NULL,to),RAY_ERR_IO);
+    unlink(marker); rmdir(to);
+    PASS();
+#endif
+}
+
+/* The portable fallback used where the host or filesystem has no
+ * no-replace rename: same contract as ray_file_rename_new. */
+static test_result_t test_file_rename_new_emulated(void) {
+#if defined(RAY_OS_WASM) || defined(RAY_OS_WINDOWS)
+    SKIP("POSIX fallback");
+#else
+    char from[160], to[160], marker[180];
+    snprintf(from,sizeof(from),"/tmp/rayforce-emu-from-%d",(int)getpid());
+    snprintf(to,sizeof(to),"/tmp/rayforce-emu-to-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(ray_mkdir(from),RAY_OK); TEST_ASSERT_EQ_I(ray_mkdir(to),RAY_OK);
+    snprintf(marker,sizeof(marker),"%s/marker",from);
+    FILE* f = fopen(marker,"wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fwrite("retained",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
+    /* an existing (empty) directory is not replaced */
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(from,to),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    TEST_ASSERT_EQ_I(rmdir(to),0);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(from,to),RAY_OK);
+    TEST_ASSERT_TRUE(access(from,F_OK) != 0);
+    snprintf(marker,sizeof(marker),"%s/marker",to);
+    TEST_ASSERT_TRUE(access(marker,F_OK) == 0);
+    /* files: an existing destination is kept, a new one is published */
+    char other[180];
+    snprintf(other,sizeof(other),"%s/other",to);
+    f = fopen(other,"wb"); TEST_ASSERT_NOT_NULL(f); fputs("x",f); fclose(f);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(other,marker),RAY_ERR_IO);
+    TEST_ASSERT_TRUE(access(other,F_OK) == 0);
+    unlink(marker);
+    TEST_ASSERT_EQ_I(ray_file_rename_new_emulated(other,marker),RAY_OK);
+    TEST_ASSERT_TRUE(access(other,F_OK) != 0 && access(marker,F_OK) == 0);
+    unlink(marker); rmdir(to);
+    PASS();
+#endif
 }
 
 /* ---- test_file_shared_lock_concurrent ---------------------------------- */
@@ -5447,6 +6250,27 @@ const test_entry_t store_entries[] = {
     { "store/file_lock_unlock", test_file_lock_unlock, store_setup, store_teardown },
     { "store/file_sync", test_file_sync_op, store_setup, store_teardown },
     { "store/file_rename", test_file_rename_op, store_setup, store_teardown },
+    { "store/col_close_failure", test_col_close_failure, store_setup, store_teardown },
+    { "store/col_append_index_rollback", test_col_append_index_rollback, store_setup, store_teardown },
+    { "store/zone_acc_slices_equal_compute", test_zone_acc_slices_equal_compute, store_setup, store_teardown },
+    { "store/zone_acc_one_chunk",            test_zone_acc_one_chunk,            store_setup, store_teardown },
+    { "store/zone_acc_merge_mid_chunk",      test_zone_acc_merge_mid_chunk,      store_setup, store_teardown },
+    { "store/zone_acc_float",                test_zone_acc_float,                store_setup, store_teardown },
+    { "store/dict_acc_slices_equal_compute", test_dict_acc_slices_equal_compute, store_setup, store_teardown },
+    { "store/dict_acc_leading_empty", test_dict_acc_leading_empty, store_setup, store_teardown },
+    { "store/dict_acc_high_cardinality",     test_dict_acc_high_cardinality,     store_setup, store_teardown },
+    { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
+    { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
+    { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
+    { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
+    { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
+    { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
+    { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
+    { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
+    { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
+    { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
+    { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
+    { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },
     { "store/sym_col_bounds_reject", test_sym_col_bounds_reject, store_setup, store_teardown },
     { "store/sym_col_count_mismatch", test_sym_col_count_mismatch, store_setup, store_teardown },

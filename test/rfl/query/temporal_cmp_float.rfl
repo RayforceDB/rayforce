@@ -1,0 +1,110 @@
+;; temporal_cmp_float.rfl — comparing a temporal column with a float inside
+;; a query is the same type error as outside one (#694).
+;;
+;; avg of a temporal column is F64 (canonical admission).  Outside a query
+;; (> ts (avg ts)) is "cannot compare timestamp and f64" (cmp.c); inside a
+;; select the generic DAG kernel promoted both sides to double, where a
+;; TIMESTAMP near 2024 has a 128 ns ULP: every row compared equal to the
+;; mean, so (> ts (avg ts)) was all false and (== ts (avg ts)) all true.
+;; The compiler now rejects a temporal-vs-float compare with the builtin
+;; error (the per-row fallback would average one cell and compare it with
+;; itself).  Same-typed temporal compares stay on the exact int64 kernel.
+(set T (table [i ts] (list [1 2 3 4] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 4))))))
+
+;; the aggregate is F64 in and out of a query
+(type (avg (at T 'ts))) -- 'f64
+(type (at (select {m: (avg ts) from: T}) 'm)) -- 'F64
+
+;; temporal vs the F64 aggregate: both paths raise the type error
+(> (at T 'ts) (avg (at T 'ts))) !- type
+(select {c: (> ts (avg ts)) from: T}) !- type
+(select {c: (< ts (avg ts)) from: T}) !- type
+(select {c: (>= ts (avg ts)) from: T}) !- type
+(select {c: (<= ts (avg ts)) from: T}) !- type
+(select {c: (== ts (avg ts)) from: T}) !- type
+(select {c: (!= ts (avg ts)) from: T}) !- type
+(select {c: (> (avg ts) ts) from: T}) !- type
+(select {from: T where: (> ts (avg ts))}) !- type
+(select {c: (if (> ts (avg ts)) 1 0) from: T}) !- type
+(update {c: (> ts (avg ts)) from: T}) !- type
+(select {c: (> ts (med ts)) from: T}) !- type
+
+;; temporal vs a float literal, DATE and TIME too
+(> (at T 'ts) 1.5) !- type
+(select {c: (> ts 1.5) from: T}) !- type
+(select {from: T where: (< ts 1.5)}) !- type
+(set Ttm (table [d t] (list (as 'DATE [10 20]) (as 'TIME [1000 2000]))))
+(select {c: (> d 1.5) from: Ttm}) !- type
+(select {c: (> t 1.5) from: Ttm}) !- type
+(select {c: (> d (avg d)) from: Ttm}) !- type
+
+;; same temporal type on both sides stays exact (rows 10 ns apart near 2024)
+(at (select {c: (> ts 2024.01.01D00:00:00.000000015) from: T}) 'c) -- [false false true true]
+(at (select {c: (>= ts (max ts)) from: T}) 'c) -- [false false false true]
+(at (select {c: (== ts (first ts)) from: T}) 'c) -- [true false false false]
+(at (select {c: (!= ts 2024.01.01D00:00:00.000000010) from: T}) 'c) -- [true false true true]
+(count (select {from: T where: (> ts 2024.01.01D00:00:00.000000015)})) -- 2
+;; integer scalars keep the exact int64 kernel
+(at (select {c: (> ts 757382400000000015) from: T}) 'c) -- [false false true true]
+(at (select {c: (> i (avg i)) from: T}) 'c) -- [false false true true]
+
+;; Different temporal types compare on one nanosecond scale, as the eval path
+;; does (temporal_as_ns): a DATE is days, a TIME milliseconds, a TIMESTAMP
+;; nanoseconds.  The compiled comparison compared raw lane values, so a
+;; TIMESTAMP column against a DATE literal compared nanoseconds with days.
+;; Oracle: the same comparison evaluated outside a select.
+(set tsx (+ 2024.01.01D00:00:00.000000000 (* (til 10) 43200000000000)))
+(set dx (+ 2024.01.01 (til 10)))
+(set tmx (+ 00:00:00.000 (* (til 10) 7200000)))
+(set TX (table [ts d tm] (list tsx dx tmx)))
+(at (select {c: (> ts 2024.01.03) from: TX}) 'c) -- (> tsx 2024.01.03)
+(at (select {c: (>= ts 2024.01.03) from: TX}) 'c) -- (>= tsx 2024.01.03)
+(at (select {c: (< ts 2024.01.03) from: TX}) 'c) -- (< tsx 2024.01.03)
+(at (select {c: (<= ts 2024.01.03) from: TX}) 'c) -- (<= tsx 2024.01.03)
+(at (select {c: (== ts 2024.01.03) from: TX}) 'c) -- (== tsx 2024.01.03)
+(at (select {c: (!= ts 2024.01.03) from: TX}) 'c) -- (!= tsx 2024.01.03)
+(count (select {from: TX where: (> ts 2024.01.03)})) -- 5
+(count (select {from: TX where: (> d 2024.01.03D12:00:00.000000000)})) -- 7
+(at (select {c: (> d 2024.01.03D12:00:00.000000000) from: TX}) 'c) -- (> dx 2024.01.03D12:00:00.000000000)
+(at (select {c: (> d 06:00:00.000) from: TX}) 'c) -- (> dx 06:00:00.000)
+(at (select {c: (> tm 2024.01.01D06:00:00.000000000) from: TX}) 'c) -- (> tmx 2024.01.01D06:00:00.000000000)
+;; column against column, and a literal on the left
+(at (select {c: (> ts d) from: TX}) 'c) -- (> tsx dx)
+(at (select {c: (>= ts d) from: TX}) 'c) -- (>= tsx dx)
+(at (select {c: (< 2024.01.03 ts) from: TX}) 'c) -- (< 2024.01.03 tsx)
+;; within with DATE bounds over a TIMESTAMP column
+(count (select {from: TX where: (within ts [2024.01.02 2024.01.04])})) -- 5
+;; a null DATE cell, and a null DATE literal, order below every value
+(set dn (concat (take dx 3) [0Nd]))
+(set TN (table [d] (list dn)))
+(at (select {c: (> d 2024.01.02D00:00:00.000000000) from: TN}) 'c) -- (> dn 2024.01.02D00:00:00.000000000)
+(at (select {c: (< d 2024.01.02D00:00:00.000000000) from: TN}) 'c) -- (< dn 2024.01.02D00:00:00.000000000)
+(at (select {c: (> ts 0Nd) from: TX}) 'c) -- (> tsx 0Nd)
+;; past the parallel threshold
+(set tsy (+ 2024.01.01D00:00:00.000000000 (* (til 100000) 1000000000)))
+(count (select {from: (table [ts] (list tsy)) where: (> ts 2024.01.02)})) -- (sum (as 'I64 (> tsy 2024.01.02)))
+;; a side that is an aggregate of another temporal type: not a literal, so the
+;; select is evaluated by the eval path, which compares on the ns scale
+(at (select {c: (> ts (first d)) from: TX}) 'c) -- (> tsx (first dx))
+(at (select {c: (< (max d) ts) from: TX}) 'c) -- (< (max dx) tsx)
+(count (select {ts: ts from: TX where: (> ts (min d))})) -- (sum (as 'I64 (> tsx (min dx))))
+;; dates beyond the TIMESTAMP range order past every timestamp
+(count (select {ts: ts from: TX where: (< ts 9999.12.31)})) -- 10
+(count (select {from: TX where: (< ts 9999.12.31)})) -- 10
+(count (select {ts: ts from: TX where: (> ts 1600.01.01)})) -- 10
+(count (select {from: TX where: (> ts 1600.01.01)})) -- 10
+(< 2024.01.01D00:00:00.000000000 9999.12.31) -- true
+(set dbig (concat dx [9999.12.31]))
+(count (select {d: d from: (table [d] (list dbig)) where: (> d 2024.01.03D12:00:00.000000000)})) -- 8
+;; an equality a DATE column cannot express holds for no row, != for every row
+(set dnul (concat dx [0Nd]))
+(at (select {c: (== d 2024.01.03D12:00:00.000000000) from: (table [d] (list dnul))}) 'c) -- (== dnul 2024.01.03D12:00:00.000000000)
+(at (select {c: (!= d 2024.01.03D12:00:00.000000000) from: (table [d] (list dnul))}) 'c) -- (!= dnul 2024.01.03D12:00:00.000000000)
+(at (select {c: (!= 2024.01.03D12:00:00.000000000 d) from: (table [d] (list dnul))}) 'c) -- (!= 2024.01.03D12:00:00.000000000 dnul)
+(at (select {c: (== d 2024.01.03D00:00:00.000000000) from: (table [d] (list dnul))}) 'c) -- (== dnul 2024.01.03D00:00:00.000000000)
+;; two literals: rewritten to one type before folding, so no rounding
+(at (select {c: (== 2024.01.02 2024.01.02D00:00:00.000000001) n: ts from: TX}) 'c) -- (take false 10)
+(at (select {c: (< 2024.01.02 2024.01.02D00:00:00.000000001) n: ts from: TX}) 'c) -- (take true 10)
+;; a null literal of the other temporal type is that type's null
+(at (select {c: (== d 0Np) from: (table [d] (list dnul))}) 'c) -- (== dnul 0Np)
+(at (select {c: (> d 0Np) from: (table [d] (list dnul))}) 'c) -- (> dnul 0Np)

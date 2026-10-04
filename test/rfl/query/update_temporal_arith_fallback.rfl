@@ -1,0 +1,28 @@
+;; update_temporal_arith_fallback.rfl — `update` of a NEW column, and `update
+;; by:`, whose expression the DAG declines (temporal + - *) fall back to
+;; eval-level evaluation like an update of an existing column already does.
+;;
+;; Both sites returned "failed to compile ... expression" instead, while the
+;; same expression worked as `select` and as an update of an existing column
+;; (follow-up to eval_fallback_sym_passthrough).
+
+(set t (table [name ts i] (list [Alice Bob Carol] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000] [1 2 3])))
+
+;; ─── control: existing column, and a compiled new column ────────────────────
+(type (at (update {from: t ts: (+ ts 1)}) 'ts)) -- 'TIMESTAMP
+(type (at (update {from: t x: (+ i 1)}) 'x)) -- 'I64
+
+;; ─── new column with temporal arithmetic ────────────────────────────────────
+(type (at (update {from: t x: (+ ts 1)}) 'x)) -- 'TIMESTAMP
+(at (update {from: t x: (+ ts 1)}) 'x) -- (+ (at t 'ts) 1)
+(at (update {from: t x: (- ts ts)}) 'x) -- (- (at t 'ts) (at t 'ts))
+;; the other columns are untouched
+(type (at (update {from: t x: (+ ts 1)}) 'name)) -- 'SYM
+(at (update {from: t x: (+ ts 1)}) 'name) -- [Alice Bob Carol]
+;; in place on a quoted table name
+(do (update {from: 't y: (- ts ts)}) (type (at t 'y))) -- 'I64
+
+;; ─── update by: with temporal arithmetic in the aggregate ───────────────────
+(set g (table [k ts] (list [a a b] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000])))
+(type (at (update {from: g by: k m: (max (+ ts 1))}) 'm)) -- 'TIMESTAMP
+(at (update {from: g by: k m: (max (+ ts 1))}) 'm) -- [2002.02.02D02:02:02.000000001 2002.02.02D02:02:02.000000001 2003.03.03D03:03:03.000000001]

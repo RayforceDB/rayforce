@@ -135,13 +135,20 @@
 (.db.splayed.set "/tmp/rfl_agg_pts/1/t/" Tts1)
 (.db.splayed.set "/tmp/rfl_agg_pts/2/t/" Tts2)
 (set Pts (.db.parted.get "/tmp/rfl_agg_pts/" 't))
-(select {r: ((fn [c] (sum c)) 'ts) from: Pts}) !- type
+;; The whole-column gate.  (A per-row lambda in a select projection,
+;; `((fn [c] (sum c)) 'ts)`, sums one cell at a time and is no gate: it
+;; only raised `type` here because the fallback could not read a parted
+;; column at all — it returns the cells over a flat table, and now over a
+;; parted one too.)
+(sum (at Pts 'ts)) !- type
+(count (select {r: ((fn [c] (sum c)) 'ts) from: Pts})) -- 5
 (set Tl1 (table [l] (list (list [1 2] [3 4]))))
 (set Tl2 (table [l] (list (list [5 6]))))
 (.db.splayed.set "/tmp/rfl_agg_plist/1/t/" Tl1)
 (.db.splayed.set "/tmp/rfl_agg_plist/2/t/" Tl2)
 (set Pl (.db.parted.get "/tmp/rfl_agg_plist/" 't))
-(select {r: ((fn [c] (sum (first (list c)))) 'l) from: Pl}) !- type
+(sum (at Pl 'l)) !- type
+(count (select {r: ((fn [c] (sum (first (list c)))) 'l) from: Pl})) -- 3
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pwrap /tmp/rfl_agg_pdate /tmp/rfl_agg_pts /tmp/rfl_agg_plist")

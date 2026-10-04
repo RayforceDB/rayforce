@@ -38,6 +38,7 @@ rayforce.cov
 .playwright-mcp/
 site/
 .venv-docs/
+__pycache__/
 
 # Benchmark binaries built into the repo root (the bench/ source dir is
 # unaffected — it has no hyphen).

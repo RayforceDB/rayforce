@@ -1,0 +1,120 @@
+;; #678: a `where:` value that is not a BOOL vector gave shape-dependent
+;; answers.  A bare I64 column reached the filter kernels, which read a mask
+;; as one byte per row (plain select: [] on a 6-row table, 16666 of 200000
+;; rows on a 200k probe), while the count-only / aggregate shapes kept every
+;; row; `where: x take: k` returned the whole table; a symbol literal
+;; `'abc` was folded to "keep every row" by the optimizer, while a computed
+;; symbol scalar and `update ... where: 'abc` were type errors.
+;;
+;; One rule now applies at every site (ray_where_mask_coerce in filter.c):
+;;   - a BOOL vector of row-count length is the mask;
+;;   - a scalar with a truth value (bool / numeric / temporal; zero and null
+;;     are false) holds for every row or none;
+;;   - any other vector (numeric, temporal, symbol, string) is a type error,
+;;     as query_coverage.rfl and where_eval_fallback.rfl already pin.
+;; The tick `'x` resolves to column x inside a query (literal_col_ref.rfl),
+;; so it behaves as the column; `(quote x)` stays the literal symbol 'x and
+;; is a type error like `'abc`.
+
+(set T (table [x y s b f] (list [0 256 0N 1 0 0] (til 6) [a b c d e f] [true false true false true false] [0.0 1.5 0Nf 2.0 0.0 0.0])))
+
+;; (a) an I64 column is no mask: a type error on every shape, never a partial
+;; byte-read mask
+(select {from: T where: x}) !- type
+(count (select {from: T where: x})) !- type
+(select {c: (count y) from: T where: x}) !- type
+(select {c: (sum y) from: T where: x}) !- type
+(select {from: T where: x take: 1}) !- type
+(select {from: T where: x asc: y}) !- type
+(select {c: (count y) from: T where: x by: s}) !- type
+(select {from: T where: (and x (> y 2))}) !- type
+(select {c: (count y) from: T where: (and x (> y 2))}) !- type
+(update {y: 99 from: T where: x}) !- type
+(delete {from: T where: x}) !- type
+
+;; (a') F64 and narrower integer columns, the same
+(select {from: T where: f}) !- type
+(select {c: (count y) from: T where: f}) !- type
+(update {y: 99 from: T where: f}) !- type
+(select {from: T where: (as 'I32 x)}) !- type
+(select {from: T where: (as 'I16 x)}) !- type
+
+;; (b) the tick form of a column name is that column
+(select {from: T where: 'x}) !- type
+(select {c: (count y) from: T where: 'x}) !- type
+(at (select {from: T where: 'b}) 'y) -- [0 2 4]
+(at (select {c: (count y) from: T where: 'b}) 'c) -- [3]
+
+;; (c) a symbol literal has no truth value: a type error on every shape
+(select {from: T where: 'abc}) !- type
+(select {c: (count y) from: T where: 'abc}) !- type
+(select {c: (count y) from: T where: 'abc by: s}) !- type
+(count (select {from: T where: 'abc})) !- type
+(select {from: T where: (quote x)}) !- type
+(select {from: T where: "str"}) !- type
+(update {y: 99 from: T where: 'abc}) !- type
+(delete {from: T where: 'abc}) !- type
+
+;; (d) a computed scalar: numeric by its truth value, symbol a type error
+(at (select {from: T where: (first [1 2])}) 'y) -- [0 1 2 3 4 5]
+(at (select {from: T where: (first [0 2])}) 'y) -- []
+(at (select {c: (count y) from: T where: (first [0 2])}) 'c) -- [0]
+(select {from: T where: (first s)}) !- type
+(update {y: 99 from: T where: (first s)}) !- type
+
+;; (e) BOOL scalar
+(at (select {from: T where: true}) 'y) -- [0 1 2 3 4 5]
+(at (select {from: T where: false}) 'y) -- []
+(at (select {c: (count y) from: T where: false}) 'c) -- [0]
+(at (update {y: 99 from: T where: false}) 'y) -- [0 1 2 3 4 5]
+
+;; (f) BOOL column
+(at (select {from: T where: b}) 'y) -- [0 2 4]
+(at (select {c: (count y) from: T where: b}) 'c) -- [3]
+(at (select {from: T where: b take: 2}) 'y) -- [0 2]
+(at (update {y: 99 from: T where: b}) 'y) -- [99 1 99 3 99 5]
+(at (delete {from: T where: b}) 'y) -- [1 3 5]
+
+;; a SYM column is not a mask either (its ids were read as bytes before)
+(select {from: T where: s}) !- type
+(select {c: (count y) from: T where: s}) !- type
+(update {y: 99 from: T where: s}) !- type
+
+;; a BOOL vector of the wrong length is a length error, not a partial mask
+(select {from: T where: [true false]}) !- length
+(select {from: T where: [1 2]}) !- type
+
+;; (g) the 200k shape from the report: the plain select used to keep 16666
+;; rows (the low byte of every eighth value), the count shape all 200000
+(set N 200000)
+(set B (table [x y] (list (% (til N) 3) (til N))))
+(select {from: B where: x}) !- type
+(select {c: (count y) from: B where: x}) !- type
+(select {from: B where: x take: 10}) !- type
+(count (select {from: B where: (!= x 0)})) -- 133333
+(at (select {c: (count y) from: B where: (!= x 0)}) 'c) -- [133333]
+
+;; ─── review follow-ups ───────────────────────────────────────────────
+;; `and` / `or` over a non-boolean column is the same type error on every
+;; shape: select splits an `and` into one filter per conjunct, update and
+;; `or` compile the whole expression, and the compiled kernel used to read
+;; an I64 operand by its bytes
+(update {y: 99 from: T where: (and x (> y 2))}) !- type
+(delete {from: T where: (and x (> y 2))}) !- type
+(select {from: T where: (or x (> y 4))}) !- type
+(update {y: 99 from: T where: (or x (> y 4))}) !- type
+(select {c: (count y) from: T where: (or x (> y 4))}) !- type
+(select {w: (and x (> y 2)) from: T}) !- type
+(at (select {from: T where: (and b (> y 1))}) 'y) -- [2 4]
+(at (update {y: 99 from: T where: (and b (> y 1))}) 'y) -- [0 1 99 3 99 5]
+(at (select {from: T where: (or b (> y 4))}) 'y) -- [0 2 4 5]
+;; the eval fallback (a projection the DAG declines) takes the same rule
+(set TF (table [x y ts] (list [0 256 0N 1 0 0] (til 6) (+ 2024.01.01D00:00:00.000000000 (* 10 (til 6))))))
+(select {k: (+ ts 1) from: TF where: x}) !- type
+(select {k: (+ ts 1) from: TF where: 'abc}) !- type
+(at (select {k: (+ ts 1) y: y from: TF where: (first [0 2])}) 'y) -- []
+(at (select {k: (+ ts 1) y: y from: TF where: (first [1 2])}) 'y) -- [0 1 2 3 4 5]
+(at (select {k: (+ ts 1) y: y from: TF where: (> y 3)}) 'y) -- [4 5]
+;; the count-only path
+(count (select {from: TF where: (first [0 2])})) -- 0
+(count (select {from: TF where: x})) !- type

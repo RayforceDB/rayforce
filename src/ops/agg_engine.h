@@ -10,6 +10,15 @@
  * the query (see agg_v2_can_handle). Enabled by default. */
 extern bool ray_agg_engine_v2;
 
+/* Test/feature knob: let an unordered grouped `take: N` find its N groups
+ * before aggregating and fold only their rows (agg_first_n_run). On by default. */
+extern bool ray_agg_first_n;
+
+/* Test/feature knob: int/SYM-key parallel groups that are not dense pre-
+ * aggregate into per-task top-bit tables (table stack) and scatter only
+ * all-distinct tails; off = the former radix scatter of every row. */
+extern bool ray_agg_tablestack;
+
 /* Admission is pure: inspecting a plan must not change execution diagnostics. */
 typedef enum {
     AGG_V2_ADMITTED,
@@ -39,6 +48,7 @@ typedef enum {
     AGG_ROUTE_V2_HASH,
     AGG_ROUTE_V2_SMALLHASH,
     AGG_ROUTE_V2_INDEXED,
+    AGG_ROUTE_V2_TABLESTACK,
     AGG_ROUTE_COUNT,
 } agg_route_t;
 
@@ -66,6 +76,10 @@ typedef struct {
     uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
     bool topn_native;               /* last v2 run selected the emit filter's top-N itself */
     int64_t topn_kept;              /* groups kept by that selection (ties included) */
+    uint64_t first_n;               /* unordered take: N answered by the first-N pre-pass */
+    uint32_t ts_tasks;              /* last table-stack run: phase-1 tasks */
+    uint32_t ts_scatter_tasks;      /* ...of which switched to raw scatter */
+    uint64_t ts_tables;             /* ...tables created across all tasks */
 } agg_route_stats_t;
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);

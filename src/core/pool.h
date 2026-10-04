@@ -46,6 +46,26 @@ typedef struct {
     int64_t     end;
 } ray_pool_task_t;
 
+/* Per-worker claim slot of the range+steal scheduler (RAY_POOL_STEAL=1).
+ *
+ * `range` holds the worker's unclaimed tickets as head (low 32 bits) and
+ * tail (high 32 bits) in ONE word, so the owner's head claim and a thief's
+ * tail cut are both a CAS against the whole pair and can never both win the
+ * same ticket.  The halves are absolute ticket numbers mod 2^32 (never
+ * window-relative offsets): a stale CAS that happens to match a later
+ * window's word then takes real, unclaimed tickets of THAT window, with the
+ * right ring slots (slot = low bits of the ticket, task_cap <= 2^16), so the
+ * ABA across windows is benign — the same reasoning that keeps task_claim
+ * monotonic.  The three counters are owner-written statistics (printed at
+ * destroy when RAY_POOL_TRACE is set).  One cache line per worker: the
+ * owner CASes `range` every ticket, thieves touch it only when they steal. */
+typedef struct {
+    _Alignas(64) _Atomic(uint64_t) range;  /* head:32 | tail:32, absolute tickets */
+    uint64_t own;      /* tickets run out of the worker's own share */
+    uint64_t stolen;   /* tickets run that were cut from other workers' tails */
+    uint64_t steals;   /* successful steal operations */
+} ray_pool_slot_t;
+
 /* Thread pool */
 struct ray_pool {
     ray_thread_t*       threads;       /* worker thread handles [n_workers] */
@@ -77,6 +97,24 @@ struct ray_pool {
     uint32_t           task_cap;      /* power of 2 */
     _Atomic(uint64_t)  task_claim;    /* next ticket to claim (bounded CAS) */
     _Atomic(uint64_t)  task_limit;    /* published end of current window */
+
+    /* Range+steal scheduler (RAY_POOL_STEAL, read once at creation; 1 by
+     * default).  Each window [base, base+n) is split into one contiguous
+     * ticket range per worker (main included), kept in slots[w].range; a
+     * worker claims from its head and, once empty, halves the tail of the
+     * other workers' ranges in a fixed victim order.  task_limit stays the
+     * monotonic high-water mark the window is carved from; task_claim is
+     * advanced with it only as bookkeeping.  `win_state` is odd while the
+     * dispatcher is writing the range words of a window and even once they
+     * are all out — a thief that cut a chunk while the window was still
+     * being published runs it privately instead of installing it in its
+     * own slot, which the dispatcher may be about to overwrite with that
+     * worker's share.  0 = shared cursor, the pre-range behaviour. */
+    uint32_t           steal;
+    uint32_t           trace;         /* RAY_POOL_TRACE: histogram at destroy */
+    ray_pool_slot_t*    slots;         /* [n_workers+1], 64-byte aligned */
+    void*              slots_raw;     /* the allocation behind `slots` */
+    _Atomic(uint64_t)  win_state;     /* 2*windows + (publishing ? 1 : 0) */
 
     /* Barrier */
     _Atomic(uint32_t)  pending;       /* decremented by each task completion */
@@ -121,6 +159,19 @@ ray_err_t ray_pool_create(ray_pool_t* pool, uint32_t n_workers);
 
 /* Shutdown and free all resources */
 void ray_pool_free(ray_pool_t* pool);
+
+/* ORDER CONTRACT.  The tasks of one window may run in ANY order and on any
+ * worker: concurrently, a later task before an earlier one, and one worker
+ * may run tasks from anywhere in the window (with ranges+stealing a worker
+ * walks its own slice in order and then takes chunks cut from the END of
+ * other workers' slices; with the shared cursor tasks start in index order
+ * but still finish in any order).  Callers may rely only on (a) each task
+ * running exactly once, (b) a task's identity — its [start, end) or index —
+ * which is what results must be placed by, and (c) everything being done
+ * when the dispatch returns.  Anything that stops early ("first N", a
+ * cutoff, a bound) must be sound whatever the order: derive it from row
+ * positions or values, never from "the tasks before this one have run"
+ * (see ray_fused_take_select in fused_topk.c for the pattern). */
 
 /* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
  * Blocks until all tasks complete. Main thread participates as worker 0. */

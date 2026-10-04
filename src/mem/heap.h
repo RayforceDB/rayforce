@@ -331,7 +331,8 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
 
 /* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
  * committed by the heap.  Allocations that would push this past the anon
- * watermark (default: total physical RAM) are backed by a disk spill file
+ * watermark (default: physical RAM, or the container's cgroup memory limit
+ * when that is smaller — ray_sys_ram_limit) are backed by a disk spill file
  * instead — file-backed pages are always reclaimable, so they cannot trigger
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
  * restores the default); intended for diagnostics and tests. */
@@ -340,7 +341,7 @@ int64_t ray_heap_anon_committed(void);
  * peak RAM an operator actually demanded (pools + direct; excludes spill). */
 int64_t ray_heap_anon_peak(void);
 /* Current anon watermark in bytes (the effective spill threshold; resolves 0
- * to total physical RAM). */
+ * to ray_sys_ram_limit()). */
 int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
 /* Release every block held by the direct-allocation reuse cache back to

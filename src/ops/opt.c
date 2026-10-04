@@ -664,6 +664,10 @@ static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
 
     ray_op_ext_t* pred_ext = find_ext(g, pred->id);
     if (!pred_ext || !pred_ext->literal || !ray_is_atom(pred_ext->literal)) return false;
+    /* Only a constant with a truth value folds.  atom_to_numeric reads a
+     * symbol's id, so `where: 'abc` folded to "keep every row"; left in
+     * place, the filter raises the scalar-predicate type error (#678). */
+    if (pred_ext->literal->type == -RAY_SYM) return false;
 
     bool keep_rows = false;
     if (!atom_to_bool(pred_ext->literal, &keep_rows)) return false;
@@ -675,6 +679,14 @@ static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
         g->nodes[node->id] = *node;
         return true;
     }
+
+    /* Over a table the filter's job is the selection it installs: the
+     * aggregate paths run it for that alone, then group the table under
+     * g->selection.  A take-0 in its place installed none, so a false
+     * `where:` grouped every row.  Leave the filter; it turns the false
+     * constant into an empty selection. */
+    ray_op_t* src = op_child(g, node, 0);
+    if (src && src->out_type == RAY_TABLE) return false;
 
     ray_op_ext_t* ext = ensure_ext_node(g, node->id);
     if (!ext) return false;

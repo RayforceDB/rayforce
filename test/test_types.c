@@ -118,6 +118,21 @@ static test_result_t test_version_getters(void) {
     PASS();
 }
 
+/* ---- test_git_commit --------------------------------------------------- */
+
+/* The exported commit is the one the build embedded, which the REPL and
+ * crash banners print too. */
+static test_result_t test_git_commit(void) {
+    const char* c = ray_git_commit();
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT(c[0] != '\0', "commit string is empty");
+#ifdef RAYFORCE_GIT_COMMIT
+    TEST_ASSERT(strcmp(c, RAYFORCE_GIT_COMMIT) == 0, "commit differs from the build's");
+#endif
+    TEST_ASSERT(ray_git_commit() == c, "commit is a constant");
+    PASS();
+}
+
 /* ---- test_version_string ----------------------------------------------- */
 
 static test_result_t test_version_string(void) {
@@ -188,6 +203,7 @@ const test_entry_t types_entries[] = {
     { "types/sizes_pointer_types", test_type_sizes_pointer_types, NULL, NULL },
     { "types/version_getters", test_version_getters, NULL, NULL },
     { "types/version_string", test_version_string, NULL, NULL },
+    { "types/git_commit", test_git_commit, NULL, NULL },
     { "types/fn_name_builtin", test_fn_name_builtin, types_runtime_setup, types_runtime_teardown },
     { NULL, NULL, NULL, NULL },
 };

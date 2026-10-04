@@ -47,10 +47,22 @@ ray_fd_t  ray_file_open(const char* path, int flags);
 void     ray_file_close(ray_fd_t fd);
 ray_err_t ray_file_lock_ex(ray_fd_t fd);
 ray_err_t ray_file_lock_sh(ray_fd_t fd);
+/* Exclusive lock without waiting: RAY_ERR_IO when another holder has it. */
+ray_err_t ray_file_trylock_ex(ray_fd_t fd);
 ray_err_t ray_file_unlock(ray_fd_t fd);
 ray_err_t ray_file_sync(ray_fd_t fd);
 ray_err_t ray_file_sync_dir(const char* path);
 ray_err_t ray_file_rename(const char* old_path, const char* new_path);
+/* Publish a new path without replacing any existing destination, including
+ * an empty directory.  Uses the host's no-replace rename; where the host or
+ * filesystem lacks one, ray_file_rename_new_emulated (never a racy
+ * check-then-rename). */
+ray_err_t ray_file_rename_new(const char* old_path, const char* new_path);
+/* No-replace rename from portable primitives.  A directory: mkdir claims
+ * the name atomically, then rename replaces only that empty placeholder
+ * (an empty directory is briefly visible at new_path).  A file: link, then
+ * unlink.  POSIX only; exposed for tests. */
+ray_err_t ray_file_rename_new_emulated(const char* old_path, const char* new_path);
 ray_err_t ray_mkdir(const char* path);
 ray_err_t ray_mkdir_p(const char* path);  /* like `mkdir -p` */
 

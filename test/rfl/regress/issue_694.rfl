@@ -1,0 +1,46 @@
+;; #694 — an integer column compared with a float scalar computed inside the
+;; select (an aggregate, or arithmetic on one) compared every row against 0:
+;; the integer-column fast path in binary_range read the scalar as int64
+;; without checking it was one.  Literals and the reversed operand order were
+;; never affected; both are kept as guards.
+(set t (table [i] (list [1 2 3 4 5])))
+
+(at (select {c: (> i (avg i)) from: t}) 'c) -- [false false false true true]
+(at (select {c: (< i (avg i)) from: t}) 'c) -- [true true false false false]
+(at (select {c: (== i (avg i)) from: t}) 'c) -- [false false true false false]
+(at (select {c: (!= i (avg i)) from: t}) 'c) -- [true true false true true]
+(at (select {c: (>= i (avg i)) from: t}) 'c) -- [false false true true true]
+(at (select {c: (<= i (avg i)) from: t}) 'c) -- [true true true false false]
+(at (select {i: i from: t where: (> i (avg i))}) 'i) -- [4 5]
+(at (select {c: (> i (/ (sum i) 5)) from: t}) 'c) -- [false false false true true]
+(at (select {c: (> i (first [3.5])) from: t}) 'c) -- [false false false true true]
+(at (update {c: (> i (avg i)) from: t}) 'c) -- [false false false true true]
+
+;; narrower integer columns take the same kernel
+(set t32 (table [j] (list (as 'i32 [1 2 3 4 5]))))
+(at (select {c: (> j (avg j)) from: t32}) 'c) -- [false false false true true]
+(at (select {j: j from: t32 where: (> j (avg j))}) 'j) -- [4 5]
+(set t16 (table [h] (list (as 'i16 [1 2 3 4 5]))))
+(at (select {c: (> h (avg h)) from: t16}) 'c) -- [false false false true true]
+(set tb (table [b] (list [true false true false true])))
+(at (select {c: (== b (avg b)) from: tb}) 'c) -- [false false false false false]
+
+;; guards: a float literal, a global, and the reversed order were already right
+(at (select {c: (> i 3.0) from: t}) 'c) -- [false false false true true]
+(set thr 3.5)
+(at (select {c: (> i thr) from: t}) 'c) -- [false false false true true]
+(at (select {c: (> (avg i) i) from: t}) 'c) -- [true true false false false]
+(at (select {c: (+ i (avg i)) from: t}) 'c) -- [4.0 5.0 6.0 7.0 8.0]
+
+;; `(count (select {from: t where: (op col lit)}))` takes a counting fast path
+;; that compared the column with the literal's raw integer value: a float
+;; literal decoded to 0, and a DATE or TIME literal against a TIMESTAMP
+;; column compared days or milliseconds with nanoseconds.
+(set TC4 (table [i d ts] (list [1 2 3 4] [2024.01.01 2024.01.02 2024.01.03 2024.01.04] (+ 2024.01.01D00:00:00.000000000 (* (til 4) 43200000000000)))))
+(count (select {from: TC4 where: (> i 2.5)})) -- 2
+(count (select {from: TC4 where: (< i 2.5)})) -- 2
+(count (select {from: TC4 where: (== i 2.0)})) -- 1
+(count (select {from: TC4 where: (> ts 2024.01.02)})) -- 1
+(count (select {from: TC4 where: (>= ts 2024.01.02)})) -- 2
+(count (select {from: TC4 where: (> d 2024.01.02D12:00:00.000000000)})) -- 2
+(count (select {from: TC4 where: (> d 2024.01.02)})) -- 2
