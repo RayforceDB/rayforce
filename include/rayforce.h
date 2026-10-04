@@ -654,6 +654,8 @@ int64_t  ray_sym_intern_runtime(const char* str, size_t len);
 int64_t  ray_sym_find(const char* str, size_t len);
 ray_t*    ray_sym_str(int64_t id);
 uint32_t ray_sym_count(void);
+/* Bytes of string storage the global symbol table holds (its arena). */
+size_t   ray_sym_bytes(void);
 
 /* Borrow a snapshot of the sym → string array.  Returns a pointer to
  * the underlying ray_t** strings table along with its length; valid

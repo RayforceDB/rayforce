@@ -201,6 +201,8 @@ This three-tier scheme means that fully-passing or fully-failing morsels (which 
 
 Rayforce uses a global thread pool (`ray_pool_t`) for parallel execution. Queries with more than `RAY_PARALLEL_THRESHOLD` (64 * 1024 = 65,536) elements are dispatched across worker threads. Each thread processes `RAY_DISPATCH_MORSELS` (8) morsels at a time to amortize scheduling overhead.
 
+Each dispatch splits its tasks into one contiguous range per worker (the main thread included); a worker runs its range in order and, once it is empty, steals half of another worker's remaining range from the tail, so an idle thread never waits on a busy one and the rows a worker touches are sequential. Tasks of one dispatch may therefore run in any order and on any worker: operators place results by task index, and any early stop (a `take:` cutoff, a top-N bound) is derived from row positions or values, never from "the earlier tasks have run". The scheduler is selected once at pool creation (`RAY_POOL_STEAL`, default `1`; `0` restores the shared claim cursor for A/B comparison) and `RAY_POOL_TRACE=1` prints the own-versus-stolen task histogram per worker to stderr at pool destroy; see [REPL Reference](../language/repl.md#environment-variables).
+
 ### Radix-Partitioned Hash Join
 
 Hash joins use adaptive radix partitioning to ensure each partition's hash table fits in L2 cache. The number of radix bits adapts between `RAY_JOIN_MIN_RADIX` (2, producing 4 partitions) and `RAY_JOIN_MAX_RADIX` (14, producing 16K partitions) based on input size, targeting a per-partition working set of `RAY_JOIN_L2_TARGET` (256 KB).
