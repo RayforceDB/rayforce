@@ -34,6 +34,11 @@
 ;; the input table is not modified
 (key T) -- ['s 'v]
 
+;; a sort key naming the derived key column sorts by the key, not the source
+(at (select {c: (count (distinct v)) from: T by: (% v 3) desc: v}) 'v) -- [2 1 0]
+(at (select {c: (count (distinct v)) from: T by: (% v 3) asc: [c v]}) 'v) -- [1 2 0]
+(at (select {c: (count (distinct v)) from: T by: (% v 3) desc: v take: 1}) 'c) -- [13]
+
 ;; plain aggregates keep the DAG path and its naming
 (key (select {c: (count v) from: T by: (% v 3)})) -- ['v 'c]
 (at (select {c: (count v) from: T by: (% v 3) asc: v}) 'c) -- [14 13 13]

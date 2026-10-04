@@ -8911,6 +8911,110 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     return ray_select_impl(args, n, false);
 }
 
+/* The hidden name a bare computed by: key is grouped under (#707). */
+#define SELECT_COMPUTED_KEY "__by_key"
+
+/* A bare computed by: key (`by: (% v 3)`) groups on the DAG path only beside
+ * plain aggregates.  Any other output (a `distinct` aggregate, a row
+ * expression) would send it to the eval-level grouping, which is slower
+ * (10-20% at 10M rows); the by-dict form `{k: (% v 3)}` materializes the key
+ * once and keeps the DAG path's speed for every output shape.  So
+ * that is the query this plans: the same dict with by: as a one-key by-dict
+ * under a hidden name, from: the table already evaluated, and a sort key
+ * naming the derived key column redirected to the hidden one.  The caller
+ * renames the hidden column to `*key_name`, the name the DAG path gives a
+ * computed key.  NULL when the shape needs no rewrite. */
+static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_name) {
+    ray_t* by_expr = dict_get(dict, "by");
+    if (!by_expr || by_expr->type != RAY_LIST || ray_len(by_expr) < 1) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    int64_t rid[7];
+    for (int i = 0; i < 7; i++) rid[i] = ray_sym_intern(reserved[i], strlen(reserved[i]));
+    int64_t nd = ray_dict_len(dict);
+    int64_t hidden = ray_sym_intern(SELECT_COMPUTED_KEY, strlen(SELECT_COMPUTED_KEY));
+    int64_t kname = derived_key_name(by_expr);
+    bool needs_eval = false;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        bool clause = false;
+        for (int r = 0; r < 7; r++) if (kid == rid[r]) clause = true;
+        if (clause) continue;
+        if (kid == kname) kname = ray_sym_intern("key", 3);
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        /* the routing's own test for an output the DAG group cannot serve */
+        if (is_single_group_key_projection(by_expr, v)) continue;
+        if (is_group_dag_agg_expr(v)) continue;
+        if (is_decomposable_agg_compound(v, tbl)) continue;
+        needs_eval = true;
+    }
+    if (!needs_eval || ray_table_get_col(tbl, hidden)) return NULL;
+
+    ray_t* bk = ray_vec_new(RAY_SYM, 1);
+    ray_t* bv = ray_list_new(1);
+    if (bk && !RAY_IS_ERR(bk)) { ((int64_t*)ray_data(bk))[0] = hidden; bk->len = 1; }
+    if (bv && !RAY_IS_ERR(bv)) bv = ray_list_append(bv, by_expr);
+    ray_t* by_dict = ray_dict_new(bk, bv);
+    if (!by_dict || RAY_IS_ERR(by_dict)) return by_dict ? by_dict : ray_error("oom", NULL);
+
+    ray_t* engine = dict;
+    ray_retain(engine);
+    ray_t* k_by = ray_sym(rid[2]);
+    engine = k_by && !RAY_IS_ERR(k_by) ? ray_dict_upsert(engine, k_by, by_dict) : engine;
+    if (k_by) ray_release(k_by);
+    ray_release(by_dict);
+    ray_t* k_from = ray_sym(rid[0]);
+    if (engine && !RAY_IS_ERR(engine) && k_from && !RAY_IS_ERR(k_from))
+        engine = ray_dict_upsert(engine, k_from, tbl);
+    if (k_from) ray_release(k_from);
+    /* asc:/desc: name result columns: the derived key is the hidden one */
+    for (int r = 4; r <= 5 && engine && !RAY_IS_ERR(engine); r++) {
+        ray_t* sv = dict_get(engine, reserved[r]);
+        ray_t* nv = NULL;
+        if (sv && sv->type == -RAY_SYM && sv->i64 == kname) {
+            nv = ray_sym(hidden);
+            if (nv && !RAY_IS_ERR(nv)) nv->attrs = sv->attrs;
+        } else if (sv && sv->type == RAY_SYM) {
+            int64_t n = ray_len(sv);
+            bool hit = false;
+            for (int64_t j = 0; j < n; j++) if (sym_cell_runtime_id(sv, j) == kname) hit = true;
+            if (hit) {
+                nv = ray_vec_new(RAY_SYM, n);
+                if (nv && !RAY_IS_ERR(nv)) {
+                    for (int64_t j = 0; j < n; j++) {
+                        int64_t id = sym_cell_runtime_id(sv, j);
+                        ((int64_t*)ray_data(nv))[j] = id == kname ? hidden : id;
+                    }
+                    nv->len = n;
+                }
+            }
+        }
+        if (!nv) continue;
+        if (RAY_IS_ERR(nv)) { ray_release(engine); return nv; }
+        ray_t* k_s = ray_sym(rid[r]);
+        if (!k_s || RAY_IS_ERR(k_s)) { ray_release(nv); ray_release(engine); return k_s ? k_s : ray_error("oom", NULL); }
+        engine = ray_dict_upsert(engine, k_s, nv);
+        ray_release(k_s);
+        ray_release(nv);
+    }
+    if (!engine || RAY_IS_ERR(engine)) return engine ? engine : ray_error("oom", NULL);
+    *key_name = kname;
+    return engine;
+}
+
+/* Names the hidden key column of a select_plan_computed_key result. */
+static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
+    if (r && !RAY_IS_ERR(r) && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE) return r;
+    int64_t hidden = ray_sym_intern(SELECT_COMPUTED_KEY, strlen(SELECT_COMPUTED_KEY));
+    int64_t nc = ray_table_ncols(r);
+    for (int64_t c = 0; c < nc; c++)
+        if (ray_table_col_name(r, c) == hidden) { ray_table_set_col_name(r, c, key_name); break; }
+    return r;
+}
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
@@ -8983,6 +9087,18 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
             ray_release(engine);
             ray_release(tbl);
             return r;
+        }
+    }
+
+    {
+        int64_t key_name = -1;
+        ray_t* engine = select_plan_computed_key(dict, tbl, &key_name);
+        if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
+        if (engine) {
+            ray_t* r = ray_select_impl(&engine, 1, true);
+            ray_release(engine);
+            ray_release(tbl);
+            return select_name_computed_key(r, key_name);
         }
     }
 
