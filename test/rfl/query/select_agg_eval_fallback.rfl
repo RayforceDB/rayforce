@@ -49,14 +49,26 @@
 (at (select {m: (max i) s: (+ (max ts) 1) from: T}) 's) -- (list (+ (max (at T 'ts)) 1))
 (count (select {s: (+ (max ts) 1) from: T})) -- 1
 
-;; ── a later projection without an aggregate is a row projection, as on the DAG path ─
-(count (select {m: (max i) y: (+ m 1) from: T})) -- 4
-(count (select {m: (max ts) y: (+ m 1) from: T})) -- 4
+;; ── a later projection over an earlier aggregate is one value too (#698) ─────
+(count (select {m: (max i) y: (+ m 1) from: T})) -- 1
+(count (select {m: (max ts) y: (+ m 1) from: T})) -- 1
+(at (select {m: (max i) y: (+ m 1) from: T}) 'y) -- [5]
+(at (select {m: (max ts) y: (+ m 1) from: T}) 'y) -- (list (+ (max (at T 'ts)) 1))
+;; beside a row projection it is broadcast with the aggregate
+(at (select {m: (max ts) y: (+ m 1) x: i from: T}) 'y) -- (take (+ (max (at T 'ts)) 1) 4)
 
 ;; ── projections without an aggregate keep the row-by-row path ────────────────
 (at (select {l: 7 x: (+ ts 1) from: T}) 'l) -- [7 7 7 7]
 (at (select {k: ((fn [a] (if (> a 2) 1 0)) i) x: (+ ts 1) from: T}) 'k) -- [0 0 1 1]
-(count (select {l: 7 s: (+ (max ts) 1) from: T})) -- 4
+;; a literal beside an aggregate is one more scalar (#698), on both paths
+(count (select {l: 7 s: (+ (max ts) 1) from: T})) -- 1
+(count (select {l: 7 s: (+ (max i) 1) from: T})) -- 1
+(at (select {l: 7 s: (+ (max ts) 1) from: T}) 'l) -- [7]
+;; literals alone keep the input's rows
+(count (select {l: 7 from: T})) -- 4
+;; a call over literals may build a column; it stays a row projection
+(count (select {t: (til 4) s: (+ (max ts) 1) from: T})) -- 4
+(count (select {t: (til 4) s: (max i) from: T})) -- 4
 
 ;; ── a length-changing verb beside an aggregate is still ragged ───────────────
 (select {a: (distinct i) m: (max i) from: (table [i] (list [1 2 2 3]))}) !- length

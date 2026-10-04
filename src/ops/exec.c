@@ -1631,11 +1631,9 @@ static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
     return gx && gx->n_keys > 0;
 }
 
-/* True when the op tree under `id` carries none of the input's rows: every
- * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
- * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
- * cannot on a one-row table (#675). */
-static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id, int depth) {
+/* True when every leaf of the op tree under `id` is a constant or, with
+ * `reduced`, sits under a reduction. */
+static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth) {
     if (id >= g->node_count || depth > 64) return false;
     ray_op_t* n = &g->nodes[id];
     switch (n->opcode) {
@@ -1645,17 +1643,32 @@ static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id, int depth) {
     case OP_MIN: case OP_MAX:
     case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
     case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP:
-        return true;
+        if (reduced) return true;
+        break;
     default: break;
     }
     if (n->arity == 0) return false;
     for (uint32_t i = 0; i < n->arity && i < 2; i++)
-        if (!op_tree_is_scalar(g, n->in_id[i], depth + 1)) return false;
+        if (!op_tree_leaves(g, n->in_id[i], reduced, depth + 1)) return false;
     if (n->opcode == OP_IF) {           /* the else branch rides in the ext */
         ray_op_ext_t* x = find_ext(g, id);
-        if (!x || !op_tree_is_scalar(g, x->third_in, depth + 1)) return false;
+        if (!x || !op_tree_leaves(g, x->third_in, reduced, depth + 1)) return false;
     }
     return true;
+}
+
+/* True when the op tree under `id` carries none of the input's rows: every
+ * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
+ * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
+ * cannot on a one-row table (#675). */
+static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, 0);
+}
+
+/* True when the op tree under `id` reads no column at all, not even under a
+ * reduction: a literal, or an expression over literals. */
+static bool op_tree_is_const(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, false, 0);
 }
 
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
@@ -3675,10 +3688,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_release(input);
                         return vec ? vec : ray_error("nyi", NULL);
                     }
-                    /* Broadcast scalar atoms to full column vectors */
+                    /* A scalar atom becomes a one-element column, widened
+                     * below only if another column carries the input's
+                     * rows.  Broadcast here, it posed as such a column and
+                     * widened the scalars beside it (#698). */
                     if (vec->type < 0) {
-                        int64_t nr = ray_table_nrows(input);
-                        ray_t* col = broadcast_scalar(vec, nr);
+                        ray_t* col = ray_enlist_fn(&vec, 1);
                         ray_release(vec);
                         vec = col;
                         if (!vec || RAY_IS_ERR(vec)) {
@@ -3701,9 +3716,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
             }
 
-            /* A scalar computed as a one-element vector rather than an atom,
-             * such as `(+ (sum x) 0)` or an `if` whose parts are all scalar,
-             * is broadcast like an atom when another column has the input's
+            /* A scalar column, an atom enlisted above or one computed as a
+             * one-element vector (`(+ (sum x) 0)`, an `if` whose parts are
+             * all scalar), is broadcast when another column has the input's
              * rows.  Left alone, the table took its row count from whichever
              * column came first and its columns disagreed in length.  When
              * every column is a scalar the one-row result stays. */
@@ -3722,7 +3737,16 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                      * same length: read the ops instead, so a scalar-only
                      * select under a failing where: is still one row. */
                     for (uint32_t c = 0; c < n_cols && !has_full; c++)
-                        if (!op_tree_is_scalar(g, columns[c], 0)) has_full = true;
+                        if (!op_tree_is_scalar(g, columns[c])) has_full = true;
+                }
+                /* A select of literals alone (`{s: 1}`) reduces nothing and
+                 * keeps the input's rows.  Beside an aggregate a literal is
+                 * one more scalar, as in a keyless group. */
+                if (!has_full) {
+                    bool all_const = true;
+                    for (uint32_t c = 0; c < n_cols && all_const; c++)
+                        if (!op_tree_is_const(g, columns[c])) all_const = false;
+                    has_full = all_const;
                 }
                 /* Every column a scalar: the reductions inside them already
                  * walked the where: selection (exec_reduction), so the
@@ -3733,9 +3757,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(g->selection);
                     g->selection = NULL;
                 }
+                /* A LIST here is an atom enlist has no vector for (F32). */
                 for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
-                    if (!cv || cv->type <= 0 || RAY_IS_PARTED(cv->type) ||
+                    if (!cv || cv->type < 0 || RAY_IS_PARTED(cv->type) ||
                         cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
                     ray_t* n_obj = make_i64(nr_in);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);

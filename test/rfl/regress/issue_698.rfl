@@ -1,0 +1,84 @@
+;; #698 — a select with a bare aggregate beside a scalar expression over
+;; aggregates came back with one row per input row.  The mixed outputs route
+;; through OP_SELECT, which broadcast the aggregate's atom to the input's rows
+;; as soon as it was computed; the broadcast column then counted as one that
+;; carries the input's rows, and the one-element `(+ (sum x) 1)` was
+;; broadcast beside it.  No output reads a row, so the result is one row.
+(set T (table [x] (list (til 8))))
+
+(count (select {s: (sum x) k: (+ (sum x) 1) from: T})) -- 1
+(at (select {s: (sum x) k: (+ (sum x) 1) from: T}) 's) -- [28]
+(at (select {s: (sum x) k: (+ (sum x) 1) from: T}) 'k) -- [29]
+(at (select {k: (+ (sum x) 1) s: (sum x) from: T}) 's) -- [28]
+(at (select {s: (sum x) m: (max x) k: (* (min x) 2) from: T}) 'm) -- [7]
+;; a scalar `if` over an aggregate beside a bare one
+(at (select {s: (sum x) k: (if (> (sum x) 4) 1 0) from: T}) 'k) -- [1]
+;; atoms of other types: a symbol and a float
+(set S (table [g v] (list ['a 'b 'c] [1.5 2.5 3.5])))
+(at (select {f: (first g) c: (+ (count g) 0) from: S}) 'f) -- ['a]
+(at (select {a: (avg v) c: (+ (count g) 0) from: S}) 'a) -- [2.5]
+
+;; a literal beside an aggregate carries no rows either
+(count (select {s: 1 y: (sum x) from: T})) -- 1
+(at (select {s: 1 y: (sum x) from: T}) 's) -- [1]
+(count (select {s: 1 k: (+ (sum x) 1) from: T})) -- 1
+
+;; under where: the reductions walk the selection; still one row
+(at (select {s: (sum x) k: (+ (sum x) 1) from: T where: (> x 3)}) 's) -- [22]
+(at (select {s: (sum x) k: (+ (sum x) 1) from: T where: (> x 3)}) 'k) -- [23]
+(at (select {s: (sum x) k: (+ (sum x) 1) from: T where: (> x 100)}) 'k) -- [1]
+(at (select {s: (sum x) k: (+ (sum x) 1) from: T where: (> x 3) take: 3}) 's) -- [22]
+;; an empty input reduces to one row as well
+(set E (select {x: x from: T where: (> x 100)}))
+(at (select {s: (sum x) k: (+ (sum x) 1) from: E}) 'k) -- [1]
+;; a one-row input
+(at (select {s: (sum x) k: (+ (sum x) 1) from: (table [x] (list [5]))}) 'k) -- [6]
+(at (select {s: (sum x) k: (+ (sum x) 1) from: (table [x] (list [5])) where: (> x 10)}) 'k) -- [1]
+
+;; guards: an output reading rows still broadcasts the scalars beside it
+(count (select {s: (sum x) y: x from: T})) -- 8
+(at (select {s: (sum x) y: x from: T where: (> x 5)}) 's) -- [13 13]
+(at (select {s: (sum x) k: (+ (sum x) 1) y: x from: T where: (> x 5)}) 'k) -- [14 14]
+(at (select {s: 1 y: x from: T where: (> x 5)}) 's) -- [1 1]
+;; a select of literals alone keeps the input's rows
+(count (select {s: 1 from: T})) -- 8
+(count (select {s: 1 from: T where: (> x 5)})) -- 2
+(count (select {s: 1 from: E})) -- 0
+(count (select {s: 1 t: 'a from: T})) -- 8
+
+;; a one-row literal select under a failing where: is no row, as on any input
+(count (select {s: 1 from: (table [x] (list [5])) where: (> x 10)})) -- 0
+
+;; scalars of any atom type widen beside a row column; these were broadcast
+;; by a str/i64/f64/bool/sym-only routine and failed with a type error
+(set D (table [d x] (list [2024.01.01 2024.01.03] [1 2])))
+(at (select {m: (max d) y: x from: D}) 'm) -- [2024.01.03 2024.01.03]
+(at (select {m: (max d) k: (+ (sum x) 1) from: D}) 'm) -- [2024.01.03]
+(at (select {m: (max (as 'I32 x)) y: x from: D}) 'm) -- (as 'I32 [2 2])
+(at (select {m: (avg (as 'F64 [0N 0N])) y: x from: D}) 'm) -- [0Nf 0Nf]
+
+;; a later output over an earlier aggregate reads its value, not a one-row
+;; column (the eval fallback; `type` and `til` are not compiled)
+(set T6 (table [x] (list (til 6))))
+(at (select {m: (max x) t: (type m) from: T6}) 't) -- ['i64]
+(at (select {m: (count x) y: (til m) from: T6}) 'y) -- (list (til 6))
+(at (select {m: (max x) y: (+ m 1) z: (* y 2) from: T6}) 'z) -- [12]
+;; beside a row column it is read per row, as before
+(at (select {m: (max x) t: (type m) w: x from: T6}) 't) -- (take 'i64 6)
+
+;; a one-element vector literal is a scalar like an atom: alone it keeps the
+;; input's rows, as it already did beside an atom literal
+(count (select {a: [7] from: T6})) -- 6
+(count (select {a: [7] b: 1 from: T6})) -- 6
+(count (select {a: [7] s: (sum x) from: T6})) -- 1
+
+;; ─── on a parted table ───────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_q698_parted")
+(.db.splayed.set "/tmp/rfl_q698_parted/2024.01.01/t/" (table [x] (list [1 2 3])))
+(.db.splayed.set "/tmp/rfl_q698_parted/2024.01.02/t/" (table [x] (list [10 20])))
+(set P (.db.parted.get "/tmp/rfl_q698_parted/" 't))
+(count (select {s: (sum x) k: (+ (sum x) 1) from: P})) -- 1
+(at (select {s: (sum x) k: (+ (sum x) 1) from: P}) 'k) -- [37]
+(at (select {s: (sum x) k: (+ (sum x) 1) from: P where: (> x 2)}) 's) -- [33]
+(count (select {s: (sum x) y: x from: P})) -- 5
+(.sys.exec "rm -rf /tmp/rfl_q698_parted")

@@ -8224,6 +8224,40 @@ static int select_fallback_has_agg(ray_t* expr) {
     return 0;
 }
 
+/* 1 when the leaves of `expr` are atom literals and the names in `scalars`,
+ * the earlier outputs already known to be one value; `*via` is set when a
+ * name was among them.  A column, a global, a vector literal or a lambda,
+ * let or quote form may carry rows, and answers 0. */
+static int select_fallback_scalar_leaves(ray_t* expr, const int64_t* scalars,
+                                         int64_t ns, int* via) {
+    if (!expr) return 0;
+    if (ray_is_atom(expr)) {
+        if (expr->type != -RAY_SYM || (expr->attrs & ATTR_QUOTED)) return 1;
+        for (int64_t i = 0; i < ns; i++)
+            if (scalars[i] == expr->i64) { *via = 1; return 1; }
+        return 0;
+    }
+    if (expr->type != RAY_LIST) return 0;
+    int64_t n = ray_len(expr);
+    if (n == 0) return 0;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (el[0]->type != -RAY_SYM || select_alias_skip_form(el[0])) return 0;
+    for (int64_t i = 1; i < n; i++)
+        if (!select_fallback_scalar_leaves(el[i], scalars, ns, via)) return 0;
+    return 1;
+}
+
+/* 1 when `expr`, an output with no aggregate in it, is one value for the
+ * whole select: an atom literal, or an expression over earlier one-value
+ * outputs (`y: (+ m 1)` after `m: (max i)`).  A call over literals alone
+ * (`(til 8)`) may build a column of the input's length and stays a row
+ * projection. */
+static int select_fallback_scalar_proj(ray_t* expr, const int64_t* scalars, int64_t ns) {
+    int via = 0;
+    return select_fallback_scalar_leaves(expr, scalars, ns, &via) &&
+           (via || ray_is_atom(expr));
+}
+
 static bool select_alias_head_is_agg(ray_t* head) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
     if (resolve_agg_opcode(head->i64) != 0) return true;
@@ -13306,16 +13340,37 @@ by_dict_done:
                  * value broadcast as the DAG path broadcasts it (exec.c
                  * OP_SELECT): to nrows beside a projection that flows a row
                  * column through, and to one row when no projection does
-                 * (case (a) above: an all-aggregate select is one row). */
-                int any_row_proj = 0;
+                 * (case (a) above: an all-aggregate select is one row).
+                 * A literal, or an expression over earlier one-value
+                 * outputs, carries no rows either (#698); a select of
+                 * literals alone keeps the input's rows. */
+                int any_row_proj = 0, any_agg = 0;
+                ray_t* scal_hdr = NULL;
+                int64_t* scalars = (int64_t*)scratch_alloc(&scal_hdr,
+                        (size_t)(dict_n / 2 + 1) * sizeof(int64_t));
+                if (!scalars) {
+                    ray_release(result);
+                    if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                    if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(colops_hdr);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                }
+                int64_t n_scalars = 0;
                 for (int64_t i = 0; i + 1 < dict_n && !any_row_proj; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
                     if (kid == from_id || kid == where_id || kid == by_id ||
                         kid == take_id || kid == asc_id || kid == desc_id ||
                         kid == nearest_id) continue;
                     ray_t* e = dict_elems[i + 1];
-                    any_row_proj = expr_refs_row_column(e, tbl) || !select_fallback_has_agg(e);
+                    int has_agg = select_fallback_has_agg(e);
+                    any_agg |= has_agg;
+                    any_row_proj = has_agg ? expr_refs_row_column(e, tbl)
+                                           : !select_fallback_scalar_proj(e, scalars, n_scalars);
+                    if (!any_row_proj) scalars[n_scalars++] = kid;
                 }
+                scratch_free(scal_hdr);
+                if (!any_agg) any_row_proj = 1;
                 int64_t bcast_len = any_row_proj ? nrows : 1;
                 int64_t out_len = -1;   /* length of the first materialized column */
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
@@ -13355,7 +13410,16 @@ by_dict_done:
                     } else {
                         col = select_fallback_passthrough_col(expr, tbl, nrows);
                         if (!col) {
-                            col = (whole_verb || one_value)
+                            /* An expression over earlier one-value outputs
+                             * with no aggregate of its own reads them at
+                             * row 0, as the row path reads a cell: they are
+                             * bound as one-row columns, and over the whole
+                             * column `(til m)` saw `[6]`, not 6 (#698). */
+                            int at_row0 = one_value && !whole_verb &&
+                                          !ray_is_atom(expr) &&
+                                          !select_fallback_has_agg(expr);
+                            col = at_row0 ? eval_expr_per_row(expr, tbl, 1)
+                                : (whole_verb || one_value)
                                 ? eval_expr_whole_column(expr, tbl)
                                 : eval_expr_per_row(expr, tbl, nrows);
                             if (one_value) col = select_fallback_broadcast(col, bcast_len);
