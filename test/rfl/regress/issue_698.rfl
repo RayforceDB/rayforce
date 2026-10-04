@@ -57,6 +57,21 @@
 (at (select {m: (max (as 'I32 x)) y: x from: D}) 'm) -- (as 'I32 [2 2])
 (at (select {m: (avg (as 'F64 [0N 0N])) y: x from: D}) 'm) -- [0Nf 0Nf]
 
+;; a later output over an earlier aggregate reads its value, not a one-row
+;; column (the eval fallback; `type` and `til` are not compiled)
+(set T6 (table [x] (list (til 6))))
+(at (select {m: (max x) t: (type m) from: T6}) 't) -- ['i64]
+(at (select {m: (count x) y: (til m) from: T6}) 'y) -- (list (til 6))
+(at (select {m: (max x) y: (+ m 1) z: (* y 2) from: T6}) 'z) -- [12]
+;; beside a row column it is read per row, as before
+(at (select {m: (max x) t: (type m) w: x from: T6}) 't) -- (take 'i64 6)
+
+;; a one-element vector literal is a scalar like an atom: alone it keeps the
+;; input's rows, as it already did beside an atom literal
+(count (select {a: [7] from: T6})) -- 6
+(count (select {a: [7] b: 1 from: T6})) -- 6
+(count (select {a: [7] s: (sum x) from: T6})) -- 1
+
 ;; ─── on a parted table ───────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_q698_parted")
 (.db.splayed.set "/tmp/rfl_q698_parted/2024.01.01/t/" (table [x] (list [1 2 3])))

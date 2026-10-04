@@ -13169,7 +13169,16 @@ by_dict_done:
                     } else {
                         col = select_fallback_passthrough_col(expr, tbl, nrows);
                         if (!col) {
-                            col = (whole_verb || one_value)
+                            /* An expression over earlier one-value outputs
+                             * with no aggregate of its own reads them at
+                             * row 0, as the row path reads a cell: they are
+                             * bound as one-row columns, and over the whole
+                             * column `(til m)` saw `[6]`, not 6 (#698). */
+                            int at_row0 = one_value && !whole_verb &&
+                                          !ray_is_atom(expr) &&
+                                          !select_fallback_has_agg(expr);
+                            col = at_row0 ? eval_expr_per_row(expr, tbl, 1)
+                                : (whole_verb || one_value)
                                 ? eval_expr_whole_column(expr, tbl)
                                 : eval_expr_per_row(expr, tbl, nrows);
                             if (one_value) col = select_fallback_broadcast(col, bcast_len);
