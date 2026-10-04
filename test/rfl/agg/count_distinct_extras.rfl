@@ -233,11 +233,11 @@
 ;; segments), the first scattered rows (MIX segments).
 (set Nsp 300000)
 (set isp (til Nsp))
-(set vsp (as 'SYMBOL (map (fn [k] (if (== 0 (% k 97)) (format "a Google %" (% k 11)) (format "v%" k))) (til 2000))))
+(set vsp (as 'SYMBOL (map (fn [k] (if (== 0 (% k 97)) (format "a needle %" (% k 11)) (format "v%" k))) (til 2000))))
 (set Tsp (table [k s u r] (list (% (* isp 7) 701) (at vsp (% isp 2000)) (% (* isp 13) 977) isp)))
-(set Fsp (select {from: Tsp where: (and (like s "*Google*") (> u 100))}))
+(set Fsp (select {from: Tsp where: (and (like s "*needle*") (> u 100))}))
 (< (* 8 (count Fsp)) Nsp) -- true
-(set SA (select {from: (select {from: Tsp by: k c: (count u) d: (count (distinct u)) mn: (min s) where: (and (like s "*Google*") (> u 100))}) asc: k}))
+(set SA (select {from: (select {from: Tsp by: k c: (count u) d: (count (distinct u)) mn: (min s) where: (and (like s "*needle*") (> u 100))}) asc: k}))
 (set SB (select {from: (select {from: Fsp by: k c: (count u) d: (count (distinct u)) mn: (min s)}) asc: k}))
 (== (count SA) (count SB)) -- true
 (all (== (at SA 'c) (at SB 'c))) -- true
