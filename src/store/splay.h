@@ -31,8 +31,8 @@ struct ray_sym_domain_s;
 
 /* Internal publication protocol shared by the table and streaming CSV writers.
  * begin serializes writers; finish publishes only on success and always unlocks.
- * Publication keeps the current generation and one previous generation; older
- * staged directories are removed best-effort after each successful publish. */
+ * Publication keeps only the current generation; the others, and the first
+ * write's root columns, are removed best-effort after each successful publish. */
 typedef struct {
     ray_fd_t lock;
     bool locked;
@@ -53,8 +53,12 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
 /* Write only to a fresh/unpublished directory owned by the caller. */
 ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable);
-/* Resolve once and retain the returned path for the entire read. */
+/* The returned generation may be removed by the next publish: open every file
+ * of a read right after resolving, and resolve again if one is missing (the
+ * splayed loaders and ray_splay_has_schema do). */
 ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz);
+/* Does dir hold a published table (a schema in its selected generation)? */
+bool ray_splay_has_schema(const char* dir);
 
 /* Splayed table I/O.
  *

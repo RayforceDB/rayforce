@@ -569,14 +569,10 @@ static ray_err_t collect_table_dirs(const char* pdir, char*** out_names,
     struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;   /* ".", "..", and the ".sym" dotfile */
-        char tdir[1024], resolved[1024], dpath[1100];
+        char tdir[1024];
         int dn = snprintf(tdir, sizeof(tdir), "%s/%s", pdir, ent->d_name);
         if (dn < 0 || (size_t)dn >= sizeof(tdir)) continue;
-        if (ray_splay_resolve_dir(tdir, resolved, sizeof(resolved)) != RAY_OK) continue;
-        dn = snprintf(dpath, sizeof(dpath), "%s/.d", resolved);
-        if (dn < 0 || (size_t)dn >= sizeof(dpath)) continue;
-        struct stat st;
-        if (stat(dpath, &st) != 0 || !S_ISREG(st.st_mode)) continue; /* not a table */
+        if (!ray_splay_has_schema(tdir)) continue; /* not a table */
         if (count >= cap) {
             int64_t ncap = cap == 0 ? 16 : cap * 2;
             char** tmp = (char**)ray_realloc_raw(names, (size_t)ncap * sizeof(char*));
@@ -612,14 +608,10 @@ static ray_err_t collect_table_dirs(const char* pdir, char*** out_names,
 /* Does partition `part` contain splayed table `tname` (i.e. a `.d` schema)? */
 static bool partition_has_table(const char* db_root, const char* part,
                                 const char* tname) {
-    char tdir[1024], resolved[1024], dpath[1100];
+    char tdir[1024];
     int n = snprintf(tdir, sizeof(tdir), "%s/%s/%s", db_root, part, tname);
     if (n < 0 || (size_t)n >= sizeof(tdir)) return false;
-    if (ray_splay_resolve_dir(tdir, resolved, sizeof(resolved)) != RAY_OK) return false;
-    n = snprintf(dpath, sizeof(dpath), "%s/.d", resolved);
-    if (n < 0 || (size_t)n >= sizeof(dpath)) return false;
-    struct stat st;
-    return stat(dpath, &st) == 0 && S_ISREG(st.st_mode);
+    return ray_splay_has_schema(tdir);
 }
 
 /* Build a 0-row table with the same column names and types as `tmpl`. */

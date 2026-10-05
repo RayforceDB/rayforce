@@ -1373,10 +1373,11 @@ static test_result_t test_save_sweeps_stale_and_skips_sym(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(narrow));
     TEST_ASSERT_EQ_I(ray_splay_save(narrow, dir, NULL), RAY_OK);
 
-    /* Old readers can still open b; the new generation has only a. */
+    /* The new generation has only a; the first write's b is removed with
+     * the rest of its columns (a reader that resolved them resolves again). */
     char bpath[512];
     snprintf(bpath, sizeof(bpath), "%s/b", dir);
-    TEST_ASSERT_EQ_I(access(bpath, F_OK), 0);
+    TEST_ASSERT_EQ_I(access(bpath, F_OK), -1);
     ray_t* loaded = ray_splay_load(dir, NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
@@ -2556,27 +2557,10 @@ static test_result_t test_generation_prune_unlinks_symlink(void) {
     TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
     TEST_ASSERT_EQ_I(ray_splay_save(three, dir, NULL), RAY_OK);
 
-    char current[1024], generations[1024], prune_dir[1024];
-    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, current, sizeof(current)), RAY_OK);
-    int n = snprintf(generations, sizeof(generations), "%s/.generations", dir);
-    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(generations));
-    DIR* d = opendir(generations);
-    TEST_ASSERT_NOT_NULL(d);
-    prune_dir[0] = '\0';
-    struct dirent* entry;
-    while ((entry = readdir(d))) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-            continue;
-        char full[1024];
-        n = snprintf(full, sizeof(full), "%s/%s", generations, entry->d_name);
-        TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(full));
-        if (strcmp(full, current) != 0) {
-            snprintf(prune_dir, sizeof(prune_dir), "%s", full);
-            break;
-        }
-    }
-    closedir(d);
-    TEST_ASSERT_TRUE(prune_dir[0] != '\0');
+    /* The selected generation is the one the next publish removes. */
+    char prune_dir[1024];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, prune_dir, sizeof(prune_dir)), RAY_OK);
+    int n;
 
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(victim), 0);
     FILE* f = fopen(victim_file, "wb");
@@ -2661,46 +2645,235 @@ static test_result_t test_generation_io_failures(void) {
     /* Failure must also release the writer lock so a retry can commit. */
     TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
     TEST_ASSERT_TRUE(generation_matches(dir, true, 9));
-    TEST_ASSERT_TRUE(generation_dir_count(dir) <= 2);
+    TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
     ray_release(next);
     ray_release(old);
     rm_rf(dir);
     PASS();
 }
 
-static test_result_t test_generation_retains_readers(void) {
+/* Only the selected generation is kept.  A table mapped before a replacement
+ * stays readable after its files are removed; a new read sees the new one. */
+static test_result_t test_generation_keeps_only_current(void) {
     const char* dir = TMP_SPLAY_BASE "/generation_readers";
     rm_rf(dir);
     ray_t* old = generation_pair(1);
     ray_t* next = generation_pair(9);
     TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
     for (int era = 0; era < 2; era++) {
-        char resolved[1024], path[1100];
+        /* era 0: the first write's root files; era 1: a generation. */
+        char resolved[1024], schema[1100];
         TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
         ray_t* pinned = ray_read_splayed(dir, NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(pinned));
         TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
-        /* Reader resolved the old path before publication but opens a column
-         * afterwards. Both the on-disk file and an existing mmap must survive. */
-        snprintf(path, sizeof(path), "%s/y", resolved);
-        ray_t* late = ray_col_load(path);
-        TEST_ASSERT_NOT_NULL(late);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(late));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(late))[0], 10);
-        ray_release(late);
+        snprintf(schema, sizeof(schema), "%s/.d", resolved);
+        TEST_ASSERT_EQ_I(access(schema, F_OK), -1);
+#ifndef _WIN32
         ray_t* py = ray_table_get_col(pinned, ray_sym_intern("y", 1));
         TEST_ASSERT_NOT_NULL(py);
         TEST_ASSERT_EQ_I(((int64_t*)ray_data(py))[0], 10);
+#endif
         ray_release(pinned);
         TEST_ASSERT_TRUE(generation_matches(dir, false, 9));
+        TEST_ASSERT_TRUE(generation_matches(dir, true, 9));
+        TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
         TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
     }
-    TEST_ASSERT_TRUE(generation_dir_count(dir) <= 2);
+    TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
     ray_release(next);
     ray_release(old);
     rm_rf(dir);
     PASS();
 }
+
+/* Names in dir other than "." and "..", sorted, joined by spaces. */
+static void dir_listing(const char* dir, char* out, size_t out_sz) {
+    char names[32][256];
+    int count = 0;
+    out[0] = '\0';
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* entry;
+    while ((entry = readdir(d)) && count < 32) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        snprintf(names[count++], sizeof(names[0]), "%s", entry->d_name);
+    }
+    closedir(d);
+    for (int i = 0; i < count; i++)
+        for (int j = i + 1; j < count; j++)
+            if (strcmp(names[i], names[j]) > 0) {
+                char t[256];
+                memcpy(t, names[i], sizeof(t));
+                memcpy(names[i], names[j], sizeof(t));
+                memcpy(names[j], t, sizeof(t));
+            }
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(out + used, out_sz - used, "%s%s", i ? " " : "", names[i]);
+        if (n < 0 || (size_t)n >= out_sz - used) return;
+        used += (size_t)n;
+    }
+}
+
+/* Issue 713: a table replaced three times holds one copy of itself.  The
+ * first write's columns and their sidecars go at the first publish; the
+ * symfile and the lock file stay. */
+static test_result_t test_generation_first_write_removed(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_first_write";
+    rm_rf(dir);
+    int64_t s_id = ray_sym_intern("s", 1);
+    ray_t* t = generation_pair(1);
+    ray_t* sv = ray_vec_new(RAY_SYM, 2);
+    int64_t a = ray_sym_intern("a", 1), b = ray_sym_intern("b", 1);
+    sv = ray_vec_append(sv, &a);
+    sv = ray_vec_append(sv, &b);
+    t = ray_table_add_col(t, s_id, sv);
+    ray_release(sv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    char sym[1100];
+    snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, sym), RAY_OK);
+    /* A sidecar of a first-write column goes with it. */
+    FILE* f = fopen(TMP_SPLAY_BASE "/generation_first_write/x.link", "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("other", f);
+    fclose(f);
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_EQ_I(ray_splay_save(t, dir, sym), RAY_OK);
+
+    char listing[512];
+    dir_listing(dir, listing, sizeof(listing));
+    TEST_ASSERT_STR_EQ(listing, ".current .generations .sym .sym.lk .write.lock");
+    TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
+    ray_t* loaded = ray_read_splayed(dir, sym);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 2);
+    ray_t* ls = ray_table_get_col(loaded, s_id);
+    TEST_ASSERT_NOT_NULL(ls);
+    TEST_ASSERT_EQ_I(ls->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(ls->len, 2);
+    ray_release(loaded);
+    ray_release(t);
+    rm_rf(dir);
+    PASS();
+}
+
+/* A table first written into a directory that holds other things (the
+ * database root of new/../db/) loses only the columns its schema named:
+ * not a partition, not a file named like no column of it. */
+static test_result_t test_generation_first_write_keeps_others(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_shared_root";
+    rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t"), 0);
+    FILE* f = fopen(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep", "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fclose(f);
+    ray_t* one = generation_pair(1);
+    ray_t* two = generation_pair(2);
+    TEST_ASSERT_EQ_I(ray_splay_save(one, dir, NULL), RAY_OK);
+    f = fopen(TMP_SPLAY_BASE "/generation_shared_root/notes", "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fclose(f);
+    TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
+    char listing[512];
+    dir_listing(dir, listing, sizeof(listing));
+    TEST_ASSERT_STR_EQ(listing, ".current .generations .write.lock 2026.10.05 notes");
+    TEST_ASSERT_EQ_I(access(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep", F_OK), 0);
+    TEST_ASSERT_TRUE(generation_matches(dir, true, 2));
+    ray_release(two);
+    ray_release(one);
+    rm_rf(dir);
+    PASS();
+}
+
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
+
+/* The publisher of test_generation_reader_races, as a writer that keeps no
+ * previous generation: make a fresh generation (hard links to the template),
+ * select it, remove the one it replaced.  Names are never reused, as the
+ * writer's are not.  Plain libc only: it runs in a forked child. */
+static void generation_flip_child(const char* dir, const char* tmpl) {
+    const char* names[] = {".d", "x", "y"};
+    struct timespec pause = {0, 100 * 1000};
+    for (int i = 1; i <= 3000; i++) {
+        char tmp[1100], cur[1100], path[1200], src[1200];
+        snprintf(path, sizeof(path), "%s/.generations/g-%d", dir, i);
+        if (mkdir(path, 0755) != 0) _exit(1);
+        for (size_t k = 0; k < 3; k++) {
+            snprintf(src, sizeof(src), "%s/%s", tmpl, names[k]);
+            snprintf(path, sizeof(path), "%s/.generations/g-%d/%s", dir, i, names[k]);
+            if (link(src, path) != 0) _exit(1);
+        }
+        snprintf(tmp, sizeof(tmp), "%s/.current.tmp", dir);
+        snprintf(cur, sizeof(cur), "%s/.current", dir);
+        FILE* f = fopen(tmp, "wb");
+        if (!f) _exit(1);
+        fprintf(f, ".generations/g-%d\n", i);
+        fclose(f);
+        if (rename(tmp, cur) != 0) _exit(1);
+        for (size_t k = 0; k < 3; k++) {
+            snprintf(path, sizeof(path), "%s/.generations/g-%d/%s", dir, i - 1, names[k]);
+            (void)unlink(path);
+        }
+        snprintf(path, sizeof(path), "%s/.generations/g-%d", dir, i - 1);
+        (void)rmdir(path);
+        nanosleep(&pause, NULL);
+    }
+    _exit(0);
+}
+
+/* A reader whose generation is removed before it opened every file resolves
+ * again and reads the selected one: no read fails while another process
+ * publishes and prunes. */
+static test_result_t test_generation_reader_races(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_race";
+    const char* tmpl = TMP_SPLAY_BASE "/generation_race_tmpl";
+    rm_rf(dir);
+    rm_rf(tmpl);
+    ray_t* t = generation_pair(1);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, tmpl, NULL), RAY_OK);
+    /* The child removes g-0 first: the table's own generation is moved there. */
+    char resolved[1024], g0[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
+    snprintf(g0, sizeof(g0), "%s/.generations/g-0", dir);
+    TEST_ASSERT_EQ_I(rename(resolved, g0), 0);
+    FILE* f = fopen(TMP_SPLAY_BASE "/generation_race/.current", "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs(".generations/g-0\n", f);
+    fclose(f);
+
+    fflush(NULL);
+    pid_t child = fork();
+    TEST_ASSERT_TRUE(child >= 0);
+    if (child == 0) generation_flip_child(dir, tmpl);
+
+    int reads = 0, failures = 0, status = 0;
+    while (waitpid(child, &status, WNOHANG) == 0) {
+        ray_t* m = ray_read_splayed(dir, NULL);
+        if (!m || RAY_IS_ERR(m) || ray_table_nrows(m) != 2) failures++;
+        if (m && RAY_IS_ERR(m)) ray_error_free(m); else if (m) ray_release(m);
+        ray_t* c = ray_splay_load(dir, NULL);
+        if (!c || RAY_IS_ERR(c) || ray_table_nrows(c) != 2) failures++;
+        if (c && RAY_IS_ERR(c)) ray_error_free(c); else if (c) ray_release(c);
+        if (!ray_splay_has_schema(dir)) failures++;
+        reads++;
+    }
+    TEST_ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    TEST_ASSERT_TRUE(reads > 0);
+    TEST_ASSERT_EQ_I(failures, 0);
+    ray_release(t);
+    rm_rf(dir);
+    rm_rf(tmpl);
+    PASS();
+}
+#endif
 
 static test_result_t test_generation_invalid_manifest(void) {
     const char* dir = TMP_SPLAY_BASE "/generation_manifest";
@@ -2770,7 +2943,12 @@ const test_entry_t splay_entries[] = {
     { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
 #endif
     { "splay/generation_io_failures", test_generation_io_failures, splay_setup, splay_teardown },
-    { "splay/generation_retains_readers", test_generation_retains_readers, splay_setup, splay_teardown },
+    { "splay/generation_keeps_only_current", test_generation_keeps_only_current, splay_setup, splay_teardown },
+    { "splay/generation_first_write_removed", test_generation_first_write_removed, splay_setup, splay_teardown },
+    { "splay/generation_first_write_keeps_others", test_generation_first_write_keeps_others, splay_setup, splay_teardown },
+#ifndef _WIN32
+    { "splay/generation_reader_races", test_generation_reader_races, splay_setup, splay_teardown },
+#endif
     { "splay/generation_invalid_manifest", test_generation_invalid_manifest, splay_setup, splay_teardown },
     { "splay/generation_writer_exit", test_generation_writer_exit, splay_setup, splay_teardown },
     { "splay/atomic_generation_publish", test_splay_atomic_generation_publish, splay_setup, splay_teardown },
