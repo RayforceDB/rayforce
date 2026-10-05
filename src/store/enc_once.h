@@ -61,4 +61,9 @@ void     ray_enc_snap_set(ray_enc_snap_t* s, const char* code, const char* fmt, 
 ray_t*   ray_enc_snap_error(const ray_enc_snap_t* s);
 void     ray_enc_yield(void);
 
+/* Test hooks: force DRAINING with `waiters` outstanding, and run one waiter's
+ * snapshot-copy-and-release step. */
+void     ray_enc_once_test_drain(ray_enc_once_t* o, const ray_enc_snap_t* snap, uint32_t waiters);
+void     ray_enc_once_test_waiter_done(ray_enc_once_t* o, ray_enc_snap_t* out);
+
 #endif /* RAY_ENC_ONCE_H */

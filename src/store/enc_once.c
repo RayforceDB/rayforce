@@ -47,7 +47,18 @@ void ray_enc_yield(void) {
 }
 
 static void once_lock(ray_enc_once_t* o) {
-    while (atomic_exchange_explicit(&o->lock, 1, memory_order_acquire)) RAY_CPU_RELAX();
+    for (;;) {
+        if (!atomic_load_explicit(&o->lock, memory_order_relaxed) &&
+            !atomic_exchange_explicit(&o->lock, 1, memory_order_acquire)) return;
+        RAY_CPU_RELAX();
+    }
+}
+/* A DRAINING state returns to IDLE once its last waiter has copied the
+ * snapshot (under the lock, after waiters was decremented). */
+static void once_drain_reset(ray_enc_once_t* o) {
+    if (o->waiters == 0 &&
+        atomic_load_explicit(&o->state, memory_order_relaxed) == RAY_ENC_ONCE_DRAINING)
+        atomic_store_explicit(&o->state, RAY_ENC_ONCE_IDLE, memory_order_release);
 }
 static void once_unlock(ray_enc_once_t* o) {
     atomic_store_explicit(&o->lock, 0, memory_order_release);
@@ -97,6 +108,21 @@ ray_t* ray_enc_snap_error(const ray_enc_snap_t* s) {
     return s->msg[0] ? ray_error(s->code, "%s", s->msg) : ray_error(s->code, NULL);
 }
 
+void ray_enc_once_test_drain(ray_enc_once_t* o, const ray_enc_snap_t* snap, uint32_t waiters) {
+    once_lock(o);
+    o->snap = *snap; o->waiters = waiters; o->attempt++;
+    atomic_store_explicit(&o->state, RAY_ENC_ONCE_DRAINING, memory_order_release);
+    once_unlock(o);
+}
+
+void ray_enc_once_test_waiter_done(ray_enc_once_t* o, ray_enc_snap_t* out) {
+    once_lock(o);
+    *out = o->snap;
+    o->waiters--;
+    once_drain_reset(o);
+    once_unlock(o);
+}
+
 ray_t* ray_enc_once_get(ray_enc_once_t* o, ray_t** slot, ray_enc_once_fn fn, void* ctx) {
     once_lock(o);
     for (;;) {
@@ -117,7 +143,7 @@ ray_t* ray_enc_once_get(ray_enc_once_t* o, ray_t** slot, ray_enc_once_fn fn, voi
             st = atomic_load_explicit(&o->state, memory_order_relaxed);
             if (st == RAY_ENC_ONCE_DRAINING && o->attempt == mine) {
                 ray_enc_snap_t s = o->snap;
-                if (o->waiters == 0) atomic_store_explicit(&o->state, RAY_ENC_ONCE_IDLE, memory_order_release);
+                once_drain_reset(o);
                 once_unlock(o);
                 return ray_enc_snap_error(&s);
             }
@@ -140,15 +166,19 @@ ray_t* ray_enc_once_get(ray_enc_once_t* o, ray_t** slot, ray_enc_once_fn fn, voi
     ray_enc_snap_t fail;
     memset(&fail, 0, sizeof fail);
     ray_t* v = fn(ctx, &fail);
+    if (v && RAY_IS_ERR(v)) {              /* fn returned an error object */
+        ray_enc_snap_take(&fail, v);       /* on this thread, before the lock */
+        v = NULL;
+    }
+    if (!v && !fail.code[0]) ray_enc_snap_set(&fail, "error", NULL);
+    if (!v) fail.is_transient = ray_enc_code_transient(fail.code);
     once_lock(o);
-    if (v && !RAY_IS_ERR(v)) {
+    if (v) {
         *slot = v;
         atomic_store_explicit(&o->state, RAY_ENC_ONCE_DONE, memory_order_release);
         once_unlock(o);
         return v;
     }
-    if (v) ray_enc_snap_take(&fail, v);    /* fn returned an error object */
-    if (!fail.code[0]) ray_enc_snap_set(&fail, "error", NULL);
     o->snap = fail;
     uint32_t next = !fail.is_transient ? RAY_ENC_ONCE_FAILED
                   : (o->waiters ? RAY_ENC_ONCE_DRAINING : RAY_ENC_ONCE_IDLE);

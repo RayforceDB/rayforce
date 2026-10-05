@@ -20,6 +20,9 @@
  *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  *   SOFTWARE.
  */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
@@ -29,6 +32,7 @@
 #include "store/enc_once.h"
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
 
 static void once_setup(void)    { ray_heap_init(); (void)ray_sym_init(); }
 static void once_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); }
@@ -50,9 +54,18 @@ static ray_t* once_fn(void* raw, ray_enc_snap_t* fail) {
              ray_enc_once_waiters(&c->once) < c->want_waiters; spin++)
             ray_enc_yield();
         ray_enc_snap_set(fail, "oom", "attempt %d failed", n);
-        fail->is_transient = true;
         return NULL;
     }
+    if (c->mode == 6) {                 /* hold, then fail deterministically */
+        for (int spin = 0; spin < 50000000 &&
+             ray_enc_once_waiters(&c->once) < c->want_waiters; spin++)
+            ray_enc_yield();
+        ray_enc_snap_set(fail, "corrupt", "held attempt %d", n);
+        return NULL;
+    }
+    if (c->mode == 3) return ray_error("corrupt", "returned error object");
+    if (c->mode == 4) return NULL;      /* NULL with an empty fail */
+    if (c->mode == 8) { ray_enc_snap_set(fail, "cancel", "cancelled %d", n); return NULL; }
     if (c->mode == 2) {
         ray_t* e = ray_error("corrupt", "col /x: bad descriptor (chunk 3)");
         ray_enc_snap_take(fail, e);
@@ -139,10 +152,131 @@ static test_result_t test_once_transient_codes(void) {
     PASS();
 }
 
+static test_result_t test_once_draining_blocks_new_attempt(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    ray_enc_snap_t x; ray_enc_snap_set(&x, "oom", "X-msg");
+    ray_enc_once_test_drain(&c.once, &x, 1);
+    once_thr_t t; memset(&t, 0, sizeof t); t.c = &c;
+    ray_thread_t th;
+    TEST_ASSERT_EQ_I(ray_thread_create(&th, once_thread, &t), RAY_OK);
+    /* Bounded observation: while a waiter is outstanding the caller must not
+     * run fn nor overwrite the snapshot. */
+    struct timespec ts = { 0, 1000000 };
+    for (int i = 0; i < 200; i++) {
+        TEST_ASSERT_EQ_I(atomic_load(&c.calls), 0);
+        TEST_ASSERT_EQ_U(ray_enc_once_waiters(&c.once), 1);
+        nanosleep(&ts, NULL);
+    }
+    TEST_ASSERT_STR_EQ(c.once.snap.code, "oom");
+    TEST_ASSERT_STR_EQ(c.once.snap.msg, "X-msg");
+    ray_enc_snap_t got;
+    ray_enc_once_test_waiter_done(&c.once, &got);
+    ray_thread_join(th);
+    TEST_ASSERT_STR_EQ(got.code, "oom");
+    TEST_ASSERT_STR_EQ(got.msg, "X-msg");
+    TEST_ASSERT_TRUE(got.is_transient);
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 1);
+    TEST_ASSERT_TRUE(t.got != NULL && t.got == c.slot);
+    ray_release(c.slot);
+    PASS();
+}
+
+static test_result_t test_once_waiters_get_deterministic(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    c.mode = 6; c.want_waiters = 7;
+    once_thr_t t[8]; ray_thread_t th[8];
+    for (int i = 0; i < 8; i++) { memset(&t[i], 0, sizeof t[i]); t[i].c = &c;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th[i], once_thread, &t[i]), RAY_OK); }
+    for (int i = 0; i < 8; i++) ray_thread_join(th[i]);
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 1);
+    for (int i = 0; i < 8; i++) {
+        TEST_ASSERT_STR_EQ(t[i].code, "corrupt");
+        TEST_ASSERT_STR_EQ(t[i].msg, "held attempt 1");
+    }
+    ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);   /* still cached */
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 1);
+    ray_error_free(r);
+    PASS();
+}
+
+static test_result_t test_once_error_object_returned(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    c.mode = 3;
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    for (int i = 0; i < 3; i++) {
+        ray_error_clear();
+        ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_STR_EQ(ray_error_msg(), "returned error object");
+        ray_error_free(r);
+    }
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 1);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+    PASS();
+}
+
+static test_result_t test_once_null_without_snapshot(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    c.mode = 4;
+    for (int i = 0; i < 3; i++) {
+        ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "error");
+        ray_error_free(r);
+    }
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 1);      /* cached as deterministic */
+    PASS();
+}
+
+static test_result_t test_once_transient_no_waiters_retries(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    c.mode = 1; c.want_waiters = 0;
+    ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+    ray_error_free(r);
+    TEST_ASSERT_EQ_U(atomic_load(&c.once.state), RAY_ENC_ONCE_IDLE);
+    r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 2);
+    ray_release(c.slot);
+    PASS();
+}
+
+static test_result_t test_once_transient_no_leak(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    c.mode = 8;                                       /* always cancel */
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    for (int i = 0; i < 20; i++) {
+        ray_error_clear();
+        ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+        ray_error_free(r);
+    }
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 20);
+    c.mode = 0;
+    ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(c.slot);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+    PASS();
+}
+
 const test_entry_t enconce_entries[] = {
     { "enconce/success_shared",        test_once_success_shared,        once_setup, once_teardown },
     { "enconce/many_waiters_transient",test_once_many_waiters_transient,once_setup, once_teardown },
     { "enconce/deterministic_cached",  test_once_deterministic_cached,  once_setup, once_teardown },
     { "enconce/transient_codes",       test_once_transient_codes,       once_setup, once_teardown },
+    { "enconce/draining_blocks_new_attempt", test_once_draining_blocks_new_attempt, once_setup, once_teardown },
+    { "enconce/waiters_get_deterministic", test_once_waiters_get_deterministic, once_setup, once_teardown },
+    { "enconce/error_object_returned", test_once_error_object_returned, once_setup, once_teardown },
+    { "enconce/null_without_snapshot", test_once_null_without_snapshot, once_setup, once_teardown },
+    { "enconce/transient_no_waiters_retries", test_once_transient_no_waiters_retries, once_setup, once_teardown },
+    { "enconce/transient_no_leak", test_once_transient_no_leak, once_setup, once_teardown },
     { NULL, NULL, NULL, NULL },
 };
