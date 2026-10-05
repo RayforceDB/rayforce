@@ -105,7 +105,36 @@ typedef struct {
     int64_t  max;               /* 40 */
 } ray_enc_desc_t;
 
+#define ENC_OFF(T, f, o) _Static_assert(offsetof(T, f) == (o), #T "." #f " offset")
 _Static_assert(sizeof(ray_enc_hdr_t) == 64, "enc header is 64 bytes");
+ENC_OFF(ray_enc_hdr_t, magic, 0);
+ENC_OFF(ray_enc_hdr_t, header_version, 4);
+ENC_OFF(ray_enc_hdr_t, index_kind, 6);
+ENC_OFF(ray_enc_hdr_t, col_flags, 7);
+ENC_OFF(ray_enc_hdr_t, rsv0, 8);
+ENC_OFF(ray_enc_hdr_t, rsv1, 12);
+ENC_OFF(ray_enc_hdr_t, side_len, 24);
+ENC_OFF(ray_enc_hdr_t, rsv2, 40);
+ENC_OFF(ray_enc_hdr_t, rsv3, 44);
+ENC_OFF(ray_enc_dirent_t, offset, 0);
+ENC_OFF(ray_enc_dirent_t, bytes, 8);
+ENC_OFF(ray_enc_dirent_t, min, 16);
+ENC_OFF(ray_enc_dirent_t, max, 24);
+ENC_OFF(ray_enc_dirent_t, sum_lo, 32);
+ENC_OFF(ray_enc_dirent_t, sum_hi, 40);
+ENC_OFF(ray_enc_dirent_t, rsv0, 48);
+ENC_OFF(ray_enc_dirent_t, rsv1, 60);
+ENC_OFF(ray_enc_desc_t, encoding, 0);
+ENC_OFF(ray_enc_desc_t, width, 1);
+ENC_OFF(ray_enc_desc_t, n_nulls, 2);
+ENC_OFF(ray_enc_desc_t, flags, 4);
+ENC_OFF(ray_enc_desc_t, rsv0, 6);
+ENC_OFF(ray_enc_desc_t, payload_bytes, 16);
+ENC_OFF(ray_enc_desc_t, rsv1, 24);
+ENC_OFF(ray_enc_desc_t, rsv2, 28);
+ENC_OFF(ray_enc_desc_t, max, 40);
+_Static_assert(RAY_ENC_DESC_AREA == RAY_ENC_VECS_PER_CHUNK * sizeof(ray_enc_desc_t),
+               "descriptor area is 64 descriptors");
 _Static_assert(offsetof(ray_enc_hdr_t, side_off) == 16, "side_off at 16");
 _Static_assert(offsetof(ray_enc_hdr_t, index_off) == 32, "index_off at 32");
 _Static_assert(offsetof(ray_enc_hdr_t, str_pool_bytes) == 48, "str_pool_bytes at 48");
@@ -139,7 +168,8 @@ static inline int64_t ray_enc_nchunks(int64_t len) {
 static inline int64_t ray_enc_nvecs(int64_t len) {
     return len <= 0 ? 0 : (len + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
 }
-/* Length of column-global vector `vec`: 1024 except the column's last. */
+/* Length of column-global vector `vec`: 1024 except the column's last.
+ * Precondition: 0 <= vec < ray_enc_nvecs(len). */
 static inline int ray_enc_vec_len(int64_t len, int64_t vec) {
     int64_t rem = len - vec * RAY_ENC_VEC;
     return rem >= RAY_ENC_VEC ? RAY_ENC_VEC : (int)rem;

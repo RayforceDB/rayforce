@@ -961,8 +961,14 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             header.attrs = (uint8_t)((header.attrs &
                 ~(uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED)) | sym_xlate_attrs);
 
+        /* aux[0..3] is the generation discriminator on disk: nothing durable
+         * lives there except the index marker stamped below, so zero it
+         * unconditionally (in-memory aux bytes, e.g. a saved_aux restore on a
+         * nullable column, must never reach the file). */
+        memset(header.aux, 0, 4);
+
         /* Stamp the "index present" marker into the reserved aux (after all
-         * other aux manipulation, which zeroes it for the common cases). */
+         * other aux manipulation). */
         if (persist_index) {
             ray_col_stamp_index(&header);
         }
@@ -1396,14 +1402,12 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
 
     ray_t* hdr = (ray_t*)ptr;
 
-    /* Validate the on-disk format major version (the `order` byte) BEFORE
-     * interpreting type/len.  FRESH SWAP, NO LEGACY: a file whose major
-     * does not match the reader is rejected here.  The loaders below reset
-     * the runtime `order` to its correct value, so reading the version out
-     * of `order` here does not leak into the live block order. */
     /* Generation discriminator (spec "Generation discriminator"): the pair
-     * (order, aux[0..3]) is validated before either parser runs, and a
-     * cross pair is corrupt, never a fallback to the other layout. */
+     * (order, aux[0..3]) is validated BEFORE type/len are interpreted or
+     * either parser runs.  FRESH SWAP, NO LEGACY: an unknown major is
+     * rejected, and a cross pair is corrupt, never a fallback to the other
+     * layout.  The loaders below reset the runtime `order`, so reading the
+     * version out of `order` here does not leak into the live block order. */
     int gen = ray_col_gen_of(ptr);
     if (gen == RAY_ENC_GEN_VERSION) {
         ray_vm_unmap_file(ptr, mapped_size);
