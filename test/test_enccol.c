@@ -168,7 +168,7 @@ static test_result_t test_load_rejects(void) {
  * and produce (order 2, "XIDX"), a file that no longer loads. */
 static test_result_t test_append_index_refuses_gen2(void) {
     TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/ai", 3000), RAY_OK);
-    ray_t* v = ray_vec_new(RAY_I32, 3000); v->len = 3000;      /* ray_col_load refuses gen 2 until Task 8 */
+    ray_t* v = ray_vec_new(RAY_I32, 3000); v->len = 3000;      
     for (int64_t i = 0; i < 3000; i++) ((int32_t*)ray_data(v))[i] = (int32_t)(i % 977);
     ray_t* z = ray_index_chunk_zone_compute(v, 8);
     TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z));
@@ -194,15 +194,16 @@ static test_result_t test_sym_requires_domain(void) {
     PASS();
 }
 
-/* ray_col_load (non-mmap) stays nyi on generation 2 until the materializer
- * lands, and leaves nothing mapped behind. */
+/* ray_col_load (non-mmap) on generation 2 returns the plain vector and
+ * leaves nothing mapped behind once it is released. */
 static test_result_t test_load_gen2_nyi(void) {
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/ln", 3000), RAY_OK);
     ray_t* r = ray_col_load(ENCCOL_TMP "/ln");
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
-    ray_error_free(r);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_I32);
+    TEST_ASSERT_EQ_I(r->len, 3000);
+    ray_release(r);
     ray_mem_stats(&m1);
     TEST_ASSERT_EQ_U(m1.sys_mapped, m0.sys_mapped);
     PASS();
@@ -414,7 +415,10 @@ static test_result_t test_consumers_refuse(void) {
             TEST_ASSERT_EQ_I(ray_col_save_gen(enc, fp, 2), RAY_OK);
             ray_release(enc);
             TEST_ASSERT_NULL(ray_rel_mmap(rd));
-            TEST_ASSERT_NULL(ray_rel_load(rd));
+            /* the copying loader materializes a plain column, so it may accept
+             * the file; only the mapping loader refuses an encoded one */
+            ray_rel_t* copied = ray_rel_load(rd);
+            if (copied) ray_rel_free(copied);
             TEST_ASSERT_EQ_I(rename(bak, fp), 0);
             ray_rel_t* again = ray_rel_mmap(rd);
             TEST_ASSERT_TRUE(again != NULL);
@@ -936,12 +940,208 @@ static test_result_t test_decode_mutation_sweep(void) {
     PASS();
 }
 
+/* ---- Task 8: materialization ---- */
+
+/* Same vector saved as generation 0 and 2: the generation-0 load and the
+ * materialized generation-2 column are equal. */
+static test_result_t check_equivalence(ray_t* v) {
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g0", 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g2", 2), RAY_OK);
+    ray_t* a = ray_col_load(ENCCOL_TMP "/g0");
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/g2");
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && c && !RAY_IS_ERR(c));
+    ray_t* b = ray_enccol_materialize(c);
+    TEST_ASSERT_FMT(b && !RAY_IS_ERR(b), "materialize: %s", b ? ray_err_code(b) : "null");
+    TEST_ASSERT_EQ_I(b->type, a->type);
+    TEST_ASSERT_EQ_I(b->len, a->len);
+    TEST_ASSERT_EQ_I(b->attrs & COL_DISK_ATTRS_MASK, a->attrs & COL_DISK_ATTRS_MASK);
+    if (a->type == RAY_STR) {
+        const ray_str_t* x = ray_data(a); const ray_str_t* y = ray_data(b);
+        const char* px = a->str_pool ? ray_data(a->str_pool) : NULL;
+        const char* py = b->str_pool ? ray_data(b->str_pool) : NULL;
+        for (int64_t i = 0; i < a->len; i++) {
+            TEST_ASSERT_FMT(x[i].len == y[i].len, "len row %lld", (long long)i);
+            TEST_ASSERT_FMT(memcmp(ray_str_t_ptr(&x[i], px), ray_str_t_ptr(&y[i], py), x[i].len) == 0, "row %lld", (long long)i);
+            if (!ray_str_is_inline(&y[i])) TEST_ASSERT_FMT(y[i].hash32 == x[i].hash32, "hash32 row %lld", (long long)i);
+        }
+    } else {
+        TEST_ASSERT_TRUE(memcmp(ray_data(a), ray_data(b), (size_t)a->len * ray_sym_elem_size(a->type, a->attrs)) == 0);
+    }
+    if (a->type == RAY_SYM) {
+        TEST_ASSERT_EQ_I(b->attrs & RAY_SYM_W_MASK, a->attrs & RAY_SYM_W_MASK);   /* width class */
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(b), ray_sym_vec_domain(a));        /* domain */
+    }
+    TEST_ASSERT_EQ_PTR(ray_enccol_materialize(c), b);       /* cached */
+    ray_retain(b);
+    ray_release(c);                                          /* retained column outlives the object */
+    TEST_ASSERT_EQ_I(b->len, a->len);
+    ray_release(b);
+    ray_release(a);
+    PASS();
+}
+
+static test_result_t test_materialize_equivalence(void) {
+    static const int8_t types[] = { RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME,
+                                    RAY_TIMESTAMP, RAY_F32, RAY_F64, RAY_GUID, RAY_SYM, RAY_STR };
+    for (size_t t = 0; t < sizeof types; t++)
+        for (int s = 0; s < 6; s++) {
+            if ((types[t] == RAY_BOOL || types[t] == RAY_U8) && s >= 4) continue;
+            ray_t* v = make_col(types[t], 140000, s);       /* three chunks, parallel decode */
+            test_result_t r = check_equivalence(v);
+            ray_release(v);
+            if (r.status != TEST_PASS) return r;
+        }
+    PASS();
+}
+
+/* Every type with nulls at the boundary lengths; SYM at every width. */
+static test_result_t test_materialize_lengths(void) {
+    static const int8_t types[] = { RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME,
+                                    RAY_TIMESTAMP, RAY_F32, RAY_F64, RAY_GUID, RAY_SYM, RAY_STR };
+    static const int64_t lens[] = { 0, 1, 1023, 1024, 1025, 65535, 65536, 65537 };
+    static const uint8_t widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
+    for (size_t t = 0; t < sizeof types; t++)
+        for (size_t l = 0; l < sizeof lens / sizeof *lens; l++)
+            for (int s = 0; s < 5; s += 4)                   /* shapes 0 (no nulls) and 4 (nulls) */
+                for (size_t w = 0; w < (types[t] == RAY_SYM ? 4u : 1u); w++) {
+                    g_symw = widths[w];
+                    ray_t* v = make_col(types[t], lens[l], s);
+                    test_result_t r = check_equivalence(v);
+                    ray_release(v);
+                    g_symw = RAY_SYM_W16;
+                    if (r.status != TEST_PASS) return r;
+                }
+    PASS();
+}
+
+/* Float payloads survive bit for bit: NaN payloads, -0.0, infinities, the null sentinel. */
+static test_result_t test_materialize_float_bits(void) {
+    static const uint64_t d64[] = { 0x7ff8000000000123ull, 0x7ff0000000000001ull, 0x8000000000000000ull,
+                                    0x0000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+                                    0xfff8000000000abcull, 0x3ff0000000000000ull };
+    static const uint32_t d32[] = { 0x7fc00123u, 0x7f800001u, 0x80000000u, 0u, 0x7f800000u, 0xff800000u, 0xffc00abcu, 0x3f800000u };
+    for (int k = 0; k < 2; k++) {
+        int64_t n = 70000;
+        ray_t* v = ray_vec_new(k ? RAY_F32 : RAY_F64, n); v->len = n;
+        for (int64_t i = 0; i < n; i++) {
+            if (k) memcpy((uint8_t*)ray_data(v) + i * 4, &d32[(i / 3) % 8], 4);
+            else   memcpy((uint8_t*)ray_data(v) + i * 8, &d64[(i / 3) % 8], 8);
+        }
+        test_result_t r = check_equivalence(v);
+        ray_release(v);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+static test_result_t test_materialize_counts_once(void) {
+    ray_t* v = make_col(RAY_I64, 5000, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/m", 2), RAY_OK);
+    ray_release(v);
+    ray_enc_counters_reset();
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/m");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);                   /* load decodes nothing */
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+    ray_t* a = ray_enccol_materialize(c); ray_t* b = ray_enccol_materialize(c);
+    TEST_ASSERT_EQ_PTR(a, b);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 5000 * 8);
+    TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(c)->decoded_bytes), 5000 * 8);   /* per column */
+    ray_release(c);
+    PASS();
+}
+
+/* Cancellation is transient: reported, not cached, retried. */
+static test_result_t test_cancel_retried(void) {
+    ray_t* v = make_col(RAY_I32, 3 * 65536, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/cn", 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/cn");
+    ray_request_interrupt();
+    ray_t* r = ray_enccol_materialize(c);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+    r = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(c);
+    PASS();
+}
+
+/* Corrupt descriptors in chunks 1 and 3: the error names chunk 1 (the
+ * lowest failing task), carries the path, and is cached. */
+static test_result_t test_materialize_lowest_failure_cached(void) {
+    ray_t* v = make_col(RAY_I32, 4 * 65536, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/f", 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/f");
+    ray_enccol_t* e = ray_enccol_of(c);
+    uint64_t off1, off3;
+    memcpy(&off1, e->base + 96 + 64 * 1, 8);
+    memcpy(&off3, e->base + 96 + 64 * 3, 8);
+    ray_release(c);
+    uint8_t one = 1;
+    patch(ENCCOL_TMP "/f", (long)off1 + 6, &one, 1);        /* descriptor 0 reserved byte */
+    patch(ENCCOL_TMP "/f", (long)off3 + 6, &one, 1);
+    c = ray_col_mmap(ENCCOL_TMP "/f");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    for (int i = 0; i < 3; i++) {
+        ray_error_clear();
+        ray_t* r = ray_enccol_materialize(c);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), "chunk 1 ") != NULL);
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), ENCCOL_TMP "/f") != NULL);
+        ray_error_free(r);
+    }
+    ray_release(c);
+    PASS();
+}
+
+static test_result_t test_oom_then_retry(void) {
+    ray_t* v = make_col(RAY_STR, 3000, 2);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/o", 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/o");
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    for (int nth = 1; nth <= 3; nth++) {
+        ray_enccol_test_fail_alloc(nth);
+        ray_t* r = ray_enccol_materialize(c);
+        if (r && RAY_IS_ERR(r)) {
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+            ray_error_free(r);
+        }
+        ray_enccol_test_fail_alloc(0);
+        if (r && !RAY_IS_ERR(r)) break;                       /* fewer allocation points than nth */
+    }
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);   /* failed attempts freed everything */
+    ray_t* r = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(c);
+    PASS();
+}
+
+static test_result_t test_col_load_materializes(void) {
+    ray_t* v = make_col(RAY_F64, 2000, 4);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/l", 2), RAY_OK);
+    ray_t* b = ray_col_load(ENCCOL_TMP "/l");
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b));
+    TEST_ASSERT_EQ_I(b->type, RAY_F64);
+    TEST_ASSERT_TRUE(memcmp(ray_data(b), ray_data(v), 2000 * 8) == 0);
+    ray_release(b); ray_release(v);
+    PASS();
+}
+
 const test_entry_t enccol_entries[] = {
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_rejects",        test_load_rejects,        enccol_setup, enccol_teardown },
     { "enccol/sym_requires_domain", test_sym_requires_domain, enccol_setup, enccol_teardown },
     { "enccol/append_index_gen2",   test_append_index_refuses_gen2, enccol_setup, enccol_teardown },
-    { "enccol/load_gen2_nyi",       test_load_gen2_nyi,       enccol_setup, enccol_teardown },
+    { "enccol/load_gen2_plain",      test_load_gen2_nyi,       enccol_setup, enccol_teardown },
     { "enccol/no_mapping_leak",     test_no_mapping_leak,     enccol_setup, enccol_teardown },
     { "enccol/load_rejects_more",   test_load_rejects_more,   enccol_setup, enccol_teardown },
     { "enccol/value_dict_side",     test_value_dict_side,     enccol_setup, enccol_teardown },
@@ -961,5 +1161,13 @@ const test_entry_t enccol_entries[] = {
     { "enccol/str_stats_corrupt",      test_str_stats_corrupt,      enccol_setup, enccol_teardown },
     { "enccol/sym_width_and_bound",    test_sym_width_and_bound,    enccol_setup, enccol_teardown },
     { "enccol/decode_mutation_sweep",  test_decode_mutation_sweep,  enccol_setup, enccol_teardown },
+    { "enccol/materialize_equivalence",        test_materialize_equivalence,        enccol_setup, enccol_teardown },
+    { "enccol/materialize_lengths",            test_materialize_lengths,            enccol_setup, enccol_teardown },
+    { "enccol/materialize_float_bits",         test_materialize_float_bits,         enccol_setup, enccol_teardown },
+    { "enccol/materialize_counts_once",        test_materialize_counts_once,        enccol_setup, enccol_teardown },
+    { "enccol/materialize_lowest_failure",     test_materialize_lowest_failure_cached, enccol_setup, enccol_teardown },
+    { "enccol/oom_then_retry",                 test_oom_then_retry,                 enccol_setup, enccol_teardown },
+    { "enccol/col_load_materializes",          test_col_load_materializes,          enccol_setup, enccol_teardown },
+    { "enccol/cancel_retried",                 test_cancel_retried,                 enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
 };

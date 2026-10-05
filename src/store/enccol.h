@@ -94,6 +94,10 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out);
 int    ray_enccol_vec_nulls(ray_enccol_t* e, int64_t vec, int* n_nulls);   /* 0 ok, -1 corrupt */
 uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width */
 
+/* The plain column (borrowed, cached for the object's lifetime) or an
+ * owned RAY_ERROR.  Single and (Task 12) parted objects. */
+ray_t* ray_enccol_materialize(ray_t* encv);
+
 /* Counters (spec "Instrumentation"); reset by tests. */
 typedef struct { uint64_t materialized; uint64_t decoded_bytes; } ray_enc_counters_t;
 void   ray_enc_counters_get(ray_enc_counters_t* out);

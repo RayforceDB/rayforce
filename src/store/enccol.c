@@ -31,6 +31,7 @@
 #include "table/domain.h"
 #include "store/enc.h"
 #include "vec/str.h"
+#include "core/pool.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -734,4 +735,161 @@ int ray_enccol_vec_nulls(ray_enccol_t* e, int64_t vec, int* n_nulls) {
     if (err) { ray_error_free(err); return -1; }
     *n_nulls = descs[vec % RAY_ENC_VECS_PER_CHUNK].n_nulls;
     return 0;
+}
+
+/* ---- Single-column materialization (spec "Materialized equivalence") ---- */
+
+typedef struct { ray_enc_snap_t snap; bool failed; } enc_task_res_t;
+
+typedef struct {
+    ray_enccol_t*   e;
+    uint8_t*        out;
+    char*           pool;
+    uint64_t        pool_cap;
+    const uint64_t* chunk_pool;     /* STR: decoded-pool base of each chunk */
+    enc_task_res_t* res;            /* one attempt result per chunk (task) */
+} enc_mat_ctx_t;
+
+/* One task per chunk.  Every failure, cancellation included, goes into the
+ * task's own fixed-size result from this thread's state; the coordinator
+ * picks the lowest failing chunk. */
+static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    enc_mat_ctx_t* x = raw;
+    ray_enccol_t* e = x->e;
+    uint8_t esz = ray_enccol_esz(e);
+    for (int64_t c = start; c < end; c++) {
+        enc_task_res_t* r = &x->res[c];
+        if (ray_interrupted()) {
+            ray_enc_snap_set(&r->snap, "cancel", "col %s: interrupted", e->path);
+            r->failed = true;
+            continue;
+        }
+        ray_enc_desc_t descs[64];
+        ray_t* err = ray_enccol_chunk_descs(e, c, descs);
+        int64_t rows = chunk_rows(e, c);
+        int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+        uint64_t pbase = x->chunk_pool ? x->chunk_pool[c] : 0;
+        for (int j = 0; !err && j < nv; j++) {
+            int64_t row = c * RAY_ENC_CHUNK + (int64_t)j * RAY_ENC_VEC;
+            uint8_t* dst = x->out + (size_t)row * esz;
+            err = ray_enccol_decode_desc(e, c, j, &descs[j], dst, x->pool, pbase, x->pool_cap);
+            if (!err && e->type == RAY_STR) {
+                int vlen = ray_enc_vec_len(e->len, row / RAY_ENC_VEC);
+                ray_str_t* s = (ray_str_t*)dst;
+                for (int i = 0; i < vlen; i++) {
+                    if (ray_str_is_inline(&s[i])) continue;
+                    pbase += s[i].len;
+                    ray_str_t_cache_hash(&s[i], x->pool);   /* the generation-0 rule */
+                }
+            }
+        }
+        if (err) { ray_enc_snap_take(&r->snap, err); r->failed = true; }
+    }
+}
+
+/* STR column-scope pass: every vector's decoded-pool bytes, with checked
+ * arithmetic, before anything is written; the total must equal
+ * str_pool_bytes.  The pool buffer is sized from these (str_pool_bytes and
+ * the *_pool_bytes functions) only: decode reports a too-small pool_cap as
+ * corrupt, so no other size may be used. */
+static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
+    uint64_t total = 0;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_desc_t descs[64];
+        ray_t* err = ray_enccol_chunk_descs(e, c, descs);
+        if (err) return err;
+        chunk_pool[c] = total;
+        int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+        for (int j = 0; j < nv; j++) {
+            uint64_t pb;
+            if ((err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb)) != NULL) return err;
+            if (pb > e->hdr.str_pool_bytes - total)
+                return ray_error("corrupt", "col %s: decoded pool exceeds str_pool_bytes at chunk %lld", e->path, (long long)c);
+            total += pb;
+        }
+    }
+    if (total != e->hdr.str_pool_bytes)
+        return ray_error("corrupt", "col %s: decoded pool is %llu bytes, header says %llu", e->path,
+                         (unsigned long long)total, (unsigned long long)e->hdr.str_pool_bytes);
+    return NULL;
+}
+
+/* Task 9 attaches synthesized indexes here; until then nothing to do. */
+static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) { (void)e; (void)vp; return NULL; }
+
+static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    uint8_t ik = e->hdr.index_kind;
+    if (ik == 1 || ik == 2 || ik == 4 || ik == 6) {
+        ray_enc_snap_set(fail, "nyi", "col %s: index region needs a newer build", e->path);
+        return NULL;
+    }
+    if (ray_interrupted()) { ray_enc_snap_set(fail, "cancel", "col %s: interrupted", e->path); return NULL; }
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "col %s: materialize", e->path); return NULL; }
+    ray_t* vec = e->type == RAY_SYM ? ray_sym_vec_new(e->attrs & RAY_SYM_W_MASK, e->len)
+                                    : ray_vec_new(e->type, e->len);
+    if (!vec || RAY_IS_ERR(vec)) {
+        if (vec) ray_enc_snap_take(fail, vec); else ray_enc_snap_set(fail, "oom", "col %s: materialize", e->path);
+        return NULL;
+    }
+    vec->len = e->len;
+    ray_t* err = NULL;
+    uint64_t* chunk_pool = NULL;
+    enc_task_res_t* res = NULL;
+    if (e->type == RAY_STR) {
+        chunk_pool = enc_alloc_fails(e) ? NULL : ray_alloc_raw((size_t)(e->n_chunks + 1) * sizeof(uint64_t));
+        if (!chunk_pool) { err = ray_error("oom", "col %s: materialize", e->path); goto fail; }
+        if ((err = enc_str_prepass(e, chunk_pool)) != NULL) goto fail;
+        if (e->hdr.str_pool_bytes > 0) {
+            ray_t* pool = enc_alloc_fails(e) ? NULL : ray_alloc((size_t)e->hdr.str_pool_bytes);
+            if (!pool || RAY_IS_ERR(pool)) { err = pool ? pool : ray_error("oom", "col %s: pool", e->path); goto fail; }
+            pool->type = RAY_U8;
+            pool->len  = (int64_t)e->hdr.str_pool_bytes;
+            vec->str_pool = pool;
+        }
+    }
+    res = enc_alloc_fails(e) ? NULL : ray_calloc_raw((size_t)(e->n_chunks + 1) * sizeof *res);
+    if (!res) { err = ray_error("oom", "col %s: materialize", e->path); goto fail; }
+    enc_mat_ctx_t x = {
+        .e = e, .out = (uint8_t*)ray_data(vec),
+        .pool = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL,
+        .pool_cap = e->hdr.str_pool_bytes, .chunk_pool = chunk_pool, .res = res,
+    };
+    ray_pool_t* tp = ray_pool_get();
+    if (e->n_chunks >= 2 && ray_pool_par_dispatch_ok(tp, e->n_chunks, 2))
+        ray_pool_dispatch_n(tp, enc_mat_chunk, &x, (uint32_t)e->n_chunks);
+    else
+        enc_mat_chunk(&x, 0, 0, e->n_chunks);
+    for (int64_t c = 0; c < e->n_chunks; c++)
+        if (res[c].failed) {                     /* the lowest-numbered failing task */
+            *fail = res[c].snap;
+            ray_free_raw(res); ray_free_raw(chunk_pool); ray_release(vec);
+            return NULL;
+        }
+    ray_free_raw(res); res = NULL;
+    ray_free_raw(chunk_pool); chunk_pool = NULL;
+    vec->attrs = e->attrs;                       /* persisted attrs (SYM width included) */
+    if (e->type == RAY_SYM) {
+        vec->sym_domain = e->dom;                /* sym_vec_new's runtime domain is immortal */
+        if (e->dom_owned) ray_sym_domain_retain(e->dom);
+    }
+    if ((err = enc_attach_index(e, &vec)) != NULL) goto fail;
+    atomic_fetch_add_explicit(&g_enc_materialized, 1, memory_order_relaxed);
+    return vec;
+fail:
+    ray_free_raw(res); ray_free_raw(chunk_pool);
+    ray_release(vec);
+    ray_enc_snap_take(fail, err);
+    return NULL;
+}
+
+/* A caller waiting on another thread's attempt (ray_enc_once_get) does not
+ * observe its own cancellation: it waits for the attempt, which polls
+ * ray_interrupted() once per chunk and ends with a transient "cancel"
+ * (the state then resets), so the wait is bounded by one chunk's decode. */
+ray_t* ray_enccol_materialize(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e) return ray_error("type", "materialize: not an encoded column");
+    return ray_enc_once_get(&e->once, &e->decoded, enc_materialize_single, e);
 }

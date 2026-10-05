@@ -1559,8 +1559,12 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
     if (cm.gen2) {
-        ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-        return ray_error("nyi", "col %s: generation 2 reader not built", path);
+        ray_t* enc = ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
+        if (!enc || RAY_IS_ERR(enc)) return enc;
+        ray_t* v = ray_enccol_materialize(enc);
+        if (!RAY_IS_ERR(v)) ray_retain(v);     /* outlives the object */
+        ray_release(enc);
+        return v;
     }
 
     /* Allocate buddy block and copy file data */
