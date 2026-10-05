@@ -23,6 +23,8 @@
 #include "store/encw.h"
 #include "vec/str.h"
 #include "ops/idxop.h"      /* ray_i128_add */
+#include "mem/heap.h"
+#include "store/col.h"       /* COL_DISK_ATTRS_MASK */
 #include <stdatomic.h>
 #include <string.h>
 
@@ -299,4 +301,174 @@ ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char*
     o->desc.payload_bytes = o->payload.len;
     return RAY_OK;
 #endif
+}
+
+#include "mem/heap.h"   /* RAY_ATTR_HAS_NULLS */
+
+static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
+    static const uint8_t zeros[4096];
+    while (n > 0) {
+        size_t k = p ? n : (n < sizeof zeros ? n : sizeof zeros);
+        if (fwrite(p ? p : zeros, 1, k, w->f) != k) return RAY_ERR_IO;
+        w->pos += k; n -= k;
+        if (p) break;
+    }
+    return RAY_OK;
+}
+
+void ray_encw_free(ray_encw_t* w) {
+    ray_free_raw(w->dir); w->dir = NULL;
+    ray_free_raw(w->dict_v); w->dict_v = NULL;
+    ray_enc_buf_free(&w->chunk);
+    ray_encw_vec_free(&w->vec);
+}
+
+ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
+                         uint32_t sym_count, uint8_t index_kind, uint8_t col_flags) {
+    memset(w, 0, sizeof *w);
+#if !RAY_ENC_LE
+    (void)f; (void)type; (void)attrs; (void)len; (void)sym_count; (void)index_kind; (void)col_flags;
+    return RAY_ERR_NYI;
+#else
+    if (!ray_encw_type_supported(type) || len < 0) return RAY_ERR_NYI;
+    w->f = f; w->type = type; w->attrs = attrs; w->len = len;
+    w->sym_count = type == RAY_SYM ? sym_count : 0;
+    w->index_kind = index_kind; w->col_flags = col_flags;
+    w->n_chunks = ray_enc_nchunks(len);
+    if (w->n_chunks > 0) {
+        w->dir = ray_calloc_raw((size_t)w->n_chunks * sizeof(ray_enc_dirent_t));
+        if (!w->dir) return RAY_ERR_OOM;
+    }
+    /* Headers and directory are written last, at offset 0 (finish). */
+    return fput(w, NULL, (size_t)RAY_ENC_DIR_OFF + (size_t)w->n_chunks * sizeof(ray_enc_dirent_t));
+#endif
+}
+
+/* VALUE_DICT is trained on the column's first chunk and frozen (spec
+ * "Encoding selection"): the filled T-bit values of every vector. */
+static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
+    ray_enc_kind_t k;
+    if (!ray_enc_kind_of(w->type, w->attrs, &k)) return RAY_OK;
+    uint64_t* all = ray_alloc_raw((size_t)n * sizeof(uint64_t));
+    ray_enc_input_t* in = ray_alloc_raw(sizeof *in);
+    if (!all || !in) { ray_free_raw(all); ray_free_raw(in); return RAY_ERR_OOM; }
+    for (int64_t s = 0; s < n; s += RAY_ENC_VEC) {
+        int vn = (int)(n - s < RAY_ENC_VEC ? n - s : RAY_ENC_VEC);
+        (void)ray_enc_load(data, w->type, w->attrs, s, vn, in);
+        memcpy(all + s, in->bits, (size_t)vn * sizeof(uint64_t));
+    }
+    /* P0 final-review ruling: train_dict returns 1 trained, 0 no dictionary
+     * (empty or more than 1<<16 distinct), -1 out of memory; OOM fails the
+     * save so resident and streamed saves never diverge silently. */
+    int tr = ray_enc_train_dict(all, n, k, &w->dict_v, &w->dict_n);
+    ray_free_raw(all); ray_free_raw(in);
+    if (tr < 0) return RAY_ERR_OOM;
+    if (tr == 0) { w->dict_v = NULL; w->dict_n = 0; }
+    return RAY_OK;
+}
+
+static bool type_is_float(int8_t t) { return t == RAY_F32 || t == RAY_F64; }
+static double bits_double(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
+
+ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n) {
+    if (w->chunk_i >= w->n_chunks) return RAY_ERR_RANGE;
+    int64_t want = w->len - w->chunk_i * RAY_ENC_CHUNK;
+    if (want > RAY_ENC_CHUNK) want = RAY_ENC_CHUNK;
+    if (n != want) return RAY_ERR_RANGE;
+    ray_err_t err;
+    if (w->chunk_i == 0 && ray_encw_type_has_dict(w->type) &&
+        (err = train_dict(w, data, n)) != RAY_OK) return err;
+    ray_enc_dict_t dict = { w->dict_v, w->dict_n };
+    w->chunk.len = 0; w->chunk.oom = false;
+    if (!ray_enc_buf_put(&w->chunk, NULL, RAY_ENC_DESC_AREA)) return RAY_ERR_OOM;
+    ray_enc_dirent_t* de = &w->dir[w->chunk_i];
+    memset(de, 0, sizeof *de);
+    bool have = false, fl = type_is_float(w->type);
+    int64_t nv = (n + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
+    for (int64_t j = 0; j < nv; j++) {
+        int vn = (int)(n - j * RAY_ENC_VEC < RAY_ENC_VEC ? n - j * RAY_ENC_VEC : RAY_ENC_VEC);
+        err = ray_encw_vec(w->type, w->attrs, data, str_pool, j * RAY_ENC_VEC, vn,
+                           w->dict_n ? &dict : NULL, &w->vec);
+        if (err != RAY_OK) return err;
+        ray_enc_desc_t desc = w->vec.desc;
+        desc.payload_off = w->chunk.len;
+        if (!ray_enc_buf_put(&w->chunk, w->vec.payload.p, w->vec.payload.len)) return RAY_ERR_OOM;
+        memcpy(w->chunk.p + j * sizeof(ray_enc_desc_t), &desc, sizeof desc);
+        if (desc.encoding == RAY_ENC_DICT) w->dict_used = true;
+        de->null_count += (uint32_t)w->vec.n_nulls;
+        if (w->vec.n_nulls > 0 && ray_enc_has_bitmap(w->type)) w->any_bitmap_null = true;
+        w->str_pool_bytes += w->vec.str_pooled;
+        if (w->str_pool_bytes > UINT32_MAX) return RAY_ERR_RANGE;
+        if (ray_encw_type_summable(w->type))
+            ray_i128_add128(&de->sum_hi, &de->sum_lo, w->vec.sum_hi, w->vec.sum_lo);
+        if (w->vec.has_stats) {
+            /* Combined in row order with the vector rule: strict compare,
+             * the first of tied values wins. */
+            bool lt = fl ? bits_double(desc.min) < bits_double(de->min) : desc.min < de->min;
+            bool gt = fl ? bits_double(desc.max) > bits_double(de->max) : desc.max > de->max;
+            if (!have || lt) de->min = desc.min;
+            if (!have || gt) de->max = desc.max;
+            have = true;
+        }
+    }
+    if (!have) { de->flags = RAY_ENC_STAT_ABSENT; de->min = de->max = 0; }
+    de->offset = w->pos;
+    de->bytes  = w->chunk.len;
+    if ((err = fput(w, w->chunk.p, w->chunk.len)) != RAY_OK) return err;
+    w->chunk_i++;
+    return RAY_OK;
+}
+
+ray_err_t ray_encw_finish(ray_encw_t* w) {
+    if (w->chunk_i != w->n_chunks) return RAY_ERR_RANGE;
+    ray_err_t err;
+    uint64_t side_off = 0, side_len = 0;
+    if (w->dict_used) {
+        ray_enc_kind_t k;
+        (void)ray_enc_kind_of(w->type, w->attrs, &k);
+        size_t esz = (size_t)k.T / 8;
+        uint64_t ebytes = 8 + ray_enc_pad8((uint64_t)w->dict_n * esz);
+        side_off = ray_enc_pad32(w->pos);
+        if ((err = fput(w, NULL, (size_t)(side_off - w->pos))) != RAY_OK) return err;
+        /* side table: n_entries, reserved, one 24-byte entry; the entry
+         * itself starts 32-aligned relative to the side-data start. */
+        uint8_t tbl[32] = {0};
+        uint32_t ne = 1; memcpy(tbl, &ne, 4);
+        uint16_t kind = RAY_ENC_SIDE_VALUE_DICT; memcpy(tbl + 8, &kind, 2);
+        uint64_t eoff = 32; memcpy(tbl + 16, &eoff, 8);
+        memcpy(tbl + 24, &ebytes, 8);
+        if ((err = fput(w, tbl, 32)) != RAY_OK) return err;
+        uint32_t eh[2] = { w->dict_n, 0 };
+        if ((err = fput(w, eh, 8)) != RAY_OK) return err;
+        for (uint32_t i = 0; i < w->dict_n; i++)
+            if ((err = fput(w, &w->dict_v[i], esz)) != RAY_OK) return err;   /* LE low bytes */
+        uint64_t used = (uint64_t)w->dict_n * esz;
+        if ((err = fput(w, NULL, (size_t)(ray_enc_pad8(used) - used))) != RAY_OK) return err;
+        side_len = 32 + ebytes;
+    }
+    ray_enc_hdr_t eh;
+    memset(&eh, 0, sizeof eh);
+    memcpy(eh.magic, "RENC", 4);
+    eh.header_version = RAY_ENC_HDR_VERSION;
+    eh.index_kind = w->index_kind;
+    eh.col_flags = w->col_flags;
+    eh.side_off = side_off; eh.side_len = side_len;
+    eh.str_pool_bytes = w->type == RAY_STR ? w->str_pool_bytes : 0;
+    eh.end_off = w->pos;
+    ray_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    uint32_t xenc = RAY_ENC_XENC;
+    memcpy(hdr.aux, &xenc, 4);
+    hdr.order = RAY_ENC_GEN;
+    hdr.type  = w->type;
+    hdr.attrs = (uint8_t)((w->attrs & COL_DISK_ATTRS_MASK) |
+                          (w->any_bitmap_null ? RAY_ATTR_HAS_NULLS : 0));
+    hdr.rc    = w->sym_count;
+    hdr.len   = w->len;
+    if (fflush(w->f) != 0 || fseek(w->f, 0, SEEK_SET) != 0) return RAY_ERR_IO;
+    if (fwrite(&hdr, 1, 32, w->f) != 32 || fwrite(&eh, 1, 64, w->f) != 64) return RAY_ERR_IO;
+    if (w->n_chunks > 0 &&
+        fwrite(w->dir, sizeof(ray_enc_dirent_t), (size_t)w->n_chunks, w->f) != (size_t)w->n_chunks)
+        return RAY_ERR_IO;
+    return fflush(w->f) == 0 ? RAY_OK : RAY_ERR_IO;
 }

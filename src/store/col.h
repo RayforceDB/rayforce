@@ -92,6 +92,13 @@ static inline ray_err_t ray_col_check_format(const ray_t* header) {
  * loads attach that symfile's domain (sym-domain architecture spec). */
 ray_err_t ray_col_save(ray_t* vec, const char* path);
 ray_err_t ray_col_save_bulk(ray_t* vec, const char* path);
+/* Write `vec` in the given generation (0 or 2).  ray_col_save / _bulk stay
+ * generation 0 only.  A column generation 2 cannot hold is written as 0. */
+ray_err_t ray_col_save_gen(ray_t* vec, const char* path, uint8_t gen);
+ray_err_t ray_col_save_bulk_gen(ray_t* vec, const char* path, uint8_t gen);
+
+bool ray_col_gen2_eligible(ray_t* col);
+void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags);
 /* Validate the complete object graph accepted by ray_col_save without
  * opening or modifying a file.  Splayed saves use this before mutating a
  * symfile or any already-committed column generation. */

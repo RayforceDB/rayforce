@@ -1222,6 +1222,21 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx) {
     return attach_finalize(v, idx);
 }
 
+static bool idx_numeric_parent(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+           t == RAY_F32 || t == RAY_F64 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t t) {
+    if (idx_numeric_parent(t))
+        return kind == RAY_IDX_NONE || kind == RAY_IDX_HASH || kind == RAY_IDX_SORT ||
+               kind == RAY_IDX_BLOOM || kind == RAY_IDX_PART || kind == RAY_IDX_ZONE ||
+               kind == RAY_IDX_CHUNK_ZONE;
+    if (t == RAY_SYM) return kind == RAY_IDX_NONE || kind == RAY_IDX_HASH || kind == RAY_IDX_PART;
+    if (t == RAY_STR) return kind == RAY_IDX_NONE || kind == RAY_IDX_HASH || kind == RAY_IDX_DICT;
+    return false;
+}
+
 ray_t* ray_index_attach_dict(ray_t** vp) {
     ray_t* v = prepare_attach_ex(vp, "dict", true, false);
     if (RAY_IS_ERR(v)) return v;
