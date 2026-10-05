@@ -665,7 +665,7 @@ ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
                               void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap) {
     int64_t rows = chunk_rows(e, c);
     int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
-    const uint8_t* body; uint64_t avail; const uint8_t* bm;
+    const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
     ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
     if (err) return err;
     uint64_t pooled = 0;
@@ -700,7 +700,7 @@ ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_e
     if (e->type != RAY_STR) return NULL;
     int64_t rows = chunk_rows(e, c);
     int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
-    const uint8_t* body; uint64_t avail; const uint8_t* bm;
+    const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
     ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
     if (err) return err;
     return dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, out);
