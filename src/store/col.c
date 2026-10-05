@@ -1840,9 +1840,12 @@ void ray_col_want_row(ray_t* col, int64_t row) {
 void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
     size_t esz = col_fixed_esz(col);
     if (!esz || n <= 0) return;
-    /* A few rows: requesting costs less than probing whether to. */
-    if (n > 64 && !ray_col_cold(col)) return;
     const uint8_t* base = (const uint8_t*)ray_data(col);
+    /* A few rows: the first one's page stands for the column (one probe);
+     * more: a sample of the column's pages. */
+    if (n <= 64 ? (idx[0] >= 0 && idx[0] < col->len &&
+                   ray_vm_resident(base + (size_t)idx[0] * esz, esz))
+                : !ray_col_cold(col)) return;
     uintptr_t last = UINTPTR_MAX;
     for (int64_t i = 0; i < n; i++) {
         if (idx[i] < 0 || idx[i] >= col->len) continue;
