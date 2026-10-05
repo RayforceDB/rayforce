@@ -35,8 +35,17 @@
 
 typedef struct { uint8_t n; uint8_t len[255]; uint8_t sym[255][8]; } ray_fsst_table_t;
 
+/* Compact encode index (~0.5 KB): symbols grouped by first byte, longest first. */
+typedef struct ray_fsst_index_s { uint8_t start[256]; uint8_t cnt[256]; uint8_t ids[255]; } ray_fsst_index_t;
+
+void    ray_fsst_index_build(const ray_fsst_table_t* t, ray_fsst_index_t* ix);
+/* out must hold 2*len bytes (worst case: every byte escaped). */
+int64_t ray_fsst_encode_ix(const ray_fsst_table_t* t, const ray_fsst_index_t* ix,
+                           const uint8_t* s, uint32_t len, uint8_t* out);
+
 void    ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t n,
                        ray_fsst_table_t* t);
+/* out must hold 2*len bytes.  Builds an index per call; use ray_fsst_encode_ix in loops. */
 int64_t ray_fsst_encode(const ray_fsst_table_t* t, const uint8_t* s, uint32_t len, uint8_t* out);
 int64_t ray_fsst_decode(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len,
                         uint8_t* out, size_t cap);

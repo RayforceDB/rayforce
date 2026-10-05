@@ -23,38 +23,46 @@
 
 #include "store/fsst.h"
 #include <rayforce.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* Lookup: for each first byte, the symbols starting with it, longest first.
- * Rebuilt per call from the table (cheap: 255 symbols). */
-typedef struct { uint8_t cnt[256]; uint8_t ids[256][255]; } fsst_index_t;
-
-static void fsst_index(const ray_fsst_table_t* t, fsst_index_t* ix) {
-    memset(ix->cnt, 0, sizeof ix->cnt);
+/* Index: symbols grouped by first byte (start/cnt into ids), within a group
+ * longest first, ties by code.  Built once per table, matched per position. */
+void ray_fsst_index_build(const ray_fsst_table_t* t, ray_fsst_index_t* ix) {
+    memset(ix, 0, sizeof *ix);
+    for (int c = 0; c < t->n; c++) ix->cnt[t->sym[c][0]]++;
+    uint8_t pos[256]; int acc = 0;
+    for (int f = 0; f < 256; f++) { ix->start[f] = (uint8_t)acc; pos[f] = (uint8_t)acc; acc += ix->cnt[f]; }
     for (int len = 8; len >= 1; len--)
         for (int c = 0; c < t->n; c++)
-            if (t->len[c] == len) { uint8_t f = t->sym[c][0]; ix->ids[f][ix->cnt[f]++] = (uint8_t)c; }
+            if (t->len[c] == len) ix->ids[pos[t->sym[c][0]]++] = (uint8_t)c;
 }
 
-static int fsst_match(const ray_fsst_table_t* t, const fsst_index_t* ix,
+static int fsst_match(const ray_fsst_table_t* t, const ray_fsst_index_t* ix,
                       const uint8_t* s, uint32_t rem) {
     uint8_t f = s[0];
+    const uint8_t* ids = ix->ids + ix->start[f];
     for (int j = 0; j < ix->cnt[f]; j++) {
-        int c = ix->ids[f][j];
+        int c = ids[j];
         if (t->len[c] <= rem && memcmp(t->sym[c], s, t->len[c]) == 0) return c;
     }
     return -1;
 }
 
-int64_t ray_fsst_encode(const ray_fsst_table_t* t, const uint8_t* s, uint32_t len, uint8_t* out) {
-    fsst_index_t ix; fsst_index(t, &ix);
+int64_t ray_fsst_encode_ix(const ray_fsst_table_t* t, const ray_fsst_index_t* ix,
+                           const uint8_t* s, uint32_t len, uint8_t* out) {
     int64_t o = 0;
     for (uint32_t i = 0; i < len;) {
-        int c = fsst_match(t, &ix, s + i, len - i);
+        int c = fsst_match(t, ix, s + i, len - i);
         if (c >= 0) { out[o++] = (uint8_t)c; i += t->len[c]; }
         else        { out[o++] = RAY_FSST_ESC; out[o++] = s[i++]; }
     }
     return o;
+}
+
+int64_t ray_fsst_encode(const ray_fsst_table_t* t, const uint8_t* s, uint32_t len, uint8_t* out) {
+    ray_fsst_index_t ix; ray_fsst_index_build(t, &ix);
+    return ray_fsst_encode_ix(t, &ix, s, len, out);
 }
 
 int64_t ray_fsst_expanded_len(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len) {
@@ -100,8 +108,19 @@ static int cand_cmp(const fsst_cand_t* a, const fsst_cand_t* b) {
     return memcmp(a->b, b->b, 8);
 }
 
+/* Training sample budget: when the input holds more than this many bytes, every
+ * stride-th string is used (stride = ceil(total / budget)), so the sample spans
+ * the whole input evenly.  The candidate map holds 2^17 slots; a new key is
+ * dropped once it is half full while existing keys keep counting.  With a
+ * 256 KiB sample that cap is rarely reached. */
+#define FSST_SAMPLE_BYTES (1u << 18)
+
+static int cand_qcmp(const void* a, const void* b) {
+    return cand_cmp((const fsst_cand_t*)a, (const fsst_cand_t*)b);
+}
+
 /* Candidates live in a small open-addressing map keyed by (len, bytes). */
-#define FSST_MAP_BITS 16
+#define FSST_MAP_BITS 17
 typedef struct { fsst_cand_t* e; uint32_t n, cap; } fsst_map_t;
 
 static uint64_t cand_key_hash(uint8_t len, const uint8_t* b) {
@@ -114,7 +133,7 @@ static void map_add(fsst_map_t* m, uint8_t len, const uint8_t* b, uint64_t g) {
     uint32_t mask = m->cap - 1;
     for (uint32_t i = (uint32_t)cand_key_hash(len, b) & mask;; i = (i + 1) & mask) {
         fsst_cand_t* e = &m->e[i];
-        if (e->len == 0) { e->len = len; memset(e->b, 0, 8); memcpy(e->b, b, len); e->gain = g; m->n++; return; }
+        if (e->len == 0) { if (m->n >= m->cap / 2) return; e->len = len; memset(e->b, 0, 8); memcpy(e->b, b, len); e->gain = g; m->n++; return; }
         if (e->len == len && memcmp(e->b, b, len) == 0) { e->gain += g; return; }
     }
 }
@@ -122,16 +141,20 @@ static void map_add(fsst_map_t* m, uint8_t len, const uint8_t* b, uint64_t g) {
 void ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t n,
                     ray_fsst_table_t* t) {
     memset(t, 0, sizeof *t);
+    uint64_t total = 0;
+    for (int64_t i = 0; i < n; i++) total += lens[i];
+    int64_t stride = total > FSST_SAMPLE_BYTES ? (int64_t)((total + FSST_SAMPLE_BYTES - 1) / FSST_SAMPLE_BYTES) : 1;
     fsst_map_t m = { NULL, 0, 1u << FSST_MAP_BITS };
     m.e = ray_calloc_raw(sizeof(fsst_cand_t) * m.cap);
-    if (!m.e) return;                                  /* empty table: everything escapes */
+    fsst_cand_t* all = ray_calloc_raw(sizeof(fsst_cand_t) * (m.cap / 2 + 1));
+    if (!m.e || !all) { ray_free_raw(m.e); ray_free_raw(all); return; }  /* empty table: everything escapes */
     for (int round = 0; round < 5; round++) {
         memset(m.e, 0, sizeof(fsst_cand_t) * m.cap); m.n = 0;
-        fsst_index_t ix; fsst_index(t, &ix);
-        for (int64_t si = 0; si < n; si++) {
+        ray_fsst_index_t ix; ray_fsst_index_build(t, &ix);
+        for (int64_t si = 0; si < n; si += stride) {
             const uint8_t* s = strs[si]; uint32_t len = lens[si];
             int prev_len = 0; uint8_t prev[8];
-            for (uint32_t i = 0; i < len && m.n < m.cap / 2;) {
+            for (uint32_t i = 0; i < len;) {
                 int c = t->n ? fsst_match(t, &ix, s + i, len - i) : -1;
                 uint8_t cl = c >= 0 ? t->len[c] : 1;
                 const uint8_t* cb = c >= 0 ? t->sym[c] : s + i;
@@ -144,27 +167,16 @@ void ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t n,
                 i += cl;
             }
         }
-        /* pick the top 255 by gain: partial selection over the map */
+        /* total order (gain, len, bytes) over distinct keys: sort, keep the first 255 */
+        size_t k = 0;
+        for (uint32_t i = 0; i < m.cap; i++) if (m.e[i].len) all[k++] = m.e[i];
+        qsort(all, k, sizeof *all, cand_qcmp);
+        if (k > 255) k = 255;
         ray_fsst_table_t nt; memset(&nt, 0, sizeof nt);
-        fsst_cand_t top[255]; int nt_n = 0;
-        for (uint32_t i = 0; i < m.cap; i++) {
-            fsst_cand_t* e = &m.e[i];
-            if (!e->len) continue;
-            if (nt_n < 255) { top[nt_n++] = *e; }
-            else {
-                int worst = 0;
-                for (int j = 1; j < 255; j++) if (cand_cmp(&top[j], &top[worst]) > 0) worst = j;
-                if (cand_cmp(e, &top[worst]) < 0) top[worst] = *e;
-            }
-        }
-        /* stable order: sort the chosen symbols by (gain desc, len desc, bytes) */
-        for (int a = 1; a < nt_n; a++)
-            for (int b = a; b > 0 && cand_cmp(&top[b], &top[b - 1]) < 0; b--) {
-                fsst_cand_t x = top[b]; top[b] = top[b - 1]; top[b - 1] = x;
-            }
-        nt.n = (uint8_t)nt_n;
-        for (int c = 0; c < nt_n; c++) { nt.len[c] = top[c].len; memcpy(nt.sym[c], top[c].b, 8); }
+        nt.n = (uint8_t)k;
+        for (size_t c = 0; c < k; c++) { nt.len[c] = all[c].len; memcpy(nt.sym[c], all[c].b, 8); }
         *t = nt;
     }
+    ray_free_raw(all);
     ray_free_raw(m.e);
 }

@@ -106,10 +106,52 @@ static test_result_t test_fsst_deterministic(void) {
     PASS();
 }
 
+static test_result_t test_fsst_encode_ix_matches_encode(void) {
+    enum { N = 500 };
+    static char buf[N][64];
+    const uint8_t* s[N]; uint32_t l[N];
+    for (int i = 0; i < N; i++) {
+        int len = snprintf(buf[i], 64, "https://host%d.example.org/a/b/%d.html", i % 7, i * 13);
+        s[i] = (const uint8_t*)buf[i]; l[i] = (uint32_t)len;
+    }
+    ray_fsst_table_t t; ray_fsst_train(s, l, N, &t);
+    ray_fsst_index_t ix; ray_fsst_index_build(&t, &ix);
+    for (int i = 0; i < N; i++) {
+        uint8_t a[2 * 64 + 1], b[2 * 64 + 1];
+        int64_t ea = ray_fsst_encode(&t, s[i], l[i], a);
+        int64_t eb = ray_fsst_encode_ix(&t, &ix, s[i], l[i], b);
+        TEST_ASSERT_EQ_I(ea, eb);
+        TEST_ASSERT_TRUE(memcmp(a, b, (size_t)ea) == 0);
+    }
+    PASS();
+}
+
+static test_result_t test_fsst_train_covers_whole_input(void) {
+    enum { N = 4000, H = 2000 };
+    static char buf[N][160];
+    const uint8_t* s[N]; uint32_t l[N];
+    for (int i = 0; i < N; i++) {
+        int len = i < H
+            ? snprintf(buf[i], 160, "http://alpha.example.com/catalog/item/%d?lang=en&utm=0123456789012345678901234567890123456789012345", i * 3)
+            : snprintf(buf[i], 160, "https://zeta.another-site.net/users/profile/%d/settings/notifications/email/digest/weekly/summary/archive", i * 5);
+        s[i] = (const uint8_t*)buf[i]; l[i] = (uint32_t)len;
+    }
+    ray_fsst_table_t t; ray_fsst_train(s, l, N, &t);
+    int64_t enc;
+    TEST_ASSERT_EQ_I(fsst_roundtrip_all(&t, s, l, N, &enc), -1);
+    int64_t raw2 = 0, enc2;
+    for (int i = H; i < N; i++) raw2 += l[i];
+    TEST_ASSERT_EQ_I(fsst_roundtrip_all(&t, s + H, l + H, N - H, &enc2), -1);
+    TEST_ASSERT_FMT(enc2 * 3 < raw2 * 2, "last half enc %lld raw %lld", (long long)enc2, (long long)raw2);
+    PASS();
+}
+
 const test_entry_t fsst_entries[] = {
     { "fsst/urls_compress",        test_fsst_urls_compress,        fsst_setup, fsst_teardown },
     { "fsst/all_bytes_empty_long", test_fsst_all_bytes_empty_long, fsst_setup, fsst_teardown },
     { "fsst/rejects_malformed",    test_fsst_rejects_malformed,    fsst_setup, fsst_teardown },
     { "fsst/deterministic",        test_fsst_deterministic,        fsst_setup, fsst_teardown },
+    { "fsst/encode_ix_matches_encode", test_fsst_encode_ix_matches_encode, fsst_setup, fsst_teardown },
+    { "fsst/train_covers_whole_input", test_fsst_train_covers_whole_input, fsst_setup, fsst_teardown },
     { NULL, NULL, NULL, NULL },
 };
