@@ -155,10 +155,15 @@ static inline int ray_col_gen_of(const void* file_header) {
     uint32_t aux0;
     memcpy(&aux0, p, 4);
     uint8_t order = p[17];
-    if (order == RAY_ENC_GEN) return aux0 == RAY_ENC_XENC ? 2 : RAY_ENC_GEN_CORRUPT;
+    /* "XENC" is compared as bytes so a big-endian host still recognises
+     * generation 2 and answers nyi (ray_enccol_open), not corrupt. */
+    if (order == RAY_ENC_GEN) return memcmp(p, "XENC", 4) == 0 ? 2 : RAY_ENC_GEN_CORRUPT;
     if (order == 0) return (aux0 == 0 || aux0 == RAY_ENC_XIDX) ? 0 : RAY_ENC_GEN_CORRUPT;
     return RAY_ENC_GEN_VERSION;
 }
+
+/* Whether this build can read generation 2 (little-endian hosts only). */
+static inline int ray_enc_gen2_supported(void) { return RAY_ENC_LE; }
 
 static inline uint64_t ray_enc_pad8(uint64_t x)  { return (x + 7) & ~(uint64_t)7; }
 static inline uint64_t ray_enc_pad32(uint64_t x) { return (x + 31) & ~(uint64_t)31; }

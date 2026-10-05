@@ -165,6 +165,7 @@ extern const test_entry_t idx_uses_entries[];
 extern const test_entry_t enc_entries[];
 extern const test_entry_t encfmt_entries[];
 extern const test_entry_t enconce_entries[];
+extern const test_entry_t enccol_entries[];
 extern const test_entry_t fsst_entries[];
 extern const test_entry_t stress_eval_entries[];
 extern const test_entry_t stress_matrix_entries[];
@@ -210,7 +211,7 @@ static const test_entry_t* const compiled_groups[] = {
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries,
     sort_entries,     splay_entries,    store_entries,    enc_entries,
-    encfmt_entries,   enconce_entries,
+    encfmt_entries,   enconce_entries,   enccol_entries,
     idx_uses_entries,
     fsst_entries,
     stress_eval_entries,

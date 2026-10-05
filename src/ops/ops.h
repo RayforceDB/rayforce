@@ -34,6 +34,10 @@ extern "C" {
 /* ===== Internal Type Constants ===== */
 
 #define RAY_SEL       14   /* selection bitmap (lazy filter) */
+/* Encoded (generation-2) column held by a table slot: payload is one
+ * pointer to a refcounted ray_enccol_t (src/store/enccol.h).  Never seen
+ * outside the store layer, the table accessors and the aware paths. */
+#define RAY_ENCCOL    15
 
 /* Lazy DAG handle (atom-only; stored inline in aux region) */
 #define RAY_LAZY      104

@@ -38,6 +38,7 @@
 #include "store/hnsw.h"
 #include "store/csr.h"
 #include "ops/idxop.h"
+#include "store/enccol.h"
 #include <string.h>
 #include <stdlib.h>     /* getenv */
 #include <stdio.h>      /* snprintf */
@@ -898,6 +899,11 @@ static void ray_release_owned_refs(ray_t* v) {
         return;
     }
 
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_payload_release(v);
+        return;
+    }
+
     /* Vector with attached index: aux[0..7] holds an owning ref to the
      * index ray_t.  Bytes 8-15 are NOT displaced into the index for a
      * STR or SYM parent — attach_finalize leaves the pool or domain
@@ -1031,6 +1037,11 @@ bool ray_retain_owned_refs(ray_t* v) {
         return true;
     }
 
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_payload_retain(v);
+        return true;
+    }
+
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
         /* Mirror ray_release_owned_refs: a mmap-resident passenger index
          * (mmod==1) is owned by the column's mapping, not refcounted here,
@@ -1142,6 +1153,11 @@ static void ray_detach_owned_refs(ray_t* v) {
         }
         memset(ix->saved_aux, 0, 16);
         ix->saved_attrs = 0;
+        return;
+    }
+
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_payload_detach(v);
         return;
     }
 
@@ -1926,6 +1942,8 @@ ray_t* ray_alloc_copy(ray_t* v) {
         if (v->type == RAY_MAPCOMMON) n_ptrs = 2;
         if (n_ptrs < 0) return ray_error("oom", NULL);
         data_size = (size_t)n_ptrs * sizeof(ray_t*);
+    } else if (v->type == RAY_ENCCOL) {
+        data_size = sizeof(void*);          /* the payload pointer; payload is refcounted */
     } else if (v->type == RAY_LIST) {
         /* RAY_LIST has type==0, which the generic branch below (t <= 0)
          * would route to data_size=0, silently producing a header-only copy
@@ -3025,6 +3043,7 @@ size_t ray_shallow_bytes(const ray_t* v) {
     }
     if (v->attrs & RAY_ATTR_SLICE) return n;
     if (v->type == RAY_INDEX) return index_own_bytes(v);
+    if (v->type == RAY_ENCCOL) return block_own_bytes(v) + ray_enccol_own_bytes((ray_t*)v);
     if (v->attrs & RAY_ATTR_HAS_INDEX) n += index_own_bytes(v->index);
     if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
         n += block_own_bytes(v->str_pool);
@@ -3087,6 +3106,12 @@ static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
         ray_t* kids[4];
         int k = ray_index_child_blocks(ix, kids, 4);
         for (int i = 0; i < k; i++) n += retained_walk(kids[i], seen);
+        return n;
+    }
+    if (v->type == RAY_ENCCOL) {
+        ray_t* kids[2];
+        int nk = ray_enccol_children((ray_t*)v, kids);
+        for (int i = 0; i < nk; i++) n += retained_walk(kids[i], seen);
         return n;
     }
     if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index) &&

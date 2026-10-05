@@ -34,6 +34,7 @@
 #include "store/serde.h"
 #include "store/fileio.h"
 #include "store/encfmt.h"
+#include "store/enccol.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "table/dict.h"
@@ -750,8 +751,11 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     (void)col_len; (void)col_type;
     FILE* f = fopen(path, "r+b");
     if (!f) return RAY_ERR_IO;
-    uint32_t cur_mg = 0;
-    if (fread(&cur_mg, 1, 4, f) == 4 && cur_mg == COL_IDX_AUX_MAGIC) { fclose(f); return RAY_ERR_CORRUPT; }
+    uint8_t h32[32];
+    if (fread(h32, 1, 32, f) != 32) { fclose(f); return RAY_ERR_CORRUPT; }
+    if (ray_col_gen_of(h32) == 2) { fclose(f); return RAY_ERR_VERSION; }
+    uint32_t cur_mg; memcpy(&cur_mg, h32, 4);
+    if (cur_mg == COL_IDX_AUX_MAGIC) { fclose(f); return RAY_ERR_CORRUPT; }
     int64_t payload_end = 0;
     ray_err_t err = ray_col_write_index_region(f, ix_v, &payload_end);
     if (err == RAY_OK) {
@@ -1671,10 +1675,8 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
     col_mapped_t cm = {0};
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
-    if (cm.gen2) {
-        ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-        return ray_error("nyi", "col %s: generation 2 reader not built", path);
-    }
+    if (cm.gen2)
+        return ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
 
     /* Validate that the file size matches the expected layout.  Without an
      * inline index the payload is the whole file (ray_free reconstructs the
