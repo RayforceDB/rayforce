@@ -331,8 +331,17 @@ static void estimate_sym(const char* sym) {
     sym_par_t P = { keep, nkeep, 0, 0 };
     pthread_t* th = xmalloc(sizeof(pthread_t) * (size_t)ncpu);
     double tp = now_s();
-    for (long i = 0; i < ncpu; i++) pthread_create(&th[i], NULL, sym_par_worker, &P);
-    for (long i = 0; i < ncpu; i++) pthread_join(th[i], NULL);
+    long started = 0;
+    for (long i = 0; i < ncpu; i++) {
+        if (pthread_create(&th[i], NULL, sym_par_worker, &P) != 0) break;
+        started++;
+    }
+    if (started < ncpu) {
+        fprintf(stderr, "warning: started %ld of %ld decode threads\n", started, ncpu);
+        sym_par_worker(&P);          /* the caller drains whatever blocks remain */
+    }
+    for (long i = 0; i < started; i++) pthread_join(th[i], NULL);
+    ncpu = started < ncpu ? started + 1 : ncpu;
     double par_s = now_s() - tp;
     if (P.bad) { fprintf(stderr, "parallel fsst decode length mismatch\n"); exit(3); }
     for (int i = 0; i < nkeep; i++) { free(keep[i].t); free(keep[i].arena); free(keep[i].eoff); free(keep[i].elen); free(keep[i].l); }
