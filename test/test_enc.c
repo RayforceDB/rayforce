@@ -105,10 +105,102 @@ static test_result_t test_bitlen(void) {
     PASS();
 }
 
+static test_result_t test_kind_of(void) {
+    ray_enc_kind_t k;
+    TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_I16, 0, &k)); TEST_ASSERT_EQ_I(k.T, 16); TEST_ASSERT_TRUE(k.is_signed);
+    TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_DATE, 0, &k)); TEST_ASSERT_EQ_I(k.T, 32); TEST_ASSERT_TRUE(k.is_signed);
+    TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_TIMESTAMP, 0, &k)); TEST_ASSERT_EQ_I(k.T, 64);
+    TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_U8, 0, &k)); TEST_ASSERT_EQ_I(k.T, 8); TEST_ASSERT_FALSE(k.is_signed);
+    TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_SYM, RAY_SYM_W16, &k)); TEST_ASSERT_EQ_I(k.T, 16); TEST_ASSERT_FALSE(k.is_signed);
+    TEST_ASSERT_FALSE(ray_enc_kind_of(RAY_F64, 0, &k));
+    TEST_ASSERT_FALSE(ray_enc_kind_of(RAY_STR, 0, &k));
+    PASS();
+}
+
+static test_result_t test_logical_and_order(void) {
+    ray_enc_kind_t s16 = { 16, true }, u8 = { 8, false };
+    TEST_ASSERT_EQ_I(ray_enc_logical(0xFFFF, s16), -1);
+    TEST_ASSERT_EQ_I(ray_enc_logical(0x7FFF, s16), 32767);
+    TEST_ASSERT_TRUE(ray_enc_lt(0xFFFF, 0x0001, s16));   /* -1 < 1 */
+    TEST_ASSERT_EQ_I(ray_enc_logical(0x80, u8), 128);     /* no sign extension */
+    TEST_ASSERT_TRUE(ray_enc_lt(0x7F, 0x80, u8));         /* 127 < 128 */
+    PASS();
+}
+
+static test_result_t test_load_i64_nulls_fill_min(void) {
+    int64_t d[5] = { 40, NULL_I64, -7, NULL_I64, 12 };
+    ray_enc_input_t in;
+    TEST_ASSERT_TRUE(ray_enc_load(d, RAY_I64, 0, 0, 5, &in));
+    TEST_ASSERT_EQ_I(in.n, 5);
+    TEST_ASSERT_EQ_I(in.n_nulls, 2);
+    TEST_ASSERT_TRUE(in.bitmap);
+    TEST_ASSERT_EQ_U(in.nullmap[0], 0x0A);                /* rows 1 and 3 */
+    TEST_ASSERT_EQ_I((int64_t)in.bits[1], -7);            /* filled with min */
+    TEST_ASSERT_EQ_I((int64_t)in.bits[3], -7);
+    TEST_ASSERT_EQ_I((int64_t)in.bits[4], 12);
+    PASS();
+}
+
+static test_result_t test_load_all_null_fills_zero(void) {
+    int32_t d[3] = { NULL_I32, NULL_I32, NULL_I32 };
+    ray_enc_input_t in;
+    TEST_ASSERT_TRUE(ray_enc_load(d, RAY_I32, 0, 0, 3, &in));
+    TEST_ASSERT_EQ_I(in.n_nulls, 3);
+    for (int i = 0; i < 3; i++) TEST_ASSERT_EQ_U(in.bits[i], 0);
+    PASS();
+}
+
+static test_result_t test_load_sym_w8_inband(void) {
+    uint8_t d[4] = { 0, 127, 128, 255 };                   /* id 0 is the in-band null */
+    ray_enc_input_t in;
+    TEST_ASSERT_TRUE(ray_enc_load(d, RAY_SYM, RAY_SYM_W8, 0, 4, &in));
+    TEST_ASSERT_FALSE(in.bitmap);
+    TEST_ASSERT_EQ_I(in.n_nulls, 1);
+    TEST_ASSERT_EQ_U(in.bits[0], 0);                       /* stored as itself */
+    TEST_ASSERT_EQ_U(in.bits[2], 128);
+    ray_enc_stats_t s;
+    ray_enc_stats(in.bits, in.n, in.k, &s);
+    TEST_ASSERT_EQ_U(s.min, 0);
+    TEST_ASSERT_EQ_U(s.max, 255);
+    TEST_ASSERT_EQ_I(s.runs, 4);
+    PASS();
+}
+
+static test_result_t test_stats_runs_and_equal(void) {
+    uint64_t v[6] = { 5, 5, 5, 9, 9, 5 };
+    ray_enc_kind_t k = { 32, true };
+    ray_enc_stats_t s;
+    ray_enc_stats(v, 6, k, &s);
+    TEST_ASSERT_EQ_I(s.runs, 3);
+    TEST_ASSERT_FALSE(s.all_equal);
+    ray_enc_stats(v, 3, k, &s);
+    TEST_ASSERT_TRUE(s.all_equal);
+    TEST_ASSERT_EQ_I(s.runs, 1);
+    PASS();
+}
+
+static test_result_t test_load_offset_start(void) {
+    int16_t d[2000];
+    for (int i = 0; i < 2000; i++) d[i] = (int16_t)(i - 1000);
+    ray_enc_input_t in;
+    TEST_ASSERT_TRUE(ray_enc_load(d, RAY_I16, 0, 1024, 976, &in));
+    TEST_ASSERT_EQ_I(in.n, 976);
+    TEST_ASSERT_EQ_I(ray_enc_logical(in.bits[0], in.k), 24);
+    TEST_ASSERT_EQ_I(ray_enc_logical(in.bits[975], in.k), 999);
+    PASS();
+}
+
 const test_entry_t enc_entries[] = {
     { "enc/pack_roundtrip_all_widths", test_pack_roundtrip_all_widths, enc_setup, enc_teardown },
     { "enc/pack_layout_t8_w1",         test_pack_layout_t8_w1,         enc_setup, enc_teardown },
     { "enc/pack_layout_t16_w3",        test_pack_layout_t16_w3,        enc_setup, enc_teardown },
     { "enc/bitlen",                    test_bitlen,                    enc_setup, enc_teardown },
+    { "enc/kind_of",                   test_kind_of,                   enc_setup, enc_teardown },
+    { "enc/logical_and_order",         test_logical_and_order,         enc_setup, enc_teardown },
+    { "enc/load_i64_nulls_fill_min",   test_load_i64_nulls_fill_min,   enc_setup, enc_teardown },
+    { "enc/load_all_null_fills_zero",  test_load_all_null_fills_zero,  enc_setup, enc_teardown },
+    { "enc/load_sym_w8_inband",        test_load_sym_w8_inband,        enc_setup, enc_teardown },
+    { "enc/stats_runs_and_equal",      test_stats_runs_and_equal,      enc_setup, enc_teardown },
+    { "enc/load_offset_start",         test_load_offset_start,         enc_setup, enc_teardown },
     { NULL, NULL, NULL, NULL },
 };

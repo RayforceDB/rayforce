@@ -48,4 +48,30 @@ void   ray_enc_pack(const uint64_t* u, int T, int w, uint8_t* out);
 void   ray_enc_unpack(const uint8_t* in, int T, int w, uint64_t* u);
 int    ray_enc_bitlen(uint64_t x);
 
+/* ---- kinds and logical values ---- */
+typedef struct { uint8_t T; bool is_signed; } ray_enc_kind_t;
+
+bool    ray_enc_kind_of(int8_t type, uint8_t attrs, ray_enc_kind_t* k);
+bool    ray_enc_has_bitmap(int8_t type);
+int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k);
+bool    ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k);
+
+/* One vector of input: T-bit patterns, null bitmap (bit i set = row i
+ * null, bitmap-carrying types only) and the null count (in-band nulls of
+ * SYM are counted too, with no bitmap). */
+typedef struct {
+    uint64_t       bits[RAY_ENC_VEC];
+    uint8_t        nullmap[RAY_ENC_VEC / 8];
+    int            n;
+    int            n_nulls;
+    ray_enc_kind_t k;
+    bool           bitmap;
+} ray_enc_input_t;
+
+bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
+                  int64_t start, int n, ray_enc_input_t* in);
+
+typedef struct { uint64_t min, max; int runs; bool all_equal; } ray_enc_stats_t;
+void ray_enc_stats(const uint64_t* v, int n, ray_enc_kind_t k, ray_enc_stats_t* s);
+
 #endif /* RAY_ENC_H */
