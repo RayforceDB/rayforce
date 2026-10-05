@@ -34,6 +34,8 @@
 #include "ops/hash.h"     /* ray_hash_bytes: STR hash-index key word */
 #include "core/pool.h"    /* parallel hash-index build */
 #include "mem/sys.h"      /* ray_sys_alloc: build scratch off the buddy heap */
+#include "lang/format.h"  /* ray_type_name */
+#include <stdatomic.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -42,6 +44,59 @@
 /* ── Routing observability counters (diagnostic, unsynchronized) ── */
 uint64_t ray_idx_consults[IDX_SITE__N];
 uint64_t ray_idx_hits[IDX_SITE__N];
+
+#define IDX_USE_SLOTS 512
+static struct { const void* key; _Atomic uint64_t n; } g_idx_use[IDX_USE_SLOTS];
+static atomic_flag g_idx_use_lock = ATOMIC_FLAG_INIT;
+
+void ray_idx_note_use(const ray_t* col) {
+    if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return;
+    const void* key = col->index;
+    uint32_t h = (uint32_t)(((uintptr_t)key >> 5) * 2654435761u) & (IDX_USE_SLOTS - 1);
+    while (atomic_flag_test_and_set_explicit(&g_idx_use_lock, memory_order_acquire)) { }
+    for (uint32_t i = 0; i < IDX_USE_SLOTS; i++) {
+        uint32_t s = (h + i) & (IDX_USE_SLOTS - 1);
+        if (g_idx_use[s].key == key || g_idx_use[s].key == NULL) {
+            g_idx_use[s].key = key;
+            atomic_fetch_add_explicit(&g_idx_use[s].n, 1, memory_order_relaxed);
+            break;
+        }
+    }                                                     /* table full: drop the count */
+    atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
+}
+
+ray_t* ray_idx_uses_fn(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", ".idx.uses expects a table, got %s", tbl ? ray_type_name(tbl->type) : "null");
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, nc);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_vec_new(RAY_I64, nc);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    while (atomic_flag_test_and_set_explicit(&g_idx_use_lock, memory_order_acquire)) { }
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) continue;
+        for (uint32_t s = 0; s < IDX_USE_SLOTS; s++)
+            if (g_idx_use[s].key == col->index && g_idx_use[s].n) {
+                int64_t name = ray_table_col_name(tbl, c);
+                int64_t cnt = (int64_t)g_idx_use[s].n;
+                keys = ray_vec_append(keys, &name);
+                if (RAY_IS_ERR(keys)) { ray_release(vals); goto out_err; }
+                vals = ray_vec_append(vals, &cnt);
+                if (RAY_IS_ERR(vals)) { ray_release(keys); goto out_err; }
+                break;
+            }
+    }
+    memset(g_idx_use, 0, sizeof g_idx_use);              /* reset */
+    atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
+    return ray_dict_new(keys, vals);
+out_err: {
+        ray_t* e = ray_error("oom", NULL);
+        atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
+        return e;
+    }
+}
 
 static void idx_stats_dump(void) {
     static const char* names[IDX_SITE__N] = {

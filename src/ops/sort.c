@@ -3723,6 +3723,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
             /* Index eligible and fresh: consult + hit. */
             ray_idx_consults[IDX_SITE_SORT]++;
             ray_idx_hits[IDX_SITE_SORT]++;
+            ray_idx_note_use(sort_vecs[0]);
             ray_retain(perm);
             idx_vec = perm;
             goto sort_idx_ready;

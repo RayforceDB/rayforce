@@ -1464,6 +1464,7 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     if (eq_atom) ray_release(eq_atom);
     if (k < 0) return false;
     ray_idx_hits[IDX_SITE_GROUP_SLICE]++;
+    ray_idx_note_use(by_col);
     g->sg_col = by_col;
     ray_retain(by_col);
     g->sg_slices_hdr = shdr;   /* NULL when k == 0 */
@@ -2498,11 +2499,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 ray_rowsel_release(g->selection);
                                 g->selection = merged;
                                 ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                                ray_idx_note_use(scol);
                                 return input;
                             }
                         } else {
                             g->selection = ssel;
                             ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                            ray_idx_note_use(scol);
                             return input;
                         }
                     }
@@ -2530,12 +2533,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     switch (ray_index_zone_class(col, cmp_op, key_i, key_f)) {
                     case RAY_ZONE_ALL:
                         ray_idx_hits[IDX_SITE_FILTER_ZONE]++;
+                        ray_idx_note_use(col);
                         /* All rows pass — mirror the lazy path: leave
                          * g->selection NULL (no filter) and return the
                          * table.  Same ownership as the hash path below. */
                         return input;
                     case RAY_ZONE_NONE: {
                         ray_idx_hits[IDX_SITE_FILTER_ZONE]++;
+                        ray_idx_note_use(col);
                         int64_t nrows = ray_table_nrows(input);
                         ray_t* empty = ray_index_empty_rowsel(nrows);
                         if (empty) { g->selection = empty; return input; }
@@ -2553,6 +2558,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             ray_t* empty = ray_index_empty_rowsel(nrows);
                             if (empty) {
                                 ray_idx_hits[IDX_SITE_FILTER_BLOOM]++;
+                                ray_idx_note_use(col);
                                 g->selection = empty;
                                 return input;
                             }
@@ -2605,6 +2611,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     : ray_index_part_eq_rowsel(col, key_i);
                                 if (sel) {
                                     ray_idx_hits[site]++;
+                                    ray_idx_note_use(col);
                                     g->selection = sel;
                                     return input;
                                 }
@@ -2627,6 +2634,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                                                 (bool)is_float);
                             if (sel) {
                                 ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                                ray_idx_note_use(col);
                                 g->selection = sel;
                                 return input;
                             }
@@ -2699,6 +2707,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             ray_t* sel = ray_index_rowsel_from_ids(nrows, NULL, 0);
                             if (sel) {
                                 ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
+                                ray_idx_note_use(eq_col);
                                 g->selection = sel;
                                 return input;
                             }
@@ -2732,6 +2741,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     nrows, grows + startp, a - startp);
                                 if (sel) {
                                     ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
+                                    ray_idx_note_use(eq_col);
                                     g->selection = sel;
                                     return input;
                                 }
@@ -2759,6 +2769,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             ray_t* sel = ray_index_in_rowsel(in_col, in_set_lit);
                             if (sel) {
                                 ray_idx_hits[IDX_SITE_IN]++;
+                                ray_idx_note_use(in_col);
                                 g->selection = sel;
                                 return input;
                             }

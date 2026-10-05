@@ -3616,6 +3616,7 @@ static void ray_register_builtins(void) {
     register_vary("del",          RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_del_fn);
     register_vary(".sys.build", RAY_FN_NONE, ray_internals_fn);
     register_vary(".sys.mem",   RAY_FN_NONE, ray_memstat_fn);
+    register_unary(".idx.uses", RAY_FN_NONE, ray_idx_uses_fn);
     register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
     register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
     register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);

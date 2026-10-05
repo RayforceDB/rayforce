@@ -2850,6 +2850,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
             }
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
+                ray_idx_note_use(rt_eq[0]);
                 asof_idx_match_ctx_t mctx = {
                     .slices = gsl, .left_gid = left_gid,
                     .lt_time = lt_time, .rt_time = rt_time,
@@ -3003,6 +3004,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 }
                 if (sparse) {
                     ray_idx_hits[IDX_SITE_ASOF]++;
+                    ray_idx_note_use(rt_eq[0]);
                     scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
                     scratch_free(fnext_hdr); scratch_free(fgid_hdr);
                     scratch_free(fsl_hdr);
@@ -3018,6 +3020,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
 
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
+                ray_idx_note_use(rt_eq[0]);
                 /* Left cursor structures — identical to the full-pass
                  * cursor merge. */
                 memset(lcnt, 0, ((size_t)n_groups + 1) * 4);

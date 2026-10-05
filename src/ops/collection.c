@@ -1136,6 +1136,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
         ray_t* ids = ray_index_distinct_ids(x, &count);
         if (ids) {
             ray_idx_hits[IDX_SITE_DISTINCT]++;
+            ray_idx_note_use(x);
             ray_t* result = gather_by_idx(x, (int64_t*)ray_data(ids), count);
             ray_release(ids);
             return result;
@@ -1458,6 +1459,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 bool miss = false;
                 if (ray_index_find_vec(vec, val, pos, &miss)) {
                     ray_idx_hits[IDX_SITE_IN]++;
+                    ray_idx_note_use(vec);
                     ray_t* result = ray_vec_new(RAY_BOOL, vlen);
                     if (RAY_IS_ERR(result)) { ray_free_raw(pos); return result; }
                     result->len = vlen;
@@ -2703,6 +2705,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 ray_idx_consults[IDX_SITE_FIND]++;
                 if (ray_index_find_vec(vec, val, out, &any_null)) {
                     ray_idx_hits[IDX_SITE_FIND]++;
+                    ray_idx_note_use(vec);
                     done = true;
                 }
             }
@@ -2753,6 +2756,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             int64_t row = ray_index_find_atom(vec, val);
             if (row >= -1) {   /* -2 means not eligible — fall through */
                 ray_idx_hits[IDX_SITE_FIND]++;
+                ray_idx_note_use(vec);
                 if (row < 0)
                     return ray_typed_null(-RAY_I64);
                 return make_i64(row);

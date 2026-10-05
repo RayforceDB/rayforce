@@ -257,6 +257,12 @@ extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
 void ray_idx_stats_init(void);   /* atexit dump when RAY_IDX_STATS set */
 
+/* Per-index use attribution (diagnostic, for the index policy
+ * measurement).  Counts one use of col->index; read and reset through the
+ * `.idx.uses` builtin.  No-op for vectors without an index. */
+void   ray_idx_note_use(const ray_t* col);
+ray_t* ray_idx_uses_fn(ray_t* tbl);
+
 /* ===== Attach / Detach ===== */
 
 /* Build an accelerator and attach.  Numeric types are supported by every
