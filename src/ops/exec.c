@@ -4226,6 +4226,37 @@ static ray_t* validate_scan_columns(ray_graph_t* g) {
     return NULL;
 }
 
+/* The mapped, fixed-width columns the graph's scans read, for the pool's
+ * scan read-ahead (ray_pool_scan_set): columns of one length, at most
+ * RAY_POOL_SCAN_MAX.  NULL when there are none. */
+static const ray_pool_scan_t* exec_scan_columns(ray_graph_t* g, ray_pool_scan_t* s) {
+    s->n = 0; s->rows = -1;
+    for (uint32_t i = 0; i < g->node_count && s->n < RAY_POOL_SCAN_MAX; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if (op->opcode != OP_SCAN) continue;
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext) continue;
+        uint16_t tid = 0;
+        memcpy(&tid, ext->base.pad, sizeof(tid));
+        ray_t* tbl = (tid > 0 && g->tables && (uint32_t)(tid - 1) < g->n_tables)
+                   ? g->tables[tid - 1] : g->table;
+        if (!tbl || tbl->type != RAY_TABLE) continue;
+        ray_t* col = ray_table_get_col(tbl, ext->sym);
+        if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
+            col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR) continue;
+        if (s->rows >= 0 && col->len != s->rows) continue;
+        size_t esz = ray_sym_elem_size(col->type, col->attrs);
+        if (esz == 0) continue;
+        const uint8_t* base = (const uint8_t*)ray_data(col);
+        bool dup = false;
+        for (uint32_t k = 0; k < s->n; k++) if (s->base[k] == base) { dup = true; break; }
+        if (dup) continue;
+        s->base[s->n] = base; s->esz[s->n] = (uint32_t)esz; s->n++;
+        s->rows = col->len;
+    }
+    return s->n ? s : NULL;
+}
+
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* The qstats capture mode is armed once per query at the eval boundary
      * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
@@ -4240,12 +4271,15 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * would reset the elapsed clock and fire premature "final" ticks. */
     ray_t* scan_err = validate_scan_columns(g);
     if (scan_err) return scan_err;
+    ray_pool_scan_t scan;
+    const ray_pool_scan_t* prev_scan = ray_pool_scan_set(exec_scan_columns(g, &scan));
     /* Never NULL: callers test RAY_IS_ERR, which is false for NULL, and then
      * dereference.  The inner paths hand NULL back unchanged when a node,
      * a compaction or a merge fails to allocate (the flat path's
      * `return result`, the streaming path's seg_tbl / partial / merged
      * returns); `(times <lazy> ...)` would then crash in loop_count. */
     ray_t* result = ray_execute_inner(g, root);
+    ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }
 

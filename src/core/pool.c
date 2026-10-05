@@ -188,6 +188,58 @@ static bool pool_steal(ray_pool_t* pool, uint32_t w, uint32_t* c0, uint32_t* c1)
  * are attributed when they run: those inside the chunk last installed here
  * (or run privately) count as stolen, the rest came with the share — so
  * own + stolen over all slots is exactly the tickets executed. */
+/* --------------------------------------------------------------------------
+ * Scan read-ahead
+ *
+ * A mapped column is read on first touch, one page fault at a time per
+ * worker (plus the kernel's own read-ahead), so a scan over storage with a
+ * high per-request latency runs at a couple of requests in flight per
+ * worker whatever the storage could serve in parallel.  The executor
+ * registers the mapped columns a graph scans (ray_pool_scan_set); for a
+ * window over exactly their rows each worker keeps the rows of the next
+ * `scan_ahead` tickets requested (MADV_WILLNEED, window by window) while it
+ * runs the current one, topping the request up once half of it is used.
+ * Tickets map to rows as the dispatcher cut them: ticket base+i covers
+ * rows [i*grain, (i+1)*grain).  RAY_SCAN_PREFETCH sets the depth in tickets
+ * (default 64, 0 turns it off); it is read when the pool is created.
+ * -------------------------------------------------------------------------- */
+static RAY_TLS const ray_pool_scan_t* t_scan;
+
+const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan) {
+    const ray_pool_scan_t* prev = t_scan;
+    t_scan = scan;
+    return prev;
+}
+
+static void pool_scan_request(const ray_pool_t* pool, uint32_t a, uint32_t b) {
+    const ray_pool_scan_t* s = pool->scan;
+    int64_t r0 = (int64_t)(uint32_t)(a - (uint32_t)pool->scan_base) * pool->scan_grain;
+    int64_t r1 = (int64_t)(uint32_t)(b - (uint32_t)pool->scan_base) * pool->scan_grain;
+    if (r1 > s->rows) r1 = s->rows;
+    if (r1 <= r0) return;
+    for (uint32_t c = 0; c < s->n; c++)
+        ray_vm_advise_willneed((void*)(s->base[c] + (size_t)r0 * s->esz[c]),
+                               (size_t)(r1 - r0) * s->esz[c]);
+}
+
+/* Before worker w runs ticket tk: keep [tk+1, tk+1+ahead) requested.
+ * Tickets are absolute mod 2^32; everything is compared relative to the
+ * window base so a wrap does not matter. */
+static inline void pool_scan_ahead(ray_pool_t* pool, ray_pool_slot_t* s, uint32_t tk) {
+    if (!pool->scan) return;
+    uint32_t b = (uint32_t)pool->scan_base;
+    uint32_t n = (uint32_t)(pool->scan_end - pool->scan_base);
+    uint32_t rel = tk - b, lo = s->pf_lo - b, hi = s->pf_hi - b;
+    /* A stolen chunk, or a new window: what was requested does not cover tk. */
+    if (lo > n || hi > n || rel + 1 < lo || rel >= hi) { lo = hi = rel + 1; }
+    if (hi - rel > pool->scan_ahead / 2 + 1) { s->pf_lo = lo + b; s->pf_hi = hi + b; return; }
+    uint32_t want = rel + 1 + pool->scan_ahead;
+    if (want > n) want = n;
+    if (want > hi) pool_scan_request(pool, hi + b, want + b);
+    s->pf_lo = lo + b;
+    s->pf_hi = (want > hi ? want : hi) + b;
+}
+
 static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
     ray_pool_slot_t* s = &pool->slots[w];
     uint32_t ch0 = 0, ch1 = 0;    /* installed chunk [ch0, ch1), empty at entry */
@@ -195,6 +247,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         uint32_t tk;
         while (pool_range_take(s, &tk)) {
             if ((uint32_t)(tk - ch0) < (uint32_t)(ch1 - ch0)) s->stolen++; else s->own++;
+            pool_scan_ahead(pool, s, tk);
             pool_exec(pool, w, tk);
             if (prog) ray_progress_pump();
         }
@@ -222,6 +275,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         }
         s->stolen += c1 - c0;
         for (; c0 != c1; c0++) {
+            pool_scan_ahead(pool, s, c0);
             pool_exec(pool, w, c0);
             if (prog) ray_progress_pump();
         }
@@ -387,6 +441,9 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
     {
         const char* e = getenv("RAY_POOL_STEAL");
         pool->steal = (e && *e) ? (strtol(e, NULL, 10) != 0) : 1;
+        e = getenv("RAY_SCAN_PREFETCH");
+        long sa = (e && *e) ? strtol(e, NULL, 10) : 64;
+        pool->scan_ahead = sa > 0 ? (uint32_t)(sa > 4096 ? 4096 : sa) : 0;
         e = getenv("RAY_POOL_TRACE");
         pool->trace = (e && *e && strtol(e, NULL, 10) != 0);
     }
@@ -439,6 +496,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         for (size_t w = 0; w < W; w++) {
             atomic_init(&pool->slots[w].range, 0);
             pool->slots[w].own = pool->slots[w].stolen = pool->slots[w].steals = 0;
+            pool->slots[w].pf_lo = pool->slots[w].pf_hi = 0;
         }
     }
 
@@ -617,6 +675,11 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
      * steal mode the range words are the publication (release each) and
      * the cursors only record the high-water mark. */
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
+    /* Scan read-ahead for this window, published with the ranges. */
+    pool->scan = (pool->scan_ahead && t_scan && t_scan->n && t_scan->rows == total_elems) ? t_scan : NULL;
+    pool->scan_base = base;
+    pool->scan_end = base + n_tasks;
+    pool->scan_grain = grain;
     if (pool->steal) {
         atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
         atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
@@ -712,6 +775,7 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
+    pool->scan = NULL;   /* tasks are not row ranges */
     if (pool->steal) {
         atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
         atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
