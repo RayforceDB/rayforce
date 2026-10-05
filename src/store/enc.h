@@ -68,6 +68,7 @@ typedef struct {
     bool           bitmap;
 } ray_enc_input_t;
 
+/* n must be 0..RAY_ENC_VEC; otherwise returns false. */
 bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
                   int64_t start, int n, ray_enc_input_t* in);
 
@@ -80,6 +81,13 @@ typedef enum {
     RAY_ENC_RLE = 4, RAY_ENC_DICT = 5, RAY_ENC_ALP = 6, RAY_ENC_ALP_RD = 7,
     RAY_ENC_STR_DICT = 8, RAY_ENC_FSST = 9
 } ray_enc_code_t;
+
+/* Input contract for every encoder entry point (choose / write / widths):
+ * values are T-bit patterns held in uint64_t (T in {8,16,32,64}), n in
+ * 0..1024.  Bits above T are ignored by FOR_BP / DELTA_BP, which emit
+ * masked bases and starts, so a sign-extended input still yields the
+ * canonical body; RLE and DICT compare whole words and expect canonical
+ * (masked) input.  Packed widths satisfy w <= T. */
 
 /* Growable output buffer over the buddy heap. */
 typedef struct { uint8_t* p; size_t len, cap; bool oom; } ray_enc_buf_t;
@@ -115,7 +123,11 @@ bool    ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
 int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
                      const ray_enc_dict_t* dict, uint64_t* out);
-bool    ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
+/* Distinct sorted values of v in the logical order of k.  Returns 1 =
+ * trained (*out holds *out_n values; free with ray_free_raw), 0 = no
+ * dictionary (n <= 0 or more than 1<<16 distinct values), -1 = out of
+ * memory.  *out is untouched unless 1 is returned. */
+int     ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
                            uint64_t** out, uint32_t* out_n);
 
 #endif /* RAY_ENC_H */

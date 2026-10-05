@@ -145,7 +145,9 @@ static int64_t estimate_column(ray_t* col, const char* name, int64_t vec_base, i
             ray_enc_load(data, col->type, col->attrs, s, n, in);
             memcpy(first + s, in->bits, sizeof(uint64_t) * (size_t)n);
         }
-        if (ray_enc_train_dict(first, m, k, &dv, &dn)) { dict.v = dv; dict.n = dn; }
+        int tr = ray_enc_train_dict(first, m, k, &dv, &dn);
+        if (tr < 0) { fprintf(stderr, "out of memory training dictionary\n"); exit(1); }
+        if (tr == 1) { dict.v = dv; dict.n = dn; }
         free(first);
     }
 

@@ -30,7 +30,7 @@ static inline int64_t pad8(int64_t x) { return (x + 7) & ~(int64_t)7; }
 /* ---- buffer ---- */
 void ray_enc_buf_free(ray_enc_buf_t* b) {
     if (b->p) ray_free_raw(b->p);
-    b->p = NULL; b->len = b->cap = 0;
+    b->p = NULL; b->len = b->cap = 0; b->oom = false;
 }
 
 bool ray_enc_buf_put(ray_enc_buf_t* b, const void* src, size_t n) {
@@ -63,7 +63,7 @@ int64_t ray_enc_size_delta(int T, int w) {
 int ray_enc_for_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* base) {
     ray_enc_stats_t s;
     ray_enc_stats(v, n, k, &s);
-    *base = s.min;
+    *base = s.min & tmask(k.T);          /* canonical: a T-bit pattern */
     uint64_t range = (s.max - s.min) & tmask(k.T);
     return ray_enc_bitlen(range);
 }
@@ -74,9 +74,9 @@ int ray_enc_for_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* base
 static void delta_fill(const uint64_t* v, int n, int T, uint64_t* d) {
     const int L = RAY_ENC_VEC / T;
     const uint64_t m = tmask(T);
-    uint64_t last = n ? v[n - 1] : 0;
+    uint64_t last = n ? v[n - 1] & m : 0;
     for (int i = L; i < RAY_ENC_VEC; i++) {
-        uint64_t a = i < n ? v[i] : last, b = (i - L) < n ? v[i - L] : last;
+        uint64_t a = i < n ? v[i] & m : last, b = (i - L) < n ? v[i - L] & m : last;
         d[i] = (a - b) & m;
     }
 }
@@ -229,8 +229,9 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
     case RAY_ENC_CONST: return write_raw(v, 1, k.T, b);
     case RAY_ENC_FOR_BP: {
         uint64_t base; (void)ray_enc_for_width(v, n, k, &base);
+        base &= m;
         uint64_t u[RAY_ENC_VEC];
-        for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = i < n ? ((v[i] - base) & m) : 0;  /* pad: base */
+        for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = i < n ? (((v[i] & m) - base) & m) : 0;  /* pad: base */
         return put_u64(b, base) && write_packed(u, k.T, w, b);
     }
     case RAY_ENC_DELTA_BP: {
@@ -238,9 +239,10 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
         uint64_t dbase; (void)ray_enc_delta_width(v, n, k, &dbase);
         uint64_t d[RAY_ENC_VEC], r[RAY_ENC_VEC];
         delta_fill(v, n, k.T, d);
-        uint64_t last = n ? v[n - 1] : 0;
+        uint64_t last = n ? v[n - 1] & m : 0;
+        dbase &= m;
         if (!put_u64(b, dbase)) return false;
-        for (int l = 0; l < L; l++) if (!put_u64(b, (l < n ? v[l] : last) & m)) return false;
+        for (int l = 0; l < L; l++) if (!put_u64(b, (l < n ? v[l] & m : last))) return false;
         for (int i = 0; i < RAY_ENC_VEC; i++) r[i] = i < L ? 0 : ((d[i] - dbase) & m);
         return write_packed(r, k.T, w, b);
     }
@@ -396,16 +398,21 @@ static void sort_kind(uint64_t* a, uint64_t* tmp, int64_t n, ray_enc_kind_t k) {
     }
 }
 
-bool ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
-                        uint64_t** out, uint32_t* out_n) {
-    if (n <= 0) return false;
+/* Returns 1 trained (*out owned by the caller, ray_free_raw), 0 no
+ * dictionary (n <= 0 or more than 1<<16 distinct values), -1 out of memory. */
+int ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
+                       uint64_t** out, uint32_t* out_n) {
+    if (n <= 0) return 0;
     uint64_t* tmp = ray_alloc_raw(sizeof(uint64_t) * 2 * (size_t)n);
-    if (!tmp) return false;
+    if (!tmp) return -1;
     memcpy(tmp, v, sizeof(uint64_t) * (size_t)n);
     sort_kind(tmp, tmp + n, n, k);
     int64_t d = 0;
     for (int64_t i = 0; i < n; i++) if (i == 0 || tmp[i] != tmp[d - 1]) tmp[d++] = tmp[i];
-    if (d > (1 << 16)) { ray_free_raw(tmp); return false; }
-    *out = tmp; *out_n = (uint32_t)d;
-    return true;
+    if (d > (1 << 16)) { ray_free_raw(tmp); return 0; }
+    /* Shrink the 2n scratch to the distinct count; keep the block on a
+     * failed shrink (it is only larger than needed). */
+    uint64_t* fit = ray_realloc_raw(tmp, sizeof(uint64_t) * (size_t)d);
+    *out = fit ? fit : tmp; *out_n = (uint32_t)d;
+    return 1;
 }

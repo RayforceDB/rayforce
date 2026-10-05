@@ -66,6 +66,7 @@ bool ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k) {
 
 bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
                   int64_t start, int n, ray_enc_input_t* in) {
+    if (n < 0 || n > RAY_ENC_VEC) return false;
     if (!ray_enc_kind_of(type, attrs, &in->k)) return false;
     in->n = n;
     in->n_nulls = 0;
