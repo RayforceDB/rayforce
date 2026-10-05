@@ -46,9 +46,12 @@
 (.db.splayed.set (format "%/indexed_str" agRoot) agStrings)
 (.db.splayed.set (format "%/indexed_str" agRoot) agStrings)
 (.idx.has? (at (.db.splayed.get (format "%/indexed_str" agRoot)) 'k)) -- true
-;; Retention is bounded to current + previous generation.
+;; Only the selected generation is kept, and the first write's columns are
+;; gone: a table replaced three times holds one copy of itself (issue 713).
 (.db.splayed.set agLeaf (table ['x] (list [11 12])))
 (.db.splayed.set agLeaf (table ['x] (list [13 14])))
 (.db.splayed.set agLeaf (table ['x] (list [15 16])))
-(.sys.exec "test $(find /tmp/rf_test_atomic_generations/2026.09.28/t/.generations -mindepth 1 -maxdepth 1 -type d | wc -l) -le 2") -- 0
+(.sys.exec "test $(find /tmp/rf_test_atomic_generations/2026.09.28/t/.generations -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1") -- 0
+(.sys.exec "test \"$(ls -A /tmp/rf_test_atomic_generations/2026.09.28/t | tr '\\n' ' ')\" = '.current .generations .write.lock '") -- 0
+(sum (at (.db.splayed.get agLeaf) 'x)) -- 31
 (.sys.exec "rm -rf /tmp/rf_test_atomic_generations") -- 0

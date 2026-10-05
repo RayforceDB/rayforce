@@ -281,6 +281,15 @@ static bool splay_generation_is_current(const ray_splay_write_t* write) {
            active && strcmp(current, write->dir) == 0;
 }
 
+/* The first write of a table is made in its directory; its columns are the
+ * table until the first publish.  From then on readers resolve .current, so
+ * the root schema is renamed out of the way (older binaries then fail loudly
+ * instead of reading obsolete files) and the columns it names are removed,
+ * with their .link sidecars.  Only what the schema names goes: the root also
+ * holds the symfile, the lock file, the generations and, for a table written
+ * into a database root, the partitions.  .legacy.d goes last, once every
+ * file it names is gone, so a cleanup cut short is finished by the next
+ * publish. */
 static void splay_retire_legacy_schema(const char* root) {
     char schema[1024], retired[1024];
     int n = snprintf(schema, sizeof(schema), "%s/.d", root);
@@ -288,14 +297,54 @@ static void splay_retire_legacy_schema(const char* root) {
     if (n < 0 || (size_t)n >= sizeof(schema) ||
         m < 0 || (size_t)m >= sizeof(retired))
         return;
-    if (access(schema, F_OK) != 0) return;
-    (void)unlink(retired);
-    if (rename(schema, retired) != 0)
-        (void)unlink(schema);
+    if (access(schema, F_OK) == 0) {
+        (void)unlink(retired);
+        if (rename(schema, retired) != 0) {
+            (void)unlink(schema);
+            return;
+        }
+    }
+    if (access(retired, F_OK) != 0) return;
+
+    ray_t* names = ray_col_load(retired);
+    if (!names || RAY_IS_ERR(names)) {
+        if (names) ray_error_free(names);
+        return;
+    }
+    bool all_gone = names->type == RAY_STR;
+    for (int64_t c = 0; all_gone && c < names->len; c++) {
+        size_t len = 0;
+        const char* name = ray_str_vec_get(names, c, &len);
+        if (!name || !splay_col_name_safe(name, len)) {
+            all_gone = false;
+            break;
+        }
+        static const char* const suffix[] = {"", ".link"};
+        for (size_t k = 0; k < sizeof(suffix) / sizeof(suffix[0]); k++) {
+            char path[1100];
+            int pn = snprintf(path, sizeof(path), "%s/%.*s%s", root,
+                              (int)len, name, suffix[k]);
+            if (pn < 0 || (size_t)pn >= sizeof(path)) { all_gone = false; break; }
+            struct stat st;
+#ifdef RAY_OS_WINDOWS
+            if (stat(path, &st) != 0) continue;
+#else
+            if (lstat(path, &st) != 0) continue;
+#endif
+            if (S_ISDIR(st.st_mode)) continue;  /* not a column file */
+            if (unlink(path) != 0) all_gone = false;
+        }
+    }
+    ray_release(names);
+    if (all_gone) (void)unlink(retired);
 }
 
-static void splay_prune_generations(const char* root, const char* current,
-                                    const char* previous) {
+/* Every generation but the selected one goes.  A reader that resolved an
+ * older one and has not opened all its files yet finds one missing, resolves
+ * again and reads the selected generation (see splay_load_impl); files it
+ * already mapped stay readable until unmapped.  Removal is best-effort: where
+ * an open file cannot be deleted (Windows), the next publish tries again. */
+static void splay_prune_generations(const char* root, const char* current) {
     char generations[1024];
     int n = snprintf(generations, sizeof(generations), "%s/.generations", root);
     if (n < 0 || (size_t)n >= sizeof(generations)) return;
@@ -312,9 +361,7 @@ static void splay_prune_generations(const char* root, const char* current,
         if (rn < 0 || (size_t)rn >= sizeof(rel) ||
             fn < 0 || (size_t)fn >= sizeof(full))
             continue;
-        if ((current && strcmp(rel, current) == 0) ||
-            (previous && strcmp(full, previous) == 0))
-            continue;
+        if (current && strcmp(rel, current) == 0) continue;
         splay_remove_tree_best_effort(full);
     }
     closedir(d);
@@ -686,12 +733,7 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
-    char previous[1024];
-    bool had_previous = false;
     if (result == RAY_OK && write->staged) {
-        if (splay_current_dir(write->root, previous, sizeof(previous),
-                              &had_previous) != RAY_OK)
-            had_previous = false;
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];
         snprintf(schema, sizeof(schema), "%s/.d", write->dir);
@@ -702,8 +744,7 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
             result = splay_publish_generation(write->root, write->generation, durable);
         if (result == RAY_OK) {
             splay_retire_legacy_schema(write->root);
-            splay_prune_generations(write->root, write->generation,
-                                    had_previous ? previous : NULL);
+            splay_prune_generations(write->root, write->generation);
         }
     }
     if (result != RAY_OK && write->staged && write->dir[0] &&
@@ -1013,14 +1054,25 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
     return tbl;
 }
 
+/* Only the selected generation is kept, so one a reader resolved can be
+ * removed before the reader has opened all its files.  A read that fails is
+ * tried again while the table keeps resolving to a different generation;
+ * a failure on the generation still selected is the table's own. */
+#define SPLAY_RESOLVE_ATTEMPTS 8
+
+static bool splay_moved_on(const char* dir, const char* resolved) {
+    char again[1024];
+    return ray_splay_resolve_dir(dir, again, sizeof(again)) == RAY_OK &&
+           strcmp(again, resolved) != 0;
+}
+
 /* Resolve sym_path to a FILE domain.  Missing file → NULL domain with
  * RAY_OK (only an error if a SYM column is later encountered — the
  * symbol-free-table exemption must hold for reads too); existing but
  * unopenable/invalid file → loud error. */
-static ray_t* splay_load_impl(const char* dir, const char* sym_path,
-                              bool use_mmap) {
-    char resolved[1024];
-    ray_err_t err = ray_splay_resolve_dir(dir, resolved, sizeof(resolved));
+static ray_t* splay_load_once(const char* dir, const char* sym_path,
+                              bool use_mmap, char* resolved, size_t resolved_sz) {
+    ray_err_t err = ray_splay_resolve_dir(dir, resolved, resolved_sz);
     if (err != RAY_OK)
         return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
     /* Resolve first: a newly published generation can reference symbols
@@ -1040,6 +1092,34 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path,
     ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap);
     if (dom) ray_sym_domain_release(dom); /* columns hold their own refs */
     return tbl;
+}
+
+static ray_t* splay_load_impl(const char* dir, const char* sym_path,
+                              bool use_mmap) {
+    char resolved[1024];
+    for (int attempt = 1;; attempt++) {
+        resolved[0] = '\0';
+        ray_t* tbl = splay_load_once(dir, sym_path, use_mmap, resolved, sizeof(resolved));
+        if (tbl && !RAY_IS_ERR(tbl)) return tbl;
+        if (attempt == SPLAY_RESOLVE_ATTEMPTS || !resolved[0] ||
+            !splay_moved_on(dir, resolved))
+            return tbl;
+        ray_error_free(tbl);
+    }
+}
+
+bool ray_splay_has_schema(const char* dir) {
+    char resolved[1024], schema[1100];
+    for (int attempt = 1;; attempt++) {
+        if (ray_splay_resolve_dir(dir, resolved, sizeof(resolved)) != RAY_OK)
+            return false;
+        int n = snprintf(schema, sizeof(schema), "%s/.d", resolved);
+        if (n < 0 || (size_t)n >= sizeof(schema)) return false;
+        struct stat st;
+        if (stat(schema, &st) == 0) return S_ISREG(st.st_mode);
+        if (attempt == SPLAY_RESOLVE_ATTEMPTS || !splay_moved_on(dir, resolved))
+            return false;
+    }
 }
 
 ray_t* ray_splay_load(const char* dir, const char* sym_path) {
@@ -1257,9 +1337,9 @@ ray_t* ray_read_splayed(const char* dir, const char* sym_path) {
     return splay_load_impl(dir, sym_path, true);
 }
 
-ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
-    char resolved[1024];
-    ray_err_t err = ray_splay_resolve_dir(dir, resolved, sizeof(resolved));
+static ray_t* splay_read_dom_once(const char* dir, ray_sym_domain_t* dom,
+                                  char* resolved, size_t resolved_sz) {
+    ray_err_t err = ray_splay_resolve_dir(dir, resolved, resolved_sz);
     if (err != RAY_OK)
         return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
     ray_sym_domain_t* fresh = NULL;
@@ -1272,6 +1352,19 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
     ray_t* tbl = splay_load_dom_impl(resolved, dom, true);
     if (fresh) ray_sym_domain_release(fresh);
     return tbl;
+}
+
+ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
+    char resolved[1024];
+    for (int attempt = 1;; attempt++) {
+        resolved[0] = '\0';
+        ray_t* tbl = splay_read_dom_once(dir, dom, resolved, sizeof(resolved));
+        if (tbl && !RAY_IS_ERR(tbl)) return tbl;
+        if (attempt == SPLAY_RESOLVE_ATTEMPTS || !resolved[0] ||
+            !splay_moved_on(dir, resolved))
+            return tbl;
+        ray_error_free(tbl);
+    }
 }
 
 ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {

@@ -87,12 +87,15 @@ same table serialize on `.write.lock`; readers resolve the manifest once and
 continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
 
-Publication keeps the selected generation and one previous generation, then
-removes older staged directories best-effort. A failed unpublished generation is
-removed immediately where the platform allows it; on Windows an open mapped file
-can defer that cleanup until a later publish. At the first manifest publish,
-the legacy root `.d` is retired so older binaries fail loudly instead of reading
-obsolete root files.
+Publication keeps only the selected generation and removes the others
+best-effort, so a replaced table holds one copy of itself on disk. A reader that
+resolved a generation removed before it opened every file resolves the manifest
+again and reads the selected one; a table already loaded stays readable. A
+failed unpublished generation is removed immediately where the platform allows
+it; on Windows an open mapped file can defer that cleanup until a later publish.
+At the first manifest publish, the legacy root `.d` is retired so older binaries
+fail loudly, and the column files it named are removed from the table
+directory; nothing else there is touched.
 
 The `.write.lock` writer lock is local-filesystem coordination. Do not rely on
 it for NFS-backed shared writers.
