@@ -27,6 +27,7 @@
 #include "store/col.h"
 #include "store/encfmt.h"
 #include "store/encw.h"
+#include "store/enccol.h"
 #include "vec/str.h"
 #include "ops/idxop.h"
 #include <stdio.h>
@@ -974,6 +975,57 @@ static test_result_t test_golden_match(void) {
     PASS();
 }
 
+/* Every checked-in fixture decodes, through the generation-2 reader, to the
+ * vector its generator regenerates.  sym_w32_rle is excluded: its saved
+ * count (0xFFFFFFFF) lies above any symbol domain a test can build. */
+static test_result_t test_golden_decode_matches(void) {
+    for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
+    const char* why = golden_emit_all(ENCFMT_TMP "/gdm");        /* also regenerates the SYM id table */
+    TEST_ASSERT_FMT(why == NULL, "%s", why);
+    for (int i = 0;; i++) {
+        const char* name; int force, want;
+        ray_t* v = golden_vec(i, &name, &force, &want);
+        if (!v) break;
+        char path[512]; snprintf(path, sizeof path, "%s/%s.bin", ENC_GOLDEN_DIR, name);
+        ray_t* c = ray_col_mmap(path);
+        TEST_ASSERT_FMT(c && !RAY_IS_ERR(c), "fixture %s does not load", name);
+        ray_enccol_t* e = ray_enccol_of(c);
+        TEST_ASSERT_FMT(e->len == v->len && e->type == v->type, "%s: shape", name);
+        uint8_t esz = ray_enccol_esz(e);
+        uint8_t out[RAY_ENC_VEC * 16]; char pool[RAY_ENC_VEC * 64];
+        const char* spool = (v->type == RAY_STR && v->str_pool) ? (const char*)ray_data(v->str_pool) : NULL;
+        for (int64_t vec = 0; vec < ray_enc_nvecs(v->len); vec++) {
+            ray_t* err = ray_enccol_decode_vec(e, vec, out, pool, 0, sizeof pool);
+            TEST_ASSERT_FMT(err == NULL, "%s vec %lld: %s", name, (long long)vec, err ? ray_err_code(err) : "");
+            int vn = ray_enc_vec_len(v->len, vec);
+            if (v->type == RAY_STR) {
+                const ray_str_t* a = (const ray_str_t*)ray_data(v) + vec * RAY_ENC_VEC;
+                const ray_str_t* b = (const ray_str_t*)out;
+                for (int r = 0; r < vn; r++) {
+                    TEST_ASSERT_FMT(a[r].len == b[r].len, "%s str len row %d", name, r);
+                    TEST_ASSERT_FMT(memcmp(ray_str_t_ptr(&a[r], spool), ray_str_t_ptr(&b[r], pool), a[r].len) == 0, "%s str row %d", name, r);
+                }
+            } else {
+                const uint8_t* a = (const uint8_t*)ray_data(v) + (size_t)vec * RAY_ENC_VEC * esz;
+                TEST_ASSERT_FMT(memcmp(a, out, (size_t)vn * esz) == 0, "%s vec %lld differs from its input", name, (long long)vec);
+            }
+        }
+        ray_release(c);
+        ray_release(v);
+    }
+    /* SYM fixture: ids from the generator's table. */
+    const char* sname; (void)golden_sym(0, ENCFMT_TMP "/gdm", &sname);
+    char path[512]; snprintf(path, sizeof path, "%s/%s.bin", ENC_GOLDEN_DIR, sname);
+    ray_t* c = ray_col_mmap(path);
+    TEST_ASSERT_FMT(c && !RAY_IS_ERR(c), "fixture %s does not load", sname);
+    uint8_t out[RAY_ENC_VEC * 16];
+    ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, out, NULL, 0, 0);
+    TEST_ASSERT_NULL(err);
+    for (int k = 0; k < 1024; k++) TEST_ASSERT_EQ_I(out[k], 100 + (k % 16));
+    ray_release(c);
+    PASS();
+}
+
 /* Pooled strings (longer than 12 bytes) reach the encoder through the
  * column's real pool.  Row i has 1 + i % 29 bytes, so inline (<= 12) and
  * pooled strings alternate; pooled rows are unique (a decimal row tag).
@@ -1190,6 +1242,7 @@ const test_entry_t encfmt_entries[] = {
     { "encfmt/vec_f32_trailer",             test_vec_f32_trailer,             encfmt_setup, encfmt_teardown },
     { "encfmt/vec_all_null_kinds",          test_vec_all_null_kinds,          encfmt_setup, encfmt_teardown },
     { "encfmt/vec_sym_w16_w32",             test_vec_sym_w16_w32,             encfmt_setup, encfmt_teardown },
+    { "encfmt/golden_decode_matches",       test_golden_decode_matches,       encfmt_setup, encfmt_teardown },
     { "encfmt/file_headers",              test_file_headers,              encfmt_setup, encfmt_teardown },
     { "encfmt/trailing_descriptors_zero", test_trailing_descriptors_zero, encfmt_setup, encfmt_teardown },
     { "encfmt/dir_sums_extremes",         test_dir_sums_extremes,         encfmt_setup, encfmt_teardown },

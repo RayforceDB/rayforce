@@ -29,6 +29,8 @@
 #include "mem/sys.h"             /* ray_sys_alloc: the map descriptor, as col.c */
 #include "table/sym.h"
 #include "table/domain.h"
+#include "store/enc.h"
+#include "vec/str.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -294,4 +296,431 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     ray_t* v = ray_enccol_wrap(e);
     if (!v || RAY_IS_ERR(v)) enccol_free(e);
     return v;
+}
+
+static _Atomic(uint64_t) g_enc_materialized;
+static _Atomic(uint64_t) g_enc_decoded_bytes;
+void ray_enc_counters_get(ray_enc_counters_t* o) {
+    o->materialized  = atomic_load(&g_enc_materialized);
+    o->decoded_bytes = atomic_load(&g_enc_decoded_bytes);
+}
+void ray_enc_counters_reset(void) {
+    atomic_store(&g_enc_materialized, 0);
+    atomic_store(&g_enc_decoded_bytes, 0);
+}
+
+uint8_t ray_enccol_esz(const ray_enccol_t* e) { return ray_sym_elem_size(e->type, e->attrs); }
+
+static int64_t chunk_rows(const ray_enccol_t* e, int64_t c) {
+    int64_t r = e->len - c * RAY_ENC_CHUNK;
+    return r > RAY_ENC_CHUNK ? RAY_ENC_CHUNK : r;
+}
+
+static void dirent_at(const ray_enccol_t* e, int64_t c, ray_enc_dirent_t* de) {
+    memcpy(de, e->base + RAY_ENC_DIR_OFF + c * sizeof *de, sizeof *de);
+}
+
+static int lane_width(const ray_enccol_t* e) { return 8 * (int)ray_enccol_esz(e); }
+
+/* 1 legal and implemented, 2 legal by the spec but not in this build
+ * (ALP, ALP_RD, float RLE/DICT: P5; STR_DICT, FSST: P6), 0 illegal. */
+static int top_encoding_class(int8_t t, uint8_t enc) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8:
+        return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE) ? 1 : 0;
+    case RAY_I16: case RAY_I32: case RAY_I64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        return enc <= RAY_ENC_DICT ? 1 : 0;
+    case RAY_SYM:
+        return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE) ? 1 : 0;
+    case RAY_F32: case RAY_F64:
+        if (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) return 1;
+        return (enc == RAY_ENC_RLE || enc == RAY_ENC_DICT || enc == RAY_ENC_ALP || enc == RAY_ENC_ALP_RD) ? 2 : 0;
+    case RAY_STR:
+        if (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) return 1;
+        return (enc == RAY_ENC_STR_DICT || enc == RAY_ENC_FSST) ? 2 : 0;
+    case RAY_GUID:
+        return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) ? 1 : 0;
+    default: return 0;
+    }
+}
+
+ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]) {
+    static const uint8_t zero[48];
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    const uint8_t* p = e->base + de.offset;
+    memcpy(out, p, RAY_ENC_DESC_AREA);
+    int64_t rows = chunk_rows(e, c);
+    int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+    uint64_t at = RAY_ENC_DESC_AREA;
+    int T = lane_width(e);
+    for (int j = 0; j < RAY_ENC_VECS_PER_CHUNK; j++) {
+        const ray_enc_desc_t* d = &out[j];
+        if (j >= nv) {
+            if (memcmp(p + (size_t)j * 48, zero, 48) != 0)
+                ENC_CORRUPT("col %s: chunk %lld trailing descriptor %d not zero", e->path, (long long)c, j);
+            continue;
+        }
+        int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+        int cls = top_encoding_class(e->type, d->encoding);
+        if (cls == 0) ENC_CORRUPT("col %s: chunk %lld vector %d illegal encoding %u", e->path, (long long)c, j, d->encoding);
+        if (cls == 2) return ray_error("nyi", "col %s: encoding %u needs a newer build", e->path, d->encoding);
+        if (d->rsv0 || d->rsv1 || d->rsv2) ENC_CORRUPT("col %s: chunk %lld vector %d reserved fields", e->path, (long long)c, j);
+        uint16_t okflags = RAY_ENC_STAT_ABSENT | (enc_type_float(e->type) ? RAY_ENC_DESC_TRAILER : 0);
+        if (d->flags & ~okflags) ENC_CORRUPT("col %s: chunk %lld vector %d flags 0x%x", e->path, (long long)c, j, d->flags);
+        bool packed = d->encoding == RAY_ENC_FOR_BP || d->encoding == RAY_ENC_DELTA_BP;
+        if (packed ? d->width > T : d->width != 0) ENC_CORRUPT("col %s: chunk %lld vector %d width %u", e->path, (long long)c, j, d->width);
+        if (d->n_nulls > vlen || (!enc_type_nullable(e->type) && d->n_nulls))
+            ENC_CORRUPT("col %s: chunk %lld vector %d null count %u", e->path, (long long)c, j, d->n_nulls);
+        if (d->payload_off != at || (d->payload_bytes & 7) || d->payload_bytes > de.bytes - at)
+            ENC_CORRUPT("col %s: chunk %lld vector %d payload placement", e->path, (long long)c, j);
+        at += d->payload_bytes;
+        bool absent = d->flags & RAY_ENC_STAT_ABSENT;
+        bool all_null = enc_type_nullable(e->type) && d->n_nulls == vlen;
+        if (all_null && (d->encoding != RAY_ENC_CONST || !absent))
+            ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector not CONST without statistics", e->path, (long long)c, j);
+        if (absent && (d->min || d->max)) ENC_CORRUPT("col %s: chunk %lld vector %d absent statistics not zero", e->path, (long long)c, j);
+        if (!absent && e->type == RAY_GUID) ENC_CORRUPT("col %s: chunk %lld vector %d statistics on GUID", e->path, (long long)c, j);
+        if (!absent && e->type == RAY_STR) return ray_error("nyi", "col %s: STR code bounds need a newer build", e->path);
+        if (!absent) {
+            if (enc_type_float(e->type)) {
+                double mn, mx; memcpy(&mn, &d->min, 8); memcpy(&mx, &d->max, 8);
+                if (isnan(mn) || isnan(mx) || mn > mx) ENC_CORRUPT("col %s: chunk %lld vector %d float bounds", e->path, (long long)c, j);
+            } else if (d->min > d->max) {
+                ENC_CORRUPT("col %s: chunk %lld vector %d min above max", e->path, (long long)c, j);
+            } else if (e->type == RAY_SYM && (d->min < 1 || (uint64_t)d->max >= e->sym_bound ||
+                                              (T < 64 && ((uint64_t)d->max >> T)))) {
+                ENC_CORRUPT("col %s: chunk %lld vector %d SYM ids outside the domain or the id width", e->path, (long long)c, j);
+            }
+        }
+    }
+    if (at != de.bytes) ENC_CORRUPT("col %s: chunk %lld has %llu bytes after its payloads", e->path,
+                                    (long long)c, (unsigned long long)(de.bytes - at));
+    return NULL;
+}
+
+static _Atomic(int64_t) g_fail_alloc_at;
+static char g_fail_path[256];
+static _Atomic(bool) g_fail_path_on;
+void ray_enccol_test_fail_alloc(int64_t nth) { atomic_store(&g_fail_alloc_at, nth); }
+void ray_enccol_test_fail_path(const char* sub) {
+    atomic_store(&g_fail_path_on, false);
+    if (sub) { snprintf(g_fail_path, sizeof g_fail_path, "%s", sub); atomic_store(&g_fail_path_on, true); }
+}
+static bool enc_alloc_fails(const ray_enccol_t* e) {
+    if (atomic_load(&g_fail_path_on) && strstr(e->path, g_fail_path)) return true;
+    int64_t v = atomic_load(&g_fail_alloc_at);
+    while (v > 0)
+        if (atomic_compare_exchange_weak(&g_fail_alloc_at, &v, v - 1)) return v == 1;
+    return false;
+}
+
+/* ---- VALUE_DICT side entry: validated once (spec "Side data") ---- */
+static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    ray_enc_kind_t k;
+    uint32_t rsv;
+    /* Structure was checked at load (Task 6); the entry's contents are
+     * checked here, once, before the first lookup. */
+    if (!ray_enc_kind_of(e->type, e->attrs, &k) || !e->vdict_len) {
+        ray_enc_snap_set(fail, "corrupt", "col %s: DICT vector without a VALUE_DICT entry", e->path);
+        return NULL;
+    }
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "col %s: VALUE_DICT", e->path); return NULL; }
+    uint64_t dict_len = e->vdict_len;
+    {
+        const uint8_t* d = e->base + e->vdict_off;
+        uint32_t n; memcpy(&n, d, 4); memcpy(&rsv, d + 4, 4);
+        size_t esz = (size_t)k.T / 8;
+        if (rsv || n == 0 || n > (1u << 16) || dict_len != 8 + ray_enc_pad8((uint64_t)n * esz)) goto bad;
+        if (!all_zero(d + 8 + (size_t)n * esz, (size_t)(ray_enc_pad8((uint64_t)n * esz) - (uint64_t)n * esz))) goto bad;
+        ray_t* vals = ray_vec_new(RAY_I64, n);
+        if (!vals || RAY_IS_ERR(vals)) { ray_enc_snap_set(fail, "oom", "col %s: VALUE_DICT", e->path); return NULL; }
+        vals->len = n;
+        uint64_t* out = (uint64_t*)ray_data(vals);
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t x = 0; memcpy(&x, d + 8 + i * esz, esz);
+            out[i] = x;
+            if (i && !ray_enc_lt(out[i - 1], x, k)) { ray_release(vals); goto bad; }  /* strictly ascending */
+        }
+        return vals;
+    }
+bad:
+    ray_enc_snap_set(fail, "corrupt", "col %s: malformed side data", e->path);
+    return NULL;
+}
+
+static ray_t* enc_dict(ray_enccol_t* e, ray_enc_dict_t* out) {
+    ray_t* d = ray_enc_once_get(&e->dict_once, &e->dict, enc_dict_validate, e);
+    if (RAY_IS_ERR(d)) return d;
+    out->v = (const uint64_t*)ray_data(d);
+    out->n = (uint32_t)d->len;
+    return NULL;
+}
+
+static uint32_t popcount_prefix(const uint8_t* bm, int n, bool* tail_clear) {
+    uint32_t c = 0;
+    for (int i = 0; i < n; i++) c += (bm[i >> 3] >> (i & 7)) & 1;
+    *tail_clear = true;
+    for (int i = n; i < RAY_ENC_VEC; i++) if ((bm[i >> 3] >> (i & 7)) & 1) { *tail_clear = false; break; }
+    return c;
+}
+
+#define VEC_CORRUPT(what) ENC_CORRUPT("col %s: chunk %lld vector %d %s", e->path, (long long)c, j, what)
+
+static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                       const uint8_t* p, uint64_t avail, const uint8_t* bm, void* out) {
+    ray_enc_kind_t k;
+    if (!ray_enc_kind_of(e->type, e->attrs, &k)) VEC_CORRUPT("kind");
+    ray_enc_dict_t dict = {0};
+    if (d->encoding == RAY_ENC_DICT) { ray_t* err = enc_dict(e, &dict); if (err) return err; }
+    uint64_t bits[RAY_ENC_VEC];
+    int64_t used = ray_enc_read(p, (size_t)avail, d->encoding, d->width, vlen, k,
+                                RAY_ENC_SLOT_TOP, 0, d->encoding == RAY_ENC_DICT ? &dict : NULL, bits);
+    if (used < 0 || (uint64_t)used != avail) VEC_CORRUPT("codec body");
+    uint8_t esz = ray_enccol_esz(e);
+    const bool sym = e->type == RAY_SYM;
+    int zeros = 0;
+    for (int i = 0; i < vlen; i++) {
+        bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
+        uint64_t x = bits[i];
+        if (sym) {
+            /* ids fit the attrs width and lie in the domain; never truncated.
+             * Id 0 is the null and is always legal. */
+            if ((esz < 8 && (x >> (8 * esz))) || (x && x >= e->sym_bound)) VEC_CORRUPT("SYM id");
+            zeros += x == 0;
+        }
+        switch (esz) {
+        case 1: ((uint8_t*)out)[i] = (uint8_t)x; break;
+        case 2: if (sym) { ((uint16_t*)out)[i] = (uint16_t)x; break; }
+                if (!null && (int16_t)x == NULL_I16) VEC_CORRUPT("sentinel outside the bitmap");
+                ((int16_t*)out)[i] = null ? NULL_I16 : (int16_t)x; break;
+        case 4: if (sym) { ((uint32_t*)out)[i] = (uint32_t)x; break; }
+                if (!null && (int32_t)x == NULL_I32) VEC_CORRUPT("sentinel outside the bitmap");
+                ((int32_t*)out)[i] = null ? NULL_I32 : (int32_t)x; break;
+        default: if (sym) { ((uint64_t*)out)[i] = x; break; }
+                if (!null && (int64_t)x == NULL_I64) VEC_CORRUPT("sentinel outside the bitmap");
+                ((int64_t*)out)[i] = null ? NULL_I64 : (int64_t)x; break;
+        }
+    }
+    if (e->type == RAY_SYM && zeros != d->n_nulls) VEC_CORRUPT("null count");
+    return NULL;
+}
+
+static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                         const uint8_t* p, uint64_t avail, const uint8_t* bm, void* out) {
+    const bool f32 = e->type == RAY_F32;
+    const size_t esz = f32 ? 4 : 8;
+    uint64_t body = d->encoding == RAY_ENC_CONST ? 8 : ray_enc_pad8((uint64_t)vlen * esz);
+    if (body > avail) VEC_CORRUPT("body");
+    if (d->encoding == RAY_ENC_CONST) {
+        if (!all_zero(p + esz, 8 - esz)) VEC_CORRUPT("padding");
+        for (int i = 0; i < vlen; i++) memcpy((uint8_t*)out + i * esz, p, esz);
+    } else {
+        if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) VEC_CORRUPT("padding");
+        memcpy(out, p, (size_t)vlen * esz);
+    }
+    for (int i = 0; i < vlen; i++) {
+        bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
+        uint8_t* q = (uint8_t*)out + i * esz;
+        if (null) {
+            if (f32) { float n = NULL_F32; memcpy(q, &n, 4); } else { double n = NULL_F64; memcpy(q, &n, 8); }
+        } else {
+            double x; if (f32) { float f; memcpy(&f, q, 4); x = f; } else memcpy(&x, q, 8);
+            if (x != x) VEC_CORRUPT("NaN outside the bitmap");
+        }
+    }
+    uint64_t rest = avail - body;
+    const uint8_t* t = p + body;
+    if (d->flags & RAY_ENC_DESC_TRAILER) {
+        if (rest < 8) VEC_CORRUPT("trailer");
+        uint16_t cnt; memcpy(&cnt, t, 2);
+        if (!all_zero(t + 2, 6) || cnt == 0 || cnt > d->n_nulls) VEC_CORRUPT("trailer header");
+        uint64_t need = 8 + ray_enc_pad8(2ull * cnt) + ray_enc_pad8((uint64_t)cnt * esz);
+        if (need != rest) VEC_CORRUPT("trailer size");
+        if (!all_zero(t + 8 + 2 * cnt, (size_t)(ray_enc_pad8(2ull * cnt) - 2ull * cnt))) VEC_CORRUPT("trailer padding");
+        const uint8_t* raw = t + 8 + ray_enc_pad8(2ull * cnt);
+        if (!all_zero(raw + cnt * esz, (size_t)(ray_enc_pad8((uint64_t)cnt * esz) - (uint64_t)cnt * esz))) VEC_CORRUPT("trailer padding");
+        int prev = -1;
+        for (int i = 0; i < cnt; i++) {
+            uint16_t pos; memcpy(&pos, t + 8 + 2 * i, 2);
+            if ((int)pos <= prev || pos >= vlen || !bm || !((bm[pos >> 3] >> (pos & 7)) & 1)) VEC_CORRUPT("trailer position");
+            prev = pos;
+            double x; if (f32) { float f; memcpy(&f, raw + i * esz, 4); x = f; } else memcpy(&x, raw + i * esz, 8);
+            if (x == x) VEC_CORRUPT("trailer value is not a NaN");
+            memcpy((uint8_t*)out + pos * esz, raw + i * esz, esz);
+        }
+    } else if (rest != 0) {
+        VEC_CORRUPT("bytes after the body");
+    }
+    return NULL;
+}
+
+static ray_t* dec_guid(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                       const uint8_t* p, uint64_t avail, void* out) {
+    static const uint8_t zero[16];
+    if (d->encoding == RAY_ENC_CONST) {
+        if (avail != 16) VEC_CORRUPT("body");
+        for (int i = 0; i < vlen; i++) memcpy((uint8_t*)out + i * 16, p, 16);
+    } else {
+        if (avail != (uint64_t)vlen * 16) VEC_CORRUPT("body");
+        memcpy(out, p, (size_t)avail);
+    }
+    int nulls = 0;
+    for (int i = 0; i < vlen; i++) nulls += memcmp((uint8_t*)out + i * 16, zero, 16) == 0;
+    if (nulls != d->n_nulls) VEC_CORRUPT("null count");
+    return NULL;
+}
+
+/* STR RAW / CONST grammar (spec "STR RAW").  With out == NULL it only
+ * validates and sizes the decoded pool bytes (pooled strings once per row);
+ * with out set the caller has already validated, and pool_out has room for
+ * pool_base + pooled bytes. */
+static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                      const uint8_t* p, uint64_t avail, void* out, char* pool_out,
+                      uint64_t pool_base, uint64_t pool_cap, uint64_t* pooled_out) {
+    ray_str_t* o = (ray_str_t*)out;
+    int nulls = 0;
+    uint64_t pooled = 0;
+    if (d->encoding == RAY_ENC_CONST) {
+        if (avail < 8) VEC_CORRUPT("body");
+        uint32_t len, rsv; memcpy(&len, p, 4); memcpy(&rsv, p + 4, 4);
+        if (rsv || avail != 8 + ray_enc_pad8(len) || !all_zero(p + 8 + len, (size_t)(ray_enc_pad8(len) - len)))
+            VEC_CORRUPT("CONST string");
+        if (len > RAY_STR_INLINE_MAX) pooled = (uint64_t)len * (uint64_t)vlen;
+        nulls = len == 0 ? vlen : 0;
+        if (out) {
+            for (int i = 0; i < vlen; i++) {
+                memset(&o[i], 0, sizeof o[i]);
+                o[i].len = len;
+                if (len <= RAY_STR_INLINE_MAX) { memcpy(o[i].data, p + 8, len); continue; }
+                uint64_t off = pool_base + (uint64_t)i * len;
+                memcpy(pool_out + off, p + 8, len);
+                memcpy(o[i].prefix, p + 8, 4);
+                o[i].pool_off = (uint32_t)off;
+            }
+        }
+    } else {
+        uint64_t dbytes = (uint64_t)vlen * 16;
+        if (avail < dbytes + 8) VEC_CORRUPT("body");
+        uint64_t pb; memcpy(&pb, p + dbytes, 8);
+        if (pb > UINT32_MAX || avail != dbytes + 8 + ray_enc_pad8(pb)) VEC_CORRUPT("pool size");
+        const uint8_t* vp = p + dbytes + 8;
+        if (!all_zero(vp + pb, (size_t)(ray_enc_pad8(pb) - pb))) VEC_CORRUPT("pool padding");
+        uint64_t run = 0;
+        for (int i = 0; i < vlen; i++) {
+            const uint8_t* w = p + (size_t)i * 16;
+            uint32_t len; memcpy(&len, w, 4);
+            if (len == 0) nulls++;
+            if (len <= RAY_STR_INLINE_MAX) {
+                if (!all_zero(w + 4 + len, 12 - len)) VEC_CORRUPT("inline padding");
+                if (out) memcpy(&o[i], w, 16);
+                continue;
+            }
+            uint32_t off, h; memcpy(&off, w + 8, 4); memcpy(&h, w + 12, 4);
+            if (h != 0 || off != run || len > pb - run || memcmp(w + 4, vp + off, 4) != 0)
+                VEC_CORRUPT("pooled descriptor");
+            if (out) {
+                memcpy(pool_out + pool_base + run, vp + off, len);
+                memset(&o[i], 0, sizeof o[i]);
+                o[i].len = len; memcpy(o[i].prefix, w + 4, 4);
+                o[i].pool_off = (uint32_t)(pool_base + run);
+            }
+            run += len;
+        }
+        if (run != pb) VEC_CORRUPT("pool not fully used");
+        pooled = pb;
+    }
+    if (nulls != d->n_nulls) VEC_CORRUPT("null count");
+    if (pooled_out) *pooled_out = pooled;
+    return NULL;
+}
+
+/* Split a payload into bitmap and body; shared by decode and pool sizing. */
+static ray_t* payload_parts(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                            const uint8_t** body, uint64_t* avail, const uint8_t** bm) {
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    const uint8_t* p = e->base + de.offset + d->payload_off;
+    uint64_t n = d->payload_bytes;
+    *bm = NULL;
+    if (d->n_nulls > 0 && ray_enc_has_bitmap(e->type)) {
+        if (n < 128) VEC_CORRUPT("null bitmap");
+        bool tail_clear;
+        if (popcount_prefix(p, vlen, &tail_clear) != d->n_nulls || !tail_clear) VEC_CORRUPT("null bitmap count");
+        *bm = p; p += 128; n -= 128;
+    }
+    *body = p; *avail = n;
+    return NULL;
+}
+
+ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                              void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap) {
+    int64_t rows = chunk_rows(e, c);
+    int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    const uint8_t* body; uint64_t avail; const uint8_t* bm;
+    ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
+    if (err) return err;
+    uint64_t pooled = 0;
+    const size_t nbytes = (size_t)vlen * ray_enccol_esz(e);
+    if (e->type == RAY_STR) {
+        /* validate and size first, so a corrupt vector writes nothing */
+        err = dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, &pooled);
+        if (err) return err;
+        if (pooled > pool_cap || pool_base > pool_cap - pooled || pool_base + pooled > UINT32_MAX)
+            VEC_CORRUPT("pool overflow");
+        err = dec_str(e, c, j, d, vlen, body, avail, out, pool_out, pool_base, pool_cap, NULL);
+    } else {
+        /* decode aside and publish only a fully validated vector */
+        uint8_t tmp[RAY_ENC_VEC * 16];
+        switch (e->type) {
+        case RAY_F32: case RAY_F64: err = dec_floats(e, c, j, d, vlen, body, avail, bm, tmp); break;
+        case RAY_GUID:              err = dec_guid(e, c, j, d, vlen, body, avail, tmp); break;
+        default:                    err = dec_ints(e, c, j, d, vlen, body, avail, bm, tmp); break;
+        }
+        if (!err) memcpy(out, tmp, nbytes);
+    }
+    if (!err) {
+        uint64_t nb = (uint64_t)nbytes + pooled;
+        atomic_fetch_add_explicit(&g_enc_decoded_bytes, nb, memory_order_relaxed);
+        atomic_fetch_add_explicit(&e->decoded_bytes, nb, memory_order_relaxed);   /* per column */
+    }
+    return err;
+}
+
+ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, uint64_t* out) {
+    *out = 0;
+    if (e->type != RAY_STR) return NULL;
+    int64_t rows = chunk_rows(e, c);
+    int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    const uint8_t* body; uint64_t avail; const uint8_t* bm;
+    ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
+    if (err) return err;
+    return dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, out);
+}
+
+ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool_out,
+                             uint64_t pool_base, uint64_t pool_cap) {
+    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return ray_error("range", "col %s: vector %lld", e->path, (long long)vec);
+    ray_enc_desc_t descs[64];
+    int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    ray_t* err = ray_enccol_chunk_descs(e, c, descs);
+    if (err) return err;
+    int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    return ray_enccol_decode_desc(e, c, j, &descs[j], out, pool_out, pool_base, pool_cap);
+}
+
+ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
+    ray_enc_desc_t descs[64];
+    int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    ray_t* err = ray_enccol_chunk_descs(e, c, descs);
+    if (err) return err;
+    int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    return ray_enccol_desc_pool_bytes(e, c, j, &descs[j], out);
+}
+
+int ray_enccol_vec_nulls(ray_enccol_t* e, int64_t vec, int* n_nulls) {
+    ray_enc_desc_t descs[64];
+    ray_t* err = ray_enccol_chunk_descs(e, vec / RAY_ENC_VECS_PER_CHUNK, descs);
+    if (err) { ray_error_free(err); return -1; }
+    *n_nulls = descs[vec % RAY_ENC_VECS_PER_CHUNK].n_nulls;
+    return 0;
 }

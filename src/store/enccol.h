@@ -73,4 +73,37 @@ void    ray_enccol_payload_detach(ray_t* v);
 size_t  ray_enccol_own_bytes(ray_t* v);
 int     ray_enccol_children(ray_t* v, ray_t* out[2]);
 
+/* Chunk c's descriptors, validated (spec "Validation": before a chunk's
+ * descriptors are used). */
+ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]);
+/* Decode vector j of chunk c (descriptor already validated) into `out`
+ * (vlen elements, generation-0 element width).  STR: pooled bytes are
+ * copied to pool_out[pool_base ...] and descriptors get pool_off =
+ * pool_base + offset within the vector; hash32 is left 0.  `pool_cap` is
+ * the size of pool_out.  Returns NULL or an owned error; on an error
+ * `out` and `pool_out` are not written. */
+ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                              void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap);
+/* Decoded-pool bytes of vector j of chunk c (STR; 0 otherwise). */
+ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                                  uint64_t* out);
+/* Column-global vector: validates chunk descriptors, then decodes. */
+ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool_out,
+                             uint64_t pool_base, uint64_t pool_cap);
+ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out);
+int    ray_enccol_vec_nulls(ray_enccol_t* e, int64_t vec, int* n_nulls);   /* 0 ok, -1 corrupt */
+uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width */
+
+/* Counters (spec "Instrumentation"); reset by tests. */
+typedef struct { uint64_t materialized; uint64_t decoded_bytes; } ray_enc_counters_t;
+void   ray_enc_counters_get(ray_enc_counters_t* out);
+void   ray_enc_counters_reset(void);
+
+/* Test hooks.  fail_alloc: the nth allocation inside generation-2 decode
+ * or materialization fails (1 = the next one); 0 disables.  fail_path:
+ * while set, every such allocation fails for a column whose path contains
+ * `sub` (NULL disables); both report "oom" (transient). */
+void   ray_enccol_test_fail_alloc(int64_t nth);
+void   ray_enccol_test_fail_path(const char* sub);
+
 #endif /* RAY_ENCCOL_H */

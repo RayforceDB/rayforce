@@ -175,6 +175,7 @@ static int64_t enc_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
         return 8 + cv.bytes + ce.bytes;
     }
     case RAY_ENC_DICT: {
+        if (!dict) return -1;                                         /* never dereference a missing dictionary */
         uint64_t codes[RAY_ENC_VEC];
         if (!dict_codes(v, n, k, dict, codes)) return -1;
         ray_enc_choice_t cc = ray_enc_choose(codes, n, K_U32, RAY_ENC_SLOT_CODES, depth + 1, NULL);
@@ -257,6 +258,7 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
             && ray_enc_write(ends, nr, K_U16, RAY_ENC_SLOT_RLE_ENDS, depth + 1, NULL, b, &c);
     }
     case RAY_ENC_DICT: {
+        if (!dict) return -1;                                         /* never dereference a missing dictionary */
         uint64_t codes[RAY_ENC_VEC];
         if (!dict_codes(v, n, k, dict, codes)) return false;
         ray_enc_choice_t c;
@@ -373,6 +375,7 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
         return 8 + a + e;
     }
     case RAY_ENC_DICT: {
+        if (!dict) return -1;                                         /* never dereference a missing dictionary */
         uint64_t codes[RAY_ENC_VEC];
         int64_t c = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_CODES, depth + 1, NULL, codes);
         if (c < 0) return -1;
