@@ -95,8 +95,6 @@ int64_t ray_enc_size_for(int w);
 int     ray_enc_delta_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* dbase);
 int64_t ray_enc_size_delta(int T, int w);
 
-#endif /* RAY_ENC_H */
-
 /* Child slots (spec "Child slots").  The top-level vector is depth 0. */
 typedef enum {
     RAY_ENC_SLOT_TOP = 0,
@@ -119,3 +117,5 @@ int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      const ray_enc_dict_t* dict, uint64_t* out);
 bool    ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
                            uint64_t** out, uint32_t* out_n);
+
+#endif /* RAY_ENC_H */

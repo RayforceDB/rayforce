@@ -340,12 +340,13 @@ static test_result_t test_i64_extremes_roundtrip(void) {
     PASS();
 }
 
-/* DICT at the top whose codes child is RLE: exercises nested children
- * (the code arrays must not be shared across recursion levels). */
+/* DICT at the top whose codes child is RLE: ~100 distinct wide values in runs of
+ * 10.  Top-level RLE would need RAW wide values (8 B per run); DICT with RLE
+ * codes (4 B per run) is smaller.  DICT is legal only at the top, so this is the
+ * deepest nesting the encoder emits (DICT -> RLE codes -> RAW/FOR children). */
 static test_result_t test_dict_codes_rle_nested(void) {
     static uint64_t v[RAY_ENC_VEC];
-    static const uint64_t vals[3] = { 500000000007ull, 9ull, 700000000013ull };
-    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = vals[(i / 200) % 3];   /* 6 long runs */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 0x123456789ABull * (uint64_t)((i / 10) % 100 + 1);
     ray_enc_kind_t k = { 64, true };
     uint64_t* d; uint32_t dn;
     TEST_ASSERT_TRUE(ray_enc_train_dict(v, RAY_ENC_VEC, k, &d, &dn));
@@ -353,14 +354,92 @@ static test_result_t test_dict_codes_rle_nested(void) {
     ray_enc_buf_t b = {0};
     ray_enc_choice_t c;
     TEST_ASSERT_TRUE(ray_enc_write(v, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, &dict, &b, &c));
-    /* RLE at the top (values as DICT) or DICT at the top (codes as RLE): either
-     * nests two levels; the round trip is what matters. */
-    TEST_ASSERT_TRUE(c.enc == RAY_ENC_RLE || c.enc == RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(c.enc, RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(b.p[0], RAY_ENC_RLE);     /* codes child header: encoding */
     uint64_t out[RAY_ENC_VEC];
     TEST_ASSERT_EQ_I(ray_enc_read(b.p, b.len, c.enc, c.width, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, &dict, out), (int64_t)b.len);
     for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_FMT(out[i] == v[i], "i=%d", i);
     ray_enc_buf_free(&b);
     ray_free_raw(d);
+    PASS();
+}
+
+/* A valid depth-1 RLE body for k={32,true}, n=4 (nr runs <= 2): values RAW child
+ * (U32), ends RAW child (U16).  40 bytes. */
+static void rle_body(uint8_t* b, uint32_t nr, uint32_t v0, uint32_t v1, uint16_t e0, uint16_t e1) {
+    memset(b, 0, 40);
+    memcpy(b, &nr, 4);
+    b[8] = RAY_ENC_RAW; uint32_t bb = 8; memcpy(b + 12, &bb, 4);
+    memcpy(b + 16, &v0, 4); memcpy(b + 20, &v1, 4);
+    b[24] = RAY_ENC_RAW; memcpy(b + 28, &bb, 4);
+    memcpy(b + 32, &e0, 2); memcpy(b + 34, &e1, 2);
+}
+
+static test_result_t test_read_rejects_malformed(void) {
+    ray_enc_kind_t k = { 32, true }, k16 = { 16, false };
+    uint8_t b[400];
+    uint64_t out[RAY_ENC_VEC];
+#define RLE_READ(av) ray_enc_read(b, (av), RAY_ENC_RLE, 0, 4, k, RAY_ENC_SLOT_TOP, 0, NULL, out)
+    rle_body(b, 1, 5, 0, 4, 0);
+    TEST_ASSERT_EQ_I(RLE_READ(40), 40);                       /* control */
+    TEST_ASSERT_EQ_I(RLE_READ(39), -1);                       /* truncated */
+    rle_body(b, 1, 5, 0, 4, 0); b[10] = 1;                    /* child header reserved */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 1, 5, 0, 4, 0); b[20] = 1;                    /* RAW padding of values */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 1, 5, 0, 4, 0); b[9] = 1;                     /* width on a RAW child */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 1, 5, 0, 4, 0); b[8] = RAY_ENC_FOR_BP; b[9] = 33;   /* width > T */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 1, 5, 0, 4, 0); b[12] = 7;                    /* body_bytes not multiple of 8 */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 1, 5, 0, 4, 0); b[13] = 4;                    /* body_bytes past avail */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 2, 5, 6, 2, 4);
+    TEST_ASSERT_EQ_I(RLE_READ(40), 40);                       /* control, two runs */
+    rle_body(b, 2, 5, 6, 4, 2);                               /* ends not ascending */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+    rle_body(b, 1, 5, 0, 3, 0);                               /* last end != n */
+    TEST_ASSERT_EQ_I(RLE_READ(40), -1);
+
+    /* top-level bodies */
+    memset(b, 0, sizeof b);
+    uint64_t base = 5; memcpy(b, &base, 8);                   /* FOR, w=0 */
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 8, RAY_ENC_FOR_BP, 0, 4, k16, RAY_ENC_SLOT_TOP, 0, NULL, out), 8);
+    base = 1ull << 16; memcpy(b, &base, 8);                   /* FOR base bit above T */
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 8, RAY_ENC_FOR_BP, 0, 4, k16, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
+    memset(b, 0, sizeof b);
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 8, RAY_ENC_FOR_BP, 17, 4, k16, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);  /* w > T */
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 8, RAY_ENC_RAW, 1, 4, k16, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);      /* width on RAW */
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 8, RAY_ENC_RAW, 0, 3, k16, RAY_ENC_SLOT_TOP, 0, NULL, out), 8);
+    b[7] = 1;                                                 /* RAW padding (n=3 U16 leaves 2 B) */
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 8, RAY_ENC_RAW, 0, 3, k16, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
+
+    int64_t dsz = ray_enc_size_delta(32, 0);                  /* DELTA, k = I32 */
+    static uint8_t db[4096];
+    memset(db, 0, sizeof db);
+    TEST_ASSERT_EQ_I(ray_enc_read(db, (size_t)dsz, RAY_ENC_DELTA_BP, 0, 100, k, RAY_ENC_SLOT_TOP, 0, NULL, out), dsz);
+    uint64_t dbase = 1ull << 32; memcpy(db, &dbase, 8);       /* dbase bit above T */
+    TEST_ASSERT_EQ_I(ray_enc_read(db, (size_t)dsz, RAY_ENC_DELTA_BP, 0, 100, k, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
+    memset(db, 0, sizeof db);
+    int64_t dsz1 = ray_enc_size_delta(32, 1);                 /* placeholder residual non-zero */
+    memset(db + 8 + 8 * 32, 0xFF, (size_t)(dsz1 - 8 - 8 * 32));
+    TEST_ASSERT_EQ_I(ray_enc_read(db, (size_t)dsz1, RAY_ENC_DELTA_BP, 1, 100, k, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
+
+    /* DELTA as a depth-3 child */
+    memset(b, 0, sizeof b);
+    b[0] = RAY_ENC_DELTA_BP; uint32_t bb = 8; memcpy(b + 4, &bb, 4);
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 16, 0, 0, 2, ((ray_enc_kind_t){16,false}), RAY_ENC_SLOT_RLE_ENDS, 3, NULL, out), -1);
+
+    /* DICT code >= dictionary count (top-level DICT, RAW codes child) */
+    static const uint64_t dv[1] = { 77 };
+    ray_enc_dict_t dict = { dv, 1 };
+    memset(b, 0, sizeof b);
+    b[0] = RAY_ENC_RAW; bb = 8; memcpy(b + 4, &bb, 4);
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 16, RAY_ENC_DICT, 0, 2, k, RAY_ENC_SLOT_TOP, 0, &dict, out), 16);
+    uint32_t bad = 1; memcpy(b + 12, &bad, 4);
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 16, RAY_ENC_DICT, 0, 2, k, RAY_ENC_SLOT_TOP, 0, &dict, out), -1);
+#undef RLE_READ
     PASS();
 }
 
@@ -401,6 +480,7 @@ const test_entry_t enc_entries[] = {
     { "enc/roundtrip_lengths_and_types",test_roundtrip_lengths_and_types,enc_setup, enc_teardown },
     { "enc/i64_extremes_roundtrip",     test_i64_extremes_roundtrip,     enc_setup, enc_teardown },
     { "enc/dict_codes_rle_nested",      test_dict_codes_rle_nested,      enc_setup, enc_teardown },
+    { "enc/read_rejects_malformed",     test_read_rejects_malformed,     enc_setup, enc_teardown },
     { "enc/read_rejects_bad_child",     test_read_rejects_bad_child,     enc_setup, enc_teardown },
     { NULL, NULL, NULL, NULL },
 };

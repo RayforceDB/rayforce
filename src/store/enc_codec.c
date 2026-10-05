@@ -116,7 +116,6 @@ static bool enc_legal(uint8_t enc, ray_enc_slot_t slot, int depth, ray_enc_kind_
         if (enc == RAY_ENC_DICT) return k.is_signed && dict && dict->n > 0;
         return enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE;
     case RAY_ENC_SLOT_RLE_VALUES:
-        if (enc == RAY_ENC_DICT) return depth == 1 && k.is_signed && dict && dict->n > 0;
         return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP;
     case RAY_ENC_SLOT_RLE_ENDS:
         return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_DELTA_BP;
@@ -171,7 +170,7 @@ static int64_t enc_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
         uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC];   /* locals: children recurse */
         int r = rle_split(v, n, vals, ends);
         ray_enc_kind_t vk = slot_child_kind(RAY_ENC_SLOT_RLE_VALUES, k);
-        ray_enc_choice_t cv = ray_enc_choose(vals, r, vk, RAY_ENC_SLOT_RLE_VALUES, depth + 1, slot == RAY_ENC_SLOT_TOP ? dict : NULL);
+        ray_enc_choice_t cv = ray_enc_choose(vals, r, vk, RAY_ENC_SLOT_RLE_VALUES, depth + 1, NULL);
         ray_enc_choice_t ce = ray_enc_choose(ends, r, K_U16, RAY_ENC_SLOT_RLE_ENDS, depth + 1, NULL);
         return 8 + cv.bytes + ce.bytes;
     }
@@ -252,7 +251,7 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
         ray_enc_choice_t c;
         ray_enc_kind_t vk = slot_child_kind(RAY_ENC_SLOT_RLE_VALUES, k);
         return ray_enc_buf_put(b, hdrw, 8)
-            && ray_enc_write(vals, nr, vk, RAY_ENC_SLOT_RLE_VALUES, depth + 1, slot == RAY_ENC_SLOT_TOP ? dict : NULL, b, &c)
+            && ray_enc_write(vals, nr, vk, RAY_ENC_SLOT_RLE_VALUES, depth + 1, NULL, b, &c)
             && ray_enc_write(ends, nr, K_U16, RAY_ENC_SLOT_RLE_ENDS, depth + 1, NULL, b, &c);
     }
     case RAY_ENC_DICT: {
@@ -303,6 +302,7 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
     const uint64_t m = tmask(k.T);
     int64_t used;
     if (!enc_legal(enc, slot, depth, k, dict)) return -1;
+    if (w != 0 && enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP) return -1;   /* width only for BP */
     switch (enc) {
     case RAY_ENC_RAW:
         return get_raw(p, avail, n, k.T, out, &used) ? used : -1;
@@ -325,6 +325,7 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
         const int L = RAY_ENC_VEC / k.T;
         if (w > k.T || avail < (size_t)ray_enc_size_delta(k.T, w)) return -1;
         uint64_t dbase; memcpy(&dbase, p, 8);
+        if (dbase & ~m) return -1;
         uint64_t full[RAY_ENC_VEC], r[RAY_ENC_VEC];
         for (int l = 0; l < L; l++) { memcpy(&full[l], p + 8 + 8 * (size_t)l, 8); if (full[l] & ~m) return -1; }
         ray_enc_unpack(p + 8 + 8 * (size_t)L, k.T, w, r);
@@ -341,7 +342,7 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
         uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC];
         ray_enc_kind_t vk = slot_child_kind(RAY_ENC_SLOT_RLE_VALUES, k);
         int64_t a = ray_enc_read(p + 8, avail - 8, 0, 0, (int)nr, vk, RAY_ENC_SLOT_RLE_VALUES, depth + 1,
-                                 slot == RAY_ENC_SLOT_TOP ? dict : NULL, vals);
+                                 NULL, vals);
         if (a < 0) return -1;
         int64_t e = ray_enc_read(p + 8 + a, avail - 8 - (size_t)a, 0, 0, (int)nr, K_U16, RAY_ENC_SLOT_RLE_ENDS, depth + 1, NULL, ends);
         if (e < 0) return -1;
