@@ -398,16 +398,17 @@ static ray_err_t csr_save(ray_csr_t* csr, const char* dir, const char* prefix) {
     return RAY_OK;
 }
 
-/* The CSR files are plain vectors; an encoded column is refused until the
- * aware paths land.  RAY_OK with *out set; RAY_ERR_NYI for an encoded
- * file (the optional ones included: only a missing file is "absent");
+/* The CSR files are plain vectors.  The mapping loader refuses an encoded
+ * (generation-2) column; the copying loader materializes it into a plain
+ * vector.  RAY_OK with *out set; RAY_ERR_NYI for an encoded file mapped
+ * (the optional ones included: only a missing file is "absent");
  * RAY_ERR_IO for anything else. */
 static ray_err_t csr_col(const char* path, bool use_mmap, ray_t** out) {
     *out = NULL;
     ray_t* c = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
     if (c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL) { ray_release(c); return RAY_ERR_NYI; }
     if (c && RAY_IS_ERR(c)) {
-        /* ray_col_load answers nyi for a generation-2 file */
+        /* a nyi on a generation-2 file (e.g. a big-endian host) */
         bool enc = false;
         if (strcmp(ray_err_code(c), "nyi") == 0) {
             FILE* f = fopen(path, "rb");

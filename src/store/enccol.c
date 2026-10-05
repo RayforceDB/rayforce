@@ -739,7 +739,7 @@ int ray_enccol_vec_nulls(ray_enccol_t* e, int64_t vec, int* n_nulls) {
 
 /* ---- Single-column materialization (spec "Materialized equivalence") ---- */
 
-typedef struct { ray_enc_snap_t snap; bool failed; } enc_task_res_t;
+typedef struct { ray_enc_snap_t snap; bool failed; bool done; } enc_task_res_t;
 
 typedef struct {
     ray_enccol_t*   e;
@@ -748,7 +748,11 @@ typedef struct {
     uint64_t        pool_cap;
     const uint64_t* chunk_pool;     /* STR: decoded-pool base of each chunk */
     enc_task_res_t* res;            /* one attempt result per chunk (task) */
+    _Atomic(int64_t) lowest_failed; /* lowest failed chunk so far (INT64_MAX: none) */
 } enc_mat_ctx_t;
+
+static _Atomic(int64_t) g_interrupt_after;     /* test hook, see enccol.h */
+void ray_enccol_test_interrupt_after(int64_t nth) { atomic_store(&g_interrupt_after, nth); }
 
 /* One task per chunk.  Every failure, cancellation included, goes into the
  * task's own fixed-size result from this thread's state; the coordinator
@@ -760,6 +764,10 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
     uint8_t esz = ray_enccol_esz(e);
     for (int64_t c = start; c < end; c++) {
         enc_task_res_t* r = &x->res[c];
+        /* Once a chunk has failed, chunks above it cannot change the
+         * reported (lowest) failure: stop decoding them.  Lower chunks
+         * still run, so the result stays deterministic. */
+        if (c > atomic_load_explicit(&x->lowest_failed, memory_order_relaxed)) continue;
         if (ray_interrupted()) {
             ray_enc_snap_set(&r->snap, "cancel", "col %s: interrupted", e->path);
             r->failed = true;
@@ -780,11 +788,24 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
                 for (int i = 0; i < vlen; i++) {
                     if (ray_str_is_inline(&s[i])) continue;
                     pbase += s[i].len;
-                    ray_str_t_cache_hash(&s[i], x->pool);   /* the generation-0 rule */
+                    /* the generation-0 rule (col_validate_str_region), computed
+                     * whatever the decoder left in the field */
+                    uint32_t h = (uint32_t)ray_str_t_hash(&s[i], x->pool);
+                    s[i].hash32 = h != 0 ? h : 1u;
                 }
             }
         }
         if (err) { ray_enc_snap_take(&r->snap, err); r->failed = true; }
+        if (r->failed) {
+            int64_t cur = atomic_load_explicit(&x->lowest_failed, memory_order_relaxed);
+            while (c < cur && !atomic_compare_exchange_weak_explicit(&x->lowest_failed, &cur, c,
+                                   memory_order_relaxed, memory_order_relaxed)) {}
+        } else {
+            int64_t k = atomic_load_explicit(&g_interrupt_after, memory_order_relaxed);
+            while (k > 0 && !atomic_compare_exchange_weak(&g_interrupt_after, &k, k - 1)) {}
+            r->done = true;
+            if (k == 1) ray_request_interrupt();
+        }
     }
 }
 
@@ -856,14 +877,19 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
         .pool = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL,
         .pool_cap = e->hdr.str_pool_bytes, .chunk_pool = chunk_pool, .res = res,
     };
+    atomic_init(&x.lowest_failed, INT64_MAX);
+    if (e->n_chunks > (int64_t)UINT32_MAX) { err = ray_error("range", "col %s: too many chunks", e->path); goto fail; }
     ray_pool_t* tp = ray_pool_get();
     if (e->n_chunks >= 2 && ray_pool_par_dispatch_ok(tp, e->n_chunks, 2))
         ray_pool_dispatch_n(tp, enc_mat_chunk, &x, (uint32_t)e->n_chunks);
     else
         enc_mat_chunk(&x, 0, 0, e->n_chunks);
+    /* A cancel also stops the pool from running its remaining tasks: a chunk
+     * that neither finished nor failed was never run and counts as cancelled. */
     for (int64_t c = 0; c < e->n_chunks; c++)
-        if (res[c].failed) {                     /* the lowest-numbered failing task */
-            *fail = res[c].snap;
+        if (res[c].failed || !res[c].done) {     /* the lowest-numbered failing task */
+            if (res[c].failed) *fail = res[c].snap;
+            else ray_enc_snap_set(fail, "cancel", "col %s: interrupted", e->path);
             ray_free_raw(res); ray_free_raw(chunk_pool); ray_release(vec);
             return NULL;
         }

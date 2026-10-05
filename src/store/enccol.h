@@ -109,5 +109,8 @@ void   ray_enc_counters_reset(void);
  * `sub` (NULL disables); both report "oom" (transient). */
 void   ray_enccol_test_fail_alloc(int64_t nth);
 void   ray_enccol_test_fail_path(const char* sub);
+/* interrupt_after: the nth chunk decoded successfully from now on calls
+ * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */
+void   ray_enccol_test_interrupt_after(int64_t nth);
 
 #endif /* RAY_ENCCOL_H */
