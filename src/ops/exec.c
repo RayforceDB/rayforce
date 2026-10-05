@@ -4226,12 +4226,33 @@ static ray_t* validate_scan_columns(ray_graph_t* g) {
     return NULL;
 }
 
-/* The mapped, fixed-width columns the graph's scans read, for the pool's
- * scan read-ahead (ray_pool_scan_set): columns of one length, at most
- * RAY_POOL_SCAN_MAX.  NULL when there are none. */
+void exec_scan_init(ray_pool_scan_t* s) {
+    s->n = 0;
+    s->rows = -1;
+    s->gate = NULL;
+    s->gate_log2 = 0;
+}
+
+void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col) {
+    if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR) return;
+    if (col->len <= 0 || (s->rows >= 0 && col->len != s->rows)) return;
+    size_t esz = ray_sym_elem_size(col->type, col->attrs);
+    if (esz == 0) return;
+    s->rows = col->len;
+    const uint8_t* base = (const uint8_t*)ray_data(col);
+    for (uint32_t k = 0; k < s->n; k++) if (s->base[k] == base) return;
+    if (s->n >= RAY_POOL_SCAN_MAX || ray_vm_resident(base, (size_t)col->len * esz)) return;
+    s->base[s->n] = base;
+    s->esz[s->n] = (uint32_t)esz;
+    s->n++;
+}
+
+/* The graph's scanned columns, when they are mapped (see exec_scan_add_col);
+ * NULL when no scan reads a mapped column. */
 static const ray_pool_scan_t* exec_scan_columns(ray_graph_t* g, ray_pool_scan_t* s) {
-    s->n = 0; s->rows = -1;
-    for (uint32_t i = 0; i < g->node_count && s->n < RAY_POOL_SCAN_MAX; i++) {
+    exec_scan_init(s);
+    for (uint32_t i = 0; i < g->node_count; i++) {
         ray_op_t* op = &g->nodes[i];
         if (op->opcode != OP_SCAN) continue;
         ray_op_ext_t* ext = find_ext(g, op->id);
@@ -4241,20 +4262,9 @@ static const ray_pool_scan_t* exec_scan_columns(ray_graph_t* g, ray_pool_scan_t*
         ray_t* tbl = (tid > 0 && g->tables && (uint32_t)(tid - 1) < g->n_tables)
                    ? g->tables[tid - 1] : g->table;
         if (!tbl || tbl->type != RAY_TABLE) continue;
-        ray_t* col = ray_table_get_col(tbl, ext->sym);
-        if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
-            col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR) continue;
-        if (s->rows >= 0 && col->len != s->rows) continue;
-        size_t esz = ray_sym_elem_size(col->type, col->attrs);
-        if (esz == 0) continue;
-        const uint8_t* base = (const uint8_t*)ray_data(col);
-        bool dup = false;
-        for (uint32_t k = 0; k < s->n; k++) if (s->base[k] == base) { dup = true; break; }
-        if (dup) continue;
-        s->base[s->n] = base; s->esz[s->n] = (uint32_t)esz; s->n++;
-        s->rows = col->len;
+        exec_scan_add_col(s, ray_table_get_col(tbl, ext->sym));
     }
-    return s->n ? s : NULL;
+    return s->rows >= 0 ? s : NULL;
 }
 
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
@@ -4271,15 +4281,20 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * would reset the elapsed clock and fire premature "final" ticks. */
     ray_t* scan_err = validate_scan_columns(g);
     if (scan_err) return scan_err;
+    /* Scan read-ahead: a registration over mapped columns made by the
+     * caller (a select, which also knows its filter) stands; otherwise the
+     * graph's own mapped scans are registered for its dispatches. */
     ray_pool_scan_t scan;
-    const ray_pool_scan_t* prev_scan = ray_pool_scan_set(exec_scan_columns(g, &scan));
+    const ray_pool_scan_t* prev_scan = ray_pool_scan_get();
+    bool own_scan = !prev_scan || prev_scan->rows < 0;
+    if (own_scan) ray_pool_scan_set(exec_scan_columns(g, &scan));
     /* Never NULL: callers test RAY_IS_ERR, which is false for NULL, and then
      * dereference.  The inner paths hand NULL back unchanged when a node,
      * a compaction or a merge fails to allocate (the flat path's
      * `return result`, the streaming path's seg_tbl / partial / merged
      * returns); `(times <lazy> ...)` would then crash in loop_count. */
     ray_t* result = ray_execute_inner(g, root);
-    ray_pool_scan_set(prev_scan);
+    if (own_scan) ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }
 

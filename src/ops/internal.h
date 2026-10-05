@@ -990,6 +990,13 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
                         const uint8_t* esz, int64_t ncols);
 
 /* ── filter.c ── */
+/* Scan read-ahead registration (ray_pool_scan_set).  exec_scan_add_col adds
+ * `col` when it is a mapped fixed-width vector of the registration's length
+ * (the first such column sets it, resident or not) whose pages are not
+ * already resident, so a warm query registers nothing to read. */
+void exec_scan_init(ray_pool_scan_t* s);
+void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col);
+
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred);
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit);
 /* The one `where:` rule (see filter.c): consumes `pred`, returns an owned

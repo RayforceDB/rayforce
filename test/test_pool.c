@@ -1653,6 +1653,140 @@ static test_result_t test_auto_all_logical_cpus(void) {
 }
 #endif
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <stdio.h>
+
+/* --------------------------------------------------------------------------
+ * Test: scan read-ahead requests the registered rows from storage.
+ *
+ * A column file is evicted from the page cache, registered, and walked by
+ * tasks that never touch its memory: its pages can only become resident
+ * because the pool asked the kernel for them.  A dispatch over exactly its
+ * rows is read ahead per ticket; a dispatch_n task reports its position
+ * through ray_pool_scan_at; the chunks a gate rules out are never
+ * requested.  Skipped where eviction has no effect (tmpfs keeps its pages)
+ * or read-ahead is turned off (RAY_SCAN_PREFETCH=0).
+ * -------------------------------------------------------------------------- */
+#define PF_ROWS      ((int64_t)1 << 20)   /* 8 MiB of int64 */
+#define PF_TASKS     8
+#define PF_LOG2      16                   /* gate chunk: 64K rows, 512 KiB */
+#define PF_PATH      "/tmp/rayforce_test_scan_ahead.col"
+
+static void pf_noop(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)ctx; (void)w; (void)s; (void)e;
+}
+
+/* dispatch_n task t walks rows [t*per, (t+1)*per) without reading them. */
+static void pf_walk(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)ctx; (void)w;
+    const int64_t per = PF_ROWS / PF_TASKS;
+    for (int64_t t = s; t < e; t++)
+        for (int64_t r = t * per; r < (t + 1) * per; r += 8192)
+            ray_pool_scan_at(PF_ROWS, r, (t + 1) * per);
+}
+
+static bool pf_evict(void) {
+    int fd = open(PF_PATH, O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = fdatasync(fd) == 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+    close(fd);
+    return ok;
+}
+
+/* Bounded wait for the kernel to finish the reads: every sampled page of
+ * [p, p+n) resident.  Returns false after ~10 s. */
+static bool pf_wait_resident(const void* p, size_t n) {
+    for (int i = 0; i < 20000; i++) {
+        if (ray_vm_resident(p, n)) return true;
+        struct timespec ts = { 0, 500000 };
+        nanosleep(&ts, NULL);
+    }
+    return false;
+}
+
+static test_result_t test_scan_read_ahead(void) {
+    ray_heap_init();
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    test_result_t res = { TEST_PASS, NULL };
+    uint8_t* base = NULL;
+    size_t size = 0;
+
+    FILE* f = fopen(PF_PATH, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    for (int64_t i = 0; i < PF_ROWS; i++) fwrite(&i, sizeof(i), 1, f);
+    fclose(f);
+    base = (uint8_t*)ray_vm_map_file(PF_PATH, &size);
+    TEST_ASSERT_NOT_NULL(base);
+    TEST_ASSERT_EQ_U(size, (uint64_t)PF_ROWS * 8);
+
+    if (!pool->scan_bytes) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
+    if (!pf_evict() || ray_vm_resident(base, size)) {
+        res = (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" };
+        goto out;
+    }
+
+    ray_pool_scan_t scan = { .base = { base }, .esz = { 8 }, .n = 1, .rows = PF_ROWS };
+    const ray_pool_scan_t* prev = ray_pool_scan_set(&scan);
+
+    /* Per ticket: a dispatch over exactly the registered rows (range mode
+     * only; the shared cursor hands consecutive tickets to different
+     * threads, so there is no per-thread run to read ahead of). */
+    if (pool->steal) {
+        ray_pool_dispatch(pool, pf_noop, NULL, PF_ROWS);
+        if (!pf_wait_resident(base, size)) {
+            res = (test_result_t){ TEST_FAIL, "per-ticket read-ahead left the rows unread" };
+            goto restore;
+        }
+        if (!pf_evict()) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+    }
+
+    /* Reported positions: dispatch_n tasks walking row ranges. */
+    ray_pool_dispatch_n(pool, pf_walk, NULL, PF_TASKS);
+    if (!pf_wait_resident(base, size)) {
+        res = (test_result_t){ TEST_FAIL, "task-reported read-ahead left the rows unread" };
+        goto restore;
+    }
+    if (!pf_evict()) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+
+    /* Gate: only even chunks may pass, so odd chunks are never requested. */
+    uint64_t gate = 0;
+    const int64_t n_chunks = PF_ROWS >> PF_LOG2;
+    for (int64_t c = 0; c < n_chunks; c += 2) gate |= UINT64_C(1) << c;
+    scan.gate = &gate;
+    scan.gate_log2 = PF_LOG2;
+    ray_pool_dispatch_n(pool, pf_walk, NULL, PF_TASKS);
+    const size_t chunk = ((size_t)1 << PF_LOG2) * 8;
+    for (int64_t c = 0; c < n_chunks; c++) {
+        const uint8_t* p = base + (size_t)c * chunk;
+        if (c % 2 == 0 && !pf_wait_resident(p, chunk)) {
+            res = (test_result_t){ TEST_FAIL, "a gated-in chunk was not read" };
+            goto restore;
+        }
+        if (c % 2 == 1 && ray_vm_resident(p + chunk / 2, 4096)) {
+            res = (test_result_t){ TEST_FAIL, "a gated-out chunk was read" };
+            goto restore;
+        }
+    }
+
+    /* Outside a dispatch the hook has nothing registered to act on. */
+    ray_pool_scan_at(PF_ROWS, 0, PF_ROWS);
+
+restore:
+    ray_pool_scan_set(prev);
+out:
+    if (base) ray_vm_unmap_file(base, size);
+    remove(PF_PATH);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    ray_heap_destroy();
+    return res;
+}
+#endif
+
 const test_entry_t pool_entries[] = {
 #if defined(__linux__) || defined(__APPLE__)
     { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
@@ -1697,6 +1831,7 @@ const test_entry_t pool_entries[] = {
     { "pool/epoll_sel_cap_growth",  test_epoll_sel_cap_growth,  NULL, NULL },
     { "pool/epoll_hup_branch",      test_epoll_hup_branch,      NULL, NULL },
     { "pool/epoll_hup_no_errfn",    test_epoll_hup_no_errfn,    NULL, NULL },
+    { "pool/scan_read_ahead",       test_scan_read_ahead,       NULL, NULL },
 #endif
     { NULL, NULL, NULL, NULL },
 };

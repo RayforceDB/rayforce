@@ -167,14 +167,20 @@ static void cdf_p1_hist(void* raw, uint32_t wid, int64_t start, int64_t end) {
         if (c->dedup) memset(recent, 0, sizeof(recent));
         int64_t begin = c->nrows / c->nw * task;
         int64_t limit = task + 1 == c->nw ? c->nrows : c->nrows / c->nw * (task + 1);
-        for (int64_t r = begin; r < limit; r++) {
-            int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
-            int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
-            uint64_t hash = cdf_pair_hash(k, v);
-            if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
-            uint32_t part = hash & (c->n_parts - 1);
-            if (my[part].cap == UINT32_MAX) { atomic_store(&c->oom, 1); return; }
-            my[part].cap++;
+        /* The first read of these rows: keep the next ones requested from
+         * storage, block by block (scan read-ahead). */
+        for (int64_t b = begin; b < limit; b += 8192) {
+            int64_t e = limit - b > 8192 ? b + 8192 : limit;
+            ray_pool_scan_at(c->nrows, b, limit);
+            for (int64_t r = b; r < e; r++) {
+                int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
+                int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
+                uint64_t hash = cdf_pair_hash(k, v);
+                if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
+                uint32_t part = hash & (c->n_parts - 1);
+                if (my[part].cap == UINT32_MAX) { atomic_store(&c->oom, 1); return; }
+                my[part].cap++;
+            }
         }
         atomic_fetch_add_explicit(&c->rows_done, limit - begin, memory_order_relaxed);
     }

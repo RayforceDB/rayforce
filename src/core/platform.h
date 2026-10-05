@@ -159,6 +159,10 @@ void  ray_vm_advise_seq(void* ptr, size_t size);
 /* Ask the kernel to start reading [ptr, ptr+size) of a file mapping now,
  * asynchronously, so a later access finds it resident.  Best effort. */
 void  ray_vm_advise_willneed(void* ptr, size_t size);
+/* True when a sample of the pages of [ptr, ptr+size) is resident: a cheap
+ * check (a handful of page probes) that a read-ahead would find nothing to
+ * read.  Where residency cannot be queried it reports false. */
+bool  ray_vm_resident(const void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
 /* Release physical pages for a free block.  When hugepage is true, only the
  * 2MB-aligned interior is released so a partial MADV_DONTNEED does not

@@ -9010,8 +9010,170 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
     return result;
 }
 
+/* --------------------------------------------------------------------------
+ * Scan read-ahead for a select (see ray_pool_scan_set in core/pool.c)
+ *
+ * ray_select opens a registration; once the source table is known the
+ * select registers the mapped columns its clauses name, and the zone-index
+ * verdict of its filter, so every dispatch it runs, fast paths included,
+ * keeps the rows just ahead of its workers requested from storage.
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    ray_pool_scan_t scan;
+    ray_t**         args;      /* the select this registration belongs to */
+    ray_t*          gate_hdr;  /* scratch block behind scan.gate */
+    bool            filled;
+} select_scan_t;
+static RAY_TLS select_scan_t* t_select_scan;
+
+static bool scan_gate_int_type(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64;
+}
+
+static bool scan_gate_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+/* A non-null integer or temporal constant that compares with a `ct` column
+ * on its stored value. */
+static bool scan_gate_atom(ray_t* a, int8_t ct, int64_t* out) {
+    if (!a || !ray_is_atom(a) || RAY_ATOM_IS_NULL(a)) return false;
+    int8_t t = (int8_t)-a->type;
+    if (scan_gate_temporal(ct) ? t != ct : !scan_gate_int_type(t)) return false;
+    switch (t) {
+    case RAY_I32:  *out = a->i32; return true;
+    case RAY_I16:  *out = a->i16; return true;
+    case RAY_U8:   *out = a->u8;  return true;
+    case RAY_BOOL: *out = a->b8;  return true;
+    default:       *out = a->i64; return true;   /* I64, DATE, TIME, TIMESTAMP */
+    }
+}
+
+/* The [lo hi] literal of a `within`. */
+static bool scan_gate_range(ray_t* v, int8_t ct, int64_t* lo, int64_t* hi) {
+    if (!v || !ray_is_vec(v) || v->len != 2 || ray_vec_has_nulls(v)) return false;
+    if (scan_gate_temporal(ct) ? v->type != ct : !scan_gate_int_type(v->type)) return false;
+    *lo = read_col_i64(ray_data(v), 0, v->type, v->attrs);
+    *hi = read_col_i64(ray_data(v), 1, v->type, v->attrs);
+    return true;
+}
+
+/* Clear the gate chunks where conjunct `e` holds for no row.  Shapes:
+ * (op col c) for op in == < <= > >=, and (within col [lo hi]), over an
+ * integer or temporal column with a chunk-zone index; anything else rules
+ * nothing out.  A null ranks below every value (null < c holds), so a
+ * chunk holding nulls always passes < and <=. */
+static void scan_gate_conjunct(select_scan_t* ss, ray_t* e, ray_t* tbl) {
+    enum { G_EQ, G_LT, G_LE, G_GT, G_GE, G_WITHIN };
+    if (!e || e->type != RAY_LIST || ray_len(e) != 3) return;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (!el[0] || el[0]->type != -RAY_SYM) return;
+    ray_t* fs = ray_sym_str(el[0]->i64);
+    if (!fs) return;
+    const char* f = ray_str_ptr(fs);
+    size_t fl = ray_str_len(fs);
+    int op;
+    if      (fl == 2 && memcmp(f, "==", 2) == 0)     op = G_EQ;
+    else if (fl == 1 && f[0] == '<')                 op = G_LT;
+    else if (fl == 2 && memcmp(f, "<=", 2) == 0)     op = G_LE;
+    else if (fl == 1 && f[0] == '>')                 op = G_GT;
+    else if (fl == 2 && memcmp(f, ">=", 2) == 0)     op = G_GE;
+    else if (fl == 6 && memcmp(f, "within", 6) == 0) op = G_WITHIN;
+    else return;
+    if (!el[1] || el[1]->type != -RAY_SYM || (el[1]->attrs & ATTR_QUOTED)) return;
+    ray_t* col = ray_table_get_col(tbl, el[1]->i64);
+    if (!col || !ray_is_vec(col) || col->len != ss->scan.rows) return;
+    int8_t ct = col->type;
+    if (!scan_gate_int_type(ct) && !scan_gate_temporal(ct)) return;
+    if (ray_index_kind(col) != RAY_IDX_CHUNK_ZONE) return;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64 ||
+        !ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs || !ix->u.chunk_zone.null_bits) return;
+    uint32_t nch = ix->u.chunk_zone.n_chunks;
+    uint8_t lg = ix->u.chunk_zone.chunk_log2;
+    if (lg >= 40 || ((int64_t)nch << lg) < col->len) return;
+    int64_t lo = 0, hi = 0;
+    if (op == G_WITHIN ? !scan_gate_range(el[2], ct, &lo, &hi)
+                       : !scan_gate_atom(el[2], ct, &lo)) return;
+    if (!ss->scan.gate) {
+        size_t words = ((size_t)nch + 63) / 64;
+        uint64_t* g = (uint64_t*)scratch_alloc(&ss->gate_hdr, words * sizeof(uint64_t));
+        if (!g) return;
+        memset(g, 0xff, words * sizeof(uint64_t));
+        ss->scan.gate = g;
+        ss->scan.gate_log2 = lg;
+    } else if (ss->scan.gate_log2 != lg) {
+        return;
+    }
+    uint64_t* g = (uint64_t*)ss->scan.gate;
+    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+    const uint8_t* nb = (const uint8_t*)ray_data(ix->u.chunk_zone.null_bits);
+    for (uint32_t c = 0; c < nch; c++) {
+        int64_t mn = mins[c], mx = maxs[c];
+        bool nulls = (nb[c >> 3] >> (c & 7)) & 1;
+        bool pass;
+        if (mn > mx) pass = (op == G_LT || op == G_LE) && nulls;   /* no non-null value */
+        else switch (op) {
+            case G_EQ: pass = lo >= mn && lo <= mx; break;
+            case G_LT: pass = nulls || mn < lo; break;
+            case G_LE: pass = nulls || mn <= lo; break;
+            case G_GT: pass = mx > lo; break;
+            case G_GE: pass = mx >= lo; break;
+            default:   pass = mx >= lo && mn <= hi; break;
+        }
+        if (!pass) g[c >> 6] &= ~(UINT64_C(1) << (c & 63));
+    }
+}
+
+/* Walk the top-level `and` of a filter. */
+static void scan_gate_where(select_scan_t* ss, ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || depth > 8) return;
+    int64_t n = ray_len(e);
+    ray_t** el = (ray_t**)ray_data(e);
+    if (n >= 2 && el[0] && el[0]->type == -RAY_SYM) {
+        ray_t* fs = ray_sym_str(el[0]->i64);
+        if (fs && ray_str_len(fs) == 3 && memcmp(ray_str_ptr(fs), "and", 3) == 0) {
+            for (int64_t i = 1; i < n; i++) scan_gate_where(ss, el[i], tbl, depth + 1);
+            return;
+        }
+    }
+    scan_gate_conjunct(ss, e, tbl);
+}
+
+/* Fill the open registration of the select `args` from its source table. */
+static void select_scan_register(ray_t** args, ray_t* dict, ray_t* tbl, ray_t* where) {
+    select_scan_t* ss = t_select_scan;
+    if (!ss || ss->filled || ss->args != args) return;
+    ss->filled = true;
+    int64_t syms[64];
+    int n = 0;
+    int64_t from_id = dict_key_id(dict, "from");
+    DICT_VIEW_DECL(pv);
+    DICT_VIEW_OPEN(dict, pv);
+    if (DICT_VIEW_OVERFLOW(pv)) { DICT_VIEW_CLOSE(pv); return; }
+    for (int64_t i = 0; i + 1 < pv_n; i += 2) {
+        if (pv[i]->i64 == from_id) continue;
+        n = collect_syms(pv[i + 1], syms, 64, n);
+    }
+    DICT_VIEW_CLOSE(pv);
+    for (int i = 0; i < n; i++)
+        exec_scan_add_col(&ss->scan, ray_table_get_col(tbl, syms[i]));
+    if (ss->scan.n && where) scan_gate_where(ss, where, tbl, 0);
+    ray_pool_scan_set(&ss->scan);
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
-    return ray_select_impl(args, n, false);
+    select_scan_t ss = { .args = args };
+    exec_scan_init(&ss.scan);
+    select_scan_t* prev_ss = t_select_scan;
+    const ray_pool_scan_t* prev_scan = ray_pool_scan_get();
+    t_select_scan = &ss;
+    ray_t* r = ray_select_impl(args, n, false);
+    t_select_scan = prev_ss;
+    ray_pool_scan_set(prev_scan);
+    if (ss.gate_hdr) scratch_free(ss.gate_hdr);
+    return r;
 }
 
 /* The hidden name a bare computed by: key is grouped under (#707). */
@@ -9178,6 +9340,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         if (RAY_IS_ERR(tbl)) return tbl;
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
+    select_scan_register(args, dict, tbl, where_expr);
 
     if (!aliases_resolved) {
         select_alias_plan_t plan;

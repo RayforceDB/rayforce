@@ -1711,8 +1711,10 @@ static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         int64_t begin = chunk * task;
         int64_t limit = task + 1 == c->n_tasks ? c->task_rows : chunk * (task + 1);
         if (c->sel) agg_dense_phaseA_fn(c, (uint32_t)task, begin, limit);
-        else for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192)
+        else for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192) {
+            ray_pool_scan_at(c->task_rows, row, limit);
             agg_dense_phaseA_fn(c, (uint32_t)task, row, limit - row < 8192 ? limit : row + 8192);
+        }
         if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
             if (loc->first_row[s] != INT64_MAX)
                 loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
@@ -3283,6 +3285,17 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
         while ((cn = agg_sel_cursor_next(&sc, rows)) > 0)
             for (int64_t i = 0; i < cn; i++)
                 agg_radix_visit(c, cur, rows[i], pos++, scatter);
+        return;
+    }
+    if (!scatter) {
+        /* The count pass is the first read of these rows: keep the next
+         * ones requested from storage, block by block (scan read-ahead). */
+        for (int64_t b = start; b < end; b += 8192) {
+            int64_t e = end - b > 8192 ? b + 8192 : end;
+            ray_pool_scan_at(c->n_in, b, end);
+            for (int64_t r = b; r < e; r++)
+                agg_radix_visit(c, cur, r, r, false);
+        }
         return;
     }
     for (int64_t r = start; r < end; r++)
@@ -6343,6 +6356,7 @@ static void agg_firstn_task(agg_firstn_ctx_t* c, uint32_t t) {
         if (fl && fl[seg] == RAY_SEL_NONE) continue;
         int64_t b = seg * RAY_MORSEL_ELEMS;
         int64_t len = c->nrows - b < RAY_MORSEL_ELEMS ? c->nrows - b : RAY_MORSEL_ELEMS;
+        if (!(seg & 7)) ray_pool_scan_at(c->nrows, b, s1 * RAY_MORSEL_ELEMS);
         for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
         for (uint32_t k = 0; k < n_keys; k++)
             agg_firstn_hash_block(hb, c->key_cols[k], c->key_data[k], b, len);

@@ -194,16 +194,29 @@ static bool pool_steal(ray_pool_t* pool, uint32_t w, uint32_t* c0, uint32_t* c1)
  * A mapped column is read on first touch, one page fault at a time per
  * worker (plus the kernel's own read-ahead), so a scan over storage with a
  * high per-request latency runs at a couple of requests in flight per
- * worker whatever the storage could serve in parallel.  The executor
- * registers the mapped columns a graph scans (ray_pool_scan_set); for a
- * window over exactly their rows each worker keeps the rows of the next
- * `scan_ahead` tickets requested (MADV_WILLNEED, window by window) while it
- * runs the current one, topping the request up once half of it is used.
- * Tickets map to rows as the dispatcher cut them: ticket base+i covers
- * rows [i*grain, (i+1)*grain).  RAY_SCAN_PREFETCH sets the depth in tickets
- * (default 64, 0 turns it off); it is read when the pool is created.
+ * worker whatever the storage could serve in parallel.  A query registers
+ * the mapped columns it reads (ray_pool_scan_set); while one of its
+ * dispatches runs, each thread keeps the next `scan_bytes` of every
+ * registered column, from the row it is at, requested (MADV_WILLNEED,
+ * window by window), topping the request up once half of it is used.
+ *
+ * The row comes from the ticket for a dispatch over exactly the registered
+ * rows (ticket base+i holds rows [i*grain, (i+1)*grain)), and from the task
+ * itself (ray_pool_scan_at) for dispatch_n tasks that walk a row range.
+ * Rows of zone chunks the query's filter rules out (scan->gate) are never
+ * requested.  RAY_SCAN_PREFETCH sets the window in KiB (default 4096, 0
+ * turns read-ahead off); it is read when the pool is created.
  * -------------------------------------------------------------------------- */
 static RAY_TLS const ray_pool_scan_t* t_scan;
+
+/* What this thread has requested for the current dispatch: rows
+ * [lo[c], hi[c]) of column c.  Stale (gen differs) at a new dispatch. */
+typedef struct {
+    uint64_t gen;
+    int64_t  lo[RAY_POOL_SCAN_MAX];
+    int64_t  hi[RAY_POOL_SCAN_MAX];
+} pool_scan_tls_t;
+static RAY_TLS pool_scan_tls_t t_pf;
 
 const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan) {
     const ray_pool_scan_t* prev = t_scan;
@@ -211,33 +224,63 @@ const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan) {
     return prev;
 }
 
-static void pool_scan_request(const ray_pool_t* pool, uint32_t a, uint32_t b) {
-    const ray_pool_scan_t* s = pool->scan;
-    int64_t r0 = (int64_t)(uint32_t)(a - (uint32_t)pool->scan_base) * pool->scan_grain;
-    int64_t r1 = (int64_t)(uint32_t)(b - (uint32_t)pool->scan_base) * pool->scan_grain;
-    if (r1 > s->rows) r1 = s->rows;
-    if (r1 <= r0) return;
-    for (uint32_t c = 0; c < s->n; c++)
-        ray_vm_advise_willneed((void*)(s->base[c] + (size_t)r0 * s->esz[c]),
-                               (size_t)(r1 - r0) * s->esz[c]);
+const ray_pool_scan_t* ray_pool_scan_get(void) { return t_scan; }
+
+/* Requested so far (all pools), for the RAY_POOL_TRACE summary. */
+static _Atomic(uint64_t) pool_scan_req_bytes, pool_scan_req_ranges;
+
+static void pool_scan_willneed(const ray_pool_scan_t* s, uint32_t c, int64_t a, int64_t b) {
+    size_t bytes = (size_t)(b - a) * s->esz[c];
+    ray_vm_advise_willneed((void*)(s->base[c] + (size_t)a * s->esz[c]), bytes);
+    atomic_fetch_add_explicit(&pool_scan_req_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&pool_scan_req_ranges, 1, memory_order_relaxed);
 }
 
-/* Before worker w runs ticket tk: keep [tk+1, tk+1+ahead) requested.
- * Tickets are absolute mod 2^32; everything is compared relative to the
- * window base so a wrap does not matter. */
-static inline void pool_scan_ahead(ray_pool_t* pool, ray_pool_slot_t* s, uint32_t tk) {
-    if (!pool->scan) return;
-    uint32_t b = (uint32_t)pool->scan_base;
-    uint32_t n = (uint32_t)(pool->scan_end - pool->scan_base);
-    uint32_t rel = tk - b, lo = s->pf_lo - b, hi = s->pf_hi - b;
-    /* A stolen chunk, or a new window: what was requested does not cover tk. */
-    if (lo > n || hi > n || rel + 1 < lo || rel >= hi) { lo = hi = rel + 1; }
-    if (hi - rel > pool->scan_ahead / 2 + 1) { s->pf_lo = lo + b; s->pf_hi = hi + b; return; }
-    uint32_t want = rel + 1 + pool->scan_ahead;
-    if (want > n) want = n;
-    if (want > hi) pool_scan_request(pool, hi + b, want + b);
-    s->pf_lo = lo + b;
-    s->pf_hi = (want > hi ? want : hi) + b;
+/* Request rows [a, b) of column c, skipping the chunks the gate rules out. */
+static void pool_scan_request(const ray_pool_scan_t* s, uint32_t c, int64_t a, int64_t b) {
+    if (!s->gate) { pool_scan_willneed(s, c, a, b); return; }
+    uint8_t lg = s->gate_log2;
+    int64_t run = -1;
+    for (int64_t ch = a >> lg; (ch << lg) < b; ch++) {
+        int64_t c0 = ch << lg;
+        if (c0 < a) c0 = a;
+        if ((s->gate[ch >> 6] >> (ch & 63)) & 1) {
+            if (run < 0) run = c0;
+        } else if (run >= 0) {
+            pool_scan_willneed(s, c, run, c0);
+            run = -1;
+        }
+    }
+    if (run >= 0) pool_scan_willneed(s, c, run, b);
+}
+
+/* This thread is about to read row r and goes on towards `end`. */
+static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
+    const ray_pool_scan_t* s = pool->scan;
+    if (end > s->rows) end = s->rows;
+    if (r < 0 || r >= end) return;
+    pool_scan_tls_t* t = &t_pf;
+    if (t->gen != pool->scan_gen) {
+        t->gen = pool->scan_gen;
+        for (uint32_t c = 0; c < s->n; c++) t->lo[c] = t->hi[c] = r;
+    }
+    for (uint32_t c = 0; c < s->n; c++) {
+        /* A jump outside what was requested starts a new run. */
+        if (r < t->lo[c] || r > t->hi[c]) t->lo[c] = t->hi[c] = r;
+        int64_t win = (int64_t)(pool->scan_bytes / s->esz[c]);
+        if (win < 1) win = 1;
+        if (t->hi[c] - r > win / 2) continue;
+        int64_t want = end - r > win ? r + win : end;
+        if (want <= t->hi[c]) continue;
+        pool_scan_request(s, c, t->hi[c], want);
+        t->hi[c] = want;
+    }
+}
+
+static inline void pool_scan_ticket(ray_pool_t* pool, uint32_t tk) {
+    if (!pool->scan_auto) return;
+    pool_scan_ahead(pool, (int64_t)(uint32_t)(tk - (uint32_t)pool->scan_base) * pool->scan_grain,
+                    pool->scan->rows);
 }
 
 static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
@@ -247,7 +290,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         uint32_t tk;
         while (pool_range_take(s, &tk)) {
             if ((uint32_t)(tk - ch0) < (uint32_t)(ch1 - ch0)) s->stolen++; else s->own++;
-            pool_scan_ahead(pool, s, tk);
+            pool_scan_ticket(pool, tk);
             pool_exec(pool, w, tk);
             if (prog) ray_progress_pump();
         }
@@ -275,7 +318,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         }
         s->stolen += c1 - c0;
         for (; c0 != c1; c0++) {
-            pool_scan_ahead(pool, s, c0);
+            pool_scan_ticket(pool, c0);
             pool_exec(pool, w, c0);
             if (prog) ray_progress_pump();
         }
@@ -330,6 +373,10 @@ static void pool_trace_dump(const ray_pool_t* pool) {
             (unsigned long long)(atomic_load_explicit(&pool->win_state, memory_order_relaxed) / 2),
             (unsigned long long)(own + stolen), (unsigned long long)own,
             (unsigned long long)stolen, (unsigned long long)steals);
+    fprintf(stderr, "pool: scan read-ahead %llu KiB per column, requested %llu MiB in %llu ranges\n",
+            (unsigned long long)(pool->scan_bytes >> 10),
+            (unsigned long long)(atomic_load_explicit(&pool_scan_req_bytes, memory_order_relaxed) >> 20),
+            (unsigned long long)atomic_load_explicit(&pool_scan_req_ranges, memory_order_relaxed));
     for (uint32_t w = 0; w < W; w++) {
         const ray_pool_slot_t* s = &pool->slots[w];
         fprintf(stderr, "pool:  w%-3u own %12llu  stolen %12llu  steals %8llu\n", w,
@@ -442,8 +489,8 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         const char* e = getenv("RAY_POOL_STEAL");
         pool->steal = (e && *e) ? (strtol(e, NULL, 10) != 0) : 1;
         e = getenv("RAY_SCAN_PREFETCH");
-        long sa = (e && *e) ? strtol(e, NULL, 10) : 64;
-        pool->scan_ahead = sa > 0 ? (uint32_t)(sa > 4096 ? 4096 : sa) : 0;
+        long kib = (e && *e) ? strtol(e, NULL, 10) : 4096;
+        pool->scan_bytes = kib > 0 ? (size_t)(kib > (1L << 20) ? (1L << 20) : kib) << 10 : 0;
         e = getenv("RAY_POOL_TRACE");
         pool->trace = (e && *e && strtol(e, NULL, 10) != 0);
     }
@@ -496,7 +543,6 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         for (size_t w = 0; w < W; w++) {
             atomic_init(&pool->slots[w].range, 0);
             pool->slots[w].own = pool->slots[w].stolen = pool->slots[w].steals = 0;
-            pool->slots[w].pf_lo = pool->slots[w].pf_hi = 0;
         }
     }
 
@@ -607,6 +653,24 @@ void ray_pool_free(ray_pool_t* pool) {
     memset(pool, 0, sizeof(*pool));
 }
 
+/* Arm read-ahead for the window about to be published: the caller's
+ * registration, requested per ticket when the window covers exactly its
+ * rows (`total` elements, `grain` per ticket from `base`). */
+static void pool_scan_begin(ray_pool_t* pool, int64_t total, uint64_t base, int64_t grain) {
+    const ray_pool_scan_t* sc = (pool->scan_bytes && t_scan && t_scan->n) ? t_scan : NULL;
+    pool->scan_gen++;
+    pool->scan = sc;
+    pool->scan_auto = sc && pool->steal && grain > 0 && sc->rows == total;
+    pool->scan_base = base;
+    pool->scan_grain = grain;
+}
+
+/* The window has drained: nothing reads the registration any more. */
+static inline void pool_scan_end(ray_pool_t* pool) {
+    pool->scan = NULL;
+    pool->scan_auto = false;
+}
+
 /* --------------------------------------------------------------------------
  * ray_pool_dispatch
  * -------------------------------------------------------------------------- */
@@ -676,10 +740,7 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
      * the cursors only record the high-water mark. */
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
     /* Scan read-ahead for this window, published with the ranges. */
-    pool->scan = (pool->scan_ahead && t_scan && t_scan->n && t_scan->rows == total_elems) ? t_scan : NULL;
-    pool->scan_base = base;
-    pool->scan_end = base + n_tasks;
-    pool->scan_grain = grain;
+    pool_scan_begin(pool, total_elems, base, grain);
     if (pool->steal) {
         atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
         atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
@@ -744,6 +805,8 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         }
     }
 
+    pool_scan_end(pool);
+
     /* All tasks done, workers heading to sem_wait (no GC in loop).
      * Safe for main to modify worker heaps between dispatches. */
     atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
@@ -775,7 +838,7 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
-    pool->scan = NULL;   /* tasks are not row ranges */
+    pool_scan_begin(pool, -1, base, 0);   /* tasks are not row ranges */
     if (pool->steal) {
         atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
         atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
@@ -833,6 +896,7 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         }
     }
 
+    pool_scan_end(pool);
     atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
     ray_rc_sync = false;
@@ -931,6 +995,15 @@ ray_pool_t* ray_pool_get(void) {
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
+}
+
+/* Read-ahead from inside a task of the singleton's open dispatch (the only
+ * pool the executor's kernels run on).  Outside a dispatch `scan` is NULL. */
+void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end) {
+    ray_pool_t* pool = &g_pool;
+    const ray_pool_scan_t* s = pool->scan;
+    if (!s || s->rows != nrows) return;
+    pool_scan_ahead(pool, r, end);
 }
 
 /* --------------------------------------------------------------------------

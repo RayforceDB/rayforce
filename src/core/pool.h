@@ -64,19 +64,22 @@ typedef struct {
     uint64_t own;      /* tickets run out of the worker's own share */
     uint64_t stolen;   /* tickets run that were cut from other workers' tails */
     uint64_t steals;   /* successful steal operations */
-    uint32_t pf_lo, pf_hi;  /* scan read-ahead requested for tickets [pf_lo, pf_hi) */
 } ray_pool_slot_t;
 
-/* Mapped columns a graph scans, registered by the executor for the
- * dispatches it runs (ray_pool_scan_set).  A dispatch over exactly `rows`
- * elements is taken to scan them: each worker asks the kernel to read the
- * rows of the tasks ahead of the one it runs (see pool.c). */
+/* Scan read-ahead: the mapped columns a query reads, registered for the
+ * dispatches it runs (ray_pool_scan_set).  While a dispatch runs, each
+ * worker keeps the rows just ahead of the ones it reads requested from
+ * storage (see pool.c).  `gate`, when set, is the zone-index verdict of the
+ * query's filter: bit c clear means no row of [c << gate_log2,
+ * (c + 1) << gate_log2) can pass it, so nothing there is requested. */
 #define RAY_POOL_SCAN_MAX 32
 typedef struct {
-    const uint8_t* base[RAY_POOL_SCAN_MAX];
-    uint32_t       esz[RAY_POOL_SCAN_MAX];
-    uint32_t       n;
-    int64_t        rows;
+    const uint8_t*  base[RAY_POOL_SCAN_MAX];
+    uint32_t        esz[RAY_POOL_SCAN_MAX];
+    uint32_t        n;
+    int64_t         rows;
+    const uint64_t* gate;
+    uint8_t         gate_log2;
 } ray_pool_scan_t;
 
 /* Thread pool */
@@ -126,14 +129,18 @@ struct ray_pool {
     uint32_t           steal;
     uint32_t           trace;         /* RAY_POOL_TRACE: histogram at destroy */
     ray_pool_slot_t*    slots;         /* [n_workers+1], 64-byte aligned */
-    /* Scan read-ahead of the open window: the registered columns when the
-     * window covers their rows, else NULL; set by the dispatcher before
-     * the ranges are published. */
+    /* Scan read-ahead of the open dispatch: the registered columns (NULL
+     * when none), set by the dispatcher before the window is published and
+     * cleared once it has drained.  With scan_auto the dispatch covers
+     * exactly their rows, ticket base+i holding rows [i*grain, (i+1)*grain),
+     * and the pool requests ahead itself; otherwise only tasks that report
+     * their position (ray_pool_scan_at) do. */
     const ray_pool_scan_t* scan;
+    bool               scan_auto;
     uint64_t           scan_base;     /* first ticket of the window */
-    uint64_t           scan_end;      /* one past its last ticket */
     int64_t            scan_grain;    /* rows per ticket */
-    uint32_t           scan_ahead;    /* tickets read ahead (RAY_SCAN_PREFETCH) */
+    uint64_t           scan_gen;      /* dispatches so far: resets per-thread state */
+    size_t             scan_bytes;    /* bytes kept requested per column and worker */
     void*              slots_raw;     /* the allocation behind `slots` */
     _Atomic(uint64_t)  win_state;     /* 2*windows + (publishing ? 1 : 0) */
 
@@ -200,6 +207,14 @@ void ray_pool_free(ray_pool_t* pool);
  * clears); returns the previous registration so nested executions can
  * restore it.  The registration must outlive those dispatches. */
 const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan);
+const ray_pool_scan_t* ray_pool_scan_get(void);
+
+/* Called by a task about to read rows [r, end) of an `nrows`-row input:
+ * when that input is the registered one, keep the rows just ahead of r
+ * requested.  For dispatch_n tasks that walk row ranges of their own; a
+ * dispatch over exactly the registered rows needs no call (the pool
+ * requests per ticket).  Cheap when nothing is registered. */
+void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end);
 
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
 

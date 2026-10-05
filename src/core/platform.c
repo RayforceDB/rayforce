@@ -113,6 +113,15 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+static size_t vm_page_size(void) {
+    static size_t pg = 0;
+    if (pg == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        pg = (ps > 0) ? (size_t)ps : 4096;
+    }
+    return pg;
+}
+
 void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (!ptr || !size) return;
     /* madvise wants a page-aligned start.  One WILLNEED reads at most a
@@ -120,10 +129,28 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
      * large range is requested window by window: each call only queues its
      * reads, so the windows are all in flight together. */
     const size_t chunk = (size_t)256 << 10;
-    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)4095;
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(vm_page_size() - 1);
     uintptr_t end = (uintptr_t)ptr + size;
     for (; a < end; a += chunk)
         madvise((void*)a, end - a < chunk ? end - a : chunk, MADV_WILLNEED);
+}
+
+bool ray_vm_resident(const void* ptr, size_t size) {
+    if (!ptr || !size) return true;
+    size_t pg = vm_page_size();
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(pg - 1);
+    size_t pages = ((uintptr_t)ptr + size - a + pg - 1) / pg;
+    size_t samples = pages < 16 ? pages : 16;
+    for (size_t i = 0; i < samples; i++) {
+        size_t at = samples > 1 ? (pages - 1) * i / (samples - 1) : 0;
+#if defined(RAY_OS_MACOS)
+        char v = 0;
+#else
+        unsigned char v = 0;
+#endif
+        if (mincore((void*)(a + at * pg), pg, &v) != 0 || !(v & 1)) return false;
+    }
+    return true;
 }
 
 void ray_vm_release(void* ptr, size_t size) {
@@ -668,6 +695,10 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 }
 
+/* No cheap residency query here: report "not resident" so a read-ahead is
+ * still requested (PrefetchVirtualMemory skips resident pages itself). */
+bool ray_vm_resident(const void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
     /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
@@ -884,6 +915,7 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
 void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
+bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
