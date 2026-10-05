@@ -2,7 +2,7 @@
 
 ## Machine and commit
 
-- commit a8a3e5e6 (branch feat/compressed-columns, worktree compress-p0), release build
+- build commit a8a3e5e6 (the commit the release binaries were built at; branch feat/compressed-columns, worktree compress-p0; RESULTS.md and estimator changes are in later commits)
 - 8 cores (`nproc`), 62 GB RAM (`free -g`), kernel 6.8.0-100-generic
 - Store: local 10M splayed ClickBench table, /skull/clickbench/rfsplayed, 9 999 505 rows, 105 columns, symfile at `<db>/.sym`
 - The 100M store was unavailable (user ruling); no remote machine was used. The submission's parted store (/skull/tmp/rayforce_tests/current) does not exist locally and was not run.
@@ -84,18 +84,27 @@ Method: linear in row count (x10.0 for 9 999 505 -> 99 997 497 rows).
 | column data encoded | 0.867 GB | 8.67 GB | 8.6 GB est. | yes (+1%) |
 | ratio | 4.15x | | 4.1x | yes |
 | HASH indexes | 1.14 GB | 11.4 GB | 11.7 GB | yes (-2.5%) |
-| .sym | 1.207 GB | 12.1 GB | 11.3 GB | within 7% (symfile grows sub-linearly in distinct strings, not exactly linear; the 10M file is 1.07x of 1/10 of the 100M one) |
+| .sym | 1.207 GB | 12.1 GB (alt. 11.3 GB x 1.056 = 11.9 GB snapshot) | 11.3 GB | within 7% (symfile grows sub-linearly in distinct strings, not exactly linear; the 10M file is 1.07x of 1/10 of the 100M one) |
 
 Caveats: encoded size depends on chunk-level locality, so per-chunk behaviour is assumed unchanged at 10x rows (same data ordering, same chunk size; 100M column files are only more chunks). Index size is the hash table, close to linear in rows. The symfile and snapshot depend on distinct-string count, which is not guaranteed linear. Skip rates are ratios and do not extrapolate by row count; they are only valid if the 100M table has the same ordering. Decode time is extrapolated at 33-35 s only if per-block cost is flat.
 
-## Snapshot vs cold read
+## Snapshot vs cold read, parallel decode, working set
 
-- Cold read: could not be measured. `sudo -n tee /proc/sys/vm/drop_caches` failed ("a password is required"); not retried. Warm read of the symfile (page cache): 0.119 s for 1.2 GB.
-- Decode: 3.544 s single thread for 1.2 GB at 10M, about 360 MB/s; the warm read is 30x faster than the decode. The decode is therefore slower than any warm read and is bounded by CPU, not IO.
-- Extrapolated to 100M: snapshot about 12.0 GB held in heap, decode about 33-35 s single thread (same 360 MB/s), versus a cold read of an 11.3 GB symfile whose time depends on the disk (not measured here).
+```
+sym file=1207249691 fsst=664513344 ratio=1.82 snapshot=1274980311 decode_s=3.570 sym_parallel_decode_s=0.667 threads=8 count=8466329
+```
+
+- Cold read: could not be measured. `sudo -n tee /proc/sys/vm/drop_caches` failed (password required); not retried. Warm read of the symfile: 0.119 s for 1.2 GB.
+- Decode of all blocks: 3.57 s single thread (about 360 MB/s), 0.667 s on 8 threads (5.4x; blocks are independent, work-stealing over 130 blocks; threads = online CPUs, no knob).
+- 100M snapshot figure used throughout: 10x the measured 10M snapshot = 12.7 GB. The alternative 11.3 GB x 1.056 = 11.9 GB (spec symfile size times the measured snapshot/file ratio) differs by 7%; the 10x figure is used because it is the conservative one. Parallel decode at 100M, if per-block cost is flat and cores are 8: about 6.7 s (single-thread about 36 s).
+- Benchmark working set, measured on the 10M splayed store with the release ./rayforce (`-t 8`, one process, `.db.splayed.get` once, all 43 queries once, script built like run.sh splits queries.rfl; 43 results, no errors):
+  - `/usr/bin/time -v`: Maximum resident set size 5 028 388 kB (4.8 GiB), wall 2.57 s, 0 major faults (page cache was warm).
+  - `/proc/PID/status` polled every 20 ms: peak RssAnon 3 053 956 kB (heap, 2.9 GiB) and peak RssFile 2 009 884 kB (mmapped column pages, evictable). Sampled peaks are lower bounds and need not coincide.
+  - The RssAnon peak already includes whatever the engine holds for the symbol table today (not separated).
+  - Assumption: x10 for 100M, heap about 30.5 GB (not measured at 100M; heap does not necessarily scale linearly, e.g. hash-group state depends on distinct keys). File-backed column pages are counted as evictable page cache, not heap.
 
 ## Decisions
 
 - **P0 gate: PASS.** Column data is 4.15x smaller (3.60 GB -> 0.867 GB at 10M, in line with the spec's 4.1x at 100M), well above the 1.5x threshold; the whole-table breakdown and projection (1.85x columns only, 2.225x with sym FSST, 3.09x with index trimming) and per-query index use are reported. Caveat: 100M was not measured, only extrapolated.
-- **PI input:** keep RefererHash (194.9 MB, used by q41) and URLHash (195.9 MB, used by q42). No benchmark query consulted WatchID (508.4 MB), FUniqID (135.2 MB) or ClientEventTime (106.9 MB): candidates to stop persisting, 750.5 MB of 1 141.6 MB at 10M (66%), about 7.5 GB at 100M. Only 2 of 43 queries consult any index, once each, on a splayed load; on the parted load the submission uses, none.
-- **PS gate input:** snapshot is 1.275 GB at 10M (about 12 GB at 100M) with a 3.5 s (about 33 s) single-thread decode. On a 32 GB machine, the 12 GB snapshot plus the 8.6 GB encoded columns is about 20.6 GB, leaving about 11 GB for the working set and page cache; this fits but is tight, while a snapshot beside 36 GB of raw columns does not. A cold read time was not measured. Recommendation: block cache, not a full snapshot, because the snapshot costs 12 GB of heap (37% of a 32 GB machine) and a decode of tens of seconds at open, and queries touch only a small part of the 8.5M symbols. Revisit if a parallel decode brings the open cost under the cold read time.
+- **PI input:** the keep list (RefererHash 194.9 MB, used by q41; URLHash 195.9 MB, used by q42) applies to splayed deployments only. On the parted load the submission uses, no segment index is consulted, so every converter-added index (all five, 1.14 GB at 10M, about 11.4 GB at 100M) is droppable. On a splayed load, WatchID (508.4 MB), FUniqID (135.2 MB) and ClientEventTime (106.9 MB) were never consulted: 750.5 MB of 1 141.6 MB at 10M (66%), about 7.5 GB at 100M. Only 2 of 43 queries consult any index, once each. Predicate group names are 0-based: g_qN is 1-based query N+1 (g_q37..g_q42 are queries 38..43), so g_q40 (RefererHash predicate) is query 41 and g_q41 (URLHash predicate) is query 42, matching the two index consults.
+- **PS gate input:** the constraint that decides is memory headroom on 32 GB, not open latency. Open latency is small: parallel decode 0.667 s at 10M, about 6.7 s at 100M (single thread about 36 s). Memory: 12.7 GB snapshot at 100M against a measured 10M heap peak of 3.05 GB (RssAnon), about 30.5 GB at 100M by x10 assumption, which already contains today's symbol representation; adding a separate 12.7 GB snapshot on top would reach about 43 GB, far above 32 GB. Encoded columns (8.67 GB) are file-backed and evictable so they do not count as heap. Recommendation: block cache (decode symbols on demand, bounded memory). A full snapshot is acceptable only if it replaces the heap symbol table the engine already holds, in which case net heap change is about 0; this was not measured, and with a 30.5 GB extrapolated heap the headroom on 32 GB is already about 1.5 GB.

@@ -28,6 +28,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define MAX_PRED 256
 
@@ -238,6 +240,29 @@ static void process_splayed(const char* dir, const char* sym, const char* keep, 
     ray_release(t);
 }
 
+/* ---- parallel decode of retained blocks ---- */
+typedef struct {
+    ray_fsst_table_t* t; uint8_t* arena; uint32_t* eoff; uint32_t* elen; uint32_t* l; int n;
+} sym_blk_t;
+typedef struct { sym_blk_t* blks; int nblk; int next; int bad; } sym_par_t;
+
+static void* sym_par_worker(void* a) {
+    sym_par_t* P = a;
+    size_t dcap = 1 << 16; uint8_t* dbuf = xmalloc(dcap);
+    for (;;) {
+        int b = __atomic_fetch_add(&P->next, 1, __ATOMIC_RELAXED);
+        if (b >= P->nblk) break;
+        sym_blk_t* k = &P->blks[b];
+        for (int i = 0; i < k->n; i++) {
+            if ((size_t)k->l[i] > dcap) { while ((size_t)k->l[i] > dcap) dcap *= 2; free(dbuf); dbuf = xmalloc(dcap); }
+            int64_t d = ray_fsst_decode(k->t, k->arena + k->eoff[i], k->elen[i], dbuf, dcap);
+            if (d != (int64_t)k->l[i]) __atomic_store_n(&P->bad, 1, __ATOMIC_RELAXED);
+        }
+    }
+    free(dbuf);
+    return NULL;
+}
+
 /* ---- symfile estimate ---- */
 static void estimate_sym(const char* sym) {
     ray_sym_domain_t* dom = ray_sym_domain_open(sym);
@@ -256,6 +281,9 @@ static void estimate_sym(const char* sym) {
     uint8_t* dbuf = xmalloc(dcap);
     ray_fsst_table_t* t = xmalloc(sizeof *t);
     ray_fsst_index_t* ix = xmalloc(sizeof *ix);
+    int64_t nblk_max = (r.count + B - 1) / B;
+    sym_blk_t* keep = xmalloc(sizeof(sym_blk_t) * (size_t)(nblk_max ? nblk_max : 1));
+    int nkeep = 0;
     for (int64_t b0 = 0; b0 < r.count; b0 += B) {
         int64_t n = r.count - b0 < B ? r.count - b0 : B;
         for (int64_t i = 0; i < n; i++) {
@@ -290,10 +318,28 @@ static void estimate_sym(const char* sym) {
             if (d != (int64_t)l[i] || memcmp(dbuf, s[i], l[i]) != 0) { fprintf(stderr, "fsst mismatch at %lld\n", (long long)(b0 + i)); exit(3); }
         }
         dec_s += now_s() - t0;
+        sym_blk_t* k = &keep[nkeep++];
+        k->n = (int)n;
+        k->t = xmalloc(sizeof *t); memcpy(k->t, t, sizeof *t);
+        k->arena = xmalloc(used ? used : 1); memcpy(k->arena, arena, used);
+        k->eoff = xmalloc(sizeof(uint32_t) * (size_t)n); k->elen = xmalloc(sizeof(uint32_t) * (size_t)n);
+        k->l = xmalloc(sizeof(uint32_t) * (size_t)n);
+        for (int64_t i = 0; i < n; i++) { k->eoff[i] = (uint32_t)eoff[i]; k->elen[i] = elen[i]; k->l[i] = l[i]; }
     }
-    printf("sym\tfile=%lld\tfsst=%lld\tratio=%.2f\tsnapshot=%lld\tdecode_s=%.3f\tcount=%lld\n",
+    /* parallel decode of every retained block on all online CPUs */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
+    sym_par_t P = { keep, nkeep, 0, 0 };
+    pthread_t* th = xmalloc(sizeof(pthread_t) * (size_t)ncpu);
+    double tp = now_s();
+    for (long i = 0; i < ncpu; i++) pthread_create(&th[i], NULL, sym_par_worker, &P);
+    for (long i = 0; i < ncpu; i++) pthread_join(th[i], NULL);
+    double par_s = now_s() - tp;
+    if (P.bad) { fprintf(stderr, "parallel fsst decode length mismatch\n"); exit(3); }
+    for (int i = 0; i < nkeep; i++) { free(keep[i].t); free(keep[i].arena); free(keep[i].eoff); free(keep[i].elen); free(keep[i].l); }
+    free(keep); free(th);
+    printf("sym\tfile=%lld\tfsst=%lld\tratio=%.2f\tsnapshot=%lld\tdecode_s=%.3f\tsym_parallel_decode_s=%.3f\tthreads=%ld\tcount=%lld\n",
            (long long)raw_file, (long long)enc, enc ? (double)raw_file / (double)enc : 0,
-           (long long)snapshot, dec_s, (long long)r.count);
+           (long long)snapshot, dec_s, par_s, ncpu, (long long)r.count);
     free(s); free(l); free(elen); free(eoff); free(arena); free(dbuf); free(t); free(ix);
     ray_sym_domain_raw_unpin(dom);
     ray_sym_domain_release(dom);
