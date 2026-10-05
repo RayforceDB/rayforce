@@ -2228,6 +2228,7 @@ static test_result_t test_select_read_ahead_mapped(void) {
         { "(select {from:X by:g n:(count (distinct u)) asc:g})", AGG_ROUTE_NONE },
         { "(select {from:X by:[u g] c:(count v) take:3})", AGG_ROUTE_NONE },
         { "(select {from:X s:(sum (+ u v)) where:(> v 5)})", AGG_ROUTE_NONE },
+        { "(select {from:X where:(> v 970) asc:u take:5})", AGG_ROUTE_NONE },
     };
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
         char qm[512], qt[512];

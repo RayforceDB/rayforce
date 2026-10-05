@@ -55,6 +55,7 @@
 #include "ops/hash.h"      /* ray_hash_i64 */
 #include "ops/cdfuse.h"
 #include "table/sym.h"     /* RAY_IS_SYM */
+#include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
 
 /* Peak-footprint estimate used by the admission gate below: 32B/row for
  * phase 1's records plus up to 24B per (partition, key) pair in phase 2,
@@ -631,10 +632,10 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         .oom = 0, .rows_done = 0,
     };
     if (nrows >= 1024) {
-        bool kc = exec_col_cold(key_col), vc = exec_col_cold(val_col);
+        bool kc = ray_col_cold(key_col), vc = ray_col_cold(val_col);
         for (int i = 0; (kc || vc) && i < 1024; i++) {
-            if (kc) exec_want_row(key_col, cdf_sample_row(nrows, i));
-            if (vc) exec_want_row(val_col, cdf_sample_row(nrows, i));
+            if (kc) ray_col_want_row(key_col, cdf_sample_row(nrows, i));
+            if (vc) ray_col_want_row(val_col, cdf_sample_row(nrows, i));
         }
     }
     p1.dedup = cdf_sample_repetition(&p1);

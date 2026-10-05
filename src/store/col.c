@@ -1820,6 +1820,39 @@ ray_t* ray_col_mmap(const char* path) {
     return col_mmap_impl(path, NULL, false);
 }
 
+static size_t col_fixed_esz(const ray_t* col) {
+    if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR ||
+        col->len <= 0) return 0;
+    return ray_sym_elem_size(col->type, col->attrs);
+}
+
+bool ray_col_cold(ray_t* col) {
+    size_t esz = col_fixed_esz(col);
+    return esz && !ray_vm_resident(ray_data(col), (size_t)col->len * esz);
+}
+
+void ray_col_want_row(ray_t* col, int64_t row) {
+    size_t esz = ray_sym_elem_size(col->type, col->attrs);
+    ray_vm_advise_willneed((uint8_t*)ray_data(col) + (size_t)row * esz, esz);
+}
+
+void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
+    size_t esz = col_fixed_esz(col);
+    if (!esz || n <= 0) return;
+    /* A few rows: requesting costs less than probing whether to. */
+    if (n > 64 && !ray_col_cold(col)) return;
+    const uint8_t* base = (const uint8_t*)ray_data(col);
+    uintptr_t last = UINTPTR_MAX;
+    for (int64_t i = 0; i < n; i++) {
+        if (idx[i] < 0 || idx[i] >= col->len) continue;
+        const uint8_t* p = base + (size_t)idx[i] * esz;
+        if (((uintptr_t)p >> 12) == last) continue;
+        last = (uintptr_t)p >> 12;
+        ray_vm_advise_willneed((void*)p, esz);
+    }
+}
+
 ray_t* ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* dom) {
     return col_mmap_impl(path, dom, true);
 }

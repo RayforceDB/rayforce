@@ -42,6 +42,7 @@
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
+#include "store/col.h"    /* ray_col_want_rows — gather read-ahead */
 #include "mem/heap.h"
 #include "core/pool.h"
 #include "mem/sys.h"
@@ -1529,6 +1530,7 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
         if (RAY_IS_ERR(result)) return result;
         result->len = n;
         uint8_t esz = (uint8_t)RAY_SYM_ELEM(w);
+        ray_col_want_rows(vec, idx, n);   /* scattered rows of a cold mapped column */
         gbi_ctx_t gc = { .src = (const char*)ray_data(vec),
                          .dst = (char*)ray_data(result),
                          .idx = idx, .esz = esz };
@@ -1569,6 +1571,7 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     if (RAY_IS_ERR(result)) return result;
     result->len = n;
     uint8_t esz = ray_type_sizes[type];
+    ray_col_want_rows(vec, idx, n);   /* scattered rows of a cold mapped column */
     /* Typed gather — compiler constant esz enables vectorization, alias-safe;
      * pool-parallel over disjoint output ranges for large gathers. */
     gbi_ctx_t gc = { .src = (const char*)ray_data(vec),

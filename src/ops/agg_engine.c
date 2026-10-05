@@ -8,6 +8,7 @@
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
 #include "table/sym.h"    /* ray_read_sym */
+#include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include <stdlib.h>
 #include <math.h>
@@ -5256,10 +5257,10 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
     if (pstep < 1) pstep = 1;
     if (!sel)
         for (uint32_t k = 0; k < n_keys; k++)
-            if (exec_col_cold(key_cols[k]))
+            if (ray_col_cold(key_cols[k]))
                 for (int64_t i = 0; i < AGG_TS_PRE_SAMPLE2; i++) {
                     int64_t pos = i * pstep + (int64_t)(ray_hash_i64(i + 7919) % (uint64_t)pstep);
-                    if (pos < nrows) exec_want_row(key_cols[k], pos);
+                    if (pos < nrows) ray_col_want_row(key_cols[k], pos);
                 }
     int64_t d = 0, n = 0;
     bool declined = false;
@@ -5342,9 +5343,9 @@ static double agg_ts_estimate(ray_pool_t* pool, ray_t** key_cols, const void** k
     };
     if (!sel)
         for (uint32_t k = 0; k < n_keys; k++)
-            if (exec_col_cold(key_cols[k]))
+            if (ray_col_cold(key_cols[k]))
                 for (int64_t i = 0; i < AGG_TS_SAMPLE; i++)
-                    exec_want_row(key_cols[k],
+                    ray_col_want_row(key_cols[k],
                         i * ctx.step + (int64_t)(ray_hash_i64(i) % (uint64_t)ctx.step));
     if (ray_pool_par_dispatch_ok(pool, AGG_TS_SAMPLE, 1))
         ray_pool_dispatch_n(pool, agg_ts_sample_fn, &ctx, AGG_TS_SAMPLE_TASKS);
@@ -6086,9 +6087,9 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     uint32_t gid = 0;
     int groups = 0, unchanged = 0;
     int64_t step = rows / SAMPLES;
-    if (exec_col_cold(keys[0]))
+    if (ray_col_cold(keys[0]))
         for (int i = 0; i < SAMPLES; i++)
-            exec_want_row(keys[0], i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+            ray_col_want_row(keys[0], i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
     for (int i = 0; i < SAMPLES; i++) {
         uint64_t jitter = ray_hash_i64(i);
         int64_t row = i * step + jitter % step;
@@ -6514,8 +6515,8 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
         int64_t samples = nrows < AGG_FIRSTN_SAMPLES ? nrows : AGG_FIRSTN_SAMPLES;
         int64_t step = nrows / samples, hits = 0;
         for (uint32_t k = 0; k < n_keys; k++)
-            if (exec_col_cold(key_cols[k]))
-                for (int64_t i = 0; i < samples; i++) exec_want_row(key_cols[k], i * step);
+            if (ray_col_cold(key_cols[k]))
+                for (int64_t i = 0; i < samples; i++) ray_col_want_row(key_cols[k], i * step);
         for (int64_t i = 0; i < samples; i++) {
             for (uint32_t k = 0; k < n_keys; k++)
                 kv[k] = agg_read_key_i64(key_cols[k], key_data[k], i * step);
@@ -6847,13 +6848,13 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (dense_par_ok && !sel && ext->n_keys == 1) {
             const void* data = ray_data(key_cols[0]);
             double touched_slots = 0;
-            if (exec_col_cold(key_cols[0]))
+            if (ray_col_cold(key_cols[0]))
                 for (uint32_t w = 0; w < dense_workers; w++) {
                     int64_t start = nrows / dense_workers * w;
                     int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
                     int64_t samples = end - start < 1024 ? end - start : 1024;
                     for (int64_t i = 0; i < samples; i++)
-                        exec_want_row(key_cols[0],
+                        ray_col_want_row(key_cols[0],
                             start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1)));
                 }
             for (uint32_t w = 0; w < dense_workers; w++) {

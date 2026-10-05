@@ -997,14 +997,6 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
 void exec_scan_init(ray_pool_scan_t* s);
 void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col);
 
-/* Sampled reads.  A sampler that reads scattered rows of a column waits on
- * one page fault per row when the column is mapped and not cached; asking
- * for every sampled row's page first (exec_want_row) turns that into about
- * one wait.  exec_col_cold says whether that pre-pass is worth running:
- * true only for a mapped fixed-width column whose pages are not resident. */
-bool exec_col_cold(ray_t* col);
-void exec_want_row(ray_t* col, int64_t row);
-
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred);
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit);
 /* The one `where:` rule (see filter.c): consumes `pred`, returns an owned
