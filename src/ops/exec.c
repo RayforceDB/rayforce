@@ -4248,6 +4248,19 @@ void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col) {
     s->n++;
 }
 
+bool exec_col_cold(ray_t* col) {
+    if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR ||
+        col->len <= 0) return false;
+    size_t esz = ray_sym_elem_size(col->type, col->attrs);
+    return esz && !ray_vm_resident(ray_data(col), (size_t)col->len * esz);
+}
+
+void exec_want_row(ray_t* col, int64_t row) {
+    size_t esz = ray_sym_elem_size(col->type, col->attrs);
+    ray_vm_advise_willneed((uint8_t*)ray_data(col) + (size_t)row * esz, esz);
+}
+
 /* The graph's scanned columns, when they are mapped (see exec_scan_add_col);
  * NULL when no scan reads a mapped column. */
 static const ray_pool_scan_t* exec_scan_columns(ray_graph_t* g, ray_pool_scan_t* s) {
