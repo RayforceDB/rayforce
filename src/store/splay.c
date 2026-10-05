@@ -1004,6 +1004,10 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                               : ray_col_load_dom(path, dom);
         if (use_mmap && col && RAY_IS_ERR(col) &&
             strcmp(ray_err_code(col), "nyi") == 0 && ray_error_msg() == NULL) {
+            /* Contract: the generation-0 mmap refusals that the plain loader
+             * can still serve (col.c) are message-less "nyi"; a "nyi" with a
+             * message is final (a generation-2 file on a big-endian host)
+             * and must reach the caller unchanged. */
             /* ray_release on an error object is a no-op (rayforce.h:180);
              * must use ray_error_free to actually reclaim the error
              * before retrying with the non-mmap loader. */
