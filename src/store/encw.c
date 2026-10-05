@@ -21,8 +21,6 @@
  *   SOFTWARE.
  */
 #include "store/encw.h"
-#include "store/col.h"
-#include "table/sym.h"
 #include "vec/str.h"
 #include "ops/idxop.h"      /* ray_i128_add */
 #include <stdatomic.h>
@@ -30,6 +28,12 @@
 
 #define ENC_F64_CANON 0x7FF8000000000000ull
 #define ENC_F32_CANON 0x7FC00000ull
+/* The null NaN patterns are the engine's NULL_F64 / NULL_F32 bits. */
+static bool canon_matches(void) {
+    double d = NULL_F64; float f = NULL_F32; uint64_t b64; uint32_t b32;
+    memcpy(&b64, &d, 8); memcpy(&b32, &f, 4);
+    return b64 == ENC_F64_CANON && b32 == ENC_F32_CANON;
+}
 
 bool ray_encw_type_has_dict(int8_t t) {
     return t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
@@ -113,6 +117,7 @@ out:
 /* ---- F32 / F64: RAW or CONST, NaN nulls in the bitmap, bit-restore trailer ---- */
 static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
                             ray_encw_vec_t* o) {
+    if (!canon_matches()) return RAY_ERR_RANGE;
     const bool f32 = type == RAY_F32;
     const size_t esz = f32 ? 4 : 8;
     const uint64_t canon = f32 ? ENC_F32_CANON : ENC_F64_CANON;
@@ -148,7 +153,6 @@ static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
     bool eq = true;
     for (int i = 1; i < n && eq; i++) if (bits[i] != bits[0]) eq = false;
     ray_err_t err;
-    if (o->n_nulls > 0 && (err = put(o, nullmap, 128)) != RAY_OK) return err;
     uint64_t raw_bytes = ray_enc_pad8((uint64_t)n * esz);
     /* The trailer's size counts in every encoding's estimate (spec "Floats"). */
     uint64_t tb = nt ? 8 + ray_enc_pad8(2ull * (uint64_t)nt) + ray_enc_pad8((uint64_t)nt * esz) : 0;
@@ -157,8 +161,10 @@ static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
         (forced == RAY_ENC_CONST ? eq
          : forced == RAY_ENC_RAW ? false
          : (eq && (8 + tb) * 8 <= (raw_bytes + tb) * 7));
-    if (forced >= 0 && forced != RAY_ENC_RAW && forced != RAY_ENC_CONST) return RAY_ERR_NYI;
+    if (o->n_nulls < n && forced >= 0 && forced != RAY_ENC_RAW && forced != RAY_ENC_CONST)
+        return RAY_ERR_NYI;
     if (forced == RAY_ENC_CONST && !use_const) return RAY_ERR_NYI;
+    if (o->n_nulls > 0 && (err = put(o, nullmap, 128)) != RAY_OK) return err;
     if (use_const) {
         o->desc.encoding = RAY_ENC_CONST;
         if ((err = put(o, &bits[0], esz)) != RAY_OK || (err = pad8(o)) != RAY_OK) return err;
@@ -201,7 +207,8 @@ static ray_err_t encw_guid(const void* data, int64_t start, int n, ray_encw_vec_
     uint64_t raw = (uint64_t)n * 16;
     ray_err_t err;
     int forced = atomic_load(&g_encw_force);
-    if (forced >= 0 && forced != RAY_ENC_RAW && !(forced == RAY_ENC_CONST && eq)) return RAY_ERR_NYI;
+    if (o->n_nulls < n && forced >= 0 && forced != RAY_ENC_RAW && !(forced == RAY_ENC_CONST && eq))
+        return RAY_ERR_NYI;
     if (o->n_nulls == n || (forced == RAY_ENC_CONST) || (forced < 0 && eq && 16 * 8 <= raw * 7)) {
         o->desc.encoding = RAY_ENC_CONST;
         err = put(o, o->n_nulls == n ? zero : p, 16);
@@ -234,7 +241,8 @@ static ray_err_t encw_str(const void* data, const char* pool, int64_t start, int
     ray_err_t err;
     o->desc.flags |= RAY_ENC_STAT_ABSENT;
     int forced = atomic_load(&g_encw_force);
-    if (forced >= 0 && forced != RAY_ENC_RAW && !(forced == RAY_ENC_CONST && eq)) return RAY_ERR_NYI;
+    if (o->n_nulls < n && forced >= 0 && forced != RAY_ENC_RAW && !(forced == RAY_ENC_CONST && eq))
+        return RAY_ERR_NYI;
     if (o->n_nulls == n || forced == RAY_ENC_CONST || (forced < 0 && eq && cst * 8 <= raw * 7)) {
         o->desc.encoding = RAY_ENC_CONST;
         uint32_t hdr[2] = { o->n_nulls == n ? 0 : s[0].len, 0 };

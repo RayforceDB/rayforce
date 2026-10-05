@@ -29,7 +29,6 @@
 #include "store/encw.h"
 #include "vec/str.h"
 #include "ops/idxop.h"
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +36,7 @@
 #define ENCFMT_TMP "/tmp/rayforce_encfmt"
 
 static void encfmt_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ENCFMT_TMP); }
-static void encfmt_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCFMT_TMP); }
+static void encfmt_teardown(void) { ray_encw_test_force(-1); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCFMT_TMP); }
 
 static void hdr_set(uint8_t h[32], uint8_t order, uint32_t aux0) {
     memset(h, 0, 32);
@@ -172,12 +171,9 @@ static test_result_t test_vec_i64_nulls_bitmap_and_sum(void) {
     TEST_ASSERT_EQ_U(v.payload.p[125], 0x01);          /* row 1000 = byte 125 bit 0 */
     TEST_ASSERT_EQ_I(v.desc.min, 7);
     TEST_ASSERT_EQ_I(v.desc.max, INT64_MAX);
-    /* sum = 2*INT64_MAX + 1020*7 as a signed 128-bit value */
-    int64_t hi = 0; uint64_t lo = 0;
-    ray_i128_add(&hi, &lo, INT64_MAX); ray_i128_add(&hi, &lo, INT64_MAX);
-    for (int i = 0; i < 1020; i++) ray_i128_add(&hi, &lo, 7);
-    TEST_ASSERT_EQ_I(v.sum_hi, hi);
-    TEST_ASSERT_EQ_U(v.sum_lo, lo);
+    /* 2*INT64_MAX + 1020*7 = 2^64 + 7138 */
+    TEST_ASSERT_EQ_I(v.sum_hi, 1);
+    TEST_ASSERT_EQ_U(v.sum_lo, 7138);
     ray_encw_vec_free(&v);
     PASS();
 }
@@ -305,7 +301,9 @@ static test_result_t test_vec_str_raw_and_const(void) {
     ray_t* s = str_vec3("", "short", "a very long string 1");    /* 0, 5, 20 bytes */
     const char* pool = s->str_pool ? (const char*)ray_data(s->str_pool) : NULL;
     ray_encw_vec_t v; ray_encw_vec_init(&v);
-    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_STR, 0, ray_data(s), pool, 0, 3, NULL, &v), RAY_OK);
+    ray_err_t rc = ray_encw_vec(RAY_STR, 0, ray_data(s), pool, 0, 3, NULL, &v);
+    if (rc != RAY_OK) { ray_release(s); ray_encw_vec_free(&v); }
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
     TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_RAW);
     TEST_ASSERT_EQ_I(v.desc.n_nulls, 1);
     TEST_ASSERT_EQ_I(v.desc.flags, RAY_ENC_STAT_ABSENT);
@@ -328,7 +326,9 @@ static test_result_t test_vec_str_raw_and_const(void) {
 
     s = str_vec3("same long string here", "same long string here", "same long string here");
     pool = (const char*)ray_data(s->str_pool);
-    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_STR, 0, ray_data(s), pool, 0, 3, NULL, &v), RAY_OK);
+    rc = ray_encw_vec(RAY_STR, 0, ray_data(s), pool, 0, 3, NULL, &v);
+    if (rc != RAY_OK) { ray_release(s); ray_encw_vec_free(&v); }
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
     TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
     TEST_ASSERT_EQ_U(v.str_pooled, 3 * 21);                   /* once per occurrence */
     TEST_ASSERT_EQ_U(v.payload.len, 8 + 24);
@@ -366,6 +366,185 @@ static test_result_t test_vec_bool_rle(void) {
     PASS();
 }
 
+#define RT(call) do { test_result_t r_ = (call); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Decode the codec body of a vector payload and compare with what the
+ * loader fed the encoder (null slots hold the fill). */
+static test_result_t roundtrip(int8_t type, uint8_t attrs, const void* data, int n,
+                               const ray_enc_dict_t* dict, int force, int want_enc) {
+    ray_encw_vec_t v; ray_encw_vec_init(&v);
+    ray_encw_test_force(force);
+    ray_err_t rc = ray_encw_vec(type, attrs, data, NULL, 0, n, dict, &v);
+    ray_encw_test_force(-1);
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, want_enc);
+    ray_enc_input_t* in = malloc(sizeof *in);
+    uint64_t* out = malloc(RAY_ENC_VEC * sizeof *out);
+    TEST_ASSERT_TRUE(in && out);
+    TEST_ASSERT_TRUE(ray_enc_load(data, type, attrs, 0, n, in));
+    size_t off = (ray_enc_has_bitmap(type) && v.n_nulls > 0) ? 128 : 0;
+    int64_t used = ray_enc_read(v.payload.p + off, v.payload.len - off, v.desc.encoding,
+                                v.desc.width, n, in->k, RAY_ENC_SLOT_TOP, 0, dict, out);
+    TEST_ASSERT_TRUE(used > 0);
+    int bad = -1;
+    for (int i = 0; i < n && bad < 0; i++) if (out[i] != in->bits[i]) bad = i;
+    TEST_ASSERT_EQ_I(bad, -1);
+    free(in); free(out);
+    ray_encw_vec_free(&v);
+    PASS();
+}
+
+static test_result_t test_vec_roundtrip_codecs(void) {
+    int32_t a[RAY_ENC_VEC]; int64_t b[RAY_ENC_VEC]; uint8_t bo[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) a[i] = 5000 + (i % 64);
+    a[7] = NULL_I32; a[900] = NULL_I32;
+    RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, NULL, RAY_ENC_RAW, RAY_ENC_RAW));
+    RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, NULL, -1, RAY_ENC_FOR_BP));
+    RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, NULL, RAY_ENC_FOR_BP, RAY_ENC_FOR_BP));
+    for (int i = 0; i < RAY_ENC_VEC; i++) a[i] = 42;
+    RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, NULL, -1, RAY_ENC_CONST));
+    for (int i = 0; i < RAY_ENC_VEC; i++) b[i] = 1000 + (int64_t)i * 3;
+    b[5] = NULL_I64;
+    RT(roundtrip(RAY_I64, 0, b, RAY_ENC_VEC, NULL, RAY_ENC_DELTA_BP, RAY_ENC_DELTA_BP));
+    for (int i = 0; i < RAY_ENC_VEC; i++) b[i] = (int64_t)(i / 100) * 1000003;
+    RT(roundtrip(RAY_I64, 0, b, RAY_ENC_VEC, NULL, RAY_ENC_RLE, RAY_ENC_RLE));
+    for (int i = 0; i < RAY_ENC_VEC; i++) bo[i] = (uint8_t)((i / 100) & 1);
+    RT(roundtrip(RAY_BOOL, 0, bo, RAY_ENC_VEC, NULL, -1, RAY_ENC_RLE));
+    RT(roundtrip(RAY_U8, 0, bo, RAY_ENC_VEC, NULL, RAY_ENC_RAW, RAY_ENC_RAW));
+    PASS();
+}
+
+static test_result_t test_vec_roundtrip_dict(void) {
+    int32_t a[RAY_ENC_VEC];
+    static const int32_t vals[3] = { 10, 1000000, 2000000000 };
+    uint64_t dv[3] = { 10, 1000000, 2000000000 };
+    ray_enc_dict_t dict = { dv, 3 };
+    for (int i = 0; i < RAY_ENC_VEC; i++) a[i] = vals[(i * 7) % 3 == 0 ? 0 : (i % 2) + 1];
+    RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, &dict, -1, RAY_ENC_DICT));
+    RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, &dict, RAY_ENC_DICT, RAY_ENC_DICT));
+    /* a value outside the dictionary cannot be forced onto DICT */
+    ray_encw_vec_t v; ray_encw_vec_init(&v);
+    a[3] = 11;
+    ray_encw_test_force(RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_I32, 0, a, NULL, 0, RAY_ENC_VEC, &dict, &v), RAY_ERR_NYI);
+    ray_encw_test_force(-1);
+    /* SYM and BOOL ignore a dictionary */
+    uint8_t sy[RAY_ENC_VEC], bo[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) { sy[i] = (uint8_t)(1 + (i * 7) % 3); bo[i] = (uint8_t)(i & 1); }
+    uint64_t sd[3] = { 1, 2, 3 }, bd[2] = { 0, 1 };
+    ray_enc_dict_t sdict = { sd, 3 }, bdict = { bd, 2 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_SYM, RAY_SYM_W8, sy, NULL, 0, RAY_ENC_VEC, &sdict, &v), RAY_OK);
+    TEST_ASSERT_TRUE(v.desc.encoding != RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_BOOL, 0, bo, NULL, 0, RAY_ENC_VEC, &bdict, &v), RAY_OK);
+    TEST_ASSERT_TRUE(v.desc.encoding != RAY_ENC_DICT);
+    ray_encw_vec_free(&v);
+    PASS();
+}
+
+static test_result_t test_vec_sums_literal(void) {
+    ray_encw_vec_t v; ray_encw_vec_init(&v);
+    int32_t neg[3] = { -5, -6, 3 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_I32, 0, neg, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.sum_hi, -1);
+    TEST_ASSERT_EQ_U(v.sum_lo, 0xFFFFFFFFFFFFFFF8ull);        /* -8 */
+    int32_t tm[3] = { 1000, 2000, NULL_I32 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_TIME, 0, tm, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.sum_hi, 0);
+    TEST_ASSERT_EQ_U(v.sum_lo, 3000);
+    int32_t dt[3] = { 1, 2, 3 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_DATE, 0, dt, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.sum_hi, 0);
+    TEST_ASSERT_EQ_U(v.sum_lo, 0);
+    int64_t ts[3] = { 1, 2, 3 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_TIMESTAMP, 0, ts, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.sum_hi, 0);
+    TEST_ASSERT_EQ_U(v.sum_lo, 0);
+    ray_encw_vec_free(&v);
+    PASS();
+}
+
+static test_result_t test_vec_f32_trailer(void) {
+    float d[4]; uint32_t odd = 0x7FC00001u;
+    d[0] = 1.5f; d[1] = NULL_F32; memcpy(&d[2], &odd, 4); d[3] = -2.0f;
+    ray_encw_vec_t v; ray_encw_vec_init(&v);
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_F32, 0, d, NULL, 0, 4, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(v.desc.n_nulls, 2);
+    TEST_ASSERT_EQ_I(v.desc.flags, RAY_ENC_DESC_TRAILER);
+    TEST_ASSERT_EQ_U((uint64_t)v.desc.min, f64_bits(-2.0));   /* widened to double */
+    TEST_ASSERT_EQ_U((uint64_t)v.desc.max, f64_bits(1.5));
+    /* bitmap 128 | RAW 4*4 | trailer: count 8, position 8, raw 8 */
+    TEST_ASSERT_EQ_U(v.payload.len, 128 + 16 + 8 + 8 + 8);
+    const uint8_t* p = v.payload.p;
+    TEST_ASSERT_EQ_U(p[0], 0x06);
+    float fill; memcpy(&fill, p + 128 + 4, 4);
+    TEST_ASSERT_TRUE(fill == -2.0f);
+    uint16_t cnt, pos; uint32_t raw;
+    memcpy(&cnt, p + 144, 2); memcpy(&pos, p + 152, 2); memcpy(&raw, p + 160, 4);
+    TEST_ASSERT_EQ_I(cnt, 1);
+    TEST_ASSERT_EQ_I(pos, 2);
+    TEST_ASSERT_EQ_U(raw, odd);
+    ray_encw_vec_free(&v);
+    PASS();
+}
+
+static test_result_t test_vec_all_null_kinds(void) {
+    ray_encw_vec_t v; ray_encw_vec_init(&v);
+    ray_t* s = str_vec3("", "", "");
+    ray_err_t rc = ray_encw_vec(RAY_STR, 0, ray_data(s), NULL, 0, 3, NULL, &v);
+    ray_release(s);
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(v.desc.n_nulls, 3);
+    TEST_ASSERT_EQ_U(v.payload.len, 8);
+    uint8_t g[4][16]; memset(g, 0, sizeof g);
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_GUID, 0, g, NULL, 0, 4, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(v.desc.n_nulls, 4);
+    TEST_ASSERT_EQ_U(v.payload.len, 16);
+    double f[3] = { NULL_F64, NULL_F64, NULL_F64 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_F64, 0, f, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(v.desc.n_nulls, 3);
+    TEST_ASSERT_EQ_I(v.desc.flags, RAY_ENC_STAT_ABSENT);
+    TEST_ASSERT_EQ_U(v.payload.len, 128 + 8);
+    /* a forced non-RAW/CONST encoding leaves an all-null vector CONST */
+    ray_encw_test_force(RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_F64, 0, f, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_GUID, 0, g, NULL, 0, 4, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
+    ray_encw_test_force(-1);
+    /* all-null with a non-canonical NaN: the raw bits go to the trailer */
+    uint64_t odd = 0x7FF8000000000001ull;
+    double h[3]; h[0] = NULL_F64; memcpy(&h[1], &odd, 8); h[2] = NULL_F64;
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_F64, 0, h, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(v.desc.flags, RAY_ENC_STAT_ABSENT | RAY_ENC_DESC_TRAILER);
+    TEST_ASSERT_EQ_U(v.payload.len, 128 + 8 + 8 + 8 + 8);
+    uint64_t raw; memcpy(&raw, v.payload.p + 128 + 8 + 16, 8);
+    TEST_ASSERT_EQ_U(raw, odd);
+    ray_encw_vec_free(&v);
+    PASS();
+}
+
+static test_result_t test_vec_sym_w16_w32(void) {
+    ray_encw_vec_t v; ray_encw_vec_init(&v);
+    uint16_t d16[3] = { 0, 5, 1000 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_SYM, RAY_SYM_W16, d16, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.n_nulls, 1);
+    TEST_ASSERT_EQ_I(v.desc.min, 5);
+    TEST_ASSERT_EQ_I(v.desc.max, 1000);
+    uint32_t d32[3] = { 7, 0, 70000 };
+    TEST_ASSERT_EQ_I(ray_encw_vec(RAY_SYM, RAY_SYM_W32, d32, NULL, 0, 3, NULL, &v), RAY_OK);
+    TEST_ASSERT_EQ_I(v.desc.n_nulls, 1);
+    TEST_ASSERT_EQ_I(v.desc.min, 7);
+    TEST_ASSERT_EQ_I(v.desc.max, 70000);
+    ray_encw_vec_free(&v);
+    RT(roundtrip(RAY_SYM, RAY_SYM_W16, d16, 3, NULL, RAY_ENC_RAW, RAY_ENC_RAW));
+    PASS();
+}
+
 const test_entry_t encfmt_entries[] = {
     { "encfmt/discriminator_pairs",       test_discriminator_pairs,       encfmt_setup, encfmt_teardown },
     { "encfmt/discriminator_cross_pairs", test_discriminator_cross_pairs, encfmt_setup, encfmt_teardown },
@@ -382,5 +561,11 @@ const test_entry_t encfmt_entries[] = {
     { "encfmt/vec_str_raw_and_const",       test_vec_str_raw_and_const,       encfmt_setup, encfmt_teardown },
     { "encfmt/vec_sym_w8_inband",           test_vec_sym_w8_inband,           encfmt_setup, encfmt_teardown },
     { "encfmt/vec_bool_rle",                test_vec_bool_rle,                encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_roundtrip_codecs",        test_vec_roundtrip_codecs,        encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_roundtrip_dict",          test_vec_roundtrip_dict,          encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_sums_literal",            test_vec_sums_literal,            encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_f32_trailer",             test_vec_f32_trailer,             encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_all_null_kinds",          test_vec_all_null_kinds,          encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_sym_w16_w32",             test_vec_sym_w16_w32,             encfmt_setup, encfmt_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -23,13 +23,12 @@
 #ifndef RAY_ENCW_H
 #define RAY_ENCW_H
 
-#include <stdio.h>
 #include <rayforce.h>
 #include "store/enc.h"
 #include "store/encfmt.h"
 
 typedef struct {
-    ray_enc_desc_t desc;
+    ray_enc_desc_t desc;        /* payload_off is set by the column writer */
     ray_enc_buf_t  payload;
     int            n_nulls;
     bool           has_stats;
@@ -45,6 +44,10 @@ ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char*
 bool      ray_encw_type_has_dict(int8_t type);
 bool      ray_encw_type_summable(int8_t type);
 bool      ray_encw_type_supported(int8_t type);
+/* Test hook: every following vector uses top-level encoding `enc` where it
+ * is legal for the type and applicable to the values (all-null vectors stay
+ * CONST); -1 restores selection.  A forced encoding that is not applicable
+ * fails the vector with RAY_ERR_NYI. */
 void      ray_encw_test_force(int enc);
 
 #endif /* RAY_ENCW_H */
