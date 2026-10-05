@@ -190,6 +190,47 @@ static test_result_t test_load_offset_start(void) {
     PASS();
 }
 
+static test_result_t test_sizes_raw_const(void) {
+    TEST_ASSERT_EQ_I(ray_enc_size_raw(1024, 16), 2048);
+    TEST_ASSERT_EQ_I(ray_enc_size_raw(3, 16), 8);      /* 6 bytes padded to 8 */
+    TEST_ASSERT_EQ_I(ray_enc_size_raw(1, 64), 8);
+    TEST_ASSERT_EQ_I(ray_enc_size_const(), 8);
+    PASS();
+}
+
+static test_result_t test_for_width_signed_extremes(void) {
+    uint64_t v[3] = { (uint64_t)(INT64_MIN + 1), (uint64_t)INT64_MAX, 0 };
+    ray_enc_kind_t k = { 64, true };
+    uint64_t base;
+    int w = ray_enc_for_width(v, 3, k, &base);
+    TEST_ASSERT_EQ_U(base, (uint64_t)(INT64_MIN + 1));  /* native min */
+    TEST_ASSERT_EQ_I(w, 64);                              /* range 2^64 - 2 */
+    TEST_ASSERT_EQ_I(ray_enc_size_for(w), 8 + 8192);
+    PASS();
+}
+
+static test_result_t test_for_width_narrow(void) {
+    uint64_t v[4] = { 0xFFFE, 0xFFFF, 0x0000, 0x0001 };  /* -2,-1,0,1 as I16 */
+    ray_enc_kind_t k = { 16, true };
+    uint64_t base;
+    int w = ray_enc_for_width(v, 4, k, &base);
+    TEST_ASSERT_EQ_U(base, 0xFFFE);
+    TEST_ASSERT_EQ_I(w, 2);                               /* residuals 0..3 */
+    PASS();
+}
+
+static test_result_t test_delta_width_sorted(void) {
+    static uint64_t v[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(1000000 + 3 * i);
+    ray_enc_kind_t k = { 64, true };
+    uint64_t dbase;
+    int w = ray_enc_delta_width(v, RAY_ENC_VEC, k, &dbase);
+    TEST_ASSERT_EQ_U(dbase, 3 * 16);                      /* lane stride L=16 */
+    TEST_ASSERT_EQ_I(w, 0);
+    TEST_ASSERT_EQ_I(ray_enc_size_delta(64, 0), 8 + 8 * 16);
+    PASS();
+}
+
 const test_entry_t enc_entries[] = {
     { "enc/pack_roundtrip_all_widths", test_pack_roundtrip_all_widths, enc_setup, enc_teardown },
     { "enc/pack_layout_t8_w1",         test_pack_layout_t8_w1,         enc_setup, enc_teardown },
@@ -202,5 +243,9 @@ const test_entry_t enc_entries[] = {
     { "enc/load_sym_w8_inband",        test_load_sym_w8_inband,        enc_setup, enc_teardown },
     { "enc/stats_runs_and_equal",      test_stats_runs_and_equal,      enc_setup, enc_teardown },
     { "enc/load_offset_start",         test_load_offset_start,         enc_setup, enc_teardown },
+    { "enc/sizes_raw_const",            test_sizes_raw_const,            enc_setup, enc_teardown },
+    { "enc/for_width_signed_extremes",  test_for_width_signed_extremes,  enc_setup, enc_teardown },
+    { "enc/for_width_narrow",           test_for_width_narrow,           enc_setup, enc_teardown },
+    { "enc/delta_width_sorted",         test_delta_width_sorted,         enc_setup, enc_teardown },
     { NULL, NULL, NULL, NULL },
 };

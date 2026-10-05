@@ -74,4 +74,25 @@ bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
 typedef struct { uint64_t min, max; int runs; bool all_equal; } ray_enc_stats_t;
 void ray_enc_stats(const uint64_t* v, int n, ray_enc_kind_t k, ray_enc_stats_t* s);
 
+/* ---- codec types ---- */
+typedef enum {
+    RAY_ENC_RAW = 0, RAY_ENC_CONST = 1, RAY_ENC_FOR_BP = 2, RAY_ENC_DELTA_BP = 3,
+    RAY_ENC_RLE = 4, RAY_ENC_DICT = 5, RAY_ENC_ALP = 6, RAY_ENC_ALP_RD = 7,
+    RAY_ENC_STR_DICT = 8, RAY_ENC_FSST = 9
+} ray_enc_code_t;
+
+/* Growable output buffer over the buddy heap. */
+typedef struct { uint8_t* p; size_t len, cap; bool oom; } ray_enc_buf_t;
+void ray_enc_buf_free(ray_enc_buf_t* b);
+bool ray_enc_buf_put(ray_enc_buf_t* b, const void* src, size_t n);
+bool ray_enc_buf_pad8(ray_enc_buf_t* b);
+
+/* Body sizes in bytes (codec bodies are 8-aligned). */
+int64_t ray_enc_size_raw(int n, int T);
+int64_t ray_enc_size_const(void);
+int     ray_enc_for_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* base);
+int64_t ray_enc_size_for(int w);
+int     ray_enc_delta_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* dbase);
+int64_t ray_enc_size_delta(int T, int w);
+
 #endif /* RAY_ENC_H */
