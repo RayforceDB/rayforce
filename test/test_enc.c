@@ -654,17 +654,45 @@ static test_result_t test_train_dict_tristate(void) {
     PASS();
 }
 
-/* RLE body whose values child claims DICT: illegal as a child at any depth. */
+/* Child header: encoding, width, bytes of body at +4. */
+static size_t put_child(uint8_t* p, uint8_t enc, uint32_t body_bytes) {
+    memset(p, 0, 8); p[0] = enc; memcpy(p + 4, &body_bytes, 4);
+    return 8;
+}
+
+/* DICT is illegal as an RLE values child.  Control pair: a valid RLE body
+ * with a RAW values child reads; the same body with the values child's
+ * encoding byte set to DICT (codes child well formed) is rejected. */
 static test_result_t test_read_rejects_dict_child(void) {
-    uint8_t body[64] = {0};
-    uint32_t nruns = 1; memcpy(body, &nruns, 4);
-    body[8] = RAY_ENC_DICT;                 /* values child header: encoding */
-    uint32_t bb = 8; memcpy(body + 12, &bb, 4);
     ray_enc_kind_t k = { 64, true };
     uint64_t dv[1] = { 7 };
     ray_enc_dict_t dict = { dv, 1 };
     uint64_t out[RAY_ENC_VEC];
-    TEST_ASSERT_EQ_I(ray_enc_read(body, sizeof body, RAY_ENC_RLE, 0, 4, k,
+    uint8_t body[96];
+    /* control: one run of 4 values, values RAW (one u64), ends RAW U16 (one) */
+    memset(body, 0, sizeof body);
+    uint32_t nruns = 1; memcpy(body, &nruns, 4);
+    size_t at = 8;
+    at += put_child(body + at, RAY_ENC_RAW, 8);
+    uint64_t seven = 7; memcpy(body + at, &seven, 8); at += 8;
+    at += put_child(body + at, RAY_ENC_RAW, (uint32_t)ray_enc_size_raw(1, 16));
+    uint16_t end4 = 4; memcpy(body + at, &end4, 2); at += (size_t)ray_enc_size_raw(1, 16);
+    int64_t used = ray_enc_read(body, sizeof body, RAY_ENC_RLE, 0, 4, k,
+                                RAY_ENC_SLOT_TOP, 0, &dict, out);
+    TEST_ASSERT_EQ_I(used, (int64_t)at);
+    for (int i = 0; i < 4; i++) TEST_ASSERT_EQ_I(out[i], 7);
+    /* variant: values child DICT, its body is a well-formed codes child (RAW U32, one code 0) */
+    uint8_t bad[128];
+    memset(bad, 0, sizeof bad);
+    memcpy(bad, &nruns, 4);
+    at = 8;
+    uint32_t cbytes = (uint32_t)ray_enc_size_raw(1, 32);
+    at += put_child(bad + at, RAY_ENC_DICT, 8 + cbytes);
+    at += put_child(bad + at, RAY_ENC_RAW, cbytes);
+    at += cbytes;                                   /* code 0 */
+    at += put_child(bad + at, RAY_ENC_RAW, (uint32_t)ray_enc_size_raw(1, 16));
+    memcpy(bad + at, &end4, 2);
+    TEST_ASSERT_EQ_I(ray_enc_read(bad, sizeof bad, RAY_ENC_RLE, 0, 4, k,
                                   RAY_ENC_SLOT_TOP, 0, &dict, out), -1);
     PASS();
 }
@@ -743,6 +771,38 @@ static test_result_t test_write_as_forced(void) {
     PASS();
 }
 
+/* n is bounded before the stack arrays are touched; a failed write leaves the
+ * buffer as it was; bits above T are ignored. */
+static test_result_t test_write_bounds_rollback_masking(void) {
+    static uint64_t v[RAY_ENC_VEC + 1];
+    ray_enc_buf_t b = {0};
+    ray_enc_choice_t c;
+    ray_enc_kind_t k64 = { 64, true };
+    TEST_ASSERT_TRUE(!ray_enc_write(v, -1, k64, RAY_ENC_SLOT_TOP, 0, NULL, &b, &c));
+    TEST_ASSERT_TRUE(!ray_enc_write(v, RAY_ENC_VEC + 1, k64, RAY_ENC_SLOT_TOP, 0, NULL, &b, &c));
+    TEST_ASSERT_TRUE(!ray_enc_write_as(RAY_ENC_RAW, v, -1, k64, NULL, &b, &c));
+    TEST_ASSERT_TRUE(!ray_enc_write_as(RAY_ENC_RAW, v, RAY_ENC_VEC + 1, k64, NULL, &b, &c));
+    TEST_ASSERT_EQ_I(b.len, 0);
+    /* rollback: a successful write first, then a failing forced write appends nothing */
+    for (int i = 0; i < 16; i++) v[i] = (uint64_t)i;
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_RAW, v, 16, k64, NULL, &b, &c));
+    size_t len0 = b.len;
+    TEST_ASSERT_TRUE(len0 > 0);
+    TEST_ASSERT_TRUE(!ray_enc_write_as(RAY_ENC_CONST, v, 16, k64, NULL, &b, &c));
+    TEST_ASSERT_EQ_I(b.len, len0);
+    /* sign-extended I16 input encodes like the masked input */
+    ray_enc_kind_t k16 = { 16, true };
+    uint64_t sx[64], mk[64];
+    for (int i = 0; i < 64; i++) { int16_t x = (int16_t)(i * 37 - 1000); sx[i] = (uint64_t)(int64_t)x; mk[i] = (uint64_t)(uint16_t)x; }
+    ray_enc_buf_t b1 = {0}, b2 = {0};
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, sx, 64, k16, NULL, &b1, &c));
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, mk, 64, k16, NULL, &b2, &c));
+    TEST_ASSERT_EQ_I(b1.len, b2.len);
+    TEST_ASSERT_TRUE(memcmp(b1.p, b2.p, b1.len) == 0);
+    ray_enc_buf_free(&b1); ray_enc_buf_free(&b2); ray_enc_buf_free(&b);
+    PASS();
+}
+
 const test_entry_t enc_entries[] = {
     { "enc/pack_roundtrip_all_widths", test_pack_roundtrip_all_widths, enc_setup, enc_teardown },
     { "enc/pack_layout_t8_w1",         test_pack_layout_t8_w1,         enc_setup, enc_teardown },
@@ -780,5 +840,6 @@ const test_entry_t enc_entries[] = {
     { "enc/read_rejects_dict_child", test_read_rejects_dict_child, enc_setup, enc_teardown },
     { "enc/train_dict_native_order", test_train_dict_native_order, enc_setup, enc_teardown },
     { "enc/write_as_forced",         test_write_as_forced,         enc_setup, enc_teardown },
+    { "enc/write_bounds_rollback_masking", test_write_bounds_rollback_masking, enc_setup, enc_teardown },
     { NULL, NULL, NULL, NULL },
 };

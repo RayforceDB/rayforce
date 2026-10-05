@@ -269,32 +269,34 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
 bool ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
                    ray_enc_slot_t slot, int depth, const ray_enc_dict_t* dict,
                    ray_enc_buf_t* out, ray_enc_choice_t* chosen) {
+    if (n < 0 || n > RAY_ENC_VEC) return false;
     ray_enc_choice_t c = ray_enc_choose(v, n, k, slot, depth, dict);
     size_t at = out->len;
     if (depth > 0) {
         uint8_t h[8] = { c.enc, c.width, 0, 0, 0, 0, 0, 0 };
-        if (!ray_enc_buf_put(out, h, 8)) return false;
+        if (!ray_enc_buf_put(out, h, 8)) { out->len = at; return false; }
     }
     size_t body_at = out->len;
-    if (!write_body(c.enc, c.width, v, n, k, slot, depth, dict, out)) return false;
+    if (!write_body(c.enc, c.width, v, n, k, slot, depth, dict, out)) { out->len = at; return false; }
     if (depth > 0) {
         uint32_t bb = (uint32_t)(out->len - body_at);
         memcpy(out->p + at + 4, &bb, 4);
     }
-    if ((int64_t)(out->len - at) != c.bytes) return false;   /* size model and writer agree */
+    if ((int64_t)(out->len - at) != c.bytes) { out->len = at; return false; }   /* size model and writer agree */
     if (chosen) *chosen = c;
     return true;
 }
 
 bool ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
                       const ray_enc_dict_t* dict, ray_enc_buf_t* out, ray_enc_choice_t* chosen) {
+    if (n < 0 || n > RAY_ENC_VEC) return false;
     if (enc > RAY_ENC_DICT || !enc_legal(enc, RAY_ENC_SLOT_TOP, 0, k, dict)) return false;
     uint8_t w;
     int64_t sz = enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &w);
     if (sz < 0) return false;
     size_t at = out->len;
-    if (!write_body(enc, w, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, out)) return false;
-    if ((int64_t)(out->len - at) != sz) return false;     /* size model and writer agree */
+    if (!write_body(enc, w, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, out)) { out->len = at; return false; }
+    if ((int64_t)(out->len - at) != sz) { out->len = at; return false; }     /* size model and writer agree */
     if (chosen) { chosen->enc = enc; chosen->width = w; chosen->bytes = sz; }
     return true;
 }
