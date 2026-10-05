@@ -48,8 +48,12 @@ uint64_t ray_idx_hits[IDX_SITE__N];
 #define IDX_USE_SLOTS 512
 static struct { const void* key; _Atomic uint64_t n; } g_idx_use[IDX_USE_SLOTS];
 static atomic_flag g_idx_use_lock = ATOMIC_FLAG_INIT;
+/* Counting is off until `.idx.uses` has been called once in the process, so
+ * a server that never asks pays one relaxed load per index use. */
+static atomic_bool g_idx_use_armed;
 
 void ray_idx_note_use(const ray_t* col) {
+    if (!atomic_load_explicit(&g_idx_use_armed, memory_order_relaxed)) return;
     if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return;
     const void* key = col->index;
     uint32_t h = (uint32_t)(((uintptr_t)key >> 5) * 2654435761u) & (IDX_USE_SLOTS - 1);
@@ -68,34 +72,41 @@ void ray_idx_note_use(const ray_t* col) {
 ray_t* ray_idx_uses_fn(ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE)
         return ray_error("type", ".idx.uses expects a table, got %s", tbl ? ray_type_name(tbl->type) : "null");
+    atomic_store_explicit(&g_idx_use_armed, true, memory_order_relaxed);
+    /* Under the lock only copy the live (key, count) pairs out and reset;
+     * matching columns and building the result allocate, so they run after. */
+    struct { const void* key; uint64_t n; } snap[IDX_USE_SLOTS];
+    uint32_t ns = 0;
+    while (atomic_flag_test_and_set_explicit(&g_idx_use_lock, memory_order_acquire)) { }
+    for (uint32_t s = 0; s < IDX_USE_SLOTS; s++)
+        if (g_idx_use[s].key && g_idx_use[s].n) {
+            snap[ns].key = g_idx_use[s].key;
+            snap[ns].n = g_idx_use[s].n;
+            ns++;
+        }
+    memset(g_idx_use, 0, sizeof g_idx_use);              /* reset */
+    atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
+
     int64_t nc = ray_table_ncols(tbl);
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, nc);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_vec_new(RAY_I64, nc);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-    while (atomic_flag_test_and_set_explicit(&g_idx_use_lock, memory_order_acquire)) { }
     for (int64_t c = 0; c < nc; c++) {
         ray_t* col = ray_table_get_col_idx(tbl, c);
         if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) continue;
-        for (uint32_t s = 0; s < IDX_USE_SLOTS; s++)
-            if (g_idx_use[s].key == col->index && g_idx_use[s].n) {
+        for (uint32_t s = 0; s < ns; s++)
+            if (snap[s].key == col->index) {
                 int64_t name = ray_table_col_name(tbl, c);
-                int64_t cnt = (int64_t)g_idx_use[s].n;
+                int64_t cnt = (int64_t)snap[s].n;
                 keys = ray_vec_append(keys, &name);
-                if (RAY_IS_ERR(keys)) { ray_release(vals); goto out_err; }
+                if (RAY_IS_ERR(keys)) { ray_release(vals); return ray_error("oom", NULL); }
                 vals = ray_vec_append(vals, &cnt);
-                if (RAY_IS_ERR(vals)) { ray_release(keys); goto out_err; }
+                if (RAY_IS_ERR(vals)) { ray_release(keys); return ray_error("oom", NULL); }
                 break;
             }
     }
-    memset(g_idx_use, 0, sizeof g_idx_use);              /* reset */
-    atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
     return ray_dict_new(keys, vals);
-out_err: {
-        ray_t* e = ray_error("oom", NULL);
-        atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
-        return e;
-    }
 }
 
 static void idx_stats_dump(void) {

@@ -2499,13 +2499,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 ray_rowsel_release(g->selection);
                                 g->selection = merged;
                                 ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
-                                ray_idx_note_use(scol);
                                 return input;
                             }
                         } else {
                             g->selection = ssel;
                             ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
-                            ray_idx_note_use(scol);
                             return input;
                         }
                     }
