@@ -96,3 +96,26 @@ int     ray_enc_delta_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t
 int64_t ray_enc_size_delta(int T, int w);
 
 #endif /* RAY_ENC_H */
+
+/* Child slots (spec "Child slots").  The top-level vector is depth 0. */
+typedef enum {
+    RAY_ENC_SLOT_TOP = 0,
+    RAY_ENC_SLOT_RLE_VALUES,   /* kind: element type at depth 1, else the enclosing slot's kind */
+    RAY_ENC_SLOT_RLE_ENDS,     /* kind U16 */
+    RAY_ENC_SLOT_CODES         /* kind U32 (DICT / STR_DICT codes) */
+} ray_enc_slot_t;
+
+typedef struct { const uint64_t* v; uint32_t n; } ray_enc_dict_t;
+typedef struct { uint8_t enc, width; int64_t bytes; } ray_enc_choice_t;
+
+ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
+                                ray_enc_slot_t slot, int depth,
+                                const ray_enc_dict_t* dict);
+bool    ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
+                      ray_enc_slot_t slot, int depth, const ray_enc_dict_t* dict,
+                      ray_enc_buf_t* out, ray_enc_choice_t* chosen);
+int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
+                     int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
+                     const ray_enc_dict_t* dict, uint64_t* out);
+bool    ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
+                           uint64_t** out, uint32_t* out_n);
