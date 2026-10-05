@@ -66,13 +66,19 @@ static inline void ray_col_stamp_format(ray_t* header) {
     header->order = RAY_COL_FORMAT_MAJOR;
 }
 
-/* Validate the format generation in a mapped/built column header's `order`
- * byte (offset 17).  Returns RAY_OK iff it matches the reader's generation,
- * else RAY_ERR_VERSION.  Strict equality: with the current generation at 0,
- * legacy/pre-stamp files (order==0) load and any other generation is refused. */
+/* Accepts the generations this build reads (0 and 2); the pair check that
+ * separates them is ray_col_gen_of (store/encfmt.h). */
 static inline ray_err_t ray_col_check_format(const ray_t* header) {
-    return header->order == RAY_COL_FORMAT_MAJOR ? RAY_OK : RAY_ERR_VERSION;
+    return (header->order == RAY_COL_FORMAT_MAJOR || header->order == 2)
+           ? RAY_OK : RAY_ERR_VERSION;
 }
+
+/* Allowlist of attr bits the save path persists; see the rationale in
+ * col.c (loaders mask untrusted disk attrs to this set).  Literal values
+ * because this header does not include table/sym.h; col.c asserts them. */
+#define COL_DISK_ATTRS_MASK ((uint8_t)(0x03 /* RAY_SYM_W_MASK */ | \
+                                       0x20 /* RAY_ATTR_SORTED */ | \
+                                       0x40 /* RAY_ATTR_HAS_NULLS */))
 
 /* Column file I/O.
  *

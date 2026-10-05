@@ -33,6 +33,7 @@
 #include "mem/sys.h"   /* ray_sys_alloc — the shared-mapping descriptor */
 #include "store/serde.h"
 #include "store/fileio.h"
+#include "store/encfmt.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "table/dict.h"
@@ -43,6 +44,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+
+_Static_assert(COL_DISK_ATTRS_MASK == (uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS),
+               "COL_DISK_ATTRS_MASK literal values drifted");
 #ifdef RAY_OS_WINDOWS
 #include <io.h>
 #else
@@ -141,8 +145,8 @@ static size_t col_str_pool_payload_len(const ray_t* vec);
  * materialization, BEFORE any error path can release the object.  Link
  * sidecar reattach (try_load_link_sidecar) runs after masking and sets
  * HAS_LINK with a freshly interned sym ID, so legit links are unaffected. */
-#define COL_DISK_ATTRS_MASK \
-    ((uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS))
+/* The definition lives in col.h so the generation-2 writer and reader
+ * share it. */
 
 /* "Index present" marker written to the on-disk header's reserved aux[0..3]
  * (see col.h: aux is reserved for index persistence).  Existing files leave
@@ -1279,6 +1283,7 @@ typedef struct {
     uint32_t saved_sym_count;
     bool    has_index;         /* aux marker present → inline index region at tail */
     size_t  index_offset;      /* 32-aligned start of the index region (has_index) */
+    bool    gen2;              /* generation-2 file: only mapped/header are set */
 } col_mapped_t;
 
 static size_t col_str_pool_payload_len(const ray_t* vec) {
@@ -1396,10 +1401,26 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
      * does not match the reader is rejected here.  The loaders below reset
      * the runtime `order` to its correct value, so reading the version out
      * of `order` here does not leak into the live block order. */
-    if (ray_col_check_format(hdr) != RAY_OK) {
+    /* Generation discriminator (spec "Generation discriminator"): the pair
+     * (order, aux[0..3]) is validated before either parser runs, and a
+     * cross pair is corrupt, never a fallback to the other layout. */
+    int gen = ray_col_gen_of(ptr);
+    if (gen == RAY_ENC_GEN_VERSION) {
         ray_vm_unmap_file(ptr, mapped_size);
         return ray_error("version", "col %s: bad format version", path);
     }
+    if (gen == RAY_ENC_GEN_CORRUPT) {
+        ray_vm_unmap_file(ptr, mapped_size);
+        return ray_error("corrupt", "col %s: format byte and generation marker disagree", path);
+    }
+    if (gen == 2) {
+        out->gen2        = true;
+        out->mapped      = ptr;
+        out->mapped_size = mapped_size;
+        out->header      = hdr;
+        return NULL;          /* the generation-2 parser validates the rest */
+    }
+    out->gen2 = false;
 
     /* Validate type from untrusted file data -- allowlist only */
     if (!is_serializable_type(hdr->type)) {
@@ -1528,6 +1549,10 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
     col_mapped_t cm = {0};
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
+    if (cm.gen2) {
+        ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+        return ray_error("nyi", "col %s: generation 2 reader not built", path);
+    }
 
     /* Allocate buddy block and copy file data */
     ray_t* vec = ray_alloc(cm.data_size);
@@ -1642,6 +1667,10 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
     col_mapped_t cm = {0};
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
+    if (cm.gen2) {
+        ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+        return ray_error("nyi", "col %s: generation 2 reader not built", path);
+    }
 
     /* Validate that the file size matches the expected layout.  Without an
      * inline index the payload is the whole file (ray_free reconstructs the
