@@ -398,15 +398,28 @@ static ray_err_t csr_save(ray_csr_t* csr, const char* dir, const char* prefix) {
     return RAY_OK;
 }
 
-/* The CSR arrays are plain vectors; an encoded column is refused until
- * the aware paths land (NULL, so every caller takes its error path). */
-static ray_t* csr_col(const char* path, bool use_mmap) {
+/* The CSR files are plain vectors; an encoded column is refused until the
+ * aware paths land.  RAY_OK with *out set; RAY_ERR_NYI for an encoded
+ * file (the optional ones included: only a missing file is "absent");
+ * RAY_ERR_IO for anything else. */
+static ray_err_t csr_col(const char* path, bool use_mmap, ray_t** out) {
+    *out = NULL;
     ray_t* c = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL) {
-        ray_release(c);
-        return NULL;
+    if (c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL) { ray_release(c); return RAY_ERR_NYI; }
+    if (c && RAY_IS_ERR(c)) {
+        /* ray_col_load answers nyi for a generation-2 file */
+        bool enc = false;
+        if (strcmp(ray_err_code(c), "nyi") == 0) {
+            FILE* f = fopen(path, "rb");
+            uint8_t h[32];
+            if (f) { enc = fread(h, 1, 32, f) == 32 && ray_col_gen_of(h) == 2; fclose(f); }
+        }
+        ray_error_free(c);
+        return enc ? RAY_ERR_NYI : RAY_ERR_IO;
     }
-    return c;
+    if (!c) return RAY_ERR_IO;
+    *out = c;
+    return RAY_OK;
 }
 
 static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* prefix,
@@ -416,28 +429,26 @@ static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* pref
 
     len = snprintf(path, sizeof(path), "%s/%s_offsets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->offsets = csr_col(path, use_mmap);
-    if (!csr->offsets || RAY_IS_ERR(csr->offsets)) {
-        csr->offsets = NULL;
-        return RAY_ERR_IO;
-    }
+    ray_err_t ce = csr_col(path, use_mmap, &csr->offsets);
+    if (ce != RAY_OK) return ce;
 
     len = snprintf(path, sizeof(path), "%s/%s_targets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->targets = csr_col(path, use_mmap);
-    if (!csr->targets || RAY_IS_ERR(csr->targets)) {
+    ce = csr_col(path, use_mmap, &csr->targets);
+    if (ce != RAY_OK) {
         ray_release(csr->offsets); csr->offsets = NULL;
-        csr->targets = NULL;
-        return RAY_ERR_IO;
+        return ce;
     }
 
     len = snprintf(path, sizeof(path), "%s/%s_rowmap", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->rowmap = csr_col(path, use_mmap);
-    if (!csr->rowmap || RAY_IS_ERR(csr->rowmap)) {
-        /* rowmap is optional — ignore error */
-        csr->rowmap = NULL;
+    ce = csr_col(path, use_mmap, &csr->rowmap);
+    if (ce == RAY_ERR_NYI) {
+        ray_release(csr->offsets); csr->offsets = NULL;
+        ray_release(csr->targets); csr->targets = NULL;
+        return ce;
     }
+    /* rowmap is optional — a missing or unreadable file is absent */
 
     if (csr->offsets->len < 1) {
         ray_release(csr->offsets); csr->offsets = NULL;
@@ -526,8 +537,13 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
     char path[1024];
     int len = snprintf(path, sizeof(path), "%s/meta", dir);
     if (len >= 0 && (size_t)len < sizeof(path)) {
-        ray_t* meta = csr_col(path, use_mmap);
-        if (meta && !RAY_IS_ERR(meta) && meta->len >= 5) {
+        ray_t* meta = NULL;
+        if (csr_col(path, use_mmap, &meta) == RAY_ERR_NYI) {
+            csr_free(&rel->fwd); csr_free(&rel->rev);
+            ray_sys_free(rel);
+            return NULL;
+        }
+        if (meta && meta->len >= 5) {
             int64_t* md = (int64_t*)ray_data(meta);
             rel->from_table = (uint16_t)md[0];
             rel->to_table = (uint16_t)md[1];
@@ -535,7 +551,7 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
             rel->fwd.sorted = md[3] != 0;
             rel->rev.sorted = md[4] != 0;
             ray_release(meta);
-        } else if (meta && !RAY_IS_ERR(meta)) {
+        } else if (meta) {
             ray_release(meta);
         }
     }

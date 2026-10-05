@@ -1003,7 +1003,7 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
         ray_t* col = use_mmap ? ray_col_mmap_splayed_dom(path, dom)
                               : ray_col_load_dom(path, dom);
         if (use_mmap && col && RAY_IS_ERR(col) &&
-            strcmp(ray_err_code(col), "nyi") == 0) {
+            strcmp(ray_err_code(col), "nyi") == 0 && ray_error_msg() == NULL) {
             /* ray_release on an error object is a no-op (rayforce.h:180);
              * must use ray_error_free to actually reclaim the error
              * before retrying with the non-mmap loader. */

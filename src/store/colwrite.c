@@ -78,6 +78,7 @@ void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags
 }
 
 static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable) {
+    if (!ray_enc_gen2_supported()) return RAY_ERR_NYI;      /* before <path>.tmp exists */
     char tmp[1100];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return RAY_ERR_IO;
     FILE* f = fopen(tmp, "wb+");

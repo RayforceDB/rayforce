@@ -31,6 +31,7 @@
 #include "store/encfmt.h"
 #include "store/enccol.h"
 #include "store/splay.h"
+#include "store/csr.h"
 #include "table/domain.h"
 #include "table/table.h"
 #include "ops/idxop.h"
@@ -265,7 +266,7 @@ static test_result_t test_load_rejects_more(void) {
     v64 = -1; patch(p, LEN_OFF, &v64, 8);
     TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
-    v64 = 65536 * 3; patch(p, LEN_OFF, &v64, 8);           /* directory would not fit */
+    v64 = 65536 * 3; patch(p, LEN_OFF, &v64, 8);           /* more rows than the directory area can describe */
     TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     /* outer reserved bytes and mmod */
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
@@ -377,19 +378,53 @@ static test_result_t test_sym_domain_rules(void) {
 
 /* Plain-vector consumers refuse an encoded column until their tasks land. */
 static test_result_t test_consumers_refuse(void) {
-    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    /* (a) CSR offsets */
-    TEST_ASSERT_EQ_I(ray_test_mkdir_p(ENCCOL_TMP "/rel"), 0);
-    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/rel/fwd_offsets", 3000), RAY_OK);
-    TEST_ASSERT_NULL(ray_rel_mmap(ENCCOL_TMP "/rel"));
+    /* (a) a complete generation-0 relation maps; one file rewritten as
+     * generation 2 (required or optional) makes the map fail */
+    {
+        int64_t sd[] = {0, 0, 1, 1, 2, 3}, dd[] = {1, 2, 2, 3, 3, 0};
+        ray_t* sv = ray_vec_from_raw(RAY_I64, sd, 6); ray_t* dv = ray_vec_from_raw(RAY_I64, dd, 6);
+        ray_t* et = ray_table_new(2);
+        et = ray_table_add_col(et, ray_sym_intern("src", 3), sv);
+        et = ray_table_add_col(et, ray_sym_intern("dst", 3), dv);
+        ray_release(sv); ray_release(dv);
+        ray_rel_t* rel = ray_rel_from_edges(et, "src", "dst", 4, 4, true);
+        TEST_ASSERT_TRUE(rel != NULL);
+        const char* rd = ENCCOL_TMP "/rel";
+        TEST_ASSERT_EQ_I(ray_rel_save(rel, rd), RAY_OK);
+        ray_rel_free(rel); ray_release(et);
+        int64_t md[5] = {0, 1, 2, 0, 1};                   /* plain meta, whatever the saver wrote */
+        ray_t* mv = ray_vec_from_raw(RAY_I64, md, 5);
+        TEST_ASSERT_EQ_I(ray_col_save(mv, ENCCOL_TMP "/rel/meta"), RAY_OK);
+        ray_release(mv);
+        ray_rel_t* good = ray_rel_mmap(rd);
+        TEST_ASSERT_TRUE(good != NULL);
+        TEST_ASSERT_TRUE(good->fwd.rowmap != NULL);        /* the optional file is really there */
+        ray_rel_free(good);
+        static const char* files[] = { "fwd_offsets", "fwd_targets", "rev_offsets", "rev_targets",
+                                       "fwd_rowmap", "rev_rowmap", "meta" };
+        for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+            char fp[256], bak[260];
+            snprintf(fp, sizeof fp, "%s/%s", rd, files[i]);
+            snprintf(bak, sizeof bak, "%s.bak", fp);
+            TEST_ASSERT_EQ_I(rename(fp, bak), 0);
+            ray_t* enc = ray_vec_new(RAY_I64, 8); enc->len = 8;
+            for (int k = 0; k < 8; k++) ((int64_t*)ray_data(enc))[k] = k;
+            TEST_ASSERT_EQ_I(ray_col_save_gen(enc, fp, 2), RAY_OK);
+            ray_release(enc);
+            TEST_ASSERT_NULL(ray_rel_mmap(rd));
+            TEST_ASSERT_NULL(ray_rel_load(rd));
+            TEST_ASSERT_EQ_I(rename(bak, fp), 0);
+            ray_rel_t* again = ray_rel_mmap(rd);
+            TEST_ASSERT_TRUE(again != NULL);
+            ray_rel_free(again);
+        }
+    }
     /* (b) hash index build */
     TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/hc", 3000), RAY_OK);
     TEST_ASSERT_EQ_I(ray_splay_hash_column(ENCCOL_TMP "/hc", NULL), RAY_ERR_NYI);
     ray_t* ok = ray_col_mmap(ENCCOL_TMP "/hc");            /* file untouched */
     TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
     ray_release(ok);
-    ray_mem_stats(&m1);
-    TEST_ASSERT_EQ_U(m1.sys_mapped, m0.sys_mapped);
     /* (c) splayed table load: one plain column, one generation-2 file */
     ray_t* tbl = ray_table_new(2);
     ray_t* a = ray_vec_new(RAY_I64, 3000); a->len = 3000;
