@@ -352,6 +352,7 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
     int64_t rows = chunk_rows(e, c);
     int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
     uint64_t at = RAY_ENC_DESC_AREA;
+    uint64_t nsum = 0;
     int T = lane_width(e);
     for (int j = 0; j < RAY_ENC_VECS_PER_CHUNK; j++) {
         const ray_enc_desc_t* d = &out[j];
@@ -374,13 +375,16 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
         if (d->payload_off != at || (d->payload_bytes & 7) || d->payload_bytes > de.bytes - at)
             ENC_CORRUPT("col %s: chunk %lld vector %d payload placement", e->path, (long long)c, j);
         at += d->payload_bytes;
+        nsum += d->n_nulls;
         bool absent = d->flags & RAY_ENC_STAT_ABSENT;
         bool all_null = enc_type_nullable(e->type) && d->n_nulls == vlen;
         if (all_null && (d->encoding != RAY_ENC_CONST || !absent))
             ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector not CONST without statistics", e->path, (long long)c, j);
         if (absent && (d->min || d->max)) ENC_CORRUPT("col %s: chunk %lld vector %d absent statistics not zero", e->path, (long long)c, j);
         if (!absent && e->type == RAY_GUID) ENC_CORRUPT("col %s: chunk %lld vector %d statistics on GUID", e->path, (long long)c, j);
-        if (!absent && e->type == RAY_STR) return ray_error("nyi", "col %s: STR code bounds need a newer build", e->path);
+        /* Only STR_DICT carries code bounds, and a STR_DICT vector already
+         * returned nyi above: on RAW / CONST this is damage in every build. */
+        if (!absent && e->type == RAY_STR) ENC_CORRUPT("col %s: chunk %lld vector %d statistics on a RAW / CONST string vector", e->path, (long long)c, j);
         if (!absent) {
             if (enc_type_float(e->type)) {
                 double mn, mx; memcpy(&mn, &d->min, 8); memcpy(&mx, &d->max, 8);
@@ -393,6 +397,8 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
             }
         }
     }
+    if (nsum != de.null_count) ENC_CORRUPT("col %s: chunk %lld descriptor null counts sum to %llu, directory says %u", e->path,
+                                           (long long)c, (unsigned long long)nsum, de.null_count);
     if (at != de.bytes) ENC_CORRUPT("col %s: chunk %lld has %llu bytes after its payloads", e->path,
                                     (long long)c, (unsigned long long)(de.bytes - at));
     return NULL;
@@ -484,8 +490,10 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
         bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
         uint64_t x = bits[i];
         if (sym) {
-            /* ids fit the attrs width and lie in the domain; never truncated.
-             * Id 0 is the null and is always legal. */
+            /* Defence in depth: ray_enc_read masks to the lane width, so the
+             * width test cannot fire here; the real width guard is the
+             * descriptor-statistics check in ray_enccol_chunk_descs.  Id 0
+             * is the null and is always legal. */
             if ((esz < 8 && (x >> (8 * esz))) || (x && x >= e->sym_bound)) VEC_CORRUPT("SYM id");
             zeros += x == 0;
         }
@@ -709,6 +717,8 @@ ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool
 }
 
 ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
+    *out = 0;
+    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return ray_error("range", "col %s: vector %lld", e->path, (long long)vec);
     ray_enc_desc_t descs[64];
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     ray_t* err = ray_enccol_chunk_descs(e, c, descs);
@@ -718,6 +728,7 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
 }
 
 int ray_enccol_vec_nulls(ray_enccol_t* e, int64_t vec, int* n_nulls) {
+    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return -1;
     ray_enc_desc_t descs[64];
     ray_t* err = ray_enccol_chunk_descs(e, vec / RAY_ENC_VECS_PER_CHUNK, descs);
     if (err) { ray_error_free(err); return -1; }

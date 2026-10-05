@@ -258,7 +258,7 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
             && ray_enc_write(ends, nr, K_U16, RAY_ENC_SLOT_RLE_ENDS, depth + 1, NULL, b, &c);
     }
     case RAY_ENC_DICT: {
-        if (!dict) return -1;                                         /* never dereference a missing dictionary */
+        if (!dict) return false;                                      /* never dereference a missing dictionary */
         uint64_t codes[RAY_ENC_VEC];
         if (!dict_codes(v, n, k, dict, codes)) return false;
         ray_enc_choice_t c;

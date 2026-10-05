@@ -446,6 +446,7 @@ static test_result_t test_consumers_refuse(void) {
 }
 
 static uint64_t g_seed = 1;
+static uint8_t g_symw = RAY_SYM_W16;      /* SYM width make_col builds */
 static uint64_t rng(void) { uint64_t x = g_seed; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g_seed = x; }
 
 /* A column of `type` and `n` rows in shape s: 0 random, 1 small range,
@@ -465,7 +466,7 @@ static ray_t* make_col(int8_t type, int64_t n, int s) {
         if (s >= 4) v->attrs |= RAY_ATTR_HAS_NULLS;
         return v;
     }
-    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W16, n) : ray_vec_new(type, n);
+    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(g_symw, n) : ray_vec_new(type, n);
     v->len = n;
     uint8_t esz = ray_sym_elem_size(type, v->attrs);
     uint8_t* d = ray_data(v);
@@ -523,29 +524,37 @@ static test_result_t check_decode(ray_t* v, const char* path) {
 static test_result_t test_roundtrip_types_shapes(void) {
     static const int8_t types[] = { RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME,
                                     RAY_TIMESTAMP, RAY_F32, RAY_F64, RAY_GUID, RAY_SYM, RAY_STR };
+    static const uint8_t widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
     for (size_t t = 0; t < sizeof types; t++)
-        for (int s = 0; s < 6; s++) {
-            if ((types[t] == RAY_BOOL || types[t] == RAY_U8) && s >= 4) continue;
-            ray_t* v = make_col(types[t], 3000, s);
-            TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/rt", 2), RAY_OK);
-            test_result_t r = check_decode(v, ENCCOL_TMP "/rt");
-            ray_release(v);
-            if (r.status != TEST_PASS) return r;
-        }
+        for (size_t w = 0; w < (types[t] == RAY_SYM ? sizeof widths : 1); w++)
+            for (int s = 0; s < 6; s++) {
+                if ((types[t] == RAY_BOOL || types[t] == RAY_U8) && s >= 4) continue;
+                g_symw = widths[w];
+                ray_t* v = make_col(types[t], 3000, s);
+                g_symw = RAY_SYM_W16;
+                TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/rt", 2), RAY_OK);
+                test_result_t r = check_decode(v, ENCCOL_TMP "/rt");
+                ray_release(v);
+                if (r.status != TEST_PASS) return r;
+            }
     PASS();
 }
 
 static test_result_t test_roundtrip_lengths(void) {
     static const int64_t lens[] = { 1, 1023, 1024, 1025, 65535, 65536, 65537 };
     static const int8_t types[] = { RAY_I32, RAY_F64, RAY_STR, RAY_SYM };
+    static const uint8_t widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
     for (size_t t = 0; t < sizeof types; t++)
-        for (size_t l = 0; l < sizeof lens / sizeof lens[0]; l++) {
-            ray_t* v = make_col(types[t], lens[l], 4);
-            TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/len", 2), RAY_OK);
-            test_result_t r = check_decode(v, ENCCOL_TMP "/len");
-            ray_release(v);
-            if (r.status != TEST_PASS) return r;
-        }
+        for (size_t w = 0; w < (types[t] == RAY_SYM ? sizeof widths : 1); w++)
+            for (size_t l = 0; l < sizeof lens / sizeof lens[0]; l++) {
+                g_symw = widths[w];
+                ray_t* v = make_col(types[t], lens[l], 4);
+                g_symw = RAY_SYM_W16;
+                TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/len", 2), RAY_OK);
+                test_result_t r = check_decode(v, ENCCOL_TMP "/len");
+                ray_release(v);
+                if (r.status != TEST_PASS) return r;
+            }
     PASS();
 }
 
@@ -657,6 +666,7 @@ static test_result_t test_decode_rejects_payload(void) {
     c = ray_col_mmap(ENCCOL_TMP "/p");
     err = ray_enccol_decode_vec(ray_enccol_of(c), 0, out, NULL, 0, 0);
     TEST_ASSERT_TRUE(err && RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "corrupt");
     ray_error_free(err);
     ray_release(c);
     PASS();
@@ -721,20 +731,97 @@ static test_result_t test_decode_trailing_bytes(void) {
     PASS();
 }
 
-/* DICT never dereferences a missing dictionary. */
+/* A DICT body is refused without a usable dictionary.  The explicit NULL
+ * guards in the codec's size / write / read bodies sit behind the
+ * legality check every public entry runs first, so they are not reachable
+ * directly; this pins the observable behaviour of the public entries. */
 static test_result_t test_dict_null_dictionary(void) {
     uint64_t v[16]; uint64_t dv[2] = { 10, 20 };
     for (int i = 0; i < 16; i++) v[i] = dv[i & 1];
     ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_I64, 0, &k));
     ray_enc_dict_t d = { dv, 2 };
-    ray_enc_buf_t buf = {0}; ray_enc_choice_t ch;
-    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_DICT, v, 16, k, &d, &buf, &ch));
+    ray_enc_buf_t buf = {0}, buf2 = {0}; ray_enc_choice_t ch;
+    bool wrote = ray_enc_write_as(RAY_ENC_DICT, v, 16, k, &d, &buf, &ch);
+    bool wrote_null = ray_enc_write_as(RAY_ENC_DICT, v, 16, k, NULL, &buf2, &ch);
     uint64_t out[16];
-    TEST_ASSERT_EQ_I(ray_enc_read(buf.p, buf.len, RAY_ENC_DICT, 0, 16, k, RAY_ENC_SLOT_TOP, 0, &d, out), (int64_t)buf.len);
-    TEST_ASSERT_TRUE(ray_enc_read(buf.p, buf.len, RAY_ENC_DICT, 0, 16, k, RAY_ENC_SLOT_TOP, 0, NULL, out) < 0);
+    int64_t good = wrote ? ray_enc_read(buf.p, buf.len, RAY_ENC_DICT, 0, 16, k, RAY_ENC_SLOT_TOP, 0, &d, out) : -2;
+    int64_t nul = wrote ? ray_enc_read(buf.p, buf.len, RAY_ENC_DICT, 0, 16, k, RAY_ENC_SLOT_TOP, 0, NULL, out) : -2;
     ray_enc_dict_t empty = { NULL, 0 };
-    TEST_ASSERT_TRUE(ray_enc_read(buf.p, buf.len, RAY_ENC_DICT, 0, 16, k, RAY_ENC_SLOT_TOP, 0, &empty, out) < 0);
-    ray_enc_buf_free(&buf);
+    int64_t emp = wrote ? ray_enc_read(buf.p, buf.len, RAY_ENC_DICT, 0, 16, k, RAY_ENC_SLOT_TOP, 0, &empty, out) : -2;
+    size_t blen = buf.len;
+    ray_enc_buf_free(&buf); ray_enc_buf_free(&buf2);
+    TEST_ASSERT_TRUE(wrote);
+    TEST_ASSERT_FALSE(wrote_null);
+    TEST_ASSERT_EQ_I(good, (int64_t)blen);
+    TEST_ASSERT_TRUE(nul < 0);
+    TEST_ASSERT_TRUE(emp < 0);
+    PASS();
+}
+
+/* Out-of-range vector numbers are refused by every column-global entry. */
+static test_result_t test_vec_range_checks(void) {
+    ray_t* v = make_col(RAY_STR, 2500, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/vr", 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/vr");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_t* e = ray_enccol_of(c);
+    int64_t nv = ray_enc_nvecs(e->len);
+    TEST_ASSERT_EQ_I(nv, 3);
+    static const int64_t bad[] = { -1, 3, 64, 1000000 };
+    int bad_ok = 1;
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        uint64_t pb = 7; int nn = 7;
+        ray_t* err = ray_enccol_vec_pool_bytes(e, bad[i], &pb);
+        if (!err || strcmp(ray_err_code(err), "range") != 0 || pb != 0) bad_ok = 0;
+        if (err) ray_error_free(err);
+        if (ray_enccol_vec_nulls(e, bad[i], &nn) != -1) bad_ok = 0;
+    }
+    uint64_t pb; int nn;
+    ray_t* e0 = ray_enccol_vec_pool_bytes(e, nv - 1, &pb);
+    int good_ok = e0 == NULL && ray_enccol_vec_nulls(e, nv - 1, &nn) == 0 && nn == 0;
+    if (e0) ray_error_free(e0);
+    ray_release(c);
+    TEST_ASSERT_TRUE(bad_ok);
+    TEST_ASSERT_TRUE(good_ok);
+    PASS();
+}
+
+/* The descriptors' null counts must add up to the directory's. */
+static test_result_t test_descriptor_null_sum(void) {
+    ray_t* v = make_col(RAY_I32, 3000, 4);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/ns", 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ns");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enc_dirent_t de; memcpy(&de, ray_enccol_of(c)->base + 96, sizeof de);
+    ray_release(c);
+    TEST_ASSERT_TRUE(de.null_count > 0);
+    uint32_t nc = de.null_count - 1; patch(ENCCOL_TMP "/ns", 96 + 52, &nc, 4);
+    c = ray_col_mmap(ENCCOL_TMP "/ns");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));                  /* directory alone is plausible */
+    ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, (uint8_t[RAY_ENC_VEC * 16]){0}, NULL, 0, 0);
+    bool ok = err && RAY_IS_ERR(err) && strcmp(ray_err_code(err), "corrupt") == 0;
+    if (err) ray_error_free(err);
+    ray_release(c);
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* STR statistics on a RAW / CONST vector are corrupt, not "newer build". */
+static test_result_t test_str_stats_corrupt(void) {
+    ray_t* v = make_col(RAY_STR, 100, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/ss", 2), RAY_OK);
+    ray_release(v);
+    uint16_t fl = 0; patch(ENCCOL_TMP "/ss", 160 + 4, &fl, 2);     /* descriptor claims statistics */
+    uint64_t one = 1; patch(ENCCOL_TMP "/ss", 160 + 40, &one, 8);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ss");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, (uint8_t[RAY_ENC_VEC * 16]){0}, (char[RAY_ENC_VEC * 64]){0}, 0, RAY_ENC_VEC * 64);
+    bool ok = err && RAY_IS_ERR(err) && strcmp(ray_err_code(err), "corrupt") == 0;
+    if (err) ray_error_free(err);
+    ray_release(c);
+    TEST_ASSERT_TRUE(ok);
     PASS();
 }
 
@@ -780,6 +867,18 @@ static test_result_t test_sym_width_and_bound(void) {
 /* Flip bits of every byte of the file past the outer header, one byte at a
  * time, in several fixtures: a load either fails or every vector decodes to
  * OK or a corrupt / nyi error, and a failed decode leaves `out` untouched. */
+static bool sweep_nyi_ok(const uint8_t* b, long n, long pos) {
+    /* a descriptor's encoding byte, or a STR directory entry's flags word */
+    int64_t len; memcpy(&len, b + offsetof(ray_t, len), 8);
+    int8_t type = (int8_t)b[offsetof(ray_t, type)];
+    for (int64_t c = 0; c < ray_enc_nchunks(len); c++) {
+        uint64_t off; memcpy(&off, b + 96 + 64 * c, 8);
+        if (type == RAY_STR && pos >= 96 + 64 * c + 56 && pos < 96 + 64 * c + 60) return true;
+        for (int j = 0; j < 64; j++) if ((long)(off + 48 * j) == pos && pos < n) return true;
+    }
+    return false;
+}
+
 static test_result_t sweep_file(const char* name, uint8_t mask, long* positions) {
     char src[256]; snprintf(src, sizeof src, "test/data/enc/%s.bin", name);
     FILE* f = fopen(src, "rb");
@@ -795,16 +894,22 @@ static test_result_t sweep_file(const char* name, uint8_t mask, long* positions)
         uint8_t m = b[pos] ^ mask;
         patch(path, pos, &m, 1);
         ray_t* c = ray_col_mmap(path);
-        if (c && RAY_IS_ERR(c)) { ray_error_free(c); }
+        if (c && RAY_IS_ERR(c)) {
+            if (strcmp(ray_err_code(c), "nyi") == 0 && !sweep_nyi_ok(b, n, pos)) bad = "nyi at load outside the allowed bytes";
+            ray_error_free(c);
+        }
         else if (c) {
             ray_enccol_t* e = ray_enccol_of(c);
             for (int64_t vec = 0; e && vec < ray_enc_nvecs(e->len) && !bad; vec++) {
                 uint8_t out[RAY_ENC_VEC * 16]; char pool[RAY_ENC_VEC * 64];
-                memset(out, CANARY, sizeof out);
+                memset(out, CANARY, sizeof out); memset(pool, CANARY, sizeof pool);
                 ray_t* err = ray_enccol_decode_vec(e, vec, out, pool, 0, sizeof pool);
                 if (!err) continue;
-                if (strcmp(ray_err_code(err), "corrupt") != 0 && strcmp(ray_err_code(err), "nyi") != 0) bad = "error code";
+                const char* code = ray_err_code(err);
+                if (strcmp(code, "nyi") == 0) { if (!sweep_nyi_ok(b, n, pos)) bad = "nyi outside the allowed bytes"; }
+                else if (strcmp(code, "corrupt") != 0) bad = "error code";
                 for (size_t i = 0; i < sizeof out && !bad; i++) if (out[i] != CANARY) bad = "out written by a failed decode";
+                for (size_t i = 0; i < sizeof pool && !bad; i++) if (pool[i] != (char)CANARY) bad = "pool written by a failed decode";
                 ray_error_free(err);
             }
             ray_release(c);
@@ -851,6 +956,9 @@ const test_entry_t enccol_entries[] = {
     { "enccol/dict_once_concurrent",   test_dict_once_concurrent,   enccol_setup, enccol_teardown },
     { "enccol/decode_trailing_bytes",  test_decode_trailing_bytes,  enccol_setup, enccol_teardown },
     { "enccol/dict_null_dictionary",   test_dict_null_dictionary,   enccol_setup, enccol_teardown },
+    { "enccol/vec_range_checks",       test_vec_range_checks,       enccol_setup, enccol_teardown },
+    { "enccol/descriptor_null_sum",    test_descriptor_null_sum,    enccol_setup, enccol_teardown },
+    { "enccol/str_stats_corrupt",      test_str_stats_corrupt,      enccol_setup, enccol_teardown },
     { "enccol/sym_width_and_bound",    test_sym_width_and_bound,    enccol_setup, enccol_teardown },
     { "enccol/decode_mutation_sweep",  test_decode_mutation_sweep,  enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
