@@ -168,10 +168,10 @@ static inline int ray_enc_gen2_supported(void) { return RAY_ENC_LE; }
 static inline uint64_t ray_enc_pad8(uint64_t x)  { return (x + 7) & ~(uint64_t)7; }
 static inline uint64_t ray_enc_pad32(uint64_t x) { return (x + 31) & ~(uint64_t)31; }
 static inline int64_t ray_enc_nchunks(int64_t len) {
-    return len <= 0 ? 0 : (len + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    return len <= 0 ? 0 : (int64_t)(((uint64_t)len + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK);
 }
 static inline int64_t ray_enc_nvecs(int64_t len) {
-    return len <= 0 ? 0 : (len + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
+    return len <= 0 ? 0 : (int64_t)(((uint64_t)len + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
 }
 /* Length of column-global vector `vec`: 1024 except the column's last.
  * Precondition: 0 <= vec < ray_enc_nvecs(len). */

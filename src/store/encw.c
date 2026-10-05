@@ -277,10 +277,9 @@ static ray_err_t encw_str(const void* data, const char* pool, int64_t start, int
 
 ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
                        int64_t start, int n, const ray_enc_dict_t* dict, ray_encw_vec_t* o) {
-#if !RAY_ENC_LE
-    (void)type; (void)attrs; (void)data; (void)str_pool; (void)start; (void)n; (void)dict; (void)o;
-    return RAY_ERR_NYI;
-#else
+    if (!ray_enc_gen2_supported()) {
+        return RAY_ERR_NYI;
+    }
     vec_reset(o);
     if (n <= 0 || n > RAY_ENC_VEC) return RAY_ERR_RANGE;
     ray_err_t err;
@@ -300,7 +299,6 @@ ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char*
     o->desc.n_nulls = (uint16_t)o->n_nulls;
     o->desc.payload_bytes = o->payload.len;
     return RAY_OK;
-#endif
 }
 
 static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
@@ -324,10 +322,9 @@ void ray_encw_free(ray_encw_t* w) {
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags) {
     memset(w, 0, sizeof *w);
-#if !RAY_ENC_LE
-    (void)f; (void)type; (void)attrs; (void)len; (void)sym_count; (void)index_kind; (void)col_flags;
-    return RAY_ERR_NYI;
-#else
+    if (!ray_enc_gen2_supported()) {
+        return RAY_ERR_NYI;
+    }
     if (!ray_encw_type_supported(type) || len < 0) return RAY_ERR_NYI;
     w->f = f; w->type = type; w->attrs = attrs; w->len = len;
     w->sym_count = type == RAY_SYM ? sym_count : 0;
@@ -339,7 +336,6 @@ ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int
     }
     /* Headers and directory are written last, at offset 0 (finish). */
     return fput(w, NULL, (size_t)RAY_ENC_DIR_OFF + (size_t)w->n_chunks * sizeof(ray_enc_dirent_t));
-#endif
 }
 
 /* VALUE_DICT is trained on the column's first chunk and frozen (spec

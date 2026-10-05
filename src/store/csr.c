@@ -23,6 +23,7 @@
 
 #include "csr.h"
 #include "store/col.h"
+#include "store/enccol.h"
 #include "mem/sys.h"
 #include "store/fileio.h"   /* ray_mkdir */
 #include <stdlib.h>
@@ -397,6 +398,17 @@ static ray_err_t csr_save(ray_csr_t* csr, const char* dir, const char* prefix) {
     return RAY_OK;
 }
 
+/* The CSR arrays are plain vectors; an encoded column is refused until
+ * the aware paths land (NULL, so every caller takes its error path). */
+static ray_t* csr_col(const char* path, bool use_mmap) {
+    ray_t* c = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+    if (c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL) {
+        ray_release(c);
+        return NULL;
+    }
+    return c;
+}
+
 static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* prefix,
                                 bool use_mmap) {
     char path[1024];
@@ -404,7 +416,7 @@ static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* pref
 
     len = snprintf(path, sizeof(path), "%s/%s_offsets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->offsets = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+    csr->offsets = csr_col(path, use_mmap);
     if (!csr->offsets || RAY_IS_ERR(csr->offsets)) {
         csr->offsets = NULL;
         return RAY_ERR_IO;
@@ -412,7 +424,7 @@ static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* pref
 
     len = snprintf(path, sizeof(path), "%s/%s_targets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->targets = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+    csr->targets = csr_col(path, use_mmap);
     if (!csr->targets || RAY_IS_ERR(csr->targets)) {
         ray_release(csr->offsets); csr->offsets = NULL;
         csr->targets = NULL;
@@ -421,7 +433,7 @@ static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* pref
 
     len = snprintf(path, sizeof(path), "%s/%s_rowmap", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->rowmap = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+    csr->rowmap = csr_col(path, use_mmap);
     if (!csr->rowmap || RAY_IS_ERR(csr->rowmap)) {
         /* rowmap is optional — ignore error */
         csr->rowmap = NULL;
@@ -514,7 +526,7 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
     char path[1024];
     int len = snprintf(path, sizeof(path), "%s/meta", dir);
     if (len >= 0 && (size_t)len < sizeof(path)) {
-        ray_t* meta = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+        ray_t* meta = csr_col(path, use_mmap);
         if (meta && !RAY_IS_ERR(meta) && meta->len >= 5) {
             int64_t* md = (int64_t*)ray_data(meta);
             rel->from_table = (uint16_t)md[0];

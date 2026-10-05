@@ -29,6 +29,7 @@
 #include "core/pool.h"
 #include "mem/sys.h"
 #include "store/col.h"
+#include "store/enccol.h"
 #include "store/fileio.h"
 #include "store/serde.h"
 #include "table/sym.h"
@@ -1028,6 +1029,15 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                              dir, (int)name_len, name);
         }
 
+        /* until the table core admits it (P1 Task 10) */
+        if (col->type == RAY_ENCCOL) {
+            ray_release(col);
+            ray_release(schema);
+            ray_release(tbl);
+            return ray_error("nyi", "splayed %s: column '%.*s' is a generation-2 file",
+                             dir, (int)name_len, name);
+        }
+
         if (c > 0 && col->len != ray_table_nrows(tbl)) {
             ray_t* err = ray_error("corrupt",
                 "splayed %s: column '%.*s' has %lld rows, expected %lld "
@@ -1373,6 +1383,7 @@ ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
     int64_t t0 = trace ? ray_profile_now_ns() : 0;
     ray_t* col = ray_col_mmap(path);
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    if (col->type == RAY_ENCCOL) { ray_release(col); return RAY_ERR_NYI; }
     ray_err_t err = RAY_ERR_IO;
     int64_t t1 = trace ? ray_profile_now_ns() : 0;
     ray_t* hi = ray_idx_hash_fn(col);

@@ -30,6 +30,9 @@
 #include "store/col.h"
 #include "store/encfmt.h"
 #include "store/enccol.h"
+#include "store/splay.h"
+#include "table/domain.h"
+#include "table/table.h"
 #include "ops/idxop.h"
 #include <unistd.h>
 #include <stdio.h>
@@ -227,17 +230,181 @@ static test_result_t test_no_mapping_leak(void) {
 
 /* The big-endian gate (generation 2 answers nyi there, not corrupt) cannot
  * be exercised end to end on a little-endian host: ray_enccol_open's
- * #if !RAY_ENC_LE branch is compiled out.  What is testable portably: the
- * gate predicate tracks RAY_ENC_LE, and the discriminator recognises "XENC"
- * bytewise, so on any host a generation-2 file reaches ray_enccol_open
+ * `!ray_enc_gen2_supported()` branch is never taken (the build with
+ * -U__BYTE_ORDER__ checks that it compiles).  What is testable here: the
+ * discriminator recognises "XENC" bytewise, so on any host a generation-2 file reaches ray_enccol_open
  * instead of being rejected as corrupt before the gate. */
 static test_result_t test_be_gate_logic(void) {
-    TEST_ASSERT_EQ_I(ray_enc_gen2_supported(), RAY_ENC_LE);
     uint8_t h[32] = {0};
     memcpy(h, "XENC", 4); h[17] = RAY_ENC_GEN;
     TEST_ASSERT_EQ_I(ray_col_gen_of(h), 2);
     memcpy(h, "CNEX", 4);                       /* byte-reversed marker is not XENC */
     TEST_ASSERT_EQ_I(ray_col_gen_of(h), RAY_ENC_GEN_CORRUPT);
+    PASS();
+}
+
+/* ---- fix round 1 ---- */
+
+#define LEN_OFF  ((long)offsetof(ray_t, len))
+#define MMOD_OFF ((long)offsetof(ray_t, mmod))
+#define RC_OFF   ((long)offsetof(ray_t, rc))
+
+static test_result_t test_load_rejects_more(void) {
+    const char* p = ENCCOL_TMP "/m";
+    uint8_t one = 1;
+    int64_t v64;
+    uint64_t u;
+    /* crafted lengths: no signed overflow, no huge directory */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    v64 = INT64_MAX; patch(p, LEN_OFF, &v64, 8);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    v64 = INT64_MAX - 1; patch(p, LEN_OFF, &v64, 8);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    v64 = -1; patch(p, LEN_OFF, &v64, 8);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    v64 = 65536 * 3; patch(p, LEN_OFF, &v64, 8);           /* directory would not fit */
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* outer reserved bytes and mmod */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    patch(p, 5, &one, 1);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    patch(p, MMOD_OFF, &one, 1);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* SYM count on a non-SYM column */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    { uint32_t sc = 5; patch(p, RC_OFF, &sc, 4); }
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* str_pool_bytes on a non-STR column */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    u = 1; patch(p, 32 + 48, &u, 8);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* trailing bytes after the last section */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    { FILE* f = fopen(p, "ab"); fwrite(&one, 1, 1, f); fclose(f); }
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* directory: chunk size not a multiple of 8 */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    u = 3073; patch(p, 96 + 8, &u, 8);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* directory: min above max */
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
+    v64 = (int64_t)1 << 40; patch(p, 96 + 16, &v64, 8);
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    /* directory: NaN float bound */
+    {
+        ray_t* f = ray_vec_new(RAY_F64, 3000); f->len = 3000;
+        for (int i = 0; i < 3000; i++) ((double*)ray_data(f))[i] = (double)(i % 100);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(f, p, 2), RAY_OK); ray_release(f);
+        uint64_t nan = 0x7ff8000000000000ull; patch(p, 96 + 16, &nan, 8);
+        TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    }
+    /* directory: a sum on a type that is not summed */
+    {
+        ray_t* g = ray_vec_new(RAY_GUID, 4); g->len = 4; memset(ray_data(g), 1, 64);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(g, p, 2), RAY_OK); ray_release(g);
+        u = 1; patch(p, 96 + 32, &u, 8);
+        TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    }
+    PASS();
+}
+
+/* Real writer output with a VALUE_DICT side entry loads; a damaged side
+ * table does not. */
+static const int64_t g_dv[4] = { 11, 900000000001ll, 77, 123456789012345ll };
+static test_result_t test_value_dict_side(void) {
+    const char* p = ENCCOL_TMP "/vd";
+    int64_t d[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) d[i] = g_dv[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
+    ray_t* v = ray_vec_from_raw(RAY_I64, d, RAY_ENC_VEC);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_t* e = ray_enccol_of(c);
+    TEST_ASSERT_TRUE(e->vdict_off != 0);
+    TEST_ASSERT_EQ_U(e->vdict_off % 32, 0);
+    uint64_t side_off = e->hdr.side_off;
+    ray_release(c);
+    uint32_t one = 1;
+    patch(p, (long)side_off + 4, &one, 4);                /* side table reserved word */
+    TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
+    PASS();
+}
+
+/* SYM with a domain: the saved-count rule and the directory id bound. */
+static ray_t* sym_col_save(const char* p) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W8, 16);
+    v->len = 16;
+    for (int i = 0; i < 16; i++) ((uint8_t*)ray_data(v))[i] = (uint8_t)((i % 4) + 1);
+    ray_err_t e = ray_col_save_gen(v, p, 2);
+    ray_release(v);
+    return e == RAY_OK ? NULL : ray_error("fail", "save");
+}
+static test_result_t test_sym_domain_rules(void) {
+    const char* p = ENCCOL_TMP "/sd";
+    ray_sym_domain_t* dom = ray_sym_runtime_domain();
+    TEST_ASSERT_NULL(sym_col_save(p));
+    ray_t* c = ray_col_mmap_splayed_dom(p, dom);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(ray_enccol_of(c)->type, RAY_SYM);
+    ray_release(c);
+    /* saved count above the domain's */
+    uint32_t big = 1000000; patch(p, RC_OFF, &big, 4);
+    ray_t* r = ray_col_mmap_splayed_dom(p, dom);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    /* directory max above the bound */
+    TEST_ASSERT_NULL(sym_col_save(p));
+    int64_t mx = 1000000; patch(p, 96 + 24, &mx, 8);
+    r = ray_col_mmap_splayed_dom(p, dom);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    /* directory min below 1 */
+    TEST_ASSERT_NULL(sym_col_save(p));
+    int64_t mn = 0; patch(p, 96 + 16, &mn, 8);
+    r = ray_col_mmap_splayed_dom(p, dom);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    PASS();
+}
+
+/* Plain-vector consumers refuse an encoded column until their tasks land. */
+static test_result_t test_consumers_refuse(void) {
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    /* (a) CSR offsets */
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(ENCCOL_TMP "/rel"), 0);
+    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/rel/fwd_offsets", 3000), RAY_OK);
+    TEST_ASSERT_NULL(ray_rel_mmap(ENCCOL_TMP "/rel"));
+    /* (b) hash index build */
+    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/hc", 3000), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_hash_column(ENCCOL_TMP "/hc", NULL), RAY_ERR_NYI);
+    ray_t* ok = ray_col_mmap(ENCCOL_TMP "/hc");            /* file untouched */
+    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
+    ray_release(ok);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.sys_mapped, m0.sys_mapped);
+    /* (c) splayed table load: one plain column, one generation-2 file */
+    ray_t* tbl = ray_table_new(2);
+    ray_t* a = ray_vec_new(RAY_I64, 3000); a->len = 3000;
+    ray_t* b = ray_vec_new(RAY_I32, 3000); b->len = 3000;
+    for (int i = 0; i < 3000; i++) { ((int64_t*)ray_data(a))[i] = i; ((int32_t*)ray_data(b))[i] = i % 977; }
+    tbl = ray_table_add_col(tbl, ray_sym_intern("ca", 2), a);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("cb", 2), b);
+    ray_release(a); ray_release(b);
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, ENCCOL_TMP "/tb", NULL), RAY_OK);
+    ray_release(tbl);
+    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/tb/cb", 3000), RAY_OK);   /* now generation 2 */
+    ray_t* r = ray_read_splayed(ENCCOL_TMP "/tb", NULL);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
+    ray_error_free(r);
     PASS();
 }
 
@@ -248,6 +415,10 @@ const test_entry_t enccol_entries[] = {
     { "enccol/append_index_gen2",   test_append_index_refuses_gen2, enccol_setup, enccol_teardown },
     { "enccol/load_gen2_nyi",       test_load_gen2_nyi,       enccol_setup, enccol_teardown },
     { "enccol/no_mapping_leak",     test_no_mapping_leak,     enccol_setup, enccol_teardown },
+    { "enccol/load_rejects_more",   test_load_rejects_more,   enccol_setup, enccol_teardown },
+    { "enccol/value_dict_side",     test_value_dict_side,     enccol_setup, enccol_teardown },
+    { "enccol/sym_domain_rules",    test_sym_domain_rules,    enccol_setup, enccol_teardown },
+    { "enccol/consumers_refuse",    test_consumers_refuse,    enccol_setup, enccol_teardown },
     { "enccol/be_gate_logic",       test_be_gate_logic,       enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
 };

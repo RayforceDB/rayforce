@@ -753,7 +753,8 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     if (!f) return RAY_ERR_IO;
     uint8_t h32[32];
     if (fread(h32, 1, 32, f) != 32) { fclose(f); return RAY_ERR_CORRUPT; }
-    if (ray_col_gen_of(h32) == 2) { fclose(f); return RAY_ERR_VERSION; }
+    int gen = ray_col_gen_of(h32);
+    if (gen != 0) { fclose(f); return gen == RAY_ENC_GEN_CORRUPT ? RAY_ERR_CORRUPT : RAY_ERR_VERSION; }
     uint32_t cur_mg; memcpy(&cur_mg, h32, 4);
     if (cur_mg == COL_IDX_AUX_MAGIC) { fclose(f); return RAY_ERR_CORRUPT; }
     int64_t payload_end = 0;
