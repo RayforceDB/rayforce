@@ -1790,11 +1790,55 @@ typedef struct {
     _Atomic uint32_t* nulls;
     _Atomic uint32_t* locks;
     ray_t** errors;
+    _Atomic uint8_t* prefetched;   /* [ngroups]: read-ahead already requested */
+    int64_t prefetch;              /* row groups requested ahead of the one starting */
 } pq_direct_work;
+
+/* Byte range of row group g in the file: its column chunks are contiguous,
+ * each from its dictionary page (or first data page) for total_compressed
+ * bytes.  False when the metadata does not give one. */
+static bool pq_group_bytes(ray_parquet_t* r, int64_t g, int64_t* lo, int64_t* hi) {
+    pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
+    int64_t rows = 0;
+    bool ok = cols && pq_group_columns(r,g,cols,&rows,NULL);
+    int64_t a = INT64_MAX, b = 0;
+    for (int64_t c = 0; ok && c < r->ncols; c++) {
+        pq_span mf[17];
+        if (!pq_fields(cols[c],mf,17)) { ok = false; break; }
+        int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
+        int64_t start = dict > 0 && dict < data ? dict : data;
+        if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) { ok = false; break; }
+        if (start < a) a = start;
+        if (start + bytes > b) b = start + bytes;
+    }
+    ray_free_raw(cols);
+    if (!ok || a >= b) return false;
+    *lo = a; *hi = b;
+    return true;
+}
+
+/* A mapped column chunk is read on first touch, one fault at a time per
+ * worker, so a worker has a single read in flight.  On storage with a high
+ * per-request latency (a network block device) that latency bounds the
+ * import.  The first task of a row group asks the kernel to start reading
+ * the next `prefetch` groups in the background: their pages arrive while
+ * this group decodes, many requests in flight.  RAY_PQ_PREFETCH sets the
+ * depth (default 2, 0 turns it off). */
+static void pq_prefetch_groups(pq_direct_work* w, int64_t g) {
+    ray_parquet_t* r = w->parent;
+    for (int64_t k = 0; k <= w->prefetch && g + k < r->ngroups; k++) {
+        uint8_t z = 0;
+        if (!atomic_compare_exchange_strong_explicit(&w->prefetched[g+k],&z,1,
+                memory_order_relaxed,memory_order_relaxed)) continue;
+        int64_t lo, hi;
+        if (pq_group_bytes(r,g+k,&lo,&hi)) ray_vm_advise_willneed(r->map + lo,(size_t)(hi-lo));
+    }
+}
 static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_direct_work* w = ptr;
     for (int64_t task = start; task < end; task++) {
         int64_t g = task/w->parent->ncols, c = task%w->parent->ncols;
+        if (w->prefetched) pq_prefetch_groups(w,g);
         ray_parquet_t* r = pq_group_reader(w->parent,g);
         if (!r) { w->errors[task] = ray_error("oom",NULL); continue; }
         /* A task is one column chunk, so both groups and columns can occupy
@@ -1863,7 +1907,15 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
         offsets[g+1] = offsets[g]+pq_get(fields[3],0);
     }
-    pq_direct_work work = {r,writers,offsets,nulls,locks,errors};
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0};
+    {
+        const char* e = getenv("RAY_PQ_PREFETCH");
+        work.prefetch = (e && *e) ? strtol(e,NULL,10) : 2;
+        if (work.prefetch > 0) {
+            work.prefetched = ray_calloc_raw((size_t)r->ngroups);
+            if (work.prefetched) for (int64_t g = 0; g < r->ngroups; g++) atomic_init(&work.prefetched[g],0);
+        }
+    }
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
     else pq_write_direct_group(&work,0,0,tasks);
@@ -1875,6 +1927,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         writers[c].rows = r->rows;
         writers[c].had_nulls = atomic_load_explicit(&nulls[c],memory_order_relaxed) != 0;
     }
+    if (work.prefetched) ray_free_raw((void*)work.prefetched);
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors); return err;

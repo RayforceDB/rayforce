@@ -113,6 +113,13 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+void ray_vm_advise_willneed(void* ptr, size_t size) {
+    if (!ptr || !size) return;
+    /* madvise wants a page-aligned start. */
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)4095;
+    madvise((void*)a, size + ((uintptr_t)ptr - a), MADV_WILLNEED);
+}
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
 #if defined(RAY_OS_MACOS)
@@ -647,6 +654,14 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 }
 
+void ray_vm_advise_willneed(void* ptr, size_t size) {
+    if (!ptr || !size) return;
+    WIN32_MEMORY_RANGE_ENTRY entry;
+    entry.VirtualAddress = ptr;
+    entry.NumberOfBytes  = size;
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+}
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
     /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
@@ -862,6 +877,7 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
 
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
+void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {

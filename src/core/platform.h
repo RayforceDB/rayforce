@@ -156,6 +156,9 @@ void* ray_vm_map_file(const char* path, size_t* out_size);
 void* ray_vm_map_fd_ro(int fd, size_t size);
 void  ray_vm_unmap_file(void* ptr, size_t size);
 void  ray_vm_advise_seq(void* ptr, size_t size);
+/* Ask the kernel to start reading [ptr, ptr+size) of a file mapping now,
+ * asynchronously, so a later access finds it resident.  Best effort. */
+void  ray_vm_advise_willneed(void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
 /* Release physical pages for a free block.  When hugepage is true, only the
  * 2MB-aligned interior is released so a partial MADV_DONTNEED does not
