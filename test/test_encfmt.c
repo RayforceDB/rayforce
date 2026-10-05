@@ -1035,6 +1035,13 @@ static int file_gen(const char* path) {
     return g;
 }
 
+static bool files_equal(const char* a, const char* b) {
+    size_t na, nb; uint8_t* pa = read_file(a, &na); uint8_t* pb = read_file(b, &nb);
+    bool eq = pa && pb && na == nb && memcmp(pa, pb, na) == 0;
+    free(pa); free(pb);
+    return eq;
+}
+
 static bool file_exists(const char* path) {
     FILE* f = fopen(path, "rb");
     if (f) fclose(f);
@@ -1061,14 +1068,14 @@ static test_result_t test_gen0_fallback(void) {
     l = ray_list_append(l, ray_i64(5));
     ray_err_t e = ray_col_save_gen(l, ENCFMT_TMP "/fl", 2);
     TEST_ASSERT_EQ_I(e, ray_col_save(l, ENCFMT_TMP "/fl0"));
-    TEST_ASSERT_TRUE(file_gen(ENCFMT_TMP "/fl") != 2);
+    TEST_ASSERT_TRUE(files_equal(ENCFMT_TMP "/fl", ENCFMT_TMP "/fl0"));   /* the gen-0 bytes */
     ray_release(l);
 
     v = i64_ramp(100);
     v->attrs |= RAY_ATTR_HAS_LINK;                       /* link bit only: ineligible */
     e = ray_col_save_gen(v, ENCFMT_TMP "/fk", 2);
     TEST_ASSERT_EQ_I(e, ray_col_save(v, ENCFMT_TMP "/fk0"));
-    TEST_ASSERT_TRUE(file_gen(ENCFMT_TMP "/fk") != 2);
+    TEST_ASSERT_TRUE(files_equal(ENCFMT_TMP "/fk", ENCFMT_TMP "/fk0"));   /* the gen-0 bytes */
     v->attrs &= (uint8_t)~RAY_ATTR_HAS_LINK;
     ray_release(v);
 
