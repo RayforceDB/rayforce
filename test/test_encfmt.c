@@ -549,10 +549,14 @@ static test_result_t test_vec_sym_w16_w32(void) {
 static uint8_t* read_file(const char* path, size_t* n) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    long sz = -1;
+    if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
     uint8_t* b = malloc((size_t)sz + 1);
+    if (!b) { fclose(f); return NULL; }
     *n = fread(b, 1, (size_t)sz, f);
     fclose(f);
+    if (*n != (size_t)sz) { free(b); return NULL; }
     return b;
 }
 
@@ -730,7 +734,13 @@ static test_result_t test_empty_column(void) {
     PASS();
 }
 
-#define ENC_GOLDEN_OUT "/tmp/rayforce_enc_golden"
+/* Compile with -DENC_GOLDEN_KEEP to regenerate the fixtures into a kept
+ * directory; otherwise the emit test writes into the (removed) test dir. */
+#ifdef ENC_GOLDEN_KEEP
+#  define ENC_GOLDEN_OUT "/tmp/rayforce_enc_golden"
+#else
+#  define ENC_GOLDEN_OUT ENCFMT_TMP "/golden_emit"
+#endif
 #define ENC_GOLDEN_DIR "test/data/enc"
 
 static uint64_t g_rng;
@@ -739,7 +749,9 @@ static uint64_t golden_rng(void) { uint64_t x = g_rng; x ^= x << 13; x ^= x >> 7
 /* Golden case i: its vector, its name, the encoding forced for every vector
  * (-1 = selection) and the top-level encoding vector 0 must have, pinned by
  * hand against ray_enc_choose (sizes in the comments).  NULL past the last. */
+static int g_kid[4];   /* pinned child-slot encodings of vector 0 (-1 = unpinned); see golden_kids */
 static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
+    for (int j = 0; j < 4; j++) g_kid[j] = -1;
     g_rng = 0x9E3779B97F4A7C15ull + (uint64_t)i;
     ray_t* v = NULL;
     *force = -1;
@@ -750,9 +762,11 @@ static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
               v = ray_vec_new(RAY_I64, 2000); v->len = 2000; for (int k = 0; k < 2000; k++) ((int64_t*)ray_data(v))[k] = 42; break; }
     case 2: { *name = "i64_delta"; *want = RAY_ENC_DELTA_BP;         /* w=0: 136 B; DICT 1296 B */
               int64_t d[1024]; for (int k = 0; k < 1024; k++) d[k] = 1700000000000ll + 1000ll * k; v = ray_vec_from_raw(RAY_I64, d, 1024); break; }
-    case 3: { *name = "i64_dict_codes_rle"; *want = RAY_ENC_DICT;    /* codes RLE: 104 B; top RLE 136 B */
+    case 3: { g_kid[1] = RAY_ENC_RLE; g_kid[2] = RAY_ENC_RAW; g_kid[3] = RAY_ENC_RAW;
+              *name = "i64_dict_codes_rle"; *want = RAY_ENC_DICT;    /* codes RLE: 104 B; top RLE 136 B */
               int64_t d[1024]; for (int k = 0; k < 1024; k++) d[k] = (int64_t)(k / 100) * 1000003ll; v = ray_vec_from_raw(RAY_I64, d, 1024); break; }
-    case 4: { *name = "i64_dict"; *want = RAY_ENC_DICT;              /* VALUE_DICT side entry; codes FOR w=2: 272 B */
+    case 4: { g_kid[1] = RAY_ENC_FOR_BP;
+              *name = "i64_dict"; *want = RAY_ENC_DICT;              /* VALUE_DICT side entry; codes FOR w=2: 272 B */
               int64_t d[1024]; for (int k = 0; k < 1024; k++) d[k] = dict_val(k); v = ray_vec_from_raw(RAY_I64, d, 1024); break; }
     case 5: { *name = "i32_nulls"; *want = RAY_ENC_FOR_BP;           /* w=10: 1288 B; DICT 1296 B */
               int32_t d[1024]; for (int k = 0; k < 1024; k++) d[k] = (k % 10 == 0) ? NULL_I32 : k; v = ray_vec_from_raw(RAY_I32, d, 1024); v->attrs |= RAY_ATTR_HAS_NULLS; break; }
@@ -801,12 +815,30 @@ static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
                    else ((int64_t*)ray_data(v))[k] = up ? INT64_MAX : INT64_MIN + 1;
                }
                break; }
-    case 23: { *name = "i64_dict_const_child"; *force = RAY_ENC_DICT; *want = RAY_ENC_DICT;  /* codes FOR w=0 at depth 1 */
+    case 23: { g_kid[1] = RAY_ENC_FOR_BP;
+               *name = "i64_dict_const_child"; *force = RAY_ENC_DICT; *want = RAY_ENC_DICT;  /* codes FOR w=0 at depth 1 */
                v = ray_vec_new(RAY_I64, 1024); v->len = 1024; for (int k = 0; k < 1024; k++) ((int64_t*)ray_data(v))[k] = 900000000001ll; break; }
-    case 24: { *name = "i64_rle_values_for"; *force = RAY_ENC_RLE; *want = RAY_ENC_RLE;      /* values FOR w=4 */
+    case 24: { g_kid[1] = RAY_ENC_FOR_BP;
+               *name = "i64_rle_values_for"; *force = RAY_ENC_RLE; *want = RAY_ENC_RLE;      /* values FOR w=4 */
                v = ray_vec_new(RAY_I64, 1024); v->len = 1024; for (int k = 0; k < 1024; k++) ((int64_t*)ray_data(v))[k] = 1000 + (k / 2) % 16; break; }
-    case 25: { *name = "i64_rle_ends_delta"; *force = RAY_ENC_RLE; *want = RAY_ENC_RLE;      /* ends DELTA w=0 */
+    case 25: { g_kid[2] = RAY_ENC_DELTA_BP;
+               *name = "i64_rle_ends_delta"; *force = RAY_ENC_RLE; *want = RAY_ENC_RLE;      /* ends DELTA w=0 */
                v = ray_vec_new(RAY_I64, 1024); v->len = 1024; for (int k = 0; k < 1024; k++) ((int64_t*)ray_data(v))[k] = (int64_t)k * 3; break; }
+    /* ends of ~790 irregular runs: RAW 1580 B, DELTA w=7 1416 B, FOR w=10 1288 B */
+    case 26: { g_kid[2] = RAY_ENC_FOR_BP;
+               *name = "i64_rle_ends_for"; *force = RAY_ENC_RLE; *want = RAY_ENC_RLE;
+               v = ray_vec_new(RAY_I64, 1024); v->len = 1024;
+               int64_t val = 0;
+               for (int k = 0; k < 1024; ) {
+                   int run = (golden_rng() % 64 == 0) ? 20 : 1;
+                   for (int j = 0; j < run && k < 1024; j++) ((int64_t*)ray_data(v))[k++] = val;
+                   val += 7;
+               }
+               break; }
+    /* three rows, dictionary of three: codes RAW 16 B beats FOR (8 + 256 B) */
+    case 27: { g_kid[1] = RAY_ENC_RAW;
+               *name = "i64_dict_codes_raw"; *force = RAY_ENC_DICT; *want = RAY_ENC_DICT;
+               int64_t d[3] = { 5, 900000000001ll, -77 }; v = ray_vec_from_raw(RAY_I64, d, 3); break; }
     default: return NULL;
     }
     return v;
@@ -838,13 +870,40 @@ static ray_err_t golden_sym(int i, const char* dir, const char** name) {
 
 static const int g_sym_want[2] = { RAY_ENC_FOR_BP, RAY_ENC_RLE };
 
-static int file_desc0_encoding(const char* path) {
+/* Encodings of vector 0 read from the file: [0] top level; RLE: [1] values,
+ * [2] ends; DICT: [1] codes and, when the codes are RLE, [2] their values and
+ * [3] their ends.  -1 where the slot does not exist or the file is short. */
+static void golden_kids(const char* path, int kid[4]) {
+    for (int j = 0; j < 4; j++) kid[j] = -1;
     size_t n; uint8_t* b = read_file(path, &n);
+    if (!b) return;
     uint64_t off = 0;                                   /* chunk 0 follows the directory */
-    if (b && n >= 96 + 64) memcpy(&off, b + 96, 8);
-    int e = (b && off >= 160 && off + 48 <= n) ? b[off] : -1;
+    if (n >= 96 + 64) memcpy(&off, b + 96, 8);
+    if (off >= 160 && off + 48 <= n) {
+        ray_enc_desc_t d; memcpy(&d, b + off, 48);
+        kid[0] = d.encoding;
+        const uint8_t* p = b + off + d.payload_off;
+        const uint8_t* end = b + n;
+        uint32_t bb;
+        if (d.encoding == RAY_ENC_RLE && p + 24 <= end) {
+            kid[1] = p[8];
+            memcpy(&bb, p + 12, 4);
+            if (p + 16 + bb < end) kid[2] = p[16 + bb];
+        } else if (d.encoding == RAY_ENC_DICT && p + 8 <= end) {
+            kid[1] = p[0];
+            if (p[0] == RAY_ENC_RLE && p + 32 <= end) {
+                kid[2] = p[16];
+                memcpy(&bb, p + 20, 4);
+                if (p + 24 + bb < end) kid[3] = p[24 + bb];
+            }
+        }
+    }
     free(b);
-    return e;
+}
+
+static int file_desc0_encoding(const char* path) {
+    int kid[4]; golden_kids(path, kid);
+    return kid[0];
 }
 
 /* Emits every case and checks vector 0's encoding against its pin. */
@@ -865,6 +924,12 @@ static const char* golden_emit_all(const char* dir) {
             snprintf(why, sizeof why, "%s: encoding %d, pinned %d", name, file_desc0_encoding(path), want);
             return why;
         }
+        int kid[4]; golden_kids(path, kid);
+        for (int j = 1; j < 4; j++)
+            if (g_kid[j] >= 0 && kid[j] != g_kid[j]) {
+                snprintf(why, sizeof why, "%s: child slot %d encoding %d, pinned %d", name, j, kid[j], g_kid[j]);
+                return why;
+            }
     }
     for (int i = 0; i < 2; i++) {
         const char* name; ray_err_t e = golden_sym(i, dir, &name);
@@ -882,7 +947,7 @@ static const char* const g_golden_names[] = {
     "u8_raw", "bool_rle", "f64_trailer", "f64_const", "f32_zeros", "guid_mixed", "str_mixed",
     "str_const", "i64_empty", "i32_two_chunks", "str_inline", "str_pooled", "str_repeated",
     "i16_delta_wT", "i32_delta_wT", "i64_delta_wT", "i64_dict_const_child", "i64_rle_values_for",
-    "i64_rle_ends_delta", "sym_w8_for", "sym_w32_rle", NULL,
+    "i64_rle_ends_delta", "i64_rle_ends_for", "i64_dict_codes_raw", "sym_w8_for", "sym_w32_rle", NULL,
 };
 
 static test_result_t test_golden_emit(void) {
@@ -899,33 +964,200 @@ static test_result_t test_golden_match(void) {
         char a[512], b[512];
         snprintf(a, sizeof a, "%s/%s.bin", ENC_GOLDEN_DIR, names[i]);
         snprintf(b, sizeof b, "%s/golden/%s.bin", ENCFMT_TMP, names[i]);
-        size_t na, nb; uint8_t* pa = read_file(a, &na); uint8_t* pb = read_file(b, &nb);
-        TEST_ASSERT_FMT(pa != NULL, "missing fixture %s", a);
-        TEST_ASSERT_FMT(pb != NULL && na == nb && memcmp(pa, pb, na) == 0,
-                        "%s differs from its fixture", names[i]);
+        size_t na = 0, nb = 0; uint8_t* pa = read_file(a, &na); uint8_t* pb = read_file(b, &nb);
+        bool ok = pa && pb && na == nb && memcmp(pa, pb, na) == 0;
+        bool have_fixture = pa != NULL;
         free(pa); free(pb);
+        TEST_ASSERT_FMT(have_fixture, "missing fixture %s", a);
+        TEST_ASSERT_FMT(ok, "%s differs from its fixture", names[i]);
     }
     PASS();
 }
 
 /* Pooled strings (longer than 12 bytes) reach the encoder through the
- * column's real pool: one pooled string per row over two chunks. */
+ * column's real pool.  Row i has 1 + i % 29 bytes, so inline (<= 12) and
+ * pooled strings alternate; pooled rows are unique (a decimal row tag).
+ * Chunk 1 is read back cell by cell: a wrong per-chunk stride or a wrong
+ * pool would change its strings or offsets. */
+static int str_row(int64_t i, char* s) {
+    int k = 1 + (int)(i % 29);
+    if (k > 12) { char tag[16]; snprintf(tag, sizeof tag, "%07d", (int)i); memset(s, 'a' + (int)(i % 26), (size_t)k); memcpy(s, tag, 7); }
+    else memset(s, 'a' + (int)(i % 26), (size_t)k);
+    return k;
+}
+
 static test_result_t test_str_pooled_column(void) {
-    int64_t len = 65536 + 5;
+    int64_t len = 65536 + 40;
     ray_t* v = ray_vec_new(RAY_STR, len);
     char s[40];
+    uint64_t pooled = 0, chunk1_pooled = 0;
     for (int64_t i = 0; i < len; i++) {
-        int k = snprintf(s, sizeof s, "pooled-string-number-%05d", (int)(i % 50000));
+        int k = str_row(i, s);
         v = ray_str_vec_append(v, s, (size_t)k);
+        if (k > 12) { pooled += (uint64_t)k; if (i >= 65536) chunk1_pooled += (uint64_t)k; }
     }
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/sp", 2), RAY_OK);
     ray_release(v);
     size_t n; uint8_t* b = read_file(ENCFMT_TMP "/sp", &n);
     TEST_ASSERT_NOT_NULL(b);
     ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64);
-    TEST_ASSERT_EQ_U(eh.str_pool_bytes, (uint64_t)len * 26);
+    TEST_ASSERT_EQ_U(eh.str_pool_bytes, pooled);
     TEST_ASSERT_EQ_U(eh.end_off, n);
+    ray_enc_dirent_t e1; memcpy(&e1, b + 96 + 64, 64);
+    ray_enc_desc_t d0; memcpy(&d0, b + e1.offset, 48);
+    TEST_ASSERT_EQ_I(d0.encoding, RAY_ENC_RAW);
+    const uint8_t* cells = b + e1.offset + d0.payload_off;
+    uint64_t pb; memcpy(&pb, cells + 40 * 16, 8);
+    TEST_ASSERT_EQ_U(pb, chunk1_pooled);
+    const uint8_t* pool = cells + 40 * 16 + 8;
+    uint32_t want_off = 0;
+    for (int j = 0; j < 40; j++) {
+        int k = str_row(65536 + j, s);
+        uint32_t len_c; memcpy(&len_c, cells + j * 16, 4);
+        TEST_ASSERT_EQ_I(len_c, k);
+        if (k <= 12) {
+            TEST_ASSERT_TRUE(memcmp(cells + j * 16 + 4, s, (size_t)k) == 0);
+        } else {
+            uint32_t off; memcpy(&off, cells + j * 16 + 8, 4);
+            TEST_ASSERT_EQ_U(off, want_off);
+            TEST_ASSERT_TRUE(memcmp(pool + off, s, (size_t)k) == 0);
+            want_off += (uint32_t)k;
+        }
+    }
     free(b);
+    PASS();
+}
+
+static int file_gen(const char* path) {
+    size_t n; uint8_t* b = read_file(path, &n);
+    int g = (b && n >= 32) ? ray_col_gen_of(b) : -99;
+    free(b);
+    return g;
+}
+
+static bool file_exists(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+static ray_t* i64_ramp(int64_t len) {
+    ray_t* v = ray_vec_new(RAY_I64, len);
+    v->len = len;
+    for (int64_t i = 0; i < len; i++) ((int64_t*)ray_data(v))[i] = i * 3;
+    return v;
+}
+
+/* Columns generation 2 cannot hold are written as generation 0. */
+static test_result_t test_gen0_fallback(void) {
+    ray_t* v = i64_ramp(2000);
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/fh", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(file_gen(ENCFMT_TMP "/fh"), 0);
+    ray_release(v);
+
+    ray_t* l = ray_list_new(2);
+    l = ray_list_append(l, ray_i64(5));
+    ray_err_t e = ray_col_save_gen(l, ENCFMT_TMP "/fl", 2);
+    TEST_ASSERT_EQ_I(e, ray_col_save(l, ENCFMT_TMP "/fl0"));
+    TEST_ASSERT_TRUE(file_gen(ENCFMT_TMP "/fl") != 2);
+    ray_release(l);
+
+    v = i64_ramp(100);
+    v->attrs |= RAY_ATTR_HAS_LINK;                       /* link bit only: ineligible */
+    e = ray_col_save_gen(v, ENCFMT_TMP "/fk", 2);
+    TEST_ASSERT_EQ_I(e, ray_col_save(v, ENCFMT_TMP "/fk0"));
+    TEST_ASSERT_TRUE(file_gen(ENCFMT_TMP "/fk") != 2);
+    v->attrs &= (uint8_t)~RAY_ATTR_HAS_LINK;
+    ray_release(v);
+
+    /* a plain column of the same shape is generation 2 */
+    v = i64_ramp(2000);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/fp", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(file_gen(ENCFMT_TMP "/fp"), 2);
+    /* generation 0 is explicit */
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/f0", 0), RAY_OK);
+    TEST_ASSERT_EQ_I(file_gen(ENCFMT_TMP "/f0"), 0);
+    /* generation 1 does not exist */
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/f1", 1), RAY_ERR_VERSION);
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/f1"));
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_bulk_gen(void) {
+    ray_t* v = i64_ramp(70000);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, ENCFMT_TMP "/b2", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/d2", 2), RAY_OK);
+    size_t na, nb; uint8_t* a = read_file(ENCFMT_TMP "/b2", &na); uint8_t* b = read_file(ENCFMT_TMP "/d2", &nb);
+    TEST_ASSERT_TRUE(a && b && na == nb && memcmp(a, b, na) == 0);   /* durability changes no bytes */
+    free(a); free(b);
+    TEST_ASSERT_EQ_I(file_gen(ENCFMT_TMP "/b2"), 2);
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/b2.tmp"));
+    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, ENCFMT_TMP "/b0", 0), RAY_OK);
+    TEST_ASSERT_EQ_I(file_gen(ENCFMT_TMP "/b0"), 0);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, ENCFMT_TMP "/b1", 1), RAY_ERR_VERSION);
+    ray_release(v);
+    PASS();
+}
+
+/* The enc header records ZONE / CHUNK_ZONE and the UNIQUE flag. */
+static test_result_t test_header_index_meta(void) {
+    ray_t* v = i64_ramp(70000);
+    ray_t* r = ray_index_attach_zone(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/iz", 2), RAY_OK);
+    ray_release(v);
+    size_t n; uint8_t* b = read_file(ENCFMT_TMP "/iz", &n);
+    TEST_ASSERT_EQ_I(file_gen(ENCFMT_TMP "/iz"), 2);
+    ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_ZONE);
+    TEST_ASSERT_EQ_I(eh.col_flags, RAY_ENC_FLAG_UNIQUE);
+    TEST_ASSERT_EQ_U(eh.index_off, 0);
+    free(b);
+
+    v = i64_ramp(70000);
+    r = ray_index_attach_chunk_zone(&v, 16);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCFMT_TMP "/ic", 2), RAY_OK);
+    ray_release(v);
+    b = read_file(ENCFMT_TMP "/ic", &n);
+    memcpy(&eh, b + 32, 64);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_EQ_I(eh.col_flags, 0);
+    free(b);
+    PASS();
+}
+
+/* A ZONE root on a type the matrix does not admit is refused, nothing left behind. */
+static test_result_t test_admission_refusal(void) {
+    ray_t* v = i64_ramp(100);
+    ray_t* r = ray_index_attach_zone(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    v->type = RAY_SYM;                                   /* matrix: SYM carries no ZONE */
+    ray_err_t e = ray_col_save_gen(v, ENCFMT_TMP "/nyi", 2);
+    v->type = RAY_I64;
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_NYI);
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/nyi"));
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/nyi.tmp"));
+    PASS();
+}
+
+/* An I/O failure returns an error and leaves neither a target nor a .tmp. */
+static test_result_t test_save_io_failure(void) {
+    ray_t* v = i64_ramp(100);
+    TEST_ASSERT_TRUE(ray_col_save_gen(v, ENCFMT_TMP "/nodir/x", 2) != RAY_OK);
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/nodir/x.tmp"));
+    /* the rename fails: the target is an existing directory */
+    (void)ray_test_mkdir_p(ENCFMT_TMP "/isdir");
+    TEST_ASSERT_TRUE(ray_col_save_gen(v, ENCFMT_TMP "/isdir", 2) != RAY_OK);
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/isdir.tmp"));
+    TEST_ASSERT_TRUE(ray_col_save_bulk_gen(v, ENCFMT_TMP "/isdir", 2) != RAY_OK);
+    TEST_ASSERT_FALSE(file_exists(ENCFMT_TMP "/isdir.tmp"));
+    ray_release(v);
     PASS();
 }
 
@@ -959,6 +1191,11 @@ const test_entry_t encfmt_entries[] = {
     { "encfmt/admission_matrix",          test_admission_matrix,          encfmt_setup, encfmt_teardown },
     { "encfmt/empty_column",              test_empty_column,              encfmt_setup, encfmt_teardown },
     { "encfmt/str_pooled_column",         test_str_pooled_column,         encfmt_setup, encfmt_teardown },
+    { "encfmt/gen0_fallback",             test_gen0_fallback,             encfmt_setup, encfmt_teardown },
+    { "encfmt/bulk_gen",                  test_bulk_gen,                  encfmt_setup, encfmt_teardown },
+    { "encfmt/header_index_meta",         test_header_index_meta,         encfmt_setup, encfmt_teardown },
+    { "encfmt/admission_refusal",         test_admission_refusal,         encfmt_setup, encfmt_teardown },
+    { "encfmt/save_io_failure",           test_save_io_failure,           encfmt_setup, encfmt_teardown },
     { "encfmt/golden_emit",               test_golden_emit,               encfmt_setup, encfmt_teardown },
     { "encfmt/golden_match",              test_golden_match,              encfmt_setup, encfmt_teardown },
     { NULL, NULL, NULL, NULL },

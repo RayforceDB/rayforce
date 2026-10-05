@@ -383,13 +383,12 @@ void      ray_dict_acc_free(ray_dict_acc_t* a);
 
 /* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
-  /* src/ops/idxop.h.  Spec "Materialization" step 3 admission matrix:
-   * numeric and temporal types carry HASH, SORT, BLOOM, PART, ZONE,
-   * CHUNK_ZONE and a marker-only root; SYM carries HASH, PART and a
-   * marker-only root; STR carries HASH, the runtime DICT and a marker-only
-   * root; GUID carries nothing. */
-  bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t parent_type);
-  
+/* Spec "Materialization" step 3 admission matrix:
+ * numeric and temporal types carry HASH, SORT, BLOOM, PART, ZONE,
+ * CHUNK_ZONE and a marker-only root; SYM carries HASH, PART and a
+ * marker-only root; STR carries HASH, the runtime DICT and a marker-only
+ * root; GUID carries nothing. */
+bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t parent_type);
 
 /* ── Inline on-disk index region (zero-copy mmap) ──
  * ray_index_inline_size: bytes the region occupies (32-aligned ray_t blocks).

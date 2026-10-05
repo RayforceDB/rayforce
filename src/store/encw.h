@@ -52,27 +52,27 @@ bool      ray_encw_type_supported(int8_t type);
 void      ray_encw_test_force(int enc);
 
 /* Column assembly (spec "Format"): begin, one chunk per 65536 rows, finish. */
-  typedef struct {
-      FILE*    f;
-      int8_t   type;
-      uint8_t  attrs;            /* source attrs; masked + HAS_NULLS derived at finish */
-      int64_t  len;
-      uint32_t sym_count;        /* outer header rc (SYM) */
-      uint8_t  index_kind;       /* 0, RAY_IDX_ZONE or RAY_IDX_CHUNK_ZONE in P1 */
-      uint8_t  col_flags;        /* RAY_ENC_FLAG_UNIQUE */
-      int64_t  n_chunks, chunk_i;
-      ray_enc_dirent_t* dir;
-      uint64_t pos;              /* bytes written == current file offset */
-      uint64_t str_pool_bytes;
-      bool     any_bitmap_null;
-      uint64_t* dict_v; uint32_t dict_n; bool dict_used;
-      ray_enc_buf_t  chunk;
-      ray_encw_vec_t vec;
-  } ray_encw_t;
-  ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
-                           uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
-  ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
-  ray_err_t ray_encw_finish(ray_encw_t* w);
-  void      ray_encw_free(ray_encw_t* w);
-  
+typedef struct {
+    FILE*    f;
+    int8_t   type;
+    uint8_t  attrs;            /* source attrs; masked + HAS_NULLS derived at finish */
+    int64_t  len;
+    uint32_t sym_count;        /* outer header rc (SYM) */
+    uint8_t  index_kind;       /* 0, RAY_IDX_ZONE or RAY_IDX_CHUNK_ZONE in P1 */
+    uint8_t  col_flags;        /* RAY_ENC_FLAG_UNIQUE */
+    int64_t  n_chunks, chunk_i;
+    ray_enc_dirent_t* dir;
+    uint64_t pos;              /* bytes written == current file offset */
+    uint64_t str_pool_bytes;
+    bool     any_bitmap_null;
+    uint64_t* dict_v; uint32_t dict_n; bool dict_used;
+    ray_enc_buf_t  chunk;
+    ray_encw_vec_t vec;
+} ray_encw_t;
+ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
+                         uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
+ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
+ray_err_t ray_encw_finish(ray_encw_t* w);
+void      ray_encw_free(ray_encw_t* w);
+
 #endif /* RAY_ENCW_H */

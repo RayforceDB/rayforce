@@ -303,8 +303,6 @@ ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char*
 #endif
 }
 
-#include "mem/heap.h"   /* RAY_ATTR_HAS_NULLS */
-
 static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
     static const uint8_t zeros[4096];
     while (n > 0) {
@@ -354,7 +352,10 @@ static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
     if (!all || !in) { ray_free_raw(all); ray_free_raw(in); return RAY_ERR_OOM; }
     for (int64_t s = 0; s < n; s += RAY_ENC_VEC) {
         int vn = (int)(n - s < RAY_ENC_VEC ? n - s : RAY_ENC_VEC);
-        (void)ray_enc_load(data, w->type, w->attrs, s, vn, in);
+        if (!ray_enc_load(data, w->type, w->attrs, s, vn, in)) {
+            ray_free_raw(all); ray_free_raw(in);
+            return RAY_ERR_RANGE;
+        }
         memcpy(all + s, in->bits, (size_t)vn * sizeof(uint64_t));
     }
     /* P0 final-review ruling: train_dict returns 1 trained, 0 no dictionary
