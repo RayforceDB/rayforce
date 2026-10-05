@@ -189,8 +189,14 @@ static int64_t estimate_column(ray_t* col, const char* name, int64_t vec_base, i
                 g_eval[p].chunk_dec[v] = (int8_t)d;
         }
     }
-    /* VALUE_DICT side entry (8 B entry + 8 B n/reserved + n values), charged only when a vector uses it. */
-    if (dict_uses) bytes += 8 + 8 + (int64_t)dn * k.T / 8;
+    /* VALUE_DICT side data, charged only when a vector uses it: the side
+     * table (u32 n_entries, u32 reserved, one 24-byte entry record = 32 B),
+     * then the entry (u32 n, u32 reserved, n values, padded to 8) placed at
+     * a 32-aligned offset. */
+    if (dict_uses) {
+        int64_t body = (16 + (int64_t)dn * k.T / 8 + 7) & ~(int64_t)7;
+        bytes += 32 + ((body + 31) & ~(int64_t)31);
+    }
     if (dv) ray_free_raw(dv);
     free(in);
     return bytes;
@@ -266,6 +272,16 @@ static void* sym_par_worker(void* a) {
 }
 
 /* ---- symfile estimate ---- */
+/* The FSST `lengths` slot (U32) allows only RAW and FOR_BP: size one vector
+ * of lengths as the smaller of the two plus its 8-byte child header. */
+static int64_t fsst_lengths_bytes(const uint64_t* lv, int m) {
+    ray_enc_kind_t ku = { 32, false };
+    uint64_t base;
+    int w = ray_enc_for_width(lv, m, ku, &base);
+    int64_t raw = ray_enc_size_raw(m, 32), fo = ray_enc_size_for(w);
+    return (raw < fo ? raw : fo) + 8;
+}
+
 static void estimate_sym(const char* sym) {
     ray_sym_domain_t* dom = ray_sym_domain_open(sym);
     if (!dom) { printf("sym\tnone\n"); return; }
@@ -306,11 +322,10 @@ static void estimate_sym(const char* sym) {
             eoff[i] = used; elen[i] = (uint32_t)e; used += (size_t)e;
         }
         blk += (int64_t)((used + 7) & ~(size_t)7) + 8;
-        ray_enc_kind_t ku = { 32, false };
         for (int64_t v = 0; v < n; v += RAY_ENC_VEC) {
             int m = (int)(n - v < RAY_ENC_VEC ? n - v : RAY_ENC_VEC);
             uint64_t lv[RAY_ENC_VEC]; for (int i = 0; i < m; i++) lv[i] = elen[v + i];
-            blk += ray_enc_choose(lv, m, ku, RAY_ENC_SLOT_TOP, 0, NULL).bytes;
+            blk += fsst_lengths_bytes(lv, m);
         }
         enc += blk;
         double t0 = now_s();
@@ -367,16 +382,17 @@ static void report_groups(void) {
         if (!nvec) { printf("group\t%s\tno-columns\n", g_pred[p].group); continue; }
         int64_t rows = 0, chunk_dec = 0, vec_dec = 0, und = 0, bytes_all = 0, bytes_und = 0;
         for (int64_t v = 0; v < nvec; v++) {
-            int cd = 1, vd = 1; int64_t vr = 0;    /* AND of {0 none, 1 all, 2 undecided} */
+            int cd = 1, vd = 1; int64_t vr = 0, vb = 0;    /* AND of {0 none, 1 all, 2 undecided} */
             for (int q = 0; q < g_npred; q++) {
                 if (strcmp(g_pred[q].group, g_pred[p].group) || !g_eval[q].nvec) continue;
                 int c = g_eval[q].chunk_dec[v], d = g_eval[q].vec_dec[v];
                 cd = (cd == 0 || c == 0) ? 0 : (cd == 2 || c == 2) ? 2 : 1;
                 vd = (vd == 0 || d == 0) ? 0 : (vd == 2 || d == 2) ? 2 : 1;
                 vr = g_eval[q].vec_rows[v];
-                bytes_all += g_eval[q].vec_bytes[v];
-                if (d == 2 && cd == 2) bytes_und += g_eval[q].vec_bytes[v];
+                vb += g_eval[q].vec_bytes[v];
             }
+            bytes_all += vb;
+            if (vd == 2 && cd == 2) bytes_und += vb;       /* final combined decisions */
             rows += vr;
             if (cd != 2) chunk_dec += vr; else if (vd != 2) vec_dec += vr; else und += vr;
         }
@@ -443,7 +459,7 @@ int main(int argc, char** argv) {
 
     static const char* encname[10] = { "RAW","CONST","FOR_BP","DELTA_BP","RLE","DICT","ALP","ALP_RD","STR_DICT","FSST" };
     int64_t nv = 0; for (int e = 0; e < 10; e++) nv += g_enc_count[e];
-    for (int e = 0; e < 10; e++) if (g_enc_count[e]) printf("mix\t%s\t%.4f\n", encname[e], (double)g_enc_count[e] / (double)nv);
+    for (int e = 0; e < 10; e++) if (g_enc_count[e]) printf("mix_fraction_of_vectors\t%s\t%.4f\n", encname[e], (double)g_enc_count[e] / (double)nv);
 
     int64_t before = g_raw_data + g_index_bytes + g_sym_raw + g_other;
     struct { const char* name; int64_t size; } sc[4] = {

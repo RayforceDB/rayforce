@@ -19,7 +19,7 @@ Run on a parted database (one subdirectory per partition, each holding <table>/)
 
 Report lines: `col` (per column: raw, encoded, ratio, index bytes), `pred` (parsed predicates),
 `sym` (symfile FSST estimate, decompressed snapshot bytes, decode time), `group` (skip rates per
-predicate group), `mix` (encoding mix), `breakdown` (whole table), `scenario` (sizes and the
+predicate group), `mix_fraction_of_vectors` (encoding mix, share of vectors per encoding, not of bytes), `breakdown` (whole table), `scenario` (sizes and the
 combined-score factor at the size weight 0.1).
 
 The engine's index sites do not consult parted segment indexes, so on a parted root the
