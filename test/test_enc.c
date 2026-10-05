@@ -654,6 +654,95 @@ static test_result_t test_train_dict_tristate(void) {
     PASS();
 }
 
+/* RLE body whose values child claims DICT: illegal as a child at any depth. */
+static test_result_t test_read_rejects_dict_child(void) {
+    uint8_t body[64] = {0};
+    uint32_t nruns = 1; memcpy(body, &nruns, 4);
+    body[8] = RAY_ENC_DICT;                 /* values child header: encoding */
+    uint32_t bb = 8; memcpy(body + 12, &bb, 4);
+    ray_enc_kind_t k = { 64, true };
+    uint64_t dv[1] = { 7 };
+    ray_enc_dict_t dict = { dv, 1 };
+    uint64_t out[RAY_ENC_VEC];
+    TEST_ASSERT_EQ_I(ray_enc_read(body, sizeof body, RAY_ENC_RLE, 0, 4, k,
+                                  RAY_ENC_SLOT_TOP, 0, &dict, out), -1);
+    PASS();
+}
+
+/* Training sorts in the kind's native order. */
+static test_result_t test_train_dict_native_order(void) {
+    uint64_t s16[6] = { 0xFFFE, 0x0003, 0x8000, 0x7FFF, 0xFFFE, 0x0000 }; /* -2,3,-32768,32767,-2,0 */
+    ray_enc_kind_t ks = { 16, true };
+    uint64_t* d; uint32_t dn;
+    TEST_ASSERT_EQ_I(ray_enc_train_dict(s16, 6, ks, &d, &dn), 1);
+    TEST_ASSERT_EQ_I(dn, 5);
+    static const uint64_t want_s[5] = { 0x8000, 0xFFFE, 0x0000, 0x0003, 0x7FFF };
+    for (int i = 0; i < 5; i++) TEST_ASSERT_FMT(d[i] == want_s[i], "signed i=%d", i);
+    ray_free_raw(d);
+    uint64_t u8[4] = { 128, 127, 255, 0 };
+    ray_enc_kind_t ku = { 8, false };
+    TEST_ASSERT_EQ_I(ray_enc_train_dict(u8, 4, ku, &d, &dn), 1);
+    static const uint64_t want_u[4] = { 0, 127, 128, 255 };
+    for (int i = 0; i < 4; i++) TEST_ASSERT_FMT(d[i] == want_u[i], "unsigned i=%d", i);
+    ray_free_raw(d);
+    PASS();
+}
+
+/* Forced writes round-trip and reach what selection never picks. */
+static int forced_roundtrip(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
+                            const ray_enc_dict_t* dict, ray_enc_buf_t* b, ray_enc_choice_t* c) {
+    b->len = 0;
+    if (!ray_enc_write_as(enc, v, n, k, dict, b, c)) return -1;
+    if ((int64_t)b->len != c->bytes || c->enc != enc) return -2;
+    uint64_t out[RAY_ENC_VEC];
+    if (ray_enc_read(b->p, b->len, c->enc, c->width, n, k, RAY_ENC_SLOT_TOP, 0, dict, out) != (int64_t)b->len) return -3;
+    uint64_t m = k.T == 64 ? ~0ull : ((1ull << k.T) - 1);
+    for (int i = 0; i < n; i++) if (out[i] != (v[i] & m)) return -4;
+    return 0;
+}
+
+static test_result_t test_write_as_forced(void) {
+    static uint64_t v[RAY_ENC_VEC];
+    ray_enc_buf_t b = {0};
+    ray_enc_choice_t c;
+    /* DELTA_BP at w = T: extremes alternating by lane row (row = i / L). */
+    static const int Ts[3] = { 16, 32, 64 };
+    for (int t = 0; t < 3; t++) {
+        int T = Ts[t], L = RAY_ENC_VEC / T;
+        uint64_t m = T == 64 ? ~0ull : ((1ull << T) - 1);
+        int64_t hi = T == 16 ? 32767 : T == 32 ? 2147483647ll : INT64_MAX;
+        for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(((i / L) & 1) ? hi : -hi) & m;
+        ray_enc_kind_t k = { (uint8_t)T, true };
+        TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DELTA_BP, v, RAY_ENC_VEC, k, NULL, &b, &c), 0);
+        TEST_ASSERT_EQ_I(c.width, T);
+        TEST_ASSERT_TRUE(ray_enc_choose(v, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, NULL).enc != RAY_ENC_DELTA_BP);
+    }
+    /* DICT over a constant vector: the codes child is FOR_BP at width 0 (a constant child at depth 1). */
+    ray_enc_kind_t k64 = { 64, true };
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 900000000001ull;
+    uint64_t dv[2] = { 11, 900000000001ull };
+    ray_enc_dict_t dict = { dv, 2 };
+    TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DICT, v, RAY_ENC_VEC, k64, &dict, &b, &c), 0);
+    TEST_ASSERT_EQ_I(b.p[0], RAY_ENC_FOR_BP);            /* codes child header */
+    TEST_ASSERT_EQ_I(b.p[1], 0);                         /* width 0 */
+    /* RLE with FOR_BP values (512 runs of two, 16 distinct values). */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 1000 + (uint64_t)((i / 2) % 16);
+    TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_RLE, v, RAY_ENC_VEC, k64, NULL, &b, &c), 0);
+    TEST_ASSERT_EQ_I(b.p[8], RAY_ENC_FOR_BP);            /* values child */
+    /* RLE with DELTA_BP ends (1024 runs of one: ends 1..1024, lane step 64). */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)i * 3;
+    TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_RLE, v, RAY_ENC_VEC, k64, NULL, &b, &c), 0);
+    uint32_t vb; memcpy(&vb, b.p + 12, 4);
+    TEST_ASSERT_EQ_I(b.p[16 + vb], RAY_ENC_DELTA_BP);    /* ends child */
+    /* illegal or inapplicable */
+    ray_enc_kind_t ku8 = { 8, false };
+    TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DELTA_BP, v, 16, ku8, NULL, &b, &c), -1);  /* unsigned */
+    TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_CONST, v, 16, k64, NULL, &b, &c), -1);     /* unequal */
+    TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DICT, v, 16, k64, &dict, &b, &c), -1);     /* not in dict */
+    ray_enc_buf_free(&b);
+    PASS();
+}
+
 const test_entry_t enc_entries[] = {
     { "enc/pack_roundtrip_all_widths", test_pack_roundtrip_all_widths, enc_setup, enc_teardown },
     { "enc/pack_layout_t8_w1",         test_pack_layout_t8_w1,         enc_setup, enc_teardown },
@@ -688,5 +777,8 @@ const test_entry_t enc_entries[] = {
     { "enc/load_rejects_bad_n",         test_load_rejects_bad_n,         enc_setup, enc_teardown },
     { "enc/buf_free_clears_oom",        test_buf_free_clears_oom,        enc_setup, enc_teardown },
     { "enc/train_dict_tristate",        test_train_dict_tristate,        enc_setup, enc_teardown },
+    { "enc/read_rejects_dict_child", test_read_rejects_dict_child, enc_setup, enc_teardown },
+    { "enc/train_dict_native_order", test_train_dict_native_order, enc_setup, enc_teardown },
+    { "enc/write_as_forced",         test_write_as_forced,         enc_setup, enc_teardown },
     { NULL, NULL, NULL, NULL },
 };

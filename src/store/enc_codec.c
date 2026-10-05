@@ -286,6 +286,19 @@ bool ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
     return true;
 }
 
+bool ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
+                      const ray_enc_dict_t* dict, ray_enc_buf_t* out, ray_enc_choice_t* chosen) {
+    if (enc > RAY_ENC_DICT || !enc_legal(enc, RAY_ENC_SLOT_TOP, 0, k, dict)) return false;
+    uint8_t w;
+    int64_t sz = enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &w);
+    if (sz < 0) return false;
+    size_t at = out->len;
+    if (!write_body(enc, w, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, out)) return false;
+    if ((int64_t)(out->len - at) != sz) return false;     /* size model and writer agree */
+    if (chosen) { chosen->enc = enc; chosen->width = w; chosen->bytes = sz; }
+    return true;
+}
+
 /* ---- readers ---- */
 static bool get_raw(const uint8_t* p, size_t avail, int n, int T, uint64_t* out, int64_t* used) {
     int64_t sz = ray_enc_size_raw(n, T);
@@ -410,9 +423,11 @@ int ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
     int64_t d = 0;
     for (int64_t i = 0; i < n; i++) if (i == 0 || tmp[i] != tmp[d - 1]) tmp[d++] = tmp[i];
     if (d > (1 << 16)) { ray_free_raw(tmp); return 0; }
-    /* Shrink the 2n scratch to the distinct count; keep the block on a
-     * failed shrink (it is only larger than needed). */
-    uint64_t* fit = ray_realloc_raw(tmp, sizeof(uint64_t) * (size_t)d);
-    *out = fit ? fit : tmp; *out_n = (uint32_t)d;
+    /* ray_realloc_raw never shrinks: copy into a block sized to the distinct count. */
+    uint64_t* fit = ray_alloc_raw(sizeof(uint64_t) * (size_t)d);
+    if (!fit) { ray_free_raw(tmp); return -1; }
+    memcpy(fit, tmp, sizeof(uint64_t) * (size_t)d);
+    ray_free_raw(tmp);
+    *out = fit; *out_n = (uint32_t)d;
     return 1;
 }

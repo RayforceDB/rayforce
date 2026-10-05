@@ -120,6 +120,12 @@ ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
 bool    ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
                       ray_enc_slot_t slot, int depth, const ray_enc_dict_t* dict,
                       ray_enc_buf_t* out, ray_enc_choice_t* chosen);
+/* Write a top-level body in encoding `enc` (children still go through
+ * selection).  False when `enc` is not legal for the kind / dictionary,
+ * not applicable to the values (CONST on unequal values, DICT on a value
+ * outside the dictionary), or on OOM. */
+bool    ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
+                         const ray_enc_dict_t* dict, ray_enc_buf_t* out, ray_enc_choice_t* chosen);
 int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
                      const ray_enc_dict_t* dict, uint64_t* out);
