@@ -115,9 +115,15 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
 
 void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (!ptr || !size) return;
-    /* madvise wants a page-aligned start. */
+    /* madvise wants a page-aligned start.  One WILLNEED reads at most a
+     * readahead window (Linux caps it at max(io_pages, ra_pages)), so a
+     * large range is requested window by window: each call only queues its
+     * reads, so the windows are all in flight together. */
+    const size_t chunk = (size_t)256 << 10;
     uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)4095;
-    madvise((void*)a, size + ((uintptr_t)ptr - a), MADV_WILLNEED);
+    uintptr_t end = (uintptr_t)ptr + size;
+    for (; a < end; a += chunk)
+        madvise((void*)a, end - a < chunk ? end - a : chunk, MADV_WILLNEED);
 }
 
 void ray_vm_release(void* ptr, size_t size) {
