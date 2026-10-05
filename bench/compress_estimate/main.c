@@ -115,9 +115,17 @@ static void report_col(const char* name, int8_t type, int64_t raw, int64_t enc, 
 }
 
 /* Encode one column (one segment) and fill predicate evaluations for it. */
-static int64_t estimate_column(ray_t* col, const char* name, int64_t row_base, int64_t total_rows) {
+static bool g_skipped[MAX_PRED];
+static int64_t estimate_column(ray_t* col, const char* name, int64_t vec_base, int64_t total_vecs) {
     ray_enc_kind_t k;
-    if (!ray_enc_kind_of(col->type, col->attrs, &k)) return -1;
+    if (!ray_enc_kind_of(col->type, col->attrs, &k)) {
+        for (int p = 0; p < g_npred; p++)
+            if (!strcmp(g_pred[p].col, name) && !g_skipped[p]) {
+                g_skipped[p] = true;
+                printf("pred_skipped\t%s\t%s\tcolumn type %s is not encodable\n", g_pred[p].group, name, ray_type_name(col->type));
+            }
+        return -1;
+    }
     const void* data = ray_data(col);
     int64_t len = col->len;
     int64_t n_chunks = (len + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
@@ -157,12 +165,12 @@ static int64_t estimate_column(ray_t* col, const char* name, int64_t row_base, i
             if (mn < cmin) cmin = mn;
             if (mx > cmax) cmax = mx;
             cnull |= vnull;
-            int64_t vi = (row_base + s) / RAY_ENC_VEC;
+            int64_t vi = vec_base + s / RAY_ENC_VEC;
             for (int p = 0; p < g_npred; p++) {
                 if (strcmp(g_pred[p].col, name)) continue;
                 pred_eval_t* e = &g_eval[p];
                 if (!e->vec_dec) {
-                    e->nvec = (total_rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
+                    e->nvec = total_vecs;
                     e->vec_dec = xcalloc((size_t)e->nvec, 1); e->chunk_dec = xcalloc((size_t)e->nvec, 1);
                     e->vec_rows = xcalloc((size_t)e->nvec, sizeof(int64_t)); e->vec_bytes = xcalloc((size_t)e->nvec, sizeof(int64_t));
                 }
@@ -173,7 +181,7 @@ static int64_t estimate_column(ray_t* col, const char* name, int64_t row_base, i
         for (int p = 0; p < g_npred; p++) {
             if (strcmp(g_pred[p].col, name) || !g_eval[p].chunk_dec) continue;
             int d = decide(&g_pred[p], cmin, cmax, cnull, col->type == RAY_SYM);
-            for (int64_t v = (row_base + c0) / RAY_ENC_VEC; v <= (row_base + c1 - 1) / RAY_ENC_VEC; v++)
+            for (int64_t v = vec_base + c0 / RAY_ENC_VEC; v <= vec_base + (c1 - 1) / RAY_ENC_VEC; v++)
                 g_eval[p].chunk_dec[v] = (int8_t)d;
         }
     }
@@ -203,7 +211,14 @@ static bool kept(const char* name, const char* keep) {
 }
 
 /* Process one splayed directory (a table or one partition). */
-static void process_splayed(const char* dir, const char* sym, const char* keep, int64_t row_base, int64_t total_rows) {
+/* Resolve a splayed directory to its published generation (or itself). */
+static bool resolve_dir(const char* dir, char* out, size_t sz) {
+    return ray_splay_resolve_dir(dir, out, sz) == RAY_OK;
+}
+
+static void process_splayed(const char* dir, const char* sym, const char* keep, int64_t vec_base, int64_t total_vecs) {
+    char rdir[1024];
+    if (!resolve_dir(dir, rdir, sizeof rdir)) { fprintf(stderr, "cannot resolve %s\n", dir); exit(2); }
     ray_t* t = ray_read_splayed(dir, sym);
     if (!t || RAY_IS_ERR(t)) { fprintf(stderr, "cannot read %s\n", dir); exit(2); }
     int64_t nc = ray_table_ncols(t);
@@ -211,15 +226,15 @@ static void process_splayed(const char* dir, const char* sym, const char* keep, 
         ray_t* col = ray_table_get_col_idx(t, c);
         ray_t* nm = ray_sym_str(ray_table_col_name(t, c));
         char name[128]; snprintf(name, sizeof name, "%.*s", (int)ray_str_len(nm), ray_str_ptr(nm));
-        char path[1024]; snprintf(path, sizeof path, "%s/%s", dir, name);
+        char path[1280]; snprintf(path, sizeof path, "%s/%s", rdir, name);
         int64_t fs = fsize(path), ib = index_bytes(path, col), raw = fs - ib;
-        int64_t enc = estimate_column(col, name, row_base, total_rows);
+        int64_t enc = estimate_column(col, name, vec_base, total_vecs);
         g_raw_data += raw; g_index_bytes += ib; if (kept(name, keep)) g_index_kept += ib;
         g_enc_data += enc >= 0 ? enc : raw;                 /* unencodable types stay raw */
         report_col(name, col->type, raw, enc >= 0 ? enc : raw, ib);
     }
     g_rows += ray_table_nrows(t);
-    char p[1024]; snprintf(p, sizeof p, "%s/.d", dir); g_other += fsize(p);
+    char p[1100]; snprintf(p, sizeof p, "%s/.d", rdir); g_other += fsize(p);
     ray_release(t);
 }
 
@@ -331,12 +346,14 @@ int main(int argc, char** argv) {
     if (preds) load_preds(preds);
     printf("col\tname\ttype\traw\tencoded\tratio\tindex\n");
 
-    char d0[1024]; snprintf(d0, sizeof d0, "%s/.d", db);
+    char rdb[1024], d0[1100];
+    if (!resolve_dir(db, rdb, sizeof rdb)) snprintf(rdb, sizeof rdb, "%s", db);
+    snprintf(d0, sizeof d0, "%s/.d", rdb);
     if (fsize(d0) > 0) {
         ray_t* t = ray_read_splayed(db, sym);
         if (!t || RAY_IS_ERR(t)) { fprintf(stderr, "cannot read %s\n", db); return 2; }
         int64_t rows = ray_table_nrows(t); ray_release(t);
-        process_splayed(db, sym, keep, 0, rows);
+        process_splayed(db, sym, keep, 0, (rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
     } else {
         if (!table) { fprintf(stderr, "parted root needs --table\n"); return 2; }
         printf("note\tparted root: the engine's index sites never consult parted segment indexes; "
@@ -349,13 +366,16 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ne; i++) {
                 if (ents[i]->d_name[0] == '.') continue;
                 char pd[1024]; snprintf(pd, sizeof pd, "%s/%s/%s", db, ents[i]->d_name, table);
-                char pdd[1100]; snprintf(pdd, sizeof pdd, "%s/.d", pd);
+                char rpd[1024], pdd[1100];
+                if (!resolve_dir(pd, rpd, sizeof rpd)) continue;
+                snprintf(pdd, sizeof pdd, "%s/.d", rpd);
                 if (fsize(pdd) <= 0) continue;
                 ray_t* t = ray_read_splayed(pd, sym);
                 if (!t || RAY_IS_ERR(t)) { fprintf(stderr, "cannot read %s\n", pd); return 2; }
                 int64_t r = ray_table_nrows(t); ray_release(t);
-                if (pass == 0) total += r;
-                else { process_splayed(pd, sym, keep, base, total); base += r; }
+                int64_t nv = (r + RAY_ENC_VEC - 1) / RAY_ENC_VEC;   /* each partition owns its vector slots */
+                if (pass == 0) total += nv;
+                else { process_splayed(pd, sym, keep, base, total); base += nv; }
             }
         }
         for (int i = 0; i < ne; i++) free(ents[i]);
