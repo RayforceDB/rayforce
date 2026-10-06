@@ -1036,3 +1036,34 @@ ray_t* ray_enccol_materialize(ray_t* encv) {
     if (!e) return ray_error("type", "materialize: not an encoded column");
     return ray_enc_once_get(&e->once, &e->decoded, enc_materialize_single, e);
 }
+
+void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    memset(m, 0, sizeof *m);
+    m->enc = encv;
+    m->len = e->len;
+    if (e->kind == RAY_ENCCOL_PARTED) {
+        m->type = (int8_t)(RAY_PARTED_BASE + e->type);
+        m->attrs = e->attrs;
+        m->n_segs = e->wrapper ? e->wrapper->len : 0;
+        m->null_count = -1;
+        return;
+    }
+    m->type = e->type;
+    m->attrs = e->attrs;
+    m->index_kind = e->hdr.index_kind;
+    m->unique = (e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE) != 0;
+    m->null_count = e->null_count;
+}
+
+bool ray_enccol_may_have_index(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE) return false;
+    if (e->hdr.index_kind || (e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE)) return true;
+    if (e->type != RAY_STR || e->n_chunks == 0) return false;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_dirent_t de; dirent_at(e, c, &de);
+        if (de.flags & RAY_ENC_STAT_ABSENT) return false;
+    }
+    return true;
+}

@@ -456,9 +456,13 @@ static test_result_t test_consumers_refuse(void) {
     ray_release(tbl);
     TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/tb/cb", 3000), RAY_OK);   /* now generation 2 */
     ray_t* r = ray_read_splayed(ENCCOL_TMP "/tb", NULL);
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
-    ray_error_free(r);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));          /* the loader keeps the encoded column */
+    TEST_ASSERT_NULL(ray_table_get_col_enc(r, ray_sym_intern("ca", 2)));
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(r, ray_sym_intern("cb", 2)) != NULL);
+    ray_t* pcb = ray_table_get_col(r, ray_sym_intern("cb", 2));   /* the legacy getter decodes */
+    TEST_ASSERT_TRUE(pcb && pcb->type == RAY_I32 && pcb->len == 3000);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(pcb))[2000], 2000 % 977);
+    ray_release(r);
     PASS();
 }
 
@@ -1467,12 +1471,11 @@ static ray_t* tbl2(int64_t n) {
     return t;
 }
 
-/* Tables are built directly from mmap'd generation-2 columns: the splayed
- * loader still refuses them until the legacy getters materialize (Task 11). */
+/* Tables are built directly from mmap'd generation-2 columns, then loaded
+ * through the splayed loader, whose columns equal the generation-0 table. */
 static test_result_t test_table_core_enccol(void) {
     ray_t* t = tbl2(70000);
-    TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/t", t), RAY_OK);
-    ray_release(t);
+    TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/t", t), RAY_OK);   /* t: the generation-0 reference */
     ray_enc_counters_reset();
     ray_t* ca = ray_col_mmap(ENCCOL_TMP "/t/a");
     ray_t* cb = ray_col_mmap(ENCCOL_TMP "/t/b");
@@ -1486,7 +1489,7 @@ static test_result_t test_table_core_enccol(void) {
     ray_release(ca); ray_release(cb);
     TEST_ASSERT_EQ_I(ray_table_nrows(s), 70000);
     TEST_ASSERT_NULL(ray_table_validate_rectangular(s, "test"));
-    TEST_ASSERT_EQ_I(ray_table_get_col_idx(s, 1)->type, RAY_ENCCOL);
+    TEST_ASSERT_TRUE(ray_table_get_col_enc_idx(s, 1) != NULL);
     /* a shorter plain column makes the table ragged */
     ray_t* shortc = make_col(RAY_I32, 10, 0);
     ray_retain(s);
@@ -1498,16 +1501,37 @@ static test_result_t test_table_core_enccol(void) {
     /* copy-on-write shares the encoded object */
     ray_t* cp = ray_alloc_copy(s);
     TEST_ASSERT_EQ_I(ray_table_nrows(cp), 70000);
+    for (int64_t c = 0; c < 2; c++) {
+        ray_t* enc = ray_table_get_col_enc_idx(s, c);
+        TEST_ASSERT_TRUE(enc != NULL);
+        TEST_ASSERT_EQ_PTR(ray_table_get_col_enc_idx(cp, c), enc);
+        TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(enc)->rc), 1);   /* one header: shared through the cols list, not duplicated */
+    }
     ray_release(cp);
-    ray_release(s);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(s, 1)->type, RAY_F64);   /* legacy getter: plain */
+    ray_release(s);
+    /* the splayed loader returns the same values as the generation-0 table */
+    ray_t* ref = t;
+    ray_t* ld = ray_read_splayed(ENCCOL_TMP "/t", NULL);
+    TEST_ASSERT_FMT(ld && !RAY_IS_ERR(ld), "read_splayed: %s", ld ? ray_err_code(ld) : "null");
+    TEST_ASSERT_EQ_I(ray_table_nrows(ld), 70000);
+    for (int64_t c = 0; c < 2; c++) {
+        TEST_ASSERT_TRUE(ray_table_get_col_enc_idx(ld, c) != NULL);
+        ray_t* want = ray_table_get_col_idx(ref, c);
+        ray_t* got  = ray_table_col_idx(ld, c);
+        TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, want->type);
+        TEST_ASSERT_EQ_I(got->len, want->len);
+        TEST_ASSERT_TRUE(memcmp(ray_data(got), ray_data(want), (size_t)want->len * 8) == 0);
+    }
+    ray_release(ld); ray_release(ref);
     PASS();
 }
 
-/* The splayed loader reads logical rows through ray_table_col_nrows, but its
- * generation-2 guard refuses the first encoded column until Task 11, which
- * must flip this to "corrupt" with "4999 rows, expected 5000". */
+/* The splayed loader reads logical rows through ray_table_col_nrows: a torn
+ * encoded column is a corrupt table. */
 static test_result_t test_table_torn_column(void) {
     ray_t* t = tbl2(5000);
     TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/torn", t), RAY_OK);
@@ -1517,8 +1541,25 @@ static test_result_t test_table_torn_column(void) {
     ray_release(b);
     ray_t* s = ray_read_splayed(ENCCOL_TMP "/torn", NULL);
     TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
-    TEST_ASSERT_STR_EQ(ray_err_code(s), "nyi");
+    TEST_ASSERT_STR_EQ(ray_err_code(s), "corrupt");
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "4999 rows, expected 5000"));
     ray_error_free(s);
+    PASS();
+}
+
+/* Row counts of the non-vector column shapes, without decoding. */
+static test_result_t test_table_col_nrows_shapes(void) {
+    ray_t* a = ray_alloc(0); a->type = -RAY_I64; a->i64 = 7;
+    TEST_ASSERT_EQ_I(ray_table_col_nrows(a), 0);       /* an atom has no rows: its len */
+    ray_release(a);
+    ray_t* keys = ray_vec_new(RAY_I64, 2); keys->len = 2;
+    ray_t* counts = ray_vec_new(RAY_I64, 2); counts->len = 2;
+    ((int64_t*)ray_data(counts))[0] = 30; ((int64_t*)ray_data(counts))[1] = 12;
+    ray_t* mc = ray_alloc(2 * sizeof(ray_t*));
+    mc->type = RAY_MAPCOMMON; mc->len = 2;
+    ((ray_t**)ray_data(mc))[0] = keys; ((ray_t**)ray_data(mc))[1] = counts;
+    TEST_ASSERT_EQ_I(ray_table_col_nrows(mc), 42);
+    ray_release(mc);
     PASS();
 }
 
@@ -1566,5 +1607,6 @@ const test_entry_t enccol_entries[] = {
     { "enccol/synth_matches_gen0",    test_synth_matches_gen0,    enccol_setup, enccol_teardown },
     { "enccol/table_core",            test_table_core_enccol,     enccol_setup, enccol_teardown },
     { "enccol/table_torn_column",     test_table_torn_column,     enccol_setup, enccol_teardown },
+    { "enccol/table_col_nrows_shapes", test_table_col_nrows_shapes, enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
 };

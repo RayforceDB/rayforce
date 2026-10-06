@@ -30,6 +30,7 @@
 #include "store/fileio.h"
 #include "core/types.h"
 #include "mem/heap.h"
+#include "table/table.h"
 #include "vec/str.h"
 #include "vec/vec.h"
 #include "ops/ops.h"
@@ -215,6 +216,23 @@ static inline bool sym_enc_cacheable(ray_t* obj) {
  * ray_serde_size — calculate serialized size (excluding IPC header)
  * -------------------------------------------------------------------------- */
 
+/* A table whose slots hold encoded columns serializes their materialized
+ * form.  Returns a retained table to read (the input itself when no slot is
+ * encoded) or an owned error. */
+static ray_t* serde_plain_table(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    bool enc = false;
+    for (int64_t c = 0; c < nc && !enc; c++) enc = ray_table_get_col_enc_idx(tbl, c) != NULL;
+    if (!enc) { ray_retain(tbl); return tbl; }
+    ray_t* out = ray_table_new(nc);
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (!col || RAY_IS_ERR(col)) { ray_release(out); return col ? col : ray_error("type", NULL); }
+        out = ray_table_add_col(out, ray_table_col_name(tbl, c), col);
+    }
+    return out;
+}
+
 int64_t ray_serde_size(ray_t* obj) {
     if (!obj) return 1; /* RAY_SERDE_NULL marker */
     if (RAY_IS_ERR(obj)) return 1 + 8; /* type + sdata */
@@ -328,10 +346,13 @@ int64_t ray_serde_size(ray_t* obj) {
     }
     case RAY_TABLE: {
         /* type + attrs + schema(recursive) + cols(recursive RAY_LIST) */
-        ray_t** slots = (ray_t**)ray_data(obj);
+        ray_t* pt = serde_plain_table(obj);
+        if (!pt || RAY_IS_ERR(pt)) { if (pt) ray_error_free(pt); return -1; }
+        ray_t** slots = (ray_t**)ray_data(pt);   /* plain-table */
         int64_t schema = schema_names_serde_size(slots[0]);
+        int64_t cols = schema > 0 ? ray_serde_size(slots[1]) : schema;   /* plain-table */
+        ray_release(pt);
         if (schema <= 0) return schema;
-        int64_t cols = ray_serde_size(slots[1]);
         if (cols <= 0) return cols;
         return 1 + 1 + schema + cols;
     }
@@ -611,10 +632,13 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         /* Layout: type + attrs + schema(recursive) + cols(recursive RAY_LIST) */
         buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
         buf++;
-        ray_t** slots = (ray_t**)ray_data(obj);
+        ray_t* pt = serde_plain_table(obj);
+        if (!pt || RAY_IS_ERR(pt)) { if (pt) ray_error_free(pt); return -1; }
+        ray_t** slots = (ray_t**)ray_data(pt);   /* plain-table */
         c = ser_schema_names(buf, slots[0]);     /* schema names as RAY_SYM vector */
-        if (c <= 0) return c;
-        int64_t cols = ray_ser_raw(buf + c, slots[1]);     /* cols (RAY_LIST) */
+        if (c <= 0) { ray_release(pt); return c; }
+        int64_t cols = ray_ser_raw(buf + c, slots[1]);     /* cols (RAY_LIST) */   /* plain-table */
+        ray_release(pt);
         if (cols <= 0) return cols;
         c += cols;
         return 1 + 1 + c;

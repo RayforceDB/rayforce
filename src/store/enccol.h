@@ -29,6 +29,7 @@
 #include "ops/ops.h"           /* RAY_ENCCOL */
 #include "store/encfmt.h"
 #include "store/enc_once.h"
+#include "table/table.h"      /* ray_col_meta_t */
 
 struct ray_sym_domain_s;
 
@@ -113,5 +114,10 @@ void   ray_enccol_test_fail_path(const char* sub);
  * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */
 void   ray_enccol_test_interrupt_after(int64_t nth);
 void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a mismatched root */
+
+void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
+/* Could materialization attach an index (recorded kind, UNIQUE, or for STR
+ * a runtime DICT, possible only when every chunk has statistics)? */
+bool ray_enccol_may_have_index(ray_t* encv);
 
 #endif /* RAY_ENCCOL_H */

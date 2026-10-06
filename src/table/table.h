@@ -34,11 +34,39 @@
  */
 
 #include <rayforce.h>
+#include <stdbool.h>
 
 int64_t ray_parted_nrows(ray_t* parted_col);
 
 /* Logical rows of any column object (plain, parted wrapper, MAPCOMMON,
  * RAY_ENCCOL) without decoding. */
 int64_t ray_table_col_nrows(ray_t* col);
+
+typedef struct {
+    int8_t   type;        /* logical type; parted: RAY_PARTED_BASE + base */
+    uint8_t  attrs;       /* generation 0: the vector's attrs; generation 2: persisted attrs */
+    int64_t  len;         /* rows (parted: sum over segments) */
+    int64_t  n_segs;      /* parted: segment count; else 0 */
+    uint8_t  index_kind;  /* attached (gen 0) or recorded (gen 2) ray_idx_kind_t */
+    bool     unique;
+    int64_t  null_count;  /* generation 2: exact, from the directory; -1 when unknown */
+    ray_t*   enc;         /* borrowed RAY_ENCCOL, or NULL */
+} ray_col_meta_t;
+
+bool    ray_col_meta_of(ray_t* col, ray_col_meta_t* m);          /* any slot object */
+bool    ray_table_col_meta(ray_t* tbl, int64_t name_id, ray_col_meta_t* m);
+bool    ray_table_col_meta_idx(ray_t* tbl, int64_t idx, ray_col_meta_t* m);
+
+/* Index of a column without decoding when it cannot carry one: NULL with
+ * *index set (borrowed RAY_INDEX block or NULL), or an owned error. */
+ray_t*  ray_table_col_index(ray_t* tbl, int64_t name_id, ray_t** index);
+ray_t*  ray_table_col_index_idx(ray_t* tbl, int64_t idx, ray_t** index);
+
+/* The borrowed RAY_ENCCOL object of a slot, or NULL (absent, plain). */
+ray_t*  ray_table_get_col_enc(ray_t* tbl, int64_t name_id);
+ray_t*  ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx);
+
+/* Null presence from metadata; never materializes. */
+bool    ray_table_col_has_nulls(ray_t* tbl, int64_t name_id);
 
 #endif /* RAY_TABLE_H */

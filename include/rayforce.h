@@ -264,6 +264,10 @@ const char* ray_err_code(ray_t* err);
  * reference and want the block reclaimed must use this helper instead —
  * otherwise the error leaks until heap teardown. */
 void ray_error_free(ray_t* err);
+/* Thread-local message of the last error made on this thread (NULL when
+ * empty), and clearing it. */
+const char* ray_error_msg(void);
+void        ray_error_clear(void);
 
 /* ===== Accessor Macros ===== */
 
@@ -696,6 +700,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
  *   ray_table_ncols / ray_table_nrows          -> 0
  *   ray_table_col_name                         -> -1
  *   ray_table_schema / ray_table_get_col*      -> NULL
+ *   ray_table_col / ray_table_col_idx          -> NULL
  *   ray_table_set_col_name / ray_table_set_col_idx -> no-op
  *   ray_table_add_col                          -> typed "type" error
  *   ray_table_validate_rectangular             -> typed "type" error
@@ -713,6 +718,11 @@ ray_t*       ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec);
 ray_t*       ray_table_validate_rectangular(ray_t* tbl, const char* context);
 ray_t*       ray_table_get_col(ray_t* tbl, int64_t name_id);
 ray_t*       ray_table_get_col_idx(ray_t* tbl, int64_t idx);
+/* Plain column (borrowed; valid for the table's lifetime; retain to keep it
+ * longer), NULL when absent or `tbl` is not a table, or an owned RAY_ERROR
+ * when an encoded column fails to materialize (corruption, OOM, cancel). */
+ray_t*       ray_table_col(ray_t* tbl, int64_t name_id);
+ray_t*       ray_table_col_idx(ray_t* tbl, int64_t idx);
 int64_t     ray_table_col_name(ray_t* tbl, int64_t idx);
 void        ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id);
 void        ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec);

@@ -25,6 +25,9 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "lang/format.h"
+#include "ops/idxop.h"
+#include "store/enccol.h"
+#include "vec/vec.h"
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -80,7 +83,7 @@ static bool table_col_is_valid(ray_t* col) {
 }
 
 static int64_t table_col_nrows(ray_t* col) {
-    if (!col) return 0;
+    if (!col || ray_is_atom(col)) return 0;      /* an atom has no rows (its len field is payload) */
     if (col->type == RAY_ENCCOL) return col->len;   /* no decode */
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)
         return ray_parted_nrows(col);
@@ -212,10 +215,13 @@ ray_t* ray_table_validate_rectangular(ray_t* tbl, const char* context) {
 }
 
 /* --------------------------------------------------------------------------
- * ray_table_get_col — lookup column by sym id; borrowed pointer or NULL.
+ * Slot lookups (borrowed slot object, plain or RAY_ENCCOL), then the
+ * accessors built on them: metadata (never decodes), plain column
+ * (materializes an encoded slot), index, encoded object, and the legacy
+ * getters.
  * -------------------------------------------------------------------------- */
 
-ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
+static ray_t* tbl_slot_by_name(ray_t* tbl, int64_t name_id) {
     if (!tbl_is_table(tbl)) return NULL;
     ray_t* schema = tbl_schema(tbl);
     ray_t* cols   = tbl_cols(tbl);
@@ -228,16 +234,98 @@ ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
     return NULL;
 }
 
-/* --------------------------------------------------------------------------
- * ray_table_get_col_idx — borrowed pointer at slot `idx`, or NULL.
- * -------------------------------------------------------------------------- */
-
-ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
+static ray_t* tbl_slot_by_idx(ray_t* tbl, int64_t idx) {
     if (!tbl_is_table(tbl)) return NULL;
     ray_t* cols = tbl_cols(tbl);
     if (!cols) return NULL;
     if (idx < 0 || idx >= cols->len) return NULL;
     return ((ray_t**)ray_data(cols))[idx];
+}
+
+bool ray_col_meta_of(ray_t* c, ray_col_meta_t* m) {
+    memset(m, 0, sizeof *m);
+    if (!c || RAY_IS_ERR(c)) return false;
+    if (c->type == RAY_ENCCOL) { ray_enccol_meta(c, m); return true; }
+    m->type = c->type;
+    m->attrs = c->attrs;
+    m->len = table_col_nrows(c);
+    m->null_count = -1;
+    if (RAY_IS_PARTED(c->type)) { m->n_segs = c->len; return true; }
+    if (ray_is_vec(c) && ray_index_has(c)) {
+        ray_index_t* ix = ray_index_payload(c->index);
+        m->index_kind = ix->kind;
+        m->unique = (ix->markers & RAY_MARK_UNIQUE) != 0;
+    }
+    return true;
+}
+
+bool ray_table_col_meta(ray_t* tbl, int64_t name_id, ray_col_meta_t* m) {
+    return ray_col_meta_of(tbl_slot_by_name(tbl, name_id), m);
+}
+bool ray_table_col_meta_idx(ray_t* tbl, int64_t idx, ray_col_meta_t* m) {
+    return ray_col_meta_of(tbl_slot_by_idx(tbl, idx), m);
+}
+
+static ray_t* slot_plain(ray_t* c) {
+    if (!c) return NULL;
+    return c->type == RAY_ENCCOL ? ray_enccol_materialize(c) : c;
+}
+ray_t* ray_table_col(ray_t* tbl, int64_t name_id)  { return slot_plain(tbl_slot_by_name(tbl, name_id)); }
+ray_t* ray_table_col_idx(ray_t* tbl, int64_t idx)  { return slot_plain(tbl_slot_by_idx(tbl, idx)); }
+
+static ray_t* slot_index(ray_t* c, ray_t** index) {
+    *index = NULL;
+    if (!c) return NULL;
+    if (c->type != RAY_ENCCOL) {
+        if (ray_is_vec(c) && ray_index_has(c)) *index = c->index;
+        return NULL;
+    }
+    if (!ray_enccol_may_have_index(c)) return NULL;    /* parted answers false too */
+    ray_t* d = ray_enccol_materialize(c);
+    if (RAY_IS_ERR(d)) return d;
+    if (ray_index_has(d)) *index = d->index;
+    return NULL;
+}
+ray_t* ray_table_col_index(ray_t* tbl, int64_t name_id, ray_t** index) {
+    return slot_index(tbl_slot_by_name(tbl, name_id), index);
+}
+ray_t* ray_table_col_index_idx(ray_t* tbl, int64_t idx, ray_t** index) {
+    return slot_index(tbl_slot_by_idx(tbl, idx), index);
+}
+
+ray_t* ray_table_get_col_enc(ray_t* tbl, int64_t name_id) {
+    ray_t* c = tbl_slot_by_name(tbl, name_id);
+    return (c && c->type == RAY_ENCCOL) ? c : NULL;
+}
+ray_t* ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx) {
+    ray_t* c = tbl_slot_by_idx(tbl, idx);
+    return (c && c->type == RAY_ENCCOL) ? c : NULL;
+}
+
+bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
+    ray_t* c = tbl_slot_by_name(tbl, name_id);
+    if (!c) return false;
+    ray_col_meta_t m;
+    ray_col_meta_of(c, &m);
+    if (m.null_count >= 0) return m.null_count > 0;          /* generation 2: directory */
+    if (m.enc || RAY_IS_PARTED(c->type)) return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
+    return ray_is_vec(c) && ray_vec_has_nulls(c);            /* generation 0: today's scan */
+}
+
+/* Legacy getters (public, include/rayforce.h): clear the slot, resolve
+ * through ray_table_col, dispose of a failure with ray_error_free and
+ * return NULL with its message left in the slot. */
+ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
+    ray_error_clear();
+    ray_t* c = ray_table_col(tbl, name_id);
+    if (c && RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
+    return c;
+}
+ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
+    ray_error_clear();
+    ray_t* c = ray_table_col_idx(tbl, idx);
+    if (c && RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
+    return c;
 }
 
 /* --------------------------------------------------------------------------

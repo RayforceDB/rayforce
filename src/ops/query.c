@@ -18568,6 +18568,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
              * pointer cells, each retained by ray_list_append. */
             (col->type == RAY_LIST && ray_len(col) == 0) ||
             RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
+            col->type == RAY_ENCCOL ||
             col->mmod != 0 ||
             (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) {
             inplace_ok = false;
@@ -18896,6 +18897,7 @@ static bool upsert_col_ok(ray_t* col) {
      * genuinely boxed and is written like any other. */
     if (col->type == RAY_LIST && ray_len(col) == 0) return false;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return false;
+    if (col->type == RAY_ENCCOL) return false;   /* in-place writes need a plain vector */
     if (col->mmod != 0) return false;
     if (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)) return false;
     /* Cells are written as W64 runtime-domain ids (append_atom_to_col);
@@ -19611,8 +19613,10 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
         if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols)
             inplace = false;
     }
-    for (int64_t c = 0; inplace && c < ncols; c++)
-        if (((ray_t**)ray_data(live_cols))[c]->rc != 1) inplace = false;
+    for (int64_t c = 0; inplace && c < ncols; c++) {
+        ray_t* slot = ((ray_t**)ray_data(live_cols))[c];
+        if (slot->rc != 1 || slot->type == RAY_ENCCOL) inplace = false;
+    }
 
     /* A batch of typed vectors matching the target is written column by
      * column; everything else is boxed into cells below. */

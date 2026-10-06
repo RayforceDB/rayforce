@@ -1045,15 +1045,6 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
             return err;
         }
 
-        /* until the legacy getters materialize (P1 Task 11) */
-        if (col->type == RAY_ENCCOL) {
-            ray_release(col);
-            ray_release(schema);
-            ray_release(tbl);
-            return ray_error("nyi", "splayed %s: column '%.*s' is a generation-2 file",
-                             dir, (int)name_len, name);
-        }
-
         ray_t* new_df = ray_table_add_col(tbl, name_id, col);
         if (!new_df || RAY_IS_ERR(new_df)) {
             ray_release(col);
