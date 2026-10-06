@@ -38,10 +38,14 @@ typedef struct {
                              * must not call abort afterwards */
     bool    wants_hash;     /* after close: build a hash by re-reading the file */
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
+    uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
+    uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */
 } ray_col_stream_t;
 
+/* gen 0 writes today's format; gen 2 stages the same raw payload and
+ * transcodes it chunk by chunk at finish (any other gen: RAY_ERR_VERSION). */
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
-                              int8_t type, struct ray_sym_domain_s* domain);
+                              int8_t type, struct ray_sym_domain_s* domain, uint8_t gen);
 /* Start building the column's index from global row start_row. Call after
  * open and before the first append; no-op for types without an index. */
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row);
@@ -58,10 +62,13 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable);
  * finish error the tmp file is already removed; the caller still calls abort
  * on every writer. */
 ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable);
+/* Refuses (RAY_ERR_DOMAIN) a writer whose finish never ran; a no-op on one
+ * already published or aborted. */
 ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable);
 /* finish every writer as one pool task per column (serially without a
  * pool), then publish them in order.  The first finish error is returned;
- * on any error every writer is aborted and nothing is published.
+ * a task the pool skipped (cancellation) is RAY_ERR_CANCEL; on any error
+ * every writer is aborted and nothing is published.
  * `col_ns` (optional, n entries) receives each column's finish time. */
 ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
                                    int64_t* col_ns);

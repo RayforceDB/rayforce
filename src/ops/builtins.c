@@ -629,6 +629,14 @@ static const char* csv_default_sym_path(const char* dir, char* buf, size_t bufsz
 }
 
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
+    ray_compress_t mode = RAY_COMPRESS_ABSENT;
+    if (n >= 1 && args[0] && args[0]->type == RAY_DICT) {
+        if (n >= 2 && args[1] && args[1]->type == RAY_DICT)
+            return ray_error("domain", "csv.splayed: a second options dict");
+        ray_t* oerr = ray_compress_opt_parse(args[0], true, &mode);
+        if (oerr) return oerr;
+        args++; n--;
+    }
     if (n < 2 || n > 4) return ray_error("arity", "csv.splayed: expects 2 to 4 arguments, got %lld", (long long)n);
 
     char dir[1024];
@@ -682,10 +690,10 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
         }
     }
 
-    ray_err_t err = ray_csv_save_splayed_named_opts(path, 0, header,
-                                                    types_arg, ncols,
-                                                    names_arg, ncols,
-                                                    dir, 0);
+    ray_err_t err = ray_csv_save_splayed_mode(path, 0, header,
+                                              types_arg, ncols,
+                                              names_arg, ncols,
+                                              dir, 0, mode);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     char sym_path[1024];

@@ -41,6 +41,7 @@
 #include "store/splay.h"
 #include "store/part.h"
 #include "store/serde.h"
+#include "store/stream.h"
 #include "vec/str.h"
 #include "ipc_harness.h"
 #include "core/ipc.h"
@@ -1409,7 +1410,168 @@ static test_result_t test_csv_parted_option(void) {
     PASS();
 }
 
+/* ---- Task 17: generation-2 stream writer; .csv.splayed and Parquet ---- */
+
+/* Streaming the same I64 values in two appends gives the resident bytes. */
+static test_result_t test_stream_matches_resident(void) {
+    int64_t n = 140000;
+    ray_t* v = i64_col(n, 13);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/res", 2), RAY_OK);
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("str1", 4), RAY_I64, NULL, 2), RAY_OK);
+    ray_t* p1 = ray_vec_new(RAY_I64, 70000); p1->len = 70000;
+    ray_t* p2 = ray_vec_new(RAY_I64, n - 70000); p2->len = n - 70000;
+    for (int64_t i = 0; i < 70000; i++) ((int64_t*)ray_data(p1))[i] = i * 13;
+    for (int64_t i = 0; i < n - 70000; i++) ((int64_t*)ray_data(p2))[i] = (70000 + i) * 13;
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, p1), RAY_OK);   /* streams reject slices */
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, p2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    ray_col_stream_abort(&w);                                    /* always valid; nothing left */
+    size_t na, nb; uint8_t* a = slurp(CS_TMP "/res", &na); uint8_t* b = slurp(CS_TMP "/str1", &nb);
+    TEST_ASSERT_TRUE(a && b);
+    TEST_ASSERT_TRUE(na == nb && memcmp(a, b, na) == 0);   /* no zone accumulator: identical */
+    free(a); free(b);
+    /* with the converters' zone accumulator the stream records CHUNK_ZONE,
+     * as the generation-0 stream persists one */
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("str2", 4), RAY_I64, NULL, 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, p1), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, p2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    ray_col_stream_abort(&w);
+    b = slurp(CS_TMP "/str2", &nb);
+    ray_enc_hdr_t hb; memcpy(&hb, b + 32, 64);
+    TEST_ASSERT_EQ_I(hb.index_kind, RAY_IDX_CHUNK_ZONE);
+    free(b);
+    ray_release(p1); ray_release(p2); ray_release(v);
+    PASS();
+}
+
+/* STR rows [lo, hi): empties, short inline cells and repeating long cells. */
+static ray_t* str_rows(int64_t lo, int64_t hi) {
+    ray_t* v = ray_vec_new(RAY_STR, hi - lo);
+    char b[96];
+    for (int64_t i = lo; i < hi; i++) {
+        int len;
+        if (i % 7 == 0) len = 0;
+        else if (i % 3 == 0) len = snprintf(b, sizeof b, "s%lld", (long long)(i % 50));
+        else len = snprintf(b, sizeof b, "a much longer string value number %lld", (long long)(i % 1000));
+        v = ray_str_vec_append(v, b, (size_t)len);
+    }
+    return v;
+}
+
+/* Same bytes from offset `from` on. */
+static bool same_file_from(const char* x, const char* y, size_t from) {
+    size_t na, nb; uint8_t* a = slurp(x, &na); uint8_t* b = slurp(y, &nb);
+    bool ok = a && b && na == nb && na >= from && memcmp(a + from, b + from, na - from) == 0;
+    free(a); free(b);
+    return ok;
+}
+
+/* A STR column across several chunks, streamed in three appends (each its
+ * own pool) gives the resident generation-2 bytes; generation 0 streams
+ * stay today's bytes (the resident generation-0 writer's). */
+static test_result_t test_stream_str_matches_resident(void) {
+    int64_t n = 200000, cut[4] = { 0, 50000, 130001, 200000 };
+    ray_t* v = str_rows(0, n);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/sres", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, CS_TMP "/sres0"), RAY_OK);
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("sst2", 4), RAY_STR, NULL, 2), RAY_OK);
+    for (int k = 0; k < 3; k++) {
+        ray_t* p = str_rows(cut[k], cut[k + 1]);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w, p), RAY_OK);
+        ray_release(p);
+    }
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    ray_col_stream_abort(&w);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/sst2"), 2);
+    TEST_ASSERT_TRUE(same_file_from(CS_TMP "/sres", CS_TMP "/sst2", 0));
+    /* generation 0, one append: the resident generation-0 payload (the
+     * resident STR header carries nonzero bytes 8..15 the stream leaves 0;
+     * that difference predates generation 2) */
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("sst0", 4), RAY_STR, NULL, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    ray_col_stream_abort(&w);
+    TEST_ASSERT_TRUE(same_file_from(CS_TMP "/sres0", CS_TMP "/sst0", 16));
+    /* the generation-2 file loads back to the same cells */
+    ray_t* back = ray_col_load(CS_TMP "/sst2");
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back) && back->len == n);
+    for (int64_t i = 0; i < n; i += 997) {
+        size_t la, lb; const char* a = ray_str_vec_get(v, i, &la); const char* b = ray_str_vec_get(back, i, &lb);
+        TEST_ASSERT_TRUE(la == lb && (la == 0 || memcmp(a, b, la) == 0));
+    }
+    ray_release(back);
+    /* I64 generation 0 streamed in two appends: the resident bytes */
+    ray_t* iv = i64_col(140000, 13);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(iv, CS_TMP "/ires0"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("ist0", 4), RAY_I64, NULL, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, iv), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    ray_col_stream_abort(&w);
+    TEST_ASSERT_TRUE(same_file_from(CS_TMP "/ires0", CS_TMP "/ist0", 0));
+    /* any other generation is refused before a file exists */
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("bad", 3), RAY_I64, NULL, 1), RAY_ERR_VERSION);
+    ray_col_stream_abort(&w);
+    ray_release(iv); ray_release(v);
+    PASS();
+}
+
+/* Parquet: one options dict per call. */
+static test_result_t test_parquet_two_dicts(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(.parquet.splayed {compress: true} {compress: true} \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/p2d\")"), "domain");
+    TEST_ASSERT_STR_EQ(ev_code("(.parquet.parted {compress: true} {rows: 2} \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/p2p\" 't)"), "domain");
+    PASS();
+}
+
+static test_result_t test_csv_splayed_option(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['a 's] (list [1 2 3 4] [\"alpha\" \"a much longer value\" \"\" \"x\"])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.write t \"" CS_TMP "/in.csv\")"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.splayed {compress: true} [I64 STR] \"" CS_TMP "/in.csv\" \"" CS_TMP "/cs\")"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/cs", "a"), 2);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/cs", "s"), 2);
+    ray_t* r = ray_eval_str("(at (.db.splayed.get \"" CS_TMP "/cs\") 's)");
+    ray_t* want = ray_eval_str("[\"alpha\" \"a much longer value\" \"\" \"x\"]");
+    ray_t* fa = ray_fmt(r, 0); ray_t* fb = ray_fmt(want, 0);
+    TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
+    ray_release(fa); ray_release(fb); ray_release(r); ray_release(want);
+    /* absent over the generation-2 destination inherits it */
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.splayed [I64 STR] \"" CS_TMP "/in.csv\" \"" CS_TMP "/cs\")"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/cs", "a"), 2);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.splayed {compress: true} {compress: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/cs2\")"), "domain");
+    PASS();
+}
+
+static test_result_t test_parquet_option(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(.parquet.splayed {compress: true} \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/pq\")"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.parquet.splayed \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/pq0\")"), "");
+    ray_t* a = ray_eval_str("(.db.splayed.get \"" CS_TMP "/pq\")");
+    ray_t* b = ray_eval_str("(.db.splayed.get \"" CS_TMP "/pq0\")");
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b));
+    for (int64_t c = 0; c < ray_table_ncols(a); c++) {
+        ray_t* nm = ray_sym_str(ray_table_col_name(a, c));
+        char cn[256]; snprintf(cn, sizeof cn, "%.*s", (int)ray_str_len(nm), ray_str_ptr(nm));
+        ray_col_meta_t m; ray_table_col_meta_idx(a, c, &m);
+        uint8_t want = (m.type >= RAY_BOOL && m.type <= RAY_STR) ? 2 : 0;
+        TEST_ASSERT_FMT(col_gen_in(CS_TMP "/pq", cn) == want, "column %s", cn);
+        TEST_ASSERT_FMT(col_gen_in(CS_TMP "/pq0", cn) == 0, "column %s (absent)", cn);
+    }
+    ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+    TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
+    ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+    TEST_ASSERT_STR_EQ(ev_code("(.parquet.parted {compress: true rows: 2} \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/pqp\" 't)"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.parquet.splayed {compress: 1} \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/pq2\")"), "domain");
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
+    { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
+    { "compress/csv_splayed_option",      test_csv_splayed_option,      rt_setup, rt_teardown },
+    { "compress/parquet_option",          test_parquet_option,          rt_setup, rt_teardown },
+    { "compress/parquet_two_dicts",       test_parquet_two_dicts,       rt_setup, rt_teardown },
     { "compress/merge_mixed_widths",  test_merge_mixed_widths,  cs_setup, cs_teardown },
     { "compress/absent_byte_identity", test_absent_byte_identity, cs_setup, cs_teardown },
     { "compress/unreadable_destination", test_unreadable_destination, cs_setup, cs_teardown },

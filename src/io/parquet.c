@@ -22,6 +22,7 @@
 #include "store/splay.h"
 #include "store/stream.h"
 #include "store/col.h"
+#include "store/colrange.h"
 #include "store/fileio.h"
 #include "lang/eval.h"
 #include "lang/internal.h"
@@ -298,6 +299,7 @@ struct ray_parquet {
     pq_interval* excluded;
     int64_t nexcluded, exclude_pos, group_rows, bloom_skipped, parallel_batches;
     bool failed, emitted, borrowed, filter_nulls;
+    uint8_t compress;     /* the import's compress option (ray_compress_t; 0 = absent) */
 };
 static bool pq_reserve(uint8_t** buf, size_t* cap, size_t n) {
     if (n > PQ_MAX_PAGE) return false;
@@ -1364,6 +1366,7 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->nselected = parent->nselected; r->noutput = parent->noutput;
     r->filter_pos = parent->filter_pos; r->filter_lo = parent->filter_lo; r->filter_hi = parent->filter_hi;
     r->filter_nulls = parent->filter_nulls;
+    r->compress = parent->compress;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
@@ -1524,7 +1527,7 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         if (!keys || keys->type != RAY_SYM) return pq_error("import option keys must be symbols");
         for (int64_t i = 0; i < keys->len; i++) {
             ray_t* key = ray_sym_vec_cell(keys,i); const char* k = key ? ray_str_ptr(key) : NULL;
-            if (!k || (strcmp(k,"types") && strcmp(k,"strict") && strcmp(k,"rows"))) return pq_error("unknown import option");
+            if (!k || (strcmp(k,"types") && strcmp(k,"strict") && strcmp(k,"rows") && strcmp(k,"compress"))) return pq_error("unknown import option");
         }
         ray_t* err = pq_strict_option(r,types);
         ray_t* rows = pq_option(types,"rows");
@@ -1534,6 +1537,12 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
             else r->batch_rows = rows->i64;
         }
         if (rows) ray_release(rows);
+        ray_t* cmp = pq_option(types,"compress");
+        if (!err && cmp) {
+            if (cmp->type != -RAY_BOOL) err = ray_error("domain","parquet: compress must be true or false");
+            else r->compress = cmp->b8 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF;
+        }
+        if (cmp && !RAY_IS_ERR(cmp)) ray_release(cmp);
         ray_t* schema = pq_option(types,"types");
         if (!err && schema && schema->type != RAY_SYM) err = pq_error("types must be a symbol vector");
         if (!err) err = pq_import_types(r,schema);
@@ -1574,7 +1583,7 @@ typedef struct {
  * shared vocabulary once after all workers join, before publishing the root.
  * Flushing it here rewrites the growing dictionary for every partition. */
 static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* leaf,
-                                   const char* sym, bool durable) {
+                                   const char* sym, bool durable, ray_compress_t mode) {
     ray_sym_domain_t* domain = NULL;
     for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].import_domain) domain = r->schema[c].import_domain;
     /* No import domain means no SYM column, so the vocabulary is untouched.
@@ -1583,7 +1592,8 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
      * the whole tree: write them as a bare staged save, without the writer
      * lock, generation handling or index pass that publishing a live table
      * needs.  The spool then deletes exactly the files it wrote. */
-    if (!domain) return durable ? ray_splay_save(batch,leaf,sym) : ray_splay_save_staged_bulk(batch,leaf,sym);
+    if (!domain) return durable ? ray_splay_save_mode(batch,leaf,sym,mode)
+                                : ray_splay_save_staged_bulk_mode(batch,leaf,sym,mode);
     ray_err_t e = ray_mkdir_p(leaf); if (e != RAY_OK) return e;
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { if (schema) ray_release(schema); return RAY_ERR_OOM; }
@@ -1592,9 +1602,18 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
         ray_t* name = ray_sym_str(r->schema[c].name);
         int n = snprintf(path,sizeof(path),"%s/%s",leaf,ray_str_ptr(name));
         if (n < 0 || (size_t)n >= sizeof(path)) { e = RAY_ERR_RANGE; break; }
+        /* a decoded batch: plain columns, SYM over the import domain; the
+         * leaf is fresh, so there is no destination to inherit from */
         ray_t* col = ray_table_get_col_idx(batch,c);
-        e = col->type == RAY_SYM ? ray_col_save_sym_encoded(col,path,domain,durable) :
-            durable ? ray_col_save(col,path) : ray_col_save_bulk(col,path);
+        ray_col_write_t cw; memset(&cw,0,sizeof cw);
+        ray_t* berr = ray_col_src_bind(col,&cw.src);
+        if (berr) { e = ray_err_from_obj(berr); ray_error_free(berr); break; }
+        cw.name = ray_str_ptr(name);
+        e = ray_col_resolve_gen_err(mode,col,NULL,ray_str_ptr(name),ray_str_len(name),&cw.gen);
+        cw.target_dom = col->type == RAY_SYM ? domain : NULL;
+        cw.durable = durable;
+        if (e == RAY_OK) e = ray_col_save_ctx(&cw,path);
+        ray_col_src_release(&cw.src);
         if (e != RAY_OK) break;
         ray_t* next = ray_str_vec_append(schema,ray_str_ptr(name),ray_str_len(name));
         if (!next || RAY_IS_ERR(next)) { if (next) ray_release(next); e = RAY_ERR_OOM; break; }
@@ -1627,7 +1646,8 @@ static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* ta
         /* All leaves are private staging output. Sync them together after
          * the workers finish, avoiding a directory fsync per column rename. */
         ray_err_t e = n < 0 || (size_t)n >= sizeof(leaf) ? RAY_ERR_RANGE :
-            pq_save_partition(r,batch,leaf,sym,false);
+            pq_save_partition(r,batch,leaf,sym,false,
+                              durable ? (ray_compress_t)r->compress : RAY_COMPRESS_OFF);
         ray_release(batch);
         if (e != RAY_OK) return ray_error(ray_err_code_str(e),"parquet: native partition write failed");
     }
@@ -1905,7 +1925,13 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     }
     for (int64_t c = 0; c < r->ncols; c++) {
         opened++;
-        e = ray_col_stream_open(&writers[c],staging,r->schema[c].name,r->schema[c].native_symbol ? RAY_SYM : (int8_t)r->schema[c].type,domain);
+        int8_t wt = r->schema[c].native_symbol ? RAY_SYM : (int8_t)r->schema[c].type;
+        /* the destination must not exist: nothing to inherit from */
+        ray_t* nm = ray_sym_str(r->schema[c].name);
+        uint8_t gen = 0;
+        e = nm ? ray_col_resolve_gen_type_err((ray_compress_t)r->compress,wt,NULL,
+                                              ray_str_ptr(nm),ray_str_len(nm),&gen) : RAY_ERR_CORRUPT;
+        if (e == RAY_OK) e = ray_col_stream_open(&writers[c],staging,r->schema[c].name,wt,domain,gen);
         if (e != RAY_OK) goto io_fail;
     }
     for (int64_t c = 0; c < r->ncols; c++) {
@@ -2013,11 +2039,15 @@ ray_t* ray_parquet_read_fn(ray_t** args, int64_t n) {
     return p ? ray_parquet_read(p,n == 2 ? args[0] : NULL) : ray_error("type","parquet.read: path must be a nonempty string");
 }
 ray_t* ray_parquet_splayed_fn(ray_t** args, int64_t n) {
+    if (n >= 2 && args[0] && args[0]->type == RAY_DICT && args[1] && args[1]->type == RAY_DICT)
+        return ray_error("domain","parquet: a second options dict");
     if (n != 2 && n != 3) return ray_error("arity","parquet.splayed: [types] path directory");
     const char* path = pq_path_arg(args[n-2]); const char* dir = pq_path_arg(args[n-1]);
     return path && dir ? ray_parquet_splayed_typed(path,dir,n == 3 ? args[0] : NULL) : ray_error("type","parquet.splayed: expected two paths");
 }
 ray_t* ray_parquet_parted_fn(ray_t** args, int64_t n) {
+    if (n >= 2 && args[0] && args[0]->type == RAY_DICT && args[1] && args[1]->type == RAY_DICT)
+        return ray_error("domain","parquet: a second options dict");
     if (n != 3 && n != 4) return ray_error("arity","parquet.parted: [types] path root table-name");
     const char* p = pq_path_arg(args[n-3]); const char* root = pq_path_arg(args[n-2]);
     ray_t* name = args[n-1]->type == -RAY_SYM ? ray_sym_str(args[n-1]->i64) : args[n-1];

@@ -344,6 +344,11 @@ bool ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src) {
            !atomic_load(&g_force_compress) && src->type != RAY_ENCCOL;
 }
 
+bool ray_col_resolve_type_needs_dest(ray_compress_t mode, int8_t type) {
+    return mode == RAY_COMPRESS_ABSENT && ray_encw_type_supported(type) &&
+           !atomic_load(&g_force_compress);
+}
+
 ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* cur,
                                        const char* name, size_t nlen, uint8_t* gen) {
     *gen = 0;

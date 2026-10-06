@@ -3648,7 +3648,8 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk,
-                                          const char* sym_path) {
+                                          const char* sym_path, ray_compress_t mode,
+                                          const char* cur, ray_err_t cur_err) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
@@ -3833,8 +3834,20 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     ray_col_stream_t writers[CSV_MAX_COLS];
     memset(writers, 0, sizeof(writers));
     for (int c = 0; c < ncols; c++) {
-        err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
-                                      resolved_types[c], sym_dom);
+        /* The column's generation (spec "Generation resolution"): only an
+         * inheriting column consults the destination's current generation,
+         * so only that one fails when it could not be resolved. */
+        ray_t* na = ray_sym_str(col_name_ids[c]);
+        uint8_t gen = 0;
+        if (cur_err != RAY_OK && ray_col_resolve_type_needs_dest(mode, resolved_types[c]))
+            err = cur_err;
+        else
+            err = na ? ray_col_resolve_gen_type_err(mode, resolved_types[c], cur,
+                                                    ray_str_ptr(na), ray_str_len(na), &gen)
+                     : RAY_OK;
+        if (err == RAY_OK)
+            err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
+                                      resolved_types[c], sym_dom, gen);
         if (err == RAY_OK) err = ray_col_stream_index_begin(&writers[c], 0);
         if (err != RAY_OK) {
             for (int j = 0; j <= c; j++) ray_col_stream_abort(&writers[j]);
@@ -4030,17 +4043,26 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk) {
+    return ray_csv_save_splayed_mode(path, delimiter, header, col_types_in, n_types,
+                                     col_names_in, n_names, dir, rows_per_chunk,
+                                     RAY_COMPRESS_ABSENT);
+}
+
+ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool header,
+                                    const int8_t* col_types_in, int32_t n_types,
+                                    const int64_t* col_names_in, int32_t n_names,
+                                    const char* dir, int64_t rows_per_chunk, ray_compress_t mode) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir) return RAY_ERR_DOMAIN;
     char sym_path[1024];
     int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
     if (n < 0 || (size_t)n >= sizeof(sym_path)) return RAY_ERR_RANGE;
     ray_splay_write_t write;
-    ray_err_t err = ray_splay_write_begin(dir, &write);
+    ray_err_t err = ray_splay_write_begin_mode(dir, mode, &write);
     if (err != RAY_OK) return err;
     err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
                                   col_names_in, n_names, write.dir,
-                                  rows_per_chunk, sym_path);
+                                  rows_per_chunk, sym_path, mode, write.cur, write.cur_err);
     return ray_splay_write_finish(&write, err, false);
 }
 

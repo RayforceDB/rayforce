@@ -4,6 +4,8 @@
 #include "ops/hash.h"
 #include "store/col.h"
 #include "store/fileio.h"
+#include "store/encw.h"
+#include "store/encfmt.h"
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
@@ -22,8 +24,13 @@
 ray_err_t ray_col_stream_open(ray_col_stream_t* w,
                                          const char* dir, int64_t name_id,
                                          int8_t type,
-                                         struct ray_sym_domain_s* dom) {
+                                         struct ray_sym_domain_s* dom,
+                                         uint8_t gen) {
     memset(w, 0, sizeof(*w));
+    if (gen != 0 && gen != 2) return RAY_ERR_VERSION;
+    /* a big-endian build refuses generation 2 before any file exists */
+    if (gen == 2 && !ray_enc_gen2_supported()) return RAY_ERR_NYI;
+    w->gen = gen;
     w->type = type;
     w->attrs = (type == RAY_SYM) ? RAY_SYM_W32 : 0;
     w->dom = dom;
@@ -139,6 +146,12 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                 if (buf[i].len > RAY_STR_INLINE_MAX) {
                     if (buf[i].pool_off > bytes || buf[i].len > bytes-buf[i].pool_off) return RAY_ERR_CORRUPT;
                     buf[i].pool_off += (uint32_t)w->pool_bytes;
+                    /* generation 2 copies each occurrence into its vector's
+                     * pool: count the decoded bytes so the row that crosses
+                     * the limit fails (descriptors may share pooled ranges,
+                     * so the staged pool can be far smaller) */
+                    if (w->gen == 2 && (w->dec_pool += buf[i].len) > UINT32_MAX)
+                        return RAY_ERR_RANGE;
                 }
                 if (!buf[i].len) w->had_nulls = true;
             }
@@ -222,6 +235,56 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
     return RAY_OK;
 }
 
+/* Generation-2 finish: the staging file holds the raw generation-0 payload
+ * ([32 B zero header][rows x element][STR: 32 B pool header + pool]); it is
+ * mapped and transcoded chunk by chunk into a second staging file, which
+ * then replaces the first (published by ray_col_stream_publish as today).
+ * The zone accumulator is recorded as CHUNK_ZONE only; no index region and
+ * no hash upgrade.  Closes w->fp on every path. */
+static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
+    if (w->zone && w->zone->saw_null) w->had_nulls = true;
+    uint8_t ik = (w->zone && w->rows >= RAY_ENC_CHUNK &&
+                  ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, w->type)) ? RAY_IDX_CHUNK_ZONE : 0;
+    stream_drop_index(w);                         /* no region, no hash upgrade */
+    ray_err_t err = fflush(w->fp) == 0 ? RAY_OK : RAY_ERR_IO;
+    if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    w->fp = NULL;
+    if (err != RAY_OK) return err;
+    uint8_t esz = w->type == RAY_SYM ? 4 : ray_sym_elem_size(w->type, 0);
+    uint64_t need = 32 + (uint64_t)w->rows * esz + (w->type == RAY_STR ? 32 + w->pool_bytes : 0);
+    size_t msz = 0;
+    void* m = ray_vm_map_file(w->tmp_path, &msz);
+    if (!m || msz < need) { if (m) ray_vm_unmap_file(m, msz); return RAY_ERR_IO; }
+    const uint8_t* data = (const uint8_t*)m + 32;
+    const char* pool = w->type == RAY_STR ? (const char*)m + 32 + (size_t)w->rows * 16 + 32 : NULL;
+    char enc_path[1100];
+    snprintf(enc_path, sizeof enc_path, "%s.g2", w->tmp_path);
+    FILE* f = fopen(enc_path, "wb+");
+    err = f ? RAY_OK : RAY_ERR_IO;
+    ray_encw_t ew; memset(&ew, 0, sizeof ew);
+    uint8_t attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
+    uint32_t sc = w->type == RAY_SYM ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
+    if (err == RAY_OK) err = ray_encw_begin(&ew, f, w->type, attrs, w->rows, sc, ik, 0);
+    for (int64_t c = 0; err == RAY_OK && c < ew.n_chunks; c++) {
+        if (ray_interrupted()) { err = RAY_ERR_CANCEL; break; }
+        int64_t n = w->rows - c * RAY_ENC_CHUNK;
+        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+        err = ray_encw_chunk(&ew, data + (size_t)c * RAY_ENC_CHUNK * esz, pool, n);
+    }
+    if (err == RAY_OK) err = ray_encw_finish(&ew);
+    ray_encw_free(&ew);
+    ray_vm_unmap_file(m, msz);
+    if (f && fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    if (err == RAY_OK && durable) {
+        ray_fd_t fd = ray_file_open(enc_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
+        else { err = ray_file_sync(fd); ray_file_close(fd); }
+    }
+    if (err == RAY_OK) err = ray_file_rename(enc_path, w->tmp_path);
+    if (err != RAY_OK) remove(enc_path);
+    return err;
+}
+
 ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
     ray_col_stream_drop_lut(w);
     if (!w->fp) return RAY_OK;
@@ -248,6 +311,13 @@ ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
     }
     if (w->pool_fp) { if (fclose(w->pool_fp) && err == RAY_OK) err = RAY_ERR_IO; w->pool_fp = NULL; }
     if (w->pool_path[0]) remove(w->pool_path);
+
+    if (err == RAY_OK && w->gen == 2) {
+        err = stream_finish_gen2(w, durable);
+        if (err != RAY_OK) { remove(w->tmp_path); stream_drop_index(w); }
+        else w->finished = true;
+        return err;
+    }
 
     /* The index region goes after the payload and the marker into the same
      * header write, so the rename publishes data and index together.  A
@@ -318,7 +388,8 @@ ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
 }
 
 ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable) {
-    if (!w->finished) return RAY_OK;
+    /* an open writer was never finished: its tmp file is incomplete */
+    if (!w->finished) return w->fp ? RAY_ERR_DOMAIN : RAY_OK;
     w->finished = false;
     ray_err_t err = ray_file_rename(w->tmp_path, w->path);
     if (err == RAY_OK && durable) err = ray_file_sync_dir(w->path);
@@ -337,6 +408,7 @@ typedef struct {
     int64_t* col_ns;
     bool durable;
     _Atomic(ray_err_t) err;
+    _Atomic(int64_t) ran;   /* tasks that finished or failed (a cancelled pool skips the rest) */
 } stream_finish_ctx_t;
 
 static void stream_finish_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -349,6 +421,7 @@ static void stream_finish_task(void* raw, uint32_t wid, int64_t start, int64_t e
         ray_err_t ok = RAY_OK;
         atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
     }
+    atomic_fetch_add_explicit(&a->ran, 1, memory_order_relaxed);
 }
 
 ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
@@ -357,13 +430,17 @@ ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
     /* finish touches only the writer's own files and never dispatches, so
      * every column finishes side by side: STR pool merges and dictionary
      * regions, which used to run one after another on the caller. */
-    stream_finish_ctx_t ctx = { .w = w, .col_ns = col_ns, .durable = durable, .err = RAY_OK };
+    stream_finish_ctx_t ctx = { .w = w, .col_ns = col_ns, .durable = durable, .err = RAY_OK, .ran = 0 };
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, n, 2))
         ray_pool_dispatch_n(pool, stream_finish_task, &ctx, (uint32_t)n);
     else
         for (int64_t c = 0; c < n; c++) stream_finish_task(&ctx, 0, c, c + 1);
     ray_err_t err = ctx.err;
+    /* A cancelled pool retires unrun tasks without running them: those
+     * writers are unfinished, so the table must not be published. */
+    if (err == RAY_OK && atomic_load_explicit(&ctx.ran, memory_order_relaxed) != n)
+        err = RAY_ERR_CANCEL;
     /* The renames stay serial and in column order (microseconds each). */
     for (int64_t c = 0; c < n; c++) {
         ray_err_t cerr = (err == RAY_OK) ? ray_col_stream_publish(&w[c], durable) : RAY_ERR_IO;

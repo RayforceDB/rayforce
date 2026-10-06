@@ -44,6 +44,7 @@
 #include "core/sock.h"
 #include "core/platform.h"
 #include "core/runtime.h"
+#include "core/pool.h"
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "mem/sys.h"
@@ -1850,7 +1851,7 @@ static test_result_t test_stream_inline_zone(void) {
     int64_t n = 200000;
     ray_t* v = zone_test_col(n, 0, 0);
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("z", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("z", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     for (int64_t off = 0; off < n; off += 70000) {
         int64_t cnt = n - off < 70000 ? n - off : 70000;
@@ -1939,7 +1940,7 @@ static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
     ((int64_t*)ray_data(s1))[7] = INT64_MIN;
     s2->attrs |= RAY_ATTR_HAS_NULLS;
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("n", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("n", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s1), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s2), RAY_OK);
@@ -1982,7 +1983,7 @@ static test_result_t test_stream_index_write_failure_drops_index(void) {
     pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
     if (!pid) {
         ray_col_stream_t w;
-        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL) != RAY_OK) _exit(2);
+        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL, 0) != RAY_OK) _exit(2);
         if (ray_col_stream_index_begin(&w, 0) != RAY_OK) _exit(2);
         if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
         struct rlimit limit;
@@ -2018,7 +2019,7 @@ static test_result_t test_stream_inline_zone_one_chunk(void) {
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
     for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;  /* unclustered */
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("o", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("o", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
@@ -2041,7 +2042,7 @@ static test_result_t test_stream_hash_candidate(void) {
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
     for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("h", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("h", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
@@ -2176,7 +2177,7 @@ static test_result_t test_stream_finish_failure_publishes_nothing(void) {
     const char* names[3] = { "fa", "fb", "fs" };
     ray_col_stream_t w[3];
     for (int c = 0; c < 3; c++) {
-        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), types[c], NULL), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), types[c], NULL, 0), RAY_OK);
         TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w[c], 0), RAY_OK);
         TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], cols[c]), RAY_OK);
     }
@@ -2197,6 +2198,44 @@ static test_result_t test_stream_finish_failure_publishes_nothing(void) {
     PASS();
 }
 
+/* A cancelled pool retires the finish tasks it has not run: close_all
+ * reports the cancellation and publishes nothing (it used to return OK with
+ * every column file missing), and publish refuses a writer whose finish
+ * never ran.  Deterministic: the cancel flag is up before the dispatch, so
+ * the pool skips every task. */
+static test_result_t test_stream_cancel_publishes_nothing(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, 3, 2)) SKIP("needs a worker pool");
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-cancel-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 70000;
+    ray_t* a = ray_vec_new(RAY_I64, n); a->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(a))[i] = i * 3;
+    const char* names[3] = { "ca", "cb", "cc" };
+    uint8_t gens[3] = { 0, 2, 0 };
+    ray_col_stream_t w[3];
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), RAY_I64, NULL, gens[c]), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], a), RAY_OK);
+    }
+    /* an open writer: publish refuses, the staging file stays private */
+    TEST_ASSERT_EQ_I(ray_col_stream_publish(&w[0], false), RAY_ERR_DOMAIN);
+    ray_request_interrupt();
+    ray_err_t e = ray_col_stream_close_all(w, 3, false, NULL);
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    for (int c = 0; c < 3; c++) {
+        char path[200]; snprintf(path, sizeof(path), "%s/%s", dir, names[c]);
+        TEST_ASSERT_TRUE(access(path, F_OK) != 0);
+        ray_col_stream_abort(&w[c]);
+    }
+    TEST_ASSERT_FALSE(stream_dir_has_tmp(dir));
+    ray_release(a);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* STR column of 100000 rows with empty strings: inline dict, HAS_NULLS set. */
 static test_result_t test_stream_inline_dict(void) {
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-dict-%d", (int)getpid());
@@ -2204,7 +2243,7 @@ static test_result_t test_stream_inline_dict(void) {
     int64_t n = 100000;
     ray_t* v = dict_test_col(n, 3000, false);
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
@@ -6269,6 +6308,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
+    { "store/stream_cancel_publishes_nothing", test_stream_cancel_publishes_nothing, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },

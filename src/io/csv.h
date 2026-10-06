@@ -93,6 +93,12 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                           const int8_t* col_types, int32_t n_types,
                                           const int64_t* col_names, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk);
+/* The same with the call's compress option (ray_compress_t); the form above
+ * passes RAY_COMPRESS_ABSENT, so each column inherits the destination's. */
+ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool header,
+                                    const int8_t* col_types, int32_t n_types,
+                                    const int64_t* col_names, int32_t n_names,
+                                    const char* dir, int64_t rows_per_chunk, ray_compress_t mode);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 
 /* Hash-vs-chunk-zone index policy for a column, from its chunk-zone entropy

@@ -149,6 +149,8 @@ ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* d
 /* Would resolving `src` under `mode` consult the destination?  Only an
  * inheriting (ABSENT) save of a plain eligible column does. */
 bool      ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src);
+/* The same question for writers that have only the column's type (streams). */
+bool      ray_col_resolve_type_needs_dest(ray_compress_t mode, int8_t type);
 ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* dest_cur,
                                        const char* name, size_t name_len, uint8_t* gen);
 /* Parse the `compress` option from `opts` (a RAY_DICT with SYM keys; NULL:

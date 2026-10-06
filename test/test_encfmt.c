@@ -28,6 +28,7 @@
 #include "store/encfmt.h"
 #include "store/encw.h"
 #include "store/enccol.h"
+#include "store/stream.h"
 #include "vec/str.h"
 #include "ops/idxop.h"
 #include <stdio.h>
@@ -975,6 +976,31 @@ static test_result_t test_golden_match(void) {
     PASS();
 }
 
+static test_result_t test_golden_stream(void) {
+    (void)ray_test_mkdir_p(ENCFMT_TMP "/gs");
+    for (int i = 0;; i++) {
+        const char* name; int force, want;
+        ray_t* v = golden_vec(i, &name, &force, &want);
+        if (!v) break;
+        ray_col_stream_t w;
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w, ENCFMT_TMP "/gs", ray_sym_intern(name, strlen(name)), v->type, NULL, 2), RAY_OK);
+        ray_encw_test_force(force);
+        ray_err_t e = v->len ? ray_col_stream_append(&w, v) : RAY_OK;
+        if (e == RAY_OK) e = ray_col_stream_close(&w, false);
+        ray_encw_test_force(-1);
+        ray_col_stream_abort(&w);
+        ray_release(v);
+        TEST_ASSERT_FMT(e == RAY_OK, "%s: stream %d", name, (int)e);
+        char a[512], b[512];
+        snprintf(a, sizeof a, "%s/%s.bin", ENC_GOLDEN_DIR, name);
+        snprintf(b, sizeof b, "%s/gs/%s", ENCFMT_TMP, name);
+        size_t na, nb; uint8_t* pa = read_file(a, &na); uint8_t* pb = read_file(b, &nb);
+        TEST_ASSERT_FMT(pa && pb && na == nb && memcmp(pa, pb, na) == 0, "%s: stream differs from the fixture", name);
+        free(pa); free(pb);
+    }
+    PASS();
+}
+
 /* Every checked-in fixture decodes, through the generation-2 reader, to the
  * vector its generator regenerates.  sym_w32_rle is excluded: its saved
  * count (0xFFFFFFFF) lies above any symbol domain a test can build. */
@@ -1258,5 +1284,6 @@ const test_entry_t encfmt_entries[] = {
     { "encfmt/save_io_failure",           test_save_io_failure,           encfmt_setup, encfmt_teardown },
     { "encfmt/golden_emit",               test_golden_emit,               encfmt_setup, encfmt_teardown },
     { "encfmt/golden_match",              test_golden_match,              encfmt_setup, encfmt_teardown },
+    { "encfmt/golden_stream", test_golden_stream, encfmt_setup, encfmt_teardown },
     { NULL, NULL, NULL, NULL },
 };
