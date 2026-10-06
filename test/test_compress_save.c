@@ -5275,6 +5275,40 @@ static test_result_t test_select_planning_no_materialize(void) {
     PASS();
 }
 
+/* A computed key beside a renamed one over a parted generation-2 table is
+ * deferred to the per-partition group kernel, as over generation 0.  The
+ * select's streamable-key gate read an encoded parted slot's type as the
+ * parted type (RAY_PARTED_BASE + SYM), not its base type, so the by-dict was
+ * flattened eagerly and the group never streamed. */
+static test_result_t test_select_parted_bydict_streams(void) {
+    static const char* const gens[] = { "true", "false" };
+    ray_t* res[2] = { NULL, NULL };
+    for (int g = 0; g < 2; g++) {
+        char q[900];
+        snprintf(q, sizeof q,
+                 "(do (set P (table [ts sg v] (list (til 400) (as 'SYM (%% (til 400) 2)) (as 'F64 (til 400)))))"
+                 " (.db.splayed.set \"%s/pb%d/1/t/\" P {compress: %s})"
+                 " (.db.splayed.set \"%s/pb%d/2/t/\" P {compress: %s})"
+                 " (set t (.db.parted.get \"%s/pb%d/\" 't))"
+                 " (set B (at (.sys.mem) 'group-perpart-runs))"
+                 " (set R (select {sv: (sum v) by: {tb: (xbar ts 200) s: sg} from: t asc: tb}))"
+                 " (list (- (at (.sys.mem) 'group-perpart-runs) B) R))",
+                 CS_TMP, g, gens[g], CS_TMP, g, gens[g], CS_TMP, g);
+        res[g] = ray_eval_str(q);
+        TEST_ASSERT_FMT(res[g] && !RAY_IS_ERR(res[g]) && res[g]->type == RAY_LIST && res[g]->len == 2,
+                        "compress %s: answered", gens[g]);
+        ray_t* runs = ((ray_t**)ray_data(res[g]))[0];
+        TEST_ASSERT_FMT(runs->i64 == 1, "compress %s: per-partition runs %lld, expected 1",
+                        gens[g], (long long)runs->i64);
+    }
+    ray_t* r2 = ((ray_t**)ray_data(res[0]))[1];
+    ray_t* r0 = ((ray_t**)ray_data(res[1]))[1];
+    TEST_ASSERT_EQ_I(ray_table_nrows(r2), 4);
+    TEST_ASSERT_TRUE(sp_same(r2, r0));
+    ray_release(res[0]); ray_release(res[1]);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/select_planning_no_materialize", test_select_planning_no_materialize, rt_setup, rt_teardown },
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
@@ -5393,5 +5427,6 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_by_key_uneven", test_select_parted_prunes_by_key_uneven, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
+    { "compress/select_parted_bydict_streams", test_select_parted_bydict_streams, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

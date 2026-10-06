@@ -2734,13 +2734,15 @@ static int8_t query_col_base_type(ray_t* col) {
     return col->type;
 }
 
-/* query_col_base_type of a table column from metadata: an encoded slot is a
- * flat column of its logical type; parted wrappers and MAPCOMMON (never
- * encoded) are asked directly. */
+/* query_col_base_type of a table column from metadata: an encoded slot
+ * reports its logical type, a parted one RAY_PARTED_BASE + base, so the base
+ * is taken from that; plain slots and MAPCOMMON (never encoded) are asked
+ * directly. */
 static int8_t tbl_col_base_type(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return 0;
-    return m.enc ? m.type : query_col_base_type(ray_table_col(tbl, sym));   /* plain: no decode */
+    if (m.enc) return RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
+    return query_col_base_type(ray_table_col(tbl, sym));   /* plain: no decode */
 }
 
 /* A scalar key type the streaming per-partition group kernel packs into an
