@@ -38,6 +38,7 @@
 #include "table/table.h"
 #include "ops/idxop.h"
 #include "store/encw.h"
+#include "store/part.h"
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1563,6 +1564,128 @@ static test_result_t test_table_col_nrows_shapes(void) {
     PASS();
 }
 
+/* Three partitions of t(a I64, b F64); partition p is generation 2 when
+ * gen2_mask has bit p set, generation 0 otherwise. */
+static ray_err_t write_parted(const char* root, int gen2_mask, int64_t rows) {
+    for (int p = 0; p < 3; p++) {
+        char dir[512]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+        ray_t* t = tbl2(rows);
+        ray_err_t e;
+        if (gen2_mask & (1 << p)) e = write_splayed_gen2(dir, t);
+        else e = ray_splay_save(t, dir, NULL);
+        ray_release(t);
+        if (e != RAY_OK) return e;
+    }
+    return RAY_OK;
+}
+
+static test_result_t test_parted_mixed_load(void) {
+    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pdb", 0x5, 4000), RAY_OK);   /* parts 1 and 3 encoded */
+    ray_enc_counters_reset();
+    ray_t* t = ray_read_parted(ENCCOL_TMP "/pdb", "t");
+    TEST_ASSERT_FMT(t && !RAY_IS_ERR(t), "parted load: %s", t ? ray_err_code(t) : "null");
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 12000);
+    ray_t* slot = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(slot && ray_enccol_is_parted(slot));
+    TEST_ASSERT_EQ_I(ray_table_col_nrows(slot), 12000);          /* sum of segment lens, no decode */
+    ray_col_meta_t m;
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("a", 1), &m));
+    TEST_ASSERT_EQ_I(m.type, RAY_PARTED_BASE + RAY_I64);
+    TEST_ASSERT_EQ_I(m.n_segs, 3);
+    TEST_ASSERT_TRUE(m.enc != NULL);
+    ray_t* enc = m.enc;
+    TEST_ASSERT_EQ_I(ray_enccol_seg(enc, 0)->type, RAY_ENCCOL);
+    TEST_ASSERT_EQ_I(ray_enccol_seg(enc, 1)->type, RAY_I64);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_t* s2 = ray_enccol_seg_col(enc, 2);                 /* one segment only */
+    TEST_ASSERT_TRUE(s2 && !RAY_IS_ERR(s2) && s2->type == RAY_I64);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    ray_t* w = ray_table_col(t, ray_sym_intern("a", 1));     /* plain wrapper */
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+    TEST_ASSERT_EQ_I(w->type, RAY_PARTED_BASE + RAY_I64);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 2);                    /* segment 0 decoded, 2 cached */
+    ray_t** segs = (ray_t**)ray_data(w);
+    TEST_ASSERT_EQ_PTR(segs[2], s2);
+    ray_retain(w);
+    ray_release(t);                                          /* retained wrapper outlives the table */
+    /* segment 0 decodes to what the same directory loads as on its own */
+    ray_t* solo = ray_read_splayed(ENCCOL_TMP "/pdb/2024.01.01/t", NULL);
+    TEST_ASSERT_TRUE(solo && !RAY_IS_ERR(solo));
+    ray_t* sa = ray_table_col(solo, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(sa && !RAY_IS_ERR(sa) && sa->len == 4000 && segs[0]->len == 4000);
+    TEST_ASSERT_TRUE(memcmp(ray_data(sa), ray_data(segs[0]), 4000 * sizeof(int64_t)) == 0);
+    ray_release(solo);
+    ray_release(w);
+    PASS();
+}
+
+static test_result_t test_parted_failure_lowest_segment(void) {
+    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pf", 0x7, 4000), RAY_OK);
+    uint8_t one = 1;
+    patch(ENCCOL_TMP "/pf/2024.01.01/t/a", 160 + 6, &one, 1);    /* segment 0 corrupt */
+    patch(ENCCOL_TMP "/pf/2024.01.03/t/a", 160 + 6, &one, 1);    /* segment 2 corrupt */
+    ray_t* t = ray_read_parted(ENCCOL_TMP "/pf", "t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_col_meta_t m; ray_table_col_meta(t, ray_sym_intern("a", 1), &m);
+    /* a transient failure first, then the deterministic one */
+    ray_enccol_test_fail_alloc(1);
+    ray_t* r = ray_table_col(t, ray_sym_intern("a", 1));
+    ray_enccol_test_fail_alloc(0);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    ray_error_free(r);
+    for (int i = 0; i < 2; i++) {
+        r = ray_table_col(t, ray_sym_intern("a", 1));
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), "2024.01.01") != NULL);
+        ray_error_free(r);
+    }
+    /* the healthy segment keeps its own cached vector */
+    ray_t* s1 = ray_enccol_seg_col(m.enc, 1);
+    TEST_ASSERT_TRUE(s1 && !RAY_IS_ERR(s1));
+    TEST_ASSERT_EQ_PTR(ray_enccol_of(ray_enccol_seg(m.enc, 1))->decoded, s1);
+    ray_release(t);
+    PASS();
+}
+
+static test_result_t test_parted_fanin_orders(void) {
+    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/po", 0x7, 4000), RAY_OK);
+    uint8_t one = 1;
+    /* order 1: segment 0 corrupt, segment 2 OOM -> corrupt (lowest), cached */
+    patch(ENCCOL_TMP "/po/2024.01.01/t/a", 160 + 6, &one, 1);
+    ray_t* t = ray_read_parted(ENCCOL_TMP "/po", "t");
+    ray_enccol_test_fail_path("2024.01.03");
+    ray_t* r = ray_table_col(t, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    ray_enccol_test_fail_path(NULL);
+    r = ray_table_col(t, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0);
+    ray_error_free(r);
+    ray_release(t);
+    /* order 2: segment 0 OOM, segment 2 corrupt -> oom first, then the retry meets corrupt */
+    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pq", 0x7, 4000), RAY_OK);
+    patch(ENCCOL_TMP "/pq/2024.01.03/t/a", 160 + 6, &one, 1);
+    t = ray_read_parted(ENCCOL_TMP "/pq", "t");
+    ray_enccol_test_fail_path("pq/2024.01.01");
+    r = ray_table_col(t, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+    ray_error_free(r);
+    ray_enccol_test_fail_path(NULL);
+    r = ray_table_col(t, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), "2024.01.03") != NULL);
+    ray_error_free(r);
+    ray_release(t);
+    PASS();
+}
+
 const test_entry_t enccol_entries[] = {
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_rejects",        test_load_rejects,        enccol_setup, enccol_teardown },
@@ -1608,5 +1731,8 @@ const test_entry_t enccol_entries[] = {
     { "enccol/table_core",            test_table_core_enccol,     enccol_setup, enccol_teardown },
     { "enccol/table_torn_column",     test_table_torn_column,     enccol_setup, enccol_teardown },
     { "enccol/table_col_nrows_shapes", test_table_col_nrows_shapes, enccol_setup, enccol_teardown },
+    { "enccol/parted_fanin_orders",            test_parted_fanin_orders,           enccol_setup, enccol_teardown },
+    { "enccol/parted_mixed_load",             test_parted_mixed_load,             enccol_setup, enccol_teardown },
+    { "enccol/parted_failure_lowest_segment", test_parted_failure_lowest_segment, enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
 };

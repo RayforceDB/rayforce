@@ -115,6 +115,17 @@ void   ray_enccol_test_fail_path(const char* sub);
 void   ray_enccol_test_interrupt_after(int64_t nth);
 void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a mismatched root */
 
+/* Wrap a plain-type parted wrapper (RAY_PARTED_BASE + base) whose segments
+ * include at least one RAY_ENCCOL; retains the wrapper. */
+ray_t* ray_enccol_parted_new(ray_t* wrapper);
+/* Segment i: its RAY_ENCCOL or plain vector (borrowed; NULL for a missing
+ * segment of a ragged partition). */
+ray_t* ray_enccol_seg(ray_t* encv, int64_t i);
+/* Segment i materialized (borrowed plain vector, NULL for a missing one)
+ * or an owned error. */
+ray_t* ray_enccol_seg_col(ray_t* encv, int64_t i);
+bool   ray_enccol_is_parted(ray_t* encv);
+
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
 /* Could materialization attach an index (recorded kind, UNIQUE, or for STR
  * a runtime DICT, possible only when every chunk has statistics)? */

@@ -439,8 +439,8 @@ static test_result_t test_has_nulls_parted(void) {
     PASS();
 }
 
-/* .db.parted.get refuses generation-2 partitions until P1 Task 12; a
- * generation-0 parted table is unchanged. */
+/* .db.parted.get loads partitions of either generation, mixed, and
+ * decodes a generation-2 segment only on materialization. */
 static void write_part(const char* day, int gen) {
     char dir[256], p[300];
     snprintf(dir, sizeof dir, "%s/pdb/%s/tb", CS_TMP, day);
@@ -451,22 +451,25 @@ static void write_part(const char* day, int gen) {
     ray_t* names = ray_vec_new(RAY_STR, 1); names = ray_str_vec_append(names, "a", 1);
     snprintf(p, sizeof p, "%s/.d", dir); ray_col_save(names, p); ray_release(names);
 }
-static test_result_t test_parted_refuses_gen2(void) {
+static test_result_t test_parted_gen2_loads(void) {
     write_part("2024.01.01", 0); write_part("2024.01.02", 0);
     ray_t* ok = ray_read_parted(CS_TMP "/pdb", "tb");
     TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
     TEST_ASSERT_EQ_I(ray_table_ncols(ok), 2);
     ray_release(ok);
-    write_part("2024.01.01", 2);
-    ray_t* e = ray_read_parted(CS_TMP "/pdb", "tb");
-    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "nyi");
-    ray_error_free(e);
-    write_part("2024.01.01", 0); write_part("2024.01.02", 2);   /* a later partition too */
-    e = ray_read_parted(CS_TMP "/pdb", "tb");
-    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "nyi");
-    ray_error_free(e);
+    ray_t* a = NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 0) { write_part("2024.01.01", 2); write_part("2024.01.02", 0); }
+        else           { write_part("2024.01.01", 0); write_part("2024.01.02", 2); }
+        ray_t* t = ray_read_parted(CS_TMP "/pdb", "tb");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_ncols(t), 2);
+        a = ray_table_col(t, ray_sym_intern("a", 1));
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+        TEST_ASSERT_EQ_I(a->type, RAY_PARTED_BASE + RAY_I64);
+        TEST_ASSERT_EQ_I(ray_parted_nrows(a), 6000);
+        ray_release(t);
+    }
     PASS();
 }
 
@@ -518,7 +521,7 @@ const test_entry_t compress_entries[] = {
     { "compress/getter_keeps_pending_message",  test_getter_keeps_pending_message,   cs_setup, cs_teardown },
     { "compress/objsize_counts_cache",          test_objsize_counts_cache,           rt_setup, rt_teardown },
     { "compress/has_nulls_parted",              test_has_nulls_parted,               cs_setup, cs_teardown },
-    { "compress/parted_refuses_gen2",           test_parted_refuses_gen2,            rt_setup, rt_teardown },
+    { "compress/parted_gen2_loads",           test_parted_gen2_loads,            rt_setup, rt_teardown },
     { "compress/meta_without_decode",           test_meta_without_decode,            cs_setup, cs_teardown },
     { "compress/legacy_getters",                test_legacy_getters,                 cs_setup, cs_teardown },
     { "compress/concurrent_one_materialization",test_concurrent_one_materialization, cs_setup, cs_teardown },

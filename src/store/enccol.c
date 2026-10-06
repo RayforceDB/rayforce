@@ -1031,10 +1031,128 @@ fail:
  * observe its own cancellation: it waits for the attempt, which polls
  * ray_interrupted() once per chunk and ends with a transient "cancel"
  * (the state then resets), so the wait is bounded by one chunk's decode. */
+/* ---- Parted object (Task 12) ---- */
+
+bool ray_enccol_is_parted(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    return e && e->kind == RAY_ENCCOL_PARTED;
+}
+
+ray_t* ray_enccol_parted_new(ray_t* wrapper) {
+    if (!wrapper || RAY_IS_ERR(wrapper) || !RAY_IS_PARTED(wrapper->type))
+        return ray_error("type", "parted encoded column needs a parted wrapper");
+    ray_enccol_t* e = ray_calloc_raw(sizeof *e);
+    if (!e) return ray_error("oom", NULL);
+    atomic_store(&e->rc, 1);
+    e->kind = RAY_ENCCOL_PARTED;
+    e->type = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+    e->len = ray_parted_nrows(wrapper);
+    ray_t** segs = (ray_t**)ray_data(wrapper);
+    bool first = true;
+    for (int64_t i = 0; i < wrapper->len; i++) {
+        if (!segs[i]) continue;
+        ray_col_meta_t m;
+        if (!ray_col_meta_of(segs[i], &m)) continue;
+        if (first) {                                    /* width / SORTED of the first segment */
+            e->attrs = m.attrs & COL_DISK_ATTRS_MASK;
+            first = false;
+        }
+        bool nulls = m.null_count >= 0 ? m.null_count > 0 : (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
+        if (nulls) e->attrs |= RAY_ATTR_HAS_NULLS;      /* OR across every segment */
+        if (!e->path[0] && segs[i]->type == RAY_ENCCOL)
+            snprintf(e->path, sizeof e->path, "%s", ray_enccol_of(segs[i])->path);
+    }
+    ray_enc_once_init(&e->once);
+    ray_enc_once_init(&e->dict_once);
+    ray_retain(wrapper);
+    e->wrapper = wrapper;
+    ray_t* v = ray_enccol_wrap(e);
+    if (!v || RAY_IS_ERR(v)) { enccol_free(e); return v ? v : ray_error("oom", NULL); }
+    return v;
+}
+
+ray_t* ray_enccol_seg(ray_t* encv, int64_t i) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_PARTED || !e->wrapper || i < 0 || i >= e->wrapper->len) return NULL;
+    return ((ray_t**)ray_data(e->wrapper))[i];
+}
+
+ray_t* ray_enccol_seg_col(ray_t* encv, int64_t i) {
+    ray_t* s = ray_enccol_seg(encv, i);
+    if (!s) return NULL;
+    return s->type == RAY_ENCCOL ? ray_enccol_materialize(s) : s;
+}
+
+typedef struct {
+    ray_t**         in;        /* the wrapper's segments */
+    ray_t**         plain;     /* borrowed results */
+    enc_task_res_t* res;       /* one attempt result per segment (task) */
+} enc_seg_ctx_t;
+
+/* One task per segment; each materializes through its own once-state, so a
+ * segment keeps its cached vector or failure whatever the others do.  The
+ * snapshot is taken from the error on this thread. */
+static void enc_seg_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    enc_seg_ctx_t* x = raw;
+    for (int64_t i = start; i < end; i++) {
+        ray_t* s = x->in[i];
+        if (!s || s->type != RAY_ENCCOL) { x->plain[i] = s; x->res[i].done = true; continue; }
+        ray_t* m = ray_enccol_materialize(s);
+        if (RAY_IS_ERR(m)) {
+            ray_enc_snap_take(&x->res[i].snap, m);
+            x->res[i].failed = true;
+            continue;
+        }
+        x->plain[i] = m;
+        x->res[i].done = true;
+    }
+}
+
+static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    int64_t n = e->wrapper->len;
+    bool inj = enc_alloc_fails(e);
+    ray_t* out = inj ? NULL : ray_alloc((size_t)n * sizeof(ray_t*));
+    ray_t** plain = inj ? NULL : ray_calloc_raw((size_t)(n + 1) * sizeof(ray_t*));
+    enc_task_res_t* res = inj ? NULL : ray_calloc_raw((size_t)(n + 1) * sizeof *res);
+    if (!out || RAY_IS_ERR(out) || !plain || !res) {
+        if (out && !RAY_IS_ERR(out)) ray_free(out);
+        ray_free_raw(plain); ray_free_raw(res);
+        ray_enc_snap_set(fail, "oom", "col %s: parted materialize", e->path);
+        return NULL;
+    }
+    out->type = e->wrapper->type;
+    out->len = n;
+    out->attrs = 0;
+    memset(out->aux, 0, 16);
+    memset(ray_data(out), 0, (size_t)n * sizeof(ray_t*));
+    enc_seg_ctx_t x = { (ray_t**)ray_data(e->wrapper), plain, res };
+    ray_pool_t* pool = ray_pool_get();
+    if (n >= 2 && n <= (int64_t)UINT32_MAX && ray_pool_par_dispatch_ok(pool, n, 2))
+        ray_pool_dispatch_n(pool, enc_seg_task, &x, (uint32_t)n);
+    else
+        enc_seg_task(&x, 0, 0, n);
+    /* A task the pool skipped on cancel neither finished nor failed. */
+    for (int64_t i = 0; i < n; i++)
+        if (res[i].failed || !res[i].done) {        /* lowest-numbered failing segment */
+            if (res[i].failed) *fail = res[i].snap;
+            else ray_enc_snap_set(fail, "cancel", "col %s: interrupted", e->path);
+            ray_free(out);                          /* no segment reference was taken yet */
+            ray_free_raw(plain); ray_free_raw(res);
+            return NULL;
+        }
+    ray_t** segs = (ray_t**)ray_data(out);
+    for (int64_t i = 0; i < n; i++) if (plain[i]) { ray_retain(plain[i]); segs[i] = plain[i]; }
+    ray_free_raw(plain); ray_free_raw(res);
+    return out;
+}
+
 ray_t* ray_enccol_materialize(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
     if (!e) return ray_error("type", "materialize: not an encoded column");
-    return ray_enc_once_get(&e->once, &e->decoded, enc_materialize_single, e);
+    return ray_enc_once_get(&e->once, &e->decoded,
+                            e->kind == RAY_ENCCOL_PARTED ? enc_materialize_parted : enc_materialize_single, e);
 }
 
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m) {

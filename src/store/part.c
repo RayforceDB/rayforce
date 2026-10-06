@@ -28,6 +28,7 @@
 #endif
 #include "part.h"
 #include "table/table.h"
+#include "store/enccol.h"
 #include "core/runtime.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
@@ -362,17 +363,6 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             part_tables[p] = NULL;
             goto fail_tables;
         }
-        /* Generation-2 columns stay encoded in a loaded table; segmenting
-         * them is P1 Task 12.  Until then refuse rather than materialize
-         * every column at open. */
-        for (int64_t c = 0, nc = ray_table_ncols(part_tables[p]); c < nc; c++) {
-            ray_col_meta_t cm;
-            if (ray_table_col_meta_idx(part_tables[p], c, &cm) && cm.enc) {
-                part_err = ray_error("nyi",
-                    "generation-2 partitions: until P1 Task 12 (%s)", path);
-                goto fail_tables;
-            }
-        }
     }
 
     /* Get schema from first partition */
@@ -410,9 +400,10 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         for (int64_t c = 0; c < ncols_p; c++) {
             int64_t n0 = ray_table_col_name(part_tables[0], c);
             int64_t np = ray_table_col_name(part_tables[p], c);
-            ray_t* c0 = ray_table_get_col_idx(part_tables[0], c);
-            ray_t* cp = ray_table_get_col_idx(part_tables[p], c);
-            if (n0 != np || !c0 || !cp || c0->type != cp->type) {
+            ray_col_meta_t m0, mp;
+            bool h0 = ray_table_col_meta_idx(part_tables[0], c, &m0);
+            bool hp = ray_table_col_meta_idx(part_tables[p], c, &mp);
+            if (n0 != np || !h0 || !hp || m0.type != mp.type) {
                 ray_t* na = ray_sym_str(np);
                 part_err = ray_error("corrupt",
                     "parted %s: partition %s/%s column %lld ('%.*s') "
@@ -502,8 +493,8 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* ---- Data columns (after MAPCOMMON) ---- */
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(part_tables[0], c);
-        ray_t* first_seg = ray_table_get_col_idx(part_tables[0], c);
-        if (!first_seg) continue;
+        ray_col_meta_t m0;
+        if (!ray_table_col_meta_idx(part_tables[0], c, &m0)) continue;
 
         ray_t* parted = ray_alloc((size_t)part_count * sizeof(ray_t*));
         if (!parted || RAY_IS_ERR(parted)) {
@@ -512,24 +503,36 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             ray_release(result);
             goto fail_tables;
         }
-        parted->type = RAY_PARTED_BASE + first_seg->type;
+        parted->type = RAY_PARTED_BASE + m0.type;
         parted->len = part_count;
         parted->attrs = 0;
         memset(parted->aux, 0, 16);
 
+        /* Segments are the slot objects themselves, encoded or plain, never
+         * decoded here: a decode failure surfaces on materialization. */
+        bool any_enc = false;
         ray_t** segs = (ray_t**)ray_data(parted);
+        memset(segs, 0, (size_t)part_count * sizeof(ray_t*));
         for (int64_t p = 0; p < part_count; p++) {
-            ray_t* seg = ray_table_get_col_idx(part_tables[p], c);
-            if (!seg) {
-                segs[p] = NULL;
-                continue;
-            }
+            ray_t* seg = ray_table_get_col_enc_idx(part_tables[p], c);
+            if (seg) any_enc = true;
+            else seg = ray_table_col_idx(part_tables[p], c);   /* plain slot: a lookup */
+            if (!seg || RAY_IS_ERR(seg)) continue;             /* ragged: missing segment */
             ray_retain(seg);
             segs[p] = seg;
         }
-
-        result = ray_table_add_col(result, name_id, parted);
-        ray_release(parted);
+        ray_t* slot = parted;
+        if (any_enc) {
+            slot = ray_enccol_parted_new(parted);
+            ray_release(parted);
+            if (!slot || RAY_IS_ERR(slot)) {
+                ray_release(result);
+                part_err = slot ? slot : ray_error("oom", NULL);
+                goto fail_tables;
+            }
+        }
+        result = ray_table_add_col(result, name_id, slot);
+        ray_release(slot);
         if (!result || RAY_IS_ERR(result)) goto fail_tables;
     }
 
@@ -632,22 +635,22 @@ static ray_t* empty_table_like(ray_t* tmpl) {
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tmpl, c);
-        if (!col) { ray_release(out); return ray_error("type", "empty_table_like: null column"); }
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(tmpl, c, &m)) { ray_release(out); return ray_error("type", "empty_table_like: null column"); }
         ray_t* ecol = NULL;
-        if (col->type == RAY_LIST) {
+        if (m.type == RAY_LIST) {
             ecol = ray_list_new(0);
-        } else if (col->type == RAY_TABLE || col->type == RAY_DICT) {
+        } else if (m.type == RAY_TABLE || m.type == RAY_DICT) {
             int64_t name_id = ray_table_col_name(tmpl, c);
             ray_t* name = ray_sym_str(name_id);
             const char* name_ptr = name ? ray_str_ptr(name) : "?";
             int name_len = name ? (int)ray_str_len(name) : 1;
-            const char* type_name = col->type == RAY_TABLE ? "TABLE" : "DICT";
+            const char* type_name = m.type == RAY_TABLE ? "TABLE" : "DICT";
             ray_release(out);
             return ray_error("nyi", "empty_table_like: column '%.*s' has unsupported nested type %s",
                              name_len, name_ptr, type_name);
         } else {
-            ecol = ray_vec_new(col->type, 0);
+            ecol = ray_vec_new(m.type, 0);
         }
         if (!ecol || RAY_IS_ERR(ecol)) { ray_release(out); return ecol ? ecol : ray_error("oom", NULL); }
         ray_t* nout = ray_table_add_col(out, ray_table_col_name(tmpl, c), ecol);
