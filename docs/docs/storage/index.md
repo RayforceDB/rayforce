@@ -26,7 +26,7 @@ The header carries a single-byte format generation. The current generation is `0
 |---|---|
 | `ray_col_save(vec, path)` | Write a vector to a column file. Handles slices, sentinel nulls, and string pools transparently. |
 | `ray_col_load(path)` | Read a column file into a heap-allocated vector. The file is read entirely into memory. |
-| `ray_col_mmap(path)` | Memory-map a column file for zero-copy access. The returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. |
+| `ray_col_mmap(path)` | Memory-map a column file. A generation-0 file is zero-copy: the returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. A compressed (generation-2) file is mapped too, but the column decodes into heap memory the first time it is read. |
 
 ```c
 // Save a vector
@@ -42,7 +42,7 @@ ray_t* mapped = ray_col_mmap("db/trades/price");
 ```
 
 !!! note "Memory-mapped vectors"
-    Memory-mapped vectors have `mmod = 1` in their header, distinguishing them from heap-allocated vectors. The buddy allocator skips them during free. Slices of mmap'd vectors retain a reference to the parent mapping.
+    Memory-mapped generation-0 vectors have `mmod = 1` in their header, distinguishing them from heap-allocated vectors; a decoded compressed column is heap memory. The buddy allocator skips them during free. Slices of mmap'd vectors retain a reference to the parent mapping.
 
 ## Splayed Tables
 
@@ -316,11 +316,11 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
 
-A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed. Compressed files keep their chunk zones, but hash and dictionary accelerators are not persisted in them; those are rebuilt or built lazily per the index policy.
+A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed. Compressed files keep their chunk zones but carry no persisted hash or dictionary index: a column that a generation-0 save would give one is written without it, and queries over it run without that accelerator.
 
 ### `.db.splayed.get` — Load a Splayed Table
 
-Loads a splayed table from a directory. Columns are memory-mapped for zero-copy access.
+Loads a splayed table from a directory. Columns are memory-mapped: generation-0 files for zero-copy access, while a compressed (generation-2) column decodes into heap memory the first time a query reads it.
 
 ```lisp
 (.db.splayed.get "/tmp/weather")

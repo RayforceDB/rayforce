@@ -113,7 +113,7 @@ errors; argument, I/O, allocation, and cancellation errors also propagate.
 The options dict also takes `compress`: `true` writes generation-2
 (compressed) column files where the column is eligible, `false` (or no
 option, since the destination is always new) generation 0. A non-bool
-`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones, but hash and dictionary accelerators are not persisted in them; those are rebuilt or built lazily per the index policy.
+`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones but carry no persisted hash or dictionary index: a column that a generation-0 save would give one is written without it, and queries over it run without that accelerator.
 For example:
 
 ```lisp
