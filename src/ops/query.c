@@ -2480,8 +2480,7 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
         return NULL;
     /* The slot object goes into the result table as it is: an encoded
      * column stays encoded. */
-    ray_t* col = ray_table_get_col_enc(tbl, expr->i64);
-    if (!col) col = ray_table_col(tbl, expr->i64);
+    ray_t* col = tbl_slot(tbl, expr->i64);
     if (!col || RAY_IS_ERR(col)) return NULL;
     ray_retain(col);
     return col;
@@ -3315,7 +3314,9 @@ static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
     }
     for (int ri = 0; ri < n_refs; ri++) {
         if (materialized_refs[ri]) {
-            ray_t* ref_col = ray_table_col(tbl, ref_syms[ri]);   /* cached by the pass above */
+            /* The first pass cached this decode and a cached success is
+             * returned as is, so the error branch is unreachable. */
+            ray_t* ref_col = ray_table_col(tbl, ref_syms[ri]);
             if (ref_col && RAY_IS_ERR(ref_col)) ray_error_free(ref_col);
             else if (ref_col) ray_env_set_query_local(ref_syms[ri], ref_col);
             ray_release(materialized_refs[ri]);
@@ -8462,9 +8463,7 @@ static ray_t* select_fallback_bind_alias(ray_t* tbl, int64_t kid, ray_t* col) {
         if (!t2 || RAY_IS_ERR(t2)) { ray_release(tbl); return t2; }
         ray_table_set_col_idx(t2, c, col);
         /* Slot objects on both sides: an encoded column is its own slot. */
-        ray_t* slot = ray_table_get_col_enc_idx(t2, c);
-        if (!slot) slot = ray_table_col_idx(t2, c);
-        if (slot != col) { ray_release(t2); return ray_error("oom", NULL); }
+        if (tbl_slot_idx(t2, c) != col) { ray_release(t2); return ray_error("oom", NULL); }
         return t2;
     }
     return ray_table_add_col(tbl, kid, col);
@@ -13856,9 +13855,7 @@ by_dict_done:
                     /* All output columns must agree in length — a length-changing
                      * projection (e.g. distinct) beside a full-length column would
                      * yield a ragged table.  Reject rather than emit one. */
-                    /* An encoded passthrough column reports its rows through
-                     * the accessor: its header length is not the row count. */
-                    int64_t col_len = col->type == RAY_ENCCOL ? ray_table_col_nrows(col) : ray_len(col);
+                    int64_t col_len = ray_len(col);
                     if (out_len < 0) {
                         out_len = col_len;
                     } else if (col_len != out_len) {
@@ -15803,7 +15800,7 @@ static int expr_refs_any_column(ray_t* expr, ray_t* tbl) {
         if (ray_sym_is_dotted(expr->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(expr->i64, &segs);
-            if (nsegs >= 1 && tbl_has_col(tbl, segs[0])) return 1;
+            if (nsegs >= 1 && ray_table_get_col(tbl, segs[0])) return 1;
         }
         return 0;
     }

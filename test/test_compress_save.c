@@ -4336,7 +4336,8 @@ static test_result_t test_query_helpers_gen2_equal(void) {
 }
 
 /* A select over a table with an undecodable column reports that column's
- * error, whatever helper meets it first. */
+ * error.  Today this exercises the select-entry decode (the helpers are
+ * unreachable behind it); it covers the helpers once Task 31 removes that. */
 static test_result_t test_query_helpers_failed_decode(void) {
     ray_t* t = ex_table(3000, true);
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
@@ -4357,6 +4358,43 @@ static test_result_t test_query_helpers_failed_decode(void) {
         test_result_t rr = ex_corrupt(r, qs[i]);
         if (rr.status != TEST_PASS) return rr;
     }
+    PASS();
+}
+
+/* simplify_agg_idiom: (first (asc c)) -> min is taken only for a null-free
+ * column.  Over a parted generation-0 column with a null in one segment the
+ * rewrite must decline (it would answer the min of the non-null cells); the
+ * parted null-free column still takes it. */
+static test_result_t test_query_first_asc_parted_nulls_gen0(void) {
+    ray_t* s0 = i64_col(5, 1); ray_t* s1 = i64_col(5, 1);
+    ray_vec_set_null(s1, 2, true);
+    ray_t* w = ray_alloc(2 * sizeof(ray_t*));
+    w->type = RAY_PARTED_BASE + RAY_I64; w->len = 2; w->attrs = 0;
+    memset(w->aux, 0, 16);
+    ((ray_t**)ray_data(w))[0] = s0; ((ray_t**)ray_data(w))[1] = s1;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("p", 1), w);
+    ray_release(w);
+    ray_t* kc = ray_vec_new(RAY_I64, 10); kc->len = 10;
+    memset(ray_data(kc), 0, 10 * sizeof(int64_t));
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), kc);
+    ray_release(kc);
+    ray_env_set(ray_sym_intern("pt", 2), t);
+    ray_t* r = ray_eval_str("(select {m: (first (asc p)) by: k from: pt})");
+    ray_t* mc = (r && !RAY_IS_ERR(r) && r->type == RAY_TABLE) ? ray_table_col(r, ray_sym_intern("m", 1)) : NULL;
+    bool declined = !(mc && mc->type == RAY_I64 && mc->len == 1 && !ray_vec_is_null(mc, 0));
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    TEST_ASSERT_TRUE(declined);
+    /* without a null the rewrite is taken: the answer is the minimum */
+    ray_vec_set_null(s1, 2, false);
+    ((int64_t*)ray_data(s1))[2] = 7;
+    s1->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    r = ray_eval_str("(select {m: (first (asc p)) by: k from: pt})");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE);
+    ray_t* col = ray_table_col(r, ray_sym_intern("m", 1));
+    TEST_ASSERT_TRUE(col && col->len == 1 && ((const int64_t*)ray_data(col))[0] == 0);
+    ray_release(r);
+    ray_release(t);
     PASS();
 }
 
@@ -4419,6 +4457,7 @@ const test_entry_t compress_entries[] = {
     { "compress/planning_never_materializes", test_planning_never_materializes, cs_setup, cs_teardown },
     { "compress/exec_start_snapshot",         test_exec_start_snapshot,         cs_setup, cs_teardown },
     { "compress/first_asc_parted_nulls_gen0", test_first_asc_parted_nulls_gen0, cs_setup, cs_teardown },
+    { "compress/query_first_asc_parted_nulls_gen0", test_query_first_asc_parted_nulls_gen0, rt_setup, rt_teardown },
     { "compress/first_asc_parted_nulls_gen2", test_first_asc_parted_nulls_gen2, rt_setup, rt_teardown },
     { "compress/bind_stage",        test_bind_stage,       cs_setup, cs_teardown },
     { "compress/fused_pred_bound",  test_fused_pred_bound, rt_setup, rt_teardown },
