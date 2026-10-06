@@ -9365,15 +9365,60 @@ static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
     return r;
 }
 
+/* The update sub-table evaluation (and select's partition pruning) is only
+ * equivalent to the whole-table evaluation for elementwise expressions.
+ * Accept a call only when its head resolves to a builtin flagged
+ * RAY_FN_ATOMIC and every argument is a column of `tbl`, a literal, a
+ * quoted symbol, or such a call.  A bare symbol that is not a column (a
+ * free variable, possibly a table-length vector), an order-dependent
+ * function (deltas, sums, ...), an aggregate, a special form, or a lambda
+ * call is not elementwise.  `meta_cols` (select): columns are found from
+ * metadata, never fetched, and a name bound as a lexical local (which
+ * shadows the column) is not a column. */
+static bool update_expr_elementwise(ray_t* e, ray_t* tbl, bool meta_cols) {
+    if (!e || RAY_IS_ERR(e)) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        if (!meta_cols) return ray_table_get_col(tbl, e->i64) != NULL;
+        ray_col_meta_t m;
+        return !ray_env_has_lexical_local(e->i64) && ray_table_col_meta(tbl, e->i64, &m);
+    }
+    if (e->type < 0) return true;
+    if (e->type != RAY_LIST) return false;
+    int64_t n = ray_len(e);
+    if (n < 2) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* head = el[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || RAY_IS_ERR(fn)) return false;
+    if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) return false;
+    if (!(fn->attrs & RAY_FN_ATOMIC)) return false;
+    for (int64_t i = 1; i < n; i++)
+        if (!update_expr_elementwise(el[i], tbl, meta_cols)) return false;
+    return true;
+}
+
 /* ---- Partition pruning before fetch ----
  *
  * A select over a parted source whose where: compares the partition key
  * with a literal (== != < > <= >= in, alone or as a conjunct of a top-level
- * `and`) runs over a source holding only the partitions that can pass:
- * a pruned partition's rows all fail the where, so dropping them first
- * changes no answer, and its columns are never fetched or decoded.  Every
- * later stage (filter, group, aggregates, take) sees the smaller source
- * unchanged.  The where itself still runs over the survivors. */
+ * `and`) runs over a source holding only the partitions that can pass, so
+ * a pruned partition's columns are never fetched or decoded.  The original
+ * where runs unchanged over the smaller source.
+ *
+ * A pruned partition's rows all fail the where, so dropping them changes
+ * no answer as long as nothing reads rows the where rejects: every where
+ * conjunct, by: expression and output must be elementwise (an output may
+ * be an aggregate of elementwise arguments), and the key must not be
+ * shadowed by a lexical local.
+ *
+ * One pruned partition is kept as a stand-in: its key with a single
+ * synthetic row of zero cells, built from metadata without a decode.  Its
+ * row fails the where like the rows it replaces, so the where stays partial
+ * exactly when it was over the whole table (never all-pass, which routes
+ * consumers differently, nor zero-row), and every consumer takes the path
+ * it takes over the whole table. */
 
 /* The partition-pruning opcode of a where head, or 0. */
 static uint16_t prune_cmp_op(ray_t* head) {
@@ -9433,12 +9478,61 @@ static void prune_where_mask(ray_t* e, int64_t key_id, ray_t* kv,
     for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
 }
 
-/* A copy of the parted table `tbl` holding only the partitions set in
- * `keep` (n_keep of them): the MAPCOMMON key keeps their keys and row
- * counts, each parted column their segment objects, retained and never
- * decoded (an encoded column stays encoded). */
+/* Can a one-row zero-cell stand-in segment of this base type be built? */
+static bool prune_stand_in_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_GUID: case RAY_SYM: case RAY_STR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A one-row segment of zero cells (SYM id 0, the empty string) shaped like
+ * `seg` — its type, SYM width and domain — read from metadata, no decode. */
+static ray_t* prune_stand_in_seg(ray_t* seg) {
+    ray_col_meta_t m;
+    if (!ray_col_meta_of(seg, &m)) return ray_error("schema", NULL);
+    ray_t* v;
+    if (m.type == RAY_SYM) {
+        v = ray_sym_vec_new(m.attrs & RAY_SYM_W_MASK, 1);
+        if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+        memset(ray_data(v), 0, ray_sym_elem_size(v->type, v->attrs));
+        v->len = 1;
+        if (seg->type == RAY_ENCCOL) ray_enccol_adopt_domain(v, seg);
+        else ray_sym_vec_adopt_domain(v, seg);
+        return v;
+    }
+    if (m.type == RAY_STR) {
+        v = ray_vec_new(RAY_STR, 1);
+        if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+        return ray_str_vec_append(v, "", 0);
+    }
+    v = ray_vec_new(m.type, 1);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    memset(ray_data(v), 0, (size_t)ray_type_sizes[(uint8_t)m.type]);
+    v->len = 1;
+    return v;
+}
+
+/* Segment p of parted column c without a decode (NULL: a ragged gap). */
+static ray_t* prune_seg(ray_t* tbl, int64_t c, int64_t p) {
+    ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
+    return enc ? ray_enccol_seg(enc, p)
+               : ((ray_t**)ray_data(ray_table_col_idx(tbl, c)))[p];   /* plain wrapper */
+}
+
+/* A copy of the parted table `tbl` holding the partitions set in `keep`
+ * (n_keep of them) and, at its place in partition order, the stand-in for
+ * pruned partition `stand`: its key, one row, prune_stand_in_seg cells
+ * (shaped like any partition's segment of the column).
+ * Kept segments are retained, never decoded (an encoded column stays
+ * encoded). */
 static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n_parts,
-                                     int64_t n_keep) {
+                                     int64_t n_keep, int64_t stand) {
+    int64_t n_out = n_keep + 1;
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -9453,8 +9547,8 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
             ray_t* kv = mp[0];
             ray_t* rc = mp[1];
             size_t esz = (size_t)ray_sym_elem_size(kv->type, kv->attrs);
-            ray_t* nkv = col_vec_new(kv, n_keep);
-            ray_t* nrc = ray_vec_new(RAY_I64, n_keep);
+            ray_t* nkv = col_vec_new(kv, n_out);
+            ray_t* nrc = ray_vec_new(RAY_I64, n_out);
             slot = ray_alloc(2 * sizeof(ray_t*));
             if (!nkv || RAY_IS_ERR(nkv) || !nrc || RAY_IS_ERR(nrc) || !slot || RAY_IS_ERR(slot)) {
                 if (nkv && !RAY_IS_ERR(nkv)) ray_release(nkv);
@@ -9465,16 +9559,17 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
             }
             int64_t k = 0;
             for (int64_t p = 0; p < n_parts; p++) {
-                if (!(keep[p / 64] & (1ULL << (p % 64)))) continue;
+                bool kept = (keep[p / 64] >> (p % 64)) & 1;
+                if (!kept && p != stand) continue;
                 memcpy((char*)ray_data(nkv) + (size_t)k * esz,
                        (const char*)ray_data(kv) + (size_t)p * esz, esz);
-                ((int64_t*)ray_data(nrc))[k] = ((const int64_t*)ray_data(rc))[p];
+                ((int64_t*)ray_data(nrc))[k] = kept ? ((const int64_t*)ray_data(rc))[p] : 1;
                 k++;
             }
-            nkv->len = n_keep;
+            nkv->len = n_out;
             nkv->attrs = kv->attrs;
             if (nkv->type == RAY_SYM) ray_sym_vec_adopt_domain(nkv, kv);
-            nrc->len = n_keep;
+            nrc->len = n_out;
             slot->type = RAY_MAPCOMMON;
             slot->len = 2;
             slot->attrs = mc->attrs;
@@ -9484,20 +9579,31 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
         } else {
             ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
             ray_t* w = enc ? NULL : ray_table_col_idx(tbl, c);   /* plain wrapper: no decode */
-            ray_t* nw = ray_alloc((size_t)(n_keep > 0 ? n_keep : 1) * sizeof(ray_t*));
+            ray_t* nw = ray_alloc((size_t)n_out * sizeof(ray_t*));
             if (!nw || RAY_IS_ERR(nw)) { ray_release(out); return ray_error("oom", NULL); }
             nw->type = m.type;
-            nw->len = n_keep;
+            nw->len = 0;
             nw->attrs = w ? w->attrs : 0;
             memset(nw->aux, 0, sizeof nw->aux);
             ray_t** segs = (ray_t**)ray_data(nw);
             bool any_enc = false;
-            int64_t k = 0;
             for (int64_t p = 0; p < n_parts; p++) {
-                if (!(keep[p / 64] & (1ULL << (p % 64)))) continue;
-                ray_t* seg = enc ? ray_enccol_seg(enc, p) : ((ray_t**)ray_data(w))[p];
-                if (seg) { ray_retain(seg); any_enc |= seg->type == RAY_ENCCOL; }
-                segs[k++] = seg;                                  /* NULL: a ragged partition's missing segment */
+                bool kept = (keep[p / 64] >> (p % 64)) & 1;
+                if (!kept && p != stand) continue;
+                ray_t* seg = prune_seg(tbl, c, p);
+                if (kept) {
+                    if (seg) ray_retain(seg);
+                } else {
+                    /* shaped like any partition's segment (the pruned one may be a ragged gap) */
+                    for (int64_t q = 0; !seg && q < n_parts; q++) seg = prune_seg(tbl, c, q);
+                    seg = seg ? prune_stand_in_seg(seg) : ray_error("schema", NULL);
+                    if (!seg || RAY_IS_ERR(seg)) {
+                        ray_release(nw); ray_release(out);
+                        return seg ? seg : ray_error("oom", NULL);
+                    }
+                }
+                any_enc |= seg && seg->type == RAY_ENCCOL;
+                segs[nw->len++] = seg;
             }
             slot = nw;
             if (any_enc) {
@@ -9519,23 +9625,96 @@ static bool parted_partition_whole(ray_t* tbl, int64_t p) {
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
         if (!ray_table_col_meta_idx(tbl, c, &m) || m.type == RAY_MAPCOMMON) continue;
-        ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
-        ray_t* seg = enc ? ray_enccol_seg(enc, p)
-                         : ((ray_t**)ray_data(ray_table_col_idx(tbl, c)))[p];   /* plain wrapper */
-        if (!seg) return false;
+        if (!prune_seg(tbl, c, p)) return false;
     }
     return true;
 }
 
-/* The pruned source for `where` over the parted table `tbl`, NULL when tbl
- * is not a whole parted table (one MAPCOMMON key, every other column parted
- * over the same partitions) or nothing is pruned, or an error. */
-static ray_t* select_prune_partitions(ray_t* tbl, ray_t* where) {
+/* Every conjunct of a where is elementwise (`in` against a literal vector
+ * included), so a row's verdict depends on that row alone. */
+static bool prune_where_elementwise(ray_t* e, ray_t* tbl) {
+    if (e && e->type == RAY_LIST && ray_len(e) >= 2) {
+        ray_t** x = (ray_t**)ray_data(e);
+        int64_t n = ray_len(e);
+        if (prune_is_and(x[0])) {
+            for (int64_t i = 1; i < n; i++)
+                if (!prune_where_elementwise(x[i], tbl)) return false;
+            return true;
+        }
+        if (prune_cmp_op(x[0]) == OP_IN && n == 3)
+            return update_expr_elementwise(x[1], tbl, true) &&
+                   x[2] && x[2]->type > 0 && x[2]->type != RAY_LIST;
+    }
+    return update_expr_elementwise(e, tbl, true);
+}
+
+/* An output reads only the rows the where keeps: elementwise, or an
+ * aggregate (RAY_FN_AGGR builtin) of elementwise arguments. */
+static bool prune_output_ok(ray_t* e, ray_t* tbl) {
+    if (update_expr_elementwise(e, tbl, true)) return true;
+    if (!e || e->type != RAY_LIST || ray_len(e) < 2) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (!el[0] || el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) return false;
+    ray_t* fn = ray_env_get(el[0]->i64);
+    if (!fn || RAY_IS_ERR(fn) || !(fn->attrs & RAY_FN_AGGR)) return false;
+    if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) return false;
+    for (int64_t i = 1; i < ray_len(e); i++)
+        if (!update_expr_elementwise(el[i], tbl, true)) return false;
+    return true;
+}
+
+/* A by: clause of column names or elementwise expressions. */
+static bool prune_by_ok(ray_t* by, ray_t* tbl) {
+    if (!by) return true;
+    if (by->type == RAY_SYM) {                                 /* [k m] */
+        for (int64_t i = 0; i < by->len; i++) {
+            int64_t id = sym_cell_runtime_id(by, i);
+            ray_col_meta_t m;
+            if (ray_env_has_lexical_local(id) || !ray_table_col_meta(tbl, id, &m)) return false;
+        }
+        return true;
+    }
+    if (by->type == RAY_DICT) {                                /* {k: expr …} */
+        ray_t* vals = ray_dict_vals(by);
+        if (!vals || vals->type != RAY_LIST) return false;
+        for (int64_t i = 0; i < vals->len; i++)
+            if (!update_expr_elementwise(((ray_t**)ray_data(vals))[i], tbl, true)) return false;
+        return true;
+    }
+    return update_expr_elementwise(by, tbl, true);
+}
+
+/* Every where conjunct, by: expression and output of the select reads only
+ * the rows the where keeps. */
+static bool prune_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
+    if (!prune_where_elementwise(where, tbl)) return false;
+    if (!prune_by_ok(dict_get(dict, "by"), tbl)) return false;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    for (int64_t i = 0; i < keys->len; i++) {
+        ray_t* k = ray_sym_vec_cell(keys, i);
+        if (!k) return false;
+        bool res = false;
+        for (size_t r = 0; r < sizeof reserved / sizeof *reserved; r++)
+            if (ray_str_len(k) == strlen(reserved[r]) &&
+                memcmp(ray_str_ptr(k), reserved[r], ray_str_len(k)) == 0) res = true;
+        if (!res && !prune_output_ok(((ray_t**)ray_data(vals))[i], tbl)) return false;
+    }
+    return true;
+}
+
+/* The pruned source for the select `dict` (where: `where`) over the parted
+ * table `tbl`; NULL when tbl is not a whole parted table (one MAPCOMMON key,
+ * every other column parted over the same partitions), the shape may read
+ * rows the where rejects, the key is shadowed, nothing is pruned, or a kept
+ * partition is ragged; or an error. */
+static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     if (!where || where->type != RAY_LIST || !tbl || tbl->type != RAY_TABLE) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     int64_t key_id = -1;
     ray_t* kv = NULL;
-    ray_t* mc_rows = NULL;
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
         if (!ray_table_col_meta_idx(tbl, c, &m)) return NULL;
@@ -9546,19 +9725,20 @@ static ray_t* select_prune_partitions(ray_t* tbl, ray_t* where) {
         ray_t** mp = (ray_t**)ray_data(mc);
         if (!mp[0] || !mp[1] || mp[1]->type != RAY_I64 || mp[0]->len != mp[1]->len) return NULL;
         kv = mp[0];
-        mc_rows = mp[1];
         key_id = ray_table_col_name(tbl, c);
     }
     if (!kv || kv->len <= 0) return NULL;
+    if (ray_env_has_lexical_local(key_id)) return NULL;          /* a formal shadows the key */
     /* the widths ray_part_prune_mask reads: 4-byte DATE/I32/TIME keys, 8 otherwise */
     bool narrow = kv->type == RAY_DATE || kv->type == RAY_I32 || kv->type == RAY_TIME;
     if (ray_sym_elem_size(kv->type, kv->attrs) != (narrow ? 4 : 8)) return NULL;
     int64_t n_parts = kv->len;
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
-        ray_table_col_meta_idx(tbl, c, &m);
+        if (!ray_table_col_meta_idx(tbl, c, &m)) return NULL;
         if (m.type == RAY_MAPCOMMON) continue;
         if (!RAY_IS_PARTED(m.type) || m.n_segs != n_parts) return NULL;
+        if (!prune_stand_in_type_ok((int8_t)RAY_PARTED_BASETYPE(m.type))) return NULL;
     }
     int64_t n_words = (n_parts + 63) / 64;
     uint64_t* acc = (uint64_t*)ray_alloc_raw((size_t)n_words * 2 * sizeof(uint64_t));
@@ -9567,25 +9747,18 @@ static ray_t* select_prune_partitions(ray_t* tbl, ray_t* where) {
     for (int64_t w = 0; w < n_words; w++) acc[w] = ~0ULL;
     prune_where_mask(where, key_id, kv, acc, tmp, n_words);
     int64_t n_keep = 0;
-    for (int64_t p = 0; p < n_parts; p++)
-        n_keep += (acc[p / 64] >> (p % 64)) & 1;
-    if (n_keep == 0) {
-        /* Nothing can pass.  The stages below are written for at least one
-         * partition, so keep the smallest one holding every column: its rows
-         * all fail the where, so the answer is the empty one. */
-        const int64_t* rows = (const int64_t*)ray_data(mc_rows);
-        int64_t best = -1;
-        for (int64_t p = 0; p < n_parts; p++)
-            if ((best < 0 || rows[p] < rows[best]) && parted_partition_whole(tbl, p)) best = p;
-        if (best >= 0) { acc[best / 64] |= 1ULL << (best % 64); n_keep = 1; }
-        else n_keep = n_parts;                                   /* no whole partition: keep them all */
+    int64_t stand = -1;                                          /* the first pruned partition */
+    bool ok = true;
+    for (int64_t p = 0; ok && p < n_parts; p++) {
+        bool kept = (acc[p / 64] >> (p % 64)) & 1;
+        n_keep += kept;
+        /* a kept ragged partition: the pruned copy would be just as malformed */
+        if (kept && !parted_partition_whole(tbl, p)) ok = false;
+        if (!kept && stand < 0) stand = p;
     }
-    /* A kept partition missing a column (a ragged table) leaves the source
-     * as it is: the pruned copy would be just as malformed. */
-    for (int64_t p = 0; n_keep < n_parts && p < n_parts; p++)
-        if (((acc[p / 64] >> (p % 64)) & 1) && !parted_partition_whole(tbl, p))
-            n_keep = n_parts;
-    ray_t* out = n_keep < n_parts ? parted_keep_partitions(tbl, acc, n_parts, n_keep) : NULL;
+    ray_t* out = NULL;
+    if (ok && n_keep < n_parts && stand >= 0 && prune_shape_ok(dict, tbl, where))
+        out = parted_keep_partitions(tbl, acc, n_parts, n_keep, stand);
     ray_free_raw(acc);
     return out;
 }
@@ -9651,13 +9824,9 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
 
-    /* Prune partitions the where: rules out before any column is fetched.
-     * Not under asc:/desc:: a where the pruning leaves all-pass hands the
-     * parted source itself to the sort, which cannot gather from it (the
-     * pinned `type` of a sort over an unfiltered parted table) — while the
-     * same where over the whole table compacts first and sorts. */
-    if (!dict_get(dict, "asc") && !dict_get(dict, "desc")) {
-        ray_t* pruned = select_prune_partitions(tbl, where_expr);
+    /* Prune partitions the where: rules out before any column is fetched. */
+    {
+        ray_t* pruned = select_prune_partitions(dict, tbl, where_expr);
         if (pruned) {
             ray_release(tbl);
             if (RAY_IS_ERR(pruned)) return pruned;
@@ -16038,34 +16207,7 @@ static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
 static bool    upsert_col_ok(ray_t* col);      /* defined with the upsert path below */
 static int64_t upsert_atom_int(ray_t* a);
 
-/* The sub-table evaluation is only equivalent to the legacy whole-table
- * evaluation for elementwise expressions.  Accept a call only when its
- * head resolves to a builtin flagged RAY_FN_ATOMIC and every argument is
- * a column of `tbl`, a literal, a quoted symbol, or such a call.  A bare
- * symbol that is not a column (a free variable, possibly a table-length
- * vector), an order-dependent function (deltas, sums, ...), an
- * aggregate, a special form, or a lambda call keeps the legacy arm. */
-static bool update_expr_elementwise(ray_t* e, ray_t* tbl) {
-    if (!e || RAY_IS_ERR(e)) return false;
-    if (e->type == -RAY_SYM) {
-        if (e->attrs & ATTR_QUOTED) return true;
-        return ray_table_get_col(tbl, e->i64) != NULL;
-    }
-    if (e->type < 0) return true;
-    if (e->type != RAY_LIST) return false;
-    int64_t n = ray_len(e);
-    if (n < 2) return false;
-    ray_t** el = (ray_t**)ray_data(e);
-    ray_t* head = el[0];
-    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
-    ray_t* fn = ray_env_get(head->i64);
-    if (!fn || RAY_IS_ERR(fn)) return false;
-    if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) return false;
-    if (!(fn->attrs & RAY_FN_ATOMIC)) return false;
-    for (int64_t i = 1; i < n; i++)
-        if (!update_expr_elementwise(el[i], tbl)) return false;
-    return true;
-}
+/* update_expr_elementwise is defined with select's partition pruning above. */
 
 /* Rows matching `(== col atom)` through a fresh hash index on col.
  * Returns 1 with rows copied into *rows (n in *n_out), 0 when the
@@ -16515,7 +16657,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
             if (kid == from_id || kid == where_id || kid == by_id) continue;
             if (kid != cn) continue;
             ucol[nu] = c; uexpr[nu] = updf[d + 1]; uval[nu] = NULL; nu++;
-            if (!update_expr_elementwise(updf[d + 1], tbl)) rowwise = false;
+            if (!update_expr_elementwise(updf[d + 1], tbl, false)) rowwise = false;
             break;
         }
     }

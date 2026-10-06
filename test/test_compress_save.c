@@ -3217,15 +3217,15 @@ static test_result_t test_filter_absent_symbol(void) {
 /* ---- Task 23: pruned parted execution ---- */
 
 /* Three partitions 2024.01.01..03 (dates 8766..8768).  Partition p holds a =
- * i * (3 + p), b = 5 i + p over 3000 rows; bit p of `gen2` selects
+ * i * (3 + p), b = 5 i + p over rows[p] rows (3000 for pdb_make); bit p of `gen2` selects
  * generation 2, and `ragged` drops column b from the last partition. */
-static ray_t* pdb_make(const char* root, unsigned gen2, bool ragged) {
+static ray_t* pdb_make_rows(const char* root, unsigned gen2, bool ragged, const int64_t rows[3]) {
     for (int p = 0; p < 3; p++) {
         char dir[256]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
         ray_t* t = ray_table_new(2);
-        ray_t* a = i64_col(3000, 3 + p);
-        ray_t* b = i64_col(3000, 5);
-        for (int i = 0; i < 3000; i++) ((int64_t*)ray_data(b))[i] += p;
+        ray_t* a = i64_col(rows[p], 3 + p);
+        ray_t* b = i64_col(rows[p], 5);
+        for (int64_t i = 0; i < rows[p]; i++) ((int64_t*)ray_data(b))[i] += p;
         t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
         if (!(ragged && p == 2)) t = ray_table_add_col(t, ray_sym_intern("b", 1), b);
         ray_release(a); ray_release(b);
@@ -3236,6 +3236,10 @@ static ray_t* pdb_make(const char* root, unsigned gen2, bool ragged) {
     }
     ray_t* t = ray_read_parted(root, "t");
     return (t && !RAY_IS_ERR(t)) ? t : NULL;
+}
+static ray_t* pdb_make(const char* root, unsigned gen2, bool ragged) {
+    static const int64_t rows[3] = { 3000, 3000, 3000 };
+    return pdb_make_rows(root, gen2, ragged, rows);
 }
 
 /* Predicates over the partition key and the roots under test. */
@@ -4738,6 +4742,13 @@ static const char* const sp_shapes[] = {
     "(select {x: (+ a b) from: t where: %s})",
     "(select {from: t where: %s asc: b})",
     "(select {c: (count (distinct b)) by: date from: t where: %s})",
+    /* shapes reading rows the where rejects, or positional: not pruned */
+    "(select {r: (sums a) from: t where: %s})",
+    "(select {r: (deltas b) from: t where: %s})",
+    "(select {r: (- a (avg a)) from: t where: %s})",
+    "(select {a: a from: t where: (and (> (count a) 6000) %s)})",
+    "(select {c: (count (distinct date)) from: t where: %s})",
+    "(select {s: (sum a) by: (sums b) from: t where: %s})",
     NULL,
 };
 /* Prunable predicates (the second rules every partition out). */
@@ -4779,6 +4790,8 @@ static test_result_t test_select_parted_prunes_fetch(void) {
         { "(select {s: (sum a) from: t where: (== date 2024.01.02)})",           1, 1 },     /* a of 01.02 */
         { "(select {c: (count a) from: t by: b where: (== date 2024.01.02)})",   2, 3000 },  /* a and b of 01.02 */
         { "(select {a: a from: t where: (<= date 2024.01.02) take: 10})",        2, 10 },    /* a of 01.01 and 01.02 */
+        { "(select {a: a from: t where: (<= date 2024.01.02) asc: b})",          4, 6000 },  /* a and b of 01.01, 01.02 */
+        { "(select {c: (count a) from: t where: (> date 2024.01.03)})",          0, 1 },     /* the stand-in alone */
         { NULL, 0, 0 },
     };
     for (int i = 0; qs[i].q; i++) {
@@ -4804,12 +4817,12 @@ static test_result_t test_select_parted_prunes_fetch(void) {
     PASS();
 }
 
-/* Pruned answers equal the unpruned scan's, on generation 0 and 2, for every
- * shape and prunable predicate (nothing surviving included); generation 0
- * decodes nothing.  One pair is excluded: a group by the partition key over
- * a where that drops the first partition, where the unpruned scan answers a
- * spurious empty group for that partition (exec_group_parted; reproduced on
- * dev) and the pruned source does not have it. */
+/* Pruned answers (or errors) equal the unpruned scan's, on generation 0 and
+ * 2, for every shape and prunable predicate (nothing surviving included);
+ * generation 0 decodes nothing.  This includes the whole scan's known
+ * oddities, which the stand-in partition reproduces: a group by the key
+ * over a where dropping the first partition answers an empty group for it,
+ * and a distinct of the key over an all-pass source is a `type` error. */
 static test_result_t test_select_parted_prunes_same(void) {
     ray_t* t0 = pdb_make(CS_TMP "/sq0", 0, false);
     ray_t* t2 = pdb_make(CS_TMP "/sq2", 7, false);
@@ -4823,12 +4836,11 @@ static test_result_t test_select_parted_prunes_same(void) {
             ray_t* u0 = sp_eval(i, sp_preds[k], true);
             sp_bind(t2);
             ray_t* p2 = sp_eval(i, sp_preds[k], false);
-            bool ok = p0 && !RAY_IS_ERR(p0);
             bool gen = sp_same(p0, p2);
-            bool spurious = i == 6 && (k == 0 || k == 5);   /* by: date, first partition dropped */
-            bool unp = spurious || sp_same(p0, u0);
+            /* the count-in-where shape (14) is not pruned, and its `or` form
+             * answers differently on the whole scan already (on dev too) */
+            bool unp = i == 14 || sp_same(p0, u0);
             drop_out(p0); drop_out(u0); drop_out(p2);
-            TEST_ASSERT_FMT(ok, "shape %d pred %s: answered", i, sp_preds[k]);
             TEST_ASSERT_FMT(gen, "shape %d pred %s: generations agree", i, sp_preds[k]);
             TEST_ASSERT_FMT(unp, "shape %d pred %s: pruned equals unpruned", i, sp_preds[k]);
             TEST_ASSERT_EQ_U(c.materialized, 0);
@@ -4842,8 +4854,8 @@ static test_result_t test_select_parted_prunes_same(void) {
 /* Mixed generations and a ragged tail (the last partition lacks b): the
  * pruned answer equals all-generation-0's.  A where that prunes the ragged
  * partition (or prunes everything) answers as the whole table would, never
- * touching it; one that keeps it, or a sorted shape, leaves the source
- * unpruned (the existing ragged-table behaviour, not compared here). */
+ * touching it; one that keeps it, or a shape that is not pruned, leaves the
+ * source unpruned (the existing ragged-table behaviour, not compared here). */
 static test_result_t test_select_parted_prunes_mixed(void) {
     static const unsigned masks[] = { 0x5, 0x2 };
     ray_t* t0 = pdb_make(CS_TMP "/sx0", 0, false);
@@ -4856,8 +4868,8 @@ static test_result_t test_select_parted_prunes_mixed(void) {
             TEST_ASSERT_NOT_NULL(tm);
             for (int i = 0; sp_shapes[i]; i++) {
                 for (int k = 0; sp_preds[k]; k++) {
-                    /* keeps 01.03, or sorts (select does not prune under asc:/desc:) */
-                    if (rag && (k == 3 || k == 4 || i == 5 || i == 9)) continue;
+                    if (rag && (k == 3 || k == 4)) continue;     /* keeps 01.03 */
+                    if (rag && i >= 11) continue;                /* not pruned: reads 01.03 */
                     sp_bind(t0);
                     ray_t* a = sp_eval(i, sp_preds[k], false);
                     sp_bind(tm);
@@ -4872,6 +4884,78 @@ static test_result_t test_select_parted_prunes_mixed(void) {
     }
     sp_bind(NULL);
     ray_release(t0);
+    PASS();
+}
+
+/* A lambda formal named like the key shadows it: the where compares the
+ * formal, so nothing is pruned and the answer is the whole table's. */
+static test_result_t test_select_parted_prunes_shadow(void) {
+    ray_t* t = pdb_make(CS_TMP "/sh", 7, false);
+    TEST_ASSERT_NOT_NULL(t);
+    sp_bind(t);
+    ray_release(t);
+    ray_t* a = ray_eval_str("((fn [date] (select {s: (sum a) from: t where: (<= date 2024.01.01)})) 2024.01.01)");
+    ray_t* b = ray_eval_str("(select {s: (sum a) from: t})");
+    ray_t* c = ray_eval_str("((fn [date] (select {a: a from: t where: (== date 2024.01.02)})) 2024.01.01)");
+    bool same = sp_same(a, b);
+    bool none = c && !RAY_IS_ERR(c) && c->type == RAY_TABLE && ray_table_nrows(c) == 0;
+    drop_out(a); drop_out(b); drop_out(c);
+    sp_bind(NULL);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_TRUE(none);
+    PASS();
+}
+
+/* Nothing survives, partitions of different sizes: the source is the
+ * stand-in alone (01.01's key, one synthetic row), nothing is decoded, and
+ * the answers equal the whole scan's — an empty table with the source's
+ * schema, a zero count, and (the whole scan's empty first-partition group)
+ * one 2024.01.01 group with count 0 under by: date. */
+static test_result_t test_select_parted_prunes_none(void) {
+    static const int64_t rows[3] = { 2500, 700, 1800 };
+    ray_t* t = pdb_make_rows(CS_TMP "/sn", 7, false, rows);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_release(t);
+    static const char* const qs[] = {
+        "(select {from: t where: %s})",
+        "(select {c: (count a) s: (sum b) from: t where: %s})",
+        "(select {c: (count a) by: date from: t where: %s})",
+        "(select {c: (count a) by: b from: t where: %s})",
+        "(select {a: a from: t where: %s desc: a take: 3})",
+        NULL,
+    };
+    ray_t* got[5] = {0};
+    for (int i = 0; qs[i]; i++) {
+        t = ray_read_parted(CS_TMP "/sn", "t");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        ray_release(t);
+        char q[256], u[256];
+        snprintf(q, sizeof q, qs[i], "(> date 2024.01.03)");
+        snprintf(u, sizeof u, qs[i], "(or (> date 2024.01.03) (> date 2024.01.03))");
+        ray_enc_counters_reset();
+        got[i] = ray_eval_str(q);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        ray_t* ref = ray_eval_str(u);
+        bool same = sp_same(got[i], ref);
+        drop_out(ref);
+        TEST_ASSERT_FMT(same, "%s: equals the whole scan", q);
+        TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", q, (unsigned long long)c.materialized);
+    }
+    sp_bind(NULL);
+    bool shape = got[0] && got[0]->type == RAY_TABLE && ray_table_nrows(got[0]) == 0 && ray_table_ncols(got[0]) == 3;
+    ray_t* cnt = got[1] && got[1]->type == RAY_TABLE ? ray_table_get_col(got[1], ray_sym_intern("c", 1)) : NULL;
+    bool zero = cnt && cnt->len == 1 && ((const int64_t*)ray_data(cnt))[0] == 0;
+    ray_t* key = got[2] && got[2]->type == RAY_TABLE ? ray_table_get_col(got[2], ray_sym_intern("date", 4)) : NULL;
+    bool group = key && key->type == RAY_DATE && key->len == 1 && ((const int32_t*)ray_data(key))[0] == 8766;
+    bool by_b = got[3] && got[3]->type == RAY_TABLE && ray_table_nrows(got[3]) == 0;
+    bool topk = got[4] && got[4]->type == RAY_TABLE && ray_table_nrows(got[4]) == 0;
+    for (int i = 0; i < 5; i++) drop_out(got[i]);
+    TEST_ASSERT_TRUE(shape);
+    TEST_ASSERT_TRUE(zero);
+    TEST_ASSERT_TRUE(group);
+    TEST_ASSERT_TRUE(by_b);
+    TEST_ASSERT_TRUE(topk);
     PASS();
 }
 
@@ -5065,6 +5149,8 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_mixed",   test_select_parted_prunes_mixed,   rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_shadow",  test_select_parted_prunes_shadow,  rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_none",    test_select_parted_prunes_none,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
