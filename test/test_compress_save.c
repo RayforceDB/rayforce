@@ -2143,6 +2143,9 @@ static ray_t* text_seg(int8_t ty, int64_t n, int64_t null_at) {
     ray_t* v = ray_vec_new(RAY_STR, n);
     for (int64_t i = 0; i < n; i++)
         v = i == null_at ? ray_str_vec_append(v, "", 0) : ray_str_vec_append(v, w[i % 3], 2);
+    /* the in-band null alone: appending "" sets the flag, which a segment
+     * need not carry (SYM ids never do), and the flag would answer for it */
+    v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     return v;
 }
 
