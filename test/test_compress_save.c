@@ -2578,17 +2578,15 @@ static test_result_t test_try_plans_bound(void) {
         ray_t* t = cp_read(gen);
         TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
         TEST_ASSERT_EQ_I(ray_table_get_col_enc(t, ray_sym_intern("a", 1)) != NULL, gen == 2);
-        /* The DAG is built in a graph over a separate read of the files: building
-         * it reads column types and decodes encoded columns, which would hide
-         * what the planners themselves decode from the counters. */
-        ray_t* tplan = cp_read(gen);
-        TEST_ASSERT_TRUE(tplan && !RAY_IS_ERR(tplan));
-        ray_graph_t* gr = ray_graph_new(tplan);
+        /* The DAG is built over the table itself: column presence is read from
+         * metadata, so building it decodes nothing (asserted below). */
+        ray_graph_t* gr = ray_graph_new(t);
         ray_t *e1, *e2, *e3, *e4, *e5, *e6, *e7, *e8;
         ray_t* err = NULL;
 
         /* a decline decodes nothing: a nullable term, int x int, an unknown column */
         agg_linear_t lin; agg_prod_t prod; agg_affine_t aff; ray_t* vec = NULL;
+        ray_enc_counters_reset();
         ray_op_t* d_null = cp_dag(gr, "(+ (* 2 b) v)", &e1);
         ray_op_t* d_ii   = cp_dag(gr, "(* a b)", &e2);
         ray_op_t* d_fv   = cp_dag(gr, "(* f v)", &e3);
@@ -2598,6 +2596,8 @@ static test_result_t test_try_plans_bound(void) {
         ray_op_t* d_af = cp_dag(gr, "(- f 1.5)", &e7);
         ray_op_t* d_ai = cp_dag(gr, "(+ a 5)", &e8);
         TEST_ASSERT_TRUE(d_null && d_ii && d_fv && d_lin && d_fg && d_fa && d_af && d_ai);
+        ray_enc_counters_t kb; ray_enc_counters_get(&kb);
+        TEST_ASSERT_EQ_U(kb.materialized, 0);               /* DAG construction decodes nothing */
         ray_enc_counters_reset();
         TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_null, &lin, &err)); TEST_ASSERT_NULL(err);
         TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_ii, &prod, &err));    TEST_ASSERT_NULL(err);
@@ -2637,13 +2637,11 @@ static test_result_t test_try_plans_bound(void) {
         ray_release(e1); ray_release(e2); ray_release(e3); ray_release(e4);
         ray_release(e5); ray_release(e6); ray_release(e7); ray_release(e8);
         ray_graph_free(gr);
-        ray_release(tplan);
         ray_release(t);
 
         /* a failed bind is the planner's error, not a decline */
         t = cp_read(gen);
-        tplan = cp_read(gen);
-        gr = ray_graph_new(tplan);
+        gr = ray_graph_new(t);
         ray_op_t* dl = cp_dag(gr, "(+ (* 2 b) a)", &e1);
         ray_op_t* dp = cp_dag(gr, "(* f g)", &e2);
         ray_op_t* da = cp_dag(gr, "(- f 1.5)", &e3);
@@ -2691,7 +2689,6 @@ static test_result_t test_try_plans_bound(void) {
         }
         ray_release(e1); ray_release(e2); ray_release(e3);
         ray_graph_free(gr);
-        ray_release(tplan);
         ray_release(t);
     }
     PASS();
@@ -2795,8 +2792,7 @@ static test_result_t test_expr_compile_bound(void) {
         ray_graph_free(gr);
         ray_release(t);
         t = cp_read(gen);
-        ray_t* tplan = cp_read(gen);       /* the DAG decodes its own table, not t */
-        gr = ray_graph_new(tplan);
+        gr = ray_graph_new(t);
         ray_op_t* d = cp_dag(gr, "(+ a b)", &e4);
         ray_graph_bind_test_fail_alloc(1);
         bool r = expr_compile(gr, t, d, &ex, &err);
@@ -2830,7 +2826,6 @@ static test_result_t test_expr_compile_bound(void) {
         ray_error_free(sel);
         ray_release(e1); ray_release(e5);
         ray_graph_free(gr);
-        ray_release(tplan);
         ray_release(t);
     }
     /* generation 0 and 2 expressions are the same values, nulls included */
@@ -4226,6 +4221,145 @@ static test_result_t test_join_sites_parted(void) {
     PASS();
 }
 
+/* ---- Task 30: query.c helpers before the select implementation ---- */
+
+/* A scalar aggregate over a column large enough to record CHUNK_ZONE:
+ * planning must not materialize it to read the synthesized zone. */
+static test_result_t test_scalar_agg_planning_zoned(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['v] (list (til 70000))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/za\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u (.db.splayed.get \"" CS_TMP "/za\"))"), "");
+    ray_col_meta_t m;
+    ray_t* u = ray_eval_str("u");
+    TEST_ASSERT_TRUE(ray_table_col_meta(u, ray_sym_intern("v", 1), &m) && m.index_kind == RAY_IDX_CHUNK_ZONE);
+    ray_release(u);
+    static const char* const qs[] = {
+        "(select {s: (sum v) from: u})", "(select {m: (max v) n: (min v) from: u})", "(select {c: (count v) a: (avg v) from: u})", NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_enc_counters_reset();
+        ray_t* r = ray_eval_str(qs[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "query %d", i);
+        ray_release(r);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        /* Answered from the zone during planning would leave UINT64_MAX: the
+         * query must reach execution.  (select still decodes its source at
+         * entry, transitional until Task 31, so the stricter "== 0" holds
+         * only after that.) */
+        TEST_ASSERT_FMT(c.at_first_exec != UINT64_MAX, "query %d answered during planning from a gen-2 zone", i);
+    }
+    ray_t* r = ray_eval_str("(sum (at u 'v))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == (int64_t)69999 * 70000 / 2);
+    ray_release(r);
+    PASS();
+}
+
+/* DAG construction names columns by metadata: over a generation-2 table whose
+ * column cannot decode, compiling every name form succeeds without decoding,
+ * and the failure surfaces when the DAG runs, as the column's own error. */
+static test_result_t test_dag_presence_without_decode(void) {
+    ray_t* t = ex_table(3000, true);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    static const char* const forms[] = { "a", "(+ a 1)", "(sum a)", "'a", "(neg a)", NULL };
+    for (int i = 0; forms[i]; i++) {
+        ray_graph_t* g = ray_graph_new(t);
+        ray_t* e = ray_parse(forms[i]);
+        ray_enc_counters_reset();
+        ray_op_t* dag = compile_expr_dag(g, e);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        TEST_ASSERT_FMT(dag != NULL, "form %s: compiled", forms[i]);
+        TEST_ASSERT_FMT(c.materialized == 0, "form %s: construction decoded", forms[i]);
+        if (dag) {
+            ray_error_clear();
+            ray_t* r = ray_execute(g, ray_optimize(g, dag));
+            if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+            test_result_t rr = ex_corrupt(r, forms[i]);
+            if (rr.status != TEST_PASS) { ray_release(e); ray_graph_free(g); ray_release(t); return rr; }
+        }
+        ray_release(e);
+        ray_graph_free(g);
+    }
+    /* an absent name is still absent: a column of another table is not found */
+    ray_graph_t* g = ray_graph_new(t);
+    ray_t* e = ray_parse("nosuchcol");
+    ray_op_t* dag = compile_expr_dag(g, e);
+    ray_t* r = dag ? ray_execute(g, ray_optimize(g, dag)) : NULL;
+    TEST_ASSERT_TRUE(!dag || (r && RAY_IS_ERR(r)));
+    if (r && RAY_IS_ERR(r)) ray_error_free(r);
+    ray_release(e);
+    ray_graph_free(g);
+    ray_release(t);
+    PASS();
+}
+
+/* Queries over the helpers of this part, on a table read from generation-0
+ * and generation-2 files, give the same answer. */
+static test_result_t test_query_helpers_gen2_equal(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 'm 'v 's] (list (% (til 80000) 7) (% (til 80000) 5) (% (* (til 80000) 13) 1000) (take ['aa 'bb 'cc 'dd] 80000))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/q0\" t {compress: false})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/q2\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u0 (.db.splayed.get \"" CS_TMP "/q0\"))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u2 (.db.splayed.get \"" CS_TMP "/q2\"))"), "");
+    ray_t* u2 = ray_eval_str("u2");
+    TEST_ASSERT_TRUE(u2 && ray_table_get_col_enc(u2, ray_sym_intern("v", 1)) != NULL);
+    ray_release(u2);
+    static const char* const qs[] = {
+        "(select {c: (count (distinct v)) by: k from: %s})",
+        "(select {c: (count (distinct v)) by: [k m] from: %s})",
+        "(select {c: (count (distinct v)) by: k from: %s where: (> v 100)})",
+        "(select {s: (sum v) a: (avg v) by: k from: %s desc: s take: 3})",
+        "(select {s: (sum v) by: [k m] from: %s asc: s take: 4})",
+        "(select {c: (count v) from: %s where: (== k 3)})",
+        "(select {c: (count v) from: %s where: (> v 500)})",
+        "(select {c: (count v) by: s from: %s})",
+        "(select {c: (count v) by: (+ k 1) from: %s})",
+        "(select {x: (+ (sum v) (count v)) by: k from: %s})",
+        "(select {x: (med v) y: (max v) by: k from: %s})",
+        "(select {k: k w: (+ v 1) from: %s take: 5})",
+        "(select {w: (* v 2) from: %s where: (< k 2) take: 6})",
+        "(select {s: (sum v) m: (min v) from: %s})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        char q0[256], q2[256];
+        snprintf(q0, sizeof q0, qs[i], "u0");
+        snprintf(q2, sizeof q2, qs[i], "u2");
+        ray_t* a = ray_eval_str(q0);
+        ray_t* b = ray_eval_str(q2);
+        bool ok = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && cp_fmt_same(a, b);
+        if (!ok) fprintf(stderr, "query_helpers_gen2_equal: %s\n", q2);
+        if (a && RAY_IS_ERR(a)) ray_error_free(a); else if (a) ray_release(a);
+        if (b && RAY_IS_ERR(b)) ray_error_free(b); else if (b) ray_release(b);
+        TEST_ASSERT_FMT(ok, "query %d", i);
+    }
+    PASS();
+}
+
+/* A select over a table with an undecodable column reports that column's
+ * error, whatever helper meets it first. */
+static test_result_t test_query_helpers_failed_decode(void) {
+    ray_t* t = ex_table(3000, true);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_env_set(ray_sym_intern("bad", 3), t);
+    ray_release(t);
+    static const char* const qs[] = {
+        "(select {c: (count (distinct a)) by: b from: bad})",
+        "(select {s: (sum a) by: b from: bad desc: s take: 2})",
+        "(select {c: (count a) from: bad where: (== a 3)})",
+        "(select {x: (+ a 1) from: bad})",
+        "(select {m: (max a) from: bad})",
+        "(select {s: (sum b) by: (+ a 1) from: bad})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_error_clear();
+        ray_t* r = ray_eval_str(qs[i]);
+        test_result_t rr = ex_corrupt(r, qs[i]);
+        if (rr.status != TEST_PASS) return rr;
+    }
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -4321,5 +4455,9 @@ const test_entry_t compress_entries[] = {
     { "compress/datalog_sites_gen2_equal",   test_datalog_sites_gen2_equal,   rt_setup, rt_teardown },
     { "compress/join_sites_parted",          test_join_sites_parted,          rt_setup, rt_teardown },
     { "compress/datalog_query_gen2_equal",   test_datalog_query_gen2_equal,   rt_setup, rt_teardown },
+    { "compress/scalar_agg_planning_zoned", test_scalar_agg_planning_zoned, rt_setup, rt_teardown },
+    { "compress/dag_presence_without_decode", test_dag_presence_without_decode, rt_setup, rt_teardown },
+    { "compress/query_helpers_gen2_equal",   test_query_helpers_gen2_equal,   rt_setup, rt_teardown },
+    { "compress/query_helpers_failed_decode", test_query_helpers_failed_decode, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
