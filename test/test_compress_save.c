@@ -3500,8 +3500,8 @@ static test_result_t test_parted_pruning_mixed(void) {
                     ray_t* b = pruned_run(tm, q, rk, &clean);
                     TEST_ASSERT_FMT(same_outcome(a, b), "mask %u ragged %d query %d root %d", masks[k], rag, q, rk);
                     TEST_ASSERT_TRUE(clean);
-                    if (rag && rk == R_SUM && q == Q_01_03) TEST_ASSERT_TRUE(RAY_IS_ERR(b));  /* the ragged partition itself */
-                    if (!rag && rk == R_SUM && q == Q_01_03) TEST_ASSERT_TRUE(!RAY_IS_ERR(b) && b->len == 6000);
+                    /* ragged too (#724): 2024.01.03's missing b reads as nulls */
+                    if (rk == R_SUM && q == Q_01_03) TEST_ASSERT_TRUE(!RAY_IS_ERR(b) && b->len == 6000);
                     drop_out(a); drop_out(b);
                 }
             }
