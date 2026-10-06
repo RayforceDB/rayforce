@@ -28,14 +28,22 @@
 #include "store/colrange.h"
 
 /* Bind column `sym` of `tbl` for this execution (deduplicated per table
- * and name; no decode).  NULL with *err NULL when absent; NULL with an
+ * and name; no decode).  A cached entry is returned only while it is still
+ * the column object the table holds, so a table released and reallocated at
+ * the same address, or a column replaced in place, never hits a stale entry.
+ * The entries of a temporary table (a sub-table, a compacted copy) are
+ * dropped with ray_graph_unbind_table before it is released.  NULL with *err NULL when absent; NULL with an
  * owned *err on failure (OOM).  Binds are made on the thread executing the
  * graph, before any pool dispatch that reads them; the returned source is
  * borrowed from the graph and valid until ray_graph_free.  `tbl` must
  * outlive the graph: the dedup key is its raw pointer. */
 ray_col_src_t* ray_graph_bind_col(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t** err);
 void           ray_graph_binds_free(ray_graph_t* g);
+/* Release and remove every entry keyed by `tbl`; borrowed sources of that
+ * table must no longer be in use. */
+void           ray_graph_unbind_table(ray_graph_t* g, ray_t* tbl);
 uint32_t       ray_graph_binds_count(const ray_graph_t* g);   /* tests */
+uint64_t       ray_graph_binds_dropped(void);                 /* tests: entries removed by unbind, process-wide */
 void           ray_graph_bind_test_fail_alloc(int64_t nth);   /* tests: fail the nth bind (0 = off) */
 
 /* True when the column is present but its shape is not a bindable source

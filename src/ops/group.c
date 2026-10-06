@@ -22,6 +22,7 @@
  */
 
 #include "ops/internal.h"
+#include "ops/colbind.h"
 #include "ops/hash.h"
 #include "ops/rowsel.h"
 #include "ops/hll.h"        /* approximate count-distinct via HyperLogLog */
@@ -11185,7 +11186,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         result = exec_group_v2(g, op2, sub, group_limit);
     for (uint32_t a = 0; a < na; a++)
         if (synth[a]) ray_release(synth[a]);
-    if (sub) ray_release(sub);
+    if (sub) { ray_graph_unbind_table(g, sub); ray_release(sub); }
     if (cerr) return cerr;
     return result;   /* NULL → legacy path */
 }
@@ -11723,7 +11724,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * produced and continue on the generic paths. */
     if (g->sg_col) {
         ray_t* sgr = exec_group_slices(g, op, tbl, group_limit);
-        if (sgr) { agg_route_record(AGG_ROUTE_SLICES); sg_hint_release(g); return sgr; }
+        if (sgr && !RAY_IS_ERR(sgr)) agg_route_record(AGG_ROUTE_SLICES);
+        if (sgr) { sg_hint_release(g); return sgr; }
         ray_t* err = sg_hint_to_selection(g, tbl);
         if (err) return err;
     }

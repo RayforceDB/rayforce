@@ -2202,8 +2202,103 @@ static test_result_t test_compile_paths_bound(void) {
             if (!is_err) break;
             TEST_ASSERT_FMT(be, "query %d bind %d: not the bind error", i, n);
         }
-        TEST_ASSERT_FMT(n >= 2, "query %d: the planners bound columns", i);
+        TEST_ASSERT_FMT(n - 1 == 2, "query %d: %d binds", i, n - 1);   /* v and w, each failing in turn */
     }
+    PASS();
+}
+
+
+static ray_t* cp_tiny(int64_t base) {
+    ray_t* t = ray_table_new(1);
+    ray_t* c = ray_vec_new(RAY_I64, 4); c->len = 4;
+    for (int i = 0; i < 4; i++) ((int64_t*)ray_data(c))[i] = base + i;
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), c);
+    ray_release(c);
+    return t;
+}
+
+/* A released temporary table's address is reused by another table with other
+ * columns: the bind must not return the first table's column.  Tables of the
+ * same shape are built until the allocator hands back the freed address. */
+static test_result_t test_bind_address_reuse(void) {
+    int64_t sa = ray_sym_intern("a", 1);
+    ray_t* t1 = cp_tiny(0);
+    ray_t* host = cp_tiny(500);
+    ray_graph_t* g = ray_graph_new(host);
+    ray_t* err = NULL;
+    ray_col_src_t* s1 = ray_graph_bind_col(g, t1, sa, &err);
+    TEST_ASSERT_TRUE(s1 && !err);
+    ray_t* o1 = s1->obj;
+    ray_t* addr1 = t1;
+    ray_release(t1);                         /* released without ray_graph_unbind_table */
+    ray_t* pile[256]; int np = 0;
+    ray_t* t2 = NULL;
+    while (np < 256 && !t2) {
+        pile[np] = cp_tiny(100);
+        if (pile[np] == addr1) t2 = pile[np];
+        np++;
+    }
+    TEST_ASSERT_TRUE(t2 != NULL);            /* the allocator reused the address */
+    ray_col_src_t* s2 = ray_graph_bind_col(g, t2, sa, &err);
+    TEST_ASSERT_TRUE(s2 && !err && s2 != s1 && s2->obj != o1);
+    ray_t* plain = NULL;
+    TEST_ASSERT_NULL(ray_col_src_plain(s2, &plain));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(plain))[0], 100);
+    for (int i = 0; i < np; i++) ray_release(pile[i]);
+    ray_graph_free(g);
+    ray_release(host);
+    PASS();
+}
+
+/* Binds of a released temporary are dropped by ray_graph_unbind_table: the
+ * column memory goes back with the table, and a gen-0 group-by over an
+ * expression drops the binds of its synthetic sub-table with unchanged results. */
+static test_result_t test_unbind_releases_temporaries(void) {
+    int64_t sa = ray_sym_intern("a", 1);
+    enum { N = 1 << 17 };
+    ray_t* host = cp_tiny(0);
+    ray_graph_t* g = ray_graph_new(host);
+    ray_mem_stats_t m0, m1, m2;
+    ray_err_t dummy = RAY_OK; (void)dummy;
+    ray_t* err = NULL;
+    ray_mem_stats(&m0);
+    /* unbound before the release: the column memory goes back with the table */
+    ray_t* big = ray_vec_new(RAY_I64, N); big->len = N;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, sa, big);
+    ray_release(big);
+    TEST_ASSERT_TRUE(ray_graph_bind_col(g, t, sa, &err) && !err);
+    TEST_ASSERT_EQ_I(ray_graph_binds_count(g), 1);
+    ray_graph_unbind_table(g, t);
+    TEST_ASSERT_EQ_I(ray_graph_binds_count(g), 0);
+    ray_release(t);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_TRUE(m1.bytes_allocated < m0.bytes_allocated + 4096);
+    /* released without unbinding: the bind keeps the column */
+    big = ray_vec_new(RAY_I64, N); big->len = N;
+    t = ray_table_new(1);
+    t = ray_table_add_col(t, sa, big);
+    ray_release(big);
+    TEST_ASSERT_TRUE(ray_graph_bind_col(g, t, sa, &err) && !err);
+    ray_release(t);
+    ray_mem_stats(&m2);
+    TEST_ASSERT_TRUE(m2.bytes_allocated >= m0.bytes_allocated + (size_t)N * 8);
+    ray_graph_free(g);
+    ray_release(host);
+
+    /* gen-0 group-by over an expression: the sub-table's binds are dropped */
+    TEST_ASSERT_STR_EQ(ev_code("(set T (table ['k 'v 'w] (list (take [1 2 3] 200000) (til 200000) (* 2 (til 200000)))))"), "");
+    const char* q = "(select {s: (sum (+ v w)) a: (avg (* 3 v)) from: T by: k})";
+    uint64_t d0 = ray_graph_binds_dropped();
+    ray_t* r = ray_eval_str(q);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(ray_graph_binds_dropped() > d0);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    ray_t* s = ray_table_get_col(r, ray_sym_intern("s", 1));
+    int64_t tot = 0;
+    for (int i = 0; i < 3; i++) tot += ((int64_t*)ray_data(s))[i];
+    TEST_ASSERT_EQ_I(tot, 3 * ((int64_t)199999 * 200000 / 2));                       /* sum of v + w = 3 * v */
+    ray_release(r);
     PASS();
 }
 
@@ -2549,7 +2644,7 @@ static test_result_t test_expr_compile_bound(void) {
             bool all_err = false;
             nbinds[gi] = cp_bind_sweep(cp_expr_body, &cx, &all_err);
             TEST_ASSERT_TRUE(all_err);
-            TEST_ASSERT_TRUE(nbinds[gi] >= (ri == 0 ? 2 : 3));
+            TEST_ASSERT_FMT(nbinds[gi] == (ri == 0 ? 2 : 3), "route %d: %d binds", ri, nbinds[gi]);   /* every bind of a clean run fails in turn */
             ray_release(t);
         }
         TEST_ASSERT_EQ_I(nbinds[0], nbinds[1]);
@@ -2640,7 +2735,7 @@ static test_result_t test_group_desc_bound(void) {
             /* every failure before the first success is the bind error: both value columns */
             bool all_err = false;
             int nb = cp_bind_sweep(cp_group_body, &cx, &all_err);
-            TEST_ASSERT_FMT(all_err && nb >= 2, "case %zu gen %d sweep nb=%d all_err=%d", c, gi * 2, nb, all_err);
+            TEST_ASSERT_FMT(all_err && nb == 2, "case %zu gen %d sweep nb=%d all_err=%d", c, gi * 2, nb, all_err);
             ray_release(t);
         }
         TEST_ASSERT_FMT(cp_groups_same(out[0], out[1], cases[c].groups, 2), "case %zu answers differ", c);
@@ -2671,11 +2766,11 @@ static test_result_t test_topk_bound(void) {
     int64_t si = ray_sym_intern("i", 1), sv = ray_sym_intern("v", 1), sd = ray_sym_intern("d", 1);
     int64_t ss = ray_sym_intern("s", 1);
     struct { int mode; int64_t k0, k1; uint8_t d0; const char* where; int min_binds; } cases[] = {
-        { 0, sv, si, 1, "(> v 5)",  3 },     /* nullable I64 desc, then i; where on v */
-        { 0, ss, si, 0, "(!= s 'beta)", 3 }, /* SYM sort key (file domain at generation 2) */
-        { 0, sd, si, 1, "(< d 2.0)", 3 },    /* F64 desc with nulls */
-        { 1, 0, 0, 0, "(> v 5)", 3 },        /* take from the front */
-        { 2, 0, 0, 0, "(== s 'gamma)", 3 },  /* take from the end */
+        { 0, sv, si, 1, "(> v 5)",  4 },     /* nullable I64 desc, then i; where on v */
+        { 0, ss, si, 0, "(!= s 'beta)", 4 }, /* SYM sort key (file domain at generation 2) */
+        { 0, sd, si, 1, "(< d 2.0)", 4 },    /* F64 desc with nulls */
+        { 1, 0, 0, 0, "(> v 5)", 4 },        /* take from the front */
+        { 2, 0, 0, 0, "(== s 'gamma)", 4 },  /* take from the end */
     };
     for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
         ray_t* out[2] = { NULL, NULL };
@@ -2696,7 +2791,7 @@ static test_result_t test_topk_bound(void) {
                             (unsigned long long)ran, (unsigned long long)dec);
             bool all_err = false;
             nbinds[gi] = cp_bind_sweep(cp_topk_body, &cx, &all_err);
-            TEST_ASSERT_FMT(all_err && nbinds[gi] >= cases[c].min_binds, "case %zu gen %d sweep nb=%d all_err=%d",
+            TEST_ASSERT_FMT(all_err && nbinds[gi] == cases[c].min_binds, "case %zu gen %d sweep nb=%d all_err=%d",
                             c, gi * 2, nbinds[gi], all_err);
             ray_release(w);
             ray_release(t);
@@ -2806,6 +2901,8 @@ const test_entry_t compress_entries[] = {
     { "compress/fused_pred_enc_source", test_fused_pred_enc_source, rt_setup, rt_teardown },
     { "compress/fused_pred_bind_failure", test_fused_pred_bind_failure, rt_setup, rt_teardown },
     { "compress/bind_dedup_validates",    test_bind_dedup_validates,    rt_setup, rt_teardown },
+    { "compress/bind_address_reuse",      test_bind_address_reuse,      rt_setup, rt_teardown },
+    { "compress/unbind_releases_temporaries", test_unbind_releases_temporaries, rt_setup, rt_teardown },
     { "compress/compile_paths_bound",     test_compile_paths_bound,     rt_setup, rt_teardown },
     { "compress/try_plans_bound",         test_try_plans_bound,         rt_setup, rt_teardown },
     { "compress/expr_compile_bound",      test_expr_compile_bound,      rt_setup, rt_teardown },

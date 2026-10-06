@@ -100,6 +100,25 @@ void ray_graph_binds_free(ray_graph_t* g) {
     g->binds = NULL;
 }
 
+static _Atomic uint64_t g_unbound;
+uint64_t ray_graph_binds_dropped(void) { return atomic_load(&g_unbound); }
+
+void ray_graph_unbind_table(ray_graph_t* g, ray_t* tbl) {
+    ray_col_binds_t* b = g ? g->binds : NULL;
+    if (!b || !tbl) return;
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < b->n; i++) {
+        if (b->e[i]->tbl == tbl) {
+            ray_col_src_release(&b->e[i]->src);
+            ray_free_raw(b->e[i]);
+            atomic_fetch_add(&g_unbound, 1);
+        } else {
+            b->e[w++] = b->e[i];
+        }
+    }
+    b->n = w;
+}
+
 uint32_t ray_graph_binds_count(const ray_graph_t* g) {
     return (g && g->binds) ? g->binds->n : 0;
 }

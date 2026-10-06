@@ -22,6 +22,7 @@
  */
 
 #include "ops/internal.h"
+#include "ops/colbind.h"
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name (error context) */
 #include "ops/rowsel.h"
@@ -2883,6 +2884,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             }
                             if (pv && !RAY_IS_ERR(pv)) ray_release(pv);
                             else if (pv) ray_error_free(pv);
+                            ray_graph_unbind_table(g, sub);
                             ray_release(sub);
                             if (done_refine) return input;
                         } else if (sub && sub != input) {
@@ -3035,7 +3037,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (g->sg_col) {
                 ray_t* serr = ray_group_slice_hint_settle(g, op, tbl, 0);
                 if (serr) {
-                    if (owned_tbl) ray_release(owned_tbl);
+                    if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }
                     return serr;
                 }
             }
@@ -3084,7 +3086,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                                        keep, nkeep);
                         if (compacted && !RAY_IS_ERR(compacted) &&
                             compacted != tbl) {
-                            if (owned_tbl) ray_release(owned_tbl);
+                            if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }
                             owned_tbl = compacted;
                             tbl = compacted;
                             ray_release(g->selection);
@@ -3105,7 +3107,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * downstream ops (SORT etc.) don't try to sel_compact the
              * aggregated output with a mismatched-length bitmap. */
             ray_t* result = exec_group(g, op, tbl, 0);
-            if (owned_tbl) ray_release(owned_tbl);
+            if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }
             if (g->selection) {
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -3125,7 +3127,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 tbl = compacted;
             }
             ray_t* result = exec_pivot(g, op, tbl);
-            if (owned_tbl) ray_release(owned_tbl);
+            if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }
             return result;
         }
 
@@ -3275,7 +3277,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
                 input = exec_group(g, child_op, tbl, n);
-                if (owned_tbl) ray_release(owned_tbl);
+                if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }
                 if (g->selection) {
                     ray_release(g->selection);
                     g->selection = NULL;

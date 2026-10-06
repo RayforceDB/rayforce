@@ -776,10 +776,11 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
      * the plain column is requested only where a payload pointer is
      * captured (R-READ: a decline takes the unfused scan path). */
     ray_t* berr = NULL;
+    if (ray_col_bind_declines(tbl, lext->sym)) return -1;
     ray_col_src_t* src = ray_graph_bind_col(g, tbl, lext->sym, &berr);
     if (berr) { *err = berr; return -1; }
     if (!src) return -1;
-    if (src->parted || src->type == RAY_MAPCOMMON) return -1;
+    if (src->parted) return -1;
     out->src = src;
     ray_t* col = NULL;
     if (out->op == FP_IN) {

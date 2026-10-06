@@ -6616,8 +6616,8 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     }
 
 done:
-    if (sub) ray_release(sub);
-    if (compact) ray_release(compact);
+    if (sub) { ray_graph_unbind_table(g, sub); ray_release(sub); }
+    if (compact) { ray_graph_unbind_table(g, compact); ray_release(compact); }
     ray_free_raw(perm); ray_free_raw(idx); ray_free_raw(local); ray_free_raw(kvs); ray_free_raw(counts);
     ray_free_raw(set.keys); ray_free_raw(set.rank); ray_free_raw(set.bloom);
     if (kv_hdr) scratch_free(kv_hdr);
@@ -6673,7 +6673,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_t* compact = agg_build_compact(g, op, tbl, ray_data(idx), n_sel);
             ray_t* result = compact && !RAY_IS_ERR(compact)
                 ? exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0, group_limit, efp) : compact;
-            if (compact && !RAY_IS_ERR(compact)) ray_release(compact);
+            if (compact && !RAY_IS_ERR(compact)) { ray_graph_unbind_table(g, compact); ray_release(compact); }
             ray_release(idx); scratch_free(kc_hdr); return result;
         }
         agg_route_record(AGG_ROUTE_V2_INDEXED);
@@ -6719,7 +6719,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }                                                                   \
             ray_t* r = exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0,   \
                                          group_limit, efp);                     \
-            ray_release(compact); ray_release(idxb);                            \
+            ray_graph_unbind_table(g, compact); ray_release(compact); ray_release(idxb); \
             return r;                                                           \
         } while (0)
 
