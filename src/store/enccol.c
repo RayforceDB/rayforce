@@ -136,6 +136,10 @@ static ray_t* enc_validate_side_table(ray_enccol_t* e) {
         if (len > sl || off > sl - len) ENC_CORRUPT("column %s: side entry %u overruns the side data", e->path, i);
         if (!all_zero(s + at, (size_t)(off - at))) ENC_CORRUPT("column %s: side padding", e->path);
         if (kind == RAY_ENC_SIDE_VALUE_DICT) {
+            /* float dictionaries are legal from P5 (spec "Type coverage"):
+             * a newer build's file, not damage */
+            if (e->type == RAY_F32 || e->type == RAY_F64)
+                return ray_error("nyi", "column %s: float dictionary needs a newer build", e->path);
             if (!ray_encw_type_has_dict(e->type)) ENC_CORRUPT("column %s: VALUE_DICT on type %s", e->path, ray_type_name(e->type));
             e->vdict_off = e->hdr.side_off + off; e->vdict_len = len;
         } else if (e->type != RAY_STR) {
@@ -252,6 +256,8 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
         if (eh->index_off != ray_enc_pad32(prev)) ENC_CORRUPT("column %s: index region not at the next 32-aligned offset", e->path);
         if (eh->index_off >= size) ENC_CORRUPT("column %s: index region past the end of the file", e->path);
         if (!all_zero(b + prev, (size_t)(eh->index_off - prev))) ENC_CORRUPT("column %s: padding before the index region not zero", e->path);
+        /* the region opens with the 80-byte wire root (spec "Index region") */
+        if (size - eh->index_off < 80) ENC_CORRUPT("column %s: index region shorter than its 80-byte root", e->path);
         prev = size;
     }
     if (prev != size) ENC_CORRUPT("column %s: %llu bytes after the last section", e->path, (unsigned long long)(size - prev));
