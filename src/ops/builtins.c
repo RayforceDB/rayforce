@@ -46,6 +46,7 @@ static inline double clear_neg_zero(double v) {
     return v;
 }
 #include "ops/hash.h"
+#include "store/col.h"
 #include "store/part.h"
 #include "store/splay.h"
 #include "table/sym.h"
@@ -696,6 +697,14 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
+    ray_compress_t mode = RAY_COMPRESS_ABSENT;
+    if (n >= 1 && args[0] && args[0]->type == RAY_DICT) {
+        if (n >= 2 && args[1] && args[1]->type == RAY_DICT)
+            return ray_error("domain", "csv.parted: a second options dict");
+        ray_t* oerr = ray_compress_opt_parse(args[0], true, &mode);
+        if (oerr) return oerr;
+        args++; n--;
+    }
     if (n < 3 || n > 6) return ray_error("arity", "csv.parted: expects 3 to 6 arguments, got %lld", (long long)n);
 
     char root[1024];
@@ -774,10 +783,10 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         return ray_error("io", "csv.parted: %s is left from an earlier failed import; remove it to retry",
                          staging);
 
-    ray_err_t err = ray_csv_save_parted_named_opts(path, 0, header,
-                                                   types_arg, ncols,
-                                                   names_arg, ncols,
-                                                   root, table_name, rows_per_part);
+    ray_err_t err = ray_csv_save_parted_mode(path, 0, header,
+                                              types_arg, ncols,
+                                              names_arg, ncols,
+                                              root, table_name, rows_per_part, mode);
     if (err != RAY_OK) {
         struct stat st;
         if (stat(dest, &st) != 0 && stat(staging, &st) == 0)

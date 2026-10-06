@@ -4048,7 +4048,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
                                          const int8_t* col_types_in, int32_t n_types,
                                          const int64_t* col_names_in, int32_t n_names,
                                          const char* root, const char* table_name,
-                                         int64_t rows_per_part, bool staged) {
+                                         int64_t rows_per_part, bool staged,
+                                         ray_compress_t mode) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !root || !table_name) return RAY_ERR_DOMAIN;
     if (rows_per_part <= 0) rows_per_part = CSV_PART_ROWS_DEFAULT;
@@ -4274,8 +4275,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
             err = RAY_ERR_RANGE;
             break;
         }
-        err = staged ? ray_splay_save_staged_bulk(tbl, leaf, root_sym)
-                     : ray_splay_save_bulk(tbl, leaf, root_sym);
+        err = staged ? ray_splay_save_staged_bulk_mode(tbl, leaf, root_sym, mode)
+                     : ray_splay_save_bulk_mode(tbl, leaf, root_sym, mode);
         ray_release(tbl);
         scratch_free(row_offsets_hdr);
         if (err != RAY_OK) {
@@ -4320,6 +4321,16 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                                          const int64_t* col_names, int32_t n_names,
                                          const char* root, const char* table_name,
                                          int64_t rows_per_part) {
+    return ray_csv_save_parted_mode(path, delimiter, header, col_types, n_types,
+                                    col_names, n_names, root, table_name,
+                                    rows_per_part, RAY_COMPRESS_ABSENT);
+}
+
+ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header,
+                                   const int8_t* col_types, int32_t n_types,
+                                   const int64_t* col_names, int32_t n_names,
+                                   const char* root, const char* table_name,
+                                   int64_t rows_per_part, ray_compress_t mode) {
     if (!path || !root || !*root || !table_name || !*table_name ||
         table_name[0] == '.' || strchr(table_name,'/') || strchr(table_name,'\\'))
         return RAY_ERR_DOMAIN;
@@ -4330,7 +4341,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     struct stat st;
     if (stat(dest,&st) == 0)
         return csv_save_parted_impl(path,delimiter,header,col_types,n_types,
-                                   col_names,n_names,dest,table_name,rows_per_part,false);
+                                   col_names,n_names,dest,table_name,rows_per_part,false,mode);
     /* Fail on an unreadable input before claiming the staging directory:
      * failed staging is retained and blocks the root, which a mistyped
      * source path must not do. */
@@ -4352,7 +4363,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     if (mkdir(staging,0755) != 0) return RAY_ERR_IO;
 #endif
     ray_err_t err = csv_save_parted_impl(path,delimiter,header,col_types,n_types,
-                                       col_names,n_names,staging,table_name,rows_per_part,true);
+                                       col_names,n_names,staging,table_name,rows_per_part,true,mode);
     if (err != RAY_OK) {
         /* Failed staging is kept for diagnosis only when it holds a
          * partition.  A failure before the first one (a type vector that

@@ -151,6 +151,10 @@ ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* d
 bool      ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src);
 ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* dest_cur,
                                        const char* name, size_t name_len, uint8_t* gen);
+/* Parse the `compress` option from `opts` (a RAY_DICT with SYM keys; NULL:
+ * absent).  strict: any key other than `compress` is a domain error.  A
+ * non-bool `compress` is a domain error.  Returns NULL or an owned error. */
+ray_t* ray_compress_opt_parse(ray_t* opts, bool strict, ray_compress_t* mode);
 void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */
 
 bool ray_col_gen2_eligible(ray_t* col);

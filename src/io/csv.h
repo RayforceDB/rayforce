@@ -25,6 +25,7 @@
 #define RAY_CSV_H
 
 #include <rayforce.h>
+#include "store/col.h"
 
 /* --------------------------------------------------------------------------
  * Column type tokens used during CSV parse and schema resolution.
@@ -83,6 +84,11 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                                          const int64_t* col_names, int32_t n_names,
                                          const char* root, const char* table_name,
                                          int64_t rows_per_part);
+ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header,
+                                   const int8_t* col_types, int32_t n_types,
+                                   const int64_t* col_names, int32_t n_names,
+                                   const char* root, const char* table_name,
+                                   int64_t rows_per_part, ray_compress_t mode);
 ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
                                           const int8_t* col_types, int32_t n_types,
                                           const int64_t* col_names, int32_t n_names,

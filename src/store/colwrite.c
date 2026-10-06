@@ -364,3 +364,28 @@ uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
     uint8_t g;
     return ray_col_resolve_gen_type_err(mode, type, cur, name, nlen, &g) == RAY_OK ? g : 0;
 }
+
+ray_t* ray_compress_opt_parse(ray_t* opts, bool strict, ray_compress_t* mode) {
+    *mode = RAY_COMPRESS_ABSENT;
+    if (!opts) return NULL;
+    if (opts->type != RAY_DICT) return ray_error("type", "options must be a dict");
+    ray_t* keys = ray_dict_keys(opts);
+    if (keys && keys->len > 0 && keys->type != RAY_SYM)
+        return ray_error("domain", "option keys must be symbols");
+    for (int64_t i = 0; strict && keys && i < keys->len; i++) {
+        ray_t* k = ray_sym_vec_cell(keys, i);
+        if (!k || ray_str_len(k) != 8 || memcmp(ray_str_ptr(k), "compress", 8) != 0)
+            return ray_error("domain", "unknown option '%.*s' (only compress is accepted)",
+                             k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
+    }
+    ray_t* key = ray_sym(ray_sym_intern("compress", 8));
+    if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
+    ray_t* v = ray_dict_get(opts, key);
+    ray_release(key);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) return v;
+    bool ok = v->type == -RAY_BOOL;
+    if (ok) *mode = v->b8 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF;
+    ray_release(v);
+    return ok ? NULL : ray_error("domain", "compress must be true or false");
+}

@@ -1341,6 +1341,57 @@ static test_result_t test_unreadable_destination(void) {
     PASS();
 }
 
+/* Evaluate and return the error code ("" for success), releasing the value. */
+static const char* ev_code(const char* src) {
+    static char code[16];
+    ray_t* r = ray_eval_str(src);
+    snprintf(code, sizeof code, "%s", (r && RAY_IS_ERR(r)) ? ray_err_code(r) : "");
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return code;
+}
+
+static test_result_t test_db_splayed_set_forms(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['a 'b] (list [1 2 3] [4 5 6])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f1\" t)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/f1", "a"), 0);
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f2\" t \"" CS_TMP "/f2.sym\")"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f3\" t {compress: true})"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/f3", "a"), 2);
+    /* absent over a generation-2 destination inherits it */
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f3\" t)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/f3", "a"), 2);
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f3\" t \"" CS_TMP "/f3.sym\" {compress: false})"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/f3", "a"), 0);
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f4\" t {compress: true} {compress: true})"), "domain");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f4\" t {compress: 1})"), "domain");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f4\" t {other: true})"), "domain");
+    TEST_ASSERT_STR_EQ(ev_code("(sum (at (.db.splayed.get \"" CS_TMP "/f3\") 'b))"), "");
+    /* round trip through a generation-2 destination */
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f5\" t {compress: true})"), "");
+    ray_t* r = ray_eval_str("(sum (at (.db.splayed.get \"" CS_TMP "/f5\") 'b))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 15);
+    ray_release(r);
+    r = ray_eval_str("(== (at (.db.splayed.get \"" CS_TMP "/f5\") 'a) [1 2 3])");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_csv_parted_option(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['a 'b] (list [1 2 3 4] [10 20 30 40])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.write t \"" CS_TMP "/in.csv\")"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr\" 't)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pr/0/t", "a"), 2);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr0\" 't)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pr0/0/t", "a"), 0);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: true} {compress: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr1\" 't)"), "domain");
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {zone: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr1\" 't)"), "domain");
+    ray_t* r = ray_eval_str("(sum (at (.db.parted.get \"" CS_TMP "/pr\" 't) 'b))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 100);
+    ray_release(r);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/merge_mixed_widths",  test_merge_mixed_widths,  cs_setup, cs_teardown },
     { "compress/absent_byte_identity", test_absent_byte_identity, cs_setup, cs_teardown },
@@ -1381,5 +1432,7 @@ const test_entry_t compress_entries[] = {
     { "compress/serde_encoded_table",           test_serde_encoded_table,            cs_setup, cs_teardown },
     { "compress/concurrent_col_index",          test_concurrent_col_index,           cs_setup, cs_teardown },
     { "compress/legacy_transient_no_leak",      test_legacy_transient_no_leak,       cs_setup, cs_teardown },
+    { "compress/db_splayed_set_forms", test_db_splayed_set_forms, rt_setup, rt_teardown },
+    { "compress/csv_parted_option",    test_csv_parted_option,    rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
