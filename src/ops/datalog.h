@@ -220,6 +220,7 @@ typedef struct {
     int         strata_sizes[DL_MAX_STRATA];         /* number of predicates per stratum */
     int         n_strata;
     uint32_t    flags;                                /* DL_FLAG_* bitmask */
+    ray_t*      first_err;                            /* first owned error behind eval_err, or NULL */
     bool        eval_err;                             /* set by compile/eval on
                                                          unrecoverable failure
                                                          (distinct from "rule

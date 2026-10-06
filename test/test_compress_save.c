@@ -4091,7 +4091,15 @@ static test_result_t test_datalog_sites_failed_decode(void) {
     TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
     ray_error_clear();
     TEST_ASSERT_TRUE(dl_eval(prog) != 0);
-    dl_program_free(prog);
+    TEST_ASSERT_TRUE(prog->first_err != NULL && RAY_IS_ERR(prog->first_err) &&
+                     strcmp(ray_err_code(prog->first_err), "corrupt") == 0);
+    dl_program_free(prog);                       /* releases the kept error */
+    {   /* a query over the datoms table returns the column's own error */
+        ray_error_clear();
+        ray_t* q = ray_eval_str("(query D (find ?x) (where (eav ?x ?p ?v)))");
+        test_result_t qr = t29_corrupt_at(q, "query", CS_TMP "/dl/e");
+        if (qr.status != TEST_PASS) return qr;
+    }
     ray_env_set(ray_sym_intern("D", 1), NULL);
     ray_release(d);
     PASS();
@@ -4184,6 +4192,37 @@ static test_result_t test_datalog_query_gen2_equal(void) {
     TEST_ASSERT_EQ_I((int)ray_table_nrows(r[0]), 50);
     TEST_ASSERT_TRUE(t29_same(r[0], r[1]));
     ray_release(r[0]); ray_release(r[1]);
+    PASS();
+}
+
+/* A join over a parted table whose segments are partly or wholly encoded
+ * (join_parted_seg_count, join_table_has_parted_col, the per-segment and
+ * flatten routes) gives the generation-0 answer, on either side. */
+static test_result_t test_join_sites_parted(void) {
+    ray_t* t0 = pdb_make(CS_TMP "/jp0", 0, false);
+    TEST_ASSERT_NOT_NULL(t0);
+    static const unsigned masks[] = { 7, 5 };
+    int64_t pv[3000], cv[3000];
+    for (int64_t i = 0; i < 3000; i++) { pv[i] = 5 * i + (i % 3); cv[i] = i; }
+    ray_t* P = t29_plain("b", pv, "c", cv, 3000);
+    for (int m = 0; m < 2; m++) {
+        char dir[64]; snprintf(dir, sizeof dir, CS_TMP "/jp%d", m + 1);
+        ray_t* tm = pdb_make(dir, masks[m], false);
+        TEST_ASSERT_NOT_NULL(tm);
+        for (int c = 0; c < 6; c++) {
+            int kind = c % 3 == 2 ? 1 : 0;
+            uint8_t jt = c % 3 == 1 ? 1 : 0;
+            bool parted_left = c < 3;
+            ray_t* r0 = parted_left ? t29_join(t0, P, kind, "b", "b", jt, NULL) : t29_join(P, t0, kind, "b", "b", jt, NULL);
+            ray_t* rm = parted_left ? t29_join(tm, P, kind, "b", "b", jt, NULL) : t29_join(P, tm, kind, "b", "b", jt, NULL);
+            bool ok = r0 && rm && !RAY_IS_ERR(r0) && !RAY_IS_ERR(rm) && t29_same(r0, rm);
+            if (r0) { if (RAY_IS_ERR(r0)) ray_error_free(r0); else ray_release(r0); }
+            if (rm) { if (RAY_IS_ERR(rm)) ray_error_free(rm); else ray_release(rm); }
+            TEST_ASSERT_FMT(ok, "mask %u case %d: answers differ", masks[m], c);
+        }
+        ray_release(tm);
+    }
+    ray_release(P); ray_release(t0);
     PASS();
 }
 
@@ -4280,6 +4319,7 @@ const test_entry_t compress_entries[] = {
     { "compress/tblop_sites_failed_decode",  test_tblop_sites_failed_decode,  rt_setup, rt_teardown },
     { "compress/datalog_sites_failed_decode", test_datalog_sites_failed_decode, rt_setup, rt_teardown },
     { "compress/datalog_sites_gen2_equal",   test_datalog_sites_gen2_equal,   rt_setup, rt_teardown },
+    { "compress/join_sites_parted",          test_join_sites_parted,          rt_setup, rt_teardown },
     { "compress/datalog_query_gen2_equal",   test_datalog_query_gen2_equal,   rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
