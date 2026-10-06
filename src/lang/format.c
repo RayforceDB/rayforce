@@ -23,6 +23,7 @@
 
 #include "lang/format.h"
 #include "lang/env.h"
+#include "table/table.h"
 #include "table/sym.h"
 #include "lang/eval.h"
 #include "ops/ops.h"    /* RAY_LAZY, ray_lazy_materialize */
@@ -52,6 +53,8 @@ typedef struct {
                          * appended (mode 2) */
     bool    io_err;     /* err was a failed write to sink */
     bool    flushed;    /* some output already reached sink */
+    char    cause_code[16];   /* code of the error that stopped a column from loading */
+    char    cause_msg[192];   /* its detail (names the column file) */
 } fmt_buf_t;
 
 #define FMT_SINK_FLUSH ((int64_t)1 << 20)
@@ -71,6 +74,8 @@ static void fmt_init(fmt_buf_t* b) {
     b->sink    = NULL;
     b->io_err  = false;
     b->flushed = false;
+    b->cause_code[0] = '\0';
+    b->cause_msg[0]  = '\0';
     b->block   = ray_alloc(256);
     if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
         b->err = true; b->err_msg = "cannot allocate the initial output buffer";
@@ -184,7 +189,9 @@ static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
     if (b->err) {
-        ray_t* e = ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
+        ray_t* e = b->cause_code[0]
+            ? ray_error(b->cause_code, "%s: %s", b->err_msg, b->cause_msg)
+            : ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
         fmt_destroy(b);
         return e;
     }
@@ -839,6 +846,23 @@ static void fmt_stream_rule(fmt_buf_t* b, const int32_t* w, int64_t n,
  * value in 10k rows wrote 100 MB of spaces). */
 #define FMT_SHOW_PAD_MAX 256
 
+/* Column ci as a plain vector.  A column that fails to materialize sets the
+ * builder's error (the thread-local message keeps the detail) and yields NULL;
+ * callers stop on b->err. */
+static ray_t* fmt_col_idx(fmt_buf_t* b, ray_t* tbl, int64_t ci) {
+    ray_t* c = ray_table_col_idx(tbl, ci);
+    if (c && RAY_IS_ERR(c)) {
+        const char* code = ray_err_code(c);
+        const char* msg  = ray_error_msg();
+        snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
+        snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
+        ray_error_free(c);
+        b->err = true; b->err_msg = "column failed to load";
+        return NULL;
+    }
+    return c;
+}
+
 static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
@@ -859,8 +883,10 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     for (int64_t ci = 0; ci < ncols; ci++) {
         ray_t* nm = ray_sym_str(ray_table_col_name(tbl, ci));
         names[ci] = (nm && !RAY_IS_ERR(nm)) ? nm : NULL;
-        ray_t* col = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col ? col->type : 0);
+        ray_col_meta_t m;
+        const char* tname = ray_type_name(ray_table_col_meta_idx(tbl, ci, &m) ? m.type : 0);
+        ray_t* col = fmt_col_idx(b, tbl, ci);
+        if (b->err) goto done;
         int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
         if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
         int32_t cell_w = 0;
@@ -895,8 +921,8 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     fmt_putc(b, '\n');
     fmt_puts(b, G_V);
     for (int64_t ci = 0; ci < ncols; ci++) {
-        ray_t* col = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col ? col->type : 0);
+        ray_col_meta_t m;
+        const char* tname = ray_type_name(ray_table_col_meta_idx(tbl, ci, &m) ? m.type : 0);
         fmt_centered(b, tname, (int32_t)strlen(tname), widths[ci]);
         fmt_puts(b, G_V);
     }
@@ -907,7 +933,9 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
         fmt_puts(b, G_V);
         for (int64_t ci = 0; ci < ncols; ci++) {
             const char* cs; int32_t cl;
-            fmt_stream_cell(&tmp, ray_table_get_col_idx(tbl, ci), ri, &cs, &cl);
+            ray_t* col = fmt_col_idx(b, tbl, ci);
+            if (b->err) goto done;
+            fmt_stream_cell(&tmp, col, ri, &cs, &cl);
             if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
             fmt_putc(b, ' ');
             fmt_putn(b, cs, cl);
@@ -957,7 +985,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         fmt_puts(b, "] (list ");
         for (int64_t i = 0; i < ncols; i++) {
             if (i > 0) fmt_putc(b, ' ');
-            ray_t* col = ray_table_get_col_idx(tbl, i);
+            ray_t* col = fmt_col_idx(b, tbl, i);
+            if (b->err) return;
             if (col) {
                 fmt_obj(b, col, mode);
             }
@@ -1066,8 +1095,18 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         }
 
         /* Column type */
-        ray_t* col_vec = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col_vec ? col_vec->type : 0);
+        ray_col_meta_t cm;
+        const char* tname = ray_type_name(ray_table_col_meta_idx(tbl, ci, &cm) ? cm.type : 0);
+        ray_t* col_vec = fmt_col_idx(b, tbl, ci);
+        if (b->err) {
+            for (int64_t k = 0; k <= ci; k++) if (name_refs[k]) ray_release(name_refs[k]);
+            if (heap_alloc) {
+                ray_free(heap_widths_blk); ray_free(heap_names_blk); ray_free(heap_nlen_blk);
+                ray_free(heap_types_blk); ray_free(heap_tlen_blk); ray_free(heap_refs_blk);
+                ray_free(heap_cells_blk);
+            }
+            return;
+        }
         col_types[ci]     = tname;
         col_type_lens[ci] = (int32_t)strlen(tname);
 

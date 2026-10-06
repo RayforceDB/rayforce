@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
+#include "table/table.h"
 #include "ops/idxop.h"       /* ray_index_carry_append: keep a hash index across concat */
 #include "lang/env.h"
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
@@ -172,8 +173,11 @@ void ray_lang_print(FILE* fp, ray_t* val) {
 
 /* Helper: format string with % placeholders, substituting args.
  * Returns a heap-allocated char* (caller must ray_free_raw) and sets *out_len.
- * If fmt has no %, returns NULL (caller falls back to plain print). */
-static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t nargs, int64_t arg_start, size_t* out_len) {
+ * If fmt has no %, returns NULL (caller falls back to plain print).  When an
+ * argument fails to format (a table column that fails to load), returns NULL
+ * with *err set to the owned error object; otherwise *err stays NULL. */
+static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t nargs, int64_t arg_start, size_t* out_len, ray_t** err) {
+    *err = NULL;
     /* Quick scan: any % in fmt? */
     int has_pct = 0;
     for (size_t i = 0; i < flen; i++) if (fmt[i] == '%') { has_pct = 1; break; }
@@ -249,6 +253,12 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                     if (a_owned) ray_release(a_owned);
                     continue;
                 }
+                if (formatted && RAY_IS_ERR(formatted)) {
+                    if (a_owned) ray_release(a_owned);
+                    ray_free_raw(buf);
+                    *err = formatted;
+                    return NULL;
+                }
                 if (formatted) ray_release(formatted);
                 tlen = snprintf(tmp, sizeof(tmp), "<type:%d>", a->type);
             }
@@ -279,7 +289,9 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
         const char* fmt = ray_str_ptr(args[0]);
         size_t flen = ray_str_len(args[0]);
         size_t out_len = 0;
-        char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len);
+        ray_t* ferr;
+        char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
+        if (ferr) return ferr;
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fputc('\n', stdout);
@@ -307,7 +319,9 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
         const char* fmt = ray_str_ptr(args[0]);
         size_t flen = ray_str_len(args[0]);
         size_t out_len = 0;
-        char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len);
+        ray_t* ferr;
+        char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
+        if (ferr) return ferr;
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fflush(stdout);
@@ -358,7 +372,9 @@ ray_t* ray_format_fn(ray_t** args, int64_t n) {
     const char* fmt = ray_str_ptr(args[0]);
     size_t flen = ray_str_len(args[0]);
     size_t out_len = 0;
-    char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len);
+    ray_t* ferr;
+    char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
+    if (ferr) return ferr;
     if (result) {
         ray_t* s = ray_str(result, out_len);
         ray_free_raw(result);
@@ -417,11 +433,16 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(result)) { ray_release(tbl); return result; }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
         int64_t col_name = ray_table_col_name(tbl, c);
+        ray_col_meta_t cm;
+        if (!ray_table_col_meta_idx(tbl, c, &cm)) continue;
+        /* Only an I64 column is read; any other is carried over still encoded. */
+        ray_t* col = (cm.type == RAY_I64) ? ray_table_col_idx(tbl, c) : ray_table_get_col_enc_idx(tbl, c);
+        if (!col) col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) { ray_release(result); ray_release(tbl); return col; }
         if (!col) continue;
 
-        if (col->type == RAY_I64) {
+        if (cm.type == RAY_I64) {
             /* Try to resolve: convert to SYM only if ALL positive values
              * are valid sym IDs. This avoids converting entity-ID columns
              * where values are plain integers that happen to collide with
@@ -2017,7 +2038,8 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
             for (int64_t c = 0; c < ncols; c++) {
                 int64_t col_name = ray_table_col_name(val, c);
-                ray_t* col_val = ray_table_get_col_idx(val, c);
+                ray_t* col_val = ray_table_col_idx(val, c);
+                if (col_val && RAY_IS_ERR(col_val)) { ray_release(keys); ray_release(vals); return col_val; }
                 keys = ray_vec_append(keys, &col_name);
                 if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
                 vals = ray_list_append(vals, col_val);
@@ -3736,12 +3758,14 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         if (RAY_IS_ERR(result)) return result;
         for (int64_t c = 0; c < ncols_a; c++) {
             int64_t col_name_a = ray_table_col_name(a, c);
-            ray_t* acol = ray_table_get_col_idx(a, c);
+            ray_t* acol = ray_table_col_idx(a, c);
+            if (acol && RAY_IS_ERR(acol)) { ray_release(result); return acol; }
             /* Find matching column in b by name */
             ray_t* bcol = NULL;
             for (int64_t j = 0; j < ncols_b; j++) {
                 if (ray_table_col_name(b, j) == col_name_a) {
-                    bcol = ray_table_get_col_idx(b, j);
+                    bcol = ray_table_col_idx(b, j);
+                    if (bcol && RAY_IS_ERR(bcol)) { ray_release(result); return bcol; }
                     break;
                 }
             }
@@ -3892,8 +3916,8 @@ ray_t* ray_ungroup_fn(ray_t* x) {
     /* Locate the nested (RAY_LIST) columns. */
     bool any_nested = false;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(x, c);
-        if (col && !RAY_IS_ERR(col) && col->type == RAY_LIST) { any_nested = true; break; }
+        ray_col_meta_t cm;
+        if (ray_table_col_meta_idx(x, c, &cm) && cm.type == RAY_LIST) { any_nested = true; break; }
     }
     /* No nested column → identity. */
     if (!any_nested) { ray_retain(x); return x; }
@@ -3908,8 +3932,11 @@ ray_t* ray_ungroup_fn(ray_t* x) {
     for (int64_t i = 0; i < nrows; i++) {
         int64_t n_i = -1;
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(x, c);
-            if (!col || RAY_IS_ERR(col) || col->type != RAY_LIST) continue;
+            ray_col_meta_t cm;
+            if (!ray_table_col_meta_idx(x, c, &cm) || cm.type != RAY_LIST) continue;
+            ray_t* col = ray_table_col_idx(x, c);
+            if (col && RAY_IS_ERR(col)) { ray_free_raw(counts); return col; }
+            if (!col) continue;
             ray_t* cell = ray_list_get(col, i);
             /* A valid nested cell is either an atom (length 1) or a typed
              * NON-LIST vector (length cell->len).  Anything else — NULL
@@ -3944,10 +3971,11 @@ ray_t* ray_ungroup_fn(ray_t* x) {
     if (!out || RAY_IS_ERR(out)) { ray_free_raw(counts); ray_release(idx); return out ? out : ray_error("oom", NULL); }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(x, c);
+        ray_t* col = ray_table_col_idx(x, c);
+        if (col && RAY_IS_ERR(col)) { ray_release(out); ray_release(idx); ray_free_raw(counts); return col; }
         int64_t name = ray_table_col_name(x, c);
         ray_t* newcol;
-        if (col && !RAY_IS_ERR(col) && col->type == RAY_LIST) {
+        if (col && col->type == RAY_LIST) {
             /* Nested: raze the per-row cells in row order. */
             newcol = ray_raze_fn(col);
             /* raze of an empty/all-empty list yields an empty LIST — leave
@@ -3959,7 +3987,7 @@ ray_t* ray_ungroup_fn(ray_t* x) {
                 ray_release(newcol); ray_release(out); ray_release(idx); ray_free_raw(counts);
                 return ray_error("length", "ungroup: razed column length mismatch, got %lld, expected %lld", (long long)ray_len(newcol), (long long)total);
             }
-        } else if (col && !RAY_IS_ERR(col)) {
+        } else if (col) {
             /* Flat: gather row i repeated n_i times. */
             newcol = gather_by_idx(col, idxd, total);
         } else {

@@ -906,7 +906,8 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
         if (RAY_IS_ERR(result)) return result;
         for (int64_t c = 0; c < ncols; c++) {
             int64_t cn = ray_table_col_name(vec, c);
-            ray_t* src_col = ray_table_get_col_idx(vec, c);
+            ray_t* src_col = ray_table_col_idx(vec, c);
+            if (src_col && RAY_IS_ERR(src_col)) { ray_release(result); return src_col; }
             ray_t* filtered = ray_filter_fn(src_col, mask);
             if (RAY_IS_ERR(filtered)) { ray_release(result); return filtered; }
             result = ray_table_add_col(result, cn, filtered);
@@ -1870,7 +1871,8 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             ray_t* result = ray_table_new(ncols);
             if (RAY_IS_ERR(result)) return result;
             for (int64_t i = 0; i < ncols; i++) {
-                ray_t* col = ray_table_get_col_idx(vec, i);
+                ray_t* col = ray_table_col_idx(vec, i);
+                if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
                 int64_t name_id = ray_table_col_name(vec, i);
                 ray_t* taken = ray_take_fn(col, n_obj);
                 if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
@@ -2055,7 +2057,8 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         ray_t* result = ray_table_new(ncols);
         if (RAY_IS_ERR(result)) return result;
         for (int64_t i = 0; i < ncols; i++) {
-            ray_t* col = ray_table_get_col_idx(vec, i);
+            ray_t* col = ray_table_col_idx(vec, i);
+            if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name_id = ray_table_col_name(vec, i);
             ray_t* taken = ray_take_fn(col, n_obj);
             if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
@@ -2425,7 +2428,8 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
      * direct `(at table 'col)` must materialize it so downstream `(at col i)` /
      * count / formatting see a dense vector instead of failing with `type`. */
     if (vec->type == RAY_TABLE && idx->type == -RAY_SYM) {
-        ray_t* col = ray_table_get_col(vec, idx->i64);
+        ray_t* col = ray_table_col(vec, idx->i64);
+        if (col && RAY_IS_ERR(col)) return col;
         if (!col) return ray_error("domain", "at: unknown table column");
         if (RAY_IS_PARTED(col->type)) return parted_to_flat_vec(col);
         if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
@@ -2450,7 +2454,8 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             int64_t key_id = ray_table_col_name(vec, c);
             keys = ray_vec_append(keys, &key_id);
             if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-            ray_t* col = ray_table_get_col_idx(vec, c);
+            ray_t* col = ray_table_col_idx(vec, c);
+            if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
             int alloc = 0;
             ray_t* val = collection_elem(col, row, &alloc);
             if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
@@ -2478,7 +2483,8 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         ray_t* result = ray_table_new(ncols);
         if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(vec, c);
+            ray_t* col = ray_table_col_idx(vec, c);
+            if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name = ray_table_col_name(vec, c);
             if (!col) continue;
             ray_t* gathered = gather_by_idx(col, ids, nidx);
@@ -4191,7 +4197,8 @@ ray_t* ray_fills_fn(ray_t* x) {
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
 
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(x, c);
+            ray_t* col = ray_table_col_idx(x, c);
+            if (col && RAY_IS_ERR(col)) { ray_release(out); return col; }
             ray_t* filled = fills_vec_eager(col);
             if (!filled || RAY_IS_ERR(filled)) {
                 ray_release(out);

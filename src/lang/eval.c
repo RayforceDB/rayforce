@@ -1832,7 +1832,8 @@ ray_t* ray_value_fn(ray_t* x) {
         ray_t* result = ray_list_new(ncols);
         if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
         for (int64_t i = 0; i < ncols; i++) {
-            ray_t* c = ray_table_get_col_idx(x, i);
+            ray_t* c = ray_table_col_idx(x, i);
+            if (c && RAY_IS_ERR(c)) { ray_release(result); return c; }
             result = ray_list_append(result, c);
             if (RAY_IS_ERR(result)) return result;
         }

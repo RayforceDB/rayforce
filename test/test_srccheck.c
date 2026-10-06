@@ -35,10 +35,7 @@
 static const char* const srccheck_pending[] = {
     "src/ops/query.c", "src/ops/datalog.c", "src/ops/group.c", "src/ops/agg_engine.c",
     "src/ops/join.c", "src/ops/tblop.c", "src/ops/exec.c", "src/ops/filter.c", "src/ops/sort.c",
-    "src/ops/collection.c", "src/ops/builtins.c", "src/ops/traverse.c", 
-    "src/ops/window.c", "src/ops/pivot.c", "src/lang/format.c",
-    "src/ops/rerank.c", "src/ops/linkop.c", "src/ops/graph_builtin.c",
-    "src/table/dict.c", "src/ops/string.c", "src/lang/eval.c",
+    "src/ops/window.c", "src/ops/pivot.c",
     NULL,
 };
 

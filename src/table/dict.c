@@ -169,7 +169,7 @@ ray_t* ray_dict_probe_sym_borrowed(ray_t* d, int64_t sym_id) {
 ray_t* ray_container_probe_sym(ray_t* v, int64_t sym_id) {
     if (!v || RAY_IS_ERR(v)) return NULL;
     if (v->type == RAY_DICT) return ray_dict_probe_sym_borrowed(v, sym_id);
-    if (v->type == RAY_TABLE) return ray_table_get_col(v, sym_id);
+    if (v->type == RAY_TABLE) return ray_table_col(v, sym_id);   /* plain column or owned error */
     return NULL;
 }
 

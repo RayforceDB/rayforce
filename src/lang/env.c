@@ -352,6 +352,12 @@ ray_t* ray_env_get(int64_t sym_id) {
     ray_t* v = env_lookup_flat(segs[0]);
     for (int i = 1; v && i < n; i++) {
         v = ray_container_probe_sym(v, segs[i]);
+        if (v && RAY_IS_ERR(v)) {
+            /* A borrowed-ref API has no channel for the owned error: report
+             * "undefined"; ray_env_resolve (the evaluator's path) surfaces it. */
+            ray_error_free(v);
+            return NULL;
+        }
     }
     return v;
 }
@@ -400,7 +406,13 @@ ray_t* ray_env_resolve(int64_t sym_id) {
             }
             next_fresh = (next != NULL);
         }
-        if (!next) next = ray_container_probe_sym(v, segs[i]);
+        if (!next) {
+            next = ray_container_probe_sym(v, segs[i]);
+            if (next && RAY_IS_ERR(next)) {   /* a column that failed to load */
+                if (fresh) ray_release(v);
+                return next;
+            }
+        }
         if (next) {
             if (fresh) ray_release(v);
             v = next;

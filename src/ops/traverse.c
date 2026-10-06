@@ -977,7 +977,8 @@ ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
     /* Find weight column in edge properties */
     int64_t weight_sym = ext->graph.weight_col_sym;
     ray_t* props = rel->fwd.props;
-    ray_t* weight_vec = ray_table_get_col(props, weight_sym);
+    ray_t* weight_vec = ray_table_col(props, weight_sym);
+    if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
     if (!weight_vec || RAY_IS_ERR(weight_vec)) return ray_error("schema", NULL);
     if (weight_vec->type != RAY_F64) return ray_error("schema", NULL);
     double* weights = (double*)ray_data(weight_vec);
@@ -1980,7 +1981,8 @@ ray_t* exec_mst(ray_graph_t* g, ray_op_t* op) {
     if (n <= 0) return ray_error("length", "graph.mst: graph must have at least one node, got %lld", (long long)n);
 
     int64_t weight_sym = ext->graph.weight_col_sym;
-    ray_t* weight_vec = ray_table_get_col(rel->fwd.props, weight_sym);
+    ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
+    if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
     if (!weight_vec || weight_vec->type != RAY_F64) return ray_error("schema", NULL);
     double* weights = (double*)ray_data(weight_vec);
 
@@ -2287,13 +2289,16 @@ ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
 
     /* Resolve weight column from edge properties */
     int64_t weight_sym = ext->graph.weight_col_sym;
-    ray_t* weight_vec = ray_table_get_col(rel->fwd.props, weight_sym);
+    ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
+    if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
     if (!weight_vec || RAY_IS_ERR(weight_vec)) return ray_error("schema", NULL);
     double* weights_arr = (double*)ray_data(weight_vec);
 
     /* Resolve coordinate columns from node properties */
-    ray_t* lat_vec = ray_table_get_col(np, ext->graph.coord_col_syms[0]);
-    ray_t* lon_vec = ray_table_get_col(np, ext->graph.coord_col_syms[1]);
+    ray_t* lat_vec = ray_table_col(np, ext->graph.coord_col_syms[0]);
+    if (lat_vec && RAY_IS_ERR(lat_vec)) return lat_vec;
+    ray_t* lon_vec = ray_table_col(np, ext->graph.coord_col_syms[1]);
+    if (lon_vec && RAY_IS_ERR(lon_vec)) return lon_vec;
     if (!lat_vec || !lon_vec) return ray_error("schema", NULL);
     double* lat = (double*)ray_data(lat_vec);
     double* lon = (double*)ray_data(lon_vec);
@@ -2431,7 +2436,8 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
         return ray_error("range", "graph.k-shortest: src and dst node ids must be in 0..%lld, got %lld and %lld", (long long)(n - 1), (long long)src_id, (long long)dst_id);
 
     int64_t weight_sym = ext->graph.weight_col_sym;
-    ray_t* weight_vec = ray_table_get_col(rel->fwd.props, weight_sym);
+    ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
+    if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
     if (!weight_vec || RAY_IS_ERR(weight_vec)) return ray_error("schema", NULL);
     double* weights_k = (double*)ray_data(weight_vec);
 

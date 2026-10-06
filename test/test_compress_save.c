@@ -362,6 +362,189 @@ static test_result_t test_failed_decode_propagates(void) {
     PASS();
 }
 
+/* Builtins, formatting, links, graph and rerank ops read table columns through
+ * the accessors: a column that fails to materialize surfaces as its own error
+ * (code and column path), never a crash or a wrong value. */
+static test_result_t test_builtins_failed_decode(void) {
+    ray_t* t = bind_corrupt_table();
+    TEST_ASSERT_TRUE(t != NULL);
+    static const char* const verbs[] = {
+        "(format \"%\" t)", "(print \"%\" t)", "(value t)", "(at t 'a)", "(at t 0)", "(at t [0 1 2])",
+        "(take t 2)", "(take t [1 2])", "(filter t (> (til 3000) 5))",
+        "(fills t)", "(concat t t)", "(resolve t)", "(as 'DICT t)", "t.a",
+        "(concat (table ['a 'b] (list (til 3000) (til 3000))) t)",
+        "(.graph.build t 'b 'b 'a)", "(.graph.build t 'a 'b)",
+        "(do (set lk (.col.link 't [0 1 2])) lk.a)",
+    };
+    for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
+        ray_error_clear();
+        ray_t* r = ray_eval_str(verbs[i]);
+        { test_result_t rr = expect_corrupt(r, verbs[i]); if (rr.status != TEST_PASS) return rr; }
+    }
+    /* ungroup: a nested column beside a flat column that fails to load */
+    {
+        ray_t* nested = ray_list_new(3000);
+        for (int i = 0; i < 3000; i++) { ray_t* e = ray_i64(i); nested = ray_list_append(nested, e); ray_release(e); }
+        ray_t* h = ray_table_new(2);
+        h = ray_table_add_col(h, ray_sym_intern("n", 1), nested); ray_release(nested);
+        ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
+        TEST_ASSERT_TRUE(enc != NULL);
+        h = ray_table_add_col(h, ray_sym_intern("a", 1), enc);
+        TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h));
+        ray_error_clear();
+        ray_t* u = ray_ungroup_fn(h);
+        test_result_t rr = expect_corrupt(u, "ungroup");
+        ray_release(h);
+        if (rr.status != TEST_PASS) return rr;
+    }
+    /* the formatter: every mode, and the streamed one */
+    for (int mode = 0; mode <= 2; mode++) {
+        ray_error_clear();
+        ray_t* f = ray_fmt(t, mode);
+        { test_result_t rr = expect_corrupt(f, "ray_fmt"); if (rr.status != TEST_PASS) return rr; }
+    }
+    FILE* sink = tmpfile();
+    TEST_ASSERT_TRUE(sink != NULL);
+    TEST_ASSERT_TRUE(ray_fmt_write(sink, t) != RAY_OK);
+    fclose(sink);
+    /* a healthy column of the same table still reads */
+    ray_t* b = ray_eval_str("(at t 'b)");
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b) && b->len == 3000);
+    ray_release(b);
+    ray_release(t);
+    PASS();
+}
+
+/* A table whose columns `names` all alias the encoded column `a` of `t`. */
+static ray_t* alias_enc_table(ray_t* t, const char* const* names, int n) {
+    ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
+    if (!enc) return NULL;
+    ray_t* h = ray_table_new(n);
+    for (int i = 0; i < n; i++)
+        h = ray_table_add_col(h, ray_sym_intern(names[i], (int64_t)strlen(names[i])), enc);
+    return h;
+}
+
+/* Graph traversals read the edge-weight and coordinate columns through the
+ * accessors; one that fails to load is reported, not read as garbage. */
+static test_result_t test_traverse_failed_decode(void) {
+    ray_t* t = bind_corrupt_table();
+    TEST_ASSERT_TRUE(t != NULL);
+    static const char* const wn[] = { "weight" };
+    static const char* const cn[] = { "lat", "lon" };
+    ray_t* props = alias_enc_table(t, wn, 1);
+    ray_t* np    = alias_enc_table(t, cn, 2);
+    TEST_ASSERT_TRUE(props && np && !RAY_IS_ERR(props) && !RAY_IS_ERR(np));
+    int64_t esrc[] = {0, 1}, edst[] = {1, 2};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, esrc, 2);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, edst, 2);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ray_sym_intern("src", 3), sv); ray_release(sv);
+    edges = ray_table_add_col(edges, ray_sym_intern("dst", 3), dv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 3, 3, false);
+    TEST_ASSERT_TRUE(rel != NULL);
+    ray_rel_set_props(rel, props);
+    for (int which = 0; which < 4; which++) {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_t* s0 = ray_i64(0); ray_t* d2 = ray_i64(2);
+        ray_op_t* so = ray_const_atom(g, s0); ray_op_t* dop = ray_const_atom(g, d2);
+        ray_release(s0); ray_release(d2);
+        ray_op_t* op = which == 0 ? ray_dijkstra(g, so, NULL, rel, "weight", 10)
+                     : which == 1 ? ray_mst(g, rel, "weight")
+                     : which == 2 ? ray_astar(g, so, dop, rel, "weight", "lat", "lon", np, 10)
+                                  : ray_k_shortest(g, so, dop, rel, "weight", 2);
+        TEST_ASSERT_TRUE(op != NULL);
+        ray_error_clear();
+        ray_t* r = ray_execute(g, op);
+        test_result_t rr = expect_corrupt(r, which == 0 ? "dijkstra" : which == 1 ? "mst" : which == 2 ? "astar" : "k-shortest");
+        ray_graph_free(g);
+        if (rr.status != TEST_PASS) return rr;
+    }
+    /* astar: a healthy weight column, failing coordinate columns */
+    {
+        ray_t* wv = ray_vec_new(RAY_F64, 2); wv->len = 2;
+        ((double*)ray_data(wv))[0] = 1.0; ((double*)ray_data(wv))[1] = 1.0;
+        ray_t* good = ray_table_new(1);
+        good = ray_table_add_col(good, ray_sym_intern("weight", 6), wv); ray_release(wv);
+        ray_rel_set_props(rel, good); ray_release(good);
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_t* s0 = ray_i64(0); ray_t* d2 = ray_i64(2);
+        ray_op_t* so = ray_const_atom(g, s0); ray_op_t* dop = ray_const_atom(g, d2);
+        ray_release(s0); ray_release(d2);
+        ray_op_t* op = ray_astar(g, so, dop, rel, "weight", "lat", "lon", np, 10);
+        TEST_ASSERT_TRUE(op != NULL);
+        ray_error_clear();
+        ray_t* r = ray_execute(g, op);
+        test_result_t rr = expect_corrupt(r, "astar coordinates");
+        ray_graph_free(g);
+        if (rr.status != TEST_PASS) return rr;
+    }
+    ray_rel_free(rel);
+    ray_release(edges); ray_release(props); ray_release(np);
+    ray_release(t);
+    PASS();
+}
+
+/* LIKE over a scanned column that fails to load reports that failure, and a
+ * dotted env path through such a table is undefined for the borrowed lookup
+ * and an error for the evaluator's. */
+static test_result_t test_like_env_failed_decode(void) {
+    ray_t* t = bind_corrupt_table();
+    TEST_ASSERT_TRUE(t != NULL);
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* col = ray_scan(g, "a");
+    ray_op_t* pat = ray_const_str(g, "1*", 2);
+    ray_op_t* lk  = ray_like(g, col, pat);
+    ray_error_clear();
+    ray_t* r = ray_execute(g, lk);
+    test_result_t rr = expect_corrupt(r, "like");
+    ray_graph_free(g);
+    if (rr.status != TEST_PASS) return rr;
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_NULL(ray_env_get(ray_sym_intern("t.a", 3)));
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);   /* the error was freed */
+    TEST_ASSERT_NOT_NULL(ray_env_get(ray_sym_intern("t.b", 3)));
+    ray_release(t);
+    PASS();
+}
+
+/* A row projection after a nearest-neighbour step reads every column of the
+ * source: the one that fails to load surfaces as the result. */
+static test_result_t test_rerank_failed_decode(void) {
+    ray_t* t = bind_corrupt_table();
+    TEST_ASSERT_TRUE(t != NULL);
+    ray_t* emb = ray_list_new(3000);
+    float row[3] = {1.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 3000; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_F32, row, 3);
+        emb = ray_list_append(emb, v); ray_release(v);
+    }
+    ray_t* h = ray_table_new(2);
+    h = ray_table_add_col(h, ray_sym_intern("emb", 3), emb); ray_release(emb);
+    ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
+    TEST_ASSERT_TRUE(enc != NULL);
+    h = ray_table_add_col(h, ray_sym_intern("a", 1), enc);
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h));
+    /* run the rerank op itself (the query path decodes a table before it gets there) */
+    static const float q[3] = {1.0f, 0.0f, 0.0f};
+    int64_t cols[2] = { ray_sym_intern("emb", 3), ray_sym_intern("a", 1) };
+    for (int i = 0; i < 2; i++) {
+        ray_graph_t* g = ray_graph_new(h);
+        ray_op_t* root = ray_const_table(g, h);
+        root = ray_knn_rerank(g, root, cols[i], q, 3, 3, RAY_HNSW_COSINE);
+        TEST_ASSERT_TRUE(root != NULL);
+        ray_error_clear();
+        ray_t* r = ray_execute(g, root);
+        { test_result_t rr = expect_corrupt(r, i == 0 ? "rerank projection" : "rerank column"); if (rr.status != TEST_PASS) { ray_graph_free(g); return rr; } }
+        ray_graph_free(g);
+    }
+    ray_release(h);
+    ray_release(t);
+    PASS();
+}
+
 /* A generation-0 table and the same table loaded from generation 2 serialize
  * to identical bytes. */
 static test_result_t test_serde_byte_identity(void) {
@@ -1358,6 +1541,20 @@ static const char* ev_code(const char* src) {
     snprintf(code, sizeof code, "%s", (r && RAY_IS_ERR(r)) ? ray_err_code(r) : "");
     if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
     return code;
+}
+
+/* The user-visible values built from a generation-2 table are plain. */
+static test_result_t test_user_values_are_plain(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['a 'b] (list [1 2 3] [4 5 6])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/uv\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u (.db.splayed.get \"" CS_TMP "/uv\"))"), "");
+    ray_t* a = ray_eval_str("(at u 'a)");
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && a->type == RAY_I64 && a->len == 3);
+    ray_release(a);
+    ray_t* s = ray_eval_str("(format \"%\" u)");
+    TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
+    ray_release(s);
+    PASS();
 }
 
 static test_result_t test_db_splayed_set_forms(void) {
@@ -3094,6 +3291,11 @@ const test_entry_t compress_entries[] = {
     { "compress/has_nulls_parted",              test_has_nulls_parted,               cs_setup, cs_teardown },
     { "compress/parted_gen2_loads",           test_parted_gen2_loads,            rt_setup, rt_teardown },
     { "compress/meta_without_decode",           test_meta_without_decode,            cs_setup, cs_teardown },
+    { "compress/user_values_are_plain",         test_user_values_are_plain,          rt_setup, rt_teardown },
+    { "compress/builtins_failed_decode",        test_builtins_failed_decode,         rt_setup, rt_teardown },
+    { "compress/rerank_failed_decode",          test_rerank_failed_decode,           rt_setup, rt_teardown },
+    { "compress/traverse_failed_decode",        test_traverse_failed_decode,         rt_setup, rt_teardown },
+    { "compress/like_env_failed_decode",        test_like_env_failed_decode,         rt_setup, rt_teardown },
     { "compress/legacy_getters",                test_legacy_getters,                 cs_setup, cs_teardown },
     { "compress/concurrent_one_materialization",test_concurrent_one_materialization, cs_setup, cs_teardown },
     { "compress/serde_encoded_table",           test_serde_encoded_table,            cs_setup, cs_teardown },

@@ -358,7 +358,8 @@ static ray_t* exec_like_input(ray_graph_t* g, ray_op_t* input_op) {
         scan_tbl = g->table;
     if (!scan_tbl) return exec_node(g, input_op);
 
-    ray_t* col = ray_table_get_col(scan_tbl, ext->sym);
+    ray_t* col = ray_table_col(scan_tbl, ext->sym);
+    if (col && RAY_IS_ERR(col)) return col;
     if (!col) return exec_node(g, input_op);
     if (RAY_IS_PARTED(col->type)) {
         int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
