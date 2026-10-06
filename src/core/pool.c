@@ -231,7 +231,11 @@ static _Atomic(uint64_t) pool_scan_req_bytes, pool_scan_req_ranges;
 
 static void pool_scan_willneed(const ray_pool_scan_t* s, uint32_t c, int64_t a, int64_t b) {
     size_t bytes = (size_t)(b - a) * s->esz[c];
-    ray_vm_advise_willneed((void*)(s->base[c] + (size_t)a * s->esz[c]), bytes);
+    void* p = (void*)(s->base[c] + (size_t)a * s->esz[c]);
+    /* Rows an earlier dispatch of the query requested are in the page cache
+     * already (or on their way in): asking again only walks those pages. */
+    if (ray_vm_resident(p, bytes)) return;
+    ray_vm_advise_willneed(p, bytes);
     atomic_fetch_add_explicit(&pool_scan_req_bytes, bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&pool_scan_req_ranges, 1, memory_order_relaxed);
 }
