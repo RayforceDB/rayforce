@@ -1027,10 +1027,6 @@ fail:
     return NULL;
 }
 
-/* A caller waiting on another thread's attempt (ray_enc_once_get) does not
- * observe its own cancellation: it waits for the attempt, which polls
- * ray_interrupted() once per chunk and ends with a transient "cancel"
- * (the state then resets), so the wait is bounded by one chunk's decode. */
 /* ---- Parted object (Task 12) ---- */
 
 bool ray_enccol_is_parted(ray_t* encv) {
@@ -1048,20 +1044,17 @@ ray_t* ray_enccol_parted_new(ray_t* wrapper) {
     e->type = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
     e->len = ray_parted_nrows(wrapper);
     ray_t** segs = (ray_t**)ray_data(wrapper);
-    bool first = true;
     for (int64_t i = 0; i < wrapper->len; i++) {
         if (!segs[i]) continue;
         ray_col_meta_t m;
         if (!ray_col_meta_of(segs[i], &m)) continue;
-        if (first) {                                    /* width / SORTED of the first segment */
-            e->attrs = m.attrs & COL_DISK_ATTRS_MASK;
-            first = false;
-        }
         bool nulls = m.null_count >= 0 ? m.null_count > 0 : (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
-        if (nulls) e->attrs |= RAY_ATTR_HAS_NULLS;      /* OR across every segment */
-        if (!e->path[0] && segs[i]->type == RAY_ENCCOL)
-            snprintf(e->path, sizeof e->path, "%s", ray_enccol_of(segs[i])->path);
+        if (nulls) e->attrs |= RAY_ATTR_HAS_NULLS;      /* OR across every segment; width and
+                                                         * SORTED are per-segment properties */
     }
+    /* Distinct from every segment's path: a segment-scoped failure (or test
+     * hook) never matches the wrapper itself. */
+    snprintf(e->path, sizeof e->path, "(parted)");
     ray_enc_once_init(&e->once);
     ray_enc_once_init(&e->dict_once);
     ray_retain(wrapper);
@@ -1109,6 +1102,9 @@ static void enc_seg_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
+static _Atomic(int) g_parted_mode;       /* test hook: 0 auto, 1 coordinator, 2 per-segment tasks */
+void ray_enccol_test_parted_mode(int mode) { atomic_store(&g_parted_mode, mode); }
+
 static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
     int64_t n = e->wrapper->len;
@@ -1129,10 +1125,22 @@ static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
     memset(ray_data(out), 0, (size_t)n * sizeof(ray_t*));
     enc_seg_ctx_t x = { (ray_t**)ray_data(e->wrapper), plain, res };
     ray_pool_t* pool = ray_pool_get();
-    if (n >= 2 && n <= (int64_t)UINT32_MAX && ray_pool_par_dispatch_ok(pool, n, 2))
-        ray_pool_dispatch_n(pool, enc_seg_task, &x, (uint32_t)n);
-    else
-        enc_seg_task(&x, 0, 0, n);
+    /* Per-segment tasks run their chunks serially (nested dispatch), so with
+     * fewer encoded segments left than workers the coordinator takes them one
+     * after another and each keeps full chunk parallelism.  Either way every
+     * segment is attempted and reported through its own result slot. */
+    int64_t n_enc = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* sg = x.in[i];
+        if (sg && sg->type == RAY_ENCCOL && !ray_enccol_of(sg)->decoded) n_enc++;
+    }
+    int mode = atomic_load(&g_parted_mode);
+    bool fan = n >= 2 && n <= (int64_t)UINT32_MAX && ray_pool_par_dispatch_ok(pool, n, 2) &&
+               n_enc >= (int64_t)pool->n_workers;
+    if (mode == 1) fan = false;
+    else if (mode == 2) fan = n >= 2 && n <= (int64_t)UINT32_MAX && ray_pool_par_dispatch_ok(pool, n, 2);
+    if (fan) ray_pool_dispatch_n(pool, enc_seg_task, &x, (uint32_t)n);
+    else enc_seg_task(&x, 0, 0, n);
     /* A task the pool skipped on cancel neither finished nor failed. */
     for (int64_t i = 0; i < n; i++)
         if (res[i].failed || !res[i].done) {        /* lowest-numbered failing segment */
@@ -1148,6 +1156,10 @@ static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
     return out;
 }
 
+/* A caller waiting on another thread's attempt (ray_enc_once_get) does not
+ * observe its own cancellation: it waits for the attempt, which polls
+ * ray_interrupted() once per chunk and ends with a transient "cancel"
+ * (the state then resets), so the wait is bounded by one chunk's decode. */
 ray_t* ray_enccol_materialize(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
     if (!e) return ray_error("type", "materialize: not an encoded column");

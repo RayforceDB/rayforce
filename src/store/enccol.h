@@ -113,6 +113,8 @@ void   ray_enccol_test_fail_path(const char* sub);
 /* interrupt_after: the nth chunk decoded successfully from now on calls
  * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */
 void   ray_enccol_test_interrupt_after(int64_t nth);
+/* Parted materialization: 0 auto, 1 always on the coordinator, 2 always per-segment tasks. */
+void   ray_enccol_test_parted_mode(int mode);
 void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a mismatched root */
 
 /* Wrap a plain-type parted wrapper (RAY_PARTED_BASE + base) whose segments

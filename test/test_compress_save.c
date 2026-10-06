@@ -468,6 +468,12 @@ static test_result_t test_parted_gen2_loads(void) {
         TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
         TEST_ASSERT_EQ_I(a->type, RAY_PARTED_BASE + RAY_I64);
         TEST_ASSERT_EQ_I(ray_parted_nrows(a), 6000);
+        ray_t** sg = (ray_t**)ray_data(a);
+        for (int i = 0; i < 2; i++) {
+            TEST_ASSERT_TRUE(sg[i] && sg[i]->type == RAY_I64 && sg[i]->len == 3000);
+            for (int64_t r = 0; r < 3000; r++)
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(sg[i]))[r], r * 3);
+        }
         ray_release(t);
     }
     PASS();
