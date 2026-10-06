@@ -103,10 +103,14 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end, uint8_t* bits);
 void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end, uint8_t* bits);
 
 /* Walk an OP_AND tree of leaf comparisons and populate fp_pred_t.
- * Returns 0 on success, -1 if any leaf can't be compiled or fan-in
- * exceeds FP_PRED_MAX_CHILDREN. */
+ * Returns 0 on success; -1 with *err NULL when a leaf is not supported
+ * (a decline: the caller takes the unfused path) or the fan-in exceeds
+ * FP_PRED_MAX_CHILDREN; -1 with an owned *err when binding or the plain
+ * request failed (OOM, a corrupt column): the caller returns that error.
+ * Call fp_pred_cleanup before releasing the graph (like_dom is borrowed
+ * from a bound source). */
 int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
-                    fp_pred_t* out);
+                    fp_pred_t* out, ray_t** err);
 
 void fp_pred_cleanup(fp_pred_t* p);
 

@@ -23,7 +23,17 @@
 
 #include "ops/colbind.h"
 #include "table/table.h"
+#include <stdatomic.h>
 #include <string.h>
+
+static _Atomic int64_t g_bind_fail_at;      /* test hook: fail the nth allocation */
+void ray_graph_bind_test_fail_alloc(int64_t nth) { atomic_store(&g_bind_fail_at, nth); }
+static bool bind_alloc_fails(void) {
+    int64_t v = atomic_load(&g_bind_fail_at);
+    while (v > 0)
+        if (atomic_compare_exchange_weak(&g_bind_fail_at, &v, v - 1)) return v == 1;
+    return false;
+}
 
 typedef struct { ray_t* tbl; int64_t sym; ray_col_src_t src; } colbind_ent_t;
 
@@ -40,6 +50,7 @@ ray_col_src_t* ray_graph_bind_col(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t
         if (b->e[i]->tbl == tbl && b->e[i]->sym == sym) return &b->e[i]->src;
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return NULL;          /* absent */
+    if (bind_alloc_fails()) { *err = ray_error("oom", "column bind"); return NULL; }
     if (!b) {
         b = ray_calloc_raw(sizeof *b);
         if (!b) { *err = ray_error("oom", "column bind"); return NULL; }

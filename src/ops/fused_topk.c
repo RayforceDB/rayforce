@@ -69,6 +69,18 @@ int ray_fused_topk_supported(ray_t* where_expr, ray_t* tbl) {
 
 #define FPK_MAX_KEYS 16
 
+/* Test hook: how often a fused select compiled its predicate (ran) and how
+ * often it declined to the unfused path. */
+static _Atomic uint64_t g_fpk_ran, g_fpk_declined;
+static void fpk_count(int declined) {
+    atomic_fetch_add_explicit(declined ? &g_fpk_declined : &g_fpk_ran, 1, memory_order_relaxed);
+}
+void ray_fused_topk_counters(uint64_t* ran, uint64_t* declined) {
+    *ran = atomic_load(&g_fpk_ran);
+    *declined = atomic_load(&g_fpk_declined);
+}
+void ray_fused_topk_counters_reset(void) { atomic_store(&g_fpk_ran, 0); atomic_store(&g_fpk_declined, 0); }
+
 typedef struct {
     int8_t      type;
     uint8_t     attrs;
@@ -556,17 +568,20 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     if (where_expr) {
         ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
         if (!pred_dag) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
-        if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
+        ray_t* cerr = NULL;
+        if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred, &cerr) != 0) {
             fp_pred_cleanup(&ctx.pred);
             ray_graph_free(g);
             fpk_unpin_keys(ctx.keys, n_sort_keys);
-            return NULL;
+            if (!cerr) fpk_count(1);
+            return cerr;                 /* NULL: a decline; else the bind failure */
         }
+        fpk_count(0);
     }
 
     if (sym_needed) {
         ray_sym_strings_borrow(&ctx.sym_strings, &ctx.sym_count);
-        if (!ctx.sym_strings) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
+        if (!ctx.sym_strings) { fp_pred_cleanup(&ctx.pred); ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
     }
     atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
 
@@ -663,8 +678,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         result = ray_table_add_col(result, alias, col);
         ray_release(col);
     }
+    fp_pred_cleanup(&ctx.pred);          /* before the graph: like_dom is borrowed from a bind */
     ray_graph_free(g);
-    fp_pred_cleanup(&ctx.pred);
     if (!build_ok) {
         ray_release(result);
         return ray_error("schema", NULL);
@@ -818,11 +833,14 @@ ray_t* ray_fused_take_select(ray_t* tbl,
     if (!g) return NULL;
     ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
     if (!pred_dag) { ray_graph_free(g); return NULL; }
-    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
+    ray_t* cerr = NULL;
+    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred, &cerr) != 0) {
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
-        return NULL;
+        if (!cerr) fpk_count(1);
+        return cerr;                     /* NULL: a decline; else the bind failure */
     }
+    fpk_count(0);
 
     ray_pool_t* pool = ray_pool_get();
     uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
@@ -894,8 +912,8 @@ ray_t* ray_fused_take_select(ray_t* tbl,
         result = ray_table_add_col(result, alias, col);
         ray_release(col);
     }
+    fp_pred_cleanup(&ctx.pred);          /* before the graph: like_dom is borrowed from a bind */
     ray_graph_free(g);
-    fp_pred_cleanup(&ctx.pred);
     if (!build_ok) {
         ray_release(result);
         return ray_error("schema", NULL);

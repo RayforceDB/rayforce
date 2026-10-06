@@ -989,7 +989,7 @@ static test_result_t test_fused_typed_comparisons(void) {
                 ray_op_t* rhs = ray_const_atom(graph, constant);
                 ray_op_t* predicate = ctors[op](graph, &graph->nodes[id], rhs);
                 fp_pred_t compiled = {0};
-                TEST_ASSERT_FMT(fp_compile_pred(graph, predicate, tbl, &compiled) == 0,
+                TEST_ASSERT_FMT(fp_compile_pred(graph, predicate, tbl, &compiled, &(ray_t*){NULL}) == 0,
                                 "fused %s comparison %d declined", ray_type_name(types[t]), op);
                 uint8_t bits[4]; fp_eval_pred(&compiled, 0, 4, bits);
                 for (int r = 0; r < 4; r++) {

@@ -31,9 +31,11 @@
  * and name; no decode).  NULL with *err NULL when absent; NULL with an
  * owned *err on failure (OOM).  Binds are made on the thread executing the
  * graph, before any pool dispatch that reads them; the returned source is
- * borrowed from the graph and valid until ray_graph_free. */
+ * borrowed from the graph and valid until ray_graph_free.  `tbl` must
+ * outlive the graph: the dedup key is its raw pointer. */
 ray_col_src_t* ray_graph_bind_col(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t** err);
 void           ray_graph_binds_free(ray_graph_t* g);
 uint32_t       ray_graph_binds_count(const ray_graph_t* g);   /* tests */
+void           ray_graph_bind_test_fail_alloc(int64_t nth);   /* tests: fail the nth bind (0 = off) */
 
 #endif /* RAY_COLBIND_H */

@@ -1615,7 +1615,7 @@ static test_result_t test_zone_skip_keeps_nulls_fused_pred(void) {
         zn_op = ops[k];
         ray_graph_t* g = ray_graph_new(tbl);
         fp_pred_t fp;
-        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp) == 0, "fp compiles");
+        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp, &(ray_t*){NULL}) == 0, "fp compiles");
         for (int64_t ms = 0; ms < ZN_ROWS; ms += 1024)
             fp_eval_pred(&fp, ms, ms + 1024, bits + ms);
         for (int64_t i = 0; i < ZN_ROWS; i++)

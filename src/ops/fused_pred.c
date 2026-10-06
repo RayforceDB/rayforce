@@ -105,8 +105,11 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
     }
 }
 
-/* Metadata forms of fp_col_supported_op / fp_col_supported: nullability
- * from ray_table_col_has_nulls, never a decode. */
+/* Planning-time admission by metadata (the bound-source forms are
+ * fp_src_supported_op / fp_src_supported below): numeric, temporal, STR and
+ * GUID comparisons have an explicit typed leg with null-as-minimum
+ * ordering, SYM equality uses domain codes, anything else needs a null-free
+ * column from ray_table_col_has_nulls, never a decode. */
 static int fp_meta_supported_op(ray_t* tbl, int64_t sym, const ray_col_meta_t* m, int eq_or_ne) {
     if (m->type >= RAY_BOOL && m->type <= RAY_TIMESTAMP) return 1;
     if (m->type == RAY_GUID || m->type == RAY_STR) return 1;
@@ -710,17 +713,18 @@ void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end,
     }
 }
 
-/* Source forms of fp_col_supported_op / fp_col_supported.  Generation 0
- * keeps the exact payload test; an encoded source answers from its
- * directory null counts (exact), never a decode. */
-/* Numeric, temporal, STR and GUID comparisons have an explicit typed leg
- * with null-as-minimum ordering. SYM equality uses domain codes. IN keeps
- * its stricter null-free admission because it uses a different evaluator. */
+/* Nullability of a bound source.  Generation 0 keeps the exact payload
+ * test; an encoded source answers from its directory null counts (exact),
+ * never a decode. */
 static int fp_src_has_nulls(const ray_col_src_t* s) {
     if (s->obj->type != RAY_ENCCOL && ray_is_vec(s->obj)) return ray_vec_has_nulls(s->obj);
     return s->may_null;
 }
 
+/* Numeric, temporal, STR and GUID comparisons have an explicit typed leg
+ * with null-as-minimum ordering. SYM equality uses domain codes. Any other
+ * form needs a null-free source; IN keeps that stricter admission
+ * (fp_src_supported) because it uses a different evaluator. */
 static int fp_src_supported_op(const ray_col_src_t* s, int eq_or_ne) {
     if (s->type >= RAY_BOOL && s->type <= RAY_TIMESTAMP) return 1;
     if (s->type == RAY_GUID || s->type == RAY_STR) return 1;
@@ -733,9 +737,9 @@ static int fp_src_supported(const ray_col_src_t* s) {
 }
 
 /* The step that captures a payload pointer asks for the plain column. */
-static int fp_src_plain(ray_col_src_t* s, ray_t** col) {
+static int fp_src_plain(ray_col_src_t* s, ray_t** col, ray_t** err) {
     ray_t* e = ray_col_src_plain(s, col);
-    if (e) { ray_error_free(e); return -1; }
+    if (e) { *err = e; return -1; }
     return 0;
 }
 
@@ -743,7 +747,7 @@ static int fp_src_plain(ray_col_src_t* s, ray_t** col) {
  * rhs) against `tbl`.  Returns 0 on success, -1 if the shape can't be
  * handled (caller should bail and let the unfused path run). */
 static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
-                          fp_cmp_t* out)
+                          fp_cmp_t* out, ray_t** err)
 {
     if (!pred_op || pred_op->arity != 2) return -1;
     out->fold = FP_FOLD_NONE;
@@ -773,7 +777,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
      * captured (R-READ: a decline takes the unfused scan path). */
     ray_t* berr = NULL;
     ray_col_src_t* src = ray_graph_bind_col(g, tbl, lext->sym, &berr);
-    if (berr) { ray_error_free(berr); return -1; }
+    if (berr) { *err = berr; return -1; }
     if (!src) return -1;
     if (src->parted || src->type == RAY_MAPCOMMON) return -1;
     out->src = src;
@@ -783,7 +787,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         ray_t* sv = rext->literal;
         if (!sv || !ray_is_vec(sv) || !fp_int_family(sv->type)) return -1;
         if (ray_len(sv) > 16) return -1;
-        if (fp_src_plain(src, &col) != 0) return -1;
+        if (fp_src_plain(src, &col, err) != 0) return -1;
         out->col_type  = col->type;
         out->col_attrs = col->attrs;
         out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
@@ -819,7 +823,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         if (src->type != RAY_STR && src->type != RAY_SYM) return -1;
         ray_t* cv_like = rext->literal;
         if (!cv_like || cv_like->type != -RAY_STR) return -1;
-        if (fp_src_plain(src, &col) != 0) return -1;
+        if (fp_src_plain(src, &col, err) != 0) return -1;
         out->col_type  = col->type;
         out->col_attrs = col->attrs;
         out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
@@ -874,7 +878,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         ray_t* cv_str = rext->literal;
         int64_t code = ray_col_src_dict_code(src, ray_str_ptr(cv_str), ray_str_len(cv_str));
         if (code != -2) {
-            if (fp_src_plain(src, &col) != 0) return -1;
+            if (fp_src_plain(src, &col, err) != 0) return -1;
             ray_index_t* dix = ray_index_payload(col->index);
             ray_t* codes = dix->u.dict.codes;
             if (!codes || RAY_IS_ERR(codes) || codes->len != col->len) return -1;
@@ -905,7 +909,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
      * forms like `(== date_col timestamp_const)` whose raw-unit
      * comparison is meaningless. */
     if (!fp_atom_col_compatible(cv->type, src->type)) return -1;
-    if (fp_src_plain(src, &col) != 0) return -1;
+    if (fp_src_plain(src, &col, err) != 0) return -1;
 
     out->col_type  = col->type;
     out->col_attrs = col->attrs;
@@ -1018,18 +1022,18 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
  * OP_AND node.  Returns 0 on success, -1 if a leaf can't be compiled or
  * the fan-in exceeds FP_PRED_MAX_CHILDREN. */
 static int fp_compile_pred_dag(ray_graph_t* g, ray_op_t* node, ray_t* tbl,
-                               fp_pred_t* out)
+                               fp_pred_t* out, ray_t** err)
 {
     if (!node) return -1;
     if (node->opcode == OP_AND) {
-        if (fp_compile_pred_dag(g, op_child(g, node, 0), tbl, out) != 0) return -1;
-        if (fp_compile_pred_dag(g, op_child(g, node, 1), tbl, out) != 0) return -1;
+        if (fp_compile_pred_dag(g, op_child(g, node, 0), tbl, out, err) != 0) return -1;
+        if (fp_compile_pred_dag(g, op_child(g, node, 1), tbl, out, err) != 0) return -1;
         return 0;
     }
     if (out->n_children >= FP_PRED_MAX_CHILDREN) return -1;
     fp_cmp_t tmp;
     memset(&tmp, 0, sizeof(tmp));
-    if (fp_compile_cmp(g, node, tbl, &tmp) != 0) {
+    if (fp_compile_cmp(g, node, tbl, &tmp, err) != 0) {
         if (tmp.aux_hdr) scratch_free(tmp.aux_hdr);
         return -1;
     }
@@ -1062,14 +1066,15 @@ static void fp_pred_order_children(fp_pred_t* p) {
 }
 
 int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
-                    fp_pred_t* out)
+                    fp_pred_t* out, ray_t** err)
 {
+    *err = NULL;
     memset(out, 0, sizeof(*out));
     out->n_children = 0;
     /* No predicate → const-true.  fp_eval_pred memsets bits to 1
      * when n_children == 0, so the worker treats every row as a hit. */
     if (!pred_op) return 0;
-    int rc = fp_compile_pred_dag(g, pred_op, tbl, out);
+    int rc = fp_compile_pred_dag(g, pred_op, tbl, out, err);
     if (rc == 0 && out->n_children > 1)
         fp_pred_order_children(out);
     return rc;

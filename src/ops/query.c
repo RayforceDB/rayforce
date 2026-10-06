@@ -9508,7 +9508,10 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
-                        if (res && RAY_IS_ERR(res)) ray_release(res);
+                        if (res && RAY_IS_ERR(res)) {      /* a failed bind: the query's error */
+                            ray_release(tbl);
+                            DICT_VIEW_CLOSE(dv); return res;
+                        }
                     }
                     if (n_sort_keys > 0 && k > 0 && k <= FPK_MAX_K && k < ray_table_nrows(tbl)) {
                         ray_t* res = ray_fused_topk_select(tbl, where_expr,
@@ -9522,7 +9525,10 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
-                        if (res && RAY_IS_ERR(res)) ray_release(res);
+                        if (res && RAY_IS_ERR(res)) {      /* a failed bind: the query's error */
+                            ray_release(tbl);
+                            DICT_VIEW_CLOSE(dv); return res;
+                        }
                     }
                 } else if (tv) {
                     ray_release(tv);

@@ -99,4 +99,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                              const int64_t* out_alias_syms,
                              uint32_t n_out);
 
+/* Test hooks: predicates compiled by the fused selects / declined. */
+void ray_fused_topk_counters(uint64_t* ran, uint64_t* declined);
+void ray_fused_topk_counters_reset(void);
+
 #endif /* RAY_OPS_FUSED_TOPK_H */
