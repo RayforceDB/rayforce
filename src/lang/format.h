@@ -52,8 +52,10 @@ void ray_fmt_print(FILE* fp, ray_t* obj, int mode);
 /* Write obj to fp in full, without display limits, streaming so memory
  * stays bounded (show).  RAY_ERR_IO if fp fails or if memory ran out after
  * part of the output was written (the part ends with an error marker);
- * RAY_ERR_OOM if memory ran out before anything was written. */
-ray_err_t ray_fmt_write(FILE* fp, ray_t* obj);
+ * RAY_ERR_OOM if memory ran out before anything was written.  A column that
+ * fails to load yields its own code and an owned error in *cause (free with
+ * ray_error_free); *cause is NULL otherwise. */
+ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause);
 
 /* Display settings */
 void ray_fmt_set_precision(int digits);

@@ -979,7 +979,7 @@ ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
     ray_t* props = rel->fwd.props;
     ray_t* weight_vec = ray_table_col(props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec || RAY_IS_ERR(weight_vec)) return ray_error("schema", NULL);
+    if (!weight_vec) return ray_error("schema", NULL);
     if (weight_vec->type != RAY_F64) return ray_error("schema", NULL);
     double* weights = (double*)ray_data(weight_vec);
 
@@ -2291,7 +2291,7 @@ ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
     int64_t weight_sym = ext->graph.weight_col_sym;
     ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec || RAY_IS_ERR(weight_vec)) return ray_error("schema", NULL);
+    if (!weight_vec) return ray_error("schema", NULL);
     double* weights_arr = (double*)ray_data(weight_vec);
 
     /* Resolve coordinate columns from node properties */
@@ -2438,7 +2438,7 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
     int64_t weight_sym = ext->graph.weight_col_sym;
     ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec || RAY_IS_ERR(weight_vec)) return ray_error("schema", NULL);
+    if (!weight_vec) return ray_error("schema", NULL);
     double* weights_k = (double*)ray_data(weight_vec);
 
     int64_t* fwd_off = (int64_t*)ray_data(rel->fwd.offsets);

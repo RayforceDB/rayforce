@@ -405,8 +405,24 @@ static test_result_t test_builtins_failed_decode(void) {
     }
     FILE* sink = tmpfile();
     TEST_ASSERT_TRUE(sink != NULL);
-    TEST_ASSERT_TRUE(ray_fmt_write(sink, t) != RAY_OK);
+    ray_t* cause = NULL;
+    TEST_ASSERT_TRUE(ray_fmt_write(sink, t, &cause) != RAY_OK);
+    { test_result_t rr = expect_corrupt(cause, "ray_fmt_write"); if (rr.status != TEST_PASS) return rr; }
     fclose(sink);
+    /* show reports the failed column as an error, freeing it (no leaked object) */
+    {
+        ray_error_clear();
+        ray_t* w0 = ray_eval_str("(show t)");   /* warm */
+        { test_result_t rr = expect_corrupt(w0, "show"); if (rr.status != TEST_PASS) return rr; }
+        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+        for (int i = 0; i < 4; i++) {
+            ray_error_clear();
+            ray_t* w = ray_eval_str("(show t)");
+            { test_result_t rr = expect_corrupt(w, "show"); if (rr.status != TEST_PASS) return rr; }
+        }
+        ray_mem_stats(&m1);
+        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+    }
     /* a healthy column of the same table still reads */
     ray_t* b = ray_eval_str("(at t 'b)");
     TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b) && b->len == 3000);

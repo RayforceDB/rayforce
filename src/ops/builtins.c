@@ -345,7 +345,12 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
         if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(stdout, "error"); continue; }
         /* show prints the whole value, streamed; the display limits belong
          * to the REPL and to print. */
-        ray_err_t e = ray_fmt_write(stdout, args[i]);
+        ray_t* cause;
+        ray_err_t e = ray_fmt_write(stdout, args[i], &cause);
+        if (cause) {   /* a column failed to load: report it, output already written stays */
+            fflush(stdout);
+            return cause;
+        }
         if (e == RAY_OK || e == RAY_ERR_IO) continue;   /* written, partly written, or stdout failed */
         /* out of memory before any output: fall back to the bounded REPL display */
         ray_t* formatted = ray_fmt(args[i], 1);
@@ -355,7 +360,7 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
             fwrite(sp, 1, sl, stdout);
             ray_release(formatted);
         } else {
-            if (formatted) ray_release(formatted);
+            if (formatted) ray_error_free(formatted);
             ray_lang_print(stdout, args[i]);
         }
     }

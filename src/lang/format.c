@@ -871,14 +871,16 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     ray_t* wblk = ray_alloc((size_t)ncols * sizeof(int32_t));
     ray_t* nblk = ray_alloc((size_t)ncols * sizeof(ray_t*));
     if (nblk) memset(ray_data(nblk), 0, (size_t)ncols * sizeof(ray_t*));
+    ray_t* cblk = ray_alloc((size_t)ncols * sizeof(ray_t*));   /* borrowed plain columns */
     fmt_buf_t tmp;
     fmt_init(&tmp);
-    if (!wblk || !nblk || tmp.err) {
+    if (!wblk || !nblk || !cblk || tmp.err) {
         b->err = true; b->err_msg = "out of memory formatting a table";
         goto done;
     }
     int32_t* widths = (int32_t*)ray_data(wblk);
     ray_t**  names  = (ray_t**)ray_data(nblk);
+    ray_t**  cols   = (ray_t**)ray_data(cblk);
 
     for (int64_t ci = 0; ci < ncols; ci++) {
         ray_t* nm = ray_sym_str(ray_table_col_name(tbl, ci));
@@ -887,6 +889,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
         const char* tname = ray_type_name(ray_table_col_meta_idx(tbl, ci, &m) ? m.type : 0);
         ray_t* col = fmt_col_idx(b, tbl, ci);
         if (b->err) goto done;
+        cols[ci] = col;
         int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
         if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
         int32_t cell_w = 0;
@@ -933,9 +936,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
         fmt_puts(b, G_V);
         for (int64_t ci = 0; ci < ncols; ci++) {
             const char* cs; int32_t cl;
-            ray_t* col = fmt_col_idx(b, tbl, ci);
-            if (b->err) goto done;
-            fmt_stream_cell(&tmp, col, ri, &cs, &cl);
+            fmt_stream_cell(&tmp, cols[ci], ri, &cs, &cl);
             if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
             fmt_putc(b, ' ');
             fmt_putn(b, cs, cl);
@@ -963,6 +964,7 @@ done:
         ray_free(nblk);
     }
     if (wblk) ray_free(wblk);
+    if (cblk) ray_free(cblk);
     fmt_destroy(&tmp);
 }
 
@@ -1503,8 +1505,14 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
 
 /* Write obj to fp in full (show): no row, column or width limits, and
  * streamed, so memory stays bounded whatever the size of obj.  RAY_ERR_IO if
- * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated. */
-ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
+ * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated.  A column
+ * that fails to load is reported with its own code: *cause (when non-NULL)
+ * receives an owned error carrying its code and message, and the matching
+ * ray_err_t is returned.  Output flushed before the failure stays written
+ * (a table's columns are all loaded before its first byte, so only values
+ * formatted ahead of it in the same call are affected). */
+ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause) {
+    if (cause) *cause = NULL;
     fmt_buf_t b;
     fmt_init(&b);
     if (b.err) return RAY_ERR_OOM;
@@ -1512,6 +1520,11 @@ ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
     fmt_obj(&b, obj, 2);
     if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
         b.io_err = b.err = true;
+    if (b.err && b.cause_code[0] && cause) {
+        *cause = ray_error(b.cause_code, "%s: %s", b.err_msg, b.cause_msg);
+        fmt_destroy(&b);
+        return ray_err_from_obj(*cause);
+    }
     ray_err_t e = !b.err ? RAY_OK : b.io_err ? RAY_ERR_IO : RAY_ERR_OOM;
     /* Out of memory after part of the output was written: end that part
      * with a marker, and report it as written so the caller does not print

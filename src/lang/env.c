@@ -328,6 +328,9 @@ ray_t* ray_env_get_local(int64_t sym_id) {
     return NULL;
 }
 
+/* Borrowed lookup.  A NULL for a dotted path into a table may also mean the
+ * column failed to load (the detail is in ray_error_msg()); ray_env_resolve
+ * returns that failure as an error instead. */
 ray_t* ray_env_get(int64_t sym_id) {
     /* Flat lookup first — covers every non-dotted name AND every
      * reserved builtin like `.sys.gc` which is bound both flat (for
