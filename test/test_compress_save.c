@@ -3569,6 +3569,26 @@ static test_result_t test_group_sites_routes_same(void) {
         if (res.status == TEST_PASS) res = gp_same_routes(t0, sel, "k4", OP_SUM, "a", NULL, "select result k4");
         ray_release(sel);
     }
+    /* an expression aggregate (exec_group_v2_exprs passes the encoded slots on) */
+    if (res.status == TEST_PASS) {
+        ray_t* r[2]; agg_route_stats_t st[2];
+        for (int gi = 0; gi < 2; gi++) {
+            ray_t* t = gi ? t2 : t0;
+            ray_graph_t* g = ray_graph_new(t);
+            ray_op_t* keys[1] = { ray_scan(g, "k0") };
+            uint16_t ops[1] = { OP_SUM };
+            ray_op_t* ins[1] = { ray_add(g, ray_scan(g, "a"), ray_mul(g, ray_scan(g, "b"), ray_const_i64(g, 3))) };
+            agg_route_reset();
+            r[gi] = ray_execute(g, ray_group(g, keys, 1, ops, ins, 1));
+            if (r[gi] && ray_is_lazy(r[gi])) r[gi] = ray_lazy_materialize(r[gi]);
+            st[gi] = agg_route_stats();
+            ray_graph_free(g);
+        }
+        TEST_ASSERT_TRUE(r[0] && r[1] && !RAY_IS_ERR(r[0]) && !RAY_IS_ERR(r[1]));
+        TEST_ASSERT_TRUE(memcmp(st[0].routes, st[1].routes, sizeof st[0].routes) == 0);
+        TEST_ASSERT_TRUE(cp_fmt_same(r[0], r[1]));
+        ray_release(r[0]); ray_release(r[1]);
+    }
     ray_release(t0); ray_release(t2);
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
@@ -3610,9 +3630,28 @@ static test_result_t test_group_sites_slice_route(void) {
  * fallback (a parted key) and the pass of encoded segments take the same
  * routes and give the same answers on generation 0 and 2; a segment that
  * fails to materialize is the query's error. */
-static ray_t* gp_parted_body(void* c) {
-    gp_ctx_t* x = c;
-    return gp_body(x);
+
+/* An expression key ((b % 7), per-partition materialized over the borrowed
+ * segments) or an expression aggregate ((a + b)) over a group. */
+static ray_t* gp_expr_body(ray_t* t, bool expr_key) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* keys[1] = { expr_key ? ray_mod(g, ray_scan(g, "b"), ray_const_i64(g, 7)) : ray_scan(g, "date") };
+    uint16_t ops[1] = { OP_SUM };
+    ray_op_t* ins[1] = { expr_key ? ray_scan(g, "a") : ray_add(g, ray_scan(g, "a"), ray_scan(g, "b")) };
+    ray_t* r = ray_execute(g, ray_group(g, keys, 1, ops, ins, 1));
+    if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    ray_graph_free(g);
+    return r;
+}
+static test_result_t gp_expr_same(ray_t* t0, ray_t* t2, bool expr_key, bool want_parted, const char* what) {
+    agg_route_reset(); ray_t* r0 = gp_expr_body(t0, expr_key); agg_route_stats_t s0 = agg_route_stats();
+    agg_route_reset(); ray_t* r2 = gp_expr_body(t2, expr_key); agg_route_stats_t s2 = agg_route_stats();
+    TEST_ASSERT_FMT(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2), "%s: ran", what);
+    if (want_parted) TEST_ASSERT_FMT(s0.routes[AGG_ROUTE_PARTED] >= 1, "%s: parted route", what);
+    TEST_ASSERT_FMT(memcmp(s0.routes, s2.routes, sizeof s0.routes) == 0, "%s: routes differ", what);
+    TEST_ASSERT_FMT(cp_fmt_same(r0, r2), "%s: answers differ", what);
+    ray_release(r0); ray_release(r2);
+    PASS();
 }
 static test_result_t test_group_sites_parted(void) {
     ray_t* t0 = pdb_make(CS_TMP "/gp0", 0, false);
@@ -3627,16 +3666,35 @@ static test_result_t test_group_sites_parted(void) {
     for (size_t i = 0; i < sizeof cases / sizeof *cases && res.status == TEST_PASS; i++) {
         gp_ctx_t c0 = { t0, cases[i].key, cases[i].op, cases[i].c1, NULL };
         gp_ctx_t c2 = { t2, cases[i].key, cases[i].op, cases[i].c1, NULL };
-        agg_route_reset(); ray_t* r0 = gp_parted_body(&c0); agg_route_stats_t s0 = agg_route_stats();
-        agg_route_reset(); ray_t* r2 = gp_parted_body(&c2); agg_route_stats_t s2 = agg_route_stats();
+        agg_route_reset(); ray_t* r0 = gp_body(&c0); agg_route_stats_t s0 = agg_route_stats();
+        agg_route_reset(); ray_t* r2 = gp_body(&c2); agg_route_stats_t s2 = agg_route_stats();
         TEST_ASSERT_FMT(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2), "case %zu ran", i);
         TEST_ASSERT_FMT(s0.routes[AGG_ROUTE_PARTED] >= 1, "case %zu: parted route", i);
         TEST_ASSERT_FMT(memcmp(s0.routes, s2.routes, sizeof s0.routes) == 0, "case %zu: routes differ", i);
         TEST_ASSERT_FMT(cp_fmt_same(r0, r2), "case %zu: answers differ", i);
         ray_release(r0); ray_release(r2);
     }
+    /* a table mixing generations (partitions 1 and 3 on generation 2) and the
+     * expression key / aggregate shapes over encoded and mixed segments */
+    ray_t* t5 = pdb_make(CS_TMP "/gp5", 5, false);
+    TEST_ASSERT_TRUE(t5);
+    for (int i = 0; i < 3 && res.status == TEST_PASS; i++) {
+        gp_ctx_t c0 = { t0, cases[i].key, cases[i].op, cases[i].c1, NULL };
+        gp_ctx_t c5 = { t5, cases[i].key, cases[i].op, cases[i].c1, NULL };
+        agg_route_reset(); ray_t* r0 = gp_body(&c0); agg_route_stats_t s0 = agg_route_stats();
+        agg_route_reset(); ray_t* r5 = gp_body(&c5); agg_route_stats_t s5 = agg_route_stats();
+        TEST_ASSERT_FMT(r0 && r5 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r5), "mixed case %d ran", i);
+        TEST_ASSERT_FMT(memcmp(s0.routes, s5.routes, sizeof s0.routes) == 0, "mixed case %d: routes differ", i);
+        TEST_ASSERT_FMT(cp_fmt_same(r0, r5), "mixed case %d: answers differ", i);
+        ray_release(r0); ray_release(r5);
+    }
+    res = gp_expr_same(t0, t2, true, true, "expression key, encoded");
+    if (res.status == TEST_PASS) res = gp_expr_same(t0, t5, true, true, "expression key, mixed");
+    if (res.status == TEST_PASS) res = gp_expr_same(t0, t2, false, true, "expression aggregate, encoded");
+    if (res.status == TEST_PASS) res = gp_expr_same(t0, t5, false, true, "expression aggregate, mixed");
+    ray_release(t5);
     ray_release(t0); ray_release(t2);
-    PASS();
+    return res;
 }
 
 static test_result_t test_group_sites_parted_failed_decode(void) {
@@ -3658,7 +3716,7 @@ static test_result_t test_group_sites_parted_failed_decode(void) {
         TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
         gp_ctx_t cx = { t, cases[i].key, cases[i].op, cases[i].c1, NULL };
         ray_error_clear();
-        ray_t* r = gp_parted_body(&cx);
+        ray_t* r = gp_body(&cx);
         if (i == 2) {   /* column a is never read: the answer is the healthy one */
             TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: expected a result", cases[i].what);
             ray_release(r);

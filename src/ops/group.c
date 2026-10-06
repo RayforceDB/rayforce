@@ -9694,12 +9694,10 @@ static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
  * of an encoded slot, else the plain one.  NULL when the slot is absent, not
  * parted, or the segment is missing (ragged partition). */
 static ray_t* group_parted_seg(ray_t* tbl, int64_t sym, int64_t p) {
-    ray_col_meta_t m;
-    if (!ray_table_col_meta(tbl, sym, &m) || !RAY_IS_PARTED(m.type)) return NULL;
     ray_t* enc = ray_table_get_col_enc(tbl, sym);
-    if (enc) return ray_enccol_seg(enc, p);
+    if (enc) return ray_enccol_is_parted(enc) ? ray_enccol_seg(enc, p) : NULL;
     ray_t* col = ray_table_col(tbl, sym);               /* plain slot: never fails */
-    if (!col || RAY_IS_ERR(col)) return NULL;
+    if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type)) return NULL;
     return ((ray_t**)ray_data(col))[p];                 /* parted wrapper, not a table */
 }
 
@@ -9707,12 +9705,10 @@ static ray_t* group_parted_seg(ray_t* tbl, int64_t sym, int64_t p) {
  * missing or the slot is not parted, or an owned error when an encoded
  * segment fails to materialize. */
 static ray_t* group_parted_seg_col(ray_t* tbl, int64_t sym, int64_t p) {
-    ray_col_meta_t m;
-    if (!ray_table_col_meta(tbl, sym, &m) || !RAY_IS_PARTED(m.type)) return NULL;
     ray_t* enc = ray_table_get_col_enc(tbl, sym);
-    if (enc) return ray_enccol_seg_col(enc, p);
+    if (enc) return ray_enccol_is_parted(enc) ? ray_enccol_seg_col(enc, p) : NULL;
     ray_t* col = ray_table_col(tbl, sym);
-    if (!col || RAY_IS_ERR(col)) return NULL;
+    if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type)) return NULL;
     return ((ray_t**)ray_data(col))[p];                 /* parted wrapper, not a table */
 }
 
@@ -10810,6 +10806,10 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                               ray_t** agg_vecs, ray_t** agg_vecs2,
                               agg_prod_t* prod, ray_t** err) {
     *err = NULL;
+    /* Admission reads metadata only; the input columns are fetched (and an
+     * encoded one decoded) once every aggregate has been admitted. */
+    int64_t agg_syms[16], agg_syms2[16];
+    for (int i = 0; i < 16; i++) agg_syms[i] = agg_syms2[i] = -1;
     /* group_limit is a HEAD(GROUP) HINT, not a semantic: this kernel computes
      * every group and the caller's HEAD trims the result, so a positive limit
      * is simply ignored here (staying eligible keeps where+by+take shapes on
@@ -10859,10 +10859,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             case RAY_TIME: case RAY_F32: case RAY_F64: break;
             default: return false;
         }
-        ray_t* col = ray_table_col(tbl, ae->sym);
-        if (col && RAY_IS_ERR(col)) { *err = col; return false; }
-        if (!col) return false;
-        agg_vecs[a] = col;
+        agg_syms[a] = ae->sym;
         if (pair) {
             if (!ext->agg_ins2 || ext->agg_ins2[a] == RAY_OP_NONE) return false;
             ray_op_t* in2 = op_node(g, ext->agg_ins2[a]);
@@ -10878,12 +10875,23 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 case RAY_F32: case RAY_F64: break;
                 default: return false;
             }
-            ray_t* col2 = ray_table_col(tbl, ae2->sym);
+            agg_syms2[a] = ae2->sym;
+        } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
+            return false;
+        }
+    }
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (agg_syms[a] >= 0) {
+            ray_t* col = ray_table_col(tbl, agg_syms[a]);
+            if (col && RAY_IS_ERR(col)) { *err = col; return false; }
+            if (!col) return false;
+            agg_vecs[a] = col;
+        }
+        if (agg_syms2[a] >= 0) {
+            ray_t* col2 = ray_table_col(tbl, agg_syms2[a]);
             if (col2 && RAY_IS_ERR(col2)) { *err = col2; return false; }
             if (!col2) return false;
             agg_vecs2[a] = col2;
-        } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
-            return false;
         }
     }
     return true;

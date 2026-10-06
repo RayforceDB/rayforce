@@ -6157,7 +6157,7 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
     int64_t nrows = ray_table_nrows(result);
     if (nrows <= 0) return result;
     ray_t* vcol = ray_table_col_idx(result, (int64_t)n_keys + ef->agg_index);
-    if (vcol && RAY_IS_ERR(vcol)) { ray_release(result); return vcol; }
+    if (vcol && RAY_IS_ERR(vcol)) { ray_error_free(vcol); return result; }   /* the sort+take downstream re-reads it */
     if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64)) return result;
     double* vals = ray_alloc_raw((size_t)nrows * sizeof(double));
     uint8_t* keep = ray_alloc_raw((size_t)nrows);
