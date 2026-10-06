@@ -3423,6 +3423,7 @@ static test_result_t test_parted_pruning_mixed(void) {
     PASS();
 }
 
+
 /* The slice-group kernel's shape admission binds the product columns
  * (sg_shape_eligible through the early settle hook): the answer equals the
  * plain-sym table's and a failed bind is the query's error. */
@@ -4722,6 +4723,203 @@ static test_result_t test_select_gen2_equal(void) {
     PASS();
 }
 
+/* ---- Task 31b: select over a parted table prunes before fetching ---- */
+
+/* Select shapes over the parted table t; %s is the where predicate. */
+static const char* const sp_shapes[] = {
+    "(select {from: t where: %s})",
+    "(select {s: (sum a) from: t where: %s})",
+    "(select {c: (count a) from: t by: b where: %s})",
+    "(select {a: a from: t where: %s take: 10})",
+    "(select {a: a from: t where: %s take: -4})",
+    "(select {a: a b: b from: t where: %s desc: a take: 5})",
+    "(select {s: (sum a) m: (max b) by: date from: t where: %s})",
+    "(select {c: (count b) from: t where: (and %s (> a 100))})",
+    "(select {x: (+ a b) from: t where: %s})",
+    "(select {from: t where: %s asc: b})",
+    "(select {c: (count (distinct b)) by: date from: t where: %s})",
+    NULL,
+};
+/* Prunable predicates (the second rules every partition out). */
+static const char* const sp_preds[] = {
+    "(== date 2024.01.02)", "(> date 2024.01.03)", "(<= date 2024.01.02)",
+    "(in date [2024.01.01 2024.01.03])", "(!= date 2024.01.02)", "(>= 2024.01.02 date)", NULL,
+};
+
+/* The query of shape i over predicate p; `unpruned` wraps the predicate in
+ * an `or` the pruner does not read, so the whole table is scanned. */
+static ray_t* sp_eval(int i, const char* p, bool unpruned) {
+    char pred[160], q[400];
+    if (unpruned) snprintf(pred, sizeof pred, "(or %s %s)", p, p);
+    else snprintf(pred, sizeof pred, "%s", p);
+    snprintf(q, sizeof q, sp_shapes[i], pred);
+    return ray_eval_str(q);
+}
+static void sp_bind(ray_t* t) { ray_env_set(ray_sym_intern("t", 1), t); }
+
+/* Both outcomes are errors with one code, or the same serialized value. */
+static bool sp_same(ray_t* x, ray_t* y) {
+    if (!x || !y) return false;
+    if (RAY_IS_ERR(x) || RAY_IS_ERR(y))
+        return RAY_IS_ERR(x) && RAY_IS_ERR(y) && strcmp(ray_err_code(x), ray_err_code(y)) == 0;
+    return t29_same(x, y) && cp_fmt_same(x, y);
+}
+
+/* A select over a parted generation-2 table decodes only the surviving
+ * partitions' referenced columns: the where on the partition key prunes
+ * before any column is fetched.  Before this change the four shapes
+ * materialized 6, 2, 6 and 3 segment columns. */
+static test_result_t test_select_parted_prunes_fetch(void) {
+    ray_t* t = pdb_make(CS_TMP "/sp", 7, false);
+    ray_t* t0 = pdb_make(CS_TMP "/sp0", 0, false);
+    TEST_ASSERT_TRUE(t && t0);
+    ray_release(t);
+    static const struct { const char* q; uint64_t cols; int64_t rows; } qs[] = {
+        { "(select {from: t where: (== date 2024.01.02)})",                      2, 3000 },  /* a and b of 01.02 */
+        { "(select {s: (sum a) from: t where: (== date 2024.01.02)})",           1, 1 },     /* a of 01.02 */
+        { "(select {c: (count a) from: t by: b where: (== date 2024.01.02)})",   2, 3000 },  /* a and b of 01.02 */
+        { "(select {a: a from: t where: (<= date 2024.01.02) take: 10})",        2, 10 },    /* a of 01.01 and 01.02 */
+        { NULL, 0, 0 },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        t = ray_read_parted(CS_TMP "/sp", "t");                     /* a fresh load: nothing cached */
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        ray_release(t);
+        ray_enc_counters_reset();
+        ray_t* r = ray_eval_str(qs[i].q);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        sp_bind(t0);
+        ray_t* r0 = ray_eval_str(qs[i].q);
+        bool ok = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == qs[i].rows;
+        bool same = sp_same(r, r0);
+        drop_out(r); drop_out(r0);
+        TEST_ASSERT_FMT(ok, "%s: answered", qs[i].q);
+        TEST_ASSERT_FMT(same, "%s: generation 0 and 2 agree", qs[i].q);
+        TEST_ASSERT_FMT(c.materialized == qs[i].cols, "%s: materialized %llu, expected %llu",
+                        qs[i].q, (unsigned long long)c.materialized, (unsigned long long)qs[i].cols);
+    }
+    sp_bind(NULL);
+    ray_release(t0);
+    PASS();
+}
+
+/* Pruned answers equal the unpruned scan's, on generation 0 and 2, for every
+ * shape and prunable predicate (nothing surviving included); generation 0
+ * decodes nothing.  One pair is excluded: a group by the partition key over
+ * a where that drops the first partition, where the unpruned scan answers a
+ * spurious empty group for that partition (exec_group_parted; reproduced on
+ * dev) and the pruned source does not have it. */
+static test_result_t test_select_parted_prunes_same(void) {
+    ray_t* t0 = pdb_make(CS_TMP "/sq0", 0, false);
+    ray_t* t2 = pdb_make(CS_TMP "/sq2", 7, false);
+    TEST_ASSERT_TRUE(t0 && t2);
+    for (int i = 0; sp_shapes[i]; i++) {
+        for (int k = 0; sp_preds[k]; k++) {
+            sp_bind(t0);
+            ray_enc_counters_reset();
+            ray_t* p0 = sp_eval(i, sp_preds[k], false);
+            ray_enc_counters_t c; ray_enc_counters_get(&c);
+            ray_t* u0 = sp_eval(i, sp_preds[k], true);
+            sp_bind(t2);
+            ray_t* p2 = sp_eval(i, sp_preds[k], false);
+            bool ok = p0 && !RAY_IS_ERR(p0);
+            bool gen = sp_same(p0, p2);
+            bool spurious = i == 6 && (k == 0 || k == 5);   /* by: date, first partition dropped */
+            bool unp = spurious || sp_same(p0, u0);
+            drop_out(p0); drop_out(u0); drop_out(p2);
+            TEST_ASSERT_FMT(ok, "shape %d pred %s: answered", i, sp_preds[k]);
+            TEST_ASSERT_FMT(gen, "shape %d pred %s: generations agree", i, sp_preds[k]);
+            TEST_ASSERT_FMT(unp, "shape %d pred %s: pruned equals unpruned", i, sp_preds[k]);
+            TEST_ASSERT_EQ_U(c.materialized, 0);
+        }
+    }
+    sp_bind(NULL);
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+/* Mixed generations and a ragged tail (the last partition lacks b): the
+ * pruned answer equals all-generation-0's.  A where that prunes the ragged
+ * partition (or prunes everything) answers as the whole table would, never
+ * touching it; one that keeps it, or a sorted shape, leaves the source
+ * unpruned (the existing ragged-table behaviour, not compared here). */
+static test_result_t test_select_parted_prunes_mixed(void) {
+    static const unsigned masks[] = { 0x5, 0x2 };
+    ray_t* t0 = pdb_make(CS_TMP "/sx0", 0, false);
+    TEST_ASSERT_NOT_NULL(t0);
+    for (int rag = 0; rag < 2; rag++) {
+        for (int m = 0; m < 2; m++) {
+            char rm[128];
+            snprintf(rm, sizeof rm, CS_TMP "/sxm_%d_%d", m, rag);
+            ray_t* tm = pdb_make(rm, masks[m], rag);
+            TEST_ASSERT_NOT_NULL(tm);
+            for (int i = 0; sp_shapes[i]; i++) {
+                for (int k = 0; sp_preds[k]; k++) {
+                    /* keeps 01.03, or sorts (select does not prune under asc:/desc:) */
+                    if (rag && (k == 3 || k == 4 || i == 5 || i == 9)) continue;
+                    sp_bind(t0);
+                    ray_t* a = sp_eval(i, sp_preds[k], false);
+                    sp_bind(tm);
+                    ray_t* b = sp_eval(i, sp_preds[k], false);
+                    bool same = sp_same(a, b) && !RAY_IS_ERR(b);
+                    drop_out(a); drop_out(b);
+                    TEST_ASSERT_FMT(same, "mask %u ragged %d shape %d pred %s", masks[m], rag, i, sp_preds[k]);
+                }
+            }
+            ray_release(tm);
+        }
+    }
+    sp_bind(NULL);
+    ray_release(t0);
+    PASS();
+}
+
+/* A damaged surviving segment surfaces as `corrupt` with its path; a damaged
+ * pruned segment is never read, and the query answers as undamaged. */
+static test_result_t test_select_parted_prunes_failure(void) {
+    ray_t* t = pdb_make(CS_TMP "/sf", 7, false);
+    TEST_ASSERT_NOT_NULL(t);
+    sp_bind(t);
+    ray_t* want = ray_eval_str("(select {s: (sum a) from: t where: (== date 2024.01.02)})");
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    sp_bind(NULL);
+    ray_release(t);
+    uint8_t one = 1;
+    FILE* f = fopen(CS_TMP "/sf/2024.01.01/t/a", "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    fseek(f, 160 + 6, SEEK_SET); fwrite(&one, 1, 1, f); fclose(f);
+    t = ray_read_parted(CS_TMP "/sf", "t");                       /* corruption passes load */
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    sp_bind(t);
+    ray_release(t);
+    static const char* const hit[] = {
+        "(select {s: (sum a) from: t where: (<= date 2024.01.02)})",
+        "(select {from: t where: (in date [2024.01.01])})",
+        "(select {c: (count a) from: t by: b where: (!= date 2024.01.03)})",
+        NULL,
+    };
+    for (int i = 0; hit[i]; i++) {
+        ray_error_clear();
+        ray_t* r = ray_eval_str(hit[i]);
+        bool corrupt = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0;
+        bool path = ray_error_msg() && strstr(ray_error_msg(), "2024.01.01/t/a");
+        drop_out(r);
+        TEST_ASSERT_FMT(corrupt && path, "%s: corrupt with the path", hit[i]);
+    }
+    ray_t* got = ray_eval_str("(select {s: (sum a) from: t where: (== date 2024.01.02)})");
+    bool same = sp_same(got, want);
+    drop_out(got);
+    ray_t* any = ray_eval_str("(select {from: t where: (> date 2024.01.01)})");
+    bool ok = any && !RAY_IS_ERR(any) && ray_table_nrows(any) == 6000;
+    drop_out(any);
+    sp_bind(NULL);
+    ray_release(want);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* simplify_agg_idiom: (first (asc c)) -> min is taken only for a null-free
  * column.  Over a parted generation-0 column with a null in one segment the
  * rewrite must decline (it would answer the min of the non-null cells); the
@@ -4864,6 +5062,10 @@ const test_entry_t compress_entries[] = {
     { "compress/select_slice_probe_failed_decode", test_select_slice_probe_failed_decode, rt_setup, rt_teardown },
     { "compress/select_bydict_binds_referenced", test_select_bydict_binds_referenced, rt_setup, rt_teardown },
     { "compress/select_decodes_referenced_only", test_select_decodes_referenced_only, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_mixed",   test_select_parted_prunes_mixed,   rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
