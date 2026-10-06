@@ -37,6 +37,8 @@
 #include "store/enccol.h"
 #include "store/part.h"
 #include "store/serde.h"
+#include "store/splay.h"
+#include "store/col.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -307,16 +309,122 @@ static test_result_t test_short_column_refused(void) {
     };
     for (int i = 0; hq[i]; i++) {
         ray_t* r = ray_eval_str(hq[i]);
-        bool err = r && RAY_IS_ERR(r);
+        bool err = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "length") == 0;
         drop_out(r);
-        TEST_ASSERT_FMT(err, "%s: refused", hq[i]);
+        TEST_ASSERT_FMT(err, "%s: refused with length", hq[i]);
     }
     bind_t(NULL);
     ray_release(t); ray_release(src);
     PASS();
 }
 
+/* A non-null column of `type` over n rows (LIST: I64 atoms). */
+static ray_t* typed_col(int8_t type, int64_t n) {
+    if (type == RAY_LIST) {
+        ray_t* l = ray_list_new(n);
+        for (int64_t i = 0; i < n; i++) { ray_t* a = ray_i64(i + 1); l = ray_list_append(l, a); ray_release(a); }
+        return l;
+    }
+    if (type == RAY_STR) {
+        ray_t* v = ray_vec_new(RAY_STR, n);
+        for (int64_t i = 0; i < n; i++) v = ray_str_vec_append(v, "v", 1);
+        return v;
+    }
+    if (type == RAY_SYM) {
+        ray_t* v = ray_vec_new(RAY_SYM, n);
+        for (int64_t i = 0; i < n; i++) { int64_t id = ray_sym_intern("k", 1); v = ray_vec_append(v, &id); }
+        return v;
+    }
+    ray_t* v = ray_vec_new(type, n);
+    v->len = n;
+    uint8_t* d = (uint8_t*)ray_data(v);
+    size_t esz = ray_elem_size(type);
+    memset(d, 0, (size_t)n * esz);
+    for (int64_t i = 0; i < n; i++) d[(size_t)i * esz] = 1;   /* 1 (true for BOOL): never a sentinel */
+    if (type == RAY_F64) for (int64_t i = 0; i < n; i++) ((double*)d)[i] = (double)i + 0.5;
+    if (type == RAY_F32) for (int64_t i = 0; i < n; i++) ((float*)d)[i] = (float)i + 0.5f;
+    return v;
+}
+
+/* Is cell i of the filled segment the type's null fill? */
+static bool fill_cell_ok(ray_t* seg, int64_t i) {
+    const void* d = ray_data(seg);
+    switch (seg->type) {
+        case RAY_F64:  { double x = ((const double*)d)[i]; return x != x; }
+        case RAY_F32:  { float x = ((const float*)d)[i]; return x != x; }
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[i] == NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[i] == NULL_I32;
+        case RAY_I16:  return ((const int16_t*)d)[i] == NULL_I16;
+        case RAY_BOOL: case RAY_U8: return ((const uint8_t*)d)[i] == 0;
+        case RAY_SYM:  return ray_read_sym(d, i, RAY_SYM, seg->attrs) == 0;
+        case RAY_STR: case RAY_GUID: {
+            static const uint8_t zero[16] = {0};
+            return memcmp((const uint8_t*)d + i * 16, zero, 16) == 0;
+        }
+        case RAY_LIST: return ((ray_t* const*)d)[i] == RAY_NULL_OBJ;
+        default: return false;
+    }
+}
+
+/* Every column type a partition can lack fills with its null (the non-nullable
+ * BOOL / U8 with 0, LIST with the null object): HAS_NULLS on exactly the
+ * nullable vector types, the table's row count, ray_vec_is_null on every
+ * nullable cell.  Generation 0 and generation 2 (where the type saves). */
+static test_result_t test_fill_every_type(void) {
+    static const int8_t types[] = {
+        RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64, RAY_DATE, RAY_TIME,
+        RAY_TIMESTAMP, RAY_SYM, RAY_STR, RAY_GUID, RAY_LIST,
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        for (size_t k = 0; k < sizeof types / sizeof types[0]; k++) {
+            int8_t ty = types[k];
+            char root[160], dir[200], symp[200];
+            snprintf(root, sizeof root, PR_TMP "/ty_%d_%d", gen, (int)ty);
+            snprintf(symp, sizeof symp, "%s/.sym", root);
+            for (int p = 0; p < 2; p++) {
+                snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+                int64_t n = p == 0 ? 3 : 5;
+                ray_t* t = ray_table_new(2);
+                ray_t* a = typed_col(RAY_I64, n);
+                t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+                ray_release(a);
+                if (p == 0) {
+                    ray_t* x = typed_col(ty, n);
+                    TEST_ASSERT_TRUE(x && !RAY_IS_ERR(x) && x->len == n);
+                    t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
+                    ray_release(x);
+                }
+                ray_err_t e = ray_splay_save_mode(t, dir, symp, gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+                ray_release(t);
+                TEST_ASSERT_FMT(e == RAY_OK, "gen %d type %d partition %d: save %d", gen, (int)ty, p, (int)e);
+            }
+            ray_t* t = ray_read_parted(root, "t");
+            TEST_ASSERT_FMT(t && !RAY_IS_ERR(t), "gen %d type %d: load", gen, (int)ty);
+            ray_t* slot = ray_table_get_col_enc(t, ray_sym_intern("x", 1));
+            ray_t* w = slot ? NULL : ray_table_col(t, ray_sym_intern("x", 1));
+            TEST_ASSERT_EQ_I(ray_table_col_nrows(slot ? slot : w), 8);
+            ray_t* seg = slot ? ray_enccol_seg(slot, 1) : ((ray_t**)ray_data(w))[1];
+            TEST_ASSERT_FMT(seg && seg->type == ty && seg->len == 5, "gen %d type %d: filled segment", gen, (int)ty);
+            bool nullable = ty != RAY_BOOL && ty != RAY_U8 && ty != RAY_LIST;
+            TEST_ASSERT_FMT(((seg->attrs & RAY_ATTR_HAS_NULLS) != 0) == nullable, "gen %d type %d: HAS_NULLS", gen, (int)ty);
+            for (int64_t i = 0; i < 5; i++) {
+                TEST_ASSERT_FMT(fill_cell_ok(seg, i), "gen %d type %d: cell %lld", gen, (int)ty, (long long)i);
+                if (nullable && ty != RAY_SYM) TEST_ASSERT_TRUE(ray_vec_is_null(seg, i));
+            }
+            /* the column reads whole: present rows, then the fill */
+            bind_t(t);
+            ray_t* c = ray_eval_str("(count (at t 'x))");
+            TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->i64 == 8);
+            drop_out(c);
+            bind_t(NULL);
+            ray_release(t);
+        }
+    }
+    PASS();
+}
+
 const test_entry_t parted_ragged_entries[] = {
+    { "parted_ragged/fill_every_type",      test_fill_every_type,      pr_setup, pr_teardown },
     { "parted_ragged/issue_repro",          test_issue_repro,          pr_setup, pr_teardown },
     { "parted_ragged/gen0",                 test_ragged_gen0,          pr_setup, pr_teardown },
     { "parted_ragged/gen2",                 test_ragged_gen2,          pr_setup, pr_teardown },

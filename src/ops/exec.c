@@ -1230,6 +1230,25 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
 
 static ray_t* flatten_parted_col(ray_t* col);
 
+/* Debug builds check that a parted column flattened out of a table has the
+ * table's row count, its MAPCOMMON total (#724: a short flat column was read
+ * past its end).  Release builds compile the check out. */
+#ifdef DEBUG
+#include <assert.h>
+static int64_t dbg_mapcommon_rows(ray_t* tbl) {
+    for (int64_t c = 0; c < ray_table_ncols(tbl); c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_MAPCOMMON) return m.len;
+    }
+    return -1;
+}
+#define PARTED_FLAT_DCHECK(tbl, flat) \
+    assert(!(flat) || RAY_IS_ERR(flat) || dbg_mapcommon_rows(tbl) < 0 || \
+           (flat)->len == dbg_mapcommon_rows(tbl))
+#else
+#define PARTED_FLAT_DCHECK(tbl, flat) ((void)0)
+#endif
+
 /* GUID membership fallback: the typed `in` kernel bails on guid operands
  * (16-byte cells it can't compare), so route them through the general
  * ray_in_fn path, which builds a guid-aware hashset.  `col` is a materialized
@@ -2258,12 +2277,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t total = ray_parted_nrows(col);
 
                 /* RAY_STR: deep-copy to handle multi-pool segments */
-                if (base == RAY_STR)
-                    return parted_flatten_str(sps, col->len, total);
+                if (base == RAY_STR) {
+                    ray_t* f = parted_flatten_str(sps, col->len, total);
+                    PARTED_FLAT_DCHECK(scan_tbl, f);
+                    return f;
+                }
                 /* RAY_LIST: share (retain) elements — byte-copy would
                  * alias them without a refcount (issue #355). */
-                if (base == RAY_LIST)
-                    return parted_flatten_list(sps, col->len, total);
+                if (base == RAY_LIST) {
+                    ray_t* f = parted_flatten_list(sps, col->len, total);
+                    PARTED_FLAT_DCHECK(scan_tbl, f);
+                    return f;
+                }
 
                 uint8_t sba = (base == RAY_SYM)
                             ? parted_sym_max_attrs(sps, col->len) : 0;
@@ -2287,6 +2312,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                  * shared domain (first SYM segment is the rep). */
                 if (flat->type == RAY_SYM)
                     ray_sym_vec_adopt_domain(flat, sym_domain_rep(col));
+                PARTED_FLAT_DCHECK(scan_tbl, flat);
                 return flat;
             }
             ray_retain(col);
@@ -4511,6 +4537,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
                     int64_t name = ray_table_col_name(result, c);
                     if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
                         ray_t* flat = flatten_parted_col(col);
+                        PARTED_FLAT_DCHECK(result, flat);
                         if (!flat || RAY_IS_ERR(flat)) {
                             ray_release(out); ray_release(result);
                             return flat ? flat : ray_error("oom", NULL);

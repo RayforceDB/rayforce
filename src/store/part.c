@@ -267,6 +267,13 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
  * symbol, resolved over the db's domain `dom`; LIST cells are the null
  * object).  Every column of a parted table then has the table's row count,
  * segment by segment, so a consumer never meets a missing segment (#724).
+ *
+ * Cost: the fill is materialized on the heap when the table is opened —
+ * rows x element size (8 B/row for I64, F64, TIMESTAMP and LIST; 16 B/row for
+ * STR and GUID; e.g. 100M rows of I64 = 800 MB) — and held for the table's
+ * lifetime, whether or not a query reads the column; dev opened a ragged
+ * table zero-copy.  Planned follow-up: a lazy all-null generation-2 segment
+ * (a header and no payload) in place of the heap fill.
  * -------------------------------------------------------------------------- */
 static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
     if (type == RAY_LIST) {
@@ -320,7 +327,9 @@ static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_
  * is an mmap'd vector from ray_read_splayed. Also builds a MAPCOMMON column
  * with partition key names and row counts.  No segment is missing: a
  * partition lacking a tail column gets a null-filled segment of its row
- * count, so every column's segment p has MAPCOMMON row count p.
+ * count, so every column's segment p has MAPCOMMON row count p.  That
+ * segment is not zero-copy: it is a heap vector built at open and held for
+ * the table's lifetime (see missing_seg_fill for the cost).
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
