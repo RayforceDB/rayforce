@@ -35,6 +35,7 @@
 #include "ops/rowsel.h"
 #include "store/col.h"
 #include <string.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -630,6 +631,39 @@ static test_result_t idx_narrow_check(ray_t* col, int64_t n, int64_t keys) {
     }
     PASS();
 }
+/* An interrupt makes a pool dispatch skip its tasks.  Narrowing the arrays
+ * of a just-built hash index runs as one; interrupted there it must keep the
+ * wide arrays it was copying, not install an unfilled copy. */
+static test_result_t test_index_hash_narrow_interrupted(void) {
+    ray_heap_init();
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) { ray_heap_destroy(); SKIP("needs pool workers"); }
+    const int64_t n = 200000, keys = 1000;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    char buf[16];
+    for (int64_t i = 0; i < n; i++) {
+        int l = snprintf(buf, sizeof buf, "k%d", (int)(i % keys));
+        v = ray_str_vec_append(v, buf, (size_t)l);
+    }
+    ray_t* w = v;
+    atomic_store(&pool->cancelled, 1);
+    ray_t* r = ray_index_attach_hash(&w);
+    atomic_store(&pool->cancelled, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_HASH);
+    int64_t bad = 0;
+    for (int64_t k = 0; k < keys; k++) {
+        int l = snprintf(buf, sizeof buf, "k%d", (int)k);
+        ray_t* a = ray_str(buf, (size_t)l);
+        if (ray_index_find_atom(w, a) != k) bad++;
+        ray_release(a);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_index_hash_narrow_roundtrip(void) {
     ray_heap_init();
     const int64_t n = 100000, keys = 977;
@@ -3967,6 +4001,7 @@ const test_entry_t index_entries[] = {
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
     { "index/mapped_drop_unmaps_tail", test_index_mapped_drop_unmaps_tail, NULL, NULL },
     { "index/hash_narrow_roundtrip", test_index_hash_narrow_roundtrip, NULL, NULL },
+    { "index/hash_narrow_interrupted", test_index_hash_narrow_interrupted, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },
     { "index/i16_zone_and_hash",             test_index_i16_zone_and_hash,             NULL, NULL },

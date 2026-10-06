@@ -1352,8 +1352,8 @@ int64_t ray_index_inline_size(const ray_index_t* ix) {
  * Generation 1 = the CSR grouped hash layout (table/gkeys/offs/rows);
  * generation-0 regions carried the retired chain layout. */
 #define RAY_IDX_FORMAT_MAJOR ((uint8_t)1)
-/* Generation 2: the same layout with the hash `table` and `offs` stored
- * narrow (see hx_get).  Written only for indexes that carry a narrow
+/* Generation 2: the same layout with the hash `table`, `offs` and `rows`
+ * stored narrow (see hx_get).  Written only for indexes that carry a narrow
  * array, so a binary that knows generation 1 alone loads such a column
  * unindexed instead of misreading it; generation-1 regions read as before. */
 #define RAY_IDX_FORMAT_NARROW ((uint8_t)2)
@@ -1367,6 +1367,19 @@ static inline int64_t hx_get(const ray_t* v, int64_t i) {
     const void* d = ray_data((ray_t*)v);
     return v->type == RAY_I32 ? (int64_t)((const uint32_t*)d)[i]
                               : ((const int64_t*)d)[i];
+}
+static inline void hx_set(ray_t* v, int64_t i, int64_t x) {
+    void* d = ray_data(v);
+    if (v->type == RAY_I32) ((uint32_t*)d)[i] = (uint32_t)x;
+    else                    ((int64_t*)d)[i] = x;
+}
+/* Copy `n` entries of `src` into `dst`, converting between widths. */
+static void hx_copy_into(ray_t* dst, const ray_t* src, int64_t n) {
+    if (dst->type == src->type) {
+        memcpy(ray_data(dst), ray_data((ray_t*)src), (size_t)n * (size_t)ray_elem_size(src->type));
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) hx_set(dst, i, hx_get(src, i));
 }
 static inline ray_idx_rows_t hx_rows(const ray_t* rows, int64_t off) {
     bool nw = rows->type == RAY_I32;
@@ -1401,10 +1414,17 @@ static ray_t* hx_narrow(ray_t* v, int64_t bound) {
     n->len = v->len;
     hx_narrow_ctx_t c = { (const int64_t*)ray_data(v), (uint32_t*)ray_data(n) };
     ray_pool_t* pool = ray_pool_get();
-    if (ray_pool_par_dispatch_ok(pool, v->len, RAY_PARALLEL_THRESHOLD))
+    if (ray_pool_par_dispatch_ok(pool, v->len, RAY_PARALLEL_THRESHOLD)) {
         ray_pool_dispatch(pool, hx_narrow_fn, &c, v->len);
-    else
+        /* An interrupt makes the dispatch skip its tasks, leaving the copy
+         * unfilled: keep the wide array. */
+        if (atomic_load_explicit(&pool->cancelled, memory_order_acquire)) {
+            ray_release(n);
+            return v;
+        }
+    } else {
         hx_narrow_fn(&c, 0, 0, v->len);
+    }
     ray_release(v);
     return n;
 }
@@ -1415,11 +1435,12 @@ static void hx_narrow_payload(ray_index_t* ix) {
     ix->u.hash.rows  = hx_narrow(ix->u.hash.rows,  ix->built_for_len);
 }
 static uint8_t idx_format_of(const ray_index_t* ix) {
-    if (ix->kind == RAY_IDX_HASH &&
-        ((ix->u.hash.table && ix->u.hash.table->type == RAY_I32) ||
-         (ix->u.hash.offs  && ix->u.hash.offs->type  == RAY_I32) ||
-         (ix->u.hash.rows  && ix->u.hash.rows->type  == RAY_I32)))
-        return RAY_IDX_FORMAT_NARROW;
+    if (ix->kind == RAY_IDX_HASH) {
+        const ray_t* a[3] = { ix->u.hash.table, ix->u.hash.offs, ix->u.hash.rows };
+        for (int i = 0; i < 3; i++)
+            if (a[i] && !RAY_IS_ERR(a[i]) && a[i]->type == RAY_I32)
+                return RAY_IDX_FORMAT_NARROW;
+    }
     return RAY_IDX_FORMAT_MAJOR;
 }
 
@@ -4073,12 +4094,15 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
     if (add > INT64_MAX - og || add > INT64_MAX - ok) return;   /* no signed overflow below */
     bool is_str = (t == RAY_STR);
 
+    /* Built in the width they end in: narrow while every value (at most
+     * n1) fits 32 bits, as hx_narrow would leave them. */
+    int8_t aw = n1 <= (int64_t)UINT32_MAX ? RAY_I32 : RAY_I64;
     ray_t* gkeys = ray_vec_new(RAY_I64, og + add > 0 ? og + add : 1);
-    ray_t* offs  = ray_vec_new(RAY_I64, og + add + 1);
-    ray_t* rows  = ray_vec_new(RAY_I64, ok + add > 0 ? ok + add : 1);
+    ray_t* offs  = ray_vec_new(aw, og + add + 1);
+    ray_t* rows  = ray_vec_new(aw, ok + add > 0 ? ok + add : 1);
     uint64_t cap = next_pow2((uint64_t)(og + add < 4 ? 8 : 2 * (og + add)));
     if (cap < 8) cap = 8;
-    ray_t* table = ray_vec_new(RAY_I64, (int64_t)cap);
+    ray_t* table = ray_vec_new(aw, (int64_t)cap);
     if (!gkeys || RAY_IS_ERR(gkeys) || !offs || RAY_IS_ERR(offs) ||
         !rows || RAY_IS_ERR(rows) || !table || RAY_IS_ERR(table)) {
         if (gkeys && !RAY_IS_ERR(gkeys)) ray_release(gkeys);
@@ -4088,22 +4112,19 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
         return;
     }
     int64_t* gk  = (int64_t*)ray_data(gkeys);
-    int64_t* of  = (int64_t*)ray_data(offs);
-    int64_t* rw  = (int64_t*)ray_data(rows);
-    int64_t* tbl = (int64_t*)ray_data(table);
     uint64_t mask = cap - 1;
     memcpy(gk, ray_data(sx->u.hash.gkeys), (size_t)og * sizeof(int64_t));
-    for (int64_t i = 0; i <= og; i++) of[i] = hx_get(sx->u.hash.offs, i);   /* either width */
-    hx_copy_rows(rw, sx->u.hash.rows, 0, ok);
+    hx_copy_into(offs, sx->u.hash.offs, og + 1);
+    hx_copy_into(rows, sx->u.hash.rows, ok);
     if (cap == sx->u.hash.mask + 1) {
         /* Same capacity: the old slots are valid as they are. */
-        for (uint64_t i = 0; i < cap; i++) tbl[i] = hx_get(sx->u.hash.table, (int64_t)i);
+        hx_copy_into(table, sx->u.hash.table, (int64_t)cap);
     } else {
-        memset(tbl, 0, (size_t)cap * sizeof(int64_t));
+        memset(ray_data(table), 0, (size_t)cap * (size_t)ray_elem_size(aw));
         for (int64_t g = 0; g < og; g++) {
             uint64_t slot = mix64((uint64_t)gk[g]) & mask;
-            while (tbl[slot] != 0) slot = (slot + 1) & mask;
-            tbl[slot] = g + 1;
+            while (hx_get(table, (int64_t)slot) != 0) slot = (slot + 1) & mask;
+            hx_set(table, (int64_t)slot, g + 1);
         }
     }
 
@@ -4114,20 +4135,20 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
         int64_t kw = (int64_t)hash_row_key_word(dst, base, r);
         uint64_t slot = mix64((uint64_t)kw) & mask;
         for (;;) {
-            int64_t gp1 = tbl[slot];
+            int64_t gp1 = hx_get(table, (int64_t)slot);
             if (gp1 == 0) break;
             if (gk[gp1 - 1] == kw &&
-                (!is_str || str_rows_eq(dst, rw[of[gp1 - 1]], r))) {
+                (!is_str || str_rows_eq(dst, hx_get(rows, hx_get(offs, gp1 - 1)), r))) {
                 ray_release(gkeys); ray_release(offs);
                 ray_release(rows);  ray_release(table);
                 return;                       /* repeated key: not carried */
             }
             slot = (slot + 1) & mask;
         }
-        tbl[slot] = ng + 1;
+        hx_set(table, (int64_t)slot, ng + 1);
         gk[ng] = kw;
-        rw[nk] = r;
-        of[ng + 1] = nk + 1;
+        hx_set(rows, nk, r);
+        hx_set(offs, ng + 1, nk + 1);
         ng++; nk++;
     }
     gkeys->len = ng; offs->len = ng + 1; rows->len = nk; table->len = (int64_t)cap;
@@ -4149,6 +4170,5 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
      * group is trivially ordered by any column: the markers carry over. */
     ix->u.hash.order_sym = sx->u.hash.order_sym;
     ix->markers = sx->markers;
-    hx_narrow_payload(ix);
     attach_finalize(dst, idx);
 }

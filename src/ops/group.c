@@ -10565,7 +10565,7 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
         const sg_task_t* tk = &c->tasks[ti];
         const ray_idx_slice_t* sl = &c->slices[tk->gi];
         int64_t n = tk->hi - tk->lo;
-        const int64_t* restrict rows = NULL;
+        const int64_t* rows = NULL;
         if (sl->rows.p && !sl->rows.narrow) {
             rows = (const int64_t*)sl->rows.p + tk->lo;
         } else if (sl->rows.p) {
