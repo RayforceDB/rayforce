@@ -312,6 +312,81 @@ DML_TESTS(insert, "(insert 't (list 9999 7))", 3001, "k", 3000, 9999)
 DML_TESTS(update, "(update {v: 1 from: 't where: (== k 7)})", 3000, "v", 7, 1)
 DML_TESTS(delete, "(delete {from: 't where: (== k 7)})", 2999, "k", 7, 8)
 
+static const char* ev_code(const char* src);
+
+/* Value operations on a table whose slots are encoded copy the column: the
+ * cached materialization and other tables sharing the encoded object keep
+ * the old values (spec "Table core: Mutation"). */
+static test_result_t test_value_ops_copy_encoded(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 'v] (list [1 2 3 4] [10 20 30 40])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/vo\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set a (.db.splayed.get \"" CS_TMP "/vo\"))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set b a)"), "");
+    ray_enc_counters_reset();
+    TEST_ASSERT_STR_EQ(ev_code("(set a (update {v: (* v 2) from: a}))"), "");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);              /* only the updated column */
+    ray_t* r = ray_eval_str("(sum (at b 'v))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 100);
+    ray_release(r);
+    r = ray_eval_str("(sum (at a 'v))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 200);
+    ray_release(r);
+    TEST_ASSERT_STR_EQ(ev_code("(set a (insert a (list 5 50)))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set a (delete {from: a where: (== k 1)}))"), "");
+    r = ray_eval_str("(count a)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 4);
+    ray_release(r);
+    r = ray_eval_str("(sum (at b 'v))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 100);
+    ray_release(r);
+    PASS();
+}
+
+static int64_t ev_i64(const char* src) {
+    ray_t* r = ray_eval_str(src);
+    int64_t v = (r && !RAY_IS_ERR(r) && r->type == -RAY_I64) ? r->i64 : INT64_MIN;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return v;
+}
+
+/* Engine-built tables (a select's output) may carry the source's encoded
+ * slots: update, insert, upsert and delete on such a result work, by name and
+ * by value, and the generation-2 source keeps its values. */
+static test_result_t test_dml_on_select_result(void) {
+    ray_t* g = bind_gen2_table("sr");
+    TEST_ASSERT_TRUE(g != NULL);
+    ray_release(g);
+    static const char* const steps[] = {
+        "(set s (select {from: t}))",
+        "(set s (update {v: (* v 2) from: s where: (< k 10)}))",
+        "(set s (insert s (list 3000 1)))",
+        "(set s (upsert s 'k (list 5 -1)))",
+        "(set s (delete {from: s where: (== k 7)}))",
+        "(set u (select {k: k v: v from: t}))",
+        "(update {v: 0 from: 'u where: (== k 1)})",
+        "(insert 'u (list 3000 1))",
+        "(upsert 'u 'k (list 2 -2))",
+        "(delete {from: 'u where: (== k 3)})",
+    };
+    for (size_t i = 0; i < sizeof steps / sizeof *steps; i++) {
+        const char* code = ev_code(steps[i]);
+        TEST_ASSERT_FMT(strcmp(code, "") == 0, "%s: %s", steps[i], code);
+    }
+    TEST_ASSERT_EQ_I(ev_i64("(count s)"), 3000);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at s 'v) 4)"), 80);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at s 'v) 5)"), -1);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at s 'k) 7)"), 8);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at s 'v) 2999)"), 1);
+    TEST_ASSERT_EQ_I(ev_i64("(count u)"), 3000);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at u 'v) 1)"), 0);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at u 'v) 2)"), -2);
+    TEST_ASSERT_EQ_I(ev_i64("(at (at u 'k) 3)"), 4);
+    TEST_ASSERT_EQ_I(ev_i64("(sum (at t 'v))"), 10 * (2999LL * 3000 / 2));
+    TEST_ASSERT_EQ_I(ev_i64("(count t)"), 3000);
+    PASS();
+}
+
 /* A generation-2 table whose column `a` loads but fails to materialize
  * (corrupt descriptor, as test_legacy_getters), bound to `t`. */
 static ray_t* bind_corrupt_table(void) {
@@ -341,7 +416,7 @@ static test_result_t test_failed_decode_propagates(void) {
     static const char* const verbs[] = {
         "(upsert 't 'a (list 5 1))", "(upsert t 'a (list 5 1))",
         "(insert 't (list 1 2))", "(insert t (list 1 2))",
-        "(update {b: 1 from: 't where: (== b 5)})", "(update {b: 1 from: t})",
+        "(update {b: 1 from: 't where: (== a 5)})", "(update {b: a from: t})",
         "(delete {from: 't where: (== b 5)})", "(delete {from: t where: (== b 5)})",
         "(select {s: (sum a) from: t})", "(select {from: t where: (> a 5)})",
     };
@@ -350,6 +425,12 @@ static test_result_t test_failed_decode_propagates(void) {
         ray_t* r = ray_eval_str(verbs[i]);
         { test_result_t rr = expect_corrupt(r, verbs[i]); if (rr.status != TEST_PASS) return rr; }
     }
+    /* An update that never reads the failing column does not decode it: the
+     * verbs read encoded columns lazily, so it succeeds and passes `a` on. */
+    ray_t* ok = ray_eval_str("(update {b: 1 from: t where: (== b 5)})");
+    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok) && ok->type == RAY_TABLE);
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(ok, ray_sym_intern("a", 1)) != NULL);
+    ray_release(ok);
     /* a splayed re-save */
     ray_error_clear();
     TEST_ASSERT_EQ_I(ray_splay_save(t, CS_TMP "/resave", NULL), RAY_ERR_CORRUPT);
@@ -4195,6 +4276,40 @@ static test_result_t test_datalog_query_gen2_equal(void) {
     PASS();
 }
 
+/* Update, delete, upsert refusal and the live-tail insert over a parted table
+ * whose segments are partly or wholly encoded give the generation-0 answer:
+ * the verbs read the encoded wrappers through the accessors. */
+static test_result_t test_dml_parted_gen2(void) {
+    static const unsigned masks[] = { 0, 7, 5 };
+    static const char* const qs[] = {
+        "(sum (at (update {a: (* a 2) from: pt where: (> b 6)}) 'a))",
+        "(sum (at (update {a: (+ a b) from: pt}) 'a))",
+        "(count (delete {from: pt where: (== b 6)}))",
+        "(sum (at (delete {from: pt where: (== b 6)}) 'a))",
+        "(count (insert pt 2024.01.03 (list 7 8)))",
+        "(sum (at (insert pt 2024.01.04 (list 7 8)) 'b))",
+    };
+    int64_t want[sizeof qs / sizeof *qs];
+    for (int m = 0; m < 3; m++) {
+        char dir[64]; snprintf(dir, sizeof dir, CS_TMP "/dp%d", m);
+        ray_t* t = pdb_make(dir, masks[m], false);
+        TEST_ASSERT_NOT_NULL(t);
+        if (m) TEST_ASSERT_TRUE(ray_table_get_col_enc(t, ray_sym_intern("a", 1)) != NULL);
+        ray_env_set(ray_sym_intern("pt", 2), t);
+        ray_release(t);
+        for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+            int64_t v = ev_i64(qs[i]);
+            TEST_ASSERT_FMT(v != INT64_MIN, "%s (mask %u): %s", qs[i], masks[m], ev_code(qs[i]));
+            if (m == 0) want[i] = v;
+            else TEST_ASSERT_FMT(v == want[i], "%s (mask %u): %lld vs %lld", qs[i], masks[m],
+                                 (long long)v, (long long)want[i]);
+        }
+        TEST_ASSERT_STR_EQ(ev_code("(upsert pt 'a (list 1 2))"), "nyi");
+        ray_env_set(ray_sym_intern("pt", 2), NULL);
+    }
+    PASS();
+}
+
 /* A join over a parted table whose segments are partly or wholly encoded
  * (join_parted_seg_count, join_table_has_parted_col, the per-segment and
  * flatten routes) gives the generation-0 answer, on either side. */
@@ -5129,6 +5244,8 @@ const test_entry_t compress_entries[] = {
     { "compress/dml_update_inplace", test_dml_update_inplace, rt_setup, rt_teardown },
     { "compress/dml_delete_copy", test_dml_delete_copy, rt_setup, rt_teardown },
     { "compress/dml_delete_inplace", test_dml_delete_inplace, rt_setup, rt_teardown },
+    { "compress/value_ops_copy_encoded", test_value_ops_copy_encoded, rt_setup, rt_teardown },
+    { "compress/dml_on_select_result", test_dml_on_select_result, rt_setup, rt_teardown },
     { "compress/failed_decode_propagates",      test_failed_decode_propagates,       rt_setup, rt_teardown },
     { "compress/serde_byte_identity",           test_serde_byte_identity,            rt_setup, rt_teardown },
     { "compress/getter_keeps_pending_message",  test_getter_keeps_pending_message,   cs_setup, cs_teardown },
@@ -5187,6 +5304,7 @@ const test_entry_t compress_entries[] = {
     { "compress/datalog_sites_failed_decode", test_datalog_sites_failed_decode, rt_setup, rt_teardown },
     { "compress/datalog_sites_gen2_equal",   test_datalog_sites_gen2_equal,   rt_setup, rt_teardown },
     { "compress/join_sites_parted",          test_join_sites_parted,          rt_setup, rt_teardown },
+    { "compress/dml_parted_gen2",            test_dml_parted_gen2,            rt_setup, rt_teardown },
     { "compress/datalog_query_gen2_equal",   test_datalog_query_gen2_equal,   rt_setup, rt_teardown },
     { "compress/scalar_agg_planning_zoned", test_scalar_agg_planning_zoned, rt_setup, rt_teardown },
     { "compress/dag_presence_without_decode", test_dag_presence_without_decode, rt_setup, rt_teardown },

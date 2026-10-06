@@ -33,7 +33,6 @@
 /* Files not yet migrated off the legacy getters.  Part B removes an entry in
  * the task that migrates the file; this list is the only place to edit. */
 static const char* const srccheck_pending[] = {
-    "src/ops/query.c",
     NULL,
 };
 

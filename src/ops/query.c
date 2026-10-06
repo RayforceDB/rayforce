@@ -7321,25 +7321,6 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
     return result;
 }
 
-/* Materialize every encoded slot of a table before a verb that reads its
- * columns through the legacy getters, so a corrupt or failed decode returns
- * its own error (code and message) instead of a NULL column.  The decode is
- * cached: later getters hit it.  NULL when every slot is plain or decoded. */
-static ray_t* table_decode_all(ray_t* tbl) {
-    if (!tbl || tbl->type != RAY_TABLE) return NULL;
-    int64_t nc = ray_table_ncols(tbl);
-    for (int64_t c = 0; c < nc; c++) {
-        if (!ray_table_get_col_enc_idx(tbl, c)) continue;
-        ray_t* col = ray_table_col_idx(tbl, c);
-        if (col && RAY_IS_ERR(col)) return col;
-    }
-    return NULL;
-}
-#define TABLE_DECODE_OR_RETURN(tbl) do { \
-        ray_t* de_ = table_decode_all(tbl); \
-        if (de_) { ray_release(tbl); return de_; } \
-    } while (0)
-
 /* (select {from: t [where: pred] [by: key] [col: expr ...]})
  * Special form — receives unevaluated dict arg. */
 ray_t* ray_select(ray_t** args, int64_t n);
@@ -9379,8 +9360,8 @@ static bool update_expr_elementwise(ray_t* e, ray_t* tbl, bool meta_cols) {
     if (!e || RAY_IS_ERR(e)) return false;
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return true;
-        if (!meta_cols) return ray_table_get_col(tbl, e->i64) != NULL;
         ray_col_meta_t m;
+        if (!meta_cols) return ray_table_col_meta(tbl, e->i64, &m);
         return !ray_env_has_lexical_local(e->i64) && ray_table_col_meta(tbl, e->i64, &m);
     }
     if (e->type < 0) return true;
@@ -16218,22 +16199,30 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
     ray_t** el = (ray_t**)ray_data(where_expr);
     if (!el[0] || el[0]->type != -RAY_SYM) return 0;
     if (el[0]->i64 != ray_sym_intern("==", 2)) return 0;
-    ray_t* col = NULL; ray_t* val_node = NULL;
-    for (int side = 1; side <= 2 && !col; side++) {
+    ray_col_meta_t m;
+    int64_t col_sym = -1; ray_t* val_node = NULL;
+    for (int side = 1; side <= 2 && col_sym < 0; side++) {
         ray_t* a = el[side];
-        if (a && a->type == -RAY_SYM && ray_table_get_col(tbl, a->i64)) {
-            col = ray_table_get_col(tbl, a->i64);
+        if (a && a->type == -RAY_SYM && ray_table_col_meta(tbl, a->i64, &m)) {
+            col_sym = a->i64;
             val_node = el[3 - side];
         }
     }
-    if (!col || !val_node || RAY_IS_ERR(val_node)) return 0;
+    if (col_sym < 0 || !val_node || RAY_IS_ERR(val_node)) return 0;
     /* The other side must be a value: a literal, a quoted symbol, or a
      * variable — never a column name (that is a column-column compare). */
-    if (val_node->type == -RAY_SYM && ray_table_get_col(tbl, val_node->i64)) return 0;
+    ray_col_meta_t vm;
+    if (val_node->type == -RAY_SYM && ray_table_col_meta(tbl, val_node->i64, &vm)) return 0;
     if (!ray_is_atom(val_node)) return 0;
-    if (col->attrs & RAY_ATTR_HAS_NULLS) return 0;
-    if (ray_index_kind(col) != RAY_IDX_HASH) return 0;
-    if (col->type == RAY_F64 || col->type == RAY_STR || col->type == RAY_GUID) return 0;
+    if (ray_table_col_has_nulls(tbl, col_sym)) return 0;
+    if (m.index_kind != RAY_IDX_HASH) return 0;
+    if (m.type == RAY_F64 || m.type == RAY_STR || m.type == RAY_GUID) return 0;
+    ray_t* ix;
+    ray_t* ie = ray_table_col_index(tbl, col_sym, &ix);
+    if (ie) { ray_error_free(ie); return 0; }
+    if (!ix) return 0;
+    ray_t* col = ray_table_col(tbl, col_sym);       /* cached with its index */
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return 0; }
     ray_t* v = ray_eval(val_node);
     if (!v) return 0;
     if (RAY_IS_ERR(v)) { ray_error_free(v); return 0; }
@@ -16273,11 +16262,9 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
         ray_graph_free(g);
     }
     if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
-        int64_t ncols = ray_table_ncols(tbl);
         ray_env_push_query_scope();
-        for (int64_t c = 0; c < ncols; c++)
-            ray_env_set_query_local(ray_table_col_name(tbl, c), ray_table_get_col_idx(tbl, c));
-        mask_vec = ray_eval(where_expr);
+        ray_t* bind_err = bind_referenced_columns(tbl, &where_expr, 1);
+        mask_vec = bind_err ? bind_err : ray_eval(where_expr);
         ray_env_pop_scope();
     }
     if (!mask_vec) return ray_error("type", "update: `where:` predicate evaluation failed");
@@ -16380,11 +16367,12 @@ static int expr_refs_any_column(ray_t* expr, ray_t* tbl) {
     if (!expr) return 0;
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         if (ray_env_has_lexical_local(expr->i64)) return 0;
-        if (ray_table_get_col(tbl, expr->i64)) return 1;
+        ray_col_meta_t m;
+        if (ray_table_col_meta(tbl, expr->i64, &m)) return 1;
         if (ray_sym_is_dotted(expr->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(expr->i64, &segs);
-            if (nsegs >= 1 && ray_table_get_col(tbl, segs[0])) return 1;
+            if (nsegs >= 1 && ray_table_col_meta(tbl, segs[0], &m)) return 1;
         }
         return 0;
     }
@@ -16471,12 +16459,14 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
             return ray_error("nyi", "update: an if over a column that also aggregates is not supported without the planner");
         }
         if (!per_row) {
-            int64_t ncols = ray_table_ncols(sub);
             ray_env_push_query_scope();
-            for (int64_t c = 0; c < ncols; c++)
-                ray_env_set_query_local(ray_table_col_name(sub, c), ray_table_get_col_idx(sub, c));
-            out = ray_eval(expr);
+            ray_t* bind_err = bind_referenced_columns(sub, &expr, 1);
+            out = bind_err ? NULL : ray_eval(expr);
             ray_env_pop_scope();
+            if (bind_err) {
+                if (cerr) ray_error_free(cerr);
+                return bind_err;
+            }
         } else {
             out = eval_expr_per_row(expr, sub, nrows);
         }
@@ -16624,7 +16614,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     int64_t ncols = ray_table_ncols(tbl);
     if (inplace_sym < 0 || ncols <= 0) return NULL;
     if (tbl->rc != 2 || tbl->mmod != 0 || (tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) return NULL;
-    ray_t* live_cols = ((ray_t**)ray_data(tbl))[1];
+    ray_t* live_cols = ray_table_cols_inplace(tbl);      /* NULL: an encoded slot */
     if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols) return NULL;
     ray_t** slots = (ray_t**)ray_data(live_cols);
     for (int64_t c = 0; c < ncols; c++)
@@ -16783,7 +16773,6 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         ray_retain(tbl);
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "update: `from:` must be a table, got %s", ray_type_name(tbl_t)); }
-    TABLE_DECODE_OR_RETURN(tbl);
 
     /* A parted table's data columns carry the RAY_PARTED_BASE wrapper type
      * (which `ray_type_name` prints as "?"), and its partition key is
@@ -16796,21 +16785,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
      * materialising parted columns on demand; replicate it here by flattening
      * the whole table once so every branch below sees wrapped-free vectors. */
     if (table_has_parted_columns(tbl)) {
-        ray_t* flat_tbl = ray_table_new(ray_table_ncols(tbl));
-        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { ray_release(tbl); return flat_tbl ? flat_tbl : ray_error("oom", NULL); }
-        int64_t nc = ray_table_ncols(tbl);
-        for (int64_t c = 0; c < nc; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            ray_t* flat_col = query_materialize_parted_col(col);
-            if (!flat_col || RAY_IS_ERR(flat_col)) {
-                ray_release(flat_tbl); ray_release(tbl);
-                return flat_col ? flat_col : ray_error("oom", NULL);
-            }
-            flat_tbl = ray_table_add_col(flat_tbl, ray_table_col_name(tbl, c), flat_col);
-            ray_release(flat_col);
-            if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { ray_release(tbl); return flat_tbl ? flat_tbl : ray_error("oom", NULL); }
-        }
+        ray_t* flat_tbl = query_materialize_parted_table(tbl);
         ray_release(tbl);
+        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
         tbl = flat_tbl;
     }
 
@@ -16852,7 +16829,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         if (by_col_name < 0) { ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("type", "update by: group key must be a column name symbol"); }
 
         /* Find group column in table */
-        ray_t* grp_col = ray_table_get_col(tbl, by_col_name);
+        ray_t* grp_col = ray_table_col(tbl, by_col_name);
+        if (grp_col && RAY_IS_ERR(grp_col)) { ray_release(tbl); DICT_VIEW_CLOSE(updv); return grp_col; }
         if (!grp_col) { ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("domain", "update by: group key column not found"); }
         int64_t nrows2 = ray_table_nrows(tbl);
 
@@ -16905,8 +16883,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             /* We need to evaluate the aggregate per group.
              * Build the result column by evaluating the expression on each group's subset. */
             int8_t out_type = RAY_I64;
-            ray_t* target_col = ray_table_get_col(tbl, kid);
-            if (ngroups == 0 && target_col) out_type = target_col->type;
+            ray_col_meta_t tm;
+            if (ngroups == 0 && ray_table_col_meta(tbl, kid, &tm)) out_type = tm.type;
             ray_t* out_col = ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
             if (RAY_IS_ERR(out_col)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
             if (ngroups == 0) {
@@ -16928,7 +16906,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
                 for (int64_t c = 0; c < ncols; c++) {
                     int64_t cn = ray_table_col_name(tbl, c);
-                    ray_t* full_col = ray_table_get_col_idx(tbl, c);
+                    ray_t* full_col = ray_table_col_idx(tbl, c);
+                    if (!full_col || RAY_IS_ERR(full_col)) {
+                        ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                        return full_col ? full_col : ray_error("oom", NULL);
+                    }
                     int8_t ct = full_col->type;
                     /* Create sub_col with the SOURCE column's width. For a SYM
                      * column that dictionary-index width is adaptive
@@ -17073,7 +17055,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 upd_cols[ui] = NULL;
                 upd_used[ui] = 1;
             } else {
-                ray_t* col = ray_table_get_col_idx(tbl, c);
+                ray_t* col = ray_table_get_col_enc_idx(tbl, c);
+                if (!col) col = ray_table_col_idx(tbl, c);
                 ray_retain(col);
                 result = ray_table_add_col(result, cn, col);
                 ray_release(col);
@@ -17132,14 +17115,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         /* Fallback: eval-level predicate evaluation */
         if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
             /* Bind column names to column vectors in env, then eval */
-            int64_t ncols2 = ray_table_ncols(tbl);
             ray_env_push_query_scope();
-            for (int64_t c = 0; c < ncols2; c++) {
-                int64_t cn = ray_table_col_name(tbl, c);
-                ray_t* col = ray_table_get_col_idx(tbl, c);
-                ray_env_set_query_local(cn, col);
-            }
-            mask_vec = ray_eval(where_expr);
+            ray_t* bind_err = bind_referenced_columns(tbl, &where_expr, 1);
+            mask_vec = bind_err ? bind_err : ray_eval(where_expr);
             ray_env_pop_scope();
         }
         if (!mask_vec || RAY_IS_ERR(mask_vec)) { ray_release(tbl); return mask_vec ? mask_vec : ray_error("type", "update: `where:` predicate evaluation failed"); }
@@ -17172,7 +17150,6 @@ ray_t* ray_update(ray_t** args, int64_t n) {
 
         for (int64_t c = 0; c < ncols; c++) {
             int64_t col_name = ray_table_col_name(tbl, c);
-            ray_t* orig_col = ray_table_get_col_idx(tbl, c);
 
             /* Check if this column has an update expression */
             ray_t* update_expr = NULL;
@@ -17180,6 +17157,15 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 int64_t kid = dict_elems[d]->i64;
                 if (kid == from_id || kid == where_id) continue;
                 if (kid == col_name) { update_expr = dict_elems[d + 1]; break; }
+            }
+
+            /* A column copied as-is keeps its encoded object; an updated one
+             * is read for the merge. */
+            ray_t* orig_col = update_expr ? NULL : ray_table_get_col_enc_idx(tbl, c);
+            if (!orig_col) orig_col = ray_table_col_idx(tbl, c);
+            if (orig_col && RAY_IS_ERR(orig_col)) {
+                ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw);
+                return orig_col;
             }
 
             if (!update_expr) {
@@ -17509,8 +17495,6 @@ ray_t* ray_update(ray_t** args, int64_t n) {
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t col_name = ray_table_col_name(tbl, c);
-        ray_t* orig_col = ray_table_get_col_idx(tbl, c);
-
         ray_t* update_expr = NULL;
         for (int64_t d = 0; d + 1 < dict_n; d += 2) {
             int64_t kid = dict_elems[d]->i64;
@@ -17519,10 +17503,17 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         }
 
         if (!update_expr) {
+            /* Copied as-is: the slot object, encoded or plain. */
+            ray_t* orig_col = ray_table_get_col_enc_idx(tbl, c);
+            if (!orig_col) orig_col = ray_table_col_idx(tbl, c);
             ray_retain(orig_col);
             result = ray_table_add_col(result, col_name, orig_col);
             ray_release(orig_col);
         } else {
+            /* The replaced column is only typed: its values are not read. */
+            ray_col_meta_t om;
+            ray_table_col_meta_idx(tbl, c, &om);
+            int8_t oct = om.type;
             /* DAG first, then the interpreter (update_eval_on). */
             ray_t* expr_vec = update_eval_on(tbl, update_expr);
             if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
@@ -17537,7 +17528,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             /* Broadcast scalar atom to full column vector if needed */
             if (expr_vec->type < 0) {
                 int64_t nrows = ray_table_nrows(tbl);
-                int8_t ct = orig_col->type;
+                int8_t ct = oct;
                 /* Type check atom against column type BEFORE broadcast */
                 int ok = (expr_vec->type == -ct);
                 if (!ok && ct == RAY_F64 && expr_vec->type == -RAY_I64) ok = 1;
@@ -17617,7 +17608,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             }
 
             /* Promote I64 vector to F64 if column is F64 */
-            if (expr_vec->type == RAY_I64 && orig_col->type == RAY_F64) {
+            if (expr_vec->type == RAY_I64 && oct == RAY_F64) {
                 int64_t nr = ray_len(expr_vec);
                 ray_t* promoted = ray_vec_new(RAY_F64, nr);
                 if (RAY_IS_ERR(promoted)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return promoted; }
@@ -17644,18 +17635,18 @@ ray_t* ray_update(ray_t** args, int64_t n) {
              * Atoms (type<0) will be broadcast later, check after broadcast.
              * For vectors, check now: only numeric promotions or same type.
              * Also allow SYM/LIST interop (columns may be stored as LIST). */
-            if (expr_vec->type > 0 && expr_vec->type != orig_col->type) {
+            if (expr_vec->type > 0 && expr_vec->type != oct) {
                 int is_ok = 0;
                 /* Numeric promotions */
-                if ((orig_col->type == RAY_I64 || orig_col->type == RAY_I32 || orig_col->type == RAY_F64) &&
+                if ((oct == RAY_I64 || oct == RAY_I32 || oct == RAY_F64) &&
                     (expr_vec->type == RAY_I64 || expr_vec->type == RAY_I32 || expr_vec->type == RAY_F64))
                     is_ok = 1;
                 /* SYM/LIST interop */
-                if ((orig_col->type == RAY_SYM || orig_col->type == RAY_LIST) &&
+                if ((oct == RAY_SYM || oct == RAY_LIST) &&
                     (expr_vec->type == RAY_SYM || expr_vec->type == RAY_LIST))
                     is_ok = 1;
                 if (!is_ok) {
-                    int8_t ev_t = expr_vec->type, oc_t = orig_col->type;            /* capture BEFORE free */
+                    int8_t ev_t = expr_vec->type, oc_t = oct;            /* capture BEFORE free */
                     ray_release(expr_vec); ray_release(result); ray_release(tbl);
                     DICT_VIEW_CLOSE(upda); return ray_error("type", "update: expression type %s does not match %s column", ray_type_name(ev_t), ray_type_name(oc_t));
                 }
@@ -17781,21 +17772,33 @@ static bool table_has_parted_columns(ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return false;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && (col->type == RAY_MAPCOMMON || RAY_IS_PARTED(col->type)))
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) &&
+            (m.type == RAY_MAPCOMMON || RAY_IS_PARTED(m.type)))
             return true;
     }
     return false;
 }
 
 /* A fresh table with every parted / mapcommon column of `tbl` flattened
- * (query_materialize_parted_col); plain columns are shared.  Owned. */
+ * (query_materialize_parted_col); plain columns are shared, an encoded
+ * non-parted slot as its encoded object.  Owned. */
 static ray_t* query_materialize_parted_table(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* flat_tbl = ray_table_new(nc);
     if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* flat_col = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        ray_col_meta_t m;
+        ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
+        ray_t* flat_col;
+        if (enc && ray_table_col_meta_idx(tbl, c, &m) && !RAY_IS_PARTED(m.type)) {
+            ray_retain(enc);
+            flat_col = enc;
+        } else {
+            ray_t* src = ray_table_col_idx(tbl, c);
+            if (src && RAY_IS_ERR(src)) { ray_release(flat_tbl); return src; }
+            flat_col = query_materialize_parted_col(src);
+        }
         if (!flat_col || RAY_IS_ERR(flat_col)) {
             ray_release(flat_tbl);
             return flat_col ? flat_col : ray_error("oom", NULL);
@@ -17917,19 +17920,24 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
     memset(out, 0, sizeof(*out));
     if (tbl->len != 2 || tbl->attrs != 0)
         return ray_error("corrupt", "insert: parted target has non-canonical table metadata");
-    ray_t** table_slots = (ray_t**)ray_data(tbl);
-    ray_t* schema = table_slots[0];
-    ray_t* columns = table_slots[1];
+    ray_t* schema = ray_table_schema(tbl);
     if (!schema || RAY_IS_ERR(schema) || schema->type != RAY_I64 ||
-        schema->attrs != 0 || schema->len < 0 ||
-        !columns || RAY_IS_ERR(columns) || columns->type != RAY_LIST ||
-        columns->attrs != 0 || columns->len != schema->len)
+        schema->attrs != 0 || schema->len < 0)
         return ray_error("corrupt", "insert: parted target has a malformed table container");
     int64_t ncols = ray_table_ncols(tbl);
+    /* Canonical layout: every schema position holds a column slot. */
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t sm;
+        if (!ray_table_col_meta_idx(tbl, c, &sm))
+            return ray_error("corrupt", "insert: parted target has a malformed table container");
+    }
     if (ncols < 2)
         return ray_error("type", "insert: parted target must have a MAPCOMMON column and at least one physical column");
 
-    ray_t* mc = ray_table_get_col_idx(tbl, 0);
+    /* A MAPCOMMON slot is never encoded: it is read without a decode. */
+    ray_col_meta_t mm;
+    ray_t* mc = (ray_table_col_meta_idx(tbl, 0, &mm) && mm.type == RAY_MAPCOMMON && !mm.enc)
+              ? ray_table_col_idx(tbl, 0) : NULL;
     if (!mc || mc->type != RAY_MAPCOMMON || mc->len != 2 ||
         mc->attrs > RAY_MC_I64)
         return ray_error("type", "insert: three-argument table form requires a canonical .db.parted.get table");
@@ -17990,7 +17998,13 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
     ray_t* common_rep = NULL;
     bool active_missing = false;
     for (int64_t c = 1; c < ncols; c++) {
-        ray_t* wrapper = ray_table_get_col_idx(tbl, c);
+        /* Shape from metadata first; the wrapper is read for its segments
+         * (an encoded parted slot materializes to a plain wrapper). */
+        ray_col_meta_t wm;
+        if (!ray_table_col_meta_idx(tbl, c, &wm) || !RAY_IS_PARTED(wm.type) || wm.n_segs != nparts)
+            return ray_error("corrupt", "insert: physical column %lld is not a canonical PARTED wrapper", (long long)(c - 1));
+        ray_t* wrapper = ray_table_col_idx(tbl, c);
+        if (wrapper && RAY_IS_ERR(wrapper)) return wrapper;
         if (!wrapper || !RAY_IS_PARTED(wrapper->type) ||
             wrapper->len != nparts || wrapper->attrs != 0)
             return ray_error("corrupt", "insert: physical column %lld is not a canonical PARTED wrapper", (long long)(c - 1));
@@ -18112,8 +18126,9 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
         }
         ray_t** items = (ray_t**)ray_data(rows);
         for (int64_t c = 0; c < v->ndata; c++) {
-            ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
-            if (RAY_PARTED_BASETYPE(wrapper->type) == RAY_LIST) {
+            ray_col_meta_t wm;
+            ray_table_col_meta_idx(tbl, c + 1, &wm);         /* validated wrapper */
+            if (RAY_PARTED_BASETYPE(wm.type) == RAY_LIST) {
                 ray_t* one = ray_list_new(1);
                 if (!one || RAY_IS_ERR(one)) {
                     ray_release(vals);
@@ -18153,7 +18168,8 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
             }
         }
         for (int64_t c = 1; c < v->ncols; c++) {
-            ray_t* col = ray_table_get_col(rows, ray_table_col_name(tbl, c));
+            /* an error (a failed decode) is taken by parted_values_append */
+            ray_t* col = ray_table_col(rows, ray_table_col_name(tbl, c));
             vals = parted_values_append(vals, col, false);
             if (!vals || RAY_IS_ERR(vals)) return vals;
         }
@@ -18191,8 +18207,9 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
         }
         if (dvals->type == RAY_LIST) {
             ray_t* item = ((ray_t**)ray_data(dvals))[found];
-            ray_t* wrapper = ray_table_get_col_idx(tbl, c);
-            if (RAY_PARTED_BASETYPE(wrapper->type) == RAY_LIST &&
+            ray_col_meta_t wm;
+            ray_table_col_meta_idx(tbl, c, &wm);             /* validated wrapper */
+            if (RAY_PARTED_BASETYPE(wm.type) == RAY_LIST &&
                 item && item->type == RAY_LIST) {
                 ray_t* one = ray_list_new(1);
                 if (!one || RAY_IS_ERR(one)) {
@@ -18289,8 +18306,9 @@ static ray_t* validate_parted_payloads(ray_t* tbl,
     }
 
     for (int64_t c = 0; c < v->ndata; c++) {
-        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
-        int8_t dst = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+        ray_col_meta_t wm;
+        ray_table_col_meta_idx(tbl, c + 1, &wm);             /* validated wrapper */
+        int8_t dst = (int8_t)RAY_PARTED_BASETYPE(wm.type);
         ray_t* payload = pv[c];
         if (dst == RAY_LIST) {
             if (!parted_value_is_scalar(payload) && payload->type != RAY_LIST)
@@ -18638,7 +18656,7 @@ static ray_t* build_parted_mapcommon(parted_insert_view_t* v,
     mc->attrs = v->mapcommon->attrs;
     memset(mc->aux, 0, 16);
     ((ray_t**)ray_data(mc))[0] = keys;   /* transfer ownership */
-    ((ray_t**)ray_data(mc))[1] = counts;
+    ((ray_t**)ray_data(mc))[1] = counts;   /* not-a-table */
     return mc;
 }
 
@@ -18682,8 +18700,9 @@ static ray_t* intern_parted_payload_symbols(ray_t* tbl,
                                             int64_t batch) {
     ray_t** pv = (ray_t**)ray_data(vals);
     for (int64_t c = 0; c < v->ndata; c++) {
-        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
-        if (RAY_PARTED_BASETYPE(wrapper->type) != RAY_SYM) continue;
+        ray_col_meta_t wm;
+        ray_table_col_meta_idx(tbl, c + 1, &wm);             /* validated wrapper */
+        if (RAY_PARTED_BASETYPE(wm.type) != RAY_SYM) continue;
         ray_t* payload = pv[c];
         int64_t n = parted_value_is_scalar(payload) ? (batch ? 1 : 0) : batch;
         for (int64_t r = 0; r < n; r++) {
@@ -18706,8 +18725,9 @@ static ray_t* fill_parted_payload_symbols(ray_t* tbl,
     ray_t** pv = (ray_t**)ray_data(vals);
     ray_t** sv = (ray_t**)ray_data(staged);
     for (int64_t c = 0; c < v->ndata; c++) {
-        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
-        if (RAY_PARTED_BASETYPE(wrapper->type) != RAY_SYM) continue;
+        ray_col_meta_t wm;
+        ray_table_col_meta_idx(tbl, c + 1, &wm);             /* validated wrapper */
+        if (RAY_PARTED_BASETYPE(wm.type) != RAY_SYM) continue;
         ray_t* payload = pv[c];
         ray_t* seg = sv[c];
         for (int64_t r = 0; r < batch; r++) {
@@ -18779,7 +18799,14 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
     }
     ray_t** pv = (ray_t**)ray_data(vals);
     for (int64_t c = 0; c < v.ndata; c++) {
-        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
+        /* Read only: the active segment is rebuilt into a fresh one and the
+         * wrapper is replaced, so a materialized (shared) wrapper is never
+         * written. */
+        ray_t* wrapper = ray_table_col_idx(tbl, c + 1);
+        if (!wrapper || RAY_IS_ERR(wrapper)) {
+            ray_release(staged); ray_release(vals);
+            return wrapper ? wrapper : ray_error("corrupt", "insert: physical column %lld is missing", (long long)c);
+        }
         ray_t** segs = (ray_t**)ray_data(wrapper);
         int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
         ray_t* old_seg = new_partition ? NULL : segs[v.nparts - 1];
@@ -18827,7 +18854,11 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
     }
     ray_t** staged_segs = (ray_t**)ray_data(staged);
     for (int64_t c = 0; c < v.ndata; c++) {
-        ray_t* old_wrapper = ray_table_get_col_idx(tbl, c + 1);
+        ray_t* old_wrapper = ray_table_col_idx(tbl, c + 1);   /* read above: cached */
+        if (!old_wrapper || RAY_IS_ERR(old_wrapper)) {
+            ray_release(result); ray_release(staged); ray_release(vals);
+            return old_wrapper ? old_wrapper : ray_error("corrupt", "insert: physical column %lld is missing", (long long)c);
+        }
         ray_t** old_segs = (ray_t**)ray_data(old_wrapper);
         ray_t* wrapper = ray_alloc((size_t)new_nparts * sizeof(ray_t*));
         if (!wrapper || RAY_IS_ERR(wrapper)) {
@@ -18907,8 +18938,6 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             ray_retain(tbl);
         }
     }
-
-    TABLE_DECODE_OR_RETURN(tbl);
 
     /* ====================================================================
      * Vec/list dispatch — n==2 append, n==3 positional insert.
@@ -19181,8 +19210,15 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         ray_t** trl = (ray_t**)ray_data(tbl_row_list);
         for (int64_t c = 0; c < ncols; c++) {
             int64_t col_name = ray_table_col_name(tbl, c);
-            ray_t* src_col = ray_table_get_col(row, col_name);
-            if (!src_col) src_col = ray_table_get_col_idx(row, c);
+            ray_t* src_col = ray_table_col(row, col_name);
+            if (!src_col) src_col = ray_table_col_idx(row, c);
+            if (src_col && RAY_IS_ERR(src_col)) {
+                for (int64_t k = 0; k < c; k++) ray_release(trl[k]);
+                tbl_row_list->len = 0;
+                ray_free(tbl_row_list);
+                ray_release(tbl); ray_release(row_orig);
+                return src_col;
+            }
             if (!src_col) {
                 tbl_row_list->len = 0;
                 ray_free(tbl_row_list);
@@ -19281,7 +19317,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                       !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
     ray_t* live_cols = NULL;
     if (inplace_ok) {
-        live_cols = ((ray_t**)ray_data(tbl))[1];
+        live_cols = ray_table_cols_inplace(tbl);         /* NULL: an encoded slot */
         if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols)
             inplace_ok = false;
     }
@@ -19298,7 +19334,6 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
              * pointer cells, each retained by ray_list_append. */
             (col->type == RAY_LIST && ray_len(col) == 0) ||
             RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON ||
-            col->type == RAY_ENCCOL ||
             col->mmod != 0 ||
             (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA))) {
             inplace_ok = false;
@@ -19450,12 +19485,38 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         return err ? err : ray_sym(inplace_sym);
     }
 
+    /* The rebuild copies every column: read them all first, so a column
+     * that fails to materialize returns before anything is built (the
+     * loop below then reads the cached columns). */
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (!col || !RAY_IS_ERR(col)) continue;
+        if (dict_vals) {
+            ray_t** dv = (ray_t**)ray_data(dict_vals);
+            for (int64_t k = 0; k < ncols; k++) if (dv[k]) ray_release(dv[k]);
+            dict_vals->len = 0;
+            ray_free(dict_vals);
+        }
+        if (tbl_row_list) {
+            ray_t** trl = (ray_t**)ray_data(tbl_row_list);
+            for (int64_t k = 0; k < ncols; k++) if (trl[k]) ray_release(trl[k]);
+            tbl_row_list->len = 0;
+            ray_free(tbl_row_list);
+        }
+        ray_release(tbl); ray_release(row_orig);
+        return col;
+    }
+
     ray_t* result = ray_table_new(ncols);
     if (RAY_IS_ERR(result)) return result;
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t col_name = ray_table_col_name(tbl, c);
-        ray_t* orig_col = ray_table_get_col_idx(tbl, c);
+        ray_t* orig_col = ray_table_col_idx(tbl, c);      /* read above: cached */
+        if (!orig_col || RAY_IS_ERR(orig_col)) {
+            ray_release(result);
+            return orig_col ? orig_col : ray_error("domain", "insert: target column %lld is missing", (long long)c);
+        }
         int8_t ct = orig_col->type;
 
         /* Typeless empty column (an empty () list, adopt-on-first-insert).
@@ -19627,7 +19688,6 @@ static bool upsert_col_ok(ray_t* col) {
      * genuinely boxed and is written like any other. */
     if (col->type == RAY_LIST && ray_len(col) == 0) return false;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return false;
-    if (col->type == RAY_ENCCOL) return false;   /* in-place writes need a plain vector */
     if (col->mmod != 0) return false;
     if (col->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)) return false;
     /* Cells are written as W64 runtime-domain ids (append_atom_to_col);
@@ -19793,8 +19853,8 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
         ray_table_ukey_drop(tbl);
         return;
     }
-    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
-    if (!cols || RAY_IS_ERR(cols)) { ray_table_ukey_drop(tbl); return; }
+    ray_t* cols = ray_table_cols_inplace(tbl);
+    if (!cols) { ray_table_ukey_drop(tbl); return; }
     ray_t** slots = (ray_t**)ray_data(cols);
     int64_t kci[RAY_UKEY_MAX_COLS];
     int64_t nk = ix->u.ukey.nk;
@@ -20021,11 +20081,12 @@ static void upsert_rollback_appends(ray_t** slots, int64_t ncols, int64_t nrows0
 static bool upsert_vec_payload_ok(ray_t* tbl, ray_t** src_cols, int64_t ncols, int64_t m) {
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* sc = src_cols[c];
-        ray_t* tc = ray_table_get_col_idx(tbl, c);
-        if (!sc || RAY_IS_ERR(sc) || sc->type != tc->type) return false;
+        ray_col_meta_t tm;
+        if (!ray_table_col_meta_idx(tbl, c, &tm)) return false;
+        if (!sc || RAY_IS_ERR(sc) || sc->type != tm.type) return false;
         if (sc->attrs & RAY_ATTR_SLICE) return false;
         if (sc->len != m) return false;
-        switch (tc->type) {
+        switch (tm.type) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
         case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
         case RAY_GUID:
@@ -20325,11 +20386,17 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     int64_t nrows0 = ray_table_nrows(tbl);
     if (ncols <= 0 || m <= 0) return NULL;
 
-    for (int64_t c = 0; c < ncols; c++)
-        if (!upsert_col_ok(ray_table_get_col_idx(tbl, c))) return NULL;
+    /* An encoded slot is judged by the column it materializes to, which the
+     * copy below copies; a failed decode declines to the legacy arms, which
+     * read the column again and report it. */
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) { ray_error_free(col); return NULL; }
+        if (!upsert_col_ok(col)) return NULL;
+    }
     for (int64_t k = 0; k < nk; k++) {
-        ray_t* kc = ray_table_get_col_idx(tbl, kci[k]);
-        if (!upsert_key_type_ok(kc->type)) return NULL;
+        ray_col_meta_t km;
+        if (!ray_table_col_meta_idx(tbl, kci[k], &km) || !upsert_key_type_ok(km.type)) return NULL;
     }
 
     /* Sole-owner check, as in insert's in-place path: the binding holds
@@ -20339,14 +20406,12 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                    !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
     ray_t* live_cols = NULL;
     if (inplace) {
-        live_cols = ((ray_t**)ray_data(tbl))[1];
+        live_cols = ray_table_cols_inplace(tbl);         /* NULL: an encoded slot */
         if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols)
             inplace = false;
     }
-    for (int64_t c = 0; inplace && c < ncols; c++) {
-        ray_t* slot = ((ray_t**)ray_data(live_cols))[c];
-        if (slot->rc != 1 || slot->type == RAY_ENCCOL) inplace = false;
-    }
+    for (int64_t c = 0; inplace && c < ncols; c++)
+        if (((ray_t**)ray_data(live_cols))[c]->rc != 1) inplace = false;
 
     /* A batch of typed vectors matching the target is written column by
      * column; everything else is boxed into cells below. */
@@ -20405,18 +20470,22 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     for (int64_t r = 0; r < m && !err && !vec_path; r++) {
         ray_t** rc = cells + (size_t)r * ncols;
         for (int64_t k = 0; k < nk && !err; k++) {
-            ray_t* kc = ray_table_get_col_idx(tbl, kci[k]);
+            ray_col_meta_t km;
+            ray_table_col_meta_idx(tbl, kci[k], &km);
             ray_t* a = rc[kci[k]];
             if (!a) {
                 err = ray_error("domain", "upsert: key value missing");
-            } else if (kc->type == RAY_STR && a->type != -RAY_STR) {
+            } else if (km.type == RAY_STR && a->type != -RAY_STR) {
                 err = ray_error("type", "upsert: key column is str but key value is %s", ray_type_name(a->type));
-            } else if (kc->type == RAY_SYM && a->type != -RAY_SYM) {
+            } else if (km.type == RAY_SYM && a->type != -RAY_SYM) {
                 err = ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(a->type));
             }
         }
-        for (int64_t c = 0; c < ncols && !err; c++)
-            if (rc[c]) err = upsert_cell_fits(ray_table_get_col_idx(tbl, c)->type, rc[c]);
+        for (int64_t c = 0; c < ncols && !err; c++) {
+            ray_col_meta_t cm;
+            ray_table_col_meta_idx(tbl, c, &cm);
+            if (rc[c]) err = upsert_cell_fits(cm.type, rc[c]);
+        }
     }
 
     /* Work table: the live columns, or a private copy of them. */
@@ -20428,7 +20497,10 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
             work = ray_table_new(ncols);
             if (RAY_IS_ERR(work)) { err = work; work = NULL; }
             for (int64_t c = 0; c < ncols && !err; c++) {
-                ray_t* orig = ray_table_get_col_idx(tbl, c);
+                /* An encoded slot's cached materialization reaches ray_cow
+                 * shared (rc 2 with this retain), so it is copied. */
+                ray_t* orig = ray_table_col_idx(tbl, c);
+                if (!orig || RAY_IS_ERR(orig)) { err = orig ? orig : ray_error("oom", NULL); break; }
                 ray_retain(orig);
                 ray_t* cp = ray_cow(orig);
                 if (!cp || RAY_IS_ERR(cp)) {
@@ -20440,7 +20512,12 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                 ray_release(cp);
                 if (RAY_IS_ERR(work)) { err = work; work = NULL; }
             }
-            if (!err) slots = (ray_t**)ray_data(((ray_t**)ray_data(work))[1]);
+            if (!err) {
+                /* a table of private copies: never an encoded slot */
+                ray_t* wc = ray_table_cols_inplace(work);
+                if (wc) slots = (ray_t**)ray_data(wc);
+                else err = ray_error("oom", NULL);
+            }
         }
     }
 
@@ -20618,7 +20695,6 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
 
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("type", "upsert: target must be a table, got %s", ray_type_name(tbl_t)); }
     if (!is_list(row) && row->type != RAY_TABLE && row->type != RAY_DICT) { int8_t row_t = row->type; ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("type", "upsert: row must be a list, table or dict, got %s", ray_type_name(row_t)); }
-    { ray_t* de = table_decode_all(tbl); if (de) { ray_release(tbl); ray_release(key_sym); ray_release(row); return de; } }
 
     int64_t ncols = ray_table_ncols(tbl);
 
@@ -20722,7 +20798,13 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         if (!src_cols) { scratch_free(tkci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
         for (int64_t c = 0; c < ncols; c++) {
             int64_t cn = ray_table_col_name(tbl, c);
-            src_cols[c] = ray_table_get_col(row, cn);
+            src_cols[c] = ray_table_col(row, cn);
+            if (src_cols[c] && RAY_IS_ERR(src_cols[c])) {
+                ray_t* e = src_cols[c];
+                scratch_free(srcs_hdr); scratch_free(tkci_hdr);
+                ray_release(tbl); ray_release(key_sym); ray_release(row);
+                return e;
+            }
         }
 
         bool fast_handled = false;
@@ -20924,7 +21006,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
     if (!key_sym_want) { scratch_free(kci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
     for (int64_t k = 0; k < n_key_cols; k++) {
         int64_t kci = key_col_indices[k];
-        ray_t* key_col = ray_table_get_col_idx(tbl, kci);
+        ray_t* key_col = ray_table_col_idx(tbl, kci);
+        if (!key_col || RAY_IS_ERR(key_col)) {
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return key_col ? key_col : ray_error("domain", "upsert: key column not found in target table");
+        }
         ray_t* key_atom = row_elems[kci];
         int8_t kt = key_col->type;
         if (kt == RAY_STR && key_atom->type != -RAY_STR) {
@@ -20958,7 +21045,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         int match = 1;
         for (int64_t k = 0; k < n_key_cols && match; k++) {
             int64_t kci = key_col_indices[k];
-            ray_t* key_col = ray_table_get_col_idx(tbl, kci);
+            ray_t* key_col = ray_table_col_idx(tbl, kci);   /* read above: cached */
             ray_t* key_atom = row_elems[kci];
             int8_t kt = key_col->type;
             if (kt == RAY_F64) {
@@ -21010,7 +21097,11 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t col_name = ray_table_col_name(tbl, c);
-        ray_t* orig_col = ray_table_get_col_idx(tbl, c);
+        ray_t* orig_col = ray_table_col_idx(tbl, c);
+        if (!orig_col || RAY_IS_ERR(orig_col)) {
+            ray_release(result); ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return orig_col ? orig_col : ray_error("domain", "upsert: target column %lld is missing", (long long)c);
+        }
         int8_t ct = orig_col->type;
 
         ray_t* new_col = ray_vec_new(ct, nrows);
@@ -21140,11 +21231,12 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
             return ray_error("type", "join: key must be a symbol name, got %s", ray_type_name(ke_t));
         }
         int64_t key_name = key_elems[i]->i64;
-        ray_t* left_key_col = ray_table_get_col(left_tbl, key_name);
-        ray_t* right_key_col = ray_table_get_col(right_tbl, key_name);
-        if (!left_key_col || !right_key_col) {
+        ray_col_meta_t lkm, rkm;            /* key types only: the scans read the data */
+        bool has_l = ray_table_col_meta(left_tbl, key_name, &lkm);
+        bool has_r = ray_table_col_meta(right_tbl, key_name, &rkm);
+        if (!has_l || !has_r) {
             ray_t* key_name_str = ray_sym_str(key_name);
-            const char* side = !left_key_col ? "left" : "right";
+            const char* side = !has_l ? "left" : "right";
             scratch_free(keyops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
             if (key_name_str) {
@@ -21154,8 +21246,8 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
             }
             return ray_error("domain", "join: key column not found in %s table", side);
         }
-        int8_t left_key_type = left_key_col->type;
-        int8_t right_key_type = right_key_col->type;
+        int8_t left_key_type = lkm.type;
+        int8_t right_key_type = rkm.type;
         if (RAY_IS_PARTED(left_key_type)) left_key_type = (int8_t)RAY_PARTED_BASETYPE(left_key_type);
         if (RAY_IS_PARTED(right_key_type)) right_key_type = (int8_t)RAY_PARTED_BASETYPE(right_key_type);
         if ((left_key_type == RAY_STR) != (right_key_type == RAY_STR)) {
@@ -21238,11 +21330,12 @@ static ray_t* antijoin_impl(ray_t** args, int64_t n) {
             return ray_error("type", "antijoin: key must be a symbol name, got %s", ray_type_name(ke_t));
         }
         int64_t key_name = key_elems[i]->i64;
-        ray_t* left_key_col = ray_table_get_col(left_tbl, key_name);
-        ray_t* right_key_col = ray_table_get_col(right_tbl, key_name);
-        if (!left_key_col || !right_key_col) {
+        ray_col_meta_t lkm, rkm;            /* key types only: the scans read the data */
+        bool has_l = ray_table_col_meta(left_tbl, key_name, &lkm);
+        bool has_r = ray_table_col_meta(right_tbl, key_name, &rkm);
+        if (!has_l || !has_r) {
             ray_t* key_name_str = ray_sym_str(key_name);
-            const char* side = !left_key_col ? "left" : "right";
+            const char* side = !has_l ? "left" : "right";
             scratch_free(keyops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
             if (key_name_str)
@@ -21250,8 +21343,8 @@ static ray_t* antijoin_impl(ray_t** args, int64_t n) {
                                  (int)ray_str_len(key_name_str), ray_str_ptr(key_name_str), side);
             return ray_error("domain", "antijoin: key column not found in %s table", side);
         }
-        int8_t left_key_type = left_key_col->type;
-        int8_t right_key_type = right_key_col->type;
+        int8_t left_key_type = lkm.type;
+        int8_t right_key_type = rkm.type;
         if (RAY_IS_PARTED(left_key_type)) left_key_type = (int8_t)RAY_PARTED_BASETYPE(left_key_type);
         if (RAY_IS_PARTED(right_key_type)) right_key_type = (int8_t)RAY_PARTED_BASETYPE(right_key_type);
         if ((left_key_type == RAY_STR) != (right_key_type == RAY_STR)) {
@@ -21694,6 +21787,13 @@ static int8_t join_i64_eq_key_type(ray_t* col) {
     return t;
 }
 
+/* The same, from a table column's metadata (0 when absent). */
+static int8_t join_i64_eq_key_type_of(ray_t* tbl, int64_t sym) {
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, sym, &m)) return 0;
+    return RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
+}
+
 static bool join_i64_eq_key_supported(int8_t t) {
     switch (t) {
     case RAY_BOOL:
@@ -21751,8 +21851,10 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         int64_t right_nrows = ray_table_nrows(right_tbl);
 
         /* Get left time column */
-        ray_t* left_time = ray_table_get_col(left_tbl, time_key);
-        ray_t* right_time = ray_table_get_col(right_tbl, time_key);
+        ray_t* left_time = ray_table_col(left_tbl, time_key);
+        if (left_time && RAY_IS_ERR(left_time)) { for (int i = 0; i < 4; i++) ray_release(eargs[i]); return left_time; }
+        ray_t* right_time = ray_table_col(right_tbl, time_key);
+        if (right_time && RAY_IS_ERR(right_time)) { for (int i = 0; i < 4; i++) ray_release(eargs[i]); return right_time; }
         if (!left_time || !right_time) return ray_error("domain", "window-join: time key column not found in both tables");
 
         /* Get equality columns.  One calloc'd carve holds every n_eq-sized eq
@@ -21774,8 +21876,16 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         uint8_t*     eq_attrs    = (uint8_t*)(eq_type + n_eq);
         for (int64_t e = 0; e < n_eq; e++) {
             int64_t eq_key = sym_cell_runtime_id(keys_vec, e);
-            left_eq[e] = ray_table_get_col(left_tbl, eq_key);
-            right_eq[e] = ray_table_get_col(right_tbl, eq_key);
+            left_eq[e] = ray_table_col(left_tbl, eq_key);
+            right_eq[e] = left_eq[e] && RAY_IS_ERR(left_eq[e]) ? NULL : ray_table_col(right_tbl, eq_key);
+            ray_t* eq_err = left_eq[e] && RAY_IS_ERR(left_eq[e]) ? left_eq[e]
+                          : right_eq[e] && RAY_IS_ERR(right_eq[e]) ? right_eq[e] : NULL;
+            if (eq_err) {
+                left_eq[e] = right_eq[e] = NULL;
+                scratch_free(eq_hdr);
+                for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                return eq_err;
+            }
             if (!left_eq[e] || !right_eq[e]) {
                 scratch_free(eq_hdr);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
@@ -21919,7 +22029,13 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("domain", "window-join: unsupported aggregation op");
             }
-            ray_t* src = ray_table_get_col(right_tbl, agg_src_ids[a]);
+            ray_t* src = ray_table_col(right_tbl, agg_src_ids[a]);
+            if (src && RAY_IS_ERR(src)) {
+                for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
+                for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
+                return src;
+            }
             if (!src) {
                 for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
@@ -22286,7 +22402,8 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         ray_t* result = ray_table_new(ncols + n_agg);
         for (int64_t c = 0; c < ncols; c++) {
             int64_t cn = ray_table_col_name(left_tbl, c);
-            ray_t* cv = ray_table_get_col_idx(left_tbl, c);
+            ray_t* cv = ray_table_get_col_enc_idx(left_tbl, c);
+            if (!cv) cv = ray_table_col_idx(left_tbl, c);
             ray_retain(cv);
             result = ray_table_add_col(result, cn, cv);
             ray_release(cv);
@@ -22353,10 +22470,8 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: unknown equality key symbol"); }
         eq_ops[i] = ray_scan(g, ray_str_ptr(nm));
         if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: equality key column not found"); }
-        ray_t* lcol = ray_table_get_col(left_tbl, eq_elems[i]->i64);
-        ray_t* rcol = ray_table_get_col(right_tbl, eq_elems[i]->i64);
-        int8_t lct = join_i64_eq_key_type(lcol);
-        int8_t rct = join_i64_eq_key_type(rcol);
+        int8_t lct = join_i64_eq_key_type_of(left_tbl, eq_elems[i]->i64);
+        int8_t rct = join_i64_eq_key_type_of(right_tbl, eq_elems[i]->i64);
         if (!join_i64_eq_key_supported(lct) ||
             !join_i64_eq_key_supported(rct)) {
             scratch_free(eqops_hdr);
@@ -22478,10 +22593,8 @@ static ray_t* ray_asof_join_core(ray_t* keys_vec, ray_t* left_tbl, ray_t* right_
         /* The asof kernel reads equality keys through read_col_i64
          * (asof_eq_lread). Decline types it cannot represent instead of
          * returning silently corrupted matches. */
-        ray_t* lcol = ray_table_get_col(left_tbl, eq_syms[i]->i64);
-        ray_t* rcol = ray_table_get_col(right_tbl, eq_syms[i]->i64);
-        int8_t lct = join_i64_eq_key_type(lcol);
-        int8_t rct = join_i64_eq_key_type(rcol);
+        int8_t lct = join_i64_eq_key_type_of(left_tbl, eq_syms[i]->i64);
+        int8_t rct = join_i64_eq_key_type_of(right_tbl, eq_syms[i]->i64);
         if (!join_i64_eq_key_supported(lct) ||
             !join_i64_eq_key_supported(rct)) {
             scratch_free(eqops_hdr);
@@ -22719,7 +22832,8 @@ static ray_t* try_stream_parted_order_by(
             kid == nearest_id) continue;
         ray_t* v = dict_elems[i + 1];
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
-        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+        ray_col_meta_t vm;
+        if (!ray_table_col_meta(tbl, v->i64, &vm)) return NULL;
     }
 
     /* Carve: key syms + resolved parted columns + two per-segment key-vec
@@ -22751,14 +22865,22 @@ static ray_t* try_stream_parted_order_by(
      * an undecidable key even when every segment is 0/1 rows (where the
      * per-segment sortedness check would trivially pass). */
     for (int64_t k = 0; k < n_keys; k++) {
-        ray_t* col = ray_table_get_col(tbl, key_syms[k]);
-        if (!col || !RAY_IS_PARTED(col->type) || col->len != nseg) {
+        ray_col_meta_t km;
+        if (!ray_table_col_meta(tbl, key_syms[k], &km) ||
+            !RAY_IS_PARTED(km.type) || km.n_segs != nseg) {
             scratch_free(hdr); return NULL;
         }
-        int8_t bt = (int8_t)RAY_PARTED_BASETYPE(col->type);
+        int8_t bt = (int8_t)RAY_PARTED_BASETYPE(km.type);
         if (bt != RAY_BOOL && bt != RAY_U8 && bt != RAY_I16 && bt != RAY_I32 &&
             bt != RAY_I64 && bt != RAY_DATE && bt != RAY_TIME &&
             bt != RAY_TIMESTAMP && bt != RAY_SYM) {
+            scratch_free(hdr); return NULL;
+        }
+        /* The segments are read: a failed decode declines, and the flat
+         * path reads the column again and reports it. */
+        ray_t* col = ray_table_col(tbl, key_syms[k]);
+        if (!col || RAY_IS_ERR(col)) {
+            if (col) ray_error_free(col);
             scratch_free(hdr); return NULL;
         }
         kcols[k] = col;
@@ -22936,7 +23058,8 @@ static ray_t* try_stream_parted_order_by_topk(
             kid == nearest_id) continue;
         ray_t* v = dict_elems[i + 1];
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
-        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+        ray_col_meta_t vm;
+        if (!ray_table_col_meta(tbl, v->i64, &vm)) return NULL;
     }
 
     /* Every sort key must appear as an output alias (dict key of an output
@@ -23005,8 +23128,12 @@ static ray_t* asof_parted_date_keys(ray_t* tbl, int64_t* out_n) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && col->type == RAY_MAPCOMMON) {
+        /* A MAPCOMMON slot is never encoded: found from metadata, read
+         * without a decode (so this never fails). */
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(tbl, c, &m) || m.type != RAY_MAPCOMMON || m.enc) continue;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && !RAY_IS_ERR(col) && col->type == RAY_MAPCOMMON) {
             ray_t** mc = (ray_t**)ray_data(col);
             if (col->len >= 1 && mc[0] && mc[0]->type == RAY_DATE) {
                 *out_n = mc[0]->len;
@@ -23029,13 +23156,17 @@ static ray_t* asof_empty_right(ray_t* dict, ray_t* parted_tbl) {
     ray_t* out = ray_table_new(nc);
     if (!out || RAY_IS_ERR(out)) { ray_release(seg0); return out ? out : ray_error("oom", NULL); }
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(seg0, c);
+        ray_col_meta_t m;
+        bool has = ray_table_col_meta_idx(seg0, c, &m);
         int64_t nm = ray_table_col_name(seg0, c);
-        int8_t  ct = col ? col->type : RAY_I64;
+        int8_t  ct = has ? m.type : RAY_I64;
         ray_t*  ev = ray_vec_new(ct, 0);
         if (!ev || RAY_IS_ERR(ev)) { ray_release(seg0); ray_release(out); return ev ? ev : ray_error("oom", NULL); }
         ev->len = 0;
-        if (ct == RAY_SYM && col) ray_sym_vec_adopt_domain(ev, col);
+        if (ct == RAY_SYM && has) {             /* the column's domain, without a decode */
+            if (m.enc) ray_enccol_adopt_domain(ev, m.enc);
+            else ray_sym_vec_adopt_domain(ev, ray_table_col_idx(seg0, c));
+        }
         out = ray_table_add_col(out, nm, ev);
         ray_release(ev);
         if (!out || RAY_IS_ERR(out)) { ray_release(seg0); return out ? out : ray_error("oom", NULL); }
@@ -23168,7 +23299,8 @@ static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
     if (!out || RAY_IS_ERR(out)) { ray_release(raw); return out ? out : ray_error("oom", NULL); }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t nm = ray_table_col_name(template, c);
-        ray_t* col = ray_table_get_col(raw, nm);
+        ray_t* col = ray_table_get_col_enc(raw, nm);
+        if (!col) col = ray_table_col(raw, nm);
         if (!col) { ray_release(raw); ray_release(out); return ray_error("schema", "asof carry: column %lld missing from group-last", (long long)nm); }
         out = ray_table_add_col(out, nm, col);
         if (!out || RAY_IS_ERR(out)) { ray_release(raw); return out ? out : ray_error("oom", NULL); }
@@ -23554,7 +23686,6 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         int8_t t = tbl->type; ray_release(tbl);
         return ray_error("type", "delete: `from:` must be a table, got %s", ray_type_name(t));
     }
-    TABLE_DECODE_OR_RETURN(tbl);
 
     /* A parted table's columns carry the RAY_PARTED_BASE wrapper and its
      * partition key is RAY_MAPCOMMON; neither describes a flat element the
@@ -23562,17 +23693,9 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
      * path declines a parted table anyway (upsert_col_ok rejects the
      * wrapper), so this only feeds the copying form. */
     if (table_has_parted_columns(tbl)) {
-        ray_t* flat = ray_table_new(ray_table_ncols(tbl));
-        if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
-        int64_t nc = ray_table_ncols(tbl);
-        for (int64_t c = 0; c < nc; c++) {
-            ray_t* fc = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
-            if (!fc || RAY_IS_ERR(fc)) { ray_release(flat); ray_release(tbl); return fc ? fc : ray_error("oom", NULL); }
-            flat = ray_table_add_col(flat, ray_table_col_name(tbl, c), fc);
-            ray_release(fc);
-            if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
-        }
+        ray_t* flat = query_materialize_parted_table(tbl);
         ray_release(tbl);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
         tbl = flat;
     }
 
@@ -23584,12 +23707,16 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
      * leaves ray_data resolving into the parent's storage, so compacting the
      * copy would move the PARENT's elements.  The in-place path declines one
      * through upsert_col_ok; the copying form has no such backstop, so refuse
-     * rather than corrupt a buffer somebody else owns. */
-    for (int64_t c = 0; c < ncols; c++)
-        if (ray_table_get_col_idx(tbl, c)->attrs & RAY_ATTR_SLICE) {
+     * rather than corrupt a buffer somebody else owns.  SLICE is a runtime
+     * attr of a plain slot; an encoded slot is never a slice. */
+    for (int64_t c = 0; c < ncols; c++) {
+        if (ray_table_get_col_enc_idx(tbl, c)) continue;
+        ray_t* col = ray_table_col_idx(tbl, c);              /* plain: no decode */
+        if (col && (col->attrs & RAY_ATTR_SLICE)) {
             ray_release(tbl);
             return ray_error("domain", "delete: column %lld is a slice view", (long long)c);
         }
+    }
 
     /* Decide in-place BEFORE evaluating the predicate.  The predicate machinery
      * binds the table's columns into a query scope (and builds a graph over
@@ -23598,7 +23725,7 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
                    !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
     ray_t* live_cols = NULL;
     if (inplace) {
-        live_cols = ((ray_t**)ray_data(tbl))[1];
+        live_cols = ray_table_cols_inplace(tbl);         /* NULL: an encoded slot */
         if (!live_cols || live_cols->rc != 1 || live_cols->len != ncols) inplace = false;
     }
     for (int64_t c = 0; inplace && c < ncols; c++) {
@@ -23652,7 +23779,10 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         return work ? work : ray_error("oom", NULL);
     }
     for (int64_t c = 0; c < ncols && !err; c++) {
-        ray_t* orig = ray_table_get_col_idx(tbl, c);
+        /* An encoded slot's cached materialization reaches ray_cow shared
+         * (rc 2 with this retain), so it is copied. */
+        ray_t* orig = ray_table_col_idx(tbl, c);
+        if (!orig || RAY_IS_ERR(orig)) { err = orig ? orig : ray_error("oom", NULL); break; }
         ray_retain(orig);
         ray_t* cp = ray_cow(orig);
         if (!cp || RAY_IS_ERR(cp)) { ray_release(orig); err = cp ? cp : ray_error("oom", NULL); break; }
@@ -23661,8 +23791,10 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         if (!work || RAY_IS_ERR(work)) { err = work ? work : ray_error("oom", NULL); work = NULL; }
     }
     if (!err) {
-        ray_t** wslots = (ray_t**)ray_data(((ray_t**)ray_data(work))[1]);
-        err = delete_compact_cols(wslots, ncols, nrows0, rows, k);
+        /* a table of private copies: never an encoded slot */
+        ray_t* wc = ray_table_cols_inplace(work);
+        err = wc ? delete_compact_cols((ray_t**)ray_data(wc), ncols, nrows0, rows, k)
+                 : ray_error("oom", NULL);
     }
     scratch_free(rows_hdr);
     ray_release(tbl);
