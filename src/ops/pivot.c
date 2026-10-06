@@ -27,6 +27,7 @@
 #include "ops/hash.h"
 #include "ops/idxop.h"
 #include "ops/rowsel.h"
+#include "ops/colbind.h"  /* ray_graph_unbind_table */
 #include "table/domain.h"   /* raw vocabulary snapshot for if_sym_side_t */
 #include "core/pool.h"
 #include "lang/format.h"    /* ray_type_name (error context) */
@@ -266,6 +267,8 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
     }
     g->table = saved_table;
     g->selection = saved_sel;
+    /* the branch bound the sub-table's columns on g: drop them with it */
+    if (sub != saved_table) ray_graph_unbind_table(g, sub);
     ray_release(sub);
     return value;
 }

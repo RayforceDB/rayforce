@@ -2247,6 +2247,17 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     return _prof_result;
 }
 
+/* Release a table an operator consumed (a selection-compacted copy, a
+ * child's result) after unbinding it: kernels compiled over it bound its
+ * columns on `g`, and each bind retains its column until ray_graph_free, so
+ * a released temporary would stay alive for the rest of the graph.  The
+ * query table itself keeps its binds. */
+static void exec_release_tmp(ray_graph_t* g, ray_t* t) {
+    if (t && !RAY_IS_ERR(t) && t->type == RAY_TABLE && t != g->table)
+        ray_graph_unbind_table(g, t);
+    ray_release(t);
+}
+
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -2404,7 +2415,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
             }
             ray_t* result = exec_reduction(g, op, input);
-            if (own_input) ray_release(input);
+            if (own_input) exec_release_tmp(g, input);
             return result;
         }
 
@@ -3065,7 +3076,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 tbl = compacted;
             }
             ray_t* result = exec_sort(g, op, tbl, 0);
-            ray_release(input);
+            exec_release_tmp(g, input);
             return result;
         }
 
@@ -3239,7 +3250,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 left = compacted;
             }
             ray_t* result = exec_join(g, op, left, right);
-            ray_release(left);
+            exec_release_tmp(g, left);
             ray_release(right);
             return result;
         }
@@ -3257,7 +3268,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 left = compacted;
             }
             ray_t* result = exec_antijoin(g, op, left, right);
-            ray_release(left);
+            exec_release_tmp(g, left);
             ray_release(right);
             return result;
         }
@@ -3275,7 +3286,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 left = compacted;
             }
             ray_t* result = exec_window_join(g, op, left, right);
-            ray_release(left);
+            exec_release_tmp(g, left);
             ray_release(right);
             return result;
         }
@@ -3295,7 +3306,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 wdf = compacted;
             }
             ray_t* result = exec_window(g, op, wdf);
-            ray_release(input);
+            exec_release_tmp(g, input);
             return result;
         }
 
@@ -3319,7 +3330,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     tbl = compacted;
                 }
                 ray_t* result = exec_sort(g, child_op, tbl, n);
-                ray_release(sort_input);
+                exec_release_tmp(g, sort_input);
                 /* Top-level statement GC catches intermediates. */
                 return result;
             }
@@ -3408,7 +3419,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
                 ray_t* result = exec_filter_head(ftbl, pred, n);
                 ray_release(pred);
-                ray_release(filter_input);
+                exec_release_tmp(g, filter_input);
                 /* Top-level statement GC catches intermediates. */
                 return result;
             } else {

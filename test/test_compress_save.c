@@ -2671,6 +2671,22 @@ static test_result_t test_unbind_releases_temporaries(void) {
     for (int i = 0; i < 3; i++) tot += ((int64_t*)ray_data(s))[i];
     TEST_ASSERT_EQ_I(tot, 3 * ((int64_t)199999 * 200000 / 2));                       /* sum of v + w = 3 * v */
     ray_release(r);
+
+    /* gen-0 IF projection: each branch runs over its rows' compacted
+     * sub-table, whose binds are dropped with it; the memory is back after
+     * the query */
+    ray_mem_stats(&m0);
+    d0 = ray_graph_binds_dropped();
+    r = ray_eval_str("(select {x: (if (> v 100000) (+ v w) (- v w)) from: T})");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(ray_graph_binds_dropped() >= d0 + 2);                         /* both branches */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 200000);
+    ray_t* x = ray_table_get_col(r, ray_sym_intern("x", 1));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(x))[7], -7);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(x))[150000], 450000);
+    ray_release(r);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_TRUE(m1.bytes_allocated < m0.bytes_allocated + 65536);
     PASS();
 }
 

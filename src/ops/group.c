@@ -16381,6 +16381,15 @@ static inline int64_t grp_sorted_lower_bound(const int64_t* a, int64_t n,
     return lo;
 }
 
+/* Release a per-partition sub-table: its expression keys / agg inputs were
+ * evaluated on the outer graph (exec_node with g->table swapped), which
+ * bound the sub-table's columns there; drop those binds with it, or each
+ * would keep its partition's column alive until the graph is freed. */
+static void pp_release_sub(ray_graph_t* g, ray_t* sub) {
+    if (sub && !RAY_IS_ERR(sub)) ray_graph_unbind_table(g, sub);
+    ray_release(sub);
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -16740,7 +16749,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             int64_t part_nrows = -1;
             for (int j = 0; j < n_borrow; j++) {
                 ray_t* seg = group_parted_seg(parted_tbl, borrow_syms[j], p);
-                if (!seg) { ray_release(sub); goto batch_fail; }
+                if (!seg) { pp_release_sub(g, sub); goto batch_fail; }
                 if (part_nrows < 0) part_nrows = seg->len;
                 ray_retain(seg);
                 sub = ray_table_add_col(sub, borrow_syms[j], seg);
@@ -16762,7 +16771,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
                     (part_nrows >= 0 && v->len != part_nrows)) {
                     if (v && !RAY_IS_ERR(v)) ray_release(v);
-                    ray_release(sub); goto batch_fail;
+                    pp_release_sub(g, sub); goto batch_fail;
                 }
                 sub = ray_table_add_col(sub, key_syms[k], v);
                 ray_release(v);
@@ -16776,14 +16785,14 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
                     (part_nrows >= 0 && v->len != part_nrows)) {
                     if (v && !RAY_IS_ERR(v)) ray_release(v);
-                    ray_release(sub); goto batch_fail;
+                    pp_release_sub(g, sub); goto batch_fail;
                 }
                 sub = ray_table_add_col(sub, agg_syms[a], v);
                 ray_release(v);
             }
 
             ray_graph_t* pg = ray_graph_new(sub);
-            if (!pg) { ray_release(sub); goto batch_fail; }
+            if (!pg) { pp_release_sub(g, sub); goto batch_fail; }
 
             for (uint32_t k = 0; k < n_part_keys; k++) {
                 ray_t* sym_atom = ray_sym_str(pk_syms[k]);
@@ -16818,19 +16827,19 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * ray_graph_free(pg) releases pg->selection. */
             if (saved_sel) {
                 if (part_nrows >= 0 && part_nrows != sel_len) {
-                    ray_graph_free(pg); ray_release(sub); goto batch_fail;
+                    ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail;
                 }
                 for (int64_t j = 0; j < sel_cnt; j++)
                     local_ids[j] = sel_ids[sel_lo + j] - sel_off;
                 ray_t* lsel = ray_index_rowsel_from_ids(sel_len, local_ids,
                                                         sel_cnt);
-                if (!lsel) { ray_graph_free(pg); ray_release(sub); goto batch_fail; }
+                if (!lsel) { ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail; }
                 pg->selection = lsel;
             }
 
             bp[bi] = ray_execute(pg, proot);
             ray_graph_free(pg);
-            ray_release(sub);
+            pp_release_sub(g, sub);
 
             if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
             if (ref_bi < 0) ref_bi = bi;   /* first built partial in this batch */
