@@ -3453,6 +3453,227 @@ static test_result_t test_slice_group_bound(void) {
     PASS();
 }
 
+/* ---- Task 28: group-by and the aggregate engine ---- */
+
+typedef struct { ray_t* t; const char* key; uint16_t op; const char* c1; const char* c2; } gp_ctx_t;
+static ray_t* gp_body(void* c) {
+    gp_ctx_t* x = c;
+    ray_graph_t* g = ray_graph_new(x->t);
+    ray_op_t* keys[1] = { ray_scan(g, x->key) };
+    uint16_t ops[1] = { x->op };
+    ray_op_t* ins[1] = { ray_scan(g, x->c1) };
+    ray_op_t* ins2[1] = { x->c2 ? ray_scan(g, x->c2) : NULL };
+    ray_t* r = ray_execute(g, ray_group_build(g, keys, 1, ops, ins, x->c2 ? ins2 : NULL, NULL, 1));
+    if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    ray_graph_free(g);
+    return r;
+}
+
+/* Every group-by entry that reads a column reports a failed materialization
+ * as itself (code and column path), on a generation-2 table loaded from disk
+ * and on a select result whose slot is passed encoded. */
+static test_result_t gp_failed_decode_one(int64_t n) {
+    static const struct { const char* key; uint16_t op; const char* c1; const char* c2; const char* what; } cases[] = {
+        { "a", OP_COUNT,         "b", NULL, "key a" },
+        { "b", OP_SUM,           "a", NULL, "sum a" },
+        { "b", OP_MEDIAN,        "a", NULL, "median a (indexed)" },
+        { "b", OP_PEARSON_CORR,  "a", "b",  "pearson a b" },
+        { "b", OP_PEARSON_CORR,  "b", "a",  "pearson b a" },
+        { "b", OP_FIRST,         "a", NULL, "first a" },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        for (int via_select = 0; via_select < 2; via_select++) {
+            ray_t* t = ex_table(n, true);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_t* in = t;
+            if (via_select) {
+                in = ex_run(t, EX_SELECT_PASS);                 /* a passed encoded into the result */
+                TEST_ASSERT_TRUE(in && !RAY_IS_ERR(in) && in->type == RAY_TABLE);
+                TEST_ASSERT_TRUE(ray_table_get_col_enc(in, ray_sym_intern("a", 1)) != NULL);
+            }
+            gp_ctx_t cx = { in, cases[k].key, cases[k].op, cases[k].c1, cases[k].c2 };
+            ray_error_clear();
+            ray_t* r = gp_body(&cx);
+            char what[96]; snprintf(what, sizeof what, "%s%s", cases[k].what, via_select ? " (select result)" : "");
+            test_result_t rr = ex_corrupt(r, what);
+            if (in != t) ray_release(in);
+            ray_release(t);
+            if (rr.status != TEST_PASS) return rr;
+        }
+    }
+    PASS();
+}
+
+static test_result_t test_group_sites_failed_decode(void) {
+    test_result_t r = gp_failed_decode_one(3000);
+    if (r.status != TEST_PASS) return r;
+    return gp_failed_decode_one(200000);
+}
+
+/* A healthy generation-2 table, directly and through a select result, groups
+ * to the generation-0 answer, and takes the same route with the same
+ * planning outcome. */
+static test_result_t gp_same_routes(ray_t* t0, ray_t* t2, const char* key, uint16_t op, const char* c1,
+                                    const char* c2, const char* what) {
+    gp_ctx_t c0 = { t0, key, op, c1, c2 }, cg = { t2, key, op, c1, c2 };
+    agg_route_reset();
+    ray_t* r0 = gp_body(&c0);
+    agg_route_stats_t s0 = agg_route_stats();
+    agg_route_reset();
+    ray_t* r2 = gp_body(&cg);
+    agg_route_stats_t s2 = agg_route_stats();
+    TEST_ASSERT_FMT(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2), "%s: ran", what);
+    TEST_ASSERT_FMT(memcmp(s0.routes, s2.routes, sizeof s0.routes) == 0, "%s: routes differ", what);
+    TEST_ASSERT_FMT(s0.last_v2_reason == s2.last_v2_reason && s0.nullable_key == s2.nullable_key &&
+                    s0.dense_plan_available == s2.dense_plan_available &&
+                    s0.dense_strategy == s2.dense_strategy && s0.dense_tasks == s2.dense_tasks,
+                    "%s: planning differs", what);
+    TEST_ASSERT_FMT(cp_fmt_same(r0, r2), "%s: answers differ", what);
+    ray_release(r0); ray_release(r2);
+    PASS();
+}
+
+static test_result_t test_group_sites_routes_same(void) {
+    TEST_ASSERT_TRUE(cp_save());
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    ray_t* t0 = cp_read(0); ray_t* t2 = cp_read(2);
+    TEST_ASSERT_TRUE(t0 && t2 && !RAY_IS_ERR(t0) && !RAY_IS_ERR(t2));
+    static const struct { const char* key; uint16_t op; const char* c1; const char* c2; } cases[] = {
+        { "k0", OP_SUM, "a", NULL },            /* dense */
+        { "k1", OP_SUM, "a", NULL },            /* sparse: table-stack */
+        { "k2", OP_AVG, "f", NULL },            /* dense, 8192 groups */
+        { "k4", OP_SUM, "a", NULL },            /* radix */
+        { "f",  OP_SUM, "a", NULL },            /* F64 key: indexed */
+        { "x",  OP_SUM, "a", NULL },            /* nullable SYM key */
+        { "k0", OP_MEDIAN, "a", NULL },         /* holistic: indexed */
+        { "k0", OP_FIRST, "a", NULL },          /* first/last */
+        { "k0", OP_PEARSON_CORR, "a", "b" },    /* binary */
+        { "k0", OP_COUNT, "a", NULL },
+    };
+    test_result_t res = { TEST_PASS, NULL };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases && res.status == TEST_PASS; i++) {
+        char w[64]; snprintf(w, sizeof w, "case %zu (%s)", i, cases[i].key);
+        res = gp_same_routes(t0, t2, cases[i].key, cases[i].op, cases[i].c1, cases[i].c2, w);
+    }
+    /* the same shapes over a select result whose slots are encoded */
+    if (res.status == TEST_PASS) {
+        ray_graph_t* g = ray_graph_new(t2);
+        ray_op_t* cs[3] = { ray_scan(g, "k0"), ray_scan(g, "k4"), ray_scan(g, "a") };
+        ray_t* sel = ray_execute(g, ray_select_op(g, ray_const_table(g, t2), cs, 3));
+        ray_graph_free(g);
+        TEST_ASSERT_TRUE(sel && !RAY_IS_ERR(sel) && sel->type == RAY_TABLE);
+        TEST_ASSERT_TRUE(ray_table_get_col_enc(sel, ray_sym_intern("a", 1)) != NULL);
+        res = gp_same_routes(t0, sel, "k0", OP_SUM, "a", NULL, "select result k0");
+        if (res.status == TEST_PASS) res = gp_same_routes(t0, sel, "k4", OP_SUM, "a", NULL, "select result k4");
+        ray_release(sel);
+    }
+    ray_release(t0); ray_release(t2);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    return res;
+}
+
+/* The slice-group route is taken on a table loaded from generation 2 with a
+ * recorded index, as it is on generation 0. */
+static test_result_t gp_slice_route(const char* dir, bool compress, ray_t** out) {
+    TEST_ASSERT_STR_EQ(ev_code("(set SY ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh])"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set KS (as 'SYM (at SY (% (til 4000) 8))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set FF (* 0.5 (as 'F64 (% (til 4000) 64))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set TI (table [s f] (list (.attr.set 'grouped KS) FF)))"), "");
+    char cmd[400];
+    snprintf(cmd, sizeof cmd, "(.db.splayed.set \"%s\" TI {compress: %s})", dir, compress ? "true" : "false");
+    TEST_ASSERT_STR_EQ(ev_code(cmd), "");
+    snprintf(cmd, sizeof cmd, "(set TL (.db.splayed.get \"%s\"))", dir);
+    TEST_ASSERT_STR_EQ(ev_code(cmd), "");
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_GROUP_SLICE];
+    *out = ray_eval_str("(select {sv: (sum f) c: (count f) from: TL by: s asc: s where: (in s ['aa 'cc])})");
+    TEST_ASSERT_TRUE(*out && !RAY_IS_ERR(*out));
+    TEST_ASSERT_FMT(ray_idx_hits[IDX_SITE_GROUP_SLICE] == hits0 + 1, "%s: slice path ran %llu times", compress ? "gen 2" : "gen 0",
+                    (unsigned long long)(ray_idx_hits[IDX_SITE_GROUP_SLICE] - hits0));
+    PASS();
+}
+
+static test_result_t test_group_sites_slice_route(void) {
+    ray_t *a = NULL, *b = NULL;
+    test_result_t r = gp_slice_route(CS_TMP "/sl0", false, &a);
+    if (r.status != TEST_PASS) return r;
+    r = gp_slice_route(CS_TMP "/sl2", true, &b);
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_TRUE(cp_fmt_same(a, b) && ray_table_nrows(a) == 2);
+    ray_release(a); ray_release(b);
+    PASS();
+}
+
+/* Parted group-by: the per-partition route (MAPCOMMON key), the concat
+ * fallback (a parted key) and the pass of encoded segments take the same
+ * routes and give the same answers on generation 0 and 2; a segment that
+ * fails to materialize is the query's error. */
+static ray_t* gp_parted_body(void* c) {
+    gp_ctx_t* x = c;
+    return gp_body(x);
+}
+static test_result_t test_group_sites_parted(void) {
+    ray_t* t0 = pdb_make(CS_TMP "/gp0", 0, false);
+    ray_t* t2 = pdb_make(CS_TMP "/gp2", 7, false);
+    TEST_ASSERT_TRUE(t0 && t2);
+    static const struct { const char* key; uint16_t op; const char* c1; } cases[] = {
+        { "date", OP_SUM, "a" },           /* per-partition */
+        { "date", OP_AVG, "b" },           /* per-partition with the AVG decomposition */
+        { "a",    OP_SUM, "b" },           /* high cardinality: concat fallback */
+    };
+    test_result_t res = { TEST_PASS, NULL };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases && res.status == TEST_PASS; i++) {
+        gp_ctx_t c0 = { t0, cases[i].key, cases[i].op, cases[i].c1, NULL };
+        gp_ctx_t c2 = { t2, cases[i].key, cases[i].op, cases[i].c1, NULL };
+        agg_route_reset(); ray_t* r0 = gp_parted_body(&c0); agg_route_stats_t s0 = agg_route_stats();
+        agg_route_reset(); ray_t* r2 = gp_parted_body(&c2); agg_route_stats_t s2 = agg_route_stats();
+        TEST_ASSERT_FMT(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2), "case %zu ran", i);
+        TEST_ASSERT_FMT(s0.routes[AGG_ROUTE_PARTED] >= 1, "case %zu: parted route", i);
+        TEST_ASSERT_FMT(memcmp(s0.routes, s2.routes, sizeof s0.routes) == 0, "case %zu: routes differ", i);
+        TEST_ASSERT_FMT(cp_fmt_same(r0, r2), "case %zu: answers differ", i);
+        ray_release(r0); ray_release(r2);
+    }
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+static test_result_t test_group_sites_parted_failed_decode(void) {
+    static const struct { const char* key; uint16_t op; const char* c1; const char* what; } cases[] = {
+        { "date", OP_SUM, "a", "per-partition" },
+        { "a",    OP_SUM, "b", "concat fallback key" },
+        { "date", OP_SUM, "b", "per-partition (healthy column)" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        (void)ray_test_rm_rf(CS_TMP "/gpf");
+        ray_t* t = pdb_make(CS_TMP "/gpf", 7, false);
+        TEST_ASSERT_TRUE(t);
+        ray_release(t);
+        /* damage partition 2's column a, then load again: the damage passes the load checks */
+        FILE* f = fopen(CS_TMP "/gpf/2024.01.02/t/a", "r+b");
+        TEST_ASSERT_TRUE(f != NULL);
+        fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
+        t = ray_read_parted(CS_TMP "/gpf", "t");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        gp_ctx_t cx = { t, cases[i].key, cases[i].op, cases[i].c1, NULL };
+        ray_error_clear();
+        ray_t* r = gp_parted_body(&cx);
+        if (i == 2) {   /* column a is never read: the answer is the healthy one */
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: expected a result", cases[i].what);
+            ray_release(r);
+        } else {
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", cases[i].what);
+            TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s", cases[i].what, ray_err_code(r));
+            TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), "2024.01.02/t/a"), "%s: message %s",
+                            cases[i].what, ray_error_msg() ? ray_error_msg() : "(none)");
+            ray_error_free(r);
+        }
+        ray_release(t);
+    }
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -3535,5 +3756,10 @@ const test_entry_t compress_entries[] = {
     { "compress/exec_sites_failed_decode", test_exec_sites_failed_decode, rt_setup, rt_teardown },
     { "compress/exec_sites_gen2_equal",    test_exec_sites_gen2_equal,    rt_setup, rt_teardown },
     { "compress/filter_absent_symbol",     test_filter_absent_symbol,     rt_setup, rt_teardown },
+    { "compress/group_sites_failed_decode", test_group_sites_failed_decode, rt_setup, rt_teardown },
+    { "compress/group_sites_routes_same",   test_group_sites_routes_same,   rt_setup, rt_teardown },
+    { "compress/group_sites_slice_route",   test_group_sites_slice_route,   rt_setup, rt_teardown },
+    { "compress/group_sites_parted",        test_group_sites_parted,        rt_setup, rt_teardown },
+    { "compress/group_sites_parted_failed_decode", test_group_sites_parted_failed_decode, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

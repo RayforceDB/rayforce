@@ -6016,7 +6016,8 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
         uint16_t kind = ext->agg_ops[a];
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* src = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
+        ray_t* src = ie ? ray_table_col(tbl, ie->sym) : NULL;
+        if (src && RAY_IS_ERR(src)) { ray_release(result); result = src; goto done; }
         int64_t param = ext->agg_k ? ext->agg_k[a] : 0;
         ray_t* col = NULL;
         if (kind == OP_MEDIAN) col = ray_median_per_group_buf(src, rows, offsets, counts, ng);
@@ -6052,8 +6053,10 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
+            ray_t* ycol = ray_table_col(tbl, ye->sym);
+            if (ycol && RAY_IS_ERR(ycol)) { ray_release(result); result = ycol; goto done; }
             col = agg_index_streaming(agg_resolve(kind, src->type), src,
-                ray_table_get_col(tbl, ye->sym), &groups, rows, offsets, nrows, param);
+                ycol, &groups, rows, offsets, nrows, param);
         } else if (kind == OP_COUNT) {
             col = ray_vec_new(RAY_I64, ng);
             if (col && !RAY_IS_ERR(col)) { col->len = ng; memcpy(ray_data(col), counts, (size_t)ng * sizeof(int64_t)); }
@@ -6153,7 +6156,8 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
     if (agg_ops && (ef->agg_op ? ef->agg_op : OP_COUNT) != agg_ops[ef->agg_index]) return result;
     int64_t nrows = ray_table_nrows(result);
     if (nrows <= 0) return result;
-    ray_t* vcol = ray_table_get_col_idx(result, (int64_t)n_keys + ef->agg_index);
+    ray_t* vcol = ray_table_col_idx(result, (int64_t)n_keys + ef->agg_index);
+    if (vcol && RAY_IS_ERR(vcol)) { ray_release(result); return vcol; }
     if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64)) return result;
     double* vals = ray_alloc_raw((size_t)nrows * sizeof(double));
     uint8_t* keep = ray_alloc_raw((size_t)nrows);
@@ -6591,7 +6595,8 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     bool identity = true;
     for (int64_t r = 0; r < set.n; r++) {
         for (uint32_t k = 0; k < n_keys; k++) {
-            ray_t* oc = ray_table_get_col_idx(sub, k);
+            ray_t* oc = ray_table_col_idx(sub, k);
+            if (oc && RAY_IS_ERR(oc)) { res = oc; goto done; }
             if (!oc || oc->type != key_cols[k]->type) goto done;
             kv[k] = agg_read_key_i64(oc, ray_data(oc), r);
         }
@@ -6650,7 +6655,12 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     int64_t* key_syms = (int64_t*)(key_cols + ext->n_keys);
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_op_ext_t* kext = find_ext(g, ext->keys[k]);
-        key_cols[k] = ray_table_get_col(tbl, kext->sym);
+        key_cols[k] = ray_table_col(tbl, kext->sym);
+        if (key_cols[k] && RAY_IS_ERR(key_cols[k])) {
+            ray_t* kerr = key_cols[k];
+            scratch_free(kc_hdr);
+            return kerr;
+        }
         key_syms[k] = kext->sym;
         if (key_cols[k]->type != RAY_SYM && ray_vec_may_have_nulls(key_cols[k]))
             route_stats.nullable_key = true;
@@ -6969,12 +6979,15 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* col;
         if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {       /* binary agg (pearson) */
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
-            ray_t* x_col = ray_table_get_col(tbl, ie->sym);
-            ray_t* y_col = ray_table_get_col(tbl, ye->sym);
+            ray_t* x_col = ray_table_col(tbl, ie->sym);
+            if (x_col && RAY_IS_ERR(x_col)) { agg_groups_free(&groups); ray_release(result); return x_col; }
+            ray_t* y_col = ray_table_col(tbl, ye->sym);
+            if (y_col && RAY_IS_ERR(y_col)) { agg_groups_free(&groups); ray_release(result); return y_col; }
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], x_col->type);
             col = agg_run_one_bin(vt, x_col, y_col, groups.gids, nrows, groups.ngroups, kparam);
         } else {
-            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
+            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_col(tbl, ie->sym) : NULL;
+            if (val_col && RAY_IS_ERR(val_col)) { agg_groups_free(&groups); ray_release(result); return val_col; }
             int8_t in_type = val_col ? val_col->type : RAY_I64;
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], in_type);
             col = agg_run_one(vt, val_col, groups.gids, nrows, groups.ngroups, kparam);
@@ -7041,7 +7054,8 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         return compact ? compact : ray_error("oom", NULL);
     }
     for (uint32_t i = 0; i < n_want; i++) {
-        ray_t* src = ray_table_get_col(tbl, want[i]);
+        ray_t* src = ray_table_col(tbl, want[i]);
+        if (src && RAY_IS_ERR(src)) { ray_release(compact); scratch_free(want_hdr); return src; }
         if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
         ray_t* gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
         if (!gcol || RAY_IS_ERR(gcol)) {
@@ -7736,7 +7750,8 @@ ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms
             for (int j = 0; j < keep_n; j++) if (keep_syms[j] == cn) { req = true; break; }
             if (!req) continue;
         }
-        ray_t* sc = ray_table_get_col_idx(tbl, c);
+        ray_t* sc = ray_table_col_idx(tbl, c);
+        if (sc && RAY_IS_ERR(sc)) { agg_groups_free(&groups); ray_release(result); return sc; }
         if (!sc) continue;
         ray_t* dc = agg_gather_col_at(sc, groups.first_row, groups.ngroups);
         if (!dc || RAY_IS_ERR(dc)) {
