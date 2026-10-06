@@ -35,6 +35,7 @@
 #include "ops/rowsel.h"
 #include "store/col.h"
 #include <string.h>
+#include <stddef.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -376,18 +377,21 @@ static test_result_t test_index_hash_large_parallel(void) {
     TEST_ASSERT_EQ_I(ix->u.hash.n_keys, ref_keys);
     TEST_ASSERT_EQ_I(ix->u.hash.n_groups, ref_groups);
     const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
-    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
+    /* The slot table and group offsets are stored narrow below 2^32 rows. */
+    TEST_ASSERT_EQ_I(ix->u.hash.table->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ix->u.hash.offs->type, RAY_I32);
+    const uint32_t* of = (const uint32_t*)ray_data(ix->u.hash.offs);
     const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-    TEST_ASSERT_EQ_I(of[0], 0);
-    TEST_ASSERT_EQ_I(of[ref_groups], ref_keys);
+    TEST_ASSERT_EQ_I((int64_t)of[0], 0);
+    TEST_ASSERT_EQ_I((int64_t)of[ref_groups], ref_keys);
     /* Serial layout: groups in first-occurrence order, each with its count,
      * rows ascending and all storing the group's key. */
     for (int64_t g = 0; g < ref_groups; g++) {
         TEST_ASSERT_EQ_I(gk[g], ref_key[g]);
-        TEST_ASSERT_EQ_I(of[g + 1] - of[g], ref_cnt[g]);
-        for (int64_t j = of[g]; j < of[g + 1]; j++) {
+        TEST_ASSERT_EQ_I((int64_t)of[g + 1] - (int64_t)of[g], ref_cnt[g]);
+        for (int64_t j = (int64_t)of[g]; j < (int64_t)of[g + 1]; j++) {
             TEST_ASSERT_EQ_I(xs[rw[j]], ref_key[g]);
-            if (j > of[g]) TEST_ASSERT_TRUE(rw[j] > rw[j - 1]);
+            if (j > (int64_t)of[g]) TEST_ASSERT_TRUE(rw[j] > rw[j - 1]);
         }
     }
     /* table probes: every key resolves to its group, an absent key misses */
@@ -579,6 +583,113 @@ static test_result_t test_index_persistence_roundtrip(void) {
     TEST_ASSERT_EQ_I(d[199], 1990);
 
     ray_release(loaded);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Narrow hash index on disk ───────────────────────────────────────
+ *
+ * Below 2^32 rows the hash index keeps its slot table and group offsets
+ * as 32-bit values, written as layout generation 2.  A column saved that
+ * way maps back with the same answers; a generation-1 region (64-bit
+ * arrays, as written before) still maps; and a generation-1 region that
+ * carries a narrow array is not trusted (the column loads unindexed). */
+static ray_t* idx_widen(ray_t* v) {
+    if (v->type != RAY_I32) return v;
+    ray_t* w = ray_vec_new(RAY_I64, v->len);
+    w->len = v->len;
+    for (int64_t i = 0; i < v->len; i++)
+        ((int64_t*)ray_data(w))[i] = (int64_t)((const uint32_t*)ray_data(v))[i];
+    ray_release(v);
+    return w;
+}
+static ray_t* hx_test_narrow(ray_t* v) {
+    if (v->type != RAY_I64) return v;
+    ray_t* w = ray_vec_new(RAY_I32, v->len);
+    w->len = v->len;
+    for (int64_t i = 0; i < v->len; i++)
+        ((uint32_t*)ray_data(w))[i] = (uint32_t)((const int64_t*)ray_data(v))[i];
+    ray_release(v);
+    return w;
+}
+static test_result_t idx_narrow_check(ray_t* col, int64_t n, int64_t keys) {
+    TEST_ASSERT_TRUE(col->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(ray_index_kind(col), RAY_IDX_HASH);
+    for (int64_t k = 0; k < keys + 3; k++) {
+        int64_t want = k < keys ? k : -1;
+        TEST_ASSERT_EQ_I(ray_index_find_row(col, k), want);
+        const int64_t* rows = NULL; int64_t gn = 0;
+        int hit = ray_index_hash_group(col, k, &rows, &gn);
+        if (k >= keys) { TEST_ASSERT_EQ_I(hit, 0); continue; }
+        TEST_ASSERT_EQ_I(hit, 1);
+        TEST_ASSERT_EQ_I(gn, (n - 1 - k) / keys + 1);
+        for (int64_t j = 0; j < gn; j++) TEST_ASSERT_EQ_I(rows[j], k + j * keys);
+    }
+    PASS();
+}
+static test_result_t test_index_hash_narrow_roundtrip(void) {
+    ray_heap_init();
+    const int64_t n = 100000, keys = 977;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i % keys;
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
+    ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ix->u.hash.table->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ix->u.hash.offs->type, RAY_I32);
+    test_result_t r = idx_narrow_check(w, n, keys);
+    if (r.status != TEST_PASS) return r;
+
+    char path[] = "/tmp/idx_narrow_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    /* generation 2: narrow arrays map back narrow */
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);
+    ray_t* m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->index->order, 2);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.offs->type, RAY_I32);
+    r = idx_narrow_check(m, n, keys);
+    ray_release(m);
+    if (r.status != TEST_PASS) { unlink(path); return r; }
+
+    /* generation 1: an index written with 64-bit arrays still maps */
+    ix->u.hash.table = idx_widen(ix->u.hash.table);
+    ix->u.hash.offs  = idx_widen(ix->u.hash.offs);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);
+    m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->index->order, 1);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.offs->type, RAY_I64);
+    r = idx_narrow_check(m, n, keys);
+    ray_release(m);
+    if (r.status != TEST_PASS) { unlink(path); return r; }
+
+    /* a generation-1 region holding a narrow array is not trusted */
+    ix->u.hash.offs = hx_test_narrow(ix->u.hash.offs);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);   /* written as generation 2 */
+    {
+        struct stat st;
+        TEST_ASSERT_EQ_I(stat(path, &st), 0);
+        int64_t region = ray_index_inline_size(ix);
+        FILE* f = fopen(path, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t gen = 1;
+        TEST_ASSERT_EQ_I(fseek(f, (long)(st.st_size - region) + (long)offsetof(ray_t, order), SEEK_SET), 0);
+        TEST_ASSERT_EQ_I(fwrite(&gen, 1, 1, f), 1);
+        fclose(f);
+    }
+    m = ray_col_mmap(path);
+    unlink(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_FALSE(m->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(m))[978], 1);   /* the data itself still reads */
+    ray_release(m);
+
     ray_release(w);
     ray_heap_destroy();
     PASS();
@@ -3849,6 +3960,7 @@ const test_entry_t index_entries[] = {
     { "index/aux_helper_slice",          test_index_aux_helper_slice,          NULL, NULL },
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
     { "index/mapped_drop_unmaps_tail", test_index_mapped_drop_unmaps_tail, NULL, NULL },
+    { "index/hash_narrow_roundtrip", test_index_hash_narrow_roundtrip, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },
     { "index/i16_zone_and_hash",             test_index_i16_zone_and_hash,             NULL, NULL },
