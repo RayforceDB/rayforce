@@ -38,4 +38,10 @@ void           ray_graph_binds_free(ray_graph_t* g);
 uint32_t       ray_graph_binds_count(const ray_graph_t* g);   /* tests */
 void           ray_graph_bind_test_fail_alloc(int64_t nth);   /* tests: fail the nth bind (0 = off) */
 
+/* True when the column is present but its shape is not a bindable source
+ * (a partition key column, a slice of a parted or encoded column): a
+ * compile site declines these as a shape, the way it declined them before
+ * the bind stage existed, instead of treating the bind's error as a failure. */
+bool ray_col_bind_declines(ray_t* tbl, int64_t sym);
+
 #endif /* RAY_COLBIND_H */

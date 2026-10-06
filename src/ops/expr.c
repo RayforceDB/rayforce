@@ -26,6 +26,7 @@
 #include "lang/format.h"    /* ray_type_name */
 #include "ops/rowsel.h"
 #include "table/table.h"   /* ray_table_col_meta */
+#include "ops/colbind.h"
 #include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE per-morsel zone-skip */
 #include <stdio.h>
 #include <stdlib.h>
@@ -383,7 +384,8 @@ static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                                        agg_linear_t* out_plan) {
+                                        agg_linear_t* out_plan, ray_t** err) {
+    *err = NULL;
     if (!g || !tbl || !input_op || !out_plan) return false;
     linear_expr_i64_t lin;
     if (!parse_linear_i64_expr(g, input_op, &lin)) return false;
@@ -391,16 +393,26 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     memset(out_plan, 0, sizeof(*out_plan));
     out_plan->n_terms = lin.n_terms;
     out_plan->bias_i64 = lin.bias_i64;
+    /* Every decision first, from the bound sources; the plain columns are
+     * requested only once the plan is certain (a decline decodes nothing). */
+    ray_col_src_t* srcs[AGG_LINEAR_MAX_TERMS];
     for (uint8_t i = 0; i < lin.n_terms; i++) {
-        ray_t* col = ray_table_get_col(tbl, lin.syms[i]);
-        if (!col || !type_is_linear_i64_col(col->type)) return false;
+        if (ray_col_bind_declines(tbl, lin.syms[i])) return false;
+        srcs[i] = ray_graph_bind_col(g, tbl, lin.syms[i], err);
+        if (!srcs[i]) return false;
+        if (srcs[i]->parted || !type_is_linear_i64_col(srcs[i]->type)) return false;
         /* scalar_sum_linear_i64_fn reads slots raw via scalar_i64_at;
          * any nullable term would poison the sum with NULL_I{16,32,64}
          * sentinels.  Refuse the fast plan and let the caller fall back
          * to the generic masked path. */
-        if (ray_vec_may_have_nulls(col)) return false;
+        if (srcs[i]->may_null) return false;
+    }
+    for (uint8_t i = 0; i < lin.n_terms; i++) {
+        ray_t* col = NULL;
+        *err = ray_col_src_plain(srcs[i], &col);
+        if (*err) return false;
         out_plan->term_ptrs[i] = ray_data(col);
-        out_plan->term_types[i] = col->type;
+        out_plan->term_types[i] = srcs[i]->type;
         out_plan->coeff_i64[i] = lin.coeff_i64[i];
     }
     out_plan->enabled = true;
@@ -414,7 +426,8 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
  * The fused read promotes each side to double exactly like expr's
  * promote(), so the accumulated sum is bit-compatible. */
 bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                               agg_prod_t* out) {
+                               agg_prod_t* out, ray_t** err) {
+    *err = NULL;
     if (!g || !tbl || !input_op || !out) return false;
     if (input_op->opcode != OP_MUL || input_op->arity != 2) return false;
     ray_op_t* lhs = op_child(g, input_op, 0);
@@ -424,29 +437,38 @@ bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     ray_op_ext_t* lx = find_ext(g, lhs->id);
     ray_op_ext_t* rx = find_ext(g, rhs->id);
     if (!lx || !rx) return false;
-    ray_t* ca = ray_table_get_col(tbl, lx->sym);
-    ray_t* cb = ray_table_get_col(tbl, rx->sym);
-    if (!ca || !cb || RAY_IS_ERR(ca) || RAY_IS_ERR(cb)) return false;
-    if (RAY_IS_PARTED(ca->type) || ca->type == RAY_MAPCOMMON) return false;
-    if (RAY_IS_PARTED(cb->type) || cb->type == RAY_MAPCOMMON) return false;
-    if (ray_vec_may_have_nulls(ca) || ray_vec_may_have_nulls(cb))
+    if (ray_col_bind_declines(tbl, lx->sym) || ray_col_bind_declines(tbl, rx->sym))
+        return false;
+    ray_col_src_t* sa = ray_graph_bind_col(g, tbl, lx->sym, err);
+    if (!sa) return false;
+    ray_col_src_t* sb = ray_graph_bind_col(g, tbl, rx->sym, err);
+    if (!sb) return false;
+    if (sa->parted || sb->parted) return false;
+    if (sa->may_null || sb->may_null)
         return false;
     #define PROD_OK_T(t) ((t) == RAY_F64 || (t) == RAY_I64 || (t) == RAY_I32 || \
                           (t) == RAY_I16 || (t) == RAY_U8  || (t) == RAY_BOOL)
-    if (!PROD_OK_T(ca->type) || !PROD_OK_T(cb->type)) return false;
+    if (!PROD_OK_T(sa->type) || !PROD_OK_T(sb->type)) return false;
     #undef PROD_OK_T
-    if (ca->type != RAY_F64 && cb->type != RAY_F64) return false;
+    if (sa->type != RAY_F64 && sb->type != RAY_F64) return false;
 
+    ray_t* ca = NULL;
+    ray_t* cb = NULL;
+    *err = ray_col_src_plain(sa, &ca);
+    if (*err) return false;
+    *err = ray_col_src_plain(sb, &cb);
+    if (*err) return false;
     out->enabled = true;
-    out->pa = ray_data(ca); out->ta = ca->type; out->aa = ca->attrs;
-    out->pb = ray_data(cb); out->tb = cb->type; out->ab = cb->attrs;
+    out->pa = ray_data(ca); out->ta = sa->type; out->aa = sa->attrs;
+    out->pb = ray_data(cb); out->tb = sb->type; out->ab = sb->attrs;
     return true;
 }
 
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return scan vector
  * plus the additive bias so we can adjust results from (sum,count) directly. */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                                    ray_t** out_vec, agg_affine_t* out_affine) {
+                                    ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
+    *err = NULL;
     if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
     if (input_op->opcode != OP_ADD && input_op->opcode != OP_SUB) return false;
     if (input_op->arity != 2 || !op_child(g, input_op, 0) || !op_child(g, input_op, 1)) return false;
@@ -492,11 +514,16 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
 
     ray_op_ext_t* base_ext = find_ext(g, base_op->id);
     if (!base_ext || base_ext->base.opcode != OP_SCAN) return false;
-    ray_t* base_vec = ray_table_get_col(tbl, base_ext->sym);
-    if (!base_vec) return false;
+    if (ray_col_bind_declines(tbl, base_ext->sym)) return false;
+    ray_col_src_t* base_src = ray_graph_bind_col(g, tbl, base_ext->sym, err);
+    if (!base_src) return false;
+    if (base_src->parted) return false;     /* a parted wrapper matches no arm below */
 
-    int8_t bt = base_vec->type;
+    int8_t bt = base_src->type;
+    ray_t* base_vec = NULL;
     if (bt == RAY_F64) {
+        *err = ray_col_src_plain(base_src, &base_vec);
+        if (*err) return false;
         out_affine->enabled = true;
         out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
         out_affine->bias_i64 = (int64_t)out_affine->bias_f64;
@@ -517,6 +544,8 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
         } else {
             c = c_i;
         }
+        *err = ray_col_src_plain(base_src, &base_vec);
+        if (*err) return false;
         out_affine->enabled = true;
         out_affine->bias_i64 = sign > 0 ? c : -c;
         out_affine->bias_f64 = (double)out_affine->bias_i64;
@@ -683,8 +712,9 @@ static bool expr_null_capable(uint8_t op, int8_t dt, int8_t t1) {
 
 /* Compile expression DAG into flat instruction array.
  * Returns true on success. Only compiles element-wise subtrees. */
-bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
+bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, ray_t** err) {
     memset(out, 0, sizeof(*out));
+    *err = NULL;
     if (ray_expr_disable) return false; /* uncounted: test knob */
     if (!root || !g || !tbl) EXPR_BAIL(EXPR_BAIL_ROOT);
     if (root->opcode == OP_SCAN || root->opcode == OP_CONST) EXPR_BAIL(EXPR_BAIL_ROOT);
@@ -768,16 +798,18 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
             if (node->opcode == OP_SCAN) {
                 ray_op_ext_t* ext = find_ext(g, node->id);
                 if (!ext) EXPR_BAIL(EXPR_BAIL_OTHER);
-                ray_t* col = ray_table_get_col(tbl, ext->sym);
-                if (!col) EXPR_BAIL(EXPR_BAIL_OTHER);
-                if (col->type == RAY_MAPCOMMON) EXPR_BAIL(EXPR_BAIL_MAPCOMMON);
-                /* Bail on the ELEMENT type: a parted wrapper carries
-                 * RAY_PARTED_BASE + base and would sail past checks on
-                 * col->type — a parted GUID column then zero-filled
-                 * every lane and matched everything. */
-                int8_t elem = RAY_IS_PARTED(col->type)
-                            ? (int8_t)RAY_PARTED_BASETYPE(col->type)
-                            : col->type;
+                ray_col_meta_t cm;
+                if (!ray_table_col_meta(tbl, ext->sym, &cm)) EXPR_BAIL(EXPR_BAIL_OTHER);
+                if (ray_col_bind_declines(tbl, ext->sym))
+                    EXPR_BAIL(cm.type == RAY_MAPCOMMON ? EXPR_BAIL_MAPCOMMON : EXPR_BAIL_SLICE);
+                ray_col_src_t* src = ray_graph_bind_col(g, tbl, ext->sym, err);
+                if (*err) return false;                 /* a failed bind is an error, not a bail */
+                if (!src) EXPR_BAIL(EXPR_BAIL_OTHER);
+                /* Bail on the ELEMENT type: a parted source reports its base
+                 * type in src->type (the wrapper type would sail past checks
+                 * — a parted GUID column then zero-filled every lane and
+                 * matched everything). */
+                int8_t elem = src->type;
                 if (elem == RAY_STR) EXPR_BAIL(EXPR_BAIL_STR); /* RAY_STR needs string comparison path */
                 /* GUID cells are 16-byte blobs the fused program has no
                  * loads or compares for — without this bail the compiled
@@ -792,14 +824,17 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 if (!((elem >= RAY_BOOL && elem <= RAY_TIMESTAMP) ||
                       elem == RAY_SYM))
                     EXPR_BAIL(EXPR_BAIL_OTHER);
-                if (col->attrs & RAY_ATTR_SLICE)     EXPR_BAIL(EXPR_BAIL_SLICE);
+                /* An encoded source is never a slice (a slice of a parted or
+                 * encoded column does not bind: ray_col_bind_declines). */
+                if (src->obj->type != RAY_ENCCOL && (src->obj->attrs & RAY_ATTR_SLICE))
+                    EXPR_BAIL(EXPR_BAIL_SLICE);
                 /* Length-1 columns used as scalar broadcasts are handled by the
                  * fallback's exec_elementwise_binary (which has vec/scalar routing).
                  * The fused evaluator reads exactly nrows elements from every scan
                  * column — a length-1 column paired with nrows>1 would overread. */
-                if (!RAY_IS_PARTED(col->type)) {
+                if (!src->parted) {
                     int64_t nrows = ray_table_nrows(tbl);
-                    if (col->len != nrows) EXPR_BAIL(EXPR_BAIL_OTHER); /* length-mismatch (scalar broadcast) */
+                    if (src->len != nrows) EXPR_BAIL(EXPR_BAIL_OTHER); /* length-mismatch (scalar broadcast) */
                 }
                 /* sym-domain Phase 2: the fused program loads SYM cells
                  * as raw i64s and resolves STR literals via the GLOBAL
@@ -807,38 +842,47 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                  * runtime-domain columns.  FILE-domain columns bail to
                  * the non-fused executor, which is domain-aware.  No-op
                  * pre-flip (every domain is the runtime singleton). */
-                {
-                    ray_t* sym_rep = sym_domain_rep(col);
-                    if (sym_rep && ray_sym_vec_domain(sym_rep) !=
-                                       ray_sym_runtime_domain())
-                        EXPR_BAIL(EXPR_BAIL_SYM_DOMAIN);
-                }
+                if (elem == RAY_SYM && src->dom != ray_sym_runtime_domain())
+                    EXPR_BAIL(EXPR_BAIL_SYM_DOMAIN);
                 /* Determine whether any lane in this column may be null.
-                 * For parted columns the wrapper attrs may not reflect
-                 * individual segments — scan all segments.  SYM columns
-                 * consumed only by null-safe comparisons skip the proof
-                 * (see sym_cmp_safe above): their raw-id lanes already
-                 * give the null-aware answers, so they compile as
+                 * A generation-2 source answers from its directory.  A
+                 * generation-0 source keeps the per-segment scan (the
+                 * wrapper attrs of a parted column may not reflect
+                 * individual segments; SYM / STR report may_null always).
+                 * SYM columns consumed only by null-safe comparisons skip
+                 * the proof (see sym_cmp_safe above): their raw-id lanes
+                 * already give the null-aware answers, so they compile as
                  * non-nullable whether or not id 0 is present. */
                 bool need_proof = !(elem == RAY_SYM && node->id < nc &&
                                     sym_cmp_safe[node->id]);
-                bool col_nulls = need_proof && ray_vec_has_nulls(col);
-                if (need_proof && RAY_IS_PARTED(col->type)) {
-                    ray_t** segs = (ray_t**)ray_data(col);
-                    for (int64_t s = 0; s < col->len; s++)
-                        if (segs[s] && ray_vec_has_nulls(segs[s]))
-                            col_nulls = true;
+                bool enc_src = src->obj->type == RAY_ENCCOL;
+                bool col_nulls = false;
+                if (need_proof && enc_src) col_nulls = src->may_null;
+                else if (need_proof && !src->may_null) col_nulls = false;
+                else if (need_proof) {
+                    ray_t* c0 = src->obj;
+                    col_nulls = ray_vec_has_nulls(c0);
+                    if (RAY_IS_PARTED(c0->type)) {
+                        ray_t** segs = (ray_t**)ray_data(c0);
+                        for (int64_t s = 0; s < c0->len; s++)
+                            if (segs[s] && ray_vec_has_nulls(segs[s]))
+                                col_nulls = true;
+                    }
                 }
                 /* Nullable SYM read as a value is out of scope: sym ids are
                  * indistinguishable from the null sentinel (id 0) in raw
                  * integer lanes. */
-                if (col_nulls && (col->type == RAY_SYM ||
-                    (RAY_IS_PARTED(col->type) &&
-                     RAY_PARTED_BASETYPE(col->type) == RAY_SYM)))
+                if (col_nulls && elem == RAY_SYM)
                     EXPR_BAIL(EXPR_BAIL_NULLS);
+                /* Past every gate: the plain column is requested here, where
+                 * its payload pointer is captured. */
+                ray_t* col = NULL;
+                *err = ray_col_src_plain(src, &col);
+                if (*err) return false;
                 out->regs[r].kind = REG_SCAN;
-                if (RAY_IS_PARTED(col->type)) {
-                    int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+                out->regs[r].src = src;
+                if (src->parted) {
+                    int8_t base = elem;
                     out->regs[r].col_type = base;
                     out->regs[r].data = NULL; /* resolved per-segment */
                     out->regs[r].is_parted = true;
@@ -2377,7 +2421,8 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
         return exec_in_to_selection(g, pred, nrows, all_pass);
 
     ray_expr_t ex;
-    if (!expr_compile(g, g->table, pred, &ex)) return NULL;
+    ray_t* cerr = NULL;
+    if (!expr_compile(g, g->table, pred, &ex, &cerr)) return cerr;   /* NULL: unsupported */
     if (ex.out_type != RAY_BOOL || ex.has_parted) return NULL;
 
     ray_pool_t* pool     = ray_pool_get();

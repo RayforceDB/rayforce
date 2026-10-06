@@ -36,6 +36,7 @@
 #include "exec.h"
 #include "core/pool.h"
 #include "core/profile.h"
+#include "store/colrange.h"
 #include "store/csr.h"
 #include "store/hnsw.h"
 #include "lftj.h"
@@ -843,6 +844,7 @@ typedef struct {
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
         ray_t*       parted_col; /* parted wrapper (is_parted only) */
+        ray_col_src_t* src;      /* bound source (REG_SCAN), borrowed from the graph registry */
         double      const_f64;  /* scalar value (REG_CONST) */
         int64_t     const_i64;  /* scalar value (REG_CONST) */
     } regs[EXPR_MAX_REGS];
@@ -1002,13 +1004,16 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                    const int64_t* keep_syms, int keep_n);
 
 /* ── expr.c ── */
+/* The try_* planners and expr_compile return false for "not this shape".  A
+ * failed column bind (or plain request) also returns false but leaves an
+ * owned error in *err (ray_error_free); *err is NULL otherwise. */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                             ray_t** out_vec, agg_affine_t* out_affine);
+                             ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                                 agg_linear_t* out_plan);
+                                 agg_linear_t* out_plan, ray_t** err);
 bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                               agg_prod_t* out);
-bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out);
+                               agg_prod_t* out, ray_t** err);
+bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, ray_t** err);
 ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
 
 /* Fused predicate→selection (skips the full BOOL vec).
@@ -1021,7 +1026,8 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
  *   - non-NULL rowsel block  → the selection (caller installs / reads it).
  *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").
  *   - NULL with *all_pass=0  → disabled / unsupported / OOM — caller falls
- *                              back to exec_node→ray_rowsel_from_pred unchanged. */
+ *                              back to exec_node→ray_rowsel_from_pred unchanged.
+ *   - an owned error         → a column bind failed; the caller returns it. */
 ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                               bool* all_pass);
 

@@ -4,6 +4,7 @@
 #include "ops/ops.h"
 #include "ops/hash.h"     /* ray_hash_bytes — wide (STR) group-key hashing */
 #include "ops/internal.h"  /* col_vec_new, col_esz */
+#include "ops/colbind.h"
 #include "ops/rowsel.h"    /* ray_rowsel_meta, ray_rowsel_to_indices */
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
@@ -922,8 +923,29 @@ typedef struct {
     uint8_t*      val_esz;   uint8_t* val2_esz;
 } agg_desc_t;
 
+/* A value column: bound, decisions from the source, payload from the plain
+ * column (the pointer is captured).  Absent leaves *col NULL; a failed bind
+ * or plain request sets *err.  The agg shapes admitted before this point
+ * never name a partition key or a sliced parted column, so a source that
+ * does not bind is an error here, not a fall back to raw reads. */
+static bool agg_desc_value(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t** col,
+                           ray_col_src_t** src, ray_t** err) {
+    *col = NULL; *src = NULL;
+    if (ray_col_bind_declines(tbl, sym)) {
+        *err = ray_error("nyi", "aggregate input is not a bindable column");
+        return false;
+    }
+    *src = ray_graph_bind_col(g, tbl, sym, err);
+    if (!*src) return *err == NULL;
+    *err = ray_col_src_plain(*src, col);
+    return *err == NULL;
+}
+
+/* False with *err NULL: out of memory; false with an owned *err: a column
+ * bind or plain request failed (the caller returns it). */
 static bool agg_desc_init(agg_desc_t* d, ray_graph_t* g, ray_op_ext_t* ext,
-                          ray_t* tbl, ray_t** key_cols) {
+                          ray_t* tbl, ray_t** key_cols, ray_t** err) {
+    *err = NULL;
     uint32_t nk = ext->n_keys, na = ext->n_aggs;
     size_t n8 = (size_t)nk + 3u * na;              /* key_data,val_data,val2_data,agg_syms */
     size_t n1 = 6u * na;                           /* types/hasnull/esz pairs */
@@ -942,20 +964,28 @@ static bool agg_desc_init(agg_desc_t* d, ray_graph_t* g, ray_op_ext_t* ext,
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         d->agg_syms[a] = ie ? ie->sym : 0;
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
+        ray_t* vc = NULL;
+        ray_col_src_t* vs = NULL;
+        if (ext->agg_ops[a] != OP_COUNT && ie &&
+            !agg_desc_value(g, tbl, ie->sym, &vc, &vs, err)) goto fail;
         d->val_data[a]    = vc ? ray_data(vc) : NULL;
-        d->val_types[a]   = vc ? vc->type : RAY_I64;
-        d->val_hasnull[a] = vc ? ray_vec_may_have_nulls(vc) : false;
+        d->val_types[a]   = vs ? vs->type : RAY_I64;
+        d->val_hasnull[a] = vs ? vs->may_null : false;
         d->val_esz[a]     = vc ? col_esz(vc) : 0;
         /* Binary agg (pearson): resolve the y-side column from agg_ins2[a]. */
-        ray_t* vc2 = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
-            ? ray_table_get_col(tbl, find_ext(g, ext->agg_ins2[a])->sym) : NULL;
+        ray_t* vc2 = NULL;
+        ray_col_src_t* vs2 = NULL;
+        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE &&
+            !agg_desc_value(g, tbl, find_ext(g, ext->agg_ins2[a])->sym, &vc2, &vs2, err)) goto fail;
         d->val2_data[a]    = vc2 ? ray_data(vc2) : NULL;
-        d->val2_types[a]   = vc2 ? vc2->type : RAY_I64;
-        d->val2_hasnull[a] = vc2 ? ray_vec_may_have_nulls(vc2) : false;
+        d->val2_types[a]   = vs2 ? vs2->type : RAY_I64;
+        d->val2_hasnull[a] = vs2 ? vs2->may_null : false;
         d->val2_esz[a]     = vc2 ? col_esz(vc2) : 0;
     }
     return true;
+fail:
+    scratch_free(d->hdr); d->hdr = NULL;
+    return false;
 }
 
 static void agg_desc_free(agg_desc_t* d) { scratch_free(d->hdr); d->hdr = NULL; }
@@ -2519,7 +2549,11 @@ static ray_t* exec_group_v2_parallel_dense(
     const agg_vtable_t** vts = vo.vts; size_t* off = vo.off; size_t block = vo.block;
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) { agg_vo_free(&vo); return ray_error(agg_cancelled() ? "cancel" : "oom", NULL); }
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) {
+        agg_vo_free(&vo);
+        return derr ? derr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+    }
     const void** key_data = d.key_data;
     const void** val_data = d.val_data; const int8_t* val_types = d.val_types;
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
@@ -2868,7 +2902,8 @@ static ray_t* exec_group_v2_parallel_smallhash(
     uint32_t nw = ray_pool_total_workers(pool);
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr ? derr : ray_error("oom", NULL);
     const void** key_data = d.key_data;
     const void** val_data = d.val_data; const int8_t* val_types = d.val_types;
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
@@ -4323,7 +4358,8 @@ static ray_t* exec_group_v2_parallel_radix(
     uint32_t nw = ray_pool_total_workers(pool);
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr ? derr : ray_error("oom", NULL);
     const void** key_data = d.key_data;
     const void** val_data = d.val_data; const int8_t* val_types = d.val_types;
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
@@ -5367,7 +5403,8 @@ static ray_t* exec_group_v2_parallel_tablestack(
     }
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr ? derr : ray_error("oom", NULL);
 
     int64_t n_in = sel ? n_sel : nrows;
     if (n_in < 0) n_in = 0;
@@ -6041,12 +6078,13 @@ done:
  * Predominantly changing states use owned partitions instead of contended CAS.
  * The sample is query-local and never supplies an answer to execution. */
 static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
-        ray_t** keys, const agg_vo_t* vo, int64_t rows) {
+        ray_t** keys, const agg_vo_t* vo, int64_t rows, ray_t** err) {
+    *err = NULL;
     if (!ext->n_aggs) return true;
     if (rows < 1024) return false;
     enum { SAMPLES = 1024, CAP = 2048 };
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, keys)) return false;
+    if (!agg_desc_init(&d, g, ext, tbl, keys, err)) return false;   /* *err: failed bind; else OOM = not shared */
     char* states = ray_alloc_raw((SAMPLES + 1) * vo->block);
     if (!states) { agg_desc_free(&d); return false; }
     char* previous = states + SAMPLES * vo->block;
@@ -6733,7 +6771,14 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         bool shared_plan = dp.ok && group_limit <= 0 && !sel && ext->n_keys == 1 && dp.total_slots >= 4096;
         for (uint32_t a = 0; a < ext->n_aggs && shared_plan; a++)
             shared_plan = vts[a]->update_shared != NULL;
-        if (shared_plan && slab_bytes <= dense_budget && agg_shared_sample(g, ext, tbl, key_cols, &vo, nrows)) {
+        ray_t* serr = NULL;
+        bool shared_ok = shared_plan && slab_bytes <= dense_budget &&
+                         agg_shared_sample(g, ext, tbl, key_cols, &vo, nrows, &serr);
+        if (serr) {                       /* a failed column bind */
+            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
+            return serr;
+        }
+        if (shared_ok) {
             route_stats.dense_worker_budget = false;
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
@@ -6753,9 +6798,13 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * occupy one field in the payload, including mixed binary uses. */
             agg_desc_t payload;
             double record_size = (double)SIZE_MAX;
-            if (agg_desc_init(&payload, g, ext, tbl, key_cols)) {
+            ray_t* perr = NULL;
+            if (agg_desc_init(&payload, g, ext, tbl, key_cols, &perr)) {
                 record_size = agg_partition_record(&payload, ext->n_aggs, NULL, NULL);
                 agg_desc_free(&payload);
+            } else if (perr) {            /* a failed column bind */
+                agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
+                return perr;
             }
             double bytes = 2.0 * part_slots * parts * (block + sizeof(int64_t))
                 + (double)eff_n * (sizeof(uint32_t) + record_size + (sel ? sizeof(int64_t) : 0))

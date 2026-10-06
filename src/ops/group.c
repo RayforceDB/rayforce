@@ -10746,7 +10746,8 @@ static ray_t* sg_hint_to_selection(ray_graph_t* g, ray_t* tbl) {
 static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                               int64_t group_limit,
                               ray_t** agg_vecs, ray_t** agg_vecs2,
-                              agg_prod_t* prod) {
+                              agg_prod_t* prod, ray_t** err) {
+    *err = NULL;
     /* group_limit is a HEAD(GROUP) HINT, not a semantic: this kernel computes
      * every group and the caller's HEAD trims the result, so a positive limit
      * is simply ignored here (staying eligible keeps where+by+take shapes on
@@ -10776,8 +10777,9 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in) return false;
         if (!pair && (aop == OP_SUM || aop == OP_AVG) &&
-            try_prod_sumavg_input_f64(g, tbl, in, &prod[a]))
+            try_prod_sumavg_input_f64(g, tbl, in, &prod[a], err))
             continue;
+        if (*err) return false;           /* a failed bind is the caller's error */
         ray_op_ext_t* ae = find_ext(g, in->id);
         if (!ae || ae->base.opcode != OP_SCAN) return false;
         ray_t* col = ray_table_get_col(tbl, ae->sym);
@@ -10826,8 +10828,10 @@ ray_t* ray_group_slice_hint_settle(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_t* agg_vecs2[16] = {0};
     agg_prod_t prod[16];
     memset(prod, 0, sizeof(prod));
-    if (sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, agg_vecs2, prod))
+    ray_t* serr = NULL;
+    if (sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, agg_vecs2, prod, &serr))
         return NULL;                      /* kernel will consume it */
+    if (serr) return serr;                /* a failed column bind */
     return sg_hint_to_selection(g, tbl);  /* fold; NULL on success */
 }
 
@@ -10837,8 +10841,9 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_t* agg_vecs2[16] = {0};
     agg_prod_t prod[16];
     memset(prod, 0, sizeof(prod));
-    if (!sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, agg_vecs2, prod))
-        return NULL;
+    ray_t* serr = NULL;
+    if (!sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, agg_vecs2, prod, &serr))
+        return serr;                      /* NULL: not this shape; else a failed column bind */
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
     ray_t* key_col = ray_table_get_col(tbl, ke->sym);
@@ -11098,6 +11103,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     char   names[na][16];
     for (uint32_t a = 0; a < na; a++) synth[a] = NULL;
     ray_t* sub = NULL;
+    ray_t* cerr = NULL;     /* a failed column bind: returned instead of the legacy path */
     bool ok = true;
     for (uint32_t a = 0; a < na && ok; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
@@ -11108,7 +11114,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ok = false; break;   /* user column shadows the synthetic name */
         }
         ray_expr_t ex;
-        if (!expr_compile(g, tbl, in, &ex)) { ok = false; break; }
+        if (!expr_compile(g, tbl, in, &ex, &cerr)) { ok = false; break; }
         ray_t* v = expr_eval_full(&ex, nrows);
         if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
             if (v && !RAY_IS_ERR(v)) ray_release(v);
@@ -11180,6 +11186,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     for (uint32_t a = 0; a < na; a++)
         if (synth[a]) ray_release(synth[a]);
     if (sub) ray_release(sub);
+    if (cerr) return cerr;
     return result;   /* NULL → legacy path */
 }
 
@@ -12022,6 +12029,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     uint8_t*      agg_owned2 = agg_owned + vla_aggs;
     uint8_t*      agg_strlen = agg_owned2 + vla_aggs;
 
+    ray_t* rerr = NULL;     /* a failed column bind in the planners below */
     for (uint32_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
         ray_op_ext_t* agg_ext = find_ext(g, agg_input_op->id);
@@ -12029,9 +12037,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_affine_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a], &agg_affine[a])) {
+            try_affine_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a], &agg_affine[a], &rerr)) {
             continue;
         }
+        if (rerr) goto resolve_fail;
 
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
             try_strlen_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a])) {
@@ -12043,17 +12052,19 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * without materializing the expression vector. */
         if (n_keys == 0 && nrows > 0 &&
             (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_linear_sumavg_input_i64(g, tbl, agg_input_op, &agg_linear[a])) {
+            try_linear_sumavg_input_i64(g, tbl, agg_input_op, &agg_linear[a], &rerr)) {
             continue;
         }
+        if (rerr) goto resolve_fail;
 
         /* SUM/AVG(a * b) float product: the scalar and DA accumulators
          * multiply per row; paths without the fused read (radix sp / HT)
          * materialize on entry via group_materialize_prod_slots. */
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) && nrows > 0 &&
-            try_prod_sumavg_input_f64(g, tbl, agg_input_op, &agg_prod[a])) {
+            try_prod_sumavg_input_f64(g, tbl, agg_input_op, &agg_prod[a], &rerr)) {
             continue;
         }
+        if (rerr) goto resolve_fail;
 
         if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
             agg_vecs[a] = ray_table_get_col(tbl, agg_ext->sym);
@@ -12062,7 +12073,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         } else {
             /* Expression node (ADD/MUL etc) — try compiled expression first */
             ray_expr_t agg_expr;
-            if (expr_compile(g, tbl, agg_input_op, &agg_expr)) {
+            if (expr_compile(g, tbl, agg_input_op, &agg_expr, &rerr)) {
                 ray_t* vec = expr_eval_full(&agg_expr, nrows);
                 if (vec && !RAY_IS_ERR(vec)) {
                     agg_vecs[a] = vec;
@@ -12070,6 +12081,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     goto resolve_ins2;
                 }
                 if (vec && RAY_IS_ERR(vec)) ray_release(vec);
+            } else if (rerr) {
+                goto resolve_fail;
             }
             /* Fallback: full recursive evaluation */
             ray_t* saved_table = g->table;
@@ -12104,7 +12117,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             } else {
                 ray_expr_t agg_expr2;
                 int compiled2 = 0;
-                if (expr_compile(g, tbl, agg_input_op2, &agg_expr2)) {
+                if (expr_compile(g, tbl, agg_input_op2, &agg_expr2, &rerr)) {
                     ray_t* vec = expr_eval_full(&agg_expr2, nrows);
                     if (vec && !RAY_IS_ERR(vec)) {
                         agg_vecs2[a] = vec;
@@ -12113,6 +12126,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     } else if (vec) {
                         ray_release(vec);
                     }
+                } else if (rerr) {
+                    goto resolve_fail;
                 }
                 if (!compiled2) {
                     ray_t* saved_table = g->table;
@@ -12135,6 +12150,18 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 }
             }
         }
+    }
+
+    if (0) {
+    resolve_fail:
+        for (uint32_t i = 0; i < n_aggs; i++) {
+            if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]);
+            if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]);
+        }
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        scratch_free(vla_hdr);
+        return rerr;
     }
 
     /* Normalize scalar agg inputs to full-length vectors.

@@ -32,6 +32,7 @@
 #include "ops/fused_pred.h"
 #include "ops/fused_topk.h"
 #include "ops/internal.h"
+#include "ops/rowsel.h"
 #include "ops/agg_engine.h"
 #include "ops/fused_group.h"
 #include "lang/parse.h"
@@ -1904,6 +1905,40 @@ static test_result_t test_bind_stage(void) {
     PASS();
 }
 
+
+/* A bind is keyed by the table's address and name; a column replaced under the
+ * same table (or a table released and reallocated at that address) must not
+ * return the old binding.  The replacement is made in the slot list itself. */
+static test_result_t test_bind_dedup_validates(void) {
+    int64_t sa = ray_sym_intern("a", 1);
+    ray_t* c1 = ray_vec_new(RAY_I64, 4); c1->len = 4;
+    for (int i = 0; i < 4; i++) ((int64_t*)ray_data(c1))[i] = i;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, sa, c1);
+    ray_release(c1);
+    ray_graph_t* g = ray_graph_new(t);
+    ray_t* err = NULL;
+    ray_col_src_t* s1 = ray_graph_bind_col(g, t, sa, &err);
+    TEST_ASSERT_TRUE(s1 && !err);
+    TEST_ASSERT_TRUE(ray_graph_bind_col(g, t, sa, &err) == s1);       /* same column: the same binding */
+    ray_t* o1 = s1->obj;
+    ray_t* c2 = ray_vec_new(RAY_I64, 4); c2->len = 4;
+    for (int i = 0; i < 4; i++) ((int64_t*)ray_data(c2))[i] = 100 + i;
+    ray_t* cols = ((ray_t**)ray_data(t))[1];
+    ray_t* old = ((ray_t**)ray_data(cols))[0];
+    ((ray_t**)ray_data(cols))[0] = c2;                                 /* takes the reference */
+    ray_release(old);
+    ray_col_src_t* s2 = ray_graph_bind_col(g, t, sa, &err);
+    TEST_ASSERT_TRUE(s2 && !err && s2 != s1);
+    ray_t* plain = NULL;
+    TEST_ASSERT_NULL(ray_col_src_plain(s2, &plain));
+    TEST_ASSERT_TRUE(s2->obj != o1 && s2->obj == c2 && ((int64_t*)ray_data(plain))[0] == 100);
+    TEST_ASSERT_EQ_I(ray_graph_binds_count(g), 2);
+    ray_graph_free(g);
+    ray_release(t);
+    PASS();
+}
+
 /* The predicate fixture: 3000 rows of row id, a SYM, an I64 and an F64 with
  * nulls, saved at generation 0 and 2 under CS_TMP "/<name>0" and "2". */
 enum { FQ_N = 3000 };
@@ -2091,6 +2126,626 @@ static test_result_t test_fused_pred_bind_failure(void) {
     PASS();
 }
 
+/* ---- Task 20: expression, aggregate and top-k compilation from bound sources ----
+ *
+ * Query-level checks go through select, which still decodes at its entry
+ * (transitional: Tasks 30-32 remove it), so select sees plain columns.  The
+ * direct-compile checks below bind a table read from generation-2 files (its
+ * slots are RAY_ENCCOL), which is where the converted sites read encoded
+ * sources. */
+
+/* Same formatted output. */
+static bool cp_fmt_same(ray_t* x, ray_t* y) {
+    if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) return false;
+    ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
+    bool same = fx && fy && ray_str_len(fx) == ray_str_len(fy) &&
+                memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0;
+    if (fx) ray_release(fx);
+    if (fy) ray_release(fy);
+    return same;
+}
+
+/* An injected bind failure arrives as the oom "column bind" error. */
+static bool cp_is_bind_error(ray_t* r) {
+    if (!r || !RAY_IS_ERR(r)) return false;
+    bool ok = strcmp(ray_err_code(r), "oom") == 0 && ray_error_msg() && strstr(ray_error_msg(), "column bind");
+    return ok;
+}
+
+/* Brief: group-by with sum / avg over an expression and top-k over a
+ * generation-2 table equal the generation-0 answers.  The compiled paths
+ * ran (expression compiles counted, fused top-k executions counted). */
+static test_result_t test_compile_paths_bound(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 'v 'w] (list (take [1 2 3] 3000) (til 3000) (* 2 (til 3000)))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/cp2\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/cp0\" t {compress: false})"), "");
+    static const char* const q[] = {
+        "(select {s: (sum (+ v w)) a: (avg (* 3 v)) from: (.db.splayed.get \"%s\") by: k})",
+        "(select {from: (.db.splayed.get \"%s\") where: (> v 10) desc: v take: 5})",
+        "(select {from: (.db.splayed.get \"%s\") where: (< w 100) take: 3})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) {
+        char a2[512], a0[512];
+        snprintf(a2, sizeof a2, q[i], CS_TMP "/cp2");
+        snprintf(a0, sizeof a0, q[i], CS_TMP "/cp0");
+        uint64_t ok0 = ray_expr_compile_ok, ran0, dec0, ran1, dec1;
+        ray_fused_topk_counters(&ran0, &dec0);
+        ray_t* x = ray_eval_str(a2); ray_t* y = ray_eval_str(a0);
+        ray_fused_topk_counters(&ran1, &dec1);
+        TEST_ASSERT_FMT(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y), "query %d", i);
+        TEST_ASSERT_FMT(cp_fmt_same(x, y), "query %d differs", i);
+        if (i == 0) TEST_ASSERT_FMT(ray_expr_compile_ok >= ok0 + 2, "query %d: expression compiled on both", i);
+        else TEST_ASSERT_FMT(ran1 >= ran0 + 2, "query %d: fused top-k ran on both (ran %llu->%llu)", i,
+                             (unsigned long long)ran0, (unsigned long long)ran1);
+        ray_release(x); ray_release(y);
+    }
+    /* A failed bind anywhere in the group-by planners (expression inputs, the
+     * linear / affine plans) is the query's error, never a silent fallback. */
+    static const char* const qb[] = {
+        "(select {s: (sum (+ v w)) a: (avg (* 3 v)) from: (.db.splayed.get \"%s\") by: k})",
+        "(select {s: (sum (+ (* 2 v) w)) from: (.db.splayed.get \"%s\")})",
+        "(select {s: (sum (+ v 1)) a: (avg (- w 2)) from: (.db.splayed.get \"%s\") by: k})",
+        NULL,
+    };
+    for (int i = 0; qb[i]; i++) {
+        char a0[512];
+        snprintf(a0, sizeof a0, qb[i], CS_TMP "/cp0");
+        int n = 1;
+        for (; n < 20; n++) {
+            ray_graph_bind_test_fail_alloc(n);
+            ray_t* r = ray_eval_str(a0);
+            ray_graph_bind_test_fail_alloc(0);
+            bool is_err = r && RAY_IS_ERR(r);
+            bool be = cp_is_bind_error(r);
+            if (is_err) ray_error_free(r); else if (r) ray_release(r);
+            if (!is_err) break;
+            TEST_ASSERT_FMT(be, "query %d bind %d: not the bind error", i, n);
+        }
+        TEST_ASSERT_FMT(n >= 2, "query %d: the planners bound columns", i);
+    }
+    PASS();
+}
+
+/* The compile fixture: CP_N rows saved at generation 0 and 2 under
+ * CS_TMP "/cp0g" and "/cp2g".  Group keys k0 (4 dense), k1 (4 sparse),
+ * k2 (8192 dense), k4 (all distinct); null-free I64 a, b; null-free F64 f,
+ * g with exactly representable sums; I64 v and SYM x with nulls; SYM y
+ * without. */
+enum { CP_N = 70000 };
+static ray_t* cp_table(void) {
+    ray_t* t = ray_table_new(11);
+    ray_t* c[11];
+    int8_t ty[11] = { RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_F64, RAY_F64, RAY_I64, RAY_SYM, RAY_SYM };
+    static const char* const nm[11] = { "k0", "k1", "k2", "k4", "a", "b", "f", "g", "v", "x", "y" };
+    for (int j = 0; j < 11; j++) {
+        c[j] = ty[j] == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, CP_N) : ray_vec_new(ty[j], CP_N);
+        c[j]->len = CP_N;
+    }
+    const char* ys[4] = { "ya", "yb", "yc", "yd" };
+    const char* xs[3] = { "xa", "xb", "xc" };
+    for (int64_t i = 0; i < CP_N; i++) {
+        ((int64_t*)ray_data(c[0]))[i] = i % 4;
+        ((int64_t*)ray_data(c[1]))[i] = (i % 4) * 1000000;
+        ((int64_t*)ray_data(c[2]))[i] = i % 8192;
+        ((int64_t*)ray_data(c[3]))[i] = i * 1000000;
+        ((int64_t*)ray_data(c[4]))[i] = i % 1000;
+        ((int64_t*)ray_data(c[5]))[i] = (i * 7) % 1000;
+        ((double*)ray_data(c[6]))[i] = (double)(i % 64) * 0.5;
+        ((double*)ray_data(c[7]))[i] = (double)(i % 32) * 0.25;
+        ((int64_t*)ray_data(c[8]))[i] = i % 17;
+        ((int64_t*)ray_data(c[9]))[i] = ray_sym_intern(xs[i % 3], 2);
+        ((int64_t*)ray_data(c[10]))[i] = ray_sym_intern(ys[i % 4], 2);
+    }
+    for (int64_t i = 0; i < CP_N; i += 9) { ray_vec_set_null(c[8], i, true); ray_vec_set_null(c[9], i, true); }
+    for (int j = 0; j < 11; j++) { t = ray_table_add_col(t, ray_sym_intern(nm[j], strlen(nm[j])), c[j]); ray_release(c[j]); }
+    return t;
+}
+
+static bool cp_save(void) {
+    ray_t* t = cp_table();
+    bool ok = ray_splay_save_mode(t, CS_TMP "/cp0g", CS_TMP "/cp0g.sym", RAY_COMPRESS_OFF) == RAY_OK &&
+              ray_splay_save_mode(t, CS_TMP "/cp2g", CS_TMP "/cp2g.sym", RAY_COMPRESS_ON) == RAY_OK;
+    ray_release(t);
+    return ok;
+}
+
+static ray_t* cp_read(int gen) {
+    return gen == 2 ? ray_read_splayed(CS_TMP "/cp2g", CS_TMP "/cp2g.sym")
+                    : ray_read_splayed(CS_TMP "/cp0g", CS_TMP "/cp0g.sym");
+}
+
+static ray_op_t* cp_dag(ray_graph_t* g, const char* src, ray_t** e) {
+    *e = ray_parse(src);
+    return *e ? compile_expr_dag(g, *e) : NULL;
+}
+
+/* The three sum/avg planners over bound sources, generation 0 and 2: the
+ * plans read the right data, decline exactly as before, decode nothing on a
+ * decline, and report bind and plain failures through their error out. */
+static test_result_t test_try_plans_bound(void) {
+    TEST_ASSERT_TRUE(cp_save());
+    for (int gen = 0; gen <= 2; gen += 2) {
+        ray_t* t = cp_read(gen);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_get_col_enc(t, ray_sym_intern("a", 1)) != NULL, gen == 2);
+        /* The DAG is built in a graph over a separate read of the files: building
+         * it reads column types and decodes encoded columns, which would hide
+         * what the planners themselves decode from the counters. */
+        ray_t* tplan = cp_read(gen);
+        TEST_ASSERT_TRUE(tplan && !RAY_IS_ERR(tplan));
+        ray_graph_t* gr = ray_graph_new(tplan);
+        ray_t *e1, *e2, *e3, *e4, *e5, *e6, *e7, *e8;
+        ray_t* err = NULL;
+
+        /* a decline decodes nothing: a nullable term, int x int, an unknown column */
+        agg_linear_t lin; agg_prod_t prod; agg_affine_t aff; ray_t* vec = NULL;
+        ray_op_t* d_null = cp_dag(gr, "(+ (* 2 b) v)", &e1);
+        ray_op_t* d_ii   = cp_dag(gr, "(* a b)", &e2);
+        ray_op_t* d_fv   = cp_dag(gr, "(* f v)", &e3);
+        ray_op_t* d_lin = cp_dag(gr, "(+ (+ (* 2 b) a) 7)", &e4);
+        ray_op_t* d_fg = cp_dag(gr, "(* f g)", &e5);
+        ray_op_t* d_fa = cp_dag(gr, "(* f a)", &e6);
+        ray_op_t* d_af = cp_dag(gr, "(- f 1.5)", &e7);
+        ray_op_t* d_ai = cp_dag(gr, "(+ a 5)", &e8);
+        TEST_ASSERT_TRUE(d_null && d_ii && d_fv && d_lin && d_fg && d_fa && d_af && d_ai);
+        ray_enc_counters_reset();
+        TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_null, &lin, &err)); TEST_ASSERT_NULL(err);
+        TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_ii, &prod, &err));    TEST_ASSERT_NULL(err);
+        TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fv, &prod, &err));    TEST_ASSERT_NULL(err);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        TEST_ASSERT_TRUE(ray_graph_binds_count(gr) >= 3);
+
+        /* linear: 2 * b + a + 7 */
+        TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+        TEST_ASSERT_NULL(err);
+        TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 2 && lin.bias_i64 == 7);
+        for (int64_t i = 0; i < CP_N; i += 997) {
+            int64_t sum = lin.bias_i64;
+            for (uint8_t j = 0; j < lin.n_terms; j++) sum += lin.coeff_i64[j] * ((const int64_t*)lin.term_ptrs[j])[i];
+            TEST_ASSERT_EQ_I(sum, 2 * ((i * 7) % 1000) + (i % 1000) + 7);
+        }
+        /* product: f * g (F64 x F64) and f * a (F64 x I64) */
+        TEST_ASSERT_TRUE(d_fg && try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));
+        TEST_ASSERT_NULL(err);
+        TEST_ASSERT_TRUE(prod.enabled && prod.ta == RAY_F64 && prod.tb == RAY_F64);
+        for (int64_t i = 0; i < CP_N; i += 997)
+            TEST_ASSERT_TRUE(((const double*)prod.pa)[i] * ((const double*)prod.pb)[i] == (double)(i % 64) * 0.5 * ((double)(i % 32) * 0.25));
+        TEST_ASSERT_TRUE(d_fa && try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));
+        TEST_ASSERT_TRUE(prod.ta == RAY_F64 && prod.tb == RAY_I64);
+        /* affine: f - 1.5, a + 5 */
+        memset(&aff, 0, sizeof aff);
+        TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err));
+        TEST_ASSERT_NULL(err);
+        TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_F64 && vec->len == CP_N);
+        TEST_ASSERT_TRUE(((const double*)ray_data(vec))[5] == 2.5);
+        memset(&aff, 0, sizeof aff);
+        TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+        TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
+        if (gen == 2) { ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 4); }
+
+        ray_release(e1); ray_release(e2); ray_release(e3); ray_release(e4);
+        ray_release(e5); ray_release(e6); ray_release(e7); ray_release(e8);
+        ray_graph_free(gr);
+        ray_release(tplan);
+        ray_release(t);
+
+        /* a failed bind is the planner's error, not a decline */
+        t = cp_read(gen);
+        tplan = cp_read(gen);
+        gr = ray_graph_new(tplan);
+        ray_op_t* dl = cp_dag(gr, "(+ (* 2 b) a)", &e1);
+        ray_op_t* dp = cp_dag(gr, "(* f g)", &e2);
+        ray_op_t* da = cp_dag(gr, "(- f 1.5)", &e3);
+        TEST_ASSERT_TRUE(dl && dp && da);
+        ray_graph_bind_test_fail_alloc(1);
+        bool r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
+        ray_graph_bind_test_fail_alloc(0);
+        bool bind_err = !r && cp_is_bind_error(err);
+        if (err) ray_error_free(err);
+        err = NULL;
+        ray_graph_bind_test_fail_alloc(1);
+        r = try_prod_sumavg_input_f64(gr, t, dp, &prod, &err);
+        ray_graph_bind_test_fail_alloc(0);
+        bool bind_err2 = !r && cp_is_bind_error(err);
+        if (err) ray_error_free(err);
+        err = NULL;
+        ray_graph_bind_test_fail_alloc(1);
+        r = try_affine_sumavg_input(gr, t, da, &vec, &aff, &err);
+        ray_graph_bind_test_fail_alloc(0);
+        bool bind_err3 = !r && cp_is_bind_error(err);
+        if (err) ray_error_free(err);
+        err = NULL;
+        TEST_ASSERT_TRUE(bind_err && bind_err2 && bind_err3);
+        /* a failed materialization of a bound encoded column */
+        if (gen == 2) {
+            ray_enccol_test_fail_alloc(1);
+            r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
+            ray_enccol_test_fail_alloc(0);
+            bool plain_err = !r && err && RAY_IS_ERR(err);
+            if (err) ray_error_free(err);
+            err = NULL;
+            ray_enccol_test_fail_alloc(1);
+            r = try_prod_sumavg_input_f64(gr, t, dp, &prod, &err);
+            ray_enccol_test_fail_alloc(0);
+            bool plain_err2 = !r && err && RAY_IS_ERR(err);
+            if (err) ray_error_free(err);
+            err = NULL;
+            ray_enccol_test_fail_alloc(1);
+            memset(&aff, 0, sizeof aff);
+            r = try_affine_sumavg_input(gr, t, da, &vec, &aff, &err);
+            ray_enccol_test_fail_alloc(0);
+            bool plain_err3 = !r && err && RAY_IS_ERR(err);
+            if (err) ray_error_free(err);
+            TEST_ASSERT_TRUE(plain_err && plain_err2 && plain_err3);
+        }
+        ray_release(e1); ray_release(e2); ray_release(e3);
+        ray_graph_free(gr);
+        ray_release(tplan);
+        ray_release(t);
+    }
+    PASS();
+}
+
+/* Run `body` with the nth bind failing, n = 1, 2, ...: every failure before
+ * the first success must be the bind error (never a decline or a silently
+ * different answer); returns how many binds the body makes. */
+typedef ray_t* (*cp_body_fn)(void* ctx);
+static int cp_bind_sweep(cp_body_fn body, void* ctx, bool* all_errors) {
+    *all_errors = true;
+    int n = 1;
+    for (; n < 40; n++) {
+        ray_graph_bind_test_fail_alloc(n);
+        ray_t* r = body(ctx);
+        ray_graph_bind_test_fail_alloc(0);
+        bool is_err = r && RAY_IS_ERR(r);
+        bool bind_err = cp_is_bind_error(r);
+        if (is_err) ray_error_free(r); else if (r) ray_release(r);
+        if (!is_err) break;
+        if (!bind_err) *all_errors = false;
+    }
+    return n - 1;
+}
+
+typedef struct { ray_t* t; const char* src; } cp_expr_ctx_t;
+static ray_t* cp_expr_body(void* c) {
+    cp_expr_ctx_t* x = c;
+    ray_graph_t* g = ray_graph_new(x->t);
+    ray_t* e = ray_parse(x->src);
+    ray_op_t* dag = compile_expr_dag(g, e);
+    ray_t* r = dag ? ray_execute(g, dag) : NULL;
+    if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    ray_release(e);
+    ray_graph_free(g);
+    return r;
+}
+
+/* expr_compile over bound sources: the scan arm decides from the source
+ * (generation 0 and 2 alike), the registers carry their source, and the
+ * three execution routes (root compile, per-node fusion, predicate to
+ * selection) answer identically and propagate a failed bind. */
+static test_result_t test_expr_compile_bound(void) {
+    TEST_ASSERT_TRUE(cp_save());
+    ray_t* res[2][3] = {{ NULL }};
+    bool nullable[2][3];
+    for (int gi = 0; gi < 2; gi++) {
+        int gen = gi * 2;
+        ray_t* t = cp_read(gen);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_graph_t* gr = ray_graph_new(t);
+        ray_t *e3, *e4, *e5;
+        ray_t* err = NULL;
+        ray_expr_t ex;
+        static const char* const srcs[3] = { "(+ (* a 3) b)", "(+ v 1)", "(+ a 1)" };
+        for (int s = 0; s < 3; s++) {
+            ray_t* e;
+            ray_op_t* d = cp_dag(gr, srcs[s], &e);
+            TEST_ASSERT_TRUE(d && expr_compile(gr, t, d, &ex, &err));
+            TEST_ASSERT_NULL(err);
+            nullable[gi][s] = false;
+            bool src_set = false;
+            for (int r = 0; r < ex.n_regs; r++) {
+                if (ex.regs[r].kind != REG_SCAN) continue;
+                src_set = ex.regs[r].src != NULL && ex.regs[r].src->obj != NULL &&
+                          (ex.regs[r].src->obj->type == RAY_ENCCOL) == (gen == 2);
+                if (ex.regs[r].nullable) nullable[gi][s] = true;
+                if (!src_set) break;
+                ray_t* plain = NULL;
+                TEST_ASSERT_NULL(ray_col_src_plain(ex.regs[r].src, &plain));
+                TEST_ASSERT_TRUE(ex.regs[r].data == ray_data(plain));
+            }
+            TEST_ASSERT_TRUE(src_set);
+            res[gi][s] = expr_eval_full(&ex, CP_N);
+            TEST_ASSERT_TRUE(res[gi][s] && !RAY_IS_ERR(res[gi][s]));
+            ray_release(e);
+        }
+        /* a: no nulls; v: nulls (the directory count at generation 2) */
+        TEST_ASSERT_FALSE(nullable[gi][0]);
+        TEST_ASSERT_TRUE(nullable[gi][1]);
+        TEST_ASSERT_FALSE(nullable[gi][2]);
+
+        /* SYM columns read from files resolve over the file's domain: both generations
+         * bail on the bound source's domain (the fused program reads raw ids) */
+        uint64_t nb = ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN];
+        ray_op_t* dx = ray_isnull(gr, ray_scan(gr, "x"));
+        TEST_ASSERT_FALSE(expr_compile(gr, t, dx, &ex, &err));
+        TEST_ASSERT_NULL(err);
+        ray_op_t* dy = ray_eq(gr, ray_scan(gr, "y"), ray_const_str(gr, "yb", 2));
+        TEST_ASSERT_FALSE(expr_compile(gr, t, dy, &ex, &err));
+        TEST_ASSERT_NULL(err);
+        TEST_ASSERT_EQ_U(ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN], nb + 2);
+        ray_t *e1 = NULL;
+        /* a partition key column and an unknown column are bails, not errors */
+        ray_op_t* dz = cp_dag(gr, "(+ nosuch 1)", &e3);
+        TEST_ASSERT_FALSE(dz && expr_compile(gr, t, dz, &ex, &err));
+        TEST_ASSERT_NULL(err);
+        ray_release(e3);
+
+        /* the failure paths of the scan arm */
+        ray_graph_free(gr);
+        ray_release(t);
+        t = cp_read(gen);
+        ray_t* tplan = cp_read(gen);       /* the DAG decodes its own table, not t */
+        gr = ray_graph_new(tplan);
+        ray_op_t* d = cp_dag(gr, "(+ a b)", &e4);
+        ray_graph_bind_test_fail_alloc(1);
+        bool r = expr_compile(gr, t, d, &ex, &err);
+        ray_graph_bind_test_fail_alloc(0);
+        TEST_ASSERT_TRUE(!r && cp_is_bind_error(err));
+        ray_error_free(err); err = NULL;
+        if (gen == 2) {
+            ray_enccol_test_fail_alloc(1);
+            r = expr_compile(gr, t, d, &ex, &err);
+            ray_enccol_test_fail_alloc(0);
+            TEST_ASSERT_TRUE(!r && err && RAY_IS_ERR(err));
+            ray_error_free(err); err = NULL;
+        }
+        ray_release(e4);
+
+        /* the predicate-to-selection route */
+        ray_op_t* dp = cp_dag(gr, "(> a 500)", &e5);
+        bool all_pass = false;
+        ray_t* sel = exec_pred_to_selection(gr, dp, CP_N, &all_pass);
+        TEST_ASSERT_TRUE(sel && !RAY_IS_ERR(sel));
+        int64_t tp = ray_rowsel_meta(sel)->total_pass;
+        ray_release(sel);
+        TEST_ASSERT_EQ_I(tp, 70 * 499);                  /* a > 500 over 70 blocks of a = i % 1000 */
+        ray_graph_free(gr);
+        gr = ray_graph_new(t);             /* fresh graph: nothing bound yet */
+        ray_graph_bind_test_fail_alloc(1);
+        dp = cp_dag(gr, "(> a 500)", &e1);
+        sel = exec_pred_to_selection(gr, dp, CP_N, &all_pass);
+        ray_graph_bind_test_fail_alloc(0);
+        TEST_ASSERT_TRUE(cp_is_bind_error(sel));
+        ray_error_free(sel);
+        ray_release(e1); ray_release(e5);
+        ray_graph_free(gr);
+        ray_release(tplan);
+        ray_release(t);
+    }
+    /* generation 0 and 2 expressions are the same values, nulls included */
+    for (int s = 0; s < 3; s++) {
+        TEST_ASSERT_TRUE(res[0][s]->len == res[1][s]->len && res[0][s]->type == res[1][s]->type);
+        TEST_ASSERT_TRUE(memcmp(ray_data(res[0][s]), ray_data(res[1][s]), (size_t)res[0][s]->len * 8) == 0);
+        TEST_ASSERT_EQ_I(nullable[0][s], nullable[1][s]);
+        ray_release(res[0][s]); ray_release(res[1][s]);
+    }
+
+    /* the execution routes: root compile and per-node fusion (the root bails on
+     * the nullable SYM, its subtree compiles) answer the same on both generations
+     * and every failed bind is returned */
+    static const char* const routes[2] = { "(+ a b)", "(+ (as 'I64 (nil? x)) (+ a b))" };
+    for (int ri = 0; ri < 2; ri++) {
+        ray_t* out[2] = { NULL, NULL };
+        int nbinds[2] = { 0, 0 };
+        for (int gi = 0; gi < 2; gi++) {
+            ray_t* t = cp_read(gi * 2);
+            cp_expr_ctx_t cx = { t, routes[ri] };
+            uint64_t ok0 = ray_expr_compile_ok;
+            out[gi] = cp_expr_body(&cx);
+            TEST_ASSERT_TRUE(out[gi] && !RAY_IS_ERR(out[gi]));
+            TEST_ASSERT_TRUE(ray_expr_compile_ok > ok0);                  /* the compile ran */
+            bool all_err = false;
+            nbinds[gi] = cp_bind_sweep(cp_expr_body, &cx, &all_err);
+            TEST_ASSERT_TRUE(all_err);
+            TEST_ASSERT_TRUE(nbinds[gi] >= (ri == 0 ? 2 : 3));
+            ray_release(t);
+        }
+        TEST_ASSERT_EQ_I(nbinds[0], nbinds[1]);
+        TEST_ASSERT_TRUE(out[0]->len == out[1]->len);
+        TEST_ASSERT_TRUE(memcmp(ray_data(out[0]), ray_data(out[1]), (size_t)out[0]->len * 8) == 0);
+        ray_release(out[0]); ray_release(out[1]);
+    }
+    PASS();
+}
+
+typedef struct { ray_t* t; const char* key; uint16_t* ops; const char* const* cols; int na; } cp_group_ctx_t;
+static ray_t* cp_group_body(void* c) {
+    cp_group_ctx_t* x = c;
+    ray_graph_t* g = ray_graph_new(x->t);
+    ray_op_t* keys[1] = { ray_scan(g, x->key) };
+    ray_op_t* ins[4];
+    for (int i = 0; i < x->na; i++) ins[i] = ray_scan(g, x->cols[i]);
+    ray_t* r = ray_execute(g, ray_group(g, keys, 1, x->ops, ins, (uint8_t)x->na));
+    if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    ray_graph_free(g);
+    return r;
+}
+
+typedef struct { int64_t key; int64_t row; } cp_krow_t;
+static int cp_krow_cmp(const void* a, const void* b) {
+    int64_t x = ((const cp_krow_t*)a)->key, y = ((const cp_krow_t*)b)->key;
+    return x < y ? -1 : x > y;
+}
+
+/* Group results equal as maps from key to the 8-byte aggregate cells. */
+static bool cp_groups_same(ray_t* x, ray_t* y, int64_t want_groups, int ncols) {
+    if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) return false;
+    if (ray_table_nrows(x) != want_groups || ray_table_nrows(y) != want_groups) return false;
+    cp_krow_t* kx = ray_alloc_raw((size_t)want_groups * sizeof *kx);
+    cp_krow_t* ky = ray_alloc_raw((size_t)want_groups * sizeof *ky);
+    bool ok = kx && ky;
+    for (int64_t i = 0; ok && i < want_groups; i++) {
+        kx[i] = (cp_krow_t){ ((const int64_t*)ray_data(ray_table_get_col_idx(x, 0)))[i], i };
+        ky[i] = (cp_krow_t){ ((const int64_t*)ray_data(ray_table_get_col_idx(y, 0)))[i], i };
+    }
+    if (ok) {
+        qsort(kx, (size_t)want_groups, sizeof *kx, cp_krow_cmp);
+        qsort(ky, (size_t)want_groups, sizeof *ky, cp_krow_cmp);
+        for (int64_t i = 0; ok && i < want_groups; i++) {
+            if (kx[i].key != ky[i].key) { ok = false; break; }
+            for (int c = 1; c <= ncols; c++) {
+                const int64_t* cx = ray_data(ray_table_get_col_idx(x, c));
+                const int64_t* cy = ray_data(ray_table_get_col_idx(y, c));
+                if (cx[kx[i].row] != cy[ky[i].row]) { ok = false; break; }
+            }
+        }
+    }
+    ray_free_raw(kx); ray_free_raw(ky);
+    return ok;
+}
+
+/* agg_desc_init, exercised through every parallel strategy that builds a
+ * descriptor (dense, small-hash/table-stack, radix, shared sample, partition
+ * payload) over bound sources: generation 0 and 2 answer the same, the route
+ * is the expected one, and a failed bind of any value column is the
+ * query's error. */
+static test_result_t test_group_desc_bound(void) {
+    TEST_ASSERT_TRUE(cp_save());
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    static uint16_t sum_avg[2] = { OP_SUM, OP_AVG };
+    static uint16_t min_max[2] = { OP_MIN, OP_MAX };
+    static const char* const cols_af[2] = { "a", "f" };
+    static const struct { const char* key; uint16_t* ops; int64_t groups; agg_route_t route; } cases[] = {
+        { "k0", sum_avg, 4,       AGG_ROUTE_V2_DENSE },
+        { "k1", sum_avg, 4,       AGG_ROUTE_V2_TABLESTACK },
+        { "k4", sum_avg, CP_N,    AGG_ROUTE_V2_RADIX },
+        { "k2", sum_avg, 8192,    AGG_ROUTE_V2_DENSE },       /* partition payload estimate */
+        { "k2", min_max, 8192,    AGG_ROUTE_V2_DENSE },       /* shared-state sample */
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        ray_t* out[2] = { NULL, NULL };
+        for (int gi = 0; gi < 2; gi++) {
+            ray_t* t = cp_read(gi * 2);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            cp_group_ctx_t cx = { t, cases[c].key, cases[c].ops, cols_af, 2 };
+            agg_route_reset();
+            out[gi] = cp_group_body(&cx);
+            agg_route_stats_t st = agg_route_stats();
+            TEST_ASSERT_FMT(out[gi] && !RAY_IS_ERR(out[gi]), "case %zu gen %d ran", c, gi * 2);
+            TEST_ASSERT_FMT(st.routes[cases[c].route] == 1, "case %zu gen %d route", c, gi * 2);
+            /* every failure before the first success is the bind error: both value columns */
+            bool all_err = false;
+            int nb = cp_bind_sweep(cp_group_body, &cx, &all_err);
+            TEST_ASSERT_FMT(all_err && nb >= 2, "case %zu gen %d sweep nb=%d all_err=%d", c, gi * 2, nb, all_err);
+            ray_release(t);
+        }
+        TEST_ASSERT_FMT(cp_groups_same(out[0], out[1], cases[c].groups, 2), "case %zu answers differ", c);
+        ray_release(out[0]); ray_release(out[1]);
+    }
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    PASS();
+}
+
+typedef struct {
+    ray_t* t; ray_t* where; int mode;          /* 0 top-k, 1 take, 2 take from the end */
+    int64_t sk[2]; uint8_t desc[2]; int64_t outs[4];
+} cp_topk_ctx_t;
+static ray_t* cp_topk_body(void* c) {
+    cp_topk_ctx_t* x = c;
+    if (x->mode == 0)
+        return ray_fused_topk_select(x->t, x->where, x->sk, x->desc, 2, 10, x->outs, NULL, 4);
+    return ray_fused_take_select(x->t, x->where, x->mode == 1 ? 7 : -7, x->outs, NULL, 4);
+}
+
+/* The fused top-k and take executors on bound sources: sort keys and gathers
+ * (generation 0 and 2, direct on a table whose slots are encoded) give the
+ * same rows, run (not decline), and return a failed bind of a sort key, a
+ * predicate column or a gathered column. */
+static test_result_t test_topk_bound(void) {
+    TEST_ASSERT_TRUE(fq_save("tk"));
+    int64_t si = ray_sym_intern("i", 1), sv = ray_sym_intern("v", 1), sd = ray_sym_intern("d", 1);
+    int64_t ss = ray_sym_intern("s", 1);
+    struct { int mode; int64_t k0, k1; uint8_t d0; const char* where; int min_binds; } cases[] = {
+        { 0, sv, si, 1, "(> v 5)",  3 },     /* nullable I64 desc, then i; where on v */
+        { 0, ss, si, 0, "(!= s 'beta)", 3 }, /* SYM sort key (file domain at generation 2) */
+        { 0, sd, si, 1, "(< d 2.0)", 3 },    /* F64 desc with nulls */
+        { 1, 0, 0, 0, "(> v 5)", 3 },        /* take from the front */
+        { 2, 0, 0, 0, "(== s 'gamma)", 3 },  /* take from the end */
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        ray_t* out[2] = { NULL, NULL };
+        int nbinds[2] = { 0, 0 };
+        for (int gi = 0; gi < 2; gi++) {
+            ray_t* t = ray_read_splayed(gi ? CS_TMP "/tk2" : CS_TMP "/tk0", gi ? CS_TMP "/tk2.sym" : CS_TMP "/tk0.sym");
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            TEST_ASSERT_EQ_I(ray_table_get_col_enc(t, si) != NULL, gi);
+            ray_t* w = ray_parse(cases[c].where);
+            cp_topk_ctx_t cx = { .t = t, .where = w, .mode = cases[c].mode,
+                                 .sk = { cases[c].k0, cases[c].k1 }, .desc = { cases[c].d0, 0 },
+                                 .outs = { si, sv, sd, ss } };
+            ray_fused_topk_counters_reset();
+            out[gi] = cp_topk_body(&cx);
+            uint64_t ran, dec; ray_fused_topk_counters(&ran, &dec);
+            TEST_ASSERT_FMT(out[gi] && !RAY_IS_ERR(out[gi]) && ran == 1 && dec == 0,
+                            "case %zu gen %d ran=%llu declined=%llu", c, gi * 2,
+                            (unsigned long long)ran, (unsigned long long)dec);
+            bool all_err = false;
+            nbinds[gi] = cp_bind_sweep(cp_topk_body, &cx, &all_err);
+            TEST_ASSERT_FMT(all_err && nbinds[gi] >= cases[c].min_binds, "case %zu gen %d sweep nb=%d all_err=%d",
+                            c, gi * 2, nbinds[gi], all_err);
+            ray_release(w);
+            ray_release(t);
+        }
+        TEST_ASSERT_EQ_I(nbinds[0], nbinds[1]);
+        TEST_ASSERT_FMT(cp_fmt_same(out[0], out[1]), "case %zu rows differ", c);
+        TEST_ASSERT_TRUE(ray_table_nrows(out[0]) == (cases[c].mode == 0 ? 10 : 7));
+        ray_release(out[0]); ray_release(out[1]);
+    }
+    /* the plain request of an encoded sort key failing is returned too */
+    ray_t* t = ray_read_splayed(CS_TMP "/tk2", CS_TMP "/tk2.sym");
+    ray_t* w = ray_parse("(> v 5)");
+    cp_topk_ctx_t cx = { .t = t, .where = w, .mode = 0, .sk = { sv, si }, .desc = { 1, 0 }, .outs = { si, sv, sd, ss } };
+    ray_enccol_test_fail_alloc(1);
+    ray_t* r = cp_topk_body(&cx);
+    ray_enccol_test_fail_alloc(0);
+    bool plain_err = r && RAY_IS_ERR(r);
+    if (plain_err) ray_error_free(r); else if (r) ray_release(r);
+    ray_release(w); ray_release(t);
+    TEST_ASSERT_TRUE(plain_err);
+    PASS();
+}
+
+/* The slice-group kernel's shape admission binds the product columns
+ * (sg_shape_eligible through the early settle hook): the answer equals the
+ * plain-sym table's and a failed bind is the query's error. */
+static test_result_t test_slice_group_bound(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set SY ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh])"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set KS (as 'SYM (at SY (% (til 4000) 8))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set FF (* 0.5 (as 'F64 (% (til 4000) 64))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set GG (* 0.25 (as 'F64 (% (til 4000) 32))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set TP (table [s f g] (list KS FF GG)))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set TI (table [s f g] (list (.attr.set 'grouped KS) FF GG)))"), "");
+    const char* qi = "(select {sv: (sum (* f g)) from: TI by: s asc: s where: (in s ['aa 'cc])})";
+    const char* qp = "(select {sv: (sum (* f g)) from: TP by: s asc: s where: (in s ['aa 'cc])})";
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_GROUP_SLICE];
+    ray_t* a = ray_eval_str(qi);
+    ray_t* b = ray_eval_str(qp);
+    TEST_ASSERT_TRUE(ray_idx_hits[IDX_SITE_GROUP_SLICE] == hits0 + 1);        /* the slice path ran once */
+    TEST_ASSERT_TRUE(cp_fmt_same(a, b) && ray_table_nrows(a) == 2);
+    ray_release(a); ray_release(b);
+    ray_graph_bind_test_fail_alloc(1);
+    a = ray_eval_str(qi);
+    ray_graph_bind_test_fail_alloc(0);
+    TEST_ASSERT_TRUE(cp_is_bind_error(a));
+    ray_error_free(a);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -2150,5 +2805,12 @@ const test_entry_t compress_entries[] = {
     { "compress/fused_pred_bound",  test_fused_pred_bound, rt_setup, rt_teardown },
     { "compress/fused_pred_enc_source", test_fused_pred_enc_source, rt_setup, rt_teardown },
     { "compress/fused_pred_bind_failure", test_fused_pred_bind_failure, rt_setup, rt_teardown },
+    { "compress/bind_dedup_validates",    test_bind_dedup_validates,    rt_setup, rt_teardown },
+    { "compress/compile_paths_bound",     test_compile_paths_bound,     rt_setup, rt_teardown },
+    { "compress/try_plans_bound",         test_try_plans_bound,         rt_setup, rt_teardown },
+    { "compress/expr_compile_bound",      test_expr_compile_bound,      rt_setup, rt_teardown },
+    { "compress/group_desc_bound",        test_group_desc_bound,        rt_setup, rt_teardown },
+    { "compress/topk_bound",              test_topk_bound,              rt_setup, rt_teardown },
+    { "compress/slice_group_bound",       test_slice_group_bound,       rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

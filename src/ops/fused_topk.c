@@ -45,6 +45,7 @@
 #include "ops/fused_pred.h"
 #include "ops/fused_group.h"   /* ray_fused_group_supported */
 #include "ops/internal.h"
+#include "ops/colbind.h"
 #include "lang/internal.h"
 #include "core/pool.h"
 #include "ops/idxop.h"      /* chunk-zone extrema: skip chunks that cannot enter the top-K */
@@ -494,45 +495,59 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
 
-    for (uint32_t c = 0; c < n_out; c++) {
-        ray_t* col = ray_table_get_col(tbl, out_col_syms[c]);
-        if (!col) return NULL;
-        int8_t ot = col->type;
-        if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON) return NULL;
-        if (!ray_is_vec(col))
-            return NULL;
+    for (uint32_t c = 0; c < n_out; c++) {       /* a gate: metadata, no bind */
+        ray_col_meta_t om;
+        if (!ray_table_col_meta(tbl, out_col_syms[c], &om)) return NULL;
+        if (RAY_IS_PARTED(om.type) || om.type == RAY_MAPCOMMON) return NULL;
+        if (om.type < RAY_BOOL || om.type > RAY_STR) return NULL;     /* not a vector */
     }
 
-    /* Resolve sort-key columns + decide if any need the SYM dict snapshot. */
+    /* The graph owns the column binds: it is made before the sort keys are
+     * resolved and freed after the output is built. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+
+    /* Resolve sort-key columns + decide if any need the SYM dict snapshot.
+     * Sort keys are materialized (spec "Top-k"): the plain column is
+     * requested here; a failed bind or plain request is returned. */
     fpk_par_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     int sym_needed = 0;
     for (uint32_t i = 0; i < n_sort_keys; i++) {
-        ray_t* col = ray_table_get_col(tbl, sort_key_syms[i]);
-        if (!col) { fpk_unpin_keys(ctx.keys, i); return NULL; }
-        int8_t kt = col->type;
-        if (RAY_IS_PARTED(kt) || kt == RAY_MAPCOMMON) { fpk_unpin_keys(ctx.keys, i); return NULL; }
+        ray_col_meta_t km;
+        if (!ray_table_col_meta(tbl, sort_key_syms[i], &km)) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
+        if (RAY_IS_PARTED(km.type) || km.type == RAY_MAPCOMMON || ray_col_bind_declines(tbl, sort_key_syms[i]))
+            { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
+        ray_t* berr = NULL;
+        ray_col_src_t* ksrc = ray_graph_bind_col(g, tbl, sort_key_syms[i], &berr);
+        if (berr) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return berr; }
+        if (!ksrc) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
+        int8_t kt = ksrc->type;
+        if (ksrc->parted || kt == RAY_MAPCOMMON) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
         if (kt != RAY_SYM && kt != RAY_STR && kt != RAY_BOOL && kt != RAY_U8
             && kt != RAY_I16 && kt != RAY_I32 && kt != RAY_I64
             && kt != RAY_DATE && kt != RAY_TIME && kt != RAY_TIMESTAMP
             && kt != RAY_F32 && kt != RAY_F64 && kt != RAY_GUID)
-            { fpk_unpin_keys(ctx.keys, i); return NULL; }
+            { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
+        ray_t* col = NULL;
+        ray_t* perr = ray_col_src_plain(ksrc, &col);
+        if (perr) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return perr; }
         ctx.keys[i].type      = kt;
         ctx.keys[i].attrs     = col->attrs;
         ctx.keys[i].esz       = ray_sym_elem_size(kt, col->attrs);
         ctx.keys[i].desc      = sort_descs[i];
-        ctx.keys[i].has_nulls = ray_vec_may_have_nulls(col) ? 1 : 0;
+        ctx.keys[i].has_nulls = ksrc->may_null ? 1 : 0;
         ctx.keys[i].nulls_first = sort_nulls_first(sort_descs[i]);
         ctx.keys[i].dom_runtime =
             (kt == RAY_SYM &&
-             ray_sym_vec_domain(col) == ray_sym_runtime_domain()) ? 1 : 0;
+             ksrc->dom == ray_sym_runtime_domain()) ? 1 : 0;
         ctx.keys[i].sym       = sort_key_syms[i];
         ctx.keys[i].base      = ray_data(col);
         ctx.keys[i].col       = col;
         ctx.keys[i].raw_ok    = 0;
         if (ctx.keys[i].dom_runtime) sym_needed = 1;
         else if (kt == RAY_SYM)
-            ctx.keys[i].raw_ok = ray_sym_domain_raw_pin(ray_sym_vec_domain(col), &ctx.keys[i].raw) ? 1 : 0;
+            ctx.keys[i].raw_ok = ray_sym_domain_raw_pin(ksrc->dom, &ctx.keys[i].raw) ? 1 : 0;
     }
     ctx.n_keys = n_sort_keys;
     ctx.k      = k;
@@ -563,8 +578,6 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     /* Compile the predicate via a temp graph just for the WHERE clause.  No
      * where: is a predicate with no children — every row passes — and the
      * heap does the whole sort-and-take in one pass. */
-    ray_graph_t* g = ray_graph_new(tbl);
-    if (!g) { fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
     if (where_expr) {
         ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
         if (!pred_dag) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
@@ -669,11 +682,16 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         return NULL;                     /* decline: the unfused path runs (as before) */
     }
     int build_ok = 1;
+    ray_t* gerr = NULL;                  /* a failed bind or plain request: returned */
     for (uint32_t c = 0; c < n_out; c++) {
         int64_t cs    = out_col_syms[c];
         int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
-        ray_t* src = ray_table_get_col(tbl, cs);
-        if (!src) { build_ok = 0; break; }
+        ray_col_src_t* ssrc = ray_graph_bind_col(g, tbl, cs, &gerr);
+        if (gerr) { build_ok = 0; break; }
+        if (!ssrc) { build_ok = 0; break; }
+        ray_t* src = NULL;
+        gerr = ray_col_src_plain(ssrc, &src);        /* P3: vector-grouped range reads */
+        if (gerr) { build_ok = 0; break; }
         ray_t* col = gather_by_idx(src, global_idx, global_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
@@ -683,7 +701,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ray_graph_free(g);
     if (!build_ok) {
         ray_release(result);
-        return NULL;                     /* decline: the unfused path runs (as before) */
+        return gerr;                     /* NULL: decline, the unfused path runs (as before) */
     }
     return result;
 }
@@ -815,12 +833,11 @@ ray_t* ray_fused_take_select(ray_t* tbl,
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
 
-    for (uint32_t c = 0; c < n_out; c++) {
-        ray_t* col = ray_table_get_col(tbl, out_col_syms[c]);
-        if (!col) return NULL;
-        int8_t ot = col->type;
-        if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON) return NULL;
-        if (!ray_is_vec(col)) return NULL;
+    for (uint32_t c = 0; c < n_out; c++) {       /* a gate: metadata, no bind */
+        ray_col_meta_t om;
+        if (!ray_table_col_meta(tbl, out_col_syms[c], &om)) return NULL;
+        if (RAY_IS_PARTED(om.type) || om.type == RAY_MAPCOMMON) return NULL;
+        if (om.type < RAY_BOOL || om.type > RAY_STR) return NULL;     /* not a vector */
     }
 
     ftk_ctx_t ctx;
@@ -904,11 +921,16 @@ ray_t* ray_fused_take_select(ray_t* tbl,
         return NULL;                     /* decline: the unfused path runs (as before) */
     }
     int build_ok = 1;
+    ray_t* gerr = NULL;                  /* a failed bind or plain request: returned */
     for (uint32_t c = 0; c < n_out; c++) {
         int64_t cs    = out_col_syms[c];
         int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
-        ray_t* src = ray_table_get_col(tbl, cs);
-        if (!src) { build_ok = 0; break; }
+        ray_col_src_t* ssrc = ray_graph_bind_col(g, tbl, cs, &gerr);
+        if (gerr) { build_ok = 0; break; }
+        if (!ssrc) { build_ok = 0; break; }
+        ray_t* src = NULL;
+        gerr = ray_col_src_plain(ssrc, &src);        /* P3: vector-grouped range reads */
+        if (gerr) { build_ok = 0; break; }
         ray_t* col = gather_by_idx(src, out, out_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
@@ -918,7 +940,7 @@ ray_t* ray_fused_take_select(ray_t* tbl,
     ray_graph_free(g);
     if (!build_ok) {
         ray_release(result);
-        return NULL;                     /* decline: the unfused path runs (as before) */
+        return gerr;                     /* NULL: decline, the unfused path runs (as before) */
     }
     return result;
 }

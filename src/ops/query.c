@@ -7881,6 +7881,11 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     {
         bool all_pass = false;
         ray_t* fsel = exec_pred_to_selection(g, pred, pre_nrows, &all_pass);
+        if (fsel && RAY_IS_ERR(fsel)) {           /* a failed column bind */
+            ray_graph_free(g);
+            ray_release(tbl);
+            return fsel;
+        }
         if (all_pass || fsel) {
             int64_t nrows = pre_nrows;
             if (fsel) {

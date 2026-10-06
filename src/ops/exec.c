@@ -1936,7 +1936,8 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
              * runs compiled. */
             if (n != root && g->table && nr > 0) {
                 ray_expr_t ex;
-                if (expr_compile(g, g->table, n, &ex)) {
+                ray_t* cerr = NULL;
+                if (expr_compile(g, g->table, n, &ex, &cerr)) {
                     ray_t* vec = expr_eval_full(&ex, nr);
                     if (vec && !RAY_IS_ERR(vec)) {
                         vals[e.id]  = vec;
@@ -1944,6 +1945,9 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
                         continue;
                     }
                     ray_error_free(vec);   /* fall through to per-node eval */
+                } else if (cerr) {         /* a failed column bind is the query's error */
+                    result = cerr;
+                    goto done;
                 }
             }
 
@@ -2294,9 +2298,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t nr = ray_table_nrows(g->table);
                 if (nr > 0) {
                     ray_expr_t ex;
-                    if (expr_compile(g, g->table, op, &ex)) {
+                    ray_t* cerr = NULL;
+                    if (expr_compile(g, g->table, op, &ex, &cerr)) {
                         ray_t* vec = expr_eval_full(&ex, nr);
                         if (vec && !RAY_IS_ERR(vec)) return vec;
+                    } else if (cerr) {
+                        return cerr;
                     }
                 }
             }
@@ -2790,6 +2797,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     bool all_pass = false;
                     ray_t* fsel = exec_pred_to_selection(g, pred_root, fnrows,
                                                          &all_pass);
+                    if (fsel && RAY_IS_ERR(fsel)) {       /* a failed column bind */
+                        ray_release(input);
+                        return fsel;
+                    }
                     if (fsel || all_pass) {
                         g->selection = fsel;  /* NULL when all rows pass */
                         return input;

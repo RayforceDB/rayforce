@@ -46,8 +46,20 @@ ray_col_src_t* ray_graph_bind_col(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t
     *err = NULL;
     if (!g || !tbl) return NULL;
     ray_col_binds_t* b = g->binds;
-    for (uint32_t i = 0; b && i < b->n; i++)
-        if (b->e[i]->tbl == tbl && b->e[i]->sym == sym) return &b->e[i]->src;
+    /* A hit must still describe the column the table holds now: a table
+     * released and reallocated at the same address (a temporary sub-table)
+     * or a column replaced in place must not return the old binding. */
+    ray_t* cur = NULL;
+    bool   cur_set = false;
+    for (uint32_t i = 0; b && i < b->n; i++) {
+        if (b->e[i]->tbl != tbl || b->e[i]->sym != sym) continue;
+        if (!cur_set) {
+            cur = ray_table_get_col_enc(tbl, sym);
+            if (!cur) cur = ray_table_col(tbl, sym);          /* plain slot: no decode */
+            cur_set = true;
+        }
+        if (b->e[i]->src.obj == cur) return &b->e[i]->src;
+    }
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return NULL;          /* absent */
     if (bind_alloc_fails()) { *err = ray_error("oom", "column bind"); return NULL; }
@@ -69,6 +81,14 @@ ray_col_src_t* ray_graph_bind_col(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t
     x->tbl = tbl; x->sym = sym;
     b->e[b->n++] = x;
     return &x->src;
+}
+
+bool ray_col_bind_declines(ray_t* tbl, int64_t sym) {
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, sym, &m)) return false;
+    if (m.type == RAY_MAPCOMMON) return true;
+    if (m.enc) return (m.enc->attrs & RAY_ATTR_SLICE) != 0;
+    return RAY_IS_PARTED(m.type) && (m.attrs & RAY_ATTR_SLICE) != 0;
 }
 
 void ray_graph_binds_free(ray_graph_t* g) {
