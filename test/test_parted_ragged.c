@@ -45,7 +45,7 @@
 #define PR_TMP "/tmp/rayforce_parted_ragged"
 
 static void pr_setup(void)    { ray_runtime_create(0, NULL); (void)ray_test_rm_rf(PR_TMP); (void)ray_test_mkdir_p(PR_TMP); }
-static void pr_teardown(void) { (void)ray_test_rm_rf(PR_TMP); ray_runtime_destroy(__RUNTIME); }
+static void pr_teardown(void) { ray_test_hooks_off(); (void)ray_test_rm_rf(PR_TMP); ray_runtime_destroy(__RUNTIME); }
 
 static void drop_out(ray_t* o) { if (!o) return; if (RAY_IS_ERR(o)) ray_error_free(o); else ray_release(o); }
 

@@ -55,7 +55,7 @@ static void ec_setup(void) {
     for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
 }
 static uint8_t* g_img; static size_t g_len;
-static void ec_teardown(void) { free(g_img); g_img = NULL; ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(EC_TMP); }
+static void ec_teardown(void) { ray_test_hooks_off(); free(g_img); g_img = NULL; ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(EC_TMP); }
 
 static bool img_load(const char* p) {
     free(g_img); g_img = NULL; g_len = 0;

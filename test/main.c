@@ -52,6 +52,9 @@
 #include "ops/idxop.h"
 #include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
 #include "store/col.h"      /* ray_store_test_force_compress — equivalence pass */
+#include "store/enccol.h"   /* ray_test_hooks_off */
+#include "store/encw.h"
+#include "ops/colbind.h"
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -905,6 +908,19 @@ int ray_test_rm_rf(const char* path) {
 
 int ray_test_mkdir_p(const char* path) {
     return ray_mkdir_p(path) == RAY_OK ? 0 : -1;
+}
+
+void ray_test_hooks_off(void) {
+    ray_enccol_test_fail_alloc(0);
+    ray_enccol_test_fail_path(NULL);
+    ray_enccol_test_interrupt_after(0);
+    ray_enccol_test_parted_mode(0);
+    ray_enccol_test_refuse_attach(0);
+    ray_col_test_fail_alloc(0);
+    ray_encw_test_force(-1);
+    ray_graph_bind_test_fail_alloc(0);
+    ray_store_test_force_compress(false);
+    ray_clear_interrupt();
 }
 
 #if defined(_WIN32)

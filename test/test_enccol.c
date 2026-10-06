@@ -51,7 +51,7 @@ static void enccol_setup(void) {
     ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ENCCOL_TMP);
     for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
 }
-static void enccol_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCCOL_TMP); }
+static void enccol_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCCOL_TMP); }
 
 static ray_err_t save_i32_rows(const char* path, int64_t n) {
     ray_t* v = ray_vec_new(RAY_I32, n); v->len = n;

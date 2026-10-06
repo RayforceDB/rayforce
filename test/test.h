@@ -46,6 +46,12 @@
 int ray_test_rm_rf(const char* path);     /* rm -rf path  */
 int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
 
+/* Disarm every global store / decode / bind test hook and clear a pending
+ * interrupt request.  Teardowns of suites that arm hooks call it, so a test
+ * that fails between arming and disarming never leaks the hook into the
+ * tests after it. */
+void ray_test_hooks_off(void);
+
 #if defined(_WIN32)
 /* POSIX helpers the tests rely on, mapped onto their MSVCRT equivalents.
  * Test paths use "/tmp/...", which Windows resolves to <drive>:\tmp; the

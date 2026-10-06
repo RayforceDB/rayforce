@@ -66,7 +66,7 @@
 #define CS_TMP "/tmp/rayforce_compress"
 
 static void cs_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray_test_rm_rf(CS_TMP); (void)ray_test_mkdir_p(CS_TMP); }
-static void cs_teardown(void) { (void)ray_test_rm_rf(CS_TMP); ray_sym_destroy(); ray_heap_destroy(); }
+static void cs_teardown(void) { ray_test_hooks_off(); (void)ray_test_rm_rf(CS_TMP); ray_sym_destroy(); ray_heap_destroy(); }
 
 static ray_t* i64_col(int64_t n, int64_t mul) {
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
@@ -246,7 +246,7 @@ static test_result_t test_serde_encoded_table(void) {
 }
 
 static void rt_setup(void)    { ray_runtime_create(0, NULL); (void)ray_test_rm_rf(CS_TMP); (void)ray_test_mkdir_p(CS_TMP); }
-static void rt_teardown(void) { (void)ray_test_rm_rf(CS_TMP); ray_runtime_destroy(__RUNTIME); }
+static void rt_teardown(void) { ray_test_hooks_off(); (void)ray_test_rm_rf(CS_TMP); ray_runtime_destroy(__RUNTIME); }
 
 /* A table `name` (columns k, v: I64 3000 rows, k = i, v = 10 i) saved as
  * generation 2, loaded and bound to the global `t`.  Returns the retained

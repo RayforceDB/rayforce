@@ -38,7 +38,7 @@
 #define ENCFMT_TMP "/tmp/rayforce_encfmt"
 
 static void encfmt_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ENCFMT_TMP); }
-static void encfmt_teardown(void) { ray_encw_test_force(-1); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCFMT_TMP); }
+static void encfmt_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCFMT_TMP); }
 
 static void hdr_set(uint8_t h[32], uint8_t order, uint32_t aux0) {
     memset(h, 0, 32);

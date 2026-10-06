@@ -39,7 +39,7 @@
 
 #define LG_TMP "/tmp/rayforce_enc_large"
 static void lg_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(LG_TMP); }
-static void lg_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(LG_TMP); }
+static void lg_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(LG_TMP); }
 
 /* 65535 descriptors sharing one pooled range of the source (a 65538-byte
  * pool): the source stays small, while the decoded compact pool counts each
