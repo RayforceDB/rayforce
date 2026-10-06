@@ -4242,11 +4242,10 @@ static test_result_t test_scalar_agg_planning_zoned(void) {
         TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "query %d", i);
         ray_release(r);
         ray_enc_counters_t c; ray_enc_counters_get(&c);
-        /* Answered from the zone during planning would leave UINT64_MAX: the
-         * query must reach execution.  (select still decodes its source at
-         * entry, transitional until Task 31, so the stricter "== 0" holds
-         * only after that.) */
-        TEST_ASSERT_FMT(c.at_first_exec != UINT64_MAX, "query %d answered during planning from a gen-2 zone", i);
+        /* The query reaches execution (answered from the zone during
+         * planning would leave UINT64_MAX) and nothing decodes before it. */
+        TEST_ASSERT_FMT(c.at_first_exec == 0, "query %d: %llu materialized before execution", i,
+                        (unsigned long long)c.at_first_exec);
     }
     ray_t* r = ray_eval_str("(sum (at u 'v))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == (int64_t)69999 * 70000 / 2);
@@ -4335,28 +4334,214 @@ static test_result_t test_query_helpers_gen2_equal(void) {
     PASS();
 }
 
-/* A select over a table with an undecodable column reports that column's
- * error.  Today this exercises the select-entry decode (the helpers are
- * unreachable behind it); it covers the helpers once Task 31 removes that. */
+/* `n` rows of b (5 i) and k (i mod 7), generation 0, then a1 .. a9
+ * (generation 2, 3 i), each loaded intact and failing to materialize: a
+ * query's error names the one column the site that failed read. */
+static ray_t* qb_table(int64_t n) {
+    char p[256];
+    (void)ray_test_rm_rf(CS_TMP "/qb");
+    (void)ray_test_mkdir_p(CS_TMP "/qb");
+    ray_t* names = ray_vec_new(RAY_STR, 11);
+    ray_t* b = i64_col(n, 5);
+    ray_t* k = ray_vec_new(RAY_I64, n); k->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(k))[i] = i % 7;
+    snprintf(p, sizeof p, "%s/qb/b", CS_TMP); ray_col_save_gen(b, p, 0);
+    snprintf(p, sizeof p, "%s/qb/k", CS_TMP); ray_col_save_gen(k, p, 0);
+    ray_release(b); ray_release(k);
+    names = ray_str_vec_append(names, "b", 1); names = ray_str_vec_append(names, "k", 1);
+    int64_t n_chunks = (n + 65535) / 65536;
+    for (int c = 1; c <= 9; c++) {
+        char nm[4]; snprintf(nm, sizeof nm, "a%d", c);
+        ray_t* a = i64_col(n, 3);
+        snprintf(p, sizeof p, "%s/qb/%s", CS_TMP, nm); ray_col_save_gen(a, p, 2);
+        ray_release(a);
+        FILE* f = fopen(p, "r+b");
+        fseek(f, (long)(96 + 64 * n_chunks + 6), SEEK_SET); fputc(1, f); fclose(f);
+        names = ray_str_vec_append(names, nm, 2);
+    }
+    snprintf(p, sizeof p, "%s/qb/.d", CS_TMP); ray_col_save(names, p); ray_release(names);
+    return ray_read_splayed(CS_TMP "/qb", NULL);
+}
+
+/* A select whose source cannot materialize a column reports that column's
+ * error from the helper that read it (the select entry no longer decodes the
+ * source): each query references its own damaged column, so the file named
+ * in the message proves which column the failing site read.  The row-wise
+ * grouped expression binds every column (bind_all_columns' error path) and
+ * fails on the first damaged column in table order, a1. */
 static test_result_t test_query_helpers_failed_decode(void) {
-    ray_t* t = ex_table(3000, true);
+    ray_t* t = qb_table(3000);
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
     ray_env_set(ray_sym_intern("bad", 3), t);
     ray_release(t);
+    static const struct { const char* q; const char* col; } qs[] = {
+        { "(select {c: (count (distinct a2)) by: b from: bad})",   "a2" },  /* count-distinct rewrite */
+        { "(select {s: (sum a3) by: b from: bad desc: s take: 2})", "a3" },
+        { "(select {c: (count a4) from: bad where: (== a4 3)})",    "a4" },
+        { "(select {x: (+ a5 1) from: bad})",                       "a5" },
+        { "(select {m: (max a6) from: bad})",                       "a6" },  /* metadata declines: execution reads */
+        { "(select {s: (sum b) by: (+ a7 1) from: bad})",           "a7" },  /* computed-key plan */
+        { "(select {x: (+ a8 b) by: k from: bad})",                 "a1" },  /* bind_all_columns */
+        { NULL, NULL },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        char path[128];
+        snprintf(path, sizeof path, "%s/qb/%s", CS_TMP, qs[i].col);
+        ray_error_clear();
+        ray_t* r = ray_eval_str(qs[i].q);
+        test_result_t rr = t29_corrupt_at(r, qs[i].q, path);
+        if (rr.status != TEST_PASS) return rr;
+    }
+    PASS();
+}
+
+/* ---- Task 31: ray_select_impl ---- */
+
+/* A select over a table whose encoded columns cannot materialize reports the
+ * failure from the site that read the column: each query below references
+ * one damaged column, and its error names that column's file.  The select
+ * entry no longer decodes the source, so a query naming a2 failing on a1
+ * would mean some site read a column the query never references.  The one
+ * exception is the row-wise expression in a grouped select, which binds
+ * every column of the table (bind_all_columns) and so fails on the first
+ * damaged column in table order. */
+static test_result_t test_select_sites_failed_decode(void) {
+    static const struct { const char* q; const char* col; } qs[] = {
+        { "(select {c: (count (distinct a2)) by: k from: bad})",            "a2" },
+        { "(select {s: (sum a3) by: k from: bad desc: s take: 2})",          "a3" },
+        { "(select {c: (count b) from: bad where: (== a4 3)})",              "a4" },
+        { "(select {x: (+ a5 1) from: bad})",                                "a5" },
+        { "(select {m: (max a6) from: bad})",                                "a6" },
+        { "(select {s: (sum b) by: (+ a7 1) from: bad})",                    "a7" },
+        { "(select {x: a8 from: bad where: (> b 10) asc: a8 take: 3})",      "a8" },
+        { "(select {f: (first a9) by: k from: bad})",                        "a9" },
+        { "(select {s: (sum a2) by: k from: bad where: (> b 10)})",          "a2" },
+        { "(select {x: a3 y: b from: bad where: (> b 10)})",                 "a3" },
+        { "(select {x: a4 from: bad asc: a4})",                              "a4" },
+        { "(select {s: (sum b) by: a5 from: bad})",                          "a5" },
+        { "(select {s: (sum a6) l: (last b) by: [k b] from: bad})",          "a6" },
+        { "(select {x: (+ a5 b) by: k from: bad})",                          "a1" },  /* bind_all_columns */
+        { NULL, NULL },
+    };
+    for (int n = 0; n < 2; n++) {
+        int64_t rows = n ? 200000 : 3000;
+        ray_t* t = qb_table(rows);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_env_set(ray_sym_intern("bad", 3), t);
+        ray_release(t);
+        for (int i = 0; qs[i].q; i++) {
+            char path[128], what[200];
+            snprintf(path, sizeof path, "%s/qb/%s", CS_TMP, qs[i].col);
+            snprintf(what, sizeof what, "%s (n=%lld)", qs[i].q, (long long)rows);
+            ray_error_clear();
+            ray_t* r = ray_eval_str(qs[i].q);
+            test_result_t rr = t29_corrupt_at(r, what, path);
+            if (rr.status != TEST_PASS) return rr;
+        }
+    }
+    PASS();
+}
+
+/* A select over a generation-2 table materializes exactly the columns it
+ * references, never the table's width, for where, by, aggregate and take
+ * shapes. */
+static test_result_t test_select_decodes_referenced_only(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 'm 'v 'w 'x 'y] (list (% (til 80000) 7) (% (til 80000) 5) (% (* (til 80000) 13) 1000) (% (til 80000) 11) (til 80000) (* 2 (til 80000)))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/rr\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u2 (.db.splayed.get \"" CS_TMP "/rr\"))"), "");
+    static const char* const cn[] = { "k", "m", "v", "w", "x", "y" };
+    for (int c = 0; c < 6; c++) {
+        ray_t* u = ray_eval_str("u2");
+        bool enc = u && ray_table_get_col_enc(u, ray_sym_intern(cn[c], 1)) != NULL;
+        ray_release(u);
+        TEST_ASSERT_FMT(enc, "column %s is encoded", cn[c]);
+    }
+    static const struct { const char* q; uint64_t cols; } qs[] = {
+        { "(select {c: (count v) from: u2 where: (> v 100)})",                1 },
+        { "(select {s: (sum v) from: u2 where: (== k 3)})",                   2 },
+        { "(select {from: u2 where: (== k 3)})",                              6 },  /* every column is output */
+        { "(select {s: (sum v) by: k from: u2})",                             2 },
+        { "(select {s: (sum v) c: (max w) by: [k m] from: u2})",              4 },
+        { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              3 },
+        { "(select {s: (sum v) by: k from: u2 desc: s take: 2})",             2 },
+        { "(select {d: (med v) e: (first w) from: u2})",                      2 },
+        { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      3 },
+        { "(select {k: k v: v from: u2 take: 5})",                            2 },
+        { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             3 },
+        { "(select {v: v from: u2 desc: v take: 3})",                         1 },
+        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      3 },
+        { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    3 },
+        { NULL, 0 },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        ray_t* u = ray_eval_str("(set u2 (.db.splayed.get \"" CS_TMP "/rr\"))");   /* a fresh load: no cached decode */
+        TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u));
+        ray_release(u);
+        ray_enc_counters_reset();
+        ray_t* r = ray_eval_str(qs[i].q);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        bool ok = r && !RAY_IS_ERR(r);
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        TEST_ASSERT_FMT(ok, "%s: answered", qs[i].q);
+        TEST_ASSERT_FMT(c.materialized == qs[i].cols, "%s: materialized %llu, references %llu",
+                        qs[i].q, (unsigned long long)c.materialized, (unsigned long long)qs[i].cols);
+    }
+    PASS();
+}
+
+/* Generation 0 and 2 give the same answers over a broad set of select shapes. */
+static test_result_t test_select_gen2_equal(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 'm 'v 'w 's 'f] (list (% (til 80000) 7) (% (til 80000) 5) (% (* (til 80000) 13) 1000) (- 40000 (til 80000)) (take ['aa 'bb 'cc 'dd] 80000) (* 0.5 (% (til 80000) 333)))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/e0\" t {compress: false})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/e2\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u0 (.db.splayed.get \"" CS_TMP "/e0\"))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u2 (.db.splayed.get \"" CS_TMP "/e2\"))"), "");
     static const char* const qs[] = {
-        "(select {c: (count (distinct a)) by: b from: bad})",
-        "(select {s: (sum a) by: b from: bad desc: s take: 2})",
-        "(select {c: (count a) from: bad where: (== a 3)})",
-        "(select {x: (+ a 1) from: bad})",
-        "(select {m: (max a) from: bad})",
-        "(select {s: (sum b) by: (+ a 1) from: bad})",
+        "(select {from: %s})",
+        "(select {from: %s where: (== k 3)})",
+        "(select {from: %s take: 7})",
+        "(select {from: %s take: -7})",
+        "(select {from: %s asc: v take: 9})",
+        "(select {from: %s desc: [k v] take: 9})",
+        "(select {v: v w: w from: %s where: (> v 990) asc: w})",
+        "(select {v: v w: w from: %s where: (> v 990) desc: w take: 5})",
+        "(select {v: v from: %s where: (> w 0) take: 6})",
+        "(select {v: v from: %s where: (> w 0) take: -6})",
+        "(select {x: (+ v w) y: (* f 2) from: %s where: (< k 2) take: 8})",
+        "(select {c: (count v) from: %s})",
+        "(select {s: (sum v) a: (avg f) mn: (min w) mx: (max w) from: %s})",
+        "(select {s: (sum v) d: (dev f) from: %s where: (in k [1 2])})",
+        "(select {d: (med v) from: %s where: (== s 'bb)})",
+        "(select {s: (sum v) by: k from: %s})",
+        "(select {s: (sum v) by: s from: %s})",
+        "(select {s: (sum f) c: (count v) by: [k s] from: %s})",
+        "(select {s: (sum v) by: k from: %s where: (> w 100)})",
+        "(select {s: (sum v) by: m from: %s where: (== s 'cc) desc: s})",
+        "(select {s: (sum v) by: k from: %s asc: s take: 3})",
+        "(select {f1: (first v) l1: (last w) by: k from: %s})",
+        "(select {mx: (max f) mn: (min v) by: [m k] from: %s})",
+        "(select {c: (count (distinct v)) by: m from: %s})",
+        "(select {c: (count (distinct s)) by: k from: %s where: (> v 10)})",
+        "(select {x: (+ v 1) by: k from: %s where: (< w -39990)})",
+        "(select {s: (sum v) by: (%% w 3) from: %s})",
+        "(select {s: (sum v) by: k from: %s where: (> v 500) desc: s take: 2})",
+        "(select {a: (avg v) by: k from: %s where: (== s 'aa)})",
+        "(select {v: v from: %s where: (and (> v 100) (< w 0)) asc: v take: 4})",
+        "(select {k: k s: s from: %s where: (== v 13) take: 3})",
+        "(select {q: (* v 2) r: (- w 1) from: %s where: (== k 6) desc: v take: 2})",
         NULL,
     };
     for (int i = 0; qs[i]; i++) {
-        ray_error_clear();
-        ray_t* r = ray_eval_str(qs[i]);
-        test_result_t rr = ex_corrupt(r, qs[i]);
-        if (rr.status != TEST_PASS) return rr;
+        char q0[256], q2[256];
+        snprintf(q0, sizeof q0, qs[i], "u0");
+        snprintf(q2, sizeof q2, qs[i], "u2");
+        ray_t* a = ray_eval_str(q0);
+        ray_t* b = ray_eval_str(q2);
+        bool ok = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && t29_same(a, b) && cp_fmt_same(a, b);
+        if (!ok) fprintf(stderr, "select_gen2_equal: %s\n", q2);
+        if (a && RAY_IS_ERR(a)) ray_error_free(a); else if (a) ray_release(a);
+        if (b && RAY_IS_ERR(b)) ray_error_free(b); else if (b) ray_release(b);
+        TEST_ASSERT_FMT(ok, "query %d", i);
     }
     PASS();
 }
@@ -4498,5 +4683,8 @@ const test_entry_t compress_entries[] = {
     { "compress/dag_presence_without_decode", test_dag_presence_without_decode, rt_setup, rt_teardown },
     { "compress/query_helpers_gen2_equal",   test_query_helpers_gen2_equal,   rt_setup, rt_teardown },
     { "compress/query_helpers_failed_decode", test_query_helpers_failed_decode, rt_setup, rt_teardown },
+    { "compress/select_sites_failed_decode", test_select_sites_failed_decode, rt_setup, rt_teardown },
+    { "compress/select_decodes_referenced_only", test_select_decodes_referenced_only, rt_setup, rt_teardown },
+    { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

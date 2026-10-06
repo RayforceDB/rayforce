@@ -12080,6 +12080,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 }
                 key_vecs[k] = vec;
                 key_owned[k] = 1;
+            } else if (vec) {
+                /* The key's own error (a column that cannot materialize,
+                 * say), not "not found". */
+                for (uint32_t j = 0; j < k; j++)
+                    if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
+                return vec;
             }
         }
         if (!key_vecs[k]) {

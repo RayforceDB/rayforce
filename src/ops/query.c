@@ -569,6 +569,29 @@ static bool tbl_has_col(ray_t* tbl, int64_t sym) {
     return ray_table_col_meta(tbl, sym, &m);
 }
 
+/* ray_vec_may_have_nulls of a column, from metadata: a plain slot is asked
+ * directly (no decode); an encoded one answers from its directory, keeping
+ * the conservative "text may hold nulls" rule. */
+static bool tbl_col_may_have_nulls(ray_t* tbl, int64_t sym) {
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, sym, &m)) return false;
+    if (!m.enc) return ray_vec_may_have_nulls(ray_table_col(tbl, sym));
+    if (m.type == RAY_SYM || m.type == RAY_STR) return true;
+    return ray_table_col_has_nulls(tbl, sym);
+}
+
+/* An empty column shaped like a table column (what a zero-row gather of it
+ * returns): a plain slot is gathered as it is; an encoded one is built from
+ * its metadata, without a decode. */
+static ray_t* tbl_col_empty(ray_t* tbl, int64_t sym) {
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, sym, &m)) return NULL;
+    if (!m.enc) return ray_group_gather(ray_table_col(tbl, sym), NULL, 0);   /* plain: no decode */
+    if (m.type == RAY_LIST) return ray_list_new(0);
+    if (m.type == RAY_SYM) return ray_sym_vec_new(m.attrs & RAY_SYM_W_MASK, 0);
+    return ray_vec_new(m.type, 0);
+}
+
 /* A column as a plain borrowed vector for a function that declines by
  * returning NULL: a column that fails to materialize declines too, and the
  * path the caller falls back to re-reads it through the accessors and
@@ -2698,6 +2721,15 @@ static int8_t query_col_base_type(ray_t* col) {
         return (p && p[0]) ? p[0]->type : 0;
     }
     return col->type;
+}
+
+/* query_col_base_type of a table column from metadata: an encoded slot is a
+ * flat column of its logical type; parted wrappers and MAPCOMMON (never
+ * encoded) are asked directly. */
+static int8_t tbl_col_base_type(ray_t* tbl, int64_t sym) {
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, sym, &m)) return 0;
+    return m.enc ? m.type : query_col_base_type(ray_table_col(tbl, sym));   /* plain: no decode */
 }
 
 /* A scalar key type the streaming per-partition group kernel packs into an
@@ -9312,7 +9344,6 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         if (RAY_IS_ERR(tbl)) return tbl;
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
-    TABLE_DECODE_OR_RETURN(tbl);
 
     if (!aliases_resolved) {
         select_alias_plan_t plan;
@@ -9542,12 +9573,12 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     if (alias_ref) { bad_clause = 1; break; }
                 }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
-                    ray_t* oc = ray_table_get_col(tbl, v->i64);
-                    if (!oc) { bad_clause = 1; break; }
-                    int8_t ot = oc->type;
+                    ray_col_meta_t om;
+                    if (!ray_table_col_meta(tbl, v->i64, &om)) { bad_clause = 1; break; }
+                    int8_t ot = om.type;
                     if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON)
                         { bad_clause = 1; break; }
-                    if (!ray_is_vec(oc))
+                    if (!(ot >= RAY_BOOL && ot <= RAY_STR))
                         { bad_clause = 1; break; }
                     out_syms[n_out_syms]    = v->i64;
                     out_aliases[n_out_syms] = kid;
@@ -9563,12 +9594,12 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     bad_clause = 1;
                 } else {
                     for (int64_t c = 0; c < nc; c++) {
-                        ray_t* oc = ray_table_get_col_idx(tbl, c);
-                        if (!oc) { bad_clause = 1; break; }
-                        int8_t ot = oc->type;
+                        ray_col_meta_t om;
+                        if (!ray_table_col_meta_idx(tbl, c, &om)) { bad_clause = 1; break; }
+                        int8_t ot = om.type;
                         if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON)
                             { bad_clause = 1; break; }
-                        if (!ray_is_vec(oc))
+                        if (!(ot >= RAY_BOOL && ot <= RAY_STR))
                             { bad_clause = 1; break; }
                         int64_t cn = ray_table_col_name(tbl, c);
                         out_syms[n_out_syms] = cn;
@@ -9584,10 +9615,8 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
              * Output columns are also handled — the fused materialiser
              * propagates null bitmaps via ray_vec_set_null. */
             if (!bad_clause) {
-                for (uint32_t i = 0; i < n_sort_keys && !bad_clause; i++) {
-                    ray_t* kc = ray_table_get_col(tbl, sort_key_syms[i]);
-                    if (!kc) bad_clause = 1;
-                }
+                for (uint32_t i = 0; i < n_sort_keys && !bad_clause; i++)
+                    if (!tbl_has_col(tbl, sort_key_syms[i])) bad_clause = 1;
             }
             /* Without a sort the positional path takes only a literal K:
              * an expression is left to the general path, which evaluates
@@ -9607,10 +9636,11 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                      * the table, found without scanning the rest. */
                     bool sorted_asc = false;
                     if (n_sort_keys == 1 && !sort_descs[0]) {
-                        ray_t* kc = ray_table_get_col(tbl, sort_key_syms[0]);
-                        sorted_asc = kc && (kc->attrs & RAY_ATTR_SORTED) &&
-                                     !(kc->attrs & RAY_ATTR_SLICE) &&
-                                     !ray_vec_may_have_nulls(kc);
+                        ray_col_meta_t km;
+                        sorted_asc = ray_table_col_meta(tbl, sort_key_syms[0], &km) &&
+                                     (km.attrs & RAY_ATTR_SORTED) &&
+                                     !(km.attrs & RAY_ATTR_SLICE) &&
+                                     !tbl_col_may_have_nulls(tbl, sort_key_syms[0]);
                     }
                     if (where_expr && (n_sort_keys == 0 || (sorted_asc && k > 0)) &&
                         k != 0 && k != INT64_MIN &&
@@ -9761,9 +9791,10 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                 dep_candidate = false;
         }
         if (dep_candidate && base_sym >= 0) {
-            ray_t* base_col = ray_table_get_col(tbl, base_sym);
-            dep_candidate = base_col && key_type_i64_projectable(base_col->type) &&
-                            !ray_vec_has_nulls(base_col);
+            ray_col_meta_t bm;
+            dep_candidate = ray_table_col_meta(tbl, base_sym, &bm) &&
+                            key_type_i64_projectable(bm.type) &&
+                            !ray_table_col_has_nulls(tbl, base_sym);
         }
         /* Exact-size carve (unbounded): at most nk dependent-key entries can
          * ever be collected (one per by-dict pair).  On the dependent-key
@@ -9791,7 +9822,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     dep_candidate = false;
                     break;
                 }
-                bool already_in_tbl = (ray_table_get_col(tbl, k->i64) != NULL);
+                bool already_in_tbl = tbl_has_col(tbl, k->i64);
                 bool trivial_self = (v->type == -RAY_SYM && v->i64 == k->i64);
                 if (already_in_tbl && !trivial_self) {
                     dep_candidate = false;
@@ -9866,9 +9897,9 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         {
             int64_t in_nc = ray_table_ncols(tbl);
             for (int64_t c = 0; c < in_nc; c++) {
-                ray_t* col = ray_table_get_col_idx(tbl, c);
-                if (col && (RAY_IS_PARTED(col->type) ||
-                            col->type == RAY_MAPCOMMON)) {
+                ray_col_meta_t cm;
+                if (ray_table_col_meta_idx(tbl, c, &cm) && (RAY_IS_PARTED(cm.type) ||
+                            cm.type == RAY_MAPCOMMON)) {
                     by_input_parted = true; break;
                 }
             }
@@ -9890,14 +9921,13 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     if (d_elems[j * 2]->i64 == k->i64) { defer_ok = false; break; }
                 if (!defer_ok) break;
                 bool trivial_self = (v && v->type == -RAY_SYM && v->i64 == k->i64);
-                if (ray_table_get_col(tbl, k->i64) && !trivial_self) {
+                if (tbl_has_col(tbl, k->i64) && !trivial_self) {
                     defer_ok = false; break;   /* alias shadows an input column */
                 }
                 if (v && v->type == RAY_LIST) continue;  /* computed expr */
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
-                    ray_t* src = ray_table_get_col(tbl, v->i64);
-                    if (!src ||
-                        !query_key_type_streamable(query_col_base_type(src))) {
+                    if (!tbl_has_col(tbl, v->i64) ||
+                        !query_key_type_streamable(tbl_col_base_type(tbl, v->i64))) {
                         defer_ok = false; break;
                     }
                     continue;
@@ -9935,7 +9965,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
              * column and hid the key column's index from the group side. */
             bool bare_ref = v && v->type == -RAY_SYM &&
                             !(v->attrs & ATTR_QUOTED) &&
-                            ray_table_get_col(tbl, v->i64) != NULL;
+                            tbl_has_col(tbl, v->i64);
             if (!(v && v->type == -RAY_SYM && v->i64 == k->i64) && !bare_ref) {
                 has_computed_by_val = true;
                 break;
@@ -10086,7 +10116,12 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         int64_t in_ncols = ray_table_ncols(tbl);
         for (int64_t c = 0; c < in_ncols; c++) {
             int64_t cn = ray_table_col_name(tbl, c);
-            ray_t* cv = ray_table_get_col_idx(tbl, c);
+            ray_t* cv = ray_table_col_idx(tbl, c);
+            if (cv && RAY_IS_ERR(cv)) {
+                ray_env_pop_scope();
+                ray_release(tbl);
+                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return cv;
+            }
             if (cv) ray_env_set_query_local(cn, cv);
         }
 
@@ -10121,13 +10156,13 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
             }
             /* Collision check: if the dict key already exists in the
              * input table, ray_table_add_col would append a second
-             * column with the same name and ray_table_get_col finds
+             * column with the same name and ray_table_col finds
              * the ORIGINAL, so the group-by would silently scan the
              * user's existing column instead of our materialised
              * one.  The one allowed exception is {x: x}, a trivial
              * self-alias: the input column is already exactly what
              * we want to group on. */
-            bool already_in_tbl = (ray_table_get_col(tbl, k->i64) != NULL);
+            bool already_in_tbl = tbl_has_col(tbl, k->i64);
             bool trivial_self = (v->type == -RAY_SYM && v->i64 == k->i64);
             if (already_in_tbl && !trivial_self) {
                 fail_err = ray_error("domain",
@@ -10761,12 +10796,12 @@ by_dict_done:
          * reads through its KEY_READ macro). */
         int use_eval_group = 0;
         if (by_key_sym >= 0) {
-            ray_t* key_col = ray_table_get_col(tbl, by_key_sym);
-            if (key_col) {
-                int8_t kct = key_col->type;
+            ray_col_meta_t km;
+            if (ray_table_col_meta(tbl, by_key_sym, &km)) {
+                int8_t kct = km.type;
                 if (RAY_IS_PARTED(kct)) kct = (int8_t)RAY_PARTED_BASETYPE(kct);
                 if (kct == RAY_LIST && (any_nonagg || n_out == 0 ||
-                    RAY_IS_PARTED(key_col->type) || !ray_agg_engine_v2))
+                    RAY_IS_PARTED(km.type) || !ray_agg_engine_v2))
                     use_eval_group = 1;
                 else if (kct == RAY_GUID && (any_nonagg || n_out == 0))
                     /* RAY_GUID routes to eval-level ray_group_indices_fn only
@@ -10792,9 +10827,9 @@ by_dict_done:
             int64_t nk = ray_len(by_expr);
             int64_t* sym_ids = (int64_t*)ray_data(by_expr);
             for (int64_t k = 0; k < nk; k++) {
-                ray_t* key_col = ray_table_get_col(tbl, sym_ids[k]);
-                if (!key_col) continue;
-                int8_t kct = key_col->type;
+                ray_col_meta_t km;
+                if (!ray_table_col_meta(tbl, sym_ids[k], &km)) continue;
+                int8_t kct = km.type;
                 if (RAY_IS_PARTED(kct)) kct = (int8_t)RAY_PARTED_BASETYPE(kct);
                 /* STR keys (dict-encoded OR plain) take the parallel DAG path:
                  * dict-STR substitutes int32 codes; plain/computed STR groups
@@ -10802,7 +10837,7 @@ by_dict_done:
                  * O(N*ngroups) eval toy-grouper (33% allocator churn). LIST
                  * composites with plain aggregates use v2 structural grouping. */
                 if (kct == RAY_LIST && (any_nonagg || n_out == 0 ||
-                    RAY_IS_PARTED(key_col->type) || !ray_agg_engine_v2)) {
+                    RAY_IS_PARTED(km.type) || !ray_agg_engine_v2)) {
                     use_eval_group = 1;
                     break;
                 }
@@ -10912,7 +10947,14 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                 }
                 for (int64_t k = 0; k < nk; k++) {
-                    key_cols[k] = ray_table_get_col(eval_tbl, key_syms[k]);
+                    key_cols[k] = ray_table_col(eval_tbl, key_syms[k]);
+                    if (key_cols[k] && RAY_IS_ERR(key_cols[k])) {
+                        ray_t* kerr = key_cols[k];
+                        scratch_free(keycols_hdr);
+                        if (eval_tbl != tbl) ray_release(eval_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return kerr;
+                    }
                     if (!key_cols[k]) {
                         scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
@@ -10948,9 +10990,9 @@ by_dict_done:
                  * parted/mapcommon/nested fall back to the legacy path. */
                 int64_t dchk_nc = ray_table_ncols(eval_tbl);
                 for (int64_t c = 0; c < dchk_nc && distinct_only; c++) {
-                    ray_t* cc = ray_table_get_col_idx(eval_tbl, c);
-                    if (!cc) { distinct_only = false; break; }
-                    switch (cc->type) {
+                    ray_col_meta_t cm;
+                    if (!ray_table_col_meta_idx(eval_tbl, c, &cm)) { distinct_only = false; break; }
+                    switch (cm.type) {
                         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
                         case RAY_BOOL: case RAY_DATE: case RAY_TIME:
                         case RAY_TIMESTAMP: case RAY_SYM: case RAY_F64:
@@ -11330,7 +11372,13 @@ by_dict_done:
                         ray_t* agg_col_expr = agg_elems[1];
                         ray_t* src_col_val = NULL;
                         if (agg_col_expr->type == -RAY_SYM && !(agg_col_expr->attrs & ATTR_QUOTED)) {
-                            src_col_val = ray_table_get_col(eval_tbl, agg_col_expr->i64);
+                            src_col_val = ray_table_col(eval_tbl, agg_col_expr->i64);
+                            if (src_col_val && RAY_IS_ERR(src_col_val)) {
+                                for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                                scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
+                                ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return src_col_val;
+                            }
                             if (src_col_val) ray_retain(src_col_val);
                         }
                         if (!src_col_val) {
@@ -11525,7 +11573,11 @@ by_dict_done:
                         bool is_key = false;
                         for (int64_t k = 0; k < nk; k++) if (key_syms[k] == cn) { is_key = true; break; }
                         if (is_key) continue;
-                        ray_t* sc = ray_table_get_col_idx(eval_tbl, c);
+                        ray_t* sc = ray_table_col_idx(eval_tbl, c);
+                        if (sc && RAY_IS_ERR(sc)) {
+                            ray_free(fi_hdr); ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return sc;
+                        }
                         if (!sc) continue;
                         ray_t* dst = NULL;
                         if (sc->type == RAY_STR) {
@@ -11601,10 +11653,11 @@ by_dict_done:
                 else {
                     int64_t enc = ray_table_ncols(eval_tbl);
                     for (int64_t c = 0; c < enc; c++) {
-                        ray_t* cv = ray_table_get_col_idx(eval_tbl, c);
+                        ray_t* cv = ray_table_col_idx(eval_tbl, c);
+                        if (cv && RAY_IS_ERR(cv)) { kv = cv; break; }   /* the query's error */
                         if (cv) ray_env_set_query_local(ray_table_col_name(eval_tbl, c), cv);
                     }
-                    kv = group_key_eval(by_expr, eval_tbl);
+                    if (!kv) kv = group_key_eval(by_expr, eval_tbl);
                     ray_env_pop_scope();
                 }
                 if (kv && !RAY_IS_ERR(kv) && ray_is_atom(kv)) {
@@ -11624,7 +11677,7 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return kv ? kv : ray_error("domain", "by: key produced no result");
                 }
                 by_key_sym = ray_sym_intern("__by_key", 8);
-                if (ray_table_get_col(eval_tbl, by_key_sym)) {
+                if (tbl_has_col(eval_tbl, by_key_sym)) {
                     ray_release(kv);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
@@ -11655,7 +11708,12 @@ by_dict_done:
 	                ray_release(tbl);
 	                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("nyi", "eval-level groupby requires scalar key");
 	            }
-            ray_t* key_col = ray_table_get_col(eval_tbl, by_key_sym);
+            ray_t* key_col = ray_table_col(eval_tbl, by_key_sym);
+            if (key_col && RAY_IS_ERR(key_col)) {
+                if (eval_tbl != tbl) ray_release(eval_tbl);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_col;
+            }
 
             /* Fast path: (select {from: t by: k}) with no aggs and
              * no non-agg expressions — we only need first-of-group
@@ -11744,7 +11802,8 @@ by_dict_done:
                         cn = ray_table_col_name(eval_tbl, pass - 1);
                         if (cn == by_key_sym) continue;
                     }
-                    ray_t* sc = ray_table_get_col(eval_tbl, cn);
+                    ray_t* sc = ray_table_col(eval_tbl, cn);
+                    if (sc && RAY_IS_ERR(sc)) { first_err = sc; break; }
                     if (!sc) continue;
                     ray_t* dst = NULL;
                     int8_t sct = sc->type;
@@ -11858,8 +11917,8 @@ by_dict_done:
                 int64_t nc0 = ray_table_ncols(eval_tbl);
                 ray_t* empty = ray_table_new(nc0);
                 if (!RAY_IS_ERR(empty)) {
-                    /* Key column first */
-                    { ray_t* sc = ray_table_get_col(eval_tbl, by_key_sym);
+                    /* Key column first (key_col: read for the grouping above) */
+                    { ray_t* sc = key_col;
                       if (sc) {
                         ray_t* ev = ray_group_gather(sc, NULL, 0);
                         if (ev && !RAY_IS_ERR(ev)) { empty = ray_table_add_col(empty, by_key_sym, ev); ray_release(ev); }
@@ -11868,10 +11927,11 @@ by_dict_done:
                     for (int64_t c = 0; c < nc0; c++) {
                         int64_t cn = ray_table_col_name(eval_tbl, c);
                         if (cn == by_key_sym) continue;
-                        ray_t* sc = ray_table_get_col_idx(eval_tbl, c);
-                        ray_t* ev = (sc->type == RAY_STR) ? ray_vec_new(RAY_STR, 0) :
-                                    (sc->type == RAY_LIST) ? ray_list_new(0) :
-                                    ray_vec_new(sc->type, 0);
+                        ray_col_meta_t scm;
+                        (void)ray_table_col_meta_idx(eval_tbl, c, &scm);
+                        ray_t* ev = (scm.type == RAY_STR) ? ray_vec_new(RAY_STR, 0) :
+                                    (scm.type == RAY_LIST) ? ray_list_new(0) :
+                                    ray_vec_new(scm.type, 0);
                         if (ev && !RAY_IS_ERR(ev)) { empty = ray_table_add_col(empty, cn, ev); ray_release(ev); }
                     }
                 }
@@ -11934,7 +11994,12 @@ by_dict_done:
                     /* Resolve source column from filtered table */
                     ray_t* src_col_val = NULL;
                     if (agg_col_expr->type == -RAY_SYM && !(agg_col_expr->attrs & ATTR_QUOTED)) {
-                        src_col_val = ray_table_get_col(eval_tbl, agg_col_expr->i64);
+                        src_col_val = ray_table_col(eval_tbl, agg_col_expr->i64);
+                        if (src_col_val && RAY_IS_ERR(src_col_val)) {
+                            for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                            ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return src_col_val;
+                        }
                         if (src_col_val) ray_retain(src_col_val);
                     }
                     if (!src_col_val) {
@@ -12163,9 +12228,10 @@ by_dict_done:
 
             /* Key column: build a typed vector matching the source column type */
             ray_t** grp_items = (ray_t**)ray_data(groups);
-            ray_t* key_col_src = ray_table_get_col(eval_tbl, by_key_sym);
+            ray_col_meta_t key_src_m;
+            bool key_src_has = ray_table_col_meta(eval_tbl, by_key_sym, &key_src_m);
             {
-                int8_t ktype = key_col_src ? key_col_src->type : RAY_I64;
+                int8_t ktype = key_src_has ? key_src_m.type : RAY_I64;
                 if (RAY_IS_PARTED(ktype)) ktype = (int8_t)RAY_PARTED_BASETYPE(ktype);
                 ray_t* key_vec;
                 if (ktype == RAY_STR) {
@@ -12181,7 +12247,7 @@ by_dict_done:
                     for (int64_t gi = 0; gi < n_groups && key_vec && !RAY_IS_ERR(key_vec); gi++)
                         key_vec = ray_list_append(key_vec, grp_items[gi * 2]);
                 } else {
-                    uint8_t kattrs = key_col_src ? key_col_src->attrs : 0;
+                    uint8_t kattrs = key_src_has ? key_src_m.attrs : 0;
                     if (ktype == RAY_SYM)
                         key_vec = ray_sym_vec_new(kattrs & RAY_SYM_W_MASK, n_groups);
                     else
@@ -12234,7 +12300,8 @@ by_dict_done:
                 for (int64_t c = 0; c < nc && !RAY_IS_ERR(result); c++) {
                     int64_t cn = ray_table_col_name(eval_tbl, c);
                     if (cn == by_key_sym) continue;
-                    ray_t* sc = ray_table_get_col_idx(eval_tbl, c);
+                    ray_t* sc = ray_table_col_idx(eval_tbl, c);
+                    if (sc && RAY_IS_ERR(sc)) { ray_release(result); result = sc; break; }
                     ray_t* dst = NULL;
                     if (sc->type == RAY_STR) {
                         dst = ray_vec_new(RAY_STR, n_groups);
@@ -12319,8 +12386,8 @@ by_dict_done:
         {
             int64_t ncols = ray_table_ncols(tbl);
             for (int64_t c = 0; c < ncols; c++) {
-                ray_t* col = ray_table_get_col_idx(tbl, c);
-                if (col && RAY_IS_PARTED(col->type)) { table_is_parted = 1; break; }
+                ray_col_meta_t cm;
+                if (ray_table_col_meta_idx(tbl, c, &cm) && RAY_IS_PARTED(cm.type)) { table_is_parted = 1; break; }
             }
         }
         /* Classification + arith-of-aggs pre-decomposition.  The
@@ -12404,7 +12471,8 @@ by_dict_done:
             }
             int64_t ncols = ray_table_ncols(tbl);
             for (int64_t c = 0; c < ncols; c++) {
-                ray_t* col = ray_table_get_col_idx(tbl, c);
+                /* the slot: a flat encoded column passes into flat_tbl encoded */
+                ray_t* col = tbl_slot_idx(tbl, c);
                 int64_t name = ray_table_col_name(tbl, c);
                 ray_t* flat_col = query_materialize_parted_col(col);
                 if (!flat_col || RAY_IS_ERR(flat_col)) {
@@ -12511,10 +12579,22 @@ by_dict_done:
                         by_name = by_expr->i64;
                     else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1)
                         by_name = ((int64_t*)ray_data(by_expr))[0];
-                    ray_t* by_col = (by_name >= 0)
-                        ? ray_table_get_col(tbl, by_name) : NULL;
-                    if (by_col)
-                        sg_armed = ray_slice_group_probe(g, root, by_col);
+                    /* The probe needs a SYM key with a hash or part index:
+                     * decided from metadata, the key read only then. */
+                    ray_col_meta_t bm;
+                    if (by_name >= 0 && ray_table_col_meta(tbl, by_name, &bm) &&
+                        bm.type == RAY_SYM &&
+                        (bm.index_kind == RAY_IDX_HASH || bm.index_kind == RAY_IDX_PART)) {
+                        ray_t* bix = NULL;
+                        ray_t* ixe = ray_table_col_index(tbl, by_name, &bix);
+                        ray_t* by_col = ixe ? ixe : ray_table_col(tbl, by_name);   /* cached: no second decode */
+                        if (by_col && RAY_IS_ERR(by_col)) {
+                            ray_graph_free(g); ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return by_col;
+                        }
+                        if (by_col)
+                            sg_armed = ray_slice_group_probe(g, root, by_col);
+                    }
                 }
                 if (sg_armed) goto where_done;
                 /* exec_node populates g->selection as a side effect
@@ -12898,7 +12978,7 @@ by_dict_done:
              * A dotted name like `Timestamp.date` compiles to a scan + trunc
              * chain, not a direct column lookup, so it must land in the
              * computed-key fallback path below (key_sym stays -1).  Otherwise
-             * downstream `ray_table_get_col(filtered_tbl, key_sym)` would
+             * downstream `ray_table_col(filtered_tbl, key_sym)` would
              * return NULL for the non-existent "Timestamp.date" column and
              * the subsequent deref would crash. */
             int64_t key_sym = -1;
@@ -12922,10 +13002,7 @@ by_dict_done:
                     int64_t empty_key_name = key_sym;
                     ray_t* empty_key_vec = NULL;
                     if (key_sym >= 0) {
-                        ray_t* sc = ray_table_get_col(filtered_tbl, key_sym);
-                        if (sc) {
-                            empty_key_vec = ray_group_gather(sc, NULL, 0);
-                        }
+                        empty_key_vec = tbl_col_empty(filtered_tbl, key_sym);
                     } else {
                         /* Match the computed-key fallback's naming
                          * rules (dotted tail / last name arg) and
@@ -12967,11 +13044,20 @@ by_dict_done:
                          * to get a length-0 key vector typed like the
                          * non-empty path would produce it. */
                         ray_env_push_query_scope();
+                        ray_t* ck_vec = NULL;
                         for (int64_t c = 0; c < nc0; c++) {
-                            ray_env_set_query_local(ray_table_col_name(filtered_tbl, c),
-                                                    ray_table_get_col_idx(filtered_tbl, c));
+                            ray_t* cv = ray_table_col_idx(filtered_tbl, c);
+                            if (cv && RAY_IS_ERR(cv)) { ck_vec = cv; break; }
+                            ray_env_set_query_local(ray_table_col_name(filtered_tbl, c), cv);
                         }
-                        ray_t* ck_vec = ray_eval(by_expr);
+                        if (ck_vec) {                    /* a column that cannot materialize */
+                            ray_env_pop_scope();
+                            ray_release(empty);
+                            if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                            ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ck_vec;
+                        }
+                        ck_vec = ray_eval(by_expr);
                         ray_env_pop_scope();
                         if (ck_vec && !RAY_IS_ERR(ck_vec) && ray_is_vec(ck_vec)) {
                             int8_t kt = ck_vec->type;
@@ -12991,10 +13077,11 @@ by_dict_done:
                     for (int64_t c = 0; c < nc0; c++) {
                         int64_t cn = ray_table_col_name(filtered_tbl, c);
                         if (cn == empty_key_name) continue;
-                        ray_t* sc = ray_table_get_col_idx(filtered_tbl, c);
-                        ray_t* ev = (sc->type == RAY_STR) ? ray_vec_new(RAY_STR, 0) :
-                                    (sc->type == RAY_LIST) ? ray_list_new(0) :
-                                    ray_vec_new(sc->type, 0);
+                        ray_col_meta_t scm;
+                        (void)ray_table_col_meta_idx(filtered_tbl, c, &scm);
+                        ray_t* ev = (scm.type == RAY_STR) ? ray_vec_new(RAY_STR, 0) :
+                                    (scm.type == RAY_LIST) ? ray_list_new(0) :
+                                    ray_vec_new(scm.type, 0);
                         if (!RAY_IS_ERR(ev)) { empty = ray_table_add_col(empty, cn, ev); ray_release(ev); }
                     }
                 }
@@ -13010,12 +13097,14 @@ by_dict_done:
                 ray_release(grouped);
                 int64_t tbl_ncols = ray_table_ncols(filtered_tbl);
                 ray_env_push_query_scope();
+                ray_t* computed_key = NULL;
                 for (int64_t c = 0; c < tbl_ncols; c++) {
                     int64_t cn = ray_table_col_name(filtered_tbl, c);
-                    ray_t* cv = ray_table_get_col_idx(filtered_tbl, c);
+                    ray_t* cv = ray_table_col_idx(filtered_tbl, c);
+                    if (cv && RAY_IS_ERR(cv)) { computed_key = cv; break; }   /* the query's error */
                     ray_env_set_query_local(cn, cv);
                 }
-                ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
+                if (!computed_key) computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
                 if (!computed_key) computed_key = ray_eval(by_expr);
                 ray_env_pop_scope();
                 if (!computed_key || RAY_IS_ERR(computed_key)) {
@@ -13146,7 +13235,15 @@ by_dict_done:
                      * key: e.g. `by: Timestamp` (plain, non-dotted) would
                      * collide with the source Timestamp column. */
                     if (cn == ckey_name) continue;
-                    ray_t* sc = ray_table_get_col_idx(filtered_tbl, c);
+                    ray_t* sc = ray_table_col_idx(filtered_tbl, c);
+                    if (sc && RAY_IS_ERR(sc)) {
+                        ray_release(res2);
+                        if (fi2_hdr) ray_free(fi2_hdr);
+                        ray_release(groups2); ray_release(computed_key);
+                        if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return sc;
+                    }
                     ray_t* dc = ray_vec_new(sc->type, ng2);
                     dc->len = ng2;    /* see note above — hoisted for null bits */
                     for (int64_t g2 = 0; g2 < ng2; g2++) { int a2 = 0; ray_t* v2 = collection_elem(sc, fi2[g2], &a2); store_typed_elem(dc, g2, v2); if (a2) ray_release(v2); }
@@ -13159,12 +13256,15 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res2;
             }
 
-            ray_t* orig_key_col = ray_table_get_col(filtered_tbl, key_sym);
-            int64_t nrows_orig = orig_key_col ? orig_key_col->len : 0;
-
+            ray_t* orig_key_col = ray_table_col(filtered_tbl, key_sym);
             /* Read group key values from grouped table BEFORE releasing it.
              * grp_key_col points into grouped — must not access after release. */
-            ray_t* grp_key_col = ray_table_get_col(grouped, key_sym);
+            ray_t* grp_key_col = (orig_key_col && RAY_IS_ERR(orig_key_col))
+                               ? orig_key_col : ray_table_col(grouped, key_sym);
+            if (grp_key_col && RAY_IS_ERR(grp_key_col)) {
+                ray_release(grouped); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return grp_key_col;
+            }
+            int64_t nrows_orig = orig_key_col ? orig_key_col->len : 0;
             int8_t kt = orig_key_col ? orig_key_col->type : 0;
 
             /* Heap-allocate gk_vals when n_groups > 256 */
@@ -13348,7 +13448,7 @@ by_dict_done:
             if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
 
             /* Add key column first */
-            ray_t* key_vec_src = ray_table_get_col(filtered_tbl, key_sym);
+            ray_t* key_vec_src = orig_key_col;   /* ray_table_col(filtered_tbl, key_sym), read above */
             if (key_vec_src->type == RAY_STR) {
                 ray_t* key_vec_dst = ray_vec_new(RAY_STR, n_groups);
                 if (!key_vec_dst || RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst ? key_vec_dst : ray_error("oom", NULL); }
@@ -13385,7 +13485,8 @@ by_dict_done:
             for (int64_t c = 0; c < ncols; c++) {
                 int64_t col_name = ray_table_col_name(filtered_tbl, c);
                 if (col_name == key_sym) continue;
-                ray_t* src_col = ray_table_get_col_idx(filtered_tbl, c);
+                ray_t* src_col = ray_table_col_idx(filtered_tbl, c);
+                if (src_col && RAY_IS_ERR(src_col)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return src_col; }
                 int8_t ct = src_col->type;
 
                 if (ct == RAY_STR) {
@@ -13660,7 +13761,7 @@ by_dict_done:
                     for (int64_t k = 0; k < nk; k++) {
                         int64_t ks = val->type == -RAY_SYM ? val->i64 : sym_cell_runtime_id(val, k);
                         if (select_scan_output(g, col_ops, nc, ks) >= 0) continue;
-                        if (!ray_table_get_col(tbl, ks) || nc >= nc_max) continue;
+                        if (!tbl_has_col(tbl, ks) || nc >= nc_max) continue;
                         ray_t* nm = ray_sym_str(ks);
                         ray_op_t* sc = nm ? ray_scan(g, ray_str_ptr(nm)) : NULL;
                         if (!sc) continue;
@@ -14072,7 +14173,7 @@ by_dict_done:
             ray_t* kept = keep_n >= 0 ? ray_table_new(keep_n > 0 ? keep_n : 1) : NULL;
             for (int64_t c = 0; kept && !RAY_IS_ERR(kept) && c < keep_n; c++)
                 kept = ray_table_add_col(kept, ray_table_col_name(result, c),
-                                         ray_table_get_col_idx(result, c));
+                                         tbl_slot_idx(result, c));
             if (kept && !RAY_IS_ERR(kept)) { ray_release(result); result = kept; }
             else if (kept) ray_release(kept);
         }
@@ -14120,18 +14221,29 @@ by_dict_done:
     if (by_expr && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
         if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
         if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
-            ray_t* key_col = ray_table_get_col_idx(result, 0);
-            if (key_col && key_col->type == RAY_BOOL && key_col->len >= 2) {
+            ray_col_meta_t rkm;
+            ray_t* key_col = (ray_table_col_meta_idx(result, 0, &rkm) &&
+                              rkm.type == RAY_BOOL && rkm.len >= 2)
+                           ? ray_table_col_idx(result, 0) : NULL;
+            ray_col_meta_t okm;
+            int64_t by_sym = -1;
+            ray_t* orig_key = NULL;
+            if (key_col && !RAY_IS_ERR(key_col)) {
                 /* Find first-occurrence order of bool values in original
                  * table.  Accept both scalar `-RAY_SYM` and single-element
                  * `RAY_SYM` vector forms. */
-                int64_t by_sym = -1;
                 if (by_expr->type == -RAY_SYM)
                     by_sym = by_expr->i64;
                 else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1)
                     by_sym = ((int64_t*)ray_data(by_expr))[0];
-                ray_t* orig_key = (by_sym >= 0) ? ray_table_get_col(tbl, by_sym) : NULL;
-                if (orig_key && orig_key->type == RAY_BOOL && orig_key->len > 0) {
+                if (by_sym >= 0 && ray_table_col_meta(tbl, by_sym, &okm) &&
+                    okm.type == RAY_BOOL && okm.len > 0)
+                    orig_key = ray_table_col(tbl, by_sym);
+                if (orig_key && RAY_IS_ERR(orig_key)) key_col = orig_key;
+            }
+            if (key_col && RAY_IS_ERR(key_col)) { ray_release(result); result = key_col; }
+            else if (key_col) {
+                if (orig_key) {
                     bool first_val = ((bool*)ray_data(orig_key))[0];
                     bool result_first = ((bool*)ray_data(key_col))[0];
                     if (first_val != result_first) {
@@ -14143,7 +14255,8 @@ by_dict_done:
                             int ok = 1;
                             for (int64_t c = 0; c < ncols_r && ok; c++) {
                                 int64_t cn = ray_table_col_name(result, c);
-                                ray_t* col = ray_table_get_col_idx(result, c);
+                                ray_t* col = ray_table_col_idx(result, c);
+                                if (col && RAY_IS_ERR(col)) { ray_release(result); result = col; ok = 0; break; }
                                 int esz = ray_elem_size(col->type);
                                 ray_t* new_col = ray_vec_new(col->type, nrows_r);
                                 if (RAY_IS_ERR(new_col)) { ok = 0; break; }
@@ -14195,8 +14308,7 @@ by_dict_done:
                 if (rebuilt && !RAY_IS_ERR(rebuilt)) {
                     for (int64_t c = 0; c < nc - 1; c++) {
                         int64_t cn = ray_table_col_name(result, c);
-                        ray_t* col = ray_table_get_col_idx(result, c);
-                        rebuilt = ray_table_add_col(rebuilt, cn, col);
+                        rebuilt = ray_table_add_col(rebuilt, cn, tbl_slot_idx(result, c));
                     }
                     ray_release(result);
                     result = rebuilt;
@@ -14310,10 +14422,11 @@ by_dict_done:
                 if (ray_env_push_query_scope() != RAY_OK) {
                     cerr = ray_error("oom", NULL);
                 } else {
-                    for (int hi = 0; hi < n_hidden_aggs; hi++)
-                        ray_env_set_local(hidden_agg_names[hi],
-                                          ray_table_get_col_idx(result,
-                                                                hbase + hi));
+                    for (int hi = 0; hi < n_hidden_aggs && !cerr; hi++) {
+                        ray_t* hc = ray_table_col_idx(result, hbase + hi);
+                        if (hc && RAY_IS_ERR(hc)) cerr = hc;
+                        else ray_env_set_local(hidden_agg_names[hi], hc);
+                    }
                     int64_t n_groups = ray_table_nrows(result);
                     for (int ci = 0; ci < n_compound && !cerr; ci++) {
                         ray_t* v = ray_eval(compound_rw[ci]);
@@ -14351,7 +14464,7 @@ by_dict_done:
                 for (int64_t c = 0; c < rnc && nt && !RAY_IS_ERR(nt); c++) {
                     if (c >= hbase && c < hbase + n_hidden_aggs) continue;
                     nt = ray_table_add_col(nt, ray_table_col_name(result, c),
-                                           ray_table_get_col_idx(result, c));
+                                           tbl_slot_idx(result, c));
                 }
                 for (int ci = 0; ci < n_compound && nt && !RAY_IS_ERR(nt); ci++)
                     nt = ray_table_add_col(nt, compound_names[ci],
@@ -14441,8 +14554,12 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: could not resolve scalar group key symbol");
             }
 
-            ray_t* orig_key = ray_table_get_col(tbl, ks);
-            ray_t* grp_key  = ray_table_get_col(result, ks);
+            ray_t* orig_key = ray_table_col(tbl, ks);
+            ray_t* grp_key  = (orig_key && RAY_IS_ERR(orig_key)) ? orig_key : ray_table_col(result, ks);
+            if (grp_key && RAY_IS_ERR(grp_key)) {
+                ray_release(result); ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return grp_key;
+            }
             int64_t nrows = orig_key ? ray_parted_nrows(orig_key) : 0;
 
             if (!orig_key || !grp_key) {
@@ -14895,8 +15012,8 @@ by_dict_done:
                                             !(cd_inner->attrs & ATTR_QUOTED) &&
                                             n_groups > 50000);
                     if (simple_cd_global) {
-                        ray_t* source = ray_table_get_col(tbl, cd_inner->i64);
-                        int8_t type = source ? source->type : 0;
+                        ray_col_meta_t sm;
+                        int8_t type = ray_table_col_meta(tbl, cd_inner->i64, &sm) ? sm.type : 0;
                         simple_cd_global = type == RAY_BOOL || type == RAY_U8 ||
                             type == RAY_I16 || type == RAY_I32 || type == RAY_I64 ||
                             type == RAY_F32 || type == RAY_F64 || type == RAY_DATE ||
@@ -14938,12 +15055,17 @@ by_dict_done:
                          * computed expressions use the per-group fallback. */
                         ray_t* src_for_global = NULL;
                         int    src_owned = 0;
-                        if (cd_inner->type == -RAY_SYM &&
-                            !(cd_inner->attrs & ATTR_QUOTED)) {
-                            src_for_global = ray_table_get_col(tbl, cd_inner->i64);
-                        }
-                        if (src_for_global && n_groups > 50000) {
-                            if (RAY_IS_PARTED(src_for_global->type) ||
+                        /* The column itself is read only for the global-hash
+                         * kernel; the per-group slice path reads it from tbl. */
+                        bool cd_col_ref = cd_inner->type == -RAY_SYM &&
+                                          !(cd_inner->attrs & ATTR_QUOTED) &&
+                                          tbl_has_col(tbl, cd_inner->i64);
+                        if (cd_col_ref && n_groups > 50000) {
+                            src_for_global = ray_table_col(tbl, cd_inner->i64);
+                            if (src_for_global && RAY_IS_ERR(src_for_global)) {
+                                col = src_for_global;      /* the query's error, below */
+                                src_for_global = NULL;
+                            } else if (RAY_IS_PARTED(src_for_global->type) ||
                                 src_for_global->type == RAY_MAPCOMMON) {
                                 ray_t* flat = query_materialize_parted_col(src_for_global);
                                 if (!flat || RAY_IS_ERR(flat)) {
@@ -14955,7 +15077,7 @@ by_dict_done:
                                 }
                             }
                         }
-                        if (src_for_global) {
+                        if (cd_col_ref && (src_for_global || n_groups <= 50000)) {
                             /* COUNT(DISTINCT) is exact per SQL/DSL
                              * semantics — the streaming HLL fast path
                              * here silently returned an approximate
@@ -15190,7 +15312,12 @@ by_dict_done:
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
         if (result && result->type == RAY_TABLE) {
-            ray_t* base_col = ray_table_get_col(result, dep_key_base_sym);
+            ray_t* base_col = ray_table_col(result, dep_key_base_sym);
+            if (base_col && RAY_IS_ERR(base_col)) {
+                ray_release(result);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return base_col;
+            }
             if (!base_col || !key_type_i64_projectable(base_col->type)) {
                 ray_release(result);
                 ray_release(tbl);
@@ -21936,11 +22063,12 @@ static int64_t asof_parted_seg_count(ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE) return -1;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!col) continue;
-        if (RAY_IS_PARTED(col->type)) return col->len;
-        if (col->type == RAY_MAPCOMMON) {
+        ray_col_meta_t m;                      /* metadata: an encoded column stays encoded */
+        if (!ray_table_col_meta_idx(tbl, c, &m)) continue;
+        if (RAY_IS_PARTED(m.type)) return m.n_segs;
+        if (m.type == RAY_MAPCOMMON) {
             /* MAPCOMMON layout: [key_values, ...]; seg count = key_values len */
+            ray_t* col = ray_table_col_idx(tbl, c);   /* never encoded: no decode */
             ray_t** mc = (ray_t**)ray_data(col);
             return (col->len >= 1 && mc[0]) ? mc[0]->len : -1;
         }
