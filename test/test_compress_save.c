@@ -52,6 +52,7 @@
 #include "store/stream.h"
 #include "vec/str.h"
 #include "ipc_harness.h"
+#include "ops/datalog.h"
 #include "core/ipc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -3732,6 +3733,460 @@ static test_result_t test_group_sites_parted_failed_decode(void) {
     PASS();
 }
 
+/* ---- Task 29: joins, table ops and Datalog ---- */
+
+/* A table of plain I64 columns saved under `dir` at generation `gen` and
+ * loaded back; with `corrupt` >= 0 the descriptor of that column's first
+ * vector is damaged after the load checks pass (one chunk, generation 2). */
+static ray_t* t29_disk(const char* dir, const char* const* names, const int64_t* mul, int nc, int64_t n,
+                       int gen, int corrupt) {
+    char p[300];
+    (void)ray_test_rm_rf(dir);
+    (void)ray_test_mkdir_p(dir);
+    ray_t* nm = ray_vec_new(RAY_STR, nc);
+    for (int j = 0; j < nc; j++) {
+        ray_t* c = i64_col(n, mul[j]);
+        snprintf(p, sizeof p, "%s/%s", dir, names[j]);
+        ray_col_save_gen(c, p, gen);
+        ray_release(c);
+        nm = ray_str_vec_append(nm, names[j], strlen(names[j]));
+    }
+    snprintf(p, sizeof p, "%s/.d", dir);
+    ray_col_save(nm, p);
+    ray_release(nm);
+    if (corrupt >= 0) {
+        snprintf(p, sizeof p, "%s/%s", dir, names[corrupt]);
+        FILE* f = fopen(p, "r+b");
+        fseek(f, (long)(96 + 64 * ((n + 65535) / 65536) + 6), SEEK_SET); fputc(1, f); fclose(f);
+    }
+    return ray_read_splayed(dir, NULL);
+}
+
+static ray_t* t29_plain(const char* n0, const int64_t* v0, const char* n1, const int64_t* v1, int64_t n) {
+    ray_t* t = ray_table_new(2);
+    ray_t* a = ray_vec_from_raw(RAY_I64, v0, n);
+    ray_t* b = ray_vec_from_raw(RAY_I64, v1, n);
+    t = ray_table_add_col(t, ray_sym_intern(n0, strlen(n0)), a);
+    t = ray_table_add_col(t, ray_sym_intern(n1, strlen(n1)), b);
+    ray_release(a); ray_release(b);
+    return t;
+}
+
+/* kind 0 join (type jt), 1 anti-join, 2 window join (time key lk, optional eq key). */
+static ray_t* t29_join(ray_t* lt, ray_t* rt, int kind, const char* lk, const char* rk, uint8_t jt, const char* eq) {
+    ray_graph_t* g = ray_graph_new(lt);
+    ray_op_t* ln = ray_const_table(g, lt);
+    ray_op_t* rn = ray_const_table(g, rt);
+    ray_op_t* root;
+    if (kind == 2) {
+        ray_op_t* eqk[1] = { eq ? ray_scan(g, eq) : NULL };
+        root = ray_asof_join(g, ln, rn, ray_scan(g, lk), eq ? eqk : NULL, eq ? 1 : 0, jt);
+    } else {
+        ray_op_t* l1[1] = { ray_scan(g, lk) };
+        ray_op_t* r1[1] = { ray_scan(g, rk) };
+        root = kind == 1 ? ray_antijoin(g, ln, l1, rn, r1, 1) : ray_join(g, ln, l1, rn, r1, 1, jt);
+        root = ray_optimize(g, root);
+    }
+    ray_error_clear();
+    ray_t* r = ray_execute(g, root);
+    if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    ray_graph_free(g);
+    return r;
+}
+
+static test_result_t t29_corrupt_at(ray_t* r, const char* what, const char* path) {
+    TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", what);
+    TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s (%s)", what, ray_err_code(r),
+                    ray_error_msg() ? ray_error_msg() : "no message");
+    TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), path), "%s: message %s", what,
+                    ray_error_msg() ? ray_error_msg() : "(none)");
+    ray_error_free(r);
+    PASS();
+}
+
+/* Equal serialized bytes: same shape, names, values and nulls. */
+static bool t29_same(ray_t* x, ray_t* y) {
+    if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) return false;
+    ray_t* sx = ray_ser(x); ray_t* sy = ray_ser(y);
+    bool same = sx && sy && !RAY_IS_ERR(sx) && !RAY_IS_ERR(sy) && sx->len == sy->len &&
+                memcmp(ray_data(sx), ray_data(sy), (size_t)sx->len) == 0;
+    if (sx && !RAY_IS_ERR(sx)) ray_release(sx);
+    if (sy && !RAY_IS_ERR(sy)) ray_release(sy);
+    return same;
+}
+
+/* Every join entry that reads a column of an input reports a failed
+ * materialization as itself (code and column path), on a generation-2 table
+ * loaded from disk and on a select result whose slot is passed encoded. */
+static test_result_t t29_join_failed_one(int64_t n) {
+    int64_t pv[3000], qv[3000];
+    int64_t m = n < 3000 ? n : 3000;
+    for (int64_t i = 0; i < m; i++) { pv[i] = 5 * i; qv[i] = i; }
+    ray_t* P = t29_plain("b", pv, "c", qv, m);       /* b matches L.b */
+    ray_t* Q = t29_plain("a", pv, "c", qv, m);       /* a matches nothing needed; key on a */
+    static const struct { int kind; bool left_is_l; const char* key; uint8_t jt; const char* eq; const char* what; } cs[] = {
+        { 0, true,  "b", 0, NULL, "inner, a gathered from the left" },
+        { 0, true,  "b", 1, NULL, "left join, a gathered from the left" },
+        { 0, false, "b", 0, NULL, "inner, a gathered from the right" },
+        { 0, true,  "a", 0, NULL, "inner, a is the left key" },
+        { 0, false, "a", 0, NULL, "inner, a is the right key" },
+        { 1, true,  "b", 0, NULL, "anti, a gathered" },
+        { 1, true,  "a", 0, NULL, "anti, a is the left key" },
+        { 1, false, "a", 0, NULL, "anti, a is the right key" },
+        { 2, true,  "b", 0, NULL, "window join, a gathered from the left" },
+        { 2, true,  "a", 0, NULL, "window join, a is the time key" },
+        { 2, false, "b", 0, NULL, "window join, a gathered from the right" },
+        { 2, true,  "b", 0, "a",  "window join, a is the equality key" },
+    };
+    for (size_t k = 0; k < sizeof cs / sizeof *cs; k++) {
+        for (int via_select = 0; via_select < 2; via_select++) {
+            ray_t* t = ex_table(n, true);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_t* in = t;
+            if (via_select) {
+                in = ex_run(t, EX_SELECT_PASS);
+                TEST_ASSERT_TRUE(in && !RAY_IS_ERR(in) && in->type == RAY_TABLE);
+                TEST_ASSERT_TRUE(ray_table_get_col_enc(in, ray_sym_intern("a", 1)) != NULL);
+            }
+            ray_t* other = strcmp(cs[k].key, "a") == 0 ? Q : P;
+            /* the right side of an eq-key window join needs the key too */
+            ray_t* Pe = NULL;
+            if (cs[k].eq) { Pe = t29_plain("a", pv, "b", qv, m); other = Pe; }
+            ray_t* r = cs[k].left_is_l ? t29_join(in, other, cs[k].kind, cs[k].key, cs[k].key, cs[k].jt, cs[k].eq)
+                                       : t29_join(other, in, cs[k].kind, cs[k].key, cs[k].key, cs[k].jt, cs[k].eq);
+            char what[128]; snprintf(what, sizeof what, "%s%s (n=%lld)", cs[k].what, via_select ? ", select result" : "", (long long)n);
+            test_result_t rr = t29_corrupt_at(r, what, CS_TMP "/ex/a");
+            if (Pe) ray_release(Pe);
+            if (in != t) ray_release(in);
+            ray_release(t);
+            if (rr.status != TEST_PASS) { ray_release(P); ray_release(Q); return rr; }
+        }
+    }
+    ray_release(P); ray_release(Q);
+    PASS();
+}
+
+static test_result_t test_join_sites_failed_decode(void) {
+    test_result_t r = t29_join_failed_one(3000);
+    if (r.status != TEST_PASS) return r;
+    return t29_join_failed_one(200000);
+}
+
+/* Generation 0 and 2 (and a select result of generation 2) join to the same
+ * rows, and the null-free key proof is taken on exactly the same joins. */
+static test_result_t test_join_sites_gen2_equal(void) {
+    TEST_ASSERT_TRUE(cp_save());
+    ray_t* t0 = cp_read(0); ray_t* t2 = cp_read(2);
+    TEST_ASSERT_TRUE(t0 && t2 && !RAY_IS_ERR(t0) && !RAY_IS_ERR(t2));
+    int64_t k0v[4] = { 0, 1, 2, 3 }, wv[4] = { 10, 20, 30, 40 };
+    ray_t* RK = t29_plain("k0", k0v, "w", wv, 4);
+    enum { RT_N = 10000 };
+    static int64_t tv[RT_N], rvv[RT_N], rk0[RT_N];
+    for (int64_t j = 0; j < RT_N; j++) { tv[j] = j * 7000000; rvv[j] = j; rk0[j] = j % 4; }
+    ray_t* RT = t29_plain("k4", tv, "rv", rvv, RT_N);
+    ray_t* RT2 = ray_table_new(3);
+    {
+        ray_t* a = ray_vec_from_raw(RAY_I64, rk0, RT_N); ray_t* b = ray_vec_from_raw(RAY_I64, tv, RT_N);
+        ray_t* c = ray_vec_from_raw(RAY_I64, rvv, RT_N);
+        RT2 = ray_table_add_col(RT2, ray_sym_intern("k0", 2), a);
+        RT2 = ray_table_add_col(RT2, ray_sym_intern("k4", 2), b);
+        RT2 = ray_table_add_col(RT2, ray_sym_intern("rv", 2), c);
+        ray_release(a); ray_release(b); ray_release(c);
+    }
+    ray_t* RX = ray_table_new(2);
+    {
+        ray_t* x = ray_sym_vec_new(RAY_SYM_W64, 2); x->len = 2;
+        ((int64_t*)ray_data(x))[0] = ray_sym_intern("xa", 2); ((int64_t*)ray_data(x))[1] = ray_sym_intern("xb", 2);
+        ray_t* w = ray_vec_from_raw(RAY_I64, wv, 2);
+        RX = ray_table_add_col(RX, ray_sym_intern("x", 1), x);
+        RX = ray_table_add_col(RX, ray_sym_intern("wx", 2), w);
+        ray_release(x); ray_release(w);
+    }
+    /* a select result of each: the encoded slots of generation 2 pass through */
+    ray_t* sel[2];
+    for (int gi = 0; gi < 2; gi++) {
+        ray_t* t = gi ? t2 : t0;
+        ray_graph_t* g = ray_graph_new(t);
+        ray_op_t* cs[4] = { ray_scan(g, "k0"), ray_scan(g, "x"), ray_scan(g, "k4"), ray_scan(g, "a") };
+        sel[gi] = ray_execute(g, ray_select_op(g, ray_const_table(g, t), cs, 4));
+        ray_graph_free(g);
+        TEST_ASSERT_TRUE(sel[gi] && !RAY_IS_ERR(sel[gi]) && sel[gi]->type == RAY_TABLE);
+    }
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(sel[1], ray_sym_intern("a", 1)) != NULL);
+    static const struct { int src; int kind; bool t_left; const char* lk; const char* rk; uint8_t jt; const char* eq; int rhs; const char* what; } cs[] = {
+        { 0, 0, true,  "k0", "k0", 0, NULL, 0, "inner k0" },
+        { 0, 0, true,  "k0", "k0", 1, NULL, 0, "left k0" },
+        { 0, 1, true,  "k0", "k0", 0, NULL, 0, "anti k0" },
+        { 0, 0, false, "k0", "k0", 0, NULL, 0, "inner, table on the right" },
+        { 0, 0, true,  "x",  "x",  0, NULL, 1, "inner nullable SYM key" },
+        { 0, 0, true,  "x",  "x",  1, NULL, 1, "left nullable SYM key" },
+        { 0, 1, true,  "x",  "x",  0, NULL, 1, "anti nullable SYM key" },
+        { 0, 2, true,  "k4", "k4", 0, NULL, 2, "window join" },
+        { 0, 2, true,  "k4", "k4", 1, NULL, 2, "window join, left" },
+        { 0, 2, true,  "k4", "k4", 0, "k0", 3, "window join with an equality key" },
+        { 1, 0, true,  "k0", "k0", 0, NULL, 0, "select result, inner k0" },
+        { 1, 0, true,  "x",  "x",  1, NULL, 1, "select result, left nullable SYM key" },
+        { 1, 1, true,  "k0", "k0", 0, NULL, 0, "select result, anti k0" },
+        { 1, 2, true,  "k4", "k4", 0, NULL, 2, "select result, window join" },
+    };
+    test_result_t res = { TEST_PASS, NULL };
+    ray_t* rhs[4] = { RK, RX, RT, RT2 };
+    for (size_t i = 0; i < sizeof cs / sizeof *cs && res.status == TEST_PASS; i++) {
+        ray_t* a = cs[i].src ? sel[0] : t0;
+        ray_t* b = cs[i].src ? sel[1] : t2;
+        ray_t* r[2]; uint64_t nf[2];
+        for (int gi = 0; gi < 2; gi++) {
+            ray_t* t = gi ? b : a;
+            uint64_t before = ray_join_nullfree_keys;
+            r[gi] = cs[i].t_left ? t29_join(t, rhs[cs[i].rhs], cs[i].kind, cs[i].lk, cs[i].rk, cs[i].jt, cs[i].eq)
+                                 : t29_join(rhs[cs[i].rhs], t, cs[i].kind, cs[i].lk, cs[i].rk, cs[i].jt, cs[i].eq);
+            nf[gi] = ray_join_nullfree_keys - before;
+        }
+        if (!(r[0] && r[1] && !RAY_IS_ERR(r[0]) && !RAY_IS_ERR(r[1]))) {
+            res = (test_result_t){ TEST_FAIL, "join did not run" };
+            fprintf(stderr, "  %s: join did not run (%s / %s)\n", cs[i].what,
+                    r[0] && RAY_IS_ERR(r[0]) ? ray_err_code(r[0]) : "ok", r[1] && RAY_IS_ERR(r[1]) ? ray_err_code(r[1]) : "ok");
+        } else if (nf[0] != nf[1]) {
+            res = (test_result_t){ TEST_FAIL, "null-free proof differs" };
+            fprintf(stderr, "  %s: null-free proofs %llu vs %llu\n", cs[i].what, (unsigned long long)nf[0], (unsigned long long)nf[1]);
+        } else if (!t29_same(r[0], r[1])) {
+            res = (test_result_t){ TEST_FAIL, "join answers differ" };
+            fprintf(stderr, "  %s: answers differ\n", cs[i].what);
+        }
+        for (int gi = 0; gi < 2; gi++) if (r[gi]) { if (RAY_IS_ERR(r[gi])) ray_error_free(r[gi]); else ray_release(r[gi]); }
+    }
+    ray_release(sel[0]); ray_release(sel[1]);
+    ray_release(RK); ray_release(RT); ray_release(RT2); ray_release(RX);
+    ray_release(t0); ray_release(t2);
+    return res;
+}
+
+/* A table of 2000 rows (a unique id, a key, a nullable value, a float and a
+ * symbol) saved at generation 0 and 2 under tb0 / tb2. */
+static bool t29_tb_save(void) {
+    enum { N = 2000 };
+    ray_t* t = ray_table_new(5);
+    ray_t* u = ray_vec_new(RAY_I64, N); u->len = N;
+    ray_t* k = ray_vec_new(RAY_I64, N); k->len = N;
+    ray_t* v = ray_vec_new(RAY_I64, N); v->len = N;
+    ray_t* f = ray_vec_new(RAY_F64, N); f->len = N;
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W64, N); s->len = N;
+    static const char* const nm[4] = { "pa", "pb", "pc", "pd" };
+    for (int64_t i = 0; i < N; i++) {
+        ((int64_t*)ray_data(u))[i] = i;
+        ((int64_t*)ray_data(k))[i] = i % 10;
+        ((int64_t*)ray_data(v))[i] = i * 3;
+        ((double*)ray_data(f))[i] = (double)(i % 7) * 0.5;
+        ((int64_t*)ray_data(s))[i] = ray_sym_intern(nm[i % 4], 2);
+    }
+    for (int64_t i = 0; i < N; i += 9) ray_vec_set_null(v, i, true);
+    t = ray_table_add_col(t, ray_sym_intern("u", 1), u);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    t = ray_table_add_col(t, ray_sym_intern("f", 1), f);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(u); ray_release(k); ray_release(v); ray_release(f); ray_release(s);
+    bool ok = ray_splay_save_mode(t, CS_TMP "/tb0", CS_TMP "/tb0.sym", RAY_COMPRESS_OFF) == RAY_OK &&
+              ray_splay_save_mode(t, CS_TMP "/tb2", CS_TMP "/tb2.sym", RAY_COMPRESS_ON) == RAY_OK;
+    ray_release(t);
+    return ok;
+}
+
+/* pivot and the table builtins give the generation-0 answer on a generation-2
+ * table and on tables that carry its encoded slots (xcol, xcols, modify). */
+static test_result_t test_tblop_sites_gen2_equal(void) {
+    TEST_ASSERT_TRUE(t29_tb_save());
+    ray_t* t0 = ray_read_splayed(CS_TMP "/tb0", CS_TMP "/tb0.sym");
+    ray_t* t2 = ray_read_splayed(CS_TMP "/tb2", CS_TMP "/tb2.sym");
+    TEST_ASSERT_TRUE(t0 && t2 && !RAY_IS_ERR(t0) && !RAY_IS_ERR(t2));
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(t2, ray_sym_intern("u", 1)) != NULL);
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(t0, ray_sym_intern("u", 1)) == NULL);
+    static const char* const verbs[] = {
+        "(pivot T 'k 's 'u sum)", "(pivot T 'k 'f 'u sum)", "(pivot T ['k] 's 'v avg)",
+        "(pivot T 'k 's 'u (fn [x] (sum x)))",
+        "(xcol T ['A 'B 'C 'D 'E])", "(xcols T ['v 'k])", "(xkey T ['u])", "(xgroup T ['k])", "(fkeys T)",
+        "(modify T 'v (fn [c] (+ c 1)))", "(modify T 'u (fn [c] c))", "(union-all T T)",
+        "(distinct (xcols T ['k 's]))",
+    };
+    int64_t sT = ray_sym_intern("T", 1);
+    for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
+        ray_t* r[2];
+        for (int gi = 0; gi < 2; gi++) {
+            ray_env_set(sT, gi ? t2 : t0);
+            ray_error_clear();
+            r[gi] = ray_eval_str(verbs[i]);
+        }
+        bool ok = r[0] && r[1] && !RAY_IS_ERR(r[0]) && !RAY_IS_ERR(r[1]) && t29_same(r[0], r[1]);
+        if (!ok) fprintf(stderr, "  %s: %s / %s\n", verbs[i], r[0] && RAY_IS_ERR(r[0]) ? ray_err_code(r[0]) : "ok",
+                         r[1] && RAY_IS_ERR(r[1]) ? ray_err_code(r[1]) : "ok");
+        for (int gi = 0; gi < 2; gi++) if (r[gi]) { if (RAY_IS_ERR(r[gi])) ray_error_free(r[gi]); else ray_release(r[gi]); }
+        TEST_ASSERT_FMT(ok, "%s: answers differ", verbs[i]);
+    }
+    /* the slot-passing builtins keep the encoded object (no decode) */
+    ray_env_set(sT, t2);
+    ray_t* xc = ray_eval_str("(xcols T ['u])");
+    TEST_ASSERT_TRUE(xc && !RAY_IS_ERR(xc) && ray_table_get_col_enc(xc, ray_sym_intern("u", 1)) != NULL);
+    ray_release(xc);
+    ray_env_set(sT, NULL);
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+/* Builtins over a table whose column a fails to materialize report it as
+ * itself; the ones that never read the column still work. */
+static test_result_t test_tblop_sites_failed_decode(void) {
+    ray_t* t = bind_corrupt_table();
+    TEST_ASSERT_TRUE(t != NULL);
+    static const char* const bad[] = {
+        "(pivot t 'b 'a 'b sum)", "(pivot t 'a 'b 'b sum)", "(pivot t 'b 'b 'a sum)", "(pivot t ['b] 'b 'a (fn [x] (sum x)))",
+        "(xkey t ['a])", "(xkey t ['b])", "(xgroup t ['a])", "(xgroup t ['b])",
+        "(modify t 'a (fn [c] c))", "(union-all t t)",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        ray_error_clear();
+        ray_t* r = ray_eval_str(bad[i]);
+        test_result_t rr = expect_corrupt(r, bad[i]);
+        if (rr.status != TEST_PASS) return rr;
+    }
+    static const char* const good[] = {
+        "(xcol t ['x 'y])", "(xcols t ['a 'b])", "(fkeys t)", "(modify t 'b (fn [c] c))",
+    };
+    for (size_t i = 0; i < sizeof good / sizeof *good; i++) {
+        ray_error_clear();
+        ray_t* r = ray_eval_str(good[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: must not decode column a", good[i]);
+        ray_release(r);
+    }
+    ray_release(t);
+    PASS();
+}
+
+/* Datalog: a datoms table whose column e fails to materialize (env D). */
+static test_result_t test_datalog_sites_failed_decode(void) {
+    static const char* const nm[3] = { "e", "a", "v" };
+    static const int64_t mul[3] = { 1, 2, 3 };
+    ray_t* d = t29_disk(CS_TMP "/dl", nm, mul, 3, 3000, 2, 0);
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d));
+    ray_env_set(ray_sym_intern("D", 1), d);
+    static const char* const verbs[] = {
+        "(scan-eav D 'x)", "(scan-eav D 1 'x)", "(retract-fact D 1 'x 2)", "(assert-fact D 1 'x 2)", "(pull D 1)",
+        "(pull D 1 ['x])",
+    };
+    for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
+        ray_error_clear();
+        ray_t* r = ray_eval_str(verbs[i]);
+        test_result_t rr = t29_corrupt_at(r, verbs[i], CS_TMP "/dl/e");
+        if (rr.status != TEST_PASS) return rr;
+    }
+    /* the rule engine: an EDB with a failing column fails the evaluation, no leak */
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_TRUE(prog != NULL);
+    TEST_ASSERT_TRUE(dl_add_edb(prog, "edge", d, 3) >= 0);
+    dl_rule_t rule;
+    dl_rule_init(&rule, "p", 3);
+    dl_rule_head_var(&rule, 0, 0); dl_rule_head_var(&rule, 1, 1); dl_rule_head_var(&rule, 2, 2);
+    int body = dl_rule_add_atom(&rule, "edge", 3);
+    dl_body_set_var(&rule, body, 0, 0); dl_body_set_var(&rule, body, 1, 1); dl_body_set_var(&rule, body, 2, 2);
+    rule.n_vars = 3;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
+    ray_error_clear();
+    TEST_ASSERT_TRUE(dl_eval(prog) != 0);
+    dl_program_free(prog);
+    ray_env_set(ray_sym_intern("D", 1), NULL);
+    ray_release(d);
+    PASS();
+}
+
+/* A recursive program with provenance over an EDB loaded from generation 0
+ * and 2 derives the same relation and the same proofs; so does a query over
+ * env-bound tables. */
+static ray_t* t29_dl_run(ray_t* edge, ray_t** prov_off, ray_t** prov_data) {
+    dl_program_t* prog = dl_program_new();
+    if (!prog) return NULL;
+    prog->flags |= DL_FLAG_PROVENANCE;
+    dl_add_edb(prog, "edge", edge, 2);
+    dl_rule_t r0; dl_rule_init(&r0, "path", 2);
+    dl_rule_head_var(&r0, 0, 0); dl_rule_head_var(&r0, 1, 1);
+    int b = dl_rule_add_atom(&r0, "edge", 2);
+    dl_body_set_var(&r0, b, 0, 0); dl_body_set_var(&r0, b, 1, 1);
+    r0.n_vars = 2;
+    dl_add_rule(prog, &r0);
+    dl_rule_t r1; dl_rule_init(&r1, "path", 2);
+    dl_rule_head_var(&r1, 0, 0); dl_rule_head_var(&r1, 1, 2);
+    int b0 = dl_rule_add_atom(&r1, "path", 2);
+    dl_body_set_var(&r1, b0, 0, 0); dl_body_set_var(&r1, b0, 1, 1);
+    int b1 = dl_rule_add_atom(&r1, "edge", 2);
+    dl_body_set_var(&r1, b1, 0, 1); dl_body_set_var(&r1, b1, 1, 2);
+    r1.n_vars = 3;
+    dl_add_rule(prog, &r1);
+    ray_t* out = NULL;
+    if (dl_eval(prog) == 0) {
+        out = dl_query(prog, "path");
+        if (out) ray_retain(out);
+        ray_t* o = dl_get_provenance_src_offsets(prog, "path");
+        ray_t* d = dl_get_provenance_src_data(prog, "path");
+        *prov_off = o ? (ray_retain(o), o) : NULL;
+        *prov_data = d ? (ray_retain(d), d) : NULL;
+    }
+    dl_program_free(prog);
+    return out;
+}
+
+static test_result_t test_datalog_sites_gen2_equal(void) {
+    static const char* const nm[2] = { "s", "d" };
+    static const int64_t mul[2] = { 1, 1 };
+    ray_t* e[2]; ray_t* out[2]; ray_t* po[2] = { NULL, NULL }; ray_t* pd[2] = { NULL, NULL };
+    for (int gi = 0; gi < 2; gi++) {
+        e[gi] = t29_disk(gi ? CS_TMP "/e2" : CS_TMP "/e0", nm, mul, 2, 30, gi ? 2 : 0, -1);
+        TEST_ASSERT_TRUE(e[gi] && !RAY_IS_ERR(e[gi]));
+        /* d = s + 1: shift the destination column through a derived table */
+        ray_t* s = ray_table_col(e[gi], ray_sym_intern("s", 1));
+        ray_t* dd = ray_vec_new(RAY_I64, 30); dd->len = 30;
+        for (int64_t i = 0; i < 30; i++) ((int64_t*)ray_data(dd))[i] = ((int64_t*)ray_data(s))[i] + 1;
+        ray_t* te = ray_table_new(2);
+        ray_t* sc = gi ? ray_table_get_col_enc(e[gi], ray_sym_intern("s", 1)) : s;
+        te = ray_table_add_col(te, ray_sym_intern("s", 1), sc);
+        te = ray_table_add_col(te, ray_sym_intern("d", 1), dd);
+        ray_release(dd);
+        ray_release(e[gi]);
+        e[gi] = te;
+        out[gi] = t29_dl_run(e[gi], &po[gi], &pd[gi]);
+    }
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(e[1], ray_sym_intern("s", 1)) != NULL);
+    TEST_ASSERT_TRUE(out[0] && out[1] && ray_table_nrows(out[0]) == 30 * 31 / 2);
+    TEST_ASSERT_TRUE(t29_same(out[0], out[1]));
+    TEST_ASSERT_TRUE(po[0] && po[1] && t29_same(po[0], po[1]));
+    TEST_ASSERT_TRUE(pd[0] && pd[1] && t29_same(pd[0], pd[1]));
+    for (int gi = 0; gi < 2; gi++) { ray_release(out[gi]); ray_release(po[gi]); ray_release(pd[gi]); ray_release(e[gi]); }
+    PASS();
+}
+
+static test_result_t test_datalog_query_gen2_equal(void) {
+    static const char* const nm3[3] = { "e", "a", "v" };
+    static const int64_t mul3[3] = { 1, 1, 10 };
+    static const char* const nm2[2] = { "p", "q" };
+    static const int64_t mul2[2] = { 1, 100 };
+    ray_t* r[2];
+    for (int gi = 0; gi < 2; gi++) {
+        ray_t* db = t29_disk(gi ? CS_TMP "/q2" : CS_TMP "/q0", nm3, mul3, 3, 50, gi ? 2 : 0, -1);
+        ray_t* ex = t29_disk(gi ? CS_TMP "/x2" : CS_TMP "/x0", nm2, mul2, 2, 50, gi ? 2 : 0, -1);
+        TEST_ASSERT_TRUE(db && ex && !RAY_IS_ERR(db) && !RAY_IS_ERR(ex));
+        if (gi) TEST_ASSERT_TRUE(ray_table_get_col_enc(ex, ray_sym_intern("p", 1)) != NULL);
+        ray_env_set(ray_sym_intern("qdb", 3), db);
+        ray_env_set(ray_sym_intern("extra", 5), ex);
+        ray_error_clear();
+        r[gi] = ray_eval_str("(query qdb (find ?x ?b) (where (eav ?x ?p ?v) (extra ?x ?b)))");
+        ray_env_set(ray_sym_intern("qdb", 3), NULL);
+        ray_env_set(ray_sym_intern("extra", 5), NULL);
+        ray_release(db); ray_release(ex);
+    }
+    TEST_ASSERT_TRUE(r[0] && r[1] && !RAY_IS_ERR(r[0]) && !RAY_IS_ERR(r[1]));
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(r[0]), 50);
+    TEST_ASSERT_TRUE(t29_same(r[0], r[1]));
+    ray_release(r[0]); ray_release(r[1]);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -3819,5 +4274,12 @@ const test_entry_t compress_entries[] = {
     { "compress/group_sites_slice_route",   test_group_sites_slice_route,   rt_setup, rt_teardown },
     { "compress/group_sites_parted",        test_group_sites_parted,        rt_setup, rt_teardown },
     { "compress/group_sites_parted_failed_decode", test_group_sites_parted_failed_decode, rt_setup, rt_teardown },
+    { "compress/join_sites_failed_decode",   test_join_sites_failed_decode,   rt_setup, rt_teardown },
+    { "compress/join_sites_gen2_equal",      test_join_sites_gen2_equal,      rt_setup, rt_teardown },
+    { "compress/tblop_sites_gen2_equal",     test_tblop_sites_gen2_equal,     rt_setup, rt_teardown },
+    { "compress/tblop_sites_failed_decode",  test_tblop_sites_failed_decode,  rt_setup, rt_teardown },
+    { "compress/datalog_sites_failed_decode", test_datalog_sites_failed_decode, rt_setup, rt_teardown },
+    { "compress/datalog_sites_gen2_equal",   test_datalog_sites_gen2_equal,   rt_setup, rt_teardown },
+    { "compress/datalog_query_gen2_equal",   test_datalog_query_gen2_equal,   rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
