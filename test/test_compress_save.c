@@ -1035,7 +1035,10 @@ static test_result_t test_staged_and_sym(void) {
      * the target domain alive across the save and flushes it afterwards. */
     struct ray_sym_domain_s* d2 = ray_sym_domain_open_or_create(CS_TMP "/sy2.sym");
     TEST_ASSERT_NOT_NULL(d2);
+    ray_enc_counters_reset();
     TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk_mode(l, CS_TMP "/sy2", CS_TMP "/sy2.sym", RAY_COMPRESS_ABSENT), RAY_OK);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);              /* merge and write by range */
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(d2, false), RAY_OK);
     ray_sym_domain_release(d2);
     TEST_ASSERT_EQ_I(file_gen(CS_TMP "/sy2/s"), 2);
@@ -1138,7 +1141,195 @@ static test_result_t test_resolver_rules(void) {
     PASS();
 }
 
+
+static ray_t* sym_tbl(const char* pfx, int nd, int64_t n) {
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W64, n); s->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        char b[32]; int k = snprintf(b, sizeof b, "%s%d", pfx, (int)(i % nd));
+        ((int64_t*)ray_data(s))[i] = ray_sym_intern(b, (size_t)k);
+    }
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(s);
+    return t;
+}
+
+static bool sym_cells_eq(ray_t* x, ray_t* y, int64_t n) {
+    if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y) || x->len != n || y->len != n) return false;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* a = ray_sym_vec_cell(x, i); ray_t* b = ray_sym_vec_cell(y, i);
+        if (!a || !b || ray_str_len(a) != ray_str_len(b) ||
+            memcmp(ray_str_ptr(a), ray_str_ptr(b), ray_str_len(a)) != 0) return false;
+    }
+    return true;
+}
+
+/* Sources of different SYM id widths (an 8-bit and a 16-bit generation-2
+ * column over two symfiles, and a plain 64-bit runtime column) through one
+ * vocabulary merge into a third symfile: decode-free, ids correct. */
+static test_result_t test_merge_mixed_widths(void) {
+    const int64_t n = 3000;
+    ray_t* t1 = sym_tbl("p", 2, n);
+    ray_t* t2 = sym_tbl("k", 300, n);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t1, CS_TMP "/m1", CS_TMP "/m1.sym", RAY_COMPRESS_ON), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t2, CS_TMP "/m2", CS_TMP "/m2.sym", RAY_COMPRESS_ON), RAY_OK);
+    ray_t* l1 = ray_read_splayed(CS_TMP "/m1", CS_TMP "/m1.sym");
+    ray_t* l2 = ray_read_splayed(CS_TMP "/m2", CS_TMP "/m2.sym");
+    TEST_ASSERT_TRUE(l1 && !RAY_IS_ERR(l1) && l2 && !RAY_IS_ERR(l2));
+    ray_t* e1 = ray_table_get_col_enc_idx(l1, 0);
+    ray_t* e2 = ray_table_get_col_enc_idx(l2, 0);
+    TEST_ASSERT_TRUE(e1 && e2);
+    ray_col_meta_t m1, m2;
+    TEST_ASSERT_TRUE(ray_col_meta_of(e1, &m1) && ray_col_meta_of(e2, &m2));
+    TEST_ASSERT_EQ_I(m1.attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+    TEST_ASSERT_EQ_I(m2.attrs & RAY_SYM_W_MASK, RAY_SYM_W16);
+    ray_t* c3 = ray_table_col_idx(t2, 0);                  /* plain W64 runtime ids */
+    ray_t* t = ray_table_new(3);
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), e1);
+    t = ray_table_add_col(t, ray_sym_intern("b", 1), e2);
+    t = ray_table_add_col(t, ray_sym_intern("c", 1), c3);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    struct ray_sym_domain_s* d3 = ray_sym_domain_open_or_create(CS_TMP "/m3.sym");
+    TEST_ASSERT_NOT_NULL(d3);
+    ray_enc_counters_reset();
+    TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk_mode(t, CS_TMP "/m3", CS_TMP "/m3.sym", RAY_COMPRESS_ABSENT), RAY_OK);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(d3, false), RAY_OK);
+    ray_sym_domain_release(d3);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/m3/a"), 2);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/m3/b"), 2);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/m3/c"), 0);
+    ray_t* l3 = ray_read_splayed(CS_TMP "/m3", CS_TMP "/m3.sym");
+    TEST_ASSERT_TRUE(l3 && !RAY_IS_ERR(l3));
+    TEST_ASSERT_TRUE(sym_cells_eq(ray_table_col_idx(l3, 0), ray_table_col_idx(t1, 0), n));
+    TEST_ASSERT_TRUE(sym_cells_eq(ray_table_col_idx(l3, 1), ray_table_col_idx(t2, 0), n));
+    TEST_ASSERT_TRUE(sym_cells_eq(ray_table_col_idx(l3, 2), ray_table_col_idx(t2, 0), n));
+    ray_release(l3); ray_release(t);
+    ray_release(l1); ray_release(l2); ray_release(t1); ray_release(t2);
+    PASS();
+}
+
+static bool files_eq(const char* a, const char* b) {
+    size_t na, nb;
+    uint8_t* x = slurp(a, &na); uint8_t* y = slurp(b, &nb);
+    bool eq = x && y && na == nb && memcmp(x, y, na) == 0;
+    free(x); free(y);
+    return eq;
+}
+
+/* Existing users: an absent option onto no destination and onto a
+ * generation-0 destination writes exactly what the per-column generation-0
+ * writers produce (the pre-resolution path). */
+static test_result_t test_absent_byte_identity(void) {
+    const int64_t n = 3000;
+    ray_t* t = sym_tbl("v", 7, n);
+    ray_t* a = i64_col(n, 3);
+    ray_t* st = ray_vec_new(RAY_STR, n);
+    for (int64_t i = 0; i < n; i++) {
+        char b[48]; int k = snprintf(b, sizeof b, i % 3 ? "x%d" : "a long string value %d", (int)i);
+        st = ray_str_vec_append(st, b, (size_t)k);
+    }
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+    t = ray_table_add_col(t, ray_sym_intern("t", 1), st);
+    ray_release(a); ray_release(st);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, CS_TMP "/bi", CS_TMP "/bi.sym"), RAY_OK);
+    /* the reference: today's per-column writers */
+    (void)ray_test_mkdir_p(CS_TMP "/ref");
+    struct ray_sym_domain_s* dom = ray_sym_domain_open_or_create(CS_TMP "/bi.sym");
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_col_save_sym_encoded(ray_table_col_idx(t, 0), CS_TMP "/ref/s", dom, true), RAY_OK);
+    ray_sym_domain_release(dom);
+    TEST_ASSERT_EQ_I(ray_col_save(ray_table_col_idx(t, 1), CS_TMP "/ref/a"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(ray_table_col_idx(t, 2), CS_TMP "/ref/t"), RAY_OK);
+    ray_t* names = ray_vec_new(RAY_STR, 3);
+    names = ray_str_vec_append(names, "s", 1);
+    names = ray_str_vec_append(names, "a", 1);
+    names = ray_str_vec_append(names, "t", 1);
+    TEST_ASSERT_EQ_I(ray_col_save(names, CS_TMP "/ref/.d"), RAY_OK);
+    ray_release(names);
+    const char* files[4] = { "s", "a", "t", ".d" };
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1)   /* again, onto the generation-0 destination */
+            TEST_ASSERT_EQ_I(ray_splay_save(t, CS_TMP "/bi", CS_TMP "/bi.sym"), RAY_OK);
+        char cur[1024], p[1200], r[256];
+        TEST_ASSERT_EQ_I(ray_splay_resolve_dir(CS_TMP "/bi", cur, sizeof cur), RAY_OK);
+        for (int f = 0; f < 4; f++) {
+            snprintf(p, sizeof p, "%s/%s", cur, files[f]);
+            snprintf(r, sizeof r, CS_TMP "/ref/%s", files[f]);
+            TEST_ASSERT_TRUE(files_eq(p, r));
+        }
+    }
+    ray_release(t);
+    PASS();
+}
+
+/* An absent option never drops inheritance silently: an unreadable
+ * destination column or generation pointer fails the save, and nothing is
+ * published.  A destination file in a header-less list format is
+ * generation 0, not an error. */
+static test_result_t test_unreadable_destination(void) {
+    if (geteuid() == 0) SKIP("running as root: permissions are not enforced");
+    const char* d = CS_TMP "/ur";
+    ray_t* t = plain_tbl(3000);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_OFF), RAY_OK);
+    char cur[1024], cur2[1024], p[1200];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur, sizeof cur), RAY_OK);
+    snprintf(p, sizeof p, "%s/a", cur);
+    uint8_t g = 9;
+    TEST_ASSERT_EQ_I(chmod(p, 0), 0);
+    TEST_ASSERT_EQ_I(ray_col_file_gen_err(p, &g), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, d, NULL), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur2, sizeof cur2), RAY_OK);
+    TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);           /* nothing published */
+    /* an explicit option does not read the destination */
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
+    /* the generation pointer itself unreadable: begin fails */
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur, sizeof cur), RAY_OK);
+    snprintf(p, sizeof p, "%s/.current", d);
+    TEST_ASSERT_EQ_I(chmod(p, 0), 0);
+    TEST_ASSERT_TRUE(ray_splay_save(t, d, NULL) != RAY_OK);
+    TEST_ASSERT_EQ_I(chmod(p, 0644), 0);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur2, sizeof cur2), RAY_OK);
+    TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
+    /* a short (truncated) destination column is corrupt, not 0 */
+    snprintf(p, sizeof p, "%s/b", cur);
+    TEST_ASSERT_EQ_I(truncate(p, 10), 0);
+    TEST_ASSERT_EQ_I(ray_col_file_gen_err(p, &g), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(ray_col_file_gen_err(CS_TMP "/nope", &g), RAY_OK);
+    TEST_ASSERT_EQ_I(g, 0);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, d, NULL), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur2, sizeof cur2), RAY_OK);
+    TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);
+    ray_release(t);
+    /* a string-list column file at the name of a now-plain column */
+    ray_t* lt = ray_table_new(1);
+    ray_t* lst = ray_list_new(3);
+    for (int i = 0; i < 3; i++) { ray_t* x = ray_str("ab", 2); lst = ray_list_append(lst, x); ray_release(x); }
+    lt = ray_table_add_col(lt, ray_sym_intern("a", 1), lst);
+    ray_release(lst);
+    TEST_ASSERT_EQ_I(ray_splay_save(lt, CS_TMP "/ul", NULL), RAY_OK);
+    ray_release(lt);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(CS_TMP "/ul", cur, sizeof cur), RAY_OK);
+    snprintf(p, sizeof p, "%s/a", cur);
+    TEST_ASSERT_EQ_I(ray_col_file_gen_err(p, &g), RAY_OK);
+    TEST_ASSERT_EQ_I(g, 0);
+    ray_t* pt = ray_table_new(1);
+    ray_t* v = i64_col(3, 1);
+    pt = ray_table_add_col(pt, ray_sym_intern("a", 1), v);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(ray_splay_save(pt, CS_TMP "/ul", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/ul", "a"), 0);
+    ray_release(pt);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/merge_mixed_widths",  test_merge_mixed_widths,  cs_setup, cs_teardown },
+    { "compress/absent_byte_identity", test_absent_byte_identity, cs_setup, cs_teardown },
+    { "compress/unreadable_destination", test_unreadable_destination, cs_setup, cs_teardown },
     { "compress/inherit_destination", test_inherit_destination, cs_setup, cs_teardown },
     { "compress/update_then_save",    test_update_then_save,    cs_setup, cs_teardown },
     { "compress/forced_generation0",  test_forced_generation0,  cs_setup, cs_teardown },

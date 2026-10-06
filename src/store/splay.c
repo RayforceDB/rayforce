@@ -464,9 +464,11 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
     if (!gens) return RAY_ERR_OOM;
     for (int64_t c = 0; c < ncols_res; c++) {
         ray_t* na = ray_sym_str(ray_table_col_name(tbl, c));
-        gens[c] = na ? ray_col_resolve_gen(mode, splay_slot(tbl, c),
-                                           write ? write->cur : NULL,
-                                           ray_str_ptr(na), ray_str_len(na)) : 0;
+        if (!na) continue;
+        ray_err_t gerr = ray_col_resolve_gen_err(mode, splay_slot(tbl, c),
+                                                 write ? write->cur : NULL,
+                                                 ray_str_ptr(na), ray_str_len(na), &gens[c]);
+        if (gerr != RAY_OK) { ray_free_raw(gens); return gerr; }   /* nothing written yet */
     }
     if (write) { ray_free_raw(write->gens); write->gens = gens; write->ngens = ncols_res; }
     ray_err_t ret = RAY_OK;
@@ -941,8 +943,13 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     /* The destination's current generation, read under the lock: the
      * generation inheritance rule compares against it. */
     write->cur[0] = '\0';
-    if (write->staged && ray_splay_resolve_dir(write->root, write->cur, sizeof write->cur) != RAY_OK)
-        write->cur[0] = '\0';
+    if (write->staged) {
+        err = ray_splay_resolve_dir(write->root, write->cur, sizeof write->cur);
+        if (err != RAY_OK) {
+            write->cur[0] = '\0';
+            return ray_splay_write_finish(write, err, false);
+        }
+    }
     if (!write->staged) {
         splay_snapshot_root(write);
         memcpy(write->dir, write->root, len + 1);
@@ -1252,6 +1259,8 @@ ray_t* ray_splay_load(const char* dir, const char* sym_path) {
  * generation-2 file records its index in the enc header and is skipped. */
 static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t** deferred,
                                   const uint8_t* gens) {
+    /* Heuristic HASH is not persisted for generation 2; index policy PI.
+     * A generation-2 file records its zone in the enc header. */
     if (gens && gens[c] == 2) return;
     {
         ray_t* col = ray_table_get_col_idx(tbl, c);

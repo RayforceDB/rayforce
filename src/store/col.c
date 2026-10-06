@@ -110,6 +110,16 @@ static ray_err_t validate_sym_bounds(const void* data, int64_t len,
 
 static size_t col_str_pool_payload_len(const ray_t* vec);
 
+/* A file in one of the magic-prefixed formats above (no ray_t header; may
+ * be shorter than 32 bytes): always generation 0. */
+bool ray_col_header_is_ext(const void* head, size_t n) {
+    if (n < 4) return false;
+    uint32_t magic;
+    memcpy(&magic, head, 4);
+    return magic == STR_LIST_MAGIC || magic == STR_VEC_MAGIC ||
+           magic == LIST_MAGIC     || magic == TABLE_MAGIC;
+}
+
 /* --------------------------------------------------------------------------
  * Column file format:
  *   Bytes 0-15:  aux — RESERVED for postponed on-disk index persistence

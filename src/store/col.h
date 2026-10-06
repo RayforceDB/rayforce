@@ -134,6 +134,17 @@ uint8_t ray_col_resolve_gen(ray_compress_t mode, ray_t* src,
 /* The same rule for writers that have only the column's type (streams). */
 uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
                                  const char* dest_cur, const char* name, size_t name_len);
+/* Checked forms, for savers: a missing destination file is generation 0,
+ * but a file that cannot be read (permissions, short, bad discriminator) or
+ * a path that overflows is an error, never a silent 0.  The uint8_t forms
+ * above read every error as 0. */
+ray_err_t ray_col_file_gen_err(const char* path, uint8_t* gen);
+/* First bytes of a magic-prefixed (header-less, generation-0) column file? */
+bool      ray_col_header_is_ext(const void* head, size_t n);
+ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* dest_cur,
+                                  const char* name, size_t name_len, uint8_t* gen);
+ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* dest_cur,
+                                       const char* name, size_t name_len, uint8_t* gen);
 void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */
 
 bool ray_col_gen2_eligible(ray_t* col);

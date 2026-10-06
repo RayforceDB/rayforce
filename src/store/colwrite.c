@@ -36,6 +36,7 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include <stdatomic.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -289,35 +290,72 @@ ray_err_t ray_col_save_bulk_gen(ray_t* vec, const char* path, uint8_t gen) {
 static _Atomic(bool) g_force_compress;
 void ray_store_test_force_compress(bool on) { atomic_store(&g_force_compress, on); }
 
-uint8_t ray_col_file_gen(const char* path) {
+/* A missing file is generation 0; any other failure to read the header
+ * (permissions, a short file, a bad discriminator) is an error, so an
+ * absent option never silently drops a destination's generation. */
+ray_err_t ray_col_file_gen_err(const char* path, uint8_t* gen) {
+    *gen = 0;
+    if (!path) return RAY_ERR_IO;
+    errno = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return errno == ENOENT ? RAY_OK : RAY_ERR_IO;
     uint8_t h[32];
-    FILE* f = path ? fopen(path, "rb") : NULL;
-    if (!f) return 0;
     size_t n = fread(h, 1, 32, f);
+    bool rd_err = ferror(f) != 0;
     fclose(f);
-    return (n == 32 && ray_col_gen_of(h) == 2) ? 2 : 0;
+    if (rd_err) return RAY_ERR_IO;
+    if (ray_col_header_is_ext(h, n)) return RAY_OK;       /* list / string formats */
+    if (n != 32) return RAY_ERR_CORRUPT;
+    int g = ray_col_gen_of(h);
+    if (g == RAY_ENC_GEN_VERSION) return RAY_ERR_VERSION;
+    if (g < 0) return RAY_ERR_CORRUPT;
+    *gen = g == 2 ? 2 : 0;
+    return RAY_OK;
+}
+
+uint8_t ray_col_file_gen(const char* path) {
+    uint8_t g;
+    return ray_col_file_gen_err(path, &g) == RAY_OK ? g : 0;
 }
 
 /* The generation the destination's current generation stores `name` in. */
-static uint8_t colw_dest_gen(const char* cur, const char* name, size_t nlen) {
-    if (!cur || !cur[0] || !name) return 0;
+static ray_err_t colw_dest_gen(const char* cur, const char* name, size_t nlen, uint8_t* gen) {
+    *gen = 0;
+    if (!cur || !cur[0]) return RAY_OK;                    /* no published table */
+    if (!name) return RAY_ERR_TYPE;
     char p[1200];
     int n = snprintf(p, sizeof p, "%s/%.*s", cur, (int)nlen, name);
-    if (n < 0 || (size_t)n >= sizeof p) return 0;
-    return ray_col_file_gen(p);
+    if (n < 0 || (size_t)n >= sizeof p) return RAY_ERR_RANGE;
+    return ray_col_file_gen_err(p, gen);
+}
+
+ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* cur,
+                                  const char* name, size_t nlen, uint8_t* gen) {
+    *gen = 0;
+    if (!colw_src_gen2_ok(src) || mode == RAY_COMPRESS_OFF) return RAY_OK;
+    *gen = 2;
+    if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return RAY_OK;
+    if (src->type == RAY_ENCCOL) return RAY_OK;            /* the slot still holds an encoded column */
+    return colw_dest_gen(cur, name, nlen, gen);            /* the destination already stores it as 2 */
+}
+
+ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* cur,
+                                       const char* name, size_t nlen, uint8_t* gen) {
+    *gen = 0;
+    if (!ray_encw_type_supported(type) || mode == RAY_COMPRESS_OFF) return RAY_OK;
+    *gen = 2;
+    if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return RAY_OK;
+    return colw_dest_gen(cur, name, nlen, gen);
 }
 
 uint8_t ray_col_resolve_gen(ray_compress_t mode, ray_t* src,
                             const char* cur, const char* name, size_t nlen) {
-    if (!colw_src_gen2_ok(src) || mode == RAY_COMPRESS_OFF) return 0;
-    if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return 2;
-    if (src->type == RAY_ENCCOL) return 2;                 /* the slot still holds an encoded column */
-    return colw_dest_gen(cur, name, nlen);                 /* the destination already stores it as 2 */
+    uint8_t g;
+    return ray_col_resolve_gen_err(mode, src, cur, name, nlen, &g) == RAY_OK ? g : 0;
 }
 
 uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
                                  const char* cur, const char* name, size_t nlen) {
-    if (!ray_encw_type_supported(type) || mode == RAY_COMPRESS_OFF) return 0;
-    if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return 2;
-    return colw_dest_gen(cur, name, nlen);
+    uint8_t g;
+    return ray_col_resolve_gen_type_err(mode, type, cur, name, nlen, &g) == RAY_OK ? g : 0;
 }
