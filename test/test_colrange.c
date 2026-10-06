@@ -575,6 +575,36 @@ static test_result_t test_table_col_src(void) {
     PASS();
 }
 
+static test_result_t test_range_parted_boundary(void) {
+    for (int p = 0; p < 2; p++) {
+        char dir[256]; snprintf(dir, sizeof dir, CR_TMP "/pdb/2024.01.0%d/t", p + 1);
+        ray_t* t = ray_table_new(1);
+        ray_t* a = ray_vec_new(RAY_I64, 3000); a->len = 3000;
+        for (int i = 0; i < 3000; i++) ((int64_t*)ray_data(a))[i] = p * 3000 + i;
+        t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+        ray_release(a);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dir, NULL, p == 0 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF), RAY_OK);
+        ray_release(t);
+    }
+    ray_t* t = ray_read_parted(CR_TMP "/pdb", "t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_col_src_t s;
+    TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("a", 1), &s));
+    TEST_ASSERT_EQ_I(s.len, 6000);
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    ray_col_range_t r;
+    TEST_ASSERT_NULL(ray_col_range(&s, 2990, 100, &sc, &r));
+    TEST_ASSERT_EQ_I(r.n, 10);                                   /* segment boundary */
+    TEST_ASSERT_EQ_I(((const int64_t*)r.data)[9], 2999);
+    TEST_ASSERT_NULL(ray_col_range(&s, 3000, 100, &sc, &r));
+    ray_col_meta_t m; ray_table_col_meta(t, ray_sym_intern("a", 1), &m);
+    ray_t* seg1 = ray_enccol_seg(m.enc, 1);                      /* the generation-0 segment */
+    TEST_ASSERT_EQ_PTR(r.data, ray_data(seg1));                  /* zero copy */
+    TEST_ASSERT_EQ_I(r.n, 100);
+    ray_col_scratch_free(&sc); ray_col_src_release(&s); ray_release(t);
+    PASS();
+}
+
 const test_entry_t colrange_entries[] = {
     { "colrange/gen0_zero_copy",          test_range_gen0_zero_copy,            cr_setup, cr_teardown },
     { "colrange/gen2_vector_clip_nulls",  test_range_gen2_vector_clip_and_nulls, cr_setup, cr_teardown },
@@ -587,5 +617,6 @@ const test_entry_t colrange_entries[] = {
     { "colrange/parted_ragged",           test_range_parted_ragged,             cr_setup, cr_teardown },
     { "colrange/bind_refuses_shapes",       test_bind_refuses_shapes,             cr_setup, cr_teardown },
     { "colrange/table_col_src",           test_table_col_src,                   cr_setup, cr_teardown },
+    { "colrange/parted_boundary",         test_range_parted_boundary,           cr_setup, cr_teardown },
     { NULL, NULL, NULL, NULL },
 };

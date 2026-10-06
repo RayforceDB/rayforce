@@ -27,6 +27,7 @@
 #include "lang/format.h"    /* ray_type_name (error context) */
 #include "ops/rowsel.h"
 #include "store/enccol.h"
+#include "table/table.h"
 #include "ops/fused_group.h"
 #include "ops/idxop.h"
 #include "ops/hash.h"
@@ -3991,8 +3992,19 @@ ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
                      ray_type_name(accum->type), ray_type_name(partial->type));
 }
 
+/* Segment s of a parted slot without decoding: the encoded wrapper's
+ * segment object or the plain wrapper's segment. */
+static ray_t* parted_slot_seg(ray_t* tbl, int64_t c, int32_t s) {
+    ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
+    if (enc) return ray_enccol_seg(enc, s);
+    ray_t* w = ray_table_col_idx(tbl, c);               /* plain wrapper: no decode */
+    if (!w || RAY_IS_ERR(w) || !RAY_IS_PARTED(w->type) || s >= w->len) return NULL;
+    return ((ray_t**)ray_data(w))[s];
+}
+
 /* Build a flat table containing one segment's columns from a parted table.
- * For each parted column, extracts segs[seg_idx] as a flat vector.
+ * For each parted column, extracts segs[seg_idx] without decoding it (a
+ * generation-2 segment stays a RAY_ENCCOL until an operator needs it).
  * MAPCOMMON columns are materialized for segment seg_idx: the partition key
  * value is broadcast to fill seg_rows elements.
  * Non-parted columns are retained as-is. */
@@ -4004,21 +4016,21 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
     /* Find segment row count from first parted column */
     int64_t seg_rows = 0;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(parted_tbl, c);
-        if (col && RAY_IS_PARTED(col->type)) {
-            ray_t** segs = (ray_t**)ray_data(col);
-            if (seg_idx < col->len && segs[seg_idx])
-                seg_rows = segs[seg_idx]->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(parted_tbl, c, &m) && RAY_IS_PARTED(m.type)) {
+            ray_t* seg = seg_idx < m.n_segs ? parted_slot_seg(parted_tbl, c, seg_idx) : NULL;
+            if (seg) seg_rows = ray_table_col_nrows(seg);
             break;
         }
     }
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(parted_tbl, c);
-        ray_t* col = ray_table_get_col_idx(parted_tbl, c);
-        if (!col) continue;
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(parted_tbl, c, &m)) continue;
 
-        if (col->type == RAY_MAPCOMMON) {
+        if (m.type == RAY_MAPCOMMON) {
+            ray_t* col = ray_table_col_idx(parted_tbl, c);  /* MAPCOMMON: plain */
             /* Materialize partition key for this segment: broadcast key
              * value across seg_rows elements. */
             if (col->len < 2) {
@@ -4061,15 +4073,13 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
             if (flat->type == RAY_SYM) ray_sym_vec_adopt_domain(flat, kv);
             seg_tbl = ray_table_add_col(seg_tbl, name_id, flat);
             ray_release(flat);
-        } else if (RAY_IS_PARTED(col->type)) {
-            ray_t** segs = (ray_t**)ray_data(col);
-            if (seg_idx >= col->len || !segs[seg_idx]) {
+        } else if (RAY_IS_PARTED(m.type)) {
+            ray_t* seg = seg_idx < m.n_segs ? parted_slot_seg(parted_tbl, c, seg_idx) : NULL;
+            if (!seg) {
                 ray_release(seg_tbl);
                 return ray_error("schema", NULL);
             }
-            ray_retain(segs[seg_idx]);
-            seg_tbl = ray_table_add_col(seg_tbl, name_id, segs[seg_idx]);
-            ray_release(segs[seg_idx]);
+            seg_tbl = ray_table_add_col(seg_tbl, name_id, seg);   /* encoded or plain, not decoded */
         } else {
             /* Non-parted, non-MAPCOMMON column in a parted table:
              * streaming should have been rejected by ray_execute().
@@ -4327,14 +4337,14 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
     if (g->table) {
         bool has_flat = false;
         for (int64_t c = 0; c < ray_table_ncols(g->table); c++) {
-            ray_t* col = ray_table_get_col_idx(g->table, c);
-            if (!col) continue;
-            if (RAY_IS_PARTED(col->type)) {
+            ray_col_meta_t m;
+            if (!ray_table_col_meta_idx(g->table, c, &m)) continue;
+            if (RAY_IS_PARTED(m.type)) {
                 if (seg_count == 0)
-                    seg_count = (int32_t)col->len;
-                else if ((int32_t)col->len != seg_count)
+                    seg_count = (int32_t)m.n_segs;
+                else if ((int32_t)m.n_segs != seg_count)
                     return ray_error("schema", NULL);
-            } else if (col->type != RAY_MAPCOMMON) {
+            } else if (m.type != RAY_MAPCOMMON) {
                 has_flat = true;
             }
         }
@@ -4378,15 +4388,17 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
             int64_t ncols = ray_table_ncols(result);
             bool any_parted = false;
             for (int64_t c = 0; c < ncols; c++) {
-                ray_t* col = ray_table_get_col_idx(result, c);
-                if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+                ray_col_meta_t m;
+                if (ray_table_col_meta_idx(result, c, &m)
+                    && (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)) {
                     any_parted = true; break;
                 }
             }
             if (any_parted) {
                 ray_t* out = ray_table_new(ncols);
                 for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ncols; c++) {
-                    ray_t* col = ray_table_get_col_idx(result, c);
+                    ray_t* col = ray_table_col_idx(result, c);
+                    if (col && RAY_IS_ERR(col)) { ray_release(out); ray_release(result); return col; }
                     int64_t name = ray_table_col_name(result, c);
                     if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
                         ray_t* flat = flatten_parted_col(col);
@@ -4468,6 +4480,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         }
 
         g->table = saved_table;
+        ray_graph_unbind_table(g, seg_tbl);
         ray_release(seg_tbl);
 
         if (!partial || RAY_IS_ERR(partial)) {
@@ -4499,14 +4512,15 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         if (empty_tbl && !RAY_IS_ERR(empty_tbl)) {
             for (int64_t c = 0; c < ncols; c++) {
                 int64_t name_id = ray_table_col_name(saved_table, c);
-                ray_t* col = ray_table_get_col_idx(saved_table, c);
-                if (!col) continue;
-                int8_t base = col->type;
-                if (col->type == RAY_MAPCOMMON) {
+                ray_col_meta_t m;
+                if (!ray_table_col_meta_idx(saved_table, c, &m)) continue;
+                int8_t base = m.type;
+                if (m.type == RAY_MAPCOMMON) {
+                    ray_t* col = ray_table_col_idx(saved_table, c);
                     ray_t** mc = (ray_t**)ray_data(col);
                     base = mc[0] ? mc[0]->type : RAY_I64;
-                } else if (RAY_IS_PARTED(col->type)) {
-                    base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+                } else if (RAY_IS_PARTED(m.type)) {
+                    base = (int8_t)RAY_PARTED_BASETYPE(m.type);
                 }
                 ray_t* ecol = ray_vec_new(base, 0);
                 if (!ecol || RAY_IS_ERR(ecol)) {

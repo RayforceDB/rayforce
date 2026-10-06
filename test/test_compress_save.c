@@ -2818,6 +2818,79 @@ static test_result_t test_topk_bound(void) {
 /* The slice-group kernel's shape admission binds the product columns
  * (sg_shape_eligible through the early settle hook): the answer equals the
  * plain-sym table's and a failed bind is the query's error. */
+/* ---- Task 23: parted pruning happens before the fetch ---- */
+
+static test_result_t test_parted_pruning_fetch(void) {
+    for (int p = 0; p < 3; p++) {
+        char dir[256]; snprintf(dir, sizeof dir, CS_TMP "/pdb/2024.01.0%d/t", p + 1);
+        ray_t* t = plain_tbl(3000);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dir, NULL, RAY_COMPRESS_ON), RAY_OK);
+        ray_release(t);
+    }
+    ray_t* t = ray_read_parted(CS_TMP "/pdb", "t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_enc_counters_reset();
+    /* A streamable DAG over default-table scans (a const-table root never
+     * streams, so it could not exercise per-segment tables). */
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* d = ray_scan(g, "date");
+    ray_t* lit = ray_date(8767);                         /* 2024.01.02 */
+    ray_op_t* pred = ray_eq(g, d, ray_const_atom(g, lit));
+    ray_op_t* sum = ray_add(g, ray_scan(g, "a"), ray_scan(g, "b"));
+    ray_op_t* f = ray_filter(g, sum, pred);
+    ray_op_t* root = ray_optimize(g, f);
+    ray_t* out = ray_execute(g, root);
+    TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->len, 3000);
+    ray_enc_counters_t c; ray_enc_counters_get(&c);
+    /* columns a and b of the surviving partition, nothing else */
+    TEST_ASSERT_FMT(c.materialized == 2, "materialized %llu segment columns", (unsigned long long)c.materialized);
+    ray_release(out); ray_release(lit); ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
+/* The same pruned query on a generation-0 parted table: per-segment
+ * execution is unchanged (same rows, nothing decoded) and matches
+ * generation 2 value for value. */
+static ray_t* pruned_sum(ray_t* t) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* d = ray_scan(g, "date");
+    ray_t* lit = ray_date(8767);
+    ray_op_t* pred = ray_eq(g, d, ray_const_atom(g, lit));
+    ray_op_t* sum = ray_add(g, ray_scan(g, "a"), ray_scan(g, "b"));
+    ray_op_t* root = ray_optimize(g, ray_filter(g, sum, pred));
+    ray_t* out = ray_execute(g, root);
+    ray_release(lit); ray_graph_free(g);
+    return out;
+}
+
+static test_result_t test_parted_pruning_gen0(void) {
+    for (int p = 0; p < 3; p++) {
+        char d0[256], d2[256];
+        snprintf(d0, sizeof d0, CS_TMP "/p0/2024.01.0%d/t", p + 1);
+        snprintf(d2, sizeof d2, CS_TMP "/p2/2024.01.0%d/t", p + 1);
+        ray_t* t = plain_tbl(3000);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d0, NULL, RAY_COMPRESS_OFF), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d2, NULL, RAY_COMPRESS_ON), RAY_OK);
+        ray_release(t);
+    }
+    ray_t* t0 = ray_read_parted(CS_TMP "/p0", "t");
+    ray_t* t2 = ray_read_parted(CS_TMP "/p2", "t");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    ray_enc_counters_reset();
+    ray_t* o0 = pruned_sum(t0);
+    TEST_ASSERT_TRUE(o0 && !RAY_IS_ERR(o0));
+    ray_enc_counters_t c; ray_enc_counters_get(&c);
+    TEST_ASSERT_EQ_U(c.materialized, 0);
+    ray_t* o2 = pruned_sum(t2);
+    TEST_ASSERT_TRUE(o2 && !RAY_IS_ERR(o2));
+    TEST_ASSERT_EQ_I(o0->len, 3000);
+    TEST_ASSERT_EQ_I(o2->len, 3000);
+    TEST_ASSERT_TRUE(memcmp(ray_data(o0), ray_data(o2), 3000 * sizeof(int64_t)) == 0);
+    ray_release(o0); ray_release(o2); ray_release(t0); ray_release(t2);
+    PASS();
+}
+
 static test_result_t test_slice_group_bound(void) {
     TEST_ASSERT_STR_EQ(ev_code("(set SY ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh])"), "");
     TEST_ASSERT_STR_EQ(ev_code("(set KS (as 'SYM (at SY (% (til 4000) 8))))"), "");
@@ -2909,5 +2982,7 @@ const test_entry_t compress_entries[] = {
     { "compress/group_desc_bound",        test_group_desc_bound,        rt_setup, rt_teardown },
     { "compress/topk_bound",              test_topk_bound,              rt_setup, rt_teardown },
     { "compress/slice_group_bound",       test_slice_group_bound,       rt_setup, rt_teardown },
+    { "compress/parted_pruning_fetch",    test_parted_pruning_fetch,    rt_setup, rt_teardown },
+    { "compress/parted_pruning_gen0",     test_parted_pruning_gen0,     rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
