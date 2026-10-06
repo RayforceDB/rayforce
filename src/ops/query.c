@@ -14576,9 +14576,9 @@ by_dict_done:
      * deferred key WHERE runs AFTER the group (post_group_where_expr): that
      * filter drops result rows, so taking the first N groups before it would
      * under-fill the answer.  A PARTED input takes the hint too: the parted
-     * group keeps the first N groups in first-seen order (exec_group_parted
-     * declines its per-partition route, whose merge order is unspecified,
-     * and hands the hint to the flattened group).  Nor
+     * group keeps the first N groups in first-seen order (the per-partition
+     * route carries each group's first global row and keeps the N smallest;
+     * the flattened group takes the hint itself).  Nor
      * with a LIST-producing aggregate (top/bot): exec.c's HEAD/TAIL table trim
      * now retains LIST cells, but the group's LIST output has no reason to pay
      * a trim it can skip, and the take is a no-op there anyway. */

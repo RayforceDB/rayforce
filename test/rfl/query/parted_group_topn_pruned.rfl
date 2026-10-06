@@ -80,6 +80,11 @@
 (set r4 (runs))
 (- r3 r2) -- 0
 (- r4 r3) -- 0
+;; an unordered take keeps the per-partition route: each group carries its
+;; first global row, and the N smallest are kept in that order
+(eqt (u2 P) (u2 F)) -- true
+(set r5 (runs))
+(- r5 r4) -- 1
 
 ;; a tiny first partition, no pruning
 (set ns [1 2000 3 70000 10 3])

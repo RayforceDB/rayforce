@@ -9904,20 +9904,6 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * concat path, which applies g->selection over the flattened table. */
     if (g->selection && n_borrow == 0) can_partition = 0;
 
-    /* An unordered `take: N` (group_limit > 0) keeps the first N groups in
-     * first-seen order.  The merge re-groups the partials, whose group order
-     * is their route's (unspecified for the parallel strategies), so the
-     * per-partition route cannot name the first N.  The one exception is a
-     * group keyed only by the partition key: one group per partition, in
-     * partition order (the LIMIT pushdown in exec_group_per_partition). */
-    if (can_partition && group_limit > 0) {
-        for (uint32_t k = 0; k < n_keys; k++) {
-            ray_col_meta_t lm;
-            if (key_is_expr[k] || !ray_table_col_meta(parted_tbl, key_syms[k], &lm) ||
-                lm.type != RAY_MAPCOMMON) { can_partition = 0; break; }
-        }
-    }
-
     /* Cardinality gate: estimate groups from a sample partition.
      * Per-partition only wins when #groups << partition_size.  The sample is
      * the first partition holding more than one row: a pruned source keeps a
@@ -16368,6 +16354,57 @@ static inline int64_t grp_sorted_lower_bound(const int64_t* a, int64_t n,
     return lo;
 }
 
+/* The rows of `result` holding the `n` smallest values of its I64 column
+ * `ci` (distinct global first-row ids), ordered by that value: an owned
+ * table, or an owned error.  A bounded max-heap keeps the selection
+ * O(rows log n). */
+static ray_t* grp_keep_first_rows(ray_t* result, int64_t ci, int64_t n) {
+    ray_t* col = ray_table_col_idx(result, ci);
+    if (!col) return ray_error("domain", "group: first-row slot missing");
+    if (RAY_IS_ERR(col)) return col;
+    if (col->type != RAY_I64) return ray_error("type", "group: first-row slot is %s", ray_type_name(col->type));
+    int64_t rows = col->len;
+    if (n > rows) n = rows;
+    const int64_t* v = (const int64_t*)ray_data(col);
+    ray_t* idx = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+    if (!idx || RAY_IS_ERR(idx)) return idx ? idx : ray_error("oom", NULL);
+    int64_t* h = (int64_t*)ray_data(idx);         /* max-heap of row indices by v */
+    int64_t hn = 0;
+    for (int64_t r = 0; r < rows && n > 0; r++) {
+        if (hn < n) {
+            int64_t i = hn++;
+            h[i] = r;
+            while (i > 0 && v[h[(i - 1) / 2]] < v[h[i]]) {
+                int64_t pi = (i - 1) / 2, t = h[pi]; h[pi] = h[i]; h[i] = t; i = pi;
+            }
+        } else if (v[r] < v[h[0]]) {
+            h[0] = r;
+            for (int64_t i = 0;;) {
+                int64_t l = 2 * i + 1, rr = l + 1, m = i;
+                if (l < hn && v[h[l]] > v[h[m]]) m = l;
+                if (rr < hn && v[h[rr]] > v[h[m]]) m = rr;
+                if (m == i) break;
+                int64_t t = h[m]; h[m] = h[i]; h[i] = t; i = m;
+            }
+        }
+    }
+    /* heap order -> ascending: repeatedly move the max to the end */
+    for (int64_t end = hn - 1; end > 0; end--) {
+        int64_t t = h[0]; h[0] = h[end]; h[end] = t;
+        for (int64_t i = 0;;) {
+            int64_t l = 2 * i + 1, rr = l + 1, m = i;
+            if (l < end && v[h[l]] > v[h[m]]) m = l;
+            if (rr < end && v[h[rr]] > v[h[m]]) m = rr;
+            if (m == i) break;
+            int64_t t2 = h[m]; h[m] = h[i]; h[i] = t2; i = m;
+        }
+    }
+    idx->len = hn;
+    ray_t* out = ray_at_fn(result, idx);
+    ray_release(idx);
+    return out ? out : ray_error("oom", NULL);
+}
+
 /* Release a per-partition sub-table: its expression keys / agg inputs were
  * evaluated on the outer graph (exec_node with g->table swapped), which
  * bound the sub-table's columns there; drop those binds with it, or each
@@ -16440,7 +16477,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         else if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
                  aop == OP_VAR || aop == OP_VAR_POP) n_std++;
     }
-    uint32_t part_n_aggs_max = n_aggs + n_avg + 2 * n_std;
+    uint32_t part_n_aggs_max = n_aggs + n_avg + 2 * n_std + 1;   /* + the first-row slot */
 
     size_t key_n = n_keys ? n_keys : 1;             /* min-1 guarded */
     size_t agg_n = n_aggs ? n_aggs : 1;
@@ -16623,6 +16660,23 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         part_ops[part_n_aggs++] = OP_COUNT;
     }
 
+    /* First-row slot: an unordered `take: N` (group_limit > 0) keeps the
+     * first N groups in first-seen order.  Each partial carries the MIN of
+     * a hidden column of global row ids (partition offset + local row, over
+     * the rows the partition's selection keeps); the merge takes the MIN,
+     * and the finished result keeps the N groups with the smallest first
+     * row, in that order (the dense first-N path's rule).  A group keyed
+     * only by the partition key needs none: the LIMIT pushdown above. */
+    int64_t frow_sym = -1;
+    uint32_t frow_slot = 0;
+    if (group_limit > 0 && n_part_keys > 0) {
+        frow_sym = ray_sym_intern("_gprow", 6);
+        ray_col_meta_t fm_;
+        if (ray_table_col_meta(parted_tbl, frow_sym, &fm_)) goto pp_cleanup;   /* a real column has the name */
+        frow_slot = part_n_aggs;
+        part_ops[part_n_aggs++] = OP_MIN;
+    }
+
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
      * FIRST→FIRST, LAST→LAST, all appended slots → SUM */
     for (uint32_t a = 0; a < part_n_aggs; a++) {
@@ -16650,6 +16704,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     /* COUNT slots for STDDEV/VAR */
     for (uint32_t i = 0; i < n_std; i++)
         part_agg_syms[std_cnt_slot[i]] = agg_syms[std_idx[i]];
+    if (frow_sym >= 0) part_agg_syms[frow_slot] = frow_sym;
+    int64_t frow_base = 0;   /* global row id of the partition's first row (no selection) */
 
     /* ---- Batched incremental merge ----
      * Process partitions in batches of MERGE_BATCH.  After each batch:
@@ -16730,7 +16786,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * unchanged.  (unique_agg's key/agg dedup is subsumed by
              * borrow_syms, which is already deduplicated.) */
             (void)unique_agg;
-            ray_t* sub = ray_table_new((int64_t)(n_borrow + n_keys + n_aggs));
+            ray_t* sub = ray_table_new((int64_t)(n_borrow + n_keys + n_aggs + 1));
             if (!sub || RAY_IS_ERR(sub)) goto batch_fail;
 
             int64_t part_nrows = -1;
@@ -16782,6 +16838,23 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 }
                 sub = ray_table_add_col(sub, agg_syms[a], v);
                 ray_release(v);
+            }
+
+            if (frow_sym >= 0) {
+                int64_t base = saved_sel ? part_off[p] : frow_base;
+                int64_t nr = part_nrows > 0 ? part_nrows : 0;
+                ray_t* ids = ray_vec_new(RAY_I64, nr > 0 ? nr : 1);
+                if (!ids || RAY_IS_ERR(ids)) {
+                    if (ids) ray_error_free(ids);
+                    pp_release_sub(g, sub); goto batch_fail;
+                }
+                ids->len = nr;
+                int64_t* idv = (int64_t*)ray_data(ids);
+                for (int64_t r = 0; r < nr; r++) idv[r] = base + r;
+                frow_base += nr;
+                sub = ray_table_add_col(sub, frow_sym, ids);
+                ray_release(ids);
+                if (!sub || RAY_IS_ERR(sub)) { if (sub) ray_error_free(sub); goto batch_fail; }
             }
 
             ray_graph_t* pg = ray_graph_new(sub);
@@ -17104,11 +17177,25 @@ batch_fail:
         goto pp_cleanup;
     }
 
+    /* First-row slot: keep the group_limit groups with the smallest first
+     * row, ordered by it (first-seen order). */
+    if (frow_sym >= 0) {
+        ray_t* kept = grp_keep_first_rows(result, (int64_t)n_keys + frow_slot, group_limit);
+        if (!kept || RAY_IS_ERR(kept)) {
+            ray_release(result);
+            if (merge_tbl) ray_release(merge_tbl);
+            ret = kept;
+            goto pp_cleanup;
+        }
+        ray_release(result);
+        result = kept;
+    }
+
     int64_t rncols = ray_table_ncols(result);
 
     /* AVG/STDDEV post-processing: build trimmed table (n_keys + n_aggs cols),
      * computing final AVG = SUM/COUNT and STDDEV/VAR from SUM, SUM_SQ, COUNT. */
-    if (has_avg || has_stddev) {
+    if (has_avg || has_stddev || frow_sym >= 0) {   /* drops the decomposed and hidden slots */
         ray_t* trimmed = ray_table_new((int64_t)(n_keys + n_aggs));
         if (!trimmed || RAY_IS_ERR(trimmed)) {
             ray_release(result);

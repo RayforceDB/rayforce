@@ -6448,8 +6448,8 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
  * the shape or the data is not one the pre-pass serves (the caller then runs
  * the full aggregation). */
 static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
-                              ray_t** key_cols, ray_t* sel, int64_t n_sel,
-                              int64_t group_limit) {
+                              ray_t** key_cols, ray_t* sel, const int64_t* sel_prefix,
+                              int64_t n_sel, int64_t group_limit) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_pool_t* pool = ray_pool_get();
     int64_t eff_n = sel ? n_sel : nrows;
@@ -6525,7 +6525,7 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
                 kv[k] = agg_read_key_i64(key_cols[k], key_data[k], i * step);
             if (agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), false) >= 0) hits++;
         }
-        if (hits * AGG_FIRSTN_SHARE > samples) goto done;
+        if (hits * AGG_FIRSTN_SHARE > samples) goto heavy;
     }
 
     /* 2. the selected rows of those groups, in row order: each task keeps its
@@ -6554,7 +6554,7 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
         if (counts[t] > AGG_FIRSTN_LOCAL) spilled = true;
         m += counts[t];
     }
-    if (m * (AGG_FIRSTN_SHARE / 2) > eff_n) goto done;   /* the sample missed a heavy group */
+    if (m * (AGG_FIRSTN_SHARE / 2) > eff_n) goto heavy;  /* the sample missed a heavy group */
     idx = ray_alloc_raw((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
     if (!idx) { res = ray_error("oom", NULL); goto done; }
     if (spilled) {
@@ -6582,29 +6582,68 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     firstn_nested = true;
     sub = exec_group_v2_run(g, op, compact, m, NULL, NULL, 0, set.n, NULL);
     firstn_nested = false;
+    goto pick;
+
+heavy:
+    /* The N groups hold a large share of the rows: aggregating only them
+     * costs about what aggregating everything does.  Run the unbounded
+     * group (the bounded emit keeps every group's first row and declines
+     * the dense routes) and pick the N groups of the set from its result. */
+    firstn_nested = true;
+    sub = exec_group_v2_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, 0, NULL);
+    firstn_nested = false;
+
+pick:
     if (!sub || RAY_IS_ERR(sub)) { res = sub ? sub : ray_error("oom", NULL); sub = NULL; goto done; }
 
     /* 3. first-seen order: the rank of every emitted group in the set.  The
-     * bounded emit already yields it; any other order is put right here. */
-    if (sub->type != RAY_TABLE || ray_table_nrows(sub) != set.n ||
+     * bounded emit already yields it; any other order is put right here;
+     * the unbounded run's other groups are dropped. */
+    int64_t sub_rows = sub->type == RAY_TABLE ? ray_table_nrows(sub) : -1;
+    if (sub->type != RAY_TABLE || sub_rows < set.n || (compact && sub_rows != set.n) ||
         ray_table_ncols(sub) < (int64_t)n_keys)
         goto done;                             /* unexpected shape: full run */
     perm = ray_alloc_raw((size_t)set.n * sizeof(int64_t));
     if (!perm) { res = ray_error("oom", NULL); goto done; }
     for (int64_t r = 0; r < set.n; r++) perm[r] = -1;
-    bool identity = true;
-    for (int64_t r = 0; r < set.n; r++) {
-        for (uint32_t k = 0; k < n_keys; k++) {
-            ray_t* oc = ray_table_col_idx(sub, k);
-            if (oc && RAY_IS_ERR(oc)) { res = oc; goto done; }
-            if (!oc || oc->type != key_cols[k]->type) goto done;
-            kv[k] = agg_read_key_i64(oc, ray_data(oc), r);
-        }
-        int64_t rk = agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), false);
-        if (rk < 0 || perm[rk] >= 0) goto done;
-        perm[rk] = r;
-        if (rk != r) identity = false;
+    bool identity = sub_rows == set.n;
+    ray_t* okc[16];
+    if (n_keys > 16) goto done;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        okc[k] = ray_table_col_idx(sub, k);
+        if (okc[k] && RAY_IS_ERR(okc[k])) { res = okc[k]; goto done; }
+        if (!okc[k] || okc[k]->type != key_cols[k]->type) goto done;
     }
+    int64_t found = 0;
+    {
+        /* hash the result's key columns a block at a time; only bloom hits
+         * read the tuple and probe the set */
+        uint64_t hb[1024];
+        const void* okd[16];
+        for (uint32_t k = 0; k < n_keys; k++) okd[k] = ray_data(okc[k]);
+        uint32_t bshift = 64 - bbits;
+        for (int64_t b0 = 0; b0 < sub_rows; b0 += 1024) {
+            int64_t len = sub_rows - b0 < 1024 ? sub_rows - b0 : 1024;
+            for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
+            for (uint32_t k = 0; k < n_keys; k++) agg_firstn_hash_block(hb, okc[k], okd[k], b0, len);
+            for (int64_t i = 0; i < len; i++) {
+                int64_t r = b0 + i;
+                uint64_t hv = AGG_FIRSTN_FINAL(hb[i]);
+                uint64_t bit = hv >> bshift;
+                int64_t rk = -1;
+                if ((set.bloom[bit >> 6] >> (bit & 63)) & 1) {
+                    for (uint32_t k = 0; k < n_keys; k++) kv[k] = agg_read_key_i64(okc[k], okd[k], r);
+                    rk = agg_firstn_probe(&set, kv, hv, false);
+                }
+                if (rk < 0) { if (compact) goto done; continue; }   /* a group not in the set */
+                if (perm[rk] >= 0) goto done;
+                perm[rk] = r;
+                found++;
+                if (rk != r) identity = false;
+            }
+        }
+    }
+    if (found != set.n) goto done;
     if (identity) { res = sub; sub = NULL; }
     else {
         ray_t* pv = ray_vec_new(RAY_I64, set.n);
@@ -6693,7 +6732,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     /* Unordered take: N — find the N groups first, aggregate only them. */
     if (group_limit > 0 && !efp) {
-        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, n_sel, group_limit);
+        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, sel_prefix, n_sel, group_limit);
         if (fr) { scratch_free(kc_hdr); return fr; }
     }
 
