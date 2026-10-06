@@ -682,7 +682,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
         if (c <= 0) return c;
-        int64_t body = ray_ser_raw(buf + c, slots[1]); /* body */   /* not-a-table */
+        int64_t body = ray_ser_raw(buf + c, slots[1]);   /* not-a-table */ /* body */
         if (body <= 0) return body;
         c += body;
         if (LAMBDA_CLOSURE(obj)) {

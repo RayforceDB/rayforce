@@ -113,7 +113,7 @@ static void check_raw_list(const char* p, const char* rel, srccheck_acc_t* acc) 
     while (fgets(line, sizeof line, f)) {
         ln++;
         if (!raw_list_hit(line)) continue;
-        if (strstr(line, "not-a-table") || strstr(line, "plain-table")) continue;
+        if (strstr(line, "/* not-a-table */") || strstr(line, "/* plain-table */")) continue;
         if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d reads slot [1] unmarked", rel, ln);
         acc->nbad++;
     }

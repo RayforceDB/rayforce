@@ -5256,11 +5256,14 @@ static test_result_t test_select_planning_no_materialize(void) {
         "(select {from: u where: (> k 2)})",
         "(select {s: (sum v) from: u by: k})",
         "(select {from: u where: (in k [1 3 5])})",
-        "(select {n: (count k) from: u where: (== s \"a\")})",
+        "(select {from: u where: (== s \"a\")})",           /* a scalar reduction or group-by under a filter pre-executes it in query.c, never reaching ray_execute */
         "(select {s: (sum v) from: w})",                /* 70000 rows: CHUNK_ZONE recorded */
         NULL,
     };
     for (int i = 0; qs[i]; i++) {
+        /* a fresh table per query: a column decoded by an earlier one stays cached */
+        TEST_ASSERT_STR_EQ(ev_code("(set u (.db.splayed.get \"" CS_TMP "/sp\"))"), "");
+        TEST_ASSERT_STR_EQ(ev_code("(set w (.db.splayed.get \"" CS_TMP "/spz\"))"), "");
         ray_enc_counters_reset();
         ray_t* r = ray_eval_str(qs[i]);
         TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "query %d: %s", i, r ? ray_err_code(r) : "null");
