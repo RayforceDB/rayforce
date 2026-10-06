@@ -3028,6 +3028,149 @@ static test_result_t test_topk_bound(void) {
     PASS();
 }
 
+
+/* ---- Task 27: executor, filter, sort, window, pivot sites ---- */
+
+/* `n` rows of a (generation 2, 3 i) and b (generation 0, 5 i); with `corrupt`
+ * the descriptor of a's first vector is damaged after the load checks pass,
+ * so a loads and fails to materialize. */
+static ray_t* ex_table(int64_t n, bool corrupt) {
+    char p[256];
+    (void)ray_test_rm_rf(CS_TMP "/ex");
+    (void)ray_test_mkdir_p(CS_TMP "/ex");
+    ray_t* a = i64_col(n, 3); ray_t* b = i64_col(n, 5);
+    snprintf(p, sizeof p, "%s/ex/a", CS_TMP); ray_col_save_gen(a, p, 2);
+    snprintf(p, sizeof p, "%s/ex/b", CS_TMP); ray_col_save_gen(b, p, 0);
+    ray_release(a); ray_release(b);
+    ray_t* names = ray_vec_new(RAY_STR, 2);
+    names = ray_str_vec_append(names, "a", 1); names = ray_str_vec_append(names, "b", 1);
+    snprintf(p, sizeof p, "%s/ex/.d", CS_TMP); ray_col_save(names, p); ray_release(names);
+    if (corrupt) {
+        int64_t n_chunks = (n + 65535) / 65536;
+        FILE* f = fopen(CS_TMP "/ex/a", "r+b");
+        fseek(f, (long)(96 + 64 * n_chunks + 6), SEEK_SET); fputc(1, f); fclose(f);
+    }
+    return ray_read_splayed(CS_TMP "/ex", NULL);
+}
+
+static test_result_t ex_corrupt(ray_t* r, const char* what) {
+    TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", what);
+    TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s (%s)", what, ray_err_code(r),
+                    ray_error_msg() ? ray_error_msg() : "no message");
+    TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), CS_TMP "/ex/a"), "%s: message %s", what,
+                    ray_error_msg() ? ray_error_msg() : "(none)");
+    ray_error_free(r);
+    PASS();
+}
+
+typedef enum { EX_HEAD, EX_TAIL, EX_FILTER, EX_FILTER_SOME, EX_SORT_B, EX_SORT_A, EX_TOPK_B,
+               EX_PIVOT, EX_WINDOW_FN_A, EX_SELECT_PASS, EX_WINDOW_PASS, EX_MERGE, EX_FILTER_NONE,
+               EX_HEAD_FILTER, EX_EAGER_FILTER, EX_N } ex_case_t;
+
+static ray_t* ex_run(ray_t* t, ex_case_t k) {
+    if (k == EX_MERGE) return ray_result_merge(t, t);
+    if (k == EX_EAGER_FILTER) {                   /* the eager gather: the lazy path never reaches it over a table */
+        int64_t n = ray_table_nrows(t);
+        ray_t* pred = ray_vec_new(RAY_BOOL, n); pred->len = n;
+        for (int64_t i = 0; i < n; i++) ((uint8_t*)ray_data(pred))[i] = i % 3 != 0;
+        ray_error_clear();
+        ray_t* r = exec_filter(NULL, NULL, t, pred);
+        ray_release(pred);
+        return r;
+    }
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* tb = ray_const_table(g, t);
+    ray_op_t* sb = ray_scan(g, "b");
+    ray_op_t* root = NULL;
+    uint8_t nf0[1] = { 0 }, d0[1] = { 0 };
+    switch (k) {
+    case EX_HEAD:  root = ray_head(g, tb, 5); break;
+    case EX_TAIL:  root = ray_tail(g, tb, 5); break;
+    case EX_FILTER: root = ray_filter(g, tb, ray_ge(g, sb, ray_const_i64(g, 5))); break;
+    case EX_HEAD_FILTER: root = ray_head(g, ray_filter(g, tb, ray_gt(g, sb, ray_const_i64(g, 50))), 4); break;
+    case EX_FILTER_SOME: root = ray_filter(g, tb, ray_gt(g, sb, ray_const_i64(g, 500))); break;
+    case EX_FILTER_NONE: root = ray_filter(g, tb, ray_lt(g, sb, ray_const_i64(g, -1))); break;
+    case EX_SORT_B: { ray_op_t* ks[1] = { sb }; root = ray_sort_op(g, tb, ks, d0, nf0, 1); break; }
+    case EX_SORT_A: { ray_op_t* ks[1] = { ray_scan(g, "a") }; root = ray_sort_op(g, tb, ks, d0, nf0, 1); break; }
+    case EX_TOPK_B: { ray_op_t* ks[1] = { sb }; root = ray_head(g, ray_sort_op(g, tb, ks, d0, nf0, 1), 3); break; }
+    case EX_PIVOT: { ray_op_t* ix[1] = { sb };
+                     root = ray_pivot_op(g, ix, 1, ray_scan(g, "a"), sb, OP_SUM); break; }
+    case EX_WINDOW_FN_A: case EX_WINDOW_PASS: {
+        ray_op_t* ord[1] = { sb };
+        uint8_t kinds[1] = { RAY_WIN_SUM };
+        ray_op_t* fin[1] = { k == EX_WINDOW_FN_A ? ray_scan(g, "a") : sb };
+        int64_t prm[1] = { 0 };
+        root = ray_window_op(g, tb, NULL, 0, ord, d0, 1, kinds, fin, prm, 1, RAY_FRAME_ROWS,
+                             RAY_BOUND_UNBOUNDED_PRECEDING, RAY_BOUND_UNBOUNDED_FOLLOWING, 0, 0);
+        break; }
+    case EX_SELECT_PASS: { ray_op_t* cs[2] = { ray_scan(g, "a"), sb }; root = ray_select_op(g, tb, cs, 2); break; }
+    default: break;
+    }
+    ray_error_clear();
+    ray_t* r = root ? ray_execute(g, root) : NULL;
+    ray_graph_free(g);
+    return r;
+}
+
+/* Every executor, filter, sort, window and pivot site that reads a column
+ * reports a failed materialization as itself (code and column path); the
+ * sites that only pass or measure a column never decode it. */
+static test_result_t ex_failed_decode_one(int64_t n, bool big) {
+    static const char* const names[EX_N] = { "head", "tail", "filter", "filter-some", "sort-b", "sort-a",
+        "top-k-b", "pivot", "window-fn-a", "select-pass", "window-pass", "result-merge", "filter-none",
+        "head-filter", "eager-filter" };
+    int64_t sa = ray_sym_intern("a", 1);
+    for (int k = 0; k < EX_N; k++) {
+        if (big && k != EX_FILTER && k != EX_FILTER_SOME && k != EX_SORT_B && k != EX_EAGER_FILTER) continue;
+        ray_t* t = ex_table(n, true);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_enc_counters_reset();
+        ray_t* r = ex_run(t, (ex_case_t)k);
+        if (k == EX_SELECT_PASS || k == EX_WINDOW_PASS || k == EX_FILTER_NONE) {
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE, "%s: expected a table", names[k]);
+            ray_enc_counters_t c; ray_enc_counters_get(&c);
+            if (k == EX_FILTER_NONE) {
+                TEST_ASSERT_FMT(ray_table_nrows(r) == 0 && ray_table_ncols(r) == 2, "%s: schema", names[k]);
+            } else {
+                TEST_ASSERT_FMT(ray_table_get_col_enc(r, sa) != NULL, "%s: a is passed encoded", names[k]);
+                TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", names[k], (unsigned long long)c.materialized);
+            }
+            ray_release(r);
+        } else {
+            test_result_t rr = ex_corrupt(r, names[k]);
+            if (rr.status != TEST_PASS) { ray_release(t); return rr; }
+        }
+        ray_release(t);
+    }
+    PASS();
+}
+
+static test_result_t test_exec_sites_failed_decode(void) {
+    test_result_t r = ex_failed_decode_one(3000, false);
+    if (r.status != TEST_PASS) return r;
+    return ex_failed_decode_one(600000, true);        /* the parallel gather */
+}
+
+/* A healthy generation-2 table gives the same answers as the plain one at
+ * every site above. */
+static test_result_t test_exec_sites_gen2_equal(void) {
+    ray_t* t2 = ex_table(3000, false);
+    TEST_ASSERT_TRUE(t2 && !RAY_IS_ERR(t2));
+    ray_t* t0 = ray_table_new(2);
+    t0 = ray_table_add_col(t0, ray_sym_intern("a", 1), i64_col(3000, 3));
+    t0 = ray_table_add_col(t0, ray_sym_intern("b", 1), i64_col(3000, 5));
+    for (int k = 0; k < EX_N; k++) {
+        if (k == EX_PIVOT || k == EX_MERGE || k == EX_EAGER_FILTER) continue;
+        ray_t* r2 = ex_run(t2, (ex_case_t)k);
+        ray_t* r0 = ex_run(t0, (ex_case_t)k);
+        TEST_ASSERT_FMT(r2 && r0 && !RAY_IS_ERR(r2) && !RAY_IS_ERR(r0), "case %d", k);
+        TEST_ASSERT_FMT(cp_fmt_same(r0, r2), "case %d rows differ", k);
+        ray_release(r2); ray_release(r0);
+    }
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
 /* ---- Task 23: pruned parted execution ---- */
 
 /* Three partitions 2024.01.01..03 (dates 8766..8768).  Partition p holds a =
@@ -3342,5 +3485,7 @@ const test_entry_t compress_entries[] = {
     { "compress/parted_pruning_multi",    test_parted_pruning_multi,    rt_setup, rt_teardown },
     { "compress/parted_pruning_failure",  test_parted_pruning_failure,  rt_setup, rt_teardown },
     { "compress/parted_pruning_mixed",    test_parted_pruning_mixed,    rt_setup, rt_teardown },
+    { "compress/exec_sites_failed_decode", test_exec_sites_failed_decode, rt_setup, rt_teardown },
+    { "compress/exec_sites_gen2_equal",    test_exec_sites_gen2_equal,    rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

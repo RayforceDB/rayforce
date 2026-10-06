@@ -3350,8 +3350,9 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
 static bool table_has_parted_col(ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) &&
+            (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON))
             return true;
     }
     return false;
@@ -3366,8 +3367,9 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
     ray_t* result = ray_table_new(ncols);
     if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result; }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
+        ray_t* src = ray_table_col_idx(tbl, c);
         int64_t name = ray_table_col_name(tbl, c);
+        if (src && RAY_IS_ERR(src)) { ray_release(idx); ray_release(result); return src; }
         if (!src) continue;
         ray_t* dst;
         if (src->type == RAY_LIST) {
@@ -3412,8 +3414,8 @@ ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
     if (k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (src && src->type == RAY_LIST) return NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_LIST) return NULL;
     }
 
     ray_t* idx = topk_indices_single(col, desc, nf, nrows, k);
@@ -3439,8 +3441,8 @@ ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
     if (k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (src && src->type == RAY_LIST) return NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_LIST) return NULL;
     }
     for (uint8_t i = 0; i < n_keys; i++)
         if (!key_cols[i] || key_cols[i]->len < nrows) return NULL;
@@ -3577,7 +3579,8 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
  * POSITION: the projection names scans by their source column and
  * expressions `_e<c>`, so a hidden key or a renamed output can share a
  * name with another projected column and a name lookup would read the
- * wrong one.  Any other key resolves by name.  Borrowed. */
+ * wrong one.  Any other key resolves by name.  Borrowed; NULL when absent,
+ * an owned error when an encoded column fails to materialize. */
 static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 uint32_t key_id, int64_t key_sym) {
     ray_op_t* child = g ? op_child(g, op, 0) : NULL;
@@ -3587,9 +3590,9 @@ static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             (int64_t)se->sort.n_cols == ray_table_ncols(tbl))
             for (uint32_t c = 0; c < se->sort.n_cols; c++)
                 if (se->sort.columns[c] == key_id)
-                    return ray_table_get_col_idx(tbl, c);
+                    return ray_table_col_idx(tbl, c);
     }
-    return ray_table_get_col(tbl, key_sym);
+    return ray_table_col(tbl, key_sym);
 }
 
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
@@ -3624,6 +3627,11 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
             ray_op_ext_t* key_ext = find_ext(g, key_op->id);
             if (key_ext && key_ext->base.opcode == OP_SCAN) {
                 key_cols[k] = sort_key_scan_col(g, op, tbl, key_op->id, key_ext->sym);
+                if (key_cols[k] && RAY_IS_ERR(key_cols[k])) {
+                    /* the full sort below re-reads the key and reports it */
+                    ray_error_free(key_cols[k]);
+                    key_cols[k] = NULL;
+                }
                 if (!key_cols[k]) { all_scan = 0; break; }
             } else {
                 all_scan = 0;
@@ -3781,8 +3789,20 @@ sort_idx_ready:;
     ray_t* new_cols[ncols];
     int64_t col_names[ncols];
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t j = 0; j < c; j++)
+                if (new_cols[j]) ray_release(new_cols[j]);
+            ray_release(result);
+            if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            for (uint32_t k = 0; k < n_sort; k++)
+                if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
+                    ray_release(sort_vecs[k]);
+            scratch_free(sort_hdr);
+            ray_release(idx_vec);
+            return col;
+        }
         if (!col) { new_cols[c] = NULL; continue; }
         ray_t* nc;
         if (col->type == RAY_LIST) {
@@ -3860,7 +3880,7 @@ sort_idx_ready:;
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, base);
+            ray_t* col = ray_table_col_idx(tbl, base);   /* cached by the pass above */
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -3889,7 +3909,7 @@ sort_idx_ready:;
     /* Propagate str_pool / null bitmaps from source columns */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);   /* cached by the pass above */
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         /* Gather null bits in sorted order */
@@ -4220,7 +4240,11 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
     }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t cn = ray_table_col_name(tbl, c);
-        ray_t* col = (cn == key_id) ? stamped : ray_table_get_col_idx(tbl, c);
+        ray_t* col = stamped;
+        if (cn != key_id) {
+            col = ray_table_get_col_enc_idx(tbl, c);
+            if (!col) col = ray_table_col_idx(tbl, c);
+        }
         out = ray_table_add_col(out, cn, col);
         if (!out || RAY_IS_ERR(out)) {
             ray_release(stamped);
@@ -4287,7 +4311,12 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     /* Resolve key columns */
     for (int64_t i = 0; i < n_keys; i++) {
-        key_cols[i] = ray_table_get_col(tbl, key_ids[i]);
+        key_cols[i] = ray_table_col(tbl, key_ids[i]);
+        if (key_cols[i] && RAY_IS_ERR(key_cols[i])) {
+            ray_t* err = key_cols[i];
+            scratch_free(k_hdr);
+            return err;
+        }
         if (!key_cols[i]) {
             scratch_free(k_hdr);
             return ray_error("domain", "xasc/xdesc: key column not found in table");
@@ -4384,8 +4413,18 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     for (int64_t c = 0; c < ncols; c++) new_cols[c] = NULL;
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t j = 0; j < c; j++)
+                if (new_cols[j]) ray_release(new_cols[j]);
+            scratch_free(nc_hdr);
+            scratch_free(cn_hdr);
+            if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            scratch_free(k_hdr);
+            ray_release(idx);
+            return col;
+        }
         if (!col) continue;
         ray_t* nc;
         if (col->type == RAY_LIST)
@@ -4453,7 +4492,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, base);
+            ray_t* col = ray_table_col_idx(tbl, base);   /* cached by the pass above */
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -4484,7 +4523,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * gather_by_idx. */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);   /* cached by the pass above */
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         bool src_has_nulls = ray_vec_may_have_nulls(col);

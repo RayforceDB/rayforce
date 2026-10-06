@@ -217,8 +217,9 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(input, c);
-        if (!col || RAY_IS_ERR(col)) continue;
+        ray_t* col = ray_table_col_idx(input, c);
+        if (col && RAY_IS_ERR(col)) { ray_release(tbl); return col; }
+        if (!col) continue;
         int64_t name_id = ray_table_col_name(input, c);
         if (col->type == RAY_MAPCOMMON) {
             ray_t* mc_filt = materialize_mapcommon_filter(col, pred, pass_count);
@@ -478,11 +479,21 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     ray_t* new_cols[ncols];
     int64_t col_names[ncols];
 
+    ray_t* src_cols[ncols];   /* borrowed: the plain columns read below */
+
     bool has_parted_cols = false;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(input, c);
+        ray_t* col = ray_table_col_idx(input, c);
         col_names[c] = ray_table_col_name(input, c);
-        if (!col || RAY_IS_ERR(col)) { new_cols[c] = NULL; continue; }
+        src_cols[c] = col;
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t k = 0; k < c; k++)
+                if (new_cols[k]) ray_release(new_cols[k]);
+            scratch_free(idx_hdr);
+            ray_release(tbl);
+            return col;
+        }
+        if (!col) { new_cols[c] = NULL; continue; }
         if (col->type == RAY_MAPCOMMON) {
             /* Materialize MAPCOMMON through filter predicate */
             new_cols[c] = materialize_mapcommon_filter(col, pred, pass_count);
@@ -521,7 +532,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
      * here and skipped there. */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(input, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         if (col->type == RAY_LIST) {
             ray_t** d = (ray_t**)ray_data(new_cols[c]);
@@ -547,7 +558,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         /* Parted-aware gather: use parted_gather_col for parted columns,
          * sequential flat gather for non-parted columns */
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(input, c);
+            ray_t* col = src_cols[c];
             if (!col || !new_cols[c]) continue;
             if (col->type == RAY_MAPCOMMON) continue; /* already materialized */
             if (col->type == RAY_LIST || parted_base_is_list(col))
@@ -575,7 +586,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
-            ray_t* col = ray_table_get_col_idx(input, c);
+            ray_t* col = src_cols[c];
             if (col && col->type == RAY_MAPCOMMON) continue; /* already materialized */
             if (col && col->type == RAY_LIST) continue; /* gathered above with retain */
             int64_t ci = mgctx.ncols;
@@ -593,7 +604,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     } else {
         /* Sequential gather with index */
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(input, c);
+            ray_t* col = src_cols[c];
             if (!col || !new_cols[c]) continue;
             if (col->type == RAY_LIST) continue; /* gathered above with retain */
             uint8_t esz = col_esz(col);
@@ -612,7 +623,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
      * singleton). */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(input, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         if (col->type == RAY_LIST || parted_base_is_list(col))
             continue;  /* elements gathered+retained; no str-pool to touch */
@@ -717,8 +728,9 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     if (!tbl || RAY_IS_ERR(tbl)) { scratch_free(idx_hdr); return tbl; }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(input, c);
+        ray_t* col = ray_table_col_idx(input, c);
         int64_t name_id = ray_table_col_name(input, c);
+        if (col && RAY_IS_ERR(col)) { scratch_free(idx_hdr); ray_release(tbl); return col; }
         if (!col) continue;
         if (col->type == RAY_MAPCOMMON) {
             ray_t* mc = materialize_mapcommon_gather(col, match_idx, found);
@@ -913,17 +925,19 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             if (use_keep &&
                 !sel_compact_keep(ray_table_col_name(tbl, c), keep_syms, keep_n))
                 continue;
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            if (!col) continue;
-            if (col->type == RAY_MAPCOMMON) {
+            ray_col_meta_t cm;
+            if (!ray_table_col_meta_idx(tbl, c, &cm)) continue;
+            if (cm.type == RAY_MAPCOMMON) {
+                ray_t* col = ray_table_col_idx(tbl, c);
+                if (!col || RAY_IS_ERR(col)) { ray_release(empty); return col; }
                 ray_t* mc = materialize_mapcommon_head(col, 0);
                 if (!mc || RAY_IS_ERR(mc)) { ray_release(empty); return mc; }
                 empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), mc);
                 ray_release(mc);
                 continue;
             }
-            int8_t ct = RAY_IS_PARTED(col->type)
-                      ? (int8_t)RAY_PARTED_BASETYPE(col->type) : col->type;
+            int8_t ct = RAY_IS_PARTED(cm.type)
+                      ? (int8_t)RAY_PARTED_BASETYPE(cm.type) : cm.type;
             /* RAY_LIST == 0; ray_vec_new rejects type <= 0, so a LIST
              * column needs ray_list_new — otherwise the empty result
              * silently drops it and the 0-row schema loses a column. */
@@ -1015,16 +1029,26 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     if (ncols > 256) { scratch_free(idx_hdr); return ray_error("limit", "table exceeds 256 columns"); }
 
     ray_t* new_cols[ncols];
+    ray_t* src_cols[ncols];   /* borrowed: the plain kept columns */
     int64_t col_names[ncols];
     bool has_parted = false;
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = NULL;
         if (use_keep && !sel_compact_keep(col_names[c], keep_syms, keep_n)) {
             new_cols[c] = NULL; continue;
         }
-        if (!col || RAY_IS_ERR(col)) { new_cols[c] = NULL; continue; }
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t k = 0; k < c; k++)
+                if (new_cols[k]) ray_release(new_cols[k]);
+            scratch_free(idx_hdr);
+            ray_release(out);
+            return col;
+        }
+        if (!col) { new_cols[c] = NULL; continue; }
+        src_cols[c] = col;
         if (col->type == RAY_MAPCOMMON) {
             ray_t** mc_ptrs = (ray_t**)ray_data(col);
             ray_t* kv = mc_ptrs[0];
@@ -1083,7 +1107,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
      * #355). */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         if (parted_base_is_list(col)) {
             ray_release(new_cols[c]);
@@ -1108,7 +1132,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
 
     if (has_parted) {
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
+            ray_t* col = src_cols[c];
             if (!col || !new_cols[c]) continue;
             if (col->type == RAY_LIST || parted_base_is_list(col))
                 continue;  /* gathered above with retain */
@@ -1137,7 +1161,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, c);
+            ray_t* col = src_cols[c];
             if (col->type == RAY_LIST) continue;  /* gathered above with retain */
             /* RAY_MAPCOMMON is not skipped here: the pre-alloc loop above already
              * materialized it to a flat new_cols[c], so col_esz returns 0 and the
@@ -1157,7 +1181,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
     } else {
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
+            ray_t* col = src_cols[c];
             if (!col || !new_cols[c]) continue;
             if (col->type == RAY_LIST) continue;  /* gathered above with retain */
             uint8_t esz = col_esz(col);
@@ -1170,7 +1194,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
 
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* scol = ray_table_get_col_idx(tbl, c);
+        ray_t* scol = src_cols[c];
         if (scol && (scol->type == RAY_LIST || parted_base_is_list(scol))) {
             /* LIST elements already gathered+retained; no str-pool / null
              * bitmap to propagate. */

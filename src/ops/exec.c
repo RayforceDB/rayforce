@@ -1363,8 +1363,28 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
  * to exec_in's bool output (null rows → 0 → not-selected); only the sink
  * differs.  Returns NULL+all_pass=0 for any unsupported shape so the caller
  * falls back to exec_node→ray_rowsel_from_pred unchanged. */
-static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op,
+static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                                 ray_t** out_col, ray_t** out_set_lit);
+
+/* What a filter-index consult needs from a column, decided from metadata so
+ * an encoded column without it is never decoded to find that out: any index
+ * (IDXW_INDEX), a sorted attribute (IDXW_SORTED), or neither (the caller
+ * reads the column's values). */
+enum { IDXW_NONE = 0, IDXW_INDEX = 1, IDXW_SORTED = 2 };
+
+static bool idx_want_ok(const ray_col_meta_t* m, unsigned want) {
+    if (!want) return true;
+    return ((want & IDXW_INDEX) && m->index_kind != RAY_IDX_NONE) ||
+           ((want & IDXW_SORTED) && (m->attrs & RAY_ATTR_SORTED));
+}
+
+/* The plain column for a decode that declines (the scan fallback re-reads the
+ * column through the accessors and reports a failure with its message). */
+static ray_t* idx_decode_col(ray_t* tbl, int64_t sym) {
+    ray_t* col = ray_table_col(tbl, sym);
+    if (col && RAY_IS_ERR(col)) { ray_error_free(col); return NULL; }
+    return col;
+}
 
 typedef struct { in_worker_ctx_t* ic; } in_sel_fill_ctx_t;
 
@@ -1387,7 +1407,7 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
      * set) and rejects parted/MAPCOMMON columns + non-CONST sets.  OP_NOT_IN
      * isn't a decode shape (the shared decode is IN-only), so `not-in` falls
      * back to the bool path here — still correct, just unfused. */
-    if (!idx_filter_in_decode(g, pred, &col, &set_lit)) return NULL;
+    if (!idx_filter_in_decode(g, pred, IDXW_NONE, &col, &set_lit)) return NULL;
     if (ray_is_atom(col) || col->len != nrows) return NULL;
 
     bool negate = (pred->opcode == OP_NOT_IN);
@@ -1408,10 +1428,10 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     return sel;
 }
 
-static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
+static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,
-                             int* out_is_float);
+                             int* out_is_float, uint8_t* out_ikind);
 
 /* ---- Slice-group fusion probe (FILTER(in/eq on c) + GROUP(by c)) ----
  *
@@ -1442,13 +1462,13 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     ray_t* eq_atom = NULL;   /* owned (built for the eq shape) */
     if (pred->opcode == OP_IN) {   /* NOT_IN also decodes — reject it */
         ray_t* c = NULL; ray_t* set = NULL;
-        if (idx_filter_in_decode(g, pred, &c, &set) && c == by_col)
+        if (idx_filter_in_decode(g, pred, IDXW_INDEX, &c, &set) && c == by_col)
             keys = set;
     }
     if (!keys) {
         ray_t* c = NULL; uint16_t cop = 0;
         int64_t ki = 0; double kf = 0.0; int isf = 0;
-        if (idx_filter_decode(g, pred, &c, &cop, &ki, &kf, &isf) &&
+        if (idx_filter_decode(g, pred, IDXW_INDEX, &c, &cop, &ki, &kf, &isf, NULL) &&
             c == by_col && cop == OP_EQ && !isf) {
             eq_atom = ray_sym(ki);
             if (!eq_atom || RAY_IS_ERR(eq_atom)) {
@@ -1517,10 +1537,10 @@ static int idx_flatten_and(ray_graph_t* g, ray_op_t* op,
     return n;
 }
 
-static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
+static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,
-                             int* out_is_float) {
+                             int* out_is_float, uint8_t* out_ikind) {
     if (!pred_op || pred_op->arity != 2) return 0;
     uint16_t opc = pred_op->opcode;
     if (opc != OP_EQ && opc != OP_NE &&
@@ -1539,9 +1559,10 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
     if (stored_table_id != 0) return 0;  /* non-default table — skip */
     ray_t* tbl = g->table;
     if (!tbl) return 0;
-    ray_t* col = ray_table_get_col(tbl, lext->sym);
-    if (!col || RAY_IS_ERR(col)) return 0;
-    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, lext->sym, &m)) return 0;
+    if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
+    if (!idx_want_ok(&m, want)) return 0;
 
     ray_t* cv = rext->literal;
     if (!cv) return 0;
@@ -1568,7 +1589,7 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
      * cross-type predicate would otherwise compare against the zero-filled
      * key slot — e.g. (> f 100) on an F64 column decoded key_f=0.0 and
      * misclassified ALL/NONE. */
-    int col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
+    int col_is_float = (m.type == RAY_F32 || m.type == RAY_F64);
     if (col_is_float && !is_float) {
         /* Integer literal vs float column: coerce, but only when the
          * value round-trips exactly through double.  Doubles have a
@@ -1584,7 +1605,12 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
         return 0;
     }
 
-    *out_col      = col;
+    if (out_ikind) *out_ikind = m.index_kind;
+    if (out_col) {
+        ray_t* col = idx_decode_col(tbl, lext->sym);
+        if (!col) return 0;
+        *out_col  = col;
+    }
     *out_cmp_op   = opc;
     *out_key_i    = key_i;
     *out_key_f    = key_f;
@@ -1600,7 +1626,7 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
  * On success, *out_col is the column vec and *out_set_lit is the CONST
  * literal vec (borrowed from the ext, valid for the lifetime of the graph).
  * Returns 1 on success, 0 if the shape is not matched. */
-static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op,
+static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                                 ray_t** out_col, ray_t** out_set_lit) {
     if (!pred_op || pred_op->arity != 2) return 0;
     if (pred_op->opcode != OP_IN) return 0;
@@ -1620,9 +1646,12 @@ static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op,
 
     ray_t* tbl = g->table;
     if (!tbl) return 0;
-    ray_t* col = ray_table_get_col(tbl, lext->sym);
-    if (!col || RAY_IS_ERR(col)) return 0;
-    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, lext->sym, &m)) return 0;
+    if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
+    if (!idx_want_ok(&m, want)) return 0;
+    ray_t* col = idx_decode_col(tbl, lext->sym);
+    if (!col) return 0;
 
     *out_col     = col;
     *out_set_lit = rext->literal;
@@ -2495,8 +2524,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t ski = 0;
                 double skf = 0.0;
                 int sisf = 0;
-                if (idx_filter_decode(g, op_child(g, op, 1), &scol, &sop,
-                                      &ski, &skf, &sisf) &&
+                if (idx_filter_decode(g, op_child(g, op, 1), IDXW_SORTED,
+                                      &scol, &sop, &ski, &skf, &sisf, NULL) &&
                     sop != OP_NE && ray_attr_is_sorted(scol)) {
                     ray_idx_consults[IDX_SITE_FILTER_RANGE]++;
                     ray_t* ssel = ray_sorted_range_rowsel(scol, sop, ski, skf,
@@ -2534,8 +2563,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t  key_i    = 0;
                 double   key_f    = 0.0;
                 int      is_float = 0;
-                if (idx_filter_decode(g, op_child(g, op, 1), &col, &cmp_op,
-                                      &key_i, &key_f, &is_float)) {
+                if (idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, &col, &cmp_op,
+                                      &key_i, &key_f, &is_float, NULL)) {
                     /* 1. Zone index: O(1) all/none short-circuit. */
                     if (ray_index_kind(col) == RAY_IDX_ZONE)
                         ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
@@ -2668,11 +2697,22 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     int64_t eq_key = 0;
                     int64_t lo = INT64_MIN, hi = INT64_MAX;
                     bool shape_ok = (ncj >= 2);
+                    /* Metadata first: a conjunct list without an equality on a
+                     * hash-indexed column decodes nothing. */
+                    bool has_hash_eq = false;
+                    for (int ci = 0; ci < ncj && shape_ok && !has_hash_eq; ci++) {
+                        uint16_t cop = 0; uint8_t ik = 0;
+                        int64_t ki = 0; double kf = 0.0; int isf = 0;
+                        has_hash_eq = idx_filter_decode(g, conj[ci], IDXW_NONE, NULL, &cop,
+                                                        &ki, &kf, &isf, &ik) &&
+                                      cop == OP_EQ && ik == RAY_IDX_HASH;
+                    }
+                    shape_ok = shape_ok && has_hash_eq;
                     for (int ci = 0; ci < ncj && shape_ok; ci++) {
                         ray_t* c = NULL; uint16_t cop = 0;
                         int64_t ki = 0; double kf = 0.0; int isf = 0;
-                        if (!idx_filter_decode(g, conj[ci], &c, &cop,
-                                               &ki, &kf, &isf) || isf) {
+                        if (!idx_filter_decode(g, conj[ci], IDXW_NONE, &c, &cop,
+                                               &ki, &kf, &isf, NULL) || isf) {
                             shape_ok = false; break;
                         }
                         if (cop == OP_EQ && !eq_col &&
@@ -2768,7 +2808,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 {
                     ray_t* in_col     = NULL;
                     ray_t* in_set_lit = NULL;
-                    if (idx_filter_in_decode(g, op_child(g, op, 1), &in_col, &in_set_lit)) {
+                    if (idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, &in_col, &in_set_lit)) {
                         bool in_col_is_float = (in_col->type == RAY_F32 ||
                                                in_col->type == RAY_F64);
                         ray_idx_kind_t in_kind = ray_index_kind(in_col);
@@ -3262,9 +3302,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     int needs = 0;
                     int64_t nc = ray_table_ncols(tbl);
                     for (int64_t c = 0; c < nc; c++) {
-                        ray_t* col = ray_table_get_col_idx(tbl, c);
-                        if (col && !RAY_IS_PARTED(col->type)
-                            && col->type != RAY_MAPCOMMON) {
+                        ray_col_meta_t cm;
+                        if (ray_table_col_meta_idx(tbl, c, &cm) && !RAY_IS_PARTED(cm.type)
+                            && cm.type != RAY_MAPCOMMON) {
                             needs = 1; break;
                         }
                     }
@@ -3336,8 +3376,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 if (n > nrows) n = nrows;
                 ray_t* result = ray_table_new(ncols);
                 for (int64_t c = 0; c < ncols; c++) {
-                    ray_t* col = ray_table_get_col_idx(input, c);
+                    ray_t* col = ray_table_col_idx(input, c);
                     int64_t name_id = ray_table_col_name(input, c);
+                    if (col && RAY_IS_ERR(col)) {
+                        ray_release(result);
+                        ray_release(input);
+                        return col;
+                    }
                     if (!col) continue;
                     if (col->type == RAY_MAPCOMMON) {
                         ray_t* mc_head = materialize_mapcommon_head(col, n);
@@ -3460,8 +3505,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t skip = nrows - n;
                 ray_t* result = ray_table_new(ncols);
                 for (int64_t c = 0; c < ncols; c++) {
-                    ray_t* col = ray_table_get_col_idx(input, c);
+                    ray_t* col = ray_table_col_idx(input, c);
                     int64_t name_id = ray_table_col_name(input, c);
+                    if (col && RAY_IS_ERR(col)) {
+                        ray_release(result);
+                        ray_release(input);
+                        return col;
+                    }
                     if (!col) continue;
                     if (col->type == RAY_MAPCOMMON) {
                         /* Materialize last N rows from MAPCOMMON partitions */
@@ -3698,7 +3748,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_op_ext_t* col_ext = find_ext(g, columns[c]);
                     if (!col_ext) continue;
                     int64_t name_id = col_ext->sym;
-                    ray_t* src_col = ray_table_get_col(input, name_id);
+                    ray_t* src_col = ray_table_get_col_enc(input, name_id);
+                    if (!src_col) src_col = ray_table_col(input, name_id);
                     if (src_col) {
                         ray_retain(src_col);
                         result = ray_table_add_col(result, name_id, src_col);
@@ -3753,9 +3804,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 bool has_full = false;
                 if (nr_in != 1) {
                     for (int64_t c = 0; c < rc; c++) {
-                        ray_t* cv = ray_table_get_col_idx(result, c);
+                        ray_col_meta_t cm;
                         /* a parted column counts its rows across segments */
-                        if (cv && cv->type > 0 && ray_parted_nrows(cv) == nr_in) { has_full = true; break; }
+                        if (ray_table_col_meta_idx(result, c, &cm) && cm.type > 0 && cm.len == nr_in) { has_full = true; break; }
                     }
                 } else {
                     /* On a one-row input a scalar and a row column have the
@@ -3784,9 +3835,17 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
                 /* A LIST here is an atom enlist has no vector for (F32). */
                 for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
-                    ray_t* cv = ray_table_get_col_idx(result, c);
-                    if (!cv || cv->type < 0 || RAY_IS_PARTED(cv->type) ||
-                        cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
+                    ray_col_meta_t cm;
+                    if (!ray_table_col_meta_idx(result, c, &cm) || cm.type < 0 ||
+                        RAY_IS_PARTED(cm.type) || cm.type == RAY_MAPCOMMON ||
+                        cm.len != 1) continue;
+                    ray_t* cv = ray_table_col_idx(result, c);
+                    if (cv && RAY_IS_ERR(cv)) {
+                        ray_release(result);
+                        g->table = saved_table;
+                        ray_release(input);
+                        return cv;
+                    }
                     ray_t* n_obj = make_i64(nr_in);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
                     if (n_obj) ray_release(n_obj);
@@ -3966,8 +4025,14 @@ ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
         ray_t* merged = ray_table_new(ncols);
         for (int64_t c = 0; c < ncols; c++) {
             int64_t name_id = ray_table_col_name(accum, c);
-            ray_t* a_col = ray_table_get_col_idx(accum, c);
-            ray_t* p_col = ray_table_get_col_idx(partial, c);
+            ray_t* a_col = ray_table_col_idx(accum, c);
+            ray_t* p_col = ray_table_col_idx(partial, c);
+            if ((a_col && RAY_IS_ERR(a_col)) || (p_col && RAY_IS_ERR(p_col))) {
+                bool a_bad = a_col && RAY_IS_ERR(a_col);
+                if (a_bad && p_col && RAY_IS_ERR(p_col)) ray_error_free(p_col);
+                ray_release(merged);
+                return a_bad ? a_col : p_col;
+            }
             if (!a_col || !p_col) {
                 ray_release(merged);
                 return ray_error("schema", NULL);

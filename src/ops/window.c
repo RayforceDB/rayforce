@@ -128,13 +128,14 @@ static inline int64_t win_read_i64(ray_t* col, int64_t row) {
 #define win_set_null       par_set_null
 #define win_finalize_nulls par_finalize_nulls
 
-/* Resolve a graph op node to a column vector from tbl */
+/* Resolve a graph op node to a column vector from tbl.  A scan key that
+ * fails to materialize comes back as an owned error (never `owned`). */
 static ray_t* win_resolve_vec(ray_graph_t* g, ray_op_t* key_op, ray_t* tbl,
                               uint8_t* owned) {
     ray_op_ext_t* key_ext = find_ext(g, key_op->id);
     if (key_ext && key_ext->base.opcode == OP_SCAN) {
         *owned = 0;
-        return ray_table_get_col(tbl, key_ext->sym);
+        return ray_table_col(tbl, key_ext->sym);
     }
     *owned = 1;
     ray_t* saved = g->table;
@@ -657,8 +658,8 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
 static int64_t window_parted_seg_count(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && RAY_IS_PARTED(col->type)) return col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) return m.n_segs;
     }
     return 0;  /* not parted (a table of only MAPCOMMON keys can't occur) */
 }
@@ -724,8 +725,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             for (uint32_t k = 0; k < ext->window.n_part_keys && !eligible; k++) {
                 ray_op_ext_t* key_ext = find_ext(g, ext->window.part_keys[k]);
                 if (key_ext && key_ext->base.opcode == OP_SCAN) {
-                    ray_t* col = ray_table_get_col(tbl, key_ext->sym);
-                    if (col && col->type == RAY_MAPCOMMON) eligible = true;
+                    ray_col_meta_t m;
+                    if (ray_table_col_meta(tbl, key_ext->sym, &m) && m.type == RAY_MAPCOMMON)
+                        eligible = true;
                 }
             }
             if (eligible) {
@@ -772,8 +774,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     {
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+            ray_col_meta_t m;
+            if (ray_table_col_meta_idx(tbl, c, &m) &&
+                (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)) {
                 int64_t nseg = window_parted_seg_count(tbl);
                 ray_t* flat = NULL;
                 for (int64_t s = 0; s < nseg; s++) {
@@ -1437,7 +1440,8 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     /* Pass-through original columns */
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_get_col_enc_idx(tbl, c);
+        if (!col) col = ray_table_col_idx(tbl, c);
         if (!col) continue;
         int64_t name_id = ray_table_col_name(tbl, c);
         ray_retain(col);

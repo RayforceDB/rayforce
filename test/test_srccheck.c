@@ -34,8 +34,7 @@
  * the task that migrates the file; this list is the only place to edit. */
 static const char* const srccheck_pending[] = {
     "src/ops/query.c", "src/ops/datalog.c", "src/ops/group.c", "src/ops/agg_engine.c",
-    "src/ops/join.c", "src/ops/tblop.c", "src/ops/exec.c", "src/ops/filter.c", "src/ops/sort.c",
-    "src/ops/window.c", "src/ops/pivot.c",
+    "src/ops/join.c", "src/ops/tblop.c",
     NULL,
 };
 
