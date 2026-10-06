@@ -28,6 +28,7 @@
 #include "table/domain.h"
 #include "table/table.h"
 #include "ops/ops.h"
+#include "ops/idxop.h"
 #include "vec/vec.h"
 #include <string.h>
 
@@ -88,6 +89,7 @@ ray_t* ray_col_src_bind(ray_t* col, ray_col_src_t* out) {
     out->attrs = m.attrs & COL_DISK_ATTRS_MASK;
     out->len = m.len;
     out->may_null = may_null_of(col);
+    out->parted = RAY_IS_PARTED(m.type);
     if (out->type == RAY_SYM) {
         out->dom = sym_domain_of(col);
         out->dom_owned = out->dom != ray_sym_runtime_domain();
@@ -206,4 +208,38 @@ ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
     ray_t* err = range_obj(src->obj, start, n, scratch, out);
     out->start = start;
     return err;
+}
+
+ray_t* ray_col_src_plain(ray_col_src_t* s, ray_t** out) {
+    *out = NULL;
+    if (!s || !s->obj) return ray_error("type", "source not bound");
+    if (s->obj->type != RAY_ENCCOL) { *out = s->obj; return NULL; }
+    ray_t* p = ray_enccol_materialize(s->obj);     /* the object's once-state, cached */
+    if (RAY_IS_ERR(p)) return p;
+    *out = p;
+    return NULL;
+}
+
+int64_t ray_col_src_sym_find(const ray_col_src_t* s, const char* str, size_t len) {
+    if (!s || s->type != RAY_SYM || !s->dom) return -1;
+    return ray_sym_domain_find(s->dom, str, len);
+}
+
+/* Codes are assigned by first occurrence (not sorted), so there is no
+ * persisted string->code map: scan the n_distinct first-occurrence rows. */
+int64_t ray_col_src_dict_code(const ray_col_src_t* s, const char* str, size_t len) {
+    if (!s || s->type != RAY_STR || !s->obj || s->obj->type == RAY_ENCCOL || s->parted) return -2;
+    ray_t* col = s->obj;
+    if (ray_index_kind(col) != RAY_IDX_DICT) return -2;
+    const ray_index_t* dix = ray_index_payload(col->index);
+    int64_t nd = dix->u.dict.n_distinct;
+    if (nd <= 0 || !dix->u.dict.first_occ || RAY_IS_ERR(dix->u.dict.first_occ)) return -1;
+    const int32_t* focc = (const int32_t*)ray_data(dix->u.dict.first_occ);
+    for (int64_t c = 0; c < nd; c++) {
+        size_t l = 0;
+        const char* p = ray_str_vec_get(col, focc[c], &l);
+        if (!p) continue;
+        if (l == len && (len == 0 || memcmp(p, str, len) == 0)) return c;
+    }
+    return -1;
 }

@@ -520,6 +520,7 @@ typedef struct ray_graph {
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
+    struct ray_col_binds_s* binds;   /* sources bound by this execution (ops/colbind.c) */
 
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
      * Armed by ray_slice_group_probe (exec.c) INSTEAD of executing the

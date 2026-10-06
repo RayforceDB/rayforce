@@ -28,6 +28,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "ops/idxop.h"
+#include "ops/colbind.h"
 #include "ops/agg_engine.h"
 #include "ops/fused_group.h"
 #include "lang/parse.h"
@@ -1850,6 +1851,109 @@ static test_result_t test_first_asc_parted_nulls_gen2(void) {
     PASS();
 }
 
+/* Binding never decodes; literal translation reads the bound domain; the
+ * plain column is produced only on request; the graph releases its binds. */
+static test_result_t test_bind_stage(void) {
+    ray_t* t = ray_table_new(1);
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W64, 3000); s->len = 3000;
+    int64_t ids[3] = { ray_sym_intern("x", 1), ray_sym_intern("y", 1), ray_sym_intern("z", 1) };
+    for (int i = 0; i < 3000; i++) ((int64_t*)ray_data(s))[i] = ids[i % 3];
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(s);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, CS_TMP "/bd", CS_TMP "/bd.sym", RAY_COMPRESS_ON), RAY_OK);
+    ray_release(t);
+    t = ray_read_splayed(CS_TMP "/bd", CS_TMP "/bd.sym");
+    ray_enc_counters_reset();
+    ray_graph_t* g = ray_graph_new(t);
+    ray_t* err = NULL;
+    ray_col_src_t* a = ray_graph_bind_col(g, t, ray_sym_intern("s", 1), &err);
+    TEST_ASSERT_TRUE(a && !err);
+    TEST_ASSERT_EQ_PTR(ray_graph_bind_col(g, t, ray_sym_intern("s", 1), &err), a);   /* deduplicated */
+    TEST_ASSERT_NULL(ray_graph_bind_col(g, t, ray_sym_intern("nope", 4), &err));
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_I(a->type, RAY_SYM);
+    TEST_ASSERT_TRUE(a->dom != ray_sym_runtime_domain());                        /* the file domain */
+    int64_t py = ray_col_src_sym_find(a, "y", 1);
+    TEST_ASSERT_TRUE(py > 0);
+    TEST_ASSERT_EQ_I(ray_col_src_sym_find(a, "absent", 6), -1);
+    TEST_ASSERT_EQ_I(ray_col_src_dict_code(a, "y", 1), -2);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_t* plain = NULL;
+    TEST_ASSERT_NULL(ray_col_src_plain(a, &plain));
+    TEST_ASSERT_TRUE(plain && plain->type == RAY_SYM);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(plain), 1, RAY_SYM, plain->attrs), py);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    TEST_ASSERT_EQ_I(ray_graph_binds_count(g), 1);
+    ray_graph_free(g);                                  /* releases the bind (ASan) */
+    ray_release(t);
+    PASS();
+}
+
+/* A fused predicate on a file-domain SYM column, compiled through the bind
+ * stage, answers as on generation 0. */
+static test_result_t test_fused_pred_bound(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['s 'v] (list ['x 'y 'z 'y 'x 'y] [1 2 3 4 5 6])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/fp2\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/fp0\" t {compress: false})"), "");
+    static const char* const q[] = {
+        "(count (select {from: (.db.splayed.get \"" CS_TMP "/fp2\") where: (== s 'y)}))",
+        "(count (select {from: (.db.splayed.get \"" CS_TMP "/fp0\") where: (== s 'y)}))",
+        "(count (select {from: (.db.splayed.get \"" CS_TMP "/fp2\") where: (and (== s 'y) (> v 2))}))",
+        "(count (select {from: (.db.splayed.get \"" CS_TMP "/fp0\") where: (and (== s 'y) (> v 2))}))",
+    };
+    for (int i = 0; i < 4; i += 2) {
+        ray_t* a = ray_eval_str(q[i]); ray_t* b = ray_eval_str(q[i + 1]);
+        TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
+        TEST_ASSERT_EQ_I(a->i64, b->i64);
+        ray_release(a); ray_release(b);
+    }
+    PASS();
+}
+
+/* Generation 0 and generation 2 of the same table answer identically for
+ * SYM ==, in, like, and numeric comparisons with nulls (3000 rows, so the
+ * encoded form is real). */
+static test_result_t test_fused_pred_gen_equiv(void) {
+    enum { N = 3000 };
+    ray_t* t = ray_table_new(3);
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W64, N); s->len = N;
+    ray_t* v = ray_vec_new(RAY_I64, N); v->len = N;
+    ray_t* d = ray_vec_new(RAY_F64, N); d->len = N;
+    const char* names[4] = { "alpha", "beta", "gamma", "alps" };
+    for (int i = 0; i < N; i++) {
+        ((int64_t*)ray_data(s))[i] = ray_sym_intern(names[i % 4], strlen(names[i % 4]));
+        ((int64_t*)ray_data(v))[i] = i % 17;
+        ((double*)ray_data(d))[i] = (double)(i % 11) * 0.5;
+    }
+    for (int i = 0; i < N; i += 7) { ray_vec_set_null(v, i, true); ray_vec_set_null(d, i, true); }
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    t = ray_table_add_col(t, ray_sym_intern("d", 1), d);
+    ray_release(s); ray_release(v); ray_release(d);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, CS_TMP "/eq0", CS_TMP "/eq0.sym", RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, CS_TMP "/eq2", CS_TMP "/eq2.sym", RAY_COMPRESS_ON), RAY_OK);
+    ray_release(t);
+    static const char* const w[] = {
+        "(== s 'beta)", "(!= s 'beta)", "(== s 'nowhere)", "(!= s 'nowhere)",
+        "(in v [1 2 3])", "(like s \"alp*\")", "(like s \"*mm*\")",
+        "(> v 5)", "(<= v 3)", "(== v 4)", "(!= v 4)", "(< d 2.0)", "(>= d 1.5)",
+        "(and (== s 'alpha) (> v 5))",
+    };
+    for (size_t i = 0; i < sizeof w / sizeof *w; i++) {
+        char q0[256], q2[256];
+        snprintf(q0, sizeof q0, "(count (select {from: (.db.splayed.get \"" CS_TMP "/eq0\" \"" CS_TMP "/eq0.sym\") where: %s}))", w[i]);
+        snprintf(q2, sizeof q2, "(count (select {from: (.db.splayed.get \"" CS_TMP "/eq2\" \"" CS_TMP "/eq2.sym\") where: %s}))", w[i]);
+        ray_t* a = ray_eval_str(q0); ray_t* b = ray_eval_str(q2);
+        TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
+        TEST_ASSERT_EQ_I(a->i64, b->i64);
+        ray_release(a); ray_release(b);
+    }
+    PASS();
+}
+
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -1905,5 +2009,8 @@ const test_entry_t compress_entries[] = {
     { "compress/exec_start_snapshot",         test_exec_start_snapshot,         cs_setup, cs_teardown },
     { "compress/first_asc_parted_nulls_gen0", test_first_asc_parted_nulls_gen0, cs_setup, cs_teardown },
     { "compress/first_asc_parted_nulls_gen2", test_first_asc_parted_nulls_gen2, rt_setup, rt_teardown },
+    { "compress/bind_stage",        test_bind_stage,       cs_setup, cs_teardown },
+    { "compress/fused_pred_bound",  test_fused_pred_bound, rt_setup, rt_teardown },
+    { "compress/fused_pred_gen_equiv", test_fused_pred_gen_equiv, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

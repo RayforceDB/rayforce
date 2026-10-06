@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "ops/colbind.h"
 #include "graph.h"
 #include "internal.h"   /* EXT_TRAIL, graph_alloc_ext_node_ex */
 #include "store/csr.h"
@@ -141,6 +142,7 @@ ray_graph_t* ray_graph_new(ray_t* tbl) {
 void ray_graph_free(ray_graph_t* g) {
     if (!g) return;
 
+    ray_graph_binds_free(g);
     if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
 
     /* Unconsumed slice-group hint (error paths / shapes that never

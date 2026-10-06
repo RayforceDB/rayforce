@@ -38,6 +38,7 @@ typedef struct {
     uint8_t attrs;                  /* persisted attrs; parted: not authoritative, see ray_col_range */
     int64_t len;                    /* rows (parted: sum over segments) */
     bool    may_null;               /* HAS_NULLS, or directory null counts for generation 2 */
+    bool    parted;                 /* a parted source (per-range attrs are authoritative) */
 } ray_col_src_t;
 
 /* A view of rows [start, start + n): elements in the generation-0
@@ -83,5 +84,17 @@ ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
 /* Bind a table column without decoding; an absent column leaves out->obj
  * NULL and returns NULL. */
 ray_t* ray_table_col_src(ray_t* tbl, int64_t name_id, ray_col_src_t* out);
+
+/* The bound source's plain column (borrowed; valid while the source is
+ * bound): the object itself for generation 0, the cached materialization
+ * for generation 2.  NULL or an owned error. */
+ray_t*  ray_col_src_plain(ray_col_src_t* s, ray_t** out);
+/* Literal translation into the source's SYM domain, without decoding:
+ * the position of the bytes, -1 when absent. */
+int64_t ray_col_src_sym_find(const ray_col_src_t* s, const char* str, size_t len);
+/* STR dictionary code of a constant: >= 0 the code, -1 provably absent,
+ * -2 no dictionary to resolve against (generation 2 in P1: STR_DICT
+ * arrives in P6).  Reads only the generation-0 column's DICT index. */
+int64_t ray_col_src_dict_code(const ray_col_src_t* s, const char* str, size_t len);
 
 #endif /* RAY_COLRANGE_H */

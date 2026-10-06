@@ -24,6 +24,7 @@
 #ifndef RAY_OPS_FUSED_PRED_H
 #define RAY_OPS_FUSED_PRED_H
 
+#include "store/colrange.h"
 #include "rayforce.h"
 #include "ops/internal.h"
 #include "ops/glob.h"
@@ -61,6 +62,7 @@ typedef struct {
     uint8_t      fold;        /* fp_fold_t — set when cval is out-of-range */
     const void*  col_base;
     ray_t*       col_obj;
+    ray_col_src_t* src;      /* bound source (borrowed from the graph registry) */
     int64_t      col_len;
     int64_t      cval;
     ray_t*       literal; /* borrowed from the predicate graph */
