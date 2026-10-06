@@ -35,7 +35,7 @@ typedef struct {
     struct ray_sym_domain_s* dom;   /* SYM: the domain ids resolve over */
     bool    dom_owned;              /* dom was retained */
     int8_t  type;                   /* logical element type (parted: base) */
-    uint8_t attrs;                  /* persisted attrs */
+    uint8_t attrs;                  /* persisted attrs; parted: not authoritative, see ray_col_range */
     int64_t len;                    /* rows (parted: sum over segments) */
     bool    may_null;               /* HAS_NULLS, or directory null counts for generation 2 */
 } ray_col_src_t;
@@ -73,7 +73,10 @@ void   ray_col_scratch_free(ray_col_scratch_t* s);
  * for n == 0).  Generation 0 is zero copy; generation 2 decodes the vector
  * into `scratch`.  The view is valid until the next call with the same
  * scratch or until the source is released.  A missing ragged segment of a
- * parted source holds no rows, as in a generation-0 parted flatten. */
+ * parted source holds no rows, as in a generation-0 parted flatten.
+ * For a parted source the SYM element width and SORTED are per range only
+ * (segments may differ): read them from the view's `attrs`, never from the
+ * source's. */
 ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
                      ray_col_scratch_t* scratch, ray_col_range_t* out);
 

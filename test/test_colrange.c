@@ -128,6 +128,12 @@ static test_result_t walk_src(ray_col_src_t* s, ray_t* ref, int64_t ref_off, int
         TEST_ASSERT_FMT(r.n > 0 && r.n <= req && start + r.n <= s->len, "n=%lld @%lld", (long long)r.n, (long long)start);
         TEST_ASSERT_EQ_I(r.start, start);
         if (gen2) TEST_ASSERT_FMT(start / 1024 == (start + r.n - 1) / 1024, "range @%lld n=%lld crosses a vector", (long long)start, (long long)r.n);
+        else {                                               /* zero copy: clipped only at the source end */
+            int64_t want = s->len - start < req ? s->len - start : req;
+            TEST_ASSERT_FMT(r.n == want, "gen0 n=%lld want %lld @%lld", (long long)r.n, (long long)want, (long long)start);
+            uint8_t esz = ray_sym_elem_size(ref->type, ref->attrs);
+            TEST_ASSERT_TRUE(r.data == (const char*)ray_data(ref) + (size_t)(ref_off + start) * esz);
+        }
         for (int64_t i = 0; i < r.n; i++) {
             const char* bad = cmp_row(&r, i, ref, ref_off + start + i);
             TEST_ASSERT_FMT(!bad, "row %lld req %lld: %s", (long long)(start + i), (long long)req, bad ? bad : "");
@@ -213,8 +219,7 @@ static test_result_t test_range_matches_materialized(void) {
                     TEST_ASSERT_EQ_I(s.type, types[t]);
                     ray_t* mat = ray_enccol_materialize(c);
                     TEST_ASSERT_TRUE(mat && !RAY_IS_ERR(mat));
-                    if (!nl && types[t] != RAY_SYM && types[t] != RAY_STR)
-                        TEST_ASSERT_TRUE(!s.may_null);      /* directory null counts prove it */
+                    if (!nl) TEST_ASSERT_TRUE(!s.may_null);             /* directory null counts prove it */
                     for (size_t q = 0; q < 3; q++) RUN(walk_src(&s, mat, 0, reqs[q], true));
                     RUN(walk_src(&s, v, 0, 1000, true));    /* and against the source rows */
                     if (n > 5000) RUN(probe_src(&s, mat, 0, true));
@@ -398,23 +403,38 @@ static ray_err_t write_splayed_gen2(const char* dir, ray_t* tbl) {
  * partition has no column b. */
 static ray_t* load_parted(const char* root, int gen2_mask, bool ragged) {
     static const int64_t rows[3] = { 3000, 1024, 70000 };
+    {   /* the shared root symfile the SYM segments' ids resolve over */
+        char sp[512]; snprintf(sp, sizeof sp, "%s/.sym", root);
+        if (ray_test_mkdir_p(root) != 0) return NULL;
+        ray_sym_domain_t* d = ray_sym_domain_open_or_create(sp);
+        if (!d) return NULL;
+        for (int i = 0; i < 512; i++) { char b[8]; int n = snprintf(b, sizeof b, "d%d", i); (void)ray_sym_domain_intern(d, b, (size_t)n); }
+        ray_err_t fe = ray_sym_domain_flush(d, false);
+        ray_sym_domain_release(d);
+        if (fe != RAY_OK) return NULL;
+    }
     for (int p = 0; p < 3; p++) {
         char dir[512]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+        char symp[512]; snprintf(symp, sizeof symp, "%s/.sym", root);
         ray_t* a = gen_col(RAY_I64, rows[p], true, 0);
         ray_t* s = gen_col(RAY_STR, rows[p], true, 0);
         ray_t* b = gen_col(RAY_F64, rows[p], true, 0);
-        ray_t* t = ray_table_new(3);
+        static const uint8_t pw[3] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32 };
+        ray_t* y = gen_col(RAY_SYM, rows[p], true, pw[p]);       /* a different width per partition */
+        ray_t* t = ray_table_new(4);
         t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
         t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
-        t = ray_table_add_col(t, ray_sym_intern("b", 1), b);
-        ray_release(a); ray_release(s); ray_release(b);
-        ray_err_t e = (gen2_mask & (1 << p)) ? write_splayed_gen2(dir, t) : ray_splay_save(t, dir, NULL);
+        t = ray_table_add_col(t, ray_sym_intern("y", 1), y);
+        t = ray_table_add_col(t, ray_sym_intern("b", 1), b);     /* last: the ragged column */
+        ray_release(a); ray_release(s); ray_release(b); ray_release(y);
+        ray_err_t e = (gen2_mask & (1 << p)) ? write_splayed_gen2(dir, t) : ray_splay_save(t, dir, symp);
         ray_release(t);
         if (e != RAY_OK) return NULL;
         if (ragged && p == 2) {
             char f[600]; snprintf(f, sizeof f, "%s/b", dir); remove(f);
-            ray_t* names = ray_vec_new(RAY_STR, 2);
+            ray_t* names = ray_vec_new(RAY_STR, 3);
             names = ray_str_vec_append(names, "a", 1); names = ray_str_vec_append(names, "s", 1);
+            names = ray_str_vec_append(names, "y", 1);
             snprintf(f, sizeof f, "%s/.d", dir);
             e = ray_col_save(names, f);
             ray_release(names);
@@ -452,8 +472,8 @@ static test_result_t walk_parted(ray_col_src_t* s, ray_t* wrapper, int64_t req) 
 static test_result_t parted_case(const char* root, int mask, bool ragged) {
     ray_t* t = load_parted(root, mask, ragged);
     TEST_ASSERT_TRUE(t != NULL);
-    static const char* cols[] = { "a", "s", "b" };
-    for (int c = 0; c < 3; c++) {
+    static const char* cols[] = { "a", "s", "b", "y" };
+    for (int c = 0; c < 4; c++) {
         ray_enc_counters_reset();
         int64_t id = ray_sym_intern(cols[c], 1);
         ray_col_src_t s;
@@ -461,7 +481,7 @@ static test_result_t parted_case(const char* root, int mask, bool ragged) {
         TEST_ASSERT_TRUE(s.obj != NULL);
         int64_t want = (ragged && c == 2) ? 3000 + 1024 : 3000 + 1024 + 70000;
         TEST_ASSERT_EQ_I(s.len, want);
-        TEST_ASSERT_EQ_I(s.type, c == 0 ? RAY_I64 : c == 1 ? RAY_STR : RAY_F64);
+        TEST_ASSERT_EQ_I(s.type, c == 0 ? RAY_I64 : c == 1 ? RAY_STR : c == 2 ? RAY_F64 : RAY_SYM);
         TEST_ASSERT_TRUE(s.may_null);
         /* reading ranges decodes vectors only: nothing is materialized */
         ray_col_scratch_t sc; ray_col_scratch_init(&sc); ray_col_range_t r;
@@ -473,6 +493,10 @@ static test_result_t parted_case(const char* root, int mask, bool ragged) {
         ray_t* w = ray_table_col(t, id);                       /* the materialized reference */
         TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w) && RAY_IS_PARTED(w->type));
         if (ragged && c == 2) TEST_ASSERT_TRUE(((ray_t**)ray_data(w))[2] == NULL);
+        if (c == 3 && (mask & 5) == 5) {                       /* generation 2 keeps each segment's width */
+            ray_t** sg = (ray_t**)ray_data(w);
+            TEST_ASSERT_TRUE((sg[0]->attrs & RAY_SYM_W_MASK) != (sg[2]->attrs & RAY_SYM_W_MASK));
+        }
         static const int64_t reqs[] = { 1000, 1024, 5000, 1 << 20 };
         for (int q = 0; q < 4; q++) RUN(walk_parted(&s, w, reqs[q]));
         /* the boundaries themselves: a range starting at the last row of a segment */
@@ -506,12 +530,32 @@ static test_result_t test_range_parted_ragged(void) {
     PASS();
 }
 
+/* Bind refuses shapes range reads cannot serve. */
+static test_result_t test_bind_refuses_shapes(void) {
+    ray_col_src_t s;
+    ray_t fake;                                              /* header only: bind rejects before any use */
+    memset(&fake, 0, sizeof fake);
+    fake.type = RAY_MAPCOMMON;
+    ray_t* e = ray_col_src_bind(&fake, &s);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e)); TEST_ASSERT_STR_EQ(ray_err_code(e), "nyi"); ray_error_free(e);
+    TEST_ASSERT_TRUE(s.obj == NULL);
+    fake.type = RAY_ENCCOL; fake.attrs = RAY_ATTR_SLICE;
+    e = ray_col_src_bind(&fake, &s);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e)); TEST_ASSERT_STR_EQ(ray_err_code(e), "nyi"); ray_error_free(e);
+    fake.type = RAY_PARTED_BASE + RAY_I64;
+    e = ray_col_src_bind(&fake, &s);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e)); TEST_ASSERT_STR_EQ(ray_err_code(e), "nyi"); ray_error_free(e);
+    PASS();
+}
+
 static test_result_t test_table_col_src(void) {
     ray_t* v = i32_nulls(2000);
+    ray_t* v2 = i32_nulls(2000);
     ray_t* t = ray_table_new(2);
     t = ray_table_add_col(t, ray_sym_intern("x", 1), v);
     ray_release(v);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(i32_nulls(2000), CR_TMP "/e", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v2, CR_TMP "/e", 2), RAY_OK);
+    ray_release(v2);
     ray_t* c = ray_col_mmap(CR_TMP "/e");
     t = ray_table_add_col(t, ray_sym_intern("y", 1), c);
     ray_release(c);
@@ -541,6 +585,7 @@ const test_entry_t colrange_entries[] = {
     { "colrange/matches_materialized",    test_range_matches_materialized,      cr_setup, cr_teardown },
     { "colrange/parted_mixed",            test_range_parted_mixed,              cr_setup, cr_teardown },
     { "colrange/parted_ragged",           test_range_parted_ragged,             cr_setup, cr_teardown },
+    { "colrange/bind_refuses_shapes",       test_bind_refuses_shapes,             cr_setup, cr_teardown },
     { "colrange/table_col_src",           test_table_col_src,                   cr_setup, cr_teardown },
     { NULL, NULL, NULL, NULL },
 };

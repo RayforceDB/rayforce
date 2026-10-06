@@ -80,6 +80,8 @@ ray_t* ray_col_src_bind(ray_t* col, ray_col_src_t* out) {
     memset(out, 0, sizeof *out);
     if (!col || RAY_IS_ERR(col)) return ray_error("type", "source bind: no column");
     if (col->type == RAY_MAPCOMMON) return ray_error("nyi", "source bind: partition key column");
+    if ((col->attrs & RAY_ATTR_SLICE) && (col->type == RAY_ENCCOL || RAY_IS_PARTED(col->type)))
+        return ray_error("nyi", "source bind: slice of an encoded or parted column");
     ray_col_meta_t m;
     ray_col_meta_of(col, &m);
     out->type = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
@@ -135,27 +137,31 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
         sc->fixed = ray_alloc_raw(SCRATCH_FIXED_BYTES);
         if (!sc->fixed) return ray_error("oom", "range read scratch");
     }
+    int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    ray_enc_desc_t descs[RAY_ENC_VECS_PER_CHUNK];
+    ray_t* err = ray_enccol_chunk_descs(e, c, descs);       /* validated once per vector */
+    if (err) return err;
     if (e->type == RAY_STR) {
         uint64_t pb = 0;
-        ray_t* err = ray_enccol_vec_pool_bytes(e, vec, &pb);
+        err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb);
         if (err) return err;
-        if (pb > sc->pool_cap) {
-            char* p = ray_realloc_raw(sc->pool, (size_t)pb);
-            if (!p) return ray_error("oom", "range read pool");
-            sc->pool = p;
+        if (pb > sc->pool_cap) {                            /* no copy of bytes about to be overwritten */
+            ray_free_raw(sc->pool);
+            sc->pool = NULL;
+            sc->pool_cap = 0;
+            sc->pool = ray_alloc_raw((size_t)pb);
+            if (!sc->pool) return ray_error("oom", "range read pool");
             sc->pool_cap = (size_t)pb;
         }
     }
-    ray_t* err = ray_enccol_decode_vec(e, vec, sc->fixed, sc->pool, 0, sc->pool_cap);
+    err = ray_enccol_decode_desc(e, c, j, &descs[j], sc->fixed, sc->pool, 0, sc->pool_cap);
     if (err) return err;
-    int nn = 0;
-    if (ray_enccol_vec_nulls(e, vec, &nn) != 0)
-        return ray_error("corrupt", "%s: vector %lld null count", e->path, (long long)vec);
     out->data = sc->fixed + (size_t)off * ray_enccol_esz(e);
     out->n = n;
     out->type = e->type;
     out->attrs = e->attrs;
-    out->may_null = nn > 0;
+    out->may_null = descs[j].n_nulls > 0;
     out->str_pool = e->type == RAY_STR ? sc->pool : NULL;
     out->dom = e->type == RAY_SYM ? e->dom : NULL;
     return NULL;
