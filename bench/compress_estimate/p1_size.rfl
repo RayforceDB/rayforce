@@ -1,0 +1,3 @@
+(set t (.db.splayed.get "/skull/clickbench/rfsplayed"))
+(.db.splayed.set "/home/hetoku/data/tmp/p1_size/hits" t {compress: true})
+(println (count (.db.splayed.get "/home/hetoku/data/tmp/p1_size/hits")))
