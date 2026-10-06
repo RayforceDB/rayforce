@@ -1538,11 +1538,15 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         }
         if (rows) ray_release(rows);
         ray_t* cmp = pq_option(types,"compress");
+        if (cmp && RAY_IS_ERR(cmp)) {            /* the lookup itself failed */
+            if (!err) err = cmp; else ray_error_free(cmp);
+            cmp = NULL;
+        }
         if (!err && cmp) {
             if (cmp->type != -RAY_BOOL) err = ray_error("domain","parquet: compress must be true or false");
             else r->compress = cmp->b8 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF;
         }
-        if (cmp && !RAY_IS_ERR(cmp)) ray_release(cmp);
+        if (cmp) ray_release(cmp);
         ray_t* schema = pq_option(types,"types");
         if (!err && schema && schema->type != RAY_SYM) err = pq_error("types must be a symbol vector");
         if (!err) err = pq_import_types(r,schema);

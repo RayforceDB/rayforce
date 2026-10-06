@@ -973,6 +973,12 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
          * Load/mmap reattach the domain below. */
         if (vec->type == RAY_SYM)
             memset(header.aux, 0, 16);
+        /* RAY_STR: aux bytes 8-15 hold the runtime str_pool pointer; it used
+         * to reach the file whenever HAS_NULLS kept aux above (a heap address
+         * on disk, different on every run).  No reader uses those bytes: both
+         * loaders zero aux before attaching the pool. */
+        if (vec->type == RAY_STR)
+            memset(header.aux + 8, 0, 8);
         /* FILE-domain SYM re-expressed to runtime ids: width follows the
          * global table, SORTED dropped (id order changed). */
         if (sym_xlate)

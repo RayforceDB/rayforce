@@ -3844,7 +3844,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         else
             err = na ? ray_col_resolve_gen_type_err(mode, resolved_types[c], cur,
                                                     ray_str_ptr(na), ray_str_len(na), &gen)
-                     : RAY_OK;
+                     : RAY_ERR_CORRUPT;
         if (err == RAY_OK)
             err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
                                       resolved_types[c], sym_dom, gen);

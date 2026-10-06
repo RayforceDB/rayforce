@@ -51,6 +51,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define CS_TMP "/tmp/rayforce_compress"
@@ -1440,6 +1441,7 @@ static test_result_t test_stream_matches_resident(void) {
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
     ray_col_stream_abort(&w);
     b = slurp(CS_TMP "/str2", &nb);
+    TEST_ASSERT_TRUE(b && nb >= 96);
     ray_enc_hdr_t hb; memcpy(&hb, b + 32, 64);
     TEST_ASSERT_EQ_I(hb.index_kind, RAY_IDX_CHUNK_ZONE);
     free(b);
@@ -1488,14 +1490,12 @@ static test_result_t test_stream_str_matches_resident(void) {
     ray_col_stream_abort(&w);
     TEST_ASSERT_EQ_I(file_gen(CS_TMP "/sst2"), 2);
     TEST_ASSERT_TRUE(same_file_from(CS_TMP "/sres", CS_TMP "/sst2", 0));
-    /* generation 0, one append: the resident generation-0 payload (the
-     * resident STR header carries nonzero bytes 8..15 the stream leaves 0;
-     * that difference predates generation 2) */
+    /* generation 0, one append: the resident generation-0 bytes */
     TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("sst0", 4), RAY_STR, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
     ray_col_stream_abort(&w);
-    TEST_ASSERT_TRUE(same_file_from(CS_TMP "/sres0", CS_TMP "/sst0", 16));
+    TEST_ASSERT_TRUE(same_file_from(CS_TMP "/sres0", CS_TMP "/sst0", 0));
     /* the generation-2 file loads back to the same cells */
     ray_t* back = ray_col_load(CS_TMP "/sst2");
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back) && back->len == n);
@@ -1516,6 +1516,137 @@ static test_result_t test_stream_str_matches_resident(void) {
     TEST_ASSERT_EQ_I(ray_col_stream_open(&w, CS_TMP, ray_sym_intern("bad", 3), RAY_I64, NULL, 1), RAY_ERR_VERSION);
     ray_col_stream_abort(&w);
     ray_release(iv); ray_release(v);
+    PASS();
+}
+
+/* SYM rows [lo, hi) as strings: a null ("") every 11th row. */
+static ray_t* sym_text_rows(int64_t lo, int64_t hi) {
+    ray_t* v = ray_vec_new(RAY_STR, hi - lo);
+    char b[32];
+    for (int64_t i = lo; i < hi; i++) {
+        int len = i % 11 == 0 ? 0 : snprintf(b, sizeof b, "v%lld", (long long)(i % 300));
+        v = ray_str_vec_append(v, b, (size_t)len);
+    }
+    return v;
+}
+
+static ray_err_t stream_sym(struct ray_sym_domain_s* d, const char* name, uint8_t gen, int64_t n) {
+    ray_col_stream_t w;
+    ray_err_t e = ray_col_stream_open(&w, CS_TMP, ray_sym_intern(name, strlen(name)), RAY_SYM, d, gen);
+    int64_t cut[4] = { 0, n / 3, n / 3 * 2 + 1, n };
+    for (int k = 0; e == RAY_OK && k < 3; k++) {
+        ray_t* p = sym_text_rows(cut[k], cut[k + 1]);
+        e = ray_col_stream_append(&w, p);
+        ray_release(p);
+    }
+    if (e == RAY_OK) e = ray_col_stream_close(&w, false);
+    ray_col_stream_abort(&w);
+    return e;
+}
+
+/* A generation-2 SYM stream (three chunks, null ids) loads back to the
+ * generation-0 stream of the same values; its outer header keeps the
+ * symfile count in rc, the W32 width it was opened with and HAS_NULLS. */
+static test_result_t test_stream_sym_gen2(void) {
+    struct ray_sym_domain_s* d = ray_sym_domain_open_or_create(CS_TMP "/s.sym");
+    TEST_ASSERT_TRUE(d != NULL);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(d, "", 0), 0);
+    int64_t n = 140000;
+    TEST_ASSERT_EQ_I(stream_sym(d, "sy0", 0, n), RAY_OK);
+    TEST_ASSERT_EQ_I(stream_sym(d, "sy2", 2, n), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(d, false), RAY_OK);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/sy0"), 0);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/sy2"), 2);
+    size_t nb; uint8_t* b = slurp(CS_TMP "/sy2", &nb);
+    TEST_ASSERT_TRUE(b && nb >= 32);
+    ray_t hdr; memcpy(&hdr, b, 32); free(b);
+    TEST_ASSERT_EQ_I(hdr.type, RAY_SYM);
+    TEST_ASSERT_EQ_I((int64_t)hdr.rc, ray_sym_domain_count(d));
+    TEST_ASSERT_EQ_I(hdr.attrs & RAY_SYM_W_MASK, RAY_SYM_W32);
+    TEST_ASSERT_TRUE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(hdr.len, n);
+    ray_t* a = ray_col_load_dom(CS_TMP "/sy0", d);
+    ray_t* c = ray_col_load_dom(CS_TMP "/sy2", d);
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && c && !RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(a->len, n); TEST_ASSERT_EQ_I(c->len, n);
+    TEST_ASSERT_TRUE(c->attrs & RAY_ATTR_HAS_NULLS);
+    int64_t nulls = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* s0 = ray_sym_vec_cell(a, i); ray_t* s1 = ray_sym_vec_cell(c, i);
+        TEST_ASSERT_TRUE(s0 && s1 && ray_str_len(s0) == ray_str_len(s1) &&
+                         memcmp(ray_str_ptr(s0), ray_str_ptr(s1), ray_str_len(s0)) == 0);
+        if (!ray_str_len(s1)) nulls++;
+    }
+    TEST_ASSERT_EQ_I(nulls, (n + 10) / 11);
+    ray_release(a); ray_release(c);
+    ray_sym_domain_release(d);
+    PASS();
+}
+
+/* A generation-2 transcode that cannot write its output (RLIMIT_FSIZE at
+ * the raw staging size, so only the encoded file overflows) fails the close
+ * and leaves nothing: no column file, no .stream-* staging or .g2 file. */
+static bool cs_dir_has_stream_tmp(const char* dir) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "ls -A %s | grep -q '^\\.stream-'", dir);
+    return system(cmd) == 0;
+}
+static test_result_t test_stream_gen2_transcode_failure(void) {
+#ifdef RAY_OS_LINUX
+    int64_t n = 140000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    for (int64_t i = 0; i < n; i++) {                 /* incompressible: RAW vectors */
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        ((int64_t*)ray_data(v))[i] = (int64_t)(x & 0x7FFFFFFFFFFFFFFFull);
+    }
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        ray_col_stream_t w;
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)(32 + n * 8);          /* the raw staging file fits exactly */
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        if (ray_col_stream_open(&w, CS_TMP, ray_sym_intern("tf", 2), RAY_I64, NULL, 2) != RAY_OK) _exit(2);
+        if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
+        ray_err_t e = ray_col_stream_close(&w, false);
+        ray_col_stream_abort(&w);
+        _exit(e == RAY_ERR_IO ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    TEST_ASSERT_TRUE(access(CS_TMP "/tf", F_OK) != 0);
+    TEST_ASSERT_FALSE(cs_dir_has_stream_tmp(CS_TMP));
+    ray_release(v);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* The resident generation-0 STR writer used to copy the runtime str_pool
+ * pointer (aux bytes 8..15) into the file when HAS_NULLS was set: two saves
+ * of equal vectors now give identical bytes, with those bytes zero. */
+static test_result_t test_str_header_no_pointer(void) {
+    ray_t* a = str_rows(0, 5000);
+    ray_t* b = str_rows(0, 5000);
+    TEST_ASSERT_TRUE(a->attrs & RAY_ATTR_HAS_NULLS);   /* the case that kept aux */
+    TEST_ASSERT_EQ_I(ray_col_save(a, CS_TMP "/h1"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(b, CS_TMP "/h2"), RAY_OK);
+    TEST_ASSERT_TRUE(same_file_from(CS_TMP "/h1", CS_TMP "/h2", 0));
+    size_t n; uint8_t* p = slurp(CS_TMP "/h1", &n);
+    TEST_ASSERT_TRUE(p && n >= 32);
+    static const uint8_t zero[8];
+    TEST_ASSERT_TRUE(memcmp(p + 8, zero, 8) == 0);
+    free(p);
+    ray_t* back = ray_col_load(CS_TMP "/h1");
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back) && back->len == 5000);
+    for (int64_t i = 0; i < 5000; i++) {
+        size_t la, lb; const char* x = ray_str_vec_get(a, i, &la); const char* y = ray_str_vec_get(back, i, &lb);
+        TEST_ASSERT_TRUE(la == lb && (la == 0 || memcmp(x, y, la) == 0));
+    }
+    ray_release(back); ray_release(a); ray_release(b);
     PASS();
 }
 
@@ -1544,6 +1675,38 @@ static test_result_t test_csv_splayed_option(void) {
     PASS();
 }
 
+/* .csv.splayed {compress: true} with a SYMBOL column (nulls, several
+ * chunks) loads back equal to the generation-0 import. */
+static test_result_t test_csv_splayed_symbol(void) {
+    FILE* f = fopen(CS_TMP "/sy.csv", "w");
+    TEST_ASSERT_TRUE(f != NULL);
+    fprintf(f, "a,s\n");
+    for (int64_t i = 0; i < 140000; i++) {
+        if (i % 13 == 0) fprintf(f, "%lld,\n", (long long)i);
+        else fprintf(f, "%lld,k%lld\n", (long long)i, (long long)(i % 400));
+    }
+    fclose(f);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.splayed {compress: true} [I64 SYMBOL] \"" CS_TMP "/sy.csv\" \"" CS_TMP "/sy2\")"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.splayed {compress: false} [I64 SYMBOL] \"" CS_TMP "/sy.csv\" \"" CS_TMP "/sy0\")"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/sy2", "s"), 2);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/sy2", "a"), 2);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/sy0", "s"), 0);
+    ray_t* x = ray_eval_str("(at (.db.splayed.get \"" CS_TMP "/sy2\") 's)");
+    ray_t* y = ray_eval_str("(at (.db.splayed.get \"" CS_TMP "/sy0\") 's)");
+    TEST_ASSERT_TRUE(x && !RAY_IS_ERR(x) && y && !RAY_IS_ERR(y));
+    TEST_ASSERT_EQ_I(x->len, 140000); TEST_ASSERT_EQ_I(y->len, 140000);
+    int64_t nulls = 0;
+    for (int64_t i = 0; i < 140000; i++) {
+        ray_t* s0 = ray_sym_vec_cell(y, i); ray_t* s1 = ray_sym_vec_cell(x, i);
+        TEST_ASSERT_TRUE(s0 && s1 && ray_str_len(s0) == ray_str_len(s1) &&
+                         memcmp(ray_str_ptr(s0), ray_str_ptr(s1), ray_str_len(s0)) == 0);
+        if (!ray_str_len(s1)) nulls++;
+    }
+    TEST_ASSERT_EQ_I(nulls, (140000 + 12) / 13);
+    ray_release(x); ray_release(y);
+    PASS();
+}
+
 static test_result_t test_parquet_option(void) {
     TEST_ASSERT_STR_EQ(ev_code("(.parquet.splayed {compress: true} \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/pq\")"), "");
     TEST_ASSERT_STR_EQ(ev_code("(.parquet.splayed \"test/data/parquet/flat-0-v1.parquet\" \"" CS_TMP "/pq0\")"), "");
@@ -1569,6 +1732,10 @@ static test_result_t test_parquet_option(void) {
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
+    { "compress/stream_sym_gen2",          test_stream_sym_gen2,          cs_setup, cs_teardown },
+    { "compress/stream_gen2_transcode_failure", test_stream_gen2_transcode_failure, cs_setup, cs_teardown },
+    { "compress/str_header_no_pointer",    test_str_header_no_pointer,    cs_setup, cs_teardown },
+    { "compress/csv_splayed_symbol",       test_csv_splayed_symbol,       rt_setup, rt_teardown },
     { "compress/csv_splayed_option",      test_csv_splayed_option,      rt_setup, rt_teardown },
     { "compress/parquet_option",          test_parquet_option,          rt_setup, rt_teardown },
     { "compress/parquet_two_dicts",       test_parquet_two_dicts,       rt_setup, rt_teardown },

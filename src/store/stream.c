@@ -254,7 +254,8 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     uint64_t need = 32 + (uint64_t)w->rows * esz + (w->type == RAY_STR ? 32 + w->pool_bytes : 0);
     size_t msz = 0;
     void* m = ray_vm_map_file(w->tmp_path, &msz);
-    if (!m || msz < need) { if (m) ray_vm_unmap_file(m, msz); return RAY_ERR_IO; }
+    /* the index was dropped above, so the staging file is exactly the payload */
+    if (!m || msz != need) { if (m) ray_vm_unmap_file(m, msz); return RAY_ERR_IO; }
     const uint8_t* data = (const uint8_t*)m + 32;
     const char* pool = w->type == RAY_STR ? (const char*)m + 32 + (size_t)w->rows * 16 + 32 : NULL;
     char enc_path[1100];
