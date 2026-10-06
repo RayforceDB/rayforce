@@ -2114,7 +2114,7 @@ ray_t* ray_parquet_scan_fn(ray_t** args, int64_t n) {
         return ray_error("oom",NULL);
     }
     ray_retain(path); ((ray_t**)ray_data(vals))[0] = path; vals->len = 1;
-    if (n == 2) { ray_retain(args[0]); ((ray_t**)ray_data(vals))[1] = args[0]; vals->len = 2; }
+    if (n == 2) { ray_retain(args[0]); ((ray_t**)ray_data(vals))[1] = args[0]; vals->len = 2; }   /* not-a-table */
     return ray_dict_new(keys,vals);
 }
 static const char* pq_symbol_name(ray_t* x) {

@@ -267,7 +267,7 @@ static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
     }
     if (ast->type == RAY_DICT) {  /* slot[0]=keys, slot[1]=vals */
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_refs_locals(c, slots[0]) || ast_refs_locals(c, slots[1]);
+        return ast_refs_locals(c, slots[0]) || ast_refs_locals(c, slots[1]);   /* not-a-table */
     }
     return false;
 }

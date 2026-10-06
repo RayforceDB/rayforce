@@ -117,7 +117,7 @@ enum {
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
 #define LAMBDA_PARAMS(lam)    (((ray_t**)ray_data(lam))[0])
-#define LAMBDA_BODY(lam)      (((ray_t**)ray_data(lam))[1])
+#define LAMBDA_BODY(lam)      (((ray_t**)ray_data(lam))[1])   /* not-a-table */
 #define LAMBDA_BC(lam)        (((ray_t**)ray_data(lam))[2])
 #define LAMBDA_CONSTS(lam)    (((ray_t**)ray_data(lam))[3])
 #define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[4]))

@@ -5244,7 +5244,36 @@ static test_result_t test_query_first_asc_parted_nulls_gen0(void) {
     PASS();
 }
 
+/* Planning a full select reads metadata only: no column is materialized
+ * before the first ray_execute. */
+static test_result_t test_select_planning_no_materialize(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 'v 's] (list [1 2 3 4 5 6] [1.5 2.5 3.5 4.5 5.5 6.5] [\"a\" \"b\" \"a\" \"c\" \"b\" \"a\"])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/sp\" t {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set u (.db.splayed.get \"" CS_TMP "/sp\"))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/spz\" (table ['v] (list (til 70000))) {compress: true})"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(set w (.db.splayed.get \"" CS_TMP "/spz\"))"), "");
+    static const char* const qs[] = {
+        "(select {from: u where: (> k 2)})",
+        "(select {s: (sum v) from: u by: k})",
+        "(select {from: u where: (in k [1 3 5])})",
+        "(select {n: (count k) from: u where: (== s \"a\")})",
+        "(select {s: (sum v) from: w})",                /* 70000 rows: CHUNK_ZONE recorded */
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_enc_counters_reset();
+        ray_t* r = ray_eval_str(qs[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "query %d: %s", i, r ? ray_err_code(r) : "null");
+        ray_release(r);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        TEST_ASSERT_FMT(c.at_first_exec == 0, "query %d materialized %llu columns before execution",
+                        i, (unsigned long long)c.at_first_exec);
+    }
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/select_planning_no_materialize", test_select_planning_no_materialize, rt_setup, rt_teardown },
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_sym_gen2",          test_stream_sym_gen2,          cs_setup, cs_teardown },

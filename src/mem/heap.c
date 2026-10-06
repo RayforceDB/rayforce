@@ -960,7 +960,7 @@ static void ray_release_owned_refs(ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         if (slots[0] && !RAY_IS_ERR(slots[0])) ray_release(slots[0]);
-        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_release(slots[1]);
+        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_release(slots[1]);   /* plain-table */
         return;
     }
 
@@ -1084,7 +1084,7 @@ bool ray_retain_owned_refs(ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         if (slots[0] && !RAY_IS_ERR(slots[0])) ray_retain(slots[0]);
-        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_retain(slots[1]);
+        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_retain(slots[1]);   /* plain-table */
         return true;
     }
 
@@ -1199,7 +1199,7 @@ static void ray_detach_owned_refs(ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         slots[0] = NULL;
-        slots[1] = NULL;
+        slots[1] = NULL;   /* plain-table */
         v->len = 0;
         return;
     }
@@ -3130,7 +3130,7 @@ static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
     if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data((ray_t*)v);
         n += retained_walk(slots[0], seen);
-        n += retained_walk(slots[1], seen);
+        n += retained_walk(slots[1], seen);   /* plain-table */
     }
     return n;
 }

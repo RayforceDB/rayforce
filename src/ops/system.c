@@ -762,7 +762,7 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
     if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         OBJSIZE_PUSH(slots[0]);
-        OBJSIZE_PUSH(slots[1]);
+        OBJSIZE_PUSH(slots[1]);   /* plain-table */
         return true;
     }
     if (v->type == RAY_LIST) {

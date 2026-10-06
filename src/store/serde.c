@@ -362,7 +362,7 @@ int64_t ray_serde_size(ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         int64_t schema = schema_names_serde_size(slots[0]);
         if (schema <= 0) return schema;
-        int64_t cols = ser_table_cols_size(obj, slots[1]);
+        int64_t cols = ser_table_cols_size(obj, slots[1]);   /* plain-table */
         if (cols <= 0) return cols;
         return 1 + 1 + schema + cols;
     }
@@ -371,7 +371,7 @@ int64_t ray_serde_size(ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         int64_t keys = ray_serde_size(slots[0]);
         if (keys <= 0) return keys;
-        int64_t vals = ray_serde_size(slots[1]);
+        int64_t vals = ray_serde_size(slots[1]);   /* not-a-table */
         if (vals <= 0) return vals;
         return 1 + 1 + keys + vals;
     }
@@ -379,7 +379,7 @@ int64_t ray_serde_size(ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         int64_t params = ray_serde_size(slots[0]);
         if (params <= 0) return params;
-        int64_t body = ray_serde_size(slots[1]);
+        int64_t body = ray_serde_size(slots[1]);   /* not-a-table */
         if (body <= 0) return body;
         int64_t size = 1 + 1 + params + body;
         if (LAMBDA_CLOSURE(obj)) {
@@ -646,7 +646,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         c = ser_schema_names(buf, slots[0]);     /* schema names as RAY_SYM vector */
         if (c <= 0) return c;
         /* cols LIST framed by hand, each column through ray_table_col_idx */
-        ray_t* cl = slots[1];
+        ray_t* cl = slots[1];   /* plain-table */
         int64_t ncl = cl ? cl->len : 0;          /* NULL cols: 0 columns, as the size arm */
         uint8_t* lp = buf + c;
         lp[0] = (uint8_t)RAY_LIST;
@@ -670,7 +670,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);
         if (c <= 0) return c;
-        int64_t vals = ray_ser_raw(buf + c, slots[1]);
+        int64_t vals = ray_ser_raw(buf + c, slots[1]);   /* not-a-table */
         if (vals <= 0) return vals;
         c += vals;
         return 1 + 1 + c;
@@ -682,7 +682,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
         if (c <= 0) return c;
-        int64_t body = ray_ser_raw(buf + c, slots[1]); /* body */
+        int64_t body = ray_ser_raw(buf + c, slots[1]); /* body */   /* not-a-table */
         if (body <= 0) return body;
         c += body;
         if (LAMBDA_CLOSURE(obj)) {
@@ -1166,7 +1166,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         dict->attrs = dict_attrs & RAY_SERDE_ATTR_WIRE_MASK;
         dict->len = 2;
         ((ray_t**)ray_data(dict))[0] = keys;
-        ((ray_t**)ray_data(dict))[1] = vals;
+        ((ray_t**)ray_data(dict))[1] = vals;   /* not-a-table */
         return dict;
     }
 
@@ -1215,7 +1215,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         lambda->len = 0;
         memset(ray_data(lambda), 0, 8 * sizeof(ray_t*));
         ((ray_t**)ray_data(lambda))[0] = params;
-        ((ray_t**)ray_data(lambda))[1] = body;
+        ((ray_t**)ray_data(lambda))[1] = body;   /* not-a-table */
         LAMBDA_CLOSURE(lambda) = closure;
         return lambda;
     }

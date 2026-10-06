@@ -30,17 +30,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/* Files not yet migrated off the legacy getters.  Part B removes an entry in
- * the task that migrates the file; this list is the only place to edit. */
-static const char* const srccheck_pending[] = {
-    NULL,
-};
-
-static bool is_pending(const char* path) {
-    for (int i = 0; srccheck_pending[i]; i++) if (strcmp(srccheck_pending[i], path) == 0) return true;
-    return false;
-}
-
 /* Line number of the first occurrence of any needle (0 if none). */
 static int first_hit(const char* path, const char* const* needles) {
     FILE* f = fopen(path, "rb");
@@ -81,13 +70,8 @@ static void check_getters(const char* p, const char* rel, srccheck_acc_t* acc) {
     acc->nseen++;
     if (strcmp(rel, "src/table/table.c") == 0) { acc->saw_table = true; return; }
     int ln = first_hit(p, needles);
-    bool pend = is_pending(rel);
-    if ((ln && !pend) || (!ln && pend)) {
-        if (!acc->nbad) {
-            if (ln) snprintf(acc->bad, sizeof acc->bad, "%s:%d uses a legacy getter", rel, ln);
-            else snprintf(acc->bad, sizeof acc->bad,
-                          "%s has no legacy getter left: remove it from srccheck_pending", rel);
-        }
+    if (ln) {
+        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d uses a legacy getter", rel, ln);
         acc->nbad++;
     }
 }
@@ -102,6 +86,58 @@ static test_result_t test_no_legacy_getters(void) {
     walk(dir, "src", &acc, check_getters);
     TEST_ASSERT_FMT(acc.saw_table && acc.nseen > 50, "source tree not scanned (%d files)", acc.nseen);
     TEST_ASSERT_FMT(acc.nbad == 0, "%s (%d files)", acc.bad, acc.nbad);
+    PASS();
+}
+
+/* Every [1] slot read outside table.c is marked: a dict / lambda / list /
+ * MAPCOMMON slot (not-a-table), or a table slot through which no column of
+ * an encoded table is read: an ownership edge, or a table proven to hold no
+ * encoded slot (plain-table). */
+static bool raw_list_hit(const char* line) {
+    if (strstr(line, "slots[1]")) return true;
+    const char* p = line;
+    while ((p = strstr(p, "(ray_t**)ray_data(")) != NULL) {
+        const char* q = strchr(p, ')');                 /* closes the cast */
+        q = q ? strchr(q + 1, ')') : NULL;              /* closes ray_data( */
+        if (q && q[1] == ')' && q[2] == '[' && q[3] == '1' && q[4] == ']') return true;
+        p++;
+    }
+    return false;
+}
+
+static void check_raw_list(const char* p, const char* rel, srccheck_acc_t* acc) {
+    if (strcmp(rel, "src/table/table.c") == 0) return;
+    FILE* f = fopen(p, "rb");
+    if (!f) return;
+    char line[4096]; int ln = 0;
+    while (fgets(line, sizeof line, f)) {
+        ln++;
+        if (!raw_list_hit(line)) continue;
+        if (strstr(line, "not-a-table") || strstr(line, "plain-table")) continue;
+        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d reads slot [1] unmarked", rel, ln);
+        acc->nbad++;
+    }
+    fclose(f);
+}
+
+static test_result_t test_no_raw_column_list(void) {
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char dir[64]; snprintf(dir, sizeof dir, "%s/src", root);
+    srccheck_acc_t acc = { "", 0, 0, false };
+    walk(dir, "src", &acc, check_raw_list);
+    TEST_ASSERT_FMT(acc.nbad == 0, "%s (%d sites)", acc.bad, acc.nbad);
+    PASS();
+}
+
+/* The generation-2 materializer attaches through the persisted-attach
+ * predicate only (spec "Source checks"). */
+static test_result_t test_materializer_attach(void) {
+    static const char* const needles[] = { "ray_index_attach_built", NULL };
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char path[128]; snprintf(path, sizeof path, "%s/src/store/enccol.c", root);
+    TEST_ASSERT_EQ_I(first_hit(path, needles), 0);
     PASS();
 }
 
@@ -121,6 +157,8 @@ static test_result_t test_cols_inplace_plain(void) {
 
 const test_entry_t srccheck_entries[] = {
     { "srccheck/no_legacy_getters", test_no_legacy_getters, NULL, NULL },
+    { "srccheck/no_raw_column_list",  test_no_raw_column_list,  NULL, NULL },
+    { "srccheck/materializer_attach", test_materializer_attach, NULL, NULL },
     { "srccheck/cols_inplace_plain", test_cols_inplace_plain, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
