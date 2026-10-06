@@ -26,6 +26,9 @@ Signatures:
 
 - `(.db.splayed.set "dir" tbl)` — write columns to `dir/`; emit a `.sym` file in the same directory.
 - `(.db.splayed.set "dir" tbl "sym_path")` — write the symbol table to a custom location (typically a shared db-root `.sym`).
+- `(.db.splayed.set "dir" tbl opts)` and `(.db.splayed.set "dir" tbl "sym_path" opts)` — the same with an options dict.
+
+`compress` (dict option, `{compress: true}` or `{compress: false}`): `true` writes generation-2 (compressed) column files where the column is eligible; `false` writes generation 0; when absent each file inherits: generation 2 when its source is an encoded column or the destination's current file is generation 2, else generation 0. Unknown keys and a non-bool `compress` are a `domain` error, as is a second options dict. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed.
 
 Returns `tbl` (retained), so the call can be threaded inside a larger expression.
 

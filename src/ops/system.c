@@ -191,6 +191,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     char sym[1024];
     const char* sym_path = NULL;
     ray_t* opts = NULL;
+    bool sym_given = false;
     for (int64_t i = 2; i < n; i++) {
         ray_t* a = args[i];
         if (a && a->type == RAY_DICT) {
@@ -199,7 +200,10 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
         } else if (i == 2) {
             /* a string names the symfile; anything else is ignored and the
              * convention applies, as before */
-            if (a && a->type == -RAY_STR) sym_path = str_to_cpath(a, sym, sizeof(sym));
+            if (a && a->type == -RAY_STR) {
+                sym_given = true;   /* an empty or over-long path stays NULL */
+                sym_path = str_to_cpath(a, sym, sizeof(sym));
+            }
         } else {
             return ray_error("domain", ".db.splayed.set: argument 4 must be an options dict, got %s",
                              a ? ray_type_name(a->type) : "null");
@@ -208,7 +212,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     ray_compress_t mode;
     ray_t* oerr = ray_compress_opt_parse(opts, true, &mode);
     if (oerr) return oerr;
-    if (!sym_path) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
+    if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
 
     ray_err_t err = ray_splay_save_mode(tbl, dir, sym_path, mode);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);

@@ -702,7 +702,7 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | — | Load splayed table from a directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |

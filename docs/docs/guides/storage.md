@@ -127,7 +127,7 @@ trades/
 
 Pass a `sym_path` to automatically save/load the symbol table alongside the data. Pass `NULL` if you manage symbols separately.
 
-From Rayfall, use `(.db.splayed.set "/tmp/weather" t)` to save and `(.db.splayed.get "/tmp/weather")` to load — no C code required.
+From Rayfall, use `(.db.splayed.set "/tmp/weather" t)` to save (add `{compress: true}` for compressed column files) and `(.db.splayed.get "/tmp/weather")` to load — no C code required.
 
 ## 5. Partitioned Tables { #partitioned-tables }
 

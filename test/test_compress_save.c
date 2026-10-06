@@ -1371,9 +1371,16 @@ static test_result_t test_db_splayed_set_forms(void) {
     ray_t* r = ray_eval_str("(sum (at (.db.splayed.get \"" CS_TMP "/f5\") 'b))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 15);
     ray_release(r);
-    r = ray_eval_str("(== (at (.db.splayed.get \"" CS_TMP "/f5\") 'a) [1 2 3])");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    r = ray_eval_str("(all (== (at (.db.splayed.get \"" CS_TMP "/f5\") 'a) [1 2 3]))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8);
     ray_release(r);
+    /* {} is absent; a null compress is a domain error */
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f6\" t {})"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/f6", "a"), 0);
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f6\" t {compress: null})"), "domain");
+    /* an empty symfile path keeps its old meaning: no convention fallback */
+    TEST_ASSERT_STR_EQ(ev_code("(set ts (table ['s] (list ['x 'y])))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/f7\" ts \"\")"), "domain");
     PASS();
 }
 
@@ -1386,6 +1393,16 @@ static test_result_t test_csv_parted_option(void) {
     TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pr0/0/t", "a"), 0);
     TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: true} {compress: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr1\" 't)"), "domain");
     TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {zone: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr1\" 't)"), "domain");
+    /* existing root: explicit modes and inheritance, typed + rows_per_part */
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: false} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr\" 't)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pr/0/t", "a"), 0);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: true} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr\" 't)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pr/0/t", "a"), 2);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr\" 't)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pr/0/t", "a"), 2);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: true} [I64 I64] \"" CS_TMP "/in.csv\" 2 \"" CS_TMP "/pt\" 't)"), "");
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/pt/1/t", "a"), 2);
+    TEST_ASSERT_STR_EQ(ev_code("(.csv.parted {compress: null} \"" CS_TMP "/in.csv\" \"" CS_TMP "/pr1\" 't)"), "domain");
     ray_t* r = ray_eval_str("(sum (at (.db.parted.get \"" CS_TMP "/pr\" 't) 'b))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 100);
     ray_release(r);

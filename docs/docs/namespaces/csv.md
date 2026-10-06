@@ -84,6 +84,7 @@ Signatures (with optional rows-per-part):
 - `(.csv.parted [types] "src.csv" "db_root" 'tbl_name)`
 - `(.csv.parted [names] [types] "src.csv" "db_root" 'tbl_name)`
 - `(.csv.parted [...]types "src.csv" rows_per_part "db_root" 'tbl_name)` — pass a positive integer just before the db-root to override the default partition size.
+- `(.csv.parted {compress: true} ...)` — any arrangement above may start with an options dict. `compress` true writes generation-2 (compressed) files where eligible, false generation 0; absent inherits per file (generation 2 when the existing destination file is generation 2). Unknown keys, a non-bool value or a second options dict are a `domain` error. Linked, nested/list and explicitly indexed columns are always written uncompressed.
 
 Streams the CSV into `db_root/<partition-number>/tbl_name/`. Returns the parted table loaded back from disk. A new root is staged at `<db_root>.csv-partial` and published after the shared dictionary flush; staging from an import that failed after writing a partition is retained for diagnosis, and a retry into the same root fails with an `io` error naming the directory to remove. A failure before the first partition (an unreadable or empty source, a type vector that does not match) leaves nothing behind. Existing roots retain per-partition update behavior. Bulk writes require an external file and directory sync for durability.
 

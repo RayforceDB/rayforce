@@ -316,6 +316,8 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
 
+A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed.
+
 ### `.db.splayed.get` — Load a Splayed Table
 
 Loads a splayed table from a directory. Columns are memory-mapped for zero-copy access.
