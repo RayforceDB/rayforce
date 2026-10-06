@@ -97,7 +97,7 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
         /* Never decode: an encoded column has no attached index until it is
          * materialized, and the materialization carries any index it built. */
         ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
-        ray_t* col = enc ? ray_enccol_of(enc)->decoded : ray_table_col_idx(tbl, c);
+        ray_t* col = enc ? ray_enccol_decoded_peek(enc) : ray_table_col_idx(tbl, c);
         if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) continue;
         for (uint32_t s = 0; s < ns; s++)
             if (snap[s].key == col->index) {

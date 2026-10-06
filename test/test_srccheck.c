@@ -61,7 +61,7 @@ static int first_hit(const char* path, const char* const* needles) {
     return 0;
 }
 
-typedef struct { char bad[512]; int nbad; const char* prefix; } srccheck_acc_t;
+typedef struct { char bad[512]; int nbad; int nseen; bool saw_table; } srccheck_acc_t;
 
 static void walk(const char* dir, const char* rel, srccheck_acc_t* acc,
                  void (*fn)(const char*, const char*, srccheck_acc_t*)) {
@@ -84,7 +84,8 @@ static void walk(const char* dir, const char* rel, srccheck_acc_t* acc,
 
 static void check_getters(const char* p, const char* rel, srccheck_acc_t* acc) {
     static const char* const needles[] = { "ray_table_get_col(", "ray_table_get_col_idx(", NULL };
-    if (strcmp(rel, "src/table/table.c") == 0) return;
+    acc->nseen++;
+    if (strcmp(rel, "src/table/table.c") == 0) { acc->saw_table = true; return; }
     int ln = first_hit(p, needles);
     bool pend = is_pending(rel);
     if ((ln && !pend) || (!ln && pend)) {
@@ -103,8 +104,9 @@ static test_result_t test_no_legacy_getters(void) {
     struct stat st;
     const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
     char dir[64]; snprintf(dir, sizeof dir, "%s/src", root);
-    srccheck_acc_t acc = { "", 0, root };
+    srccheck_acc_t acc = { "", 0, 0, false };
     walk(dir, "src", &acc, check_getters);
+    TEST_ASSERT_FMT(acc.saw_table && acc.nseen > 50, "source tree not scanned (%d files)", acc.nseen);
     TEST_ASSERT_FMT(acc.nbad == 0, "%s (%d files)", acc.bad, acc.nbad);
     PASS();
 }

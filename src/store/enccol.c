@@ -1231,3 +1231,10 @@ bool ray_enccol_may_have_index(ray_t* encv) {
     }
     return true;
 }
+
+ray_t* ray_enccol_decoded_peek(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e) return NULL;
+    if (atomic_load_explicit(&e->once.state, memory_order_acquire) != RAY_ENC_ONCE_DONE) return NULL;
+    return e->decoded;
+}

@@ -215,7 +215,7 @@ static const test_entry_t* const compiled_groups[] = {
     pool_entries,     progress_entries,
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries,
-    sort_entries,     splay_entries,    srccheck_entries,    store_entries,    enc_entries,
+    sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
     encfmt_entries,   enconce_entries,   enccol_entries, enccorrupt_entries,
     large_entries,
     colrange_entries,

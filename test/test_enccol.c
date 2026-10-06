@@ -1052,6 +1052,53 @@ static test_result_t test_materialize_float_bits(void) {
     PASS();
 }
 
+/* ---- Task 25: decoded peek and the in-place column list ---- */
+
+static void peek_thread(void* arg) {
+    ray_t* c = arg;
+    for (int i = 0; i < 20000; i++) {
+        ray_t* d = ray_enccol_decoded_peek(c);
+        if (d) (void)d->len;
+    }
+}
+static void peek_mat_thread(void* arg) { (void)ray_enccol_materialize((ray_t*)arg); }
+
+static test_result_t test_decoded_peek(void) {
+    ray_t* v = make_col(RAY_I64, 5000, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/pk", 2), RAY_OK);
+    ray_release(v);
+    ray_enc_counters_reset();
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/pk");
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(c));
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);                   /* a peek decodes nothing */
+    ray_thread_t th[3];
+    ray_thread_create(&th[0], peek_thread, c);
+    ray_thread_create(&th[1], peek_thread, c);
+    ray_thread_create(&th[2], peek_mat_thread, c);
+    for (int i = 0; i < 3; i++) ray_thread_join(th[i]);
+    ray_t* m = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(c), m);
+    ray_release(c);
+    PASS();
+}
+
+static test_result_t test_cols_inplace_encoded(void) {
+    ray_t* v = make_col(RAY_I64, 100, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/ci", 2), RAY_OK);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ci");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), v);
+    TEST_ASSERT_TRUE(ray_table_cols_inplace(t) != NULL);
+    t = ray_table_add_col(t, ray_sym_intern("b", 1), c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_NULL(ray_table_cols_inplace(t));           /* an encoded slot refuses */
+    ray_release(t); ray_release(c); ray_release(v);
+    PASS();
+}
+
 static test_result_t test_materialize_counts_once(void) {
     ray_t* v = make_col(RAY_I64, 5000, 0);
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/m", 2), RAY_OK);
@@ -1792,6 +1839,8 @@ const test_entry_t enccol_entries[] = {
     { "enccol/materialize_equivalence",        test_materialize_equivalence,        enccol_setup, enccol_teardown },
     { "enccol/materialize_lengths",            test_materialize_lengths,            enccol_setup, enccol_teardown },
     { "enccol/materialize_float_bits",         test_materialize_float_bits,         enccol_setup, enccol_teardown },
+    { "enccol/decoded_peek",                   test_decoded_peek,                   enccol_setup, enccol_teardown },
+    { "enccol/cols_inplace_encoded",           test_cols_inplace_encoded,           enccol_setup, enccol_teardown },
     { "enccol/materialize_counts_once",        test_materialize_counts_once,        enccol_setup, enccol_teardown },
     { "enccol/materialize_lowest_failure",     test_materialize_lowest_failure_cached, enccol_setup, enccol_teardown },
     { "enccol/oom_then_retry",                 test_oom_then_retry,                 enccol_setup, enccol_teardown },

@@ -99,6 +99,10 @@ uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width *
  * owned RAY_ERROR.  Single and (Task 12) parted objects. */
 ray_t* ray_enccol_materialize(ray_t* encv);
 
+/* The cached plain column when the materialization has completed, else NULL;
+ * never decodes and is safe against a concurrent materialize. */
+ray_t* ray_enccol_decoded_peek(ray_t* encv);
+
 /* Counters (spec "Instrumentation"); reset by tests. */
 typedef struct {
     uint64_t materialized;

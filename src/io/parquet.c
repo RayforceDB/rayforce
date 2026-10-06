@@ -11,6 +11,7 @@
 #include "core/pool.h"
 #include "core/crc32.h"
 #include "mem/heap.h"
+#include "table/table.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
@@ -2259,19 +2260,17 @@ static bool pq_predicates(ray_parquet_t* r, ray_t* where, pq_predicate* predicat
     if (pos == r->noutput) return false;
     predicates[(*n)++] = (pq_predicate){pos,lo,hi}; return true;
 }
-/* A decoded batch is built in memory by the reader and never holds an encoded
- * slot, so the accessor cannot fail; the error branch keeps the contract. */
-static ray_t* pq_batch_col(ray_t* batch, int64_t c) {
-    ray_t* v = ray_table_col_idx(batch,c);
-    if (v && RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
-    return v;
-}
-static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int64_t n) {
+/* Compacts the batch's columns in place, dropping rows that fail the integer
+ * predicates.  Returns NULL or an owned error. */
+static ray_t* pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int64_t n) {
+    ray_t* cols = ray_table_cols_inplace(batch);
+    if (!cols) return ray_error("type", "parquet: batch holds an encoded column");
+    ray_t** cv = (ray_t**)ray_data(cols);
     int64_t rows = ray_table_nrows(batch), dst = 0, nc = ray_table_ncols(batch);
     for (int64_t i = 0; i < rows; i++) {
         bool keep = true;
         for (int64_t p = 0; p < n && keep; p++) {
-            ray_t* v = pq_batch_col(batch,predicates[p].pos);
+            ray_t* v = cv[predicates[p].pos];
             int64_t x = v->type == RAY_I16 ? ((int16_t*)ray_data(v))[i] :
                 v->type == RAY_I32 ? ((int32_t*)ray_data(v))[i] : ((int64_t*)ray_data(v))[i];
             keep = ray_vec_is_null(v,i) ? predicates[p].lo == INT64_MIN :
@@ -2279,19 +2278,23 @@ static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int
         }
         if (!keep) continue;
         if (dst != i) for (int64_t c = 0; c < nc; c++) {
-            ray_t* v = pq_batch_col(batch,c); size_t size = ray_sym_elem_size(v->type,v->attrs);
+            ray_t* v = cv[c]; size_t size = ray_sym_elem_size(v->type,v->attrs);
             memcpy((uint8_t*)ray_data(v)+(size_t)dst*size,(uint8_t*)ray_data(v)+(size_t)i*size,size);
         }
         dst++;
     }
-    for (int64_t c = 0; c < nc; c++) pq_batch_col(batch,c)->len = dst;
+    for (int64_t c = 0; c < nc; c++) cv[c]->len = dst;
+    return NULL;
 }
 static ray_t* pq_accumulate(ray_parquet_t* r, pq_aggregate* aggs, int64_t n,
                             const uint32_t* gids, const pq_predicate* predicates, int64_t np) {
     for (;;) {
         ray_t* batch = ray_parquet_next(r);
         if (!batch || RAY_IS_ERR(batch)) return batch;
-        if (np) pq_filter_integers(batch,predicates,np);
+        if (np) {
+            ray_t* fe = pq_filter_integers(batch,predicates,np);
+            if (fe) { ray_release(batch); return fe; }
+        }
         int64_t rows = ray_table_nrows(batch);
         for (int64_t a = 0; a < n; a++) {
             ray_t* v = ray_table_col_idx(batch,aggs[a].pos);

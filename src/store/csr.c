@@ -207,6 +207,8 @@ ray_rel_t* ray_rel_from_edges(ray_t* edge_table,
     int64_t dst_sym = ray_sym_intern(dst_col, strlen(dst_col));
     if (src_sym < 0 || dst_sym < 0) return NULL;  /* sym intern OOM */
 
+    /* Known gap: the signature has no error channel, so a column that cannot
+     * materialize declines with NULL and the error message is dropped. */
     ray_t* src_vec = ray_table_col(edge_table, src_sym);
     ray_t* dst_vec = ray_table_col(edge_table, dst_sym);
     if ((src_vec && RAY_IS_ERR(src_vec)) || (dst_vec && RAY_IS_ERR(dst_vec))) {
@@ -276,6 +278,8 @@ ray_rel_t* ray_rel_build(ray_t* from_table, const char* fk_col,
         return NULL;
 
     int64_t fk_sym = ray_sym_intern(fk_col, strlen(fk_col));
+    /* Known gap: a column that cannot materialize declines with NULL and the
+     * error message is dropped (no error channel in the signature). */
     ray_t* fk_vec = ray_table_col(from_table, fk_sym);
     if (fk_vec && RAY_IS_ERR(fk_vec)) { ray_error_free(fk_vec); return NULL; }
     if (!fk_vec || fk_vec->type != RAY_I64) return NULL;
