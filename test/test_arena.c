@@ -424,6 +424,53 @@ static test_result_t test_arena_total_used_multi_chunk(void) {
     PASS();
 }
 
+/* ---- a large arena spills past the anonymous watermark (#712) ----------- *
+ *
+ * A domain's string arena starts with small chunks.  Grown to 64 MiB under a
+ * watermark only 4 MiB above the current footprint, it must not hold that in
+ * anonymous RAM: its chunks grow until they are large enough to be mapped
+ * over spill files.  Every string still reads back. */
+static test_result_t test_arena_spills_past_watermark(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    ray_heap_init();
+    ray_heap_direct_cache_drain();
+    int64_t base = ray_heap_anon_committed();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(base + INT64_C(4) * 1024 * 1024);
+
+    ray_arena_t* arena = ray_arena_new(64 * 1024);
+    char buf[200];
+    memset(buf, 'x', sizeof(buf));
+    const int n = 300000;   /* 300K strings of 200 bytes: ~78 MiB of atoms */
+    ray_t* first = NULL;
+    ray_t* last = NULL;
+    bool ok = arena != NULL;
+    for (int i = 0; i < n && ok; i++) {
+        int k = snprintf(buf, 16, "%d", i);
+        buf[k] = 'x';
+        ray_t* a = ray_arena_str(arena, buf, sizeof(buf));
+        if (!a) ok = false;
+        if (i == 0) first = a;
+        last = a;
+    }
+    int64_t grown = ray_heap_anon_committed() - base;
+    bool bounded = grown < INT64_C(8) * 1024 * 1024;
+    bool readable = ok && first && last &&
+                    memcmp(ray_str_ptr(first), "0x", 2) == 0 &&
+                    memcmp(ray_str_ptr(last), "299999x", 7) == 0 &&
+                    ray_str_len(last) == sizeof(buf);
+    ray_arena_destroy(arena);
+    bool back = ray_heap_anon_committed() == base;
+    ray_heap_set_anon_watermark(previous);
+    ray_heap_destroy();
+    TEST_ASSERT_TRUE(ok && readable);
+    TEST_ASSERT_TRUE(bounded);
+    TEST_ASSERT_TRUE(back);
+    PASS();
+}
+
 /* ---- ray_arena_reset NULL arena guard ----------------------------------- */
 
 static test_result_t test_arena_reset_null(void) {
@@ -452,6 +499,7 @@ const test_entry_t arena_entries[] = {
     { "arena/total_used_null",          test_arena_total_used_null,          NULL, NULL },
     { "arena/total_used_multi_chunk",   test_arena_total_used_multi_chunk,   NULL, NULL },
     { "arena/reset_null",               test_arena_reset_null,               NULL, NULL },
+    { "arena/spills_past_watermark",    test_arena_spills_past_watermark,    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
