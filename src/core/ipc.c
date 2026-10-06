@@ -479,6 +479,7 @@ static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel,
 
 static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 {
+    ray_serde_fail_clear();
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -489,8 +490,16 @@ static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
      * can put on the wire and we drop as before. */
     ray_t* fallback = NULL;
     if (ser_size <= 0) {
-        fallback = ray_error("type", "result of type %s is not serializable over IPC",
-                             result ? ray_type_name(result->type) : "null");
+        const char* fcode = ray_serde_fail_code();
+        if (fcode) {                       /* an encoded column failed to decode: say so */
+            char code[8], msg[256];
+            snprintf(code, sizeof code, "%s", fcode);
+            snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+            fallback = ray_error(code, "%s", msg);
+        } else {
+            fallback = ray_error("type", "result of type %s is not serializable over IPC",
+                                 result ? ray_type_name(result->type) : "null");
+        }
         result   = fallback;
         ser_size = ray_serde_size(result);
         if (ser_size <= 0) { if (fallback) ray_error_free(fallback); return; }

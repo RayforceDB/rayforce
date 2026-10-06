@@ -7175,8 +7175,6 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
     return result;
 }
 
-/* (select {from: t [where: pred] [by: key] [col: expr ...]})
- * Special form — receives unevaluated dict arg. */
 /* Materialize every encoded slot of a table before a verb that reads its
  * columns through the legacy getters, so a corrupt or failed decode returns
  * its own error (code and message) instead of a NULL column.  The decode is
@@ -7196,6 +7194,8 @@ static ray_t* table_decode_all(ray_t* tbl) {
         if (de_) { ray_release(tbl); return de_; } \
     } while (0)
 
+/* (select {from: t [where: pred] [by: key] [col: expr ...]})
+ * Special form — receives unevaluated dict arg. */
 ray_t* ray_select(ray_t** args, int64_t n);
 static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved);
 ray_t* ray_update(ray_t** args, int64_t n);

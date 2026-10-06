@@ -22,6 +22,7 @@
  */
 
 
+#define _POSIX_C_SOURCE 200809L
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
@@ -39,6 +40,8 @@
 #include "store/part.h"
 #include "store/serde.h"
 #include "vec/str.h"
+#include "ipc_harness.h"
+#include "core/ipc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,12 +239,14 @@ static ray_t* bind_gen2_table(const char* name) {
     snprintf(dir, sizeof dir, "%s/%s", CS_TMP, name);
     (void)ray_test_mkdir_p(dir);
     ray_t* k = i64_col(3000, 1); ray_t* v = i64_col(3000, 10);
-    snprintf(p, sizeof p, "%s/k", dir); ray_col_save_gen(k, p, 2);
-    snprintf(p, sizeof p, "%s/v", dir); ray_col_save_gen(v, p, 2);
+    snprintf(p, sizeof p, "%s/k", dir); if (ray_col_save_gen(k, p, 2) != RAY_OK) return NULL;
+    snprintf(p, sizeof p, "%s/v", dir); if (ray_col_save_gen(v, p, 2) != RAY_OK) return NULL;
     ray_release(k); ray_release(v);
     ray_t* names = ray_vec_new(RAY_STR, 2);
     names = ray_str_vec_append(names, "k", 1); names = ray_str_vec_append(names, "v", 1);
-    snprintf(p, sizeof p, "%s/.d", dir); ray_col_save(names, p); ray_release(names);
+    snprintf(p, sizeof p, "%s/.d", dir);
+    ray_err_t de = ray_col_save(names, p); ray_release(names);
+    if (de != RAY_OK) return NULL;
     ray_t* t = ray_read_splayed(dir, NULL);
     if (!t || RAY_IS_ERR(t)) return NULL;
     ray_env_set(ray_sym_intern("t", 1), t);
@@ -465,7 +470,41 @@ static test_result_t test_parted_refuses_gen2(void) {
     PASS();
 }
 
+static void ipc_setup(void) {
+    rt_setup();
+    ray_poll_t* p = ray_poll_create();
+    if (p) ray_runtime_set_poll(p);
+}
+static void ipc_teardown(void) {
+    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
+    if (p) { ray_runtime_set_poll(NULL); ray_poll_destroy(p); }
+    rt_teardown();
+}
+
+/* A result holding a column that fails to decode reaches the client as that
+ * error (code and column path), not as "not serializable". */
+static test_result_t test_ipc_failed_decode(void) {
+    ray_t* t = bind_corrupt_table();
+    TEST_ASSERT_TRUE(t != NULL);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT_TRUE(h >= 0);
+    ray_t* msg = ray_str("t", 1);
+    ray_t* r = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    /* an error frame carries only its code: the message stays on the server */
+    ray_error_free(r);
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_release(t);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/ipc_failed_decode",             test_ipc_failed_decode,              ipc_setup, ipc_teardown },
     { "compress/dml_upsert_copy", test_dml_upsert_copy, rt_setup, rt_teardown },
     { "compress/dml_upsert_inplace", test_dml_upsert_inplace, rt_setup, rt_teardown },
     { "compress/dml_insert_copy", test_dml_insert_copy, rt_setup, rt_teardown },

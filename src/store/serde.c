@@ -220,6 +220,9 @@ static inline bool sym_enc_cacheable(ray_t* obj) {
  * (the message stays in the error slot) so ray_ser reports it as itself. */
 static _Thread_local char g_ser_fail_code[8];
 
+void ray_serde_fail_clear(void) { g_ser_fail_code[0] = '\0'; }
+const char* ray_serde_fail_code(void) { return g_ser_fail_code[0] ? g_ser_fail_code : NULL; }
+
 static int64_t ser_note_col_failure(ray_t* err) {
     const char* code = ray_err_code(err);
     snprintf(g_ser_fail_code, sizeof g_ser_fail_code, "%s", code ? code : "domain");
@@ -644,12 +647,13 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         if (c <= 0) return c;
         /* cols LIST framed by hand, each column through ray_table_col_idx */
         ray_t* cl = slots[1];
+        int64_t ncl = cl ? cl->len : 0;          /* NULL cols: 0 columns, as the size arm */
         uint8_t* lp = buf + c;
         lp[0] = (uint8_t)RAY_LIST;
-        lp[1] = cl->attrs & RAY_SERDE_ATTR_WIRE_MASK;
-        memcpy(lp + 2, &cl->len, 8);
+        lp[1] = cl ? cl->attrs & RAY_SERDE_ATTR_WIRE_MASK : 0;
+        memcpy(lp + 2, &ncl, 8);
         int64_t cols = 1 + 1 + 8;
-        for (int64_t i = 0; i < cl->len; i++) {
+        for (int64_t i = 0; i < ncl; i++) {
             ray_t* col = ray_table_col_idx(obj, i);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); return -1; }
             int64_t child = ray_ser_raw(lp + cols, col);

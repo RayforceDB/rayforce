@@ -324,26 +324,26 @@ bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     return ray_is_vec(c) && ray_vec_has_nulls(c);            /* generation 0: today's scan */
 }
 
-/* Legacy getters (public, include/rayforce.h): resolve through ray_table_col.
- * A success leaves any pending error message of the caller untouched (the
- * getters used to be pure lookups); a failure disposes of the error with
+/* Legacy getters (public, include/rayforce.h).  A plain slot (the common
+ * case) is a pure lookup that leaves the error slot alone; only an encoded
+ * slot saves the pending message, clears the slot and decodes.  Success
+ * restores the pending message; a failure disposes of the error with
  * ray_error_free and returns NULL with its message left in the slot. */
-static ray_t* legacy_col(ray_t* c, const char* pending) {
-    if (c && RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
+static ray_t* legacy_slot(ray_t* slot) {
+    if (!slot || slot->type != RAY_ENCCOL) return slot;
+    char pending[256];
+    snprintf(pending, sizeof pending, "%s", ray_error_msg() ? ray_error_msg() : "");
+    ray_error_clear();
+    ray_t* c = ray_enccol_materialize(slot);
+    if (RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
     if (pending[0]) ray_error_free(ray_error("domain", "%s", pending));
     return c;
 }
 ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
-    char pending[256];
-    snprintf(pending, sizeof pending, "%s", ray_error_msg() ? ray_error_msg() : "");
-    ray_error_clear();
-    return legacy_col(ray_table_col(tbl, name_id), pending);
+    return legacy_slot(tbl_slot_by_name(tbl, name_id));
 }
 ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
-    char pending[256];
-    snprintf(pending, sizeof pending, "%s", ray_error_msg() ? ray_error_msg() : "");
-    ray_error_clear();
-    return legacy_col(ray_table_col_idx(tbl, idx), pending);
+    return legacy_slot(tbl_slot_by_idx(tbl, idx));
 }
 
 /* --------------------------------------------------------------------------
