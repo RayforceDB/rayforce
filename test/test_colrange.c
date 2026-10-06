@@ -479,8 +479,7 @@ static test_result_t parted_case(const char* root, int mask, bool ragged) {
         ray_col_src_t s;
         TEST_ASSERT_NULL(ray_table_col_src(t, id, &s));
         TEST_ASSERT_TRUE(s.obj != NULL);
-        int64_t want = (ragged && c == 2) ? 3000 + 1024 : 3000 + 1024 + 70000;
-        TEST_ASSERT_EQ_I(s.len, want);
+        TEST_ASSERT_EQ_I(s.len, 3000 + 1024 + 70000);         /* ragged b too: its missing rows are nulls */
         TEST_ASSERT_EQ_I(s.type, c == 0 ? RAY_I64 : c == 1 ? RAY_STR : c == 2 ? RAY_F64 : RAY_SYM);
         TEST_ASSERT_TRUE(s.may_null);
         /* reading ranges decodes vectors only: nothing is materialized */
@@ -492,7 +491,11 @@ static test_result_t parted_case(const char* root, int mask, bool ragged) {
         TEST_ASSERT_EQ_U(k.materialized, 0);
         ray_t* w = ray_table_col(t, id);                       /* the materialized reference */
         TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w) && RAY_IS_PARTED(w->type));
-        if (ragged && c == 2) TEST_ASSERT_TRUE(((ray_t**)ray_data(w))[2] == NULL);
+        if (ragged && c == 2) {                                /* the load filled the missing segment */
+            ray_t* g = ((ray_t**)ray_data(w))[2];
+            TEST_ASSERT_TRUE(g && g->type == RAY_F64 && g->len == 70000 && (g->attrs & RAY_ATTR_HAS_NULLS));
+            for (int64_t i = 0; i < g->len; i++) TEST_ASSERT_TRUE(ray_vec_is_null(g, i));
+        }
         if (c == 3 && (mask & 5) == 5) {                       /* generation 2 keeps each segment's width */
             ray_t** sg = (ray_t**)ray_data(w);
             TEST_ASSERT_TRUE((sg[0]->attrs & RAY_SYM_W_MASK) != (sg[2]->attrs & RAY_SYM_W_MASK));
@@ -523,10 +526,30 @@ static test_result_t test_range_parted_mixed(void) {
     PASS();
 }
 
-/* A missing ragged segment holds no rows, as in a generation-0 parted flatten. */
+/* A ragged partition's missing column reads as nulls over its rows (#724).
+ * A missing segment, which only a hand-built wrapper has, holds no rows,
+ * matching ray_parted_nrows (the executor refuses a table whose parted
+ * columns' row counts differ, so a scan never meets one). */
 static test_result_t test_range_parted_ragged(void) {
     RUN(parted_case(CR_TMP "/r5", 0x5, true));
     RUN(parted_case(CR_TMP "/r0", 0x0, true));
+    ray_t* t = load_parted(CR_TMP "/rh", 0x0, false);
+    TEST_ASSERT_TRUE(t != NULL);
+    ray_t* b = ray_table_col(t, ray_sym_intern("b", 1));
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b) && RAY_IS_PARTED(b->type) && b->len == 3);
+    ray_t* w = ray_alloc(3 * sizeof(ray_t*));
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+    w->type = b->type; w->len = 3; w->attrs = 0; memset(w->aux, 0, 16);
+    ray_t** ws = (ray_t**)ray_data(w);
+    for (int i = 0; i < 3; i++) { ws[i] = i == 1 ? NULL : ((ray_t**)ray_data(b))[i]; if (ws[i]) ray_retain(ws[i]); }
+    TEST_ASSERT_EQ_I(ray_parted_nrows(w), 3000 + 70000);
+    ray_col_src_t s;
+    TEST_ASSERT_NULL(ray_col_src_bind(w, &s));
+    TEST_ASSERT_EQ_I(s.len, 3000 + 70000);
+    RUN(walk_parted(&s, w, 5000));
+    ray_col_src_release(&s);
+    ray_release(w);
+    ray_release(t);
     PASS();
 }
 

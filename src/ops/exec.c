@@ -4171,6 +4171,11 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
                 ray_release(seg_tbl);
                 return ray_error("schema", NULL);
             }
+            if (ray_table_col_nrows(seg) != seg_rows) {        /* segments of one partition align */
+                ray_release(seg_tbl);
+                return ray_error("length", "parted table: segment %d of column %lld has %lld rows, expected %lld",
+                                 (int)seg_idx, (long long)c, (long long)ray_table_col_nrows(seg), (long long)seg_rows);
+            }
             seg_tbl = ray_table_add_col(seg_tbl, name_id, seg);   /* encoded or plain, not decoded */
         } else {
             /* Non-parted, non-MAPCOMMON column in a parted table:
@@ -4428,9 +4433,21 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
     int32_t seg_count = 0;
     if (g->table) {
         bool has_flat = false;
+        /* Every parted and MAPCOMMON column covers the same rows: a
+         * flattened column is sized by its own row count and consumers
+         * index up to the table's, so a shorter one (a hand-built wrapper
+         * with a missing segment; ray_read_parted fills those, #724) is
+         * refused here rather than read past its end. */
+        int64_t parted_rows = -1;
         for (int64_t c = 0; c < ray_table_ncols(g->table); c++) {
             ray_col_meta_t m;
             if (!ray_table_col_meta_idx(g->table, c, &m)) continue;
+            if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) {
+                if (parted_rows < 0) parted_rows = m.len;
+                else if (m.len != parted_rows)
+                    return ray_error("length", "parted table: column %lld has %lld rows, expected %lld",
+                                     (long long)c, (long long)m.len, (long long)parted_rows);
+            }
             if (RAY_IS_PARTED(m.type)) {
                 if (seg_count == 0)
                     seg_count = (int32_t)m.n_segs;

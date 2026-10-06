@@ -37,6 +37,7 @@
 #include "table/domain.h"
 #include "lang/cal.h"   /* MONTHDAYS, date_leap_year — calendar-date validation */
 #include "core/numparse.h"  /* ray_parse_i64 — overflow-checked integer names */
+#include "lang/format.h"     /* ray_type_name */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -260,11 +261,66 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
 }
 
 /* --------------------------------------------------------------------------
+ * missing_seg_fill — the segment of a column a ragged partition lacks: `rows`
+ * cells of `type`'s null (the sentinel ray_vec_set_null writes, HAS_NULLS
+ * set; the non-nullable BOOL / U8 read 0; SYM cells are id 0, the empty
+ * symbol, resolved over the db's domain `dom`; LIST cells are the null
+ * object).  Every column of a parted table then has the table's row count,
+ * segment by segment, so a consumer never meets a missing segment (#724).
+ * -------------------------------------------------------------------------- */
+static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
+    if (type == RAY_LIST) {
+        ray_t* l = ray_list_new(rows);
+        if (!l || RAY_IS_ERR(l)) return l ? l : ray_error("oom", NULL);
+        ray_t** e = (ray_t**)ray_data(l);
+        for (int64_t i = 0; i < rows; i++) e[i] = RAY_NULL_OBJ;   /* arena object: no ref */
+        l->len = rows;
+        return l;
+    }
+    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W8, rows) : ray_vec_new(type, rows);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = rows;
+    void* p = ray_data(v);
+    switch (type) {
+        case RAY_F64:
+            for (int64_t i = 0; i < rows; i++) ((double*)p)[i] = NULL_F64;
+            break;
+        case RAY_F32:
+            for (int64_t i = 0; i < rows; i++) ((float*)p)[i] = NULL_F32;
+            break;
+        case RAY_I64: case RAY_TIMESTAMP:
+            for (int64_t i = 0; i < rows; i++) ((int64_t*)p)[i] = NULL_I64;
+            break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+            for (int64_t i = 0; i < rows; i++) ((int32_t*)p)[i] = NULL_I32;
+            break;
+        case RAY_I16:
+            for (int64_t i = 0; i < rows; i++) ((int16_t*)p)[i] = NULL_I16;
+            break;
+        case RAY_SYM: case RAY_STR: case RAY_GUID:     /* id 0, the empty string, the zero GUID */
+        case RAY_BOOL: case RAY_U8:
+            memset(p, 0, (size_t)rows * ray_sym_elem_size(type, v->attrs));
+            break;
+        default:
+            ray_release(v);
+            return ray_error("nyi", "parted: a partition lacks a column of type %s", ray_type_name(type));
+    }
+    if (type != RAY_BOOL && type != RAY_U8 && rows > 0) v->attrs |= RAY_ATTR_HAS_NULLS;
+    if (type == RAY_SYM && dom) {
+        ray_sym_domain_retain(dom);
+        v->sym_domain = dom;          /* the fresh vector holds the immortal runtime domain: no release */
+    }
+    return v;
+}
+
+/* --------------------------------------------------------------------------
  * ray_read_parted — zero-copy open of a partitioned table
  *
  * Builds parted columns (RAY_PARTED_BASE + base_type) where each segment
  * is an mmap'd vector from ray_read_splayed. Also builds a MAPCOMMON column
- * with partition key names and row counts.
+ * with partition key names and row counts.  No segment is missing: a
+ * partition lacking a tail column gets a null-filled segment of its row
+ * count, so every column's segment p has MAPCOMMON row count p.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
@@ -381,8 +437,9 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* Cross-partition schema validation: column association is by INDEX
      * (see the data-column loop below), so every column a partition has
      * must match the first partition's name and type at the same index.
-     * A partition MAY have fewer columns — the missing tail becomes NULL
-     * segments (supported ragged mode) — but never more, and never a
+     * A partition MAY have fewer columns — the missing tail reads as
+     * null-filled segments (supported ragged mode, missing_seg_fill) — but
+     * never more, and never a
      * renamed/retyped column (silent mis-association otherwise).  SYM
      * index width (attrs) may legally differ per partition — partitions
      * written at different dictionary sizes carry different index
@@ -517,8 +574,21 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             ray_t* seg = ray_table_get_col_enc_idx(part_tables[p], c);
             if (seg) any_enc = true;
             else seg = ray_table_col_idx(part_tables[p], c);   /* plain slot: a lookup */
-            if (!seg || RAY_IS_ERR(seg)) continue;             /* ragged: missing segment */
-            ray_retain(seg);
+            if (seg && !RAY_IS_ERR(seg)) {
+                ray_retain(seg);
+                segs[p] = seg;
+                continue;
+            }
+            /* Ragged: partition p lacks this tail column.  Its rows read
+             * as the column's nulls, so the column has the MAPCOMMON row
+             * count of every partition. */
+            if (!seg) seg = missing_seg_fill(m0.type, ray_table_nrows(part_tables[p]), dom);
+            if (!seg || RAY_IS_ERR(seg)) {
+                ray_release(parted);                           /* releases the filled segs */
+                ray_release(result);
+                part_err = seg ? seg : ray_error("oom", NULL);
+                goto fail_tables;
+            }
             segs[p] = seg;
         }
         ray_t* slot = parted;

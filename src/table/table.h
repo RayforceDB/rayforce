@@ -36,6 +36,12 @@
 #include <rayforce.h>
 #include <stdbool.h>
 
+/* Rows of a parted wrapper: the sum of its present segments' lengths (a
+ * MAPCOMMON: the sum of its row counts; anything else: len).  A wrapper from
+ * ray_read_parted has every segment, a ragged partition's absent column
+ * null-filled to the partition's row count, so this is the table's row count
+ * (#724).  A missing segment (hand-built wrappers only) counts 0 rows; the
+ * executor refuses a table whose parted and MAPCOMMON row counts differ. */
 int64_t ray_parted_nrows(ray_t* parted_col);
 
 /* Logical rows of any column object (plain, parted wrapper, MAPCOMMON,

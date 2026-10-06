@@ -9692,7 +9692,8 @@ static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
  * filter, not the key materialization). */
 /* Segment p of a parted slot, borrowed, never decoded: the encoded segment
  * of an encoded slot, else the plain one.  NULL when the slot is absent, not
- * parted, or the segment is missing (ragged partition). */
+ * parted, or the segment is missing (a hand-built wrapper; ray_read_parted
+ * null-fills a ragged partition's absent column). */
 static ray_t* group_parted_seg(ray_t* tbl, int64_t sym, int64_t p) {
     ray_t* enc = ray_table_get_col_enc(tbl, sym);
     if (enc) return ray_enccol_is_parted(enc) ? ray_enccol_seg(enc, p) : NULL;

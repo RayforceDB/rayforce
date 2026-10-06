@@ -180,7 +180,7 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n,
         ray_t** segs = (ray_t**)ray_data(obj);
         int64_t acc = 0;
         for (int64_t i = 0; i < obj->len; i++) {
-            int64_t sl = segs[i] ? ray_table_col_nrows(segs[i]) : 0;   /* missing: no rows */
+            int64_t sl = segs[i] ? ray_table_col_nrows(segs[i]) : 0;   /* missing (hand-built only): no rows */
             if (start < acc + sl) {
                 int64_t local = start - acc;
                 if (n > sl - local) n = sl - local;          /* never cross a segment */
