@@ -943,6 +943,14 @@ static const char* const equiv_skip[] = {
     "equiv/store/splay_open_roundtrip",
     "equiv/store/splay_str_column_roundtrip",
     "equiv/store/part_open",
+    "equiv/lang/eval/insert_parted_e2e",
+    "equiv/lang/eval/insert_parted_rollover",
+    "equiv/lang/eval/insert_parted_errors",
+    "equiv/lang/eval/insert_parted_physical_types",
+    /* runs its own heap lifecycle and leaks a domain into the process-wide
+     * cache on purpose: a second run in the same process (this pass) opens
+     * no domain.  It saves a symbol file only, no table. */
+    "equiv/domain/survives_heap_recycle",
     /* .idx.info of the dict index the save path attaches on its own to a
      * STR column of 65536 rows or more (generation 2 persists none). */
     "equiv/rfl/null/sym_str_null_compare",
@@ -1048,7 +1056,11 @@ int main(int argc, char** argv) {
     /* Equivalence pass: C groups that save and reload tables, then every
      * .rfl file that saves one. */
     static const test_entry_t* const equiv_groups[] = {
-        splay_entries, store_entries, partition_exec_entries, link_entries, NULL,
+        splay_entries, store_entries, partition_exec_entries, link_entries,
+        /* query-heavy groups that save tables */
+        stress_eval_entries, stress_matrix_entries, stress_random_entries,
+        lang_entries, index_entries, csr_entries, domain_entries, sym_entries,
+        NULL,
     };
     char ename[600];
     for (int gi = 0; equiv_groups[gi]; gi++) {
