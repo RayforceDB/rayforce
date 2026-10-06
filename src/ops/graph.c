@@ -24,6 +24,7 @@
 #include "graph.h"
 #include "internal.h"   /* EXT_TRAIL, graph_alloc_ext_node_ex */
 #include "store/csr.h"
+#include "table/table.h"   /* ray_table_col_meta */
 #include "store/hnsw.h"
 #include <string.h>
 
@@ -211,6 +212,14 @@ void ray_graph_free(ray_graph_t* g) {
  * the base type and the wrapper stays where it belongs, on the column.  The
  * executor decides how to read a parted column from the column itself, never
  * from the node. */
+/* Estimated rows as the graph has always recorded them: a parted wrapper's
+ * len (its segment count), MAPCOMMON's len (2), else the row count. */
+static uint32_t scan_est_rows(const ray_col_meta_t* m) {
+    if (RAY_IS_PARTED(m->type)) return (uint32_t)m->n_segs;
+    if (m->type == RAY_MAPCOMMON) return 2;
+    return (uint32_t)m->len;
+}
+
 static int8_t scan_out_type(int8_t col_type) {
     return RAY_IS_PARTED(col_type) ? (int8_t)RAY_PARTED_BASETYPE(col_type)
                                    : col_type;
@@ -229,10 +238,10 @@ ray_op_t* ray_scan(ray_graph_t* g, const char* col_name) {
 
     /* Infer output type from the bound table */
     if (g->table) {
-        ray_t* col = ray_table_get_col(g->table, sym_id);
-        if (col) {
-            ext->base.out_type = scan_out_type(col->type);
-            ext->base.est_rows = (uint32_t)col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta(g->table, sym_id, &m)) {
+            ext->base.out_type = scan_out_type(m.type);
+            ext->base.est_rows = scan_est_rows(&m);
         }
     }
 
@@ -499,8 +508,9 @@ static int8_t cmp_temporal_type(ray_graph_t* g, ray_op_t* x) {
     /* A date-partitioned table's key scans as MAPCOMMON over DATE values. */
     if (t == RAY_MAPCOMMON && x->opcode == OP_SCAN && g->table) {
         ray_op_ext_t* ext = find_ext(g, x->id);
-        ray_t* col = ext ? ray_table_get_col(g->table, ext->sym) : NULL;
-        if (col && col->type == RAY_MAPCOMMON && col->attrs == RAY_MC_DATE)
+        ray_col_meta_t m;
+        if (ext && ray_table_col_meta(g->table, ext->sym, &m)
+            && m.type == RAY_MAPCOMMON && m.attrs == RAY_MC_DATE)
             return RAY_DATE;
     }
     return 0;
@@ -619,8 +629,8 @@ static bool if_branch_is_list_scan(ray_graph_t* g, ray_op_t* b) {
     if (!b || b->opcode != OP_SCAN || !g->table) return false;
     ray_op_ext_t* ext = find_ext(g, b->id);
     if (!ext) return false;
-    ray_t* col = ray_table_get_col(g->table, ext->sym);
-    return col && col->type == RAY_LIST;
+    ray_col_meta_t m;
+    return ray_table_col_meta(g->table, ext->sym, &m) && m.type == RAY_LIST;
 }
 
 /* Is node `id` a bare null atom literal (`0N`, `0Nf`, `0Ni`, ...)? */
@@ -1470,10 +1480,10 @@ ray_op_t* ray_scan_table(ray_graph_t* g, uint16_t table_id, const char* col_name
     /* Infer output type from the specified table */
     ray_t* tbl = g->tables[table_id];
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, sym_id);
-        if (col) {
-            ext->base.out_type = scan_out_type(col->type);
-            ext->base.est_rows = (uint32_t)col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta(tbl, sym_id, &m)) {
+            ext->base.out_type = scan_out_type(m.type);
+            ext->base.est_rows = scan_est_rows(&m);
         }
     }
 

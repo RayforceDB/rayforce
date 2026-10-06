@@ -28,6 +28,9 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "ops/idxop.h"
+#include "ops/agg_engine.h"
+#include "ops/fused_group.h"
+#include "lang/parse.h"
 #include "table/sym.h"
 #include "table/table.h"
 #include "core/runtime.h"
@@ -1729,6 +1732,68 @@ static test_result_t test_parquet_option(void) {
     PASS();
 }
 
+/* A loaded table whose three columns are generation 2. */
+static ray_t* gen2_tbl3(void) {
+    ray_t* t = ray_table_new(3);
+    ray_t* k = i64_col(5000, 1);
+    ray_t* v = ray_vec_new(RAY_F64, 5000); v->len = 5000;
+    for (int i = 0; i < 5000; i++) ((double*)ray_data(v))[i] = i * 0.5;
+    ray_t* s = ray_vec_new(RAY_STR, 5000);
+    for (int i = 0; i < 5000; i++) s = ray_str_vec_append(s, (i & 1) ? "odd value text" : "ev", (i & 1) ? 14 : 2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(k); ray_release(v); ray_release(s);
+    ray_err_t e = ray_splay_save_mode(t, CS_TMP "/plan", NULL, RAY_COMPRESS_ON);
+    ray_release(t);
+    if (e != RAY_OK) return ray_error("io", "save failed");
+    return ray_read_splayed(CS_TMP "/plan", NULL);
+}
+
+static test_result_t test_planning_never_materializes(void) {
+    ray_t* t = gen2_tbl3();
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_enc_counters_reset();
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* keys[] = { ray_scan(g, "k") };
+    ray_op_t* val = ray_scan(g, "v");
+    ray_op_t* ins[] = { val };
+    uint16_t ops[] = { OP_SUM };
+    ray_op_t* grp = ray_group(g, keys, 1, ops, ins, 1);
+    (void)agg_v2_admission(g, grp, t);
+    ray_op_t* p = ray_gt(g, ray_scan(g, "k"), ray_const_i64(g, 5));
+    (void)ray_optimize(g, p);
+    ray_t* e1 = ray_parse("(> k 5)");
+    ray_t* e2 = ray_parse("(like s \"odd*\")");
+    ray_t* e3 = ray_parse("(in k [1 2 3])");
+    (void)ray_fused_group_supported(e1, t);
+    (void)ray_fused_group_supported(e2, t);
+    (void)ray_fused_group_supported(e3, t);
+    ray_enc_counters_t c; ray_enc_counters_get(&c);
+    TEST_ASSERT_EQ_U(c.materialized, 0);
+    TEST_ASSERT_EQ_U(c.decoded_bytes, 0);
+    ray_release(e1); ray_release(e2); ray_release(e3);
+    ray_graph_free(g);
+    ray_release(t);
+    PASS();
+}
+
+static test_result_t test_exec_start_snapshot(void) {
+    ray_t* t = gen2_tbl3();
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_enc_counters_reset();
+    ray_enc_counters_t c; ray_enc_counters_get(&c);
+    TEST_ASSERT_EQ_U(c.at_first_exec, UINT64_MAX);
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* s = ray_scan(g, "k");
+    ray_t* out = ray_execute(g, s);
+    TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out));
+    ray_enc_counters_get(&c);
+    TEST_ASSERT_EQ_U(c.at_first_exec, 0);         /* nothing before execution */
+    ray_release(out); ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -1780,5 +1845,7 @@ const test_entry_t compress_entries[] = {
     { "compress/legacy_transient_no_leak",      test_legacy_transient_no_leak,       cs_setup, cs_teardown },
     { "compress/db_splayed_set_forms", test_db_splayed_set_forms, rt_setup, rt_teardown },
     { "compress/csv_parted_option",    test_csv_parted_option,    rt_setup, rt_teardown },
+    { "compress/planning_never_materializes", test_planning_never_materializes, cs_setup, cs_teardown },
+    { "compress/exec_start_snapshot",         test_exec_start_snapshot,         cs_setup, cs_teardown },
     { NULL, NULL, NULL, NULL },
 };

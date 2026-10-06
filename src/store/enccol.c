@@ -301,13 +301,20 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
 
 static _Atomic(uint64_t) g_enc_materialized;
 static _Atomic(uint64_t) g_enc_decoded_bytes;
+static _Atomic(uint64_t) g_enc_at_first_exec = UINT64_MAX;
+void ray_enc_note_exec_start(void) {
+    uint64_t want = UINT64_MAX;
+    atomic_compare_exchange_strong(&g_enc_at_first_exec, &want, atomic_load(&g_enc_materialized));
+}
 void ray_enc_counters_get(ray_enc_counters_t* o) {
+    o->at_first_exec = atomic_load(&g_enc_at_first_exec);
     o->materialized  = atomic_load(&g_enc_materialized);
     o->decoded_bytes = atomic_load(&g_enc_decoded_bytes);
 }
 void ray_enc_counters_reset(void) {
     atomic_store(&g_enc_materialized, 0);
     atomic_store(&g_enc_decoded_bytes, 0);
+    atomic_store(&g_enc_at_first_exec, UINT64_MAX);
 }
 
 uint8_t ray_enccol_esz(const ray_enccol_t* e) { return ray_sym_elem_size(e->type, e->attrs); }

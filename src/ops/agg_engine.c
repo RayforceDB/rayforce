@@ -7,6 +7,7 @@
 #include "ops/rowsel.h"    /* ray_rowsel_meta, ray_rowsel_to_indices */
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
+#include "table/table.h"
 #include "table/sym.h"    /* ray_read_sym */
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include <stdlib.h>
@@ -101,8 +102,8 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (ext->n_keys == 1 && op_node(g, ext->keys[0]) && op_node(g, ext->keys[0])->opcode == OP_SCAN) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
         if (ke && ke->sym == ray_sym_intern("_src", 4)) {
-            ray_t* cnt = ray_table_get_col(tbl, ray_sym_intern("_count", 6));
-            if (cnt && cnt->type == RAY_I64) return AGG_V2_SHAPE;
+            ray_col_meta_t cm;
+            if (ray_table_col_meta(tbl, ray_sym_intern("_count", 6), &cm) && cm.type == RAY_I64) return AGG_V2_SHAPE;
         }
     }
 
@@ -111,9 +112,9 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_op_t* key = op_node(g, ext->keys[k]);
         if (!key || key->opcode != OP_SCAN) return AGG_V2_KEY_EXPRESSION;
         ray_op_ext_t* kext = find_ext(g, key->id);
-        ray_t* kc = kext ? ray_table_get_col(tbl, kext->sym) : NULL;
-        if (!kc) return AGG_V2_SHAPE;
-        switch (kc->type) {
+        ray_col_meta_t km;
+        if (!kext || !ray_table_col_meta(tbl, kext->sym, &km)) return AGG_V2_SHAPE;
+        switch (km.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
             case RAY_TIMESTAMP: case RAY_SYM:
@@ -133,14 +134,15 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         bool floating = false, indexed = false;
         for (uint32_t k = 0; k < ext->n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
-            ray_t* col = ray_table_get_col(tbl, ke->sym);
-            if (col->type == RAY_F32 || col->type == RAY_F64) floating = true;
-            if (col->type == RAY_STR || col->type == RAY_GUID || col->type == RAY_LIST) indexed = true;
+            ray_col_meta_t cm;
+            if (!ray_table_col_meta(tbl, ke->sym, &cm)) continue;
+            if (cm.type == RAY_F32 || cm.type == RAY_F64) floating = true;
+            if (cm.type == RAY_STR || cm.type == RAY_GUID || cm.type == RAY_LIST) indexed = true;
         }
         for (uint32_t a = 0; a < ext->n_aggs; a++) {
             ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-            ray_t* col = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
-            if (col && agg_indexed_supported(ext->agg_ops[a], col->type)) indexed = true;
+            ray_col_meta_t cm;
+            if (ie && ray_table_col_meta(tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
         }
         if (floating && !indexed) return AGG_V2_PARALLEL_WIDE;
     }
@@ -153,9 +155,10 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             ray_op_t* in = op_node(g, ext->agg_ins[a]);
             if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* ie = find_ext(g, in->id);
-            ray_t* ic = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
-            if (ic && agg_indexed_supported(ext->agg_ops[a], ic->type)) continue;
-            const agg_vtable_t* vt = ic ? agg_resolve(ext->agg_ops[a], ic->type) : NULL;
+            ray_col_meta_t im;
+            bool ih = ie && ray_table_col_meta(tbl, ie->sym, &im);
+            if (ih && agg_indexed_supported(ext->agg_ops[a], im.type)) continue;
+            const agg_vtable_t* vt = ih ? agg_resolve(ext->agg_ops[a], im.type) : NULL;
             if (!vt) return AGG_V2_AGG_TYPE;
             if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
             continue;  /* admitted */
@@ -165,11 +168,11 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             ray_op_t* xin = op_node(g, ext->agg_ins[a]); ray_op_t* yin = op_node(g, ext->agg_ins2[a]);
             if (!xin || xin->opcode != OP_SCAN || !yin || yin->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* xe = find_ext(g, xin->id); ray_op_ext_t* ye = find_ext(g, yin->id);
-            ray_t* xc = xe ? ray_table_get_col(tbl, xe->sym) : NULL;
-            ray_t* yc = ye ? ray_table_get_col(tbl, ye->sym) : NULL;
-            if (!xc || !yc) return AGG_V2_SHAPE;
-            if (!agg_resolve(ext->agg_ops[a], xc->type)) return AGG_V2_AGG_TYPE;
-            if (!agg_resolve(ext->agg_ops[a], yc->type)) return AGG_V2_AGG_TYPE;
+            ray_col_meta_t xm, ym;
+            if (!xe || !ye || !ray_table_col_meta(tbl, xe->sym, &xm)
+                || !ray_table_col_meta(tbl, ye->sym, &ym)) return AGG_V2_SHAPE;
+            if (!agg_resolve(ext->agg_ops[a], xm.type)) return AGG_V2_AGG_TYPE;
+            if (!agg_resolve(ext->agg_ops[a], ym.type)) return AGG_V2_AGG_TYPE;
             continue;  /* admitted */
         }
         if (ext->agg_ops[a] == OP_COUNT) {
@@ -180,10 +183,10 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
         ray_op_ext_t* ie = find_ext(g, in->id);
-        ray_t* ic = (ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
-        if (!ic) return AGG_V2_SHAPE;
-        if (agg_indexed_supported(ext->agg_ops[a], ic->type)) continue;
-        const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], ic->type);
+        ray_col_meta_t im;
+        if (!ie || !ray_table_col_meta(tbl, ie->sym, &im)) return AGG_V2_SHAPE;
+        if (agg_indexed_supported(ext->agg_ops[a], im.type)) continue;
+        const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], im.type);
         if (!vt) return AGG_V2_AGG_TYPE;
         if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
         /* The streaming 64-bit integer avg packs its 128-bit high word with
@@ -191,8 +194,8 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * group has fewer than 2^32 rows; the narrower kernels keep a plain
          * int64 sum, exact below 2^31 rows.  A table that large keeps the
          * legacy engines, whose accumulators carry a full high word. */
-        if (ext->agg_ops[a] == OP_AVG && ic->type != RAY_F64 && ic->type != RAY_F32 &&
-            ray_table_nrows(tbl) >= ((int64_t)1 << ((ic->type == RAY_I64 || ic->type == RAY_TIMESTAMP) ? 32 : 31)))
+        if (ext->agg_ops[a] == OP_AVG && im.type != RAY_F64 && im.type != RAY_F32 &&
+            ray_table_nrows(tbl) >= ((int64_t)1 << ((im.type == RAY_I64 || im.type == RAY_TIMESTAMP) ? 32 : 31)))
             return AGG_V2_AGG_TYPE;
     }
     return AGG_V2_ADMITTED;
@@ -976,8 +979,9 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
     vo->block = 0;
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
-        int8_t in_type = vc ? vc->type : RAY_I64;
+        ray_col_meta_t vm;
+        bool vh = ext->agg_ops[a] != OP_COUNT && ie && ray_table_col_meta(tbl, ie->sym, &vm);
+        int8_t in_type = vh ? vm.type : RAY_I64;
         vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
         vo->off[a] = vo->block;
         vo->block += vo->vts[a]->state_size;
@@ -6386,10 +6390,10 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         if (!has_in) { if (aop == OP_COUNT) continue; return false; }
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         if (!ie || ie->base.opcode != OP_SCAN) return false;
-        ray_t* col = ray_table_get_col(tbl, ie->sym);
-        if (!col) return false;
+        ray_col_meta_t cm;
+        if (!ray_table_col_meta(tbl, ie->sym, &cm)) return false;
         if (aop == OP_COUNT) continue;
-        switch (col->type) {
+        switch (cm.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
             default: return false;   /* floats: the fold order shows in the value */
@@ -6621,8 +6625,8 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* col = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
-        if (col && agg_indexed_supported(ext->agg_ops[a], col->type)) indexed = true;
+        ray_col_meta_t cm;
+        if (ie && ray_table_col_meta(tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
     }
     if (indexed) {
         if (sel) {

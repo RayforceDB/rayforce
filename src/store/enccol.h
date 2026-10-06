@@ -100,7 +100,12 @@ uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width *
 ray_t* ray_enccol_materialize(ray_t* encv);
 
 /* Counters (spec "Instrumentation"); reset by tests. */
-typedef struct { uint64_t materialized; uint64_t decoded_bytes; } ray_enc_counters_t;
+typedef struct {
+    uint64_t materialized;
+    uint64_t decoded_bytes;
+    uint64_t at_first_exec;   /* materialized when the first ray_execute since the last reset started; UINT64_MAX until then */
+} ray_enc_counters_t;
+void   ray_enc_note_exec_start(void);
 void   ray_enc_counters_get(ray_enc_counters_t* out);
 void   ray_enc_counters_reset(void);
 

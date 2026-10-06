@@ -28,6 +28,7 @@
 #include "vec/vec.h"
 #include "opt.h"
 #include "idiom.h"
+#include "table/table.h"   /* ray_table_col_meta */
 #include "core/profile.h"
 #include "mem/heap.h"
 #include <float.h>
@@ -1975,8 +1976,10 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             tbl = g->table;
         if (!tbl) continue;
 
-        ray_t* mc_col = ray_table_get_col(tbl, scan_ext->sym);
-        if (!mc_col || mc_col->type != RAY_MAPCOMMON) continue;
+        ray_col_meta_t mm;
+        if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
+        ray_t* mc_col = ray_table_get_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
+        if (!mc_col || RAY_IS_ERR(mc_col)) continue;
 
         /* Extract constant value */
         ray_op_ext_t* const_ext = find_ext(g, const_node->id);
@@ -2162,8 +2165,8 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             memcpy(&sn_tid, sn_ext->base.pad, sizeof(uint16_t));
             if (sn_tid != stored_table_id) continue;
 
-            ray_t* sn_col = ray_table_get_col(tbl, sn_ext->sym);
-            if (!sn_col || !RAY_IS_PARTED(sn_col->type)) continue;
+            ray_col_meta_t sm;
+            if (!ray_table_col_meta(tbl, sn_ext->sym, &sm) || !RAY_IS_PARTED(sm.type)) continue;
 
             if (sn_ext->seg_mask) {
                 /* AND with existing mask (conjunctive filters) */

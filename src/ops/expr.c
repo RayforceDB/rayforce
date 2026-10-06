@@ -25,6 +25,7 @@
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name */
 #include "ops/rowsel.h"
+#include "table/table.h"   /* ray_table_col_meta */
 #include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE per-morsel zone-skip */
 #include <stdio.h>
 #include <stdlib.h>
@@ -723,10 +724,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     if (other && other->opcode == OP_CONST) safe = true;
                     else if (other && other->opcode == OP_SCAN) {
                         ray_op_ext_t* oe = find_ext(g, other->id);
-                        ray_t* oc = oe ? ray_table_get_col(tbl, oe->sym) : NULL;
-                        if (oc && (RAY_IS_PARTED(oc->type)
-                                   ? RAY_PARTED_BASETYPE(oc->type) == RAY_SYM
-                                   : oc->type == RAY_SYM))
+                        ray_col_meta_t om;
+                        bool oh = oe && ray_table_col_meta(tbl, oe->sym, &om);
+                        if (oh && (RAY_IS_PARTED(om.type)
+                                   ? RAY_PARTED_BASETYPE(om.type) == RAY_SYM
+                                   : om.type == RAY_SYM))
                             safe = true;
                     }
                 }

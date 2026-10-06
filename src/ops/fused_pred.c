@@ -38,6 +38,7 @@
 #include "ops/fused_group.h"  /* ray_fused_group_supported decl */
 #include "ops/fused_pred.h"
 #include "table/domain.h"     /* sym-domain resolution */
+#include "table/table.h"       /* ray_table_col_meta */
 #include "ops/idxop.h"        /* RAY_IDX_CHUNK_ZONE chunk-skip in fp_eval_cmp */
 #include "lang/eval.h"        /* ATTR_QUOTED */
 
@@ -120,6 +121,15 @@ static int fp_col_supported(const ray_t* col) {
     return col && !ray_vec_has_nulls(col);
 }
 
+/* Metadata forms of fp_col_supported_op / fp_col_supported: nullability
+ * from ray_table_col_has_nulls, never a decode. */
+static int fp_meta_supported_op(ray_t* tbl, int64_t sym, const ray_col_meta_t* m, int eq_or_ne) {
+    if (m->type >= RAY_BOOL && m->type <= RAY_TIMESTAMP) return 1;
+    if (m->type == RAY_GUID || m->type == RAY_STR) return 1;
+    if (eq_or_ne && m->type == RAY_SYM) return 1;
+    return !ray_table_col_has_nulls(tbl, sym);
+}
+
 static int fp_expr_const_str(ray_t* expr) {
     if (!expr) return 0;
     if (expr->type == -RAY_STR && !(expr->attrs & ATTR_QUOTED)) return 1;
@@ -167,10 +177,10 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
      * compile agree — divergence here means the executor returns
      * `nyi` on shapes the planner thought were ok. */
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, lhs->i64);
-        if (!col) return -1;
-        if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return -1;
-        int8_t ct = col->type;
+        ray_col_meta_t m;
+        if (!ray_table_col_meta(tbl, lhs->i64, &m)) return -1;
+        if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return -1;
+        int8_t ct = m.type;
         int is_ord = (code >= 2);  /* LT/LE/GT/GE */
         if (is_ord && ct == RAY_SYM) return -1;
         /* Dict-encoded STR: EQ/NE only, compared on the int32 code vector
@@ -179,7 +189,7 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
          * are meaningless on first-occurrence codes, so reject them. */
         int is_dict_str = (ct == RAY_STR && !is_ord
                            && rhs->type == -RAY_STR
-                           && ray_index_kind(col) == RAY_IDX_DICT);
+                           && m.index_kind == RAY_IDX_DICT);
         /* Only types with a matching typed comparison implementation. */
         if (!is_dict_str
             && ct != RAY_SYM && ct != RAY_BOOL && ct != RAY_U8
@@ -187,7 +197,7 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
             && ct != RAY_DATE && ct != RAY_TIME && ct != RAY_TIMESTAMP
             && ct != RAY_F32 && ct != RAY_F64 && ct != RAY_STR && ct != RAY_GUID)
             return -1;
-        if (!fp_col_supported_op(col, code == 0 || code == 1)) return -1;
+        if (!fp_meta_supported_op(tbl, lhs->i64, &m, code == 0 || code == 1)) return -1;
         if (!is_dict_str && !fp_atom_col_compatible(rhs->type, ct)) return -1;
     }
     return code;
@@ -207,12 +217,12 @@ static int fp_check_like(ray_t* expr, ray_t* tbl) {
         return 0;
     if (!fp_expr_const_str(elems[2])) return 0;
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, lhs->i64);
+        ray_col_meta_t m;
         /* A null text cell is the empty string on every like path (the
          * kernel and this evaluator both match the pattern against ""),
          * so a nullable column is admitted. */
-        if (!col) return 0;
-        if (col->type != RAY_STR && col->type != RAY_SYM) return 0;
+        if (!ray_table_col_meta(tbl, lhs->i64, &m)) return 0;
+        if (m.type != RAY_STR && m.type != RAY_SYM) return 0;
     }
     return 1;
 }
@@ -241,10 +251,10 @@ static int fp_check_in(ray_t* expr, ray_t* tbl) {
     if (ray_len(rhs) > 16) return 0;
     if (!fp_int_family(rhs->type)) return 0;
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, lhs->i64);
-        if (!col || !fp_col_supported(col)) return 0;
-        if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return 0;
-        if (!fp_int_family(col->type)) return 0;
+        ray_col_meta_t m;
+        if (!ray_table_col_meta(tbl, lhs->i64, &m) || ray_table_col_has_nulls(tbl, lhs->i64)) return 0;
+        if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
+        if (!fp_int_family(m.type)) return 0;
     }
     return 1;
 }

@@ -25,6 +25,7 @@
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name (error context) */
 #include "ops/rowsel.h"
+#include "store/enccol.h"
 #include "ops/fused_group.h"
 #include "ops/idxop.h"
 #include "ops/hash.h"
@@ -4293,6 +4294,7 @@ static ray_t* flatten_parted_col(ray_t* col) {
 }
 
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
+    ray_enc_note_exec_start();
     if (!g || !root) return ray_error("nyi", NULL);
 
     /* Lazy-init the global thread pool on first call */
