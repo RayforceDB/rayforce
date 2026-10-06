@@ -9556,7 +9556,7 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
             slot->attrs = mc->attrs;
             memcpy(slot->aux, mc->aux, sizeof slot->aux);
             ((ray_t**)ray_data(slot))[0] = nkv;                  /* adopts the new refs */
-            ((ray_t**)ray_data(slot))[1] = nrc;
+            ((ray_t**)ray_data(slot))[1] = nrc;   /* not-a-table */
         } else {
             ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
             ray_t* w = enc ? NULL : ray_table_col_idx(tbl, c);   /* plain wrapper: no decode */
@@ -17922,7 +17922,7 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
         return ray_error("corrupt", "insert: parted target has non-canonical table metadata");
     ray_t* schema = ray_table_schema(tbl);
     if (!schema || RAY_IS_ERR(schema) || schema->type != RAY_I64 ||
-        schema->attrs != 0 || schema->len < 0)
+        schema->attrs != 0 || schema->len < 0 || !ray_table_cols_canonical(tbl))
         return ray_error("corrupt", "insert: parted target has a malformed table container");
     int64_t ncols = ray_table_ncols(tbl);
     /* Canonical layout: every schema position holds a column slot. */
@@ -19220,6 +19220,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 return src_col;
             }
             if (!src_col) {
+                for (int64_t k = 0; k < c; k++) ray_release(trl[k]);
                 tbl_row_list->len = 0;
                 ray_free(tbl_row_list);
                 ray_release(tbl); ray_release(row_orig);
@@ -19488,33 +19489,38 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
     /* The rebuild copies every column: read them all first, so a column
      * that fails to materialize returns before anything is built (the
      * loop below then reads the cached columns). */
+    /* Every exit below releases the row payload carriers and the operands. */
+    #define INSERT_REBUILD_FREE() do {                                          \
+        if (dict_vals) {                                                        \
+            ray_t** dv_ = (ray_t**)ray_data(dict_vals);                         \
+            for (int64_t k_ = 0; k_ < ncols; k_++) if (dv_[k_]) ray_release(dv_[k_]); \
+            dict_vals->len = 0; /* prevent ray_free from double-releasing children */ \
+            ray_free(dict_vals);                                                \
+        }                                                                       \
+        if (tbl_row_list) {                                                     \
+            ray_t** trl_ = (ray_t**)ray_data(tbl_row_list);                     \
+            for (int64_t k_ = 0; k_ < ncols; k_++) if (trl_[k_]) ray_release(trl_[k_]); \
+            tbl_row_list->len = 0;                                              \
+            ray_free(tbl_row_list);                                             \
+        }                                                                       \
+        ray_release(tbl);                                                       \
+        ray_release(row_orig);                                                  \
+    } while (0)
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_col_idx(tbl, c);
         if (!col || !RAY_IS_ERR(col)) continue;
-        if (dict_vals) {
-            ray_t** dv = (ray_t**)ray_data(dict_vals);
-            for (int64_t k = 0; k < ncols; k++) if (dv[k]) ray_release(dv[k]);
-            dict_vals->len = 0;
-            ray_free(dict_vals);
-        }
-        if (tbl_row_list) {
-            ray_t** trl = (ray_t**)ray_data(tbl_row_list);
-            for (int64_t k = 0; k < ncols; k++) if (trl[k]) ray_release(trl[k]);
-            tbl_row_list->len = 0;
-            ray_free(tbl_row_list);
-        }
-        ray_release(tbl); ray_release(row_orig);
+        INSERT_REBUILD_FREE();
         return col;
     }
 
     ray_t* result = ray_table_new(ncols);
-    if (RAY_IS_ERR(result)) return result;
+    if (RAY_IS_ERR(result)) { INSERT_REBUILD_FREE(); return result; }
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t col_name = ray_table_col_name(tbl, c);
         ray_t* orig_col = ray_table_col_idx(tbl, c);      /* read above: cached */
         if (!orig_col || RAY_IS_ERR(orig_col)) {
-            ray_release(result);
+            ray_release(result); INSERT_REBUILD_FREE();
             return orig_col ? orig_col : ray_error("domain", "insert: target column %lld is missing", (long long)c);
         }
         int8_t ct = orig_col->type;
@@ -19529,17 +19535,17 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             ray_t* new_col = append_boxed_table_col(
                 orig_col, row_elems[c], tbl_row_list != NULL);
             if (!new_col || RAY_IS_ERR(new_col)) {
-                ray_release(result);
+                ray_release(result); INSERT_REBUILD_FREE();
                 return new_col ? new_col : ray_error("oom", NULL);
             }
             result = ray_table_add_col(result, col_name, new_col);
             ray_release(new_col);
-            if (!result || RAY_IS_ERR(result)) return result;
+            if (!result || RAY_IS_ERR(result)) { INSERT_REBUILD_FREE(); return result; }
             continue;
         }
 
         ray_t* new_col = ray_vec_new(ct, nrows + 1);
-        if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
+        if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
 
         /* Copy existing data */
         bool src_has_nulls = ray_vec_may_have_nulls(orig_col);
@@ -19554,7 +19560,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                     const char* sp = ray_str_vec_get(orig_col, r, &slen);
                     new_col = ray_str_vec_append(new_col, sp ? sp : "", sp ? slen : 0);
                 }
-                if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
+                if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
             }
         } else if (ct == RAY_SYM) {
             /* The output MIXES orig_col cells with the appended row value
@@ -19563,7 +19569,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             for (int64_t r = 0; r < nrows; r++) {
                 int64_t sym_val = sym_cell_runtime_id(orig_col, r);
                 new_col = ray_vec_append(new_col, &sym_val);
-                if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
+                if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
                 if (src_has_nulls && ray_vec_is_null(orig_col, r))
                     ray_vec_set_null(new_col, new_col->len - 1, true);
             }
@@ -19572,7 +19578,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             uint8_t* src = (uint8_t*)ray_data(orig_col);
             for (int64_t r = 0; r < nrows; r++) {
                 new_col = ray_vec_append(new_col, src + r * elem_sz);
-                if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
+                if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
                 if (src_has_nulls && ray_vec_is_null(orig_col, r))
                     ray_vec_set_null(new_col, new_col->len - 1, true);
             }
@@ -19613,28 +19619,16 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         } else {
             new_col = append_atom_to_col(new_col, row_elems[c]);
         }
-        if (RAY_IS_ERR(new_col)) { ray_release(result); return new_col; }
+        if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
 
         result = ray_table_add_col(result, col_name, new_col);
         ray_release(new_col);
-        if (RAY_IS_ERR(result)) return result;
+        if (RAY_IS_ERR(result)) { INSERT_REBUILD_FREE(); return result; }
     }
 
     /* Cleanup dict_vals, tbl_row_list, and original row */
-    if (dict_vals) {
-        ray_t** dv = (ray_t**)ray_data(dict_vals);
-        for (int64_t c = 0; c < ncols; c++) if (dv[c]) ray_release(dv[c]);
-        dict_vals->len = 0; /* prevent ray_free from double-releasing children */
-        ray_free(dict_vals);
-    }
-    if (tbl_row_list) {
-        ray_t** trl = (ray_t**)ray_data(tbl_row_list);
-        for (int64_t c = 0; c < ncols; c++) if (trl[c]) ray_release(trl[c]);
-        tbl_row_list->len = 0;
-        ray_free(tbl_row_list);
-    }
-    ray_release(tbl);
-    ray_release(row_orig);
+    INSERT_REBUILD_FREE();
+    #undef INSERT_REBUILD_FREE
 
     /* In-place: store the new table in the env and return the symbol. */
     if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
@@ -21855,7 +21849,10 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         if (left_time && RAY_IS_ERR(left_time)) { for (int i = 0; i < 4; i++) ray_release(eargs[i]); return left_time; }
         ray_t* right_time = ray_table_col(right_tbl, time_key);
         if (right_time && RAY_IS_ERR(right_time)) { for (int i = 0; i < 4; i++) ray_release(eargs[i]); return right_time; }
-        if (!left_time || !right_time) return ray_error("domain", "window-join: time key column not found in both tables");
+        if (!left_time || !right_time) {
+            for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+            return ray_error("domain", "window-join: time key column not found in both tables");
+        }
 
         /* Get equality columns.  One calloc'd carve holds every n_eq-sized eq
          * buffer: five pointer arrays (left_eq/right_eq/eq_data/left_eq_hdr/
@@ -22400,7 +22397,9 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         /* Build result table: left columns + every aggregation column */
         int64_t ncols = ray_table_ncols(left_tbl);
         ray_t* result = ray_table_new(ncols + n_agg);
-        for (int64_t c = 0; c < ncols; c++) {
+        if (!result) result = ray_error("oom", NULL);
+        /* ray_table_add_col consumes `result` on failure: stop adding then. */
+        for (int64_t c = 0; c < ncols && !RAY_IS_ERR(result); c++) {
             int64_t cn = ray_table_col_name(left_tbl, c);
             ray_t* cv = ray_table_get_col_enc_idx(left_tbl, c);
             if (!cv) cv = ray_table_col_idx(left_tbl, c);
@@ -22409,7 +22408,8 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             ray_release(cv);
         }
         for (int64_t a = 0; a < n_agg; a++) {
-            result = ray_table_add_col(result, agg_names[a], agg_result_vecs[a]);
+            if (!RAY_IS_ERR(result))
+                result = ray_table_add_col(result, agg_names[a], agg_result_vecs[a]);
             ray_release(agg_result_vecs[a]);
         }
         for (int i = 0; i < 4; i++) ray_release(eargs[i]);

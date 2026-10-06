@@ -447,6 +447,14 @@ ray_t* ray_table_schema(ray_t* tbl) {
     return tbl_schema(tbl);
 }
 
+bool ray_table_cols_canonical(ray_t* tbl) {
+    if (!tbl_is_table(tbl)) return false;
+    ray_t* schema = tbl_schema(tbl);
+    ray_t* cols = tbl_cols(tbl);
+    return schema && !RAY_IS_ERR(schema) && cols && !RAY_IS_ERR(cols) &&
+           cols->type == RAY_LIST && cols->attrs == 0 && cols->len == schema->len;
+}
+
 ray_t* ray_table_cols_inplace(ray_t* tbl) {
     if (!tbl_is_table(tbl)) return NULL;
     ray_t* cols = tbl_cols(tbl);

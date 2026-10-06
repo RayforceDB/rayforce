@@ -74,4 +74,8 @@ bool    ray_table_col_has_nulls(ray_t* tbl, int64_t name_id);
  * their copy route).  Ownership checks (rc) stay with the caller. */
 ray_t*  ray_table_cols_inplace(ray_t* tbl);
 
+/* The column-list container is canonical: a RAY_LIST with zero attrs whose
+ * length is the schema's.  Reads only the container header, never a slot. */
+bool    ray_table_cols_canonical(ray_t* tbl);
+
 #endif /* RAY_TABLE_H */

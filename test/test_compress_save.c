@@ -427,10 +427,13 @@ static test_result_t test_failed_decode_propagates(void) {
     }
     /* An update that never reads the failing column does not decode it: the
      * verbs read encoded columns lazily, so it succeeds and passes `a` on. */
-    ray_t* ok = ray_eval_str("(update {b: 1 from: t where: (== b 5)})");
-    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok) && ok->type == RAY_TABLE);
-    TEST_ASSERT_TRUE(ray_table_get_col_enc(ok, ray_sym_intern("a", 1)) != NULL);
-    ray_release(ok);
+    static const char* const lazy[] = { "(update {b: 1 from: t where: (== b 5)})", "(update {b: 1 from: t})" };
+    for (size_t i = 0; i < 2; i++) {
+        ray_t* ok = ray_eval_str(lazy[i]);
+        TEST_ASSERT_FMT(ok && !RAY_IS_ERR(ok) && ok->type == RAY_TABLE, "%s", lazy[i]);
+        TEST_ASSERT_TRUE(ray_table_get_col_enc(ok, ray_sym_intern("a", 1)) != NULL);
+        ray_release(ok);
+    }
     /* a splayed re-save */
     ray_error_clear();
     TEST_ASSERT_EQ_I(ray_splay_save(t, CS_TMP "/resave", NULL), RAY_ERR_CORRUPT);
@@ -4297,6 +4300,8 @@ static test_result_t test_dml_parted_gen2(void) {
         if (m) TEST_ASSERT_TRUE(ray_table_get_col_enc(t, ray_sym_intern("a", 1)) != NULL);
         ray_env_set(ray_sym_intern("pt", 2), t);
         ray_release(t);
+        int64_t sum0 = ev_i64("(sum (at pt 'a))"), sumb0 = ev_i64("(sum (at pt 'b))");
+        TEST_ASSERT_TRUE(sum0 != INT64_MIN && sumb0 != INT64_MIN);
         for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
             int64_t v = ev_i64(qs[i]);
             TEST_ASSERT_FMT(v != INT64_MIN, "%s (mask %u): %s", qs[i], masks[m], ev_code(qs[i]));
@@ -4305,8 +4310,40 @@ static test_result_t test_dml_parted_gen2(void) {
                                  (long long)v, (long long)want[i]);
         }
         TEST_ASSERT_STR_EQ(ev_code("(upsert pt 'a (list 1 2))"), "nyi");
+        /* the by-value verbs left the bound table as it was */
+        TEST_ASSERT_EQ_I(ev_i64("(count pt)"), 9000);
+        TEST_ASSERT_EQ_I(ev_i64("(sum (at pt 'a))"), sum0);
+        TEST_ASSERT_EQ_I(ev_i64("(sum (at pt 'b))"), sumb0);
         ray_env_set(ray_sym_intern("pt", 2), NULL);
     }
+    PASS();
+}
+
+/* The live-tail insert still refuses a parted target whose column-list
+ * container is not canonical (a LIST with zero attrs, as long as the schema),
+ * and accepts the canonical one. */
+static test_result_t test_parted_insert_container(void) {
+    ray_t* t = pdb_make(CS_TMP "/pc", 7, false);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_env_set(ray_sym_intern("pt", 2), t);
+    ray_t* cols = ((ray_t**)ray_data(t))[1];       /* test-only container edits, restored */
+    const char* q = "(insert pt 2024.01.03 (list 7 8))";
+    uint8_t a0 = cols->attrs;
+    cols->attrs = 1;
+    ray_error_clear();
+    TEST_ASSERT_STR_EQ(ev_code(q), "corrupt");
+    cols->attrs = a0;
+    int8_t t0 = cols->type;
+    cols->type = RAY_I64;
+    TEST_ASSERT_STR_EQ(ev_code(q), "corrupt");
+    cols->type = t0;
+    int64_t n0 = cols->len;
+    cols->len = n0 + 1;
+    TEST_ASSERT_STR_EQ(ev_code(q), "corrupt");
+    cols->len = n0;
+    TEST_ASSERT_EQ_I(ev_i64("(count (insert pt 2024.01.03 (list 7 8)))"), 9001);
+    ray_env_set(ray_sym_intern("pt", 2), NULL);
+    ray_release(t);
     PASS();
 }
 
@@ -5305,6 +5342,7 @@ const test_entry_t compress_entries[] = {
     { "compress/datalog_sites_gen2_equal",   test_datalog_sites_gen2_equal,   rt_setup, rt_teardown },
     { "compress/join_sites_parted",          test_join_sites_parted,          rt_setup, rt_teardown },
     { "compress/dml_parted_gen2",            test_dml_parted_gen2,            rt_setup, rt_teardown },
+    { "compress/parted_insert_container",    test_parted_insert_container,    rt_setup, rt_teardown },
     { "compress/datalog_query_gen2_equal",   test_datalog_query_gen2_equal,   rt_setup, rt_teardown },
     { "compress/scalar_agg_planning_zoned", test_scalar_agg_planning_zoned, rt_setup, rt_teardown },
     { "compress/dag_presence_without_decode", test_dag_presence_without_decode, rt_setup, rt_teardown },
