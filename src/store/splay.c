@@ -1033,24 +1033,25 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                              dir, (int)name_len, name);
         }
 
-        /* until the table core admits it (P1 Task 10) */
+        int64_t col_rows = ray_table_col_nrows(col);
+        if (c > 0 && col_rows != ray_table_nrows(tbl)) {
+            ray_t* err = ray_error("corrupt",
+                "splayed %s: column '%.*s' has %lld rows, expected %lld "
+                "(torn overwrite?)", dir, (int)name_len, name,
+                (long long)col_rows, (long long)ray_table_nrows(tbl));
+            ray_release(col);
+            ray_release(schema);
+            ray_release(tbl);
+            return err;
+        }
+
+        /* until the legacy getters materialize (P1 Task 11) */
         if (col->type == RAY_ENCCOL) {
             ray_release(col);
             ray_release(schema);
             ray_release(tbl);
             return ray_error("nyi", "splayed %s: column '%.*s' is a generation-2 file",
                              dir, (int)name_len, name);
-        }
-
-        if (c > 0 && col->len != ray_table_nrows(tbl)) {
-            ray_t* err = ray_error("corrupt",
-                "splayed %s: column '%.*s' has %lld rows, expected %lld "
-                "(torn overwrite?)", dir, (int)name_len, name,
-                (long long)col->len, (long long)ray_table_nrows(tbl));
-            ray_release(col);
-            ray_release(schema);
-            ray_release(tbl);
-            return err;
         }
 
         ray_t* new_df = ray_table_add_col(tbl, name_id, col);

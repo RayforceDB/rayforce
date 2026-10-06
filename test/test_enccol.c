@@ -1439,6 +1439,89 @@ static test_result_t test_materialize_refusal_cached(void) {
     PASS();
 }
 
+/* Write a table as a legacy splayed directory whose columns are generation 2. */
+static ray_err_t write_splayed_gen2(const char* dir, ray_t* tbl) {
+    if (ray_test_mkdir_p(dir) != 0) return RAY_ERR_IO;
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* names = ray_vec_new(RAY_STR, nc);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* nm = ray_sym_str(ray_table_col_name(tbl, c));
+        char p[512]; snprintf(p, sizeof p, "%s/%.*s", dir, (int)ray_str_len(nm), ray_str_ptr(nm));
+        ray_err_t e = ray_col_save_gen(ray_table_get_col_idx(tbl, c), p, 2);
+        if (e != RAY_OK) { ray_release(names); return e; }
+        names = ray_str_vec_append(names, ray_str_ptr(nm), ray_str_len(nm));
+    }
+    char p[512]; snprintf(p, sizeof p, "%s/.d", dir);
+    ray_err_t e = ray_col_save(names, p);
+    ray_release(names);
+    return e;
+}
+
+static ray_t* tbl2(int64_t n) {
+    ray_t* t = ray_table_new(2);
+    ray_t* a = make_col(RAY_I64, n, 0);
+    ray_t* b = make_col(RAY_F64, n, 4);
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+    t = ray_table_add_col(t, ray_sym_intern("b", 1), b);
+    ray_release(a); ray_release(b);
+    return t;
+}
+
+/* Tables are built directly from mmap'd generation-2 columns: the splayed
+ * loader still refuses them until the legacy getters materialize (Task 11). */
+static test_result_t test_table_core_enccol(void) {
+    ray_t* t = tbl2(70000);
+    TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/t", t), RAY_OK);
+    ray_release(t);
+    ray_enc_counters_reset();
+    ray_t* ca = ray_col_mmap(ENCCOL_TMP "/t/a");
+    ray_t* cb = ray_col_mmap(ENCCOL_TMP "/t/b");
+    TEST_ASSERT_FMT(ca && !RAY_IS_ERR(ca) && cb && !RAY_IS_ERR(cb), "mmap");
+    TEST_ASSERT_EQ_I(ca->type, RAY_ENCCOL);
+    TEST_ASSERT_EQ_I(ray_table_col_nrows(ca), 70000);
+    ray_t* s = ray_table_new(2);
+    s = ray_table_add_col(s, ray_sym_intern("a", 1), ca);
+    s = ray_table_add_col(s, ray_sym_intern("b", 1), cb);
+    TEST_ASSERT_FMT(s && !RAY_IS_ERR(s), "add_col: %s", s ? ray_err_code(s) : "null");
+    ray_release(ca); ray_release(cb);
+    TEST_ASSERT_EQ_I(ray_table_nrows(s), 70000);
+    TEST_ASSERT_NULL(ray_table_validate_rectangular(s, "test"));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(s, 1)->type, RAY_ENCCOL);
+    /* a shorter plain column makes the table ragged */
+    ray_t* shortc = make_col(RAY_I32, 10, 0);
+    ray_retain(s);
+    ray_t* r = ray_table_add_col(s, ray_sym_intern("c", 1), shortc);
+    ray_t* e = ray_table_validate_rectangular(r, "test");
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    ray_error_free(e);
+    ray_release(r); ray_release(shortc);
+    /* copy-on-write shares the encoded object */
+    ray_t* cp = ray_alloc_copy(s);
+    TEST_ASSERT_EQ_I(ray_table_nrows(cp), 70000);
+    ray_release(cp);
+    ray_release(s);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    PASS();
+}
+
+/* The splayed loader reads logical rows through ray_table_col_nrows, but its
+ * generation-2 guard refuses the first encoded column until Task 11, which
+ * must flip this to "corrupt" with "4999 rows, expected 5000". */
+static test_result_t test_table_torn_column(void) {
+    ray_t* t = tbl2(5000);
+    TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/torn", t), RAY_OK);
+    ray_release(t);
+    ray_t* b = make_col(RAY_F64, 4999, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(b, ENCCOL_TMP "/torn/b", 2), RAY_OK);
+    ray_release(b);
+    ray_t* s = ray_read_splayed(ENCCOL_TMP "/torn", NULL);
+    TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
+    TEST_ASSERT_STR_EQ(ray_err_code(s), "nyi");
+    ray_error_free(s);
+    PASS();
+}
+
 const test_entry_t enccol_entries[] = {
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_rejects",        test_load_rejects,        enccol_setup, enccol_teardown },
@@ -1481,5 +1564,7 @@ const test_entry_t enccol_entries[] = {
     { "enccol/attach_refused",        test_attach_refused,        enccol_setup, enccol_teardown },
     { "enccol/materialize_refusal",   test_materialize_refusal_cached, enccol_setup, enccol_teardown },
     { "enccol/synth_matches_gen0",    test_synth_matches_gen0,    enccol_setup, enccol_teardown },
+    { "enccol/table_core",            test_table_core_enccol,     enccol_setup, enccol_teardown },
+    { "enccol/table_torn_column",     test_table_torn_column,     enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
 };

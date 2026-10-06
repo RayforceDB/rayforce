@@ -37,4 +37,8 @@
 
 int64_t ray_parted_nrows(ray_t* parted_col);
 
+/* Logical rows of any column object (plain, parted wrapper, MAPCOMMON,
+ * RAY_ENCCOL) without decoding. */
+int64_t ray_table_col_nrows(ray_t* col);
+
 #endif /* RAY_TABLE_H */

@@ -75,15 +75,19 @@ static bool table_col_is_valid(ray_t* col) {
     return col->type == RAY_LIST ||
            ray_is_vec(col) ||
            RAY_IS_PARTED(col->type) ||
-           col->type == RAY_MAPCOMMON;
+           col->type == RAY_MAPCOMMON ||
+           col->type == RAY_ENCCOL;          /* single or parted; len is logical */
 }
 
 static int64_t table_col_nrows(ray_t* col) {
     if (!col) return 0;
+    if (col->type == RAY_ENCCOL) return col->len;   /* no decode */
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)
         return ray_parted_nrows(col);
     return col->len;
 }
+
+int64_t ray_table_col_nrows(ray_t* col) { return table_col_nrows(col); }
 
 /* --------------------------------------------------------------------------
  * ray_table_new — allocates an empty table with capacity for `ncols`.
@@ -304,10 +308,7 @@ int64_t ray_table_nrows(ray_t* tbl) {
     ray_t* first_col = ((ray_t**)ray_data(cols))[0];
     if (!first_col || RAY_IS_ERR(first_col)) return 0;
 
-    if (RAY_IS_PARTED(first_col->type) || first_col->type == RAY_MAPCOMMON)
-        return ray_parted_nrows(first_col);
-
-    return first_col->len;
+    return table_col_nrows(first_col);
 }
 
 int64_t ray_parted_nrows(ray_t* v) {
