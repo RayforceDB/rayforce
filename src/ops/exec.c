@@ -4544,6 +4544,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
                 g->selection = NULL;
             }
             g->table = saved_table;
+            ray_graph_unbind_table(g, empty_tbl);
             ray_release(empty_tbl);
         }
     }
