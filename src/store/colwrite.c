@@ -284,3 +284,40 @@ ray_err_t ray_col_save_gen(ray_t* vec, const char* path, uint8_t gen) {
 ray_err_t ray_col_save_bulk_gen(ray_t* vec, const char* path, uint8_t gen) {
     return colw_save_gen(vec, path, gen, false);
 }
+
+/* Equivalence-run hook: an absent option behaves as true. */
+static _Atomic(bool) g_force_compress;
+void ray_store_test_force_compress(bool on) { atomic_store(&g_force_compress, on); }
+
+uint8_t ray_col_file_gen(const char* path) {
+    uint8_t h[32];
+    FILE* f = path ? fopen(path, "rb") : NULL;
+    if (!f) return 0;
+    size_t n = fread(h, 1, 32, f);
+    fclose(f);
+    return (n == 32 && ray_col_gen_of(h) == 2) ? 2 : 0;
+}
+
+/* The generation the destination's current generation stores `name` in. */
+static uint8_t colw_dest_gen(const char* cur, const char* name, size_t nlen) {
+    if (!cur || !cur[0] || !name) return 0;
+    char p[1200];
+    int n = snprintf(p, sizeof p, "%s/%.*s", cur, (int)nlen, name);
+    if (n < 0 || (size_t)n >= sizeof p) return 0;
+    return ray_col_file_gen(p);
+}
+
+uint8_t ray_col_resolve_gen(ray_compress_t mode, ray_t* src,
+                            const char* cur, const char* name, size_t nlen) {
+    if (!colw_src_gen2_ok(src) || mode == RAY_COMPRESS_OFF) return 0;
+    if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return 2;
+    if (src->type == RAY_ENCCOL) return 2;                 /* the slot still holds an encoded column */
+    return colw_dest_gen(cur, name, nlen);                 /* the destination already stores it as 2 */
+}
+
+uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
+                                 const char* cur, const char* name, size_t nlen) {
+    if (!ray_encw_type_supported(type) || mode == RAY_COMPRESS_OFF) return 0;
+    if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return 2;
+    return colw_dest_gen(cur, name, nlen);
+}

@@ -213,6 +213,9 @@ static ray_err_t col_preflight_recursive(ray_t* obj) {
 
 ray_err_t ray_col_save_preflight(ray_t* vec) {
     if (!vec || RAY_IS_ERR(vec)) return RAY_ERR_TYPE;
+    /* An encoded column's logical type is always storable; a parted one
+     * (like a plain parted wrapper) has no single-file form. */
+    if (vec->type == RAY_ENCCOL) return ray_enccol_is_parted(vec) ? RAY_ERR_NYI : RAY_OK;
     if (is_serializable_type(vec->type)) return RAY_OK;
     if (vec->type == RAY_LIST || vec->type == RAY_TABLE)
         return col_preflight_recursive(vec);

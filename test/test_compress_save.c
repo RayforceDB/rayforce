@@ -846,7 +846,307 @@ static test_result_t test_write_parted_refused(void) {
     PASS();
 }
 
+
+/* ---- Task 15: generation resolution in splayed saves ---- */
+
+static uint8_t col_gen_in(const char* dir, const char* name) {
+    char cur[1024], p[1200];
+    if (ray_splay_resolve_dir(dir, cur, sizeof cur) != RAY_OK) return 253;
+    snprintf(p, sizeof p, "%s/%s", cur, name);
+    return file_gen(p);
+}
+
+static ray_t* plain_tbl(int64_t n) {
+    ray_t* t = ray_table_new(2);
+    ray_t* a = i64_col(n, 3); ray_t* b = i64_col(n, 5);
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+    t = ray_table_add_col(t, ray_sym_intern("b", 1), b);
+    ray_release(a); ray_release(b);
+    return t;
+}
+
+static test_result_t test_inherit_destination(void) {
+    const char* d = CS_TMP "/inh";
+    ray_t* t = plain_tbl(3000);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "b"), 2);
+    /* a fresh plain table, no option: the destination keeps generation 2 */
+    TEST_ASSERT_EQ_I(ray_splay_save(t, d, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
+    /* the loaded (encoded) table into a new directory: the source rule */
+    ray_t* l = ray_read_splayed(d, NULL);
+    TEST_ASSERT_EQ_I(ray_splay_save(l, CS_TMP "/inh2", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/inh2", "b"), 2);
+    ray_release(l);
+    /* explicit false writes generation 0 */
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 0);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "b"), 0);
+    /* absent over a generation-0 destination stays 0 */
+    TEST_ASSERT_EQ_I(ray_splay_save(t, d, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 0);
+    ray_release(t);
+    PASS();
+}
+
+static test_result_t test_update_then_save(void) {
+    const char* d = CS_TMP "/upd";
+    ray_t* t = plain_tbl(3000);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
+    ray_release(t);
+    ray_t* l = ray_read_splayed(d, NULL);
+    ray_t* mut = i64_col(3000, 11);                     /* a value update's plain result */
+    ray_table_set_col_idx(l, 0, mut);
+    ray_release(mut);
+    TEST_ASSERT_EQ_I(ray_splay_save(l, d, NULL), RAY_OK);         /* same directory */
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "b"), 2);
+    TEST_ASSERT_EQ_I(ray_splay_save(l, CS_TMP "/upd2", NULL), RAY_OK);  /* new directory */
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/upd2", "a"), 0);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/upd2", "b"), 2);
+    /* the mixed directory keeps each column's generation on a plain resave */
+    ray_release(l);
+    l = plain_tbl(3000);
+    TEST_ASSERT_EQ_I(ray_splay_save(l, CS_TMP "/upd2", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/upd2", "a"), 0);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/upd2", "b"), 2);
+    ray_release(l);
+    PASS();
+}
+
+static test_result_t test_forced_generation0(void) {
+    const char* d = CS_TMP "/forced";
+    ray_t* t = ray_table_new(3);
+    ray_t* lnk = i64_col(100, 1);
+    lnk->attrs |= RAY_ATTR_HAS_LINK; lnk->link_target = ray_sym_intern("other", 5);
+    ray_t* hx = i64_col(100, 2);
+    ray_t* hi = ray_index_attach_hash(&hx);
+    TEST_ASSERT_TRUE(hi && !RAY_IS_ERR(hi)); hx = hi;
+    ray_t* lst = ray_list_new(100);
+    for (int i = 0; i < 100; i++) { ray_t* x = ray_i64(i); lst = ray_list_append(lst, x); ray_release(x); }
+    t = ray_table_add_col(t, ray_sym_intern("l", 1), lnk);
+    t = ray_table_add_col(t, ray_sym_intern("h", 1), hx);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), lst);
+    ray_release(lnk); ray_release(hx); ray_release(lst);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "l"), 0);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "h"), 0);
+    char cur[1024], p[1200];
+    ray_splay_resolve_dir(d, cur, sizeof cur);
+    snprintf(p, sizeof p, "%s/l.link", cur);
+    TEST_ASSERT_EQ_I(access(p, F_OK), 0);               /* the .link sidecar was written */
+    ray_release(t);
+    PASS();
+}
+
+/* The four-way matrix over partitions, with ZONE / UNIQUE / linked inputs:
+ * plain -> 2, encoded -> 2 (index kind and flag carried), encoded -> 0
+ * (materialized, the synthesized index persisted the generation-0 way), and
+ * linked columns stay generation 0 with their sidecar. */
+static test_result_t test_matrix_parted_indexed(void) {
+    for (int p = 0; p < 2; p++) {
+        char dir[256]; snprintf(dir, sizeof dir, CS_TMP "/mp/2024.01.0%d/t", p + 1);
+        ray_t* z = i64_col(3000, 3 + p);
+        ray_t* zi = ray_index_attach_zone(&z); TEST_ASSERT_TRUE(zi && !RAY_IS_ERR(zi)); z = zi;
+        ray_t* u = i64_col(3000, 1);
+        ray_t* root = ray_index_new_root(RAY_IDX_NONE, RAY_I64, 3000);
+        ray_index_payload(root)->markers = RAY_MARK_UNIQUE;
+        ray_t* ui = ray_index_attach_persisted(&u, root); TEST_ASSERT_TRUE(ui && !RAY_IS_ERR(ui)); u = ui;
+        ray_t* l = i64_col(3000, 1);
+        l->attrs |= RAY_ATTR_HAS_LINK; l->link_target = ray_sym_intern("other", 5);
+        ray_t* t = ray_table_new(3);
+        t = ray_table_add_col(t, ray_sym_intern("z", 1), z);
+        t = ray_table_add_col(t, ray_sym_intern("u", 1), u);
+        t = ray_table_add_col(t, ray_sym_intern("l", 1), l);
+        ray_release(z); ray_release(u); ray_release(l);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dir, NULL, RAY_COMPRESS_ON), RAY_OK);
+        ray_release(t);
+        TEST_ASSERT_EQ_I(col_gen_in(dir, "z"), 2);
+        TEST_ASSERT_EQ_I(col_gen_in(dir, "u"), 2);
+        TEST_ASSERT_EQ_I(col_gen_in(dir, "l"), 0);
+    }
+    for (int p = 0; p < 2; p++) {
+        char src[256], d2[256], d0[256], cur[1024], lp[1200];
+        snprintf(src, sizeof src, CS_TMP "/mp/2024.01.0%d/t", p + 1);
+        snprintf(d2, sizeof d2, CS_TMP "/mp2/2024.01.0%d/t", p + 1);
+        snprintf(d0, sizeof d0, CS_TMP "/mp0/2024.01.0%d/t", p + 1);
+        ray_t* t = ray_read_splayed(src, NULL);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_enc_counters_reset();
+        TEST_ASSERT_EQ_I(ray_splay_save(t, d2, NULL), RAY_OK);                 /* encoded -> 2 */
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d0, NULL, RAY_COMPRESS_OFF), RAY_OK);  /* encoded -> 0 */
+        ray_release(t);
+        TEST_ASSERT_EQ_I(col_gen_in(d2, "z"), 2);
+        TEST_ASSERT_EQ_I(col_gen_in(d0, "z"), 0);
+        ray_splay_resolve_dir(d2, cur, sizeof cur);
+        snprintf(lp, sizeof lp, "%s/l.link", cur);
+        TEST_ASSERT_EQ_I(access(lp, F_OK), 0);
+        ray_t* t2 = ray_read_splayed(d2, NULL);
+        ray_col_meta_t m;
+        TEST_ASSERT_TRUE(ray_table_col_meta(t2, ray_sym_intern("z", 1), &m) && m.index_kind == RAY_IDX_ZONE);
+        TEST_ASSERT_TRUE(ray_table_col_meta(t2, ray_sym_intern("u", 1), &m) && m.unique);
+        ray_release(t2);
+        ray_t* t0 = ray_read_splayed(d0, NULL);
+        ray_t* z0 = ray_table_col(t0, ray_sym_intern("z", 1));
+        TEST_ASSERT_EQ_I(ray_index_kind(z0), RAY_IDX_ZONE);
+        ray_t* u0 = ray_table_col(t0, ray_sym_intern("u", 1));
+        TEST_ASSERT_TRUE(ray_index_has(u0) && (ray_index_payload(u0->index)->markers & RAY_MARK_UNIQUE));
+        ray_release(t0);
+    }
+    ray_t* pt = ray_read_parted(CS_TMP "/mp2", "t");
+    TEST_ASSERT_TRUE(pt && !RAY_IS_ERR(pt));
+    TEST_ASSERT_EQ_I(ray_table_nrows(pt), 6000);
+    ray_release(pt);
+    PASS();
+}
+
+static test_result_t test_chunk_zone_recorded(void) {
+    const char* d = CS_TMP "/cz";
+    ray_t* t = plain_tbl(70000);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
+    ray_release(t);
+    ray_t* l = ray_read_splayed(d, NULL);
+    ray_col_meta_t m;
+    TEST_ASSERT_TRUE(ray_table_col_meta(l, ray_sym_intern("a", 1), &m));
+    TEST_ASSERT_EQ_I(m.index_kind, RAY_IDX_CHUNK_ZONE);
+    ray_t* a = ray_table_col(l, ray_sym_intern("a", 1));
+    TEST_ASSERT_EQ_I(ray_index_kind(a), RAY_IDX_CHUNK_ZONE);
+    ray_release(l);
+    PASS();
+}
+
+static test_result_t test_staged_and_sym(void) {
+    ray_t* t = ray_table_new(1);
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W64, 2000); s->len = 2000;
+    int64_t ids[3] = { ray_sym_intern("x", 1), ray_sym_intern("y", 1), ray_sym_intern("z", 1) };
+    for (int i = 0; i < 2000; i++) ((int64_t*)ray_data(s))[i] = ids[i % 3];
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(s);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, CS_TMP "/sy", CS_TMP "/sy.sym", RAY_COMPRESS_ON), RAY_OK);
+    ray_release(t);
+    TEST_ASSERT_EQ_I(col_gen_in(CS_TMP "/sy", "s"), 2);
+    ray_t* l = ray_read_splayed(CS_TMP "/sy", CS_TMP "/sy.sym");
+    TEST_ASSERT_TRUE(l && !RAY_IS_ERR(l));
+    /* private staging path, absent mode, encoded source: generation 2, into
+     * another symfile.  Like the CSV/Parquet staging callers, the test holds
+     * the target domain alive across the save and flushes it afterwards. */
+    struct ray_sym_domain_s* d2 = ray_sym_domain_open_or_create(CS_TMP "/sy2.sym");
+    TEST_ASSERT_NOT_NULL(d2);
+    TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk_mode(l, CS_TMP "/sy2", CS_TMP "/sy2.sym", RAY_COMPRESS_ABSENT), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(d2, false), RAY_OK);
+    ray_sym_domain_release(d2);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/sy2/s"), 2);
+    ray_t* l2 = ray_read_splayed(CS_TMP "/sy2", CS_TMP "/sy2.sym");
+    TEST_ASSERT_TRUE(l2 && !RAY_IS_ERR(l2));
+    ray_t* c1 = ray_table_col(l, ray_sym_intern("s", 1));
+    ray_t* c2 = ray_table_col(l2, ray_sym_intern("s", 1));
+    for (int64_t i = 0; i < 2000; i++) {
+        ray_t* x = ray_sym_vec_cell(c1, i); ray_t* y = ray_sym_vec_cell(c2, i);
+        TEST_ASSERT_TRUE(ray_str_len(x) == ray_str_len(y) && memcmp(ray_str_ptr(x), ray_str_ptr(y), ray_str_len(x)) == 0);
+    }
+    ray_release(l2); ray_release(l);
+    PASS();
+}
+
+/* Preflight admits a single encoded column but keeps refusing parted kinds
+ * (a parted RAY_ENCCOL and a plain parted wrapper) and the partition key
+ * column: a splayed save of a table carrying one is nyi before anything is
+ * written, and nothing is decoded. */
+static test_result_t test_save_refuses_parted_kinds(void) {
+    for (int pass = 0; pass < 2; pass++) {
+        write_part("2024.01.01", pass ? 0 : 2); write_part("2024.01.02", pass ? 0 : 2);
+        ray_t* pt = ray_read_parted(CS_TMP "/pdb", "tb");
+        TEST_ASSERT_TRUE(pt && !RAY_IS_ERR(pt));
+        TEST_ASSERT_EQ_I(ray_table_ncols(pt), 2);
+        ray_t* key = ray_table_get_col_enc_idx(pt, 0) ? NULL : ray_table_col_idx(pt, 0);
+        TEST_ASSERT_TRUE(key && key->type == RAY_MAPCOMMON);
+        ray_t* enc = ray_table_get_col_enc_idx(pt, 1);
+        ray_t* slot = enc ? enc : ray_table_col_idx(pt, 1);
+        if (pass == 0) TEST_ASSERT_TRUE(enc && ray_enccol_is_parted(enc));
+        else           TEST_ASSERT_TRUE(!enc && RAY_IS_PARTED(slot->type));
+        ray_enc_counters_reset();
+        TEST_ASSERT_EQ_I(ray_col_save_preflight(slot), RAY_ERR_NYI);
+        TEST_ASSERT_EQ_I(ray_col_save_preflight(key), RAY_ERR_NYI);
+        for (int which = 0; which < 3; which++) {
+            ray_t* t;
+            if (which == 2) { t = pt; ray_retain(t); }
+            else {
+                t = ray_table_new(1);
+                t = ray_table_add_col(t, ray_sym_intern("c", 1), which ? key : slot);
+                TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            }
+            for (int m = 0; m < 3; m++) {
+                TEST_ASSERT_EQ_I(ray_splay_save_mode(t, CS_TMP "/pref", NULL, (ray_compress_t)m), RAY_ERR_NYI);
+                TEST_ASSERT_FALSE(ray_splay_has_schema(CS_TMP "/pref"));
+                TEST_ASSERT_EQ_I(access(CS_TMP "/pref/c", F_OK), -1);
+            }
+            ray_release(t);
+        }
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        ray_release(pt);
+    }
+    /* a single encoded column passes preflight */
+    ray_t* v = i64_col(3000, 3);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/one", 2), RAY_OK);
+    ray_release(v);
+    ray_t* e = ray_col_mmap(CS_TMP "/one");
+    TEST_ASSERT_TRUE(e && !RAY_IS_ERR(e) && e->type == RAY_ENCCOL);
+    TEST_ASSERT_EQ_I(ray_col_save_preflight(e), RAY_OK);
+    ray_release(e);
+    PASS();
+}
+
+/* The resolver on its own: explicit modes, the source rule, the destination
+ * rule, the forced kinds, and the equivalence-run hook. */
+static test_result_t test_resolver_rules(void) {
+    ray_t* v = i64_col(100, 1);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ON, v, NULL, "a", 1), 2);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_OFF, v, NULL, "a", 1), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, v, NULL, "a", 1), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, v, "", "a", 1), 0);
+    (void)ray_test_mkdir_p(CS_TMP "/rd");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/rd/a", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/rd/b", 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_file_gen(CS_TMP "/rd/a"), 2);
+    TEST_ASSERT_EQ_I(ray_col_file_gen(CS_TMP "/rd/b"), 0);
+    TEST_ASSERT_EQ_I(ray_col_file_gen(CS_TMP "/rd/missing"), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, v, CS_TMP "/rd", "a", 1), 2);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, v, CS_TMP "/rd", "b", 1), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_OFF, v, CS_TMP "/rd", "a", 1), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen_type(RAY_COMPRESS_ABSENT, RAY_I64, CS_TMP "/rd", "a", 1), 2);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen_type(RAY_COMPRESS_ABSENT, RAY_I64, CS_TMP "/rd", "b", 1), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen_type(RAY_COMPRESS_ON, RAY_LIST, NULL, "a", 1), 0);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen_type(RAY_COMPRESS_ON, RAY_I64, NULL, "a", 1), 2);
+    ray_t* e = ray_col_mmap(CS_TMP "/rd/a");
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, e, NULL, "x", 1), 2);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_OFF, e, NULL, "x", 1), 0);
+    ray_release(e);
+    ray_t* lnk = i64_col(10, 1);
+    lnk->attrs |= RAY_ATTR_HAS_LINK; lnk->link_target = ray_sym_intern("other", 5);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ON, lnk, CS_TMP "/rd", "a", 1), 0);
+    ray_release(lnk);
+    ray_store_test_force_compress(true);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, v, NULL, "a", 1), 2);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_OFF, v, NULL, "a", 1), 0);
+    ray_store_test_force_compress(false);
+    TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, v, NULL, "a", 1), 0);
+    ray_release(v);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/inherit_destination", test_inherit_destination, cs_setup, cs_teardown },
+    { "compress/update_then_save",    test_update_then_save,    cs_setup, cs_teardown },
+    { "compress/forced_generation0",  test_forced_generation0,  cs_setup, cs_teardown },
+    { "compress/chunk_zone_recorded", test_chunk_zone_recorded, cs_setup, cs_teardown },
+    { "compress/matrix_parted_indexed", test_matrix_parted_indexed, cs_setup, cs_teardown },
+    { "compress/staged_and_sym",      test_staged_and_sym,      cs_setup, cs_teardown },
+    { "compress/save_refuses_parted_kinds", test_save_refuses_parted_kinds, rt_setup, rt_teardown },
+    { "compress/resolver_rules",      test_resolver_rules,      cs_setup, cs_teardown },
     { "compress/write_sym_domains",      test_write_sym_domains,      cs_setup, cs_teardown },
     { "compress/write_parted_refused",   test_write_parted_refused,   rt_setup, rt_teardown },
     { "compress/matrix_failure_inject",  test_matrix_failure_inject,  cs_setup, cs_teardown },

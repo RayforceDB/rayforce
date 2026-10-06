@@ -104,6 +104,10 @@ ray_err_t ray_col_save_bulk_gen(ray_t* vec, const char* path, uint8_t gen);
  * encoded->2 (range reads, SYM ids remapped into the target domain, no
  * whole-column materialization).  On failure every temporary is released and
  * the staging file removed; nothing is renamed into place. */
+/* The tri-state `compress` option of a save (spec "Generation
+ * resolution"): explicit true / false set every file; absent inherits. */
+typedef enum { RAY_COMPRESS_ABSENT = 0, RAY_COMPRESS_ON = 1, RAY_COMPRESS_OFF = 2 } ray_compress_t;
+
 enum { RAY_COL_IDX_KEEP = 0, RAY_COL_IDX_REBUILD = 1, RAY_COL_IDX_DROP = 2 };
 typedef struct {
     ray_col_src_t src;                    /* bound by the caller (ray_col_src_bind); not released here */
@@ -116,6 +120,21 @@ typedef struct {
 } ray_col_write_t;
 ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path);
 void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
+
+/* Generation resolution, decided by a save under the destination's
+ * .write.lock.  `dest_cur` is the destination's current published
+ * generation directory, NULL or "" when it holds no published table.
+ * ON: 2 for every file generation 2 can hold; OFF: 0; ABSENT: 2 when the
+ * source is a RAY_ENCCOL or the destination's current generation stores the
+ * file `name` as generation 2, else 0.  Linked, nested, list and
+ * HASH/SORT/BLOOM/PART-indexed columns are always 0. */
+uint8_t ray_col_file_gen(const char* path);   /* 2 when the file is generation 2, else 0 (missing included) */
+uint8_t ray_col_resolve_gen(ray_compress_t mode, ray_t* src,
+                            const char* dest_cur, const char* name, size_t name_len);
+/* The same rule for writers that have only the column's type (streams). */
+uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
+                                 const char* dest_cur, const char* name, size_t name_len);
+void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */
 
 bool ray_col_gen2_eligible(ray_t* col);
 void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags);
