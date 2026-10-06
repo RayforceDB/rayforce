@@ -1201,6 +1201,13 @@ ray_t* ray_enccol_materialize(ray_t* encv) {
                             e->kind == RAY_ENCCOL_PARTED ? enc_materialize_parted : enc_materialize_single, e);
 }
 
+void ray_enccol_adopt_domain(ray_t* out, ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || !out || out->type != RAY_SYM || e->type != RAY_SYM || !e->dom) return;
+    out->sym_domain = e->dom;                    /* sym_vec_new's runtime domain is immortal */
+    if (e->dom_owned) ray_sym_domain_retain(e->dom);
+}
+
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m) {
     ray_enccol_t* e = ray_enccol_of(encv);
     memset(m, 0, sizeof *m);

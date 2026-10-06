@@ -46,6 +46,7 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "table/dict.h"
+#include "store/enccol.h"    /* ray_enccol_adopt_domain — empty columns of encoded SYM */
 #include "mem/heap.h"
 
 #include <string.h>
@@ -569,27 +570,36 @@ static bool tbl_has_col(ray_t* tbl, int64_t sym) {
     return ray_table_col_meta(tbl, sym, &m);
 }
 
-/* ray_vec_may_have_nulls of a column, from metadata: a plain slot is asked
- * directly (no decode); an encoded one answers from its directory, keeping
- * the conservative "text may hold nulls" rule. */
+/* ray_vec_may_have_nulls of a column without a decode: a plain slot is asked
+ * directly; an encoded one answers what its materialization would (the
+ * persisted attrs become the vector's, text always may hold nulls). */
 static bool tbl_col_may_have_nulls(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return false;
     if (!m.enc) return ray_vec_may_have_nulls(ray_table_col(tbl, sym));
     if (m.type == RAY_SYM || m.type == RAY_STR) return true;
-    return ray_table_col_has_nulls(tbl, sym);
+    return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
 }
 
-/* An empty column shaped like a table column (what a zero-row gather of it
- * returns): a plain slot is gathered as it is; an encoded one is built from
- * its metadata, without a decode. */
+/* An empty column shaped like a table column: what ray_group_gather(col,
+ * NULL, 0) returns.  A plain slot is gathered as it is; an encoded one is
+ * built the same way from its metadata, without a decode. */
 static ray_t* tbl_col_empty(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return NULL;
     if (!m.enc) return ray_group_gather(ray_table_col(tbl, sym), NULL, 0);   /* plain: no decode */
     if (m.type == RAY_LIST) return ray_list_new(0);
-    if (m.type == RAY_SYM) return ray_sym_vec_new(m.attrs & RAY_SYM_W_MASK, 0);
-    return ray_vec_new(m.type, 0);
+    if (m.type == RAY_STR) {
+        const char* p0 = ""; uint32_t l0 = 0;
+        return ray_str_vec_from_parts(&p0, &l0, NULL, 0);
+    }
+    ray_t* out = m.type == RAY_SYM ? ray_sym_vec_new(m.attrs & RAY_SYM_W_MASK, 0)
+                                   : ray_vec_new(m.type, 0);
+    if (!out || RAY_IS_ERR(out)) return out;
+    if (m.type == RAY_SYM) ray_enccol_adopt_domain(out, m.enc);
+    out->len = 0;
+    if (tbl_col_may_have_nulls(tbl, sym)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
 }
 
 /* A column as a plain borrowed vector for a function that declines by
@@ -8138,6 +8148,76 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
     return n;
 }
 
+/* Can evaluating `e` reach a column of `tbl` only by naming it?  True when
+ * the tree holds nothing but literals (no symbols among them), column names
+ * and names of global builtins other than eval: a lambda (bound or literal
+ * body aside, which is walked), a local, a quoted name or an unknown name may
+ * read query locals by name at run time, so those keep every column bound. */
+static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
+    if (!e) return true;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return false;
+        if (tbl_has_col(tbl, e->i64)) return true;
+        if (ray_sym_is_dotted(e->i64)) {
+            const int64_t* segs;
+            int nsegs = ray_sym_segs(e->i64, &segs);
+            return nsegs >= 1 && tbl_has_col(tbl, segs[0]);
+        }
+        if (ray_env_get_local(e->i64)) return false;
+        ray_t* fn = ray_env_get(e->i64);
+        if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
+            return false;
+        ray_t* nm = ray_sym_str(e->i64);
+        return !(nm && ray_str_len(nm) == 4 && memcmp(ray_str_ptr(nm), "eval", 4) == 0);
+    }
+    if (e->type == RAY_LIST) {
+        ray_t** el = (ray_t**)ray_data(e);
+        for (int64_t i = 0; i < ray_len(e); i++)
+            if (!expr_reads_named_columns_only(el[i], tbl)) return false;
+        return true;
+    }
+    if (e->type < 0) return true;                                /* a non-symbol atom */
+    return e->type >= RAY_BOOL && e->type <= RAY_STR && e->type != RAY_SYM;   /* a literal vector */
+}
+
+/* Bind the columns of `tbl` as query locals for evaluating exprs[0..n): every
+ * plain column, as always, and an encoded one only when some expression names
+ * it (collect_col_refs_set) and no expression can reach a column otherwise
+ * (expr_reads_named_columns_only), so the evaluation decodes just the columns
+ * it reads.  NULL, or the owned error of a column that fails to materialize
+ * (or of the scratch carve).  The caller has pushed the query scope. */
+static ray_t* bind_referenced_columns(ray_t* tbl, ray_t* const* exprs, int64_t n) {
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* refs_hdr = NULL;
+    int64_t* refs = NULL;
+    int n_refs = -1;                          /* collected on the first encoded slot */
+    bool narrow = true;
+    for (int64_t c = 0; c < nc; c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        if (narrow && ray_table_get_col_enc_idx(tbl, c)) {
+            if (n_refs < 0) {
+                for (int64_t e = 0; e < n && narrow; e++)
+                    narrow = expr_reads_named_columns_only(exprs[e], tbl);
+            }
+            if (narrow && n_refs < 0) {
+                refs = (int64_t*)scratch_alloc(&refs_hdr, (size_t)nc * sizeof(int64_t));
+                if (!refs) return ray_error("oom", NULL);
+                n_refs = 0;
+                for (int64_t e = 0; e < n; e++)
+                    n_refs = collect_col_refs_set(exprs[e], tbl, refs, (int)nc, n_refs);
+            }
+            bool named = !narrow;
+            for (int i = 0; i < n_refs && !named; i++) named = refs[i] == cn;
+            if (!named) continue;
+        }
+        ray_t* cv = ray_table_col_idx(tbl, c);
+        if (cv && RAY_IS_ERR(cv)) { scratch_free(refs_hdr); return cv; }
+        if (cv) ray_env_set_query_local(cn, cv);
+    }
+    scratch_free(refs_hdr);
+    return NULL;
+}
+
 /* Build a narrow projection of `src_tbl` containing only the columns in
  * `keep_syms[0..n_keep)`, preserving the original column order.
  * Schema/cols share the source vec/list headers (retain'd internally
@@ -10113,16 +10193,27 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         }
 
         ray_env_push_query_scope();
-        int64_t in_ncols = ray_table_ncols(tbl);
-        for (int64_t c = 0; c < in_ncols; c++) {
-            int64_t cn = ray_table_col_name(tbl, c);
-            ray_t* cv = ray_table_col_idx(tbl, c);
-            if (cv && RAY_IS_ERR(cv)) {
+        {
+            /* The by-vals the loop below evaluates (a self-alias {x: x} is
+             * not evaluated): an encoded column is bound only when one of
+             * them names it. */
+            ray_t* bv_hdr = NULL;
+            ray_t** bvals = (ray_t**)scratch_alloc(&bv_hdr, (size_t)nk * sizeof(ray_t*));
+            ray_t* berr = bvals ? NULL : ray_error("oom", NULL);
+            int64_t n_bv = 0;
+            for (int64_t i = 0; bvals && i < nk; i++) {
+                ray_t* k = d_elems[i * 2];
+                ray_t* v = d_elems[i * 2 + 1];
+                if (k && v && v->type == -RAY_SYM && v->i64 == k->i64) continue;
+                bvals[n_bv++] = v;
+            }
+            if (!berr) berr = bind_referenced_columns(tbl, bvals, n_bv);
+            scratch_free(bv_hdr);
+            if (berr) {
                 ray_env_pop_scope();
                 ray_release(tbl);
-                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return cv;
+                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return berr;
             }
-            if (cv) ray_env_set_query_local(cn, cv);
         }
 
         by_sym_vec_owned = ray_vec_new(RAY_SYM, nk);
@@ -11651,12 +11742,7 @@ by_dict_done:
                 ray_t* kv = NULL;
                 if (ray_env_push_query_scope() != RAY_OK) kv = ray_error("oom", NULL);
                 else {
-                    int64_t enc = ray_table_ncols(eval_tbl);
-                    for (int64_t c = 0; c < enc; c++) {
-                        ray_t* cv = ray_table_col_idx(eval_tbl, c);
-                        if (cv && RAY_IS_ERR(cv)) { kv = cv; break; }   /* the query's error */
-                        if (cv) ray_env_set_query_local(ray_table_col_name(eval_tbl, c), cv);
-                    }
+                    kv = bind_referenced_columns(eval_tbl, &by_expr, 1);   /* an error is the query's */
                     if (!kv) kv = group_key_eval(by_expr, eval_tbl);
                     ray_env_pop_scope();
                 }
@@ -13044,12 +13130,7 @@ by_dict_done:
                          * to get a length-0 key vector typed like the
                          * non-empty path would produce it. */
                         ray_env_push_query_scope();
-                        ray_t* ck_vec = NULL;
-                        for (int64_t c = 0; c < nc0; c++) {
-                            ray_t* cv = ray_table_col_idx(filtered_tbl, c);
-                            if (cv && RAY_IS_ERR(cv)) { ck_vec = cv; break; }
-                            ray_env_set_query_local(ray_table_col_name(filtered_tbl, c), cv);
-                        }
+                        ray_t* ck_vec = bind_referenced_columns(filtered_tbl, &by_expr, 1);
                         if (ck_vec) {                    /* a column that cannot materialize */
                             ray_env_pop_scope();
                             ray_release(empty);
@@ -13097,13 +13178,7 @@ by_dict_done:
                 ray_release(grouped);
                 int64_t tbl_ncols = ray_table_ncols(filtered_tbl);
                 ray_env_push_query_scope();
-                ray_t* computed_key = NULL;
-                for (int64_t c = 0; c < tbl_ncols; c++) {
-                    int64_t cn = ray_table_col_name(filtered_tbl, c);
-                    ray_t* cv = ray_table_col_idx(filtered_tbl, c);
-                    if (cv && RAY_IS_ERR(cv)) { computed_key = cv; break; }   /* the query's error */
-                    ray_env_set_query_local(cn, cv);
-                }
+                ray_t* computed_key = bind_referenced_columns(filtered_tbl, &by_expr, 1);   /* an error is the query's */
                 if (!computed_key) computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
                 if (!computed_key) computed_key = ray_eval(by_expr);
                 ray_env_pop_scope();
@@ -13445,24 +13520,24 @@ by_dict_done:
             /* Build result table: key column first, then others */
             int64_t ncols = ray_table_ncols(filtered_tbl);
             ray_t* result = ray_table_new(ncols);
-            if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
+            if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
 
             /* Add key column first */
             ray_t* key_vec_src = orig_key_col;   /* ray_table_col(filtered_tbl, key_sym), read above */
             if (key_vec_src->type == RAY_STR) {
                 ray_t* key_vec_dst = ray_vec_new(RAY_STR, n_groups);
-                if (!key_vec_dst || RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst ? key_vec_dst : ray_error("oom", NULL); }
+                if (!key_vec_dst || RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst ? key_vec_dst : ray_error("oom", NULL); }
                 for (int64_t gi = 0; gi < n_groups; gi++) {
                     size_t slen = 0;
                     const char* sp = ray_str_vec_get(key_vec_src, first_idx[gi], &slen);
                     key_vec_dst = ray_str_vec_append(key_vec_dst, sp ? sp : "", sp ? slen : 0);
-                    if (RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst; }
+                    if (RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst; }
                 }
                 result = ray_table_add_col(result, key_sym, key_vec_dst);
                 ray_release(key_vec_dst);
             } else {
                 ray_t* key_vec_dst = ray_vec_new(key_vec_src->type, n_groups);
-                if (RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst; }
+                if (RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst; }
                 /* Set len BEFORE the store loop: store_typed_elem routes
                  * null atoms through ray_vec_set_null, which range-checks
                  * idx against vec->len and silently returns RAY_ERR_RANGE
@@ -13486,25 +13561,25 @@ by_dict_done:
                 int64_t col_name = ray_table_col_name(filtered_tbl, c);
                 if (col_name == key_sym) continue;
                 ray_t* src_col = ray_table_col_idx(filtered_tbl, c);
-                if (src_col && RAY_IS_ERR(src_col)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return src_col; }
+                if (src_col && RAY_IS_ERR(src_col)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return src_col; }
                 int8_t ct = src_col->type;
 
                 if (ct == RAY_STR) {
                     /* String column: build STR vector */
                     ray_t* dst = ray_vec_new(RAY_STR, n_groups);
-                    if (!dst || RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst ? dst : ray_error("oom", NULL); }
+                    if (!dst || RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst ? dst : ray_error("oom", NULL); }
                     for (int64_t gi = 0; gi < n_groups; gi++) {
                         size_t slen = 0;
                         const char* sp = ray_str_vec_get(src_col, first_idx[gi], &slen);
                         dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
-                        if (RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst; }
+                        if (RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst; }
                     }
                     result = ray_table_add_col(result, col_name, dst);
                     ray_release(dst);
                 } else if (ct == RAY_LIST) {
                     /* List column: pick items */
                     ray_t* dst = ray_alloc(n_groups * sizeof(ray_t*));
-                    if (!dst) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
+                    if (!dst) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
                     dst->type = RAY_LIST;
                     dst->len = n_groups;
                     ray_t** dout = (ray_t**)ray_data(dst);
@@ -13521,7 +13596,7 @@ by_dict_done:
                      * propagate through store_typed_elem → ray_vec_set_null
                      * (same reason as the key column above). */
                     ray_t* dst = ray_vec_new(ct, n_groups);
-                    if (RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst; }
+                    if (RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst; }
                     dst->len = n_groups;
                     for (int64_t gi = 0; gi < n_groups; gi++) {
                         int alloc = 0;
@@ -13532,7 +13607,7 @@ by_dict_done:
                     result = ray_table_add_col(result, col_name, dst);
                     ray_release(dst);
                 }
-                if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
+                if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
             }
 
             if (fi_heap_hdr) ray_free(fi_heap_hdr);

@@ -141,5 +141,8 @@ void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
 /* Could materialization attach an index (recorded kind, UNIQUE, or for STR
  * a runtime DICT, possible only when every chunk has statistics)? */
 bool ray_enccol_may_have_index(ray_t* encv);
+/* A fresh SYM vector `out` (runtime domain) takes the domain the column's ids
+ * resolve over, as its materialization would; no decode. */
+void ray_enccol_adopt_domain(ray_t* out, ray_t* encv);
 
 #endif /* RAY_ENCCOL_H */
