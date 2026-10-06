@@ -571,24 +571,63 @@ static bool tbl_has_col(ray_t* tbl, int64_t sym) {
     return ray_table_col_meta(tbl, sym, &m);
 }
 
+/* The first present segment of a plain parted wrapper, or NULL. */
+static ray_t* tbl_parted_first_seg(ray_t* col) {
+    ray_t** segs = (ray_t**)ray_data(col);
+    for (int64_t i = 0; i < col->len; i++)
+        if (segs[i] && !RAY_IS_ERR(segs[i])) return segs[i];
+    return NULL;
+}
+
 /* ray_vec_may_have_nulls of a column without a decode: a plain slot is asked
- * directly; an encoded one answers what its materialization would (the
- * persisted attrs become the vector's, text always may hold nulls). */
+ * directly, a plain parted wrapper through its segments (the null flag lives
+ * on them, the wrapper's attrs are 0); an encoded one answers what its
+ * materialization would (the persisted attrs become the vector's, a parted
+ * one's are the OR of its segments', text always may hold nulls). */
 static bool tbl_col_may_have_nulls(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return false;
-    if (!m.enc) return ray_vec_may_have_nulls(ray_table_col(tbl, sym));
-    if (m.type == RAY_SYM || m.type == RAY_STR) return true;
+    if (!m.enc) {
+        ray_t* col = ray_table_col(tbl, sym);
+        if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type))
+            return ray_vec_may_have_nulls(col);
+        ray_t** segs = (ray_t**)ray_data(col);
+        for (int64_t i = 0; i < col->len; i++)
+            if (segs[i] && !RAY_IS_ERR(segs[i]) && ray_vec_may_have_nulls(segs[i])) return true;
+        return false;
+    }
+    int8_t bt = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
+    if (bt == RAY_SYM || bt == RAY_STR) return true;
     return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
 }
 
 /* An empty column shaped like a table column: what ray_group_gather(col,
- * NULL, 0) returns.  A plain slot is gathered as it is; an encoded one is
- * built the same way from its metadata, without a decode. */
+ * NULL, 0) returns.  A plain slot is gathered as it is, a plain parted
+ * wrapper as its first segment (its base type and domain); an encoded one is
+ * built the same way from its metadata, without a decode, a parted one at its
+ * base type. */
 static ray_t* tbl_col_empty(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return NULL;
-    if (!m.enc) return ray_group_gather(ray_table_col(tbl, sym), NULL, 0);   /* plain: no decode */
+    if (!m.enc) {                                   /* plain: no decode */
+        ray_t* col = ray_table_col(tbl, sym);
+        if (col && !RAY_IS_ERR(col) && RAY_IS_PARTED(col->type)) {
+            ray_t* seg = tbl_parted_first_seg(col);
+            if (!seg) return ray_error("nyi", "empty column of a parted column without segments");
+            col = seg;
+        }
+        return ray_group_gather(col, NULL, 0);
+    }
+    if (RAY_IS_PARTED(m.type)) {
+        ray_t* seg = ray_enccol_seg(m.enc, 0);      /* borrowed, encoded or plain */
+        if (!seg) return ray_error("nyi", "empty column of a parted column without segments");
+        if (seg->type != RAY_ENCCOL) return ray_group_gather(seg, NULL, 0);
+        ray_col_meta_t sm;
+        if (!ray_col_meta_of(seg, &sm)) return ray_error("schema", NULL);
+        m.type = sm.type;
+        m.attrs = sm.attrs;                         /* segment 0's SYM width */
+        m.enc = seg;                                /* and its domain */
+    }
     if (m.type == RAY_LIST) return ray_list_new(0);
     if (m.type == RAY_STR) {
         const char* p0 = ""; uint32_t l0 = 0;

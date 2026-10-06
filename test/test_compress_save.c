@@ -5309,6 +5309,56 @@ static test_result_t test_select_parted_bydict_streams(void) {
     PASS();
 }
 
+/* The empty-key and nullability helpers of the select planner, over a parted
+ * generation-2 table, answer as over generation 0: a grouped select whose
+ * where leaves no row (zero groups: the empty key column is built from the
+ * filtered table), and a nullable sort key under a positional take.  The
+ * parted arms of those helpers (an encoded parted slot's base type, a plain
+ * parted wrapper's nulls from its segments) sit behind gates no select
+ * reaches today: an unfiltered zero-group select needs an empty parted table,
+ * which the parted group refuses first (nyi, both generations), and the
+ * nullable-key take needs SORTED, which no parted slot carries. */
+static test_result_t test_select_parted_empty_nullable(void) {
+    static const char* const qs[] = {
+        "(select {from: t by: sg where: (> v 1000.0)})",
+        "(select {from: t by: n where: (> v 1000.0)})",
+        "(select {from: t by: s where: (> v 1000.0)})",
+        "(select {x: (count v) from: t by: n where: (> v 1000.0)})",
+        "(select {from: t where: (> v 10.0) asc: n take: 3})",
+        "(select {from: t where: (> v 10.0) desc: n take: 3})",
+        "(select {from: t by: sg})",
+        NULL,   /* (select {from: t}) stays parted: no serialized form to compare (#728) */
+    };
+    ray_t* tb[2] = { NULL, NULL };
+    static const char* const gens[] = { "true", "false" };
+    for (int g = 0; g < 2; g++) {
+        char q[900];
+        snprintf(q, sizeof q,
+                 "(do (set P (table [sg v n s] (list (as 'SYM (%% (til 400) 2)) (as 'F64 (til 400))"
+                 " (concat [0N 0N] (til 398)) (at [\"a\" \"\" \"c\"] (%% (til 400) 3)))))"
+                 " (.db.splayed.set \"%s/pe%d/1/t/\" P {compress: %s})"
+                 " (.db.splayed.set \"%s/pe%d/2/t/\" P {compress: %s})"
+                 " (.db.parted.get \"%s/pe%d/\" 't))",
+                 CS_TMP, g, gens[g], CS_TMP, g, gens[g], CS_TMP, g);
+        tb[g] = ray_eval_str(q);
+        TEST_ASSERT_FMT(tb[g] && !RAY_IS_ERR(tb[g]) && tb[g]->type == RAY_TABLE,
+                        "compress %s: loaded", gens[g]);
+    }
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(tb[0], ray_sym_intern("n", 1)) != NULL);
+    for (int i = 0; qs[i]; i++) {
+        sp_bind(tb[0]);
+        ray_t* r2 = ray_eval_str(qs[i]);
+        sp_bind(tb[1]);
+        ray_t* r0 = ray_eval_str(qs[i]);
+        bool same = sp_same(r2, r0);
+        drop_out(r2); drop_out(r0);
+        TEST_ASSERT_FMT(same, "%s: generation 0 and 2 agree", qs[i]);
+    }
+    sp_bind(NULL);
+    ray_release(tb[0]); ray_release(tb[1]);
+    PASS();
+}
+
 /* The parted group's cardinality estimate over an I64 key whose first
  * partition holds a null (INT64_MIN) beside positive values: the span is
  * taken in u64 and capped, never a signed overflow (UBSan), and the grouped
@@ -5455,6 +5505,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { "compress/select_parted_bydict_streams", test_select_parted_bydict_streams, rt_setup, rt_teardown },
+    { "compress/select_parted_empty_nullable", test_select_parted_empty_nullable, rt_setup, rt_teardown },
     { "compress/parted_group_null_i64_estimate", test_parted_group_null_i64_estimate, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

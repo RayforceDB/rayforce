@@ -937,7 +937,9 @@ long ray_test_sysconf(int name) {
  * that differs is a bug in the generation-2 path, never a test change. */
 static const char* const equiv_skip[] = {
     /* mmod 1: a loaded column (or segment) maps the generation-0 file's
-     * payload in place; a generation-2 column decodes into the heap. */
+     * payload in place; a generation-2 column decodes into the heap.
+     * Generation-2 columns are encoded objects decoded into heap memory, so
+     * "mapped in place" (mmod 1) is a generation-0 residency property. */
     "equiv/store/splay_open_roundtrip",
     "equiv/store/splay_str_column_roundtrip",
     "equiv/store/part_open",
