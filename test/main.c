@@ -947,35 +947,18 @@ long ray_test_sysconf(int name) {
 /* ─── Equivalence pass ────────────────────────────────────────────────
  * Every save in these tests is written as generation 2 (absent compress
  * behaves as true) and every load reads it back: results must equal the
- * generation-0 run.  A test that asserts a property of the generation-0
- * file format itself (bytes, sizes, an auto-built persisted index, its
- * .idx.info) is listed in equiv_skip with that property; anything else
- * that differs is a bug in the generation-2 path, never a test change. */
+ * generation-0 run.  An assert on a generation-0 property (mapped-in-place
+ * residency, an auto-built persisted index, header bytes) is written
+ * generation-aware (TEST_ASSERT_LOADED_MMOD, a header check, or an explicit
+ * {compress: false} save) so the rest of the test still runs here; a test
+ * that cannot run twice in one process is listed in equiv_skip with the
+ * reason.  Anything else that differs is a bug in the generation-2 path,
+ * never a test change. */
 static const char* const equiv_skip[] = {
-    /* mmod 1: a loaded column (or segment) maps the generation-0 file's
-     * payload in place; a generation-2 column decodes into the heap.
-     * Generation-2 columns are encoded objects decoded into heap memory, so
-     * "mapped in place" (mmod 1) is a generation-0 residency property. */
-    "equiv/store/splay_open_roundtrip",
-    "equiv/store/splay_str_column_roundtrip",
-    "equiv/store/part_open",
-    "equiv/lang/eval/insert_parted_e2e",
-    "equiv/lang/eval/insert_parted_rollover",
-    "equiv/lang/eval/insert_parted_errors",
-    "equiv/lang/eval/insert_parted_physical_types",
     /* runs its own heap lifecycle and leaks a domain into the process-wide
      * cache on purpose: a second run in the same process (this pass) opens
      * no domain.  It saves a symbol file only, no table. */
     "equiv/domain/survives_heap_recycle",
-    /* .idx.info of the dict index the save path attaches on its own to a
-     * STR column of 65536 rows or more (generation 2 persists none). */
-    "equiv/rfl/null/sym_str_null_compare",
-    /* .idx.has? of that same auto-attached STR dict index. */
-    "equiv/rfl/store/splayed_str_pool_lifetime",
-    /* rewrites header byte 17 (`order`) of the saved files to 0: the
-     * generation-0 discriminator, which a generation-2 file refuses as
-     * corrupt. */
-    "equiv/rfl/store/col_format_generation",
     NULL,
 };
 
@@ -998,16 +981,20 @@ static bool rfl_file_saves(const char* path) {
 }
 
 static const test_entry_t* g_equiv_inner;
+static bool g_equiv_on;
+bool ray_test_equiv_pass(void) { return g_equiv_on; }
 static void equiv_c_setup(void) {
     if (g_equiv_inner->setup) g_equiv_inner->setup();
     ray_store_test_force_compress(true);
+    g_equiv_on = true;
 }
 static void equiv_c_teardown(void) {
+    g_equiv_on = false;
     ray_store_test_force_compress(false);
     if (g_equiv_inner->teardown) g_equiv_inner->teardown();
 }
-static void equiv_rfl_setup(void)    { rfl_setup(); ray_store_test_force_compress(true); }
-static void equiv_rfl_teardown(void) { ray_store_test_force_compress(false); rfl_teardown(); }
+static void equiv_rfl_setup(void)    { rfl_setup(); ray_store_test_force_compress(true); g_equiv_on = true; }
+static void equiv_rfl_teardown(void) { g_equiv_on = false; ray_store_test_force_compress(false); rfl_teardown(); }
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)

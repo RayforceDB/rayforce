@@ -3218,8 +3218,8 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
         old_tail[i] = segs[1];
         TEST_ASSERT_EQ_I(segs[0]->len, 2);
         TEST_ASSERT_EQ_I(segs[1]->len, 2);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
-        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
+        TEST_ASSERT_LOADED_MMOD(segs[1], 1);
     }
 
     ray_t* base_sym_col = lang_parted_insert_col(before, "ticker");
@@ -3350,7 +3350,7 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
         ray_t** segs = (ray_t**)ray_data(col);
         TEST_ASSERT_EQ_PTR(segs[0], hist_seg[i]);
         TEST_ASSERT_EQ_I(segs[0]->len, 2);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
         TEST_ASSERT_EQ_I(segs[1]->len, 5);
         TEST_ASSERT_EQ_U(segs[1]->mmod, 0);
         TEST_ASSERT_EQ_I(segs[2]->len, 2);
@@ -3420,7 +3420,7 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
     TEST_ASSERT_EQ_PTR(future_sym[0], live_sym[0]);
     TEST_ASSERT_EQ_PTR(future_sym[1], live_sym[1]);
     TEST_ASSERT_EQ_PTR(future_sym[2], live_sym[2]);
-    TEST_ASSERT_EQ_U(future_sym[0]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(future_sym[0], 1);
     TEST_ASSERT_EQ_U(future_sym[1]->mmod, 0);
     TEST_ASSERT_EQ_U(future_sym[2]->mmod, 0);
     TEST_ASSERT_EQ_U(future_sym[3]->mmod, 0);
@@ -3480,8 +3480,8 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
     ray_t* cold_id = lang_parted_insert_col(cold, "id");
     TEST_ASSERT_NOT_NULL(cold_id);
     ray_t** cold_id_segs = (ray_t**)ray_data(cold_id);
-    TEST_ASSERT_EQ_U(cold_id_segs[0]->mmod, 1);
-    TEST_ASSERT_EQ_U(cold_id_segs[1]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(cold_id_segs[0], 1);
+    TEST_ASSERT_LOADED_MMOD(cold_id_segs[1], 1);
 
     ray_release(cold);
     ray_release(future);
@@ -3597,8 +3597,8 @@ static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_ticker[pidx]), live_dom);
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_venue[pidx]), live_dom);
     }
-    TEST_ASSERT_EQ_U(live_ticker[0]->mmod, 1);
-    TEST_ASSERT_EQ_U(live_venue[0]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(live_ticker[0], 1);
+    TEST_ASSERT_LOADED_MMOD(live_venue[0], 1);
     for (int64_t pidx = 1; pidx < 3; pidx++) {
         TEST_ASSERT_EQ_U(live_ticker[pidx]->mmod, 0);
         TEST_ASSERT_EQ_U(live_venue[pidx]->mmod, 0);
@@ -3680,8 +3680,8 @@ static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
     for (int64_t pidx = 0; pidx < 3; pidx++) {
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cold_ticker[pidx]), cold_dom);
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cold_venue[pidx]), cold_dom);
-        TEST_ASSERT_EQ_U(cold_ticker[pidx]->mmod, 1);
-        TEST_ASSERT_EQ_U(cold_venue[pidx]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(cold_ticker[pidx], 1);
+        TEST_ASSERT_LOADED_MMOD(cold_venue[pidx], 1);
     }
     TEST_ASSERT_EQ_I(ray_sym_domain_count(cold_dom), disk_syms_persisted);
     TEST_ASSERT_EQ_I(ray_sym_domain_find(cold_dom, "omni", 4), omni_pos);
@@ -3706,7 +3706,7 @@ static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
     ray_t* cold_id_col = lang_parted_insert_col(cold, "id");
     TEST_ASSERT_NOT_NULL(cold_id_col);
     ray_t** cold_id = (ray_t**)ray_data(cold_id_col);
-    TEST_ASSERT_EQ_U(cold_id[2]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(cold_id[2], 1);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(cold_id[2]))[0], 7);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(cold_id[2]))[1], 8);
 
@@ -3878,8 +3878,8 @@ static test_result_t test_eval_insert_parted_errors_impl(const char* root) {
         ray_t** segs = (ray_t**)ray_data(col);
         TEST_ASSERT_EQ_I(segs[0]->len, 2);
         TEST_ASSERT_EQ_I(segs[1]->len, 2);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
-        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
+        TEST_ASSERT_LOADED_MMOD(segs[1], 1);
     }
 
     char day3[1200];
@@ -4111,8 +4111,8 @@ static test_result_t test_eval_insert_parted_physical_types_impl(
         historical[i] = segs[0];
         TEST_ASSERT_EQ_I(segs[0]->len, 1);
         TEST_ASSERT_EQ_I(segs[1]->len, 1);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
-        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
+        TEST_ASSERT_LOADED_MMOD(segs[1], 1);
     }
 
     /* A fully validated exact-schema zero-vector batch is pointer-identical
@@ -4158,7 +4158,7 @@ static test_result_t test_eval_insert_parted_physical_types_impl(
                          lang_parted_wide_types[i]);
         ray_t** segs = (ray_t**)ray_data(wrapper);
         TEST_ASSERT_EQ_PTR(segs[0], historical[i]);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
         TEST_ASSERT_EQ_I(segs[0]->len, 1);
         TEST_ASSERT_EQ_I(segs[1]->type, lang_parted_wide_types[i]);
         TEST_ASSERT_EQ_I(segs[1]->len, 3);

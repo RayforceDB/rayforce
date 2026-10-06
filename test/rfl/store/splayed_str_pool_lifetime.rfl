@@ -93,7 +93,10 @@
 (set _BT (table [id note] (list (til _N) (at (list "alpha" "beta" "gamma" "delta") (% (til _N) 4)))))
 (.db.splayed.set "rf_bigstr/" _BT)
 (set _BT 0)
-(.idx.has? (at (.db.splayed.get "rf_bigstr/") 'note)) -- true
+;; (a generation-2 save, as in the equivalence pass, persists no dict index;
+;; the load-and-drop cycles below must hold either way)
+(set _G2 (== 0 (.sys.exec "d=rf_bigstr; [ -f $d/.current ] && d=$d/$(cat $d/.current); [ \"$(od -An -tu1 -j17 -N1 $d/note | tr -d ' ')\" = 2 ]")))
+(.idx.has? (at (.db.splayed.get "rf_bigstr/") 'note)) -- (not _G2)
 
 (set _m0 (at (.sys.mem) 'sys-mapped))
 (set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)

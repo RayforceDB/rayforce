@@ -386,9 +386,9 @@ static test_result_t test_splay_open_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(lb);
     TEST_ASSERT_NOT_NULL(lc);
 
-    TEST_ASSERT_EQ_U(la->mmod, 1);
-    TEST_ASSERT_EQ_U(lb->mmod, 1);
-    TEST_ASSERT_EQ_U(lc->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(la, 1);
+    TEST_ASSERT_LOADED_MMOD(lb, 1);
+    TEST_ASSERT_LOADED_MMOD(lc, 1);
 
     /* Verify data */
     int64_t* da = (int64_t*)ray_data(la);
@@ -456,14 +456,14 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     ray_t* loaded_names = ray_table_get_col(loaded, id_name);
     TEST_ASSERT_NOT_NULL(loaded_ids);
     TEST_ASSERT_NOT_NULL(loaded_names);
-    TEST_ASSERT_EQ_U(loaded_ids->mmod, 1);
-    TEST_ASSERT_EQ_U(loaded_names->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(loaded_ids, 1);
+    TEST_ASSERT_LOADED_MMOD(loaded_names, 1);
     TEST_ASSERT_EQ_I(loaded_names->type, RAY_STR);
     TEST_ASSERT_NOT_NULL(loaded_names->str_pool);
     /* The pool owns the mapping it shares with the column (mmod 3), so a
      * selection that keeps the pool keeps the region — the column's own
      * free no longer takes the bytes with it. */
-    TEST_ASSERT_EQ_U(loaded_names->str_pool->mmod, 3);
+    TEST_ASSERT_LOADED_MMOD(loaded_names->str_pool, 3);
     /* Empty STR roundtrips as the canonical null and retains metadata. */
     TEST_ASSERT_TRUE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE(ray_vec_is_null(loaded_names, 2));
@@ -934,9 +934,9 @@ static test_result_t test_part_open(void) {
     /* Verify segment 0 has 3 rows, mmod=1 (mmap'd) */
     ray_t** segs_a = (ray_t**)ray_data(col_a);
     TEST_ASSERT_EQ_I(segs_a[0]->len, 3);
-    TEST_ASSERT_EQ_U(segs_a[0]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(segs_a[0], 1);
     TEST_ASSERT_EQ_I(segs_a[1]->len, 5);
-    TEST_ASSERT_EQ_U(segs_a[1]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(segs_a[1], 1);
 
     /* Verify data in segment 0 */
     int64_t* data_a0 = (int64_t*)ray_data(segs_a[0]);

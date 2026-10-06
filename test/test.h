@@ -36,6 +36,7 @@
 #ifndef RAY_TEST_H
 #define RAY_TEST_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -51,6 +52,15 @@ int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
  * that fails between arming and disarming never leaks the hook into the
  * tests after it. */
 void ray_test_hooks_off(void);
+
+/* True while the equivalence pass runs a test (every save is generation 2).
+ * A loaded column or segment is mapped in place (mmod 1; a string pool
+ * shares the mapping, mmod 3) after a generation-0 save, and decoded into
+ * heap memory (mmod 0) after a generation-2 one: residency asserts take the
+ * generation into account so the rest of the test still runs in both. */
+bool ray_test_equiv_pass(void);
+#define TEST_ASSERT_LOADED_MMOD(v, gen0_mmod) \
+    TEST_ASSERT_EQ_U((v)->mmod, ray_test_equiv_pass() ? 0u : (unsigned)(gen0_mmod))
 
 #if defined(_WIN32)
 /* POSIX helpers the tests rely on, mapped onto their MSVCRT equivalents.
