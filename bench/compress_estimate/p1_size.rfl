@@ -1,3 +1,9 @@
-(set t (.db.splayed.get "/skull/clickbench/rfsplayed"))
-(.db.splayed.set "/home/hetoku/data/tmp/p1_size/hits" t {compress: true})
-(println (count (.db.splayed.get "/home/hetoku/data/tmp/p1_size/hits")))
+;; P1 size measurement: re-save a splayed store compressed.
+;; Arguments after `--`: --src DIR (the generation-0 store), --out DIR (the
+;; compressed copy).  Defaults: the 10M ClickBench store and its scratch copy.
+(set u (at (.sys.args) 'user))
+(set src (if (in 'src (key u)) (at u 'src) "/skull/clickbench/rfsplayed"))
+(set out (if (in 'out (key u)) (at u 'out) "/home/hetoku/data/tmp/p1_size/hits"))
+(set t (.db.splayed.get src))
+(.db.splayed.set out t {compress: true})
+(println (count (.db.splayed.get out)))

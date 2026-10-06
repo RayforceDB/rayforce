@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# P1 size measurement: re-save the 10M store compressed and list per-column
+# P1 size measurement: re-save a splayed store compressed and list per-column
 # file sizes and generations next to the generation-0 originals.
+#   usage: p1_size.sh [SRC] [OUT] [RAYFORCE]
+#   SRC       generation-0 splayed store (default /skull/clickbench/rfsplayed)
+#   OUT       directory for the compressed copy, removed first
+#             (default /home/hetoku/data/tmp/p1_size/hits)
+#   RAYFORCE  release binary (default ./rayforce)
 set -euo pipefail
-SRC=/skull/clickbench/rfsplayed
-OUT=/home/hetoku/data/tmp/p1_size/hits
-rm -rf /home/hetoku/data/tmp/p1_size
-./rayforce bench/compress_estimate/p1_size.rfl >&2
+SRC=${1:-/skull/clickbench/rfsplayed}
+OUT=${2:-/home/hetoku/data/tmp/p1_size/hits}
+BIN=${3:-./rayforce}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+rm -rf "$OUT"
+"$BIN" "$HERE/p1_size.rfl" -- --src "$SRC" --out "$OUT" >&2
 cur() { if [ -f "$1/.current" ]; then echo "$1/$(cat "$1/.current")"; else echo "$1"; fi; }
 S=$(cur "$SRC"); D=$(cur "$OUT")
 printf 'column\tgen0_bytes\tp1_bytes\tp1_gen\n'
