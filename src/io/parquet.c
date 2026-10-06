@@ -1531,6 +1531,10 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         }
         ray_t* err = pq_strict_option(r,types);
         ray_t* rows = pq_option(types,"rows");
+        if (rows && RAY_IS_ERR(rows)) {          /* the lookup itself failed */
+            if (!err) err = rows; else ray_error_free(rows);
+            rows = NULL;
+        }
         if (!err && rows) {
             if (rows->type != -RAY_I64 || rows->i64 < 1 || rows->i64 > PQ_MAX_PART_ROWS)
                 err = pq_error("partition rows must be 1..1048576");
