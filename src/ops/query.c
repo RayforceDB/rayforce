@@ -7177,6 +7177,25 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
 
 /* (select {from: t [where: pred] [by: key] [col: expr ...]})
  * Special form — receives unevaluated dict arg. */
+/* Materialize every encoded slot of a table before a verb that reads its
+ * columns through the legacy getters, so a corrupt or failed decode returns
+ * its own error (code and message) instead of a NULL column.  The decode is
+ * cached: later getters hit it.  NULL when every slot is plain or decoded. */
+static ray_t* table_decode_all(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE) return NULL;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        if (!ray_table_get_col_enc_idx(tbl, c)) continue;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) return col;
+    }
+    return NULL;
+}
+#define TABLE_DECODE_OR_RETURN(tbl) do { \
+        ray_t* de_ = table_decode_all(tbl); \
+        if (de_) { ray_release(tbl); return de_; } \
+    } while (0)
+
 ray_t* ray_select(ray_t** args, int64_t n);
 static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved);
 ray_t* ray_update(ray_t** args, int64_t n);
@@ -9178,6 +9197,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         if (RAY_IS_ERR(tbl)) return tbl;
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
+    TABLE_DECODE_OR_RETURN(tbl);
 
     if (!aliases_resolved) {
         select_alias_plan_t plan;
@@ -16056,6 +16076,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         ray_retain(tbl);
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "update: `from:` must be a table, got %s", ray_type_name(tbl_t)); }
+    TABLE_DECODE_OR_RETURN(tbl);
 
     /* A parted table's data columns carry the RAY_PARTED_BASE wrapper type
      * (which `ray_type_name` prints as "?"), and its partition key is
@@ -18180,6 +18201,8 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         }
     }
 
+    TABLE_DECODE_OR_RETURN(tbl);
+
     /* ====================================================================
      * Vec/list dispatch — n==2 append, n==3 positional insert.
      * Tables with n==2 fall through to the legacy table-row append below.
@@ -19888,6 +19911,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
 
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("type", "upsert: target must be a table, got %s", ray_type_name(tbl_t)); }
     if (!is_list(row) && row->type != RAY_TABLE && row->type != RAY_DICT) { int8_t row_t = row->type; ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("type", "upsert: row must be a list, table or dict, got %s", ray_type_name(row_t)); }
+    { ray_t* de = table_decode_all(tbl); if (de) { ray_release(tbl); ray_release(key_sym); ray_release(row); return de; } }
 
     int64_t ncols = ray_table_ncols(tbl);
 
@@ -22822,6 +22846,7 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         int8_t t = tbl->type; ray_release(tbl);
         return ray_error("type", "delete: `from:` must be a table, got %s", ray_type_name(t));
     }
+    TABLE_DECODE_OR_RETURN(tbl);
 
     /* A parted table's columns carry the RAY_PARTED_BASE wrapper and its
      * partition key is RAY_MAPCOMMON; neither describes a flat element the

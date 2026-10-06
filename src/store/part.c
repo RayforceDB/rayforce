@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 #include "part.h"
+#include "table/table.h"
 #include "core/runtime.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
@@ -360,6 +361,17 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             part_err = part_tables[p]; /* error objects survive release */
             part_tables[p] = NULL;
             goto fail_tables;
+        }
+        /* Generation-2 columns stay encoded in a loaded table; segmenting
+         * them is P1 Task 12.  Until then refuse rather than materialize
+         * every column at open. */
+        for (int64_t c = 0, nc = ray_table_ncols(part_tables[p]); c < nc; c++) {
+            ray_col_meta_t cm;
+            if (ray_table_col_meta_idx(part_tables[p], c, &cm) && cm.enc) {
+                part_err = ray_error("nyi",
+                    "generation-2 partitions: until P1 Task 12 (%s)", path);
+                goto fail_tables;
+            }
         }
     }
 

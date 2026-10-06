@@ -270,6 +270,8 @@ static ray_t* slot_plain(ray_t* c) {
     if (!c) return NULL;
     return c->type == RAY_ENCCOL ? ray_enccol_materialize(c) : c;
 }
+/* The result is borrowed and read-only: encoded objects are shared between
+ * table copies and share one decoded cache, so never write through it. */
 ray_t* ray_table_col(ray_t* tbl, int64_t name_id)  { return slot_plain(tbl_slot_by_name(tbl, name_id)); }
 ray_t* ray_table_col_idx(ray_t* tbl, int64_t idx)  { return slot_plain(tbl_slot_by_idx(tbl, idx)); }
 
@@ -308,24 +310,40 @@ bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     ray_col_meta_t m;
     ray_col_meta_of(c, &m);
     if (m.null_count >= 0) return m.null_count > 0;          /* generation 2: directory */
-    if (m.enc || RAY_IS_PARTED(c->type)) return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
+    if (m.enc) return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
+    if (RAY_IS_PARTED(c->type)) {             /* the wrapper carries no flag: OR the segments' */
+        ray_t** segs = (ray_t**)ray_data(c);
+        for (int64_t i = 0; i < c->len; i++) {
+            ray_col_meta_t sm;
+            if (!ray_col_meta_of(segs[i], &sm)) continue;
+            if (sm.null_count >= 0 ? sm.null_count > 0 : (sm.attrs & RAY_ATTR_HAS_NULLS) != 0)
+                return true;
+        }
+        return false;
+    }
     return ray_is_vec(c) && ray_vec_has_nulls(c);            /* generation 0: today's scan */
 }
 
-/* Legacy getters (public, include/rayforce.h): clear the slot, resolve
- * through ray_table_col, dispose of a failure with ray_error_free and
- * return NULL with its message left in the slot. */
-ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
-    ray_error_clear();
-    ray_t* c = ray_table_col(tbl, name_id);
+/* Legacy getters (public, include/rayforce.h): resolve through ray_table_col.
+ * A success leaves any pending error message of the caller untouched (the
+ * getters used to be pure lookups); a failure disposes of the error with
+ * ray_error_free and returns NULL with its message left in the slot. */
+static ray_t* legacy_col(ray_t* c, const char* pending) {
     if (c && RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
+    if (pending[0]) ray_error_free(ray_error("domain", "%s", pending));
     return c;
 }
-ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
+ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
+    char pending[256];
+    snprintf(pending, sizeof pending, "%s", ray_error_msg() ? ray_error_msg() : "");
     ray_error_clear();
-    ray_t* c = ray_table_col_idx(tbl, idx);
-    if (c && RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
-    return c;
+    return legacy_col(ray_table_col(tbl, name_id), pending);
+}
+ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
+    char pending[256];
+    snprintf(pending, sizeof pending, "%s", ray_error_msg() ? ray_error_msg() : "");
+    ray_error_clear();
+    return legacy_col(ray_table_col_idx(tbl, idx), pending);
 }
 
 /* --------------------------------------------------------------------------

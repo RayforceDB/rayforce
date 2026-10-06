@@ -2210,8 +2210,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 scan_tbl = g->table;
             }
             if (!scan_tbl) return ray_error("schema", NULL);
-            ray_t* col = ray_table_get_col(scan_tbl, ext->sym);
+            ray_t* col = ray_table_col(scan_tbl, ext->sym);
             if (!col) return ray_error("schema", NULL);
+            if (RAY_IS_ERR(col)) return col;     /* a failed decode keeps its own code and message */
             if (col->type == RAY_MAPCOMMON)
                 return materialize_mapcommon(col);
             if (RAY_IS_PARTED(col->type)) {

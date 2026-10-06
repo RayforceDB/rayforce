@@ -40,6 +40,7 @@
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
+#include "store/enccol.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
@@ -706,6 +707,12 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
         if (v->type == -RAY_STR &&
             !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)))
             OBJSIZE_PUSH(v->obj);
+        return true;
+    }
+    if (v->type == RAY_ENCCOL) {          /* the decoded cache (and its index), the parted wrapper */
+        ray_t* kids[2];
+        int nk = ray_enccol_children(v, kids);
+        for (int i = 0; i < nk; i++) OBJSIZE_PUSH(kids[i]);
         return true;
     }
     if (v->attrs & RAY_ATTR_SLICE) {

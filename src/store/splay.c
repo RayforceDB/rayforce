@@ -382,7 +382,12 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
      * columns have already replaced an existing committed generation. */
     int64_t preflight_ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < preflight_ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) {           /* a failed decode: its code, message left in the slot */
+            ray_err_t derr = ray_err_from_obj(col);
+            ray_error_free(col);
+            return derr;
+        }
         ray_err_t err = ray_col_save_preflight(col);
         if (err != RAY_OK) return err;
     }
