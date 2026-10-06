@@ -1978,8 +1978,9 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
 
         ray_col_meta_t mm;
         if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
-        ray_t* mc_col = ray_table_get_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
-        if (!mc_col || RAY_IS_ERR(mc_col)) continue;
+        ray_t* mc_col = ray_table_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
+        if (!mc_col) continue;
+        if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
 
         /* Extract constant value */
         ray_op_ext_t* const_ext = find_ext(g, const_node->id);

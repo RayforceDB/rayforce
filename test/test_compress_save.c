@@ -1794,6 +1794,62 @@ static test_result_t test_exec_start_snapshot(void) {
     PASS();
 }
 
+/* first (asc v) over a parted column with a null must not become OP_MIN
+ * (MIN skips nulls; asc puts them first).  The wrapper's own attrs are
+ * always 0, so the check reads the segments' null flags. */
+static int first_asc_stays(ray_t* t, const char* col) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* f = ray_first(g, ray_asc_op(g, ray_scan(g, col)));
+    ray_op_t* r = ray_optimize(g, f);
+    int stays = r && r->opcode != OP_MIN;
+    ray_graph_free(g);
+    return stays;
+}
+
+static test_result_t test_first_asc_parted_nulls_gen0(void) {
+    ray_t* s0 = i64_col(5, 1); ray_t* s1 = i64_col(5, 1);
+    ray_vec_set_null(s1, 2, true);
+    ray_t* w = ray_alloc(2 * sizeof(ray_t*));
+    w->type = RAY_PARTED_BASE + RAY_I64; w->len = 2; w->attrs = 0;
+    memset(w->aux, 0, 16);
+    ((ray_t**)ray_data(w))[0] = s0; ((ray_t**)ray_data(w))[1] = s1;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("p", 1), w);
+    ray_release(w);
+    TEST_ASSERT_TRUE(first_asc_stays(t, "p"));
+    /* without a null the rewrite is still taken */
+    ray_vec_set_null(s1, 2, false);
+    s1->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    TEST_ASSERT_FALSE(first_asc_stays(t, "p"));
+    ray_release(t);
+    PASS();
+}
+
+static void write_null_part(const char* day, int gen, bool with_null) {
+    char dir[256], p[300];
+    snprintf(dir, sizeof dir, "%s/pdb/%s/tb", CS_TMP, day);
+    (void)ray_test_mkdir_p(dir);
+    ray_t* a = i64_col(3000, 3);
+    if (with_null) ray_vec_set_null(a, 7, true);
+    snprintf(p, sizeof p, "%s/a", dir); ray_col_save_gen(a, p, gen);
+    ray_release(a);
+    ray_t* names = ray_vec_new(RAY_STR, 1); names = ray_str_vec_append(names, "a", 1);
+    snprintf(p, sizeof p, "%s/.d", dir); ray_col_save(names, p); ray_release(names);
+}
+
+static test_result_t test_first_asc_parted_nulls_gen2(void) {
+    for (int pass = 0; pass < 2; pass++) {
+        (void)ray_test_rm_rf(CS_TMP "/pdb");
+        write_null_part("2024.01.01", 2, pass == 0);
+        write_null_part("2024.01.02", 2, false);
+        ray_t* t = ray_read_parted(CS_TMP "/pdb", "tb");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(first_asc_stays(t, "a"), pass == 0);
+        ray_release(t);
+    }
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
@@ -1847,5 +1903,7 @@ const test_entry_t compress_entries[] = {
     { "compress/csv_parted_option",    test_csv_parted_option,    rt_setup, rt_teardown },
     { "compress/planning_never_materializes", test_planning_never_materializes, cs_setup, cs_teardown },
     { "compress/exec_start_snapshot",         test_exec_start_snapshot,         cs_setup, cs_teardown },
+    { "compress/first_asc_parted_nulls_gen0", test_first_asc_parted_nulls_gen0, cs_setup, cs_teardown },
+    { "compress/first_asc_parted_nulls_gen2", test_first_asc_parted_nulls_gen2, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

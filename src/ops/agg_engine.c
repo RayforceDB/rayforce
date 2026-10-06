@@ -135,7 +135,7 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         for (uint32_t k = 0; k < ext->n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
             ray_col_meta_t cm;
-            if (!ray_table_col_meta(tbl, ke->sym, &cm)) continue;
+            if (!ray_table_col_meta(tbl, ke->sym, &cm)) continue;   /* present: the key loop above checked */
             if (cm.type == RAY_F32 || cm.type == RAY_F64) floating = true;
             if (cm.type == RAY_STR || cm.type == RAY_GUID || cm.type == RAY_LIST) indexed = true;
         }
