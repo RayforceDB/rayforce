@@ -801,24 +801,6 @@ static bool group_keys_have_bool(ray_t* by_expr, ray_t* tbl) {
     return true;   /* computed / unresolved key shapes: stay conservative */
 }
 
-/* True when `tbl` carries PARTED or MAPCOMMON columns (a parted store).  The
- * parted GROUP dispatch (exec_group_parted) treats a positive group_limit as
- * "stop after group_limit partitions", which assumes every partition yields a
- * group — an EMPTY partition breaks that and under-fills the answer.  Rather
- * than push a hint that path would mis-apply, grouped takes over parted inputs
- * keep the post-execution take. */
-static bool table_is_parted(ray_t* tbl) {
-    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return true;
-    int64_t nc = ray_table_ncols(tbl);
-    for (int64_t c = 0; c < nc; c++) {
-        ray_col_meta_t m;
-        if (ray_table_col_meta_idx(tbl, c, &m) &&
-            (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON))
-            return true;
-    }
-    return false;
-}
-
 /* Apply sort (asc/desc) and take clauses to a materialized result table.
  * Used by eval-level paths that bypass the DAG (e.g., LIST/STR group keys).
  * Builds a temporary DAG for sorting (supports per-column direction flags)
@@ -9439,8 +9421,15 @@ static bool update_expr_elementwise(ray_t* e, ray_t* tbl, bool meta_cols) {
  * synthetic row of zero cells, built from metadata without a decode.  Its
  * row fails the where like the rows it replaces, so the where stays partial
  * exactly when it was over the whole table (never all-pass, which routes
- * consumers differently, nor zero-row), and every consumer takes the path
- * it takes over the whole table. */
+ * consumers differently, nor zero-row).
+ *
+ * Consumers that size their route from the source's shape still see a
+ * smaller source with a one-row partition, usually first: the totals and
+ * per-partition averages cover the kept partitions only.  A consumer must
+ * not size its route from that one row: the parted group samples its
+ * cardinality from the first partition holding more than one row
+ * (exec_group_parted), so a pruned and an unpruned query over partitions of
+ * similar shape take the same group route. */
 
 /* The partition-pruning opcode of a where head, or 0. */
 static uint16_t prune_cmp_op(ray_t* head) {
@@ -14596,8 +14585,10 @@ by_dict_done:
      * machinery — has_sort keeps the two disjoint).  Also NOT pushed when a
      * deferred key WHERE runs AFTER the group (post_group_where_expr): that
      * filter drops result rows, so taking the first N groups before it would
-     * under-fill the answer.  Nor over a PARTED input (exec_group_parted
-     * mis-applies the hint on empty partitions — see table_is_parted), nor
+     * under-fill the answer.  A PARTED input takes the hint too: the parted
+     * group keeps the first N groups in first-seen order (exec_group_parted
+     * declines its per-partition route, whose merge order is unspecified,
+     * and hands the hint to the flattened group).  Nor
      * with a LIST-producing aggregate (top/bot): exec.c's HEAD/TAIL table trim
      * now retains LIST cells, but the group's LIST output has no reason to pay
      * a trim it can skip, and the take is a no-op there anyway. */
@@ -14605,8 +14596,7 @@ by_dict_done:
     take_pre_t take_pre = {0};   /* decoded take: value, reused by apply_sort_take */
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
                             && !post_group_where_expr && !has_list_agg
-                            && !group_keys_have_bool(by_expr, tbl)
-                            && !table_is_parted(tbl));
+                            && !group_keys_have_bool(by_expr, tbl));
     if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }

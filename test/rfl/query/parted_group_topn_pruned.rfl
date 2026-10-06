@@ -1,0 +1,110 @@
+;; Grouped top-N (`asc:`/`desc:` on an aggregate with `take:`) and unordered
+;; `take:` after `by:` over a parted table, with and without partition
+;; pruning.  Every answer equals the same query over an in-memory copy.
+;;
+;; The partitions are uneven (50 / 2000 / 3 / 70000 / 10 / 3 rows).  A pruned
+;; where keeps a one-row stand-in partition first; the parted group must not
+;; size its route from it, and the per-partition route must never trim each
+;; partition to the top N groups before the merge (a group's count is a sum
+;; over partitions).  The second table has a tiny first partition and no
+;; pruning: the same per-partition route, reached without the stand-in.
+(.sys.exec "rm -rf rf_test_gtopn rf_test_gtopn2") -- 0
+(set syms ['p 'q 'r 'u 'v 'w 'z 'a 'm])
+(set strs (list "aa" "bb" "" "cc" "dddd"))
+(set mk (fn [n o] (table [a b s x i] (list (- (% (* (+ o (til n)) 7919) 1000) 500) (% (* (+ o (til n)) 31) 97) (at syms (% (* (+ o (til n)) 13) 9)) (at strs (% (+ o (til n)) 5)) (as 'I32 (% (+ o (til n)) 50))))))
+(set days [2024.01.01 2024.01.02 2024.01.03 2024.01.04 2024.01.05 2024.01.06])
+(set ns [50 2000 3 70000 10 3])
+(set offs [0 50 2050 2053 72053 72063])
+(set wr (fn [root k] (.db.splayed.set (format "%/%/t/" root (at days k)) (mk (at ns k) (at offs k)) (format "%/.sym" root))))
+(count (map (fn [k] (wr "rf_test_gtopn" k)) (til 6))) -- 6
+(set P (.db.parted.get "rf_test_gtopn/" 't))
+(set F (raze (map (fn [k] (update {date: (take (at days k) (at ns k)) from: (mk (at ns k) (at offs k))})) (til 6))))
+(count P) -- 72066
+(count F) -- 72066
+;; same values, column by column, compared through their text form
+(set eqc (fn [a b c] (all (== (as 'STR (at a c)) (as 'STR (at b c))))))
+(set eqt (fn [a b] (all (map (fn [c] (eqc a b c)) (cols a)))))
+
+;; ordered top-N: the aggregate column is exact (keys may differ among ties)
+(set q1 (fn [tb] (select {c: (count a) by: s from: tb where: (>= date 2024.01.04) asc: c take: 3})))
+(set q2 (fn [tb] (select {c: (count a) by: s from: tb where: (>= date 2024.01.04) desc: c take: 3})))
+(set q3 (fn [tb] (select {c: (count a) by: [s i] from: tb where: (>= date 2024.01.04) asc: c take: 3})))
+(set q4 (fn [tb] (select {c: (count a) by: [s i] from: tb where: (>= date 2024.01.04) desc: c take: 3})))
+(set q5 (fn [tb] (select {c: (count a) by: [s x] from: tb where: (in date [2024.01.02 2024.01.04]) asc: c take: 4})))
+(set q6 (fn [tb] (select {c: (count a) by: [s b] from: tb where: (> date 2024.01.01) asc: c take: 5})))
+(set q7 (fn [tb] (select {t: (sum b) by: s from: tb where: (>= date 2024.01.04) asc: t take: 3})))
+(set q8 (fn [tb] (select {t: (sum b) by: [s i] from: tb where: (>= date 2024.01.04) desc: t take: 3})))
+(set q9 (fn [tb] (select {c: (count a) by: s from: tb where: (>= date 2024.01.04) asc: c take: 100})))
+(set q10 (fn [tb] (select {c: (count a) by: s from: tb where: (>= date 2024.01.04) desc: c take: 100})))
+(set q11 (fn [tb] (select {c: (count a) by: [s i] from: tb where: (and (>= date 2024.01.04) (> b 10)) asc: c take: 3})))
+(set q12 (fn [tb] (select {c: (count a) by: s from: tb where: (and (>= date 2024.01.04) (> b 0)) asc: c take: 3})))
+(eqc (q1 P) (q1 F) 'c) -- true
+(eqc (q2 P) (q2 F) 'c) -- true
+(eqc (q3 P) (q3 F) 'c) -- true
+(eqc (q4 P) (q4 F) 'c) -- true
+(eqc (q5 P) (q5 F) 'c) -- true
+(eqc (q6 P) (q6 F) 'c) -- true
+(eqc (q7 P) (q7 F) 't) -- true
+(eqc (q8 P) (q8 F) 't) -- true
+(eqc (q9 P) (q9 F) 'c) -- true
+(eqc (q10 P) (q10 F) 'c) -- true
+(eqc (q11 P) (q11 F) 'c) -- true
+(eqc (q12 P) (q12 F) 'c) -- true
+(count (q9 P)) -- 9
+(at (q3 P) 'c) -- [155 155 155]
+
+;; unordered take after by: the first N groups in first-seen order
+(set u1 (fn [tb] (select {c: (count a) by: [s x] from: tb where: (>= date 2024.01.04) take: 3})))
+(set u2 (fn [tb] (select {c: (count a) by: s from: tb where: (>= date 2024.01.04) take: 4})))
+(set u3 (fn [tb] (select {c: (count a) by: [s i] from: tb where: (in date [2024.01.02 2024.01.04]) take: 5})))
+(set u4 (fn [tb] (select {c: (count a) by: s from: tb where: (and (>= date 2024.01.02) (> b 50)) take: 2})))
+(eqt (u1 P) (u1 F)) -- true
+(eqt (u2 P) (u2 F)) -- true
+(eqt (u3 P) (u3 F)) -- true
+(eqt (u4 P) (u4 F)) -- true
+
+;; the group route is the same with and without pruning: the stand-in
+;; partition never drives the parted group's cardinality estimate (the `or`
+;; form is not pruned)
+(set runs (fn [] (at (.sys.mem) 'group-perpart-runs)))
+(set r0 (runs))
+(count (select {c: (count a) by: s from: P where: (>= date 2024.01.04)})) -- 9
+(set r1 (runs))
+(count (select {c: (count a) by: s from: P where: (or (>= date 2024.01.04) (>= date 2024.01.04))})) -- 9
+(set r2 (runs))
+(- r1 r0) -- 1
+(- r2 r1) -- 1
+(count (select {c: (count a) by: [s i] from: P where: (>= date 2024.01.04)})) -- 450
+(set r3 (runs))
+(count (select {c: (count a) by: [s i] from: P where: (or (>= date 2024.01.04) (>= date 2024.01.04))})) -- 450
+(set r4 (runs))
+(- r3 r2) -- 0
+(- r4 r3) -- 0
+
+;; a tiny first partition, no pruning
+(set ns [1 2000 3 70000 10 3])
+(set offs [0 1 2001 2004 72004 72014])
+(count (map (fn [k] (wr "rf_test_gtopn2" k)) (til 6))) -- 6
+(set P2 (.db.parted.get "rf_test_gtopn2/" 't))
+(set F2 (raze (map (fn [k] (update {date: (take (at days k) (at ns k)) from: (mk (at ns k) (at offs k))})) (til 6))))
+(set d1 (fn [tb] (select {c: (count a) by: [s i] from: tb asc: c take: 3})))
+(set d2 (fn [tb] (select {c: (count a) by: s from: tb where: (> b 0) asc: c take: 3})))
+(set d3 (fn [tb] (select {c: (count a) by: [s i] from: tb where: (> b 10) desc: c take: 3})))
+(set d4 (fn [tb] (select {c: (count a) by: [s x] from: tb take: 3})))
+(eqc (d1 P2) (d1 F2) 'c) -- true
+(eqc (d2 P2) (d2 F2) 'c) -- true
+(eqc (d3 P2) (d3 F2) 'c) -- true
+(eqt (d4 P2) (d4 F2)) -- true
+;; grouped by the partition key alone: one group per non-empty partition,
+;; so an unordered take reads only the first N non-empty partitions
+(.sys.exec "rm -rf rf_test_gtopn3") -- 0
+(.db.splayed.set "rf_test_gtopn3/2024.01.01/t/" (table [a] (list (take 0 0))) "rf_test_gtopn3/.sym")
+(.db.splayed.set "rf_test_gtopn3/2024.01.02/t/" (table [a] (list (til 3000))) "rf_test_gtopn3/.sym")
+(.db.splayed.set "rf_test_gtopn3/2024.01.03/t/" (table [a] (list (take 0 0))) "rf_test_gtopn3/.sym")
+(.db.splayed.set "rf_test_gtopn3/2024.01.04/t/" (table [a] (list (til 5000))) "rf_test_gtopn3/.sym")
+(.db.splayed.set "rf_test_gtopn3/2024.01.05/t/" (table [a] (list (til 2000))) "rf_test_gtopn3/.sym")
+(set P3 (.db.parted.get "rf_test_gtopn3/" 't))
+(at (select {c: (count a) by: date from: P3 take: 2}) 'c) -- [3000 5000]
+(at (select {c: (count a) by: date from: P3 take: 2}) 'date) -- [2024.01.02 2024.01.04]
+(at (select {c: (count a) by: date from: P3 take: 5}) 'c) -- [3000 5000 2000]
+(.sys.exec "rm -rf rf_test_gtopn rf_test_gtopn2 rf_test_gtopn3") -- 0

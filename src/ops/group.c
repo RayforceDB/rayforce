@@ -9915,20 +9915,45 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * concat path, which applies g->selection over the flattened table. */
     if (g->selection && n_borrow == 0) can_partition = 0;
 
-    /* Cardinality gate: estimate groups from first partition.
-     * Per-partition only wins when #groups << partition_size. */
+    /* An unordered `take: N` (group_limit > 0) keeps the first N groups in
+     * first-seen order.  The merge re-groups the partials, whose group order
+     * is their route's (unspecified for the parallel strategies), so the
+     * per-partition route cannot name the first N.  The one exception is a
+     * group keyed only by the partition key: one group per partition, in
+     * partition order (the LIMIT pushdown in exec_group_per_partition). */
+    if (can_partition && group_limit > 0) {
+        for (uint32_t k = 0; k < n_keys; k++) {
+            ray_col_meta_t lm;
+            if (key_is_expr[k] || !ray_table_col_meta(parted_tbl, key_syms[k], &lm) ||
+                lm.type != RAY_MAPCOMMON) { can_partition = 0; break; }
+        }
+    }
+
+    /* Cardinality gate: estimate groups from a sample partition.
+     * Per-partition only wins when #groups << partition_size.  The sample is
+     * the first partition holding more than one row: a pruned source keeps a
+     * one-row stand-in for its pruned partitions (query.c, partition
+     * pruning), usually first, and a one-row sample always estimates one
+     * group whatever the data. */
     if (can_partition) {
         int64_t rows_per_part = total_rows / n_parts;
         int64_t est_groups = 1;
+        int32_t sp = 0;
+        if (n_borrow > 0) {
+            for (int32_t p = 0; p < n_parts; p++) {
+                ray_t* sg = group_parted_seg(parted_tbl, borrow_syms[0], p);
+                if (sg && sg->len > 1) { sp = p; break; }
+            }
+        }
         for (uint32_t k = 0; k < n_keys; k++) {
             if (key_is_expr[k]) {
-                /* Expression key: materialize partition 0 and estimate its
+                /* Expression key: materialize the sample and estimate its
                  * distinct group count via HyperLogLog.  A range-based proxy
                  * (as used for integer scan keys below) would badly over-count
                  * bucketed keys — xbar values are spaced N apart, so hi-lo
                  * spans the whole domain range, not the bucket count. */
                 ray_t* v0 = group_eval_part_expr(g, parted_tbl, borrow_syms,
-                                                 n_borrow, ext->keys[k], 0);
+                                                 n_borrow, ext->keys[k], sp);
                 if (!v0) { est_groups = rows_per_part; break; }
                 ray_t* cd = ray_count_distinct_approx(v0);
                 ray_release(v0);
@@ -9950,7 +9975,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
              * per-partition sub-GROUP-BY, contributes 0 to cardinality. */
             if (pcm.type == RAY_MAPCOMMON) { continue; }
             if (!RAY_IS_PARTED(pcm.type)) { est_groups = rows_per_part; break; }
-            ray_t* seg0 = group_parted_seg_col(parted_tbl, key_syms[k], 0);
+            ray_t* seg0 = group_parted_seg_col(parted_tbl, key_syms[k], sp);
             if (seg0 && RAY_IS_ERR(seg0)) {
                 scratch_free(key_syms_hdr); scratch_free(agg_syms_hdr);
                 scratch_free(key_is_expr_hdr); scratch_free(agg_is_expr_hdr);
@@ -10006,7 +10031,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             est_groups *= card;
             if (est_groups > rows_per_part) { est_groups = rows_per_part; break; }
         }
-        /* Post-filter cap: est_groups is estimated from partition 0's
+        /* Post-filter cap: est_groups is estimated from the sample's
          * UNFILTERED rows, but a pushed-down WHERE lets a partition yield at
          * most one group per SURVIVING row.  Without this cap a selective
          * filter over a genuinely low-cardinality group-by would be judged
@@ -10216,7 +10241,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 
         ray_t* saved = g->table;
         g->table = flat_tbl;
-        ray_t* result = exec_group(g, op, flat_tbl, 0);
+        ray_t* result = exec_group(g, op, flat_tbl, group_limit);
         g->table = saved;
         ray_release(flat_tbl);
         scratch_free(needed_hdr);
@@ -16391,6 +16416,18 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     atomic_fetch_add_explicit(&ray_group_perpart_runs_ctr, 1,
                               memory_order_relaxed);
 
+    /* The top-N emit filter (`asc:/desc: <agg> take: N`) names groups of the
+     * whole result: a partition's partial must keep every group (a group's
+     * aggregate is merged over all partitions), and so must the merge.  Disarm
+     * it for the partial and merge executions (restored in pp_cleanup) and
+     * trim the finished result once with the filter's own decision. */
+    ray_group_emit_filter_t ef_saved = ray_group_emit_filter_get();
+    ray_group_emit_filter_t ef_trim  = ray_group_emit_filter_active();
+    if (ef_saved.enabled) {
+        ray_group_emit_filter_t off = {0};
+        ray_group_emit_filter_set(off);
+    }
+
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
@@ -16480,13 +16517,25 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     }
 
     /* LIMIT pushdown: when all GROUP BY keys are MAPCOMMON (n_part_keys==0),
-     * each partition produces exactly 1 group.  Limit the partition loop.
-     * Disabled under a pushed-down WHERE: a filtered partition may yield 0
-     * groups (all rows filtered out), breaking the "1 group per partition"
-     * assumption the limit relies on — the outer take/limit truncates the
-     * merged result instead. */
-    if (group_limit > 0 && n_part_keys == 0 && group_limit < n_parts && !saved_sel)
-        n_parts = (int32_t)group_limit;
+     * each non-empty partition produces exactly 1 group.  Limit the partition
+     * loop to the first group_limit non-empty partitions (the partition key's
+     * per-partition row counts say which).  Disabled under a pushed-down
+     * WHERE: a filtered partition may yield 0 groups (all rows filtered out),
+     * breaking the "1 group per non-empty partition" assumption the limit
+     * relies on — the outer take/limit truncates the merged result instead. */
+    if (group_limit > 0 && n_part_keys == 0 && n_mc_keys > 0 &&
+        group_limit < n_parts && !saved_sel) {
+        ray_t* mc_col = ray_table_col(parted_tbl, mc_sym_ids[0]);   /* MAPCOMMON is plain */
+        ray_t* mc_cnt = (mc_col && !RAY_IS_ERR(mc_col) && mc_col->type == RAY_MAPCOMMON)
+                      ? ((ray_t**)ray_data(mc_col))[1] : NULL;      /* not-a-table */
+        if (mc_cnt && mc_cnt->type == RAY_I64 && mc_cnt->len >= n_parts) {
+            const int64_t* cnt = (const int64_t*)ray_data(mc_cnt);
+            int64_t seen = 0;
+            for (int32_t p = 0; p < n_parts; p++) {
+                if (cnt[p] > 0 && ++seen == group_limit) { n_parts = p + 1; break; }
+            }
+        }
+    }
 
     /* Pushed-down WHERE setup (Part A): flatten the global selection once,
      * clear g->selection for the materialization phase, and precompute the
@@ -17245,8 +17294,12 @@ batch_fail:
 
     if (merge_tbl) ray_release(merge_tbl);
     ret = result;
+    if (ef_trim.enabled && ef_trim.agg_index < n_aggs &&
+        (ef_trim.agg_op ? ef_trim.agg_op : OP_COUNT) == ext->agg_ops[ef_trim.agg_index])
+        ret = agg_emit_filter_trim(ret, n_keys, n_aggs, ext->agg_ops, &ef_trim);
 
 pp_cleanup:
+    if (ef_saved.enabled) ray_group_emit_filter_set(ef_saved);
     scratch_free(mc_sym_ids_hdr);
     scratch_free(pk_syms_hdr);
     scratch_free(pkeys_hdr);
