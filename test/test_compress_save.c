@@ -3065,7 +3065,7 @@ static test_result_t ex_corrupt(ray_t* r, const char* what) {
 
 typedef enum { EX_HEAD, EX_TAIL, EX_FILTER, EX_FILTER_SOME, EX_SORT_B, EX_SORT_A, EX_TOPK_B,
                EX_PIVOT, EX_WINDOW_FN_A, EX_SELECT_PASS, EX_WINDOW_PASS, EX_MERGE, EX_FILTER_NONE,
-               EX_HEAD_FILTER, EX_EAGER_FILTER, EX_N } ex_case_t;
+               EX_HEAD_FILTER, EX_EAGER_FILTER, EX_TOPK_A, EX_N } ex_case_t;
 
 static ray_t* ex_run(ray_t* t, ex_case_t k) {
     if (k == EX_MERGE) return ray_result_merge(t, t);
@@ -3092,6 +3092,7 @@ static ray_t* ex_run(ray_t* t, ex_case_t k) {
     case EX_FILTER_NONE: root = ray_filter(g, tb, ray_lt(g, sb, ray_const_i64(g, -1))); break;
     case EX_SORT_B: { ray_op_t* ks[1] = { sb }; root = ray_sort_op(g, tb, ks, d0, nf0, 1); break; }
     case EX_SORT_A: { ray_op_t* ks[1] = { ray_scan(g, "a") }; root = ray_sort_op(g, tb, ks, d0, nf0, 1); break; }
+    case EX_TOPK_A: { ray_op_t* ks[1] = { ray_scan(g, "a") }; root = ray_head(g, ray_sort_op(g, tb, ks, d0, nf0, 1), 3); break; }
     case EX_TOPK_B: { ray_op_t* ks[1] = { sb }; root = ray_head(g, ray_sort_op(g, tb, ks, d0, nf0, 1), 3); break; }
     case EX_PIVOT: { ray_op_t* ix[1] = { sb };
                      root = ray_pivot_op(g, ix, 1, ray_scan(g, "a"), sb, OP_SUM); break; }
@@ -3118,7 +3119,7 @@ static ray_t* ex_run(ray_t* t, ex_case_t k) {
 static test_result_t ex_failed_decode_one(int64_t n, bool big) {
     static const char* const names[EX_N] = { "head", "tail", "filter", "filter-some", "sort-b", "sort-a",
         "top-k-b", "pivot", "window-fn-a", "select-pass", "window-pass", "result-merge", "filter-none",
-        "head-filter", "eager-filter" };
+        "head-filter", "eager-filter", "top-k-a" };
     int64_t sa = ray_sym_intern("a", 1);
     for (int k = 0; k < EX_N; k++) {
         if (big && k != EX_FILTER && k != EX_FILTER_SOME && k != EX_SORT_B && k != EX_EAGER_FILTER) continue;
@@ -3131,6 +3132,7 @@ static test_result_t ex_failed_decode_one(int64_t n, bool big) {
             ray_enc_counters_t c; ray_enc_counters_get(&c);
             if (k == EX_FILTER_NONE) {
                 TEST_ASSERT_FMT(ray_table_nrows(r) == 0 && ray_table_ncols(r) == 2, "%s: schema", names[k]);
+                TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", names[k], (unsigned long long)c.materialized);
             } else {
                 TEST_ASSERT_FMT(ray_table_get_col_enc(r, sa) != NULL, "%s: a is passed encoded", names[k]);
                 TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", names[k], (unsigned long long)c.materialized);
@@ -3160,6 +3162,8 @@ static test_result_t test_exec_sites_gen2_equal(void) {
     t0 = ray_table_add_col(t0, ray_sym_intern("a", 1), i64_col(3000, 3));
     t0 = ray_table_add_col(t0, ray_sym_intern("b", 1), i64_col(3000, 5));
     for (int k = 0; k < EX_N; k++) {
+        /* pivot: its output columns follow the hash table's order, so rows are compared by the
+         * dedicated pivot tests; merge and the eager filter take no graph. */
         if (k == EX_PIVOT || k == EX_MERGE || k == EX_EAGER_FILTER) continue;
         ray_t* r2 = ex_run(t2, (ex_case_t)k);
         ray_t* r0 = ex_run(t0, (ex_case_t)k);
@@ -3168,6 +3172,49 @@ static test_result_t test_exec_sites_gen2_equal(void) {
         ray_release(r2); ray_release(r0);
     }
     ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+
+/* Rows of a graph FILTER on column s (SYM) or v over the fixture table, run on generation 0 or 2. */
+static int64_t fq_filter_rows(const char* name, int gen, const char* col, ray_t* atom, ray_enc_counters_t* c) {
+    char d[160], sy[170];
+    snprintf(d, sizeof d, "%s/%s%d", CS_TMP, name, gen); snprintf(sy, sizeof sy, "%s.sym", d);
+    ray_t* t = ray_read_splayed(d, sy);
+    if (!t || RAY_IS_ERR(t)) return -1;
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* root = ray_filter(g, ray_const_table(g, t),
+                                ray_eq(g, ray_scan(g, col), ray_const_atom(g, atom)));
+    ray_enc_counters_reset();
+    ray_t* r = ray_execute(g, root);
+    ray_enc_counters_get(c);
+    int64_t n = (r && !RAY_IS_ERR(r)) ? (g->selection ? ray_rowsel_meta(g->selection)->total_pass : ray_table_nrows(r)) : -1;
+    if (r && !RAY_IS_ERR(r)) ray_release(r);
+    ray_graph_free(g);
+    ray_release(t);
+    return n;
+}
+
+/* An equality on a symbol missing from the column's domain selects no rows from the domain alone: a
+ * generation-2 column is not decoded to learn that; a present symbol, and a predicate on an encoded
+ * column with no index, give the same rows on both generations. */
+static test_result_t test_filter_absent_symbol(void) {
+    TEST_ASSERT_TRUE(fq_save("as"));
+    ray_t* none = ray_sym(ray_sym_intern("nowhere_at_all", 14));
+    ray_t* beta = ray_sym(ray_sym_intern("beta", 4));
+    ray_t* four = ray_i64(4);
+    ray_enc_counters_t c0, c2;
+    TEST_ASSERT_EQ_I(fq_filter_rows("as", 0, "s", none, &c0), 0);
+    TEST_ASSERT_EQ_I(fq_filter_rows("as", 2, "s", none, &c2), 0);
+    TEST_ASSERT_EQ_U(c2.materialized, 0);
+    TEST_ASSERT_EQ_I(fq_filter_rows("as", 0, "s", beta, &c0), 750);
+    TEST_ASSERT_EQ_I(fq_filter_rows("as", 2, "s", beta, &c2), 750);
+    TEST_ASSERT_TRUE(c2.materialized >= 1);                /* the scan binds s; the result gather reads the rest */
+    int64_t v0 = fq_filter_rows("as", 0, "v", four, &c0);
+    int64_t v2 = fq_filter_rows("as", 2, "v", four, &c2);
+    TEST_ASSERT_TRUE(v0 > 0 && v0 == v2);
+    TEST_ASSERT_TRUE(c2.materialized <= 5);                /* no index: each column decodes at most once */
+    ray_release(none); ray_release(beta); ray_release(four);
     PASS();
 }
 
@@ -3487,5 +3534,6 @@ const test_entry_t compress_entries[] = {
     { "compress/parted_pruning_mixed",    test_parted_pruning_mixed,    rt_setup, rt_teardown },
     { "compress/exec_sites_failed_decode", test_exec_sites_failed_decode, rt_setup, rt_teardown },
     { "compress/exec_sites_gen2_equal",    test_exec_sites_gen2_equal,    rt_setup, rt_teardown },
+    { "compress/filter_absent_symbol",     test_filter_absent_symbol,     rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

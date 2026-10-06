@@ -3787,10 +3787,12 @@ sort_idx_ready:;
     /* Pre-allocate all output columns, then do a single fused gather pass */
     ray_pool_t* gather_pool = (gather_rows > RAY_PARALLEL_THRESHOLD) ? ray_pool_get() : NULL;
     ray_t* new_cols[ncols];
+    ray_t* src_cols[ncols];   /* borrowed: the plain source columns */
     int64_t col_names[ncols];
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = col;
         if (col && RAY_IS_ERR(col)) {
             for (int64_t j = 0; j < c; j++)
                 if (new_cols[j]) ray_release(new_cols[j]);
@@ -3880,7 +3882,7 @@ sort_idx_ready:;
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_col_idx(tbl, base);   /* cached by the pass above */
+            ray_t* col = src_cols[base];
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -3909,7 +3911,7 @@ sort_idx_ready:;
     /* Propagate str_pool / null bitmaps from source columns */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_col_idx(tbl, c);   /* cached by the pass above */
+        ray_t* col = src_cols[c];
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         /* Gather null bits in sorted order */
@@ -4398,7 +4400,8 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     ray_t* nc_hdr = NULL;
     ray_t** new_cols = (ray_t**)scratch_alloc(&nc_hdr,
-                             (size_t)ncols * sizeof(ray_t*));
+                             (size_t)ncols * 2 * sizeof(ray_t*));
+    ray_t** src_cols = new_cols ? new_cols + ncols : NULL;   /* borrowed plain sources */
     ray_t* cn_hdr = NULL;
     int64_t* col_names = (int64_t*)scratch_alloc(&cn_hdr,
                              (size_t)ncols * sizeof(int64_t));
@@ -4410,11 +4413,12 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         ray_release(idx);
         return ray_error("oom", NULL);
     }
-    for (int64_t c = 0; c < ncols; c++) new_cols[c] = NULL;
+    for (int64_t c = 0; c < ncols; c++) { new_cols[c] = NULL; src_cols[c] = NULL; }
 
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = col;
         if (col && RAY_IS_ERR(col)) {
             for (int64_t j = 0; j < c; j++)
                 if (new_cols[j]) ray_release(new_cols[j]);
@@ -4492,7 +4496,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_col_idx(tbl, base);   /* cached by the pass above */
+            ray_t* col = src_cols[base];
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -4523,7 +4527,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * gather_by_idx. */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_col_idx(tbl, c);   /* cached by the pass above */
+        ray_t* col = src_cols[c];
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         bool src_has_nulls = ray_vec_may_have_nulls(col);

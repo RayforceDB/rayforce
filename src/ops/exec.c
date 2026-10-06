@@ -1431,7 +1431,7 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
 static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,
-                             int* out_is_float, uint8_t* out_ikind);
+                             int* out_is_float, ray_col_meta_t* out_meta);
 
 /* ---- Slice-group fusion probe (FILTER(in/eq on c) + GROUP(by c)) ----
  *
@@ -1540,7 +1540,7 @@ static int idx_flatten_and(ray_graph_t* g, ray_op_t* op,
 static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,
-                             int* out_is_float, uint8_t* out_ikind) {
+                             int* out_is_float, ray_col_meta_t* out_meta) {
     if (!pred_op || pred_op->arity != 2) return 0;
     uint16_t opc = pred_op->opcode;
     if (opc != OP_EQ && opc != OP_NE &&
@@ -1605,7 +1605,7 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
         return 0;
     }
 
-    if (out_ikind) *out_ikind = m.index_kind;
+    if (out_meta) *out_meta = m;
     if (out_col) {
         ray_t* col = idx_decode_col(tbl, lext->sym);
         if (!col) return 0;
@@ -2558,6 +2558,33 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * pre-existing selection (the entry shape downstream
              * group-by / sort already expects). */
             if (input->type == RAY_TABLE && !g->selection) {
+                /* A symbol missing from the column's domain selects no rows,
+                 * indexed or not.  Decided from the domain alone: a generation-2
+                 * column is never decoded to learn that. */
+                {
+                    uint16_t pc = 0; int64_t pk = 0; double pf = 0.0; int pif = 0;
+                    ray_col_meta_t pm;
+                    if (idx_filter_decode(g, op_child(g, op, 1), IDXW_NONE, NULL, &pc,
+                                          &pk, &pf, &pif, &pm) &&
+                        pm.type == RAY_SYM && pc == OP_EQ && !pif && pk != 0) {
+                        ray_op_t* sl = op_child(g, op_child(g, op, 1), 0);
+                        ray_op_ext_t* sx = sl ? find_ext(g, sl->id) : NULL;
+                        struct ray_sym_domain_s* dom = NULL;
+                        if (pm.enc) {
+                            ray_enccol_t* ee = ray_enccol_of(pm.enc);
+                            if (ee) dom = ee->dom;
+                        } else if (sx) {
+                            ray_t* pcol = ray_table_col(g->table, sx->sym);
+                            if (pcol && RAY_IS_ERR(pcol)) ray_error_free(pcol);
+                            else if (pcol) dom = ray_sym_vec_domain(pcol);
+                        }
+                        ray_t* ps = dom ? ray_sym_str(pk) : NULL;
+                        if (ps && ray_sym_domain_find(dom, ray_str_ptr(ps), ray_str_len(ps)) < 0) {
+                            ray_t* empty = ray_index_empty_rowsel(ray_table_nrows(input));
+                            if (empty) { g->selection = empty; return input; }
+                        }
+                    }
+                }
                 ray_t*   col      = NULL;
                 uint16_t cmp_op   = 0;
                 int64_t  key_i    = 0;
@@ -2701,11 +2728,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                      * hash-indexed column decodes nothing. */
                     bool has_hash_eq = false;
                     for (int ci = 0; ci < ncj && shape_ok && !has_hash_eq; ci++) {
-                        uint16_t cop = 0; uint8_t ik = 0;
+                        uint16_t cop = 0; ray_col_meta_t cm;
                         int64_t ki = 0; double kf = 0.0; int isf = 0;
                         has_hash_eq = idx_filter_decode(g, conj[ci], IDXW_NONE, NULL, &cop,
-                                                        &ki, &kf, &isf, &ik) &&
-                                      cop == OP_EQ && ik == RAY_IDX_HASH;
+                                                        &ki, &kf, &isf, &cm) &&
+                                      cop == OP_EQ && cm.index_kind == RAY_IDX_HASH;
                     }
                     shape_ok = shape_ok && has_hash_eq;
                     for (int ci = 0; ci < ncj && shape_ok; ci++) {
