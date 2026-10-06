@@ -2128,6 +2128,80 @@ static test_result_t test_first_asc_parted_nulls_gen0(void) {
     PASS();
 }
 
+/* A text segment: SYM ids or STR cells; `null_at` >= 0 holds the null (id
+ * 0, the empty string) there. */
+static ray_t* text_seg(int8_t ty, int64_t n, int64_t null_at) {
+    static const char* const w[3] = { "aa", "bb", "cc" };
+    if (ty == RAY_SYM) {
+        ray_t* v = ray_sym_vec_new(RAY_SYM_W64, n); v->len = n;
+        for (int64_t i = 0; i < n; i++)
+            ((int64_t*)ray_data(v))[i] = i == null_at ? 0 : ray_sym_intern(w[i % 3], 2);
+        return v;
+    }
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    for (int64_t i = 0; i < n; i++)
+        v = i == null_at ? ray_str_vec_append(v, "", 0) : ray_str_vec_append(v, w[i % 3], 2);
+    return v;
+}
+
+/* (first (asc p)) takes the same route over a parted SYM/STR column as over
+ * the flat column with the same cells: text nulls are in-band (no flag), so
+ * the parted check reads each plain segment's payload. */
+static test_result_t test_first_asc_parted_text_nulls(void) {
+    static const int8_t tys[2] = { RAY_SYM, RAY_STR };
+    for (int ti = 0; ti < 2; ti++) {
+        for (int with_null = 0; with_null < 2; with_null++) {
+            ray_t* s0 = text_seg(tys[ti], 5, -1);
+            ray_t* s1 = text_seg(tys[ti], 5, with_null ? 2 : -1);
+            ray_t* w = ray_alloc(2 * sizeof(ray_t*));
+            w->type = RAY_PARTED_BASE + tys[ti]; w->len = 2; w->attrs = 0;
+            memset(w->aux, 0, 16);
+            ((ray_t**)ray_data(w))[0] = s0; ((ray_t**)ray_data(w))[1] = s1;
+            ray_t* t = ray_table_new(1);
+            t = ray_table_add_col(t, ray_sym_intern("p", 1), w);
+            ray_release(w);
+            ray_t* fl = text_seg(tys[ti], 10, with_null ? 7 : -1);   /* the same cells, flat */
+            ray_t* tf = ray_table_new(1);
+            tf = ray_table_add_col(tf, ray_sym_intern("p", 1), fl);
+            ray_release(fl);
+            bool has = ray_table_col_has_nulls(t, ray_sym_intern("p", 1));
+            int parted = first_asc_stays(t, "p"), flat = first_asc_stays(tf, "p");
+            ray_release(t); ray_release(tf);
+            TEST_ASSERT_FMT(has == (bool)with_null, "type %d null %d: has_nulls %d", tys[ti], with_null, has);
+            TEST_ASSERT_FMT(parted == flat, "type %d null %d: parted route %d, flat %d", tys[ti], with_null, parted, flat);
+        }
+    }
+    PASS();
+}
+
+/* A parted STR column whose generation-0 segment holds the null beside a
+ * generation-2 segment: the encoded wrapper reports it too. */
+static void write_str_part(const char* day, int gen, bool with_null) {
+    char dir[256], p[300];
+    snprintf(dir, sizeof dir, "%s/pdt/%s/tb", CS_TMP, day);
+    (void)ray_test_mkdir_p(dir);
+    ray_t* a = text_seg(RAY_STR, 3000, with_null ? 7 : -1);
+    snprintf(p, sizeof p, "%s/a", dir); ray_col_save_gen(a, p, gen);
+    ray_release(a);
+    ray_t* names = ray_vec_new(RAY_STR, 1); names = ray_str_vec_append(names, "a", 1);
+    snprintf(p, sizeof p, "%s/.d", dir); ray_col_save(names, p); ray_release(names);
+}
+
+static test_result_t test_parted_text_nulls_mixed_gen(void) {
+    for (int pass = 0; pass < 2; pass++) {
+        (void)ray_test_rm_rf(CS_TMP "/pdt");
+        write_str_part("2024.01.01", 0, pass == 0);
+        write_str_part("2024.01.02", 2, false);
+        ray_t* t = ray_read_parted(CS_TMP "/pdt", "tb");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(ray_table_get_col_enc(t, ray_sym_intern("a", 1)) != NULL);   /* the encoded wrapper */
+        bool has = ray_table_col_has_nulls(t, ray_sym_intern("a", 1));
+        ray_release(t);
+        TEST_ASSERT_EQ_I(has, pass == 0);
+    }
+    PASS();
+}
+
 static void write_null_part(const char* day, int gen, bool with_null) {
     char dir[256], p[300];
     snprintf(dir, sizeof dir, "%s/pdb/%s/tb", CS_TMP, day);
@@ -5476,6 +5550,8 @@ const test_entry_t compress_entries[] = {
     { "compress/query_first_asc_parted_nulls_gen0", test_query_first_asc_parted_nulls_gen0, rt_setup, rt_teardown },
     { "compress/grouped_nonagg_binds_referenced", test_grouped_nonagg_binds_referenced, rt_setup, rt_teardown },
     { "compress/first_asc_parted_nulls_gen2", test_first_asc_parted_nulls_gen2, rt_setup, rt_teardown },
+    { "compress/first_asc_parted_text_nulls", test_first_asc_parted_text_nulls, rt_setup, rt_teardown },
+    { "compress/parted_text_nulls_mixed_gen", test_parted_text_nulls_mixed_gen, rt_setup, rt_teardown },
     { "compress/bind_stage",        test_bind_stage,       cs_setup, cs_teardown },
     { "compress/fused_pred_bound",  test_fused_pred_bound, rt_setup, rt_teardown },
     { "compress/fused_pred_enc_source", test_fused_pred_enc_source, rt_setup, rt_teardown },

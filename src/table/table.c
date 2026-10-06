@@ -311,13 +311,18 @@ bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     ray_col_meta_of(c, &m);
     if (m.null_count >= 0) return m.null_count > 0;          /* generation 2: directory */
     if (m.enc) return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
-    if (RAY_IS_PARTED(c->type)) {             /* the wrapper carries no flag: OR the segments' */
+    if (RAY_IS_PARTED(c->type)) {             /* the wrapper carries no flag: ask each segment */
         ray_t** segs = (ray_t**)ray_data(c);
         for (int64_t i = 0; i < c->len; i++) {
             ray_col_meta_t sm;
             if (!ray_col_meta_of(segs[i], &sm)) continue;
-            if (sm.null_count >= 0 ? sm.null_count > 0 : (sm.attrs & RAY_ATTR_HAS_NULLS) != 0)
-                return true;
+            bool text = !sm.enc && (sm.type == RAY_SYM || sm.type == RAY_STR);
+            bool nulls = sm.null_count >= 0 ? sm.null_count > 0   /* an encoded segment's directory */
+                       /* a plain text segment: the exact check, which scans
+                        * the payload (text nulls are in-band, no flag) */
+                       : text ? ray_vec_has_nulls(segs[i])
+                       : (sm.attrs & RAY_ATTR_HAS_NULLS) != 0;
+            if (nulls) return true;
         }
         return false;
     }

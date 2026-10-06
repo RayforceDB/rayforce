@@ -29,6 +29,7 @@
 #include "mem/sys.h"             /* ray_sys_alloc: the map descriptor, as col.c */
 #include "table/sym.h"
 #include "table/domain.h"
+#include "vec/vec.h"              /* ray_vec_has_nulls */
 #include "store/enc.h"
 #include "vec/str.h"
 #include "core/pool.h"
@@ -1082,7 +1083,12 @@ ray_t* ray_enccol_parted_new(ray_t* wrapper) {
         if (!segs[i]) continue;
         ray_col_meta_t m;
         if (!ray_col_meta_of(segs[i], &m)) continue;
-        bool nulls = m.null_count >= 0 ? m.null_count > 0 : (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
+        /* an encoded segment: its directory's null count (in-band text nulls
+         * included); a plain one: the exact check, which scans a SYM/STR
+         * payload (text nulls set no flag) */
+        bool nulls = m.null_count >= 0 ? m.null_count > 0
+                   : !m.enc && (m.type == RAY_SYM || m.type == RAY_STR) ? ray_vec_has_nulls(segs[i])
+                   : (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
         if (nulls) e->attrs |= RAY_ATTR_HAS_NULLS;      /* OR across every segment; width and
                                                          * SORTED are per-segment properties */
     }
