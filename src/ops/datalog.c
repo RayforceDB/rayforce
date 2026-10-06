@@ -121,12 +121,6 @@ static void dl_cols_borrow(ray_t* tbl, int64_t n, ray_t** cols) {
     }
 }
 
-/* Slot at `c` for handing to another table without reading it: the encoded
- * object when the slot is encoded, else the plain column (never fails). */
-static ray_t* dl_slot_pass(ray_t* tbl, int64_t c) {
-    ray_t* col = ray_table_get_col_enc_idx(tbl, c);
-    return col ? col : ray_table_col_idx(tbl, c);
-}
 
 int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
     if (!prog || !name || !table || prog->n_rels >= DL_MAX_RELS)
@@ -155,7 +149,7 @@ int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
 
     ray_t* new_tbl = ray_table_new(arity);
     for (int c = 0; c < arity; c++) {
-        ray_t* col = dl_slot_pass(table, c);
+        ray_t* col = ray_table_slot_idx(table, c);
         if (!col) { ray_release(new_tbl); return -1; }
         new_tbl = ray_table_add_col(new_tbl, rel->col_names[c], col);
         if (RAY_IS_ERR(new_tbl)) return -1;
@@ -886,7 +880,7 @@ static ray_t* dl_table_add_computed_col(ray_t* tbl, ray_t* new_col, const char* 
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* out = ray_table_new((int)(ncols + 1));
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = dl_slot_pass(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (col)
             out = ray_table_add_col(out, ray_table_col_name(tbl, c), col);
     }
@@ -1028,7 +1022,7 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
     int64_t rnc = ray_table_ncols(right);
     ray_t* ltbl = ray_table_new((int)lnc);
     for (int64_t c = 0; c < lnc; c++) {
-        ray_t* col = dl_slot_pass(left, c);
+        ray_t* col = ray_table_slot_idx(left, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "L%d", (int)c);
         int64_t sym = ray_sym_intern(name, strlen(name));
@@ -1036,7 +1030,7 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
     }
     ray_t* rtbl = ray_table_new((int)rnc);
     for (int64_t c = 0; c < rnc; c++) {
-        ray_t* col = dl_slot_pass(right, c);
+        ray_t* col = ray_table_slot_idx(right, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "R%d", (int)c);
         int64_t sym = ray_sym_intern(name, strlen(name));
@@ -1081,14 +1075,14 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
     int64_t rnc = ray_table_ncols(right);
     ray_t* ltbl = ray_table_new((int)lnc);
     for (int64_t c = 0; c < lnc; c++) {
-        ray_t* col = dl_slot_pass(left, c);
+        ray_t* col = ray_table_slot_idx(left, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "L%d", (int)c);
         ltbl = ray_table_add_col(ltbl, ray_sym_intern(name, strlen(name)), col);
     }
     ray_t* rtbl = ray_table_new((int)rnc);
     for (int64_t c = 0; c < rnc; c++) {
-        ray_t* col = dl_slot_pass(right, c);
+        ray_t* col = ray_table_slot_idx(right, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "R%d", (int)c);
         rtbl = ray_table_add_col(rtbl, ray_sym_intern(name, strlen(name)), col);
@@ -2558,7 +2552,7 @@ static ray_t* table_rename_cols(ray_t* tbl, dl_rel_t* target_rel) {
     /* Build new table with correct column names sharing the same column data */
     ray_t* out = ray_table_new(arity);
     for (int c = 0; c < arity; c++) {
-        ray_t* col = dl_slot_pass(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (col)
             out = ray_table_add_col(out, target_rel->col_names[c], col);
     }
@@ -2571,7 +2565,7 @@ static ray_t* canonicalize(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* out = ray_table_new(nc);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = dl_slot_pass(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (!col) continue;
         char buf[16];
         snprintf(buf, sizeof(buf), "c%d", (int)c);
@@ -2587,7 +2581,7 @@ static ray_t* restore_names(ray_t* tbl, ray_t* src) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* out = ray_table_new(nc);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = dl_slot_pass(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (col)
             out = ray_table_add_col(out, ray_table_col_name(src, c), col);
     }
@@ -2831,7 +2825,12 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
             rs->ref_cols = NULL;
             return false;
         }
-        rs->ref_cols[c] = col ? (int64_t*)ray_data(col) : NULL;
+        if (!col) {                     /* the hash reads every column of every row */
+            ray_free_raw(rs->ref_cols);
+            rs->ref_cols = NULL;
+            return false;
+        }
+        rs->ref_cols[c] = (int64_t*)ray_data(col);
     }
     int64_t cap = 16;
     while (cap < (nrows > 0 ? nrows * 2 : 16)) cap *= 2;
@@ -3049,19 +3048,25 @@ static void dl_build_provenance(dl_program_t* prog) {
             if (dl_rowset_init(&rs, derived)) {
                 int64_t ncols_t = ray_table_ncols(rel->table);
                 int64_t** tbl_cols = (int64_t**)ray_calloc_raw(sizeof(int64_t*) * (size_t)ncols_t);
-                if (tbl_cols) {
-                    for (int64_t c = 0; c < ncols_t; c++) {
-                        ray_t* col = ray_table_col_idx(rel->table, c);
-                        if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
-                        tbl_cols[c] = col ? (int64_t*)ray_data(col) : NULL;
-                    }
+                /* every column must be readable: the probe reads each
+                 * row's cell of every column.  A column that fails to
+                 * materialize skips this rule's marking and is kept as the
+                 * program's error. */
+                bool cols_ok = tbl_cols != NULL;
+                for (int64_t c = 0; cols_ok && c < ncols_t; c++) {
+                    ray_t* col = ray_table_col_idx(rel->table, c);
+                    if (col && RAY_IS_ERR(col)) { dl_keep_err(prog, col); col = NULL; }
+                    if (!col) cols_ok = false;
+                    else tbl_cols[c] = (int64_t*)ray_data(col);
+                }
+                if (cols_ok) {
                     for (int64_t row = 0; row < nrows; row++) {
                         if (pd[row] >= 0) continue;
                         if (dl_rowset_contains(&rs, tbl_cols, row))
                             pd[row] = r;
                     }
-                    ray_free_raw(tbl_cols);
                 }
+                ray_free_raw(tbl_cols);
                 dl_rowset_destroy(&rs);
             }
             ray_release(derived);
@@ -4550,7 +4555,7 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
             ray_col_meta_t cm;
             if (!ray_table_col_meta_idx(db, c, &cm)) continue;
             ray_t* col = (cm.type == RAY_SYM) ? ray_table_col_idx(db, c)
-                                              : dl_slot_pass(db, c);
+                                              : ray_table_slot_idx(db, c);
             if (!col) continue;
             if (RAY_IS_ERR(col)) {
                 ray_release(eav_tbl);
@@ -4699,7 +4704,7 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                 bool have_col = ray_table_col_meta_idx(env_val, c, &cm);
                 ray_t* col = !have_col ? NULL
                            : (cm.type == RAY_SYM) ? ray_table_col_idx(env_val, c)
-                                                  : dl_slot_pass(env_val, c);
+                                                  : ray_table_slot_idx(env_val, c);
                 ray_t* next_clean;
                 if (col && RAY_IS_ERR(col)) {
                     ray_release(clean);

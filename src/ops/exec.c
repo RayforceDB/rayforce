@@ -3812,8 +3812,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_op_ext_t* col_ext = find_ext(g, columns[c]);
                     if (!col_ext) continue;
                     int64_t name_id = col_ext->sym;
-                    ray_t* src_col = ray_table_get_col_enc(input, name_id);
-                    if (!src_col) src_col = ray_table_col(input, name_id);
+                    ray_t* src_col = ray_table_slot(input, name_id);
                     if (src_col) {
                         ray_retain(src_col);
                         result = ray_table_add_col(result, name_id, src_col);
@@ -4121,16 +4120,6 @@ ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
                      ray_type_name(accum->type), ray_type_name(partial->type));
 }
 
-/* Segment s of a parted slot without decoding: the encoded wrapper's
- * segment object or the plain wrapper's segment. */
-static ray_t* parted_slot_seg(ray_t* tbl, int64_t c, int32_t s) {
-    ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
-    if (enc) return ray_enccol_seg(enc, s);
-    ray_t* w = ray_table_col_idx(tbl, c);               /* plain wrapper: no decode */
-    if (!w || RAY_IS_ERR(w) || !RAY_IS_PARTED(w->type) || s >= w->len) return NULL;
-    return ((ray_t**)ray_data(w))[s];
-}
-
 /* Build a flat table containing one segment's columns from a parted table.
  * For each parted column, extracts segs[seg_idx] without decoding it (a
  * generation-2 segment stays a RAY_ENCCOL until an operator needs it).
@@ -4147,7 +4136,7 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
         if (ray_table_col_meta_idx(parted_tbl, c, &m) && RAY_IS_PARTED(m.type)) {
-            ray_t* seg = seg_idx < m.n_segs ? parted_slot_seg(parted_tbl, c, seg_idx) : NULL;
+            ray_t* seg = seg_idx < m.n_segs ? ray_table_parted_seg_idx(parted_tbl, c, seg_idx) : NULL;
             if (seg) seg_rows = ray_table_col_nrows(seg);
             break;
         }
@@ -4203,7 +4192,7 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
             seg_tbl = ray_table_add_col(seg_tbl, name_id, flat);
             ray_release(flat);
         } else if (RAY_IS_PARTED(m.type)) {
-            ray_t* seg = seg_idx < m.n_segs ? parted_slot_seg(parted_tbl, c, seg_idx) : NULL;
+            ray_t* seg = seg_idx < m.n_segs ? ray_table_parted_seg_idx(parted_tbl, c, seg_idx) : NULL;
             if (!seg) {
                 ray_release(seg_tbl);
                 return ray_error("schema", NULL);

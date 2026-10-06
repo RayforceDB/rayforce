@@ -72,6 +72,18 @@ ray_t*  ray_table_col_index_idx(ray_t* tbl, int64_t idx, ray_t** index);
 ray_t*  ray_table_get_col_enc(ray_t* tbl, int64_t name_id);
 ray_t*  ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx);
 
+/* The slot object itself, plain or encoded (borrowed; never decodes), or
+ * NULL when absent: for handing a column to another table unread. */
+ray_t*  ray_table_slot(ray_t* tbl, int64_t name_id);
+ray_t*  ray_table_slot_idx(ray_t* tbl, int64_t idx);
+
+/* Segment s of a parted slot (borrowed; never decodes): the encoded
+ * wrapper's segment object or the plain wrapper's segment.  NULL when the
+ * slot is absent or not parted, s is out of range, or the segment is
+ * missing (a hand-built wrapper). */
+ray_t*  ray_table_parted_seg(ray_t* tbl, int64_t name_id, int64_t s);
+ray_t*  ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s);
+
 /* Null presence from metadata; never materializes. */
 bool    ray_table_col_has_nulls(ray_t* tbl, int64_t name_id);
 

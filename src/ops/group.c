@@ -9690,17 +9690,6 @@ static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
  * g->selection, so this materialization is unfiltered regardless of whether a
  * pushed-down WHERE is active (the per-partition sub-group applies the
  * filter, not the key materialization). */
-/* Segment p of a parted slot, borrowed, never decoded: the encoded segment
- * of an encoded slot, else the plain one.  NULL when the slot is absent, not
- * parted, or the segment is missing (a hand-built wrapper; ray_read_parted
- * null-fills a ragged partition's absent column). */
-static ray_t* group_parted_seg(ray_t* tbl, int64_t sym, int64_t p) {
-    ray_t* enc = ray_table_get_col_enc(tbl, sym);
-    if (enc) return ray_enccol_is_parted(enc) ? ray_enccol_seg(enc, p) : NULL;
-    ray_t* col = ray_table_col(tbl, sym);               /* plain slot: never fails */
-    if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type)) return NULL;
-    return ((ray_t**)ray_data(col))[p];                 /* parted wrapper, not a table */
-}
 
 /* Segment p of a parted slot as a plain vector (borrowed), NULL when it is
  * missing or the slot is not parted, or an owned error when an encoded
@@ -9730,7 +9719,7 @@ static ray_t* group_eval_part_expr(ray_graph_t* g, ray_t* parted_tbl,
     ray_t* sub = ray_table_new(n_src > 0 ? (int64_t)n_src : 1);
     if (!sub || RAY_IS_ERR(sub)) return NULL;
     for (int j = 0; j < n_src; j++) {
-        ray_t* seg = group_parted_seg(parted_tbl, src_syms[j], p);
+        ray_t* seg = ray_table_parted_seg(parted_tbl, src_syms[j], p);
         if (!seg) { ray_release(sub); return NULL; }
         ray_retain(seg);
         sub = ray_table_add_col(sub, src_syms[j], seg);
@@ -9941,7 +9930,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
         int32_t sp = 0;
         if (n_borrow > 0) {
             for (int32_t p = 0; p < n_parts; p++) {
-                ray_t* sg = group_parted_seg(parted_tbl, borrow_syms[0], p);
+                ray_t* sg = ray_table_parted_seg(parted_tbl, borrow_syms[0], p);
                 if (sg && sg->len > 1) { sp = p; break; }
             }
         }
@@ -10432,8 +10421,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     if (!sub || RAY_IS_ERR(sub)) { result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name = ray_table_col_name(tbl, c);
-        ray_t* use = ray_table_get_col_enc_idx(tbl, c);     /* pass encoded slots on undecoded */
-        if (!use) use = ray_table_col_idx(tbl, c);          /* plain slot: never fails */
+        ray_t* use = ray_table_slot_idx(tbl, c);     /* pass encoded slots on undecoded */
         for (uint32_t k = 0; k < nk; k++)
             if (key_col[k] && dict_sym[k] == name) {
                 const ray_index_t* dix = ray_index_payload(key_col[k]->index);
@@ -11233,7 +11221,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* v = expr_eval_full(&ex, nrows);
         if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
             if (v && !RAY_IS_ERR(v)) ray_release(v);
-            else if (v) ray_release(v);
+            else if (v) ray_error_free(v);
             ok = false; break;
         }
         synth[a] = v;
@@ -11243,8 +11231,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         sub = ray_table_new(ncols + na);
         if (!sub || RAY_IS_ERR(sub)) { ok = false; }
         for (int64_t c = 0; c < ncols && ok; c++) {
-            ray_t* pc = ray_table_get_col_enc_idx(tbl, c);   /* encoded slots pass undecoded */
-            if (!pc) pc = ray_table_col_idx(tbl, c);         /* plain slot: never fails */
+            ray_t* pc = ray_table_slot_idx(tbl, c);   /* encoded slots pass undecoded */
             sub = ray_table_add_col(sub, ray_table_col_name(tbl, c), pc);
             if (!sub || RAY_IS_ERR(sub)) ok = false;
         }
@@ -16748,7 +16735,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
             int64_t part_nrows = -1;
             for (int j = 0; j < n_borrow; j++) {
-                ray_t* seg = group_parted_seg(parted_tbl, borrow_syms[j], p);
+                ray_t* seg = ray_table_parted_seg(parted_tbl, borrow_syms[j], p);
                 if (!seg) { pp_release_sub(g, sub); goto batch_fail; }
                 if (part_nrows < 0) part_nrows = seg->len;
                 ray_retain(seg);
@@ -16770,7 +16757,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 g->table = saved;
                 if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
                     (part_nrows >= 0 && v->len != part_nrows)) {
-                    if (v && !RAY_IS_ERR(v)) ray_release(v);
+                    /* decline: the concat fallback re-evaluates the
+                     * expression and reports its error */
+                    if (v && RAY_IS_ERR(v)) ray_error_free(v);
+                    else if (v) ray_release(v);
                     pp_release_sub(g, sub); goto batch_fail;
                 }
                 sub = ray_table_add_col(sub, key_syms[k], v);
@@ -16784,7 +16774,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 g->table = saved;
                 if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
                     (part_nrows >= 0 && v->len != part_nrows)) {
-                    if (v && !RAY_IS_ERR(v)) ray_release(v);
+                    /* decline: the concat fallback re-evaluates the
+                     * expression and reports its error */
+                    if (v && RAY_IS_ERR(v)) ray_error_free(v);
+                    else if (v) ray_release(v);
                     pp_release_sub(g, sub); goto batch_fail;
                 }
                 sub = ray_table_add_col(sub, agg_syms[a], v);
@@ -17269,8 +17262,7 @@ batch_fail:
                 trimmed = ray_table_add_col(trimmed, nm, out_col);
                 ray_release(out_col);
             } else {
-                ray_t* col = ray_table_get_col_enc_idx(result, c);   /* passed on undecoded */
-                if (!col) col = ray_table_col_idx(result, c);        /* plain slot: never fails */
+                ray_t* col = ray_table_slot_idx(result, c);   /* passed on undecoded */
                 if (col) {
                     ray_retain(col);
                     trimmed = ray_table_add_col(trimmed, nm, col);

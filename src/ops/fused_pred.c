@@ -781,7 +781,6 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     if (berr) { *err = berr; return -1; }
     if (!src) return -1;
     if (src->parted) return -1;
-    out->src = src;
     ray_t* col = NULL;
     if (out->op == FP_IN) {
         if (!fp_src_supported(src) || !fp_int_family(src->type)) return -1;

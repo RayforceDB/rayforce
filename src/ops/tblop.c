@@ -88,8 +88,7 @@ static ray_t* pivot_normalize_f64_key(ray_t* tbl, int64_t pcol_name) {
         int64_t cn = ray_table_col_name(tbl, c);
         ray_t* cv = norm;
         if (cn != pcol_name) {
-            cv = ray_table_get_col_enc_idx(tbl, c);
-            if (!cv) cv = ray_table_col_idx(tbl, c);
+            cv = ray_table_slot_idx(tbl, c);
         }
         wt = ray_table_add_col(wt, cn, cv);
     }
@@ -861,8 +860,7 @@ ray_t* ray_xcol_fn(ray_t* tbl, ray_t* names) {
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_enc_idx(tbl, c);
-        if (!col) col = ray_table_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         out = ray_table_add_col(out, syms[c], col);
         if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     }
@@ -883,8 +881,7 @@ ray_t* ray_xcols_fn(ray_t* tbl, ray_t* cols) {
     ray_t* out = ray_table_new(n);
     if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     for (int64_t i = 0; i < n; i++) {
-        ray_t* col = ray_table_get_col_enc(tbl, syms[i]);
-        if (!col) col = ray_table_col(tbl, syms[i]);
+        ray_t* col = ray_table_slot(tbl, syms[i]);
         if (!col) {
             ray_release(out);
             ray_free_raw(syms);
@@ -1254,8 +1251,7 @@ ray_t* ray_modify_fn(ray_t** args, int64_t n) {
         int64_t cname = ray_table_col_name(tbl, i);
         ray_t* cvec = new_col;
         if (cname != target_sym) {
-            cvec = ray_table_get_col_enc_idx(tbl, i);
-            if (!cvec) cvec = ray_table_col_idx(tbl, i);
+            cvec = ray_table_slot_idx(tbl, i);
         }
         result = ray_table_add_col(result, cname, cvec);
         if (RAY_IS_ERR(result)) { ray_release(new_col); return result; }

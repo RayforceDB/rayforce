@@ -1440,8 +1440,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     /* Pass-through original columns */
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_enc_idx(tbl, c);
-        if (!col) col = ray_table_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (!col) continue;
         int64_t name_id = ray_table_col_name(tbl, c);
         ray_retain(col);

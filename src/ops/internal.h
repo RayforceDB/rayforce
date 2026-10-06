@@ -844,7 +844,6 @@ typedef struct {
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
         ray_t*       parted_col; /* parted wrapper (is_parted only) */
-        ray_col_src_t* src;      /* bound source (REG_SCAN), borrowed from the graph registry */
         double      const_f64;  /* scalar value (REG_CONST) */
         int64_t     const_i64;  /* scalar value (REG_CONST) */
     } regs[EXPR_MAX_REGS];

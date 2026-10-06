@@ -2927,13 +2927,21 @@ static test_result_t test_expr_compile_bound(void) {
             bool src_set = false;
             for (int r = 0; r < ex.n_regs; r++) {
                 if (ex.regs[r].kind != REG_SCAN) continue;
-                src_set = ex.regs[r].src != NULL && ex.regs[r].src->obj != NULL &&
-                          (ex.regs[r].src->obj->type == RAY_ENCCOL) == (gen == 2);
                 if (ex.regs[r].nullable) nullable[gi][s] = true;
+                /* the register reads a source bound on the graph: the
+                 * registry's entry for one of the scanned columns (a hit,
+                 * no new bind), encoded exactly at generation 2 */
+                src_set = false;
+                static const char* const cn[3] = { "a", "b", "v" };
+                for (int k = 0; k < 3 && !src_set; k++) {
+                    ray_col_src_t* bs = ray_graph_bind_col(gr, t, ray_sym_intern(cn[k], 1), &err);
+                    TEST_ASSERT_NULL(err);
+                    ray_t* plain = NULL;
+                    if (!bs || !bs->obj || ray_col_src_plain(bs, &plain) || !plain) continue;
+                    src_set = ex.regs[r].data == ray_data(plain) &&
+                              (bs->obj->type == RAY_ENCCOL) == (gen == 2);
+                }
                 if (!src_set) break;
-                ray_t* plain = NULL;
-                TEST_ASSERT_NULL(ray_col_src_plain(ex.regs[r].src, &plain));
-                TEST_ASSERT_TRUE(ex.regs[r].data == ray_data(plain));
             }
             TEST_ASSERT_TRUE(src_set);
             res[gi][s] = expr_eval_full(&ex, CP_N);

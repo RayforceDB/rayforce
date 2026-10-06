@@ -4244,8 +4244,7 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
         int64_t cn = ray_table_col_name(tbl, c);
         ray_t* col = stamped;
         if (cn != key_id) {
-            col = ray_table_get_col_enc_idx(tbl, c);
-            if (!col) col = ray_table_col_idx(tbl, c);
+            col = ray_table_slot_idx(tbl, c);
         }
         out = ray_table_add_col(out, cn, col);
         if (!out || RAY_IS_ERR(out)) {

@@ -880,7 +880,6 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 *err = ray_col_src_plain(src, &col);
                 if (*err) return false;
                 out->regs[r].kind = REG_SCAN;
-                out->regs[r].src = src;
                 if (src->parted) {
                     int8_t base = elem;
                     out->regs[r].col_type = base;

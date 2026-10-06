@@ -54,8 +54,7 @@ ray_col_src_t* ray_graph_bind_col(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_t
     for (uint32_t i = 0; b && i < b->n; i++) {
         if (b->e[i]->tbl != tbl || b->e[i]->sym != sym) continue;
         if (!cur_set) {
-            cur = ray_table_get_col_enc(tbl, sym);
-            if (!cur) cur = ray_table_col(tbl, sym);          /* plain slot: no decode */
+            cur = ray_table_slot(tbl, sym);                   /* no decode */
             cur_set = true;
         }
         if (b->e[i]->src.obj == cur) return &b->e[i]->src;

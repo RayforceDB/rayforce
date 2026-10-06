@@ -656,16 +656,6 @@ static ray_t* tbl_col_idx_or_null(ray_t* tbl, int64_t idx) {
     if (c && RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
     return c;
 }
-/* The slot object, encoded or plain, for a column that goes into another
- * table without being read. */
-static ray_t* tbl_slot_idx(ray_t* tbl, int64_t idx) {
-    ray_t* c = ray_table_get_col_enc_idx(tbl, idx);
-    return c ? c : ray_table_col_idx(tbl, idx);
-}
-static ray_t* tbl_slot(ray_t* tbl, int64_t sym) {
-    ray_t* c = ray_table_get_col_enc(tbl, sym);
-    return c ? c : ray_table_col(tbl, sym);
-}
 
 /* See the call site in ray_select_impl.  NULL: some output is not answerable
  * from metadata (the caller plans the query as usual). */
@@ -2535,7 +2525,7 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
         return NULL;
     /* The slot object goes into the result table as it is: an encoded
      * column stays encoded. */
-    ray_t* col = tbl_slot(tbl, expr->i64);
+    ray_t* col = ray_table_slot(tbl, expr->i64);
     if (!col || RAY_IS_ERR(col)) return NULL;
     ray_retain(col);
     return col;
@@ -4910,9 +4900,9 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     if (rc != n_aggs + 1) { ray_release(R); return NULL; }
     ray_t* O = ray_table_new(rc);
     if (!O || RAY_IS_ERR(O)) { if (O) ray_error_free(O); ray_release(R); return NULL; }
-    O = ray_table_add_col(O, ray_table_col_name(R, 0), tbl_slot_idx(R, 0));
+    O = ray_table_add_col(O, ray_table_col_name(R, 0), ray_table_slot_idx(R, 0));
     for (int a = 0; a < n_aggs && O && !RAY_IS_ERR(O); a++) {
-        ray_t* col = tbl_slot(R, alias[a]);
+        ray_t* col = ray_table_slot(R, alias[a]);
         if (!col) { ray_release(O); ray_release(R); return NULL; }
         O = ray_table_add_col(O, alias[a], col);
     }
@@ -8248,7 +8238,7 @@ static ray_t* project_table_cols(ray_t* src_tbl, const int64_t* keep_syms,
     ray_t* nt = ray_table_new(n_keep);
     if (!nt || RAY_IS_ERR(nt)) return nt ? nt : ray_error("oom", NULL);
     for (int i = 0; i < n_keep; i++) {
-        ray_t* col = tbl_slot(src_tbl, keep_syms[i]);   /* the slot object: an encoded column stays encoded */
+        ray_t* col = ray_table_slot(src_tbl, keep_syms[i]);   /* the slot object: an encoded column stays encoded */
         if (!col) { ray_release(nt); return ray_error("domain", "select: projected column not found"); }
         ray_t* nt2 = ray_table_add_col(nt, keep_syms[i], col);
         if (!nt2 || RAY_IS_ERR(nt2)) {
@@ -8595,7 +8585,7 @@ static ray_t* select_fallback_bind_alias(ray_t* tbl, int64_t kid, ray_t* col) {
         if (!t2 || RAY_IS_ERR(t2)) { ray_release(tbl); return t2; }
         ray_table_set_col_idx(t2, c, col);
         /* Slot objects on both sides: an encoded column is its own slot. */
-        if (tbl_slot_idx(t2, c) != col) { ray_release(t2); return ray_error("oom", NULL); }
+        if (ray_table_slot_idx(t2, c) != col) { ray_release(t2); return ray_error("oom", NULL); }
         return t2;
     }
     return ray_table_add_col(tbl, kid, col);
@@ -9258,12 +9248,12 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
             if (dv[i]->i64 == cn && cn != from_id && cn != where_id && cn != by_id && cn != take_id && cn != asc_id && cn != desc_id && cn != nearest_id) { is_output = true; break; }
         for (int64_t h = 0; h < plan->n_hidden; h++) if (plan->hidden_names[h] == cn) { is_hidden = true; break; }
         if (is_output || is_hidden) continue;
-        out = ray_table_add_col(out, cn, tbl_slot_idx(result, c));
+        out = ray_table_add_col(out, cn, ray_table_slot_idx(result, c));
     }
     for (int64_t i = 0; i + 1 < dv_n && out && !RAY_IS_ERR(out); i += 2) {
         int64_t cn = dv[i]->i64;
         if (cn == from_id || cn == where_id || cn == by_id || cn == take_id || cn == asc_id || cn == desc_id || cn == nearest_id) continue;
-        ray_t* col = tbl_slot(result, cn);   /* the slot object, encoded or plain */
+        ray_t* col = ray_table_slot(result, cn);   /* the slot object, encoded or plain */
         if (!col) continue;   /* an output the engine folded away (e.g. a key projection) */
         out = ray_table_add_col(out, cn, col);
     }
@@ -14669,7 +14659,7 @@ by_dict_done:
             ray_t* kept = keep_n >= 0 ? ray_table_new(keep_n > 0 ? keep_n : 1) : NULL;
             for (int64_t c = 0; kept && !RAY_IS_ERR(kept) && c < keep_n; c++)
                 kept = ray_table_add_col(kept, ray_table_col_name(result, c),
-                                         tbl_slot_idx(result, c));
+                                         ray_table_slot_idx(result, c));
             if (kept && !RAY_IS_ERR(kept)) { ray_release(result); result = kept; }
             else if (kept) ray_release(kept);
         }
@@ -14804,7 +14794,7 @@ by_dict_done:
                 if (rebuilt && !RAY_IS_ERR(rebuilt)) {
                     for (int64_t c = 0; c < nc - 1; c++) {
                         int64_t cn = ray_table_col_name(result, c);
-                        rebuilt = ray_table_add_col(rebuilt, cn, tbl_slot_idx(result, c));
+                        rebuilt = ray_table_add_col(rebuilt, cn, ray_table_slot_idx(result, c));
                     }
                     ray_release(result);
                     result = rebuilt;
@@ -14960,7 +14950,7 @@ by_dict_done:
                 for (int64_t c = 0; c < rnc && nt && !RAY_IS_ERR(nt); c++) {
                     if (c >= hbase && c < hbase + n_hidden_aggs) continue;
                     nt = ray_table_add_col(nt, ray_table_col_name(result, c),
-                                           tbl_slot_idx(result, c));
+                                           ray_table_slot_idx(result, c));
                 }
                 for (int ci = 0; ci < n_compound && nt && !RAY_IS_ERR(nt); ci++)
                     nt = ray_table_add_col(nt, compound_names[ci],
@@ -17086,8 +17076,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 upd_cols[ui] = NULL;
                 upd_used[ui] = 1;
             } else {
-                ray_t* col = ray_table_get_col_enc_idx(tbl, c);
-                if (!col) col = ray_table_col_idx(tbl, c);
+                ray_t* col = ray_table_slot_idx(tbl, c);
                 ray_retain(col);
                 result = ray_table_add_col(result, cn, col);
                 ray_release(col);
@@ -17535,8 +17524,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
 
         if (!update_expr) {
             /* Copied as-is: the slot object, encoded or plain. */
-            ray_t* orig_col = ray_table_get_col_enc_idx(tbl, c);
-            if (!orig_col) orig_col = ray_table_col_idx(tbl, c);
+            ray_t* orig_col = ray_table_slot_idx(tbl, c);
             ray_retain(orig_col);
             result = ray_table_add_col(result, col_name, orig_col);
             ray_release(orig_col);
@@ -22432,8 +22420,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         /* ray_table_add_col consumes `result` on failure: stop adding then. */
         for (int64_t c = 0; c < ncols && !RAY_IS_ERR(result); c++) {
             int64_t cn = ray_table_col_name(left_tbl, c);
-            ray_t* cv = ray_table_get_col_enc_idx(left_tbl, c);
-            if (!cv) cv = ray_table_col_idx(left_tbl, c);
+            ray_t* cv = ray_table_slot_idx(left_tbl, c);
             ray_retain(cv);
             result = ray_table_add_col(result, cn, cv);
             ray_release(cv);
@@ -23330,8 +23317,7 @@ static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
     if (!out || RAY_IS_ERR(out)) { ray_release(raw); return out ? out : ray_error("oom", NULL); }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t nm = ray_table_col_name(template, c);
-        ray_t* col = ray_table_get_col_enc(raw, nm);
-        if (!col) col = ray_table_col(raw, nm);
+        ray_t* col = ray_table_slot(raw, nm);
         if (!col) { ray_release(raw); ray_release(out); return ray_error("schema", "asof carry: column %lld missing from group-last", (long long)nm); }
         out = ray_table_add_col(out, nm, col);
         if (!out || RAY_IS_ERR(out)) { ray_release(raw); return out ? out : ray_error("oom", NULL); }

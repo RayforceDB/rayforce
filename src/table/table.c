@@ -304,6 +304,22 @@ ray_t* ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx) {
     return (c && c->type == RAY_ENCCOL) ? c : NULL;
 }
 
+ray_t* ray_table_slot(ray_t* tbl, int64_t name_id) { return tbl_slot_by_name(tbl, name_id); }
+ray_t* ray_table_slot_idx(ray_t* tbl, int64_t idx) { return tbl_slot_by_idx(tbl, idx); }
+
+static ray_t* slot_parted_seg(ray_t* c, int64_t s) {
+    if (!c) return NULL;
+    if (c->type == RAY_ENCCOL) return ray_enccol_is_parted(c) ? ray_enccol_seg(c, s) : NULL;
+    if (!RAY_IS_PARTED(c->type) || s < 0 || s >= c->len) return NULL;
+    return ((ray_t**)ray_data(c))[s];                   /* parted wrapper, not a table */
+}
+ray_t* ray_table_parted_seg(ray_t* tbl, int64_t name_id, int64_t s) {
+    return slot_parted_seg(tbl_slot_by_name(tbl, name_id), s);
+}
+ray_t* ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s) {
+    return slot_parted_seg(tbl_slot_by_idx(tbl, idx), s);
+}
+
 bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     ray_t* c = tbl_slot_by_name(tbl, name_id);
     if (!c) return false;
