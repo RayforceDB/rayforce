@@ -48,10 +48,10 @@
 
 /* 256 interned symbols, so SYM test ids up to 255 lie inside the runtime domain. */
 static void enccol_setup(void) {
-    ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ENCCOL_TMP);
+    ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ray_test_tmp(ENCCOL_TMP));
     for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
 }
-static void enccol_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ENCCOL_TMP); }
+static void enccol_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ray_test_tmp(ENCCOL_TMP)); }
 
 static ray_err_t save_i32_rows(const char* path, int64_t n) {
     ray_t* v = ray_vec_new(RAY_I32, n); v->len = n;
@@ -63,7 +63,9 @@ static ray_err_t save_i32_rows(const char* path, int64_t n) {
 
 /* Patch `n` bytes at file offset `off`. */
 static void patch(const char* path, long off, const void* b, size_t n) {
-    FILE* f = fopen(path, "r+b"); fseek(f, off, SEEK_SET); fwrite(b, 1, n, f); fclose(f);
+    FILE* f = fopen(path, "r+b");
+    if (!f) ray_test_fatal("cannot open %s", path);
+    fseek(f, off, SEEK_SET); fwrite(b, 1, n, f); fclose(f);
 }
 
 static ray_t* mmap_expect_err(const char* path, const char* code) {
@@ -76,8 +78,8 @@ static ray_t* mmap_expect_err(const char* path, const char* code) {
 
 static test_result_t test_open_returns_enccol(void) {
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/a", 70000), RAY_OK);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/a");
+    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/a"), 70000), RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/a"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     TEST_ASSERT_EQ_I(c->type, RAY_ENCCOL);
     TEST_ASSERT_EQ_I(c->len, 70000);
@@ -99,12 +101,12 @@ static test_result_t test_open_returns_enccol(void) {
 }
 
 static test_result_t test_load_rejects(void) {
-    const char* p = ENCCOL_TMP "/r";
+    const char* p = ray_test_tmp(ENCCOL_TMP "/r");
     uint8_t one = 1, two = 2;
     uint64_t u;
     /* truncation: one byte short */
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
-    { FILE* f = fopen(p, "r+b"); fseek(f, 0, SEEK_END); long sz = ftell(f); fclose(f);
+    { FILE* f = fopen(p, "r+b"); TEST_ASSERT_TRUE(f != NULL); fseek(f, 0, SEEK_END); long sz = ftell(f); fclose(f);
       TEST_ASSERT_EQ_I(truncate(p, sz - 1), 0); }
     TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     /* header_version 2 */
@@ -169,14 +171,14 @@ static test_result_t test_load_rejects(void) {
 /* Appending a generation-0 index region would stamp "XIDX" over "XENC"
  * and produce (order 2, "XIDX"), a file that no longer loads. */
 static test_result_t test_append_index_refuses_gen2(void) {
-    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/ai", 3000), RAY_OK);
+    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/ai"), 3000), RAY_OK);
     ray_t* v = ray_vec_new(RAY_I32, 3000); v->len = 3000;
     for (int64_t i = 0; i < 3000; i++) ((int32_t*)ray_data(v))[i] = (int32_t)(i % 977);
     ray_t* z = ray_index_chunk_zone_compute(v, 8);
     TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z));
-    TEST_ASSERT_EQ_I(ray_col_append_index(ENCCOL_TMP "/ai", ray_index_payload(z), 3000, RAY_I32), RAY_ERR_VERSION);
+    TEST_ASSERT_EQ_I(ray_col_append_index(ray_test_tmp(ENCCOL_TMP "/ai"), ray_index_payload(z), 3000, RAY_I32), RAY_ERR_VERSION);
     ray_release(z); ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ai");             /* still loads */
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ai"));             /* still loads */
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_release(c);
     PASS();
@@ -187,9 +189,9 @@ static test_result_t test_sym_requires_domain(void) {
     for (int i = 0; i < 16; i++) ids[i] = (uint8_t)(i % 4);
     ray_t* v = ray_sym_vec_new(RAY_SYM_W8, 16);
     v->len = 16; memcpy(ray_data(v), ids, 16);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/s", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/s"), 2), RAY_OK);
     ray_release(v);
-    ray_t* r = ray_col_mmap_splayed_dom(ENCCOL_TMP "/s", NULL);
+    ray_t* r = ray_col_mmap_splayed_dom(ray_test_tmp(ENCCOL_TMP "/s"), NULL);
     TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
     TEST_ASSERT_STR_EQ(ray_err_code(r), "sym");
     ray_error_free(r);
@@ -200,8 +202,8 @@ static test_result_t test_sym_requires_domain(void) {
  * leaves nothing mapped behind once it is released. */
 static test_result_t test_load_gen2_plain(void) {
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/ln", 3000), RAY_OK);
-    ray_t* r = ray_col_load(ENCCOL_TMP "/ln");
+    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/ln"), 3000), RAY_OK);
+    ray_t* r = ray_col_load(ray_test_tmp(ENCCOL_TMP "/ln"));
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_I32);
     TEST_ASSERT_EQ_I(r->len, 3000);
@@ -213,7 +215,7 @@ static test_result_t test_load_gen2_plain(void) {
 
 /* A valid open, then corrupt opens on every error path, leave no mapping. */
 static test_result_t test_no_mapping_leak(void) {
-    const char* p = ENCCOL_TMP "/lk";
+    const char* p = ray_test_tmp(ENCCOL_TMP "/lk");
     uint8_t two = 2;
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
@@ -256,7 +258,7 @@ static test_result_t test_be_gate_logic(void) {
 #define RC_OFF   ((long)offsetof(ray_t, rc))
 
 static test_result_t test_load_rejects_more(void) {
-    const char* p = ENCCOL_TMP "/m";
+    const char* p = ray_test_tmp(ENCCOL_TMP "/m");
     uint8_t one = 1;
     int64_t v64;
     uint64_t u;
@@ -290,7 +292,7 @@ static test_result_t test_load_rejects_more(void) {
     TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     /* trailing bytes after the last section */
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
-    { FILE* f = fopen(p, "ab"); fwrite(&one, 1, 1, f); fclose(f); }
+    { FILE* f = fopen(p, "ab"); TEST_ASSERT_TRUE(f != NULL); fwrite(&one, 1, 1, f); fclose(f); }
     TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     /* directory: chunk size not a multiple of 8 */
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);
@@ -322,7 +324,7 @@ static test_result_t test_load_rejects_more(void) {
  * table does not. */
 static const int64_t g_dv[4] = { 11, 900000000001ll, 77, 123456789012345ll };
 static test_result_t test_value_dict_side(void) {
-    const char* p = ENCCOL_TMP "/vd";
+    const char* p = ray_test_tmp(ENCCOL_TMP "/vd");
     int64_t d[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) d[i] = g_dv[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
     ray_t* v = ray_vec_from_raw(RAY_I64, d, RAY_ENC_VEC);
@@ -351,7 +353,7 @@ static ray_t* sym_col_save(const char* p) {
     return e == RAY_OK ? NULL : ray_error("fail", "save");
 }
 static test_result_t test_sym_domain_rules(void) {
-    const char* p = ENCCOL_TMP "/sd";
+    const char* p = ray_test_tmp(ENCCOL_TMP "/sd");
     ray_sym_domain_t* dom = ray_sym_runtime_domain();
     TEST_ASSERT_NULL(sym_col_save(p));
     ray_t* c = ray_col_mmap_splayed_dom(p, dom);
@@ -403,12 +405,12 @@ static test_result_t test_consumers_refuse(void) {
         ray_release(sv); ray_release(dv);
         ray_rel_t* rel = ray_rel_from_edges(et, "src", "dst", 4, 4, true);
         TEST_ASSERT_TRUE(rel != NULL);
-        const char* rd = ENCCOL_TMP "/rel";
+        const char* rd = ray_test_tmp(ENCCOL_TMP "/rel");
         TEST_ASSERT_EQ_I(ray_rel_save(rel, rd), RAY_OK);
         ray_rel_free(rel); ray_release(et);
         int64_t md[5] = {0, 1, 2, 0, 1};                   /* plain meta, whatever the saver wrote */
         ray_t* mv = ray_vec_from_raw(RAY_I64, md, 5);
-        TEST_ASSERT_EQ_I(ray_col_save(mv, ENCCOL_TMP "/rel/meta"), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_save(mv, ray_test_tmp(ENCCOL_TMP "/rel/meta")), RAY_OK);
         ray_release(mv);
         ray_rel_t* base = ray_rel_load(rd);                 /* the generation-0 load */
         TEST_ASSERT_TRUE(base != NULL);
@@ -440,9 +442,9 @@ static test_result_t test_consumers_refuse(void) {
         ray_rel_free(base);
     }
     /* (b) hash index build */
-    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/hc", 3000), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_hash_column(ENCCOL_TMP "/hc", NULL), RAY_ERR_NYI);
-    ray_t* ok = ray_col_mmap(ENCCOL_TMP "/hc");            /* file untouched */
+    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/hc"), 3000), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_hash_column(ray_test_tmp(ENCCOL_TMP "/hc"), NULL), RAY_ERR_NYI);
+    ray_t* ok = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/hc"));            /* file untouched */
     TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
     ray_release(ok);
     /* (c) splayed table load: one plain column, one generation-2 file */
@@ -453,10 +455,10 @@ static test_result_t test_consumers_refuse(void) {
     tbl = ray_table_add_col(tbl, ray_sym_intern("ca", 2), a);
     tbl = ray_table_add_col(tbl, ray_sym_intern("cb", 2), b);
     ray_release(a); ray_release(b);
-    TEST_ASSERT_EQ_I(ray_splay_save(tbl, ENCCOL_TMP "/tb", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, ray_test_tmp(ENCCOL_TMP "/tb"), NULL), RAY_OK);
     ray_release(tbl);
-    TEST_ASSERT_EQ_I(save_i32_rows(ENCCOL_TMP "/tb/cb", 3000), RAY_OK);   /* now generation 2 */
-    ray_t* r = ray_read_splayed(ENCCOL_TMP "/tb", NULL);
+    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/tb/cb"), 3000), RAY_OK);   /* now generation 2 */
+    ray_t* r = ray_read_splayed(ray_test_tmp(ENCCOL_TMP "/tb"), NULL);
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));          /* the loader keeps the encoded column */
     TEST_ASSERT_NULL(ray_table_get_col_enc(r, ray_sym_intern("ca", 2)));
     TEST_ASSERT_TRUE(ray_table_get_col_enc(r, ray_sym_intern("cb", 2)) != NULL);
@@ -554,8 +556,8 @@ static test_result_t test_roundtrip_types_shapes(void) {
                 g_symw = widths[w];
                 ray_t* v = make_col(types[t], 3000, s);
                 g_symw = RAY_SYM_W16;
-                TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/rt", 2), RAY_OK);
-                test_result_t r = check_decode(v, ENCCOL_TMP "/rt");
+                TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/rt"), 2), RAY_OK);
+                test_result_t r = check_decode(v, ray_test_tmp(ENCCOL_TMP "/rt"));
                 ray_release(v);
                 if (r.status != TEST_PASS) return r;
             }
@@ -572,8 +574,8 @@ static test_result_t test_roundtrip_lengths(void) {
                 g_symw = widths[w];
                 ray_t* v = make_col(types[t], lens[l], 4);
                 g_symw = RAY_SYM_W16;
-                TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/len", 2), RAY_OK);
-                test_result_t r = check_decode(v, ENCCOL_TMP "/len");
+                TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/len"), 2), RAY_OK);
+                test_result_t r = check_decode(v, ray_test_tmp(ENCCOL_TMP "/len"));
                 ray_release(v);
                 if (r.status != TEST_PASS) return r;
             }
@@ -584,20 +586,20 @@ static test_result_t test_roundtrip_lengths(void) {
 static test_result_t test_roundtrip_edges(void) {
     int64_t d64[6] = { INT64_MIN + 1, INT64_MAX, 0, NULL_I64, -1, INT64_MAX };
     ray_t* v = ray_vec_from_raw(RAY_I64, d64, 6); v->attrs |= RAY_ATTR_HAS_NULLS;
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/e", 2), RAY_OK);
-    test_result_t r = check_decode(v, ENCCOL_TMP "/e"); ray_release(v);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/e"), 2), RAY_OK);
+    test_result_t r = check_decode(v, ray_test_tmp(ENCCOL_TMP "/e")); ray_release(v);
     if (r.status != TEST_PASS) return r;
     int16_t d16[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) d16[i] = (int16_t)(-32767 + (i % 3) * 32767);
     v = ray_vec_from_raw(RAY_I16, d16, RAY_ENC_VEC);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/e", 2), RAY_OK);
-    r = check_decode(v, ENCCOL_TMP "/e"); ray_release(v);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/e"), 2), RAY_OK);
+    r = check_decode(v, ray_test_tmp(ENCCOL_TMP "/e")); ray_release(v);
     if (r.status != TEST_PASS) return r;
     uint8_t u8[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) u8[i] = (uint8_t)(127 + (i & 1));
     v = ray_vec_from_raw(RAY_U8, u8, RAY_ENC_VEC);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/e", 2), RAY_OK);
-    r = check_decode(v, ENCCOL_TMP "/e"); ray_release(v);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/e"), 2), RAY_OK);
+    r = check_decode(v, ray_test_tmp(ENCCOL_TMP "/e")); ray_release(v);
     return r;
 }
 
@@ -639,9 +641,9 @@ static test_result_t test_dict_once_concurrent(void) {
     static const int64_t vals[4] = { 11, 900000000001ll, 77, 123456789012345ll };
     ray_t* v = ray_vec_new(RAY_I64, 1024); v->len = 1024;
     for (int i = 0; i < 1024; i++) ((int64_t*)ray_data(v))[i] = vals[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/dc", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/dc"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/dc");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/dc"));
     ray_enccol_t* e = ray_enccol_of(c);
     ray_enc_desc_t d0; memcpy(&d0, e->base + 160, 48);
     TEST_ASSERT_EQ_I(d0.encoding, RAY_ENC_DICT);
@@ -666,26 +668,26 @@ static test_result_t test_decode_rejects_payload(void) {
     int32_t d[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) d[i] = 5000 + (i % 64);
     ray_t* v = ray_vec_from_raw(RAY_I32, d, RAY_ENC_VEC);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/p", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/p"), 2), RAY_OK);
     ray_release(v);
     uint64_t bad_base = 0x100000000ull;               /* payload starts at 160 + 3072 */
-    patch(ENCCOL_TMP "/p", 160 + 3072, &bad_base, 8);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/p");          /* load passes: payload unread */
+    patch(ray_test_tmp(ENCCOL_TMP "/p"), 160 + 3072, &bad_base, 8);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/p"));          /* load passes: payload unread */
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     uint8_t out[4096];
     ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, out, NULL, 0, 0);
     TEST_ASSERT_TRUE(err && RAY_IS_ERR(err));
     TEST_ASSERT_STR_EQ(ray_err_code(err), "corrupt");
-    TEST_ASSERT_TRUE(strstr(ray_error_msg(), ENCCOL_TMP "/p") != NULL);
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), ray_test_tmp(ENCCOL_TMP "/p")) != NULL);
     ray_error_free(err);
     ray_release(c);
     /* A trailing descriptor that is not all zero: */
     v = ray_vec_from_raw(RAY_I32, d, 10);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/p", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/p"), 2), RAY_OK);
     ray_release(v);
     uint8_t one = 1;
-    patch(ENCCOL_TMP "/p", 160 + 48 * 5 + 3, &one, 1);
-    c = ray_col_mmap(ENCCOL_TMP "/p");
+    patch(ray_test_tmp(ENCCOL_TMP "/p"), 160 + 48 * 5 + 3, &one, 1);
+    c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/p"));
     err = ray_enccol_decode_vec(ray_enccol_of(c), 0, out, NULL, 0, 0);
     TEST_ASSERT_TRUE(err && RAY_IS_ERR(err));
     TEST_ASSERT_STR_EQ(ray_err_code(err), "corrupt");
@@ -716,6 +718,7 @@ static test_result_t decode_expect_corrupt(ray_enccol_t* e, int64_t vec, const c
  * move, so the structure stays consistent and only the body is wrong. */
 static void grow_payload(const char* path) {
     FILE* f = fopen(path, "r+b");
+    if (!f) ray_test_fatal("cannot open %s", path);
     uint64_t chunk_bytes, end_off, pb;
     fseek(f, 96 + 8, SEEK_SET); fread(&chunk_bytes, 8, 1, f);
     fseek(f, 32 + 56, SEEK_SET); fread(&end_off, 8, 1, f);
@@ -736,14 +739,14 @@ static test_result_t test_decode_trailing_bytes(void) {
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         ray_t* v = make_col(cases[i].type, 1000, cases[i].s);
-        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/tb", 2), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/tb"), 2), RAY_OK);
         ray_release(v);
-        ray_t* c = ray_col_mmap(ENCCOL_TMP "/tb");
+        ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/tb"));
         TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
         TEST_ASSERT_EQ_U(ray_enccol_of(c)->hdr.side_off, 0);     /* the payload is the file's tail */
         ray_release(c);
-        grow_payload(ENCCOL_TMP "/tb");
-        c = ray_col_mmap(ENCCOL_TMP "/tb");
+        grow_payload(ray_test_tmp(ENCCOL_TMP "/tb"));
+        c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/tb"));
         TEST_ASSERT_FMT(c && !RAY_IS_ERR(c), "type %d shape %d: load", (int)cases[i].type, cases[i].s);
         char what[64]; snprintf(what, sizeof what, "type %d shape %d", (int)cases[i].type, cases[i].s);
         test_result_t r = decode_expect_corrupt(ray_enccol_of(c), 0, what);
@@ -783,9 +786,9 @@ static test_result_t test_dict_null_dictionary(void) {
 /* Out-of-range vector numbers are refused by every column-global entry. */
 static test_result_t test_vec_range_checks(void) {
     ray_t* v = make_col(RAY_STR, 2500, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/vr", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/vr"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/vr");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/vr"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_enccol_t* e = ray_enccol_of(c);
     int64_t nv = ray_enc_nvecs(e->len);
@@ -812,15 +815,15 @@ static test_result_t test_vec_range_checks(void) {
 /* The descriptors' null counts must add up to the directory's. */
 static test_result_t test_descriptor_null_sum(void) {
     ray_t* v = make_col(RAY_I32, 3000, 4);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/ns", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/ns"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ns");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ns"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_enc_dirent_t de; memcpy(&de, ray_enccol_of(c)->base + 96, sizeof de);
     ray_release(c);
     TEST_ASSERT_TRUE(de.null_count > 0);
-    uint32_t nc = de.null_count - 1; patch(ENCCOL_TMP "/ns", 96 + 52, &nc, 4);
-    c = ray_col_mmap(ENCCOL_TMP "/ns");
+    uint32_t nc = de.null_count - 1; patch(ray_test_tmp(ENCCOL_TMP "/ns"), 96 + 52, &nc, 4);
+    c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ns"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));                  /* directory alone is plausible */
     ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, (uint8_t[RAY_ENC_VEC * 16]){0}, NULL, 0, 0);
     bool ok = err && RAY_IS_ERR(err) && strcmp(ray_err_code(err), "corrupt") == 0;
@@ -833,11 +836,11 @@ static test_result_t test_descriptor_null_sum(void) {
 /* STR statistics on a RAW / CONST vector are corrupt, not "newer build". */
 static test_result_t test_str_stats_corrupt(void) {
     ray_t* v = make_col(RAY_STR, 100, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/ss", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/ss"), 2), RAY_OK);
     ray_release(v);
-    uint16_t fl = 0; patch(ENCCOL_TMP "/ss", 160 + 4, &fl, 2);     /* descriptor claims statistics */
-    uint64_t one = 1; patch(ENCCOL_TMP "/ss", 160 + 40, &one, 8);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ss");
+    uint16_t fl = 0; patch(ray_test_tmp(ENCCOL_TMP "/ss"), 160 + 4, &fl, 2);     /* descriptor claims statistics */
+    uint64_t one = 1; patch(ray_test_tmp(ENCCOL_TMP "/ss"), 160 + 40, &one, 8);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ss"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, (uint8_t[RAY_ENC_VEC * 16]){0}, (char[RAY_ENC_VEC * 64]){0}, 0, RAY_ENC_VEC * 64);
     bool ok = err && RAY_IS_ERR(err) && strcmp(ray_err_code(err), "corrupt") == 0;
@@ -853,11 +856,11 @@ static test_result_t test_sym_width_and_bound(void) {
     /* ids above 255 in a column whose attrs say W8: */
     ray_t* v = ray_sym_vec_new(RAY_SYM_W16, 2048); v->len = 2048;
     for (int i = 0; i < 2048; i++) ((uint16_t*)ray_data(v))[i] = (uint16_t)(260 + i % 100);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/sw", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/sw"), 2), RAY_OK);
     ray_release(v);
     uint8_t w8 = RAY_SYM_W8;
-    patch(ENCCOL_TMP "/sw", (long)offsetof(ray_t, attrs), &w8, 1);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/sw");
+    patch(ray_test_tmp(ENCCOL_TMP "/sw"), (long)offsetof(ray_t, attrs), &w8, 1);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/sw"));
     if (c && RAY_IS_ERR(c)) {
         TEST_ASSERT_STR_EQ(ray_err_code(c), "corrupt");
         ray_error_free(c);
@@ -872,13 +875,13 @@ static test_result_t test_sym_width_and_bound(void) {
     /* ids at or above the saved count; statistics made absent so only the
      * payload says so: */
     v = make_col(RAY_SYM, 1000, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/sb", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/sb"), 2), RAY_OK);
     ray_release(v);
-    uint32_t bound = 50; patch(ENCCOL_TMP "/sb", RC_OFF, &bound, 4);
+    uint32_t bound = 50; patch(ray_test_tmp(ENCCOL_TMP "/sb"), RC_OFF, &bound, 4);
     uint64_t z = 0; uint32_t fl = RAY_ENC_STAT_ABSENT; uint16_t fl16 = RAY_ENC_STAT_ABSENT;
-    patch(ENCCOL_TMP "/sb", 96 + 16, &z, 8); patch(ENCCOL_TMP "/sb", 96 + 24, &z, 8); patch(ENCCOL_TMP "/sb", 96 + 56, &fl, 4);
-    patch(ENCCOL_TMP "/sb", 160 + 32, &z, 8); patch(ENCCOL_TMP "/sb", 160 + 40, &z, 8); patch(ENCCOL_TMP "/sb", 160 + 4, &fl16, 2);
-    c = ray_col_mmap(ENCCOL_TMP "/sb");
+    patch(ray_test_tmp(ENCCOL_TMP "/sb"), 96 + 16, &z, 8); patch(ray_test_tmp(ENCCOL_TMP "/sb"), 96 + 24, &z, 8); patch(ray_test_tmp(ENCCOL_TMP "/sb"), 96 + 56, &fl, 4);
+    patch(ray_test_tmp(ENCCOL_TMP "/sb"), 160 + 32, &z, 8); patch(ray_test_tmp(ENCCOL_TMP "/sb"), 160 + 40, &z, 8); patch(ray_test_tmp(ENCCOL_TMP "/sb"), 160 + 4, &fl16, 2);
+    c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/sb"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     TEST_ASSERT_EQ_U(ray_enccol_of(c)->sym_bound, 50);
     test_result_t r = decode_expect_corrupt(ray_enccol_of(c), 0, "id above the bound");
@@ -909,8 +912,11 @@ static test_result_t sweep_file(const char* name, uint8_t mask, long* positions)
     uint8_t* b = malloc((size_t)n);
     TEST_ASSERT_TRUE(fread(b, 1, (size_t)n, f) == (size_t)n);
     fclose(f);
-    const char* path = ENCCOL_TMP "/sweep";
-    f = fopen(path, "wb"); fwrite(b, 1, (size_t)n, f); fclose(f);
+    const char* path = ray_test_tmp(ENCCOL_TMP "/sweep");
+    f = fopen(path, "wb");
+    if (!f) free(b);
+    TEST_ASSERT_TRUE(f != NULL);
+    fwrite(b, 1, (size_t)n, f); fclose(f);
     const char* bad = NULL;
     for (long pos = 32; pos < n && !bad; pos++) {
         uint8_t m = b[pos] ^ mask;
@@ -963,10 +969,10 @@ static test_result_t test_decode_mutation_sweep(void) {
 /* Same vector saved as generation 0 and 2: the generation-0 load and the
  * materialized generation-2 column are equal. */
 static test_result_t check_equivalence(ray_t* v) {
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g0", 0), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g2", 2), RAY_OK);
-    ray_t* a = ray_col_load(ENCCOL_TMP "/g0");
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/g2");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/g0"), 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/g2"), 2), RAY_OK);
+    ray_t* a = ray_col_load(ray_test_tmp(ENCCOL_TMP "/g0"));
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/g2"));
     TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && c && !RAY_IS_ERR(c));
     ray_t* b = ray_enccol_materialize(c);
     TEST_ASSERT_FMT(b && !RAY_IS_ERR(b), "materialize: %s", b ? ray_err_code(b) : "null");
@@ -1065,10 +1071,10 @@ static void peek_mat_thread(void* arg) { (void)ray_enccol_materialize((ray_t*)ar
 
 static test_result_t test_decoded_peek(void) {
     ray_t* v = make_col(RAY_I64, 5000, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/pk", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/pk"), 2), RAY_OK);
     ray_release(v);
     ray_enc_counters_reset();
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/pk");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/pk"));
     TEST_ASSERT_NULL(ray_enccol_decoded_peek(c));
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);                   /* a peek decodes nothing */
@@ -1086,8 +1092,8 @@ static test_result_t test_decoded_peek(void) {
 
 static test_result_t test_cols_inplace_encoded(void) {
     ray_t* v = make_col(RAY_I64, 100, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/ci", 2), RAY_OK);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/ci");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/ci"), 2), RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ci"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_t* t = ray_table_new(2);
     t = ray_table_add_col(t, ray_sym_intern("a", 1), v);
@@ -1101,10 +1107,10 @@ static test_result_t test_cols_inplace_encoded(void) {
 
 static test_result_t test_materialize_counts_once(void) {
     ray_t* v = make_col(RAY_I64, 5000, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/m", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/m"), 2), RAY_OK);
     ray_release(v);
     ray_enc_counters_reset();
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/m");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/m"));
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);                   /* load decodes nothing */
     TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
@@ -1121,9 +1127,9 @@ static test_result_t test_materialize_counts_once(void) {
 /* Cancellation is transient: reported, not cached, retried. */
 static test_result_t test_cancel_retried(void) {
     ray_t* v = make_col(RAY_I32, 3 * 65536, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/cn", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/cn"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/cn");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/cn"));
     ray_request_interrupt();
     ray_t* r = ray_enccol_materialize(c);
     ray_clear_interrupt();
@@ -1139,9 +1145,9 @@ static test_result_t test_cancel_retried(void) {
 /* The per-chunk poll: the interrupt arrives after chunk 0 has decoded. */
 static test_result_t test_cancel_mid_decode(void) {
     ray_t* v = make_col(RAY_I32, 128 * 65536, 1);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/cm", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/cm"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/cm");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/cm"));
     ray_enccol_test_interrupt_after(1);
     ray_t* r = ray_enccol_materialize(c);
     ray_enccol_test_interrupt_after(0);
@@ -1167,9 +1173,9 @@ static void cancel_wait_thread(void* raw) {
 }
 static test_result_t test_cancel_waiter(void) {
     ray_t* v = make_col(RAY_I32, 128 * 65536, 1);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/cw", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/cw"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/cw");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/cw"));
     ray_enccol_t* e = ray_enccol_of(c);
     cwait_t p = { c, "" }, w = { c, "" };
     ray_thread_t tp, tw;
@@ -1191,7 +1197,7 @@ static test_result_t test_cancel_waiter(void) {
 /* ray_col_load_dom on a generation-2 SYM file: the loaded vector holds its own
  * reference on the symfile domain (owned branch) and outlives the object. */
 static test_result_t test_load_dom_refcount(void) {
-    const char* p = ENCCOL_TMP "/ld";
+    const char* p = ray_test_tmp(ENCCOL_TMP "/ld");
     TEST_ASSERT_NULL(sym_col_save(p));
     ray_sym_domain_t* dom = ray_sym_domain_new();
     for (int i = 0; i < 400; i++) { char b[12]; int n = snprintf(b, sizeof b, "d%d", i); (void)ray_sym_domain_intern(dom, b, (size_t)n); }
@@ -1210,18 +1216,18 @@ static test_result_t test_load_dom_refcount(void) {
  * lowest failing task), carries the path, and is cached. */
 static test_result_t test_materialize_lowest_failure_cached(void) {
     ray_t* v = make_col(RAY_I32, 4 * 65536, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/f", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/f"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/f");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/f"));
     ray_enccol_t* e = ray_enccol_of(c);
     uint64_t off1, off3;
     memcpy(&off1, e->base + 96 + 64 * 1, 8);
     memcpy(&off3, e->base + 96 + 64 * 3, 8);
     ray_release(c);
     uint8_t one = 1;
-    patch(ENCCOL_TMP "/f", (long)off1 + 6, &one, 1);        /* descriptor 0 reserved byte */
-    patch(ENCCOL_TMP "/f", (long)off3 + 6, &one, 1);
-    c = ray_col_mmap(ENCCOL_TMP "/f");
+    patch(ray_test_tmp(ENCCOL_TMP "/f"), (long)off1 + 6, &one, 1);        /* descriptor 0 reserved byte */
+    patch(ray_test_tmp(ENCCOL_TMP "/f"), (long)off3 + 6, &one, 1);
+    c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/f"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     uint64_t dec0 = 0;
     for (int i = 0; i < 3; i++) {
@@ -1232,7 +1238,7 @@ static test_result_t test_materialize_lowest_failure_cached(void) {
         TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
         TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
         TEST_ASSERT_TRUE(strstr(ray_error_msg(), "chunk 1 ") != NULL);
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), ENCCOL_TMP "/f") != NULL);
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), ray_test_tmp(ENCCOL_TMP "/f")) != NULL);
         ray_error_free(r);
     }
     ray_release(c);
@@ -1241,9 +1247,9 @@ static test_result_t test_materialize_lowest_failure_cached(void) {
 
 static test_result_t test_oom_then_retry(void) {
     ray_t* v = make_col(RAY_STR, 3000, 2);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/o", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/o"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/o");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/o"));
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     bool done = false;
     for (int nth = 1; nth <= 16 && !done; nth++) {          /* until an attempt passes every injection point */
@@ -1266,8 +1272,8 @@ static test_result_t test_oom_then_retry(void) {
 
 static test_result_t test_col_load_materializes(void) {
     ray_t* v = make_col(RAY_F64, 2000, 4);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/l", 2), RAY_OK);
-    ray_t* b = ray_col_load(ENCCOL_TMP "/l");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/l"), 2), RAY_OK);
+    ray_t* b = ray_col_load(ray_test_tmp(ENCCOL_TMP "/l"));
     TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b));
     TEST_ASSERT_EQ_I(b->type, RAY_F64);
     TEST_ASSERT_TRUE(memcmp(ray_data(b), ray_data(v), 2000 * 8) == 0);
@@ -1311,7 +1317,7 @@ static test_result_t test_synth_zone(void) {
         TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z));
         v = z;
         ray_t* keep;
-        ray_t* m = save_and_materialize(v, ENCCOL_TMP "/z", &keep);
+        ray_t* m = save_and_materialize(v, ray_test_tmp(ENCCOL_TMP "/z"), &keep);
         TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
         TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_ZONE);
         ray_index_t* a = ray_index_payload(v->index);
@@ -1362,7 +1368,7 @@ static test_result_t test_synth_chunk_zone(void) {
         ray_t* z = ray_index_attach_chunk_zone(&v, 16);
         TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z)); v = z;
         ray_t* keep;
-        ray_t* m = save_and_materialize(v, ENCCOL_TMP "/cz", &keep);
+        ray_t* m = save_and_materialize(v, ray_test_tmp(ENCCOL_TMP "/cz"), &keep);
         TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
         TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_CHUNK_ZONE);
         ray_t* ref = ray_index_chunk_zone_compute(m, 16);         /* builder on the decoded data */
@@ -1382,7 +1388,7 @@ static test_result_t test_unique_flag(void) {
     ray_t* a = ray_index_attach_persisted(&v, root);
     TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a)); v = a;
     ray_t* keep;
-    ray_t* m = save_and_materialize(v, ENCCOL_TMP "/u", &keep);
+    ray_t* m = save_and_materialize(v, ray_test_tmp(ENCCOL_TMP "/u"), &keep);
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
     ray_enccol_t* e = ray_enccol_of(keep);
     TEST_ASSERT_EQ_I(e->hdr.col_flags, RAY_ENC_FLAG_UNIQUE);
@@ -1399,10 +1405,10 @@ static test_result_t test_unique_flag(void) {
  * double release or a leak). */
 static test_result_t test_attach_refused(void) {
     ray_t* v = make_col(RAY_GUID, 50, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/gu", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/gu"), 2), RAY_OK);
     uint8_t f = RAY_ENC_FLAG_UNIQUE;
-    patch(ENCCOL_TMP "/gu", 32 + 7, &f, 1);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/gu");
+    patch(ray_test_tmp(ENCCOL_TMP "/gu"), 32 + 7, &f, 1);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/gu"));
     TEST_ASSERT_TRUE(c && RAY_IS_ERR(c));
     TEST_ASSERT_STR_EQ(ray_err_code(c), "corrupt");
     ray_error_free(c);
@@ -1431,10 +1437,10 @@ static test_result_t test_synth_matches_gen0(void) {
         ray_t* z = k ? ray_index_attach_chunk_zone(&v, 16) : ray_index_attach_zone(&v);
         TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z)); v = z;
         ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;
-        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g0", 0), RAY_OK);
-        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g2", 2), RAY_OK);
-        ray_t* a = ray_col_mmap(ENCCOL_TMP "/g0");
-        ray_t* b = ray_col_load(ENCCOL_TMP "/g2");
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/g0"), 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/g2"), 2), RAY_OK);
+        ray_t* a = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/g0"));
+        ray_t* b = ray_col_load(ray_test_tmp(ENCCOL_TMP "/g2"));
         TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b));
         TEST_ASSERT_EQ_I(ray_index_kind(b), ray_index_kind(a));
         TEST_ASSERT_EQ_I(ray_index_kind(b), k ? RAY_IDX_CHUNK_ZONE : RAY_IDX_ZONE);
@@ -1473,9 +1479,9 @@ static test_result_t test_materialize_refusal_cached(void) {
     ray_t* v = make_col(RAY_I64, 70000, 4);
     ray_t* z = ray_index_attach_zone(&v);
     TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z)); v = z;
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/rf", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/rf"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ENCCOL_TMP "/rf");
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/rf"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_enccol_test_refuse_attach(1);
     ray_t* r = ray_enccol_materialize(c);
@@ -1523,10 +1529,10 @@ static ray_t* tbl2(int64_t n) {
  * through the splayed loader, whose columns equal the generation-0 table. */
 static test_result_t test_table_core_enccol(void) {
     ray_t* t = tbl2(70000);
-    TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/t", t), RAY_OK);   /* t: the generation-0 reference */
+    TEST_ASSERT_EQ_I(write_splayed_gen2(ray_test_tmp(ENCCOL_TMP "/t"), t), RAY_OK);   /* t: the generation-0 reference */
     ray_enc_counters_reset();
-    ray_t* ca = ray_col_mmap(ENCCOL_TMP "/t/a");
-    ray_t* cb = ray_col_mmap(ENCCOL_TMP "/t/b");
+    ray_t* ca = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/t/a"));
+    ray_t* cb = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/t/b"));
     TEST_ASSERT_FMT(ca && !RAY_IS_ERR(ca) && cb && !RAY_IS_ERR(cb), "mmap");
     TEST_ASSERT_EQ_I(ca->type, RAY_ENCCOL);
     TEST_ASSERT_EQ_I(ray_table_col_nrows(ca), 70000);
@@ -1562,7 +1568,7 @@ static test_result_t test_table_core_enccol(void) {
     ray_release(s);
     /* the splayed loader returns the same values as the generation-0 table */
     ray_t* ref = t;
-    ray_t* ld = ray_read_splayed(ENCCOL_TMP "/t", NULL);
+    ray_t* ld = ray_read_splayed(ray_test_tmp(ENCCOL_TMP "/t"), NULL);
     TEST_ASSERT_FMT(ld && !RAY_IS_ERR(ld), "read_splayed: %s", ld ? ray_err_code(ld) : "null");
     TEST_ASSERT_EQ_I(ray_table_nrows(ld), 70000);
     for (int64_t c = 0; c < 2; c++) {
@@ -1582,12 +1588,12 @@ static test_result_t test_table_core_enccol(void) {
  * encoded column is a corrupt table. */
 static test_result_t test_table_torn_column(void) {
     ray_t* t = tbl2(5000);
-    TEST_ASSERT_EQ_I(write_splayed_gen2(ENCCOL_TMP "/torn", t), RAY_OK);
+    TEST_ASSERT_EQ_I(write_splayed_gen2(ray_test_tmp(ENCCOL_TMP "/torn"), t), RAY_OK);
     ray_release(t);
     ray_t* b = make_col(RAY_F64, 4999, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(b, ENCCOL_TMP "/torn/b", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(b, ray_test_tmp(ENCCOL_TMP "/torn/b"), 2), RAY_OK);
     ray_release(b);
-    ray_t* s = ray_read_splayed(ENCCOL_TMP "/torn", NULL);
+    ray_t* s = ray_read_splayed(ray_test_tmp(ENCCOL_TMP "/torn"), NULL);
     TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
     TEST_ASSERT_STR_EQ(ray_err_code(s), "corrupt");
     TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "4999 rows, expected 5000"));
@@ -1627,9 +1633,9 @@ static ray_err_t write_parted(const char* root, int gen2_mask, int64_t rows) {
 }
 
 static test_result_t test_parted_mixed_load(void) {
-    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pdb", 0x5, 4000), RAY_OK);   /* parts 1 and 3 encoded */
+    TEST_ASSERT_EQ_I(write_parted(ray_test_tmp(ENCCOL_TMP "/pdb"), 0x5, 4000), RAY_OK);   /* parts 1 and 3 encoded */
     ray_enc_counters_reset();
-    ray_t* t = ray_read_parted(ENCCOL_TMP "/pdb", "t");
+    ray_t* t = ray_read_parted(ray_test_tmp(ENCCOL_TMP "/pdb"), "t");
     TEST_ASSERT_FMT(t && !RAY_IS_ERR(t), "parted load: %s", t ? ray_err_code(t) : "null");
     TEST_ASSERT_EQ_I(ray_table_nrows(t), 12000);
     ray_t* slot = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
@@ -1659,7 +1665,7 @@ static test_result_t test_parted_mixed_load(void) {
     ray_retain(w);
     ray_release(t);                                          /* retained wrapper outlives the table */
     /* segment 0 decodes to what the same directory loads as on its own */
-    ray_t* solo = ray_read_splayed(ENCCOL_TMP "/pdb/2024.01.01/t", NULL);
+    ray_t* solo = ray_read_splayed(ray_test_tmp(ENCCOL_TMP "/pdb/2024.01.01/t"), NULL);
     TEST_ASSERT_TRUE(solo && !RAY_IS_ERR(solo));
     ray_t* sa = ray_table_col(solo, ray_sym_intern("a", 1));
     TEST_ASSERT_TRUE(sa && !RAY_IS_ERR(sa) && sa->len == 4000 && segs[0]->len == 4000);
@@ -1670,11 +1676,11 @@ static test_result_t test_parted_mixed_load(void) {
 }
 
 static test_result_t test_parted_failure_lowest_segment(void) {
-    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pf", 0x7, 4000), RAY_OK);
+    TEST_ASSERT_EQ_I(write_parted(ray_test_tmp(ENCCOL_TMP "/pf"), 0x7, 4000), RAY_OK);
     uint8_t one = 1;
-    patch(ENCCOL_TMP "/pf/2024.01.01/t/a", 160 + 6, &one, 1);    /* segment 0 corrupt */
-    patch(ENCCOL_TMP "/pf/2024.01.03/t/a", 160 + 6, &one, 1);    /* segment 2 corrupt */
-    ray_t* t = ray_read_parted(ENCCOL_TMP "/pf", "t");
+    patch(ray_test_tmp(ENCCOL_TMP "/pf/2024.01.01/t/a"), 160 + 6, &one, 1);    /* segment 0 corrupt */
+    patch(ray_test_tmp(ENCCOL_TMP "/pf/2024.01.03/t/a"), 160 + 6, &one, 1);    /* segment 2 corrupt */
+    ray_t* t = ray_read_parted(ray_test_tmp(ENCCOL_TMP "/pf"), "t");
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
     ray_col_meta_t m; ray_table_col_meta(t, ray_sym_intern("a", 1), &m);
     /* a transient failure first, then the deterministic one */
@@ -1703,8 +1709,8 @@ static test_result_t test_parted_failure_lowest_segment(void) {
  * happens inside a segment, and each segment keeps its own once-state. */
 static test_result_t fanin_run(int mode) {
     char po[64], pq[64];
-    snprintf(po, sizeof po, ENCCOL_TMP "/po%d", mode);
-    snprintf(pq, sizeof pq, ENCCOL_TMP "/pq%d", mode);
+    snprintf(po, sizeof po, ray_test_tmp(ENCCOL_TMP "/po%d"), mode);
+    snprintf(pq, sizeof pq, ray_test_tmp(ENCCOL_TMP "/pq%d"), mode);
     char f[600];
     ray_enccol_test_parted_mode(mode);
     TEST_ASSERT_EQ_I(write_parted(po, 0x7, 4000), RAY_OK);
@@ -1762,13 +1768,13 @@ static test_result_t test_parted_fanin_orders(void) {
 /* A parted load of generation-2 segments materializes to exactly the wrapper
  * a generation-0 load of the same data produces, ragged partition included. */
 static test_result_t test_parted_equals_gen0(void) {
-    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pg2", 0x5, 3000), RAY_OK);
-    TEST_ASSERT_EQ_I(write_parted(ENCCOL_TMP "/pg0", 0x0, 3000), RAY_OK);
+    TEST_ASSERT_EQ_I(write_parted(ray_test_tmp(ENCCOL_TMP "/pg2"), 0x5, 3000), RAY_OK);
+    TEST_ASSERT_EQ_I(write_parted(ray_test_tmp(ENCCOL_TMP "/pg0"), 0x0, 3000), RAY_OK);
     /* the same rows in both (rng is consumed per write): rewrite pg0 from pg2's columns */
     for (int p = 0; p < 3; p++) {
         char d2[512], d0[512];
-        snprintf(d2, sizeof d2, ENCCOL_TMP "/pg2/2024.01.0%d/t", p + 1);
-        snprintf(d0, sizeof d0, ENCCOL_TMP "/pg0/2024.01.0%d/t", p + 1);
+        snprintf(d2, sizeof d2, ray_test_tmp(ENCCOL_TMP "/pg2/2024.01.0%d/t"), p + 1);
+        snprintf(d0, sizeof d0, ray_test_tmp(ENCCOL_TMP "/pg0/2024.01.0%d/t"), p + 1);
         ray_t* src = ray_read_splayed(d2, NULL);
         TEST_ASSERT_TRUE(src && !RAY_IS_ERR(src));
         int64_t nc = ray_table_ncols(src);
@@ -1779,14 +1785,14 @@ static test_result_t test_parted_equals_gen0(void) {
         TEST_ASSERT_EQ_I(ray_splay_save(flat, d0, NULL), RAY_OK);
         ray_release(flat); ray_release(src);
     }
-    remove(ENCCOL_TMP "/pg2/2024.01.03/t/b");
+    remove(ray_test_tmp(ENCCOL_TMP "/pg2/2024.01.03/t/b"));
     {
         ray_t* names = ray_vec_new(RAY_STR, 1); names = ray_str_vec_append(names, "a", 1);
-        TEST_ASSERT_EQ_I(ray_col_save(names, ENCCOL_TMP "/pg2/2024.01.03/t/.d"), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_save(names, ray_test_tmp(ENCCOL_TMP "/pg2/2024.01.03/t/.d")), RAY_OK);
         ray_release(names);
     }
-    ray_t* t2 = ray_read_parted(ENCCOL_TMP "/pg2", "t");
-    ray_t* t0 = ray_read_parted(ENCCOL_TMP "/pg0", "t");
+    ray_t* t2 = ray_read_parted(ray_test_tmp(ENCCOL_TMP "/pg2"), "t");
+    ray_t* t0 = ray_read_parted(ray_test_tmp(ENCCOL_TMP "/pg0"), "t");
     TEST_ASSERT_TRUE(t2 && !RAY_IS_ERR(t2) && t0 && !RAY_IS_ERR(t0));
     ray_enc_counters_reset();
     TEST_ASSERT_EQ_I(ray_table_ncols(t2), ray_table_ncols(t0));

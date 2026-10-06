@@ -384,12 +384,12 @@ static test_result_t test_morsel_mmap_advise(void) {
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_MORSEL_COL);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_MORSEL_COL));
     TEST_ASSERT_EQ_I(err, RAY_OK);
     ray_release(vec);
 
     /* Load via mmap -> mmod == 1 */
-    ray_t* mapped = ray_col_mmap(TMP_MORSEL_COL);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_MORSEL_COL));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_U(mapped->mmod, 1);
@@ -412,7 +412,7 @@ static test_result_t test_morsel_mmap_advise(void) {
     TEST_ASSERT_EQ_I(count, 8);
 
     ray_release(mapped);
-    unlink(TMP_MORSEL_COL);
+    unlink(ray_test_tmp(TMP_MORSEL_COL));
     PASS();
 }
 

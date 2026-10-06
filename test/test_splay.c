@@ -80,10 +80,10 @@ static void rm_rf(const char* path) {
  * Chunks of 20k rows with >4k new strings each take the parallel batch. */
 static test_result_t test_csv_splayed_symfile_order(void) {
     TEST_ASSERT_NOT_NULL(ray_pool_get());
-    const char* dir = TMP_SPLAY_BASE "/csvorder";
-    const char* csv = TMP_SPLAY_BASE "/csvorder.csv";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/csvorder");
+    const char* csv = ray_test_tmp(TMP_SPLAY_BASE "/csvorder.csv");
     rm_rf(dir);
-    mkdir(TMP_SPLAY_BASE, 0755);
+    mkdir(ray_test_tmp(TMP_SPLAY_BASE), 0755);
 
     enum { NROWS = 60000, CHUNK = 20000, NA = 13000, NB = 9000 };
     FILE* f = fopen(csv, "wb");
@@ -162,10 +162,10 @@ static test_result_t test_csv_splayed_symfile_order(void) {
  * not treat it so, and merged two rows, losing a value.) */
 static test_result_t test_csv_splayed_quote_mode_per_file(void) {
     TEST_ASSERT_NOT_NULL(ray_pool_get());
-    const char* dir = TMP_SPLAY_BASE "/csvquote";
-    const char* csv = TMP_SPLAY_BASE "/csvquote.csv";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/csvquote");
+    const char* csv = ray_test_tmp(TMP_SPLAY_BASE "/csvquote.csv");
     rm_rf(dir);
-    mkdir(TMP_SPLAY_BASE, 0755);
+    mkdir(ray_test_tmp(TMP_SPLAY_BASE), 0755);
 
     enum { NROWS = 60000, CHUNK = 20000, LONE = 45007 };
     FILE* f = fopen(csv, "wb");
@@ -231,7 +231,7 @@ static test_result_t test_save_null_dir(void) {
  * 2. ray_splay_save: NULL tbl → RAY_ERR_TYPE
  * ========================================================================= */
 static test_result_t test_save_null_tbl(void) {
-    ray_err_t err = ray_splay_save(NULL, TMP_SPLAY_BASE "/t", NULL);
+    ray_err_t err = ray_splay_save(NULL, ray_test_tmp(TMP_SPLAY_BASE "/t"), NULL);
     TEST_ASSERT_EQ_I(err, RAY_ERR_TYPE);
     PASS();
 }
@@ -271,23 +271,23 @@ static test_result_t assert_save_rejects_unsafe_col_name(const char* dir,
 
 static test_result_t test_save_rejects_dot_col_name(void) {
     return assert_save_rejects_unsafe_col_name(
-        TMP_SPLAY_BASE "/dot_col", ".hidden", 7);
+        ray_test_tmp(TMP_SPLAY_BASE "/dot_col"), ".hidden", 7);
 }
 
 static test_result_t test_save_rejects_slash_col_name(void) {
     return assert_save_rejects_unsafe_col_name(
-        TMP_SPLAY_BASE "/slash_col", "a/b", 3);
+        ray_test_tmp(TMP_SPLAY_BASE "/slash_col"), "a/b", 3);
 }
 
 static test_result_t test_save_rejects_backslash_col_name(void) {
     return assert_save_rejects_unsafe_col_name(
-        TMP_SPLAY_BASE "/backslash_col", "a\\b", 3);
+        ray_test_tmp(TMP_SPLAY_BASE "/backslash_col"), "a\\b", 3);
 }
 
 static test_result_t test_save_rejects_nul_col_name(void) {
     static const char bad_name[] = { 'a', '\0', 'b' };
     return assert_save_rejects_unsafe_col_name(
-        TMP_SPLAY_BASE "/nul_col", bad_name, sizeof(bad_name));
+        ray_test_tmp(TMP_SPLAY_BASE "/nul_col"), bad_name, sizeof(bad_name));
 }
 
 /* =========================================================================
@@ -315,7 +315,7 @@ static test_result_t test_load_null_dir(void) {
  * ========================================================================= */
 static test_result_t test_load_missing_schema(void) {
     /* Directory exists but contains no .d file */
-    const char* dir = TMP_SPLAY_BASE "/no_schema";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/no_schema");
     rm_rf(dir);
     (void)ray_test_mkdir_p(dir);
 
@@ -334,7 +334,7 @@ static test_result_t test_load_missing_schema(void) {
  *    col-load-fail branch (lines 195-199).
  * ========================================================================= */
 static test_result_t test_load_missing_col_file(void) {
-    const char* dir = TMP_SPLAY_BASE "/miss_col";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/miss_col");
     rm_rf(dir);
 
     int64_t id_a = ray_sym_intern("aa", 2);
@@ -376,7 +376,7 @@ static test_result_t test_load_missing_col_file(void) {
  *    This hits lines 46-54 of validate_sym_columns with nc > 0 and no SYM.
  * ========================================================================= */
 static test_result_t test_validate_sym_no_sym_cols(void) {
-    const char* dir = TMP_SPLAY_BASE "/nosym_ok";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/nosym_ok");
     rm_rf(dir);
 
     int64_t id_x = ray_sym_intern("xval", 4);
@@ -389,7 +389,7 @@ static test_result_t test_validate_sym_no_sym_cols(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     /* Save with sym_path so the sym file is written */
-    const char* sym_path = TMP_SPLAY_BASE "/nosym_ok_sym";
+    const char* sym_path = ray_test_tmp(TMP_SPLAY_BASE "/nosym_ok_sym");
     ray_err_t err = ray_splay_save(tbl, dir, sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -436,8 +436,8 @@ static test_result_t test_validate_sym_no_sym_cols(void) {
  *    coverage from our suite.
  * ========================================================================= */
 static test_result_t test_validate_sym_corrupt(void) {
-    const char* dir     = TMP_SPLAY_BASE "/sym_corrupt";
-    const char* sym_path = TMP_SPLAY_BASE "/sym_corrupt_sym";
+    const char* dir     = ray_test_tmp(TMP_SPLAY_BASE "/sym_corrupt");
+    const char* sym_path = ray_test_tmp(TMP_SPLAY_BASE "/sym_corrupt_sym");
     rm_rf(dir);
     unlink(sym_path);
 
@@ -508,7 +508,7 @@ static test_result_t test_validate_sym_corrupt(void) {
  *     is reserved for actual SYM columns without a domain).
  * ========================================================================= */
 static test_result_t test_load_bad_sym_path(void) {
-    const char* dir = TMP_SPLAY_BASE "/bad_sym";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/bad_sym");
     rm_rf(dir);
 
     int64_t id_k = ray_sym_intern("k1", 2);
@@ -570,7 +570,7 @@ static test_result_t test_load_bad_sym_path(void) {
  *     branch and the "nyi fallback" path for types that don't support mmap.
  * ========================================================================= */
 static test_result_t test_read_splayed_roundtrip(void) {
-    const char* dir = TMP_SPLAY_BASE "/mmap_rt";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/mmap_rt");
     rm_rf(dir);
 
     int64_t id_p = ray_sym_intern("price", 5);
@@ -616,7 +616,7 @@ static test_result_t test_read_splayed_roundtrip(void) {
  *     never reach the sym-save branch.
  * ========================================================================= */
 static test_result_t test_save_sym_error(void) {
-    const char* dir = TMP_SPLAY_BASE "/sym_err_save";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/sym_err_save");
     rm_rf(dir);
 
     int64_t id_v = ray_sym_intern("v", 1);
@@ -653,7 +653,7 @@ static test_result_t test_save_sym_error(void) {
  *     single I64 value pointing at a sym whose string begins with '.'.
  * ========================================================================= */
 static test_result_t test_load_corrupt_col_name_in_schema(void) {
-    const char* dir = TMP_SPLAY_BASE "/corrupt_name";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/corrupt_name");
     rm_rf(dir);
 
     int64_t id_ok  = ray_sym_intern("okname", 6);
@@ -729,7 +729,7 @@ static test_result_t test_load_dir_path_too_long(void) {
  *     path-length check before attempting to open the (nonexistent) file.
  * ========================================================================= */
 static test_result_t test_load_col_path_too_long(void) {
-    const char* dir = "/tmp/rft_ln";
+    const char* dir = ray_test_tmp("/tmp/rft_ln");
     rm_rf(dir);
 
     /* Build a column name that is 1017 chars: dir (11) + "/" (1) + name (1017)
@@ -786,7 +786,7 @@ static test_result_t test_load_col_path_too_long(void) {
  *     with tbl having nc=0, schema_ncols=0. Hits lines 46,49,53,54.
  * ========================================================================= */
 static test_result_t test_validate_sym_zero_col_table(void) {
-    const char* dir = TMP_SPLAY_BASE "/zero_col";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/zero_col");
     rm_rf(dir);
 
     /* Build a zero-column table */
@@ -823,8 +823,8 @@ static test_result_t test_validate_sym_zero_col_table(void) {
  *     reach the bulk symfile flush.
  * ========================================================================= */
 static test_result_t test_save_bulk_with_sym_path(void) {
-    const char* dir      = TMP_SPLAY_BASE "/bulk_sym";
-    const char* sym_path = TMP_SPLAY_BASE "/bulk_sym.sym";
+    const char* dir      = ray_test_tmp(TMP_SPLAY_BASE "/bulk_sym");
+    const char* sym_path = ray_test_tmp(TMP_SPLAY_BASE "/bulk_sym.sym");
     rm_rf(dir);
     unlink(sym_path);
 
@@ -861,8 +861,8 @@ static test_result_t test_save_bulk_with_sym_path(void) {
 }
 
 static test_result_t test_save_staged_bulk_defers_sym_flush(void) {
-    const char* dir      = TMP_SPLAY_BASE "/staged_bulk_sym";
-    const char* sym_path = TMP_SPLAY_BASE "/staged_bulk_sym.sym";
+    const char* dir      = ray_test_tmp(TMP_SPLAY_BASE "/staged_bulk_sym");
+    const char* sym_path = ray_test_tmp(TMP_SPLAY_BASE "/staged_bulk_sym.sym");
     rm_rf(dir);
     unlink(sym_path);
 
@@ -916,7 +916,7 @@ static test_result_t test_save_dir_path_too_long(void) {
 #endif
     /* Construct the nested path in a buffer */
     char long_dir[2048];
-    const char* base   = "/tmp/rft_deep_save";  /* 18 chars */
+    const char* base   = ray_test_tmp("/tmp/rft_deep_save");  /* 18 chars */
     const char* comp   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; /* 50 chars */
     int nlevels        = 20;
 
@@ -957,7 +957,7 @@ static test_result_t test_save_dir_path_too_long(void) {
     ray_release(col);
     ray_release(tbl);
     /* Cleanup entire nested tree from the base */
-    (void)ray_test_rm_rf("/tmp/rft_deep_save");
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rft_deep_save"));
     PASS();
 }
 
@@ -969,7 +969,7 @@ static test_result_t test_save_dir_path_too_long(void) {
  *     The column must pass the name-safety check (no /, \, ., not empty).
  * ========================================================================= */
 static test_result_t test_save_col_path_too_long(void) {
-    const char* dir = "/tmp/rft_sv";
+    const char* dir = ray_test_tmp("/tmp/rft_sv");
     rm_rf(dir);
 
     /* dir = 11 chars; "/" = 1 char; need name_len >= 1012 to make total >= 1024 */
@@ -1009,7 +1009,7 @@ static test_result_t test_save_col_path_too_long(void) {
  *     Use setenv("RAY_CSV_TRACE","1",1) before the call and unsetenv after.
  * ========================================================================= */
 static test_result_t test_trace_valid_dir(void) {
-    const char* dir = TMP_SPLAY_BASE "/trace_valid";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/trace_valid");
     rm_rf(dir);
 
     int64_t id_t = ray_sym_intern("tval", 4);
@@ -1042,7 +1042,7 @@ static test_result_t test_trace_valid_dir(void) {
  *     fprintf (schema load failed branch).
  * ========================================================================= */
 static test_result_t test_trace_missing_schema(void) {
-    const char* dir = TMP_SPLAY_BASE "/trace_noschema";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/trace_noschema");
     rm_rf(dir);
     /* Create dir without .d file */
     (void)ray_test_mkdir_p(dir);
@@ -1064,7 +1064,7 @@ static test_result_t test_trace_missing_schema(void) {
  *     → hits lines 221-223 fprintf (col load failed branch).
  * ========================================================================= */
 static test_result_t test_trace_missing_col(void) {
-    const char* dir = TMP_SPLAY_BASE "/trace_misscol";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/trace_misscol");
     rm_rf(dir);
 
     int64_t id_a = ray_sym_intern("ta", 2);
@@ -1107,7 +1107,7 @@ static test_result_t test_trace_missing_col(void) {
  *     an empty sym table and no symfile.
  * ========================================================================= */
 static test_result_t test_trace_fresh_load(void) {
-    const char* dir = TMP_SPLAY_BASE "/trace_missym";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/trace_missym");
     rm_rf(dir);
 
     int64_t id_c = ray_sym_intern("tc", 2);
@@ -1149,7 +1149,7 @@ static test_result_t test_save_schema_write_fails(void) {
      * read-only attribute is ignored for directories. */
     SKIP("read-only directories are not enforced on Windows");
 #endif
-    const char* dir = TMP_SPLAY_BASE "/no_write_schema";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/no_write_schema");
     rm_rf(dir);
     (void)ray_test_mkdir_p(dir);
 
@@ -1217,8 +1217,8 @@ static test_result_t test_save_schema_write_fails(void) {
  *     remaining caller of the heap STR deep-copy path.
  * ========================================================================= */
 static test_result_t test_load_str_pool_heap(void) {
-    const char* dir_pool = TMP_SPLAY_BASE "/str_pool";
-    const char* dir_inl  = TMP_SPLAY_BASE "/str_inline";
+    const char* dir_pool = ray_test_tmp(TMP_SPLAY_BASE "/str_pool");
+    const char* dir_inl  = ray_test_tmp(TMP_SPLAY_BASE "/str_inline");
     rm_rf(dir_pool);
     rm_rf(dir_inl);
 
@@ -1294,7 +1294,7 @@ static test_result_t test_load_str_pool_heap(void) {
  *     gate for the STR-schema change.
  * ========================================================================= */
 static test_result_t test_selfdescribing_schema_fresh_process(void) {
-    const char* dir = TMP_SPLAY_BASE "/selfdesc";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/selfdesc");
     rm_rf(dir);
 
     int64_t id_a = ray_sym_intern("alpha", 5);
@@ -1344,8 +1344,8 @@ static test_result_t test_selfdescribing_schema_fresh_process(void) {
  *     sym_path is supplied; (c) .d is the commit marker — written last.
  * ========================================================================= */
 static test_result_t test_save_sweeps_stale_and_skips_sym(void) {
-    const char* dir = TMP_SPLAY_BASE "/sweep";
-    const char* symp = TMP_SPLAY_BASE "/sweep_sym";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/sweep");
+    const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/sweep_sym");
     rm_rf(dir);
     unlink(symp);
 
@@ -1398,7 +1398,7 @@ static test_result_t test_save_sweeps_stale_and_skips_sym(void) {
  *     re-set fully heals it.
  * ========================================================================= */
 static test_result_t test_torn_write_heals(void) {
-    const char* dir = TMP_SPLAY_BASE "/torn";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/torn");
     rm_rf(dir);
 
     int64_t id_x = ray_sym_intern("x", 1);
@@ -1441,8 +1441,8 @@ static test_result_t test_torn_write_heals(void) {
  *     now closed by construction rather than by dictionary dumping).
  * ========================================================================= */
 static test_result_t test_nested_sym_list_symfile(void) {
-    const char* dir  = TMP_SPLAY_BASE "/nested_sym";
-    const char* symp = TMP_SPLAY_BASE "/nested_sym_symfile";
+    const char* dir  = ray_test_tmp(TMP_SPLAY_BASE "/nested_sym");
+    const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/nested_sym_symfile");
     rm_rf(dir);
     unlink(symp);
 
@@ -1506,7 +1506,7 @@ static test_result_t test_nested_sym_list_symfile(void) {
  *     row count by rewriting it from a narrower vec.
  * ========================================================================= */
 static test_result_t test_ragged_columns_corrupt(void) {
-    const char* dir = TMP_SPLAY_BASE "/ragged";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/ragged");
     rm_rf(dir);
 
     int64_t id_a = ray_sym_intern("a", 1);
@@ -1552,7 +1552,7 @@ static test_result_t test_ragged_columns_corrupt(void) {
  *     error — but never crash under ASan.
  * ========================================================================= */
 static test_result_t test_untrusted_attrs_masked(void) {
-    const char* dir = TMP_SPLAY_BASE "/untrusted_attrs";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/untrusted_attrs");
     rm_rf(dir);
 
     int64_t id_a = ray_sym_intern("a", 1);
@@ -1651,7 +1651,7 @@ static test_result_t test_sym_col_name_allowed(void) {
     /* (a) issue #280: an I64 column literally named "sym", no SYM columns
      *     -> saves and round-trips; no ".sym" symfile is written. */
     {
-        const char* dir = TMP_SPLAY_BASE "/symcol_i64";
+        const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/symcol_i64");
         rm_rf(dir);
         int64_t id_sym = ray_sym_intern("sym", 3);
         ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
@@ -1686,7 +1686,7 @@ static test_result_t test_sym_col_name_allowed(void) {
     /* (b) a SYM-typed column named "sym" coexists with the ".sym" symfile
      *     and round-trips (the canonical q "sym" ticker column). */
     {
-        const char* dir = TMP_SPLAY_BASE "/symcol_sym";
+        const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/symcol_sym");
         rm_rf(dir);
         int64_t id_sym = ray_sym_intern("sym", 3);
         int64_t aapl = ray_sym_intern("AAPL", 4);
@@ -1729,7 +1729,7 @@ static test_result_t test_sym_col_name_allowed(void) {
     /* (c) explicit sym_path that lands ON a column file (SYM columns
      *     present) is rejected before any write. */
     {
-        const char* dir = TMP_SPLAY_BASE "/symcol_collide";
+        const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/symcol_collide");
         rm_rf(dir);
         int64_t id_s  = ray_sym_intern("s", 1);
         int64_t id_px = ray_sym_intern("px", 2);
@@ -1758,7 +1758,7 @@ static test_result_t test_sym_col_name_allowed(void) {
     /* (d) explicit sym_path whose ".lk" lock lands on a column file is
      *     rejected too: symfile "px" -> lock "px.lk" vs a column "px.lk". */
     {
-        const char* dir = TMP_SPLAY_BASE "/symcol_collide_lk";
+        const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/symcol_collide_lk");
         rm_rf(dir);
         int64_t id_s  = ray_sym_intern("s", 1);
         int64_t id_lk = ray_sym_intern("px.lk", 5);
@@ -1787,11 +1787,11 @@ static test_result_t test_sym_col_name_allowed(void) {
     /* (e) NO false positive: a column "px" with the symfile in a DIFFERENT
      *     directory saves fine even though a SYM column exists. */
     {
-        const char* dir  = TMP_SPLAY_BASE "/symcol_nocollide";
-        const char* symp = TMP_SPLAY_BASE "/symcol_nocollide_dom";
+        const char* dir  = ray_test_tmp(TMP_SPLAY_BASE "/symcol_nocollide");
+        const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/symcol_nocollide_dom");
         rm_rf(dir);
         unlink(symp);
-        unlink(TMP_SPLAY_BASE "/symcol_nocollide_dom.lk");
+        unlink(ray_test_tmp(TMP_SPLAY_BASE "/symcol_nocollide_dom.lk"));
         int64_t id_s  = ray_sym_intern("s", 1);
         int64_t id_px = ray_sym_intern("px", 2);
         int64_t aapl  = ray_sym_intern("AAPL", 4);
@@ -1811,7 +1811,7 @@ static test_result_t test_sym_col_name_allowed(void) {
         ray_release(tbl);
         rm_rf(dir);
         unlink(symp);
-        unlink(TMP_SPLAY_BASE "/symcol_nocollide_dom.lk");
+        unlink(ray_test_tmp(TMP_SPLAY_BASE "/symcol_nocollide_dom.lk"));
     }
     PASS();
 }
@@ -1822,11 +1822,11 @@ static test_result_t test_sym_col_name_allowed(void) {
  *     process dictionary; column width derives from the vocabulary.
  * ========================================================================= */
 static test_result_t test_per_table_symfile_vocabulary(void) {
-    const char* dir  = TMP_SPLAY_BASE "/vocab";
-    const char* symp = TMP_SPLAY_BASE "/vocab_sym";
+    const char* dir  = ray_test_tmp(TMP_SPLAY_BASE "/vocab");
+    const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/vocab_sym");
     rm_rf(dir);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/vocab_sym.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/vocab_sym.lk"));
 
     /* Bloat the global dictionary with unrelated session symbols — the
      * v2 dump would have persisted all of them. */
@@ -1892,7 +1892,7 @@ static test_result_t test_per_table_symfile_vocabulary(void) {
     ray_release(tbl);
     rm_rf(dir);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/vocab_sym.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/vocab_sym.lk"));
     PASS();
 }
 
@@ -1904,11 +1904,11 @@ static test_result_t test_per_table_symfile_vocabulary(void) {
  *     the heap and mmap loaders.
  * ========================================================================= */
 static test_result_t test_restart_reload_divergent_global(void) {
-    const char* dir  = TMP_SPLAY_BASE "/restart";
-    const char* symp = TMP_SPLAY_BASE "/restart_sym";
+    const char* dir  = ray_test_tmp(TMP_SPLAY_BASE "/restart");
+    const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/restart_sym");
     rm_rf(dir);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/restart_sym.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/restart_sym.lk"));
 
     int64_t id_s = ray_sym_intern("s", 1);
     int64_t v1 = ray_sym_intern("rst_aa", 6);
@@ -1952,7 +1952,7 @@ static test_result_t test_restart_reload_divergent_global(void) {
 
     rm_rf(dir);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/restart_sym.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/restart_sym.lk"));
     PASS();
 }
 
@@ -1963,13 +1963,13 @@ static test_result_t test_restart_reload_divergent_global(void) {
  *     append-only across the two saves (first table's positions stable).
  * ========================================================================= */
 static test_result_t test_shared_symfile_domain_identity(void) {
-    const char* dir1 = TMP_SPLAY_BASE "/share_a";
-    const char* dir2 = TMP_SPLAY_BASE "/share_b";
-    const char* symp = TMP_SPLAY_BASE "/share_sym";
+    const char* dir1 = ray_test_tmp(TMP_SPLAY_BASE "/share_a");
+    const char* dir2 = ray_test_tmp(TMP_SPLAY_BASE "/share_b");
+    const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/share_sym");
     rm_rf(dir1);
     rm_rf(dir2);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/share_sym.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/share_sym.lk"));
 
     int64_t id_s = ray_sym_intern("s", 1);
     int64_t va = ray_sym_intern("shr_aa", 6);
@@ -2037,7 +2037,7 @@ static test_result_t test_shared_symfile_domain_identity(void) {
     rm_rf(dir1);
     rm_rf(dir2);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/share_sym.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/share_sym.lk"));
     PASS();
 }
 
@@ -2049,11 +2049,11 @@ static test_result_t test_shared_symfile_domain_identity(void) {
  *     written and the load failed with the loud "sym" error.
  * ========================================================================= */
 static test_result_t test_empty_sym_table_roundtrip(void) {
-    const char* dir  = TMP_SPLAY_BASE "/empty_sym";
-    const char* symp = TMP_SPLAY_BASE "/empty_sym_symfile";
+    const char* dir  = ray_test_tmp(TMP_SPLAY_BASE "/empty_sym");
+    const char* symp = ray_test_tmp(TMP_SPLAY_BASE "/empty_sym_symfile");
     rm_rf(dir);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/empty_sym_symfile.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/empty_sym_symfile.lk"));
 
     int64_t id_s = ray_sym_intern("s", 1);
     ray_t* col = ray_sym_vec_new(RAY_SYM_W8, 4);
@@ -2100,7 +2100,7 @@ static test_result_t test_empty_sym_table_roundtrip(void) {
     ray_release(tbl);
     rm_rf(dir);
     unlink(symp);
-    unlink(TMP_SPLAY_BASE "/empty_sym_symfile.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/empty_sym_symfile.lk"));
     PASS();
 }
 
@@ -2114,7 +2114,7 @@ static test_result_t test_empty_sym_table_roundtrip(void) {
  *     intern state cannot influence resolution in either order.
  * ========================================================================= */
 static test_result_t test_resolution_order_independence(void) {
-    const char* root = TMP_SPLAY_BASE "/ordroot";
+    const char* root = ray_test_tmp(TMP_SPLAY_BASE "/ordroot");
     rm_rf(root);
     char live[600], part[600], symp[600];
     snprintf(live, sizeof(live), "%s/live", root);
@@ -2225,11 +2225,11 @@ static test_result_t test_resolution_order_independence(void) {
  *     dir/.sym precedence rule the explicit argument wins over.
  * ========================================================================= */
 static test_result_t test_resolution_explicit_wins(void) {
-    const char* dir  = TMP_SPLAY_BASE "/explwin";
-    const char* osym = TMP_SPLAY_BASE "/explwin_other";
+    const char* dir  = ray_test_tmp(TMP_SPLAY_BASE "/explwin");
+    const char* osym = ray_test_tmp(TMP_SPLAY_BASE "/explwin_other");
     rm_rf(dir);
     unlink(osym);
-    unlink(TMP_SPLAY_BASE "/explwin_other.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/explwin_other.lk"));
 
     int64_t id_s = ray_sym_intern("s", 1);
     ray_t* a_dir  = ray_str(dir, strlen(dir));
@@ -2323,7 +2323,7 @@ static test_result_t test_resolution_explicit_wins(void) {
     ray_release(tb);
     rm_rf(dir);
     unlink(osym);
-    unlink(TMP_SPLAY_BASE "/explwin_other.lk");
+    unlink(ray_test_tmp(TMP_SPLAY_BASE "/explwin_other.lk"));
     PASS();
 }
 
@@ -2356,7 +2356,7 @@ static test_result_t test_splayed_has_nulls_roundtrip(void) {
 
     for (int i = 0; i < n_types; i++) {
         int8_t t = types[i];
-        const char* dir = TMP_SPLAY_BASE "/hasnulls_rt";
+        const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/hasnulls_rt");
         rm_rf(dir);
 
         ray_t* col = (t == RAY_SYM) ? ray_sym_vec_new(RAY_SYM_W8, 4)
@@ -2407,7 +2407,7 @@ static test_result_t test_splayed_has_nulls_roundtrip(void) {
  * is deterministic (unsupported nested data), so it also proves that a
  * preflight/write error cannot advance the table-level manifest. */
 static test_result_t test_splay_atomic_generation_publish(void) {
-    const char* dir = TMP_SPLAY_BASE "/atomic_generation";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/atomic_generation");
     char manifest[512];
     int n = snprintf(manifest, sizeof(manifest), "%s/.current", dir);
     TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(manifest));
@@ -2538,9 +2538,9 @@ static int generation_dir_count(const char* dir) {
 
 #ifndef _WIN32
 static test_result_t test_generation_prune_unlinks_symlink(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_symlink";
-    const char* victim = TMP_SPLAY_BASE "/generation_symlink_victim";
-    const char* victim_file = TMP_SPLAY_BASE "/generation_symlink_victim/keep";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_symlink");
+    const char* victim = ray_test_tmp(TMP_SPLAY_BASE "/generation_symlink_victim");
+    const char* victim_file = ray_test_tmp(TMP_SPLAY_BASE "/generation_symlink_victim/keep");
     rm_rf(dir);
     rm_rf(victim);
 
@@ -2590,7 +2590,7 @@ static test_result_t test_generation_prune_unlinks_symlink(void) {
 /* Force actual filesystem failures after the first column and after all
  * columns respectively. No invalid object or preflight shortcut is involved. */
 static test_result_t test_generation_io_failures(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_io";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_io");
     rm_rf(dir);
     ray_t* old = generation_pair(1);
     ray_t* next = generation_pair(9);
@@ -2655,7 +2655,7 @@ static test_result_t test_generation_io_failures(void) {
 /* Only the selected generation is kept.  A table mapped before a replacement
  * stays readable after its files are removed; a new read sees the new one. */
 static test_result_t test_generation_keeps_only_current(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_readers";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_readers");
     rm_rf(dir);
     ray_t* old = generation_pair(1);
     ray_t* next = generation_pair(9);
@@ -2721,7 +2721,7 @@ static void dir_listing(const char* dir, char* out, size_t out_sz) {
  * first write's columns and their sidecars go at the first publish; the
  * symfile and the lock file stay. */
 static test_result_t test_generation_first_write_removed(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_first_write";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_first_write");
     rm_rf(dir);
     int64_t s_id = ray_sym_intern("s", 1);
     ray_t* t = generation_pair(1);
@@ -2736,7 +2736,7 @@ static test_result_t test_generation_first_write_removed(void) {
     snprintf(sym, sizeof(sym), "%s/.sym", dir);
     TEST_ASSERT_EQ_I(ray_splay_save(t, dir, sym), RAY_OK);
     /* A sidecar of a first-write column goes with it. */
-    FILE* f = fopen(TMP_SPLAY_BASE "/generation_first_write/x.link", "wb");
+    FILE* f = fopen(ray_test_tmp(TMP_SPLAY_BASE "/generation_first_write/x.link"), "wb");
     TEST_ASSERT_NOT_NULL(f);
     fputs("other", f);
     fclose(f);
@@ -2764,23 +2764,23 @@ static test_result_t test_generation_first_write_removed(void) {
  * database root of new/../db/) loses only the columns its schema named:
  * not a partition, not a file named like no column of it. */
 static test_result_t test_generation_first_write_keeps_others(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_shared_root";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_shared_root");
     rm_rf(dir);
-    TEST_ASSERT_EQ_I(ray_test_mkdir_p(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t"), 0);
-    FILE* f = fopen(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep", "wb");
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(ray_test_tmp(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t")), 0);
+    FILE* f = fopen(ray_test_tmp(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep"), "wb");
     TEST_ASSERT_NOT_NULL(f);
     fclose(f);
     ray_t* one = generation_pair(1);
     ray_t* two = generation_pair(2);
     TEST_ASSERT_EQ_I(ray_splay_save(one, dir, NULL), RAY_OK);
-    f = fopen(TMP_SPLAY_BASE "/generation_shared_root/notes", "wb");
+    f = fopen(ray_test_tmp(TMP_SPLAY_BASE "/generation_shared_root/notes"), "wb");
     TEST_ASSERT_NOT_NULL(f);
     fclose(f);
     TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
     char listing[512];
     dir_listing(dir, listing, sizeof(listing));
     TEST_ASSERT_STR_EQ(listing, ".current .generations .write.lock 2026.10.05 notes");
-    TEST_ASSERT_EQ_I(access(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep", F_OK), 0);
+    TEST_ASSERT_EQ_I(access(ray_test_tmp(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep"), F_OK), 0);
     TEST_ASSERT_TRUE(generation_matches(dir, true, 2));
     ray_release(two);
     ray_release(one);
@@ -2831,8 +2831,8 @@ static void generation_flip_child(const char* dir, const char* tmpl) {
  * again and reads the selected one: no read fails while another process
  * publishes and prunes. */
 static test_result_t test_generation_reader_races(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_race";
-    const char* tmpl = TMP_SPLAY_BASE "/generation_race_tmpl";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_race");
+    const char* tmpl = ray_test_tmp(TMP_SPLAY_BASE "/generation_race_tmpl");
     rm_rf(dir);
     rm_rf(tmpl);
     ray_t* t = generation_pair(1);
@@ -2844,7 +2844,7 @@ static test_result_t test_generation_reader_races(void) {
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
     snprintf(g0, sizeof(g0), "%s/.generations/g-0", dir);
     TEST_ASSERT_EQ_I(rename(resolved, g0), 0);
-    FILE* f = fopen(TMP_SPLAY_BASE "/generation_race/.current", "wb");
+    FILE* f = fopen(ray_test_tmp(TMP_SPLAY_BASE "/generation_race/.current"), "wb");
     TEST_ASSERT_NOT_NULL(f);
     fputs(".generations/g-0\n", f);
     fclose(f);
@@ -2876,14 +2876,14 @@ static test_result_t test_generation_reader_races(void) {
 #endif
 
 static test_result_t test_generation_invalid_manifest(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_manifest";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_manifest");
     rm_rf(dir);
     ray_t* t = generation_pair(1);
     TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
     const char* invalid[] = {"", ".generations/../x\n", ".generations/g-1/..\n",
                              ".generations/g-1\njunk\n", ".generations/\n"};
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
-        FILE* f = fopen(TMP_SPLAY_BASE "/generation_manifest/.current", "wb");
+        FILE* f = fopen(ray_test_tmp(TMP_SPLAY_BASE "/generation_manifest/.current"), "wb");
         TEST_ASSERT_NOT_NULL(f);
         TEST_ASSERT_TRUE(fputs(invalid[i], f) >= 0);
         TEST_ASSERT_EQ_I(fclose(f), 0);
@@ -2902,7 +2902,7 @@ static test_result_t test_generation_invalid_manifest(void) {
 }
 
 static test_result_t test_generation_writer_exit(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_exit";
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/generation_exit");
     rm_rf(dir);
     ray_t* old = generation_pair(1);
     ray_t* next = generation_pair(9);

@@ -38,8 +38,8 @@
 #include <unistd.h>
 
 #define LG_TMP "/tmp/rayforce_enc_large"
-static void lg_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(LG_TMP); }
-static void lg_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(LG_TMP); }
+static void lg_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ray_test_tmp(LG_TMP)); }
+static void lg_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ray_test_tmp(LG_TMP)); }
 
 /* 65535 descriptors sharing one pooled range of the source (a 65538-byte
  * pool): the source stays small, while the decoded compact pool counts each
@@ -68,9 +68,9 @@ static ray_t* shared_str(uint32_t last_len) {
 static test_result_t test_pool_exact_limit(void) {
     ray_t* v = shared_str(65537);
     TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
-    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, LG_TMP "/ok", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, ray_test_tmp(LG_TMP "/ok"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(LG_TMP "/ok");
+    ray_t* c = ray_col_mmap(ray_test_tmp(LG_TMP "/ok"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     TEST_ASSERT_EQ_U(ray_enccol_of(c)->hdr.str_pool_bytes, UINT32_MAX);
     ray_t* m = ray_enccol_materialize(c);
@@ -83,10 +83,10 @@ static test_result_t test_pool_exact_limit(void) {
 static test_result_t test_pool_one_byte_over(void) {
     ray_t* v = shared_str(65538);
     TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
-    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, LG_TMP "/over", 2), RAY_ERR_RANGE);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, ray_test_tmp(LG_TMP "/over"), 2), RAY_ERR_RANGE);
     ray_release(v);
-    TEST_ASSERT_TRUE(access(LG_TMP "/over", F_OK) != 0);
-    TEST_ASSERT_TRUE(access(LG_TMP "/over.tmp", F_OK) != 0);
+    TEST_ASSERT_TRUE(access(ray_test_tmp(LG_TMP "/over"), F_OK) != 0);
+    TEST_ASSERT_TRUE(access(ray_test_tmp(LG_TMP "/over.tmp"), F_OK) != 0);
     PASS();
 }
 
@@ -95,14 +95,14 @@ static test_result_t test_pool_one_byte_over(void) {
  * the crossing (the last) row; abort removes every staging file. */
 static test_result_t test_stream_crossing_last_row(void) {
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, LG_TMP, ray_sym_intern("st", 2), RAY_STR, NULL, 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, ray_test_tmp(LG_TMP), ray_sym_intern("st", 2), RAY_STR, NULL, 2), RAY_OK);
     ray_t* v = shared_str(65538);
     TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_ERR_RANGE);
     ray_release(v);
     ray_col_stream_abort(&w);
-    TEST_ASSERT_TRUE(access(LG_TMP "/.stream-st.col", F_OK) != 0);
-    TEST_ASSERT_TRUE(access(LG_TMP "/.stream-st.pool", F_OK) != 0);
+    TEST_ASSERT_TRUE(access(ray_test_tmp(LG_TMP "/.stream-st.col"), F_OK) != 0);
+    TEST_ASSERT_TRUE(access(ray_test_tmp(LG_TMP "/.stream-st.pool"), F_OK) != 0);
     PASS();
 }
 

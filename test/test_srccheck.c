@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* Line number of the first occurrence of any needle (0 if none). */
 static int first_hit(const char* path, const char* const* needles) {
@@ -155,10 +156,31 @@ static test_result_t test_cols_inplace_plain(void) {
     PASS();
 }
 
+/* Every "/tmp" path a test names lives under this process's own root, so
+ * two suites on one host never share a file: plain paths, paths inside a
+ * Rayfall or shell line, the bare root; an already-moved path and a path
+ * that merely contains "/tmp" elsewhere are left alone.  The root exists. */
+static test_result_t test_tmp_paths_per_process(void) {
+    char root[64];
+    snprintf(root, sizeof root, "/tmp/rayforce_t.%ld", (long)getpid());
+    char want[256];
+    snprintf(want, sizeof want, "%s/rayforce_x/a", root);
+    TEST_ASSERT_STR_EQ(ray_test_tmp("/tmp/rayforce_x/a"), want);
+    TEST_ASSERT_STR_EQ(ray_test_tmp(want), want);
+    snprintf(want, sizeof want, "(.db.splayed.set \"%s/t\" T) rm -rf %s/u; cd %s", root, root, root);
+    TEST_ASSERT_STR_EQ(ray_test_tmp("(.db.splayed.set \"/tmp/t\" T) rm -rf /tmp/u; cd /tmp"), want);
+    TEST_ASSERT_STR_EQ(ray_test_tmp("/var/tmp/x /tmpx rf_tmp/y"), "/var/tmp/x /tmpx rf_tmp/y");
+    TEST_ASSERT_TRUE(ray_test_tmp("/tmp/rayforce_x/a") == ray_test_tmp("/tmp/rayforce_x/a"));
+    struct stat st;
+    TEST_ASSERT_TRUE(stat(root, &st) == 0 && S_ISDIR(st.st_mode));
+    PASS();
+}
+
 const test_entry_t srccheck_entries[] = {
     { "srccheck/no_legacy_getters", test_no_legacy_getters, NULL, NULL },
     { "srccheck/no_raw_column_list",  test_no_raw_column_list,  NULL, NULL },
     { "srccheck/materializer_attach", test_materializer_attach, NULL, NULL },
     { "srccheck/cols_inplace_plain", test_cols_inplace_plain, NULL, NULL },
+    { "srccheck/tmp_paths_per_process", test_tmp_paths_per_process, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

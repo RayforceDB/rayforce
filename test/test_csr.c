@@ -1047,7 +1047,7 @@ static test_result_t test_csr_save_load(void) {
     TEST_ASSERT_NOT_NULL(rel);
 
     /* Save */
-    const char* dir = "/tmp/test_csr_save";
+    const char* dir = ray_test_tmp("/tmp/test_csr_save");
     ray_err_t err = ray_rel_save(rel, dir);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -1629,7 +1629,7 @@ static test_result_t test_save_load_rev(void) {
     ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, true);
     TEST_ASSERT_NOT_NULL(rel);
 
-    const char* dir = "/tmp/test_csr_rev";
+    const char* dir = ray_test_tmp("/tmp/test_csr_rev");
     ray_err_t err = ray_rel_save(rel, dir);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -2915,7 +2915,7 @@ static test_result_t test_rel_save_load_errors(void) {
     TEST_ASSERT_NOT_NULL(rel);
 
     /* NULL rel → RAY_ERR_IO */
-    TEST_ASSERT_EQ_I(ray_rel_save(NULL, "/tmp/test_csr_err"), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_rel_save(NULL, ray_test_tmp("/tmp/test_csr_err")), RAY_ERR_IO);
     /* NULL dir → RAY_ERR_IO */
     TEST_ASSERT_EQ_I(ray_rel_save(rel, NULL), RAY_ERR_IO);
 
@@ -2924,9 +2924,9 @@ static test_result_t test_rel_save_load_errors(void) {
 
     /* ray_rel_load on NULL or non-existent dir → NULL */
     TEST_ASSERT_EQ_PTR(ray_rel_load(NULL), NULL);
-    TEST_ASSERT_EQ_PTR(ray_rel_load("/tmp/this_csr_dir_must_not_exist_xyz"), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_load(ray_test_tmp("/tmp/this_csr_dir_must_not_exist_xyz")), NULL);
     TEST_ASSERT_EQ_PTR(ray_rel_mmap(NULL), NULL);
-    TEST_ASSERT_EQ_PTR(ray_rel_mmap("/tmp/this_csr_dir_must_not_exist_xyz"), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap(ray_test_tmp("/tmp/this_csr_dir_must_not_exist_xyz")), NULL);
 
     ray_rel_free(rel);
     ray_release(edges);
@@ -2947,7 +2947,7 @@ static test_result_t test_rel_save_mmap_reuse(void) {
     ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, true);
     TEST_ASSERT_NOT_NULL(rel);
 
-    const char* dir = "/tmp/test_csr_mmap_reuse";
+    const char* dir = ray_test_tmp("/tmp/test_csr_mmap_reuse");
     /* First save creates dir */
     TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
     /* Second save into existing dir hits the EEXIST branch (mkdir returns -1, errno=EEXIST) */
@@ -3215,7 +3215,7 @@ static test_result_t test_load_nonmonotonic_offsets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_mono";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_mono");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* fwd has 4 nodes, 6 edges.  Forge offsets[5] = {0,5,2,?,6} so the last
@@ -3241,7 +3241,7 @@ static test_result_t test_load_negative_offset(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_neg";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_neg");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* offsets[1] = -1 with last entry still == n_edges (6). */
@@ -3264,7 +3264,7 @@ static test_result_t test_load_offset_count_mismatch(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_count";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_count");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* targets has 6 edges; make offsets[4] = 5 (monotonic, but != 6). */
@@ -3288,7 +3288,7 @@ static test_result_t test_load_empty_offsets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_empty_off";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_empty_off");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     csr_overwrite_i64(dir, "fwd_offsets", NULL, 0);  /* len 0 */
@@ -3310,7 +3310,7 @@ static test_result_t test_load_rev_corrupt_frees_fwd(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_rev";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_rev");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* Corrupt only rev_offsets: fwd loads fine, rev load must fail and the
@@ -3334,7 +3334,7 @@ static test_result_t test_load_missing_rowmap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_rowmap";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_rowmap");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* Delete both rowmap files — they are optional on load. */
@@ -3367,7 +3367,7 @@ static test_result_t test_load_missing_meta(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_meta";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_meta");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3397,7 +3397,7 @@ static test_result_t test_load_short_meta(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_short_meta";
+    const char* dir = ray_test_tmp("/tmp/test_csr_short_meta");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* Overwrite meta with a 2-element vector (need >= 5 to apply). */
@@ -3425,7 +3425,7 @@ static test_result_t test_mmap_missing_rowmap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_mmap_no_rowmap";
+    const char* dir = ray_test_tmp("/tmp/test_csr_mmap_no_rowmap");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3452,7 +3452,7 @@ static test_result_t test_load_missing_targets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_targets";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_targets");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3475,7 +3475,7 @@ static test_result_t test_load_missing_offsets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_offsets";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_offsets");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3524,7 +3524,7 @@ static test_result_t test_multi_edge_roundtrip(void) {
     TEST_ASSERT_EQ_I(nb[2], 1);
     TEST_ASSERT_EQ_I(nb[3], 2);
 
-    const char* dir = "/tmp/test_csr_multi_edge";
+    const char* dir = ray_test_tmp("/tmp/test_csr_multi_edge");
     TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
 
     ray_rel_t* loaded = ray_rel_load(dir);
@@ -3568,7 +3568,7 @@ static test_result_t test_single_edge_roundtrip(void) {
     TEST_ASSERT_EQ_I(ray_csr_degree(&rel->fwd, 1), 0);
     TEST_ASSERT_EQ_I(ray_csr_degree(&rel->rev, 1), 1);
 
-    const char* dir = "/tmp/test_csr_single_edge";
+    const char* dir = ray_test_tmp("/tmp/test_csr_single_edge");
     TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
     ray_rel_t* loaded = ray_rel_load(dir);
     TEST_ASSERT_NOT_NULL(loaded);

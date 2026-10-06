@@ -4802,10 +4802,10 @@ static test_result_t test_sort_embedded_nul(void) {
 static test_result_t test_eval_read_write_csv(void) {
     /* Create a table, write it to CSV, read it back */
     ray_t* result = ray_eval_str(
-        "(do (set t (table ['a 'b] (list [1 2 3] [10 20 30]))) "
+        ray_test_tmp("(do (set t (table ['a 'b] (list [1 2 3] [10 20 30]))) "
         "(.csv.write t \"/tmp/test_rayfall.csv\") "
         "(set t2 (.csv.read \"/tmp/test_rayfall.csv\")) "
-        "(count t2))");
+        "(count t2))"));
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, -RAY_I64);
@@ -8983,7 +8983,7 @@ static test_result_t test_select_releases_input_table(void) {
 
 static test_result_t test_select_derived_key_file_chunks(void) {
     ray_t* r = ray_eval_str(
-        "(do (set __dk_i (til 20000)) "
+        ray_test_tmp("(do (set __dk_i (til 20000)) "
         "    (set __dk_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
         "    (set __dk_mk (fn [k] ((fn [j] (if (== 0 (% j 11)) \"\" (if (== 0 (% j 7)) "
         "        (format \"https://www.%/p/%\" (at __dk_hosts (% (* 31 j) 37)) (% j 13)) "
@@ -9002,7 +9002,7 @@ static test_result_t test_select_derived_key_file_chunks(void) {
         "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
         "        ref: ref v: v where: (!= ref \"\")}) by: p c: (count ref) sv: (sum v) mn: (min ref)}))) "
         "    (set __dk_fp (fn [r] (ser (xasc (xasc (table [k c sv mn] (list (at (value r) 0) (at r 'c) (at r 'sv) (at r 'mn))) 'mn) 'c)))) "
-        "    (count (distinct (at __dk_F 'ref))))");
+        "    (count (distinct (at __dk_F 'ref))))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->i64, 414);              /* vocabulary of 414 values */
@@ -9018,7 +9018,7 @@ static test_result_t test_select_derived_key_file_chunks(void) {
     ray_derived_key_chunk_set_for_test(7);      /* 60 chunks, the last one short */
     ray_t* same7 = ray_eval_str("(all (== (__dk_fp (__dk_keyq __dk_F)) (__dk_fp __dk_r7)))");
     ray_derived_key_chunk_set_for_test(0);
-    ray_t* cleanup = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_test_dk_chunks/\")");
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_dk_chunks/\")"));
     ray_release(cleanup);
 
     TEST_ASSERT_NOT_NULL(same);
@@ -9443,7 +9443,7 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
      * a finite claim the filesystem backs.  Bounding this path would turn a
      * large-file read that previously allocated and spilled into a hard
      * error, and would make success depend on live process state. */
-    const char* big = "/tmp/rf_read_big_sized.bin";
+    const char* big = ray_test_tmp("/tmp/rf_read_big_sized.bin");
     FILE* bf = fopen(big, "wb");
     TEST_ASSERT_NOT_NULL(bf);
     static char chunk[65536];

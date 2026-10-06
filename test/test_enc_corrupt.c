@@ -51,11 +51,11 @@
 #define STRUCT_MIN_PCT 90
 #define EC_TMP "/tmp/rayforce_enccorrupt"
 static void ec_setup(void) {
-    ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(EC_TMP);
+    ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ray_test_tmp(EC_TMP));
     for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
 }
 static uint8_t* g_img; static size_t g_len;
-static void ec_teardown(void) { ray_test_hooks_off(); free(g_img); g_img = NULL; ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(EC_TMP); }
+static void ec_teardown(void) { ray_test_hooks_off(); free(g_img); g_img = NULL; ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ray_test_tmp(EC_TMP)); }
 
 static bool img_load(const char* p) {
     free(g_img); g_img = NULL; g_len = 0;
@@ -286,6 +286,7 @@ static ray_t* str_const(void) {
 /* A SYM vector of `n` ids written with saved count 200. */
 static void save_sym200(const uint8_t* ids, int n, const char* p) {
     FILE* f = fopen(p, "wb+");
+    if (!f) ray_test_fatal("cannot open %s", p);
     ray_encw_t w;
     (void)ray_encw_begin(&w, f, RAY_SYM, RAY_SYM_W8, n, 200, 0, 0);
     (void)ray_encw_chunk(&w, ids, NULL, n);
@@ -297,7 +298,7 @@ static void save_sym200(const uint8_t* ids, int n, const char* p) {
 
 /* ---- outer header, enc header ---- */
 static test_result_t test_reject_headers(void) {
-    const char* p = EC_TMP "/h";
+    const char* p = ray_test_tmp(EC_TMP "/h");
     /* (order 0, "XENC"), (order 2, "XIDX"), (order 2, zero aux): encfmt/discriminator_cross_pairs;
      * version 2, truncation: enccol/load_rejects. Here: every other header rule. */
     SAVE(bool_runs(), p); W8(18, 0);              BAD(p, 0, "corrupt", "not storable in generation 2");
@@ -366,7 +367,7 @@ static test_result_t test_reject_headers(void) {
 
 /* ---- chunk directory ---- */
 static test_result_t test_reject_directory(void) {
-    const char* p = EC_TMP "/d";
+    const char* p = ray_test_tmp(EC_TMP "/d");
     SAVE(bool_runs(), p); W64(DIR(0), rd64(DIR(0)) + 8);           BAD(p, 0, "corrupt", "chunk 0 at");
     SAVE(bool_runs(), p); W64(DIR(0) + 8, 8);                      BAD(p, 0, "corrupt", "below the descriptor area");
     SAVE(bool_runs(), p); W64(DIR(0) + 8, rd64(DIR(0) + 8) - 4);   BAD(p, 0, "corrupt", "not a multiple of 8");
@@ -390,7 +391,7 @@ static test_result_t test_reject_directory(void) {
 
 /* ---- side data: table, entries, placement, contents ---- */
 static test_result_t test_reject_side_data(void) {
-    const char* p = EC_TMP "/s";
+    const char* p = ray_test_tmp(EC_TMP "/s");
     uint8_t sb[256]; uint16_t kind[3]; uint64_t off[3], len[3];
     /* the writer's own side region of an I64 DICT column: table @side, entry @side+32 */
     SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
@@ -484,7 +485,7 @@ static test_result_t test_reject_side_data(void) {
 
 /* ---- vector descriptors (materialization validates a chunk's descriptors before using them) ---- */
 static test_result_t test_reject_descriptors(void) {
-    const char* p = EC_TMP "/x";
+    const char* p = ray_test_tmp(EC_TMP "/x");
     size_t D;
     SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE); D = desc_at(0, 0);
     W8(D, 200);                    BAD(p, 1, "corrupt", "illegal encoding");
@@ -526,7 +527,7 @@ static test_result_t test_reject_descriptors(void) {
 
 /* ---- payloads: floats, bitmaps, GUID, STR, SYM, DICT codes ---- */
 static test_result_t test_reject_payloads(void) {
-    const char* p = EC_TMP "/q";
+    const char* p = ray_test_tmp(EC_TMP "/q");
     size_t at;
     /* null bitmap */
     SAVE(i32_nulls_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
@@ -634,7 +635,7 @@ static test_result_t test_reject_payloads(void) {
 
 /* ---- codec grammar over a whole file: RAW, RLE, children, FOR_BP, DELTA_BP ---- */
 static test_result_t test_reject_codec_grammar(void) {
-    const char* p = EC_TMP "/g";
+    const char* p = ray_test_tmp(EC_TMP "/g");
     size_t at;
     for (int k = 0; k < 18; k++) {
         SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE);
@@ -726,7 +727,7 @@ static test_result_t test_reject_depth4(void) {
 
 /* Damage in a range nobody reads stays unread; whoever reads it gets corrupt. */
 static test_result_t test_lazy_validation(void) {
-    const char* p = EC_TMP "/lazy";
+    const char* p = ray_test_tmp(EC_TMP "/lazy");
     ray_t* v = ray_vec_new(RAY_I32, 2 * 65536); v->len = 2 * 65536;
     for (int i = 0; i < 2 * 65536; i++) ((int32_t*)ray_data(v))[i] = i % 100;
     SAVE(v, p);
@@ -800,7 +801,7 @@ static bool fuzz_one(const char* p, const char** bad) {
  * reject something; flips confined to the headers, directory and
  * descriptors (everything before the first payload) must reject nearly all. */
 static test_result_t test_fuzz_flips(void) {
-    const char* p = EC_TMP "/fz";
+    const char* p = ray_test_tmp(EC_TMP "/fz");
     g_fz = 0xC0FFEE;
     int rej_all_total = 0, structural_total = 0, structural_rej = 0;
     for (int base = 0; base < 5; base++) {

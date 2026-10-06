@@ -42,10 +42,10 @@
 
 /* 256 interned symbols, so SYM test ids up to 255 lie inside the runtime domain. */
 static void cr_setup(void) {
-    ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(CR_TMP);
+    ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(ray_test_tmp(CR_TMP));
     for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
 }
-static void cr_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(CR_TMP); }
+static void cr_teardown(void) { ray_test_hooks_off(); ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(ray_test_tmp(CR_TMP)); }
 
 static ray_t* i32_nulls(int64_t n) {
     ray_t* v = ray_vec_new(RAY_I32, n); v->len = n;
@@ -210,8 +210,8 @@ static test_result_t test_range_matches_materialized(void) {
                         ray_release(sl);
                     }
                     /* generation 2 */
-                    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CR_TMP "/c", 2), RAY_OK);
-                    ray_t* c = ray_col_mmap(CR_TMP "/c");
+                    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(CR_TMP "/c"), 2), RAY_OK);
+                    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/c"));
                     TEST_ASSERT_FMT(c && !RAY_IS_ERR(c), "mmap");
                     TEST_ASSERT_EQ_I(c->type, RAY_ENCCOL);
                     TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
@@ -247,8 +247,8 @@ static test_result_t test_range_gen0_zero_copy(void) {
 
 static test_result_t test_range_gen2_vector_clip_and_nulls(void) {
     ray_t* v = i32_nulls(5000);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CR_TMP "/a", 2), RAY_OK);
-    ray_t* c = ray_col_mmap(CR_TMP "/a");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(CR_TMP "/a"), 2), RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/a"));
     ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
     TEST_ASSERT_TRUE(s.may_null);
     ray_col_scratch_t sc; ray_col_scratch_init(&sc);
@@ -280,8 +280,8 @@ static test_result_t test_range_two_str_views(void) {
         n = snprintf(buf, sizeof buf, "another long text %d", i * 7);
         b = ray_str_vec_append(b, buf, (size_t)n);
     }
-    TEST_ASSERT_EQ_I(ray_col_save_gen(b, CR_TMP "/b", 2), RAY_OK);
-    ray_t* bc = ray_col_mmap(CR_TMP "/b");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(b, ray_test_tmp(CR_TMP "/b"), 2), RAY_OK);
+    ray_t* bc = ray_col_mmap(ray_test_tmp(CR_TMP "/b"));
     ray_col_src_t sa, sb;
     TEST_ASSERT_NULL(ray_col_src_bind(a, &sa));              /* generation 0 */
     TEST_ASSERT_NULL(ray_col_src_bind(bc, &sb));             /* generation 2 */
@@ -321,8 +321,8 @@ static test_result_t test_range_slice_and_long_strings(void) {
     static char big[1000]; memset(big, 'x', sizeof big);
     ray_t* st = ray_vec_new(RAY_STR, 1024);
     for (int i = 0; i < 1024; i++) { big[0] = (char)('a' + i % 26); st = ray_str_vec_append(st, big, sizeof big); }
-    TEST_ASSERT_EQ_I(ray_col_save_gen(st, CR_TMP "/big", 2), RAY_OK);
-    ray_t* c = ray_col_mmap(CR_TMP "/big");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(st, ray_test_tmp(CR_TMP "/big"), 2), RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/big"));
     TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
     TEST_ASSERT_NULL(ray_col_range(&s, 0, 1024, &sc, &r));
     TEST_ASSERT_TRUE(sc.pool_cap >= 1024 * 1000);
@@ -333,10 +333,10 @@ static test_result_t test_range_slice_and_long_strings(void) {
 
 static test_result_t test_range_error_propagates(void) {
     ray_t* v = i32_nulls(3000);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CR_TMP "/bad", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(CR_TMP "/bad"), 2), RAY_OK);
     ray_release(v);
-    FILE* f = fopen(CR_TMP "/bad", "r+b"); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-    ray_t* c = ray_col_mmap(CR_TMP "/bad");
+    FILE* f = fopen(ray_test_tmp(CR_TMP "/bad"), "r+b"); TEST_ASSERT_TRUE(f != NULL); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
+    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/bad"));
     ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
     ray_col_scratch_t sc; ray_col_scratch_init(&sc);
     ray_col_range_t r;
@@ -352,8 +352,8 @@ static test_result_t test_range_error_propagates(void) {
 /* Bounds, scratch size and the memory of a released source. */
 static test_result_t test_range_bounds_and_scratch(void) {
     ray_t* v = gen_col(RAY_GUID, 3000, true, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CR_TMP "/g", 2), RAY_OK);
-    ray_t* c = ray_col_mmap(CR_TMP "/g");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(CR_TMP "/g"), 2), RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/g"));
     ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
     ray_col_scratch_t sc; ray_col_scratch_init(&sc);
     ray_col_range_t r;
@@ -519,10 +519,10 @@ static test_result_t parted_case(const char* root, int mask, bool ragged) {
 }
 
 static test_result_t test_range_parted_mixed(void) {
-    RUN(parted_case(CR_TMP "/p5", 0x5, false));       /* gen2, gen0, gen2 */
-    RUN(parted_case(CR_TMP "/p2", 0x2, false));       /* gen0, gen2, gen0 */
-    RUN(parted_case(CR_TMP "/p0", 0x0, false));       /* all gen0: plain parted wrapper */
-    RUN(parted_case(CR_TMP "/p7", 0x7, false));       /* all gen2 */
+    RUN(parted_case(ray_test_tmp(CR_TMP "/p5"), 0x5, false));       /* gen2, gen0, gen2 */
+    RUN(parted_case(ray_test_tmp(CR_TMP "/p2"), 0x2, false));       /* gen0, gen2, gen0 */
+    RUN(parted_case(ray_test_tmp(CR_TMP "/p0"), 0x0, false));       /* all gen0: plain parted wrapper */
+    RUN(parted_case(ray_test_tmp(CR_TMP "/p7"), 0x7, false));       /* all gen2 */
     PASS();
 }
 
@@ -531,9 +531,9 @@ static test_result_t test_range_parted_mixed(void) {
  * matching ray_parted_nrows (the executor refuses a table whose parted
  * columns' row counts differ, so a scan never meets one). */
 static test_result_t test_range_parted_ragged(void) {
-    RUN(parted_case(CR_TMP "/r5", 0x5, true));
-    RUN(parted_case(CR_TMP "/r0", 0x0, true));
-    ray_t* t = load_parted(CR_TMP "/rh", 0x0, false);
+    RUN(parted_case(ray_test_tmp(CR_TMP "/r5"), 0x5, true));
+    RUN(parted_case(ray_test_tmp(CR_TMP "/r0"), 0x0, true));
+    ray_t* t = load_parted(ray_test_tmp(CR_TMP "/rh"), 0x0, false);
     TEST_ASSERT_TRUE(t != NULL);
     ray_t* b = ray_table_col(t, ray_sym_intern("b", 1));
     TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b) && RAY_IS_PARTED(b->type) && b->len == 3);
@@ -577,9 +577,9 @@ static test_result_t test_table_col_src(void) {
     ray_t* t = ray_table_new(2);
     t = ray_table_add_col(t, ray_sym_intern("x", 1), v);
     ray_release(v);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v2, CR_TMP "/e", 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v2, ray_test_tmp(CR_TMP "/e"), 2), RAY_OK);
     ray_release(v2);
-    ray_t* c = ray_col_mmap(CR_TMP "/e");
+    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/e"));
     t = ray_table_add_col(t, ray_sym_intern("y", 1), c);
     ray_release(c);
     ray_enc_counters_reset();
@@ -600,7 +600,7 @@ static test_result_t test_table_col_src(void) {
 
 static test_result_t test_range_parted_boundary(void) {
     for (int p = 0; p < 2; p++) {
-        char dir[256]; snprintf(dir, sizeof dir, CR_TMP "/pdb/2024.01.0%d/t", p + 1);
+        char dir[256]; snprintf(dir, sizeof dir, ray_test_tmp(CR_TMP "/pdb/2024.01.0%d/t"), p + 1);
         ray_t* t = ray_table_new(1);
         ray_t* a = ray_vec_new(RAY_I64, 3000); a->len = 3000;
         for (int i = 0; i < 3000; i++) ((int64_t*)ray_data(a))[i] = p * 3000 + i;
@@ -609,7 +609,7 @@ static test_result_t test_range_parted_boundary(void) {
         TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dir, NULL, p == 0 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF), RAY_OK);
         ray_release(t);
     }
-    ray_t* t = ray_read_parted(CR_TMP "/pdb", "t");
+    ray_t* t = ray_read_parted(ray_test_tmp(CR_TMP "/pdb"), "t");
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
     ray_col_src_t s;
     TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("a", 1), &s));

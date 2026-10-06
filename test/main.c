@@ -388,6 +388,8 @@ static ray_t* rfl_eval(const char* src, const char* path, int line_no) {
     return v;
 }
 
+static char* tmp_subst(const char* s);   /* the per-process /tmp rewrite, below */
+
 static test_result_t run_rfl_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) FAILF("cannot open %s", path);
@@ -400,6 +402,9 @@ static test_result_t run_rfl_file(const char* path) {
     size_t r = fread(src, 1, (size_t)n, f);
     src[r] = '\0';
     fclose(f);
+    /* every "/tmp" path the file names moves under this process's root */
+    char* moved = tmp_subst(src);
+    if (moved) { free(src); src = moved; }
 
     /* ";; @requires: posix" anywhere in a file marks it as depending on a
      * POSIX shell / filesystem (.sys.exec pipelines, /proc).  Where that
@@ -923,6 +928,89 @@ void ray_test_hooks_off(void) {
     ray_clear_interrupt();
 }
 
+/* ---- Per-process scratch root (declared in test.h) ---- */
+
+static char   g_tmp_root[64];   /* "/tmp/rayforce_t.<pid>", set in main() */
+static size_t g_tmp_root_len;
+
+/* A "/tmp" path starts at s[i]: "/tmp" as a whole path component, not part
+ * of a longer name ("/var/tmp", "/tmpx"), and not already under the root. */
+static bool tmp_hit(const char* s, size_t n, size_t i) {
+    if (i + 4 > n || memcmp(s + i, "/tmp", 4) != 0) return false;
+    if (i > 0) {
+        char c = s[i - 1];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '.' || c == '-' || c == '/' || c == '~') return false;
+    }
+    char r = s[i + 4];
+    if (!(r == '/' || r == '\0' || r == '"' || r == '\\' || r == '\'' || r == ' ' ||
+          r == ')' || r == ';' || r == '\n' || r == '\t')) return false;
+    bool under_root = strncmp(s + i, g_tmp_root, g_tmp_root_len) == 0 &&
+                      (s[i + g_tmp_root_len] == '/' || s[i + g_tmp_root_len] == '\0');
+    return !under_root;
+}
+
+/* The rewrite of `s` (malloc'd), or NULL when `s` names no "/tmp" path or
+ * the root is not set yet. */
+static char* tmp_subst(const char* s) {
+    if (!g_tmp_root_len || !s) return NULL;
+    size_t n = strlen(s), hits = 0;
+    for (size_t i = 0; i < n; i++) if (tmp_hit(s, n, i)) hits++;
+    if (!hits) return NULL;
+    char* out = (char*)malloc(n + hits * g_tmp_root_len + 1);
+    if (!out) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
+    size_t o = 0;
+    for (size_t i = 0; i < n; ) {
+        if (tmp_hit(s, n, i)) { memcpy(out + o, g_tmp_root, g_tmp_root_len); o += g_tmp_root_len; i += 4; }
+        else out[o++] = s[i++];
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* Interned results: an open-addressed table keyed by the argument's text. */
+typedef struct { char* key; char* val; } tmp_ent_t;
+static tmp_ent_t* g_tmp_tab;
+static size_t     g_tmp_cap, g_tmp_n;
+
+static size_t tmp_hash(const char* s) {
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 1099511628211ull;
+    return (size_t)h;
+}
+static char* tmp_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* d = (char*)malloc(n);
+    if (!d) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
+    return memcpy(d, s, n);
+}
+
+const char* ray_test_tmp(const char* s) {
+    if (!s) return s;
+    if (g_tmp_n * 2 >= g_tmp_cap) {
+        size_t ncap = g_tmp_cap ? g_tmp_cap * 2 : 1024;
+        tmp_ent_t* nt = (tmp_ent_t*)calloc(ncap, sizeof *nt);
+        if (!nt) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
+        for (size_t i = 0; i < g_tmp_cap; i++) {
+            if (!g_tmp_tab[i].key) continue;
+            size_t j = tmp_hash(g_tmp_tab[i].key) & (ncap - 1);
+            while (nt[j].key) j = (j + 1) & (ncap - 1);
+            nt[j] = g_tmp_tab[i];
+        }
+        free(g_tmp_tab); g_tmp_tab = nt; g_tmp_cap = ncap;
+    }
+    size_t j = tmp_hash(s) & (g_tmp_cap - 1);
+    while (g_tmp_tab[j].key) {
+        if (strcmp(g_tmp_tab[j].key, s) == 0) return g_tmp_tab[j].val;
+        j = (j + 1) & (g_tmp_cap - 1);
+    }
+    char* v = tmp_subst(s);
+    g_tmp_tab[j].key = tmp_strdup(s);
+    g_tmp_tab[j].val = v ? v : g_tmp_tab[j].key;
+    g_tmp_n++;
+    return g_tmp_tab[j].val;
+}
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -1024,6 +1112,10 @@ int main(int argc, char** argv) {
     }
 
     if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
+    snprintf(g_tmp_root, sizeof g_tmp_root, "/tmp/rayforce_t.%ld", (long)getpid());
+    (void)ray_test_rm_rf(g_tmp_root);                    /* a dead run's leftovers under a reused pid */
+    if (ray_test_mkdir_p(g_tmp_root) != 0) { fprintf(stderr, "cannot create %s\n", g_tmp_root); return 2; }
+    g_tmp_root_len = strlen(g_tmp_root);
     const char* rfl_root = getenv("RFL_ROOT");
     if (!rfl_root || !*rfl_root) rfl_root = "test/rfl";
     if (rfl_scan(rfl_root) < 0) return 2;
@@ -1086,6 +1178,8 @@ int main(int argc, char** argv) {
         total++;
         run_one(&e, &pass, &fail, &skip);
     }
+
+    (void)ray_test_rm_rf(g_tmp_root);
 
     printf("\n%s=== %d of %d passed (%d skipped, %d failed) ===%s\n",
            fail ? C_RED : (skip ? C_YELLOW : C_GREEN),

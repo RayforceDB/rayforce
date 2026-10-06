@@ -44,8 +44,8 @@
 
 #define PR_TMP "/tmp/rayforce_parted_ragged"
 
-static void pr_setup(void)    { ray_runtime_create(0, NULL); (void)ray_test_rm_rf(PR_TMP); (void)ray_test_mkdir_p(PR_TMP); }
-static void pr_teardown(void) { ray_test_hooks_off(); (void)ray_test_rm_rf(PR_TMP); ray_runtime_destroy(__RUNTIME); }
+static void pr_setup(void)    { ray_runtime_create(0, NULL); (void)ray_test_rm_rf(ray_test_tmp(PR_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(PR_TMP)); }
+static void pr_teardown(void) { ray_test_hooks_off(); (void)ray_test_rm_rf(ray_test_tmp(PR_TMP)); ray_runtime_destroy(__RUNTIME); }
 
 static void drop_out(ray_t* o) { if (!o) return; if (RAY_IS_ERR(o)) ray_error_free(o); else ray_release(o); }
 
@@ -133,8 +133,8 @@ static const char* const queries[] = {
 /* Every query answers on the ragged table exactly as on the reference. */
 static test_result_t ragged_matches(unsigned gen2) {
     char rr[128], rf[128];
-    snprintf(rr, sizeof rr, PR_TMP "/rag_%u", gen2);
-    snprintf(rf, sizeof rf, PR_TMP "/ref_%u", gen2);
+    snprintf(rr, sizeof rr, ray_test_tmp(PR_TMP "/rag_%u"), gen2);
+    snprintf(rf, sizeof rf, ray_test_tmp(PR_TMP "/ref_%u"), gen2);
     TEST_ASSERT_TRUE(write_db(rr, gen2, true));
     TEST_ASSERT_TRUE(write_db(rf, gen2, false));
     ray_t* tr = load_db(rr);
@@ -166,8 +166,8 @@ static test_result_t test_ragged_mixed(void) {
 
 /* The issue's repro: pinned answers, not only reference equality. */
 static test_result_t test_issue_repro(void) {
-    TEST_ASSERT_TRUE(write_db(PR_TMP "/repro", 0, true));
-    ray_t* t = load_db(PR_TMP "/repro");
+    TEST_ASSERT_TRUE(write_db(ray_test_tmp(PR_TMP "/repro"), 0, true));
+    ray_t* t = load_db(ray_test_tmp(PR_TMP "/repro"));
     TEST_ASSERT_NOT_NULL(t);
     bind_t(t);
     ray_t* r = ray_eval_str("(at (select {s: (sum b) from: t}) 's)");
@@ -204,7 +204,7 @@ static test_result_t test_issue_repro(void) {
  * partition's MAPCOMMON row count; ray_parted_nrows is the table's rows. */
 static test_result_t test_segments_full(void) {
     for (unsigned gen2 = 0; gen2 < 8; gen2 += 4) {
-        char root[128]; snprintf(root, sizeof root, PR_TMP "/seg_%u", gen2);
+        char root[128]; snprintf(root, sizeof root, ray_test_tmp(PR_TMP "/seg_%u"), gen2);
         TEST_ASSERT_TRUE(write_db(root, gen2 | 1, true));
         ray_t* t = load_db(root);
         TEST_ASSERT_NOT_NULL(t);
@@ -233,8 +233,8 @@ static test_result_t test_segments_full(void) {
 static test_result_t test_large_ragged(void) {
     for (unsigned gen2 = 0; gen2 < 4; gen2++) {
         char rr[128], rf[128], q[512];
-        snprintf(rr, sizeof rr, PR_TMP "/lrag_%u", gen2);
-        snprintf(rf, sizeof rf, PR_TMP "/lref_%u", gen2);
+        snprintf(rr, sizeof rr, ray_test_tmp(PR_TMP "/lrag_%u"), gen2);
+        snprintf(rf, sizeof rf, ray_test_tmp(PR_TMP "/lref_%u"), gen2);
         for (int k = 0; k < 2; k++) {
             const char* root = k ? rf : rr;
             snprintf(q, sizeof q, "(.db.splayed.set \"%s/2024.01.01/t/\" (table [a b] (list [1 2] [10 20])) {compress: %s})",
@@ -280,8 +280,8 @@ static test_result_t test_large_ragged(void) {
  * (here a missing segment, which ray_read_parted never produces) is refused
  * by the executor, never read past its end. */
 static test_result_t test_short_column_refused(void) {
-    TEST_ASSERT_TRUE(write_db(PR_TMP "/hand", 0, false));
-    ray_t* src = load_db(PR_TMP "/hand");
+    TEST_ASSERT_TRUE(write_db(ray_test_tmp(PR_TMP "/hand"), 0, false));
+    ray_t* src = load_db(ray_test_tmp(PR_TMP "/hand"));
     TEST_ASSERT_NOT_NULL(src);
     ray_t* b = ray_table_col(src, ray_sym_intern("b", 1));
     TEST_ASSERT_TRUE(b && RAY_IS_PARTED(b->type) && b->len == 3);
@@ -379,7 +379,7 @@ static test_result_t test_fill_every_type(void) {
         for (size_t k = 0; k < sizeof types / sizeof types[0]; k++) {
             int8_t ty = types[k];
             char root[160], dir[200], symp[200];
-            snprintf(root, sizeof root, PR_TMP "/ty_%d_%d", gen, (int)ty);
+            snprintf(root, sizeof root, ray_test_tmp(PR_TMP "/ty_%d_%d"), gen, (int)ty);
             snprintf(symp, sizeof symp, "%s/.sym", root);
             for (int p = 0; p < 2; p++) {
                 snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
