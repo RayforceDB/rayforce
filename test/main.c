@@ -51,6 +51,7 @@
 #include "ops/internal.h"
 #include "ops/idxop.h"
 #include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
+#include "store/col.h"      /* ray_store_test_force_compress — equivalence pass */
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -927,6 +928,61 @@ long ray_test_sysconf(int name) {
 }
 #endif
 
+/* ─── Equivalence pass ────────────────────────────────────────────────
+ * Every save in these tests is written as generation 2 (absent compress
+ * behaves as true) and every load reads it back: results must equal the
+ * generation-0 run.  A test that asserts a property of the generation-0
+ * file format itself (bytes, sizes, an auto-built persisted index, its
+ * .idx.info) is listed in equiv_skip with that property; anything else
+ * that differs is a bug in the generation-2 path, never a test change. */
+static const char* const equiv_skip[] = {
+    /* mmod 1: a loaded column (or segment) maps the generation-0 file's
+     * payload in place; a generation-2 column decodes into the heap. */
+    "equiv/store/splay_open_roundtrip",
+    "equiv/store/splay_str_column_roundtrip",
+    "equiv/store/part_open",
+    /* .idx.info of the dict index the save path attaches on its own to a
+     * STR column of 65536 rows or more (generation 2 persists none). */
+    "equiv/rfl/null/sym_str_null_compare",
+    /* .idx.has? of that same auto-attached STR dict index. */
+    "equiv/rfl/store/splayed_str_pool_lifetime",
+    /* rewrites header byte 17 (`order`) of the saved files to 0: the
+     * generation-0 discriminator, which a generation-2 file refuses as
+     * corrupt. */
+    "equiv/rfl/store/col_format_generation",
+    NULL,
+};
+
+static bool equiv_skipped(const char* name) {
+    for (int i = 0; equiv_skip[i]; i++) if (strcmp(equiv_skip[i], name) == 0) return true;
+    return false;
+}
+
+static bool rfl_file_saves(const char* path) {
+    static const char* const forms[] = { ".db.splayed.set", ".csv.splayed", ".csv.parted",
+                                         ".parquet.splayed", ".parquet.parted", NULL };
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    static char buf[1 << 20];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    for (int i = 0; forms[i]; i++) if (strstr(buf, forms[i])) return true;
+    return false;
+}
+
+static const test_entry_t* g_equiv_inner;
+static void equiv_c_setup(void) {
+    if (g_equiv_inner->setup) g_equiv_inner->setup();
+    ray_store_test_force_compress(true);
+}
+static void equiv_c_teardown(void) {
+    ray_store_test_force_compress(false);
+    if (g_equiv_inner->teardown) g_equiv_inner->teardown();
+}
+static void equiv_rfl_setup(void)    { rfl_setup(); ray_store_test_force_compress(true); }
+static void equiv_rfl_teardown(void) { ray_store_test_force_compress(false); rfl_teardown(); }
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     (void)_mkdir("/tmp");   /* tests use "/tmp/..." paths (see test.h) */
@@ -984,6 +1040,33 @@ int main(int argc, char** argv) {
             .setup    = rfl_setup,
             .teardown = rfl_teardown,
         };
+        run_one(&e, &pass, &fail, &skip);
+    }
+
+    /* Equivalence pass: C groups that save and reload tables, then every
+     * .rfl file that saves one. */
+    static const test_entry_t* const equiv_groups[] = {
+        splay_entries, store_entries, partition_exec_entries, link_entries, NULL,
+    };
+    char ename[600];
+    for (int gi = 0; equiv_groups[gi]; gi++) {
+        for (int i = 0; equiv_groups[gi][i].name; i++) {
+            snprintf(ename, sizeof ename, "equiv/%s", equiv_groups[gi][i].name);
+            if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
+            g_equiv_inner = &equiv_groups[gi][i];
+            test_entry_t e = { .name = ename, .func = equiv_groups[gi][i].func,
+                               .setup = equiv_c_setup, .teardown = equiv_c_teardown };
+            total++;
+            run_one(&e, &pass, &fail, &skip);
+        }
+    }
+    for (int i = 0; i < g_rfl_count; i++) {
+        snprintf(ename, sizeof ename, "equiv/%s", g_rfl_names[i]);
+        if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
+        if (!rfl_file_saves(g_rfl_paths[i])) continue;
+        test_entry_t e = { .name = ename, .func = rfl_thunks[i],
+                           .setup = equiv_rfl_setup, .teardown = equiv_rfl_teardown };
+        total++;
         run_one(&e, &pass, &fail, &skip);
     }
 
