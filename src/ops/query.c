@@ -15518,12 +15518,12 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
     int64_t key = ok ? (col->type == RAY_SYM ? v->i64 : upsert_atom_int(v)) : 0;
     ray_release(v);
     if (!ok) return 0;
-    const int64_t* ids = NULL; int64_t n = 0;
+    ray_idx_rows_t ids = { NULL, false }; int64_t n = 0;
     int hit = ray_index_hash_group(col, key, &ids, &n);
     if (hit < 0) return 0;
     int64_t* out = (int64_t*)scratch_alloc(rows_hdr, (size_t)(n > 0 ? n : 1) * sizeof(int64_t));
     if (!out) return 0;
-    if (n > 0) memcpy(out, ids, (size_t)n * sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++) out[i] = ray_idx_rows_at(ids, i);
     *rows = out; *n_out = n;
     return 1;
 }

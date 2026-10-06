@@ -2693,7 +2693,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             if (dom_id < 0) absent = true;
                             else probe = dom_id;
                         }
-                        const int64_t* grows = NULL;
+                        ray_idx_rows_t grows = { NULL, false };
                         int64_t gn = 0;
                         int hit = absent ? 0
                             : ray_index_hash_group(eq_col, probe, &grows, &gn);
@@ -2713,7 +2713,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             bool mono = true;
                             int64_t prevv = INT64_MIN;
                             for (int64_t pp = 0; pp < gn; pp++) {
-                                int64_t v = read_col_i64(rgd, grows[pp], rt, ra);
+                                int64_t v = read_col_i64(rgd, ray_idx_rows_at(grows, pp), rt, ra);
                                 if (v < prevv) { mono = false; break; }
                                 prevv = v;
                             }
@@ -2721,19 +2721,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 int64_t a = 0, b = gn;   /* first pos >= lo */
                                 while (a < b) {
                                     int64_t m = a + (b - a) / 2;
-                                    if (read_col_i64(rgd, grows[m], rt, ra) < lo) a = m + 1;
+                                    if (read_col_i64(rgd, ray_idx_rows_at(grows, m), rt, ra) < lo) a = m + 1;
                                     else b = m;
                                 }
                                 int64_t startp = a;
                                 b = gn;                   /* first pos > hi */
                                 while (a < b) {
                                     int64_t m = a + (b - a) / 2;
-                                    if (read_col_i64(rgd, grows[m], rt, ra) <= hi) a = m + 1;
+                                    if (read_col_i64(rgd, ray_idx_rows_at(grows, m), rt, ra) <= hi) a = m + 1;
                                     else b = m;
                                 }
                                 int64_t nrows = ray_table_nrows(input);
-                                ray_t* sel = ray_index_rowsel_from_ids(
-                                    nrows, grows + startp, a - startp);
+                                ray_t* sel = ray_index_rowsel_from_rows(
+                                    nrows, ray_idx_rows_from(grows, startp), a - startp);
                                 if (sel) {
                                     ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                     g->selection = sel;
