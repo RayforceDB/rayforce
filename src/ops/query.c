@@ -6394,10 +6394,6 @@ static ray_t* try_count_distinct_v2_rewrite(
                         kct_j == RAY_DATE || kct_j == RAY_TIME || kct_j == RAY_TIMESTAMP || kct_j == RAY_F32 || kct_j == RAY_F64 ||
                         kct_j == RAY_STR || kct_j == RAY_GUID || kct_j == RAY_LIST);
         if (!kct_ok_j) return NULL;
-        /* The gates are metadata; the read declines on a failed decode and
-         * the general path re-reads the column and reports it. */
-        K_cols[j] = tbl_col_or_null(tbl, K_syms[j]);
-        if (!K_cols[j]) return NULL;
     }
     ray_col_meta_t xm;
     if (!ray_table_col_meta(tbl, cd_X_sym, &xm)) return NULL;
@@ -6411,11 +6407,19 @@ static ray_t* try_count_distinct_v2_rewrite(
                   xct == RAY_DATE || xct == RAY_TIME || xct == RAY_TIMESTAMP || xct == RAY_F32 || xct == RAY_F64 ||
                   xct == RAY_STR || xct == RAY_GUID || xct == RAY_LIST);
     if (!xct_ok) return NULL;
-    ray_t* X_col = tbl_col_or_null(tbl, cd_X_sym);
-    if (!X_col) return NULL;
 
     if (where_expr && !ray_fused_group_supported(where_expr, tbl))
         return NULL;
+
+    /* Every gate above is metadata, so a declined rewrite decodes nothing.
+     * A read declines on a failed decode; the general path re-reads the
+     * column and reports it. */
+    for (int j = 0; j < n_K; j++) {
+        K_cols[j] = tbl_col_or_null(tbl, K_syms[j]);
+        if (!K_cols[j]) return NULL;
+    }
+    ray_t* X_col = tbl_col_or_null(tbl, cd_X_sym);
+    if (!X_col) return NULL;
 
     /* === Fused single-pass kernel (spec Part B) ===
      * Single narrow key, plain column cd-inner, no WHERE, flat columns:
@@ -8221,6 +8225,17 @@ static ray_t* bind_referenced_columns(ray_t* tbl, ray_t* const* exprs, int64_t n
     }
     scratch_free(refs_hdr);
     return NULL;
+}
+
+/* bind_referenced_columns with bind_all_columns' contract: publishes `tbl`
+ * as the active query table and returns the previous one (the caller
+ * restores it after the matching ray_env_pop_scope); `*err` is the owned
+ * error of a column that failed to materialize, else NULL. */
+static ray_t* bind_referenced_query(ray_t* tbl, ray_t* const* exprs, int64_t n, ray_t** err) {
+    ray_t* prev = g_active_query_table;
+    g_active_query_table = tbl;
+    *err = bind_referenced_columns(tbl, exprs, n);
+    return prev;
 }
 
 /* Build a narrow projection of `src_tbl` containing only the columns in
@@ -12641,7 +12656,7 @@ by_dict_done:
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                     }
                     ray_t* bind_err_ = NULL;
-                    ray_t* _aqt = bind_all_columns(eval_tbl, &bind_err_);
+                    ray_t* _aqt = bind_referenced_query(eval_tbl, &val_expr_item, 1, &bind_err_);
                     ray_t* full_val = bind_err_ ? bind_err_ : ray_eval(val_expr_item);
                     g_active_query_table = _aqt;
                     ray_env_pop_scope();
@@ -15655,7 +15670,7 @@ by_dict_done:
                         scatter_err = ray_error("oom", NULL); break;
                     }
                     ray_t* bind_err_ = NULL;
-                    ray_t* _aqt = bind_all_columns(tbl, &bind_err_);
+                    ray_t* _aqt = bind_referenced_query(tbl, &nonagg_exprs[ni], 1, &bind_err_);
                     ray_t* full_val = bind_err_ ? bind_err_ : ray_eval(nonagg_exprs[ni]);
                     g_active_query_table = _aqt;
                     ray_env_pop_scope();

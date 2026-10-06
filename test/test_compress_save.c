@@ -4570,7 +4570,7 @@ static test_result_t test_query_helpers_failed_decode(void) {
         { "(select {x: (+ a5 1) from: bad})",                       "a5" },
         { "(select {m: (max a6) from: bad})",                       "a6" },  /* metadata declines: execution reads */
         { "(select {s: (sum b) by: (+ a7 1) from: bad})",           "a7" },  /* computed-key plan */
-        { "(select {x: (+ a8 b) by: k from: bad})",                 "a1" },  /* bind_all_columns */
+        { "(select {x: (+ a8 b) by: k from: bad})",                 "a8" },  /* grouped row-wise output */
         { NULL, NULL },
     };
     for (int i = 0; qs[i].q; i++) {
@@ -4590,10 +4590,9 @@ static test_result_t test_query_helpers_failed_decode(void) {
  * failure from the site that read the column: each query below references
  * one damaged column, and its error names that column's file.  The select
  * entry no longer decodes the source, so a query naming a2 failing on a1
- * would mean some site read a column the query never references.  The one
- * exception is the row-wise expression in a grouped select, which binds
- * every column of the table (bind_all_columns) and so fails on the first
- * damaged column in table order. */
+ * would mean some site read a column the query never references (the
+ * row-wise expression in a grouped select included: it binds the columns it
+ * names). */
 static test_result_t test_select_sites_failed_decode(void) {
     static const struct { const char* q; const char* col; } qs[] = {
         { "(select {c: (count (distinct a2)) by: k from: bad})",            "a2" },
@@ -4609,7 +4608,7 @@ static test_result_t test_select_sites_failed_decode(void) {
         { "(select {x: a4 from: bad asc: a4})",                              "a4" },
         { "(select {s: (sum b) by: a5 from: bad})",                          "a5" },
         { "(select {s: (sum a6) l: (last b) by: [k b] from: bad})",          "a6" },
-        { "(select {x: (+ a5 b) by: k from: bad})",                          "a1" },  /* bind_all_columns */
+        { "(select {x: (+ a5 b) by: k from: bad})",                          "a5" },  /* grouped row-wise output */
         { NULL, NULL },
     };
     for (int n = 0; n < 2; n++) {
@@ -5207,6 +5206,32 @@ static test_result_t test_select_parted_prunes_failure(void) {
     PASS();
 }
 
+/* A grouped non-aggregate output over a generation-2 table decodes only the
+ * columns it names (and the key): the full-table evaluation behind the
+ * per-group scatter binds the referenced columns, not every column.  The
+ * DAG scatter (an integer key) and the eval-level group (a STR key) both. */
+static test_result_t test_grouped_nonagg_binds_referenced(void) {
+    TEST_ASSERT_STR_EQ(ev_code("(set t (table ['k 's 'v 'w 'z] (list (% (til 3000) 7) (at (list \"a\" \"b\" \"c\") (% (til 3000) 3)) (til 3000) (* 2 (til 3000)) (* 3 (til 3000)))))"), "");
+    TEST_ASSERT_STR_EQ(ev_code("(.db.splayed.set \"" CS_TMP "/gnb\" t {compress: true})"), "");
+    static const char* const qs[] = {
+        "(select {x: (+ v 1) by: k from: u})",
+        "(select {x: (+ v 1) by: s from: u})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        TEST_ASSERT_STR_EQ(ev_code("(set u (.db.splayed.get \"" CS_TMP "/gnb\"))"), "");   /* nothing cached */
+        ray_enc_counters_reset();
+        ray_t* r = ray_eval_str(qs[i]);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        bool ok = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        TEST_ASSERT_FMT(ok, "%s: answered", qs[i]);
+        TEST_ASSERT_FMT(c.materialized == 2, "%s: materialized %llu, expected 2 (the key and v)",
+                        qs[i], (unsigned long long)c.materialized);
+    }
+    PASS();
+}
+
 /* simplify_agg_idiom: (first (asc c)) -> min is taken only for a null-free
  * column.  Over a parted generation-0 column with a null in one segment the
  * rewrite must decline (it would answer the min of the non-null cells); the
@@ -5449,6 +5474,7 @@ const test_entry_t compress_entries[] = {
     { "compress/exec_start_snapshot",         test_exec_start_snapshot,         cs_setup, cs_teardown },
     { "compress/first_asc_parted_nulls_gen0", test_first_asc_parted_nulls_gen0, cs_setup, cs_teardown },
     { "compress/query_first_asc_parted_nulls_gen0", test_query_first_asc_parted_nulls_gen0, rt_setup, rt_teardown },
+    { "compress/grouped_nonagg_binds_referenced", test_grouped_nonagg_binds_referenced, rt_setup, rt_teardown },
     { "compress/first_asc_parted_nulls_gen2", test_first_asc_parted_nulls_gen2, rt_setup, rt_teardown },
     { "compress/bind_stage",        test_bind_stage,       cs_setup, cs_teardown },
     { "compress/fused_pred_bound",  test_fused_pred_bound, rt_setup, rt_teardown },
