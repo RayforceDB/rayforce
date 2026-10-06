@@ -279,6 +279,14 @@ test-ndebug: $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)
 	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET).test $(NDEBUG_LIB_OBJ) $(NDEBUG_TEST_OBJ) $(LIBS) $(DEBUG_LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
 
+# Multi-GiB generation-2 STR pool limits (spec "Large data").  Needs ~10 GiB
+# of RAM and ~5 GiB of free space under /tmp.
+test-large: CFLAGS = $(DEBUG_CFLAGS)
+test-large: LDFLAGS = $(DEBUG_LDFLAGS)
+test-large: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
+	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test -f large/
+
 # ─── ThreadSanitizer ────────────────────────────────────────────────
 # Data-race detection for the lock-free pool/heap paths, which the
 # default ASan build cannot see (ASan and TSan are mutually exclusive,
@@ -477,7 +485,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist test test-ndebug coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: default debug release lib dist test test-ndebug test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

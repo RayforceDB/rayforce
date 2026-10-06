@@ -167,6 +167,7 @@ extern const test_entry_t encfmt_entries[];
 extern const test_entry_t enconce_entries[];
 extern const test_entry_t enccol_entries[];
 extern const test_entry_t enccorrupt_entries[];
+extern const test_entry_t large_entries[];
 extern const test_entry_t colrange_entries[];
 extern const test_entry_t compress_entries[];
 extern const test_entry_t fsst_entries[];
@@ -215,6 +216,7 @@ static const test_entry_t* const compiled_groups[] = {
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries,
     sort_entries,     splay_entries,    store_entries,    enc_entries,
     encfmt_entries,   enconce_entries,   enccol_entries, enccorrupt_entries,
+    large_entries,
     colrange_entries,
     compress_entries,
     idx_uses_entries,
@@ -961,6 +963,9 @@ int main(int argc, char** argv) {
         const test_entry_t* g = compiled_groups[gi];
         for (int i = 0; g[i].name; i++) {
             if (!name_matches_filter(g[i].name, filter)) continue;
+            /* large/ tests need several GiB of RAM and disk: only on request */
+            if (strncmp(g[i].name, "large/", 6) == 0 &&
+                !(filter && strncmp(filter, "large/", 6) == 0)) continue;
             total++;
             run_one(&g[i], &pass, &fail, &skip);
         }
