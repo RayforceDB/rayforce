@@ -96,11 +96,7 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
         fclose(f); remove(tmp);
         return RAY_ERR_NYI;
     }
-    uint32_t sc = 0;
-    if (vec->type == RAY_SYM) {
-        int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(vec));
-        sc = dc > UINT32_MAX ? UINT32_MAX : (uint32_t)dc;
-    }
+    uint32_t sc = 0;                    /* SYM never reaches here: colw_gen2_range */
     uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     const char* data = (const char*)ray_data(vec);          /* slice-safe */
     ray_t* owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
@@ -196,7 +192,9 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
             if (type == RAY_SYM) {
                 for (int64_t i = 0; i < v.n; i++) {
                     int64_t id = ray_read_sym(v.data, i, RAY_SYM, v.attrs), pos = id;
-                    if (w->target_dom && v.dom != w->target_dom) {
+                    if (w->target_dom && v.dom == w->target_dom) {
+                        if (id < 0 || id >= ray_sym_domain_count(w->target_dom)) { e = RAY_ERR_CORRUPT; break; }
+                    } else if (w->target_dom) {
                         ray_t* str = ray_sym_domain_str(v.dom, id);
                         pos = str ? ray_sym_domain_find(w->target_dom, ray_str_ptr(str), ray_str_len(str)) : -1;
                     } else if (lut) {
@@ -247,6 +245,11 @@ static bool colw_src_gen2_ok(ray_t* obj) {
 ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path) {
     ray_t* obj = w->src.obj;
     if (!obj || !path) return RAY_ERR_TYPE;
+    if (w->index_decision != RAY_COL_IDX_KEEP) return RAY_ERR_NYI;      /* P1: keep only */
+    /* parted sources have no single-file form; a later preflight admitting
+     * RAY_ENCCOL must keep excluding parted kinds */
+    if (RAY_IS_PARTED(obj->type) || (obj->type == RAY_ENCCOL && ray_enccol_is_parted(obj)))
+        return RAY_ERR_NYI;
     if (w->gen == 2 && colw_src_gen2_ok(obj)) {
         if (obj->type != RAY_ENCCOL && obj->type != RAY_SYM)
             return colw_gen2_vec(obj, path, w->durable, w->index_kind);   /* direct pointers */
@@ -268,7 +271,7 @@ static ray_err_t colw_save_gen(ray_t* vec, const char* path, uint8_t gen, bool d
     if (!path) return RAY_ERR_IO;
     ray_col_write_t w; memset(&w, 0, sizeof w);
     ray_t* err = ray_col_src_bind(vec, &w.src);
-    if (err) { ray_error_free(err); return RAY_ERR_TYPE; }
+    if (err) { ray_err_t be = ray_err_from_obj(err); ray_error_free(err); return be; }
     w.gen = gen; w.durable = durable;
     ray_err_t e = ray_col_save_ctx(&w, path);
     ray_col_src_release(&w.src);

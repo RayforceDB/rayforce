@@ -662,8 +662,9 @@ static test_result_t test_matrix_failure_cleanup(void) {
     PASS();
 }
 
-/* Failure injection: each allocation of the range writer, the encoded
- * source's own allocations and a mid-write I/O failure leave no file, no
+/* Failure injection: the range writer's buffers (at least one injection is
+ * asserted to fire), the encoded source's own allocations and a mid-write I/O
+ * failure leave no file, no
  * staging file and no leaked bytes. */
 static test_result_t test_matrix_failure_inject(void) {
     ray_t* v = ray_vec_new(RAY_STR, 70000); v->len = 70000;
@@ -682,11 +683,13 @@ static test_result_t test_matrix_failure_inject(void) {
     TEST_ASSERT_TRUE(enc && !RAY_IS_ERR(enc));
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     bool done = false;
+    int injected = 0;
     for (int nth = 1; nth <= 8 && !done; nth++) {
         ray_col_test_fail_alloc(nth);
         ray_err_t r = save_ctx(enc, CS_TMP "/d", 2, NULL);
         ray_col_test_fail_alloc(0);
         if (r == RAY_OK) { done = true; break; }
+        injected++;
         TEST_ASSERT_EQ_I(r, RAY_ERR_OOM);
         TEST_ASSERT_EQ_I(file_gen(CS_TMP "/d"), 255);
         TEST_ASSERT_EQ_I(file_gen(CS_TMP "/d.tmp"), 255);
@@ -694,30 +697,158 @@ static test_result_t test_matrix_failure_inject(void) {
         TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "nth %d leaked", nth);
     }
     TEST_ASSERT_TRUE(done);
+    TEST_ASSERT_TRUE(injected >= 1);                        /* the writer's buffers were really failed */
+    {   /* encoded -> 2 keeps a STR column byte for byte */
+        size_t na, nb; uint8_t* a = slurp(CS_TMP "/s", &na); uint8_t* b = slurp(CS_TMP "/d", &nb);
+        TEST_ASSERT_TRUE(a && b && na == nb && memcmp(a, b, na) == 0); free(a); free(b);
+    }
     (void)remove(CS_TMP "/d");
+    /* decode-side allocation failures, encoded -> 2 and encoded -> 0 */
+    for (int g = 0; g <= 2; g += 2) {
+        for (int nth = 1; nth <= 16; nth++) {
+            ray_enccol_test_fail_alloc(nth);
+            ray_err_t r = save_ctx(enc, CS_TMP "/g", (uint8_t)g, NULL);
+            ray_enccol_test_fail_alloc(0);
+            if (r == RAY_OK) { (void)remove(CS_TMP "/g"); break; }
+            TEST_ASSERT_EQ_I(r, RAY_ERR_OOM);
+            TEST_ASSERT_EQ_I(file_gen(CS_TMP "/g"), 255);
+            TEST_ASSERT_EQ_I(file_gen(CS_TMP "/g.tmp"), 255);
+            ray_mem_stats(&m1);
+            TEST_ASSERT_TRUE(m1.bytes_allocated == m0.bytes_allocated);
+        }
+    }
+    (void)remove(CS_TMP "/g");
+    ray_mem_stats(&m0);                                     /* the successful encoded -> 0 cached its materialization */
     /* staging path unusable: the open fails, nothing appears */
     TEST_ASSERT_EQ_I(mkdir(CS_TMP "/e.tmp", 0700), 0);
     TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/e", 2, NULL), RAY_ERR_IO);
     TEST_ASSERT_EQ_I(file_gen(CS_TMP "/e"), 255);
     (void)rmdir(CS_TMP "/e.tmp");
     /* I/O failure while writing: file size limit */
-    struct rlimit old, lim; getrlimit(RLIMIT_FSIZE, &old);
-    lim = old; lim.rlim_cur = 65536;
-    void (*oldsig)(int) = signal(SIGXFSZ, SIG_IGN);
-    setrlimit(RLIMIT_FSIZE, &lim);
-    ray_err_t r = save_ctx(enc, CS_TMP "/f", 2, NULL);
-    setrlimit(RLIMIT_FSIZE, &old);
-    signal(SIGXFSZ, oldsig);
-    TEST_ASSERT_EQ_I(r, RAY_ERR_IO);
-    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/f"), 255);
-    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/f.tmp"), 255);
+    struct rlimit old, lim;
+    if (getrlimit(RLIMIT_FSIZE, &old) == 0) {
+        lim = old; lim.rlim_cur = 65536;
+        void (*oldsig)(int) = signal(SIGXFSZ, SIG_IGN);
+        if (setrlimit(RLIMIT_FSIZE, &lim) == 0) {
+            ray_err_t r = save_ctx(enc, CS_TMP "/f", 2, NULL);
+            setrlimit(RLIMIT_FSIZE, &old);
+            TEST_ASSERT_EQ_I(r, RAY_ERR_IO);
+            TEST_ASSERT_EQ_I(file_gen(CS_TMP "/f"), 255);
+            TEST_ASSERT_EQ_I(file_gen(CS_TMP "/f.tmp"), 255);
+        }
+        signal(SIGXFSZ, oldsig);
+    }
     ray_mem_stats(&m1);
     TEST_ASSERT_TRUE(m1.bytes_allocated == m0.bytes_allocated);
     ray_release(enc);
     PASS();
 }
 
+static ray_t* sym_vec_over(struct ray_sym_domain_s* d, const int64_t* ids, int64_t n) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W8, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ray_write_sym(ray_data(v), i, (uint64_t)ids[i], RAY_SYM, RAY_SYM_W8);
+    v->sym_domain = d; ray_sym_domain_retain(d);
+    return v;
+}
+
+static test_result_t test_write_sym_domains(void) {
+    struct ray_sym_domain_s* A = ray_sym_domain_open_or_create(CS_TMP "/A.sym");
+    struct ray_sym_domain_s* C = ray_sym_domain_open_or_create(CS_TMP "/C.sym");
+    TEST_ASSERT_TRUE(A && C);
+    static const char* w[4] = { "", "q", "r", "s" };
+    for (int i = 0; i < 4; i++) ray_sym_domain_intern(A, w[i], strlen(w[i]));
+    for (int i = 0; i < 3; i++) ray_sym_domain_intern(C, w[i], strlen(w[i]));   /* no "s" */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(A, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(C, false), RAY_OK);
+
+    /* an id past the target's count is corrupt in both generations, nothing left behind */
+    int64_t bad[3] = { 1, 2, 9 };
+    ray_t* vb = sym_vec_over(A, bad, 3);
+    for (int g = 0; g <= 2; g += 2) {
+        TEST_ASSERT_EQ_I(save_ctx(vb, CS_TMP "/bad", (uint8_t)g, A), RAY_ERR_CORRUPT);
+        TEST_ASSERT_EQ_I(file_gen(CS_TMP "/bad"), 255);
+        TEST_ASSERT_EQ_I(file_gen(CS_TMP "/bad.tmp"), 255);
+    }
+    ray_release(vb);
+
+    /* absent from the target domain: corrupt, encoded -> 0 leaves no staging file */
+    int64_t ok[6] = { 1, 1, 2, 3, 3, 3 };                   /* sorted */
+    ray_t* v = sym_vec_over(A, ok, 6);
+    v->attrs |= RAY_ATTR_SORTED;
+    TEST_ASSERT_EQ_I(save_ctx(v, CS_TMP "/pa", 2, A), RAY_OK);
+    ray_t* enc = ray_col_mmap_splayed_dom(CS_TMP "/pa", A);
+    TEST_ASSERT_TRUE(enc && !RAY_IS_ERR(enc));
+    for (int g = 0; g <= 2; g += 2) {
+        TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/miss", (uint8_t)g, C), RAY_ERR_CORRUPT);
+        TEST_ASSERT_EQ_I(file_gen(CS_TMP "/miss"), 255);
+        TEST_ASSERT_EQ_I(file_gen(CS_TMP "/miss.tmp"), 255);
+    }
+    /* same domain: byte identical to plain -> 2, SORTED kept, rc = count */
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/same", 2, A), RAY_OK);
+    size_t na, nb; uint8_t* a = slurp(CS_TMP "/pa", &na); uint8_t* b = slurp(CS_TMP "/same", &nb);
+    TEST_ASSERT_TRUE(a && b && na == nb && memcmp(a, b, na) == 0);
+    uint32_t rc; memcpy(&rc, b + 20, 4);
+    TEST_ASSERT_EQ_I(rc, 4); free(a); free(b);
+    ray_t* r = ray_col_load_dom(CS_TMP "/same", A);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && (r->attrs & RAY_ATTR_SORTED));
+    ray_release(r);
+    /* another domain that has every symbol: SORTED dropped */
+    struct ray_sym_domain_s* D = ray_sym_domain_open_or_create(CS_TMP "/D.sym");
+    for (int i = 3; i >= 0; i--) ray_sym_domain_intern(D, w[i], strlen(w[i]));
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(D, false), RAY_OK);
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/other", 2, D), RAY_OK);
+    r = ray_col_load_dom(CS_TMP "/other", D);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && !(r->attrs & RAY_ATTR_SORTED));
+    ray_release(r);
+    /* bare file from a FILE-domain source: process-local ids through the LUT */
+    for (int g = 0; g <= 2; g += 2) {
+        const char* o = g ? CS_TMP "/bare2" : CS_TMP "/bare0";
+        TEST_ASSERT_EQ_I(save_ctx(enc, o, (uint8_t)g, NULL), RAY_OK);
+        r = ray_col_load(o);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        for (int64_t i = 0; i < 6; i++) {
+            ray_t* s0 = ray_sym_vec_cell(v, i); ray_t* s1 = ray_sym_vec_cell(r, i);
+            TEST_ASSERT_TRUE(ray_str_len(s0) == ray_str_len(s1) &&
+                             memcmp(ray_str_ptr(s0), ray_str_ptr(s1), ray_str_len(s0)) == 0);
+        }
+        ray_release(r);
+    }
+    /* P1 keeps the index as is */
+    ray_col_write_t cw; memset(&cw, 0, sizeof cw);
+    TEST_ASSERT_TRUE(ray_col_src_bind(v, &cw.src) == NULL);
+    cw.gen = 2; cw.target_dom = A; cw.index_decision = RAY_COL_IDX_DROP;
+    TEST_ASSERT_EQ_I(ray_col_save_ctx(&cw, CS_TMP "/idx"), RAY_ERR_NYI);
+    ray_col_src_release(&cw.src);
+    ray_release(enc); ray_release(v);
+    ray_sym_domain_release(A); ray_sym_domain_release(C); ray_sym_domain_release(D);
+    PASS();
+}
+
+/* A parted source is refused up front in both generations, undecoded. */
+static test_result_t test_write_parted_refused(void) {
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 0) { write_part("2024.01.01", 2); write_part("2024.01.02", 2); }
+        else           { write_part("2024.01.01", 2); write_part("2024.01.02", 0); }
+        ray_t* t = ray_read_parted(CS_TMP "/pdb", "tb");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_t* a = ray_table_col(t, ray_sym_intern("a", 1));
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+        ray_enc_counters_reset();
+        for (int g = 0; g <= 2; g += 2) {
+            TEST_ASSERT_EQ_I(save_ctx(a, CS_TMP "/pq", (uint8_t)g, NULL), RAY_ERR_NYI);
+            TEST_ASSERT_EQ_I(file_gen(CS_TMP "/pq"), 255);
+            TEST_ASSERT_EQ_I(file_gen(CS_TMP "/pq.tmp"), 255);
+        }
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        ray_release(t);
+    }
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/write_sym_domains",      test_write_sym_domains,      cs_setup, cs_teardown },
+    { "compress/write_parted_refused",   test_write_parted_refused,   rt_setup, rt_teardown },
     { "compress/matrix_failure_inject",  test_matrix_failure_inject,  cs_setup, cs_teardown },
     { "compress/matrix_flat",            test_matrix_flat,            cs_setup, cs_teardown },
     { "compress/matrix_sym_remap",       test_matrix_sym_remap,       cs_setup, cs_teardown },
