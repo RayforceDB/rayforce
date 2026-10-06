@@ -12970,27 +12970,12 @@ by_dict_done:
          * below by materializing only the group key and distinct column when
          * needed; other non-aggs still require a flat table view. */
         if (has_nonagg_needing_flat && table_is_parted) {
-            ray_t* flat_tbl = ray_table_new(ray_table_ncols(tbl));
+            /* Every parted slot, encoded or not, is read and flattened; only
+             * a non-parted encoded column passes into flat_tbl encoded. */
+            ray_t* flat_tbl = query_materialize_parted_table(tbl);
             if (!flat_tbl || RAY_IS_ERR(flat_tbl)) {
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat_tbl ? flat_tbl : ray_error("oom", NULL);
-            }
-            int64_t ncols = ray_table_ncols(tbl);
-            for (int64_t c = 0; c < ncols; c++) {
-                /* the slot: a flat encoded column passes into flat_tbl encoded */
-                ray_t* col = tbl_slot_idx(tbl, c);
-                int64_t name = ray_table_col_name(tbl, c);
-                ray_t* flat_col = query_materialize_parted_col(col);
-                if (!flat_col || RAY_IS_ERR(flat_col)) {
-                    ray_release(flat_tbl); ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat_col ? flat_col : ray_error("oom", NULL);
-                }
-                flat_tbl = ray_table_add_col(flat_tbl, name, flat_col);
-                ray_release(flat_col);
-                if (!flat_tbl || RAY_IS_ERR(flat_tbl)) {
-                    ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat_tbl ? flat_tbl : ray_error("oom", NULL);
-                }
             }
             ray_graph_free(g);
             ray_release(tbl);
