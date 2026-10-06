@@ -8,7 +8,7 @@ Rayforce uses a custom memory subsystem — no calls to `malloc` or `free` ever 
 - **Slab cache** — Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.
 - **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated. Note that `ray_retain`/`ray_release`/`ray_cow` are no-ops on `RAY_ERROR` objects, so an error block must be reclaimed with `ray_error_free()` rather than `ray_release()`.
 - **Arena allocator** — For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an `RAY_ATTR_ARENA` flag that makes retain/release no-ops. The entire arena is freed at once when work completes.
-- **Out-of-core spill** — There is no enforced memory ceiling. The heap tracks how much anonymous (RAM) memory it has committed; once an allocation would push that past the **anon watermark** (by default total physical RAM, or the container's cgroup memory limit when that is smaller — `docker run --memory`, systemd `MemoryMax=`; `-m SIZE` overrides it), it is backed by a preallocated disk file instead of anonymous RAM. File-backed pages are always reclaimable to disk, so they can't trigger the OOM killer — the working set spills and the query completes (slowly) rather than being killed. This never rejects work. Total physical RAM is detected at startup for this threshold and for reporting (see `.sys.info` → `total-mem`).
+- **Out-of-core spill** — There is no enforced memory ceiling. The heap tracks how much anonymous (RAM) memory it has committed; once an allocation would push that past the **anon watermark** (by default total physical RAM, or the container's cgroup memory limit when that is smaller — `docker run --memory`, systemd `MemoryMax=` — less a quarter of it, at least 3 GiB and at most half, left to the page cache; `-m SIZE` overrides it), it is backed by a preallocated disk file instead of anonymous RAM. File-backed pages are always reclaimable to disk, so they can't trigger the OOM killer — the working set spills and the query completes (slowly) rather than being killed. This never rejects work. Total physical RAM is detected at startup for this threshold and for reporting (see `.sys.info` → `total-mem`).
 
 For a deep dive into the allocator internals, see [Memory Model](../architecture/memory.md).
 
@@ -234,12 +234,14 @@ disk-full error.
 has committed, and when a new pool or large allocation would push that past the
 watermark — by default the smaller of total physical RAM and the container's
 cgroup memory limit (cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`,
-including limits set on a parent slice), or the `-m SIZE` flag when given — it
+including limits set on a parent slice), less a quarter of it (at least 3 GiB,
+at most half) left to the page cache, or the `-m SIZE` flag when given — it
 backs that allocation with a disk spill file **instead of** anonymous RAM. This never rejects work; it just routes
 the overflow to disk so it spills rather than getting OOM-killed. A query like
 `(til 10000000000)` (a 74 GiB vector) on a smaller machine now spills to disk and
 completes (slowly) instead of being terminated. The progress bar's `used / total`
-figure shows the footprint approaching total RAM — the point where spill begins.
+figure shows the footprint approaching total RAM; spill begins below it, at the
+watermark.
 
 ### Checking total RAM
 
@@ -256,24 +258,28 @@ total-mem | 16777216000
 
 ### Gauging headroom
 
-To see how close a workload is to spilling to disk, compare the live object
-footprint (`bytes-allocated + direct-bytes` from `(.sys.mem)`) against
-`total-mem` from `(.sys.info)`:
+To see how close a workload is to spilling to disk, compare the anonymous
+footprint the heap has committed (`anon-committed` from `(.sys.mem)`: pools,
+large blocks and the off-heap tables such as the symbol arenas) against the
+spill threshold (`anon-watermark`):
 
 ```lisp
-;; Live footprint as a percentage of physical RAM
+;; Committed RAM as a percentage of the spill threshold
 (set stats (.sys.mem))
-(set info (.sys.info))
-(* 100.0 (/ (+ (get stats 'bytes-allocated) (get stats 'direct-bytes))
-            (get info 'total-mem)))
+(* 100.0 (/ (get stats 'anon-committed) (get stats 'anon-watermark)))
 ```
 
 ```text
 29.4
 ```
 
-This shows 29.4% of physical RAM is in use — plenty of headroom before the heap
-begins spilling to disk.
+This shows the workload uses 29.4% of the RAM it may take before new memory
+starts going to spill files.
+
+A spill file is mapped shared.  An embedding process that `fork()`s and keeps
+running rayforce code in the child shares the spilled blocks with the parent
+instead of getting its own copy, so the child must not write them; run the
+child through `exec` (as `.sys.exec` does) or start it before anything spills.
 
 ## 9. Practical Patterns
 

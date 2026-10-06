@@ -335,17 +335,22 @@ void ray_mem_trace_end(ray_mem_trace_t* out) {
     atomic_store_explicit(&g_mem_trace_active, 0, memory_order_release);
 }
 
-/* Anonymous (RAM-resident) pool + direct bytes we have committed.  File-backed
- * spill mappings are NOT counted (they can be evicted to disk, never OOM-kill).
- * When a new anon mapping would push this past the watermark, it is routed to a
- * spill file instead — this never rejects work, it just picks disk over RAM. */
+/* Anonymous (RAM-resident) pool, direct and sys bytes we have committed.
+ * File-backed spill mappings are NOT counted (they can be evicted to disk,
+ * never OOM-kill).  When a new anon mapping would push this past the
+ * watermark, it is routed to a spill file instead — or, when no spill file can
+ * be made, to RAM anyway: this never rejects work, it just picks disk over
+ * RAM.  A spill mapping is MAP_SHARED: after fork() parent and child share
+ * it instead of each having a copy, so a child that keeps running rayforce
+ * code must not write blocks the parent spilled. */
 static _Atomic(int64_t) g_anon_committed = 0;
-static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to ray_sys_ram_limit() */
+static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = the default (heap_anon_watermark) */
 static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
 
 /* Commit `bytes` of anonymous (RAM-resident) footprint and advance the peak
- * high-water.  Called only from the two anon-commit sites; file-backed spill
- * mappings never call this (they must not count toward the RAM watermark). */
+ * high-water.  Called from the anon-commit sites (pools, direct blocks, sys
+ * blocks); file-backed spill mappings never call this (they must not count
+ * toward the RAM watermark). */
 static void heap_anon_commit(int64_t bytes) {
     int64_t nv = atomic_fetch_add_explicit(&g_anon_committed, bytes,
                                             memory_order_relaxed) + bytes;
@@ -359,12 +364,22 @@ static void heap_anon_commit(int64_t bytes) {
 }
 
 /* Threshold above which anon allocations spill to disk.  Default keeps our
- * anon footprint within the RAM the process may actually use — physical RAM,
- * or the container's cgroup limit when that is smaller (#688); swap + page
- * cache stay as headroom. */
+ * anon footprint below the RAM the process may actually use — physical RAM,
+ * or the container's cgroup limit when that is smaller (#688) — by a quarter
+ * of it, at least 3 GiB and at most half.  That room is for the page cache:
+ * the mapped inputs, the dirty pages of the files being written and those of
+ * the spill files themselves.  Without it spilling would start only once
+ * nothing was left, and under a cgroup the page cache is charged to the same
+ * limit (#712). */
 static int64_t heap_anon_watermark(void) {
     int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
-    return wm > 0 ? wm : ray_sys_ram_limit();
+    if (wm > 0) return wm;
+    int64_t lim = ray_sys_ram_limit();
+    if (lim <= 0) return lim;
+    int64_t room = lim / 4;
+    if (room < (INT64_C(3) << 30)) room = INT64_C(3) << 30;
+    if (room > lim / 2) room = lim / 2;
+    return lim - room;
 }
 /* True if committing `bytes` more anonymous RAM would cross the watermark. */
 static bool heap_anon_would_exceed(size_t bytes) {
@@ -382,6 +397,10 @@ int64_t ray_heap_anon_peak(void) {
 }
 int64_t ray_heap_anon_watermark(void) {
     return heap_anon_watermark();
+}
+int64_t ray_heap_mem_budget(void) {
+    int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
+    return wm > 0 ? wm : ray_sys_ram_limit();
 }
 void ray_heap_set_anon_watermark(int64_t bytes) {
     atomic_store_explicit(&g_anon_watermark, bytes < 0 ? 0 : bytes,
@@ -589,13 +608,16 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
      * would push our RAM footprint past the watermark — a file-backed pool
      * can't be OOM-killed.  Otherwise take the fast anon path (and still fall
      * back to a spill file below if the kernel refuses the mapping). */
-    if (!heap_anon_would_exceed(pool_size))
+    bool over = heap_anon_would_exceed(pool_size);
+    if (!over)
         mem = ray_vm_alloc_aligned(pool_size, pool_size);
 
 #if !RAY_HEAP_FILE_SPILL
+    /* No spill files here: past the watermark the pool comes from RAM. */
+    if (!mem && over) mem = ray_vm_alloc_aligned(pool_size, pool_size);
     if (!mem) return false;
 #else
-    if (!mem) {
+    if (!mem) do {
         /* Anonymous mmap refused — usually means RAM+swap can't satisfy
          * pool_size right now.  Fall back to file-backed mmap: create a
          * tempfile in h->swap_path, reserve `pool_size` bytes of disk
@@ -608,7 +630,7 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
         size_t plen = strlen(h->swap_path);
         size_t need = plen + 64;  /* room for "rayheap_<pid>_<heap>_<cnt>.dat" */
         swap_path = (char*)ray_sys_alloc(need);
-        if (!swap_path) return false;
+        if (!swap_path) break;
         snprintf(swap_path, need, "%srayheap_%d_%u_%llu.dat",
                  h->swap_path, (int)getpid(), (unsigned)h->id,
                  (unsigned long long)cnt);
@@ -616,7 +638,8 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
         swap_fd = open(swap_path, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (swap_fd < 0) {
             ray_sys_free(swap_path);
-            return false;
+            swap_path = NULL;
+            break;
         }
 
         /* Reserve EXACTLY pool_size bytes of disk blocks AND grow the
@@ -630,7 +653,9 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
             close(swap_fd);
             unlink(swap_path);
             ray_sys_free(swap_path);
-            return false;
+            swap_fd = -1;
+            swap_path = NULL;
+            break;
         }
 
         /* Reserve 2*pool_size of address space anonymously to guarantee
@@ -646,7 +671,9 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
             close(swap_fd);
             unlink(swap_path);
             ray_sys_free(swap_path);
-            return false;
+            swap_fd = -1;
+            swap_path = NULL;
+            break;
         }
 
         uintptr_t addr    = (uintptr_t)anon;
@@ -669,7 +696,9 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
             close(swap_fd);
             unlink(swap_path);
             ray_sys_free(swap_path);
-            return false;
+            swap_fd = -1;
+            swap_path = NULL;
+            break;
         }
 
         /* Count the swap-backed pool as committed working set — it is a RAM
@@ -688,7 +717,11 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
         unlink(swap_path);
         ray_sys_free(swap_path);
         swap_path = NULL;
-    }
+    } while (0);
+    /* No spill file (no writable spill directory, disk full): RAM past the
+     * watermark rather than failing the allocation. */
+    if (!mem && over) mem = ray_vm_alloc_aligned(pool_size, pool_size);
+    if (!mem) return false;
 #endif /* RAY_HEAP_FILE_SPILL */
 
     /* Enable transparent huge pages on anon pools (Linux).  Self-aligned
@@ -1294,9 +1327,9 @@ static inline void direct_cache_unlock(void) {
 }
 
 static size_t direct_cache_budget(void) {
-    int64_t wm = heap_anon_watermark();
+    int64_t wm = ray_heap_mem_budget();
     size_t b = (wm > 0) ? (size_t)wm / 16 : 0;
-    /* 1/16 of the watermark is the sole bound (1GB on a 16GB box, ~8GB
+    /* 1/16 of the memory budget is the sole bound (1GB on a 16GB box, ~8GB
      * on 128GB).  Earlier absolute caps (512MB, then 4GB) each turned
      * out to exclude exactly the blocks whose kernel re-zeroing cost the
      * most at the next data scale: a 100M-row group query cycles several
@@ -1426,6 +1459,9 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
             base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
         if (!base) {
             base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
+            /* No spill file (no writable spill directory, disk full): RAM
+             * past the watermark rather than failing the allocation. */
+            if (!base && force_file) base = ray_vm_alloc(map_size);
             if (!base) return NULL;
         }
         if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
@@ -2071,6 +2107,97 @@ void ray_mem_stats(ray_mem_stats_t* out) {
  * popped once per thread lifetime, never on an allocation path. */
 static ray_heap_t* g_heap_idle = NULL;
 
+/* The spill directory, as ray_heap_init resolves it (see there). */
+static void heap_swap_dir(char* out, size_t cap) {
+    const char* env = getenv("RAY_HEAP_SWAP");
+    if (!(env && *env)) env = getenv("TMPDIR");
+    const char* sp = (env && *env && strlen(env) < cap - 16) ? env : "/tmp";
+    size_t sp_len = strlen(sp);
+    memcpy(out, sp, sp_len);
+    out[sp_len] = '\0';
+    if (sp_len > 0 && out[sp_len - 1] != '/' && sp_len < cap - 1) {
+        out[sp_len] = '/';
+        out[sp_len + 1] = '\0';
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Off-heap system blocks
+ *
+ * ray_sys_alloc serves storage that lives outside the per-thread heaps: the
+ * string arenas of the symbol table and the column domains, their hash
+ * tables, index-build scratch.  It counts toward the anonymous watermark like
+ * pools and direct blocks, so -m (or the default) bounds it too, and a block
+ * of RAY_SYS_SPILL_MIN bytes or more that would cross the watermark is mapped
+ * over a spill file instead (#712), or taken from RAM when no spill file can be
+ * made.  The file is unlinked and its descriptor closed at once — the mapping
+ * keeps it — so spilled blocks hold no fds.
+ * -------------------------------------------------------------------------- */
+#define RAY_SYS_SPILL_MIN ((size_t)1 << 20)
+
+#if RAY_HEAP_FILE_SPILL
+static void* heap_sys_map_file(size_t size) {
+    static _Atomic uint64_t sys_swap_counter = 0;
+    char path[320];
+    heap_swap_dir(path, 256);
+    size_t plen = strlen(path);
+    snprintf(path + plen, sizeof(path) - plen, "raysys_%d_%llu.dat", (int)getpid(),
+             (unsigned long long)atomic_fetch_add_explicit(&sys_swap_counter, 1,
+                                                           memory_order_relaxed));
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return NULL;
+    void* p = NULL;
+    if (heap_preallocate(fd, 0, (off_t)size) == 0) {
+        p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) p = NULL;
+    }
+    unlink(path);
+    close(fd);
+    if (p) ray_sys_track_add((int64_t)size);   /* committed working set, as a spilled pool */
+    return p;
+}
+#endif
+
+void* ray_heap_sys_map(size_t size, bool* spilled) {
+    *spilled = false;
+    void* p = NULL;
+#if RAY_HEAP_FILE_SPILL
+    bool big = size >= RAY_SYS_SPILL_MIN;
+    bool to_file = big && heap_anon_would_exceed(size);
+    if (to_file) {
+        direct_cache_drain();
+        to_file = heap_anon_would_exceed(size);
+    }
+    if (!to_file) p = ray_vm_alloc(size);
+    if (!p && big) {
+        p = heap_sys_map_file(size);
+        if (p) { *spilled = true; return p; }
+    }
+    /* No spill file (no writable spill directory, disk full): RAM rather
+     * than failing — callers of ray_sys_alloc grow core tables with it. */
+    if (!p && to_file) p = ray_vm_alloc(size);
+#else
+    p = ray_vm_alloc(size);
+#endif
+    if (p) heap_anon_commit((int64_t)size);
+    return p;
+}
+
+void ray_heap_sys_unmap(void* p, size_t size, bool spilled) {
+    if (!p) return;
+#if RAY_HEAP_FILE_SPILL
+    if (spilled) {
+        munmap(p, size);
+        ray_sys_track_sub((int64_t)size);
+        return;
+    }
+#else
+    (void)spilled;
+#endif
+    atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)size, memory_order_relaxed);
+    ray_vm_free(p, size);
+}
+
 void ray_heap_init(void) {
     if (ray_tl_heap) return;
 
@@ -2150,16 +2277,7 @@ void ray_heap_init(void) {
      * always ensured so heap_add_pool can concatenate `<swap_path><filename>`
      * unconditionally.  An empty / over-long value is rejected in favour of
      * the next option. */
-    const char* env = getenv("RAY_HEAP_SWAP");
-    if (!(env && *env)) env = getenv("TMPDIR");
-    const char* sp = (env && *env && strlen(env) < sizeof(h->swap_path) - 16) ? env : "/tmp";
-    size_t sp_len = strlen(sp);
-    memcpy(h->swap_path, sp, sp_len);
-    h->swap_path[sp_len] = '\0';
-    if (sp_len > 0 && h->swap_path[sp_len - 1] != '/' && sp_len < sizeof(h->swap_path) - 1) {
-        h->swap_path[sp_len] = '/';
-        h->swap_path[sp_len + 1] = '\0';
-    }
+    heap_swap_dir(h->swap_path, sizeof(h->swap_path));
 
     ray_tl_heap = h;
 }

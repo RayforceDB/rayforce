@@ -586,8 +586,8 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
     /* Memory admission gate: peak footprint is ~CDF_BYTES_PER_ROW bytes/row
      * (see the constant's derivation above and the phase-3 KNOWN MEMORY
      * BOUND comment).  Decline rather than risk the OOM killer when that
-     * estimate would exceed a quarter of the heap's anon watermark (default:
-     * total physical RAM) — leaving headroom for the rest of the query
+     * estimate would exceed a quarter of the heap's memory budget (default:
+     * physical RAM or the cgroup limit) — leaving headroom for the rest of the query
      * (source columns, other operators, concurrent work) sharing the same
      * budget.  No new env knob: this rides the existing watermark, which
      * ray_heap_set_anon_watermark already lets tests/embedders override.
@@ -596,7 +596,7 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
      * tests calling ray_cd_fused directly, without the app's runtime/RAM
      * probe) sees ray_sys_total_ram() == 0, which must not read as a
      * zero-byte budget. */
-    int64_t wm = ray_heap_anon_watermark();
+    int64_t wm = ray_heap_mem_budget();
     if (wm > 0 && (double)nrows * CDF_BYTES_PER_ROW > (double)wm / 4.0)
         return NULL;
 

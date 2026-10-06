@@ -41,6 +41,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "mem/sys.h"     /* ray_sys_alloc: off-heap blocks and the watermark */
 #include "core/platform.h"
 #include "core/pool.h"
 
@@ -2618,6 +2619,52 @@ static test_result_t test_direct_cache_replaces_old_blocks(void) {
     PASS();
 }
 
+/* Allocations off the per-thread heaps (ray_sys_alloc: the symbol and domain
+ * string arenas, index-build scratch) count toward the anonymous watermark,
+ * and a large one that would cross it is backed by a spill file (#712): it
+ * reads zero and holds data like any other block, without adding to the
+ * anonymous footprint.  Small ones stay anonymous so tiny blocks never get a
+ * file each. */
+static test_result_t test_sys_alloc_watermark(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    const size_t big = 8u * 1024 * 1024;
+    ray_heap_direct_cache_drain();
+    int64_t base = ray_heap_anon_committed();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(base + INT64_C(64) * 1024 * 1024);
+
+    uint64_t* a = (uint64_t*)ray_sys_alloc(big);
+    int64_t with_a = ray_heap_anon_committed();
+    bool counted = a && with_a == base + (int64_t)big + 4096;
+    char* s = (char*)ray_sys_alloc(100);
+    bool small_counted = s && ray_heap_anon_committed() == with_a + 4096;
+    ray_sys_free(s);
+
+    ray_heap_set_anon_watermark(with_a + 1024 * 1024);
+    uint64_t* b = (uint64_t*)ray_sys_alloc(big);
+    bool spilled = b && ray_heap_anon_committed() == with_a;
+    bool zero = b != NULL;
+    if (b) {
+        for (size_t i = 0; i < big / 8; i += 512) zero = zero && b[i] == 0;
+        b[big / 8 - 1] = 7;
+    }
+    char* t = (char*)ray_sys_alloc(100);
+    bool small_anon = t && ray_heap_anon_committed() == with_a + 4096;
+    ray_sys_free(t);
+    b = (uint64_t*)ray_sys_realloc(b, 2 * big);
+    bool kept = b && b[big / 8 - 1] == 7 && ray_heap_anon_committed() == with_a;
+    ray_sys_free(b);
+    ray_sys_free(a);
+    bool back = ray_heap_anon_committed() == base;
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_TRUE(counted && small_counted);
+    TEST_ASSERT_TRUE(spilled && zero && small_anon);
+    TEST_ASSERT_TRUE(kept && back);
+    PASS();
+}
+
 static void direct_cache_churn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     _Atomic(int)* errors = raw;
@@ -3091,6 +3138,7 @@ const test_entry_t heap_entries[] = {
     { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
     { "heap/direct_cache_many_entries", test_direct_cache_many_entries, heap_setup, heap_teardown },
     { "heap/direct_cache_replaces_old", test_direct_cache_replaces_old_blocks, heap_setup, heap_teardown },
+    { "heap/sys_alloc_watermark", test_sys_alloc_watermark, heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },

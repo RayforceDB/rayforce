@@ -329,21 +329,28 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
     return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
 }
 
-/* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
- * committed by the heap.  Allocations that would push this past the anon
- * watermark (default: physical RAM, or the container's cgroup memory limit
- * when that is smaller — ray_sys_ram_limit) are backed by a disk spill file
+/* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
+ * committed.  Allocations that would push this past the anon watermark
+ * (default: ray_sys_ram_limit — physical RAM, or the container's cgroup
+ * memory limit when that is smaller — less a quarter of it, at least 3 GiB
+ * and at most half, left to the page cache) are backed by a disk spill file
  * instead — file-backed pages are always reclaimable, so they cannot trigger
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
  * restores the default); intended for diagnostics and tests. */
 int64_t ray_heap_anon_committed(void);
 /* High-water mark of the anon-committed footprint since process start — the
- * peak RAM an operator actually demanded (pools + direct; excludes spill). */
+ * peak RAM an operator actually demanded (pools, direct and sys blocks;
+ * excludes spill). */
 int64_t ray_heap_anon_peak(void);
 /* Current anon watermark in bytes (the effective spill threshold; resolves 0
- * to ray_sys_ram_limit()). */
+ * to the default, ray_sys_ram_limit() less the page-cache room). */
 int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
+/* The RAM a query may plan for (sizing gates, cache budgets): the watermark
+ * when one was set (-m), else ray_sys_ram_limit().  Unlike the default
+ * watermark it does not leave the page-cache room, which decides where new
+ * memory goes, not how much a query may hold. */
+int64_t ray_heap_mem_budget(void);
 /* Release every block held by the direct-allocation reuse cache back to
  * the kernel (their committed-RAM accounting drops with them).  The cache
  * self-drains under watermark pressure; this is for tests and explicit
