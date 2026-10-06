@@ -4590,19 +4590,21 @@ static test_result_t test_query_helpers_gen2_equal(void) {
 }
 
 /* Damage the descriptor of a generation-2 file's first vector after the load
- * checks pass: the column loads and fails to materialize. */
-static bool qb_damage(const char* path, int64_t n) {
+ * checks pass: the column loads and fails to materialize.  The byte is a
+ * reserved descriptor field, so writing 0 back restores the file. */
+static bool qb_set_reserved(const char* path, int64_t n, int byte) {
     FILE* f = fopen(path, "r+b");
     if (!f) return false;
     int64_t n_chunks = (n + 65535) / 65536;
-    bool ok = fseek(f, (long)(96 + 64 * n_chunks + 6), SEEK_SET) == 0 && fputc(1, f) != EOF;
+    bool ok = fseek(f, (long)(96 + 64 * n_chunks + 6), SEEK_SET) == 0 && fputc(byte, f) != EOF;
     return fclose(f) == 0 && ok;
 }
+static bool qb_damage(const char* path, int64_t n) { return qb_set_reserved(path, n, 1); }
 
 /* `n` rows of b (5 i) and k (i mod 7), generation 0, then, generation 2:
  * a1 .. a9 (3 i), kb (BOOL, i mod 3 == 0), ks (STR, 5 values), kd (i mod 5),
  * kh (i mod 60000), kf (F64, (i mod 9) / 2).  `damage` NULL damages a1 .. a9
- * (each loads intact and fails to materialize), else only the named column:
+ * (each loads intact and fails to materialize), "" none, else only the named column:
  * a query's error names the one column the failing site read.  NULL when a
  * file cannot be written or damaged. */
 static ray_t* qb_table(int64_t n, const char* damage) {
@@ -4758,18 +4760,26 @@ static test_result_t test_select_routes_failed_decode(void) {
         { "(select {from: bad by: ks where: (< b 0)})",                      "ks", true  },
         { NULL, NULL, false },
     };
+    /* The table is written once per size, intact; each query damages its one
+     * column in place, loads a fresh table, and restores the byte after. */
     for (int n = 0; n < 2; n++) {
         int64_t rows = n ? 200000 : 3000;
+        ray_t* t0 = qb_table(rows, "");
+        TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0));
+        ray_release(t0);
         for (int i = 0; qs[i].q; i++) {
-            ray_t* t = qb_table(rows, qs[i].col);
-            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-            ray_env_set(ray_sym_intern("bad", 3), t);
-            ray_release(t);
             char path[128], what[200];
             snprintf(path, sizeof path, "%s/qb/%s", CS_TMP, qs[i].col);
             snprintf(what, sizeof what, "%s, %s damaged (n=%lld)", qs[i].q, qs[i].col, (long long)rows);
+            TEST_ASSERT_TRUE(qb_damage(path, rows));
+            ray_t* t = ray_read_splayed(CS_TMP "/qb", NULL);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_env_set(ray_sym_intern("bad", 3), t);
+            ray_release(t);
             ray_error_clear();
             ray_t* r = ray_eval_str(qs[i].q);
+            ray_env_set(ray_sym_intern("bad", 3), NULL);
+            TEST_ASSERT_TRUE(qb_set_reserved(path, rows, 0));
             if (qs[i].ok) {
                 bool fine = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 0;
                 if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
