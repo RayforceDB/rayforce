@@ -4819,10 +4819,12 @@ static test_result_t test_select_parted_prunes_fetch(void) {
 
 /* Pruned answers (or errors) equal the unpruned scan's, on generation 0 and
  * 2, for every shape and prunable predicate (nothing surviving included);
- * generation 0 decodes nothing.  This includes the whole scan's known
- * oddities, which the stand-in partition reproduces: a group by the key
- * over a where dropping the first partition answers an empty group for it,
- * and a distinct of the key over an all-pass source is a `type` error. */
+ * generation 0 decodes nothing.  On these even partitions that includes the
+ * whole scan's oddities (an empty first-partition group under by: on the
+ * key, a `type` error for a distinct of the key).  On uneven partitions the
+ * whole scan's spurious empty first-partition group under by: on the key
+ * no longer appears when pruning applies (see prunes_by_key_uneven); it
+ * still appears when nothing survives, as on dev, and for unpruned shapes. */
 static test_result_t test_select_parted_prunes_same(void) {
     ray_t* t0 = pdb_make(CS_TMP "/sq0", 0, false);
     ray_t* t2 = pdb_make(CS_TMP "/sq2", 7, false);
@@ -4956,6 +4958,55 @@ static test_result_t test_select_parted_prunes_none(void) {
     TEST_ASSERT_TRUE(group);
     TEST_ASSERT_TRUE(by_b);
     TEST_ASSERT_TRUE(topk);
+    PASS();
+}
+
+/* Uneven partitions (50/2000/3/4000/10 rows): a group by the key over a where
+ * selecting the third partition answers the single correct group, on
+ * generation 0 and 2.  The whole scan (dev) also answers an empty group for
+ * 2024.01.01 here (its first partition has no survivor and fewer rows pass
+ * than it holds); pruning drops that partition, and the spurious group with
+ * it. */
+static test_result_t test_select_parted_prunes_by_key_uneven(void) {
+    static const int64_t rows[5] = { 50, 2000, 3, 4000, 10 };
+    ray_t* t[2] = { NULL, NULL };
+    for (int g = 0; g < 2; g++) {
+        const char* root = g ? CS_TMP "/bu2" : CS_TMP "/bu0";
+        for (int p = 0; p < 5; p++) {
+            char dir[256]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+            ray_t* x = ray_table_new(2);
+            ray_t* a = i64_col(rows[p], 1);
+            ray_t* b = i64_col(rows[p], 7);
+            x = ray_table_add_col(x, ray_sym_intern("a", 1), a);
+            x = ray_table_add_col(x, ray_sym_intern("b", 1), b);
+            ray_release(a); ray_release(b);
+            TEST_ASSERT_TRUE(ray_splay_save_mode(x, dir, NULL, g ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF) == RAY_OK);
+            ray_release(x);
+        }
+        t[g] = ray_read_parted(root, "t");
+        TEST_ASSERT_TRUE(t[g] && !RAY_IS_ERR(t[g]));
+    }
+    static const struct { const char* q; int ng; int32_t d[2]; int64_t c[2]; } qs[] = {
+        { "(select {c: (count a) by: date from: t where: (== date 2024.01.03)})",               1, { 8768, 0 }, { 3, 0 } },
+        { "(select {c: (count a) by: date from: t where: (in date [2024.01.03 2024.01.05])})",  2, { 8768, 8770 }, { 3, 10 } },
+        { "(select {c: (count a) by: date from: t where: (and (== date 2024.01.03) (> a 0))})", 1, { 8768, 0 }, { 2, 0 } },
+        { NULL, 0, { 0, 0 }, { 0, 0 } },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        ray_t* r[2];
+        for (int g = 0; g < 2; g++) { sp_bind(t[g]); r[g] = ray_eval_str(qs[i].q); }
+        bool same = sp_same(r[0], r[1]);
+        ray_t* d = r[0] && !RAY_IS_ERR(r[0]) && r[0]->type == RAY_TABLE ? ray_table_get_col(r[0], ray_sym_intern("date", 4)) : NULL;
+        ray_t* c = r[0] && !RAY_IS_ERR(r[0]) && r[0]->type == RAY_TABLE ? ray_table_get_col(r[0], ray_sym_intern("c", 1)) : NULL;
+        bool ok = d && c && d->type == RAY_DATE && d->len == qs[i].ng && c->len == qs[i].ng;
+        for (int k = 0; ok && k < qs[i].ng; k++)
+            ok = ((const int32_t*)ray_data(d))[k] == qs[i].d[k] && ((const int64_t*)ray_data(c))[k] == qs[i].c[k];
+        drop_out(r[0]); drop_out(r[1]);
+        TEST_ASSERT_FMT(same, "%s: generations agree", qs[i].q);
+        TEST_ASSERT_FMT(ok, "%s: the surviving groups only", qs[i].q);
+    }
+    sp_bind(NULL);
+    ray_release(t[0]); ray_release(t[1]);
     PASS();
 }
 
@@ -5151,6 +5202,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_mixed",   test_select_parted_prunes_mixed,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_shadow",  test_select_parted_prunes_shadow,  rt_setup, rt_teardown },
     { "compress/select_parted_prunes_none",    test_select_parted_prunes_none,    rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_by_key_uneven", test_select_parted_prunes_by_key_uneven, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
