@@ -116,6 +116,9 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
 
 /* Trim a finished group result to the emit filter's kept superset (row order
  * preserved; consumes `result`).  Used by routes that emit every group. */
+/* True when the armed emit filter names this group node's slot (the
+ * operation it names, count when unset): the one routing and trim test. */
+bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext);
 ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
                             const uint16_t* agg_ops, const ray_group_emit_filter_t* ef);
 

@@ -2811,7 +2811,7 @@ typedef struct {
     int64_t  ncols;
 } dl_rowset_t;
 
-static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
+static bool dl_rowset_init(dl_program_t* prog, dl_rowset_t* rs, ray_t* ref) {
     int64_t ncols = ray_table_ncols(ref);
     int64_t nrows = ray_table_nrows(ref);
     rs->ncols = ncols;
@@ -2820,7 +2820,7 @@ static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_col_idx(ref, c);
         if (col && RAY_IS_ERR(col)) {
-            ray_error_free(col);
+            dl_keep_err(prog, col);         /* the rule's marking is skipped */
             ray_free_raw(rs->ref_cols);
             rs->ref_cols = NULL;
             return false;
@@ -3045,7 +3045,7 @@ static void dl_build_provenance(dl_program_t* prog) {
              * hashset over `derived` once and probe per row of rel —
              * was O(nrows × derived_rows × ncols), now O(nrows + derived_rows). */
             dl_rowset_t rs;
-            if (dl_rowset_init(&rs, derived)) {
+            if (dl_rowset_init(prog, &rs, derived)) {
                 int64_t ncols_t = ray_table_ncols(rel->table);
                 int64_t** tbl_cols = (int64_t**)ray_calloc_raw(sizeof(int64_t*) * (size_t)ncols_t);
                 /* every column must be readable: the probe reads each

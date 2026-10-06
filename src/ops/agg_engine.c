@@ -6196,7 +6196,7 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
  * exists and holds the operation the filter names (count when unset).  The
  * filter stays armed while the matched select's whole `from:` evaluates, so
  * grouped selects nested inside see it too; for them this is false. */
-static bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext) {
+bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext) {
     return ef && ef->enabled && ext && ef->agg_index < ext->n_aggs &&
            (ef->agg_op ? ef->agg_op : OP_COUNT) == ext->agg_ops[ef->agg_index];
 }

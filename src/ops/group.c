@@ -17295,8 +17295,7 @@ batch_fail:
 
     if (merge_tbl) ray_release(merge_tbl);
     ret = result;
-    if (ef_trim.enabled && ef_trim.agg_index < n_aggs &&
-        (ef_trim.agg_op ? ef_trim.agg_op : OP_COUNT) == ext->agg_ops[ef_trim.agg_index])
+    if (agg_emit_filter_targets(&ef_trim, ext))
         ret = agg_emit_filter_trim(ret, n_keys, n_aggs, ext->agg_ops, &ef_trim);
 
 pp_cleanup:

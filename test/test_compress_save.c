@@ -2939,7 +2939,11 @@ static test_result_t test_expr_compile_bound(void) {
                 src_set = false;
                 static const char* const cn[3] = { "a", "b", "v" };
                 for (int k = 0; k < 3 && !src_set; k++) {
+                    uint32_t nb = ray_graph_binds_count(gr);
                     ray_col_src_t* bs = ray_graph_bind_col(gr, t, ray_sym_intern(cn[k], 1), &err);
+                    /* a column this expression scans is already bound: a hit */
+                    bool scanned = strstr(srcs[s], cn[k]) != NULL;
+                    if (scanned) TEST_ASSERT_EQ_I(ray_graph_binds_count(gr), nb);
                     TEST_ASSERT_NULL(err);
                     ray_t* plain = NULL;
                     if (!bs || !bs->obj || ray_col_src_plain(bs, &plain) || !plain) continue;
