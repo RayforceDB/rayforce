@@ -5309,6 +5309,33 @@ static test_result_t test_select_parted_bydict_streams(void) {
     PASS();
 }
 
+/* The parted group's cardinality estimate over an I64 key whose first
+ * partition holds a null (INT64_MIN) beside positive values: the span is
+ * taken in u64 and capped, never a signed overflow (UBSan), and the grouped
+ * answer equals the flat one, in both generations. */
+static test_result_t test_parted_group_null_i64_estimate(void) {
+    static const char* const gens[] = { "true", "false" };
+    for (int g = 0; g < 2; g++) {
+        char q[900];
+        snprintf(q, sizeof q,
+                 "(do (set P (table [n v] (list (concat [0N 0N] (%% (til 398) 3)) (as 'F64 (til 400)))))"
+                 " (.db.splayed.set \"%s/pn%d/1/t/\" P {compress: %s})"
+                 " (.db.splayed.set \"%s/pn%d/2/t/\" P {compress: %s})"
+                 " (set t (.db.parted.get \"%s/pn%d/\" 't))"
+                 " (set F (table [n v] (list (concat (at P 'n) (at P 'n)) (concat (at P 'v) (at P 'v)))))"
+                 " (list (select {s: (sum v) c: (count v) from: t by: n asc: n})"
+                 "       (select {s: (sum v) c: (count v) from: F by: n asc: n})))",
+                 CS_TMP, g, gens[g], CS_TMP, g, gens[g], CS_TMP, g);
+        ray_t* r = ray_eval_str(q);
+        bool ok = r && !RAY_IS_ERR(r) && r->type == RAY_LIST && r->len == 2 &&
+                  ray_table_nrows(((ray_t**)ray_data(r))[0]) == 4 &&
+                  sp_same(((ray_t**)ray_data(r))[0], ((ray_t**)ray_data(r))[1]);
+        drop_out(r);
+        TEST_ASSERT_FMT(ok, "compress %s: parted group equals flat", gens[g]);
+    }
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
     { "compress/select_planning_no_materialize", test_select_planning_no_materialize, rt_setup, rt_teardown },
     { "compress/stream_matches_resident", test_stream_matches_resident, cs_setup, cs_teardown },
@@ -5428,5 +5455,6 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { "compress/select_parted_bydict_streams", test_select_parted_bydict_streams, rt_setup, rt_teardown },
+    { "compress/parted_group_null_i64_estimate", test_parted_group_null_i64_estimate, rt_setup, rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

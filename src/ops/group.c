@@ -9939,6 +9939,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 int64_t card = cd->i64;
                 ray_release(cd);
                 if (card < 1) card = 1;
+                if (card > rows_per_part / est_groups) { est_groups = rows_per_part; break; }
                 est_groups *= card;
                 if (est_groups > rows_per_part) { est_groups = rows_per_part; break; }
                 continue;
@@ -9986,7 +9987,10 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     if (v[r] < lo) lo = v[r];
                     if (v[r] > hi) hi = v[r];
                 }
-                card = hi - lo + 1;
+                /* The span in u64: a null (INT64_MIN) beside a positive
+                 * value overflows the signed difference. */
+                uint64_t span = (uint64_t)hi - (uint64_t)lo;
+                card = span >= (uint64_t)rows_per_part ? rows_per_part : (int64_t)span + 1;
             } else if (bt == RAY_I32) {
                 const int32_t* v = (const int32_t*)ray_data(seg0);
                 int32_t lo = v[0], hi = v[0];
@@ -9994,10 +9998,11 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     if (v[r] < lo) lo = v[r];
                     if (v[r] > hi) hi = v[r];
                 }
-                card = (int64_t)(hi - lo + 1);
+                card = (int64_t)hi - (int64_t)lo + 1;
             } else {
                 card = seg0->len;
             }
+            if (card > rows_per_part / est_groups) { est_groups = rows_per_part; break; }
             est_groups *= card;
             if (est_groups > rows_per_part) { est_groups = rows_per_part; break; }
         }
