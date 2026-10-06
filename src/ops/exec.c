@@ -2108,6 +2108,9 @@ void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save) {
     g->memo_hdr = save->hdr; g->memo_table = save->table;
 }
 
+/* Row filters being executed on this thread, the outermost first. */
+static RAY_TLS int tl_filter_depth;
+
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -2159,8 +2162,21 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
         }
     }
 
+    /* A row filter (not a HAVING over a group); an `and` runs as a chain of
+     * them, each executing the next one in as its input. */
+    bool row_filter = false;
+    if (op->opcode == OP_FILTER) {
+        ray_op_t* fc = op_child(g, op, 0);
+        row_filter = !fc || fc->opcode != OP_GROUP;
+    }
+    if (row_filter) tl_filter_depth++;
     ray_t* _prof_result = exec_node_inner(g, op);
     tl_exec_depth--;
+    /* The outermost filter of a chain has the final selection: the
+     * select's columns held back for it can be requested now. */
+    if (row_filter && --tl_filter_depth == 0 && _prof_result && !RAY_IS_ERR(_prof_result))
+        ray_select_scan_filtered(g->selection,
+            _prof_result->type == RAY_TABLE ? ray_table_nrows(_prof_result) : 0);
 
     /* First consumer of a shared node: keep a ref for the others (a lazy
      * value is not kept — materialising it is the consumer's business). */

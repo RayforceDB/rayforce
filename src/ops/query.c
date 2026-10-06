@@ -9017,9 +9017,15 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
  * select registers the mapped columns its clauses name, and the zone-index
  * verdict of its filter, so every dispatch it runs, fast paths included,
  * keeps the rows just ahead of its workers requested from storage.
+ *
+ * A filter the zones say nothing about may keep a handful of rows; the
+ * columns only read after it are then held back (`defer`) until its
+ * selection is known (ray_select_scan_filtered): read whole when the
+ * selected rows land on most of their pages, else only those pages.
  * -------------------------------------------------------------------------- */
 typedef struct {
     ray_pool_scan_t scan;
+    ray_pool_scan_t defer;     /* read after the filter, requested once it ran */
     ray_t**         args;      /* the select this registration belongs to */
     ray_t*          gate_hdr;  /* scratch block behind scan.gate */
     bool            filled;
@@ -9146,26 +9152,117 @@ static void select_scan_register(ray_t** args, ray_t* dict, ray_t* tbl, ray_t* w
     select_scan_t* ss = t_select_scan;
     if (!ss || ss->filled || ss->args != args) return;
     ss->filled = true;
-    int64_t syms[64];
-    int n = 0;
+    int64_t syms[64], wsyms[64];
+    int n = 0, nw = 0;
     int64_t from_id = dict_key_id(dict, "from");
+    int64_t where_id = dict_key_id(dict, "where");
     DICT_VIEW_DECL(pv);
     DICT_VIEW_OPEN(dict, pv);
     if (DICT_VIEW_OVERFLOW(pv)) { DICT_VIEW_CLOSE(pv); return; }
     for (int64_t i = 0; i + 1 < pv_n; i += 2) {
         if (pv[i]->i64 == from_id) continue;
-        n = collect_syms(pv[i + 1], syms, 64, n);
+        if (pv[i]->i64 == where_id) nw = collect_syms(pv[i + 1], wsyms, 64, nw);
+        else n = collect_syms(pv[i + 1], syms, 64, n);
     }
     DICT_VIEW_CLOSE(pv);
+    for (int i = 0; i < nw; i++)
+        exec_scan_add_col(&ss->scan, ray_table_get_col(tbl, wsyms[i]));
+    int64_t nrows = ray_table_nrows(tbl);
+    bool rows_set = ss->scan.rows >= 0;
+    if (!rows_set) ss->scan.rows = nrows;   /* the gate is sized by it */
+    if (where) scan_gate_where(ss, where, tbl, 0);
+    bool defer = where && !ss->scan.gate;
     for (int i = 0; i < n; i++)
-        exec_scan_add_col(&ss->scan, ray_table_get_col(tbl, syms[i]));
-    if (ss->scan.n && where) scan_gate_where(ss, where, tbl, 0);
+        exec_scan_add_col(defer ? &ss->defer : &ss->scan, ray_table_get_col(tbl, syms[i]));
+    /* A column the filter also reads is requested with it. */
+    for (uint32_t k = 0; k < ss->defer.n; ) {
+        bool dup = false;
+        for (uint32_t j = 0; j < ss->scan.n; j++) dup |= ss->scan.base[j] == ss->defer.base[k];
+        if (!dup) { k++; continue; }
+        ss->defer.base[k] = ss->defer.base[ss->defer.n - 1];
+        ss->defer.esz[k] = ss->defer.esz[ss->defer.n - 1];
+        ss->defer.n--;
+    }
+    /* No mapped column at all: leave ray_execute its own registration. */
+    if (!ss->scan.n && !ss->defer.n && !rows_set) ss->scan.rows = -1;
     ray_pool_scan_set(&ss->scan);
+}
+
+/* Rows of selection `sel` that select_scan_want_selected requests page by
+ * page at most; a larger selection is read whole. */
+#define SELECT_SCAN_SPARSE_MAX 65536
+
+/* Add the pages of bytes [a, b) to the pending range [*lo, *hi), sending the
+ * pending range first when the new pages do not touch it. */
+static void select_scan_want_range(uintptr_t a, uintptr_t b, uintptr_t* lo, uintptr_t* hi) {
+    const uintptr_t pg = 4096;
+    uintptr_t plo = a & ~(pg - 1), phi = (b + pg - 1) & ~(pg - 1);
+    if (*hi && plo <= *hi) {
+        if (phi > *hi) *hi = phi;
+        return;
+    }
+    if (*hi) ray_vm_advise_willneed((void*)*lo, *hi - *lo);
+    *lo = plo;
+    *hi = phi;
+}
+
+/* Request the pages of the column at `base` (elements of `esz` bytes) that
+ * the rows selected by `sel` fall on, adjacent pages as one range. */
+static void select_scan_want_selected(const uint8_t* base, size_t esz, int64_t rows,
+                                      ray_t* sel) {
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    const uint8_t* fl = ray_rowsel_flags(sel);
+    const uint32_t* off = ray_rowsel_offsets(sel);
+    const uint16_t* idx = ray_rowsel_idx(sel);
+    uintptr_t lo = 0, hi = 0;
+    for (uint32_t s = 0; s < m->n_segs; s++) {
+        int64_t r0 = (int64_t)s * RAY_MORSEL_ELEMS;
+        if (fl[s] == RAY_SEL_ALL) {
+            int64_t r1 = r0 + RAY_MORSEL_ELEMS < rows ? r0 + RAY_MORSEL_ELEMS : rows;
+            select_scan_want_range((uintptr_t)(base + (size_t)r0 * esz),
+                                   (uintptr_t)(base + (size_t)r1 * esz), &lo, &hi);
+        } else if (fl[s] == RAY_SEL_MIX) {
+            for (uint32_t i = off[s]; i < off[s + 1]; i++) {
+                uintptr_t a = (uintptr_t)(base + (size_t)(r0 + idx[i]) * esz);
+                select_scan_want_range(a, a + esz, &lo, &hi);
+            }
+        }
+    }
+    if (hi) ray_vm_advise_willneed((void*)lo, hi - lo);
+}
+
+/* The filter of the running select has produced `sel` (NULL when it kept
+ * every row, or returned a compacted table of `kept` rows).  Request each
+ * column held back for it: whole when there is at least a quarter of a
+ * selected row per page of it, or too many rows to request one by one;
+ * else only the pages the selected rows fall on. */
+void ray_select_scan_filtered(ray_t* sel, int64_t kept) {
+    select_scan_t* ss = t_select_scan;
+    if (!ss || !ss->defer.n) return;
+    ray_pool_scan_t* d = &ss->defer;
+    int64_t rows = d->rows;
+    /* A compacted result was gathered already: nothing left to read. */
+    if (!sel && kept < rows) { d->n = 0; return; }
+    int64_t pass = sel ? ray_rowsel_meta(sel)->total_pass : rows;
+    for (uint32_t k = 0; k < d->n; k++) {
+        double per_page = (double)pass / (double)rows * (4096.0 / d->esz[k]);
+        if (pass >= rows || per_page >= 0.25 || pass > SELECT_SCAN_SPARSE_MAX) {
+            if (ss->scan.n < RAY_POOL_SCAN_MAX) {
+                ss->scan.base[ss->scan.n] = d->base[k];
+                ss->scan.esz[ss->scan.n] = d->esz[k];
+                ss->scan.n++;
+            }
+        } else if (pass > 0) {
+            select_scan_want_selected(d->base[k], d->esz[k], rows, sel);
+        }
+    }
+    d->n = 0;
 }
 
 ray_t* ray_select(ray_t** args, int64_t n) {
     select_scan_t ss = { .args = args };
     exec_scan_init(&ss.scan);
+    exec_scan_init(&ss.defer);
     select_scan_t* prev_ss = t_select_scan;
     const ray_pool_scan_t* prev_scan = ray_pool_scan_get();
     t_select_scan = &ss;

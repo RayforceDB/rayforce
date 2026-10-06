@@ -2261,6 +2261,65 @@ static test_result_t test_select_read_ahead_mapped(void) {
     (void)ray_test_rm_rf(PFS_ROOT);
     PASS();
 }
+
+/* A filter the zone indexes say nothing about (an expression) may keep a
+ * handful of rows.  The columns read only after it are then requested for
+ * the pages those rows fall on, not whole — judged on the final selection
+ * of an `and`, not its first conjunct; when it keeps most rows they are
+ * read whole.  Results match the in-memory table either way. */
+static test_result_t test_select_read_ahead_sparse_filter(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 400000))"
+        "(set pfs_t (table [u w s] (list (% (* pfs_i 7919) 1000003) (* pfs_i 3)"
+        " (as 'SYM (map (fn [k] (format \"s%\" (% k 10000))) pfs_i)))))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("w")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+    static const struct { const char* q; bool whole; } cases[] = {
+        { "(select {from:X s:(sum w) c:(count w) where:(== (% u 100000) 42)})", false },
+        /* an `and` runs as a chain of filters, the cheap dense one first */
+        { "(select {from:X s:(sum w) c:(count w) where:(and (like s \"s1234\") (!= s \"s1\"))})", false },
+        { "(select {from:X s:(sum w) c:(count w) where:(> (% u 10) 2)})", true },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char qm[256], qt[256];
+        const char* x = strstr(cases[c].q, "X");
+        snprintf(qm, sizeof qm, "%.*spfs_m%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        snprintf(qt, sizeof qt, "%.*spfs_t%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        TEST_ASSERT_TRUE(pfs_evict());
+        ray_t* got = ray_eval_str(qm);
+        bool resident = pfs_col_resident("w");
+        ray_t* want = ray_eval_str(qt);
+        bool ok = got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want);
+        if (ok) {
+            ray_t* fg = ray_fmt(got, 0);
+            ray_t* fw = ray_fmt(want, 0);
+            ok = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                 memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fw)) == 0;
+            if (fg) ray_release(fg);
+            if (fw) ray_release(fw);
+        }
+        if (got) { if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got); }
+        if (want) { if (RAY_IS_ERR(want)) ray_error_free(want); else ray_release(want); }
+        TEST_ASSERT_FMT(ok, "case %zu: mapped result differs from the in-memory one", c);
+        TEST_ASSERT_FMT(resident == cases[c].whole,
+                        "case %zu: column w %s after the query", c,
+                        resident ? "read whole" : "not read whole");
+    }
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
 #endif
 
 const test_entry_t agg_contract_entries[] = {
@@ -2300,6 +2359,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/cancelled_group", test_cancelled_group, contract_setup, contract_teardown },
 #if defined(__linux__)
     { "agg_contract/select_read_ahead_mapped", test_select_read_ahead_mapped, contract_setup, contract_teardown },
+    { "agg_contract/select_read_ahead_sparse_filter", test_select_read_ahead_sparse_filter, contract_setup, contract_teardown },
 #endif
     { NULL, NULL, NULL, NULL },
 };
