@@ -1267,8 +1267,8 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
      * A generation-2 file records its zone in the enc header. */
     if (gens && gens[c] == 2) return;
     {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!col || RAY_IS_ERR(col)) return;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return; }   /* best effort: no index */
 
         /* Explicit SYM index: a SYM column carrying a grouped (hash) index in
          * memory gets a hash index persisted inline — regardless of length (the
@@ -1397,7 +1397,8 @@ typedef struct {
 } splay_index_ctx_t;
 
 static void splay_persist_deferred(splay_index_ctx_t* x, int64_t c) {
-    ray_t* col = ray_table_get_col_idx(x->tbl, c);
+    ray_t* col = ray_table_col_idx(x->tbl, c);
+    if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }   /* best effort: no index append */
     ray_t* nstr = ray_sym_str(ray_table_col_name(x->tbl, c));
     char path[1100];
     int n = (nstr && !RAY_IS_ERR(nstr))
@@ -1409,7 +1410,7 @@ static void splay_persist_deferred(splay_index_ctx_t* x, int64_t c) {
         if (have_path)
             (void)ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
         ray_release(hi);
-    } else if (have_path) {
+    } else if (have_path && col) {
         (void)ray_col_append_index(path, ray_index_payload(x->deferred[c]), col->len, col->type);
     }
     ray_release(x->deferred[c]);
@@ -1457,7 +1458,8 @@ static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t*
          * writes of all deferred columns together. */
         for (int64_t c = 0; c < nc; c++) {
             if (!deferred[c] || (gens && gens[c] == 2)) continue;
-            ray_t* hi = ray_idx_hash_fn(ray_table_get_col_idx(tbl, c));
+            ray_t* hc = ray_table_col_idx(tbl, c);
+            ray_t* hi = (hc && !RAY_IS_ERR(hc)) ? ray_idx_hash_fn(hc) : hc;
             if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) ctx.hashed[c] = hi;
             else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
         }

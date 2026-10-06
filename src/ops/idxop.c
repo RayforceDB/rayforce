@@ -27,6 +27,7 @@
 #include "mem/cow.h"
 #include "vec/vec.h"
 #include "table/table.h"
+#include "store/enccol.h"
 #include "table/sym.h"
 #include "lang/eval.h"
 #include "ops/ops.h"
@@ -93,7 +94,10 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
     ray_t* vals = ray_vec_new(RAY_I64, nc);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        /* Never decode: an encoded column has no attached index until it is
+         * materialized, and the materialization carries any index it built. */
+        ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
+        ray_t* col = enc ? ray_enccol_of(enc)->decoded : ray_table_col_idx(tbl, c);
         if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) continue;
         for (uint32_t s = 0; s < ns; s++)
             if (snap[s].key == col->index) {

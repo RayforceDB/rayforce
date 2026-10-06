@@ -446,3 +446,13 @@ ray_t* ray_table_schema(ray_t* tbl) {
     if (!tbl_is_table(tbl)) return NULL;
     return tbl_schema(tbl);
 }
+
+ray_t* ray_table_cols_inplace(ray_t* tbl) {
+    if (!tbl_is_table(tbl)) return NULL;
+    ray_t* cols = tbl_cols(tbl);
+    if (!cols || RAY_IS_ERR(cols)) return NULL;
+    ray_t** cv = (ray_t**)ray_data(cols);
+    for (int64_t i = 0; i < cols->len; i++)
+        if (cv[i] && cv[i]->type == RAY_ENCCOL) return NULL;
+    return cols;
+}

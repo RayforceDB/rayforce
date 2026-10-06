@@ -3634,7 +3634,14 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     (void)wid; (void)end;
     csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
     if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
-    ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
+    ray_t* col = ray_table_col_idx(a->tbl, (int64_t)start);
+    if (col && RAY_IS_ERR(col)) {
+        ray_err_t ce = ray_err_from_obj(col);
+        ray_error_free(col);
+        ray_err_t ok = RAY_OK;
+        atomic_compare_exchange_strong_explicit(&a->err, &ok, ce, memory_order_relaxed, memory_order_relaxed);
+        return;
+    }
     int64_t tt0 = a->col_ns ? ray_profile_now_ns() : 0;
     ray_err_t e = ray_col_stream_append(&a->writers[start], col);
     if (a->col_ns) a->col_ns[start] += ray_profile_now_ns() - tt0;
@@ -4263,7 +4270,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
         /* Match Parquet parted output: build numeric zones while the bounded
          * decoded partition is resident, before serialization. */
         for (int64_t c = 0; c < ray_table_ncols(tbl); c++) {
-            ray_t* col = ray_table_get_col_idx(tbl,c);
+            ray_t* col = ray_table_col_idx(tbl,c);
+            if (col && RAY_IS_ERR(col)) { err = ray_err_from_obj(col); ray_error_free(col); break; }
             if (col->type == RAY_STR || col->type == RAY_SYM || col->type == RAY_F32 || col->type == RAY_GUID) continue;
             ray_retain(col);
             ray_t* indexed = col->len >= 65536 ? ray_index_attach_chunk_zone(&col,16) : ray_index_attach_zone(&col);
@@ -4712,8 +4720,18 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
         return RAY_ERR_OOM;
     }
     csv_col_info_t* ci = (csv_col_info_t*)ray_data(col_info_block);
-    for (int64_t c = 0; c < ncols; c++)
-        csv_col_info_init(&ci[c], ray_table_get_col_idx(table, c));
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_col_idx(table, c);
+        if (col && RAY_IS_ERR(col)) {
+            ray_err_t ce = ray_err_from_obj(col);
+            ray_error_free(col);
+            ray_free(col_info_block);
+            fclose(fp);
+            remove(tmp_path);
+            return ce;
+        }
+        csv_col_info_init(&ci[c], col);
+    }
 
     /* Header row: column names */
     for (int64_t c = 0; c < ncols; c++) {

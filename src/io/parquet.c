@@ -1381,7 +1381,8 @@ static ray_pool_t* pq_group_pool(ray_parquet_t* r) {
 static ray_t* pq_append_table(ray_t** vectors, ray_t* batch, int64_t ncols) {
     int64_t nr = ray_table_nrows(batch);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(batch,c);
+        ray_t* src = ray_table_col_idx(batch,c);
+        if (src && RAY_IS_ERR(src)) return src;
         if (src->type == RAY_STR) {
             for (int64_t i = 0; i < nr; i++) {
                 size_t n; const char* p = ray_str_vec_get(src,i,&n);
@@ -1612,7 +1613,8 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
         if (n < 0 || (size_t)n >= sizeof(path)) { e = RAY_ERR_RANGE; break; }
         /* a decoded batch: plain columns, SYM over the import domain; the
          * leaf is fresh, so there is no destination to inherit from */
-        ray_t* col = ray_table_get_col_idx(batch,c);
+        ray_t* col = ray_table_col_idx(batch,c);
+        if (col && RAY_IS_ERR(col)) { e = ray_err_from_obj(col); ray_error_free(col); break; }
         ray_col_write_t cw; memset(&cw,0,sizeof cw);
         ray_t* berr = ray_col_src_bind(col,&cw.src);
         if (berr) { e = ray_err_from_obj(berr); ray_error_free(berr); break; }
@@ -1642,7 +1644,8 @@ static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* ta
         if (!batch || RAY_IS_ERR(batch)) return batch;
         /* Native zones are built while the bounded decoded batch is resident. */
         if (durable) for (int64_t c = 0; c < r->ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(batch,c);
+            ray_t* col = ray_table_col_idx(batch,c);
+            if (col && RAY_IS_ERR(col)) { ray_release(batch); return col; }
             if (col->type == RAY_STR || col->type == RAY_SYM || col->type == RAY_F32) continue;
             ray_retain(col);
             ray_t* e = col->len >= PQ_BATCH ? ray_index_attach_chunk_zone(&col,16) : ray_index_attach_zone(&col);
@@ -1849,7 +1852,9 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
             ray_t* batch = ray_parquet_next(r);
             if (!batch) break;
             if (RAY_IS_ERR(batch)) { w->errors[task] = batch; break; }
-            ray_err_t err = ray_col_stream_append(&local,ray_table_get_col_idx(batch,0));
+            ray_t* bcol = ray_table_col_idx(batch,0);
+            if (bcol && RAY_IS_ERR(bcol)) { w->errors[task] = bcol; ray_release(batch); break; }
+            ray_err_t err = ray_col_stream_append(&local,bcol);
             row += ray_table_nrows(batch); ray_release(batch);
             if (err != RAY_OK) { w->errors[task] = ray_error(ray_err_code_str(err),"parquet: direct column write failed"); break; }
         }
@@ -1965,7 +1970,9 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
         ray_t* batch = ray_read_splayed(leaf,NULL);
         if (!batch || RAY_IS_ERR(batch)) { err = batch ? batch : ray_error("oom",NULL); goto done; }
         for (int64_t c = 0; c < r->ncols; c++) {
-            e = ray_col_stream_append(&writers[c],ray_table_get_col_idx(batch,c));
+            ray_t* bcol = ray_table_col_idx(batch,c);
+            if (bcol && RAY_IS_ERR(bcol)) { e = ray_err_from_obj(bcol); ray_error_free(bcol); break; }
+            e = ray_col_stream_append(&writers[c],bcol);
             if (e != RAY_OK) break;
         }
         ray_release(batch);
@@ -2252,12 +2259,19 @@ static bool pq_predicates(ray_parquet_t* r, ray_t* where, pq_predicate* predicat
     if (pos == r->noutput) return false;
     predicates[(*n)++] = (pq_predicate){pos,lo,hi}; return true;
 }
+/* A decoded batch is built in memory by the reader and never holds an encoded
+ * slot, so the accessor cannot fail; the error branch keeps the contract. */
+static ray_t* pq_batch_col(ray_t* batch, int64_t c) {
+    ray_t* v = ray_table_col_idx(batch,c);
+    if (v && RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    return v;
+}
 static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int64_t n) {
     int64_t rows = ray_table_nrows(batch), dst = 0, nc = ray_table_ncols(batch);
     for (int64_t i = 0; i < rows; i++) {
         bool keep = true;
         for (int64_t p = 0; p < n && keep; p++) {
-            ray_t* v = ray_table_get_col_idx(batch,predicates[p].pos);
+            ray_t* v = pq_batch_col(batch,predicates[p].pos);
             int64_t x = v->type == RAY_I16 ? ((int16_t*)ray_data(v))[i] :
                 v->type == RAY_I32 ? ((int32_t*)ray_data(v))[i] : ((int64_t*)ray_data(v))[i];
             keep = ray_vec_is_null(v,i) ? predicates[p].lo == INT64_MIN :
@@ -2265,12 +2279,12 @@ static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int
         }
         if (!keep) continue;
         if (dst != i) for (int64_t c = 0; c < nc; c++) {
-            ray_t* v = ray_table_get_col_idx(batch,c); size_t size = ray_sym_elem_size(v->type,v->attrs);
+            ray_t* v = pq_batch_col(batch,c); size_t size = ray_sym_elem_size(v->type,v->attrs);
             memcpy((uint8_t*)ray_data(v)+(size_t)dst*size,(uint8_t*)ray_data(v)+(size_t)i*size,size);
         }
         dst++;
     }
-    for (int64_t c = 0; c < nc; c++) ray_table_get_col_idx(batch,c)->len = dst;
+    for (int64_t c = 0; c < nc; c++) pq_batch_col(batch,c)->len = dst;
 }
 static ray_t* pq_accumulate(ray_parquet_t* r, pq_aggregate* aggs, int64_t n,
                             const uint32_t* gids, const pq_predicate* predicates, int64_t np) {
@@ -2280,7 +2294,8 @@ static ray_t* pq_accumulate(ray_parquet_t* r, pq_aggregate* aggs, int64_t n,
         if (np) pq_filter_integers(batch,predicates,np);
         int64_t rows = ray_table_nrows(batch);
         for (int64_t a = 0; a < n; a++) {
-            ray_t* v = ray_table_get_col_idx(batch,aggs[a].pos);
+            ray_t* v = ray_table_col_idx(batch,aggs[a].pos);
+            if (v && RAY_IS_ERR(v)) { ray_release(batch); return v; }
             ray_valid_t valid = {ray_data(v),v->type,ray_vec_may_have_nulls(v)};
             aggs[a].kernel->update_batch(aggs[a].state,aggs[a].kernel->state_size,gids,ray_data(v),&valid,rows,NULL);
         }

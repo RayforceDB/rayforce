@@ -69,4 +69,9 @@ ray_t*  ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx);
 /* Null presence from metadata; never materializes. */
 bool    ray_table_col_has_nulls(ray_t* tbl, int64_t name_id);
 
+/* The table's column list for an in-place value write, or NULL when the
+ * table is not a table or any slot holds a RAY_ENCCOL (callers then take
+ * their copy route).  Ownership checks (rc) stay with the caller. */
+ray_t*  ray_table_cols_inplace(ray_t* tbl);
+
 #endif /* RAY_TABLE_H */

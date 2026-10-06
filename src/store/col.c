@@ -190,6 +190,7 @@ static bool is_serializable_type(int8_t t) {
 static ray_err_t col_preflight_recursive(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return RAY_ERR_TYPE;
     int8_t type = obj->type;
+    if (type == RAY_ENCCOL) return RAY_OK;
     if (type < 0 || is_serializable_type(type)) return RAY_OK;
 
     if (type == RAY_LIST) {
@@ -204,8 +205,10 @@ static ray_err_t col_preflight_recursive(ray_t* obj) {
     if (type == RAY_TABLE) {
         int64_t ncols = ray_table_ncols(obj);
         for (int64_t c = 0; c < ncols; c++) {
-            ray_err_t err = col_preflight_recursive(
-                ray_table_get_col_idx(obj, c));
+            ray_t* sc = ray_table_get_col_enc_idx(obj, c);
+            if (!sc) sc = ray_table_col_idx(obj, c);
+            ray_err_t err = col_preflight_recursive(sc);
+            if (sc && RAY_IS_ERR(sc)) ray_error_free(sc);
             if (err != RAY_OK) return err;
         }
         return RAY_OK;
@@ -429,7 +432,12 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
         for (int64_t c = 0; c < ncols; c++) {
             int64_t name_sym = ray_table_col_name(obj, c);
             if (fwrite(&name_sym, 8, 1, f) != 1) return RAY_ERR_IO;
-            ray_t* col = ray_table_get_col_idx(obj, c);
+            ray_t* col = ray_table_col_idx(obj, c);
+            if (col && RAY_IS_ERR(col)) {
+                ray_err_t ce = ray_err_from_obj(col);
+                ray_error_free(col);
+                return ce;
+            }
             ray_err_t err = col_write_recursive(col, f);
             if (err != RAY_OK) return err;
         }
