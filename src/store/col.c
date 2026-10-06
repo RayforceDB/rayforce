@@ -1443,11 +1443,11 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     int gen = ray_col_gen_of(ptr);
     if (gen == RAY_ENC_GEN_VERSION) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("version", "col %s: bad format version", path);
+        return ray_error("version", "column %s: bad format version", path);
     }
     if (gen == RAY_ENC_GEN_CORRUPT) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("corrupt", "col %s: format byte and generation marker disagree", path);
+        return ray_error("corrupt", "column %s: format byte and generation marker disagree", path);
     }
     if (gen == 2) {
         out->gen2        = true;

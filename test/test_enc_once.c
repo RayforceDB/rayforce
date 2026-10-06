@@ -67,7 +67,7 @@ static ray_t* once_fn(void* raw, ray_enc_snap_t* fail) {
     if (c->mode == 4) return NULL;      /* NULL with an empty fail */
     if (c->mode == 8) { ray_enc_snap_set(fail, "cancel", "cancelled %d", n); return NULL; }
     if (c->mode == 2) {
-        ray_t* e = ray_error("corrupt", "col /x: bad descriptor (chunk 3)");
+        ray_t* e = ray_error("corrupt", "column /x: bad descriptor (chunk 3)");
         ray_enc_snap_take(fail, e);
         return NULL;
     }
@@ -131,7 +131,7 @@ static test_result_t test_once_deterministic_cached(void) {
         ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
         TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
         TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_STR_EQ(ray_error_msg(), "col /x: bad descriptor (chunk 3)");
+        TEST_ASSERT_STR_EQ(ray_error_msg(), "column /x: bad descriptor (chunk 3)");
         ray_error_free(r);
     }
     TEST_ASSERT_EQ_I(atomic_load(&c.calls), 1);

@@ -114,9 +114,10 @@ static void side_table(uint8_t* buf, size_t total, int ne, const uint16_t* kind,
     }
 }
 
+/* every generation-2 reader message opens "column <path>:" */
 static bool names_path(const char* path) {
     const char* m = ray_error_msg();
-    return m && strstr(m, path) != NULL;
+    return m && strncmp(m, "column ", 7) == 0 && strstr(m, path) != NULL;
 }
 static bool has_needle(const char* needle) {
     const char* m = ray_error_msg();

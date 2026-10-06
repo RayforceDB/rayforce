@@ -383,53 +383,53 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
         const ray_enc_desc_t* d = &out[j];
         if (j >= nv) {
             if (memcmp(p + (size_t)j * 48, zero, 48) != 0)
-                ENC_CORRUPT("col %s: chunk %lld trailing descriptor %d not zero", e->path, (long long)c, j);
+                ENC_CORRUPT("column %s: chunk %lld trailing descriptor %d not zero", e->path, (long long)c, j);
             continue;
         }
         int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
         int cls = top_encoding_class(e->type, d->encoding);
-        if (cls == 0) ENC_CORRUPT("col %s: chunk %lld vector %d illegal encoding %u", e->path, (long long)c, j, d->encoding);
-        if (cls == 2) return ray_error("nyi", "col %s: encoding %u needs a newer build", e->path, d->encoding);
-        if (d->rsv0 || d->rsv1 || d->rsv2) ENC_CORRUPT("col %s: chunk %lld vector %d descriptor reserved fields", e->path, (long long)c, j);
+        if (cls == 0) ENC_CORRUPT("column %s: chunk %lld vector %d illegal encoding %u", e->path, (long long)c, j, d->encoding);
+        if (cls == 2) return ray_error("nyi", "column %s: encoding %u needs a newer build", e->path, d->encoding);
+        if (d->rsv0 || d->rsv1 || d->rsv2) ENC_CORRUPT("column %s: chunk %lld vector %d descriptor reserved fields", e->path, (long long)c, j);
         uint16_t okflags = RAY_ENC_STAT_ABSENT | (enc_type_float(e->type) ? RAY_ENC_DESC_TRAILER : 0);
-        if (d->flags & ~okflags) ENC_CORRUPT("col %s: chunk %lld vector %d flags 0x%x", e->path, (long long)c, j, d->flags);
+        if (d->flags & ~okflags) ENC_CORRUPT("column %s: chunk %lld vector %d flags 0x%x", e->path, (long long)c, j, d->flags);
         bool packed = d->encoding == RAY_ENC_FOR_BP || d->encoding == RAY_ENC_DELTA_BP;
-        if (packed ? d->width > T : d->width != 0) ENC_CORRUPT("col %s: chunk %lld vector %d width %u", e->path, (long long)c, j, d->width);
-        if (d->n_nulls > vlen) ENC_CORRUPT("col %s: chunk %lld vector %d null count %u above the vector length", e->path, (long long)c, j, d->n_nulls);
+        if (packed ? d->width > T : d->width != 0) ENC_CORRUPT("column %s: chunk %lld vector %d width %u", e->path, (long long)c, j, d->width);
+        if (d->n_nulls > vlen) ENC_CORRUPT("column %s: chunk %lld vector %d null count %u above the vector length", e->path, (long long)c, j, d->n_nulls);
         if (!enc_type_nullable(e->type) && d->n_nulls)
-            ENC_CORRUPT("col %s: chunk %lld vector %d nulls counted in a non-nullable type", e->path, (long long)c, j);
-        if (d->payload_off != at) ENC_CORRUPT("col %s: chunk %lld vector %d payload offset %llu, expected %llu", e->path, (long long)c, j,
+            ENC_CORRUPT("column %s: chunk %lld vector %d nulls counted in a non-nullable type", e->path, (long long)c, j);
+        if (d->payload_off != at) ENC_CORRUPT("column %s: chunk %lld vector %d payload offset %llu, expected %llu", e->path, (long long)c, j,
                                              (unsigned long long)d->payload_off, (unsigned long long)at);
-        if (d->payload_bytes & 7) ENC_CORRUPT("col %s: chunk %lld vector %d payload size not a multiple of 8", e->path, (long long)c, j);
-        if (d->payload_bytes > de.bytes - at) ENC_CORRUPT("col %s: chunk %lld vector %d payload overruns the chunk", e->path, (long long)c, j);
+        if (d->payload_bytes & 7) ENC_CORRUPT("column %s: chunk %lld vector %d payload size not a multiple of 8", e->path, (long long)c, j);
+        if (d->payload_bytes > de.bytes - at) ENC_CORRUPT("column %s: chunk %lld vector %d payload overruns the chunk", e->path, (long long)c, j);
         at += d->payload_bytes;
         nsum += d->n_nulls;
         bool absent = d->flags & RAY_ENC_STAT_ABSENT;
         bool all_null = enc_type_nullable(e->type) && d->n_nulls == vlen;
         if (all_null && d->encoding != RAY_ENC_CONST)
-            ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector not CONST", e->path, (long long)c, j);
+            ENC_CORRUPT("column %s: chunk %lld vector %d all-null vector not CONST", e->path, (long long)c, j);
         if (all_null && !absent)
-            ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector carries statistics", e->path, (long long)c, j);
-        if (absent && (d->min || d->max)) ENC_CORRUPT("col %s: chunk %lld vector %d absent statistics not zero", e->path, (long long)c, j);
-        if (!absent && e->type == RAY_GUID) ENC_CORRUPT("col %s: chunk %lld vector %d statistics on GUID", e->path, (long long)c, j);
+            ENC_CORRUPT("column %s: chunk %lld vector %d all-null vector carries statistics", e->path, (long long)c, j);
+        if (absent && (d->min || d->max)) ENC_CORRUPT("column %s: chunk %lld vector %d absent statistics not zero", e->path, (long long)c, j);
+        if (!absent && e->type == RAY_GUID) ENC_CORRUPT("column %s: chunk %lld vector %d statistics on GUID", e->path, (long long)c, j);
         /* Only STR_DICT carries code bounds, and a STR_DICT vector already
          * returned nyi above: on RAW / CONST this is damage in every build. */
-        if (!absent && e->type == RAY_STR) ENC_CORRUPT("col %s: chunk %lld vector %d statistics on a RAW / CONST string vector", e->path, (long long)c, j);
+        if (!absent && e->type == RAY_STR) ENC_CORRUPT("column %s: chunk %lld vector %d statistics on a RAW / CONST string vector", e->path, (long long)c, j);
         if (!absent) {
             if (enc_type_float(e->type)) {
                 double mn, mx; memcpy(&mn, &d->min, 8); memcpy(&mx, &d->max, 8);
-                if (isnan(mn) || isnan(mx) || mn > mx) ENC_CORRUPT("col %s: chunk %lld vector %d float bounds", e->path, (long long)c, j);
+                if (isnan(mn) || isnan(mx) || mn > mx) ENC_CORRUPT("column %s: chunk %lld vector %d float bounds", e->path, (long long)c, j);
             } else if (d->min > d->max) {
-                ENC_CORRUPT("col %s: chunk %lld vector %d min above max", e->path, (long long)c, j);
+                ENC_CORRUPT("column %s: chunk %lld vector %d min above max", e->path, (long long)c, j);
             } else if (e->type == RAY_SYM && (d->min < 1 || (uint64_t)d->max >= e->sym_bound ||
                                               (T < 64 && ((uint64_t)d->max >> T)))) {
-                ENC_CORRUPT("col %s: chunk %lld vector %d SYM statistics outside the domain or the id width", e->path, (long long)c, j);
+                ENC_CORRUPT("column %s: chunk %lld vector %d SYM statistics outside the domain or the id width", e->path, (long long)c, j);
             }
         }
     }
-    if (nsum != de.null_count) ENC_CORRUPT("col %s: chunk %lld descriptor null counts sum to %llu, directory says %u", e->path,
+    if (nsum != de.null_count) ENC_CORRUPT("column %s: chunk %lld descriptor null counts sum to %llu, directory says %u", e->path,
                                            (long long)c, (unsigned long long)nsum, de.null_count);
-    if (at != de.bytes) ENC_CORRUPT("col %s: chunk %lld has %llu bytes after its payloads", e->path,
+    if (at != de.bytes) ENC_CORRUPT("column %s: chunk %lld has %llu bytes after its payloads", e->path,
                                     (long long)c, (unsigned long long)(de.bytes - at));
     return NULL;
 }
@@ -459,10 +459,10 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
     /* Structure was checked at load (Task 6); the entry's contents are
      * checked here, once, before the first lookup. */
     if (!ray_enc_kind_of(e->type, e->attrs, &k) || !e->vdict_len) {
-        ray_enc_snap_set(fail, "corrupt", "col %s: DICT vector without a VALUE_DICT entry", e->path);
+        ray_enc_snap_set(fail, "corrupt", "column %s: DICT vector without a VALUE_DICT entry", e->path);
         return NULL;
     }
-    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "col %s: VALUE_DICT", e->path); return NULL; }
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "column %s: VALUE_DICT", e->path); return NULL; }
     uint64_t dict_len = e->vdict_len;
     {
         const uint8_t* d = e->base + e->vdict_off;
@@ -473,7 +473,7 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
         if (dict_len != 8 + ray_enc_pad8((uint64_t)n * esz)) { why = "VALUE_DICT entry size"; goto bad; }
         if (!all_zero(d + 8 + (size_t)n * esz, (size_t)(ray_enc_pad8((uint64_t)n * esz) - (uint64_t)n * esz))) { why = "VALUE_DICT entry padding"; goto bad; }
         ray_t* vals = ray_vec_new(RAY_I64, n);
-        if (!vals || RAY_IS_ERR(vals)) { ray_enc_snap_set(fail, "oom", "col %s: VALUE_DICT", e->path); return NULL; }
+        if (!vals || RAY_IS_ERR(vals)) { ray_enc_snap_set(fail, "oom", "column %s: VALUE_DICT", e->path); return NULL; }
         vals->len = n;
         uint64_t* out = (uint64_t*)ray_data(vals);
         for (uint32_t i = 0; i < n; i++) {
@@ -484,7 +484,7 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
         return vals;
     }
 bad:
-    ray_enc_snap_set(fail, "corrupt", "col %s: %s", e->path, why);
+    ray_enc_snap_set(fail, "corrupt", "column %s: %s", e->path, why);
     return NULL;
 }
 
@@ -504,7 +504,7 @@ static uint32_t popcount_prefix(const uint8_t* bm, int n, bool* tail_clear) {
     return c;
 }
 
-#define VEC_CORRUPT(what) ENC_CORRUPT("col %s: chunk %lld vector %d %s", e->path, (long long)c, j, what)
+#define VEC_CORRUPT(what) ENC_CORRUPT("column %s: chunk %lld vector %d %s", e->path, (long long)c, j, what)
 
 static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
                        const uint8_t* p, uint64_t avail, const uint8_t* bm, void* out) {
@@ -515,7 +515,7 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
     uint64_t bits[RAY_ENC_VEC];
     int64_t used = ray_enc_read(p, (size_t)avail, d->encoding, d->width, vlen, k,
                                 RAY_ENC_SLOT_TOP, 0, d->encoding == RAY_ENC_DICT ? &dict : NULL, bits);
-    if (used < 0) ENC_CORRUPT("col %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
+    if (used < 0) ENC_CORRUPT("column %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
     if ((uint64_t)used != avail) VEC_CORRUPT("bytes after the codec body");
     uint8_t esz = ray_enccol_esz(e);
     const bool sym = e->type == RAY_SYM;
@@ -749,7 +749,7 @@ ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_e
 
 ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool_out,
                              uint64_t pool_base, uint64_t pool_cap) {
-    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return ray_error("range", "col %s: vector %lld", e->path, (long long)vec);
+    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return ray_error("range", "column %s: vector %lld", e->path, (long long)vec);
     ray_enc_desc_t descs[64];
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     ray_t* err = ray_enccol_chunk_descs(e, c, descs);
@@ -760,7 +760,7 @@ ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool
 
 ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
     *out = 0;
-    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return ray_error("range", "col %s: vector %lld", e->path, (long long)vec);
+    if (vec < 0 || vec >= ray_enc_nvecs(e->len)) return ray_error("range", "column %s: vector %lld", e->path, (long long)vec);
     ray_enc_desc_t descs[64];
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     ray_t* err = ray_enccol_chunk_descs(e, c, descs);
@@ -810,7 +810,7 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
          * still run, so the result stays deterministic. */
         if (c > atomic_load_explicit(&x->lowest_failed, memory_order_relaxed)) continue;
         if (ray_interrupted()) {
-            ray_enc_snap_set(&r->snap, "cancel", "col %s: interrupted", e->path);
+            ray_enc_snap_set(&r->snap, "cancel", "column %s: interrupted", e->path);
             r->failed = true;
             continue;
         }
@@ -867,12 +867,12 @@ static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
             uint64_t pb;
             if ((err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb)) != NULL) return err;
             if (pb > e->hdr.str_pool_bytes - total)
-                return ray_error("corrupt", "col %s: decoded pool exceeds str_pool_bytes at chunk %lld", e->path, (long long)c);
+                return ray_error("corrupt", "column %s: decoded pool exceeds str_pool_bytes at chunk %lld", e->path, (long long)c);
             total += pb;
         }
     }
     if (total != e->hdr.str_pool_bytes)
-        return ray_error("corrupt", "col %s: decoded pool is %llu bytes, header says %llu", e->path,
+        return ray_error("corrupt", "column %s: decoded pool is %llu bytes, header says %llu", e->path,
                          (unsigned long long)total, (unsigned long long)e->hdr.str_pool_bytes);
     return NULL;
 }
@@ -886,7 +886,7 @@ static double dbl_of(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
  * 0/0 when no value (zone_scan_int / zone_scan_float, src/ops/idxop.c). */
 static ray_t* enc_synth_zone(ray_enccol_t* e) {
     ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_ZONE, e->type, e->len);
-    if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: zone", e->path);
+    if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "column %s: zone", e->path);
     ray_index_t* ix = ray_index_payload(root);
     bool fl = enc_type_float(e->type), have = false;
     int64_t mn = 0, mx = 0;
@@ -912,7 +912,7 @@ static ray_t* enc_synth_zone(ray_enccol_t* e) {
  * (readers accept a NULL aggs). */
 static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_CHUNK_ZONE, e->type, e->len);
-    if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: chunk zone", e->path);
+    if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "column %s: chunk zone", e->path);
     ray_index_t* ix = ray_index_payload(root);
     uint32_t nc = (uint32_t)e->n_chunks;
     bool fl = enc_type_float(e->type);
@@ -932,7 +932,7 @@ static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     if (!ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs || !ix->u.chunk_zone.null_bits ||
         (sums && !ix->u.chunk_zone.aggs) || enc_alloc_fails(e)) {
         ray_release(root);
-        return ray_error("oom", "col %s: chunk zone", e->path);
+        return ray_error("oom", "column %s: chunk zone", e->path);
     }
     mins->len = maxs->len = nc;
     nb->len = (nc + 7) / 8;
@@ -969,16 +969,16 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
     ray_t* root = NULL;
     if (kind == RAY_IDX_ZONE || kind == RAY_IDX_CHUNK_ZONE) {
         if (!ray_zone_acc_supported(e->type))
-            return ray_error("corrupt", "col %s: zone index on type %s", e->path, ray_type_name(e->type));
+            return ray_error("corrupt", "column %s: zone index on type %s", e->path, ray_type_name(e->type));
         root = kind == RAY_IDX_ZONE ? enc_synth_zone(e) : enc_synth_chunk_zone(e);
         if (RAY_IS_ERR(root)) return root;
     } else if (kind != 0) {
-        return ray_error("corrupt", "col %s: index kind %u without a region", e->path, kind);
+        return ray_error("corrupt", "column %s: index kind %u without a region", e->path, kind);
     }
     if (unique) {
         if (!root) {
             root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_NONE, e->type, e->len);
-            if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: unique marker", e->path);
+            if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "column %s: unique marker", e->path);
         }
         ray_index_payload(root)->markers |= RAY_MARK_UNIQUE;
     }
@@ -990,7 +990,7 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
          * programming errors pass through unchanged */
         if (strcmp(ray_err_code(r), "corrupt") != 0) return r;
         ray_error_free(r);
-        return ray_error("corrupt", "col %s: index or UNIQUE flag not admitted on type %s",
+        return ray_error("corrupt", "column %s: index or UNIQUE flag not admitted on type %s",
                          e->path, ray_type_name(e->type));
     }
     *vp = r;
@@ -1001,15 +1001,15 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
     uint8_t ik = e->hdr.index_kind;
     if (ik == 1 || ik == 2 || ik == 4 || ik == 6) {
-        ray_enc_snap_set(fail, "nyi", "col %s: index region needs a newer build", e->path);
+        ray_enc_snap_set(fail, "nyi", "column %s: index region needs a newer build", e->path);
         return NULL;
     }
-    if (ray_interrupted()) { ray_enc_snap_set(fail, "cancel", "col %s: interrupted", e->path); return NULL; }
-    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "col %s: materialize", e->path); return NULL; }
+    if (ray_interrupted()) { ray_enc_snap_set(fail, "cancel", "column %s: interrupted", e->path); return NULL; }
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "column %s: materialize", e->path); return NULL; }
     ray_t* vec = e->type == RAY_SYM ? ray_sym_vec_new(e->attrs & RAY_SYM_W_MASK, e->len)
                                     : ray_vec_new(e->type, e->len);
     if (!vec || RAY_IS_ERR(vec)) {
-        if (vec) ray_enc_snap_take(fail, vec); else ray_enc_snap_set(fail, "oom", "col %s: materialize", e->path);
+        if (vec) ray_enc_snap_take(fail, vec); else ray_enc_snap_set(fail, "oom", "column %s: materialize", e->path);
         return NULL;
     }
     vec->len = e->len;
@@ -1018,25 +1018,25 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     enc_task_res_t* res = NULL;
     if (e->type == RAY_STR) {
         chunk_pool = enc_alloc_fails(e) ? NULL : ray_alloc_raw((size_t)(e->n_chunks + 1) * sizeof(uint64_t));
-        if (!chunk_pool) { err = ray_error("oom", "col %s: materialize", e->path); goto fail; }
+        if (!chunk_pool) { err = ray_error("oom", "column %s: materialize", e->path); goto fail; }
         if ((err = enc_str_prepass(e, chunk_pool)) != NULL) goto fail;
         if (e->hdr.str_pool_bytes > 0) {
             ray_t* pool = enc_alloc_fails(e) ? NULL : ray_alloc((size_t)e->hdr.str_pool_bytes);
-            if (!pool || RAY_IS_ERR(pool)) { err = pool ? pool : ray_error("oom", "col %s: pool", e->path); goto fail; }
+            if (!pool || RAY_IS_ERR(pool)) { err = pool ? pool : ray_error("oom", "column %s: pool", e->path); goto fail; }
             pool->type = RAY_U8;
             pool->len  = (int64_t)e->hdr.str_pool_bytes;
             vec->str_pool = pool;
         }
     }
     res = enc_alloc_fails(e) ? NULL : ray_calloc_raw((size_t)(e->n_chunks + 1) * sizeof *res);
-    if (!res) { err = ray_error("oom", "col %s: materialize", e->path); goto fail; }
+    if (!res) { err = ray_error("oom", "column %s: materialize", e->path); goto fail; }
     enc_mat_ctx_t x = {
         .e = e, .out = (uint8_t*)ray_data(vec),
         .pool = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL,
         .pool_cap = e->hdr.str_pool_bytes, .chunk_pool = chunk_pool, .res = res,
     };
     atomic_init(&x.lowest_failed, INT64_MAX);
-    if (e->n_chunks > (int64_t)UINT32_MAX) { err = ray_error("range", "col %s: too many chunks", e->path); goto fail; }
+    if (e->n_chunks > (int64_t)UINT32_MAX) { err = ray_error("range", "column %s: too many chunks", e->path); goto fail; }
     ray_pool_t* tp = ray_pool_get();
     if (e->n_chunks >= 2 && ray_pool_par_dispatch_ok(tp, e->n_chunks, 2))
         ray_pool_dispatch_n(tp, enc_mat_chunk, &x, (uint32_t)e->n_chunks);
@@ -1047,7 +1047,7 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     for (int64_t c = 0; c < e->n_chunks; c++)
         if (res[c].failed || !res[c].done) {     /* the lowest-numbered failing task */
             if (res[c].failed) *fail = res[c].snap;
-            else ray_enc_snap_set(fail, "cancel", "col %s: interrupted", e->path);
+            else ray_enc_snap_set(fail, "cancel", "column %s: interrupted", e->path);
             ray_free_raw(res); ray_free_raw(chunk_pool); ray_release(vec);
             return NULL;
         }
@@ -1161,7 +1161,7 @@ static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
     if (!out || RAY_IS_ERR(out) || !plain || !res) {
         if (out && !RAY_IS_ERR(out)) ray_free(out);
         ray_free_raw(plain); ray_free_raw(res);
-        ray_enc_snap_set(fail, "oom", "col %s: parted materialize", e->path);
+        ray_enc_snap_set(fail, "oom", "column %s: parted materialize", e->path);
         return NULL;
     }
     out->type = e->wrapper->type;
@@ -1191,7 +1191,7 @@ static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
     for (int64_t i = 0; i < n; i++)
         if (res[i].failed || !res[i].done) {        /* lowest-numbered failing segment */
             if (res[i].failed) *fail = res[i].snap;
-            else ray_enc_snap_set(fail, "cancel", "col %s: interrupted", e->path);
+            else ray_enc_snap_set(fail, "cancel", "column %s: interrupted", e->path);
             ray_free(out);                          /* no segment reference was taken yet */
             ray_free_raw(plain); ray_free_raw(res);
             return NULL;
