@@ -34,6 +34,8 @@
 #include "lang/eval.h"
 #include "core/platform.h"
 #include "store/col.h"
+#include "store/colrange.h"
+#include "table/domain.h"
 #include "store/encfmt.h"
 #include "store/enccol.h"
 #include "store/splay.h"
@@ -45,6 +47,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define CS_TMP "/tmp/rayforce_compress"
 
@@ -512,7 +518,211 @@ static test_result_t test_ipc_failed_decode(void) {
     PASS();
 }
 
+static uint8_t file_gen(const char* path) {
+    uint8_t h[32] = {0};
+    FILE* f = fopen(path, "rb");
+    if (!f) return 255;
+    size_t n = fread(h, 1, 32, f); fclose(f);
+    if (n != 32) return 255;
+    int g = ray_col_gen_of(h);
+    return g < 0 ? 254 : (uint8_t)g;
+}
+
+static uint8_t* slurp(const char* path, size_t* n) {
+    FILE* f = fopen(path, "rb"); if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t* b = malloc((size_t)sz + 1); *n = fread(b, 1, (size_t)sz, f); fclose(f);
+    return b;
+}
+
+static ray_err_t save_ctx(ray_t* col, const char* path, uint8_t gen, struct ray_sym_domain_s* dom) {
+    ray_col_write_t w; memset(&w, 0, sizeof w);
+    ray_t* e = ray_col_src_bind(col, &w.src);
+    if (e) { ray_error_free(e); return RAY_ERR_TYPE; }
+    w.name = "c"; w.gen = gen; w.target_dom = dom; w.durable = false;
+    ray_err_t r = ray_col_save_ctx(&w, path);
+    ray_col_src_release(&w.src);
+    return r;
+}
+
+static test_result_t test_matrix_flat(void) {
+    ray_t* v = i64_col(140000, 7);
+    /* plain -> 0 is today's writer, byte for byte */
+    TEST_ASSERT_EQ_I(save_ctx(v, CS_TMP "/p0", 0, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, CS_TMP "/ref0"), RAY_OK);
+    size_t na, nb; uint8_t* a = slurp(CS_TMP "/p0", &na); uint8_t* b = slurp(CS_TMP "/ref0", &nb);
+    TEST_ASSERT_TRUE(na == nb && memcmp(a, b, na) == 0); free(a); free(b);
+    /* plain -> 2 */
+    TEST_ASSERT_EQ_I(save_ctx(v, CS_TMP "/p2", 2, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/p2"), 2);
+    /* encoded -> 2: range reads, no materialization, identical bytes */
+    ray_t* enc = ray_col_mmap(CS_TMP "/p2");
+    ray_enc_counters_reset();
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/e2", 2, NULL), RAY_OK);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    a = slurp(CS_TMP "/p2", &na); b = slurp(CS_TMP "/e2", &nb);
+    TEST_ASSERT_TRUE(na == nb && memcmp(a, b, na) == 0); free(a); free(b);
+    /* encoded -> 0: materializes once, then today's writer */
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/e0", 0, NULL), RAY_OK);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/e0"), 0);
+    a = slurp(CS_TMP "/e0", &na); b = slurp(CS_TMP "/ref0", &nb);
+    TEST_ASSERT_TRUE(na == nb && memcmp(a, b, na) == 0); free(a); free(b);
+    ray_release(enc); ray_release(v);
+    PASS();
+}
+
+/* A SYM column over domain A (insertion order z, a, m) re-encoded into a
+ * domain B with another order and a wider width class. */
+static test_result_t test_matrix_sym_remap(void) {
+    struct ray_sym_domain_s* A = ray_sym_domain_open_or_create(CS_TMP "/A.sym");
+    struct ray_sym_domain_s* B = ray_sym_domain_open_or_create(CS_TMP "/B.sym");
+    TEST_ASSERT_TRUE(A && B);
+    ray_sym_domain_intern(A, "", 0); ray_sym_domain_intern(B, "", 0);
+    static const char* w[3] = { "z", "a", "m" };
+    for (int i = 0; i < 3; i++) ray_sym_domain_intern(A, w[i], 1);
+    for (int i = 0; i < 300; i++) { char b[16]; int n = snprintf(b, sizeof b, "pad%d", i); ray_sym_domain_intern(B, b, (size_t)n); }
+    for (int i = 2; i >= 0; i--) ray_sym_domain_intern(B, w[i], 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(A, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(B, false), RAY_OK);
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W8, 5000); v->len = 5000;
+    for (int64_t i = 0; i < 5000; i++) ray_write_sym(ray_data(v), i, (uint64_t)(i % 4), RAY_SYM, RAY_SYM_W8);
+    v->sym_domain = A; ray_sym_domain_retain(A);
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    /* plain -> 2 over A, then encoded -> 2 into B, then encoded -> 0 into B */
+    TEST_ASSERT_EQ_I(save_ctx(v, CS_TMP "/sa", 2, A), RAY_OK);
+    ray_t* enc = ray_col_mmap_splayed_dom(CS_TMP "/sa", A);
+    TEST_ASSERT_TRUE(enc && !RAY_IS_ERR(enc));
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/sb2", 2, B), RAY_OK);
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/sb0", 0, B), RAY_OK);
+    const char* outs[2] = { CS_TMP "/sb2", CS_TMP "/sb0" };
+    for (int o = 0; o < 2; o++) {
+        ray_t* r = ray_col_load_dom(outs[o], B);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "reload %s", outs[o]);
+        TEST_ASSERT_EQ_I(r->attrs & RAY_SYM_W_MASK, RAY_SYM_W16);
+        for (int64_t i = 0; i < 5000; i++) {
+            ray_t* s0 = ray_sym_vec_cell(v, i); ray_t* s1 = ray_sym_vec_cell(r, i);
+            TEST_ASSERT_TRUE(ray_str_len(s0) == ray_str_len(s1) &&
+                             memcmp(ray_str_ptr(s0), ray_str_ptr(s1), ray_str_len(s0)) == 0);
+        }
+        TEST_ASSERT_TRUE(r->attrs & RAY_ATTR_HAS_NULLS);
+        ray_release(r);
+    }
+    ray_release(enc); ray_release(v);
+    ray_sym_domain_release(A); ray_sym_domain_release(B);
+    PASS();
+}
+
+/* Equal long strings at distinct pool offsets with differing cached hashes
+ * are one value (storage equality ignores pool_off and hash32): CONST, and
+ * the round trip gives both rows the bytes. */
+static test_result_t test_str_const_distinct_offsets(void) {
+    static const char txt[] = "a twenty-one-byte str";      /* 21 bytes */
+    ray_t* v = ray_vec_new(RAY_STR, 2); v->len = 2;
+    ray_t* pool = ray_alloc(42); pool->type = RAY_U8; pool->len = 42;
+    memcpy(ray_data(pool), txt, 21); memcpy((char*)ray_data(pool) + 21, txt, 21);
+    v->str_pool = pool;
+    ray_str_t* d = ray_data(v);
+    for (int i = 0; i < 2; i++) {
+        memset(&d[i], 0, sizeof d[i]);
+        d[i].len = 21; memcpy(d[i].prefix, txt, 4);
+        d[i].pool_off = (uint32_t)(21 * i); d[i].hash32 = i ? 9u : 5u;
+    }
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/sc", 2), RAY_OK);
+    ray_t* c = ray_col_mmap(CS_TMP "/sc");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enc_desc_t d0; memcpy(&d0, ray_enccol_of(c)->base + 160, 48);
+    TEST_ASSERT_EQ_I(d0.encoding, RAY_ENC_CONST);
+    ray_t* m = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    for (int i = 0; i < 2; i++) {
+        size_t n; const char* p = ray_str_vec_get(m, i, &n);
+        TEST_ASSERT_TRUE(n == 21 && memcmp(p, txt, 21) == 0);
+    }
+    TEST_ASSERT_EQ_I(m->str_pool->len, 42);                 /* once per occurrence */
+    ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* A failed encoded -> 2 save leaves no file and no staging file. */
+static test_result_t test_matrix_failure_cleanup(void) {
+    ray_t* v = i64_col(3000, 1);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/src", 2), RAY_OK);
+    ray_release(v);
+    FILE* f = fopen(CS_TMP "/src", "r+b"); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
+    ray_t* enc = ray_col_mmap(CS_TMP "/src");
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/dst", 2, NULL), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/dst"), 255);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/dst.tmp"), 255);
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/dst", 0, NULL), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/dst"), 255);
+    ray_release(enc);
+    PASS();
+}
+
+/* Failure injection: each allocation of the range writer, the encoded
+ * source's own allocations and a mid-write I/O failure leave no file, no
+ * staging file and no leaked bytes. */
+static test_result_t test_matrix_failure_inject(void) {
+    ray_t* v = ray_vec_new(RAY_STR, 70000); v->len = 70000;
+    ray_t* pool = ray_alloc(70000 * 24); pool->type = RAY_U8; pool->len = 70000 * 24;
+    ray_str_t* d = ray_data(v);
+    for (int64_t i = 0; i < 70000; i++) {
+        memset(&d[i], 0, sizeof d[i]);
+        d[i].len = 24; d[i].pool_off = (uint32_t)(24 * i);
+        for (int k = 0; k < 24; k++) ((char*)ray_data(pool))[24 * i + k] = (char)('a' + (i * 7 + k * 13) % 26);
+        memcpy(d[i].prefix, (char*)ray_data(pool) + 24 * i, 4);
+    }
+    v->str_pool = pool;
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, CS_TMP "/s", 2), RAY_OK);
+    ray_release(v);
+    ray_t* enc = ray_col_mmap(CS_TMP "/s");
+    TEST_ASSERT_TRUE(enc && !RAY_IS_ERR(enc));
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    bool done = false;
+    for (int nth = 1; nth <= 8 && !done; nth++) {
+        ray_col_test_fail_alloc(nth);
+        ray_err_t r = save_ctx(enc, CS_TMP "/d", 2, NULL);
+        ray_col_test_fail_alloc(0);
+        if (r == RAY_OK) { done = true; break; }
+        TEST_ASSERT_EQ_I(r, RAY_ERR_OOM);
+        TEST_ASSERT_EQ_I(file_gen(CS_TMP "/d"), 255);
+        TEST_ASSERT_EQ_I(file_gen(CS_TMP "/d.tmp"), 255);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "nth %d leaked", nth);
+    }
+    TEST_ASSERT_TRUE(done);
+    (void)remove(CS_TMP "/d");
+    /* staging path unusable: the open fails, nothing appears */
+    TEST_ASSERT_EQ_I(mkdir(CS_TMP "/e.tmp", 0700), 0);
+    TEST_ASSERT_EQ_I(save_ctx(enc, CS_TMP "/e", 2, NULL), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/e"), 255);
+    (void)rmdir(CS_TMP "/e.tmp");
+    /* I/O failure while writing: file size limit */
+    struct rlimit old, lim; getrlimit(RLIMIT_FSIZE, &old);
+    lim = old; lim.rlim_cur = 65536;
+    void (*oldsig)(int) = signal(SIGXFSZ, SIG_IGN);
+    setrlimit(RLIMIT_FSIZE, &lim);
+    ray_err_t r = save_ctx(enc, CS_TMP "/f", 2, NULL);
+    setrlimit(RLIMIT_FSIZE, &old);
+    signal(SIGXFSZ, oldsig);
+    TEST_ASSERT_EQ_I(r, RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/f"), 255);
+    TEST_ASSERT_EQ_I(file_gen(CS_TMP "/f.tmp"), 255);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_TRUE(m1.bytes_allocated == m0.bytes_allocated);
+    ray_release(enc);
+    PASS();
+}
+
 const test_entry_t compress_entries[] = {
+    { "compress/matrix_failure_inject",  test_matrix_failure_inject,  cs_setup, cs_teardown },
+    { "compress/matrix_flat",            test_matrix_flat,            cs_setup, cs_teardown },
+    { "compress/matrix_sym_remap",       test_matrix_sym_remap,       cs_setup, cs_teardown },
+    { "compress/matrix_failure_cleanup", test_matrix_failure_cleanup, cs_setup, cs_teardown },
+    { "compress/str_const_offsets",      test_str_const_distinct_offsets, cs_setup, cs_teardown },
     { "compress/ipc_failed_decode",             test_ipc_failed_decode,              ipc_setup, ipc_teardown },
     { "compress/dml_upsert_copy", test_dml_upsert_copy, rt_setup, rt_teardown },
     { "compress/dml_upsert_inplace", test_dml_upsert_inplace, rt_setup, rt_teardown },

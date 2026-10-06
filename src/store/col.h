@@ -27,6 +27,7 @@
 #include <rayforce.h>
 #include <string.h>
 #include <stdio.h>
+#include "store/colrange.h"
 
 struct ray_sym_domain_s;
 
@@ -96,6 +97,25 @@ ray_err_t ray_col_save_bulk(ray_t* vec, const char* path);
  * generation 0 only.  A column generation 2 cannot hold is written as 0. */
 ray_err_t ray_col_save_gen(ray_t* vec, const char* path, uint8_t gen);
 ray_err_t ray_col_save_bulk_gen(ray_t* vec, const char* path, uint8_t gen);
+
+/* Write context (spec "Writers"): a bound source (plain or encoded), the
+ * resolved generation and the SYM target domain.  Handles plain->0,
+ * plain->2, encoded->0 (materialize, then the generation-0 writer) and
+ * encoded->2 (range reads, SYM ids remapped into the target domain, no
+ * whole-column materialization).  On failure every temporary is released and
+ * the staging file removed; nothing is renamed into place. */
+enum { RAY_COL_IDX_KEEP = 0, RAY_COL_IDX_REBUILD = 1, RAY_COL_IDX_DROP = 2 };
+typedef struct {
+    ray_col_src_t src;                    /* bound by the caller (ray_col_src_bind); not released here */
+    const char*   name;                   /* column name, diagnostics */
+    uint8_t       gen;                    /* resolved generation: 0 or 2 */
+    struct ray_sym_domain_s* target_dom;  /* SYM: destination symfile domain; NULL = bare */
+    uint8_t       index_decision;         /* P1: RAY_COL_IDX_KEEP */
+    uint8_t       index_kind;             /* generation 2: kind to record (0 = from the source) */
+    bool          durable;
+} ray_col_write_t;
+ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path);
+void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
 
 bool ray_col_gen2_eligible(ray_t* col);
 void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags);
