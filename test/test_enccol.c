@@ -959,7 +959,7 @@ static test_result_t test_decode_mutation_sweep(void) {
 static test_result_t check_equivalence(ray_t* v) {
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g0", 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g2", 2), RAY_OK);
-    ray_t* a = ray_col_load(ENCCOL_TMP "/g0");
+    ray_t* a = ray_col_mmap(ENCCOL_TMP "/g0");
     ray_t* c = ray_col_mmap(ENCCOL_TMP "/g2");
     TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && c && !RAY_IS_ERR(c));
     ray_t* b = ray_enccol_materialize(c);
@@ -1222,6 +1222,141 @@ static test_result_t test_col_load_materializes(void) {
     PASS();
 }
 
+static ray_t* save_and_materialize(ray_t* v, const char* path, ray_t** keep) {
+    if (ray_col_save_gen(v, path, 2) != RAY_OK) return ray_error("io", NULL);
+    *keep = ray_col_mmap(path);
+    if (!*keep || RAY_IS_ERR(*keep)) return *keep;
+    return ray_enccol_materialize(*keep);
+}
+
+static test_result_t test_synth_zone(void) {
+    ray_t* v = make_col(RAY_I32, 5000, 4);
+    ray_t* z = ray_index_attach_zone(&v);
+    TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z));
+    v = z;
+    ray_t* keep;
+    ray_t* m = save_and_materialize(v, ENCCOL_TMP "/z", &keep);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_ZONE);
+    ray_index_t* a = ray_index_payload(v->index);
+    ray_index_t* b = ray_index_payload(m->index);
+    TEST_ASSERT_EQ_I(b->u.zone.min_i, a->u.zone.min_i);
+    TEST_ASSERT_EQ_I(b->u.zone.max_i, a->u.zone.max_i);
+    TEST_ASSERT_EQ_I(b->u.zone.n_nulls, a->u.zone.n_nulls);
+    TEST_ASSERT_EQ_I(b->built_for_len, 5000);
+    ray_release(keep); ray_release(v);
+    PASS();
+}
+
+/* CHUNK_ZONE synthesized at 64K chunks equals the builder's on the
+ * decoded vector, for an integer and a float column with an all-null chunk. */
+static test_result_t test_synth_chunk_zone(void) {
+    static const int8_t types[] = { RAY_I64, RAY_F64 };
+    for (size_t t = 0; t < 2; t++) {
+        int64_t n = 3 * 65536 + 17;
+        ray_t* v = make_col(types[t], n, 4);
+        uint8_t* d = ray_data(v);
+        for (int64_t i = 65536; i < 2 * 65536; i++) {             /* chunk 1 all null */
+            if (types[t] == RAY_I64) { int64_t x = NULL_I64; memcpy(d + i * 8, &x, 8); }
+            else                     { double x = NULL_F64; memcpy(d + i * 8, &x, 8); }
+        }
+        ray_t* z = ray_index_attach_chunk_zone(&v, 16);
+        TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z)); v = z;
+        ray_t* keep;
+        ray_t* m = save_and_materialize(v, ENCCOL_TMP "/cz", &keep);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_CHUNK_ZONE);
+        ray_t* ref = ray_index_chunk_zone_compute(m, 16);         /* builder on the decoded data */
+        ray_index_t* a = ray_index_payload(ref);
+        ray_index_t* b = ray_index_payload(m->index);
+        TEST_ASSERT_EQ_I(b->u.chunk_zone.n_chunks, a->u.chunk_zone.n_chunks);
+        TEST_ASSERT_EQ_I(b->u.chunk_zone.is_f64, a->u.chunk_zone.is_f64);
+        TEST_ASSERT_TRUE(memcmp(ray_data(b->u.chunk_zone.mins), ray_data(a->u.chunk_zone.mins), 8 * 4) == 0);
+        TEST_ASSERT_TRUE(memcmp(ray_data(b->u.chunk_zone.maxs), ray_data(a->u.chunk_zone.maxs), 8 * 4) == 0);
+        TEST_ASSERT_TRUE(memcmp(ray_data(b->u.chunk_zone.null_bits), ray_data(a->u.chunk_zone.null_bits), 1) == 0);
+        if (!a->u.chunk_zone.is_f64)
+            TEST_ASSERT_TRUE(memcmp(ray_data(b->u.chunk_zone.aggs), ray_data(a->u.chunk_zone.aggs), 8 * 12) == 0);
+        ray_release(ref); ray_release(keep); ray_release(v);
+    }
+    PASS();
+}
+
+static test_result_t test_unique_flag(void) {
+    int64_t d[100]; for (int i = 0; i < 100; i++) d[i] = i * 3;
+    ray_t* v = ray_vec_from_raw(RAY_I64, d, 100);
+    ray_t* root = ray_index_new_root(RAY_IDX_NONE, RAY_I64, 100);
+    ray_index_payload(root)->markers = RAY_MARK_UNIQUE;
+    ray_t* a = ray_index_attach_persisted(&v, root);
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a)); v = a;
+    ray_t* keep;
+    ray_t* m = save_and_materialize(v, ENCCOL_TMP "/u", &keep);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_enccol_t* e = ray_enccol_of(keep);
+    TEST_ASSERT_EQ_I(e->hdr.col_flags, RAY_ENC_FLAG_UNIQUE);
+    TEST_ASSERT_EQ_I(e->hdr.index_kind, 0);
+    TEST_ASSERT_TRUE(ray_index_has(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_NONE);
+    TEST_ASSERT_TRUE(ray_index_payload(m->index)->markers & RAY_MARK_UNIQUE);
+    ray_release(keep); ray_release(v);
+    PASS();
+}
+
+/* The matrix refuses a pair: on a file (GUID claiming UNIQUE) at load; on
+ * the attach itself the root is consumed exactly once (ASan would report a
+ * double release or a leak). */
+static test_result_t test_attach_refused(void) {
+    ray_t* v = make_col(RAY_GUID, 50, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/gu", 2), RAY_OK);
+    uint8_t f = RAY_ENC_FLAG_UNIQUE;
+    patch(ENCCOL_TMP "/gu", 32 + 7, &f, 1);
+    ray_t* c = ray_col_mmap(ENCCOL_TMP "/gu");
+    TEST_ASSERT_TRUE(c && RAY_IS_ERR(c));
+    TEST_ASSERT_STR_EQ(ray_err_code(c), "corrupt");
+    ray_error_free(c);
+    ray_t* root = ray_index_new_root(RAY_IDX_ZONE, RAY_GUID, v->len);
+    ray_t* r = ray_index_attach_persisted(&v, root);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    TEST_ASSERT_FALSE(ray_index_has(v));
+    ray_release(v);
+    PASS();
+}
+
+
+/* A gen-2 load carries the same attachment a gen-0 load of the same vector
+ * with the same index does (ZONE and CHUNK_ZONE, plus UNIQUE on top). */
+static test_result_t test_synth_matches_gen0(void) {
+    for (int k = 0; k < 2; k++) {
+        int64_t n = 2 * 65536 + 5;
+        ray_t* v = make_col(RAY_I64, n, 4);
+        ray_t* z = k ? ray_index_attach_chunk_zone(&v, 16) : ray_index_attach_zone(&v);
+        TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z)); v = z;
+        ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g0", 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ENCCOL_TMP "/g2", 2), RAY_OK);
+        ray_t* a = ray_col_mmap(ENCCOL_TMP "/g0");
+        ray_t* b = ray_col_load(ENCCOL_TMP "/g2");
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b));
+        TEST_ASSERT_EQ_I(ray_index_kind(b), ray_index_kind(a));
+        TEST_ASSERT_EQ_I(ray_index_kind(b), k ? RAY_IDX_CHUNK_ZONE : RAY_IDX_ZONE);
+        ray_index_t* ia = ray_index_payload(a->index);
+        ray_index_t* ib = ray_index_payload(b->index);
+        TEST_ASSERT_EQ_I(ib->markers & RAY_MARK_UNIQUE, ia->markers & RAY_MARK_UNIQUE);   /* MMAP is residency */
+        TEST_ASSERT_EQ_I(ib->built_for_len, ia->built_for_len);
+        if (k) {
+            TEST_ASSERT_EQ_I(ib->u.chunk_zone.n_chunks, ia->u.chunk_zone.n_chunks);
+            TEST_ASSERT_TRUE(memcmp(ray_data(ib->u.chunk_zone.mins), ray_data(ia->u.chunk_zone.mins), 8 * 3) == 0);
+            TEST_ASSERT_TRUE(memcmp(ray_data(ib->u.chunk_zone.aggs), ray_data(ia->u.chunk_zone.aggs), 8 * 9) == 0);
+        } else {
+            TEST_ASSERT_EQ_I(ib->u.zone.min_i, ia->u.zone.min_i);
+            TEST_ASSERT_EQ_I(ib->u.zone.max_i, ia->u.zone.max_i);
+        }
+        ray_release(a); ray_release(b); ray_release(v);
+    }
+    PASS();
+}
+
 const test_entry_t enccol_entries[] = {
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_rejects",        test_load_rejects,        enccol_setup, enccol_teardown },
@@ -1258,5 +1393,10 @@ const test_entry_t enccol_entries[] = {
     { "enccol/cancel_mid_decode",              test_cancel_mid_decode,              enccol_setup, enccol_teardown },
     { "enccol/cancel_waiter",                  test_cancel_waiter,                  enccol_setup, enccol_teardown },
     { "enccol/load_dom_refcount",              test_load_dom_refcount,              enccol_setup, enccol_teardown },
+    { "enccol/synth_zone",            test_synth_zone,            enccol_setup, enccol_teardown },
+    { "enccol/synth_chunk_zone",      test_synth_chunk_zone,      enccol_setup, enccol_teardown },
+    { "enccol/unique_flag",           test_unique_flag,           enccol_setup, enccol_teardown },
+    { "enccol/attach_refused",        test_attach_refused,        enccol_setup, enccol_teardown },
+    { "enccol/synth_matches_gen0",    test_synth_matches_gen0,    enccol_setup, enccol_teardown },
     { NULL, NULL, NULL, NULL },
 };

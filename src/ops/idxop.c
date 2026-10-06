@@ -1222,6 +1222,36 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx) {
     return attach_finalize(v, idx);
 }
 
+ray_t* ray_index_new_root(ray_idx_kind_t kind, int8_t parent_type, int64_t parent_len) {
+    return ray_index_alloc(kind, parent_type, parent_len);
+}
+
+/* The one admission predicate for a heap-built root (generation-2
+ * materialization, the validator and the writer share the matrix). */
+ray_t* ray_index_attach_persisted(ray_t** vp, ray_t* root) {
+    if (!root || RAY_IS_ERR(root) || root->type != RAY_INDEX) {
+        if (root && !RAY_IS_ERR(root)) ray_release(root);
+        return ray_error("type", "attach_persisted: not an index object");
+    }
+    ray_index_t* ix = ray_index_payload(root);
+    ray_t* v = vp ? *vp : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
+        (v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX))) {
+        ray_release(root);
+        return ray_error("type", "attach_persisted: needs a fresh plain vector");
+    }
+    if (!ray_index_kind_admits((ray_idx_kind_t)ix->kind, v->type) ||
+        ix->parent_type != v->type || ix->built_for_len != v->len) {
+        int k = ix->kind;
+        ray_release(root);
+        return ray_error("corrupt", "index kind %d is not admitted on type %d", k, (int)v->type);
+    }
+    v = ray_cow(v);
+    if (!v || RAY_IS_ERR(v)) { ray_release(root); return v ? v : ray_error("oom", NULL); }
+    *vp = v;
+    return attach_finalize(v, root);
+}
+
 static bool idx_numeric_parent(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
            t == RAY_F32 || t == RAY_F64 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;

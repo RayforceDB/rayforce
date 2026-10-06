@@ -383,6 +383,14 @@ void      ray_dict_acc_free(ray_dict_acc_t* a);
 
 /* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
+/* Attach a heap-built root to a fresh plain vector.  Consumes `root` on
+ * success and on error; refuses (corrupt) a pair the matrix does not
+ * admit, a root whose parent_type or built_for_len disagree, a slice, or
+ * a vector already indexed. */
+ray_t* ray_index_attach_persisted(ray_t** vp, ray_t* root);
+/* A zeroed RAY_INDEX block of `kind` for a parent (public wrapper of the
+ * allocator used by every builder). */
+ray_t* ray_index_new_root(ray_idx_kind_t kind, int8_t parent_type, int64_t parent_len);
 /* Spec "Materialization" step 3 admission matrix:
  * numeric and temporal types carry HASH, SORT, BLOOM, PART, ZONE,
  * CHUNK_ZONE and a marker-only root; SYM carries HASH, PART and a

@@ -836,8 +836,116 @@ static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
     return NULL;
 }
 
-/* Task 9 attaches synthesized indexes here; until then nothing to do. */
-static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) { (void)e; (void)vp; return NULL; }
+static double dbl_of(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
+
+/* ZONE: combined min/max (first of ties wins, row order) and null count;
+ * 0/0 when no value (zone_scan_int / zone_scan_float, src/ops/idxop.c). */
+static ray_t* enc_synth_zone(ray_enccol_t* e) {
+    ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_ZONE, e->type, e->len);
+    if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: zone", e->path);
+    ray_index_t* ix = ray_index_payload(root);
+    bool fl = enc_type_float(e->type), have = false;
+    int64_t mn = 0, mx = 0;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_dirent_t de; dirent_at(e, c, &de);
+        if (de.flags & RAY_ENC_STAT_ABSENT) continue;
+        bool lt = fl ? dbl_of(de.min) < dbl_of(mn) : de.min < mn;
+        bool gt = fl ? dbl_of(de.max) > dbl_of(mx) : de.max > mx;
+        if (!have || lt) mn = de.min;
+        if (!have || gt) mx = de.max;
+        have = true;
+    }
+    if (fl) { ix->u.zone.min_f = have ? dbl_of(mn) : 0.0; ix->u.zone.max_f = have ? dbl_of(mx) : 0.0; }
+    else    { ix->u.zone.min_i = have ? mn : 0;          ix->u.zone.max_i = have ? mx : 0; }
+    ix->u.zone.n_nulls = e->null_count;
+    return root;
+}
+
+/* CHUNK_ZONE at chunk_log2 16 (the builder default) from the directory;
+ * all-null chunks keep the builder's empty extrema (INT64_MAX / INT64_MIN,
+ * +inf / -inf); aggs [sum_lo | non-null rows | sum_hi] for the integer
+ * types, as the builder, none for floats. */
+static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
+    ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_CHUNK_ZONE, e->type, e->len);
+    if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: chunk zone", e->path);
+    ray_index_t* ix = ray_index_payload(root);
+    uint32_t nc = (uint32_t)e->n_chunks;
+    bool fl = enc_type_float(e->type);
+    ix->u.chunk_zone.n_chunks = nc;
+    ix->u.chunk_zone.chunk_log2 = 16;
+    ix->u.chunk_zone.is_f64 = fl ? 1 : 0;
+    ray_t* mins = ray_vec_new(fl ? RAY_F64 : RAY_I64, nc);
+    ray_t* maxs = ray_vec_new(fl ? RAY_F64 : RAY_I64, nc);
+    ray_t* nb   = ray_vec_new(RAY_U8, (nc + 7) / 8);
+    ray_t* aggs = fl ? NULL : ray_vec_new(RAY_I64, 3 * (int64_t)nc);
+    /* Stored before any check so ray_release(root) frees what exists. */
+    ix->u.chunk_zone.mins = (mins && !RAY_IS_ERR(mins)) ? mins : NULL;
+    ix->u.chunk_zone.maxs = (maxs && !RAY_IS_ERR(maxs)) ? maxs : NULL;
+    ix->u.chunk_zone.null_bits = (nb && !RAY_IS_ERR(nb)) ? nb : NULL;
+    ix->u.chunk_zone.aggs = (aggs && !RAY_IS_ERR(aggs)) ? aggs : NULL;
+    if (!ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs || !ix->u.chunk_zone.null_bits ||
+        (!fl && !ix->u.chunk_zone.aggs) || enc_alloc_fails(e)) {
+        ray_release(root);
+        return ray_error("oom", "col %s: chunk zone", e->path);
+    }
+    mins->len = maxs->len = nc;
+    nb->len = (nc + 7) / 8;
+    memset(ray_data(nb), 0, (size_t)nb->len);
+    if (aggs) aggs->len = 3 * (int64_t)nc;
+    for (uint32_t c = 0; c < nc; c++) {
+        ray_enc_dirent_t de; dirent_at(e, c, &de);
+        bool absent = de.flags & RAY_ENC_STAT_ABSENT;
+        if (fl) {
+            ((double*)ray_data(mins))[c] = absent ? INFINITY  : dbl_of(de.min);
+            ((double*)ray_data(maxs))[c] = absent ? -INFINITY : dbl_of(de.max);
+        } else {
+            ((int64_t*)ray_data(mins))[c] = absent ? INT64_MAX : de.min;
+            ((int64_t*)ray_data(maxs))[c] = absent ? INT64_MIN : de.max;
+        }
+        if (de.null_count) ((uint8_t*)ray_data(nb))[c >> 3] |= (uint8_t)(1u << (c & 7));
+        if (aggs) {
+            int64_t* ag = (int64_t*)ray_data(aggs);
+            ag[c] = (int64_t)de.sum_lo;
+            ag[nc + c] = chunk_rows(e, c) - (int64_t)de.null_count;
+            ag[2 * (int64_t)nc + c] = (int64_t)de.sum_hi;
+        }
+    }
+    return root;
+}
+
+/* ZONE / CHUNK_ZONE roots are synthesized from the verified directory and
+ * the UNIQUE marker from the column flag; every attach goes through the
+ * admission predicate, a refusal is corrupt. */
+static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
+    uint8_t kind = e->hdr.index_kind;
+    bool unique = e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE;
+    if (kind == 0 && !unique) return NULL;
+    ray_t* root = NULL;
+    if (kind == RAY_IDX_ZONE || kind == RAY_IDX_CHUNK_ZONE) {
+        if (!ray_zone_acc_supported(e->type))
+            return ray_error("corrupt", "col %s: zone index on type %s", e->path, ray_type_name(e->type));
+        root = kind == RAY_IDX_ZONE ? enc_synth_zone(e) : enc_synth_chunk_zone(e);
+        if (RAY_IS_ERR(root)) return root;
+    } else if (kind != 0) {
+        return ray_error("corrupt", "col %s: index kind %u without a region", e->path, kind);
+    }
+    if (unique) {
+        if (!root) {
+            root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_NONE, e->type, e->len);
+            if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: unique marker", e->path);
+        }
+        ray_index_payload(root)->markers |= RAY_MARK_UNIQUE;
+    }
+    ray_t* r = ray_index_attach_persisted(vp, root);    /* consumes root */
+    if (RAY_IS_ERR(r)) {
+        if (strcmp(ray_err_code(r), "oom") == 0) return r;
+        ray_error_free(r);
+        return ray_error("corrupt", "col %s: index or UNIQUE flag not admitted on type %s",
+                         e->path, ray_type_name(e->type));
+    }
+    *vp = r;
+    return NULL;
+}
 
 static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
