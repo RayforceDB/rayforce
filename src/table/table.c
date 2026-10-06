@@ -320,6 +320,10 @@ ray_t* ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s) {
     return slot_parted_seg(tbl_slot_by_idx(tbl, idx), s);
 }
 
+/* aux[0] of a parted SYM/STR wrapper: its null presence once computed. */
+#define PARTED_TEXT_NULLS_KNOWN 0x01
+#define PARTED_TEXT_NULLS_HAS   0x02
+
 bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     ray_t* c = tbl_slot_by_name(tbl, name_id);
     if (!c) return false;
@@ -328,6 +332,18 @@ bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     if (m.null_count >= 0) return m.null_count > 0;          /* generation 2: directory */
     if (m.enc) return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
     if (RAY_IS_PARTED(c->type)) {             /* the wrapper carries no flag: ask each segment */
+        /* A text wrapper caches its answer in aux[0] (PARTED_TEXT_NULLS_*):
+         * the segment scans run once per wrapper, not on every planning
+         * call.  A wrapper is never edited in place (an insert builds a new
+         * one, aux zeroed) and its loaded segments are read-only.  The byte
+         * is written with the same value by any racing caller. */
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(c->type);
+        bool text_base = base == RAY_SYM || base == RAY_STR;
+        if (text_base) {
+            uint8_t k = __atomic_load_n(&c->aux[0], __ATOMIC_RELAXED);
+            if (k & PARTED_TEXT_NULLS_KNOWN) return (k & PARTED_TEXT_NULLS_HAS) != 0;
+        }
+        bool any = false;
         ray_t** segs = (ray_t**)ray_data(c);
         for (int64_t i = 0; i < c->len; i++) {
             ray_col_meta_t sm;
@@ -338,9 +354,12 @@ bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
                         * the payload (text nulls are in-band, no flag) */
                        : text ? ray_vec_has_nulls(segs[i])
                        : (sm.attrs & RAY_ATTR_HAS_NULLS) != 0;
-            if (nulls) return true;
+            if (nulls) { any = true; break; }
         }
-        return false;
+        if (text_base)
+            __atomic_store_n(&c->aux[0], (uint8_t)(PARTED_TEXT_NULLS_KNOWN |
+                             (any ? PARTED_TEXT_NULLS_HAS : 0)), __ATOMIC_RELAXED);
+        return any;
     }
     return ray_is_vec(c) && ray_vec_has_nulls(c);            /* generation 0: today's scan */
 }

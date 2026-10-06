@@ -16235,8 +16235,8 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
     ray_col_meta_t vm;
     if (val_node->type == -RAY_SYM && ray_table_col_meta(tbl, val_node->i64, &vm)) return 0;
     if (!ray_is_atom(val_node)) return 0;
+    if (m.index_kind != RAY_IDX_HASH) return 0;            /* metadata first: no null scan */
     if (ray_table_col_has_nulls(tbl, col_sym)) return 0;
-    if (m.index_kind != RAY_IDX_HASH) return 0;
     if (m.type == RAY_F64 || m.type == RAY_STR || m.type == RAY_GUID) return 0;
     ray_t* ix;
     ray_t* ie = ray_table_col_index(tbl, col_sym, &ix);

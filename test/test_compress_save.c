@@ -2170,9 +2170,13 @@ static test_result_t test_first_asc_parted_text_nulls(void) {
             tf = ray_table_add_col(tf, ray_sym_intern("p", 1), fl);
             ray_release(fl);
             bool has = ray_table_col_has_nulls(t, ray_sym_intern("p", 1));
+            /* the answer is cached on the wrapper: later calls scan nothing */
+            bool cached = (ray_table_slot(t, ray_sym_intern("p", 1))->aux[0] & 0x01) != 0;
+            bool again = ray_table_col_has_nulls(t, ray_sym_intern("p", 1));
             int parted = first_asc_stays(t, "p"), flat = first_asc_stays(tf, "p");
             ray_release(t); ray_release(tf);
             TEST_ASSERT_FMT(has == (bool)with_null, "type %d null %d: has_nulls %d", tys[ti], with_null, has);
+            TEST_ASSERT_FMT(cached && again == has, "type %d null %d: cached %d", tys[ti], with_null, cached);
             TEST_ASSERT_FMT(parted == flat, "type %d null %d: parted route %d, flat %d", tys[ti], with_null, parted, flat);
         }
     }
