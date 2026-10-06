@@ -304,13 +304,19 @@ bool ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
 }
 
 /* ---- readers ---- */
+/* The reason of the last failed ray_enc_read on this thread, so a corrupt
+ * file's error names the rule that fired.  Not format. */
+static _Thread_local const char* rd_why;
+const char* ray_enc_read_why(void) { return rd_why ? rd_why : "unknown"; }
+#define RD_FAIL(why) ((void)(rd_why = (why)), -1)
+
 static bool get_raw(const uint8_t* p, size_t avail, int n, int T, uint64_t* out, int64_t* used) {
     int64_t sz = ray_enc_size_raw(n, T);
-    if ((size_t)sz > avail) return false;
+    if ((size_t)sz > avail) { rd_why = "RAW body short"; return false; }
     for (int i = 0; i < n; i++) {
         uint64_t x = 0; memcpy(&x, p + (size_t)i * (size_t)T / 8, (size_t)T / 8); out[i] = x;
     }
-    for (int64_t i = (int64_t)n * T / 8; i < sz; i++) if (p[i]) return false;   /* zero padding */
+    for (int64_t i = (int64_t)n * T / 8; i < sz; i++) if (p[i]) { rd_why = "RAW padding not zero"; return false; }   /* zero padding */
     *used = sz;
     return true;
 }
@@ -320,8 +326,8 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
                          const ray_enc_dict_t* dict, uint64_t* out) {
     const uint64_t m = tmask(k.T);
     int64_t used;
-    if (!enc_legal(enc, slot, depth, k, dict)) return -1;
-    if (w != 0 && enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP) return -1;   /* width only for BP */
+    if (!enc_legal(enc, slot, depth, k, dict)) return RD_FAIL("encoding illegal in this slot or depth");
+    if (w != 0 && enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP) return RD_FAIL("width on a non-packed encoding");   /* width only for BP */
     switch (enc) {
     case RAY_ENC_RAW:
         return get_raw(p, avail, n, k.T, out, &used) ? used : -1;
@@ -332,9 +338,10 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
         return used;
     }
     case RAY_ENC_FOR_BP: {
-        if (w > k.T || avail < (size_t)ray_enc_size_for(w)) return -1;
+        if (w > k.T) return RD_FAIL("FOR_BP width above the type width");
+        if (avail < (size_t)ray_enc_size_for(w)) return RD_FAIL("FOR_BP body short");
         uint64_t base; memcpy(&base, p, 8);
-        if (base & ~m) return -1;
+        if (base & ~m) return RD_FAIL("FOR_BP base above the type width");
         uint64_t u[RAY_ENC_VEC];
         ray_enc_unpack(p + 8, k.T, w, u);
         for (int i = 0; i < n; i++) out[i] = (base + u[i]) & m;
@@ -342,22 +349,24 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
     }
     case RAY_ENC_DELTA_BP: {
         const int L = RAY_ENC_VEC / k.T;
-        if (w > k.T || avail < (size_t)ray_enc_size_delta(k.T, w)) return -1;
+        if (w > k.T) return RD_FAIL("DELTA_BP width above the type width");
+        if (avail < (size_t)ray_enc_size_delta(k.T, w)) return RD_FAIL("DELTA_BP body short");
         uint64_t dbase; memcpy(&dbase, p, 8);
-        if (dbase & ~m) return -1;
+        if (dbase & ~m) return RD_FAIL("DELTA_BP base above the type width");
         uint64_t full[RAY_ENC_VEC], r[RAY_ENC_VEC];
-        for (int l = 0; l < L; l++) { memcpy(&full[l], p + 8 + 8 * (size_t)l, 8); if (full[l] & ~m) return -1; }
+        for (int l = 0; l < L; l++) { memcpy(&full[l], p + 8 + 8 * (size_t)l, 8); if (full[l] & ~m) return RD_FAIL("DELTA_BP head above the type width"); }
         ray_enc_unpack(p + 8 + 8 * (size_t)L, k.T, w, r);
-        for (int i = 0; i < L; i++) if (r[i]) return -1;   /* placeholders are zero */
+        for (int i = 0; i < L; i++) if (r[i]) return RD_FAIL("DELTA_BP placeholder not zero");   /* placeholders are zero */
         for (int i = L; i < RAY_ENC_VEC; i++) full[i] = (full[i - L] + dbase + r[i]) & m;
         memcpy(out, full, sizeof(uint64_t) * (size_t)n);
         return ray_enc_size_delta(k.T, w);
     }
     case RAY_ENC_RLE: {
-        if (avail < 8) return -1;
+        if (avail < 8) return RD_FAIL("RLE header short");
         uint32_t nr; memcpy(&nr, p, 4);
         uint32_t rsv; memcpy(&rsv, p + 4, 4);
-        if (rsv || nr == 0 || nr > (uint32_t)n) return -1;
+        if (rsv) return RD_FAIL("RLE reserved word not zero");
+        if (nr == 0 || nr > (uint32_t)n) return RD_FAIL("RLE run count out of range");
         uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC];
         ray_enc_kind_t vk = slot_child_kind(RAY_ENC_SLOT_RLE_VALUES, k);
         int64_t a = ray_enc_read(p + 8, avail - 8, 0, 0, (int)nr, vk, RAY_ENC_SLOT_RLE_VALUES, depth + 1,
@@ -367,36 +376,40 @@ static int64_t read_body(const uint8_t* p, size_t avail, uint8_t enc, uint8_t w,
         if (e < 0) return -1;
         uint64_t prev = 0;
         for (uint32_t i = 0; i < nr; i++) {
-            if (ends[i] <= prev || ends[i] > (uint64_t)n) return -1;   /* strictly ascending */
+            if (ends[i] <= prev || ends[i] > (uint64_t)n) return RD_FAIL("RLE run ends not ascending or past the vector");   /* strictly ascending */
             for (uint64_t j = prev; j < ends[i]; j++) out[j] = vals[i];
             prev = ends[i];
         }
-        if (prev != (uint64_t)n) return -1;                           /* last end is n */
+        if (prev != (uint64_t)n) return RD_FAIL("RLE last run end is not the vector length");                           /* last end is n */
         return 8 + a + e;
     }
     case RAY_ENC_DICT: {
-        if (!dict) return -1;                                         /* never dereference a missing dictionary */
+        if (!dict) return RD_FAIL("DICT without a dictionary");                                         /* never dereference a missing dictionary */
         uint64_t codes[RAY_ENC_VEC];
         int64_t c = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_CODES, depth + 1, NULL, codes);
         if (c < 0) return -1;
-        for (int i = 0; i < n; i++) { if (codes[i] >= dict->n) return -1; out[i] = dict->v[codes[i]]; }
+        for (int i = 0; i < n; i++) { if (codes[i] >= dict->n) return RD_FAIL("DICT code outside the dictionary"); out[i] = dict->v[codes[i]]; }
         return c;
     }
     }
-    return -1;
+    return RD_FAIL("unknown encoding");
 }
 
 int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
                      const ray_enc_dict_t* dict, uint64_t* out) {
-    if (depth > RAY_ENC_DEPTH_MAX || n < 0 || n > RAY_ENC_VEC) return -1;
+    if (depth > RAY_ENC_DEPTH_MAX) return RD_FAIL("cascade deeper than the maximum");
+    if (n < 0 || n > RAY_ENC_VEC) return RD_FAIL("vector length out of range");
     if (depth == 0) return read_body(p, avail, enc, width, n, k, slot, depth, dict, out);
-    if (avail < 8) return -1;
+    if (avail < 8) return RD_FAIL("child header short");
     uint16_t rsv; memcpy(&rsv, p + 2, 2);
     uint32_t bb;  memcpy(&bb, p + 4, 4);
-    if (rsv || (bb & 7) || bb > avail - 8) return -1;
+    if (rsv) return RD_FAIL("child header reserved bytes not zero");
+    if (bb & 7) return RD_FAIL("child body size not a multiple of 8");
+    if (bb > avail - 8) return RD_FAIL("child body overruns its parent");
     int64_t used = read_body(p + 8, bb, p[0], p[1], n, k, slot, depth, dict, out);
-    if (used != (int64_t)bb) return -1;
+    if (used < 0) return -1;
+    if (used != (int64_t)bb) return RD_FAIL("child body not fully consumed");
     return 8 + (int64_t)bb;
 }
 

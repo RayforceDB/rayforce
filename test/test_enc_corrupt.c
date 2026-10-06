@@ -33,11 +33,22 @@
 #include "store/encw.h"
 #include "store/enccol.h"
 #include "vec/str.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+/* The generation-2 corruption suite.  Each test crafts exactly one rule
+ * violation on an otherwise valid file and asserts the error code and a
+ * message needle naming the rule that fired (and the column path), so a
+ * rule that stops firing, or a different rule firing in its place, fails
+ * the test.  Organized by the spec's "Validation" list: headers, directory,
+ * side data, descriptors, payloads, codec grammar, lazy validation, fuzz.
+ * Index region parsing is Task P4 and is not covered here. */
+
+/* structural flips (headers, directory, descriptors) must be rejected at least this often; measured 94.8% */
+#define STRUCT_MIN_PCT 90
 #define EC_TMP "/tmp/rayforce_enccorrupt"
 static void ec_setup(void) {
     ray_heap_init(); (void)ray_sym_init(); (void)ray_test_mkdir_p(EC_TMP);
@@ -46,73 +57,231 @@ static void ec_setup(void) {
 static uint8_t* g_img; static size_t g_len;
 static void ec_teardown(void) { free(g_img); g_img = NULL; ray_sym_destroy(); ray_heap_destroy(); (void)ray_test_rm_rf(EC_TMP); }
 
-static void img_load(const char* p) {
-    free(g_img); FILE* f = fopen(p, "rb"); fseek(f, 0, SEEK_END); g_len = (size_t)ftell(f);
-    fseek(f, 0, SEEK_SET); g_img = malloc(g_len); fread(g_img, 1, g_len, f); fclose(f);
+static bool img_load(const char* p) {
+    free(g_img); g_img = NULL; g_len = 0;
+    FILE* f = fopen(p, "rb"); if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f); if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    g_len = (size_t)sz; g_img = malloc(g_len ? g_len : 1);
+    bool ok = g_img && fread(g_img, 1, g_len, f) == g_len;
+    fclose(f);
+    return ok;
 }
-static void img_store(const char* p, size_t n) { FILE* f = fopen(p, "wb"); fwrite(g_img, 1, n, f); fclose(f); }
+static bool img_store(const char* p, size_t n) {
+    FILE* f = fopen(p, "wb"); if (!f) return false;
+    bool ok = fwrite(g_img, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
 static uint64_t rd64(size_t off) { uint64_t x; memcpy(&x, g_img + off, 8); return x; }
 static void wr(size_t off, const void* b, size_t n) { memcpy(g_img + off, b, n); }
-/* file offset of chunk c's descriptor j, and of its payload */
-static size_t desc_at(int c, int j) { return (size_t)rd64(96 + 64 * (size_t)c) + 48 * (size_t)j; }
-static size_t payload_at(int c, int j) { return (size_t)rd64(96 + 64 * (size_t)c) + (size_t)rd64(desc_at(c, j) + 8); }
+static void W8(size_t off, uint8_t v)   { wr(off, &v, 1); }
+static void W16(size_t off, uint16_t v) { wr(off, &v, 2); }
+static void W32(size_t off, uint32_t v) { wr(off, &v, 4); }
+static void W64(size_t off, uint64_t v) { wr(off, &v, 8); }
 
-/* The error message names the column file. */
-static bool ec_names_path(ray_t* err, const char* path) {
-    (void)err;
+#define DIR(c) (96 + 64 * (size_t)(c))                          /* directory entry c */
+#define EH 32                                                   /* enc header */
+static size_t desc_at(int c, int j) { return (size_t)rd64(DIR(c)) + 48 * (size_t)j; }
+static size_t payload_at(int c, int j) { return (size_t)rd64(DIR(c)) + (size_t)rd64(desc_at(c, j) + 8); }
+static size_t chunk_end(int c) { return (size_t)(rd64(DIR(c)) + rd64(DIR(c) + 8)); }
+
+/* Resize the last chunk (nothing follows it) to `nb` bytes, keeping the end offset consistent. */
+static void set_chunk_bytes(int c, uint64_t nb) {
+    size_t nl = (size_t)rd64(DIR(c)) + (size_t)nb;
+    uint8_t* q = realloc(g_img, nl); if (q) g_img = q;
+    if (nl > g_len) memset(g_img + g_len, 0, nl - g_len);
+    g_len = nl;
+    W64(DIR(c) + 8, nb); W64(EH + 56, nl);
+}
+/* Replace everything after the chunks by a side data region of `n` bytes. */
+static void put_side(const uint8_t* bytes, size_t n) {
+    size_t prev = chunk_end(0);
+    size_t off = (prev + 31) & ~(size_t)31;
+    uint8_t* q = realloc(g_img, off + n); if (q) g_img = q;
+    memset(g_img + prev, 0, off - prev + n);
+    memcpy(g_img + off, bytes, n);
+    g_len = off + n;
+    W64(EH + 16, off); W64(EH + 24, n); W64(EH + 56, g_len);
+}
+/* Side table of `ne` entries (kind, offset, length) followed by `total` bytes. */
+static void side_table(uint8_t* buf, size_t total, int ne, const uint16_t* kind, const uint64_t* off, const uint64_t* len) {
+    memset(buf, 0, total);
+    uint32_t n = (uint32_t)ne; memcpy(buf, &n, 4);
+    for (int i = 0; i < ne; i++) {
+        memcpy(buf + 8 + 24 * i, &kind[i], 2);
+        memcpy(buf + 8 + 24 * i + 8, &off[i], 8);
+        memcpy(buf + 8 + 24 * i + 16, &len[i], 8);
+    }
+}
+
+static bool names_path(const char* path) {
     const char* m = ray_error_msg();
     return m && strstr(m, path) != NULL;
 }
+static bool has_needle(const char* needle) {
+    const char* m = ray_error_msg();
+    return m && strstr(m, needle) != NULL;
+}
 
-/* Expect `code` at load (stage 0) or at materialization (stage 1). */
-static const char* expect(const char* path, int stage, const char* code) {
-    static char why[256];
+/* Expect `code` at load (stage 0), at materialization (stage 1) or at a
+ * range read of the whole column (stage 2); the message must name the file
+ * and contain `needle`. */
+static const char* expect(const char* path, int stage, const char* code, const char* needle) {
+    static char why[512];
     ray_error_clear();
     ray_t* c = ray_col_mmap(path);
     if (stage == 0) {
-        if (!c || !RAY_IS_ERR(c)) { if (c) ray_release(c); snprintf(why, sizeof why, "loaded, want %s", code); return why; }
-        bool ok = strcmp(ray_err_code(c), code) == 0 && ec_names_path(c, path);
-        snprintf(why, sizeof why, "load gave %s want %s (path named: %d)", ray_err_code(c), code, ec_names_path(c, path));
+        if (!c || !RAY_IS_ERR(c)) { if (c && !RAY_IS_ERR(c)) ray_release(c); snprintf(why, sizeof why, "loaded, want %s [%s]", code, needle); return why; }
+        bool ok = strcmp(ray_err_code(c), code) == 0 && names_path(path) && has_needle(needle);
+        snprintf(why, sizeof why, "load gave %s: \"%s\", want %s [%s]", ray_err_code(c), ray_error_msg() ? ray_error_msg() : "", code, needle);
         ray_error_free(c);
         return ok ? NULL : why;
     }
-    if (!c || RAY_IS_ERR(c)) { snprintf(why, sizeof why, "load failed (%s)", c ? ray_err_code(c) : "null"); ray_error_free(c); return why; }
-    ray_t* m = ray_enccol_materialize(c);
-    bool ok = m && RAY_IS_ERR(m) && strcmp(ray_err_code(m), code) == 0 && ec_names_path(m, path);
-    snprintf(why, sizeof why, "materialize gave %s want %s (path named: %d)", (m && RAY_IS_ERR(m)) ? ray_err_code(m) : "a column", code,
-             (m && RAY_IS_ERR(m)) ? ec_names_path(m, path) : 0);
-    if (m && RAY_IS_ERR(m)) ray_error_free(m);
+    if (!c || RAY_IS_ERR(c)) {
+        snprintf(why, sizeof why, "load failed (%s: %s), want %s at stage %d [%s]", c ? ray_err_code(c) : "null",
+                 ray_error_msg() ? ray_error_msg() : "", code, stage, needle);
+        if (c) ray_error_free(c);
+        return why;
+    }
+    ray_t* m;
+    ray_col_src_t src; ray_col_scratch_t sc;
+    if (stage == 1) {
+        m = ray_enccol_materialize(c);
+    } else {
+        m = ray_col_src_bind(c, &src);
+        if (!m) {
+            ray_col_scratch_init(&sc);
+            ray_col_range_t r;
+            for (int64_t at = 0; at < src.len && !m; at += RAY_ENC_VEC) {
+                int64_t n = src.len - at < RAY_ENC_VEC ? src.len - at : RAY_ENC_VEC;
+                m = ray_col_range(&src, at, n, &sc, &r);
+            }
+            ray_col_scratch_free(&sc); ray_col_src_release(&src);
+        }
+    }
+    bool is_err = m && RAY_IS_ERR(m);
+    bool ok = is_err && strcmp(ray_err_code(m), code) == 0 && names_path(path) && has_needle(needle);
+    snprintf(why, sizeof why, "stage %d gave %s: \"%s\", want %s [%s]", stage,
+             is_err ? ray_err_code(m) : "a column", is_err && ray_error_msg() ? ray_error_msg() : "", code, needle);
+    if (is_err) ray_error_free(m);
     ray_release(c);
     return ok ? NULL : why;
 }
 
-#define EXPECT(path, stage, code) do { const char* w_ = expect(path, stage, code); \
+#define EXPECT(path, stage, code, needle) do { const char* w_ = expect(path, stage, code, needle); \
     TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
+/* write the patched image and expect */
+#define BAD(path, stage, code, needle) do { TEST_ASSERT_TRUE(img_store(path, g_len)); EXPECT(path, stage, code, needle); } while (0)
 
-static void save_vec(ray_t* v, const char* p) { (void)ray_col_save_gen(v, p, 2); ray_release(v); img_load(p); }
+static void save_vec(ray_t* v, const char* p) {
+    ray_err_t e = ray_col_save_gen(v, p, 2); ray_release(v);
+    if (e != RAY_OK) { free(g_img); g_img = NULL; g_len = 0; return; }
+    (void)img_load(p);
+}
+#define SAVE(v, p) do { save_vec((v), (p)); TEST_ASSERT_TRUE(g_img != NULL); } while (0)
 
-/* Pinned by hand against ray_enc_choose (and asserted before any patch):
- * BOOL runs of 100 -> top-level RLE, 64 B: [u32 11][u32 0]
- * [values hdr: RAW, body 16 @+8][values @+16][ends hdr: RAW, body 24 @+32]
- * [ends U16 @+40]; BOOL has no DICT, so no dictionary competes. */
+#define NEED_ENC(c, j, enc) TEST_ASSERT_FMT(g_img[desc_at(c, j)] == (enc), \
+    "descriptor %d.%d is encoding %d, the test pins %d", c, j, g_img[desc_at(c, j)], enc)
+
+/* ---- fixtures (each pinned by hand against ray_enc_choose and asserted before any patch) ---- */
+
+/* BOOL runs of 100 -> top-level RLE, 64 B payload: [u32 11][u32 0]
+ * [values hdr: RAW, body 16 @+8][values @+16][ends hdr: RAW, body 24 @+32][ends U16 @+40]. */
 static ray_t* bool_runs(void) {
     ray_t* v = ray_vec_new(RAY_BOOL, 1024); v->len = 1024;
     for (int i = 0; i < 1024; i++) ((uint8_t*)ray_data(v))[i] = (uint8_t)((i / 100) & 1);
     return v;
 }
-
-/* Four wide values at hash-scattered rows -> DICT with a FOR_BP w=2 codes
- * child (272 B) and a VALUE_DICT side entry. */
+static ray_t* bool_const(void) {
+    ray_t* v = ray_vec_new(RAY_BOOL, 1024); v->len = 1024; memset(ray_data(v), 0, 1024);
+    return v;
+}
+/* Four wide values at hash-scattered rows -> DICT, FOR_BP w=2 codes child, VALUE_DICT side entry. */
 static ray_t* i64_dict(void) {
     static const int64_t vals[4] = { 11, 900000000001ll, 77, 123456789012345ll };
     ray_t* v = ray_vec_new(RAY_I64, 1024); v->len = 1024;
     for (int i = 0; i < 1024; i++) ((int64_t*)ray_data(v))[i] = vals[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
     return v;
 }
-
-#define NEED_ENC(c, j, enc) TEST_ASSERT_FMT(g_img[desc_at(c, j)] == (enc), \
-    "descriptor %d.%d is encoding %d, the test pins %d", c, j, g_img[desc_at(c, j)], enc)
-
+/* Three wide values: an I32 VALUE_DICT of 12 bytes plus 4 bytes of padding. */
+static ray_t* i32_dict3(void) {
+    static const int32_t vals[3] = { 11, 900000001, 77 };
+    ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) ((int32_t*)ray_data(v))[i] = vals[((uint32_t)((uint32_t)i * 2654435761u) >> 30) % 3];
+    return v;
+}
+/* 100 scattered 32-bit values, a null at every tenth row: RAW with a 128-byte bitmap first. */
+static ray_t* i32_nulls_raw(void) {
+    ray_t* v = ray_vec_new(RAY_I32, 100); v->len = 100;
+    for (int i = 0; i < 100; i++) ((int32_t*)ray_data(v))[i] = i % 10 ? (int32_t)((uint32_t)i * 2654435761u >> 1) : NULL_I32;
+    return v;
+}
+static ray_t* i32_for(void) {
+    ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) ((int32_t*)ray_data(v))[i] = 1000 + (int32_t)(((uint32_t)i * 2654435761u) >> 27);
+    return v;
+}
+/* Rising with a jitter: lane deltas stay narrow, so DELTA_BP wins. */
+static ray_t* i32_delta(void) {
+    ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) ((int32_t*)ray_data(v))[i] = i * 3 + (i * 7) % 5;
+    return v;
+}
+static ray_t* i32_allnull(void) {
+    ray_t* v = ray_vec_new(RAY_I32, 10); v->len = 10;
+    for (int i = 0; i < 10; i++) ((int32_t*)ray_data(v))[i] = NULL_I32;
+    return v;
+}
+static ray_t* f64_plain(void) {
+    double d[4] = { 1.0, 2.0, 3.0, 4.0 };
+    return ray_vec_from_raw(RAY_F64, d, 4);
+}
+static ray_t* f64_stats(void) {
+    ray_t* f = ray_vec_new(RAY_F64, 100); f->len = 100;
+    for (int i = 0; i < 100; i++) ((double*)ray_data(f))[i] = i;
+    return f;
+}
+/* Two non-canonical NaNs at rows 0 and 1: bitmap bits 0,1 and a trailer of two. */
+static ray_t* f64_two_odd(void) {
+    uint64_t a = 0x7FF8000000000001ull, b = 0x7FF8000000000002ull; double d[4] = { 0, 0, 1.0, 2.0 };
+    memcpy(&d[0], &a, 8); memcpy(&d[1], &b, 8);
+    return ray_vec_from_raw(RAY_F64, d, 4);
+}
+static ray_t* f32_odd(void) {
+    uint32_t odd = 0x7FC00001u; float d[4] = { 2.5f, NULL_F32, 0, -1.0f };
+    memcpy(&d[2], &odd, 4);
+    return ray_vec_from_raw(RAY_F32, d, 4);
+}
+static ray_t* f32_plain(void) {
+    float d[3] = { 1.0f, 2.0f, 3.0f };
+    return ray_vec_from_raw(RAY_F32, d, 3);
+}
+static ray_t* f32_const(void) {
+    ray_t* v = ray_vec_new(RAY_F32, 64); v->len = 64;
+    for (int i = 0; i < 64; i++) ((float*)ray_data(v))[i] = 2.5f;
+    return v;
+}
+static ray_t* guid_raw(void) {
+    ray_t* g = ray_vec_new(RAY_GUID, 4); g->len = 4;
+    for (int i = 0; i < 64; i++) ((uint8_t*)ray_data(g))[i] = (uint8_t)(i * 37 + 1);
+    return g;
+}
+static ray_t* guid_const(void) {
+    ray_t* g = ray_vec_new(RAY_GUID, 4); g->len = 4; memset(ray_data(g), 5, 64);
+    return g;
+}
+/* "short" inline (descriptor 0, bytes 0..15), a pooled string (descriptor 1, bytes 16..31;
+ * pool_off at 24, hash32 at 28), pool length @+32, pool @+40. */
+static ray_t* str_mixed(void) {
+    ray_t* s = ray_vec_new(RAY_STR, 2);
+    s = ray_str_vec_append(s, "short", 5);
+    return ray_str_vec_append(s, "a pooled string here", 20);
+}
+static ray_t* str_const(void) {
+    ray_t* s = ray_vec_new(RAY_STR, 8);
+    for (int i = 0; i < 8; i++) s = ray_str_vec_append(s, "a constant pooled string!", 25);
+    return s;
+}
 /* A SYM vector of `n` ids written with saved count 200. */
 static void save_sym200(const uint8_t* ids, int n, const char* p) {
     FILE* f = fopen(p, "wb+");
@@ -121,174 +290,423 @@ static void save_sym200(const uint8_t* ids, int n, const char* p) {
     (void)ray_encw_chunk(&w, ids, NULL, n);
     (void)ray_encw_finish(&w);
     ray_encw_free(&w); fclose(f);
-    img_load(p);
+    (void)img_load(p);
 }
+#define SAVE_SYM(ids, n, p) do { save_sym200((ids), (n), (p)); TEST_ASSERT_TRUE(g_img != NULL); } while (0)
 
+/* ---- outer header, enc header ---- */
 static test_result_t test_reject_headers(void) {
     const char* p = EC_TMP "/h";
-    uint8_t b; uint16_t v16; uint32_t v32; uint64_t v64;
-    save_vec(bool_runs(), p);
-    b = 0; wr(17, &b, 1); img_store(p, g_len); EXPECT(p, 0, "corrupt");             /* (order 0, "XENC") */
-    save_vec(bool_runs(), p);
-    v32 = RAY_ENC_XIDX; wr(0, &v32, 4); img_store(p, g_len); EXPECT(p, 0, "corrupt"); /* (order 2, "XIDX") */
-    save_vec(bool_runs(), p);
-    v32 = 0; wr(0, &v32, 4); img_store(p, g_len); EXPECT(p, 0, "corrupt");          /* (order 2, zero aux) */
-    save_vec(bool_runs(), p);
-    v16 = 2; wr(36, &v16, 2); img_store(p, g_len); EXPECT(p, 0, "version");
-    save_vec(bool_runs(), p);
-    b = 'X'; wr(32, &b, 1); img_store(p, g_len); EXPECT(p, 0, "corrupt");           /* magic */
-    save_vec(bool_runs(), p);
-    b = 7; wr(38, &b, 1); img_store(p, g_len); EXPECT(p, 0, "corrupt");             /* index kind 7 */
-    save_vec(bool_runs(), p);
-    v64 = 1; wr(32 + 48, &v64, 8); img_store(p, g_len); EXPECT(p, 0, "corrupt");    /* str_pool_bytes on BOOL */
-    /* STR: str_pool_bytes above UINT32_MAX (load) and one byte off the built pool (materialization) */
-    for (int k = 0; k < 2; k++) {
-        ray_t* st = ray_vec_new(RAY_STR, 2);
-        st = ray_str_vec_append(st, "a pooled string here", 20); st = ray_str_vec_append(st, "x", 1);
-        save_vec(st, p);
-        v64 = k == 0 ? 0x100000000ull : rd64(32 + 48) + 1;
-        wr(32 + 48, &v64, 8); img_store(p, g_len);
-        if (k == 0) EXPECT(p, 0, "corrupt"); else EXPECT(p, 1, "corrupt");
+    /* (order 0, "XENC"), (order 2, "XIDX"), (order 2, zero aux): encfmt/discriminator_cross_pairs;
+     * version 2, truncation: enccol/load_rejects. Here: every other header rule. */
+    SAVE(bool_runs(), p); W8(18, 0);              BAD(p, 0, "corrupt", "not storable in generation 2");
+    SAVE(bool_runs(), p); W8(19, 1);              BAD(p, 0, "corrupt", "width bits on a non-SYM column");
+    SAVE(bool_runs(), p); W8(19, 0x08);           BAD(p, 0, "corrupt", "outside the persisted set");
+    SAVE(bool_runs(), p); W32(20, 5);             BAD(p, 0, "corrupt", "SYM count on a non-SYM column");
+    SAVE(bool_runs(), p); W64(24, (uint64_t)-1);  BAD(p, 0, "corrupt", "negative length");
+    SAVE(bool_runs(), p); W64(24, 1ull << 40);    BAD(p, 0, "corrupt", "exceeds what the file holds");
+    SAVE(bool_runs(), p); W8(5, 1);               BAD(p, 0, "corrupt", "reserved header bytes set");
+    SAVE(bool_runs(), p); W8(16, 1);              BAD(p, 0, "corrupt", "header mmod byte set");
+    SAVE(bool_runs(), p); W8(EH, 'X');            BAD(p, 0, "corrupt", "missing RENC header");
+    SAVE(bool_runs(), p); W16(EH + 4, 2);         BAD(p, 0, "version", "header version 2");
+    SAVE(bool_runs(), p); W8(EH + 6, 7);          BAD(p, 0, "corrupt", "index kind 7");
+    ray_t* g = guid_raw(); SAVE(g, p); W8(EH + 6, 3); BAD(p, 0, "corrupt", "not admitted on type");  /* ZONE on GUID */
+    SAVE(guid_raw(), p);  W8(EH + 7, 1);          BAD(p, 0, "corrupt", "UNIQUE not admitted");
+    SAVE(bool_runs(), p); W8(EH + 7, 2);          BAD(p, 0, "corrupt", "reserved column flags");
+    SAVE(bool_runs(), p); W32(EH + 8, 1);         BAD(p, 0, "corrupt", "reserved enc header fields");
+    SAVE(bool_runs(), p); W32(EH + 12, 1);        BAD(p, 0, "corrupt", "reserved enc header fields");
+    SAVE(bool_runs(), p); W32(EH + 40, 1);        BAD(p, 0, "corrupt", "reserved enc header fields");
+    SAVE(bool_runs(), p); W32(EH + 44, 1);        BAD(p, 0, "corrupt", "reserved enc header fields");
+    SAVE(bool_runs(), p); W64(EH + 48, 1);        BAD(p, 0, "corrupt", "on a non-STR column");
+    SAVE(str_mixed(), p); W64(EH + 48, 0x100000000ull); BAD(p, 0, "corrupt", "above 4 GiB");
+    SAVE(bool_runs(), p); W64(EH + 56, g_len + 8); BAD(p, 0, "corrupt", "end offset");
+    SAVE(bool_runs(), p); TEST_ASSERT_TRUE(img_store(p, 60)); EXPECT(p, 0, "corrupt", "shorter than its headers");
+    SAVE(bool_runs(), p); W8(EH + 6, 1);          BAD(p, 0, "corrupt", "disagrees with index offset");   /* HASH, no region */
+    SAVE(bool_runs(), p); W64(EH + 32, 4096);     BAD(p, 0, "corrupt", "disagrees with index offset");   /* region, no kind */
+    SAVE(bool_runs(), p); W8(EH + 6, 1); W64(EH + 32, g_len - 32); BAD(p, 0, "corrupt", "not at the next 32-aligned offset");
+    SAVE(bool_runs(), p); W8(EH + 6, 1); W64(EH + 32, g_len); BAD(p, 0, "corrupt", "index region past the end");
+    /* padding before the index region: a 3080-byte chunk end (not 32-aligned) followed by a dirty pad byte */
+    SAVE(bool_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
+    {
+        size_t prev = chunk_end(0); TEST_ASSERT_TRUE(prev % 32 != 0);
+        size_t off = (prev + 31) & ~(size_t)31;
+        uint8_t* q = realloc(g_img, off + 32); g_img = q; memset(g_img + prev, 0, off + 32 - prev);
+        g_img[prev] = 1; g_len = off + 32;
+        W64(EH + 56, g_len); W8(EH + 6, 1); W64(EH + 32, off);
+        BAD(p, 0, "corrupt", "padding before the index region not zero");
     }
-    save_vec(bool_runs(), p);
-    img_store(p, g_len - 8); EXPECT(p, 0, "corrupt");                                /* truncated */
-    save_vec(bool_runs(), p);
-    b = 1; wr(4, &b, 1); img_store(p, g_len); EXPECT(p, 0, "corrupt");              /* aux reserved byte */
+    /* bytes after the last section */
+    SAVE(bool_runs(), p); { size_t n = g_len; g_img = realloc(g_img, n + 8); memset(g_img + n, 0, 8); g_len = n + 8; W64(EH + 56, g_len); }
+    BAD(p, 0, "corrupt", "bytes after the last section");
+    /* a SYM column opened without a symfile (explicit require) */
+    {
+        uint8_t ids[16]; for (int i = 0; i < 16; i++) ids[i] = (uint8_t)(i % 4);
+        ray_t* v = ray_sym_vec_new(RAY_SYM_W8, 16); v->len = 16; memcpy(ray_data(v), ids, 16);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK); ray_release(v);
+        ray_error_clear();
+        ray_t* r = ray_col_mmap_splayed_dom(p, NULL);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "sym");
+        TEST_ASSERT_TRUE(has_needle("no symfile resolved") && names_path(p));
+        ray_error_free(r);
+    }
     PASS();
 }
 
+/* ---- chunk directory ---- */
 static test_result_t test_reject_directory(void) {
     const char* p = EC_TMP "/d";
-    uint32_t v32; uint64_t v64; int64_t i64;
-    save_vec(bool_runs(), p);
-    v64 = rd64(104) + 8; wr(104, &v64, 8); img_store(p, g_len); EXPECT(p, 0, "corrupt");   /* chunk bytes overrun */
-    save_vec(bool_runs(), p);
-    v32 = 2; wr(96 + 56, &v32, 4); img_store(p, g_len); EXPECT(p, 0, "corrupt");           /* flags bit 1 */
-    save_vec(bool_runs(), p);
-    i64 = -1; wr(96 + 24, &i64, 8); img_store(p, g_len); EXPECT(p, 0, "corrupt");          /* max below min */
-    ray_t* f = ray_vec_new(RAY_F64, 100); f->len = 100;
-    for (int i = 0; i < 100; i++) ((double*)ray_data(f))[i] = i;
-    save_vec(f, p);
-    v64 = 5; wr(96 + 32, &v64, 8); img_store(p, g_len); EXPECT(p, 0, "corrupt");           /* sum on F64 */
+    SAVE(bool_runs(), p); W64(DIR(0), rd64(DIR(0)) + 8);           BAD(p, 0, "corrupt", "chunk 0 at");
+    SAVE(bool_runs(), p); W64(DIR(0) + 8, 8);                      BAD(p, 0, "corrupt", "below the descriptor area");
+    SAVE(bool_runs(), p); W64(DIR(0) + 8, rd64(DIR(0) + 8) - 4);   BAD(p, 0, "corrupt", "not a multiple of 8");
+    SAVE(bool_runs(), p); W64(DIR(0) + 8, rd64(DIR(0) + 8) + 8);   BAD(p, 0, "corrupt", "overruns the file");
+    SAVE(bool_runs(), p); W32(DIR(0) + 48, 1);                     BAD(p, 0, "corrupt", "reserved directory words");
+    SAVE(bool_runs(), p); W32(DIR(0) + 60, 1);                     BAD(p, 0, "corrupt", "reserved directory words");
+    SAVE(bool_runs(), p); W32(DIR(0) + 56, 2);                     BAD(p, 0, "corrupt", "reserved directory flag bits");
+    SAVE(bool_runs(), p); W32(DIR(0) + 52, 1025);                  BAD(p, 0, "corrupt", "over 1024 rows");
+    SAVE(bool_runs(), p); W32(DIR(0) + 52, 1);                     BAD(p, 0, "corrupt", "nulls in a non-nullable column");
+    SAVE(i32_allnull(), p); W32(DIR(0) + 56, 0);                   BAD(p, 0, "corrupt", "statistics on an all-null chunk");
+    SAVE(guid_raw(), p);    W32(DIR(0) + 56, 0);                   BAD(p, 0, "corrupt", "statistics on GUID");
+    SAVE(bool_runs(), p);   W64(DIR(0) + 16, 2); W64(DIR(0) + 24, 1); BAD(p, 0, "corrupt", "min above max");
+    SAVE(f64_stats(), p);   { double nan = NAN; wr(DIR(0) + 16, &nan, 8); } BAD(p, 0, "corrupt", "float bounds");
+    SAVE(f64_stats(), p);   { double hi = 5.0, lo = 1.0; wr(DIR(0) + 16, &hi, 8); wr(DIR(0) + 24, &lo, 8); } BAD(p, 0, "corrupt", "float bounds");
+    SAVE(i32_allnull(), p); W64(DIR(0) + 16, 3);                   BAD(p, 0, "corrupt", "absent statistics not zero");
+    SAVE(f64_stats(), p);   W64(DIR(0) + 32, 5);                   BAD(p, 0, "corrupt", "sum on an unsummed type");
+    SAVE(i32_allnull(), p); W64(DIR(0) + 32, 5);                   BAD(p, 0, "corrupt", "sum of no values");
+    /* a STR chunk with statistics present: a newer build's file (pinned in enccol/load_rejects) */
     PASS();
 }
 
-static test_result_t test_reject_descriptors(void) {
-    const char* p = EC_TMP "/x";
-    uint8_t b; uint16_t v16;
-    save_vec(bool_runs(), p);
-    b = 200; wr(desc_at(0, 0), &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");       /* unknown encoding */
-    save_vec(bool_runs(), p);
-    NEED_ENC(0, 0, RAY_ENC_RLE);
-    b = RAY_ENC_ALP; wr(desc_at(0, 0), &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt"); /* ALP on BOOL */
-    save_vec(bool_runs(), p);
-    b = 65; wr(desc_at(0, 0) + 1, &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");    /* width on RLE */
-    save_vec(bool_runs(), p);
-    v16 = 1025; wr(desc_at(0, 0) + 2, &v16, 2); img_store(p, g_len); EXPECT(p, 1, "corrupt"); /* n_nulls > vlen */
-    save_vec(bool_runs(), p);
-    b = 1; wr(desc_at(0, 3) + 20, &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");    /* trailing descriptor */
-    ray_t* f = ray_vec_new(RAY_F64, 100); f->len = 100;
-    for (int i = 0; i < 100; i++) ((double*)ray_data(f))[i] = i;
-    save_vec(f, p);
-    b = RAY_ENC_ALP; wr(desc_at(0, 0), &b, 1); img_store(p, g_len); EXPECT(p, 1, "nyi");   /* legal, not in P1 */
-    /* an all-null vector that is not CONST */
-    ray_t* n = ray_vec_new(RAY_I32, 10); n->len = 10;
-    for (int i = 0; i < 10; i++) ((int32_t*)ray_data(n))[i] = NULL_I32;
-    save_vec(n, p);
-    b = RAY_ENC_RAW; wr(desc_at(0, 0), &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* an all-null vector with statistics present (min = max = 0, flag cleared) */
-    n = ray_vec_new(RAY_I32, 10); n->len = 10;
-    for (int i = 0; i < 10; i++) ((int32_t*)ray_data(n))[i] = NULL_I32;
-    save_vec(n, p);
-    NEED_ENC(0, 0, RAY_ENC_CONST);
-    v16 = 0; wr(desc_at(0, 0) + 4, &v16, 2); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    PASS();
-}
-
-static test_result_t test_reject_payloads(void) {
-    const char* p = EC_TMP "/q";
-    uint8_t b; uint16_t v16; uint32_t v32;
-    /* RLE run ends not ascending: ends[1] (U16 at +42) below ends[0] = 100 */
-    save_vec(bool_runs(), p);
-    NEED_ENC(0, 0, RAY_ENC_RLE);
-    TEST_ASSERT_EQ_I(g_img[payload_at(0, 0) + 8], RAY_ENC_RAW);
-    TEST_ASSERT_EQ_I(g_img[payload_at(0, 0) + 32], RAY_ENC_RAW);
-    v16 = 50; wr(payload_at(0, 0) + 42, &v16, 2); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* RLE last run end short of the vector length (ends[10] at +60, was 1024) */
-    save_vec(bool_runs(), p);
-    v16 = 1000; wr(payload_at(0, 0) + 60, &v16, 2); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* RLE run end beyond the vector length */
-    save_vec(bool_runs(), p);
-    v16 = 1025; wr(payload_at(0, 0) + 60, &v16, 2); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* CONST as a child */
-    save_vec(bool_runs(), p);
-    b = RAY_ENC_CONST; wr(payload_at(0, 0) + 8, &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* child body_bytes overrun */
-    save_vec(bool_runs(), p);
-    v32 = 0xFFF0; wr(payload_at(0, 0) + 12, &v32, 4); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* null bitmap count disagrees with n_nulls */
-    ray_t* v = ray_vec_new(RAY_I32, 100); v->len = 100;
-    for (int i = 0; i < 100; i++) ((int32_t*)ray_data(v))[i] = i % 10 ? i : NULL_I32;
-    save_vec(v, p);
-    b = 0xFF; wr(payload_at(0, 0) + 5, &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* float trailer position not in the bitmap */
-    double d[4]; uint64_t odd = 0x7FF8000000000001ull;
-    d[0] = 2.5; d[1] = NULL_F64; memcpy(&d[2], &odd, 8); d[3] = -1.0;
-    save_vec(ray_vec_from_raw(RAY_F64, d, 4), p);
-    v16 = 0; wr(payload_at(0, 0) + 128 + 32 + 8, &v16, 2); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* STR RAW: hash32 nonzero; inline padding; pool_off off by one */
-    for (int k = 0; k < 3; k++) {
-        ray_t* s = ray_vec_new(RAY_STR, 2);
-        s = ray_str_vec_append(s, "short", 5);
-        s = ray_str_vec_append(s, "a pooled string here", 20);
-        save_vec(s, p);
-        size_t at = payload_at(0, 0);
-        if (k == 0) { v32 = 7; wr(at + 16 + 12, &v32, 4); }
-        if (k == 1) { b = 'x'; wr(at + 4 + 6, &b, 1); }
-        if (k == 2) { v32 = 1; wr(at + 16 + 8, &v32, 4); }
-        img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    }
-    /* DICT codes at or above the VALUE_DICT entry count: the codes child is
-     * FOR_BP w=2; its base (@payload + 8) set to 4 makes every code >= 4 */
-    save_vec(i64_dict(), p);
-    NEED_ENC(0, 0, RAY_ENC_DICT);
-    TEST_ASSERT_EQ_I(g_img[payload_at(0, 0)], RAY_ENC_FOR_BP);
-    uint64_t base4 = 4; wr(payload_at(0, 0) + 8, &base4, 8); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    /* SYM ids at or above the saved SYM count (200) in RAW, CONST, FOR_BP
-     * and RLE vectors whose statistics still claim ids below it */
-    uint8_t ids[1024];
-    for (int i = 0; i < 4; i++) ids[i] = (uint8_t)(i + 1);
-    save_sym200(ids, 4, p); NEED_ENC(0, 0, RAY_ENC_RAW);
-    b = 250; wr(payload_at(0, 0) + 2, &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    for (int i = 0; i < 1024; i++) ids[i] = 5;
-    save_sym200(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_CONST);
-    wr(payload_at(0, 0), &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");
-    for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(100 + i % 16);
-    save_sym200(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_FOR_BP);
-    uint64_t sb = 199; wr(payload_at(0, 0), &sb, 8); img_store(p, g_len); EXPECT(p, 1, "corrupt");  /* 199 + 1.. >= 200 */
-    for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + i / 100);
-    save_sym200(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_RLE);
-    wr(payload_at(0, 0) + 16, &b, 1); img_store(p, g_len); EXPECT(p, 1, "corrupt");                /* first run value */
-    PASS();
-}
-
+/* ---- side data: table, entries, placement, contents ---- */
 static test_result_t test_reject_side_data(void) {
     const char* p = EC_TMP "/s";
-    for (int k = 0; k < 5; k++) {
-        save_vec(i64_dict(), p);
-        NEED_ENC(0, 0, RAY_ENC_DICT);
-        size_t side = (size_t)rd64(32 + 16), entry = side + 32;
-        TEST_ASSERT_TRUE(side != 0);
-        uint32_t one = 1; uint16_t kind9 = 9;
-        if (k == 0) { int64_t x = rd64(entry + 8 + 8); wr(entry + 8, &x, 8); }   /* entries not ascending */
-        if (k == 1) { uint32_t n = 3; wr(entry, &n, 4); }                          /* count disagrees with size */
-        if (k == 2) wr(side + 4, &one, 4);                                         /* table reserved word */
-        if (k == 3) wr(side + 8, &kind9, 2);                                       /* unknown kind */
-        if (k == 4) wr(entry + 4, &one, 4);                                        /* entry reserved word */
-        img_store(p, g_len);
-        /* contents are checked before first use; structure at load */
-        if (k <= 1 || k == 4) EXPECT(p, 1, "corrupt"); else EXPECT(p, 0, "corrupt");
+    uint8_t sb[256]; uint16_t kind[3]; uint64_t off[3], len[3];
+    /* the writer's own side region of an I64 DICT column: table @side, entry @side+32 */
+    SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
+    size_t side = (size_t)rd64(EH + 16);
+    TEST_ASSERT_TRUE(side != 0 && rd64(EH + 24) == 72);
+    uint8_t good[72]; memcpy(good, g_img + side, 72);
+    struct { const char* needle; int what; } tbl[] = {
+        { "side table reserved word set", 0 }, { "side table entry count 0", 1 }, { "side table entry count 4", 2 },
+        { "side table longer than the side data", 3 }, { "reserved fields set", 4 }, { "reserved fields set", 5 },
+        { "unknown kind 9", 6 }, { "unknown kind 4", 7 },
+        { "offset not the next 32-aligned position", 8 }, { "offset not the next 32-aligned position", 9 },
+        { "length 4", 10 }, { "overruns the side data", 11 },
+        { "side tail", 12 }, { "side tail longer than padding", 13 },
+    };
+    for (size_t t = 0; t < sizeof tbl / sizeof *tbl; t++) {
+        memcpy(sb, good, 72); size_t n = 72;
+        switch (tbl[t].what) {
+        case 0: { uint32_t one = 1; memcpy(sb + 4, &one, 4); } break;
+        case 1: memset(sb, 0, 4); break;
+        case 2: { uint32_t four = 4; memcpy(sb, &four, 4); } break;
+        case 3: { uint32_t three = 3; memcpy(sb, &three, 4); } break;
+        case 4: sb[10] = 1; break;
+        case 5: sb[12] = 1; break;
+        case 6: sb[8] = 9; break;
+        case 7: sb[8] = 4; break;
+        case 8: sb[16] = 33; break;
+        case 9: sb[16] = 64; break;
+        case 10: sb[24] = 4; break;
+        case 11: sb[24] = 0xFF; sb[25] = 0xFF; break;
+        case 12: memset(sb + 72, 0, 24); sb[80] = 1; n = 96; break;      /* tail within padding, dirty */
+        case 13: memset(sb + 72, 0, 56); n = 128; break;                  /* tail longer than the padding */
+        }
+        SAVE(i64_dict(), p); put_side(sb, n);
+        BAD(p, 0, "corrupt", tbl[t].needle);
     }
+    /* duplicate kind, string entry on a non-STR column, dirty gap before an entry */
+    kind[0] = 1; kind[1] = 1; off[0] = 64; off[1] = 128; len[0] = 40; len[1] = 40;
+    side_table(sb, 168, 2, kind, off, len);
+    SAVE(i64_dict(), p); put_side(sb, 168); BAD(p, 0, "corrupt", "duplicate kind 1");
+    kind[1] = 2;
+    side_table(sb, 168, 2, kind, off, len);
+    SAVE(i64_dict(), p); put_side(sb, 168); BAD(p, 0, "corrupt", "string side entry on type");
+    side_table(sb, 168, 2, kind, off, len); sb[56] = 1;
+    SAVE(i64_dict(), p); put_side(sb, 168); BAD(p, 0, "corrupt", "side padding");
+    /* VALUE_DICT entry on a type without a dictionary */
+    kind[0] = 1; off[0] = 32; len[0] = 40;
+    side_table(sb, 72, 1, kind, off, len);
+    SAVE(bool_runs(), p); put_side(sb, 72); BAD(p, 0, "corrupt", "VALUE_DICT on type");
+    /* side region placement */
+    SAVE(bool_runs(), p); put_side(good, 72); W64(EH + 16, rd64(EH + 16) + 8); BAD(p, 0, "corrupt", "side data not at the next 32-aligned offset");
+    SAVE(bool_runs(), p); put_side(good, 72); W64(EH + 24, 4);                 BAD(p, 0, "corrupt", "side data length 4");
+    SAVE(bool_runs(), p); put_side(good, 72); W64(EH + 24, 1ull << 30);        BAD(p, 0, "corrupt", "side data overruns the file");
+    SAVE(bool_runs(), p); W64(EH + 24, 8);                                     BAD(p, 0, "corrupt", "side length without side data");
+    SAVE(bool_const(), p);
+    {   /* dirty bytes between the last chunk and the side data */
+        size_t prev = chunk_end(0); TEST_ASSERT_TRUE(prev % 32 != 0);
+        put_side(good, 72); g_img[prev] = 1;
+        BAD(p, 0, "corrupt", "padding before the side data not zero");
+    }
+    /* entry contents, checked once before first use (materialization) */
+    for (int k = 0; k < 6; k++) {
+        SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
+        size_t entry = side + 32;
+        const char* needle = "";
+        if (k == 0) { W64(entry + 8, rd64(entry + 16)); needle = "VALUE_DICT values not ascending"; }
+        if (k == 1) { W32(entry, 3); needle = "VALUE_DICT entry size"; }
+        if (k == 2) { W32(entry + 4, 1); needle = "VALUE_DICT entry reserved word"; }
+        if (k == 3) { W32(entry, 0); needle = "VALUE_DICT entry count"; }
+        if (k == 4) { W32(entry, 65537); needle = "VALUE_DICT entry count"; }
+        if (k == 5) { W64(entry + 8, rd64(entry + 16)); W64(entry + 16, rd64(entry + 8)); needle = "VALUE_DICT values not ascending"; }
+        BAD(p, 1, "corrupt", needle);
+    }
+    {   /* nonzero padding after an odd-count I32 dictionary */
+        SAVE(i32_dict3(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
+        size_t entry = (size_t)rd64(EH + 16) + 32;
+        TEST_ASSERT_EQ_I((int)rd64(EH + 24), 8 + 24 + 8 + 16);
+        W8(entry + 8 + 12, 1);
+        BAD(p, 1, "corrupt", "VALUE_DICT entry padding");
+    }
+    {   /* a DICT vector whose side entry is gone */
+        SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
+        size_t end = chunk_end(0);
+        g_len = end; W64(EH + 16, 0); W64(EH + 24, 0); W64(EH + 56, end);
+        BAD(p, 1, "corrupt", "DICT vector without a VALUE_DICT entry");
+    }
+    PASS();
+}
+
+/* ---- vector descriptors (materialization validates a chunk's descriptors before using them) ---- */
+static test_result_t test_reject_descriptors(void) {
+    const char* p = EC_TMP "/x";
+    size_t D;
+    SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE); D = desc_at(0, 0);
+    W8(D, 200);                    BAD(p, 1, "corrupt", "illegal encoding");
+    SAVE(bool_runs(), p); W8(desc_at(0, 0), RAY_ENC_ALP);  BAD(p, 1, "corrupt", "illegal encoding");   /* ALP on BOOL */
+    SAVE(bool_runs(), p); W16(desc_at(0, 0) + 6, 1);       BAD(p, 1, "corrupt", "descriptor reserved fields");
+    SAVE(bool_runs(), p); W32(desc_at(0, 0) + 24, 1);      BAD(p, 1, "corrupt", "descriptor reserved fields");
+    SAVE(bool_runs(), p); W32(desc_at(0, 0) + 28, 1);      BAD(p, 1, "corrupt", "descriptor reserved fields");
+    SAVE(bool_runs(), p); W16(desc_at(0, 0) + 4, 4);       BAD(p, 1, "corrupt", "flags 0x4");
+    SAVE(bool_runs(), p); W16(desc_at(0, 0) + 4, 2);       BAD(p, 1, "corrupt", "flags 0x2");        /* float trailer on a non-float */
+    SAVE(bool_runs(), p); W8(desc_at(0, 0) + 1, 65);       BAD(p, 1, "corrupt", "width 65");         /* width on RLE */
+    SAVE(i32_for(), p);   NEED_ENC(0, 0, RAY_ENC_FOR_BP); W8(desc_at(0, 0) + 1, 33); BAD(p, 1, "corrupt", "width 33");   /* FOR_BP width above T */
+    SAVE(bool_runs(), p); W16(desc_at(0, 0) + 2, 1025);    BAD(p, 1, "corrupt", "above the vector length");
+    SAVE(bool_runs(), p); W16(desc_at(0, 0) + 2, 1);       BAD(p, 1, "corrupt", "nulls counted in a non-nullable type");
+    SAVE(bool_runs(), p); W64(desc_at(0, 0) + 8, rd64(desc_at(0, 0) + 8) + 8); BAD(p, 1, "corrupt", "payload offset");
+    SAVE(bool_runs(), p); W64(desc_at(0, 0) + 16, rd64(desc_at(0, 0) + 16) + 1); BAD(p, 1, "corrupt", "payload size not a multiple of 8");
+    SAVE(bool_runs(), p); W64(desc_at(0, 0) + 16, 1 << 20); BAD(p, 1, "corrupt", "payload overruns the chunk");
+    SAVE(bool_runs(), p); W8(desc_at(0, 3) + 20, 1);       BAD(p, 1, "corrupt", "trailing descriptor 3 not zero");
+    SAVE(bool_runs(), p); set_chunk_bytes(0, rd64(DIR(0) + 8) + 8); BAD(p, 1, "corrupt", "bytes after its payloads");
+    SAVE(bool_runs(), p); W16(desc_at(0, 0) + 4, 1); W64(desc_at(0, 0) + 40, 1); BAD(p, 1, "corrupt", "absent statistics not zero");
+    SAVE(bool_runs(), p); W64(desc_at(0, 0) + 32, 2); W64(desc_at(0, 0) + 40, 1); BAD(p, 1, "corrupt", "min above max");
+    SAVE(f64_stats(), p); W64(desc_at(0, 0) + 32, 0x7FF8000000000000ull); BAD(p, 1, "corrupt", "float bounds");
+    SAVE(f64_stats(), p); { double hi = 5.0, lo = 1.0; wr(desc_at(0, 0) + 32, &hi, 8); wr(desc_at(0, 0) + 40, &lo, 8); } BAD(p, 1, "corrupt", "float bounds");
+    SAVE(f64_plain(), p); W8(desc_at(0, 0), RAY_ENC_ALP);  BAD(p, 1, "nyi", "needs a newer build");  /* legal, not in P1 */
+    SAVE(guid_raw(), p);  W16(desc_at(0, 0) + 4, 0);       BAD(p, 1, "corrupt", "statistics on GUID");
+    SAVE(i32_allnull(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
+    W8(desc_at(0, 0), RAY_ENC_RAW);                        BAD(p, 1, "corrupt", "all-null vector not CONST");
+    SAVE(i32_allnull(), p); W16(desc_at(0, 0) + 4, 0);     BAD(p, 1, "corrupt", "all-null vector carries statistics");
+    SAVE(i32_nulls_raw(), p); W16(desc_at(0, 0) + 2, 9);   BAD(p, 1, "corrupt", "descriptor null counts sum to 9");
+    {   /* STR statistics on a RAW vector (directory says absent, the descriptor does not) */
+        SAVE(str_mixed(), p); W16(desc_at(0, 0) + 4, 0);   BAD(p, 1, "corrupt", "statistics on a RAW / CONST string vector");
+    }
+    {   /* SYM statistics outside the domain: ids in 1..4, saved count 200 */
+        uint8_t ids[4] = { 1, 2, 3, 4 };
+        SAVE_SYM(ids, 4, p); W64(desc_at(0, 0) + 40, 250);
+        BAD(p, 1, "corrupt", "SYM statistics outside the domain");
+    }
+    PASS();
+}
+
+/* ---- payloads: floats, bitmaps, GUID, STR, SYM, DICT codes ---- */
+static test_result_t test_reject_payloads(void) {
+    const char* p = EC_TMP "/q";
+    size_t at;
+    /* null bitmap */
+    SAVE(i32_nulls_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    W8(at, 0xFF);                                          BAD(p, 1, "corrupt", "null bitmap count");
+    SAVE(i32_nulls_raw(), p); at = payload_at(0, 0); g_img[at + 12] |= 0x10;   /* bit 100: past the 100 rows */
+    BAD(p, 1, "corrupt", "null bitmap tail bits set");
+    SAVE(i32_nulls_raw(), p);
+    W64(desc_at(0, 0) + 16, 64); set_chunk_bytes(0, 3072 + 64); BAD(p, 1, "corrupt", "null bitmap short");
+    SAVE(i32_nulls_raw(), p); at = payload_at(0, 0); W32(at + 128 + 4, (uint32_t)NULL_I32);
+    BAD(p, 1, "corrupt", "sentinel outside the bitmap");
+    /* floats */
+    SAVE(f64_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    W64(at + 8, 0x7FF8000000000001ull);                    BAD(p, 1, "corrupt", "NaN outside the bitmap");
+    SAVE(f64_plain(), p); W64(desc_at(0, 0) + 16, 8); set_chunk_bytes(0, 3072 + 8);
+    BAD(p, 1, "corrupt", "float body short");
+    SAVE(f64_plain(), p); W16(desc_at(0, 0) + 4, 2);       BAD(p, 1, "corrupt", "trailer missing");
+    SAVE(f64_plain(), p); W64(desc_at(0, 0) + 16, 40); set_chunk_bytes(0, 3072 + 40);
+    BAD(p, 1, "corrupt", "bytes after the body");
+    SAVE(f32_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    W8(at + 12, 1);                                        BAD(p, 1, "corrupt", "float body padding");
+    SAVE(f32_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST); at = payload_at(0, 0);
+    W8(at + 4, 1);                                         BAD(p, 1, "corrupt", "float CONST padding");
+    /* the trailer (F64: bitmap 128, body 32, trailer @+160: u16 cnt, 6 reserved, positions @+168, values) */
+    for (int k = 0; k < 9; k++) {
+        SAVE(f64_two_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        at = payload_at(0, 0);
+        TEST_ASSERT_TRUE(g_img[desc_at(0, 0) + 4] & RAY_ENC_DESC_TRAILER);
+        size_t t = at + 128 + 32;
+        const char* needle = "";
+        uint16_t cnt = 0; memcpy(&cnt, g_img + t, 2); TEST_ASSERT_EQ_I(cnt, 2);
+        if (k == 0) { W8(t + 2, 1); needle = "trailer reserved bytes"; }
+        if (k == 1) { W16(t, 0); needle = "trailer count"; }
+        if (k == 2) { W16(t, 3); needle = "trailer count"; }
+        if (k == 3) { W16(t, 1); needle = "trailer size"; }
+        if (k == 4) { W16(t + 8, 1); W16(t + 10, 0); needle = "trailer positions not ascending"; }
+        if (k == 5) { W16(t + 8, 9); needle = "trailer position past the vector"; }
+        if (k == 6) { W16(t + 10, 2); needle = "trailer position not in the bitmap"; }
+        if (k == 7) { double one = 1.0; wr(t + 16, &one, 8); needle = "trailer value is not a NaN"; }
+        if (k == 8) { W8(t + 8 + 4, 1); needle = "trailer position padding"; }
+        BAD(p, 1, "corrupt", needle);
+    }
+    /* F32: one trailer value; 4 value bytes, 4 padding (bitmap 128, body 16, trailer @+144, position @+152, value @+160) */
+    SAVE(f32_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    W8(at + 128 + 16 + 16 + 4, 1);                         BAD(p, 1, "corrupt", "trailer value padding");
+    /* GUID */
+    SAVE(guid_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    W64(desc_at(0, 0) + 16, 56); set_chunk_bytes(0, 3072 + 56); BAD(p, 1, "corrupt", "GUID RAW body size");
+    SAVE(guid_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
+    W64(desc_at(0, 0) + 16, 24); set_chunk_bytes(0, 3072 + 24); BAD(p, 1, "corrupt", "GUID CONST body size");
+    SAVE(guid_raw(), p); memset(g_img + payload_at(0, 0), 0, 16); BAD(p, 1, "corrupt", "GUID null count");
+    /* STR RAW / CONST */
+    for (int k = 0; k < 10; k++) {
+        SAVE(str_mixed(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        at = payload_at(0, 0);
+        const char* needle = "";
+        if (k == 0) { W32(at + 16 + 12, 7); needle = "pooled descriptor hash not zero"; }
+        if (k == 1) { W8(at + 4 + 6, 'x'); needle = "inline padding"; }
+        if (k == 2) { W32(at + 16 + 8, 1); needle = "pooled descriptor offset"; }
+        if (k == 3) { W32(at + 16, 100); needle = "pooled descriptor past the pool"; }
+        if (k == 4) { W8(at + 16 + 4, 'Z'); needle = "pooled descriptor prefix"; }
+        if (k == 5) { W64(at + 32, 21); needle = "pool not fully used"; }
+        if (k == 6) { W64(at + 32, 40); needle = "pool size"; }
+        if (k == 7) { W64(at + 32, 0x100000000ull); needle = "pool size above 4 GiB"; }
+        if (k == 8) { W8(at + 40 + 20, 1); needle = "pool padding"; }
+        if (k == 9) { W64(desc_at(0, 0) + 16, 16); set_chunk_bytes(0, 3072 + 16); needle = "STR RAW body short"; }
+        BAD(p, 1, "corrupt", needle);
+    }
+    SAVE(str_mixed(), p); W16(desc_at(0, 0) + 2, 1); W32(DIR(0) + 52, 1); BAD(p, 1, "corrupt", "STR null count");
+    SAVE(str_mixed(), p); W64(EH + 48, rd64(EH + 48) + 1);      BAD(p, 1, "corrupt", "header says");
+    SAVE(str_mixed(), p); W64(EH + 48, rd64(EH + 48) - 1);      BAD(p, 1, "corrupt", "exceeds str_pool_bytes");
+    for (int k = 0; k < 4; k++) {
+        SAVE(str_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
+        at = payload_at(0, 0);
+        const char* needle = "";
+        if (k == 0) { W32(at + 4, 1); needle = "STR CONST reserved word"; }
+        if (k == 1) { W8(at + 8 + 25, 1); needle = "STR CONST padding"; }
+        if (k == 2) { W64(desc_at(0, 0) + 16, rd64(desc_at(0, 0) + 16) + 8); set_chunk_bytes(0, rd64(DIR(0) + 8) + 8); needle = "STR CONST body size"; }
+        if (k == 3) { W64(desc_at(0, 0) + 16, 0); set_chunk_bytes(0, 3072); needle = "STR CONST body short"; }
+        BAD(p, 1, "corrupt", needle);
+    }
+    /* DICT codes at or above the entry count: the codes child is FOR_BP w=2 whose base is raised to 4 */
+    SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(g_img[payload_at(0, 0)], RAY_ENC_FOR_BP);
+    W64(payload_at(0, 0) + 8, 4);                          BAD(p, 1, "corrupt", "DICT code outside the dictionary");
+    /* SYM */
+    {
+        uint8_t ids[1024];
+        for (int i = 0; i < 4; i++) ids[i] = (uint8_t)(i + 1);
+        SAVE_SYM(ids, 4, p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        W8(payload_at(0, 0) + 2, 250);                     BAD(p, 1, "corrupt", "SYM id outside the symbol domain");
+        ids[0] = 0;                                         /* one null */
+        SAVE_SYM(ids, 4, p); W8(payload_at(0, 0), 7);      BAD(p, 1, "corrupt", "SYM null count");
+        for (int i = 0; i < 1024; i++) ids[i] = 5;
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_CONST);
+        W8(payload_at(0, 0), 250);                         BAD(p, 1, "corrupt", "SYM id outside the symbol domain");
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(100 + i % 16);
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_FOR_BP);
+        W64(payload_at(0, 0), 199);                        BAD(p, 1, "corrupt", "SYM id outside the symbol domain");
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + i / 100);
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_RLE);
+        W8(payload_at(0, 0) + 16, 250);                    BAD(p, 1, "corrupt", "SYM id outside the symbol domain");
+    }
+    PASS();
+}
+
+/* ---- codec grammar over a whole file: RAW, RLE, children, FOR_BP, DELTA_BP ---- */
+static test_result_t test_reject_codec_grammar(void) {
+    const char* p = EC_TMP "/g";
+    size_t at;
+    for (int k = 0; k < 18; k++) {
+        SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE);
+        at = payload_at(0, 0);
+        TEST_ASSERT_EQ_I(g_img[at + 8], RAY_ENC_RAW);
+        TEST_ASSERT_EQ_I(g_img[at + 32], RAY_ENC_RAW);
+        const char* needle = "";
+        if (k == 0)  { W8(at + 16 + 11, 1); needle = "RAW padding not zero"; }
+        if (k == 1)  { W32(at + 12, 8); needle = "RAW body short"; }                  /* values child body 8 < 16, and unconsumed */
+        if (k == 2)  { W16(at + 42, 50); needle = "RLE run ends not ascending"; }
+        if (k == 3)  { W16(at + 60, 1010); needle = "RLE last run end is not the vector length"; }
+        if (k == 4)  { W16(at + 60, 1025); needle = "RLE run ends not ascending or past the vector"; }
+        if (k == 5)  { W8(at + 8, RAY_ENC_CONST); needle = "encoding illegal in this slot or depth"; }
+        if (k == 6)  { W32(at + 12, 0xFFF0); needle = "child body overruns its parent"; }
+        if (k == 7)  { W32(at + 12, 17); needle = "child body size not a multiple of 8"; }
+        if (k == 8)  { W16(at + 10, 1); needle = "child header reserved bytes not zero"; }
+        if (k == 9)  { W32(at + 12, 24); needle = "child body not fully consumed"; }
+        if (k == 10) { W8(at + 9, 1); needle = "width on a non-packed encoding"; }
+        if (k == 11) { W32(at, 0); needle = "RLE run count out of range"; }
+        if (k == 12) { W32(at, 2000); needle = "RLE run count out of range"; }
+        if (k == 13) { W32(at + 4, 1); needle = "RLE reserved word not zero"; }
+        if (k == 14) { W8(at + 32, RAY_ENC_FOR_BP); W8(at + 33, 17); needle = "FOR_BP width above the type width"; }
+        if (k == 15) { W8(at + 32, RAY_ENC_FOR_BP); W8(at + 33, 16); needle = "FOR_BP body short"; }
+        if (k == 16) { W8(at + 32, RAY_ENC_FOR_BP); W8(at + 33, 0); W32(at + 36, 8); W64(at + 40, 0x10000); needle = "FOR_BP base above the type width"; }
+        if (k == 17) { W8(at + 32, 200); needle = "encoding illegal in this slot or depth"; }
+        char want[96]; snprintf(want, sizeof want, "codec body: %s", needle);
+        BAD(p, 1, "corrupt", want);
+    }
+    /* a damaged payload that leaves the body valid but longer than the codec consumed */
+    SAVE(bool_runs(), p); at = payload_at(0, 0);
+    W64(desc_at(0, 0) + 16, 72); set_chunk_bytes(0, rd64(DIR(0) + 8) + 8);
+    BAD(p, 1, "corrupt", "bytes after the codec body");
+    /* DELTA_BP: I32 (T 32, 32 lanes): base @+0, lane heads @+8, placeholder residuals from +264 */
+    for (int k = 0; k < 3; k++) {
+        SAVE(i32_delta(), p); NEED_ENC(0, 0, RAY_ENC_DELTA_BP);
+        at = payload_at(0, 0);
+        const char* needle = "";
+        if (k == 0) { W64(at, 0x100000000ull); needle = "DELTA_BP base above the type width"; }
+        if (k == 1) { W64(at + 8, 0x100000000ull); needle = "DELTA_BP head above the type width"; }
+        if (k == 2) { W8(at + 8 + 8 * 32, 1); needle = "DELTA_BP placeholder not zero"; }
+        char want[96]; snprintf(want, sizeof want, "codec body: %s", needle);
+        BAD(p, 1, "corrupt", want);
+    }
+    /* FOR_BP at the top: base above the type width */
+    SAVE(i32_for(), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP);
+    W64(payload_at(0, 0), 0x100000000ull);                 BAD(p, 1, "corrupt", "codec body: FOR_BP base above the type width");
+    PASS();
+}
+
+/* ---- the child cascade at the codec boundary: depth limit, legal slots ---- */
+static size_t put_hdr(uint8_t* b, uint8_t enc, uint8_t w, uint32_t bb) {
+    memset(b, 0, 8); b[0] = enc; b[1] = w; memcpy(b + 4, &bb, 4);
+    return 8;
+}
+/* RLE body of one run over n values (nr = 1, RAW values child, RAW ends child). Returns its size. */
+static size_t rle_body(uint8_t* b, uint32_t value, uint16_t n) {
+    uint32_t nr = 1, z = 0; size_t at = 0;
+    memcpy(b, &nr, 4); memcpy(b + 4, &z, 4); at = 8;
+    at += put_hdr(b + at, RAY_ENC_RAW, 0, 8); memset(b + at, 0, 8); memcpy(b + at, &value, 4); at += 8;
+    at += put_hdr(b + at, RAY_ENC_RAW, 0, 8); memset(b + at, 0, 8); memcpy(b + at, &n, 2); at += 8;
+    return at;
+}
+static test_result_t test_reject_depth4(void) {
+    uint8_t body[256]; uint64_t out[RAY_ENC_VEC];
+    ray_enc_kind_t u32 = { 32, false };
+    /* control: a valid RLE body at the top, children at depth 1 */
+    size_t n = rle_body(body, 77, 4);
+    TEST_ASSERT_EQ_I(n, 40);
+    TEST_ASSERT_EQ_I(ray_enc_read(body, n, RAY_ENC_RLE, 0, 4, u32, RAY_ENC_SLOT_TOP, 0, NULL, out), 40);
+    TEST_ASSERT_EQ_U(out[0], 77); TEST_ASSERT_EQ_U(out[3], 77);
+    /* control: an RLE child (in a codes slot) at depth 2, its own children at depth 3 */
+    uint8_t child[256]; size_t cl = put_hdr(child, RAY_ENC_RLE, 0, 40); memcpy(child + cl, body, 40); cl += 40;
+    TEST_ASSERT_EQ_I(ray_enc_read(child, cl, 0, 0, 4, u32, RAY_ENC_SLOT_CODES, 2, NULL, out), 48);
+    TEST_ASSERT_EQ_U(out[1], 77);
+    /* controls: RAW and FOR_BP children at depth 3 */
+    uint8_t leaf[64]; size_t ll = put_hdr(leaf, RAY_ENC_RAW, 0, 8); memset(leaf + 8, 0, 8); ll += 8;
+    TEST_ASSERT_EQ_I(ray_enc_read(leaf, ll, 0, 0, 2, u32, RAY_ENC_SLOT_CODES, 3, NULL, out), 16);
+    ll = put_hdr(leaf, RAY_ENC_FOR_BP, 0, 8); memset(leaf + 8, 0, 8); ll += 8;
+    TEST_ASSERT_EQ_I(ray_enc_read(leaf, ll, 0, 0, 2, u32, RAY_ENC_SLOT_CODES, 3, NULL, out), 16);
+    /* an RLE child at depth 3 would put its children at depth 4: refused for the slot */
+    TEST_ASSERT_EQ_I(ray_enc_read(child, cl, 0, 0, 4, u32, RAY_ENC_SLOT_CODES, 3, NULL, out), -1);
+    TEST_ASSERT_TRUE(strstr(ray_enc_read_why(), "encoding illegal in this slot or depth") != NULL);
+    /* any child at depth 4 */
+    ll = put_hdr(leaf, RAY_ENC_RAW, 0, 8); memset(leaf + 8, 0, 8); ll += 8;
+    TEST_ASSERT_EQ_I(ray_enc_read(leaf, ll, 0, 0, 2, u32, RAY_ENC_SLOT_CODES, 4, NULL, out), -1);
+    TEST_ASSERT_TRUE(strstr(ray_enc_read_why(), "cascade deeper than the maximum") != NULL);
     PASS();
 }
 
@@ -297,98 +715,134 @@ static test_result_t test_lazy_validation(void) {
     const char* p = EC_TMP "/lazy";
     ray_t* v = ray_vec_new(RAY_I32, 2 * 65536); v->len = 2 * 65536;
     for (int i = 0; i < 2 * 65536; i++) ((int32_t*)ray_data(v))[i] = i % 100;
-    save_vec(v, p);
-    uint8_t b = 1; wr(desc_at(1, 0) + 6, &b, 1); img_store(p, g_len);
+    SAVE(v, p);
+    W8(desc_at(1, 0) + 6, 1); TEST_ASSERT_TRUE(img_store(p, g_len));
     ray_t* c = ray_col_mmap(p);
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
-    ray_col_src_t s; ray_col_src_bind(c, &s);
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
     ray_col_scratch_t sc; ray_col_scratch_init(&sc);
     ray_col_range_t r;
     TEST_ASSERT_NULL(ray_col_range(&s, 0, 1024, &sc, &r));               /* chunk 0 fine */
+    ray_error_clear();
     ray_t* e = ray_col_range(&s, 65536, 1024, &sc, &r);                  /* chunk 1 read */
     TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0);
+    TEST_ASSERT_TRUE(has_needle("descriptor reserved fields") && names_path(p));
     ray_error_free(e);
     ray_col_scratch_free(&sc); ray_col_src_release(&s);
     ray_t* m = ray_enccol_materialize(c);
     TEST_ASSERT_TRUE(m && RAY_IS_ERR(m));
     ray_error_free(m);
     ray_release(c);
+    /* the aware path: an out-of-domain SYM id fails a range read of its own vector, not its neighbours */
+    uint8_t ids[2048];
+    for (int i = 0; i < 2048; i++) ids[i] = (uint8_t)(1 + i % 7);
+    SAVE_SYM(ids, 2048, p); NEED_ENC(0, 0, RAY_ENC_FOR_BP);
+    W64(payload_at(0, 1), 199);   /* second vector: ids 199.. >= the saved count 200 */
+    TEST_ASSERT_TRUE(img_store(p, g_len));
+    c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    TEST_ASSERT_NULL(ray_col_src_bind(c, &s)); ray_col_scratch_init(&sc);
+    TEST_ASSERT_NULL(ray_col_range(&s, 0, 1024, &sc, &r));
+    ray_error_clear();
+    e = ray_col_range(&s, 1024, 1024, &sc, &r);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0);
+    TEST_ASSERT_TRUE(has_needle("SYM id outside the symbol domain") && names_path(p));
+    ray_error_free(e);
+    ray_col_scratch_free(&sc); ray_col_src_release(&s);
+    ray_release(c);
     PASS();
 }
 
-/* Codec grammar edge: a child chain deeper than 3 is rejected. */
-static test_result_t test_reject_depth4(void) {
-    uint8_t body[256] = {0};
-    /* A child at depth 3 may only be RAW or FOR_BP: an RLE child there would
-     * put its own children at depth 4, and the reader refuses it. */
-    ray_enc_kind_t k = { 32, false };
-    uint64_t out[RAY_ENC_VEC];
-    body[0] = RAY_ENC_RLE;                       /* child header at depth 3: RLE */
-    uint32_t bb = 8; memcpy(body + 4, &bb, 4);
-    TEST_ASSERT_EQ_I(ray_enc_read(body, sizeof body, 0, 0, 4, k, RAY_ENC_SLOT_CODES, 3, NULL, out), -1);
-    PASS();
-}
-
-static uint64_t g_fz = 0xC0FFEE;
+static uint64_t g_fz;
 static uint64_t fz(void) { uint64_t x = g_fz; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g_fz = x; }
 
 static bool ec_allowed_code(const char* c) {
-    static const char* ok[] = { "corrupt", "nyi", "version", "range", "io" };
-    for (size_t i = 0; i < sizeof ok / sizeof *ok; i++) if (strcmp(c, ok[i]) == 0) return true;
-    return false;
+    return strcmp(c, "corrupt") == 0 || strcmp(c, "nyi") == 0 || strcmp(c, "version") == 0;
 }
 
-/* Random byte flips: corrupt or a result, never a crash, a hang or a read
- * outside the mapping (ASan/UBSan). */
+/* One mutated image: rejected (true) or a well-formed result (false); `bad` set on a violation. */
+static bool fuzz_one(const char* p, const char** bad) {
+    ray_t* c = ray_col_mmap(p);
+    bool rejected = false;
+    if (c && !RAY_IS_ERR(c)) {
+        ray_enccol_t* e = ray_enccol_of(c);
+        int8_t want_type = e ? e->type : 0; int64_t want_len = e ? e->len : -1;
+        ray_t* m = ray_enccol_materialize(c);
+        if (m && RAY_IS_ERR(m)) {
+            if (!ec_allowed_code(ray_err_code(m))) *bad = "materialize: error code outside {corrupt, nyi, version}";
+            ray_error_free(m); rejected = true;
+        } else if (!m) *bad = "materialize returned NULL";
+        else if (m->type != want_type || m->len != want_len) *bad = "materialized vector disagrees with the header";
+        ray_release(c);
+    } else if (c) {
+        if (!ec_allowed_code(ray_err_code(c))) *bad = "load: error code outside {corrupt, nyi, version}";
+        ray_error_free(c); rejected = true;
+    } else *bad = "ray_col_mmap returned NULL";
+    return rejected;
+}
+
+/* Random byte flips: an error or a well-formed result, never a crash, a
+ * hang or a read outside the mapping (ASan/UBSan).  Whole-file flips must
+ * reject something; flips confined to the headers, directory and
+ * descriptors (everything before the first payload) must reject nearly all. */
 static test_result_t test_fuzz_flips(void) {
     const char* p = EC_TMP "/fz";
+    g_fz = 0xC0FFEE;
+    int rej_all_total = 0, structural_total = 0, structural_rej = 0;
     for (int base = 0; base < 5; base++) {
         ray_t* v;
         if (base == 0) v = bool_runs();
         else if (base == 1) { v = ray_vec_new(RAY_I32, 70000); v->len = 70000;
             for (int i = 0; i < 70000; i++) ((int32_t*)ray_data(v))[i] = i % 7 ? i % 300 : NULL_I32; }
-        else if (base == 2) { double d[4]; uint64_t odd = 0x7FF8000000000001ull; d[0] = 2.5; d[1] = NULL_F64;
-            memcpy(&d[2], &odd, 8); d[3] = -1.0; v = ray_vec_from_raw(RAY_F64, d, 4); }
+        else if (base == 2) v = f64_two_odd();
         else if (base == 3) { v = ray_vec_new(RAY_STR, 50);
             for (int i = 0; i < 50; i++) v = ray_str_vec_append(v, i % 3 ? "a long pooled string value" : "s", i % 3 ? 26 : 1); }
         else v = i64_dict();
-        int8_t want_type = v->type; int64_t want_len = v->len;
-        save_vec(v, p);
-        uint8_t* orig = malloc(g_len); memcpy(orig, g_img, g_len);
+        SAVE(v, p);
+        uint8_t* orig = malloc(g_len); TEST_ASSERT_TRUE(orig != NULL); memcpy(orig, g_img, g_len);
+        size_t first_payload = (size_t)rd64(DIR(0)) + 3072;
+        int rejected = 0;
         for (int it = 0; it < 300; it++) {
             memcpy(g_img, orig, g_len);
             int flips = 1 + (int)(fz() % 3);
-            for (int k = 0; k < flips; k++) g_img[fz() % g_len] ^= (uint8_t)(1u << (fz() % 8));
-            img_store(p, g_len);
-            ray_t* c = ray_col_mmap(p);
+            for (int k = 0; k < flips; k++) {
+                size_t pos = (size_t)(fz() % g_len); uint8_t bit = (uint8_t)(1u << (fz() % 8));
+                g_img[pos] ^= bit;
+            }
             const char* bad = NULL;
-            if (c && !RAY_IS_ERR(c)) {
-                ray_t* m = ray_enccol_materialize(c);
-                if (m && RAY_IS_ERR(m)) {
-                    if (!ec_allowed_code(ray_err_code(m))) bad = "materialize: error code outside the allowed set";
-                    ray_error_free(m);
-                } else if (!m) bad = "materialize returned NULL";
-                else if (m->type != want_type || m->len != want_len) bad = "materialized vector is not well formed";
-                ray_release(c);
-            } else if (c) {
-                if (!ec_allowed_code(ray_err_code(c))) bad = "load: error code outside the allowed set";
-                ray_error_free(c);
-            } else bad = "ray_col_mmap returned NULL";
+            if (!img_store(p, g_len)) bad = "could not write the mutated image";
+            else if (fuzz_one(p, &bad)) rejected++;
             if (bad) { free(orig); TEST_ASSERT_FMT(0, "base %d iter %d: %s", base, it, bad); }
+        }
+        TEST_ASSERT_FMT(rejected > 0, "base %d: %d of 300 mutated images rejected", base, rejected);
+        rej_all_total += rejected;
+        /* structural region only: one flip each in [0, first_payload) */
+        for (int it = 0; it < 200; it++) {
+            memcpy(g_img, orig, g_len);
+            size_t pos = (size_t)(fz() % first_payload); uint8_t bit = (uint8_t)(1u << (fz() % 8));
+            g_img[pos] ^= bit;
+            const char* bad = NULL;
+            if (!img_store(p, g_len)) bad = "could not write the mutated image";
+            else { structural_total++; if (fuzz_one(p, &bad)) structural_rej++; }
+            if (bad) { free(orig); TEST_ASSERT_FMT(0, "base %d structural iter %d: %s", base, it, bad); }
         }
         free(orig);
     }
+    TEST_ASSERT_FMT(structural_rej * 100 >= structural_total * STRUCT_MIN_PCT,
+                    "structural flips rejected %d of %d", structural_rej, structural_total);
+    (void)rej_all_total;
     PASS();
 }
 
 const test_entry_t enccorrupt_entries[] = {
-    { "enccorrupt/headers",     test_reject_headers,     ec_setup, ec_teardown },
-    { "enccorrupt/directory",   test_reject_directory,   ec_setup, ec_teardown },
-    { "enccorrupt/descriptors", test_reject_descriptors, ec_setup, ec_teardown },
-    { "enccorrupt/payloads",    test_reject_payloads,    ec_setup, ec_teardown },
-    { "enccorrupt/side_data",   test_reject_side_data,   ec_setup, ec_teardown },
-    { "enccorrupt/lazy",        test_lazy_validation,    ec_setup, ec_teardown },
-    { "enccorrupt/depth4",      test_reject_depth4,      ec_setup, ec_teardown },
-    { "enccorrupt/fuzz_flips",  test_fuzz_flips,         ec_setup, ec_teardown },
+    { "enccorrupt/headers",       test_reject_headers,       ec_setup, ec_teardown },
+    { "enccorrupt/directory",     test_reject_directory,     ec_setup, ec_teardown },
+    { "enccorrupt/side_data",     test_reject_side_data,     ec_setup, ec_teardown },
+    { "enccorrupt/descriptors",   test_reject_descriptors,   ec_setup, ec_teardown },
+    { "enccorrupt/payloads",      test_reject_payloads,      ec_setup, ec_teardown },
+    { "enccorrupt/codec_grammar", test_reject_codec_grammar, ec_setup, ec_teardown },
+    { "enccorrupt/depth4",        test_reject_depth4,        ec_setup, ec_teardown },
+    { "enccorrupt/lazy",          test_lazy_validation,      ec_setup, ec_teardown },
+    { "enccorrupt/fuzz_flips",    test_fuzz_flips,           ec_setup, ec_teardown },
     { NULL, NULL, NULL, NULL },
 };

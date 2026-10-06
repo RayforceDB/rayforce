@@ -129,6 +129,8 @@ bool    ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k
 int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
                      const ray_enc_dict_t* dict, uint64_t* out);
+/* Why the last ray_enc_read on this thread failed (diagnostics only). */
+const char* ray_enc_read_why(void);
 /* Distinct sorted values of v in the logical order of k.  Returns 1 =
  * trained (*out holds *out_n values; free with ray_free_raw), 0 = no
  * dictionary (n <= 0 or more than 1<<16 distinct values), -1 = out of

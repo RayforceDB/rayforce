@@ -114,8 +114,9 @@ static ray_t* enc_validate_side_table(ray_enccol_t* e) {
     const uint8_t* s = e->base + e->hdr.side_off;
     uint64_t sl = e->hdr.side_len;
     uint32_t ne, rsv; memcpy(&ne, s, 4); memcpy(&rsv, s + 4, 4);
-    if (rsv || ne == 0 || ne > 3 || 8 + 24ull * ne > sl)
-        ENC_CORRUPT("column %s: side table header", e->path);
+    if (rsv) ENC_CORRUPT("column %s: side table reserved word set", e->path);
+    if (ne == 0 || ne > 3) ENC_CORRUPT("column %s: side table entry count %u", e->path, ne);
+    if (8 + 24ull * ne > sl) ENC_CORRUPT("column %s: side table longer than the side data", e->path);
     uint64_t at = 8 + 24ull * ne;              /* end of the table */
     bool seen[4] = { false, false, false, false };
     for (uint32_t i = 0; i < ne; i++) {
@@ -123,11 +124,15 @@ static ray_t* enc_validate_side_table(ray_enccol_t* e) {
         uint16_t kind, r16; uint32_t r32;
         memcpy(&kind, t, 2); memcpy(&r16, t + 2, 2); memcpy(&r32, t + 4, 4);
         uint64_t off = rd_u64(t + 8), len = rd_u64(t + 16);
-        if (r16 || r32 || kind < RAY_ENC_SIDE_VALUE_DICT || kind > RAY_ENC_SIDE_FSST_TABLE || seen[kind])
-            ENC_CORRUPT("column %s: side entry %u kind %u", e->path, i, kind);
+        if (r16 || r32) ENC_CORRUPT("column %s: side entry %u reserved fields set", e->path, i);
+        if (kind < RAY_ENC_SIDE_VALUE_DICT || kind > RAY_ENC_SIDE_FSST_TABLE)
+            ENC_CORRUPT("column %s: side entry %u unknown kind %u", e->path, i, kind);
+        if (seen[kind]) ENC_CORRUPT("column %s: side entry %u duplicate kind %u", e->path, i, kind);
         seen[kind] = true;
-        if ((off & 31) || off != ray_enc_pad32(at) || len < 8 || len > sl || off > sl - len)
-            ENC_CORRUPT("column %s: side entry %u placement", e->path, i);
+        if ((off & 31) || off != ray_enc_pad32(at))
+            ENC_CORRUPT("column %s: side entry %u offset not the next 32-aligned position", e->path, i);
+        if (len < 8) ENC_CORRUPT("column %s: side entry %u length %llu", e->path, i, (unsigned long long)len);
+        if (len > sl || off > sl - len) ENC_CORRUPT("column %s: side entry %u overruns the side data", e->path, i);
         if (!all_zero(s + at, (size_t)(off - at))) ENC_CORRUPT("column %s: side padding", e->path);
         if (kind == RAY_ENC_SIDE_VALUE_DICT) {
             if (!ray_encw_type_has_dict(e->type)) ENC_CORRUPT("column %s: VALUE_DICT on type %s", e->path, ray_type_name(e->type));
@@ -147,8 +152,8 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
     uint64_t size = e->size;
     if (size < RAY_ENC_DIR_OFF) ENC_CORRUPT("column %s: generation-2 file shorter than its headers", e->path);
     ray_t h; memcpy(&h, b, 32);
-    if (!all_zero(b + 4, 12) || h.mmod != 0)
-        ENC_CORRUPT("column %s: reserved header bytes set", e->path);
+    if (!all_zero(b + 4, 12)) ENC_CORRUPT("column %s: reserved header bytes set", e->path);
+    if (h.mmod != 0) ENC_CORRUPT("column %s: header mmod byte set", e->path);
     if (!ray_encw_type_supported(h.type)) ENC_CORRUPT("column %s: type %d not storable in generation 2", e->path, (int)h.type);
     if (h.attrs & ~COL_DISK_ATTRS_MASK) ENC_CORRUPT("column %s: attrs 0x%02x outside the persisted set", e->path, h.attrs);
     if (h.type != RAY_SYM && (h.attrs & RAY_SYM_W_MASK)) ENC_CORRUPT("column %s: width bits on a non-SYM column", e->path);
@@ -172,8 +177,10 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
         ENC_CORRUPT("column %s: UNIQUE not admitted on type %s", e->path, ray_type_name(h.type));
     if (eh->col_flags & ~RAY_ENC_FLAG_UNIQUE) ENC_CORRUPT("column %s: reserved column flags", e->path);
     if (eh->rsv0 || eh->rsv1 || eh->rsv2 || eh->rsv3) ENC_CORRUPT("column %s: reserved enc header fields set", e->path);
-    if (eh->str_pool_bytes > UINT32_MAX || (h.type != RAY_STR && eh->str_pool_bytes))
-        ENC_CORRUPT("column %s: str_pool_bytes %llu", e->path, (unsigned long long)eh->str_pool_bytes);
+    if (eh->str_pool_bytes > UINT32_MAX)
+        ENC_CORRUPT("column %s: str_pool_bytes %llu above 4 GiB", e->path, (unsigned long long)eh->str_pool_bytes);
+    if (h.type != RAY_STR && eh->str_pool_bytes)
+        ENC_CORRUPT("column %s: str_pool_bytes %llu on a non-STR column", e->path, (unsigned long long)eh->str_pool_bytes);
     if (eh->end_off != size)
         ENC_CORRUPT("column %s: end offset %llu, file is %llu bytes (truncated?)", e->path,
                     (unsigned long long)eh->end_off, (unsigned long long)size);
@@ -194,10 +201,12 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
         if (rows > RAY_ENC_CHUNK) rows = RAY_ENC_CHUNK;
         if (de.offset != prev) ENC_CORRUPT("column %s: chunk %lld at %llu, expected %llu", e->path,
                                            (long long)c, (unsigned long long)de.offset, (unsigned long long)prev);
-        if (de.bytes < RAY_ENC_DESC_AREA || (de.bytes & 7) || de.bytes > size - de.offset)
-            ENC_CORRUPT("column %s: chunk %lld size %llu", e->path, (long long)c, (unsigned long long)de.bytes);
-        if (de.rsv0 || de.rsv1 || (de.flags & ~RAY_ENC_STAT_ABSENT))
-            ENC_CORRUPT("column %s: chunk %lld reserved directory bits", e->path, (long long)c);
+        if (de.bytes < RAY_ENC_DESC_AREA)
+            ENC_CORRUPT("column %s: chunk %lld size %llu below the descriptor area", e->path, (long long)c, (unsigned long long)de.bytes);
+        if (de.bytes & 7) ENC_CORRUPT("column %s: chunk %lld size %llu not a multiple of 8", e->path, (long long)c, (unsigned long long)de.bytes);
+        if (de.bytes > size - de.offset) ENC_CORRUPT("column %s: chunk %lld size %llu overruns the file", e->path, (long long)c, (unsigned long long)de.bytes);
+        if (de.rsv0 || de.rsv1) ENC_CORRUPT("column %s: chunk %lld reserved directory words set", e->path, (long long)c);
+        if (de.flags & ~RAY_ENC_STAT_ABSENT) ENC_CORRUPT("column %s: chunk %lld reserved directory flag bits", e->path, (long long)c);
         if ((int64_t)de.null_count > rows) ENC_CORRUPT("column %s: chunk %lld null count %u over %lld rows",
                                                       e->path, (long long)c, de.null_count, (long long)rows);
         if (!enc_type_nullable(h.type) && de.null_count) ENC_CORRUPT("column %s: nulls in a non-nullable column", e->path);
@@ -225,9 +234,10 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
         prev = de.offset + de.bytes;
     }
     if (eh->side_off) {
-        if (eh->side_off != ray_enc_pad32(prev) || eh->side_len < 8 || eh->side_off > size ||
-            eh->side_len > size - eh->side_off || !all_zero(b + prev, (size_t)(eh->side_off - prev)))
-            ENC_CORRUPT("column %s: side data placement", e->path);
+        if (eh->side_off != ray_enc_pad32(prev)) ENC_CORRUPT("column %s: side data not at the next 32-aligned offset", e->path);
+        if (eh->side_len < 8) ENC_CORRUPT("column %s: side data length %llu", e->path, (unsigned long long)eh->side_len);
+        if (eh->side_off > size || eh->side_len > size - eh->side_off) ENC_CORRUPT("column %s: side data overruns the file", e->path);
+        if (!all_zero(b + prev, (size_t)(eh->side_off - prev))) ENC_CORRUPT("column %s: padding before the side data not zero", e->path);
         ray_t* serr = enc_validate_side_table(e);
         if (serr) return serr;
         prev = eh->side_off + eh->side_len;
@@ -238,9 +248,9 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
                       eh->index_kind == 4 || eh->index_kind == 6;
     if (want_index != (eh->index_off != 0)) ENC_CORRUPT("column %s: index kind %u disagrees with index offset", e->path, eh->index_kind);
     if (eh->index_off) {
-        if (eh->index_off != ray_enc_pad32(prev) || eh->index_off >= size ||
-            !all_zero(b + prev, (size_t)(eh->index_off - prev)))
-            ENC_CORRUPT("column %s: index region placement", e->path);
+        if (eh->index_off != ray_enc_pad32(prev)) ENC_CORRUPT("column %s: index region not at the next 32-aligned offset", e->path);
+        if (eh->index_off >= size) ENC_CORRUPT("column %s: index region past the end of the file", e->path);
+        if (!all_zero(b + prev, (size_t)(eh->index_off - prev))) ENC_CORRUPT("column %s: padding before the index region not zero", e->path);
         prev = size;
     }
     if (prev != size) ENC_CORRUPT("column %s: %llu bytes after the last section", e->path, (unsigned long long)(size - prev));
@@ -373,21 +383,26 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
         int cls = top_encoding_class(e->type, d->encoding);
         if (cls == 0) ENC_CORRUPT("col %s: chunk %lld vector %d illegal encoding %u", e->path, (long long)c, j, d->encoding);
         if (cls == 2) return ray_error("nyi", "col %s: encoding %u needs a newer build", e->path, d->encoding);
-        if (d->rsv0 || d->rsv1 || d->rsv2) ENC_CORRUPT("col %s: chunk %lld vector %d reserved fields", e->path, (long long)c, j);
+        if (d->rsv0 || d->rsv1 || d->rsv2) ENC_CORRUPT("col %s: chunk %lld vector %d descriptor reserved fields", e->path, (long long)c, j);
         uint16_t okflags = RAY_ENC_STAT_ABSENT | (enc_type_float(e->type) ? RAY_ENC_DESC_TRAILER : 0);
         if (d->flags & ~okflags) ENC_CORRUPT("col %s: chunk %lld vector %d flags 0x%x", e->path, (long long)c, j, d->flags);
         bool packed = d->encoding == RAY_ENC_FOR_BP || d->encoding == RAY_ENC_DELTA_BP;
         if (packed ? d->width > T : d->width != 0) ENC_CORRUPT("col %s: chunk %lld vector %d width %u", e->path, (long long)c, j, d->width);
-        if (d->n_nulls > vlen || (!enc_type_nullable(e->type) && d->n_nulls))
-            ENC_CORRUPT("col %s: chunk %lld vector %d null count %u", e->path, (long long)c, j, d->n_nulls);
-        if (d->payload_off != at || (d->payload_bytes & 7) || d->payload_bytes > de.bytes - at)
-            ENC_CORRUPT("col %s: chunk %lld vector %d payload placement", e->path, (long long)c, j);
+        if (d->n_nulls > vlen) ENC_CORRUPT("col %s: chunk %lld vector %d null count %u above the vector length", e->path, (long long)c, j, d->n_nulls);
+        if (!enc_type_nullable(e->type) && d->n_nulls)
+            ENC_CORRUPT("col %s: chunk %lld vector %d nulls counted in a non-nullable type", e->path, (long long)c, j);
+        if (d->payload_off != at) ENC_CORRUPT("col %s: chunk %lld vector %d payload offset %llu, expected %llu", e->path, (long long)c, j,
+                                             (unsigned long long)d->payload_off, (unsigned long long)at);
+        if (d->payload_bytes & 7) ENC_CORRUPT("col %s: chunk %lld vector %d payload size not a multiple of 8", e->path, (long long)c, j);
+        if (d->payload_bytes > de.bytes - at) ENC_CORRUPT("col %s: chunk %lld vector %d payload overruns the chunk", e->path, (long long)c, j);
         at += d->payload_bytes;
         nsum += d->n_nulls;
         bool absent = d->flags & RAY_ENC_STAT_ABSENT;
         bool all_null = enc_type_nullable(e->type) && d->n_nulls == vlen;
-        if (all_null && (d->encoding != RAY_ENC_CONST || !absent))
-            ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector not CONST without statistics", e->path, (long long)c, j);
+        if (all_null && d->encoding != RAY_ENC_CONST)
+            ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector not CONST", e->path, (long long)c, j);
+        if (all_null && !absent)
+            ENC_CORRUPT("col %s: chunk %lld vector %d all-null vector carries statistics", e->path, (long long)c, j);
         if (absent && (d->min || d->max)) ENC_CORRUPT("col %s: chunk %lld vector %d absent statistics not zero", e->path, (long long)c, j);
         if (!absent && e->type == RAY_GUID) ENC_CORRUPT("col %s: chunk %lld vector %d statistics on GUID", e->path, (long long)c, j);
         /* Only STR_DICT carries code bounds, and a STR_DICT vector already
@@ -401,7 +416,7 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
                 ENC_CORRUPT("col %s: chunk %lld vector %d min above max", e->path, (long long)c, j);
             } else if (e->type == RAY_SYM && (d->min < 1 || (uint64_t)d->max >= e->sym_bound ||
                                               (T < 64 && ((uint64_t)d->max >> T)))) {
-                ENC_CORRUPT("col %s: chunk %lld vector %d SYM ids outside the domain or the id width", e->path, (long long)c, j);
+                ENC_CORRUPT("col %s: chunk %lld vector %d SYM statistics outside the domain or the id width", e->path, (long long)c, j);
             }
         }
     }
@@ -433,6 +448,7 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
     ray_enc_kind_t k;
     uint32_t rsv;
+    const char* why;
     /* Structure was checked at load (Task 6); the entry's contents are
      * checked here, once, before the first lookup. */
     if (!ray_enc_kind_of(e->type, e->attrs, &k) || !e->vdict_len) {
@@ -445,8 +461,10 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
         const uint8_t* d = e->base + e->vdict_off;
         uint32_t n; memcpy(&n, d, 4); memcpy(&rsv, d + 4, 4);
         size_t esz = (size_t)k.T / 8;
-        if (rsv || n == 0 || n > (1u << 16) || dict_len != 8 + ray_enc_pad8((uint64_t)n * esz)) goto bad;
-        if (!all_zero(d + 8 + (size_t)n * esz, (size_t)(ray_enc_pad8((uint64_t)n * esz) - (uint64_t)n * esz))) goto bad;
+        if (rsv) { why = "VALUE_DICT entry reserved word"; goto bad; }
+        if (n == 0 || n > (1u << 16)) { why = "VALUE_DICT entry count"; goto bad; }
+        if (dict_len != 8 + ray_enc_pad8((uint64_t)n * esz)) { why = "VALUE_DICT entry size"; goto bad; }
+        if (!all_zero(d + 8 + (size_t)n * esz, (size_t)(ray_enc_pad8((uint64_t)n * esz) - (uint64_t)n * esz))) { why = "VALUE_DICT entry padding"; goto bad; }
         ray_t* vals = ray_vec_new(RAY_I64, n);
         if (!vals || RAY_IS_ERR(vals)) { ray_enc_snap_set(fail, "oom", "col %s: VALUE_DICT", e->path); return NULL; }
         vals->len = n;
@@ -454,12 +472,12 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
         for (uint32_t i = 0; i < n; i++) {
             uint64_t x = 0; memcpy(&x, d + 8 + i * esz, esz);
             out[i] = x;
-            if (i && !ray_enc_lt(out[i - 1], x, k)) { ray_release(vals); goto bad; }  /* strictly ascending */
+            if (i && !ray_enc_lt(out[i - 1], x, k)) { ray_release(vals); why = "VALUE_DICT values not ascending"; goto bad; }  /* strictly ascending */
         }
         return vals;
     }
 bad:
-    ray_enc_snap_set(fail, "corrupt", "col %s: malformed side data", e->path);
+    ray_enc_snap_set(fail, "corrupt", "col %s: %s", e->path, why);
     return NULL;
 }
 
@@ -490,7 +508,8 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
     uint64_t bits[RAY_ENC_VEC];
     int64_t used = ray_enc_read(p, (size_t)avail, d->encoding, d->width, vlen, k,
                                 RAY_ENC_SLOT_TOP, 0, d->encoding == RAY_ENC_DICT ? &dict : NULL, bits);
-    if (used < 0 || (uint64_t)used != avail) VEC_CORRUPT("codec body");
+    if (used < 0) ENC_CORRUPT("col %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
+    if ((uint64_t)used != avail) VEC_CORRUPT("bytes after the codec body");
     uint8_t esz = ray_enccol_esz(e);
     const bool sym = e->type == RAY_SYM;
     int zeros = 0;
@@ -502,7 +521,7 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
              * width test cannot fire here; the real width guard is the
              * descriptor-statistics check in ray_enccol_chunk_descs.  Id 0
              * is the null and is always legal. */
-            if ((esz < 8 && (x >> (8 * esz))) || (x && x >= e->sym_bound)) VEC_CORRUPT("SYM id");
+            if ((esz < 8 && (x >> (8 * esz))) || (x && x >= e->sym_bound)) VEC_CORRUPT("SYM id outside the symbol domain or the id width");
             zeros += x == 0;
         }
         switch (esz) {
@@ -518,7 +537,7 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
                 ((int64_t*)out)[i] = null ? NULL_I64 : (int64_t)x; break;
         }
     }
-    if (e->type == RAY_SYM && zeros != d->n_nulls) VEC_CORRUPT("null count");
+    if (e->type == RAY_SYM && zeros != d->n_nulls) VEC_CORRUPT("SYM null count");
     return NULL;
 }
 
@@ -527,12 +546,12 @@ static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
     const bool f32 = e->type == RAY_F32;
     const size_t esz = f32 ? 4 : 8;
     uint64_t body = d->encoding == RAY_ENC_CONST ? 8 : ray_enc_pad8((uint64_t)vlen * esz);
-    if (body > avail) VEC_CORRUPT("body");
+    if (body > avail) VEC_CORRUPT("float body short");
     if (d->encoding == RAY_ENC_CONST) {
-        if (!all_zero(p + esz, 8 - esz)) VEC_CORRUPT("padding");
+        if (!all_zero(p + esz, 8 - esz)) VEC_CORRUPT("float CONST padding");
         for (int i = 0; i < vlen; i++) memcpy((uint8_t*)out + i * esz, p, esz);
     } else {
-        if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) VEC_CORRUPT("padding");
+        if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) VEC_CORRUPT("float body padding");
         memcpy(out, p, (size_t)vlen * esz);
     }
     for (int i = 0; i < vlen; i++) {
@@ -548,18 +567,21 @@ static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
     uint64_t rest = avail - body;
     const uint8_t* t = p + body;
     if (d->flags & RAY_ENC_DESC_TRAILER) {
-        if (rest < 8) VEC_CORRUPT("trailer");
+        if (rest < 8) VEC_CORRUPT("trailer missing");
         uint16_t cnt; memcpy(&cnt, t, 2);
-        if (!all_zero(t + 2, 6) || cnt == 0 || cnt > d->n_nulls) VEC_CORRUPT("trailer header");
+        if (!all_zero(t + 2, 6)) VEC_CORRUPT("trailer reserved bytes");
+        if (cnt == 0 || cnt > d->n_nulls) VEC_CORRUPT("trailer count");
         uint64_t need = 8 + ray_enc_pad8(2ull * cnt) + ray_enc_pad8((uint64_t)cnt * esz);
         if (need != rest) VEC_CORRUPT("trailer size");
-        if (!all_zero(t + 8 + 2 * cnt, (size_t)(ray_enc_pad8(2ull * cnt) - 2ull * cnt))) VEC_CORRUPT("trailer padding");
+        if (!all_zero(t + 8 + 2 * cnt, (size_t)(ray_enc_pad8(2ull * cnt) - 2ull * cnt))) VEC_CORRUPT("trailer position padding");
         const uint8_t* raw = t + 8 + ray_enc_pad8(2ull * cnt);
-        if (!all_zero(raw + cnt * esz, (size_t)(ray_enc_pad8((uint64_t)cnt * esz) - (uint64_t)cnt * esz))) VEC_CORRUPT("trailer padding");
+        if (!all_zero(raw + cnt * esz, (size_t)(ray_enc_pad8((uint64_t)cnt * esz) - (uint64_t)cnt * esz))) VEC_CORRUPT("trailer value padding");
         int prev = -1;
         for (int i = 0; i < cnt; i++) {
             uint16_t pos; memcpy(&pos, t + 8 + 2 * i, 2);
-            if ((int)pos <= prev || pos >= vlen || !bm || !((bm[pos >> 3] >> (pos & 7)) & 1)) VEC_CORRUPT("trailer position");
+            if ((int)pos <= prev) VEC_CORRUPT("trailer positions not ascending");
+            if (pos >= vlen) VEC_CORRUPT("trailer position past the vector");
+            if (!bm || !((bm[pos >> 3] >> (pos & 7)) & 1)) VEC_CORRUPT("trailer position not in the bitmap");
             prev = pos;
             double x; if (f32) { float f; memcpy(&f, raw + i * esz, 4); x = f; } else memcpy(&x, raw + i * esz, 8);
             if (x == x) VEC_CORRUPT("trailer value is not a NaN");
@@ -575,15 +597,15 @@ static ray_t* dec_guid(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
                        const uint8_t* p, uint64_t avail, void* out) {
     static const uint8_t zero[16];
     if (d->encoding == RAY_ENC_CONST) {
-        if (avail != 16) VEC_CORRUPT("body");
+        if (avail != 16) VEC_CORRUPT("GUID CONST body size");
         for (int i = 0; i < vlen; i++) memcpy((uint8_t*)out + i * 16, p, 16);
     } else {
-        if (avail != (uint64_t)vlen * 16) VEC_CORRUPT("body");
+        if (avail != (uint64_t)vlen * 16) VEC_CORRUPT("GUID RAW body size");
         memcpy(out, p, (size_t)avail);
     }
     int nulls = 0;
     for (int i = 0; i < vlen; i++) nulls += memcmp((uint8_t*)out + i * 16, zero, 16) == 0;
-    if (nulls != d->n_nulls) VEC_CORRUPT("null count");
+    if (nulls != d->n_nulls) VEC_CORRUPT("GUID null count");
     return NULL;
 }
 
@@ -598,10 +620,11 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
     int nulls = 0;
     uint64_t pooled = 0;
     if (d->encoding == RAY_ENC_CONST) {
-        if (avail < 8) VEC_CORRUPT("body");
+        if (avail < 8) VEC_CORRUPT("STR CONST body short");
         uint32_t len, rsv; memcpy(&len, p, 4); memcpy(&rsv, p + 4, 4);
-        if (rsv || avail != 8 + ray_enc_pad8(len) || !all_zero(p + 8 + len, (size_t)(ray_enc_pad8(len) - len)))
-            VEC_CORRUPT("CONST string");
+        if (rsv) VEC_CORRUPT("STR CONST reserved word");
+        if (avail != 8 + ray_enc_pad8(len)) VEC_CORRUPT("STR CONST body size");
+        if (!all_zero(p + 8 + len, (size_t)(ray_enc_pad8(len) - len))) VEC_CORRUPT("STR CONST padding");
         if (len > RAY_STR_INLINE_MAX) pooled = (uint64_t)len * (uint64_t)vlen;
         nulls = len == 0 ? vlen : 0;
         if (out) {
@@ -617,9 +640,10 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
         }
     } else {
         uint64_t dbytes = (uint64_t)vlen * 16;
-        if (avail < dbytes + 8) VEC_CORRUPT("body");
+        if (avail < dbytes + 8) VEC_CORRUPT("STR RAW body short");
         uint64_t pb; memcpy(&pb, p + dbytes, 8);
-        if (pb > UINT32_MAX || avail != dbytes + 8 + ray_enc_pad8(pb)) VEC_CORRUPT("pool size");
+        if (pb > UINT32_MAX) VEC_CORRUPT("pool size above 4 GiB");
+        if (avail != dbytes + 8 + ray_enc_pad8(pb)) VEC_CORRUPT("pool size");
         const uint8_t* vp = p + dbytes + 8;
         if (!all_zero(vp + pb, (size_t)(ray_enc_pad8(pb) - pb))) VEC_CORRUPT("pool padding");
         uint64_t run = 0;
@@ -633,8 +657,10 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
                 continue;
             }
             uint32_t off, h; memcpy(&off, w + 8, 4); memcpy(&h, w + 12, 4);
-            if (h != 0 || off != run || len > pb - run || memcmp(w + 4, vp + off, 4) != 0)
-                VEC_CORRUPT("pooled descriptor");
+            if (h != 0) VEC_CORRUPT("pooled descriptor hash not zero");
+            if (off != run) VEC_CORRUPT("pooled descriptor offset");
+            if (len > pb - run) VEC_CORRUPT("pooled descriptor past the pool");
+            if (memcmp(w + 4, vp + off, 4) != 0) VEC_CORRUPT("pooled descriptor prefix");
             if (out) {
                 memcpy(pool_out + pool_base + run, vp + off, len);
                 memset(&o[i], 0, sizeof o[i]);
@@ -646,7 +672,7 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
         if (run != pb) VEC_CORRUPT("pool not fully used");
         pooled = pb;
     }
-    if (nulls != d->n_nulls) VEC_CORRUPT("null count");
+    if (nulls != d->n_nulls) VEC_CORRUPT("STR null count");
     if (pooled_out) *pooled_out = pooled;
     return NULL;
 }
@@ -659,9 +685,10 @@ static ray_t* payload_parts(ray_enccol_t* e, int64_t c, int j, const ray_enc_des
     uint64_t n = d->payload_bytes;
     *bm = NULL;
     if (d->n_nulls > 0 && ray_enc_has_bitmap(e->type)) {
-        if (n < 128) VEC_CORRUPT("null bitmap");
+        if (n < 128) VEC_CORRUPT("null bitmap short");
         bool tail_clear;
-        if (popcount_prefix(p, vlen, &tail_clear) != d->n_nulls || !tail_clear) VEC_CORRUPT("null bitmap count");
+        if (popcount_prefix(p, vlen, &tail_clear) != d->n_nulls) VEC_CORRUPT("null bitmap count");
+        if (!tail_clear) VEC_CORRUPT("null bitmap tail bits set");
         *bm = p; p += 128; n -= 128;
     }
     *body = p; *avail = n;
