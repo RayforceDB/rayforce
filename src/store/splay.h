@@ -48,6 +48,7 @@ typedef struct {
     char generation[256];
     ray_compress_t mode;    /* the call's tri-state compress option */
     char cur[1024];         /* destination's current generation dir, "" when none (under the lock) */
+    ray_err_t cur_err;      /* resolving cur failed: only an inheriting column fails on it */
     uint8_t* gens;          /* resolved generation per column file (ray_alloc_raw), freed by finish */
     int64_t ngens;
 } ray_splay_write_t;

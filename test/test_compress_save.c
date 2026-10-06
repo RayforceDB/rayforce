@@ -1283,17 +1283,30 @@ static test_result_t test_unreadable_destination(void) {
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur2, sizeof cur2), RAY_OK);
     TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);           /* nothing published */
     /* an explicit option does not read the destination */
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 0);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur, sizeof cur), RAY_OK);
+    snprintf(p, sizeof p, "%s/a", cur);
+    TEST_ASSERT_EQ_I(chmod(p, 0), 0);
     TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
     TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
-    /* the generation pointer itself unreadable: begin fails */
+    /* the generation pointer itself unreadable: an inheriting save fails,
+     * explicit ones proceed as before */
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur, sizeof cur), RAY_OK);
     snprintf(p, sizeof p, "%s/.current", d);
     TEST_ASSERT_EQ_I(chmod(p, 0), 0);
     TEST_ASSERT_TRUE(ray_splay_save(t, d, NULL) != RAY_OK);
     TEST_ASSERT_EQ_I(chmod(p, 0644), 0);
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur2, sizeof cur2), RAY_OK);
-    TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);
+    TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);           /* nothing published */
     TEST_ASSERT_EQ_I(col_gen_in(d, "a"), 2);
+    for (int m = RAY_COMPRESS_ON; m <= RAY_COMPRESS_OFF; m++) {
+        TEST_ASSERT_EQ_I(chmod(p, 0), 0);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, (ray_compress_t)m), RAY_OK);
+        TEST_ASSERT_EQ_I(chmod(p, 0644), 0);
+        TEST_ASSERT_EQ_I(col_gen_in(d, "a"), m == RAY_COMPRESS_ON ? 2 : 0);
+    }
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur, sizeof cur), RAY_OK);
     /* a short (truncated) destination column is corrupt, not 0 */
     snprintf(p, sizeof p, "%s/b", cur);
     TEST_ASSERT_EQ_I(truncate(p, 10), 0);
@@ -1303,6 +1316,8 @@ static test_result_t test_unreadable_destination(void) {
     TEST_ASSERT_EQ_I(ray_splay_save(t, d, NULL), RAY_ERR_CORRUPT);
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(d, cur2, sizeof cur2), RAY_OK);
     TEST_ASSERT_TRUE(strcmp(cur2, cur) == 0);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_OFF), RAY_OK);   /* explicit: replaced */
+    TEST_ASSERT_EQ_I(col_gen_in(d, "b"), 0);
     ray_release(t);
     /* a string-list column file at the name of a now-plain column */
     ray_t* lt = ray_table_new(1);

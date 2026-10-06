@@ -128,10 +128,13 @@ void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
  * source is a RAY_ENCCOL or the destination's current generation stores the
  * file `name` as generation 2, else 0.  Linked, nested, list and
  * HASH/SORT/BLOOM/PART-indexed columns are always 0. */
+/* lossy: read errors read as 0 — writers use the *_err forms */
 uint8_t ray_col_file_gen(const char* path);   /* 2 when the file is generation 2, else 0 (missing included) */
+/* lossy: read errors read as 0 — writers use the *_err forms */
 uint8_t ray_col_resolve_gen(ray_compress_t mode, ray_t* src,
                             const char* dest_cur, const char* name, size_t name_len);
-/* The same rule for writers that have only the column's type (streams). */
+/* The same rule for writers that have only the column's type (streams).
+ * lossy: read errors read as 0 — writers use the *_err forms */
 uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
                                  const char* dest_cur, const char* name, size_t name_len);
 /* Checked forms, for savers: a missing destination file is generation 0,
@@ -143,6 +146,9 @@ ray_err_t ray_col_file_gen_err(const char* path, uint8_t* gen);
 bool      ray_col_header_is_ext(const void* head, size_t n);
 ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* dest_cur,
                                   const char* name, size_t name_len, uint8_t* gen);
+/* Would resolving `src` under `mode` consult the destination?  Only an
+ * inheriting (ABSENT) save of a plain eligible column does. */
+bool      ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src);
 ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* dest_cur,
                                        const char* name, size_t name_len, uint8_t* gen);
 void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */

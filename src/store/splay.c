@@ -465,6 +465,11 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
     for (int64_t c = 0; c < ncols_res; c++) {
         ray_t* na = ray_sym_str(ray_table_col_name(tbl, c));
         if (!na) continue;
+        if (write && write->cur_err != RAY_OK &&
+            ray_col_resolve_needs_dest(mode, splay_slot(tbl, c))) {
+            ray_free_raw(gens);
+            return write->cur_err;                         /* inheritance needs the destination */
+        }
         ray_err_t gerr = ray_col_resolve_gen_err(mode, splay_slot(tbl, c),
                                                  write ? write->cur : NULL,
                                                  ray_str_ptr(na), ray_str_len(na), &gens[c]);
@@ -944,11 +949,10 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
      * generation inheritance rule compares against it. */
     write->cur[0] = '\0';
     if (write->staged) {
-        err = ray_splay_resolve_dir(write->root, write->cur, sizeof write->cur);
-        if (err != RAY_OK) {
-            write->cur[0] = '\0';
-            return ray_splay_write_finish(write, err, false);
-        }
+        /* A failure matters only to a column that inherits from the
+         * destination (splay_write_table_impl); explicit modes proceed. */
+        write->cur_err = ray_splay_resolve_dir(write->root, write->cur, sizeof write->cur);
+        if (write->cur_err != RAY_OK) write->cur[0] = '\0';
     }
     if (!write->staged) {
         splay_snapshot_root(write);

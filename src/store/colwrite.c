@@ -339,6 +339,11 @@ ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* c
     return colw_dest_gen(cur, name, nlen, gen);            /* the destination already stores it as 2 */
 }
 
+bool ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src) {
+    return mode == RAY_COMPRESS_ABSENT && colw_src_gen2_ok(src) &&
+           !atomic_load(&g_force_compress) && src->type != RAY_ENCCOL;
+}
+
 ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* cur,
                                        const char* name, size_t nlen, uint8_t* gen) {
     *gen = 0;
