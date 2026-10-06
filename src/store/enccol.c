@@ -836,6 +836,9 @@ static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
     return NULL;
 }
 
+static _Atomic int g_refuse_attach;
+void ray_enccol_test_refuse_attach(int on) { atomic_store(&g_refuse_attach, on); }
+
 static double dbl_of(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
 
 /* ZONE: combined min/max (first of ties wins, row order) and null count;
@@ -863,28 +866,30 @@ static ray_t* enc_synth_zone(ray_enccol_t* e) {
 
 /* CHUNK_ZONE at chunk_log2 16 (the builder default) from the directory;
  * all-null chunks keep the builder's empty extrema (INT64_MAX / INT64_MIN,
- * +inf / -inf); aggs [sum_lo | non-null rows | sum_hi] for the integer
- * types, as the builder, none for floats. */
+ * +inf / -inf); aggs [sum_lo | non-null rows | sum_hi] only for the types
+ * whose directory carries sums (ray_encw_type_summable), NULL otherwise
+ * (readers accept a NULL aggs). */
 static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_CHUNK_ZONE, e->type, e->len);
     if (!root || RAY_IS_ERR(root)) return root ? root : ray_error("oom", "col %s: chunk zone", e->path);
     ray_index_t* ix = ray_index_payload(root);
     uint32_t nc = (uint32_t)e->n_chunks;
     bool fl = enc_type_float(e->type);
+    bool sums = ray_encw_type_summable(e->type);
     ix->u.chunk_zone.n_chunks = nc;
     ix->u.chunk_zone.chunk_log2 = 16;
     ix->u.chunk_zone.is_f64 = fl ? 1 : 0;
     ray_t* mins = ray_vec_new(fl ? RAY_F64 : RAY_I64, nc);
     ray_t* maxs = ray_vec_new(fl ? RAY_F64 : RAY_I64, nc);
     ray_t* nb   = ray_vec_new(RAY_U8, (nc + 7) / 8);
-    ray_t* aggs = fl ? NULL : ray_vec_new(RAY_I64, 3 * (int64_t)nc);
+    ray_t* aggs = sums ? ray_vec_new(RAY_I64, 3 * (int64_t)nc) : NULL;
     /* Stored before any check so ray_release(root) frees what exists. */
     ix->u.chunk_zone.mins = (mins && !RAY_IS_ERR(mins)) ? mins : NULL;
     ix->u.chunk_zone.maxs = (maxs && !RAY_IS_ERR(maxs)) ? maxs : NULL;
     ix->u.chunk_zone.null_bits = (nb && !RAY_IS_ERR(nb)) ? nb : NULL;
     ix->u.chunk_zone.aggs = (aggs && !RAY_IS_ERR(aggs)) ? aggs : NULL;
     if (!ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs || !ix->u.chunk_zone.null_bits ||
-        (!fl && !ix->u.chunk_zone.aggs) || enc_alloc_fails(e)) {
+        (sums && !ix->u.chunk_zone.aggs) || enc_alloc_fails(e)) {
         ray_release(root);
         return ray_error("oom", "col %s: chunk zone", e->path);
     }
@@ -936,9 +941,13 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
         }
         ray_index_payload(root)->markers |= RAY_MARK_UNIQUE;
     }
+    if (atomic_load_explicit(&g_refuse_attach, memory_order_relaxed))
+        ray_index_payload(root)->built_for_len++;       /* test: the predicate must refuse */
     ray_t* r = ray_index_attach_persisted(vp, root);    /* consumes root */
     if (RAY_IS_ERR(r)) {
-        if (strcmp(ray_err_code(r), "oom") == 0) return r;
+        /* only the predicate's refusal is a wire violation; oom and
+         * programming errors pass through unchanged */
+        if (strcmp(ray_err_code(r), "corrupt") != 0) return r;
         ray_error_free(r);
         return ray_error("corrupt", "col %s: index or UNIQUE flag not admitted on type %s",
                          e->path, ray_type_name(e->type));

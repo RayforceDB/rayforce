@@ -1244,7 +1244,7 @@ ray_t* ray_index_attach_persisted(ray_t** vp, ray_t* root) {
         ix->parent_type != v->type || ix->built_for_len != v->len) {
         int k = ix->kind;
         ray_release(root);
-        return ray_error("corrupt", "index kind %d is not admitted on type %d", k, (int)v->type);
+        return ray_error("corrupt", "index kind %d is not admitted on type %s", k, ray_type_name(v->type));
     }
     v = ray_cow(v);
     if (!v || RAY_IS_ERR(v)) { ray_release(root); return v ? v : ray_error("oom", NULL); }

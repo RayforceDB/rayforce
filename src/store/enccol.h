@@ -112,5 +112,6 @@ void   ray_enccol_test_fail_path(const char* sub);
 /* interrupt_after: the nth chunk decoded successfully from now on calls
  * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */
 void   ray_enccol_test_interrupt_after(int64_t nth);
+void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a mismatched root */
 
 #endif /* RAY_ENCCOL_H */
