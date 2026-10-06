@@ -665,7 +665,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     if (!result || RAY_IS_ERR(result)) {
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
-        return result ? result : ray_error("oom", NULL);
+        if (result) ray_error_free(result);
+        return NULL;                     /* decline: the unfused path runs (as before) */
     }
     int build_ok = 1;
     for (uint32_t c = 0; c < n_out; c++) {
@@ -682,7 +683,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ray_graph_free(g);
     if (!build_ok) {
         ray_release(result);
-        return ray_error("schema", NULL);
+        return NULL;                     /* decline: the unfused path runs (as before) */
     }
     return result;
 }
@@ -899,7 +900,8 @@ ray_t* ray_fused_take_select(ray_t* tbl,
     if (!result || RAY_IS_ERR(result)) {
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
-        return result ? result : ray_error("oom", NULL);
+        if (result) ray_error_free(result);
+        return NULL;                     /* decline: the unfused path runs (as before) */
     }
     int build_ok = 1;
     for (uint32_t c = 0; c < n_out; c++) {
@@ -916,7 +918,7 @@ ray_t* ray_fused_take_select(ray_t* tbl,
     ray_graph_free(g);
     if (!build_ok) {
         ray_release(result);
-        return ray_error("schema", NULL);
+        return NULL;                     /* decline: the unfused path runs (as before) */
     }
     return result;
 }
