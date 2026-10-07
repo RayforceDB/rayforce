@@ -1998,6 +1998,149 @@ static test_result_t test_lazy_memo_goes_with_table(void) {
     PASS();
 }
 
+/* ---- Fix round 1 ---------------------------------------------------- */
+
+/* Review I1: a column under 65536 rows records ZONE (not CHUNK_ZONE), so the
+ * OP_FILTER single-compare consult answers it from ray_enc_zone_class.  A
+ * 1000-row table, a = row (I64), f = row (F64, 0.0 first): ALL, NONE and
+ * undecided compares, the F64 ones against -0.0 (== +0.0), give these rows
+ * on both generations through a graph FILTER and through select; generation
+ * 2 materializes nothing at the consult, and the zone hits are equal. */
+#define SR_Z0 SR_TMP "/z0/"
+#define SR_Z2 SR_TMP "/z2/"
+static ray_op_t* zp_a_ge0(ray_graph_t* g)   { return ray_ge(g, ray_scan(g, "a"), ray_const_i64(g, 0)); }
+static ray_op_t* zp_a_gt999(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "a"), ray_const_i64(g, 999)); }
+static ray_op_t* zp_a_ge499(ray_graph_t* g) { return ray_ge(g, ray_scan(g, "a"), ray_const_i64(g, 499)); }
+static ray_op_t* zp_a_ne1000(ray_graph_t* g){ return ray_ne(g, ray_scan(g, "a"), ray_const_i64(g, 1000)); }
+static ray_op_t* zp_a_eq1000(ray_graph_t* g){ return ray_eq(g, ray_scan(g, "a"), ray_const_i64(g, 1000)); }
+static ray_op_t* zp_f_ge_nz(ray_graph_t* g) { return ray_ge(g, ray_scan(g, "f"), ray_const_f64(g, -0.0)); }
+static ray_op_t* zp_f_lt_nz(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "f"), ray_const_f64(g, -0.0)); }
+static ray_op_t* zp_f_le_nz(ray_graph_t* g) { return ray_le(g, ray_scan(g, "f"), ray_const_f64(g, -0.0)); }
+static ray_op_t* zp_f_gt_nz(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, -0.0)); }
+static ray_op_t* zp_f_gt998(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, 998.5)); }
+static test_result_t test_zone_class_dir_small(void) {
+    /* under 65536 rows a save records only a zone the column carries (the
+     * converters attach one to every such column) */
+    sr_eval_ok("(set Z (table [a f] (list (.idx.zone (til 1000)) (.idx.zone (as 'F64 (til 1000))))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_Z0 "\" Z {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_Z2 "\" Z {compress: true})");
+    static const struct { ray_op_t* (*build)(ray_graph_t*); const char* where; int64_t rows; uint64_t hit; } cs[] = {
+        { zp_a_ge0,    "(>= a 0)",     1000, 1 },   /* ALL */
+        { zp_a_gt999,  "(> a 999)",       0, 1 },   /* NONE */
+        { zp_a_ge499,  "(>= a 499)",    501, 0 },   /* undecided: the scan */
+        { zp_a_ne1000, "(!= a 1000)",  1000, 1 },   /* ALL */
+        { zp_a_eq1000, "(== a 1000)",     0, 1 },   /* NONE */
+        { zp_f_ge_nz,  "(>= f -0.0)",  1000, 1 },   /* ALL: 0.0 >= -0.0 */
+        { zp_f_lt_nz,  "(< f -0.0)",      0, 1 },   /* NONE */
+        { zp_f_le_nz,  "(<= f -0.0)",     1, 0 },   /* undecided: row 0 equals */
+        { zp_f_gt_nz,  "(> f -0.0)",    999, 0 },   /* undecided */
+        { zp_f_gt998,  "(> f 998.5)",     1, 0 },   /* undecided */
+    };
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        for (int gen = 0; gen < 2; gen++) {
+            ray_t* t = sr_eval(gen ? "(.db.splayed.get \"" SR_Z2 "\")" : "(.db.splayed.get \"" SR_Z0 "\")");
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_col_meta_t m;
+            TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("a", 1), &m));
+            TEST_ASSERT_EQ_I(m.index_kind, RAY_IDX_ZONE);
+            TEST_ASSERT_TRUE(gen ? m.enc != NULL : m.enc == NULL);
+            TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("f", 1), &m));
+            TEST_ASSERT_EQ_I(m.index_kind, RAY_IDX_ZONE);
+            uint64_t h0 = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+            uint64_t mat = 9;
+            int64_t n = sr_filter_rows(t, cs[i].build, &mat);
+            uint64_t hit = ray_idx_hits[IDX_SITE_FILTER_ZONE] - h0;
+            TEST_ASSERT_FMT(n == cs[i].rows, "%s gen %d: %lld rows, want %lld", cs[i].where, gen,
+                            (long long)n, (long long)cs[i].rows);
+            TEST_ASSERT_FMT(hit == cs[i].hit, "%s gen %d: %llu zone hits", cs[i].where, gen, (unsigned long long)hit);
+            if (gen) TEST_ASSERT_FMT(mat == 0, "%s: %llu materializations", cs[i].where, (unsigned long long)mat);
+            ray_release(t);
+            /* the same through select (the projection reads a or f after the filter) */
+            sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_Z2 : SR_Z0);
+            char q[160];
+            snprintf(q, sizeof q, "(count (at (select {a: a from: T where: %s}) 'a))", cs[i].where);
+            ray_t* r = sr_eval(q);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->i64 == cs[i].rows, "%s gen %d: select gave %lld",
+                            q, gen, r && !RAY_IS_ERR(r) ? (long long)r->i64 : -1LL);
+            sr_drop(r);
+        }
+    }
+    PASS();
+}
+
+/* Review minor 1: .idx.uses keys a directory answer by the encoded payload,
+ * as the lazy cache does: an answer through a header copy of the column (a
+ * second table sharing the payload) shows in the original table's uses. */
+static ray_op_t* cpred_h_out2(ray_graph_t* g) { return ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, -5)); }
+static test_result_t test_uses_shared_payload(void) {
+    ray_t* t = sr_load(2);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("h", 1));
+    TEST_ASSERT_NOT_NULL(enc);
+    ray_enccol_ref(ray_enccol_of(enc));                  /* the reference the new header holds */
+    ray_t* cp = ray_enccol_wrap(ray_enccol_of(enc));     /* a second header, one payload */
+    TEST_ASSERT_TRUE(cp && !RAY_IS_ERR(cp) && cp != enc && ray_enccol_of(cp) == ray_enccol_of(enc));
+    ray_t* t2 = ray_table_add_col(ray_table_new(1), ray_sym_intern("h", 1), cp);
+    ray_release(cp);
+    TEST_ASSERT_TRUE(t2 && !RAY_IS_ERR(t2));
+    TEST_ASSERT_TRUE(ray_table_get_col_enc(t2, ray_sym_intern("h", 1)) != enc);
+    ray_t* u = ray_idx_uses_fn(t);                       /* arms the counters, resets them */
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u));
+    ray_release(u);
+    uint64_t mat = 9;
+    TEST_ASSERT_EQ_I(sr_filter_rows(t2, cpred_h_out2, &mat), 0);   /* a zone exclusion on the copy */
+    TEST_ASSERT_EQ_U(mat, 0);
+    u = ray_idx_uses_fn(t);
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && ray_dict_len(u) == 1);
+    ray_t* key = ray_sym(ray_sym_intern("h", 1));
+    ray_t* hv = ray_dict_get(u, key);
+    TEST_ASSERT_TRUE(hv && !RAY_IS_ERR(hv) && hv->i64 == 1);
+    sr_drop(hv); ray_release(key); ray_release(u);
+    ray_release(t2); ray_release(t);
+    PASS();
+}
+
+/* Review minor 5: compare literals on chunk boundaries of k (= row; chunk 1
+ * is rows 65536..131071), through the fused selection, with absolute counts
+ * and the vectors decoded: a decided chunk 1 decodes nothing, an undecided
+ * one its 64 vectors.  A wrong boundary in zone_cmp_core shows without a
+ * generation-0 comparison. */
+static test_result_t test_zone_dir_boundaries(void) {
+    static const struct { uint16_t op; int64_t lit; int64_t rows; bool decoded; } cs[] = {
+        { OP_EQ, 65536, 1, true },       { OP_EQ, 131071, 1, true },
+        { OP_NE, 65536, 199999, true },  { OP_NE, 131071, 199999, true },
+        { OP_LT, 65536, 65536, false },  { OP_LT, 131071, 131071, true },    /* chunk min: chunk 1 all-fail */
+        { OP_LE, 65536, 65537, true },   { OP_LE, 131071, 131072, false },   /* chunk max: chunk 1 all-pass */
+        { OP_GT, 65536, 134463, true },  { OP_GT, 131071, 68928, false },    /* chunk max: chunk 1 all-fail */
+        { OP_GE, 65536, 134464, false }, { OP_GE, 131071, 68929, true },     /* chunk min: chunk 1 all-pass */
+    };
+    ray_t* t = sr_load(2);
+    TEST_ASSERT_NOT_NULL(t);
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        ray_graph_t* g = ray_graph_new(t);
+        ray_op_t* k = ray_scan(g, "k");
+        ray_op_t* c = ray_const_i64(g, cs[i].lit);
+        ray_op_t* p = cs[i].op == OP_EQ ? ray_eq(g, k, c) : cs[i].op == OP_NE ? ray_ne(g, k, c)
+                    : cs[i].op == OP_LT ? ray_lt(g, k, c) : cs[i].op == OP_LE ? ray_le(g, k, c)
+                    : cs[i].op == OP_GT ? ray_gt(g, k, c) : ray_ge(g, k, c);
+        ray_enc_counters_reset();
+        bool all = false;
+        ray_t* s = exec_pred_to_selection(g, p, ray_table_nrows(t), &all);
+        TEST_ASSERT_FMT(!(s && RAY_IS_ERR(s)) && (s || all), "case %zu: no selection", i);
+        int64_t n = s ? ray_rowsel_meta(s)->total_pass : ray_table_nrows(t);
+        ray_enc_counters_t kc; ray_enc_counters_get(&kc);
+        TEST_ASSERT_FMT(n == cs[i].rows, "case %zu (op %u, %lld): %lld rows, want %lld", i, cs[i].op,
+                        (long long)cs[i].lit, (long long)n, (long long)cs[i].rows);
+        TEST_ASSERT_FMT(kc.decoded_bytes == (cs[i].decoded ? 65536u * 8u : 0u), "case %zu: %llu bytes decoded",
+                        i, (unsigned long long)kc.decoded_bytes);
+        TEST_ASSERT_EQ_U(kc.materialized, 0);
+        if (s) ray_rowsel_release(s);
+        ray_graph_free(g);
+    }
+    ray_release(t);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -2049,5 +2192,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/lazy_hash_enc",       test_lazy_hash_enc,       srr_setup, srr_teardown },
     { "scanrange/filter_consult_enc_shapes", test_filter_consult_enc_shapes, srr_setup, srr_teardown },
     { "scanrange/lazy_memo_goes_with_table", test_lazy_memo_goes_with_table, srr_setup, srr_teardown },
+    { "scanrange/zone_class_dir_small",  test_zone_class_dir_small,  sr_rt_setup, sr_rt_teardown },
+    { "scanrange/uses_shared_payload",   test_uses_shared_payload,   srr_setup, srr_teardown },
+    { "scanrange/zone_dir_boundaries",   test_zone_dir_boundaries,   srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

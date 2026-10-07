@@ -1452,10 +1452,16 @@ static int64_t idx_conj_sym(ray_graph_t* g, ray_op_t* pred) {
     return x ? x->sym : -1;
 }
 
-/* Metadata may show nulls: a text column always may (ray_vec_may_have_nulls). */
-static bool idx_meta_may_null(const ray_col_meta_t* m) {
+/* The eq+range conjunction's one null rule, for the metadata pass and the
+ * decode loop alike: a generation-2 column (m->enc, published or not) by its
+ * exact directory null count, a text column always (ray_vec_may_have_nulls),
+ * a plain column by ray_vec_may_have_nulls on its vector (borrowed from the
+ * table: reading it decodes nothing). */
+static bool idx_conj_may_null(ray_graph_t* g, const ray_col_meta_t* m, int64_t sym) {
     if (m->type == RAY_SYM || m->type == RAY_STR) return true;
-    return m->null_count >= 0 ? m->null_count != 0 : (m->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    if (m->enc) return m->null_count != 0;
+    ray_t* c = g->table ? idx_decode_col(g->table, sym) : NULL;
+    return !c || ray_vec_may_have_nulls(c);
 }
 
 /* The eq+range conjunction's decode loop decided from metadata: no float
@@ -1473,10 +1479,10 @@ static bool idx_eqrange_meta_ok(ray_graph_t* g, ray_op_t** conj, int ncj) {
         if (sym < 0) return false;
         if (cop == OP_EQ && eq_sym < 0 &&
             (cm.index_kind == RAY_IDX_HASH || idx_lazy_meta_ok(&cm)) &&
-            (cm.type == RAY_SYM ? ki != 0 : !idx_meta_may_null(&cm))) {
+            (cm.type == RAY_SYM ? ki != 0 : !idx_conj_may_null(g, &cm, sym))) {
             eq_sym = sym;
         } else if (cop == OP_GE || cop == OP_GT || cop == OP_LE || cop == OP_LT) {
-            if (idx_meta_may_null(&cm)) return false;
+            if (idx_conj_may_null(g, &cm, sym)) return false;
             if (rg_sym < 0) rg_sym = sym;
             else if (rg_sym != sym) return false;
         } else return false;
@@ -2986,19 +2992,20 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
                     for (int ci = 0; ci < ncj && shape_ok; ci++) {
-                        ray_t* c = NULL; uint16_t cop = 0;
+                        ray_t* c = NULL; uint16_t cop = 0; ray_col_meta_t dm;
                         int64_t ki = 0; double kf = 0.0; int isf = 0;
                         if (!idx_filter_decode(g, conj[ci], IDXW_NONE, &c, &cop,
-                                               &ki, &kf, &isf, NULL) || isf) {
+                                               &ki, &kf, &isf, &dm) || isf) {
                             shape_ok = false; break;
                         }
+                        bool c_nulls = idx_conj_may_null(g, &dm, idx_conj_sym(g, conj[ci]));
                         if (cop == OP_EQ && !eq_col &&
                             (ray_index_kind(c) == RAY_IDX_HASH || ray_idx_lazy_hash_wanted(c)) &&
-                            (c->type == RAY_SYM ? ki != 0 : !ray_vec_may_have_nulls(c))) {
+                            (c->type == RAY_SYM ? ki != 0 : !c_nulls)) {
                             eq_col = c; eq_key = ki;
                         } else if (cop == OP_GE || cop == OP_GT ||
                                    cop == OP_LE || cop == OP_LT) {
-                            if (ray_vec_may_have_nulls(c)) { shape_ok = false; break; }
+                            if (c_nulls) { shape_ok = false; break; }
                             if (!rg_col) rg_col = c;
                             else if (rg_col != c) { shape_ok = false; break; }
                             if (cop == OP_GE)      { if (ki > lo) lo = ki; }

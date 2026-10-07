@@ -73,11 +73,15 @@ void ray_idx_note_use(const ray_t* col) {
     idx_use_add(col->index);
 }
 
-/* A directory answer counts under the encoded object itself (it has no
- * index block until materialized). */
+/* A directory answer counts under the encoded payload (it has no index
+ * block until materialized), as the lazy cache keys it: every header copy
+ * of the column reports the same uses. */
 void ray_idx_note_use_enc(const ray_t* encv) {
     if (!atomic_load_explicit(&g_idx_use_armed, memory_order_relaxed)) return;
-    if (encv && !RAY_IS_ERR(encv) && encv->type == RAY_ENCCOL) idx_use_add(encv);
+    if (encv && !RAY_IS_ERR(encv) && encv->type == RAY_ENCCOL) {
+        const ray_enccol_t* e = ray_enccol_of((ray_t*)encv);
+        if (e) idx_use_add(e);
+    }
 }
 
 static const void* lazy_use_key(const ray_t* col);   /* the lazy hash cache, below */
@@ -116,7 +120,7 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
          * a directory answer under the encoded object. */
         const void* own = (col && (col->attrs & RAY_ATTR_HAS_INDEX)) ? (const void*)col->index : NULL;
         const void* lazy = lazy_use_key(enc ? enc : col);
-        const void* dir = enc;                            /* ray_idx_note_use_enc */
+        const void* dir = enc ? (const void*)ray_enccol_of(enc) : NULL;   /* ray_idx_note_use_enc */
         if (!own && !lazy && !dir) continue;
         int64_t cnt = 0;
         for (uint32_t s = 0; s < ns; s++)
