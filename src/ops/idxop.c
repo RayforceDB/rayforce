@@ -4224,34 +4224,69 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
  * are rare (one per point-lookup filter), so the lock is never contended in
  * practice.  Allocation, the build and every release run outside it. */
 
-bool ray_idx_lazy_hash_wanted(const ray_t* col) {
+/* A fresh integer chunk zone's whole-column [min, max] over its non-empty
+ * chunks, or false (no such zone, or every chunk empty).  *nc_eff: the
+ * non-empty chunks. */
+static bool chunk_zone_extrema(const ray_t* col, int64_t* gmin, int64_t* gmax, uint32_t* nc_eff) {
     if (!col || RAY_IS_ERR(col) || !ray_is_vec(col) || (col->attrs & RAY_ATTR_SLICE)) return false;
-    int esz = numeric_elem_size(col->type);
-    if (esz == 0 || col->type == RAY_F32 || col->type == RAY_F64) return false;
+    if (numeric_elem_size(col->type) == 0 || col->type == RAY_F32 || col->type == RAY_F64) return false;
     if (ray_index_kind(col) != RAY_IDX_CHUNK_ZONE) return false;
     const ray_index_t* ix = ray_index_payload(col->index);
     if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64) return false;
     uint32_t nc = ix->u.chunk_zone.n_chunks;
-    if (nc < 4 || !ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs) return false;
+    if (nc == 0 || !ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs) return false;
     const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
     const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
-    int64_t gmin = INT64_MAX, gmax = INT64_MIN;
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    uint32_t n_eff = 0;
     for (uint32_t g = 0; g < nc; g++) {
         if (mins[g] > maxs[g]) continue;               /* all-null chunk */
-        if (mins[g] < gmin) gmin = mins[g];
-        if (maxs[g] > gmax) gmax = maxs[g];
+        if (mins[g] < lo) lo = mins[g];
+        if (maxs[g] > hi) hi = maxs[g];
+        n_eff++;
     }
-    if (gmin == INT64_MAX) return false;
+    if (n_eff == 0) return false;
+    *gmin = lo; *gmax = hi;
+    if (nc_eff) *nc_eff = n_eff;
+    return true;
+}
+
+bool ray_idx_zone_excludes(const ray_t* col, int64_t key) {
+    int64_t lo, hi;
+    return chunk_zone_extrema(col, &lo, &hi, NULL) && (key < lo || key > hi);
+}
+
+bool ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set) {
+    int64_t lo, hi;
+    if (!set || RAY_IS_ERR(set) || ray_is_atom(set)) return false;
+    if (numeric_elem_size(set->type) == 0 || set->type == RAY_F32 || set->type == RAY_F64) return false;
+    if (!chunk_zone_extrema(col, &lo, &hi, NULL)) return false;
+    const uint8_t* sb = (const uint8_t*)ray_data((ray_t*)set);
+    for (int64_t i = 0; i < set->len; i++) {
+        int64_t v = set_vec_read_i64(sb, set->type, i);
+        if (v >= lo && v <= hi) return false;
+    }
+    return true;
+}
+
+bool ray_idx_lazy_hash_wanted(const ray_t* col) {
+    int64_t gmin, gmax;
+    uint32_t n_eff = 0;
+    if (!chunk_zone_extrema(col, &gmin, &gmax, &n_eff)) return false;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    uint32_t nc = ix->u.chunk_zone.n_chunks;
+    if (nc < 4 || n_eff < 4) return false;
+    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
     uint64_t range = (uint64_t)gmax - (uint64_t)gmin; /* full I64 width: wraps correctly */
     if (range == 0) return false;
     double span_sum = 0.0;
-    uint32_t n_eff = 0;
     for (uint32_t g = 0; g < nc; g++) {
         if (mins[g] > maxs[g]) continue;
         span_sum += (double)((uint64_t)maxs[g] - (uint64_t)mins[g]);
-        n_eff++;
     }
-    if (n_eff < 4 || (span_sum / (double)n_eff) / (double)range <= 0.5) return false;
+    if ((span_sum / (double)n_eff) / (double)range <= 0.5) return false;
+    int esz = numeric_elem_size(col->type);
     uint64_t cap = 8, want = 2u * (uint64_t)col->len;
     while (cap < want) cap <<= 1;
     return cap * 8u + (uint64_t)col->len * 8u <= 5u * (uint64_t)col->len * (uint64_t)esz;

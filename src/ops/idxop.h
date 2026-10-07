@@ -291,6 +291,11 @@ ray_t* ray_idx_uses_fn(ray_t* tbl);
  * at least 4 non-empty chunks whose mean chunk span exceeds half the global
  * range, and an index costing at most 5x the column's payload. */
 bool   ray_idx_lazy_hash_wanted(const ray_t* col);
+/* True when col's fresh integer chunk zone proves that no row equals key
+ * (key outside its whole-column [min, max]), or, for _set, no row equals any
+ * element of the integer vector set.  The caller has ruled out nulls. */
+bool   ray_idx_zone_excludes(const ray_t* col, int64_t key);
+bool   ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set);
 /* For a probe on `col`: NULL with *out = a retained vector equal to col
  * carrying a HASH (from the cache, or built now), or NULL with *out = NULL
  * when no lazy index applies (not wanted, over budget, declined before, or

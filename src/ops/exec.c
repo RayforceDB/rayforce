@@ -2732,6 +2732,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                              * gets the lazy in-memory one (built on this first
                              * point lookup, reused after).  The indexed copy
                              * has the table column's rows. */
+                            /* A key outside the chunk zone's whole range
+                             * matches nothing: answered here, nothing built. */
+                            if (eq_kind != RAY_IDX_HASH && eq_kind != RAY_IDX_PART &&
+                                ray_idx_zone_excludes(col, key_i)) {
+                                ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
+                                ray_t* empty = ray_index_empty_rowsel(ray_table_nrows(input));
+                                if (empty) {
+                                    ray_idx_hits[IDX_SITE_FILTER_ZONE]++;
+                                    ray_idx_note_use(col);
+                                    g->selection = empty;
+                                    return input;
+                                }
+                            }
                             ray_t* lazy_col = NULL;
                             if (eq_kind != RAY_IDX_HASH && eq_kind != RAY_IDX_PART) {
                                 ray_t* le = ray_idx_lazy_hash(col, &lazy_col);
@@ -2932,6 +2945,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_idx_kind_t in_kind = ray_index_kind(in_col);
                         /* No persisted index: a small integer set on an
                          * unprunable zone probes the lazy in-memory hash. */
+                        if (in_kind != RAY_IDX_HASH && in_kind != RAY_IDX_PART &&
+                            !in_col_is_float && !ray_vec_may_have_nulls(in_col) &&
+                            ray_idx_zone_excludes_set(in_col, in_set_lit)) {
+                            /* every element outside the zone's range */
+                            ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
+                            ray_t* empty = ray_index_empty_rowsel(ray_table_nrows(input));
+                            if (empty) {
+                                ray_idx_hits[IDX_SITE_FILTER_ZONE]++;
+                                ray_idx_note_use(in_col);
+                                g->selection = empty;
+                                return input;
+                            }
+                        }
                         ray_t* in_lazy = NULL;
                         if (in_kind != RAY_IDX_HASH && in_kind != RAY_IDX_PART &&
                             !in_col_is_float && !ray_vec_may_have_nulls(in_col) &&

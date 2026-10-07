@@ -2268,6 +2268,36 @@ static test_result_t test_lazy_not_wanted(void) {
     PASS();
 }
 
+/* A key outside the column's zone range matches nothing: the zone answers,
+ * no scan work is counted and nothing is built, however often it is asked.
+ * An `in` set wholly outside the range likewise; one in range scans. */
+static test_result_t lazy_out_of_range(const char* opts) {
+    lz_make_opts(opts);
+    uint64_t z0 = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++) {
+        ray_t* r = lz_eval("(count (select {v: v from: A where: (== h 2000000)}))");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 0);
+        ray_release(r);
+        r = lz_eval("(count (select {v: v from: A where: (in h [2000000 -5])}))");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 0);
+        ray_release(r);
+    }
+    TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_ZONE], z0 + 2 * (RAY_IDX_LAZY_BUILD_PROBES + 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), -1);
+    /* in range: 0 is row 0 */
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 0)}) 'v)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 0);
+    ray_release(r);
+    r = lz_eval("(count (select {v: v from: A where: (in h [2000000 7919])}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), 2 * 300000);   /* both scanned */
+    PASS();
+}
+static test_result_t test_lazy_out_of_range(void)      { return lazy_out_of_range(""); }
+static test_result_t test_lazy_out_of_range_gen2(void) { return lazy_out_of_range(" {compress: true}"); }
+
 /* Generation 2: the hash comes from the materialized column, the slot keeps
  * its encoded object and zone, and the entry goes with the object. */
 static test_result_t test_lazy_gen2(void) {
@@ -6581,6 +6611,8 @@ const test_entry_t store_entries[] = {
     { "idxlazy/budget",        test_lazy_budget,        lz_setup, lz_teardown },
     { "idxlazy/not_wanted",    test_lazy_not_wanted,    lz_setup, lz_teardown },
     { "idxlazy/gen2",          test_lazy_gen2,          lz_setup, lz_teardown },
+    { "idxlazy/out_of_range",  test_lazy_out_of_range,  lz_setup, lz_teardown },
+    { "idxlazy/out_of_range_gen2", test_lazy_out_of_range_gen2, lz_setup, lz_teardown },
     { "idxlazy/concurrent",    test_lazy_concurrent,    lz_setup, lz_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
