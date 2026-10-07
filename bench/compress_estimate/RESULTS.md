@@ -140,3 +140,55 @@ Extrapolation to 100M (rows x10, same ordering and chunk behaviour assumed, `.sy
 ## P1 gate decision
 
 **P1 size gate (size per P0): PASS.** Overall P1 / P0 estimate = 1.0006 (limit 1.10); the worst type with at least 1% of the table is SYM at 1.0022; generation-2 column data is 5.73x smaller than generation 0 (limit 1.5x).
+
+## PI index policy (10M store, release build, commit 2dcb78ae)
+
+Policy, fixed in the plan before measuring: converters stop persisting
+auto-built HASH indexes; explicit `.idx.hash` is always honoured; parted
+converters never auto-build segment HASH indexes; q41 / q42 stay unchanged
+(identical results, warm within 5%), with an in-memory HASH built on first
+use if needed.
+
+Stores: both converted from /skull/clickbench/hits_h.csv into
+/home/hetoku/data/tmp/pi_bench (same filesystem), `conv_hash` by binary built
+from detached copy of commit 2dcb78ae, `conv_nohash` by a second detached copy
+of the same commit with the upgrade check returning 0 (measurement-only build,
+not committed). Warm: 5 alternated rounds x 10 runs after a warm-up run in
+each process. Cold: 5 runs, fresh process per run, page cache evicted before
+each run by per-file POSIX_FADV_DONTNEED (dd iflag=nocache). Index use
+verified with `.idx.uses`: conv_hash `{RefererHash:1}` / `{URLHash:1}`,
+conv_nohash `{}` / `{}`. Result rows of q41 and q42 are identical across the
+two stores (each store is also stable against itself).
+
+| query | warm hash ms | warm no-hash ms | warm ratio | cold hash ms | cold no-hash ms | cold ratio |
+|---|---|---|---|---|---|---|
+| q41 | 5.849 | 9.154 | 1.565 | 74.418 | 218.279 | 2.933 |
+| q42 | 4.522 | 7.975 | 1.763 | 37.176 | 180.057 | 4.843 |
+
+Load (`.db.splayed.get`, cold): hash 3296.8 / 3301.1 ms (q41 / q42 runs),
+no-hash 3272.1 / 3262.8 ms.
+
+| converter | wall s | peak RSS | store bytes |
+|---|---|---|---|
+| with upgrade | 16.57 | 5 356 888 kB | 5 948 945 203 |
+| without upgrade | 14.74 | 4 492 028 kB | 4 807 577 107 |
+
+Per column (bytes with / without): WatchID 588 420 000 / 80 002 560,
+ClientEventTime 186 893 024 / 80 002 560, FUniqID 215 227 840 / 80 002 560,
+RefererHash 274 911 456 / 80 002 560, URLHash 275 928 576 / 80 002 560,
+UserID 80 002 560 / 80 002 560 (no index in this store).
+
+Extrapolated to 100M (x 10.0): index bytes saved 11.4 GB, converter time saved 18.3 s.
+
+Informational (ruling C1), generation-2 store: `conv_gen2` = the no-hash
+converter with `{compress: true}`; 25.97 s, peak RSS 4 492 372 kB, 2 074 724 107
+bytes (whole table); RefererHash 77 548 464 B, URLHash 68 057 128 B; both
+queries consult no index (`{}`). q41 / q42 warm, alternated with the other two
+stores (5 x 10 runs): hash 5.785 / 4.521 ms, no-hash 9.200 / 7.998 ms
+(ratio 1.590 / 1.769), gen2 9.227 / 7.958 ms (ratio 1.595 / 1.760). A
+generation-2 store therefore shows the same gap as the gen-0 no-hash store.
+Parted loads never consult segment indexes (P0), so the submission path is
+unaffected by PI; the driver measures splayed stores only. A resaved table
+that already carries a HASH keeps it.
+
+**PI lazy build needed: yes** — q41 warm ratio 1.565, q42 warm ratio 1.763 (yes iff either exceeds 1.05).
