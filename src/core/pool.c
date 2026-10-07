@@ -210,9 +210,19 @@ static bool pool_steal(ray_pool_t* pool, uint32_t w, uint32_t* c0, uint32_t* c1)
 static RAY_TLS const ray_pool_scan_t* t_scan;
 
 /* What this thread has requested for the current dispatch: rows
- * [lo[c], hi[c]) of column c.  Stale (gen differs) at a new dispatch. */
+ * [lo[c], hi[c]) of column c.  Stale (gen differs) at a new dispatch.
+ *
+ * A dispatch reads only some of the registered columns (a filter its
+ * predicate's, a counting pass its keys).  Requesting the others too
+ * interleaves streams the dispatch does not need, which a spinning disk pays
+ * for in seeks.  So a column is requested only once the dispatch is seen to
+ * read it: its page in the middle of the rows this thread went through since
+ * its previous call is in the page cache (`active`).  A column the dispatch
+ * does not read, or reads only sparsely, stays out of the page cache there. */
 typedef struct {
     uint64_t gen;
+    uint32_t active;   /* columns this dispatch reads, by bit */
+    int64_t  last;     /* row of the previous call in this dispatch; -1 none */
     int64_t  lo[RAY_POOL_SCAN_MAX];
     int64_t  hi[RAY_POOL_SCAN_MAX];
 } pool_scan_tls_t;
@@ -266,9 +276,21 @@ static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
     pool_scan_tls_t* t = &t_pf;
     if (t->gen != pool->scan_gen) {
         t->gen = pool->scan_gen;
+        t->active = 0;
+        t->last = -1;
         for (uint32_t c = 0; c < s->n; c++) t->lo[c] = t->hi[c] = r;
     }
+    /* Which columns were read over the rows behind this one. */
+    if (t->last >= 0 && t->last != r) {
+        int64_t mid = (t->last < r ? t->last + r : r + t->last) / 2;
+        for (uint32_t c = 0; c < s->n && c < 32; c++)
+            if (!(t->active >> c & 1) &&
+                ray_vm_resident(s->base[c] + (size_t)mid * s->esz[c], 1))
+                t->active |= UINT32_C(1) << c;
+    }
+    t->last = r;
     for (uint32_t c = 0; c < s->n; c++) {
+        if (c >= 32 || !(t->active >> c & 1)) continue;
         /* A jump outside what was requested starts a new run. */
         if (r < t->lo[c] || r > t->hi[c]) t->lo[c] = t->hi[c] = r;
         int64_t win = (int64_t)(pool->scan_bytes / s->esz[c]);
