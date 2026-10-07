@@ -42,6 +42,8 @@ typedef struct {
     int64_t len;                    /* rows (parted: sum over segments) */
     bool    may_null;               /* HAS_NULLS, or directory null counts for generation 2 */
     bool    parted;                 /* a parted source (per-range attrs are authoritative) */
+    _Atomic(int64_t*) seg_off;      /* parted: segment row offsets (n_segs + 1), built on the
+                                     * first range read, published once, freed on release */
 } ray_col_src_t;
 
 /* A view of rows [start, start + n): elements in the generation-0
@@ -119,6 +121,10 @@ static inline bool ray_col_src_encoded(const ray_col_src_t* s) {
  * published materialization; NULL when reading it would decode.  Borrowed
  * from the source; never decodes. */
 ray_t*  ray_col_src_ready(const ray_col_src_t* s);
+/* The base pointer (row 0) a scan reads the source at in place: the ready
+ * plain vector's data; NULL when it must be read by range (not ready, or a
+ * parted wrapper, which has no single base).  Never decodes. */
+const void* ray_col_src_base(const ray_col_src_t* s);
 /* Generation-0 element width of the source (SYM: its persisted width). */
 uint8_t ray_col_src_esz(const ray_col_src_t* s);
 
@@ -166,8 +172,13 @@ ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32
                     int64_t lo, int64_t hi, bool contiguous,
                     void* ctx, uint32_t wid, ray_col_piece_fn fn);
 
-/* A dispatch's failure envelope: workers note range errors keyed by their
- * task's first row; the coordinator returns the lowest-keyed one. */
+/* A dispatch's failure envelope (R-FAIL): a worker notes a range error
+ * keyed by its task's first row and stops reading.  The answer is the
+ * lowest-keyed failure, independent of scheduling, so a task may return
+ * early only when ray_scan_fail_skip says a LOWER key already failed (a
+ * task below the lowest failure still runs: it may fail lower).  After the
+ * join, every coordinator calls ray_scan_fail_finish, which also turns a
+ * cancelled dispatch (tasks the pool skipped note nothing) into `cancel`. */
 typedef struct {
     _Atomic(uint32_t) lock;
     _Atomic(int64_t)  key;     /* lowest failing key; INT64_MAX when none */
@@ -181,7 +192,17 @@ void   ray_scan_fail_note(ray_scan_fail_t* f, int64_t key, ray_t* err);
 static inline bool ray_scan_failed(ray_scan_fail_t* f) {
     return atomic_load_explicit(&f->key, memory_order_acquire) != INT64_MAX;
 }
+/* True only when a failure with a key lower than `key` is already noted:
+ * the task of `key` cannot change the answer and may skip its work. */
+static inline bool ray_scan_fail_skip(ray_scan_fail_t* f, int64_t key) {
+    return atomic_load_explicit(&f->key, memory_order_acquire) < key;
+}
 /* NULL, or a fresh error rebuilt on the calling thread. */
 ray_t* ray_scan_fail_error(ray_scan_fail_t* f);
+/* The coordinator's verdict after the join: the lowest noted failure; else
+ * `cancel` when the dispatch was cancelled (ray_interrupted(), or `pool`'s
+ * cancel flag; pool may be NULL); else NULL.  A noted failure stands over a
+ * cancel: it is a real fault of the data, a cancel only an absence of work. */
+ray_t* ray_scan_fail_finish(ray_scan_fail_t* f, ray_pool_t* pool);
 
 #endif /* RAY_COLRANGE_H */

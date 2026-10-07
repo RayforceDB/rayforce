@@ -23,6 +23,7 @@
 
 #include "store/colrange.h"
 #include "core/platform.h"
+#include "core/pool.h"
 #include "store/col.h"
 #include "store/enccol.h"
 #include "table/sym.h"
@@ -102,6 +103,7 @@ ray_t* ray_col_src_bind(ray_t* col, ray_col_src_t* out) {
 }
 
 void ray_col_src_release(ray_col_src_t* s) {
+    ray_free_raw(atomic_load_explicit(&s->seg_off, memory_order_acquire));
     if (s->obj) ray_release(s->obj);
     if (s->dom && s->dom_owned) ray_sym_domain_release(s->dom);
     memset(s, 0, sizeof *s);
@@ -170,7 +172,41 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
     return NULL;
 }
 
-static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n,
+/* The plain or encoded parted wrapper behind obj, or NULL. */
+static ray_t* parted_wrapper(ray_t* obj) {
+    if (obj->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of(obj);
+        return e->kind == RAY_ENCCOL_SINGLE ? NULL : e->wrapper;
+    }
+    return RAY_IS_PARTED(obj->type) ? obj : NULL;
+}
+
+/* A parted source's segment row offsets (off[i] = first row of segment i,
+ * off[n] = len), built on the first range read and published once (workers
+ * share the source).  A missing segment (hand-built only) holds no rows.
+ * The encoded wrapper and its materialization have the same segments. */
+static ray_t* src_seg_off(ray_col_src_t* s, ray_t* w, const int64_t** out) {
+    int64_t* a = atomic_load_explicit(&s->seg_off, memory_order_acquire);
+    if (!a) {
+        a = ray_alloc_raw((size_t)(w->len + 1) * sizeof *a);
+        if (!a) return ray_error("oom", "parted segment offsets");
+        ray_t** segs = (ray_t**)ray_data(w);
+        a[0] = 0;
+        for (int64_t i = 0; i < w->len; i++)
+            a[i + 1] = a[i] + (segs[i] ? ray_table_col_nrows(segs[i]) : 0);
+        int64_t* exp = NULL;
+        if (!atomic_compare_exchange_strong_explicit(&s->seg_off, &exp, a, memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+            ray_free_raw(a);
+            a = exp;
+        }
+    }
+    *out = a;
+    return NULL;
+}
+
+/* off: the parted wrapper's segment offsets (src_seg_off), NULL otherwise. */
+static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off,
                         ray_col_scratch_t* sc, ray_col_range_t* out) {
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
@@ -179,20 +215,34 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n,
     }
     if (RAY_IS_PARTED(obj->type)) {
         ray_t** segs = (ray_t**)ray_data(obj);
-        int64_t acc = 0;
-        for (int64_t i = 0; i < obj->len; i++) {
-            int64_t sl = segs[i] ? ray_table_col_nrows(segs[i]) : 0;   /* missing (hand-built only): no rows */
-            if (start < acc + sl) {
-                int64_t local = start - acc;
-                if (n > sl - local) n = sl - local;          /* never cross a segment */
-                return range_obj(segs[i], local, n, sc, out);
-            }
-            acc += sl;
+        int64_t ns = obj->len;
+        if (!off || ns <= 0 || start < 0 || start >= off[ns])
+            return ray_error("range", "range read past the last segment");
+        int64_t lo = 0, hi = ns - 1;                     /* the last i with off[i] <= start */
+        while (lo < hi) {
+            int64_t mid = lo + (hi - lo + 1) / 2;
+            if (off[mid] <= start) lo = mid; else hi = mid - 1;
         }
-        return ray_error("range", "range read past the last segment");
+        int64_t sl = off[lo + 1] - off[lo];              /* > 0: start < off[lo + 1] */
+        int64_t local = start - off[lo];
+        if (n > sl - local) n = sl - local;              /* never cross a segment */
+        return range_obj(segs[lo], local, n, NULL, sc, out);
     }
     range_plain(obj, start, n, out);
     return NULL;
+}
+
+/* range_obj over the source's object `obj` (s->obj or its published
+ * materialization), with the segment offsets for a parted one. */
+static ray_t* range_src(ray_col_src_t* s, ray_t* obj, int64_t start, int64_t n,
+                        ray_col_scratch_t* sc, ray_col_range_t* out) {
+    const int64_t* off = NULL;
+    ray_t* w = parted_wrapper(obj);
+    if (w) {
+        ray_t* err = src_seg_off(s, w, &off);
+        if (err) return err;
+    }
+    return range_obj(obj, start, n, off, sc, out);
 }
 
 ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
@@ -206,7 +256,7 @@ ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
     out->attrs = src->attrs;
     out->dom = src->dom;
     if (n == 0 || start == src->len) return NULL;
-    ray_t* err = range_obj(src->obj, start, n, scratch, out);
+    ray_t* err = range_src(src, src->obj, start, n, scratch, out);
     out->start = start;
     return err;
 }
@@ -255,6 +305,11 @@ ray_t* ray_col_src_ready(const ray_col_src_t* s) {
     return ray_enccol_decoded_peek(s->obj);        /* published materialization, or NULL */
 }
 
+const void* ray_col_src_base(const ray_col_src_t* s) {
+    ray_t* rd = ray_col_src_ready(s);
+    return (rd && !RAY_IS_PARTED(rd->type)) ? ray_data(rd) : NULL;
+}
+
 void ray_col_cursor_init(ray_col_cursor_t* c, ray_col_src_t* src) {
     memset(c, 0, sizeof *c);
     c->src = src;
@@ -284,7 +339,7 @@ ray_t* ray_col_cursor_at(ray_col_cursor_t* c, int64_t r, const ray_col_range_t**
     c->v.type = s->type;
     c->v.attrs = s->attrs;
     c->v.dom = s->dom;
-    ray_t* err = range_obj(obj, r, s->len - r, &c->sc, &c->v);   /* ray_col_range's body, same clipping */
+    ray_t* err = range_src(s, obj, r, s->len - r, &c->sc, &c->v);   /* ray_col_range's body, same clipping */
     c->v.start = r;
     if (err) return err;
     if (c->v.n <= 0) return ray_error("range", "scan cursor: empty range read at row %lld", (long long)r);
@@ -344,11 +399,17 @@ ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32
             uint8_t esz = ray_col_src_esz(s);
             if (plain[i]) { pc[i].data = (const char*)plain[i] + (size_t)lo * esz; continue; }
             if (s->type != RAY_F32 && s->type != RAY_F64) { err = ray_error("nyi", "scan walk: contiguous non-float source"); break; }
+            const ray_col_range_t* v;
+            if ((err = ray_col_cursor_at(&cur[i], lo, &v)) != NULL) break;
+            if (v->start + v->n >= hi) {                 /* one view covers the block: no copy */
+                pc[i].data = (const char*)v->data + (size_t)(lo - v->start) * esz;
+                pc[i].may_null = v->may_null;
+                continue;
+            }
             buf[i] = ray_alloc_raw((size_t)(hi - lo) * esz);
             if (!buf[i]) { err = ray_error("oom", "scan walk block"); break; }
             bool mn = false;
             for (int64_t r = lo; r < hi; ) {
-                const ray_col_range_t* v;
                 if ((err = ray_col_cursor_at(&cur[i], r, &v)) != NULL) break;
                 int64_t take = v->start + v->n - r; if (take > hi - r) take = hi - r;
                 memcpy((char*)buf[i] + (size_t)(r - lo) * esz, (const char*)v->data + (size_t)(r - v->start) * esz, (size_t)take * esz);
@@ -409,10 +470,17 @@ void ray_scan_fail_note(ray_scan_fail_t* f, int64_t key, ray_t* err) {
 
 ray_t* ray_scan_fail_error(ray_scan_fail_t* f) {
     if (!ray_scan_failed(f)) return NULL;
-    /* The snapshot is written under the lock; take it so a note racing a
-     * late reader cannot tear it. */
+    /* The snapshot is written under the lock: copy it there so a note
+     * racing a late reader cannot tear it. */
     while (atomic_exchange_explicit(&f->lock, 1, memory_order_acquire)) RAY_CPU_RELAX();
-    ray_t* e = ray_enc_snap_error(&f->snap);
+    ray_enc_snap_t snap = f->snap;
     atomic_store_explicit(&f->lock, 0, memory_order_release);
-    return e;
+    return ray_enc_snap_error(&snap);                /* allocates outside the lock */
+}
+
+ray_t* ray_scan_fail_finish(ray_scan_fail_t* f, ray_pool_t* pool) {
+    if (ray_scan_failed(f)) return ray_scan_fail_error(f);
+    if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_acquire)))
+        return ray_error("cancel", "scan: interrupted");
+    return NULL;
 }
