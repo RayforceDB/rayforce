@@ -582,7 +582,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
         if (!pred_dag) { ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
         ray_t* cerr = NULL;
-        if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred, &cerr) != 0) {
+        if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred, &cerr) != 0 ||
+            fp_pred_plain(&ctx.pred, &cerr) != 0) {   /* interim: scans read plain columns */
             fp_pred_cleanup(&ctx.pred);
             ray_graph_free(g);
             fpk_unpin_keys(ctx.keys, n_sort_keys);
@@ -852,7 +853,8 @@ ray_t* ray_fused_take_select(ray_t* tbl,
     ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
     if (!pred_dag) { ray_graph_free(g); return NULL; }
     ray_t* cerr = NULL;
-    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred, &cerr) != 0) {
+    if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred, &cerr) != 0 ||
+        fp_pred_plain(&ctx.pred, &cerr) != 0) {       /* interim: scans read plain columns */
         fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
         if (!cerr) fpk_count(1);

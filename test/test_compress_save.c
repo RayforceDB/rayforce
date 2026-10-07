@@ -2426,6 +2426,7 @@ static test_result_t test_fused_pred_enc_source(void) {
         uint8_t* bits[2] = { ray_alloc_raw(FQ_N + 64), ray_alloc_raw(FQ_N + 64) };
         ray_t* tb[2] = { t0, t2 };
         int rc[2] = { 0, 0 };
+        bool rerr = false;
         for (int g = 0; g < 2; g++) {
             ray_graph_t* gr = ray_graph_new(tb[g]);
             ray_t* e = ray_parse(w[i]);
@@ -2434,12 +2435,19 @@ static test_result_t test_fused_pred_enc_source(void) {
             rc[g] = dag ? fp_compile_pred(gr, dag, tb[g], &p, &err) : -1;
             if (err) { ray_error_free(err); rc[g] = -2; }
             memset(bits[g], 0, FQ_N + 64);
-            if (rc[g] == 0) for (int64_t st = 0; st < FQ_N; st += 1024) fp_eval_pred(&p, st, st + 1024 < FQ_N ? st + 1024 : FQ_N, bits[g] + st);
-            if (rc[g] == 0) fp_pred_cleanup(&p);
+            if (rc[g] == 0) {                  /* encoded children read by range */
+                fp_scratch_t sc; fp_scratch_init(&sc);
+                for (int64_t st = 0; st < FQ_N && !rerr; st += 1024) {
+                    ray_t* ee = fp_eval_pred_rs(&p, st, st + 1024 < FQ_N ? st + 1024 : FQ_N, bits[g] + st, &sc);
+                    if (ee) { ray_error_free(ee); rerr = true; }
+                }
+                fp_scratch_free(&sc);
+                fp_pred_cleanup(&p);
+            }
             ray_release(e);
             ray_graph_free(gr);
         }
-        bool same = rc[0] == 0 && rc[1] == 0 && memcmp(bits[0], bits[1], FQ_N) == 0;
+        bool same = rc[0] == 0 && rc[1] == 0 && !rerr && memcmp(bits[0], bits[1], FQ_N) == 0;
         bool any = false;
         for (int r = 0; r < FQ_N; r++) if (bits[0][r]) { any = true; break; }
         ray_free_raw(bits[0]); ray_free_raw(bits[1]);
@@ -2477,16 +2485,19 @@ static test_result_t test_fused_pred_bind_failure(void) {
     if (r && !RAY_IS_ERR(r)) ray_release(r);
     TEST_ASSERT_TRUE(ok);
 
-    /* a failed materialization of a bound encoded column */
+    /* a failed materialization of a bound encoded column: compiling decodes
+     * nothing (the child reads by range), the plain request fails */
     ray_t* t2 = ray_read_splayed(ray_test_tmp(CS_TMP "/ff2"), ray_test_tmp(CS_TMP "/ff2.sym"));
     TEST_ASSERT_TRUE(t2 && !RAY_IS_ERR(t2));
     ray_graph_t* gr = ray_graph_new(t2);
     ray_op_t* dag = ray_gt(gr, ray_scan(gr, "v"), ray_const_i64(gr, 5));   /* no column lookup: nothing decoded yet */
     fp_pred_t p; ray_t* err = NULL;
     ray_enccol_test_fail_alloc(1);
-    int rc = dag ? fp_compile_pred(gr, dag, t2, &p, &err) : 0;
+    int rc = dag ? fp_compile_pred(gr, dag, t2, &p, &err) : -1;
+    bool compiled = rc == 0 && !err && p.n_children == 1 && p.children[0].enc;
+    int prc = rc == 0 ? fp_pred_plain(&p, &err) : 0;
     ray_enccol_test_fail_alloc(0);
-    bool plain_err = rc != 0 && err && RAY_IS_ERR(err);
+    bool plain_err = compiled && prc != 0 && err && RAY_IS_ERR(err);
     if (rc == 0) fp_pred_cleanup(&p);
     if (err) ray_error_free(err);
     ray_graph_free(gr);

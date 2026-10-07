@@ -87,6 +87,14 @@ typedef struct {
      * LUT does not cover (the same rule as the bare like kernel). */
     uint8_t      like_empty_match;
     struct ray_sym_domain_s* like_dom;
+    /* The bound source (borrowed from the graph).  enc: a generation-2
+     * single-file column without a published materialization; col_base
+     * and col_obj are NULL at compile and a view is bound per morsel
+     * (fp_eval_pred_rs).  col_pool: STR, the base of the pooled ray_str_t
+     * offsets col_base's descriptors point into. */
+    ray_col_src_t* src;
+    bool         enc;
+    const char*  col_pool;
 } fp_cmp_t;
 
 typedef struct {
@@ -98,8 +106,19 @@ typedef struct {
  * bits[0..end-start). */
 void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end, uint8_t* bits);
 
-/* Evaluate the full (possibly ANDed) predicate; AND of children into bits[]. */
+/* Evaluate the full (possibly ANDed) predicate; AND of children into bits[].
+ * No child may be encoded (fp_eval_pred_rs reads those). */
 void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end, uint8_t* bits);
+
+/* Per-task range-read scratch, one per child.  Allocate it per task, free
+ * it inside the same task (a scratch holds its column until freed). */
+typedef struct { ray_col_scratch_t sc[FP_PRED_MAX_CHILDREN]; } fp_scratch_t;
+void   fp_scratch_init(fp_scratch_t* s);
+void   fp_scratch_free(fp_scratch_t* s);
+/* fp_eval_pred over [start, end) (end - start <= RAY_MORSEL_ELEMS) with
+ * range reads for encoded children.  NULL or an owned error. */
+ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
+                       uint8_t* bits, fp_scratch_t* s);
 
 /* Walk an OP_AND tree of leaf comparisons and populate fp_pred_t.
  * Returns 0 on success; -1 with *err NULL when a leaf is not supported
@@ -112,5 +131,10 @@ int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
                     fp_pred_t* out, ray_t** err);
 
 void fp_pred_cleanup(fp_pred_t* p);
+
+/* Interim: turn every encoded child into a plain one (its plain column is
+ * requested, which materializes it) for a caller that evaluates with
+ * fp_eval_pred only.  0, or -1 with an owned *err. */
+int fp_pred_plain(fp_pred_t* p, ray_t** err);
 
 #endif /* RAY_OPS_FUSED_PRED_H */
