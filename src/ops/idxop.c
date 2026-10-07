@@ -1654,6 +1654,7 @@ typedef struct {
     int64_t*        rw;            /* [n_keys] */
     int64_t*        tbl;           /* [cap] */
     uint64_t        tmask;
+    int64_t         n_groups;      /* pass F */
     _Atomic(bool)   oom;
 } hash_par_t;
 
@@ -1795,9 +1796,31 @@ static void hp_touch(ray_pool_t* pool, int n_tasks, hp_touch_t* t) {
     ray_pool_dispatch_n(pool, hp_touch_fn, t, (uint32_t)n_tasks);
 }
 
+/* F (in-memory builds only): the key table filled by every worker at once,
+ * each claiming its slot with a compare-and-swap.  Any insertion order gives
+ * a valid open-addressing table; only its byte layout differs from the
+ * group-order fill, which a persisted index needs and a cache entry does not. */
+static void hp_pass_f(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    hash_par_t* h = (hash_par_t*)raw;
+    int64_t lo = h->n_groups * start / h->n_tasks, hi = h->n_groups * (start + 1) / h->n_tasks;
+    for (int64_t g = lo; g < hi; g++) {
+        uint64_t slot = mix64((uint64_t)h->gk[g]) & h->tmask;
+        for (;;) {
+            int64_t want = 0;
+            if (__atomic_compare_exchange_n(&h->tbl[slot], &want, g + 1, false,
+                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
+            slot = (slot + 1) & h->tmask;
+        }
+    }
+}
+
+/* canonical: the key table is filled in group order, so the bytes are the
+ * same whatever the core count (a persisted .idx.hash); false lets the
+ * workers fill it concurrently (the lazy in-memory index). */
 static bool hash_build_par(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
                            ray_t** rows_out, ray_t** table_out, uint64_t* mask_out,
-                           int64_t* n_keys_out, int64_t* n_groups_out) {
+                           int64_t* n_keys_out, int64_t* n_groups_out, bool canonical) {
     int64_t n = v->len;
     ray_pool_t* pool = ray_pool_get();
     if (!ray_pool_par_dispatch_ok(pool, n, 1 << 16)) return false;
@@ -1905,10 +1928,15 @@ static bool hash_build_par(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
     h.of[0] = 0;
     /* Key table filled in group order, exactly as the serial build does:
      * the persisted index is then the same bytes whatever the core count. */
-    for (int64_t g = 0; g < n_groups; g++) {
-        uint64_t slot = mix64((uint64_t)h.gk[g]) & h.tmask;
-        while (h.tbl[slot] != 0) slot = (slot + 1) & h.tmask;
-        h.tbl[slot] = g + 1;
+    if (canonical) {
+        for (int64_t g = 0; g < n_groups; g++) {
+            uint64_t slot = mix64((uint64_t)h.gk[g]) & h.tmask;
+            while (h.tbl[slot] != 0) slot = (slot + 1) & h.tmask;
+            h.tbl[slot] = g + 1;
+        }
+    } else {
+        h.n_groups = n_groups;
+        ray_pool_dispatch_n(pool, hp_pass_f, &h, (uint32_t)h.n_tasks);
     }
     if (ray_interrupted()) { ok = false; goto done; }
 
@@ -1929,7 +1957,7 @@ done:
     return ok;
 }
 
-ray_t* ray_index_attach_hash(ray_t** vp) {
+static ray_t* attach_hash_impl(ray_t** vp, bool canonical) {
     /* allow_str: keyed on a byte hash with payload-verified compares;
      * allow_sym: RAY_SYM uses domain ids. */
     ray_t* v = prepare_attach_ex(vp, "hash", true, true);
@@ -1943,7 +1971,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
         ray_t *pg = NULL, *po = NULL, *pr = NULL, *pt = NULL;
         int64_t pk = 0, pn = 0;
         uint64_t pm = 0;
-        if (!is_str && hash_build_par(v, &pg, &po, &pr, &pt, &pm, &pk, &pn)) {
+        if (!is_str && hash_build_par(v, &pg, &po, &pr, &pt, &pm, &pk, &pn, canonical)) {
             if (ray_interrupted()) {
                 ray_release(pg); ray_release(po); ray_release(pr); ray_release(pt);
                 return ray_error("cancel", "interrupted");
@@ -2113,6 +2141,11 @@ hash_cancel_csr:
     ray_release(rows);
     return ray_error("cancel", "interrupted");
 }
+
+ray_t* ray_index_attach_hash(ray_t** vp) { return attach_hash_impl(vp, true); }
+/* The lazy cache's build: never persisted, so its key table needs no
+ * canonical layout and is filled in parallel. */
+static ray_t* attach_hash_mem(ray_t** vp) { return attach_hash_impl(vp, false); }
 
 /* --------------------------------------------------------------------------
  * Hash-index point-lookup probe — public entry point for the eq-filter
@@ -4226,9 +4259,14 @@ bool ray_idx_lazy_hash_wanted(const ray_t* col) {
 
 #define LAZY_SLOTS 64
 #define LAZY_HASH_BYTES_PER_ROW 58     /* the converters' hash-build figure, per row */
-/* hcol NULL: a declined column (over budget, or its build failed), kept so
- * later probes do not retry it; it holds no bytes. */
-typedef struct { const ray_t* key; ray_t* col; ray_t* hcol; int64_t bytes; uint64_t tick; } lazy_ent_t;
+/* An entry is built (hcol set), pending (hcol NULL: a wanted column whose
+ * probes are still answered by the scan; work = rows those scans read), or
+ * declined (over budget, or its build failed: later probes do not retry).
+ * Only a built entry holds bytes. */
+typedef struct {
+    const ray_t* key; ray_t* col; ray_t* hcol;
+    int64_t bytes; int64_t work; uint64_t tick; bool declined;
+} lazy_ent_t;
 static lazy_ent_t  g_lazy[LAZY_SLOTS];
 static int64_t     g_lazy_bytes;
 static uint64_t    g_lazy_tick;
@@ -4264,20 +4302,24 @@ static int lazy_slot(lazy_drop_t* d) {
     return lru;
 }
 
-/* Remember that col gets no lazy index.  Under the lock. */
-static void lazy_decline_locked(ray_t* col, lazy_drop_t* d) {
-    if (lazy_find(col) >= 0) return;
-    int s = lazy_slot(d);
-    ray_retain(col);
-    g_lazy[s] = (lazy_ent_t){ .key = col, .col = col, .hcol = NULL, .bytes = 0, .tick = ++g_lazy_tick };
-}
-static void lazy_decline(ray_t* col) {
+/* Record col without an index: pending (this probe's scan counted as its
+ * first work) or declined.  An entry another probe made meanwhile stands. */
+static void lazy_memo(ray_t* col, bool declined) {
     lazy_drop_t d = { .n = 0 };
     lazy_lock();
-    lazy_decline_locked(col, &d);
+    int i = lazy_find(col);
+    if (i >= 0) {
+        if (declined && !g_lazy[i].hcol) g_lazy[i].declined = true;
+    } else {
+        int s = lazy_slot(&d);
+        ray_retain(col);
+        g_lazy[s] = (lazy_ent_t){ .key = col, .col = col, .work = declined ? 0 : col->len,
+                                  .tick = ++g_lazy_tick, .declined = declined };
+    }
     lazy_unlock();
     lazy_drop(&d);
 }
+static void lazy_decline(ray_t* col) { lazy_memo(col, true); }
 
 const ray_t* ray_idx_lazy_lookup(const ray_t* col) {
     lazy_lock();
@@ -4285,6 +4327,14 @@ const ray_t* ray_idx_lazy_lookup(const ray_t* col) {
     const ray_t* r = i >= 0 ? g_lazy[i].hcol : NULL;
     lazy_unlock();
     return r;
+}
+
+int64_t ray_idx_lazy_work(const ray_t* col) {
+    lazy_lock();
+    int i = col ? lazy_find(col) : -1;
+    int64_t w = i < 0 || g_lazy[i].declined ? -1 : g_lazy[i].hcol ? 0 : g_lazy[i].work;
+    lazy_unlock();
+    return w;
 }
 
 /* The index block of col's cached copy, as a .idx.uses key (compared,
@@ -4303,20 +4353,34 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
     lazy_lock();
     int hit = lazy_find(col);
     if (hit >= 0) {
-        g_lazy[hit].tick = ++g_lazy_tick;
-        if (g_lazy[hit].hcol) { ray_retain(g_lazy[hit].hcol); *out = g_lazy[hit].hcol; }
+        lazy_ent_t* e = &g_lazy[hit];
+        e->tick = ++g_lazy_tick;
+        if (e->hcol) {
+            ray_retain(e->hcol);
+            *out = e->hcol;
+            lazy_unlock();
+            return NULL;
+        }
+        /* Pending: the scan answers until the rows earlier probes scanned
+         * pay for the build (RAY_IDX_LAZY_BUILD_PROBES). */
+        if (e->declined || e->work < (int64_t)(RAY_IDX_LAZY_BUILD_PROBES - 1) * col->len) {
+            if (!e->declined) e->work += col->len;      /* this probe scans */
+            lazy_unlock();
+            return NULL;
+        }
+        lazy_unlock();                                  /* repeated enough: build now */
+    } else {
         lazy_unlock();
-        return NULL;                                    /* cached, or declined before */
+        /* The shape is decided from the zone's chunk extrema (O(chunks),
+         * nothing built), so a column it rejects is simply asked again. */
+        if (!ray_idx_lazy_hash_wanted(col)) return NULL;
     }
-    lazy_unlock();
-    /* Not remembered: the shape is decided from the zone's chunk extrema
-     * (O(chunks), nothing built), so it is simply asked again. */
-    if (!ray_idx_lazy_hash_wanted(col)) return NULL;
     int64_t budget = ray_sys_ram_limit() / 4;
     if (budget <= 0) return NULL;                       /* no runtime: no budget, no cache */
     int64_t bytes = col->len * (int64_t)(numeric_elem_size(col->type) + LAZY_HASH_BYTES_PER_ROW);
     if (bytes > budget) { lazy_decline(col); return NULL; }
-    ray_t* h = ray_idx_hash_fn(col);                    /* copy-on-write: col is never modified */
+    if (hit < 0) { lazy_memo(col, false); return NULL; } /* first probe: the scan answers */
+    ray_t* h = attach_via(col, attach_hash_mem);        /* copy-on-write: col is never modified */
     if (!h) { lazy_decline(col); return ray_error("oom", "lazy hash"); }
     if (RAY_IS_ERR(h)) {
         /* an interrupted build is the query's cancellation, not the column's */
@@ -4337,7 +4401,7 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
         ray_release(h);
         return NULL;
     }
-    if (i >= 0) lazy_take(&d, i);                       /* declined meanwhile: this build stands */
+    if (i >= 0) lazy_take(&d, i);                       /* its pending (or declined) memo */
     while (g_lazy_bytes + bytes > budget) {             /* least recently used first */
         int lru = -1;
         for (int k = 0; k < LAZY_SLOTS; k++)
@@ -4377,7 +4441,7 @@ void ray_idx_lazy_clear(void) {
 int64_t ray_idx_lazy_count(void) {
     int64_t n = 0;
     lazy_lock();
-    for (int i = 0; i < LAZY_SLOTS; i++) n += g_lazy[i].hcol != NULL;
+    for (int i = 0; i < LAZY_SLOTS; i++) n += g_lazy[i].hcol != NULL;   /* built entries */
     lazy_unlock();
     return n;
 }

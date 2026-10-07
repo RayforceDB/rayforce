@@ -275,7 +275,17 @@ ray_t* ray_idx_uses_fn(ray_t* tbl);
  * indexed heap copy (ray_idx_hash_fn, copy-on-write).  The bytes held stay
  * within a quarter of ray_sys_ram_limit(); least recently used entries are
  * evicted to make room.  A column the budget or a failed build declines is
- * remembered, so later probes do not retry it. */
+ * remembered, so later probes do not retry it.
+ *
+ * The build waits for proven repetition: the scan answers a wanted column's
+ * probes, and the rows they read are counted in a pending entry, until that
+ * scan work pays for one build.  Measured on 10M unclustered I64 rows (8
+ * cores, release, page cache warm): the parallel in-memory build, column copy
+ * included, takes 615 ms (about 61 ns/row); the equality scan it replaces
+ * reads the mapped column in 1.9 ms (about 0.19 ns/row).  61 / 0.19 rounds
+ * to 320 full-column probes: the 320th probe builds, the first 319 scan.
+ * A cold scan costs more and pays sooner, so the warm ratio is the safe one. */
+#define RAY_IDX_LAZY_BUILD_PROBES 320
 
 /* The random-shape test the converters used: a fresh, integer CHUNK_ZONE of
  * at least 4 non-empty chunks whose mean chunk span exceeds half the global
@@ -283,7 +293,8 @@ ray_t* ray_idx_uses_fn(ray_t* tbl);
 bool   ray_idx_lazy_hash_wanted(const ray_t* col);
 /* For a probe on `col`: NULL with *out = a retained vector equal to col
  * carrying a HASH (from the cache, or built now), or NULL with *out = NULL
- * when no lazy index applies (not wanted, over budget, declined before); an
+ * when no lazy index applies (not wanted, over budget, declined before, or
+ * still pending: the caller scans and this probe's work is counted); an
  * owned error on failure to build (the caller falls back to its scan). */
 ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out);
 /* The cached indexed copy for col, borrowed (valid while the entry lives:
@@ -292,6 +303,9 @@ const ray_t* ray_idx_lazy_lookup(const ray_t* col);
 /* Drop the entry of a column object that is going away (the generation-2
  * object frees its materialization). */
 void   ray_idx_lazy_forget(const ray_t* col);
+/* Tests: rows the scans of col's pending probes read (0 once built), or -1
+ * when col has no entry or was declined. */
+int64_t ray_idx_lazy_work(const ray_t* col);
 /* Tests and runtime teardown: drop every entry; indexed entry count; bytes held. */
 void    ray_idx_lazy_clear(void);
 int64_t ray_idx_lazy_count(void);

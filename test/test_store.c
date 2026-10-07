@@ -2138,19 +2138,50 @@ static int lz_slot_kind(const char* var, const char* col, ray_t** enc_out) {
     return (int)m.index_kind;
 }
 
+/* Run the point lookup (== h 7919) on `var` n times; true when every
+ * answer is the one row v = 1. */
+static bool lz_probe_n(const char* var, int n) {
+    char src[128];
+    snprintf(src, sizeof src, "(at (select {v: v from: %s where: (== h 7919)}) 'v)", var);
+    for (int k = 0; k < n; k++) {
+        ray_t* r = lz_eval(src);
+        bool ok = r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        if (!ok) return false;
+    }
+    return true;
+}
+/* The table column var.col (borrowed: the table holds it). */
+static ray_t* lz_col(const char* var, const char* col) {
+    ray_t* t = ray_env_get(ray_sym_intern(var, strlen(var)));
+    ray_t* c = t ? ray_table_col(t, ray_sym_intern(col, strlen(col))) : NULL;
+    return c && !RAY_IS_ERR(c) ? c : NULL;
+}
+
+/* The first RAY_IDX_LAZY_BUILD_PROBES - 1 probes scan (their rows are
+ * counted, nothing is built); the next one builds, and later probes reuse it.
+ * Every answer is the same. */
 static test_result_t test_lazy_first_use(void) {
     lz_make();
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
     lz_ok("(do (.idx.uses A) null)");
-    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
-    ray_release(r);
+    for (int k = 1; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {
+        TEST_ASSERT_TRUE(lz_probe_n("A", 1));
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), (int64_t)k * 300000);
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    ray_t* u = lz_eval("(.idx.uses A)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && ray_dict_len(u) == 0);   /* the scans used no index */
+    ray_release(u);
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));                          /* this one builds */
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), 0);
     TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 300000LL * (8 + 58));
-    ray_t* u = lz_eval("(at (.idx.uses A) 'h)");
+    u = lz_eval("(at (.idx.uses A) 'h)");
     TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u->i64 == 1);          /* attributed to the column */
     ray_release(u);
-    r = lz_eval("(at (select {v: v from: A where: (in h [7919 15838])}) 'v)");   /* rows 1 and 2 */
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (in h [7919 15838])}) 'v)");   /* rows 1 and 2 */
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 2 &&
                      ((int64_t*)ray_data(r))[0] == 1 && ((int64_t*)ray_data(r))[1] == 2);
     ray_release(r);
@@ -2173,6 +2204,8 @@ static test_result_t test_lazy_eq_range(void) {
     lz_make();
     ray_t* tbl = ray_env_get(ray_sym_intern("A", 1));
     TEST_ASSERT_TRUE(tbl && tbl->type == RAY_TABLE);
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));   /* scans: pending */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
     uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_EQRANGE];
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
@@ -2192,7 +2225,7 @@ static test_result_t test_lazy_eq_range(void) {
 /* Never persisted: a resave of the probed table records a zone, not a hash. */
 static test_result_t test_lazy_not_persisted(void) {
     lz_make();
-    lz_ok("(select {v: v from: A where: (== h 7919)})");
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
     lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/b/\" A)");
     lz_ok("(set B (.db.splayed.get \"/tmp/rayforce_lazy/b/\"))");
@@ -2215,9 +2248,8 @@ static test_result_t test_lazy_budget(void) {
     ray_release(r);
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
     TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
-    r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");    /* budget back: declined stays */
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
-    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), -1);    /* declined */
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));  /* budget back: declined stays */
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
     PASS();
 }
@@ -2226,8 +2258,9 @@ static test_result_t test_lazy_budget(void) {
  * does a query that is not a point lookup. */
 static test_result_t test_lazy_not_wanted(void) {
     lz_make();
-    lz_ok("(select {h: h from: A where: (== v 7919)})");
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES; k++) lz_ok("(select {h: h from: A where: (== v 7919)})");
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "v")), -1);   /* not even pending */
     lz_ok("(select {h: h from: A where: (> h 7919)})");
     lz_ok("(select {s: (sum h) from: A})");
     lz_ok("(select {c: (count v) from: A by: h})");
@@ -2242,11 +2275,11 @@ static test_result_t test_lazy_gen2(void) {
     ray_t* enc = NULL;
     TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", &enc), RAY_IDX_CHUNK_ZONE);
     TEST_ASSERT_NOT_NULL(enc);                                     /* generation 2 */
-    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
-    ray_release(r);
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
-    r = lz_eval("(count (select {v: v from: A where: (in h [7919 15838 3])}))");
+    ray_t* r = lz_eval("(count (select {v: v from: A where: (in h [7919 15838 3])}))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 2);
     ray_release(r);
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
@@ -2284,6 +2317,11 @@ static test_result_t test_lazy_concurrent(void) {
     TEST_ASSERT_TRUE(ray_idx_lazy_hash_wanted(v));
     for (int round = 0; round < 8; round++) {
         ray_idx_lazy_clear();
+        for (int k = 1; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {   /* pending: the scans' work */
+            ray_t* o = NULL;
+            TEST_ASSERT_NULL(ray_idx_lazy_hash(v, &o));
+            TEST_ASSERT_NULL(o);
+        }
         _Atomic int go = 0;
         lz_thr_t t[2]; ray_thread_t th[2];
         for (int k = 0; k < 2; k++) {
