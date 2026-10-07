@@ -1947,8 +1947,8 @@ static test_result_t test_filter_consult_enc_shapes(void) {
     ray_op_t* (*preds[])(ray_graph_t*) = { cpred_h_in_out, cpred_h_in, cpred_h_eq_g, cpred_h_rng_v, cpred_h_rng };
     const int64_t want_entries[] = { 0, 1, 0, 0, 1 };   /* lazy memos after one run */
     /* the consults decode nothing; the `in` scan that answers a pending
-     * probe still materializes its column until Task 8 range-reads it */
-    const uint64_t want_mat[] = { 0, 1, 0, 0, 0 };
+     * probe range-reads its column */
+    const uint64_t want_mat[] = { 0, 0, 0, 0, 0 };
     for (size_t i = 0; i < sizeof preds / sizeof preds[0]; i++) {
         int64_t n[2]; uint64_t hits[2];
         for (int gen = 0; gen < 2; gen++) {
@@ -2483,6 +2483,107 @@ static test_result_t test_topk_take_error(void) {
     PASS();
 }
 
+/* `in` / `not-in` selections (exec_in_to_selection) range-read a
+ * generation-2 column: the same selection as generation 0, nothing
+ * materialized, for an integer set, a nullable column under not-in, an F64
+ * column and a file-domain SYM set with a literal absent from the domain. */
+static ray_op_t* fpp_v_notin(ray_graph_t* g) {
+    ray_t* set = sr_i64_set(293, 2993);              /* rows 100 and 1000: 1000 is null */
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "v"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* fpp_f_in(ray_graph_t* g) {
+    ray_t* set = ray_vec_new(RAY_F64, 3); set->len = 3;
+    ((double*)ray_data(set))[0] = 12.0; ((double*)ray_data(set))[1] = 13.0; ((double*)ray_data(set))[2] = 150001.0;
+    ray_op_t* o = ray_in(g, ray_scan(g, "f"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* fpp_s_in(ray_graph_t* g) {
+    ray_t* set = ray_vec_new(RAY_SYM, 3); set->len = 3;
+    ((int64_t*)ray_data(set))[0] = ray_sym_intern("e", 1);
+    ((int64_t*)ray_data(set))[1] = ray_sym_intern("zzq", 3);   /* absent from the file domain */
+    ((int64_t*)ray_data(set))[2] = ray_sym_intern("b", 1);
+    ray_op_t* o = ray_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static test_result_t test_in_selection(void) {
+    test_result_t r;
+    if ((r = sr_sel_same(fpp_g_in)).status != TEST_PASS) return r;   /* (in g [2 5]) */
+    if ((r = sr_sel_same(fpp_v_notin)).status != TEST_PASS) return r;
+    if ((r = sr_sel_same(fpp_f_in)).status != TEST_PASS) return r;
+    if ((r = sr_sel_same(fpp_s_in)).status != TEST_PASS) return r;
+    SR_SAME("(count (select {from: T where: (in s ['a 'e])}))", 0);
+    SR_SAME("(count (select {from: T where: (not-in g [0 1 2])}))", 0);
+    /* the OP_FILTER IN consult (Task 5) then the fused selection: nothing decoded */
+    int64_t want = 0;
+    for (int64_t i = 0; i < 200000; i++) want += (i % 7 == 2 || i % 7 == 5);
+    for (int gen = 0; gen < 2; gen++) {
+        ray_t* t = sr_load(gen);
+        uint64_t mat = 9;
+        TEST_ASSERT_EQ_I(sr_filter_rows(t, fpp_g_in, &mat), want);
+        if (gen) TEST_ASSERT_EQ_U(mat, 0);
+        ray_release(t);
+    }
+    PASS();
+}
+
+/* A generation-2 column already materialized elsewhere is read in place
+ * by the `in` selection: nothing decoded again. */
+static test_result_t test_in_selection_reuses_materialized(void) {
+    sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", SR_G2);
+    ray_t* s = sr_eval("(sum (at T 'g))");                          /* materializes g */
+    TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
+    ray_release(s);
+    ray_t* t = sr_eval("T");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_NOT_NULL(ray_enccol_decoded_peek(ray_table_get_col_enc(t, ray_sym_intern("g", 1))));
+    ray_enc_counters_reset();
+    ray_graph_t* g = ray_graph_new(t);
+    bool all = false;
+    ray_t* sel = exec_pred_to_selection(g, fpp_g_in(g), ray_table_nrows(t), &all);
+    TEST_ASSERT_TRUE(sel && !RAY_IS_ERR(sel));
+    TEST_ASSERT_EQ_I(ray_rowsel_meta(sel)->total_pass, 57143);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+    ray_rowsel_release(sel);
+    ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
+/* A corrupt chunk the `in` selection reads is its error, with the column
+ * path; an interrupted selection is `cancel`, not a partial answer. */
+static test_result_t test_in_selection_error(void) {
+    char path[600];
+    sr_make_bad("g", path, sizeof path);
+    for (int i = 0; i < 2; i++) {
+        ray_t* t = sr_eval("(.db.splayed.get \"" SR_TMP "/bad/\")");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_graph_t* g = ray_graph_new(t);
+        bool all = false;
+        ray_error_clear();
+        ray_t* s = exec_pred_to_selection(g, i ? fpp_g_in(g) : ray_not_in(g, ray_scan(g, "g"), ray_const_i64(g, 3)),
+                                          ray_table_nrows(t), &all);
+        TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
+        TEST_ASSERT_STR_EQ(ray_err_code(s), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(s);
+        ray_graph_free(g); ray_release(t);
+    }
+    for (int gen = 0; gen < 2; gen++) {
+        ray_t* t = sr_load(gen);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_graph_t* g = ray_graph_new(t);
+        ray_op_t* pred = fpp_g_in(g);
+        bool all = false;
+        ray_request_interrupt();
+        ray_t* s = exec_pred_to_selection(g, pred, ray_table_nrows(t), &all);
+        ray_clear_interrupt();
+        TEST_ASSERT_FMT(s && RAY_IS_ERR(s), "gen %d: not an error", gen);
+        TEST_ASSERT_STR_EQ(ray_err_code(s), "cancel");
+        ray_error_free(s);
+        ray_graph_free(g); ray_release(t);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -2545,5 +2646,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/fp_range_and_stops",    test_fp_range_and_stops,    srr_setup, srr_teardown },
     { "scanrange/topk_materializes_keys", test_topk_materializes_keys, srr_setup, srr_teardown },
     { "scanrange/topk_take_error",       test_topk_take_error,       srr_setup, srr_teardown },
+    { "scanrange/in_selection",          test_in_selection,          srr_setup, srr_teardown },
+    { "scanrange/in_selection_reuses_materialized", test_in_selection_reuses_materialized, srr_setup, srr_teardown },
+    { "scanrange/in_selection_error",    test_in_selection_error,    srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

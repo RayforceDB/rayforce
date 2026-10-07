@@ -1119,21 +1119,29 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
 
 /* Per-morsel "fill this morsel's bool" callback used by pred_sel_drive.
  * Writes out[0..n) (1=selected, 0=not) for the kernel's verdict on global
- * rows [start, start+n).  Null rows must resolve to 0 (not-selected). */
-typedef void (*pred_sel_fill_fn)(void* ctx, int64_t start, int64_t n,
-                                 uint8_t* out);
+ * rows [start, start+n).  Null rows must resolve to 0 (not-selected).  `sc`
+ * is the calling task's range scratch: initialized at the task's start and
+ * freed at its end on the same thread, so a fill that range-reads one
+ * source keeps one decode buffer per task, not per morsel. */
+typedef void (*pred_sel_fill_fn)(void* ctx, ray_col_scratch_t* sc, int64_t start,
+                                 int64_t n, uint8_t* out);
 
 /* Generic selection-output driver: dispatch `fill` over [0,nrows) in the
  * per-task rowsel-builder model, stitch into one block.  Same tri-state
  * return as exec_pred_to_selection (block / NULL+all_pass / NULL).  Used by
- * the standalone predicate kernels (exec_in_to_selection). */
+ * the standalone predicate kernels (exec_in_to_selection).  With `fail`
+ * (initialized by the caller, noted by the fill), the dispatch's verdict is
+ * ray_scan_fail_finish's: the lowest noted failure, else `cancel` for a
+ * cancelled dispatch, returned as an owned error (no block). */
 ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
-                      bool* all_pass);
+                      ray_scan_fail_t* fail, bool* all_pass);
 
-/* `in` selection-output worker: a root OP_IN over a flat column + literal set,
- * streaming membership bools straight into a rowsel.  Same tri-state return as
+/* `in` / `not-in` selection-output worker: a root OP_IN / OP_NOT_IN over a
+ * flat column + literal set, streaming membership bools straight into a
+ * rowsel (a generation-2 column is read by range).  Same tri-state return as
  * exec_pred_to_selection; NULL+all_pass=0 for any unsupported shape (non-CONST
- * set, parted/MAPCOMMON/STR column, or OP_NOT_IN) → bool-path fallback. */
+ * set, parted/MAPCOMMON/STR/GUID column) → bool-path fallback; an owned
+ * error for a bind or range-read failure or a cancel. */
 ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass);
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input);

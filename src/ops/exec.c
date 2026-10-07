@@ -633,7 +633,12 @@ ray_t* broadcast_scalar(ray_t* atom, int64_t nrows) {
 /* OP_IN worker — process [start, end) of the BOOL output buffer.
  * Disjoint slices, no synchronization. */
 typedef struct {
-    ray_t*         col;
+    ray_t*         col;      /* NULL for a range-read source (cd set) */
+    /* Range-read view: element i of the column is cd[i - cd_base], with SYM
+     * width class cattrs.  NULL for a plain column, read at ray_data(col). */
+    const void*    cd;
+    int64_t        cd_base;
+    uint8_t        cattrs;
     const double*  svf;
     const int64_t* svi;
     int64_t        sv_len;
@@ -712,42 +717,46 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
     (void)worker_id;
     in_worker_ctx_t* c = (in_worker_ctx_t*)vctx;
     ray_t* col = c->col;
-    const void* cd = c->col_is_atom ? NULL : ray_data(col);
+    const void* cd = c->col_is_atom ? NULL : (c->cd ? c->cd : ray_data(col));
+    int64_t cd_base = c->cd ? c->cd_base : 0;
     int8_t ct = c->ct;
-    uint8_t cattrs = c->col_is_atom ? 0 : col->attrs;
+    uint8_t cattrs = c->col_is_atom ? 0 : (c->cd ? c->cattrs : col->attrs);
     /* Output index is relative to ob_base so a fused-selection caller can
      * point ob at a morsel-local scratch (ob_base = morsel start) while the
      * column is still read at the absolute row index i: element i writes
      * ob[i - ob_base], which lands at scratch[0..n).  Full-vec callers set
-     * ob_base = 0, leaving the plain ob[i]. */
+     * ob_base = 0, leaving the plain ob[i].  A range-read view is indexed
+     * the same way: element i is cd[i - cd_base]. */
     uint8_t* ob = c->ob;
     int64_t ob_base = c->ob_base;
     int64_t sv_len = c->sv_len;
     int negate = c->negate ? 1 : 0;
 
     #define IN_READ_I64(dst, idx) do {                                      \
+        int64_t _ix = (idx) - cd_base;                                      \
         switch (ct) {                                                       \
-        case RAY_BOOL: case RAY_U8: (dst) = ((const uint8_t*)cd)[idx]; break; \
-        case RAY_I16:  (dst) = ((const int16_t*)cd)[idx]; break;            \
+        case RAY_BOOL: case RAY_U8: (dst) = ((const uint8_t*)cd)[_ix]; break; \
+        case RAY_I16:  (dst) = ((const int16_t*)cd)[_ix]; break;            \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                        \
-                       (dst) = ((const int32_t*)cd)[idx]; break;            \
+                       (dst) = ((const int32_t*)cd)[_ix]; break;            \
         case RAY_I64:  case RAY_TIMESTAMP:                                  \
-                       (dst) = ((const int64_t*)cd)[idx]; break;            \
-        case RAY_SYM:  (dst) = ray_read_sym(cd, (idx), ct, cattrs); break;  \
+                       (dst) = ((const int64_t*)cd)[_ix]; break;            \
+        case RAY_SYM:  (dst) = ray_read_sym(cd, _ix, ct, cattrs); break;    \
         default:       (dst) = 0; break;                                    \
         }                                                                   \
     } while (0)
 
     #define IN_READ_F64(dst, idx) do {                                      \
+        int64_t _ix = (idx) - cd_base;                                      \
         switch (ct) {                                                       \
-        case RAY_BOOL: case RAY_U8: (dst) = (double)((const uint8_t*)cd)[idx]; break; \
-        case RAY_I16:  (dst) = (double)((const int16_t*)cd)[idx]; break;    \
+        case RAY_BOOL: case RAY_U8: (dst) = (double)((const uint8_t*)cd)[_ix]; break; \
+        case RAY_I16:  (dst) = (double)((const int16_t*)cd)[_ix]; break;    \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                        \
-                       (dst) = (double)((const int32_t*)cd)[idx]; break;    \
+                       (dst) = (double)((const int32_t*)cd)[_ix]; break;    \
         case RAY_I64:  case RAY_TIMESTAMP:                                  \
-                       (dst) = (double)((const int64_t*)cd)[idx]; break;    \
-        case RAY_F32:  (dst) = (double)((const float*)cd)[idx]; break;      \
-        case RAY_F64:  (dst) = ((const double*)cd)[idx]; break;             \
+                       (dst) = (double)((const int64_t*)cd)[_ix]; break;    \
+        case RAY_F32:  (dst) = (double)((const float*)cd)[_ix]; break;      \
+        case RAY_F64:  (dst) = ((const double*)cd)[_ix]; break;             \
         default:       (dst) = 0.0; break;                                  \
         }                                                                   \
     } while (0)
@@ -756,6 +765,8 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
      * the per-element null check is a single ray_vec_is_null call when
      * nulls are present, or eliminated entirely when they are not. */
     bool vec_has_nulls = c->col_has_nulls && !c->col_is_atom;
+    #define IN_IS_NULL(i) (c->cd ? ray_raw_is_null(ct, cattrs, cd, (i) - cd_base) \
+                                 : ray_vec_is_null(col, (i)))
 
     /* ---- SIMD-friendly fast path -----------------------------------------
      * Common case: non-atom fixed-width INTEGER column, integer set (not
@@ -777,19 +788,19 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
         if (w == RAY_SYM_W8) {
             const uint8_t* dp = (const uint8_t*)cd;
             for (int64_t i = start; i < end; i++)
-                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+                ob[i - ob_base] = (uint8_t)(lut[dp[i - cd_base]] ^ neg);
         } else if (w == RAY_SYM_W16) {
             const uint16_t* dp = (const uint16_t*)cd;
             for (int64_t i = start; i < end; i++)
-                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+                ob[i - ob_base] = (uint8_t)(lut[dp[i - cd_base]] ^ neg);
         } else if (w == RAY_SYM_W32) {
             const uint32_t* dp = (const uint32_t*)cd;
             for (int64_t i = start; i < end; i++)
-                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+                ob[i - ob_base] = (uint8_t)(lut[dp[i - cd_base]] ^ neg);
         } else {
             const int64_t* dp = (const int64_t*)cd;
             for (int64_t i = start; i < end; i++)
-                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+                ob[i - ob_base] = (uint8_t)(lut[dp[i - cd_base]] ^ neg);
         }
         return;
     }
@@ -816,7 +827,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
             if ((HASNULL) && vec_has_nulls) {                                \
                 CTYPE sent = (CTYPE)(SENT);                                  \
                 for (int64_t i = start; i < end; i++) {                      \
-                    CTYPE v = dp[i];                                         \
+                    CTYPE v = dp[i - cd_base];                               \
                     uint8_t f = (uint8_t)((v==t0)|(v==t1)|(v==t2)|(v==t3)|   \
                                           (v==t4)|(v==t5)|(v==t6)|(v==t7));  \
                     uint8_t isn = (uint8_t)(v == sent);                      \
@@ -824,7 +835,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
                 }                                                            \
             } else {                                                         \
                 for (int64_t i = start; i < end; i++) {                      \
-                    CTYPE v = dp[i];                                         \
+                    CTYPE v = dp[i - cd_base];                               \
                     uint8_t f = (uint8_t)((v==t0)|(v==t1)|(v==t2)|(v==t3)|   \
                                           (v==t4)|(v==t5)|(v==t6)|(v==t7));  \
                     ob[i - ob_base] = (uint8_t)(f ^ neg);                    \
@@ -859,7 +870,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
             for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
         } else if (vec_has_nulls) {
             for (int64_t i = start; i < end; i++) {
-                if (ray_vec_is_null(col, i)) { ob[i - ob_base] = 0; continue; }
+                if (IN_IS_NULL(i)) { ob[i - ob_base] = 0; continue; }
                 double cv;
                 if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
                 else IN_READ_F64(cv, i);
@@ -878,7 +889,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
             for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
         } else if (vec_has_nulls) {
             for (int64_t i = start; i < end; i++) {
-                if (ray_vec_is_null(col, i)) { ob[i - ob_base] = 0; continue; }
+                if (IN_IS_NULL(i)) { ob[i - ob_base] = 0; continue; }
                 int64_t cv;
                 if (c->col_is_atom) cv = col->i64;
                 else IN_READ_I64(cv, i);
@@ -895,6 +906,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
     }
     #undef IN_READ_I64
     #undef IN_READ_F64
+    #undef IN_IS_NULL
 }
 
 /* ============================================================================
@@ -930,18 +942,23 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
  * the bool path can surface nyi/oom while the fused path falls back. */
 typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2 } in_ctx_status_t;
 
-static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
-                                           double* svf_stack, int64_t* svi_stack,
-                                           in_worker_ctx_t* out_ctx,
-                                           ray_t** sv_hdr_out,
-                                           ray_t** lut_hdr_out) {
+/* The body shared by in_build_worker_ctx (a column vector or atom) and
+ * in_build_worker_ctx_meta (a bound source read by range), over the
+ * column's description: `atom` is the column when it is an atom (else
+ * NULL), ct its element type, may_null its null flag, and dom (SYM) the
+ * domain its raw ids resolve over.  out_ctx->col is left NULL. */
+static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
+                                         struct ray_sym_domain_s* dom,
+                                         ray_t* set, bool negate,
+                                         double* svf_stack, int64_t* svi_stack,
+                                         in_worker_ctx_t* out_ctx,
+                                         ray_t** sv_hdr_out,
+                                         ray_t** lut_hdr_out) {
     *sv_hdr_out = NULL;
     *lut_hdr_out = NULL;
     int64_t set_len = ray_is_atom(set) ? 1 : set->len;
 
-    int8_t ct = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
     int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
-    if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
 
     if (ct == RAY_STR || st == RAY_STR) return IN_CTX_UNSUPPORTED;
@@ -990,8 +1007,8 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
      * context.  Also skip null elements when building the probe
      * buffer so a non-null col row doesn't accidentally match the
      * sentinel value of a null set element. */
-    bool col_has_nulls = !ray_is_atom(col) && ray_vec_may_have_nulls(col);
-    bool col_atom_null = ray_is_atom(col) && RAY_ATOM_IS_NULL(col);
+    bool col_has_nulls = !atom && may_null;
+    bool col_atom_null = atom && RAY_ATOM_IS_NULL(atom);
     bool set_has_nulls = !ray_is_atom(set) && ray_vec_may_have_nulls(set);
 
     #define READ_I64(dst, vec, type, idx) do {                             \
@@ -1048,10 +1065,8 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
     struct ray_sym_domain_s* in_col_dom = NULL;  /* non-NULL ⇒ translate */
     struct ray_sym_domain_s* in_set_dom = NULL;
     if (col_class == 2 && set_class == 2 && set_len > 0) {
-        ray_t* col_rep = ray_is_atom(col) ? NULL : sym_domain_rep(col);
         ray_t* set_rep = ray_is_atom(set) ? NULL : sym_domain_rep(set);
-        struct ray_sym_domain_s* cd =
-            col_rep ? ray_sym_vec_domain(col_rep) : ray_sym_runtime_domain();
+        struct ray_sym_domain_s* cd = (!atom && dom) ? dom : ray_sym_runtime_domain();
         struct ray_sym_domain_s* sd =
             set_rep ? ray_sym_vec_domain(set_rep) : ray_sym_runtime_domain();
         if (cd != sd) { in_col_dom = cd; in_set_dom = sd; }
@@ -1111,10 +1126,8 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
      * verdict is one flag per domain position).  O(D) build, then the
      * worker does one byte load per row regardless of set size. */
     const uint8_t* symlut = NULL;
-    if (!ray_is_atom(col) && col_class == 2 && !use_double && sv_len > 0) {
-        ray_t* col_rep2 = sym_domain_rep(col);
-        struct ray_sym_domain_s* cdom = col_rep2
-            ? ray_sym_vec_domain(col_rep2) : ray_sym_runtime_domain();
+    if (!atom && col_class == 2 && !use_double && sv_len > 0) {
+        struct ray_sym_domain_s* cdom = dom ? dom : ray_sym_runtime_domain();
         int64_t d = ray_sym_domain_count(cdom);
         if (d > 0 && d <= (int64_t)1 << 22) {
             ray_t* lh = ray_alloc(d);
@@ -1137,7 +1150,7 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
     const uint64_t* htf = NULL;
     int64_t ht_mask = 0;
     bool ht_has_min = false;
-    if (!ray_is_atom(col) && !symlut && sv_len > IN_SIMD_SET) {
+    if (!atom && !symlut && sv_len > IN_SIMD_SET) {
         int64_t cap = 16;
         while (cap < sv_len * 2) cap <<= 1;
         ray_t* hh = ray_alloc((size_t)cap * sizeof(int64_t));
@@ -1171,19 +1184,58 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
     }
 
     *out_ctx = (in_worker_ctx_t){
-        .col = col,
+        .col = atom,
         .svf = svf, .svi = svi, .sv_len = sv_len,
         .symlut = symlut,
         .hti = hti, .htf = htf, .ht_mask = ht_mask, .ht_has_min = ht_has_min,
         .ob = NULL, .ob_base = 0, .ct = ct,
         .col_has_nulls = col_has_nulls,
         .col_atom_null = col_atom_null,
-        .col_is_atom = ray_is_atom(col),
+        .col_is_atom = atom != NULL,
         .use_double = use_double,
         .negate = negate,
     };
     *sv_hdr_out = sv_hdr;
     return IN_CTX_OK;
+}
+
+static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
+                                           double* svf_stack, int64_t* svi_stack,
+                                           in_worker_ctx_t* out_ctx,
+                                           ray_t** sv_hdr_out,
+                                           ray_t** lut_hdr_out) {
+    bool atom = ray_is_atom(col);
+    int8_t ct = atom ? (int8_t)(-col->type) : col->type;
+    if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
+    struct ray_sym_domain_s* dom = NULL;
+    if (!atom && ct == RAY_SYM) {
+        ray_t* rep = sym_domain_rep(col);
+        dom = rep ? ray_sym_vec_domain(rep) : ray_sym_runtime_domain();
+    }
+    in_ctx_status_t st = in_build_ctx_core(atom ? col : NULL, ct,
+                                           !atom && ray_vec_may_have_nulls(col), dom,
+                                           set, negate, svf_stack, svi_stack,
+                                           out_ctx, sv_hdr_out, lut_hdr_out);
+    if (st == IN_CTX_OK) out_ctx->col = col;
+    return st;
+}
+
+/* The context for a bound source read by range (exec_in_to_selection's
+ * generation-2 path): the column described by its type, persisted attrs,
+ * null flag and SYM domain.  ctx.col stays NULL; each fill sets cd /
+ * cd_base / cattrs to its range view. */
+static in_ctx_status_t in_build_worker_ctx_meta(int8_t ct, uint8_t attrs, bool may_null,
+                                                struct ray_sym_domain_s* dom,
+                                                ray_t* set, bool negate,
+                                                double* svf_stack, int64_t* svi_stack,
+                                                in_worker_ctx_t* out_ctx,
+                                                ray_t** sv_hdr_out,
+                                                ray_t** lut_hdr_out) {
+    in_ctx_status_t st = in_build_ctx_core(NULL, ct, may_null, dom, set, negate,
+                                           svf_stack, svi_stack, out_ctx,
+                                           sv_hdr_out, lut_hdr_out);
+    if (st == IN_CTX_OK) out_ctx->cattrs = attrs;
+    return st;
 }
 
 /* Public entry for the typed membership kernel — the eval-level `in`
@@ -1374,14 +1426,16 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     return out;
 }
 
-/* Fused `in`/`not-in` → row selection.  Decodes a root OP_IN/OP_NOT_IN of the
- * shape (SCAN flat-col) IN (CONST set) against g->table, builds the same probe
- * buffer + worker context as exec_in, then drives the per-task rowsel builders
- * — each morsel runs exec_in_worker into a morsel-local scratch (ob_base =
- * morsel start) and streams the verdict via rowsel_emit_segment.  Bit-identical
- * to exec_in's bool output (null rows → 0 → not-selected); only the sink
- * differs.  Returns NULL+all_pass=0 for any unsupported shape so the caller
- * falls back to exec_node→ray_rowsel_from_pred unchanged. */
+/* Fused `in`/`not-in` → row selection (exec_in_to_selection).  Binds the
+ * column of a root OP_IN/OP_NOT_IN of the shape (SCAN flat-col) IN (CONST
+ * set) against g->table (a generation-2 column is read by range, never
+ * decoded whole), builds the same probe buffer + worker context as exec_in,
+ * then drives the per-task rowsel builders — each morsel runs exec_in_worker
+ * into a morsel-local scratch (ob_base = morsel start) and streams the
+ * verdict via rowsel_emit_segment.  Bit-identical to exec_in's bool output
+ * (null rows → 0 → not-selected); only the sink differs.  Returns
+ * NULL+all_pass=0 for any unsupported shape so the caller falls back to
+ * exec_node→ray_rowsel_from_pred unchanged. */
 static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                                 ray_t** out_col, ray_t** out_set_lit, ray_col_meta_t* out_meta);
 
@@ -1558,7 +1612,8 @@ static int idx_filter_enc_in_consult(ray_t* enc, const ray_col_meta_t* m, ray_t*
 
 typedef struct { in_worker_ctx_t* ic; } in_sel_fill_ctx_t;
 
-static void in_sel_fill(void* vctx, int64_t start, int64_t n, uint8_t* out) {
+static void in_sel_fill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_t n, uint8_t* out) {
+    (void)sc;
     in_sel_fill_ctx_t* c = (in_sel_fill_ctx_t*)vctx;
     in_worker_ctx_t local = *c->ic;        /* per-call copy: morsel-local sink */
     local.ob      = out;                    /* element i writes out[i - start] */
@@ -1566,19 +1621,68 @@ static void in_sel_fill(void* vctx, int64_t start, int64_t n, uint8_t* out) {
     exec_in_worker(&local, 0, start, start + n);
 }
 
+/* The range-reading fill: rows [start, start + n) of the bound source,
+ * one range view at a time (a view ends at a generation-2 vector
+ * boundary), each through exec_in_worker with cd / cd_base at the view.
+ * A failed read is noted keyed by the morsel's first row (a global row:
+ * the lowest failure wins) and the rest of the morsel is not-selected. */
+typedef struct {
+    in_worker_ctx_t* ic;
+    ray_col_src_t*   src;
+    ray_scan_fail_t* fail;
+} in_sel_rfill_ctx_t;
+
+static void in_sel_rfill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_t n, uint8_t* out) {
+    in_sel_rfill_ctx_t* c = (in_sel_rfill_ctx_t*)vctx;
+    if (ray_scan_fail_skip(c->fail, start)) { memset(out, 0, (size_t)n); return; }
+    int64_t at = 0;
+    while (at < n) {
+        ray_col_range_t v;
+        ray_t* e = ray_col_range(c->src, start + at, n - at, sc, &v);
+        if (!e && v.n <= 0)
+            e = ray_error("range", "in selection: empty range read at row %lld", (long long)(start + at));
+        if (e) {
+            ray_scan_fail_note(c->fail, start, e);
+            memset(out + at, 0, (size_t)(n - at));
+            return;
+        }
+        in_worker_ctx_t local = *c->ic;
+        local.ob = out + at;   local.ob_base = start + at;
+        local.cd = v.data;     local.cd_base = start + at;
+        local.cattrs = v.attrs;
+        exec_in_worker(&local, 0, start + at, start + at + v.n);
+        at += v.n;
+    }
+}
+
 ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass) {
     *all_pass = false;
     if (pred->opcode != OP_IN && pred->opcode != OP_NOT_IN) return NULL;
+    if (pred->arity != 2) return NULL;
 
-    ray_t* col = NULL;
-    ray_t* set_lit = NULL;
-    /* idx_filter_in_decode matches OP_IN of shape (SCAN flat-col) IN (CONST
-     * set) and rejects parted/MAPCOMMON columns + non-CONST sets.  OP_NOT_IN
-     * isn't a decode shape (the shared decode is IN-only), so `not-in` falls
-     * back to the bool path here — still correct, just unfused. */
-    if (!idx_filter_in_decode(g, pred, IDXW_NONE, &col, &set_lit, NULL)) return NULL;
-    if (ray_is_atom(col) || col->len != nrows) return NULL;
+    /* Shape: (SCAN flat-col) IN / NOT-IN (CONST set) over the default
+     * table.  The column is bound, never decoded: a plain column (or a
+     * generation-2 one whose materialization is published) is read in
+     * place, a generation-2 one by range. */
+    ray_op_t* lhs = op_child(g, pred, 0);
+    ray_op_t* rhs = op_child(g, pred, 1);
+    if (!lhs || lhs->opcode != OP_SCAN || !rhs || rhs->opcode != OP_CONST) return NULL;
+    ray_op_ext_t* le = find_ext(g, lhs->id);
+    ray_op_ext_t* re = find_ext(g, rhs->id);
+    if (!le || !re || !re->literal) return NULL;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, le->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0 || !g->table) return NULL;   /* default table only, as idx_filter_in_decode */
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(g->table, le->sym, &m) || RAY_IS_PARTED(m.type) ||
+        m.type == RAY_MAPCOMMON) return NULL;
+    if (ray_col_bind_declines(g->table, le->sym)) return NULL;
+    ray_t* berr = NULL;
+    ray_col_src_t* src = ray_graph_bind_col(g, g->table, le->sym, &berr);
+    if (berr) return berr;
+    if (!src || src->parted || src->len != nrows) return NULL;
+    ray_t* set_lit = re->literal;
 
     bool negate = (pred->opcode == OP_NOT_IN);
     double  svf_stack[32];
@@ -1586,12 +1690,25 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     in_worker_ctx_t ic;
     ray_t* sv_hdr = NULL;
     ray_t* lut_hdr = NULL;
-    if (in_build_worker_ctx(col, set_lit, negate, svf_stack, svi_stack,
-                            &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
-        return NULL;  /* STR / OOM → bool-path fallback */
-
-    in_sel_fill_ctx_t fctx = { &ic };
-    ray_t* sel = pred_sel_drive(nrows, in_sel_fill, &fctx, all_pass);
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    ray_t* sel;
+    ray_t* col = ray_col_src_ready(src);
+    if (col) {
+        if (ray_is_atom(col) || RAY_IS_PARTED(col->type)) return NULL;
+        if (in_build_worker_ctx(col, set_lit, negate, svf_stack, svi_stack,
+                                &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
+            return NULL;  /* STR / OOM → bool-path fallback */
+        in_sel_fill_ctx_t fctx = { &ic };
+        sel = pred_sel_drive(nrows, in_sel_fill, &fctx, &fail, all_pass);
+    } else {
+        if (in_build_worker_ctx_meta(src->type, src->attrs, src->may_null, src->dom,
+                                     set_lit, negate, svf_stack, svi_stack,
+                                     &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
+            return NULL;  /* STR / GUID / OOM → bool-path fallback */
+        ray_col_src_advise(src, 0, nrows);
+        in_sel_rfill_ctx_t fctx = { &ic, src, &fail };
+        sel = pred_sel_drive(nrows, in_sel_rfill, &fctx, &fail, all_pass);
+    }
 
     if (sv_hdr) ray_free(sv_hdr);
     if (lut_hdr) ray_free(lut_hdr);

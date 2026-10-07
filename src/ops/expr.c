@@ -2506,16 +2506,25 @@ typedef struct {
     void*             fill_ctx;
     rowsel_builder_t* sel_builders;
     uint32_t          n_sel_builders;
+    ray_scan_fail_t*  fail;           /* NULL: the fill cannot fail */
 } pred_sel_drive_ctx_t;
 
 static void pred_sel_worker(void* vctx, uint32_t worker_id,
                             int64_t start, int64_t end) {
     (void)worker_id;
     pred_sel_drive_ctx_t* c = (pred_sel_drive_ctx_t*)vctx;
+    /* a lower task already failed: this one cannot change the answer (a
+     * skipped builder stays all-NONE; the coordinator discards it) */
+    if (c->fail && ray_scan_fail_skip(c->fail, start)) return;
 
     ray_t* scratch_hdr = NULL;
     uint8_t* scratch = (uint8_t*)scratch_alloc(&scratch_hdr, RAY_MORSEL_ELEMS);
-    if (!scratch) return;
+    if (!scratch) {
+        if (c->fail) ray_scan_fail_note(c->fail, start, ray_error("oom", "selection scratch"));
+        return;
+    }
+    ray_col_scratch_t sc;                   /* this task's range scratch */
+    ray_col_scratch_init(&sc);
 
     const int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     _Static_assert((RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS) % RAY_MORSEL_ELEMS == 0,
@@ -2528,15 +2537,16 @@ static void pred_sel_worker(void* vctx, uint32_t worker_id,
 
     for (int64_t ms = start; ms < end; ms += RAY_MORSEL_ELEMS) {
         int64_t me = (ms + RAY_MORSEL_ELEMS < end) ? ms + RAY_MORSEL_ELEMS : end;
-        c->fill(c->fill_ctx, ms, me - ms, scratch);
+        c->fill(c->fill_ctx, &sc, ms, me - ms, scratch);
         uint32_t lseg = (uint32_t)(ms / RAY_MORSEL_ELEMS) - local_base_seg;
         rowsel_emit_segment(sb, lseg, scratch, me - ms);
     }
+    ray_col_scratch_free(&sc);
     scratch_free(scratch_hdr);
 }
 
 ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
-                      bool* all_pass) {
+                      ray_scan_fail_t* fail, bool* all_pass) {
     *all_pass = false;
     if (nrows <= 0) { *all_pass = true; return NULL; }
 
@@ -2552,13 +2562,22 @@ ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
         .fill_ctx       = fill_ctx,
         .sel_builders   = builders,
         .n_sel_builders = n_builders,
+        .fail           = fail,
     };
     if (parallel)
         ray_pool_dispatch(pool, pred_sel_worker, &ctx, nrows);
     else
         pred_sel_worker(&ctx, 0, 0, nrows);
 
-    return pred_sel_builders_finish(builders, n_builders, nrows, all_pass);
+    bool ap = false;
+    ray_t* block = pred_sel_builders_finish(builders, n_builders, nrows, &ap);
+    ray_t* ferr = fail ? ray_scan_fail_finish(fail, parallel ? pool : NULL) : NULL;
+    if (ferr) {
+        if (block) ray_rowsel_release(block);
+        return ferr;
+    }
+    *all_pass = ap;
+    return block;
 }
 
 ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
