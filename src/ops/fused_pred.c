@@ -783,6 +783,9 @@ ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
         ray_t* e = fp_eval_pred_rs(p, start, cut, bits, s);
         return e ? e : fp_eval_pred_rs(p, cut, end, bits + (cut - start), s);
     }
+    /* Children AND into bits; once no row of the window passes, the rest
+     * would only AND zeros, so they are not evaluated (nor their vectors
+     * decoded). */
     uint8_t tmp[RAY_MORSEL_ELEMS];
     for (uint8_t i = 0; i < p->n_children; i++) {
         const fp_cmp_t* c = &p->children[i];
@@ -798,7 +801,10 @@ ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
         } else {
             fp_eval_cmp(c, start, end, dst);
         }
-        if (i > 0) for (int64_t r = 0; r < n; r++) bits[r] &= tmp[r];
+        uint8_t any = 0;
+        if (i == 0) for (int64_t r = 0; r < n; r++) any |= bits[r];
+        else        for (int64_t r = 0; r < n; r++) { bits[r] &= tmp[r]; any |= bits[r]; }
+        if (!any) break;                          /* the window is decided: all fail */
     }
     return NULL;
 }

@@ -2149,7 +2149,9 @@ static test_result_t test_zone_dir_boundaries(void) {
 /* Compile a fused predicate over t0 and t2 and compare bits per morsel,
  * aligned and then shifted by 500 rows (a window straddles a vector
  * boundary: fp_eval_pred_rs splits it); nothing is materialized. */
+static int64_t g_fp_pass;                                 /* passing rows of the aligned sweep */
 static test_result_t sr_fp_same_on(ray_t* t0, ray_t* t2, ray_op_t* (*build)(ray_graph_t*)) {
+    g_fp_pass = 0;
     TEST_ASSERT_NOT_NULL(t0); TEST_ASSERT_NOT_NULL(t2);
     ray_graph_t* g0 = ray_graph_new(t0); ray_graph_t* g2 = ray_graph_new(t2);
     fp_pred_t p0, p2;
@@ -2173,6 +2175,7 @@ static test_result_t sr_fp_same_on(ray_t* t0, ray_t* t2, ray_op_t* (*build)(ray_
             ray_t* e = fp_eval_pred_rs(&p2, ms, me, b, &sc);
             TEST_ASSERT_NULL(e);
             TEST_ASSERT_FMT(memcmp(a, b, (size_t)(me - ms)) == 0, "morsel at %lld", (long long)ms);
+            if (off == 0) for (int64_t i = 0; i < me - ms; i++) g_fp_pass += b[i];
         }
     }
     ray_enc_counters_t k; ray_enc_counters_get(&k);
@@ -2319,6 +2322,42 @@ static test_result_t test_fp_range_late_materialized(void) {
     PASS();
 }
 
+/* An AND stops at the first child that fails the whole window: k == 500
+ * (ordered first: an 8-byte EQ) passes in vector 0 only, so v <= 4000 is
+ * read for that one vector (4 KB).  Without the stop v is decoded in every
+ * window (nullable v takes the typed compare, which the directory gate does
+ * not decide); k decodes chunk 0 only (the gate decides its chunks 1-3). */
+static ray_op_t* fpp_k_eq_v(ray_graph_t* g) {
+    return ray_and(g, ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 500)), fpp_v_le(g));
+}
+static test_result_t test_fp_range_and_stops(void) {
+    test_result_t r;
+    if ((r = sr_fp_same(fpp_k_eq_v)).status != TEST_PASS) return r;
+    TEST_ASSERT_EQ_I(g_fp_pass, 1);
+    ray_t* t = sr_load(2);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_graph_t* g = ray_graph_new(t);
+    fp_pred_t p; ray_t* e = NULL;
+    TEST_ASSERT_EQ_I(fp_compile_pred(g, fpp_k_eq_v(g), t, &p, &e), 0);
+    TEST_ASSERT_EQ_I(p.n_children, 2);
+    TEST_ASSERT_TRUE(p.children[0].enc && p.children[0].op == FP_EQ && p.children[0].col_esz == 8);
+    TEST_ASSERT_TRUE(p.children[1].enc);
+    ray_enc_counters_reset();
+    fp_scratch_t sc; fp_scratch_init(&sc);
+    uint8_t b[RAY_MORSEL_ELEMS];
+    int64_t n = ray_table_nrows(t);
+    for (int64_t ms = 0; ms < n; ms += RAY_MORSEL_ELEMS) {
+        int64_t me = ms + RAY_MORSEL_ELEMS < n ? ms + RAY_MORSEL_ELEMS : n;
+        TEST_ASSERT_NULL(fp_eval_pred_rs(&p, ms, me, b, &sc));
+    }
+    fp_scratch_free(&sc);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8 + 1024 * 4);   /* k: chunk 0; v: vector 0 */
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    fp_pred_cleanup(&p); ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
 /* STR children read through the view's pool: typed compares (EQ, LT on
  * the bytes; empty cells are null, below every value) and LIKE.  4000
  * rows: four vectors, the last partial. */
@@ -2363,6 +2402,7 @@ static test_result_t test_fp_range_str(void) {
         if (t0) ray_release(t0);
         if (t2) ray_release(t2);
         if (r.status != TEST_PASS) return r;
+        TEST_ASSERT_FMT(g_fp_pass > 0, "case %zu matches no row", i);   /* never vacuous */
     }
     PASS();
 }
@@ -2394,17 +2434,21 @@ static test_result_t test_topk_materializes_keys(void) {
 }
 
 /* A range read the top-k or take scan makes fails: the query's error, the
- * column's path in the message; an interrupted scan is `cancel`.  v > 400000 leaves chunk 2 (the corrupt
- * one) undecided by the directory gate and decides chunks 0 and 1, so the
- * ascending top-k and the forward take both read it. */
+ * column's path in the message; an interrupted scan is `cancel`.  The
+ * corrupt chunk is 2.  v > 400000 decides chunks 0 and 1 and leaves chunk
+ * 2 undecided, so the ascending top-k and the forward take read it; v ==
+ * 395000 (row 131669) leaves only chunk 2 undecided, so the backward take
+ * and the descending top-k read it whatever the schedule. */
 static test_result_t test_topk_take_error(void) {
     static const char* const qs[] = {
         "(select {k: k from: T where: (> v 400000) asc: k take: 5})",
         "(select {k: k from: T where: (> v 400000) take: 4})",
+        "(select {k: k from: T where: (== v 395000) take: -4})",           /* the backward take */
+        "(select {k: k from: T where: (== v 395000) desc: k take: 5})",
     };
     char path[600];
     sr_make_bad("v", path, sizeof path);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/bad/\"))");
         ray_fused_topk_counters_reset();
         ray_error_clear();
@@ -2498,6 +2542,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/fp_range_ready_child",  test_fp_range_ready_child,  srr_setup, srr_teardown },
     { "scanrange/fp_range_str",          test_fp_range_str,          sr_rt_setup, sr_rt_teardown },
     { "scanrange/fp_range_late_materialized", test_fp_range_late_materialized, srr_setup, srr_teardown },
+    { "scanrange/fp_range_and_stops",    test_fp_range_and_stops,    srr_setup, srr_teardown },
     { "scanrange/topk_materializes_keys", test_topk_materializes_keys, srr_setup, srr_teardown },
     { "scanrange/topk_take_error",       test_topk_take_error,       srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },

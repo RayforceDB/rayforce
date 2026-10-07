@@ -406,8 +406,10 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
  * one's), so it is re-tested before every morsel — one relaxed load and a
  * compare — and the rest of the chunk is abandoned once it cannot beat it.
  * Encoded predicate children read by range through the task's scratch `fs`;
- * a failed read is noted under the morsel's first row and ends the rows
- * (the later ones are higher keys), as does a failure noted below them. */
+ * a failed read is noted under the morsel's first row and ends this call's
+ * rows (one ascending run within a chunk: the rest are higher keys), as
+ * does a failure noted below them.  The task's other chunk slots may lie
+ * lower and are still scanned (fpk_par_fn). */
 static inline void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx, int32_t* hnp,
                                  int32_t k, int64_t row, int64_t end, int64_t chunk) {
     int32_t hn = *hnp;

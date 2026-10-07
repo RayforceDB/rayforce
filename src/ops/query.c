@@ -10311,7 +10311,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
-                        if (res && RAY_IS_ERR(res)) {      /* a failed bind: the query's error */
+                        if (res && RAY_IS_ERR(res)) {      /* a failed bind or range read: the query's error */
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
@@ -10328,7 +10328,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
-                        if (res && RAY_IS_ERR(res)) {      /* a failed bind: the query's error */
+                        if (res && RAY_IS_ERR(res)) {      /* a failed bind or range read: the query's error */
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
