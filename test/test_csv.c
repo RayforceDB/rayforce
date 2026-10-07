@@ -2033,6 +2033,50 @@ static test_result_t test_csv_parted_zones(void) {
     ray_sym_destroy(); ray_heap_destroy(); PASS();
 }
 
+/* Index policy: a parted conversion never persists a segment HASH, even for
+ * an unclustered I64 column spanning four chunks in every partition (the
+ * shape the splayed converter hashes).  Two partitions of 262144 rows,
+ * converted twice: into a fresh root (staged path) and again into the now
+ * existing root (non-staged path, which runs ray_splay_build_indexes).
+ * A guard that passes today; it cannot go red until the policy changes. */
+static test_result_t csv_parted_assert_no_hash(const char* root) {
+    char leaf[200], sym[200];
+    snprintf(sym, sizeof(sym), "%s/.sym", root);
+    for (int p = 0; p < 2; p++) {
+        snprintf(leaf, sizeof(leaf), "%s/%d/t", root, p);
+        ray_t* t = ray_read_splayed(leaf, sym);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        for (int c = 0; c < 2; c++) {
+            ray_t* v = ray_table_get_col_idx(t, c);
+            TEST_ASSERT_TRUE(v != NULL);
+            TEST_ASSERT_FMT(ray_index_kind(v) != RAY_IDX_HASH, "%s partition %d column %d", root, p, c);
+        }
+        ray_release(t);
+    }
+    PASS();
+}
+static test_result_t test_csv_parted_no_segment_hash(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char root[160];
+    snprintf(root, sizeof(root), "%s", ray_test_tmp("/tmp/rayforce-csv-nohash"));
+    (void)ray_test_rm_rf(root);
+    FILE* f = fopen(TMP_CSV, "w"); TEST_ASSERT_TRUE(f != NULL);
+    fputs("u,c\n", f);
+    for (long long i = 0; i < 524288; i++) fprintf(f, "%lld,%lld\n", (i * 7919) % 1000003, i);
+    fclose(f);
+    int8_t types[] = { RAY_I64, RAY_I64 };
+    for (int pass = 0; pass < 2; pass++) {            /* 0: fresh root (staged); 1: existing root */
+        if (pass) TEST_ASSERT_TRUE(access(root, F_OK) == 0);
+        TEST_ASSERT_EQ_I(ray_csv_save_parted_named_opts(TMP_CSV, ',', true, types, 2, NULL, 0,
+                                                        root, "t", 262144), RAY_OK);
+        test_result_t r = csv_parted_assert_no_hash(root);
+        if (r.status != TEST_PASS) return r;
+    }
+    (void)ray_test_rm_rf(root);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_csv_parted_staging(void) {
     ray_heap_init(); (void)ray_sym_init();
     char root[160],partial[200],path[240];
@@ -2234,6 +2278,7 @@ const test_entry_t csv_entries[] = {
     { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
+    { "csv/parted_no_segment_hash", test_csv_parted_no_segment_hash, NULL, NULL },
     { "csv/splayed_inline_indexes", test_csv_splayed_inline_indexes, NULL, NULL },
     { "csv/splayed_hash_waves", test_csv_splayed_hash_waves, NULL, NULL },
     { "csv/native_pooled_batches", test_csv_native_pooled_batches, NULL, NULL },

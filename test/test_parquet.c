@@ -494,6 +494,37 @@ static test_result_t test_pq_splayed_inline_indexes(void) {
     PASS();
 }
 
+/* Smoke test: the parted Parquet conversion persists no HASH in any segment.
+ * zones.parquet's row groups (30-40K rows) are below one chunk, so no auto
+ * index of any kind can occur here; the policy itself is pinned by
+ * store/staged_bulk_no_hash, which exercises the save this route uses. */
+static test_result_t test_pq_parted_no_segment_hash(void) {
+    char root[160];
+    snprintf(root, sizeof(root), "%s", ray_test_tmp("/tmp/rayforce-pq-nohash"));
+    (void)ray_test_rm_rf(root);
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* r = ray_parquet_parted_typed(FIX "zones.parquet", root, "t", NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 200000); ray_release(r);
+    ray_t* t = ray_read_parted(root, "t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    int nparted = 0;
+    for (int64_t c = 0; c < ray_table_ncols(t); c++) {
+        ray_t* w = ray_table_get_col_idx(t, c);
+        TEST_ASSERT_TRUE(w != NULL);
+        if (!RAY_IS_PARTED(w->type)) continue;       /* the virtual partition-key column */
+        nparted++;
+        ray_t** segs = (ray_t**)ray_data(w);
+        for (int64_t s = 0; s < w->len; s++)
+            TEST_ASSERT_FMT(!segs[s] || ray_index_kind(segs[s]) != RAY_IDX_HASH,
+                            "column %lld segment %lld", (long long)c, (long long)s);
+    }
+    TEST_ASSERT_TRUE(nparted >= 2);
+    ray_release(t);
+    ray_pool_destroy();
+    (void)ray_test_rm_rf(root);
+    PASS();
+}
+
 static test_result_t test_pq_small_stack(void) {
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
     ray_pool_destroy();
@@ -523,6 +554,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
     {"parquet/splayed_inline_indexes",test_pq_splayed_inline_indexes,pq_setup,pq_teardown},
+    {"parquet/parted_no_segment_hash",test_pq_parted_no_segment_hash,pq_setup,pq_teardown},
     {"parquet/parallel",test_pq_parallel,pq_setup,pq_teardown},
     {"parquet/range",test_pq_range,pq_setup,pq_teardown},
     {NULL,NULL,NULL,NULL}

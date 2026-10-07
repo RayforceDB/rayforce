@@ -2073,6 +2073,30 @@ static test_result_t test_stream_hash_wave(void) {
     PASS();
 }
 
+/* Index policy: the staged bulk save (parted Parquet partitions, fresh
+ * .csv.parted leaves) persists no HASH for an unclustered I64 column of
+ * 300000 rows, the shape the splayed converter hashes today.  A guard that
+ * passes today (the staged path builds no index); vacuous when the legacy
+ * getter decodes a generation-2 column in the equivalence pass. */
+static test_result_t test_staged_bulk_no_hash(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "%s", ray_test_tmp("/tmp/rayforce-staged-nohash"));
+    (void)ray_test_rm_rf(dir);
+    int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("u", 1), v);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk(t, dir, NULL), RAY_OK);
+    ray_release(t);
+    ray_t* back = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_TRUE(ray_index_kind(ray_table_get_col_idx(back, 0)) != RAY_IDX_HASH);
+    ray_release(back);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* The index region streamed to a file (block by block) is byte-identical to
  * the one the buffered writer lays out in memory, for every public index kind. */
 static bool region_file_matches_buffer(ray_t* w) {
@@ -6306,6 +6330,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
+    { "store/staged_bulk_no_hash", test_staged_bulk_no_hash, store_setup, store_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
     { "store/stream_cancel_publishes_nothing", test_stream_cancel_publishes_nothing, store_setup, store_teardown },

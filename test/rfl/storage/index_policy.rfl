@@ -1,0 +1,28 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; Index policy (compressed-columns PI): explicit .idx.hash requests are
+;; always persisted by .db.splayed.set, survive a reload and are consulted,
+;; for I64, STR and SYM columns, whatever the converters do on their own.
+(.sys.exec "rm -rf /tmp/rf_test_idx_policy") -- 0
+(set n 300000)
+(set i (til n))
+;; unclustered I64: the auto heuristic's shape; here the hash is explicit
+(set h (.idx.hash (% (* i 7919) 1000003)))
+(set s (.idx.hash (as 'STR (map (fn [j] (format "k%" (% j 977))) (til 70000)))))
+(set y (.idx.hash (as 'SYMBOL (map (fn [j] (format "y%" (% j 31))) (til 70000)))))
+;; below one chunk: the auto heuristic never hashes this, only the explicit request does
+(set m (.idx.hash (% (* (til 5000) 7919) 1009)))
+(.db.splayed.set "/tmp/rf_test_idx_policy/c/" (table [m] (list m)))
+(.db.splayed.set "/tmp/rf_test_idx_policy/a/" (table [h] (list h)))
+(.db.splayed.set "/tmp/rf_test_idx_policy/b/" (table [s y] (list s y)))
+(set A (.db.splayed.get "/tmp/rf_test_idx_policy/a/"))
+(set B (.db.splayed.get "/tmp/rf_test_idx_policy/b/"))
+(set C (.db.splayed.get "/tmp/rf_test_idx_policy/c/"))
+(at (.idx.info (at A 'h)) 'kind) -- 'hash
+(at (.idx.info (at C 'm)) 'kind) -- 'hash
+(at (.idx.info (at B 's)) 'kind) -- 'hash
+(at (.idx.info (at B 'y)) 'kind) -- 'hash
+;; the persisted hash answers equality (7919 = 1 * 7919 is the only row) and is consulted
+(do (.idx.uses A) null)
+(at (select {h: h from: A where: (== h 7919)}) 'h) -- [7919]
+(at (.idx.uses A) 'h) -- 1
+(.sys.exec "rm -rf /tmp/rf_test_idx_policy") -- 0
