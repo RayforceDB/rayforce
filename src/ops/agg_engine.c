@@ -3297,19 +3297,15 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
                 agg_radix_visit(c, cur, rows[i], pos++, scatter);
         return;
     }
-    if (!scatter) {
-        /* The count pass is the first read of these rows: keep the next
-         * ones requested from storage, block by block (scan read-ahead). */
-        for (int64_t b = start; b < end; b += 8192) {
-            int64_t e = end - b > 8192 ? b + 8192 : end;
-            ray_pool_scan_at(c->n_in, b, end);
-            for (int64_t r = b; r < e; r++)
-                agg_radix_visit(c, cur, r, r, false);
-        }
-        return;
+    /* Keep the next rows requested from storage, block by block (scan
+     * read-ahead): the count pass is the first read of the key columns, the
+     * scatter pass the first of the aggregate columns. */
+    for (int64_t b = start; b < end; b += 8192) {
+        int64_t e = end - b > 8192 ? b + 8192 : end;
+        ray_pool_scan_at(c->n_in, b, end);
+        for (int64_t r = b; r < e; r++)
+            agg_radix_visit(c, cur, r, r, scatter);
     }
-    for (int64_t r = start; r < end; r++)
-        agg_radix_visit(c, cur, r, r, scatter);
 }
 
 /* Phase 1, pass 1: count each chunk's rows per partition. */
