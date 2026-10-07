@@ -2298,6 +2298,60 @@ static test_result_t lazy_out_of_range(const char* opts) {
 static test_result_t test_lazy_out_of_range(void)      { return lazy_out_of_range(""); }
 static test_result_t test_lazy_out_of_range_gen2(void) { return lazy_out_of_range(" {compress: true}"); }
 
+/* Mappings of files under the lazy tests' root that were unlinked: a
+ * pruned store generation some object still pins.  0 off Linux. */
+static int lz_deleted_mappings(void) {
+    int n = 0;
+#ifdef __linux__
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[1024];
+    const char* root = ray_test_tmp("/tmp/rayforce_lazy");
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, root) && strstr(line, "(deleted)")) n++;
+    fclose(f);
+#endif
+    return n;
+}
+
+/* A table reloaded per request (a server re-reading a store after each
+ * publish) leaves its old column to the cache alone: that entry is dropped
+ * on the next probe, so the cache holds one entry, the heap and the mapped
+ * bytes stay flat, and the pruned generations' files are not pinned. */
+static test_result_t test_lazy_reload_bounded(void) {
+    lz_make();
+    ray_mem_stats_t st;
+    size_t mapped1 = 0, alloc1 = 0;
+    for (int round = 0; round < 3; round++) {
+        if (round) {
+            lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/a/\" A)");   /* a new generation */
+            lz_ok("(set A (.db.splayed.get \"/tmp/rayforce_lazy/a/\"))");
+        }
+        TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 1);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 300000LL * (8 + 58));
+        ray_mem_stats(&st);
+        if (round == 0) { mapped1 = st.sys_mapped; alloc1 = st.bytes_allocated; }
+    }
+    TEST_ASSERT_FMT(st.sys_mapped <= mapped1, "mapped %zu after 3 loads, %zu after 1", st.sys_mapped, mapped1);
+    TEST_ASSERT_FMT(st.bytes_allocated <= alloc1 + (1u << 20), "heap %zu after 3 loads, %zu after 1",
+                    st.bytes_allocated, alloc1);
+    TEST_ASSERT_EQ_I(lz_deleted_mappings(), 0);
+    /* the table goes: its entry goes with the next probe of any column */
+    lz_ok("(set A null)");
+    ray_t* other = ray_vec_new(RAY_I64, 1);
+    other->len = 1; ((int64_t*)ray_data(other))[0] = 7;
+    ray_t* o = NULL;
+    TEST_ASSERT_NULL(ray_idx_lazy_hash(other, &o));
+    TEST_ASSERT_NULL(o);
+    ray_release(other);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    TEST_ASSERT_EQ_I(lz_deleted_mappings(), 0);
+    PASS();
+}
+
 /* Generation 2: the hash comes from the materialized column, the slot keeps
  * its encoded object and zone, and the entry goes with the object. */
 static test_result_t test_lazy_gen2(void) {
@@ -6611,6 +6665,7 @@ const test_entry_t store_entries[] = {
     { "idxlazy/budget",        test_lazy_budget,        lz_setup, lz_teardown },
     { "idxlazy/not_wanted",    test_lazy_not_wanted,    lz_setup, lz_teardown },
     { "idxlazy/gen2",          test_lazy_gen2,          lz_setup, lz_teardown },
+    { "idxlazy/reload_bounded", test_lazy_reload_bounded, lz_setup, lz_teardown },
     { "idxlazy/out_of_range",  test_lazy_out_of_range,  lz_setup, lz_teardown },
     { "idxlazy/out_of_range_gen2", test_lazy_out_of_range_gen2, lz_setup, lz_teardown },
     { "idxlazy/concurrent",    test_lazy_concurrent,    lz_setup, lz_teardown },

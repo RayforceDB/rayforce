@@ -272,7 +272,8 @@ ray_t* ray_idx_uses_fn(ray_t* tbl);
  * (generation 0: the table's column; generation 2: the encoded object's
  * materialization), never in a table slot and never attached to the column,
  * so no save can see it.  An entry holds one reference to the column and an
- * indexed heap copy (ray_idx_hash_fn, copy-on-write).  The bytes held stay
+ * indexed heap copy (ray_idx_hash_fn, copy-on-write); an entry whose column
+ * only the cache still holds is dropped on the next probe.  The bytes held stay
  * within a quarter of ray_sys_ram_limit(); least recently used entries are
  * evicted to make room.  A column the budget or a failed build declines is
  * remembered, so later probes do not retry it.
@@ -311,9 +312,11 @@ void   ray_idx_lazy_forget(const ray_t* col);
 /* Tests: rows the scans of col's pending probes read (0 once built), or -1
  * when col has no entry or was declined. */
 int64_t ray_idx_lazy_work(const ray_t* col);
-/* Tests and runtime teardown: drop every entry; indexed entry count; bytes held. */
+/* Tests and runtime teardown: drop every entry; indexed entry count; every
+ * entry (built, pending, declined); bytes held. */
 void    ray_idx_lazy_clear(void);
 int64_t ray_idx_lazy_count(void);
+int64_t ray_idx_lazy_entries(void);
 int64_t ray_idx_lazy_bytes(void);
 
 /* ===== Attach / Detach ===== */

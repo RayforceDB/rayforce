@@ -4326,8 +4326,17 @@ static int lazy_find(const ray_t* col) {
     for (int i = 0; i < LAZY_SLOTS; i++) if (g_lazy[i].key == col) return i;
     return -1;
 }
+/* Entries whose column only the cache still holds: its table is gone (a
+ * reload, a dropped variable), so nothing can probe it again.  Taken into d,
+ * which keeps a dead table's copy and its mapped files (a pruned store
+ * generation) from living on until budget pressure. */
+static void lazy_sweep_locked(lazy_drop_t* d) {
+    for (int i = 0; i < LAZY_SLOTS; i++)
+        if (g_lazy[i].col && ray_atomic_load(&g_lazy[i].col->rc) == 1) lazy_take(d, i);
+}
 /* A free slot, else the least recently used one emptied into d. */
 static int lazy_slot(lazy_drop_t* d) {
+    lazy_sweep_locked(d);
     int lru = 0;
     for (int i = 0; i < LAZY_SLOTS; i++) {
         if (!g_lazy[i].key) return i;
@@ -4385,7 +4394,9 @@ static const void* lazy_use_key(const ray_t* col) {
 ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
     *out = NULL;
     if (!col || RAY_IS_ERR(col) || !ray_is_vec(col)) return NULL;
+    lazy_drop_t dead = { .n = 0 };
     lazy_lock();
+    lazy_sweep_locked(&dead);
     int hit = lazy_find(col);
     if (hit >= 0) {
         lazy_ent_t* e = &g_lazy[hit];
@@ -4394,6 +4405,7 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
             ray_retain(e->hcol);
             *out = e->hcol;
             lazy_unlock();
+            lazy_drop(&dead);
             return NULL;
         }
         /* Pending: the scan answers until the rows earlier probes scanned
@@ -4401,11 +4413,14 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
         if (e->declined || e->work < (int64_t)(RAY_IDX_LAZY_BUILD_PROBES - 1) * col->len) {
             if (!e->declined) e->work += col->len;      /* this probe scans */
             lazy_unlock();
+            lazy_drop(&dead);
             return NULL;
         }
         lazy_unlock();                                  /* repeated enough: build now */
+        lazy_drop(&dead);
     } else {
         lazy_unlock();
+        lazy_drop(&dead);
         /* The shape is decided from the zone's chunk extrema (O(chunks),
          * nothing built), so a column it rejects is simply asked again. */
         if (!ray_idx_lazy_hash_wanted(col)) return NULL;
@@ -4437,6 +4452,7 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
         return NULL;
     }
     if (i >= 0) lazy_take(&d, i);                       /* its pending (or declined) memo */
+    lazy_sweep_locked(&d);                              /* dead entries go before live ones */
     while (g_lazy_bytes + bytes > budget) {             /* least recently used first */
         int lru = -1;
         for (int k = 0; k < LAZY_SLOTS; k++)
@@ -4477,6 +4493,14 @@ int64_t ray_idx_lazy_count(void) {
     int64_t n = 0;
     lazy_lock();
     for (int i = 0; i < LAZY_SLOTS; i++) n += g_lazy[i].hcol != NULL;   /* built entries */
+    lazy_unlock();
+    return n;
+}
+
+int64_t ray_idx_lazy_entries(void) {
+    int64_t n = 0;
+    lazy_lock();
+    for (int i = 0; i < LAZY_SLOTS; i++) n += g_lazy[i].key != NULL;
     lazy_unlock();
     return n;
 }
