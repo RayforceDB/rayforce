@@ -773,6 +773,7 @@ static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
 ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
                        uint8_t* bits, fp_scratch_t* s) {
     int64_t n = end - start;
+    assert(n <= RAY_MORSEL_ELEMS);
     bool any_enc = false;
     for (uint8_t i = 0; i < p->n_children; i++) any_enc |= p->children[i].enc;
     if (!any_enc) { fp_eval_pred(p, start, end, bits); return NULL; }

@@ -2275,6 +2275,48 @@ static test_result_t test_fp_range_ready_child(void) {
     return r;
 }
 
+/* A materialization published after the compile: the child stays encoded
+ * (enc was decided at compile), so the per-morsel bind reads the published
+ * vector in place.  k < 70000 leaves chunk 1 undecided by the directory
+ * gate: without the in-place read its 64 vectors are decoded again. */
+static test_result_t test_fp_range_late_materialized(void) {
+    ray_t* t0 = sr_load(0); ray_t* t2 = sr_load(2);
+    TEST_ASSERT_NOT_NULL(t0); TEST_ASSERT_NOT_NULL(t2);
+    ray_graph_t* g0 = ray_graph_new(t0); ray_graph_t* g2 = ray_graph_new(t2);
+    fp_pred_t p0, p2; ray_t* e = NULL;
+    TEST_ASSERT_EQ_I(fp_compile_pred(g0, fpp_k_lt(g0), t0, &p0, &e), 0);
+    TEST_ASSERT_EQ_I(fp_compile_pred(g2, fpp_k_lt(g2), t2, &p2, &e), 0);
+    TEST_ASSERT_NULL(e);
+    TEST_ASSERT_TRUE(p2.children[0].enc);                          /* compiled before the publish */
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("k", 1), &s));
+    ray_t* col = NULL;
+    TEST_ASSERT_NULL(ray_col_src_plain(&s, &col));                 /* publishes k's materialization */
+    ray_col_src_release(&s);
+    TEST_ASSERT_NOT_NULL(col);
+    ray_enc_counters_reset();
+    fp_scratch_t sc; fp_scratch_init(&sc);
+    uint8_t a[RAY_MORSEL_ELEMS], b[RAY_MORSEL_ELEMS];
+    int64_t n = ray_table_nrows(t0), pass = 0;
+    for (int64_t off = 0; off <= 500; off += 500) {
+        for (int64_t ms = off; ms < n; ms += RAY_MORSEL_ELEMS) {
+            int64_t me = ms + RAY_MORSEL_ELEMS < n ? ms + RAY_MORSEL_ELEMS : n;
+            fp_eval_pred(&p0, ms, me, a);
+            TEST_ASSERT_NULL(fp_eval_pred_rs(&p2, ms, me, b, &sc));
+            TEST_ASSERT_FMT(memcmp(a, b, (size_t)(me - ms)) == 0, "morsel at %lld", (long long)ms);
+            if (off == 0) for (int64_t i = 0; i < me - ms; i++) pass += b[i];
+        }
+    }
+    fp_scratch_free(&sc);
+    TEST_ASSERT_EQ_I(pass, 70000);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    fp_pred_cleanup(&p0); fp_pred_cleanup(&p2);
+    ray_graph_free(g0); ray_graph_free(g2);
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
 /* STR children read through the view's pool: typed compares (EQ, LT on
  * the bytes; empty cells are null, below every value) and LIKE.  4000
  * rows: four vectors, the last partial. */
@@ -2300,7 +2342,7 @@ static ray_t* sr_str_tbl(int gen) {
     return (t && !RAY_IS_ERR(t)) ? t : NULL;
 }
 static ray_op_t* fpp_t_eq(ray_graph_t* g) {
-    ray_t* lit = ray_str("s00042", 6);
+    ray_t* lit = ray_str("s00039", 6);      /* 39 % 3 == 0, 39 % 7 != 0: a cell */
     ray_op_t* o = ray_eq(g, ray_scan(g, "t"), ray_const_atom(g, lit)); ray_release(lit); return o;
 }
 static ray_op_t* fpp_t_lt(ray_graph_t* g) {
@@ -2381,5 +2423,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/fp_range_dir_gate",     test_fp_range_dir_gate,     srr_setup, srr_teardown },
     { "scanrange/fp_range_ready_child",  test_fp_range_ready_child,  srr_setup, srr_teardown },
     { "scanrange/fp_range_str",          test_fp_range_str,          sr_rt_setup, sr_rt_teardown },
+    { "scanrange/fp_range_late_materialized", test_fp_range_late_materialized, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };
