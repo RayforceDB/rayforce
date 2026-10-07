@@ -83,11 +83,9 @@ does not read its own output back. The converters add no hash index of their
 own: a hash index is persisted only when the column carries one built with
 `.idx.hash` when the table is saved (a table resaved from an older store keeps
 a hash it already has), and a parted conversion builds none for its segments.
-An index
-that cannot be written (for example, the disk fills) is dropped and the column
-is published without it. Writers to the
-same table serialize on `.write.lock`; readers resolve the manifest once and
-continue using that generation. The symbol vocabulary stays at its original
+An index that cannot be written (for example, the disk fills) is dropped and the
+column is published without it. Writers to the same table serialize on
+`.write.lock`; readers resolve the manifest once and continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
 
 Publication keeps only the selected generation and removes the others

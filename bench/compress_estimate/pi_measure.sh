@@ -39,7 +39,10 @@ build)
   avail=$(df -B1 --output=avail "$W" | tail -1)
   [ "$avail" -ge $((13 * 1024 * 1024 * 1024)) ] || { echo "need 13 GB free in $W, have $avail" >&2; exit 2; }
   # both binaries from detached copies of the same commit (HEAD): BIN_H as
-  # committed, BIN_N with the converter's hash upgrade check forced to 0
+  # committed, BIN_N with the converter's hash upgrade check forced to 0.
+  # The BIN_N patch targets commit 2dcb78ae / trees before PI Task 3 (which
+  # removed ray_csv_hash_upgrade_check); on a later tree there is nothing to
+  # disable, the patch is skipped and BIN_N equals BIN_H.
   SHA=$(git -C "$REPO" rev-parse --short HEAD)
   T=${PI_TREES:-$W}
   for t in h n; do
@@ -51,7 +54,10 @@ import sys
 p = sys.argv[1]
 s = open(p).read()
 sig = "int ray_csv_hash_upgrade_check(int8_t type, int64_t len,\n                               const void* index_payload) {\n"
-assert s.count(sig) == 1, "signature not found exactly once"
+if s.count(sig) == 0:
+    print("pi_measure: no hash upgrade check in this tree (post PI Task 3): BIN_N not patched", file=sys.stderr)
+    sys.exit(0)
+assert s.count(sig) == 1, "signature found more than once"
 s = s.replace(sig, sig + "    (void)type; (void)len; (void)index_payload;\n    return 0;   /* PI measurement only: upgrade disabled */\n")
 open(p, "w").write(s)
 PY

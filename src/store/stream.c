@@ -235,8 +235,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
  * ([32 B zero header][rows x element][STR: 32 B pool header + pool]); it is
  * mapped and transcoded chunk by chunk into a second staging file, which
  * then replaces the first (published by ray_col_stream_publish as today).
- * The zone accumulator is recorded as CHUNK_ZONE only; no index region and
- * no hash upgrade.  Closes w->fp on every path. */
+ * The zone accumulator is recorded as CHUNK_ZONE only (in the enc header);
+ * no index region.  Closes w->fp on every path. */
 static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     if (w->zone && w->zone->saw_null) w->had_nulls = true;
     uint8_t ik = (w->zone && w->rows >= RAY_ENC_CHUNK &&

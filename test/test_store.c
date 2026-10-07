@@ -2053,6 +2053,42 @@ static test_result_t test_staged_bulk_no_hash(void) {
     PASS();
 }
 
+/* A column carrying a HASH (as an older converter's store did) keeps it
+ * through a load and a resave that requests no index: the save cannot tell
+ * it from an explicit .idx.hash.  Generation 0 is pinned (compress off). */
+static int store_slot_kind(ray_t* t, int64_t c) {
+    ray_col_meta_t m;
+    return ray_table_col_meta_idx(t, c, &m) ? (int)m.index_kind : -1;
+}
+static test_result_t test_resave_keeps_hash(void) {
+    char dirs[2][160];
+    snprintf(dirs[0], sizeof(dirs[0]), "%s", ray_test_tmp("/tmp/rayforce-resave-hash0"));
+    snprintf(dirs[1], sizeof(dirs[1]), "%s", ray_test_tmp("/tmp/rayforce-resave-hash1"));
+    for (int i = 0; i < 2; i++) (void)ray_test_rm_rf(dirs[i]);
+    int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_t* h = ray_idx_hash_fn(v);
+    ray_release(v);
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && (h->attrs & RAY_ATTR_HAS_INDEX));
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("u", 1), h);
+    ray_release(h);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dirs[0], NULL, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(t);
+    ray_t* a = ray_read_splayed(dirs[0], NULL);
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+    TEST_ASSERT_EQ_I(store_slot_kind(a, 0), RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(a, dirs[1], NULL, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(a);
+    ray_t* b = ray_read_splayed(dirs[1], NULL);
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b));
+    TEST_ASSERT_EQ_I(store_slot_kind(b, 0), RAY_IDX_HASH);
+    ray_release(b);
+    for (int i = 0; i < 2; i++) (void)ray_test_rm_rf(dirs[i]);
+    PASS();
+}
+
 /* The index region streamed to a file (block by block) is byte-identical to
  * the one the buffered writer lays out in memory, for every public index kind. */
 static bool region_file_matches_buffer(ray_t* w) {
@@ -6284,6 +6320,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/staged_bulk_no_hash", test_staged_bulk_no_hash, store_setup, store_teardown },
+    { "store/resave_keeps_hash", test_resave_keeps_hash, store_setup, store_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
     { "store/stream_cancel_publishes_nothing", test_stream_cancel_publishes_nothing, store_setup, store_teardown },

@@ -1371,7 +1371,7 @@ static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t*
     if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0) return;
-    /* One task per column: the zone / dictionary / hash builds are per-row
+    /* One task per column: the zone / dictionary builds are per-row
      * scans of each column and used to run one after another on the
      * calling thread — the longest serial stretch of a CSV → splayed load. */
     ray_pool_t* pool = ray_pool_get();

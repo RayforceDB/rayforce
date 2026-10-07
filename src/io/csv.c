@@ -46,7 +46,7 @@
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "lang/format.h"
 #include "ops/hash.h"
-#include "ops/idxop.h"      /* ray_index_payload — shared hash-upgrade policy */
+#include "ops/idxop.h"      /* ray_index_payload */
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"

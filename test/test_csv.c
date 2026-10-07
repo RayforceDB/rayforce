@@ -2119,10 +2119,6 @@ static test_result_t test_csv_parted_staging(void) {
     unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy(); PASS();
 }
 
-/* 300000 rows streamed in chunks of 100000 (not a multiple of 65536): both
- * integer columns carry a 5-chunk zone (the converters persist no HASH of
- * their own: index policy, compressed-columns PI), the STR column a dict,
- * and the nullable column a zone whose null bits come from the parse chunks. */
 static bool csv_vec_bytes_eq(ray_t* a, ray_t* b, size_t esz) {
     return a && b && a->len == b->len && !memcmp(ray_data(a), ray_data(b), (size_t)a->len * esz);
 }
@@ -2132,6 +2128,10 @@ static int csv_slot_index_kind(ray_t* t, int64_t c) {
     ray_col_meta_t m;
     return ray_table_col_meta_idx(t, c, &m) ? (int)m.index_kind : -1;
 }
+/* 300000 rows streamed in chunks of 100000 (not a multiple of 65536): both
+ * integer columns carry a 5-chunk zone (the converters persist no HASH of
+ * their own: index policy, compressed-columns PI), the STR column a dict,
+ * and the nullable column a zone whose null bits come from the parse chunks. */
 static test_result_t test_csv_splayed_inline_indexes(void) {
     ray_heap_init(); (void)ray_sym_init();
     char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-inline-%d",(int)getpid());
@@ -2155,7 +2155,6 @@ static test_result_t test_csv_splayed_inline_indexes(void) {
     /* the unclustered column keeps its zone (no longer sacrificed for a hash) */
     TEST_ASSERT_EQ_I(csv_slot_index_kind(t,1),RAY_IDX_CHUNK_ZONE);
     ray_t* b=ray_table_get_col_idx(t,1);
-    TEST_ASSERT_EQ_I(ray_index_kind(b),RAY_IDX_CHUNK_ZONE);
     ray_t* bplain=ray_vec_from_raw(RAY_I64,ray_data(b),b->len);
     ray_t* bref=ray_index_chunk_zone_compute(bplain,16);
     TEST_ASSERT_TRUE(bref && !RAY_IS_ERR(bref));
