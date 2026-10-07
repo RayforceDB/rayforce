@@ -2561,125 +2561,6 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
     return true;
 }
 
-/* Per-column elem size for the hash-attach cap.  Mirrors the integer
- * shapes accepted by ray_index_attach_hash (BOOL/U8/I16/I32/I64/DATE/
- * TIME/TIMESTAMP); returns 0 for floats and dict-backed types so the
- * caller skips them. */
-static int csv_hash_elem_size(int8_t t) {
-    switch (t) {
-    case RAY_BOOL: case RAY_U8:                       return 1;
-    case RAY_I16:                                     return 2;
-    case RAY_I32: case RAY_DATE:                      return 4;
-    case RAY_I64: case RAY_TIME: case RAY_TIMESTAMP:  return 8;
-    default:                                          return 0;
-    }
-}
-
-/* Decide whether `v` is a good candidate for an auto-attached hash
- * index, using only its (already-attached) chunk_zone as the entropy
- * proxy.  A column is "random-shaped" when each chunk's [min, max]
- * covers more than half the global range — i.e. there's effectively
- * no clustering, so the per-chunk zone-skip never excludes a chunk
- * and the only way to accelerate `col == K` is by hashing.
- *
- * The memory cap rejects columns where the hash index (table+chain
- * arrays — ~24 bytes/row at default load factor) would be much larger
- * than the data itself.  We use 5× the column's data bytes as the
- * budget: this comfortably admits I32/I64 numeric IDs (where the
- * index is 3–5× the data) while still excluding narrow types like
- * BOOL/U8/I16 where the index would dwarf the column.
- *
- * Returns 1 to attach, 0 to skip. */
-/* Payload-level core of the hash-upgrade decision.  Its only caller is the
- * .csv.splayed / Parquet conversion path: the stream writer builds each
- * column's chunk zone inline and, for integer columns whose zone passes this
- * check, the column is re-read once to build the hash.  Indexing is a
- * CONVERSION-time decision, made once and persisted with the column files.
- * A `.csv.read` into memory attaches nothing (it used to run this same
- * heuristic over every column and throw the result away — 19.7 s of a 46 s
- * 8 GB load), so there is no in-memory decision left for the on-disk one to
- * match.  It lives here because the heuristic is written against the
- * chunk-zone payload the CSV type machinery defines. */
-int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
-                               const void* index_payload) {
-    const ray_index_t* ix = (const ray_index_t*)index_payload;
-    int esz = csv_hash_elem_size(type);
-    if (esz == 0) return 0;
-    if (!ix || ix->kind != RAY_IDX_CHUNK_ZONE || ix->u.chunk_zone.is_f64)
-        return 0;
-    uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
-    if (n_chunks < 4) return 0;
-    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
-    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
-
-    /* Whole-column [gmin, gmax] from the chunk extrema, ignoring empty
-     * chunks (mn > mx, set by the chunk_zone scan when a chunk is fully
-     * null). */
-    int64_t gmin = INT64_MAX, gmax = INT64_MIN;
-    for (uint32_t g = 0; g < n_chunks; g++) {
-        if (mins[g] > maxs[g]) continue;
-        if (mins[g] < gmin) gmin = mins[g];
-        if (maxs[g] > gmax) gmax = maxs[g];
-    }
-    if (gmin == INT64_MAX || gmax == INT64_MIN) return 0;
-    /* Compute (gmax - gmin) in uint64 space — the signed subtraction
-     * overflows when the range spans the full I64 width (e.g. UserID
-     * hashing to both sign halves).  Reinterpret as uint64 first;
-     * 2's-complement wrap gives the correct |gmax - gmin|. */
-    uint64_t global_range = (uint64_t)gmax - (uint64_t)gmin;
-    if (global_range == 0) return 0;  /* constant column — pointless */
-
-    /* Average per-chunk span / global range — selectivity proxy.
-     * Sum the per-chunk spans as doubles so the accumulation can't
-     * overflow when chunks span the full I64 width (uint64 sum
-     * across ~150 chunks each ~1.8e19 wide overflows; double has
-     * ~15 significant decimal digits, plenty for this coarse ratio).
-     *
-     * Threshold = 0.5.  mean_ratio measures how much of the global
-     * value range an average chunk spans: it is the entropy/clustering
-     * signal that decides whether a hash index pays off.  A value
-     * near 1.0 means each chunk already covers (almost) the whole
-     * range — the column is effectively uniformly random, chunk_zone
-     * min/max pruning is useless, so every point lookup degenerates
-     * to a full-column scan and a hash index is the only way to make
-     * it cheap.  A small ratio means values are clustered, so
-     * chunk_zone already prunes most chunks and the index buys little.
-     * 0.5 is the natural random-vs-clustered separator: above it a
-     * chunk spans more than half the range (no useful zone pruning,
-     * index it); below it clustering gives the zone map real pruning
-     * power and the index's memory/build cost isn't justified. */
-    double dgr = (double)global_range;
-    double span_sum = 0.0;
-    uint32_t n_eff = 0;
-    for (uint32_t g = 0; g < n_chunks; g++) {
-        if (mins[g] > maxs[g]) continue;
-        uint64_t span = (uint64_t)maxs[g] - (uint64_t)mins[g];
-        span_sum += (double)span;
-        n_eff++;
-    }
-    if (n_eff < 4) return 0;
-    double mean_ratio = (span_sum / (double)n_eff) / dgr;
-    if (mean_ratio <= 0.5) return 0;
-
-    /* Memory cap: ray_index_attach_hash allocates a power-of-two
-     * `cap = next_pow2(2*n)` int64 table plus an n-entry int64
-     * chain.  Skip when the index would cost more than 5× the
-     * column's payload — keeps narrow integer types (where the
-     * index dwarfs the data) out of the index set while admitting
-     * I32 / I64 numeric IDs.  Done in int64 arithmetic (we cap n
-     * to anything that would overflow at the row counts we accept). */
-    int64_t n = len;
-    if (n <= 0) return 0;
-    uint64_t cap = 8;
-    uint64_t want = (uint64_t)(2 * n);
-    while (cap < want) cap <<= 1;
-    uint64_t aux_bytes  = cap * 8u + (uint64_t)n * 8u;
-    uint64_t data_bytes = (uint64_t)n * (uint64_t)esz;
-    if (aux_bytes > 5u * data_bytes) return 0;
-
-    return 1;
-}
-
 /* --------------------------------------------------------------------------
  * `INT` schema columns — auto narrowest integer width.
  *
@@ -3558,13 +3439,9 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
 
     /* ---- 11. Build table ---- */
     {
-        /* No index attach at load time.  Index policy lives at csv→splayed
-         * CONVERSION (store/splay.c: chunk-zone / dict, upgraded to a hash
-         * index by ray_csv_hash_upgrade_check) where the decision is made
-         * once and persisted.  A `.csv.read` into memory used to pay for a
-         * chunk-zone AND a hash index on all 105 columns of an 8 GB file —
-         * 3.6 s + 16.1 s of a 46 s load — for indexes most in-memory reads
-         * never probe.  Columns that need one can be indexed explicitly. */
+        /* .csv.read attaches no index: indexes are a conversion-time
+         * decision (zones and dictionaries streamed with the columns by
+         * .csv.splayed / .parquet.splayed, index policy PI). */
 
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
@@ -3988,27 +3865,10 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     }
 
     /* The domain was flushed before the closes and .d names columns through
-     * the global symbol table, so drop its tables before the hash re-read. */
+     * the global symbol table, so drop its tables before .d is written. */
     if (sym_dom) { ray_sym_domain_release(sym_dom); sym_dom = NULL; }
     int64_t tr_rel_end = ray_profile_now_ns();
     if (trace) fprintf(stderr, "csv.splayed: domain_release=%.1fms\n", TR_MS(tr_rel_end - tr_close_end));
-
-    /* Columns whose zone asked for a hash: the only files read back, before
-     * .d so an in-place first write never publishes a half-appended region. */
-    memset(tr_col_ns, 0, sizeof(tr_col_ns));
-    if (err == RAY_OK) ray_col_stream_hash_all(writers, ncols, trace ? tr_col_ns : NULL);
-    for (int c = 0; c < ncols; c++)
-        if (writers[c].index) { ray_release(writers[c].index); writers[c].index = NULL; }
-    int64_t tr_hash_end = ray_profile_now_ns();
-    if (trace) {
-        for (int c = 0; c < ncols; c++) {
-            if (!tr_col_ns[c]) continue;
-            ray_t* na = ray_sym_str(col_name_ids[c]);
-            fprintf(stderr, "csv.splayed: hash col=%s type=%d task=%.1fms\n",
-                    na ? ray_str_ptr(na) : "?", (int)resolved_types[c], TR_MS(tr_col_ns[c]));
-        }
-        fprintf(stderr, "csv.splayed: hash_phase=%.1fms\n", TR_MS(tr_hash_end - tr_rel_end));
-    }
 
     /* .d LAST — the commit marker.  All column files are renamed into
      * place by now and the symfile is flushed; a crash or error before
@@ -4038,7 +3898,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         }
     }
     if (trace) fprintf(stderr, "csv.splayed: schema=%.1fms total=%.1fms\n",
-                       TR_MS(ray_profile_now_ns() - tr_hash_end), TR_MS(ray_profile_now_ns() - tr_t0));
+                       TR_MS(ray_profile_now_ns() - tr_rel_end), TR_MS(ray_profile_now_ns() - tr_t0));
 #undef TR_MS
 
     if (sym_dom) ray_sym_domain_release(sym_dom);

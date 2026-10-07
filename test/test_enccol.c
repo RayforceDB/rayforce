@@ -441,12 +441,6 @@ static test_result_t test_consumers_refuse(void) {
         }
         ray_rel_free(base);
     }
-    /* (b) hash index build */
-    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/hc"), 3000), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_hash_column(ray_test_tmp(ENCCOL_TMP "/hc"), NULL), RAY_ERR_NYI);
-    ray_t* ok = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/hc"));            /* file untouched */
-    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
-    ray_release(ok);
     /* (c) splayed table load: one plain column, one generation-2 file */
     ray_t* tbl = ray_table_new(2);
     ray_t* a = ray_vec_new(RAY_I64, 3000); a->len = 3000;

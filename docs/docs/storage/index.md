@@ -79,8 +79,11 @@ The table, partition and CSV entry points follow the same publication protocol.
 Indexes are built in the new generation before it is published. The CSV and
 Parquet converters build each column's chunk zone or string dictionary from
 the rows as they are streamed and write it with the column, so a conversion
-does not read its own output back; only integer columns whose zone qualifies
-for a hash index are re-read, one column at a time, to build it. An index
+does not read its own output back. The converters add no hash index of their
+own: a hash index is persisted only when the column carries one built with
+`.idx.hash` when the table is saved (a table resaved from an older store keeps
+a hash it already has), and a parted conversion builds none for its segments.
+An index
 that cannot be written (for example, the disk fills) is dropped and the column
 is published without it. Writers to the
 same table serialize on `.write.lock`; readers resolve the manifest once and

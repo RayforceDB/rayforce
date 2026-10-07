@@ -1992,19 +1992,18 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
 finish_columns:
     if (domain) { e = ray_sym_domain_flush(domain,true); if (e != RAY_OK) goto io_fail; }
     /* All columns are still under a private staging directory. Commit
-     * their final images together below, after the hash re-read.  Every
+     * their final images together below.  Every
      * column finishes as a pool task; the renames run serially after. */
     e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
     if (e != RAY_OK) goto io_fail;
     /* The persisted domain is flushed and every writer is closed (the zone
      * and dictionary indexes were built inline while streaming). Drop the
-     * ingestion hash tables and string arena before the hash re-read of the
-     * integer columns; reopening needs only the file-backed vocabulary. */
+     * ingestion hash tables and string arena before the schema is written;
+     * reopening needs only the file-backed vocabulary. */
     if (domain) {
         ray_sym_domain_release(domain); domain = NULL;
         for (int64_t c = 0; c < opened; c++) writers[c].dom = NULL;
     }
-    ray_col_stream_hash_all(writers,r->ncols,NULL);
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { err = schema ? schema : ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {

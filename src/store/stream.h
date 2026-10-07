@@ -33,10 +33,6 @@ typedef struct {
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
-    ray_t*  index;          /* after close: the zone kept for a hash candidate;
-                             * the caller releases it AND sets it to NULL, or
-                             * must not call abort afterwards */
-    bool    wants_hash;     /* after close: build a hash by re-reading the file */
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
     uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
     uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */
@@ -72,14 +68,5 @@ ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable);
  * `col_ns` (optional, n entries) receives each column's finish time. */
 ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
                                    int64_t* col_ns);
-/* Build the hash index of every closed writer whose zone asked for one
- * (wants_hash) by re-reading its published file, and release the zones.
- * Several candidates build as pool tasks (one column per task, in waves
- * sized from the RAM budget); a single one builds with the parallel
- * builder.  Best effort: a failed build leaves the column with its zone. */
-void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns);
-/* Hash builds in flight at once: clamp(ram_limit / 4 / (58 B * max(rows, 1)),
- * 1, candidates).  Pure; `candidates` >= 1 expected. */
-int64_t ray_col_stream_hash_wave(int64_t ram_limit, int64_t rows, int64_t candidates);
 void ray_col_stream_abort(ray_col_stream_t* w);
 #endif

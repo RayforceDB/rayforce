@@ -22,6 +22,7 @@
  */
 
 #include "test.h"
+#include "table/table.h"
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
@@ -2118,12 +2119,18 @@ static test_result_t test_csv_parted_staging(void) {
     unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy(); PASS();
 }
 
-/* 300000 rows streamed in chunks of 100000 (not a multiple of 65536): the
- * clustered column carries a 5-chunk zone, the unclustered one a hash (the
- * upgrade needs at least four chunks), the STR column a dict, and the
- * nullable column a zone whose null bits come from the parse chunks. */
+/* 300000 rows streamed in chunks of 100000 (not a multiple of 65536): both
+ * integer columns carry a 5-chunk zone (the converters persist no HASH of
+ * their own: index policy, compressed-columns PI), the STR column a dict,
+ * and the nullable column a zone whose null bits come from the parse chunks. */
 static bool csv_vec_bytes_eq(ray_t* a, ray_t* b, size_t esz) {
     return a && b && a->len == b->len && !memcmp(ray_data(a), ray_data(b), (size_t)a->len * esz);
+}
+/* index kind of a slot read from the column metadata (generation-explicit:
+ * the equivalence pass saves compressed, where the slot is not resident) */
+static int csv_slot_index_kind(ray_t* t, int64_t c) {
+    ray_col_meta_t m;
+    return ray_table_col_meta_idx(t, c, &m) ? (int)m.index_kind : -1;
 }
 static test_result_t test_csv_splayed_inline_indexes(void) {
     ray_heap_init(); (void)ray_sym_init();
@@ -2145,7 +2152,19 @@ static test_result_t test_csv_splayed_inline_indexes(void) {
     TEST_ASSERT_EQ_I(ix->u.chunk_zone.n_chunks,5);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.mins))[1],65536);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(ix->u.chunk_zone.maxs))[4],299999);
-    TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,1)),RAY_IDX_HASH);
+    /* the unclustered column keeps its zone (no longer sacrificed for a hash) */
+    TEST_ASSERT_EQ_I(csv_slot_index_kind(t,1),RAY_IDX_CHUNK_ZONE);
+    ray_t* b=ray_table_get_col_idx(t,1);
+    TEST_ASSERT_EQ_I(ray_index_kind(b),RAY_IDX_CHUNK_ZONE);
+    ray_t* bplain=ray_vec_from_raw(RAY_I64,ray_data(b),b->len);
+    ray_t* bref=ray_index_chunk_zone_compute(bplain,16);
+    TEST_ASSERT_TRUE(bref && !RAY_IS_ERR(bref));
+    const ray_index_t* bz=ray_index_payload(b->index);
+    const ray_index_t* brz=ray_index_payload(bref);
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(bz->u.chunk_zone.mins,brz->u.chunk_zone.mins,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(bz->u.chunk_zone.maxs,brz->u.chunk_zone.maxs,8));
+    TEST_ASSERT_TRUE(csv_vec_bytes_eq(bz->u.chunk_zone.aggs,brz->u.chunk_zone.aggs,8));
+    ray_release(bref); ray_release(bplain);
     ray_t* s=ray_table_get_col_idx(t,2);
     TEST_ASSERT_EQ_I(ray_index_kind(s),RAY_IDX_DICT);
     TEST_ASSERT_EQ_I(ray_index_payload(s->index)->u.dict.n_distinct,500);
@@ -2172,10 +2191,11 @@ static test_result_t test_csv_splayed_inline_indexes(void) {
     PASS();
 }
 
-/* Four unclustered I64 columns (hash candidates) and one clustered column,
- * converted twice: with the runtime RAM limit as is, and with it lowered so
- * every hash wave holds one column (built on the calling thread, outside any
- * dispatch).  Both conversions must publish identical column files. */
+/* Four unclustered I64 columns and one clustered column, converted twice:
+ * with the runtime RAM limit as is, and with it lowered to 4 * 58 B * rows.
+ * Every column carries its chunk zone (no auto HASH) and both conversions
+ * publish identical column files.  Since the hash waves are gone nothing in
+ * a conversion reads the RAM limit: this guards that non-dependency. */
 static bool csv_files_equal(const char* a, const char* b) {
     FILE* fa = fopen(a, "rb"); FILE* fb = fopen(b, "rb");
     bool ok = fa && fb;
@@ -2189,8 +2209,8 @@ static bool csv_files_equal(const char* a, const char* b) {
     if (fb) fclose(fb);
     return ok;
 }
-static test_result_t test_csv_splayed_hash_waves(void) {
-    /* a runtime supplies the RAM limit the wave width is derived from */
+static test_result_t test_csv_splayed_ram_independent(void) {
+    /* a runtime supplies the RAM limit the old wave width was derived from */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
     TEST_ASSERT_NOT_NULL(rt);
     char dirs[2][128];
@@ -2205,14 +2225,14 @@ static test_result_t test_csv_splayed_hash_waves(void) {
     int8_t types[]={RAY_I64,RAY_I64,RAY_I64,RAY_I64,RAY_I64};
     int64_t saved = __RUNTIME->ram_limit;
     for (int run=0; run<2; run++) {
-        /* 4 * 58 B * 300000 rows: one column per wave */
+        /* 4 * 58 B * 300000 rows: the limit the hash waves used to read */
         if (run) __RUNTIME->ram_limit = 4LL*58*300000;
         ray_err_t e=ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,5,NULL,0,dirs[run],100000);
         __RUNTIME->ram_limit = saved;
         TEST_ASSERT_EQ_I(e,RAY_OK);
         ray_t* t=ray_read_splayed(dirs[run],NULL); TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-        for (int c=0;c<4;c++) TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,c)),RAY_IDX_HASH);
-        TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(t,4)),RAY_IDX_CHUNK_ZONE);
+        for (int c=0;c<4;c++) TEST_ASSERT_EQ_I(csv_slot_index_kind(t,c),RAY_IDX_CHUNK_ZONE);
+        TEST_ASSERT_EQ_I(csv_slot_index_kind(t,4),RAY_IDX_CHUNK_ZONE);
         ray_release(t);
     }
     const char* names[]={"a","b","c","d","k"};
@@ -2280,7 +2300,7 @@ const test_entry_t csv_entries[] = {
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
     { "csv/parted_no_segment_hash", test_csv_parted_no_segment_hash, NULL, NULL },
     { "csv/splayed_inline_indexes", test_csv_splayed_inline_indexes, NULL, NULL },
-    { "csv/splayed_hash_waves", test_csv_splayed_hash_waves, NULL, NULL },
+    { "csv/splayed_ram_independent", test_csv_splayed_ram_independent, NULL, NULL },
     { "csv/native_pooled_batches", test_csv_native_pooled_batches, NULL, NULL },
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },

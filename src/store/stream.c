@@ -10,8 +10,6 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
-#include "io/csv.h"      /* ray_csv_hash_upgrade_check: the shared upgrade policy */
-#include "store/splay.h" /* ray_splay_hash_column */
 #include "core/pool.h"
 #include "core/profile.h"
 #include "core/runtime.h"
@@ -103,8 +101,6 @@ ray_err_t ray_col_stream_index_merge(ray_col_stream_t* dst, ray_col_stream_t* sr
 static void stream_drop_index(ray_col_stream_t* w) {
     if (w->zone) { ray_zone_acc_free(w->zone); ray_free_raw(w->zone); w->zone = NULL; }
     if (w->dict) { ray_dict_acc_free(w->dict); ray_free_raw(w->dict); w->dict = NULL; }
-    if (w->index) { ray_release(w->index); w->index = NULL; }
-    w->wants_hash = false;
 }
 
 ray_err_t ray_col_stream_append(ray_col_stream_t* w,
@@ -245,7 +241,7 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     if (w->zone && w->zone->saw_null) w->had_nulls = true;
     uint8_t ik = (w->zone && w->rows >= RAY_ENC_CHUNK &&
                   ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, w->type)) ? RAY_IDX_CHUNK_ZONE : 0;
-    stream_drop_index(w);                         /* no region, no hash upgrade */
+    stream_drop_index(w);                         /* no index region */
     ray_err_t err = fflush(w->fp) == 0 ? RAY_OK : RAY_ERR_IO;
     if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
     w->fp = NULL;
@@ -321,9 +317,7 @@ ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
     }
 
     /* The index region goes after the payload and the marker into the same
-     * header write, so the rename publishes data and index together.  A
-     * zone the hash policy wants upgraded is handed back instead: the
-     * converter re-reads only that column to build the hash. */
+     * header write, so the rename publishes data and index together. */
     bool inline_index = false;
     /* The persisted HAS_NULLS bit derives from the payload (col.c #495): a
      * sentinel in any slice, flagged or not, publishes the bit, so the
@@ -335,23 +329,22 @@ ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
         ray_free_raw(w->zone); ray_free_raw(w->dict); w->zone = NULL; w->dict = NULL;
         if (idx && RAY_IS_ERR(idx)) { ray_error_free(idx); idx = NULL; }   /* best effort */
         if (idx) {
+            /* Index policy (compressed-columns PI): the converters persist
+             * the zone or dictionary they streamed and never upgrade it to
+             * a HASH of their own; explicit .idx.hash is persisted by
+             * ray_col_save. */
             const ray_index_t* ix = ray_index_payload(idx);
-            if (ix->kind == RAY_IDX_CHUNK_ZONE &&
-                ray_csv_hash_upgrade_check(w->type, w->rows, ix)) {
-                w->index = idx; w->wants_hash = true;
-            } else {
-                int64_t payload_end = 0;
-                ray_err_t ierr = ray_col_write_index_region(w->fp, ix, &payload_end);
-                inline_index = ierr == RAY_OK;
-                /* The index is a best-effort accelerator: when its region
-                 * cannot be written, cut the file back to the payload and
-                 * publish the column without it.  Only a failed cut is an
-                 * error, since the file would then be unloadable. */
-                if (ierr != RAY_OK && payload_end > 0 &&
-                    !ray_col_truncate(w->fp, payload_end))
-                    err = RAY_ERR_IO;
-                ray_release(idx);
-            }
+            int64_t payload_end = 0;
+            ray_err_t ierr = ray_col_write_index_region(w->fp, ix, &payload_end);
+            inline_index = ierr == RAY_OK;
+            /* The index is a best-effort accelerator: when its region
+             * cannot be written, cut the file back to the payload and
+             * publish the column without it.  Only a failed cut is an
+             * error, since the file would then be unloadable. */
+            if (ierr != RAY_OK && payload_end > 0 &&
+                !ray_col_truncate(w->fp, payload_end))
+                err = RAY_ERR_IO;
+            ray_release(idx);
         }
     }
 
@@ -449,83 +442,6 @@ ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
         if (err != RAY_OK) ray_col_stream_abort(&w[c]);
     }
     return err;
-}
-
-typedef struct {
-    ray_col_stream_t* w;
-    const int64_t* cand;
-    int64_t base;
-    int64_t* col_ns;
-} stream_hash_ctx_t;
-
-static void stream_hash_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; (void)end;
-    stream_hash_ctx_t* a = (stream_hash_ctx_t*)raw;
-    int64_t c = a->cand[a->base + start];
-    int64_t t0 = a->col_ns ? ray_profile_now_ns() : 0;
-    (void)ray_splay_hash_column(a->w[c].path, a->w[c].index);   /* best effort */
-    if (a->col_ns) a->col_ns[c] = ray_profile_now_ns() - t0;
-}
-
-/* Peak private memory of one in-flight hash build, per row of the column.
- * Inside a pool task the build takes the serial path of
- * ray_index_attach_hash: the probe table (next_pow2(2n) x 8 B: 16-32 B/row,
- * 21.5 at 100 M rows) lives only during the key pass and is freed before
- * the CSR table of the same size is built, so the two never coexist; rgid,
- * gkeys, offs and rows are 8 B/row each (worst case: every key distinct)
- * and the index stays allocated until its region is written.  That is
- * ~54 B/row on paper; measured as a 58 B/row RSS delta per column in
- * flight (2 M-row I64 columns), which is the figure used here.  The mmap of
- * the column file itself is page cache and not counted. */
-#define STREAM_HASH_BYTES_PER_ROW 58
-/* Share of the RAM budget the in-flight builds may take together. */
-#define STREAM_HASH_RAM_SHARE 4
-
-int64_t ray_col_stream_hash_wave(int64_t ram_limit, int64_t rows, int64_t candidates) {
-    int64_t budget = ram_limit / STREAM_HASH_RAM_SHARE;
-    int64_t per_col = (rows > 0 ? rows : 1) * STREAM_HASH_BYTES_PER_ROW;
-    int64_t wave = budget / per_col;
-    if (wave < 1) wave = 1;
-    if (wave > candidates) wave = candidates;
-    return wave;
-}
-
-void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns) {
-    int64_t* cand = (int64_t*)ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
-    int64_t ncand = 0, rows = 0;
-    if (cand)
-        for (int64_t c = 0; c < n; c++)
-            if (w[c].wants_hash) { cand[ncand++] = c; if (w[c].rows > rows) rows = w[c].rows; }
-    ray_pool_t* pool = ray_pool_get();
-    if (ncand >= 2 && ray_pool_par_dispatch_ok(pool, ncand, 2)) {
-        /* Columns in flight at once, from the RAM budget (-m, else physical
-         * RAM / cgroup): W = ram_limit / SHARE / (58 B * rows), clamped to
-         * [1, ncand].  Each task builds serially, so K columns finish in
-         * ceil(K / W) serial build times instead of K parallel-inside builds
-         * that scale to ~2x on 24 threads. */
-        int64_t wave = ray_col_stream_hash_wave(ray_sys_ram_limit(), rows, ncand);
-        for (int64_t base = 0; base < ncand; base += wave) {
-            int64_t k = ncand - base < wave ? ncand - base : wave;
-            stream_hash_ctx_t ctx = { .w = w, .cand = cand, .base = base, .col_ns = col_ns };
-            if (k == 1)
-                /* A lone build runs here, outside any dispatch, so
-                 * ray_parallel_flag stays down and its builder is parallel. */
-                stream_hash_task(&ctx, 0, 0, 1);
-            else
-                ray_pool_dispatch_n(pool, stream_hash_task, &ctx, (uint32_t)k);
-        }
-    } else {
-        /* one candidate (or no pool): the build is parallel inside */
-        for (int64_t i = 0; i < ncand; i++) {
-            stream_hash_ctx_t ctx = { .w = w, .cand = cand, .base = i, .col_ns = col_ns };
-            stream_hash_task(&ctx, 0, 0, 1);
-        }
-    }
-    if (!cand)   /* OOM on the candidate list: the columns keep their zones */
-        for (int64_t c = 0; c < n; c++) w[c].wants_hash = false;
-    ray_free_raw(cand);
-    for (int64_t c = 0; c < n; c++)
-        if (w[c].index) { ray_release(w[c].index); w[c].index = NULL; }
 }
 
 void ray_col_stream_abort(ray_col_stream_t* w) {

@@ -25,4 +25,16 @@
 (do (.idx.uses A) null)
 (at (select {h: h from: A where: (== h 7919)}) 'h) -- [7919]
 (at (.idx.uses A) 'h) -- 1
+;; a conversion persists zones only: the unclustered column is not hashed
+(set u (% (* i 7919) 1000003))
+(.csv.write (table [u c] (list u i)) "/tmp/rf_test_idx_policy.csv") -- 0
+(set C2 (.csv.splayed [u c] [I64 I64] "/tmp/rf_test_idx_policy.csv" "/tmp/rf_test_idx_policy/c2/"))
+(at (.idx.info (at C2 'u)) 'kind) -- 'chunk_zone
+(at (.idx.info (at C2 'c)) 'kind) -- 'chunk_zone
+(set D2 (.db.splayed.get "/tmp/rf_test_idx_policy/c2/"))
+(at (.idx.info (at D2 'u)) 'kind) -- 'chunk_zone
+;; a re-save of a converted table does not add a hash either
+(.db.splayed.set "/tmp/rf_test_idx_policy/d2/" D2)
+(at (.idx.info (at (.db.splayed.get "/tmp/rf_test_idx_policy/d2/") 'u)) 'kind) -- 'chunk_zone
+(.sys.exec "rm -f /tmp/rf_test_idx_policy.csv") -- 0
 (.sys.exec "rm -rf /tmp/rf_test_idx_policy") -- 0

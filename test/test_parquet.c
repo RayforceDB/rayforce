@@ -4,6 +4,7 @@
 #include "core/pool.h"
 #include "mem/heap.h"
 #include "table/sym.h"
+#include "table/table.h"
 #include "store/part.h"
 #include "store/splay.h"
 #include "ops/idxop.h"
@@ -462,7 +463,7 @@ static void* pq_small_stack_worker(void* result) {
 }
 #endif
 /* Direct path: 7 uneven row groups merge into the whole-column zone; the
- * unclustered column with nulls gets a hash. */
+ * unclustered column with nulls keeps its zone (no converter HASH). */
 static test_result_t test_pq_splayed_inline_indexes(void) {
     const char* names[] = {"x","y"};
     for (int cores = 1; cores <= 4; cores *= 4) {
@@ -487,7 +488,10 @@ static test_result_t test_pq_splayed_inline_indexes(void) {
         if (w->u.chunk_zone.null_bits)
             TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.null_bits),ray_data(w->u.chunk_zone.null_bits),(size_t)((g->u.chunk_zone.n_chunks+7)/8)),0);
         ray_release(want); ray_release(plain);
-        TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(table,1)),RAY_IDX_HASH);
+        /* index policy: the converter persists no HASH of its own */
+        { ray_col_meta_t m1; TEST_ASSERT_TRUE(ray_table_col_meta_idx(table,1,&m1));
+          TEST_ASSERT_EQ_I(m1.index_kind,RAY_IDX_CHUNK_ZONE);
+          TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(table,1)),RAY_IDX_CHUNK_ZONE); }
         ray_release(table); pq_remove_native(dir,names,2);
         ray_pool_destroy();
     }
