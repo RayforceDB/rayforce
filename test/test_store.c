@@ -51,6 +51,7 @@
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "vec/str.h"
+#include "vec/vec.h"          /* ray_vec_may_have_nulls */
 
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
@@ -2349,6 +2350,108 @@ static test_result_t test_lazy_reload_bounded(void) {
     TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
     TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
     TEST_ASSERT_EQ_I(lz_deleted_mappings(), 0);
+    PASS();
+}
+
+/* The filter's answer `sel` equals the scan oracle `orc` (a vector
+ * expression that no filter-index site sees): same length, same I64 values. */
+static bool lz_same(const char* sel, const char* orc) {
+    ray_t* a = lz_eval(sel);
+    ray_t* b = lz_eval(orc);
+    bool ok = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->len == b->len &&
+              ray_elem_size(a->type) == 8 && ray_elem_size(b->type) == 8 &&
+              memcmp(ray_data(a), ray_data(b), (size_t)a->len * 8) == 0;
+    if (!ok) fprintf(stderr, "lz_same: %s vs %s\n", sel, orc);
+    if (a && RAY_IS_ERR(a)) ray_error_free(a); else if (a) ray_release(a);
+    if (b && RAY_IS_ERR(b)) ray_error_free(b); else if (b) ray_release(b);
+    return ok;
+}
+
+/* TIMESTAMP, the other 8-byte type the cost test admits, waits and builds
+ * like I64; equality and `in` answer the scan's rows throughout. */
+static test_result_t test_lazy_timestamp(void) {
+    lz_ok("(set i (til 300000))");
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/ts/\" (table [t v] (list (+ 2020.01.01D00:00:00.000000000 (% (* i 7919) 1000003)) i)))");
+    lz_ok("(set T (.db.splayed.get \"/tmp/rayforce_lazy/ts/\"))");
+    ray_t* tc = lz_col("T", "t");
+    TEST_ASSERT_TRUE(tc && tc->type == RAY_TIMESTAMP && ray_index_kind(tc) == RAY_IDX_CHUNK_ZONE);
+    const char* sel = "(at (select {v: v from: T where: (== t 2020.01.01D00:00:00.000007919)}) 'v)";
+    const char* orc = "(at (at T 'v) (where (== (at T 't) 2020.01.01D00:00:00.000007919)))";
+    for (int k = 1; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {
+        TEST_ASSERT_TRUE(lz_same(sel, orc));
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    }
+    TEST_ASSERT_TRUE(lz_same(sel, orc));                            /* builds */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    TEST_ASSERT_TRUE(lz_same(sel, orc));
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: T where: (in t [2020.01.01D00:00:00.000007919 2020.01.01D00:00:00.000015838])}) 'v)",
+                             "(at (at T 'v) (where (in (at T 't) [2020.01.01D00:00:00.000007919 2020.01.01D00:00:00.000015838])))"));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    PASS();
+}
+
+/* A column with nulls never builds (the probe sites gate on nulls): the
+ * scan answers every time and no work is counted. */
+static test_result_t test_lazy_nulls_never(void) {
+    lz_ok("(set i (til 300000))");
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/n/\" (table [h v] (list (concat [0Nl] (% (* (til 299999) 7919) 1000003)) i)))");
+    lz_ok("(set N (.db.splayed.get \"/tmp/rayforce_lazy/n/\"))");
+    TEST_ASSERT_TRUE(ray_vec_may_have_nulls(lz_col("N", "h")));
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++) {
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: N where: (== h 7919)}) 'v)",
+                                 "(at (at N 'v) (where (== (at N 'h) 7919)))"));
+        if (k % 16 == 0)
+            TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: N where: (in h [7919 15838])}) 'v)",
+                                     "(at (at N 'v) (where (in (at N 'h) [7919 15838])))"));
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    PASS();
+}
+
+/* A slice of the table and a filtered sub-table carry no chunk zone of the
+ * column: never built, never pending, answers equal the scan's. */
+static test_result_t test_lazy_derived_never(void) {
+    lz_make();
+    lz_ok("(set S (take A 200000))");
+    lz_ok("(set F (select {from: A where: (< v 200000)}))");
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++) {
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: S where: (== h 7919)}) 'v)",
+                                 "(at (at S 'v) (where (== (at S 'h) 7919)))"));
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: F where: (== h 7919)}) 'v)",
+                                 "(at (at F 'v) (where (== (at F 'h) 7919)))"));
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    PASS();
+}
+
+/* After an update (to a new table or in place) and an insert, the filter
+ * answers the changed rows: the cached copy of the old column is never
+ * served for the new one. */
+static test_result_t test_lazy_after_mutation(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    lz_ok("(set A2 (update {h: 7919 where: (== v 5) from: A}))");
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++)
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A2 where: (== h 7919)}) 'v)",
+                                 "(at (at A2 'v) (where (== (at A2 'h) 7919)))"));
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));                          /* A itself unchanged */
+    lz_ok("(update {h: 7919 where: (== v 6) from: 'A})");
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A where: (== h 7919)}) 'v)",
+                             "(at (at A 'v) (where (== (at A 'h) 7919)))"));
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A where: (in h [7919 15838])}) 'v)",
+                             "(at (at A 'v) (where (in (at A 'h) [7919 15838])))"));
+    ray_t* r = lz_eval("(count (select {v: v from: A where: (== h 7919)}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 2);          /* rows 1 and 6 */
+    ray_release(r);
+    lz_ok("(insert 'A (list 7919 300000))");
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A where: (== h 7919)}) 'v)",
+                             "(at (at A 'v) (where (== (at A 'h) 7919)))"));
+    r = lz_eval("(count (select {v: v from: A where: (== h 7919)}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 3);          /* and the inserted row */
+    ray_release(r);
     PASS();
 }
 
@@ -6666,6 +6769,10 @@ const test_entry_t store_entries[] = {
     { "idxlazy/not_wanted",    test_lazy_not_wanted,    lz_setup, lz_teardown },
     { "idxlazy/gen2",          test_lazy_gen2,          lz_setup, lz_teardown },
     { "idxlazy/reload_bounded", test_lazy_reload_bounded, lz_setup, lz_teardown },
+    { "idxlazy/timestamp",     test_lazy_timestamp,     lz_setup, lz_teardown },
+    { "idxlazy/nulls_never",   test_lazy_nulls_never,   lz_setup, lz_teardown },
+    { "idxlazy/derived_never", test_lazy_derived_never, lz_setup, lz_teardown },
+    { "idxlazy/after_mutation", test_lazy_after_mutation, lz_setup, lz_teardown },
     { "idxlazy/out_of_range",  test_lazy_out_of_range,  lz_setup, lz_teardown },
     { "idxlazy/out_of_range_gen2", test_lazy_out_of_range_gen2, lz_setup, lz_teardown },
     { "idxlazy/concurrent",    test_lazy_concurrent,    lz_setup, lz_teardown },
