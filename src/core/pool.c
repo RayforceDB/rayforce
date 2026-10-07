@@ -223,6 +223,7 @@ typedef struct {
     uint64_t gen;
     uint32_t active;   /* columns this dispatch reads, by bit */
     int64_t  last;     /* row of the previous call in this dispatch; -1 none */
+    uint8_t  miss[RAY_POOL_SCAN_MAX];   /* probes that found column c not read */
     int64_t  lo[RAY_POOL_SCAN_MAX];
     int64_t  hi[RAY_POOL_SCAN_MAX];
 } pool_scan_tls_t;
@@ -278,6 +279,7 @@ static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
         t->gen = pool->scan_gen;
         t->active = 0;
         t->last = -1;
+        memset(t->miss, 0, sizeof(t->miss));
         for (uint32_t c = 0; c < s->n; c++) t->lo[c] = t->hi[c] = r;
     }
     /* Rows the filter's zones rule out are skipped by the pass: nothing to
@@ -286,13 +288,18 @@ static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
         int64_t ch = r >> s->gate_log2;
         if (!((s->gate[ch >> 6] >> (ch & 63)) & 1)) { t->last = -1; return; }
     }
-    /* Which columns were read over the rows behind this one. */
+    /* Which columns were read over the rows behind this one.  A column
+     * found unread a few times is one this pass reads sparsely or not at
+     * all: this thread stops probing it for the rest of the dispatch. */
     if (t->last >= 0 && t->last != r) {
         int64_t mid = (t->last < r ? t->last + r : r + t->last) / 2;
-        for (uint32_t c = 0; c < s->n && c < 32; c++)
-            if (!(t->active >> c & 1) &&
-                ray_vm_resident(s->base[c] + (size_t)mid * s->esz[c], 1))
+        for (uint32_t c = 0; c < s->n && c < 32; c++) {
+            if ((t->active >> c & 1) || t->miss[c] >= 4) continue;
+            if (ray_vm_resident(s->base[c] + (size_t)mid * s->esz[c], 1))
                 t->active |= UINT32_C(1) << c;
+            else
+                t->miss[c]++;
+        }
     }
     t->last = r;
     for (uint32_t c = 0; c < s->n; c++) {
