@@ -479,14 +479,15 @@ static test_result_t test_scan_fail_cancel(void) {
     ray_request_interrupt();                                        /* the interrupt alone also cancels */
     ray_scan_fail_init(&d.f);
     e = ray_scan_fail_finish(&d.f, NULL);
+    ray_scan_fail_note(&d.f, 3, ray_error("corrupt", "noted"));     /* a noted failure stands */
+    ray_t* e2 = ray_scan_fail_finish(&d.f, pool);
+    ray_clear_interrupt();                                          /* before any assert: none leaks */
     TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
     TEST_ASSERT_STR_EQ(ray_err_code(e), "cancel");
     ray_error_free(e);
-    ray_scan_fail_note(&d.f, 3, ray_error("corrupt", "noted"));     /* a noted failure stands */
-    e = ray_scan_fail_finish(&d.f, pool);
-    ray_clear_interrupt();
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-    ray_error_free(e);
+    TEST_ASSERT_TRUE(e2 && RAY_IS_ERR(e2));
+    TEST_ASSERT_STR_EQ(ray_err_code(e2), "corrupt");
+    ray_error_free(e2);
     PASS();
 }
 

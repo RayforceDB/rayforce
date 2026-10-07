@@ -32,7 +32,9 @@
 struct ray_sym_domain_s;
 
 /* A bound column source: the object a scan reads ranges of.  Binding
- * retains the object (and a non-runtime SYM domain) and never decodes. */
+ * retains the object (and a non-runtime SYM domain) and never decodes.
+ * The struct owns seg_off: never copy it by value (bind it in place, share
+ * it by pointer, release it once). */
 typedef struct {
     ray_t*  obj;                    /* retained: plain vector, slice, RAY_ENCCOL, or plain parted wrapper */
     struct ray_sym_domain_s* dom;   /* SYM: the domain ids resolve over */
@@ -43,7 +45,8 @@ typedef struct {
     bool    may_null;               /* HAS_NULLS, or directory null counts for generation 2 */
     bool    parted;                 /* a parted source (per-range attrs are authoritative) */
     _Atomic(int64_t*) seg_off;      /* parted: segment row offsets (n_segs + 1), built on the
-                                     * first range read, published once, freed on release */
+                                     * first range read, published once, owned (a by-value
+                                     * copy would free it twice), freed on release */
 } ray_col_src_t;
 
 /* A view of rows [start, start + n): elements in the generation-0
