@@ -495,9 +495,11 @@ static test_result_t test_pq_splayed_inline_indexes(void) {
 }
 
 /* Smoke test: the parted Parquet conversion persists no HASH in any segment.
- * zones.parquet's row groups (30-40K rows) are below one chunk, so no auto
- * index of any kind can occur here; the policy itself is pinned by
- * store/staged_bulk_no_hash, which exercises the save this route uses. */
+ * zones.parquet's row groups (30-40K rows) are below one chunk, so the auto
+ * heuristic cannot fire here; the policy itself is pinned by
+ * store/staged_bulk_no_hash, which exercises the save this route uses.  The
+ * pin is still live: forcing an explicit hash onto each decoded batch in
+ * pq_write_reader makes it fail ("column 1 segment 0"). */
 static test_result_t test_pq_parted_no_segment_hash(void) {
     char root[160];
     snprintf(root, sizeof(root), "%s", ray_test_tmp("/tmp/rayforce-pq-nohash"));
