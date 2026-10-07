@@ -268,6 +268,10 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
+/* At a statement boundary: when the anon footprint is past the watermark,
+ * unmap empty pools and release the pages of free blocks now rather than at
+ * the idle decay.  No-op otherwise, or inside parallel work. */
+int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
  * once on first use, so this exists to let a test drive the policy without

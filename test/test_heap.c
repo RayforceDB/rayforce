@@ -2665,6 +2665,47 @@ static test_result_t test_sys_alloc_watermark(void) {
     PASS();
 }
 
+/* A query that needed several pools leaves them mapped and counted after it
+ * frees everything, so the next one sees the watermark reached.  Past the
+ * watermark a statement boundary unmaps the empty pools; below it, it
+ * leaves them for reuse. */
+static test_result_t test_relieve_under_pressure(void) {
+    enum { N = 64 };
+    const size_t sz = 1u << 20;
+    ray_t* blocks[N] = {0};
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    int64_t base = ray_heap_anon_committed();
+
+    /* No pressure: nothing is handed back. */
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    for (int i = 0; i < N; i++) blocks[i] = ray_alloc(sz);
+    for (int i = 0; i < N; i++) if (blocks[i]) ray_free(blocks[i]);
+    int64_t kept = ray_heap_anon_committed();
+    int64_t r0 = ray_heap_relieve();
+    bool idle = r0 == 0 && ray_heap_anon_committed() == kept;
+    bool grew = kept >= base + INT64_C(32) * 1024 * 1024;
+
+    /* Pressure: the footprint is past the watermark. */
+    ray_heap_set_anon_watermark(base + INT64_C(16) * 1024 * 1024);
+    for (int i = 0; i < N; i++) blocks[i] = ray_alloc(sz);
+    for (int i = 0; i < N; i++) if (blocks[i]) ray_free(blocks[i]);
+    int64_t before = ray_heap_anon_committed();
+    ray_heap_relieve();
+    int64_t after = ray_heap_anon_committed();
+    bool shrank = after <= before - INT64_C(32) * 1024 * 1024;
+
+    /* The heap still allocates after its pools went away. */
+    ray_t* again = ray_alloc(sz);
+    bool usable = again != NULL;
+    if (again) { memset(ray_data(again), 7, sz); ray_free(again); }
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_TRUE(grew && idle);
+    TEST_ASSERT_TRUE(shrank);
+    TEST_ASSERT_TRUE(usable);
+    PASS();
+}
+
 static void direct_cache_churn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     _Atomic(int)* errors = raw;
@@ -3139,6 +3180,7 @@ const test_entry_t heap_entries[] = {
     { "heap/direct_cache_many_entries", test_direct_cache_many_entries, heap_setup, heap_teardown },
     { "heap/direct_cache_replaces_old", test_direct_cache_replaces_old_blocks, heap_setup, heap_teardown },
     { "heap/sys_alloc_watermark", test_sys_alloc_watermark, heap_setup, heap_teardown },
+    { "heap/relieve_under_pressure", test_relieve_under_pressure, heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },

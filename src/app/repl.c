@@ -891,6 +891,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
 
     if (profiling) profile_print(use_color);
     ray_heap_gc();
+    ray_heap_relieve();
     /* Statement boundary.  Check BEFORE stamping: the clock still holds the
      * end of the previous statement, so what we measure is the gap between
      * statements — the time the process actually sat idle.  Stamping first
