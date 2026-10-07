@@ -75,4 +75,10 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
 ray_err_t ray_encw_finish(ray_encw_t* w);
 void      ray_encw_free(ray_encw_t* w);
 
+/* An all-null generation-2 column image of `len` rows in an anonymous
+ * mapping (*out, *out_size; ray_vm_unmap_file releases it).  `fill`: min(len,
+ * 65536) null cells of `type` (generation-0 width; SYM at `attrs` width). */
+ray_err_t ray_encw_null_image(int8_t type, uint8_t attrs, int64_t len, uint32_t sym_count,
+                              const void* fill, void** out, size_t* out_size);
+
 #endif /* RAY_ENCW_H */

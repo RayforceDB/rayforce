@@ -25,6 +25,7 @@
 #include "ops/idxop.h"      /* ray_i128_add */
 #include "mem/heap.h"
 #include "store/col.h"       /* COL_DISK_ATTRS_MASK */
+#include "core/platform.h"   /* ray_vm_map_anon */
 #include <stdatomic.h>
 #include <string.h>
 
@@ -367,18 +368,14 @@ static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
 static bool type_is_float(int8_t t) { return t == RAY_F32 || t == RAY_F64; }
 static double bits_double(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
 
-ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n) {
-    if (w->chunk_i >= w->n_chunks) return RAY_ERR_RANGE;
-    int64_t want = w->len - w->chunk_i * RAY_ENC_CHUNK;
-    if (want > RAY_ENC_CHUNK) want = RAY_ENC_CHUNK;
-    if (n != want) return RAY_ERR_RANGE;
+/* Chunk body (descriptors, then payloads) of n rows into w->chunk and its
+ * directory entry into *de (offset left to the caller). */
+static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* str_pool, int64_t n,
+                                 ray_enc_dirent_t* de) {
     ray_err_t err;
-    if (w->chunk_i == 0 && ray_encw_type_has_dict(w->type) &&
-        (err = train_dict(w, data, n)) != RAY_OK) return err;
     ray_enc_dict_t dict = { w->dict_v, w->dict_n };
     w->chunk.len = 0; w->chunk.oom = false;
     if (!ray_enc_buf_put(&w->chunk, NULL, RAY_ENC_DESC_AREA)) return RAY_ERR_OOM;
-    ray_enc_dirent_t* de = &w->dir[w->chunk_i];
     memset(de, 0, sizeof *de);
     bool have = false, fl = type_is_float(w->type);
     int64_t nv = (n + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
@@ -409,11 +406,45 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
         }
     }
     if (!have) { de->flags = RAY_ENC_STAT_ABSENT; de->min = de->max = 0; }
+    de->bytes = w->chunk.len;
+    return RAY_OK;
+}
+
+ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n) {
+    if (w->chunk_i >= w->n_chunks) return RAY_ERR_RANGE;
+    int64_t want = w->len - w->chunk_i * RAY_ENC_CHUNK;
+    if (want > RAY_ENC_CHUNK) want = RAY_ENC_CHUNK;
+    if (n != want) return RAY_ERR_RANGE;
+    ray_err_t err;
+    if (w->chunk_i == 0 && ray_encw_type_has_dict(w->type) &&
+        (err = train_dict(w, data, n)) != RAY_OK) return err;
+    ray_enc_dirent_t* de = &w->dir[w->chunk_i];
+    if ((err = encw_chunk_body(w, data, str_pool, n, de)) != RAY_OK) return err;
     de->offset = w->pos;
-    de->bytes  = w->chunk.len;
     if ((err = fput(w, w->chunk.p, w->chunk.len)) != RAY_OK) return err;
     w->chunk_i++;
     return RAY_OK;
+}
+
+/* The 32-byte outer header and the enc header of a column of w->pos bytes. */
+static void encw_headers(const ray_encw_t* w, uint64_t side_off, uint64_t side_len, bool has_nulls,
+                         ray_t* hdr, ray_enc_hdr_t* eh) {
+    memset(eh, 0, sizeof *eh);
+    memcpy(eh->magic, "RENC", 4);
+    eh->header_version = RAY_ENC_HDR_VERSION;
+    eh->index_kind = w->index_kind;
+    eh->col_flags = w->col_flags;
+    eh->side_off = side_off; eh->side_len = side_len;
+    eh->str_pool_bytes = w->type == RAY_STR ? w->str_pool_bytes : 0;
+    eh->end_off = w->pos;
+    memset(hdr, 0, sizeof *hdr);
+    uint32_t xenc = RAY_ENC_XENC;
+    memcpy(hdr->aux, &xenc, 4);
+    hdr->order = RAY_ENC_GEN;
+    hdr->type  = w->type;
+    hdr->attrs = (uint8_t)((w->attrs & COL_DISK_ATTRS_MASK) | (has_nulls ? RAY_ATTR_HAS_NULLS : 0));
+    hdr->rc    = w->sym_count;
+    hdr->len   = w->len;
 }
 
 ray_err_t ray_encw_finish(ray_encw_t* w) {
@@ -444,28 +475,76 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
         side_len = 32 + ebytes;
     }
     ray_enc_hdr_t eh;
-    memset(&eh, 0, sizeof eh);
-    memcpy(eh.magic, "RENC", 4);
-    eh.header_version = RAY_ENC_HDR_VERSION;
-    eh.index_kind = w->index_kind;
-    eh.col_flags = w->col_flags;
-    eh.side_off = side_off; eh.side_len = side_len;
-    eh.str_pool_bytes = w->type == RAY_STR ? w->str_pool_bytes : 0;
-    eh.end_off = w->pos;
     ray_t hdr;
-    memset(&hdr, 0, sizeof hdr);
-    uint32_t xenc = RAY_ENC_XENC;
-    memcpy(hdr.aux, &xenc, 4);
-    hdr.order = RAY_ENC_GEN;
-    hdr.type  = w->type;
-    hdr.attrs = (uint8_t)((w->attrs & COL_DISK_ATTRS_MASK) |
-                          (w->any_bitmap_null ? RAY_ATTR_HAS_NULLS : 0));
-    hdr.rc    = w->sym_count;
-    hdr.len   = w->len;
+    encw_headers(w, side_off, side_len, w->any_bitmap_null, &hdr, &eh);
     if (fflush(w->f) != 0 || fseek(w->f, 0, SEEK_SET) != 0) return RAY_ERR_IO;
     if (fwrite(&hdr, 1, 32, w->f) != 32 || fwrite(&eh, 1, 64, w->f) != 64) return RAY_ERR_IO;
     if (w->n_chunks > 0 &&
         fwrite(w->dir, sizeof(ray_enc_dirent_t), (size_t)w->n_chunks, w->f) != (size_t)w->n_chunks)
         return RAY_ERR_IO;
     return fflush(w->f) == 0 ? RAY_OK : RAY_ERR_IO;
+}
+
+/* An all-null column image (spec "Nulls": every vector CONST of the fill,
+ * statistics absent; the non-nullable BOOL / U8 read 0, with statistics).
+ * Every full chunk has the same body, so two bodies are encoded (a full
+ * chunk and the last) and the full one is copied: the image is about
+ * n_chunks x (64 B entry + one chunk body), e.g. 11.5 KiB per 65536 rows of
+ * I64 (descriptors plus a bitmap and a CONST per vector), 3.5 KiB for STR.
+ * `fill` holds min(len, 65536) null cells of `type` in its generation-0
+ * width (SYM: `attrs` width).  The outer header carries HAS_NULLS for every
+ * nullable type, in-band text nulls included: every row is a null.  The
+ * image lives in a ray_vm_map_anon mapping returned in *out (released by
+ * ray_vm_unmap_file, e.g. by ray_enccol_open on failure or its release). */
+ray_err_t ray_encw_null_image(int8_t type, uint8_t attrs, int64_t len, uint32_t sym_count,
+                              const void* fill, void** out, size_t* out_size) {
+    *out = NULL; *out_size = 0;
+    if (!ray_enc_gen2_supported()) return RAY_ERR_NYI;
+    if (!ray_encw_type_supported(type) || len < 0) return RAY_ERR_NYI;
+    ray_encw_t w;
+    memset(&w, 0, sizeof w);
+    w.type = type; w.attrs = attrs; w.len = len;
+    w.sym_count = type == RAY_SYM ? sym_count : 0;
+    w.n_chunks = ray_enc_nchunks(len);
+    int64_t last_rows = len - (w.n_chunks - 1) * RAY_ENC_CHUNK;
+    ray_enc_buf_t full = {0};
+    ray_enc_dirent_t full_de, last_de;
+    memset(&full_de, 0, sizeof full_de);
+    memset(&last_de, 0, sizeof last_de);
+    ray_err_t err = RAY_OK;
+    if (w.n_chunks > 1 || (w.n_chunks == 1 && last_rows == RAY_ENC_CHUNK)) {
+        if ((err = encw_chunk_body(&w, fill, NULL, RAY_ENC_CHUNK, &full_de)) != RAY_OK) goto out;
+        if (!ray_enc_buf_put(&full, w.chunk.p, w.chunk.len)) { err = RAY_ERR_OOM; goto out; }
+    }
+    if (w.n_chunks > 0 && last_rows < RAY_ENC_CHUNK &&
+        (err = encw_chunk_body(&w, fill, NULL, last_rows, &last_de)) != RAY_OK) goto out;
+    if (w.n_chunks > 0 && last_rows == RAY_ENC_CHUNK) {     /* the last chunk is full */
+        last_de = full_de;
+        w.chunk.len = 0;
+        if (!ray_enc_buf_put(&w.chunk, full.p, full.len)) { err = RAY_ERR_OOM; goto out; }
+    }
+    uint64_t size = RAY_ENC_DIR_OFF + (uint64_t)w.n_chunks * sizeof(ray_enc_dirent_t);
+    if (w.n_chunks > 0) size += (uint64_t)(w.n_chunks - 1) * full.len + w.chunk.len;
+    uint8_t* img = ray_vm_map_anon((size_t)size);
+    if (!img) { err = RAY_ERR_OOM; goto out; }
+    uint64_t at = RAY_ENC_DIR_OFF + (uint64_t)w.n_chunks * sizeof(ray_enc_dirent_t);
+    for (int64_t c = 0; c < w.n_chunks; c++) {
+        bool last = c == w.n_chunks - 1;
+        ray_enc_dirent_t de = last ? last_de : full_de;
+        de.offset = at;
+        memcpy(img + RAY_ENC_DIR_OFF + (size_t)c * sizeof de, &de, sizeof de);
+        memcpy(img + at, last ? w.chunk.p : full.p, last ? w.chunk.len : full.len);
+        at += de.bytes;
+    }
+    w.pos = size;
+    ray_enc_hdr_t eh;
+    ray_t hdr;
+    encw_headers(&w, 0, 0, len > 0 && type != RAY_BOOL && type != RAY_U8, &hdr, &eh);
+    memcpy(img, &hdr, 32);
+    memcpy(img + RAY_ENC_HDR_OFF, &eh, sizeof eh);
+    *out = img; *out_size = (size_t)size;
+out:
+    ray_enc_buf_free(&full);
+    ray_encw_free(&w);
+    return err;
 }

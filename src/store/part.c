@@ -29,6 +29,7 @@
 #include "part.h"
 #include "table/table.h"
 #include "store/enccol.h"
+#include "store/encw.h"      /* ray_encw_null_image */
 #include "core/runtime.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
@@ -261,19 +262,13 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
 }
 
 /* --------------------------------------------------------------------------
- * missing_seg_fill — the segment of a column a ragged partition lacks: `rows`
- * cells of `type`'s null (the sentinel ray_vec_set_null writes, HAS_NULLS
- * set; the non-nullable BOOL / U8 read 0; SYM cells are id 0, the empty
- * symbol, resolved over the db's domain `dom`; LIST cells are the null
- * object).  Every column of a parted table then has the table's row count,
- * segment by segment, so a consumer never meets a missing segment (#724).
- *
- * Cost: the fill is materialized on the heap when the table is opened —
- * rows x element size (8 B/row for I64, F64, TIMESTAMP and LIST; 16 B/row for
- * STR and GUID; e.g. 100M rows of I64 = 800 MB) — and held for the table's
- * lifetime, whether or not a query reads the column; dev opened a ragged
- * table zero-copy.  Planned follow-up: a lazy all-null generation-2 segment
- * (a header and no payload) in place of the heap fill.
+ * missing_seg_fill — `rows` cells of `type`'s null on the heap: the sentinel
+ * ray_vec_set_null writes, HAS_NULLS set; the non-nullable BOOL / U8 read
+ * 0; SYM cells are id 0, the empty symbol, resolved over the db's domain
+ * `dom`; LIST cells are the null object.  It is the segment of a column a
+ * ragged partition lacks only where generation 2 cannot hold the type
+ * (LIST, or a big-endian host); otherwise it is the fill one chunk of the
+ * lazy segment is encoded from (missing_seg).
  * -------------------------------------------------------------------------- */
 static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
     if (type == RAY_LIST) {
@@ -321,15 +316,45 @@ static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_
 }
 
 /* --------------------------------------------------------------------------
+ * missing_seg — the segment of a column a ragged partition lacks: `rows`
+ * rows of the column's null, so every column of a parted table has the
+ * table's row count, segment by segment, and a consumer never meets a
+ * missing segment (#724).
+ *
+ * Every type generation 2 stores gets a lazy all-null segment: a
+ * generation-2 RAY_ENCCOL over an in-memory image (ray_encw_null_image, an
+ * anonymous mapping the enccol owns and unmaps), so opening costs about
+ * n_chunks x (64 B + one chunk body) — 11.5 KiB per 65536 rows of I64, e.g.
+ * 18 MB for 100M rows where a heap fill held 800 MB — and the rows decode
+ * only when a query reads them, like any encoded segment (its directory
+ * answers null presence without a decode).  Its materialization is
+ * missing_seg_fill's value: the same nulls, HAS_NULLS on every nullable
+ * type, SYM over `dom`.  The image is never a file: a save re-encodes it
+ * through the writers, as any encoded source.  LIST (and every type on a
+ * host without generation 2) keeps the heap fill: rows x element size,
+ * held for the table's lifetime.  `what` names the segment in errors.
+ * -------------------------------------------------------------------------- */
+static ray_t* missing_seg(int8_t type, int64_t rows, struct ray_sym_domain_s* dom, const char* what) {
+    if (!ray_enc_gen2_supported() || !ray_encw_type_supported(type))
+        return missing_seg_fill(type, rows, dom);
+    ray_t* fill = missing_seg_fill(type, rows < RAY_ENC_CHUNK ? rows : RAY_ENC_CHUNK, dom);
+    if (!fill || RAY_IS_ERR(fill)) return fill ? fill : ray_error("oom", NULL);
+    void* img = NULL; size_t size = 0;
+    ray_err_t e = ray_encw_null_image(type, fill->attrs, rows, 0, ray_data(fill), &img, &size);
+    ray_release(fill);
+    if (e != RAY_OK) return ray_error(ray_err_code_str(e), "%s: null segment", what);
+    return ray_enccol_open(img, size, what, type == RAY_SYM ? dom : NULL, false);
+}
+
+/* --------------------------------------------------------------------------
  * ray_read_parted — zero-copy open of a partitioned table
  *
  * Builds parted columns (RAY_PARTED_BASE + base_type) where each segment
  * is an mmap'd vector from ray_read_splayed. Also builds a MAPCOMMON column
  * with partition key names and row counts.  No segment is missing: a
- * partition lacking a tail column gets a null-filled segment of its row
- * count, so every column's segment p has MAPCOMMON row count p.  That
- * segment is not zero-copy: it is a heap vector built at open and held for
- * the table's lifetime (see missing_seg_fill for the cost).
+ * partition lacking a tail column gets a segment of nulls of its row count
+ * (missing_seg: a lazy all-null encoded segment, O(chunks) bytes at open),
+ * so every column's segment p has MAPCOMMON row count p.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
@@ -447,7 +472,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
      * (see the data-column loop below), so every column a partition has
      * must match the first partition's name and type at the same index.
      * A partition MAY have fewer columns — the missing tail reads as
-     * null-filled segments (supported ragged mode, missing_seg_fill) — but
+     * segments of nulls (supported ragged mode, missing_seg) — but
      * never more, and never a
      * renamed/retyped column (silent mis-association otherwise).  SYM
      * index width (attrs) may legally differ per partition — partitions
@@ -591,7 +616,14 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             /* Ragged: partition p lacks this tail column.  Its rows read
              * as the column's nulls, so the column has the MAPCOMMON row
              * count of every partition. */
-            if (!seg) seg = missing_seg_fill(m0.type, ray_table_nrows(part_tables[p]), dom);
+            if (!seg) {
+                char what[1200];
+                ray_t* na = ray_sym_str(name_id);
+                snprintf(what, sizeof what, "%s/%s/%s/%.*s (absent: nulls)", db_root, part_dirs[p],
+                         table_name, na ? (int)ray_str_len(na) : 1, na ? ray_str_ptr(na) : "?");
+                seg = missing_seg(m0.type, ray_table_nrows(part_tables[p]), dom, what);
+                if (seg && !RAY_IS_ERR(seg) && seg->type == RAY_ENCCOL) any_enc = true;
+            }
             if (!seg || RAY_IS_ERR(seg)) {
                 ray_release(parted);                           /* releases the filled segs */
                 ray_release(result);

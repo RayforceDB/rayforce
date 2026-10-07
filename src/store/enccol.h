@@ -131,7 +131,7 @@ void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a 
 ray_t* ray_enccol_parted_new(ray_t* wrapper);
 /* Segment i: its RAY_ENCCOL or plain vector (borrowed; NULL for a missing
  * segment, which ray_read_parted never builds: a ragged partition's absent
- * column is a null-filled plain segment). */
+ * column is a lazy all-null RAY_ENCCOL segment, or for LIST a heap fill). */
 ray_t* ray_enccol_seg(ray_t* encv, int64_t i);
 /* Segment i materialized (borrowed plain vector, NULL for a missing one)
  * or an owned error. */

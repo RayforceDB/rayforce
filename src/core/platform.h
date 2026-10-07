@@ -155,6 +155,8 @@ void  ray_vm_free(void* ptr, size_t size);
 void* ray_vm_map_file(const char* path, size_t* out_size);
 void* ray_vm_map_fd_ro(int fd, size_t size);
 void  ray_vm_unmap_file(void* ptr, size_t size);
+/* Zeroed writable memory released by ray_vm_unmap_file (a generated file image). */
+void* ray_vm_map_anon(size_t size);
 void  ray_vm_advise_seq(void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
 /* Release physical pages for a free block.  When hugepage is true, only the

@@ -109,6 +109,18 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
     return p;
 }
 
+/* A zeroed, writable private mapping with no file behind it, released by
+ * ray_vm_unmap_file: an in-memory image that the code mapping files takes
+ * as one of its own (a generated column).  Counted in the file-mapping
+ * total, which ray_vm_unmap_file debits.  NULL on failure. */
+void* ray_vm_map_anon(size_t size) {
+    if (size == 0) return NULL;
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
+
 void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
@@ -639,6 +651,22 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
     return p;
 }
 
+/* A zeroed, writable view backed by the paging file, released by
+ * ray_vm_unmap_file (UnmapViewOfFile at the view's base): an in-memory
+ * image that the code mapping files takes as one of its own.  Counted in
+ * the file-mapping total.  NULL on failure. */
+void* ray_vm_map_anon(size_t size) {
+    if (size == 0) return NULL;
+    HANDLE hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                     (DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
+    if (!hMap) return NULL;
+    void* p = MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, size);
+    CloseHandle(hMap);
+    if (!p) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
+
 void ray_vm_advise_seq(void* ptr, size_t size) {
     /* PrefetchVirtualMemory is Win8.1+. Best-effort; ignore failure. */
     WIN32_MEMORY_RANGE_ENTRY entry;
@@ -855,6 +883,18 @@ void ray_vm_unmap_file(void* ptr, size_t size) {
 void* ray_vm_map_fd_ro(int fd, size_t size) {
     if (size == 0) return NULL;
     void* p = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
+
+/* A zeroed, writable private mapping with no file behind it, released by
+ * ray_vm_unmap_file: an in-memory image that the code mapping files takes
+ * as one of its own (a generated column).  Counted in the file-mapping
+ * total, which ray_vm_unmap_file debits.  NULL on failure. */
+void* ray_vm_map_anon(size_t size) {
+    if (size == 0) return NULL;
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return NULL;
     ray_sys_track_file_add((int64_t)size);
     return p;

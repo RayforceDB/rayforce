@@ -74,8 +74,8 @@ void   ray_col_scratch_free(ray_col_scratch_t* s);
  * for n == 0).  Generation 0 is zero copy; generation 2 decodes the vector
  * into `scratch`.  The view is valid until the next call with the same
  * scratch or until the source is released.  A loaded parted source has no
- * missing segment (ray_read_parted null-fills a ragged partition's absent
- * column, #724); a hand-built wrapper's missing segment holds no rows,
+ * missing segment (ray_read_parted gives a ragged partition's absent
+ * column a segment of nulls, #724); a hand-built wrapper's missing segment holds no rows,
  * matching ray_parted_nrows, and the executor refuses a table whose parted
  * columns' row counts differ, so a scan never reads one.
  * For a parted source the SYM element width and SORTED are per range only
