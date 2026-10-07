@@ -303,10 +303,18 @@ static inline void col_propagate_str_pool_parted(ray_t* dst, ray_t** segs, int64
 static inline void col_propagate_nulls_gather(ray_t* dst, const ray_t* src,
                                                const int64_t* indices,
                                                int64_t count) {
-    bool src_has_nulls = ray_vec_may_have_nulls(src);
+    /* Two loops, the may-have-nulls test hoisted out: this runs once per
+     * row per gathered column, and with the test inside, inlined into a
+     * large caller (sel_compact), the loop lost its registers and cost ~8%
+     * on where-heavy group queries. */
+    if (!ray_vec_may_have_nulls(src)) {
+        for (int64_t r = 0; r < count; r++)
+            if (indices[r] < 0) ray_vec_set_null(dst, r, true);
+        return;
+    }
     for (int64_t r = 0; r < count; r++) {
-        if (indices[r] < 0 ||
-            (src_has_nulls && ray_vec_is_null((ray_t*)src, indices[r])))
+        int64_t i = indices[r];
+        if (i < 0 || ray_vec_is_null((ray_t*)src, i))
             ray_vec_set_null(dst, r, true);
     }
 }
