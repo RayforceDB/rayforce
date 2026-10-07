@@ -37,6 +37,7 @@
 #include "ops/agg_engine.h"   /* agg_select_distinct — dict-linked pure-distinct path */
 #include "core/runtime.h"     /* __VM — per-thread query/eval context */
 #include "ops/rowsel.h"
+#include "store/col.h"      /* ray_col_want_rows — group-gather read-ahead */
 #include "ops/fused_group.h"
 #include "ops/fused_topk.h"
 #include "ops/hll.h"
@@ -6450,6 +6451,24 @@ static ray_t* try_count_distinct_v2_rewrite(
  * match_count_distinct (typically a column ref, possibly a dotted-name
  * or computed sub-expression).  Returns an I64 vector of length
  * n_groups with the per-group distinct count. */
+/* The per-group gathers of count_distinct_per_group_buf read `src` at the
+ * rows its groups list.  On a mapped column that is not cached they would
+ * wait on one page fault at a time: request those rows first — the whole
+ * column when there is at least a quarter of a listed row per page of it,
+ * else the pages of the listed rows. */
+static void cd_want_group_rows(ray_t* src, const int64_t* idx_buf,
+                               const int64_t* offsets, const int64_t* grp_cnt,
+                               int64_t n_groups) {
+    if (!src || RAY_IS_ERR(src) || n_groups <= 0 || !ray_col_cold(src)) return;
+    int64_t total = offsets[n_groups - 1] + grp_cnt[n_groups - 1];
+    size_t esz = ray_sym_elem_size(src->type, src->attrs);
+    if (total <= 0 || esz == 0 || src->len <= 0) return;
+    if ((double)total / (double)src->len * (4096.0 / (double)esz) >= 0.25)
+        ray_vm_advise_willneed(ray_data(src), (size_t)src->len * esz);
+    else
+        ray_col_want_rows(src, idx_buf, total);
+}
+
 static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                                            const int64_t* idx_buf,
                                            const int64_t* offsets,
@@ -6483,6 +6502,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         ray_release(src);
         return wide;
     }
+    cd_want_group_rows(src, idx_buf, offsets, grp_cnt, n_groups);
 
     ray_t* out = ray_vec_new(RAY_I64, n_groups);
     if (!out || RAY_IS_ERR(out)) {
