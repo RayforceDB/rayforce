@@ -3005,7 +3005,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     bool all_pass = false;
                     ray_t* fsel = exec_pred_to_selection(g, pred_root, fnrows,
                                                          &all_pass);
-                    if (fsel && RAY_IS_ERR(fsel)) {       /* a failed column bind */
+                    if (fsel && RAY_IS_ERR(fsel)) {       /* a failed bind or range read, an oom, a cancel */
                         ray_release(input);
                         return fsel;
                     }

@@ -1163,6 +1163,7 @@ static test_result_t test_expr_elementwise_equal(void) {
     ray_t* res[2];
     for (int gen = 0; gen < 2; gen++) {
         ray_t* t = sr_load(gen);
+        TEST_ASSERT_NOT_NULL(t);
         ray_enc_counters_reset();
         ray_graph_t* g = ray_graph_new(t);
         ray_op_t* e = ray_add(g, ray_scan(g, "k"), ray_scan(g, "v"));
@@ -1185,6 +1186,8 @@ static test_result_t test_expr_elementwise_equal(void) {
  * nullable I32 and a nullable F64 column, generation 0 against 2. */
 static test_result_t sr_mid_one(ray_op_t* (*build)(ray_graph_t*)) {
     uint8_t out[2][100];
+    memset(out[0], 0xA5, sizeof out[0]);       /* unwritten bytes cannot compare equal */
+    memset(out[1], 0x5A, sizeof out[1]);
     for (int gen = 0; gen < 2; gen++) {
         ray_t* t = sr_load(gen);
         ray_graph_t* g = ray_graph_new(t);
@@ -1286,33 +1289,141 @@ static test_result_t test_count_fast_path(void) {
     PASS();
 }
 
-/* The fast path's SYM compare over a file domain with nulls and an absent
- * literal, both generations: equal to the general path (`and ... true`
- * declines the fast path) in all six comparisons. */
+/* The fast path's SYM compare, on an in-memory (runtime-domain) table and
+ * over a file domain at both generations, with nulls and an absent
+ * literal: EQ / NE take the fast path and equal the general path (`and
+ * ... true` declines the fast path); the ordered compares decline (#738:
+ * symbols order by string, never by raw id). */
 static test_result_t test_count_fast_sym_nulls(void) {
     sr_eval_ok("(set N (table [s] (list (take (as 'SYM (list \"zq\" \"aq\" \"\" \"mq\")) 30001))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n0/\" N {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n2/\" N {compress: true})");
-    static const char* preds[] = {
-        "(== s 'mq)", "(!= s 'mq)", "(< s 'mq)", "(<= s 'mq)", "(> s 'aq)", "(>= s 'aq)",
-        "(== s 'qqq)", "(!= s 'qqq)", "(< s 'qqq)", "(<= s 'qqq)", "(> s 'qqq)", "(>= s 'qqq)",
+    static const char* eqs[] = { "(== s 'mq)", "(!= s 'mq)", "(== s 'qqq)", "(!= s 'qqq)" };
+    static const char* ords[] = {
+        "(< s 'mq)", "(<= s 'mq)", "(> s 'aq)", "(>= s 'aq)",
+        "(< s 'qqq)", "(<= s 'qqq)", "(> s 'qqq)", "(>= s 'qqq)",
     };
-    for (int gen = 0; gen < 2; gen++) {
-        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/n2/" : SR_TMP "/n0/");
-        for (size_t i = 0; i < sizeof preds / sizeof preds[0]; i++) {
+    static const char* const loads[] = {
+        "(set T N)",                                         /* runtime domain */
+        "(set T (.db.splayed.get \"" SR_TMP "/n0/\"))",
+        "(set T (.db.splayed.get \"" SR_TMP "/n2/\"))",
+    };
+    for (int l = 0; l < 3; l++) {
+        sr_eval_ok(loads[l]);
+        for (size_t i = 0; i < sizeof eqs / sizeof eqs[0]; i++) {
             char q[256];
             uint64_t f0 = ray_query_test_count_fast();
-            snprintf(q, sizeof q, "(count (select {from: T where: %s}))", preds[i]);
+            snprintf(q, sizeof q, "(count (select {from: T where: %s}))", eqs[i]);
             ray_t* a = sr_eval(q);
-            TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 1);
-            snprintf(q, sizeof q, "(count (select {from: T where: (and %s true)}))", preds[i]);
+            TEST_ASSERT_FMT(ray_query_test_count_fast() - f0 == 1, "load %d %s: not the fast path", l, eqs[i]);
+            snprintf(q, sizeof q, "(count (select {from: T where: (and %s true)}))", eqs[i]);
             ray_t* b = sr_eval(q);
             TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
-            TEST_ASSERT_FMT(a->i64 == b->i64, "gen %d %s: fast %lld, general %lld", gen, preds[i],
+            TEST_ASSERT_FMT(a->i64 == b->i64, "load %d %s: fast %lld, general %lld", l, eqs[i],
                             (long long)a->i64, (long long)b->i64);
             ray_release(a); ray_release(b);
         }
+        for (size_t i = 0; i < sizeof ords / sizeof ords[0]; i++) {
+            char q[256];
+            uint64_t f0 = ray_query_test_count_fast();
+            snprintf(q, sizeof q, "(count (select {from: T where: %s}))", ords[i]);
+            ray_t* a = sr_eval(q);
+            TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+            TEST_ASSERT_FMT(ray_query_test_count_fast() == f0, "load %d %s: took the fast path", l, ords[i]);
+            ray_release(a);
+        }
     }
+    PASS();
+}
+
+/* The reuse rule: a generation-2 column whose materialization is already
+ * published compiles to a plain register over that vector (no range
+ * reads) and is not decoded again. */
+static test_result_t test_expr_reuses_materialized(void) {
+    sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", SR_G2);
+    ray_t* s = sr_eval("(sum (at T 'v))");                          /* materializes v */
+    TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
+    ray_release(s);
+    ray_t* t = sr_eval("T");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* ev = ray_table_get_col_enc(t, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(ev);
+    ray_t* dec = ray_enccol_decoded_peek(ev);
+    TEST_ASSERT_NOT_NULL(dec);
+    ray_enc_counters_reset();
+    ray_graph_t* g = ray_graph_new(t);
+    ray_expr_t ex;
+    ray_t* err = NULL;
+    TEST_ASSERT_TRUE(expr_compile(g, t, ray_add(g, ray_scan(g, "k"), ray_scan(g, "v")), &ex, &err));
+    TEST_ASSERT_NULL(err);
+    int seen = 0;
+    for (uint8_t r = 0; r < ex.n_regs; r++) {
+        if (ex.regs[r].kind != REG_SCAN) continue;
+        if (ex.regs[r].col_type == RAY_I32) {                       /* v */
+            TEST_ASSERT_FALSE(ex.regs[r].enc);
+            TEST_ASSERT_TRUE(ex.regs[r].data == ray_data(dec));
+            seen++;
+        } else {                                                    /* k: not materialized */
+            TEST_ASSERT_TRUE(ex.regs[r].enc && !ex.regs[r].data);
+            seen++;
+        }
+    }
+    TEST_ASSERT_EQ_I(seen, 2);
+    ray_t* out = expr_eval_full(&ex, ray_table_nrows(t));
+    TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out));
+    ray_release(out);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
+/* A range-read failure surfaces as `corrupt` with the column path through
+ * the element-wise and the group call sites of expr_eval_full (on a sound
+ * generation-2 table neither run decodes k or v, so the fused path is the
+ * one taken; the group key g is read whole), and an interrupt is
+ * `cancel`. */
+static test_result_t test_expr_error_sites(void) {
+    static const char* const qs[] = {
+        "(select {z: (+ k v) from: T})",
+        "(select {z: (max (* k v)) by: g from: T})",
+    };
+    for (int i = 0; i < 2; i++) {
+        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", SR_G2);
+        ray_t* r = sr_eval(qs[i]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_t* t = sr_eval("T");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        for (int c = 0; c < 2; c++) {
+            ray_t* ev = ray_table_get_col_enc(t, ray_sym_intern(c ? "v" : "k", 1));
+            TEST_ASSERT_FMT(ev && !ray_enccol_decoded_peek(ev), "%s: column %s decoded", qs[i], c ? "v" : "k");
+        }
+        ray_release(t);
+    }
+    char path[600];
+    sr_make_bad("v", path, sizeof path);
+    for (int i = 0; i < 2; i++) {
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/bad/\"))");
+        ray_error_clear();
+        ray_t* r = sr_eval(qs[i]);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: not an error", qs[i]);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+    }
+    /* cancel: an interrupted dispatch is `cancel`, not a partial selection */
+    ray_t* t = sr_load(1);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_graph_t* g = ray_graph_new(t);
+    bool all = false;
+    ray_request_interrupt();
+    ray_t* sel = exec_pred_to_selection(g, pred_v_gt(g), ray_table_nrows(t), &all);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(sel && RAY_IS_ERR(sel));
+    TEST_ASSERT_STR_EQ(ray_err_code(sel), "cancel");
+    ray_error_free(sel);
+    ray_graph_free(g); ray_release(t);
     PASS();
 }
 
@@ -1351,5 +1462,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/expr_error",             test_expr_error,             srr_setup, srr_teardown },
     { "scanrange/count_fast_path",        test_count_fast_path,        srr_setup, srr_teardown },
     { "scanrange/count_fast_sym_nulls",   test_count_fast_sym_nulls,   sr_rt_setup, sr_rt_teardown },
+    { "scanrange/expr_reuses_materialized", test_expr_reuses_materialized, srr_setup, srr_teardown },
+    { "scanrange/expr_error_sites",       test_expr_error_sites,       srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

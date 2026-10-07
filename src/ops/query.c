@@ -7858,11 +7858,10 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     int ok = 0;
     if (src.parted || src.len != ray_table_nrows(tbl)) goto out;
     /* A SYM column needs no null proof (issue #533): its null is id 0 in
-     * every domain (a file domain seeds "" at position 0), below every
-     * real id, and the general path ranks a null below everything in all
-     * six comparisons, so a raw id compare against a non-null literal is
-     * already the null-aware count.  (ray_vec_may_have_nulls is always
-     * true for a plain SYM vector, which declined generation 0 here.) */
+     * every domain (a file domain seeds "" at position 0) and the literal
+     * is non-null, so a raw id EQ / NE is already the null-aware count.
+     * (ray_vec_may_have_nulls is always true for a plain SYM vector, which
+     * declined generation 0 here.)  Ordered SYM compares decline below. */
     if (src.type != RAY_SYM && (col ? ray_vec_may_have_nulls(col) : src.may_null)) goto out;
 
     switch (src.type) {
@@ -7878,6 +7877,9 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
         break;
     case RAY_SYM:
         if (rhs_expr->type != -RAY_SYM) goto out;
+        /* Symbols order by string, not by intern id or domain position
+         * (#738): only EQ / NE are raw-id answers. */
+        if (op != COUNT_CMP_EQ && op != COUNT_CMP_NE) goto out;
         break;
     default:
         goto out;
@@ -7905,13 +7907,12 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     }
     /* SYM cells are positions in the COLUMN's domain; the literal atom
      * carries a runtime id — re-express it (sym-domain Phase 2; no-op
-     * for runtime-domain columns).  Absent: the general path ranks the
-     * literal above every cell (EQ counts 0, NE all, LT / LE all, GT / GE
-     * none), which INT64_MAX reproduces; -1 would rank it below. */
+     * for runtime-domain columns).  Absent ⇒ -1: never equals any cell
+     * (cells are non-negative), so EQ counts 0 and NE counts all —
+     * exactly the absent-literal-matches-nothing contract. */
     if (src.type == RAY_SYM && src.dom != ray_sym_runtime_domain()) {
         ray_t* s = ray_sym_str(rhs);
         rhs = s ? ray_col_src_sym_find(&src, ray_str_ptr(s), ray_str_len(s)) : -1;
-        if (rhs < 0) rhs = INT64_MAX;
     }
     ray_pool_t* pool = ray_pool_get();
     uint32_t nworkers = pool ? ray_pool_total_workers(pool) : 1;

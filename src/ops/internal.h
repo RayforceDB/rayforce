@@ -36,6 +36,7 @@
 #include "exec.h"
 #include "core/pool.h"
 #include "core/profile.h"
+#include "core/runtime.h"   /* ray_err_code — expr_eval_err_fatal */
 #include "store/colrange.h"
 #include "store/csr.h"
 #include "store/hnsw.h"
@@ -1028,7 +1029,6 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
 /* A failed expr_eval_full result: NULL or oom keeps the caller's fallback;
  * any other error (a range read's corrupt, a cancel) is the query's answer,
  * since a fallback would re-read the same column and hide the path. */
-const char* ray_err_code(ray_t* err);   /* core/runtime.h */
 static inline bool expr_eval_err_fatal(ray_t* v) {
     return v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "oom") != 0;
 }
@@ -1050,10 +1050,13 @@ uint64_t ray_query_test_count_fast(void);
  * Returns:
  *   - non-NULL rowsel block  → the selection (caller installs / reads it).
  *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").
- *   - NULL with *all_pass=0  → disabled / unsupported / OOM — caller falls
+ *   - NULL with *all_pass=0  → disabled / unsupported, or an OOM before the
+ *                              dispatch (builders, rowsel block) — caller falls
  *                              back to exec_node→ray_rowsel_from_pred unchanged.
- *   - an owned error         → a column bind or a range read failed (or the
- *                              dispatch was cancelled); the caller returns it. */
+ *   - an owned error         → a column bind or a range read failed, a task's
+ *                              fused or range scratch ran out of memory (oom),
+ *                              or the dispatch was cancelled; the caller
+ *                              returns it (no fallback). */
 ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                               bool* all_pass);
 
