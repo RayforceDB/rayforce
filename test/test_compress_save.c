@@ -2459,8 +2459,9 @@ static test_result_t test_fused_pred_enc_source(void) {
     PASS();
 }
 
-/* A bind failure reaches the query as its error; a plain-request failure
- * reaches fp_compile_pred's error out-parameter; a decline stays a decline. */
+/* A bind failure reaches the query as its error; a bound encoded column
+ * compiles without a decode (a failed range read is the scan's error,
+ * scanrange/topk_take_error); a decline stays a decline. */
 static test_result_t test_fused_pred_bind_failure(void) {
     TEST_ASSERT_TRUE(fq_save("ff"));
     ray_fused_topk_counters_reset();
@@ -2485,8 +2486,8 @@ static test_result_t test_fused_pred_bind_failure(void) {
     if (r && !RAY_IS_ERR(r)) ray_release(r);
     TEST_ASSERT_TRUE(ok);
 
-    /* a failed materialization of a bound encoded column: compiling decodes
-     * nothing (the child reads by range), the plain request fails */
+    /* a bound encoded column: compiling decodes nothing (the child reads by
+     * range), so an injected decode failure is not reached */
     ray_t* t2 = ray_read_splayed(ray_test_tmp(CS_TMP "/ff2"), ray_test_tmp(CS_TMP "/ff2.sym"));
     TEST_ASSERT_TRUE(t2 && !RAY_IS_ERR(t2));
     ray_graph_t* gr = ray_graph_new(t2);
@@ -2495,9 +2496,7 @@ static test_result_t test_fused_pred_bind_failure(void) {
     ray_enccol_test_fail_alloc(1);
     int rc = dag ? fp_compile_pred(gr, dag, t2, &p, &err) : -1;
     bool compiled = rc == 0 && !err && p.n_children == 1 && p.children[0].enc;
-    int prc = rc == 0 ? fp_pred_plain(&p, &err) : 0;
     ray_enccol_test_fail_alloc(0);
-    bool plain_err = compiled && prc != 0 && err && RAY_IS_ERR(err);
     if (rc == 0) fp_pred_cleanup(&p);
     if (err) ray_error_free(err);
     ray_graph_free(gr);
@@ -2513,7 +2512,7 @@ static test_result_t test_fused_pred_bind_failure(void) {
     ray_release(e);
     ray_graph_free(gr);
     ray_release(t2);
-    TEST_ASSERT_TRUE(plain_err);
+    TEST_ASSERT_TRUE(compiled);
     TEST_ASSERT_TRUE(decline);
     PASS();
 }
@@ -4926,9 +4925,9 @@ static test_result_t test_select_decodes_referenced_only(void) {
         { "(select {d: (med v) e: (first w) from: u2})",                      2 },
         { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      2 },  /* P2: x's consult reads the directory */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
-        { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             3 },
+        { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             2 },  /* P2: the take scan range-reads w */
         { "(select {v: v from: u2 desc: v take: 3})",                         1 },
-        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      3 },
+        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      2 },  /* P2: the top-k scan range-reads w */
         { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    0 },  /* P2: a fused side range-reads; w's consult reads the directory */
         { NULL, 0 },
     };

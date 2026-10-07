@@ -32,6 +32,7 @@
 #include "core/pool.h"
 #include "lang/eval.h"
 #include "lang/format.h"
+#include "lang/parse.h"
 #include "store/col.h"
 #include "store/colrange.h"
 #include "store/enccol.h"
@@ -44,6 +45,7 @@
 #include "ops/rowsel.h"
 #include "ops/idxop.h"
 #include "ops/fused_pred.h"
+#include "ops/fused_topk.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2365,6 +2367,78 @@ static test_result_t test_fp_range_str(void) {
     PASS();
 }
 
+/* ---- Task 7: top-k and take scans on range reads -------------------- */
+
+/* SR_SAME through the fused top-k / take: both generations take it. */
+static test_result_t sr_fused_same(const char* q, uint64_t want_mat) {
+    ray_fused_topk_counters_reset();
+    test_result_t r = sr_same(q, want_mat);
+    if (r.status != TEST_PASS) return r;
+    uint64_t ran = 0, declined = 0;
+    ray_fused_topk_counters(&ran, &declined);
+    TEST_ASSERT_FMT(ran == 2 && declined == 0, "%s: fused ran %llu, declined %llu", q,
+                    (unsigned long long)ran, (unsigned long long)declined);
+    PASS();
+}
+#define SR_FUSED_SAME(q, m) do { test_result_t r_ = sr_fused_same((q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Top-k: results equal generation 0; the materializations are exactly the
+ * sort keys plus the projected columns (gathers by row list arrive in P3). */
+static test_result_t test_topk_materializes_keys(void) {
+    SR_FUSED_SAME("(select {k: k from: T where: (> v 1000) desc: k take: 5})", 1);            /* k: key and output */
+    SR_FUSED_SAME("(select {g: g k: k from: T where: (> v 1000) asc: [g k] take: 7})", 2);    /* two keys */
+    SR_FUSED_SAME("(select {f: f from: T where: (== g 3) desc: k take: 3})", 2);              /* key k, projected f */
+    SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: 4})", 1);                      /* take scan: projected k */
+    SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: -4})", 1);                     /* take from the end */
+    PASS();
+}
+
+/* A range read the top-k or take scan makes fails: the query's error, the
+ * column's path in the message; an interrupted scan is `cancel`.  v > 400000 leaves chunk 2 (the corrupt
+ * one) undecided by the directory gate and decides chunks 0 and 1, so the
+ * ascending top-k and the forward take both read it. */
+static test_result_t test_topk_take_error(void) {
+    static const char* const qs[] = {
+        "(select {k: k from: T where: (> v 400000) asc: k take: 5})",
+        "(select {k: k from: T where: (> v 400000) take: 4})",
+    };
+    char path[600];
+    sr_make_bad("v", path, sizeof path);
+    for (int i = 0; i < 2; i++) {
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/bad/\"))");
+        ray_fused_topk_counters_reset();
+        ray_error_clear();
+        ray_t* r = sr_eval(qs[i]);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: not an error", qs[i]);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+        uint64_t ran = 0, declined = 0;
+        ray_fused_topk_counters(&ran, &declined);
+        TEST_ASSERT_EQ_U(ran, 1);
+    }
+    /* cancel: an interrupted scan is `cancel`, not a partial answer.
+     * Generation 0: a generation-2 sort key's materialization would answer
+     * the cancel before the scan runs. */
+    ray_t* t = sr_load(0);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_t* w = ray_parse("(> v 400000)");
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+    int64_t ks = ray_sym_intern("k", 1);
+    uint8_t asc = 0;
+    for (int i = 0; i < 2; i++) {
+        ray_request_interrupt();
+        ray_t* r = i ? ray_fused_topk_select(t, w, &ks, &asc, 1, 5, &ks, NULL, 1)
+                     : ray_fused_take_select(t, w, 4, &ks, NULL, 1);
+        ray_clear_interrupt();
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: not an error", i ? "top-k" : "take");
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+        ray_error_free(r);
+    }
+    ray_release(w); ray_release(t);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -2424,5 +2498,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/fp_range_ready_child",  test_fp_range_ready_child,  srr_setup, srr_teardown },
     { "scanrange/fp_range_str",          test_fp_range_str,          sr_rt_setup, sr_rt_teardown },
     { "scanrange/fp_range_late_materialized", test_fp_range_late_materialized, srr_setup, srr_teardown },
+    { "scanrange/topk_materializes_keys", test_topk_materializes_keys, srr_setup, srr_teardown },
+    { "scanrange/topk_take_error",       test_topk_take_error,       srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

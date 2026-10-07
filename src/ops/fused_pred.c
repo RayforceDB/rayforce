@@ -1117,20 +1117,6 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     return 0;
 }
 
-/* Interim for callers that evaluate with fp_eval_pred only (fused_topk.c
- * until its scans read by range): every encoded child requests its plain
- * column, the pre-range-read behaviour.  0, or -1 with an owned *err. */
-int fp_pred_plain(fp_pred_t* p, ray_t** err) {
-    *err = NULL;
-    for (uint8_t i = 0; i < p->n_children; i++) {
-        fp_cmp_t* c = &p->children[i];
-        if (!c->enc) continue;
-        c->enc = false;
-        if (fp_bind_fields(c->src, c, err) != 0) return -1;
-    }
-    return 0;
-}
-
 /* Walk the predicate DAG (an OP_AND tree of leaf comparisons) and collect
  * leaves into `out->children`.  Pass 3: balanced binary OP_AND emitted
  * by compile_expr_dag means we recurse on both inputs whenever we see an

@@ -132,9 +132,4 @@ int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
 
 void fp_pred_cleanup(fp_pred_t* p);
 
-/* Interim: turn every encoded child into a plain one (its plain column is
- * requested, which materializes it) for a caller that evaluates with
- * fp_eval_pred only.  0, or -1 with an owned *err. */
-int fp_pred_plain(fp_pred_t* p, ray_t** err);
-
 #endif /* RAY_OPS_FUSED_PRED_H */
