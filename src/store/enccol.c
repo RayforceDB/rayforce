@@ -1276,3 +1276,23 @@ ray_t* ray_enccol_decoded_peek(ray_t* encv) {
     if (atomic_load_explicit(&e->once.state, memory_order_acquire) != RAY_ENC_ONCE_DONE) return NULL;
     return e->decoded;
 }
+
+void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out) {
+    ray_enc_dirent_t de;
+    dirent_at(e, c, &de);
+    out->rows = chunk_rows(e, c);
+    out->has_minmax = (de.flags & RAY_ENC_STAT_ABSENT) == 0;
+    out->min = de.min; out->max = de.max;
+    out->null_count = de.null_count;
+    out->sum_lo = de.sum_lo; out->sum_hi = de.sum_hi;
+}
+
+void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
+                           uint64_t* off, uint64_t* len) {
+    int64_t c0 = lo / RAY_ENC_CHUNK, c1 = (hi - 1) / RAY_ENC_CHUNK;
+    ray_enc_dirent_t a, b;
+    dirent_at(e, c0, &a);
+    dirent_at(e, c1, &b);
+    *off = a.offset;
+    *len = b.offset + b.bytes - a.offset;
+}

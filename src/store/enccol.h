@@ -146,6 +146,23 @@ bool   ray_enccol_is_parted(ray_t* encv);
 void   ray_enccol_set_synthetic(ray_t* encv);
 bool   ray_enccol_is_synthetic(ray_t* encv);
 
+/* One chunk's directory statistics. */
+typedef struct {
+    int64_t  rows;           /* rows in the chunk */
+    int64_t  min, max;       /* logical_T values (float types: the double's bits); valid when has_minmax */
+    bool     has_minmax;     /* directory flag bit 0 clear */
+    uint32_t null_count;
+    uint64_t sum_lo;         /* exact 128-bit sum (BOOL, U8, I16, I32, I64, TIME: ray_encw_type_summable) */
+    int64_t  sum_hi;
+} ray_enc_chunk_stat_t;
+/* Chunk c of a single-file encoded column; the directory was verified at
+ * load, so this cannot fail.  c must be below e->n_chunks. */
+void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out);
+/* File byte range holding rows [lo, hi): from the first touched chunk's
+ * descriptors to the end of the last touched chunk.  lo < hi. */
+void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
+                           uint64_t* off, uint64_t* len);
+
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
 /* Could materialization attach an index (recorded kind, UNIQUE, or for STR
  * a runtime DICT, possible only when every chunk has statistics)? */

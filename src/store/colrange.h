@@ -27,6 +27,7 @@
 #include <rayforce.h>
 #include <stdatomic.h>
 #include "store/enc_once.h"
+#include "store/enccol.h"   /* ray_enc_chunk_stat_t */
 #include "ops/ops.h"   /* RAY_DISPATCH_MORSELS, RAY_MORSEL_ELEMS: the pool's task grain */
 
 struct ray_sym_domain_s;
@@ -130,6 +131,14 @@ ray_t*  ray_col_src_ready(const ray_col_src_t* s);
 const void* ray_col_src_base(const ray_col_src_t* s);
 /* Generation-0 element width of the source (SYM: its persisted width). */
 uint8_t ray_col_src_esz(const ray_col_src_t* s);
+
+/* Chunk c's statistics when the source is a single-file generation-2
+ * column; false otherwise (plain, parted, slice). */
+bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, ray_enc_chunk_stat_t* out);
+/* One sequential read-ahead hint for rows [lo, hi): plain mmapped
+ * columns hint their element bytes, generation 2 the chunk bytes from the
+ * directory, parted sources each touched segment; heap vectors nothing. */
+void ray_col_src_advise(const ray_col_src_t* s, int64_t lo, int64_t hi);
 
 /* One source in one task: P1's scratch plus the current view. */
 typedef struct {

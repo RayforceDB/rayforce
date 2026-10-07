@@ -484,3 +484,56 @@ ray_t* ray_scan_fail_finish(ray_scan_fail_t* f, ray_pool_t* pool) {
         return ray_error("cancel", "scan: interrupted");
     return NULL;
 }
+
+/* ---- Directory statistics and read-ahead ---- */
+
+bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, ray_enc_chunk_stat_t* out) {
+    if (!ray_col_src_encoded(s)) return false;
+    ray_enccol_t* e = ray_enccol_of(s->obj);
+    if (e->kind != RAY_ENCCOL_SINGLE || c < 0 || c >= e->n_chunks) return false;
+    ray_enccol_chunk_stat(e, c, out);
+    return true;
+}
+
+#define ADVISE_PAGE ((uintptr_t)4096)   /* madvise needs a page-aligned start */
+
+/* Rows [lo, hi) of obj, within its rows.  Every mapping starts on a page
+ * boundary (mmap), so rounding the start down stays inside it.  A synthetic
+ * segment lives in an anonymous mapping: the hint is harmless there. */
+static void advise_obj(ray_t* obj, int64_t lo, int64_t hi) {
+    if (!obj || lo >= hi) return;
+    if (obj->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of(obj);
+        if (e->kind == RAY_ENCCOL_PARTED) { advise_obj(e->wrapper, lo, hi); return; }
+        uint64_t off, len;
+        ray_enccol_byte_range(e, lo, hi, &off, &len);
+        uint64_t a = off & ~(uint64_t)(ADVISE_PAGE - 1);
+        ray_vm_advise_seq((void*)(e->base + a), (size_t)(off + len - a));
+        return;
+    }
+    if (RAY_IS_PARTED(obj->type)) {
+        ray_t** segs = (ray_t**)ray_data(obj);
+        int64_t acc = 0;
+        for (int64_t i = 0; i < obj->len && acc < hi; i++) {
+            int64_t sl = segs[i] ? ray_table_col_nrows(segs[i]) : 0;
+            int64_t a = lo > acc ? lo - acc : 0, b = hi - acc < sl ? hi - acc : sl;
+            if (a < b) advise_obj(segs[i], a, b);
+            acc += sl;
+        }
+        return;
+    }
+    ray_t* own = plain_owner(obj);
+    if (own->mmod != 1) return;                          /* heap vector: nothing to hint */
+    int64_t base_row = (obj->attrs & RAY_ATTR_SLICE) ? obj->slice_offset : 0;
+    uint8_t esz = ray_sym_elem_size(own->type, own->attrs);
+    uintptr_t p = (uintptr_t)ray_data(own) + (uintptr_t)(base_row + lo) * esz;
+    uintptr_t a = p & ~(ADVISE_PAGE - 1);
+    ray_vm_advise_seq((void*)a, (size_t)(p + (uintptr_t)(hi - lo) * esz - a));
+}
+
+void ray_col_src_advise(const ray_col_src_t* s, int64_t lo, int64_t hi) {
+    if (!s || !s->obj) return;
+    if (lo < 0) lo = 0;
+    if (hi > s->len) hi = s->len;
+    advise_obj(s->obj, lo, hi);
+}

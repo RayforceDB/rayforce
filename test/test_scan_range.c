@@ -736,6 +736,87 @@ static test_result_t test_walk_contig_views(void) {
     PASS();
 }
 
+/* ---- Task 2: directory statistics and the read-ahead byte range ---- */
+
+static test_result_t test_chunk_stat_matches_data(void) {
+    int64_t n = 3 * 65536 + 100;
+    ray_t* v = sr_i32(n, 11);
+    ray_t* c = sr_gen2(v, "st");
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    for (int64_t ch = 0; ch < 4; ch++) {
+        ray_enc_chunk_stat_t st;
+        TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&s, ch, &st));
+        int64_t lo = ch * 65536, hi = lo + 65536 < n ? lo + 65536 : n;
+        int64_t mn = INT64_MAX, mx = INT64_MIN, sum = 0; uint32_t nn = 0;
+        for (int64_t i = lo; i < hi; i++) {
+            int32_t x = ((int32_t*)ray_data(v))[i];
+            if (x == NULL_I32) { nn++; continue; }
+            if (x < mn) mn = x;
+            if (x > mx) mx = x;
+            sum += x;
+        }
+        TEST_ASSERT_EQ_I(st.rows, hi - lo);
+        TEST_ASSERT_TRUE(st.has_minmax);
+        TEST_ASSERT_EQ_I(st.min, mn); TEST_ASSERT_EQ_I(st.max, mx);
+        TEST_ASSERT_EQ_U(st.null_count, nn);
+        TEST_ASSERT_EQ_U(st.sum_lo, (uint64_t)sum);                 /* the exact sum, sign-extended */
+        TEST_ASSERT_EQ_I(st.sum_hi, sum < 0 ? -1 : 0);
+    }
+    ray_enc_chunk_stat_t st;
+    TEST_ASSERT_FALSE(ray_col_src_chunk_stat(&s, 4, &st));          /* past the last chunk */
+    TEST_ASSERT_FALSE(ray_col_src_chunk_stat(&s, -1, &st));
+    ray_col_src_t p; TEST_ASSERT_NULL(ray_col_src_bind(v, &p));      /* plain: no statistics */
+    TEST_ASSERT_FALSE(ray_col_src_chunk_stat(&p, 0, &st));
+    ray_col_src_release(&p); ray_col_src_release(&s); ray_release(c); ray_release(v);
+    PASS();
+}
+
+static test_result_t test_byte_range_from_directory(void) {
+    int64_t n = 4 * 65536;
+    ray_t* v = sr_i32(n, 0);
+    ray_t* c = sr_gen2(v, "br");
+    ray_enccol_t* e = ray_enccol_of(c);
+    ray_enc_dirent_t d1, d2;                            /* directory entries 1 and 2 */
+    memcpy(&d1, e->base + RAY_ENC_DIR_OFF + 1 * sizeof(ray_enc_dirent_t), sizeof d1);
+    memcpy(&d2, e->base + RAY_ENC_DIR_OFF + 2 * sizeof(ray_enc_dirent_t), sizeof d2);
+    uint64_t off, len;
+    ray_enccol_byte_range(e, 65536 + 5, 2 * 65536 + 10, &off, &len);   /* chunks 1 and 2 */
+    TEST_ASSERT_EQ_U(off, d1.offset);
+    TEST_ASSERT_EQ_U(off + len, d2.offset + d2.bytes);
+    ray_enccol_byte_range(e, 65536, 2 * 65536, &off, &len);            /* exactly chunk 1 */
+    TEST_ASSERT_EQ_U(off, d1.offset);
+    TEST_ASSERT_EQ_U(len, d1.bytes);
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    ray_col_src_advise(&s, 0, n);                       /* a hint only: must not fault or fail */
+    ray_col_src_advise(&s, 7, 8);
+    ray_col_src_advise(&s, 5, 5);                       /* empty: nothing */
+    ray_col_src_release(&s);
+    /* Plain mmapped, its slice, a heap vector: hints only, never a fault. */
+    char p0[512]; snprintf(p0, sizeof p0, "%s/br0", sr_root());
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p0, 0), RAY_OK);
+    ray_t* m = ray_col_mmap(p0);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_t* sl = ray_vec_slice(m, 1000, 70000);
+    TEST_ASSERT_TRUE(sl && !RAY_IS_ERR(sl));
+    ray_col_src_t sm, ss, sh;
+    TEST_ASSERT_NULL(ray_col_src_bind(m, &sm));
+    TEST_ASSERT_NULL(ray_col_src_bind(sl, &ss));
+    TEST_ASSERT_NULL(ray_col_src_bind(v, &sh));
+    ray_col_src_advise(&sm, 3, n);
+    ray_col_src_advise(&ss, 0, 70000);
+    ray_col_src_advise(&sh, 0, n);
+    ray_col_src_release(&sm); ray_col_src_release(&ss); ray_col_src_release(&sh);
+    ray_release(sl); ray_release(m);
+    /* A parted wrapper: each touched segment, across segment boundaries. */
+    ray_t* w = sr_parted_i64(4, 1000);
+    ray_col_src_t sp; TEST_ASSERT_NULL(ray_col_src_bind(w, &sp));
+    ray_col_src_advise(&sp, 500, 2500);
+    ray_col_src_advise(&sp, 0, 4000);
+    ray_col_src_release(&sp); ray_release(w);
+    ray_release(c); ray_release(v);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -758,5 +839,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_plain_slice",        test_walk_plain_slice,        sr_setup,    sr_teardown },
     { "scanrange/walk_materialized_parted", test_walk_materialized_parted, sr_rt_setup, sr_rt_teardown },
     { "scanrange/walk_contig_views",       test_walk_contig_views,       sr_setup,    sr_teardown },
+    { "scanrange/chunk_stat_matches_data",   test_chunk_stat_matches_data,   sr_setup, sr_teardown },
+    { "scanrange/byte_range_from_directory", test_byte_range_from_directory, sr_setup, sr_teardown },
     { NULL, NULL, NULL, NULL },
 };
