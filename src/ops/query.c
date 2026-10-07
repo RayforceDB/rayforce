@@ -9167,6 +9167,43 @@ static void scan_gate_where(select_scan_t* ss, ray_t* e, ray_t* tbl, int depth) 
     scan_gate_conjunct(ss, e, tbl);
 }
 
+/* A column is registered unless it is cached (exec_scan_add_col samples the
+ * whole column).  Under a zone gate only the chunks it lets through are
+ * read: drop the columns whose sampled gated-in pages are cached already,
+ * so a repeated query over cached rows does no read-ahead work at all. */
+static void scan_gate_drop_cached(ray_pool_scan_t* s) {
+    int64_t nch = (s->rows + ((int64_t)1 << s->gate_log2) - 1) >> s->gate_log2;
+    int64_t first = -1, last = -1, n_in = 0;
+    for (int64_t ch = 0; ch < nch; ch++) {
+        if (!((s->gate[ch >> 6] >> (ch & 63)) & 1)) continue;
+        if (first < 0) first = ch;
+        last = ch;
+        n_in++;
+    }
+    if (first < 0) return;
+    /* Four gated-in chunks: the first, the last and two between them. */
+    int64_t in[4];
+    int nin = 0;
+    for (int64_t ch = first, k = 0; ch <= last && nin < 4; ch++) {
+        if (!((s->gate[ch >> 6] >> (ch & 63)) & 1)) continue;
+        if (k == 0 || k == n_in - 1 || k == n_in / 3 || k == 2 * n_in / 3) in[nin++] = ch;
+        k++;
+    }
+    for (uint32_t k = 0; k < s->n; ) {
+        bool cached = true;
+        for (int i = 0; i < nin && cached; i++) {
+            int64_t r0 = in[i] << s->gate_log2;
+            int64_t r1 = r0 + ((int64_t)1 << s->gate_log2) < s->rows ? r0 + ((int64_t)1 << s->gate_log2) : s->rows;
+            cached = ray_vm_resident(s->base[k] + (size_t)r0 * s->esz[k],
+                                     (size_t)(r1 - r0) * s->esz[k]);
+        }
+        if (!cached) { k++; continue; }
+        s->base[k] = s->base[s->n - 1];
+        s->esz[k] = s->esz[s->n - 1];
+        s->n--;
+    }
+}
+
 /* Fill the open registration of the select `args` from its source table. */
 static void select_scan_register(ray_t** args, ray_t* dict, ray_t* tbl, ray_t* where) {
     select_scan_t* ss = t_select_scan;
@@ -9191,6 +9228,7 @@ static void select_scan_register(ray_t** args, ray_t* dict, ray_t* tbl, ray_t* w
     bool rows_set = ss->scan.rows >= 0;
     if (!rows_set) ss->scan.rows = nrows;   /* the gate is sized by it */
     if (where) scan_gate_where(ss, where, tbl, 0);
+    if (ss->scan.gate) scan_gate_drop_cached(&ss->scan);
     bool defer = where && !ss->scan.gate;
     for (int i = 0; i < n; i++)
         exec_scan_add_col(defer ? &ss->defer : &ss->scan, ray_table_get_col(tbl, syms[i]));

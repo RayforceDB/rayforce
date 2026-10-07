@@ -280,6 +280,12 @@ static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
         t->last = -1;
         for (uint32_t c = 0; c < s->n; c++) t->lo[c] = t->hi[c] = r;
     }
+    /* Rows the filter's zones rule out are skipped by the pass: nothing to
+     * learn or request there, and the run starts again past them. */
+    if (s->gate) {
+        int64_t ch = r >> s->gate_log2;
+        if (!((s->gate[ch >> 6] >> (ch & 63)) & 1)) { t->last = -1; return; }
+    }
     /* Which columns were read over the rows behind this one. */
     if (t->last >= 0 && t->last != r) {
         int64_t mid = (t->last < r ? t->last + r : r + t->last) / 2;
