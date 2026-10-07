@@ -776,6 +776,27 @@ static ray_t* fk_delta(void) {
     return v;
 }
 
+/* fk_for with a null every 10th row (a bitmap). */
+static ray_t* fk_for_nulls(int8_t type) {
+    ray_t* v = fk_for(type);
+    for (int i = 0; i < 1024; i += 10) {
+        if (type == RAY_I16) ((int16_t*)ray_data(v))[i] = NULL_I16;
+        else ((int32_t*)ray_data(v))[i] = NULL_I32;
+    }
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    return v;
+}
+/* fk_delta with nulls at rows 1024 and 1025, two lane heads of vector 1:
+ * their fill (the vector's minimum) is close to the true values, so the
+ * deltas stay small and the vector stays DELTA_BP. */
+static ray_t* fk_delta_nulls(void) {
+    ray_t* v = fk_delta();
+    ((int32_t*)ray_data(v))[1024] = NULL_I32;
+    ((int32_t*)ray_data(v))[1025] = NULL_I32;
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    return v;
+}
+
 static test_result_t test_fast_kernel_corrupt_twice(void) {
     const char* p = ray_test_tmp(EC_TMP "/fk");
     size_t at;
@@ -811,6 +832,26 @@ static test_result_t test_fast_kernel_corrupt_twice(void) {
     W32(at + 8 + 8 * 32, 1);                                BAD2(p, 1, "DELTA_BP placeholder not zero");
     SAVE(fk_delta(), p); at = payload_at(0, 1);
     W64(at + 8, (uint64_t)1 << 31);                         BAD2(p, 1, "sentinel outside the bitmap");   /* lane 0 head on MIN */
+    /* With a null bitmap: a row outside it on the sentinel (the merge pass's rule).
+     * I16 / I32 FOR_BP: the base moved onto the sentinel, so the minimum's
+     * rows decode to it, nulls (every 10th row) and non-nulls alike. */
+    for (int t = 0; t < 2; t++) {
+        int8_t type = t ? RAY_I32 : RAY_I16;
+        int T = t ? 32 : 16;
+        SAVE(fk_for_nulls(type), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); at = payload_at(0, 0);
+        TEST_ASSERT_TRUE(rd64(desc_at(0, 0)) >> 16 & 0xFFFF);      /* n_nulls > 0: a bitmap leads the payload */
+        W64(at + 128, (uint64_t)1 << (T - 1));              BAD2(p, 0, "sentinel outside the bitmap");
+    }
+    /* I32 DELTA_BP with a bitmap: lane 2's head (row 1026, not null) on the sentinel */
+    SAVE(fk_delta_nulls(), p); NEED_ENC(0, 1, RAY_ENC_DELTA_BP); at = payload_at(0, 1);
+    TEST_ASSERT_TRUE(rd64(desc_at(0, 1)) >> 16 & 0xFFFF);
+    W64(at + 128 + 8 + 8 * 2, (uint64_t)1 << 31);               BAD2(p, 1, "sentinel outside the bitmap");
+    /* SYM FOR_BP: id 0 (the null) in a vector whose descriptor counts no nulls */
+    uint8_t ids[1024];
+    for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + ((uint32_t)i * 2654435761u >> 27));
+    SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); at = payload_at(0, 0);
+    TEST_ASSERT_EQ_I(rd64(desc_at(0, 0)) >> 16 & 0xFFFF, 0);
+    W64(at, 0);                                             BAD2(p, 0, "SYM null count");   /* base 1 -> 0 */
     PASS();
 }
 

@@ -44,7 +44,11 @@ ray_enccol_t* ray_enccol_of(ray_t* v) {
     return e;
 }
 
+static _Atomic(int64_t) g_enccol_live;          /* test hook, see enccol.h */
+int64_t ray_enccol_test_live(void) { return atomic_load(&g_enccol_live); }
+
 static void enccol_free(ray_enccol_t* e) {
+    atomic_fetch_sub_explicit(&g_enccol_live, 1, memory_order_relaxed);
     if (e->decoded) {
         ray_idx_lazy_forget(e->decoded);     /* a lazy hash goes with its object */
         ray_release(e->decoded);
@@ -55,6 +59,11 @@ static void enccol_free(ray_enccol_t* e) {
     if (e->map)     ray_file_map_release(e->map);
     ray_free_raw((void*)e->desc_ok);
     ray_free_raw(e);
+}
+
+void ray_enccol_ref(ray_enccol_t* e) { atomic_fetch_add_explicit(&e->rc, 1, memory_order_relaxed); }
+void ray_enccol_unref(ray_enccol_t* e) {
+    if (atomic_fetch_sub_explicit(&e->rc, 1, memory_order_acq_rel) == 1) enccol_free(e);
 }
 
 void ray_enccol_payload_retain(ray_t* v) {
@@ -281,6 +290,7 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     m->base = mapped; m->len = size; m->rc = 1; m->next = NULL;
     ray_enccol_t* e = ray_calloc_raw(sizeof *e);
     if (!e) { ray_file_map_release(m); return ray_error("oom", NULL); }
+    atomic_fetch_add_explicit(&g_enccol_live, 1, memory_order_relaxed);
     atomic_store(&e->rc, 1);
     e->kind = RAY_ENCCOL_SINGLE;
     e->map = m; e->base = (const uint8_t*)mapped; e->size = size;
@@ -1003,7 +1013,7 @@ static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t*
 static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
                         const uint8_t* body, uint64_t avail, const uint8_t* bm, void* out,
                         size_t nbytes, bool try_fast) {
-    uint8_t tmp[RAY_ENC_VEC * 16];
+    _Alignas(8) uint8_t tmp[RAY_ENC_VEC * 16];      /* the fast kernel needs 8-aligned output */
     ray_t* err;
     if (try_fast && dec_fast(e, d, vlen, body, avail, bm, 0, tmp)) {
         memcpy(out, tmp, nbytes);
@@ -1466,6 +1476,7 @@ ray_t* ray_enccol_parted_new(ray_t* wrapper) {
         return ray_error("type", "parted encoded column needs a parted wrapper");
     ray_enccol_t* e = ray_calloc_raw(sizeof *e);
     if (!e) return ray_error("oom", NULL);
+    atomic_fetch_add_explicit(&g_enccol_live, 1, memory_order_relaxed);
     atomic_store(&e->rc, 1);
     e->kind = RAY_ENCCOL_PARTED;
     e->type = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);

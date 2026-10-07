@@ -40,14 +40,24 @@
 void ray_col_scratch_init(ray_col_scratch_t* s) { memset(s, 0, sizeof *s); }
 
 /* Decoded bytes are counted per scratch and column, not per vector: the
- * counters are shared by every worker. */
+ * counters are shared by every worker.  The scratch references the column
+ * it counts for (once per column, not per vector), so a flush never reads a
+ * freed column, whatever the order of the scratch's and source's release. */
+static _Atomic(uint64_t) g_wide_hits;              /* test hook */
+uint64_t ray_col_test_wide_hits(void) { return atomic_load(&g_wide_hits); }
+
 static void scratch_flush(ray_col_scratch_t* s) {
-    if (s->acc_e) ray_enccol_note_decoded(s->acc_e, s->acc_bytes);
+    if (s->acc_e) {
+        ray_enccol_note_decoded(s->acc_e, s->acc_bytes);
+        ray_enccol_unref(s->acc_e);
+    }
+    if (s->wide_hits) atomic_fetch_add_explicit(&g_wide_hits, s->wide_hits, memory_order_relaxed);
     s->acc_e = NULL;
     s->acc_bytes = 0;
+    s->wide_hits = 0;
 }
 static void scratch_count(ray_col_scratch_t* s, ray_enccol_t* e, uint64_t nb) {
-    if (s->acc_e != e) { scratch_flush(s); s->acc_e = e; }
+    if (s->acc_e != e) { scratch_flush(s); ray_enccol_ref(e); s->acc_e = e; }
     s->acc_bytes += nb;
 }
 
@@ -293,6 +303,7 @@ ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
     if (ray_enccol_decode_wide(e, c, (int)(vec % RAY_ENC_VECS_PER_CHUNK), &descs[vec % RAY_ENC_VECS_PER_CHUNK],
                                wide, dst, &nb)) {
         scratch_count(sc, e, nb);
+        sc->wide_hits++;
         *got = n;
     }
     return NULL;

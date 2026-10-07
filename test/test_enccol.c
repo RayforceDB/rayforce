@@ -708,7 +708,7 @@ static uint64_t fk_sentinel(int T) { return T == 64 ? (uint64_t)1 << 63 : (uint6
 
 static test_result_t test_fast_kernel_equal(void) {
     static const struct { int8_t type; uint8_t attrs; } kinds[] = {
-        { RAY_U8, 0 }, { RAY_I16, 0 }, { RAY_I32, 0 }, { RAY_I64, 0 }, { RAY_DATE, 0 },
+        { RAY_U8, 0 }, { RAY_BOOL, 0 }, { RAY_I16, 0 }, { RAY_I32, 0 }, { RAY_I64, 0 }, { RAY_DATE, 0 }, { RAY_TIME, 0 },
         { RAY_SYM, RAY_SYM_W8 }, { RAY_SYM, RAY_SYM_W16 }, { RAY_SYM, RAY_SYM_W32 }, { RAY_SYM, RAY_SYM_W64 },
     };
     static const int lens[] = { 1024, 1000, 77, 1 };
@@ -785,6 +785,22 @@ static test_result_t test_fast_kernel_equal(void) {
     static uint8_t out[RAY_ENC_VEC * 8];
     TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len, RAY_ENC_VEC, true, 0, out), 0);
     TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len, RAY_ENC_VEC, false, 0, out), -1);
+    /* the same sentinel with a bitmap that flags other rows, not 700: every
+     * output (native, widened i64 and f64) declines, the reference reports it */
+    {
+        static uint8_t nb[RAY_ENC_VEC / 8];
+        static int64_t wi[RAY_ENC_VEC]; static double wf[RAY_ENC_VEC];
+        memset(nb, 0, sizeof nb);
+        int nn = 0;
+        for (int i = 3; i < RAY_ENC_VEC; i += 50) if (i != 700) { nb[i >> 3] |= (uint8_t)(1u << (i & 7)); nn++; }
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, nn, nb, b.p, b.len, RAY_ENC_VEC, true, 0, out), 0);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, nn, nb, b.p, b.len, RAY_ENC_VEC, true, RAY_I64, wi), 0);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, nn, nb, b.p, b.len, RAY_ENC_VEC, true, RAY_F64, wf), 0);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, nn, nb, b.p, b.len, RAY_ENC_VEC, false, 0, out), -1);
+        nb[700 >> 3] |= (uint8_t)(1u << (700 & 7));                         /* flagged: a null, sound */
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, nn + 1, nb, b.p, b.len, RAY_ENC_VEC, true, RAY_I64, wi), 1);
+        TEST_ASSERT_TRUE(wi[700] == NULL_I64);
+    }
     /* a body one word short and one word long: declined, reported */
     TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len - 8, RAY_ENC_VEC, true, 0, out), 0);
     TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len - 8, RAY_ENC_VEC, false, 0, out), -1);
@@ -856,6 +872,31 @@ static test_result_t test_desc_validated_once(void) {
     TEST_ASSERT_NULL(ray_col_range(&s, 0, 1024, &sc, &r));             /* chunk 0 unaffected */
     ray_col_scratch_free(&sc); ray_col_src_release(&s);
     ray_release(c);
+    PASS();
+}
+
+/* The scratch references the column it counts for: freeing it after its
+ * source and column are released is safe and still counts (ASan). */
+static test_result_t test_scratch_outlives_source(void) {
+    const char* p = ray_test_tmp(ENCCOL_TMP "/so");
+    TEST_ASSERT_EQ_I(save_i32_rows(p, 5000), RAY_OK);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    ray_col_range_t r;
+    ray_enc_counters_reset();
+    int64_t live = ray_enccol_test_live();
+    TEST_ASSERT_NULL(ray_col_range(&s, 1024, 1024, &sc, &r));
+    ray_col_src_release(&s);
+    ray_release(c);                                   /* the scratch's reference keeps the column */
+    TEST_ASSERT_EQ_I(ray_enccol_test_live(), live);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);             /* not counted yet */
+    ray_col_scratch_free(&sc);                        /* counts, then drops the last reference */
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 4);
+    TEST_ASSERT_EQ_I(ray_enccol_test_live(), live - 1);
     PASS();
 }
 
@@ -2072,6 +2113,7 @@ const test_entry_t enccol_entries[] = {
     { "enccol/fast_kernel_equal",      test_fast_kernel_equal,      enccol_setup, enccol_teardown },
     { "enccol/desc_validated_once",    test_desc_validated_once,    enccol_setup, enccol_teardown },
     { "enccol/desc_first_touch_concurrent", test_desc_first_touch_concurrent, enccol_setup, enccol_teardown },
+    { "enccol/scratch_outlives_source", test_scratch_outlives_source, enccol_setup, enccol_teardown },
     { "enccol/decode_trailing_bytes",  test_decode_trailing_bytes,  enccol_setup, enccol_teardown },
     { "enccol/dict_null_dictionary",   test_dict_null_dictionary,   enccol_setup, enccol_teardown },
     { "enccol/vec_range_checks",       test_vec_range_checks,       enccol_setup, enccol_teardown },

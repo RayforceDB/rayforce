@@ -1558,7 +1558,10 @@ static test_result_t test_count_native_queries(void) {
 /* Narrow registers widened straight from the packed vector: I16 and I32
  * with nulls, element-wise and as a filter, both generations equal. */
 static test_result_t test_expr_widened_registers(void) {
+    uint64_t h0 = ray_col_test_wide_hits();
     SR_SAME("(select {z: (+ g 1) from: T})", 0);                 /* I16, no nulls */
+    TEST_ASSERT_FMT(ray_col_test_wide_hits() - h0 == 196, "(+ g 1): %llu of 196 vectors widened in place",
+                    (unsigned long long)(ray_col_test_wide_hits() - h0));   /* gen 2 only; every vector FOR_BP */
     SR_SAME("(select {z: (* v 2) from: T})", 0);                 /* I32, null every 10th */
     SR_SAME("(count (select {from: T where: (> (+ g 1) 3)}))", 0);
     SR_SAME("(select {z: (* (+ v 1) 0.5) from: T})", 0);         /* an F64 program over I32 */
@@ -1574,9 +1577,16 @@ static test_result_t test_expr_widened_registers(void) {
         for (int gen = 0; gen < 2; gen++) {
             sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/w2/" : SR_TMP "/w0/");
             ray_enc_counters_reset();
+            uint64_t h0 = ray_col_test_wide_hits();
             out[gen] = sr_eval(qs[i]);
             TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d", qs[i], gen);
-            if (gen) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0); }
+            uint64_t hits = ray_col_test_wide_hits() - h0;
+            if (gen) {
+                ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0);
+                TEST_ASSERT_FMT(hits > 0, "%s: no vector widened in place", qs[i]);
+            } else {
+                TEST_ASSERT_EQ_U(hits, 0);                          /* generation 0 reads in place */
+            }
         }
         ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
         TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0, "%s differs", qs[i]);

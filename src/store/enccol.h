@@ -108,6 +108,9 @@ ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
  * caller reads the vector by range, which decodes or reports it. */
 int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               int8_t wide, void* out, uint64_t* produced);
+/* A reference on the column's payload (the RAY_ENCCOL headers share it). */
+void   ray_enccol_ref(ray_enccol_t* e);
+void   ray_enccol_unref(ray_enccol_t* e);
 /* Count decoded bytes (global and per column counters). */
 void   ray_enccol_note_decoded(ray_enccol_t* e, uint64_t bytes);
 /* Decoded-pool bytes of vector j of chunk c (STR; 0 otherwise). */
@@ -150,6 +153,8 @@ void   ray_enccol_test_interrupt_after(int64_t nth);
 /* Parted materialization: 0 auto, 1 always on the coordinator, 2 always per-segment tasks. */
 void   ray_enccol_test_parted_mode(int mode);
 void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a mismatched root */
+/* Encoded column objects alive (opened, not yet freed). */
+int64_t  ray_enccol_test_live(void);
 /* Chunk descriptor validations run since process start. */
 uint64_t ray_enccol_test_desc_validations(void);
 /* One top-level integer vector body (`enc`, `width`) of a column of `type`
