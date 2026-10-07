@@ -1648,6 +1648,15 @@ static test_result_t test_expr_parted_segments(void) {
     TEST_ASSERT_EQ_U(m2, 0);
     TEST_ASSERT_TRUE(sr_vec_eq(c, d));                 /* ragged: synthetic nulls read by range */
     TEST_ASSERT_EQ_U(mr, 0);
+    /* one column with generation-2 segments and a synthetic null segment */
+    sr_parted_xy(SR_TMP "/pmx", 3, true, false);
+    sr_parted_xy(SR_TMP "/pmxref", 3, false, true);
+    uint64_t mm = 99;
+    ray_t* e = sr_parted_add(SR_TMP "/pmx", &mm);
+    ray_t* f = sr_parted_add(SR_TMP "/pmxref", NULL);
+    TEST_ASSERT_TRUE(sr_vec_eq(e, f));
+    TEST_ASSERT_EQ_U(mm, 0);
+    sr_drop(e); sr_drop(f);
     /* a segment another consumer already materialized is read in place
      * (published), the others by range: same vector, no new decode */
     sr_evalf_ok("(set T (.db.parted.get \"%s\" 't))", SR_TMP "/pp2");
@@ -1664,6 +1673,10 @@ static test_result_t test_expr_parted_segments(void) {
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_TRUE(q && !RAY_IS_ERR(q));
     TEST_ASSERT_EQ_U(k.materialized, 0);
+    /* only the unpublished generation-2 segments are decoded by range:
+     * x in partitions 1 and 3, y in partition 3 (y's partition 1 is read
+     * from its published vector) */
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 3 * 70000 * 8);
     TEST_ASSERT_TRUE(sr_vec_eq(ray_table_get_col(q, ray_sym_intern("z", 1)), b));
     ray_release(q); ray_release(t);
     sr_drop(a); sr_drop(b); sr_drop(c); sr_drop(d);
@@ -1683,10 +1696,13 @@ static void sr_parted_bad(const char* root, int part, const char* col, int64_t c
     sr_patch(path, (long)off + 6, 1);
 }
 /* Range-read failures in two segments: the answer is the lowest one in
- * row order across the whole parted column (failure keys are global row
- * offsets), every run.  Partition 1 fails late (chunk 1, rows 65536..),
- * partition 3 early (chunk 0): partition 1 still wins.  With only
- * partition 3 corrupt, its failure is the answer. */
+ * row order across the whole parted column, every run.  Partition 1 fails
+ * late (chunk 1, rows 65536..), partition 3 early (chunk 0): partition 1
+ * wins.  The evaluator stops at the first failing segment, which alone
+ * gives that answer; with the stop disabled (test hook) partition 3 runs
+ * too and only the global failure keys (65536 against 140000, where
+ * segment-local keys would be 65536 against 0) keep partition 1 the
+ * answer.  With only partition 3 corrupt, its failure is the answer. */
 static test_result_t test_expr_parted_fail_lowest(void) {
     sr_parted_xy(SR_TMP "/pbad", 7, false, false);
     char p1[600], p3[600];
@@ -1700,14 +1716,80 @@ static test_result_t test_expr_parted_fail_lowest(void) {
         ray_error_free(v);
     }
     sr_parted_bad(SR_TMP "/pbad", 1, "y", 1, p1, sizeof p1);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 8; i++) {
+        ray_expr_test_parted_all_segments(i & 1);
         ray_error_clear();
         ray_t* v = sr_parted_add(SR_TMP "/pbad", NULL);
         TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
         TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
-        TEST_ASSERT_FMT(strstr(ray_error_msg(), p1) != NULL, "not %s: %s", p1, ray_error_msg());
+        TEST_ASSERT_FMT(strstr(ray_error_msg(), p1) != NULL, "run %d: not %s: %s", i, p1, ray_error_msg());
         ray_error_free(v);
     }
+    ray_expr_test_parted_all_segments(false);
+    PASS();
+}
+
+/* Compile (+ x y) over parted table t and evaluate it through the parted
+ * evaluator directly (nrows rows). */
+static ray_t* sr_parted_eval(ray_t* t, int64_t nrows) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_expr_t ex; ray_t* cerr = NULL;
+    ray_t* v;
+    if (expr_compile(g, t, ray_add(g, ray_scan(g, "x"), ray_scan(g, "y")), &ex, &cerr))
+        v = expr_eval_full(&ex, nrows);
+    else
+        v = cerr ? cerr : ray_error("nyi", "sr_parted_eval: not compiled");
+    ray_graph_free(g);
+    return v;
+}
+/* A cancel ends the segment loop: two dispatched partitions (70000 rows,
+ * their tasks skipped by the cancelled pool) and a corrupt third one small
+ * enough to run inline; the answer is `cancel`, never the third's
+ * `corrupt`. */
+static test_result_t test_expr_parted_cancel(void) {
+    for (int p = 0; p < 3; p++)
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/pcn/2024.01.0%d/t/\" %s {compress: true})", p + 1,
+                    p == 2 ? "(table [x y] (list (til 1000) (% (til 1000) 97)))"
+                           : "(table [x y] (list (til 70000) (% (til 70000) 97)))");
+    char p3[600];
+    sr_parted_bad(SR_TMP "/pcn", 3, "y", 0, p3, sizeof p3);
+    sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/pcn\" 't))");
+    ray_t* t = sr_eval("T");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* v = sr_parted_eval(t, 141000);                     /* sound run: corrupt */
+    TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
+    TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
+    ray_error_free(v);
+    ray_request_interrupt();
+    v = sr_parted_eval(t, 141000);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
+    TEST_ASSERT_STR_EQ(ray_err_code(v), "cancel");
+    ray_error_free(v);
+    ray_release(t);
+    PASS();
+}
+
+/* Parted registers whose segments differ in length (a hand-built table:
+ * x splits 3000 + 5000, y 5000 + 3000) are a `length` error, never
+ * clipped or read past a segment end. */
+static test_result_t test_expr_parted_seg_lengths(void) {
+    ray_t* wx = sr_parted_i64(2, 4000); ray_t* wy = sr_parted_i64(2, 4000);
+    ray_t** sx = (ray_t**)ray_data(wx); ray_t** sy = (ray_t**)ray_data(wy);
+    ray_release(sx[0]); ray_release(sx[1]); ray_release(sy[0]); ray_release(sy[1]);
+    sx[0] = ray_vec_new(RAY_I64, 3000); sx[0]->len = 3000; memset(ray_data(sx[0]), 0, 3000 * 8);
+    sx[1] = ray_vec_new(RAY_I64, 5000); sx[1]->len = 5000; memset(ray_data(sx[1]), 0, 5000 * 8);
+    sy[0] = ray_vec_new(RAY_I64, 5000); sy[0]->len = 5000; memset(ray_data(sy[0]), 0, 5000 * 8);
+    sy[1] = ray_vec_new(RAY_I64, 3000); sy[1]->len = 3000; memset(ray_data(sy[1]), 0, 3000 * 8);
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), wx);
+    t = ray_table_add_col(t, ray_sym_intern("y", 1), wy);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* v = sr_parted_eval(t, 8000);
+    TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
+    TEST_ASSERT_STR_EQ(ray_err_code(v), "length");
+    ray_error_free(v);
+    ray_release(t); ray_release(wx); ray_release(wy);
     PASS();
 }
 
@@ -1754,5 +1836,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/expr_widened_registers", test_expr_widened_registers, srr_setup, srr_teardown },
     { "scanrange/expr_parted_segments",   test_expr_parted_segments,   srr_setup, srr_teardown },
     { "scanrange/expr_parted_fail_lowest", test_expr_parted_fail_lowest, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/expr_parted_cancel",     test_expr_parted_cancel,     sr_rt_setup, sr_rt_teardown },
+    { "scanrange/expr_parted_seg_lengths", test_expr_parted_seg_lengths, sr_rt_setup, sr_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

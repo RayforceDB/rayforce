@@ -1040,6 +1040,9 @@ static inline bool expr_eval_err_fatal(ray_t* v) {
  * (at most EXPR_MORSEL rows, any alignment) into out[0 .. end - start). */
 void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end,
                               uint8_t* out, ray_t** err);
+/* Test hook: the parted evaluator runs every segment instead of stopping
+ * at the first failing one (false restores the stop). */
+void ray_expr_test_parted_all_segments(bool on);
 
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */

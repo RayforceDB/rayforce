@@ -928,6 +928,7 @@ void ray_test_hooks_off(void) {
     ray_graph_bind_test_fail_alloc(0);
     ray_store_test_force_compress(false);
     ray_idx_lazy_test_fail_build(NULL);
+    ray_expr_test_parted_all_segments(false);
     ray_clear_interrupt();
 }
 

@@ -2243,6 +2243,12 @@ static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t n
     else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
 }
 
+/* Test hook: the parted evaluator runs every segment instead of stopping
+ * at the first failing one, so the global failure keys alone must pick the
+ * lowest failure. */
+static bool g_expr_test_parted_all_segs;
+void ray_expr_test_parted_all_segments(bool on) { g_expr_test_parted_all_segs = on; }
+
 /* Segment s of a parted register's object: a plain segment vector, a
  * RAY_ENCCOL (generation 2 or synthetic), or NULL for a missing segment. */
 static ray_t* expr_seg(ray_t* parted_col, int64_t s) {
@@ -2261,8 +2267,8 @@ static int64_t expr_nsegs(ray_t* parted_col) {
  * segment of a ragged partition) is bound as its own source and read by
  * range, never materialized.  Failure keys are global rows (the segment's
  * first row plus the task start), so the lowest failure in row order is
- * the answer; segments run in order and the first failing one ends the
- * loop. */
+ * the answer; segments run in order, and the first failing one or a
+ * cancel ends the loop (a cancel is answered by ray_scan_fail_finish). */
 static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
     ray_t* out = ray_vec_new(expr->out_type, nrows);
     if (!out || RAY_IS_ERR(out)) {
@@ -2307,6 +2313,15 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             if (!seg_expr.regs[r].is_parted) continue;
             ray_t* seg = expr_seg(seg_expr.regs[r].parted_col, s);
             if (!seg) { seg_ok = false; break; }
+            /* every register reads the same rows: a segment of another
+             * length is a malformed table, never clipped */
+            int64_t rl = ray_table_col_nrows(seg);
+            if (rl != seg_len) {
+                ray_scan_fail_note(&fail, global_off,
+                                   ray_error("length", "parted expression: segment %lld has %lld rows, expected %lld",
+                                             (long long)s, (long long)rl, (long long)seg_len));
+                seg_ok = false; break;
+            }
             ray_t* segp = seg;
             if (seg->type == RAY_ENCCOL) {
                 ray_t* pk = ray_enccol_decoded_peek(seg);   /* published: read it in place */
@@ -2348,8 +2363,12 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
                    (size_t)seg_len * esz);
         }
         for (uint8_t i = 0; i < n_seg_src; i++) ray_col_src_release(&seg_src[i]);
-        if (ray_scan_failed(&fail)) break;          /* the lowest failing segment */
         global_off += seg_len;
+        /* the lowest failing segment ends the loop; so does a cancel, which
+         * a later inline segment's failure could otherwise overtake */
+        if (ray_scan_failed(&fail) && !g_expr_test_parted_all_segs) break;
+        if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_acquire)))
+            break;
     }
     ray_t* ferr = ray_scan_fail_finish(&fail, dispatched ? pool : NULL);
     if (ferr) { ray_release(out); return ferr; }
