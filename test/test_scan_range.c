@@ -1595,6 +1595,122 @@ static test_result_t test_expr_widened_registers(void) {
     PASS();
 }
 
+/* ---- Task 4: parted fused expressions over encoded segments ---- */
+
+/* Three partitions of [x y] under `root`: bit p of gen2 writes partition p
+ * compressed; ragged: partition 3 has only x; nullref: partition 3 carries
+ * y as explicit nulls (the reference for the ragged table). */
+static void sr_parted_xy(const char* root, unsigned gen2, bool ragged, bool nullref) {
+    for (int p = 0; p < 3; p++) {
+        const char* tbl = (ragged && p == 2) ? "(table [x] (list (til 70000)))"
+                        : (nullref && p == 2) ? "(table [x y] (list (til 70000) (take [0Nl] 70000)))"
+                        : "(table [x y] (list (til 70000) (% (til 70000) 97)))";
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.0%d/t/\" %s {compress: %s})", root, p + 1, tbl,
+                    ((gen2 >> p) & 1) ? "true" : "false");
+    }
+}
+/* (+ x y) over a parted table through the parted evaluator
+ * (expr_eval_full_parted).  ray_execute of the bare graph streams the
+ * partitions one flat segment table at a time (build_segment_table) and
+ * never reaches it; a projecting select keeps the table parted, so the
+ * element-wise arm sees parted registers.  Returns the z column. */
+static ray_t* sr_parted_add(const char* root, uint64_t* mat) {
+    sr_evalf_ok("(set T (.db.parted.get \"%s\" 't))", root);
+    ray_enc_counters_reset();
+    ray_t* q = sr_eval("(select {z: (+ x y) from: T})");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    if (mat) *mat = k.materialized;
+    if (!q || RAY_IS_ERR(q)) return q;
+    ray_t* v = ray_table_get_col(q, ray_sym_intern("z", 1));
+    if (v) ray_retain(v);
+    ray_release(q);
+    return v;
+}
+static bool sr_vec_eq(ray_t* a, ray_t* b) {
+    return a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->type == b->type && a->len == b->len &&
+           (a->attrs & RAY_ATTR_HAS_NULLS) == (b->attrs & RAY_ATTR_HAS_NULLS) &&
+           memcmp(ray_data(a), ray_data(b), (size_t)a->len * ray_sym_elem_size(a->type, a->attrs)) == 0;
+}
+/* Segments generation 2, 0, 2 against an all-generation-0 copy; and a
+ * ragged generation-0 table against its explicit-null reference.  Equal
+ * vectors, nothing materialized. */
+static test_result_t test_expr_parted_segments(void) {
+    sr_parted_xy(SR_TMP "/pp2", 5, false, false);
+    sr_parted_xy(SR_TMP "/pp0", 0, false, false);
+    sr_parted_xy(SR_TMP "/prg", 0, true, false);
+    sr_parted_xy(SR_TMP "/pref", 0, false, true);
+    uint64_t m2 = 99, mr = 99;
+    ray_t* a = sr_parted_add(SR_TMP "/pp2", &m2);
+    ray_t* b = sr_parted_add(SR_TMP "/pp0", NULL);
+    ray_t* c = sr_parted_add(SR_TMP "/prg", &mr);
+    ray_t* d = sr_parted_add(SR_TMP "/pref", NULL);
+    TEST_ASSERT_TRUE(sr_vec_eq(a, b));
+    TEST_ASSERT_EQ_U(m2, 0);
+    TEST_ASSERT_TRUE(sr_vec_eq(c, d));                 /* ragged: synthetic nulls read by range */
+    TEST_ASSERT_EQ_U(mr, 0);
+    /* a segment another consumer already materialized is read in place
+     * (published), the others by range: same vector, no new decode */
+    sr_evalf_ok("(set T (.db.parted.get \"%s\" 't))", SR_TMP "/pp2");
+    ray_t* t = sr_eval("T");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* ey = ray_table_get_col_enc(t, ray_sym_intern("y", 1));
+    TEST_ASSERT_TRUE(ey && ey->type == RAY_ENCCOL && ray_enccol_is_parted(ey));
+    ray_t* s0 = ray_enccol_seg_col(ey, 0);
+    TEST_ASSERT_TRUE(s0 && !RAY_IS_ERR(s0));
+    TEST_ASSERT_NOT_NULL(ray_enccol_decoded_peek(ray_enccol_seg(ey, 0)));
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(ey));                /* the column is not published */
+    ray_enc_counters_reset();
+    ray_t* q = sr_eval("(select {z: (+ x y) from: T})");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_TRUE(q && !RAY_IS_ERR(q));
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_TRUE(sr_vec_eq(ray_table_get_col(q, ray_sym_intern("z", 1)), b));
+    ray_release(q); ray_release(t);
+    sr_drop(a); sr_drop(b); sr_drop(c); sr_drop(d);
+    PASS();
+}
+
+/* Column `col` of partition `part` (1-based) under `root`: its resolved
+ * path, with chunk `c`'s descriptor 0 reserved bytes set (corrupt). */
+static void sr_parted_bad(const char* root, int part, const char* col, int64_t c, char* path, size_t cap) {
+    char rel[512], dir[512];
+    snprintf(rel, sizeof rel, "%s/2024.01.0%d/t/", root, part);
+    if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) abort();
+    size_t dl = strlen(dir);
+    snprintf(path, cap, "%s%s%s", dir, (dl && dir[dl - 1] == '/') ? "" : "/", col);
+    uint64_t off = sr_dirent_offset(path, c);
+    if (!off) abort();
+    sr_patch(path, (long)off + 6, 1);
+}
+/* Range-read failures in two segments: the answer is the lowest one in
+ * row order across the whole parted column (failure keys are global row
+ * offsets), every run.  Partition 1 fails late (chunk 1, rows 65536..),
+ * partition 3 early (chunk 0): partition 1 still wins.  With only
+ * partition 3 corrupt, its failure is the answer. */
+static test_result_t test_expr_parted_fail_lowest(void) {
+    sr_parted_xy(SR_TMP "/pbad", 7, false, false);
+    char p1[600], p3[600];
+    sr_parted_bad(SR_TMP "/pbad", 3, "y", 0, p3, sizeof p3);
+    for (int i = 0; i < 2; i++) {
+        ray_error_clear();
+        ray_t* v = sr_parted_add(SR_TMP "/pbad", NULL);
+        TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
+        TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
+        TEST_ASSERT_FMT(strstr(ray_error_msg(), p3) != NULL, "not %s: %s", p3, ray_error_msg());
+        ray_error_free(v);
+    }
+    sr_parted_bad(SR_TMP "/pbad", 1, "y", 1, p1, sizeof p1);
+    for (int i = 0; i < 4; i++) {
+        ray_error_clear();
+        ray_t* v = sr_parted_add(SR_TMP "/pbad", NULL);
+        TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
+        TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
+        TEST_ASSERT_FMT(strstr(ray_error_msg(), p1) != NULL, "not %s: %s", p1, ray_error_msg());
+        ray_error_free(v);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -1636,5 +1752,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/count_native_kernels",   test_count_native_kernels,   sr_setup,  sr_teardown },
     { "scanrange/count_native_queries",   test_count_native_queries,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_widened_registers", test_expr_widened_registers, srr_setup, srr_teardown },
+    { "scanrange/expr_parted_segments",   test_expr_parted_segments,   srr_setup, srr_teardown },
+    { "scanrange/expr_parted_fail_lowest", test_expr_parted_fail_lowest, sr_rt_setup, sr_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

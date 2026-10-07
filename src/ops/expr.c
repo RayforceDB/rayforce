@@ -28,6 +28,7 @@
 #include "table/table.h"   /* ray_table_col_meta */
 #include "ops/colbind.h"
 #include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE per-morsel zone-skip */
+#include "store/enccol.h"    /* ray_enccol_seg: encoded parted segments */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -878,10 +879,13 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                  * (generation 0, or a published materialization) keeps
                  * today's capture; a generation-2 single-file source is
                  * range-read per morsel (expr_eval_morsel), never
-                 * materialized here.  An encoded parted source keeps
-                 * is_parted (Task 4: its segments). */
+                 * materialized here.  An encoded parted source without a
+                 * published materialization keeps is_parted over the
+                 * RAY_ENCCOL itself: expr_eval_full_parted binds each
+                 * encoded segment and reads it by range. */
                 ray_t* ready = ray_col_src_ready(src);
                 bool enc = !src->parted && !ready;
+                bool enc_parted = src->parted && !ready;
                 out->regs[r].kind = REG_SCAN;
                 out->regs[r].src = src;
                 out->regs[r].enc = enc;
@@ -898,8 +902,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     out->regs[r].null_src = col_nulls;
                 } else {
                     ray_t* col = NULL;
-                    *err = ray_col_src_plain(src, &col);   /* ready, or parted until Task 4 */
-                    if (*err) return false;
+                    if (enc_parted) col = src->obj;        /* segments read by expr_eval_full_parted */
+                    else {
+                        *err = ray_col_src_plain(src, &col);   /* ready: never decodes */
+                        if (*err) return false;
+                    }
                     if (src->parted) {
                         int8_t base = elem;
                         out->regs[r].col_type = base;
@@ -2103,6 +2110,8 @@ typedef struct {
     rowsel_builder_t* sel_builders;    /* NULL = normal bool/vec output */
     uint32_t          n_sel_builders;  /* slot count (fused mode only)  */
     ray_scan_fail_t*  fail;            /* range-read failures, keyed by task start */
+    int64_t           key_base;        /* added to every failure key: a parted
+                                        * segment's first row, so keys are global */
 } expr_full_ctx_t;
 
 static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -2113,14 +2122,15 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     /* a lower task already failed: this one cannot change the answer (the
      * coordinator discards the output; a skipped selection builder stays
      * all-NONE) */
-    if (ray_scan_fail_skip(c->fail, start)) return;
+    int64_t key = c->key_base + start;
+    if (ray_scan_fail_skip(c->fail, key)) return;
 
     /* Per-worker scratch buffers (heap-allocated via arena, morsel-sized) */
     ray_t* scratch_hdr = NULL;
     /* one morsel buffer per register the expression uses */
     char* scratch_mem = (char*)scratch_alloc(&scratch_hdr,
                             (size_t)(expr->n_regs ? expr->n_regs : 1) * EXPR_MORSEL * 8);
-    if (!scratch_mem) { ray_scan_fail_note(c->fail, start, ray_error("oom", "fused expression scratch")); return; }
+    if (!scratch_mem) { ray_scan_fail_note(c->fail, key, ray_error("oom", "fused expression scratch")); return; }
     void* scratch[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++)
         scratch[r] = scratch_mem + (size_t)r * EXPR_MORSEL * 8;
@@ -2177,7 +2187,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
         if (!failed) {
             ray_t* err = NULL;
             result = expr_eval_morsel(expr, scratch, rsc, ms, me, &err);
-            if (err) { ray_scan_fail_note(c->fail, start, err); failed = true; result = NULL; }
+            if (err) { ray_scan_fail_note(c->fail, key, err); failed = true; result = NULL; }
         }
         if (sb) {
             /* Selection mode: emit this morsel's bools (or, on the rare
@@ -2233,9 +2243,26 @@ static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t n
     else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
 }
 
+/* Segment s of a parted register's object: a plain segment vector, a
+ * RAY_ENCCOL (generation 2 or synthetic), or NULL for a missing segment. */
+static ray_t* expr_seg(ray_t* parted_col, int64_t s) {
+    if (parted_col->type == RAY_ENCCOL) return ray_enccol_seg(parted_col, s);
+    return ((ray_t**)ray_data(parted_col))[s];     /* not-a-table: a parted wrapper */
+}
+static int64_t expr_nsegs(ray_t* parted_col) {
+    return parted_col->type == RAY_ENCCOL ? ray_enccol_of(parted_col)->wrapper->len : parted_col->len;
+}
+
 /* Evaluate compiled expression over parted (segmented) columns.
- * Iterates segments as outer loop, rebinds data pointers per segment,
- * then dispatches the existing morsel evaluator per segment. Zero copy. */
+ * Iterates segments as outer loop, rebinds every parted register to the
+ * segment, then dispatches the existing morsel evaluator per segment.  A
+ * plain segment (or an encoded one whose materialization is published) is
+ * read in place; an encoded segment (generation 2, or the synthetic null
+ * segment of a ragged partition) is bound as its own source and read by
+ * range, never materialized.  Failure keys are global rows (the segment's
+ * first row plus the task start), so the lowest failure in row order is
+ * the answer; segments run in order and the first failing one ends the
+ * loop. */
 static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
     ray_t* out = ray_vec_new(expr->out_type, nrows);
     if (!out || RAY_IS_ERR(out)) {
@@ -2253,57 +2280,75 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
     }
     if (!ref_parted) { ray_release(out); return ray_error("nyi", NULL); }
 
-    int64_t n_segs = ref_parted->len;
+    int64_t n_segs = expr_nsegs(ref_parted);
     uint8_t esz = ray_elem_size(expr->out_type);
     ray_pool_t* pool = ray_pool_get();
     int64_t global_off = 0;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     bool dispatched = false;
 
-    for (int64_t s = 0; s < n_segs && !ray_scan_failed(&fail); s++) {
+    for (int64_t s = 0; s < n_segs; s++) {
         /* Determine segment length from any non-NULL parted register */
         int64_t seg_len = 0;
         for (uint8_t r = 0; r < expr->n_regs; r++) {
             if (expr->regs[r].is_parted) {
-                ray_t** segs = (ray_t**)ray_data(expr->regs[r].parted_col);
-                if (segs[s]) { seg_len = segs[s]->len; break; }
+                ray_t* seg = expr_seg(expr->regs[r].parted_col, s);
+                if (seg) { seg_len = ray_table_col_nrows(seg); break; }
             }
         }
         if (seg_len <= 0) continue;
 
-        /* Stack-copy expr, rebind parted registers to this segment's data */
+        /* Stack-copy expr, rebind parted registers to this segment */
         ray_expr_t seg_expr = *expr;
+        ray_col_src_t seg_src[EXPR_MAX_REGS];     /* bound in place, released below */
+        uint8_t n_seg_src = 0;
         bool seg_ok = true;
         for (uint8_t r = 0; r < seg_expr.n_regs; r++) {
-            if (seg_expr.regs[r].is_parted) {
-                ray_t** segs = (ray_t**)ray_data(seg_expr.regs[r].parted_col);
-                if (!segs[s]) { seg_ok = false; break; }
-                seg_expr.regs[r].data = ray_data(segs[s]);
+            if (!seg_expr.regs[r].is_parted) continue;
+            ray_t* seg = expr_seg(seg_expr.regs[r].parted_col, s);
+            if (!seg) { seg_ok = false; break; }
+            ray_t* segp = seg;
+            if (seg->type == RAY_ENCCOL) {
+                ray_t* pk = ray_enccol_decoded_peek(seg);   /* published: read it in place */
+                if (pk) segp = pk;
+            }
+            seg_expr.regs[r].is_parted = false;
+            if (segp->type == RAY_ENCCOL) {
+                ray_t* be = ray_col_src_bind(seg, &seg_src[n_seg_src]);
+                if (be) { ray_scan_fail_note(&fail, global_off, be); seg_ok = false; break; }
+                seg_expr.regs[r].src = &seg_src[n_seg_src++];
+                seg_expr.regs[r].enc = true;
+                seg_expr.regs[r].data = NULL;
+                seg_expr.regs[r].col_attrs = seg_expr.regs[r].src->attrs;
+                ray_col_src_advise(seg_expr.regs[r].src, 0, seg_len);
+            } else {
+                seg_expr.regs[r].enc = false;
+                seg_expr.regs[r].data = ray_data(segp);
                 /* SYM index width is PER SEGMENT (partitions saved at
                  * different vocabulary sizes legitimately differ) — the
                  * compile-time reg carries no width for parted scans. */
-                seg_expr.regs[r].col_attrs = segs[s]->attrs;
+                seg_expr.regs[r].col_attrs = segp->attrs;
             }
         }
-        if (!seg_ok) {
+        if (seg_ok) {
+            expr_full_ctx_t ctx = {
+                .expr = &seg_expr,
+                .out_data = (char*)ray_data(out) + global_off * esz,
+                .out_type = expr->out_type,
+                .fail = &fail,
+                .key_base = global_off,
+            };
+            if (pool && seg_len >= RAY_PARALLEL_THRESHOLD) {
+                ray_pool_dispatch(pool, expr_full_fn, &ctx, seg_len);
+                dispatched = true;
+            } else
+                expr_full_fn(&ctx, 0, 0, seg_len);
+        } else if (!ray_scan_failed(&fail)) {
             memset((char*)ray_data(out) + global_off * esz, 0,
                    (size_t)seg_len * esz);
-            global_off += seg_len;
-            continue;
         }
-
-        expr_full_ctx_t ctx = {
-            .expr = &seg_expr,
-            .out_data = (char*)ray_data(out) + global_off * esz,
-            .out_type = expr->out_type,
-            .fail = &fail,
-        };
-        if (pool && seg_len >= RAY_PARALLEL_THRESHOLD) {
-            ray_pool_dispatch(pool, expr_full_fn, &ctx, seg_len);
-            dispatched = true;
-        } else
-            expr_full_fn(&ctx, 0, 0, seg_len);
-
+        for (uint8_t i = 0; i < n_seg_src; i++) ray_col_src_release(&seg_src[i]);
+        if (ray_scan_failed(&fail)) break;          /* the lowest failing segment */
         global_off += seg_len;
     }
     ray_t* ferr = ray_scan_fail_finish(&fail, dispatched ? pool : NULL);

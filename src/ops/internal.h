@@ -851,11 +851,15 @@ typedef struct {
                                  * (else: only op-generated sentinels) */
         ray_col_src_t* src;     /* bound source (REG_SCAN; borrowed from the graph) */
         bool        enc;        /* src is range-read per morsel (generation 2,
-                                 * single file, not materialized): data is NULL */
+                                 * single file, not materialized; or, rebound
+                                 * per segment, an encoded parted segment):
+                                 * data is NULL */
         const void* data;       /* column data pointer (REG_SCAN only) */
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
-        ray_t*       parted_col; /* parted wrapper (is_parted only) */
+        ray_t*       parted_col; /* parted wrapper, or a RAY_ENCCOL_PARTED without a
+                                  * published materialization (is_parted only):
+                                  * expr_eval_full_parted rebinds it per segment */
         double      const_f64;  /* scalar value (REG_CONST) */
         int64_t     const_i64;  /* scalar value (REG_CONST) */
     } regs[EXPR_MAX_REGS];
