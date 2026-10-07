@@ -4306,6 +4306,11 @@ static lazy_ent_t  g_lazy[LAZY_SLOTS];
 static int64_t     g_lazy_bytes;
 static uint64_t    g_lazy_tick;
 static atomic_flag g_lazy_lock = ATOMIC_FLAG_INIT;
+static _Atomic(int) g_lazy_fail;       /* test hook: 1 = next build "oom", 2 = "cancel" */
+
+void ray_idx_lazy_test_fail_build(const char* code) {
+    atomic_store(&g_lazy_fail, !code ? 0 : strcmp(code, "cancel") == 0 ? 2 : 1);
+}
 
 static void lazy_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lazy_lock, memory_order_acquire)) RAY_CPU_RELAX(); }
 static void lazy_unlock(void) { atomic_flag_clear_explicit(&g_lazy_lock, memory_order_release); }
@@ -4334,16 +4339,19 @@ static void lazy_sweep_locked(lazy_drop_t* d) {
     for (int i = 0; i < LAZY_SLOTS; i++)
         if (g_lazy[i].col && ray_atomic_load(&g_lazy[i].col->rc) == 1) lazy_take(d, i);
 }
-/* A free slot, else the least recently used one emptied into d. */
+/* A free slot, else the least recently used memo (pending or declined:
+ * cheap to lose), else the least recently used built entry, emptied into d. */
 static int lazy_slot(lazy_drop_t* d) {
     lazy_sweep_locked(d);
-    int lru = 0;
+    int lru_memo = -1, lru_built = -1;
     for (int i = 0; i < LAZY_SLOTS; i++) {
         if (!g_lazy[i].key) return i;
-        if (g_lazy[i].tick < g_lazy[lru].tick) lru = i;
+        int* lru = g_lazy[i].hcol ? &lru_built : &lru_memo;
+        if (*lru < 0 || g_lazy[i].tick < g_lazy[*lru].tick) *lru = i;
     }
-    lazy_take(d, lru);
-    return lru;
+    int v = lru_memo >= 0 ? lru_memo : lru_built;
+    lazy_take(d, v);
+    return v;
 }
 
 /* Record col without an index: pending (this probe's scan counted as its
@@ -4365,10 +4373,11 @@ static void lazy_memo(ray_t* col, bool declined) {
 }
 static void lazy_decline(ray_t* col) { lazy_memo(col, true); }
 
-const ray_t* ray_idx_lazy_lookup(const ray_t* col) {
+ray_t* ray_idx_lazy_lookup(const ray_t* col) {
     lazy_lock();
     int i = col ? lazy_find(col) : -1;
-    const ray_t* r = i >= 0 ? g_lazy[i].hcol : NULL;
+    ray_t* r = i >= 0 ? g_lazy[i].hcol : NULL;
+    if (r) ray_retain(r);                               /* taken under the lock */
     lazy_unlock();
     return r;
 }
@@ -4430,7 +4439,10 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
     int64_t bytes = col->len * (int64_t)(numeric_elem_size(col->type) + LAZY_HASH_BYTES_PER_ROW);
     if (bytes > budget) { lazy_decline(col); return NULL; }
     if (hit < 0) { lazy_memo(col, false); return NULL; } /* first probe: the scan answers */
-    ray_t* h = attach_via(col, attach_hash_mem);        /* copy-on-write: col is never modified */
+    int fail = atomic_exchange(&g_lazy_fail, 0);
+    ray_t* h = fail == 2 ? ray_error("cancel", "interrupted")
+             : fail == 1 ? ray_error("oom", "lazy hash")
+             : attach_via(col, attach_hash_mem);        /* copy-on-write: col is never modified */
     if (!h) { lazy_decline(col); return ray_error("oom", "lazy hash"); }
     if (RAY_IS_ERR(h)) {
         /* an interrupted build is the query's cancellation, not the column's */

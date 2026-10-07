@@ -28,20 +28,27 @@ Suited to "does this value exist in the column" / "which row(s) hold this value"
 
 Converted tables persist chunk zones and string dictionaries, not hash
 indexes. When an equality filter, or an `in` filter with a small set of
-integers, meets an integer column whose chunk zone cannot prune (values
-spread over the whole range in every chunk), the filter scans. Once the same
-column has been scanned this way often enough to pay for an index (about 320
-lookups: a build costs roughly as much as that many scans), the engine builds
-a hash index for it in memory and reuses it for later filters in the same
-process. Compressed columns are covered too: the index is built from the
-decoded column. It is never written to disk and never changes the table's
-column (`.idx.info` still reports its zone). Scans, aggregates and range
-filters never count towards a build. The memory it holds is bounded by a
-quarter of the RAM the process may use (physical memory, or the container's
-memory limit when that is smaller); the least recently used index is dropped
-first, and a column too large for the bound is remembered and scanned without
-retrying. Build one explicitly with `.idx.hash` to have it from the first
-lookup and to persist it with the table.
+integers, meets an 8-byte integer or timestamp column whose chunk zone cannot
+prune (values spread over the whole range in every chunk), the filter scans.
+Narrower columns are never indexed this way: their index would cost more than
+five times their data. A key outside the column's whole value range is
+answered by the zone alone, without a scan.
+
+Once the same column has been scanned this way often enough to pay for an
+index (about 320 lookups, since one build costs roughly as much as that many
+scans), the engine builds a hash index for it in memory and reuses it for
+later filters in the same process. Compressed columns are covered too: the
+index is built from the decoded column. It is never written to disk and never
+changes the table's column (`.idx.info` still reports its zone). Scans,
+aggregates and range filters never count towards a build.
+
+The memory it holds is bounded by a quarter of the RAM the process may use
+(physical memory, or the container's memory limit when that is smaller). The
+least recently used index is dropped first; an index whose table is gone (a
+reload, a dropped variable) is dropped on the next lookup; a column too large
+for the bound is remembered and scanned without retrying. Build one
+explicitly with `.idx.hash` to have it from the first lookup and to persist
+it with the table.
 
 ### Range queries / sorted access — `.idx.sort`
 

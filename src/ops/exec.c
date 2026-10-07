@@ -1397,17 +1397,23 @@ static bool idx_want_ok(const ray_col_meta_t* m, unsigned want) {
            ((want & IDXW_SORTED) && (m->attrs & RAY_ATTR_SORTED));
 }
 
-/* Metadata admits the lazy in-memory hash (ray_idx_lazy_hash): an integer
- * column, no nulls, a chunk zone the hash may replace.  The column's own
+/* Metadata admits the lazy in-memory hash (ray_idx_lazy_hash): an 8-byte
+ * integer or timestamp column, no nulls, a chunk zone the hash may replace.  The column's own
  * shape test runs on the decoded vector after this. */
 static bool idx_lazy_meta_ok(const ray_col_meta_t* m) {
     if (m->index_kind != RAY_IDX_CHUNK_ZONE) return false;
-    switch (m->type) {
-    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
-    default: return false;
-    }
+    /* the lazy cost test admits 8-byte columns only */
+    if (m->type != RAY_I64 && m->type != RAY_TIMESTAMP) return false;
     return m->null_count >= 0 ? m->null_count == 0 : !(m->attrs & RAY_ATTR_HAS_NULLS);
+}
+
+/* A lazy-hash failure is best effort (the scan answers), except an
+ * interrupted build: that is the query's cancellation, handed back. */
+static ray_t* idx_lazy_err(ray_t* le) {
+    if (!le) return NULL;
+    if (strcmp(ray_err_code(le), "cancel") == 0) return le;
+    ray_error_free(le);
+    return NULL;
 }
 
 /* An `in` set that is a point lookup for the lazy hash: an integer-family
@@ -2747,8 +2753,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             }
                             ray_t* lazy_col = NULL;
                             if (eq_kind != RAY_IDX_HASH && eq_kind != RAY_IDX_PART) {
-                                ray_t* le = ray_idx_lazy_hash(col, &lazy_col);
-                                if (le) ray_error_free(le);      /* best effort: the scan answers */
+                                ray_t* le = idx_lazy_err(ray_idx_lazy_hash(col, &lazy_col));
+                                if (le) { ray_release(input); return le; }
                                 if (lazy_col) eq_kind = RAY_IDX_HASH;
                             }
                             ray_t* probe_col = lazy_col ? lazy_col : col;
@@ -2853,8 +2859,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_t* eq_lazy = NULL;
                     if (shape_ok && eq_col && rg_col && rg_col != eq_col &&
                         ray_index_kind(eq_col) != RAY_IDX_HASH) {
-                        ray_t* le = ray_idx_lazy_hash(eq_col, &eq_lazy);
-                        if (le) ray_error_free(le);      /* best effort: the scan answers */
+                        ray_t* le = idx_lazy_err(ray_idx_lazy_hash(eq_col, &eq_lazy));
+                        if (le) { ray_release(input); return le; }
                         if (eq_lazy) eq_col = eq_lazy;
                         else shape_ok = false;
                     }
@@ -2962,8 +2968,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         if (in_kind != RAY_IDX_HASH && in_kind != RAY_IDX_PART &&
                             !in_col_is_float && !ray_vec_may_have_nulls(in_col) &&
                             idx_lazy_set_ok(in_col, in_set_lit)) {
-                            ray_t* le = ray_idx_lazy_hash(in_col, &in_lazy);
-                            if (le) ray_error_free(le);          /* best effort: the scan answers */
+                            ray_t* le = idx_lazy_err(ray_idx_lazy_hash(in_col, &in_lazy));
+                            if (le) { ray_release(input); return le; }
                             if (in_lazy) in_kind = RAY_IDX_HASH;
                         }
                         ray_t* in_probe = in_lazy ? in_lazy : in_col;

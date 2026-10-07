@@ -265,9 +265,10 @@ ray_t* ray_idx_uses_fn(ray_t* tbl);
 
 /* ===== Lazy in-memory HASH (index policy) =====
  *
- * The converters persist a CHUNK_ZONE, not a HASH.  A point lookup (an
- * equality or `in` filter) on an integer column whose zone cannot prune
- * builds a HASH in memory on first use and reuses it in the same process.
+ * The converters persist a CHUNK_ZONE, not a HASH.  Point lookups (equality
+ * or `in` filters) on an 8-byte integer or timestamp column whose zone cannot
+ * prune (the cost test admits no narrower type) build a HASH in memory once
+ * they have been repeated enough, and reuse it in the same process.
  * The index lives in a process-wide cache keyed by the plain column object
  * (generation 0: the table's column; generation 2: the encoded object's
  * materialization), never in a table slot and never attached to the column,
@@ -285,7 +286,12 @@ ray_t* ray_idx_uses_fn(ray_t* tbl);
  * included, takes 615 ms (about 61 ns/row); the equality scan it replaces
  * reads the mapped column in 1.9 ms (about 0.19 ns/row).  61 / 0.19 rounds
  * to 320 full-column probes: the 320th probe builds, the first 319 scan.
- * A cold scan costs more and pays sooner, so the warm ratio is the safe one. */
+ * A cold scan costs more and pays sooner, so the warm ratio is the safe one.
+ *
+ * Threads: the cache takes its own lock, but its entries share column
+ * objects with the caller's tables, so a caller outside the pool's workers
+ * that probes while another thread uses the same objects must run with
+ * ray_rc_sync set (atomic reference counts), as for any shared object. */
 #define RAY_IDX_LAZY_BUILD_PROBES 320
 
 /* The random-shape test the converters used: a fresh, integer CHUNK_ZONE of
@@ -303,15 +309,17 @@ bool   ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set);
  * still pending: the caller scans and this probe's work is counted); an
  * owned error on failure to build (the caller falls back to its scan). */
 ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out);
-/* The cached indexed copy for col, borrowed (valid while the entry lives:
- * tests and single-threaded diagnostics), or NULL. */
-const ray_t* ray_idx_lazy_lookup(const ray_t* col);
+/* The cached indexed copy for col, retained (the caller releases it), or NULL. */
+ray_t* ray_idx_lazy_lookup(const ray_t* col);
 /* Drop the entry of a column object that is going away (the generation-2
  * object frees its materialization). */
 void   ray_idx_lazy_forget(const ray_t* col);
 /* Tests: rows the scans of col's pending probes read (0 once built), or -1
  * when col has no entry or was declined. */
 int64_t ray_idx_lazy_work(const ray_t* col);
+/* Test hook: the next lazy build fails with `code` ("oom" or "cancel");
+ * NULL disarms. */
+void    ray_idx_lazy_test_fail_build(const char* code);
 /* Tests and runtime teardown: drop every entry; indexed entry count; every
  * entry (built, pending, declined); bytes held. */
 void    ray_idx_lazy_clear(void);

@@ -2105,6 +2105,7 @@ static void lz_setup(void) {
     (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_lazy"));
 }
 static void lz_teardown(void) {
+    ray_idx_lazy_test_fail_build(NULL);
     ray_idx_lazy_clear();
     (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_lazy"));
     ray_runtime_destroy(g_lzrt);
@@ -2483,6 +2484,80 @@ static test_result_t test_lazy_gen2(void) {
     PASS();
 }
 
+/* A wanted column of n rows with a chunk zone of 4096-row chunks (owned). */
+static ray_t* lz_zoned_vec(int64_t n, int64_t salt) {
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = ((i + salt) * 7919) % 1000003;
+    ray_t* z = ray_index_attach_chunk_zone(&v, 12);
+    (void)z;
+    return v;
+}
+
+/* Memos (pending or declined columns) never push out a built index: with
+ * every slot taken, the oldest memo goes first. */
+static test_result_t test_lazy_memo_evicts_memo(void) {
+    ray_t* b = lz_zoned_vec(50000, 0);
+    TEST_ASSERT_TRUE(ray_idx_lazy_hash_wanted(b));
+    ray_t* o = NULL;
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {
+        if (o) ray_release(o);
+        o = NULL;
+        TEST_ASSERT_NULL(ray_idx_lazy_hash(b, &o));
+    }
+    TEST_ASSERT_NOT_NULL(o);                                       /* built */
+    ray_release(o);
+    ray_t* m[80];
+    for (int k = 0; k < 80; k++) {                                 /* more memos than slots */
+        m[k] = lz_zoned_vec(50000, k + 1);
+        ray_t* mo = NULL;
+        TEST_ASSERT_NULL(ray_idx_lazy_hash(m[k], &mo));
+        TEST_ASSERT_NULL(mo);                                      /* pending */
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    ray_t* lk = ray_idx_lazy_lookup(b);
+    TEST_ASSERT_NOT_NULL(lk);
+    ray_release(lk);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(m[0]), -1);                 /* the oldest memo went */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(m[79]), 50000);
+    ray_idx_lazy_clear();
+    for (int k = 0; k < 80; k++) ray_release(m[k]);
+    ray_release(b);
+    PASS();
+}
+
+/* An interrupted build cancels the query (it does not go on to scan) and is
+ * not remembered against the column: the next probe builds.  A build that
+ * runs out of memory is best effort: the scan answers and the column is
+ * declined. */
+static test_result_t test_lazy_cancel(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));
+    ray_idx_lazy_test_fail_build("cancel");
+    ray_t* r = lz_eval("(select {v: v from: A where: (== h 7919)})");
+    ray_idx_lazy_test_fail_build(NULL);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_TRUE(ray_idx_lazy_work(lz_col("A", "h")) > 0);     /* still pending */
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    PASS();
+}
+static test_result_t test_lazy_oom(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));
+    ray_idx_lazy_test_fail_build("oom");
+    bool ok = lz_probe_n("A", 1);                                  /* the scan answers */
+    ray_idx_lazy_test_fail_build(NULL);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), -1);    /* declined */
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    PASS();
+}
+
 /* Two threads probing the same column at once keep one hash: the loser of
  * the build race finds the winner's entry under the lock and drops its own. */
 typedef struct { ray_t* col; _Atomic int* go; ray_t* out; ray_t* err; } lz_thr_t;
@@ -2520,7 +2595,9 @@ static test_result_t test_lazy_concurrent(void) {
         TEST_ASSERT_EQ_PTR(t[0].out, t[1].out);           /* one indexed copy */
         TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
         TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), n * (8 + 58));
-        TEST_ASSERT_EQ_PTR(ray_idx_lazy_lookup(v), t[0].out);
+        ray_t* lk = ray_idx_lazy_lookup(v);               /* retained */
+        TEST_ASSERT_EQ_PTR(lk, t[0].out);
+        ray_release(lk);
         TEST_ASSERT_EQ_I(ray_index_kind(t[0].out), RAY_IDX_HASH);
         TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_CHUNK_ZONE);  /* the column is untouched */
         ray_release(t[0].out); ray_release(t[1].out);
@@ -6776,6 +6853,9 @@ const test_entry_t store_entries[] = {
     { "idxlazy/out_of_range",  test_lazy_out_of_range,  lz_setup, lz_teardown },
     { "idxlazy/out_of_range_gen2", test_lazy_out_of_range_gen2, lz_setup, lz_teardown },
     { "idxlazy/concurrent",    test_lazy_concurrent,    lz_setup, lz_teardown },
+    { "idxlazy/memo_evicts_memo", test_lazy_memo_evicts_memo, lz_setup, lz_teardown },
+    { "idxlazy/cancel",        test_lazy_cancel,        lz_setup, lz_teardown },
+    { "idxlazy/oom",           test_lazy_oom,           lz_setup, lz_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
     { "store/stream_cancel_publishes_nothing", test_stream_cancel_publishes_nothing, store_setup, store_teardown },
