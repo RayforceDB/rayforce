@@ -6299,7 +6299,9 @@ static inline int64_t agg_firstn_probe(agg_firstn_set_t* s, const int64_t* kv,
 /* Fold key column `col` rows [b, b+n) into the running hashes h[0..n). The
  * widening matches agg_read_key_i64 (signed types sign-extend, SYM and U8/BOOL
  * zero-extend), so the folded hash equals agg_firstn_hash of the read tuple. */
-static void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
+/* Always inlined: the per-task hash pass is the pre-pass's hot loop, and a
+ * second caller (the pick) must not turn it into a call. */
+static inline __attribute__((always_inline)) void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
                                   int64_t b, int64_t n) {
     switch (col->type) {
         case RAY_I64: case RAY_TIMESTAMP: {
@@ -6444,12 +6446,50 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     return true;
 }
 
+/* Map the rows of a group result (key columns okc, sub_rows rows) to the
+ * set's ranks: perm[rank] = row.  Rows of groups outside the set are skipped,
+ * or fail the pick (-1) when `strict` (every row must be a set group).  The
+ * key columns are hashed a block at a time; only bloom hits read the tuple
+ * and probe.  Returns the number of set groups found, -1 on a mismatch.  Kept
+ * out of line: the pre-pass's serial probe loop stays small. */
+static __attribute__((noinline)) int64_t agg_firstn_pick(
+        agg_firstn_set_t* set, ray_t** okc, uint32_t n_keys, int64_t sub_rows,
+        uint32_t bbits, bool strict, int64_t* perm, int64_t* kv, bool* identity) {
+    uint64_t hb[1024];
+    const void* okd[16];
+    for (uint32_t k = 0; k < n_keys; k++) okd[k] = ray_data(okc[k]);
+    uint32_t bshift = 64 - bbits;
+    int64_t found = 0;
+    for (int64_t b0 = 0; b0 < sub_rows; b0 += 1024) {
+        int64_t len = sub_rows - b0 < 1024 ? sub_rows - b0 : 1024;
+        for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
+        for (uint32_t k = 0; k < n_keys; k++) agg_firstn_hash_block(hb, okc[k], okd[k], b0, len);
+        for (int64_t i = 0; i < len; i++) {
+            int64_t r = b0 + i;
+            uint64_t hv = AGG_FIRSTN_FINAL(hb[i]);
+            uint64_t bit = hv >> bshift;
+            int64_t rk = -1;
+            if ((set->bloom[bit >> 6] >> (bit & 63)) & 1) {
+                for (uint32_t k = 0; k < n_keys; k++) kv[k] = agg_read_key_i64(okc[k], okd[k], r);
+                rk = agg_firstn_probe(set, kv, hv, false);
+            }
+            if (rk < 0) { if (strict) return -1; continue; }
+            if (perm[rk] >= 0) return -1;
+            perm[rk] = r;
+            found++;
+            if (rk != r) *identity = false;
+        }
+    }
+    return found;
+}
+
 /* The first `group_limit` groups in first-seen order, an error, or NULL when
  * the shape or the data is not one the pre-pass serves (the caller then runs
  * the full aggregation). */
 static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
                               ray_t** key_cols, ray_t* sel, const int64_t* sel_prefix,
-                              int64_t n_sel, int64_t group_limit) {
+                              int64_t n_sel, int64_t group_limit,
+                              bool allow_heavy, bool* heavy_out) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_pool_t* pool = ray_pool_get();
     int64_t eff_n = sel ? n_sel : nrows;
@@ -6586,9 +6626,13 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
 
 heavy:
     /* The N groups hold a large share of the rows: aggregating only them
-     * costs about what aggregating everything does.  Run the unbounded
-     * group (the bounded emit keeps every group's first row and declines
-     * the dense routes) and pick the N groups of the set from its result. */
+     * costs about what aggregating everything does.  The bounded full run
+     * is the answer when it stays on a dense route (the task-local slabs
+     * select the N smallest first rows); the caller asks again with
+     * allow_heavy only when it would leave them for radix.  Then run the
+     * unbounded group (dense routes allowed) and pick the N groups of the
+     * set from its result. */
+    if (!allow_heavy) { if (heavy_out) *heavy_out = true; goto done; }
     firstn_nested = true;
     sub = exec_group_v2_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, 0, NULL);
     firstn_nested = false;
@@ -6614,35 +6658,8 @@ pick:
         if (okc[k] && RAY_IS_ERR(okc[k])) { res = okc[k]; goto done; }
         if (!okc[k] || okc[k]->type != key_cols[k]->type) goto done;
     }
-    int64_t found = 0;
-    {
-        /* hash the result's key columns a block at a time; only bloom hits
-         * read the tuple and probe the set */
-        uint64_t hb[1024];
-        const void* okd[16];
-        for (uint32_t k = 0; k < n_keys; k++) okd[k] = ray_data(okc[k]);
-        uint32_t bshift = 64 - bbits;
-        for (int64_t b0 = 0; b0 < sub_rows; b0 += 1024) {
-            int64_t len = sub_rows - b0 < 1024 ? sub_rows - b0 : 1024;
-            for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
-            for (uint32_t k = 0; k < n_keys; k++) agg_firstn_hash_block(hb, okc[k], okd[k], b0, len);
-            for (int64_t i = 0; i < len; i++) {
-                int64_t r = b0 + i;
-                uint64_t hv = AGG_FIRSTN_FINAL(hb[i]);
-                uint64_t bit = hv >> bshift;
-                int64_t rk = -1;
-                if ((set.bloom[bit >> 6] >> (bit & 63)) & 1) {
-                    for (uint32_t k = 0; k < n_keys; k++) kv[k] = agg_read_key_i64(okc[k], okd[k], r);
-                    rk = agg_firstn_probe(&set, kv, hv, false);
-                }
-                if (rk < 0) { if (compact) goto done; continue; }   /* a group not in the set */
-                if (perm[rk] >= 0) goto done;
-                perm[rk] = r;
-                found++;
-                if (rk != r) identity = false;
-            }
-        }
-    }
+    int64_t found = agg_firstn_pick(&set, okc, n_keys, sub_rows, bbits, compact != NULL,
+                                    perm, kv, &identity);
     if (found != set.n) goto done;
     if (identity) { res = sub; sub = NULL; }
     else {
@@ -6731,8 +6748,10 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
     /* Unordered take: N — find the N groups first, aggregate only them. */
+    bool firstn_heavy = false;   /* the N groups hold a large share: see agg_first_n_run */
     if (group_limit > 0 && !efp) {
-        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, sel_prefix, n_sel, group_limit);
+        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, sel_prefix, n_sel,
+                                    group_limit, false, &firstn_heavy);
         if (fr) { scratch_free(kc_hdr); return fr; }
     }
 
@@ -6962,6 +6981,16 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp, dense_workers, AGG_DENSE_TASK_LOCAL,
                                                     sel, sel_prefix, n_sel, efp, group_limit);
             agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
+        }
+        if (keys_intsym && firstn_heavy && dp.ok) {
+            /* A dense plan exists but the bounded emit leaves the dense
+             * routes here (partition ownership and the shared slab take no
+             * limit): the unbounded group keeps them, and the N groups are
+             * picked from it.  Without a dense plan both runs are radix and
+             * the bounded one selects the N groups itself. */
+            ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, sel_prefix, n_sel,
+                                        group_limit, true, NULL);
+            if (fr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return fr; }
         }
         if (keys_intsym) {
             /* Sparse ranges and excessive dense worker traffic: pre-aggregate

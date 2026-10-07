@@ -2068,9 +2068,10 @@ static test_result_t test_dense_unordered_take(void) {
 static bool first_n_same_table(ray_t* a, ray_t* b);
 
 /* Unordered take: N where the first N groups hold a large share of the
- * rows (one heavy group): the pre-pass runs the unbounded aggregation, which
- * keeps the dense route (a bounded emit declines it for radix), and picks the
- * N groups in first-seen order from its result. */
+ * rows (one heavy group) on a dense key: the pre-pass gives the shape to the
+ * bounded full run, whose task-local dense route selects the N smallest
+ * first rows itself (an unbounded run plus a pick is slower there).  The
+ * pick is taken only where the bounded run would leave the dense routes. */
 static test_result_t test_first_n_heavy_dense(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
@@ -2085,9 +2086,10 @@ static test_result_t test_first_n_heavy_dense(void) {
     ray_t* r = ray_eval_str("(select {from:hv_t c:(count v) s:(sum v) by:k take:10})");
     agg_route_stats_t stats = agg_route_stats();
     TEST_ASSERT_TRUE(old && !RAY_IS_ERR(old) && r && !RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(stats.first_n, 1);
+    TEST_ASSERT_EQ_I(stats.first_n, 0);
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
     TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
+    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
     TEST_ASSERT_TRUE(first_n_same_table(old, r));
     /* row 0 starts the heavy group 0 (a third of the rows), then rows 1, 2,
      * 4, 5, ... start (i*7919) % 50000 */
@@ -2163,8 +2165,6 @@ static test_result_t test_first_n_take(void) {
         { "(select {from:fn_t by:[nu w] c:(count v) take:10})", 1 },
         { "(select {from:fn_t by:[u s] c:(count u) take:[3 5]})", 1 },
         { "(select {from:fn_t by:u c:(count fl) take:4})", 1 },
-        /* the 10 groups hold 10/97 of the rows: the unbounded run, then the pick */
-        { "(select {from:fn_t by:g c:(count u) take:10})", 1 },
         /* left to the full aggregation */
         { "(select {from:fn_t by:u sf:(sum fl) take:10})", 0 },
         { "(select {from:fn_t by:u fv:(first v) take:10})", 0 },
@@ -2175,6 +2175,9 @@ static test_result_t test_first_n_take(void) {
         { "(select {from:fn_t by:u c:(count u) take:[-5 3]})", 0 },
         { "(select {from:fn_small by:u c:(count u) take:10})", 0 },
         { "(select {from:fn_t by:w c:(count u) take:100})", 0 },
+        /* the 10 groups hold 10/97 of the rows: the bounded run, on its
+         * dense route, selects them */
+        { "(select {from:fn_t by:g c:(count u) take:10})", 0 },
         { "(select {from:fn_t where:(> v 100000) by:u c:(count u) take:10})", 0 },
     };
     for (size_t q = 0; q < sizeof(shapes) / sizeof(shapes[0]); q++) {
